@@ -1,0 +1,163 @@
+[package]
+name = "reth_bsc"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "reth_bsc"
+path = "src/lib.rs"
+
+[[bin]]
+name = "reth-bsc"
+path = "src/main.rs"
+
+[dependencies]
+reth = { path = "../reth/bin/reth" }
+reth-cli = { path = "../reth/crates/cli/cli" }
+reth-cli-commands = { path = "../reth/crates/cli/commands" }
+reth-basic-payload-builder = { path = "../reth/crates/payload/basic" }
+reth-db = { path = "../reth/crates/storage/db" }
+reth-chainspec = { path = "../reth/crates/chainspec" }
+reth-cli-util = { path = "../reth/crates/cli/util" }
+reth-discv4 = { path = "../reth/crates/net/discv4", features = [
+    "test-utils",
+] }
+reth-engine-primitives = { path = "../reth/crates/engine/primitives" }
+reth-ethereum-forks = { path = "../reth/crates/ethereum/hardforks", features = [
+    "serde",
+] }
+reth-ethereum-payload-builder = { path = "../reth/crates/ethereum/payload" }
+reth-ethereum-primitives = { path = "../reth/crates/ethereum/primitives" }
+reth-eth-wire = { path = "../reth/crates/net/eth-wire" }
+reth-eth-wire-types = { path = "../reth/crates/net/eth-wire-types" }
+reth-evm = { path = "../reth/crates/evm/evm" }
+reth-evm-ethereum = { path = "../reth/crates/ethereum/evm" }
+reth-node-core = { path = "../reth/crates/node/core" }
+reth-revm = { path = "../reth/crates/revm" }
+reth-network = { path = "../reth/crates/net/network", features = [
+    "test-utils",
+] }
+reth-network-p2p = { path = "../reth/crates/net/p2p" }
+reth-network-api = { path = "../reth/crates/net/network-api" }
+reth-node-ethereum = { path = "../reth/crates/ethereum/node", features = [
+    "test-utils",
+] }
+reth-network-peers = { path = "../reth/crates/net/peers" }
+reth-optimism-rpc = { path = "../reth/crates/optimism/rpc" }
+reth-payload-primitives = { path = "../reth/crates/payload/primitives" }
+reth-primitives = { path = "../reth/crates/primitives" }
+reth-primitives-traits = { path = "../reth/crates/primitives-traits" }
+reth-provider = { path = "../reth/crates/storage/provider", features = [
+    "test-utils",
+] }
+reth-rpc-eth-api = { path = "../reth/crates/rpc/rpc-eth-api" }
+reth-rpc-engine-api = { path = "../reth/crates/rpc/rpc-engine-api" }
+reth-tracing = { path = "../reth/crates/tracing" }
+reth-trie-common = { path = "../reth/crates/trie/common" }
+reth-trie-db = { path = "../reth/crates/trie/db" }
+revm = { version = "24.0.1", features = ["secp256r1"] }
+
+# alloy dependencies
+alloy-genesis = "1.0.9"
+alloy-consensus = "1.0.9"
+alloy-chains = "0.2.0"
+alloy-eips = "1.0.9"
+alloy-evm = "0.10"
+alloy-json-abi = { version = "1.0.0", default-features = false }
+alloy-dyn-abi = "1.1.0"
+alloy-network = "1.0.9"
+alloy-primitives = { version = "1.1.0", default-features = false, features = [
+    "map-foldhash",
+] }
+alloy-rlp = { version = "0.3.10", default-features = false, features = [
+    "core-net",
+] }
+alloy-rpc-types = { version = "1.0.9", features = ["engine"] }
+alloy-rpc-types-eth = "1.0.9"
+alloy-rpc-types-engine = "1.0.9"
+alloy-signer = "1.0.9"
+alloy-sol-macro = "1.1.0"
+alloy-sol-types = { version = "1.1.0", default-features = false }
+
+jsonrpsee = "0.25.1"
+jsonrpsee-core = { version = "0.25.1" }
+jsonrpsee-types = "0.25.1"
+
+# misc dependencies
+auto_impl = "1"
+async-trait = "0.1"
+bytes = "1.5"
+clap = { version = "4.4", features = ["derive"] }
+cfg-if = { version = "1.0", default-features = false }
+derive_more = "0.99"
+eyre = "0.6"
+futures = "0.3"
+lazy_static = "1.4.0"
+once_cell = { version = "1.19", default-features = false, features = ["alloc"] }
+parity-bytes = { version = "0.1.2", default-features = false }
+parking_lot = "0.12"
+secp256k1 = { version = "0.28", features = [
+    "global-context",
+    "std",
+    "recovery",
+] }
+serde = { version = "1.0", features = ["derive"], default-features = false }
+serde_json = "1.0"
+thiserror = "1.0"
+tokio = { version = "1.36", features = ["full"] }
+tokio-stream = "0.1"
+tracing = "0.1"
+
+
+# precompiles deps
+bls_on_arkworks = "0.3.0"
+
+cometbft = { git = "https://github.com/bnb-chain/greenfield-cometbft-rs.git", rev = "1282547" }
+cometbft-light-client-verifier = { git = "https://github.com/bnb-chain/greenfield-cometbft-rs.git", rev = "1282547" }
+cometbft-proto = { git = "https://github.com/bnb-chain/greenfield-cometbft-rs.git", rev = "1282547" }
+cometbft-light-client = { git = "https://github.com/bnb-chain/greenfield-cometbft-rs.git", rev = "1282547" }
+
+prost = { version = "0.12.6" }
+
+tendermint = { git = "https://github.com/bnb-chain/tendermint-rs-parlia", rev = "8c21ccbd58a174e07eed2c9343e63ccd00f0fbd5", features = [
+    "secp256k1",
+] }
+
+[target.'cfg(unix)'.dependencies]
+tikv-jemalloc-ctl = "0.6"
+tikv-jemallocator = { version = "0.6", optional = true }
+libc = "0.2"
+
+[features]
+default = ["jemalloc"]
+jemalloc = ["dep:tikv-jemallocator"]
+dev = ["reth-cli-commands/arbitrary", "reth/dev", "revm/dev"]
+
+serde = [
+    "alloy-chains/serde",
+    "alloy-consensus/serde",
+    "alloy-eips/serde",
+    "alloy-primitives/serde",
+    "alloy-rpc-types-engine/serde",
+    "alloy-rpc-types-eth/serde",
+    "bytes/serde",
+    "parking_lot/serde",
+    "reth-eth-wire/serde",
+    "reth-eth-wire-types/serde",
+    "reth-ethereum-forks/serde",
+    "reth-ethereum-primitives/serde",
+    "reth-network/serde",
+    "reth-network-api/serde",
+    "reth-primitives-traits/serde",
+    "reth-revm/serde",
+    "reth-trie-common/serde",
+    "reth-trie-db/serde",
+    "revm/serde",
+    "secp256k1/serde",
+]
+
+client = [
+    "jsonrpsee/client",
+    "jsonrpsee/async-client",
+    "reth-rpc-eth-api/client",
+] 
