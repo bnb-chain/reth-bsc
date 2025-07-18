@@ -12,50 +12,50 @@ name = "reth-bsc"
 path = "src/main.rs"
 
 [dependencies]
-reth = { git = "https://github.com/sunny2022da/reth.git", rev = "3ef2aef" }
-reth-cli = { git = "https://github.com/sunny2022da/reth.git", rev = "3ef2aef" }
-reth-cli-commands = { git = "https://github.com/sunny2022da/reth.git", rev = "3ef2aef" }
-reth-basic-payload-builder = { git = "https://github.com/sunny2022da/reth.git", rev = "3ef2aef" }
-reth-db = { git = "https://github.com/sunny2022da/reth.git", rev = "3ef2aef" }
-reth-engine-local = { git = "https://github.com/sunny2022da/reth.git", rev = "3ef2aef" }
-reth-chainspec = { git = "https://github.com/sunny2022da/reth.git", rev = "3ef2aef" }
-reth-cli-util = { git = "https://github.com/sunny2022da/reth.git", rev = "3ef2aef" }
-reth-discv4 = { git = "https://github.com/sunny2022da/reth.git", rev = "3ef2aef", features = [
+reth = { git = "https://github.com/sunny2022da/reth.git", rev = "17b0d1" }
+reth-cli = { git = "https://github.com/sunny2022da/reth.git", rev = "17b0d1" }
+reth-cli-commands = { git = "https://github.com/sunny2022da/reth.git", rev = "17b0d1" }
+reth-basic-payload-builder = { git = "https://github.com/sunny2022da/reth.git", rev = "17b0d1" }
+reth-db = { git = "https://github.com/sunny2022da/reth.git", rev = "17b0d1" }
+reth-engine-local = { git = "https://github.com/sunny2022da/reth.git", rev = "17b0d1" }
+reth-chainspec = { git = "https://github.com/sunny2022da/reth.git", rev = "17b0d1" }
+reth-cli-util = { git = "https://github.com/sunny2022da/reth.git", rev = "17b0d1" }
+reth-discv4 = { git = "https://github.com/sunny2022da/reth.git", rev = "17b0d1", features = [
     "test-utils",
 ] }
-reth-engine-primitives = { git = "https://github.com/sunny2022da/reth.git", rev = "3ef2aef" }
-reth-ethereum-forks = { git = "https://github.com/sunny2022da/reth.git", rev = "3ef2aef", features = [
+reth-engine-primitives = { git = "https://github.com/sunny2022da/reth.git", rev = "17b0d1" }
+reth-ethereum-forks = { git = "https://github.com/sunny2022da/reth.git", rev = "17b0d1", features = [
     "serde",
 ] }
-reth-ethereum-payload-builder = { git = "https://github.com/sunny2022da/reth.git", rev = "3ef2aef" }
-reth-ethereum-primitives = { git = "https://github.com/sunny2022da/reth.git", rev = "3ef2aef" }
-reth-eth-wire = { git = "https://github.com/sunny2022da/reth.git", rev = "3ef2aef" }
-reth-eth-wire-types = { git = "https://github.com/sunny2022da/reth.git", rev = "3ef2aef" }
-reth-evm = { git = "https://github.com/sunny2022da/reth.git", rev = "3ef2aef" }
-reth-evm-ethereum = { git = "https://github.com/sunny2022da/reth.git", rev = "3ef2aef" }
-reth-node-core = { git = "https://github.com/sunny2022da/reth.git", rev = "3ef2aef" }
-reth-revm = { git = "https://github.com/sunny2022da/reth.git", rev = "3ef2aef" }
-reth-network = { git = "https://github.com/sunny2022da/reth.git", rev = "3ef2aef", features = [
+reth-ethereum-payload-builder = { git = "https://github.com/sunny2022da/reth.git", rev = "17b0d1" }
+reth-ethereum-primitives = { git = "https://github.com/sunny2022da/reth.git", rev = "17b0d1" }
+reth-eth-wire = { git = "https://github.com/sunny2022da/reth.git", rev = "17b0d1" }
+reth-eth-wire-types = { git = "https://github.com/sunny2022da/reth.git", rev = "17b0d1" }
+reth-evm = { git = "https://github.com/sunny2022da/reth.git", rev = "17b0d1" }
+reth-evm-ethereum = { git = "https://github.com/sunny2022da/reth.git", rev = "17b0d1" }
+reth-node-core = { git = "https://github.com/sunny2022da/reth.git", rev = "17b0d1" }
+reth-revm = { git = "https://github.com/sunny2022da/reth.git", rev = "17b0d1" }
+reth-network = { git = "https://github.com/sunny2022da/reth.git", rev = "17b0d1", features = [
     "test-utils",
 ] }
-reth-network-p2p = { git = "https://github.com/sunny2022da/reth.git", rev = "3ef2aef" }
-reth-network-api = { git = "https://github.com/sunny2022da/reth.git", rev = "3ef2aef" }
-reth-node-ethereum = { git = "https://github.com/sunny2022da/reth.git", rev = "3ef2aef", features = [
+reth-network-p2p = { git = "https://github.com/sunny2022da/reth.git", rev = "17b0d1" }
+reth-network-api = { git = "https://github.com/sunny2022da/reth.git", rev = "17b0d1" }
+reth-node-ethereum = { git = "https://github.com/sunny2022da/reth.git", rev = "17b0d1", features = [
     "test-utils",
 ] }
-reth-network-peers = { git = "https://github.com/sunny2022da/reth.git", rev = "3ef2aef" }
-reth-optimism-rpc = { git = "https://github.com/sunny2022da/reth.git", rev = "3ef2aef" }
-reth-payload-primitives = { git = "https://github.com/sunny2022da/reth.git", rev = "3ef2aef" }
-reth-primitives = { git = "https://github.com/sunny2022da/reth.git", rev = "3ef2aef" }
-reth-primitives-traits = { git = "https://github.com/sunny2022da/reth.git", rev = "3ef2aef" }
-reth-provider = { git = "https://github.com/sunny2022da/reth.git", rev = "3ef2aef", features = [
+reth-network-peers = { git = "https://github.com/sunny2022da/reth.git", rev = "17b0d1" }
+reth-optimism-rpc = { git = "https://github.com/sunny2022da/reth.git", rev = "17b0d1" }
+reth-payload-primitives = { git = "https://github.com/sunny2022da/reth.git", rev = "17b0d1" }
+reth-primitives = { git = "https://github.com/sunny2022da/reth.git", rev = "17b0d1" }
+reth-primitives-traits = { git = "https://github.com/sunny2022da/reth.git", rev = "17b0d1" }
+reth-provider = { git = "https://github.com/sunny2022da/reth.git", rev = "17b0d1", features = [
     "test-utils",
 ] }
-reth-rpc-eth-api = { git = "https://github.com/sunny2022da/reth.git", rev = "3ef2aef" }
-reth-rpc-engine-api = { git = "https://github.com/sunny2022da/reth.git", rev = "3ef2aef" }
-reth-tracing = { git = "https://github.com/sunny2022da/reth.git", rev = "3ef2aef" }
-reth-trie-common = { git = "https://github.com/sunny2022da/reth.git", rev = "3ef2aef" }
-reth-trie-db = { git = "https://github.com/sunny2022da/reth.git", rev = "3ef2aef" }
+reth-rpc-eth-api = { git = "https://github.com/sunny2022da/reth.git", rev = "17b0d1" }
+reth-rpc-engine-api = { git = "https://github.com/sunny2022da/reth.git", rev = "17b0d1" }
+reth-tracing = { git = "https://github.com/sunny2022da/reth.git", rev = "17b0d1" }
+reth-trie-common = { git = "https://github.com/sunny2022da/reth.git", rev = "17b0d1" }
+reth-trie-db = { git = "https://github.com/sunny2022da/reth.git", rev = "17b0d1" }
 revm = "27.0.2"
 
 # alloy dependencies
