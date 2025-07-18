@@ -50,3 +50,14 @@ This project is inspired by and builds upon the work of:
 
 - [BNB Chain Reth](https://github.com/bnb-chain/reth) - The original BSC implementation of Reth
 - The Reth team, especially [@mattsse](https://github.com/mattsse) for their invaluable contributions to the Reth ecosystem
+
+## Acknowledgements from BNBChain team
+
+This project based on the excellent community versions as foundation, We extend our sincere appreciation to the teams below:
+- [Reth-bsc](https://github.com/loocapro/reth-bsc) - The BSC Reth implementation from community
+- [Reth](https://github.com/paradigmxyz/reth) - The reth project
+- Especially thanks to:
+  - [@loocapro](https://github.com/loocapro)
+  - [@mattsse](https://github.com/mattsse)
+  - [@klkvr](https://github.com/klkvr)
+  - All contributors on reth and reth-bsc
