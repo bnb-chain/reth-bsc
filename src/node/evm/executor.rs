@@ -1,4 +1,4 @@
-use super::patch::{patch_mainnet_after_tx, patch_mainnet_before_tx};
+use super::patch::{patch_mainnet_after_tx, patch_mainnet_before_tx, patch_chapel_after_tx, patch_chapel_before_tx};
 use crate::{
     consensus::{MAX_SYSTEM_REWARD, SYSTEM_ADDRESS, SYSTEM_REWARD_PERCENT},
     evm::transaction::BscTxEnv,
@@ -272,6 +272,29 @@ where
         Ok(())
     }
 
+     /// Handle update validatorsetv2 system tx.
+     /// Activated by <https://github.com/bnb-chain/BEPs/pull/294>
+    fn handle_update_validator_set_v2_tx(&mut self, tx: &TransactionSigned) -> Result<(), BlockExecutionError> {
+        sol!(
+            function updateValidatorSetV2(
+                address[] _consensusAddrs,
+                uint64[] _votingPowers,
+                bytes[] _voteAddrs
+            );
+        );
+
+        let input = tx.input();
+        let is_update_validator_set_v2_tx =
+            input.len() >= 4 && input[..4] == updateValidatorSetV2Call::SELECTOR;
+
+        if is_update_validator_set_v2_tx {
+            let signer = tx.recover_signer().map_err(BlockExecutionError::other)?;
+            self.transact_system_tx(tx, signer)?;
+        }
+
+        Ok(())
+    }
+
     /// Distributes block rewards to the validator.
     fn distribute_block_rewards(&mut self, validator: Address) -> Result<(), BlockExecutionError> {
         let system_account = self
@@ -384,6 +407,7 @@ where
 
         // apply patches before
         patch_mainnet_before_tx(tx.tx(), self.evm.db_mut())?;
+        patch_chapel_before_tx(tx.tx(), self.evm.db_mut())?;
 
         let block_available_gas = self.evm.block().gas_limit - self.gas_used;
         if tx.tx().gas_limit() > block_available_gas {
@@ -414,6 +438,7 @@ where
 
         // apply patches after
         patch_mainnet_after_tx(tx.tx(), self.evm.db_mut())?;
+        patch_chapel_after_tx(tx.tx(), self.evm.db_mut())?;
 
         Ok(gas_used)
     }
@@ -455,9 +480,14 @@ where
             }
         }
 
+        // TODO: add breathe check and polish it later.
+        let system_txs_v2 = self.system_txs.clone();
+        for tx in &system_txs_v2 {
+            self.handle_update_validator_set_v2_tx(tx)?;
+        }
+
         // TODO:
         // Consensus: Slash validator if not in turn
-        // Consensus: Update validator set
 
         Ok((
             self.evm,
