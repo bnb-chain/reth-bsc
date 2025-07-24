@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::{
-    node::{rpc::engine_api::payload::BscPayloadTypes, BscNode},
+    node::{engine_api::payload::BscPayloadTypes, BscNode},
     BscBlock, BscPrimitives,
 };
 use alloy_eips::eip7685::Requests;

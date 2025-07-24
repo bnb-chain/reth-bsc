@@ -1,4 +1,6 @@
-use super::patch::{patch_mainnet_after_tx, patch_mainnet_before_tx, patch_chapel_after_tx, patch_chapel_before_tx};
+use super::patch::{
+    patch_chapel_after_tx, patch_chapel_before_tx, patch_mainnet_after_tx, patch_mainnet_before_tx,
+};
 use crate::{
     consensus::{MAX_SYSTEM_REWARD, SYSTEM_ADDRESS, SYSTEM_REWARD_PERCENT},
     evm::transaction::BscTxEnv,
@@ -272,9 +274,12 @@ where
         Ok(())
     }
 
-     /// Handle update validatorsetv2 system tx.
-     /// Activated by <https://github.com/bnb-chain/BEPs/pull/294>
-    fn handle_update_validator_set_v2_tx(&mut self, tx: &TransactionSigned) -> Result<(), BlockExecutionError> {
+    /// Handle update validatorsetv2 system tx.
+    /// Activated by <https://github.com/bnb-chain/BEPs/pull/294>
+    fn handle_update_validator_set_v2_tx(
+        &mut self,
+        tx: &TransactionSigned,
+    ) -> Result<(), BlockExecutionError> {
         sol!(
             function updateValidatorSetV2(
                 address[] _consensusAddrs,

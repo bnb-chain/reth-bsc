@@ -594,8 +594,6 @@ static MAINNET_PATCHES_AFTER_TX: LazyLock<HashMap<B256, StoragePatch>> = LazyLoc
             },
         ),
     ])
-
-    
 });
 
 /// Applies storage patches to the state before a transaction is executed for Chapel testnet.

@@ -1,7 +1,7 @@
 use super::handle::ImportHandle;
 use crate::{
     consensus::{ParliaConsensus, ParliaConsensusErr},
-    node::{network::BscNewBlock, rpc::engine_api::payload::BscPayloadTypes},
+    node::{engine_api::payload::BscPayloadTypes, network::BscNewBlock},
     BscBlock, BscBlockBody,
 };
 use alloy_consensus::{BlockBody, Header};

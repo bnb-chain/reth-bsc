@@ -2,9 +2,9 @@
 use crate::{
     consensus::ParliaConsensus,
     node::{
+        engine_api::payload::BscPayloadTypes,
         network::block_import::{handle::ImportHandle, service::ImportService, BscBlockImport},
         primitives::{BscBlobTransactionSidecar, BscPrimitives},
-        rpc::engine_api::payload::BscPayloadTypes,
         BscNode,
     },
     BscBlock,

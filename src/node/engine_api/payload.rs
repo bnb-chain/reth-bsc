@@ -1,4 +1,4 @@
-use crate::node::{engine::BscBuiltPayload, rpc::engine_api::validator::BscExecutionData};
+use crate::node::{engine::BscBuiltPayload, engine_api::validator::BscExecutionData};
 use reth::{
     payload::EthPayloadBuilderAttributes,
     primitives::{NodePrimitives, SealedBlock},

@@ -1,8 +1,7 @@
 #![allow(missing_docs)]
 //! Credits to <https://github.com/bnb-chain/reth/blob/main/crates/bsc/primitives/src/system_contracts/mod.rs>
 use crate::{
-    chainspec::bsc::bsc_mainnet,
-    chainspec::bsc_chapel::bsc_testnet,
+    chainspec::{bsc::bsc_mainnet, bsc_chapel::bsc_testnet},
     hardforks::{bsc::BscHardfork, BscHardforks},
 };
 use abi::{STAKE_HUB_ABI, VALIDATOR_SET_ABI};
@@ -386,8 +385,8 @@ where
 {
     let mut m = HashMap::new();
     for (fork, condition) in spec.forks_iter() {
-        if condition.transitions_at_block(block_number)
-            || condition.transitions_at_timestamp(block_time, parent_block_time)
+        if condition.transitions_at_block(block_number) ||
+            condition.transitions_at_timestamp(block_time, parent_block_time)
         {
             if let Ok(contracts) = get_system_contract_codes(spec, fork.name()) {
                 for (address, v) in &contracts {
