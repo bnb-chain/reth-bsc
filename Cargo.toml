@@ -45,6 +45,7 @@ reth-rpc-engine-api = { git = "https://github.com/paradigmxyz/reth", rev = "7b76
 reth-tracing = { git = "https://github.com/paradigmxyz/reth", rev = "7b76a1e" }
 reth-trie-common = { git = "https://github.com/paradigmxyz/reth", rev = "7b76a1e" }
 reth-trie-db = { git = "https://github.com/paradigmxyz/reth", rev = "7b76a1e" }
+reth-trie = { git = "https://github.com/paradigmxyz/reth", rev = "7b76a1e" }
 revm = "27.0.2"
 
 # alloy dependencies

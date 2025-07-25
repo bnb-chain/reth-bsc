@@ -26,6 +26,7 @@ pub mod config;
 mod executor;
 mod factory;
 mod patch;
+mod prefetch;
 
 impl<DB, I> Evm for BscEvm<DB, I>
 where
