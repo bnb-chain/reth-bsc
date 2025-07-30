@@ -12,7 +12,7 @@ use crate::{
 };
 use alloy_consensus::{Transaction, TxReceipt};
 use alloy_eips::{eip7685::Requests, Encodable2718};
-use alloy_evm::{block::ExecutableTx, eth::receipt_builder::ReceiptBuilderCtx};
+use alloy_evm::{block::{ExecutableTx, StateChangeSource}, eth::receipt_builder::ReceiptBuilderCtx};
 use alloy_primitives::{uint, Address, TxKind, U256};
 use alloy_sol_macro::sol;
 use alloy_sol_types::SolCall;
@@ -56,6 +56,8 @@ where
     system_contracts: SystemContract<Spec>,
     /// Context for block execution.
     _ctx: EthBlockExecutionCtx<'a>,
+    /// state hook
+    hook: Option<Box<dyn OnStateHook>>,
 }
 
 impl<'a, DB, EVM, Spec, R: ReceiptBuilder> BscBlockExecutor<'a, EVM, Spec, R>
@@ -91,6 +93,7 @@ where
             receipt_builder,
             system_contracts,
             _ctx,
+            hook: None,
         }
     }
 
@@ -195,6 +198,10 @@ where
         let result_and_state = self.evm.transact(tx_env).map_err(BlockExecutionError::other)?;
 
         let ResultAndState { result, state } = result_and_state;
+
+        if let Some(hook) = &mut self.hook {
+            hook.on_state(StateChangeSource::Transaction(self.receipts.len()), &state);
+        } 
 
         let tx = tx.clone();
         let gas_used = result.gas_used();
@@ -430,6 +437,11 @@ where
 
         f(&result);
 
+        // Call state hook if it exists, passing the evmstate
+        if let Some(hook) = &mut self.hook {
+            hook.on_state(StateChangeSource::Transaction(self.receipts.len()), &state);
+        }
+
         let gas_used = result.gas_used();
         self.gas_used += gas_used;
         self.receipts.push(self.receipt_builder.build_receipt(ReceiptBuilderCtx {
@@ -504,7 +516,9 @@ where
         ))
     }
 
-    fn set_state_hook(&mut self, _hook: Option<Box<dyn OnStateHook>>) {}
+    fn set_state_hook(&mut self, _hook: Option<Box<dyn OnStateHook>>) {
+        self.hook = _hook;
+    }
 
     fn evm_mut(&mut self) -> &mut Self::Evm {
         &mut self.evm
