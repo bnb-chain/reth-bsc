@@ -439,7 +439,9 @@ where
 
         // Call state hook if it exists, passing the evmstate
         if let Some(hook) = &mut self.hook {
-            hook.on_state(StateChangeSource::Transaction(self.receipts.len()), &state);
+            let mut temp_state = state.clone();
+            temp_state.remove(&SYSTEM_ADDRESS);
+            hook.on_state(StateChangeSource::Transaction(self.receipts.len()), &temp_state);
         }
 
         let gas_used = result.gas_used();
