@@ -155,15 +155,19 @@ where
 
     /// Add a new block import task to the pending imports
     fn on_new_block(&mut self, block: BlockMsg, peer_id: PeerId) {
-        if self.processed_blocks.contains(&block.hash) {
-            return;
-        }
+        // When simulating live sync on historical blocks, the consensus engine must be prevented from accepting new blocks.
+        // This is achieved here by returning early.
+        return;
 
-        let payload_fut = self.new_payload(block.clone(), peer_id);
-        self.pending_imports.push(payload_fut);
+        // if self.processed_blocks.contains(&block.hash) {
+        //     return;
+        // }
 
-        let fcu_fut = self.update_fork_choice(block, peer_id);
-        self.pending_imports.push(fcu_fut);
+        // let payload_fut = self.new_payload(block.clone(), peer_id);
+        // self.pending_imports.push(payload_fut);
+
+        // let fcu_fut = self.update_fork_choice(block, peer_id);
+        // self.pending_imports.push(fcu_fut);
     }
 }
 
