@@ -188,7 +188,7 @@ impl<DB: Database + 'static> SnapshotProvider for EnhancedDbSnapshotProvider<DB>
         { // fast path query.
             let mut cache_guard = self.base.cache.write();
             if let Some(cached_snap) = cache_guard.get(&block_number) {
-                tracing::debug!("Succeed to query snapshot from cache, request {} -> found snapshot for block {}", block_number, cached_snap.block_number);
+                tracing::trace!("Succeed to query snapshot from cache, request {} -> found snapshot for block {}", block_number, cached_snap.block_number);
                 return Some(cached_snap.clone());
             }
         }
@@ -248,7 +248,7 @@ impl<DB: Database + 'static> SnapshotProvider for EnhancedDbSnapshotProvider<DB>
 
         headers_to_apply.reverse();
         let mut working_snapshot = base_snapshot;
-        tracing::info!("Start to apply headers to base snapshot, base_snapshot: {:?}, target_snapshot: {}, apply_length: {}", 
+        tracing::trace!("Start to apply headers to base snapshot, base_snapshot: {:?}, target_snapshot: {}, apply_length: {}",
             working_snapshot.block_number, block_number, headers_to_apply.len());
 
         for (_index, header) in headers_to_apply.iter().enumerate() {

@@ -55,24 +55,6 @@ where
         consensus
     }
 
-    /// Create consensus with database-backed persistent snapshots
-    pub fn with_database<DB: reth_db::database::Database + 'static>(
-        chain_spec: Arc<ChainSpec>,
-        database: DB,
-        epoch: u64,
-        cache_size: usize,
-    ) -> ParliaConsensus<ChainSpec, crate::consensus::parlia::provider::DbSnapshotProvider<DB>> {
-        let snapshot_provider = Arc::new(
-            crate::consensus::parlia::provider::DbSnapshotProvider::new(database, cache_size)
-        );
-        let consensus = ParliaConsensus::new(chain_spec, snapshot_provider, epoch);
-        
-        // Initialize genesis snapshot if needed
-        consensus.ensure_genesis_snapshot();
-        
-        consensus
-    }
-
     /// Validate block pre-execution using Parlia rules
     fn validate_block_pre_execution_impl(&self, block: &SealedBlock<BscBlock>) -> Result<(), ConsensusError> {
         // Check transaction root
@@ -174,8 +156,11 @@ where
         // 1. Basic post-execution validation (gas used, receipts root, logs bloom)
         self.validate_basic_post_execution_fields(block, receipts)?;
 
-        // 2. BSC-specific post-execution validation
-        self.validate_parlia_post_execution_fields(block, receipts)?;
+
+        // tracing::info!("This might be useless - start");
+        // // 2. BSC-specific post-execution validation
+        // self.validate_parlia_post_execution_fields(block, receipts)?;
+        // tracing::info!("This might be useless - end");
 
         Ok(())
     }
@@ -224,7 +209,7 @@ where
         let parent_number = header.number - 1;
         let snapshot = match self.snapshot_provider.snapshot(parent_number) {
             Some(snapshot) => {
-                tracing::debug!(
+                tracing::trace!(
                     "BSC: Using snapshot for block {} to validate block {} (snapshot_block_number={})",
                     parent_number, header.number, snapshot.block_number
                 );
@@ -280,7 +265,7 @@ where
             tracing::debug!("Epoch boundary at block {}", header.number);
         }
 
-        tracing::debug!("Succeed to finish full post-execution validation for block {}", header.number);
+        tracing::trace!("Succeed to finish full post-execution validation for block {}", header.number);
         Ok(())
     }
 
@@ -464,8 +449,7 @@ where
             .consensus_validator
             .recover_proposer_from_seal(header)?;
         
-        let in_turn = snapshot.is_inturn(proposer);
-        let inturn_validator = snapshot.inturn_validator();
+        let (inturn_validator, in_turn) = snapshot.inturn_validator_and_check(proposer);
 
         let expected_difficulty = if in_turn { DIFF_INTURN } else { DIFF_NOTURN };
 

@@ -217,7 +217,6 @@ mod tests {
         let snapshot_provider = Arc::new(EnhancedDbSnapshotProvider::new(
             db.clone(),
             2048,
-            header_provider,
             chain_spec,
         ));
         

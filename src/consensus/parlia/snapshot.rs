@@ -63,6 +63,10 @@ pub struct Snapshot {
 
     /// Expected block interval in milliseconds.
     pub block_interval: u64,
+
+    /// Cached inturn validator result to avoid redundant calculations
+    #[serde(skip)]
+    cached_inturn_validator: std::sync::OnceLock<Address>,
 }
 
 impl Snapshot {
@@ -111,6 +115,7 @@ impl Snapshot {
             vote_data: Default::default(),
             turn_length: Some(DEFAULT_TURN_LENGTH),
             block_interval: DEFAULT_BLOCK_INTERVAL,
+            cached_inturn_validator: std::sync::OnceLock::new(),
         }
     }
 
@@ -262,13 +267,12 @@ impl Snapshot {
 
     /// Returns `true` if `proposer` is in-turn according to snapshot rules.
     pub fn is_inturn(&self, proposer: Address) -> bool { 
-        let inturn_val = self.inturn_validator();
-        let is_inturn = inturn_val == proposer;
+        let (_inturn_val, is_inturn) = self.inturn_validator_and_check(proposer);
         
         if !is_inturn {
             tracing::debug!(
                 "🎯 [BSC] is_inturn check: proposer=0x{:x}, inturn_validator=0x{:x}, is_inturn={}, validators={:?}",
-                proposer, inturn_val, is_inturn, self.validators
+                proposer, _inturn_val, is_inturn, self.validators
             );
         }
         
@@ -282,18 +286,28 @@ impl Snapshot {
     }
 
     /// Validator that should propose the **next** block.
+    /// Uses caching to avoid redundant calculations during block execution.
     pub fn inturn_validator(&self) -> Address {
-        let turn_length = u64::from(self.turn_length.unwrap_or(DEFAULT_TURN_LENGTH));
-        let next_block = self.block_number + 1;
-        let offset = (next_block / turn_length) as usize % self.validators.len();
-        let next_validator = self.validators[offset];
-        
-        tracing::debug!(
-            "inturn_validator debug info, snapshot_block={}, next_block={}, turn_length={}, offset={}, validators_len={}, next_validator=0x{:x}",
-            self.block_number, next_block, turn_length, offset, self.validators.len(), next_validator
-        );
-        
-        next_validator
+        *self.cached_inturn_validator.get_or_init(|| {
+            let turn_length = u64::from(self.turn_length.unwrap_or(DEFAULT_TURN_LENGTH));
+            let next_block = self.block_number + 1;
+            let offset = (next_block / turn_length) as usize % self.validators.len();
+            let next_validator = self.validators[offset];
+            
+            tracing::trace!(
+                "inturn_validator debug info, snapshot_block={}, next_block={}, turn_length={}, offset={}, validators_len={}, next_validator=0x{:x}",
+                self.block_number, next_block, turn_length, offset, self.validators.len(), next_validator
+            );
+            
+            next_validator
+        })
+    }
+
+    /// Optimized version that returns both the validator and whether the proposer is in-turn.
+    /// This avoids calling inturn_validator() twice when both values are needed.
+    pub fn inturn_validator_and_check(&self, proposer: Address) -> (Address, bool) {
+        let inturn_val = self.inturn_validator();
+        (inturn_val, inturn_val == proposer)
     }
 
     /// Returns index in `validators` for `validator` if present.

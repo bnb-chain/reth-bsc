@@ -46,11 +46,11 @@ impl HeaderCacheReader {
 
     pub fn get_header_by_number(&mut self, block_number: u64) -> Option<Header> {
         if let Some(header) = self.blocknumber_to_header.get(&block_number) {
-            tracing::info!("Get header from cache, block_number: {:?}", header.number());
+            tracing::trace!("Get header from cache, block_number: {:?}", header.number());
             return Some(header.clone());
         }
         if let Some(header) = crate::shared::get_header_by_number_from_provider(block_number) {
-            tracing::info!("Get header from provider, block_number: {:?}", header.number());
+            tracing::trace!("Get header from provider, block_number: {:?}", header.number());
             return Some(header);
         }
 
@@ -75,7 +75,25 @@ impl HeaderCacheReader {
         let header_clone_for_log = header.clone();
         self.blocknumber_to_header.insert(block_number, header.clone());
         self.blockhash_to_header.insert(block_hash, header);
-        tracing::info!("Insert header to cache, block_number: {:?}, block_hash: {:?}, header: {:?}", block_number, block_hash, header_clone_for_log);
+        tracing::trace!("Insert header to cache, block_number: {:?}, block_hash: {:?}, header: {:?}", block_number, block_hash, header_clone_for_log);
+    }
+
+    /// Get multiple headers in a single lock acquisition for better performance
+    pub fn get_headers_batch(&mut self, block_numbers: &[u64]) -> Vec<Option<Header>> {
+        block_numbers.iter().map(|&block_number| {
+            if let Some(header) = self.blocknumber_to_header.get(&block_number) {
+                tracing::trace!("Get header from cache, block_number: {}", header.number());
+                Some(header.clone())
+            } else if let Some(header) = crate::shared::get_header_by_number_from_provider(block_number) {
+                tracing::trace!("Get header from provider, block_number: {}", header.number());
+                // Cache the retrieved header for future use
+                self.blocknumber_to_header.insert(block_number, header.clone());
+                Some(header)
+            } else {
+                tracing::warn!("Failed to get header from cache and provider, block_number: {}", block_number);
+                None
+            }
+        }).collect()
     }
 }
 

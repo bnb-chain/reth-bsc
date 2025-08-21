@@ -38,7 +38,7 @@ where
     /// finalize the new block, post check and finalize the system tx.
     /// depends on parlia, header and snapshot.
     pub(crate) fn finalize_new_block(&mut self, block: &BlockEnv) -> Result<(), BlockExecutionError> {
-        tracing::info!("Start to finalize new block, block_number: {}", block.number); 
+        tracing::trace!("Start to finalize new block, block_number: {}", block.number);
         self.verify_validators(self.inner_ctx.current_validators.clone(), self.inner_ctx.header.clone())?;
         self.verify_turn_length(self.inner_ctx.snap.clone(), self.inner_ctx.header.clone())?;
 
@@ -93,7 +93,7 @@ where
             return Err(BscBlockExecutionError::UnexpectedSystemTx.into());
         }
 
-        tracing::info!("Succeed to finalize new block, block_number: {}", block.number);
+        tracing::trace!("Succeed to finalize new block, block_number: {}", block.number);
         Ok(())
     }
 
@@ -101,7 +101,7 @@ where
         let header_ref = header.as_ref().unwrap();
         let epoch_length = self.parlia_consensus.as_ref().unwrap().get_epoch_length(header_ref);
         if header_ref.number % epoch_length != 0 {
-            tracing::info!("Skip verify validator, block_number {} is not an epoch boundary, epoch_length: {}", header_ref.number, epoch_length);
+            tracing::trace!("Skip verify validator, block_number {} is not an epoch boundary, epoch_length: {}", header_ref.number, epoch_length);
             return Ok(());
         }
 
@@ -147,7 +147,7 @@ where
             parlia.get_epoch_length(header_ref)
         };
         if header_ref.number % epoch_length != 0 || !self.spec.is_bohr_active_at_timestamp(header_ref.timestamp) {
-            tracing::info!("Skip verify turn length, block_number {} is not an epoch boundary, epoch_length: {}", header_ref.number, epoch_length);
+            tracing::trace!("Skip verify turn length, block_number {} is not an epoch boundary, epoch_length: {}", header_ref.number, epoch_length);
             return Ok(());
         }
         let turn_length_from_header = {
@@ -310,7 +310,7 @@ where
             if reward_to_system > 0 {
                 let tx = self.system_contracts.distribute_to_system(reward_to_system);
                 self.transact_system_tx(tx, validator)?;
-                tracing::info!("Distribute to system, block_number: {}, reward_to_system: {}", self.evm.block().number, reward_to_system);
+                tracing::trace!("Distribute to system, block_number: {}, reward_to_system: {}", self.evm.block().number, reward_to_system);
             }
 
             block_reward -= reward_to_system;
@@ -318,7 +318,7 @@ where
 
         let tx = self.system_contracts.distribute_to_validator(validator, block_reward);
         self.transact_system_tx(tx, validator)?;
-        tracing::info!("Distribute to validator, block_number: {}, block_reward: {}", self.evm.block().number, block_reward);
+        tracing::trace!("Distribute to validator, block_number: {}, block_reward: {}", self.evm.block().number, block_reward);
         
         Ok(())
     }

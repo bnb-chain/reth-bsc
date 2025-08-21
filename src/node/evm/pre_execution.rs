@@ -35,19 +35,19 @@ where
     /// depends on parlia, header and snapshot.
     pub(crate) fn check_new_block(&mut self, block: &BlockEnv) -> Result<(), BlockExecutionError> {
         let block_number = block.number.to::<u64>();
-        tracing::info!("Check new block, block_number: {}", block_number);
+        tracing::trace!("Check new block, block_number: {}", block_number);
 
-        let header = crate::node::evm::util::HEADER_CACHE_READER
-            .lock()
-            .unwrap()
-            .get_header_by_number(block_number)
+        // Batch header retrieval in single lock acquisition for better performance
+        let headers = {
+            let mut cache = crate::node::evm::util::HEADER_CACHE_READER.lock().unwrap();
+            cache.get_headers_batch(&[block_number, block_number - 1])
+        };
+        
+        let header = headers[0].clone()
             .ok_or(BlockExecutionError::msg("Failed to get header from global header reader"))?;
         self.inner_ctx.header = Some(header.clone());
 
-        let parent_header = crate::node::evm::util::HEADER_CACHE_READER
-            .lock()
-            .unwrap()
-            .get_header_by_number(block_number - 1)
+        let parent_header = headers[1].clone()
             .ok_or(BlockExecutionError::msg("Failed to get parent header from global header reader"))?;
         self.inner_ctx.parent_header = Some(parent_header.clone());
 

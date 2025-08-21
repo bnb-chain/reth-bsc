@@ -115,7 +115,7 @@ where
         // Determine if this is mainnet for Hertz patches
         let is_mainnet = spec.chain().id() == 56; // BSC mainnet chain ID
         let hertz_patch_manager = HertzPatchManager::new(is_mainnet);
-        tracing::info!("Succeed to new block executor, header: {:?}", ctx.header);
+        tracing::trace!("Succeed to new block executor, header: {:?}", ctx.header);
 
         if let Some(ref header) = ctx.header {
             crate::node::evm::util::HEADER_CACHE_READER.lock().unwrap().insert_header_to_cache(header.clone());
