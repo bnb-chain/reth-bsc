@@ -6,7 +6,7 @@ use crate::chainspec::BscChainSpec;
 
 use crate::consensus::parlia::{Parlia, VoteAddress};
 use crate::node::evm::error::BscBlockExecutionError;
-use alloy_primitives::Address;
+use alloy_primitives::{Address, B256};
 
 /// Validator information extracted from header
 #[derive(Debug, Clone)]
@@ -32,6 +32,10 @@ pub trait SnapshotProvider: Send + Sync {
     
     /// Returns the header for the given `block_number`.
     fn get_header(&self, block_number: u64) -> Option<alloy_consensus::Header>;
+
+    fn get_header_by_hash(&self, _hash: &B256) -> Option<alloy_consensus::Header> {
+        None
+    }
 }
 
 /// `DbSnapshotProvider` wraps an MDBX database; it keeps a small in-memory LRU to avoid hitting
@@ -326,6 +330,12 @@ impl<DB: Database + 'static> SnapshotProvider for EnhancedDbSnapshotProvider<DB>
     fn get_header(&self, block_number: u64) -> Option<alloy_consensus::Header> {
         let header = crate::node::evm::util::HEADER_CACHE_READER.lock().unwrap().get_header_by_number(block_number);
         tracing::info!("Succeed to fetch header, is_none: {} for block {} in enhanced snapshot provider", header.is_none(), block_number);
+        header
+    }
+
+    fn get_header_by_hash(&self, block_hash: &B256) -> Option<alloy_consensus::Header> {
+        let header = crate::node::evm::util::HEADER_CACHE_READER.lock().unwrap().get_header_by_hash(block_hash);
+        tracing::info!("Succeed to fetch header, is_none: {} for block {} in enhanced snapshot provider", header.is_none(), block_hash);
         header
     }
 }

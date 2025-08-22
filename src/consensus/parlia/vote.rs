@@ -70,4 +70,13 @@ impl VoteAttestation {
     pub fn decode_rlp(bytes: &[u8]) -> alloy_rlp::Result<Self> {
         Self::decode(&mut &*bytes)
     }
-} 
+
+    pub fn new_with_vote_data(data: VoteData) -> Self {
+        Self {
+            vote_address_set: ValidatorsBitSet::default(),
+            agg_signature: VoteSignature::default(),
+            data,
+            extra: Bytes::default(),
+        }
+    }
+}

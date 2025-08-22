@@ -9387,6 +9387,7 @@ dependencies = [
  "parking_lot",
  "phf",
  "prost 0.12.6",
+ "rand 0.9.2",
  "reth",
  "reth-basic-payload-builder",
  "reth-chainspec",
