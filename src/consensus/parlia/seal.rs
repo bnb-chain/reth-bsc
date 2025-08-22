@@ -3,7 +3,7 @@ use super::{
     VoteSignature,
 };
 use crate::{hardforks::BscHardforks, BscBlock};
-use alloy_consensus::{BlockHeader, Header, SignableTransaction};
+use alloy_consensus::{BlockHeader, Header};
 use alloy_primitives::{
     map::foldhash::{HashSet, HashSetExt},
     Address, Bytes, B256,
