@@ -1,15 +1,17 @@
+pub mod error;
+pub mod util;
+
 use crate::{
     evm::{
         api::{BscContext, BscEvm},
         transaction::BscTxEnv,
     },
     hardforks::bsc::BscHardfork,
-    node::BscNode,
 };
 use alloy_primitives::{Address, Bytes};
-use config::BscEvmConfig;
+
 use reth::{
-    api::FullNodeTypes,
+    api::{FullNodeTypes, NodeTypes},
     builder::{components::ExecutorBuilder, BuilderContext},
 };
 use reth_evm::{precompiles::PrecompilesMap, Database, Evm, EvmEnv};
@@ -23,7 +25,10 @@ use revm::{
 
 mod assembler;
 pub mod config;
+pub use config::BscEvmConfig;
 mod executor;
+mod pre_execution;
+mod post_execution;
 mod factory;
 mod patch;
 
@@ -120,7 +125,8 @@ pub struct BscExecutorBuilder;
 
 impl<Node> ExecutorBuilder<Node> for BscExecutorBuilder
 where
-    Node: FullNodeTypes<Types = BscNode>,
+    Node: FullNodeTypes,
+    Node::Types: NodeTypes<Primitives = crate::node::primitives::BscPrimitives, ChainSpec = crate::chainspec::BscChainSpec, Payload = crate::node::engine_api::payload::BscPayloadTypes, StateCommitment = reth_trie_db::MerklePatriciaTrie, Storage = crate::node::storage::BscStorage>,
 {
     type EVM = BscEvmConfig;
 
