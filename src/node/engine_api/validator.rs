@@ -1,7 +1,10 @@
+use super::payload::BscPayloadTypes;
+use crate::consensus::parlia::seal::{default_sign_fn, SealBlock};
+use crate::shared::get_snapshot_provider;
 use crate::{chainspec::BscChainSpec, hardforks::BscHardforks, BscBlock, BscPrimitives};
 use alloy_consensus::BlockHeader;
 use alloy_eips::eip4895::Withdrawal;
-use alloy_primitives::B256;
+use alloy_primitives::{Address, B256};
 use alloy_rpc_types_engine::PayloadError;
 use reth::{
     api::{FullNodeComponents, NodeTypes},
@@ -11,15 +14,13 @@ use reth::{
     },
     consensus::ConsensusError,
 };
+use reth_chainspec::EthChainSpec;
 use reth_engine_primitives::{ExecutionPayload, PayloadValidator};
 use reth_payload_primitives::NewPayloadError;
 use reth_primitives::{RecoveredBlock, SealedBlock};
-use reth_primitives_traits::Block as _;
 use reth_trie_common::HashedPostState;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-
-use super::payload::BscPayloadTypes;
 
 #[derive(Debug, Default, Clone)]
 #[non_exhaustive]
@@ -118,18 +119,31 @@ pub struct BscExecutionPayloadValidator<ChainSpec> {
 
 impl<ChainSpec> BscExecutionPayloadValidator<ChainSpec>
 where
-    ChainSpec: BscHardforks,
+    ChainSpec: EthChainSpec + BscHardforks,
 {
     pub fn ensure_well_formed_payload(
         &self,
         payload: BscExecutionData,
-    ) -> Result<SealedBlock<BscBlock>, PayloadError> {
+    ) -> Result<SealedBlock<BscBlock>, NewPayloadError> {
         let block = payload.0;
 
-        let expected_hash = block.header.hash_slow();
+        let snapshot_provider = if let Some(provider) = get_snapshot_provider() {
+            provider.clone()
+        } else {
+            tracing::error!("Failed to register Parlia RPC due to can not get snapshot provider");
+            return Err(NewPayloadError::Other(Box::from("Failed to get snapshot provider")))
+        };
 
-        // First parse the block
-        let sealed_block = block.seal_slow();
+        let validator_address = Address::default();
+        let seal_block_gen = SealBlock::new_with_sign_fn(
+            snapshot_provider,
+            self.inner.clone(),
+            validator_address,
+            default_sign_fn,
+        );
+
+        let expected_hash = block.header.hash_slow();
+        let sealed_block = seal_block_gen.seal(block).map_err(NewPayloadError::other)?;
 
         // Ensure the hash included in the payload matches the block hash
         if expected_hash != sealed_block.hash() {

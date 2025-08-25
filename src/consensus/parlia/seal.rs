@@ -1,7 +1,9 @@
 use super::{
-    constants::*, Snapshot, SnapshotProvider, VoteAddress, VoteAttestation, VoteData, VoteEnvelope,
+    constants::{DIFF_NOTURN, EXTRA_SEAL_LEN},
+    Snapshot, SnapshotProvider, VoteAddress, VoteAttestation, VoteData, VoteEnvelope,
     VoteSignature,
 };
+use crate::consensus::parlia::util::encode_header_with_chain_id;
 use crate::{hardforks::BscHardforks, BscBlock};
 use alloy_consensus::{BlockHeader, Header};
 use alloy_primitives::{
@@ -9,37 +11,42 @@ use alloy_primitives::{
     Address, Bytes, B256,
 };
 use blst::min_pk::{AggregateSignature, Signature as blsSignature};
+use bytes::BytesMut;
 use rand::Rng;
 use reth::consensus::ConsensusError;
 use reth_chainspec::EthChainSpec;
+use reth_primitives::SealedBlock;
 use reth_primitives_traits::{Block, SealedHeader};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 type SignFnPtr = fn(Address, &str, &[u8]) -> Result<[u8; 65], ConsensusError>;
-// type SignTxFnPtr = fn(Address, &mut dyn SignableTransaction<Signature>, u64) -> Result<Box<dyn SignableTransaction<Signature>>, ConsensusError>;
 
-pub struct SealBlock<P, ChainSpec> {
-    snapshot_provider: P,
-    chain_spec: ChainSpec,
+pub struct SealBlock<ChainSpec> {
+    snapshot_provider: Arc<dyn SnapshotProvider + Send + Sync>,
+    chain_spec: Arc<ChainSpec>,
 
     validator_address: Address,
     sign_fn: SignFnPtr,
 }
 
-impl<P, ChainSpec> SealBlock<P, ChainSpec>
+impl<ChainSpec> SealBlock<ChainSpec>
 where
-    ChainSpec: EthChainSpec + BscHardforks + Send + Sync + 'static,
-    P: SnapshotProvider + std::fmt::Debug + Send + Sync + 'static,
+    ChainSpec: EthChainSpec + BscHardforks,
 {
     #[allow(dead_code)]
-    fn new(snapshot_provider: P, chain_spec: ChainSpec, validator_address: Address) -> Self {
+    pub(crate) fn new(
+        snapshot_provider: Arc<dyn SnapshotProvider + Send + Sync>,
+        chain_spec: Arc<ChainSpec>,
+        validator_address: Address,
+    ) -> Self {
         Self { snapshot_provider, chain_spec, validator_address, sign_fn: default_sign_fn }
     }
 
     #[allow(dead_code)]
-    fn new_with_sign_fn(
-        snapshot_provider: P,
-        chain_spec: ChainSpec,
+    pub(crate) fn new_with_sign_fn(
+        snapshot_provider: Arc<dyn SnapshotProvider + Send + Sync>,
+        chain_spec: Arc<ChainSpec>,
         validator_address: Address,
         sign_fn: SignFnPtr,
     ) -> Self {
@@ -51,12 +58,7 @@ where
         self.sign_fn = sign_fn;
     }
 
-    pub fn seal(
-        self,
-        block: &BscBlock,
-        results_sender: std::sync::mpsc::Sender<reth_primitives_traits::SealedBlock<BscBlock>>,
-        stop_receiver: std::sync::mpsc::Receiver<()>,
-    ) -> Result<(), ConsensusError> {
+    pub fn seal(self, block: BscBlock) -> Result<SealedBlock<BscBlock>, ConsensusError> {
         let header = block.header();
         if header.number == 0 {
             return Err(ConsensusError::Other(
@@ -79,7 +81,9 @@ where
 
         if snap.sign_recently(val) {
             tracing::info!("Signed recently, must wait for others");
-            return Ok(());
+            return Err(ConsensusError::Other(
+                format!("Signed recently, must wait for others, validator: {val}").into(),
+            ));
         }
 
         let delay = self.delay_for_ramanujan_fork(&snap, header);
@@ -91,98 +95,39 @@ where
             header.difficulty
         );
 
-        let block = block.clone();
+        std::thread::sleep(delay);
 
-        std::thread::spawn(move || {
-            if let Ok(()) = stop_receiver.try_recv() {
-                return;
-            } else {
-                std::thread::sleep(delay);
-            }
+        let mut header = block.header;
+        if let Err(e) = self.assemble_vote_attestation_stub(&mut header) {
+            tracing::error!(target: "parlia::seal", "Assemble vote attestation failed: {e}");
+        }
 
-            let mut header = block.header().clone();
-            if let Err(e) = self.assemble_vote_attestation_stub(&mut header) {
-                tracing::error!(target: "parlia::seal", "Assemble vote attestation failed: {e}");
-            }
-
-            match sign_fn(val, "mimetype/parlia", &[]) {
-                Ok(sig) => {
-                    let mut extra = header.extra_data.to_vec();
-                    if extra.len() >= EXTRA_SEAL_LEN {
-                        let start = extra.len() - EXTRA_SEAL_LEN;
-                        extra[start..].copy_from_slice(&sig);
-                        header.extra_data = Bytes::from(extra);
-                    } else {
-                        tracing::error!(target: "parlia::seal", "extra_data too short to insert seal");
-                    }
-                }
-                Err(e) => {
-                    tracing::debug!(target: "parlia::seal", "Sign for the block header failed when sealing, err {e}")
-                }
-            }
-
-            let option_highest_verified_header = self.get_highest_verified_header();
-
-            if self.should_wait_for_current_block_process(&header, &option_highest_verified_header)
-            {
-                let gas_used = match option_highest_verified_header {
-                    Some(h) => h.gas_used(),
-                    _ => 0,
-                };
-                let wait_process_estimate = (gas_used as f64 / 100_000_000f64).ceil();
-                tracing::info!(target: "parlia::seal", "Waiting for received in turn block to process waitProcessEstimate(Seconds) {wait_process_estimate}");
-                std::thread::sleep(Duration::from_secs(wait_process_estimate as u64));
-                if let Ok(()) = stop_receiver.try_recv() {
-                    tracing::info!(target: "parlia::seal", "Received block process finished, abort block seal");
-                    return;
-                }
-                //TODO:
-                let current_header = 0;
-                if current_header >= header.number() {
-                    tracing::info!(target: "parlia::seal", "Process backoff time exhausted, and current header has updated to abort this seal");
-                    return;
+        let mut out = BytesMut::new();
+        encode_header_with_chain_id(&header, &mut out, self.chain_spec.chain_id());
+        match sign_fn(val, "mimetype/parlia", out.iter().as_slice()) {
+            Ok(sig) => {
+                let mut extra = header.extra_data.to_vec();
+                if extra.len() >= EXTRA_SEAL_LEN {
+                    let start = extra.len() - EXTRA_SEAL_LEN;
+                    extra[start..].copy_from_slice(&sig);
+                    header.extra_data = Bytes::from(extra);
                 } else {
-                    tracing::info!(target: "parlia::seal", "Process backoff time exhausted, start to seal block");
+                    tracing::error!(target: "parlia::seal", "extra_data too short to insert seal");
                 }
             }
-
-            let _ = results_sender
-                .send(BscBlock::new_sealed(SealedHeader::new_unhashed(header), block.body));
-        });
-
-        Ok(())
-    }
-
-    fn get_highest_verified_header(&self) -> Option<alloy_consensus::Header> {
-        // TODO: latest_block_number
-        let latest_block_number: u64 = 0;
-        self.snapshot_provider.get_header(latest_block_number)
-    }
-
-    fn should_wait_for_current_block_process(
-        &self,
-        header: &Header,
-        option_highest_verified_header: &Option<alloy_consensus::Header>,
-    ) -> bool {
-        if let Some(highest_verified_header) = option_highest_verified_header {
-            if header.difficulty == alloy_primitives::U256::from(2) {
-                return false;
+            Err(e) => {
+                tracing::debug!(target: "parlia::seal", "Sign for the block header failed when sealing, err {e}")
             }
-            if header.parent_hash == highest_verified_header.parent_hash() {
-                return true;
-            }
-        };
-        false
+        }
+
+        let block_hash = header.hash_slow();
+        Ok(BscBlock::new_sealed(SealedHeader::new(header, block_hash), block.body))
     }
 
-    fn delay_for_ramanujan_fork(
-        &self,
-        snapshot: &Snapshot,
-        header: &Header,
-    ) -> std::time::Duration {
+    fn delay_for_ramanujan_fork(&self, snapshot: &Snapshot, header: &Header) -> Duration {
         let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
 
-        let mut delay = Duration::from_secs((header.timestamp as u64).saturating_sub(now_secs));
+        let mut delay = Duration::from_secs(header.timestamp().saturating_sub(now_secs));
 
         if self.chain_spec.is_ramanujan_active_at_block(header.number) {
             return delay;
@@ -202,10 +147,7 @@ where
         delay
     }
 
-    fn assemble_vote_attestation_stub(
-        &self,
-        header: &mut alloy_consensus::Header,
-    ) -> Result<(), ConsensusError> {
+    fn assemble_vote_attestation_stub(&self, header: &mut Header) -> Result<(), ConsensusError> {
         if !self.chain_spec.is_luban_active_at_block(header.number()) || header.number() < 2 {
             return Ok(());
         }
@@ -227,10 +169,7 @@ where
         let votes: Vec<VoteEnvelope> = Vec::new();
 
         let (justified_block_number, justified_block_hash) =
-            match self.get_justified_number_and_hash(&parent) {
-                Ok((a, b)) => (a, b),
-                Err(err) => return Err(err),
-            };
+            self.get_justified_number_and_hash(&parent).map_err(|e| e)?;
 
         let mut attestation = VoteAttestation::new_with_vote_data(VoteData {
             source_hash: justified_block_hash,
@@ -308,7 +247,7 @@ where
 
     fn get_justified_number_and_hash(
         &self,
-        header: &alloy_consensus::Header,
+        header: &Header,
     ) -> Result<(u64, B256), ConsensusError> {
         let snap = self
             .snapshot_provider
@@ -318,6 +257,6 @@ where
     }
 }
 
-fn default_sign_fn(_: Address, _: &str, _: &[u8]) -> Result<[u8; 65], ConsensusError> {
+pub fn default_sign_fn(_: Address, _: &str, _: &[u8]) -> Result<[u8; 65], ConsensusError> {
     Err(ConsensusError::Other("sign_fn not set".into()))
 }
