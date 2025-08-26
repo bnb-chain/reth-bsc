@@ -6,12 +6,10 @@ use super::{
 use crate::consensus::parlia::util::encode_header_with_chain_id;
 use crate::{hardforks::BscHardforks, BscBlock};
 use alloy_consensus::{BlockHeader, Header};
-use alloy_primitives::{
-    map::foldhash::{HashSet, HashSetExt},
-    Address, Bytes, B256,
-};
+use alloy_primitives::{keccak256, map::foldhash::{HashSet, HashSetExt}, Address, Bytes, B256};
 use blst::min_pk::{AggregateSignature, Signature as blsSignature};
 use bytes::BytesMut;
+use k256::ecdsa::{SigningKey, Signature, signature::Signer};
 use rand::Rng;
 use reth::consensus::ConsensusError;
 use reth_chainspec::EthChainSpec;
@@ -20,7 +18,7 @@ use reth_primitives_traits::{Block, SealedHeader};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-type SignFnPtr = fn(Address, &str, &[u8]) -> Result<[u8; 65], ConsensusError>;
+type SignFnPtr = fn(Address, &str, &[u8]) -> Result<Vec<u8>, ConsensusError>;
 
 pub struct SealBlock<ChainSpec> {
     snapshot_provider: Arc<dyn SnapshotProvider + Send + Sync>,
@@ -257,6 +255,11 @@ where
     }
 }
 
-pub fn default_sign_fn(_: Address, _: &str, _: &[u8]) -> Result<[u8; 65], ConsensusError> {
-    Err(ConsensusError::Other("sign_fn not set".into()))
+pub fn default_sign_fn(_addr: Address, _: &str, data: &[u8]) -> Result<Vec<u8>, ConsensusError> {
+    let hash = keccak256(data);
+    let private_key = &[0u8; 40]; // TODO get private key by addr
+    let signing_key = SigningKey::from_slice(private_key)
+        .map_err(|e| ConsensusError::Other(format!("invalid private key, e:{e}").into()))?;
+    let sig_result: Signature = signing_key.sign(hash.as_slice());
+    Ok(sig_result.to_bytes().to_vec())
 }

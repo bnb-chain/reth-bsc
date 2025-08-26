@@ -134,7 +134,7 @@ where
             return Err(NewPayloadError::Other(Box::from("Failed to get snapshot provider")))
         };
 
-        let validator_address = Address::default();
+        let validator_address = Address::default(); // TODO get validator_address from config
         let seal_block_gen = SealBlock::new_with_sign_fn(
             snapshot_provider,
             self.inner.clone(),

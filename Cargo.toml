@@ -111,6 +111,8 @@ cometbft-light-client = { git = "https://github.com/bnb-chain/greenfield-cometbf
 prost = { version = "0.12.6" }
 
 tendermint = { git = "https://github.com/bnb-chain/tendermint-rs-parlia", rev = "8c21ccbd58a174e07eed2c9343e63ccd00f0fbd5", features = ["secp256k1"] }
+signature = "2.2.0"
+k256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
 
 [target.'cfg(unix)'.dependencies]
 tikv-jemalloc-ctl = "0.6"
