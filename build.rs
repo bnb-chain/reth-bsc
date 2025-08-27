@@ -43,8 +43,8 @@ fn main() {
                     continue;
                 }
 
-                // Process mainnet and chapel subdirectories
-                for network in ["mainnet", "chapel"] {
+                // Process mainnet, chapel and rialto subdirectories
+                for network in ["mainnet", "chapel", "rialto"] {
                     let network_path = path.join(network);
                     if network_path.exists() {
                         if let Ok(contract_files) = fs::read_dir(&network_path) {
