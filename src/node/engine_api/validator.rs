@@ -120,12 +120,12 @@ pub struct BscExecutionPayloadValidator<ChainSpec> {
 
 impl<ChainSpec> BscExecutionPayloadValidator<ChainSpec>
 where
-    ChainSpec: EthChainSpec + BscHardforks,
+    ChainSpec: BscHardforks,
 {
     pub fn ensure_well_formed_payload(
         &self,
         payload: BscExecutionData,
-    ) -> Result<SealedBlock<BscBlock>, NewPayloadError> {
+    ) -> Result<SealedBlock<BscBlock>, PayloadError> {
         let block = payload.0;
 
         // let snapshot_provider = if let Some(provider) = get_snapshot_provider() {
