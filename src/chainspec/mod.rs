@@ -14,6 +14,7 @@ use std::{fmt::Display, sync::Arc};
 
 pub mod bsc;
 pub mod bsc_chapel;
+pub mod bsc_rialto;
 pub mod parser;
 
 pub use bsc_chapel::bsc_testnet;

@@ -160,8 +160,8 @@ impl BscHardfork {
         ])
     }
 
-    /// Bsc qa list of hardforks.
-    pub fn bsc_qa() -> ChainHardforks {
+    /// Bsc qanet list of hardforks.
+    pub fn bsc_qanet() -> ChainHardforks {
         ChainHardforks::new(vec![
             (EthereumHardfork::Frontier.boxed(), ForkCondition::Block(0)),
             (EthereumHardfork::Homestead.boxed(), ForkCondition::Block(0)),
