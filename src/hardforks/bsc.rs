@@ -199,7 +199,7 @@ impl BscHardfork {
             (EthereumHardfork::Prague.boxed(), ForkCondition::Timestamp(1754967081)),
             (Self::Pascal.boxed(), ForkCondition::Timestamp(1754967081)),
             (Self::Lorentz.boxed(), ForkCondition::Timestamp(1754967081)),
-            (Self::Maxwell.boxed(), ForkCondition::Timestamp(1754967081)),
+            (Self::Maxwell.boxed(), ForkCondition::Timestamp(1754967101)),
         ])
     }
 }
