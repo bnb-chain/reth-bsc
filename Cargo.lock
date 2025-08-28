@@ -9357,7 +9357,6 @@ dependencies = [
  "derive_more 0.99.20",
  "eyre",
  "futures",
- "hex 0.4.3",
  "jsonrpsee",
  "jsonrpsee-core",
  "jsonrpsee-types",
