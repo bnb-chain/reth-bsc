@@ -32,5 +32,5 @@ pub fn bsc_qanet() -> ChainSpec {
 
 // Dummy Head for BSC Qanet
 pub fn head() -> Head {
-    Head { number: 10000, timestamp: 1754976242, ..Default::default() }
+    Head { number: 1376256, timestamp: 1756074108, ..Default::default() }
 }
