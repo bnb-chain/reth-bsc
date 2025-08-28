@@ -150,9 +150,16 @@ impl EthExecutorSpec for BscChainSpec {
 impl BscChainSpec {
     /// Get the head information for this chain spec
     pub fn head(&self) -> Head {
-        match self.inner.chain().try_into().ok().unwrap_or(NamedChain::BinanceSmartChain) {
-            NamedChain::BinanceSmartChain => bsc::head(),
-            NamedChain::BinanceSmartChainTestnet => bsc_chapel::head(),
+        match self.inner.chain().kind() {
+            ChainKind::Named(NamedChain::BinanceSmartChain) => {
+                bsc::head()
+            }
+            ChainKind::Named(NamedChain::BinanceSmartChainTestnet) => {
+                bsc_chapel::head()
+            }
+            ChainKind::Id(714) => {
+                bsc_rialto::head()
+            }
             _ => bsc::head(),
         }
     }

@@ -1,7 +1,7 @@
 use crate::hardforks::bsc::BscHardfork;
 use alloy_primitives::{BlockHash, U256};
 use reth_chainspec::{
-    make_genesis_header, BaseFeeParams, BaseFeeParamsKind, Chain, ChainSpec,
+    make_genesis_header, BaseFeeParams, BaseFeeParamsKind, Chain, ChainSpec, Head,
 };
 use reth_primitives::SealedHeader;
 use std::str::FromStr;
@@ -28,4 +28,9 @@ pub fn bsc_qanet() -> ChainSpec {
         ),
         ..Default::default()
     }
+}
+
+// Dummy Head for BSC Qanet
+pub fn head() -> Head {
+    Head { number: 10000, timestamp: 1754976242, ..Default::default() }
 }
