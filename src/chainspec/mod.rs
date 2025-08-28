@@ -5,7 +5,7 @@ use alloy_eips::eip7840::BlobParams;
 use alloy_genesis::Genesis;
 use alloy_primitives::{Address, B256, U256};
 use reth_chainspec::{
-    BaseFeeParams, ChainSpec, DepositContract, EthChainSpec, EthereumHardfork, EthereumHardforks,
+    BaseFeeParams, ChainKind, ChainSpec, DepositContract, EthChainSpec, EthereumHardfork, EthereumHardforks,
     ForkCondition, ForkFilter, ForkId, Hardforks, Head, NamedChain,
 };
 use reth_discv4::NodeRecord;
@@ -80,12 +80,15 @@ impl EthChainSpec for BscChainSpec {
     }
 
     fn bootnodes(&self) -> Option<Vec<NodeRecord>> {
-        match self.inner.chain().try_into().ok()? {
-            NamedChain::BinanceSmartChain => {
+        match self.inner.chain().kind() {
+            ChainKind::Named(NamedChain::BinanceSmartChain) => {
                 Some(crate::node::network::bootnodes::bsc_mainnet_nodes())
             }
-            NamedChain::BinanceSmartChainTestnet => {
+            ChainKind::Named(NamedChain::BinanceSmartChainTestnet) => {
                 Some(crate::node::network::bootnodes::bsc_testnet_nodes())
+            }
+            ChainKind::Id(714) => {
+                Some(crate::node::network::bootnodes::bsc_qanet_nodes())
             }
             _ => None,
         }
