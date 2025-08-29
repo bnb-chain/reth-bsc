@@ -350,7 +350,7 @@ pub fn revm_spec_by_timestamp_and_block_number(
         BscHardfork::Maxwell
     } else if chain_spec.is_lorentz_active_at_timestamp(timestamp) {
         BscHardfork::Lorentz
-    } else if chain_spec.is_pascal_active_at_timestamp(timestamp) {
+    } else if chain_spec.is_pascal_active_at_timestamp(block_number, timestamp) {
         BscHardfork::Pascal
     } else if chain_spec.is_bohr_active_at_timestamp(timestamp) {
         BscHardfork::Bohr

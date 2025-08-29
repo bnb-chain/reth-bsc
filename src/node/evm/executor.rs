@@ -428,15 +428,21 @@ where
         // TODO: (Consensus System Call Before Execution)[https://github.com/bnb-chain/reth/blob/main/crates/bsc/evm/src/execute.rs#L678]
 
         if !self.spec.is_feynman_active_at_timestamp(self.evm.block().number.to::<u64>(), self.evm.block().timestamp.to::<u64>() - 3) {
+            println!(
+                "Feynman fork not active yet. Block number: {}, timestamp: {}, upgrading contracts",
+                self.evm.block().number.to::<u64>(),
+                self.evm.block().timestamp.to::<u64>()
+            );
             self.upgrade_contracts()?;
         }
 
 
         if self.spec.chain_id() == 714 {
-            if self.evm.block().number.to::<u64>() == 8 { // need > londonBlock
+            if self.spec.is_pascal_active_at_timestamp(self.evm.block().number.to::<u64>(), self.evm.block().timestamp.to::<u64>()) &&
+                !self.spec.is_pascal_active_at_timestamp(self.evm.block().number.to::<u64>() - 1, self.evm.block().timestamp.to::<u64>() - 3) {
                 self.apply_history_storage_account(self.evm.block().number.to::<u64>())?;
             }
-            if self.evm.block().number.to::<u64>() >= 8 {
+            if self.spec.is_pascal_active_at_timestamp(self.evm.block().number.to::<u64>(), self.evm.block().timestamp.to::<u64>()) {
                 self.system_caller
                     .apply_blockhashes_contract_call(self._ctx.parent_hash, &mut self.evm)?;
             }
