@@ -564,6 +564,7 @@ where
         {
             println!("A11");
             self.initialize_feynman_contracts(self.evm.block().beneficiary)?;
+            println!("A12");
         }
 
         let system_txs = self.system_txs.clone();
