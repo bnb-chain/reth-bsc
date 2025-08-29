@@ -537,7 +537,7 @@ where
             self.deploy_genesis_contracts(self.evm.block().beneficiary)?;
         }
 
-        if self.spec.is_feynman_active_at_timestamp(self.evm.block().number.to::<u64>(), self.evm.block().timestamp.to()) {
+        if self.spec.is_feynman_active_at_timestamp(self.evm.block().number.to::<u64>(), self.evm.block().timestamp.to::<u64>() - 3) {
             self.upgrade_contracts()?;
         }
 
