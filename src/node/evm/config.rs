@@ -162,15 +162,26 @@ where
 
     fn evm_env(&self, header: &Header) -> EvmEnv<BscHardfork> {
         let blob_params = self.chain_spec().blob_params_at_timestamp(header.timestamp);
-        let spec = revm_spec_by_timestamp_and_block_number(
-            self.chain_spec().clone(),
-            header.timestamp(),
-            header.number(),
-        );
+        let mut spec = None;
+        if self.chain_spec().chain().id() == 714 && (header.number == 6 || header.number == 7) {
+            // Compatible with incorrect fork configuration of qa net.
+            if header.number == 6 {
+                spec = Some(BscHardfork::Luban);
+            }
+            if header.number == 7 {
+                spec = Some(BscHardfork::Plato);
+            }
+        } else {
+            spec = Some(revm_spec_by_timestamp_and_block_number(
+                self.chain_spec().clone(),
+                header.timestamp(),
+                header.number(),
+            ));
+        }
 
         // configure evm env based on parent block
         let mut cfg_env =
-            CfgEnv::new().with_chain_id(self.chain_spec().chain().id()).with_spec(spec);
+            CfgEnv::new().with_chain_id(self.chain_spec().chain().id()).with_spec(spec.unwrap());
 
         if let Some(blob_params) = &blob_params {
             cfg_env.set_max_blobs_per_tx(blob_params.max_blobs_per_tx);
@@ -184,7 +195,7 @@ where
                 BlobExcessGasAndPrice { excess_blob_gas, blob_gasprice }
             });
 
-        let eth_spec = SpecId::from(spec);
+        let eth_spec = SpecId::from(spec.unwrap());
 
         let block_env = BlockEnv {
             number: U256::from(header.number()),
