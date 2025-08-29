@@ -362,7 +362,7 @@ pub fn revm_spec_by_timestamp_and_block_number(
         BscHardfork::Cancun
     } else if chain_spec.is_feynman_fix_active_at_timestamp(timestamp) {
         BscHardfork::FeynmanFix
-    } else if chain_spec.is_feynman_active_at_timestamp(timestamp) {
+    } else if chain_spec.is_feynman_active_at_timestamp(block_number, timestamp) {
         BscHardfork::Feynman
     } else if chain_spec.is_kepler_active_at_timestamp(timestamp) {
         BscHardfork::Kepler

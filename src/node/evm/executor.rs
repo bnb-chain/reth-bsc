@@ -427,7 +427,7 @@ where
         // TODO: (Consensus Verify cascading fields)[https://github.com/bnb-chain/reth/blob/main/crates/bsc/evm/src/pre_execution.rs#L43]
         // TODO: (Consensus System Call Before Execution)[https://github.com/bnb-chain/reth/blob/main/crates/bsc/evm/src/execute.rs#L678]
 
-        if !self.spec.is_feynman_active_at_timestamp(self.evm.block().timestamp.to()) {
+        if !self.spec.is_feynman_active_at_timestamp(self.evm.block().number.to::<u64>(), self.evm.block().timestamp.to()) {
             self.upgrade_contracts()?;
         }
 
@@ -537,14 +537,14 @@ where
             self.deploy_genesis_contracts(self.evm.block().beneficiary)?;
         }
 
-        if self.spec.is_feynman_active_at_timestamp(self.evm.block().timestamp.to()) {
+        if self.spec.is_feynman_active_at_timestamp(self.evm.block().number.to::<u64>(), self.evm.block().timestamp.to()) {
             self.upgrade_contracts()?;
         }
 
-        if self.spec.is_feynman_active_at_timestamp(self.evm.block().timestamp.to()) &&
+        if self.spec.is_feynman_active_at_timestamp(self.evm.block().number.to::<u64>(), self.evm.block().timestamp.to()) &&
             !self
                 .spec
-                .is_feynman_active_at_timestamp(self.evm.block().timestamp.to::<u64>() - 100)
+                .is_feynman_active_at_timestamp(self.evm.block().number.to::<u64>() - 30, self.evm.block().timestamp.to::<u64>() - 90)
         {
             self.initialize_feynman_contracts(self.evm.block().beneficiary)?;
         }
