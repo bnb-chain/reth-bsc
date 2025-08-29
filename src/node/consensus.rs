@@ -71,10 +71,14 @@ impl<ChainSpec: EthChainSpec + BscHardforks> HeaderValidator for BscConsensus<Ch
             })
         }
 
-        // ensure that the blob gas fields for this block
-        if let Some(blob_params) = self.chain_spec.blob_params_at_timestamp(header.timestamp) {
-            validate_against_parent_4844(header.header(), parent.header(), blob_params)?;
+        // Compatible with incorrect configuration of qa environment.
+        if self.chain_spec.is_london_active_at_block(header.number) {
+            // ensure that the blob gas fields for this block
+            if let Some(blob_params) = self.chain_spec.blob_params_at_timestamp(header.timestamp) {
+                validate_against_parent_4844(header.header(), parent.header(), blob_params)?;
+            }
         }
+       
 
         Ok(())
     }
