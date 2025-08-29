@@ -427,7 +427,7 @@ where
         // TODO: (Consensus Verify cascading fields)[https://github.com/bnb-chain/reth/blob/main/crates/bsc/evm/src/pre_execution.rs#L43]
         // TODO: (Consensus System Call Before Execution)[https://github.com/bnb-chain/reth/blob/main/crates/bsc/evm/src/execute.rs#L678]
 
-        if !self.spec.is_feynman_active_at_timestamp(self.evm.block().number.to::<u64>(), self.evm.block().timestamp.to()) {
+        if !self.spec.is_feynman_active_at_timestamp(self.evm.block().number.to::<u64>(), self.evm.block().timestamp.to::<u64>() - 3) {
             self.upgrade_contracts()?;
         }
 
