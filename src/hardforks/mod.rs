@@ -110,7 +110,8 @@ pub trait BscHardforks: EthereumHardforks {
     }
 
     /// Convenience method to check if [`BscHardfork::Kepler`] is active at a given timestamp.
-    fn is_kepler_active_at_timestamp(&self, timestamp: u64) -> bool {
+    fn is_kepler_active_at_timestamp(&self, block_number: u64, timestamp: u64) -> bool {
+        self.is_london_active_at_block(block_number) &&
         self.bsc_fork_activation(BscHardfork::Kepler).active_at_timestamp(timestamp)
     }
 
