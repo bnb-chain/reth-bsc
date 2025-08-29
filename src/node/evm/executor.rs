@@ -544,7 +544,7 @@ where
         if self.spec.is_feynman_active_at_timestamp(self.evm.block().number.to::<u64>(), self.evm.block().timestamp.to()) &&
             !self
                 .spec
-                .is_feynman_active_at_timestamp(self.evm.block().number.to::<u64>() - 30, self.evm.block().timestamp.to::<u64>() - 90)
+                .is_feynman_active_at_timestamp(self.evm.block().number.to::<u64>() - 1, self.evm.block().timestamp.to::<u64>() - 3)
         {
             self.initialize_feynman_contracts(self.evm.block().beneficiary)?;
         }
