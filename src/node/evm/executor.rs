@@ -116,7 +116,7 @@ where
             &self.spec,
             self.evm.block().number.to(),
             self.evm.block().timestamp.to(),
-            self.evm.block().timestamp.to::<u64>() - 3_000, /* TODO: how to get parent block
+            self.evm.block().timestamp.to::<u64>() - 3, /* TODO: how to get parent block
                                                              * timestamp? */
         )
         .map_err(|_| BlockExecutionError::msg("Failed to get upgrade system contracts"))?;
