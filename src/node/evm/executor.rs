@@ -137,15 +137,15 @@ where
         beneficiary: Address,
     ) -> Result<(), BlockExecutionError> {
         // Exit early if contracts are already initialized
-        if !self
-            .evm
-            .db_mut()
-            .storage(STAKE_HUB_CONTRACT, U256::ZERO)
-            .map_err(BlockExecutionError::other)?
-            .is_zero()
-        {
-            return Ok(());
-        }
+        // if !self
+        //     .evm
+        //     .db_mut()
+        //     .storage(STAKE_HUB_CONTRACT, U256::ZERO)
+        //     .map_err(BlockExecutionError::other)?
+        //     .is_zero()
+        // {
+        //     return Ok(());
+        // }
 
         let txs = self.system_contracts.feynman_contracts_txs();
         for tx in txs {
