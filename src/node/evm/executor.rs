@@ -563,7 +563,7 @@ where
                 .is_feynman_active_at_timestamp(self.evm.block().number.to::<u64>() - 1, self.evm.block().timestamp.to::<u64>() - 3)
         {
             println!("A11");
-            self.initialize_feynman_contracts(self.evm.block().beneficiary)?;
+            // self.initialize_feynman_contracts(self.evm.block().beneficiary)?; // todo: why
             println!("A12");
         }
 
