@@ -124,6 +124,7 @@ where
         for (address, maybe_code) in contracts {
             if let Some(code) = maybe_code {
                 self.upgrade_system_contract(address, code)?;
+                println!("Upgraded system contract: {:?} at block: {:?}", address, self.evm.block().number.to::<u64>());
             }
         }
 
@@ -563,7 +564,7 @@ where
                 .is_feynman_active_at_timestamp(self.evm.block().number.to::<u64>() - 1, self.evm.block().timestamp.to::<u64>() - 3)
         {
             println!("A11");
-            // self.initialize_feynman_contracts(self.evm.block().beneficiary)?; // todo: why
+            self.initialize_feynman_contracts(self.evm.block().beneficiary)?; // todo: why
             println!("A12");
         }
 
