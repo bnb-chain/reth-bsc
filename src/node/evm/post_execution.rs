@@ -297,6 +297,7 @@ where
         if system_account.account.is_none() ||
             system_account.account.as_ref().unwrap().info.balance == U256::ZERO
         {
+            tracing::info!("System account is empty, block_number: {}, timestamp: {}", self.evm.block().number, self.evm.block().timestamp);
             return Ok(());
         }
 
