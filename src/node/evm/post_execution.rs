@@ -266,9 +266,9 @@ where
 
         let result_and_state = self.evm.transact(tx_env).map_err(BlockExecutionError::other)?;
         let ResultAndState { result, state } = result_and_state;
-        if let Some(hook) = &mut self.hook {
-            hook.on_state(StateChangeSource::Transaction(self.receipts.len()), &state);
-        } 
+        let mut temp_state = state.clone();
+        temp_state.remove(&SYSTEM_ADDRESS);
+        self.system_caller.on_state(StateChangeSource::Transaction(self.receipts.len()), &temp_state);
 
         let gas_used = result.gas_used();
         self.gas_used += gas_used;
