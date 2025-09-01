@@ -6,7 +6,7 @@ use crate::{
     evm::transaction::BscTxEnv,
     hardforks::BscHardforks,
     system_contracts::{
-        get_upgrade_system_contracts, is_system_transaction, SystemContract, STAKE_HUB_CONTRACT,
+        get_upgrade_system_contracts, is_system_transaction, SystemContract,
         SYSTEM_REWARD_CONTRACT,
     },
 };

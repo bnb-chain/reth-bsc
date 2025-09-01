@@ -161,27 +161,21 @@ where
     }
 
     fn evm_env(&self, header: &Header) -> EvmEnv<BscHardfork> {
-        let blob_params = self.chain_spec().blob_params_at_timestamp(header.timestamp);
-        let mut spec = None;
-        if self.chain_spec().chain().id() == 714 && (header.number == 6 || header.number == 7) {
-            // Compatible with incorrect fork configuration of qa net.
-            if header.number == 6 {
-                spec = Some(BscHardfork::Luban);
-            }
-            if header.number == 7 {
-                spec = Some(BscHardfork::Plato);
-            }
-        } else {
-            spec = Some(revm_spec_by_timestamp_and_block_number(
+        let mut blob_params = None;
+        //let blob_params = self.chain_spec().blob_params_at_timestamp(header.timestamp);
+        if self.chain_spec().is_london_active_at_block(header.number) && self.chain_spec().is_prague_active_at_timestamp(header.timestamp) {
+            blob_params = self.chain_spec().blob_params_at_timestamp(header.timestamp);
+        }
+        let spec = revm_spec_by_timestamp_and_block_number(
                 self.chain_spec().clone(),
                 header.timestamp(),
                 header.number(),
-            ));
-        }
+        );
+        
 
         // configure evm env based on parent block
         let mut cfg_env =
-            CfgEnv::new().with_chain_id(self.chain_spec().chain().id()).with_spec(spec.unwrap());
+            CfgEnv::new().with_chain_id(self.chain_spec().chain().id()).with_spec(spec);
 
         if let Some(blob_params) = &blob_params {
             cfg_env.set_max_blobs_per_tx(blob_params.max_blobs_per_tx);
@@ -195,7 +189,7 @@ where
                 BlobExcessGasAndPrice { excess_blob_gas, blob_gasprice }
             });
 
-        let eth_spec = SpecId::from(spec.unwrap());
+        let eth_spec = SpecId::from(spec);
 
         let block_env = BlockEnv {
             number: U256::from(header.number()),
@@ -346,21 +340,21 @@ pub fn revm_spec_by_timestamp_and_block_number(
     timestamp: u64,
     block_number: u64,
 ) -> BscHardfork {
-    if chain_spec.is_maxwell_active_at_timestamp(timestamp) {
+    if chain_spec.is_maxwell_active_at_timestamp(block_number, timestamp) {
         BscHardfork::Maxwell
-    } else if chain_spec.is_lorentz_active_at_timestamp(timestamp) {
+    } else if chain_spec.is_lorentz_active_at_timestamp(block_number, timestamp) {
         BscHardfork::Lorentz
     } else if chain_spec.is_pascal_active_at_timestamp(block_number, timestamp) {
         BscHardfork::Pascal
-    } else if chain_spec.is_bohr_active_at_timestamp(timestamp) {
+    } else if chain_spec.is_bohr_active_at_timestamp(block_number, timestamp) {
         BscHardfork::Bohr
-    } else if chain_spec.is_haber_fix_active_at_timestamp(timestamp) {
+    } else if chain_spec.is_haber_fix_active_at_timestamp(block_number, timestamp) {
         BscHardfork::HaberFix
-    } else if chain_spec.is_haber_active_at_timestamp(timestamp) {
+    } else if chain_spec.is_haber_active_at_timestamp(block_number, timestamp) {
         BscHardfork::Haber
-    } else if BscHardforks::is_cancun_active_at_timestamp(&chain_spec, timestamp) {
+    } else if BscHardforks::is_cancun_active_at_timestamp(&chain_spec, block_number, timestamp) {
         BscHardfork::Cancun
-    } else if chain_spec.is_feynman_fix_active_at_timestamp(timestamp) {
+    } else if chain_spec.is_feynman_fix_active_at_timestamp(block_number, timestamp) {
         BscHardfork::FeynmanFix
     } else if chain_spec.is_feynman_active_at_timestamp(block_number, timestamp) {
         BscHardfork::Feynman

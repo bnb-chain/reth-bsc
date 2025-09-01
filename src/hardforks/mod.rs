@@ -140,7 +140,8 @@ pub trait BscHardforks: EthereumHardforks {
     }
 
     /// Convenience method to check if [`BscHardfork::FeynmanFix`] is active at a given timestamp.
-    fn is_feynman_fix_active_at_timestamp(&self, timestamp: u64) -> bool {
+    fn is_feynman_fix_active_at_timestamp(&self, block_number: u64, timestamp: u64) -> bool {
+        self.is_london_active_at_block(block_number) &&
         self.bsc_fork_activation(BscHardfork::FeynmanFix).active_at_timestamp(timestamp)
     }
 
@@ -152,7 +153,8 @@ pub trait BscHardforks: EthereumHardforks {
     }
 
     /// Convenience method to check if [`BscHardfork::Haber`] is active at a given timestamp.
-    fn is_haber_active_at_timestamp(&self, timestamp: u64) -> bool {
+    fn is_haber_active_at_timestamp(&self, block_number: u64, timestamp: u64) -> bool {
+        self.is_london_active_at_block(block_number) &&
         self.bsc_fork_activation(BscHardfork::Haber).active_at_timestamp(timestamp)
     }
 
@@ -164,7 +166,8 @@ pub trait BscHardforks: EthereumHardforks {
     }
 
     /// Convenience method to check if [`BscHardfork::HaberFix`] is active at a given timestamp.
-    fn is_haber_fix_active_at_timestamp(&self, timestamp: u64) -> bool {
+    fn is_haber_fix_active_at_timestamp(&self, block_number: u64, timestamp: u64) -> bool {
+        self.is_london_active_at_block(block_number) &&
         self.bsc_fork_activation(BscHardfork::HaberFix).active_at_timestamp(timestamp)
     }
 
@@ -176,7 +179,8 @@ pub trait BscHardforks: EthereumHardforks {
     }
 
     /// Convenience method to check if [`BscHardfork::Cancun`] is active at a given timestamp.
-    fn is_cancun_active_at_timestamp(&self, timestamp: u64) -> bool {
+    fn is_cancun_active_at_timestamp(&self, block_number: u64, timestamp: u64) -> bool {
+        self.is_london_active_at_block(block_number) &&
         self.bsc_fork_activation(BscHardfork::Cancun).active_at_timestamp(timestamp)
     }
 
@@ -188,7 +192,8 @@ pub trait BscHardforks: EthereumHardforks {
     }
 
     /// Convenience method to check if [`BscHardfork::Bohr`] is active at a given timestamp.
-    fn is_bohr_active_at_timestamp(&self, timestamp: u64) -> bool {
+    fn is_bohr_active_at_timestamp(&self, block_number: u64, timestamp: u64) -> bool {
+        self.is_london_active_at_block(block_number) &&
         self.bsc_fork_activation(BscHardfork::Bohr).active_at_timestamp(timestamp)
     }
 
@@ -199,7 +204,6 @@ pub trait BscHardforks: EthereumHardforks {
             !self.is_prague_active_at_timestamp(parent_timestamp)
     }
 
-
     /// Convenience method to check if [`BscHardfork::Pascal`] is active at a given timestamp.
     fn is_pascal_active_at_timestamp(&self, block_number: u64, timestamp: u64) -> bool {
         self.is_london_active_at_block(block_number) &&
@@ -207,12 +211,14 @@ pub trait BscHardforks: EthereumHardforks {
     }
 
     /// Convenience method to check if [`BscHardfork::Lorentz`] is active at a given timestamp.
-    fn is_lorentz_active_at_timestamp(&self, timestamp: u64) -> bool {
+    fn is_lorentz_active_at_timestamp(&self, block_number: u64, timestamp: u64) -> bool {
+        self.is_london_active_at_block(block_number) &&
         self.bsc_fork_activation(BscHardfork::Lorentz).active_at_timestamp(timestamp)
     }
 
     /// Convenience method to check if [`BscHardfork::Maxwell`] is active at a given timestamp.
-    fn is_maxwell_active_at_timestamp(&self, timestamp: u64) -> bool {
+    fn is_maxwell_active_at_timestamp(&self, block_number: u64, timestamp: u64) -> bool {
+        self.is_london_active_at_block(block_number) &&
         self.bsc_fork_activation(BscHardfork::Maxwell).active_at_timestamp(timestamp)
     }
 }

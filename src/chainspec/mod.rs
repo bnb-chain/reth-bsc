@@ -30,10 +30,6 @@ impl EthChainSpec for BscChainSpec {
     type Header = Header;
 
     fn blob_params_at_timestamp(&self, timestamp: u64) -> Option<BlobParams> {
-        if self.inner.chain().id() == 714 && timestamp <= 1754967084 {
-            // Compatible with incorrect fork configuration of qa net.
-            return None;
-        }
         // BSC doesn't modify blob params in Prague, while ETH does.
         // This is a key difference between BSC and ETH chain specifications.
         if self.inner.is_cancun_active_at_timestamp(timestamp) {
