@@ -87,7 +87,7 @@ impl EthChainSpec for BscChainSpec {
             ChainKind::Named(NamedChain::BinanceSmartChainTestnet) => {
                 Some(crate::node::network::bootnodes::bsc_testnet_nodes())
             }
-            ChainKind::Id(714) => {
+            ChainKind::Id(bsc_rialto::RIALTO_CHAIN_ID) => {
                 Some(crate::node::network::bootnodes::bsc_qanet_nodes())
             }
             _ => None,
@@ -157,7 +157,7 @@ impl BscChainSpec {
             ChainKind::Named(NamedChain::BinanceSmartChainTestnet) => {
                 bsc_chapel::head()
             }
-            ChainKind::Id(714) => {
+            ChainKind::Id(bsc_rialto::RIALTO_CHAIN_ID) => {
                 bsc_rialto::head()
             }
             _ => bsc::head(),

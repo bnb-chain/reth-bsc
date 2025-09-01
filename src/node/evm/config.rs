@@ -162,7 +162,7 @@ where
 
     fn evm_env(&self, header: &Header) -> EvmEnv<BscHardfork> {
         let mut blob_params = None;
-        if self.chain_spec().is_london_active_at_block(header.number) && self.chain_spec().is_prague_active_at_timestamp(header.timestamp) {
+        if self.chain_spec().is_london_active_at_block(header.number) && BscHardforks::is_cancun_active_at_timestamp(self.chain_spec(), header.number, header.timestamp) {
             blob_params = self.chain_spec().blob_params_at_timestamp(header.timestamp);
         }
         let spec = revm_spec_by_timestamp_and_block_number(

@@ -6,12 +6,14 @@ use reth_chainspec::{
 use reth_primitives::SealedHeader;
 use std::str::FromStr;
 
+pub const RIALTO_CHAIN_ID: u64 = 714;
+
 pub fn bsc_qanet() -> ChainSpec {
     let genesis = serde_json::from_str(include_str!("genesis_rialto.json"))
         .expect("Can't deserialize BSC Qanet genesis json");
     let hardforks = BscHardfork::bsc_qanet();
     ChainSpec {
-        chain: Chain::from_id(714),
+        chain: Chain::from_id(RIALTO_CHAIN_ID),
         genesis: serde_json::from_str(include_str!("genesis_rialto.json"))
             .expect("Can't deserialize BSC Qanet genesis json"),
         paris_block_and_final_difficulty: Some((0, U256::from(0))),
