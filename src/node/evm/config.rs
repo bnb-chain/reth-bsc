@@ -161,12 +161,16 @@ where
     }
 
     fn evm_env(&self, header: &Header) -> EvmEnv<BscHardfork> {
-        let blob_params = self.chain_spec().blob_params_at_timestamp(header.timestamp);
+        let mut blob_params = None;
+        if self.chain_spec().is_london_active_at_block(header.number) && BscHardforks::is_cancun_active_at_timestamp(self.chain_spec(), header.number, header.timestamp) {
+            blob_params = self.chain_spec().blob_params_at_timestamp(header.timestamp);
+        }
         let spec = revm_spec_by_timestamp_and_block_number(
             self.chain_spec().clone(),
             header.timestamp(),
             header.number(),
         );
+        
 
         // configure evm env based on parent block
         let mut cfg_env =
@@ -335,25 +339,25 @@ pub fn revm_spec_by_timestamp_and_block_number(
     timestamp: u64,
     block_number: u64,
 ) -> BscHardfork {
-    if chain_spec.is_maxwell_active_at_timestamp(timestamp) {
+    if chain_spec.is_maxwell_active_at_timestamp(block_number, timestamp) {
         BscHardfork::Maxwell
-    } else if chain_spec.is_lorentz_active_at_timestamp(timestamp) {
+    } else if chain_spec.is_lorentz_active_at_timestamp(block_number, timestamp) {
         BscHardfork::Lorentz
-    } else if chain_spec.is_pascal_active_at_timestamp(timestamp) {
+    } else if chain_spec.is_pascal_active_at_timestamp(block_number, timestamp) {
         BscHardfork::Pascal
-    } else if chain_spec.is_bohr_active_at_timestamp(timestamp) {
+    } else if chain_spec.is_bohr_active_at_timestamp(block_number, timestamp) {
         BscHardfork::Bohr
-    } else if chain_spec.is_haber_fix_active_at_timestamp(timestamp) {
+    } else if chain_spec.is_haber_fix_active_at_timestamp(block_number, timestamp) {
         BscHardfork::HaberFix
-    } else if chain_spec.is_haber_active_at_timestamp(timestamp) {
+    } else if chain_spec.is_haber_active_at_timestamp(block_number, timestamp) {
         BscHardfork::Haber
-    } else if BscHardforks::is_cancun_active_at_timestamp(&chain_spec, timestamp) {
+    } else if BscHardforks::is_cancun_active_at_timestamp(&chain_spec, block_number, timestamp) {
         BscHardfork::Cancun
-    } else if chain_spec.is_feynman_fix_active_at_timestamp(timestamp) {
+    } else if chain_spec.is_feynman_fix_active_at_timestamp(block_number, timestamp) {
         BscHardfork::FeynmanFix
-    } else if chain_spec.is_feynman_active_at_timestamp(timestamp) {
+    } else if chain_spec.is_feynman_active_at_timestamp(block_number, timestamp) {
         BscHardfork::Feynman
-    } else if chain_spec.is_kepler_active_at_timestamp(timestamp) {
+    } else if chain_spec.is_kepler_active_at_timestamp(block_number, timestamp) {
         BscHardfork::Kepler
     } else if chain_spec.is_hertz_fix_active_at_block(block_number) {
         BscHardfork::HertzFix
