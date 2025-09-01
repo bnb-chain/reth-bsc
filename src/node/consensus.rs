@@ -79,7 +79,6 @@ impl<ChainSpec: EthChainSpec + BscHardforks> HeaderValidator for BscConsensus<Ch
                 validate_against_parent_4844(header.header(), parent.header(), blob_params)?;
             }
         }
-       
 
         Ok(())
     }

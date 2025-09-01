@@ -124,7 +124,6 @@ where
         for (address, maybe_code) in contracts {
             if let Some(code) = maybe_code {
                 self.upgrade_system_contract(address, code)?;
-                println!("Upgraded system contract: {:?} at block: {:?}", address, self.evm.block().number.to::<u64>());
             }
         }
 
@@ -136,17 +135,6 @@ where
         &mut self,
         beneficiary: Address,
     ) -> Result<(), BlockExecutionError> {
-        // Exit early if contracts are already initialized
-        // if !self
-        //     .evm
-        //     .db_mut()
-        //     .storage(STAKE_HUB_CONTRACT, U256::ZERO)
-        //     .map_err(BlockExecutionError::other)?
-        //     .is_zero()
-        // {
-        //     return Ok(());
-        // }
-
         let txs = self.system_contracts.feynman_contracts_txs();
         for tx in txs {
             self.transact_system_tx(&tx, beneficiary)?;
@@ -428,14 +416,7 @@ where
         // TODO: (Consensus Verify cascading fields)[https://github.com/bnb-chain/reth/blob/main/crates/bsc/evm/src/pre_execution.rs#L43]
         // TODO: (Consensus System Call Before Execution)[https://github.com/bnb-chain/reth/blob/main/crates/bsc/evm/src/execute.rs#L678]
 
-        println!("A1");
         if !self.spec.is_feynman_active_at_timestamp(self.evm.block().number.to::<u64>(), self.evm.block().timestamp.to::<u64>() - 3) {
-            println!(
-                "Feynman fork not active yet. Block number: {}, timestamp: {}, upgrading contracts",
-                self.evm.block().number.to::<u64>(),
-                self.evm.block().timestamp.to::<u64>()
-            );
-            println!("A2");
             self.upgrade_contracts()?;
         }
      
@@ -531,21 +512,16 @@ where
             self.deploy_genesis_contracts(self.evm.block().beneficiary)?;
         }
 
-        println!("A8");
         if self.spec.is_feynman_active_at_timestamp(self.evm.block().number.to::<u64>(), self.evm.block().timestamp.to::<u64>() - 3) {
-            println!("A9");
             self.upgrade_contracts()?;
         }
 
-        println!("A10");
         if self.spec.is_feynman_active_at_timestamp(self.evm.block().number.to::<u64>(), self.evm.block().timestamp.to()) &&
             !self
                 .spec
                 .is_feynman_active_at_timestamp(self.evm.block().number.to::<u64>() - 1, self.evm.block().timestamp.to::<u64>() - 3)
         {
-            println!("A11");
-            self.initialize_feynman_contracts(self.evm.block().beneficiary)?; // todo: why
-            println!("A12");
+            self.initialize_feynman_contracts(self.evm.block().beneficiary)?;
         }
 
         let system_txs = self.system_txs.clone();
