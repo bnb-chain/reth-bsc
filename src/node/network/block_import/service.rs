@@ -1,6 +1,6 @@
 use super::handle::ImportHandle;
 use crate::{
-    consensus::{ParliaConsensus, ParliaConsensusErr},
+    consensus::{ParliaConsensus, ParliaConsensusErr, parlia::vote_pool},
     node::{engine_api::payload::BscPayloadTypes, network::BscNewBlock},
     BscBlock, BscBlockBody,
 };
@@ -186,6 +186,10 @@ where
             if let Some(outcome) = outcome {
                 if let Ok(BlockValidation::ValidBlock { block }) = &outcome.result {
                     this.processed_blocks.insert(block.hash);
+                    
+                    // Prune old votes from the vote pool based on the new block number
+                    let block_number = block.block.0.block.header.number();
+                    vote_pool::prune(block_number);
                 }
 
                 if let Err(e) = this.to_network.send(BlockImportEvent::Outcome(outcome)) {

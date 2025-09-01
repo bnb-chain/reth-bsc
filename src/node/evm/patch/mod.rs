@@ -772,3 +772,44 @@ where
     state.apply_transition(vec![(address, account_change)]);
     Ok(())
 }
+
+/// Hertz patch manager for compatibility.
+/// <https://>forum.bnbchain.org/t/about-the-hertzfix/2400>
+pub struct HertzPatchManager {
+    is_mainnet: bool,
+}
+
+impl HertzPatchManager {
+    pub fn new(is_mainnet: bool) -> Self {
+        Self { is_mainnet }
+    }
+
+    pub fn patch_before_tx<T, DB>(&self, transaction: &T, state: &mut State<DB>) -> Result<(), BlockExecutionError>
+    where
+        T: SignedTransaction,
+        DB: Database,
+        <DB as revm::Database>::Error: Sync + Send + 'static,
+    {
+        if self.is_mainnet {
+            patch_mainnet_before_tx(transaction, state)?;
+        } else {
+            patch_chapel_before_tx(transaction, state)?;
+        }
+        Ok(())
+    }
+    
+    /// Apply patches after transaction execution
+    pub fn patch_after_tx<T, DB>(&self, transaction: &T, state: &mut State<DB>) -> Result<(), BlockExecutionError>
+    where
+        T: SignedTransaction,
+        DB: Database,
+        <DB as revm::Database>::Error: Sync + Send + 'static,
+    {
+        if self.is_mainnet {
+            patch_mainnet_after_tx(transaction, state)?;
+        } else {
+            patch_chapel_after_tx(transaction, state)?;
+        }
+        Ok(())
+    }
+}
