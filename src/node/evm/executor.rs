@@ -438,36 +438,16 @@ where
             println!("A2");
             self.upgrade_contracts()?;
         }
-
-
-        println!("A3");
-        if self.spec.chain_id() == 714 {
-            if self.spec.is_pascal_active_at_timestamp(self.evm.block().number.to::<u64>(), self.evm.block().timestamp.to::<u64>()) &&
-                !self.spec.is_pascal_active_at_timestamp(self.evm.block().number.to::<u64>() - 1, self.evm.block().timestamp.to::<u64>() - 3) {
-                println!("A4");
+     
+        // enable BEP-440/EIP-2935 for historical block hashes from state
+        if self.spec.is_pascal_active_at_timestamp(self.evm.block().number.to::<u64>(), self.evm.block().timestamp.to::<u64>()) &&
+            !self.spec.is_pascal_active_at_timestamp(self.evm.block().number.to::<u64>() - 1, self.evm.block().timestamp.to::<u64>() - 3) {
                 self.apply_history_storage_account(self.evm.block().number.to::<u64>())?;
-            }
-            println!("A5");
-            if self.spec.is_pascal_active_at_timestamp(self.evm.block().number.to::<u64>(), self.evm.block().timestamp.to::<u64>()) {
-                println!("A6");
-                self.system_caller
-                    .apply_blockhashes_contract_call(self._ctx.parent_hash, &mut self.evm)?;
-            }
-        } else {
-            // enable BEP-440/EIP-2935 for historical block hashes from state
-            if self.spec.is_prague_transition_at_timestamp(
-                self.evm.block().timestamp.to(),
-                self.evm.block().timestamp.to::<u64>() - 3,
-            ) {
-                self.apply_history_storage_account(self.evm.block().number.to::<u64>())?;
-            }
-            if self.spec.is_prague_active_at_timestamp(self.evm.block().timestamp.to()) {
-                self.system_caller
-                    .apply_blockhashes_contract_call(self._ctx.parent_hash, &mut self.evm)?;
-            }
         }
-        println!("A7");
-       
+        if self.spec.is_pascal_active_at_timestamp(self.evm.block().number.to::<u64>(), self.evm.block().timestamp.to::<u64>()) {
+            self.system_caller
+                .apply_blockhashes_contract_call(self._ctx.parent_hash, &mut self.evm)?;
+        }
 
         Ok(())
     }
