@@ -112,7 +112,7 @@ where
         header: Option<Header>
     ) -> Result<(), BlockExecutionError> {
         let header_ref = header.as_ref().unwrap();
-        let epoch_length = self.inner_ctx.snap.as_ref().unwrap().epoch_num;
+        let epoch_length = self.parlia.get_epoch_length(&header_ref);
         if header_ref.number % epoch_length != 0 {
             tracing::debug!("Skip verify validator, block_number {} is not an epoch boundary, epoch_length: {}", header_ref.number, epoch_length);
             return Ok(());
