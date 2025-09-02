@@ -239,7 +239,6 @@ where
     }
 }
 
-
 impl<'a, DB, E, Spec, R> BlockExecutor for BscBlockExecutor<'a, E, Spec, R>
 where
     DB: Database + 'a,

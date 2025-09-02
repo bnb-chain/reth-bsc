@@ -77,7 +77,7 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
             }
 
             let count = header.extra_data[EXTRA_VANITY_LEN] as usize;
-            let start = EXTRA_VANITY_LEN+VALIDATOR_NUMBER_SIZE;
+            let start = EXTRA_VANITY_LEN + VALIDATOR_NUMBER_SIZE;
             let end = start + count * VALIDATOR_BYTES_LEN_AFTER_LUBAN;
 
             let mut extra_min_len = end + EXTRA_SEAL_LEN;

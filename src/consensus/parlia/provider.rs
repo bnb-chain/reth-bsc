@@ -113,7 +113,7 @@ impl<DB: Database> DbSnapshotProvider<DB> {
             }
         }
         
-        tracing::debug!("Failed to find snapshot for block {}, searching for fallback...", block_number);
+        tracing::warn!("Failed to find snapshot for block {}, searching for fallback...", block_number);
         
         // If exact snapshot not found, look for the most recent snapshot before this block
         let mut cursor = tx
@@ -135,7 +135,7 @@ impl<DB: Database> DbSnapshotProvider<DB> {
         if let Some(ref snap) = last {
             tracing::debug!("Succeed to find fallback snapshot for block {} at block {} in DB (searched {} snapshots)", block_number, snap.block_number, found_count);
         } else {
-            tracing::debug!("Failed to find snapshot for block {} from DB", block_number);
+            tracing::warn!("Failed to find snapshot for block {} from DB", block_number);
         }
         last
     }

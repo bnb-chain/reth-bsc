@@ -81,12 +81,6 @@ impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 's
         // Check extra data
         self.check_header_extra(header).map_err(|e| ConsensusError::Other(format!("Invalid header extra: {e}")))?;
 
-        // Ensure that the mix digest is zero as we don't have fork protection currently
-        // mix_hash is millisecond timestamp after Lorentz/Maxwell.
-        // if header.mix_hash != EMPTY_MIX_HASH {
-        // return Err(ConsensusError::InvalidMixHash);
-        // }
-
         // Ensure that the block with no uncles
         if header.ommers_hash != EMPTY_OMMER_ROOT_HASH {
             return Err(ConsensusError::BodyOmmersHashDiff(

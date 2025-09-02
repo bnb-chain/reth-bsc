@@ -65,7 +65,6 @@ impl HeaderCacheReader {
         if let Some(header) = crate::shared::get_header_by_hash_from_provider(block_hash) {
             return Some(header);
         }
-
         None
     }
 
