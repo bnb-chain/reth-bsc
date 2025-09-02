@@ -41,7 +41,7 @@ where
         &mut self, 
         block: &BlockEnv
     ) -> Result<(), BlockExecutionError> {
-        tracing::debug!("Start to finalize new block, block_number: {}", block.number); 
+        tracing::trace!("Start to finalize new block, block_number: {}", block.number); 
         self.verify_validators(self.inner_ctx.current_validators.clone(), self.inner_ctx.header.clone())?;
         self.verify_turn_length(self.inner_ctx.header.clone())?;
 
@@ -102,7 +102,7 @@ where
             self.get_current_validators(header.number)?;
         }
 
-        tracing::debug!("Succeed to finalize new block, block_number: {}", block.number);
+        tracing::trace!("Succeed to finalize new block, block_number: {}", block.number);
         Ok(())
     }
 
@@ -114,7 +114,7 @@ where
         let header_ref = header.as_ref().unwrap();
         let epoch_length = self.parlia.get_epoch_length(header_ref);
         if header_ref.number % epoch_length != 0 {
-            tracing::debug!("Skip verify validator, block_number {} is not an epoch boundary, epoch_length: {}", header_ref.number, epoch_length);
+            tracing::trace!("Skip verify validator, block_number {} is not an epoch boundary, epoch_length: {}", header_ref.number, epoch_length);
             return Ok(());
         }
 
@@ -161,7 +161,7 @@ where
         let header_ref = header.as_ref().unwrap();
         let epoch_length = self.inner_ctx.snap.as_ref().unwrap().epoch_num;
         if header_ref.number % epoch_length != 0 || !self.spec.is_bohr_active_at_timestamp(header_ref.timestamp) {
-            tracing::debug!("Skip verify turn length, block_number {} is not an epoch boundary, epoch_length: {}", header_ref.number, epoch_length);
+            tracing::trace!("Skip verify turn length, block_number {} is not an epoch boundary, epoch_length: {}", header_ref.number, epoch_length);
             return Ok(());
         }
         let turn_length_from_header = {

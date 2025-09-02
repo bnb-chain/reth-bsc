@@ -46,11 +46,11 @@ impl HeaderCacheReader {
 
     pub fn get_header_by_number(&mut self, block_number: u64) -> Option<Header> {
         if let Some(header) = self.blocknumber_to_header.get(&block_number) {
-            tracing::debug!("Get header from cache, block_number: {:?}", header.number());
+            tracing::trace!("Get header from cache, block_number: {:?}", header.number());
             return Some(header.clone());
         }
         if let Some(header) = crate::shared::get_header_by_number_from_provider(block_number) {
-            tracing::debug!("Get header from provider, block_number: {:?}", header.number());
+            tracing::trace!("Get header from provider, block_number: {:?}", header.number());
             return Some(header);
         }
 
@@ -75,7 +75,7 @@ impl HeaderCacheReader {
         let header_clone_for_log = header.clone();
         self.blocknumber_to_header.insert(block_number, header.clone());
         self.blockhash_to_header.insert(block_hash, header);
-        tracing::debug!("Insert header to cache, block_number: {:?}, block_hash: {:?}, header: {:?}", block_number, block_hash, header_clone_for_log);
+        tracing::trace!("Insert header to cache, block_number: {:?}, block_hash: {:?}, header: {:?}", block_number, block_hash, header_clone_for_log);
     }
 }
 

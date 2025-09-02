@@ -58,7 +58,7 @@ where
         block: &BlockEnv
     ) -> Result<(), BlockExecutionError> {
         let block_number = block.number.to::<u64>();
-        tracing::debug!("Check new block, block_number: {}", block_number);
+        tracing::trace!("Check new block, block_number: {}", block_number);
 
         let header = crate::node::evm::util::HEADER_CACHE_READER
             .lock()
@@ -82,39 +82,7 @@ where
             .ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;
         self.inner_ctx.snap = Some(snap.clone());
 
-        let verify_res = self
-            .verify_cascading_fields(&header, &parent_header, &snap);
-
-        // TODO: remove this part, just for debug.
-        if let Err(err) = verify_res {
-            let proposer = header.beneficiary;
-            let is_inturn = snap.is_inturn(proposer);
-            let expected_difficulty: u64 = if is_inturn { 2 } else { 1 };
-            let recent_counts = snap.count_recent_proposers();
-
-            tracing::error!(
-                target: "bsc::pre_execution",
-                error = ?err,
-                block_number = header.number,
-                parent_number = parent_header.number,
-                header_timestamp = header.timestamp,
-                parent_timestamp = parent_header.timestamp,
-                proposer = %format!("0x{:x}", proposer),
-                validators_len = snap.validators.len(),
-                epoch_len = snap.epoch_num,
-                turn_length = snap.turn_length.map(|v| v as u64),
-                block_interval = snap.block_interval,
-                is_inturn,
-                expected_difficulty,
-                header_difficulty = %format!("{}", header.difficulty),
-                miner_history_check_len = snap.miner_history_check_len(),
-                recent_proposers = %format!("{:?}", snap.recent_proposers),
-                recent_counts = %format!("{:?}", recent_counts),
-                "Consensus verify_cascading_fields failed with detailed diagnostics"
-            );
-
-            return Err(err);
-        }
+        self.verify_cascading_fields(&header, &parent_header, &snap)?;
 
         let epoch_length = self.parlia.get_epoch_length(&header);
         if header.number % epoch_length == 0 {

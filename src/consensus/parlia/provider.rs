@@ -33,6 +33,7 @@ pub trait SnapshotProvider: Send + Sync {
     /// Returns the header for the given `block_number`.
     fn get_header(&self, block_number: u64) -> Option<alloy_consensus::Header>;
 
+    /// Returns the header for the given `hash`.
     fn get_header_by_hash(&self, _hash: &B256) -> Option<alloy_consensus::Header> {
         None
     }
@@ -41,8 +42,6 @@ pub trait SnapshotProvider: Send + Sync {
 /// `DbSnapshotProvider` wraps an MDBX database; it keeps a small in-memory LRU to avoid hitting
 /// storage for hot epochs. The DB layer persists snapshots as CBOR blobs via the `ParliaSnapshots`
 /// table that is already defined in `db.rs`.
-/// 
-/// Enhanced to include backward walking logic like reth-bsc-trail and bsc-erigon.
 #[derive(Debug)]
 pub struct DbSnapshotProvider<DB: Database> {
     db: DB,
@@ -152,8 +151,7 @@ impl<DB: Database> DbSnapshotProvider<DB> {
 
 impl<DB: Database + 'static> SnapshotProvider for DbSnapshotProvider<DB> {
     fn snapshot(&self, block_number: u64) -> Option<Snapshot> {
-        // fast path: cache
-        {
+        { // fast path: cache
             let mut guard = self.cache.write();
             if let Some(snap) = guard.get(&block_number) {
                 return Some(snap.clone());
@@ -261,13 +259,13 @@ impl<DB: Database + 'static> SnapshotProvider for EnhancedDbSnapshotProvider<DB>
     
     fn get_header(&self, block_number: u64) -> Option<alloy_consensus::Header> {
         let header = crate::node::evm::util::HEADER_CACHE_READER.lock().unwrap().get_header_by_number(block_number);
-        tracing::info!("Succeed to fetch header, is_none: {} for block {} in enhanced snapshot provider", header.is_none(), block_number);
+        tracing::debug!("Succeed to fetch header, is_none: {} for block {} in enhanced snapshot provider", header.is_none(), block_number);
         header
     }
 
     fn get_header_by_hash(&self, block_hash: &B256) -> Option<alloy_consensus::Header> {
         let header = crate::node::evm::util::HEADER_CACHE_READER.lock().unwrap().get_header_by_hash(block_hash);
-        tracing::info!("Succeed to fetch header by hash, is_none: {} for hash {} in enhanced snapshot provider", header.is_none(), block_hash);
+        tracing::debug!("Succeed to fetch header by hash, is_none: {} for hash {} in enhanced snapshot provider", header.is_none(), block_hash);
         header
     }
 }

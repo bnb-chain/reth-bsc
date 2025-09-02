@@ -155,7 +155,7 @@ impl<P: SnapshotProvider + Send + Sync + 'static> ParliaApiServer for ParliaApiI
                     num
                 },
                 Err(e) => {
-                    tracing::error!("❌ [BSC-RPC] Failed to parse hex block number '{}': {}", block_number, e);
+                    tracing::error!("Failed to parse hex block number '{}': {}", block_number, e);
                     return Err(ErrorObject::owned(
                         -32602, 
                         "Invalid block number format", 
@@ -170,7 +170,7 @@ impl<P: SnapshotProvider + Send + Sync + 'static> ParliaApiServer for ParliaApiI
                     num
                 },
                 Err(e) => {
-                    tracing::error!("❌ [BSC-RPC] Failed to parse decimal block number '{}': {}", block_number, e);
+                    tracing::error!("Failed to parse decimal block number '{}': {}", block_number, e);
                     return Err(ErrorObject::owned(
                         -32602, 
                         "Invalid block number format", 
@@ -185,14 +185,14 @@ impl<P: SnapshotProvider + Send + Sync + 'static> ParliaApiServer for ParliaApiI
         // Get snapshot from provider (equivalent to api.parlia.snapshot call in BSC)
         match self.snapshot_provider.snapshot(block_num) {
             Some(snapshot) => {
-                tracing::info!("✅ [BSC-RPC] Found snapshot for block {}: validators={}, epoch_num={}, block_hash=0x{:x}", 
+                tracing::info!("Found snapshot for block {}: validators={}, epoch_num={}, block_hash=0x{:x}", 
                     block_num, snapshot.validators.len(), snapshot.epoch_num, snapshot.block_hash);
                 let result: SnapshotResult = snapshot.into();
                 // Snapshot result prepared
                 Ok(Some(result))
             },
             None => {
-                tracing::warn!("⚠️ [BSC-RPC] No snapshot found for block {}", block_num);
+                tracing::warn!("No snapshot found for block {}", block_num);
                 Ok(None)
             }
         }

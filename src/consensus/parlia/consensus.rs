@@ -158,7 +158,7 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
         if raw_attestation_data.is_empty() {
             return Ok(None);
         }
-        tracing::debug!("try debug attestation data, attestation_data_len: {:?}, header_number: {:?}", 
+        tracing::trace!("try debug attestation data, attestation_data_len: {:?}, header_number: {:?}", 
             raw_attestation_data.len(), header.number());
 
         Ok(Some(

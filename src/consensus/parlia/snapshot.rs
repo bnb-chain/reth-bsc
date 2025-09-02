@@ -343,10 +343,7 @@ impl Snapshot {
     }
 }
 
-// ---------------------------------------------------------------------------
-// DB compression helpers (same approach as reth-bsc-trail)
-// ---------------------------------------------------------------------------
-
+// DB compression helpers
 impl Compress for Snapshot {
     type Compressed = Vec<u8>;
 

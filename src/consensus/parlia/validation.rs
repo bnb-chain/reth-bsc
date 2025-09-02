@@ -107,11 +107,11 @@ impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 's
         }
 
         if self.spec.is_bohr_active_at_timestamp(header.timestamp) {
-           if header.parent_beacon_block_root.is_none() ||
+            if header.parent_beacon_block_root.is_none() ||
                header.parent_beacon_block_root.unwrap() != B256::default()
-           {
-               return Err(ConsensusError::ParentBeaconBlockRootUnexpected)
-           }
+            {
+                return Err(ConsensusError::ParentBeaconBlockRootUnexpected)
+            }
         } else if header.parent_beacon_block_root.is_some() {
            return Err(ConsensusError::ParentBeaconBlockRootUnexpected)
         }

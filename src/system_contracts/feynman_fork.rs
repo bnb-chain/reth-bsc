@@ -11,7 +11,6 @@ pub struct ValidatorElectionInfo {
 
 /// Helper type for the output of `get_top_validators_by_voting_power`
 #[derive(Clone, Debug, Default)]
-#[allow(dead_code)]
 pub struct ElectedValidators {
     pub validators: Vec<Address>,
     pub voting_powers: Vec<u64>,

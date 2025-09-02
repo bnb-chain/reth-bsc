@@ -22,5 +22,3 @@ pub use util::hash_with_chain_id;
 pub use provider::SnapshotProvider;
 pub use vote_pool as votes;
 pub use consensus::Parlia;
-
-     
