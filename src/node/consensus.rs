@@ -69,7 +69,7 @@ impl<ChainSpec: EthChainSpec + BscHardforks + 'static> BscConsensus<ChainSpec> {
 impl<ChainSpec: EthChainSpec + BscHardforks + 'static> HeaderValidator<Header> 
     for BscConsensus<ChainSpec> {
     fn validate_header(&self, header: &SealedHeader) -> Result<(), ConsensusError> {
-        // tracing::info!("Validating header, block_number: {:?}", header.number);
+        // tracing::debug!("Validating header, block_number: {:?}", header.number);
         if let Err(err) = self.parlia.validate_header(header) {
             tracing::warn!("Failed to validate_header, block_number: {}, err: {:?}", header.number, err);
             return Err(err);
@@ -82,7 +82,7 @@ impl<ChainSpec: EthChainSpec + BscHardforks + 'static> HeaderValidator<Header>
         header: &SealedHeader,
         parent: &SealedHeader,
     ) -> Result<(), ConsensusError> {
-        // tracing::info!("Validating header against parent, block_number: {:?}", header.number);
+        // tracing::debug!("Validating header against parent, block_number: {:?}", header.number);
         if let Err(err) = validate_against_parent_hash_number(header.header(), parent) {
             tracing::warn!("Failed to validate_against_parent_hash_number, block_number: {}, err: {:?}", header.number, err);
             return Err(err)
@@ -121,7 +121,7 @@ impl<ChainSpec: EthChainSpec<Header = Header> + BscHardforks + 'static> Consensu
         body: &BscBlockBody,
         header: &SealedHeader,
     ) -> Result<(), ConsensusError> {
-        // tracing::info!("Validating body against header, block_number: {:?}", header.number);
+        // tracing::debug!("Validating body against header, block_number: {:?}", header.number);
         Consensus::<BscBlock>::validate_body_against_header(&self.base, body, header)
     }
 
@@ -130,7 +130,7 @@ impl<ChainSpec: EthChainSpec<Header = Header> + BscHardforks + 'static> Consensu
         &self,
         block: &SealedBlock<BscBlock>,
     ) -> Result<(), ConsensusError> {
-        // tracing::info!("Validating block pre-execution, block_number: {:?}", block.header().number);
+        // tracing::debug!("Validating block pre-execution, block_number: {:?}", block.header().number);
         self.parlia.validate_block_pre_execution(block)?;
         Ok(())
     }
@@ -145,7 +145,7 @@ impl<ChainSpec: EthChainSpec<Header = Header> + BscHardforks + 'static> FullCons
         block: &RecoveredBlock<BscBlock>,
         result: &BlockExecutionResult<Receipt>,
     ) -> Result<(), ConsensusError> {
-        // tracing::info!("Validating block post-execution, block_number: {:?}", block.header().number);
+        // tracing::debug!("Validating block post-execution, block_number: {:?}", block.header().number);
         FullConsensus::<BscPrimitives>::validate_block_post_execution(&self.base, block, result)
     }
 }

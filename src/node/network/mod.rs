@@ -17,7 +17,6 @@ use reth::{
 };
 use reth_chainspec::EthChainSpec;
 use reth_discv4::Discv4Config;
-
 use reth_eth_wire::{BasicNetworkPrimitives, NewBlock, NewBlockPayload};
 use reth_ethereum_primitives::PooledTransactionVariant;
 use reth_engine_primitives::BeaconConsensusEngineHandle;
@@ -168,8 +167,6 @@ impl Default for BscNetworkBuilder {
         Self::new(Arc::new(Mutex::new(Some(rx))))
     }
 }
-
-
 
 impl BscNetworkBuilder {
     /// Returns the [`NetworkConfig`] that contains the settings to launch the p2p network.
