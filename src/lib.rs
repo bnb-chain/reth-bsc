@@ -1,7 +1,11 @@
 pub mod chainspec;
 pub mod consensus;
-mod evm;
+pub mod evm;
 mod hardforks;
 pub mod node;
-pub use node::primitives::{BscBlock, BscBlockBody, BscPrimitives};
+pub mod rpc;
+pub mod shared;
+pub use node::primitives::BscPrimitives;
+pub use node::primitives::{BscBlock, BscBlockBody, BscBlobTransactionSidecar};
 mod system_contracts;
+pub use system_contracts::SLASH_CONTRACT;

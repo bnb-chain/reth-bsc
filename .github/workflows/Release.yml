@@ -1,0 +1,53 @@
+name: Release
+
+on:
+  release:
+    types: [created]
+
+jobs:
+  build-release-assets:
+    name: build-release-assets
+    # This permissions block is the required change
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+          override: true
+
+      - name: Build binary
+        run: cargo build --release --target ${{ matrix.target }}
+        env:
+          RUSTFLAGS: -C strip=symbols
+
+      - name: Prepare artifact
+        run: |
+          set -e
+          bin_name="reth-bsc"
+          tag_name="${{ github.ref_name }}"
+          asset_name="${bin_name}-${tag_name}-${{ matrix.target }}"
+          mkdir -p "${asset_name}"
+          cp "target/${{ matrix.target }}/release/${bin_name}" "${asset_name}/"
+          tar -czvf "${asset_name}.tar.gz" "${asset_name}"
+          echo "ASSET_NAME=${asset_name}.tar.gz" >> $GITHUB_ENV
+
+      - name: Upload release asset
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # This token is provided by Actions, you do not need to create your own token
+        uses: softprops/action-gh-release@v1
+        with:
+          files: ${{ env.ASSET_NAME }}
