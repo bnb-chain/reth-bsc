@@ -1,3 +1,4 @@
+use super::payload::BscPayloadTypes;
 use crate::{chainspec::BscChainSpec, hardforks::BscHardforks, BscBlock, BscPrimitives};
 use alloy_consensus::BlockHeader;
 use alloy_eips::eip4895::Withdrawal;
@@ -14,12 +15,10 @@ use reth::{
 use reth_engine_primitives::{ExecutionPayload, PayloadValidator};
 use reth_payload_primitives::NewPayloadError;
 use reth_primitives::{RecoveredBlock, SealedBlock};
-use reth_primitives_traits::Block as _;
 use reth_trie_common::HashedPostState;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-
-use super::payload::BscPayloadTypes;
+use reth_primitives_traits::Block;
 
 #[derive(Debug, Default, Clone)]
 #[non_exhaustive]
@@ -125,10 +124,7 @@ where
         payload: BscExecutionData,
     ) -> Result<SealedBlock<BscBlock>, PayloadError> {
         let block = payload.0;
-
         let expected_hash = block.header.hash_slow();
-
-        // First parse the block
         let sealed_block = block.seal_slow();
 
         // Ensure the hash included in the payload matches the block hash
