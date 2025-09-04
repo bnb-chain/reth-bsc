@@ -13,6 +13,7 @@ use alloy_consensus::{BlockHeader, Transaction};
 use alloy_eips::eip7685::Requests;
 use alloy_primitives::{Address, Bytes, U256};
 use k256::ecdsa::SigningKey;
+use reth::transaction_pool::PoolTransaction;
 use reth::{
     api::FullNodeTypes,
     builder::{components::PayloadServiceBuilder, BuilderContext},
@@ -26,9 +27,11 @@ use reth_primitives::{SealedBlock, TransactionSigned};
 use reth_provider::{BlockNumReader, HeaderProvider};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use reth_chainspec::EthChainSpec;
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
+use crate::node::evm::util::HEADER_CACHE_READER;
 
 /// Built payload for BSC. This is similar to [`EthBuiltPayload`] but without sidecars as those
 /// included into [`BscBlock`].
@@ -76,7 +79,7 @@ pub struct BscMiner<Pool, Provider> {
 
 impl<Pool, Provider> BscMiner<Pool, Provider>
 where
-    Pool: TransactionPool + Clone + 'static,
+    Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>> + Clone + 'static,
     Provider: HeaderProvider<Header = alloy_consensus::Header>
         + BlockNumReader
         + Clone
@@ -144,6 +147,22 @@ where
         if !self.mining_config.is_mining_enabled() {
             info!("Mining is disabled in configuration");
             return Ok(());
+        }
+
+        // Ensure the genesis block header is cached so that the snapshot provider can create the genesis snapshot
+        {
+            let mut cache = HEADER_CACHE_READER.lock().unwrap();
+            if cache.get_header_by_number(0).is_none() {
+                if let Some(genesis_header) = self.provider.header_by_number(0)? {
+                    cache.insert_header_to_cache(genesis_header);
+                    info!("Inserted genesis header from provider into cache");
+                } else {
+                    // Build the genesis header from the chain spec as fallback
+                    let genesis_header = self.chain_spec.genesis_header().clone();
+                    cache.insert_header_to_cache(genesis_header);
+                    info!("Inserted genesis header from chain spec into cache");
+                }
+            }
         }
 
         info!("Starting BSC mining service for validator: {}", self.validator_address);
@@ -341,17 +360,12 @@ where
         // Collect transactions until we hit gas limit
         for pooled_tx in best_txs {
             let recovered = pooled_tx.to_consensus();
-            let tx = recovered.as_ref();
-            if gas_used + tx.gas_limit() > gas_limit {
+            if gas_used + recovered.gas_limit() > gas_limit {
                 break;
             }
-            gas_used += tx.gas_limit();
+            gas_used += recovered.gas_limit();
 
-            // let (tx, rlp) = recovered.into_parts();
-            // tx.tx_hash();
-            // TransactionSigned::new_unchecked(tx, rlp);
-            // let signed_tx: TransactionSigned = recovered.into_inner();
-            // transactions.push(signed_tx);
+            transactions.push(recovered.into_inner());
         }
 
         debug!("Collected {} transactions for block, gas used: {}", transactions.len(), gas_used);
@@ -397,7 +411,7 @@ where
 impl<Node, Pool, Evm> PayloadServiceBuilder<Node, Pool, Evm> for BscPayloadServiceBuilder
 where
     Node: FullNodeTypes<Types = BscNode>,
-    Pool: TransactionPool + Clone + 'static,
+    Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>> + Clone + 'static,
     Evm: ConfigureEvm,
 {
     async fn spawn_payload_builder_service(

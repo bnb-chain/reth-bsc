@@ -36,6 +36,7 @@ pub mod mining_config;
 pub mod network;
 pub mod primitives;
 pub mod storage;
+mod pooled_tx;
 
 /// Bsc addons configuring RPC types
 pub type BscNodeAddOns<N> = RpcAddOns<
