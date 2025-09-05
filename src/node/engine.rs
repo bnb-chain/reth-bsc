@@ -167,20 +167,6 @@ where
             } else {
                 info!("Genesis header already cached");
             }
-            
-            // Verify the genesis header is actually in cache
-            if let Some(cached_genesis) = cache.get_header_by_number(0) {
-                info!("Verified genesis header in cache: block={}, hash={}", cached_genesis.number(), cached_genesis.hash_slow());
-            } else {
-                error!("Genesis header still not in cache after insertion!");
-            }
-        }
-
-        // Trigger genesis snapshot creation by attempting to get snapshot for block 0
-        if self.snapshot_provider.snapshot(0).is_none() {
-            warn!("Failed to get or create genesis snapshot, mining may fail");
-        } else {
-            info!("Genesis snapshot available or created successfully");
         }
 
         info!("Starting BSC mining service for validator: {}", self.validator_address);
