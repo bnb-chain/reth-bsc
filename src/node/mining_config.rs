@@ -162,8 +162,8 @@ impl MiningConfig {
 static GLOBAL_MINING_CONFIG: OnceLock<MiningConfig> = OnceLock::new();
 
 /// Set a global mining configuration to override env defaults (typically from CLI args)
-pub fn set_global_mining_config(cfg: MiningConfig) -> Result<(), MiningConfig> {
-    GLOBAL_MINING_CONFIG.set(cfg)
+pub fn set_global_mining_config(cfg: MiningConfig) -> Result<(), Box<MiningConfig>> {
+    GLOBAL_MINING_CONFIG.set(cfg).map_err(Box::new)
 }
 
 /// Get the global mining configuration override if set

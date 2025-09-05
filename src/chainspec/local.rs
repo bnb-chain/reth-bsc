@@ -37,7 +37,7 @@ pub fn head() -> Head {
 
 #[cfg(test)]
 mod tests {
-    use crate::chainspec::bsc::{bsc_mainnet, head};
+    use crate::chainspec::bsc::head;
     use alloy_primitives::hex;
     use reth_chainspec::{ForkHash, ForkId};
     use crate::chainspec::local::bsc_local;

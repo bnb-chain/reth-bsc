@@ -121,6 +121,7 @@ impl<ChainSpec> BscExecutionPayloadValidator<ChainSpec>
 where
     ChainSpec: EthChainSpec + BscHardforks,
 {
+    // TODO: only a checker func, and nothing need to change.
     pub fn ensure_well_formed_payload(
         &self,
         payload: BscExecutionData,
@@ -128,15 +129,14 @@ where
         let block = payload.0;
 
         let expected_hash = block.header.hash_slow();
-        let sealed_block;
-        match &self.sealed_block {
+        let sealed_block = match &self.sealed_block {
             Some(to_sealed) => {
-                sealed_block = to_sealed.clone();
+                to_sealed.clone()
             }
-            None => {
-                sealed_block = block.seal_slow();
+             None => {
+                block.seal_slow()
             }
-        }
+        };
 
         // Ensure the hash included in the payload matches the block hash
         if expected_hash != sealed_block.hash() {

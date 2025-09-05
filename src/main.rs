@@ -79,7 +79,9 @@ fn main() -> eyre::Result<()> {
                 mining_config = mining_config.ensure_keys_available();
 
                 // Best-effort set; ignore error if already set
-                let _ = mining_config::set_global_mining_config(mining_config);
+                if let Err(_boxed_config) = mining_config::set_global_mining_config(mining_config) {
+                    tracing::warn!("Mining config already set, ignoring new configuration");
+                }
             }
 
             let (node, engine_handle_tx) = BscNode::new();

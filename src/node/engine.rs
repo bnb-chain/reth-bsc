@@ -243,11 +243,12 @@ where
         let scheduled_ms = parent_ts_ms + period_ms;
 
         // Candidate header for backoff calculation
-        let mut candidate = alloy_consensus::Header::default();
-        candidate.number = parent.number() + 1;
-        candidate.timestamp = scheduled_ms / 1000; // seconds part for header
-        candidate.beneficiary = self.validator_address;
-        candidate.difficulty = U256::from(DIFF_NOTURN);
+        let candidate = alloy_consensus::Header { 
+            number: parent.number() + 1, 
+            timestamp: scheduled_ms / 1000, 
+            beneficiary: self.validator_address, 
+            difficulty: U256::from(DIFF_NOTURN), 
+            ..Default::default() };
 
         // Compute final delay using Parlia helper (ms)
         let left_over_ms: u64 = 0; // reserved time for finalize
@@ -260,7 +261,7 @@ where
 
         // Final time in seconds (ceil ms)
         let target_ms = scheduled_ms + delay_ms;
-        let target_secs = (target_ms + 999) / 1000;
+        let target_secs = target_ms.div_ceil(1000);
         Ok(target_secs)
     }
 

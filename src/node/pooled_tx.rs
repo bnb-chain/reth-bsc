@@ -1,3 +1,4 @@
+// TODO: tmp mock, and will remove it later.
 use alloy_consensus::transaction::Recovered;
 use alloy_consensus::{
     EthereumTxEnvelope, SignableTransaction, TxEip1559, TxEip2930, TxEip4844, TxEip4844Variant,
@@ -15,9 +16,7 @@ fn mock_eth_pooled_transaction_new_legacy(
             .into_signed(Signature::test_signature()),
     );
     let transaction = Recovered::new_unchecked(tx, Default::default());
-    let pooled_tx = EthPooledTransaction::new(transaction.clone(), 200);
-
-    pooled_tx
+    EthPooledTransaction::new(transaction.clone(), 200)
 }
 
 #[allow(unused)]
@@ -29,8 +28,7 @@ fn mock_eth_pooled_transaction_new_eip2930(
             .into_signed(Signature::test_signature()),
     );
     let transaction = Recovered::new_unchecked(tx, Default::default());
-    let pooled_tx = EthPooledTransaction::new(transaction.clone(), 200);
-    pooled_tx
+    EthPooledTransaction::new(transaction.clone(), 200)
 }
 
 #[allow(unused)]
@@ -47,8 +45,7 @@ fn mock_eth_pooled_transaction_new_eip1559(
         .into_signed(Signature::test_signature()),
     );
     let transaction = Recovered::new_unchecked(tx, Default::default());
-    let pooled_tx = EthPooledTransaction::new(transaction.clone(), 200);
-    pooled_tx
+    EthPooledTransaction::new(transaction.clone(), 200)
 }
 
 #[allow(unused)]
@@ -67,9 +64,7 @@ fn mock_eth_pooled_transaction_new_eip4844() -> EthPooledTransaction<EthereumTxE
         .into_signed(Signature::test_signature()),
     );
     let transaction = Recovered::new_unchecked(tx, Default::default());
-    let pooled_tx = EthPooledTransaction::new(transaction.clone(), 300);
-
-    pooled_tx
+    EthPooledTransaction::new(transaction.clone(), 300)
 }
 
 #[allow(unused)]
