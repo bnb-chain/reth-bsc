@@ -133,7 +133,7 @@ where
             Some(to_sealed) => {
                 to_sealed.clone()
             }
-             None => {
+            None => {
                 block.seal_slow()
             }
         };
