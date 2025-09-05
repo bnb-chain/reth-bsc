@@ -1,5 +1,6 @@
 use crate::consensus::parlia::util::calculate_millisecond_timestamp;
 use crate::node::engine_api::validator::{BscEngineValidator, BscExecutionData};
+use crate::node::evm::util::HEADER_CACHE_READER;
 use crate::{
     consensus::parlia::{provider::SnapshotProvider, seal::SealBlock},
     node::{
@@ -20,6 +21,7 @@ use reth::{
     payload::{PayloadBuilderHandle, PayloadServiceCommand},
     transaction_pool::TransactionPool,
 };
+use reth_chainspec::EthChainSpec;
 use reth_engine_primitives::PayloadValidator;
 use reth_evm::ConfigureEvm;
 use reth_payload_primitives::BuiltPayload;
@@ -27,11 +29,9 @@ use reth_primitives::{SealedBlock, TransactionSigned};
 use reth_provider::{BlockNumReader, HeaderProvider};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use reth_chainspec::EthChainSpec;
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
-use crate::node::evm::util::HEADER_CACHE_READER;
 
 /// Built payload for BSC. This is similar to [`EthBuiltPayload`] but without sidecars as those
 /// included into [`BscBlock`].
@@ -79,7 +79,9 @@ pub struct BscMiner<Pool, Provider> {
 
 impl<Pool, Provider> BscMiner<Pool, Provider>
 where
-    Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>> + Clone + 'static,
+    Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>>
+        + Clone
+        + 'static,
     Provider: HeaderProvider<Header = alloy_consensus::Header>
         + BlockNumReader
         + Clone
@@ -159,10 +161,26 @@ where
                 } else {
                     // Build the genesis header from the chain spec as fallback
                     let genesis_header = self.chain_spec.genesis_header().clone();
-                    cache.insert_header_to_cache(genesis_header);
+                    cache.insert_header_to_cache(genesis_header.clone());
                     info!("Inserted genesis header from chain spec into cache");
                 }
+            } else {
+                info!("Genesis header already cached");
             }
+            
+            // Verify the genesis header is actually in cache
+            if let Some(cached_genesis) = cache.get_header_by_number(0) {
+                info!("Verified genesis header in cache: block={}, hash={}", cached_genesis.number(), cached_genesis.hash_slow());
+            } else {
+                error!("Genesis header still not in cache after insertion!");
+            }
+        }
+
+        // Trigger genesis snapshot creation by attempting to get snapshot for block 0
+        if self.snapshot_provider.snapshot(0).is_none() {
+            warn!("Failed to get or create genesis snapshot, mining may fail");
+        } else {
+            info!("Genesis snapshot available or created successfully");
         }
 
         info!("Starting BSC mining service for validator: {}", self.validator_address);
@@ -411,7 +429,9 @@ where
 impl<Node, Pool, Evm> PayloadServiceBuilder<Node, Pool, Evm> for BscPayloadServiceBuilder
 where
     Node: FullNodeTypes<Types = BscNode>,
-    Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>> + Clone + 'static,
+    Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>>
+        + Clone
+        + 'static,
     Evm: ConfigureEvm,
 {
     async fn spawn_payload_builder_service(

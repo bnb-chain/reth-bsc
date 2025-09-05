@@ -1,11 +1,10 @@
 //! Chain specification for BSC, credits to: <https://github.com/bnb-chain/reth/blob/main/crates/bsc/chainspec/src/bsc.rs>
 use crate::hardforks::bsc::BscHardfork;
-use alloy_primitives::{BlockHash, U256};
+use alloy_primitives::U256;
 use reth_chainspec::{
     make_genesis_header, BaseFeeParams, BaseFeeParamsKind, Chain, ChainSpec, Head, NamedChain,
 };
 use reth_primitives::SealedHeader;
-use std::str::FromStr;
 
 pub fn bsc_local() -> ChainSpec {
     let genesis = serde_json::from_str(include_str!("genesis_local.json"))
@@ -13,20 +12,18 @@ pub fn bsc_local() -> ChainSpec {
     let hardforks = BscHardfork::bsc_local();
     ChainSpec {
         chain: Chain::from_named(NamedChain::BinanceSmartChain),
-        genesis: serde_json::from_str(include_str!("genesis.json"))
-            .expect("Can't deserialize BSC Mainnet genesis json"),
+        genesis: serde_json::from_str(include_str!("genesis_local.json"))
+            .expect("Can't deserialize BSC Local genesis json"),
         paris_block_and_final_difficulty: Some((0, U256::from(0))),
         hardforks: hardforks.clone(),
         deposit_contract: None,
         base_fee_params: BaseFeeParamsKind::Constant(BaseFeeParams::new(1, 1)),
         prune_delete_limit: 3500,
-        genesis_header: SealedHeader::new(
-            make_genesis_header(&genesis, &hardforks),
-            BlockHash::from_str(
-                "0x0d21840abff46b96c84b2ac9e10e4f5cdaeb5693cb665db62a2f3b02d2d57b5b",
-            )
-                .unwrap(),
-        ),
+        genesis_header: {
+            let header = make_genesis_header(&genesis, &hardforks);
+            let hash = header.hash_slow();
+            SealedHeader::new(header, hash)
+        },
         ..Default::default()
     }
 }
@@ -37,7 +34,7 @@ pub fn head() -> Head {
 
 #[cfg(test)]
 mod tests {
-    use crate::chainspec::bsc::{bsc_mainnet, head};
+    use crate::chainspec::bsc::head;
     use alloy_primitives::hex;
     use reth_chainspec::{ForkHash, ForkId};
     use crate::chainspec::local::bsc_local;

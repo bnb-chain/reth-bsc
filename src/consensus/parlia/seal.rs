@@ -213,6 +213,38 @@ impl SealBlock {
     fn sign_fn(&self, data: &[u8]) -> Result<Vec<u8>, ConsensusError> {
         let hash = keccak256(data);
         let sig_result: Signature = self.signing_key.sign(hash.as_slice());
-        Ok(sig_result.to_bytes().to_vec())
+        let mut sig_bytes = sig_result.to_bytes().to_vec(); // 64 bytes (r + s)
+        
+        // Calculate recovery ID by trying both possible values
+        let recovery_id = self.calculate_recovery_id(hash.as_slice(), &sig_result)?;
+        sig_bytes.push(recovery_id); // 1 byte recovery ID
+        
+        Ok(sig_bytes)
+    }
+    
+    fn calculate_recovery_id(&self, hash: &[u8], sig: &Signature) -> Result<u8, ConsensusError> {
+        use k256::ecdsa::{RecoveryId, VerifyingKey};
+        
+        let verifying_key = VerifyingKey::from(&self.signing_key);
+        
+        // Try recovery ID 0
+        if let Ok(recovery_id) = RecoveryId::try_from(0u8) {
+            if let Ok(recovered_key) = VerifyingKey::recover_from_prehash(hash, sig, recovery_id) {
+                if recovered_key == verifying_key {
+                    return Ok(0);
+                }
+            }
+        }
+        
+        // Try recovery ID 1
+        if let Ok(recovery_id) = RecoveryId::try_from(1u8) {
+            if let Ok(recovered_key) = VerifyingKey::recover_from_prehash(hash, sig, recovery_id) {
+                if recovered_key == verifying_key {
+                    return Ok(1);
+                }
+            }
+        }
+        
+        Err(ConsensusError::Other("Failed to determine recovery ID".into()))
     }
 }
