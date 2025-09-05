@@ -187,17 +187,29 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
         let signature_bytes = &extra_data[signature_offset..signature_offset + EXTRA_SEAL_LEN - 1];
 
         let recovery_id = RecoveryId::try_from(recovery_byte)
-            .map_err(|_| ParliaConsensusError::RecoverECDSAInnerError)?;
+            .map_err(|err| {
+                tracing::error!("Failed to create RecoveryId from recovery_byte {}: {}", recovery_byte, err);
+                ParliaConsensusError::RecoverECDSAInnerError
+            })?;
         let signature = RecoverableSignature::from_compact(signature_bytes, recovery_id)
-            .map_err(|_| ParliaConsensusError::RecoverECDSAInnerError)?;
+            .map_err(|err| {
+                tracing::error!("Failed to recover signature from signature_bytes (len={}), recovery_id={}: {}", signature_bytes.len(), recovery_byte, err);
+                ParliaConsensusError::RecoverECDSAInnerError
+            })?;
 
         let message = Message::from_digest_slice(
                             hash_with_chain_id(header, self.spec.chain().id()).as_slice(),
         )
-        .map_err(|_| ParliaConsensusError::RecoverECDSAInnerError)?;
+        .map_err(|err| {
+            tracing::error!("Failed to create Message from hash digest: {}", err);
+            ParliaConsensusError::RecoverECDSAInnerError
+        })?;
         let public = &SECP256K1
             .recover_ecdsa(&message, &signature)
-            .map_err(|_| ParliaConsensusError::RecoverECDSAInnerError)?;
+            .map_err(|err| {
+                tracing::error!("Failed to recover ECDSA public key from message and signature: {}", err);
+                ParliaConsensusError::RecoverECDSAInnerError
+            })?;
 
         let proposer =
             Address::from_slice(&alloy_primitives::keccak256(&public.serialize_uncompressed()[1..])[12..]);
