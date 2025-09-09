@@ -5,6 +5,8 @@ use crate::{
     consensus::parlia::{provider::SnapshotProvider, seal::SealBlock},
     node::{
         engine_api::payload::BscPayloadTypes,
+        evm::config::BscEvmConfig,
+        miner::payload_builder::BscPayloadBuilder,
         mining_config::{keystore, MiningConfig},
         BscNode,
     },
@@ -229,7 +231,11 @@ where
         info!("Mining new block on top of block {}", parent_number);
 
         // Build and seal the block
-        self.mine_block_now(&head).await
+        // self.mine_block_now(&head).await
+        let evm_config = BscEvmConfig::new(self.chain_spec.clone());
+        let payload_builder = BscPayloadBuilder::new(self.provider.clone(), self.pool.clone(), evm_config);
+        let _execution_data = payload_builder.build_payload(&head)?;
+        Ok(())
     }
 
     /// Calculate the optimal time to mine the next block
