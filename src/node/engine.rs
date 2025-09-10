@@ -86,6 +86,7 @@ where
         + 'static,
     Provider: HeaderProvider<Header = alloy_consensus::Header>
         + BlockNumReader
+        + reth_provider::StateProviderFactory
         + Clone
         + Send
         + Sync
@@ -198,6 +199,7 @@ where
             .ok_or("Head block header not found")?;
 
         // Create sealed header for the current head block
+        // todo: remove it later, directly use the sealed header from provider.
         use alloy_primitives::keccak256;
         let head_hash = keccak256(alloy_rlp::encode(&head_header));
         let head = reth_primitives::SealedHeader::new(head_header, head_hash);
