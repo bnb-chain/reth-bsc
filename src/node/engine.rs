@@ -27,6 +27,7 @@ use reth_chainspec::EthChainSpec;
 use reth_engine_primitives::PayloadValidator;
 use reth_evm::ConfigureEvm;
 use reth_payload_primitives::BuiltPayload;
+use reth_ethereum_payload_builder::EthereumBuilderConfig;
 use reth_primitives::{SealedBlock, TransactionSigned};
 use reth_provider::{BlockNumReader, HeaderProvider};
 use std::sync::Arc;
@@ -34,10 +35,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
+use reth_basic_payload_builder::{BuildArguments, PayloadConfig};
+use reth::payload::EthPayloadBuilderAttributes;
+use reth_revm::cancelled::CancelOnDrop;
 
 /// Built payload for BSC. This is similar to [`EthBuiltPayload`] but without sidecars as those
 /// included into [`BscBlock`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct BscBuiltPayload {
     /// The built block
     pub(crate) block: Arc<SealedBlock<BscBlock>>,
@@ -195,17 +199,11 @@ where
         let current_block_number = self.provider.best_block_number()?;
         let head_header = self
             .provider
-            .header_by_number(current_block_number)?
+            .sealed_header(current_block_number)?
             .ok_or("Head block header not found")?;
 
-        // Create sealed header for the current head block
-        // todo: remove it later, directly use the sealed header from provider.
-        use alloy_primitives::keccak256;
-        let head_hash = keccak256(alloy_rlp::encode(&head_header));
-        let head = reth_primitives::SealedHeader::new(head_header, head_hash);
-
         let current_time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        let parent_number = head.number();
+        let parent_number = head_header.number();
 
         // Get snapshot for parent block to check authorization
         let snapshot = self
@@ -224,7 +222,7 @@ where
         }
 
         // Calculate when we should mine based on turn and backoff
-        let next_block_time = self.calculate_next_block_time(&head, &snapshot, current_time)?;
+        let next_block_time = self.calculate_next_block_time(&head_header, &snapshot, current_time)?;
 
         if current_time < next_block_time {
             return Err(format!("Too early to mine, wait until {next_block_time}").into());
@@ -235,8 +233,13 @@ where
         // Build and seal the block
         // self.mine_block_now(&head).await
         let evm_config = BscEvmConfig::new(self.chain_spec.clone());
-        let payload_builder = BscPayloadBuilder::new(self.provider.clone(), self.pool.clone(), evm_config);
-        let _execution_data = payload_builder.build_payload(&head)?;
+        let payload_builder = BscPayloadBuilder::new(self.provider.clone(), self.pool.clone(), evm_config, EthereumBuilderConfig::new());
+        let _execution_data = payload_builder.build_payload(&head_header.clone(), BuildArguments::<EthPayloadBuilderAttributes, BscBuiltPayload>::new(
+            reth_revm::cached::CachedReads::default(),
+            PayloadConfig::new(Arc::new(head_header.clone()), EthPayloadBuilderAttributes::default()),
+            CancelOnDrop::default(),
+            None,
+        ))?;
         Ok(())
     }
 

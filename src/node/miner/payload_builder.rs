@@ -1,6 +1,6 @@
 
-use alloy_consensus::Header;
 use alloy_primitives::{Address, U256};
+use reth_primitives::SealedHeader;
 use crate::node::engine::BscBuiltPayload;
 use crate::node::evm::config::BscEvmConfig;
 use reth_provider::StateProviderFactory;
@@ -18,7 +18,10 @@ use reth_evm::block::{BlockExecutionError, BlockValidationError};
 use reth::transaction_pool::error::InvalidPoolTransactionError;
 use reth_primitives::InvalidTransactionError;
 use reth_evm::execute::BlockBuilderOutcome;
+use reth_ethereum_payload_builder::EthereumBuilderConfig;
 use std::sync::Arc;
+use reth_basic_payload_builder::BuildArguments;
+use reth::payload::EthPayloadBuilderAttributes;
 
 /// BSC payload builder, used to build payload for bsc miner.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,7 +32,8 @@ pub struct BscPayloadBuilder<Pool, Client, EvmConfig = BscEvmConfig> {
     pool: Pool,
     /// The type responsible for creating the evm.
     evm_config: EvmConfig,
-    // builder_config: EthereumBuilderConfig,
+    /// Payload builder configuration, now reuse eth builder config.
+    builder_config: EthereumBuilderConfig,
     // todo: aborted build task by new header.
 }
 
@@ -44,12 +48,12 @@ where
         client: Client,
         pool: Pool,
         evm_config: EvmConfig,
-        //builder_config: EthereumBuilderConfig,
+        builder_config: EthereumBuilderConfig,
     ) -> Self {
-        Self { client, pool, evm_config }
+        Self { client, pool, evm_config, builder_config }
     }
 
-    pub fn build_payload(&self, parent: &Header) -> Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn build_payload(&self, parent: &SealedHeader, _args: BuildArguments<EthPayloadBuilderAttributes, BscBuiltPayload>,) -> Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>> {
         // 1.prepare header field by parlia, such as timestamp, difficulty etc.
         // 2.apply change before execute, maybe need upgrade system contract.
         // 3.fetch tx-list from tx pool
@@ -58,23 +62,27 @@ where
         // 6.seal block by parlia
         // 7.queue to engine-api for memory tree and broadcast it block_import channel(maybe in here)
 
+        // let new_header = alloy_consensus::Header {
+        //     parent_hash: parent.hash(),
+        //     number: parent.number() + 1,
+        //     timestamp: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(), // 
+        //     beneficiary: self.validator_address,
+        //     gas_limit: parent.gas_limit(),
+        //     extra_data: Bytes::from(vec![0u8; 32 + 65]), // Vanity + seal placeholder
+        //     difficulty: self.calculate_difficulty(parent)?,
+        //     ..Default::default()
+        // };
+
 
         let state_provider = self.client.state_by_block_hash(parent.hash_slow())?;
         let state = StateProviderDatabase::new(&state_provider);
         let mut cached_reads = CachedReads::default();
         let mut db = State::builder().with_database(cached_reads.as_db_mut(state)).build();
-
-        // Convert Header to SealedHeader
-        // todo: remove it later.
-        let sealed_parent = reth_primitives::SealedHeader::new(
-            parent.clone(),
-            parent.hash_slow(),
-        );
         
         let mut builder = self.evm_config
         .builder_for_next_block(
             &mut db,
-            &sealed_parent,
+            &parent,
             NextBlockEnvAttributes {
                 timestamp: parent.timestamp + 1,
                 suggested_fee_recipient: Address::ZERO,
