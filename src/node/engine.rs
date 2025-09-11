@@ -232,14 +232,19 @@ where
 
         // Build and seal the block
         // self.mine_block_now(&head).await
+
+        // todo: prepare attributes
         let evm_config = BscEvmConfig::new(self.chain_spec.clone());
         let payload_builder = BscPayloadBuilder::new(self.provider.clone(), self.pool.clone(), evm_config, EthereumBuilderConfig::new());
-        let _execution_data = payload_builder.build_payload(&head_header.clone(), BuildArguments::<EthPayloadBuilderAttributes, BscBuiltPayload>::new(
+        let _execution_data = payload_builder.build_payload(BuildArguments::<EthPayloadBuilderAttributes, BscBuiltPayload>::new(
             reth_revm::cached::CachedReads::default(),
             PayloadConfig::new(Arc::new(head_header.clone()), EthPayloadBuilderAttributes::default()),
             CancelOnDrop::default(),
             None,
         ))?;
+        
+        // todo: seal block by parlia.
+        // todo: queue to engine-api for memory tree and broadcast it block_import channel.
         Ok(())
     }
 
