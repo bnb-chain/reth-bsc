@@ -38,6 +38,7 @@ use tracing::{debug, error, info, warn};
 use reth_basic_payload_builder::{BuildArguments, PayloadConfig};
 use reth::payload::EthPayloadBuilderAttributes;
 use reth_revm::cancelled::CancelOnDrop;
+use crate::consensus::parlia::util::calculate_difficulty;
 
 /// Built payload for BSC. This is similar to [`EthBuiltPayload`] but without sidecars as those
 /// included into [`BscBlock`].
@@ -197,13 +198,13 @@ where
     async fn try_mine_block(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Get current head block from chain state
         let current_block_number = self.provider.best_block_number()?;
-        let head_header = self
+        let parent_header = self
             .provider
             .sealed_header(current_block_number)?
             .ok_or("Head block header not found")?;
 
         let current_time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        let parent_number = head_header.number();
+        let parent_number = parent_header.number();
 
         // Get snapshot for parent block to check authorization
         let snapshot = self
@@ -222,7 +223,8 @@ where
         }
 
         // Calculate when we should mine based on turn and backoff
-        let next_block_time = self.calculate_next_block_time(&head_header, &snapshot, current_time)?;
+        // todo: fix it.
+        let next_block_time = self.calculate_next_block_time(&parent_header, &snapshot, current_time)?;
 
         if current_time < next_block_time {
             return Err(format!("Too early to mine, wait until {next_block_time}").into());
@@ -233,16 +235,24 @@ where
         // Build and seal the block
         // self.mine_block_now(&head).await
 
-        // todo: prepare attributes
+        // todo: check whether need difficulty/mix_hash fields, maybe need define bsc attributes.
+        let _diff = calculate_difficulty(&snapshot, self.validator_address);
+        let attributes = EthPayloadBuilderAttributes{
+            parent: parent_header.hash(),
+            timestamp: next_block_time,
+            suggested_fee_recipient: self.validator_address,
+            ..Default::default()
+        };
+
         let evm_config = BscEvmConfig::new(self.chain_spec.clone());
         let payload_builder = BscPayloadBuilder::new(self.provider.clone(), self.pool.clone(), evm_config, EthereumBuilderConfig::new());
-        let _execution_data = payload_builder.build_payload(BuildArguments::<EthPayloadBuilderAttributes, BscBuiltPayload>::new(
+        let _payload = payload_builder.build_payload(BuildArguments::<EthPayloadBuilderAttributes, BscBuiltPayload>::new(
             reth_revm::cached::CachedReads::default(),
-            PayloadConfig::new(Arc::new(head_header.clone()), EthPayloadBuilderAttributes::default()),
+            PayloadConfig::new(Arc::new(parent_header.clone()), attributes),
             CancelOnDrop::default(),
             None,
         ))?;
-        
+
         // todo: seal block by parlia.
         // todo: queue to engine-api for memory tree and broadcast it block_import channel.
         Ok(())

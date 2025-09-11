@@ -5,6 +5,9 @@ use alloy_rlp::Encodable;
 use bytes::BufMut;
 use std::env;
 use super::constants::EXTRA_SEAL_LEN;
+use crate::consensus::parlia::Snapshot;
+use alloy_primitives::Address;
+use crate::consensus::parlia::{DIFF_NOTURN, DIFF_INTURN};
 
 const SECONDS_PER_DAY: u64 = 86400; // 24 * 60 * 60
 
@@ -117,6 +120,13 @@ pub fn calculate_millisecond_timestamp(header: &Header) -> u64 {
     };
 
     seconds * 1000 + ms_part
+}
+
+pub fn calculate_difficulty(snap: &Snapshot, signer: Address) -> U256 {
+    if snap.is_inturn(signer) {
+        return DIFF_INTURN
+    }
+    return DIFF_NOTURN
 }
 
 #[cfg(test)]
