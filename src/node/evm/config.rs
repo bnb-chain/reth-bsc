@@ -1,4 +1,8 @@
-use super::{assembler::BscBlockAssembler, executor::BscBlockExecutor, factory::BscEvmFactory};
+use super::{
+    assembler::BscBlockAssembler,
+    executor::BscBlockExecutor,
+    factory::BscEvmFactory,
+};
 use crate::{
     chainspec::BscChainSpec,
     evm::transaction::BscTxEnv,
@@ -37,6 +41,8 @@ pub struct BscBlockExecutionCtx<'a> {
     pub base: EthBlockExecutionCtx<'a>,
     /// Block header (optional for BSC-specific logic).
     pub header: Option<Header>,
+    /// Whether the block is being mined.
+    pub is_miner: bool,
 }
 
 impl<'a> BscBlockExecutionCtx<'a> {
@@ -311,6 +317,7 @@ where
                 withdrawals: block.body().withdrawals.as_ref().map(Cow::Borrowed),
             },
             header: Some(block.header().clone()),
+            is_miner: false,
         }
     }
 
@@ -327,6 +334,7 @@ where
                 withdrawals: attributes.withdrawals.map(Cow::Owned),
             },
             header: None, // No header available for next block context
+            is_miner: true,
         }
     }
 }
@@ -349,6 +357,7 @@ where
                 withdrawals: block.body.inner.withdrawals.as_ref().map(Cow::Borrowed),
             },
             header: Some(block.header.clone()),
+            is_miner: false,
         }
     }
 
