@@ -13,13 +13,15 @@ pub fn prepare_new_header(parlia: Arc<Parlia<BscChainSpec>>, parent_snap: &Snaps
     new_header.parent_hash = parent_header.hash_slow();
     new_header.beneficiary = signer;
     new_header.difficulty = calculate_difficulty(parent_snap, signer);
-    if new_header.extra_data.len() < EXTRA_VANITY_LEN{
+    if new_header.extra_data.len() < EXTRA_VANITY_LEN {
         new_header.extra_data = Bytes::from(vec![0u8; EXTRA_VANITY_LEN]);
     }
 
     parlia.prepare_timestamp(parent_snap, parent_header, &mut new_header);
     parlia.prepare_validators(parent_snap, parent_header, &mut new_header);
     parlia.prepare_turn_length(parent_snap, parent_header, &mut new_header);
+
+    // todo: Attestation
 
     return new_header;
 }

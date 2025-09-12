@@ -81,6 +81,8 @@ pub struct BscMiner<Pool, Provider> {
     parlia: Arc<crate::consensus::parlia::Parlia<crate::chainspec::BscChainSpec>>,
     signing_key: Option<SigningKey>,
     mining_config: MiningConfig,
+
+    // todo: add more eventloop for performance like bsc miner.
 }
 
 impl<Pool, Provider> BscMiner<Pool, Provider>
