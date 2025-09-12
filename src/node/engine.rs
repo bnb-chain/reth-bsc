@@ -6,7 +6,7 @@ use crate::{
     node::{
         engine_api::payload::BscPayloadTypes,
         evm::config::BscEvmConfig,
-        miner::payload_builder::BscPayloadBuilder,
+        miner::{payload_builder::BscPayloadBuilder, util::prepare_new_header},
         mining_config::{keystore, MiningConfig},
         BscNode,
     },
@@ -232,10 +232,12 @@ where
 
         info!("Mining new block on top of block {}", parent_number);
 
+        let _new_header = prepare_new_header(self.parlia.clone(), &snapshot, &parent_header, self.validator_address);
+
         // Build and seal the block
         // self.mine_block_now(&head).await
 
-        // todo: check whether need difficulty/mix_hash fields, maybe need define bsc attributes.
+        // todo: check whether need difficulty/mix_hash fields, maybe need define new bsc attributes.
         let _diff = calculate_difficulty(&snapshot, self.validator_address);
         let attributes = EthPayloadBuilderAttributes{
             parent: parent_header.hash(),

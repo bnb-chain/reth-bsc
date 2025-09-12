@@ -10,6 +10,7 @@ pub mod validation;
 pub mod db;
 pub mod seal;
 pub mod go_rng;
+pub mod ramanujan_fork;
 
 #[cfg(test)]     
 mod tests;  

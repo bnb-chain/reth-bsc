@@ -122,6 +122,13 @@ pub fn calculate_millisecond_timestamp(header: &Header) -> u64 {
     seconds * 1000 + ms_part
 }
 
+pub fn set_millisecond_part_of_timestamp(timestamp_ms: u64, header: &mut Header) {
+    let milliseconds_part = timestamp_ms % 1000;
+    let mut mix_hash_bytes = [0u8; 32];
+    mix_hash_bytes[24..32].copy_from_slice(&milliseconds_part.to_be_bytes());
+    header.mix_hash = B256::new(mix_hash_bytes);
+}
+
 pub fn calculate_difficulty(snap: &Snapshot, signer: Address) -> U256 {
     if snap.is_inturn(signer) {
         return DIFF_INTURN

@@ -19,6 +19,7 @@ use super::{
     },
     hash_with_chain_id,
     provider::ValidatorsInfo,
+    util::set_millisecond_part_of_timestamp,
     BACKOFF_TIME_OF_INITIAL, BACKOFF_TIME_OF_WIGGLE, DEFAULT_TURN_LENGTH,LORENTZ_BACKOFF_TIME_OF_INITIAL,
 };
 use crate::consensus::parlia::go_rng::{RngSource, Shuffle};
@@ -467,6 +468,15 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
         }
 
         delay_ms
+    }
+
+    pub fn prepare_header_timestamp(&self, millisecond_timestamp: u64, header: &mut Header) {
+        header.timestamp = millisecond_timestamp / 1000;
+        if self.spec.is_lorentz_active_at_timestamp(header.number, header.timestamp) {
+            set_millisecond_part_of_timestamp(millisecond_timestamp, header);
+        } else {
+            header.mix_hash = B256::ZERO;
+        }
     }
 
 }
