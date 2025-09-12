@@ -433,4 +433,13 @@ where
                 BscBlockExecutionError::UnknownHeader { block_hash: snap.vote_data.target_hash }.into()
             })
     }
+
+    /// prepare some intermediate data for produce new block.
+    /// todo: only used by miner.
+    pub(crate) fn prepare_new_block(
+        &mut self, 
+        _block: &BlockEnv
+    ) -> Result<(), BlockExecutionError> {
+        todo!()
+    }
 }

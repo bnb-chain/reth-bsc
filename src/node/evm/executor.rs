@@ -254,7 +254,9 @@ where
     fn apply_pre_execution_changes(&mut self) -> Result<(), BlockExecutionError> {
         // pre check and prepare some intermediate data for commit parlia snapshot in finish function.
         let block_env = self.evm.block().clone();
-        if !self.ctx.is_miner {
+        if self.ctx.is_miner {
+            self.prepare_new_block(&block_env)?;
+        } else {
             self.check_new_block(&block_env)?;
         }
         
@@ -360,10 +362,10 @@ where
             self.initialize_feynman_contracts(self.evm.block().beneficiary)?;
         }
 
-        if !self.ctx.is_miner {
-            self.post_check_new_block(&self.evm.block().clone())?;
-        } else {
+        if self.ctx.is_miner {
             self.finalize_new_block(&self.evm.block().clone())?;
+        } else {
+            self.post_check_new_block(&self.evm.block().clone())?;
         }
 
         Ok((
@@ -376,8 +378,8 @@ where
         ))
     }
 
-    fn set_state_hook(&mut self, _hook: Option<Box<dyn OnStateHook>>) {
-        self.system_caller.with_state_hook(_hook);
+    fn set_state_hook(&mut self, hook: Option<Box<dyn OnStateHook>>) {
+        self.system_caller.with_state_hook(hook);
     }
 
     fn evm_mut(&mut self) -> &mut Self::Evm {
