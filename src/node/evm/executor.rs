@@ -361,10 +361,9 @@ where
         }
 
         if !self.ctx.is_miner {
-            self.finalize_new_block(&self.evm.block().clone())?;
+            self.post_check_new_block(&self.evm.block().clone())?;
         } else {
-            tracing::trace!("Miner block, skip finalize_new_block");
-            // TODO: add system txs to the block.
+            self.finalize_new_block(&self.evm.block().clone())?;
         }
 
         Ok((

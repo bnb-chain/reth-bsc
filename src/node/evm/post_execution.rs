@@ -35,9 +35,9 @@ where
     BscTxEnv: IntoTxEnv<<EVM as alloy_evm::Evm>::Tx>,
     R::Transaction: Into<TransactionSigned>,
 {
-    /// finalize the new block, post check and finalize the system tx.
+    /// post check the new block, post check some parlia field and the system txs.
     /// depends on parlia, header and snapshot.
-    pub(crate) fn finalize_new_block(
+    pub(crate) fn post_check_new_block(
         &mut self, 
         block: &BlockEnv
     ) -> Result<(), BlockExecutionError> {
@@ -455,5 +455,14 @@ where
         )?;
 
         Ok(())
+    }
+
+    /// generate system txs and apply them, used by miner.
+    /// TODO: impl it.
+    pub(crate) fn finalize_new_block(
+        &mut self, 
+        _block: &BlockEnv
+    ) -> Result<(), BlockExecutionError> {
+        todo!()
     }
 }
