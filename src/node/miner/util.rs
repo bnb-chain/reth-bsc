@@ -13,8 +13,7 @@ pub fn prepare_new_header(parlia: Arc<Parlia<BscChainSpec>>, parent_snap: &Snaps
     new_header.beneficiary = signer;
     new_header.difficulty = calculate_difficulty(parent_snap, signer);
 
-    let new_block_time = parlia.block_time_for_ramanujan_fork(parent_snap, parent_header, &new_header);
-    parlia.prepare_header_timestamp(new_block_time, &mut new_header);
+    parlia.prepare_timestamp(parent_snap, parent_header, &mut new_header);
 
 
     // new_header.timestamp = parlia.block_time_for_ramanujan_fork(snap, parent, &new_header);

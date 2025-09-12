@@ -470,12 +470,13 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
         delay_ms
     }
 
-    pub fn prepare_header_timestamp(&self, millisecond_timestamp: u64, header: &mut Header) {
-        header.timestamp = millisecond_timestamp / 1000;
-        if self.spec.is_lorentz_active_at_timestamp(header.number, header.timestamp) {
-            set_millisecond_part_of_timestamp(millisecond_timestamp, header);
+    pub fn prepare_timestamp(&self, parent_snap: &Snapshot, parent_header: &Header, new_header: &mut Header) {
+        let millisecond_timestamp = self.block_time_for_ramanujan_fork(parent_snap, parent_header, &new_header);
+        new_header.timestamp = millisecond_timestamp / 1000;
+        if self.spec.is_lorentz_active_at_timestamp(new_header.number, new_header.timestamp) {
+            set_millisecond_part_of_timestamp(millisecond_timestamp, new_header);
         } else {
-            header.mix_hash = B256::ZERO;
+            new_header.mix_hash = B256::ZERO;
         }
     }
 
