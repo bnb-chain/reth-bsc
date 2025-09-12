@@ -60,6 +60,7 @@ where
 
         let state_provider = self.client.state_by_block_hash(parent_header.hash_slow())?;
         let state = StateProviderDatabase::new(&state_provider);
+        // todo: query validators from state and cache.
         let mut db = State::builder().with_database(cached_reads.as_db_mut(state)).build();
         
         let mut builder = self.evm_config

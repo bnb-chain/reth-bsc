@@ -38,7 +38,6 @@ use tracing::{debug, error, info, warn};
 use reth_basic_payload_builder::{BuildArguments, PayloadConfig};
 use reth::payload::EthPayloadBuilderAttributes;
 use reth_revm::cancelled::CancelOnDrop;
-use crate::consensus::parlia::util::calculate_difficulty;
 
 /// Built payload for BSC. This is similar to [`EthBuiltPayload`] but without sidecars as those
 /// included into [`BscBlock`].
@@ -203,7 +202,7 @@ where
             .sealed_header(current_block_number)?
             .ok_or("Head block header not found")?;
 
-        let current_time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        // let current_time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         let parent_number = parent_header.number();
 
         // Get snapshot for parent block to check authorization
@@ -224,24 +223,21 @@ where
 
         // Calculate when we should mine based on turn and backoff
         // todo: fix it.
-        let next_block_time = self.calculate_next_block_time(&parent_header, &snapshot, current_time)?;
+        // let next_block_time = self.calculate_next_block_time(&parent_header, &snapshot, current_time)?;
 
-        if current_time < next_block_time {
-            return Err(format!("Too early to mine, wait until {next_block_time}").into());
-        }
+        // if current_time < next_block_time {
+        //     return Err(format!("Too early to mine, wait until {next_block_time}").into());
+        // }
 
-        info!("Mining new block on top of block {}", parent_number);
-
-        let _new_header = prepare_new_header(self.parlia.clone(), &snapshot, &parent_header, self.validator_address);
+        // info!("Mining new block on top of block {}", parent_number);
 
         // Build and seal the block
         // self.mine_block_now(&head).await
 
-        // todo: check whether need difficulty/mix_hash fields, maybe need define new bsc attributes.
-        let _diff = calculate_difficulty(&snapshot, self.validator_address);
+        let new_header = prepare_new_header(self.parlia.clone(), &snapshot, &parent_header, self.validator_address);
         let attributes = EthPayloadBuilderAttributes{
-            parent: parent_header.hash(),
-            timestamp: next_block_time,
+            parent: new_header.parent_hash.into(),
+            timestamp: new_header.timestamp,
             suggested_fee_recipient: self.validator_address,
             ..Default::default()
         };

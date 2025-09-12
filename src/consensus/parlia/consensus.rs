@@ -480,4 +480,12 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
         }
     }
 
+    pub fn prepare_validators(&self, _parent_snap: &Snapshot, _parent_header: &Header, _new_header: &mut Header) {
+        todo!()
+    }
+
+    pub fn prepare_turn_length(&self, _parent_snap: &Snapshot, _parent_header: &Header, _new_header: &mut Header) {
+        todo!()
+    }
+
 }
