@@ -535,7 +535,7 @@ where
         }
 
         {   // prepare new header in miner mode.
-            let epoch_length = self.parlia.get_epoch_length(&header);
+            let epoch_length = self.inner_ctx.snap.as_ref().unwrap().epoch_num;
             if header.number % epoch_length == 0 && self.spec.is_bohr_active_at_timestamp(header.number, header.timestamp) {
                 self.ctx.turn_length = self.get_turn_length(&header)?;
             }

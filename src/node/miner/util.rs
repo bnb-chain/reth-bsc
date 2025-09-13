@@ -5,12 +5,13 @@ use crate::consensus::parlia::Snapshot;
 use crate::consensus::parlia::consensus::Parlia;
 use crate::consensus::parlia::util::calculate_difficulty;
 use crate::chainspec::BscChainSpec;
-use crate::consensus::parlia::EXTRA_VANITY_LEN;
+use crate::consensus::parlia::{EXTRA_VANITY_LEN, EXTRA_SEAL_LEN};
 use reth::payload::EthPayloadBuilderAttributes;
 use crate::hardforks::BscHardforks;
 use alloy_primitives::B256;
 use reth_chainspec::EthChainSpec;
 use crate::node::evm::pre_execution::VALIDATOR_CACHE;
+use crate::node::miner::signer::seal_header_with_global_signer;
 
 pub fn prepare_new_attributes(parlia: Arc<Parlia<BscChainSpec>>, parent_snap: &Snapshot, parent_header: &Header, signer: Address) -> EthPayloadBuilderAttributes {
     let new_header = prepare_new_header(parlia.clone(), parent_snap, parent_header, signer);
@@ -37,7 +38,13 @@ where
     return new_header;
 }
 
-pub fn finalize_new_header<ChainSpec>(parlia: Arc<Parlia<ChainSpec>>, parent_snap: &Snapshot, parent_header: &Header, new_header: &mut Header) 
+/// finalize a new header and seal it.
+pub fn finalize_new_header<ChainSpec>(
+    parlia: Arc<Parlia<ChainSpec>>, 
+    parent_snap: &Snapshot, 
+    parent_header: &Header, 
+    turn_length: Option<u8>,
+    new_header: &mut Header) -> Result<(), crate::node::miner::signer::SignerError>
 where
     ChainSpec: EthChainSpec + crate::hardforks::BscHardforks + 'static,
 {
@@ -58,12 +65,25 @@ where
             
             parlia.prepare_validators(validators, new_header);
         }
-
     }
-    
-    // todo: now doing
-    //parlia.prepare_turn_length(parent_snap, parent_header, new_header);
 
-    // todo: Attestation
-    //todo!()
+    {   // prepare turn length
+        parlia.prepare_turn_length(parent_snap, turn_length, new_header);
+    }
+
+    // todo: assembleVoteAttestation
+
+    {   // seal header
+        let mut extra_data = new_header.extra_data.to_vec();
+        extra_data.extend_from_slice(&[0u8; EXTRA_SEAL_LEN]);
+        new_header.extra_data = Bytes::from(extra_data);
+        
+        let seal_data = seal_header_with_global_signer(new_header, parlia.spec.chain().id())?;
+        let mut extra_data = new_header.extra_data.to_vec();
+        let start = extra_data.len() - EXTRA_SEAL_LEN;
+        extra_data[start..].copy_from_slice(&seal_data);
+        new_header.extra_data = Bytes::from(extra_data);
+    }
+
+    Ok(())
 }

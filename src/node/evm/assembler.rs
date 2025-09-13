@@ -141,12 +141,15 @@ where
                 .unwrap()
                 .snapshot(header.number - 1)
                 .ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;
-            crate::node::miner::util::finalize_new_header(
+            if let Err(e) = crate::node::miner::util::finalize_new_header(
                 self.parlia.clone(), 
                 &parent_snap, 
                 &parent_header, 
+                ctx.turn_length,
                 &mut header
-            );
+            ) {
+                tracing::warn!("Failed to finalize header: {}", e);
+            }
         }
 
         Ok(Block {

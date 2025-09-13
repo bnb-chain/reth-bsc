@@ -528,8 +528,14 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
         new_header.extra_data = alloy_primitives::Bytes::from(extra_data);
     }
 
-    pub fn prepare_turn_length(&self, _parent_snap: &Snapshot, _parent_header: &Header, _new_header: &mut Header) {
-        todo!()
+    pub fn prepare_turn_length(&self, parent_snap: &Snapshot, turn_length: Option<u8>, new_header: &mut Header) {
+        let epoch_length = parent_snap.epoch_num;
+        if new_header.number % epoch_length != 0 || !self.spec.is_bohr_active_at_timestamp(new_header.number, new_header.timestamp) {
+            return;
+        }
+        let mut extra_data = new_header.extra_data.to_vec();
+        extra_data.push(turn_length.unwrap_or(DEFAULT_TURN_LENGTH) as u8);
+        new_header.extra_data = alloy_primitives::Bytes::from(extra_data);
     }
 
 }
