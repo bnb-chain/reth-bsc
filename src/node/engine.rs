@@ -71,6 +71,7 @@ impl BuiltPayload for BscBuiltPayload {
 pub struct BscPayloadServiceBuilder;
 
 /// Mining Service that handles block production for BSC
+/// todo: move to miner/miner.rs
 pub struct BscMiner<Pool, Provider> {
     pool: Pool,
     provider: Provider,
@@ -367,7 +368,6 @@ where
         // Handle payload service commands (keep minimal compatibility)
         ctx.task_executor().spawn_critical("payload-service-handler", async move {
             let mut subscriptions = Vec::new();
-
             while let Some(message) = rx.recv().await {
                 match message {
                     PayloadServiceCommand::Subscribe(tx) => {

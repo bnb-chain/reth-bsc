@@ -14,14 +14,13 @@ use crate::node::miner::signer::seal_header_with_global_signer;
 
 pub fn prepare_new_attributes(parlia: Arc<Parlia<BscChainSpec>>, parent_snap: &Snapshot, parent_header: &Header, signer: Address) -> EthPayloadBuilderAttributes {
     let new_header = prepare_new_header(parlia.clone(), parent_snap, parent_header, signer);
-    let attributes = EthPayloadBuilderAttributes{
+    EthPayloadBuilderAttributes{
         parent: new_header.parent_hash,
         timestamp: new_header.timestamp,
         suggested_fee_recipient: new_header.beneficiary,
         prev_randao: new_header.mix_hash,
         ..Default::default()
-    };
-    attributes
+    }
 }
 
 /// prepare a tmp new header for preparing attributes.

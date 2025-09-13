@@ -1,3 +1,4 @@
+// todo: refine or remove.
 use super::{
     constants::{DIFF_NOTURN, EXTRA_SEAL_LEN},
     vote_pool::fetch_vote_by_block_hash,

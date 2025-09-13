@@ -59,7 +59,6 @@ where
 
         let state_provider = self.client.state_by_block_hash(parent_header.hash_slow())?;
         let state = StateProviderDatabase::new(&state_provider);
-        // todo: query validators from state and cache.
         let mut db = State::builder().with_database(cached_reads.as_db_mut(state)).build();
         
         let mut builder = self.evm_config
@@ -77,7 +76,7 @@ where
             )
             .map_err(PayloadBuilderError::other)?;
 
-        // todo: rewrite in here.
+        // check: rewrite in here.
         builder.apply_pre_execution_changes().map_err(|err| {
             warn!(target: "payload_builder", %err, "failed to apply pre-execution changes");
             PayloadBuilderError::Internal(err.into())
@@ -88,7 +87,7 @@ where
         let block_gas_limit: u64 = builder.evm_mut().block().gas_limit;
 
         let base_fee = builder.evm_mut().block().basefee;
-        // todo: now only filter out blob tx by none blob fee for simple test.
+        // check: now only filter out blob tx by none blob fee for simple test.
         let mut best_tx_list = self.pool.best_transactions_with_attributes(BestTransactionsAttributes::new(base_fee, None));
         while let Some(pool_tx) = best_tx_list.next() {
             // ensure we still have capacity for this transaction
@@ -139,8 +138,8 @@ where
             cumulative_gas_used += gas_used;
         }
 
-        // todo: add system txs to payload, need to rewrite finish.
-        // todo: rewrite in here.
+        // add system txs to payload, need to rewrite finish.
+        // check: rewrite in here.
         let BlockBuilderOutcome { execution_result, block, .. } = builder.finish(&state_provider)?;
         let sealed_block = Arc::new(block.sealed_block().clone());
         let payload = BscBuiltPayload {
