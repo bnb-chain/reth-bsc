@@ -480,8 +480,52 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
         }
     }
 
-    pub fn prepare_validators(&self, _parent_snap: &Snapshot, _parent_header: &Header, _new_header: &mut Header) {
-        todo!()
+
+    pub fn prepare_validators(&self, validators: Option<(Vec<alloy_primitives::Address>, Vec<crate::consensus::parlia::VoteAddress>)>, new_header: &mut Header) {
+        let epoch_length = self.get_epoch_length(&new_header);
+        if (new_header.number) % epoch_length != 0 {
+            return;
+        }
+        let Some((mut new_validators, vote_address_map)) = validators else {
+            return;
+        };
+
+        new_validators.sort();
+        let is_luban_active = self.spec.is_luban_active_at_block(new_header.number);
+        let mut extra_data = new_header.extra_data.to_vec();
+        if !is_luban_active {
+            // Pre-Luban: append validator addresses directly to extra data
+            for validator in &new_validators {
+                extra_data.extend_from_slice(validator.as_slice());
+            }
+        } else {
+            // Luban active: append validator count first, then validators with vote addresses
+            extra_data.push(new_validators.len() as u8);
+            let mut vote_map = std::collections::HashMap::new();
+            let is_on_luban = self.spec.is_luban_active_at_block(new_header.number) && 
+                !self.spec.is_luban_active_at_block(new_header.number - 1);
+            if is_on_luban {
+                let zero_bls_key = VoteAddress::ZERO;
+                for validator in &new_validators {
+                    vote_map.insert(*validator, zero_bls_key);
+                }
+            } else {
+                for (i, validator) in new_validators.iter().enumerate() {
+                    if i < vote_address_map.len() {
+                        vote_map.insert(*validator, vote_address_map[i]);
+                    } else {
+                        vote_map.insert(*validator, VoteAddress::ZERO);
+                    }
+                }
+            }
+            for validator in &new_validators {
+                extra_data.extend_from_slice(validator.as_slice());
+                if let Some(vote_addr) = vote_map.get(validator) {
+                    extra_data.extend_from_slice(vote_addr.as_slice());
+                }
+            }
+        }
+        new_header.extra_data = alloy_primitives::Bytes::from(extra_data);
     }
 
     pub fn prepare_turn_length(&self, _parent_snap: &Snapshot, _parent_header: &Header, _new_header: &mut Header) {

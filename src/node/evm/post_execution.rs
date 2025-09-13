@@ -5,6 +5,7 @@ use crate::node::miner::signer::{sign_system_transaction, is_signer_initialized}
 use crate::consensus::parlia::{DIFF_INTURN, VoteAddress, VoteAttestation, snapshot::DEFAULT_TURN_LENGTH, constants::COLLECT_ADDITIONAL_VOTES_REWARD_RATIO, util::is_breathe_block};
 use crate::consensus::{SYSTEM_ADDRESS, MAX_SYSTEM_REWARD, SYSTEM_REWARD_PERCENT};
 use crate::evm::transaction::BscTxEnv;
+use crate::node::miner::util::prepare_new_header;
 use crate::system_contracts::{SLASH_CONTRACT, SYSTEM_REWARD_CONTRACT, feynman_fork::{ValidatorElectionInfo, get_top_validators_by_voting_power, ElectedValidators}};
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
 use reth_evm::{eth::receipt_builder::{ReceiptBuilder, ReceiptBuilderCtx}, execute::BlockExecutionError, Database, Evm, FromRecoveredTx, FromTxWithEncoded, IntoTxEnv, block::StateChangeSource};
@@ -102,6 +103,7 @@ where
         let epoch_length = self.parlia.get_epoch_length(&header);
         if (header.number + 1)% epoch_length == 0 {
             // cache it on pre block.
+            // for verify validators in post-check of fullnode mode and prepare new header in miner mode.
             self.get_current_validators(header.number)?;
         }
 
@@ -522,6 +524,21 @@ where
              )?;
             tracing::debug!("Update validator set, block_number: {}, max_elected_validators: {}, validators_election_info: {:?}", 
                 header_number, max_elected_validators, validators_election_info);
+        }
+
+        let header = prepare_new_header(self.parlia.clone(), self.inner_ctx.snap.as_ref().unwrap(), self.inner_ctx.parent_header.as_ref().unwrap(), self.evm.block().beneficiary);
+        let epoch_length = self.parlia.get_epoch_length(&header);
+        if (header.number + 1)% epoch_length == 0 {
+            // cache it on pre block.
+            // for verify validators in post-check of fullnode mode and prepare new header in miner mode.
+            self.get_current_validators(header.number)?;
+        }
+
+        {   // prepare new header in miner mode.
+            let epoch_length = self.parlia.get_epoch_length(&header);
+            if header.number % epoch_length == 0 && self.spec.is_bohr_active_at_timestamp(header.number, header.timestamp) {
+                self.ctx.turn_length = self.get_turn_length(&header)?;
+            }
         }
 
         Ok(())

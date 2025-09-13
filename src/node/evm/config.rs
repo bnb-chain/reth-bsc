@@ -43,6 +43,8 @@ pub struct BscBlockExecutionCtx<'a> {
     pub header: Option<Header>,
     /// Whether the block is being mined.
     pub is_miner: bool,
+    /// Used to finalize header in miner mode.
+    pub turn_length: Option<u8>,
 }
 
 impl<'a> BscBlockExecutionCtx<'a> {
@@ -318,6 +320,7 @@ where
             },
             header: Some(block.header().clone()),
             is_miner: false,
+            turn_length: None,
         }
     }
 
@@ -335,6 +338,7 @@ where
             },
             header: None, // No header available for next block context
             is_miner: true,
+            turn_length: None,
         }
     }
 }
@@ -358,6 +362,7 @@ where
             },
             header: Some(block.header.clone()),
             is_miner: false,
+            turn_length: None,
         }
     }
 

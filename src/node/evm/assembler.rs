@@ -1,6 +1,7 @@
 use crate::{
     node::evm::config::{BscBlockExecutorFactory, BscEvmConfig, BscBlockExecutionCtx},
     chainspec::BscChainSpec,
+    consensus::parlia::{SnapshotProvider, Parlia},
     BscBlock, BscBlockBody,
 };
 use alloy_consensus::{Block, BlockBody, Header, EMPTY_OMMER_ROOT_HASH, proofs, Transaction, BlockHeader};
@@ -17,17 +18,29 @@ use reth_provider::BlockExecutionResult;
 use std::sync::Arc;
 
 /// Block assembler for BSC, mainly for support BscBlockExecutionCtx.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BscBlockAssembler<ChainSpec = BscChainSpec> {
     /// The chainspec.
     pub chain_spec: Arc<ChainSpec>,
     /// Extra data to use for the blocks.
     pub extra_data: Bytes,
+    /// Snapshot provider for accessing Parlia validator snapshots.
+    pub(super) snapshot_provider: Option<Arc<dyn SnapshotProvider + Send + Sync>>,
+    /// Parlia consensus instance.
+    pub(crate) parlia: Arc<Parlia<ChainSpec>>,
 }
 
-impl<ChainSpec> BscBlockAssembler<ChainSpec> {
+impl<ChainSpec> BscBlockAssembler<ChainSpec> 
+where
+    ChainSpec: EthChainSpec + crate::hardforks::BscHardforks + 'static,
+{
     pub fn new(chain_spec: Arc<ChainSpec>) -> Self {
-        Self { chain_spec, extra_data: Default::default() }
+        Self { 
+            chain_spec: chain_spec.clone(), 
+            extra_data: Default::default(),  
+            snapshot_provider: crate::shared::get_snapshot_provider().cloned(),
+            parlia: Arc::new(Parlia::new(chain_spec, 200)),
+        }
     }
 }
 
@@ -38,7 +51,7 @@ where
         Transaction = TransactionSigned,
         Receipt = Receipt,
     >,
-    ChainSpec: EthChainSpec + EthereumHardforks,
+    ChainSpec: EthChainSpec + EthereumHardforks + crate::hardforks::BscHardforks + 'static,
 {
     type Block = Block<TransactionSigned>;
 
@@ -92,8 +105,7 @@ where
             };
         }
 
-        // todo: prepare header and seal it.
-        let header = Header {
+        let mut header = Header {
             parent_hash: eth_ctx.parent_hash,
             ommers_hash: EMPTY_OMMER_ROOT_HASH,
             beneficiary: evm_env.block_env.beneficiary,
@@ -116,8 +128,26 @@ where
             excess_blob_gas,
             requests_hash,
         };
-        // todo: seal block by parlia.
-        // finalize_new_header
+        
+        {   // finalize_new_header
+            let parent_header = crate::node::evm::util::HEADER_CACHE_READER
+                .lock()
+                .unwrap()
+                .get_header_by_number(header.number - 1)
+                .ok_or(BlockExecutionError::msg("Failed to get header from global header reader"))?;
+            let parent_snap = self
+                .snapshot_provider
+                .as_ref()
+                .unwrap()
+                .snapshot(header.number - 1)
+                .ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;
+            crate::node::miner::util::finalize_new_header(
+                self.parlia.clone(), 
+                &parent_snap, 
+                &parent_header, 
+                &mut header
+            );
+        }
 
         Ok(Block {
             header,
@@ -145,5 +175,16 @@ impl BlockAssembler<BscBlockExecutorFactory> for BscEvmConfig {
                 sidecars: None,
             },
         })
+    }
+}
+
+impl<ChainSpec> std::fmt::Debug for BscBlockAssembler<ChainSpec> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BscBlockAssembler")
+            .field("chain_spec", &"Arc<ChainSpec>")
+            .field("extra_data", &self.extra_data)
+            .field("snapshot_provider", &self.snapshot_provider.is_some())
+            .field("parlia", &"Arc<Parlia<ChainSpec>>")
+            .finish()
     }
 }
