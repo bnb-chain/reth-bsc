@@ -160,6 +160,24 @@ where
             return Ok(());
         }
 
+        // Initialize global signer if signing key is available
+        if let Some(ref signing_key) = self.signing_key {
+            use crate::node::miner::signer::init_global_signer;
+            use alloy_primitives::B256;
+            
+            // Convert SigningKey to B256
+            let private_key_bytes = signing_key.as_nonzero_scalar().to_bytes();
+            let private_key = B256::from_slice(&private_key_bytes);
+            
+            if let Err(e) = init_global_signer(private_key) {
+                warn!("Failed to initialize global signer: {}", e);
+            } else {
+                info!("Global signer initialized successfully");
+            }
+        } else {
+            warn!("No signing key available, global signer not initialized");
+        }
+
         // Ensure the genesis block header is cached so that the snapshot provider can create the genesis snapshot
         {
             let mut cache = HEADER_CACHE_READER.lock().unwrap();

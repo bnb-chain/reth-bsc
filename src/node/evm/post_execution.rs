@@ -1,6 +1,7 @@
 use super::executor::BscBlockExecutor;
 use super::error::BscBlockExecutionError;
 use super::util::set_nonce;
+use crate::node::miner::signer::{sign_system_transaction, is_signer_initialized};
 use crate::consensus::parlia::{DIFF_INTURN, VoteAddress, VoteAttestation, snapshot::DEFAULT_TURN_LENGTH, constants::COLLECT_ADDITIONAL_VOTES_REWARD_RATIO, util::is_breathe_block};
 use crate::consensus::{SYSTEM_ADDRESS, MAX_SYSTEM_REWARD, SYSTEM_REWARD_PERCENT};
 use crate::evm::transaction::BscTxEnv;
@@ -247,8 +248,18 @@ where
             }
             Some(self.system_txs.remove(0))
         } else {
-            // todo: sign it by pk.
-            None
+            if is_signer_initialized() {
+                match sign_system_transaction(transaction.clone()) {
+                    Ok(signed) => Some(signed),
+                    Err(e) => {
+                        tracing::warn!("Failed to sign system transaction: {}", e);
+                        None
+                    }
+                }
+            } else {
+                tracing::warn!("Global signer not initialized for mining mode");
+                None
+            }
         };
 
         // Create TxEnv first (before moving transaction)
@@ -467,7 +478,7 @@ where
     }
 
     /// generate system txs and apply them, used by miner.
-    /// TODO: impl it.
+    /// TODO: refine it more.
     pub(crate) fn finalize_new_block(
         &mut self, 
         block: &BlockEnv

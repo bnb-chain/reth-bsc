@@ -435,7 +435,7 @@ where
     }
 
     /// prepare some intermediate data for produce new block.
-    /// todo: only used by miner.
+    /// TODO: refine it more.
     pub(crate) fn prepare_new_block(
         &mut self, 
         block: &BlockEnv
