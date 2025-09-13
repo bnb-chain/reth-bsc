@@ -2,6 +2,7 @@ use crate::{
     node::evm::config::{BscBlockExecutorFactory, BscEvmConfig, BscBlockExecutionCtx},
     chainspec::BscChainSpec,
     consensus::parlia::{SnapshotProvider, Parlia},
+    hardforks::BscHardforks,
     BscBlock, BscBlockBody,
 };
 use alloy_consensus::{Block, BlockBody, Header, EMPTY_OMMER_ROOT_HASH, proofs, Transaction, BlockHeader};
@@ -91,10 +92,11 @@ where
         let mut excess_blob_gas = None;
         let mut blob_gas_used = None;
 
-        if self.chain_spec.is_cancun_active_at_timestamp(timestamp) {
+        let block_number = evm_env.block_env.number.saturating_to();
+        if BscHardforks::is_cancun_active_at_timestamp(&*self.chain_spec, block_number, timestamp) {
             blob_gas_used =
                 Some(transactions.iter().map(|tx| tx.blob_gas_used().unwrap_or_default()).sum());
-            excess_blob_gas = if self.chain_spec.is_cancun_active_at_timestamp(parent.timestamp) {
+            excess_blob_gas = if BscHardforks::is_cancun_active_at_timestamp(&*self.chain_spec, parent.number, parent.timestamp) {
                 parent.maybe_next_block_excess_blob_gas(
                     self.chain_spec.blob_params_at_timestamp(timestamp),
                 )

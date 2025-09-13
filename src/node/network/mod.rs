@@ -181,6 +181,20 @@ impl BscNetworkBuilder {
     {
         let Self { engine_handle_rx } = self;
 
+        // Check if CLI bootnodes are provided and set bootnode override
+        if let Some(cli_bootnodes) = ctx.config().network.resolved_bootnodes() {
+            use crate::chainspec::bootnode_override;
+            if let Err(e) = bootnode_override::set_bootnode_override(Some(cli_bootnodes)) {
+                warn!(target: "bsc", "Failed to set bootnode override: {}", e);
+            }
+        } else {
+            // No CLI bootnodes provided, disable override
+            use crate::chainspec::bootnode_override;
+            if let Err(e) = bootnode_override::set_bootnode_override(None) {
+                warn!(target: "bsc", "Failed to disable bootnode override: {}", e);
+            }
+        }
+
         let network_builder = ctx.network_config_builder()?;
         let mut discv4 = Discv4Config::builder();
 

@@ -34,14 +34,14 @@ pub fn head() -> Head {
 
 #[cfg(test)]
 mod tests {
-    use crate::chainspec::bsc::head;
+    use super::head;
     use alloy_primitives::hex;
     use reth_chainspec::{ForkHash, ForkId};
     use crate::chainspec::local::bsc_local;
 
     #[test]
     fn can_create_forkid() {
-        let b = hex::decode("3f2e9ae4").unwrap();
+        let b = hex::decode("e4d5334c").unwrap();
         let expected = [b[0], b[1], b[2], b[3]];
         let expected_f_id = ForkId { hash: ForkHash(expected), next: 0 };
 

@@ -16,6 +16,8 @@ pub mod bsc;
 pub mod bsc_chapel;
 pub mod bsc_rialto;
 pub mod parser;
+pub mod genesis_override;
+pub mod bootnode_override;
 mod local;
 
 pub use bsc_chapel::bsc_testnet;
@@ -61,6 +63,11 @@ impl EthChainSpec for BscChainSpec {
     }
 
     fn genesis_hash(&self) -> B256 {
+        // Check if genesis hash override is active
+        if let Some(override_hash) = genesis_override::get_genesis_hash_override() {
+            return override_hash;
+        }
+        
         self.inner.genesis_hash()
     }
 
@@ -81,6 +88,12 @@ impl EthChainSpec for BscChainSpec {
     }
 
     fn bootnodes(&self) -> Option<Vec<NodeRecord>> {
+        // Check if bootnode override is active
+        if bootnode_override::has_bootnode_override() {
+            return bootnode_override::get_bootnode_override().clone();
+        }
+        
+        // Fall back to default bootnodes based on chain
         match self.inner.chain().kind() {
             ChainKind::Named(NamedChain::BinanceSmartChain) => {
                 Some(crate::node::network::bootnodes::bsc_mainnet_nodes())
@@ -116,7 +129,8 @@ impl Hardforks for BscChainSpec {
     }
 
     fn latest_fork_id(&self) -> ForkId {
-        self.inner.latest_fork_id()
+        let head = self.head();
+        self.inner.fork_id(&head)
     }
 
     fn fork_filter(&self, head: Head) -> ForkFilter {
@@ -151,7 +165,7 @@ impl EthExecutorSpec for BscChainSpec {
 impl BscChainSpec {
     /// Get the head information for this chain spec
     pub fn head(&self) -> Head {
-        match self.inner.chain().kind() {
+        let mut head = match self.inner.chain().kind() {
             ChainKind::Named(NamedChain::BinanceSmartChain) => {
                 bsc::head()
             }
@@ -162,7 +176,14 @@ impl BscChainSpec {
                 bsc_rialto::head()
             }
             _ => local::head(),
+        };
+
+        // Override head hash if genesis hash override is set
+        if let Some(override_hash) = genesis_override::get_genesis_hash_override() {
+            head.hash = override_hash;
         }
+
+        head
     }
 }
 
@@ -226,5 +247,78 @@ mod tests {
             assert_eq!(blob_params.target_blob_count, 3);
             assert_eq!(blob_params.max_blob_count, 6);
         }
+    }
+
+    #[test]
+    fn test_genesis_hash_override_complete() {
+        use alloy_primitives::B256;
+        use std::str::FromStr;
+        
+        let chain_spec = BscChainSpec::from(bsc_testnet());
+        
+        // Check if override is already set from other tests
+        let override_already_set = crate::chainspec::genesis_override::get_genesis_hash_override().is_some();
+        
+        if !override_already_set {
+            // Test original behavior without override first
+            let original_genesis_hash = chain_spec.genesis_hash();
+            let original_head = chain_spec.head();
+            
+            // Set genesis hash override
+            let custom_genesis_hash = B256::from_str("0xb4844167d735617495363867c84affa9f4069bcdae48411ae3badbe1d227d3e5").unwrap();
+            crate::chainspec::genesis_override::set_genesis_hash_override(Some("0xb4844167d735617495363867c84affa9f4069bcdae48411ae3badbe1d227d3e5".to_string()))
+                .expect("Should set genesis hash override");
+            
+            // Test that all methods now use the override
+            let overridden_genesis_hash = chain_spec.genesis_hash();
+            assert_eq!(overridden_genesis_hash, custom_genesis_hash, "genesis_hash() should return the override");
+            
+            let overridden_head = chain_spec.head();
+            assert_eq!(overridden_head.hash, custom_genesis_hash, "head().hash should use the override");
+            assert_eq!(overridden_head.number, original_head.number, "head().number should remain unchanged");
+            assert_eq!(overridden_head.timestamp, original_head.timestamp, "head().timestamp should remain unchanged");
+            
+            // Test fork ID calculations with override
+            let overridden_fork_id = chain_spec.fork_id(&overridden_head);
+            let overridden_latest_fork_id = chain_spec.latest_fork_id();
+            
+            // NOTE: Fork ID calculation in reth may not directly use the head hash or our genesis_hash() override
+            // because the inner chainspec doesn't know about our override. The key thing is that our 
+            // genesis_hash() and head() methods correctly return the override.
+            
+            // Verify that our methods are consistent with each other
+            assert_eq!(overridden_fork_id.hash, overridden_latest_fork_id.hash, "fork_id() and latest_fork_id() should have same hash");
+            assert_eq!(overridden_fork_id.next, overridden_latest_fork_id.next, "fork_id() and latest_fork_id() should have same next");
+            
+            // Test validation function
+            assert!(crate::chainspec::genesis_override::validate_genesis_hash(custom_genesis_hash), "Custom genesis hash should validate");
+            assert!(!crate::chainspec::genesis_override::validate_genesis_hash(original_genesis_hash), "Original genesis hash should not validate with override set");
+        } else {
+            // Override is already set from another test, just verify it's working
+            let current_override = crate::chainspec::genesis_override::get_genesis_hash_override().unwrap();
+            
+            let genesis_hash = chain_spec.genesis_hash();
+            let head = chain_spec.head();
+            let fork_id = chain_spec.fork_id(&head);
+            let latest_fork_id = chain_spec.latest_fork_id();
+            
+            assert_eq!(genesis_hash, current_override, "genesis_hash() should match current override");
+            assert_eq!(head.hash, current_override, "head().hash should match current override");
+            assert_eq!(fork_id.hash, latest_fork_id.hash, "fork_id() and latest_fork_id() should have same hash");
+            
+        }
+    }
+
+    #[test]
+    fn test_fork_id_consistency() {
+        // Test that fork_id() and latest_fork_id() are consistent
+        let chain_spec = BscChainSpec::from(bsc_testnet());
+        let head = chain_spec.head();
+        let fork_id = chain_spec.fork_id(&head);
+        let latest_fork_id = chain_spec.latest_fork_id();
+        
+        // Test consistency
+        assert_eq!(fork_id.hash, latest_fork_id.hash, "fork_id and latest_fork_id should have same hash");
+        assert_eq!(fork_id.next, latest_fork_id.next, "fork_id and latest_fork_id should have same next");
     }
 }

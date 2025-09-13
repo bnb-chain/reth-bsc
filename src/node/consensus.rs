@@ -100,7 +100,7 @@ impl<ChainSpec: EthChainSpec + BscHardforks + 'static> HeaderValidator<Header>
         }
 
         // ensure that the blob gas fields for this block
-        if self.chain_spec.is_london_active_at_block(header.header().number) && BscHardforks::is_cancun_active_at_timestamp(&*self.chain_spec, header.header().number, header.header().timestamp) {
+        if BscHardforks::is_cancun_active_at_timestamp(&*self.chain_spec, header.header().number, header.header().timestamp) {
             if let Some(blob_params) = self.chain_spec.blob_params_at_timestamp(header.timestamp) {
                 if let Err(err) = validate_against_parent_4844(header.header(), parent.header(), blob_params) {
                     tracing::warn!("Failed to validate_against_parent_4844, block_number: {}, err: {:?}", header.number, err);

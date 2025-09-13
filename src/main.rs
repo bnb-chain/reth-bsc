@@ -2,7 +2,7 @@ use clap::{Args, Parser};
 use reth::{builder::NodeHandle, cli::Cli};
 use reth_bsc::node::consensus::BscConsensus;
 use reth_bsc::{
-    chainspec::parser::BscChainSpecParser,
+    chainspec::{parser::BscChainSpecParser, genesis_override},
     node::{evm::config::BscEvmConfig, BscNode},
 };
 use std::sync::Arc;
@@ -37,6 +37,10 @@ pub struct BscCliArgs {
     /// Use development chain with auto-generated validators
     #[arg(long = "bsc-dev")]
     pub dev_mode: bool,
+
+    /// Genesis hash override for chain validation
+    #[arg(long = "genesis-hash")]
+    pub genesis_hash: Option<String>,
 }
 
 fn main() -> eyre::Result<()> {
@@ -50,6 +54,12 @@ fn main() -> eyre::Result<()> {
     Cli::<BscChainSpecParser, BscCliArgs>::parse().run_with_components::<BscNode>(
         |spec| (BscEvmConfig::new(spec.clone()), BscConsensus::new(spec)),
         async move |builder, args| {
+            // Set genesis hash override if provided
+            if let Err(e) = genesis_override::set_genesis_hash_override(args.genesis_hash) {
+                tracing::error!("Failed to set genesis hash override: {}", e);
+                return Err(e);
+            }
+            
             // Map CLI args into a global MiningConfig override before launching services
             {
                 use reth_bsc::node::mining_config::{self, MiningConfig};

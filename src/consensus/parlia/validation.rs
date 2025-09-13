@@ -92,8 +92,7 @@ impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 's
         validate_header_base_fee(header, &self.spec)?;
 
         // Ensures that EIP-4844 fields are valid once cancun is active.
-        if self.spec.is_london_active_at_block(header.number) && 
-            self.spec.is_cancun_active_at_timestamp(header.timestamp) {
+        if BscHardforks::is_cancun_active_at_timestamp(&*self.spec, header.number, header.timestamp) {
             validate_4844_header_of_bsc(header)?;
         } else if header.blob_gas_used.is_some() {
             return Err(ConsensusError::BlobGasUsedUnexpected)
@@ -147,7 +146,7 @@ impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 's
         }
 
         // EIP-4844: Shard Blob Transactions
-        if self.spec.is_cancun_active_at_timestamp(block.timestamp) {
+        if BscHardforks::is_cancun_active_at_timestamp(&*self.spec, block.number, block.timestamp) {
             // Check that the blob gas used in the header matches the sum of the blob gas used by
             // each blob tx
             let header_blob_gas_used =
