@@ -438,8 +438,62 @@ where
     /// todo: only used by miner.
     pub(crate) fn prepare_new_block(
         &mut self, 
-        _block: &BlockEnv
+        block: &BlockEnv
     ) -> Result<(), BlockExecutionError> {
-        todo!()
+        let parent_header = crate::node::evm::util::HEADER_CACHE_READER
+            .lock()
+            .unwrap()
+            .get_header_by_number(block.number.to::<u64>() - 1)
+            .ok_or(BlockExecutionError::msg("Failed to get parent header from global header reader"))?;
+        self.inner_ctx.parent_header = Some(parent_header.clone());
+
+        let snap = self
+            .snapshot_provider
+            .as_ref()
+            .unwrap()
+            .snapshot(block.number.to::<u64>() - 1)
+            .ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;
+        self.inner_ctx.snap = Some(snap.clone());
+
+        let header_number = block.number.to::<u64>();
+        let header_timestamp = block.timestamp.to::<u64>();
+        if self.spec.is_feynman_active_at_timestamp(header_number, header_timestamp) &&
+            !self.spec.is_feynman_transition_at_timestamp(header_timestamp, parent_header.timestamp) &&
+            is_breathe_block(parent_header.timestamp, header_timestamp)
+        {
+            let (to, data) = self.system_contracts.get_max_elected_validators();
+            let bz = self.eth_call(to, data)?;
+            let max_elected_validators = self.system_contracts.unpack_data_into_max_elected_validators(bz.as_ref());
+            tracing::debug!("max_elected_validators: {:?}", max_elected_validators);
+            self.inner_ctx.max_elected_validators = Some(max_elected_validators);
+
+            let (to, data) = self.system_contracts.get_validator_election_info();
+            let bz = self.eth_call(to, data)?;
+
+            let (validators, voting_powers, vote_addrs, total_length) =
+                self.system_contracts.unpack_data_into_validator_election_info(bz.as_ref());
+
+            let total_length = total_length.to::<u64>() as usize;
+            if validators.len() != total_length ||
+                voting_powers.len() != total_length ||
+                vote_addrs.len() != total_length
+            {
+                return Err(BlockExecutionError::msg("Failed to get top validators"));
+            }
+
+            let validator_election_info: Vec<ValidatorElectionInfo> = validators
+                .into_iter()
+                .zip(voting_powers)
+                .zip(vote_addrs)
+                .map(|((validator, voting_power), vote_addr)| ValidatorElectionInfo {
+                    address: validator,
+                    voting_power,
+                    vote_address: vote_addr,
+                })
+                .collect();
+            tracing::debug!("validator_election_info: {:?}", validator_election_info);
+            self.inner_ctx.validators_election_info = Some(validator_election_info);
+        }
+        Ok(())
     }
 }

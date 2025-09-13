@@ -65,16 +65,17 @@ where
         self.distribute_incoming(block.beneficiary)?;
 
         if self.spec.is_plato_active_at_block(block.number.to()) {
-            let header = self.inner_ctx.header.as_ref().unwrap().clone();
-            self.distribute_finality_reward(&header)?;
+            self.distribute_finality_reward()?;
         }
 
         // update validator set after Feynman upgrade
-        let header = self.inner_ctx.header.as_ref().unwrap().clone();
+        let header_number = self.evm.block().number.to::<u64>();
+        let header_timestamp = self.evm.block().timestamp.to::<u64>();
+        let header_beneficiary = self.evm.block().beneficiary;
         let parent_header = self.inner_ctx.parent_header.as_ref().unwrap().clone();
-        if self.spec.is_feynman_active_at_timestamp(header.number, header.timestamp) &&
-            is_breathe_block(parent_header.timestamp, header.timestamp) &&
-            !self.spec.is_feynman_transition_at_timestamp(header.timestamp, parent_header.timestamp)
+        if self.spec.is_feynman_active_at_timestamp(header_number, header_timestamp) &&
+            is_breathe_block(parent_header.timestamp, header_timestamp) &&
+            !self.spec.is_feynman_transition_at_timestamp(header_timestamp, parent_header.timestamp)
         {
             let max_elected_validators = self.inner_ctx.max_elected_validators.unwrap_or(U256::from(21));
             let validators_election_info = self.inner_ctx.validators_election_info.clone().unwrap_or_default();
@@ -82,10 +83,10 @@ where
             self.update_validator_set_v2(
                  max_elected_validators,
                  validators_election_info.clone(),
-                 header.beneficiary,
+                 header_beneficiary,
              )?;
             tracing::debug!("Update validator set, block_number: {}, max_elected_validators: {}, validators_election_info: {:?}", 
-                header.number, max_elected_validators, validators_election_info);
+                header_number, max_elected_validators, validators_election_info);
         }
 
         if !self.system_txs.is_empty() {
@@ -96,6 +97,7 @@ where
             return Err(BscBlockExecutionError::UnexpectedSystemTx.into());
         }
 
+        let header = self.inner_ctx.header.as_ref().unwrap().clone();
         let epoch_length = self.parlia.get_epoch_length(&header);
         if (header.number + 1)% epoch_length == 0 {
             // cache it on pre block.
@@ -222,26 +224,32 @@ where
             .unwrap_or_default();
 
         let transaction = set_nonce(transaction, account.nonce);
-        let hash = transaction.signature_hash();
-        if self.system_txs.is_empty() || hash != self.system_txs[0].signature_hash() {
-            // slash tx could fail and not in the block
-            if let Some(to) = transaction.to() {
-                if to == SLASH_CONTRACT &&
-                    (self.system_txs.is_empty() ||
-                        self.system_txs[0].to().unwrap_or_default() !=
-                            SLASH_CONTRACT)
-                {
-                    warn!("slash validator failed");
-                    return Ok(());
+
+        let signed_tx = if !self.ctx.is_miner {
+            let hash = transaction.signature_hash();
+            if self.system_txs.is_empty() || hash != self.system_txs[0].signature_hash() {
+                // slash tx could fail and not in the block
+                if let Some(to) = transaction.to() {
+                    if to == SLASH_CONTRACT &&
+                        (self.system_txs.is_empty() ||
+                            self.system_txs[0].to().unwrap_or_default() !=
+                                SLASH_CONTRACT)
+                    {
+                        warn!("slash validator failed");
+                        return Ok(());
+                    }
                 }
+                warn!("unexpected transaction: {:?}", transaction);
+                for tx in self.system_txs.iter() {
+                    warn!("left system tx: {:?}", tx);
+                }
+                return Err(BscBlockExecutionError::UnexpectedSystemTx.into());
             }
-            warn!("unexpected transaction: {:?}", transaction);
-            for tx in self.system_txs.iter() {
-                warn!("left system tx: {:?}", tx);
-            }
-            return Err(BscBlockExecutionError::UnexpectedSystemTx.into());
-        }
-        let signed_tx = self.system_txs.remove(0);
+            Some(self.system_txs.remove(0))
+        } else {
+            // todo: sign it by pk.
+            None
+        };
 
         // Create TxEnv first (before moving transaction)
         let tx_env = BscTxEnv {
@@ -272,8 +280,9 @@ where
 
         let gas_used = result.gas_used();
         self.gas_used += gas_used;
+
         self.receipts.push(self.receipt_builder.build_receipt(ReceiptBuilderCtx {
-            tx: &signed_tx,
+            tx: signed_tx.as_ref().unwrap(),
             evm: &self.evm,
             result,
             state: &state,
@@ -342,20 +351,20 @@ where
 
     fn distribute_finality_reward(
         &mut self,
-        header: &Header
     ) -> Result<(), BlockExecutionError> {
         // distribute finality reward per 200 blocks.
         let distribute_interval = 200;
-        if header.number % distribute_interval != 0 {
+        let block_number = self.evm.block().number.to::<u64>();
+        if block_number % distribute_interval != 0 {
             return Ok(());
         }
 
-        let validator = header.beneficiary;
+        let validator = self.evm.block().beneficiary;
         let mut accumulated_weights: HashMap<Address, U256> = HashMap::new();
 
-        let start = (header.number - distribute_interval).max(1);
-        let end = header.number;
-        let mut target_number = header.number - 1;
+        let start = (block_number - distribute_interval).max(1);
+        let end = block_number;
+        let mut target_number = block_number - 1;
         for _ in (start..end).rev() {
             let header = self.snapshot_provider.
                 as_ref().
@@ -461,8 +470,49 @@ where
     /// TODO: impl it.
     pub(crate) fn finalize_new_block(
         &mut self, 
-        _block: &BlockEnv
+        block: &BlockEnv
     ) -> Result<(), BlockExecutionError> {
-        todo!()
+        let snap = self.inner_ctx.snap.as_ref().unwrap();
+        let expected_validator = snap.inturn_validator();
+        if block.beneficiary != expected_validator {
+            let signed_recently = if self.spec.is_plato_active_at_block(block.number.to()) {
+                snap.sign_recently(expected_validator)
+            } else {
+                snap.recent_proposers.iter().any(|(_, v)| *v == expected_validator)
+            };
+            if !signed_recently {
+                self.slash_spoiled_validator(block.beneficiary, expected_validator)?;
+                tracing::info!("Slash spoiled validator, block_number: {}, spoiled_validator: {}", block.number, expected_validator);
+            }
+        }
+
+        self.distribute_incoming(block.beneficiary)?;
+
+        if self.spec.is_plato_active_at_block(block.number.to()) {
+            self.distribute_finality_reward()?;
+        }
+
+        // update validator set after Feynman upgrade
+        let header_number = self.evm.block().number.to::<u64>();
+        let header_timestamp = self.evm.block().timestamp.to::<u64>();
+        let header_beneficiary = self.evm.block().beneficiary;
+        let parent_header = self.inner_ctx.parent_header.as_ref().unwrap().clone();
+        if self.spec.is_feynman_active_at_timestamp(header_number, header_timestamp) &&
+            is_breathe_block(parent_header.timestamp, header_timestamp) &&
+            !self.spec.is_feynman_transition_at_timestamp(header_timestamp, parent_header.timestamp)
+        {
+            let max_elected_validators = self.inner_ctx.max_elected_validators.unwrap_or(U256::from(21));
+            let validators_election_info = self.inner_ctx.validators_election_info.clone().unwrap_or_default();
+ 
+            self.update_validator_set_v2(
+                 max_elected_validators,
+                 validators_election_info.clone(),
+                 header_beneficiary,
+             )?;
+            tracing::debug!("Update validator set, block_number: {}, max_elected_validators: {}, validators_election_info: {:?}", 
+                header_number, max_elected_validators, validators_election_info);
+        }
+
+        Ok(())
     }
 }
