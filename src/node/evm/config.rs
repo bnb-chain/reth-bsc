@@ -197,7 +197,6 @@ where
             header.number(),
         );
 
-
         // configure evm env based on parent block
         let mut cfg_env =
             CfgEnv::new().with_chain_id(self.chain_spec().chain().id()).with_spec(spec);

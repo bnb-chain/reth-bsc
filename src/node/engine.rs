@@ -1,8 +1,6 @@
-use crate::consensus::parlia::util::calculate_millisecond_timestamp;
-use crate::node::engine_api::validator::{BscEngineValidator, BscExecutionData};
 use crate::node::evm::util::HEADER_CACHE_READER;
 use crate::{
-    consensus::parlia::{provider::SnapshotProvider, seal::SealBlock},
+    consensus::parlia::provider::SnapshotProvider,
     node::{
         engine_api::payload::BscPayloadTypes,
         evm::config::BscEvmConfig,
@@ -12,9 +10,9 @@ use crate::{
     },
     BscBlock, BscPrimitives,
 };
-use alloy_consensus::{BlockHeader, Transaction};
+use alloy_consensus::BlockHeader;
 use alloy_eips::eip7685::Requests;
-use alloy_primitives::{Address, Bytes, U256};
+use alloy_primitives::{Address, U256};
 use k256::ecdsa::SigningKey;
 use reth::transaction_pool::PoolTransaction;
 use reth::{
@@ -24,14 +22,13 @@ use reth::{
     transaction_pool::TransactionPool,
 };
 use reth_chainspec::EthChainSpec;
-use reth_engine_primitives::PayloadValidator;
 use reth_evm::ConfigureEvm;
 use reth_payload_primitives::BuiltPayload;
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
 use reth_primitives::{SealedBlock, TransactionSigned};
 use reth_provider::{BlockNumReader, HeaderProvider};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
@@ -251,7 +248,7 @@ where
         // queue to engine-api for memory tree and broadcast it block_import channel.
         // todo: check it.
         self.submit_block(&payload.block()).await?;
-        
+
         Ok(())
     }
 

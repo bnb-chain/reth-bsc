@@ -33,7 +33,7 @@ pub struct BscBlockAssembler<ChainSpec = BscChainSpec> {
 
 impl<ChainSpec> BscBlockAssembler<ChainSpec> 
 where
-    ChainSpec: EthChainSpec + crate::hardforks::BscHardforks + 'static,
+    ChainSpec: EthChainSpec + BscHardforks + 'static,
 {
     pub fn new(chain_spec: Arc<ChainSpec>) -> Self {
         Self { 

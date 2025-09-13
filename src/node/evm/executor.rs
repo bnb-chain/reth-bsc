@@ -101,7 +101,7 @@ where
     /// Creates a new BscBlockExecutor.
     pub fn new(
         evm: EVM,
-        mut ctx: BscBlockExecutionCtx<'a>,
+        ctx: BscBlockExecutionCtx<'a>,
         spec: Spec,
         receipt_builder: R,
         system_contracts: SystemContract<Spec>,

@@ -8,7 +8,6 @@ use crate::chainspec::BscChainSpec;
 use crate::consensus::parlia::{EXTRA_VANITY_LEN, EXTRA_SEAL_LEN};
 use reth::payload::EthPayloadBuilderAttributes;
 use crate::hardforks::BscHardforks;
-use alloy_primitives::B256;
 use reth_chainspec::EthChainSpec;
 use crate::node::evm::pre_execution::VALIDATOR_CACHE;
 use crate::node::miner::signer::seal_header_with_global_signer;
@@ -28,7 +27,7 @@ pub fn prepare_new_attributes(parlia: Arc<Parlia<BscChainSpec>>, parent_snap: &S
 /// prepare a tmp new header for preparing attributes.
 pub fn prepare_new_header<ChainSpec>(parlia: Arc<Parlia<ChainSpec>>, parent_snap: &Snapshot, parent_header: &Header, signer: Address) -> Header 
 where
-    ChainSpec: EthChainSpec + crate::hardforks::BscHardforks + 'static,
+    ChainSpec: EthChainSpec + BscHardforks + 'static,
 {
     let mut new_header = Header::default();
     new_header.number = parent_header.number + 1;

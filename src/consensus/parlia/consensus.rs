@@ -480,7 +480,6 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
         }
     }
 
-
     pub fn prepare_validators(&self, validators: Option<(Vec<alloy_primitives::Address>, Vec<crate::consensus::parlia::VoteAddress>)>, new_header: &mut Header) {
         let epoch_length = self.get_epoch_length(&new_header);
         if (new_header.number) % epoch_length != 0 {
