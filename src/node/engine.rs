@@ -6,7 +6,7 @@ use crate::{
     node::{
         engine_api::payload::BscPayloadTypes,
         evm::config::BscEvmConfig,
-        miner::{payload_builder::BscPayloadBuilder, util::prepare_new_header},
+        miner::{payload_builder::BscPayloadBuilder, util::prepare_new_attributes},
         mining_config::{keystore, MiningConfig},
         BscNode,
     },
@@ -254,14 +254,7 @@ where
         // Build and seal the block
         // self.mine_block_now(&head).await
 
-        let new_header = prepare_new_header(self.parlia.clone(), &snapshot, &parent_header, self.validator_address);
-        let attributes = EthPayloadBuilderAttributes{
-            parent: new_header.parent_hash.into(),
-            timestamp: new_header.timestamp,
-            suggested_fee_recipient: self.validator_address,
-            ..Default::default()
-        };
-
+        let attributes = prepare_new_attributes(self.parlia.clone(), &snapshot, &parent_header, self.validator_address);
         let evm_config = BscEvmConfig::new(self.chain_spec.clone());
         let payload_builder = BscPayloadBuilder::new(self.provider.clone(), self.pool.clone(), evm_config, EthereumBuilderConfig::new());
         let _payload = payload_builder.build_payload(BuildArguments::<EthPayloadBuilderAttributes, BscBuiltPayload>::new(
@@ -271,7 +264,6 @@ where
             None,
         ))?;
 
-        // todo: seal block by parlia.
         // todo: queue to engine-api for memory tree and broadcast it block_import channel.
         Ok(())
     }

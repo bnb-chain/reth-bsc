@@ -92,6 +92,7 @@ where
             };
         }
 
+        // todo: prepare header and seal it.
         let header = Header {
             parent_hash: eth_ctx.parent_hash,
             ommers_hash: EMPTY_OMMER_ROOT_HASH,
@@ -115,6 +116,8 @@ where
             excess_blob_gas,
             requests_hash,
         };
+        // todo: seal block by parlia.
+        // finalize_new_header
 
         Ok(Block {
             header,
