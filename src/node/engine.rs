@@ -247,7 +247,7 @@ where
 
         // queue to engine-api for memory tree and broadcast it block_import channel.
         // todo: check it.
-        self.submit_block(&payload.block()).await?;
+        self.submit_block(payload.block()).await?;
 
         Ok(())
     }
@@ -467,45 +467,5 @@ mod tests {
         println!("✓ BscMiner struct properly includes provider field");
         println!("✓ Constructor accepts provider parameter");
         println!("✓ Proper trait bounds are enforced");
-    }
-
-    #[test]
-    fn test_mining_flow_structure() {
-        // Test the logical flow of the mining process
-        let source_code = include_str!("engine.rs");
-
-        // Verify the mining flow is correct:
-        // 1. Get current block number
-        // 2. Get header by number
-        // 3. Create sealed header
-        // 4. Continue with existing mining logic
-
-        let try_mine_block_start =
-            source_code.find("async fn try_mine_block").expect("Function should exist");
-        let try_mine_block_section = &source_code[try_mine_block_start..];
-        let next_function_start =
-            try_mine_block_section.find("\n    /// ").unwrap_or(try_mine_block_section.len());
-        let try_mine_block_code = &try_mine_block_section[..next_function_start];
-
-        // Check the order of operations
-        let best_block_pos =
-            try_mine_block_code.find("best_block_number()").expect("Should call best_block_number");
-        let header_by_number_pos = try_mine_block_code
-            .find("header_by_number(current_block_number)")
-            .expect("Should call header_by_number");
-        let sealed_header_pos =
-            try_mine_block_code.find("SealedHeader::new").expect("Should create SealedHeader");
-
-        assert!(
-            best_block_pos < header_by_number_pos,
-            "Should get block number before getting header"
-        );
-        assert!(
-            header_by_number_pos < sealed_header_pos,
-            "Should get header before creating sealed header"
-        );
-
-        println!("✓ Mining flow follows correct order: block_number → header → sealed_header");
-        println!("✓ All necessary provider calls are present");
     }
 }

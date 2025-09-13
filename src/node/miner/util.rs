@@ -15,13 +15,13 @@ use crate::node::miner::signer::seal_header_with_global_signer;
 pub fn prepare_new_attributes(parlia: Arc<Parlia<BscChainSpec>>, parent_snap: &Snapshot, parent_header: &Header, signer: Address) -> EthPayloadBuilderAttributes {
     let new_header = prepare_new_header(parlia.clone(), parent_snap, parent_header, signer);
     let attributes = EthPayloadBuilderAttributes{
-        parent: new_header.parent_hash.into(),
+        parent: new_header.parent_hash,
         timestamp: new_header.timestamp,
         suggested_fee_recipient: new_header.beneficiary,
         prev_randao: new_header.mix_hash,
         ..Default::default()
     };
-    return attributes;
+    attributes
 }
 
 /// prepare a tmp new header for preparing attributes.
@@ -29,12 +29,14 @@ pub fn prepare_new_header<ChainSpec>(parlia: Arc<Parlia<ChainSpec>>, parent_snap
 where
     ChainSpec: EthChainSpec + BscHardforks + 'static,
 {
-    let mut new_header = Header::default();
-    new_header.number = parent_header.number + 1;
-    new_header.parent_hash = parent_header.hash_slow();
-    new_header.beneficiary = signer;
+    let mut new_header = Header { 
+        number: parent_header.number + 1, 
+        parent_hash: parent_header.hash_slow(), 
+        beneficiary: signer, 
+        ..Default::default() 
+    };
     parlia.prepare_timestamp(parent_snap, parent_header, &mut new_header);
-    return new_header;
+    new_header
 }
 
 /// finalize a new header and seal it.
@@ -53,7 +55,7 @@ where
     }
 
     {   // prepare validators
-        let epoch_length = parlia.get_epoch_length(&new_header);
+        let epoch_length = parlia.get_epoch_length(new_header);
         if (new_header.number)% epoch_length == 0 {
             let mut validators: Option<(Vec<Address>, Vec<crate::consensus::parlia::VoteAddress>)> = None;
             let mut cache = VALIDATOR_CACHE.lock().unwrap();

@@ -16,7 +16,7 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
         let parent_ts = calculate_millisecond_timestamp(parent);
         let mut new_block_ts = parent_ts + snap.block_interval;
         if self.spec.is_ramanujan_active_at_block(header.number) {
-            new_block_ts = new_block_ts + self.back_off_time(snap, parent, header);
+            new_block_ts += self.back_off_time(snap, parent, header);
         }
         
         let now = SystemTime::now()
@@ -26,7 +26,7 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
         
         if new_block_ts < now {
             // Just to make the millisecond part of the time look more aligned.
-            new_block_ts = ((now + MILLISECONDS_UNIT - 1) / MILLISECONDS_UNIT) * MILLISECONDS_UNIT;
+            new_block_ts = now.div_ceil(MILLISECONDS_UNIT) * MILLISECONDS_UNIT;
         }
         
         new_block_ts

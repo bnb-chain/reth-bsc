@@ -112,10 +112,8 @@ where
         tracing::trace!("Succeed to new block executor, header: {:?}", ctx.header);
         if let Some(ref header) = ctx.header {
             crate::node::evm::util::HEADER_CACHE_READER.lock().unwrap().insert_header_to_cache(header.clone());
-        } else {
-            if !ctx.is_miner { // miner has no current header.
-                tracing::warn!("No header found in the context, block_number: {:?}", evm.block().number.to::<u64>());
-            }
+        } else if !ctx.is_miner { // miner has no current header.
+            tracing::warn!("No header found in the context, block_number: {:?}", evm.block().number.to::<u64>());
         }
 
         let parlia = Arc::new(Parlia::new(Arc::new(spec.clone()), 200));

@@ -471,7 +471,7 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
     }
 
     pub fn prepare_timestamp(&self, parent_snap: &Snapshot, parent_header: &Header, new_header: &mut Header) {
-        let millisecond_timestamp = self.block_time_for_ramanujan_fork(parent_snap, parent_header, &new_header);
+        let millisecond_timestamp = self.block_time_for_ramanujan_fork(parent_snap, parent_header, new_header);
         new_header.timestamp = millisecond_timestamp / 1000;
         if self.spec.is_lorentz_active_at_timestamp(new_header.number, new_header.timestamp) {
             set_millisecond_part_of_timestamp(millisecond_timestamp, new_header);
@@ -481,7 +481,7 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
     }
 
     pub fn prepare_validators(&self, validators: Option<(Vec<alloy_primitives::Address>, Vec<crate::consensus::parlia::VoteAddress>)>, new_header: &mut Header) {
-        let epoch_length = self.get_epoch_length(&new_header);
+        let epoch_length = self.get_epoch_length(new_header);
         if (new_header.number) % epoch_length != 0 {
             return;
         }
@@ -533,7 +533,7 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
             return;
         }
         let mut extra_data = new_header.extra_data.to_vec();
-        extra_data.push(turn_length.unwrap_or(DEFAULT_TURN_LENGTH) as u8);
+        extra_data.push(turn_length.unwrap_or(DEFAULT_TURN_LENGTH));
         new_header.extra_data = alloy_primitives::Bytes::from(extra_data);
     }
 

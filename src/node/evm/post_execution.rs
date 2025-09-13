@@ -249,19 +249,17 @@ where
                 return Err(BscBlockExecutionError::UnexpectedSystemTx.into());
             }
             Some(self.system_txs.remove(0))
-        } else {
-            if is_signer_initialized() {
-                match sign_system_transaction(transaction.clone()) {
-                    Ok(signed) => Some(signed),
-                    Err(e) => {
-                        tracing::warn!("Failed to sign system transaction: {}", e);
-                        None
-                    }
+        } else if is_signer_initialized() {
+            match sign_system_transaction(transaction.clone()) {
+                Ok(signed) => Some(signed),
+                Err(e) => {
+                    tracing::warn!("Failed to sign system transaction: {}", e);
+                    None
                 }
-            } else {
-                tracing::warn!("Global signer not initialized for mining mode");
-                None
             }
+        } else {
+            tracing::warn!("Global signer not initialized for mining mode");
+            None
         };
 
         // Create TxEnv first (before moving transaction)

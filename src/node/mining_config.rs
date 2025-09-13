@@ -72,7 +72,7 @@ impl MiningConfig {
         // Validator Address: 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266
 
         // Derive validator address from private key
-        if let Ok(signing_key) = keystore::load_private_key_from_hex(&private_key_hex) {
+        if let Ok(signing_key) = keystore::load_private_key_from_hex(private_key_hex) {
             let validator_address = keystore::get_validator_address(&signing_key);
             
             Self {

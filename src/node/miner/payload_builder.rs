@@ -142,7 +142,7 @@ where
         // todo: add system txs to payload, need to rewrite finish.
         // todo: rewrite in here.
         let BlockBuilderOutcome { execution_result, block, .. } = builder.finish(&state_provider)?;
-        let sealed_block = Arc::new(block.sealed_block().clone().into());
+        let sealed_block = Arc::new(block.sealed_block().clone());
         let payload = BscBuiltPayload {
             block: sealed_block,
             fees: total_fees,

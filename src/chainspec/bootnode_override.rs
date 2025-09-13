@@ -20,5 +20,5 @@ pub fn get_bootnode_override() -> &'static Option<Vec<NodeRecord>> {
 
 /// Check if bootnode override is active
 pub fn has_bootnode_override() -> bool {
-    BOOTNODE_OVERRIDE.get().map_or(false, |nodes| nodes.is_some())
+    BOOTNODE_OVERRIDE.get().is_some_and(|nodes| nodes.is_some())
 }

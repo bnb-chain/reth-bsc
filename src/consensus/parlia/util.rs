@@ -133,7 +133,7 @@ pub fn calculate_difficulty(snap: &Snapshot, signer: Address) -> U256 {
     if snap.is_inturn(signer) {
         return DIFF_INTURN
     }
-    return DIFF_NOTURN
+    DIFF_NOTURN
 }
 
 #[cfg(test)]
