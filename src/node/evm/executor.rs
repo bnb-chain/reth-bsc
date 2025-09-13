@@ -108,7 +108,6 @@ where
     ) -> Self {
         let is_mainnet = spec.chain().id() == 56; // BSC mainnet chain ID
         let hertz_patch_manager = HertzPatchManager::new(is_mainnet);
-        ctx.turn_length = None;
         
         tracing::trace!("Succeed to new block executor, header: {:?}", ctx.header);
         if let Some(ref header) = ctx.header {

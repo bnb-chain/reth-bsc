@@ -38,6 +38,8 @@ use tracing::{debug, error, info, warn};
 use reth_basic_payload_builder::{BuildArguments, PayloadConfig};
 use reth::payload::EthPayloadBuilderAttributes;
 use reth_revm::cancelled::CancelOnDrop;
+use crate::node::miner::signer::init_global_signer;
+use alloy_primitives::B256;
 
 /// Built payload for BSC. This is similar to [`EthBuiltPayload`] but without sidecars as those
 /// included into [`BscBlock`].
@@ -160,19 +162,14 @@ where
             return Ok(());
         }
 
-        // Initialize global signer if signing key is available
         if let Some(ref signing_key) = self.signing_key {
-            use crate::node::miner::signer::init_global_signer;
-            use alloy_primitives::B256;
-            
-            // Convert SigningKey to B256
             let private_key_bytes = signing_key.as_nonzero_scalar().to_bytes();
             let private_key = B256::from_slice(&private_key_bytes);
             
             if let Err(e) = init_global_signer(private_key) {
                 warn!("Failed to initialize global signer: {}", e);
             } else {
-                info!("Global signer initialized successfully");
+                info!("Succeed to initialize global signer");
             }
         } else {
             warn!("No signing key available, global signer not initialized");
@@ -241,176 +238,21 @@ where
             return Err("Signed recently, must wait for others".into());
         }
 
-        // Calculate when we should mine based on turn and backoff
-        // todo: fix it.
-        // let next_block_time = self.calculate_next_block_time(&parent_header, &snapshot, current_time)?;
-
-        // if current_time < next_block_time {
-        //     return Err(format!("Too early to mine, wait until {next_block_time}").into());
-        // }
-
-        // info!("Mining new block on top of block {}", parent_number);
-
-        // Build and seal the block
-        // self.mine_block_now(&head).await
-
         let attributes = prepare_new_attributes(self.parlia.clone(), &snapshot, &parent_header, self.validator_address);
         let evm_config = BscEvmConfig::new(self.chain_spec.clone());
         let payload_builder = BscPayloadBuilder::new(self.provider.clone(), self.pool.clone(), evm_config, EthereumBuilderConfig::new());
-        let _payload = payload_builder.build_payload(BuildArguments::<EthPayloadBuilderAttributes, BscBuiltPayload>::new(
+        let payload = payload_builder.build_payload(BuildArguments::<EthPayloadBuilderAttributes, BscBuiltPayload>::new(
             reth_revm::cached::CachedReads::default(),
             PayloadConfig::new(Arc::new(parent_header.clone()), attributes),
             CancelOnDrop::default(),
             None,
         ))?;
 
-        // todo: queue to engine-api for memory tree and broadcast it block_import channel.
+        // queue to engine-api for memory tree and broadcast it block_import channel.
+        // todo: check it.
+        self.submit_block(&payload.block()).await?;
+        
         Ok(())
-    }
-
-    /// Calculate the optimal time to mine the next block
-    fn calculate_next_block_time(
-        &self,
-        parent: &reth_primitives::SealedHeader,
-        snapshot: &crate::consensus::parlia::Snapshot,
-        _current_time: u64,
-    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-        use crate::consensus::parlia::constants::DIFF_NOTURN;
-
-        // Scheduled next time in ms: parent time (ms) + period (ms)
-        let parent_ts_ms = calculate_millisecond_timestamp(parent.header());
-        let period_ms = snapshot.block_interval;
-        let scheduled_ms = parent_ts_ms + period_ms;
-
-        // Candidate header for backoff calculation
-        let candidate = alloy_consensus::Header { 
-            number: parent.number() + 1, 
-            timestamp: scheduled_ms / 1000, 
-            beneficiary: self.validator_address, 
-            difficulty: U256::from(DIFF_NOTURN), 
-            ..Default::default() };
-
-        // Compute final delay using Parlia helper (ms)
-        let left_over_ms: u64 = 0; // reserved time for finalize
-        let delay_ms = self.parlia.compute_delay_with_backoff(
-            snapshot,
-            parent.header(),
-            &candidate,
-            left_over_ms,
-        );
-
-        // Final time in seconds (ceil ms)
-        let target_ms = scheduled_ms + delay_ms;
-        let target_secs = target_ms.div_ceil(1000);
-        Ok(target_secs)
-    }
-
-    /// Mine a block immediately
-    async fn mine_block_now(
-        &self,
-        parent: &reth_primitives::SealedHeader,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Build block header
-        let mut header = alloy_consensus::Header {
-            parent_hash: parent.hash(),
-            number: parent.number() + 1,
-            timestamp: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
-            beneficiary: self.validator_address,
-            gas_limit: parent.gas_limit(),
-            extra_data: Bytes::from(vec![0u8; 32 + 65]), // Vanity + seal placeholder
-            difficulty: self.calculate_difficulty(parent)?,
-            ..Default::default()
-        };
-
-        // Collect transactions from the pool
-        let transactions = self.collect_transactions(&header).await?;
-
-        // Calculate gas used and other header fields
-        header.gas_used = transactions.iter().map(|tx| tx.gas_limit()).sum();
-        // TODO: Calculate proper transaction root
-        header.transactions_root = alloy_primitives::keccak256(alloy_rlp::encode(&transactions));
-
-        // Create block body
-        let body = crate::BscBlockBody {
-            inner: reth_primitives::BlockBody {
-                transactions,
-                ommers: Vec::new(),
-                withdrawals: None,
-            },
-            sidecars: None,
-        };
-
-        // Create unsealed block
-        let block = BscBlock { header, body };
-
-        // Seal the block using Parlia consensus
-        let signing_key: SigningKey =
-            self.signing_key.clone().ok_or("No signing key available for block sealing")?;
-
-        // SealBlock init
-        let sealed_block =
-            SealBlock::new(self.snapshot_provider.clone(), self.chain_spec.clone(), signing_key)
-                .seal(block.clone())
-                .map_err(|e| format!("Seal error: {:?}", e))?;
-
-        let exec_payload = BscExecutionData(block);
-
-        let validator = BscEngineValidator::new(self.chain_spec.clone(), Some(sealed_block));
-
-        let block = match validator.ensure_well_formed_payload(exec_payload) {
-            Ok(block) => block,
-            Err(e) => {
-                error!("Payload invalid: {e}");
-                return Err(e.into());
-            }
-        };
-
-        self.submit_block(block.sealed_block()).await?;
-
-        Ok(())
-    }
-
-    /// Calculate difficulty for the new block
-    fn calculate_difficulty(
-        &self,
-        parent: &reth_primitives::SealedHeader,
-    ) -> Result<U256, Box<dyn std::error::Error + Send + Sync>> {
-        use crate::consensus::parlia::constants::{DIFF_INTURN, DIFF_NOTURN};
-
-        let snapshot =
-            self.snapshot_provider.snapshot(parent.number()).ok_or("No snapshot available")?;
-
-        let difficulty =
-            if snapshot.is_inturn(self.validator_address) { DIFF_INTURN } else { DIFF_NOTURN };
-
-        Ok(U256::from(difficulty))
-    }
-
-    /// Collect transactions from the transaction pool
-    async fn collect_transactions(
-        &self,
-        header: &alloy_consensus::Header,
-    ) -> Result<Vec<TransactionSigned>, Box<dyn std::error::Error + Send + Sync>> {
-        let mut transactions: Vec<TransactionSigned> = Vec::new();
-        let mut gas_used = 0u64;
-        let gas_limit = header.gas_limit();
-
-        // Get best transactions from pool
-        let best_txs = self.pool.best_transactions();
-
-        // Collect transactions until we hit gas limit
-        for pooled_tx in best_txs {
-            let recovered = pooled_tx.to_consensus();
-            if gas_used + recovered.gas_limit() > gas_limit {
-                break;
-            }
-            gas_used += recovered.gas_limit();
-
-            transactions.push(recovered.into_inner());
-        }
-
-        debug!("Collected {} transactions for block, gas used: {}", transactions.len(), gas_used);
-        Ok(transactions)
     }
 
     /// Submit the sealed block (placeholder for now)
