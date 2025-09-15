@@ -131,6 +131,9 @@ impl MiningConfig {
 
         let private_key_hex = std::env::var("BSC_PRIVATE_KEY").ok();
 
+        let keystore_path = std::env::var("BSC_KEYSTORE_PATH").ok().map(Into::into);
+        let keystore_password = std::env::var("BSC_KEYSTORE_PASSWORD").ok();
+
         let gas_limit = std::env::var("BSC_GAS_LIMIT")
             .ok()
             .and_then(|v| v.parse().ok());
@@ -142,6 +145,8 @@ impl MiningConfig {
         let mut cfg = Self {
             enabled,
             private_key_hex,
+            keystore_path,
+            keystore_password,
             gas_limit,
             mining_interval_ms,
             ..Default::default()
@@ -151,6 +156,10 @@ impl MiningConfig {
         if cfg.validator_address.is_none() {
             if let Some(ref pk_hex) = cfg.private_key_hex {
                 if let Ok(sk) = keystore::load_private_key_from_hex(pk_hex) {
+                    cfg.validator_address = Some(keystore::get_validator_address(&sk));
+                }
+            } else if let (Some(ref path), Some(ref pass)) = (&cfg.keystore_path, &cfg.keystore_password) {
+                if let Ok(sk) = keystore::load_private_key_from_keystore(path, pass) {
                     cfg.validator_address = Some(keystore::get_validator_address(&sk));
                 }
             }
@@ -183,13 +192,15 @@ pub mod keystore {
 
     /// Load private key from keystore file
     pub fn load_private_key_from_keystore(
-        _keystore_path: &Path,
-        _password: &str,
+        keystore_path: &Path,
+        password: &str,
     ) -> Result<SigningKey, Box<dyn std::error::Error + Send + Sync>> {
-        // TODO: Implement proper keystore loading
-        // This would typically use eth_keystore or similar library
-        // For now, return an error to indicate not implemented
-        Err("Keystore loading not yet implemented - use private_key_hex for testing".into())
+        let key_bytes = eth_keystore::decrypt_key(keystore_path, password)?; // Vec<u8>
+        if key_bytes.len() != 32 {
+            return Err("Decrypted private key must be 32 bytes".into());
+        }
+        let signing_key = SigningKey::from_slice(&key_bytes)?;
+        Ok(signing_key)
     }
 
     /// Load private key from hex string
@@ -252,5 +263,41 @@ mod tests {
         
         // Verify we can get an address from the key
         assert_ne!(address, Address::ZERO);
+    }
+
+    #[test]
+    fn test_load_private_key_from_keystore_file() {
+        use std::fs;
+        use std::io::Write;
+        use std::path::PathBuf;
+        use uuid::Uuid;
+
+        // This is a real V3 keystore JSON (address bcdd0d2c...) with password "0123456789"
+        let keystore_json = r#"{"address":"bcdd0d2cda5f6423e57b6a4dcd75decbe31aecf0","crypto":{"cipher":"aes-128-ctr","ciphertext":"f7505ced32fe3037d6dc25ae7e9716858e516bacfb0dc28c9995f01cf7fee84a","cipherparams":{"iv":"d93e5314f18ccfc8330e1ad37534fa29"},"kdf":"scrypt","kdfparams":{"dklen":32,"n":262144,"p":1,"r":8,"salt":"1fb8f954f70fb0ddb8be5b1fb57d821df21dda700682f382baed311dde95a6c7"},"mac":"c501bb033f94cb9efc3c63fe1547555fc1412d3abb8b400cacda37bd9de888ec"},"id":"7246dc9c-d170-4009-8878-8628be169836","version":3}"#;
+
+        // Write to a temporary file
+        let mut path: PathBuf = std::env::temp_dir();
+        let fname = format!("UTC--test-{}--bcdd0d2cda5f6423e57b6a4dcd75decbe31aecf0", Uuid::new_v4());
+        path.push(fname);
+        {
+            let mut f = fs::File::create(&path).unwrap();
+            f.write_all(keystore_json.as_bytes()).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        // Decrypt with the known password
+        let signing_key = keystore::load_private_key_from_keystore(&path, "0123456789").unwrap();
+        // convert signing_key to hex string
+        let signing_key_hex = alloy_primitives::hex::encode(signing_key.to_bytes());
+        println!("signing_key: 0x{}", signing_key_hex);
+
+        let address = keystore::get_validator_address(&signing_key);
+
+        // Expect derived address to match the keystore address
+        let expected: Address = "0xbcdd0d2cda5f6423e57b6a4dcd75decbe31aecf0".parse().unwrap();
+        assert_eq!(address, expected);
+
+        // Cleanup best-effort
+        let _ = fs::remove_file(&path);
     }
 }

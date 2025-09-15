@@ -30,6 +30,14 @@ pub struct BscCliArgs {
     #[arg(long = "mining.private-key")]
     pub private_key: Option<String>,
 
+    /// Path to an Ethereum V3 keystore JSON for mining
+    #[arg(long = "mining.keystore-path")]
+    pub keystore_path: Option<PathBuf>,
+
+    /// Password for the keystore file (plain string)
+    #[arg(long = "mining.keystore-password")]
+    pub keystore_password: Option<String>,
+
     /// Custom genesis file path
     #[arg(long = "genesis")]
     pub genesis_file: Option<PathBuf>,
@@ -83,6 +91,13 @@ fn main() -> eyre::Result<()> {
                         let addr = mining_config::keystore::get_validator_address(&sk);
                         mining_config.validator_address = Some(addr);
                     }
+                }
+
+                if let Some(ref path) = args.keystore_path {
+                    mining_config.keystore_path = Some(path.clone());
+                }
+                if let Some(ref pass) = args.keystore_password {
+                    mining_config.keystore_password = Some(pass.clone());
                 }
 
                 // Ensure keys are available if enabled but none provided
