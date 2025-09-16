@@ -37,6 +37,7 @@ use reth::payload::EthPayloadBuilderAttributes;
 use reth_revm::cancelled::CancelOnDrop;
 use crate::node::miner::signer::init_global_signer;
 use alloy_primitives::B256;
+use reth_primitives_traits::BlockBody;
 
 /// Built payload for BSC. This is similar to [`EthBuiltPayload`] but without sidecars as those
 /// included into [`BscBlock`].
@@ -248,6 +249,7 @@ where
 
         // queue to engine-api for memory tree and broadcast it block_import channel.
         // todo: check it.
+        debug!("Submitting block: {:?}, tx_len: {}", payload.block().header(), payload.block().body().transaction_count());
         self.submit_block(payload.block()).await?;
 
         Ok(())

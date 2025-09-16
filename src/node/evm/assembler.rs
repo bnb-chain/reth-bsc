@@ -152,6 +152,8 @@ where
             ) {
                 tracing::warn!("Failed to finalize header: {}", e);
             }
+
+            tracing::debug!("Succeed to finalize header: {:?}", header)
         }
 
         Ok(Block {
