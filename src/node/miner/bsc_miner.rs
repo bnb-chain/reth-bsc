@@ -1,4 +1,3 @@
-use crate::node::evm::util::HEADER_CACHE_READER;
 use crate::{
     consensus::parlia::provider::SnapshotProvider,
     node::{
@@ -18,7 +17,6 @@ use alloy_primitives::{Address, B256};
 use k256::ecdsa::SigningKey;
 use reth::transaction_pool::PoolTransaction;
 use reth::transaction_pool::TransactionPool;
-use reth_chainspec::EthChainSpec;
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
 use reth_payload_primitives::BuiltPayload;
 use reth_primitives::{SealedBlock, TransactionSigned};
@@ -132,24 +130,6 @@ where
             }
         } else {
             warn!("No signing key available, global signer not initialized");
-        }
-
-        // Ensure the genesis block header is cached so that the snapshot provider can create the genesis snapshot
-        {
-            let mut cache = HEADER_CACHE_READER.lock().unwrap();
-            if cache.get_header_by_number(0).is_none() {
-                if let Some(genesis_header) = self.provider.header_by_number(0)? {
-                    cache.insert_header_to_cache(genesis_header);
-                    info!("Inserted genesis header from provider into cache");
-                } else {
-                    // Build the genesis header from the chain spec as fallback
-                    let genesis_header = self.chain_spec.genesis_header().clone();
-                    cache.insert_header_to_cache(genesis_header.clone());
-                    info!("Inserted genesis header from chain spec into cache");
-                }
-            } else {
-                info!("Genesis header already cached");
-            }
         }
 
         info!("Starting BSC mining service for validator: {}", self.validator_address);

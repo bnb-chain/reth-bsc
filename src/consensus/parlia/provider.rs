@@ -6,7 +6,7 @@ use crate::chainspec::BscChainSpec;
 
 use crate::consensus::parlia::{Parlia, VoteAddress};
 use crate::node::evm::error::BscBlockExecutionError;
-use alloy_primitives::{Address, B256, hex};
+use alloy_primitives::{Address, B256};
 
 /// Validator information extracted from header
 #[derive(Debug, Clone)]
@@ -224,13 +224,9 @@ impl<DB: Database + 'static> SnapshotProvider for EnhancedDbSnapshotProvider<DB>
 
             // Check if we need to handle genesis
             if current_block == 0 {
-                tracing::debug!("Attempting to create genesis snapshot for block 0");
                 if let Some(header) = crate::node::evm::util::HEADER_CACHE_READER.lock().unwrap().get_header_by_number(0) {
-                    tracing::info!("Found genesis header in cache: block={}, hash={}", header.number, header.hash_slow());
-                    tracing::debug!("Genesis header extraData: 0x{}", hex::encode(&header.extra_data));
                     let ValidatorsInfo { consensus_addrs, vote_addrs } =
                         self.parlia.parse_validators_from_header(&header, self.parlia.epoch).map_err(|err| {
-                            tracing::error!("Failed to parse validators from header: {:?}", err);
                             BscBlockExecutionError::ParliaConsensusInnerError { error: err.into() }
                         }).ok()?;
                     let genesis_snap = Snapshot::new(

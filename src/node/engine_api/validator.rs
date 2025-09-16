@@ -12,7 +12,6 @@ use reth::{
     },
     consensus::ConsensusError,
 };
-use reth_chainspec::EthChainSpec;
 use reth_engine_primitives::{ExecutionPayload, PayloadValidator};
 use reth_payload_primitives::NewPayloadError;
 use reth_primitives::{RecoveredBlock, SealedBlock};
@@ -34,7 +33,7 @@ where
     type Validator = BscEngineValidator;
 
     async fn build(self, ctx: &AddOnsContext<'_, Node>) -> eyre::Result<Self::Validator> {
-        Ok(BscEngineValidator::new(Arc::new(ctx.config.chain.clone().as_ref().clone()), None))
+        Ok(BscEngineValidator::new(Arc::new(ctx.config.chain.clone().as_ref().clone())))
     }
 }
 
@@ -49,8 +48,8 @@ pub struct BscEngineValidator {
 
 impl BscEngineValidator {
     /// Instantiates a new validator.
-    pub fn new(chain_spec: Arc<BscChainSpec>, sealed_block: Option<SealedBlock<BscBlock>>) -> Self {
-        Self { inner: BscExecutionPayloadValidator { inner: chain_spec, sealed_block } }
+    pub fn new(chain_spec: Arc<BscChainSpec>) -> Self {
+        Self { inner: BscExecutionPayloadValidator { inner: chain_spec } }
     }
 }
 
@@ -114,14 +113,12 @@ pub struct BscExecutionPayloadValidator<ChainSpec> {
     /// Chain spec to validate against.
     #[allow(unused)]
     inner: Arc<ChainSpec>,
-    sealed_block: Option<SealedBlock<BscBlock>>,
 }
 
 impl<ChainSpec> BscExecutionPayloadValidator<ChainSpec>
 where
-    ChainSpec: EthChainSpec + BscHardforks,
+    ChainSpec: BscHardforks,
 {
-    // TODO: only a checker func, and nothing need to change.
     pub fn ensure_well_formed_payload(
         &self,
         payload: BscExecutionData,
@@ -129,21 +126,14 @@ where
         let block = payload.0;
 
         let expected_hash = block.header.hash_slow();
-        let sealed_block = match &self.sealed_block {
-            Some(to_sealed) => {
-                to_sealed.clone()
-            }
-            None => {
-                block.seal_slow()
-            }
-        };
+        let sealed_block = block.seal_slow();
 
         // Ensure the hash included in the payload matches the block hash
         if expected_hash != sealed_block.hash() {
             return Err(PayloadError::BlockHash {
                 execution: sealed_block.hash(),
                 consensus: expected_hash,
-            })?;
+            })?
         }
 
         Ok(sealed_block)
