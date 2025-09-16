@@ -70,7 +70,7 @@ fn main() -> eyre::Result<()> {
             
             // Map CLI args into a global MiningConfig override before launching services
             {
-                use reth_bsc::node::mining_config::{self, MiningConfig};
+                use reth_bsc::node::miner::{config as mining_config, MiningConfig};
 
                 let mut mining_config: MiningConfig = if args.mining_dev {
                     // Dev mode: generate ephemeral keys

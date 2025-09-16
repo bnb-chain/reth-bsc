@@ -33,7 +33,6 @@ pub mod engine;
 pub mod engine_api;
 pub mod evm;
 pub mod miner;
-pub mod mining_config;
 pub mod network;
 pub mod primitives;
 pub mod storage;

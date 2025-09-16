@@ -188,7 +188,6 @@ pub mod keystore {
     use k256::ecdsa::{SigningKey, Signature, signature::Signer};
     use alloy_primitives::keccak256;
     use std::path::Path;
-    use reth::consensus::ConsensusError;
 
     /// Load private key from keystore file
     pub fn load_private_key_from_keystore(
@@ -227,8 +226,8 @@ pub mod keystore {
     /// Create signing function with loaded private key
     pub fn create_signing_function(
         signing_key: SigningKey,
-    ) -> impl Fn(Address, &str, &[u8]) -> Result<Vec<u8>, ConsensusError> + Send + Sync + 'static {
-        move |_addr: Address, _mimetype: &str, data: &[u8]| -> Result<Vec<u8>, ConsensusError> {
+    ) -> impl Fn(Address, &str, &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> + Send + Sync + 'static {
+        move |_addr: Address, _mimetype: &str, data: &[u8]| -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
             let hash = keccak256(data);
             let signature: Signature = signing_key.sign(hash.as_slice());
             Ok(signature.to_bytes().to_vec())
