@@ -3,14 +3,6 @@ use reth::rpc::api::IntoEngineApiRpcModule;
 use reth_engine_primitives::ConsensusEngineHandle;
 use std::sync::Arc;
 
-#[cfg(feature = "bench-test")]
-use alloy_rpc_types::engine::{ForkchoiceState, PayloadStatusEnum};
-#[cfg(feature = "bench-test")]
-use jsonrpsee_types::error::ErrorObjectOwned;
-#[cfg(feature = "bench-test")]
-use reth_payload_primitives::EngineApiMessageVersion;
-#[cfg(feature = "bench-test")]
-use reth_node_ethereum::engine::EthPayloadAttributes;
 
 pub mod builder;
 pub mod payload;
