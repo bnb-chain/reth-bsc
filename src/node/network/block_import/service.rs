@@ -390,7 +390,7 @@ mod tests {
         async fn new(responses: EngineResponses) -> Self {
             let consensus = Arc::new(ParliaConsensus { provider: MockProvider });
             let (to_engine, from_engine) = mpsc::unbounded_channel();
-            let engine_handle = BeaconConsensusEngineHandle::new(to_engine);
+            let engine_handle = ConsensusEngineHandle::new(to_engine);
 
             handle_engine_msg(from_engine, responses).await;
 
