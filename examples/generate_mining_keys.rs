@@ -3,7 +3,7 @@
 //! 
 //! Usage: cargo run --example generate_mining_keys
 
-use reth_bsc::node::mining_config::MiningConfig;
+use reth_bsc::node::miner::MiningConfig;
 
 fn main() {
     println!("🔑 BSC Mining Key Generator");
