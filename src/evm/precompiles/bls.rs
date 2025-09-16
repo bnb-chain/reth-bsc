@@ -3,14 +3,14 @@
 use alloy_primitives::Bytes;
 use bls_on_arkworks as bls;
 use revm::precompile::{
-    u64_to_address, PrecompileError, PrecompileOutput, PrecompileResult, PrecompileWithAddress,
+    u64_to_address, PrecompileError, PrecompileOutput, PrecompileResult, Precompile, PrecompileId,
 };
 use std::vec::Vec;
 
 use super::error::BscPrecompileError;
 
-pub(crate) const BLS_SIGNATURE_VALIDATION: PrecompileWithAddress =
-    PrecompileWithAddress(u64_to_address(102), bls_signature_validation_run);
+pub(crate) const BLS_SIGNATURE_VALIDATION: Precompile =
+    Precompile::new(PrecompileId::Identity, u64_to_address(102), bls_signature_validation_run);
 
 const BLS_MSG_HASH_LENGTH: u64 = 32;
 const BLS_SIGNATURE_LENGTH: u64 = 96;

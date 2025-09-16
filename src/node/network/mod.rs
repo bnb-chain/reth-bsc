@@ -19,7 +19,7 @@ use reth_chainspec::EthChainSpec;
 use reth_discv4::Discv4Config;
 use reth_eth_wire::{BasicNetworkPrimitives, NewBlock, NewBlockPayload};
 use reth_ethereum_primitives::PooledTransactionVariant;
-use reth_engine_primitives::BeaconConsensusEngineHandle;
+use reth_engine_primitives::ConsensusEngineHandle;
 use reth_network::{NetworkConfig, NetworkHandle, NetworkManager};
 use reth_network_api::PeersInfo;
 use std::{sync::Arc, time::Duration};
@@ -149,13 +149,13 @@ pub type BscNetworkPrimitives =
 #[derive(Debug)]
 pub struct BscNetworkBuilder {
     engine_handle_rx: Arc<
-        Mutex<Option<oneshot::Receiver<BeaconConsensusEngineHandle<BscPayloadTypes>>>>,
+        Mutex<Option<oneshot::Receiver<ConsensusEngineHandle<BscPayloadTypes>>>>,
     >,
 }
 
 impl BscNetworkBuilder {
     pub fn new(
-        engine_handle_rx: Arc<Mutex<Option<oneshot::Receiver<BeaconConsensusEngineHandle<BscPayloadTypes>>>>>,
+        engine_handle_rx: Arc<Mutex<Option<oneshot::Receiver<ConsensusEngineHandle<BscPayloadTypes>>>>>,
     ) -> Self {
         Self { engine_handle_rx }
     }

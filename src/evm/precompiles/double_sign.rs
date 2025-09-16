@@ -6,12 +6,12 @@ use alloy_rlp::{Decodable, RlpDecodable, RlpEncodable};
 use core::cmp::Ordering;
 use revm::precompile::{
     secp256k1, u64_to_address, PrecompileError, PrecompileOutput, PrecompileResult,
-    PrecompileWithAddress,
+    Precompile, PrecompileId,
 };
 
 /// Double sign evidence validation precompile for BSC.
-pub(crate) const DOUBLE_SIGN_EVIDENCE_VALIDATION: PrecompileWithAddress =
-    PrecompileWithAddress(u64_to_address(104), double_sign_evidence_validation_run);
+pub(crate) const DOUBLE_SIGN_EVIDENCE_VALIDATION: Precompile =
+    Precompile::new(PrecompileId::Identity, u64_to_address(104), double_sign_evidence_validation_run);
 
 const EXTRA_SEAL_LENGTH: usize = 65;
 

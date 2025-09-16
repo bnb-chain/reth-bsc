@@ -20,11 +20,10 @@ use reth::{
     builder::{components::ComponentsBuilder, rpc::RpcAddOns, DebugNode, Node, NodeAdapter},
 };
 use reth_engine_local::LocalPayloadAttributesBuilder;
-use reth_engine_primitives::BeaconConsensusEngineHandle;
+use reth_engine_primitives::ConsensusEngineHandle;
 use reth_node_ethereum::{node::EthereumPoolBuilder, EthereumEthApiBuilder};
 use reth_payload_primitives::{PayloadAttributesBuilder, PayloadTypes};
 use reth_primitives::BlockBody;
-use reth_trie_db::MerklePatriciaTrie;
 use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex};
 
@@ -49,11 +48,11 @@ pub type BscNodeAddOns<N> = RpcAddOns<
 #[derive(Debug, Clone)]
 pub struct BscNode {
     engine_handle_rx:
-        Arc<Mutex<Option<oneshot::Receiver<BeaconConsensusEngineHandle<BscPayloadTypes>>>>>,
+        Arc<Mutex<Option<oneshot::Receiver<ConsensusEngineHandle<BscPayloadTypes>>>>>,
 }
 
 impl BscNode {
-    pub fn new() -> (Self, oneshot::Sender<BeaconConsensusEngineHandle<BscPayloadTypes>>) {
+    pub fn new() -> (Self, oneshot::Sender<ConsensusEngineHandle<BscPayloadTypes>>) {
         let (tx, rx) = oneshot::channel();
         (Self { engine_handle_rx: Arc::new(Mutex::new(Some(rx))) }, tx)
     }
@@ -94,7 +93,6 @@ impl BscNode {
 impl NodeTypes for BscNode {
     type Primitives = BscPrimitives;
     type ChainSpec = BscChainSpec;
-    type StateCommitment = MerklePatriciaTrie;
     type Storage = BscStorage;
     type Payload = BscPayloadTypes;
 }

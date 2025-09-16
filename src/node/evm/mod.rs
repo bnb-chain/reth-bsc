@@ -126,7 +126,7 @@ pub struct BscExecutorBuilder;
 impl<Node> ExecutorBuilder<Node> for BscExecutorBuilder
 where
     Node: FullNodeTypes,
-    Node::Types: NodeTypes<Primitives = crate::node::primitives::BscPrimitives, ChainSpec = crate::chainspec::BscChainSpec, Payload = crate::node::engine_api::payload::BscPayloadTypes, StateCommitment = reth_trie_db::MerklePatriciaTrie, Storage = crate::node::storage::BscStorage>,
+    Node::Types: NodeTypes<Primitives = crate::node::primitives::BscPrimitives, ChainSpec = crate::chainspec::BscChainSpec, Payload = crate::node::engine_api::payload::BscPayloadTypes, Storage = crate::node::storage::BscStorage>,
 {
     type EVM = BscEvmConfig;
 

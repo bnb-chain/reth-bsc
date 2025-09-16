@@ -1,29 +1,29 @@
 use alloy_primitives::Bytes;
 use parity_bytes::BytesRef;
 use revm::precompile::{
-    u64_to_address, PrecompileError, PrecompileOutput, PrecompileResult, PrecompileWithAddress,
+    u64_to_address, PrecompileError, PrecompileOutput, PrecompileResult, Precompile, PrecompileId,
 };
 use tendermint::lite::iavl_proof;
 
 /// Iavl proof validation precompile for BSC.
-pub(crate) const IAVL_PROOF_VALIDATION: PrecompileWithAddress =
-    PrecompileWithAddress(u64_to_address(101), iavl_proof_validation_run);
+pub(crate) const IAVL_PROOF_VALIDATION: Precompile =
+    Precompile::new(PrecompileId::Identity, u64_to_address(101), iavl_proof_validation_run);
 
 /// Iavl proof validation precompile for BSC after Nano hardfork.
-pub(crate) const IAVL_PROOF_VALIDATION_NANO: PrecompileWithAddress =
-    PrecompileWithAddress(u64_to_address(101), iavl_proof_validation_run_nano);
+pub(crate) const IAVL_PROOF_VALIDATION_NANO: Precompile =
+    Precompile::new(PrecompileId::Identity, u64_to_address(101), iavl_proof_validation_run_nano);
 
 /// Iavl proof validation precompile for BSC after Moran hardfork.
-pub(crate) const IAVL_PROOF_VALIDATION_MORAN: PrecompileWithAddress =
-    PrecompileWithAddress(u64_to_address(101), iavl_proof_validation_run_moran);
+pub(crate) const IAVL_PROOF_VALIDATION_MORAN: Precompile =
+    Precompile::new(PrecompileId::Identity, u64_to_address(101), iavl_proof_validation_run_moran);
 
 /// Iavl proof validation precompile for BSC after Planck hardfork.
-pub(crate) const IAVL_PROOF_VALIDATION_PLANCK: PrecompileWithAddress =
-    PrecompileWithAddress(u64_to_address(101), iavl_proof_validation_run_planck);
+pub(crate) const IAVL_PROOF_VALIDATION_PLANCK: Precompile =
+    Precompile::new(PrecompileId::Identity, u64_to_address(101), iavl_proof_validation_run_planck);
 
 /// Iavl proof validation precompile for BSC after Plato hardfork.
-pub(crate) const IAVL_PROOF_VALIDATION_PLATO: PrecompileWithAddress =
-    PrecompileWithAddress(u64_to_address(101), iavl_proof_validation_run_plato);
+pub(crate) const IAVL_PROOF_VALIDATION_PLATO: Precompile =
+    Precompile::new(PrecompileId::Identity, u64_to_address(101), iavl_proof_validation_run_plato);
 
 /// Run Iavl proof validation.
 fn iavl_proof_validation_run(input: &[u8], gas_limit: u64) -> PrecompileResult {

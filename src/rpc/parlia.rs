@@ -1,5 +1,5 @@
 
-use jsonrpsee::{core::RpcResult, proc_macros::rpc, types::ErrorObject};
+use jsonrpsee::{core::RpcResult, proc_macros::rpc, types::error::ErrorObject};
 use serde::{Deserialize, Serialize};
 
 use crate::consensus::parlia::{Snapshot, SnapshotProvider};
