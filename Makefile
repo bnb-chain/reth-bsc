@@ -2,7 +2,7 @@
 
 # Cargo profile for builds. Default is for local builds, CI uses an override.
 PROFILE ?= release
-
+FEATURES ?= jemalloc,asm-keccak
 ##@ Help
 
 .PHONY: help

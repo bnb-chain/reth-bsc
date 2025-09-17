@@ -18,18 +18,137 @@ This project aims to bring Reth's high-performance Ethereum client capabilities 
 - **BSC Mainnet**: Synced to the tip ✅ (12T disk required)
 - **BSC Testnet**: Synced to the tip ✅ (780GB disk usage)
 
-## Getting Started
+## Building
 
-Refer to the [Reth documentation](https://reth.rs/) for general guidance on running a node and be sure to
-add these 2 cli required to start reth-bsc:     
+### Clone and Build
+
 ```bash
---chain bsc \
---db.max-size 7TB
+# Clone the repository
+git clone https://github.com/bnb-chain/reth-bsc.git
+cd reth-bsc
+
+# use cargo
+cargo build  # debug mode
+cargo build --release  # release mode 
+
+# use makefile
+# release mode default. 
+# cargo build --bin reth-bsc --features "jemalloc,asm-keccak" --profile "release"
+make build
+
+# build in max perf profile
+# RUSTFLAGS="-C target-cpu=native" cargo build --bin reth-bsc --profile maxperf --features jemalloc,asm-keccak
+make maxperf 
 ```
 
-## Snapshot
+## Running
+
+### Full Node (Recommended)
+
+A full node stores recent state and can serve RPC requests efficiently:
+
+```bash
+./target/${profile}/reth-bsc node --full --chain bsc --datadir ./data_dir
+```
+
+### Archive Node
+
+An archive node stores the complete blockchain history and state:
+
+```bash
+./target/${profile}/reth-bsc node --chain bsc --datadir ./data_dir
+```
+
+### BSC Testnet
+
+To run on BSC Testnet instead of Mainnet, simply replace `--chain bsc` with `--chain bsc-testnet` in any of the above commands:
+
+```bash
+# Example: Full node on BSC Testnet
+./target/${profile}/reth-bsc node --full --chain bsc-testnet --datadir ./data_dir
+```
+
+### RPC Configuration
+
+To enable RPC services, add these parameters to your node command:
+
+#### HTTP & Websocket
+```bash
+# Full node with HTTP and WebSocket RPC enabled
+./target/${profile}/reth-bsc node --full \
+  --chain bsc \
+  --datadir ./data_dir \
+  --http \
+  --http.addr 0.0.0.0 \
+  --http.port 8545 \
+  --http.api eth,net,web3,txpool,debug \
+  --ws \
+  --ws.addr 0.0.0.0 \
+  --ws.port 8546 \
+  --ws.api eth,net,web3,txpool
+```
+
+### Available API Modules
+
+- `eth`: Ethereum JSON-RPC API (block info, transactions, etc.)
+- `net`: Network information (peer count, network ID)
+- `web3`: Web3 standard APIs (client version, sha3)
+- `txpool`: Transaction pool information
+- `debug`: Debug APIs for development (tracing, profiling)
+- `trace`: Transaction tracing (requires archive node)
+- `admin`: Administrative APIs (peer management)
+
+
+## Sync
+
+### 1. Genesis Sync
+
+Sync from block 0 (will take weeks):
+
+```bash
+./target/release/reth-bsc node --chain bsc --datadir=./data_dir
+```
+
+### 2. Snapshot Sync
 
 Refer to the [SNAPSHOT.md](https://github.com/bnb-chain/reth-bsc/blob/main/SNAPSHOT.md) for snapshot information
+
+## Monitoring
+
+### Check Sync Status
+
+```bash
+# Check current block
+curl -X POST \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
+  http://localhost:8545
+
+# Check sync status
+curl -X POST \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","method":"eth_syncing","params":[],"id":1}' \
+  http://localhost:8545
+```
+
+### Metrics
+
+Enable metrics endpoint for monitoring:
+
+```bash
+--metrics 0.0.0.0:6060
+```
+
+Then access metrics at `http://localhost:6060/metrics`
+
+### Logs
+
+Enable detailed logging:
+
+```bash
+--log.file.verbosity debug \
+--log.file.directory ./logs
+```
 
 ## Contributing
 
@@ -37,7 +156,7 @@ We welcome community contributions! Whether you're interested in helping with hi
 
 ## Disclaimer
 
-This project is experimental and under active development. Use at your own risk.
+This project is experimental and under active development. Use at your own risk. Always backup your data and test on testnet first.
 
 ## Credits
 
