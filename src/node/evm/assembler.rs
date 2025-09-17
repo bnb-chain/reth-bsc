@@ -6,6 +6,7 @@ use crate::{
     BscBlock, BscBlockBody,
 };
 use alloy_consensus::{Block, BlockBody, Header, EMPTY_OMMER_ROOT_HASH, proofs, Transaction, BlockHeader};
+use alloy_primitives::keccak256;
 use alloy_eips::{eip7840::BlobParams, merge::BEACON_NONCE};
 use alloy_primitives::Bytes;
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
@@ -153,7 +154,9 @@ where
                 tracing::warn!("Failed to finalize header: {}", e);
             }
 
-            tracing::debug!("Succeed to finalize header: {:?}", header)
+            let header_hash = keccak256(alloy_rlp::encode(&header));
+            tracing::debug!("Succeed to finalize header, block_number={}, hash=0x{:x}, parent_hash=0x{:x}, txs={}", 
+                header.number, header_hash, header.parent_hash, transactions.len())
         }
 
         Ok(Block {

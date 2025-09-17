@@ -99,7 +99,7 @@ where
                         validator_address, derived_address
                     );
                 }
-                info!("Using derived address from private key: {}", derived_address);
+                info!("Succeed to derived address from private key, address: {}", derived_address);
                 validator_address = derived_address;
             }
 
@@ -129,7 +129,7 @@ where
 
     pub async fn start(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if !self.mining_config.is_mining_enabled() {
-            info!("Skip to start mining due to mining is disabled");
+            info!("Skip to start mining due to miner is disabled");
             return Ok(());
         }
 
@@ -137,7 +137,7 @@ where
             let private_key_bytes = signing_key.as_nonzero_scalar().to_bytes();
             let private_key = B256::from_slice(&private_key_bytes);
             if let Err(e) = init_global_signer(private_key) {
-                return Err(format!("Failed to initialize global signer: {}", e).into());
+                return Err(format!("Failed to initialize global signer due to {}", e).into());
             } else {
                 info!("Succeed to initialize global signer");
             }
@@ -145,20 +145,20 @@ where
             return Err("No signing key available, global signer not initialized".into());
         }
 
-        self.spawn_miner_workers().await?;
+        self.spawn_workers().await?;
 
         info!("Succeed to start mining, address: {}", self.validator_address);
         Ok(())
     }
 
-    async fn spawn_miner_workers(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn spawn_workers(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let provider = self.provider.clone();
         let snapshot_provider = self.snapshot_provider.clone();
         let validator_address = self.validator_address;
         let mining_queue_tx = self.mining_queue_tx.clone();
         
-        self.task_executor.spawn_critical("trigger_mine_worker", async move {
-            info!("Succeed to spawn trigger mine worker");
+        self.task_executor.spawn_critical("trigger_worker", async move {
+            info!("Succeed to spawn trigger worker");
             let mut notifications = provider.subscribe_to_canonical_state();
             
             loop {
@@ -171,19 +171,19 @@ where
                                         let chain = new.clone();
                                         let tip = chain.tip();
                                     
-                                        // many checks for mining.
-                                        if tip.timestamp() < SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() - 30 {
-                                            debug!("Skip to mine new block due to maybe in syncing.");
+                                        // todo: refine check is_syncing status.
+                                        if tip.timestamp() < SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() - 3 {
+                                            debug!("Skip to mine new block due to maybe in syncing");
                                             continue;
                                         }
                                         let parent_header = match provider.sealed_header(tip.number()) {
                                             Ok(Some(header)) => header,
                                             Ok(None) => {
-                                                debug!("Skip to mine new block due to head block header not found for block {}", tip.number());
+                                                debug!("Skip to mine new block due to head block header not found, block: {}", tip.number());
                                                 continue;
                                             }
                                             Err(e) => {
-                                                debug!("Skip to mine new block due to error getting header for block {}: {}", tip.number(), e);
+                                                debug!("Skip to mine new block due to error getting header, block: {}, due to {}", tip.number(), e);
                                                 continue;
                                             }
                                         };
@@ -191,7 +191,7 @@ where
                                         let parent_snapshot = match snapshot_provider.snapshot(tip.number()) {
                                             Some(snapshot) => snapshot,
                                             None => {
-                                                debug!("Skip to mine new block due to no snapshot available for block {}", tip.number());
+                                                debug!("Skip to mine new block due to no snapshot available, block: {}", tip.number());
                                                 continue;
                                             }
                                         };
@@ -200,7 +200,7 @@ where
                                             continue;
                                         }
                                         if parent_snapshot.sign_recently(validator_address) {
-                                            debug!("Skip to mine new block due to signed recently: {}", validator_address);
+                                            debug!("Skip to mine new block due to signed recently, validator: {}", validator_address);
                                             continue;
                                         }
 
@@ -210,9 +210,9 @@ where
                                         };
 
                                         
-                                        debug!("Queuing mining context for block #{}", tip.number() + 1);
+                                        debug!("Queuing mining context, block: {}", tip.number() + 1);
                                         if let Err(e) = mining_queue_tx.send(mining_ctx) {
-                                            error!("Failed to send mining context to queue: {}", e);
+                                            error!("Failed to send mining context to queue due to {}", e);
                                         }
 
                                     }
@@ -220,7 +220,7 @@ where
                                         let old_tip = old.tip();
                                         let new_tip = new.tip();
                                         warn!(
-                                            "Chain reorganization detected! Old tip: #{} -> New tip: #{} (depth: {} blocks)",
+                                            "Chain reorganization detected! Old tip: {} -> New tip: {} (depth: {} blocks)",
                                             old_tip.number(),
                                             new_tip.number(),
                                             old.len()
@@ -235,7 +235,7 @@ where
                                 }
                             }
                             Err(e) => {
-                                warn!("Failed to receive canonical state notification: {}", e);
+                                warn!("Failed to receive canonical state notification due to {}", e);
                                 tokio::time::sleep(Duration::from_millis(1000)).await;
                                 notifications = provider.subscribe_to_canonical_state();
                             }
@@ -257,7 +257,7 @@ where
                 
                 while let Some(mining_ctx) = mining_queue_rx.recv().await {
                     let next_block = mining_ctx.parent_header.number() + 1;
-                    debug!("Received mining context for next_block #{}", next_block);
+                    debug!("Received mining context, next_block: {}", next_block);
 
                      match Self::try_mine_block(
                          pool.clone(),
@@ -268,10 +268,10 @@ where
                          mining_ctx
                      ).await {
                         Ok(()) => {
-                            debug!("Succeed to mine block, next_block #{}", next_block);
+                            debug!("Succeed to mine block, next_block: {}", next_block);
                         }
                         Err(e) => {
-                            error!("Failed to mine block due to {}, next_block #{}", e, next_block);
+                            error!("Failed to mine block due to {}, next_block: {}", e, next_block);
                         }
                     }
                 }
@@ -324,7 +324,7 @@ where
             None,
         ))?;
 
-        info!("Start to submit block #{} (hash: 0x{:x}, txs: {})", 
+        info!("Start to submit block: {} (hash: 0x{:x}, txs: {})", 
             payload.block().header().number(),
             payload.block().hash(),
             payload.block().body().transaction_count()
@@ -332,7 +332,7 @@ where
 
         Self::submit_block(payload.block()).await?;
 
-        info!("Succeed to mine and submit, block #{}", payload.block().header().number());
+        info!("Succeed to mine and submit, block: {}", payload.block().header().number());
         Ok(())
     }
 
@@ -357,6 +357,7 @@ where
         // If the block import sender is available, forward the block to the import service
         if let Some(sender) = get_block_import_sender() {
             // Wrap into IncomingBlock tuple (BlockMsg, PeerId)
+            // todo: check announce_new_block/announce_new_block_hash.
             let peer_id = PeerId::default(); // `None` for self-originated blocks
             let incoming: crate::node::network::block_import::service::IncomingBlock =
                 (msg, peer_id);
