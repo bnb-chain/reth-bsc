@@ -46,6 +46,7 @@ reth-rpc-engine-api = { git = "https://github.com/bnb-chain/reth.git", branch = 
 reth-tracing = { git = "https://github.com/bnb-chain/reth.git", branch = "3f86efc3bb-bsc" }
 reth-trie-common = { git = "https://github.com/bnb-chain/reth.git", branch = "3f86efc3bb-bsc" }
 reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", branch = "3f86efc3bb-bsc" }
+reth-tasks = { git = "https://github.com/bnb-chain/reth.git", branch = "3f86efc3bb-bsc" }
 revm = "28.0.1"
 
 # alloy dependencies

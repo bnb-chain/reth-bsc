@@ -86,31 +86,26 @@ where
         } else {
             info!("Mining is enabled - will start mining after consensus initialization");
 
-            // Defer mining initialization until consensus module sets up the snapshot provider
             let mining_config_clone = mining_config.clone();
             let pool_clone = pool.clone();
             let provider_clone = ctx.provider().clone();
             let chain_spec_clone = Arc::new(ctx.config().chain.clone().as_ref().clone());
+            let task_executor_clone = ctx.task_executor().clone();
 
             ctx.task_executor().spawn_critical("bsc-miner-initializer", async move {
                 info!("Waiting for consensus module to initialize snapshot provider...");
-
-                // Wait up to 10 seconds for snapshot provider to become available
                 let mut attempts = 0;
                 let snapshot_provider = loop {
                     if let Some(provider) = crate::shared::get_snapshot_provider() {
                         break provider.clone();
                     }
-
                     attempts += 1;
                     if attempts > 100 {
                         error!("Timed out waiting for snapshot provider - mining disabled");
                         return;
                     }
-
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 };
-
                 info!("Snapshot provider available, starting BSC mining service");
 
                 match BscMiner::new(
@@ -119,10 +114,11 @@ where
                     snapshot_provider,
                     chain_spec_clone,
                     mining_config_clone,
+                    task_executor_clone,
                 ) {
                     Ok(mut miner) => {
                         info!("BSC miner created successfully, starting mining loop");
-                        if let Err(e) = miner.start_mining().await {
+                        if let Err(e) = miner.start().await {
                             error!("Mining service failed: {}", e);
                         }
                     }

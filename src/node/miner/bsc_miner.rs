@@ -20,17 +20,23 @@ use reth::transaction_pool::TransactionPool;
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
 use reth_payload_primitives::BuiltPayload;
 use reth_primitives::{SealedBlock, TransactionSigned};
-use reth_provider::{BlockNumReader, HeaderProvider};
+use reth_provider::{BlockNumReader, HeaderProvider, CanonStateSubscriptions, CanonStateNotification};
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::time::interval;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
+use reth_tasks::TaskExecutor;
 use reth_basic_payload_builder::{BuildArguments, PayloadConfig};
 use reth::payload::EthPayloadBuilderAttributes;
 use reth_revm::cancelled::CancelOnDrop;
 use reth_primitives_traits::BlockBody;
 
-/// Mining Service that handles block production for BSC
+struct MiningContext {
+    parent_header: reth_primitives::SealedHeader,
+    parent_snapshot: Arc<crate::consensus::parlia::snapshot::Snapshot>,
+}
+
+/// Miner that handles block production for BSC
 pub struct BscMiner<Pool, Provider> {
     pool: Pool,
     provider: Provider,
@@ -40,6 +46,9 @@ pub struct BscMiner<Pool, Provider> {
     parlia: Arc<crate::consensus::parlia::Parlia<crate::chainspec::BscChainSpec>>,
     signing_key: Option<SigningKey>,
     mining_config: MiningConfig,
+    task_executor: TaskExecutor,
+    mining_queue_tx: mpsc::UnboundedSender<MiningContext>,
+    mining_queue_rx: Option<mpsc::UnboundedReceiver<MiningContext>>,
 
     // todo: add more eventloop for performance like bsc miner.
 }
@@ -52,6 +61,7 @@ where
     Provider: HeaderProvider<Header = alloy_consensus::Header>
         + BlockNumReader
         + reth_provider::StateProviderFactory
+        + CanonStateSubscriptions
         + Clone
         + Send
         + Sync
@@ -63,15 +73,13 @@ where
         snapshot_provider: Arc<dyn SnapshotProvider + Send + Sync>,
         chain_spec: Arc<crate::chainspec::BscChainSpec>,
         mining_config: MiningConfig,
+        task_executor: TaskExecutor,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        // Validate mining configuration
         mining_config.validate()?;
 
         // We'll derive and trust the validator address from the configured signing key when possible.
         // If not available, fall back to configured address (may be ZERO when disabled).
         let mut validator_address = mining_config.validator_address.unwrap_or(Address::ZERO);
-
-        // Load signing key if mining is enabled
         let signing_key = if mining_config.is_mining_enabled() {
             let key = if let Some(keystore_path) = &mining_config.keystore_path {
                 let password = mining_config.keystore_password.as_deref().unwrap_or("");
@@ -100,104 +108,236 @@ where
             None
         };
 
-        Ok(Self {
-            pool,
-            provider,
-            snapshot_provider,
+        let (mining_queue_tx, mining_queue_rx) = mpsc::unbounded_channel::<MiningContext>();
+        let miner = Self {
+            pool: pool.clone(),
+            provider: provider.clone(),
+            snapshot_provider: snapshot_provider.clone(),
             validator_address,
             chain_spec: chain_spec.clone(),
-            parlia: Arc::new(crate::consensus::parlia::Parlia::new(chain_spec, 200)),
+            parlia: Arc::new(crate::consensus::parlia::Parlia::new(chain_spec.clone(), 200)),
             signing_key,
-            mining_config,
-        })
+            mining_config: mining_config.clone(),
+            task_executor: task_executor.clone(),
+            mining_queue_tx,
+            mining_queue_rx: Some(mining_queue_rx),
+        };
+
+        info!("Succeed to new miner instance, address: {}", validator_address);
+        Ok(miner)
     }
 
-    /// Start the PoA mining loop
-    pub async fn start_mining(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn start(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if !self.mining_config.is_mining_enabled() {
-            info!("Mining is disabled in configuration");
+            info!("Skip to start mining due to mining is disabled");
             return Ok(());
         }
 
         if let Some(ref signing_key) = self.signing_key {
             let private_key_bytes = signing_key.as_nonzero_scalar().to_bytes();
             let private_key = B256::from_slice(&private_key_bytes);
-            
             if let Err(e) = init_global_signer(private_key) {
-                warn!("Failed to initialize global signer: {}", e);
+                return Err(format!("Failed to initialize global signer: {}", e).into());
             } else {
                 info!("Succeed to initialize global signer");
             }
         } else {
-            warn!("No signing key available, global signer not initialized");
+            return Err("No signing key available, global signer not initialized".into());
         }
 
-        info!("Starting BSC mining service for validator: {}", self.validator_address);
+        self.spawn_miner_workers().await?;
 
-        // Mining interval from config or default
-        let interval_ms = self.mining_config.mining_interval_ms.unwrap_or(3000);
-        let mut mining_interval = interval(Duration::from_millis(interval_ms));
-
-        info!("BSC mining interval is: {}", interval_ms);
-        loop {
-            mining_interval.tick().await;
-
-            if let Err(e) = self.try_mine_block().await {
-                error!("Mining attempt failed: {}", e);
-                // Continue mining loop even if individual attempts fail
-            }
-        }
+        info!("Succeed to start mining, address: {}", self.validator_address);
+        Ok(())
     }
 
-    /// Attempt to mine a block if conditions are met
-    async fn try_mine_block(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Get current head block from chain state
-        let current_block_number = self.provider.best_block_number()?;
-        let parent_header = self
-            .provider
-            .sealed_header(current_block_number)?
-            .ok_or("Head block header not found")?;
+    async fn spawn_miner_workers(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let provider = self.provider.clone();
+        let snapshot_provider = self.snapshot_provider.clone();
+        let validator_address = self.validator_address;
+        let mining_queue_tx = self.mining_queue_tx.clone();
+        
+        self.task_executor.spawn_critical("trigger_mine_worker", async move {
+            info!("Succeed to spawn trigger mine worker");
+            let mut notifications = provider.subscribe_to_canonical_state();
+            
+            loop {
+                tokio::select! {
+                    notification = notifications.recv() => {
+                        match notification {
+                            Ok(event) => {
+                                match event {
+                                    CanonStateNotification::Commit { new } => {
+                                        let chain = new.clone();
+                                        let tip = chain.tip();
+                                    
+                                        // many checks for mining.
+                                        if tip.timestamp() < SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() - 30 {
+                                            debug!("Skip to mine new block due to maybe in syncing.");
+                                            continue;
+                                        }
+                                        let parent_header = match provider.sealed_header(tip.number()) {
+                                            Ok(Some(header)) => header,
+                                            Ok(None) => {
+                                                debug!("Skip to mine new block due to head block header not found for block {}", tip.number());
+                                                continue;
+                                            }
+                                            Err(e) => {
+                                                debug!("Skip to mine new block due to error getting header for block {}: {}", tip.number(), e);
+                                                continue;
+                                            }
+                                        };
 
-        // let current_time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        let parent_number = parent_header.number();
+                                        let parent_snapshot = match snapshot_provider.snapshot(tip.number()) {
+                                            Some(snapshot) => snapshot,
+                                            None => {
+                                                debug!("Skip to mine new block due to no snapshot available for block {}", tip.number());
+                                                continue;
+                                            }
+                                        };
+                                        if !parent_snapshot.validators.contains(&validator_address) {
+                                            debug!("Skip to mine new block due to not authorized validator: {}", validator_address);
+                                            continue;
+                                        }
+                                        if parent_snapshot.sign_recently(validator_address) {
+                                            debug!("Skip to mine new block due to signed recently: {}", validator_address);
+                                            continue;
+                                        }
 
-        // Get snapshot for parent block to check authorization
-        let snapshot = self
-            .snapshot_provider
-            .snapshot(parent_number)
-            .ok_or("No snapshot available for parent block")?;
+                                        let mining_ctx = MiningContext {
+                                            parent_header,
+                                            parent_snapshot: Arc::new(parent_snapshot),
+                                        };
 
-        // Check if we're authorized to mine
-        if !snapshot.validators.contains(&self.validator_address) {
-            return Err(format!("Not authorized validator: {}", self.validator_address).into());
+                                        
+                                        debug!("Queuing mining context for block #{}", tip.number() + 1);
+                                        if let Err(e) = mining_queue_tx.send(mining_ctx) {
+                                            error!("Failed to send mining context to queue: {}", e);
+                                        }
+
+                                    }
+                                    CanonStateNotification::Reorg { old, new } => {
+                                        let old_tip = old.tip();
+                                        let new_tip = new.tip();
+                                        warn!(
+                                            "Chain reorganization detected! Old tip: #{} -> New tip: #{} (depth: {} blocks)",
+                                            old_tip.number(),
+                                            new_tip.number(),
+                                            old.len()
+                                        );
+                                        info!(
+                                            "Reorg details - Old hash: 0x{:x}, New hash: 0x{:x}",
+                                            old_tip.hash(),
+                                            new_tip.hash()
+                                        );
+                                        
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Failed to receive canonical state notification: {}", e);
+                                tokio::time::sleep(Duration::from_millis(1000)).await;
+                                notifications = provider.subscribe_to_canonical_state();
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        if let Some(mut mining_queue_rx) = self.mining_queue_rx.take() {
+            let pool = self.pool.clone();
+            let provider = self.provider.clone();
+            let chain_spec = self.chain_spec.clone();
+            let parlia = self.parlia.clone();
+            let validator_address = self.validator_address;
+
+            self.task_executor.spawn_critical("mining_worker", async move {
+                info!("Succeed to spawn mining worker, address: 0x{:x}", validator_address);
+                
+                while let Some(mining_ctx) = mining_queue_rx.recv().await {
+                    let next_block = mining_ctx.parent_header.number() + 1;
+                    debug!("Received mining context for next_block #{}", next_block);
+
+                     match Self::try_mine_block(
+                         pool.clone(),
+                         provider.clone(), 
+                         chain_spec.clone(),
+                         parlia.clone(),
+                         validator_address,
+                         mining_ctx
+                     ).await {
+                        Ok(()) => {
+                            debug!("Succeed to mine block, next_block #{}", next_block);
+                        }
+                        Err(e) => {
+                            error!("Failed to mine block due to {}, next_block #{}", e, next_block);
+                        }
+                    }
+                }
+                
+                warn!("Mining worker stopped");
+            });
+        } else {
+            warn!("Mining queue receiver not available");
         }
-
-        // Check if we signed recently (avoid signing too frequently)
-        if snapshot.sign_recently(self.validator_address) {
-            return Err("Signed recently, must wait for others".into());
-        }
-
-        let attributes = prepare_new_attributes(self.parlia.clone(), &snapshot, &parent_header, self.validator_address);
-        let evm_config = BscEvmConfig::new(self.chain_spec.clone());
-        let payload_builder = BscPayloadBuilder::new(self.provider.clone(), self.pool.clone(), evm_config, EthereumBuilderConfig::new());
-        let payload = payload_builder.build_payload(BuildArguments::<EthPayloadBuilderAttributes, BscBuiltPayload>::new(
-            reth_revm::cached::CachedReads::default(),
-            PayloadConfig::new(Arc::new(parent_header.clone()), attributes),
-            CancelOnDrop::default(),
-            None,
-        ))?;
-
-        // queue to engine-api for memory tree and broadcast it block_import channel.
-        // todo: check it.
-        debug!("Submitting block: {:?}, tx_len: {}", payload.block().header(), payload.block().body().transaction_count());
-        self.submit_block(payload.block()).await?;
 
         Ok(())
     }
 
-    /// Submit the sealed block (placeholder for now)
+     async fn try_mine_block<P, Pr>(
+        pool: P,
+        provider: Pr,
+        chain_spec: Arc<crate::chainspec::BscChainSpec>,
+        parlia: Arc<crate::consensus::parlia::Parlia<crate::chainspec::BscChainSpec>>,
+        validator_address: Address,
+        mining_ctx: MiningContext,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        P: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>> + Clone + Send + Sync,
+        Pr: HeaderProvider<Header = alloy_consensus::Header>
+            + BlockNumReader
+            + reth_provider::StateProviderFactory
+            + CanonStateSubscriptions
+            + Clone
+            + Send
+            + Sync,
+    {
+        let attributes = prepare_new_attributes(
+            parlia.clone(), 
+            &mining_ctx.parent_snapshot, 
+            &mining_ctx.parent_header, 
+            validator_address
+        );
+
+        let evm_config = BscEvmConfig::new(chain_spec.clone());
+        let payload_builder = BscPayloadBuilder::new(
+            provider.clone(), 
+            pool.clone(), 
+            evm_config, 
+            EthereumBuilderConfig::new()
+        );
+        let payload = payload_builder.build_payload(BuildArguments::<EthPayloadBuilderAttributes, BscBuiltPayload>::new(
+            reth_revm::cached::CachedReads::default(),
+            PayloadConfig::new(Arc::new(mining_ctx.parent_header.clone()), attributes),
+            CancelOnDrop::default(),
+            None,
+        ))?;
+
+        info!("Start to submit block #{} (hash: 0x{:x}, txs: {})", 
+            payload.block().header().number(),
+            payload.block().hash(),
+            payload.block().body().transaction_count()
+        );
+
+        Self::submit_block(payload.block()).await?;
+
+        info!("Succeed to mine and submit, block #{}", payload.block().header().number());
+        Ok(())
+    }
+
+    /// todo: check and refine.
     async fn submit_block(
-        &self,
         sealed_block: &SealedBlock<BscBlock>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         use crate::node::network::BscNewBlock;
@@ -222,11 +362,14 @@ where
                 (msg, peer_id);
             if sender.send(incoming).is_err() {
                 warn!("Failed to send mined block to import service: channel closed");
+            } else {
+                debug!("Succeed to send mined block to import service");
             }
         } else {
-            warn!("Block import sender not initialised; mined block not imported");
+            warn!("Failed to send mined block due to import sender not initialised");
         }
 
         Ok(())
     }
+
 }
