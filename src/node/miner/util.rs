@@ -24,7 +24,7 @@ pub fn prepare_new_attributes(parlia: Arc<Parlia<BscChainSpec>>, parent_snap: &S
     if BscHardforks::is_bohr_active_at_timestamp(&parlia.spec, new_header.number, new_header.timestamp) {
         attributes.parent_beacon_block_root = Some(B256::default());
     }
-    return attributes;
+    attributes
 }
 
 /// prepare a tmp new header for preparing attributes.
