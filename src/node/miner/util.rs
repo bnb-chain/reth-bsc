@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use alloy_consensus::Header;
-use alloy_primitives::{Address, Bytes};
+use alloy_primitives::{Address, Bytes, B256};
 use crate::consensus::parlia::Snapshot;
 use crate::consensus::parlia::consensus::Parlia;
 use crate::consensus::parlia::util::{calculate_difficulty, debug_header};
@@ -14,13 +14,17 @@ use crate::node::miner::signer::seal_header_with_global_signer;
 
 pub fn prepare_new_attributes(parlia: Arc<Parlia<BscChainSpec>>, parent_snap: &Snapshot, parent_header: &Header, signer: Address) -> EthPayloadBuilderAttributes {
     let new_header = prepare_new_header(parlia.clone(), parent_snap, parent_header, signer);
-    EthPayloadBuilderAttributes{
+    let mut attributes = EthPayloadBuilderAttributes{
         parent: new_header.parent_hash,
         timestamp: new_header.timestamp,
         suggested_fee_recipient: new_header.beneficiary,
         prev_randao: new_header.mix_hash,
         ..Default::default()
+    };
+    if BscHardforks::is_bohr_active_at_timestamp(&parlia.spec, new_header.number, new_header.timestamp) {
+        attributes.parent_beacon_block_root = Some(B256::default());
     }
+    return attributes;
 }
 
 /// prepare a tmp new header for preparing attributes.
