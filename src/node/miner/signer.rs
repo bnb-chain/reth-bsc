@@ -2,7 +2,7 @@ use once_cell::sync::OnceCell;
 use std::sync::Arc;
 use reth_primitives::{Transaction, TransactionSigned};
 use reth_primitives_traits::crypto::secp256k1::sign_message;
-use alloy_primitives::{B256, keccak256};
+use alloy_primitives::B256;
 use alloy_consensus::{SignableTransaction, Header};
 use crate::consensus::parlia::{hash_with_chain_id, EXTRA_SEAL_LEN};
 use secp256k1::{SECP256K1, Message, SecretKey};
@@ -48,12 +48,10 @@ impl MinerSigner {
 
     pub fn seal_header(&self, header: &Header, chain_id: u64) -> Result<[u8; EXTRA_SEAL_LEN], SignerError> {
         let hash_data = hash_with_chain_id(header, chain_id);
-        
-        let hash = keccak256(hash_data.as_slice());
         let secret_key = SecretKey::from_slice(self.private_key.as_ref())
             .map_err(|e| SignerError::SigningFailed(format!("Invalid private key: {}", e)))?;
         
-        let message = Message::from_digest(hash.0);
+        let message = Message::from_digest(hash_data.0);
         let recoverable_sig = SECP256K1.sign_ecdsa_recoverable(&message, &secret_key);
         let (recovery_id, signature_bytes) = recoverable_sig.serialize_compact();
         
