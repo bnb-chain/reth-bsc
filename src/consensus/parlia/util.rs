@@ -41,7 +41,7 @@ pub fn debug_header(header: &Header, chain_id: u64, context: &str) {
         state_root = %format!("0x{:x}", header.state_root),
         transactions_root = %format!("0x{:x}", header.transactions_root),
         receipts_root = %format!("0x{:x}", header.receipts_root),
-        logs_bloom = %format!("0x{}", alloy_primitives::hex::encode(&header.logs_bloom)),
+        logs_bloom = %format!("0x{}", alloy_primitives::hex::encode(header.logs_bloom)),
         difficulty = %header.difficulty.to_string(),
         number = header.number,
         gas_limit = header.gas_limit,

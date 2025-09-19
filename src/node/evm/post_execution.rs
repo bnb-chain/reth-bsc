@@ -101,7 +101,7 @@ where
 
         let header = self.inner_ctx.header.as_ref().unwrap().clone();
         let epoch_length = self.parlia.get_epoch_length(&header);
-        if (header.number + 1)% epoch_length == 0 {
+        if (header.number + 1).is_multiple_of(epoch_length) {
             // cache it on pre block.
             // for verify validators in post-check of fullnode mode and prepare new header in miner mode.
             self.get_current_validators(header.number)?;
@@ -118,7 +118,7 @@ where
     ) -> Result<(), BlockExecutionError> {
         let header_ref = header.as_ref().unwrap();
         let epoch_length = self.parlia.get_epoch_length(header_ref);
-        if header_ref.number % epoch_length != 0 {
+        if !header_ref.number.is_multiple_of(epoch_length) {
             tracing::trace!("Skip verify validator, block_number {} is not an epoch boundary, epoch_length: {}", header_ref.number, epoch_length);
             return Ok(());
         }
@@ -165,7 +165,7 @@ where
     ) -> Result<(), BlockExecutionError> {
         let header_ref = header.as_ref().unwrap();
         let epoch_length = self.inner_ctx.snap.as_ref().unwrap().epoch_num;
-        if header_ref.number % epoch_length != 0 || !self.spec.is_bohr_active_at_timestamp(header_ref.number, header_ref.timestamp) {
+        if !header_ref.number.is_multiple_of(epoch_length) || !self.spec.is_bohr_active_at_timestamp(header_ref.number, header_ref.timestamp) {
             tracing::trace!("Skip verify turn length, block_number {} is not an epoch boundary, epoch_length: {}", header_ref.number, epoch_length);
             return Ok(());
         }
@@ -366,7 +366,7 @@ where
         // distribute finality reward per 200 blocks.
         let distribute_interval = 200;
         let block_number = self.evm.block().number.to::<u64>();
-        if block_number % distribute_interval != 0 {
+        if !block_number.is_multiple_of(distribute_interval) {
             return Ok(());
         }
 
@@ -526,7 +526,7 @@ where
 
         let header = prepare_new_header(self.parlia.clone(), self.inner_ctx.snap.as_ref().unwrap(), self.inner_ctx.parent_header.as_ref().unwrap(), self.evm.block().beneficiary);
         let epoch_length = self.parlia.get_epoch_length(&header);
-        if (header.number + 1)% epoch_length == 0 {
+        if (header.number + 1).is_multiple_of(epoch_length) {
             // cache it on pre block.
             // for verify validators in post-check of fullnode mode and prepare new header in miner mode.
             self.get_current_validators(header.number)?;
@@ -534,7 +534,7 @@ where
 
         {   // prepare new header in miner mode.
             let epoch_length = self.inner_ctx.snap.as_ref().unwrap().epoch_num;
-            if header.number % epoch_length == 0 && self.spec.is_bohr_active_at_timestamp(header.number, header.timestamp) {
+            if header.number.is_multiple_of(epoch_length) && self.spec.is_bohr_active_at_timestamp(header.number, header.timestamp) {
                 self.ctx.turn_length = self.get_turn_length(&header)?;
             }
         }

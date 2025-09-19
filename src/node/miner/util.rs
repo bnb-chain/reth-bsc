@@ -55,7 +55,7 @@ where
 
     {   // prepare validators
         let epoch_length = parlia.get_epoch_length(new_header);
-        if (new_header.number)% epoch_length == 0 {
+        if (new_header.number).is_multiple_of(epoch_length) {
             let mut validators: Option<(Vec<Address>, Vec<crate::consensus::parlia::VoteAddress>)> = None;
             let mut cache = VALIDATOR_CACHE.lock().unwrap();
             if let Some(cached_result) = cache.get(&parent_header.number) {

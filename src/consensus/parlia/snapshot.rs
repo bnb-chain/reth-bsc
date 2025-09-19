@@ -193,10 +193,10 @@ impl Snapshot {
 
         let epoch_length = snap.epoch_num;
         let next_block_number = block_number + 1;
-        if snap.epoch_num == DEFAULT_EPOCH_LENGTH && is_lorentz_active && next_block_number % LORENTZ_EPOCH_LENGTH == 0 {
+        if snap.epoch_num == DEFAULT_EPOCH_LENGTH && is_lorentz_active && next_block_number.is_multiple_of(LORENTZ_EPOCH_LENGTH) {
             snap.epoch_num = LORENTZ_EPOCH_LENGTH;
         }
-        if snap.epoch_num == LORENTZ_EPOCH_LENGTH && is_maxwell_active && next_block_number % MAXWELL_EPOCH_LENGTH == 0 {
+        if snap.epoch_num == LORENTZ_EPOCH_LENGTH && is_maxwell_active && next_block_number.is_multiple_of(MAXWELL_EPOCH_LENGTH) {
             snap.epoch_num = MAXWELL_EPOCH_LENGTH;
         }
 
