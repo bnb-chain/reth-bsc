@@ -203,13 +203,17 @@ where
                                             debug!("Skip to mine new block due to signed recently, validator: {}", validator_address);
                                             continue;
                                         }
+                                        // TODO: remove it later, now just for easy to debug.
+                                        if !parent_snapshot.is_inturn(validator_address) {
+                                            debug!("Skip to produce due to is not inturn");
+                                            continue;
+                                        }
 
                                         let mining_ctx = MiningContext {
                                             parent_header,
                                             parent_snapshot: Arc::new(parent_snapshot),
                                         };
 
-                                        
                                         debug!("Queuing mining context, block: {}", tip.number() + 1);
                                         if let Err(e) = mining_queue_tx.send(mining_ctx) {
                                             error!("Failed to send mining context to queue due to {}", e);
@@ -330,35 +334,48 @@ where
             payload.block().body().transaction_count()
         );
 
-        Self::submit_block(payload.block()).await?;
+        Self::submit_block(payload.block(), mining_ctx, provider).await?;
 
         info!("Succeed to mine and submit, block: {}", payload.block().header().number());
         Ok(())
     }
 
     /// todo: check and refine.
-    async fn submit_block(
+    async fn submit_block<Pr>(
         sealed_block: &SealedBlock<BscBlock>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        mining_ctx: MiningContext,
+        provider: Pr,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> 
+    where
+        Pr: HeaderProvider<Header = alloy_consensus::Header>
+            + BlockNumReader
+            + reth_provider::StateProviderFactory
+            + CanonStateSubscriptions
+            + Clone
+            + Send
+            + Sync,
+    {
         use crate::node::network::BscNewBlock;
-        use crate::shared::get_block_import_sender;
+        use crate::shared::{get_block_import_sender, get_local_peer_id_or_default};
         use alloy_primitives::U128;
         use reth_network::message::NewBlockMessage;
-        use reth_network_api::PeerId;
 
+        let parent_number = mining_ctx.parent_header.number();
+        let parent_td = provider.header_td_by_number(parent_number)
+            .map_err(|e| format!("Failed to get parent total difficulty: {}", e))?
+            .unwrap_or_default();
+        let current_difficulty = sealed_block.header().difficulty();
+        let new_td = parent_td + current_difficulty;
+        
+        let td = U128::from(new_td.to::<u128>());
         let block_hash = sealed_block.hash();
-        let block = sealed_block.clone_block();
-
-        // Construct the NewBlock network message
-        let td = U128::from(1u64); // TODO: compute real total difficulty
-        let new_block = BscNewBlock(reth_eth_wire::NewBlock { block: block.clone(), td });
+        let new_block = BscNewBlock(reth_eth_wire::NewBlock { block: sealed_block.clone_block(), td });
         let msg = NewBlockMessage { hash: block_hash, block: Arc::new(new_block) };
 
-        // If the block import sender is available, forward the block to the import service
         if let Some(sender) = get_block_import_sender() {
-            // Wrap into IncomingBlock tuple (BlockMsg, PeerId)
             // todo: check announce_new_block/announce_new_block_hash.
-            let peer_id = PeerId::default(); // `None` for self-originated blocks
+            // todo: check engine-api re-execute and p2p.
+            let peer_id = get_local_peer_id_or_default();
             let incoming: crate::node::network::block_import::service::IncomingBlock =
                 (msg, peer_id);
             if sender.send(incoming).is_err() {

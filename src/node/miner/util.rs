@@ -3,7 +3,7 @@ use alloy_consensus::Header;
 use alloy_primitives::{Address, Bytes};
 use crate::consensus::parlia::Snapshot;
 use crate::consensus::parlia::consensus::Parlia;
-use crate::consensus::parlia::util::calculate_difficulty;
+use crate::consensus::parlia::util::{calculate_difficulty, debug_header};
 use crate::chainspec::BscChainSpec;
 use crate::consensus::parlia::{EXTRA_VANITY_LEN, EXTRA_SEAL_LEN};
 use reth::payload::EthPayloadBuilderAttributes;
@@ -83,6 +83,8 @@ where
         let start = extra_data.len() - EXTRA_SEAL_LEN;
         extra_data[start..].copy_from_slice(&seal_data);
         new_header.extra_data = Bytes::from(extra_data);
+
+        debug_header(new_header, parlia.spec.chain().id(), "finalize_new_header");
     }
 
     Ok(())

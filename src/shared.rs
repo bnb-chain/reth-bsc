@@ -5,6 +5,7 @@ use alloy_primitives::B256;
 use reth_provider::HeaderProvider;
 use crate::node::network::block_import::service::IncomingBlock;
 use tokio::sync::mpsc::UnboundedSender;
+use reth_network_api::PeerId;
 
 /// Function type for HeaderProvider::header() access (by hash)
 type HeaderByHashFn = Arc<dyn Fn(&B256) -> Option<Header> + Send + Sync>;
@@ -23,6 +24,9 @@ static HEADER_BY_NUMBER_PROVIDER: OnceLock<HeaderByNumberFn> = OnceLock::new();
 
 /// Global sender for submitting mined blocks to the import service
 static BLOCK_IMPORT_SENDER: OnceLock<UnboundedSender<IncomingBlock>> = OnceLock::new();
+
+/// Global local peer ID for network identification
+static LOCAL_PEER_ID: OnceLock<PeerId> = OnceLock::new();
 
 /// Store the snapshot provider globally
 pub fn set_snapshot_provider(provider: Arc<dyn SnapshotProvider + Send + Sync>) -> Result<(), Arc<dyn SnapshotProvider + Send + Sync>> {
@@ -107,4 +111,14 @@ pub fn set_block_import_sender(sender: UnboundedSender<IncomingBlock>) -> Result
 /// Get a reference to the global block import sender, if initialized.
 pub fn get_block_import_sender() -> Option<&'static UnboundedSender<IncomingBlock>> {
     BLOCK_IMPORT_SENDER.get()
+}
+
+/// Store the local peer ID globally. Returns an error if it was set before.
+pub fn set_local_peer_id(peer_id: PeerId) -> Result<(), PeerId> {
+    LOCAL_PEER_ID.set(peer_id)
+}
+
+/// Get the global local peer ID, or return a default PeerId if not set.
+pub fn get_local_peer_id_or_default() -> PeerId {
+    LOCAL_PEER_ID.get().cloned().unwrap_or_default()
 }

@@ -12,7 +12,7 @@ use revm::{
 use alloy_consensus::{TxReceipt, Header, BlockHeader};
 use alloy_primitives::B256;
 use crate::consensus::parlia::{VoteAddress, Snapshot, Parlia, DIFF_INTURN, DIFF_NOTURN};
-use crate::consensus::parlia::util::{is_breathe_block, calculate_millisecond_timestamp};
+use crate::consensus::parlia::util::{is_breathe_block, calculate_millisecond_timestamp, debug_header};
 use crate::consensus::parlia::vote::MAX_ATTESTATION_EXTRA_LENGTH;
 use crate::node::evm::error::BscBlockExecutionError;
 use crate::node::evm::util::HEADER_CACHE_READER;
@@ -381,6 +381,9 @@ where
         })?;
 
         if proposer != header.beneficiary {
+            tracing::error!("Wrong header signer, block_number: {}, proposer: {:?}, expected: {:?}", 
+                header.number(), proposer, header.beneficiary);
+            debug_header(header, self.spec.chain().id(), "verify_seal_header");
             return Err(BscBlockExecutionError::WrongHeaderSigner {
                 block_number: header.number(),
                 signer: GotExpected { got: proposer, expected: header.beneficiary }.into(),
