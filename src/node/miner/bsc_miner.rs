@@ -30,6 +30,10 @@ use reth_basic_payload_builder::{BuildArguments, PayloadConfig};
 use reth::payload::EthPayloadBuilderAttributes;
 use reth_revm::cancelled::CancelOnDrop;
 use reth_primitives_traits::BlockBody;
+use crate::node::network::BscNewBlock;
+use crate::shared::{get_block_import_sender, get_local_peer_id_or_default};
+use alloy_primitives::U128;
+use reth_network::message::NewBlockMessage;
 
 struct MiningContext {
     parent_header: reth_primitives::SealedHeader,
@@ -334,7 +338,7 @@ where
             payload.block().body().transaction_count()
         );
 
-        Self::submit_block(payload.block(), mining_ctx, provider).await?;
+        Self::submit_block(payload.block(), mining_ctx, provider, parlia).await?;
 
         info!("Succeed to mine and submit, block: {}", payload.block().header().number());
         Ok(())
@@ -345,6 +349,7 @@ where
         sealed_block: &SealedBlock<BscBlock>,
         mining_ctx: MiningContext,
         provider: Pr,
+        parlia: Arc<crate::consensus::parlia::Parlia<crate::chainspec::BscChainSpec>>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> 
     where
         Pr: HeaderProvider<Header = alloy_consensus::Header>
@@ -355,10 +360,26 @@ where
             + Send
             + Sync,
     {
-        use crate::node::network::BscNewBlock;
-        use crate::shared::{get_block_import_sender, get_local_peer_id_or_default};
-        use alloy_primitives::U128;
-        use reth_network::message::NewBlockMessage;
+        // now is focus on the basic workflow.
+        // TODO: refine it later. https://github.com/bnb-chain/bsc/blob/master/consensus/parlia/parlia.go#L1702.
+        let present_timestamp = parlia.present_timestamp();
+        if sealed_block.header().timestamp > present_timestamp {
+            let delay_ms = (sealed_block.header().timestamp - present_timestamp) * 1000;
+            tracing::info!(
+                target: "bsc::miner",
+                block_number = sealed_block.header().number,
+                block_timestamp = sealed_block.header().timestamp,
+                present_timestamp = present_timestamp,
+                delay_ms = delay_ms,
+                "Block timestamp is in the future, waiting before submission"
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+            tracing::debug!(
+                target: "bsc::miner",
+                block_number = sealed_block.header().number,
+                "Finished waiting, proceeding with block submission"
+            );
+        }
 
         let parent_number = mining_ctx.parent_header.number();
         let parent_td = provider.header_td_by_number(parent_number)
