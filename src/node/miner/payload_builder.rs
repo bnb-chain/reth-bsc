@@ -53,13 +53,14 @@ where
         Self { client, pool, evm_config, builder_config }
     }
 
+    // todo: check more and refine it later.
     pub fn build_payload(self,args: BuildArguments<EthPayloadBuilderAttributes, BscBuiltPayload>) -> Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>> {
         let BuildArguments { mut cached_reads, config, cancel: _cancel, best_payload: _best_payload } = args;
         let PayloadConfig { parent_header, attributes } = config;
 
         let state_provider = self.client.state_by_block_hash(parent_header.hash_slow())?;
         let state = StateProviderDatabase::new(&state_provider);
-        let mut db = State::builder().with_database(cached_reads.as_db_mut(state)).build();
+        let mut db = State::builder().with_database(cached_reads.as_db_mut(state)).with_bundle_update().build();
         
         let mut builder = self.evm_config
             .builder_for_next_block(

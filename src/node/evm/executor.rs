@@ -249,8 +249,15 @@ where
     type Evm = E;
 
     fn apply_pre_execution_changes(&mut self) -> Result<(), BlockExecutionError> {
-        // pre check and prepare some intermediate data for commit parlia snapshot in finish function.
         let block_env = self.evm.block().clone();
+        debug!(
+            target: "bsc::executor", 
+            block_id = %block_env.number,
+            is_miner = self.ctx.is_miner,
+            "Start to apply_pre_execution_changes"
+        );
+        
+        // pre check and prepare some intermediate data for commit parlia snapshot in finish function.
         if self.ctx.is_miner {
             self.prepare_new_block(&block_env)?;
         } else {
@@ -342,6 +349,14 @@ where
     fn finish(
         mut self,
     ) -> Result<(Self::Evm, BlockExecutionResult<R::Receipt>), BlockExecutionError> {
+        let block_env = self.evm.block().clone();
+        debug!(
+            target: "bsc::executor", 
+            block_id = %block_env.number,
+            is_miner = self.ctx.is_miner,
+            "Start to finish"
+        );
+
         // If first block deploy genesis contracts
         if self.evm.block().number == uint!(1U256) {
             self.deploy_genesis_contracts(self.evm.block().beneficiary)?;
