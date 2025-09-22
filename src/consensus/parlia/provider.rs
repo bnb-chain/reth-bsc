@@ -166,7 +166,7 @@ impl<DB: Database + 'static> SnapshotProvider for DbSnapshotProvider<DB> {
 
     fn insert(&self, snapshot: Snapshot) {
         self.cache.write().insert(snapshot.block_number, snapshot.clone());
-        if snapshot.block_number % crate::consensus::parlia::snapshot::CHECKPOINT_INTERVAL == 0 {
+        if snapshot.block_number.is_multiple_of(crate::consensus::parlia::snapshot::CHECKPOINT_INTERVAL) {
             match self.persist_to_db(&snapshot) {
                 Ok(()) => {
                     tracing::debug!("Succeed to persist snapshot for block {} to DB", snapshot.block_number);
@@ -207,7 +207,7 @@ impl<DB: Database + 'static> SnapshotProvider for EnhancedDbSnapshotProvider<DB>
             }
 
             // Check database at checkpoint intervals (every 1024 blocks)
-            if current_block % crate::consensus::parlia::snapshot::CHECKPOINT_INTERVAL == 0 {
+            if current_block.is_multiple_of(crate::consensus::parlia::snapshot::CHECKPOINT_INTERVAL) {
                 if let Some(snap) = self.base.load_from_db(current_block) {
                     tracing::debug!("Succeed to load snap, block_number: {}, snap_block_number: {}, wanted_block_number: {}", current_block, snap.block_number, block_number);
                     if snap.block_number == current_block {
@@ -353,7 +353,7 @@ impl<DB: Database + 'static> EnhancedDbSnapshotProvider<DB> {
 
                 // Cache and persist snapshots at checkpoints
                 self.base.cache.write().insert(working_snapshot.block_number, working_snapshot.clone());
-                if working_snapshot.block_number % crate::consensus::parlia::snapshot::CHECKPOINT_INTERVAL == 0 {
+                if working_snapshot.block_number.is_multiple_of(crate::consensus::parlia::snapshot::CHECKPOINT_INTERVAL) {
                     tracing::info!("Persisting snapshot checkpoint for block {}", working_snapshot.block_number);
                     self.base.insert(working_snapshot.clone());
                 }
@@ -362,7 +362,7 @@ impl<DB: Database + 'static> EnhancedDbSnapshotProvider<DB> {
             current_block = chunk_end + 1;
             
             // Log progress and memory usage every 50k blocks
-            if current_block % 50000 == 0 {
+            if current_block.is_multiple_of(50000) {
                 let mem_info = Self::get_memory_usage();
                 tracing::info!("Incremental rebuild progress: {} / {} blocks completed, Memory: RSS={}MB VSZ={}MB", 
                     current_block - 1, target_block, mem_info.0, mem_info.1);

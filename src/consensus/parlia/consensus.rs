@@ -69,7 +69,7 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
         }
 
         let is_luban_active = self.spec.is_luban_active_at_block(header.number);
-        let is_epoch = header.number % epoch_length == 0;
+        let is_epoch = header.number.is_multiple_of(epoch_length);
 
         if is_luban_active {
             if !is_epoch {
@@ -91,9 +91,7 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
             Some(header.extra_data[start..end].to_vec())
         } else {
             if is_epoch &&
-                (extra_len - EXTRA_VANITY_LEN - EXTRA_SEAL_LEN) %
-                VALIDATOR_BYTES_LEN_BEFORE_LUBAN !=
-                    0
+                !(extra_len - EXTRA_VANITY_LEN - EXTRA_SEAL_LEN).is_multiple_of(VALIDATOR_BYTES_LEN_BEFORE_LUBAN)
             {
                 return None;
             }
@@ -104,7 +102,7 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
 
     /// Get turn length from header
     pub fn get_turn_length_from_header(&self, header: &Header, epoch_length: u64) -> Result<Option<u8>, ParliaConsensusError> {
-        if header.number % epoch_length != 0 ||
+        if !header.number.is_multiple_of(epoch_length) ||
             !self.spec.is_bohr_active_at_timestamp(header.number, header.timestamp)
         {
             return Ok(None);
@@ -138,7 +136,7 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
             return Ok(None);
         }
 
-        let mut raw_attestation_data = if header.number() % epoch_length != 0 {
+        let mut raw_attestation_data = if !header.number().is_multiple_of(epoch_length) {
             &header.extra_data[EXTRA_VANITY_LEN..extra_len - EXTRA_SEAL_LEN]
         } else {
             let validator_count =
@@ -218,7 +216,7 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
         &self,
         header: &Header,
     ) -> Result<usize, ParliaConsensusError> {
-        if header.number % self.get_epoch_length(header) != 0 {
+        if !header.number.is_multiple_of(self.get_epoch_length(header)) {
             return Ok(0);
         }
 
@@ -241,7 +239,7 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
             return Err(ParliaConsensusError::ExtraSignatureMissing);
         }
 
-        if header.number % self.get_epoch_length(header) != 0 {
+        if !header.number.is_multiple_of(self.get_epoch_length(header)) {
             return Ok(());
         }
 
@@ -259,7 +257,7 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
         } else {
             let validator_bytes_len = extra_len - EXTRA_VANITY_LEN - EXTRA_SEAL_LEN;
             if validator_bytes_len / VALIDATOR_BYTES_LEN_BEFORE_LUBAN == 0 ||
-                validator_bytes_len % VALIDATOR_BYTES_LEN_BEFORE_LUBAN != 0
+                !validator_bytes_len.is_multiple_of(VALIDATOR_BYTES_LEN_BEFORE_LUBAN)
             {
                 return Err(ParliaConsensusError::InvalidHeaderExtraLen {
                     header_extra_len: extra_len as u64,
@@ -273,7 +271,7 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
     pub fn check_header_extra(&self, header: &Header) -> Result<(), ParliaConsensusError> {
         self.check_header_extra_len(header)?;
 
-        let is_epoch = header.number % self.get_epoch_length(header) == 0;
+        let is_epoch = header.number.is_multiple_of(self.get_epoch_length(header));
         let validator_bytes_len = self.get_validator_len_from_header(header)?;
         if (!is_epoch && validator_bytes_len != 0) || (is_epoch && validator_bytes_len == 0) {
             return Err(ParliaConsensusError::InvalidHeaderExtraValidatorBytesLen {
