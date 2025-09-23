@@ -22,8 +22,9 @@ use reth_payload_primitives::BuiltPayload;
 use reth_primitives::{SealedBlock, TransactionSigned};
 use reth_provider::{BlockNumReader, HeaderProvider, CanonStateSubscriptions, CanonStateNotification};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
+use tokio_stream::StreamExt;
 use tracing::{debug, error, info, warn};
 use reth_tasks::TaskExecutor;
 use reth_basic_payload_builder::{BuildArguments, PayloadConfig};
@@ -35,12 +36,133 @@ use crate::shared::{get_block_import_sender, get_local_peer_id_or_default};
 use alloy_primitives::U128;
 use reth_network::message::NewBlockMessage;
 
-struct MiningContext {
+pub struct MiningContext {
     parent_header: reth_primitives::SealedHeader,
     parent_snapshot: Arc<crate::consensus::parlia::snapshot::Snapshot>,
 }
 
-/// Miner that handles block production for BSC
+/// NewWorkWorker responsible for listening to canonical state changes and triggering mining.
+pub struct NewWorkWorker<Provider> {
+    provider: Provider,
+    snapshot_provider: Arc<dyn SnapshotProvider + Send + Sync>,
+    validator_address: Address,
+    mining_queue_tx: mpsc::UnboundedSender<MiningContext>,
+}
+
+impl<Provider> NewWorkWorker<Provider> 
+where
+    Provider: HeaderProvider<Header = alloy_consensus::Header>
+        + BlockNumReader
+        + reth_provider::StateProviderFactory
+        + CanonStateSubscriptions
+        + reth_provider::NodePrimitivesProvider
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+{
+    pub fn new(
+        provider: Provider,
+        snapshot_provider: Arc<dyn SnapshotProvider + Send + Sync>,
+        validator_address: Address,
+        mining_queue_tx: mpsc::UnboundedSender<MiningContext>,
+    ) -> Self {
+        Self {
+            provider,
+            snapshot_provider,
+            validator_address,
+            mining_queue_tx,
+        }
+    }
+
+    pub async fn run(self) {
+        info!("Succeed to spawn trigger worker");
+        let mut notifications = self.provider.canonical_state_stream();
+        
+        loop {
+            tokio::select! {
+                notification = notifications.next() => {
+                    match notification {
+                        Some(event) => {
+                            self.try_new_work(event.clone()).await;
+                        }
+                        None => {
+                            warn!("Canonical state notification stream ended, exiting...");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn try_new_work(&self, new_state: CanonStateNotification<Provider::Primitives>) {
+        // todo: refine it as pre cache to speedup, committed.execution_outcome().
+        let committed = new_state.committed();
+        let tip = committed.tip();
+
+        
+        debug!(
+            "try new work, tip_block={}, committed_blocks={}",
+            committed.tip().number(),
+            committed.len()
+        );
+        
+        // todo: refine check is_syncing status.
+        if tip.timestamp() < SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() - 3 {
+            debug!("Skip to mine new block due to maybe in syncing, validator: {}, tip: {}", self.validator_address, tip.number());
+            return;
+        }
+        
+        let parent_header = match self.provider.sealed_header(tip.number()) {
+            Ok(Some(header)) => header,
+            Ok(None) => {
+                debug!("Skip to mine new block due to head block header not found, validator: {}, tip: {}", self.validator_address, tip.number());
+                return;
+            }
+            Err(e) => {
+                debug!("Skip to mine new block due to error getting header,validator: {}, tip: {}, due to {}", self.validator_address, tip.number(), e);
+                return;
+            }
+        };
+
+        let parent_snapshot = match self.snapshot_provider.snapshot(tip.number()) {
+            Some(snapshot) => snapshot,
+            None => {
+                debug!("Skip to mine new block due to no snapshot available, validator: {}, tip: {}", self.validator_address, tip.number());
+                return;
+            }
+        };
+        
+        if !parent_snapshot.validators.contains(&self.validator_address) {
+            debug!("Skip to mine new block due to not authorized validator: {}, tip: {}", self.validator_address, tip.number());
+            return;
+        }
+        
+        if parent_snapshot.sign_recently(self.validator_address) {
+            debug!("Skip to mine new block due to signed recently, validator: {}, tip: {}", self.validator_address, tip.number());
+            return;
+        }
+        
+        // TODO: remove it later, now just for easy to debug.
+        if !parent_snapshot.is_inturn(self.validator_address) {
+            debug!("Skip to produce due to is not inturn, validator: {}, tip: {}", self.validator_address, tip.number());
+            return;
+        }
+
+        let mining_ctx = MiningContext {
+            parent_header,
+            parent_snapshot: Arc::new(parent_snapshot),
+        };
+
+        debug!("Queuing mining context, next_block: {}", tip.number() + 1);
+        if let Err(e) = self.mining_queue_tx.send(mining_ctx) {
+            error!("Failed to send mining context to queue due to {}", e);
+        }
+    }
+}
+
+/// Miner that handles block production for BSC.
 pub struct BscMiner<Pool, Provider> {
     pool: Pool,
     provider: Provider,
@@ -53,8 +175,6 @@ pub struct BscMiner<Pool, Provider> {
     task_executor: TaskExecutor,
     mining_queue_tx: mpsc::UnboundedSender<MiningContext>,
     mining_queue_rx: Option<mpsc::UnboundedReceiver<MiningContext>>,
-
-    // todo: add more eventloop for performance like bsc miner.
 }
 
 impl<Pool, Provider> BscMiner<Pool, Provider>
@@ -156,103 +276,15 @@ where
     }
 
     async fn spawn_workers(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let provider = self.provider.clone();
-        let snapshot_provider = self.snapshot_provider.clone();
-        let validator_address = self.validator_address;
-        let mining_queue_tx = self.mining_queue_tx.clone();
-        
-        self.task_executor.spawn_critical("trigger_worker", async move {
-            info!("Succeed to spawn trigger worker");
-            let mut notifications = provider.subscribe_to_canonical_state();
-            
-            loop {
-                tokio::select! {
-                    notification = notifications.recv() => {
-                        match notification {
-                            Ok(event) => {
-                                match event {
-                                    CanonStateNotification::Commit { new } => {
-                                        let chain = new.clone();
-                                        let tip = chain.tip();
-                                    
-                                        // todo: refine check is_syncing status.
-                                        if tip.timestamp() < SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() - 3 {
-                                            debug!("Skip to mine new block due to maybe in syncing");
-                                            continue;
-                                        }
-                                        let parent_header = match provider.sealed_header(tip.number()) {
-                                            Ok(Some(header)) => header,
-                                            Ok(None) => {
-                                                debug!("Skip to mine new block due to head block header not found, block: {}", tip.number());
-                                                continue;
-                                            }
-                                            Err(e) => {
-                                                debug!("Skip to mine new block due to error getting header, block: {}, due to {}", tip.number(), e);
-                                                continue;
-                                            }
-                                        };
+        let new_work_worker = NewWorkWorker::new(
+            self.provider.clone(),
+            self.snapshot_provider.clone(),
+            self.validator_address,
+            self.mining_queue_tx.clone(),
+        );
+        self.task_executor.spawn_critical("new_work_eventloop", new_work_worker.run());
 
-                                        let parent_snapshot = match snapshot_provider.snapshot(tip.number()) {
-                                            Some(snapshot) => snapshot,
-                                            None => {
-                                                debug!("Skip to mine new block due to no snapshot available, block: {}", tip.number());
-                                                continue;
-                                            }
-                                        };
-                                        if !parent_snapshot.validators.contains(&validator_address) {
-                                            debug!("Skip to mine new block due to not authorized validator: {}", validator_address);
-                                            continue;
-                                        }
-                                        if parent_snapshot.sign_recently(validator_address) {
-                                            debug!("Skip to mine new block due to signed recently, validator: {}", validator_address);
-                                            continue;
-                                        }
-                                        // TODO: remove it later, now just for easy to debug.
-                                        if !parent_snapshot.is_inturn(validator_address) {
-                                            debug!("Skip to produce due to is not inturn");
-                                            continue;
-                                        }
-
-                                        let mining_ctx = MiningContext {
-                                            parent_header,
-                                            parent_snapshot: Arc::new(parent_snapshot),
-                                        };
-
-                                        debug!("Queuing mining context, block: {}", tip.number() + 1);
-                                        if let Err(e) = mining_queue_tx.send(mining_ctx) {
-                                            error!("Failed to send mining context to queue due to {}", e);
-                                        }
-
-                                    }
-                                    CanonStateNotification::Reorg { old, new } => {
-                                        let old_tip = old.tip();
-                                        let new_tip = new.tip();
-                                        warn!(
-                                            "Chain reorganization detected! Old tip: {} -> New tip: {} (depth: {} blocks)",
-                                            old_tip.number(),
-                                            new_tip.number(),
-                                            old.len()
-                                        );
-                                        info!(
-                                            "Reorg details - Old hash: 0x{:x}, New hash: 0x{:x}",
-                                            old_tip.hash(),
-                                            new_tip.hash()
-                                        );
-                                        
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                warn!("Failed to receive canonical state notification due to {}", e);
-                                tokio::time::sleep(Duration::from_millis(1000)).await;
-                                notifications = provider.subscribe_to_canonical_state();
-                            }
-                        }
-                    }
-                }
-            }
-        });
-
+        // TODO: add more eventloop workers for performance like bsc miner.
         if let Some(mut mining_queue_rx) = self.mining_queue_rx.take() {
             let pool = self.pool.clone();
             let provider = self.provider.clone();
