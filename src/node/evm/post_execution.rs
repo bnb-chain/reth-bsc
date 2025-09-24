@@ -92,11 +92,14 @@ where
         }
 
         if !self.system_txs.is_empty() {
-            tracing::error!("Unexpected system tx, block_number: {}, len: {}", block.number, self.system_txs.len());
+            tracing::warn!(
+                "Remaining system txs after block execution, block_number: {}, len: {}",
+                block.number,
+                self.system_txs.len()
+            );
             for tx in self.system_txs.iter() {
-                tracing::error!("system tx: {:?}", tx);
+                tracing::warn!("remaining system tx: {:?}", tx);
             }
-            return Err(BscBlockExecutionError::UnexpectedSystemTx.into());
         }
 
         let header = self.inner_ctx.header.as_ref().unwrap().clone();

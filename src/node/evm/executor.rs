@@ -287,10 +287,54 @@ where
 
     fn execute_transaction_with_commit_condition(
         &mut self,
-        _tx: impl ExecutableTx<Self>,
-        _f: impl FnOnce(&ExecutionResult<<Self::Evm as Evm>::HaltReason>) -> CommitChanges,
+        tx: impl ExecutableTx<Self>,
+        f: impl FnOnce(&ExecutionResult<<Self::Evm as Evm>::HaltReason>) -> CommitChanges,
     ) -> Result<Option<u64>, BlockExecutionError> {
-        unimplemented!();
+        // The sum of the transaction's gas limit, Tg, and the gas utilized in this block prior,
+        // must be no greater than the block's gasLimit.
+        let block_available_gas = self.evm.block().gas_limit - self.gas_used;
+
+        if tx.tx().gas_limit() > block_available_gas {
+            return Err(BlockValidationError::TransactionGasLimitMoreThanAvailableBlockGas {
+                transaction_gas_limit: tx.tx().gas_limit(),
+                block_available_gas,
+            }
+            .into());
+        }
+
+        // Execute transaction.
+        let ResultAndState { result, state } = self
+            .evm
+            .transact(&tx)
+            .map_err(|err| BlockExecutionError::evm(err, tx.tx().trie_hash()))?;
+
+        if !f(&result).should_commit() {
+            return Ok(None);
+        }
+
+        let mut temp_state = state.clone();
+        temp_state.remove(&SYSTEM_ADDRESS);
+        self.system_caller
+            .on_state(StateChangeSource::Transaction(self.receipts.len()), &temp_state);
+
+        let gas_used = result.gas_used();
+
+        // append gas used
+        self.gas_used += gas_used;
+
+        // Push transaction changeset and calculate header bloom filter for receipt.
+        self.receipts.push(self.receipt_builder.build_receipt(ReceiptBuilderCtx {
+            tx: tx.tx(),
+            evm: &self.evm,
+            result,
+            state: &state,
+            cumulative_gas_used: self.gas_used,
+        }));
+
+        // Commit the state changes.
+        self.evm.db_mut().commit(state);
+
+        Ok(Some(gas_used))
     }
 
     fn execute_transaction_with_result_closure(
