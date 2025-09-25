@@ -116,7 +116,7 @@ where
                     mining_config_clone,
                     task_executor_clone,
                 ) {
-                    Ok(mut miner) => {
+                    Ok(miner) => {
                         info!("BSC miner created successfully, starting mining loop");
                         if let Err(e) = miner.start().await {
                             error!("Mining service failed: {}", e);

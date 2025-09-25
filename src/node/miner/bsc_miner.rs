@@ -101,7 +101,6 @@ where
         let committed = new_state.committed();
         let tip = committed.tip();
 
-        
         debug!(
             "try new work, tip_block={}, committed_blocks={}",
             committed.tip().number(),
@@ -121,7 +120,7 @@ where
                 return;
             }
             Err(e) => {
-                debug!("Skip to mine new block due to error getting header,validator: {}, tip: {}, due to {}", self.validator_address, tip.number(), e);
+                debug!("Skip to mine new block due to error getting header, validator: {}, tip: {}, due to {}", self.validator_address, tip.number(), e);
                 return;
             }
         };
@@ -135,7 +134,7 @@ where
         };
         
         if !parent_snapshot.validators.contains(&self.validator_address) {
-            debug!("Skip to mine new block due to not authorized validator: {}, tip: {}", self.validator_address, tip.number());
+            debug!("Skip to mine new block due to not authorized, validator: {}, tip: {}", self.validator_address, tip.number());
             return;
         }
         
@@ -162,6 +161,76 @@ where
     }
 }
 
+/// MainWorkWorker responsible for processing mining tasks and block building.
+pub struct MainWorkWorker<Pool, Provider> {
+    pool: Pool,
+    provider: Provider,
+    chain_spec: Arc<crate::chainspec::BscChainSpec>,
+    parlia: Arc<crate::consensus::parlia::Parlia<crate::chainspec::BscChainSpec>>,
+    validator_address: Address,
+    mining_queue_rx: mpsc::UnboundedReceiver<MiningContext>,
+}
+
+impl<Pool, Provider> MainWorkWorker<Pool, Provider>
+where
+    Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>>
+        + Clone
+        + 'static,
+    Provider: HeaderProvider<Header = alloy_consensus::Header>
+        + BlockNumReader
+        + reth_provider::StateProviderFactory
+        + CanonStateSubscriptions
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+{
+    pub fn new(
+        pool: Pool,
+        provider: Provider,
+        chain_spec: Arc<crate::chainspec::BscChainSpec>,
+        parlia: Arc<crate::consensus::parlia::Parlia<crate::chainspec::BscChainSpec>>,
+        validator_address: Address,
+        mining_queue_rx: mpsc::UnboundedReceiver<MiningContext>,
+    ) -> Self {
+        Self {
+            pool,
+            provider,
+            chain_spec,
+            parlia,
+            validator_address,
+            mining_queue_rx,
+        }
+    }
+
+    pub async fn run(mut self) {
+        info!("Succeed to spawn mining worker, address: 0x{:x}", self.validator_address);
+        
+        while let Some(mining_ctx) = self.mining_queue_rx.recv().await {
+            let next_block = mining_ctx.parent_header.number() + 1;
+            debug!("Received mining context, next_block: {}", next_block);
+
+             match BscMiner::<Pool, Provider>::try_mine_block(
+                 self.pool.clone(),
+                 self.provider.clone(), 
+                 self.chain_spec.clone(),
+                 self.parlia.clone(),
+                 self.validator_address,
+                 mining_ctx
+             ).await {
+                Ok(()) => {
+                    debug!("Succeed to mine block, next_block: {}", next_block);
+                }
+                Err(e) => {
+                    error!("Failed to mine block due to {}, next_block: {}", e, next_block);
+                }
+            }
+        }
+        
+        warn!("Mining worker stopped");
+    }
+}
+
 /// Miner that handles block production for BSC.
 pub struct BscMiner<Pool, Provider> {
     pool: Pool,
@@ -174,7 +243,7 @@ pub struct BscMiner<Pool, Provider> {
     mining_config: MiningConfig,
     task_executor: TaskExecutor,
     mining_queue_tx: mpsc::UnboundedSender<MiningContext>,
-    mining_queue_rx: Option<mpsc::UnboundedReceiver<MiningContext>>,
+    mining_queue_rx: mpsc::UnboundedReceiver<MiningContext>,
 }
 
 impl<Pool, Provider> BscMiner<Pool, Provider>
@@ -219,7 +288,7 @@ where
             if derived_address != validator_address {
                 if validator_address != Address::ZERO {
                     warn!(
-                        "Validator address mismatch: configured={}, derived={}",
+                        "Validator address mismatch, configured: {}, derived: {}",
                         validator_address, derived_address
                     );
                 }
@@ -244,14 +313,14 @@ where
             mining_config: mining_config.clone(),
             task_executor: task_executor.clone(),
             mining_queue_tx,
-            mining_queue_rx: Some(mining_queue_rx),
+            mining_queue_rx: mining_queue_rx,
         };
 
         info!("Succeed to new miner instance, address: {}", validator_address);
         Ok(miner)
     }
 
-    pub async fn start(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn start(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if !self.mining_config.is_mining_enabled() {
             info!("Skip to start mining due to miner is disabled");
             return Ok(());
@@ -269,13 +338,10 @@ where
             return Err("No signing key available, global signer not initialized".into());
         }
 
-        self.spawn_workers().await?;
-
-        info!("Succeed to start mining, address: {}", self.validator_address);
-        Ok(())
+        self.spawn_workers().await
     }
 
-    async fn spawn_workers(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn spawn_workers(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let new_work_worker = NewWorkWorker::new(
             self.provider.clone(),
             self.snapshot_provider.clone(),
@@ -284,44 +350,18 @@ where
         );
         self.task_executor.spawn_critical("new_work_eventloop", new_work_worker.run());
 
-        // TODO: add more eventloop workers for performance like bsc miner.
-        if let Some(mut mining_queue_rx) = self.mining_queue_rx.take() {
-            let pool = self.pool.clone();
-            let provider = self.provider.clone();
-            let chain_spec = self.chain_spec.clone();
-            let parlia = self.parlia.clone();
-            let validator_address = self.validator_address;
-
-            self.task_executor.spawn_critical("mining_worker", async move {
-                info!("Succeed to spawn mining worker, address: 0x{:x}", validator_address);
-                
-                while let Some(mining_ctx) = mining_queue_rx.recv().await {
-                    let next_block = mining_ctx.parent_header.number() + 1;
-                    debug!("Received mining context, next_block: {}", next_block);
-
-                     match Self::try_mine_block(
-                         pool.clone(),
-                         provider.clone(), 
-                         chain_spec.clone(),
-                         parlia.clone(),
-                         validator_address,
-                         mining_ctx
-                     ).await {
-                        Ok(()) => {
-                            debug!("Succeed to mine block, next_block: {}", next_block);
-                        }
-                        Err(e) => {
-                            error!("Failed to mine block due to {}, next_block: {}", e, next_block);
-                        }
-                    }
-                }
-                
-                warn!("Mining worker stopped");
-            });
-        } else {
-            warn!("Mining queue receiver not available");
-        }
-
+            let main_work_worker = MainWorkWorker::new(
+                self.pool.clone(),
+                self.provider.clone(),
+                self.chain_spec.clone(),
+                self.parlia.clone(),
+                self.validator_address,
+                self.mining_queue_rx,
+            );
+            
+            self.task_executor.spawn_critical("mining_worker", main_work_worker.run());
+        
+        info!("Succeed to start mining, address: {}", self.validator_address);
         Ok(())
     }
 
