@@ -43,9 +43,9 @@ pub struct MiningContext {
 
 /// NewWorkWorker responsible for listening to canonical state changes and triggering mining.
 pub struct NewWorkWorker<Provider> {
+    validator_address: Address,
     provider: Provider,
     snapshot_provider: Arc<dyn SnapshotProvider + Send + Sync>,
-    validator_address: Address,
     mining_queue_tx: mpsc::UnboundedSender<MiningContext>,
 }
 
@@ -62,15 +62,15 @@ where
         + 'static,
 {
     pub fn new(
+        validator_address: Address,
         provider: Provider,
         snapshot_provider: Arc<dyn SnapshotProvider + Send + Sync>,
-        validator_address: Address,
         mining_queue_tx: mpsc::UnboundedSender<MiningContext>,
     ) -> Self {
         Self {
+            validator_address,
             provider,
             snapshot_provider,
-            validator_address,
             mining_queue_tx,
         }
     }
@@ -100,7 +100,6 @@ where
         // todo: refine it as pre cache to speedup, committed.execution_outcome().
         let committed = new_state.committed();
         let tip = committed.tip();
-
         debug!(
             "try new work, tip_block={}, committed_blocks={}",
             committed.tip().number(),
@@ -161,13 +160,14 @@ where
     }
 }
 
-/// MainWorkWorker responsible for processing mining tasks and block building.
+/// MainWorkWorker responsible for processing mining tasks and block building,
+/// submit the seal block to engine-tree and other peers.
 pub struct MainWorkWorker<Pool, Provider> {
+    validator_address: Address,
     pool: Pool,
     provider: Provider,
     chain_spec: Arc<crate::chainspec::BscChainSpec>,
     parlia: Arc<crate::consensus::parlia::Parlia<crate::chainspec::BscChainSpec>>,
-    validator_address: Address,
     mining_queue_rx: mpsc::UnboundedReceiver<MiningContext>,
 }
 
@@ -186,11 +186,11 @@ where
         + 'static,
 {
     pub fn new(
+        validator_address: Address,
         pool: Pool,
         provider: Provider,
         chain_spec: Arc<crate::chainspec::BscChainSpec>,
         parlia: Arc<crate::consensus::parlia::Parlia<crate::chainspec::BscChainSpec>>,
-        validator_address: Address,
         mining_queue_rx: mpsc::UnboundedReceiver<MiningContext>,
     ) -> Self {
         Self {
@@ -241,13 +241,13 @@ where
             evm_config, 
             EthereumBuilderConfig::new()
         );
-        let payload = payload_builder.build_payload(BuildArguments::<EthPayloadBuilderAttributes, BscBuiltPayload>::new(
-            reth_revm::cached::CachedReads::default(),
-            PayloadConfig::new(Arc::new(mining_ctx.parent_header.clone()), attributes),
-            CancelOnDrop::default(),
-            None,
-        ))?;
-
+        let payload = payload_builder.build_payload(
+            BuildArguments::<EthPayloadBuilderAttributes, BscBuiltPayload>::new(
+                reth_revm::cached::CachedReads::default(),
+                PayloadConfig::new(Arc::new(mining_ctx.parent_header.clone()), attributes),
+                CancelOnDrop::default(),
+                None,)
+        )?;
         info!("Start to submit block: {} (hash: 0x{:x}, txs: {})", 
             payload.block().header().number(),
             payload.block().hash(),
@@ -255,7 +255,6 @@ where
         );
 
         self.submit_block(payload.block(), mining_ctx).await?;
-
         info!("Succeed to mine and submit, block: {}", payload.block().header().number());
         Ok(())
     }
@@ -300,8 +299,6 @@ where
         let msg = NewBlockMessage { hash: block_hash, block: Arc::new(new_block) };
 
         if let Some(sender) = get_block_import_sender() {
-            // todo: check announce_new_block/announce_new_block_hash.
-            // todo: check engine-api re-execute and p2p.
             let peer_id = get_local_peer_id_or_default();
             let incoming: crate::node::network::block_import::service::IncomingBlock =
                 (msg, peer_id);
@@ -321,8 +318,7 @@ where
 /// Miner that handles block production for BSC.
 pub struct BscMiner<Pool, Provider> {
     validator_address: Address,
-    signing_key: Option<SigningKey>,
-    mining_config: MiningConfig,
+    signing_key: SigningKey,
     task_executor: TaskExecutor,
     new_work_worker: NewWorkWorker<Provider>,
     main_work_worker: MainWorkWorker<Pool, Provider>,
@@ -355,91 +351,68 @@ where
         // We'll derive and trust the validator address from the configured signing key when possible.
         // If not available, fall back to configured address (may be ZERO when disabled).
         let mut validator_address = mining_config.validator_address.unwrap_or(Address::ZERO);
-        let signing_key = if mining_config.is_mining_enabled() {
-            let key = if let Some(keystore_path) = &mining_config.keystore_path {
-                let password = mining_config.keystore_password.as_deref().unwrap_or("");
-                keystore::load_private_key_from_keystore(keystore_path, password)?
-            } else if let Some(hex_key) = &mining_config.private_key_hex {
-                keystore::load_private_key_from_hex(hex_key)?
-            } else {
-                return Err("No signing key configured".into());
-            };
-
-            // Derive validator address from the signing key and prefer it
-            let derived_address = keystore::get_validator_address(&key);
-            if derived_address != validator_address {
-                if validator_address != Address::ZERO {
-                    warn!(
-                        "Validator address mismatch, configured: {}, derived: {}",
-                        validator_address, derived_address
-                    );
-                }
-                info!("Succeed to derived address from private key, address: {}", derived_address);
-                validator_address = derived_address;
-            }
-
-            Some(key)
+        let signing_key = if let Some(keystore_path) = &mining_config.keystore_path {
+            let password = mining_config.keystore_password.as_deref().unwrap_or("");
+            keystore::load_private_key_from_keystore(keystore_path, password)?
+        } else if let Some(hex_key) = &mining_config.private_key_hex {
+            keystore::load_private_key_from_hex(hex_key)?
         } else {
-            None
+            return Err("No signing key configured".into());
         };
-
-        let (mining_queue_tx, mining_queue_rx) = mpsc::unbounded_channel::<MiningContext>();
+        // Derive validator address from the signing key and prefer it.
+        let derived_address = keystore::get_validator_address(&signing_key);
+        if derived_address != validator_address {
+            if validator_address != Address::ZERO {
+                warn!(
+                    "Validator address mismatch, configured: {}, derived: {}",
+                    validator_address, derived_address
+                );
+            }
+            info!("Succeed to derived address from private key, address: {}", derived_address);
+            validator_address = derived_address;
+        }
         
-        // Initialize workers
+        let (mining_queue_tx, mining_queue_rx) = mpsc::unbounded_channel::<MiningContext>();
         let new_work_worker = NewWorkWorker::new(
+            validator_address,
             provider.clone(),
             snapshot_provider.clone(),
-            validator_address,
             mining_queue_tx.clone(),
         );
-        
         let main_work_worker = MainWorkWorker::new(
+            validator_address,
             pool.clone(),
             provider.clone(),
             chain_spec.clone(),
             Arc::new(crate::consensus::parlia::Parlia::new(chain_spec.clone(), 200)),
-            validator_address,
             mining_queue_rx,
         );
         
         let miner = Self {
             validator_address,
             signing_key,
-            mining_config: mining_config.clone(),
             task_executor: task_executor.clone(),
             new_work_worker,
             main_work_worker,
         };
-
-        info!("Succeed to new miner instance, address: {}", validator_address);
+        info!("Succeed to new miner, address: {}", validator_address);
         Ok(miner)
     }
 
     pub async fn start(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if !self.mining_config.is_mining_enabled() {
-            info!("Skip to start mining due to miner is disabled");
-            return Ok(());
-        }
-
-        if let Some(ref signing_key) = self.signing_key {
-            let private_key_bytes = signing_key.as_nonzero_scalar().to_bytes();
-            let private_key = B256::from_slice(&private_key_bytes);
-            if let Err(e) = init_global_signer(private_key) {
-                return Err(format!("Failed to initialize global signer due to {}", e).into());
-            } else {
-                info!("Succeed to initialize global signer");
-            }
+        let private_key_bytes = self.signing_key.as_nonzero_scalar().to_bytes();
+        let private_key = B256::from_slice(&private_key_bytes);
+        if let Err(e) = init_global_signer(private_key) {
+            return Err(format!("Failed to initialize global signer due to {}", e).into());
         } else {
-            return Err("No signing key available, global signer not initialized".into());
+            info!("Succeed to initialize global signer");
         }
-
         self.spawn_workers().await
     }
 
     async fn spawn_workers(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.task_executor.spawn_critical("new_work_eventloop", self.new_work_worker.run());
-        self.task_executor.spawn_critical("mining_worker", self.main_work_worker.run());
-        
+        self.task_executor.spawn_critical("new_work_worker", self.new_work_worker.run());
+        self.task_executor.spawn_critical("main_work_worker", self.main_work_worker.run());
         info!("Succeed to start mining, address: {}", self.validator_address);
         Ok(())
     }

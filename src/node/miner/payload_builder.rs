@@ -54,7 +54,7 @@ where
     }
 
     // todo: check more and refine it later.
-    pub fn build_payload(self,args: BuildArguments<EthPayloadBuilderAttributes, BscBuiltPayload>) -> Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn build_payload(self, args: BuildArguments<EthPayloadBuilderAttributes, BscBuiltPayload>) -> Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>> {
         let BuildArguments { mut cached_reads, config, cancel: _cancel, best_payload: _best_payload } = args;
         let PayloadConfig { parent_header, attributes } = config;
 
