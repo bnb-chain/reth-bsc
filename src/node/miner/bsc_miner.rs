@@ -76,7 +76,7 @@ where
     }
 
     pub async fn run(self) {
-        info!("Succeed to spawn trigger worker");
+        info!("Succeed to spawn new work worker, address: {}", self.validator_address);
         let mut notifications = self.provider.canonical_state_stream();
         
         loop {
@@ -204,7 +204,7 @@ where
     }
 
     pub async fn run(mut self) {
-        info!("Succeed to spawn mining worker, address: 0x{:x}", self.validator_address);
+        info!("Succeed to spawn main work worker, address: {}", self.validator_address);
         
         while let Some(mining_ctx) = self.mining_queue_rx.recv().await {
             let next_block = mining_ctx.parent_header.number() + 1;
@@ -288,7 +288,7 @@ where
 
         let parent_number = mining_ctx.parent_header.number();
         let parent_td = self.provider.header_td_by_number(parent_number)
-            .map_err(|e| format!("Failed to get parent total difficulty: {}", e))?
+            .map_err(|e| format!("Failed to get parent total difficulty due to {}", e))?
             .unwrap_or_default();
         let current_difficulty = sealed_block.header().difficulty();
         let new_td = parent_td + current_difficulty;
@@ -303,12 +303,14 @@ where
             let incoming: crate::node::network::block_import::service::IncomingBlock =
                 (msg, peer_id);
             if sender.send(incoming).is_err() {
-                warn!("Failed to send mined block to import service: channel closed");
+                warn!("Failed to send mined block to import service due to channel closed");
+                return Err("Failed to send mined block to import service due to channel closed".into());
             } else {
                 debug!("Succeed to send mined block to import service");
             }
         } else {
             warn!("Failed to send mined block due to import sender not initialised");
+            return Err("Failed to send mined block due to import sender not initialised".into());
         }
 
         Ok(())
