@@ -28,6 +28,8 @@ use bit_set::BitSet;
 
 const BLST_DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
 
+const K_ANCESTOR_GENERATION_DEPTH: u64 = 3;
+
 type ValidatorCache = LruMap<u64, (Vec<Address>, Vec<VoteAddress>), ByLength>;
 
 static VALIDATOR_CACHE: LazyLock<Mutex<ValidatorCache>> = LazyLock::new(|| {
@@ -284,6 +286,29 @@ where
                 }
                 .into());
             }
+
+            let mut is_match = false;
+            let mut ancestor = parent.clone();
+            for _ in 0..self.get_ancestor_generation_depth(header) {
+                if ancestor.number() == target_block {
+                    is_match = true;
+                    break;
+                }
+                ancestor = crate::node::evm::util::HEADER_CACHE_READER
+                    .lock()
+                    .unwrap()
+                    .get_header_by_hash(&ancestor.parent_hash())
+                    .ok_or_else(|| BscBlockExecutionError::UnknownHeader { block_hash: ancestor.parent_hash() })?;
+            }
+
+            if !is_match {
+                return Err(BscBlockExecutionError::InvalidAttestationTarget {
+                    block_number: GotExpected { got: target_block, expected: parent.number() },
+                    block_hash: GotExpected { got: target_hash, expected: parent.hash_slow() }
+                        .into(),
+                }
+                .into());
+            }
     
             // the attestation source block should be the highest justified block.
             let source_block = attestation.data.source_number;
@@ -366,6 +391,13 @@ where
         }
     
         Ok(())
+    }
+
+    fn get_ancestor_generation_depth(&self, header: &Header) -> u64 {
+        if self.spec.is_fermi_active_at_timestamp(header.number(),header.timestamp) {
+            return K_ANCESTOR_GENERATION_DEPTH;
+        }
+        1
     }
 
     

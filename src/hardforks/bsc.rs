@@ -61,8 +61,10 @@ hardfork!(
         /// BSC `Lorentz` hardfork
         Lorentz,
         /// BSC `Maxwell` hardfork
-        #[default]
         Maxwell,
+        /// BSC `Fermi` hardfork
+        #[default]
+        Fermi,
     }
 );
 
@@ -110,7 +112,7 @@ impl BscHardfork {
             (Self::Pascal.boxed(), ForkCondition::Timestamp(1742436600)), /* 2025-03-20 02:10:00 AM UTC - deployed with Prague */
             (Self::Lorentz.boxed(), ForkCondition::Timestamp(1745903100)), /* 2025-04-29 05:05:00 AM UTC */
             (Self::Maxwell.boxed(), ForkCondition::Timestamp(1751250600)), /* 2025-06-30 02:30:00 AM UTC */
-            // Note: FermiTime is nil in official BSC config, so we don't include it yet
+            (Self::Fermi.boxed(), ForkCondition::Timestamp(1759199400)), /* 2025-09-30 02:30:00 AM UTC */
         ])
     }
 
@@ -155,6 +157,7 @@ impl BscHardfork {
             (Self::Pascal.boxed(), ForkCondition::Timestamp(1740452880)),
             (Self::Lorentz.boxed(), ForkCondition::Timestamp(1744097580)),
             (Self::Maxwell.boxed(), ForkCondition::Timestamp(1748243100)),
+            (Self::Fermi.boxed(), ForkCondition::Timestamp(1759199400)),
         ])
     }
 
@@ -198,6 +201,7 @@ impl BscHardfork {
             (Self::Pascal.boxed(), ForkCondition::Timestamp(1754967081)),
             (Self::Lorentz.boxed(), ForkCondition::Timestamp(1754967081)),
             (Self::Maxwell.boxed(), ForkCondition::Timestamp(1754967101)),
+            (Self::Fermi.boxed(), ForkCondition::Timestamp(1759199400)), 
         ])
     }
 }
@@ -240,7 +244,7 @@ impl From<BscHardfork> for SpecId {
             BscHardfork::HaberFix |
             BscHardfork::Bohr |
             BscHardfork::Tycho => SpecId::CANCUN,
-            BscHardfork::Pascal | BscHardfork::Lorentz | BscHardfork::Maxwell => SpecId::PRAGUE,
+            BscHardfork::Pascal | BscHardfork::Lorentz | BscHardfork::Maxwell | BscHardfork::Fermi => SpecId::PRAGUE,
         }
     }
 }

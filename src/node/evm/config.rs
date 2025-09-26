@@ -365,7 +365,9 @@ pub fn revm_spec_by_timestamp_and_block_number(
     timestamp: u64,
     block_number: u64,
 ) -> BscHardfork {
-    if chain_spec.is_maxwell_active_at_timestamp(block_number, timestamp) {
+    if chain_spec.is_fermi_active_at_timestamp(block_number, timestamp) {
+        BscHardfork::Fermi
+    } else if chain_spec.is_maxwell_active_at_timestamp(block_number, timestamp) {
         BscHardfork::Maxwell
     } else if chain_spec.is_lorentz_active_at_timestamp(block_number, timestamp) {
         BscHardfork::Lorentz
