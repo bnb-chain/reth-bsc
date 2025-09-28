@@ -35,8 +35,12 @@ use revm::{
 use tracing::debug;
 use alloy_eips::eip2935::{HISTORY_STORAGE_ADDRESS, HISTORY_STORAGE_CODE};
 use alloy_primitives::keccak256;
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, cell::RefCell};
 use crate::consensus::parlia::SnapshotProvider;
+
+thread_local! {
+    pub static ASSEMBLE_SYSTEM_TXS: RefCell<Vec<reth_primitives_traits::Recovered<reth_primitives_traits::TxTy<crate::BscPrimitives>>>> = RefCell::new(Vec::new());
+}
 
 /// Helper type for the input of post execution.
 #[allow(clippy::type_complexity)]
@@ -80,6 +84,8 @@ where
     pub(crate) parlia: Arc<Parlia<Spec>>,
     /// Inner execution context.
     pub(super) inner_ctx: InnerExecutionContext,
+    /// assemble system txs.
+    pub(crate) assemble_system_txs: Vec<reth_primitives_traits::Recovered<reth_primitives_traits::TxTy<crate::BscPrimitives>>>,
 }
 
 impl<'a, DB, EVM, Spec, R: ReceiptBuilder> BscBlockExecutor<'a, EVM, Spec, R>
@@ -99,7 +105,7 @@ where
     R::Transaction: Into<TransactionSigned>,
 {
     /// Creates a new BscBlockExecutor.
-    pub fn new(
+    pub(crate) fn new(
         evm: EVM,
         ctx: BscBlockExecutionCtx<'a>,
         spec: Spec,
@@ -139,6 +145,7 @@ where
                 header: None,
                 parent_header: None,
             },
+            assemble_system_txs: vec![],
         }
     }
 
@@ -226,6 +233,7 @@ where
         self.evm.db_mut().apply_transition(vec![(HISTORY_STORAGE_ADDRESS, transition)]);
         Ok(true)
     }
+
 }
 
 impl<'a, DB, E, Spec, R> BlockExecutor for BscBlockExecutor<'a, E, Spec, R>
@@ -424,6 +432,10 @@ where
             self.post_check_new_block(&self.evm.block().clone())?;
         }
 
+        ASSEMBLE_SYSTEM_TXS.with(|txs| {
+            *txs.borrow_mut() = self.assemble_system_txs.clone();
+        });
+
         Ok((
             self.evm,
             BlockExecutionResult {
@@ -446,4 +458,20 @@ where
         &self.evm
     }
 
+}
+
+impl<'a, EVM, Spec, R: ReceiptBuilder> BscBlockExecutor<'a, EVM, Spec, R>
+where
+    Spec: EthChainSpec + EthereumHardforks + BscHardforks + Hardforks + Clone,
+    EVM: alloy_evm::Evm,
+{
+    // miner BscBlockBuilder use this method to fetch system txs.
+    pub(crate) fn finish_with_system_txs<F, T>(self, finish_fn: F) -> Result<(T, Vec<reth_primitives_traits::Recovered<reth_primitives_traits::TxTy<crate::BscPrimitives>>>), BlockExecutionError>
+    where
+        F: FnOnce(Self) -> Result<T, BlockExecutionError>,
+    {
+        let result = finish_fn(self)?;
+        let system_txs = ASSEMBLE_SYSTEM_TXS.with(|txs| txs.borrow().clone());
+        Ok((result, system_txs))
+    }
 }

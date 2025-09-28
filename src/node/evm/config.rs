@@ -1,5 +1,6 @@
 use super::{
     assembler::BscBlockAssembler,
+    builder::BscBlockBuilder,
     executor::BscBlockExecutor,
     factory::BscEvmFactory,
 };
@@ -19,8 +20,9 @@ use reth_ethereum_forks::EthereumHardfork;
 use reth_evm::{
     block::{BlockExecutorFactory, BlockExecutorFor},
     eth::{receipt_builder::ReceiptBuilder, EthBlockExecutionCtx},
-    ConfigureEngineEvm, ConfigureEvm, EvmEnv, EvmFactory, ExecutableTxIterator, ExecutionCtxFor,
-    FromRecoveredTx, FromTxWithEncoded, IntoTxEnv, NextBlockEnvAttributes,
+    execute::BlockBuilder,
+    ConfigureEngineEvm, ConfigureEvm, Database, EvmEnv, EvmFactory, EvmFor, ExecutableTxIterator, ExecutionCtxFor,
+    FromRecoveredTx, FromTxWithEncoded, InspectorFor, IntoTxEnv, NextBlockEnvAttributes,
 };
 use reth_evm_ethereum::RethReceiptBuilder;
 use reth_primitives::{BlockTy, HeaderTy, SealedBlock, SealedHeader, TransactionSigned};
@@ -131,7 +133,7 @@ impl<R, Spec, EvmFactory> BscBlockExecutorFactory<R, Spec, EvmFactory> {
 
 impl<R, Spec, EvmF> BlockExecutorFactory for BscBlockExecutorFactory<R, Spec, EvmF>
 where
-    R: ReceiptBuilder<Transaction = TransactionSigned, Receipt: TxReceipt<Log = Log>>,
+    R: ReceiptBuilder<Transaction = TransactionSigned, Receipt: TxReceipt<Log = Log>> + Clone,
     Spec: EthereumHardforks + BscHardforks + EthChainSpec + Hardforks + Clone,
     EvmF: EvmFactory<Tx: FromRecoveredTx<TransactionSigned> + FromTxWithEncoded<TransactionSigned>>,
     R::Transaction: From<TransactionSigned> + Clone,
@@ -147,11 +149,12 @@ where
         &self.evm_factory
     }
 
+    #[allow(refining_impl_trait)]
     fn create_executor<'a, DB, I>(
         &'a self,
         evm: <Self::EvmFactory as EvmFactory>::Evm<&'a mut State<DB>, I>,
         ctx: Self::ExecutionCtx<'a>,
-    ) -> impl BlockExecutorFor<'a, Self, DB, I>
+    ) -> BscBlockExecutor<'a, <Self::EvmFactory as EvmFactory>::Evm<&'a mut State<DB>, I>, Spec, R>
     where
         DB: alloy_evm::Database + 'a,
         I: Inspector<<Self::EvmFactory as EvmFactory>::Context<&'a mut State<DB>>> + 'a,
@@ -160,7 +163,7 @@ where
             evm,
             ctx,
             self.spec().clone(),
-            self.receipt_builder(),
+            self.receipt_builder().clone(),
             SystemContract::new(self.spec().clone()),
         )
     }
@@ -176,14 +179,14 @@ where
     type Error = Infallible;
     type NextBlockEnvCtx = NextBlockEnvAttributes;
     type BlockExecutorFactory = BscBlockExecutorFactory;
-    type BlockAssembler = Self;
+    type BlockAssembler = BscBlockAssembler<BscChainSpec>;
 
     fn block_executor_factory(&self) -> &Self::BlockExecutorFactory {
         &self.executor_factory
     }
 
     fn block_assembler(&self) -> &Self::BlockAssembler {
-        self
+        &self.block_assembler
     }
 
     fn evm_env(&self, header: &Header) -> EvmEnv<BscHardfork> {
@@ -341,6 +344,36 @@ where
             turn_length: None,
         }
     }
+
+    // payload builder use this method to create BscBlockBuilder.
+    fn create_block_builder<'a, DB, I>(
+        &'a self,
+        evm: EvmFor<Self, &'a mut State<DB>, I>,
+        parent: &'a SealedHeader<HeaderTy<Self::Primitives>>,
+        ctx: <Self::BlockExecutorFactory as BlockExecutorFactory>::ExecutionCtx<'a>,
+    ) -> impl BlockBuilder<
+        Primitives = Self::Primitives,
+        Executor: BlockExecutorFor<'a, Self::BlockExecutorFactory, DB, I>,
+    >
+    where
+        DB: Database,
+        I: InspectorFor<Self, &'a mut State<DB>> + 'a,
+    {
+        let bsc_executor = BscBlockExecutor::new(
+            evm,
+            ctx.clone(),
+            self.executor_factory.spec().clone(),
+            self.executor_factory.receipt_builder().clone(),
+            SystemContract::new(self.executor_factory.spec().clone()),
+        );
+        
+        BscBlockBuilder::new(
+            bsc_executor,
+            ctx,
+            &self.block_assembler,
+            parent,
+        )
+    }
 }
 
 impl ConfigureEngineEvm<BscExecutionData> for BscEvmConfig
@@ -448,3 +481,4 @@ pub fn revm_spec_by_timestamp_and_block_number(
         }
     }
 }
+

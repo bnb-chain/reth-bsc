@@ -17,7 +17,7 @@ use alloy_consensus::{Header, TxReceipt, Transaction as AlloyTransaction, Signab
 use alloy_primitives::{Address, hex, TxKind, U256};
 use std::collections::HashMap;
 use tracing::warn;
-use reth_primitives_traits::GotExpected;
+use reth_primitives_traits::{GotExpected, SignerRecoverable};
 use bit_set::BitSet;
 
 
@@ -43,7 +43,7 @@ where
         &mut self, 
         block: &BlockEnv
     ) -> Result<(), BlockExecutionError> {
-        tracing::trace!("Start to finalize new block, block_number: {}", block.number); 
+        tracing::debug!("Start to post check new block, block_number: {}, is_miner: {}", block.number, self.ctx.is_miner); 
         self.verify_validators(self.inner_ctx.current_validators.clone(), self.inner_ctx.header.clone())?;
         self.verify_turn_length(self.inner_ctx.header.clone())?;
 
@@ -257,13 +257,22 @@ where
                 Ok(signed) => Some(signed),
                 Err(e) => {
                     tracing::warn!("Failed to sign system transaction: {}", e);
-                    None
+                    return Err(BscBlockExecutionError::FailedToSignSystemTransaction { error: e.to_string() }.into());
                 }
             }
         } else {
             tracing::warn!("Global signer not initialized for mining mode");
-            None
+            return Err(BscBlockExecutionError::GlobalSignerNotInitializedForMiningMode.into());
         };
+
+        if self.ctx.is_miner {
+            if let Some(signed) = signed_tx.clone() {
+                let recovered = signed.try_into_recovered_unchecked().unwrap_or_else(|_| {
+                    panic!("Failed to recover system transaction signature")
+                });
+                self.assemble_system_txs.push(recovered);
+            }
+        }
 
         // Create TxEnv first (before moving transaction)
         let tx_env = BscTxEnv {
@@ -486,6 +495,7 @@ where
         &mut self, 
         block: &BlockEnv
     ) -> Result<(), BlockExecutionError> {
+        tracing::debug!("Start to finalize new block, block_number: {}, is_miner: {}", block.number, self.ctx.is_miner);
         let snap = self.inner_ctx.snap.as_ref().unwrap();
         let expected_validator = snap.inturn_validator();
         if block.beneficiary != expected_validator {

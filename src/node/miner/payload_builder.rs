@@ -10,7 +10,7 @@ use reth_payload_primitives::PayloadBuilderError;
 use reth::transaction_pool::{TransactionPool, PoolTransaction};
 use reth_primitives::TransactionSigned;
 use reth::transaction_pool::BestTransactionsAttributes;
-use tracing::trace;
+use tracing::debug;
 use reth_evm::block::{BlockExecutionError, BlockValidationError};
 use reth::transaction_pool::error::InvalidPoolTransactionError;
 use reth_primitives::InvalidTransactionError;
@@ -20,7 +20,8 @@ use std::sync::Arc;
 use reth_basic_payload_builder::{BuildArguments, PayloadConfig};
 use reth::payload::EthPayloadBuilderAttributes;
 use reth_payload_primitives::PayloadBuilderAttributes;
-use alloy_consensus::Transaction;
+use alloy_consensus::{Transaction, BlockHeader};
+use reth_primitives_traits::SignerRecoverable;
 use tracing::warn;
 
 /// BSC payload builder, used to build payload for bsc miner.
@@ -116,11 +117,11 @@ where
                 })) => {
                     if error.is_nonce_too_low() {
                         // if the nonce is too low, we can skip this transaction
-                        trace!(target: "payload_builder", %error, ?tx, "skipping nonce too low transaction");
+                        debug!(target: "payload_builder", %error, ?tx, "skipping nonce too low transaction");
                     } else {
                         // if the transaction is invalid, we can skip it and all of its
                         // descendants
-                        trace!(target: "payload_builder", %error, ?tx, "skipping invalid transaction and its descendants");
+                        debug!(target: "payload_builder", %error, ?tx, "skipping invalid transaction and its descendants");
                         best_tx_list.mark_invalid(
                             &pool_tx,
                             InvalidPoolTransactionError::Consensus(
@@ -143,6 +144,24 @@ where
         // check: rewrite in here.
         let BlockBuilderOutcome { execution_result, block, .. } = builder.finish(&state_provider)?;
         let sealed_block = Arc::new(block.sealed_block().clone());
+        
+        // just for debugging, and remove it later.
+        let transactions = &sealed_block.body().inner.transactions;
+        debug!("debug_miner, block_number: {}, block_hash: {:?}, contains {} transactions:", sealed_block.number(), sealed_block.hash(), transactions.len());
+        
+        for (index, tx) in transactions.iter().enumerate() {
+            debug!("debug_miner, transaction {}: hash={:?}, from={:?}, to={:?}, value={:?}, gas_limit={}, gas_price={:?}, nonce={}", 
+                index + 1,
+                tx.hash(),
+                tx.recover_signer().ok(),
+                tx.to(),
+                tx.value(),
+                tx.gas_limit(),
+                tx.gas_price(),
+                tx.nonce()
+            );
+        }
+        
         let payload = BscBuiltPayload {
             block: sealed_block,
             fees: total_fees,

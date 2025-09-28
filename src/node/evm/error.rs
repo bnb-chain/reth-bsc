@@ -163,6 +163,17 @@ pub enum BscBlockExecutionError {
     /// Error when the turn length is different from the calculated turn length
     #[error("mismatching turn length on epoch block")]
     MismatchingEpochTurnLengthError,
+
+    /// Error when failed to sign system transaction
+    #[error("failed to sign system transaction: {error}")]
+    FailedToSignSystemTransaction {
+        /// The underlying error message
+        error: String,
+    },
+
+    /// Error when global signer is not initialized for mining mode
+    #[error("global signer not initialized for mining mode")]
+    GlobalSignerNotInitializedForMiningMode,
 }
 
 impl From<BscBlockExecutionError> for BlockExecutionError {

@@ -24,6 +24,7 @@ use revm::{
 };
 
 mod assembler;
+mod builder;
 pub mod config;
 pub use config::BscEvmConfig;
 mod executor;
