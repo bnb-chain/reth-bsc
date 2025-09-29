@@ -270,7 +270,7 @@ where
                 let recovered = signed.try_into_recovered_unchecked().unwrap_or_else(|_| {
                     panic!("Failed to recover system transaction signature")
                 });
-                self.assemble_system_txs.push(recovered);
+                self.assembled_system_txs.push(recovered);
             }
         }
 

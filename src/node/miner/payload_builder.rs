@@ -145,12 +145,11 @@ where
         let BlockBuilderOutcome { execution_result, block, .. } = builder.finish(&state_provider)?;
         let sealed_block = Arc::new(block.sealed_block().clone());
         
-        // just for debugging, and remove it later.
+        // for debugging, and remove it later.
         let transactions = &sealed_block.body().inner.transactions;
-        debug!("debug_miner, block_number: {}, block_hash: {:?}, contains {} transactions:", sealed_block.number(), sealed_block.hash(), transactions.len());
-        
+        debug!("debug payload_builder, block_number: {}, block_hash: {:?}, contains {} transactions:", sealed_block.number(), sealed_block.hash(), transactions.len());
         for (index, tx) in transactions.iter().enumerate() {
-            debug!("debug_miner, transaction {}: hash={:?}, from={:?}, to={:?}, value={:?}, gas_limit={}, gas_price={:?}, nonce={}", 
+            debug!("debug payload_builder, transaction {}: hash={:?}, from={:?}, to={:?}, value={:?}, gas_limit={}, gas_price={:?}, nonce={}", 
                 index + 1,
                 tx.hash(),
                 tx.recover_signer().ok(),

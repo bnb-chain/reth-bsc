@@ -481,4 +481,3 @@ pub fn revm_spec_by_timestamp_and_block_number(
         }
     }
 }
-

@@ -19,6 +19,8 @@ use reth_primitives_traits::{logs_bloom, SealedHeader};
 use reth_provider::{BlockExecutionResult, StateProvider};
 use revm::database::BundleState;
 use std::sync::Arc;
+use crate::node::primitives::{BscBlock, BscBlockBody};
+
 
 /// BSC block assembler input that mirrors BlockAssemblerInput but is not #[non_exhaustive]
 /// 
@@ -42,7 +44,6 @@ pub struct BscBlockAssemblerInput<'a, 'b, F: BlockExecutorFactory, H = Header> {
     /// State root for this block.
     pub state_root: alloy_primitives::B256,
 }
-
 
 /// Block assembler for BSC, mainly for support BscBlockExecutionCtx.
 #[derive(Clone)]
@@ -145,7 +146,7 @@ where
             requests_hash,
         };
         
-        {   // finalize_new_header - BSC specific finalization logic
+        {   // finalize_new_header
             let parent_header = crate::node::evm::util::HEADER_CACHE_READER
                 .lock()
                 .unwrap()
@@ -172,19 +173,16 @@ where
                 header.number, header_hash, header.parent_hash, transactions.len())
         }
 
-        use crate::node::primitives::{BscBlock, BscBlockBody};
         Ok(BscBlock {
             header,
             body: BscBlockBody {
                 inner: BlockBody { transactions, ommers: Default::default(), withdrawals },
-                sidecars: None,
+                sidecars: None, // todo: implement blob storage.
             },
         })
     }
 
 }
-
-
 
 impl<F, ChainSpec> BlockAssembler<F> for BscBlockAssembler<ChainSpec>
 where
@@ -197,7 +195,7 @@ where
 {
     type Block = crate::node::primitives::BscBlock;
 
-    // assemble_block is unused, BscBlockBuiler use assemble_block_bsc instead.
+    // note that assemble_block is unused, BscBlockBuiler use assemble_block_bsc instead.
     fn assemble_block(
         &self,
         input: BlockAssemblerInput<'_, '_, F>,
@@ -300,7 +298,6 @@ where
                 header.number, header_hash, header.parent_hash, transactions.len())
         }
 
-        use crate::node::primitives::{BscBlock, BscBlockBody};
         Ok(BscBlock {
             header,
             body: BscBlockBody {

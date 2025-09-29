@@ -39,7 +39,7 @@ use std::{collections::HashMap, sync::Arc, cell::RefCell};
 use crate::consensus::parlia::SnapshotProvider;
 
 thread_local! {
-    pub static ASSEMBLE_SYSTEM_TXS: RefCell<Vec<reth_primitives_traits::Recovered<reth_primitives_traits::TxTy<crate::BscPrimitives>>>> = RefCell::new(Vec::new());
+    pub static ASSEMBLED_SYSTEM_TXS: RefCell<Vec<reth_primitives_traits::Recovered<reth_primitives_traits::TxTy<crate::BscPrimitives>>>> = RefCell::new(Vec::new());
 }
 
 /// Helper type for the input of post execution.
@@ -84,8 +84,8 @@ where
     pub(crate) parlia: Arc<Parlia<Spec>>,
     /// Inner execution context.
     pub(super) inner_ctx: InnerExecutionContext,
-    /// assemble system txs.
-    pub(crate) assemble_system_txs: Vec<reth_primitives_traits::Recovered<reth_primitives_traits::TxTy<crate::BscPrimitives>>>,
+    /// assembled system txs.
+    pub(crate) assembled_system_txs: Vec<reth_primitives_traits::Recovered<reth_primitives_traits::TxTy<crate::BscPrimitives>>>,
 }
 
 impl<'a, DB, EVM, Spec, R: ReceiptBuilder> BscBlockExecutor<'a, EVM, Spec, R>
@@ -145,7 +145,7 @@ where
                 header: None,
                 parent_header: None,
             },
-            assemble_system_txs: vec![],
+            assembled_system_txs: vec![],
         }
     }
 
@@ -233,7 +233,6 @@ where
         self.evm.db_mut().apply_transition(vec![(HISTORY_STORAGE_ADDRESS, transition)]);
         Ok(true)
     }
-
 }
 
 impl<'a, DB, E, Spec, R> BlockExecutor for BscBlockExecutor<'a, E, Spec, R>
@@ -432,8 +431,8 @@ where
             self.post_check_new_block(&self.evm.block().clone())?;
         }
 
-        ASSEMBLE_SYSTEM_TXS.with(|txs| {
-            *txs.borrow_mut() = self.assemble_system_txs.clone();
+        ASSEMBLED_SYSTEM_TXS.with(|txs| {
+            *txs.borrow_mut() = self.assembled_system_txs.clone();
         });
 
         Ok((
@@ -471,7 +470,7 @@ where
         F: FnOnce(Self) -> Result<T, BlockExecutionError>,
     {
         let result = finish_fn(self)?;
-        let system_txs = ASSEMBLE_SYSTEM_TXS.with(|txs| txs.borrow().clone());
+        let system_txs = ASSEMBLED_SYSTEM_TXS.with(|txs| txs.borrow().clone());
         Ok((result, system_txs))
     }
 }

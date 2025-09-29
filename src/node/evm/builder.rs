@@ -89,12 +89,12 @@ where
         }
     }
 
-    // fetch assemble_system_txs and add into sealed block.
+    // fetch assembled_system_txs and add into sealed block.
     fn finish(
         mut self,
         state: impl StateProvider,
     ) -> Result<BlockBuilderOutcome<BscPrimitives>, BlockExecutionError> {
-        let ((evm, result), assemble_system_txs) = self.executor.finish_with_system_txs(|executor| executor.finish())?;
+        let ((evm, result), assembled_system_txs) = self.executor.finish_with_system_txs(|executor| executor.finish())?;
         let (db, evm_env) = evm.finish();
 
         // merge all transitions into bundle state
@@ -107,8 +107,8 @@ where
             .map_err(BlockExecutionError::other)?;
 
         let user_tx_len = self.transactions.len();
-        let system_tx_len = assemble_system_txs.len();
-        self.transactions.extend(assemble_system_txs);
+        let system_tx_len = assembled_system_txs.len();
+        self.transactions.extend(assembled_system_txs);
         let total_tx_len = self.transactions.len();
 
         let (transactions, senders): (Vec<_>, Vec<_>) =
