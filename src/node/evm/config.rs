@@ -363,7 +363,7 @@ where
             evm,
             ctx.clone(),
             self.executor_factory.spec().clone(),
-            self.executor_factory.receipt_builder().clone(),
+            *self.executor_factory.receipt_builder(),
             SystemContract::new(self.executor_factory.spec().clone()),
         );
         
