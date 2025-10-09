@@ -179,7 +179,7 @@ where
     /// Matches BSC's TryUpdateBuildInSystemContract exactly
     fn upgrade_contracts_with_timing(&mut self, at_block_begin: bool) -> Result<(), BlockExecutionError> {
         let block_number = self.evm.block().number.to::<u64>();
-        let parent_time = self.inner_ctx.parent_header.as_ref().unwrap().timestamp;
+        let parent_time: u64 = self.inner_ctx.parent_header.as_ref().unwrap().timestamp;
         let current_time = self.evm.block().timestamp.to::<u64>();
         
         if at_block_begin {
@@ -187,7 +187,7 @@ where
             if !self.spec.is_feynman_active_at_timestamp(block_number, parent_time) {
                 // At block-begin (pre-Feynman), apply only block-based transitions.
                 // Use parent_time for both timestamp params to suppress timestamp forks here.
-                self.upgrade_contracts_at_times(block_number, parent_time, parent_time)?;
+                self.upgrade_contracts_at_times(block_number, current_time, parent_time)?;
             }
             // HistoryStorage (EIP-2935) deploy is handled in apply_pre_execution_changes with
             // a single, London-gated Prague transition check to avoid duplicate calls.
@@ -327,29 +327,34 @@ where
         self.upgrade_contracts_with_timing(true)?;
 
         // Prague/London fork gates: group checks for clarity.
-        let number = self.evm.block().number.to::<u64>();
-        let time_now = self.evm.block().timestamp.to::<u64>();
-        let parent_time = self
-            .inner_ctx
-            .parent_header
-            .as_ref()
-            .map(|h| h.timestamp)
-            .unwrap_or(time_now);
+        // let number = self.evm.block().number.to::<u64>();
+        // let time_now = self.evm.block().timestamp.to::<u64>();
+        // let parent_time: u64 = self.inner_ctx.parent_header.as_ref().unwrap().timestamp;
 
-        let london_by_block = self.spec.is_london_active_at_block(number);
-        let prague_now = self.spec.is_prague_active_at_timestamp(time_now);
-        let prague_just_activated = prague_now && !self.spec.is_prague_active_at_timestamp(parent_time);
 
-        if london_by_block {
-            // Deploy HistoryStorage exactly on Prague transition.
-            if prague_just_activated {
-                self.apply_history_storage_account(number)?;
-            }
-            // Always call blockhashes contract when Prague is active.
-            if prague_now {
-                self.system_caller
-                    .apply_blockhashes_contract_call(self.ctx.base.parent_hash, &mut self.evm)?;
-            }
+        // let london_by_block = self.spec.is_london_active_at_block(number);
+        // let prague_now = self.spec.is_prague_active_at_timestamp(time_now);
+        // let prague_just_activated = prague_now && !self.spec.is_prague_active_at_timestamp(parent_time);
+
+        // if london_by_block {
+        //     // Deploy HistoryStorage exactly on Prague transition.
+        //     if prague_just_activated {
+        //         self.apply_history_storage_account(number)?;
+        //     }
+        //     // Always call blockhashes contract when Prague is active.
+        //     if prague_now {
+        //         self.system_caller
+        //             .apply_blockhashes_contract_call(self.ctx.base.parent_hash, &mut self.evm)?;
+        //     }
+        // }
+        // enable BEP-440/EIP-2935 for historical block hashes from state
+        if self.spec.is_pascal_active_at_timestamp(self.evm.block().number.to::<u64>(), self.evm.block().timestamp.to::<u64>()) &&
+            !self.spec.is_pascal_active_at_timestamp(self.evm.block().number.to::<u64>() - 1, self.evm.block().timestamp.to::<u64>() - 3) {
+                self.apply_history_storage_account(self.evm.block().number.to::<u64>())?;
+        }
+        if self.spec.is_pascal_active_at_timestamp(self.evm.block().number.to::<u64>(), self.evm.block().timestamp.to::<u64>()) {
+            self.system_caller
+                .apply_blockhashes_contract_call(self.ctx.base.parent_hash, &mut self.evm)?;
         }
 
         Ok(())
@@ -472,11 +477,7 @@ where
         );
 
         // If first block deploy genesis contracts.
-        // Do this only when mining, or when verifying a block that actually
-        // contains the signed system transactions to consume (i.e. replay mode).
-        if self.evm.block().number == uint!(1U256)
-            && (self.ctx.is_miner || !self.system_txs.is_empty())
-        {
+        if self.evm.block().number == uint!(1U256) {
             self.deploy_genesis_contracts(self.evm.block().beneficiary)?;
         }
 
@@ -489,8 +490,8 @@ where
                 self.evm.block().timestamp.to(),
             )
             && !self.spec.is_feynman_active_at_timestamp(
-                self.evm.block().number.to::<u64>() - 1,
-                self.evm.block().timestamp.to::<u64>() - 3,
+                self.inner_ctx.parent_header.as_ref().unwrap().number,
+                self.inner_ctx.parent_header.as_ref().unwrap().timestamp,
             )
         {
             self.initialize_feynman_contracts(self.evm.block().beneficiary)?;
