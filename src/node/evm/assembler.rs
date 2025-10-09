@@ -105,29 +105,16 @@ where
 
         let withdrawals_root =
             withdrawals.as_deref().map(|w| proofs::calculate_withdrawals_root(w));
-        // Only include RequestsHash when both London and Prague are active.
-        // This matches our consensus gating for dev chains where Prague may activate before London.
-        let requests_hash = (self
-            .chain_spec
-            .is_london_active_at_block(block_number)
-            && self
-                .chain_spec
-                .is_prague_active_at_timestamp(timestamp))
+        let requests_hash = BscHardforks::is_prague_active_at_timestamp(&*self.chain_spec, block_number, timestamp)
             .then(|| requests.requests_hash());
 
         let mut excess_blob_gas = None;
         let mut blob_gas_used = None;
-        if self
-            .chain_spec
-            .is_london_active_at_block(block_number)
-            && BscHardforks::is_cancun_active_at_timestamp(&*self.chain_spec, block_number, timestamp)
+        if BscHardforks::is_cancun_active_at_timestamp(&*self.chain_spec, block_number, timestamp)
         {
             blob_gas_used =
                 Some(transactions.iter().map(|tx| tx.blob_gas_used().unwrap_or_default()).sum());
-            excess_blob_gas = if self
-                .chain_spec
-                .is_london_active_at_block(parent.number)
-                && BscHardforks::is_cancun_active_at_timestamp(&*self.chain_spec, parent.number, parent.timestamp)
+            excess_blob_gas = if BscHardforks::is_cancun_active_at_timestamp(&*self.chain_spec, parent.number, parent.timestamp)
             {
                 parent.maybe_next_block_excess_blob_gas(
                     self.chain_spec.blob_params_at_timestamp(timestamp),
@@ -245,13 +232,7 @@ where
 
         let withdrawals_root =
             withdrawals.as_deref().map(|w| proofs::calculate_withdrawals_root(w));
-        // Only include RequestsHash when both London and Prague are active.
-        let requests_hash = (self
-            .chain_spec
-            .is_london_active_at_block(block_number)
-            && self
-                .chain_spec
-                .is_prague_active_at_timestamp(timestamp))
+        let requests_hash = BscHardforks::is_prague_active_at_timestamp(&*self.chain_spec, block_number, timestamp)
             .then(|| requests.requests_hash());
 
         let mut excess_blob_gas = None;

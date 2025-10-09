@@ -182,19 +182,12 @@ where
         let parent_time: u64 = self.inner_ctx.parent_header.as_ref().unwrap().timestamp;
         let current_time = self.evm.block().timestamp.to::<u64>();
         
-        if at_block_begin {
-            // Block begin: upgrade when Feynman is NOT active
+        if at_block_begin { // Block begin: upgrade when Feynman is NOT active
             if !self.spec.is_feynman_active_at_timestamp(block_number, parent_time) {
-                // At block-begin (pre-Feynman), apply only block-based transitions.
-                // Use parent_time for both timestamp params to suppress timestamp forks here.
                 self.upgrade_contracts_at_times(block_number, current_time, parent_time)?;
             }
-            // HistoryStorage (EIP-2935) deploy is handled in apply_pre_execution_changes with
-            // a single, London-gated Prague transition check to avoid duplicate calls.
-        } else {
-            // Block end: upgrade when Feynman IS active  
+        } else { // Block end: upgrade when Feynman IS active
             if self.spec.is_feynman_active_at_timestamp(block_number, parent_time) {
-                // Always use the same parameters as BSC: (blockNumber, parent.Time, header.Time, statedb)
                 self.upgrade_contracts_at_times(block_number, current_time, parent_time)?;
             }
         }
@@ -471,8 +464,7 @@ where
         // BSC system contract upgrades at block end - matches BSC's TryUpdateBuildInSystemContract(atBlockBegin=false)  
         self.upgrade_contracts_with_timing(false)?;
 
-        if self.spec.is_london_active_at_block(self.evm.block().number.to::<u64>())
-            && self.spec.is_feynman_active_at_timestamp(
+        if self.spec.is_feynman_active_at_timestamp(
                 self.evm.block().number.to::<u64>(),
                 self.evm.block().timestamp.to(),
             )
