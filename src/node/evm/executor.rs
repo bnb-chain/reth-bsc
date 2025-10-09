@@ -326,33 +326,20 @@ where
         // BSC system contract upgrades at block begin - matches BSC's TryUpdateBuildInSystemContract(atBlockBegin=true)
         self.upgrade_contracts_with_timing(true)?;
 
-        // Prague/London fork gates: group checks for clarity.
-        // let number = self.evm.block().number.to::<u64>();
-        // let time_now = self.evm.block().timestamp.to::<u64>();
-        // let parent_time: u64 = self.inner_ctx.parent_header.as_ref().unwrap().timestamp;
-
-
-        // let london_by_block = self.spec.is_london_active_at_block(number);
-        // let prague_now = self.spec.is_prague_active_at_timestamp(time_now);
-        // let prague_just_activated = prague_now && !self.spec.is_prague_active_at_timestamp(parent_time);
-
-        // if london_by_block {
-        //     // Deploy HistoryStorage exactly on Prague transition.
-        //     if prague_just_activated {
-        //         self.apply_history_storage_account(number)?;
-        //     }
-        //     // Always call blockhashes contract when Prague is active.
-        //     if prague_now {
-        //         self.system_caller
-        //             .apply_blockhashes_contract_call(self.ctx.base.parent_hash, &mut self.evm)?;
-        //     }
-        // }
         // enable BEP-440/EIP-2935 for historical block hashes from state
-        if self.spec.is_pascal_active_at_timestamp(self.evm.block().number.to::<u64>(), self.evm.block().timestamp.to::<u64>()) &&
-            !self.spec.is_pascal_active_at_timestamp(self.evm.block().number.to::<u64>() - 1, self.evm.block().timestamp.to::<u64>() - 3) {
+        if BscHardforks::is_prague_transition_at_timestamp(
+            &self.spec,
+            self.evm.block().number.to::<u64>(), 
+            self.evm.block().timestamp.to::<u64>(), 
+            self.inner_ctx.parent_header.as_ref().unwrap().timestamp) {
+                // Deploy HistoryStorage exactly on Prague transition.
                 self.apply_history_storage_account(self.evm.block().number.to::<u64>())?;
         }
-        if self.spec.is_pascal_active_at_timestamp(self.evm.block().number.to::<u64>(), self.evm.block().timestamp.to::<u64>()) {
+        if BscHardforks::is_prague_active_at_timestamp(
+            &self.spec, 
+            self.evm.block().number.to::<u64>(), 
+            self.evm.block().timestamp.to::<u64>()) {
+            // Always call blockhashes contract when Prague is active.
             self.system_caller
                 .apply_blockhashes_contract_call(self.ctx.base.parent_hash, &mut self.evm)?;
         }
