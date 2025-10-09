@@ -8,6 +8,8 @@ use schnellru::ByLength;
 use alloy_primitives::{Address, B256};
 use secp256k1::{SECP256K1, Message, ecdsa::{RecoveryId, RecoverableSignature}};
 use crate::hardforks::BscHardforks;
+use crate::consensus::parlia::snapshot::DEFAULT_EPOCH_LENGTH;
+use crate::shared;
 use reth_chainspec::EthChainSpec;
 use alloy_consensus::{Header, BlockHeader};
 use alloy_rlp::Decodable;
@@ -51,8 +53,22 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
         &self.spec
     }
 
-    /// Get epoch length from header
+    /// Get epoch length for the given header.
+    ///
+    /// Mirrors geth's Parlia.epochLength: derive the epoch length from the parent snapshot
+    /// when possible; fall back to fork-based inference otherwise.
     pub fn get_epoch_length(&self, header: &Header) -> u64 {
+        let number = header.number();
+        if number == 0 { return DEFAULT_EPOCH_LENGTH; }
+
+        if let Some(provider) = shared::get_snapshot_provider() {
+            if let Some(snap) = provider.snapshot(number - 1) {
+                return snap.epoch_num;
+            }
+        }
+        tracing::warn!("Failed to get epoch length from snapshot provider, block_number: {}, header_number: {}, header_timestamp: {}", number, header.number(), header.timestamp());
+
+        // Fallback: infer from hardfork timestamps if snapshot not available
         if self.spec.is_maxwell_active_at_timestamp(header.number(), header.timestamp()) {
             return crate::consensus::parlia::snapshot::MAXWELL_EPOCH_LENGTH;
         }
@@ -157,7 +173,7 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
         if raw_attestation_data.is_empty() {
             return Ok(None);
         }
-        tracing::trace!("try debug attestation data, attestation_data_len: {:?}, header_number: {:?}", 
+        tracing::debug!("try debug attestation data, attestation_data_len: {:?}, header_number: {:?}", 
             raw_attestation_data.len(), header.number());
 
         Ok(Some(

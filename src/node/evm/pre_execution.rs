@@ -328,7 +328,7 @@ where
 
         let parlia = Parlia::new(Arc::new(self.spec.clone()), 200);
         let attestation =
-            parlia.get_vote_attestation_from_header(header, snap.epoch_num).map_err(|err| {
+            parlia.get_vote_attestation_from_header(header, parlia.get_epoch_length(header)).map_err(|err| {
                 tracing::error!("Failed to get vote attestation from header, block_number: {}, error: {:?}", header.number(), err);
                 BscBlockExecutionError::ParliaConsensusInnerError { error: err.into() }
             })?;
