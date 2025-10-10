@@ -382,7 +382,11 @@ mod tests {
     impl TestFixture {
         /// Create a new test fixture with the given engine responses
         async fn new(responses: EngineResponses) -> Self {
-            let consensus = Arc::new(ParliaConsensus { provider: MockProvider });
+            // Use mainnet chain spec for tests; it influences only fast-finality parsing.
+            let consensus = Arc::new(ParliaConsensus { 
+                provider: MockProvider, 
+                chain_spec: Arc::new(crate::chainspec::BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet())),
+            });
             let (to_engine, from_engine) = mpsc::unbounded_channel();
             let engine_handle = BeaconConsensusEngineHandle::new(to_engine);
 
