@@ -335,6 +335,7 @@ impl Snapshot {
     pub fn sign_recently_by_counts(&self, validator: Address, counts: &HashMap<Address, u8>) -> bool {
         if let Some(&times) = counts.get(&validator) {
             let allowed = u64::from(self.turn_length.unwrap_or(1));
+            // Allow up to `allowed` times within the recent window; flag only when exceeding.
             if u64::from(times) >= allowed {
                 tracing::warn!("Recently signed, validator: {:?}, block_number: {:?}, times: {:?}, allowed: {:?}", validator, self.block_number, times, allowed);
                 return true;

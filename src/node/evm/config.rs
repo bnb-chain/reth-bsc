@@ -226,7 +226,7 @@ where
             let ts = header.timestamp();
             let london = cs.is_london_active_at_block(num);
             let cancun = BscHardforks::is_cancun_active_at_timestamp(cs, num, ts);
-            let prague = BscHardforks::is_prague_active_at_timestamp(cs, num, ts);
+            let prague = cs.is_prague_active_at_timestamp(ts);
             let lorentz = cs.is_lorentz_active_at_timestamp(num, ts);
             let maxwell = cs.is_maxwell_active_at_timestamp(num, ts);
             tracing::debug!(

@@ -236,10 +236,10 @@ impl<ChainSpec: EthChainSpec<Header = Header> + BscHardforks + 'static> FullCons
         }
 
         // Validate that the header requests hash matches the calculated requests hash
-        if BscHardforks::is_prague_active_at_timestamp(
-            &*self.chain_spec, 
-            block.header().number, 
-            block.header().timestamp)
+        // For dev/test chains where Prague can be timestamp-activated before London,
+        // gate RequestsHash enforcement on both London (block-based) and Prague (timestamp-based).
+        if chain_spec.is_london_active_at_block(block.header().number)
+            && chain_spec.is_prague_active_at_timestamp(block.header().timestamp)
         {
             let Some(header_requests_hash) = block.header().requests_hash else {
                 return Err(ConsensusError::RequestsHashMissing)
