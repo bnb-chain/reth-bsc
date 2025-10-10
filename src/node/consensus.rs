@@ -46,12 +46,7 @@ where
         crate::shared::set_header_provider(Arc::new(ctx.provider().clone()))
             .unwrap_or_else(|e| panic!("Failed to set global header provider: {e}"));
 
-        let consensus = Arc::new(BscConsensus::new(ctx.chain_spec()));
-        
-        crate::shared::set_bsc_consensus(consensus.clone())
-            .unwrap_or_else(|_| panic!("Failed to set global BSC consensus"));
-
-        Ok(consensus)
+        Ok(Arc::new(BscConsensus::new(ctx.chain_spec())))
     }
 }
 
@@ -68,32 +63,6 @@ pub struct BscConsensus<ChainSpec> {
 impl<ChainSpec: EthChainSpec + BscHardforks + 'static> BscConsensus<ChainSpec> {
     pub fn new(chain_spec: Arc<ChainSpec>) -> Self {
         Self { base: EthBeaconConsensus::new(chain_spec.clone()), parlia: Arc::new(Parlia::new(chain_spec.clone(), 200)), chain_spec }
-    }
-
-    /// BSC-specific fork choice method that determines if a reorganization is needed.
-    /// This uses BSC's fast finality rules when Plato hard fork is active.
-    /// 
-    /// # Arguments
-    /// * `current` - Current canonical head header
-    /// * `incoming` - New header being considered for chain head
-    /// 
-    /// # Returns
-    /// * `true` - Reorganization is needed, should switch to incoming header
-    /// * `false` - No reorganization needed, keep current header
-    pub fn should_reorg(&self, current: &Header, incoming: &Header) -> bool {
-        self.parlia.reorg_needed_with_fast_finality(current, incoming)
-    }
-
-    /// Get the highest justified block number and hash for the given header.
-    /// This is used for fast finality in BSC's PoSA consensus.
-    ///
-    /// # Arguments
-    /// * `header` - Header to get justified information for
-    ///
-    /// # Returns
-    /// * `(justified_number, justified_hash)` - Justified block number and hash
-    pub fn get_justified_number_and_hash(&self, header: &Header) -> (u64, B256) {
-        self.parlia.get_justified_number_and_hash(header)
     }
 }
 
@@ -128,32 +97,6 @@ impl<ChainSpec: EthChainSpec + BscHardforks + 'static> HeaderValidator<Header>
                 parent_timestamp: parent_ts,
                 timestamp: header_ts,
             })
-        }
-
-        // Enforce Parlia backoff schedule (Ramanujan and later):
-        // header.timestamp must be >= parent.timestamp + period + computed_backoff.
-        if self.chain_spec.is_ramanujan_active_at_block(header.number) {
-            if let Some(sp) = crate::shared::get_snapshot_provider() {
-                if let Some(snap) = sp.snapshot(parent.number) {
-                    let required_ms = parent_ts + snap.block_interval +
-                        self.parlia.back_off_time(&snap, parent.header(), header.header());
-                    if header_ts < required_ms {
-                        tracing::warn!(
-                            target: "reth_bsc::node::evm::pre_execution",
-                            "Block time is too early, block_number: {}, ts: {:?}, parent_ts: {:?}, block_interval: {:?}, back_off_time: {:?}",
-                            header.number,
-                            header_ts,
-                            parent_ts,
-                            snap.block_interval,
-                            required_ms.saturating_sub(parent_ts + snap.block_interval)
-                        );
-                        return Err(ConsensusError::TimestampIsInPast {
-                            parent_timestamp: required_ms,
-                            timestamp: header_ts,
-                        })
-                    }
-                }
-            }
         }
 
         // ensure that the blob gas fields for this block
@@ -236,11 +179,7 @@ impl<ChainSpec: EthChainSpec<Header = Header> + BscHardforks + 'static> FullCons
         }
 
         // Validate that the header requests hash matches the calculated requests hash
-        // For dev/test chains where Prague can be timestamp-activated before London,
-        // gate RequestsHash enforcement on both London (block-based) and Prague (timestamp-based).
-        if chain_spec.is_london_active_at_block(block.header().number)
-            && chain_spec.is_prague_active_at_timestamp(block.header().timestamp)
-        {
+        if chain_spec.is_london_active_at_block(block.header().number) && chain_spec.is_prague_active_at_timestamp(block.header().timestamp) {
             let Some(header_requests_hash) = block.header().requests_hash else {
                 return Err(ConsensusError::RequestsHashMissing)
             };

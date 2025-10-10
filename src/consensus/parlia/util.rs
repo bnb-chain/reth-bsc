@@ -53,11 +53,11 @@ pub fn debug_header(header: &Header, chain_id: u64, context: &str) {
         mix_hash = %format!("0x{:x}", header.mix_hash),
         nonce = %header.nonce.to_string(),
         base_fee_per_gas = ?header.base_fee_per_gas,
-        withdrawals_root = ?header.withdrawals_root.map(|h| format!("0x{h:x}")),
+        withdrawals_root = ?header.withdrawals_root.map(|h| format!("0x{:x}", h)),
         blob_gas_used = ?header.blob_gas_used,
         excess_blob_gas = ?header.excess_blob_gas,
-        parent_beacon_block_root = ?header.parent_beacon_block_root.map(|h| format!("0x{h:x}")),
-        requests_hash = ?header.requests_hash.map(|h| format!("0x{h:x}")),
+        parent_beacon_block_root = ?header.parent_beacon_block_root.map(|h| format!("0x{:x}", h)),
+        requests_hash = ?header.requests_hash.map(|h| format!("0x{:x}", h)),
     );
 }
 

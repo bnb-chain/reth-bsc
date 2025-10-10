@@ -60,95 +60,29 @@ where
         let block_number = block.number.to::<u64>();
         tracing::trace!("Check new block, block_number: {}", block_number);
 
-        // Prefer the header provided by the execution context (fork-aware).
-        let header = if let Some(h) = self.ctx.header.clone() {
-            h
-        } else {
-            crate::node::evm::util::HEADER_CACHE_READER
-                .lock()
-                .unwrap()
-                .get_header_by_number(block_number)
-                .ok_or(BlockExecutionError::msg("Failed to get header from global header reader"))?
-        };
+        let header = crate::node::evm::util::HEADER_CACHE_READER
+            .lock()
+            .unwrap()
+            .get_header_by_number(block_number)
+            .ok_or(BlockExecutionError::msg("Failed to get header from global header reader"))?;
         self.inner_ctx.header = Some(header.clone());
 
-        // Fetch parent header by hash to ensure we track the correct fork lineage.
-        let parent_header = self
+        let parent_header = crate::node::evm::util::HEADER_CACHE_READER
+            .lock()
+            .unwrap()
+            .get_header_by_number(block_number - 1)
+            .ok_or(BlockExecutionError::msg("Failed to get parent header from global header reader"))?;
+        self.inner_ctx.parent_header = Some(parent_header.clone());
+
+        let snap = self
             .snapshot_provider
             .as_ref()
             .unwrap()
-            .get_header_by_hash(&header.parent_hash)
-            .or_else(|| {
-                crate::node::evm::util::HEADER_CACHE_READER
-                    .lock()
-                    .unwrap()
-                    .get_header_by_number(block_number - 1)
-            })
-            .ok_or(BlockExecutionError::msg("Failed to get parent header from snapshot provider or cache"))?;
-        self.inner_ctx.parent_header = Some(parent_header.clone());
+            .snapshot(block_number-1)
+            .ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;
+        self.inner_ctx.snap = Some(snap.clone());
 
-        // Build parent snapshot using resilient fallbacks.
-        // Prefer deriving parent from base (parent_number - 1), but tolerate missing snapshots
-        // and over-proposal scenarios by falling back to stored provider snapshots.
-        let provider = self.snapshot_provider.as_ref().unwrap();
-        let base_snap = provider
-            .snapshot(parent_header.number.saturating_sub(1))
-            .or_else(|| provider.snapshot(block_number.saturating_sub(1)))
-            .ok_or(BlockExecutionError::msg("Failed to get base snapshot from snapshot provider"))?;
-
-        // Attempt to derive parent by applying header over base if lineage matches.
-        let lineage_matches = parent_header.number == base_snap.block_number + 1
-            && parent_header.parent_hash == base_snap.block_hash;
-        let derived_parent = if lineage_matches {
-            let proposer = Parlia::new(Arc::new(self.spec.clone()), 200)
-                .recover_proposer(&parent_header)
-                .map_err(|err| BscBlockExecutionError::ParliaConsensusInnerError { error: err.into() })?;
-            let epoch_len = self.parlia.get_epoch_length(&parent_header);
-            let maybe_attestation = self
-                .parlia
-                .get_vote_attestation_from_header(&parent_header, epoch_len)
-                .map_err(|err| BscBlockExecutionError::ParliaConsensusInnerError { error: err.into() })?;
-
-            let mut new_validators: Vec<Address> = Vec::new();
-            let mut vote_addrs: Option<Vec<VoteAddress>> = None;
-            if parent_header.number % epoch_len == 0 {
-                if let Ok(info) = self.parlia.parse_validators_from_header(&parent_header, epoch_len) {
-                    new_validators = info.consensus_addrs;
-                    vote_addrs = info.vote_addrs;
-                }
-            }
-            let maybe_turn_length = self
-                .parlia
-                .get_turn_length_from_header(&parent_header, epoch_len)
-                .ok()
-                .flatten();
-
-            base_snap.apply(
-                proposer,
-                &parent_header,
-                new_validators,
-                vote_addrs,
-                maybe_attestation,
-                maybe_turn_length,
-                &self.spec,
-            )
-        } else {
-            None
-        };
-
-        // If deriving failed (e.g., over-proposed on dev/single-validator), fall back to stored parent snapshot
-        // or the last known snapshot at block_number - 1.
-        let parent_snap = if let Some(s) = derived_parent {
-            s
-        } else {
-            provider
-                .snapshot(parent_header.number)
-                .or_else(|| provider.snapshot(block_number.saturating_sub(1)))
-                .ok_or(BlockExecutionError::msg("Failed to get parent snapshot from snapshot provider"))?
-        };
-        self.inner_ctx.snap = Some(parent_snap.clone());
-
-        self.verify_cascading_fields(&header, &parent_header, &parent_snap)?;
+        self.verify_cascading_fields(&header, &parent_header, &snap)?;
 
         let epoch_length = self.parlia.get_epoch_length(&header);
         if header.number % epoch_length == 0 {
@@ -303,8 +237,7 @@ where
             let current_ts: u64 = calculate_millisecond_timestamp(header);
             let parent_ts: u64 = calculate_millisecond_timestamp(parent);
             if current_ts < parent_ts + block_interval + back_off_time {
-                tracing::warn!(
-                    "Block time is too early, block_number: {}, ts: {:?}, parent_ts: {:?}, block_interval: {:?}, back_off_time: {:?}",
+                tracing::warn!("Block time is too early, block_number: {}, ts: {:?}, parent_ts: {:?}, block_interval: {:?}, back_off_time: {:?}", 
                     header.number(), current_ts, parent_ts, block_interval, back_off_time);
                 return Err(BscBlockExecutionError::FutureBlock {
                     block_number: header.number(),

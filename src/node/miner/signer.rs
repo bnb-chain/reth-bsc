@@ -27,7 +27,7 @@ impl std::fmt::Display for SignerError {
         match self {
             SignerError::NotInitialized => write!(f, "Global signer not initialized"),
             SignerError::AlreadyInitialized => write!(f, "Global signer already initialized"),
-            SignerError::SigningFailed(msg) => write!(f, "Signing failed: {msg}"),
+            SignerError::SigningFailed(msg) => write!(f, "Signing failed: {}", msg),
         }
     }
 }
@@ -49,7 +49,7 @@ impl MinerSigner {
     pub fn seal_header(&self, header: &Header, chain_id: u64) -> Result<[u8; EXTRA_SEAL_LEN], SignerError> {
         let hash_data = hash_with_chain_id(header, chain_id);
         let secret_key = SecretKey::from_slice(self.private_key.as_ref())
-            .map_err(|e| SignerError::SigningFailed(format!("Invalid private key: {e}")))?;
+            .map_err(|e| SignerError::SigningFailed(format!("Invalid private key: {}", e)))?;
         
         let message = Message::from_digest(hash_data.0);
         let recoverable_sig = SECP256K1.sign_ecdsa_recoverable(&message, &secret_key);

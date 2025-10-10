@@ -8,7 +8,7 @@ use crate::chainspec::BscChainSpec;
 use crate::consensus::parlia::{EXTRA_VANITY_LEN, EXTRA_SEAL_LEN};
 use reth::payload::EthPayloadBuilderAttributes;
 use crate::hardforks::BscHardforks;
-use reth_chainspec::{EthChainSpec};
+use reth_chainspec::EthChainSpec;
 use crate::node::evm::pre_execution::VALIDATOR_CACHE;
 use crate::node::miner::signer::seal_header_with_global_signer;
 

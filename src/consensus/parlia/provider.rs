@@ -5,7 +5,6 @@ use std::sync::Arc;
 use crate::chainspec::BscChainSpec;
 
 use crate::consensus::parlia::{Parlia, VoteAddress};
-use crate::hardforks::BscHardforks;
 use crate::node::evm::error::BscBlockExecutionError;
 use alloy_primitives::{Address, B256};
 
@@ -335,19 +334,6 @@ impl<DB: Database + 'static> EnhancedDbSnapshotProvider<DB> {
                     err
                 }).ok()?;
 
-                // Detect over-proposed proposer ahead of time to avoid hard-failing snapshot rebuilds.
-                let is_bohr = self.chain_spec.is_bohr_active_at_timestamp(header.number, header.timestamp);
-                let mut is_over_proposed = false;
-                if is_bohr {
-                    // Bohr+ uses recent-window counts
-                    is_over_proposed = working_snapshot.sign_recently(header.beneficiary);
-                } else {
-                    // Pre-Bohr: proposer must not appear in recent_proposers values
-                    if working_snapshot.recent_proposers.values().any(|&v| v == header.beneficiary) {
-                        is_over_proposed = true;
-                    }
-                }
-
                 // Apply header to snapshot
                 working_snapshot = match working_snapshot.apply(
                     header.beneficiary,
@@ -360,22 +346,8 @@ impl<DB: Database + 'static> EnhancedDbSnapshotProvider<DB> {
                 ) {
                     Some(snap) => snap,
                     None => {
-                        if is_over_proposed {
-                            // Tolerate and advance snapshot for over-proposed headers:
-                            // update block_number/hash only; do not mutate recents/validators.
-                            tracing::warn!(
-                                target: "reth_bsc::consensus::parlia::provider",
-                                "Failed to apply header {} to snapshot due to over-proposed; advancing snapshot without updating recents",
-                                header.number
-                            );
-                            let mut passthrough = working_snapshot.clone();
-                            passthrough.block_number = header.number;
-                            passthrough.block_hash = header.hash_slow();
-                            passthrough
-                        } else {
-                            tracing::warn!("Failed to apply header {} to snapshot", header.number);
-                            return None;
-                        }
+                        tracing::warn!("Failed to apply header {} to snapshot", header.number);
+                        return None;
                     }
                 };
 

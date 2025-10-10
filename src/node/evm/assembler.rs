@@ -88,47 +88,30 @@ where
         // Use the base EthBlockExecutionCtx for compatibility
         let eth_ctx = ctx.as_eth_context();
         let timestamp = evm_env.block_env.timestamp.saturating_to();
-        let block_number: u64 = evm_env.block_env.number.saturating_to();
         let transactions_root = proofs::calculate_transaction_root(&transactions);
         let receipts_root = Receipt::calculate_receipt_root_no_memo(receipts);
         let logs_bloom = logs_bloom(receipts.iter().flat_map(|r| &r.logs));
 
-        
-
-        let withdrawals = (self
+        let withdrawals = self
             .chain_spec
-            .is_london_active_at_block(block_number)
-            && self
-                .chain_spec
-                .is_shanghai_active_at_timestamp(timestamp))
+            .is_shanghai_active_at_timestamp(timestamp)
             .then(|| eth_ctx.withdrawals.clone().map(|w| w.into_owned()).unwrap_or_default());
 
         let withdrawals_root =
             withdrawals.as_deref().map(|w| proofs::calculate_withdrawals_root(w));
-        // Only include RequestsHash when both London and Prague are active.
-        // This matches our consensus gating for dev chains where Prague may activate before London.
-        let requests_hash = (self
+        let requests_hash = self
             .chain_spec
-            .is_london_active_at_block(block_number)
-            && self
-                .chain_spec
-                .is_prague_active_at_timestamp(timestamp))
+            .is_prague_active_at_timestamp(timestamp)
             .then(|| requests.requests_hash());
 
         let mut excess_blob_gas = None;
         let mut blob_gas_used = None;
-        if self
-            .chain_spec
-            .is_london_active_at_block(block_number)
-            && BscHardforks::is_cancun_active_at_timestamp(&*self.chain_spec, block_number, timestamp)
-        {
+
+        let block_number = evm_env.block_env.number.saturating_to();
+        if BscHardforks::is_cancun_active_at_timestamp(&*self.chain_spec, block_number, timestamp) {
             blob_gas_used =
                 Some(transactions.iter().map(|tx| tx.blob_gas_used().unwrap_or_default()).sum());
-            excess_blob_gas = if self
-                .chain_spec
-                .is_london_active_at_block(parent.number)
-                && BscHardforks::is_cancun_active_at_timestamp(&*self.chain_spec, parent.number, parent.timestamp)
-            {
+            excess_blob_gas = if BscHardforks::is_cancun_active_at_timestamp(&*self.chain_spec, parent.number, parent.timestamp) {
                 parent.maybe_next_block_excess_blob_gas(
                     self.chain_spec.blob_params_at_timestamp(timestamp),
                 )
@@ -230,44 +213,30 @@ where
         // Use the base EthBlockExecutionCtx for compatibility
         let eth_ctx = ctx.as_eth_context();
         let timestamp = evm_env.block_env.timestamp.saturating_to();
-        let block_number: u64 = evm_env.block_env.number.saturating_to();
         let transactions_root = proofs::calculate_transaction_root(&transactions);
         let receipts_root = Receipt::calculate_receipt_root_no_memo(receipts);
         let logs_bloom = logs_bloom(receipts.iter().flat_map(|r| &r.logs));
 
-        let withdrawals = (self
+        let withdrawals = self
             .chain_spec
-            .is_london_active_at_block(block_number)
-            && self
-                .chain_spec
-                .is_shanghai_active_at_timestamp(timestamp))
+            .is_shanghai_active_at_timestamp(timestamp)
             .then(|| eth_ctx.withdrawals.clone().map(|w| w.into_owned()).unwrap_or_default());
 
         let withdrawals_root =
             withdrawals.as_deref().map(|w| proofs::calculate_withdrawals_root(w));
-        // Only include RequestsHash when both London and Prague are active.
-        let requests_hash = (self
+        let requests_hash = self
             .chain_spec
-            .is_london_active_at_block(block_number)
-            && self
-                .chain_spec
-                .is_prague_active_at_timestamp(timestamp))
+            .is_prague_active_at_timestamp(timestamp)
             .then(|| requests.requests_hash());
 
         let mut excess_blob_gas = None;
         let mut blob_gas_used = None;
-        if self
-            .chain_spec
-            .is_london_active_at_block(block_number)
-            && BscHardforks::is_cancun_active_at_timestamp(&*self.chain_spec, block_number, timestamp)
-        {
+
+        let block_number = evm_env.block_env.number.saturating_to();
+        if BscHardforks::is_cancun_active_at_timestamp(&*self.chain_spec, block_number, timestamp) {
             blob_gas_used =
                 Some(transactions.iter().map(|tx| tx.blob_gas_used().unwrap_or_default()).sum());
-            excess_blob_gas = if self
-                .chain_spec
-                .is_london_active_at_block(parent.number)
-                && BscHardforks::is_cancun_active_at_timestamp(&*self.chain_spec, parent.number, parent.timestamp)
-            {
+            excess_blob_gas = if BscHardforks::is_cancun_active_at_timestamp(&*self.chain_spec, parent.number, parent.timestamp) {
                 parent.maybe_next_block_excess_blob_gas(
                     self.chain_spec.blob_params_at_timestamp(timestamp),
                 )

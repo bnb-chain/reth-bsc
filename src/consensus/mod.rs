@@ -30,9 +30,9 @@ impl<P> ParliaConsensus<P>
 where
     P: BlockNumReader + Clone,
 {
-    /// Determines the head block hash according to Parlia consensus rules with BSC fast finality:
-    /// 1. Use BSC's ReorgNeededWithFastFinality logic when available
-    /// 2. Fallback to block number comparison for basic cases
+    /// Determines the head block hash according to Parlia consensus rules:
+    /// 1. Follow the highest block number
+    /// 2. For same height blocks, pick the one with lower hash
     pub(crate) fn canonical_head(
         &self,
         hash: B256,
@@ -42,38 +42,11 @@ where
         let current_hash =
             self.provider.block_hash(current_head)?.ok_or(ParliaConsensusErr::HeadHashNotFound)?;
 
-        // For basic cases where incoming block is clearly better/worse, use simple logic
         match number.cmp(&current_head) {
             Ordering::Greater => Ok((hash, current_hash)),
+            Ordering::Equal => Ok((hash.min(current_hash), current_hash)),
             Ordering::Less => Ok((current_hash, current_hash)),
-            Ordering::Equal => {
-                // For same height blocks, try to use BSC fast finality logic if possible
-                if let (Some(current_header), Some(incoming_header)) = (
-                    self.get_header_by_hash(current_hash),
-                    self.get_header_by_hash(hash)
-                ) {
-                    if let Some(consensus) = crate::shared::get_bsc_consensus() {
-                        let should_reorg = consensus.should_reorg(&current_header, &incoming_header);
-                        if should_reorg {
-                            Ok((hash, current_hash))
-                        } else {
-                            Ok((current_hash, current_hash))
-                        }
-                    } else {
-                        // Fallback: pick lower hash
-                        Ok((hash.min(current_hash), current_hash))
-                    }
-                } else {
-                    // Fallback: pick lower hash if headers not available
-                    Ok((hash.min(current_hash), current_hash))
-                }
-            }
         }
-    }
-
-    /// Helper method to get header by hash if provider supports it
-    fn get_header_by_hash(&self, hash: B256) -> Option<alloy_consensus::Header> {
-        crate::shared::get_header_by_hash(&hash)
     }
 }
 

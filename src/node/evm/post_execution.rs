@@ -6,14 +6,14 @@ use crate::consensus::parlia::{DIFF_INTURN, VoteAddress, VoteAttestation, snapsh
 use crate::consensus::{SYSTEM_ADDRESS, MAX_SYSTEM_REWARD, SYSTEM_REWARD_PERCENT};
 use crate::evm::transaction::BscTxEnv;
 use crate::node::miner::util::prepare_new_header;
-use crate::system_contracts::{SYSTEM_REWARD_CONTRACT, feynman_fork::{ValidatorElectionInfo, get_top_validators_by_voting_power, ElectedValidators}};
+use crate::system_contracts::{SLASH_CONTRACT, SYSTEM_REWARD_CONTRACT, feynman_fork::{ValidatorElectionInfo, get_top_validators_by_voting_power, ElectedValidators}};
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
 use reth_evm::{eth::receipt_builder::{ReceiptBuilder, ReceiptBuilderCtx}, execute::BlockExecutionError, Database, Evm, FromRecoveredTx, FromTxWithEncoded, IntoTxEnv, block::StateChangeSource};
 use reth_primitives::{TransactionSigned, Transaction};
 use reth_revm::State;
 use crate::node::evm::ResultAndState;
 use revm::{context::{BlockEnv, TxEnv}, Database as RevmDatabase, DatabaseCommit};
-use alloy_consensus::{Header, TxReceipt, Transaction as AlloyTransaction};
+use alloy_consensus::{Header, TxReceipt, Transaction as AlloyTransaction, SignableTransaction};
 use alloy_primitives::{Address, hex, TxKind, U256};
 use std::collections::HashMap;
 use tracing::warn;
@@ -47,7 +47,7 @@ where
         self.verify_validators(self.inner_ctx.current_validators.clone(), self.inner_ctx.header.clone())?;
         self.verify_turn_length(self.inner_ctx.header.clone())?;
 
-        // Handle system transactions: slash spoiled validator if needed
+        // finalize the system txs.
         if self.inner_ctx.header.as_ref().unwrap().difficulty != DIFF_INTURN {
             tracing::debug!("Start to slash spoiled validator, block_number: {}, block_difficulty: {:?}, diff_inturn: {:?}", 
                 block.number, self.inner_ctx.header.as_ref().unwrap().difficulty, DIFF_INTURN);
@@ -64,15 +64,13 @@ where
             }
         }
 
-        // Distribute incoming rewards
         self.distribute_incoming(block.beneficiary)?;
 
-        // Distribute finality rewards if Plato is active
         if self.spec.is_plato_active_at_block(block.number.to()) {
             self.distribute_finality_reward()?;
         }
 
-        // Update validator set after Feynman upgrade
+        // update validator set after Feynman upgrade
         let header_number = self.evm.block().number.to::<u64>();
         let header_timestamp = self.evm.block().timestamp.to::<u64>();
         let header_beneficiary = self.evm.block().beneficiary;
@@ -85,15 +83,14 @@ where
             let validators_election_info = self.inner_ctx.validators_election_info.clone().unwrap_or_default();
  
             self.update_validator_set_v2(
-                max_elected_validators,
-                validators_election_info.clone(),
-                header_beneficiary,
-            )?;
+                 max_elected_validators,
+                 validators_election_info.clone(),
+                 header_beneficiary,
+             )?;
             tracing::debug!("Update validator set, block_number: {}, max_elected_validators: {}, validators_election_info: {:?}", 
                 header_number, max_elected_validators, validators_election_info);
         }
 
-        // Check that all system transactions have been processed
         if !self.system_txs.is_empty() {
             tracing::warn!(
                 "Remaining system txs after block execution, block_number: {}, len: {}",
@@ -222,12 +219,11 @@ where
     }
 
     pub(crate) fn transact_system_tx(
-        &mut self,
-        transaction: Transaction,
-        sender: Address,
+        &mut self, 
+        transaction: Transaction, 
+        sender: Address
     ) -> Result<(), BlockExecutionError> {
-        let account = self
-            .evm
+        let account = self.evm
             .db_mut()
             .basic(sender)
             .map_err(BlockExecutionError::other)?
@@ -236,10 +232,15 @@ where
         let transaction = set_nonce(transaction, account.nonce);
 
         let signed_tx = if !self.ctx.is_miner {
-            if self.system_txs.is_empty() {
-                // Slash tx could fail and not be in the block
+            let hash = transaction.signature_hash();
+            if self.system_txs.is_empty() || hash != self.system_txs[0].signature_hash() {
+                // slash tx could fail and not in the block
                 if let Some(to) = transaction.to() {
-                    if to == crate::system_contracts::SLASH_CONTRACT {
+                    if to == SLASH_CONTRACT &&
+                        (self.system_txs.is_empty() ||
+                            self.system_txs[0].to().unwrap_or_default() !=
+                                SLASH_CONTRACT)
+                    {
                         warn!("slash validator failed");
                         return Ok(());
                     }
@@ -252,16 +253,8 @@ where
             }
             Some(self.system_txs.remove(0))
         } else if is_signer_initialized() {
-            // In mining mode, sign the transaction
             match sign_system_transaction(transaction.clone()) {
-                Ok(signed) => {
-                    let recovered = signed.clone().try_into_recovered_unchecked().unwrap_or_else(|_| {
-                        panic!("Failed to recover system transaction signature")
-                    });
-                    self.assembled_system_txs.push(recovered);
-                    Some(signed)
-                    
-                }
+                Ok(signed) => Some(signed),
                 Err(e) => {
                     tracing::warn!("Failed to sign system transaction: {}", e);
                     return Err(BscBlockExecutionError::FailedToSignSystemTransaction { error: e.to_string() }.into());
@@ -272,8 +265,16 @@ where
             return Err(BscBlockExecutionError::GlobalSignerNotInitializedForMiningMode.into());
         };
 
-        // Create TxEnv first (before moving transaction)
+        if self.ctx.is_miner {
+            if let Some(signed) = signed_tx.clone() {
+                let recovered = signed.try_into_recovered_unchecked().unwrap_or_else(|_| {
+                    panic!("Failed to recover system transaction signature")
+                });
+                self.assembled_system_txs.push(recovered);
+            }
+        }
 
+        // Create TxEnv first (before moving transaction)
         let tx_env = BscTxEnv {
             base: TxEnv {
                 caller: sender,
@@ -294,10 +295,7 @@ where
             is_system_transaction: true,
         };
 
-        let result_and_state = self
-            .evm
-            .transact(tx_env)
-            .map_err(BlockExecutionError::other)?;
+        let result_and_state = self.evm.transact(tx_env).map_err(BlockExecutionError::other)?;
         let ResultAndState { result, state } = result_and_state;
         let mut temp_state = state.clone();
         temp_state.remove(&SYSTEM_ADDRESS);
