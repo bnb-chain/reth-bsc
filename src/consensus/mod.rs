@@ -1,9 +1,9 @@
 use alloy_consensus::constants::ETH_TO_WEI;
 use alloy_primitives::{address, Address, BlockNumber, B256};
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
-use crate::{chainspec::BscChainSpec, consensus::parlia::Parlia, hardforks::BscHardforks, shared};
+use crate::{chainspec::BscChainSpec, hardforks::BscHardforks, shared};
 use reth_provider::{BlockNumReader, ProviderError};
 use std::cmp::Ordering;
 
@@ -84,14 +84,12 @@ where
                     .ok()
                     .and_then(|mut c| c.get_header_by_hash(&incoming_hash))
             });
-        let current_header = shared::get_header_by_number_from_provider(current_number).or_else(
-            || {
-                crate::node::evm::util::HEADER_CACHE_READER
-                    .lock()
-                    .ok()
-                    .and_then(|mut c| c.get_header_by_number(current_number))
-            },
-        );
+        let current_header = shared::get_header_by_hash_from_provider(&current_hash).or_else(|| {
+            crate::node::evm::util::HEADER_CACHE_READER
+                .lock()
+                .ok()
+                .and_then(|mut c| c.get_header_by_hash(&current_hash))
+        });
 
         // If we can't access headers, we can't apply fast finality
         let (Some(incoming_header), Some(current_header)) = (incoming_header, current_header) else {
@@ -100,28 +98,38 @@ where
 
         // Decode vote attestations from headers (post-Luban) to extract justified numbers.
         // Use Parlia helper that understands header layout across hardforks.
-        let parlia = Parlia::new(self.chain_spec.clone(), 200);
-        let incoming_epoch = parlia.get_epoch_length(&incoming_header);
-        let current_epoch = parlia.get_epoch_length(&current_header);
-
-        let mut incoming_justified: u64 = 0;
-        if plato_incoming {
-            if let Ok(Some(att)) =
-                parlia.get_vote_attestation_from_header(&incoming_header, incoming_epoch)
-            {
-                // Highest justified number prior to this header is the attestation's source
-                incoming_justified = att.data.source_number;
+        // Fast finality must use snapshot provider; if unavailable, skip FF.
+        let sp = match shared::get_snapshot_provider() {
+            Some(sp) => sp,
+            None => {
+                warn!(target: "forkchoice", "Snapshot provider not set; skipping fast-finality");
+                return None;
             }
-        }
-
-        let mut current_justified: u64 = 0;
-        if plato_current {
-            if let Ok(Some(att)) =
-                parlia.get_vote_attestation_from_header(&current_header, current_epoch)
-            {
-                current_justified = att.data.source_number;
+        };
+        // Get justified numbers from snapshots at parent blocks
+        let incoming_justified = if plato_incoming {
+            match sp.snapshot(incoming_header.number) {
+                Some(snap) => snap.vote_data.target_number,
+                None => {
+                    warn!(target: "forkchoice", "Missing snapshot for incoming parent; skipping fast-finality");
+                    return None;
+                }
             }
-        }
+        } else {
+            0
+        };
+
+        let current_justified = if plato_current {
+            match sp.snapshot(current_header.number) {
+                Some(snap) => snap.vote_data.target_number,
+                None => {
+                    warn!(target: "forkchoice", "Missing snapshot for current parent; skipping fast-finality");
+                    return None;
+                }
+            }
+        } else {
+            0
+        };
 
         // If equal, fast finality can't decide: let caller fallback
         if incoming_justified == current_justified {
@@ -162,6 +170,36 @@ mod tests {
     use crate::chainspec::bsc_rialto::bsc_qanet;
     use crate::consensus::parlia::vote::{VoteAttestation, VoteData};
     use crate::consensus::parlia::constants::{EXTRA_SEAL_LEN, EXTRA_VANITY_LEN};
+    use crate::consensus::parlia::Snapshot;
+    use crate::consensus::parlia::provider::SnapshotProvider as ParliaSnapshotProvider;
+    use std::sync::Arc;
+
+    use once_cell::sync::Lazy;
+    use std::collections::HashMap as StdHashMap;
+    use std::sync::RwLock;
+
+    static DUMMY_SNAP_STORE: Lazy<RwLock<StdHashMap<u64, Snapshot>>> =
+        Lazy::new(|| RwLock::new(StdHashMap::new()));
+
+    #[derive(Debug)]
+    struct DummySnapProvider;
+    impl ParliaSnapshotProvider for DummySnapProvider {
+        fn snapshot(&self, block_number: u64) -> Option<Snapshot> {
+            DUMMY_SNAP_STORE.read().ok().and_then(|m| m.get(&block_number).cloned())
+        }
+        fn insert(&self, snapshot: Snapshot) {
+            if let Ok(mut m) = DUMMY_SNAP_STORE.write() {
+                m.insert(snapshot.block_number, snapshot);
+            }
+        }
+        fn get_header(&self, _block_number: u64) -> Option<alloy_consensus::Header> { None }
+    }
+
+    fn ensure_snapshot_provider() {
+        if crate::shared::get_snapshot_provider().is_none() {
+            let _ = crate::shared::set_snapshot_provider(Arc::new(DummySnapProvider));
+        }
+    }
 
     #[derive(Clone)]
     struct MockProvider {
@@ -253,6 +291,7 @@ mod tests {
 
     #[test]
     fn test_fast_finality_prefers_higher_justified_even_if_lower_height() {
+        ensure_snapshot_provider();
         // Arrange chain spec with Plato/Luban early activations (qanet)
         let chain_spec = Arc::new(crate::chainspec::BscChainSpec::from(bsc_qanet()));
 
@@ -271,6 +310,11 @@ mod tests {
             cache.insert_header_to_cache(incoming.clone());
         }
 
+        // Provide snapshots with justified numbers at head blocks
+        let sp = crate::shared::get_snapshot_provider().unwrap().clone();
+        sp.insert(Snapshot { block_number: current.number, vote_data: VoteData { target_number: 50, ..Default::default() }, epoch_num: 200, ..Default::default() });
+        sp.insert(Snapshot { block_number: incoming.number, vote_data: VoteData { target_number: 60, ..Default::default() }, epoch_num: 200, ..Default::default() });
+
         // Mock provider returns current head number/hash
         let provider = MockProvider::new(10, current_hash);
         let consensus = ParliaConsensus { provider, chain_spec };
@@ -285,6 +329,7 @@ mod tests {
 
     #[test]
     fn test_fast_finality_falls_back_when_equal_justified() {
+        ensure_snapshot_provider();
         let chain_spec = Arc::new(crate::chainspec::BscChainSpec::from(bsc_qanet()));
 
         // Current canonical head: number 10, justified=50
@@ -302,6 +347,11 @@ mod tests {
             cache.insert_header_to_cache(incoming.clone());
         }
 
+        // Provide snapshots with equal justified numbers at head blocks
+        let sp = crate::shared::get_snapshot_provider().unwrap().clone();
+        sp.insert(Snapshot { block_number: current.number, vote_data: VoteData { target_number: 50, ..Default::default() }, epoch_num: 200, ..Default::default() });
+        sp.insert(Snapshot { block_number: incoming.number, vote_data: VoteData { target_number: 50, ..Default::default() }, epoch_num: 200, ..Default::default() });
+
         let provider = MockProvider::new(10, current_hash);
         let consensus = ParliaConsensus { 
             provider, 
@@ -317,6 +367,7 @@ mod tests {
 
     #[test]
     fn test_fast_finality_rejects_higher_height_if_lower_justified() {
+        ensure_snapshot_provider();
         let chain_spec = Arc::new(crate::chainspec::BscChainSpec::from(bsc_qanet()));
 
         // Current canonical head: number 10, justified=50
@@ -333,6 +384,11 @@ mod tests {
             cache.insert_header_to_cache(current.clone());
             cache.insert_header_to_cache(incoming.clone());
         }
+
+        // Provide snapshots with lower justified number for incoming head
+        let sp = crate::shared::get_snapshot_provider().unwrap().clone();
+        sp.insert(Snapshot { block_number: current.number, vote_data: VoteData { target_number: 50, ..Default::default() }, epoch_num: 200, ..Default::default() });
+        sp.insert(Snapshot { block_number: incoming.number, vote_data: VoteData { target_number: 40, ..Default::default() }, epoch_num: 200, ..Default::default() });
 
         let provider = MockProvider::new(10, current_hash);
         let consensus = ParliaConsensus { 
