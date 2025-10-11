@@ -1,9 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 
-//use crate::consensus::parlia::TURN_LENGTH_SIZE;
-
 use super::vote::{VoteAddress, VoteAttestation, VoteData};
-use alloy_primitives::{Address, BlockNumber, B256};
+use alloy_primitives::{Address, BlockNumber, BlockHash};
 use serde::{Deserialize, Serialize};
 use reth_db::table::{Compress, Decompress};
 use reth_db::DatabaseError;
@@ -48,7 +46,7 @@ pub struct Snapshot {
     /// Block number of the epoch boundary.
     pub block_number: BlockNumber,
     /// Hash of that block.
-    pub block_hash: B256,
+    pub block_hash: BlockHash,
     /// Sorted validator set (ascending by address).
     pub validators: Vec<Address>,
     /// Extra information about validators (index + vote addr).
@@ -72,7 +70,7 @@ impl Snapshot {
     pub fn new(
         mut validators: Vec<Address>,
         block_number: BlockNumber,
-        block_hash: B256,
+        block_hash: BlockHash,
         epoch_num: u64,
         vote_addrs: Option<Vec<VoteAddress>>, // one-to-one with `validators`
     ) -> Self {
@@ -384,7 +382,7 @@ mod tests {
     fn sign_recently_detects_over_propose() {
         // three validators
         let validators = vec![addr(1), addr(2), addr(3)];
-        let mut snap = Snapshot::new(validators.clone(), 0, B256::ZERO, DEFAULT_EPOCH_LENGTH, None);
+        let mut snap = Snapshot::new(validators.clone(), 0, BlockHash::default(), DEFAULT_EPOCH_LENGTH, None);
 
         // simulate that validator 1 proposed previous block 0
         snap.recent_proposers.insert(1, addr(1));
@@ -399,7 +397,7 @@ mod tests {
     #[test]
     fn sign_recently_allows_within_limit() {
         let validators = vec![addr(1), addr(2), addr(3)];
-        let snap = Snapshot::new(validators, 0, B256::ZERO, DEFAULT_EPOCH_LENGTH, None);
+        let snap = Snapshot::new(validators, 0, BlockHash::default(), DEFAULT_EPOCH_LENGTH, None);
         // no recent entries, validator should be allowed
         assert!(!snap.sign_recently(addr(1)));
     }

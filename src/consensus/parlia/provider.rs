@@ -7,6 +7,7 @@ use crate::chainspec::BscChainSpec;
 use crate::consensus::parlia::{Parlia, VoteAddress};
 use crate::node::evm::error::{BscBlockExecutionError, BscBlockValidationError};
 use alloy_primitives::{Address, B256};
+use alloy_primitives::{BlockNumber, BlockHash};
 
 /// Validator information extracted from header
 #[derive(Debug, Clone)]
@@ -24,17 +25,21 @@ use reth_db::cursor::DbCursorRO;
 use schnellru::{ByLength, LruMap};
 
 pub trait SnapshotProvider: Send + Sync {
-    /// Returns the snapshot that is valid for the given `block_number` (usually parent block).
-    fn snapshot(&self, block_number: u64) -> Option<Snapshot>;
+    /// Returns the snapshot that is valid for the given `block_number`.
+    fn snapshot(&self, block_number: BlockNumber) -> Option<Snapshot>;
+
+    fn snapshot_by_hash(&self, _block_hash: &BlockHash) -> Option<Snapshot> {
+        None
+    }
 
     /// Inserts (or replaces) the snapshot in the provider.
     fn insert(&self, snapshot: Snapshot);
     
     /// Returns the header for the given `block_number`.
-    fn get_header(&self, block_number: u64) -> Option<alloy_consensus::Header>;
+    fn get_header(&self, block_number: BlockNumber) -> Option<alloy_consensus::Header>;
 
     /// Returns the header for the given `hash`.
-    fn get_header_by_hash(&self, _hash: &B256) -> Option<alloy_consensus::Header> {
+    fn get_header_by_hash(&self, _block_hash: &BlockHash) -> Option<alloy_consensus::Header> {
         None
     }
 }
@@ -45,8 +50,8 @@ pub trait SnapshotProvider: Send + Sync {
 #[derive(Debug)]
 pub struct DbSnapshotProvider<DB: Database> {
     db: DB,
-    /// Front cache keyed by *block number*.
-    cache: RwLock<LruMap<u64, Snapshot, ByLength>>,
+    cache: RwLock<LruMap<BlockNumber, Snapshot, ByLength>>,
+    cache_by_hash: RwLock<LruMap<BlockHash, Snapshot, ByLength>>,
 }
 
 /// Enhanced version with backward walking capability
@@ -64,6 +69,7 @@ impl<DB: Database> DbSnapshotProvider<DB> {
         Self { 
             db, 
             cache: RwLock::new(LruMap::new(ByLength::new(capacity as u32))),
+            cache_by_hash: RwLock::new(LruMap::new(ByLength::new(capacity as u32))),
         }
     }
 }
@@ -140,11 +146,24 @@ impl<DB: Database> DbSnapshotProvider<DB> {
         last
     }
 
+    fn query_db_by_hash(&self, block_hash: &B256) -> Option<Snapshot> {
+        let tx = self.db.tx().ok()?;
+        if let Ok(Some(raw_blob)) = tx.get::<crate::consensus::parlia::db::ParliaSnapshotsByHash>(*block_hash) {
+            let raw = &raw_blob.0;
+            if let Ok(decoded) = Snapshot::decompress(raw) {
+                tracing::debug!("Succeed to query snapshot from db, block_number: {}, block_hash: {}", decoded.block_number, decoded.block_hash);
+                return Some(decoded);
+            }
+        }
+        None
+    }
+
     fn persist_to_db(&self, snap: &Snapshot) -> Result<(), DatabaseError> {
         let tx = self.db.tx_mut()?;
         tx.put::<crate::consensus::parlia::db::ParliaSnapshots>(snap.block_number, ParliaSnapshotBlob(snap.clone().compress()))?;
+        tx.put::<crate::consensus::parlia::db::ParliaSnapshotsByHash>(snap.block_hash, ParliaSnapshotBlob(snap.clone().compress()))?;
         tx.commit()?;
-        tracing::debug!("Succeed to insert snapshot block {} to DB", snap.block_number);
+        tracing::debug!("Succeed to insert snapshot to db, block_number: {}, block_hash: {}", snap.block_number, snap.block_hash);
         Ok(())
     }
 }
@@ -164,8 +183,22 @@ impl<DB: Database + 'static> SnapshotProvider for DbSnapshotProvider<DB> {
         Some(snap)
     }
 
+    fn snapshot_by_hash(&self, block_hash: &B256) -> Option<Snapshot> {
+        { // fast path: cache
+            let mut guard = self.cache_by_hash.write();
+            if let Some(snap) = guard.get(block_hash) {
+                return Some(snap.clone());
+            }
+        }
+        // slow path: query db
+        let snap = self.query_db_by_hash(block_hash)?;
+        self.cache_by_hash.write().insert(*block_hash, snap.clone());
+        Some(snap)
+    }
+
     fn insert(&self, snapshot: Snapshot) {
         self.cache.write().insert(snapshot.block_number, snapshot.clone());
+        self.cache_by_hash.write().insert(snapshot.block_hash, snapshot.clone());
         if snapshot.block_number.is_multiple_of(crate::consensus::parlia::snapshot::CHECKPOINT_INTERVAL) {
             match self.persist_to_db(&snapshot) {
                 Ok(()) => {
@@ -252,6 +285,8 @@ impl<DB: Database + 'static> SnapshotProvider for EnhancedDbSnapshotProvider<DB>
         // Incremental forward building from base_snapshot to target block
         self.build_snapshot_incrementally(base_snapshot, block_number)
     }
+
+    // todo:
 
     fn insert(&self, snapshot: Snapshot) {
         self.base.insert(snapshot);
