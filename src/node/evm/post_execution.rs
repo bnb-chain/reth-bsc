@@ -1,5 +1,5 @@
 use super::executor::BscBlockExecutor;
-use super::error::BscBlockExecutionError;
+use super::error::{BscBlockExecutionError, BscBlockValidationError};
 use super::util::set_nonce;
 use crate::node::miner::signer::{sign_system_transaction, is_signer_initialized};
 use crate::consensus::parlia::{DIFF_INTURN, VoteAddress, VoteAttestation, snapshot::DEFAULT_TURN_LENGTH, constants::COLLECT_ADDITIONAL_VOTES_REWARD_RATIO, util::is_breathe_block};
@@ -176,7 +176,7 @@ where
             match self.parlia.get_turn_length_from_header(header_ref, epoch_length) {
                 Ok(Some(length)) => length,
                 Ok(None) => return Ok(()),
-                Err(err) => return Err(BscBlockExecutionError::ParliaConsensusInnerError { error: Box::new(err) }.into()),
+                Err(err) => return Err(BscBlockExecutionError::Validation(BscBlockValidationError::ParliaConsensusError { error: Box::new(err) }).into()),
             }
         };
         let turn_length_from_contract = self.get_turn_length(header_ref)?.unwrap();
@@ -187,7 +187,9 @@ where
 
         tracing::warn!("Failed to verify turn length, block_number: {}, turn_length_from_header: {}, turn_length_from_contract: {}, epoch_length: {}", 
             header_ref.number, turn_length_from_header, turn_length_from_contract, epoch_length);
-        Err(BscBlockExecutionError::MismatchingEpochTurnLengthError.into())
+        Err(BscBlockExecutionError::Validation(
+            BscBlockValidationError::MismatchingEpochTurnLengthError
+        ).into())
     }
 
     fn get_turn_length(
@@ -249,7 +251,9 @@ where
                 for tx in self.system_txs.iter() {
                     warn!("left system tx: {:?}", tx);
                 }
-                return Err(BscBlockExecutionError::UnexpectedSystemTx.into());
+                return Err(BscBlockExecutionError::Validation(
+                    BscBlockValidationError::UnexpectedSystemTx
+                ).into());
             }
             Some(self.system_txs.remove(0))
         } else if is_signer_initialized() {
@@ -403,7 +407,7 @@ where
             if let Some(attestation) =
                 self.parlia.get_vote_attestation_from_header(&header, snap.epoch_num).map_err(|err| {
                     tracing::error!("Failed to distribute finality reward due to can not get vote attestation from header, block_number: {}, error: {:?}", header.number, err);
-                    BscBlockExecutionError::ParliaConsensusInnerError { error: err.into() }
+                    BscBlockExecutionError::Validation(BscBlockValidationError::ParliaConsensusError { error: err.into() })
                 })?
             {
                 self.process_attestation(&attestation, &header, &mut accumulated_weights)?;
@@ -445,11 +449,12 @@ where
         }
 
         if validators_bit_set.len() > validators.len() {
-            return Err(BscBlockExecutionError::InvalidAttestationVoteCount(GotExpected {
-                got: validators_bit_set.len() as u64,
-                expected: validators.len() as u64,
-            })
-            .into());
+            return Err(BscBlockExecutionError::Validation(
+                BscBlockValidationError::InvalidAttestationVoteCount(GotExpected {
+                    got: validators_bit_set.len() as u64,
+                    expected: validators.len() as u64,
+                })
+            ).into());
         }
 
         let mut valid_vote_count = 0;

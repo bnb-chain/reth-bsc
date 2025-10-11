@@ -5,7 +5,7 @@ use std::sync::Arc;
 use crate::chainspec::BscChainSpec;
 
 use crate::consensus::parlia::{Parlia, VoteAddress};
-use crate::node::evm::error::BscBlockExecutionError;
+use crate::node::evm::error::{BscBlockExecutionError, BscBlockValidationError};
 use alloy_primitives::{Address, B256};
 
 /// Validator information extracted from header
@@ -227,7 +227,7 @@ impl<DB: Database + 'static> SnapshotProvider for EnhancedDbSnapshotProvider<DB>
                 if let Some(header) = crate::node::evm::util::HEADER_CACHE_READER.lock().unwrap().get_header_by_number(0) {
                     let ValidatorsInfo { consensus_addrs, vote_addrs } =
                         self.parlia.parse_validators_from_header(&header, self.parlia.epoch).map_err(|err| {
-                            BscBlockExecutionError::ParliaConsensusInnerError { error: err.into() }
+                            BscBlockExecutionError::Validation(BscBlockValidationError::ParliaConsensusError { error: err.into() })
                         }).ok()?;
                     let genesis_snap = Snapshot::new(
                         consensus_addrs,

@@ -14,7 +14,7 @@ use alloy_primitives::B256;
 use crate::consensus::parlia::{VoteAddress, Snapshot, Parlia, DIFF_INTURN, DIFF_NOTURN};
 use crate::consensus::parlia::util::{is_breathe_block, calculate_millisecond_timestamp, debug_header};
 use crate::consensus::parlia::vote::MAX_ATTESTATION_EXTRA_LENGTH;
-use crate::node::evm::error::BscBlockExecutionError;
+use crate::node::evm::error::{BscBlockExecutionError, BscBlockValidationError};
 use crate::node::evm::util::HEADER_CACHE_READER;
 use crate::system_contracts::feynman_fork::ValidatorElectionInfo;
 use std::{collections::HashMap, sync::{Arc, LazyLock, Mutex}};
@@ -239,11 +239,12 @@ where
             if current_ts < parent_ts + block_interval + back_off_time {
                 tracing::warn!("Block time is too early, block_number: {}, ts: {:?}, parent_ts: {:?}, block_interval: {:?}, back_off_time: {:?}", 
                     header.number(), current_ts, parent_ts, block_interval, back_off_time);
-                return Err(BscBlockExecutionError::FutureBlock {
-                    block_number: header.number(),
-                    hash: header.hash_slow(),
-                }
-                .into());
+                return Err(BscBlockExecutionError::Validation(
+                    BscBlockValidationError::FutureBlock {
+                        block_number: header.number(),
+                        hash: header.hash_slow(),
+                    }
+                ).into());
             }
         }
         Ok(())
@@ -263,26 +264,28 @@ where
         let attestation =
             parlia.get_vote_attestation_from_header(header, snap.epoch_num).map_err(|err| {
                 tracing::error!("Failed to get vote attestation from header, block_number: {}, error: {:?}", header.number(), err);
-                BscBlockExecutionError::ParliaConsensusInnerError { error: err.into() }
+                BscBlockExecutionError::Validation(BscBlockValidationError::ParliaConsensusError { error: err.into() })
             })?;
         if let Some(attestation) = attestation {
             if attestation.extra.len() > MAX_ATTESTATION_EXTRA_LENGTH {
-                return Err(BscBlockExecutionError::TooLargeAttestationExtraLen {
-                    extra_len: MAX_ATTESTATION_EXTRA_LENGTH,
-                }
-                .into());
+                return Err(BscBlockExecutionError::Validation(
+                    BscBlockValidationError::TooLargeAttestationExtraLen {
+                        extra_len: MAX_ATTESTATION_EXTRA_LENGTH,
+                    }
+                ).into());
             }
     
             // the attestation target block should be direct parent.
             let target_block = attestation.data.target_number;
             let target_hash = attestation.data.target_hash;
             if target_block != parent.number() || target_hash != parent.hash_slow() {
-                return Err(BscBlockExecutionError::InvalidAttestationTarget {
-                    block_number: GotExpected { got: target_block, expected: parent.number() },
-                    block_hash: GotExpected { got: target_hash, expected: parent.hash_slow() }
-                        .into(),
-                }
-                .into());
+                return Err(BscBlockExecutionError::Validation(
+                    BscBlockValidationError::InvalidAttestationTarget {
+                        block_number: GotExpected { got: target_block, expected: parent.number() },
+                        block_hash: GotExpected { got: target_hash, expected: parent.hash_slow() }
+                            .into(),
+                    }
+                ).into());
             }
     
             // the attestation source block should be the highest justified block.
@@ -291,12 +294,13 @@ where
             
             let justified = self.get_justified_header(snap)?;
             if source_block != justified.number() || source_hash != justified.hash_slow() {
-                return Err(BscBlockExecutionError::InvalidAttestationSource {
-                    block_number: GotExpected { got: source_block, expected: justified.number() },
-                    block_hash: GotExpected { got: source_hash, expected: justified.hash_slow() }
-                        .into(),
-                }
-                .into());
+                return Err(BscBlockExecutionError::Validation(
+                    BscBlockValidationError::InvalidAttestationSource {
+                        block_number: GotExpected { got: source_block, expected: justified.number() },
+                        block_hash: GotExpected { got: source_hash, expected: justified.hash_slow() }
+                            .into(),
+                    }
+                ).into());
             }
 
             let pre_snap = self
@@ -313,11 +317,12 @@ where
             );
             let bit_set_count = vote_bit_set.len();
             if bit_set_count > validators_count {
-                return Err(BscBlockExecutionError::InvalidAttestationVoteCount(GotExpected {
-                    got: bit_set_count as u64,
-                    expected: validators_count as u64,
-                })
-                .into());
+                return Err(BscBlockExecutionError::Validation(
+                    BscBlockValidationError::InvalidAttestationVoteCount(GotExpected {
+                        got: bit_set_count as u64,
+                        expected: validators_count as u64,
+                    })
+                ).into());
             }
              
             let mut vote_addrs: Vec<VoteAddress> = Vec::with_capacity(bit_set_count);
@@ -336,11 +341,12 @@ where
             // check if voted validator count satisfied 2/3 + 1
             let at_least_votes = (validators_count * 2).div_ceil(3); // ceil division
             if vote_addrs.len() < at_least_votes {
-                return Err(BscBlockExecutionError::InvalidAttestationVoteCount(GotExpected {
-                    got: vote_addrs.len() as u64,
-                    expected: at_least_votes as u64,
-                })
-                .into());
+                return Err(BscBlockExecutionError::Validation(
+                    BscBlockValidationError::InvalidAttestationVoteCount(GotExpected {
+                        got: vote_addrs.len() as u64,
+                        expected: at_least_votes as u64,
+                    })
+                ).into());
             }
  
             // check bls aggregate sig
@@ -377,38 +383,43 @@ where
         let parlia = Parlia::new(Arc::new(self.spec.clone()), 200);
         let proposer = parlia.recover_proposer(header).map_err(|err| {
             tracing::error!("Failed to recover proposer from header, block_number: {}, error: {:?}", header.number(), err);
-            BscBlockExecutionError::ParliaConsensusInnerError { error: err.into() }
+            BscBlockExecutionError::Validation(BscBlockValidationError::ParliaConsensusError { error: err.into() })
         })?;
 
         if proposer != header.beneficiary {
             tracing::error!("Wrong header signer, block_number: {}, proposer: {:?}, expected: {:?}", 
                 header.number(), proposer, header.beneficiary);
             debug_header(header, self.spec.chain().id(), "verify_seal_header");
-            return Err(BscBlockExecutionError::WrongHeaderSigner {
-                block_number: header.number(),
-                signer: GotExpected { got: proposer, expected: header.beneficiary }.into(),
-            }
-            .into());
+            return Err(BscBlockExecutionError::Validation(
+                BscBlockValidationError::WrongHeaderSigner {
+                    block_number: header.number(),
+                    signer: GotExpected { got: proposer, expected: header.beneficiary }.into(),
+                }
+            ).into());
         }
 
         if !snap.validators.contains(&proposer) {
-            return Err(BscBlockExecutionError::SignerUnauthorized { 
-                block_number: header.number(), 
-                proposer 
-            }.into());
+            return Err(BscBlockExecutionError::Validation(
+                BscBlockValidationError::SignerUnauthorized { 
+                    block_number: header.number(), 
+                    proposer 
+                }
+            ).into());
         }
 
         if snap.sign_recently(proposer) {
-            return Err(BscBlockExecutionError::SignerOverLimit { proposer }.into());
+            return Err(BscBlockExecutionError::Validation(
+                BscBlockValidationError::SignerOverLimit { proposer }
+            ).into());
         }
 
         let is_inturn = snap.is_inturn(proposer);
         if (is_inturn && header.difficulty != DIFF_INTURN) ||
             (!is_inturn && header.difficulty != DIFF_NOTURN)
         {
-            return Err(
-                BscBlockExecutionError::InvalidDifficulty { difficulty: header.difficulty }.into()
-            );
+            return Err(BscBlockExecutionError::Validation(
+                BscBlockValidationError::InvalidDifficulty { difficulty: header.difficulty }
+            ).into());
         }
 
         Ok(())
