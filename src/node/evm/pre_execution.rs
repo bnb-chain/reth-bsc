@@ -60,17 +60,13 @@ where
         let block_number = block.number.to::<u64>();
         tracing::trace!("Check new block, block_number: {}", block_number);
 
-        let header = crate::node::evm::util::HEADER_CACHE_READER
-            .lock()
-            .unwrap()
-            .get_header_by_number(block_number)
-            .ok_or(BlockExecutionError::msg("Failed to get header from global header reader"))?;
-        self.inner_ctx.header = Some(header.clone());
+        self.inner_ctx.header = self.ctx.header.clone();
+        let header = self.inner_ctx.header.clone().unwrap();
 
         let parent_header = crate::node::evm::util::HEADER_CACHE_READER
             .lock()
             .unwrap()
-            .get_header_by_number(block_number - 1)
+            .get_header_by_hash(&header.parent_hash())
             .ok_or(BlockExecutionError::msg("Failed to get parent header from global header reader"))?;
         self.inner_ctx.parent_header = Some(parent_header.clone());
 
@@ -78,7 +74,7 @@ where
             .snapshot_provider
             .as_ref()
             .unwrap()
-            .snapshot(block_number-1)
+            .snapshot_by_hash(&header.parent_hash())
             .ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;
         self.inner_ctx.snap = Some(snap.clone());
 
@@ -457,7 +453,7 @@ where
         let parent_header = crate::node::evm::util::HEADER_CACHE_READER
             .lock()
             .unwrap()
-            .get_header_by_number(block.number.to::<u64>() - 1)
+            .get_header_by_hash(&self.ctx.base.parent_hash)
             .ok_or(BlockExecutionError::msg("Failed to get parent header from global header reader"))?;
         self.inner_ctx.parent_header = Some(parent_header.clone());
 
@@ -465,7 +461,7 @@ where
             .snapshot_provider
             .as_ref()
             .unwrap()
-            .snapshot(block.number.to::<u64>() - 1)
+            .snapshot_by_hash(&self.ctx.base.parent_hash)
             .ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;
         self.inner_ctx.snap = Some(snap.clone());
 
