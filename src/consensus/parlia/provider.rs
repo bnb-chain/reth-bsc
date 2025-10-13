@@ -28,6 +28,7 @@ pub trait SnapshotProvider: Send + Sync {
     /// Returns the snapshot that is valid for the given `block_number`.
     fn snapshot(&self, block_number: BlockNumber) -> Option<Snapshot>;
 
+    /// Returns the snapshot that is valid for the given `block_hash`.
     fn snapshot_by_hash(&self, _block_hash: &BlockHash) -> Option<Snapshot> {
         None
     }
@@ -50,7 +51,9 @@ pub trait SnapshotProvider: Send + Sync {
 #[derive(Debug)]
 pub struct DbSnapshotProvider<DB: Database> {
     db: DB,
+    /// Cache for snapshots by block number
     cache: RwLock<LruMap<BlockNumber, Snapshot, ByLength>>,
+    /// Cache for snapshots by block hash
     cache_by_hash: RwLock<LruMap<BlockHash, Snapshot, ByLength>>,
 }
 
@@ -286,7 +289,7 @@ impl<DB: Database + 'static> SnapshotProvider for EnhancedDbSnapshotProvider<DB>
         self.build_snapshot_incrementally(base_snapshot, block_number)
     }
 
-    // todo:
+    // query snapshot by hash, note that it will try to rebuild snapshot if not found.
     fn snapshot_by_hash(&self, block_hash: &BlockHash) -> Option<Snapshot> {
         if let Some(snap) = self.base.snapshot_by_hash(block_hash) {
             return Some(snap);
@@ -372,7 +375,8 @@ impl<DB: Database + 'static> EnhancedDbSnapshotProvider<DB> {
             tracing::warn!("Failed to rebuild snapshot due to not found base snapshot");
             return None;
         }
-        tracing::debug!("try rebuild snapshot, from block: {}, to block: {}, skip block len: {:?}", base_snapshot.clone().unwrap().block_number, target_header.number, skip_block_hashes.len());
+        tracing::debug!("try rebuild snapshot, from block: {}, to block: {}, skip block len: {:?}", 
+            base_snapshot.clone().unwrap().block_number, target_header.number, skip_block_hashes.len());
 
         skip_block_hashes.reverse();
         let mut working_snapshot = base_snapshot.clone().unwrap();
@@ -390,11 +394,16 @@ impl<DB: Database + 'static> EnhancedDbSnapshotProvider<DB> {
                 
             let validators_info = if is_epoch_boundary {
                 let checkpoint_block_number = header.number - miner_check_len;
-                tracing::debug!("Updating validator set at epoch boundary, checkpoint_block: {}, current_block: {}", checkpoint_block_number, header.number);
+                tracing::debug!("Updating validator set at epoch boundary, checkpoint_block: {}, current_block: {}", 
+                    checkpoint_block_number, header.number);
                     
                 if let Some(checkpoint_header) = self.get_header(checkpoint_block_number) {
-                    let parsed = self.parlia.parse_validators_from_header(&checkpoint_header, working_snapshot.epoch_num);
-                    turn_length = self.parlia.get_turn_length_from_header(&checkpoint_header, working_snapshot.epoch_num).map_err(|err| {
+                    let parsed = 
+                        self.parlia.parse_validators_from_header(&checkpoint_header, working_snapshot.epoch_num);
+                    turn_length = 
+                        self.parlia.get_turn_length_from_header(
+                            &checkpoint_header, 
+                            working_snapshot.epoch_num).map_err(|err| {
                         tracing::error!("Failed to get turn length from checkpoint header, block_number: {}, checkpoint_block_number: {}, epoch_num: {}, error: {:?}", 
                             header.number, checkpoint_block_number, working_snapshot.epoch_num, err);
                         err
@@ -413,7 +422,8 @@ impl<DB: Database + 'static> EnhancedDbSnapshotProvider<DB> {
 
             let new_validators = validators_info.consensus_addrs;
             let vote_addrs = validators_info.vote_addrs;
-            let attestation = self.parlia.get_vote_attestation_from_header(header.as_ref(), working_snapshot.epoch_num).map_err(|err| {
+            let attestation = 
+                self.parlia.get_vote_attestation_from_header(header.as_ref(), working_snapshot.epoch_num).map_err(|err| {
                 tracing::error!("Failed to get vote attestation from header, block_number: {}, epoch_num: {}, error: {:?}", 
                     header.number, working_snapshot.epoch_num, err);
                 err
