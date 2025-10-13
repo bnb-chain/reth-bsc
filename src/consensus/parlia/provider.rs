@@ -287,6 +287,26 @@ impl<DB: Database + 'static> SnapshotProvider for EnhancedDbSnapshotProvider<DB>
     }
 
     // todo:
+    fn snapshot_by_hash(&self, block_hash: &BlockHash) -> Option<Snapshot> {
+        if let Some(snap) = self.base.snapshot_by_hash(block_hash) {
+            return Some(snap);
+        } else {
+            if let Some(target_header) = self.get_header_by_hash(block_hash) {
+                if target_header.number == 0 {
+                    return self.init_genesis_snapshot(&target_header);
+                }
+                let snap= self.try_rebuild(&target_header);
+                if snap.is_some() {
+                    self.base.cache.write().insert(target_header.number, snap.clone().unwrap());
+                    self.base.cache_by_hash.write().insert(target_header.hash_slow(), snap.clone().unwrap());
+                }
+                return snap;
+            } else {
+                tracing::warn!("Failed to query snapshot by hash due to not found header, block_hash: {}", block_hash);
+                None
+            }
+        }
+    }
 
     fn insert(&self, snapshot: Snapshot) {
         self.base.insert(snapshot);
@@ -306,6 +326,124 @@ impl<DB: Database + 'static> SnapshotProvider for EnhancedDbSnapshotProvider<DB>
 }
 
 impl<DB: Database + 'static> EnhancedDbSnapshotProvider<DB> {
+    fn init_genesis_snapshot(&self, genesis_header: &alloy_consensus::Header) -> Option<Snapshot> {
+        let ValidatorsInfo { consensus_addrs, vote_addrs } =
+            self.parlia.parse_validators_from_header(
+                &genesis_header, 
+                self.parlia.epoch)
+                .map_err(|err| {
+                    BscBlockExecutionError::Validation(BscBlockValidationError::ParliaConsensusError { error: err.into() })
+                })
+                .ok()?;
+        let genesis_snapshot = Snapshot::new(
+            consensus_addrs,
+            0,
+            genesis_header.hash_slow(),
+            self.parlia.epoch,
+            vote_addrs,
+        );
+        self.base.insert(genesis_snapshot.clone());
+        return Some(genesis_snapshot);
+    }
+
+    fn try_rebuild(&self, target_header: &alloy_consensus::Header) -> Option<Snapshot> {
+        let mut skip_block_hashes = Vec::new();
+         let base_snapshot = {
+            let mut parent_block_hash = target_header.parent_hash;
+            skip_block_hashes.push(target_header.hash_slow());
+            loop {
+                let parent_header = self.get_header_by_hash(&parent_block_hash);
+                if parent_header.is_none() {
+                    tracing::warn!("Failed to query snapshot by hash due to not found header, block_hash: {}", parent_block_hash);
+                    break None;
+                }
+                if parent_header.clone().unwrap().number == 0 {
+                    self.init_genesis_snapshot(parent_header.as_ref().unwrap());
+                }
+                if let Some(snap) = self.base.snapshot_by_hash(&parent_block_hash) {
+                    break Some(snap);
+                }
+                skip_block_hashes.push(parent_block_hash);
+                tracing::debug!("Succeed to walk to parent block, parent_block_number: {}", parent_header.clone().unwrap().number);
+                parent_block_hash = parent_header.clone().unwrap().parent_hash;
+            }
+        };
+        if base_snapshot.is_none() {
+            tracing::warn!("Failed to rebuild snapshot due to not found base snapshot");
+            return None;
+        }
+        tracing::debug!("try rebuild snapshot, from block: {}, to block: {}, skip block len: {:?}", base_snapshot.clone().unwrap().block_number, target_header.number, skip_block_hashes.len());
+
+        skip_block_hashes.reverse();
+        let mut working_snapshot = base_snapshot.clone().unwrap();
+        for block_hash in skip_block_hashes {
+            let apply_header = self.get_header_by_hash(&block_hash);
+            if apply_header.is_none() {
+                tracing::warn!("Failed to query snapshot by hash due to not found header, block_hash: {}", block_hash);
+                return None;
+            }
+            let header = apply_header.unwrap();
+            let epoch_remainder = header.number % working_snapshot.epoch_num;
+            let miner_check_len = working_snapshot.miner_history_check_len();
+            let is_epoch_boundary = header.number > 0 && epoch_remainder == miner_check_len;
+            let mut turn_length = None;
+                
+            let validators_info = if is_epoch_boundary {
+                let checkpoint_block_number = header.number - miner_check_len;
+                tracing::debug!("Updating validator set at epoch boundary, checkpoint_block: {}, current_block: {}", checkpoint_block_number, header.number);
+                    
+                if let Some(checkpoint_header) = self.get_header(checkpoint_block_number) {
+                    let parsed = self.parlia.parse_validators_from_header(&checkpoint_header, working_snapshot.epoch_num);
+                    turn_length = self.parlia.get_turn_length_from_header(&checkpoint_header, working_snapshot.epoch_num).map_err(|err| {
+                        tracing::error!("Failed to get turn length from checkpoint header, block_number: {}, checkpoint_block_number: {}, epoch_num: {}, error: {:?}", 
+                            header.number, checkpoint_block_number, working_snapshot.epoch_num, err);
+                        err
+                    }).ok()?;
+                    parsed
+                } else {
+                    tracing::error!("Failed to find checkpoint header for block {}", checkpoint_block_number);
+                    return None;
+                }
+            } else {
+                Ok(ValidatorsInfo {
+                    consensus_addrs: Vec::new(),
+                    vote_addrs: None,
+                })
+            }.ok()?;
+
+            let new_validators = validators_info.consensus_addrs;
+            let vote_addrs = validators_info.vote_addrs;
+            let attestation = self.parlia.get_vote_attestation_from_header(header.as_ref(), working_snapshot.epoch_num).map_err(|err| {
+                tracing::error!("Failed to get vote attestation from header, block_number: {}, epoch_num: {}, error: {:?}", 
+                    header.number, working_snapshot.epoch_num, err);
+                err
+            }).ok()?;
+
+            // Apply header to snapshot
+            working_snapshot = match working_snapshot.apply(
+                header.beneficiary,
+                header.as_ref(),
+                new_validators,
+                vote_addrs,
+                attestation,
+                turn_length,
+                &*self.chain_spec,
+            ) {
+                Some(snap) => snap,
+                None => {
+                    tracing::warn!("Failed to apply header {} to snapshot", header.number);
+                    return None;
+                }
+            };
+
+            // rebuild snapshot is not refresh cache.
+            if working_snapshot.block_number.is_multiple_of(crate::consensus::parlia::snapshot::CHECKPOINT_INTERVAL) {
+                self.base.persist_to_db(&working_snapshot).ok()?;
+            }
+        }
+        Some(working_snapshot)
+    }
+
     /// Build snapshot incrementally to avoid OOM by processing headers in small chunks
     fn build_snapshot_incrementally(&self, base_snapshot: Snapshot, target_block: u64) -> Option<Snapshot> {
         const CHUNK_SIZE: u64 = 1024; // Process headers in chunks to avoid OOM
