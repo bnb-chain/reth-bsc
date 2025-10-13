@@ -73,7 +73,8 @@ where
 
     /// BSC-specific assemble_block method that accepts BscBlockAssemblerInput.
     /// This method is completely aligned with the standard assemble_block implementation.
-    pub fn assemble_block_bsc(&self, input: BscBlockAssemblerInput<'_, '_, BscBlockExecutorFactory>) -> Result<crate::node::primitives::BscBlock, BlockExecutionError>
+    pub fn assemble_block_bsc(&self, input: BscBlockAssemblerInput<'_, '_, BscBlockExecutorFactory>) -> 
+        Result<crate::node::primitives::BscBlock, BlockExecutionError>
     {
         let BscBlockAssemblerInput {
             evm_env,
@@ -151,13 +152,13 @@ where
             let parent_header = crate::node::evm::util::HEADER_CACHE_READER
                 .lock()
                 .unwrap()
-                .get_header_by_number(header.number - 1)
+                .get_header_by_hash(&header.parent_hash)
                 .ok_or(BlockExecutionError::msg("Failed to get header from global header reader"))?;
             let parent_snap = self
                 .snapshot_provider
                 .as_ref()
                 .unwrap()
-                .snapshot(header.number - 1)
+                .snapshot_by_hash(&header.parent_hash)
                 .ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;
             if let Err(e) = crate::node::miner::util::finalize_new_header(
                 self.parlia.clone(), 
@@ -277,13 +278,13 @@ where
             let parent_header = crate::node::evm::util::HEADER_CACHE_READER
                 .lock()
                 .unwrap()
-                .get_header_by_number(header.number - 1)
+                .get_header_by_hash(&header.parent_hash)
                 .ok_or(BlockExecutionError::msg("Failed to get header from global header reader"))?;
             let parent_snap = self
                 .snapshot_provider
                 .as_ref()
                 .unwrap()
-                .snapshot(header.number - 1)
+                .snapshot_by_hash(&header.parent_hash)
                 .ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;
             if let Err(e) = crate::node::miner::util::finalize_new_header(
                 self.parlia.clone(), 

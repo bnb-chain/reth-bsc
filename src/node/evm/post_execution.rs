@@ -434,11 +434,11 @@ where
         parent_header: &Header,
         accumulated_weights: &mut std::collections::HashMap<Address, U256>,
     ) -> Result<(), BlockExecutionError> {
-        let justified_header = self.snapshot_provider.as_ref().unwrap().get_header(attestation.data.target_number)
+        let justified_header = self.snapshot_provider.as_ref().unwrap().get_header_by_hash(&attestation.data.target_hash)
             .ok_or_else(|| BlockExecutionError::msg(format!("Header not found for block number: {}", attestation.data.target_number)))?;
-        let parent = self.snapshot_provider.as_ref().unwrap().get_header(justified_header.number - 1)
+        let parent = self.snapshot_provider.as_ref().unwrap().get_header_by_hash(&justified_header.parent_hash)
             .ok_or_else(|| BlockExecutionError::msg(format!("Header not found for block number: {}", justified_header.number - 1)))?;
-        let snapshot = self.snapshot_provider.as_ref().unwrap().snapshot(parent.number);
+        let snapshot = self.snapshot_provider.as_ref().unwrap().snapshot_by_hash(&parent.hash_slow());
         let validators = &snapshot.unwrap().validators;  
         let mut validators_bit_set = BitSet::new();
         let vote_address_set = attestation.vote_address_set;
