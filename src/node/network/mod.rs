@@ -206,7 +206,8 @@ impl BscNetworkBuilder {
         let (to_import, from_network) = mpsc::unbounded_channel();
         let (to_network, import_outcome) = mpsc::unbounded_channel();
 
-        let handle = ImportHandle::new(to_import.clone(), import_outcome);
+        let (to_hashes, from_hashes) = mpsc::unbounded_channel();
+        let handle = ImportHandle::new(to_import.clone(), to_hashes, import_outcome);
 
         // Expose the sender globally so that the miner can submit newly mined blocks
         if crate::shared::set_block_import_sender(to_import.clone()).is_err() {
@@ -233,7 +234,7 @@ impl BscNetworkBuilder {
                 .await
                 .unwrap();
 
-            ImportService::new(consensus, handle, from_network, to_network).await.unwrap();
+            ImportService::new(consensus, handle, from_network, from_hashes, to_network).await.unwrap();
         });
 
         let network_builder = network_builder

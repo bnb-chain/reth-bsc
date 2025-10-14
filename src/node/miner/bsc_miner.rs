@@ -21,12 +21,12 @@ use reth_ethereum_payload_builder::EthereumBuilderConfig;
 use reth_payload_primitives::BuiltPayload;
 use reth_primitives::{SealedBlock, TransactionSigned};
 use reth_provider::{BlockNumReader, HeaderProvider, CanonStateSubscriptions, CanonStateNotification};
+use reth_tasks::TaskExecutor;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tracing::{debug, error, info, warn};
-use reth_tasks::TaskExecutor;
 use reth_basic_payload_builder::{BuildArguments, PayloadConfig};
 use reth::payload::EthPayloadBuilderAttributes;
 use reth_revm::cancelled::CancelOnDrop;
@@ -77,20 +77,17 @@ where
 
     pub async fn run(self) {
         info!("Succeed to spawn new work worker, address: {}", self.validator_address);
+        
         let mut notifications = self.provider.canonical_state_stream();
         
         loop {
-            tokio::select! {
-                notification = notifications.next() => {
-                    match notification {
-                        Some(event) => {
-                            self.try_new_work(event.clone()).await;
-                        }
-                        None => {
-                            warn!("Canonical state notification stream ended, exiting...");
-                            break;
-                        }
-                    }
+            match notifications.next().await {
+                Some(event) => {
+                    self.try_new_work(event.clone()).await;
+                }
+                None => {
+                    warn!("Canonical state notification stream ended, exiting...");
+                    break;
                 }
             }
         }
@@ -112,7 +109,7 @@ where
             return;
         }
         
-        let parent_header = match self.provider.sealed_header(tip.number()) {
+        let parent_header = match self.provider.sealed_header_by_hash(tip.hash()) {
             Ok(Some(header)) => header,
             Ok(None) => {
                 debug!("Skip to mine new block due to head block header not found, validator: {}, tip: {}", self.validator_address, tip.number());
@@ -124,7 +121,7 @@ where
             }
         };
 
-        let parent_snapshot = match self.snapshot_provider.snapshot(tip.number()) {
+        let parent_snapshot = match self.snapshot_provider.snapshot_by_hash(&tip.hash()) {
             Some(snapshot) => snapshot,
             None => {
                 debug!("Skip to mine new block due to no snapshot available, validator: {}, tip: {}", self.validator_address, tip.number());
@@ -143,6 +140,7 @@ where
         }
         
         // TODO: remove it later, now just for easy to debug.
+        // TODO: support backoff if not inturn.
         if !parent_snapshot.is_inturn(self.validator_address) {
             debug!("Skip to produce due to is not inturn, validator: {}, tip: {}", self.validator_address, tip.number());
             return;
@@ -206,16 +204,24 @@ where
     pub async fn run(mut self) {
         info!("Succeed to spawn main work worker, address: {}", self.validator_address);
         
-        while let Some(mining_ctx) = self.mining_queue_rx.recv().await {
-            let next_block = mining_ctx.parent_header.number() + 1;
-            debug!("Received mining context, next_block: {}", next_block);
+        loop {
+            match self.mining_queue_rx.recv().await {
+                Some(ctx) => {
+                    let next_block = ctx.parent_header.number() + 1;
+                    debug!("Received mining context, next_block: {}", next_block);
 
-             match self.try_mine_block(mining_ctx).await {
-                Ok(()) => {
-                    debug!("Succeed to mine block, next_block: {}", next_block);
+                    match self.try_mine_block(ctx).await {
+                        Ok(()) => {
+                            debug!("Succeed to mine block, next_block: {}", next_block);
+                        }
+                        Err(e) => {
+                            error!("Failed to mine block due to {}, next_block: {}", e, next_block);
+                        }
+                    }
                 }
-                Err(e) => {
-                    error!("Failed to mine block due to {}, next_block: {}", e, next_block);
+                None => {
+                    warn!("Mining queue closed, exiting main work worker");
+                    break;
                 }
             }
         }
@@ -321,9 +327,9 @@ where
 pub struct BscMiner<Pool, Provider> {
     validator_address: Address,
     signing_key: SigningKey,
-    task_executor: TaskExecutor,
     new_work_worker: NewWorkWorker<Provider>,
     main_work_worker: MainWorkWorker<Pool, Provider>,
+    task_executor: TaskExecutor,
 }
 
 impl<Pool, Provider> BscMiner<Pool, Provider>
@@ -393,9 +399,9 @@ where
         let miner = Self {
             validator_address,
             signing_key,
-            task_executor: task_executor.clone(),
             new_work_worker,
             main_work_worker,
+            task_executor,
         };
         info!("Succeed to new miner, address: {}", validator_address);
         Ok(miner)
@@ -409,10 +415,10 @@ where
         } else {
             info!("Succeed to initialize global signer");
         }
-        self.spawn_workers().await
+        self.spawn_workers()
     }
 
-    async fn spawn_workers(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    fn spawn_workers(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.task_executor.spawn_critical("new_work_worker", self.new_work_worker.run());
         self.task_executor.spawn_critical("main_work_worker", self.main_work_worker.run());
         info!("Succeed to start mining, address: {}", self.validator_address);

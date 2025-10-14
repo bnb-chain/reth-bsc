@@ -348,10 +348,10 @@ impl<DB: Database + 'static> EnhancedDbSnapshotProvider<DB> {
     }
 
     fn try_rebuild(&self, target_header: &alloy_consensus::Header) -> Option<Snapshot> {
-        let mut skip_block_hashes = Vec::new();
+        let mut rebuild_block_hashes = Vec::new();
          let base_snapshot = {
             let mut parent_block_hash = target_header.parent_hash;
-            skip_block_hashes.push(target_header.hash_slow());
+            rebuild_block_hashes.push(target_header.hash_slow());
             loop {
                 let parent_header = self.get_header_by_hash(&parent_block_hash);
                 if parent_header.is_none() {
@@ -364,7 +364,7 @@ impl<DB: Database + 'static> EnhancedDbSnapshotProvider<DB> {
                 if let Some(snap) = self.base.snapshot_by_hash(&parent_block_hash) {
                     break Some(snap);
                 }
-                skip_block_hashes.push(parent_block_hash);
+                rebuild_block_hashes.push(parent_block_hash);
                 tracing::debug!("Succeed to walk to parent block, parent_block_number: {}", parent_header.clone().unwrap().number);
                 parent_block_hash = parent_header.clone().unwrap().parent_hash;
             }
@@ -373,12 +373,12 @@ impl<DB: Database + 'static> EnhancedDbSnapshotProvider<DB> {
             tracing::warn!("Failed to rebuild snapshot due to not found base snapshot");
             return None;
         }
-        tracing::debug!("try rebuild snapshot, from block: {}, to block: {}, skip block len: {:?}", 
-            base_snapshot.clone().unwrap().block_number, target_header.number, skip_block_hashes.len());
+        tracing::debug!("try rebuild snapshot, from block: {}, to block: {}, rebuild block len: {:?}", 
+            base_snapshot.clone().unwrap().block_number, target_header.number, rebuild_block_hashes.len());
 
-        skip_block_hashes.reverse();
+        rebuild_block_hashes.reverse();
         let mut working_snapshot = base_snapshot.clone().unwrap();
-        for block_hash in skip_block_hashes {
+        for block_hash in rebuild_block_hashes {
             let apply_header = self.get_header_by_hash(&block_hash);
             if apply_header.is_none() {
                 tracing::warn!("Failed to query snapshot by hash due to not found header, block_hash: {}", block_hash);

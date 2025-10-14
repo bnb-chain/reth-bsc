@@ -20,6 +20,9 @@ use reth_payload_primitives::{BuiltPayload, EngineApiMessageVersion, PayloadType
 use reth_primitives::NodePrimitives;
 use reth_primitives_traits::{AlloyBlockHeader, Block};
 use reth_provider::{BlockHashReader, BlockNumReader};
+use reth_eth_wire_types::broadcast::NewBlockHashes;
+use reth_eth_wire::{GetBlockHeaders, BlockHashNumber};
+use reth_network::{NetworkHandle, message::{PeerResponse, BlockRequest}, FetchClient};
 use std::{
     future::Future,
     pin::Pin,
@@ -43,6 +46,9 @@ type ImportFut = Pin<Box<dyn Future<Output = Option<Outcome>> + Send + Sync>>;
 /// Channel message type for incoming blocks
 pub(crate) type IncomingBlock = (BlockMsg, PeerId);
 
+/// Channel message type for incoming block hashes
+pub(crate) type IncomingHashes = (NewBlockHashes, PeerId);
+
 /// Size of the LRU cache for processed blocks.
 const LRU_PROCESSED_BLOCKS_SIZE: u32 = 100;
 
@@ -59,6 +65,8 @@ where
     consensus: Arc<ParliaConsensus<Provider>>,
     /// Receive the new block from the network
     from_network: UnboundedReceiver<IncomingBlock>,
+    /// Receive block hashes from the network for downloading
+    from_hashes: UnboundedReceiver<IncomingHashes>,
     /// Send the event of the import to the network
     to_network: UnboundedSender<ImportEvent>,
     /// Pending block imports.
@@ -76,12 +84,14 @@ where
         consensus: Arc<ParliaConsensus<Provider>>,
         engine: BeaconConsensusEngineHandle<BscPayloadTypes>,
         from_network: UnboundedReceiver<IncomingBlock>,
+        from_hashes: UnboundedReceiver<IncomingHashes>,
         to_network: UnboundedSender<ImportEvent>,
     ) -> Self {
         Self {
             engine,
             consensus,
             from_network,
+            from_hashes,
             to_network,
             pending_imports: FuturesUnordered::new(),
             processed_blocks: LruCache::new(LRU_PROCESSED_BLOCKS_SIZE),
@@ -165,6 +175,58 @@ where
         let fcu_fut = self.update_fork_choice(block, peer_id);
         self.pending_imports.push(fcu_fut);
     }
+
+    /// Handle incoming block hashes by using Reth's proven download mechanism
+    fn on_new_block_hashes(&mut self, hashes: NewBlockHashes, peer_id: PeerId) {
+        let hash_numbers = hashes.0.clone();
+        
+        for hash_number in hash_numbers {
+            if self.processed_blocks.contains(&hash_number.hash) {
+                continue;
+            }
+
+            tracing::trace!(
+                target: "bsc::block_import",
+                peer_id = %peer_id,
+                block_hash = %hash_number.hash,
+                block_number = hash_number.number,
+                "Requesting block download by simulating FCU for NewBlockHashes"
+            );
+
+            let forkchoice_state = ForkchoiceState {
+                head_block_hash: hash_number.hash,
+                safe_block_hash: hash_number.hash, 
+                finalized_block_hash: hash_number.hash,
+            };
+
+            let engine = self.engine.clone();
+            let block_hash = hash_number.hash;
+            let download_fut = Box::pin(async move {
+                match engine.fork_choice_updated(forkchoice_state, None, EngineApiMessageVersion::V1).await {
+                    Ok(result) => {
+                        tracing::debug!(
+                            target: "bsc::block_import",
+                            block_hash = %block_hash,
+                            status = ?result.payload_status.status,
+                            "FCU result for missing block download"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "bsc::block_import", 
+                            block_hash = %block_hash,
+                            error = %err,
+                            "Failed to trigger block download via FCU"
+                        );
+                    }
+                }
+                None
+            });
+
+            self.pending_imports.push(download_fut);
+            self.processed_blocks.insert(hash_number.hash);
+        }
+    }
 }
 
 impl<Provider> Future for ImportService<Provider>
@@ -179,6 +241,11 @@ where
         // Receive new blocks from network
         while let Poll::Ready(Some((block, peer_id))) = this.from_network.poll_recv(cx) {
             this.on_new_block(block, peer_id);
+        }
+
+        // Receive new block hashes from network
+        while let Poll::Ready(Some((hashes, peer_id))) = this.from_hashes.poll_recv(cx) {
+            this.on_new_block_hashes(hashes, peer_id);
         }
 
         // Process completed imports and send events to network
@@ -393,11 +460,18 @@ mod tests {
             handle_engine_msg(from_engine, responses).await;
 
             let (to_import, from_network) = mpsc::unbounded_channel();
+            let (to_hashes, from_hashes) = mpsc::unbounded_channel();
             let (to_network, import_outcome) = mpsc::unbounded_channel();
 
-            let handle = ImportHandle::new(to_import, import_outcome);
+            let handle = ImportHandle::new(to_import, to_hashes, import_outcome);
 
-            let service = ImportService::new(consensus, engine_handle, from_network, to_network);
+            let service = ImportService::new(
+                consensus, 
+                engine_handle, 
+                from_network, 
+                from_hashes,
+                to_network
+            );
             tokio::spawn(Box::pin(async move {
                 service.await.unwrap();
             }));
