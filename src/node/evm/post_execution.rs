@@ -435,9 +435,9 @@ where
         accumulated_weights: &mut std::collections::HashMap<Address, U256>,
     ) -> Result<(), BlockExecutionError> {
         let justified_header = self.snapshot_provider.as_ref().unwrap().get_header_by_hash(&attestation.data.target_hash)
-            .ok_or_else(|| BlockExecutionError::msg(format!("Header not found for block number: {}", attestation.data.target_number)))?;
+            .ok_or_else(|| BlockExecutionError::msg(format!("Header not found, block_hash: {}", attestation.data.target_hash)))?;
         let parent = self.snapshot_provider.as_ref().unwrap().get_header_by_hash(&justified_header.parent_hash)
-            .ok_or_else(|| BlockExecutionError::msg(format!("Header not found for block number: {}", justified_header.number - 1)))?;
+            .ok_or_else(|| BlockExecutionError::msg(format!("Header not found, block_hash: {}", justified_header.parent_hash)))?;
         let snapshot = self.snapshot_provider.as_ref().unwrap().snapshot_by_hash(&parent.hash_slow());
         let validators = &snapshot.unwrap().validators;  
         let mut validators_bit_set = BitSet::new();

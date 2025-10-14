@@ -90,8 +90,8 @@ where
             let pool_clone = pool.clone();
             let provider_clone = ctx.provider().clone();
             let chain_spec_clone = Arc::new(ctx.config().chain.clone().as_ref().clone());
-
             let task_executor_clone = ctx.task_executor().clone();
+            
             ctx.task_executor().spawn_critical("bsc-miner-initializer", async move {
                 info!("Waiting for consensus module to initialize snapshot provider...");
                 let mut attempts = 0;

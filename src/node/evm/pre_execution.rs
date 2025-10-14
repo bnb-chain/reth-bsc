@@ -66,7 +66,7 @@ where
         let parent_header = crate::node::evm::util::HEADER_CACHE_READER
             .lock()
             .unwrap()
-            .get_header_by_hash(&header.parent_hash())
+            .get_header_by_hash(&header.parent_hash)
             .ok_or(BlockExecutionError::msg("Failed to get parent header from global header reader"))?;
         self.inner_ctx.parent_header = Some(parent_header.clone());
 
@@ -74,7 +74,7 @@ where
             .snapshot_provider
             .as_ref()
             .unwrap()
-            .snapshot_by_hash(&header.parent_hash())
+            .snapshot_by_hash(&header.parent_hash)
             .ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;
         self.inner_ctx.snap = Some(snap.clone());
 

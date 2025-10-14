@@ -77,7 +77,6 @@ where
 
     pub async fn run(self) {
         info!("Succeed to spawn new work worker, address: {}", self.validator_address);
-        
         let mut notifications = self.provider.canonical_state_stream();
         
         loop {
