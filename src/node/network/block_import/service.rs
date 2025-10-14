@@ -176,7 +176,7 @@ where
         self.pending_imports.push(fcu_fut);
     }
 
-    /// Handle incoming block hashes by using Reth's proven download mechanism
+    /// Handle incoming block hashes by using Reth engine-tree download mechanism
     fn on_new_block_hashes(&mut self, hashes: NewBlockHashes, peer_id: PeerId) {
         let hash_numbers = hashes.0.clone();
         
