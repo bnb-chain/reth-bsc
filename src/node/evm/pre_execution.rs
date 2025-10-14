@@ -81,7 +81,7 @@ where
         self.verify_cascading_fields(&header, &parent_header, &snap)?;
 
         let epoch_length = self.parlia.get_epoch_length(&header);
-        if header.number % epoch_length == 0 {
+        if header.number.is_multiple_of(epoch_length) {
             let (validator_set, vote_addresses) = self.get_current_validators(header.number-1 /*mostly in cache*/)?;
             tracing::debug!("validator_set: {:?}, vote_addresses: {:?}", validator_set, vote_addresses);
             

@@ -292,22 +292,20 @@ impl<DB: Database + 'static> SnapshotProvider for EnhancedDbSnapshotProvider<DB>
     // query snapshot by hash, note that it will try to rebuild snapshot if not found.
     fn snapshot_by_hash(&self, block_hash: &BlockHash) -> Option<Snapshot> {
         if let Some(snap) = self.base.snapshot_by_hash(block_hash) {
-            return Some(snap);
-        } else {
-            if let Some(target_header) = self.get_header_by_hash(block_hash) {
-                if target_header.number == 0 {
-                    return self.init_genesis_snapshot(&target_header);
-                }
-                let snap= self.try_rebuild(&target_header);
-                if snap.is_some() {
-                    self.base.cache.write().insert(target_header.number, snap.clone().unwrap());
-                    self.base.cache_by_hash.write().insert(target_header.hash_slow(), snap.clone().unwrap());
-                }
-                return snap;
-            } else {
-                tracing::warn!("Failed to query snapshot by hash due to not found header, block_hash: {}", block_hash);
-                None
+            Some(snap)
+        } else if let Some(target_header) = self.get_header_by_hash(block_hash) {
+            if target_header.number == 0 {
+                return self.init_genesis_snapshot(&target_header);
             }
+            let snap= self.try_rebuild(&target_header);
+            if snap.is_some() {
+                self.base.cache.write().insert(target_header.number, snap.clone().unwrap());
+                self.base.cache_by_hash.write().insert(target_header.hash_slow(), snap.clone().unwrap());
+            }
+            snap
+        } else {
+            tracing::warn!("Failed to query snapshot by hash due to not found header, block_hash: {}", block_hash);
+            None
         }
     }
 
@@ -332,7 +330,7 @@ impl<DB: Database + 'static> EnhancedDbSnapshotProvider<DB> {
     fn init_genesis_snapshot(&self, genesis_header: &alloy_consensus::Header) -> Option<Snapshot> {
         let ValidatorsInfo { consensus_addrs, vote_addrs } =
             self.parlia.parse_validators_from_header(
-                &genesis_header, 
+                genesis_header, 
                 self.parlia.epoch)
                 .map_err(|err| {
                     BscBlockExecutionError::Validation(BscBlockValidationError::ParliaConsensusError { error: err.into() })
@@ -346,7 +344,7 @@ impl<DB: Database + 'static> EnhancedDbSnapshotProvider<DB> {
             vote_addrs,
         );
         self.base.insert(genesis_snapshot.clone());
-        return Some(genesis_snapshot);
+        Some(genesis_snapshot)
     }
 
     fn try_rebuild(&self, target_header: &alloy_consensus::Header) -> Option<Snapshot> {
