@@ -13,14 +13,15 @@ use crate::{
     BscBlock,
 };
 use alloy_consensus::BlockHeader;
-use alloy_primitives::{Address, B256};
+use alloy_primitives::{Address, B256, Sealable};
 use k256::ecdsa::SigningKey;
 use reth::transaction_pool::PoolTransaction;
 use reth::transaction_pool::TransactionPool;
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
 use reth_payload_primitives::BuiltPayload;
 use reth_primitives::{SealedBlock, TransactionSigned};
-use reth_provider::{BlockNumReader, HeaderProvider, CanonStateSubscriptions, CanonStateNotification};
+use reth_primitives_traits::SealedHeader;
+use reth_provider::{BlockNumReader, HeaderProvider, CanonStateSubscriptions};
 use reth_tasks::TaskExecutor;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -77,12 +78,26 @@ where
 
     pub async fn run(self) {
         info!("Succeed to spawn new work worker, address: {}", self.validator_address);
-        let mut notifications = self.provider.canonical_state_stream();
         
+        if let Some(tip_header) = self.get_tip_header_at_startup() {
+            debug!("try to mine block at startup, block_number: {}", tip_header.number() + 1);
+            self.try_new_work(&tip_header).await;
+        }
+        
+        let mut notifications = self.provider.canonical_state_stream();
         loop {
             match notifications.next().await {
                 Some(event) => {
-                    self.try_new_work(event.clone()).await;
+                    // todo: refine it as pre cache to speedup, committed.execution_outcome().
+                    let committed = event.committed();
+                    let tip = committed.tip();
+                    debug!(
+                        "try new work, tip_block={}, committed_blocks={}",
+                        committed.tip().number(),
+                        committed.len()
+                    );
+                    let tip_header = tip.clone_sealed_header();
+                    self.try_new_work(&tip_header).await;
                 }
                 None => {
                     warn!("Canonical state notification stream ended, exiting...");
@@ -92,16 +107,16 @@ where
         }
     }
 
-    async fn try_new_work(&self, new_state: CanonStateNotification<Provider::Primitives>) {
-        // todo: refine it as pre cache to speedup, committed.execution_outcome().
-        let committed = new_state.committed();
-        let tip = committed.tip();
-        debug!(
-            "try new work, tip_block={}, committed_blocks={}",
-            committed.tip().number(),
-            committed.len()
-        );
-        
+    fn get_tip_header_at_startup(&self) -> Option<reth_primitives::SealedHeader> {
+        let best_number = self.provider.best_block_number().ok()?;
+        let tip_header = self.provider.sealed_header(best_number).ok()??;
+        Some(tip_header)
+    }
+
+    async fn try_new_work<H>(&self, tip: &SealedHeader<H>) 
+    where
+        H: alloy_consensus::BlockHeader + Sealable,
+    {
         // todo: refine check is_syncing status.
         if tip.timestamp() < SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() - 3 {
             debug!("Skip to mine new block due to maybe in syncing, validator: {}, tip: {}", self.validator_address, tip.number());
