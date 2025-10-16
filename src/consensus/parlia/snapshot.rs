@@ -30,6 +30,7 @@ pub const MAXWELL_TURN_LENGTH: u8 = 16;
 pub const DEFAULT_BLOCK_INTERVAL: u64 = 3000;   // 3000 ms
 pub const LORENTZ_BLOCK_INTERVAL: u64 = 1500;   // 1500 ms
 pub const MAXWELL_BLOCK_INTERVAL: u64 = 750;   //  750 ms
+pub const FERMI_BLOCK_INTERVAL: u64 = 450;   //  450 ms
 
 /// `ValidatorInfo` holds metadata for a validator at a given epoch.
 #[derive(Debug, Default, PartialEq, Eq, Clone, Serialize, Deserialize)]
@@ -185,7 +186,10 @@ impl Snapshot {
         }
 
         let is_lorentz_active = chain_spec.is_lorentz_active_at_timestamp(header_number, header_timestamp);
-        if is_maxwell_active {
+        let is_fermi_active = chain_spec.is_fermi_active_at_timestamp(header_number, header_timestamp);
+        if is_fermi_active {
+            snap.block_interval = FERMI_BLOCK_INTERVAL;
+        } else if is_maxwell_active {
             snap.block_interval = MAXWELL_BLOCK_INTERVAL;
         } else if is_lorentz_active {
             snap.block_interval = LORENTZ_BLOCK_INTERVAL;
