@@ -1,4 +1,6 @@
 use alloy_primitives::U256;
+use crate::chainspec::BscChainSpec;
+use crate::consensus::parlia::{Parlia, DEFAULT_MIN_GAS_TIP};
 use crate::node::engine::BscBuiltPayload;
 use crate::node::evm::config::BscEvmConfig;
 use reth_provider::StateProviderFactory;
@@ -25,7 +27,6 @@ use reth_payload_primitives::PayloadBuilderAttributes;
 use alloy_consensus::{Transaction, BlockHeader};
 use reth_primitives_traits::{SignerRecoverable, BlockBody};
 use tracing::warn;
-use crate::chainspec::{BscChainSpec};
 use reth::transaction_pool::error::Eip4844PoolTransactionError;
 use crate::node::primitives::BscBlobTransactionSidecar;
 use std::collections::HashMap;
@@ -43,7 +44,10 @@ pub struct BscPayloadBuilder<Pool, Client, EvmConfig = BscEvmConfig> {
     evm_config: EvmConfig,
     /// Payload builder configuration, now reuse eth builder config.
     builder_config: EthereumBuilderConfig,
-    /// Bsc chain spec.
+    /// Parlia consensus instance
+    parlia: Arc<Parlia<BscChainSpec>>,
+    // todo: aborted build task by new header.
+
     chain_spec: Arc<BscChainSpec>,
 }
 
@@ -60,8 +64,9 @@ where
         evm_config: EvmConfig,
         builder_config: EthereumBuilderConfig,
         chain_spec: Arc<BscChainSpec>,
+        parlia: Arc<Parlia<BscChainSpec>>,
     ) -> Self {
-        Self { client, pool, evm_config, builder_config, chain_spec }
+        Self { client, pool, evm_config, builder_config, chain_spec, parlia }
     }
 
     // todo: check more and refine it later.
@@ -73,6 +78,29 @@ where
         let state = StateProviderDatabase::new(&state_provider);
         let mut db = State::builder().with_database(cached_reads.as_db_mut(state)).with_bundle_update().build();
         
+        //TODO: override the basefee and gaslimit after london fork.
+        //TODO: set default header extra with Reth version.
+		// extra, _ = rlp.EncodeToBytes([]interface{}{
+		// 	uint(gethversion.Major<<16 | gethversion.Minor<<8 | gethversion.Patch),
+		// 	"geth",
+		// 	runtime.Version(),
+		// 	runtime.GOOS,
+		// })
+        // TODO: parlia override header un-used fields.
+        // if w.chainConfig.Parlia == nil {
+		// 	header.ParentBeaconRoot = genParams.beaconRoot
+		// } else {
+		// 	header.WithdrawalsHash = &types.EmptyWithdrawalsHash
+		// 	if w.chainConfig.IsBohr(header.Number, header.Time) {
+		// 		header.ParentBeaconRoot = new(common.Hash)
+		// 	}
+		// 	if w.chainConfig.IsPrague(header.Number, header.Time) {
+		// 		header.RequestsHash = &types.EmptyRequestsHash
+		// 	}
+		// }
+        // if env.header.EmptyWithdrawalsHash() {
+		// 	body.Withdrawals = make([]*types.Withdrawal, 0)
+		// }
         let mut builder = self.evm_config
             .builder_for_next_block(
                 &mut db,
@@ -95,17 +123,36 @@ where
 
         let mut total_fees = U256::ZERO;
         let mut cumulative_gas_used = 0;
-        let block_gas_limit: u64 = builder.evm_mut().block().gas_limit;
+        // reserve the systemtx gas
+        let system_txs_gas = self.parlia.estimate_gas_reserved_for_system_txs(Some(parent_header.timestamp), parent_header.number, parent_header.timestamp);
+        let block_gas_limit: u64 = builder.evm_mut().block().gas_limit - system_txs_gas;
+
         let base_fee = builder.evm_mut().block().basefee;
         
         let mut sidecars_map = HashMap::new();
+        let min_gas_tip = DEFAULT_MIN_GAS_TIP;
         let mut block_blob_count = 0;
 
         // todo: calc blob fee.
         let blob_params = self.chain_spec.blob_params_at_timestamp(attributes.timestamp());
         let max_blob_count = blob_params.as_ref().map(|params| params.max_blob_count).unwrap_or_default();
+        // check: now only filter out blob tx by none blob fee for simple test.
+        
         let mut best_tx_list = self.pool.best_transactions_with_attributes(BestTransactionsAttributes::new(base_fee, None));
         while let Some(pool_tx) = best_tx_list.next() {
+            // TODO: add MEV greedy merge local tx filter out logic.
+
+            // TODO: filter out tx with NANO_BLACK_LIST.
+
+            // filter out tx with min gas tip.
+            if pool_tx.effective_tip_per_gas(base_fee).unwrap_or(0_u128) < min_gas_tip {
+                best_tx_list.mark_invalid(
+                    &pool_tx,
+                    InvalidPoolTransactionError::Underpriced,
+                );
+                continue
+            }
+
             // ensure we still have capacity for this transaction
             if cumulative_gas_used + pool_tx.gas_limit() > block_gas_limit {
                 // we can't fit this transaction into the block, so we need to mark it as invalid
@@ -182,6 +229,7 @@ where
                 Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
                     error, ..
                 })) => {
+                    // TODO: need confirm which error should be skipped.
                     if error.is_nonce_too_low() {
                         // if the nonce is too low, we can skip this transaction
                         debug!(target: "payload_builder", %error, ?tx, "skipping nonce too low transaction");
@@ -229,7 +277,7 @@ where
         // set sidecars to seal block
         let mut blob_sidecars:Vec<BscBlobTransactionSidecar>= Vec::new();
         let transactions = &sealed_block.body().inner.transactions;
-        debug!("debug payload_builder, block_number: {}, block_hash: {:?}, contains {} transactions:", sealed_block.number(), sealed_block.hash(), transactions.len());
+        debug!("debug payload_builder, block_number: {}, block_hash: {:?}, txs: {} gas: {}, fees: {}", sealed_block.number(), sealed_block.hash(), transactions.len(), cumulative_gas_used, total_fees);
         for (index, tx) in transactions.iter().enumerate() {
             debug!("debug payload_builder, transaction {}: hash={:?}, from={:?}, to={:?}, value={:?}, gas_limit={}, gas_price={:?}, nonce={}", 
                 index + 1,
@@ -341,11 +389,12 @@ where
                 match result {
                     Ok(payload) => {
                         // TODO: retry and pick best one.
-                        info!("Start to submit block: {} (hash: 0x{:x}, txs: {}, cost_time: {:?})", 
+                        info!("Start to submit block: {} (hash: 0x{:x}, parent_hash: 0x{:x}, diff: {}, txs: {})", 
                             payload.block().header().number(),
                             payload.block().hash(),
-                            payload.block().body().transaction_count(),
-                            elapsed
+                            payload.block().header().parent_hash(),
+                            payload.block().header().difficulty(),
+                            payload.block().body().transaction_count()
                         );
                         if let Err(err) = self.result_tx.send(payload) {
                             warn!("Failed to send payload to result channel: {}", err);

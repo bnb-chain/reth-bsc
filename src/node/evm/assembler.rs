@@ -94,6 +94,7 @@ where
         let logs_bloom = logs_bloom(receipts.iter().flat_map(|r| &r.logs));
         let block_number = evm_env.block_env.number.saturating_to();
 
+        // TODO: using BSC specific logic for these un-used fields.
         let withdrawals = self
             .chain_spec
             .is_shanghai_active_at_timestamp(timestamp)
@@ -107,6 +108,7 @@ where
             .is_prague_active_at_block_and_timestamp(block_number, timestamp)
             .then(|| requests.requests_hash());
 
+        // TODO: merge const PR and fix here
         let mut excess_blob_gas = None;
         let mut blob_gas_used = None;
 
@@ -220,6 +222,7 @@ where
         let logs_bloom = logs_bloom(receipts.iter().flat_map(|r| &r.logs));
         let block_number = evm_env.block_env.number.saturating_to();
 
+        // TODO: bsc has special logic for these un-used fields.
         let withdrawals = self
             .chain_spec
             .is_shanghai_active_at_timestamp(timestamp)
@@ -235,7 +238,7 @@ where
         let mut excess_blob_gas = None;
         let mut blob_gas_used = None;
 
-        
+        // TODO: fetch blob params from evm ctx.
         if BscHardforks::is_cancun_active_at_timestamp(&*self.chain_spec, block_number, timestamp) {
             blob_gas_used =
                 Some(transactions.iter().map(|tx| tx.blob_gas_used().unwrap_or_default()).sum());

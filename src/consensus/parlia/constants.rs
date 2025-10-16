@@ -1,4 +1,4 @@
-use alloy_primitives::U256;
+use alloy_primitives::{address, Address, U256};
 
 /// Fixed 32-byte vanity prefix present in every header.
 pub const EXTRA_VANITY_LEN: usize = 32;
@@ -24,3 +24,21 @@ pub const BACKOFF_TIME_OF_INITIAL: u64 = 1000; // milliseconds
 pub const LORENTZ_BACKOFF_TIME_OF_INITIAL: u64 = 2000; // milliseconds
 pub const DEFAULT_TURN_LENGTH: u8 = 1;
 pub const BACKOFF_TIME_OF_WIGGLE: u64 = 1000; // milliseconds
+
+// Ramanujan HF constants
+pub const FIXED_BACKOFF_TIME_BEFORE_FORK_MILLIS: u64 = 200; // 200 ms
+pub const WIGGLE_TIME_BEFORE_FORK_MILLIS: u64 = 500; // 500 ms
+
+// This is introduced because of the Tendermint IAVL Merkle Proof verification exploitation.
+pub const NANO_BLACK_LIST: [Address; 3] = [
+      address!("0x489A8756C18C0b8B24EC2a2b9FF3D4d447F79BEc"),
+      address!("0xFd6042Df3D74ce9959922FeC559d7995F3933c55"),
+      address!("0xdb789Eb5BDb4E559beD199B8b82dED94e1d056C9"),
+];
+
+// system txs gas limit
+pub const SYSTEM_TXS_GAS_HARD_LIMIT: u64 = 20_000_000; // Maximum gas reserved for system transactions (Parlia consensus only)
+pub const SYSTEM_TXS_GAS_SOFT_LIMIT: u64 = 1_000_000; // Maximum gas reserved for system transactions, excluding validator update transactions (Parlia consensus only)
+
+// miner config default values
+pub const DEFAULT_MIN_GAS_TIP: u128 = 50_000_000; // 0.05 Gwei

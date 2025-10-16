@@ -1,12 +1,20 @@
 use std::sync::Arc;
 use std::time::SystemTime;
 use lazy_static::lazy_static;
+use rand::Rng;
 use std::sync::RwLock;
 
 use schnellru::LruMap;
 use schnellru::ByLength;
 use alloy_primitives::{Address, B256};
 use secp256k1::{SECP256K1, Message, ecdsa::{RecoveryId, RecoverableSignature}};
+use crate::consensus::parlia::util::calculate_millisecond_timestamp;
+use crate::consensus::parlia::util::is_breathe_block;
+use crate::consensus::parlia::DIFF_NOTURN;
+use crate::consensus::parlia::FIXED_BACKOFF_TIME_BEFORE_FORK_MILLIS;
+use crate::consensus::parlia::SYSTEM_TXS_GAS_HARD_LIMIT;
+use crate::consensus::parlia::SYSTEM_TXS_GAS_SOFT_LIMIT;
+use crate::consensus::parlia::WIGGLE_TIME_BEFORE_FORK_MILLIS;
 use crate::hardforks::BscHardforks;
 use reth_chainspec::EthChainSpec;
 use alloy_consensus::{Header, BlockHeader};
@@ -34,6 +42,8 @@ lazy_static! {
 }
 
 #[derive(Debug)]
+#[derive(PartialEq)]
+#[derive(Eq)]
 pub struct Parlia<ChainSpec> {
     pub spec: Arc<ChainSpec>,
     pub epoch: u64, // The epoch number
@@ -221,8 +231,8 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
         Ok(proposer)
     }
     
-    pub fn present_timestamp(&self) -> u64 {
-        SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs()
+    pub fn /*  */present_millis_timestamp(&self) -> u64 {
+        SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64
     }
 
     fn get_validator_len_from_header(
@@ -468,6 +478,34 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
         delay_ms
     }
 
+    pub fn delay_for_ramanujan_fork(&self, snap: &Snapshot, header: &Header) -> u64 {
+        let present_timestamp = self.present_millis_timestamp();
+        let header_timestamp = calculate_millisecond_timestamp(header);
+        let mut delay_ms = 0;
+        if header_timestamp > present_timestamp {
+            delay_ms = header_timestamp - present_timestamp;
+        }
+        tracing::debug!(
+            target: "bsc::miner",
+            block_number = header.number,
+            block_timestamp = header_timestamp,
+            present_timestamp = present_timestamp,
+            delay_ms = delay_ms,
+            "Block timestamp is in the future, waiting before submission"
+        );
+
+        if self.spec.is_ramanujan_active_at_block(header.number) {
+            return delay_ms;
+        }
+
+        // It's not our turn explicitly to sign, delay it a bit
+        if header.difficulty == DIFF_NOTURN {
+            let wiggle = (snap.validators.len() / 2 + 1) as u64 * WIGGLE_TIME_BEFORE_FORK_MILLIS;
+            delay_ms += FIXED_BACKOFF_TIME_BEFORE_FORK_MILLIS + rand::rng().random_range(0..wiggle);
+        }
+        delay_ms
+    }
+
     pub fn prepare_timestamp(&self, parent_snap: &Snapshot, parent_header: &Header, new_header: &mut Header) {
         let millisecond_timestamp = self.block_time_for_ramanujan_fork(parent_snap, parent_header, new_header);
         new_header.timestamp = millisecond_timestamp / 1000;
@@ -488,9 +526,8 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
         };
 
         new_validators.sort();
-        let is_luban_active = self.spec.is_luban_active_at_block(new_header.number);
         let mut extra_data = new_header.extra_data.to_vec();
-        if !is_luban_active {
+        if !self.spec.is_luban_active_at_block(new_header.number) {
             // Pre-Luban: append validator addresses directly to extra data
             for validator in &new_validators {
                 extra_data.extend_from_slice(validator.as_slice());
@@ -499,9 +536,7 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
             // Luban active: append validator count first, then validators with vote addresses
             extra_data.push(new_validators.len() as u8);
             let mut vote_map = std::collections::HashMap::new();
-            let is_on_luban = self.spec.is_luban_active_at_block(new_header.number) && 
-                !self.spec.is_luban_active_at_block(new_header.number - 1);
-            if is_on_luban {
+            if self.spec.is_luban_transition_at_block(new_header.number) {
                 let zero_bls_key = VoteAddress::ZERO;
                 for validator in &new_validators {
                     vote_map.insert(*validator, zero_bls_key);
@@ -517,9 +552,7 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
             }
             for validator in &new_validators {
                 extra_data.extend_from_slice(validator.as_slice());
-                if let Some(vote_addr) = vote_map.get(validator) {
-                    extra_data.extend_from_slice(vote_addr.as_slice());
-                }
+                extra_data.extend_from_slice(vote_map.get(validator).unwrap().as_slice());
             }
         }
         new_header.extra_data = alloy_primitives::Bytes::from(extra_data);
@@ -531,8 +564,23 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
             return;
         }
         let mut extra_data = new_header.extra_data.to_vec();
+        // TODO: fetch turn length from system contract or use default value.
         extra_data.push(turn_length.unwrap_or(DEFAULT_TURN_LENGTH));
         new_header.extra_data = alloy_primitives::Bytes::from(extra_data);
+    }
+
+    pub fn estimate_gas_reserved_for_system_txs(&self, parent_timestamp: Option<u64>, current_number: u64, current_timestamp: u64) -> u64 {
+        if let Some(parent_timestamp) = parent_timestamp {
+            // Mainnet and Chapel have both passed Feynman. Now, simplify the logic before and during the Feynman hard fork.
+            if self.spec.is_feynman_active_at_timestamp(current_number, current_timestamp) &&
+                !self.spec.is_feynman_fix_transition_at_timestamp(current_timestamp, parent_timestamp) &&
+                 !is_breathe_block(parent_timestamp, current_timestamp) {
+                // params.SystemTxsGasSoftLimit > (depositTxGas+slashTxGas+finalityRewardTxGas)*150/100
+                return SYSTEM_TXS_GAS_SOFT_LIMIT;
+            }
+        }
+        // params.SystemTxsGasHardLimit > (depositTxGas+slashTxGas+finalityRewardTxGas+updateValidatorTxGas)*150/100
+        SYSTEM_TXS_GAS_HARD_LIMIT
     }
 
 }

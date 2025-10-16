@@ -354,6 +354,7 @@ where
             .unwrap_or_default()
             .balance;
 
+        // TODO: kepler reward handling needs to be refined?
         // Kepler introduced a max system reward limit, so we need to pay the system reward to the
         // system contract if the limit is not exceeded.
         if !self.spec.is_kepler_active_at_timestamp(self.evm.block().number.to(), self.evm.block().timestamp.to()) &&
@@ -379,6 +380,7 @@ where
     fn distribute_finality_reward(
         &mut self,
     ) -> Result<(), BlockExecutionError> {
+        // TODO: magic num
         // distribute finality reward per 200 blocks.
         let distribute_interval = 200;
         let block_number = self.evm.block().number.to::<u64>();
@@ -392,6 +394,7 @@ where
         let start = (block_number - distribute_interval).max(1);
         let end = block_number;
         let mut target_number = block_number - 1;
+        // TODO: need query block header and snapshot by hash?
         for _ in (start..end).rev() {
             let header = self.snapshot_provider.
                 as_ref().
@@ -501,17 +504,22 @@ where
         block: &BlockEnv
     ) -> Result<(), BlockExecutionError> {
         tracing::debug!("Start to finalize new block, block_number: {}, is_miner: {}", block.number, self.ctx.is_miner);
-        let snap = self.inner_ctx.snap.as_ref().unwrap();
-        let expected_validator = snap.inturn_validator();
-        if block.beneficiary != expected_validator {
+        
+        // TODO: check miner if is authorized before signing.
+        // 1. check if it's authorized to seal;
+        // 2. check if sign recently;
+        if block.difficulty != DIFF_INTURN {
+            // avoid to slash the recent signed validator.
+            let snap = self.inner_ctx.snap.as_ref().unwrap();
+            let spoiled_validator = snap.inturn_validator();
             let signed_recently = if self.spec.is_plato_active_at_block(block.number.to()) {
-                snap.sign_recently(expected_validator)
+                snap.sign_recently(spoiled_validator)
             } else {
-                snap.recent_proposers.iter().any(|(_, v)| *v == expected_validator)
+                snap.recent_proposers.iter().any(|(_, v)| *v == spoiled_validator)
             };
             if !signed_recently {
-                self.slash_spoiled_validator(block.beneficiary, expected_validator)?;
-                tracing::info!("Slash spoiled validator, block_number: {}, spoiled_validator: {}", block.number, expected_validator);
+                self.slash_spoiled_validator(block.beneficiary, spoiled_validator)?;
+                tracing::debug!("Slash spoiled validator, block_number: {}, spoiled_validator: {}", block.number, spoiled_validator);
             }
         }
 
@@ -542,6 +550,7 @@ where
                 header_number, max_elected_validators, validators_election_info);
         }
 
+        // TODO: prepare header when call build payload?
         let header = prepare_new_header(self.parlia.clone(), self.inner_ctx.snap.as_ref().unwrap(), self.inner_ctx.parent_header.as_ref().unwrap(), self.evm.block().beneficiary);
         let epoch_length = self.parlia.get_epoch_length(&header);
         if (header.number + 1).is_multiple_of(epoch_length) {

@@ -1,8 +1,8 @@
 // todo: refine or remove.
 use super::{
-    constants::{DIFF_NOTURN, EXTRA_SEAL_LEN},
+    constants::EXTRA_SEAL_LEN,
     vote_pool::fetch_vote_by_block_hash,
-    Snapshot, SnapshotProvider, VoteAddress, VoteAttestation, VoteData, VoteSignature,
+    SnapshotProvider, VoteAddress, VoteAttestation, VoteData, VoteSignature,
 };
 use crate::chainspec::BscChainSpec;
 use crate::consensus::parlia::util::encode_header_with_chain_id;
@@ -16,7 +16,6 @@ use alloy_primitives::{
 use blst::min_pk::{AggregateSignature, Signature as blsSignature};
 use bytes::BytesMut;
 use k256::ecdsa::{signature::Signer, Signature, SigningKey};
-use rand::Rng;
 use reth::consensus::ConsensusError;
 use secp256k1::{Message, SECP256K1, ecdsa::{RecoveryId as Secp256k1RecoveryId, RecoverableSignature}};
 use reth_chainspec::EthChainSpec;
@@ -24,7 +23,6 @@ use reth_primitives::SealedBlock;
 use reth_primitives_traits::{Block, SealedHeader};
 use std::fmt;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone)]
 pub struct SealBlock {
@@ -83,30 +81,6 @@ impl SealBlock {
 
         let block_hash = header.hash_slow();
         Ok(BscBlock::new_sealed(SealedHeader::new(header, block_hash), block.body))
-    }
-
-    #[allow(dead_code)]
-    fn delay_for_ramanujan_fork(&self, snapshot: &Snapshot, header: &Header) -> Duration {
-        let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-
-        let mut delay = Duration::from_secs(header.timestamp().saturating_sub(now_secs));
-
-        if self.chain_spec.is_ramanujan_active_at_block(header.number) {
-            return delay;
-        }
-
-        if header.difficulty == DIFF_NOTURN {
-            const FIXED_BACKOFF_TIME_BEFORE_FORK: Duration = Duration::from_millis(200);
-            const WIGGLE_TIME_BEFORE_FORK: u64 = 500 * 1000 * 1000; // 500 ms
-
-            let validators = snapshot.validators.len();
-            let rand_wiggle = rand::rng()
-                .random_range(0..(WIGGLE_TIME_BEFORE_FORK * (validators / 2 + 1) as u64));
-
-            delay += FIXED_BACKOFF_TIME_BEFORE_FORK + Duration::from_nanos(rand_wiggle);
-        }
-
-        delay
     }
 
     fn assemble_vote_attestation_stub(&self, header: &mut Header) -> Result<(), ConsensusError> {

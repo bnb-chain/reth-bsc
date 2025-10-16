@@ -30,6 +30,7 @@ const BLST_DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
 
 type ValidatorCache = LruMap<u64, (Vec<Address>, Vec<VoteAddress>), ByLength>;
 
+// TODO: need cache with block hash?
 pub static VALIDATOR_CACHE: LazyLock<Mutex<ValidatorCache>> = LazyLock::new(|| {
     Mutex::new(LruMap::new(ByLength::new(1024)))
 });
@@ -144,6 +145,7 @@ where
         block_number: u64
     ) -> Result<(Vec<Address>, Vec<VoteAddress>), BlockExecutionError> {
         {
+            // TODO: need cache with block hash?
             let mut cache = VALIDATOR_CACHE.lock().unwrap();
             if let Some(cached_result) = cache.get(&block_number) {
                 tracing::debug!("Succeed to query cached validator result, block_number: {}, evm_block_number: {}", 

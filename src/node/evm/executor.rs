@@ -410,21 +410,25 @@ where
             "Start to finish"
         );
 
-        // If first block deploy genesis contracts
-        if self.evm.block().number == uint!(1U256) {
-            self.deploy_genesis_contracts(self.evm.block().beneficiary)?;
-        }
-
-        if self.spec.is_feynman_active_at_timestamp(self.evm.block().number.to::<u64>(), self.evm.block().timestamp.to::<u64>() - 3) {
+        if self.spec.is_feynman_active_at_timestamp(self.evm.block().number.to::<u64>(), self.evm.block().timestamp.to::<u64>()) {
             self.upgrade_contracts()?;
         }
 
-        if self.spec.is_feynman_active_at_timestamp(self.evm.block().number.to::<u64>(), self.evm.block().timestamp.to()) &&
-            !self
-                .spec
-                .is_feynman_active_at_timestamp(self.evm.block().number.to::<u64>() - 1, self.evm.block().timestamp.to::<u64>() - 3)
-        {
+        // TODO: add nano block list check
+        // if self.spec.is_nano_active_at_block(block_env.number.to::<u64>()) {
+            // for receipt in self.receipts.iter() {
+            //     NANO_BLACK_LIST.contains(&receipt.contract_address) {
+            //         return Err(BlockExecutionError::other("History storage address is not allowed"));
+            //     }
+            // }
+        // }
+        if self.spec.is_feynman_transition_at_timestamp(self.evm.block().number.to::<u64>(), self.evm.block().timestamp.to::<u64>()) {
             self.initialize_feynman_contracts(self.evm.block().beneficiary)?;
+        }
+
+        // If first block deploy genesis contracts
+        if self.evm.block().number == uint!(1U256) {
+            self.deploy_genesis_contracts(self.evm.block().beneficiary)?;
         }
 
         if self.ctx.is_miner {
