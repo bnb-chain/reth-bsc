@@ -80,7 +80,7 @@ where
         info!("Succeed to spawn new work worker, address: {}", self.validator_address);
         
         if let Some(tip_header) = self.get_tip_header_at_startup() {
-            debug!("try to mine block at startup, block_number: {}", tip_header.number() + 1);
+            debug!("try new work at startup, tip_block: {}", tip_header.number());
             self.try_new_work(&tip_header).await;
         }
         
@@ -92,7 +92,7 @@ where
                     let committed = event.committed();
                     let tip = committed.tip();
                     debug!(
-                        "try new work, tip_block={}, committed_blocks={}",
+                        "try new work, tip_block: {}, committed_blocks: {}",
                         committed.tip().number(),
                         committed.len()
                     );
@@ -218,6 +218,7 @@ where
     pub async fn run(mut self) {
         info!("Succeed to spawn main work worker, address: {}", self.validator_address);
         
+        // todo: use tokio rewrite it.
         loop {
             match self.mining_queue_rx.recv().await {
                 Some(ctx) => {
@@ -262,17 +263,20 @@ where
             EthereumBuilderConfig::new(),
             self.chain_spec.clone(),
         );
+        
+        let build_start = std::time::Instant::now();        
         let payload = payload_builder.build_payload(
             BuildArguments::<EthPayloadBuilderAttributes, BscBuiltPayload>::new(
                 reth_revm::cached::CachedReads::default(),
                 PayloadConfig::new(Arc::new(mining_ctx.parent_header.clone()), attributes),
-                CancelOnDrop::default(),
+                CancelOnDrop::default(), // todo: refine abort logic
                 None,)
         )?;
-        info!("Start to submit block: {} (hash: 0x{:x}, txs: {})", 
+        debug!("Succeed to build block: {} (hash: 0x{:x}, trx_len: {}, cost_time: {:?})", 
             payload.block().header().number(),
             payload.block().hash(),
-            payload.block().body().transaction_count()
+            payload.block().body().transaction_count(),
+            build_start.elapsed()
         );
 
         self.submit_block(payload.block(), mining_ctx).await?;
