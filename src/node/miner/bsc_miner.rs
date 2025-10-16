@@ -334,7 +334,7 @@ where
                                 block_number,
                                 block_hash,
                                 tx_index: idx as u64,
-                                tx_hash: tx.hash().clone(),
+                                tx_hash: *tx.hash(),
                             });
                         }
                     }
