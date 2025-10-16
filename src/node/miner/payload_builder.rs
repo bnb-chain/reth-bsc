@@ -25,7 +25,8 @@ use reth_primitives_traits::SignerRecoverable;
 use tracing::warn;
 use crate::chainspec::{BscChainSpec};
 use reth::transaction_pool::error::Eip4844PoolTransactionError;
-use reth_ethereum_engine_primitives::BlobSidecars;
+use crate::node::primitives::BscBlobTransactionSidecar;
+use std::collections::HashMap;
 use reth_chainspec::EthChainSpec;
 use reth_chainspec::EthereumHardforks;
 
@@ -97,8 +98,7 @@ where
         let block_gas_limit: u64 = builder.evm_mut().block().gas_limit;
         let base_fee = builder.evm_mut().block().basefee;
         
-        let mut blob_sidecars = BlobSidecars::Empty;
-
+        let mut sidecars_map = HashMap::new();
         let mut block_blob_count = 0;
         // todo: calc blob fee.
 
@@ -215,16 +215,17 @@ where
 
             // Add blob tx sidecar to the payload.
             if let Some(sidecar) = blob_tx_sidecar {
-                blob_sidecars.push_sidecar_variant(sidecar.as_ref().clone());
+                sidecars_map.insert(*tx.hash(), sidecar);
             }
         }
 
         // add system txs to payload, need to rewrite finish.
         // check: rewrite in here.
         let BlockBuilderOutcome { execution_result, block, .. } = builder.finish(&state_provider)?;
-        let sealed_block = Arc::new(block.sealed_block().clone());
+        let mut sealed_block = Arc::new(block.sealed_block().clone());
         
-        // for debugging, and remove it later.
+        // set sidecars to seal block
+        let mut blob_sidecars:Vec<BscBlobTransactionSidecar>= Vec::new();
         let transactions = &sealed_block.body().inner.transactions;
         debug!("debug payload_builder, block_number: {}, block_hash: {:?}, contains {} transactions:", sealed_block.number(), sealed_block.hash(), transactions.len());
         for (index, tx) in transactions.iter().enumerate() {
@@ -238,13 +239,28 @@ where
                 tx.gas_price(),
                 tx.nonce()
             );
+            if tx.is_eip4844() {
+                let sidecar = sidecars_map.get(tx.hash()).unwrap();
+                let bsc_blob_tx_sidecar = BscBlobTransactionSidecar {
+                    inner: sidecar.as_eip4844().unwrap().clone(),
+                    block_number: sealed_block.header().number(),
+                    block_hash: sealed_block.hash(),
+                    tx_index: index as u64,
+                    tx_hash: *tx.hash(),
+                };
+                blob_sidecars.push(bsc_blob_tx_sidecar);
+            }
         }
-     
+
+        let mut plain = sealed_block.clone_block();
+        plain.body.sidecars = Some(blob_sidecars);
+        sealed_block = Arc::new(plain.into());
+    
+        debug!("debug payload_builder, sealed_block: {:?}", sealed_block);
         let payload = BscBuiltPayload {
             block: sealed_block,
             fees: total_fees,
             requests: Some(execution_result.requests),
-            sidecars: Some(blob_sidecars),
         };
         Ok(payload)
     }
