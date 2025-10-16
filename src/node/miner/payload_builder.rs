@@ -239,7 +239,7 @@ where
                 tx.nonce()
             );
         }
-        
+     
         let payload = BscBuiltPayload {
             block: sealed_block,
             fees: total_fees,

@@ -36,6 +36,8 @@ use crate::node::network::BscNewBlock;
 use crate::shared::{get_block_import_sender, get_local_peer_id_or_default};
 use alloy_primitives::U128;
 use reth_network::message::NewBlockMessage;
+use reth_ethereum_engine_primitives::BlobSidecars;
+use crate::node::primitives::BscBlobTransactionSidecar;
 
 pub struct MiningContext {
     parent_header: reth_primitives::SealedHeader,
@@ -275,7 +277,7 @@ where
             payload.block().body().transaction_count()
         );
 
-        self.submit_block(payload.block(), mining_ctx).await?;
+        self.submit_block(payload.block(), mining_ctx, payload.sidecars()).await?;
         info!("Succeed to mine and submit, block: {}", payload.block().header().number());
         Ok(())
     }
@@ -285,6 +287,7 @@ where
         &self,
         sealed_block: &SealedBlock<BscBlock>,
         mining_ctx: MiningContext,
+        sidecars: Option<BlobSidecars>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // now is focus on the basic workflow.
         // TODO: refine it later. https://github.com/bnb-chain/bsc/blob/master/consensus/parlia/parlia.go#L1702.
@@ -314,9 +317,37 @@ where
         let current_difficulty = sealed_block.header().difficulty();
         let new_td = parent_td + current_difficulty;
         
+
+        let mut block = sealed_block.clone_block();
+        let sidecars_vec = match sidecars {
+            Some(reth_ethereum_engine_primitives::BlobSidecars::Eip4844(vec4844)) => {
+                let block_number = sealed_block.header().number();
+                let block_hash = sealed_block.hash();
+        
+                let mut sidecar_iter = vec4844.into_iter();
+                let mut out = Vec::new();
+                for (idx, tx) in block.body.inner.transactions.iter().enumerate() {
+                    if tx.is_eip4844() {
+                        if let Some(inner) = sidecar_iter.next() {
+                            out.push(BscBlobTransactionSidecar {
+                                inner,
+                                block_number,
+                                block_hash,
+                                tx_index: idx as u64,
+                                tx_hash: tx.hash().clone(),
+                            });
+                        }
+                    }
+                }
+                out
+            }
+            _ => Vec::new(),
+        };
+        block.body.sidecars = if sidecars_vec.is_empty() { None } else { Some(sidecars_vec) };
         let td = U128::from(new_td.to::<u128>());
         let block_hash = sealed_block.hash();
-        let new_block = BscNewBlock(reth_eth_wire::NewBlock { block: sealed_block.clone_block(), td });
+        let new_block = BscNewBlock(reth_eth_wire::NewBlock { block, td });
+        debug!("debug submit_block, new_block: {:?} sidecar count: {:?}", new_block, new_block.0.block.body.sidecars.as_ref().map(|s| s.len()).unwrap_or(0));
         let msg = NewBlockMessage { hash: block_hash, block: Arc::new(new_block) };
 
         if let Some(sender) = get_block_import_sender() {
