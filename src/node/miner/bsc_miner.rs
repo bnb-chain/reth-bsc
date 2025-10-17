@@ -42,6 +42,12 @@ pub struct MiningContext {
     parent_snapshot: Arc<crate::consensus::parlia::snapshot::Snapshot>,
 }
 
+impl MiningContext {
+    pub fn parent_header(&self) -> &reth_primitives::SealedHeader {
+        &self.parent_header
+    }
+}
+
 /// NewWorkWorker responsible for listening to canonical state changes and triggering mining.
 pub struct NewWorkWorker<Provider> {
     validator_address: Address,
@@ -310,7 +316,7 @@ where
                 PayloadConfig::new(Arc::new(mining_ctx.parent_header.clone()), attributes),
                 CancelOnDrop::default(), // todo: refine abort logic
                 None,)
-        )?;
+        ).await?;
         debug!("Succeed to build block: {} (hash: 0x{:x}, trx_len: {}, cost_time: {:?})", 
             payload.block().header().number(),
             payload.block().hash(),
@@ -360,7 +366,6 @@ where
         let td = U128::from(new_td.to::<u128>());
         let block_hash = sealed_block.hash();
         let new_block = BscNewBlock(reth_eth_wire::NewBlock { block: sealed_block.clone_block(), td });
-        debug!("debug submit_block, new_block: {:?} sidecar count: {:?}", new_block, new_block.0.block.body.sidecars.as_ref().map(|s| s.len()).unwrap_or(0));
         let msg = NewBlockMessage { hash: block_hash, block: Arc::new(new_block) };
 
         if let Some(sender) = get_block_import_sender() {

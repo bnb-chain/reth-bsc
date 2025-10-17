@@ -1,4 +1,6 @@
 use alloy_primitives::U256;
+use reth_payload_primitives::BuiltPayload;
+use reth_primitives_traits::BlockBody;
 use crate::node::engine::BscBuiltPayload;
 use crate::node::evm::config::BscEvmConfig;
 use reth_provider::StateProviderFactory;
@@ -18,6 +20,7 @@ use reth_evm::execute::BlockBuilderOutcome;
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
 use std::sync::Arc;
 use reth_basic_payload_builder::{BuildArguments, PayloadConfig};
+use reth_revm::cancelled::CancelOnDrop;
 use reth::payload::EthPayloadBuilderAttributes;
 use reth_payload_primitives::PayloadBuilderAttributes;
 use alloy_consensus::{Transaction, BlockHeader};
@@ -48,10 +51,10 @@ pub struct BscPayloadBuilder<Pool, Client, EvmConfig = BscEvmConfig> {
 
 impl<Pool, Client, EvmConfig> BscPayloadBuilder<Pool, Client, EvmConfig> 
 where
-    Client: StateProviderFactory,
-    EvmConfig: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes>,
+    Client: StateProviderFactory + 'static,
+    EvmConfig: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
     <EvmConfig as ConfigureEvm>::Primitives: reth_primitives_traits::NodePrimitives<BlockHeader = alloy_consensus::Header, SignedTx = alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip4844>, Block = crate::node::primitives::BscBlock>,
-    Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>>,
+    Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>> + 'static,
 {
     pub const fn new(
         client: Client,
@@ -65,7 +68,7 @@ where
 
     // todo: check more and refine it later.
     // todo: support async for build payload.
-    pub fn build_payload(self, args: BuildArguments<EthPayloadBuilderAttributes, BscBuiltPayload>) -> Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn build_payload(self, args: BuildArguments<EthPayloadBuilderAttributes, BscBuiltPayload>) -> Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>> {
         let BuildArguments { mut cached_reads, config, cancel: _cancel, best_payload: _best_payload } = args;
         let PayloadConfig { parent_header, attributes } = config;
 
@@ -264,5 +267,85 @@ where
             requests: Some(execution_result.requests),
         };
         Ok(payload)
+    }
+}
+
+
+struct BscPayloadJob<Pool, Client, EvmConfig = BscEvmConfig> {
+    /// The payload builder instance
+    builder: BscPayloadBuilder<Pool, Client, EvmConfig>,
+    /// Timeout for payload building
+    timeout: std::time::Duration,
+    /// Cancel handle that automatically cancels the job when dropped
+    cancel: CancelOnDrop,
+    // todo, mev
+    // retry
+    // abort
+}
+
+impl<Pool, Client, EvmConfig> BscPayloadJob<Pool, Client, EvmConfig>
+where
+    Client: StateProviderFactory + 'static,
+    EvmConfig: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
+    <EvmConfig as ConfigureEvm>::Primitives: reth_primitives_traits::NodePrimitives<BlockHeader = alloy_consensus::Header, SignedTx = alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip4844>, Block = crate::node::primitives::BscBlock>,
+    Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>> + 'static,
+{
+    /// Creates a new BscPayloadJob
+    pub fn new(
+        builder: BscPayloadBuilder<Pool, Client, EvmConfig>,
+        timeout: std::time::Duration,
+    ) -> Self {
+        Self {
+            builder,
+            timeout,
+            cancel: CancelOnDrop::default(),
+        }
+    }
+
+    /// Runs the payload job asynchronously with timeout support
+    pub async fn run(
+        self,
+        args: BuildArguments<EthPayloadBuilderAttributes, BscBuiltPayload>,
+    ) -> Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>> {
+        use tracing::{info, warn};
+        use std::time::Instant;
+
+        let start_time = Instant::now();
+        let block_number = args.config.parent_header.number() + 1;
+        
+        info!("Starting BscPayloadJob run for block {} with timeout {:?}", block_number, self.timeout);
+
+        // Use tokio::select! to handle both the payload building and timeout
+        tokio::select! {
+            // Main payload building task
+            result = self.builder.build_payload(args) => {
+                let duration = start_time.elapsed();
+                match result {
+                    Ok(payload) => {
+                        // todo: queue result
+                        // pick best one.
+                        info!("BscPayloadJob completed successfully in {:?}: block hash: 0x{:x}", 
+                              duration, payload.block().hash());
+                        Ok(payload)
+                    }
+                    Err(e) => {
+                        warn!("BscPayloadJob failed in {:?}: {}", duration, e);
+                        Err(e)
+                    }
+                }
+            }
+            
+            // Simple timeout tick
+            _ = tokio::time::sleep(self.timeout) => {
+                warn!("BscPayloadJob timed out after {:?} for block {}", self.timeout, block_number);
+                
+                // Explicitly drop the cancel handle to trigger cancellation
+                drop(self.cancel);
+                info!("Cancel handle dropped for timed out job, block {}", block_number);
+                
+                Err(format!("Payload job timed out after {:?}", self.timeout).into())
+            }
+        }
+        // Note: self.cancel will be automatically dropped here, triggering cancellation
     }
 }

@@ -1,6 +1,9 @@
 
 use alloy_primitives::Address;
-use futures_util::FutureExt;
+use futures::FutureExt;
+use reth_payload_primitives::BuiltPayload;
+use alloy_consensus::BlockHeader;
+use reth_primitives_traits::BlockBody;
 use std::{
     future::Future,
     pin::Pin,
@@ -15,20 +18,6 @@ use crate::node::{
     miner::bsc_miner::MiningContext,
 };
 
-/// Result of a payload building job
-#[derive(Debug, Clone)]
-pub struct PayloadJobResult {
-    /// Job identifier
-    pub job_id: u64,
-    /// Block number that was built
-    pub block_number: u64,
-    /// Whether the job was successful
-    pub success: bool,
-    /// Optional error message if job failed
-    pub error_message: Option<String>,
-    /// The built BSC payload (if successful)
-    pub payload: Option<BscBuiltPayload>,
-}
 
 /// A payload building job that constructs blocks for BSC
 pub struct PayloadJob {
@@ -67,23 +56,12 @@ impl PayloadJob {
 }
 
 impl Future for PayloadJob {
-    type Output = Result<PayloadJobResult, Box<dyn std::error::Error + Send + Sync>>;
+    type Output = Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>>;
 
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // Empty implementation - immediately return success with mock BscBuiltPayload
-        
-        // Create a mock BscBuiltPayload (in real implementation, this would be built from actual mining)
-        let mock_payload = BscBuiltPayload::default(); // This creates an empty payload
-        
-        let result = PayloadJobResult {
-            job_id: self.job_id,
-            block_number: self.block_number,
-            success: true,
-            error_message: None,
-            payload: Some(mock_payload),
-        };
-        
-        Poll::Ready(Ok(result))
+        // Empty implementation - immediately return mock BscBuiltPayload
+        let mock_payload = BscBuiltPayload::default();
+        Poll::Ready(Ok(mock_payload))
     }
 }
 
@@ -134,34 +112,22 @@ where
         // Poll the currently running payload job if it exists
         if let Some(ref mut job) = this.running_payload_job {
             match job.poll_unpin(cx) {
-                Poll::Ready(Ok(result)) => {
-                    // Job completed successfully, extract the result
-                    info!("PayloadJob {} completed successfully for block {}", 
-                          result.job_id, result.block_number);
+                Poll::Ready(Ok(payload)) => {
+                    let job_id = job.job_id();
+                    info!("PayloadJob {} completed successfully, built payload: block hash: 0x{:x}, fees: {}", 
+                          job_id, payload.block().hash(), payload.fees());
                     
-                    if result.success {
-                        if let Some(payload) = result.payload {
-                            info!("Payload built successfully for job {}: block hash: 0x{:x}, fees: {}", 
-                                  result.job_id, payload.block().hash(), payload.fees());
-                            
-                            // TODO: Here you can process the successful BscBuiltPayload
-                            // For example:
-                            // - Submit the block to the network
-                            // - Store the payload for later use  
-                            // - Notify other components
-                            // - Update metrics
-                            
-                            debug!("Block details: number={}, gas_used={}, tx_count={}", 
-                                   payload.block().number(), 
-                                   payload.block().gas_used(),
-                                   payload.block().body().transaction_count());
-                        } else {
-                            warn!("PayloadJob {} completed successfully but no payload returned", result.job_id);
-                        }
-                    } else {
-                        warn!("PayloadJob {} completed but was not successful: {:?}", 
-                              result.job_id, result.error_message);
-                    }
+                    // TODO: Here you can process the successful BscBuiltPayload
+                    // For example:
+                    // - Submit the block to the network
+                    // - Store the payload for later use  
+                    // - Notify other components
+                    // - Update metrics
+                    
+                    debug!("Block details: number={}, gas_used={}, tx_count={}", 
+                           payload.block().number(), 
+                           payload.block().gas_used(),
+                           payload.block().body().transaction_count());
                     
                     this.running_payload_job = None; // Clear completed job
                     
@@ -187,7 +153,7 @@ where
         // Poll the mining queue for new contexts
         match this.mining_queue_rx.poll_recv(cx) {
             Poll::Ready(Some(ctx)) => {
-                let next_block = ctx.parent_header.number() + 1;
+                let next_block = ctx.parent_header().number() + 1;
                 debug!("Received mining context for block {}", next_block);
                 
                 // Generate a new PayloadJob
@@ -216,3 +182,6 @@ where
         }
     }
 }
+
+
+// todo: think more
