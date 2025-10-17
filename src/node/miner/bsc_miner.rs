@@ -244,6 +244,45 @@ where
         warn!("Mining worker stopped");
     }
 
+    pub async fn run_v2(mut self) {
+        info!("Succeed to spawn main work worker v2, address: {}", self.validator_address);
+        
+        // Use tokio::select! for better async handling
+        loop {
+            tokio::select! {
+                // Handle mining context from queue
+                ctx_result = self.mining_queue_rx.recv() => {
+                    match ctx_result {
+                        Some(ctx) => {
+                            let next_block = ctx.parent_header.number() + 1;
+                            debug!("Received mining context, next_block: {}", next_block);
+
+                            match self.try_mine_block(ctx).await {
+                                Ok(()) => {
+                                    debug!("Succeed to mine block, next_block: {}", next_block);
+                                }
+                                Err(e) => {
+                                    error!("Failed to mine block due to {}, next_block: {}", e, next_block);
+                                }
+                            }
+                        }
+                        None => {
+                            warn!("Mining queue closed, exiting main work worker");
+                            break;
+                        }
+                    }
+                }
+                // Handle graceful shutdown signal (optional)
+                _ = tokio::signal::ctrl_c() => {
+                    info!("Received shutdown signal, stopping main work worker v2");
+                    break;
+                }
+            }
+        }
+        
+        warn!("Mining worker v2 stopped");
+    }
+
     async fn try_mine_block(
         &self,
         mining_ctx: MiningContext,
