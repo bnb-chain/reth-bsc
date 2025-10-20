@@ -6,11 +6,11 @@ use reth_revm::{database::StateProviderDatabase, db::State};
 use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
 use reth_evm::execute::BlockBuilder;
 use alloy_evm::Evm;
-use reth_payload_primitives::PayloadBuilderError;
+use reth_payload_primitives::{PayloadBuilderError, BuiltPayload};
 use reth::transaction_pool::{TransactionPool, PoolTransaction};
 use reth_primitives::TransactionSigned;
 use reth::transaction_pool::BestTransactionsAttributes;
-use tracing::debug;
+use tracing::{debug, info};
 use reth_evm::block::{BlockExecutionError, BlockValidationError};
 use reth::transaction_pool::error::InvalidPoolTransactionError;
 use reth_primitives::InvalidTransactionError;
@@ -23,7 +23,7 @@ use tokio::sync::{oneshot, mpsc};
 use reth::payload::EthPayloadBuilderAttributes;
 use reth_payload_primitives::PayloadBuilderAttributes;
 use alloy_consensus::{Transaction, BlockHeader};
-use reth_primitives_traits::SignerRecoverable;
+use reth_primitives_traits::{SignerRecoverable, BlockBody};
 use tracing::warn;
 use crate::chainspec::{BscChainSpec};
 use reth::transaction_pool::error::Eip4844PoolTransactionError;
@@ -341,6 +341,11 @@ where
                 match result {
                     Ok(Ok(payload)) => {
                         // TODO: retry and pick best one.
+                        info!("Start to submit block: {} (hash: 0x{:x}, txs: {})", 
+                            payload.block().header().number(),
+                            payload.block().hash(),
+                            payload.block().body().transaction_count()
+                        );
                         if let Err(err) = self.result_tx.send(payload) {
                             warn!("Failed to send payload to result channel: {}", err);
                         }

@@ -330,11 +330,11 @@ where
             let block_number = payload.block().number();
             let block_hash = payload.block().hash();
             
-            info!("Received payload for submission: block {} (hash: 0x{:x})", block_number, block_hash);
+            debug!("Received payload for submission: block {} (hash: 0x{:x})", block_number, block_hash);
             
             match self.submit_payload(payload).await {
                 Ok(()) => {
-                    info!("Successfully submitted block {} (hash: 0x{:x})", block_number, block_hash);
+                    info!("Succeed to submitt block {} (hash: 0x{:x})", block_number, block_hash);
                 }
                 Err(e) => {
                     error!("Failed to submit block {} (hash: 0x{:x}): {}", block_number, block_hash, e);
@@ -342,10 +342,10 @@ where
             }
         }
 
-        warn!("ResultWorkWorker stopped - payload channel closed");
+        warn!("ResultWorkWorker stopped");
     }
 
-    /// Submit a built payload to the network
+    /// Submit a built payload to the engine-tree/network
     async fn submit_payload(&self, payload: BscBuiltPayload) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let sealed_block = payload.block();
         let block_number = sealed_block.number();
@@ -358,6 +358,8 @@ where
                sealed_block.gas_used());
 
         // Check if block timestamp is in the future and wait if necessary
+        // now is focus on the basic workflow.
+        // TODO: refine it later. https://github.com/bnb-chain/bsc/blob/master/consensus/parlia/parlia.go#L1702.
         let present_timestamp = self.parlia.present_timestamp();
         if sealed_block.header().timestamp > present_timestamp {
             let delay_ms = (sealed_block.header().timestamp - present_timestamp) * 1000;
@@ -395,14 +397,13 @@ where
                 warn!("Failed to send mined block to import service - channel closed");
                 return Err("Failed to send mined block to import service - channel closed".into());
             } else {
-                debug!("Successfully sent mined block to import service");
+                debug!("Succeed to send mined block to import service");
             }
         } else {
-            warn!("Block import sender not initialized");
-            return Err("Block import sender not initialized".into());
+            warn!("Failed to send mined block due to import sender not initialised");
+            return Err("Failed to send mined block due to import sender not initialised".into());
         }
         
-        info!("Block {} submitted successfully", block_number);
         Ok(())
     }
 }
