@@ -268,6 +268,16 @@ where
     }
 }
 
+/// Handle for aborting a BscPayloadJob
+pub struct BscPayloadJobHandle {
+    abort_tx: oneshot::Sender<()>,
+}
+
+impl BscPayloadJobHandle {
+    pub fn abort(self) {
+        let _ = self.abort_tx.send(());
+    }
+}
 
 pub struct BscPayloadJob<Pool, Client, EvmConfig = BscEvmConfig> {
     /// The payload builder instance
@@ -280,8 +290,6 @@ pub struct BscPayloadJob<Pool, Client, EvmConfig = BscEvmConfig> {
     cancel: CancelOnDrop,
     /// Abort receiver for external termination
     abort_rx: oneshot::Receiver<()>,
-    /// Abort sender for internal abort function
-    abort_tx: Option<oneshot::Sender<()>>,
     /// Abort flag
     is_aborted: bool,
     /// Sender for payload results
@@ -296,33 +304,29 @@ where
     <EvmConfig as ConfigureEvm>::Primitives: reth_primitives_traits::NodePrimitives<BlockHeader = alloy_consensus::Header, SignedTx = alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip4844>, Block = crate::node::primitives::BscBlock>,
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>> + 'static,
 {
-    /// Creates a new BscPayloadJob
+    /// Creates a new BscPayloadJob and returns both the job and its handle
     pub fn new(
         builder: BscPayloadBuilder<Pool, Client, EvmConfig>,
         args: BuildArguments<EthPayloadBuilderAttributes, BscBuiltPayload>,
         result_tx: mpsc::UnboundedSender<BscBuiltPayload>,
-    ) -> Self {
+    ) -> (Self, BscPayloadJobHandle) {
         let (abort_tx, abort_rx) = oneshot::channel();
         
-        Self {
+        let job = Self {
             builder,
             timeout: std::time::Duration::from_millis(500), // Default 500ms timeout
             cancel: args.cancel.clone(),
             args,
             abort_rx,
-            abort_tx: Some(abort_tx),
             is_aborted: false,
             result_tx,
-        }
-    }
-
-    /// Abort the payload job
-    pub fn abort(&mut self) -> Result<(), ()> {
-        if let Some(abort_tx) = self.abort_tx.take() {
-            abort_tx.send(()).map_err(|_| ())
-        } else {
-            Err(()) // Already aborted or consumed
-        }
+        };
+        
+        let handle = BscPayloadJobHandle {
+            abort_tx,
+        };
+        
+        (job, handle)
     }
 
     /// Runs the payload job asynchronously with timeout support

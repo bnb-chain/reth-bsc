@@ -4,7 +4,7 @@ use crate::{
         engine::BscBuiltPayload,
         evm::config::BscEvmConfig,
         miner::{
-            payload::{BscPayloadBuilder, BscPayloadJob}, 
+            payload::{BscPayloadBuilder, BscPayloadJob, BscPayloadJobHandle}, 
             util::prepare_new_attributes, 
             signer::init_global_signer_from_k256,
             config::{keystore, MiningConfig}
@@ -38,12 +38,6 @@ use reth_network::message::NewBlockMessage;
 pub struct MiningContext {
     parent_header: reth_primitives::SealedHeader,
     parent_snapshot: Arc<crate::consensus::parlia::snapshot::Snapshot>,
-}
-
-impl MiningContext {
-    pub fn parent_header(&self) -> &reth_primitives::SealedHeader {
-        &self.parent_header
-    }
 }
 
 /// NewWorkWorker responsible for listening to canonical state changes and triggering mining.
@@ -185,8 +179,8 @@ pub struct MainWorkWorker<Pool, Provider> {
     chain_spec: Arc<crate::chainspec::BscChainSpec>,
     parlia: Arc<crate::consensus::parlia::Parlia<crate::chainspec::BscChainSpec>>,
     mining_queue_rx: mpsc::UnboundedReceiver<MiningContext>,
-    /// Sender for built payloads to ResultWorkWorker
     payload_tx: mpsc::UnboundedSender<BscBuiltPayload>,
+    running_job_handle: Option<BscPayloadJobHandle>,
 }
 
 impl<Pool, Provider> MainWorkWorker<Pool, Provider>
@@ -220,13 +214,13 @@ where
             validator_address,
             mining_queue_rx,
             payload_tx,
+            running_job_handle: None,
         }
     }
 
     pub async fn run(mut self) {
         info!("Succeed to spawn main work worker, address: {}", self.validator_address);
         
-        // todo: use tokio rewrite it.
         loop {
             match self.mining_queue_rx.recv().await {
                 Some(ctx) => {
@@ -253,9 +247,13 @@ where
     }
 
     async fn try_mine_block(
-        &self,
+        &mut self,
         mining_ctx: MiningContext,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(handle) = self.running_job_handle.take() {
+            handle.abort();
+        }
+        
         let attributes = prepare_new_attributes(
             self.parlia.clone(), 
             &mining_ctx.parent_snapshot, 
@@ -272,7 +270,7 @@ where
             self.chain_spec.clone(),
         );
                 
-        let payload_job = BscPayloadJob::new(
+        let (payload_job, job_handle) = BscPayloadJob::new(
             payload_builder,
             BuildArguments::<EthPayloadBuilderAttributes, BscBuiltPayload>::new(
                 reth_revm::cached::CachedReads::default(),
@@ -283,6 +281,7 @@ where
             self.payload_tx.clone(),
         );
         
+        self.running_job_handle = Some(job_handle);
         tokio::spawn(async move {
             payload_job.run().await
         });
@@ -292,7 +291,7 @@ where
 
 }
 
-/// Worker responsible for processing and submitting built payloads
+/// Worker responsible for submitting built payloads
 pub struct ResultWorkWorker<Provider> {
     /// Validator address
     validator_address: Address,

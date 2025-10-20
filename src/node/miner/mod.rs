@@ -6,4 +6,4 @@ pub mod config;
 
 pub use miner::{BscMiner, ResultWorkWorker};
 pub use config::{MiningConfig, keystore};
-pub use payload::{BscPayloadBuilder, BscPayloadJob};
+pub use payload::{BscPayloadBuilder, BscPayloadJob, BscPayloadJobHandle};
