@@ -295,7 +295,7 @@ where
             self.payload_tx.clone(),
         );
         // TODO: wait for MEV bids, select a best reward from local block & Bids.
-        
+
         let start_time = std::time::Instant::now();
         self.running_job_handle = Some(job_handle);
         self.payload_job_join_set.spawn(async move {

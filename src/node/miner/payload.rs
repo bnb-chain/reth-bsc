@@ -109,7 +109,6 @@ where
         
         let mut sidecars_map = HashMap::new();
         let min_gas_tip = DEFAULT_MIN_GAS_TIP;
-        let mut blob_sidecars = BlobSidecars::Empty;
 
         let mut block_blob_count = 0;
 
