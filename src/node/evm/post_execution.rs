@@ -1,6 +1,7 @@
 use super::executor::BscBlockExecutor;
 use super::error::{BscBlockExecutionError, BscBlockValidationError};
 use super::util::set_nonce;
+use crate::consensus::parlia::FF_REWARD_DISTRIBUTION_INTERVAL;
 use crate::node::miner::signer::{sign_system_transaction, is_signer_initialized};
 use crate::consensus::parlia::{DIFF_INTURN, VoteAddress, VoteAttestation, snapshot::DEFAULT_TURN_LENGTH, constants::COLLECT_ADDITIONAL_VOTES_REWARD_RATIO, util::is_breathe_block};
 use crate::consensus::{SYSTEM_ADDRESS, MAX_SYSTEM_REWARD, SYSTEM_REWARD_PERCENT};
@@ -77,7 +78,7 @@ where
         let parent_header = self.inner_ctx.parent_header.as_ref().unwrap().clone();
         if self.spec.is_feynman_active_at_timestamp(header_number, header_timestamp) &&
             is_breathe_block(parent_header.timestamp, header_timestamp) &&
-            !self.spec.is_feynman_transition_at_timestamp(header_timestamp, parent_header.timestamp)
+            !self.spec.is_feynman_transition_at_timestamp(header_number, header_timestamp, parent_header.timestamp)
         {
             let max_elected_validators = self.inner_ctx.max_elected_validators.unwrap_or(U256::from(21));
             let validators_election_info = self.inner_ctx.validators_election_info.clone().unwrap_or_default();
@@ -107,7 +108,7 @@ where
         if (header.number + 1).is_multiple_of(epoch_length) {
             // cache it on pre block.
             // for verify validators in post-check of fullnode mode and prepare new header in miner mode.
-            self.get_current_validators(header.number)?;
+            self.get_current_validators(header.number, header.hash_slow())?;
         }
 
         tracing::trace!("Succeed to finalize new block, block_number: {}", block.number);
@@ -354,7 +355,6 @@ where
             .unwrap_or_default()
             .balance;
 
-        // TODO: kepler reward handling needs to be refined?
         // Kepler introduced a max system reward limit, so we need to pay the system reward to the
         // system contract if the limit is not exceeded.
         if !self.spec.is_kepler_active_at_timestamp(self.evm.block().number.to(), self.evm.block().timestamp.to()) &&
@@ -362,6 +362,7 @@ where
         {
             let reward_to_system = block_reward >> SYSTEM_REWARD_PERCENT;
             if reward_to_system > 0 {
+                // send reward to SYSTEM_REWARD_CONTRACT from miner.
                 let tx = self.system_contracts.distribute_to_system(reward_to_system);
                 self.transact_system_tx(tx, validator)?;
                 tracing::debug!("Distribute to system, block_number: {}, reward_to_system: {}", self.evm.block().number, reward_to_system);
@@ -370,6 +371,7 @@ where
             block_reward -= reward_to_system;
         }
 
+        // send all left gas fees to VALIDATOR_CONTRACT for distributing & burning.
         let tx = self.system_contracts.distribute_to_validator(validator, block_reward);
         self.transact_system_tx(tx, validator)?;
         tracing::debug!("Distribute to validator, block_number: {}, block_reward: {}", self.evm.block().number, block_reward);
@@ -380,18 +382,16 @@ where
     fn distribute_finality_reward(
         &mut self,
     ) -> Result<(), BlockExecutionError> {
-        // TODO: magic num
-        // distribute finality reward per 200 blocks.
-        let distribute_interval = 200;
+        // distribute finality reward per FF_REWARD_DISTRIBUTION_INTERVAL blocks.
         let block_number = self.evm.block().number.to::<u64>();
-        if !block_number.is_multiple_of(distribute_interval) {
+        if !block_number.is_multiple_of(FF_REWARD_DISTRIBUTION_INTERVAL) {
             return Ok(());
         }
 
         let validator = self.evm.block().beneficiary;
         let mut accumulated_weights: HashMap<Address, U256> = HashMap::new();
 
-        let start = (block_number - distribute_interval).max(1);
+        let start = (block_number - FF_REWARD_DISTRIBUTION_INTERVAL).max(1);
         let end = block_number;
         let mut target_number = block_number - 1;
         // TODO: need query block header and snapshot by hash?
@@ -536,7 +536,7 @@ where
         let parent_header = self.inner_ctx.parent_header.as_ref().unwrap().clone();
         if self.spec.is_feynman_active_at_timestamp(header_number, header_timestamp) &&
             is_breathe_block(parent_header.timestamp, header_timestamp) &&
-            !self.spec.is_feynman_transition_at_timestamp(header_timestamp, parent_header.timestamp)
+            !self.spec.is_feynman_transition_at_timestamp(header_number, header_timestamp, parent_header.timestamp)
         {
             let max_elected_validators = self.inner_ctx.max_elected_validators.unwrap_or(U256::from(21));
             let validators_election_info = self.inner_ctx.validators_election_info.clone().unwrap_or_default();
@@ -556,7 +556,7 @@ where
         if (header.number + 1).is_multiple_of(epoch_length) {
             // cache it on pre block.
             // for verify validators in post-check of fullnode mode and prepare new header in miner mode.
-            self.get_current_validators(header.number)?;
+            self.get_current_validators(header.number, header.hash_slow())?;
         }
 
         {   // prepare new header in miner mode.

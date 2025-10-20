@@ -78,29 +78,7 @@ where
         let state = StateProviderDatabase::new(&state_provider);
         let mut db = State::builder().with_database(cached_reads.as_db_mut(state)).with_bundle_update().build();
         
-        //TODO: override the basefee and gaslimit after london fork.
-        //TODO: set default header extra with Reth version.
-		// extra, _ = rlp.EncodeToBytes([]interface{}{
-		// 	uint(gethversion.Major<<16 | gethversion.Minor<<8 | gethversion.Patch),
-		// 	"geth",
-		// 	runtime.Version(),
-		// 	runtime.GOOS,
-		// })
-        // TODO: parlia override header un-used fields.
-        // if w.chainConfig.Parlia == nil {
-		// 	header.ParentBeaconRoot = genParams.beaconRoot
-		// } else {
-		// 	header.WithdrawalsHash = &types.EmptyWithdrawalsHash
-		// 	if w.chainConfig.IsBohr(header.Number, header.Time) {
-		// 		header.ParentBeaconRoot = new(common.Hash)
-		// 	}
-		// 	if w.chainConfig.IsPrague(header.Number, header.Time) {
-		// 		header.RequestsHash = &types.EmptyRequestsHash
-		// 	}
-		// }
-        // if env.header.EmptyWithdrawalsHash() {
-		// 	body.Withdrawals = make([]*types.Withdrawal, 0)
-		// }
+        // using reth internal builder to build default payload.
         let mut builder = self.evm_config
             .builder_for_next_block(
                 &mut db,
@@ -124,13 +102,15 @@ where
         let mut total_fees = U256::ZERO;
         let mut cumulative_gas_used = 0;
         // reserve the systemtx gas
-        let system_txs_gas = self.parlia.estimate_gas_reserved_for_system_txs(Some(parent_header.timestamp), parent_header.number, parent_header.timestamp);
-        let block_gas_limit: u64 = builder.evm_mut().block().gas_limit - system_txs_gas;
+        let system_txs_gas = self.parlia.estimate_gas_reserved_for_system_txs(Some(parent_header.timestamp), parent_header.number+1, attributes.timestamp);
+        let block_gas_limit: u64 = builder.evm_mut().block().gas_limit.saturating_sub(system_txs_gas);
 
         let base_fee = builder.evm_mut().block().basefee;
         
         let mut sidecars_map = HashMap::new();
         let min_gas_tip = DEFAULT_MIN_GAS_TIP;
+        let mut blob_sidecars = BlobSidecars::Empty;
+
         let mut block_blob_count = 0;
 
         // todo: calc blob fee.
@@ -146,10 +126,7 @@ where
 
             // filter out tx with min gas tip.
             if pool_tx.effective_tip_per_gas(base_fee).unwrap_or(0_u128) < min_gas_tip {
-                best_tx_list.mark_invalid(
-                    &pool_tx,
-                    InvalidPoolTransactionError::Underpriced,
-                );
+                // Skip packaging underpriced transactions, but do not mark them invalid.
                 continue
             }
 

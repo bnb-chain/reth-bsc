@@ -278,15 +278,17 @@ where
         let state_clear_flag = self.spec.is_spurious_dragon_active_at_block(self.evm.block().number.to());
         self.evm.db_mut().set_state_clear_flag(state_clear_flag);
 
-        if !self.spec.is_feynman_active_at_timestamp(self.evm.block().number.to::<u64>(), self.evm.block().timestamp.to::<u64>() - 3) {
+        let parent_timestamp = self.inner_ctx.parent_header.as_ref().unwrap().timestamp;
+        // Note: here use a parent timestamp to check if the feynman fork is active. 
+        if !self.spec.is_feynman_active_at_timestamp(self.evm.block().number.to::<u64>(), parent_timestamp) {
             self.upgrade_contracts()?;
         }
      
         // enable BEP-440/EIP-2935 for historical block hashes from state
-        if self.spec.is_prague_transition_at_block_and_timestamp(self.evm.block().number.to::<u64>(), self.evm.block().timestamp.to::<u64>(),self.evm.block().timestamp.to::<u64>() - 3) {
+        if BscHardforks::is_prague_transition_at_timestamp(&self.spec, self.evm.block().number.to::<u64>(), self.evm.block().timestamp.to::<u64>(),self.evm.block().timestamp.to::<u64>() - 3) {
                 self.apply_history_storage_account(self.evm.block().number.to::<u64>())?;
         }
-        if self.spec.is_prague_active_at_block_and_timestamp(self.evm.block().number.to::<u64>(), self.evm.block().timestamp.to::<u64>()) {
+        if BscHardforks::is_prague_active_at_timestamp(&self.spec, self.evm.block().number.to::<u64>(), self.evm.block().timestamp.to::<u64>()) {
             self.system_caller
                 .apply_blockhashes_contract_call(self.ctx.base.parent_hash, &mut self.evm)?;
         }
@@ -410,7 +412,9 @@ where
             "Start to finish"
         );
 
-        if self.spec.is_feynman_active_at_timestamp(self.evm.block().number.to::<u64>(), self.evm.block().timestamp.to::<u64>()) {
+        let parent_timestamp = self.inner_ctx.parent_header.as_ref().unwrap().timestamp;
+        // Note: here use a parent timestamp to check if the feynman fork is active. 
+        if self.spec.is_feynman_active_at_timestamp(self.evm.block().number.to::<u64>(), parent_timestamp) {
             self.upgrade_contracts()?;
         }
 
@@ -422,7 +426,7 @@ where
             //     }
             // }
         // }
-        if self.spec.is_feynman_transition_at_timestamp(self.evm.block().number.to::<u64>(), self.evm.block().timestamp.to::<u64>()) {
+        if self.spec.is_feynman_transition_at_timestamp(self.evm.block().number.to::<u64>(), self.evm.block().timestamp.to::<u64>(), parent_timestamp) {
             self.initialize_feynman_contracts(self.evm.block().beneficiary)?;
         }
 

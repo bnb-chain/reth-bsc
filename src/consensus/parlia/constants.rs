@@ -1,4 +1,4 @@
-use alloy_primitives::{address, Address, U256};
+use alloy_primitives::{address, b256, Address, B256, U256};
 
 /// Fixed 32-byte vanity prefix present in every header.
 pub const EXTRA_VANITY_LEN: usize = 32;
@@ -42,3 +42,13 @@ pub const SYSTEM_TXS_GAS_SOFT_LIMIT: u64 = 1_000_000; // Maximum gas reserved fo
 
 // miner config default values
 pub const DEFAULT_MIN_GAS_TIP: u128 = 50_000_000; // 0.05 Gwei
+
+// FF reward distribution interval
+pub const FF_REWARD_DISTRIBUTION_INTERVAL: u64 = 200;
+
+// default hash
+// EmptyWithdrawalsHash is the known hash of the empty withdrawal set.
+pub const EMPTY_WITHDRAWALS_HASH: B256 = b256!("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421");
+
+// EmptyRequestsHash is the known hash of an empty request set, sha256("").
+pub const EMPTY_REQUESTS_HASH: B256 = b256!("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");

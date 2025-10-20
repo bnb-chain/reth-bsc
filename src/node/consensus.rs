@@ -179,7 +179,7 @@ impl<ChainSpec: EthChainSpec<Header = Header> + BscHardforks + 'static> FullCons
         }
 
         // Validate that the header requests hash matches the calculated requests hash
-        if chain_spec.is_prague_active_at_block_and_timestamp(block.header().number, block.header().timestamp) {
+        if BscHardforks::is_prague_active_at_timestamp(chain_spec.as_ref(), block.header().number, block.header().timestamp) {
             let Some(header_requests_hash) = block.header().requests_hash else {
                 return Err(ConsensusError::RequestsHashMissing)
             };

@@ -13,8 +13,7 @@ use crate::node::evm::pre_execution::VALIDATOR_CACHE;
 use crate::node::miner::signer::seal_header_with_global_signer;
 
 pub fn prepare_new_attributes(parlia: Arc<Parlia<BscChainSpec>>, parent_snap: &Snapshot, parent_header: &Header, signer: Address) -> EthPayloadBuilderAttributes {
-    // TODO: add extra data, vanity, forkhash, validator, turnlength, seal.
-    // TODO: add difficulty
+   
     let new_header = prepare_new_header(parlia.clone(), parent_snap, parent_header, signer);
     let mut attributes = EthPayloadBuilderAttributes{
         parent: new_header.parent_hash,
@@ -56,11 +55,19 @@ where
 {
     new_header.difficulty = calculate_difficulty(parent_snap, new_header.beneficiary);
 
+
     // fill consensus data into extra field.
     if new_header.extra_data.len() < EXTRA_VANITY_LEN {
         new_header.extra_data = Bytes::from(vec![0u8; EXTRA_VANITY_LEN]);
     }
     // TODO: add vanity data, and fork hash.
+    // set default header extra with Reth version.
+    // extra, _ = rlp.EncodeToBytes([]interface{}{
+    // 	uint(gethversion.Major<<16 | gethversion.Minor<<8 | gethversion.Patch),
+    // 	"geth",
+    // 	runtime.Version(),
+    // 	runtime.GOOS,
+    // })
 
     // prepare validators
     {   
@@ -68,7 +75,7 @@ where
         if (new_header.number).is_multiple_of(epoch_length) {
             let mut validators: Option<(Vec<Address>, Vec<crate::consensus::parlia::VoteAddress>)> = None;
             let mut cache = VALIDATOR_CACHE.lock().unwrap();
-            if let Some(cached_result) = cache.get(&parent_header.number) {
+            if let Some(cached_result) = cache.get(&parent_header.hash_slow()) {
                 tracing::debug!("Succeed to query cached validator result, block_number: {}", parent_header.number);
                 validators = Some(cached_result.clone());
             }
