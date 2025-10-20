@@ -9,8 +9,9 @@ use crate::{
             signer::init_global_signer_from_k256,
             config::{keystore, MiningConfig}
         },
+        network::BscNewBlock,
     },
-    BscBlock,
+    shared::{get_block_import_sender, get_local_peer_id_or_default},
 };
 use alloy_consensus::BlockHeader;
 use alloy_primitives::{Address, Sealable};
@@ -19,8 +20,8 @@ use reth::transaction_pool::PoolTransaction;
 use reth::transaction_pool::TransactionPool;
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
 use reth_payload_primitives::BuiltPayload;
-use reth_primitives::{SealedBlock, TransactionSigned};
-use reth_primitives_traits::SealedHeader;
+use reth_primitives::TransactionSigned;
+use reth_primitives_traits::{SealedHeader, BlockBody};
 use reth_provider::{BlockNumReader, HeaderProvider, CanonStateSubscriptions};
 use reth_tasks::TaskExecutor;
 use std::sync::Arc;
@@ -31,9 +32,6 @@ use tracing::{debug, error, info, warn};
 use reth_basic_payload_builder::{BuildArguments, PayloadConfig};
 use reth::payload::EthPayloadBuilderAttributes;
 use reth_revm::cancelled::CancelOnDrop;
-use reth_primitives_traits::BlockBody;
-use crate::node::network::BscNewBlock;
-use crate::shared::{get_block_import_sender, get_local_peer_id_or_default};
 use alloy_primitives::U128;
 use reth_network::message::NewBlockMessage;
 
@@ -178,8 +176,8 @@ where
     }
 }
 
-/// MainWorkWorker responsible for processing mining tasks and block building,
-/// submit the seal block to engine-tree and other peers.
+/// MainWorkWorker responsible for processing mining tasks and block building.
+/// Built payloads are sent to ResultWorkWorker for submission.
 pub struct MainWorkWorker<Pool, Provider> {
     validator_address: Address,
     pool: Pool,
@@ -187,6 +185,8 @@ pub struct MainWorkWorker<Pool, Provider> {
     chain_spec: Arc<crate::chainspec::BscChainSpec>,
     parlia: Arc<crate::consensus::parlia::Parlia<crate::chainspec::BscChainSpec>>,
     mining_queue_rx: mpsc::UnboundedReceiver<MiningContext>,
+    /// Sender for built payloads to ResultWorkWorker
+    payload_tx: mpsc::UnboundedSender<BscBuiltPayload>,
 }
 
 impl<Pool, Provider> MainWorkWorker<Pool, Provider>
@@ -210,6 +210,7 @@ where
         chain_spec: Arc<crate::chainspec::BscChainSpec>,
         parlia: Arc<crate::consensus::parlia::Parlia<crate::chainspec::BscChainSpec>>,
         mining_queue_rx: mpsc::UnboundedReceiver<MiningContext>,
+        payload_tx: mpsc::UnboundedSender<BscBuiltPayload>,
     ) -> Self {
         Self {
             pool,
@@ -218,6 +219,7 @@ where
             parlia,
             validator_address,
             mining_queue_rx,
+            payload_tx,
         }
     }
 
@@ -324,65 +326,138 @@ where
             build_start.elapsed()
         );
 
-        self.submit_block(payload.block(), mining_ctx).await?;
-        info!("Succeed to mine and submit, block: {}", payload.block().header().number());
+        // Send payload to ResultWorkWorker for submission
+        if let Err(e) = self.payload_tx.send(payload) {
+            error!("Failed to send payload to result worker: {}", e);
+            return Err(format!("Failed to send payload to result worker: {}", e).into());
+        }
+        
+        info!("Succeed to build and queue payload for submission, block: {}", mining_ctx.parent_header.number() + 1);
         Ok(())
     }
 
-    /// todo: check and refine.
-    async fn submit_block(
-        &self,
-        sealed_block: &SealedBlock<BscBlock>,
-        mining_ctx: MiningContext,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // now is focus on the basic workflow.
-        // TODO: refine it later. https://github.com/bnb-chain/bsc/blob/master/consensus/parlia/parlia.go#L1702.
+}
+
+/// Worker responsible for processing and submitting built payloads
+pub struct ResultWorkWorker<Pool, Provider> {
+    /// Validator address
+    validator_address: Address,
+    /// Transaction pool
+    pool: Pool,
+    /// Provider for blockchain data
+    provider: Provider,
+    /// Chain specification
+    chain_spec: Arc<crate::chainspec::BscChainSpec>,
+    /// Parlia consensus engine
+    parlia: Arc<crate::consensus::parlia::Parlia<crate::chainspec::BscChainSpec>>,
+    /// Receiver for built payloads
+    payload_rx: mpsc::UnboundedReceiver<BscBuiltPayload>,
+}
+
+impl<Pool, Provider> ResultWorkWorker<Pool, Provider>
+where
+    Provider: HeaderProvider + BlockNumReader + Send + Sync,
+{
+    /// Creates a new ResultWorkWorker instance
+    pub fn new(
+        validator_address: Address,
+        pool: Pool,
+        provider: Provider,
+        chain_spec: Arc<crate::chainspec::BscChainSpec>,
+        parlia: Arc<crate::consensus::parlia::Parlia<crate::chainspec::BscChainSpec>>,
+        payload_rx: mpsc::UnboundedReceiver<BscBuiltPayload>,
+    ) -> Self {
+        Self {
+            validator_address,
+            pool,
+            provider,
+            chain_spec,
+            parlia,
+            payload_rx,
+        }
+    }
+
+    /// Run the result worker to process and submit payloads
+    pub async fn run(mut self) {
+        info!("Starting ResultWorkWorker for validator: {}", self.validator_address);
+
+        while let Some(payload) = self.payload_rx.recv().await {
+            let block_number = payload.block().number();
+            let block_hash = payload.block().hash();
+            
+            info!("Received payload for submission: block {} (hash: 0x{:x})", block_number, block_hash);
+            
+            match self.submit_payload(payload).await {
+                Ok(()) => {
+                    info!("Successfully submitted block {} (hash: 0x{:x})", block_number, block_hash);
+                }
+                Err(e) => {
+                    error!("Failed to submit block {} (hash: 0x{:x}): {}", block_number, block_hash, e);
+                }
+            }
+        }
+
+        warn!("ResultWorkWorker stopped - payload channel closed");
+    }
+
+    /// Submit a built payload to the network
+    async fn submit_payload(&self, payload: BscBuiltPayload) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let sealed_block = payload.block();
+        let block_number = sealed_block.number();
+        let block_hash = sealed_block.hash();
+        
+        debug!("Submitting block {} (hash: 0x{:x}, txs: {}, gas_used: {})", 
+               block_number, 
+               block_hash, 
+               sealed_block.body().transaction_count(),
+               sealed_block.gas_used());
+
+        // Check if block timestamp is in the future and wait if necessary
         let present_timestamp = self.parlia.present_timestamp();
         if sealed_block.header().timestamp > present_timestamp {
             let delay_ms = (sealed_block.header().timestamp - present_timestamp) * 1000;
-            tracing::info!(
-                target: "bsc::miner",
-                block_number = sealed_block.header().number,
-                block_timestamp = sealed_block.header().timestamp,
-                present_timestamp = present_timestamp,
-                delay_ms = delay_ms,
-                "Block timestamp is in the future, waiting before submission"
+            info!(
+                "Block {} timestamp is in the future, waiting {}ms before submission",
+                block_number, delay_ms
             );
             tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
-            tracing::debug!(
-                target: "bsc::miner",
-                block_number = sealed_block.header().number,
-                "Finished waiting, proceeding with block submission"
-            );
         }
 
-        let parent_number = mining_ctx.parent_header.number();
+        // Calculate total difficulty
+        let parent_number = block_number - 1;
         let parent_td = self.provider.header_td_by_number(parent_number)
-            .map_err(|e| format!("Failed to get parent total difficulty due to {}", e))?
+            .map_err(|e| format!("Failed to get parent total difficulty: {}", e))?
             .unwrap_or_default();
         let current_difficulty = sealed_block.header().difficulty();
         let new_td = parent_td + current_difficulty;
         
         let td = U128::from(new_td.to::<u128>());
-        let block_hash = sealed_block.hash();
-        let new_block = BscNewBlock(reth_eth_wire::NewBlock { block: sealed_block.clone_block(), td });
-        let msg = NewBlockMessage { hash: block_hash, block: Arc::new(new_block) };
+        let new_block = BscNewBlock(reth_eth_wire::NewBlock { 
+            block: sealed_block.clone_block(), 
+            td 
+        });
+        let msg = NewBlockMessage { 
+            hash: block_hash, 
+            block: Arc::new(new_block) 
+        };
 
+        // Send to block import service
         if let Some(sender) = get_block_import_sender() {
             let peer_id = get_local_peer_id_or_default();
             let incoming: crate::node::network::block_import::service::IncomingBlock =
                 (msg, peer_id);
             if sender.send(incoming).is_err() {
-                warn!("Failed to send mined block to import service due to channel closed");
-                return Err("Failed to send mined block to import service due to channel closed".into());
+                warn!("Failed to send mined block to import service - channel closed");
+                return Err("Failed to send mined block to import service - channel closed".into());
             } else {
-                debug!("Succeed to send mined block to import service");
+                debug!("Successfully sent mined block to import service");
             }
         } else {
-            warn!("Failed to send mined block due to import sender not initialised");
-            return Err("Failed to send mined block due to import sender not initialised".into());
+            warn!("Block import sender not initialized");
+            return Err("Block import sender not initialized".into());
         }
-
+        
+        info!("Block {} submitted successfully", block_number);
         Ok(())
     }
 }
@@ -393,6 +468,7 @@ pub struct BscMiner<Pool, Provider> {
     signing_key: SigningKey,
     new_work_worker: NewWorkWorker<Provider>,
     main_work_worker: MainWorkWorker<Pool, Provider>,
+    result_work_worker: ResultWorkWorker<Pool, Provider>,
     task_executor: TaskExecutor,
 }
 
@@ -445,19 +521,33 @@ where
         }
         
         let (mining_queue_tx, mining_queue_rx) = mpsc::unbounded_channel::<MiningContext>();
+        let (payload_tx, payload_rx) = mpsc::unbounded_channel::<BscBuiltPayload>();
+        
         let new_work_worker = NewWorkWorker::new(
             validator_address,
             provider.clone(),
             snapshot_provider.clone(),
             mining_queue_tx.clone(),
         );
+        
+        let parlia = Arc::new(crate::consensus::parlia::Parlia::new(chain_spec.clone(), 200));
         let main_work_worker = MainWorkWorker::new(
             validator_address,
             pool.clone(),
             provider.clone(),
             chain_spec.clone(),
-            Arc::new(crate::consensus::parlia::Parlia::new(chain_spec.clone(), 200)),
+            parlia.clone(),
             mining_queue_rx,
+            payload_tx,
+        );
+        
+        let result_work_worker = ResultWorkWorker::new(
+            validator_address,
+            pool.clone(),
+            provider.clone(),
+            chain_spec.clone(),
+            parlia.clone(),
+            payload_rx,
         );
         
         let miner = Self {
@@ -465,6 +555,7 @@ where
             signing_key,
             new_work_worker,
             main_work_worker,
+            result_work_worker,
             task_executor,
         };
         info!("Succeed to new miner, address: {}", validator_address);
@@ -483,6 +574,7 @@ where
     fn spawn_workers(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.task_executor.spawn_critical("new_work_worker", self.new_work_worker.run());
         self.task_executor.spawn_critical("main_work_worker", self.main_work_worker.run());
+        self.task_executor.spawn_critical("result_work_worker", self.result_work_worker.run());
         info!("Succeed to start mining, address: {}", self.validator_address);
         Ok(())
     }

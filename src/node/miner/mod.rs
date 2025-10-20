@@ -5,5 +5,5 @@ pub mod bsc_miner;
 pub mod config;
 pub mod main_worker;
 
-pub use bsc_miner::BscMiner;
+pub use bsc_miner::{BscMiner, ResultWorkWorker};
 pub use config::{MiningConfig, keystore};
