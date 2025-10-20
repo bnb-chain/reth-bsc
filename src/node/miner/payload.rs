@@ -31,7 +31,6 @@ use crate::node::primitives::BscBlobTransactionSidecar;
 use std::collections::HashMap;
 use reth_chainspec::EthChainSpec;
 use reth_chainspec::EthereumHardforks;
-use tracing::trace;
 
 /// BSC payload builder, used to build payload for bsc miner.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,7 +104,6 @@ where
         // todo: calc blob fee.
         let blob_params = self.chain_spec.blob_params_at_timestamp(attributes.timestamp());
         let max_blob_count = blob_params.as_ref().map(|params| params.max_blob_count).unwrap_or_default();
-        // check: now only filter out blob tx by none blob fee for simple test.
         let mut best_tx_list = self.pool.best_transactions_with_attributes(BestTransactionsAttributes::new(base_fee, None));
         while let Some(pool_tx) = best_tx_list.next() {
             // ensure we still have capacity for this transaction
@@ -167,7 +165,7 @@ where
                         Err(Eip4844PoolTransactionError::UnexpectedEip7594SidecarBeforeOsaka)
                     }
                 };
-                debug!("debug payload_builder,tx hash: {:?}, blob_sidecar_result: {:?}", tx.hash(), blob_sidecar_result);
+                debug!("debug payload_builder,tx_hash: {:?}, blob_sidecar_result: {:?}", tx.hash(), blob_sidecar_result);
 
                 blob_tx_sidecar = match blob_sidecar_result {
                     Ok(sidecar) => Some(sidecar),
@@ -176,7 +174,7 @@ where
                         continue
                     }
                 };
-                debug!("debug payload_builder, tx hash: {:?}, blob_tx_sidecar: {:?}", tx.hash(), blob_tx_sidecar);
+                debug!("debug payload_builder, tx_hash: {:?}, blob_tx_sidecar: {:?}", tx.hash(), blob_tx_sidecar);
             }
             
             let gas_used = match builder.execute_transaction(tx.clone()) {
@@ -271,7 +269,7 @@ where
 }
 
 
-struct BscPayloadJob<Pool, Client, EvmConfig = BscEvmConfig> {
+pub struct BscPayloadJob<Pool, Client, EvmConfig = BscEvmConfig> {
     /// The payload builder instance
     builder: BscPayloadBuilder<Pool, Client, EvmConfig>,
     /// Timeout for payload building
@@ -301,7 +299,6 @@ where
     /// Creates a new BscPayloadJob
     pub fn new(
         builder: BscPayloadBuilder<Pool, Client, EvmConfig>,
-        timeout: std::time::Duration,
         args: BuildArguments<EthPayloadBuilderAttributes, BscBuiltPayload>,
         result_tx: mpsc::UnboundedSender<BscBuiltPayload>,
     ) -> Self {
@@ -309,7 +306,7 @@ where
         
         Self {
             builder,
-            timeout,
+            timeout: std::time::Duration::from_millis(500), // Default 500ms timeout
             cancel: args.cancel.clone(),
             args,
             abort_rx,
@@ -330,34 +327,37 @@ where
 
     /// Runs the payload job asynchronously with timeout support
     pub async fn run(mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Async build payload.
+        let builder_task = tokio::spawn(async move {
+            self.builder.build_payload(self.args).await
+        });
+        
         tokio::select! {
-            // do payload building.
-            result = self.builder.build_payload(self.args) => {
+            result = builder_task => {
                 match result {
-                    Ok(payload) => {
+                    Ok(Ok(payload)) => {
                         // TODO: retry and pick best one.
                         if let Err(err) = self.result_tx.send(payload) {
                             warn!("Failed to send payload to result channel: {}", err);
                         }
                         Ok(())
-                    }
-                    Err(e) => {
-                        Err(e)
-                    }
+                    },
+                    Ok(Err(e)) => Err(e),
+                    Err(e) => Err(format!("Payload building task failed: {}", e).into()),
                 }
             }
             
             // normal finish by timer.
             _ = tokio::time::sleep(self.timeout) => {
                 drop(self.cancel);
-                Ok(())
+                Ok(()) // Timeout, no payload
             }
             
             // abort by external signal
             _ = &mut self.abort_rx => {
                 drop(self.cancel);
                 self.is_aborted = true;
-                Ok(())
+                Ok(()) // Aborted, no payload
             }
         }
     }

@@ -4,7 +4,7 @@ use crate::{
         engine::BscBuiltPayload,
         evm::config::BscEvmConfig,
         miner::{
-            payload_builder::BscPayloadBuilder, 
+            payload::{BscPayloadBuilder, BscPayloadJob}, 
             util::prepare_new_attributes, 
             signer::init_global_signer_from_k256,
             config::{keystore, MiningConfig}
@@ -252,45 +252,6 @@ where
         warn!("Mining worker stopped");
     }
 
-    pub async fn run_v2(mut self) {
-        info!("Succeed to spawn main work worker v2, address: {}", self.validator_address);
-        
-        // Use tokio::select! for better async handling
-        loop {
-            tokio::select! {
-                // Handle mining context from queue
-                ctx_result = self.mining_queue_rx.recv() => {
-                    match ctx_result {
-                        Some(ctx) => {
-                            let next_block = ctx.parent_header.number() + 1;
-                            debug!("Received mining context, next_block: {}", next_block);
-
-                            match self.try_mine_block(ctx).await {
-                                Ok(()) => {
-                                    debug!("Succeed to mine block, next_block: {}", next_block);
-                                }
-                                Err(e) => {
-                                    error!("Failed to mine block due to {}, next_block: {}", e, next_block);
-                                }
-                            }
-                        }
-                        None => {
-                            warn!("Mining queue closed, exiting main work worker");
-                            break;
-                        }
-                    }
-                }
-                // Handle graceful shutdown signal (optional)
-                _ = tokio::signal::ctrl_c() => {
-                    info!("Received shutdown signal, stopping main work worker v2");
-                    break;
-                }
-            }
-        }
-        
-        warn!("Mining worker v2 stopped");
-    }
-
     async fn try_mine_block(
         &self,
         mining_ctx: MiningContext,
@@ -310,68 +271,53 @@ where
             EthereumBuilderConfig::new(),
             self.chain_spec.clone(),
         );
-        
-        let build_start = std::time::Instant::now();        
-        let payload = payload_builder.build_payload(
+                
+        let payload_job = BscPayloadJob::new(
+            payload_builder,
             BuildArguments::<EthPayloadBuilderAttributes, BscBuiltPayload>::new(
                 reth_revm::cached::CachedReads::default(),
                 PayloadConfig::new(Arc::new(mining_ctx.parent_header.clone()), attributes),
                 CancelOnDrop::default(), // todo: refine abort logic
-                None,)
-        ).await?;
-        debug!("Succeed to build block: {} (hash: 0x{:x}, trx_len: {}, cost_time: {:?})", 
-            payload.block().header().number(),
-            payload.block().hash(),
-            payload.block().body().transaction_count(),
-            build_start.elapsed()
+                None,
+            ),
+            self.payload_tx.clone(),
         );
-
-        // Send payload to ResultWorkWorker for submission
-        if let Err(e) = self.payload_tx.send(payload) {
-            error!("Failed to send payload to result worker: {}", e);
-            return Err(format!("Failed to send payload to result worker: {}", e).into());
-        }
         
-        info!("Succeed to build and queue payload for submission, block: {}", mining_ctx.parent_header.number() + 1);
+        tokio::spawn(async move {
+            payload_job.run().await
+        });
+        
         Ok(())
     }
 
 }
 
 /// Worker responsible for processing and submitting built payloads
-pub struct ResultWorkWorker<Pool, Provider> {
+pub struct ResultWorkWorker<Provider> {
     /// Validator address
     validator_address: Address,
-    /// Transaction pool
-    pool: Pool,
     /// Provider for blockchain data
     provider: Provider,
-    /// Chain specification
-    chain_spec: Arc<crate::chainspec::BscChainSpec>,
     /// Parlia consensus engine
     parlia: Arc<crate::consensus::parlia::Parlia<crate::chainspec::BscChainSpec>>,
     /// Receiver for built payloads
     payload_rx: mpsc::UnboundedReceiver<BscBuiltPayload>,
 }
 
-impl<Pool, Provider> ResultWorkWorker<Pool, Provider>
+impl<Provider> ResultWorkWorker<Provider>
 where
     Provider: HeaderProvider + BlockNumReader + Send + Sync,
 {
     /// Creates a new ResultWorkWorker instance
     pub fn new(
         validator_address: Address,
-        pool: Pool,
         provider: Provider,
-        chain_spec: Arc<crate::chainspec::BscChainSpec>,
         parlia: Arc<crate::consensus::parlia::Parlia<crate::chainspec::BscChainSpec>>,
         payload_rx: mpsc::UnboundedReceiver<BscBuiltPayload>,
     ) -> Self {
         Self {
             validator_address,
-            pool,
             provider,
-            chain_spec,
             parlia,
             payload_rx,
         }
@@ -468,7 +414,7 @@ pub struct BscMiner<Pool, Provider> {
     signing_key: SigningKey,
     new_work_worker: NewWorkWorker<Provider>,
     main_work_worker: MainWorkWorker<Pool, Provider>,
-    result_work_worker: ResultWorkWorker<Pool, Provider>,
+    result_work_worker: ResultWorkWorker<Provider>,
     task_executor: TaskExecutor,
 }
 
@@ -543,9 +489,7 @@ where
         
         let result_work_worker = ResultWorkWorker::new(
             validator_address,
-            pool.clone(),
             provider.clone(),
-            chain_spec.clone(),
             parlia.clone(),
             payload_rx,
         );
