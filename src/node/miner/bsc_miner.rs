@@ -281,10 +281,13 @@ where
             self.payload_tx.clone(),
         );
         
+        let start_time = std::time::Instant::now();
         self.running_job_handle = Some(job_handle);
         tokio::spawn(async move {
-            payload_job.run().await
+            payload_job.start().await
         });
+        debug!("Succeed to async start payload job, cost_time: {:?}, block_number: {}", 
+            start_time.elapsed(), mining_ctx.parent_header.number()+1);
         
         Ok(())
     }

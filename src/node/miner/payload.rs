@@ -294,7 +294,7 @@ pub struct BscPayloadJob<Pool, Client, EvmConfig = BscEvmConfig> {
     is_aborted: bool,
     /// Sender for payload results
     result_tx: mpsc::UnboundedSender<BscBuiltPayload>,
-    // TODO, retry, mev.
+    // TODO: enrich retry, mev workflows.
 }
 
 impl<Pool, Client, EvmConfig> BscPayloadJob<Pool, Client, EvmConfig>
@@ -314,7 +314,7 @@ where
         
         let job = Self {
             builder,
-            timeout: std::time::Duration::from_millis(500), // Default 500ms timeout
+            timeout: std::time::Duration::from_millis(500), // TODO: refine it more.
             cancel: args.cancel.clone(),
             args,
             abort_rx,
@@ -330,43 +330,55 @@ where
     }
 
     /// Runs the payload job asynchronously with timeout support
-    pub async fn run(mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Async build payload.
+    pub async fn start(mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let start_time = std::time::Instant::now();
         let builder_task = tokio::spawn(async move {
             self.builder.build_payload(self.args).await
         });
         
         tokio::select! {
             result = builder_task => {
+                let elapsed = start_time.elapsed();
                 match result {
                     Ok(Ok(payload)) => {
                         // TODO: retry and pick best one.
-                        info!("Start to submit block: {} (hash: 0x{:x}, txs: {})", 
+                        info!("Start to submit block: {} (hash: 0x{:x}, txs: {}, build_time: {:?})", 
                             payload.block().header().number(),
                             payload.block().hash(),
-                            payload.block().body().transaction_count()
+                            payload.block().body().transaction_count(),
+                            elapsed
                         );
                         if let Err(err) = self.result_tx.send(payload) {
                             warn!("Failed to send payload to result channel: {}", err);
                         }
                         Ok(())
                     },
-                    Ok(Err(e)) => Err(e),
-                    Err(e) => Err(format!("Payload building task failed: {}", e).into()),
+                    Ok(Err(e)) => {
+                        warn!("Payload building failed after {:?}: {}", elapsed, e);
+                        Err(e)
+                    },
+                    Err(e) => {
+                        warn!("Payload building task failed after {:?}: {}", elapsed, e);
+                        Err(format!("Payload building task failed: {}", e).into())
+                    },
                 }
             }
             
             // normal finish by timer
             _ = tokio::time::sleep(self.timeout) => {
+                let elapsed = start_time.elapsed();
+                warn!("Payload building timed out after {:?}", elapsed);
                 drop(self.cancel);
-                Ok(()) // Timeout, no payload
+                Ok(())
             }
             
             // abort by external signal
             _ = &mut self.abort_rx => {
+                let elapsed = start_time.elapsed();
+                info!("Payload building aborted after {:?}", elapsed);
                 drop(self.cancel);
                 self.is_aborted = true;
-                Ok(()) // Aborted, no payload
+                Ok(())
             }
         }
     }
