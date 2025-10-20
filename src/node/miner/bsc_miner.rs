@@ -333,7 +333,7 @@ where
             let block_number = payload.block().number();
             let block_hash = payload.block().hash();
             
-            debug!("Received payload for submission: block {} (hash: 0x{:x})", block_number, block_hash);
+            debug!("Received payload for submission, block {} (hash: 0x{:x})", block_number, block_hash);
             
             match self.submit_payload(payload).await {
                 Ok(()) => {

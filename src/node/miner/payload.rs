@@ -124,7 +124,7 @@ where
 
             let tx = pool_tx.to_consensus();
             let mut blob_tx_sidecar = None;
-            debug!("debug payload_builder, tx: {:?} is blob tx: {:?} tx type: {:?}", tx.hash(), tx.is_eip4844(), tx.tx_type());
+            debug!("debug payload_builder, tx: {:?} is_blob_tx: {:?} tx_type: {:?}", tx.hash(), tx.is_eip4844(), tx.tx_type());
             if let Some(blob_tx) = tx.as_eip4844() {
                 let tx_blob_count = blob_tx.tx().blob_versioned_hashes.len() as u64;
 
@@ -274,11 +274,13 @@ pub struct BscPayloadJobHandle {
 }
 
 impl BscPayloadJobHandle {
+    // aborted by new head.
     pub fn abort(self) {
         let _ = self.abort_tx.send(());
     }
 }
 
+/// BscPayloadJob is used to async build payloads to get best payload.
 pub struct BscPayloadJob<Pool, Client, EvmConfig = BscEvmConfig> {
     /// The payload builder instance
     builder: BscPayloadBuilder<Pool, Client, EvmConfig>,
@@ -342,7 +344,7 @@ where
                 match result {
                     Ok(Ok(payload)) => {
                         // TODO: retry and pick best one.
-                        info!("Start to submit block: {} (hash: 0x{:x}, txs: {}, build_time: {:?})", 
+                        info!("Start to submit block: {} (hash: 0x{:x}, txs: {}, cost_time: {:?})", 
                             payload.block().header().number(),
                             payload.block().hash(),
                             payload.block().body().transaction_count(),
@@ -372,7 +374,7 @@ where
                 Ok(())
             }
             
-            // abort by external signal
+            // abort by new head
             _ = &mut self.abort_rx => {
                 let elapsed = start_time.elapsed();
                 info!("Payload building aborted after {:?}", elapsed);
