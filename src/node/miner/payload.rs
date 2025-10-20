@@ -165,7 +165,7 @@ where
                         Err(Eip4844PoolTransactionError::UnexpectedEip7594SidecarBeforeOsaka)
                     }
                 };
-                debug!("debug payload_builder,tx_hash: {:?}, blob_sidecar_result: {:?}", tx.hash(), blob_sidecar_result);
+                debug!("debug payload_builder, tx_hash: {:?}, blob_sidecar_result: {:?}", tx.hash(), blob_sidecar_result);
 
                 blob_tx_sidecar = match blob_sidecar_result {
                     Ok(sidecar) => Some(sidecar),
@@ -356,7 +356,7 @@ where
                 }
             }
             
-            // normal finish by timer.
+            // normal finish by timer
             _ = tokio::time::sleep(self.timeout) => {
                 drop(self.cancel);
                 Ok(()) // Timeout, no payload
