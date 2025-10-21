@@ -334,15 +334,12 @@ where
     /// Runs the payload job asynchronously with timeout support
     pub async fn start(mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let start_time = std::time::Instant::now();
-        let builder_task = tokio::spawn(async move {
-            self.builder.build_payload(self.args).await
-        });
         
         tokio::select! {
-            result = builder_task => {
+            result = self.builder.build_payload(self.args) => {
                 let elapsed = start_time.elapsed();
                 match result {
-                    Ok(Ok(payload)) => {
+                    Ok(payload) => {
                         // TODO: retry and pick best one.
                         info!("Start to submit block: {} (hash: 0x{:x}, txs: {}, cost_time: {:?})", 
                             payload.block().header().number(),
@@ -355,13 +352,9 @@ where
                         }
                         Ok(())
                     },
-                    Ok(Err(e)) => {
+                    Err(e) => {
                         warn!("Payload building failed after {:?}: {}", elapsed, e);
                         Err(e)
-                    },
-                    Err(e) => {
-                        warn!("Payload building task failed after {:?}: {}", elapsed, e);
-                        Err(format!("Payload building task failed: {}", e).into())
                     },
                 }
             }

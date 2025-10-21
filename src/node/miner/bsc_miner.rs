@@ -27,6 +27,7 @@ use reth_tasks::TaskExecutor;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 use tokio_stream::StreamExt;
 use tracing::{debug, error, info, warn};
 use reth_basic_payload_builder::{BuildArguments, PayloadConfig};
@@ -181,6 +182,7 @@ pub struct MainWorkWorker<Pool, Provider> {
     mining_queue_rx: mpsc::UnboundedReceiver<MiningContext>,
     payload_tx: mpsc::UnboundedSender<BscBuiltPayload>,
     running_job_handle: Option<BscPayloadJobHandle>,
+    payload_job_join_set: JoinSet<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
 }
 
 impl<Pool, Provider> MainWorkWorker<Pool, Provider>
@@ -215,6 +217,7 @@ where
             mining_queue_rx,
             payload_tx,
             running_job_handle: None,
+            payload_job_join_set: JoinSet::new(),
         }
     }
 
@@ -222,23 +225,31 @@ where
         info!("Succeed to spawn main work worker, address: {}", self.validator_address);
         
         loop {
-            match self.mining_queue_rx.recv().await {
-                Some(ctx) => {
-                    let next_block = ctx.parent_header.number() + 1;
-                    debug!("Received mining context, next_block: {}", next_block);
+            tokio::select! {
+                mining_ctx = self.mining_queue_rx.recv() => {
+                    match mining_ctx {
+                        Some(ctx) => {
+                            let next_block = ctx.parent_header.number() + 1;
+                            debug!("Received mining context, next_block: {}", next_block);
 
-                    match self.try_mine_block(ctx).await {
-                        Ok(()) => {
-                            debug!("Succeed to mine block, next_block: {}", next_block);
+                            match self.try_mine_block(ctx).await {
+                                Ok(()) => {
+                                    debug!("Succeed to mine block, next_block: {}", next_block);
+                                }
+                                Err(e) => {
+                                    error!("Failed to mine block due to {}, next_block: {}", e, next_block);
+                                }
+                            }
                         }
-                        Err(e) => {
-                            error!("Failed to mine block due to {}, next_block: {}", e, next_block);
+                        None => {
+                            warn!("Mining queue closed, exiting main work worker");
+                            break;
                         }
                     }
                 }
-                None => {
-                    warn!("Mining queue closed, exiting main work worker");
-                    break;
+                
+                _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {
+                    self.check_payload_job_results().await;
                 }
             }
         }
@@ -283,13 +294,30 @@ where
         
         let start_time = std::time::Instant::now();
         self.running_job_handle = Some(job_handle);
-        tokio::spawn(async move {
+        self.payload_job_join_set.spawn(async move {
             payload_job.start().await
         });
         debug!("Succeed to async start payload job, cost_time: {:?}, block_number: {}", 
             start_time.elapsed(), mining_ctx.parent_header.number()+1);
         
         Ok(())
+    }
+
+    /// Check and print completed payload job tasks results
+    pub async fn check_payload_job_results(&mut self) {
+        while let Some(result) = self.payload_job_join_set.try_join_next() {
+            match result {
+                Ok(Ok(())) => {
+                    debug!("Succeed to execute payload job");
+                }
+                Ok(Err(e)) => {
+                    warn!("Failed to execute payload job due to {}", e);
+                }
+                Err(join_err) => {
+                    error!("Failed to execute payload job due to task panicked or was cancelled, join_err: {}", join_err);
+                }
+            }
+        }
     }
 
 }
@@ -337,7 +365,7 @@ where
             
             match self.submit_payload(payload).await {
                 Ok(()) => {
-                    info!("Succeed to submitt block {} (hash: 0x{:x})", block_number, block_hash);
+                    info!("Succeed to submit block {} (hash: 0x{:x})", block_number, block_hash);
                 }
                 Err(e) => {
                     error!("Failed to submit block {} (hash: 0x{:x}): {}", block_number, block_hash, e);
@@ -373,8 +401,7 @@ where
             tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
         }
 
-        // Calculate total difficulty
-        let parent_number = block_number - 1;
+        let parent_number = block_number.checked_sub(1).unwrap_or(0);
         let parent_td = self.provider.header_td_by_number(parent_number)
             .map_err(|e| format!("Failed to get parent total difficulty due to {}", e))?
             .unwrap_or_default();
