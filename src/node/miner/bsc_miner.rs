@@ -401,7 +401,7 @@ where
             tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
         }
 
-        let parent_number = block_number.checked_sub(1).unwrap_or(0);
+        let parent_number = block_number.saturating_sub(1);
         let parent_td = self.provider.header_td_by_number(parent_number)
             .map_err(|e| format!("Failed to get parent total difficulty due to {}", e))?
             .unwrap_or_default();
