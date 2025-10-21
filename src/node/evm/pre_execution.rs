@@ -278,19 +278,11 @@ where
             // the attestation target block should be direct parent.
             let target_block = attestation.data.target_number;
             let target_hash = attestation.data.target_hash;
-            if target_block != parent.number() || target_hash != parent.hash_slow() {
-                return Err(BscBlockExecutionError::InvalidAttestationTarget {
-                    block_number: GotExpected { got: target_block, expected: parent.number() },
-                    block_hash: GotExpected { got: target_hash, expected: parent.hash_slow() }
-                        .into(),
-                }
-                .into());
-            }
 
             let mut is_match = false;
             let mut ancestor = parent.clone();
             for _ in 0..self.get_ancestor_generation_depth(header) {
-                if ancestor.number() == target_block {
+                if ancestor.number() == target_block && ancestor.hash_slow() == target_hash {
                     is_match = true;
                     break;
                 }
@@ -299,6 +291,7 @@ where
                     .unwrap()
                     .get_header_by_hash(&ancestor.parent_hash())
                     .ok_or_else(|| BscBlockExecutionError::UnknownHeader { block_hash: ancestor.parent_hash() })?;
+
             }
 
             if !is_match {
