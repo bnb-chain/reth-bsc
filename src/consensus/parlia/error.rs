@@ -1,6 +1,6 @@
 use alloy_primitives::BlockNumber;
 
-use crate::consensus::parlia::{VoteAddress, VoteData};
+use crate::consensus::parlia::VoteAddress;
 
 /// Parlia consensus error.
 #[derive(thiserror::Error, Debug, PartialEq, Eq, Clone)]
@@ -55,8 +55,6 @@ pub enum ParliaConsensusError {
     /// Error when header extra attestation is invalid
     #[error("fetch vote error")]
     FetchVoteError {
-        expected: VoteData,
-        got: VoteData,
         address: VoteAddress,
     },
 

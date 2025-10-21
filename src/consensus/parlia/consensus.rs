@@ -608,9 +608,8 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
         // Check vote data from votes
         for vote in votes.iter() {
             if vote.data.hash() != attestation.data.hash() {
+                tracing::debug!(target: "parlia::consensus", "vote data hash mismatch, expected={:?}, got={:?}", attestation.data, vote);
                 return Err(ParliaConsensusError::FetchVoteError {
-                    expected: attestation.data,
-                    got: vote.data,
                     address: vote.vote_address,
                 });
             }
