@@ -1,6 +1,6 @@
 use alloy_primitives::BlockNumber;
 
-use crate::consensus::parlia::{VoteData, VoteEnvelope};
+use crate::consensus::parlia::{VoteAddress, VoteData};
 
 /// Parlia consensus error.
 #[derive(thiserror::Error, Debug, PartialEq, Eq, Clone)]
@@ -56,7 +56,8 @@ pub enum ParliaConsensusError {
     #[error("fetch vote error")]
     FetchVoteError {
         expected: VoteData,
-        got: VoteEnvelope,
+        got: VoteData,
+        address: VoteAddress,
     },
 
     /// Error when aggregate signature failed

@@ -610,7 +610,8 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
             if vote.data.hash() != attestation.data.hash() {
                 return Err(ParliaConsensusError::FetchVoteError {
                     expected: attestation.data,
-                    got: vote.clone(),
+                    got: vote.data,
+                    address: vote.vote_address,
                 });
             }
         }
