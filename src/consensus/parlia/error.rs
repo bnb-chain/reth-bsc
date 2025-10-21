@@ -1,5 +1,7 @@
 use alloy_primitives::BlockNumber;
 
+use crate::consensus::parlia::{VoteData, VoteEnvelope};
+
 /// Parlia consensus error.
 #[derive(thiserror::Error, Debug, PartialEq, Eq, Clone)]
 pub enum ParliaConsensusError {
@@ -49,4 +51,22 @@ pub enum ParliaConsensusError {
     /// Error when header extra attestation is invalid
     #[error("invalid attestation")]
     ExtraInvalidAttestation,
+
+    /// Error when header extra attestation is invalid
+    #[error("fetch vote error")]
+    FetchVoteError {
+        expected: VoteData,
+        got: VoteEnvelope,
+    },
+
+    /// Error when aggregate signature failed
+    #[error("aggregate signature failed")]
+    AggregateSignatureError,
+
+    /// Error when invalid attestation vote count
+    #[error("invalid attestation vote count")]
+    InvalidAttestationVoteCount {
+        got: u32,
+        expected: u32,
+    },
 }

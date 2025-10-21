@@ -10,7 +10,7 @@ use reth::payload::EthPayloadBuilderAttributes;
 use crate::hardforks::BscHardforks;
 use reth_chainspec::EthChainSpec;
 use crate::node::evm::pre_execution::VALIDATOR_CACHE;
-use crate::node::miner::signer::seal_header_with_global_signer;
+use crate::node::miner::signer::{seal_header_with_global_signer, SignerError};
 
 pub fn prepare_new_attributes(parlia: Arc<Parlia<BscChainSpec>>, parent_snap: &Snapshot, parent_header: &Header, signer: Address) -> EthPayloadBuilderAttributes {
    
@@ -89,7 +89,11 @@ where
         parlia.prepare_turn_length(parent_snap, turn_length, new_header);
     }
 
-    // TODO: assembleVoteAttestation from votePool at last
+    // TODO: add BEP-590 changes in fermi hardfork later, it changes the assemble and verify logic.
+    if let Err(e) = parlia.assemble_vote_attestation(parent_snap, parent_header, new_header) {
+        tracing::debug!(target: "parlia::miner", "Assemble vote attestation failed: {e:?}");
+        return Err(SignerError::SigningFailed(format!("Assemble vote attestation failed: {e:?}")));
+    }
 
     // seal header
     {   

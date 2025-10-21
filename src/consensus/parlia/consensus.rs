@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::SystemTime;
 use lazy_static::lazy_static;
@@ -10,6 +11,9 @@ use alloy_primitives::{Address, B256};
 use secp256k1::{SECP256K1, Message, ecdsa::{RecoveryId, RecoverableSignature}};
 use crate::consensus::parlia::util::calculate_millisecond_timestamp;
 use crate::consensus::parlia::util::is_breathe_block;
+use crate::consensus::parlia::vote_pool::fetch_vote_by_block_hash;
+use crate::consensus::parlia::VoteData;
+use crate::consensus::parlia::VoteSignature;
 use crate::consensus::parlia::DIFF_NOTURN;
 use crate::consensus::parlia::FIXED_BACKOFF_TIME_BEFORE_FORK_MILLIS;
 use crate::consensus::parlia::SYSTEM_TXS_GAS_HARD_LIMIT;
@@ -583,4 +587,68 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
         SYSTEM_TXS_GAS_HARD_LIMIT
     }
 
+    pub fn assemble_vote_attestation(&self, parent_snap: &Snapshot, parent_header: &Header, current_header: &mut Header) -> Result<(), ParliaConsensusError> {
+        if !self.spec.is_luban_active_at_block(current_header.number()) || current_header.number() < 2 {
+            return Ok(());
+        }
+
+        let votes = fetch_vote_by_block_hash(current_header.parent_hash());
+        if votes.len() < parent_snap.validators.len() * 2 / 3 {
+            return Ok(());
+        }
+
+        // get justified number and hash from parent snapshot
+        let (justified_number, justified_hash) = (parent_snap.vote_data.target_number, parent_snap.vote_data.target_hash);
+        let mut attestation = VoteAttestation::new_with_vote_data(VoteData {
+            source_number: justified_number,
+            source_hash: justified_hash,
+            target_number: parent_header.number,
+            target_hash: parent_header.hash_slow(),
+        });
+        // Check vote data from votes
+        for vote in votes.iter() {
+            if vote.data.hash() != attestation.data.hash() {
+                return Err(ParliaConsensusError::FetchVoteError {
+                    expected: attestation.data,
+                    got: vote.clone(),
+                });
+            }
+        }
+        // Prepare aggregated vote signature and vote address set
+        let mut vote_addr_set: HashSet<VoteAddress> = HashSet::new();
+        let mut signatures: Vec<VoteSignature> = Vec::new();
+        for vote in votes.iter() {
+            vote_addr_set.insert(vote.vote_address);
+            signatures.push(vote.signature);
+        }
+        let sigs: Vec<blst::min_pk::Signature> = signatures.iter().map(|sig| blst::min_pk::Signature::from_bytes(sig.as_slice()).unwrap()).collect();
+        let sigs_ref: Vec<&blst::min_pk::Signature> = sigs.iter().collect();
+        let aggregate = blst::min_pk::AggregateSignature::aggregate(&sigs_ref, false)
+            .map_err(|_| ParliaConsensusError::AggregateSignatureError)?;
+        attestation.agg_signature.copy_from_slice(&aggregate.to_signature().to_bytes());
+        // Prepare vote address bitset.
+        for (_, val_info) in parent_snap.validators_map.iter() {
+            if vote_addr_set.contains(&val_info.vote_addr) {
+                attestation.vote_address_set |= 1 << (val_info.index - 1)
+            }
+        }
+        if attestation.vote_address_set.count_ones() < signatures.len() as u32 {
+            return Err(ParliaConsensusError::InvalidAttestationVoteCount {
+                got: attestation.vote_address_set.count_ones(),
+                expected: signatures.len() as u32,
+            });
+        }
+        // Append attestation to header extra field.
+        let buf = alloy_rlp::encode(&attestation);
+        let extra_seal_start = current_header.extra_data.len() - EXTRA_SEAL_LEN;
+        let extra_seal_bytes = &current_header.extra_data[extra_seal_start..];
+
+        let mut new_extra = Vec::with_capacity(extra_seal_start + buf.len() + EXTRA_SEAL_LEN);
+        new_extra.extend_from_slice(&current_header.extra_data[..extra_seal_start]);
+        new_extra.extend_from_slice(buf.as_ref());
+        new_extra.extend_from_slice(extra_seal_bytes);
+
+        current_header.extra_data = alloy_primitives::Bytes::from(new_extra);
+        Ok(())
+    }
 }

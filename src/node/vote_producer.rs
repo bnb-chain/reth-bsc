@@ -111,10 +111,10 @@ pub fn maybe_produce_and_broadcast_for_head(
     BLOCKS_SINCE_MINING.store(threshold, Ordering::Relaxed);
 
     // Use current header's snapshot to determine source (last justified)
-    let snap = match snapshot_provider.snapshot(target_number) {
+    let snap = match snapshot_provider.snapshot_by_hash(&target_hash) {
         Some(s) => s,
         None => {
-            tracing::trace!(target: "bsc::vote", reason = "missing-snapshot", target_number=target_number, "skip vote production");
+            tracing::trace!(target: "bsc::vote", reason = "missing-snapshot", target_hash=%format!("0x{:x}", target_hash), "skip vote production");
             return;
         }
     };

@@ -272,7 +272,7 @@ where
                     }
                 ).into());
             }
-    
+            // TODO: add BEP-590 changes in fermi hardfork later
             // the attestation target block should be direct parent.
             let target_block = attestation.data.target_number;
             let target_hash = attestation.data.target_hash;
