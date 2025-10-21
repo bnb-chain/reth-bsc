@@ -65,7 +65,7 @@ where
     }
 
     // todo: check more and refine it later.
-    pub async fn build_payload(self, args: BuildArguments<EthPayloadBuilderAttributes, BscBuiltPayload>) -> Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn build_payload(&self, args: BuildArguments<EthPayloadBuilderAttributes, BscBuiltPayload>) -> Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>> {
         let BuildArguments { mut cached_reads, config, cancel, best_payload: _best_payload } = args;
         let PayloadConfig { parent_header, attributes } = config;
 
@@ -268,26 +268,29 @@ where
     }
 }
 
-/// Handle for aborting a BscPayloadJob
+/// Handle for controlling a BscPayloadJob
 pub struct BscPayloadJobHandle {
     abort_tx: oneshot::Sender<()>,
 }
 
 impl BscPayloadJobHandle {
-    // aborted by new head.
+    /// Abort the payload job
     pub fn abort(self) {
         let _ = self.abort_tx.send(());
     }
+    
 }
 
 /// BscPayloadJob is used to async build payloads to get best payload.
 pub struct BscPayloadJob<Pool, Client, EvmConfig = BscEvmConfig> {
     /// The payload builder instance
-    builder: BscPayloadBuilder<Pool, Client, EvmConfig>,
+    builder: Arc<BscPayloadBuilder<Pool, Client, EvmConfig>>,
     /// Timeout for payload building
     timeout: std::time::Duration,
-    /// Build arguments for the payload
-    args: BuildArguments<EthPayloadBuilderAttributes, BscBuiltPayload>,
+    /// Message queue for processing build arguments
+    try_build_rx: mpsc::UnboundedReceiver<Arc<BuildArguments<EthPayloadBuilderAttributes, BscBuiltPayload>>>,
+    /// Sender for sending arguments back to queue
+    try_build_tx: mpsc::UnboundedSender<Arc<BuildArguments<EthPayloadBuilderAttributes, BscBuiltPayload>>>,
     /// Cancel handle that automatically cancels the job when dropped
     cancel: CancelOnDrop,
     /// Abort receiver for external termination
@@ -296,6 +299,10 @@ pub struct BscPayloadJob<Pool, Client, EvmConfig = BscEvmConfig> {
     is_aborted: bool,
     /// Sender for payload results
     result_tx: mpsc::UnboundedSender<BscBuiltPayload>,
+    /// Potential payloads vector for selecting the best one
+    potential_payloads: Vec<BscBuiltPayload>,
+    /// Current build arguments
+    build_args: Arc<BuildArguments<EthPayloadBuilderAttributes, BscBuiltPayload>>,
     // TODO: enrich retry, mev workflows.
 }
 
@@ -309,19 +316,37 @@ where
     /// Creates a new BscPayloadJob and returns both the job and its handle
     pub fn new(
         builder: BscPayloadBuilder<Pool, Client, EvmConfig>,
-        args: BuildArguments<EthPayloadBuilderAttributes, BscBuiltPayload>,
+        build_args: BuildArguments<EthPayloadBuilderAttributes, BscBuiltPayload>,
         result_tx: mpsc::UnboundedSender<BscBuiltPayload>,
     ) -> (Self, BscPayloadJobHandle) {
         let (abort_tx, abort_rx) = oneshot::channel();
+        let (try_build_tx, try_build_rx) = mpsc::unbounded_channel();
+        
+        // Clone cancel before moving build_args
+        let cancel = build_args.cancel.clone();
+        
+        // Store current args by cloning from build_args
+        let build_args_arc = Arc::new(BuildArguments {
+            cached_reads: build_args.cached_reads.clone(),
+            config: build_args.config.clone(),
+            cancel: build_args.cancel.clone(),
+            best_payload: build_args.best_payload.clone(),
+        });
+        
+        // Send build_args to the queue
+        let _ = try_build_tx.send(build_args_arc.clone());
         
         let job = Self {
-            builder,
+            builder: Arc::new(builder),
             timeout: std::time::Duration::from_millis(500), // TODO: refine it more.
-            cancel: args.cancel.clone(),
-            args,
+            try_build_rx,
+            try_build_tx: try_build_tx.clone(),
+            cancel,
             abort_rx,
             is_aborted: false,
             result_tx,
+            potential_payloads: Vec::new(),
+            build_args: build_args_arc,
         };
         
         let handle = BscPayloadJobHandle {
@@ -334,47 +359,118 @@ where
     /// Runs the payload job asynchronously with timeout support
     pub async fn start(mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let start_time = std::time::Instant::now();
+        let mut build_task: Option<tokio::task::JoinHandle<Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>>>> = None;
         
-        tokio::select! {
-            result = self.builder.build_payload(self.args) => {
-                let elapsed = start_time.elapsed();
-                match result {
-                    Ok(payload) => {
-                        // TODO: retry and pick best one.
-                        info!("Start to submit block: {} (hash: 0x{:x}, txs: {}, cost_time: {:?})", 
-                            payload.block().header().number(),
-                            payload.block().hash(),
-                            payload.block().body().transaction_count(),
-                            elapsed
-                        );
-                        if let Err(err) = self.result_tx.send(payload) {
-                            warn!("Failed to send payload to result channel: {}", err);
+        loop {
+            tokio::select! {
+                // Listen for new arguments from queue
+                args = self.try_build_rx.recv() => {
+                    match args {
+                        Some(args) => {
+                            debug!("Received new build arguments, starting payload building");
+                            
+                            // Start building payload (non-blocking)
+                            let builder = self.builder.clone();
+                            let args_clone = BuildArguments {
+                                cached_reads: args.cached_reads.clone(),
+                                config: args.config.clone(),
+                                cancel: args.cancel.clone(),
+                                best_payload: args.best_payload.clone(),
+                            };
+                            build_task = Some(tokio::spawn(async move {
+                                builder.build_payload(args_clone).await
+                            }));
                         }
-                        Ok(())
-                    },
-                    Err(e) => {
-                        warn!("Payload building failed after {:?}: {}", elapsed, e);
-                        Err(e)
-                    },
+                        None => {
+                            debug!("Try build queue closed, exiting payload job");
+                            break Ok(());
+                        }
+                    }
+                }
+                
+                // Handle build task completion (only if we have a task)
+                result = build_task.as_mut().unwrap(), if build_task.is_some() => {
+                    build_task = None;
+                    match result {
+                        Ok(Ok(payload)) => {
+                            let elapsed = start_time.elapsed();
+                            debug!("Built payload: {} (hash: 0x{:x}, txs: {}, cost_time: {:?})", 
+                                payload.block().header().number(),
+                                payload.block().hash(),
+                                payload.block().body().transaction_count(),
+                                elapsed
+                            );
+                            self.potential_payloads.push(payload);
+
+                            // TODO: refine it later.
+                            if elapsed < self.timeout / 2 {
+                                 if let Err(err) = self.try_build_tx.send(self.build_args.clone()) {
+                                    warn!("Failed to send args to try build queue: {}", err);
+                                }
+                            } else {
+                                if let Some(best_payload) = self.pick_best_payload() {
+                                    info!("Succeed to pick the best payload: {} (hash: 0x{:x}, txs: {}, fees: {})", 
+                                        best_payload.block().header().number(),
+                                        best_payload.block().hash(),
+                                        best_payload.block().body().transaction_count(),
+                                        best_payload.fees()
+                                    );
+                                    if let Err(err) = self.result_tx.send(best_payload) {
+                                        warn!("Failed to send best payload to result channel: {}", err);
+                                    }
+                                }
+                            }
+                            
+                        },
+                        Ok(Err(e)) => {
+                            let elapsed = start_time.elapsed();
+                            warn!("Payload building failed after {:?}: {}", elapsed, e);
+                        },
+                        Err(join_err) => {
+                            let elapsed = start_time.elapsed();
+                            warn!("Payload building task failed after {:?}: {}", elapsed, join_err);
+                        },
+                    }
+                }
+                
+                // normal finish by timer
+                _ = tokio::time::sleep(self.timeout) => {
+                    let elapsed = start_time.elapsed();
+                    warn!("Payload building timed out after {:?}", elapsed);
+                    drop(self.cancel);
+                    break Ok(());
+                }
+                
+                // abort by new head
+                _ = &mut self.abort_rx => {
+                    let elapsed = start_time.elapsed();
+                    info!("Abort payload building by new head, cost_time: {:?}", elapsed);
+                    drop(self.cancel);
+                    self.is_aborted = true;
+                    break Ok(());
                 }
             }
-            
-            // normal finish by timer
-            _ = tokio::time::sleep(self.timeout) => {
-                let elapsed = start_time.elapsed();
-                warn!("Payload building timed out after {:?}", elapsed);
-                drop(self.cancel);
-                Ok(())
-            }
-            
-            // abort by new head
-            _ = &mut self.abort_rx => {
-                let elapsed = start_time.elapsed();
-                info!("Payload building aborted after {:?}", elapsed);
-                drop(self.cancel);
-                self.is_aborted = true;
-                Ok(())
-            }
         }
+    }
+
+    /// Pick the best payload from potential payloads
+    fn pick_best_payload(&mut self) -> Option<BscBuiltPayload> {
+        if self.potential_payloads.is_empty() {
+            return None;
+        }
+
+        // pick the payload with the highest fees as best payload.
+        let best_index = self.potential_payloads
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, payload)| payload.fees())
+            .map(|(index, _)| index)?;
+
+        let best_payload = self.potential_payloads.remove(best_index);
+        
+        // Clear other potential payloads to avoid memory buildup
+        self.potential_payloads.clear();
+        
+        Some(best_payload)
     }
 }
