@@ -212,8 +212,9 @@ where
                 }
             }
             // update and add to total fees
-            let miner_fee = tx.effective_tip_per_gas(base_fee).expect("fee is always valid; execution succeeded");
-            total_fees += U256::from(miner_fee) * U256::from(gas_used);
+            if let Some(miner_fee) = tx.effective_tip_per_gas(base_fee) {
+                total_fees += U256::from(miner_fee) * U256::from(gas_used);
+            }
             cumulative_gas_used += gas_used;
 
             // Add blob tx sidecar to the payload.
@@ -242,15 +243,18 @@ where
                 tx.nonce()
             );
             if tx.is_eip4844() {
-                let sidecar = sidecars_map.get(tx.hash()).unwrap();
-                let bsc_blob_tx_sidecar = BscBlobTransactionSidecar {
-                    inner: sidecar.as_eip4844().unwrap().clone(),
-                    block_number: sealed_block.header().number(),
-                    block_hash: sealed_block.hash(),
-                    tx_index: index as u64,
-                    tx_hash: *tx.hash(),
-                };
-                blob_sidecars.push(bsc_blob_tx_sidecar);
+                if let Some(sidecar) = sidecars_map.get(tx.hash()) {
+                    if let Some(eip4844_sidecar) = sidecar.as_eip4844() {
+                        let bsc_blob_tx_sidecar = BscBlobTransactionSidecar {
+                            inner: eip4844_sidecar.clone(),
+                            block_number: sealed_block.header().number(),
+                            block_hash: sealed_block.hash(),
+                            tx_index: index as u64,
+                            tx_hash: *tx.hash(),
+                        };
+                        blob_sidecars.push(bsc_blob_tx_sidecar);
+                    }
+                }
             }
         }
 
@@ -303,6 +307,8 @@ pub struct BscPayloadJob<Pool, Client, EvmConfig = BscEvmConfig> {
     potential_payloads: Vec<BscBuiltPayload>,
     /// Current build arguments
     build_args: Arc<BuildArguments<EthPayloadBuilderAttributes, BscBuiltPayload>>,
+    /// Retry count for payload building
+    retries: u32,
     // TODO: enrich retry, mev workflows.
 }
 
@@ -333,8 +339,6 @@ where
             best_payload: build_args.best_payload.clone(),
         });
         
-        // Send build_args to the queue
-        let _ = try_build_tx.send(build_args_arc.clone());
         
         let job = Self {
             builder: Arc::new(builder),
@@ -347,6 +351,7 @@ where
             result_tx,
             potential_payloads: Vec::new(),
             build_args: build_args_arc,
+            retries: 0,
         };
         
         let handle = BscPayloadJobHandle {
@@ -359,7 +364,13 @@ where
     /// Runs the payload job asynchronously with timeout support
     pub async fn start(mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let start_time = std::time::Instant::now();
-        let mut build_task: Option<tokio::task::JoinHandle<Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>>>> = None;
+        let mut build_tasks = tokio::task::JoinSet::new();
+        
+        // Send initial build_args to the queue
+        if let Err(err) = self.try_build_tx.send(self.build_args.clone()) {
+            warn!("Failed to send initial build args to try build queue: {}", err);
+            return Ok(());
+        }
         
         loop {
             tokio::select! {
@@ -367,7 +378,8 @@ where
                 args = self.try_build_rx.recv() => {
                     match args {
                         Some(args) => {
-                            debug!("Received new build arguments, starting payload building");
+                            self.retries += 1;
+                            debug!("Received new build arguments, starting payload building (retries: {})", self.retries);
                             
                             // Start building payload (non-blocking)
                             let builder = self.builder.clone();
@@ -377,9 +389,9 @@ where
                                 cancel: args.cancel.clone(),
                                 best_payload: args.best_payload.clone(),
                             };
-                            build_task = Some(tokio::spawn(async move {
+                            build_tasks.spawn(async move {
                                 builder.build_payload(args_clone).await
-                            }));
+                            });
                         }
                         None => {
                             debug!("Try build queue closed, exiting payload job");
@@ -388,24 +400,29 @@ where
                     }
                 }
                 
-                // Handle build task completion (only if we have a task)
-                result = build_task.as_mut().unwrap(), if build_task.is_some() => {
-                    build_task = None;
+                // Handle build task completion (non-blocking)
+                result = build_tasks.join_next() => {
                     match result {
-                        Ok(Ok(payload)) => {
+                        Some(Ok(Ok(payload))) => {
+                            if self.is_aborted {
+                                break Ok(());
+                            }
                             let elapsed = start_time.elapsed();
-                            debug!("Built payload: {} (hash: 0x{:x}, txs: {}, cost_time: {:?})", 
+                            debug!("Built payload: {} (hash: 0x{:x}, txs: {}, fees: {}, cost_time: {:?}, retries: {})", 
                                 payload.block().header().number(),
                                 payload.block().hash(),
                                 payload.block().body().transaction_count(),
-                                elapsed
+                                payload.fees(),
+                                elapsed,
+                                self.retries
                             );
                             self.potential_payloads.push(payload);
 
                             // TODO: refine it later.
                             if elapsed < self.timeout / 2 {
-                                 if let Err(err) = self.try_build_tx.send(self.build_args.clone()) {
+                                if let Err(err) = self.try_build_tx.send(self.build_args.clone()) {
                                     warn!("Failed to send args to try build queue: {}", err);
+                                    return Err(Box::new(PayloadBuilderError::other(std::io::Error::new(std::io::ErrorKind::Other, "Failed to send args to try build queue"))));
                                 }
                             } else {
                                 if let Some(best_payload) = self.pick_best_payload() {
@@ -419,16 +436,19 @@ where
                                         warn!("Failed to send best payload to result channel: {}", err);
                                     }
                                 }
+                                return Ok(());
                             }
-                            
                         },
-                        Ok(Err(e)) => {
+                        Some(Ok(Err(e))) => {
                             let elapsed = start_time.elapsed();
-                            warn!("Payload building failed after {:?}: {}", elapsed, e);
+                            warn!("Payload building failed after {:?} (retries: {}): {}", elapsed, self.retries, e);
                         },
-                        Err(join_err) => {
+                        Some(Err(join_err)) => {
                             let elapsed = start_time.elapsed();
-                            warn!("Payload building task failed after {:?}: {}", elapsed, join_err);
+                            warn!("Payload building task failed after {:?} (retries: {}): {}", elapsed, self.retries, join_err);
+                        },
+                        None => {
+                            // No task completed, continue to next iteration
                         },
                     }
                 }
@@ -437,17 +457,15 @@ where
                 _ = tokio::time::sleep(self.timeout) => {
                     let elapsed = start_time.elapsed();
                     warn!("Payload building timed out after {:?}", elapsed);
-                    drop(self.cancel);
-                    break Ok(());
+                    drop(std::mem::take(&mut self.cancel));
                 }
                 
                 // abort by new head
                 _ = &mut self.abort_rx => {
                     let elapsed = start_time.elapsed();
                     info!("Abort payload building by new head, cost_time: {:?}", elapsed);
-                    drop(self.cancel);
+                    drop(std::mem::take(&mut self.cancel));
                     self.is_aborted = true;
-                    break Ok(());
                 }
             }
         }
