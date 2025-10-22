@@ -299,7 +299,7 @@ where
     }
 }
 
-/// Handle for abort a BscPayloadJob
+/// Handle for aborting a BscPayloadJob
 pub struct BscPayloadJobHandle {
     abort_tx: oneshot::Sender<()>,
 }
@@ -309,7 +309,6 @@ impl BscPayloadJobHandle {
     pub fn abort(self) {
         let _ = self.abort_tx.send(());
     }
-    
 }
 
 /// BscPayloadJob is used to async build payloads to get best payload.
@@ -338,7 +337,7 @@ pub struct BscPayloadJob<Pool, Client, EvmConfig = BscEvmConfig> {
     retries: u32,
     /// JoinSet for managing build tasks
     build_tasks: tokio::task::JoinSet<Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>>>,
-    // TODO: enrich retry, mev workflows.
+    // TODO: enrich mev workflows.
 }
 
 impl<Pool, Client, EvmConfig> BscPayloadJob<Pool, Client, EvmConfig>
@@ -395,7 +394,7 @@ where
                     match args {
                         Some(_) => {
                             self.retries += 1;
-                            debug!("Received new build signal, starting payload building, block_number: {}, retries: {}", 
+                            debug!("Try new build, block_number: {}, retries: {}", 
                                 self.build_args.config.parent_header.number()+1, self.retries);
                             
                             let builder = self.builder.clone();
@@ -410,7 +409,7 @@ where
                             });
                         }
                         None => {
-                            debug!("Try build queue closed, exiting payload job");
+                            debug!("Exit payload job by queue closed");
                             return Ok(());
                         }
                     }
@@ -491,10 +490,10 @@ where
                 warn!("Failed to send best payload to result channel: {}", err);
                 return Err(Box::new(BscPayloadJobError::ResultChannelSendError(err.to_string())));
             }
-            return Ok(());
+            Ok(())
         } else {
             warn!("No best payload available to send");
-            return Err(Box::new(BscPayloadJobError::NoPayloadsAvailable));
+            Err(Box::new(BscPayloadJobError::NoPayloadsAvailable))
         }
     }
 
