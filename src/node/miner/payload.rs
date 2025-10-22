@@ -1,6 +1,37 @@
 use alloy_primitives::U256;
 use crate::node::engine::BscBuiltPayload;
 use crate::node::evm::config::BscEvmConfig;
+use reth_provider::StateProviderFactory;
+use reth_revm::{database::StateProviderDatabase, db::State};
+use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
+use reth_evm::execute::BlockBuilder;
+use alloy_evm::Evm;
+use reth_payload_primitives::{PayloadBuilderError, BuiltPayload};
+use reth::transaction_pool::{TransactionPool, PoolTransaction};
+use reth_primitives::TransactionSigned;
+use reth::transaction_pool::BestTransactionsAttributes;
+use tracing::{debug, info};
+use reth_evm::block::{BlockExecutionError, BlockValidationError};
+use reth::transaction_pool::error::InvalidPoolTransactionError;
+use reth_primitives::InvalidTransactionError;
+use reth_evm::execute::BlockBuilderOutcome;
+use reth_ethereum_payload_builder::EthereumBuilderConfig;
+use std::sync::Arc;
+use reth_basic_payload_builder::{BuildArguments, PayloadConfig};
+use reth_revm::cancelled::CancelOnDrop;
+use tokio::sync::{oneshot, mpsc};
+use reth::payload::EthPayloadBuilderAttributes;
+use reth_payload_primitives::PayloadBuilderAttributes;
+use alloy_consensus::{Transaction, BlockHeader};
+use reth_primitives_traits::{SignerRecoverable, BlockBody};
+use tracing::warn;
+use crate::chainspec::{BscChainSpec};
+use reth::transaction_pool::error::Eip4844PoolTransactionError;
+use crate::node::primitives::BscBlobTransactionSidecar;
+use std::collections::HashMap;
+use reth_chainspec::EthChainSpec;
+use reth_chainspec::EthereumHardforks;
+
 
 /// Errors that can occur during payload job execution
 #[derive(Debug, thiserror::Error)]
@@ -32,36 +63,6 @@ pub enum BscPayloadJobError {
     #[error("Channel communication failed: {0}")]
     ChannelCommunicationError(String),
 }
-use reth_provider::StateProviderFactory;
-use reth_revm::{database::StateProviderDatabase, db::State};
-use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
-use reth_evm::execute::BlockBuilder;
-use alloy_evm::Evm;
-use reth_payload_primitives::{PayloadBuilderError, BuiltPayload};
-use reth::transaction_pool::{TransactionPool, PoolTransaction};
-use reth_primitives::TransactionSigned;
-use reth::transaction_pool::BestTransactionsAttributes;
-use tracing::{debug, info};
-use reth_evm::block::{BlockExecutionError, BlockValidationError};
-use reth::transaction_pool::error::InvalidPoolTransactionError;
-use reth_primitives::InvalidTransactionError;
-use reth_evm::execute::BlockBuilderOutcome;
-use reth_ethereum_payload_builder::EthereumBuilderConfig;
-use std::sync::Arc;
-use reth_basic_payload_builder::{BuildArguments, PayloadConfig};
-use reth_revm::cancelled::CancelOnDrop;
-use tokio::sync::{oneshot, mpsc};
-use reth::payload::EthPayloadBuilderAttributes;
-use reth_payload_primitives::PayloadBuilderAttributes;
-use alloy_consensus::{Transaction, BlockHeader};
-use reth_primitives_traits::{SignerRecoverable, BlockBody};
-use tracing::warn;
-use crate::chainspec::{BscChainSpec};
-use reth::transaction_pool::error::Eip4844PoolTransactionError;
-use crate::node::primitives::BscBlobTransactionSidecar;
-use std::collections::HashMap;
-use reth_chainspec::EthChainSpec;
-use reth_chainspec::EthereumHardforks;
 
 /// BSC payload builder, used to build payload for bsc miner.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,23 +133,15 @@ where
         let mut sidecars_map = HashMap::new();
         let mut block_blob_count = 0;
 
-        let mut is_cancel = false;
-
         // todo: calc blob fee.
         let blob_params = self.chain_spec.blob_params_at_timestamp(attributes.timestamp());
         let max_blob_count = blob_params.as_ref().map(|params| params.max_blob_count).unwrap_or_default();
         let mut best_tx_list = self.pool.best_transactions_with_attributes(BestTransactionsAttributes::new(base_fee, None));
-        debug!("debug payload_builder, starting transaction processing, block_gas_limit: {}, base_fee: {}", block_gas_limit, base_fee);
-        let mut tx_count = 0;
         while let Some(pool_tx) = best_tx_list.next() {
             if cancel.is_cancelled() {
-                is_cancel = true;
                 break;
             }
 
-            tx_count += 1;
-            debug!("debug payload_builder, processing transaction #{}: hash={:?}, gas_limit={}, block_gas_limit={}", 
-                tx_count, pool_tx.hash(), pool_tx.gas_limit(), block_gas_limit);
             // ensure we still have capacity for this transaction
             if cumulative_gas_used + pool_tx.gas_limit() > block_gas_limit {
                 // we can't fit this transaction into the block, so we need to mark it as invalid
@@ -163,7 +156,7 @@ where
 
             let tx = pool_tx.to_consensus();
             let mut blob_tx_sidecar = None;
-            debug!("debug payload_builder, tx: {:?} is_blob_tx: {:?} tx_type: {:?}", tx.hash(), tx.is_eip4844(), tx.tx_type());
+            debug!("debug payload_builder, block_number: {}, tx: {:?}, is_blob_tx: {:?}, tx_type: {:?}", parent_header.number()+1, tx.hash(), tx.is_eip4844(), tx.tx_type());
             if let Some(blob_tx) = tx.as_eip4844() {
                 let tx_blob_count = blob_tx.tx().blob_versioned_hashes.len() as u64;
 
@@ -204,7 +197,7 @@ where
                         Err(Eip4844PoolTransactionError::UnexpectedEip7594SidecarBeforeOsaka)
                     }
                 };
-                debug!("debug payload_builder, tx_hash: {:?}, blob_sidecar_result: {:?}", tx.hash(), blob_sidecar_result);
+                debug!("debug payload_builder, block_number: {}, tx_hash: {:?}, blob_sidecar_result: {:?}", parent_header.number()+1, tx.hash(), blob_sidecar_result);
 
                 blob_tx_sidecar = match blob_sidecar_result {
                     Ok(sidecar) => Some(sidecar),
@@ -213,7 +206,7 @@ where
                         continue
                     }
                 };
-                debug!("debug payload_builder, tx_hash: {:?}, blob_tx_sidecar: {:?}", tx.hash(), blob_tx_sidecar);
+                debug!("debug payload_builder, block_number: {}, tx_hash: {:?}, blob_tx_sidecar: {:?}", parent_header.number()+1, tx.hash(), blob_tx_sidecar);
             }
             
             let gas_used = match builder.execute_transaction(tx.clone()) {
@@ -251,9 +244,8 @@ where
                 }
             }
             // update and add to total fees
-            if let Some(miner_fee) = tx.effective_tip_per_gas(base_fee) {
-                total_fees += U256::from(miner_fee) * U256::from(gas_used);
-            }
+            let miner_fee = tx.effective_tip_per_gas(base_fee).expect("fee is always valid; execution succeeded");
+            total_fees += U256::from(miner_fee) * U256::from(gas_used);
             cumulative_gas_used += gas_used;
 
             // Add blob tx sidecar to the payload.
@@ -262,9 +254,6 @@ where
             }
         }
 
-        debug!("debug payload_builder, finished transaction processing, total_tx_count: {}, cumulative_gas_used: {}, total_fees: {}, is_cancel: {}", 
-            tx_count, cumulative_gas_used, total_fees, is_cancel);
-
         // add system txs to payload.
         let BlockBuilderOutcome { execution_result, block, .. } = builder.finish(&state_provider)?;
         let mut sealed_block = Arc::new(block.sealed_block().clone());
@@ -272,7 +261,7 @@ where
         // set sidecars to seal block
         let mut blob_sidecars:Vec<BscBlobTransactionSidecar>= Vec::new();
         let transactions = &sealed_block.body().inner.transactions;
-        debug!("debug payload_builder, block_number: {}, block_hash: {:?}, contains {} transaction, is_cancel: {}", sealed_block.number(), sealed_block.hash(), transactions.len(), is_cancel);
+        debug!("debug payload_builder, block_number: {}, block_hash: {:?}, trx_len: {} , is_cancel: {}", sealed_block.number(), sealed_block.hash(), transactions.len(), cancel.is_cancelled());
         for (index, tx) in transactions.iter().enumerate() {
             debug!("debug payload_builder, transaction {}: hash={:?}, from={:?}, to={:?}, value={:?}, gas_limit={}, gas_price={:?}, nonce={}", 
                 index + 1,
@@ -285,18 +274,15 @@ where
                 tx.nonce()
             );
             if tx.is_eip4844() {
-                if let Some(sidecar) = sidecars_map.get(tx.hash()) {
-                    if let Some(eip4844_sidecar) = sidecar.as_eip4844() {
-                        let bsc_blob_tx_sidecar = BscBlobTransactionSidecar {
-                            inner: eip4844_sidecar.clone(),
-                            block_number: sealed_block.header().number(),
-                            block_hash: sealed_block.hash(),
-                            tx_index: index as u64,
-                            tx_hash: *tx.hash(),
-                        };
-                        blob_sidecars.push(bsc_blob_tx_sidecar);
-                    }
-                }
+                let sidecar = sidecars_map.get(tx.hash()).unwrap();
+                let bsc_blob_tx_sidecar = BscBlobTransactionSidecar {
+                    inner: sidecar.as_eip4844().unwrap().clone(),
+                    block_number: sealed_block.header().number(),
+                    block_hash: sealed_block.hash(),
+                    tx_index: index as u64,
+                    tx_hash: *tx.hash(),
+                };
+                blob_sidecars.push(bsc_blob_tx_sidecar);
             }
         }
 
@@ -304,7 +290,6 @@ where
         plain.body.sidecars = Some(blob_sidecars);
         sealed_block = Arc::new(plain.into());
     
-        debug!("debug payload_builder, sealed_block: {:?}", sealed_block);
         let payload = BscBuiltPayload {
             block: sealed_block,
             fees: total_fees,
@@ -314,13 +299,13 @@ where
     }
 }
 
-/// Handle for controlling a BscPayloadJob
+/// Handle for abort a BscPayloadJob
 pub struct BscPayloadJobHandle {
     abort_tx: oneshot::Sender<()>,
 }
 
 impl BscPayloadJobHandle {
-    /// Abort the payload job
+    /// Abort the payload job by new head.
     pub fn abort(self) {
         let _ = self.abort_tx.send(());
     }
@@ -399,18 +384,19 @@ where
     pub async fn start(mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let start_time = std::time::Instant::now();
         
-        // Send initial signal to the queue
         if let Err(err) = self.try_build_tx.send(()) {
             warn!("Failed to send initial signal to try build queue: {}", err);
             return Err(Box::new(BscPayloadJobError::BuildQueueSendError(err.to_string())));
         }
+
         loop {
             tokio::select! {
                 args = self.try_build_rx.recv() => {
                     match args {
                         Some(_) => {
                             self.retries += 1;
-                            debug!("Received new build signal, starting payload building (retries: {})", self.retries);
+                            debug!("Received new build signal, starting payload building, block_number: {}, retries: {}", 
+                                self.build_args.config.parent_header.number()+1, self.retries);
                             
                             let builder = self.builder.clone();
                             let build_args = BuildArguments {
@@ -450,8 +436,9 @@ where
                             // TODO: refine it later.
                             if elapsed < self.timeout / 2 && self.retries < 3 {
                                 if let Err(err) = self.try_build_tx.send(()) {
-                                    warn!("Failed to send signal to try build queue: {}", err);
-                                    return Err(Box::new(BscPayloadJobError::BuildQueueSendError(err.to_string())));
+                                    warn!("Failed to send signal to try build queue, block_number: {}, retries: {}, error: {:?}", 
+                                        self.build_args.config.parent_header.number()+1, self.retries, err);
+                                    return self.try_return_best_payload();
                                 }
                             } else {
                                 return self.try_return_best_payload();
@@ -459,12 +446,14 @@ where
                         },
                         Some(Ok(Err(e))) => {
                             let elapsed = start_time.elapsed();
-                            warn!("Failed to build payload building failed after {:?} (retries: {}): {}", elapsed, self.retries, e);
+                            warn!("Failed to build payload task due to {}, cost_time: {:?}, block_number: {}, retries: {}", 
+                                e, elapsed, self.build_args.config.parent_header.number()+1, self.retries);
                             return self.try_return_best_payload();
                         },
                         Some(Err(join_err)) => {
                             let elapsed = start_time.elapsed();
-                            warn!("Payload building task failed after {:?} (retries: {}): {}", elapsed, self.retries, join_err);
+                            warn!("Failed to join payload build task due to {}, cost_time: {:?}, block_number: {}, retries: {}", 
+                                join_err, elapsed, self.build_args.config.parent_header.number()+1, self.retries);
                             return self.try_return_best_payload();
                         },
                         None => {
@@ -476,7 +465,8 @@ where
                 // normal finish by timer
                 _ = tokio::time::sleep(self.timeout) => {
                     let elapsed = start_time.elapsed();
-                    warn!("Payload building timed out after {:?}", elapsed);
+                    info!("try return best payload due to has no time, cost_time: {:?}, block_number: {}, retries: {}", 
+                        elapsed, self.build_args.config.parent_header.number()+1, self.retries);
                     drop(std::mem::take(&mut self.cancel));
                     return self.try_return_best_payload();
                 }
@@ -484,7 +474,8 @@ where
                 // abort by new head
                 _ = &mut self.abort_rx => {
                     let elapsed = start_time.elapsed();
-                    info!("Abort payload building by new head, cost_time: {:?}", elapsed);
+                    info!("Abort payload building by new head, cost_time: {:?}, block_number: {}, retries: {}", 
+                        elapsed, self.build_args.config.parent_header.number()+1, self.retries);
                     drop(std::mem::take(&mut self.cancel));
                     self.is_aborted = true;
                     return Err(Box::new(BscPayloadJobError::JobAborted));
@@ -493,15 +484,9 @@ where
         }
     }
 
-
+    /// Try to return the best payload to result channel
     fn try_return_best_payload(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if let Some(best_payload) = self.pick_best_payload() {
-            info!("Succeed to pick the best payload: {} (hash: 0x{:x}, txs: {}, fees: {})", 
-                best_payload.block().header().number(),
-                best_payload.block().hash(),
-                best_payload.block().body().transaction_count(),
-                best_payload.fees()
-            );
             if let Err(err) = self.result_tx.send(best_payload) {
                 warn!("Failed to send best payload to result channel: {}", err);
                 return Err(Box::new(BscPayloadJobError::ResultChannelSendError(err.to_string())));
@@ -526,11 +511,18 @@ where
             .max_by_key(|(_, payload)| payload.fees())
             .map(|(index, _)| index)?;
 
+        let total_len = self.potential_payloads.len();
         let best_payload = self.potential_payloads.remove(best_index);
+        info!("Succeed to pick the best payload: {} (hash: 0x{:x}, txs: {}, fees: {}), pick_index: {}, total_len: {}", 
+            best_payload.block().header().number(),
+            best_payload.block().hash(),
+            best_payload.block().body().transaction_count(),
+            best_payload.fees(),
+            best_index,
+            total_len
+        );
         
-        // Clear other potential payloads to avoid memory buildup
         self.potential_payloads.clear();
-        
         Some(best_payload)
     }
 }
