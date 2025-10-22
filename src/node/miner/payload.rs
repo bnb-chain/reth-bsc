@@ -1,6 +1,7 @@
 use alloy_primitives::U256;
 use crate::node::engine::BscBuiltPayload;
 use crate::node::evm::config::BscEvmConfig;
+use crate::node::miner::bsc_miner::MiningContext;
 use reth_provider::StateProviderFactory;
 use reth_revm::{database::StateProviderDatabase, db::State};
 use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
@@ -32,6 +33,9 @@ use std::collections::HashMap;
 use reth_chainspec::EthChainSpec;
 use reth_chainspec::EthereumHardforks;
 
+
+/// Delay left over for mining calculation
+const DELAY_LEFT_OVER: u64 = 50;
 
 /// Errors that can occur during payload job execution
 #[derive(Debug, thiserror::Error)]
@@ -313,6 +317,10 @@ impl BscPayloadJobHandle {
 
 /// BscPayloadJob is used to async build payloads to get best payload.
 pub struct BscPayloadJob<Pool, Client, EvmConfig = BscEvmConfig> {
+    /// Parlia consensus engine
+    parlia: Arc<crate::consensus::parlia::Parlia<crate::chainspec::BscChainSpec>>,
+    /// Mining context
+    mining_ctx: MiningContext,
     /// The payload builder instance
     builder: Arc<BscPayloadBuilder<Pool, Client, EvmConfig>>,
     /// Timeout for payload building
@@ -336,7 +344,7 @@ pub struct BscPayloadJob<Pool, Client, EvmConfig = BscEvmConfig> {
     /// Retry count for payload building
     retries: u32,
     /// JoinSet for managing build tasks
-    build_tasks: tokio::task::JoinSet<Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>>>,
+    join_handle: tokio::task::JoinSet<Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>>>,
     // TODO: enrich mev workflows.
 }
 
@@ -349,17 +357,26 @@ where
 {
     /// Creates a new BscPayloadJob and returns both the job and its handle
     pub fn new(
+        parlia: Arc<crate::consensus::parlia::Parlia<crate::chainspec::BscChainSpec>>,
+        mining_ctx: MiningContext,
         builder: BscPayloadBuilder<Pool, Client, EvmConfig>,
         build_args: BuildArguments<EthPayloadBuilderAttributes, BscBuiltPayload>,
         result_tx: mpsc::UnboundedSender<BscBuiltPayload>,
     ) -> (Self, BscPayloadJobHandle) {
         let (abort_tx, abort_rx) = oneshot::channel();
         let (try_build_tx, try_build_rx) = mpsc::unbounded_channel();
-        
         let cancel = build_args.cancel.clone();
+        let mining_delay = parlia.clone().delay_for_mining(
+            &mining_ctx.parent_snapshot, 
+            &mining_ctx.parent_header, 
+            mining_ctx.header.as_ref().unwrap(), 
+            DELAY_LEFT_OVER);
+
         let job = Self {
+            parlia,
+            mining_ctx,
             builder: Arc::new(builder),
-            timeout: std::time::Duration::from_millis(500), // TODO: refine it more.
+            timeout: std::time::Duration::from_millis(mining_delay),
             try_build_rx,
             try_build_tx: try_build_tx.clone(),
             cancel,
@@ -369,31 +386,34 @@ where
             potential_payloads: Vec::new(),
             build_args,
             retries: 0,
-            build_tasks: tokio::task::JoinSet::new(),
+            join_handle: tokio::task::JoinSet::new(),
         };
         
         let handle = BscPayloadJobHandle {
             abort_tx,
         };
+
+        debug!("Succeed to new payload job, block_number: {}, timeout: {:?}", job.mining_ctx.parent_header.number()+1, job.timeout);
         
         (job, handle)
     }
 
     /// Runs the payload job asynchronously with timeout support
     pub async fn start(mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let start_time = std::time::Instant::now();
-        
+        let mut start_time = std::time::Instant::now();
         if let Err(err) = self.try_build_tx.send(()) {
-            warn!("Failed to send initial signal to try build queue: {}", err);
+            warn!("Failed to send to try build queue: {}", err);
             return Err(Box::new(BscPayloadJobError::BuildQueueSendError(err.to_string())));
         }
 
         loop {
             tokio::select! {
+                // Trigger the async build payload by queue.
                 args = self.try_build_rx.recv() => {
                     match args {
                         Some(_) => {
                             self.retries += 1;
+                            start_time = std::time::Instant::now();
                             debug!("Try new build, block_number: {}, retries: {}", 
                                 self.build_args.config.parent_header.number()+1, self.retries);
                             
@@ -404,7 +424,7 @@ where
                                 best_payload: self.build_args.best_payload.clone(),
                                 cancel: self.build_args.cancel.clone(),
                             };
-                            self.build_tasks.spawn(async move {
+                            self.join_handle.spawn(async move {
                                 builder.build_payload(build_args).await
                             });
                         }
@@ -415,14 +435,15 @@ where
                     }
                 }
                 
-                result = self.build_tasks.join_next() => {
+                // Try to join the async payload build task.
+                result = self.join_handle.join_next() => {
                     match result {
                         Some(Ok(Ok(payload))) => {
                             if self.is_aborted {
                                 return Err(Box::new(BscPayloadJobError::JobAborted));
                             }
                             let elapsed = start_time.elapsed();
-                            debug!("debug payload_builder, try built payload: {} (hash: 0x{:x}, txs: {}, fees: {}, cost_time: {:?}, retries: {})", 
+                            debug!("Try to build payload: {} (hash: 0x{:x}, txs: {}, fees: {}, cost_time: {:?}, retries: {})", 
                                 payload.block().header().number(),
                                 payload.block().hash(),
                                 payload.block().body().transaction_count(),
@@ -432,13 +453,21 @@ where
                             );
                             self.potential_payloads.push(payload);
 
-                            // TODO: refine it later.
-                            if elapsed < self.timeout / 2 && self.retries < 3 {
+                            let mining_delay = self.parlia.delay_for_mining(
+                                &self.mining_ctx.parent_snapshot, 
+                                &self.mining_ctx.parent_header, 
+                                self.mining_ctx.header.as_ref().unwrap(), 
+                                DELAY_LEFT_OVER);
+                            // TODO: check more details and refine it later.
+                            // There is still plenty of time left and retry to build payload.
+                            if std::time::Duration::from_millis(mining_delay) > elapsed*2 && self.retries < 3 {
                                 if let Err(err) = self.try_build_tx.send(()) {
-                                    warn!("Failed to send signal to try build queue, block_number: {}, retries: {}, error: {:?}", 
+                                    warn!("Failed to send to try build queue, block_number: {}, retries: {}, error: {:?}", 
                                         self.build_args.config.parent_header.number()+1, self.retries, err);
                                     return self.try_return_best_payload();
                                 }
+                                debug!("Succeed to send to try build queue, block_number: {}, retries: {}, last_cost_time: {:?}, new_mining_delay: {:?}", 
+                                    self.build_args.config.parent_header.number()+1, self.retries, elapsed, std::time::Duration::from_millis(mining_delay));
                             } else {
                                 return self.try_return_best_payload();
                             }
@@ -461,7 +490,7 @@ where
                     }
                 }
                 
-                // normal finish by timer
+                // Finish timeout by timer.
                 _ = tokio::time::sleep(self.timeout) => {
                     let elapsed = start_time.elapsed();
                     info!("try return best payload due to has no time, cost_time: {:?}, block_number: {}, retries: {}", 
@@ -470,7 +499,7 @@ where
                     return self.try_return_best_payload();
                 }
                 
-                // abort by new head
+                // Abort by new head.
                 _ = &mut self.abort_rx => {
                     let elapsed = start_time.elapsed();
                     info!("Abort payload building by new head, cost_time: {:?}, block_number: {}, retries: {}", 

@@ -11,8 +11,9 @@ use crate::hardforks::BscHardforks;
 use reth_chainspec::EthChainSpec;
 use crate::node::evm::pre_execution::VALIDATOR_CACHE;
 use crate::node::miner::signer::seal_header_with_global_signer;
+use crate::node::miner::bsc_miner::MiningContext;
 
-pub fn prepare_new_attributes(parlia: Arc<Parlia<BscChainSpec>>, parent_snap: &Snapshot, parent_header: &Header, signer: Address) -> EthPayloadBuilderAttributes {
+pub fn prepare_new_attributes(ctx: &mut MiningContext, parlia: Arc<Parlia<BscChainSpec>>, parent_snap: &Snapshot, parent_header: &Header, signer: Address) -> EthPayloadBuilderAttributes {
     let new_header = prepare_new_header(parlia.clone(), parent_snap, parent_header, signer);
     let mut attributes = EthPayloadBuilderAttributes{
         parent: new_header.parent_hash,
@@ -24,6 +25,7 @@ pub fn prepare_new_attributes(parlia: Arc<Parlia<BscChainSpec>>, parent_snap: &S
     if BscHardforks::is_bohr_active_at_timestamp(&parlia.spec, new_header.number, new_header.timestamp) {
         attributes.parent_beacon_block_root = Some(B256::default());
     }
+    ctx.header = Some(new_header);
     attributes
 }
 

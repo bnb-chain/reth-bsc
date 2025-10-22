@@ -37,8 +37,9 @@ use alloy_primitives::U128;
 use reth_network::message::NewBlockMessage;
 
 pub struct MiningContext {
-    parent_header: reth_primitives::SealedHeader,
-    parent_snapshot: Arc<crate::consensus::parlia::snapshot::Snapshot>,
+    pub header: Option<reth_primitives::Header>, // tmp header for payload building.
+    pub parent_header: reth_primitives::SealedHeader,
+    pub parent_snapshot: Arc<crate::consensus::parlia::snapshot::Snapshot>,
 }
 
 /// NewWorkWorker responsible for listening to canonical state changes and triggering mining.
@@ -160,6 +161,7 @@ where
         }
 
         let mining_ctx = MiningContext {
+            header: None,
             parent_header,
             parent_snapshot: Arc::new(parent_snapshot),
         };
@@ -259,16 +261,20 @@ where
 
     async fn try_mine_block(
         &mut self,
-        mining_ctx: MiningContext,
+        mut mining_ctx: MiningContext,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if let Some(handle) = self.running_job_handle.take() {
             handle.abort();
         }
         
+        let parent_snapshot = mining_ctx.parent_snapshot.clone();
+        let parent_header = mining_ctx.parent_header.clone();
+        let block_number = parent_header.number() + 1;
         let attributes = prepare_new_attributes(
+            &mut mining_ctx,
             self.parlia.clone(), 
-            &mining_ctx.parent_snapshot, 
-            &mining_ctx.parent_header, 
+            &parent_snapshot, 
+            &parent_header, 
             self.validator_address
         );
 
@@ -280,16 +286,19 @@ where
             EthereumBuilderConfig::new(),
             self.chain_spec.clone(),
         );
+        let build_args = BuildArguments::<EthPayloadBuilderAttributes, BscBuiltPayload>::new(
+            reth_revm::cached::CachedReads::default(),
+            PayloadConfig::new(Arc::new(mining_ctx.parent_header.clone()), attributes),
+            CancelOnDrop::default(),
+            None,
+        );
                 
         let (payload_job, job_handle) = BscPayloadJob::new(
-            payload_builder,
-            BuildArguments::<EthPayloadBuilderAttributes, BscBuiltPayload>::new(
-                reth_revm::cached::CachedReads::default(),
-                PayloadConfig::new(Arc::new(mining_ctx.parent_header.clone()), attributes),
-                CancelOnDrop::default(),
-                None,
-            ),
-            self.payload_tx.clone(),
+            self.parlia.clone(), 
+            mining_ctx,
+            payload_builder, 
+            build_args, 
+            self.payload_tx.clone()
         );
         
         let start_time = std::time::Instant::now();
@@ -297,8 +306,8 @@ where
         self.payload_job_join_set.spawn(async move {
             payload_job.start().await
         });
-        debug!("Succeed to async start payload job, cost_time: {:?}, block_number: {}", 
-            start_time.elapsed(), mining_ctx.parent_header.number()+1);
+        debug!("Succeed to async start payload job, cost_time: {:?}, block_number: {}",
+            start_time.elapsed(), block_number);
         
         Ok(())
     }
