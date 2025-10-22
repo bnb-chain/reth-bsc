@@ -291,13 +291,13 @@ where
                     .unwrap()
                     .get_header_by_hash(&ancestor.parent_hash())
                     .ok_or_else(|| BscBlockExecutionError::UnknownHeader { block_hash: ancestor.parent_hash() })?;
-
+                tracing::debug!("ancestor: {:?}", ancestor);
             }
 
             if !is_match {
                 return Err(BscBlockExecutionError::InvalidAttestationTarget {
-                    block_number: GotExpected { got: target_block, expected: parent.number() },
-                    block_hash: GotExpected { got: target_hash, expected: parent.hash_slow() }
+                    block_number: GotExpected { got: target_block, expected: ancestor.number() },
+                    block_hash: GotExpected { got: target_hash, expected: ancestor.hash_slow() }
                         .into(),
                 }
                 .into());
