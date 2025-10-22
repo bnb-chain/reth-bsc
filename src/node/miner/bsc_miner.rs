@@ -286,7 +286,7 @@ where
             BuildArguments::<EthPayloadBuilderAttributes, BscBuiltPayload>::new(
                 reth_revm::cached::CachedReads::default(),
                 PayloadConfig::new(Arc::new(mining_ctx.parent_header.clone()), attributes),
-                CancelOnDrop::default(), // todo: refine abort logic
+                CancelOnDrop::default(),
                 None,
             ),
             self.payload_tx.clone(),

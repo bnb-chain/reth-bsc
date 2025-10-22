@@ -101,11 +101,23 @@ where
         let mut sidecars_map = HashMap::new();
         let mut block_blob_count = 0;
 
+        let mut is_cancel = false;
+
         // todo: calc blob fee.
         let blob_params = self.chain_spec.blob_params_at_timestamp(attributes.timestamp());
         let max_blob_count = blob_params.as_ref().map(|params| params.max_blob_count).unwrap_or_default();
         let mut best_tx_list = self.pool.best_transactions_with_attributes(BestTransactionsAttributes::new(base_fee, None));
+        debug!("debug payload_builder, starting transaction processing, block_gas_limit: {}, base_fee: {}", block_gas_limit, base_fee);
+        let mut tx_count = 0;
         while let Some(pool_tx) = best_tx_list.next() {
+            if cancel.is_cancelled() {
+                is_cancel = true;
+                break;
+            }
+
+            tx_count += 1;
+            debug!("debug payload_builder, processing transaction #{}: hash={:?}, gas_limit={}, block_gas_limit={}", 
+                tx_count, pool_tx.hash(), pool_tx.gas_limit(), block_gas_limit);
             // ensure we still have capacity for this transaction
             if cumulative_gas_used + pool_tx.gas_limit() > block_gas_limit {
                 // we can't fit this transaction into the block, so we need to mark it as invalid
@@ -116,10 +128,6 @@ where
                     InvalidPoolTransactionError::ExceedsGasLimit(pool_tx.gas_limit(), block_gas_limit),
                 );
                 continue
-            }
-
-            if cancel.is_cancelled() {
-                break;
             }
 
             let tx = pool_tx.to_consensus();
@@ -223,6 +231,9 @@ where
             }
         }
 
+        debug!("debug payload_builder, finished transaction processing, total_tx_count: {}, cumulative_gas_used: {}, total_fees: {}, is_cancel: {}", 
+            tx_count, cumulative_gas_used, total_fees, is_cancel);
+
         // add system txs to payload.
         let BlockBuilderOutcome { execution_result, block, .. } = builder.finish(&state_provider)?;
         let mut sealed_block = Arc::new(block.sealed_block().clone());
@@ -230,7 +241,7 @@ where
         // set sidecars to seal block
         let mut blob_sidecars:Vec<BscBlobTransactionSidecar>= Vec::new();
         let transactions = &sealed_block.body().inner.transactions;
-        debug!("debug payload_builder, block_number: {}, block_hash: {:?}, contains {} transactions:", sealed_block.number(), sealed_block.hash(), transactions.len());
+        debug!("debug payload_builder, block_number: {}, block_hash: {:?}, contains {} transaction, is_cancel: {}", sealed_block.number(), sealed_block.hash(), transactions.len(), is_cancel);
         for (index, tx) in transactions.iter().enumerate() {
             debug!("debug payload_builder, transaction {}: hash={:?}, from={:?}, to={:?}, value={:?}, gas_limit={}, gas_price={:?}, nonce={}", 
                 index + 1,
@@ -322,21 +333,18 @@ where
     /// Creates a new BscPayloadJob and returns both the job and its handle
     pub fn new(
         builder: BscPayloadBuilder<Pool, Client, EvmConfig>,
-        build_args: BuildArguments<EthPayloadBuilderAttributes, BscBuiltPayload>,
+        args: BuildArguments<EthPayloadBuilderAttributes, BscBuiltPayload>,
         result_tx: mpsc::UnboundedSender<BscBuiltPayload>,
     ) -> (Self, BscPayloadJobHandle) {
         let (abort_tx, abort_rx) = oneshot::channel();
         let (try_build_tx, try_build_rx) = mpsc::unbounded_channel();
         
-        // Clone cancel before moving build_args
-        let cancel = build_args.cancel.clone();
-        
-        // Store current args by cloning from build_args
-        let build_args_arc = Arc::new(BuildArguments {
-            cached_reads: build_args.cached_reads.clone(),
-            config: build_args.config.clone(),
-            cancel: build_args.cancel.clone(),
-            best_payload: build_args.best_payload.clone(),
+        let cancel = CancelOnDrop::default();
+        let build_args = Arc::new(BuildArguments {
+            cached_reads: args.cached_reads.clone(),
+            config: args.config.clone(),
+            best_payload: args.best_payload.clone(),
+            cancel: cancel.clone(),
         });
         
         
@@ -350,7 +358,7 @@ where
             is_aborted: false,
             result_tx,
             potential_payloads: Vec::new(),
-            build_args: build_args_arc,
+            build_args,
             retries: 0,
         };
         
@@ -377,20 +385,21 @@ where
                 // Listen for new arguments from queue
                 args = self.try_build_rx.recv() => {
                     match args {
-                        Some(args) => {
+                        Some(_args) => {
                             self.retries += 1;
                             debug!("Received new build arguments, starting payload building (retries: {})", self.retries);
                             
                             // Start building payload (non-blocking)
                             let builder = self.builder.clone();
-                            let args_clone = BuildArguments {
-                                cached_reads: args.cached_reads.clone(),
-                                config: args.config.clone(),
-                                cancel: args.cancel.clone(),
-                                best_payload: args.best_payload.clone(),
-                            };
+                            let build_args = self.build_args.clone();
+                            let cancel = self.cancel.clone();
                             build_tasks.spawn(async move {
-                                builder.build_payload(args_clone).await
+                                builder.build_payload(BuildArguments {
+                                    cached_reads: build_args.cached_reads.clone(),
+                                    config: build_args.config.clone(),
+                                    cancel,
+                                    best_payload: build_args.best_payload.clone(),
+                                }).await
                             });
                         }
                         None => {
@@ -408,7 +417,7 @@ where
                                 break Ok(());
                             }
                             let elapsed = start_time.elapsed();
-                            debug!("Built payload: {} (hash: 0x{:x}, txs: {}, fees: {}, cost_time: {:?}, retries: {})", 
+                            debug!("debug payload_builder, try built payload: {} (hash: 0x{:x}, txs: {}, fees: {}, cost_time: {:?}, retries: {})", 
                                 payload.block().header().number(),
                                 payload.block().hash(),
                                 payload.block().body().transaction_count(),
@@ -419,7 +428,7 @@ where
                             self.potential_payloads.push(payload);
 
                             // TODO: refine it later.
-                            if elapsed < self.timeout / 2 {
+                            if elapsed < self.timeout / 2 && self.retries < 3 {
                                 if let Err(err) = self.try_build_tx.send(self.build_args.clone()) {
                                     warn!("Failed to send args to try build queue: {}", err);
                                     return Err(Box::new(PayloadBuilderError::other(std::io::Error::new(std::io::ErrorKind::Other, "Failed to send args to try build queue"))));
