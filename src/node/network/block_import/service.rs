@@ -19,7 +19,7 @@ use reth_node_ethereum::EthEngineTypes;
 use reth_payload_primitives::{BuiltPayload, EngineApiMessageVersion, PayloadTypes};
 use reth_primitives::NodePrimitives;
 use reth_primitives_traits::{AlloyBlockHeader, Block};
-use reth_provider::{BlockHashReader, BlockNumReader};
+use reth_provider::{BlockHashReader, BlockNumReader, BlockReaderIdExt, HeaderProvider};
 use reth_eth_wire_types::broadcast::NewBlockHashes;
 use reth_eth_wire::{GetBlockHeaders, BlockHashNumber};
 use reth_network::{NetworkHandle, message::{PeerResponse, BlockRequest}, FetchClient};
@@ -57,7 +57,7 @@ const LRU_PROCESSED_BLOCKS_SIZE: u32 = 100;
 /// import outcomes via `to_network` channel.
 pub struct ImportService<Provider>
 where
-    Provider: BlockNumReader + Clone,
+    Provider: BlockNumReader + HeaderProvider + BlockReaderIdExt + Clone,
 {
     /// The handle to communicate with the engine service
     engine: BeaconConsensusEngineHandle<BscPayloadTypes>,
@@ -77,7 +77,7 @@ where
 
 impl<Provider> ImportService<Provider>
 where
-    Provider: BlockNumReader + Clone + 'static,
+    Provider: BlockNumReader + HeaderProvider<Header = Header> + BlockReaderIdExt + Clone + 'static,
 {
     /// Create a new block import service
     pub fn new(
@@ -101,14 +101,19 @@ where
     /// Process a new payload and return the outcome
     fn new_payload(&self, block: BlockMsg, peer_id: PeerId) -> ImportFut {
         let engine = self.engine.clone();
+        let consensus = self.consensus.clone();
 
         Box::pin(async move {
             let sealed_block = block.block.0.block.clone().seal();
+            let header = sealed_block.header().clone();
             let payload = BscPayloadTypes::block_to_payload(sealed_block);
-
             match engine.new_payload(payload).await {
                 Ok(payload_status) => match payload_status.status {
                     PayloadStatusEnum::Valid => {
+                        // handle fork choice update with valid payload
+                        if let Err(e) = Self::update_fork_choice(engine, consensus, header).await {
+                            tracing::warn!(target: "bsc::block_import", "Failed to update fork choice: {}", e);
+                        }
                         Outcome { peer: peer_id, result: Ok(BlockValidation::ValidBlock { block }) }
                             .into()
                     }
@@ -124,43 +129,33 @@ where
         })
     }
 
-    /// Process a forkchoice update and return the outcome
-    fn update_fork_choice(&self, block: BlockMsg, peer_id: PeerId) -> ImportFut {
-        let engine = self.engine.clone();
-        let consensus = self.consensus.clone();
-        let sealed_block = block.block.0.block.clone().seal();
-        let hash = sealed_block.hash();
-        let number = sealed_block.number();
+    /// Process a forkchoice update and return the outcome  
+    async fn update_fork_choice(
+        engine: BeaconConsensusEngineHandle<BscPayloadTypes>, 
+        consensus: Arc<ParliaConsensus<Provider>>,
+        new_header: Header) -> Result<(), ParliaConsensusErr> {
 
-        Box::pin(async move {
-            let (head_block_hash, current_hash) = match consensus.canonical_head(hash, number) {
-                Ok(hash) => hash,
-                Err(_) => return None,
-            };
+        let new_canonical_head = consensus.canonical_head(&new_header)?;
+        // get safe block and finalized block with new canonical head
+        // ref: https://github.com/bnb-chain/bsc/blob/f70aaa8399ccee429804eecf3fc4c6fd8d9e6cab/eth/api_backend.go#L72
+        let (_, safe_block_hash) = consensus.get_justified_number_and_hash(&new_canonical_head).unwrap_or((0, B256::ZERO));
+        let (_, finalized_block_hash) = consensus.get_finalized_number_and_hash(&new_canonical_head).unwrap_or((0, B256::ZERO));
+        let state = ForkchoiceState {
+            head_block_hash: new_canonical_head.hash_slow(),
+            safe_block_hash,
+            finalized_block_hash,
+        };
 
-            let state = ForkchoiceState {
-                head_block_hash,
-                safe_block_hash: head_block_hash,
-                finalized_block_hash: head_block_hash,
-            };
-
-            match engine.fork_choice_updated(state, None, EngineApiMessageVersion::default()).await
-            {
-                Ok(response) => match response.payload_status.status {
-                    PayloadStatusEnum::Valid => {
-                        Outcome { peer: peer_id, result: Ok(BlockValidation::ValidBlock { block }) }
-                            .into()
-                    }
-                    PayloadStatusEnum::Invalid { validation_error } => Outcome {
-                        peer: peer_id,
-                        result: Err(BlockImportError::Other(validation_error.into())),
-                    }
-                    .into(),
-                    _ => None,
-                },
-                Err(err) => None,
-            }
-        })
+        tracing::debug!(target: "parlia", "Fork choice updated: state = {:?}, new_canonical_head = {:?}, new_header = {:?}", state, new_canonical_head, new_header);
+        match engine.fork_choice_updated(state, None, EngineApiMessageVersion::default()).await
+        {
+            Ok(response) => match response.payload_status.status {
+                PayloadStatusEnum::Invalid { validation_error } => 
+                Err(ParliaConsensusErr::ForkChoiceUpdateError(validation_error)),
+                _ => Ok(()),
+            },
+            Err(err) => Err(ParliaConsensusErr::ForkChoiceUpdateError(err.to_string())),
+        }
     }
 
     /// Add a new block import task to the pending imports
@@ -171,9 +166,6 @@ where
 
         let payload_fut = self.new_payload(block.clone(), peer_id);
         self.pending_imports.push(payload_fut);
-
-        let fcu_fut = self.update_fork_choice(block, peer_id);
-        self.pending_imports.push(fcu_fut);
     }
 
     /// Handle incoming block hashes by using Reth engine-tree download mechanism
@@ -231,7 +223,7 @@ where
 
 impl<Provider> Future for ImportService<Provider>
 where
-    Provider: BlockNumReader + BlockHashReader + Clone + 'static + Unpin,
+    Provider: BlockNumReader + HeaderProvider<Header = Header> + BlockReaderIdExt + Clone + 'static + Unpin,
 {
     type Output = Result<(), Box<dyn std::error::Error>>;
 

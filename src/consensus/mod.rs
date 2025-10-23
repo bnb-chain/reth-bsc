@@ -1,10 +1,12 @@
-use alloy_consensus::constants::ETH_TO_WEI;
-use alloy_primitives::{address, Address, BlockNumber, B256};
+use alloy_consensus::{constants::ETH_TO_WEI, Header};
+use alloy_eips::BlockNumberOrTag;
+use alloy_primitives::{address, Address, B256};
+use rand::Rng;
 use std::sync::Arc;
 use tracing::{info, warn};
 
 use crate::{chainspec::BscChainSpec, hardforks::BscHardforks, shared};
-use reth_provider::{BlockNumReader, ProviderError};
+use reth_provider::{BlockNumReader, BlockReaderIdExt, HeaderProvider, ProviderError};
 use std::cmp::Ordering;
 
 pub const SYSTEM_ADDRESS: Address = address!("0xfffffffffffffffffffffffffffffffffffffffe");
@@ -22,6 +24,12 @@ pub enum ParliaConsensusErr {
     /// Head block hash not found
     #[error("Head block hash not found")]
     HeadHashNotFound,
+    /// Fork choice update error
+    #[error("Fork choice update error: {0}")]
+    ForkChoiceUpdateError(String),
+    /// Unknown total difficulty
+    #[error("Unknown total difficulty for block {0} at number {1}")]
+    UnknownTotalDifficulty(B256, u64),
 }
 
 /// Parlia consensus implementation
@@ -34,128 +42,187 @@ pub struct ParliaConsensus<P> {
 
 impl<P> ParliaConsensus<P>
 where
-    P: BlockNumReader + Clone,
+    P: BlockNumReader + HeaderProvider<Header = Header> + BlockReaderIdExt + Clone,
 {
     /// Determines the head block hash according to Parlia consensus rules:
     /// 1. Follow the highest block number
     /// 2. For same height blocks, pick the one with lower hash
-    pub(crate) fn canonical_head(&self, hash: B256, number: BlockNumber) -> Result<(B256, B256), ParliaConsensusErr> {
-        let current_head = self.provider.best_block_number()?;
-        let current_hash = self.provider.block_hash(current_head)?.ok_or(ParliaConsensusErr::HeadHashNotFound)?;
-
-        // Try fast-finality fork choice first (Plato and later)
-        if let Some((ff_head, ff_current)) = self.fast_finality_head_choice(hash, number, current_hash, current_head) {
-            return Ok((ff_head, ff_current));
-        }
-
-        // Fallback to height and hash tie-breaker
-        match number.cmp(&current_head) {
-            Ordering::Greater => Ok((hash, current_hash)),
-            Ordering::Equal => Ok((hash.min(current_hash), current_hash)),
-            Ordering::Less => Ok((current_hash, current_hash)),
+    pub(crate) fn canonical_head(&self, incoming: &Header) -> Result<Header, ParliaConsensusErr> {
+        let current_head = self.provider.header_by_number_or_tag(BlockNumberOrTag::Latest)?.ok_or(ParliaConsensusErr::HeadHashNotFound)?;
+        tracing::debug!(target: "parlia", "Canonical head: incoming = {:?}, current = {:?}", incoming, current_head);
+        match self.head_choice_with_fast_finality(incoming, &current_head) {
+            Ok(true) => Ok(incoming.clone()),
+            Ok(false) => Ok(current_head),
+            Err(e) => {
+                // TODO: current the reth return TD is wrong, it need to refactor later.
+                tracing::debug!(target: "parlia", "Failed to head choice with fast finality: {:?}", e);
+                // Fallback to height and hash tie-breaker
+                match incoming.number.cmp(&current_head.number) {
+                    Ordering::Greater => Ok(incoming.clone()),
+                    Ordering::Equal => {
+                        if incoming.hash_slow() < current_head.hash_slow() {
+                            Ok(incoming.clone())
+                        } else {
+                            Ok(current_head)
+                        }
+                    }
+                    Ordering::Less => Ok(current_head),
+                }
+            }
         }
     }
 
     /// Implements BSC fast finality fork choice similar to geth's
     /// `ReorgNeededWithFastFinality`.
+    /// ref: https://github.com/bnb-chain/bsc/blob/3f345c855ebceb14cca98dc3776718185ba2014a/core/forkchoice.go#L129
     ///
     /// Returns `Some((head, current))` if a decision could be made using fast finality. If fast
     /// finality is not applicable (pre-Plato or missing headers), returns `None` so that caller can
     /// fallback to default selection.
-    fn fast_finality_head_choice(
+    pub(crate) fn head_choice_with_fast_finality(
         &self,
-        incoming_hash: B256,
-        incoming_number: BlockNumber,
-        current_hash: B256,
-        current_number: BlockNumber,
-    ) -> Option<(B256, B256)> {
-        // Only applicable when Plato is active on at least one of the compared blocks
-        let plato_incoming = self.chain_spec.is_plato_active_at_block(incoming_number);
-        let plato_current = self.chain_spec.is_plato_active_at_block(current_number);
-        if !(plato_incoming || plato_current) {
-            return None;
-        }
-
-        // Fetch headers via global provider; fallback to in-process header cache if unavailable
-        let incoming_header = shared::get_header_by_hash_from_provider(&incoming_hash)
-            .or_else(|| {
-                crate::node::evm::util::HEADER_CACHE_READER
-                    .lock()
-                    .ok()
-                    .and_then(|mut c| c.get_header_by_hash(&incoming_hash))
-            });
-        let current_header = shared::get_header_by_hash_from_provider(&current_hash).or_else(|| {
-            crate::node::evm::util::HEADER_CACHE_READER
-                .lock()
-                .ok()
-                .and_then(|mut c| c.get_header_by_hash(&current_hash))
-        });
-
-        // If we can't access headers, we can't apply fast finality
-        let (Some(incoming_header), Some(current_header)) = (incoming_header, current_header) else {
-            return None;
+        incoming: &Header,
+        current: &Header,
+    ) -> Result<bool, ParliaConsensusErr> {
+        // Get justified numbers from snapshots at parent blocks
+        let (incoming_justified_num, _) = if self.chain_spec.is_plato_active_at_block(incoming.number) {
+            self.get_justified_number_and_hash(incoming).unwrap_or((0, B256::ZERO))
+        } else {
+            (0, B256::ZERO)
         };
 
+        let (current_justified_num, _) = if self.chain_spec.is_plato_active_at_block(current.number) {
+            self.get_justified_number_and_hash(current).unwrap_or((0, B256::ZERO))
+        } else {
+            (0, B256::ZERO)
+        };
+
+        tracing::debug!(target: "parlia", "Head choice with fast finality: incoming_justified_num = {:?}, current_justified_num = {:?}", incoming_justified_num, current_justified_num);
+        // If equal, fast finality can't decide: let caller fallback
+        if incoming_justified_num == current_justified_num {
+            return self.head_choice_with_td(incoming, current);
+        }
+
+        if incoming_justified_num > current_justified_num && incoming.number <= current.number {
+            info!(
+                target: "forkchoice",
+                fromHeight = current.number,
+                fromHash = ?current.hash_slow(),
+                toHeight = incoming.number,
+                toHash = ?incoming.hash_slow(),
+                fromJustified = current_justified_num,
+                toJustified = incoming_justified_num,
+                "Chain find higher justifiedNumber"
+            );
+        }
+        Ok(incoming_justified_num > current_justified_num)
+    }
+
+
+    /// Implements BSC fork choice similar to geth's `ReorgNeeded`.
+    /// ref: https://github.com/bnb-chain/bsc/blob/3f345c855ebceb14cca98dc3776718185ba2014a/core/forkchoice.go#L76
+    pub(crate) fn head_choice_with_td(
+        &self,
+        incoming: &Header,
+        current: &Header,
+    ) -> Result<bool, ParliaConsensusErr> { 
+        // TODO: the reth TD is wrong in BSC, it need store and reply the correct TD for BSC.
+        // Assume the incoming block is already fetched.
+        let incoming_td = self.provider.header_td(&incoming.hash_slow())
+            .map_err(ParliaConsensusErr::Provider)?
+            .ok_or(ParliaConsensusErr::UnknownTotalDifficulty(incoming.hash_slow(), incoming.number))?;
+        let current_td = self.provider.header_td(&current.hash_slow())
+            .map_err(ParliaConsensusErr::Provider)?
+            .ok_or(ParliaConsensusErr::UnknownTotalDifficulty(current.hash_slow(), current.number))?;
+
+        tracing::debug!(target: "parlia", "Head choice with TD: incoming_td = {:?}, current_td = {:?}", incoming_td, current_td);
+        // there no need to check eth's TerminalTotalDifficulty here.
+        // If the total difficulty is higher than our known, add it to the canonical chain
+        match incoming_td.cmp(&current_td) {
+            Ordering::Greater => Ok(true),
+            Ordering::Less => Ok(false),
+            Ordering::Equal => {
+                // Local and external difficulty is identical.
+	            // Second clause in the if statement reduces the vulnerability to selfish mining.
+	            // Please refer to http://www.cs.cornell.edu/~ie53/publications/btcProcFC.pdf
+                let reorg = if incoming.number < current.number {
+                    true
+                } else if incoming.number > current.number {
+                    false
+                } else {
+                    // handle incoming_number == current_number case here.
+                    if incoming.timestamp == current.timestamp {
+                        if incoming.beneficiary == current.beneficiary {
+                            incoming.hash_slow() < current.hash_slow()
+                        } else {
+                            // just rand select a fork.
+                            // ref: https://github.com/bnb-chain/bsc/blob/3f345c855ebceb14cca98dc3776718185ba2014a/core/forkchoice.go#L118
+                            rand::rng().random::<f64>() < 0.5
+                        }
+                    } else {
+                        incoming.timestamp < current.timestamp
+                    }
+                };
+                Ok(reorg)
+            }
+        }
+        
+    }
+
+    pub(crate) fn get_justified_number_and_hash(
+        &self,
+        header: &Header,
+    ) -> Option<(u64, B256)> {
+        if !self.chain_spec.is_luban_active_at_block(header.number) {
+            return None;
+        }
         // Decode vote attestations from headers (post-Luban) to extract justified numbers.
         // Use Parlia helper that understands header layout across hardforks.
         // Fast finality must use snapshot provider; if unavailable, skip FF.
         let sp = match shared::get_snapshot_provider() {
             Some(sp) => sp,
             None => {
-                warn!(target: "forkchoice", "Snapshot provider not set; skipping fast-finality");
+                warn!(target: "parlia", header_hash = ?header.hash_slow(), "Snapshot provider not set in get_justified_number_and_hash");
                 return None;
             }
         };
-        // Get justified numbers from snapshots at parent blocks
-        let incoming_justified = if plato_incoming {
-            match sp.snapshot(incoming_header.number) {
-                Some(snap) => snap.vote_data.target_number,
-                None => {
-                    warn!(target: "forkchoice", "Missing snapshot for incoming parent; skipping fast-finality");
-                    return None;
-                }
+        
+        match sp.snapshot_by_hash(&header.hash_slow()) {
+            Some(snap) => Some((snap.vote_data.target_number, snap.vote_data.target_hash)),
+            None => {
+                warn!(target: "parlia", header_hash = ?header.hash_slow(), "Missing snapshot for header in get_justified_number_and_hash");
+                None
             }
-        } else {
-            0
-        };
-
-        let current_justified = if plato_current {
-            match sp.snapshot(current_header.number) {
-                Some(snap) => snap.vote_data.target_number,
-                None => {
-                    warn!(target: "forkchoice", "Missing snapshot for current parent; skipping fast-finality");
-                    return None;
-                }
-            }
-        } else {
-            0
-        };
-
-        // If equal, fast finality can't decide: let caller fallback
-        if incoming_justified == current_justified {
-            return None;
-        }
-
-        // If the incoming branch has a higher justified number, prefer it.
-        if incoming_justified > current_justified {
-            // Log if switching to a lower/equal height for visibility (parity with geth's log)
-            if incoming_number <= current_number {
-                info!(
-                    target: "forkchoice",
-                    fromHeight = current_number,
-                    fromHash = ?current_hash,
-                    toHeight = incoming_number,
-                    toHash = ?incoming_hash,
-                    fromJustified = current_justified,
-                    toJustified = incoming_justified,
-                    "Chain find higher justifiedNumber"
-                );
-            }
-            Some((incoming_hash, current_hash))
-        } else {
-            Some((current_hash, current_hash))
         }
     }
+
+    pub(crate) fn get_finalized_number_and_hash(
+        &self,
+        header: &Header,
+    ) -> Option<(u64, B256)> {
+        if !self.chain_spec.is_plato_active_at_block(header.number) {
+            return None;
+        }
+        // Decode vote attestations from headers (post-Luban) to extract justified numbers.
+        // Use Parlia helper that understands header layout across hardforks.
+        // Fast finality must use snapshot provider; if unavailable, skip FF.
+        let sp = match shared::get_snapshot_provider() {
+            Some(sp) => sp,
+            None => {
+                warn!(target: "parlia", header_hash = ?header.hash_slow(), "Snapshot provider not set in get_justified_number_and_hash");
+                return None;
+            }
+        };
+        
+        match sp.snapshot_by_hash(&header.hash_slow()) {
+            Some(snap) => Some((snap.vote_data.source_number, snap.vote_data.source_hash)),
+            None => {
+                warn!(target: "parlia", header_hash = ?header.hash_slow(), "Missing snapshot for header in get_justified_number_and_hash");
+                None
+            }
+        }
+    }
+
 }
 
 pub mod parlia;
