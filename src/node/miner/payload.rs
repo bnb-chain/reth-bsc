@@ -173,7 +173,6 @@ where
         // TODO: Calculate blob fee.
         let blob_params = self.chain_spec.blob_params_at_timestamp(attributes.timestamp());
         let max_blob_count = blob_params.as_ref().map(|params| params.max_blob_count).unwrap_or_default();
-        // Create a fresh iterator for each payload build to avoid invalid state persistence
         let mut best_tx_list = self.pool.best_transactions_with_attributes(BestTransactionsAttributes::new(base_fee, None));
         while let Some(pool_tx) = best_tx_list.next() {
             if cancel.is_cancelled() {
@@ -566,7 +565,7 @@ where
 
         let total_len = self.potential_payloads.len();
         let best_payload = self.potential_payloads.remove(best_index);
-        info!("Succeed to pick the best payload: {} (hash: 0x{:x}, txs: {}, fees: {}), pick: {}th payload, total_len: {}", 
+        info!("Succeed to pick the best payload: {} (hash: 0x{:x}, txs: {}, fees: {}), pick: {}th payload as best, total_len: {}", 
             best_payload.block().header().number(),
             best_payload.block().hash(),
             best_payload.block().body().transaction_count(),
