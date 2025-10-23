@@ -461,7 +461,7 @@ where
                                 return Err(Box::new(BscPayloadJobError::JobAborted));
                             }
                             let elapsed = start_time.elapsed();
-                            debug!("Try to build payload: {} (hash: 0x{:x}, txs: {}, fees: {}, cost_time: {:?}, retries: {})", 
+                            debug!("Succeed to try new build: {} (hash: 0x{:x}, txs: {}, fees: {}, cost_time: {:?}, retries: {})", 
                                 payload.block().header().number(),
                                 payload.block().hash(),
                                 payload.block().body().transaction_count(),
