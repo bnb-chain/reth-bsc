@@ -530,8 +530,6 @@ where
                     self.is_aborted = true;
                     return Err(Box::new(BscPayloadJobError::JobAborted));
                 }
-
-
             }
         }
     }
