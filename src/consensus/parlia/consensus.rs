@@ -577,7 +577,7 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
         if let Some(parent_timestamp) = parent_timestamp {
             // Mainnet and Chapel have both passed Feynman. Now, simplify the logic before and during the Feynman hard fork.
             if self.spec.is_feynman_active_at_timestamp(current_number, current_timestamp) &&
-                !self.spec.is_feynman_fix_transition_at_timestamp(current_number, current_timestamp, parent_timestamp) &&
+                !self.spec.is_feynman_transition_at_timestamp(current_number, current_timestamp, parent_timestamp) &&
                  !is_breathe_block(parent_timestamp, current_timestamp) {
                 // params.SystemTxsGasSoftLimit > (depositTxGas+slashTxGas+finalityRewardTxGas)*150/100
                 return SYSTEM_TXS_GAS_SOFT_LIMIT;

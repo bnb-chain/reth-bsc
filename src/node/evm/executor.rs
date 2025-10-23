@@ -285,7 +285,7 @@ where
         }
      
         // enable BEP-440/EIP-2935 for historical block hashes from state
-        if BscHardforks::is_prague_transition_at_timestamp(&self.spec, self.evm.block().number.to::<u64>(), self.evm.block().timestamp.to::<u64>(),self.evm.block().timestamp.to::<u64>() - 3) {
+        if BscHardforks::is_prague_transition_at_timestamp(&self.spec, self.evm.block().number.to::<u64>(), self.evm.block().timestamp.to::<u64>(), parent_timestamp) {
                 self.apply_history_storage_account(self.evm.block().number.to::<u64>())?;
         }
         if BscHardforks::is_prague_active_at_timestamp(&self.spec, self.evm.block().number.to::<u64>(), self.evm.block().timestamp.to::<u64>()) {

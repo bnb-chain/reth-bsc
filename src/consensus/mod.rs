@@ -58,6 +58,7 @@ where
 
     /// Implements BSC fast finality fork choice similar to geth's
     /// `ReorgNeededWithFastFinality`.
+    /// ref: https://github.com/bnb-chain/bsc/blob/3f345c855ebceb14cca98dc3776718185ba2014a/core/forkchoice.go#L129
     ///
     /// Returns `Some((head, current))` if a decision could be made using fast finality. If fast
     /// finality is not applicable (pre-Plato or missing headers), returns `None` so that caller can

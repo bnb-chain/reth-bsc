@@ -218,7 +218,6 @@ where
         let logs_bloom = logs_bloom(receipts.iter().flat_map(|r| &r.logs));
         let block_number = evm_env.block_env.number.saturating_to();
 
-        // TODO: bsc has special logic for these un-used fields.
         let withdrawals = self
             .chain_spec
             .is_shanghai_active_at_timestamp(timestamp)
