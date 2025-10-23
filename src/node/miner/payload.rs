@@ -37,6 +37,12 @@ use reth_chainspec::EthereumHardforks;
 /// Delay left over for mining calculation
 const DELAY_LEFT_OVER: u64 = 50;
 
+/// Time multiplier for retry condition check
+const TIME_MULTIPLIER: u32 = 2;
+
+/// Maximum number of retries for payload building
+const MAX_RETRIES: u32 = 3;
+
 /// Errors that can occur during payload job execution
 #[derive(Debug, thiserror::Error)]
 pub enum BscPayloadJobError {
@@ -100,7 +106,21 @@ where
         Self { client, pool, evm_config, builder_config, chain_spec }
     }
 
-    // todo: check more and refine it later.
+    /// Builds a payload with the given arguments.
+    /// 
+    /// # Thread Safety
+    /// 
+    /// This method takes `&self` and may be called concurrently. The underlying fields
+    /// (such as `client`, `pool`, etc.) are designed to be thread-safe, but callers should
+    /// ensure that concurrent calls don't cause race conditions in shared state.
+    /// 
+    /// # Arguments
+    /// 
+    /// * `args` - Build arguments containing cached reads, config, cancel token, and best payload
+    /// 
+    /// # Returns
+    /// 
+    /// Returns a `Result` containing the built payload or an error.
     pub async fn build_payload(&self, args: BuildArguments<EthPayloadBuilderAttributes, BscBuiltPayload>) -> Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>> {
         let BuildArguments { mut cached_reads, config, cancel, best_payload: _best_payload } = args;
         let PayloadConfig { parent_header, attributes } = config;
@@ -137,7 +157,7 @@ where
         let mut sidecars_map = HashMap::new();
         let mut block_blob_count = 0;
 
-        // todo: calc blob fee.
+        // TODO: Calculate blob fee.
         let blob_params = self.chain_spec.blob_params_at_timestamp(attributes.timestamp());
         let max_blob_count = blob_params.as_ref().map(|params| params.max_blob_count).unwrap_or_default();
         let mut best_tx_list = self.pool.best_transactions_with_attributes(BestTransactionsAttributes::new(base_fee, None));
@@ -388,13 +408,11 @@ where
             retries: 0,
             join_handle: tokio::task::JoinSet::new(),
         };
-        
         let handle = BscPayloadJobHandle {
             abort_tx,
         };
 
         debug!("Succeed to new payload job, block_number: {}, timeout: {:?}", job.mining_ctx.parent_header.number()+1, job.timeout);
-        
         (job, handle)
     }
 
@@ -402,7 +420,7 @@ where
     pub async fn start(mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut start_time = std::time::Instant::now();
         if let Err(err) = self.try_build_tx.send(()) {
-            warn!("Failed to send to try build queue: {}", err);
+            warn!("Failed to send to first try build queue due to {}, block_number: {}", err, self.build_args.config.parent_header.number()+1);
             return Err(Box::new(BscPayloadJobError::BuildQueueSendError(err.to_string())));
         }
 
@@ -460,7 +478,7 @@ where
                                 DELAY_LEFT_OVER);
                             // TODO: check more details and refine it later.
                             // There is still plenty of time left and retry to build payload.
-                            if std::time::Duration::from_millis(mining_delay) > elapsed*2 && self.retries < 3 {
+                            if std::time::Duration::from_millis(mining_delay) > elapsed * TIME_MULTIPLIER && self.retries < MAX_RETRIES {
                                 if let Err(err) = self.try_build_tx.send(()) {
                                     warn!("Failed to send to try build queue, block_number: {}, retries: {}, error: {:?}", 
                                         self.build_args.config.parent_header.number()+1, self.retries, err);
