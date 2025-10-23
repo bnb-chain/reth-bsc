@@ -4,13 +4,12 @@ use alloy_consensus::Transaction;
 use reth_primitives::TransactionSigned;
 use reth_primitives_traits::SignerRecoverable;
 use std::sync::Arc;
-use crate::node::miner::bid_simulator::{Bid, NewBidPackage, BidSimulator};
+use crate::node::miner::bid_simulator::{Bid, NewBidPackage};
 use reth_provider::StateProviderFactory;
-use crate::consensus::parlia::provider::SnapshotProvider;
-use crate::node::miner::MiningConfig;
 use crate::chainspec::BscChainSpec;
 use reth_chainspec::EthChainSpec;
 use tracing::debug;
+use crate::node::miner::bsc_miner::BscMiner;
 // Use the MEV server trait and types from reth-rpc-api
 pub use reth_rpc_api::MevFullApiServer;
 pub use reth_rpc_api::mev::{BidArgs, RawBid};
@@ -21,30 +20,31 @@ const PAY_BID_TX_GAS_LIMIT: u64 = 25000;
 
 /// Implementation of the MEV Builder RPC API
 
-pub struct MevApiImpl<Client> 
+pub struct MevApiImpl<Pool, Client> 
 where
     Client: StateProviderFactory + Clone + Send + Sync + 'static,
 {
-    /// Bid simulator (wrapped in RwLock for interior mutability)
-    simulator: Arc<parking_lot::RwLock<BidSimulator<Client>>>,
-    snapshot_provider: Arc<dyn SnapshotProvider + Send + Sync>,
-    mining_config: MiningConfig,
-    chain_spec: Arc<BscChainSpec>,
+    miner: Arc<BscMiner<Pool, Client>>,
 
 }
 
-impl<Client> MevApiImpl<Client>
+impl<Pool, Client> MevApiImpl<Pool, Client>
 where
-    Client: StateProviderFactory + Clone + Send + Sync + 'static,
+    Client: reth_provider::HeaderProvider<Header = alloy_consensus::Header>
+        + reth_provider::BlockNumReader
+        + reth_provider::StateProviderFactory
+        + reth_provider::CanonStateSubscriptions
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    Pool: reth::transaction_pool::TransactionPool<Transaction: reth::transaction_pool::PoolTransaction<Consensus = TransactionSigned>> + Clone + 'static,
 {
     /// Create a new MEV API instance
     pub fn new(
-        simulator: Arc<parking_lot::RwLock<BidSimulator<Client>>>,
-        snapshot_provider: Arc<dyn SnapshotProvider + Send + Sync>,
-        mining_config: MiningConfig,
-        chain_spec: Arc<BscChainSpec>,
+        miner: Arc<BscMiner<Pool, Client>>,
     ) -> Self {
-        Self { simulator, snapshot_provider, mining_config, chain_spec }
+        Self { miner }
     }
 
     /// Parse transaction from bytes with validation
@@ -220,9 +220,17 @@ where
 }
 
 #[async_trait::async_trait]
-impl<Client> MevFullApiServer for MevApiImpl<Client>
+impl<Pool, Client> MevFullApiServer for MevApiImpl<Pool, Client>
 where
-    Client: StateProviderFactory + Clone + Send + Sync + 'static,
+    Client: reth_provider::HeaderProvider<Header = alloy_consensus::Header>
+        + reth_provider::BlockNumReader
+        + reth_provider::StateProviderFactory
+        + reth_provider::CanonStateSubscriptions
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    Pool: reth::transaction_pool::TransactionPool<Transaction: reth::transaction_pool::PoolTransaction<Consensus = TransactionSigned>> + Clone + 'static,
 {
     /// Send a bundle to the relay (not implemented for BSC)
     async fn send_bundle(
@@ -260,7 +268,7 @@ where
         );
 
         let parent_number = bid.raw_bid.block_number.to();
-        let parent_snapshot = match self.snapshot_provider.snapshot(parent_number) {
+        let parent_snapshot = match self.miner.snapshot_provider().snapshot(parent_number) {
             Some(snapshot) => snapshot,
             None => {
                 tracing::error!("Skip to new bid due to no snapshot available, block number: {}", parent_number);
@@ -281,7 +289,7 @@ where
             ));
         }
 
-        if let Some(validator_address) = self.mining_config.validator_address {
+        if let Some(validator_address) = self.miner.mining_config().validator_address {
             if !parent_snapshot.is_inturn(validator_address) {
                 tracing::error!("Skip to new bid due to is not inturn, block number: {}", parent_number);
                 return Err(jsonrpsee::types::ErrorObject::owned(
@@ -366,20 +374,17 @@ where
         debug!("bid_hash: {:?}", bid_hash);
         
         // Check if this bid is already pending
-        {
-            let mut simulator = self.simulator.write();
-            if !simulator.check_pending_bid(bid.raw_bid.block_number.to(), builder, bid_hash) {
-                tracing::error!("Skip to new bid due to pending bid, block number: {}", bid.raw_bid.block_number);
-                return Err(jsonrpsee::types::ErrorObject::owned(
-                    -32602,
-                    "Pending bid",
-                    None::<()>,
-                ));
-            }
+        if !self.miner.check_pending_bid(bid.raw_bid.block_number.to(), builder, bid_hash) {
+            tracing::error!("Skip to new bid due to pending bid, block number: {}", bid.raw_bid.block_number);
+            return Err(jsonrpsee::types::ErrorObject::owned(
+                -32602,
+                "Pending bid",
+                None::<()>,
+            ));
         }
 
         // Convert BidArgs to Bid object
-        let bid_obj = match Self::to_bid(&bid, builder, &self.chain_spec,bid_hash) {
+        let bid_obj = match Self::to_bid(&bid, builder, self.miner.chain_spec(), bid_hash) {
             Ok(bid) => bid,
             Err(e) => {
                 tracing::error!("Failed to convert BidArgs to Bid: {}", e);
@@ -405,12 +410,8 @@ where
             bid_hash
         );
 
-        // Submit to simulator asynchronously
-        let simulator = Arc::clone(&self.simulator);
-        tokio::spawn(async move {
-            let mut simulator = simulator.write();
-            simulator.commit_new_bid(bid_package);
-        });
+        // Submit to miner
+        self.miner.send_bid(bid_package);
 
         Ok(bid_hash)
     }

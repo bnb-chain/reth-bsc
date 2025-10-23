@@ -20,6 +20,8 @@ use alloy_primitives::{Address, B256};
 use reth_primitives::SealedHeader;
 use reth_provider::StateProvider;
 use crate::consensus::SYSTEM_ADDRESS;
+use crate::node::engine::BscBuiltPayload;
+use reth_evm::execute::BlockBuilderOutcome;
 
 #[derive(Clone)]
 pub struct Bid {
@@ -272,7 +274,13 @@ where Client: StateProviderFactory + Clone + 'static,
         bid_runtime.commit_transaction(pay_bid_txs, &mut builder);
         
         // Finish the builder
-        let _outcome = builder.finish(&state_provider).map_err(PayloadBuilderError::other).unwrap();
+        let BlockBuilderOutcome { execution_result, block, .. } = builder.finish(&state_provider).map_err(PayloadBuilderError::other).unwrap();
+        let sealed_block = Arc::new(block.sealed_block().clone());
+        bid_runtime.bsc_payload = BscBuiltPayload {
+            block: sealed_block,
+            fees: bid_runtime.gas_fee,
+            requests: Some(execution_result.requests),
+        };
 
 
         let best_bid = self.best_bid.get(&parent_hash);
@@ -301,11 +309,16 @@ where Client: StateProviderFactory + Clone + 'static,
         // todo: recommit
 
     }
+
+    /// Get the best bid for a given parent hash
+    pub fn get_best_bid(&self, parent_hash: B256) -> Option<BidRuntime<BscEvmConfig>> {
+        self.best_bid.get(&parent_hash).cloned()
+    }
 }
 
 #[derive(Clone)]
 pub struct BidRuntime<EvmConfig = BscEvmConfig> {
-    bid: Bid,
+    pub bid: Bid,
     expected_block_reward: U256,
     expected_validator_reward: U256,
     packed_block_reward: U256,
@@ -319,6 +332,7 @@ pub struct BidRuntime<EvmConfig = BscEvmConfig> {
     parent_header: SealedHeader,
     attributes: EthPayloadBuilderAttributes,
     builder_config: EthereumBuilderConfig,
+    pub bsc_payload: BscBuiltPayload,
     
     gas_used: u64,
     gas_fee: U256,
@@ -335,6 +349,7 @@ EvmConfig: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
             bid,
             evm_config,
             builder_config: EthereumBuilderConfig::default(),
+            bsc_payload: BscBuiltPayload::default(),
             expected_block_reward: U256::ZERO,
             expected_validator_reward: U256::ZERO,
             packed_block_reward: U256::ZERO,
@@ -389,21 +404,5 @@ EvmConfig: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
 
     fn valid_reward(&self) -> bool {
         return self.packed_block_reward >= self.expected_block_reward && self.packed_validator_reward >= self.expected_validator_reward;
-    }
-}
-
-pub trait BidFetcher<Client>
-where
-    Client: StateProviderFactory + Clone + 'static,
-{
-    fn get_best_bid(&self, parent_hash: B256) -> Option<BidRuntime<BscEvmConfig>>;
-}
-
-impl<Client> BidFetcher<Client> for BidSimulator<Client>
-where
-    Client: StateProviderFactory + Clone + 'static,
-{
-    fn get_best_bid(&self, parent_hash: B256) -> Option<BidRuntime<BscEvmConfig>> {
-        self.best_bid.get(&parent_hash).cloned()
     }
 }

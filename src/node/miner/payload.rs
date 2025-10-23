@@ -2,6 +2,7 @@ use alloy_primitives::U256;
 use crate::node::engine::BscBuiltPayload;
 use crate::node::evm::config::BscEvmConfig;
 use crate::node::miner::bsc_miner::MiningContext;
+use crate::node::miner::bid_simulator::BidSimulator;
 use reth_provider::StateProviderFactory;
 use reth_revm::{database::StateProviderDatabase, db::State};
 use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
@@ -365,12 +366,13 @@ pub struct BscPayloadJob<Pool, Client, EvmConfig = BscEvmConfig> {
     retries: u32,
     /// JoinSet for managing build tasks
     join_handle: tokio::task::JoinSet<Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>>>,
-    // TODO: enrich mev workflows.
+    /// Simulator for bid management
+    simulator: Arc<parking_lot::RwLock<BidSimulator<Client>>>,
 }
 
 impl<Pool, Client, EvmConfig> BscPayloadJob<Pool, Client, EvmConfig>
 where
-    Client: StateProviderFactory + 'static,
+    Client: StateProviderFactory + Clone + 'static,
     EvmConfig: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
     <EvmConfig as ConfigureEvm>::Primitives: reth_primitives_traits::NodePrimitives<BlockHeader = alloy_consensus::Header, SignedTx = alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip4844>, Block = crate::node::primitives::BscBlock>,
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>> + 'static,
@@ -382,6 +384,7 @@ where
         builder: BscPayloadBuilder<Pool, Client, EvmConfig>,
         build_args: BuildArguments<EthPayloadBuilderAttributes, BscBuiltPayload>,
         result_tx: mpsc::UnboundedSender<BscBuiltPayload>,
+        simulator: Arc<parking_lot::RwLock<BidSimulator<Client>>>,
     ) -> (Self, BscPayloadJobHandle) {
         let (abort_tx, abort_rx) = oneshot::channel();
         let (try_build_tx, try_build_rx) = mpsc::unbounded_channel();
@@ -407,6 +410,7 @@ where
             build_args,
             retries: 0,
             join_handle: tokio::task::JoinSet::new(),
+            simulator,
         };
         let handle = BscPayloadJobHandle {
             abort_tx,
@@ -507,7 +511,21 @@ where
                         },
                     }
                 }
-                
+
+                // cronjob to get best bid from bid simulator.
+                _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {
+                    let best_bid = {
+                        let simulator = self.simulator.read();
+                        simulator.get_best_bid(self.mining_ctx.parent_header.hash())
+                    };
+                    if let Some(bid) = best_bid {
+                        debug!("Succeed to get best bid, block: {}", bid.bid.block_number);
+                        self.potential_payloads.push(bid.bsc_payload);
+                    } else {
+                        debug!("No best bid found");
+                    }
+                }
+
                 // Finish timeout by timer.
                 _ = tokio::time::sleep(self.timeout) => {
                     let elapsed = start_time.elapsed();
