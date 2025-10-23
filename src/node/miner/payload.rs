@@ -17,9 +17,11 @@ use reth::transaction_pool::error::InvalidPoolTransactionError;
 use reth_primitives::InvalidTransactionError;
 use reth_evm::execute::BlockBuilderOutcome;
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
+use reth_revm::cached::CachedReads;
+use reth_primitives::HeaderTy;
+use reth_revm::cancelled::ManualCancel;
 use std::sync::Arc;
-use reth_basic_payload_builder::{BuildArguments, PayloadConfig};
-use reth_revm::cancelled::CancelOnDrop;
+use reth_basic_payload_builder::PayloadConfig;
 use tokio::sync::{oneshot, mpsc};
 use reth::payload::EthPayloadBuilderAttributes;
 use reth_payload_primitives::PayloadBuilderAttributes;
@@ -74,6 +76,17 @@ pub enum BscPayloadJobError {
     ChannelCommunicationError(String),
 }
 
+/// Build arguments for BscPayloadBuilder.
+#[derive(Debug, Clone)]
+pub struct BscBuildArguments<Attributes> {
+    /// Previously cached disk reads
+    pub cached_reads: CachedReads,
+    /// How to configure the payload.
+    pub config: PayloadConfig<Attributes, HeaderTy<<BscBuiltPayload as BuiltPayload>::Primitives>>,
+    /// A marker that can be used to cancel the job.
+    pub cancel: ManualCancel,
+}
+
 /// BSC payload builder, used to build payload for bsc miner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BscPayloadBuilder<Pool, Client, EvmConfig = BscEvmConfig> {
@@ -116,13 +129,13 @@ where
     /// 
     /// # Arguments
     /// 
-    /// * `args` - Build arguments containing cached reads, config, cancel token, and best payload
+    /// * `args` - Build arguments containing cached reads, config, cancel token
     /// 
     /// # Returns
     /// 
     /// Returns a `Result` containing the built payload or an error.
-    pub async fn build_payload(&self, args: BuildArguments<EthPayloadBuilderAttributes, BscBuiltPayload>) -> Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>> {
-        let BuildArguments { mut cached_reads, config, cancel, best_payload: _best_payload } = args;
+    pub async fn build_payload(&self, args: BscBuildArguments<EthPayloadBuilderAttributes>) -> Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>> {
+        let BscBuildArguments { mut cached_reads, config, cancel } = args;
         let PayloadConfig { parent_header, attributes } = config;
 
         let state_provider = self.client.state_by_block_hash(parent_header.hash_slow())?;
@@ -160,6 +173,7 @@ where
         // TODO: Calculate blob fee.
         let blob_params = self.chain_spec.blob_params_at_timestamp(attributes.timestamp());
         let max_blob_count = blob_params.as_ref().map(|params| params.max_blob_count).unwrap_or_default();
+        // Create a fresh iterator for each payload build to avoid invalid state persistence
         let mut best_tx_list = self.pool.best_transactions_with_attributes(BestTransactionsAttributes::new(base_fee, None));
         while let Some(pool_tx) = best_tx_list.next() {
             if cancel.is_cancelled() {
@@ -349,8 +363,6 @@ pub struct BscPayloadJob<Pool, Client, EvmConfig = BscEvmConfig> {
     try_build_rx: mpsc::UnboundedReceiver<()>,
     /// Sender for sending arguments back to queue
     try_build_tx: mpsc::UnboundedSender<()>,
-    /// Cancel handle that automatically cancels the job when dropped
-    cancel: CancelOnDrop,
     /// Abort receiver for external termination
     abort_rx: oneshot::Receiver<()>,
     /// Abort flag
@@ -360,7 +372,7 @@ pub struct BscPayloadJob<Pool, Client, EvmConfig = BscEvmConfig> {
     /// Potential payloads vector for selecting the best one
     potential_payloads: Vec<BscBuiltPayload>,
     /// Current build arguments
-    build_args: BuildArguments<EthPayloadBuilderAttributes, BscBuiltPayload>,
+    build_args: BscBuildArguments<EthPayloadBuilderAttributes>,
     /// Retry count for payload building
     retries: u32,
     /// JoinSet for managing build tasks
@@ -380,12 +392,11 @@ where
         parlia: Arc<crate::consensus::parlia::Parlia<crate::chainspec::BscChainSpec>>,
         mining_ctx: MiningContext,
         builder: BscPayloadBuilder<Pool, Client, EvmConfig>,
-        build_args: BuildArguments<EthPayloadBuilderAttributes, BscBuiltPayload>,
+        build_args: BscBuildArguments<EthPayloadBuilderAttributes>,
         result_tx: mpsc::UnboundedSender<BscBuiltPayload>,
     ) -> (Self, BscPayloadJobHandle) {
         let (abort_tx, abort_rx) = oneshot::channel();
         let (try_build_tx, try_build_rx) = mpsc::unbounded_channel();
-        let cancel = build_args.cancel.clone();
         let mining_delay = parlia.clone().delay_for_mining(
             &mining_ctx.parent_snapshot, 
             &mining_ctx.parent_header, 
@@ -399,7 +410,6 @@ where
             timeout: std::time::Duration::from_millis(mining_delay),
             try_build_rx,
             try_build_tx: try_build_tx.clone(),
-            cancel,
             abort_rx,
             is_aborted: false,
             result_tx,
@@ -436,12 +446,7 @@ where
                                 self.build_args.config.parent_header.number()+1, self.retries);
                             
                             let builder = self.builder.clone();
-                            let build_args = BuildArguments {
-                                cached_reads: self.build_args.cached_reads.clone(),
-                                config: self.build_args.config.clone(),
-                                best_payload: self.build_args.best_payload.clone(),
-                                cancel: self.build_args.cancel.clone(),
-                            };
+                            let build_args = self.build_args.clone();
                             self.join_handle.spawn(async move {
                                 builder.build_payload(build_args).await
                             });
@@ -513,7 +518,7 @@ where
                     let elapsed = start_time.elapsed();
                     info!("try return best payload due to has no time, cost_time: {:?}, block_number: {}, retries: {}", 
                         elapsed, self.build_args.config.parent_header.number()+1, self.retries);
-                    drop(std::mem::take(&mut self.cancel));
+                    self.build_args.cancel.clone().cancel();
                     return self.try_return_best_payload();
                 }
                 
@@ -522,10 +527,12 @@ where
                     let elapsed = start_time.elapsed();
                     info!("Abort payload building by new head, cost_time: {:?}, block_number: {}, retries: {}", 
                         elapsed, self.build_args.config.parent_header.number()+1, self.retries);
-                    drop(std::mem::take(&mut self.cancel));
+                    self.build_args.cancel.clone().cancel();
                     self.is_aborted = true;
                     return Err(Box::new(BscPayloadJobError::JobAborted));
                 }
+
+
             }
         }
     }
@@ -559,12 +566,12 @@ where
 
         let total_len = self.potential_payloads.len();
         let best_payload = self.potential_payloads.remove(best_index);
-        info!("Succeed to pick the best payload: {} (hash: 0x{:x}, txs: {}, fees: {}), pick_index: {}, total_len: {}", 
+        info!("Succeed to pick the best payload: {} (hash: 0x{:x}, txs: {}, fees: {}), pick: {}th payload, total_len: {}", 
             best_payload.block().header().number(),
             best_payload.block().hash(),
             best_payload.block().body().transaction_count(),
             best_payload.fees(),
-            best_index,
+            best_index+1,
             total_len
         );
         

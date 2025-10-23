@@ -30,9 +30,9 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_stream::StreamExt;
 use tracing::{debug, error, info, warn};
-use reth_basic_payload_builder::{BuildArguments, PayloadConfig};
-use reth::payload::EthPayloadBuilderAttributes;
-use reth_revm::cancelled::CancelOnDrop;
+use reth_basic_payload_builder::PayloadConfig;
+use crate::node::miner::payload::BscBuildArguments;
+use reth_revm::cancelled::ManualCancel;
 use alloy_primitives::U128;
 use reth_network::message::NewBlockMessage;
 use alloy_rlp::Encodable;
@@ -288,12 +288,11 @@ where
             EthereumBuilderConfig::new(),
             self.chain_spec.clone(),
         );
-        let build_args = BuildArguments::<EthPayloadBuilderAttributes, BscBuiltPayload>::new(
-            reth_revm::cached::CachedReads::default(),
-            PayloadConfig::new(Arc::new(mining_ctx.parent_header.clone()), attributes),
-            CancelOnDrop::default(),
-            None,
-        );
+        let build_args = BscBuildArguments {
+            cached_reads: reth_revm::cached::CachedReads::default(),
+            config: PayloadConfig::new(Arc::new(mining_ctx.parent_header.clone()), attributes),
+            cancel: ManualCancel::default(),
+        };
                 
         let (payload_job, job_handle) = BscPayloadJob::new(
             self.parlia.clone(), 
