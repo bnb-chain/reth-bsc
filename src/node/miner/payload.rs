@@ -563,7 +563,7 @@ where
 
         let total_len = self.potential_payloads.len();
         let best_payload = self.potential_payloads.remove(best_index);
-        info!("Succeed to pick the best payload: {} (hash: 0x{:x}, txs: {}, fees: {}), pick: {}th payload as best, total_len: {}", 
+        info!("Succeed to pick the best payload: {} (hash: 0x{:x}, txs: {}, fees: {}), pick the {}th payload as best, total_len: {}", 
             best_payload.block().header().number(),
             best_payload.block().hash(),
             best_payload.block().body().transaction_count(),
