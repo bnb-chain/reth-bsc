@@ -35,7 +35,7 @@ pub trait SnapshotProvider: Send + Sync {
 
     /// Inserts (or replaces) the snapshot in the provider.
     fn insert(&self, snapshot: Snapshot);
-    
+
     /// Returns the header for the given `block_number`.
     fn get_header(&self, block_number: BlockNumber) -> Option<alloy_consensus::Header>;
 

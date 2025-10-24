@@ -427,6 +427,7 @@ where
             block: Arc::new(new_block) 
         };
 
+        // TODO: just commit state, handle FCU and send block to P2P, it avoid re-execution again.
         if let Some(sender) = get_block_import_sender() {
             let peer_id = get_local_peer_id_or_default();
             let incoming: crate::node::network::block_import::service::IncomingBlock =
