@@ -182,7 +182,7 @@ where
         let sp = match shared::get_snapshot_provider() {
             Some(sp) => sp,
             None => {
-                warn!(target: "parlia", header_hash = ?header.hash_slow(), "Snapshot provider not set in get_justified_number_and_hash");
+                warn!(target: "parlia", header_hash = ?header.hash_slow(), "Snapshot provider not set when get justified number and hash");
                 return None;
             }
         };
@@ -190,7 +190,7 @@ where
         match sp.snapshot_by_hash(&header.hash_slow()) {
             Some(snap) => Some((snap.vote_data.target_number, snap.vote_data.target_hash)),
             None => {
-                warn!(target: "parlia", header_hash = ?header.hash_slow(), "Missing snapshot for header in get_justified_number_and_hash");
+                warn!(target: "parlia", header_hash = ?header.hash_slow(), "Missing snapshot for header when get justified number and hash");
                 None
             }
         }
@@ -209,7 +209,7 @@ where
         let sp = match shared::get_snapshot_provider() {
             Some(sp) => sp,
             None => {
-                warn!(target: "parlia", header_hash = ?header.hash_slow(), "Snapshot provider not set in get_justified_number_and_hash");
+                warn!(target: "parlia", header_hash = ?header.hash_slow(), "Snapshot provider not set when get finalized number and hash");
                 return None;
             }
         };
@@ -217,7 +217,7 @@ where
         match sp.snapshot_by_hash(&header.hash_slow()) {
             Some(snap) => Some((snap.vote_data.source_number, snap.vote_data.source_hash)),
             None => {
-                warn!(target: "parlia", header_hash = ?header.hash_slow(), "Missing snapshot for header in get_justified_number_and_hash");
+                warn!(target: "parlia", header_hash = ?header.hash_slow(), "Missing snapshot for header when get finalized number and hash");
                 None
             }
         }
@@ -380,7 +380,7 @@ mod tests {
         }
 
         fn sealed_header(&self, number: BlockNumber) -> Result<Option<SealedHeader<Self::Header>>, ProviderError> {
-            Ok(self.headers_by_number.get(&number).cloned().map(|h| SealedHeader::seal_slow(h)))
+            Ok(self.headers_by_number.get(&number).cloned().map(SealedHeader::seal_slow))
         }
 
         fn sealed_headers_while(

@@ -363,7 +363,7 @@ mod tests {
         let mut outcomes = Vec::new();
 
         // Wait for both NewPayload and FCU outcomes from first block
-        while outcomes.len() < 1 {
+        while outcomes.is_empty() {
             match fixture.handle.poll_outcome(&mut cx) {
                 Poll::Ready(Some(outcome)) => {
                     outcomes.push(outcome);
@@ -487,7 +487,7 @@ mod tests {
         }
 
         fn sealed_header(&self, number: BlockNumber) -> Result<Option<SealedHeader<Self::Header>>, ProviderError> {
-            Ok(self.headers_by_number.get(&number).cloned().map(|h| SealedHeader::seal_slow(h)))
+            Ok(self.headers_by_number.get(&number).cloned().map(SealedHeader::seal_slow))
         }
 
         fn sealed_headers_while(
@@ -582,7 +582,7 @@ mod tests {
             let mut outcomes = Vec::new();
 
             // Wait for both NewPayload and FCU outcomes
-            while outcomes.len() < 1 {
+            while outcomes.is_empty() {
                 match self.handle.poll_outcome(&mut cx) {
                     Poll::Ready(Some(outcome)) => {
                         outcomes.push(outcome);
