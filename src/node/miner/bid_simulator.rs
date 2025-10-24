@@ -22,6 +22,7 @@ use reth_provider::StateProvider;
 use crate::consensus::SYSTEM_ADDRESS;
 use crate::node::engine::BscBuiltPayload;
 use reth_evm::execute::BlockBuilderOutcome;
+use reth_provider::{HeaderProvider, BlockHashReader};
 
 #[derive(Clone)]
 pub struct Bid {
@@ -68,7 +69,7 @@ pub struct BidSimulator<Client> {
 }
 
 impl<Client> BidSimulator<Client> 
-where Client: StateProviderFactory + Clone + 'static,
+where Client: HeaderProvider<Header = alloy_consensus::Header> + BlockHashReader + StateProviderFactory + Clone + 'static,
 {
     pub fn new(client: Client, chain_spec: Arc<BscChainSpec>) -> Self {
         Self { 
@@ -108,7 +109,7 @@ where Client: StateProviderFactory + Clone + 'static,
             Ok(None) => return,
             Err(_) => return,
         };
-        
+        debug!("final_block_number:{}", final_block_number);
         if bid.bid.block_number <= final_block_number {
             // Bid is for a block that's already finalized, ignore it
             // todo: async clear
@@ -118,8 +119,17 @@ where Client: StateProviderFactory + Clone + 'static,
 
 
         let parent_hash = bid.bid.parent_hash;
-
-        let mut _bid_runtime = match self.new_bid_runtime(&bid.bid, 0) {
+        let parent_header = match self.client.header(&parent_hash) {
+            Ok(Some(header)) => {
+                let hash = header.hash_slow();
+                SealedHeader::new(header, hash)
+            },
+            _ => {
+                debug!("Failed to get parent header for hash: {:?}", parent_hash);
+                return;
+            }
+        };
+        let mut _bid_runtime = match self.new_bid_runtime(&bid.bid, 100, parent_header.clone()) {
             Ok(bid_runtime   ) => bid_runtime,
             Err(err) => {
                 debug!("create runtime error:{}",err);
@@ -129,9 +139,10 @@ where Client: StateProviderFactory + Clone + 'static,
         let mut to_commit = true;
         let mut _bid_accepted = true;
         if let Some(best_bid) = self.best_bid_to_run.get(&parent_hash).cloned() {
-            let best_bid_runtime = match self.new_bid_runtime(&best_bid, 0) {
+            let best_bid_runtime = match self.new_bid_runtime(&best_bid, 100, parent_header.clone()) {
                 Ok(best_bid_runtime) => best_bid_runtime,
-                Err(_) => {
+                Err(err) => {
+                    debug!("create runtime error:{}",err);
                     return;
                 }
             };
@@ -183,14 +194,14 @@ where Client: StateProviderFactory + Clone + 'static,
         });
     }
 
-    fn new_bid_runtime(&self, _bid: &Bid, _validator_commission: u64) -> Result<BidRuntime<BscEvmConfig>, Box<dyn std::error::Error + Send + Sync>>{
-        let mut runtime = BidRuntime::new(_bid.clone(), BscEvmConfig::new(self.chain_spec.clone()));
+    fn new_bid_runtime(&self, _bid: &Bid, _validator_commission: u64, parent_header: SealedHeader) -> Result<BidRuntime<BscEvmConfig>, Box<dyn std::error::Error + Send + Sync>>{
+        let mut runtime = BidRuntime::new(_bid.clone(), BscEvmConfig::new(self.chain_spec.clone()), parent_header);
         let expected_block_reward = _bid.gas_fee;
         let mut expected_validator_reward = expected_block_reward * U256::from(_validator_commission);
         expected_validator_reward = expected_validator_reward / U256::from(10000u64);
-
+        debug!("expected_block_reward:{}, _validator_commission:{}, expected_validator_reward:{}, builder_fee:{}",expected_block_reward,_validator_commission, expected_validator_reward, _bid.builder_fee);
         if expected_validator_reward < _bid.builder_fee {
-            debug!("BidSimulator: invalid bid, builder fee exceeds validator reward, ignore");
+            debug!("BidSimulator: invalid bid, builder fee exceeds validator reward, ignore expected_validator_reward:{} builder_fee:{}", expected_validator_reward, _bid.builder_fee);
             return Err("invalid bid: builder fee exceeds validator reward".into());
         }
         expected_validator_reward = expected_validator_reward - _bid.builder_fee;
@@ -201,7 +212,7 @@ where Client: StateProviderFactory + Clone + 'static,
 
     fn commit_bid(&mut self,reason: u32, bid_runtime: &mut BidRuntime<BscEvmConfig>) {
         // todo: interrupt
-        debug!("bid committed reason:{}, bid hash:{}",reason, "");
+        debug!("bid committed reason:{}, bid hash:{}",reason, bid_runtime.bid.bid_hash);
         bid_runtime.bid.committed = true;
         self.sim_bid(bid_runtime);
     }
@@ -221,6 +232,7 @@ where Client: StateProviderFactory + Clone + 'static,
 
         let mut txs_except_last = bid_runtime.bid.txs.clone();
         let pay_bid_tx = txs_except_last.pop();
+        debug!("bid_runtime.parent_header hash:{}", bid_runtime.parent_header.hash_slow());
         let state_provider = self.client.state_by_block_hash(bid_runtime.parent_header.hash_slow()).unwrap();
         let sp_db = StateProviderDatabase::new(&state_provider);
         let mut db = State::builder()
@@ -251,7 +263,7 @@ where Client: StateProviderFactory + Clone + 'static,
         //     bid_runtime.commit_transaction(payBidTx, bid_runtime.parent_header, bid_runtime.attributes, bid_runtime.builder_config);
         // }
         // todo: check whether time `NoInterruptLeftOver-delayLeftOver` is enough for simulating
-        if let Err(e) = bid_runtime.pack_reward(5, &state_provider) {
+        if let Err(e) = bid_runtime.pack_reward(100, &state_provider) {
             debug!("Failed to pack reward: {:?}", e);
             return;
         }
@@ -343,8 +355,7 @@ where
 EvmConfig: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
 <EvmConfig as ConfigureEvm>::Primitives: reth_primitives_traits::NodePrimitives<BlockHeader = alloy_consensus::Header, SignedTx = alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip4844>, Block = crate::node::primitives::BscBlock>,
 {
-    fn new(bid: Bid, evm_config: EvmConfig) -> Self {
-
+    fn new(bid: Bid, evm_config: EvmConfig,parent_header:SealedHeader) -> Self {
         Self {
             bid,
             evm_config,
@@ -354,7 +365,7 @@ EvmConfig: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
             expected_validator_reward: U256::ZERO,
             packed_block_reward: U256::ZERO,
             packed_validator_reward: U256::ZERO,
-            parent_header: SealedHeader::default(),
+            parent_header: parent_header,
             attributes: EthPayloadBuilderAttributes::default(),
             gas_used: 0,
             gas_fee: U256::ZERO,
@@ -403,6 +414,7 @@ EvmConfig: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
     }
 
     fn valid_reward(&self) -> bool {
+        debug!("packed_block_reward:{}, expected_block_reward:{}, packed_validator_reward:{}, expected_validator_reward:{}", self.packed_block_reward, self.expected_block_reward, self.packed_validator_reward, self.expected_validator_reward);
         return self.packed_block_reward >= self.expected_block_reward && self.packed_validator_reward >= self.expected_validator_reward;
     }
 }

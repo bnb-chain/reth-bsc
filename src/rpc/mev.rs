@@ -1,4 +1,5 @@
 use jsonrpsee::core::RpcResult;
+use jsonrpsee::proc_macros::rpc;
 use alloy_primitives::B256;
 use alloy_consensus::Transaction;
 use reth_primitives::TransactionSigned;
@@ -9,10 +10,17 @@ use crate::chainspec::BscChainSpec;
 use reth_chainspec::EthChainSpec;
 use tracing::debug;
 use crate::consensus::parlia::SnapshotProvider;
-// Use the MEV server trait and types from reth-rpc-api
-pub use reth_rpc_api::MevFullApiServer;
+// Use MEV types from reth-rpc-api, but define our own server trait to avoid conflicts
 pub use reth_rpc_api::mev::{BidArgs, RawBid};
 pub use alloy_rpc_types_mev::{EthBundleHash, MevSendBundle, SimBundleOverrides, SimBundleResponse};
+
+/// Custom MEV API server trait - only includes send_bid to avoid conflicts with reth's default MEV API
+#[rpc(server, namespace = "mev")]
+pub trait BscMevApi {
+    /// Send a bid to the builder
+    #[method(name = "sendBid")]
+    async fn send_bid(&self, bid: BidArgs) -> RpcResult<B256>;
+}
 
 
 const PAY_BID_TX_GAS_LIMIT: u64 = 25000;
@@ -30,6 +38,11 @@ impl MevApiImpl {
         chain_spec: Arc<BscChainSpec>,
     ) -> Self {
         Self { snapshot_provider, chain_spec }
+    }
+
+    /// Get header by number from global header provider
+    fn get_header_by_number(&self, block_number: u64) -> Option<alloy_consensus::Header> {
+        crate::shared::get_header_by_number(block_number)
     }
 
     /// Parse transaction from bytes with validation
@@ -205,32 +218,7 @@ impl MevApiImpl {
 }
 
 #[async_trait::async_trait]
-impl MevFullApiServer for MevApiImpl {
-    /// Send a bundle to the relay (not implemented for BSC)
-    async fn send_bundle(
-        &self,
-        _request: MevSendBundle,
-    ) -> RpcResult<EthBundleHash> {
-        Err(jsonrpsee::types::ErrorObject::owned(
-            -32601,
-            "Method not supported",
-            Some("sendBundle is not supported on BSC"),
-        ))
-    }
-
-    /// Simulate a bundle (not implemented for BSC)
-    async fn sim_bundle(
-        &self,
-        _bundle: MevSendBundle,
-        _sim_overrides: SimBundleOverrides,
-    ) -> RpcResult<SimBundleResponse> {
-        Err(jsonrpsee::types::ErrorObject::owned(
-            -32601,
-            "Method not supported",
-            Some("simBundle is not supported on BSC"),
-        ))
-    }
-
+impl BscMevApiServer for MevApiImpl {
     /// Send a bid to the builder
     /// Returns the bid hash
     async fn send_bid(&self, bid: BidArgs) -> RpcResult<B256> {
@@ -241,34 +229,61 @@ impl MevFullApiServer for MevApiImpl {
             bid.raw_bid.txs.len()
         );
 
-        let parent_number = bid.raw_bid.block_number.to();
-        let parent_snapshot = match self.snapshot_provider.snapshot(parent_number) {
-            Some(snapshot) => snapshot,
+        // bid.raw_bid.block_number is the NEW block to be built
+        // bid.raw_bid.parent_hash is the hash of the PARENT block (block_number - 1)
+        let new_block_number: u64 = bid.raw_bid.block_number.to();
+        let parent_block_number = new_block_number.saturating_sub(1);
+        
+        // Get parent block header from chain (not from snapshot!)
+        let parent_header = match self.get_header_by_number(parent_block_number) {
+            Some(header) => header,
             None => {
-                tracing::error!("Skip to new bid due to no snapshot available, block number: {}", parent_number);
+                tracing::error!(
+                    "Skip bid: parent block {} not found on chain", 
+                    parent_block_number
+                );
                 return Err(jsonrpsee::types::ErrorObject::owned(
                     -32602,
-                    "No snapshot available",
+                    "Parent block not found",
                     None::<()>,
                 ));
             }
         };
 
-        if bid.raw_bid.parent_hash != parent_snapshot.block_hash {
-            tracing::error!("Skip to new bid due to block hash mismatch, block number: {}", parent_number);
+        // Verify parent hash matches
+        let parent_hash = parent_header.hash_slow();
+        if bid.raw_bid.parent_hash != parent_hash {
+            tracing::error!(
+                "Skip bid: parent hash mismatch. Expected: {:?}, Got: {:?}, Block: {}", 
+                parent_hash,
+                bid.raw_bid.parent_hash,
+                new_block_number
+            );
             return Err(jsonrpsee::types::ErrorObject::owned(
                 -32602,
-                "Block hash mismatch",
+                "Parent hash mismatch",
                 None::<()>,
             ));
         }
 
-        // Get mining config from global (assuming we have a way to access it)
-        // For now, we'll skip validator address check or add it to MevApiImpl
-        // TODO: Add validator address check here if needed
+        // Optional: Check if validator is inturn using snapshot (for filtering bids)
+        // Note: This is optional - you may want to accept bids even when not inturn
+        if let Some(snapshot) = self.snapshot_provider.snapshot(parent_block_number) {
+            // You can add validator checks here if needed
+            tracing::debug!(
+                "Validator snapshot available for block {}, validators: {}", 
+                parent_block_number,
+                snapshot.validators.len()
+            );
+        } else {
+            tracing::debug!(
+                "No snapshot available for block {} (validator may not be inturn)",
+                parent_block_number
+            );
+        }
 
         if bid.raw_bid.gas_fee == 0 || bid.raw_bid.gas_used ==0{
-            tracing::error!("Skip to new bid due to gas fee or gas used is 0, block number: {}", parent_number);
+            tracing::error!("Skip to new bid due to gas fee or gas used is 0, block number: {}", new_block_number);
             return Err(jsonrpsee::types::ErrorObject::owned(
                 -32602,
                 "Gas fee or gas used is 0",
@@ -279,7 +294,7 @@ impl MevFullApiServer for MevApiImpl {
         if bid.raw_bid.builder_fee != 0 {
             let builder_fee = bid.raw_bid.builder_fee;
             if builder_fee < 0 {
-                tracing::error!("Skip to new bid due to builder fee is less than 0, block number: {}", parent_number);
+                tracing::error!("Skip to new bid due to builder fee is less than 0, block number: {}", new_block_number);
                 return Err(jsonrpsee::types::ErrorObject::owned(
                     -32602,
                     "Builder fee is less than 0",
@@ -288,7 +303,7 @@ impl MevFullApiServer for MevApiImpl {
             }
 
             if builder_fee > bid.raw_bid.gas_fee {
-                tracing::error!("Skip to new bid due to builder fee is greater than gas fee, block number: {}", parent_number);
+                tracing::error!("Skip to new bid due to builder fee is greater than gas fee, block number: {}", new_block_number);
                 return Err(jsonrpsee::types::ErrorObject::owned(
                     -32602,
                     "Builder fee is greater than gas fee",
@@ -298,7 +313,7 @@ impl MevFullApiServer for MevApiImpl {
         }
 
         if bid.pay_bid_tx.is_empty() || bid.pay_bid_tx_gas_used == 0 {
-            tracing::error!("Skip to new bid due to pay bid tx is empty or gas used is 0, block number: {}", parent_number);
+            tracing::error!("Skip to new bid due to pay bid tx is empty or gas used is 0, block number: {}", new_block_number);
             return Err(jsonrpsee::types::ErrorObject::owned(
                 -32602,
                 "Pay bid tx is empty or gas used is 0",
@@ -307,7 +322,7 @@ impl MevFullApiServer for MevApiImpl {
         }
 
         if bid.pay_bid_tx_gas_used > PAY_BID_TX_GAS_LIMIT {
-            tracing::error!("Skip to new bid due to pay bid tx gas used is greater than limit, block number: {}", parent_number);
+            tracing::error!("Skip to new bid due to pay bid tx gas used is greater than limit, block number: {}", new_block_number);
             return Err(jsonrpsee::types::ErrorObject::owned(
                 -32602,
                 "Pay bid tx gas used is greater than limit",
