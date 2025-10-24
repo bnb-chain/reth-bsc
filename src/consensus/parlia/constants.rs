@@ -24,3 +24,7 @@ pub const BACKOFF_TIME_OF_INITIAL: u64 = 1000; // milliseconds
 pub const LORENTZ_BACKOFF_TIME_OF_INITIAL: u64 = 2000; // milliseconds
 pub const DEFAULT_TURN_LENGTH: u8 = 1;
 pub const BACKOFF_TIME_OF_WIGGLE: u64 = 1000; // milliseconds
+
+// system txs gas limit
+pub const SYSTEM_TXS_GAS_HARD_LIMIT: u64 = 20_000_000; // Maximum gas reserved for system transactions (Parlia consensus only)
+pub const SYSTEM_TXS_GAS_SOFT_LIMIT: u64 = 1_000_000; // Maximum gas reserved for system transactions, excluding validator update transactions (Parlia consensus only)

@@ -287,6 +287,7 @@ where
             evm_config, 
             EthereumBuilderConfig::new(),
             self.chain_spec.clone(),
+            self.parlia.clone(),
         );
         let build_args = BscBuildArguments {
             cached_reads: reth_revm::cached::CachedReads::default(),

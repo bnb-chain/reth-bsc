@@ -1,4 +1,5 @@
 use alloy_primitives::U256;
+use crate::consensus::parlia::Parlia;
 use crate::node::engine::BscBuiltPayload;
 use crate::node::evm::config::BscEvmConfig;
 use crate::node::miner::bsc_miner::MiningContext;
@@ -100,6 +101,7 @@ pub struct BscPayloadBuilder<Pool, Client, EvmConfig = BscEvmConfig> {
     builder_config: EthereumBuilderConfig,
     /// Bsc chain spec.
     chain_spec: Arc<BscChainSpec>,
+    parlia: Arc<Parlia<BscChainSpec>>,
 }
 
 impl<Pool, Client, EvmConfig> BscPayloadBuilder<Pool, Client, EvmConfig> 
@@ -115,8 +117,9 @@ where
         evm_config: EvmConfig,
         builder_config: EthereumBuilderConfig,
         chain_spec: Arc<BscChainSpec>,
+        parlia: Arc<Parlia<BscChainSpec>>,
     ) -> Self {
-        Self { client, pool, evm_config, builder_config, chain_spec }
+        Self { client, pool, evm_config, builder_config, chain_spec, parlia }
     }
 
     /// Builds a payload with the given arguments.
@@ -164,7 +167,10 @@ where
 
         let mut total_fees = U256::ZERO;
         let mut cumulative_gas_used = 0;
-        let block_gas_limit: u64 = builder.evm_mut().block().gas_limit;
+        // reserve the systemtx gas
+        let system_txs_gas = self.parlia.estimate_gas_reserved_for_system_txs(Some(parent_header.timestamp), parent_header.number+1, attributes.timestamp);
+        let block_gas_limit: u64 = builder.evm_mut().block().gas_limit.saturating_sub(system_txs_gas);
+
         let base_fee = builder.evm_mut().block().basefee;
         
         let mut sidecars_map = HashMap::new();

@@ -77,7 +77,7 @@ where
         let parent_header = self.inner_ctx.parent_header.as_ref().unwrap().clone();
         if self.spec.is_feynman_active_at_timestamp(header_number, header_timestamp) &&
             is_breathe_block(parent_header.timestamp, header_timestamp) &&
-            !self.spec.is_feynman_transition_at_timestamp(header_timestamp, parent_header.timestamp)
+            !self.spec.is_feynman_transition_at_timestamp(header_number, header_timestamp, parent_header.timestamp)
         {
             let max_elected_validators = self.inner_ctx.max_elected_validators.unwrap_or(U256::from(21));
             let validators_election_info = self.inner_ctx.validators_election_info.clone().unwrap_or_default();
@@ -528,7 +528,7 @@ where
         let parent_header = self.inner_ctx.parent_header.as_ref().unwrap().clone();
         if self.spec.is_feynman_active_at_timestamp(header_number, header_timestamp) &&
             is_breathe_block(parent_header.timestamp, header_timestamp) &&
-            !self.spec.is_feynman_transition_at_timestamp(header_timestamp, parent_header.timestamp)
+            !self.spec.is_feynman_transition_at_timestamp(header_number, header_timestamp, parent_header.timestamp)
         {
             let max_elected_validators = self.inner_ctx.max_elected_validators.unwrap_or(U256::from(21));
             let validators_election_info = self.inner_ctx.validators_election_info.clone().unwrap_or_default();

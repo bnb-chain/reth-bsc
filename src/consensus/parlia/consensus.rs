@@ -7,6 +7,9 @@ use schnellru::LruMap;
 use schnellru::ByLength;
 use alloy_primitives::{Address, B256};
 use secp256k1::{SECP256K1, Message, ecdsa::{RecoveryId, RecoverableSignature}};
+use crate::consensus::parlia::util::is_breathe_block;
+use crate::consensus::parlia::SYSTEM_TXS_GAS_HARD_LIMIT;
+use crate::consensus::parlia::SYSTEM_TXS_GAS_SOFT_LIMIT;
 use crate::hardforks::BscHardforks;
 use reth_chainspec::EthChainSpec;
 use alloy_consensus::{Header, BlockHeader};
@@ -33,7 +36,7 @@ lazy_static! {
     static ref RECOVERED_PROPOSER_CACHE: RwLock<LruMap<B256, Address, ByLength>> = RwLock::new(LruMap::new(ByLength::new(RECOVERED_PROPOSER_CACHE_NUM as u32)));
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Parlia<ChainSpec> {
     pub spec: Arc<ChainSpec>,
     pub epoch: u64, // The epoch number
@@ -529,4 +532,17 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
         new_header.extra_data = alloy_primitives::Bytes::from(extra_data);
     }
 
+    pub fn estimate_gas_reserved_for_system_txs(&self, parent_timestamp: Option<u64>, current_number: u64, current_timestamp: u64) -> u64 {
+        if let Some(parent_timestamp) = parent_timestamp {
+            // Mainnet and Chapel have both passed Feynman. Now, simplify the logic before and during the Feynman hard fork.
+            if self.spec.is_feynman_active_at_timestamp(current_number, current_timestamp) &&
+                !self.spec.is_feynman_transition_at_timestamp(current_number, current_timestamp, parent_timestamp) &&
+                 !is_breathe_block(parent_timestamp, current_timestamp) {
+                // params.SystemTxsGasSoftLimit > (depositTxGas+slashTxGas+finalityRewardTxGas)*150/100
+                return SYSTEM_TXS_GAS_SOFT_LIMIT;
+            }
+        }
+        // params.SystemTxsGasHardLimit > (depositTxGas+slashTxGas+finalityRewardTxGas+updateValidatorTxGas)*150/100
+        SYSTEM_TXS_GAS_HARD_LIMIT
+    }
 }

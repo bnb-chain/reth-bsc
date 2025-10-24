@@ -108,7 +108,7 @@ where
         }
     
         if self.spec.is_feynman_active_at_timestamp(header.number, header.timestamp) &&
-            !self.spec.is_feynman_transition_at_timestamp(header.timestamp, parent_header.timestamp) &&
+            !self.spec.is_feynman_transition_at_timestamp(header.number, header.timestamp, parent_header.timestamp) &&
             is_breathe_block(parent_header.timestamp, header.timestamp)
         {
             let (to, data) = self.system_contracts.get_max_elected_validators();
@@ -477,7 +477,7 @@ where
         let header_number = block.number.to::<u64>();
         let header_timestamp = block.timestamp.to::<u64>();
         if self.spec.is_feynman_active_at_timestamp(header_number, header_timestamp) &&
-            !self.spec.is_feynman_transition_at_timestamp(header_timestamp, parent_header.timestamp) &&
+            !self.spec.is_feynman_transition_at_timestamp(header_number, header_timestamp, parent_header.timestamp) &&
             is_breathe_block(parent_header.timestamp, header_timestamp)
         {
             let (to, data) = self.system_contracts.get_max_elected_validators();

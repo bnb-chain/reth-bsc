@@ -117,9 +117,10 @@ pub trait BscHardforks: EthereumHardforks {
 
     /// Convenience method to check if [`BscHardfork::Feynman`] is firstly active at a given
     /// timestamp and parent timestamp.
-    fn is_feynman_transition_at_timestamp(&self, timestamp: u64, parent_timestamp: u64) -> bool {
-        self.bsc_fork_activation(BscHardfork::Feynman)
-            .transitions_at_timestamp(timestamp, parent_timestamp)
+    fn is_feynman_transition_at_timestamp(&self, block_number: u64, timestamp: u64, parent_timestamp: u64) -> bool {
+        let parent_number = if block_number > 0 { block_number - 1 } else { 0 };
+        !self.is_feynman_active_at_timestamp(parent_number, parent_timestamp)
+            && self.is_feynman_active_at_timestamp(block_number, timestamp)
     }
 
     /// Convenience method to check if [`BscHardfork::Feynman`] is active at a given timestamp.
