@@ -157,6 +157,7 @@ where
         
         if !parent_snapshot.is_inturn(self.validator_address) {
             debug!("Try off-turn mining, validator: {}, next_block: {}", self.validator_address, tip.number() + 1);
+            return;
         }
 
         let mining_ctx = MiningContext {
