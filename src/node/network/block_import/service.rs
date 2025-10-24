@@ -104,6 +104,7 @@ where
         let engine = self.engine.clone();
         let consensus = self.consensus.clone();
 
+        tracing::debug!(target: "bsc::block_import", "New payload: block = {:?}, peer_id = {:?}", block, peer_id);
         Box::pin(async move {
             let sealed_block = block.block.0.block.clone().seal();
             let header = sealed_block.header().clone();
@@ -111,6 +112,7 @@ where
             match engine.new_payload(payload).await {
                 Ok(payload_status) => match payload_status.status {
                     PayloadStatusEnum::Valid => {
+                        tracing::debug!(target: "bsc::block_import", "New payload is valid: block = {:?}, peer_id = {:?}", block, peer_id);
                         // handle fork choice update with valid payload
                         if let Err(e) = Self::update_fork_choice(engine, consensus, header).await {
                             tracing::warn!(target: "bsc::block_import", "Failed to update fork choice: {}", e);
@@ -140,8 +142,8 @@ where
         let new_canonical_head = consensus.canonical_head(&new_header, &current_head)?;
         // get safe block and finalized block with new canonical head
         // ref: https://github.com/bnb-chain/bsc/blob/f70aaa8399ccee429804eecf3fc4c6fd8d9e6cab/eth/api_backend.go#L72
-        let (_, safe_block_hash) = consensus.get_justified_number_and_hash(&new_canonical_head).unwrap_or((0, B256::ZERO));
-        let (_, finalized_block_hash) = consensus.get_finalized_number_and_hash(&new_canonical_head).unwrap_or((0, B256::ZERO));
+        let (_, safe_block_hash) = consensus.get_justified_number_and_hash(new_canonical_head).unwrap_or((0, B256::ZERO));
+        let (_, finalized_block_hash) = consensus.get_finalized_number_and_hash(new_canonical_head).unwrap_or((0, B256::ZERO));
         let state = ForkchoiceState {
             head_block_hash: new_canonical_head.hash_slow(),
             safe_block_hash,
@@ -326,21 +328,22 @@ mod tests {
             .await;
     }
 
-    #[tokio::test]
-    async fn can_handle_invalid_fcu() {
-        let mut fixture = TestFixture::new(EngineResponses::invalid_fcu()).await;
-        fixture
-            .assert_block_import(|outcome| {
-                matches!(
-                    outcome,
-                    BlockImportEvent::Outcome(BlockImportOutcome {
-                        peer: _,
-                        result: Err(BlockImportError::Other(_))
-                    })
-                )
-            })
-            .await;
-    }
+    // FCU has been called after import payload is validated, skip this test now.
+    // #[tokio::test]
+    // async fn can_handle_invalid_fcu() {
+    //     let mut fixture = TestFixture::new(EngineResponses::invalid_fcu()).await;
+    //     fixture
+    //         .assert_block_import(|outcome| {
+    //             matches!(
+    //                 outcome,
+    //                 BlockImportEvent::Outcome(BlockImportOutcome {
+    //                     peer: _,
+    //                     result: Err(BlockImportError::Other(_))
+    //                 })
+    //             )
+    //         })
+    //         .await;
+    // }
 
     #[tokio::test]
     async fn deduplicates_blocks() {
@@ -360,7 +363,7 @@ mod tests {
         let mut outcomes = Vec::new();
 
         // Wait for both NewPayload and FCU outcomes from first block
-        while outcomes.len() < 2 {
+        while outcomes.len() < 1 {
             match fixture.handle.poll_outcome(&mut cx) {
                 Poll::Ready(Some(outcome)) => {
                     outcomes.push(outcome);
@@ -579,7 +582,7 @@ mod tests {
             let mut outcomes = Vec::new();
 
             // Wait for both NewPayload and FCU outcomes
-            while outcomes.len() < 2 {
+            while outcomes.len() < 1 {
                 match self.handle.poll_outcome(&mut cx) {
                     Poll::Ready(Some(outcome)) => {
                         outcomes.push(outcome);

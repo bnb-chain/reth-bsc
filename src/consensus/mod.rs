@@ -50,7 +50,7 @@ where
     /// 2. For same height blocks, pick the one with lower hash
     pub(crate) fn canonical_head<'a>(&self, incoming: &'a Header, current_head: &'a Header) -> Result<&'a Header, ParliaConsensusErr> {
         tracing::debug!(target: "parlia", "Canonical head: incoming = {:?}, current = {:?}", incoming, current_head);
-        match self.head_choice_with_fast_finality(incoming, &current_head) {
+        match self.head_choice_with_fast_finality(incoming, current_head) {
             Ok(true) => Ok(incoming),
             Ok(false) => Ok(current_head),
             Err(e) => {
@@ -242,30 +242,45 @@ mod tests {
     use crate::consensus::parlia::provider::SnapshotProvider as ParliaSnapshotProvider;
     use std::sync::Arc;
 
-    use once_cell::sync::Lazy;
     use std::collections::HashMap as StdHashMap;
     use std::sync::RwLock;
 
-    static DUMMY_SNAP_STORE: Lazy<RwLock<StdHashMap<u64, Snapshot>>> =
-        Lazy::new(|| RwLock::new(StdHashMap::new()));
-
     #[derive(Debug)]
-    struct DummySnapProvider;
+    struct DummySnapProvider {
+        snap_store: RwLock<StdHashMap<u64, Snapshot>>,
+        snap_store_by_hash: RwLock<StdHashMap<BlockHash, Snapshot>>,
+    }
+    impl DummySnapProvider {
+        fn new() -> Self {
+            Self { snap_store: RwLock::new(StdHashMap::new()), snap_store_by_hash: RwLock::new(StdHashMap::new()) }
+        }
+    }
     impl ParliaSnapshotProvider for DummySnapProvider {
         fn snapshot(&self, block_number: u64) -> Option<Snapshot> {
-            DUMMY_SNAP_STORE.read().ok().and_then(|m| m.get(&block_number).cloned())
+            self.snap_store.read().ok().and_then(|m| m.get(&block_number).cloned())
+        }
+        fn snapshot_by_hash(&self, block_hash: &BlockHash) -> Option<Snapshot> {
+            self.snap_store_by_hash.read().ok().and_then(|m| m.get(block_hash).cloned())
         }
         fn insert(&self, snapshot: Snapshot) {
-            if let Ok(mut m) = DUMMY_SNAP_STORE.write() {
-                m.insert(snapshot.block_number, snapshot);
+            if let Ok(mut m) = self.snap_store.write() {
+                m.insert(snapshot.block_number, snapshot.clone());
+            }
+            if let Ok(mut m) = self.snap_store_by_hash.write() {
+                m.insert(snapshot.block_hash, snapshot.clone());
             }
         }
-        fn get_header(&self, _block_number: u64) -> Option<alloy_consensus::Header> { None }
+        fn get_header(&self, _block_number: u64) -> Option<alloy_consensus::Header> { 
+            todo!()
+        }
+        fn get_header_by_hash(&self, _block_hash: &BlockHash) -> Option<alloy_consensus::Header> { 
+            todo!()
+        }
     }
 
     fn ensure_snapshot_provider() {
         if crate::shared::get_snapshot_provider().is_none() {
-            let _ = crate::shared::set_snapshot_provider(Arc::new(DummySnapProvider));
+            let _ = crate::shared::set_snapshot_provider(Arc::new(DummySnapProvider::new()));
         }
     }
 
@@ -442,12 +457,13 @@ mod tests {
         let sp = crate::shared::get_snapshot_provider().unwrap().clone();
 
         let cases = [
-            // ((current_number, current_vote_source_num, current_vote_target_num), (incoming_number, incoming_vote_source_num, incoming_vote_target_num), reorg)
-            ((10, 8, 9), (11, 9, 10), true), // reorg to incoming (higher justified)
-            // ((20, 18, 19), (21, 18, 19), true), // reorg (equal justified， higher justified)
-            // ((30, 28, 29), (31, 27, 28), false), // no reorg (lower justified)
+            // ((current_number, current_td, current_vote_source_num, current_vote_target_num), (incoming_number, incoming_td, incoming_vote_source_num, incoming_vote_target_num), reorg)
+            ((10, 20, 8, 9), (11, 22, 9, 10), true), // reorg to incoming (higher justified)
+            ((20, 40, 18, 19), (21, 40, 18, 19), false), // no reorg (equal justified, equal TD)
+            ((20, 40, 18, 19), (21, 42, 18, 19), true), // no reorg (equal justified, higher TD)
+            ((30, 60, 28, 29), (31, 62, 27, 28), false), // no reorg (lower justified)
         ];
-        for ((current_number, current_vote_source_num, current_vote_target_num), (incoming_number, incoming_vote_source_num, incoming_vote_target_num), reorg) in cases {
+        for ((current_number, current_td, current_vote_source_num, current_vote_target_num), (incoming_number, incoming_td, incoming_vote_source_num, incoming_vote_target_num), reorg) in cases {
             let current = header_with_attestation(current_number, current_vote_source_num, current_vote_target_num);
             let incoming = header_with_attestation(incoming_number, incoming_vote_source_num, incoming_vote_target_num);
 
@@ -455,8 +471,8 @@ mod tests {
             sp.insert(Snapshot { block_hash: incoming.hash_slow(), block_number: incoming.number, vote_data: VoteData { source_number: incoming_vote_source_num, target_number: incoming_vote_target_num, ..Default::default() }, epoch_num: 200, ..Default::default() });
 
             let mut provider = MockProvider::new();
-            provider.insert(current.clone(), U256::from(20));
-            provider.insert(incoming.clone(), U256::from(20));
+            provider.insert(current.clone(), U256::from(current_td));
+            provider.insert(incoming.clone(), U256::from(incoming_td));
             let consensus = ParliaConsensus {
                 provider,
                 chain_spec: chain_spec.clone(),
