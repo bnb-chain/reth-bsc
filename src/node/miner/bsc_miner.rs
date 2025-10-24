@@ -155,11 +155,8 @@ where
             return;
         }
         
-        // TODO: remove it later, now just for easy to debug.
-        // TODO: support backoff if not inturn.
         if !parent_snapshot.is_inturn(self.validator_address) {
-            debug!("Skip to produce due to is not inturn, validator: {}, tip: {}", self.validator_address, tip.number());
-            return;
+            debug!("Try off-turn mining, validator: {}, next_block: {}", self.validator_address, tip.number() + 1);
         }
 
         let mining_ctx = MiningContext {
@@ -392,12 +389,18 @@ where
         let sealed_block = payload.block();
         let block_number = sealed_block.number();
         let block_hash = sealed_block.hash();
-        
-        debug!("Submitting block {} (hash: 0x{:x}, txs: {}, gas_used: {})", 
+        let difficulty = sealed_block.header().difficulty();
+        let turn_status = if difficulty == crate::consensus::parlia::constants::DIFF_INTURN { 
+            "inturn" 
+        } else { 
+            "offturn" 
+        };
+        debug!("Submitting block {} (hash: 0x{:x}, txs: {}, gas_used: {}, turn_status: {})", 
                block_number, 
                block_hash, 
                sealed_block.body().transaction_count(),
-               sealed_block.gas_used());
+               sealed_block.gas_used(),
+               turn_status);
 
         // Check if block timestamp is in the future and wait if necessary
         // now is focus on the basic workflow.
