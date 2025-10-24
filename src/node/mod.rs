@@ -41,7 +41,7 @@ pub mod vote_producer;
 /// Bsc addons configuring RPC types
 pub type BscNodeAddOns<N> = RpcAddOns<
     N,
-    EthereumEthApiBuilder,
+    EthereumEthApiBuilder,  // Use standard Ethereum API builder
     BscPayloadValidatorBuilder,
     BscEngineApiBuilder,
     BscEngineValidatorBuilder,
