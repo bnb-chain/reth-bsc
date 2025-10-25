@@ -45,51 +45,13 @@ pub struct MiningContext {
     pub parent_snapshot: Arc<crate::consensus::parlia::snapshot::Snapshot>,
 }
 
+#[derive(Clone)]
 pub struct SubmitContext {
     pub mining_ctx: MiningContext,
     pub payload: BscBuiltPayload,
     pub cancel: ManualCancel,
 }
 
-/// Task for handling delayed payload submission
-pub struct DelaySubmitTask {
-    payload: BscBuiltPayload,
-    delay_ms: u64,
-    delay_submit_tx: mpsc::UnboundedSender<BscBuiltPayload>,
-    cancel: ManualCancel,
-}
-
-impl DelaySubmitTask {
-    /// Create a new delay submit task
-    pub fn new(
-        payload: BscBuiltPayload,
-        delay_ms: u64,
-        delay_submit_tx: mpsc::UnboundedSender<BscBuiltPayload>,
-        cancel: ManualCancel,
-    ) -> Self {
-        Self {
-            payload,
-            delay_ms,
-            delay_submit_tx,
-            cancel,
-        }
-    }
-
-    /// Start the delay task asynchronously
-    pub fn asyc_start(self) {
-        tokio::spawn(async move {
-            tokio::time::sleep(tokio::time::Duration::from_millis(self.delay_ms)).await;
-            if !self.cancel.is_cancelled() {
-                if let Err(e) = self.delay_submit_tx.send(self.payload) {
-                    error!("Failed to send delayed payload to channel: {}", e);
-                }
-            } else {
-                debug!("Delay submit task is cancelled, block_hash: {}, block_number: {}", 
-                    self.payload.block().hash(), self.payload.block().number());
-            }
-        });
-    }
-}
 
 /// NewWorkWorker responsible for listening to canonical state changes and triggering mining.
 pub struct NewWorkWorker<Provider> {
@@ -388,7 +350,9 @@ pub struct ResultWorkWorker<Provider> {
     parlia: Arc<crate::consensus::parlia::Parlia<crate::chainspec::BscChainSpec>>,
     /// Receiver for built payloads
     payload_rx: mpsc::UnboundedReceiver<SubmitContext>,
+    /// Receiver for delayed payloads
     delay_submit_rx: mpsc::UnboundedReceiver<BscBuiltPayload>,
+    /// Sender for delayed payloads
     delay_submit_tx: mpsc::UnboundedSender<BscBuiltPayload>,
 }
 
@@ -412,6 +376,26 @@ where
             delay_submit_tx,
             delay_submit_rx,
         }
+    }
+
+    /// Create and start a delay submit task
+    fn start_delay_task(
+        payload: BscBuiltPayload,
+        delay_ms: u64,
+        delay_submit_tx: mpsc::UnboundedSender<BscBuiltPayload>,
+        cancel: ManualCancel,
+    ) {
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+            if !cancel.is_cancelled() {
+                if let Err(e) = delay_submit_tx.send(payload) {
+                    error!("Failed to send delayed payload to channel: {}", e);
+                }
+            } else {
+                debug!("Delay submit task is cancelled, block_hash: {}, block_number: {}", 
+                    payload.block().hash(), payload.block().number());
+            }
+        });
     }
 
     /// Run the result worker to process and submit payloads
@@ -438,13 +422,12 @@ where
                                     }
                                 }
                             } else {
-                                let delay_task = DelaySubmitTask::new(
+                                Self::start_delay_task(
                                     payload,
                                     delay_ms,
                                     self.delay_submit_tx.clone(),
                                     submit_ctx.cancel.clone(),
                                 );
-                                delay_task.asyc_start();
                                 info!(
                                     "Block {} scheduled for delayed submission in {}ms",
                                     block_number, delay_ms
@@ -483,7 +466,6 @@ where
 
         warn!("ResultWorkWorker stopped");
     }
-
 
     /// Submit a built payload to the engine-tree/network
     async fn submit_payload(&self, payload: BscBuiltPayload) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

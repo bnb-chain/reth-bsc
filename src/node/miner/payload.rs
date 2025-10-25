@@ -404,7 +404,6 @@ where
         let (try_build_tx, try_build_rx) = mpsc::unbounded_channel();
         let mining_delay = parlia.clone().delay_for_mining(
             &mining_ctx.parent_snapshot, 
-            &mining_ctx.parent_header, 
             mining_ctx.header.as_ref().unwrap(), 
             DELAY_LEFT_OVER);
 
@@ -483,10 +482,10 @@ where
 
                             let mining_delay = self.parlia.delay_for_mining(
                                 &self.mining_ctx.parent_snapshot, 
-                                &self.mining_ctx.parent_header, 
                                 self.mining_ctx.header.as_ref().unwrap(), 
                                 DELAY_LEFT_OVER);
-                            // TODO: check more details and refine it later.
+
+                            // TODO: check more details and refine it later, listen new trxs.
                             // There is still plenty of time left and retry to build payload.
                             if std::time::Duration::from_millis(mining_delay) > elapsed * TIME_MULTIPLIER && self.retries < MAX_RETRIES {
                                 if let Err(err) = self.try_build_tx.send(()) {
