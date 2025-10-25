@@ -485,9 +485,8 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
         };
 
         new_validators.sort();
-        let is_luban_active = self.spec.is_luban_active_at_block(new_header.number);
         let mut extra_data = new_header.extra_data.to_vec();
-        if !is_luban_active {
+        if !self.spec.is_luban_active_at_block(new_header.number) {
             // Pre-Luban: append validator addresses directly to extra data
             for validator in &new_validators {
                 extra_data.extend_from_slice(validator.as_slice());
@@ -496,9 +495,7 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
             // Luban active: append validator count first, then validators with vote addresses
             extra_data.push(new_validators.len() as u8);
             let mut vote_map = std::collections::HashMap::new();
-            let is_on_luban = self.spec.is_luban_active_at_block(new_header.number) && 
-                !self.spec.is_luban_active_at_block(new_header.number - 1);
-            if is_on_luban {
+            if self.spec.is_luban_transition_at_block(new_header.number) {
                 let zero_bls_key = VoteAddress::ZERO;
                 for validator in &new_validators {
                     vote_map.insert(*validator, zero_bls_key);
@@ -514,9 +511,7 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
             }
             for validator in &new_validators {
                 extra_data.extend_from_slice(validator.as_slice());
-                if let Some(vote_addr) = vote_map.get(validator) {
-                    extra_data.extend_from_slice(vote_addr.as_slice());
-                }
+                extra_data.extend_from_slice(vote_map.get(validator).unwrap().as_slice());
             }
         }
         new_header.extra_data = alloy_primitives::Bytes::from(extra_data);
@@ -528,6 +523,7 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
             return;
         }
         let mut extra_data = new_header.extra_data.to_vec();
+        // TODO: fetch turn length from system contract or use default value.
         extra_data.push(turn_length.unwrap_or(DEFAULT_TURN_LENGTH));
         new_header.extra_data = alloy_primitives::Bytes::from(extra_data);
     }
