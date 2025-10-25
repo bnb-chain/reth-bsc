@@ -72,8 +72,8 @@ where
         if (new_header.number).is_multiple_of(epoch_length) {
             let mut validators: Option<(Vec<Address>, Vec<crate::consensus::parlia::VoteAddress>)> = None;
             let mut cache = VALIDATOR_CACHE.lock().unwrap();
-            if let Some(cached_result) = cache.get(&parent_header.number) {
-                tracing::debug!("Succeed to query cached validator result, block_number: {}", parent_header.number);
+            if let Some(cached_result) = cache.get(&parent_header.hash_slow()) {
+                tracing::debug!("Succeed to query cached validator result, block_number: {}, block_hash: {}", parent_header.number, parent_header.hash_slow());
                 validators = Some(cached_result.clone());
             }
             

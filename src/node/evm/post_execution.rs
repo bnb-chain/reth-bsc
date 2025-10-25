@@ -108,7 +108,7 @@ where
         if (header.number + 1).is_multiple_of(epoch_length) {
             // cache it on pre block.
             // for verify validators in post-check of fullnode mode and prepare new header in miner mode.
-            self.get_current_validators(header.number)?;
+            self.get_current_validators(header.number, header.hash_slow())?;
         }
 
         tracing::trace!("Succeed to finalize new block, block_number: {}", block.number);
@@ -550,7 +550,7 @@ where
         if (header.number + 1).is_multiple_of(epoch_length) {
             // cache it on pre block.
             // for verify validators in post-check of fullnode mode and prepare new header in miner mode.
-            self.get_current_validators(header.number)?;
+            self.get_current_validators(header.number, header.hash_slow())?;
         }
 
         {   // prepare new header in miner mode.
