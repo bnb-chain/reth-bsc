@@ -48,6 +48,7 @@ pub struct MiningContext {
 pub struct SubmitContext {
     pub mining_ctx: MiningContext,
     pub payload: BscBuiltPayload,
+    pub cancel: ManualCancel,
 }
 
 /// Task for handling delayed payload submission
@@ -55,6 +56,7 @@ pub struct DelaySubmitTask {
     payload: BscBuiltPayload,
     delay_ms: u64,
     delay_submit_tx: mpsc::UnboundedSender<BscBuiltPayload>,
+    cancel: ManualCancel,
 }
 
 impl DelaySubmitTask {
@@ -63,23 +65,27 @@ impl DelaySubmitTask {
         payload: BscBuiltPayload,
         delay_ms: u64,
         delay_submit_tx: mpsc::UnboundedSender<BscBuiltPayload>,
+        cancel: ManualCancel,
     ) -> Self {
         Self {
             payload,
             delay_ms,
             delay_submit_tx,
+            cancel,
         }
     }
 
     /// Start the delay task asynchronously
-    pub fn start(self) {
+    pub fn asyc_start(self) {
         tokio::spawn(async move {
-            // Sleep for the specified delay
             tokio::time::sleep(tokio::time::Duration::from_millis(self.delay_ms)).await;
-            
-            // Send the payload to the delay channel
-            if let Err(e) = self.delay_submit_tx.send(self.payload) {
-                error!("Failed to send delayed payload to channel: {}", e);
+            if !self.cancel.is_cancelled() {
+                if let Err(e) = self.delay_submit_tx.send(self.payload) {
+                    error!("Failed to send delayed payload to channel: {}", e);
+                }
+            } else {
+                debug!("Delay submit task is cancelled, block_hash: {}, block_number: {}", 
+                    self.payload.block().hash(), self.payload.block().number());
             }
         });
     }
@@ -408,30 +414,20 @@ where
         }
     }
 
-    // struct DelaySubmitTask {
-    //     delay_submit_tx: mpsc::UnboundedSender<BscBuiltPayload>,
-    //     submit_ctx: SubmitContext,
-    //     delay_ms: u64,
-    // }
-
-
     /// Run the result worker to process and submit payloads
     pub async fn run(mut self) {
         info!("Starting ResultWorkWorker for validator: {}", self.validator_address);
 
         loop {
             tokio::select! {
-                // Handle new payloads from main channel
                 submit_ctx = self.payload_rx.recv() => {
                     match submit_ctx {
                         Some(submit_ctx) => {
                             let payload = submit_ctx.payload;
                             let block_number = payload.block().number();
                             let block_hash = payload.block().hash();
-                            
                             let delay_ms = self.parlia.delay_for_ramanujan_fork(&submit_ctx.mining_ctx.parent_snapshot, payload.block().header());
-                            debug!("Received payload for submission, block {} (hash: 0x{:x})", block_number, block_hash);
-
+                            debug!("Check submit delay, block {} (hash: 0x{:x}), delay_ms: {}", block_number, block_hash, delay_ms);
                             if delay_ms == 0 {
                                 match self.submit_payload(payload).await {
                                     Ok(()) => {
@@ -442,14 +438,13 @@ where
                                     }
                                 }
                             } else {
-                                // Create and start a delay submit task
                                 let delay_task = DelaySubmitTask::new(
                                     payload,
                                     delay_ms,
                                     self.delay_submit_tx.clone(),
+                                    submit_ctx.cancel.clone(),
                                 );
-                                delay_task.start();
-                                
+                                delay_task.asyc_start();
                                 info!(
                                     "Block {} scheduled for delayed submission in {}ms",
                                     block_number, delay_ms
@@ -463,16 +458,11 @@ where
                     }
                 }
                 
-                // Handle delayed payloads
                 delayed_payload = self.delay_submit_rx.recv() => {
                     match delayed_payload {
                         Some(payload) => {
                             let block_number = payload.block().number();
-                            let block_hash = payload.block().hash();
-                            
-                            debug!("Processing delayed payload, block {} (hash: 0x{:x})", block_number, block_hash);
-                            
-                            // Submit the delayed payload
+                            let block_hash = payload.block().hash();                            
                             match self.submit_payload(payload).await {
                                 Ok(()) => {
                                     info!("Succeed to submit delayed block {} (hash: 0x{:x})", block_number, block_hash);
@@ -499,6 +489,12 @@ where
     async fn submit_payload(&self, payload: BscBuiltPayload) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let sealed_block = payload.block();
         let block_number = sealed_block.number();
+        if block_number <= self.provider.last_block_number()? {
+            debug!("Skip to submit block due to block number is less than last block number, block_number: {}, last_block_number: {}", 
+                block_number, self.provider.last_block_number()?);
+            return Ok(());
+        }
+
         let block_hash = sealed_block.hash();
         let difficulty = sealed_block.header().difficulty();
         let turn_status = if difficulty == crate::consensus::parlia::constants::DIFF_INTURN { 
@@ -506,27 +502,12 @@ where
         } else { 
             "offturn" 
         };
-        let mut delay_ms = 0;
-        // Check if block timestamp is in the future and wait if necessary
-        // now is focus on the basic workflow.
-        // TODO: refine it later. https://github.com/bnb-chain/bsc/blob/master/consensus/parlia/parlia.go#L1702.
-        let present_timestamp = self.parlia.present_timestamp();
-        if sealed_block.header().timestamp > present_timestamp {
-            delay_ms = (sealed_block.header().timestamp - present_timestamp) * 1000;
-            info!(
-                "Block {} timestamp is in the future, waiting {}ms before submission",
-                block_number, delay_ms
-            );
-            tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
-        }
-
-        debug!("Submitting block {} (hash: 0x{:x}, txs: {}, gas_used: {}, turn_status: {}, delay_ms: {})", 
+        debug!("Submitting block {} (hash: 0x{:x}, txs: {}, gas_used: {}, turn_status: {})", 
                block_number, 
                block_hash, 
                sealed_block.body().transaction_count(),
                sealed_block.gas_used(),
-               turn_status,
-               delay_ms);
+               turn_status);
 
         let parent_number = block_number.saturating_sub(1);
         let parent_td = self.provider.header_td_by_number(parent_number)

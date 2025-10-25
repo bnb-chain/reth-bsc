@@ -546,6 +546,7 @@ where
             if let Err(err) = self.result_tx.send(SubmitContext {
                 mining_ctx: self.mining_ctx.clone(),
                 payload: best_payload,
+                cancel: self.build_args.cancel.clone(),
             }) {
                 warn!("Failed to send best payload to result channel: {}", err);
                 return Err(Box::new(BscPayloadJobError::ResultChannelSendError(err.to_string())));
