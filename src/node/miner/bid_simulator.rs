@@ -21,6 +21,7 @@ use reth_primitives::SealedHeader;
 use crate::node::engine::BscBuiltPayload;
 use reth_evm::execute::BlockBuilderOutcome;
 use reth_provider::{HeaderProvider, BlockHashReader};
+use parking_lot::RwLock;
 use std::str::FromStr;
 
 #[derive(Clone)]
@@ -56,11 +57,12 @@ pub struct NewBidPackage {
 // 4. can be interrupt the last bid and commit
 pub struct BidSimulator<Client> {
     client: Client,
-    // bid to run, the best bid to run
-    best_bid_to_run: HashMap<B256, Bid>,
-    simulating_bid: HashMap<B256, Bid>,
-    best_bid: HashMap<B256, BidRuntime<BscEvmConfig>>,
-    pending_bid: HashMap<String, u8>,
+    // Each map has its own lock for fine-grained concurrency control
+    // This avoids writer starvation when one operation needs write access
+    best_bid_to_run: Arc<RwLock<HashMap<B256, Bid>>>,
+    simulating_bid: Arc<RwLock<HashMap<B256, Bid>>>,
+    best_bid: Arc<RwLock<HashMap<B256, BidRuntime<BscEvmConfig>>>>,
+    pending_bid: Arc<RwLock<HashMap<String, u8>>>,
     bid_receiving: bool,
     chain_spec: Arc<BscChainSpec>,
     min_gas_price: U256,
@@ -74,19 +76,20 @@ where Client: HeaderProvider<Header = alloy_consensus::Header> + BlockHashReader
         Self { 
             client,
             chain_spec,
-            best_bid_to_run: HashMap::new(),
-            simulating_bid: HashMap::new(),
-            best_bid: HashMap::new(),
-            pending_bid: HashMap::new(),
+            best_bid_to_run: Arc::new(RwLock::new(HashMap::new())),
+            simulating_bid: Arc::new(RwLock::new(HashMap::new())),
+            best_bid: Arc::new(RwLock::new(HashMap::new())),
+            pending_bid: Arc::new(RwLock::new(HashMap::new())),
             bid_receiving: true,
             min_gas_price: U256::ZERO,
            // max_bid_pre_builder: 10,
         }   
     }
 
-    pub fn check_pending_bid(&mut self, block_number: u64, builder: Address, bid_hash: B256) -> bool{
+    pub fn check_pending_bid(&self, block_number: u64, builder: Address, bid_hash: B256) -> bool{
         let key = format!("{}-{}-{}", block_number, builder, bid_hash);
-        if let Some(exist) = self.pending_bid.get(&key) {
+        let pending_bid = self.pending_bid.read();
+        if let Some(exist) = pending_bid.get(&key) {
             if *exist > 0 {
                 return false;
             }
@@ -95,12 +98,12 @@ where Client: HeaderProvider<Header = alloy_consensus::Header> + BlockHashReader
         return true;
     }
 
-    pub fn add_pending_bid(&mut self, block_number: u64, builder: Address, bid_hash: B256) {
+    pub fn add_pending_bid(&self, block_number: u64, builder: Address, bid_hash: B256) {
         let key = format!("{}-{}-{}", block_number, builder, bid_hash);
-        self.pending_bid.insert(key, 1);
+        self.pending_bid.write().insert(key, 1);
     }
 
-    pub fn commit_new_bid(&mut self, bid: NewBidPackage) {
+    pub fn commit_new_bid(&self, bid: NewBidPackage) {
         debug!("commit_new_bid:{}", bid.bid.bid_hash);
         self.add_pending_bid(bid.bid.block_number, bid.bid.builder, bid.bid.bid_hash);
         let final_block_number   = match self.client.finalized_block_number() {
@@ -137,7 +140,10 @@ where Client: HeaderProvider<Header = alloy_consensus::Header> + BlockHashReader
         };
         let mut to_commit = true;
         let mut _bid_accepted = true;
-        if let Some(best_bid) = self.best_bid_to_run.get(&parent_hash).cloned() {
+        
+        // Acquire read lock only when needed
+        let best_bid_opt = self.best_bid_to_run.read().get(&parent_hash).cloned();
+        if let Some(best_bid) = best_bid_opt {
             let best_bid_runtime = match self.new_bid_runtime(&best_bid, 100, parent_header.clone()) {
                 Ok(best_bid_runtime) => best_bid_runtime,
                 Err(err) => {
@@ -159,28 +165,28 @@ where Client: HeaderProvider<Header = alloy_consensus::Header> + BlockHashReader
         }
 
         if to_commit {
-            self.best_bid_to_run.insert(_bid_runtime.bid.parent_hash, _bid_runtime.bid.clone());
+            self.best_bid_to_run.write().insert(_bid_runtime.bid.parent_hash, _bid_runtime.bid.clone());
             // todo: can be interrupted
             // if let Some(simulating_bid) = self.simulating_bid.get(&bid.bid.parent_hash) {
 
             // }
-            self.commit_bid(5,&mut _bid_runtime)
+            self.commit_bid(5, _bid_runtime)
 
         }
     }
 
-    fn clear(&mut self, block_number: u64, _block_hash: B256) {
+    fn clear(&self, block_number: u64, _block_hash: B256) {
         let clear_threshold = 5; //todo: config
         let min_block_number = block_number.saturating_sub(clear_threshold);
 
         // Clear old bids from best_bid_to_run, simulating_bid, and best_bid
-        self.best_bid_to_run.retain(|_, bid| bid.block_number >= min_block_number);
-        self.simulating_bid.retain(|_, bid| bid.block_number >= min_block_number);
-        self.best_bid.retain(|_, bid| bid.bid.block_number >= min_block_number);
+        self.best_bid_to_run.write().retain(|_, bid| bid.block_number >= min_block_number);
+        self.simulating_bid.write().retain(|_, bid| bid.block_number >= min_block_number);
+        self.best_bid.write().retain(|_, bid| bid.bid.block_number >= min_block_number);
 
         // Clear old pending bids by parsing block_number from key prefix
         // Key format: "{block_number}-{builder}-{bid_hash}"
-        self.pending_bid.retain(|key, _| {
+        self.pending_bid.write().retain(|key, _| {
             // Parse block_number from the key (first part before '-')
             if let Some(block_num_str) = key.split('-').next() {
                 if let Ok(bid_block_number) = block_num_str.parse::<u64>() {
@@ -209,7 +215,7 @@ where Client: HeaderProvider<Header = alloy_consensus::Header> + BlockHashReader
         Ok(runtime)
     }
 
-    fn commit_bid(&mut self,reason: u32, bid_runtime: &mut BidRuntime<BscEvmConfig>) {
+    fn commit_bid(&self, reason: u32, mut bid_runtime: BidRuntime<BscEvmConfig>) {
         // todo: interrupt
         debug!("bid committed reason:{}, bid hash:{}",reason, bid_runtime.bid.bid_hash);
         bid_runtime.bid.committed = true;
@@ -217,14 +223,14 @@ where Client: HeaderProvider<Header = alloy_consensus::Header> + BlockHashReader
     }
 
     // sim_bid commit tx and set best bid
-    fn sim_bid(&mut self, bid_runtime: &mut BidRuntime<BscEvmConfig>) {
+    fn sim_bid(&self, mut bid_runtime: BidRuntime<BscEvmConfig>) {
         if !self.bid_receiving {
             return 
         }
         let mut success = false;
         //let startTs = std::time::Instant::now();
         let parent_hash = bid_runtime.bid.parent_hash;
-        self.simulating_bid.insert(parent_hash, bid_runtime.bid.clone());
+        self.simulating_bid.write().insert(parent_hash, bid_runtime.bid.clone());
         
         // todo: gas check
 
@@ -293,28 +299,49 @@ where Client: HeaderProvider<Header = alloy_consensus::Header> + BlockHashReader
             requests: Some(execution_result.requests),
         };
 
-        let best_bid = self.best_bid.get(&parent_hash);
-        if let Some(best_bid) = best_bid {
-            if best_bid.packed_block_reward < bid_runtime.packed_block_reward {
-                self.best_bid.insert(parent_hash, bid_runtime.clone());
+        // Acquire write lock to update best_bid
+        {
+            let mut best_bid_map = self.best_bid.write();
+            let best_bid = best_bid_map.get(&parent_hash);
+            if let Some(best_bid) = best_bid {
+                if best_bid.packed_block_reward < bid_runtime.packed_block_reward {
+                    debug!("bidSimulator: insert new best bid, block number:{}, parent hash:{}, builder:{}, bid hash:{}, gas used:{}",
+                    bid_runtime.bid.block_number,
+                    bid_runtime.bid.parent_hash,
+                    bid_runtime.bid.builder,
+                    bid_runtime.bid.bid_hash,
+                    bid_runtime.gas_used,
+                    );
+                    best_bid_map.insert(parent_hash, bid_runtime.clone());
+                    success = true;
+                }else {
+                    debug!("current best bid is better than new bid, ignore");
+                }
+            }else {
+                debug!("bidSimulator: insert new best bid, block number:{}, parent hash:{}, builder:{}, bid hash:{}, gas used:{}",
+                 bid_runtime.bid.block_number,
+                 bid_runtime.bid.parent_hash,
+                 bid_runtime.bid.builder,
+                 bid_runtime.bid.bid_hash,
+                 bid_runtime.gas_used,
+                );
+                best_bid_map.insert(parent_hash, bid_runtime.clone());
                 success = true;
             }
-        }else {
-            self.best_bid.insert(parent_hash, bid_runtime.clone());
-            success = true;
         }
 
-        debug!("bidSimulator: sim_bid finished, block number:{}, parent hash:{}, builder:{}, bid hash:{}, gas used:{}",
+        debug!("bidSimulator: sim_bid finished, block number:{}, parent hash:{}, builder:{}, bid hash:{}, gas used:{}, success:{}",
          bid_runtime.bid.block_number,
          bid_runtime.bid.parent_hash,
          bid_runtime.bid.builder,
          bid_runtime.bid.bid_hash,
          bid_runtime.gas_used,
+         success,
         );
 
-        self.simulating_bid.remove(&parent_hash);
+        self.simulating_bid.write().remove(&parent_hash);
         if !success {
-            self.best_bid_to_run.remove(&parent_hash);
+            self.best_bid_to_run.write().remove(&parent_hash);
         }
         // todo: recommit
 
@@ -322,7 +349,7 @@ where Client: HeaderProvider<Header = alloy_consensus::Header> + BlockHashReader
 
     /// Get the best bid for a given parent hash
     pub fn get_best_bid(&self, parent_hash: B256) -> Option<BidRuntime<BscEvmConfig>> {
-        self.best_bid.get(&parent_hash).cloned()
+        self.best_bid.read().get(&parent_hash).cloned()
     }
 }
 

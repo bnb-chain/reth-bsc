@@ -187,7 +187,7 @@ pub struct MainWorkWorker<Pool, Provider> {
     payload_tx: mpsc::UnboundedSender<BscBuiltPayload>,
     running_job_handle: Option<BscPayloadJobHandle>,
     payload_job_join_set: JoinSet<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
-    simulator: Arc<parking_lot::RwLock<BidSimulator<Provider>>>,
+    simulator: Arc<BidSimulator<Provider>>,  // No outer RwLock, each map has its own lock
 }
 
 impl<Pool, Provider> MainWorkWorker<Pool, Provider>
@@ -212,7 +212,7 @@ where
         parlia: Arc<crate::consensus::parlia::Parlia<crate::chainspec::BscChainSpec>>,
         mining_queue_rx: mpsc::UnboundedReceiver<MiningContext>,
         payload_tx: mpsc::UnboundedSender<BscBuiltPayload>,
-        simulator: Arc<parking_lot::RwLock<BidSimulator<Provider>>>,
+        simulator: Arc<BidSimulator<Provider>>,  // No outer RwLock needed
     ) -> Self {
         Self {
             pool,
@@ -454,7 +454,7 @@ where
 }
 
 pub struct MevWorkWorker<Provider> {
-    simulator: Arc<parking_lot::RwLock<BidSimulator<Provider>>>,
+    simulator: Arc<BidSimulator<Provider>>,  // No outer RwLock, each map has its own lock
 }
 
 impl<Provider> MevWorkWorker<Provider>
@@ -469,7 +469,7 @@ where
         + 'static,
 {
     pub fn new(
-        simulator: Arc<parking_lot::RwLock<BidSimulator<Provider>>>,
+        simulator: Arc<BidSimulator<Provider>>,
     ) -> Self {
         Self { simulator }
     }
@@ -481,16 +481,19 @@ where
             tokio::time::sleep(Duration::from_millis(20)).await;
             // Attempt to send bids
             debug!("get bid from queue");
-            self.send_bid();
+            self.get_bid_and_send();
         }
     }
 
     /// Send a bid to the miner's bid simulator (reads from global queue)
-    fn send_bid(&self) {
+    fn get_bid_and_send(&self) {
         // Read bid packages from the global queue
         if let Some(bid_package) = crate::shared::pop_bid_package() {
-            let mut simulator = self.simulator.write();
-            simulator.commit_new_bid(bid_package);
+            debug!("Popped bid package from queue, block: {}, committing to simulator", bid_package.bid.block_number);
+            let start = std::time::Instant::now();
+            // No outer lock to acquire - each map handles its own locking
+            self.simulator.commit_new_bid(bid_package);
+            debug!("✅ Bid committed to simulator, total time: {}ms", start.elapsed().as_millis());
         }
     }
 }
@@ -504,7 +507,7 @@ pub struct BscMiner<Pool, Provider> {
     result_work_worker: ResultWorkWorker<Provider>,
     mev_work_worker: MevWorkWorker<Provider>,
     task_executor: TaskExecutor,
-    simulator: Arc<parking_lot::RwLock<BidSimulator<Provider>>>,
+    simulator: Arc<BidSimulator<Provider>>,  // No outer RwLock needed, each map has its own lock
     snapshot_provider: Arc<dyn SnapshotProvider + Send + Sync>,
     mining_config: crate::node::miner::MiningConfig,
     chain_spec: Arc<crate::chainspec::BscChainSpec>,
@@ -568,8 +571,8 @@ where
             mining_queue_tx.clone(),
         );
         
-        // Create a single shared BidSimulator instance wrapped in RwLock
-        let simulator = Arc::new(parking_lot::RwLock::new(BidSimulator::new(provider.clone(), chain_spec.clone())));
+        // Create a single shared BidSimulator instance (no outer RwLock, each map has its own)
+        let simulator = Arc::new(BidSimulator::new(provider.clone(), chain_spec.clone()));
         let parlia = Arc::new(crate::consensus::parlia::Parlia::new(chain_spec.clone(), 200));
         let main_work_worker = MainWorkWorker::new(
             validator_address,
@@ -620,18 +623,18 @@ where
     }
 
     fn spawn_workers(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.task_executor.spawn_critical("mev_work_worker", self.mev_work_worker.run());
         self.task_executor.spawn_critical("new_work_worker", self.new_work_worker.run());
         self.task_executor.spawn_critical("main_work_worker", self.main_work_worker.run());
         self.task_executor.spawn_critical("result_work_worker", self.result_work_worker.run());
-        self.task_executor.spawn_critical("mev_work_worker", self.mev_work_worker.run());
         info!("Succeed to start mining, address: {}", self.validator_address);
         Ok(())
     }
 
     /// Check if a bid is already pending
     pub fn check_pending_bid(&self, block_number: u64, builder: Address, bid_hash: alloy_primitives::B256) -> bool {
-        let mut simulator = self.simulator.write();
-        simulator.check_pending_bid(block_number, builder, bid_hash)
+        // No outer lock needed - each map has its own fine-grained locks
+        self.simulator.check_pending_bid(block_number, builder, bid_hash)
     }
 
     /// Get mining config

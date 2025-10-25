@@ -42,7 +42,7 @@ const DELAY_LEFT_OVER: u64 = 50;
 const TIME_MULTIPLIER: u32 = 2;
 
 /// Maximum number of retries for payload building
-const MAX_RETRIES: u32 = 10;
+const MAX_RETRIES: u32 = 300;
 
 /// Errors that can occur during payload job execution
 #[derive(Debug, thiserror::Error)]
@@ -366,8 +366,8 @@ pub struct BscPayloadJob<Pool, Client, EvmConfig = BscEvmConfig> {
     retries: u32,
     /// JoinSet for managing build tasks
     join_handle: tokio::task::JoinSet<Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>>>,
-    /// Simulator for bid management
-    simulator: Arc<parking_lot::RwLock<BidSimulator<Client>>>,
+    /// Simulator for bid management (no outer RwLock, each map has its own)
+    simulator: Arc<BidSimulator<Client>>,
 }
 
 impl<Pool, Client, EvmConfig> BscPayloadJob<Pool, Client, EvmConfig>
@@ -384,7 +384,7 @@ where
         builder: BscPayloadBuilder<Pool, Client, EvmConfig>,
         build_args: BuildArguments<EthPayloadBuilderAttributes, BscBuiltPayload>,
         result_tx: mpsc::UnboundedSender<BscBuiltPayload>,
-        simulator: Arc<parking_lot::RwLock<BidSimulator<Client>>>,
+        simulator: Arc<BidSimulator<Client>>,  // No outer RwLock needed
     ) -> (Self, BscPayloadJobHandle) {
         let (abort_tx, abort_rx) = oneshot::channel();
         let (try_build_tx, try_build_rx) = mpsc::unbounded_channel();
@@ -431,6 +431,19 @@ where
 
         loop {
             tokio::select! {
+                // cronjob to get best bid from bid simulator - HIGHEST PRIORITY
+                // _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {
+                //     debug!("Timer triggered: checking best bid from simulator");
+                //     // No outer lock needed - each map has its own fine-grained locks
+                //     let best_bid = self.simulator.get_best_bid(self.mining_ctx.parent_header.hash());
+                //     if let Some(bid) = best_bid {
+                //         info!("Found best bid! block: {}, builder: {:?}, gas_fee: {}", bid.bid.block_number, bid.bid.builder, bid.bid.gas_fee);
+                //         self.potential_payloads.push(bid.bsc_payload);
+                //     } else {
+                //         debug!("No best bid found for parent_hash: {:?}", self.mining_ctx.parent_header.hash());
+                //     }
+                // }
+
                 // Trigger the async build payload by queue.
                 args = self.try_build_rx.recv() => {
                     match args {
@@ -476,6 +489,15 @@ where
                             );
                             self.potential_payloads.push(payload);
 
+                            // No outer lock needed - each map has its own fine-grained locks
+                            let best_bid = self.simulator.get_best_bid(self.mining_ctx.parent_header.hash());
+                            if let Some(bid) = best_bid {
+                                info!("Found best bid! block: {}, builder: {:?}, gas_fee: {}", bid.bid.block_number, bid.bid.builder, bid.bid.gas_fee);
+                                self.potential_payloads.push(bid.bsc_payload);
+                            } else {
+                                debug!("No best bid found for parent_hash: {:?}", self.mining_ctx.parent_header.hash());
+                            }
+
                             let mining_delay = self.parlia.delay_for_mining(
                                 &self.mining_ctx.parent_snapshot, 
                                 &self.mining_ctx.parent_header, 
@@ -495,6 +517,7 @@ where
                                 debug!("block number:{}, retries:{}", self.build_args.config.parent_header.number()+1, self.retries);
                                 return self.try_return_best_payload();
                             }
+                            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
                         },
                         Some(Ok(Err(e))) => {
                             let elapsed = start_time.elapsed();
@@ -511,21 +534,6 @@ where
                         None => {
                             // No task completed, continue to next iteration
                         },
-                    }
-                }
-
-                // cronjob to get best bid from bid simulator - HIGHEST PRIORITY
-                _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {
-                    debug!("Timer triggered: checking best bid from simulator");
-                    let best_bid = {
-                        let simulator = self.simulator.read();
-                        simulator.get_best_bid(self.mining_ctx.parent_header.hash())
-                    };
-                    if let Some(bid) = best_bid {
-                        info!("Found best bid! block: {}, builder: {:?}, gas_fee: {}", bid.bid.block_number, bid.bid.builder, bid.bid.gas_fee);
-                        self.potential_payloads.push(bid.bsc_payload);
-                    } else {
-                        debug!("No best bid found for parent_hash: {:?}", self.mining_ctx.parent_header.hash());
                     }
                 }
                 
