@@ -2,7 +2,7 @@ use alloy_primitives::U256;
 use crate::consensus::parlia::Parlia;
 use crate::node::engine::BscBuiltPayload;
 use crate::node::evm::config::BscEvmConfig;
-use crate::node::miner::bsc_miner::MiningContext;
+use crate::node::miner::bsc_miner::{MiningContext, SubmitContext};
 use reth_provider::StateProviderFactory;
 use reth_revm::{database::StateProviderDatabase, db::State};
 use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
@@ -373,7 +373,7 @@ pub struct BscPayloadJob<Pool, Client, EvmConfig = BscEvmConfig> {
     /// Abort flag
     is_aborted: bool,
     /// Sender for payload results
-    result_tx: mpsc::UnboundedSender<BscBuiltPayload>,
+    result_tx: mpsc::UnboundedSender<SubmitContext>,
     /// Potential payloads vector for selecting the best one
     potential_payloads: Vec<BscBuiltPayload>,
     /// Current build arguments
@@ -398,7 +398,7 @@ where
         mining_ctx: MiningContext,
         builder: BscPayloadBuilder<Pool, Client, EvmConfig>,
         build_args: BscBuildArguments<EthPayloadBuilderAttributes>,
-        result_tx: mpsc::UnboundedSender<BscBuiltPayload>,
+        result_tx: mpsc::UnboundedSender<SubmitContext>,
     ) -> (Self, BscPayloadJobHandle) {
         let (abort_tx, abort_rx) = oneshot::channel();
         let (try_build_tx, try_build_rx) = mpsc::unbounded_channel();
@@ -543,7 +543,10 @@ where
     /// Try to return the best payload to result channel
     fn try_return_best_payload(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if let Some(best_payload) = self.pick_best_payload() {
-            if let Err(err) = self.result_tx.send(best_payload) {
+            if let Err(err) = self.result_tx.send(SubmitContext {
+                mining_ctx: self.mining_ctx.clone(),
+                payload: best_payload,
+            }) {
                 warn!("Failed to send best payload to result channel: {}", err);
                 return Err(Box::new(BscPayloadJobError::ResultChannelSendError(err.to_string())));
             }

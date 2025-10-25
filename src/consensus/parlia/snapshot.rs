@@ -334,7 +334,7 @@ impl Snapshot {
         if let Some(&times) = counts.get(&validator) {
             let allowed = u64::from(self.turn_length.unwrap_or(1));
             if u64::from(times) >= allowed { 
-                tracing::warn!("Recently signed, validator: {:?}, block_number: {:?}, times: {:?}, allowed: {:?}", validator, self.block_number, times, allowed);
+                tracing::debug!("Recently signed, validator: {:?}, block_number: {:?}, times: {:?}, allowed: {:?}", validator, self.block_number, times, allowed);
                 return true;
             }
         }

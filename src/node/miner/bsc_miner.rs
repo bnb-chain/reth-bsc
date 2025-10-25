@@ -38,10 +38,51 @@ use reth_network::message::NewBlockMessage;
 use alloy_rlp::Encodable;
 use alloy_primitives::keccak256;
 
+#[derive(Clone)]
 pub struct MiningContext {
     pub header: Option<reth_primitives::Header>, // tmp header for payload building.
     pub parent_header: reth_primitives::SealedHeader,
     pub parent_snapshot: Arc<crate::consensus::parlia::snapshot::Snapshot>,
+}
+
+pub struct SubmitContext {
+    pub mining_ctx: MiningContext,
+    pub payload: BscBuiltPayload,
+}
+
+/// Task for handling delayed payload submission
+pub struct DelaySubmitTask {
+    payload: BscBuiltPayload,
+    delay_ms: u64,
+    delay_submit_tx: mpsc::UnboundedSender<BscBuiltPayload>,
+}
+
+impl DelaySubmitTask {
+    /// Create a new delay submit task
+    pub fn new(
+        payload: BscBuiltPayload,
+        delay_ms: u64,
+        delay_submit_tx: mpsc::UnboundedSender<BscBuiltPayload>,
+    ) -> Self {
+        Self {
+            payload,
+            delay_ms,
+            delay_submit_tx,
+        }
+    }
+
+    /// Start the delay task asynchronously
+    pub fn start(self) {
+        tokio::spawn(async move {
+            // Sleep for the specified delay
+            tokio::time::sleep(tokio::time::Duration::from_millis(self.delay_ms)).await;
+            
+            // Send the payload to the delay channel
+            if let Err(e) = self.delay_submit_tx.send(self.payload) {
+                error!("Failed to send delayed payload to channel: {}", e);
+            }
+        });
+    }
 }
 
 /// NewWorkWorker responsible for listening to canonical state changes and triggering mining.
@@ -157,7 +198,7 @@ where
         
         if !parent_snapshot.is_inturn(self.validator_address) {
             debug!("Try off-turn mining, validator: {}, next_block: {}", self.validator_address, tip.number() + 1);
-            return;
+            // return;
         }
 
         let mining_ctx = MiningContext {
@@ -182,7 +223,7 @@ pub struct MainWorkWorker<Pool, Provider> {
     chain_spec: Arc<crate::chainspec::BscChainSpec>,
     parlia: Arc<crate::consensus::parlia::Parlia<crate::chainspec::BscChainSpec>>,
     mining_queue_rx: mpsc::UnboundedReceiver<MiningContext>,
-    payload_tx: mpsc::UnboundedSender<BscBuiltPayload>,
+    payload_tx: mpsc::UnboundedSender<SubmitContext>,
     running_job_handle: Option<BscPayloadJobHandle>,
     payload_job_join_set: JoinSet<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
 }
@@ -208,7 +249,7 @@ where
         chain_spec: Arc<crate::chainspec::BscChainSpec>,
         parlia: Arc<crate::consensus::parlia::Parlia<crate::chainspec::BscChainSpec>>,
         mining_queue_rx: mpsc::UnboundedReceiver<MiningContext>,
-        payload_tx: mpsc::UnboundedSender<BscBuiltPayload>,
+        payload_tx: mpsc::UnboundedSender<SubmitContext>,
     ) -> Self {
         Self {
             pool,
@@ -340,50 +381,119 @@ pub struct ResultWorkWorker<Provider> {
     /// Parlia consensus engine
     parlia: Arc<crate::consensus::parlia::Parlia<crate::chainspec::BscChainSpec>>,
     /// Receiver for built payloads
-    payload_rx: mpsc::UnboundedReceiver<BscBuiltPayload>,
+    payload_rx: mpsc::UnboundedReceiver<SubmitContext>,
+    delay_submit_rx: mpsc::UnboundedReceiver<BscBuiltPayload>,
+    delay_submit_tx: mpsc::UnboundedSender<BscBuiltPayload>,
 }
 
 impl<Provider> ResultWorkWorker<Provider>
 where
-    Provider: HeaderProvider + BlockNumReader + Send + Sync,
+    Provider: HeaderProvider + BlockNumReader + Send + Sync + Clone + 'static,
 {
     /// Creates a new ResultWorkWorker instance
     pub fn new(
         validator_address: Address,
         provider: Provider,
         parlia: Arc<crate::consensus::parlia::Parlia<crate::chainspec::BscChainSpec>>,
-        payload_rx: mpsc::UnboundedReceiver<BscBuiltPayload>,
+        payload_rx: mpsc::UnboundedReceiver<SubmitContext>,
     ) -> Self {
+        let (delay_submit_tx, delay_submit_rx) = mpsc::unbounded_channel::<BscBuiltPayload>();
         Self {
             validator_address,
             provider,
             parlia,
             payload_rx,
+            delay_submit_tx,
+            delay_submit_rx,
         }
     }
+
+    // struct DelaySubmitTask {
+    //     delay_submit_tx: mpsc::UnboundedSender<BscBuiltPayload>,
+    //     submit_ctx: SubmitContext,
+    //     delay_ms: u64,
+    // }
+
 
     /// Run the result worker to process and submit payloads
     pub async fn run(mut self) {
         info!("Starting ResultWorkWorker for validator: {}", self.validator_address);
 
-        while let Some(payload) = self.payload_rx.recv().await {
-            let block_number = payload.block().number();
-            let block_hash = payload.block().hash();
-            
-            debug!("Received payload for submission, block {} (hash: 0x{:x})", block_number, block_hash);
-            
-            match self.submit_payload(payload).await {
-                Ok(()) => {
-                    info!("Succeed to submit block {} (hash: 0x{:x})", block_number, block_hash);
+        loop {
+            tokio::select! {
+                // Handle new payloads from main channel
+                submit_ctx = self.payload_rx.recv() => {
+                    match submit_ctx {
+                        Some(submit_ctx) => {
+                            let payload = submit_ctx.payload;
+                            let block_number = payload.block().number();
+                            let block_hash = payload.block().hash();
+                            
+                            let delay_ms = self.parlia.delay_for_ramanujan_fork(&submit_ctx.mining_ctx.parent_snapshot, payload.block().header());
+                            debug!("Received payload for submission, block {} (hash: 0x{:x})", block_number, block_hash);
+
+                            if delay_ms == 0 {
+                                match self.submit_payload(payload).await {
+                                    Ok(()) => {
+                                        info!("Succeed to submit block {} (hash: 0x{:x})", block_number, block_hash);
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to submit block {} (hash: 0x{:x}): {}", block_number, block_hash, e);
+                                    }
+                                }
+                            } else {
+                                // Create and start a delay submit task
+                                let delay_task = DelaySubmitTask::new(
+                                    payload,
+                                    delay_ms,
+                                    self.delay_submit_tx.clone(),
+                                );
+                                delay_task.start();
+                                
+                                info!(
+                                    "Block {} scheduled for delayed submission in {}ms",
+                                    block_number, delay_ms
+                                );
+                            }
+                        }
+                        None => {
+                            warn!("Main payload channel closed, stopping ResultWorkWorker");
+                            break;
+                        }
+                    }
                 }
-                Err(e) => {
-                    error!("Failed to submit block {} (hash: 0x{:x}): {}", block_number, block_hash, e);
+                
+                // Handle delayed payloads
+                delayed_payload = self.delay_submit_rx.recv() => {
+                    match delayed_payload {
+                        Some(payload) => {
+                            let block_number = payload.block().number();
+                            let block_hash = payload.block().hash();
+                            
+                            debug!("Processing delayed payload, block {} (hash: 0x{:x})", block_number, block_hash);
+                            
+                            // Submit the delayed payload
+                            match self.submit_payload(payload).await {
+                                Ok(()) => {
+                                    info!("Succeed to submit delayed block {} (hash: 0x{:x})", block_number, block_hash);
+                                }
+                                Err(e) => {
+                                    error!("Failed to submit delayed block {} (hash: 0x{:x}): {}", block_number, block_hash, e);
+                                }
+                            }
+                        }
+                        None => {
+                            warn!("Delay payload channel closed, stopping ResultWorkWorker");
+                            break;
+                        }
+                    }
                 }
             }
         }
 
         warn!("ResultWorkWorker stopped");
     }
+
 
     /// Submit a built payload to the engine-tree/network
     async fn submit_payload(&self, payload: BscBuiltPayload) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -396,25 +506,27 @@ where
         } else { 
             "offturn" 
         };
-        debug!("Submitting block {} (hash: 0x{:x}, txs: {}, gas_used: {}, turn_status: {})", 
-               block_number, 
-               block_hash, 
-               sealed_block.body().transaction_count(),
-               sealed_block.gas_used(),
-               turn_status);
-
+        let mut delay_ms = 0;
         // Check if block timestamp is in the future and wait if necessary
         // now is focus on the basic workflow.
         // TODO: refine it later. https://github.com/bnb-chain/bsc/blob/master/consensus/parlia/parlia.go#L1702.
         let present_timestamp = self.parlia.present_timestamp();
         if sealed_block.header().timestamp > present_timestamp {
-            let delay_ms = (sealed_block.header().timestamp - present_timestamp) * 1000;
+            delay_ms = (sealed_block.header().timestamp - present_timestamp) * 1000;
             info!(
                 "Block {} timestamp is in the future, waiting {}ms before submission",
                 block_number, delay_ms
             );
             tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
         }
+
+        debug!("Submitting block {} (hash: 0x{:x}, txs: {}, gas_used: {}, turn_status: {}, delay_ms: {})", 
+               block_number, 
+               block_hash, 
+               sealed_block.body().transaction_count(),
+               sealed_block.gas_used(),
+               turn_status,
+               delay_ms);
 
         let parent_number = block_number.saturating_sub(1);
         let parent_td = self.provider.header_td_by_number(parent_number)
@@ -514,7 +626,7 @@ where
         }
         
         let (mining_queue_tx, mining_queue_rx) = mpsc::unbounded_channel::<MiningContext>();
-        let (payload_tx, payload_rx) = mpsc::unbounded_channel::<BscBuiltPayload>();
+        let (payload_tx, payload_rx) = mpsc::unbounded_channel::<SubmitContext>();
         
         let new_work_worker = NewWorkWorker::new(
             validator_address,
