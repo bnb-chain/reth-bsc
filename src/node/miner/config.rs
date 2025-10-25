@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 use std::path::PathBuf;
 
-/// Mining configuration for BSC PoA
+/// Mining configuration for BSC PoSA
 #[derive(Clone, Serialize, Deserialize)]
 pub struct MiningConfig {
     /// Enable mining

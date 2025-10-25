@@ -1,6 +1,7 @@
 use reth::consensus::{HeaderValidator, ConsensusError, Consensus};
 use reth::primitives::SealedHeader;
 use reth_chainspec::{EthChainSpec, EthereumHardforks, EthereumHardfork};
+use crate::consensus::parlia::util::calculate_millisecond_timestamp;
 use crate::hardforks::BscHardforks;
 use super::Parlia;
 use alloy_consensus::{Header, EMPTY_OMMER_ROOT_HASH};
@@ -70,10 +71,11 @@ pub fn validate_4844_header_of_bsc(header: &SealedHeader) -> Result<(), Consensu
 impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 'static> HeaderValidator for Parlia<ChainSpec> {
     fn validate_header(&self, header: &SealedHeader) -> Result<(), ConsensusError> {
         // Don't waste time checking blocks from the future
-        let present_timestamp = self.present_timestamp();
-        if header.timestamp > present_timestamp {
+        let present_timestamp = self.present_millis_timestamp();
+        let header_timestamp = calculate_millisecond_timestamp(header);
+        if header_timestamp > present_timestamp {
             return Err(ConsensusError::TimestampIsInFuture {
-               timestamp: header.timestamp,
+               timestamp: header_timestamp,
                present_timestamp,
             });
         }

@@ -28,3 +28,7 @@ pub const BACKOFF_TIME_OF_WIGGLE: u64 = 1000; // milliseconds
 // system txs gas limit
 pub const SYSTEM_TXS_GAS_HARD_LIMIT: u64 = 20_000_000; // Maximum gas reserved for system transactions (Parlia consensus only)
 pub const SYSTEM_TXS_GAS_SOFT_LIMIT: u64 = 1_000_000; // Maximum gas reserved for system transactions, excluding validator update transactions (Parlia consensus only)
+
+// Ramanujan HF constants
+pub const FIXED_BACKOFF_TIME_BEFORE_FORK_MILLIS: u64 = 200; // 200 ms
+pub const WIGGLE_TIME_BEFORE_FORK_MILLIS: u64 = 500; // 500 ms

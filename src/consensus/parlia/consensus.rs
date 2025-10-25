@@ -224,8 +224,8 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
         Ok(proposer)
     }
     
-    pub fn present_timestamp(&self) -> u64 {
-        SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs()
+    pub fn present_millis_timestamp(&self) -> u64 {
+        SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64
     }
 
     fn get_validator_len_from_header(
@@ -437,13 +437,13 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
     ///   otherwise 4/5 of the period.
     pub fn delay_for_mining(
         &self,
-        snap: &Snapshot,
-        parent: &Header,
+        parent_snap: &Snapshot,
+        _parent: &Header,
         header: &Header,
         left_over_ms: u64,
     ) -> u64 {
-        let period_ms = snap.block_interval;
-        let mut delay_ms = self.block_time_for_ramanujan_fork(snap, parent, header);
+        let period_ms = parent_snap.block_interval;
+        let mut delay_ms = self.delay_for_ramanujan_fork(parent_snap, header);
 
         if left_over_ms >= period_ms {
             warn!("Delay invalid argument: left_over_ms={}, period_ms={}", left_over_ms, period_ms);
@@ -454,7 +454,7 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
         }
 
         let mut time_for_mining_ms = period_ms / 2;
-        let last_block_in_turn = snap.last_block_in_one_turn(header.number);
+        let last_block_in_turn = parent_snap.last_block_in_one_turn(header.number);
         if !last_block_in_turn {
             time_for_mining_ms = period_ms * 4 / 5;
         }

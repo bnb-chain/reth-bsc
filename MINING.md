@@ -1,14 +1,14 @@
-# BSC PoA Mining Implementation
+# BSC PoSA Mining Implementation
 
 ## Overview
 
-This implementation adds Proof-of-Authority (PoA) mining capability to reth-bsc, integrating with the existing Parlia consensus mechanism. The mining service automatically produces blocks when the node is configured as a validator.
+This implementation adds Proof-of-Authority (PoSA) mining capability to reth-bsc, integrating with the existing Parlia consensus mechanism. The mining service automatically produces blocks when the node is configured as a validator.
 
 ## Architecture
 
 ### Key Components
 
-1. **BscPoAMiner** (`src/node/engine.rs`): Main mining service
+1. **BscPoSAMiner** (`src/node/engine.rs`): Main mining service
    - Monitors validator authorization
    - Implements turn-based block production
    - Handles backoff timing for non-in-turn validators
@@ -132,7 +132,7 @@ let derived_address = keystore::get_validator_address(&signing_key);
 
 ### Starting Mining
 
-The mining service automatically starts when the node launches with the PoA payload service configured. It runs in a continuous loop:
+The mining service automatically starts when the node launches with the PoSA payload service configured. It runs in a continuous loop:
 
 1. Check if authorized to mine
 2. Calculate optimal mining time based on turn
@@ -145,7 +145,7 @@ The mining service automatically starts when the node launches with the PoA payl
 Mining activity is logged with different levels:
 
 ```
-INFO: Starting BSC PoA mining service for validator: 0x...
+INFO: Starting BSC PoSA mining service for validator: 0x...
 INFO: Mining new block on top of block 12345
 DEBUG: Mining attempt failed: Too early to mine, wait until 1640995200
 ```
@@ -201,7 +201,7 @@ cargo build --release
 ```
 
 Monitor logs for mining activity:
-- `INFO: Starting BSC PoA mining service for validator: 0x...`
+- `INFO: Starting BSC PoSA mining service for validator: 0x...`
 - `INFO: Mining new block on top of block 12345`
 
 ### Verify Mining
@@ -228,4 +228,4 @@ Check that blocks are being produced with your derived validator address as the 
 - Comprehensive testing
 - Production hardening
 
-This implementation provides the foundation for PoA mining in reth-bsc. The modular design allows for gradual enhancement of each component while maintaining compatibility with the existing codebase.
+This implementation provides the foundation for PoSA mining in reth-bsc. The modular design allows for gradual enhancement of each component while maintaining compatibility with the existing codebase.

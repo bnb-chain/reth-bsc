@@ -399,19 +399,18 @@ where
                sealed_block.body().transaction_count(),
                sealed_block.gas_used());
 
-        // Check if block timestamp is in the future and wait if necessary
-        // now is focus on the basic workflow.
-        // TODO: refine it later. https://github.com/bnb-chain/bsc/blob/master/consensus/parlia/parlia.go#L1702.
-        let present_timestamp = self.parlia.present_timestamp();
-        if sealed_block.header().timestamp > present_timestamp {
-            let delay_ms = (sealed_block.header().timestamp - present_timestamp) * 1000;
-            info!(
-                "Block {} timestamp is in the future, waiting {}ms before submission",
-                block_number, delay_ms
-            );
-            tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
-        }
+        let parent_snapshot = crate::shared::get_snapshot_provider().unwrap().snapshot_by_hash(&sealed_block.header().parent_hash).unwrap();
+        let delay_ms = self.parlia.delay_for_ramanujan_fork(&parent_snapshot, sealed_block.header());
+        tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+        tracing::debug!(
+            target: "bsc::miner",
+            block_number = sealed_block.header().number,
+            delay_ms = delay_ms,
+            "Finished waiting, proceeding with block submission"
+        );
 
+        // TODO: wait more times when huge chain import.
+        // TODO: only canonical head can broadcast, avoid sidechain blocks.
         let parent_number = block_number.saturating_sub(1);
         let parent_td = self.provider.header_td_by_number(parent_number)
             .map_err(|e| format!("Failed to get parent total difficulty due to {}", e))?
