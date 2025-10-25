@@ -183,7 +183,6 @@ fn main() -> eyre::Result<()> {
                         
                         // Get chain spec from context
                         let chain_spec = std::sync::Arc::new(ctx.config().chain.clone().as_ref().clone());
-                        
                         let mev_api = MevApiImpl::new(snapshot_provider, chain_spec);
                         ctx.modules.merge_configured(mev_api.into_rpc())?;
                         tracing::info!("Succeed to register MEV RPC API");

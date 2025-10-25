@@ -331,7 +331,7 @@ where
         parent: &SealedHeader<HeaderTy<Self::Primitives>>,
         attributes: Self::NextBlockEnvCtx,
     ) -> ExecutionCtxFor<'_, Self> {
-        tracing::debug!("try to create next block ctx for miner, next_block_numer={}", parent.number+1);
+        tracing::debug!("try to create next block ctx for miner, next_block_numer={}, parent_hash={}", parent.number+1, parent.hash());
         BscBlockExecutionCtx {
             base: EthBlockExecutionCtx {
                 parent_hash: parent.hash(),

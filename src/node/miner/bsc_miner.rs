@@ -480,6 +480,7 @@ where
             // Interval for checking bid packages
             tokio::time::sleep(Duration::from_millis(20)).await;
             // Attempt to send bids
+            debug!("get bid from queue");
             self.send_bid();
         }
     }

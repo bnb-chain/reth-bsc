@@ -42,7 +42,7 @@ const DELAY_LEFT_OVER: u64 = 50;
 const TIME_MULTIPLIER: u32 = 2;
 
 /// Maximum number of retries for payload building
-const MAX_RETRIES: u32 = 3;
+const MAX_RETRIES: u32 = 10;
 
 /// Errors that can occur during payload job execution
 #[derive(Debug, thiserror::Error)]
@@ -422,6 +422,7 @@ where
 
     /// Runs the payload job asynchronously with timeout support
     pub async fn start(mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        info!("BscPayloadJob started for block: {}", self.build_args.config.parent_header.number() + 1);
         let mut start_time = std::time::Instant::now();
         if let Err(err) = self.try_build_tx.send(()) {
             warn!("Failed to send to first try build queue due to {}, block_number: {}", err, self.build_args.config.parent_header.number()+1);
@@ -491,6 +492,7 @@ where
                                 debug!("Succeed to send to try build queue, block_number: {}, retries: {}, last_cost_time: {:?}, new_mining_delay: {:?}", 
                                     self.build_args.config.parent_header.number()+1, self.retries, elapsed, std::time::Duration::from_millis(mining_delay));
                             } else {
+                                debug!("block number:{}, retries:{}", self.build_args.config.parent_header.number()+1, self.retries);
                                 return self.try_return_best_payload();
                             }
                         },
@@ -512,20 +514,21 @@ where
                     }
                 }
 
-                // cronjob to get best bid from bid simulator.
+                // cronjob to get best bid from bid simulator - HIGHEST PRIORITY
                 _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {
+                    debug!("Timer triggered: checking best bid from simulator");
                     let best_bid = {
                         let simulator = self.simulator.read();
                         simulator.get_best_bid(self.mining_ctx.parent_header.hash())
                     };
                     if let Some(bid) = best_bid {
-                        debug!("Succeed to get best bid, block: {}", bid.bid.block_number);
+                        info!("Found best bid! block: {}, builder: {:?}, gas_fee: {}", bid.bid.block_number, bid.bid.builder, bid.bid.gas_fee);
                         self.potential_payloads.push(bid.bsc_payload);
                     } else {
-                        debug!("No best bid found");
+                        debug!("No best bid found for parent_hash: {:?}", self.mining_ctx.parent_header.hash());
                     }
                 }
-
+                
                 // Finish timeout by timer.
                 _ = tokio::time::sleep(self.timeout) => {
                     let elapsed = start_time.elapsed();
@@ -565,6 +568,7 @@ where
     /// Pick the best payload from potential payloads
     fn pick_best_payload(&mut self) -> Option<BscBuiltPayload> {
         if self.potential_payloads.is_empty() {
+            debug!("block number:{}, potential payloads is empty",self.build_args.config.parent_header.number()+1);
             return None;
         }
 
