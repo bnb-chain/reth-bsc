@@ -94,6 +94,7 @@ where
         mut self,
         state: impl StateProvider,
     ) -> Result<BlockBuilderOutcome<BscPrimitives>, BlockExecutionError> {
+        // TODO: remove finish_with_system_txs, keep executor.finish(), system txs can be fetched from executor.
         let ((evm, result), assembled_system_txs) = self.executor.finish_with_system_txs(|executor| executor.finish())?;
         let (db, evm_env) = evm.finish();
 
