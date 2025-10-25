@@ -389,6 +389,7 @@ impl BscMevApiServer for MevApiImpl {
         );
 
         // Submit to global bid queue
+        debug!("push bid package to queue bid_hash: {:?}, send time: {:?}", bid_hash, std::time::Instant::now());
         if let Err(e) = crate::shared::push_bid_package(bid_package) {
             tracing::error!("Failed to push bid package to queue: {}", e);
             return Err(jsonrpsee::types::ErrorObject::owned(
