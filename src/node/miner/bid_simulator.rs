@@ -18,11 +18,10 @@ use crate::chainspec::{BscChainSpec};
 use std::collections::HashMap;
 use alloy_primitives::{Address, B256};
 use reth_primitives::SealedHeader;
-use reth_provider::StateProvider;
-use crate::consensus::SYSTEM_ADDRESS;
 use crate::node::engine::BscBuiltPayload;
 use reth_evm::execute::BlockBuilderOutcome;
 use reth_provider::{HeaderProvider, BlockHashReader};
+use std::str::FromStr;
 
 #[derive(Clone)]
 pub struct Bid {
@@ -245,7 +244,7 @@ where Client: HeaderProvider<Header = alloy_consensus::Header> + BlockHashReader
         let parent_header = bid_runtime.parent_header.clone();
         let attributes = bid_runtime.attributes.clone();
         let builder_config = bid_runtime.builder_config.clone();
-        
+        debug!("parent_header: {:?}", parent_header.hash_slow());
         let mut builder = evm_config.builder_for_next_block(&mut db, &parent_header, NextBlockEnvAttributes {
                 timestamp:        attributes.timestamp(),
                 suggested_fee_recipient: attributes.suggested_fee_recipient(),
@@ -259,11 +258,11 @@ where Client: HeaderProvider<Header = alloy_consensus::Header> + BlockHashReader
         // First commit: bid transactions
         bid_runtime.commit_transaction(txs_except_last, &mut builder);
 
-        // if let Some(payBidTx) = payBidTx {
-        //     bid_runtime.commit_transaction(payBidTx, bid_runtime.parent_header, bid_runtime.attributes, bid_runtime.builder_config);
-        // }
+        // todo: get system balance from ctx
+        let system_balance = bid_runtime.gas_fee;
+
         // todo: check whether time `NoInterruptLeftOver-delayLeftOver` is enough for simulating
-        if let Err(e) = bid_runtime.pack_reward(100, &state_provider) {
+        if let Err(e) = bid_runtime.pack_reward(100, system_balance) {
             debug!("Failed to pack reward: {:?}", e);
             return;
         }
@@ -294,7 +293,6 @@ where Client: HeaderProvider<Header = alloy_consensus::Header> + BlockHashReader
             requests: Some(execution_result.requests),
         };
 
-
         let best_bid = self.best_bid.get(&parent_hash);
         if let Some(best_bid) = best_bid {
             if best_bid.packed_block_reward < bid_runtime.packed_block_reward {
@@ -310,7 +308,7 @@ where Client: HeaderProvider<Header = alloy_consensus::Header> + BlockHashReader
          bid_runtime.bid.block_number,
          bid_runtime.bid.parent_hash,
          bid_runtime.bid.builder,
-         "",
+         bid_runtime.bid.bid_hash,
          bid_runtime.gas_used,
         );
 
@@ -355,7 +353,18 @@ where
 EvmConfig: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
 <EvmConfig as ConfigureEvm>::Primitives: reth_primitives_traits::NodePrimitives<BlockHeader = alloy_consensus::Header, SignedTx = alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip4844>, Block = crate::node::primitives::BscBlock>,
 {
-    fn new(bid: Bid, evm_config: EvmConfig,parent_header:SealedHeader) -> Self {
+    fn new(bid: Bid, evm_config: EvmConfig, parent_header: SealedHeader) -> Self {
+        // Construct attributes from bid information
+        // The bid already contains the target block_number and parent_hash
+        let attributes = EthPayloadBuilderAttributes {
+            parent: bid.parent_hash,
+            timestamp: parent_header.timestamp + 3, // BSC block time is 3 seconds
+            suggested_fee_recipient: Address::from_str("0xbcdd0d2cda5f6423e57b6a4dcd75decbe31aecf0").unwrap(), // Will be set by validator
+            prev_randao: parent_header.mix_hash,
+            parent_beacon_block_root: None, // Will be set if Bohr is active
+            ..Default::default()
+        };
+
         Self {
             bid,
             evm_config,
@@ -365,8 +374,8 @@ EvmConfig: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
             expected_validator_reward: U256::ZERO,
             packed_block_reward: U256::ZERO,
             packed_validator_reward: U256::ZERO,
-            parent_header: parent_header,
-            attributes: EthPayloadBuilderAttributes::default(),
+            parent_header,
+            attributes,
             gas_used: 0,
             gas_fee: U256::ZERO,
         }
@@ -406,8 +415,9 @@ EvmConfig: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
         self.gas_fee += gas_fee;
     }
 
-    fn pack_reward(&mut self, validator_commission: u64, state_provider: &impl StateProvider) -> Result<(), Box<dyn std::error::Error>> {
-        self.packed_block_reward = state_provider.account_balance(&SYSTEM_ADDRESS)?.unwrap_or_default();
+    fn pack_reward(&mut self, validator_commission: u64, system_balance: U256) -> Result<(), Box<dyn std::error::Error>> {
+        self.packed_block_reward = system_balance;
+        debug!("packed_block_reward:{}", self.packed_block_reward);
         self.packed_validator_reward = self.packed_block_reward * U256::from(validator_commission) / U256::from(10000u64);
         self.packed_validator_reward = self.packed_validator_reward - self.bid.builder_fee;
         Ok(())

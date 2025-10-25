@@ -503,6 +503,7 @@ where
         tracing::debug!("Start to finalize new block, block_number: {}, is_miner: {}", block.number, self.ctx.is_miner);
         let snap = self.inner_ctx.snap.as_ref().unwrap();
         let expected_validator = snap.inturn_validator();
+        tracing::debug!("expected_validator: {:?}, block.beneficiary: {:?}", expected_validator, block.beneficiary);
         if block.beneficiary != expected_validator {
             let signed_recently = if self.spec.is_plato_active_at_block(block.number.to()) {
                 snap.sign_recently(expected_validator)

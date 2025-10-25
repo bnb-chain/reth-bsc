@@ -13,6 +13,7 @@ use crate::consensus::parlia::SnapshotProvider;
 // Use MEV types from reth-rpc-api, but define our own server trait to avoid conflicts
 pub use reth_rpc_api::mev::{BidArgs, RawBid};
 pub use alloy_rpc_types_mev::{EthBundleHash, MevSendBundle, SimBundleOverrides, SimBundleResponse};
+use alloy_primitives::Address;
 
 /// Custom MEV API server trait - only includes send_bid to avoid conflicts with reth's default MEV API
 #[rpc(server, namespace = "mev")]
@@ -29,6 +30,7 @@ const PAY_BID_TX_GAS_LIMIT: u64 = 25000;
 pub struct MevApiImpl {
     snapshot_provider: Arc<dyn SnapshotProvider + Send + Sync>,
     chain_spec: Arc<BscChainSpec>,
+    validator_address: Address,
 }
 
 impl MevApiImpl {
@@ -37,7 +39,8 @@ impl MevApiImpl {
         snapshot_provider: Arc<dyn SnapshotProvider + Send + Sync>,
         chain_spec: Arc<BscChainSpec>,
     ) -> Self {
-        Self { snapshot_provider, chain_spec }
+        let validator_address = "0xbCDD0d2cDA5f6423E57B6a4dCD75DEcbE31aeCf0".parse().unwrap();
+        Self { snapshot_provider, chain_spec, validator_address }
     }
 
     /// Get header by number from global header provider
@@ -266,6 +269,24 @@ impl BscMevApiServer for MevApiImpl {
             ));
         }
 
+         // Recover builder address from signature
+         let builder = match Self::recover_builder_address(&bid.raw_bid, &bid.signature) {
+            Ok(addr) => addr,
+            Err(e) => {
+                tracing::error!("Failed to recover builder address: {}", e);
+                return Err(jsonrpsee::types::ErrorObject::owned(
+                    -32602,
+                    format!("Invalid signature: {}", e),
+                    None::<()>,
+                ));
+            }
+        };
+        debug!("builder: {:?}", builder);
+        
+        // Calculate bid hash (using RLP hash of RawBid)
+        let bid_hash = Self::calculate_raw_bid_hash(&bid.raw_bid);
+        debug!("bid_hash: {:?}", bid_hash);
+
         // Optional: Check if validator is inturn using snapshot (for filtering bids)
         // Note: This is optional - you may want to accept bids even when not inturn
         if let Some(snapshot) = self.snapshot_provider.snapshot(parent_block_number) {
@@ -275,6 +296,14 @@ impl BscMevApiServer for MevApiImpl {
                 parent_block_number,
                 snapshot.validators.len()
             );
+            if !snapshot.is_inturn(self.validator_address) {
+                tracing::error!("Skip bid: validator is not inturn, block number: {}, validator address: {}", new_block_number, self.validator_address);
+                return Err(jsonrpsee::types::ErrorObject::owned(
+                    -32602,
+                    "Validator is not inturn",
+                    None::<()>,
+                ));
+            }
         } else {
             tracing::debug!(
                 "No snapshot available for block {} (validator may not be inturn)",
@@ -329,25 +358,6 @@ impl BscMevApiServer for MevApiImpl {
                 None::<()>,
             ));
         }
-
-        // Recover builder address from signature
-        let builder = match Self::recover_builder_address(&bid.raw_bid, &bid.signature) {
-            Ok(addr) => addr,
-            Err(e) => {
-                tracing::error!("Failed to recover builder address: {}", e);
-                return Err(jsonrpsee::types::ErrorObject::owned(
-                    -32602,
-                    format!("Invalid signature: {}", e),
-                    None::<()>,
-                ));
-            }
-        };
-        debug!("builder: {:?}", builder);
-        
-        // Calculate bid hash (using RLP hash of RawBid)
-        let bid_hash = Self::calculate_raw_bid_hash(&bid.raw_bid);
-        debug!("bid_hash: {:?}", bid_hash);
-        
         // Check if this bid is already pending - skip for now as we removed miner reference
         // TODO: Add check_pending_bid to global state if needed
 
