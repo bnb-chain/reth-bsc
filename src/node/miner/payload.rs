@@ -1,5 +1,5 @@
 use alloy_primitives::U256;
-use crate::consensus::parlia::Parlia;
+use crate::consensus::parlia::{Parlia, DEFAULT_MIN_GAS_TIP};
 use crate::node::engine::BscBuiltPayload;
 use crate::node::evm::config::BscEvmConfig;
 use crate::node::miner::bsc_miner::MiningContext;
@@ -174,6 +174,8 @@ where
         let base_fee = builder.evm_mut().block().basefee;
         
         let mut sidecars_map = HashMap::new();
+        // TODO: add min gas tip to config.
+        let min_gas_tip = DEFAULT_MIN_GAS_TIP;
         let mut block_blob_count = 0;
 
         // TODO: Calculate blob fee.
@@ -183,6 +185,12 @@ where
         while let Some(pool_tx) = best_tx_list.next() {
             if cancel.is_cancelled() {
                 break;
+            }
+
+            // filter out tx with min gas tip.
+            if pool_tx.effective_tip_per_gas(base_fee).unwrap_or(0_u128) < min_gas_tip {
+                // Skip packaging underpriced transactions, but do not mark them invalid.
+                continue
             }
 
             // ensure we still have capacity for this transaction
@@ -304,7 +312,7 @@ where
         // set sidecars to seal block
         let mut blob_sidecars:Vec<BscBlobTransactionSidecar>= Vec::new();
         let transactions = &sealed_block.body().inner.transactions;
-        debug!("debug payload_builder, block_number: {}, block_hash: {:?}, trx_len: {} , is_cancel: {}", sealed_block.number(), sealed_block.hash(), transactions.len(), cancel.is_cancelled());
+        debug!("debug payload_builder, block_number: {}, block_hash: {:?}, txs: {} gas: {}, fees: {}", sealed_block.number(), sealed_block.hash(), transactions.len(), cumulative_gas_used, total_fees);
         for (index, tx) in transactions.iter().enumerate() {
             debug!("debug payload_builder, transaction {}: hash={:?}, from={:?}, to={:?}, value={:?}, gas_limit={}, gas_price={:?}, nonce={}", 
                 index + 1,

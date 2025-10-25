@@ -5,6 +5,7 @@ use alloy_consensus::{BlockBody, Header, EMPTY_OMMER_ROOT_HASH, proofs, Transact
 use alloy_primitives::{keccak256, B256};
 use alloy_eips::{eip7840::BlobParams, merge::BEACON_NONCE};
 use alloy_primitives::Bytes;
+use alloy_rpc_types::Withdrawals;
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_ethereum_primitives::{Receipt, TransactionSigned};
 use reth_evm::{
@@ -176,7 +177,7 @@ where
         Ok(BscBlock {
             header,
             body: BscBlockBody {
-                inner: BlockBody { transactions, ommers: Default::default(), withdrawals: None },
+                inner: BlockBody { transactions, ommers: Default::default(), withdrawals: Some(Withdrawals::new(vec![])) },
                 sidecars: None, // todo: implement blob storage.
             },
         })

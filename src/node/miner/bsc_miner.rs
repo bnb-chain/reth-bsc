@@ -94,8 +94,12 @@ where
                     let committed = event.committed();
                     let tip = committed.tip();
                     debug!(
-                        "try new work, tip_block: {}, committed_blocks: {}",
+                        "try new work, tip_block={}, hash={}, parent_hash={}, miner={}, diff={}, committed_blocks={}",
                         committed.tip().number(),
+                        format!("0x{:x}", committed.tip().hash()),
+                        format!("0x{:x}", committed.tip().parent_hash()),
+                        committed.tip().beneficiary(),
+                        committed.tip().difficulty(),
                         committed.len()
                     );
                     let tip_header = tip.clone_sealed_header();
