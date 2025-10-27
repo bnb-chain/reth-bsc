@@ -37,6 +37,7 @@ use alloy_primitives::U128;
 use reth_network::message::NewBlockMessage;
 use alloy_rlp::Encodable;
 use alloy_primitives::keccak256;
+use crate::node::miner::bid_simulator::BidSimulator;
 
 pub struct MiningContext {
     pub header: Option<reth_primitives::Header>, // tmp header for payload building.
@@ -187,6 +188,7 @@ pub struct MainWorkWorker<Pool, Provider> {
     payload_tx: mpsc::UnboundedSender<BscBuiltPayload>,
     running_job_handle: Option<BscPayloadJobHandle>,
     payload_job_join_set: JoinSet<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
+    simulator: Arc<parking_lot::RwLock<BidSimulator<Provider>>>,
 }
 
 impl<Pool, Provider> MainWorkWorker<Pool, Provider>
@@ -211,6 +213,7 @@ where
         parlia: Arc<crate::consensus::parlia::Parlia<crate::chainspec::BscChainSpec>>,
         mining_queue_rx: mpsc::UnboundedReceiver<MiningContext>,
         payload_tx: mpsc::UnboundedSender<BscBuiltPayload>,
+        simulator: Arc<parking_lot::RwLock<BidSimulator<Provider>>>,
     ) -> Self {
         Self {
             pool,
@@ -222,6 +225,7 @@ where
             payload_tx,
             running_job_handle: None,
             payload_job_join_set: JoinSet::new(),
+            simulator,
         }
     }
 
@@ -235,6 +239,7 @@ where
                         Some(ctx) => {
                             let next_block = ctx.parent_header.number() + 1;
                             debug!("Received mining context, next_block: {}", next_block);
+                            let _parent_hash = ctx.parent_header.hash();
 
                             match self.try_mine_block(ctx).await {
                                 Ok(()) => {
@@ -293,14 +298,14 @@ where
             cached_reads: reth_revm::cached::CachedReads::default(),
             config: PayloadConfig::new(Arc::new(mining_ctx.parent_header.clone()), attributes),
             cancel: ManualCancel::default(),
-        };
-                
+        };    
         let (payload_job, job_handle) = BscPayloadJob::new(
             self.parlia.clone(), 
             mining_ctx,
             payload_builder, 
             build_args, 
-            self.payload_tx.clone()
+            self.payload_tx.clone(),
+            self.simulator.clone(),
         );
         
         let start_time = std::time::Instant::now();
@@ -459,6 +464,10 @@ pub struct BscMiner<Pool, Provider> {
     main_work_worker: MainWorkWorker<Pool, Provider>,
     result_work_worker: ResultWorkWorker<Provider>,
     task_executor: TaskExecutor,
+    simulator: Arc<parking_lot::RwLock<BidSimulator<Provider>>>,
+    snapshot_provider: Arc<dyn SnapshotProvider + Send + Sync>,
+    mining_config: crate::node::miner::MiningConfig,
+    chain_spec: Arc<crate::chainspec::BscChainSpec>,
 }
 
 impl<Pool, Provider> BscMiner<Pool, Provider>
@@ -519,6 +528,8 @@ where
             mining_queue_tx.clone(),
         );
         
+        // Create a single shared BidSimulator instance wrapped in RwLock
+        let simulator = Arc::new(parking_lot::RwLock::new(BidSimulator::new(provider.clone(), chain_spec.clone())));
         let parlia = Arc::new(crate::consensus::parlia::Parlia::new(chain_spec.clone(), 200));
         let main_work_worker = MainWorkWorker::new(
             validator_address,
@@ -528,6 +539,7 @@ where
             parlia.clone(),
             mining_queue_rx,
             payload_tx,
+            simulator.clone(),
         );
         
         let result_work_worker = ResultWorkWorker::new(
@@ -544,6 +556,10 @@ where
             main_work_worker,
             result_work_worker,
             task_executor,
+            simulator,
+            snapshot_provider,
+            mining_config,
+            chain_spec,
         };
         info!("Succeed to new miner, address: {}", validator_address);
         Ok(miner)
@@ -612,6 +628,39 @@ where
         self.task_executor.spawn_critical("result_work_worker", self.result_work_worker.run());
         info!("Succeed to start mining, address: {}", self.validator_address);
         Ok(())
+    }
+
+    /// Send a bid to the miner's bid simulator
+    pub fn send_bid(
+        &self,
+        bid_package: crate::node::miner::bid_simulator::NewBidPackage,
+    ) {
+        let simulator = Arc::clone(&self.simulator);
+        self.task_executor.spawn(Box::pin(async move {
+            let mut simulator = simulator.write();
+            simulator.commit_new_bid(bid_package);
+        }));
+    }
+
+    /// Check if a bid is already pending
+    pub fn check_pending_bid(&self, block_number: u64, builder: Address, bid_hash: alloy_primitives::B256) -> bool {
+        let mut simulator = self.simulator.write();
+        simulator.check_pending_bid(block_number, builder, bid_hash)
+    }
+
+    /// Get mining config
+    pub fn mining_config(&self) -> &crate::node::miner::MiningConfig {
+        &self.mining_config
+    }
+
+    /// Get chain spec
+    pub fn chain_spec(&self) -> &Arc<crate::chainspec::BscChainSpec> {
+        &self.chain_spec
+    }
+
+    /// Get snapshot provider
+    pub fn snapshot_provider(&self) -> &Arc<dyn SnapshotProvider + Send + Sync> {
+        &self.snapshot_provider
     }
 
 }
