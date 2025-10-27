@@ -504,6 +504,7 @@ where
                             if let Some(bid) = best_bid {
                                 info!("Found best bid! block: {}, builder: {:?}, gas_fee: {}", bid.bid.block_number, bid.bid.builder, bid.bid.gas_fee);
                                 self.potential_payloads.push(bid.bsc_payload);
+                                return self.try_return_best_payload();
                             } else {
                                 debug!("No best bid found for parent_hash: {:?}", self.mining_ctx.parent_header.hash());
                             }
@@ -607,7 +608,7 @@ where
             best_index+1,
             total_len
         );
-        
+
         self.potential_payloads.clear();
         Some(best_payload)
     }

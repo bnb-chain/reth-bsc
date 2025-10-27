@@ -299,7 +299,8 @@ where
             cached_reads: reth_revm::cached::CachedReads::default(),
             config: PayloadConfig::new(Arc::new(mining_ctx.parent_header.clone()), attributes),
             cancel: ManualCancel::default(),
-        };    
+        };
+        
         let (payload_job, job_handle) = BscPayloadJob::new(
             self.parlia.clone(), 
             mining_ctx,
@@ -484,7 +485,6 @@ where
             // Interval for checking bid packages
             tokio::time::sleep(Duration::from_millis(20)).await;
             // Attempt to send bids
-            debug!("get bid from queue");
             self.get_bid_and_send();
         }
     }
@@ -575,9 +575,9 @@ where
             mining_queue_tx.clone(),
         );
         
-        // Create a single shared BidSimulator instance (no outer RwLock, each map has its own)
-        let simulator = Arc::new(BidSimulator::new(provider.clone(), chain_spec.clone()));
         let parlia = Arc::new(crate::consensus::parlia::Parlia::new(chain_spec.clone(), 200));
+        // Create a single shared BidSimulator instance (no outer RwLock, each map has its own)
+        let simulator = Arc::new(BidSimulator::new(provider.clone(), chain_spec.clone(), parlia.clone(), validator_address, snapshot_provider.clone()));
         let main_work_worker = MainWorkWorker::new(
             validator_address,
             pool.clone(),

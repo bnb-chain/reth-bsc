@@ -22,7 +22,9 @@ use crate::node::engine::BscBuiltPayload;
 use reth_evm::execute::BlockBuilderOutcome;
 use reth_provider::{HeaderProvider, BlockHashReader};
 use parking_lot::RwLock;
-use std::str::FromStr;
+use crate::node::miner::util::prepare_new_attributes;
+use crate::node::miner::bsc_miner::MiningContext;
+use crate::consensus::parlia::provider::SnapshotProvider;
 
 #[derive(Clone)]
 pub struct Bid {
@@ -44,6 +46,22 @@ impl Bid
     }
 }
 
+impl std::fmt::Debug for Bid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Bid")
+            .field("builder", &format!("{:?}", self.builder))
+            .field("block_number", &self.block_number)
+            .field("parent_hash", &format!("{:?}", self.parent_hash))
+            .field("txs_count", &self.txs.len())  // 只显示交易数量，避免输出过长
+            .field("gas_used", &self.gas_used)
+            .field("gas_fee", &self.gas_fee)
+            .field("builder_fee", &self.builder_fee)
+            .field("committed", &self.committed)
+            .field("bid_hash", &format!("{:?}", self.bid_hash))
+            .finish()  // 移除分号，返回 Result
+    }
+}
+
 pub struct NewBidPackage {
     pub bid: Bid,
     pub runtime: u64,
@@ -56,7 +74,12 @@ pub struct NewBidPackage {
 // 3. find best bid
 // 4. can be interrupt the last bid and commit
 pub struct BidSimulator<Client> {
+
     client: Client,
+    snapshot_provider: Arc<dyn SnapshotProvider + Send + Sync>,
+    parlia: Arc<crate::consensus::parlia::Parlia<crate::chainspec::BscChainSpec>>,
+    validator_address: Address,
+
     // Each map has its own lock for fine-grained concurrency control
     // This avoids writer starvation when one operation needs write access
     best_bid_to_run: Arc<RwLock<HashMap<B256, Bid>>>,
@@ -72,10 +95,13 @@ pub struct BidSimulator<Client> {
 impl<Client> BidSimulator<Client> 
 where Client: HeaderProvider<Header = alloy_consensus::Header> + BlockHashReader + StateProviderFactory + Clone + 'static,
 {
-    pub fn new(client: Client, chain_spec: Arc<BscChainSpec>) -> Self {
+    pub fn new(client: Client, chain_spec: Arc<BscChainSpec>, parlia: Arc<crate::consensus::parlia::Parlia<crate::chainspec::BscChainSpec>>, validator_address: Address, snapshot_provider: Arc<dyn SnapshotProvider + Send + Sync>) -> Self {
         Self { 
             client,
+            parlia,
+            validator_address,
             chain_spec,
+            snapshot_provider,
             best_bid_to_run: Arc::new(RwLock::new(HashMap::new())),
             simulating_bid: Arc::new(RwLock::new(HashMap::new())),
             best_bid: Arc::new(RwLock::new(HashMap::new())),
@@ -131,7 +157,28 @@ where Client: HeaderProvider<Header = alloy_consensus::Header> + BlockHashReader
                 return;
             }
         };
-        let mut _bid_runtime = match self.new_bid_runtime(&bid.bid, 100, parent_header.clone()) {
+        let parent_snapshot = match self.snapshot_provider.snapshot_by_hash(&parent_hash) {
+            Some(snapshot) => snapshot,
+            None => {
+                debug!("Skip to mine new block due to no snapshot available, validator: {}, tip: {}", self.validator_address, parent_hash);
+                return;
+            }
+        };
+        let mut mining_ctx = MiningContext {
+            parent_snapshot: Arc::new(parent_snapshot),
+            parent_header: parent_header.clone(),
+            header: None,
+        };
+        let parent_snapshot = mining_ctx.parent_snapshot.clone();
+        let attributes = prepare_new_attributes(
+            &mut mining_ctx,
+            self.parlia.clone(), 
+            &parent_snapshot, 
+            &parent_header, 
+            self.validator_address,
+        );
+
+        let mut _bid_runtime = match self.new_bid_runtime(&bid.bid, 100, parent_header.clone(), attributes.clone()) {
             Ok(bid_runtime   ) => bid_runtime,
             Err(err) => {
                 debug!("create runtime error:{}",err);
@@ -144,7 +191,7 @@ where Client: HeaderProvider<Header = alloy_consensus::Header> + BlockHashReader
         // Acquire read lock only when needed
         let best_bid_opt = self.best_bid_to_run.read().get(&parent_hash).cloned();
         if let Some(best_bid) = best_bid_opt {
-            let best_bid_runtime = match self.new_bid_runtime(&best_bid, 100, parent_header.clone()) {
+            let best_bid_runtime = match self.new_bid_runtime(&best_bid, 100, parent_header.clone(), attributes.clone()) {
                 Ok(best_bid_runtime) => best_bid_runtime,
                 Err(err) => {
                     debug!("create runtime error:{}",err);
@@ -199,12 +246,11 @@ where Client: HeaderProvider<Header = alloy_consensus::Header> + BlockHashReader
         });
     }
 
-    fn new_bid_runtime(&self, _bid: &Bid, _validator_commission: u64, parent_header: SealedHeader) -> Result<BidRuntime<BscEvmConfig>, Box<dyn std::error::Error + Send + Sync>>{
-        let mut runtime = BidRuntime::new(_bid.clone(), BscEvmConfig::new(self.chain_spec.clone()), parent_header);
+    fn new_bid_runtime(&self, _bid: &Bid, _validator_commission: u64, parent_header: SealedHeader, attributes: EthPayloadBuilderAttributes) -> Result<BidRuntime<BscEvmConfig>, Box<dyn std::error::Error + Send + Sync>>{
+        let mut runtime = BidRuntime::new(_bid.clone(), BscEvmConfig::new(self.chain_spec.clone()), parent_header, attributes);
         let expected_block_reward = _bid.gas_fee;
         let mut expected_validator_reward = expected_block_reward * U256::from(_validator_commission);
         expected_validator_reward = expected_validator_reward / U256::from(10000u64);
-        debug!("expected_block_reward:{}, _validator_commission:{}, expected_validator_reward:{}, builder_fee:{}",expected_block_reward,_validator_commission, expected_validator_reward, _bid.builder_fee);
         if expected_validator_reward < _bid.builder_fee {
             debug!("BidSimulator: invalid bid, builder fee exceeds validator reward, ignore expected_validator_reward:{} builder_fee:{}", expected_validator_reward, _bid.builder_fee);
             return Err("invalid bid: builder fee exceeds validator reward".into());
@@ -237,7 +283,6 @@ where Client: HeaderProvider<Header = alloy_consensus::Header> + BlockHashReader
 
         let mut txs_except_last = bid_runtime.bid.txs.clone();
         let pay_bid_tx = txs_except_last.pop();
-        debug!("bid_runtime.parent_header hash:{}", bid_runtime.parent_header.hash_slow());
         let state_provider = self.client.state_by_block_hash(bid_runtime.parent_header.hash_slow()).unwrap();
         let sp_db = StateProviderDatabase::new(&state_provider);
         let mut db = State::builder()
@@ -250,7 +295,6 @@ where Client: HeaderProvider<Header = alloy_consensus::Header> + BlockHashReader
         let parent_header = bid_runtime.parent_header.clone();
         let attributes = bid_runtime.attributes.clone();
         let builder_config = bid_runtime.builder_config.clone();
-        debug!("parent_header: {:?}", parent_header.hash_slow());
         let mut builder = evm_config.builder_for_next_block(&mut db, &parent_header, NextBlockEnvAttributes {
                 timestamp:        attributes.timestamp(),
                 suggested_fee_recipient: attributes.suggested_fee_recipient(),
@@ -305,26 +349,12 @@ where Client: HeaderProvider<Header = alloy_consensus::Header> + BlockHashReader
             let best_bid = best_bid_map.get(&parent_hash);
             if let Some(best_bid) = best_bid {
                 if best_bid.packed_block_reward < bid_runtime.packed_block_reward {
-                    debug!("bidSimulator: insert new best bid, block number:{}, parent hash:{}, builder:{}, bid hash:{}, gas used:{}",
-                    bid_runtime.bid.block_number,
-                    bid_runtime.bid.parent_hash,
-                    bid_runtime.bid.builder,
-                    bid_runtime.bid.bid_hash,
-                    bid_runtime.gas_used,
-                    );
                     best_bid_map.insert(parent_hash, bid_runtime.clone());
                     success = true;
                 }else {
                     debug!("current best bid is better than new bid, ignore");
                 }
             }else {
-                debug!("bidSimulator: insert new best bid, block number:{}, parent hash:{}, builder:{}, bid hash:{}, gas used:{}",
-                 bid_runtime.bid.block_number,
-                 bid_runtime.bid.parent_hash,
-                 bid_runtime.bid.builder,
-                 bid_runtime.bid.bid_hash,
-                 bid_runtime.gas_used,
-                );
                 best_bid_map.insert(parent_hash, bid_runtime.clone());
                 success = true;
             }
@@ -380,18 +410,7 @@ where
 EvmConfig: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
 <EvmConfig as ConfigureEvm>::Primitives: reth_primitives_traits::NodePrimitives<BlockHeader = alloy_consensus::Header, SignedTx = alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip4844>, Block = crate::node::primitives::BscBlock>,
 {
-    fn new(bid: Bid, evm_config: EvmConfig, parent_header: SealedHeader) -> Self {
-        // Construct attributes from bid information
-        // The bid already contains the target block_number and parent_hash
-        let attributes = EthPayloadBuilderAttributes {
-            parent: bid.parent_hash,
-            timestamp: parent_header.timestamp + 3, // BSC block time is 3 seconds
-            suggested_fee_recipient: Address::from_str("0xbcdd0d2cda5f6423e57b6a4dcd75decbe31aecf0").unwrap(), // Will be set by validator
-            prev_randao: parent_header.mix_hash,
-            parent_beacon_block_root: None, // Will be set if Bohr is active
-            ..Default::default()
-        };
-
+    fn new(bid: Bid, evm_config: EvmConfig, parent_header: SealedHeader, attributes: EthPayloadBuilderAttributes) -> Self {
         Self {
             bid,
             evm_config,
@@ -444,14 +463,12 @@ EvmConfig: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
 
     fn pack_reward(&mut self, validator_commission: u64, system_balance: U256) -> Result<(), Box<dyn std::error::Error>> {
         self.packed_block_reward = system_balance;
-        debug!("packed_block_reward:{}", self.packed_block_reward);
         self.packed_validator_reward = self.packed_block_reward * U256::from(validator_commission) / U256::from(10000u64);
         self.packed_validator_reward = self.packed_validator_reward - self.bid.builder_fee;
         Ok(())
     }
 
     fn valid_reward(&self) -> bool {
-        debug!("packed_block_reward:{}, expected_block_reward:{}, packed_validator_reward:{}, expected_validator_reward:{}", self.packed_block_reward, self.expected_block_reward, self.packed_validator_reward, self.expected_validator_reward);
         return self.packed_block_reward >= self.expected_block_reward && self.packed_validator_reward >= self.expected_validator_reward;
     }
 }

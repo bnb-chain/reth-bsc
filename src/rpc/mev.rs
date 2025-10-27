@@ -1,6 +1,6 @@
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::proc_macros::rpc;
-use alloy_primitives::B256;
+use alloy_primitives::{B256,Bytes, U64, U256};
 use alloy_consensus::Transaction;
 use reth_primitives::TransactionSigned;
 use reth_primitives_traits::SignerRecoverable;
@@ -10,10 +10,44 @@ use crate::chainspec::BscChainSpec;
 use reth_chainspec::EthChainSpec;
 use tracing::debug;
 use crate::consensus::parlia::SnapshotProvider;
-// Use MEV types from reth-rpc-api, but define our own server trait to avoid conflicts
-pub use reth_rpc_api::mev::{BidArgs, RawBid};
-pub use alloy_rpc_types_mev::{EthBundleHash, MevSendBundle, SimBundleOverrides, SimBundleResponse};
 use alloy_primitives::Address;
+
+/// Raw bid data structure from builder
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RawBid {
+    /// Block number for this bid
+    pub block_number: U64,
+    /// Parent block hash
+    pub parent_hash: B256,
+    /// List of transactions in the bid
+    pub txs: Vec<Bytes>,
+    /// List of transaction hashes that cannot be reverted
+    #[serde(default)]
+    pub un_revertible: Vec<B256>,
+    /// Total gas used
+    pub gas_used: U64,
+    /// Gas fee
+    pub gas_fee: U256,
+    /// Builder fee
+    pub builder_fee: U256,
+}
+
+/// Builder bid arguments for mev_sendBid
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BidArgs {
+    /// Raw bid from builder
+    pub raw_bid: RawBid,
+    /// Signature of the bid from builder
+    pub signature: Bytes,
+    /// Optional payment transaction to builder from sentry
+    #[serde(default)]
+    pub pay_bid_tx: Bytes,
+    /// Gas used by the payment transaction
+    #[serde(default)]
+    pub pay_bid_tx_gas_used: U64,
+}
 
 /// Custom MEV API server trait - only includes send_bid to avoid conflicts with reth's default MEV API
 #[rpc(server, namespace = "mev")]
@@ -113,6 +147,9 @@ impl MevApiImpl {
             txs.push(pay_bid_tx);
         }
 
+        for tx in txs.clone() {
+            debug!("tx: {:?}", tx);
+        }
         // 5. Create Bid object
         let bid = Bid {
             builder,
@@ -125,6 +162,7 @@ impl MevApiImpl {
             committed: false,
             bid_hash: bid_hash,
         };
+        debug!("bid: {:?}", bid);
 
         Ok(bid)
     }

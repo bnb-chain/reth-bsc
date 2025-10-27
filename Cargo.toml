@@ -13,42 +13,41 @@ name = "reth-bsc"
 path = "src/main.rs"
 
 [dependencies]
-reth = { path = "/Users/constbh/rustRepo/reth/bin/reth" }
-reth-cli = { path = "/Users/constbh/rustRepo/reth/crates/cli/cli" }
-reth-cli-commands = { path = "/Users/constbh/rustRepo/reth/crates/cli/commands" }
-reth-basic-payload-builder = { path = "/Users/constbh/rustRepo/reth/crates/payload/basic" }
-reth-db = { path = "/Users/constbh/rustRepo/reth/crates/storage/db" }
-reth-engine-local = { path = "/Users/constbh/rustRepo/reth/crates/engine/local" }
-reth-chainspec = { path = "/Users/constbh/rustRepo/reth/crates/chainspec" }
-reth-cli-util = { path = "/Users/constbh/rustRepo/reth/crates/cli/util" }
-reth-discv4 = { path = "/Users/constbh/rustRepo/reth/crates/net/discv4", features = ["test-utils"] }
-reth-engine-primitives = { path = "/Users/constbh/rustRepo/reth/crates/engine/primitives" }
-reth-ethereum-forks = { path = "/Users/constbh/rustRepo/reth/crates/ethereum/hardforks", features = ["serde"] }
-reth-ethereum-payload-builder = { path = "/Users/constbh/rustRepo/reth/crates/ethereum/payload" }
-reth-ethereum-primitives = { path = "/Users/constbh/rustRepo/reth/crates/ethereum/primitives" }
-reth-eth-wire = { path = "/Users/constbh/rustRepo/reth/crates/net/eth-wire" }
-reth-eth-wire-types = { path = "/Users/constbh/rustRepo/reth/crates/net/eth-wire-types" }
-reth-evm = { path = "/Users/constbh/rustRepo/reth/crates/evm/evm" }
-reth-evm-ethereum = { path = "/Users/constbh/rustRepo/reth/crates/ethereum/evm" }
-reth-node-core = { path = "/Users/constbh/rustRepo/reth/crates/node/core" }
-reth-revm = { path = "/Users/constbh/rustRepo/reth/crates/revm" }
-reth-network = { path = "/Users/constbh/rustRepo/reth/crates/net/network", features = ["test-utils"] }
-reth-network-p2p = { path = "/Users/constbh/rustRepo/reth/crates/net/p2p" }
-reth-network-api = { path = "/Users/constbh/rustRepo/reth/crates/net/network-api" }
-reth-node-ethereum = { path = "/Users/constbh/rustRepo/reth/crates/ethereum/node", features = ["test-utils"] }
-reth-network-peers = { path = "/Users/constbh/rustRepo/reth/crates/net/peers" }
-reth-payload-primitives = { path = "/Users/constbh/rustRepo/reth/crates/payload/primitives" }
-reth-ethereum-engine-primitives = { path = "/Users/constbh/rustRepo/reth/crates/ethereum/engine-primitives" }
-reth-primitives = { path = "/Users/constbh/rustRepo/reth/crates/primitives" }
-reth-primitives-traits = { path = "/Users/constbh/rustRepo/reth/crates/primitives-traits" }
-reth-provider = { path = "/Users/constbh/rustRepo/reth/crates/storage/provider", features = ["test-utils"] }
-reth-rpc-api = { path = "/Users/constbh/rustRepo/reth/crates/rpc/rpc-api" }
-reth-rpc-eth-api = { path = "/Users/constbh/rustRepo/reth/crates/rpc/rpc-eth-api" }
-reth-rpc-engine-api = { path = "/Users/constbh/rustRepo/reth/crates/rpc/rpc-engine-api" }
-reth-tracing = { path = "/Users/constbh/rustRepo/reth/crates/tracing" }
-reth-trie-common = { path = "/Users/constbh/rustRepo/reth/crates/trie/common" }
-reth-trie-db = { path = "/Users/constbh/rustRepo/reth/crates/trie/db" }
-reth-tasks = { path = "/Users/constbh/rustRepo/reth/crates/tasks" }
+reth = { git = "https://github.com/bnb-chain/reth.git", branch = "validator-dev" }
+reth-cli = { git = "https://github.com/bnb-chain/reth.git", branch = "validator-dev" }
+reth-cli-commands = { git = "https://github.com/bnb-chain/reth.git", branch = "validator-dev" }
+reth-basic-payload-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "validator-dev" }
+reth-db = { git = "https://github.com/bnb-chain/reth.git", branch = "validator-dev" }
+reth-engine-local = { git = "https://github.com/bnb-chain/reth.git", branch = "validator-dev" }
+reth-chainspec = { git = "https://github.com/bnb-chain/reth.git", branch = "validator-dev" }
+reth-cli-util = { git = "https://github.com/bnb-chain/reth.git", branch = "validator-dev" }
+reth-discv4 = { git = "https://github.com/bnb-chain/reth.git", branch = "validator-dev", features = ["test-utils"] }
+reth-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "validator-dev" }
+reth-ethereum-forks = { git = "https://github.com/bnb-chain/reth.git", branch = "validator-dev", features = ["serde"] }
+reth-ethereum-payload-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "validator-dev" }
+reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "validator-dev" }
+reth-eth-wire = { git = "https://github.com/bnb-chain/reth.git", branch = "validator-dev" }
+reth-eth-wire-types = { git = "https://github.com/bnb-chain/reth.git", branch = "validator-dev" }
+reth-evm = { git = "https://github.com/bnb-chain/reth.git", branch = "validator-dev" }
+reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "validator-dev" }
+reth-node-core = { git = "https://github.com/bnb-chain/reth.git", branch = "validator-dev" }
+reth-revm = { git = "https://github.com/bnb-chain/reth.git", branch = "validator-dev" }
+reth-network = { git = "https://github.com/bnb-chain/reth.git", branch = "validator-dev", features = ["test-utils"] }
+reth-network-p2p = { git = "https://github.com/bnb-chain/reth.git", branch = "validator-dev" }
+reth-network-api = { git = "https://github.com/bnb-chain/reth.git", branch = "validator-dev" }
+reth-node-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "validator-dev", features = ["test-utils"] }
+reth-network-peers = { git = "https://github.com/bnb-chain/reth.git", branch = "validator-dev" }
+reth-payload-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "validator-dev" }
+reth-ethereum-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "validator-dev" }
+reth-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "validator-dev" }
+reth-primitives-traits = { git = "https://github.com/bnb-chain/reth.git", branch = "validator-dev" }
+reth-provider = { git = "https://github.com/bnb-chain/reth.git", branch = "validator-dev", features = ["test-utils"] }
+reth-rpc-eth-api = { git = "https://github.com/bnb-chain/reth.git", branch = "validator-dev" }
+reth-rpc-engine-api = { git = "https://github.com/bnb-chain/reth.git", branch = "validator-dev" }
+reth-tracing = { git = "https://github.com/bnb-chain/reth.git", branch = "validator-dev" }
+reth-trie-common = { git = "https://github.com/bnb-chain/reth.git", branch = "validator-dev" }
+reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", branch = "validator-dev" }
+reth-tasks = { git = "https://github.com/bnb-chain/reth.git", branch = "validator-dev" }
 revm = "28.0.1"
 
 # alloy dependencies
