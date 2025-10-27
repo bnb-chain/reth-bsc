@@ -10,7 +10,7 @@ use reth::payload::EthPayloadBuilderAttributes;
 use crate::hardforks::BscHardforks;
 use reth_chainspec::EthChainSpec;
 use crate::node::evm::pre_execution::VALIDATOR_CACHE;
-use crate::node::miner::signer::seal_header_with_global_signer;
+use crate::node::miner::signer::{seal_header_with_global_signer, SignerError};
 use crate::node::miner::bsc_miner::MiningContext;
 
 pub fn prepare_new_attributes(ctx: &mut MiningContext, parlia: Arc<Parlia<BscChainSpec>>, parent_snap: &Snapshot, parent_header: &Header, signer: Address) -> EthPayloadBuilderAttributes {
@@ -58,14 +58,22 @@ where
     if new_header.extra_data.len() < EXTRA_VANITY_LEN {
         new_header.extra_data = Bytes::from(vec![0u8; EXTRA_VANITY_LEN]);
     }
+    // TODO: add vanity data, and fork hash.
+    // set default header extra with Reth version.
+    // extra, _ = rlp.EncodeToBytes([]interface{}{
+    // 	uint(gethversion.Major<<16 | gethversion.Minor<<8 | gethversion.Patch),
+    // 	"geth",
+    // 	runtime.Version(),
+    // 	runtime.GOOS,
+    // })
 
     {   // prepare validators
         let epoch_length = parlia.get_epoch_length(new_header);
         if (new_header.number).is_multiple_of(epoch_length) {
             let mut validators: Option<(Vec<Address>, Vec<crate::consensus::parlia::VoteAddress>)> = None;
             let mut cache = VALIDATOR_CACHE.lock().unwrap();
-            if let Some(cached_result) = cache.get(&parent_header.number) {
-                tracing::debug!("Succeed to query cached validator result, block_number: {}", parent_header.number);
+            if let Some(cached_result) = cache.get(&parent_header.hash_slow()) {
+                tracing::debug!("Succeed to query cached validator result, block_number: {}, block_hash: {}", parent_header.number, parent_header.hash_slow());
                 validators = Some(cached_result.clone());
             }
             
@@ -76,8 +84,12 @@ where
     {   // prepare turn length
         parlia.prepare_turn_length(parent_snap, turn_length, new_header);
     }
-
-    // todo: assembleVoteAttestation
+    
+    // TODO: add BEP-590 changes in fermi hardfork later, it changes the assemble and verify logic.
+    if let Err(e) = parlia.assemble_vote_attestation(parent_snap, parent_header, new_header) {
+        tracing::debug!(target: "parlia::miner", "Assemble vote attestation failed: {e:?}");
+        return Err(SignerError::SigningFailed(format!("Assemble vote attestation failed: {e:?}")));
+    }
 
     {   // seal header
         let mut extra_data = new_header.extra_data.to_vec();

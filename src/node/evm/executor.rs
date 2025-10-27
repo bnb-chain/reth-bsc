@@ -277,13 +277,14 @@ where
         // set state clear flag if the block is after the Spurious Dragon hardfork.
         let state_clear_flag = self.spec.is_spurious_dragon_active_at_block(self.evm.block().number.to());
         self.evm.db_mut().set_state_clear_flag(state_clear_flag);
-
-        if !self.spec.is_feynman_active_at_timestamp(self.evm.block().number.to::<u64>(), self.evm.block().timestamp.to::<u64>() - 3) {
+        let parent_timestamp = self.inner_ctx.parent_header.as_ref().unwrap().timestamp;
+        // Note: here use a parent timestamp to check if the feynman fork is active. 
+        if !self.spec.is_feynman_active_at_timestamp(self.evm.block().number.to::<u64>(), parent_timestamp) {
             self.upgrade_contracts()?;
         }
      
         // enable BEP-440/EIP-2935 for historical block hashes from state
-        if self.spec.is_prague_transition_at_block_and_timestamp(self.evm.block().number.to::<u64>(), self.evm.block().timestamp.to::<u64>(),self.evm.block().timestamp.to::<u64>() - 3) {
+        if self.spec.is_prague_transition_at_block_and_timestamp(self.evm.block().number.to::<u64>(), self.evm.block().timestamp.to::<u64>(), parent_timestamp) {
                 self.apply_history_storage_account(self.evm.block().number.to::<u64>())?;
         }
         if self.spec.is_prague_active_at_block_and_timestamp(self.evm.block().number.to::<u64>(), self.evm.block().timestamp.to::<u64>()) {
@@ -414,16 +415,21 @@ where
         if self.evm.block().number == uint!(1U256) {
             self.deploy_genesis_contracts(self.evm.block().beneficiary)?;
         }
-
-        if self.spec.is_feynman_active_at_timestamp(self.evm.block().number.to::<u64>(), self.evm.block().timestamp.to::<u64>() - 3) {
+        let parent_timestamp = self.inner_ctx.parent_header.as_ref().unwrap().timestamp;
+        // Note: here use a parent timestamp to check if the feynman fork is active. 
+        if self.spec.is_feynman_active_at_timestamp(self.evm.block().number.to::<u64>(), parent_timestamp) {
             self.upgrade_contracts()?;
         }
 
-        if self.spec.is_feynman_active_at_timestamp(self.evm.block().number.to::<u64>(), self.evm.block().timestamp.to()) &&
-            !self
-                .spec
-                .is_feynman_active_at_timestamp(self.evm.block().number.to::<u64>() - 1, self.evm.block().timestamp.to::<u64>() - 3)
-        {
+        // TODO: add nano block list check
+        // if self.spec.is_nano_active_at_block(block_env.number.to::<u64>()) {
+            // for receipt in self.receipts.iter() {
+            //     NANO_BLACK_LIST.contains(&receipt.contract_address) {
+            //         return Err(BlockExecutionError::other("History storage address is not allowed"));
+            //     }
+            // }
+        // }
+        if self.spec.is_feynman_transition_at_timestamp(self.evm.block().number.to::<u64>(), self.evm.block().timestamp.to::<u64>(), parent_timestamp) {
             self.initialize_feynman_contracts(self.evm.block().beneficiary)?;
         }
 

@@ -102,8 +102,12 @@ where
                     let committed = event.committed();
                     let tip = committed.tip();
                     debug!(
-                        "try new work, tip_block: {}, committed_blocks: {}",
+                        "try new work, tip_block={}, hash={}, parent_hash={}, miner={}, diff={}, committed_blocks={}",
                         committed.tip().number(),
+                        format!("0x{:x}", committed.tip().hash()),
+                        format!("0x{:x}", committed.tip().parent_hash()),
+                        committed.tip().beneficiary(),
+                        committed.tip().difficulty(),
                         committed.len()
                     );
                     let tip_header = tip.clone_sealed_header();
@@ -489,6 +493,8 @@ where
                sealed_block.gas_used(),
                turn_status);
 
+        // TODO: wait more times when huge chain import.
+        // TODO: only canonical head can broadcast, avoid sidechain blocks.
         let parent_number = block_number.saturating_sub(1);
         let parent_td = self.provider.header_td_by_number(parent_number)
             .map_err(|e| format!("Failed to get parent total difficulty due to {}", e))?
