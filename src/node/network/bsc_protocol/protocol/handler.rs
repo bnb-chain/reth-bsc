@@ -7,6 +7,7 @@ use tokio::sync::mpsc;
 use super::proto::{BscProtoMessage};
 use crate::node::network::bsc_protocol::stream::{BscProtocolConnection};
 use crate::node::network::bsc_protocol::registry;
+use reth_network::Peers;
 
 #[derive(Clone, Debug, Default)]
 pub struct BscProtocolHandler;
@@ -52,8 +53,13 @@ impl ConnectionHandler for BscConnectionHandler {
         // when available. However, reth passes `_peer_id` which we can use.
         // Even if the connection drops, failed sends will lazily clean up entries.
         registry::register_peer(_peer_id, tx);
-        // EVN: mark this peer if present in whitelist
+        // EVN: mark this peer if present in whitelist and mark as trusted at runtime
         crate::node::network::evn_peers::mark_evn_if_whitelisted(_peer_id);
+        if crate::node::network::evn_peers::is_evn_peer(_peer_id) {
+            if let Some(net) = crate::shared::get_network_handle() {
+                net.add_trusted_peer_id(_peer_id);
+            }
+        }
         // Ensure EVN refresh listener is running to handle post-sync EVN updates
         // for existing peers.
         crate::node::network::bsc_protocol::registry::spawn_evn_refresh_listener();
