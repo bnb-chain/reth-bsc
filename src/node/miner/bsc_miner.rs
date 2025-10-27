@@ -38,6 +38,7 @@ use reth_network::message::NewBlockMessage;
 use alloy_rlp::Encodable;
 use alloy_primitives::keccak256;
 use crate::node::miner::bid_simulator::BidSimulator;
+use std::time::Duration;
 
 pub struct MiningContext {
     pub header: Option<reth_primitives::Header>, // tmp header for payload building.
@@ -456,6 +457,47 @@ where
     }
 }
 
+pub struct MevWorkWorker<Provider> {
+    simulator: Arc<parking_lot::RwLock<BidSimulator<Provider>>>,
+}
+
+impl<Provider> MevWorkWorker<Provider>
+where
+    Provider: HeaderProvider<Header = alloy_consensus::Header>
+        + BlockNumReader
+        + reth_provider::StateProviderFactory
+        + CanonStateSubscriptions
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+{
+    pub fn new(
+        simulator: Arc<parking_lot::RwLock<BidSimulator<Provider>>>,
+    ) -> Self {
+        Self { simulator }
+    }
+
+    pub async fn run(self) {
+        info!("Starting MevWorkWorker");
+        loop {
+            // Interval for checking bid packages
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            // Attempt to send bids
+            self.send_bid();
+        }
+    }
+
+    /// Send a bid to the miner's bid simulator (reads from global queue)
+    fn send_bid(&self) {
+        // Read bid packages from the global queue
+        if let Some(bid_package) = crate::shared::pop_bid_package() {
+            let mut simulator = self.simulator.write();
+            simulator.commit_new_bid(bid_package);
+        }
+    }
+}
+
 /// Miner that handles block production for BSC.
 pub struct BscMiner<Pool, Provider> {
     validator_address: Address,
@@ -463,6 +505,7 @@ pub struct BscMiner<Pool, Provider> {
     new_work_worker: NewWorkWorker<Provider>,
     main_work_worker: MainWorkWorker<Pool, Provider>,
     result_work_worker: ResultWorkWorker<Provider>,
+    mev_work_worker: MevWorkWorker<Provider>,
     task_executor: TaskExecutor,
     simulator: Arc<parking_lot::RwLock<BidSimulator<Provider>>>,
     snapshot_provider: Arc<dyn SnapshotProvider + Send + Sync>,
@@ -549,12 +592,17 @@ where
             payload_rx,
         );
         
+        let mev_work_worker = MevWorkWorker::new(
+            simulator.clone(),
+        );
+
         let miner = Self {
             validator_address,
             signing_key,
             new_work_worker,
             main_work_worker,
             result_work_worker,
+            mev_work_worker,
             task_executor,
             simulator,
             snapshot_provider,
@@ -626,20 +674,9 @@ where
         self.task_executor.spawn_critical("new_work_worker", self.new_work_worker.run());
         self.task_executor.spawn_critical("main_work_worker", self.main_work_worker.run());
         self.task_executor.spawn_critical("result_work_worker", self.result_work_worker.run());
+        self.task_executor.spawn_critical("mev_work_worker", self.mev_work_worker.run());
         info!("Succeed to start mining, address: {}", self.validator_address);
         Ok(())
-    }
-
-    /// Send a bid to the miner's bid simulator
-    pub fn send_bid(
-        &self,
-        bid_package: crate::node::miner::bid_simulator::NewBidPackage,
-    ) {
-        let simulator = Arc::clone(&self.simulator);
-        self.task_executor.spawn(Box::pin(async move {
-            let mut simulator = simulator.write();
-            simulator.commit_new_bid(bid_package);
-        }));
     }
 
     /// Check if a bid is already pending

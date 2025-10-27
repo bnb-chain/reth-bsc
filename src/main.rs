@@ -101,6 +101,9 @@ fn main() -> eyre::Result<()> {
         std::env::set_var("RUST_BACKTRACE", "1");
     }
 
+    // Initialize bid package queue at startup
+    reth_bsc::shared::init_bid_package_queue();
+
     Cli::<BscChainSpecParser, BscCliArgs>::parse().run_with_components::<BscNode>(
         |spec| (BscEvmConfig::new(spec.clone()), BscConsensus::new(spec)),
         async move |builder, args| {
@@ -258,6 +261,25 @@ fn main() -> eyre::Result<()> {
                         ctx.modules.merge_configured(parlia_api.into_rpc())?;
 
                         tracing::info!("Succeed to register Parlia RPC API");
+                        Ok(())
+                    }).extend_rpc_modules(move |ctx| {
+                        tracing::info!("Start to register MEV RPC API: mev_sendBid");
+                        use reth_bsc::rpc::mev::{MevApiImpl, MevFullApiServer};
+                        
+                        // Get snapshot provider and chain spec for MEV API
+                        let snapshot_provider = if let Some(provider) = reth_bsc::shared::get_snapshot_provider() {
+                            provider.clone()
+                        } else {
+                            tracing::warn!("Snapshot provider not available, MEV RPC API not registered");
+                            return Ok(());
+                        };
+                        
+                        // Get chain spec from context
+                        let chain_spec = std::sync::Arc::new(ctx.config().chain.clone().as_ref().clone());
+                        
+                        let mev_api = MevApiImpl::new(snapshot_provider, chain_spec);
+                        ctx.modules.merge_configured(mev_api.into_rpc())?;
+                        tracing::info!("Succeed to register MEV RPC API");
                         Ok(())
                     })
                     .launch().await?;
