@@ -112,7 +112,7 @@ where
             match engine.new_payload(payload).await {
                 Ok(payload_status) => match payload_status.status {
                     PayloadStatusEnum::Valid => {
-                        tracing::debug!(target: "bsc::block_import", "New payload is valid: block = {:?}, peer_id = {:?}", block, peer_id);
+                        tracing::debug!(target: "bsc::block_import", "New payload is valid, block = {:?}, peer_id = {:?}", block, peer_id);
                         // handle fork choice update with valid payload
                         if let Err(e) = Self::update_fork_choice(engine, consensus, header).await {
                             tracing::warn!(target: "bsc::block_import", "Failed to update fork choice: {}", e);
@@ -138,12 +138,13 @@ where
         consensus: Arc<ParliaConsensus<Provider>>,
         new_header: Header) -> Result<(), ParliaConsensusErr> {
         let last_canonical_number = consensus.provider.last_block_number()?;
+        tracing::debug!(target: "parlia", "Last canonical number: {:?}, new_header = {:?}", last_canonical_number, new_header);
         let current_head = consensus.provider.header_by_number(last_canonical_number)?.ok_or(ParliaConsensusErr::HeadHashNotFound)?;
         let new_canonical_head = consensus.canonical_head(&new_header, &current_head)?;
         // get safe block and finalized block with new canonical head
         // ref: https://github.com/bnb-chain/bsc/blob/f70aaa8399ccee429804eecf3fc4c6fd8d9e6cab/eth/api_backend.go#L72
-        let (_, safe_block_hash) = consensus.get_justified_number_and_hash(new_canonical_head).unwrap_or((0, B256::ZERO));
-        let (_, finalized_block_hash) = consensus.get_finalized_number_and_hash(new_canonical_head).unwrap_or((0, B256::ZERO));
+        let (safe_block_number, safe_block_hash) = consensus.get_justified_number_and_hash(new_canonical_head).unwrap_or((0, B256::ZERO));
+        let (finalized_block_number, finalized_block_hash) = consensus.get_finalized_number_and_hash(new_canonical_head).unwrap_or((0, B256::ZERO));
         let state = ForkchoiceState {
             head_block_hash: new_canonical_head.hash_slow(),
             safe_block_hash,

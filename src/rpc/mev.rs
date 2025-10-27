@@ -160,7 +160,7 @@ impl MevApiImpl {
             gas_fee: bid_args.raw_bid.gas_fee,
             builder_fee: bid_args.raw_bid.builder_fee,
             committed: false,
-            bid_hash: bid_hash,
+            bid_hash,
         };
         debug!("bid: {:?}", bid);
 

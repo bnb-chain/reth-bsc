@@ -203,7 +203,7 @@ where
         if !self.chain_spec.is_plato_active_at_block(header.number) {
             return None;
         }
-        // Decode vote attestations from headers (post-Luban) to extract justified numbers.
+        // Decode vote attestations from headers (post-Luban) to extract finalized numbers.
         // Use Parlia helper that understands header layout across hardforks.
         // Fast finality must use snapshot provider; if unavailable, skip FF.
         let sp = match shared::get_snapshot_provider() {

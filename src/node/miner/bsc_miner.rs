@@ -40,10 +40,18 @@ use alloy_primitives::keccak256;
 use crate::node::miner::bid_simulator::BidSimulator;
 use std::time::Duration;
 
+#[derive(Clone)]
 pub struct MiningContext {
     pub header: Option<reth_primitives::Header>, // tmp header for payload building.
     pub parent_header: reth_primitives::SealedHeader,
     pub parent_snapshot: Arc<crate::consensus::parlia::snapshot::Snapshot>,
+}
+
+#[derive(Clone)]
+pub struct SubmitContext {
+    pub mining_ctx: MiningContext,
+    pub payload: BscBuiltPayload,
+    pub cancel: ManualCancel,
 }
 
 /// NewWorkWorker responsible for listening to canonical state changes and triggering mining.
@@ -96,8 +104,12 @@ where
                     let committed = event.committed();
                     let tip = committed.tip();
                     debug!(
-                        "try new work, tip_block: {}, committed_blocks: {}",
+                        "try new work, tip_block={}, hash={}, parent_hash={}, miner={}, diff={}, committed_blocks={}",
                         committed.tip().number(),
+                        format!("0x{:x}", committed.tip().hash()),
+                        format!("0x{:x}", committed.tip().parent_hash()),
+                        committed.tip().beneficiary(),
+                        committed.tip().difficulty(),
                         committed.len()
                     );
                     let tip_header = tip.clone_sealed_header();
@@ -157,11 +169,8 @@ where
             return;
         }
         
-        // TODO: remove it later, now just for easy to debug.
-        // TODO: support backoff if not inturn.
         if !parent_snapshot.is_inturn(self.validator_address) {
-            debug!("Skip to produce due to is not inturn, validator: {}, tip: {}", self.validator_address, tip.number());
-            return;
+            debug!("Try off-turn mining, validator: {}, next_block: {}", self.validator_address, tip.number() + 1);
         }
 
         let mining_ctx = MiningContext {
@@ -186,7 +195,7 @@ pub struct MainWorkWorker<Pool, Provider> {
     chain_spec: Arc<crate::chainspec::BscChainSpec>,
     parlia: Arc<crate::consensus::parlia::Parlia<crate::chainspec::BscChainSpec>>,
     mining_queue_rx: mpsc::UnboundedReceiver<MiningContext>,
-    payload_tx: mpsc::UnboundedSender<BscBuiltPayload>,
+    payload_tx: mpsc::UnboundedSender<SubmitContext>,
     running_job_handle: Option<BscPayloadJobHandle>,
     payload_job_join_set: JoinSet<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
     simulator: Arc<BidSimulator<Provider>>,  // No outer RwLock, each map has its own lock
@@ -206,6 +215,7 @@ where
         + Sync
         + 'static,
 {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         validator_address: Address,
         pool: Pool,
@@ -213,8 +223,8 @@ where
         chain_spec: Arc<crate::chainspec::BscChainSpec>,
         parlia: Arc<crate::consensus::parlia::Parlia<crate::chainspec::BscChainSpec>>,
         mining_queue_rx: mpsc::UnboundedReceiver<MiningContext>,
-        payload_tx: mpsc::UnboundedSender<BscBuiltPayload>,
         simulator: Arc<BidSimulator<Provider>>,  // No outer RwLock needed
+        payload_tx: mpsc::UnboundedSender<SubmitContext>,
     ) -> Self {
         Self {
             pool,
@@ -225,8 +235,8 @@ where
             mining_queue_rx,
             payload_tx,
             running_job_handle: None,
-            payload_job_join_set: JoinSet::new(),
             simulator,
+            payload_job_join_set: JoinSet::new(),
         }
     }
 
@@ -306,8 +316,8 @@ where
             mining_ctx,
             payload_builder, 
             build_args, 
-            self.payload_tx.clone(),
             self.simulator.clone(),
+            self.payload_tx.clone(),
         );
         
         let start_time = std::time::Instant::now();
@@ -349,44 +359,117 @@ pub struct ResultWorkWorker<Provider> {
     /// Parlia consensus engine
     parlia: Arc<crate::consensus::parlia::Parlia<crate::chainspec::BscChainSpec>>,
     /// Receiver for built payloads
-    payload_rx: mpsc::UnboundedReceiver<BscBuiltPayload>,
+    payload_rx: mpsc::UnboundedReceiver<SubmitContext>,
+    /// Receiver for delayed payloads
+    delay_submit_rx: mpsc::UnboundedReceiver<BscBuiltPayload>,
+    /// Sender for delayed payloads
+    delay_submit_tx: mpsc::UnboundedSender<BscBuiltPayload>,
 }
 
 impl<Provider> ResultWorkWorker<Provider>
 where
-    Provider: HeaderProvider + BlockNumReader + Send + Sync,
+    Provider: HeaderProvider + BlockNumReader + Send + Sync + Clone + 'static,
 {
     /// Creates a new ResultWorkWorker instance
     pub fn new(
         validator_address: Address,
         provider: Provider,
         parlia: Arc<crate::consensus::parlia::Parlia<crate::chainspec::BscChainSpec>>,
-        payload_rx: mpsc::UnboundedReceiver<BscBuiltPayload>,
+        payload_rx: mpsc::UnboundedReceiver<SubmitContext>,
     ) -> Self {
+        let (delay_submit_tx, delay_submit_rx) = mpsc::unbounded_channel::<BscBuiltPayload>();
         Self {
             validator_address,
             provider,
             parlia,
             payload_rx,
+            delay_submit_tx,
+            delay_submit_rx,
         }
+    }
+
+    /// Create and start a delay submit task
+    fn start_delay_task(
+        payload: BscBuiltPayload,
+        delay_ms: u64,
+        delay_submit_tx: mpsc::UnboundedSender<BscBuiltPayload>,
+        cancel: ManualCancel,
+    ) {
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+            if !cancel.is_cancelled() {
+                if let Err(e) = delay_submit_tx.send(payload) {
+                    error!("Failed to send delayed payload to channel: {}", e);
+                }
+            } else {
+                debug!("Delay submit task is cancelled, block_hash: {}, block_number: {}", 
+                    payload.block().hash(), payload.block().number());
+            }
+        });
     }
 
     /// Run the result worker to process and submit payloads
     pub async fn run(mut self) {
         info!("Starting ResultWorkWorker for validator: {}", self.validator_address);
 
-        while let Some(payload) = self.payload_rx.recv().await {
-            let block_number = payload.block().number();
-            let block_hash = payload.block().hash();
-            
-            debug!("Received payload for submission, block {} (hash: 0x{:x})", block_number, block_hash);
-            
-            match self.submit_payload(payload).await {
-                Ok(()) => {
-                    info!("Succeed to submit block {} (hash: 0x{:x})", block_number, block_hash);
+        loop {
+            tokio::select! {
+                submit_ctx = self.payload_rx.recv() => {
+                    match submit_ctx {
+                        Some(submit_ctx) => {
+                            let payload = submit_ctx.payload;
+                            let block_number = payload.block().number();
+                            let block_hash = payload.block().hash();
+                            let delay_ms = self.parlia.delay_for_ramanujan_fork(&submit_ctx.mining_ctx.parent_snapshot, payload.block().header());
+                            debug!("Check submit delay, block {} (hash: 0x{:x}), delay_ms: {}", block_number, block_hash, delay_ms);
+                            if delay_ms == 0 {
+                                match self.submit_payload(payload).await {
+                                    Ok(()) => {
+                                        info!("Succeed to submit block {} (hash: 0x{:x})", block_number, block_hash);
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to submit block {} (hash: 0x{:x}): {}", block_number, block_hash, e);
+                                    }
+                                }
+                            } else {
+                                Self::start_delay_task(
+                                    payload,
+                                    delay_ms,
+                                    self.delay_submit_tx.clone(),
+                                    submit_ctx.cancel.clone(),
+                                );
+                                info!(
+                                    "Block {} scheduled for delayed submission in {}ms",
+                                    block_number, delay_ms
+                                );
+                            }
+                        }
+                        None => {
+                            warn!("Main payload channel closed, stopping ResultWorkWorker");
+                            break;
+                        }
+                    }
                 }
-                Err(e) => {
-                    error!("Failed to submit block {} (hash: 0x{:x}): {}", block_number, block_hash, e);
+                
+                delayed_payload = self.delay_submit_rx.recv() => {
+                    match delayed_payload {
+                        Some(payload) => {
+                            let block_number = payload.block().number();
+                            let block_hash = payload.block().hash();                            
+                            match self.submit_payload(payload).await {
+                                Ok(()) => {
+                                    info!("Succeed to submit delayed block {} (hash: 0x{:x})", block_number, block_hash);
+                                }
+                                Err(e) => {
+                                    error!("Failed to submit delayed block {} (hash: 0x{:x}): {}", block_number, block_hash, e);
+                                }
+                            }
+                        }
+                        None => {
+                            warn!("Delay payload channel closed, stopping ResultWorkWorker");
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -398,27 +481,28 @@ where
     async fn submit_payload(&self, payload: BscBuiltPayload) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let sealed_block = payload.block();
         let block_number = sealed_block.number();
+        if block_number <= self.provider.last_block_number()? {
+            debug!("Skip to submit block due to block number is less than last block number, block_number: {}, last_block_number: {}", 
+                block_number, self.provider.last_block_number()?);
+            return Ok(());
+        }
+
         let block_hash = sealed_block.hash();
-        
-        debug!("Submitting block {} (hash: 0x{:x}, txs: {}, gas_used: {})", 
+        let difficulty = sealed_block.header().difficulty();
+        let turn_status = if difficulty == crate::consensus::parlia::constants::DIFF_INTURN { 
+            "inturn" 
+        } else { 
+            "offturn" 
+        };
+        debug!("Submitting block {} (hash: 0x{:x}, txs: {}, gas_used: {}, turn_status: {})", 
                block_number, 
                block_hash, 
                sealed_block.body().transaction_count(),
-               sealed_block.gas_used());
+               sealed_block.gas_used(),
+               turn_status);
 
-        // Check if block timestamp is in the future and wait if necessary
-        // now is focus on the basic workflow.
-        // TODO: refine it later. https://github.com/bnb-chain/bsc/blob/master/consensus/parlia/parlia.go#L1702.
-        let present_timestamp = self.parlia.present_timestamp();
-        if sealed_block.header().timestamp > present_timestamp {
-            let delay_ms = (sealed_block.header().timestamp - present_timestamp) * 1000;
-            info!(
-                "Block {} timestamp is in the future, waiting {}ms before submission",
-                block_number, delay_ms
-            );
-            tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
-        }
-
+        // TODO: wait more times when huge chain import.
+        // TODO: only canonical head can broadcast, avoid sidechain blocks.
         let parent_number = block_number.saturating_sub(1);
         let parent_td = self.provider.header_td_by_number(parent_number)
             .map_err(|e| format!("Failed to get parent total difficulty due to {}", e))?
@@ -566,7 +650,7 @@ where
         }
         
         let (mining_queue_tx, mining_queue_rx) = mpsc::unbounded_channel::<MiningContext>();
-        let (payload_tx, payload_rx) = mpsc::unbounded_channel::<BscBuiltPayload>();
+        let (payload_tx, payload_rx) = mpsc::unbounded_channel::<SubmitContext>();
         
         let new_work_worker = NewWorkWorker::new(
             validator_address,
@@ -585,8 +669,8 @@ where
             chain_spec.clone(),
             parlia.clone(),
             mining_queue_rx,
-            payload_tx,
             simulator.clone(),
+            payload_tx,
         );
         
         let result_work_worker = ResultWorkWorker::new(

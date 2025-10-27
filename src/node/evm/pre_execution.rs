@@ -10,7 +10,7 @@ use revm::{
     primitives::{Address, Bytes, TxKind, U256},
 };
 use alloy_consensus::{TxReceipt, Header, BlockHeader};
-use alloy_primitives::B256;
+use alloy_primitives::{BlockHash, BlockNumber, B256};
 use crate::consensus::parlia::{VoteAddress, Snapshot, Parlia, DIFF_INTURN, DIFF_NOTURN};
 use crate::consensus::parlia::util::{is_breathe_block, calculate_millisecond_timestamp, debug_header};
 use crate::consensus::parlia::vote::MAX_ATTESTATION_EXTRA_LENGTH;
@@ -28,7 +28,7 @@ use bit_set::BitSet;
 
 const BLST_DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
 
-type ValidatorCache = LruMap<u64, (Vec<Address>, Vec<VoteAddress>), ByLength>;
+type ValidatorCache = LruMap<BlockHash, (Vec<Address>, Vec<VoteAddress>), ByLength>;
 
 pub static VALIDATOR_CACHE: LazyLock<Mutex<ValidatorCache>> = LazyLock::new(|| {
     Mutex::new(LruMap::new(ByLength::new(1024)))
@@ -82,7 +82,8 @@ where
 
         let epoch_length = self.parlia.get_epoch_length(&header);
         if header.number.is_multiple_of(epoch_length) {
-            let (validator_set, vote_addresses) = self.get_current_validators(header.number-1 /*mostly in cache*/)?;
+            // TODO: need fix it later, it may got error when restart the node?
+            let (validator_set, vote_addresses) = self.get_current_validators(header.number-1, header.parent_hash)?;
             tracing::debug!("validator_set: {:?}, vote_addresses: {:?}", validator_set, vote_addresses);
             
             let vote_addrs_map = if vote_addresses.is_empty() {
@@ -150,13 +151,14 @@ where
 
     pub(crate) fn get_current_validators(
         &mut self, 
-        block_number: u64
+        block_number: BlockNumber,
+        block_hash: BlockHash
     ) -> Result<(Vec<Address>, Vec<VoteAddress>), BlockExecutionError> {
         {
             let mut cache = VALIDATOR_CACHE.lock().unwrap();
-            if let Some(cached_result) = cache.get(&block_number) {
-                tracing::debug!("Succeed to query cached validator result, block_number: {}, evm_block_number: {}", 
-                    block_number, self.evm.block().number);
+            if let Some(cached_result) = cache.get(&block_hash) {
+                tracing::debug!("Succeed to query cached validator result, block_number: {}, block_hash: {}, evm_block_number: {}", 
+                block_number, block_hash, self.evm.block().number);
                 return Ok(cached_result.clone());
             }
         }
@@ -174,9 +176,9 @@ where
 
         {
             let mut cache = VALIDATOR_CACHE.lock().unwrap();
-            cache.insert(block_number, result.clone());
-            tracing::debug!("Succeed to update cache, block_number: {}, evm_block_number: {}", 
-                block_number, self.evm.block().number);
+            cache.insert(block_hash, result.clone());
+            tracing::debug!("Succeed to update cache, block_number: {}, block_hash: {}, evm_block_number: {}", 
+                block_number, block_hash, self.evm.block().number);
         }
 
         Ok(result)

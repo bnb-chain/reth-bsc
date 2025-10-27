@@ -42,7 +42,7 @@ pub struct Bid {
 impl Bid
 {
     fn is_committed(&self) -> bool {
-        return self.committed;
+        self.committed
     }
 }
 
@@ -121,7 +121,7 @@ where Client: HeaderProvider<Header = alloy_consensus::Header> + BlockHashReader
             }
         }
         // todo: check pre builder max bid count
-        return true;
+        true
     }
 
     pub fn add_pending_bid(&self, block_number: u64, builder: Address, bid_hash: B256) {
@@ -250,12 +250,12 @@ where Client: HeaderProvider<Header = alloy_consensus::Header> + BlockHashReader
         let mut runtime = BidRuntime::new(_bid.clone(), BscEvmConfig::new(self.chain_spec.clone()), parent_header, attributes);
         let expected_block_reward = _bid.gas_fee;
         let mut expected_validator_reward = expected_block_reward * U256::from(_validator_commission);
-        expected_validator_reward = expected_validator_reward / U256::from(10000u64);
+        expected_validator_reward /= U256::from(10000u64);
         if expected_validator_reward < _bid.builder_fee {
             debug!("BidSimulator: invalid bid, builder fee exceeds validator reward, ignore expected_validator_reward:{} builder_fee:{}", expected_validator_reward, _bid.builder_fee);
             return Err("invalid bid: builder fee exceeds validator reward".into());
         }
-        expected_validator_reward = expected_validator_reward - _bid.builder_fee;
+        expected_validator_reward -= _bid.builder_fee;
         runtime.expected_block_reward = expected_block_reward;
         runtime.expected_validator_reward = expected_validator_reward;
         Ok(runtime)
@@ -330,8 +330,7 @@ where Client: HeaderProvider<Header = alloy_consensus::Header> + BlockHashReader
         // todo: if enable greedy merge, fill bid env with transactions from mempool
 
         // Second commit: pay bid transaction
-        let mut pay_bid_txs = Vec::new();
-        pay_bid_txs.push(pay_bid_tx.unwrap());
+        let pay_bid_txs = vec![pay_bid_tx.unwrap()];
         bid_runtime.commit_transaction(pay_bid_txs, &mut builder);
         
         // Finish the builder
@@ -428,12 +427,7 @@ EvmConfig: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
     }
 
     fn is_expected_better_than(&self, ohter: &BidRuntime<EvmConfig>) -> bool {
-        if self.expected_block_reward >= ohter.expected_block_reward {
-            if self.expected_validator_reward >= ohter.expected_validator_reward {
-                return true;
-            }
-        }
-        return false;
+        self.expected_block_reward >= ohter.expected_block_reward && self.expected_validator_reward >= ohter.expected_validator_reward
     }
 
     fn commit_transaction<B>(&mut self, bid_txs: Vec<TransactionSigned>, builder: &mut B)
@@ -464,11 +458,11 @@ EvmConfig: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
     fn pack_reward(&mut self, validator_commission: u64, system_balance: U256) -> Result<(), Box<dyn std::error::Error>> {
         self.packed_block_reward = system_balance;
         self.packed_validator_reward = self.packed_block_reward * U256::from(validator_commission) / U256::from(10000u64);
-        self.packed_validator_reward = self.packed_validator_reward - self.bid.builder_fee;
+        self.packed_validator_reward -= self.bid.builder_fee;
         Ok(())
     }
 
     fn valid_reward(&self) -> bool {
-        return self.packed_block_reward >= self.expected_block_reward && self.packed_validator_reward >= self.expected_validator_reward;
+        self.packed_block_reward >= self.expected_block_reward && self.packed_validator_reward >= self.expected_validator_reward
     }
 }

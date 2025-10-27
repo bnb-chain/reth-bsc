@@ -1,9 +1,9 @@
 use alloy_primitives::U256;
-use crate::consensus::parlia::Parlia;
+use crate::consensus::parlia::{Parlia, DEFAULT_MIN_GAS_TIP};
 use crate::node::engine::BscBuiltPayload;
 use crate::node::evm::config::BscEvmConfig;
-use crate::node::miner::bsc_miner::MiningContext;
 use crate::node::miner::bid_simulator::BidSimulator;
+use crate::node::miner::bsc_miner::{MiningContext, SubmitContext};
 use reth_provider::StateProviderFactory;
 use reth_revm::{database::StateProviderDatabase, db::State};
 use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
@@ -175,6 +175,8 @@ where
         let base_fee = builder.evm_mut().block().basefee;
         
         let mut sidecars_map = HashMap::new();
+        // TODO: add min gas tip to config.
+        let min_gas_tip = DEFAULT_MIN_GAS_TIP;
         let mut block_blob_count = 0;
 
         // TODO: Calculate blob fee.
@@ -184,6 +186,12 @@ where
         while let Some(pool_tx) = best_tx_list.next() {
             if cancel.is_cancelled() {
                 break;
+            }
+
+            // filter out tx with min gas tip.
+            if pool_tx.effective_tip_per_gas(base_fee).unwrap_or(0_u128) < min_gas_tip {
+                // Skip packaging underpriced transactions, but do not mark them invalid.
+                continue
             }
 
             // ensure we still have capacity for this transaction
@@ -305,7 +313,7 @@ where
         // set sidecars to seal block
         let mut blob_sidecars:Vec<BscBlobTransactionSidecar>= Vec::new();
         let transactions = &sealed_block.body().inner.transactions;
-        debug!("debug payload_builder, block_number: {}, block_hash: {:?}, trx_len: {} , is_cancel: {}", sealed_block.number(), sealed_block.hash(), transactions.len(), cancel.is_cancelled());
+        debug!("debug payload_builder, block_number: {}, block_hash: {:?}, txs: {} gas: {}, fees: {}", sealed_block.number(), sealed_block.hash(), transactions.len(), cumulative_gas_used, total_fees);
         for (index, tx) in transactions.iter().enumerate() {
             debug!("debug payload_builder, transaction {}: hash={:?}, from={:?}, to={:?}, value={:?}, gas_limit={}, gas_price={:?}, nonce={}", 
                 index + 1,
@@ -374,7 +382,7 @@ pub struct BscPayloadJob<Pool, Client, EvmConfig = BscEvmConfig> {
     /// Abort flag
     is_aborted: bool,
     /// Sender for payload results
-    result_tx: mpsc::UnboundedSender<BscBuiltPayload>,
+    result_tx: mpsc::UnboundedSender<SubmitContext>,
     /// Potential payloads vector for selecting the best one
     potential_payloads: Vec<BscBuiltPayload>,
     /// Current build arguments
@@ -400,14 +408,13 @@ where
         mining_ctx: MiningContext,
         builder: BscPayloadBuilder<Pool, Client, EvmConfig>,
         build_args: BscBuildArguments<EthPayloadBuilderAttributes>,
-        result_tx: mpsc::UnboundedSender<BscBuiltPayload>,
         simulator: Arc<BidSimulator<Client>>,  // No outer RwLock needed
+        result_tx: mpsc::UnboundedSender<SubmitContext>,
     ) -> (Self, BscPayloadJobHandle) {
         let (abort_tx, abort_rx) = oneshot::channel();
         let (try_build_tx, try_build_rx) = mpsc::unbounded_channel();
         let mining_delay = parlia.clone().delay_for_mining(
             &mining_ctx.parent_snapshot, 
-            &mining_ctx.parent_header, 
             mining_ctx.header.as_ref().unwrap(), 
             DELAY_LEFT_OVER);
 
@@ -446,19 +453,6 @@ where
 
         loop {
             tokio::select! {
-                // cronjob to get best bid from bid simulator - HIGHEST PRIORITY
-                // _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {
-                //     debug!("Timer triggered: checking best bid from simulator");
-                //     // No outer lock needed - each map has its own fine-grained locks
-                //     let best_bid = self.simulator.get_best_bid(self.mining_ctx.parent_header.hash());
-                //     if let Some(bid) = best_bid {
-                //         info!("Found best bid! block: {}, builder: {:?}, gas_fee: {}", bid.bid.block_number, bid.bid.builder, bid.bid.gas_fee);
-                //         self.potential_payloads.push(bid.bsc_payload);
-                //     } else {
-                //         debug!("No best bid found for parent_hash: {:?}", self.mining_ctx.parent_header.hash());
-                //     }
-                // }
-
                 // Trigger the async build payload by queue.
                 args = self.try_build_rx.recv() => {
                     match args {
@@ -505,16 +499,14 @@ where
                                 info!("Found best bid! block: {}, builder: {:?}, gas_fee: {}", bid.bid.block_number, bid.bid.builder, bid.bid.gas_fee);
                                 self.potential_payloads.push(bid.bsc_payload);
                                 return self.try_return_best_payload();
-                            } else {
-                                debug!("No best bid found for parent_hash: {:?}", self.mining_ctx.parent_header.hash());
                             }
 
                             let mining_delay = self.parlia.delay_for_mining(
                                 &self.mining_ctx.parent_snapshot, 
-                                &self.mining_ctx.parent_header, 
                                 self.mining_ctx.header.as_ref().unwrap(), 
                                 DELAY_LEFT_OVER);
-                            // TODO: check more details and refine it later.
+
+                            // TODO: check more details and refine it later, listen new trxs.
                             // There is still plenty of time left and retry to build payload.
                             if std::time::Duration::from_millis(mining_delay) > elapsed * TIME_MULTIPLIER && self.retries < MAX_RETRIES {
                                 if let Err(err) = self.try_build_tx.send(()) {
@@ -525,7 +517,6 @@ where
                                 debug!("Succeed to send to try build queue, block_number: {}, retries: {}, last_cost_time: {:?}, new_mining_delay: {:?}", 
                                     self.build_args.config.parent_header.number()+1, self.retries, elapsed, std::time::Duration::from_millis(mining_delay));
                             } else {
-                                debug!("block number:{}, retries:{}", self.build_args.config.parent_header.number()+1, self.retries);
                                 return self.try_return_best_payload();
                             }
                             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -573,7 +564,11 @@ where
     /// Try to return the best payload to result channel
     fn try_return_best_payload(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if let Some(best_payload) = self.pick_best_payload() {
-            if let Err(err) = self.result_tx.send(best_payload) {
+            if let Err(err) = self.result_tx.send(SubmitContext {
+                mining_ctx: self.mining_ctx.clone(),
+                payload: best_payload,
+                cancel: self.build_args.cancel.clone(),
+            }) {
                 warn!("Failed to send best payload to result channel: {}", err);
                 return Err(Box::new(BscPayloadJobError::ResultChannelSendError(err.to_string())));
             }

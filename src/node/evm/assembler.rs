@@ -1,13 +1,11 @@
 use crate::{
-    node::evm::config::{BscBlockExecutorFactory, BscBlockExecutionCtx},
-    chainspec::BscChainSpec,
-    consensus::parlia::{SnapshotProvider, Parlia},
-    hardforks::BscHardforks,
+    chainspec::BscChainSpec, consensus::parlia::{Parlia, SnapshotProvider, EMPTY_REQUESTS_HASH, EMPTY_WITHDRAWALS_HASH}, hardforks::BscHardforks, node::evm::config::{BscBlockExecutionCtx, BscBlockExecutorFactory}
 };
 use alloy_consensus::{BlockBody, Header, EMPTY_OMMER_ROOT_HASH, proofs, Transaction, BlockHeader};
-use alloy_primitives::keccak256;
+use alloy_primitives::{keccak256, B256};
 use alloy_eips::{eip7840::BlobParams, merge::BEACON_NONCE};
 use alloy_primitives::Bytes;
+use alloy_rpc_types::Withdrawals;
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_ethereum_primitives::{Receipt, TransactionSigned};
 use reth_evm::{
@@ -81,7 +79,7 @@ where
             execution_ctx: ctx,
             parent,
             transactions,
-            output: BlockExecutionResult { receipts, requests, gas_used },
+            output: BlockExecutionResult { receipts, requests: _, gas_used },
             state_root,
             ..
         } = input;
@@ -94,26 +92,27 @@ where
         let logs_bloom = logs_bloom(receipts.iter().flat_map(|r| &r.logs));
         let block_number = evm_env.block_env.number.saturating_to();
 
-        let withdrawals = self
-            .chain_spec
-            .is_shanghai_active_at_timestamp(timestamp)
-            .then(|| eth_ctx.withdrawals.clone().map(|w| w.into_owned()).unwrap_or_default());
-
-        
-        let withdrawals_root =
-            withdrawals.as_deref().map(|w| proofs::calculate_withdrawals_root(w));
-        let requests_hash = self
-            .chain_spec
-            .is_prague_active_at_block_and_timestamp(block_number, timestamp)
-            .then(|| requests.requests_hash());
+        // parlia override header un-used fields.
+        let mut withdrawals_root = None;
+        let mut parent_beacon_block_root = None;
+        let mut requests_hash = None;
+        if BscHardforks::is_cancun_active_at_timestamp(self.chain_spec.as_ref(), block_number, timestamp) {
+            withdrawals_root = Some(EMPTY_WITHDRAWALS_HASH);
+            if self.chain_spec.is_bohr_active_at_timestamp(block_number, timestamp) {
+                parent_beacon_block_root = Some(B256::default());
+            }
+            if self.chain_spec.is_prague_active_at_block_and_timestamp(block_number, timestamp) {
+                requests_hash = Some(EMPTY_REQUESTS_HASH);
+            }
+        }
 
         let mut excess_blob_gas = None;
         let mut blob_gas_used = None;
 
-        if BscHardforks::is_cancun_active_at_timestamp(&*self.chain_spec, block_number, timestamp) {
+        if BscHardforks::is_cancun_active_at_timestamp(self.chain_spec.as_ref(), block_number, timestamp) {
             blob_gas_used =
                 Some(transactions.iter().map(|tx| tx.blob_gas_used().unwrap_or_default()).sum());
-            excess_blob_gas = if BscHardforks::is_cancun_active_at_timestamp(&*self.chain_spec, parent.number, parent.timestamp) {
+            excess_blob_gas = if BscHardforks::is_cancun_active_at_timestamp(self.chain_spec.as_ref(), parent.number, parent.timestamp) {
                 parent.maybe_next_block_excess_blob_gas(
                     self.chain_spec.blob_params_at_timestamp(timestamp),
                 )
@@ -142,7 +141,7 @@ where
             difficulty: evm_env.block_env.difficulty,
             gas_used: *gas_used,
             extra_data: self.extra_data.clone(),
-            parent_beacon_block_root: eth_ctx.parent_beacon_block_root,
+            parent_beacon_block_root,
             blob_gas_used,
             excess_blob_gas,
             requests_hash,
@@ -178,7 +177,7 @@ where
         Ok(BscBlock {
             header,
             body: BscBlockBody {
-                inner: BlockBody { transactions, ommers: Default::default(), withdrawals },
+                inner: BlockBody { transactions, ommers: Default::default(), withdrawals: Some(Withdrawals::new(vec![])) },
                 sidecars: None, // todo: implement blob storage.
             },
         })
@@ -227,9 +226,7 @@ where
 
         let withdrawals_root =
             withdrawals.as_deref().map(|w| proofs::calculate_withdrawals_root(w));
-        let requests_hash = self
-            .chain_spec
-            .is_prague_active_at_block_and_timestamp(block_number, timestamp)
+        let requests_hash = self.chain_spec.is_prague_active_at_block_and_timestamp(block_number, timestamp)
             .then(|| requests.requests_hash());
 
         let mut excess_blob_gas = None;
