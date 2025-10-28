@@ -9466,6 +9466,7 @@ dependencies = [
  "k256",
  "lazy_static",
  "libc",
+ "lru 0.12.5",
  "once_cell",
  "parity-bytes",
  "parking_lot",

@@ -101,6 +101,7 @@ pub struct BscPayloadBuilder<Pool, Client, EvmConfig = BscEvmConfig> {
     builder_config: EthereumBuilderConfig,
     /// Bsc chain spec.
     chain_spec: Arc<BscChainSpec>,
+    /// Parlia consensus engine.
     parlia: Arc<Parlia<BscChainSpec>>,
 }
 
@@ -528,7 +529,7 @@ where
                 // Finish timeout by timer.
                 _ = tokio::time::sleep(self.timeout) => {
                     let elapsed = start_time.elapsed();
-                    info!("try return best payload due to has no time, cost_time: {:?}, block_number: {}, retries: {}", 
+                    info!("Try return best payload due to has no time, cost_time: {:?}, block_number: {}, retries: {}", 
                         elapsed, self.build_args.config.parent_header.number()+1, self.retries);
                     self.build_args.cancel.clone().cancel();
                     return self.try_return_best_payload();
@@ -537,8 +538,8 @@ where
                 // Abort by new head.
                 _ = &mut self.abort_rx => {
                     let elapsed = start_time.elapsed();
-                    info!("Abort payload building by new head, cost_time: {:?}, block_number: {}, retries: {}", 
-                        elapsed, self.build_args.config.parent_header.number()+1, self.retries);
+                    info!("Abort payload building by new head, cost_time: {:?}, block_number: {}, parent_hash: 0x{:x}, retries: {}", 
+                        elapsed, self.build_args.config.parent_header.number()+1, self.build_args.config.parent_header.parent_hash(), self.retries);
                     self.build_args.cancel.clone().cancel();
                     self.is_aborted = true;
                     return Err(Box::new(BscPayloadJobError::JobAborted));

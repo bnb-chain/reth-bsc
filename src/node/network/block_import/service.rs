@@ -137,7 +137,7 @@ where
         engine: BeaconConsensusEngineHandle<BscPayloadTypes>, 
         consensus: Arc<ParliaConsensus<Provider>>,
         new_header: Header) -> Result<(), ParliaConsensusErr> {
-        let last_canonical_number = consensus.provider.last_block_number()?;
+        let last_canonical_number = consensus.provider.best_block_number()?;
         tracing::debug!(target: "parlia", "Last canonical number: {:?}, new_header = {:?}", last_canonical_number, new_header);
         let current_head = consensus.provider.header_by_number(last_canonical_number)?.ok_or(ParliaConsensusErr::HeadHashNotFound)?;
         let new_canonical_head = consensus.canonical_head(&new_header, &current_head)?;
