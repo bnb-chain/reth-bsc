@@ -444,7 +444,6 @@ where
 
     /// Runs the payload job asynchronously with timeout support
     pub async fn start(mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        info!("BscPayloadJob started for block: {}", self.build_args.config.parent_header.number() + 1);
         let mut start_time = std::time::Instant::now();
         if let Err(err) = self.try_build_tx.send(()) {
             warn!("Failed to send to first try build queue due to {}, block_number: {}", err, self.build_args.config.parent_header.number()+1);
@@ -498,7 +497,6 @@ where
                             if let Some(bid) = best_bid {
                                 info!("Found best bid! block: {}, builder: {:?}, gas_fee: {}", bid.bid.block_number, bid.bid.builder, bid.bid.gas_fee);
                                 self.potential_payloads.push(bid.bsc_payload);
-                                return self.try_return_best_payload();
                             }
 
                             let mining_delay = self.parlia.delay_for_mining(
@@ -508,7 +506,8 @@ where
 
                             // TODO: check more details and refine it later, listen new trxs.
                             // There is still plenty of time left and retry to build payload.
-                            if std::time::Duration::from_millis(mining_delay) > elapsed * TIME_MULTIPLIER && self.retries < MAX_RETRIES {
+                            //if std::time::Duration::from_millis(mining_delay) > elapsed * TIME_MULTIPLIER && self.retries < MAX_RETRIES {
+                            if std::time::Duration::from_millis(mining_delay) > elapsed * TIME_MULTIPLIER {
                                 if let Err(err) = self.try_build_tx.send(()) {
                                     warn!("Failed to send to try build queue, block_number: {}, retries: {}, error: {:?}", 
                                         self.build_args.config.parent_header.number()+1, self.retries, err);
@@ -519,7 +518,7 @@ where
                             } else {
                                 return self.try_return_best_payload();
                             }
-                            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                            //tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
                         },
                         Some(Ok(Err(e))) => {
                             let elapsed = start_time.elapsed();
@@ -582,7 +581,6 @@ where
     /// Pick the best payload from potential payloads
     fn pick_best_payload(&mut self) -> Option<BscBuiltPayload> {
         if self.potential_payloads.is_empty() {
-            debug!("block number:{}, potential payloads is empty",self.build_args.config.parent_header.number()+1);
             return None;
         }
 

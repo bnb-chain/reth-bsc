@@ -8,7 +8,6 @@ use crate::evm::{
 use alloy_primitives::{U256};
 use reth_evm::Database;
 use revm::{bytecode::Bytecode, primitives::eip7702};
-use tracing::debug;
 
 use alloy_consensus::constants::KECCAK_EMPTY;
 use revm::{
@@ -181,7 +180,6 @@ impl<DB: Database, INSP> Handler for BscHandler<DB, INSP> {
         let system_account = ctx.journal_mut().load_account(SYSTEM_ADDRESS)?;
         system_account.data.mark_touch();
         system_account.data.info.balance = system_account.data.info.balance.saturating_add(tx_fee);
-        debug!("system_account.data.info.balance: {} tx_fee: {}", system_account.data.info.balance, tx_fee);
         Ok(())
     }
 
