@@ -130,14 +130,12 @@ where Client: HeaderProvider<Header = alloy_consensus::Header> + BlockHashReader
     }
 
     pub fn commit_new_bid(&self, bid: NewBidPackage) {
-        debug!("commit_new_bid:{}", bid.bid.bid_hash);
         self.add_pending_bid(bid.bid.block_number, bid.bid.builder, bid.bid.bid_hash);
         let final_block_number   = match self.client.finalized_block_number() {
             Ok(Some(final_block_number)) => final_block_number,
             Ok(None) => return,
             Err(_) => return,
         };
-        debug!("final_block_number:{}", final_block_number);
         if bid.bid.block_number <= final_block_number {
             // Bid is for a block that's already finalized, ignore it
             // todo: async clear
@@ -283,7 +281,14 @@ where Client: HeaderProvider<Header = alloy_consensus::Header> + BlockHashReader
 
         let mut txs_except_last = bid_runtime.bid.txs.clone();
         let pay_bid_tx = txs_except_last.pop();
-        let state_provider = self.client.state_by_block_hash(bid_runtime.parent_header.hash_slow()).unwrap();
+        
+        let state_provider = match self.client.state_by_block_hash(bid_runtime.parent_header.hash_slow()) {
+            Ok(provider) => provider,
+            Err(e) => {
+                debug!("Failed to get state provider by block hash: {:?}", e);
+                return;
+            }
+        };
         let sp_db = StateProviderDatabase::new(&state_provider);
         let mut db = State::builder()
             .with_database(sp_db)
@@ -295,15 +300,25 @@ where Client: HeaderProvider<Header = alloy_consensus::Header> + BlockHashReader
         let parent_header = bid_runtime.parent_header.clone();
         let attributes = bid_runtime.attributes.clone();
         let builder_config = bid_runtime.builder_config.clone();
-        let mut builder = evm_config.builder_for_next_block(&mut db, &parent_header, NextBlockEnvAttributes {
+        let mut builder = match evm_config.builder_for_next_block(&mut db, &parent_header, NextBlockEnvAttributes {
                 timestamp:        attributes.timestamp(),
                 suggested_fee_recipient: attributes.suggested_fee_recipient(),
                 prev_randao:      attributes.prev_randao(),
                 gas_limit:        builder_config.gas_limit(parent_header.gas_limit),
                 parent_beacon_block_root: attributes.parent_beacon_block_root(),
                 withdrawals:     Some(attributes.withdrawals().clone()),
-            }).map_err(PayloadBuilderError::other).unwrap();
-        builder.apply_pre_execution_changes().map_err(PayloadBuilderError::other).unwrap();
+            }).map_err(PayloadBuilderError::other) {
+            Ok(builder) => builder,
+            Err(e) => {
+                debug!("Failed to create builder for next block: {:?}", e);
+                return;
+            }
+        };
+        
+        if let Err(e) = builder.apply_pre_execution_changes().map_err(PayloadBuilderError::other) {
+            debug!("Failed to apply pre-execution changes: {:?}", e);
+            return;
+        }
         
         // First commit: bid transactions
         bid_runtime.commit_transaction(txs_except_last, &mut builder);
@@ -330,11 +345,22 @@ where Client: HeaderProvider<Header = alloy_consensus::Header> + BlockHashReader
         // todo: if enable greedy merge, fill bid env with transactions from mempool
 
         // Second commit: pay bid transaction
-        let pay_bid_txs = vec![pay_bid_tx.unwrap()];
-        bid_runtime.commit_transaction(pay_bid_txs, &mut builder);
+        if let Some(pay_bid_tx) = pay_bid_tx {
+            let pay_bid_txs = vec![pay_bid_tx];
+            bid_runtime.commit_transaction(pay_bid_txs, &mut builder);
+        } else {
+            debug!("No pay bid transaction found, skipping bid");
+            return;
+        }
         
         // Finish the builder
-        let BlockBuilderOutcome { execution_result, block, .. } = builder.finish(&state_provider).map_err(PayloadBuilderError::other).unwrap();
+        let BlockBuilderOutcome { execution_result, block, .. } = match builder.finish(&state_provider).map_err(PayloadBuilderError::other) {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                debug!("Failed to finish builder: {:?}", e);
+                return;
+            }
+        };
         let sealed_block = Arc::new(block.sealed_block().clone());
         bid_runtime.bsc_payload = BscBuiltPayload {
             block: sealed_block,
