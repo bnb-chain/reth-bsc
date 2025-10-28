@@ -287,6 +287,11 @@ where
             info!(target: "reth::cli", peer_id=%local_peer_id, "Local peer ID set globally");
         }
 
+        // Share network handle for dynamic EVN actions (trust marking, targeted ETH messages).
+        if let Err(_h) = crate::shared::set_network_handle(handle.clone()) {
+            warn!(target: "bsc::evn", "Network handle already initialised; overriding skipped");
+        }
+
         // EVN sync watcher: arm EVN only once node is considered synced (by head timestamp lag)
         {
             // Only spawn if EVN is enabled; otherwise skip

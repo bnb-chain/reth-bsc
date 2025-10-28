@@ -13,7 +13,7 @@ use reth::network::cache::LruCache;
 use reth_engine_primitives::{BeaconConsensusEngineHandle, EngineTypes};
 use reth_network::{
     import::{BlockImportError, BlockImportEvent, BlockImportOutcome, BlockValidation},
-    message::NewBlockMessage,
+    message::{NewBlockMessage, PeerMessage},
 };
 use reth_network_api::PeerId;
 use reth_node_ethereum::EthEngineTypes;
@@ -250,7 +250,22 @@ where
             if let Some(outcome) = outcome {
                 if let Ok(BlockValidation::ValidBlock { block }) = &outcome.result {
                     this.processed_blocks.insert(block.hash);
-                    // TODO(reth hook): If from proxied validators, target EVN peers with ETH broadcast.
+                    // If from proxied validators, target EVN peers with ETH NewBlockHashes.
+                    if let Some(cfg) = crate::node::network::evn::get_global_evn_config() {
+                        let header_ref = &block.block.0.block.header;
+                        let coinbase = header_ref.beneficiary;
+                        if cfg.proxyed_validators.contains(&coinbase) {
+                            if let Some(net) = crate::shared::get_network_handle() {
+                                let peers = crate::node::network::evn_peers::snapshot();
+                                for (peer_id, info) in peers {
+                                    if info.is_evn {
+                                        // Send full NewBlock to EVN peers to avoid re-fetching.
+                                        net.send_eth_message(peer_id, PeerMessage::NewBlock(block.clone()));
+                                    }
+                                }
+                            }
+                        }
+                    }
                     // Prune old votes from the vote pool based on the new block number
                     let block_number = block.block.0.block.header.number();
                     vote_pool::prune(block_number);

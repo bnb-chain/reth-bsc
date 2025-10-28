@@ -3,6 +3,8 @@ use std::sync::{Arc, OnceLock};
 use alloy_consensus::Header;
 use alloy_primitives::B256;
 use reth_provider::{HeaderProvider, BlockNumReader};
+use crate::node::network::BscNetworkPrimitives;
+use reth_network::NetworkHandle;
 use crate::node::network::block_import::service::IncomingBlock;
 use tokio::sync::mpsc::UnboundedSender;
 use reth_network_api::PeerId;
@@ -28,11 +30,20 @@ type BestBlockNumberFn = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
 /// Global best block number function
 static BEST_BLOCK_NUMBER_PROVIDER: OnceLock<BestBlockNumberFn> = OnceLock::new();
 
+/// Function type for best total difficulty (u128 approximation)
+type BestTdFn = Arc<dyn Fn() -> Option<u128> + Send + Sync>;
+
+/// Global best total difficulty provider
+static BEST_TD_PROVIDER: OnceLock<BestTdFn> = OnceLock::new();
+
 /// Global sender for submitting mined blocks to the import service
 static BLOCK_IMPORT_SENDER: OnceLock<UnboundedSender<IncomingBlock>> = OnceLock::new();
 
 /// Global local peer ID for network identification
 static LOCAL_PEER_ID: OnceLock<PeerId> = OnceLock::new();
+
+/// Global network handle to interact with P2P (reth).
+static NETWORK_HANDLE: OnceLock<NetworkHandle<BscNetworkPrimitives>> = OnceLock::new();
 
 /// Store the snapshot provider globally
 pub fn set_snapshot_provider(provider: Arc<dyn SnapshotProvider + Send + Sync>) -> Result<(), Arc<dyn SnapshotProvider + Send + Sync>> {
@@ -78,6 +89,22 @@ where
     BEST_BLOCK_NUMBER_PROVIDER
         .set(best_block_number_fn)
         .map_err(|_| "Failed to set best block number provider")?;
+
+    // Create function for best total difficulty (u128 approximation)
+    let provider_clone4 = provider.clone();
+    let best_td_fn = Arc::new(move || -> Option<u128> {
+        match provider_clone4.best_block_number() {
+            Ok(n) => match provider_clone4.header_td_by_number(n) {
+                Ok(Some(td)) => {
+                    // Convert to u128; safe approximation for small deltas (thresholds are small)
+                    Some(td.to::<u128>())
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    });
+    BEST_TD_PROVIDER.set(best_td_fn).map_err(|_| "Failed to set best td provider")?;
     
     Ok(())
 }
@@ -121,6 +148,11 @@ pub fn get_best_block_number() -> Option<u64> {
     BEST_BLOCK_NUMBER_PROVIDER.get().and_then(|f| f())
 }
 
+/// Get the best total difficulty (u128 approximation) if available
+pub fn get_best_total_difficulty_u128() -> Option<u128> {
+    BEST_TD_PROVIDER.get().and_then(|f| f())
+}
+
 /// Store the block import sender globally. Returns an error if it was set before.
 pub fn set_block_import_sender(sender: UnboundedSender<IncomingBlock>) -> Result<(), UnboundedSender<IncomingBlock>> {
     BLOCK_IMPORT_SENDER.set(sender)
@@ -140,4 +172,14 @@ pub fn set_local_peer_id(peer_id: PeerId) -> Result<(), PeerId> {
 /// Get the global local peer ID, or return a default PeerId if not set.
 pub fn get_local_peer_id_or_default() -> PeerId {
     LOCAL_PEER_ID.get().cloned().unwrap_or_default()
+}
+
+/// Store the reth `NetworkHandle` globally for dynamic peer actions.
+pub fn set_network_handle(handle: NetworkHandle<BscNetworkPrimitives>) -> Result<(), NetworkHandle<BscNetworkPrimitives>> {
+    NETWORK_HANDLE.set(handle)
+}
+
+/// Get a clone of the global network handle if available.
+pub fn get_network_handle() -> Option<NetworkHandle<BscNetworkPrimitives>> {
+    NETWORK_HANDLE.get().cloned()
 }
