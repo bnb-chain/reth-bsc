@@ -9,6 +9,7 @@ use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::{B256, U128};
 use alloy_rpc_types::engine::{ForkchoiceState, PayloadStatusEnum};
 use futures::{future::Either, stream::FuturesUnordered, StreamExt};
+use parking_lot::RwLock;
 use reth::network::cache::LruCache;
 use reth_engine_primitives::{BeaconConsensusEngineHandle, EngineTypes};
 use reth_network::{
@@ -63,7 +64,7 @@ where
     /// The handle to communicate with the engine service
     engine: BeaconConsensusEngineHandle<BscPayloadTypes>,
     /// The consensus implementation
-    consensus: Arc<ParliaConsensus<Provider>>,
+    consensus: Arc<RwLock<ParliaConsensus<Provider>>>,
     /// Receive the new block from the network
     from_network: UnboundedReceiver<IncomingBlock>,
     /// Receive block hashes from the network for downloading
@@ -82,7 +83,7 @@ where
 {
     /// Create a new block import service
     pub fn new(
-        consensus: Arc<ParliaConsensus<Provider>>,
+        consensus: Arc<RwLock<ParliaConsensus<Provider>>>,
         engine: BeaconConsensusEngineHandle<BscPayloadTypes>,
         from_network: UnboundedReceiver<IncomingBlock>,
         from_hashes: UnboundedReceiver<IncomingHashes>,
@@ -104,7 +105,7 @@ where
         let engine = self.engine.clone();
         let consensus = self.consensus.clone();
 
-        tracing::debug!(target: "bsc::block_import", "New payload: block = {:?}, peer_id = {:?}", block, peer_id);
+        tracing::debug!(target: "bsc::block_import", "New payload: block = ({:?}, {:?}), peer_id = {:?}", block.block.0.block.header.number, block.block.0.block.header.hash_slow(), peer_id);
         Box::pin(async move {
             let sealed_block = block.block.0.block.clone().seal();
             let header = sealed_block.header().clone();
@@ -135,23 +136,25 @@ where
     /// Process a forkchoice update and return the outcome  
     async fn update_fork_choice(
         engine: BeaconConsensusEngineHandle<BscPayloadTypes>, 
-        consensus: Arc<ParliaConsensus<Provider>>,
+        consensus: Arc<RwLock<ParliaConsensus<Provider>>>,
         new_header: Header) -> Result<(), ParliaConsensusErr> {
-        let last_canonical_number = consensus.provider.last_block_number()?;
-        tracing::debug!(target: "parlia", "Last canonical number: {:?}, new_header = {:?}", last_canonical_number, new_header);
-        let current_head = consensus.provider.header_by_number(last_canonical_number)?.ok_or(ParliaConsensusErr::HeadHashNotFound)?;
-        let new_canonical_head = consensus.canonical_head(&new_header, &current_head)?;
+        let best_number = consensus.read().provider.chain_info()?.best_number;
+        tracing::debug!(target: "parlia", "Best canonical number: {:?}, new_header = {:?}", best_number, new_header);
+        let current_head = consensus.read().provider.header_by_number(best_number)?.ok_or(ParliaConsensusErr::HeadHashNotFound)?;
+        let (new_td, current_td) = consensus.write().header_td_fcu(&engine, &new_header, &current_head).await?;
+        let new_canonical_head = consensus.read().canonical_head((&new_header, new_td), (&current_head, current_td))?;
         // get safe block and finalized block with new canonical head
         // ref: https://github.com/bnb-chain/bsc/blob/f70aaa8399ccee429804eecf3fc4c6fd8d9e6cab/eth/api_backend.go#L72
-        let (safe_block_number, safe_block_hash) = consensus.get_justified_number_and_hash(new_canonical_head).unwrap_or((0, B256::ZERO));
-        let (finalized_block_number, finalized_block_hash) = consensus.get_finalized_number_and_hash(new_canonical_head).unwrap_or((0, B256::ZERO));
+        let (safe_block_number, safe_block_hash) = consensus.read().get_justified_number_and_hash(new_canonical_head).unwrap_or((0, B256::ZERO));
+        let (finalized_block_number, finalized_block_hash) = consensus.read().get_finalized_number_and_hash(new_canonical_head).unwrap_or((0, B256::ZERO));
         let state = ForkchoiceState {
             head_block_hash: new_canonical_head.hash_slow(),
             safe_block_hash,
             finalized_block_hash,
         };
 
-        tracing::debug!(target: "parlia", "Fork choice updated: state = {:?}, new_canonical_head = {:?}, new_header = {:?}", state, new_canonical_head, new_header);
+        tracing::debug!(target: "parlia", "Fork choice updated: state = {:?}, new_canonical_head = ({:?}, {:?}), new_header = ({:?}, {:?})", 
+            state, new_canonical_head.number, new_canonical_head.hash_slow(), new_header.number, new_header.hash_slow());
         match engine.fork_choice_updated(state, None, EngineApiMessageVersion::default()).await
         {
             Ok(response) => match response.payload_status.status {
@@ -273,7 +276,7 @@ where
                     // Produce and broadcast a local vote for this new canonical head, if eligible
                     if let Some(sp) = crate::shared::get_snapshot_provider() {
                         let sp = Arc::clone(sp);
-                        let spec = this.consensus.chain_spec.clone();
+                        let spec = this.consensus.read().chain_spec.clone();
                         let header = block.block.0.block.header.clone();
                         tokio::spawn(async move {
                             crate::node::vote_producer::maybe_produce_and_broadcast_for_head(

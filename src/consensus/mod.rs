@@ -1,10 +1,12 @@
 use alloy_consensus::{constants::ETH_TO_WEI, Header};
-use alloy_primitives::{address, Address, B256};
+use alloy_primitives::{Address, B256, BlockHash, BlockNumber, U256, address};
 use rand::Rng;
+use reth_engine_primitives::BeaconConsensusEngineHandle;
+use schnellru::{ByLength, LruMap};
 use std::sync::Arc;
 use tracing::{info, warn};
 
-use crate::{chainspec::BscChainSpec, hardforks::BscHardforks, shared};
+use crate::{chainspec::BscChainSpec, hardforks::BscHardforks, node::engine_api::payload::BscPayloadTypes, shared};
 use reth_provider::{BlockNumReader, HeaderProvider, ProviderError};
 use std::cmp::Ordering;
 
@@ -29,6 +31,16 @@ pub enum ParliaConsensusErr {
     /// Unknown total difficulty
     #[error("Unknown total difficulty for block {0} at number {1}")]
     UnknownTotalDifficulty(B256, u64),
+    /// Internal error
+    #[error(transparent)]
+    Internal(Box<dyn core::error::Error + Send + Sync>),
+}
+
+impl ParliaConsensusErr {
+    /// Create a new internal error.
+    pub fn internal<E: core::error::Error + Send + Sync + 'static>(e: E) -> Self {
+        Self::Internal(Box::new(e))
+    }
 }
 
 /// Parlia consensus implementation
@@ -39,6 +51,8 @@ pub struct ParliaConsensus<P> {
     pub provider: P,
     /// Chain spec is required to determine hardfork activation and parse attestations.
     pub chain_spec: Arc<BscChainSpec>,
+    /// collect all forks headers and TDs.
+    pub header_td_cache: LruMap<BlockHash, Option<U256>, ByLength>,
 }
 
 impl<P> ParliaConsensus<P>
@@ -48,27 +62,13 @@ where
     /// Determines the head block hash according to Parlia consensus rules:
     /// 1. Follow the highest block number
     /// 2. For same height blocks, pick the one with lower hash
-    pub(crate) fn canonical_head<'a>(&self, incoming: &'a Header, current_head: &'a Header) -> Result<&'a Header, ParliaConsensusErr> {
-        tracing::debug!(target: "parlia", "Canonical head: incoming = {:?}, current = {:?}", incoming, current_head);
-        match self.head_choice_with_fast_finality(incoming, current_head) {
-            Ok(true) => Ok(incoming),
-            Ok(false) => Ok(current_head),
-            Err(e) => {
-                // TODO: current the reth return TD is wrong, it need to refactor later.
-                tracing::debug!(target: "parlia", "Failed to head choice with fast finality: {:?}", e);
-                // Fallback to height and hash tie-breaker
-                match incoming.number.cmp(&current_head.number) {
-                    Ordering::Greater => Ok(incoming),
-                    Ordering::Equal => {
-                        if incoming.hash_slow() < current_head.hash_slow() {
-                            Ok(incoming)
-                        } else {
-                            Ok(current_head)
-                        }
-                    }
-                    Ordering::Less => Ok(current_head),
-                }
-            }
+    pub(crate) fn canonical_head<'a>(&self, incoming: (&'a Header, Option<U256>), current: (&'a Header, Option<U256>)) -> Result<&'a Header, ParliaConsensusErr> {
+        tracing::debug!(target: "parlia", "Canonical head: incoming = ({:?}, {:?}, {:?}), current = ({:?}, {:?}, {:?})", 
+            incoming.0.number, incoming.0.hash_slow(), incoming.1, current.0.number, current.0.hash_slow(), current.1);
+        if self.head_choice_with_fast_finality(incoming, current)? {
+            Ok(incoming.0)
+        } else {
+            Ok(current.0)
         }
     }
 
@@ -81,18 +81,18 @@ where
     /// fallback to default selection.
     pub(crate) fn head_choice_with_fast_finality(
         &self,
-        incoming: &Header,
-        current: &Header,
+        incoming: (&Header, Option<U256>),
+        current: (&Header, Option<U256>),
     ) -> Result<bool, ParliaConsensusErr> {
         // Get justified numbers from snapshots at parent blocks
-        let (incoming_justified_num, _) = if self.chain_spec.is_plato_active_at_block(incoming.number) {
-            self.get_justified_number_and_hash(incoming).unwrap_or((0, B256::ZERO))
+        let (incoming_justified_num, _) = if self.chain_spec.is_plato_active_at_block(incoming.0.number) {
+            self.get_justified_number_and_hash(incoming.0).unwrap_or((0, B256::ZERO))
         } else {
             (0, B256::ZERO)
         };
 
-        let (current_justified_num, _) = if self.chain_spec.is_plato_active_at_block(current.number) {
-            self.get_justified_number_and_hash(current).unwrap_or((0, B256::ZERO))
+        let (current_justified_num, _) = if self.chain_spec.is_plato_active_at_block(current.0.number) {
+            self.get_justified_number_and_hash(current.0).unwrap_or((0, B256::ZERO))
         } else {
             (0, B256::ZERO)
         };
@@ -103,13 +103,13 @@ where
             return self.head_choice_with_td(incoming, current);
         }
 
-        if incoming_justified_num > current_justified_num && incoming.number <= current.number {
+        if incoming_justified_num > current_justified_num && incoming.0.number <= current.0.number {
             info!(
                 target: "forkchoice",
-                fromHeight = current.number,
-                fromHash = ?current.hash_slow(),
-                toHeight = incoming.number,
-                toHash = ?incoming.hash_slow(),
+                fromHeight = current.0.number,
+                fromHash = ?current.0.hash_slow(),
+                toHeight = incoming.0.number,
+                toHash = ?incoming.0.hash_slow(),
                 fromJustified = current_justified_num,
                 toJustified = incoming_justified_num,
                 "Chain find higher justifiedNumber"
@@ -123,19 +123,17 @@ where
     /// ref: https://github.com/bnb-chain/bsc/blob/3f345c855ebceb14cca98dc3776718185ba2014a/core/forkchoice.go#L76
     pub(crate) fn head_choice_with_td(
         &self,
-        incoming: &Header,
-        current: &Header,
+        incoming: (&Header, Option<U256>),
+        current: (&Header, Option<U256>),
     ) -> Result<bool, ParliaConsensusErr> { 
-        // TODO: the reth TD is wrong in BSC, it need store and reply the correct TD for BSC.
-        // Assume the incoming block is already fetched.
-        let incoming_td = self.provider.header_td(&incoming.hash_slow())
-            .map_err(ParliaConsensusErr::Provider)?
-            .ok_or(ParliaConsensusErr::UnknownTotalDifficulty(incoming.hash_slow(), incoming.number))?;
-        let current_td = self.provider.header_td(&current.hash_slow())
-            .map_err(ParliaConsensusErr::Provider)?
-            .ok_or(ParliaConsensusErr::UnknownTotalDifficulty(current.hash_slow(), current.number))?;
+        let current_td = current.1
+            .ok_or(ParliaConsensusErr::UnknownTotalDifficulty(current.0.hash_slow(), current.0.number))?;
+        let incoming_td = incoming.1
+            .ok_or(ParliaConsensusErr::UnknownTotalDifficulty(incoming.0.hash_slow(), incoming.0.number))?;
 
-        tracing::debug!(target: "parlia", "Head choice with TD: incoming_td = {:?}, current_td = {:?}", incoming_td, current_td);
+        let (incoming, current) = (incoming.0, current.0);
+        tracing::debug!(target: "parlia", "Head choice with TD: incoming = ({:?}, {:?}, {:?}), current = ({:?}, {:?}, {:?})", 
+            incoming.number, incoming.hash_slow(), incoming_td, current.number, current.hash_slow(), current_td);
         // there no need to check eth's TerminalTotalDifficulty here.
         // If the total difficulty is higher than our known, add it to the canonical chain
         match incoming_td.cmp(&current_td) {
@@ -222,7 +220,39 @@ where
             }
         }
     }
+    
+    pub(crate) async fn header_td_fcu(
+        &mut self,
+        engine: &BeaconConsensusEngineHandle<BscPayloadTypes>,
+        incoming: &Header,
+        current: &Header,
+    ) -> Result<(Option<U256>, Option<U256>), ParliaConsensusErr> {
+        let current_td = self.header_td(engine, current.number, current.hash_slow()).await?;
+        let incoming_td = match self.header_td(engine, incoming.number, incoming.hash_slow()).await {
+            Ok(td) => td,
+            Err(e) => {
+                tracing::debug!(target: "parlia", "Failed to get incoming header TD: {:?}, try to query parent block TD", e);
+                match self.header_td(engine, incoming.number - 1, incoming.parent_hash).await? {
+                    Some(td) => Some(td + incoming.difficulty),
+                    None => {
+                        tracing::debug!(target: "parlia", "Failed to get parent header TD, return None");
+                        None
+                    }
+                }
+                
+            },
+        };
+        Ok((incoming_td, current_td))
+    }
 
+    pub(crate) async fn header_td(&mut self, engine: &BeaconConsensusEngineHandle<BscPayloadTypes>, number: BlockNumber, hash: BlockHash) -> Result<Option<U256>, ParliaConsensusErr> {
+        if let Some(td) = self.header_td_cache.get(&hash) {
+            return Ok(*td);
+        }
+        let td = engine.query_td(number, hash).await.map_err(ParliaConsensusErr::internal)?;
+        self.header_td_cache.insert(hash, td);
+        Ok(td)
+    }
 }
 
 pub mod parlia;

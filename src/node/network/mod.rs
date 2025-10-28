@@ -10,6 +10,7 @@ use crate::{
 };
 use alloy_rlp::{Decodable, Encodable};
 use handshake::BscHandshake;
+use parking_lot::RwLock;
 use reth::{
     api::{FullNodeTypes, TxTy},
     builder::{components::NetworkBuilder, BuilderContext},
@@ -22,6 +23,7 @@ use reth_ethereum_primitives::PooledTransactionVariant;
 use reth_engine_primitives::BeaconConsensusEngineHandle;
 use reth_network::{NetworkConfig, NetworkHandle, NetworkManager};
 use reth_network_api::PeersInfo;
+use schnellru::{ByLength, LruMap};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{info, warn, debug};
@@ -222,10 +224,11 @@ impl BscNetworkBuilder {
         use crate::node::network::block_import::service::ImportService;
         
         // Create consensus instance for ImportService
-        let consensus = Arc::new(ParliaConsensus { 
+        let consensus = Arc::new(RwLock::new(ParliaConsensus { 
+            header_td_cache: LruMap::new(ByLength::new(128)),
             provider: ctx.provider().clone(),
             chain_spec: ctx.chain_spec().clone(),
-        });
+        }));
         
         // Spawn the critical ImportService task exactly like the official implementation
         ctx.task_executor().spawn_critical("block import", async move {
