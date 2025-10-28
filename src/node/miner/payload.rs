@@ -511,6 +511,14 @@ where
                                             elapsed, self.build_args.config.parent_header.number()+1, self.retries);
                                         return self.try_return_best_payload();
                                     }
+                                    // Abort by new head.
+                                    _ = &mut self.abort_rx => {
+                                        info!("Abort payload building by new head, cost_time: {:?}, block_number: {}, retries: {}", 
+                                            elapsed, self.build_args.config.parent_header.number()+1, self.retries);
+                                        self.build_args.cancel.clone().cancel();
+                                        self.is_aborted = true;
+                                        return Err(Box::new(BscPayloadJobError::JobAborted));
+                                    }
                                     Some(_tx_hash) = self.tx_listener.recv() => {
                                         new_tx_count+=1;
                                         let mining_delay = self.parlia.delay_for_mining(
@@ -518,8 +526,10 @@ where
                                             self.mining_ctx.header.as_ref().unwrap(), 
                                             DELAY_LEFT_OVER);
                                         if std::time::Duration::from_millis(mining_delay) < elapsed {
+                                            debug!("try return best payload due to mining_delay < elapsed, block_number: {}, retries: {}, mining_delay: {:?}, elapsed: {:?}", 
+                                                self.build_args.config.parent_header.number()+1, self.retries, mining_delay, elapsed);
                                             return self.try_return_best_payload();
-                                        }else if std::time::Duration::from_millis(mining_delay) < elapsed * TIME_MULTIPLIER {
+                                        } else if std::time::Duration::from_millis(mining_delay) < elapsed * TIME_MULTIPLIER {
                                             if let Err(err) = self.try_build_tx.send(()) {
                                                 warn!("Failed to send to try build queue, block_number: {}, retries: {}, error: {:?}", 
                                                     self.build_args.config.parent_header.number()+1, self.retries, err);
@@ -527,8 +537,8 @@ where
                                             }
                                             debug!("Succeed to send to try build queue, block_number: {}, retries: {}, last_cost_time: {:?}, new_mining_delay: {:?}", 
                                                     self.build_args.config.parent_header.number()+1, self.retries, elapsed, std::time::Duration::from_millis(mining_delay));
-                                            break;
-                                        }else if new_tx_count >= payload_tx_count{
+                                            break;  // Break out of the loop and wait for the next payload
+                                        } else if new_tx_count >= payload_tx_count {
                                             if let Err(err) = self.try_build_tx.send(()) {
                                                 warn!("Failed to send to try build queue, block_number: {}, retries: {}, error: {:?}", 
                                                     self.build_args.config.parent_header.number()+1, self.retries, err);
@@ -536,7 +546,7 @@ where
                                             }
                                             debug!("Succeed to send to try build queue, block_number: {}, retries: {}, last_cost_time: {:?}, new_mining_delay: {:?}", 
                                                 self.build_args.config.parent_header.number()+1, self.retries, elapsed, std::time::Duration::from_millis(mining_delay));
-                                            break;
+                                            break; // Break out of the loop and wait for the next payload
                                         }
                                     }
                                 }
