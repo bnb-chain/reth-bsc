@@ -528,17 +528,15 @@ where
                                             debug!("Succeed to send to try build queue, block_number: {}, retries: {}, last_cost_time: {:?}, new_mining_delay: {:?}", 
                                                     self.build_args.config.parent_header.number()+1, self.retries, elapsed, std::time::Duration::from_millis(mining_delay));
                                             break;
-                                        }else {
-                                            if new_tx_count >= payload_tx_count {
-                                                if let Err(err) = self.try_build_tx.send(()) {
-                                                    warn!("Failed to send to try build queue, block_number: {}, retries: {}, error: {:?}", 
-                                                        self.build_args.config.parent_header.number()+1, self.retries, err);
-                                                    return self.try_return_best_payload();
-                                                }
-                                                debug!("Succeed to send to try build queue, block_number: {}, retries: {}, last_cost_time: {:?}, new_mining_delay: {:?}", 
-                                                    self.build_args.config.parent_header.number()+1, self.retries, elapsed, std::time::Duration::from_millis(mining_delay));
-                                                break;
+                                        }else if new_tx_count >= payload_tx_count{
+                                            if let Err(err) = self.try_build_tx.send(()) {
+                                                warn!("Failed to send to try build queue, block_number: {}, retries: {}, error: {:?}", 
+                                                    self.build_args.config.parent_header.number()+1, self.retries, err);
+                                                return self.try_return_best_payload();
                                             }
+                                            debug!("Succeed to send to try build queue, block_number: {}, retries: {}, last_cost_time: {:?}, new_mining_delay: {:?}", 
+                                                self.build_args.config.parent_header.number()+1, self.retries, elapsed, std::time::Duration::from_millis(mining_delay));
+                                            break;
                                         }
                                     }
                                 }
