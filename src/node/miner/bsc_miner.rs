@@ -481,16 +481,15 @@ where
     /// Submit a built payload to the engine-tree/network
     async fn submit_payload(&self, payload: BscBuiltPayload) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let sealed_block = payload.block();
+        let block_hash = sealed_block.hash();
         let block_number = sealed_block.number();
+        let parent_hash = sealed_block.header().parent_hash;
         if block_number <= self.provider.chain_info()?.best_number {
             debug!("Skip to submit block due to block number is less than last block number, block_number: {}, last_block_number: {}", 
                 block_number, self.provider.last_block_number()?);
             return Ok(());
         }
 
-        let block_hash = sealed_block.hash();
-        let parent_hash = sealed_block.header().parent_hash;
-        
         {   // check double sign
             let mut cache = self.recent_mined_blocks.lock().unwrap();
             if let Some(prev_parents) = cache.get(&block_number) {
