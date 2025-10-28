@@ -64,7 +64,7 @@ where
     /// The handle to communicate with the engine service
     engine: BeaconConsensusEngineHandle<BscPayloadTypes>,
     /// The consensus implementation
-    consensus: Arc<RwLock<ParliaConsensus<Provider>>>,
+    consensus: Arc<ParliaConsensus<Provider>>,
     /// Receive the new block from the network
     from_network: UnboundedReceiver<IncomingBlock>,
     /// Receive block hashes from the network for downloading
@@ -83,7 +83,7 @@ where
 {
     /// Create a new block import service
     pub fn new(
-        consensus: Arc<RwLock<ParliaConsensus<Provider>>>,
+        consensus: Arc<ParliaConsensus<Provider>>,
         engine: BeaconConsensusEngineHandle<BscPayloadTypes>,
         from_network: UnboundedReceiver<IncomingBlock>,
         from_hashes: UnboundedReceiver<IncomingHashes>,
@@ -136,17 +136,17 @@ where
     /// Process a forkchoice update and return the outcome  
     async fn update_fork_choice(
         engine: BeaconConsensusEngineHandle<BscPayloadTypes>, 
-        consensus: Arc<RwLock<ParliaConsensus<Provider>>>,
+        consensus: Arc<ParliaConsensus<Provider>>,
         new_header: Header) -> Result<(), ParliaConsensusErr> {
-        let best_number = consensus.read().provider.chain_info()?.best_number;
+        let best_number = consensus.provider.chain_info()?.best_number;
         tracing::debug!(target: "parlia", "Best canonical number: {:?}, new_header = {:?}", best_number, new_header);
-        let current_head = consensus.read().provider.header_by_number(best_number)?.ok_or(ParliaConsensusErr::HeadHashNotFound)?;
-        let (new_td, current_td) = consensus.write().header_td_fcu(&engine, &new_header, &current_head).await?;
-        let new_canonical_head = consensus.read().canonical_head((&new_header, new_td), (&current_head, current_td))?;
+        let current_head = consensus.provider.header_by_number(best_number)?.ok_or(ParliaConsensusErr::HeadHashNotFound)?;
+        let (new_td, current_td) = consensus.header_td_fcu(&engine, &new_header, &current_head).await?;
+        let new_canonical_head = consensus.canonical_head((&new_header, new_td), (&current_head, current_td))?;
         // get safe block and finalized block with new canonical head
         // ref: https://github.com/bnb-chain/bsc/blob/f70aaa8399ccee429804eecf3fc4c6fd8d9e6cab/eth/api_backend.go#L72
-        let (safe_block_number, safe_block_hash) = consensus.read().get_justified_number_and_hash(new_canonical_head).unwrap_or((0, B256::ZERO));
-        let (finalized_block_number, finalized_block_hash) = consensus.read().get_finalized_number_and_hash(new_canonical_head).unwrap_or((0, B256::ZERO));
+        let (safe_block_number, safe_block_hash) = consensus.get_justified_number_and_hash(new_canonical_head).unwrap_or((0, B256::ZERO));
+        let (finalized_block_number, finalized_block_hash) = consensus.get_finalized_number_and_hash(new_canonical_head).unwrap_or((0, B256::ZERO));
         let state = ForkchoiceState {
             head_block_hash: new_canonical_head.hash_slow(),
             safe_block_hash,
@@ -276,7 +276,7 @@ where
                     // Produce and broadcast a local vote for this new canonical head, if eligible
                     if let Some(sp) = crate::shared::get_snapshot_provider() {
                         let sp = Arc::clone(sp);
-                        let spec = this.consensus.read().chain_spec.clone();
+                        let spec = this.consensus.chain_spec.clone();
                         let header = block.block.0.block.header.clone();
                         tokio::spawn(async move {
                             crate::node::vote_producer::maybe_produce_and_broadcast_for_head(
@@ -311,6 +311,7 @@ mod tests {
     use reth_node_ethereum::EthEngineTypes;
     use reth_primitives::{Block, SealedHeader};
     use reth_provider::ProviderError;
+    use schnellru::{ByLength, LruMap};
     use std::{
         collections::HashMap, sync::Arc, task::{Context, Poll}
     };
@@ -559,10 +560,10 @@ mod tests {
         /// Create a new test fixture with the given engine responses
         async fn new(responses: EngineResponses) -> Self {
             // Use mainnet chain spec for tests; it influences only fast-finality parsing.
-            let consensus = Arc::new(ParliaConsensus { 
-                provider: MockProvider::new(), 
-                chain_spec: Arc::new(crate::chainspec::BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet())),
-            });
+            let mut consensus = Arc::new(ParliaConsensus::new(
+                MockProvider::new(), 
+                Arc::new(crate::chainspec::BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet())),
+            ));
             let (to_engine, from_engine) = mpsc::unbounded_channel();
             let engine_handle = BeaconConsensusEngineHandle::new(to_engine);
 

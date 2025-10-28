@@ -1,5 +1,6 @@
 use alloy_consensus::{constants::ETH_TO_WEI, Header};
 use alloy_primitives::{Address, B256, BlockHash, BlockNumber, U256, address};
+use parking_lot::RwLock;
 use rand::Rng;
 use reth_engine_primitives::BeaconConsensusEngineHandle;
 use schnellru::{ByLength, LruMap};
@@ -52,13 +53,21 @@ pub struct ParliaConsensus<P> {
     /// Chain spec is required to determine hardfork activation and parse attestations.
     pub chain_spec: Arc<BscChainSpec>,
     /// collect all forks headers and TDs.
-    pub header_td_cache: LruMap<BlockHash, Option<U256>, ByLength>,
+    pub header_td_cache: RwLock<LruMap<BlockHash, Option<U256>, ByLength>>,
 }
 
 impl<P> ParliaConsensus<P>
 where
     P: BlockNumReader + HeaderProvider<Header = Header> + Clone,
 {
+    pub fn new(provider: P, chain_spec: Arc<BscChainSpec>) -> Self {
+        Self {
+            provider,
+            chain_spec,
+            header_td_cache: RwLock::new(LruMap::new(ByLength::new(128))),
+        }
+    }
+
     /// Determines the head block hash according to Parlia consensus rules:
     /// 1. Follow the highest block number
     /// 2. For same height blocks, pick the one with lower hash
@@ -222,7 +231,7 @@ where
     }
     
     pub(crate) async fn header_td_fcu(
-        &mut self,
+        &self,
         engine: &BeaconConsensusEngineHandle<BscPayloadTypes>,
         incoming: &Header,
         current: &Header,
@@ -244,13 +253,12 @@ where
         };
         Ok((incoming_td, current_td))
     }
-
-    pub(crate) async fn header_td(&mut self, engine: &BeaconConsensusEngineHandle<BscPayloadTypes>, number: BlockNumber, hash: BlockHash) -> Result<Option<U256>, ParliaConsensusErr> {
-        if let Some(td) = self.header_td_cache.get(&hash) {
+    pub(crate) async fn header_td(&self, engine: &BeaconConsensusEngineHandle<BscPayloadTypes>, number: BlockNumber, hash: BlockHash) -> Result<Option<U256>, ParliaConsensusErr> {
+        if let Some(td) = self.header_td_cache.write().get(&hash) {
             return Ok(*td);
         }
         let td = engine.query_td(number, hash).await.map_err(ParliaConsensusErr::internal)?;
-        self.header_td_cache.insert(hash, td);
+        self.header_td_cache.write().insert(hash, td);
         Ok(td)
     }
 }
@@ -445,11 +453,11 @@ mod tests {
             provider.insert(curr_header.clone(), U256::from(curr_td));
             let new_header = header_with_attestation(new_number, new_vote_source_num, new_vote_target_num);
             provider.insert(new_header.clone(), U256::from(new_td));
-            let consensus = ParliaConsensus {
+            let consensus = ParliaConsensus::new(
                 provider,
-                chain_spec: Arc::new(crate::chainspec::BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet())),
-            };
-            let canonical_head = consensus.canonical_head(&new_header, &curr_header).unwrap();
+                Arc::new(crate::chainspec::BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet())),
+            );
+            let canonical_head = consensus.canonical_head((&new_header, Some(U256::from(new_td))), (&curr_header, Some(U256::from(curr_td)))).unwrap();
             if reorg {
                 assert_eq!(canonical_head, &new_header);
             } else {
@@ -503,12 +511,12 @@ mod tests {
             let mut provider = MockProvider::new();
             provider.insert(current.clone(), U256::from(current_td));
             provider.insert(incoming.clone(), U256::from(incoming_td));
-            let consensus = ParliaConsensus {
+            let consensus = ParliaConsensus::new(
                 provider,
-                chain_spec: chain_spec.clone(),
-            };
+                chain_spec.clone(),
+            );
 
-            let canonical_head = consensus.canonical_head(&incoming, &current).unwrap();
+            let canonical_head = consensus.canonical_head((&incoming, Some(U256::from(incoming_td))), (&current, Some(U256::from(current_td)))).unwrap();
             if reorg {
                 assert_eq!(canonical_head, &incoming);
             } else {
