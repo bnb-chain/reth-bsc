@@ -1,12 +1,8 @@
 #![allow(clippy::owned_cow)]
 use crate::{
-    node::{
-        engine_api::payload::BscPayloadTypes,
-        network::block_import::{handle::ImportHandle, BscBlockImport},
-        primitives::{BscBlobTransactionSidecar, BscPrimitives},
-        BscNode,
-    },
-    BscBlock,
+    BscBlock, node::{
+        BscNode, engine_api::payload::BscPayloadTypes, network::block_import::{BscBlockImport, handle::ImportHandle}, primitives::{BscBlobTransactionSidecar, BscPrimitives}
+    }, shared::get_canonical_header_by_number
 };
 use alloy_rlp::{Decodable, Encodable};
 use handshake::BscHandshake;
@@ -308,8 +304,8 @@ where
                         // If already armed, stop watcher
                         if crate::node::network::evn::is_evn_synced() { break; }
                         // Query latest header via global providers
-                        if let Some(n) = crate::shared::get_best_block_number() {
-                            if let Some(h) = crate::shared::get_header_by_number(n) {
+                        if let Some(n) = crate::shared::get_best_canonical_block_number() {
+                            if let Some(h) = get_canonical_header_by_number(n) {
                                 let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(u64::MAX);
                                 let ts = h.timestamp();
                                 if now >= ts && now.saturating_sub(ts) <= max_lag {

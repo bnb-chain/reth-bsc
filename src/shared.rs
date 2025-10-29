@@ -109,47 +109,37 @@ where
     Ok(())
 }
 
-/// Get the global header by hash provider function
-pub fn get_header_by_hash_provider() -> Option<&'static HeaderByHashFn> {
-    HEADER_BY_HASH_PROVIDER.get()
-}
-
-/// Get the global header by number provider function  
-pub fn get_header_by_number_provider() -> Option<&'static HeaderByNumberFn> {
-    HEADER_BY_NUMBER_PROVIDER.get()
-}
-
 /// Get header by hash from the global header provider
 /// Directly calls the stored HeaderProvider::header() function
-pub fn get_header_by_hash_from_provider(block_hash: &B256) -> Option<Header> {
+pub fn get_canonical_header_by_hash_from_provider(block_hash: &B256) -> Option<Header> {
     let provider_fn = HEADER_BY_HASH_PROVIDER.get()?;
     provider_fn(block_hash)
 }
 
 /// Get header by number from the global header provider
 /// Directly calls the stored HeaderProvider::header_by_number() function
-pub fn get_header_by_number_from_provider(block_number: u64) -> Option<Header> {
+pub fn get_canonical_header_by_number_from_provider(block_number: u64) -> Option<Header> {
     let provider_fn = HEADER_BY_NUMBER_PROVIDER.get()?;
     provider_fn(block_number)
 }
 
 /// Get header by hash - simplified interface
-pub fn get_header_by_hash(block_hash: &B256) -> Option<Header> {
-    get_header_by_hash_from_provider(block_hash)
+pub fn get_canonical_header_by_hash(block_hash: &B256) -> Option<Header> {
+    get_canonical_header_by_hash_from_provider(block_hash)
 }
 
 /// Get header by number - simplified interface
-pub fn get_header_by_number(block_number: u64) -> Option<Header> {
-    get_header_by_number_from_provider(block_number)
+pub fn get_canonical_header_by_number(block_number: u64) -> Option<Header> {
+    get_canonical_header_by_number_from_provider(block_number)
 }
 
 /// Get the best block number from the global provider if initialized
-pub fn get_best_block_number() -> Option<u64> {
+pub fn get_best_canonical_block_number() -> Option<u64> {
     BEST_BLOCK_NUMBER_PROVIDER.get().and_then(|f| f())
 }
 
 /// Get the best total difficulty (u128 approximation) if available
-pub fn get_best_total_difficulty_u128() -> Option<u128> {
+pub fn get_best_canonical_td() -> Option<u128> {
     BEST_TD_PROVIDER.get().and_then(|f| f())
 }
 
