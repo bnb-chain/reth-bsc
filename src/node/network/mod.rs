@@ -222,10 +222,10 @@ impl BscNetworkBuilder {
         use crate::node::network::block_import::service::ImportService;
         
         // Create consensus instance for ImportService
-        let consensus = Arc::new(ParliaConsensus { 
-            provider: ctx.provider().clone(),
-            chain_spec: ctx.chain_spec().clone(),
-        });
+        let consensus = Arc::new(ParliaConsensus::new(
+            ctx.provider().clone(),
+            ctx.chain_spec().clone(),
+        ));
         
         // Spawn the critical ImportService task exactly like the official implementation
         ctx.task_executor().spawn_critical("block import", async move {
