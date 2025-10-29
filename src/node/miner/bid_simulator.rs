@@ -15,6 +15,7 @@ use std::sync::Arc;
 use reth::payload::EthPayloadBuilderAttributes;
 use reth_payload_primitives::PayloadBuilderAttributes;
 use crate::chainspec::{BscChainSpec};
+use reth_chainspec::EthChainSpec;
 use std::collections::HashMap;
 use alloy_primitives::{Address, B256};
 use reth_primitives::SealedHeader;
@@ -25,6 +26,11 @@ use parking_lot::RwLock;
 use crate::node::miner::util::prepare_new_attributes;
 use crate::node::miner::bsc_miner::MiningContext;
 use crate::consensus::parlia::provider::SnapshotProvider;
+use std::sync::atomic::{AtomicBool, Ordering};
+use crate::node::miner::payload::DELAY_LEFT_OVER;
+
+const NO_INTERRUPT_LEFT_OVER: u64 = 500;
+const PAY_BID_TX_GAS_LIMIT: u64 = 25000;
 
 #[derive(Clone)]
 pub struct Bid {
@@ -37,6 +43,7 @@ pub struct Bid {
     pub builder_fee: U256,
     pub committed: bool,
     pub bid_hash: B256,
+    pub interrupt_flag: Arc<AtomicBool>,
 }
 
 impl Bid
@@ -52,13 +59,13 @@ impl std::fmt::Debug for Bid {
             .field("builder", &format!("{:?}", self.builder))
             .field("block_number", &self.block_number)
             .field("parent_hash", &format!("{:?}", self.parent_hash))
-            .field("txs_count", &self.txs.len())  // 只显示交易数量，避免输出过长
+            .field("txs_count", &self.txs.len()) 
             .field("gas_used", &self.gas_used)
             .field("gas_fee", &self.gas_fee)
             .field("builder_fee", &self.builder_fee)
             .field("committed", &self.committed)
             .field("bid_hash", &format!("{:?}", self.bid_hash))
-            .finish()  // 移除分号，返回 Result
+            .finish()  
     }
 }
 
@@ -129,20 +136,21 @@ where Client: HeaderProvider<Header = alloy_consensus::Header> + BlockHashReader
         self.pending_bid.write().insert(key, 1);
     }
 
-    pub fn commit_new_bid(&self, bid: NewBidPackage) {
+    pub fn commit_new_bid(&self, bid: NewBidPackage) -> Option<BidRuntime<BscEvmConfig>> {
+        if !self.check_pending_bid(bid.bid.block_number, bid.bid.builder, bid.bid.bid_hash) {
+            debug!("bid is already pending, ignore");
+            return None;
+        }
         self.add_pending_bid(bid.bid.block_number, bid.bid.builder, bid.bid.bid_hash);
         let final_block_number   = match self.client.finalized_block_number() {
             Ok(Some(final_block_number)) => final_block_number,
-            Ok(None) => return,
-            Err(_) => return,
+            Ok(None) => return None,
+            Err(_) => return None,
         };
         if bid.bid.block_number <= final_block_number {
             // Bid is for a block that's already finalized, ignore it
-            // todo: async clear
-            self.clear(bid.bid.block_number, bid.bid.bid_hash);
-            return;
+            return None;
         }
-
 
         let parent_hash = bid.bid.parent_hash;
         let parent_header = match self.client.header(&parent_hash) {
@@ -152,14 +160,14 @@ where Client: HeaderProvider<Header = alloy_consensus::Header> + BlockHashReader
             },
             _ => {
                 debug!("Failed to get parent header for hash: {:?}", parent_hash);
-                return;
+                return None;
             }
         };
         let parent_snapshot = match self.snapshot_provider.snapshot_by_hash(&parent_hash) {
             Some(snapshot) => snapshot,
             None => {
                 debug!("Skip to mine new block due to no snapshot available, validator: {}, tip: {}", self.validator_address, parent_hash);
-                return;
+                return None;
             }
         };
         let mut mining_ctx = MiningContext {
@@ -180,7 +188,7 @@ where Client: HeaderProvider<Header = alloy_consensus::Header> + BlockHashReader
             Ok(bid_runtime   ) => bid_runtime,
             Err(err) => {
                 debug!("create runtime error:{}",err);
-                return;
+                return None;
             }
         };
         let mut to_commit = true;
@@ -193,12 +201,12 @@ where Client: HeaderProvider<Header = alloy_consensus::Header> + BlockHashReader
                 Ok(best_bid_runtime) => best_bid_runtime,
                 Err(err) => {
                     debug!("create runtime error:{}",err);
-                    return;
+                    return None;
                 }
             };
             if _bid_runtime.is_expected_better_than(&best_bid_runtime) {
                 debug!("new bid has better expectedBlockReward builder:{}, bid_hash:{}", _bid_runtime.bid.builder,"");
-            } else if best_bid.is_committed() {
+            } else if !best_bid.is_committed() {
                 _bid_runtime = best_bid_runtime;
                 _bid_accepted = false;
                 debug!("discard new bid and to simulate the non-committed bestBidToRun builder:{}, bid_hash:{}", _bid_runtime.bid.builder,"");
@@ -211,16 +219,27 @@ where Client: HeaderProvider<Header = alloy_consensus::Header> + BlockHashReader
 
         if to_commit {
             self.best_bid_to_run.write().insert(_bid_runtime.bid.parent_hash, _bid_runtime.bid.clone());
-            // todo: can be interrupted
-            // if let Some(simulating_bid) = self.simulating_bid.get(&bid.bid.parent_hash) {
 
-            // }
-            self.commit_bid(5, _bid_runtime)
-
+            if let Some(simulating_bid) = self.simulating_bid.read().get(&bid.bid.parent_hash).cloned() {
+                let delay_ms = self.parlia.delay_for_mining(&parent_snapshot, &parent_header, DELAY_LEFT_OVER);
+                if delay_ms >= NO_INTERRUPT_LEFT_OVER || delay_ms == 0 {
+                    simulating_bid.interrupt_flag.store(true, Ordering::Relaxed);
+                    let bid_simulate_req = self.commit_bid(5, _bid_runtime);
+                    return Some(bid_simulate_req);
+                }else {
+                    debug!("simulate in progress, no interrupt after delay_ms:{}, NO_INTERRUPT_LEFT_OVER:{},bid hash:{}", delay_ms, NO_INTERRUPT_LEFT_OVER, _bid_runtime.bid.bid_hash);
+                }
+            }else {
+                let bid_simulate_req = self.commit_bid(5, _bid_runtime);
+                return Some(bid_simulate_req);
+            }
         }
+
+        None
+        
     }
 
-    fn clear(&self, block_number: u64, _block_hash: B256) {
+    pub fn clear(&self, block_number: u64) {
         let clear_threshold = 5; //todo: config
         let min_block_number = block_number.saturating_sub(clear_threshold);
 
@@ -245,7 +264,7 @@ where Client: HeaderProvider<Header = alloy_consensus::Header> + BlockHashReader
     }
 
     fn new_bid_runtime(&self, _bid: &Bid, _validator_commission: u64, parent_header: SealedHeader, attributes: EthPayloadBuilderAttributes) -> Result<BidRuntime<BscEvmConfig>, Box<dyn std::error::Error + Send + Sync>>{
-        let mut runtime = BidRuntime::new(_bid.clone(), BscEvmConfig::new(self.chain_spec.clone()), parent_header, attributes);
+        let mut runtime = BidRuntime::new(_bid.clone(), BscEvmConfig::new(self.chain_spec.clone()), parent_header, attributes, self.chain_spec.clone());
         let expected_block_reward = _bid.gas_fee;
         let mut expected_validator_reward = expected_block_reward * U256::from(_validator_commission);
         expected_validator_reward /= U256::from(10000u64);
@@ -259,15 +278,16 @@ where Client: HeaderProvider<Header = alloy_consensus::Header> + BlockHashReader
         Ok(runtime)
     }
 
-    fn commit_bid(&self, reason: u32, mut bid_runtime: BidRuntime<BscEvmConfig>) {
+    fn commit_bid(&self, reason: u32, mut bid_runtime: BidRuntime<BscEvmConfig>) -> BidRuntime<BscEvmConfig> {
         // todo: interrupt
         debug!("bid committed reason:{}, bid hash:{}",reason, bid_runtime.bid.bid_hash);
         bid_runtime.bid.committed = true;
-        self.sim_bid(bid_runtime);
+
+        bid_runtime
     }
 
     // sim_bid commit tx and set best bid
-    fn sim_bid(&self, mut bid_runtime: BidRuntime<BscEvmConfig>) {
+    pub fn bid_simulate(&self, mut bid_runtime: BidRuntime<BscEvmConfig>) {
         if !self.bid_receiving {
             return 
         }
@@ -300,11 +320,18 @@ where Client: HeaderProvider<Header = alloy_consensus::Header> + BlockHashReader
         let parent_header = bid_runtime.parent_header.clone();
         let attributes = bid_runtime.attributes.clone();
         let builder_config = bid_runtime.builder_config.clone();
+        let gas_limit = builder_config.gas_limit(parent_header.gas_limit);
+        let system_txs_gas = self.parlia.estimate_gas_reserved_for_system_txs(Some(parent_header.timestamp), parent_header.number+1, attributes.timestamp);
+        if bid_runtime.bid.gas_used > gas_limit - system_txs_gas - PAY_BID_TX_GAS_LIMIT {
+            debug!("bidSimulator: gas limit exceeded, ignore");
+            return;
+        }
+
         let mut builder = match evm_config.builder_for_next_block(&mut db, &parent_header, NextBlockEnvAttributes {
                 timestamp:        attributes.timestamp(),
                 suggested_fee_recipient: attributes.suggested_fee_recipient(),
                 prev_randao:      attributes.prev_randao(),
-                gas_limit:        builder_config.gas_limit(parent_header.gas_limit),
+                gas_limit,
                 parent_beacon_block_root: attributes.parent_beacon_block_root(),
                 withdrawals:     Some(attributes.withdrawals().clone()),
             }).map_err(PayloadBuilderError::other) {
@@ -315,18 +342,30 @@ where Client: HeaderProvider<Header = alloy_consensus::Header> + BlockHashReader
             }
         };
         
+
+        let block_gas_limit: u64 = builder.evm_mut().block().gas_limit.saturating_sub(system_txs_gas);
+        
+        // todo: prefetch transactions
+
         if let Err(e) = builder.apply_pre_execution_changes().map_err(PayloadBuilderError::other) {
             debug!("Failed to apply pre-execution changes: {:?}", e);
             return;
         }
         
         // First commit: bid transactions
-        bid_runtime.commit_transaction(txs_except_last, &mut builder);
+        if let Err(e) = bid_runtime.commit_transaction(txs_except_last, &mut builder, block_gas_limit) {
+            debug!("Failed to commit bid transactions: {:?}", e);
+            return;
+        }
 
-        // todo: get system balance from ctx
+
+        // let delay_ms = self.parlia.delay_for_mining(&bid_runtime.parent_snapshot, , DELAY_LEFT_OVER);
+        // if delay_ms == 0 {
+        //     debug!("delay_ms is 0, no time left for simulation, ignore");
+        //     return;
+        // }
+
         let system_balance = bid_runtime.gas_fee;
-
-        // todo: check whether time `NoInterruptLeftOver-delayLeftOver` is enough for simulating
         if let Err(e) = bid_runtime.pack_reward(100, system_balance) {
             debug!("Failed to pack reward: {:?}", e);
             return;
@@ -335,6 +374,7 @@ where Client: HeaderProvider<Header = alloy_consensus::Header> + BlockHashReader
             debug!("bidSimulator: invalid bid, ignore");
             return;
         }
+        
         if bid_runtime.gas_used != 0 {
             let bid_gas_price = bid_runtime.gas_fee / U256::from(bid_runtime.gas_used);
             if bid_gas_price < self.min_gas_price {
@@ -344,10 +384,13 @@ where Client: HeaderProvider<Header = alloy_consensus::Header> + BlockHashReader
         }
         // todo: if enable greedy merge, fill bid env with transactions from mempool
 
-        // Second commit: pay bid transaction
+        // Second commit: pay bid transaction (gas limit already includes space for this)
         if let Some(pay_bid_tx) = pay_bid_tx {
             let pay_bid_txs = vec![pay_bid_tx];
-            bid_runtime.commit_transaction(pay_bid_txs, &mut builder);
+            if let Err(e) = bid_runtime.commit_transaction(pay_bid_txs, &mut builder, block_gas_limit) {
+                debug!("Failed to commit pay bid transaction: {:?}", e);
+                return;
+            }
         } else {
             debug!("No pay bid transaction found, skipping bid");
             return;
@@ -395,6 +438,7 @@ where Client: HeaderProvider<Header = alloy_consensus::Header> + BlockHashReader
         );
 
         self.simulating_bid.write().remove(&parent_hash);
+        bid_runtime.finished.store(true, Ordering::Relaxed);
         if !success {
             self.best_bid_to_run.write().remove(&parent_hash);
         }
@@ -416,7 +460,7 @@ pub struct BidRuntime<EvmConfig = BscEvmConfig> {
     packed_block_reward: U256,
     packed_validator_reward: U256,
 
-    //finished: bool,
+    finished: Arc<AtomicBool>,
     // todo: duration
 
     // evn
@@ -424,6 +468,7 @@ pub struct BidRuntime<EvmConfig = BscEvmConfig> {
     parent_header: SealedHeader,
     attributes: EthPayloadBuilderAttributes,
     builder_config: EthereumBuilderConfig,
+    chain_spec: Arc<BscChainSpec>,
     pub bsc_payload: BscBuiltPayload,
     
     gas_used: u64,
@@ -435,7 +480,7 @@ where
 EvmConfig: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
 <EvmConfig as ConfigureEvm>::Primitives: reth_primitives_traits::NodePrimitives<BlockHeader = alloy_consensus::Header, SignedTx = alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip4844>, Block = crate::node::primitives::BscBlock>,
 {
-    fn new(bid: Bid, evm_config: EvmConfig, parent_header: SealedHeader, attributes: EthPayloadBuilderAttributes) -> Self {
+    fn new(bid: Bid, evm_config: EvmConfig, parent_header: SealedHeader, attributes: EthPayloadBuilderAttributes, chain_spec: Arc<BscChainSpec>) -> Self {
         Self {
             bid,
             evm_config,
@@ -449,6 +494,8 @@ EvmConfig: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
             attributes,
             gas_used: 0,
             gas_fee: U256::ZERO,
+            finished: Arc::new(AtomicBool::new(false)),
+            chain_spec,
         }
     }
 
@@ -456,29 +503,71 @@ EvmConfig: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
         self.expected_block_reward >= ohter.expected_block_reward && self.expected_validator_reward >= ohter.expected_validator_reward
     }
 
-    fn commit_transaction<B>(&mut self, bid_txs: Vec<TransactionSigned>, builder: &mut B)
+    fn commit_transaction<B>(&mut self, bid_txs: Vec<TransactionSigned>, builder: &mut B, block_gas_limit: u64) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
         B: BlockBuilder,
         B::Primitives: reth_primitives_traits::NodePrimitives<SignedTx = TransactionSigned>,
     {
+        let mut block_blob_count = 0;
         let mut gas_used: u64 = 0;
         let mut gas_fee: U256 = U256::ZERO;
         let base_fee = builder.evm().block().basefee;
+        let mut cumulative_gas_used = 0;
+        let blob_params = self.chain_spec.blob_params_at_timestamp(self.attributes.timestamp());
+        let max_blob_count = blob_params.as_ref().map(|params| params.max_blob_count).unwrap_or_default();
         for tx in bid_txs {
+            // Check interrupt flag before processing each transaction
+            if self.bid.interrupt_flag.load(Ordering::Relaxed) {
+                debug!("Bid runtime interrupted before processing transaction");
+                return Err("bid runtime interrupted".into());
+            }
+            // ensure we still have capacity for this transaction
+            if cumulative_gas_used + tx.gas_limit() > block_gas_limit {
+                // we can't fit this transaction into the block, so we need to mark it as invalid
+                // which also removes all dependent transaction from the iterator before we can
+                // continue
+                debug!("bidSimulator: gas limit exceeded, ignore");
+                continue;
+            }
+            cumulative_gas_used += tx.gas_limit();
+            
+            // Check blob transaction limits before moving tx
+            if let Some(blob_tx) = tx.as_eip4844() {
+                let tx_blob_count = blob_tx.tx().blob_versioned_hashes.len() as u64;
+
+                if block_blob_count + tx_blob_count > max_blob_count {
+                    debug!(target: "payload_builder", tx=?tx.hash(), ?block_blob_count, "skipping blob transaction because it would exceed the max blob count per block");
+                    continue
+                }
+
+                // Note: For bid simulation, we skip sidecar validation as the bid has already
+                // been validated when submitted. Sidecars are not included in bid transactions.
+                // We only need to track blob count for gas limit purposes.
+                block_blob_count += tx_blob_count;
+            }
+            
             let tx_effective_gas_price = tx.effective_gas_price(Some(base_fee));
             let recovered_tx = match tx.try_into_recovered() {
                 Ok(recovered) => recovered,
                 Err(err) => {
                     debug!("Failed to recover transaction signature: {:?}", err);
-                    continue;
+                    return Err("Failed to recover transaction signature".into());
                 }
             };
-            let _gas_used = builder.execute_transaction(recovered_tx).map_err(PayloadBuilderError::other).unwrap();
+
+            let _gas_used = match builder.execute_transaction(recovered_tx).map_err(PayloadBuilderError::other) {
+                Ok(gas_used) => gas_used,
+                Err(err) => {
+                    debug!("Failed to execute transaction: {:?}", err);
+                    return Err("Failed to execute transaction".into());
+                }
+            };
             gas_used += _gas_used;
             gas_fee += (U256::from(tx_effective_gas_price) + U256::from(base_fee)) * U256::from(_gas_used);
         }
         self.gas_used += gas_used;
         self.gas_fee += gas_fee;
+        Ok(())
     }
 
     fn pack_reward(&mut self, validator_commission: u64, system_balance: U256) -> Result<(), Box<dyn std::error::Error>> {

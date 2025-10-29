@@ -39,7 +39,7 @@ use reth_chainspec::EthereumHardforks;
 
 
 /// Delay left over for mining calculation
-const DELAY_LEFT_OVER: u64 = 50;
+pub const DELAY_LEFT_OVER: u64 = 50;
 
 /// Time multiplier for retry condition check
 const TIME_MULTIPLIER: u32 = 2;

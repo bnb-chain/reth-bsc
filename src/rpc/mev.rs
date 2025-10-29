@@ -161,6 +161,7 @@ impl MevApiImpl {
             builder_fee: bid_args.raw_bid.builder_fee,
             committed: false,
             bid_hash,
+            interrupt_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         debug!("bid: {:?}", bid);
 

@@ -37,7 +37,7 @@ use alloy_primitives::U128;
 use reth_network::message::{NewBlockMessage, PeerMessage};
 use alloy_rlp::Encodable;
 use alloy_primitives::keccak256;
-use crate::node::miner::bid_simulator::BidSimulator;
+use crate::node::miner::bid_simulator::{BidSimulator, BidRuntime};
 use std::time::Duration;
 use std::sync::Mutex;
 use lru::LruCache;
@@ -587,6 +587,9 @@ where
 
 pub struct MevWorkWorker<Provider> {
     simulator: Arc<BidSimulator<Provider>>,  // No outer RwLock, each map has its own lock
+    bid_simulate_req_rx: mpsc::UnboundedReceiver<BidRuntime<BscEvmConfig>>,
+    bid_simulate_req_tx: mpsc::UnboundedSender<BidRuntime<BscEvmConfig>>,
+    provider: Provider,
 }
 
 impl<Provider> MevWorkWorker<Provider>
@@ -602,17 +605,42 @@ where
 {
     pub fn new(
         simulator: Arc<BidSimulator<Provider>>,
+        provider: Provider,
     ) -> Self {
-        Self { simulator }
+        let (bid_simulate_req_tx, bid_simulate_req_rx) = mpsc::unbounded_channel::<BidRuntime<BscEvmConfig>>();
+        Self { simulator, bid_simulate_req_rx, bid_simulate_req_tx, provider }
     }
 
-    pub async fn run(self) {
+    pub async fn run(mut self) {
         info!("Starting MevWorkWorker");
+        let mut send_bid_interval = tokio::time::interval(Duration::from_millis(20));
+        let mut clear_bid_interval = tokio::time::interval(Duration::from_millis(1000));
+        
         loop {
-            // Interval for checking bid packages
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            // Attempt to send bids
-            self.get_bid_and_send();
+            tokio::select! {
+                bid_runtime = self.bid_simulate_req_rx.recv() => {
+                    match bid_runtime {
+                        Some(bid_runtime) => {
+                            self.simulator.bid_simulate(bid_runtime);
+                        }
+                        None => {
+                            warn!("Bid simulate request channel closed");
+                            break;
+                        }
+                    }
+                }
+                
+                // Interval for checking bid packages
+                _ = send_bid_interval.tick() => {
+                    // Attempt to send bids
+                    self.get_bid_and_send();
+                }
+
+                _ = clear_bid_interval.tick() => {
+                    let last_block_number = self.provider.last_block_number().unwrap_or(0);
+                    self.simulator.clear(last_block_number);
+                }
+            }
         }
     }
 
@@ -621,7 +649,11 @@ where
         // Read bid packages from the global queue
         if let Some(bid_package) = crate::shared::pop_bid_package() {
             debug!("Popped bid package from queue, block: {}, committing to simulator", bid_package.bid.block_number);
-            self.simulator.commit_new_bid(bid_package);
+            if let Some(req) = self.simulator.commit_new_bid(bid_package) {
+                if let Err(e) = self.bid_simulate_req_tx.send(req) {
+                    error!("Failed to send bid simulate request due to channel closed: {}", e);
+                }
+            }
         }
     }
 }
@@ -722,6 +754,7 @@ where
         
         let mev_work_worker = MevWorkWorker::new(
             simulator.clone(),
+            provider.clone(),
         );
 
         let miner = Self {
