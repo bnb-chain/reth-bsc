@@ -250,8 +250,6 @@ where
                         Some(ctx) => {
                             let next_block = ctx.parent_header.number() + 1;
                             debug!("Received mining context, next_block: {}", next_block);
-                            let _parent_hash = ctx.parent_header.hash();
-
                             match self.try_mine_block(ctx).await {
                                 Ok(()) => {
                                     debug!("Succeed to mine block, next_block: {}", next_block);
@@ -588,10 +586,7 @@ where
         // Read bid packages from the global queue
         if let Some(bid_package) = crate::shared::pop_bid_package() {
             debug!("Popped bid package from queue, block: {}, committing to simulator", bid_package.bid.block_number);
-            let start = std::time::Instant::now();
-            // No outer lock to acquire - each map handles its own locking
             self.simulator.commit_new_bid(bid_package);
-            debug!("✅ Bid committed to simulator, total time: {}ms", start.elapsed().as_millis());
         }
     }
 }
