@@ -87,6 +87,7 @@ eyre = "0.6"
 futures = "0.3"
 hex = "0.4"
 lazy_static = "1.4.0"
+lru = "0.12"
 phf = { version = "0.11", features = ["macros"] }
 once_cell = { version = "1.19", default-features = false, features = ["alloc"] }
 parity-bytes = { version = "0.1.2", default-features = false }

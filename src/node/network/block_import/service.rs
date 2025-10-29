@@ -9,6 +9,7 @@ use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::{B256, U128};
 use alloy_rpc_types::engine::{ForkchoiceState, PayloadStatusEnum};
 use futures::{future::Either, stream::FuturesUnordered, StreamExt};
+use parking_lot::RwLock;
 use reth::network::cache::LruCache;
 use reth_engine_primitives::{BeaconConsensusEngineHandle, EngineTypes};
 use reth_network::{
@@ -104,7 +105,7 @@ where
         let engine = self.engine.clone();
         let consensus = self.consensus.clone();
 
-        tracing::debug!(target: "bsc::block_import", "New payload: block = {:?}, peer_id = {:?}", block, peer_id);
+        tracing::debug!(target: "bsc::block_import", "New payload: block = ({:?}, {:?}), peer_id = {:?}", block.block.0.block.header.number, block.block.0.block.header.hash_slow(), peer_id);
         Box::pin(async move {
             let sealed_block = block.block.0.block.clone().seal();
             let header = sealed_block.header().clone();
@@ -137,10 +138,11 @@ where
         engine: BeaconConsensusEngineHandle<BscPayloadTypes>, 
         consensus: Arc<ParliaConsensus<Provider>>,
         new_header: Header) -> Result<(), ParliaConsensusErr> {
-        let last_canonical_number = consensus.provider.last_block_number()?;
-        tracing::debug!(target: "parlia", "Last canonical number: {:?}, new_header = {:?}", last_canonical_number, new_header);
-        let current_head = consensus.provider.header_by_number(last_canonical_number)?.ok_or(ParliaConsensusErr::HeadHashNotFound)?;
-        let new_canonical_head = consensus.canonical_head(&new_header, &current_head)?;
+        let best_number = consensus.provider.chain_info()?.best_number;
+        tracing::debug!(target: "parlia", "Best canonical number: {:?}, new_header = {:?}", best_number, new_header);
+        let current_head = consensus.provider.header_by_number(best_number)?.ok_or(ParliaConsensusErr::HeadHashNotFound)?;
+        let (new_td, current_td) = consensus.header_td_fcu(&engine, &new_header, &current_head).await?;
+        let new_canonical_head = consensus.canonical_head((&new_header, new_td), (&current_head, current_td))?;
         // get safe block and finalized block with new canonical head
         // ref: https://github.com/bnb-chain/bsc/blob/f70aaa8399ccee429804eecf3fc4c6fd8d9e6cab/eth/api_backend.go#L72
         let (safe_block_number, safe_block_hash) = consensus.get_justified_number_and_hash(new_canonical_head).unwrap_or((0, B256::ZERO));
@@ -151,7 +153,8 @@ where
             finalized_block_hash,
         };
 
-        tracing::debug!(target: "parlia", "Fork choice updated: state = {:?}, new_canonical_head = {:?}, new_header = {:?}", state, new_canonical_head, new_header);
+        tracing::debug!(target: "parlia", "Fork choice updated: state = {:?}, new_canonical_head = ({:?}, {:?}), new_header = ({:?}, {:?})", 
+            state, new_canonical_head.number, new_canonical_head.hash_slow(), new_header.number, new_header.hash_slow());
         match engine.fork_choice_updated(state, None, EngineApiMessageVersion::default()).await
         {
             Ok(response) => match response.payload_status.status {
@@ -308,6 +311,7 @@ mod tests {
     use reth_node_ethereum::EthEngineTypes;
     use reth_primitives::{Block, SealedHeader};
     use reth_provider::ProviderError;
+    use schnellru::{ByLength, LruMap};
     use std::{
         collections::HashMap, sync::Arc, task::{Context, Poll}
     };
@@ -556,10 +560,10 @@ mod tests {
         /// Create a new test fixture with the given engine responses
         async fn new(responses: EngineResponses) -> Self {
             // Use mainnet chain spec for tests; it influences only fast-finality parsing.
-            let consensus = Arc::new(ParliaConsensus { 
-                provider: MockProvider::new(), 
-                chain_spec: Arc::new(crate::chainspec::BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet())),
-            });
+            let mut consensus = Arc::new(ParliaConsensus::new(
+                MockProvider::new(), 
+                Arc::new(crate::chainspec::BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet())),
+            ));
             let (to_engine, from_engine) = mpsc::unbounded_channel();
             let engine_handle = BeaconConsensusEngineHandle::new(to_engine);
 

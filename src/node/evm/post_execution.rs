@@ -61,7 +61,8 @@ where
             };
             if !signed_recently {
                 self.slash_spoiled_validator(block.beneficiary, spoiled_validator)?;
-                tracing::debug!("Slash spoiled validator, block_number: {}, spoiled_validator: {}", block.number, spoiled_validator);
+                tracing::debug!("Slash spoiled validator, block_number: {}, spoiled_validator: {}, backoff_validator: {}", 
+                    block.number, spoiled_validator, block.beneficiary);
             }
         }
 

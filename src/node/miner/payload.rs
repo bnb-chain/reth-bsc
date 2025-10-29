@@ -44,9 +44,6 @@ const DELAY_LEFT_OVER: u64 = 50;
 /// Time multiplier for retry condition check
 const TIME_MULTIPLIER: u32 = 2;
 
-/// Maximum number of retries for payload building
-const MAX_RETRIES: u32 = 300;
-
 /// Errors that can occur during payload job execution
 #[derive(Debug, thiserror::Error)]
 pub enum BscPayloadJobError {
@@ -102,6 +99,7 @@ pub struct BscPayloadBuilder<Pool, Client, EvmConfig = BscEvmConfig> {
     builder_config: EthereumBuilderConfig,
     /// Bsc chain spec.
     chain_spec: Arc<BscChainSpec>,
+    /// Parlia consensus engine.
     parlia: Arc<Parlia<BscChainSpec>>,
 }
 
@@ -364,7 +362,10 @@ impl BscPayloadJobHandle {
 }
 
 /// BscPayloadJob is used to async build payloads to get best payload.
-pub struct BscPayloadJob<Pool, Client, EvmConfig = BscEvmConfig> {
+pub struct BscPayloadJob<Pool, Client, EvmConfig = BscEvmConfig> 
+where
+    Pool: TransactionPool,
+{
     /// Parlia consensus engine
     parlia: Arc<crate::consensus::parlia::Parlia<crate::chainspec::BscChainSpec>>,
     /// Mining context
@@ -377,6 +378,8 @@ pub struct BscPayloadJob<Pool, Client, EvmConfig = BscEvmConfig> {
     try_build_rx: mpsc::UnboundedReceiver<()>,
     /// Sender for sending arguments back to queue
     try_build_tx: mpsc::UnboundedSender<()>,
+    /// Listener for new transactions from the pool
+    tx_listener: mpsc::UnboundedReceiver<alloy_primitives::B256>,
     /// Abort receiver for external termination
     abort_rx: oneshot::Receiver<()>,
     /// Abort flag
@@ -413,10 +416,20 @@ where
     ) -> (Self, BscPayloadJobHandle) {
         let (abort_tx, abort_rx) = oneshot::channel();
         let (try_build_tx, try_build_rx) = mpsc::unbounded_channel();
+        let (tx_listener_tx, tx_listener_rx) = mpsc::unbounded_channel();
+        
         let mining_delay = parlia.clone().delay_for_mining(
             &mining_ctx.parent_snapshot, 
             mining_ctx.header.as_ref().unwrap(), 
             DELAY_LEFT_OVER);
+
+        // Spawn a background task to listen for new transactions from pool
+        let mut pool_listener = builder.pool.pending_transactions_listener();
+        tokio::spawn(async move {
+            while let Some(tx_hash) = pool_listener.recv().await {
+                let _ = tx_listener_tx.send(tx_hash);
+            }
+        });
 
         let job = Self {
             parlia,
@@ -425,6 +438,7 @@ where
             timeout: std::time::Duration::from_millis(mining_delay),
             try_build_rx,
             try_build_tx: try_build_tx.clone(),
+            tx_listener: tx_listener_rx,
             abort_rx,
             is_aborted: false,
             result_tx,
@@ -449,7 +463,7 @@ where
             warn!("Failed to send to first try build queue due to {}, block_number: {}", err, self.build_args.config.parent_header.number()+1);
             return Err(Box::new(BscPayloadJobError::BuildQueueSendError(err.to_string())));
         }
-
+    
         loop {
             tokio::select! {
                 // Trigger the async build payload by queue.
@@ -482,6 +496,7 @@ where
                                 return Err(Box::new(BscPayloadJobError::JobAborted));
                             }
                             let elapsed = start_time.elapsed();
+                            let payload_tx_count = payload.block().body().transaction_count();
                             debug!("Succeed to try new build: {} (hash: 0x{:x}, txs: {}, fees: {}, cost_time: {:?}, retries: {})", 
                                 payload.block().header().number(),
                                 payload.block().hash(),
@@ -491,34 +506,56 @@ where
                                 self.retries
                             );
                             self.potential_payloads.push(payload);
-
-                            // No outer lock needed - each map has its own fine-grained locks
-                            let best_bid = self.simulator.get_best_bid(self.mining_ctx.parent_header.hash());
-                            if let Some(bid) = best_bid {
-                                info!("Found best bid! block: {}, builder: {:?}, gas_fee: {}", bid.bid.block_number, bid.bid.builder, bid.bid.gas_fee);
-                                self.potential_payloads.push(bid.bsc_payload);
-                            }
-
-                            let mining_delay = self.parlia.delay_for_mining(
-                                &self.mining_ctx.parent_snapshot, 
-                                self.mining_ctx.header.as_ref().unwrap(), 
-                                DELAY_LEFT_OVER);
-
-                            // TODO: check more details and refine it later, listen new trxs.
-                            // There is still plenty of time left and retry to build payload.
-                            //if std::time::Duration::from_millis(mining_delay) > elapsed * TIME_MULTIPLIER && self.retries < MAX_RETRIES {
-                            if std::time::Duration::from_millis(mining_delay) > elapsed * TIME_MULTIPLIER {
-                                if let Err(err) = self.try_build_tx.send(()) {
-                                    warn!("Failed to send to try build queue, block_number: {}, retries: {}, error: {:?}", 
-                                        self.build_args.config.parent_header.number()+1, self.retries, err);
-                                    return self.try_return_best_payload();
+                            let mut new_tx_count = 0;
+                            // loop wait new transactions or timeout.
+                            loop {
+                                tokio::select! {
+                                    // Finish timeout by timer.
+                                    _ = tokio::time::sleep(self.timeout) => {
+                                        info!("try return best payload due to has no time, cost_time: {:?}, block_number: {}, retries: {}", 
+                                            elapsed, self.build_args.config.parent_header.number()+1, self.retries);
+                                        return self.try_return_best_payload();
+                                    }
+                                    // Abort by new head.
+                                    _ = &mut self.abort_rx => {
+                                        info!("Abort payload building by new head, cost_time: {:?}, block_number: {}, retries: {}", 
+                                            elapsed, self.build_args.config.parent_header.number()+1, self.retries);
+                                        self.build_args.cancel.clone().cancel();
+                                        self.is_aborted = true;
+                                        return Err(Box::new(BscPayloadJobError::JobAborted));
+                                    }
+                                    Some(_tx_hash) = self.tx_listener.recv() => {
+                                        new_tx_count+=1;
+                                        let mining_delay = self.parlia.delay_for_mining(
+                                            &self.mining_ctx.parent_snapshot, 
+                                            self.mining_ctx.header.as_ref().unwrap(), 
+                                            DELAY_LEFT_OVER);
+                                        if std::time::Duration::from_millis(mining_delay) < elapsed {
+                                            debug!("try return best payload due to mining_delay < elapsed, block_number: {}, retries: {}, mining_delay: {:?}, elapsed: {:?}", 
+                                                self.build_args.config.parent_header.number()+1, self.retries, mining_delay, elapsed);
+                                            return self.try_return_best_payload();
+                                        } else if std::time::Duration::from_millis(mining_delay) < elapsed * TIME_MULTIPLIER {
+                                            if let Err(err) = self.try_build_tx.send(()) {
+                                                warn!("Failed to send to try build queue, block_number: {}, retries: {}, error: {:?}", 
+                                                    self.build_args.config.parent_header.number()+1, self.retries, err);
+                                                return self.try_return_best_payload();
+                                            }
+                                            debug!("Succeed to send to try build queue, block_number: {}, retries: {}, last_cost_time: {:?}, new_mining_delay: {:?}", 
+                                                    self.build_args.config.parent_header.number()+1, self.retries, elapsed, std::time::Duration::from_millis(mining_delay));
+                                            break;  // Break out of the loop and wait for the next payload
+                                        } else if new_tx_count >= payload_tx_count {
+                                            if let Err(err) = self.try_build_tx.send(()) {
+                                                warn!("Failed to send to try build queue, block_number: {}, retries: {}, error: {:?}", 
+                                                    self.build_args.config.parent_header.number()+1, self.retries, err);
+                                                return self.try_return_best_payload();
+                                            }
+                                            debug!("Succeed to send to try build queue, block_number: {}, retries: {}, last_cost_time: {:?}, new_mining_delay: {:?}", 
+                                                self.build_args.config.parent_header.number()+1, self.retries, elapsed, std::time::Duration::from_millis(mining_delay));
+                                            break; // Break out of the loop and wait for the next payload
+                                        }
+                                    }
                                 }
-                                debug!("Succeed to send to try build queue, block_number: {}, retries: {}, last_cost_time: {:?}, new_mining_delay: {:?}", 
-                                    self.build_args.config.parent_header.number()+1, self.retries, elapsed, std::time::Duration::from_millis(mining_delay));
-                            } else {
-                                return self.try_return_best_payload();
                             }
-                            //tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
                         },
                         Some(Ok(Err(e))) => {
                             let elapsed = start_time.elapsed();
@@ -541,7 +578,7 @@ where
                 // Finish timeout by timer.
                 _ = tokio::time::sleep(self.timeout) => {
                     let elapsed = start_time.elapsed();
-                    info!("try return best payload due to has no time, cost_time: {:?}, block_number: {}, retries: {}", 
+                    info!("Try return best payload due to has no time, cost_time: {:?}, block_number: {}, retries: {}", 
                         elapsed, self.build_args.config.parent_header.number()+1, self.retries);
                     self.build_args.cancel.clone().cancel();
                     return self.try_return_best_payload();
@@ -550,8 +587,8 @@ where
                 // Abort by new head.
                 _ = &mut self.abort_rx => {
                     let elapsed = start_time.elapsed();
-                    info!("Abort payload building by new head, cost_time: {:?}, block_number: {}, retries: {}", 
-                        elapsed, self.build_args.config.parent_header.number()+1, self.retries);
+                    info!("Abort payload building by new head, cost_time: {:?}, block_number: {}, parent_hash: 0x{:x}, retries: {}", 
+                        elapsed, self.build_args.config.parent_header.number()+1, self.build_args.config.parent_header.parent_hash(), self.retries);
                     self.build_args.cancel.clone().cancel();
                     self.is_aborted = true;
                     return Err(Box::new(BscPayloadJobError::JobAborted));

@@ -39,6 +39,11 @@ use alloy_rlp::Encodable;
 use alloy_primitives::keccak256;
 use crate::node::miner::bid_simulator::BidSimulator;
 use std::time::Duration;
+use std::sync::Mutex;
+use lru::LruCache;
+
+/// Maximum number of recently mined blocks to track for double signing prevention
+const RECENT_MINED_BLOCKS_CACHE_SIZE: usize = 100;
 
 #[derive(Clone)]
 pub struct MiningContext {
@@ -92,7 +97,7 @@ where
         info!("Succeed to spawn new work worker, address: {}", self.validator_address);
         
         if let Some(tip_header) = self.get_tip_header_at_startup() {
-            debug!("try new work at startup, tip_block: {}", tip_header.number());
+            debug!("Try new work at startup, tip_block={}", tip_header.number());
             self.try_new_work(&tip_header).await;
         }
         
@@ -104,7 +109,7 @@ where
                     let committed = event.committed();
                     let tip = committed.tip();
                     debug!(
-                        "try new work, tip_block={}, hash={}, parent_hash={}, miner={}, diff={}, committed_blocks={}",
+                        "Try new work, tip_block={}, hash={}, parent_hash={}, miner={}, diff={}, committed_blocks={}",
                         committed.tip().number(),
                         format!("0x{:x}", committed.tip().hash()),
                         format!("0x{:x}", committed.tip().parent_hash()),
@@ -362,6 +367,8 @@ pub struct ResultWorkWorker<Provider> {
     delay_submit_rx: mpsc::UnboundedReceiver<BscBuiltPayload>,
     /// Sender for delayed payloads
     delay_submit_tx: mpsc::UnboundedSender<BscBuiltPayload>,
+    /// LRU cache to track recently mined blocks to prevent double signing
+    recent_mined_blocks: Arc<Mutex<LruCache<u64, Vec<alloy_primitives::B256>>>>,
 }
 
 impl<Provider> ResultWorkWorker<Provider>
@@ -376,6 +383,7 @@ where
         payload_rx: mpsc::UnboundedReceiver<SubmitContext>,
     ) -> Self {
         let (delay_submit_tx, delay_submit_rx) = mpsc::unbounded_channel::<BscBuiltPayload>();
+        let recent_mined_blocks = Arc::new(Mutex::new(LruCache::new(std::num::NonZeroUsize::new(RECENT_MINED_BLOCKS_CACHE_SIZE).unwrap())));
         Self {
             validator_address,
             provider,
@@ -383,6 +391,7 @@ where
             payload_rx,
             delay_submit_tx,
             delay_submit_rx,
+            recent_mined_blocks,
         }
     }
 
@@ -478,11 +487,36 @@ where
     /// Submit a built payload to the engine-tree/network
     async fn submit_payload(&self, payload: BscBuiltPayload) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let sealed_block = payload.block();
+        let block_hash = sealed_block.hash();
         let block_number = sealed_block.number();
-        if block_number <= self.provider.last_block_number()? {
+        let parent_hash = sealed_block.header().parent_hash;
+        if block_number <= self.provider.chain_info()?.best_number {
             debug!("Skip to submit block due to block number is less than last block number, block_number: {}, last_block_number: {}", 
                 block_number, self.provider.last_block_number()?);
             return Ok(());
+        }
+
+        {   // check double sign
+            let mut cache = self.recent_mined_blocks.lock().unwrap();
+            if let Some(prev_parents) = cache.get(&block_number) {
+                let mut double_sign = false;
+                for prev_parent in prev_parents {
+                    if *prev_parent == parent_hash {
+                        error!("Reject Double Sign!! block: {}, hash: 0x{:x}, root: 0x{:x}, ParentHash: 0x{:x}", 
+                            block_number, block_hash, sealed_block.header().state_root, parent_hash);
+                        double_sign = true;
+                        break;
+                    }
+                }
+                if double_sign {
+                    return Ok(());
+                }
+                let mut updated_parents = prev_parents.clone();
+                updated_parents.push(parent_hash);
+                cache.put(block_number, updated_parents);
+            } else {
+                cache.put(block_number, vec![parent_hash]);
+            }
         }
 
         let block_hash = sealed_block.hash();
@@ -492,9 +526,10 @@ where
         } else { 
             "offturn" 
         };
-        debug!("Submitting block {} (hash: 0x{:x}, txs: {}, gas_used: {}, turn_status: {})", 
+        debug!("Submitting block {} (hash: 0x{:x}, parent_hash: 0x{:x}, txs: {}, gas_used: {}, turn_status: {})", 
                block_number, 
                block_hash, 
+               parent_hash,
                sealed_block.body().transaction_count(),
                sealed_block.gas_used(),
                turn_status);
