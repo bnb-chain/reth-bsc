@@ -294,9 +294,6 @@ mod tests {
         }
     }
     impl ParliaSnapshotProvider for DummySnapProvider {
-        fn snapshot(&self, block_number: u64) -> Option<Snapshot> {
-            self.snap_store.read().ok().and_then(|m| m.get(&block_number).cloned())
-        }
         fn snapshot_by_hash(&self, block_hash: &BlockHash) -> Option<Snapshot> {
             self.snap_store_by_hash.read().ok().and_then(|m| m.get(block_hash).cloned())
         }
@@ -307,12 +304,6 @@ mod tests {
             if let Ok(mut m) = self.snap_store_by_hash.write() {
                 m.insert(snapshot.block_hash, snapshot.clone());
             }
-        }
-        fn get_header(&self, _block_number: u64) -> Option<alloy_consensus::Header> { 
-            todo!()
-        }
-        fn get_header_by_hash(&self, _block_hash: &BlockHash) -> Option<alloy_consensus::Header> { 
-            todo!()
         }
     }
 
