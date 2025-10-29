@@ -516,6 +516,7 @@ where
                                             elapsed, self.build_args.config.parent_header.number()+1, self.retries);
                                         return self.try_return_best_payload();
                                     }
+
                                     // Abort by new head.
                                     _ = &mut self.abort_rx => {
                                         info!("Abort payload building by new head, cost_time: {:?}, block_number: {}, retries: {}", 
@@ -524,6 +525,7 @@ where
                                         self.is_aborted = true;
                                         return Err(Box::new(BscPayloadJobError::JobAborted));
                                     }
+
                                     Some(_tx_hash) = self.tx_listener.recv() => {
                                         new_tx_count+=1;
                                         let mining_delay = self.parlia.delay_for_mining(
@@ -599,6 +601,11 @@ where
 
     /// Try to return the best payload to result channel
     fn try_return_best_payload(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let best_bid = self.simulator.get_best_bid(self.mining_ctx.parent_header.hash());
+        if let Some(bid) = best_bid {
+            info!("Found best bid! block: {}, builder: {:?}, gas_fee: {}", bid.bid.block_number, bid.bid.builder, bid.bid.gas_fee);
+            self.potential_payloads.push(bid.bsc_payload);
+        }
         if let Some(best_payload) = self.pick_best_payload() {
             if let Err(err) = self.result_tx.send(SubmitContext {
                 mining_ctx: self.mining_ctx.clone(),
