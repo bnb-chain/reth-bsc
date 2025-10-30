@@ -116,7 +116,7 @@ where
                         committed.len()
                     );
                     
-                    // If this is a reorg event, validate it using fork choice rules
+                    // If this is a reorg event, validate it using bsc fork choice rules
                     if let CanonStateNotification::Reorg { old, new } = &event {
                         match self.validate_reorg(old, new).await {
                             Ok(true) => {
@@ -191,14 +191,11 @@ where
             "Reorg detected, validating with fork choice rules"
         );
         
-        // Get fork choice engine from global storage
-        let fork_choice_engine = crate::shared::get_fork_choice_engine()
+        let forkchoice_engine = crate::shared::get_fork_choice_engine()
             .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
                 "Fork choice engine not initialized".into()
             })?;
         
-        // Get the old and new tip headers for validation
-        // Use sealed headers to get alloy_consensus::Header type
         let old_header = self.provider.sealed_header(old.tip().number())
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
                 format!("Failed to get old header: {}", e).into()
@@ -215,9 +212,7 @@ where
                 format!("New header not found for block {}", new.tip().number()).into()
             })?;
         
-        // Validate reorg using fork choice engine's is_need_reorg method
-        // Check if the reorg from old_header to new_header is justified
-        match fork_choice_engine.is_need_reorg(new_header.header(), old_header.header()).await {
+        match forkchoice_engine.is_need_reorg(new_header.header(), old_header.header()).await {
             Ok(true) => {
                 debug!(
                     target: "bsc::miner",
@@ -855,4 +850,3 @@ where
     }
 
 }
-

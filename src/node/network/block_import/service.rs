@@ -65,7 +65,7 @@ where
     /// The handle to communicate with the engine service
     engine: BeaconConsensusEngineHandle<BscPayloadTypes>,
     /// The fork choice engine for BSC
-    fork_choice_engine: BscForkChoiceEngine<Provider>,
+    forkchoice_engine: BscForkChoiceEngine<Provider>,
     /// Receive the new block from the network
     from_network: UnboundedReceiver<IncomingBlock>,
     /// Receive block hashes from the network for downloading
@@ -91,21 +91,19 @@ where
         from_hashes: UnboundedReceiver<IncomingHashes>,
         to_network: UnboundedSender<ImportEvent>,
     ) -> Self {
-        // Create fork choice engine
-        let fork_choice_engine = BscForkChoiceEngine::new(
+        let forkchoice_engine = BscForkChoiceEngine::new(
             provider,
             engine.clone(),
             chain_spec,
         );
         
-        // Store fork choice engine globally for use in other modules (e.g., miner)
-        if let Err(e) = crate::shared::set_fork_choice_engine(fork_choice_engine.clone()) {
-            tracing::warn!(target: "bsc::block_import", "Fork choice engine already initialized; skipping global set");
+        if let Err(e) = crate::shared::set_fork_choice_engine(forkchoice_engine.clone()) {
+            tracing::warn!(target: "bsc::block_import", error = %e, "Fork choice engine already initialized; skipping global set");
         }
         
         Self {
             engine,
-            fork_choice_engine,
+            forkchoice_engine,
             from_network,
             from_hashes,
             to_network,
@@ -117,7 +115,7 @@ where
     /// Process a new payload and return the outcome
     fn new_payload(&self, block: BlockMsg, peer_id: PeerId) -> ImportFut {
         let engine = self.engine.clone();
-        let fork_choice_engine = self.fork_choice_engine.clone();
+        let forkchoice_engine = self.forkchoice_engine.clone();
 
         tracing::debug!(target: "bsc::block_import", "New payload: block = ({:?}, {:?}), peer_id = {:?}", block.block.0.block.header.number, block.block.0.block.header.hash_slow(), peer_id);
         Box::pin(async move {
@@ -129,7 +127,7 @@ where
                     PayloadStatusEnum::Valid => {
                         tracing::debug!(target: "bsc::block_import", "New payload is valid, block = {:?}, peer_id = {:?}", block, peer_id);
                         // handle fork choice update with valid payload
-                        if let Err(e) = fork_choice_engine.update_forkchoice(&header).await {
+                        if let Err(e) = forkchoice_engine.update_forkchoice(&header).await {
                             tracing::warn!(target: "bsc::block_import", "Failed to update fork choice: {}", e);
                         }
                         Outcome { peer: peer_id, result: Ok(BlockValidation::ValidBlock { block }) }
@@ -257,7 +255,7 @@ where
                     // Produce and broadcast a local vote for this new canonical head, if eligible
                     if let Some(sp) = crate::shared::get_snapshot_provider() {
                         let sp = Arc::clone(sp);
-                        let spec = this.fork_choice_engine.chain_spec().clone();
+                        let spec = this.forkchoice_engine.chain_spec().clone();
                         let header = block.block.0.block.header.clone();
                         tokio::spawn(async move {
                             crate::node::vote_producer::maybe_produce_and_broadcast_for_head(

@@ -289,11 +289,13 @@ where
 #[derive(Debug, Clone)]
 pub struct BscForkChoiceEngine<P> {
     /// The provider for reading block information
-    provider: P,
+    pub(crate) provider: P,
     /// The engine handle for communicating with the consensus engine
-    engine_handle: BeaconConsensusEngineHandle<BscPayloadTypes>,
+    pub(crate) engine_handle: BeaconConsensusEngineHandle<BscPayloadTypes>,
+    /// Chain specification
+    chain_spec: Arc<BscChainSpec>,
     /// The fork choice rule
-    fork_choice_rule: Arc<BscForkChoiceRule>,
+    forkchoice_rule: Arc<BscForkChoiceRule>,
     /// Cache for header total difficulties
     header_td_cache: Arc<parking_lot::RwLock<schnellru::LruMap<B256, Option<alloy_primitives::U256>, schnellru::ByLength>>>,
 }
@@ -311,14 +313,15 @@ where
         Self {
             provider,
             engine_handle,
-            fork_choice_rule: Arc::new(BscForkChoiceRule::new(chain_spec)),
+            chain_spec: chain_spec.clone(),
+            forkchoice_rule: Arc::new(BscForkChoiceRule::new(chain_spec)),
             header_td_cache: Arc::new(parking_lot::RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new(128)))),
         }
     }
 
     /// Returns a reference to the chain specification.
     pub fn chain_spec(&self) -> &Arc<BscChainSpec> {
-        &self.fork_choice_rule.spec
+        &self.chain_spec
     }
 
     /// Updates the fork choice based on the incoming header.
@@ -341,13 +344,12 @@ where
             "Updating fork choice with incoming header"
         );
 
-        // Get the current canonical head
         let current_number = self.provider.chain_info()?.best_number;
         tracing::debug!(target: "bsc::forkchoice", "Best canonical number: {:?}, new_header = {:?}", current_number, incoming_header);
         
         let current_head = self.provider.header_by_number(current_number)?.ok_or(ParliaConsensusErr::HeadHashNotFound)?;
         
-        // Determine if we need to reorg using fork choice rules (TD fetching is done internally)
+        // Determine if we need to reorg using fork choice rules 
         let need_reorg = self.is_need_reorg(incoming_header, &current_head).await?;
         
         // The new canonical head is the incoming header if reorg is needed, otherwise current
@@ -414,10 +416,7 @@ where
         incoming_header: &Header,
         current_header: &Header,
     ) -> Result<bool, ParliaConsensusErr> {
-        // Get TD for both headers
         let (incoming_td, current_td) = self.header_td_fcu(&self.engine_handle, incoming_header, current_header).await?;
-
-        // Get justified numbers for both headers
         let incoming_justified_num = self.get_justified_number_and_hash(incoming_header)
             .map(|(num, _)| num)
             .unwrap_or(0);
@@ -425,17 +424,15 @@ where
             .map(|(num, _)| num)
             .unwrap_or(0);
 
-        // Build HeaderForForkchoice objects
         let incoming_for_fc = HeaderForForkchoice::new(incoming_header, incoming_td, incoming_justified_num);
         let current_for_fc = HeaderForForkchoice::new(current_header, current_td, current_justified_num);
 
-        // Delegate to BscForkChoiceRule for the actual fork choice decision
-        self.fork_choice_rule.is_need_reorg(&incoming_for_fc, &current_for_fc)
+        self.forkchoice_rule.is_need_reorg(&incoming_for_fc, &current_for_fc)
     }
 
     /// Gets the justified number and hash from the header's snapshot.
     fn get_justified_number_and_hash(&self, header: &Header) -> Option<(u64, B256)> {
-        if !self.fork_choice_rule.spec.is_luban_active_at_block(header.number) {
+        if !self.chain_spec.is_luban_active_at_block(header.number) {
             return None;
         }
         
@@ -456,7 +453,7 @@ where
 
     /// Gets the finalized number and hash from the header's snapshot.
     fn get_finalized_number_and_hash(&self, header: &Header) -> Option<(u64, B256)> {
-        if !self.fork_choice_rule.spec.is_plato_active_at_block(header.number) {
+        if !self.chain_spec.is_plato_active_at_block(header.number) {
             return None;
         }
         
