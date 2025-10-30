@@ -45,7 +45,6 @@ impl ParliaConsensusErr {
 }
 
 /// Parlia consensus implementation
-/// TODO: parlia may need maintentain a fork chain state, and in memory TD store. 
 /// the reth is hard to interact with fork logic.
 pub struct ParliaConsensus<P> {
     /// The provider for reading block information

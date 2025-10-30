@@ -8,7 +8,6 @@ use crate::consensus::parlia::{DIFF_INTURN, VoteAddress, VoteAttestation, snapsh
 use crate::consensus::{SYSTEM_ADDRESS, MAX_SYSTEM_REWARD, SYSTEM_REWARD_PERCENT};
 use crate::evm::transaction::BscTxEnv;
 use crate::node::miner::util::prepare_new_header;
-use crate::shared::{get_canonical_header_by_number};
 use crate::system_contracts::{SLASH_CONTRACT, SYSTEM_REWARD_CONTRACT, feynman_fork::{ValidatorElectionInfo, get_top_validators_by_voting_power, ElectedValidators}};
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
 use reth_evm::{eth::receipt_builder::{ReceiptBuilder, ReceiptBuilderCtx}, execute::BlockExecutionError, Database, Evm, FromRecoveredTx, FromTxWithEncoded, IntoTxEnv, block::StateChangeSource};
@@ -396,11 +395,12 @@ where
 
         let start = (block_number - FF_REWARD_DISTRIBUTION_INTERVAL).max(1);
         let end = block_number;
-        let mut target_number = block_number - 1;
-        // TODO: need query block header and snapshot by hash?
+
+        // query block header and snapshot by hash from cache.
+        let mut target_hash = self.ctx.base.parent_hash;
         for _ in (start..end).rev() {
-            let header = get_canonical_header_by_number(target_number).
-                ok_or_else(|| BlockExecutionError::msg(format!("Header not found for block number: {target_number}")))?;
+            let header = get_header_by_hash_from_cache(&target_hash).
+                ok_or_else(|| BlockExecutionError::msg(format!("Header not found for block hash: {target_hash}")))?;
             let snap = self.snapshot_provider.
                 as_ref().
                 unwrap().
@@ -415,7 +415,7 @@ where
             {
                 self.process_attestation(&attestation, &header, &mut accumulated_weights)?;
             }
-            target_number = header.number - 1;
+            target_hash = header.parent_hash;
         }
 
         let mut validators: Vec<Address> = accumulated_weights.keys().copied().collect();
