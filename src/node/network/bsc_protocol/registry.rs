@@ -51,8 +51,8 @@ pub fn broadcast_votes(votes: Vec<crate::consensus::parlia::vote::VoteEnvelope>)
         let is_evn = |peer: &PeerId| crate::node::network::evn_peers::is_evn_peer(*peer);
 
         // Determine local head TD (u128 approx) and latest block
-        let local_best_td = crate::shared::get_best_total_difficulty_u128();
-        let local_best_number = crate::shared::get_best_block_number().unwrap_or_default();
+        let local_best_td = crate::shared::get_best_canonical_td();
+        let local_best_number = crate::shared::get_best_canonical_block_number().unwrap_or_default();
         let delta_td_threshold: u128 = 20;
 
         // Build a map of PeerId -> PeerInfo for connected peers

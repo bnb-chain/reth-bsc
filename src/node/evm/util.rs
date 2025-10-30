@@ -1,6 +1,6 @@
 use reth_primitives::Transaction;
 use alloy_consensus::{Header, BlockHeader};
-use alloy_primitives::B256;
+use alloy_primitives::{B256, BlockHash, BlockNumber};
 use schnellru::{ByLength, LruMap};
 use std::sync::{LazyLock, Mutex};
 
@@ -49,7 +49,7 @@ impl HeaderCacheReader {
             tracing::trace!("Get header from cache, block_number: {:?}", header.number());
             return Some(header.clone());
         }
-        if let Some(header) = crate::shared::get_header_by_number_from_provider(block_number) {
+        if let Some(header) = crate::shared::get_canonical_header_by_number_from_provider(block_number) {
             tracing::trace!("Get header from provider, block_number: {:?}", header.number());
             return Some(header);
         }
@@ -62,7 +62,7 @@ impl HeaderCacheReader {
         if let Some(header) = self.blockhash_to_header.get(block_hash) {
             return Some(header.clone());
         }
-        if let Some(header) = crate::shared::get_header_by_hash_from_provider(block_hash) {
+        if let Some(header) = crate::shared::get_canonical_header_by_hash_from_provider(block_hash) {
             return Some(header);
         }
         None
@@ -81,3 +81,23 @@ impl HeaderCacheReader {
 pub static HEADER_CACHE_READER: LazyLock<Mutex<HeaderCacheReader>> = LazyLock::new(|| {
     Mutex::new(HeaderCacheReader::new(100000))
 });
+
+
+/// Get header by hash from the global header provider
+pub fn get_header_by_hash_from_cache(block_hash: &BlockHash) -> Option<Header> {
+    let header = HEADER_CACHE_READER.lock().unwrap().get_header_by_hash(block_hash);
+    tracing::debug!("Succeed to fetch header by hash, is_none: {} for hash {}", header.is_none(), block_hash);
+    header
+}
+
+/// Get canonical header by number from the global header provider
+pub fn get_cannonical_header_from_cache(number: BlockNumber) -> Option<Header> {
+    let header = HEADER_CACHE_READER.lock().unwrap().get_header_by_number(number);
+    tracing::debug!("Succeed to fetch canonical header by number, is_none: {} for number {}", header.is_none(), number);
+    header
+}
+
+/// Insert header to cache
+pub fn insert_header_to_cache(header: Header) {
+    HEADER_CACHE_READER.lock().unwrap().insert_header_to_cache(header);
+}

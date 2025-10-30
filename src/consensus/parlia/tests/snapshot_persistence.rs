@@ -5,7 +5,7 @@ use super::super::{
     snapshot::Snapshot,
     provider::SnapshotProvider,
 };
-use alloy_primitives::{Address, B256};
+use alloy_primitives::{Address, B256, BlockHash};
 use reth_db::{init_db, mdbx::DatabaseArguments, Database, transaction::DbTx, cursor::DbCursorRO};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -52,7 +52,7 @@ fn test_snapshot_database_persistence() -> eyre::Result<()> {
     
     // Verify snapshots can be retrieved
     for expected in &test_snapshots {
-        let retrieved = provider.snapshot(expected.block_number)
+        let retrieved = provider.snapshot_by_hash(&expected.block_hash)
             .unwrap_or_else(|| panic!("Snapshot at block {} should exist", expected.block_number));
         
         assert_eq!(retrieved.block_number, expected.block_number);
@@ -77,7 +77,8 @@ fn test_snapshot_range_queries() -> eyre::Result<()> {
     let provider = DbSnapshotProvider::new(database.clone(), 256);
     
     // Insert snapshots at blocks 1024, 2048, 3072, 4096, 5120
-    for i in 1..=5 {
+    let mut test_snapshots = Vec::new();
+    for i in 1..=6 {
         let block_number = i * 1024;
         let snapshot = Snapshot {
             block_number,
@@ -87,23 +88,26 @@ fn test_snapshot_range_queries() -> eyre::Result<()> {
             ..Default::default()
         };
         
-        provider.insert(snapshot);
+        test_snapshots.push(snapshot.clone());
+        // only save 3 snapshots to DB
+        if [1, 2, 5].contains(&i) {
+            provider.insert(snapshot);
+        }
     }
     
     // Test range queries - should find nearest predecessor
     let test_cases = vec![
-        (500, None),           // Before first snapshot
-        (1000, None),          // Just before first snapshot  
-        (1024, Some(1024)),    // Exact match
-        (1500, Some(1024)),    // Between snapshots - should find 1024
-        (2048, Some(2048)),    // Exact match
-        (3000, Some(2048)),    // Should find nearest predecessor (2048)
-        (5120, Some(5120)),    // Last snapshot
-        (6000, Some(5120)),    // After last snapshot - should find 5120
+        (BlockHash::random(), None),                   // Before first snapshot
+        (test_snapshots[0].block_hash, Some(1024)),    // Exact match
+        (test_snapshots[1].block_hash, Some(2048)),    // Exact match
+        (test_snapshots[2].block_hash, None),          // not exist
+        (test_snapshots[3].block_hash, None),    // not exist
+        (test_snapshots[4].block_hash, Some(5120)),    // Last snapshot
+        (test_snapshots[5].block_hash, None),    // After last snapshot - should find 5120
     ];
     
     for (query_block, expected_block) in test_cases {
-        let result = provider.snapshot(query_block);
+        let result = provider.snapshot_by_hash(&query_block);
         match expected_block {
             Some(expected) => {
                 let snapshot = result.unwrap_or_else(|| panic!("Should find snapshot for block {query_block}"));
@@ -150,7 +154,7 @@ fn test_direct_database_access() -> eyre::Result<()> {
     
     // Check raw database table
     let tx = database.tx()?;
-    let mut cursor = tx.cursor_read::<crate::consensus::parlia::db::ParliaSnapshots>()?;
+    let mut cursor = tx.cursor_read::<crate::consensus::parlia::db::ParliaSnapshotsByHash>()?;
     let mut count = 0;
     
     for item in cursor.walk(None)? {
@@ -177,6 +181,7 @@ fn test_snapshot_cache_behavior() -> eyre::Result<()> {
     let provider = DbSnapshotProvider::new(database.clone(), 2);
     
     // Insert more snapshots than cache size
+    let mut test_snapshots = Vec::new();
     for i in 1..=5 {
         let block_number = i * 1024;
         let snapshot = Snapshot {
@@ -186,16 +191,19 @@ fn test_snapshot_cache_behavior() -> eyre::Result<()> {
             epoch_num: 200,
             ..Default::default()
         };
-        
+        test_snapshots.push(snapshot.clone());
         provider.insert(snapshot);
     }
     
     // All snapshots should still be retrievable (from DB if not in cache)
-    for i in 1..=5 {
-        let block_number = i * 1024;
-        let snapshot = provider.snapshot(block_number)
-            .unwrap_or_else(|| panic!("Snapshot at block {block_number} should be retrievable"));
-        assert_eq!(snapshot.block_number, block_number);
+    for expected in &test_snapshots {
+        let snapshot = provider.snapshot_by_hash(&expected.block_hash)
+            .unwrap_or_else(|| panic!("Snapshot at block {} should be retrievable", expected.block_hash));
+        assert_eq!(snapshot.block_number, expected.block_number);
+        assert_eq!(snapshot.block_hash, expected.block_hash);
+        assert_eq!(snapshot.validators.len(), expected.validators.len());
+        assert_eq!(snapshot.epoch_num, expected.epoch_num);
+        assert_eq!(snapshot.turn_length, expected.turn_length);
     }
     
     Ok(())

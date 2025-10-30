@@ -1,10 +1,11 @@
 
+use alloy_primitives::BlockHash;
 use jsonrpsee::{core::RpcResult, proc_macros::rpc, types::ErrorObject};
 use serde::{Deserialize, Serialize};
 
 use crate::consensus::parlia::{Snapshot, SnapshotProvider};
 
-use std::sync::Arc;
+use std::{str::FromStr, sync::Arc};
 
 /// Validator information in the snapshot (matches BSC official format)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,7 +97,7 @@ pub trait ParliaApi {
     /// Get snapshot at a specific block (official BSC API method)
     /// Params: block number as hex string (e.g., "0x123132")
     #[method(name = "getSnapshot")]
-    async fn get_snapshot(&self, block_number: String) -> RpcResult<Option<SnapshotResult>>;
+    async fn get_snapshot_by_hash(&self, block_hash: String) -> RpcResult<Option<SnapshotResult>>;
 
     /// Build call data for StakeHub.addNodeIDs(bytes32[] nodeIDs). Returns { to, data } as hex.
     #[method(name = "buildAddNodeIDsCall")]
@@ -125,16 +126,12 @@ impl DynSnapshotProvider {
 }
 
 impl SnapshotProvider for DynSnapshotProvider {
-    fn snapshot(&self, block_number: u64) -> Option<crate::consensus::parlia::snapshot::Snapshot> {
-        self.inner.snapshot(block_number)
-    }
-
-    fn insert(&self, snapshot: crate::consensus::parlia::snapshot::Snapshot) {
+    fn insert(&self, snapshot: Snapshot) {
         self.inner.insert(snapshot)
     }
     
-    fn get_header(&self, block_number: u64) -> Option<alloy_consensus::Header> {
-        self.inner.get_header(block_number)
+    fn snapshot_by_hash(&self, block_hash: &BlockHash) -> Option<Snapshot> {
+        self.inner.snapshot_by_hash(block_hash)
     }
 }
 
@@ -152,55 +149,25 @@ impl<P: SnapshotProvider> ParliaApiImpl<P> {
 impl<P: SnapshotProvider + Send + Sync + 'static> ParliaApiServer for ParliaApiImpl<P> {
     /// Get snapshot at a specific block (matches BSC official API.GetSnapshot)
     /// Accepts block number as hex string like "0x123132"
-    async fn get_snapshot(&self, block_number: String) -> RpcResult<Option<SnapshotResult>> {
+    async fn get_snapshot_by_hash(&self, block_hash: String) -> RpcResult<Option<SnapshotResult>> {
         // parlia_getSnapshot called
-        
-        // Parse hex block number (like BSC API does)
-        let block_num = if let Some(stripped) = block_number.strip_prefix("0x") {
-            match u64::from_str_radix(stripped, 16) {
-                Ok(num) => {
-                    // Parsed hex block number
-                    num
-                },
-                Err(e) => {
-                    tracing::error!("Failed to parse hex block number '{}': {}", block_number, e);
-                    return Err(ErrorObject::owned(
-                        -32602, 
-                        "Invalid block number format", 
-                        None::<()>
-                    ));
-                }
-            }
-        } else {
-            match block_number.parse::<u64>() {
-                Ok(num) => {
-                    // Parsed decimal block number
-                    num
-                },
-                Err(e) => {
-                    tracing::error!("Failed to parse decimal block number '{}': {}", block_number, e);
-                    return Err(ErrorObject::owned(
-                        -32602, 
-                        "Invalid block number format", 
-                        None::<()>
-                    ));
-                }
-            }
-        };
-        
-        // Querying snapshot provider
+        let block_hash = BlockHash::from_str(&block_hash).map_err(|_| ErrorObject::owned(
+            -32602, 
+            "Invalid block hash format", 
+            None::<()>
+        ))?;
         
         // Get snapshot from provider (equivalent to api.parlia.snapshot call in BSC)
-        match self.snapshot_provider.snapshot(block_num) {
+        match self.snapshot_provider.snapshot_by_hash(&block_hash) {
             Some(snapshot) => {
                 tracing::info!("Found snapshot for block {}: validators={}, epoch_num={}, block_hash=0x{:x}", 
-                    block_num, snapshot.validators.len(), snapshot.epoch_num, snapshot.block_hash);
+                block_hash, snapshot.validators.len(), snapshot.epoch_num, snapshot.block_hash);
                 let result: SnapshotResult = snapshot.into();
                 // Snapshot result prepared
                 Ok(Some(result))
             },
             None => {
-                tracing::warn!("No snapshot found for block {}", block_num);
+                tracing::warn!("No snapshot found for block hash {}", block_hash);
                 Ok(None)
             }
         }
@@ -262,9 +229,11 @@ mod tests {
             chain_spec,
         ));
         
+        let bh1 = BlockHash::from_str("0xeeed4270b9874af140ab3e9293a144941203d45adb994a6d6de833897a52fe68").unwrap();
         // Insert a test snapshot
         let test_snapshot = Snapshot {
             block_number: 100,
+            block_hash: bh1,
             validators: vec![alloy_primitives::Address::random(), alloy_primitives::Address::random()],
             epoch_num: 200,
             turn_length: Some(1),
@@ -275,7 +244,7 @@ mod tests {
         let api = ParliaApiImpl::new(snapshot_provider);
         
         // Test snapshot retrieval with hex block number (BSC official format)
-        let result = api.get_snapshot("0x64".to_string()).await.unwrap(); // 0x64 = 100
+        let result = api.get_snapshot_by_hash("0xeeed4270b9874af140ab3e9293a144941203d45adb994a6d6de833897a52fe68".to_string()).await.unwrap(); // 0x64 = 100
         assert!(result.is_some());
         
         let snapshot_result = result.unwrap();
@@ -285,7 +254,9 @@ mod tests {
         assert_eq!(snapshot_result.turn_length, 1);
         
         // Test with decimal format too
-        let result = api.get_snapshot("100".to_string()).await.unwrap();
+        let result = api.get_snapshot_by_hash("eeed4270b9874af140ab3e9293a144941203d45adb994a6d6de833897a52fe68".to_string()).await.unwrap();
         assert!(result.is_some());
+        let snapshot_result = result.unwrap();
+        assert_eq!(snapshot_result.number, 100);
     }
 }
