@@ -316,6 +316,11 @@ where
         }
     }
 
+    /// Returns a reference to the chain specification.
+    pub fn chain_spec(&self) -> &Arc<BscChainSpec> {
+        &self.fork_choice_rule.spec
+    }
+
     /// Updates the fork choice based on the incoming header.
     /// 
     /// This function evaluates whether the incoming header should become the new canonical head

@@ -1,6 +1,7 @@
 use super::handle::ImportHandle;
 use crate::{
-    consensus::{ParliaConsensus, ParliaConsensusErr, parlia::vote_pool},
+    chainspec::BscChainSpec,
+    consensus::{ParliaConsensusErr, parlia::vote_pool},
     node::{engine_api::payload::BscPayloadTypes, network::BscNewBlock, consensus::BscForkChoiceEngine},
     BscBlock, BscBlockBody,
 };
@@ -63,8 +64,6 @@ where
 {
     /// The handle to communicate with the engine service
     engine: BeaconConsensusEngineHandle<BscPayloadTypes>,
-    /// The consensus implementation
-    consensus: Arc<ParliaConsensus<Provider>>,
     /// The fork choice engine for BSC
     fork_choice_engine: BscForkChoiceEngine<Provider>,
     /// Receive the new block from the network
@@ -85,7 +84,8 @@ where
 {
     /// Create a new block import service
     pub fn new(
-        consensus: Arc<ParliaConsensus<Provider>>,
+        provider: Provider,
+        chain_spec: Arc<BscChainSpec>,
         engine: BeaconConsensusEngineHandle<BscPayloadTypes>,
         from_network: UnboundedReceiver<IncomingBlock>,
         from_hashes: UnboundedReceiver<IncomingHashes>,
@@ -93,9 +93,9 @@ where
     ) -> Self {
         // Create fork choice engine
         let fork_choice_engine = BscForkChoiceEngine::new(
-            consensus.provider.clone(),
+            provider,
             engine.clone(),
-            consensus.chain_spec.clone(),
+            chain_spec,
         );
         
         // Store fork choice engine globally for use in other modules (e.g., miner)
@@ -105,7 +105,6 @@ where
         
         Self {
             engine,
-            consensus,
             fork_choice_engine,
             from_network,
             from_hashes,
@@ -118,7 +117,6 @@ where
     /// Process a new payload and return the outcome
     fn new_payload(&self, block: BlockMsg, peer_id: PeerId) -> ImportFut {
         let engine = self.engine.clone();
-        let consensus = self.consensus.clone();
         let fork_choice_engine = self.fork_choice_engine.clone();
 
         tracing::debug!(target: "bsc::block_import", "New payload: block = ({:?}, {:?}), peer_id = {:?}", block.block.0.block.header.number, block.block.0.block.header.hash_slow(), peer_id);
@@ -259,7 +257,7 @@ where
                     // Produce and broadcast a local vote for this new canonical head, if eligible
                     if let Some(sp) = crate::shared::get_snapshot_provider() {
                         let sp = Arc::clone(sp);
-                        let spec = this.consensus.chain_spec.clone();
+                        let spec = this.fork_choice_engine.chain_spec().clone();
                         let header = block.block.0.block.header.clone();
                         tokio::spawn(async move {
                             crate::node::vote_producer::maybe_produce_and_broadcast_for_head(
@@ -543,10 +541,9 @@ mod tests {
         /// Create a new test fixture with the given engine responses
         async fn new(responses: EngineResponses) -> Self {
             // Use mainnet chain spec for tests; it influences only fast-finality parsing.
-            let mut consensus = Arc::new(ParliaConsensus::new(
-                MockProvider::new(), 
-                Arc::new(crate::chainspec::BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet())),
-            ));
+            let provider = MockProvider::new();
+            let chain_spec = Arc::new(crate::chainspec::BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet()));
+            
             let (to_engine, from_engine) = mpsc::unbounded_channel();
             let engine_handle = BeaconConsensusEngineHandle::new(to_engine);
 
@@ -559,7 +556,8 @@ mod tests {
             let handle = ImportHandle::new(to_import, to_hashes, import_outcome);
 
             let service = ImportService::new(
-                consensus, 
+                provider,
+                chain_spec,
                 engine_handle, 
                 from_network, 
                 from_hashes,

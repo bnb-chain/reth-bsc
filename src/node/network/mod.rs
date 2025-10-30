@@ -217,15 +217,12 @@ impl BscNetworkBuilder {
             warn!(target: "bsc", "Block import sender already initialised; overriding skipped");
         }
         
-        // Import the necessary types for consensus
-        use crate::consensus::ParliaConsensus;
+        // Import the necessary types for block import service
         use crate::node::network::block_import::service::ImportService;
         
-        // Create consensus instance for ImportService
-        let consensus = Arc::new(ParliaConsensus::new(
-            ctx.provider().clone(),
-            ctx.chain_spec().clone(),
-        ));
+        // Clone needed values before moving into the async closure
+        let provider = ctx.provider().clone();
+        let chain_spec = ctx.chain_spec().clone();
         
         // Spawn the critical ImportService task exactly like the official implementation
         ctx.task_executor().spawn_critical("block import", async move {
@@ -237,7 +234,14 @@ impl BscNetworkBuilder {
                 .await
                 .unwrap();
 
-            ImportService::new(consensus, handle, from_network, from_hashes, to_network).await.unwrap();
+            ImportService::new(
+                provider,
+                chain_spec,
+                handle,
+                from_network,
+                from_hashes,
+                to_network,
+            ).await.unwrap();
         });
 
         let network_builder = network_builder
