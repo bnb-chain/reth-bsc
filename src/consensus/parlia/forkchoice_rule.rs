@@ -282,7 +282,6 @@ mod tests {
                 }
             }
             impl SnapshotProvider for TestSnapProvider {
-                fn snapshot(&self, _block_number: u64) -> Option<Snapshot> { None }
                 fn snapshot_by_hash(&self, block_hash: &B256) -> Option<Snapshot> {
                     self.snaps.read().ok().and_then(|m| m.get(block_hash).cloned())
                 }
@@ -291,7 +290,6 @@ mod tests {
                         m.insert(snapshot.block_hash, snapshot);
                     }
                 }
-                fn get_header(&self, _block_number: u64) -> Option<Header> { None }
             }
 
             let sp = Arc::new(TestSnapProvider::new());
