@@ -208,15 +208,21 @@ where
                 "Fork choice engine not initialized".into()
             })?;
         
-        // Fetch headers by hash instead of number to get the correct headers from both chains.
-        // Using number would return the current canonical header (which is already the new chain).
-        let old_header = self.provider.sealed_header_by_hash(old.tip().hash())
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                format!("Failed to get old header: {}", e).into()
-            })?
-            .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
-                format!("Old header not found for block hash {:?}", old.tip().hash()).into()
-            })?;
+        let old_header = match self.provider.sealed_header_by_hash(old.tip().hash()) {
+            Ok(Some(header)) => header,
+            Ok(None) => {
+                // Old header not found (may have been pruned), accept the reorg as valid
+                debug!(
+                    target: "bsc::miner",
+                    old_tip_hash = ?old.tip().hash(),
+                    "Old header not found, accepting reorg as valid"
+                );
+                return Ok(true);
+            }
+            Err(e) => {
+                return Err(format!("Failed to get old header: {}", e).into());
+            }
+        };
         
         let new_header = self.provider.sealed_header_by_hash(new.tip().hash())
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
