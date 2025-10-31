@@ -13,6 +13,8 @@ use crate::consensus::parlia::SnapshotProvider;
 use alloy_primitives::Address;
 use alloy_consensus::BlobTransactionSidecar;
 use alloy_consensus::{TxEip4844WithSidecar, transaction::RlpEcdsaDecodableTx};
+use crate::node::miner::config::MiningConfig;
+use crate::node::miner::config::keystore;
 
 /// Raw bid data structure from builder
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -81,7 +83,47 @@ impl MevApiImpl {
         snapshot_provider: Arc<dyn SnapshotProvider + Send + Sync>,
         chain_spec: Arc<BscChainSpec>,
     ) -> Self {
-        let validator_address = "0xbCDD0d2cDA5f6423E57B6a4dCD75DEcbE31aeCf0".parse().unwrap();
+        let mining_config =
+        if let Some(cfg) = crate::node::miner::config::get_global_mining_config() {
+            cfg.clone()
+        } else {
+            MiningConfig::from_env()
+        };
+
+        let mut validator_address = mining_config.validator_address.unwrap_or(Address::ZERO);
+        
+        // Try to load signing key and derive validator address
+        if let Some(keystore_path) = &mining_config.keystore_path {
+            let password = mining_config.keystore_password.as_deref().unwrap_or("");
+            if let Ok(signing_key) = keystore::load_private_key_from_keystore(keystore_path, password) {
+                let derived_address = keystore::get_validator_address(&signing_key);
+                if derived_address != validator_address && validator_address != Address::ZERO {
+                    tracing::warn!(
+                        "Validator address mismatch, configured: {}, derived: {}",
+                        validator_address, derived_address
+                    );
+                }
+                validator_address = derived_address;
+                tracing::info!("Derived validator address from keystore: {}", derived_address);
+            } else {
+                tracing::warn!("Failed to load signing key from keystore");
+            }
+        } else if let Some(hex_key) = &mining_config.private_key_hex {
+            if let Ok(signing_key) = keystore::load_private_key_from_hex(hex_key) {
+                let derived_address = keystore::get_validator_address(&signing_key);
+                if derived_address != validator_address && validator_address != Address::ZERO {
+                    tracing::warn!(
+                        "Validator address mismatch, configured: {}, derived: {}",
+                        validator_address, derived_address
+                    );
+                }
+                validator_address = derived_address;
+                tracing::info!("Derived validator address from hex key: {}", derived_address);
+            } else {
+                tracing::warn!("Failed to load signing key from hex");
+            }
+        }
+        
         Self { snapshot_provider, chain_spec, validator_address }
     }
 
