@@ -48,6 +48,7 @@ pub struct MiningContext {
     pub header: Option<reth_primitives::Header>, // tmp header for payload building.
     pub parent_header: reth_primitives::SealedHeader,
     pub parent_snapshot: Arc<crate::consensus::parlia::snapshot::Snapshot>,
+    pub is_inturn: bool,
 }
 
 #[derive(Clone)]
@@ -106,14 +107,17 @@ where
                     // todo: refine it as pre cache to speedup, committed.execution_outcome().
                     let committed = event.committed();
                     let tip = committed.tip();
+                    let is_reorg = matches!(event, CanonStateNotification::Reorg { .. });
                     debug!(
-                        "Try new work, tip_block={}, hash={}, parent_hash={}, miner={}, diff={}, committed_blocks={}",
-                        committed.tip().number(),
-                        format!("0x{:x}", committed.tip().hash()),
-                        format!("0x{:x}", committed.tip().parent_hash()),
-                        committed.tip().beneficiary(),
-                        committed.tip().difficulty(),
-                        committed.len()
+                        target: "bsc::miner",
+                        tip_block = committed.tip().number(),
+                        hash = ?committed.tip().hash(),
+                        parent_hash = ?committed.tip().parent_hash(),
+                        miner = ?committed.tip().beneficiary(),
+                        diff = %committed.tip().difficulty(),
+                        committed_blocks = committed.len(),
+                        is_reorg,
+                        "Try new work"
                     );
                     
                     // If this is a reorg event, validate it using bsc fork choice rules
@@ -123,6 +127,10 @@ where
                                 // Reorg is valid, proceed with mining
                                 debug!(
                                     target: "bsc::miner",
+                                    old_tip_number = old.tip().number(),
+                                    new_tip_number = new.tip().number(),
+                                    old_tip_hash = ?old.tip().hash(),
+                                    new_tip_hash = ?new.tip().hash(),
                                     "Reorg validated by fork choice rules, proceeding with mining"
                                 );
                             }
@@ -132,6 +140,8 @@ where
                                     target: "bsc::miner",
                                     old_tip_number = old.tip().number(),
                                     new_tip_number = new.tip().number(),
+                                    old_tip_hash = ?old.tip().hash(),
+                                    new_tip_hash = ?new.tip().hash(),
                                     "Reorg rejected by fork choice rules, skipping mining on this tip"
                                 );
                                 continue;
@@ -143,6 +153,8 @@ where
                                     target: "bsc::miner",
                                     old_tip_number = old.tip().number(),
                                     new_tip_number = new.tip().number(),
+                                    old_tip_hash = ?old.tip().hash(),
+                                    new_tip_hash = ?new.tip().hash(),
                                     error = %e,
                                     "Failed to validate reorg, proceeding with mining"
                                 );
@@ -196,20 +208,22 @@ where
                 "Fork choice engine not initialized".into()
             })?;
         
-        let old_header = self.provider.sealed_header(old.tip().number())
+        // Fetch headers by hash instead of number to get the correct headers from both chains.
+        // Using number would return the current canonical header (which is already the new chain).
+        let old_header = self.provider.sealed_header_by_hash(old.tip().hash())
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
                 format!("Failed to get old header: {}", e).into()
             })?
             .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
-                format!("Old header not found for block {}", old.tip().number()).into()
+                format!("Old header not found for block hash {:?}", old.tip().hash()).into()
             })?;
         
-        let new_header = self.provider.sealed_header(new.tip().number())
+        let new_header = self.provider.sealed_header_by_hash(new.tip().hash())
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
                 format!("Failed to get new header: {}", e).into()
             })?
             .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
-                format!("New header not found for block {}", new.tip().number()).into()
+                format!("New header not found for block hash {:?}", new.tip().hash()).into()
             })?;
         
         match forkchoice_engine.is_need_reorg(new_header.header(), old_header.header()).await {
@@ -279,7 +293,9 @@ where
             return;
         }
         
+        let mut is_inturn = true;
         if !parent_snapshot.is_inturn(self.validator_address) {
+            is_inturn = false;
             debug!("Try off-turn mining, validator: {}, next_block: {}", self.validator_address, tip.number() + 1);
         }
 
@@ -287,6 +303,7 @@ where
             header: None,
             parent_header,
             parent_snapshot: Arc::new(parent_snapshot),
+            is_inturn,
         };
 
         debug!("Queuing mining context, next_block: {}", tip.number() + 1);
@@ -443,7 +460,7 @@ where
                     debug!("Succeed to execute payload job");
                 }
                 Ok(Err(e)) => {
-                    warn!("Failed to execute payload job due to {}", e);
+                    debug!("Failed to execute payload job due to {}", e);
                 }
                 Err(join_err) => {
                     error!("Failed to execute payload job due to task panicked or was cancelled, join_err: {}", join_err);
@@ -627,13 +644,16 @@ where
         } else { 
             "offturn" 
         };
-        debug!("Submitting block {} (hash: 0x{:x}, parent_hash: 0x{:x}, txs: {}, gas_used: {}, turn_status: {})", 
-               block_number, 
-               block_hash, 
-               parent_hash,
-               sealed_block.body().transaction_count(),
-               sealed_block.gas_used(),
-               turn_status);
+        debug!(
+            target: "bsc::miner",
+            block_number,
+            hash = ?block_hash,
+            parent_hash = ?parent_hash,
+            txs = sealed_block.body().transaction_count(),
+            gas_used = sealed_block.gas_used(),
+            turn_status,
+            "Submitting block"
+        );
 
         // TODO: wait more times when huge chain import.
         // TODO: only canonical head can broadcast, avoid sidechain blocks.

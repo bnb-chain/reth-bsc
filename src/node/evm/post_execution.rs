@@ -49,7 +49,7 @@ where
         self.verify_validators(self.inner_ctx.current_validators.clone(), self.inner_ctx.header.clone())?;
         self.verify_turn_length(self.inner_ctx.header.clone())?;
 
-        // finalize the system txs.
+        // check the system txs.
         if self.inner_ctx.header.as_ref().unwrap().difficulty != DIFF_INTURN {
             tracing::debug!("Start to slash spoiled validator, block_number: {}, block_difficulty: {:?}, diff_inturn: {:?}", 
                 block.number, self.inner_ctx.header.as_ref().unwrap().difficulty, DIFF_INTURN);
@@ -62,8 +62,15 @@ where
             };
             if !signed_recently {
                 self.slash_spoiled_validator(block.beneficiary, spoiled_validator)?;
-                tracing::debug!("Slash spoiled validator, block_number: {}, spoiled_validator: {}, backoff_validator: {}", 
-                    block.number, spoiled_validator, block.beneficiary);
+                let block_hash = self.inner_ctx.header.as_ref().map(|h| h.hash_slow());
+                tracing::info!(
+                    target: "bsc::evm",
+                    block_number = %block.number,
+                    block_hash = ?block_hash,
+                    spoiled_validator = ?spoiled_validator,
+                    backoff_validator = ?block.beneficiary,
+                    "Slash spoiled validator"
+                );
             }
         }
 
@@ -498,7 +505,6 @@ where
     }
 
     /// generate system txs and apply them, used by miner.
-    /// TODO: refine it more.
     pub(crate) fn finalize_new_block(
         &mut self, 
         block: &BlockEnv
@@ -513,8 +519,20 @@ where
                 snap.recent_proposers.iter().any(|(_, v)| *v == expected_validator)
             };
             if !signed_recently {
+                // Note: If this is a backoff (offturn) validator trying to slash the inturn validator,
+                // this block may not become part of the canonical chain. The inturn validator's block
+                // has higher difficulty (DIFF_INTURN=2) and will be preferred by fork choice rules.
+                // This slash attempt will only succeed if the inturn validator truly failed to produce a block.
                 self.slash_spoiled_validator(block.beneficiary, expected_validator)?;
-                tracing::info!("Slash spoiled validator, block_number: {}, spoiled_validator: {}", block.number, expected_validator);
+                let block_hash = self.inner_ctx.header.as_ref().map(|h| h.hash_slow());
+                tracing::trace!(
+                    target: "bsc::evm",
+                    block_number = %block.number,
+                    block_hash = ?block_hash,
+                    spoiled_validator = ?expected_validator,
+                    backoff_validator = ?block.beneficiary,
+                    "Try slash spoiled validator by miner"
+                );
             }
         }
 

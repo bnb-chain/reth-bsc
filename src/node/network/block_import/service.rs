@@ -174,8 +174,8 @@ where
 
             let forkchoice_state = ForkchoiceState {
                 head_block_hash: hash_number.hash,
-                safe_block_hash: hash_number.hash, 
-                finalized_block_hash: hash_number.hash,
+                safe_block_hash: B256::ZERO, 
+                finalized_block_hash: B256::ZERO,
             };
 
             let engine = self.engine.clone();

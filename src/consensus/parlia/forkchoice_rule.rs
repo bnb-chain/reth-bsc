@@ -57,7 +57,7 @@ impl BscForkChoiceRule {
             current_hash = ?current.header.hash_slow(),
             current_td = ?current.td,
             current_justified = current.justified_num,
-            "BscForkChoiceRule: Checking if reorg is needed"
+            "BscForkChoiceRule: Checking whether reorg is needed"
         );
 
         // Try fast finality first (Plato fork)
