@@ -276,10 +276,6 @@ Pool: reth::transaction_pool::TransactionPool<Transaction: reth::transaction_poo
         //let startTs = std::time::Instant::now();
         let parent_hash = bid_runtime.bid.parent_hash;
         self.simulating_bid.write().insert(parent_hash, bid_runtime.bid.clone());
-        
-        // todo: gas check
-
-
         let mut txs_except_last = bid_runtime.bid.txs.clone();
         let pay_bid_tx = txs_except_last.pop();
         
@@ -322,12 +318,9 @@ Pool: reth::transaction_pool::TransactionPool<Transaction: reth::transaction_poo
                 return;
             }
         };
-        
-
-        let block_gas_limit: u64 = builder.evm_mut().block().gas_limit.saturating_sub(system_txs_gas);
+        let mut block_gas_limit: u64 = builder.evm_mut().block().gas_limit.saturating_sub(system_txs_gas);
         
         // todo: prefetch transactions
-
         if let Err(e) = builder.apply_pre_execution_changes().map_err(PayloadBuilderError::other) {
             debug!("Failed to apply pre-execution changes: {:?}", e);
             return;
@@ -358,6 +351,7 @@ Pool: reth::transaction_pool::TransactionPool<Transaction: reth::transaction_poo
         }
         // todo: if enable greedy merge, fill bid env with transactions from mempool
 
+        block_gas_limit -= bid_runtime.gas_used;
         // Second commit: pay bid transaction (gas limit already includes space for this)
         if let Some(pay_bid_tx) = pay_bid_tx {
             let pay_bid_txs = vec![pay_bid_tx];
@@ -444,8 +438,6 @@ pub struct BidRuntime<Pool, EvmConfig = BscEvmConfig> {
     packed_validator_reward: U256,
 
     finished: Arc<AtomicBool>,
-    // todo: duration
-
     pool: Pool,
     evm_config: EvmConfig,
     parent_header: SealedHeader,
@@ -557,7 +549,6 @@ EvmConfig: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
                     }
                     continue
                 }
-                // this is an error that we should treat as fatal for this attempt
                 Err(err) => return Err(Box::new(PayloadBuilderError::evm(err))),
             };
 

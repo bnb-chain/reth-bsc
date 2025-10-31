@@ -773,10 +773,6 @@ pub struct BscMiner<Pool, Provider> {
     result_work_worker: ResultWorkWorker<Provider>,
     mev_work_worker: MevWorkWorker<Provider, Pool>,
     task_executor: TaskExecutor,
-    simulator: Arc<BidSimulator<Provider, Pool>>,  // No outer RwLock needed, each map has its own lock
-    snapshot_provider: Arc<dyn SnapshotProvider + Send + Sync>,
-    mining_config: crate::node::miner::MiningConfig,
-    chain_spec: Arc<crate::chainspec::BscChainSpec>,
 }
 
 impl<Pool, Provider> BscMiner<Pool, Provider>
@@ -838,7 +834,6 @@ where
         );
         
         let parlia = Arc::new(crate::consensus::parlia::Parlia::new(chain_spec.clone(), 200));
-        // Create a single shared BidSimulator instance (no outer RwLock, each map has its own)
         let simulator = Arc::new(BidSimulator::new(provider.clone(), pool.clone(), chain_spec.clone(), parlia.clone(), validator_address, snapshot_provider.clone()));
         let main_work_worker = MainWorkWorker::new(
             validator_address,
@@ -871,10 +866,6 @@ where
             result_work_worker,
             mev_work_worker,
             task_executor,
-            simulator,
-            snapshot_provider,
-            mining_config,
-            chain_spec,
         };
         info!("Succeed to new miner, address: {}", validator_address);
         Ok(miner)
@@ -897,26 +888,4 @@ where
         info!("Succeed to start mining, address: {}", self.validator_address);
         Ok(())
     }
-
-    /// Check if a bid is already pending
-    pub fn check_pending_bid(&self, block_number: u64, builder: Address, bid_hash: alloy_primitives::B256) -> bool {
-        // No outer lock needed - each map has its own fine-grained locks
-        self.simulator.check_pending_bid(block_number, builder, bid_hash)
-    }
-
-    /// Get mining config
-    pub fn mining_config(&self) -> &crate::node::miner::MiningConfig {
-        &self.mining_config
-    }
-
-    /// Get chain spec
-    pub fn chain_spec(&self) -> &Arc<crate::chainspec::BscChainSpec> {
-        &self.chain_spec
-    }
-
-    /// Get snapshot provider
-    pub fn snapshot_provider(&self) -> &Arc<dyn SnapshotProvider + Send + Sync> {
-        &self.snapshot_provider
-    }
-
 }

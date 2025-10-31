@@ -385,13 +385,6 @@ where
 
         let gas_used = result.gas_used();
         self.gas_used += gas_used;
-        debug!("receipt_builder.build_receipt: {:?}", self.receipt_builder.build_receipt(ReceiptBuilderCtx {
-            tx: &tx_ref,
-            evm: &self.evm,
-            result: result.clone(),
-            state: &state,
-            cumulative_gas_used: self.gas_used,
-        }));
         self.receipts.push(self.receipt_builder.build_receipt(ReceiptBuilderCtx {
             tx: &tx_ref,
             evm: &self.evm,
