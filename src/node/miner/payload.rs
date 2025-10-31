@@ -395,7 +395,7 @@ where
     /// JoinSet for managing build tasks
     join_handle: tokio::task::JoinSet<Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>>>,
     /// Simulator for bid management (no outer RwLock, each map has its own)
-    simulator: Arc<BidSimulator<Client>>,
+    simulator: Arc<BidSimulator<Client, Pool>>,
 }
 
 impl<Pool, Client, EvmConfig> BscPayloadJob<Pool, Client, EvmConfig>
@@ -411,7 +411,7 @@ where
         mining_ctx: MiningContext,
         builder: BscPayloadBuilder<Pool, Client, EvmConfig>,
         build_args: BscBuildArguments<EthPayloadBuilderAttributes>,
-        simulator: Arc<BidSimulator<Client>>,  // No outer RwLock needed
+        simulator: Arc<BidSimulator<Client, Pool>>,  // No outer RwLock needed
         result_tx: mpsc::UnboundedSender<SubmitContext>,
     ) -> (Self, BscPayloadJobHandle) {
         let (abort_tx, abort_rx) = oneshot::channel();

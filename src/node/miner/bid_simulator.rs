@@ -57,53 +57,39 @@ impl Bid
     }
 }
 
-impl std::fmt::Debug for Bid {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Bid")
-            .field("builder", &format!("{:?}", self.builder))
-            .field("block_number", &self.block_number)
-            .field("parent_hash", &format!("{:?}", self.parent_hash))
-            .field("txs_count", &self.txs.len()) 
-            .field("blob_sidecars_count", &self.blob_sidecars.len())
-            .field("gas_used", &self.gas_used)
-            .field("gas_fee", &self.gas_fee)
-            .field("builder_fee", &self.builder_fee)
-            .field("committed", &self.committed)
-            .field("bid_hash", &format!("{:?}", self.bid_hash))
-            .finish()  
-    }
-} 
-
 // bid loop receive bid from client and commit bid to simulator
 // 1. last block number check
 // 2. pack bid runtime and calculate bid value
 // 3. find best bid
 // 4. can be interrupt the last bid and commit
-pub struct BidSimulator<Client> {
+pub struct BidSimulator<Client, Pool> {
 
     client: Client,
     snapshot_provider: Arc<dyn SnapshotProvider + Send + Sync>,
     parlia: Arc<crate::consensus::parlia::Parlia<crate::chainspec::BscChainSpec>>,
+    pool: Pool,
     validator_address: Address,
 
     // Each map has its own lock for fine-grained concurrency control
     // This avoids writer starvation when one operation needs write access
     best_bid_to_run: Arc<RwLock<HashMap<B256, Bid>>>,
     simulating_bid: Arc<RwLock<HashMap<B256, Bid>>>,
-    best_bid: Arc<RwLock<HashMap<B256, BidRuntime<BscEvmConfig>>>>,
+    best_bid: Arc<RwLock<HashMap<B256, BidRuntime<Pool, BscEvmConfig>>>>,
     pending_bid: Arc<RwLock<HashMap<String, u8>>>,
     bid_receiving: bool,
     chain_spec: Arc<BscChainSpec>,
     min_gas_price: U256,
 }
 
-impl<Client> BidSimulator<Client> 
+impl<Client, Pool> BidSimulator<Client, Pool> 
 where Client: HeaderProvider<Header = alloy_consensus::Header> + BlockHashReader + StateProviderFactory + Clone + 'static,
+Pool: reth::transaction_pool::TransactionPool<Transaction: reth::transaction_pool::PoolTransaction<Consensus = TransactionSigned>> + 'static,
 {
-    pub fn new(client: Client, chain_spec: Arc<BscChainSpec>, parlia: Arc<crate::consensus::parlia::Parlia<crate::chainspec::BscChainSpec>>, validator_address: Address, snapshot_provider: Arc<dyn SnapshotProvider + Send + Sync>) -> Self {
+    pub fn new(client: Client, pool: Pool, chain_spec: Arc<BscChainSpec>, parlia: Arc<crate::consensus::parlia::Parlia<crate::chainspec::BscChainSpec>>, validator_address: Address, snapshot_provider: Arc<dyn SnapshotProvider + Send + Sync>) -> Self {
         Self { 
             client,
             parlia,
+            pool,
             validator_address,
             chain_spec,
             snapshot_provider,
@@ -124,7 +110,6 @@ where Client: HeaderProvider<Header = alloy_consensus::Header> + BlockHashReader
                 return false;
             }
         }
-        // todo: check pre builder max bid count
         true
     }
 
@@ -133,7 +118,7 @@ where Client: HeaderProvider<Header = alloy_consensus::Header> + BlockHashReader
         self.pending_bid.write().insert(key, 1);
     }
 
-    pub fn commit_new_bid(&self, bid: Bid) -> Option<BidRuntime<BscEvmConfig>> {
+    pub fn commit_new_bid(&self, bid: Bid) -> Option<BidRuntime<Pool, BscEvmConfig>> {
         if !self.check_pending_bid(bid.block_number, bid.builder, bid.bid_hash) {
             debug!("bid is already pending, ignore");
             return None;
@@ -260,8 +245,8 @@ where Client: HeaderProvider<Header = alloy_consensus::Header> + BlockHashReader
         });
     }
 
-    fn new_bid_runtime(&self, _bid: &Bid, _validator_commission: u64, parent_header: SealedHeader, attributes: EthPayloadBuilderAttributes) -> Result<BidRuntime<BscEvmConfig>, Box<dyn std::error::Error + Send + Sync>>{
-        let mut runtime = BidRuntime::new(_bid.clone(), BscEvmConfig::new(self.chain_spec.clone()), parent_header, attributes, self.chain_spec.clone());
+    fn new_bid_runtime(&self, _bid: &Bid, _validator_commission: u64, parent_header: SealedHeader, attributes: EthPayloadBuilderAttributes) -> Result<BidRuntime<Pool, BscEvmConfig>, Box<dyn std::error::Error + Send + Sync>>{
+        let mut runtime = BidRuntime::new(_bid.clone(), self.pool.clone(), BscEvmConfig::new(self.chain_spec.clone()), parent_header, attributes, self.chain_spec.clone());
         let expected_block_reward = _bid.gas_fee;
         let mut expected_validator_reward = expected_block_reward * U256::from(_validator_commission);
         expected_validator_reward /= U256::from(10000u64);
@@ -275,7 +260,7 @@ where Client: HeaderProvider<Header = alloy_consensus::Header> + BlockHashReader
         Ok(runtime)
     }
 
-    fn commit_bid(&self, reason: u32, mut bid_runtime: BidRuntime<BscEvmConfig>) -> BidRuntime<BscEvmConfig> {
+    fn commit_bid(&self, reason: u32, mut bid_runtime: BidRuntime<Pool, BscEvmConfig>) -> BidRuntime<Pool, BscEvmConfig> {
         debug!("bid committed reason:{}, bid hash:{}",reason, bid_runtime.bid.bid_hash);
         bid_runtime.bid.committed = true;
 
@@ -283,7 +268,7 @@ where Client: HeaderProvider<Header = alloy_consensus::Header> + BlockHashReader
     }
 
     // sim_bid commit tx and set best bid
-    pub fn bid_simulate(&self, mut bid_runtime: BidRuntime<BscEvmConfig>) {
+    pub fn bid_simulate(&self, mut bid_runtime: BidRuntime<Pool, BscEvmConfig>) {
         if !self.bid_receiving {
             return 
         }
@@ -395,7 +380,7 @@ where Client: HeaderProvider<Header = alloy_consensus::Header> + BlockHashReader
         };
         let mut sealed_block = Arc::new(block.sealed_block().clone());
 
-        // Update block_hash for all blob sidecars
+        // Update block_hash for all blob sidecars and insert into pool's blob store
         let block_hash = sealed_block.hash();
         for sidecar in bid_runtime.blob_sidecars.iter_mut() {
             sidecar.block_hash = block_hash;
@@ -445,13 +430,13 @@ where Client: HeaderProvider<Header = alloy_consensus::Header> + BlockHashReader
     }
 
     /// Get the best bid for a given parent hash
-    pub fn get_best_bid(&self, parent_hash: B256) -> Option<BidRuntime<BscEvmConfig>> {
+    pub fn get_best_bid(&self, parent_hash: B256) -> Option<BidRuntime<Pool, BscEvmConfig>> {
         self.best_bid.read().get(&parent_hash).cloned()
     }
 }
 
 #[derive(Clone)]
-pub struct BidRuntime<EvmConfig = BscEvmConfig> {
+pub struct BidRuntime<Pool, EvmConfig = BscEvmConfig> {
     pub bid: Bid,
     expected_block_reward: U256,
     expected_validator_reward: U256,
@@ -461,7 +446,7 @@ pub struct BidRuntime<EvmConfig = BscEvmConfig> {
     finished: Arc<AtomicBool>,
     // todo: duration
 
-    // evn
+    pool: Pool,
     evm_config: EvmConfig,
     parent_header: SealedHeader,
     attributes: EthPayloadBuilderAttributes,
@@ -474,14 +459,16 @@ pub struct BidRuntime<EvmConfig = BscEvmConfig> {
     blob_sidecars: Vec<BscBlobTransactionSidecar>,
 }
 
-impl<EvmConfig> BidRuntime<EvmConfig> 
+impl<Pool, EvmConfig> BidRuntime<Pool, EvmConfig> 
 where 
+Pool: reth::transaction_pool::TransactionPool<Transaction: reth::transaction_pool::PoolTransaction<Consensus = TransactionSigned>> + Clone + 'static,
 EvmConfig: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
 <EvmConfig as ConfigureEvm>::Primitives: reth_primitives_traits::NodePrimitives<BlockHeader = alloy_consensus::Header, SignedTx = alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip4844>, Block = crate::node::primitives::BscBlock>,
 {
-    fn new(bid: Bid, evm_config: EvmConfig, parent_header: SealedHeader, attributes: EthPayloadBuilderAttributes, chain_spec: Arc<BscChainSpec>) -> Self {
+    fn new(bid: Bid, pool: Pool, evm_config: EvmConfig, parent_header: SealedHeader, attributes: EthPayloadBuilderAttributes, chain_spec: Arc<BscChainSpec>) -> Self {
         Self {
             bid,
+            pool,
             evm_config,
             builder_config: EthereumBuilderConfig::default(),
             bsc_payload: BscBuiltPayload::default(),
@@ -499,7 +486,7 @@ EvmConfig: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
         }
     }
 
-    fn is_expected_better_than(&self, ohter: &BidRuntime<EvmConfig>) -> bool {
+    fn is_expected_better_than(&self, ohter: &BidRuntime<Pool, EvmConfig>) -> bool {
         self.expected_block_reward >= ohter.expected_block_reward && self.expected_validator_reward >= ohter.expected_validator_reward
     }
 
@@ -577,6 +564,12 @@ EvmConfig: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
             if is_blob_tx {
                 // Get sidecar from bid.blob_sidecars if available and convert to BscBlobTransactionSidecar
                 if let Some(sidecar) = self.bid.blob_sidecars.get(&tx_hash) {
+                    // Insert blob sidecar into pool's blob store
+                    use alloy_eips::eip7594::BlobTransactionSidecarVariant;
+                    if let Err(e) = self.pool.insert_blob(tx_hash, BlobTransactionSidecarVariant::Eip4844(sidecar.clone())) {
+                        debug!("Failed to insert blob sidecar for tx {:?}: {:?}", tx_hash, e);
+                        return Err("Failed to insert blob sidecar".into());
+                    }
                     let bsc_sidecar = BscBlobTransactionSidecar {
                         inner: sidecar.clone(),
                         block_number: self.bid.block_number,

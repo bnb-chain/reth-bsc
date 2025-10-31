@@ -308,7 +308,7 @@ pub struct MainWorkWorker<Pool, Provider> {
     payload_tx: mpsc::UnboundedSender<SubmitContext>,
     running_job_handle: Option<BscPayloadJobHandle>,
     payload_job_join_set: JoinSet<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
-    simulator: Arc<BidSimulator<Provider>>,  // No outer RwLock, each map has its own lock
+    simulator: Arc<BidSimulator<Provider, Pool>>,  // No outer RwLock, each map has its own lock
 }
 
 impl<Pool, Provider> MainWorkWorker<Pool, Provider>
@@ -333,7 +333,7 @@ where
         chain_spec: Arc<crate::chainspec::BscChainSpec>,
         parlia: Arc<crate::consensus::parlia::Parlia<crate::chainspec::BscChainSpec>>,
         mining_queue_rx: mpsc::UnboundedReceiver<MiningContext>,
-        simulator: Arc<BidSimulator<Provider>>,  // No outer RwLock needed
+        simulator: Arc<BidSimulator<Provider, Pool>>,  // No outer RwLock needed
         payload_tx: mpsc::UnboundedSender<SubmitContext>,
     ) -> Self {
         Self {
@@ -690,14 +690,14 @@ where
     }
 }
 
-pub struct MevWorkWorker<Provider> {
-    simulator: Arc<BidSimulator<Provider>>,  // No outer RwLock, each map has its own lock
-    bid_simulate_req_rx: mpsc::UnboundedReceiver<BidRuntime<BscEvmConfig>>,
-    bid_simulate_req_tx: mpsc::UnboundedSender<BidRuntime<BscEvmConfig>>,
+pub struct MevWorkWorker<Provider, Pool> {
+    simulator: Arc<BidSimulator<Provider, Pool>>,  // No outer RwLock, each map has its own lock
+    bid_simulate_req_rx: mpsc::UnboundedReceiver<BidRuntime<Pool, BscEvmConfig>>,
+    bid_simulate_req_tx: mpsc::UnboundedSender<BidRuntime<Pool, BscEvmConfig>>,
     provider: Provider,
 }
 
-impl<Provider> MevWorkWorker<Provider>
+impl<Provider, Pool> MevWorkWorker<Provider, Pool>
 where
     Provider: HeaderProvider<Header = alloy_consensus::Header>
         + BlockNumReader
@@ -707,12 +707,13 @@ where
         + Send
         + Sync
         + 'static,
+    Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>> + 'static,
 {
     pub fn new(
-        simulator: Arc<BidSimulator<Provider>>,
+        simulator: Arc<BidSimulator<Provider, Pool>>,
         provider: Provider,
     ) -> Self {
-        let (bid_simulate_req_tx, bid_simulate_req_rx) = mpsc::unbounded_channel::<BidRuntime<BscEvmConfig>>();
+        let (bid_simulate_req_tx, bid_simulate_req_rx) = mpsc::unbounded_channel::<BidRuntime<Pool, BscEvmConfig>>();
         Self { simulator, bid_simulate_req_rx, bid_simulate_req_tx, provider }
     }
 
@@ -770,9 +771,9 @@ pub struct BscMiner<Pool, Provider> {
     new_work_worker: NewWorkWorker<Provider>,
     main_work_worker: MainWorkWorker<Pool, Provider>,
     result_work_worker: ResultWorkWorker<Provider>,
-    mev_work_worker: MevWorkWorker<Provider>,
+    mev_work_worker: MevWorkWorker<Provider, Pool>,
     task_executor: TaskExecutor,
-    simulator: Arc<BidSimulator<Provider>>,  // No outer RwLock needed, each map has its own lock
+    simulator: Arc<BidSimulator<Provider, Pool>>,  // No outer RwLock needed, each map has its own lock
     snapshot_provider: Arc<dyn SnapshotProvider + Send + Sync>,
     mining_config: crate::node::miner::MiningConfig,
     chain_spec: Arc<crate::chainspec::BscChainSpec>,
@@ -838,7 +839,7 @@ where
         
         let parlia = Arc::new(crate::consensus::parlia::Parlia::new(chain_spec.clone(), 200));
         // Create a single shared BidSimulator instance (no outer RwLock, each map has its own)
-        let simulator = Arc::new(BidSimulator::new(provider.clone(), chain_spec.clone(), parlia.clone(), validator_address, snapshot_provider.clone()));
+        let simulator = Arc::new(BidSimulator::new(provider.clone(), pool.clone(), chain_spec.clone(), parlia.clone(), validator_address, snapshot_provider.clone()));
         let main_work_worker = MainWorkWorker::new(
             validator_address,
             pool.clone(),
