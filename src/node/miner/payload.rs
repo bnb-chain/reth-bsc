@@ -614,7 +614,7 @@ where
             }
             Ok(())
         } else {
-            warn!("No best payload available to send");
+            warn!("No best payload available to send, try_mine_block_number: {}", self.build_args.config.parent_header.number()+1);
             Err(Box::new(BscPayloadJobError::NoPayloadsAvailable))
         }
     }
