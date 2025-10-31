@@ -87,7 +87,7 @@ impl MevApiImpl {
 
     /// Get header by number from global header provider
     fn get_header_by_number(&self, block_number: u64) -> Option<alloy_consensus::Header> {
-        crate::shared::get_header_by_number(block_number)
+        crate::shared::get_canonical_header_by_number_from_provider(block_number)
     }
 
     /// Parse transaction from bytes with validation
@@ -478,7 +478,7 @@ impl BscMevApiServer for MevApiImpl {
 
         // Optional: Check if validator is inturn using snapshot (for filtering bids)
         // Note: This is optional - you may want to accept bids even when not inturn
-        if let Some(snapshot) = self.snapshot_provider.snapshot(parent_block_number) {
+        if let Some(snapshot) = self.snapshot_provider.snapshot_by_hash(&parent_hash) {
             // You can add validator checks here if needed
             tracing::debug!(
                 "Validator snapshot available for block {}, validators: {}", 

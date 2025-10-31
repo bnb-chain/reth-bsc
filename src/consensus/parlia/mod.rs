@@ -11,6 +11,7 @@ pub mod db;
 pub mod go_rng;
 pub mod ramanujan_fork;
 pub mod bls_signer;
+pub mod forkchoice_rule;
 
 #[cfg(test)]     
 mod tests;  
@@ -23,3 +24,4 @@ pub use util::hash_with_chain_id;
 pub use provider::SnapshotProvider;
 pub use vote_pool as votes;
 pub use consensus::Parlia;
+pub use forkchoice_rule::{BscForkChoiceRule, HeaderForForkchoice};

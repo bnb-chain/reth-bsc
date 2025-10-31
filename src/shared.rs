@@ -50,6 +50,28 @@ static BID_PACKAGE_QUEUE: OnceLock<Arc<Mutex<VecDeque<crate::node::miner::bid_si
 /// Global network handle to interact with P2P (reth).
 static NETWORK_HANDLE: OnceLock<NetworkHandle<BscNetworkPrimitives>> = OnceLock::new();
 
+/// Trait for fork choice engine operations that can be stored globally
+pub trait ForkChoiceEngineTrait: Send + Sync {
+    fn update_forkchoice<'a>(&'a self, header: &'a Header) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), crate::consensus::ParliaConsensusErr>> + Send + 'a>>;
+    fn is_need_reorg<'a>(&'a self, incoming_header: &'a Header, current_header: &'a Header) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, crate::consensus::ParliaConsensusErr>> + Send + 'a>>;
+}
+
+impl<P> ForkChoiceEngineTrait for crate::node::consensus::BscForkChoiceEngine<P>
+where
+    P: HeaderProvider<Header = Header> + BlockNumReader + Clone + Send + Sync,
+{
+    fn update_forkchoice<'a>(&'a self, header: &'a Header) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), crate::consensus::ParliaConsensusErr>> + Send + 'a>> {
+        Box::pin(self.update_forkchoice(header))
+    }
+    
+    fn is_need_reorg<'a>(&'a self, incoming_header: &'a Header, current_header: &'a Header) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, crate::consensus::ParliaConsensusErr>> + Send + 'a>> {
+        Box::pin(self.is_need_reorg(incoming_header, current_header))
+    }
+}
+
+/// Global fork choice engine instance
+static FORK_CHOICE_ENGINE: OnceLock<Box<dyn ForkChoiceEngineTrait>> = OnceLock::new();
+
 /// Store the snapshot provider globally
 pub fn set_snapshot_provider(provider: Arc<dyn SnapshotProvider + Send + Sync>) -> Result<(), Arc<dyn SnapshotProvider + Send + Sync>> {
     SNAPSHOT_PROVIDER.set(provider)
@@ -114,47 +136,37 @@ where
     Ok(())
 }
 
-/// Get the global header by hash provider function
-pub fn get_header_by_hash_provider() -> Option<&'static HeaderByHashFn> {
-    HEADER_BY_HASH_PROVIDER.get()
-}
-
-/// Get the global header by number provider function  
-pub fn get_header_by_number_provider() -> Option<&'static HeaderByNumberFn> {
-    HEADER_BY_NUMBER_PROVIDER.get()
-}
-
 /// Get header by hash from the global header provider
 /// Directly calls the stored HeaderProvider::header() function
-pub fn get_header_by_hash_from_provider(block_hash: &B256) -> Option<Header> {
+pub fn get_canonical_header_by_hash_from_provider(block_hash: &B256) -> Option<Header> {
     let provider_fn = HEADER_BY_HASH_PROVIDER.get()?;
     provider_fn(block_hash)
 }
 
 /// Get header by number from the global header provider
 /// Directly calls the stored HeaderProvider::header_by_number() function
-pub fn get_header_by_number_from_provider(block_number: u64) -> Option<Header> {
+pub fn get_canonical_header_by_number_from_provider(block_number: u64) -> Option<Header> {
     let provider_fn = HEADER_BY_NUMBER_PROVIDER.get()?;
     provider_fn(block_number)
 }
 
 /// Get header by hash - simplified interface
-pub fn get_header_by_hash(block_hash: &B256) -> Option<Header> {
-    get_header_by_hash_from_provider(block_hash)
+pub fn get_canonical_header_by_hash(block_hash: &B256) -> Option<Header> {
+    get_canonical_header_by_hash_from_provider(block_hash)
 }
 
 /// Get header by number - simplified interface
-pub fn get_header_by_number(block_number: u64) -> Option<Header> {
-    get_header_by_number_from_provider(block_number)
+pub fn get_canonical_header_by_number(block_number: u64) -> Option<Header> {
+    get_canonical_header_by_number_from_provider(block_number)
 }
 
 /// Get the best block number from the global provider if initialized
-pub fn get_best_block_number() -> Option<u64> {
+pub fn get_best_canonical_block_number() -> Option<u64> {
     BEST_BLOCK_NUMBER_PROVIDER.get().and_then(|f| f())
 }
 
 /// Get the best total difficulty (u128 approximation) if available
-pub fn get_best_total_difficulty_u128() -> Option<u128> {
+pub fn get_best_canonical_td() -> Option<u128> {
     BEST_TD_PROVIDER.get().and_then(|f| f())
 }
 
@@ -212,4 +224,22 @@ pub fn set_network_handle(handle: NetworkHandle<BscNetworkPrimitives>) -> Result
 /// Get a clone of the global network handle if available.
 pub fn get_network_handle() -> Option<NetworkHandle<BscNetworkPrimitives>> {
     NETWORK_HANDLE.get().cloned()
+}
+
+/// Store the fork choice engine globally.
+/// 
+/// This stores a `BscForkChoiceEngine` instance to provide global access for fork choice operations.
+pub fn set_fork_choice_engine<P>(engine: crate::node::consensus::BscForkChoiceEngine<P>) 
+    -> Result<(), Box<dyn std::error::Error>>
+where
+    P: HeaderProvider<Header = Header> + BlockNumReader + Clone + Send + Sync + 'static,
+{
+    let boxed: Box<dyn ForkChoiceEngineTrait> = Box::new(engine);
+    FORK_CHOICE_ENGINE.set(boxed).map_err(|_| "Failed to set fork choice engine")?;
+    Ok(())
+}
+
+/// Get a reference to the global fork choice engine.
+pub fn get_fork_choice_engine() -> Option<&'static dyn ForkChoiceEngineTrait> {
+    FORK_CHOICE_ENGINE.get().map(|b| &**b)
 }

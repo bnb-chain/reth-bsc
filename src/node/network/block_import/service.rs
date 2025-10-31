@@ -1,7 +1,8 @@
 use super::handle::ImportHandle;
 use crate::{
-    consensus::{ParliaConsensus, ParliaConsensusErr, parlia::vote_pool},
-    node::{engine_api::payload::BscPayloadTypes, network::BscNewBlock},
+    chainspec::BscChainSpec,
+    consensus::{ParliaConsensusErr, parlia::vote_pool},
+    node::{engine_api::payload::BscPayloadTypes, network::BscNewBlock, consensus::BscForkChoiceEngine},
     BscBlock, BscBlockBody,
 };
 use alloy_consensus::{BlockBody, Header};
@@ -63,8 +64,8 @@ where
 {
     /// The handle to communicate with the engine service
     engine: BeaconConsensusEngineHandle<BscPayloadTypes>,
-    /// The consensus implementation
-    consensus: Arc<ParliaConsensus<Provider>>,
+    /// The fork choice engine for BSC
+    forkchoice_engine: BscForkChoiceEngine<Provider>,
     /// Receive the new block from the network
     from_network: UnboundedReceiver<IncomingBlock>,
     /// Receive block hashes from the network for downloading
@@ -83,15 +84,26 @@ where
 {
     /// Create a new block import service
     pub fn new(
-        consensus: Arc<ParliaConsensus<Provider>>,
+        provider: Provider,
+        chain_spec: Arc<BscChainSpec>,
         engine: BeaconConsensusEngineHandle<BscPayloadTypes>,
         from_network: UnboundedReceiver<IncomingBlock>,
         from_hashes: UnboundedReceiver<IncomingHashes>,
         to_network: UnboundedSender<ImportEvent>,
     ) -> Self {
+        let forkchoice_engine = BscForkChoiceEngine::new(
+            provider,
+            engine.clone(),
+            chain_spec,
+        );
+        
+        if let Err(e) = crate::shared::set_fork_choice_engine(forkchoice_engine.clone()) {
+            tracing::warn!(target: "bsc::block_import", error = %e, "Fork choice engine already initialized; skipping global set");
+        }
+        
         Self {
             engine,
-            consensus,
+            forkchoice_engine,
             from_network,
             from_hashes,
             to_network,
@@ -103,7 +115,7 @@ where
     /// Process a new payload and return the outcome
     fn new_payload(&self, block: BlockMsg, peer_id: PeerId) -> ImportFut {
         let engine = self.engine.clone();
-        let consensus = self.consensus.clone();
+        let forkchoice_engine = self.forkchoice_engine.clone();
 
         tracing::debug!(target: "bsc::block_import", "New payload: block = ({:?}, {:?}), peer_id = {:?}", block.block.0.block.header.number, block.block.0.block.header.hash_slow(), peer_id);
         Box::pin(async move {
@@ -115,7 +127,7 @@ where
                     PayloadStatusEnum::Valid => {
                         tracing::debug!(target: "bsc::block_import", "New payload is valid, block = {:?}, peer_id = {:?}", block, peer_id);
                         // handle fork choice update with valid payload
-                        if let Err(e) = Self::update_fork_choice(engine, consensus, header).await {
+                        if let Err(e) = forkchoice_engine.update_forkchoice(&header).await {
                             tracing::warn!(target: "bsc::block_import", "Failed to update fork choice: {}", e);
                         }
                         Outcome { peer: peer_id, result: Ok(BlockValidation::ValidBlock { block }) }
@@ -131,39 +143,6 @@ where
                 Err(err) => None,
             }
         })
-    }
-
-    /// Process a forkchoice update and return the outcome  
-    async fn update_fork_choice(
-        engine: BeaconConsensusEngineHandle<BscPayloadTypes>, 
-        consensus: Arc<ParliaConsensus<Provider>>,
-        new_header: Header) -> Result<(), ParliaConsensusErr> {
-        let best_number = consensus.provider.chain_info()?.best_number;
-        tracing::debug!(target: "parlia", "Best canonical number: {:?}, new_header = {:?}", best_number, new_header);
-        let current_head = consensus.provider.header_by_number(best_number)?.ok_or(ParliaConsensusErr::HeadHashNotFound)?;
-        let (new_td, current_td) = consensus.header_td_fcu(&engine, &new_header, &current_head).await?;
-        let new_canonical_head = consensus.canonical_head((&new_header, new_td), (&current_head, current_td))?;
-        // get safe block and finalized block with new canonical head
-        // ref: https://github.com/bnb-chain/bsc/blob/f70aaa8399ccee429804eecf3fc4c6fd8d9e6cab/eth/api_backend.go#L72
-        let (safe_block_number, safe_block_hash) = consensus.get_justified_number_and_hash(new_canonical_head).unwrap_or((0, B256::ZERO));
-        let (finalized_block_number, finalized_block_hash) = consensus.get_finalized_number_and_hash(new_canonical_head).unwrap_or((0, B256::ZERO));
-        let state = ForkchoiceState {
-            head_block_hash: new_canonical_head.hash_slow(),
-            safe_block_hash,
-            finalized_block_hash,
-        };
-
-        tracing::debug!(target: "parlia", "Fork choice updated: state = {:?}, new_canonical_head = ({:?}, {:?}), new_header = ({:?}, {:?})", 
-            state, new_canonical_head.number, new_canonical_head.hash_slow(), new_header.number, new_header.hash_slow());
-        match engine.fork_choice_updated(state, None, EngineApiMessageVersion::default()).await
-        {
-            Ok(response) => match response.payload_status.status {
-                PayloadStatusEnum::Invalid { validation_error } => 
-                Err(ParliaConsensusErr::ForkChoiceUpdateError(validation_error)),
-                _ => Ok(()),
-            },
-            Err(err) => Err(ParliaConsensusErr::ForkChoiceUpdateError(err.to_string())),
-        }
     }
 
     /// Add a new block import task to the pending imports
@@ -276,7 +255,7 @@ where
                     // Produce and broadcast a local vote for this new canonical head, if eligible
                     if let Some(sp) = crate::shared::get_snapshot_provider() {
                         let sp = Arc::clone(sp);
-                        let spec = this.consensus.chain_spec.clone();
+                        let spec = this.forkchoice_engine.chain_spec().clone();
                         let header = block.block.0.block.header.clone();
                         tokio::spawn(async move {
                             crate::node::vote_producer::maybe_produce_and_broadcast_for_head(
@@ -560,10 +539,9 @@ mod tests {
         /// Create a new test fixture with the given engine responses
         async fn new(responses: EngineResponses) -> Self {
             // Use mainnet chain spec for tests; it influences only fast-finality parsing.
-            let mut consensus = Arc::new(ParliaConsensus::new(
-                MockProvider::new(), 
-                Arc::new(crate::chainspec::BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet())),
-            ));
+            let provider = MockProvider::new();
+            let chain_spec = Arc::new(crate::chainspec::BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet()));
+            
             let (to_engine, from_engine) = mpsc::unbounded_channel();
             let engine_handle = BeaconConsensusEngineHandle::new(to_engine);
 
@@ -576,7 +554,8 @@ mod tests {
             let handle = ImportHandle::new(to_import, to_hashes, import_outcome);
 
             let service = ImportService::new(
-                consensus, 
+                provider,
+                chain_spec,
                 engine_handle, 
                 from_network, 
                 from_hashes,

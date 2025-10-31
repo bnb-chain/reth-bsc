@@ -1,12 +1,18 @@
 use crate::{
     hardforks::BscHardforks, 
-    node::BscNode, 
+    node::{BscNode, engine_api::payload::BscPayloadTypes}, 
     BscBlock, BscBlockBody, BscPrimitives,
-    consensus::parlia::{provider::EnhancedDbSnapshotProvider, Parlia, util::calculate_millisecond_timestamp},
+    chainspec::BscChainSpec,
+    consensus::{
+        ParliaConsensusErr,
+        parlia::{provider::EnhancedDbSnapshotProvider, Parlia, util::calculate_millisecond_timestamp, BscForkChoiceRule, HeaderForForkchoice},
+    },
+    shared,
 };
 use alloy_consensus::{Header, TxReceipt};
 use alloy_primitives::{B256, Bytes};
 use alloy_eips::Encodable2718;
+use alloy_rpc_types::engine::{ForkchoiceState, PayloadStatusEnum};
 use reth::{
     api::FullNodeTypes,
     builder::{components::ConsensusBuilder, BuilderContext},
@@ -19,6 +25,9 @@ use reth::{
 use reth_chainspec::EthChainSpec;
 use reth_primitives::{gas_spent_by_transactions, GotExpected};
 use reth_ethereum_primitives::Receipt;
+use reth_engine_primitives::BeaconConsensusEngineHandle;
+use reth_payload_primitives::EngineApiMessageVersion;
+use reth_provider::{BlockNumReader, HeaderProvider};
 use std::sync::Arc;
 
 /// A basic Bsc consensus builder.
@@ -269,4 +278,241 @@ where
     tracing::info!("Succeed to create EnhancedDbSnapshotProvider with backward walking capability");
 
     Ok(snapshot_provider)
+}
+
+/// BSC Fork Choice Engine
+/// 
+/// Manages fork choice decisions for BSC/Parlia consensus, including:
+/// - Evaluating incoming blocks against current canonical head
+/// - Applying fast finality rules (justified/finalized blocks)
+/// - Communicating fork choice updates to the consensus engine
+#[derive(Debug, Clone)]
+pub struct BscForkChoiceEngine<P> {
+    /// The provider for reading block information
+    pub(crate) provider: P,
+    /// The engine handle for communicating with the consensus engine
+    pub(crate) engine_handle: BeaconConsensusEngineHandle<BscPayloadTypes>,
+    /// Chain specification
+    chain_spec: Arc<BscChainSpec>,
+    /// The fork choice rule
+    forkchoice_rule: Arc<BscForkChoiceRule>,
+    /// Cache for header total difficulties
+    header_td_cache: Arc<parking_lot::RwLock<schnellru::LruMap<B256, Option<alloy_primitives::U256>, schnellru::ByLength>>>,
+}
+
+impl<P> BscForkChoiceEngine<P>
+where
+    P: BlockNumReader + HeaderProvider<Header = Header> + Clone,
+{
+    /// Creates a new `BscForkChoiceEngine` instance.
+    pub fn new(
+        provider: P,
+        engine_handle: BeaconConsensusEngineHandle<BscPayloadTypes>,
+        chain_spec: Arc<BscChainSpec>,
+    ) -> Self {
+        Self {
+            provider,
+            engine_handle,
+            chain_spec: chain_spec.clone(),
+            forkchoice_rule: Arc::new(BscForkChoiceRule::new(chain_spec)),
+            header_td_cache: Arc::new(parking_lot::RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new(128)))),
+        }
+    }
+
+    /// Returns a reference to the chain specification.
+    pub fn chain_spec(&self) -> &Arc<BscChainSpec> {
+        &self.chain_spec
+    }
+
+    /// Updates the fork choice based on the incoming header.
+    /// 
+    /// This function evaluates whether the incoming header should become the new canonical head
+    /// according to BSC's fork choice rules (Parlia consensus with fast finality).
+    ///
+    /// # Arguments
+    ///
+    /// * `incoming_header` - The incoming header to evaluate for fork choice
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` if the fork choice was successfully updated, or an error if the update failed.
+    pub async fn update_forkchoice(&self, incoming_header: &Header) -> Result<(), ParliaConsensusErr> {
+        tracing::debug!(
+            target: "bsc::forkchoice",
+            block_number = incoming_header.number,
+            block_hash = ?incoming_header.hash_slow(),
+            "Updating fork choice with incoming header"
+        );
+
+        let current_number = self.provider.chain_info()?.best_number;
+        tracing::debug!(target: "bsc::forkchoice", "Best canonical number: {:?}, new_header = {:?}", current_number, incoming_header);
+        
+        let current_head = self.provider.header_by_number(current_number)?.ok_or(ParliaConsensusErr::HeadHashNotFound)?;
+        
+        // Determine if we need to reorg using fork choice rules 
+        let need_reorg = self.is_need_reorg(incoming_header, &current_head).await?;
+        
+        // The new canonical head is the incoming header if reorg is needed, otherwise current
+        let new_canonical_head = if need_reorg {
+            incoming_header
+        } else {
+            &current_head
+        };
+        
+        // Get safe block and finalized block with new canonical head
+        // ref: https://github.com/bnb-chain/bsc/blob/f70aaa8399ccee429804eecf3fc4c6fd8d9e6cab/eth/api_backend.go#L72
+        let (safe_block_number, safe_block_hash) = self.get_justified_number_and_hash(new_canonical_head).unwrap_or((0, B256::ZERO));
+        let (finalized_block_number, finalized_block_hash) = self.get_finalized_number_and_hash(new_canonical_head).unwrap_or((0, B256::ZERO));
+        
+        let state = ForkchoiceState {
+            head_block_hash: new_canonical_head.hash_slow(),
+            safe_block_hash,
+            finalized_block_hash,
+        };
+
+        tracing::debug!(
+            target: "bsc::forkchoice",
+            ?state,
+            new_canonical_head_number = new_canonical_head.number,
+            new_canonical_head_hash = ?new_canonical_head.hash_slow(),
+            incoming_header_number = incoming_header.number,
+            incoming_header_hash = ?incoming_header.hash_slow(),
+            safe_block_number,
+            finalized_block_number,
+            "Fork choice updated"
+        );
+        
+        match self.engine_handle.fork_choice_updated(state, None, EngineApiMessageVersion::default()).await
+        {
+            Ok(response) => match response.payload_status.status {
+                PayloadStatusEnum::Invalid { validation_error } => 
+                    Err(ParliaConsensusErr::ForkChoiceUpdateError(validation_error)),
+                _ => Ok(()),
+            },
+            Err(err) => Err(ParliaConsensusErr::ForkChoiceUpdateError(err.to_string())),
+        }
+    }
+
+    /// Determines if a chain reorganization is needed based on fork choice rules.
+    ///
+    /// This function compares the incoming header with the current canonical header
+    /// and decides whether the incoming chain should replace the current canonical chain.
+    /// The decision is based on BSC's Parlia consensus rules with fast finality support.
+    ///
+    /// This function handles TD (Total Difficulty) fetching internally.
+    ///
+    /// # Arguments
+    ///
+    /// * `incoming_header` - The incoming header from a potentially better chain
+    /// * `current_header` - The current canonical head header
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(true)` if a reorg is needed (incoming should become canonical),
+    /// `Ok(false)` if no reorg is needed (current remains canonical),
+    /// or an error if the comparison failed.
+    pub async fn is_need_reorg(
+        &self,
+        incoming_header: &Header,
+        current_header: &Header,
+    ) -> Result<bool, ParliaConsensusErr> {
+        let (incoming_td, current_td) = self.header_td_fcu(&self.engine_handle, incoming_header, current_header).await?;
+        let incoming_justified_num = self.get_justified_number_and_hash(incoming_header)
+            .map(|(num, _)| num)
+            .unwrap_or(0);
+        let current_justified_num = self.get_justified_number_and_hash(current_header)
+            .map(|(num, _)| num)
+            .unwrap_or(0);
+
+        let incoming_for_fc = HeaderForForkchoice::new(incoming_header, incoming_td, incoming_justified_num);
+        let current_for_fc = HeaderForForkchoice::new(current_header, current_td, current_justified_num);
+
+        self.forkchoice_rule.is_need_reorg(&incoming_for_fc, &current_for_fc)
+    }
+
+    /// Gets the justified number and hash from the header's snapshot.
+    fn get_justified_number_and_hash(&self, header: &Header) -> Option<(u64, B256)> {
+        if !self.chain_spec.is_luban_active_at_block(header.number) {
+            return None;
+        }
+        
+        let sp = shared::get_snapshot_provider()?;
+        
+        match sp.snapshot_by_hash(&header.hash_slow()) {
+            Some(snap) => Some((snap.vote_data.target_number, snap.vote_data.target_hash)),
+            None => {
+                tracing::warn!(
+                    target: "bsc::forkchoice",
+                    header_hash = ?header.hash_slow(),
+                    "Missing snapshot for header when get justified number and hash"
+                );
+                None
+            }
+        }
+    }
+
+    /// Gets the finalized number and hash from the header's snapshot.
+    fn get_finalized_number_and_hash(&self, header: &Header) -> Option<(u64, B256)> {
+        if !self.chain_spec.is_plato_active_at_block(header.number) {
+            return None;
+        }
+        
+        let sp = shared::get_snapshot_provider()?;
+        
+        match sp.snapshot_by_hash(&header.hash_slow()) {
+            Some(snap) => Some((snap.vote_data.source_number, snap.vote_data.source_hash)),
+            None => {
+                tracing::warn!(
+                    target: "bsc::forkchoice",
+                    header_hash = ?header.hash_slow(),
+                    "Missing snapshot for header when get finalized number and hash"
+                );
+                None
+            }
+        }
+    }
+
+    /// Gets the total difficulty for both incoming and current headers.
+    ///
+    /// This private method queries the total difficulty (TD) from the engine for both headers,
+    /// with fallback logic for the incoming header if not found directly.
+    async fn header_td_fcu(
+        &self,
+        engine: &BeaconConsensusEngineHandle<BscPayloadTypes>,
+        incoming: &Header,
+        current: &Header,
+    ) -> Result<(Option<alloy_primitives::U256>, Option<alloy_primitives::U256>), ParliaConsensusErr> {
+        let current_td = self.header_td(engine, current.number, current.hash_slow()).await?;
+        let incoming_td = match self.header_td(engine, incoming.number, incoming.hash_slow()).await {
+            Ok(td) => td,
+            Err(e) => {
+                tracing::debug!(target: "bsc::forkchoice", "Failed to get incoming header TD: {:?}, try to query parent block TD", e);
+                match self.header_td(engine, incoming.number - 1, incoming.parent_hash).await? {
+                    Some(td) => Some(td + incoming.difficulty),
+                    None => {
+                        tracing::debug!(target: "bsc::forkchoice", "Failed to get parent header TD, return None");
+                        None
+                    }
+                }
+            },
+        };
+        Ok((incoming_td, current_td))
+    }
+
+    /// Gets the total difficulty for a specific header.
+    ///
+    /// This private method queries the TD from the engine and caches it for future use.
+    async fn header_td(
+        &self,
+        engine: &BeaconConsensusEngineHandle<BscPayloadTypes>,
+        number: u64,
+        hash: B256,
+    ) -> Result<Option<alloy_primitives::U256>, ParliaConsensusErr> {
+        if let Some(td) = self.header_td_cache.write().get(&hash) {
+            return Ok(*td);
+        }
+        let td = engine.query_td(number, hash).await.map_err(ParliaConsensusErr::internal)?;
+        self.header_td_cache.write().insert(hash, td);
+        Ok(td)
+    }
 }

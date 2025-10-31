@@ -2,12 +2,13 @@ use super::executor::BscBlockExecutor;
 use super::error::{BscBlockExecutionError, BscBlockValidationError};
 use super::util::set_nonce;
 use crate::consensus::parlia::FF_REWARD_DISTRIBUTION_INTERVAL;
+use crate::node::evm::util::get_header_by_hash_from_cache;
 use crate::node::miner::signer::{sign_system_transaction, is_signer_initialized};
 use crate::consensus::parlia::{DIFF_INTURN, VoteAddress, VoteAttestation, snapshot::DEFAULT_TURN_LENGTH, constants::COLLECT_ADDITIONAL_VOTES_REWARD_RATIO, util::is_breathe_block};
 use crate::consensus::{SYSTEM_ADDRESS, MAX_SYSTEM_REWARD, SYSTEM_REWARD_PERCENT};
 use crate::evm::transaction::BscTxEnv;
 use crate::node::miner::util::prepare_new_header;
-use crate::system_contracts::{SLASH_CONTRACT, SYSTEM_REWARD_CONTRACT, feynman_fork::{ValidatorElectionInfo, get_top_validators_by_voting_power, ElectedValidators}};
+use crate::system_contracts::{SLASH_CONTRACT, SYSTEM_REWARD_CONTRACT, STAKE_HUB_CONTRACT, feynman_fork::{ValidatorElectionInfo, get_top_validators_by_voting_power, ElectedValidators}};
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
 use reth_evm::{eth::receipt_builder::{ReceiptBuilder, ReceiptBuilderCtx}, execute::BlockExecutionError, Database, Evm, FromRecoveredTx, FromTxWithEncoded, IntoTxEnv, block::StateChangeSource};
 use reth_primitives::{TransactionSigned, Transaction};
@@ -273,10 +274,25 @@ where
 
         if self.ctx.is_miner {
             if let Some(signed) = signed_tx.clone() {
-                let recovered = signed.try_into_recovered_unchecked().unwrap_or_else(|_| {
+                let recovered = signed.clone().try_into_recovered_unchecked().unwrap_or_else(|_| {
                     panic!("Failed to recover system transaction signature")
                 });
                 self.assembled_system_txs.push(recovered);
+
+                if transaction.to() == Some(STAKE_HUB_CONTRACT) {
+                    if let Some(net) = crate::shared::get_network_handle() {
+                        let tx_to_broadcast = signed.clone();
+                        tokio::spawn(async move {
+                            if let Some(txh) = net.transactions_handle().await {
+                                txh.broadcast_transactions(std::iter::once(tx_to_broadcast));
+                                tracing::info!(
+                                    target: "bsc::evn",
+                                    "Broadcasted StakeHub system tx to public network"
+                                );
+                            }
+                        });
+                    }
+                }
             }
         }
 
@@ -394,18 +410,16 @@ where
 
         let start = (block_number - FF_REWARD_DISTRIBUTION_INTERVAL).max(1);
         let end = block_number;
-        let mut target_number = block_number - 1;
-        // TODO: need query block header and snapshot by hash?
+
+        // query block header and snapshot by hash from cache.
+        let mut target_hash = self.ctx.base.parent_hash;
         for _ in (start..end).rev() {
-            let header = self.snapshot_provider.
-                as_ref().
-                unwrap().
-                get_header(target_number)
-                .ok_or_else(|| BlockExecutionError::msg(format!("Header not found for block number: {target_number}")))?;
+            let header = get_header_by_hash_from_cache(&target_hash).
+                ok_or_else(|| BlockExecutionError::msg(format!("Header not found for block hash: {target_hash}")))?;
             let snap = self.snapshot_provider.
                 as_ref().
                 unwrap().
-                snapshot(target_number).
+                snapshot_by_hash(&header.hash_slow()).
                 ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;
 
             if let Some(attestation) =
@@ -416,7 +430,7 @@ where
             {
                 self.process_attestation(&attestation, &header, &mut accumulated_weights)?;
             }
-            target_number = header.number - 1;
+            target_hash = header.parent_hash;
         }
 
         let mut validators: Vec<Address> = accumulated_weights.keys().copied().collect();
@@ -438,9 +452,9 @@ where
         parent_header: &Header,
         accumulated_weights: &mut std::collections::HashMap<Address, U256>,
     ) -> Result<(), BlockExecutionError> {
-        let justified_header = self.snapshot_provider.as_ref().unwrap().get_header_by_hash(&attestation.data.target_hash)
+        let justified_header = get_header_by_hash_from_cache(&attestation.data.target_hash)
             .ok_or_else(|| BlockExecutionError::msg(format!("Header not found, block_hash: {}", attestation.data.target_hash)))?;
-        let parent = self.snapshot_provider.as_ref().unwrap().get_header_by_hash(&justified_header.parent_hash)
+        let parent = get_header_by_hash_from_cache(&justified_header.parent_hash)
             .ok_or_else(|| BlockExecutionError::msg(format!("Header not found, block_hash: {}", justified_header.parent_hash)))?;
         let snapshot = self.snapshot_provider.as_ref().unwrap().snapshot_by_hash(&parent.hash_slow());
         let validators = &snapshot.unwrap().validators;  

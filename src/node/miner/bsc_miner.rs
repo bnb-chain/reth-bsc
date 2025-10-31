@@ -22,7 +22,7 @@ use reth_ethereum_payload_builder::EthereumBuilderConfig;
 use reth_payload_primitives::BuiltPayload;
 use reth_primitives::TransactionSigned;
 use reth_primitives_traits::{SealedHeader, BlockBody};
-use reth_provider::{BlockNumReader, HeaderProvider, CanonStateSubscriptions};
+use reth_provider::{BlockNumReader, HeaderProvider, CanonStateSubscriptions, CanonStateNotification};
 use reth_tasks::TaskExecutor;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -35,8 +35,6 @@ use crate::node::miner::payload::BscBuildArguments;
 use reth_revm::cancelled::ManualCancel;
 use alloy_primitives::U128;
 use reth_network::message::{NewBlockMessage, PeerMessage};
-use alloy_rlp::Encodable;
-use alloy_primitives::keccak256;
 use crate::node::miner::bid_simulator::{BidSimulator, BidRuntime};
 use std::time::Duration;
 use std::sync::Mutex;
@@ -117,6 +115,41 @@ where
                         committed.tip().difficulty(),
                         committed.len()
                     );
+                    
+                    // If this is a reorg event, validate it using bsc fork choice rules
+                    if let CanonStateNotification::Reorg { old, new } = &event {
+                        match self.validate_reorg(old, new).await {
+                            Ok(true) => {
+                                // Reorg is valid, proceed with mining
+                                debug!(
+                                    target: "bsc::miner",
+                                    "Reorg validated by fork choice rules, proceeding with mining"
+                                );
+                            }
+                            Ok(false) => {
+                                // Reorg is invalid according to fork choice rules, skip mining
+                                warn!(
+                                    target: "bsc::miner",
+                                    old_tip_number = old.tip().number(),
+                                    new_tip_number = new.tip().number(),
+                                    "Reorg rejected by fork choice rules, skipping mining on this tip"
+                                );
+                                continue;
+                            }
+                            Err(e) => {
+                                // Validation failed (engine not initialized or headers unavailable)
+                                // Log the error but proceed with mining to maintain availability
+                                warn!(
+                                    target: "bsc::miner",
+                                    old_tip_number = old.tip().number(),
+                                    new_tip_number = new.tip().number(),
+                                    error = %e,
+                                    "Failed to validate reorg, proceeding with mining"
+                                );
+                            }
+                        }
+                    }
+                    
                     let tip_header = tip.clone_sealed_header();
                     self.try_new_work(&tip_header).await;
                 }
@@ -124,6 +157,78 @@ where
                     warn!("Canonical state notification stream ended, exiting...");
                     break;
                 }
+            }
+        }
+    }
+
+    /// Validate if a reorg is justified according to BSC fork choice rules.
+    ///
+    /// # Arguments
+    ///
+    /// * `old` - The old chain that was reverted
+    /// * `new` - The new chain that replaced it
+    ///
+    /// # Returns
+    ///
+    /// Returns a `Result<bool, Box<dyn Error>>`:
+    /// - `Ok(true)` - Reorg is valid and justified, should proceed with mining
+    /// - `Ok(false)` - Reorg is invalid according to fork choice rules, should skip mining
+    /// - `Err(error)` - Validation failed (engine not initialized or headers unavailable), error contains reason
+    async fn validate_reorg<N>(
+        &self,
+        old: &Arc<reth::providers::Chain<N>>,
+        new: &Arc<reth::providers::Chain<N>>,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>>
+    where
+        N: reth_primitives_traits::NodePrimitives,
+    {
+        debug!(
+            target: "bsc::miner",
+            old_tip_number = old.tip().number(),
+            old_tip_hash = ?old.tip().hash(),
+            new_tip_number = new.tip().number(),
+            new_tip_hash = ?new.tip().hash(),
+            "Reorg detected, validating with fork choice rules"
+        );
+        
+        let forkchoice_engine = crate::shared::get_fork_choice_engine()
+            .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
+                "Fork choice engine not initialized".into()
+            })?;
+        
+        let old_header = self.provider.sealed_header(old.tip().number())
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("Failed to get old header: {}", e).into()
+            })?
+            .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("Old header not found for block {}", old.tip().number()).into()
+            })?;
+        
+        let new_header = self.provider.sealed_header(new.tip().number())
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("Failed to get new header: {}", e).into()
+            })?
+            .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("New header not found for block {}", new.tip().number()).into()
+            })?;
+        
+        match forkchoice_engine.is_need_reorg(new_header.header(), old_header.header()).await {
+            Ok(true) => {
+                debug!(
+                    target: "bsc::miner",
+                    "Reorg validated by fork choice rules (is_need_reorg=true)"
+                );
+                Ok(true)
+            }
+            Ok(false) => {
+                debug!(
+                    target: "bsc::miner",
+                    "Reorg rejected by fork choice rules (is_need_reorg=false)"
+                );
+                Ok(false)
+            }
+            Err(e) => {
+                Err(format!("Fork choice validation error: {}", e).into())
             }
         }
     }
@@ -779,54 +884,6 @@ where
             return Err(format!("Failed to initialize global signer due to {}", e).into());
         } else {
             info!("Succeed to initialize global signer");
-        }
-        // EVN: Auto-build StakeHub add/remove NodeIDs txs if configured
-        if let Some(cfg) = crate::node::network::evn::get_global_evn_config() {
-            if let Some(nonce) = cfg.nodeids_nonce {
-                let sys = crate::system_contracts::SystemContract::new(self.main_work_worker.chain_spec.as_ref().clone());
-
-                if !cfg.nodeids_to_add.is_empty() {
-                    let tx = sys.add_node_ids_tx(cfg.nodeids_to_add.clone(), nonce);
-                    match crate::node::miner::signer::sign_system_transaction(tx) {
-                        Ok(signed) => {
-                            let mut out = Vec::new();
-                            signed.encode(&mut out);
-                            let hash = keccak256(&out);
-                            info!(
-                                target: "bsc::evn",
-                                action = "addNodeIDs",
-                                count = cfg.nodeids_to_add.len(),
-                                nonce = nonce,
-                                tx_hash = format!("0x{:x}", hash),
-                                raw_rlp = format!("0x{}", alloy_primitives::hex::encode(&out)),
-                                "Built StakeHub.addNodeIDs transaction"
-                            );
-                        }
-                        Err(e) => warn!(target: "bsc::evn", error = %e, "Failed to sign addNodeIDs transaction"),
-                    }
-                }
-
-                if !cfg.nodeids_to_remove.is_empty() {
-                    let tx = sys.remove_node_ids_tx(cfg.nodeids_to_remove.clone(), nonce);
-                    match crate::node::miner::signer::sign_system_transaction(tx) {
-                        Ok(signed) => {
-                            let mut out = Vec::new();
-                            signed.encode(&mut out);
-                            let hash = keccak256(&out);
-                            info!(
-                                target: "bsc::evn",
-                                action = "removeNodeIDs",
-                                count = cfg.nodeids_to_remove.len(),
-                                nonce = nonce,
-                                tx_hash = format!("0x{:x}", hash),
-                                raw_rlp = format!("0x{}", alloy_primitives::hex::encode(&out)),
-                                "Built StakeHub.removeNodeIDs transaction"
-                            );
-                        }
-                        Err(e) => warn!(target: "bsc::evn", error = %e, "Failed to sign removeNodeIDs transaction"),
-                    }
-                }
-            }
         }
         self.spawn_workers()
     }

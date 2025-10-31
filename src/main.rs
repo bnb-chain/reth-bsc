@@ -87,10 +87,6 @@ pub struct BscCliArgs {
     /// Comma-separated bytes32 NodeIDs to remove in StakeHub (0x-prefixed)
     #[arg(long = "evn.remove-nodeid", value_delimiter = ',')]
     pub evn_remove_nodeids: Vec<String>,
-
-    /// Nonce to use when building add/remove NodeIDs transactions. If omitted, no tx is built.
-    #[arg(long = "evn.nodeids.nonce")]
-    pub evn_nodeids_nonce: Option<u64>,
 }
 
 fn main() -> eyre::Result<()> {
@@ -236,7 +232,6 @@ fn main() -> eyre::Result<()> {
                     proxyed_validators: parsed_validators,
                     nodeids_to_add: parse_nodeids(args.evn_add_nodeids.clone()),
                     nodeids_to_remove: parse_nodeids(args.evn_remove_nodeids.clone()),
-                    nodeids_nonce: args.evn_nodeids_nonce,
                 };
                 let _ = reth_bsc::node::network::evn::set_global_evn_config(cfg);
                 if evn_enabled { tracing::info!("EVN features enabled (disable peer tx broadcast)"); }

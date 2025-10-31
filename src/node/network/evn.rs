@@ -10,7 +10,6 @@ pub struct EvnConfig {
     pub proxyed_validators: Vec<Address>,
     pub nodeids_to_add: Vec<[u8; 32]>,
     pub nodeids_to_remove: Vec<[u8; 32]>,
-    pub nodeids_nonce: Option<u64>,
 }
 
 /// Global EVN config
@@ -71,4 +70,28 @@ pub fn is_evn_ready() -> bool { is_evn_enabled() && is_evn_synced() }
 pub fn subscribe_evn_armed() -> broadcast::Receiver<()> {
     let tx = EVN_ARMED_TX.get_or_init(|| broadcast::channel(4).0);
     tx.subscribe()
+}
+
+// --- One-time application guard for StakeHub NodeIDs actions ---
+/// Tuple of (node IDs to add, node IDs to remove)
+pub type NodeIdsActions = (Vec<[u8; 32]>, Vec<[u8; 32]>);
+// Ensures we only include add/remove NodeIDs system transactions once per process lifetime.
+static NODEIDS_ACTION_APPLIED: AtomicBool = AtomicBool::new(false);
+
+/// Returns configured NodeIDs add/remove lists exactly once if any are set.
+/// Subsequent calls return None to avoid re-including the same actions in multiple blocks.
+pub fn take_nodeids_actions_once() -> Option<NodeIdsActions> {
+    let cfg = GLOBAL_EVN_CONFIG.get()?;
+    let has_actions = !cfg.nodeids_to_add.is_empty() || !cfg.nodeids_to_remove.is_empty();
+    if !has_actions {
+        return None;
+    }
+    if NODEIDS_ACTION_APPLIED
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
+        Some((cfg.nodeids_to_add.clone(), cfg.nodeids_to_remove.clone()))
+    } else {
+        None
+    }
 }
