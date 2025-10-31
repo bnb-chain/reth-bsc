@@ -48,6 +48,7 @@ reth-tracing = { git = "https://github.com/bnb-chain/reth.git", branch = "valida
 reth-trie-common = { git = "https://github.com/bnb-chain/reth.git", branch = "validator-dev" }
 reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", branch = "validator-dev" }
 reth-tasks = { git = "https://github.com/bnb-chain/reth.git", branch = "validator-dev" }
+reth-transaction-pool = { git = "https://github.com/bnb-chain/reth.git", branch = "validator-dev" }
 revm = "28.0.1"
 
 # alloy dependencies

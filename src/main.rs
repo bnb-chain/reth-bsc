@@ -265,7 +265,7 @@ fn main() -> eyre::Result<()> {
                     }).extend_rpc_modules(move |ctx| {
                         tracing::info!("Start to register MEV RPC API: mev_sendBid");
                         use reth_bsc::rpc::mev::{MevApiImpl, BscMevApiServer};
-                        
+
                         // Get snapshot provider and chain spec for MEV API
                         let snapshot_provider = if let Some(provider) = reth_bsc::shared::get_snapshot_provider() {
                             provider.clone()
@@ -273,7 +273,7 @@ fn main() -> eyre::Result<()> {
                             tracing::warn!("Snapshot provider not available, MEV RPC API not registered");
                             return Ok(());
                         };
-                        
+
                         // Get chain spec from context
                         let chain_spec = std::sync::Arc::new(ctx.config().chain.clone().as_ref().clone());
                         let mev_api = MevApiImpl::new(snapshot_provider, chain_spec);

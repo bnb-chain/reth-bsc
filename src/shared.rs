@@ -45,7 +45,7 @@ static BLOCK_IMPORT_SENDER: OnceLock<UnboundedSender<IncomingBlock>> = OnceLock:
 static LOCAL_PEER_ID: OnceLock<PeerId> = OnceLock::new();
 
 /// Global queue for bid packages (thread-safe)
-static BID_PACKAGE_QUEUE: OnceLock<Arc<Mutex<VecDeque<crate::node::miner::bid_simulator::NewBidPackage>>>> = OnceLock::new();
+static BID_PACKAGE_QUEUE: OnceLock<Arc<Mutex<VecDeque<crate::node::miner::bid_simulator::Bid>>>> = OnceLock::new();
 
 /// Global network handle to interact with P2P (reth).
 static NETWORK_HANDLE: OnceLock<NetworkHandle<BscNetworkPrimitives>> = OnceLock::new();
@@ -185,7 +185,7 @@ pub fn init_bid_package_queue() {
 }
 
 /// Push a bid package to the global queue
-pub fn push_bid_package(package: crate::node::miner::bid_simulator::NewBidPackage) -> Result<(), &'static str> {
+pub fn push_bid_package(package: crate::node::miner::bid_simulator::Bid) -> Result<(), &'static str> {
     if let Some(queue) = BID_PACKAGE_QUEUE.get() {
         queue.lock().push_back(package);
         Ok(())
@@ -194,8 +194,8 @@ pub fn push_bid_package(package: crate::node::miner::bid_simulator::NewBidPackag
     }
 }
 
-/// Pop a bid package from the global queue
-pub fn pop_bid_package() -> Option<crate::node::miner::bid_simulator::NewBidPackage> {
+/// Pop a bid package from the global queueBid
+pub fn pop_bid_package() -> Option<crate::node::miner::bid_simulator::Bid> {
     BID_PACKAGE_QUEUE.get().and_then(|queue| queue.lock().pop_front())
 }
 

@@ -629,7 +629,7 @@ where
                         }
                     }
                 }
-                
+
                 // Interval for checking bid packages
                 _ = send_bid_interval.tick() => {
                     // Attempt to send bids
@@ -648,7 +648,7 @@ where
     fn get_bid_and_send(&self) {
         // Read bid packages from the global queue
         if let Some(bid_package) = crate::shared::pop_bid_package() {
-            debug!("Popped bid package from queue, block: {}, committing to simulator", bid_package.bid.block_number);
+            debug!("Popped bid package from queue, block: {}, committing to simulator", bid_package.block_number);
             if let Some(req) = self.simulator.commit_new_bid(bid_package) {
                 if let Err(e) = self.bid_simulate_req_tx.send(req) {
                     error!("Failed to send bid simulate request due to channel closed: {}", e);

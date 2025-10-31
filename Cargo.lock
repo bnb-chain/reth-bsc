@@ -9509,6 +9509,7 @@ dependencies = [
  "reth-rpc-eth-api",
  "reth-tasks",
  "reth-tracing",
+ "reth-transaction-pool",
  "reth-trie-common",
  "reth-trie-db",
  "revm",

@@ -5,12 +5,14 @@ use alloy_consensus::Transaction;
 use reth_primitives::TransactionSigned;
 use reth_primitives_traits::SignerRecoverable;
 use std::sync::Arc;
-use crate::node::miner::bid_simulator::{Bid, NewBidPackage};
+use crate::node::miner::bid_simulator::Bid;
 use crate::chainspec::BscChainSpec;
 use reth_chainspec::EthChainSpec;
 use tracing::debug;
 use crate::consensus::parlia::SnapshotProvider;
 use alloy_primitives::Address;
+use alloy_consensus::BlobTransactionSidecar;
+use alloy_consensus::{TxEip4844WithSidecar, transaction::RlpEcdsaDecodableTx};
 
 /// Raw bid data structure from builder
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -20,7 +22,7 @@ pub struct RawBid {
     pub block_number: U64,
     /// Parent block hash
     pub parent_hash: B256,
-    /// List of transactions in the bid
+    /// List of transactions in the bid (may include blob tx with sidecars)
     pub txs: Vec<Bytes>,
     /// List of transaction hashes that cannot be reverted
     #[serde(default)]
@@ -31,6 +33,12 @@ pub struct RawBid {
     pub gas_fee: U256,
     /// Builder fee
     pub builder_fee: U256,
+}
+
+/// Decoded transaction with optional sidecar
+struct DecodedTransaction {
+    tx: TransactionSigned,
+    sidecar: Option<BlobTransactionSidecar>,
 }
 
 /// Builder bid arguments for mev_sendBid
@@ -112,19 +120,158 @@ impl MevApiImpl {
         Ok(tx)
     }
 
+    /// Decode transaction with sidecar support
+    /// This matches Go's UnmarshalBinary + decodeTyped logic
+    /// For blob transactions, tries to extract sidecar from the byte stream
+    fn decode_transaction_with_sidecar(
+        tx_bytes: &alloy_primitives::Bytes,
+        chain_spec: &BscChainSpec,
+    ) -> Result<DecodedTransaction, String> {
+        if tx_bytes.is_empty() {
+            return Err("Empty transaction bytes".to_string());
+        }
+
+        // Check if it's a legacy transaction (first byte > 0x7f)
+        let is_legacy = tx_bytes[0] > 0xc0;
+        debug!("is_legacy: {}, tx_bytes[0]:{:?}", is_legacy, tx_bytes[0]);
+        if is_legacy {
+            // Legacy transaction - no sidecar possible
+            let tx = Self::parse_transaction(tx_bytes, chain_spec)?;
+            return Ok(DecodedTransaction { tx, sidecar: None });
+        }
+
+        // EIP-2718 typed transaction envelope
+        let tx_type = tx_bytes[0];
+        
+        // For blob transactions (type 0x03), check if sidecar is included
+        const BLOB_TX_TYPE: u8 = 0x03;
+        
+        if tx_type == BLOB_TX_TYPE {
+            debug!(
+                "Detected blob transaction, length: {}, first 64 bytes: {}",
+                tx_bytes.len(),
+                hex::encode(&tx_bytes[..tx_bytes.len().min(64)])
+            );
+            
+            // Try to decode with sidecar first
+            let payload = &tx_bytes[1..]; // Skip type byte
+            
+            match Self::try_decode_blob_tx_with_sidecar(payload) {
+                Ok((tx, sidecar)) => {
+                    // Validate chain ID
+                    if let Some(tx_chain_id) = tx.chain_id() {
+                        if tx_chain_id != chain_spec.chain().id() {
+                            return Err(format!(
+                                "Transaction chain ID {} does not match expected chain ID {}",
+                                tx_chain_id,
+                                chain_spec.chain().id()
+                            ));
+                        }
+                    }
+                    
+                    // Validate signature
+                    tx.recover_signer()
+                        .map_err(|e| format!("Failed to recover transaction signer: {}", e))?;
+                    
+                    debug!(
+                        "Successfully decoded blob tx {:?} with sidecar ({} blobs)",
+                        tx.hash(),
+                        sidecar.blobs.len()
+                    );
+                    
+                    return Ok(DecodedTransaction { 
+                        tx, 
+                        sidecar: Some(sidecar) 
+                    });
+                }
+                Err(e) => {
+                    debug!("Failed to decode with sidecar: {}, trying without", e);
+                    // Fall through to standard decoding
+                }
+            }
+        }
+        
+        // Standard decoding (no sidecar)
+        let tx = Self::parse_transaction(tx_bytes, chain_spec)?;
+        
+        Ok(DecodedTransaction { tx, sidecar: None })
+    }
+
+    /// Try to decode a blob transaction with sidecar from RLP payload
+    /// Uses alloy-consensus's TxEip4844WithSidecar which already has decode logic
+    fn try_decode_blob_tx_with_sidecar(
+        payload: &[u8],
+    ) -> Result<(TransactionSigned, BlobTransactionSidecar), String> {
+        use alloy_consensus::Signed;
+        
+        debug!(
+            "Attempting to decode blob tx with sidecar using TxEip4844WithSidecar, payload length: {}",
+            payload.len()
+        );
+        
+        let mut buf = payload;
+        
+        // Decode using alloy's TxEip4844WithSidecar which handles the format:
+        // rlp([tx_fields..., signature_fields, sidecar_fields])
+        let (tx_with_sidecar, signature) = TxEip4844WithSidecar::<BlobTransactionSidecar>::rlp_decode_with_signature(&mut buf)
+            .map_err(|e| {
+                debug!("Failed to decode TxEip4844WithSidecar: {}", e);
+                format!("Failed to decode transaction with sidecar: {}", e)
+            })?;
+        
+        debug!(
+            "Successfully decoded TxEip4844WithSidecar, blobs={}, remaining bytes={}",
+            tx_with_sidecar.sidecar.blobs.len(),
+            buf.len()
+        );
+        
+        // Convert to TransactionSigned
+        // First get the inner TxEip4844 and sidecar
+        let (eip4844_tx, sidecar) = tx_with_sidecar.into_parts();
+        
+        // Create a Signed<TxEip4844> 
+        let signed_eip4844 = Signed::new_unhashed(eip4844_tx, signature);
+        
+        // Convert to TransactionSigned via TxEnvelope
+        use alloy_consensus::TxEnvelope;
+        let envelope: TxEnvelope = signed_eip4844.into();
+        let tx_signed = TransactionSigned::from(envelope);
+        
+        debug!(
+            "Converted to TransactionSigned: tx_hash={:?}, blobs={}",
+            tx_signed.hash(),
+            sidecar.blobs.len()
+        );
+        
+        Ok((tx_signed, sidecar))
+    }
+
     /// Convert BidArgs to Bid object
     /// This matches the Go implementation: BidArgs.ToBid()
+    /// Returns the Bid object with blob sidecars included.
     fn to_bid(
         bid_args: &BidArgs,
         builder: alloy_primitives::Address,
         chain_spec: &BscChainSpec,
         bid_hash: B256,
     ) -> Result<Bid, String> {
-        // 1. Decode transactions from RawBid
+        use std::collections::HashMap;
+        
+        // 1. Decode transactions from RawBid, extracting sidecars
         let mut txs = Vec::new();
+        let mut blob_sidecars = HashMap::new();
+        
         for tx_bytes in &bid_args.raw_bid.txs {
-            let tx = Self::parse_transaction(tx_bytes, chain_spec)?;
-            txs.push(tx);
+            let decoded = Self::decode_transaction_with_sidecar(tx_bytes, chain_spec)?;
+            
+            // Store sidecar if present
+            if let Some(sidecar) = decoded.sidecar {
+                let tx_hash = *decoded.tx.hash();
+                debug!("Found blob sidecar for tx {:?} with {} blobs", tx_hash, sidecar.blobs.len());
+                blob_sidecars.insert(tx_hash, sidecar);
+            }
+            
+            txs.push(decoded.tx);
         }
 
         // 2. Validate UnRevertible count
@@ -136,26 +283,30 @@ impl MevApiImpl {
             ));
         }
 
-        // 3. Create UnRevertible hash set (stored in Bid for later use)
-        // Note: In Rust we'll store it as a Vec in the Bid struct
-        // The Go version uses mapset, but Vec is sufficient for our needs
-
-        // 4. Handle PayBidTx if present
+        // 3. Handle PayBidTx if present
         if !bid_args.pay_bid_tx.is_empty() {
-            let pay_bid_tx = Self::parse_transaction(&bid_args.pay_bid_tx, chain_spec)
+            let decoded = Self::decode_transaction_with_sidecar(&bid_args.pay_bid_tx, chain_spec)
                 .map_err(|e| format!("Failed to parse PayBidTx: {}", e))?;
-            txs.push(pay_bid_tx);
+            
+            // Store sidecar if present
+            if let Some(sidecar) = decoded.sidecar {
+                let tx_hash = *decoded.tx.hash();
+                debug!("Found blob sidecar for PayBidTx {:?} with {} blobs", tx_hash, sidecar.blobs.len());
+                blob_sidecars.insert(tx_hash, sidecar);
+            }
+            
+            txs.push(decoded.tx);
         }
 
-        for tx in txs.clone() {
-            debug!("tx: {:?}", tx);
-        }
-        // 5. Create Bid object
+        debug!("Decoded {} transactions with {} blob sidecars for bid", txs.len(), blob_sidecars.len());
+        
+        // 4. Create Bid object
         let bid = Bid {
             builder,
             block_number: bid_args.raw_bid.block_number.to(),
             parent_hash: bid_args.raw_bid.parent_hash,
             txs,
+            blob_sidecars,
             gas_used: bid_args.raw_bid.gas_used.to(),
             gas_fee: bid_args.raw_bid.gas_fee,
             builder_fee: bid_args.raw_bid.builder_fee,
@@ -163,7 +314,6 @@ impl MevApiImpl {
             bid_hash,
             interrupt_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
-        debug!("bid: {:?}", bid);
 
         Ok(bid)
     }
@@ -413,13 +563,6 @@ impl BscMevApiServer for MevApiImpl {
             }
         };
 
-        // Create bid package
-        let bid_package = NewBidPackage {
-            bid: bid_obj,
-            runtime: 0, // Will be calculated by simulator
-            bid_value: 0, // Will be calculated by simulator
-        };
-
         // Log acceptance before async processing
         tracing::info!(
             "Bid accepted for block {}, bid_hash: {:?}",
@@ -429,7 +572,7 @@ impl BscMevApiServer for MevApiImpl {
 
         // Submit to global bid queue
         debug!("push bid package to queue bid_hash: {:?}, send time: {:?}", bid_hash, std::time::Instant::now());
-        if let Err(e) = crate::shared::push_bid_package(bid_package) {
+        if let Err(e) = crate::shared::push_bid_package(bid_obj) {
             tracing::error!("Failed to push bid package to queue: {}", e);
             return Err(jsonrpsee::types::ErrorObject::owned(
                 -32603,
