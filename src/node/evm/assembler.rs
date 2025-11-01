@@ -178,7 +178,7 @@ where
             header,
             body: BscBlockBody {
                 inner: BlockBody { transactions, ommers: Default::default(), withdrawals: Some(Withdrawals::new(vec![])) },
-                sidecars: None, // todo: implement blob storage.
+                sidecars: None, // BscSidecars is added to the block body in the payload builder.
             },
         })
     }
