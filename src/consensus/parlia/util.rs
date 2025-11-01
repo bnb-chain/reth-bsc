@@ -25,7 +25,6 @@ pub fn is_breathe_block(last_block_time: u64, block_time: u64) -> bool {
 }
 
 /// Print all header fields that participate for debug.
-/// TODO: remove it later.
 pub fn debug_header(header: &Header, chain_id: u64, context: &str) {
     let block_id = format!("#{}-0x{:x}", header.number, alloy_primitives::keccak256(header.parent_hash.as_slice()));
     let signed_extra_data = &header.extra_data[..header.extra_data.len().saturating_sub(EXTRA_SEAL_LEN)];
