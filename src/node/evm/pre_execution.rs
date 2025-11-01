@@ -424,6 +424,19 @@ where
         if (is_inturn && header.difficulty != DIFF_INTURN) ||
             (!is_inturn && header.difficulty != DIFF_NOTURN)
         {
+            let expected_difficulty = if is_inturn { DIFF_INTURN } else { DIFF_NOTURN };
+            tracing::warn!(
+                target: "bsc::validation",
+                block_number = header.number(),
+                block_hash = ?header.hash_slow(),
+                proposer = ?proposer,
+                is_inturn,
+                actual_difficulty = %header.difficulty,
+                expected_difficulty = %expected_difficulty,
+                diff_inturn = %DIFF_INTURN,
+                diff_noturn = %DIFF_NOTURN,
+                "Block difficulty validation failed: mismatch between inturn status and difficulty"
+            );
             return Err(BscBlockExecutionError::Validation(
                 BscBlockValidationError::InvalidDifficulty { difficulty: header.difficulty }
             ).into());
