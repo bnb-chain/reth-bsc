@@ -241,36 +241,10 @@ impl BscNetworkBuilder {
             ).await.unwrap();
         });
 
-        // Build dynamic head from actual best block number and header
-        let dynamic_head = {
-            let provider = ctx.provider();
-            match provider.best_block_number() {
-                Ok(n) => {
-                    if let Ok(Some(h)) = provider.header_by_number(n) {
-                        let td = provider
-                            .header_td_by_number(n)
-                            .ok()
-                            .flatten()
-                            .unwrap_or_default();
-                        reth_chainspec::Head {
-                            hash: h.hash_slow(),
-                            number: n,
-                            timestamp: h.timestamp,
-                            difficulty: h.difficulty,
-                            total_difficulty: td,
-                        }
-                    } else {
-                        ctx.chain_spec().head()
-                    }
-                }
-                Err(_) => ctx.chain_spec().head(),
-            }
-        };
-
-        tracing::info!(target: "bsc", "Dynamic head: {:?}", dynamic_head);
+        // TODO: update network with the latest canonical head, but has a fork id issue, can fix it later.
         let network_builder = network_builder
             .boot_nodes(ctx.chain_spec().bootnodes().unwrap_or_default())
-            .set_head(dynamic_head)
+            .set_head(ctx.chain_spec().head())
             .with_pow()
             .block_import(Box::new(BscBlockImport::new(handle)))
             .discovery(discv4)
@@ -279,6 +253,19 @@ impl BscNetworkBuilder {
         
         let mut network_config = ctx.build_network_config(network_builder);
         network_config.status.forkid = network_config.fork_filter.current();
+        let provider = ctx.provider();
+        if let Ok(number) = provider.best_block_number() {
+            let td = provider.header_td_by_number(number).unwrap_or_default();
+            network_config.status.total_difficulty = td;
+        }
+        debug!(
+            target: "bsc::net",
+            version = ?network_config.status.version,
+            td = ?network_config.status.total_difficulty,
+            blockhash = ?network_config.status.blockhash,
+            genesis = ?network_config.status.genesis,
+            "Initialized ETH status for handshake"
+        );
 
         Ok(network_config)
     }

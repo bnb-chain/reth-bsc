@@ -551,11 +551,13 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
 
         let votes = fetch_vote_by_block_hash(current_header.parent_hash());
         if votes.len() < usize::div_ceil(parent_snap.validators.len() * 2, 3) {
-            tracing::debug!(target: "parlia::consensus", "vote count is less than 2/3 of validators, skip assemble vote attestation, vote count={}, validators count={}", votes.len(), parent_snap.validators.len());
+            tracing::debug!(target: "parlia::consensus", "vote count is less than 2/3 of validators, skip assemble vote attestation, number={}, parent ={:?}, vote count={}, validators count={}", 
+                current_header.number(), current_header.parent_hash(), votes.len(), parent_snap.validators.len());
             return Ok(());
         }
 
-        tracing::debug!(target: "parlia::consensus", "assemble vote attestation, vote count={}, validators count={}", votes.len(), parent_snap.validators.len());
+        tracing::debug!(target: "parlia::consensus", "assemble vote attestation, number={}, parent ={:?}, vote count={}, validators count={}", 
+            current_header.number(), current_header.parent_hash(), votes.len(), parent_snap.validators.len());
         // get justified number and hash from parent snapshot
         let (justified_number, justified_hash) = (parent_snap.vote_data.target_number, parent_snap.vote_data.target_hash);
         let mut attestation = VoteAttestation::new_with_vote_data(VoteData {
@@ -598,16 +600,10 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
             });
         }
         // Append attestation to header extra field.
+        let mut extra_data = current_header.extra_data.to_vec();
         let buf = alloy_rlp::encode(&attestation);
-        let extra_seal_start = current_header.extra_data.len() - EXTRA_SEAL_LEN;
-        let extra_seal_bytes = &current_header.extra_data[extra_seal_start..];
-
-        let mut new_extra = Vec::with_capacity(extra_seal_start + buf.len() + EXTRA_SEAL_LEN);
-        new_extra.extend_from_slice(&current_header.extra_data[..extra_seal_start]);
-        new_extra.extend_from_slice(buf.as_ref());
-        new_extra.extend_from_slice(extra_seal_bytes);
-
-        current_header.extra_data = alloy_primitives::Bytes::from(new_extra);
+        extra_data.extend_from_slice(buf.as_ref());
+        current_header.extra_data = alloy_primitives::Bytes::from(extra_data);
         Ok(())
     }
 }

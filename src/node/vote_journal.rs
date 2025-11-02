@@ -98,7 +98,10 @@ impl VoteJournal {
     /// Returns true if the vote is allowed under rules, along with the provided source/target context.
     pub fn under_rules(&self, source_number: u64, target_number: u64) -> bool {
         // Rule 1: must not publish two distinct votes for the same height
-        if self.lru.contains(target_number) { return false; }
+        if self.lru.contains(target_number) { 
+            tracing::trace!(target: "bsc::vote", reason = "duplicate-height", target_number=target_number, "skip vote production");
+            return false; 
+        }
 
         // Rule 2: must not vote within the span of its other votes
         // Backward window
@@ -108,7 +111,10 @@ impl VoteJournal {
         }
         while block_number < target_number {
             if let Some(vd) = self.lru.get(block_number) {
-                if vd.source_number > source_number { return false; }
+                if vd.source_number > source_number { 
+                    tracing::trace!(target: "bsc::vote", reason = "backward-window", block_number=block_number, source_number=source_number, vd.source_number=vd.source_number, "skip vote production");
+                    return false; 
+                }
             }
             block_number += 1;
         }
@@ -117,7 +123,10 @@ impl VoteJournal {
         let upper = target_number + UPPER_LIMIT_OF_VOTE_BLOCK_NUMBER;
         while bn <= upper {
             if let Some(vd) = self.lru.get(bn) {
-                if vd.source_number < source_number { return false; }
+                if vd.source_number < source_number { 
+                    tracing::trace!(target: "bsc::vote", reason = "forward-window", block_number=bn, source_number=source_number, vd.source_number=vd.source_number, "skip vote production");
+                    return false; 
+                }
             }
             bn += 1;
         }

@@ -255,23 +255,6 @@ where
                             }
                         }
                     }
-                    // Prune old votes from the vote pool based on the new block number
-                    let block_number = block.block.0.block.header.number();
-                    vote_pool::prune(block_number);
-
-                    // Produce and broadcast a local vote for this new canonical head, if eligible
-                    if let Some(sp) = crate::shared::get_snapshot_provider() {
-                        let sp = Arc::clone(sp);
-                        let spec = this.forkchoice_engine.chain_spec().clone();
-                        let header = block.block.0.block.header.clone();
-                        tokio::spawn(async move {
-                            crate::node::vote_producer::maybe_produce_and_broadcast_for_head(
-                                spec,
-                                sp.as_ref(),
-                                &header,
-                            );
-                        });
-                    }
                 }
 
                 if let Err(e) = this.to_network.send(BlockImportEvent::Outcome(outcome)) {

@@ -1,17 +1,12 @@
 use crate::{
-    consensus::parlia::provider::SnapshotProvider,
-    node::{
+    chainspec::BscChainSpec, consensus::parlia::{Parlia, provider::SnapshotProvider, vote_pool}, node::{
         engine::BscBuiltPayload,
         evm::config::BscEvmConfig,
         miner::{
-            payload::{BscPayloadBuilder, BscPayloadJob, BscPayloadJobHandle}, 
-            util::prepare_new_attributes, 
-            signer::init_global_signer_from_k256,
-            config::{keystore, MiningConfig}
+            config::{MiningConfig, keystore}, payload::{BscPayloadBuilder, BscPayloadJob, BscPayloadJobHandle}, signer::init_global_signer_from_k256, util::prepare_new_attributes
         },
         network::BscNewBlock,
-    },
-    shared::{get_block_import_sender, get_local_peer_id_or_default},
+    }, shared::{get_block_import_sender, get_local_peer_id_or_default}
 };
 use alloy_consensus::BlockHeader;
 use alloy_primitives::{Address, Sealable};
@@ -64,6 +59,7 @@ pub struct NewWorkWorker<Provider> {
     provider: Provider,
     snapshot_provider: Arc<dyn SnapshotProvider + Send + Sync>,
     mining_queue_tx: mpsc::UnboundedSender<MiningContext>,
+    consensus: Arc<Parlia<BscChainSpec>>,
 }
 
 impl<Provider> NewWorkWorker<Provider> 
@@ -83,12 +79,14 @@ where
         provider: Provider,
         snapshot_provider: Arc<dyn SnapshotProvider + Send + Sync>,
         mining_queue_tx: mpsc::UnboundedSender<MiningContext>,
+        consensus: Arc<Parlia<BscChainSpec>>,
     ) -> Self {
         Self {
             validator_address,
             provider,
             snapshot_provider,
             mining_queue_tx,
+            consensus,
         }
     }
 
@@ -163,6 +161,33 @@ where
                     }
                     
                     let tip_header = tip.clone_sealed_header();
+                    // Prune old votes from the vote pool based on the new block number
+                    let block_number = self.provider.last_block_number().ok().unwrap_or(tip_header.number());
+                    vote_pool::prune(block_number);
+
+                    // Produce and broadcast a local vote for this new canonical head, if eligible
+                    if let Some(sp) = crate::shared::get_snapshot_provider() {
+                        let sp = Arc::clone(sp);
+                        let spec = self.consensus.spec.clone();
+                        match self.provider.header(&tip_header.hash()) {
+                            Ok(Some(h)) => {
+                                tracing::debug!(target: "bsc::vote", "Succeed to get header for tip block, validator: {}, tip: {}", self.validator_address, tip_header.number());
+                                tokio::spawn(async move {
+                                    crate::node::vote_producer::maybe_produce_and_broadcast_for_head(
+                                        spec,
+                                        sp.as_ref(),
+                                        &h,
+                                    );
+                                });
+                            }
+                            Err(e) => {
+                                tracing::error!(target: "bsc::vote", "Failed to get header for tip block, validator: {}, tip: {}, due to {}", self.validator_address, tip_header.number(), e);
+                            }
+                            _ => {
+                                tracing::error!(target: "bsc::vote", "Failed to get header for tip block, validator: {}, tip: {}", self.validator_address, tip_header.number());
+                            }
+                        }
+                    }
                     self.try_new_work(&tip_header).await;
                 }
                 None => {
@@ -924,11 +949,13 @@ where
         let (mining_queue_tx, mining_queue_rx) = mpsc::unbounded_channel::<MiningContext>();
         let (payload_tx, payload_rx) = mpsc::unbounded_channel::<SubmitContext>();
         
+        let parlia = Arc::new(crate::consensus::parlia::Parlia::new(chain_spec.clone(), 200));
         let new_work_worker = NewWorkWorker::new(
             validator_address,
             provider.clone(),
             snapshot_provider.clone(),
             mining_queue_tx.clone(),
+            parlia.clone(),
         );
         
         let parlia = Arc::new(crate::consensus::parlia::Parlia::new(chain_spec.clone(), 200));
