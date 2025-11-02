@@ -87,10 +87,6 @@ pub struct BscCliArgs {
     /// Comma-separated bytes32 NodeIDs to remove in StakeHub (0x-prefixed)
     #[arg(long = "evn.remove-nodeid", value_delimiter = ',')]
     pub evn_remove_nodeids: Vec<String>,
-
-    /// Nonce to use when building add/remove NodeIDs transactions. If omitted, no tx is built.
-    #[arg(long = "evn.nodeids.nonce")]
-    pub evn_nodeids_nonce: Option<u64>,
 }
 
 fn main() -> eyre::Result<()> {
@@ -100,6 +96,9 @@ fn main() -> eyre::Result<()> {
     if std::env::var_os("RUST_BACKTRACE").is_none() {
         std::env::set_var("RUST_BACKTRACE", "1");
     }
+
+    // Initialize bid package queue at startup
+    reth_bsc::shared::init_bid_package_queue();
 
     Cli::<BscChainSpecParser, BscCliArgs>::parse().run_with_components::<BscNode>(
         |spec| (BscEvmConfig::new(spec.clone()), BscConsensus::new(spec)),
@@ -233,7 +232,6 @@ fn main() -> eyre::Result<()> {
                     proxyed_validators: parsed_validators,
                     nodeids_to_add: parse_nodeids(args.evn_add_nodeids.clone()),
                     nodeids_to_remove: parse_nodeids(args.evn_remove_nodeids.clone()),
-                    nodeids_nonce: args.evn_nodeids_nonce,
                 };
                 let _ = reth_bsc::node::network::evn::set_global_evn_config(cfg);
                 if evn_enabled { tracing::info!("EVN features enabled (disable peer tx broadcast)"); }
@@ -258,6 +256,24 @@ fn main() -> eyre::Result<()> {
                         ctx.modules.merge_configured(parlia_api.into_rpc())?;
 
                         tracing::info!("Succeed to register Parlia RPC API");
+                        Ok(())
+                    }).extend_rpc_modules(move |ctx| {
+                        tracing::info!("Start to register MEV RPC API: mev_sendBid");
+                        use reth_bsc::rpc::mev::{MevApiImpl, BscMevApiServer};
+
+                        // Get snapshot provider and chain spec for MEV API
+                        let snapshot_provider = if let Some(provider) = reth_bsc::shared::get_snapshot_provider() {
+                            provider.clone()
+                        } else {
+                            tracing::warn!("Snapshot provider not available, MEV RPC API not registered");
+                            return Ok(());
+                        };
+
+                        // Get chain spec from context
+                        let chain_spec = std::sync::Arc::new(ctx.config().chain.clone().as_ref().clone());
+                        let mev_api = MevApiImpl::new(snapshot_provider, chain_spec);
+                        ctx.modules.merge_configured(mev_api.into_rpc())?;
+                        tracing::info!("Succeed to register MEV RPC API");
                         Ok(())
                     })
                     .launch().await?;

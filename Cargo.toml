@@ -48,6 +48,7 @@ reth-tracing = { git = "https://github.com/bnb-chain/reth.git", branch = "valida
 reth-trie-common = { git = "https://github.com/bnb-chain/reth.git", branch = "validator-dev" }
 reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", branch = "validator-dev" }
 reth-tasks = { git = "https://github.com/bnb-chain/reth.git", branch = "validator-dev" }
+reth-transaction-pool = { git = "https://github.com/bnb-chain/reth.git", branch = "validator-dev" }
 revm = "28.0.1"
 
 # alloy dependencies
@@ -60,6 +61,7 @@ alloy-network = "1.0.23"
 alloy-rpc-types = { version = "1.0.23", features = ["engine"] }
 alloy-rpc-types-eth = "1.0.23"
 alloy-rpc-types-engine = "1.0.23"
+alloy-rpc-types-mev = "1.0.23"
 alloy-signer = "1.0.23"
 
 alloy-chains = "0.2.5"
@@ -84,6 +86,7 @@ cfg-if = { version = "1.0", default-features = false }
 derive_more = "0.99"
 eyre = "0.6"
 futures = "0.3"
+hex = "0.4"
 lazy_static = "1.4.0"
 lru = "0.12"
 phf = { version = "0.11", features = ["macros"] }

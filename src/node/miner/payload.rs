@@ -2,6 +2,7 @@ use alloy_primitives::U256;
 use crate::consensus::parlia::{Parlia, DEFAULT_MIN_GAS_TIP};
 use crate::node::engine::BscBuiltPayload;
 use crate::node::evm::config::BscEvmConfig;
+use crate::node::miner::bid_simulator::BidSimulator;
 use crate::node::miner::bsc_miner::{MiningContext, SubmitContext};
 use reth_provider::StateProviderFactory;
 use reth_revm::{database::StateProviderDatabase, db::State};
@@ -38,7 +39,7 @@ use reth_chainspec::EthereumHardforks;
 
 
 /// Delay left over for mining calculation
-const DELAY_LEFT_OVER: u64 = 50;
+pub const DELAY_LEFT_OVER: u64 = 50;
 
 /// Time multiplier for retry condition check
 const TIME_MULTIPLIER: u32 = 2;
@@ -393,12 +394,13 @@ where
     retries: u32,
     /// JoinSet for managing build tasks
     join_handle: tokio::task::JoinSet<Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>>>,
-    // TODO: enrich mev workflows.
+    /// Simulator for bid management (no outer RwLock, each map has its own)
+    simulator: Arc<BidSimulator<Client, Pool>>,
 }
 
 impl<Pool, Client, EvmConfig> BscPayloadJob<Pool, Client, EvmConfig>
 where
-    Client: StateProviderFactory + 'static,
+    Client: StateProviderFactory + reth_provider::HeaderProvider<Header = alloy_consensus::Header> + reth_provider::BlockHashReader + Clone + 'static,
     EvmConfig: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
     <EvmConfig as ConfigureEvm>::Primitives: reth_primitives_traits::NodePrimitives<BlockHeader = alloy_consensus::Header, SignedTx = alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip4844>, Block = crate::node::primitives::BscBlock>,
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>> + 'static,
@@ -409,6 +411,7 @@ where
         mining_ctx: MiningContext,
         builder: BscPayloadBuilder<Pool, Client, EvmConfig>,
         build_args: BscBuildArguments<EthPayloadBuilderAttributes>,
+        simulator: Arc<BidSimulator<Client, Pool>>,  // No outer RwLock needed
         result_tx: mpsc::UnboundedSender<SubmitContext>,
     ) -> (Self, BscPayloadJobHandle) {
         let (abort_tx, abort_rx) = oneshot::channel();
@@ -443,6 +446,7 @@ where
             build_args,
             retries: 0,
             join_handle: tokio::task::JoinSet::new(),
+            simulator,
         };
         let handle = BscPayloadJobHandle {
             abort_tx,
@@ -512,6 +516,7 @@ where
                                             elapsed, self.build_args.config.parent_header.number()+1, self.retries);
                                         return self.try_return_best_payload();
                                     }
+
                                     // Abort by new head.
                                     _ = &mut self.abort_rx => {
                                         info!("Abort payload building by new head, cost_time: {:?}, block_number: {}, retries: {}", 
@@ -520,6 +525,7 @@ where
                                         self.is_aborted = true;
                                         return Err(Box::new(BscPayloadJobError::JobAborted));
                                     }
+
                                     Some(_tx_hash) = self.tx_listener.recv() => {
                                         new_tx_count+=1;
                                         let mining_delay = self.parlia.delay_for_mining(
@@ -603,6 +609,11 @@ where
 
     /// Try to return the best payload to result channel
     fn try_return_best_payload(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let best_bid = self.simulator.get_best_bid(self.mining_ctx.parent_header.hash());
+        if let Some(bid) = best_bid {
+            info!("Found best bid! block: {}, builder: {:?}, gas_fee: {}", bid.bid.block_number, bid.bid.builder, bid.bid.gas_fee);
+            self.potential_payloads.push(bid.bsc_payload);
+        }
         if let Some(best_payload) = self.pick_best_payload() {
             if let Err(err) = self.result_tx.send(SubmitContext {
                 mining_ctx: self.mining_ctx.clone(),
@@ -642,7 +653,7 @@ where
             best_index+1,
             total_len
         );
-        
+
         self.potential_payloads.clear();
         Some(best_payload)
     }

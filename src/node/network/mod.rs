@@ -2,7 +2,7 @@
 use crate::{
     BscBlock, node::{
         BscNode, engine_api::payload::BscPayloadTypes, network::block_import::{BscBlockImport, handle::ImportHandle}, primitives::{BscBlobTransactionSidecar, BscPrimitives}
-    }, shared::get_canonical_header_by_number
+    }
 };
 use alloy_rlp::{Decodable, Encodable};
 use handshake::BscHandshake;
@@ -250,7 +250,6 @@ impl BscNetworkBuilder {
             .add_rlpx_sub_protocol(bsc_protocol::protocol::handler::BscProtocolHandler);
         
         let mut network_config = ctx.build_network_config(network_builder);
-        // Ensure our advertised fork ID matches the fork filter we validate against.
         network_config.status.forkid = network_config.fork_filter.current();
 
         Ok(network_config)
@@ -287,48 +286,122 @@ where
             info!(target: "reth::cli", peer_id=%local_peer_id, "Local peer ID set globally");
         }
 
-        // Share network handle for dynamic EVN actions (trust marking, targeted ETH messages).
         if let Err(_h) = crate::shared::set_network_handle(handle.clone()) {
             warn!(target: "bsc::evn", "Network handle already initialised; overriding skipped");
         }
 
-        // EVN sync watcher: arm EVN only once node is considered synced (by head timestamp lag)
-        {
-            // Only spawn if EVN is enabled; otherwise skip
-            if crate::node::network::evn::is_evn_enabled() {
-                let max_lag = std::env::var("BSC_EVN_SYNC_LAG_SECS")
-                    .ok()
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(30);
-                // Placeholder: if needed later, capture provider/chain_spec here for extended EVN logic
-                ctx.task_executor().spawn_critical("evn-sync-watcher", async move {
-                    use std::time::{SystemTime, UNIX_EPOCH, Duration};
-                    use alloy_consensus::BlockHeader;
-                    loop {
-                        // If already armed, stop watcher
-                        if crate::node::network::evn::is_evn_synced() { break; }
-                        // Query latest header via global providers
-                        if let Some(n) = crate::shared::get_best_canonical_block_number() {
-                            if let Some(h) = get_canonical_header_by_number(n) {
-                                let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(u64::MAX);
-                                let ts = h.timestamp();
-                                if now >= ts && now.saturating_sub(ts) <= max_lag {
-                                    crate::node::network::evn::set_evn_synced(true);
-                                    info!(target: "bsc::evn", head=%n, head_ts=%ts, lag = now - ts, "EVN armed: node considered synced");
-                                    // Once EVN is armed, query on-chain StakeHub for validator NodeIDs and
-                                    // mark currently connected peers that match as EVN (on-chain reason).
-                                    break;
-                                } else {
-                                    debug!(target: "bsc::evn", head=%n, head_ts=%ts, lag = now.saturating_sub(ts), max_lag=%max_lag, "EVN not armed yet: syncing");
-                                }
-                            }
-                        }
-                        tokio::time::sleep(Duration::from_secs(2)).await;
-                    }
-                });
-            }
+        if crate::node::network::evn::is_evn_enabled() {
+            spawn_evn_sync_watcher(ctx, handle.clone());
         }
 
         Ok(handle)
     }
+}
+
+fn spawn_evn_sync_watcher<Node>(ctx: &BuilderContext<Node>, net: NetworkHandle<BscNetworkPrimitives>)
+where
+    Node: FullNodeTypes<Types = BscNode>,
+{
+    use reth_provider::StateProviderFactory;
+    let max_lag = std::env::var("BSC_EVN_SYNC_LAG_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(30);
+    let provider = ctx.provider().clone();
+    let chain_spec = ctx.chain_spec().clone();
+    ctx.task_executor().spawn_critical("evn-sync-watcher", async move {
+        use std::time::{SystemTime, UNIX_EPOCH, Duration};
+        use alloy_consensus::BlockHeader;
+        use alloy_primitives::U256;
+        use reth_primitives::TransactionSigned;
+        use crate::node::miner::signer::{is_signer_initialized, sign_system_transaction};
+
+        loop {
+            if crate::node::network::evn::is_evn_synced() { break; }
+            if let Some(n) = crate::shared::get_best_canonical_block_number() {
+                if let Some(h) = crate::shared::get_canonical_header_by_number(n) {
+                    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(u64::MAX);
+                    let ts = h.timestamp();
+                    if now >= ts && now.saturating_sub(ts) <= max_lag {
+                        crate::node::network::evn::set_evn_synced(true);
+                        info!(target: "bsc::evn", head=%n, head_ts=%ts, lag = now - ts, "EVN armed: node considered synced");
+                        if let Some((to_add, to_remove)) = crate::node::network::evn::take_nodeids_actions_once() {
+                            if let Some(cfg) = crate::node::miner::config::get_global_mining_config() {
+                                if cfg.is_mining_enabled() {
+                                    if let Some(validator) = cfg.validator_address {
+                                        let mut waited = 0u64;
+                                        while !is_signer_initialized() && waited < 100 {
+                                            tokio::time::sleep(Duration::from_millis(100)).await;
+                                            waited += 1;
+                                        }
+
+                                        if is_signer_initialized() {
+                                            if let Ok(state) = provider.state_by_block_hash(h.hash_slow()) {
+                                                if let Ok(Some(acc)) = state.basic_account(&validator) {
+                                                    let mut next_nonce = acc.nonce;
+                                                    let chain_id = chain_spec.chain().id();
+
+                                                    let mut signed_batch: Vec<TransactionSigned> = Vec::new();
+
+                                                    if !to_add.is_empty() {
+                                                        let (_to, data) = crate::system_contracts::encode_add_node_ids_call(to_add.clone());
+                                                        let tx = reth_primitives::Transaction::Legacy(alloy_consensus::TxLegacy {
+                                                            chain_id: Some(chain_id),
+                                                            nonce: next_nonce,
+                                                            gas_limit: u64::MAX / 2,
+                                                            gas_price: 0,
+                                                            value: U256::ZERO,
+                                                            input: data,
+                                                            to: alloy_primitives::TxKind::Call(crate::system_contracts::STAKE_HUB_CONTRACT),
+                                                        });
+                                                        if let Ok(signed) = sign_system_transaction(tx) {
+                                                            next_nonce += 1;
+                                                            signed_batch.push(signed);
+                                                            info!(target: "bsc::evn", count = to_add.len(), "Prepared StakeHub.addNodeIDs for broadcast");
+                                                        }
+                                                    }
+
+                                                    if !to_remove.is_empty() {
+                                                        let (_to, data) = crate::system_contracts::encode_remove_node_ids_call(to_remove.clone());
+                                                        let tx = reth_primitives::Transaction::Legacy(alloy_consensus::TxLegacy {
+                                                            chain_id: Some(chain_id),
+                                                            nonce: next_nonce,
+                                                            gas_limit: u64::MAX / 2,
+                                                            gas_price: 0,
+                                                            value: U256::ZERO,
+                                                            input: data,
+                                                            to: alloy_primitives::TxKind::Call(crate::system_contracts::STAKE_HUB_CONTRACT),
+                                                        });
+                                                        if let Ok(signed) = sign_system_transaction(tx) {
+                                                            signed_batch.push(signed);
+                                                            info!(target: "bsc::evn", count = to_remove.len(), "Prepared StakeHub.removeNodeIDs for broadcast");
+                                                        }
+                                                    }
+
+                                                    if !signed_batch.is_empty() {
+                                                        if let Some(txh) = net.transactions_handle().await {
+                                                            let count = signed_batch.len();
+                                                            txh.broadcast_transactions(signed_batch);
+                                                            info!(target: "bsc::evn", n = count, "Broadcasted StakeHub NodeIDs system txs to public network");
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            info!(target: "bsc::evn", "Skipping NodeIDs broadcast: miner signer not initialised");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        break;
+                    } else {
+                        debug!(target: "bsc::evn", head=%n, head_ts=%ts, lag = now.saturating_sub(ts), max_lag=%max_lag, "EVN not armed yet: syncing");
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    });
 }

@@ -460,7 +460,6 @@ where
             .get_header_by_hash(&self.ctx.base.parent_hash)
             .ok_or(BlockExecutionError::msg("Failed to get parent header from global header reader"))?;
         self.inner_ctx.parent_header = Some(parent_header.clone());
-
         let snap = self
             .snapshot_provider
             .as_ref()

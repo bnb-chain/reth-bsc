@@ -8,6 +8,8 @@ use reth_network::NetworkHandle;
 use crate::node::network::block_import::service::IncomingBlock;
 use tokio::sync::mpsc::UnboundedSender;
 use reth_network_api::PeerId;
+use parking_lot::Mutex;
+use std::collections::VecDeque;
 
 /// Function type for HeaderProvider::header() access (by hash)
 type HeaderByHashFn = Arc<dyn Fn(&B256) -> Option<Header> + Send + Sync>;
@@ -41,6 +43,9 @@ static BLOCK_IMPORT_SENDER: OnceLock<UnboundedSender<IncomingBlock>> = OnceLock:
 
 /// Global local peer ID for network identification
 static LOCAL_PEER_ID: OnceLock<PeerId> = OnceLock::new();
+
+/// Global queue for bid packages (thread-safe)
+static BID_PACKAGE_QUEUE: OnceLock<Arc<Mutex<VecDeque<crate::node::miner::bid_simulator::Bid>>>> = OnceLock::new();
 
 /// Global network handle to interact with P2P (reth).
 static NETWORK_HANDLE: OnceLock<NetworkHandle<BscNetworkPrimitives>> = OnceLock::new();
@@ -184,6 +189,31 @@ pub fn set_local_peer_id(peer_id: PeerId) -> Result<(), PeerId> {
 /// Get the global local peer ID, or return a default PeerId if not set.
 pub fn get_local_peer_id_or_default() -> PeerId {
     LOCAL_PEER_ID.get().cloned().unwrap_or_default()
+}
+
+/// Initialize the bid package queue (should be called once at startup)
+pub fn init_bid_package_queue() {
+    let _ = BID_PACKAGE_QUEUE.set(Arc::new(Mutex::new(VecDeque::new())));
+}
+
+/// Push a bid package to the global queue
+pub fn push_bid_package(package: crate::node::miner::bid_simulator::Bid) -> Result<(), &'static str> {
+    if let Some(queue) = BID_PACKAGE_QUEUE.get() {
+        queue.lock().push_back(package);
+        Ok(())
+    } else {
+        Err("Bid package queue not initialized")
+    }
+}
+
+/// Pop a bid package from the global queueBid
+pub fn pop_bid_package() -> Option<crate::node::miner::bid_simulator::Bid> {
+    BID_PACKAGE_QUEUE.get().and_then(|queue| queue.lock().pop_front())
+}
+
+/// Get the count of pending bid packages in the queue
+pub fn bid_package_queue_len() -> usize {
+    BID_PACKAGE_QUEUE.get().map(|queue| queue.lock().len()).unwrap_or(0)
 }
 
 /// Store the reth `NetworkHandle` globally for dynamic peer actions.
