@@ -349,13 +349,14 @@ mod tests {
         // Wait for the first block to be processed
         let waker = futures::task::noop_waker();
         let mut cx = Context::from_waker(&waker);
-        let mut outcomes = Vec::new();
 
-        // Wait for both NewPayload and FCU outcomes from first block
-        while outcomes.is_empty() {
+        // Wait for the first block to be processed
+        loop {
             match fixture.handle.poll_outcome(&mut cx) {
-                Poll::Ready(Some(outcome)) => {
-                    outcomes.push(outcome);
+                Poll::Ready(Some(event)) => {
+                    if matches!(event, BlockImportEvent::Outcome(_)) {
+                        break;
+                    }
                 }
                 Poll::Ready(None) => break,
                 Poll::Pending => tokio::task::yield_now().await,
@@ -570,20 +571,29 @@ mod tests {
             let mut cx = Context::from_waker(&waker);
             let mut outcomes = Vec::new();
 
-            // Wait for both NewPayload and FCU outcomes
-            while outcomes.is_empty() {
+            // Wait for the first block to be processed
+            let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(1);
+            loop {
                 match self.handle.poll_outcome(&mut cx) {
-                    Poll::Ready(Some(outcome)) => {
-                        outcomes.push(outcome);
+                    Poll::Ready(Some(event)) => {
+                        outcomes.push(event);
+                        if outcomes.iter().any(|e| assert_fn(e)) {
+                            break;
+                        }
                     }
                     Poll::Ready(None) => break,
-                    Poll::Pending => tokio::task::yield_now().await,
+                    Poll::Pending => {
+                        if tokio::time::Instant::now() >= deadline {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
                 }
             }
 
             // Assert that at least one outcome matches our criteria
             assert!(
-                outcomes.iter().any(assert_fn),
+                outcomes.iter().any(|e| assert_fn(e)),
                 "No outcome matched the expected criteria. Outcomes: {outcomes:?}"
             );
         }
