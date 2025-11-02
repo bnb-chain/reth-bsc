@@ -44,7 +44,7 @@ impl Decodable for BscCapPacket {
         if message_id != (BscProtoMessageId::Capability as u8) {
             return Err(alloy_rlp::Error::Custom("Invalid message ID for BscCapPacket"));
         }
-        
+
         // Decode RLP list: [protocol_version, extra]
         let header = alloy_rlp::Header::decode(buf)?;
         if !header.list {
@@ -60,7 +60,7 @@ impl Decodable for BscCapPacket {
         }
         let extra = Bytes::copy_from_slice(&buf[..remaining_len]);
         *buf = &buf[remaining_len..];
-        
+
         Ok(Self { protocol_version, extra })
     }
 }
@@ -116,6 +116,7 @@ impl Decodable for VotesPacket {
 /// mirroring Geth's logic.
 pub fn handle_votes_broadcast(packet: VotesPacket) {
     if let Some(first) = packet.0.into_iter().next() {
+        tracing::debug!(target: "bsc::vote", "insert first vote into local pool, target_number: {}, target_hash: {}", first.data.target_number, first.data.target_hash);
         votes::put_vote(first);
     }
 }

@@ -19,10 +19,12 @@ impl ProtocolHandler for BscProtocolHandler {
     type ConnectionHandler = BscConnectionHandler;
 
     fn on_incoming(&self, _socket_addr: SocketAddr) -> Option<Self::ConnectionHandler> {
+        tracing::debug!(target: "bsc_protocol", "Incoming connection, socket_addr: {}", _socket_addr);
         Some(BscConnectionHandler)
     }
 
     fn on_outgoing(&self, _socket_addr: SocketAddr, _peer_id: PeerId) -> Option<Self::ConnectionHandler> {
+        tracing::debug!(target: "bsc_protocol", "Outgoing connection, socket_addr: {}, peer_id: {}", _socket_addr, _peer_id);
         Some(BscConnectionHandler)
     }
 }
@@ -38,6 +40,7 @@ impl ConnectionHandler for BscConnectionHandler {
         _direction: reth_network_api::Direction,
         _peer_id: PeerId,
     ) -> OnNotSupported {
+        tracing::debug!(target: "bsc_protocol", "Unsupported by peer, direction: {}, peer_id: {}", _direction, _peer_id);
         OnNotSupported::KeepAlive
     }
 
@@ -47,6 +50,7 @@ impl ConnectionHandler for BscConnectionHandler {
         _peer_id: PeerId,
         conn: ProtocolConnection,
     ) -> Self::Connection {
+        tracing::debug!(target: "bsc_protocol", "Into connection, direction: {}, peer_id: {}", direction, _peer_id);
         let (tx, rx) = mpsc::unbounded_channel();
         // Save sender so other components can broadcast BSC messages
         // Note: PeerId is not exposed directly here, so we rely on the local peer id for keying

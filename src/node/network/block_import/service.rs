@@ -13,6 +13,7 @@ use futures::{future::Either, stream::FuturesUnordered, StreamExt};
 use parking_lot::RwLock;
 use reth::network::cache::LruCache;
 use reth_engine_primitives::{BeaconConsensusEngineHandle, EngineTypes};
+use reth::consensus::HeaderValidator;
 use reth_network::{
     import::{BlockImportError, BlockImportEvent, BlockImportOutcome, BlockValidation},
     message::{NewBlockMessage, PeerMessage},
@@ -150,6 +151,12 @@ where
         if self.processed_blocks.contains(&block.hash) {
             return;
         }
+
+        // Send ValidHeader announcement to trigger NewBlock diffusion from few peers
+        // TODO: add header validation later
+        let _ = self
+            .to_network
+            .send(BlockImportEvent::Announcement(BlockValidation::ValidHeader { block: block.clone() }));
 
         let payload_fut = self.new_payload(block.clone(), peer_id);
         self.pending_imports.push(payload_fut);

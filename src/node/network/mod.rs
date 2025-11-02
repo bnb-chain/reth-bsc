@@ -18,6 +18,7 @@ use reth_ethereum_primitives::PooledTransactionVariant;
 use reth_engine_primitives::BeaconConsensusEngineHandle;
 use reth_network::{NetworkConfig, NetworkHandle, NetworkManager};
 use reth_network_api::PeersInfo;
+use reth_provider::{BlockNumReader, HeaderProvider};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{info, warn, debug};
@@ -240,9 +241,36 @@ impl BscNetworkBuilder {
             ).await.unwrap();
         });
 
+        // Build dynamic head from actual best block number and header
+        let dynamic_head = {
+            let provider = ctx.provider();
+            match provider.best_block_number() {
+                Ok(n) => {
+                    if let Ok(Some(h)) = provider.header_by_number(n) {
+                        let td = provider
+                            .header_td_by_number(n)
+                            .ok()
+                            .flatten()
+                            .unwrap_or_default();
+                        reth_chainspec::Head {
+                            hash: h.hash_slow(),
+                            number: n,
+                            timestamp: h.timestamp,
+                            difficulty: h.difficulty,
+                            total_difficulty: td,
+                        }
+                    } else {
+                        ctx.chain_spec().head()
+                    }
+                }
+                Err(_) => ctx.chain_spec().head(),
+            }
+        };
+
+        tracing::info!(target: "bsc", "Dynamic head: {:?}", dynamic_head);
         let network_builder = network_builder
             .boot_nodes(ctx.chain_spec().bootnodes().unwrap_or_default())
-            .set_head(ctx.chain_spec().head())
+            .set_head(dynamic_head)
             .with_pow()
             .block_import(Box::new(BscBlockImport::new(handle)))
             .discovery(discv4)

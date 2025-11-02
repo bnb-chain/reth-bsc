@@ -198,6 +198,7 @@ pub fn maybe_produce_and_broadcast_for_head(
                 // Continue despite journal error; do not halt voting pipeline.
             }
             // insert into local pool
+            tracing::debug!(target: "bsc::vote", "insert self vote into local pool, target_number: {}, target_hash: {}", data.target_number, data.target_hash);
             votes::put_vote(envelope.clone());
             // broadcast to peers
             crate::node::network::bsc_protocol::registry::broadcast_votes(vec![envelope]);

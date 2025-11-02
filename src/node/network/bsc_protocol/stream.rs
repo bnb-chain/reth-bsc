@@ -145,6 +145,7 @@ impl BscProtocolConnection {
         let slice = frame.as_ref();
         let msg_id = slice[0];
 
+        tracing::debug!(target: "bsc_protocol", "Handshake not completed, processing handshake frame, msg_id: {:?}", msg_id);
         if msg_id != BscProtoMessageId::Capability as u8 {
             tracing::warn!(target: "bsc_protocol", got = format_args!("{:#04x}", msg_id), "Expected capability during handshake");
             return Poll::Ready(None);
@@ -199,10 +200,10 @@ impl BscProtocolConnection {
 
     /// Handle normal protocol messages after handshake
     fn handle_protocol_message(&self, frame: &BytesMut) {
-        tracing::debug!(target: "bsc_protocol", "Handshake completed, processing normal message");
         let slice = frame.as_ref();
         let msg_id = slice[0];
 
+        tracing::debug!(target: "bsc_protocol", "Handshake completed, processing normal message, msg_id: {:?}", msg_id);
         match msg_id {
             x if x == BscProtoMessageId::Votes as u8 => {
                 tracing::debug!(target: "bsc_protocol", "Processing votes message");
