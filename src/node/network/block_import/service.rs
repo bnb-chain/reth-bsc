@@ -577,7 +577,7 @@ mod tests {
                 match self.handle.poll_outcome(&mut cx) {
                     Poll::Ready(Some(event)) => {
                         outcomes.push(event);
-                        if outcomes.iter().any(|e| assert_fn(e)) {
+                        if outcomes.iter().any(&assert_fn) {
                             break;
                         }
                     }
@@ -593,7 +593,7 @@ mod tests {
 
             // Assert that at least one outcome matches our criteria
             assert!(
-                outcomes.iter().any(|e| assert_fn(e)),
+                outcomes.iter().any(assert_fn),
                 "No outcome matched the expected criteria. Outcomes: {outcomes:?}"
             );
         }
