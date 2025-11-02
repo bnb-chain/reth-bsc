@@ -11,13 +11,13 @@ use revm::{
 };
 use alloy_consensus::{TxReceipt, Header, BlockHeader};
 use alloy_primitives::{BlockHash, BlockNumber, B256};
-use crate::consensus::parlia::{VoteAddress, Snapshot, Parlia, DIFF_INTURN, DIFF_NOTURN};
-use crate::consensus::parlia::util::{is_breathe_block, calculate_millisecond_timestamp, debug_header};
+use crate::consensus::parlia::{VoteAddress, Snapshot, DIFF_INTURN, DIFF_NOTURN};
+use crate::consensus::parlia::util::{is_breathe_block, debug_header};
 use crate::consensus::parlia::vote::MAX_ATTESTATION_EXTRA_LENGTH;
 use crate::node::evm::error::{BscBlockExecutionError, BscBlockValidationError};
 use crate::node::evm::util::HEADER_CACHE_READER;
 use crate::system_contracts::feynman_fork::ValidatorElectionInfo;
-use std::{collections::HashMap, sync::{Arc, LazyLock, Mutex}};
+use std::{collections::HashMap, sync::{LazyLock, Mutex}};
 use schnellru::{ByLength, LruMap};
 use reth_primitives::GotExpected;
 use blst::{
@@ -237,24 +237,7 @@ where
         header: &Header,
         parent: &Header,
     ) -> Result<(), BlockExecutionError> {
-        if self.spec.is_ramanujan_active_at_block(header.number()) {
-            let block_interval = snap.block_interval;
-            // TODO: recheck it, maybe still has bugs.
-            let back_off_time = self.parlia.back_off_time(snap, parent, header);
-            let current_ts: u64 = calculate_millisecond_timestamp(header);
-            let parent_ts: u64 = calculate_millisecond_timestamp(parent);
-            if current_ts < parent_ts + block_interval + back_off_time {
-                tracing::warn!("Block time is too early, block_number: {}, ts: {:?}, parent_ts: {:?}, block_interval: {:?}, back_off_time: {:?}", 
-                    header.number(), current_ts, parent_ts, block_interval, back_off_time);
-                return Err(BscBlockExecutionError::Validation(
-                    BscBlockValidationError::FutureBlock {
-                        block_number: header.number(),
-                        hash: header.hash_slow(),
-                    }
-                ).into());
-            }
-        }
-        Ok(())
+        self.parlia.block_time_verify_for_ramanujan_fork(snap, header, parent)
     }
 
     fn verify_vote_attestation(
@@ -267,9 +250,8 @@ where
             return Ok(());
         }
 
-        let parlia = Parlia::new(Arc::new(self.spec.clone()), 200);
         let attestation =
-            parlia.get_vote_attestation_from_header(header, snap.epoch_num).map_err(|err| {
+            self.parlia.get_vote_attestation_from_header(header, snap.epoch_num).map_err(|err| {
                 tracing::error!("Failed to get vote attestation from header, block_number: {}, error: {:?}", header.number(), err);
                 BscBlockExecutionError::Validation(BscBlockValidationError::ParliaConsensusError { error: err.into() })
             })?;
@@ -387,8 +369,7 @@ where
         snap: &Snapshot,
         header: &Header,
     ) -> Result<(), BlockExecutionError> {
-        let parlia = Parlia::new(Arc::new(self.spec.clone()), 200);
-        let proposer = parlia.recover_proposer(header).map_err(|err| {
+        let proposer = self.parlia.recover_proposer(header).map_err(|err| {
             tracing::error!("Failed to recover proposer from header, block_number: {}, error: {:?}", header.number(), err);
             BscBlockExecutionError::Validation(BscBlockValidationError::ParliaConsensusError { error: err.into() })
         })?;

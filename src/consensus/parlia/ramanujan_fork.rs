@@ -6,6 +6,8 @@ use crate::consensus::parlia::consensus::Parlia;
 use crate::consensus::parlia::constants::DIFF_NOTURN;
 use crate::hardforks::BscHardforks;
 use reth_chainspec::EthChainSpec;
+use crate::node::evm::error::{BscBlockExecutionError, BscBlockValidationError};
+use reth_evm::execute::BlockExecutionError;
 
 impl<ChainSpec> Parlia<ChainSpec> 
 where ChainSpec: EthChainSpec + BscHardforks + 'static,
@@ -53,5 +55,28 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
             delay_ms += FIXED_BACKOFF_TIME_BEFORE_FORK_MILLIS + rand::rng().random_range(0..wiggle);
         }
         delay_ms
+    }
+
+    /// Verify block time for Ramanujan fork.
+    pub fn block_time_verify_for_ramanujan_fork(&self, snap: &Snapshot, header: &Header, parent: &Header) -> Result<(), BlockExecutionError> {
+        if self.spec.is_ramanujan_active_at_block(header.number) {
+            let current_ts = calculate_millisecond_timestamp(header);
+            let parent_ts = calculate_millisecond_timestamp(parent);
+            let back_off_time = self.back_off_time(snap, parent, header);
+            
+            if current_ts < parent_ts + snap.block_interval + back_off_time {
+                tracing::warn!(
+                    "Block time is too early, block_number: {}, ts: {:?}, parent_ts: {:?}, block_interval: {:?}, back_off_time: {:?}", 
+                    header.number, current_ts, parent_ts, snap.block_interval, back_off_time
+                );
+                return Err(BscBlockExecutionError::Validation(
+                    BscBlockValidationError::FutureBlock {
+                        block_number: header.number,
+                        hash: header.hash_slow(),
+                    }
+                ).into());
+            }
+        }
+        Ok(())
     }
 }
