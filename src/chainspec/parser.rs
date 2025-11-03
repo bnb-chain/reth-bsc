@@ -207,5 +207,9 @@ fn add_hardforks_to_chainspec(
         chain_spec = chain_spec.with_fork(BscHardfork::Maxwell, ForkCondition::Timestamp(maxwell_time));
     }
     
+    if let Some(fermi_time) = config.get("fermiTime").and_then(|v| v.as_u64()) {
+        chain_spec = chain_spec.with_fork(BscHardfork::Fermi, ForkCondition::Timestamp(fermi_time));
+    }
+    
     Ok(chain_spec)
 }

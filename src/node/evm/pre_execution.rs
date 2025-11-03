@@ -101,12 +101,15 @@ where
             self.inner_ctx.current_validators = Some((validator_set, vote_addrs_map));
 
             // Also fetch on-chain NodeIDs for validators (EVN identification) and update cache.
-            let (to2, data2) = self.system_contracts.get_node_ids(self.inner_ctx.current_validators.as_ref().unwrap().0.clone());
-            if let Ok(output2) = self.eth_call(to2, data2) {
-                let (_consensus_addrs, node_ids_list) = self.system_contracts.unpack_data_into_node_ids(&output2);
-                let mut flat: Vec<[u8; 32]> = Vec::new();
-                for ids in node_ids_list { for id in ids { flat.push(id); } }
-                crate::node::network::evn_peers::update_onchain_nodeids(flat);
+            // Only available after Maxwell hardfork when StakeHub contract's getNodeIDs is deployed
+            if self.spec.is_maxwell_active_at_timestamp(header.number, header.timestamp) {
+                let (to2, data2) = self.system_contracts.get_node_ids(self.inner_ctx.current_validators.as_ref().unwrap().0.clone());
+                if let Ok(output2) = self.eth_call(to2, data2) {
+                    let (_consensus_addrs, node_ids_list) = self.system_contracts.unpack_data_into_node_ids(&output2);
+                    let mut flat: Vec<[u8; 32]> = Vec::new();
+                    for ids in node_ids_list { for id in ids { flat.push(id); } }
+                    crate::node::network::evn_peers::update_onchain_nodeids(flat);
+                }
             }
         }
     

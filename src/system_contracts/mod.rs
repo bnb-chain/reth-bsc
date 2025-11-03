@@ -184,6 +184,7 @@ impl<Spec: EthChainSpec + crate::hardforks::BscHardforks> SystemContract<Spec> {
     }
 
     /// Return system address and input to query validator NodeIDs from StakeHub.
+    /// Note: This function should only be called after Maxwell hardfork when StakeHub.getNodeIDs is available.
     pub fn get_node_ids(&self, validators: Vec<Address>) -> (Address, Bytes) {
         let function = self.stake_hub_abi.function("getNodeIDs").unwrap().first().unwrap();
         let vals = validators.into_iter().map(DynSolValue::from).collect::<Vec<_>>();
@@ -192,6 +193,7 @@ impl<Spec: EthChainSpec + crate::hardforks::BscHardforks> SystemContract<Spec> {
     }
 
     /// Unpack the data into (consensusAddresses, nodeIDsList)
+    /// Note: This function should only be called after Maxwell hardfork when StakeHub.getNodeIDs is available.
     pub fn unpack_data_into_node_ids(&self, data: &[u8]) -> (Vec<Address>, Vec<Vec<[u8; 32]>>) {
         let function = self.stake_hub_abi.function("getNodeIDs").unwrap().first().unwrap();
         let output = function.abi_decode_output(data).unwrap();
@@ -297,6 +299,7 @@ impl<Spec: EthChainSpec + crate::hardforks::BscHardforks> SystemContract<Spec> {
 
     /// Creates a transaction to add NodeIDs for the validator in StakeHub.
     /// Mirrors BSC's StakeHub.addNodeIDs(bytes32[] nodeIDs).
+    /// Note: This function should only be called after Maxwell hardfork when StakeHub.addNodeIDs is available.
     #[allow(dead_code)]
     pub fn add_node_ids_tx(&self, node_ids: Vec<[u8; 32]>, nonce: u64) -> Transaction {
         let function = self.stake_hub_abi.function("addNodeIDs").unwrap().first().unwrap();
@@ -326,6 +329,7 @@ impl<Spec: EthChainSpec + crate::hardforks::BscHardforks> SystemContract<Spec> {
 
     /// Creates a transaction to remove NodeIDs for the validator in StakeHub.
     /// Mirrors BSC's StakeHub.removeNodeIDs(bytes32[] nodeIDs).
+    /// Note: This function should only be called after Maxwell hardfork when StakeHub.removeNodeIDs is available.
     #[allow(dead_code)]
     pub fn remove_node_ids_tx(&self, node_ids: Vec<[u8; 32]>, nonce: u64) -> Transaction {
         let function = self.stake_hub_abi.function("removeNodeIDs").unwrap().first().unwrap();
