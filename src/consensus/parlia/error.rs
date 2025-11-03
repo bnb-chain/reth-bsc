@@ -2,9 +2,14 @@ use alloy_primitives::{BlockHash, BlockNumber};
 
 use crate::consensus::parlia::VoteAddress;
 
+
 /// Parlia consensus error.
 #[derive(thiserror::Error, Debug, PartialEq, Eq, Clone)]
 pub enum ParliaConsensusError {
+    /// Error when snapshot provider is not found
+    #[error("snapshot provider not found")]
+    SnapshotProviderNotFound,
+
     /// Error when header extra vanity is missing
     #[error("missing header extra vanity")]
     ExtraVanityMissing,
@@ -32,6 +37,20 @@ pub enum ParliaConsensusError {
     /// Error for invalid header extra
     #[error("invalid header extra")]
     InvalidHeaderExtra,
+
+    /// Error for invalid header extra
+    #[error("header not found: {block_hash}")]
+    HeaderNotFound {
+        /// The block hash
+        block_hash: BlockHash,
+    },
+
+    /// Error when the snapshot is not found
+    #[error("snapshot not found: {block_hash}")]
+    SnapshotNotFound {
+        /// The block hash
+        block_hash: BlockHash,
+    },
 
     /// Error when the header is not in epoch
     #[error("{block_number} is not in epoch")]

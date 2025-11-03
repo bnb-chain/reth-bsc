@@ -32,6 +32,8 @@ use super::{
 };
 use crate::consensus::parlia::go_rng::{RngSource, Shuffle};
 use tracing::{trace, debug, warn};
+use crate::node::evm::pre_execution::K_ANCESTOR_GENERATION_DEPTH;
+use crate::consensus::parlia::provider::SnapshotProvider;
 
 const RECOVERED_PROPOSER_CACHE_NUM: usize = 4096;
 const ADDRESS_LENGTH: usize = 20; // Ethereum address length in bytes
@@ -534,7 +536,7 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
         let mut time_for_mining_ms = period_ms / 2;
         let last_block_in_turn = snap.last_block_in_one_turn(header.number);
         if !last_block_in_turn {
-            time_for_mining_ms = period_ms * 4 / 5;
+            time_for_mining_ms = period_ms;
         }
         if delay_ms > time_for_mining_ms {
             delay_ms = time_for_mining_ms;
@@ -631,27 +633,55 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
         SYSTEM_TXS_GAS_HARD_LIMIT
     }
     
-    pub fn assemble_vote_attestation(&self, parent_snap: &Snapshot, parent_header: &Header, current_header: &mut Header) -> Result<(), ParliaConsensusError> {
-        if !self.spec.is_luban_active_at_block(current_header.number()) || current_header.number() < 2 {
+    pub fn assemble_vote_attestation(&self, parent_snap: &Snapshot, parent_header: &Header, current_header: &mut Header, snapshot_provider: &Arc<dyn SnapshotProvider + Send + Sync>) -> Result<(), ParliaConsensusError> {
+        if !self.spec.is_luban_active_at_block(current_header.number()) || current_header.number() < 3 {
             return Ok(());
         }
 
-        let votes = fetch_vote_by_block_hash(current_header.parent_hash());
-        if votes.len() < usize::div_ceil(parent_snap.validators.len() * 2, 3) {
-            tracing::debug!(target: "parlia::consensus", "vote count is less than 2/3 of validators, skip assemble vote attestation, number={}, parent ={:?}, vote count={}, validators count={}", 
-                current_header.number(), current_header.parent_hash(), votes.len(), parent_snap.validators.len());
-            return Ok(());
-        }
-
-        tracing::debug!(target: "parlia::consensus", "assemble vote attestation, number={}, parent ={:?}, vote count={}, validators count={}", 
-            current_header.number(), current_header.parent_hash(), votes.len(), parent_snap.validators.len());
         // get justified number and hash from parent snapshot
         let (justified_number, justified_hash) = (parent_snap.vote_data.target_number, parent_snap.vote_data.target_hash);
+        let mut times = 1;
+        if self.spec.is_fermi_active_at_timestamp(current_header.number(), current_header.timestamp()) {
+            times = K_ANCESTOR_GENERATION_DEPTH;
+        }
+        let mut votes = Vec::new();
+        let mut target_header = parent_header.clone();
+        let mut target_header_parent_snap = None;
+        for _ in 0..times {
+            if let Some(snap) = snapshot_provider.snapshot_by_hash(&target_header.parent_hash()) {
+                votes = fetch_vote_by_block_hash(target_header.hash_slow());
+                let quorum = usize::div_ceil(snap.validators.len() * 2, 3);
+                if votes.len() >= quorum {
+                    target_header_parent_snap = Some(snap);
+                    break;
+                }
+                let block_hash = target_header.parent_hash();
+                if let Some(header) = crate::shared::get_canonical_header_by_hash_from_provider(&block_hash) {
+                    target_header = header;
+                } else {
+                    return Err(ParliaConsensusError::HeaderNotFound {
+                        block_hash,
+                    });
+                }
+                if target_header.number() <= justified_number {
+                    break;
+                }
+            } else {
+                return Err(ParliaConsensusError::SnapshotNotFound {
+                    block_hash: current_header.parent_hash(),
+                });
+            }
+        }
+        if target_header_parent_snap.is_none() {
+            warn!("target_header_parent_snap is none");
+            return Ok(());
+        }
+
         let mut attestation = VoteAttestation::new_with_vote_data(VoteData {
             source_number: justified_number,
             source_hash: justified_hash,
-            target_number: parent_header.number,
-            target_hash: parent_header.hash_slow(),
+            target_number: target_header.number(),
+            target_hash: target_header.hash_slow(),
         });
         // Check vote data from votes
         for vote in votes.iter() {
@@ -675,7 +705,8 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
             .map_err(|_| ParliaConsensusError::AggregateSignatureError)?;
         attestation.agg_signature.copy_from_slice(&aggregate.to_signature().to_bytes());
         // Prepare vote address bitset.
-        for (_, val_info) in parent_snap.validators_map.iter() {
+        let target_snap = target_header_parent_snap.unwrap();
+        for (_, val_info) in target_snap.validators_map.iter() {
             if vote_addr_set.contains(&val_info.vote_addr) {
                 attestation.vote_address_set |= 1 << (val_info.index - 1)
             }
