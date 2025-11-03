@@ -1,5 +1,5 @@
 use crate::{
-    chainspec::BscChainSpec, consensus::parlia::{Parlia, SnapshotProvider, EMPTY_REQUESTS_HASH, EMPTY_WITHDRAWALS_HASH}, hardforks::BscHardforks, node::evm::config::{BscBlockExecutionCtx, BscBlockExecutorFactory}
+    chainspec::BscChainSpec, consensus::parlia::{Parlia, EMPTY_REQUESTS_HASH, EMPTY_WITHDRAWALS_HASH}, hardforks::BscHardforks, node::evm::config::{BscBlockExecutionCtx, BscBlockExecutorFactory}
 };
 use alloy_consensus::{BlockBody, Header, EMPTY_OMMER_ROOT_HASH, proofs, Transaction, BlockHeader};
 use alloy_primitives::{keccak256, B256};
@@ -50,8 +50,6 @@ pub struct BscBlockAssembler<ChainSpec = BscChainSpec> {
     pub chain_spec: Arc<ChainSpec>,
     /// Extra data to use for the blocks.
     pub extra_data: Bytes,
-    /// Snapshot provider for accessing Parlia validator snapshots.
-    pub(super) snapshot_provider: Option<Arc<dyn SnapshotProvider + Send + Sync>>,
     /// Parlia consensus instance.
     pub(crate) parlia: Arc<Parlia<ChainSpec>>,
 }
@@ -64,7 +62,6 @@ where
         Self { 
             chain_spec: chain_spec.clone(), 
             extra_data: Default::default(),  
-            snapshot_provider: crate::shared::get_snapshot_provider().cloned(),
             parlia: Arc::new(Parlia::new(chain_spec, 200)),
         }
     }
@@ -74,6 +71,11 @@ where
     pub fn assemble_block_bsc(&self, input: BscBlockAssemblerInput<'_, '_, BscBlockExecutorFactory>) -> 
         Result<crate::node::primitives::BscBlock, BlockExecutionError>
     {
+        // Get snapshot provider, return error if not available
+        let snapshot_provider = crate::shared::get_snapshot_provider()
+            .cloned()
+            .ok_or_else(|| BlockExecutionError::msg("Snapshot provider not available"))?;
+
         let BscBlockAssemblerInput {
             evm_env,
             execution_ctx: ctx,
@@ -153,10 +155,7 @@ where
                 .unwrap()
                 .get_header_by_hash(&header.parent_hash)
                 .ok_or(BlockExecutionError::msg("Failed to get header from global header reader"))?;
-            let parent_snap = self
-                .snapshot_provider
-                .as_ref()
-                .unwrap()
+            let parent_snap = snapshot_provider
                 .snapshot_by_hash(&header.parent_hash)
                 .ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;
             if let Err(e) = crate::node::miner::util::finalize_new_header(
@@ -201,6 +200,11 @@ where
         &self,
         input: BlockAssemblerInput<'_, '_, F>,
     ) -> Result<crate::node::primitives::BscBlock, BlockExecutionError> {
+        // Get snapshot provider, return error if not available
+        let snapshot_provider = crate::shared::get_snapshot_provider()
+            .cloned()
+            .ok_or_else(|| BlockExecutionError::msg("Snapshot provider not available"))?;
+
         let BlockAssemblerInput {
             evm_env,
             execution_ctx: ctx,
@@ -277,10 +281,7 @@ where
                 .unwrap()
                 .get_header_by_hash(&header.parent_hash)
                 .ok_or(BlockExecutionError::msg("Failed to get header from global header reader"))?;
-            let parent_snap = self
-                .snapshot_provider
-                .as_ref()
-                .unwrap()
+            let parent_snap = snapshot_provider
                 .snapshot_by_hash(&header.parent_hash)
                 .ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;
             if let Err(e) = crate::node::miner::util::finalize_new_header(
@@ -313,7 +314,6 @@ impl<ChainSpec> std::fmt::Debug for BscBlockAssembler<ChainSpec> {
         f.debug_struct("BscBlockAssembler")
             .field("chain_spec", &"Arc<ChainSpec>")
             .field("extra_data", &self.extra_data)
-            .field("snapshot_provider", &self.snapshot_provider.is_some())
             .field("parlia", &"Arc<Parlia<ChainSpec>>")
             .finish()
     }
