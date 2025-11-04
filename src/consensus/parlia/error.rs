@@ -6,10 +6,6 @@ use crate::consensus::parlia::VoteAddress;
 /// Parlia consensus error.
 #[derive(thiserror::Error, Debug, PartialEq, Eq, Clone)]
 pub enum ParliaConsensusError {
-    /// Error when snapshot provider is not found
-    #[error("snapshot provider not found")]
-    SnapshotProviderNotFound,
-
     /// Error when header extra vanity is missing
     #[error("missing header extra vanity")]
     ExtraVanityMissing,

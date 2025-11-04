@@ -32,7 +32,7 @@ use super::{
 };
 use crate::consensus::parlia::go_rng::{RngSource, Shuffle};
 use tracing::{trace, debug, warn};
-use crate::node::evm::pre_execution::K_ANCESTOR_GENERATION_DEPTH;
+use crate::consensus::parlia::constants::K_ANCESTOR_GENERATION_DEPTH;
 use crate::consensus::parlia::provider::SnapshotProvider;
 
 const RECOVERED_PROPOSER_CACHE_NUM: usize = 4096;
@@ -668,7 +668,7 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
                 }
             } else {
                 return Err(ParliaConsensusError::SnapshotNotFound {
-                    block_hash: current_header.parent_hash(),
+                    block_hash: target_header.parent_hash(),
                 });
             }
         }
