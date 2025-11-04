@@ -1,7 +1,7 @@
 #![allow(clippy::owned_cow)]
 use crate::{
     BscBlock, node::{
-        BscNode, engine_api::payload::BscPayloadTypes, network::block_import::{BscBlockImport, handle::ImportHandle}, primitives::{BscBlobTransactionSidecar, BscPrimitives}
+        BscNode, engine_api::payload::BscPayloadTypes, network::{block_import::{BscBlockImport, handle::ImportHandle}, evn_peers::peer_id_to_node_id}, primitives::{BscBlobTransactionSidecar, BscPrimitives}
     }
 };
 use alloy_rlp::{Decodable, Encodable};
@@ -251,6 +251,7 @@ impl BscNetworkBuilder {
             .eth_rlpx_handshake(Arc::new(BscHandshake::default()))
             .add_rlpx_sub_protocol(bsc_protocol::protocol::handler::BscProtocolHandler);
         
+        let peer_id = network_builder.get_peer_id();
         let mut network_config = ctx.build_network_config(network_builder);
         network_config.status.forkid = network_config.fork_filter.current();
         let provider = ctx.provider();
@@ -260,11 +261,12 @@ impl BscNetworkBuilder {
         }
         debug!(
             target: "bsc::net",
+            peer_id = ?peer_id_to_node_id(peer_id),
             version = ?network_config.status.version,
             td = ?network_config.status.total_difficulty,
             blockhash = ?network_config.status.blockhash,
             genesis = ?network_config.status.genesis,
-            "Initialized ETH status for handshake"
+            "Initialized BSC network configuration"
         );
 
         Ok(network_config)

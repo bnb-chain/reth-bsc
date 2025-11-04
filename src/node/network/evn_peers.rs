@@ -1,3 +1,4 @@
+use alloy_primitives::{B256, keccak256};
 use once_cell::sync::Lazy;
 use reth_network_api::PeerId;
 use std::collections::{HashMap, HashSet};
@@ -27,6 +28,10 @@ static ONCHAIN_NODEIDS: Lazy<RwLock<HashSet<String>>> =
 pub fn normalize_node_id_str(s: &str) -> String {
     let s = s.trim().to_lowercase();
     s.strip_prefix("0x").unwrap_or(&s).to_string()
+}
+
+pub fn peer_id_to_node_id(peer: PeerId) -> B256 {
+    keccak256(peer.as_slice())
 }
 
 /// Attempt to mark a peer as EVN by whitelist entries in the global EVN config.

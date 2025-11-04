@@ -233,6 +233,7 @@ fn main() -> eyre::Result<()> {
                     nodeids_to_add: parse_nodeids(args.evn_add_nodeids.clone()),
                     nodeids_to_remove: parse_nodeids(args.evn_remove_nodeids.clone()),
                 };
+                tracing::debug!(target: "bsc::init", "EVN is enabled: {}, config: {:?}", evn_enabled, cfg);
                 let _ = reth_bsc::node::network::evn::set_global_evn_config(cfg);
                 if evn_enabled { tracing::info!("EVN features enabled (disable peer tx broadcast)"); }
             }
