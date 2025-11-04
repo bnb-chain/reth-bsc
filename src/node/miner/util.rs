@@ -12,6 +12,7 @@ use reth_chainspec::EthChainSpec;
 use crate::node::evm::pre_execution::VALIDATOR_CACHE;
 use crate::node::miner::signer::{seal_header_with_global_signer, SignerError};
 use crate::node::miner::bsc_miner::MiningContext;
+use crate::consensus::eip4844::calc_excess_blob_gas;
 
 pub fn prepare_new_attributes(ctx: &mut MiningContext, parlia: Arc<Parlia<BscChainSpec>>, parent_snap: &Snapshot, parent_header: &Header, signer: Address) -> EthPayloadBuilderAttributes {
     let new_header = prepare_new_header(parlia.clone(), parent_snap, parent_header, signer);
@@ -40,6 +41,11 @@ where
         beneficiary: signer, 
         ..Default::default() 
     };
+    if BscHardforks::is_cancun_active_at_timestamp(parlia.spec.as_ref(), new_header.number, new_header.timestamp) {
+        new_header.blob_gas_used = Some(0);
+        new_header.excess_blob_gas = Some(calc_excess_blob_gas(parlia.spec.as_ref(), parent_header, new_header.timestamp));
+    }
+
     parlia.prepare_timestamp(parent_snap, parent_header, &mut new_header);
     new_header
 }

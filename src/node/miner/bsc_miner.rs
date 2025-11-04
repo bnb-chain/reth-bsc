@@ -38,7 +38,7 @@ use lru::LruCache;
 /// Maximum number of recently mined blocks to track for double signing prevention
 const RECENT_MINED_BLOCKS_CACHE_SIZE: usize = 100;
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MiningContext {
     pub header: Option<reth_primitives::Header>, // tmp header for payload building.
     pub parent_header: reth_primitives::SealedHeader,
@@ -526,6 +526,7 @@ where
             EthereumBuilderConfig::new(),
             self.chain_spec.clone(),
             self.parlia.clone(),
+            mining_ctx.clone(),
         );
         let build_args = BscBuildArguments {
             cached_reads: reth_revm::cached::CachedReads::default(),

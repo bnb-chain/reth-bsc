@@ -36,6 +36,7 @@ use crate::node::primitives::BscBlobTransactionSidecar;
 use std::collections::HashMap;
 use reth_chainspec::EthChainSpec;
 use reth_chainspec::EthereumHardforks;
+use crate::consensus::eip4844::{calc_blob_fee, BLOB_TX_BLOB_GAS_PER_BLOB};
 
 
 /// Delay left over for mining calculation
@@ -101,6 +102,8 @@ pub struct BscPayloadBuilder<Pool, Client, EvmConfig = BscEvmConfig> {
     chain_spec: Arc<BscChainSpec>,
     /// Parlia consensus engine.
     parlia: Arc<Parlia<BscChainSpec>>,
+    // ctx
+    ctx: MiningContext,
 }
 
 impl<Pool, Client, EvmConfig> BscPayloadBuilder<Pool, Client, EvmConfig> 
@@ -117,8 +120,9 @@ where
         builder_config: EthereumBuilderConfig,
         chain_spec: Arc<BscChainSpec>,
         parlia: Arc<Parlia<BscChainSpec>>,
+        ctx: MiningContext,
     ) -> Self {
-        Self { client, pool, evm_config, builder_config, chain_spec, parlia }
+        Self { client, pool, evm_config, builder_config, chain_spec, parlia, ctx }
     }
 
     /// Builds a payload with the given arguments.
@@ -177,10 +181,15 @@ where
         let min_gas_tip = DEFAULT_MIN_GAS_TIP;
         let mut block_blob_count = 0;
 
-        // TODO: Calculate blob fee.
+        let mut blob_fee = None;
         let blob_params = self.chain_spec.blob_params_at_timestamp(attributes.timestamp());
+        if let Some(header) = &self.ctx.header {
+            if header.excess_blob_gas != Some(0) {
+                blob_fee = Some(calc_blob_fee(&self.chain_spec, header));
+            }
+        }
         let max_blob_count = blob_params.as_ref().map(|params| params.max_blob_count).unwrap_or_default();
-        let mut best_tx_list = self.pool.best_transactions_with_attributes(BestTransactionsAttributes::new(base_fee, None));
+        let mut best_tx_list = self.pool.best_transactions_with_attributes(BestTransactionsAttributes::new(base_fee, blob_fee.map(|fee| fee as u64)));
         while let Some(pool_tx) = best_tx_list.next() {
             if cancel.is_cancelled() {
                 break;
@@ -209,7 +218,6 @@ where
             debug!("debug payload_builder, block_number: {}, tx: {:?}, is_blob_tx: {:?}, tx_type: {:?}", parent_header.number()+1, tx.hash(), tx.is_eip4844(), tx.tx_type());
             if let Some(blob_tx) = tx.as_eip4844() {
                 let tx_blob_count = blob_tx.tx().blob_versioned_hashes.len() as u64;
-
                 if block_blob_count + tx_blob_count > max_blob_count {
                     // we can't fit this _blob_ transaction into the block, so we mark it as
                     // invalid, which removes its dependent transactions from
@@ -226,6 +234,22 @@ where
                         ),
                     );
                     continue
+                }
+
+                if self.chain_spec.is_cancun_active_at_timestamp(attributes.timestamp()) {
+                    let left =   max_blob_count - block_blob_count;
+                    if left < blob_tx.tx().blob_gas_used().unwrap_or(0) / BLOB_TX_BLOB_GAS_PER_BLOB {
+                        best_tx_list.mark_invalid(
+                            &pool_tx,
+                            InvalidPoolTransactionError::Eip4844(
+                                Eip4844PoolTransactionError::TooManyEip4844Blobs {
+                                    have: block_blob_count + tx_blob_count,
+                                    permitted: max_blob_count,
+                                },
+                            ),
+                        );
+                        continue
+                    }
                 }
 
                 let blob_sidecar_result = 'sidecar: {
