@@ -18,8 +18,9 @@ use reth_evm::{precompiles::PrecompilesMap, Database, Evm, EvmEnv};
 use revm::{
     context::{
         result::{EVMError, HaltReason, ResultAndState},
-        BlockEnv,
+        BlockEnv, ContextTr,
     },
+    context_interface::JournalTr,
     Context, ExecuteEvm, InspectEvm, Inspector, SystemCallEvm,
 };
 
@@ -62,14 +63,24 @@ where
         // Normal execution: BlockExecutor filters system txs before calling transact
         // debug_traceTransaction/debug_traceCall: detect and handle system txs here
 
-        if !tx.is_system_transaction {
+        if self.inspect {
             use crate::system_contracts::is_invoke_system_contract;
             use revm::primitives::TxKind;
+            use alloy_primitives::U256;
             
-            tx.is_system_transaction = matches!(tx.base.kind, TxKind::Call(to) 
+            tx.is_system_transaction = matches!(tx.base.kind, TxKind::Call(to)
                 if tx.base.caller == self.block.beneficiary
                     && is_invoke_system_contract(&to)
                     && tx.base.gas_price == 0);
+            
+            // Increase beneficiary balance to max for system transactions
+            if tx.is_system_transaction {
+                let beneficiary = self.block.beneficiary;
+                if let Ok(account) = self.journal_mut().load_account(beneficiary) {
+                    account.data.info.balance = U256::MAX;
+                    account.data.mark_touch();
+                }
+            }
         }
 
         // Save original environment for system transactions
