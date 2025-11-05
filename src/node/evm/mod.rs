@@ -72,7 +72,7 @@ where
                     && is_invoke_system_contract(&to)
                     && tx.base.gas_price == 0);
             
-            // Increase beneficiary balance to max for system transactions
+            // Increase beneficiary balance for system transactions
             if tx.is_system_transaction {
                 let beneficiary = self.block.beneficiary;
                 if let Ok(account) = self.journal_mut().load_account(beneficiary) {
