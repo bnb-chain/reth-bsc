@@ -102,7 +102,7 @@ pub struct BscPayloadBuilder<Pool, Client, EvmConfig = BscEvmConfig> {
     chain_spec: Arc<BscChainSpec>,
     /// Parlia consensus engine.
     parlia: Arc<Parlia<BscChainSpec>>,
-    // ctx
+    // Mining context containing header information for blob fee calculation
     ctx: MiningContext,
 }
 
@@ -183,10 +183,13 @@ where
 
         let mut blob_fee = None;
         let blob_params = self.chain_spec.blob_params_at_timestamp(attributes.timestamp());
-        if let Some(header) = &self.ctx.header {
-            if header.excess_blob_gas != Some(0) {
-                blob_fee = Some(calc_blob_fee(&self.chain_spec, header));
-            }
+        let header = self.ctx.header.as_ref().ok_or_else(|| {
+            Box::new(std::io::Error::other(
+                "Missing header in mining context"
+            )) as Box<dyn std::error::Error + Send + Sync>
+        })?;
+        if header.excess_blob_gas != Some(0) {
+            blob_fee = Some(calc_blob_fee(&self.chain_spec, header));
         }
         let max_blob_count = blob_params.as_ref().map(|params| params.max_blob_count).unwrap_or_default();
         let mut best_tx_list = self.pool.best_transactions_with_attributes(BestTransactionsAttributes::new(base_fee, blob_fee.map(|fee| fee as u64)));
@@ -237,7 +240,7 @@ where
                 }
 
                 if self.chain_spec.is_cancun_active_at_timestamp(attributes.timestamp()) {
-                    let left =   max_blob_count - block_blob_count;
+                    let left =  max_blob_count - block_blob_count;
                     if left < blob_tx.tx().blob_gas_used().unwrap_or(0) / BLOB_TX_BLOB_GAS_PER_BLOB {
                         best_tx_list.mark_invalid(
                             &pool_tx,

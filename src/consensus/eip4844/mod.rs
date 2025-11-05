@@ -3,7 +3,7 @@
 mod blob_fee;
 
 pub use blob_fee::{
-    calc_blob_fee, calc_excess_blob_gas,
+    calc_blob_fee,
     CANCUN_UPDATE_FRACTION, MIN_BLOB_GAS_PRICE,
     BLOB_TX_BLOB_GAS_PER_BLOB,
 };

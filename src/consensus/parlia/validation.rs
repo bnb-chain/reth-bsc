@@ -41,7 +41,6 @@ pub fn validate_header_base_fee<ChainSpec: EthereumHardforks>(
 pub fn validate_4844_header_of_bsc(header: &SealedHeader) -> Result<(), ConsensusError> {
     let blob_gas_used = header.blob_gas_used.ok_or(ConsensusError::BlobGasUsedMissing)?;
     let excess_blob_gas = header.excess_blob_gas.ok_or(ConsensusError::ExcessBlobGasMissing)?;
-
     if blob_gas_used > MAX_DATA_GAS_PER_BLOCK_DENCUN {
         return Err(ConsensusError::BlobGasUsedExceedsMaxBlobGasPerBlock {
             blob_gas_used,

@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use alloy_consensus::Header;
+use alloy_consensus::{Header, BlockHeader};
 use alloy_primitives::{Address, Bytes, B256};
 use crate::consensus::parlia::Snapshot;
 use crate::consensus::parlia::consensus::Parlia;
@@ -12,7 +12,6 @@ use reth_chainspec::EthChainSpec;
 use crate::node::evm::pre_execution::VALIDATOR_CACHE;
 use crate::node::miner::signer::{seal_header_with_global_signer, SignerError};
 use crate::node::miner::bsc_miner::MiningContext;
-use crate::consensus::eip4844::calc_excess_blob_gas;
 
 pub fn prepare_new_attributes(ctx: &mut MiningContext, parlia: Arc<Parlia<BscChainSpec>>, parent_snap: &Snapshot, parent_header: &Header, signer: Address) -> EthPayloadBuilderAttributes {
     let new_header = prepare_new_header(parlia.clone(), parent_snap, parent_header, signer);
@@ -42,8 +41,8 @@ where
         ..Default::default() 
     };
     if BscHardforks::is_cancun_active_at_timestamp(parlia.spec.as_ref(), new_header.number, new_header.timestamp) {
-        new_header.blob_gas_used = Some(0);
-        new_header.excess_blob_gas = Some(calc_excess_blob_gas(parlia.spec.as_ref(), parent_header, new_header.timestamp));
+        let blob_params = parlia.spec.blob_params_at_timestamp(new_header.timestamp);
+        new_header.excess_blob_gas = parent_header.maybe_next_block_excess_blob_gas(blob_params);
     }
 
     parlia.prepare_timestamp(parent_snap, parent_header, &mut new_header);
