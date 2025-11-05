@@ -66,8 +66,7 @@ where
         if self.inspect {
             use crate::system_contracts::is_invoke_system_contract;
             use revm::primitives::TxKind;
-            use alloy_primitives::U256;
-            
+
             tx.is_system_transaction = matches!(tx.base.kind, TxKind::Call(to)
                 if tx.base.caller == self.block.beneficiary
                     && is_invoke_system_contract(&to)
@@ -77,7 +76,7 @@ where
             if tx.is_system_transaction {
                 let beneficiary = self.block.beneficiary;
                 if let Ok(account) = self.journal_mut().load_account(beneficiary) {
-                    account.data.info.balance = U256::MAX;
+                    account.data.info.balance = tx.base.value;
                     account.data.mark_touch();
                 }
             }
