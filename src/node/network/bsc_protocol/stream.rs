@@ -176,20 +176,8 @@ impl BscProtocolConnection {
                 
                 self.handshake_completed = true;
                 self.handshake_deadline = None;
-
-                if !self.is_dialer {
-                    // Responder sends capability response
-                    let response = Self::encode_command(BscCommand::Capability {
-                        protocol_version: BSC_PROTOCOL_VERSION,
-                        extra: Bytes::from_static(&[0x00u8]) // Raw RLP: single 0x00 byte represents []byte{00}
-                    });
-                    tracing::debug!(target: "bsc_protocol", "BSC handshake completed (responder) - sending response");
-                    Poll::Ready(Some(Some(response)))
-                } else {
-                    // Dialer just completes handshake
-                    tracing::debug!(target: "bsc_protocol", "BSC handshake completed (dialer) - no response needed");
-                    Poll::Ready(Some(None))
-                }
+                tracing::debug!(target: "bsc_protocol", "BSC handshake completed");
+                Poll::Ready(Some(None))
             }
             Err(e) => {
                 tracing::warn!(target: "bsc_protocol", error = %e, "Failed to decode BSC capability during handshake");

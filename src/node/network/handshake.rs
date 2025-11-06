@@ -51,19 +51,16 @@ impl BscHandshake {
                 EthStreamError::InvalidMessage(e.into())
             }) {
                 Ok(their_status) => {
+                    tracing::trace!(target: "bsc_handshake", "bsc handshake: upgrade status: {:?}", their_status);
                     // Successful handshake; log remote's EVN preference
+                    // TODO: cannot get peer id here, need to add it to the upgrade status message.
                     if their_status.extension.disable_peer_tx_broadcast {
-                        debug!("Peer requests: disable TX broadcast towards them (EVN)");
+                        debug!(target: "bsc_handshake", "Peer requests: disable TX broadcast towards them (EVN)");
                     }
                     return Ok(negotiated_status);
                 }
-                Err(_) => {
-                    // Some legacy BSC nodes respond with an empty 0x0b upgrade-status (0x0bc2c180).
-                    // Accept this specific payload leniency but still disconnect on all other errors.
-                    if their_msg.as_ref() == [0x0b, 0xc2, 0xc1, 0x80] {
-                        debug!("Tolerating legacy empty upgrade-status 0x0bc2c180 message");
-                        return Ok(negotiated_status);
-                    }
+                Err(e) => {
+                    tracing::trace!(target: "bsc_handshake", "bsc handshake: upgrade failed: {:?}", e);
                     unauth.disconnect(DisconnectReason::ProtocolBreach).await?;
                     return Err(EthStreamError::EthHandshakeError(
                         EthHandshakeError::NonStatusMessageInHandshake,

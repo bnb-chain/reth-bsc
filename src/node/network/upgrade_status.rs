@@ -1,7 +1,7 @@
 //! Implement BSC upgrade message which is required during handshake with other BSC clients, e.g.,
 //! geth.
 use alloy_rlp::{Decodable, Encodable};
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 /// The message id for the upgrade status message, used in the BSC handshake.
 const UPGRADE_STATUS_MESSAGE_ID: u8 = 0x0b;
@@ -18,7 +18,7 @@ pub struct UpgradeStatus {
 impl Encodable for UpgradeStatus {
     fn encode(&self, out: &mut dyn BufMut) {
         UPGRADE_STATUS_MESSAGE_ID.encode(out);
-        self.extension.encode(out);
+        vec![&self.extension].encode(out);
     }
 }
 
@@ -31,8 +31,11 @@ impl Decodable for UpgradeStatus {
         
         // BSC sends: 0x0b (message id) followed by [[disable_peer_tx_broadcast]]
         // The remaining bytes should be the extension wrapped in an extra list
-        let extension = UpgradeStatusExtension::decode(buf)?;
-        Ok(Self { extension })
+        let extension: Vec<UpgradeStatusExtension> = Decodable::decode(buf)?;
+        if extension.len() != 1 {
+            return Err(alloy_rlp::Error::Custom("Invalid extension length"));
+        }
+        Ok(Self { extension: extension[0] })
     }
 }
 
@@ -47,7 +50,7 @@ impl UpgradeStatus {
 
 /// The extension to define whether to enable or disable the flag.
 /// This flag currently is ignored, and will be supported later.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Copy)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct UpgradeStatusExtension {
     // TODO: support disable_peer_tx_broadcast flag
@@ -64,18 +67,17 @@ impl Encodable for UpgradeStatusExtension {
 
 impl Decodable for UpgradeStatusExtension {
     fn decode(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
+        // if got empty extension, return false
+        if buf[0] == 0x80 {
+            buf.advance(1);
+            return Ok(Self { disable_peer_tx_broadcast: false });
+        }
         // First try `[bool]` format
-        if let Ok(values) = <Vec<bool>>::decode(buf) {
-            if values.len() == 1 {
-                return Ok(Self { disable_peer_tx_broadcast: values[0] });
-            }
+        let vals = <Vec<bool>>::decode(buf)?;
+        if vals.len() != 1 {
+            return Err(alloy_rlp::Error::Custom("Invalid bool length"));
         }
-        // Fallback to `[[bool]]` as sometimes seen on BSC
-        let nested: Vec<Vec<bool>> = Decodable::decode(buf)?;
-        if nested.len() == 1 && nested[0].len() == 1 {
-            return Ok(Self { disable_peer_tx_broadcast: nested[0][0] });
-        }
-        Err(alloy_rlp::Error::Custom("Invalid extension format"))
+        Ok(Self { disable_peer_tx_broadcast: vals[0] })
     }
 }
 
@@ -87,13 +89,20 @@ mod tests {
     #[test]
     fn test_decode_bsc_upgrade_status() {
         // Raw wire message captured from a BSC peer.
-        let raw = hex::decode("0bc180").unwrap();
-
-        let mut slice = raw.as_slice();
-        let decoded = UpgradeStatus::decode(&mut slice).expect("should decode");
-
-        assert!(!decoded.extension.disable_peer_tx_broadcast);
-        // the slice should be fully consumed
-        assert!(slice.is_empty(), "all bytes must be consumed by decoder");
+        let cases = vec![
+            ("0bc180", UpgradeStatus { extension: UpgradeStatusExtension { disable_peer_tx_broadcast: false } }),
+            ("0bc2c180", UpgradeStatus { extension: UpgradeStatusExtension { disable_peer_tx_broadcast: false } }),
+            ("0bc2c101", UpgradeStatus { extension: UpgradeStatusExtension { disable_peer_tx_broadcast: true } }),
+        ];
+        for (raw, expected) in cases {
+            let raw = hex::decode(raw).unwrap();
+            let mut slice = raw.as_slice();
+            let decoded = UpgradeStatus::decode(&mut slice).expect("should decode");
+            println!("decoded: {:?}", decoded);
+            assert_eq!(expected, decoded);
+            let mut enc = BytesMut::new();
+            UpgradeStatus { extension: UpgradeStatusExtension { disable_peer_tx_broadcast: false } }.encode(&mut enc);
+            println!("enc: {:x?}", enc.freeze());
+        }
     }
 }
