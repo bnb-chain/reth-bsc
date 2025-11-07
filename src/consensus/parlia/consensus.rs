@@ -15,6 +15,7 @@ use crate::consensus::parlia::VoteSignature;
 use crate::consensus::parlia::SYSTEM_TXS_GAS_HARD_LIMIT;
 use crate::consensus::parlia::SYSTEM_TXS_GAS_SOFT_LIMIT;
 use crate::hardforks::BscHardforks;
+use crate::node::evm::pre_execution::TURN_LENGTH_CACHE;
 use reth_chainspec::EthChainSpec;
 use alloy_consensus::{Header, BlockHeader};
 use alloy_rlp::Decodable;
@@ -598,14 +599,22 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
         new_header.extra_data = alloy_primitives::Bytes::from(extra_data);
     }
 
-    pub fn prepare_turn_length(&self, parent_snap: &Snapshot, turn_length: Option<u8>, new_header: &mut Header) {
+    pub fn prepare_turn_length(&self, parent_snap: &Snapshot, new_header: &mut Header) -> Result<(), ParliaConsensusError> {
         let epoch_length = parent_snap.epoch_num;
         if !new_header.number.is_multiple_of(epoch_length) || !self.spec.is_bohr_active_at_timestamp(new_header.number, new_header.timestamp) {
-            return;
+            return Ok(());
         }
+        
+        let mut cache = TURN_LENGTH_CACHE.lock().unwrap();
+        let turn_length = *cache.get(&new_header.parent_hash).ok_or(ParliaConsensusError::TurnLengthNotFound {
+            block_hash: new_header.parent_hash,
+        })?;
+        
         let mut extra_data = new_header.extra_data.to_vec();
-        extra_data.push(turn_length.unwrap());
+        extra_data.push(turn_length);
         new_header.extra_data = alloy_primitives::Bytes::from(extra_data);
+
+        Ok(())
     }
 
     pub fn estimate_gas_reserved_for_system_txs(&self, parent_timestamp: Option<u64>, current_number: u64, current_timestamp: u64) -> u64 {

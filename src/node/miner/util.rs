@@ -9,8 +9,8 @@ use crate::consensus::parlia::{EXTRA_VANITY_LEN, EXTRA_SEAL_LEN};
 use reth::payload::EthPayloadBuilderAttributes;
 use crate::hardforks::BscHardforks;
 use reth_chainspec::EthChainSpec;
-use crate::node::evm::pre_execution::{TURN_LENGTH_CACHE, VALIDATOR_CACHE};
-use crate::node::miner::signer::{seal_header_with_global_signer};
+use crate::node::evm::pre_execution::{VALIDATOR_CACHE};
+use crate::node::miner::signer::{SignerError, seal_header_with_global_signer};
 use crate::node::miner::bsc_miner::MiningContext;
 
 pub fn prepare_new_attributes(ctx: &mut MiningContext, parlia: Arc<Parlia<BscChainSpec>>, parent_header: &Header, signer: Address) -> EthPayloadBuilderAttributes {
@@ -93,14 +93,8 @@ where
         }
     }
 
-    {   // prepare turn length
-        let mut turn_length = None;
-        let mut cache = TURN_LENGTH_CACHE.lock().unwrap();
-        if let Some(cached_turn_length) = cache.get(&parent_header.hash_slow()) {
-            turn_length = Some(*cached_turn_length);
-        }
-        parlia.prepare_turn_length(parent_snap, turn_length, new_header);
-    }
+    parlia.prepare_turn_length(parent_snap, new_header).
+        map_err(|e| SignerError::SigningFailed(format!("Failed to prepare turn length: {}", e)))?;
     
     // TODO: add BEP-590 changes in fermi hardfork later, it changes the assemble and verify logic.
     if let Err(e) = parlia.assemble_vote_attestation(parent_snap, parent_header, new_header) {

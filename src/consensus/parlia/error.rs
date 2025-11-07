@@ -1,4 +1,4 @@
-use alloy_primitives::BlockNumber;
+use alloy_primitives::{BlockHash, BlockNumber};
 
 use crate::consensus::parlia::VoteAddress;
 
@@ -67,5 +67,11 @@ pub enum ParliaConsensusError {
     InvalidAttestationVoteCount {
         got: u32,
         expected: u32,
+    },
+
+    /// Error when turn length is not found
+    #[error("turn length not found")]
+    TurnLengthNotFound {
+        block_hash: BlockHash,
     },
 }
