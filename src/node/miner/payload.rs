@@ -202,15 +202,14 @@ where
             }
 
             // filter out blacklisted transactions before executing.
-            if self.chain_spec.is_nano_active_at_block(parent_header.number+1) {
-                if blacklist::check_tx_basic_blacklist(pool_tx.sender(), pool_tx.to()) {
-                    tracing::debug!(target: "payload_builder", "Blacklisted transaction: {:?}", pool_tx.hash());
-                    best_tx_list.mark_invalid(
-                        &pool_tx,
-                        InvalidPoolTransactionError::other(BlacklistedAddressError()),
-                    );
-                    continue
-                }
+            if self.chain_spec.is_nano_active_at_block(parent_header.number+1) 
+                && blacklist::check_tx_basic_blacklist(pool_tx.sender(), pool_tx.to()) {
+                tracing::debug!(target: "payload_builder", "Blacklisted transaction: {:?}", pool_tx.hash());
+                best_tx_list.mark_invalid(
+                    &pool_tx,
+                    InvalidPoolTransactionError::other(BlacklistedAddressError()),
+                );
+                continue
             }
             // filter out tx with min gas tip.
             if pool_tx.effective_tip_per_gas(base_fee).unwrap_or(0_u128) < min_gas_tip {

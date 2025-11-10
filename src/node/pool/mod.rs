@@ -171,7 +171,7 @@ where
 			.build_with_tasks(ctx.task_executor().clone(), blob_store.clone());
 
 		// Inject blacklist wrapper
-		let validator = validator.map(|inner| BscTxValidator::new(inner));
+		let validator = validator.map(BscTxValidator::new);
 
 		// Build txpool and start maintenance task
 		let transaction_pool = TxPoolBuilder::new(ctx)
