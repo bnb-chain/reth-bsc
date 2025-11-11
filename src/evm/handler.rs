@@ -80,9 +80,7 @@ impl<DB: Database, INSP> Handler for BscHandler<DB, INSP> {
                 continue;
             };
 
-            // TODO: blacklist need check in txpool, tx execution, and state changes.
-            // now only check in tx execution.
-            // BSC specific validation on https://github.com/bnb-chain/bsc/blob/develop/core/state_transition.go#L593
+            // check if authority is blacklisted.
             if blacklist::is_blacklisted(&authority) {
                 continue;
             }

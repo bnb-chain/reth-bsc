@@ -1,9 +1,12 @@
 use alloy_primitives::U256;
 use crate::consensus::parlia::{Parlia, DEFAULT_MIN_GAS_TIP};
+use crate::evm::blacklist;
+use crate::hardforks::BscHardforks;
 use crate::node::engine::BscBuiltPayload;
 use crate::node::evm::config::BscEvmConfig;
 use crate::node::miner::bid_simulator::BidSimulator;
 use crate::node::miner::bsc_miner::{MiningContext, SubmitContext};
+use crate::node::pool::BlacklistedAddressError;
 use reth_provider::StateProviderFactory;
 use reth_revm::{database::StateProviderDatabase, db::State};
 use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
@@ -198,6 +201,16 @@ where
                 break;
             }
 
+            // filter out blacklisted transactions before executing.
+            if self.chain_spec.is_nano_active_at_block(parent_header.number+1) 
+                && blacklist::check_tx_basic_blacklist(pool_tx.sender(), pool_tx.to()) {
+                tracing::debug!(target: "payload_builder", "Blacklisted transaction: {:?}", pool_tx.hash());
+                best_tx_list.mark_invalid(
+                    &pool_tx,
+                    InvalidPoolTransactionError::other(BlacklistedAddressError()),
+                );
+                continue
+            }
             // filter out tx with min gas tip.
             if pool_tx.effective_tip_per_gas(base_fee).unwrap_or(0_u128) < min_gas_tip {
                 // Skip packaging underpriced transactions, but do not mark them invalid.
@@ -239,7 +252,7 @@ where
                     continue
                 }
 
-                if self.chain_spec.is_cancun_active_at_timestamp(attributes.timestamp()) {
+                if BscHardforks::is_cancun_active_at_timestamp(&self.chain_spec, parent_header.number+1, attributes.timestamp()) {
                     let left =  max_blob_count - block_blob_count;
                     if left < blob_tx.tx().blob_gas_used().unwrap_or(0) / BLOB_TX_BLOB_GAS_PER_BLOB {
                         best_tx_list.mark_invalid(

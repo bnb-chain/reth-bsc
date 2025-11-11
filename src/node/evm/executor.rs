@@ -230,7 +230,7 @@ where
                 target: "bsc::executor::prague",
                 block_number,
                 error = ?err,
-                "Failed to load HistoryStorageAddress account"
+                "Failed to load HistoryStorageAddress account",
             );
             BlockExecutionError::other(err)
         })?;

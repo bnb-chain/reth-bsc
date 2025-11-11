@@ -16,3 +16,16 @@ pub static NANO_BLACKLIST: LazyLock<HashSet<Address>> = LazyLock::new(|| {
 pub fn is_blacklisted(address: &Address) -> bool {
     NANO_BLACKLIST.contains(address)
 }
+
+#[inline]
+pub fn check_tx_basic_blacklist(from: Address, to: Option<Address>) -> bool {
+    if is_blacklisted(&from) {
+        return true;
+    }
+    if let Some(to) = to {
+        if is_blacklisted(&to) {
+            return true;
+        }
+    }
+    false
+}
