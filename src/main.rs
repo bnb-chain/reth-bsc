@@ -242,7 +242,7 @@ fn main() -> eyre::Result<()> {
             let NodeHandle { node, node_exit_future: exit_future } =
                 builder.node(node)
                     .extend_rpc_modules(move |ctx| {
-                        tracing::info!("Start to register Parlia RPC API: parlia_getSnapshot");
+                        tracing::info!("Start to register Parlia RPC API...");
                         use reth_bsc::rpc::parlia::{ParliaApiImpl, ParliaApiServer, DynSnapshotProvider};
                         
                         let snapshot_provider = if let Some(provider) = reth_bsc::shared::get_snapshot_provider() {
@@ -253,13 +253,11 @@ fn main() -> eyre::Result<()> {
                         };
                         
                         let wrapped_provider = Arc::new(DynSnapshotProvider::new(snapshot_provider));
-                        let parlia_api = ParliaApiImpl::new(wrapped_provider);
+                        let parlia_api = ParliaApiImpl::new(wrapped_provider, ctx.provider().clone());
                         ctx.modules.merge_configured(parlia_api.into_rpc())?;
-
                         tracing::info!("Succeed to register Parlia RPC API");
-                        Ok(())
-                    }).extend_rpc_modules(move |ctx| {
-                        tracing::info!("Start to register MEV RPC API: mev_sendBid");
+
+                        tracing::info!("Start to register MEV RPC API...");
                         use reth_bsc::rpc::mev::{MevApiImpl, BscMevApiServer};
 
                         // Get snapshot provider and chain spec for MEV API
@@ -275,9 +273,8 @@ fn main() -> eyre::Result<()> {
                         let mev_api = MevApiImpl::new(snapshot_provider, chain_spec);
                         ctx.modules.merge_configured(mev_api.into_rpc())?;
                         tracing::info!("Succeed to register MEV RPC API");
-                        Ok(())
-                    }).extend_rpc_modules(move |ctx| {
-                        tracing::info!("Start to register Blob RPC API: eth_getBlobSidecarByTxHash, eth_getBlobSidecars");
+
+                        tracing::info!("Start to register Blob RPC API...");
                         use reth_bsc::rpc::blob::{BlobApiImpl, BlobApiServer};
 
                         // Get pool and provider from context
@@ -286,7 +283,6 @@ fn main() -> eyre::Result<()> {
                         
                         let blob_api = BlobApiImpl::new(pool, provider);
                         ctx.modules.merge_configured(blob_api.into_rpc())?;
-                        
                         tracing::info!("Succeed to register Blob RPC API");
                         Ok(())
                     })

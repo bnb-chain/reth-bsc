@@ -489,14 +489,6 @@ where
             self.upgrade_contracts()?;
         }
 
-        // TODO: add nano block list check
-        // if self.spec.is_nano_active_at_block(block_env.number.to::<u64>()) {
-            // for receipt in self.receipts.iter() {
-            //     NANO_BLACK_LIST.contains(&receipt.contract_address) {
-            //         return Err(BlockExecutionError::other("History storage address is not allowed"));
-            //     }
-            // }
-        // }
         if self.spec.is_feynman_transition_at_timestamp(self.evm.block().number.to::<u64>(), self.evm.block().timestamp.to::<u64>(), parent_timestamp) {
             self.initialize_feynman_contracts(self.evm.block().beneficiary)?;
         }
