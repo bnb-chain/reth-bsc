@@ -3,18 +3,28 @@ use alloy_rlp::{Decodable, Encodable};
 use futures::{Stream, StreamExt};
 use std::{pin::Pin, task::{Context, Poll, ready}};
 use reth_eth_wire::multiplex::ProtocolConnection;
-use bytes::{Bytes};
-use tokio::sync::mpsc::UnboundedReceiver;
+use bytes::Bytes;
+use tokio::sync::{mpsc::UnboundedReceiver, oneshot};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio::time::{Duration, Sleep};
 use futures::Future;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
+use reth_network_api::PeerId;
+use alloy_primitives::U128;
+use reth_eth_wire::NewBlock;
+use reth_network::message::NewBlockMessage;
+use crate::node::network::BscNewBlock;
 
 /// Handshake timeout, mirroring the Go implementation.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+/// TTL for pending range requests before being pruned
+const PENDING_REQ_TTL: Duration = Duration::from_secs(15);
+/// Minimum interval between pending-request pruning passes
+const PRUNE_INTERVAL: Duration = Duration::from_secs(5);
 
 use crate::node::network::votes::{VotesPacket, BscCapPacket, handle_votes_broadcast};
-use super::protocol::proto::{BscProtoMessageId, BSC_PROTOCOL_VERSION};
+use crate::node::network::blocks_by_range::{GetBlocksByRangePacket, BlocksByRangePacket, build_blocks_by_range_response, MAX_REQUEST_RANGE_BLOCKS_COUNT};
+use super::protocol::proto::BscProtoMessageId;
 
 /// Commands that can be sent to the BSC connection.
 #[allow(dead_code)]
@@ -22,6 +32,11 @@ use super::protocol::proto::{BscProtoMessageId, BSC_PROTOCOL_VERSION};
 pub enum BscCommand {
     Capability { protocol_version: u64, extra: Bytes },
     Votes(Arc<Vec<crate::consensus::parlia::vote::VoteEnvelope>>),
+    GetBlocksByRange(
+        crate::node::network::blocks_by_range::GetBlocksByRangePacket,
+        oneshot::Sender<Result<crate::node::network::blocks_by_range::BlocksByRangePacket, String>>,
+    ),
+    BlocksByRange(BlocksByRangePacket),
 }
 
 /// Stream that handles incoming BSC protocol messages and returns outgoing messages to send.
@@ -32,15 +47,29 @@ pub struct BscProtocolConnection {
     handshake_completed: bool,
     is_dialer: bool,
     initial_capability: Option<BscCommand>,
+    /// Pending in-flight GetBlocksByRange requests mapped by request_id
+    pending_range_reqs: HashMap<u64, (oneshot::Sender<Result<BlocksByRangePacket, String>>, std::time::Instant)>,
+    /// Protocol version negotiated for this connection (1 or 2)
+    proto_version: u64,
+    /// PeerId for this connection, if known
+    peer_id: Option<PeerId>,
+    /// Last time we pruned pending requests
+    last_prune: std::time::Instant,
 }
 
 impl BscProtocolConnection {
-    pub fn new(conn: ProtocolConnection, commands: UnboundedReceiver<BscCommand>, is_dialer: bool) -> Self {
+    pub fn new(
+        conn: ProtocolConnection,
+        commands: UnboundedReceiver<BscCommand>,
+        is_dialer: bool,
+        proto_version: u64,
+        peer_id: Option<PeerId>,
+    ) -> Self {
         let handshake_deadline = Some(Box::pin(tokio::time::sleep(HANDSHAKE_TIMEOUT)));
         // Both sides should send initial capability in BSC protocol
         // BSC sends []byte{00} which in RLP is encoded as a single byte 0x00
         let initial_capability = Some(BscCommand::Capability { 
-            protocol_version: BSC_PROTOCOL_VERSION, 
+            protocol_version: proto_version, 
             extra: Bytes::from_static(&[0x00u8]) // Raw RLP: single 0x00 byte represents []byte{00}
         });
         
@@ -51,6 +80,29 @@ impl BscProtocolConnection {
             handshake_completed: false,
             is_dialer,
             initial_capability,
+            pending_range_reqs: HashMap::new(),
+            proto_version,
+            peer_id,
+            last_prune: std::time::Instant::now(),
+        }
+    }
+
+    fn prune_pending_requests(&mut self) {
+        // Rate-limit pruning
+        let now = std::time::Instant::now();
+        if now.duration_since(self.last_prune) < PRUNE_INTERVAL {
+            return;
+        }
+        self.last_prune = now;
+        let mut to_remove: Vec<u64> = Vec::new();
+        for (req_id, (tx, ts)) in self.pending_range_reqs.iter() {
+            if tx.is_closed() || now.duration_since(*ts) > PENDING_REQ_TTL {
+                to_remove.push(*req_id);
+            }
+        }
+        for id in to_remove {
+            self.pending_range_reqs.remove(&id);
+            tracing::debug!(target: "bsc_protocol", req_id = id, "Pruned stale pending range request");
         }
     }
 
@@ -87,15 +139,51 @@ impl BscProtocolConnection {
                 
                 buf
             }
+            BscCommand::GetBlocksByRange(req, _tx) => {
+                let mut buf = BytesMut::new();
+                req.encode(&mut buf);
+                tracing::debug!(
+                    target: "bsc_protocol",
+                    req_id = req.request_id,
+                    count = req.count,
+                    "Encoded GetBlocksByRange packet"
+                );
+                buf
+            }
+            BscCommand::BlocksByRange(packet) => {
+                let mut buf = BytesMut::new();
+                packet.encode(&mut buf);
+                tracing::debug!(
+                    target: "bsc_protocol",
+                    req_id = packet.request_id,
+                    blocks = packet.blocks.len(),
+                    encoded_len = buf.len(),
+                    "Encoded BlocksByRange packet"
+                );
+                buf
+            }
         }
     }
 
     /// Poll for outgoing commands and encode them
     fn poll_outgoing_commands(&mut self, cx: &mut Context<'_>) -> Option<BytesMut> {
         tracing::trace!(target: "bsc_protocol", "Checking for outgoing commands");
+        // Opportunistically prune stale pending requests
+        self.prune_pending_requests();
         if let Poll::Ready(Some(cmd)) = self.commands.poll_next_unpin(cx) {
             tracing::trace!(target: "bsc_protocol", cmd = ?cmd, "Processing outgoing command");
-            let encoded = Self::encode_command(cmd);
+            let encoded = match cmd {
+                BscCommand::GetBlocksByRange(req, resp_tx) => {
+                    // track pending request, then encode
+                    let req_id = req.request_id;
+                    // Overwrite existing pending if any
+                    self.pending_range_reqs.insert(req_id, (resp_tx, std::time::Instant::now()));
+                    let mut buf = BytesMut::new();
+                    req.encode(&mut buf);
+                    buf
+                }
+                other => Self::encode_command(other),
+            };
             tracing::trace!(target: "bsc_protocol", len = encoded.len(), "Sending encoded command");
             Some(encoded)
         } else {
@@ -117,6 +205,8 @@ impl BscProtocolConnection {
             return Poll::Ready(Some(None));
         }
 
+        // Opportunistically prune stale pending requests
+        self.prune_pending_requests();
         tracing::trace!(target: "bsc_protocol", len = raw.len(), "Received frame");
         Poll::Ready(Some(Some(raw)))
     }
@@ -151,8 +241,8 @@ impl BscProtocolConnection {
         
         match BscCapPacket::decode(&mut &slice[..]) {
             Ok(pkt) => {
-                if pkt.protocol_version != BSC_PROTOCOL_VERSION {
-                    tracing::warn!(target: "bsc_protocol", "Protocol version mismatch: {} != {}", pkt.protocol_version, BSC_PROTOCOL_VERSION);
+                if pkt.protocol_version != self.proto_version {
+                    tracing::warn!(target: "bsc_protocol", "Protocol version mismatch: {} != {}", pkt.protocol_version, self.proto_version);
                     return Poll::Ready(None);
                 }
 
@@ -177,7 +267,8 @@ impl BscProtocolConnection {
     }
 
     /// Handle normal protocol messages after handshake
-    fn handle_protocol_message(&self, frame: &BytesMut) {
+    fn handle_protocol_message(&mut self, frame: &BytesMut) -> Option<BytesMut> {
+        tracing::debug!(target: "bsc_protocol", "Handshake completed, processing normal message");
         let slice = frame.as_ref();
         let msg_id = slice[0];
 
@@ -190,14 +281,79 @@ impl BscProtocolConnection {
                         let count = packet.0.len();
                         handle_votes_broadcast(packet);
                         tracing::trace!(target: "bsc_protocol", count, "Processed votes packet");
+                        None
                     }
                     Err(e) => {
                         tracing::warn!(target: "bsc_protocol", error = %e, "Failed to decode VotesPacket");
+                        None
+                    }
+                }
+            }
+            x if x == BscProtoMessageId::GetBlocksByRange as u8 => {
+                tracing::debug!(target: "bsc_protocol", "Processing GetBlocksByRange request");
+                match GetBlocksByRangePacket::decode(&mut &slice[..]) {
+                    Ok(req) => {
+                        if req.count == 0 || req.count > MAX_REQUEST_RANGE_BLOCKS_COUNT {
+                            tracing::warn!(
+                                target: "bsc_protocol",
+                                count = req.count,
+                                "Invalid GetBlocksByRange count; ignoring"
+                            );
+                            return None;
+                        }
+
+                        let resp = build_blocks_by_range_response(&req);
+                        let encoded = Self::encode_command(BscCommand::BlocksByRange(resp));
+                        tracing::debug!(target: "bsc_protocol", "Replying BlocksByRange for request");
+                        Some(encoded)
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "bsc_protocol", error = %e, "Failed to decode GetBlocksByRangePacket");
+                        None
+                    }
+                }
+            }
+            x if x == BscProtoMessageId::BlocksByRange as u8 => {
+                tracing::debug!(target: "bsc_protocol", "Processing BlocksByRange response");
+                match BlocksByRangePacket::decode(&mut &slice[..]) {
+                    Ok(res) => {
+                        tracing::debug!(
+                            target: "bsc_protocol",
+                            req_id = res.request_id,
+                            blocks = res.blocks.len(),
+                            "Received BlocksByRange"
+                        );
+                // Forward blocks to import path (iterate oldest -> newest)
+                if let Some(sender) = crate::shared::get_block_import_sender() {
+                    if let Some(peer) = self.peer_id {
+                        for block in res.blocks.iter().rev() {
+                            let nb = BscNewBlock(NewBlock { block: block.clone(), td: U128::from(0u64) });
+                            let hash = nb.0.block.header.hash_slow();
+                            let msg = NewBlockMessage { hash, block: Arc::new(nb) };
+                            let _ = sender.send((msg, peer));
+                        }
+                    } else {
+                        tracing::debug!(target: "bsc_protocol", "No peer_id associated with connection; dropping range import forward");
+                    }
+                } else {
+                    tracing::debug!(target: "bsc_protocol", "Block import sender not available; dropping range import forward");
+                }
+                        if let Some((waiter, _)) = self.pending_range_reqs.remove(&res.request_id) {
+                            let _ = waiter.send(Ok(res));
+                        } else {
+                            tracing::trace!(target: "bsc_protocol", "No waiter for request_id; dropping BlocksByRange");
+                        }
+                        None
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "bsc_protocol", error = %e, "Failed to decode BlocksByRangePacket");
+                        None
                     }
                 }
             }
             _ => {
                 tracing::debug!(target: "bsc_protocol", msg_id = format_args!("{:#04x}", msg_id), "Unknown BSC message id");
+                None
             }
         }
     }
@@ -242,8 +398,9 @@ impl Stream for BscProtocolConnection {
                     Poll::Ready(None) => return Poll::Ready(None), // Handshake failed
                     Poll::Pending => return Poll::Pending,
                 }
+            } else if let Some(response) = this.handle_protocol_message(&raw_frame) {
+                return Poll::Ready(Some(response));
             } else {
-                this.handle_protocol_message(&raw_frame);
                 // After handshake, check if there are more messages to process
                 // If not, we'll loop back and check for commands/incoming frames
                 continue;

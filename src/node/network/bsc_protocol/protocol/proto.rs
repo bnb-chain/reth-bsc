@@ -1,32 +1,39 @@
 use reth_eth_wire::{protocol::Protocol, Capability};
 
-/// BSC protocol version we support
-pub const BSC_PROTOCOL_VERSION: u64 = 1;
+// Note: Version 2 adds GetBlocksByRange/BlocksByRange messages (0x02/0x03).
 
 /// BSC protocol name
 pub const BSC_PROTOCOL_NAME: &str = "bsc";
 
-/// Number of message types supported (strict parity subset)
-/// 0x00: Capability
-/// 0x01: Votes
-pub const BSC_MESSAGE_COUNT: u8 = 2;
+/// Message counts for supported versions.
+pub const BSC_MESSAGE_COUNT_V1: u8 = 2; // Capability + Votes
+pub const BSC_MESSAGE_COUNT_V2: u8 = 4; // + GetBlocksByRange + BlocksByRange
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BscProtoMessageId {
     Capability = 0x00,
     Votes = 0x01,
+    GetBlocksByRange = 0x02,
+    BlocksByRange = 0x03,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BscProtoMessage;
 
 impl BscProtoMessage {
-    /// Returns the capability for the `bsc` protocol version 1.
-    pub fn capability() -> Capability { Capability::new_static(BSC_PROTOCOL_NAME, BSC_PROTOCOL_VERSION as usize) }
+    /// Returns the capability for the `bsc` protocol version.
+    pub fn capability_for(version: u64) -> Capability { Capability::new_static(BSC_PROTOCOL_NAME, version as usize) }
 
-    /// Returns the protocol for the `bsc` protocol.
-    pub fn protocol() -> Protocol { Protocol::new(Self::capability(), BSC_MESSAGE_COUNT) }
+    /// Returns the protocol for the `bsc` protocol with the message count for the given version.
+    pub fn protocol_for(version: u64) -> Protocol {
+        let count = match version {
+            1 => BSC_MESSAGE_COUNT_V1,
+            2 => BSC_MESSAGE_COUNT_V2,
+            _ => BSC_MESSAGE_COUNT_V1,
+        };
+        Protocol::new(Self::capability_for(version), count)
+    }
 }
 
 #[cfg(test)]

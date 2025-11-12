@@ -203,6 +203,36 @@ where
                 "Requesting block download by simulating FCU for NewBlockHashes"
             );
 
+            // Try quick range fetch via BSC subprotocol (mimic geth asyncFetchRangeBlocks)
+            // Prefer the announcing peer; if it doesn't have bsc extension, fallback to any bsc peer.
+            {
+                let start_height = hash_number.number;
+                let start_hash = hash_number.hash;
+                let announcing_peer = peer_id;
+                // Resolve target bsc peer
+                let target_peer = if crate::node::network::bsc_protocol::registry::has_registered_peer(announcing_peer) {
+                    Some(announcing_peer)
+                } else {
+                    crate::node::network::bsc_protocol::registry::list_registered_peers().into_iter().next()
+                };
+                if let Some(bsc_peer) = target_peer {
+                    tokio::spawn(async move {
+                        use std::time::Duration;
+                        // Bump request timeout to 1000ms to accommodate slower peers
+                        let req_timeout = Duration::from_millis(1000);
+                        let import_timeout = Duration::from_millis(2000);
+                        let _ = crate::node::network::bsc_protocol::registry::batch_request_range_and_await_import(
+                            bsc_peer,
+                            start_height,
+                            start_hash,
+                            1,
+                            req_timeout,
+                            import_timeout,
+                        ).await;
+                    });
+                }
+            }
+
             let forkchoice_state = ForkchoiceState {
                 head_block_hash: hash_number.hash,
                 safe_block_hash: B256::ZERO, 
@@ -268,6 +298,10 @@ where
             if let Some(outcome) = outcome {
                 if let Ok(BlockValidation::ValidBlock { block }) = &outcome.result {
                     this.processed_blocks.insert(block.hash);
+                    // Cache the full block body for later range responses.
+                    crate::shared::cache_full_block(block.block.0.block.clone());
+                    // Notify listeners about the imported block hash for event-driven waits
+                    crate::shared::notify_block_imported(block.hash);
                     // If from proxied validators, target EVN peers with ETH NewBlockHashes.
                     if let Some(cfg) = crate::node::network::evn::get_global_evn_config() {
                         let header_ref = &block.block.0.block.header;

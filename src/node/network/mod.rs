@@ -30,6 +30,7 @@ pub mod evn;
 pub mod evn_peers;
 pub(crate) mod upgrade_status;
 pub(crate) mod votes;
+pub(crate) mod blocks_by_range;
 pub(crate) mod bsc_protocol {
     pub mod protocol {
         pub mod handler;
@@ -224,7 +225,38 @@ impl BscNetworkBuilder {
         // Clone needed values before moving into the async closure
         let provider = ctx.provider().clone();
         let chain_spec = ctx.chain_spec().clone();
-        
+
+        // Install a cached full block provider so that BSC BlocksByRange replies
+        // can include full bodies if they were recently imported. External callers
+        // can override by setting a richer provider before network starts.
+        {
+            use reth_provider::{HeaderProvider, BlockNumReader};
+            struct CachedFullBlockProvider<P> { inner: P }
+            impl<P> crate::shared::FullBlockProvider for CachedFullBlockProvider<P>
+            where
+                P: HeaderProvider<Header = alloy_consensus::Header> + BlockNumReader + Clone + Send + Sync + 'static,
+            {
+                fn block_by_hash(&self, hash: &alloy_primitives::B256) -> Option<crate::node::primitives::BscBlock> {
+                    crate::shared::get_cached_block_by_hash(hash).or_else(|| {
+                        self.inner.header(hash).ok().flatten().map(|h| crate::node::primitives::BscBlock {
+                            header: h,
+                            body: crate::node::primitives::BscBlockBody { inner: reth_ethereum_primitives::BlockBody::default(), sidecars: None },
+                        })
+                    })
+                }
+                fn block_by_number(&self, number: u64) -> Option<crate::node::primitives::BscBlock> {
+                    crate::shared::get_cached_block_by_number(number).or_else(|| {
+                        self.inner.header_by_number(number).ok().flatten().map(|h| crate::node::primitives::BscBlock {
+                            header: h,
+                            body: crate::node::primitives::BscBlockBody { inner: reth_ethereum_primitives::BlockBody::default(), sidecars: None },
+                        })
+                    })
+                }
+            }
+
+            let _ = crate::shared::set_full_block_provider(Arc::new(CachedFullBlockProvider { inner: provider.clone() }));
+        }
+
         // Spawn the critical ImportService task exactly like the official implementation
         ctx.task_executor().spawn_critical("block import", async move {
             let handle = engine_handle_rx
@@ -254,7 +286,9 @@ impl BscNetworkBuilder {
             .block_import(Box::new(BscBlockImport::new(handle)))
             .discovery(discv4)
             .eth_rlpx_handshake(Arc::new(BscHandshake::default()))
-            .add_rlpx_sub_protocol(bsc_protocol::protocol::handler::BscProtocolHandler);
+            // Advertise both bsc/2 (with range messages) and bsc/1 (votes only)
+            .add_rlpx_sub_protocol(bsc_protocol::protocol::handler::BscProtocolHandlerV2)
+            .add_rlpx_sub_protocol(bsc_protocol::protocol::handler::BscProtocolHandlerV1);
         
         let peer_id = network_builder.get_peer_id();
         let mut network_config = ctx.build_network_config(network_builder);

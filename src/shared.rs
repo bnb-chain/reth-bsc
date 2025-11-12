@@ -1,6 +1,6 @@
 use crate::consensus::parlia::SnapshotProvider;
 use std::sync::{Arc, OnceLock};
-use alloy_consensus::Header;
+use alloy_consensus::{Header, BlockHeader};
 use alloy_primitives::B256;
 use reth_provider::{HeaderProvider, BlockNumReader};
 use crate::node::network::BscNetworkPrimitives;
@@ -13,6 +13,10 @@ use parking_lot::Mutex;
 use std::collections::VecDeque;
 use reth_payload_builder_primitives::Events;
 use crate::node::engine_api::payload::BscPayloadTypes;
+use crate::node::primitives::BscBlock;
+use std::sync::RwLock;
+use schnellru::{LruMap, ByLength};
+use tokio::sync::broadcast;
 
 /// Function type for HeaderProvider::header() access (by hash)
 type HeaderByHashFn = Arc<dyn Fn(&B256) -> Option<Header> + Send + Sync>;
@@ -58,6 +62,8 @@ static NETWORK_HANDLE: OnceLock<NetworkHandle<BscNetworkPrimitives>> = OnceLock:
 
 /// Global payload events broadcast sender
 static PAYLOAD_EVENTS_TX: OnceLock<broadcast::Sender<Events<BscPayloadTypes>>> = OnceLock::new();
+/// Broadcast channel for notifying about successfully imported block hashes
+static IMPORTED_BLOCKS_TX: OnceLock<broadcast::Sender<B256>> = OnceLock::new();
 
 /// Trait for fork choice engine operations that can be stored globally
 pub trait ForkChoiceEngineTrait: Send + Sync {
@@ -80,6 +86,36 @@ where
 
 /// Global fork choice engine instance
 static FORK_CHOICE_ENGINE: OnceLock<Box<dyn ForkChoiceEngineTrait>> = OnceLock::new();
+
+/// Trait for full block access (header + body + sidecars)
+pub trait FullBlockProvider: Send + Sync {
+    fn block_by_hash(&self, hash: &B256) -> Option<BscBlock>;
+    fn block_by_number(&self, number: u64) -> Option<BscBlock>;
+}
+
+/// Global full block provider instance
+static FULL_BLOCK_PROVIDER: OnceLock<Arc<dyn FullBlockProvider + Send + Sync>> = OnceLock::new();
+
+/// In-memory cache for recently seen full blocks (hash -> block), and number -> hash mapping.
+/// This allows answering range requests with full bodies if they were recently imported.
+static BODY_CACHE: OnceLock<RwLock<BodyCache>> = OnceLock::new();
+
+/// Max number of full blocks to store in the in-memory body cache
+const BODY_CACHE_CAPACITY: usize = 512;
+
+struct BodyCache {
+    by_hash: LruMap<B256, BscBlock, ByLength>,
+    by_number: LruMap<u64, B256, ByLength>,
+}
+
+impl Default for BodyCache {
+    fn default() -> Self {
+        Self {
+            by_hash: LruMap::new(ByLength::new(BODY_CACHE_CAPACITY.try_into().unwrap())),
+            by_number: LruMap::new(ByLength::new(BODY_CACHE_CAPACITY.try_into().unwrap())),
+        }
+    }
+}
 
 /// Store the snapshot provider globally
 pub fn set_snapshot_provider(provider: Arc<dyn SnapshotProvider + Send + Sync>) -> Result<(), Arc<dyn SnapshotProvider + Send + Sync>> {
@@ -141,7 +177,7 @@ where
         }
     });
     BEST_TD_PROVIDER.set(best_td_fn).map_err(|_| "Failed to set best td provider")?;
-    
+
     Ok(())
 }
 
@@ -270,4 +306,145 @@ where
 /// Get a reference to the global fork choice engine.
 pub fn get_fork_choice_engine() -> Option<&'static dyn ForkChoiceEngineTrait> {
     FORK_CHOICE_ENGINE.get().map(|b| &**b)
+}
+
+/// Get or initialize the imported blocks broadcast sender
+fn imported_blocks_sender() -> broadcast::Sender<B256> {
+    IMPORTED_BLOCKS_TX
+        .get_or_init(|| broadcast::channel::<B256>(128).0)
+        .clone()
+}
+
+/// Subscribe to imported block hash notifications
+pub fn subscribe_imported_blocks() -> broadcast::Receiver<B256> {
+    imported_blocks_sender().subscribe()
+}
+
+/// Notify listeners that a block with the given hash has been imported
+pub fn notify_block_imported(hash: B256) {
+    let _ = imported_blocks_sender().send(hash);
+}
+
+/// Set the global full block provider
+pub fn set_full_block_provider(provider: Arc<dyn FullBlockProvider + Send + Sync>) -> Result<(), Arc<dyn FullBlockProvider + Send + Sync>> {
+    FULL_BLOCK_PROVIDER.set(provider)
+}
+
+/// Try to get a full block by hash from the global provider
+pub fn get_full_block_by_hash(hash: &B256) -> Option<BscBlock> {
+    FULL_BLOCK_PROVIDER.get().and_then(|p| p.block_by_hash(hash))
+}
+
+/// Try to get a full block by number from the global provider
+pub fn get_full_block_by_number(number: u64) -> Option<BscBlock> {
+    FULL_BLOCK_PROVIDER.get().and_then(|p| p.block_by_number(number))
+}
+
+/// A closure-based full block provider for easy integration.
+pub struct ClosureFullBlockProvider<ByHash, ByNumber>
+where
+    ByHash: Fn(&B256) -> Option<BscBlock> + Send + Sync + 'static,
+    ByNumber: Fn(u64) -> Option<BscBlock> + Send + Sync + 'static,
+{
+    by_hash: ByHash,
+    by_number: ByNumber,
+}
+
+impl<ByHash, ByNumber> ClosureFullBlockProvider<ByHash, ByNumber>
+where
+    ByHash: Fn(&B256) -> Option<BscBlock> + Send + Sync + 'static,
+    ByNumber: Fn(u64) -> Option<BscBlock> + Send + Sync + 'static,
+{
+    pub fn new(by_hash: ByHash, by_number: ByNumber) -> Self { Self { by_hash, by_number } }
+}
+
+impl<ByHash, ByNumber> FullBlockProvider for ClosureFullBlockProvider<ByHash, ByNumber>
+where
+    ByHash: Fn(&B256) -> Option<BscBlock> + Send + Sync + 'static,
+    ByNumber: Fn(u64) -> Option<BscBlock> + Send + Sync + 'static,
+{
+    fn block_by_hash(&self, hash: &B256) -> Option<BscBlock> { (self.by_hash)(hash) }
+    fn block_by_number(&self, number: u64) -> Option<BscBlock> { (self.by_number)(number) }
+}
+
+/// Helper to install a closure-based full block provider.
+pub fn set_full_block_provider_from_closures<ByHash, ByNumber>(
+    by_hash: ByHash,
+    by_number: ByNumber,
+) -> Result<(), Arc<dyn FullBlockProvider + Send + Sync>>
+where
+    ByHash: Fn(&B256) -> Option<BscBlock> + Send + Sync + 'static,
+    ByNumber: Fn(u64) -> Option<BscBlock> + Send + Sync + 'static,
+{
+    set_full_block_provider(Arc::new(ClosureFullBlockProvider::new(by_hash, by_number)))
+}
+
+/// Inserts a full block into the in-memory body cache.
+pub fn cache_full_block(block: BscBlock) {
+    let cache = BODY_CACHE.get_or_init(|| RwLock::new(BodyCache::default()));
+    if let Ok(mut guard) = cache.write() {
+        let hash = block.header.hash_slow();
+        let number = block.header.number();
+        guard.by_number.insert(number, hash);
+        guard.by_hash.insert(hash, block);
+    }
+}
+
+/// Fetch a full block from the in-memory body cache by hash.
+pub fn get_cached_block_by_hash(hash: &B256) -> Option<BscBlock> {
+    let cache = BODY_CACHE.get_or_init(|| RwLock::new(BodyCache::default()));
+    if let Ok(mut guard) = cache.write() {
+        if let Some(block) = guard.by_hash.get(hash) {
+            return Some(block.clone());
+        }
+    }
+    None
+}
+
+/// Fetch a full block from the in-memory body cache by number.
+pub fn get_cached_block_by_number(number: u64) -> Option<BscBlock> {
+    let cache = BODY_CACHE.get_or_init(|| RwLock::new(BodyCache::default()));
+    if let Ok(mut guard) = cache.write() {
+        if let Some(h_ref) = guard.by_number.get(&number) {
+            let h = *h_ref;
+            if let Some(block) = guard.by_hash.get(&h) {
+                return Some(block.clone());
+            }
+        }
+    }
+    None
+}
+
+/// Clear the body cache (primarily for testing)
+#[cfg(test)]
+pub fn clear_body_cache() {
+    let cache = BODY_CACHE.get_or_init(|| RwLock::new(BodyCache::default()));
+    if let Ok(mut guard) = cache.write() {
+        *guard = BodyCache::default();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_consensus::Header;
+    use crate::BscBlockBody;
+
+    fn mk_block(num: u64, parent: B256) -> BscBlock {
+        let header = Header { parent_hash: parent, number: num, ..Default::default() };
+        BscBlock { header, body: BscBlockBody { inner: reth_ethereum_primitives::BlockBody::default(), sidecars: None } }
+    }
+
+    #[test]
+    fn test_body_cache_put_and_get() {
+        let genesis = mk_block(0, B256::ZERO);
+        let ghash = genesis.header.hash_slow();
+        cache_full_block(genesis.clone());
+        assert_eq!(get_cached_block_by_hash(&ghash).unwrap().header.hash_slow(), ghash);
+        assert_eq!(get_cached_block_by_number(0).unwrap().header.hash_slow(), ghash);
+    }
+
+    // Note: eviction behavior depends on access patterns; an exhaustive eviction
+    // test would be flaky here without introspecting the LRU. The cache is covered
+    // by basic put/get tests above.
 }

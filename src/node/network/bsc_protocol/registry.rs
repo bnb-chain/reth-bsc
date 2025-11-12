@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use once_cell::sync::Lazy;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::sync::broadcast;
 
@@ -11,6 +12,11 @@ use reth_network_api::PeerId;
 
 use super::stream::BscCommand;
 use reth_network::Peers;
+use crate::node::network::blocks_by_range::{GetBlocksByRangePacket, BlocksByRangePacket, MAX_REQUEST_RANGE_BLOCKS_COUNT};
+use alloy_primitives::B256;
+use std::time::Duration;
+use tokio::time::timeout;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Global registry of active BSC protocol senders per peer.
 static REGISTRY: Lazy<RwLock<HashMap<PeerId, UnboundedSender<BscCommand>>>> =
@@ -33,6 +39,104 @@ pub fn register_peer(peer: PeerId, tx: UnboundedSender<BscCommand>) {
             tracing::error!(target: "bsc::registry", error=%e, "Registry lock poisoned (register)");
         }
     }
+}
+
+/// Snapshot the currently registered BSC protocol peers
+pub fn list_registered_peers() -> Vec<PeerId> {
+    match REGISTRY.read() {
+        Ok(guard) => guard.keys().copied().collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Returns true if the given peer is registered with the BSC subprotocol
+pub fn has_registered_peer(peer: PeerId) -> bool {
+    match REGISTRY.read() {
+        Ok(guard) => guard.contains_key(&peer),
+        Err(_) => false,
+    }
+}
+
+/// Simple request id generator for GetBlocksByRange
+static REQ_COUNTER: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(1));
+
+/// Request blocks by range from a specific peer. Returns response or timeout error.
+pub async fn request_blocks_by_range(
+    peer: PeerId,
+    start_height: u64,
+    start_hash: B256,
+    count: u64,
+    timeout_dur: Duration,
+) -> Result<BlocksByRangePacket, String> {
+    if count == 0 || count > MAX_REQUEST_RANGE_BLOCKS_COUNT {
+        return Err(format!("invalid count {}", count));
+    }
+
+    let tx = {
+        let guard = REGISTRY.read();
+        match guard {
+            Ok(g) => g.get(&peer).cloned(),
+            Err(_) => None,
+        }
+    }.ok_or_else(|| "peer not registered for bsc protocol".to_string())?;
+
+    let request_id = REQ_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let (resp_tx, resp_rx) = oneshot::channel();
+    let packet = GetBlocksByRangePacket { request_id, start_block_height: start_height, start_block_hash: start_hash, count };
+    tx.send(BscCommand::GetBlocksByRange(packet, resp_tx))
+        .map_err(|_| "failed to send GetBlocksByRange command".to_string())?;
+
+    match timeout(timeout_dur, resp_rx).await {
+        Ok(Ok(Ok(res))) => Ok(res),
+        Ok(Ok(Err(e))) => Err(e),
+        Ok(Err(_canceled)) => Err("request canceled".to_string()),
+        Err(_elapsed) => Err("request timed out".to_string()),
+    }
+}
+
+/// Batch request a range and wait for import of the returned blocks.
+/// Returns the list of imported block hashes in ascending order (oldest -> newest).
+pub async fn batch_request_range_and_await_import(
+    peer: PeerId,
+    start_height: u64,
+    start_hash: B256,
+    count: u64,
+    request_timeout: Duration,
+    per_block_import_timeout: Duration,
+) -> Result<Vec<B256>, String> {
+    let resp = request_blocks_by_range(peer, start_height, start_hash, count, request_timeout).await?;
+    let mut expected: Vec<B256> = resp.blocks.iter().map(|b| b.header.hash_slow()).collect();
+    // resp.blocks are newest-first; normalize to oldest-first
+    expected.reverse();
+
+    let mut rx = crate::shared::subscribe_imported_blocks();
+    let mut imported: Vec<B256> = Vec::with_capacity(expected.len());
+
+    for h in expected.iter().copied() {
+        // Fast path: already canonical
+        if crate::shared::get_canonical_header_by_hash(&h).is_some() {
+            imported.push(h);
+            continue;
+        }
+        // Wait on imported-blocks broadcast for this specific hash
+        let deadline = tokio::time::Instant::now() + per_block_import_timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(format!("import timeout for block {h:?}"));
+            }
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Ok(seen)) => {
+                    if seen == h { imported.push(h); break; }
+                    // else keep waiting for our target
+                }
+                Ok(Err(_closed)) => return Err("import notification channel closed".to_string()),
+                Err(_elapsed) => return Err(format!("import timeout for block {h:?}")),
+            }
+        }
+    }
+
+    Ok(imported)
 }
 
 /// Broadcast votes to all connected peers.
