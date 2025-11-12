@@ -519,6 +519,10 @@ where
         let tx_hash = tx.tx().trie_hash();
         let tx_ref = tx.tx().clone();
         
+        // Get transaction gas parameters
+        let tx_gas_price = tx.tx().gas_price().unwrap_or(0);
+        let tx_gas_limit = tx.tx().gas_limit();
+        
         // Log SYSTEM_ADDRESS balance before transaction
         let system_balance_before_tx = self.evm.db_mut()
             .load_cache_account(crate::consensus::SYSTEM_ADDRESS)
@@ -550,19 +554,25 @@ where
         
         let balance_change = system_balance_after_tx.saturating_sub(system_balance_before_tx);
         
-        if balance_change > 0 {
-            info!(
-                target: "bsc::executor::tx",
-                block_number = self.evm.block().number.to::<u64>(),
-                tx_index = self.receipts.len(),
-                tx_hash = ?tx_hash,
-                gas_used,
-                system_balance_before = %system_balance_before_tx,
-                system_balance_after = %system_balance_after_tx,
-                balance_increase = %balance_change,
-                "Transaction increased SYSTEM_ADDRESS balance (gas fees)"
-            );
-        }
+        // Calculate expected gas fee
+        let expected_gas_fee = U256::from(gas_used) * U256::from(tx_gas_price);
+        
+        // Always log for debugging (remove condition)
+        info!(
+            target: "bsc::executor::tx",
+            block_number = self.evm.block().number.to::<u64>(),
+            tx_index = self.receipts.len(),
+            tx_hash = ?tx_hash,
+            gas_price = tx_gas_price,
+            gas_limit = tx_gas_limit,
+            gas_used,
+            expected_gas_fee = %expected_gas_fee,
+            system_balance_before = %system_balance_before_tx,
+            system_balance_after = %system_balance_after_tx,
+            balance_change = %balance_change,
+            cumulative_gas_used = self.gas_used,
+            "Transaction SYSTEM_ADDRESS balance change"
+        );
         
         self.receipts.push(self.receipt_builder.build_receipt(ReceiptBuilderCtx {
             tx: &tx_ref,
@@ -612,12 +622,18 @@ where
             .map(|info| info.balance)
             .unwrap_or_default();
         
+        // Get block basefee for gas fee calculation
+        let block_basefee = self.evm.block().basefee;
+        
         info!(
             target: "bsc::executor::finish",
             block_number = self.evm.block().number.to::<u64>(),
             is_miner = self.ctx.is_miner,
+            total_tx_count = self.receipts.len(),
+            cumulative_gas_used = self.gas_used,
+            block_basefee,
             system_balance_before_post = %system_balance_before_post,
-            "SYSTEM_ADDRESS balance BEFORE post_check_new_block/finalize_new_block"
+            "SYSTEM_ADDRESS balance BEFORE post_check_new_block/finalize_new_block (All transactions executed)"
         );
 
         if self.ctx.is_miner {

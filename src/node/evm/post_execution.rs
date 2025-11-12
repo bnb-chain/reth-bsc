@@ -523,6 +523,21 @@ where
             "Calling transact_system_tx for distribute_to_validator (FINAL VALUE)"
         );
         
+        // For block 67892488, compare with BSCScan expected value
+        if block_number == 67892488 {
+            let expected_value = U256::from(1176192797317251u128);
+            let block_reward_u256 = U256::from(block_reward);
+            let difference = expected_value.saturating_sub(block_reward_u256);
+            tracing::info!(
+                target: "bsc::distribute",
+                block_number,
+                expected_from_bscscan = %expected_value,
+                actual_calculated = %block_reward_u256,
+                difference = %difference,
+                "BSCScan comparison for block 67892488"
+            );
+        }
+        
         self.transact_system_tx(tx, validator)?;
         tracing::debug!("Distribute to validator, block_number: {}, block_reward: {}", self.evm.block().number, block_reward);
         
