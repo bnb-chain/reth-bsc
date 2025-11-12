@@ -45,7 +45,24 @@ where
         &mut self, 
         block: &BlockEnv
     ) -> Result<(), BlockExecutionError> {
-        tracing::debug!("Start to post check new block, block_number: {}, is_miner: {}", block.number, self.ctx.is_miner); 
+        tracing::debug!("Start to post check new block, block_number: {}, is_miner: {}", block.number, self.ctx.is_miner);
+        
+        // Log SYSTEM_ADDRESS balance at the start of post_check_new_block
+        let system_balance_at_start = self.evm
+            .db_mut()
+            .load_cache_account(crate::consensus::SYSTEM_ADDRESS)
+            .ok()
+            .and_then(|acc| acc.account_info())
+            .map(|info| info.balance)
+            .unwrap_or_default();
+        
+        tracing::info!(
+            target: "bsc::post_execution",
+            block_number = block.number.to::<u64>(),
+            system_balance_at_start = %system_balance_at_start,
+            "=== START post_check_new_block ==="
+        );
+        
         self.verify_validators(self.inner_ctx.current_validators.clone(), self.inner_ctx.header.clone())?;
         self.verify_turn_length(self.inner_ctx.header.clone())?;
 
