@@ -335,6 +335,21 @@ where
             history_contract_exists,
             "Prague hardfork check result and contract state"
         );
+        // Track SystemAddress balance before Prague operations
+        let system_balance_before_prague = self.evm.db_mut()
+            .load_cache_account(crate::consensus::SYSTEM_ADDRESS)
+            .ok()
+            .and_then(|acc| acc.account_info())
+            .map(|info| info.balance)
+            .unwrap_or_default();
+        
+        info!(
+            target: "bsc::executor::prague",
+            block_number = self.evm.block().number.to::<u64>(),
+            system_balance_before_prague = %system_balance_before_prague,
+            "SystemAddress balance BEFORE Prague operations"
+        );
+        
         if is_prague_transition {
                 debug!(
                     target: "bsc::executor::prague",
@@ -342,6 +357,21 @@ where
                     "Calling apply_history_storage_account (Prague transition)"
                 );
                 self.apply_history_storage_account(self.evm.block().number.to::<u64>())?;
+                
+                let system_balance_after_deploy = self.evm.db_mut()
+                    .load_cache_account(crate::consensus::SYSTEM_ADDRESS)
+                    .ok()
+                    .and_then(|acc| acc.account_info())
+                    .map(|info| info.balance)
+                    .unwrap_or_default();
+                
+                info!(
+                    target: "bsc::executor::prague",
+                    block_number = self.evm.block().number.to::<u64>(),
+                    system_balance_after_deploy = %system_balance_after_deploy,
+                    balance_change = %(system_balance_after_deploy.saturating_sub(system_balance_before_prague)),
+                    "SystemAddress balance AFTER apply_history_storage_account"
+                );
         }
         if is_prague_active {
             debug!(
@@ -350,8 +380,40 @@ where
                 parent_hash = ?self.ctx.base.parent_hash,
                 "Calling apply_blockhashes_contract_call (Prague active)"
             );
+            
+            let system_balance_before_call = self.evm.db_mut()
+                .load_cache_account(crate::consensus::SYSTEM_ADDRESS)
+                .ok()
+                .and_then(|acc| acc.account_info())
+                .map(|info| info.balance)
+                .unwrap_or_default();
+            
+            info!(
+                target: "bsc::executor::prague",
+                block_number = self.evm.block().number.to::<u64>(),
+                system_balance_before_call = %system_balance_before_call,
+                "SystemAddress balance BEFORE apply_blockhashes_contract_call"
+            );
+            
             self.system_caller
                 .apply_blockhashes_contract_call(self.ctx.base.parent_hash, &mut self.evm)?;
+            
+            let system_balance_after_call = self.evm.db_mut()
+                .load_cache_account(crate::consensus::SYSTEM_ADDRESS)
+                .ok()
+                .and_then(|acc| acc.account_info())
+                .map(|info| info.balance)
+                .unwrap_or_default();
+            
+            let gas_consumed = system_balance_before_call.saturating_sub(system_balance_after_call);
+            
+            info!(
+                target: "bsc::executor::prague",
+                block_number = self.evm.block().number.to::<u64>(),
+                system_balance_after_call = %system_balance_after_call,
+                gas_consumed = %gas_consumed,
+                "SystemAddress balance AFTER apply_blockhashes_contract_call (GAS CONSUMED!)"
+            );
         } else {
             trace!(
                 target: "bsc::executor::prague",
@@ -359,6 +421,21 @@ where
                 "Prague not active, skipping apply_blockhashes_contract_call"
             );
         }
+        
+        let system_balance_after_prague = self.evm.db_mut()
+            .load_cache_account(crate::consensus::SYSTEM_ADDRESS)
+            .ok()
+            .and_then(|acc| acc.account_info())
+            .map(|info| info.balance)
+            .unwrap_or_default();
+        
+        info!(
+            target: "bsc::executor::prague",
+            block_number = self.evm.block().number.to::<u64>(),
+            system_balance_after_prague = %system_balance_after_prague,
+            total_balance_change = %(system_balance_after_prague.saturating_sub(system_balance_before_prague)),
+            "SystemAddress balance AFTER all Prague operations"
+        );
 
         Ok(())
     }
