@@ -557,30 +557,36 @@ where
         // Calculate expected gas fee
         let expected_gas_fee = U256::from(gas_used) * U256::from(tx_gas_price);
         
-        // Always log for debugging (remove condition)
-        info!(
-            target: "bsc::executor::tx",
-            block_number = self.evm.block().number.to::<u64>(),
-            tx_index = self.receipts.len(),
-            tx_hash = ?tx_hash,
-            gas_price = tx_gas_price,
-            gas_limit = tx_gas_limit,
-            gas_used,
-            expected_gas_fee = %expected_gas_fee,
-            system_balance_before = %system_balance_before_tx,
-            system_balance_after = %system_balance_after_tx,
-            balance_change = %balance_change,
-            cumulative_gas_used = self.gas_used,
-            "Transaction SYSTEM_ADDRESS balance change"
-        );
-        
-        self.receipts.push(self.receipt_builder.build_receipt(ReceiptBuilderCtx {
+        // Build receipt first to get more details
+        let receipt = self.receipt_builder.build_receipt(ReceiptBuilderCtx {
             tx: &tx_ref,
             evm: &self.evm,
             result,
             state: &state,
             cumulative_gas_used: self.gas_used,
-        }));
+        });
+        
+        // Log transaction details including receipt info
+        info!(
+            target: "bsc::executor::tx",
+            block_number = self.evm.block().number.to::<u64>(),
+            tx_index = self.receipts.len(),
+            tx_hash = ?tx_hash,
+            tx_to = ?tx_ref.to(),
+            tx_value = %tx_ref.value(),
+            gas_price = tx_gas_price,
+            gas_limit = tx_gas_limit,
+            gas_used,
+            receipt_gas_used = receipt.cumulative_gas_used(),
+            expected_gas_fee = %expected_gas_fee,
+            system_balance_before = %system_balance_before_tx,
+            system_balance_after = %system_balance_after_tx,
+            balance_change = %balance_change,
+            cumulative_gas_used = self.gas_used,
+            "Transaction executed"
+        );
+        
+        self.receipts.push(receipt);
         self.evm.db_mut().commit(state);
 
         self.hertz_patch_manager.patch_after_tx(&tx_ref, self.evm.db_mut())?;
@@ -624,6 +630,18 @@ where
         
         // Get block basefee for gas fee calculation
         let block_basefee = self.evm.block().basefee;
+        
+        // Log all receipts for debugging
+        for (idx, receipt) in self.receipts.iter().enumerate() {
+            // Note: We can't easily get the gas_price from receipt, so this is approximate
+            info!(
+                target: "bsc::executor::receipt",
+                block_number = self.evm.block().number.to::<u64>(),
+                receipt_index = idx,
+                cumulative_gas_used = receipt.cumulative_gas_used(),
+                "Receipt summary"
+            );
+        }
         
         info!(
             target: "bsc::executor::finish",
