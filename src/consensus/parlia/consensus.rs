@@ -691,6 +691,13 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
         let buf = alloy_rlp::encode(&attestation);
         extra_data.extend_from_slice(buf.as_ref());
         current_header.extra_data = alloy_primitives::Bytes::from(extra_data);
+        
+        // Update metric: successfully assembled vote attestation
+        use once_cell::sync::Lazy;
+        use crate::metrics::BscVoteMetrics;
+        static VOTE_METRICS: Lazy<BscVoteMetrics> = Lazy::new(BscVoteMetrics::default);
+        VOTE_METRICS.votes_attested_total.increment(votes.len() as u64);
+        
         Ok(())
     }
 }

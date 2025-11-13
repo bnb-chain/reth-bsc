@@ -3,6 +3,7 @@ use crate::{
     consensus::{SYSTEM_ADDRESS, parlia::{VoteAddress, Snapshot, Parlia}},
     evm::transaction::BscTxEnv,
     hardforks::BscHardforks,
+    metrics::{BscConsensusMetrics, BscBlockchainMetrics, BscVoteMetrics, BscExecutorMetrics, BscRewardsMetrics},
     system_contracts::{
         get_upgrade_system_contracts, is_system_transaction, SystemContract,
         feynman_fork::ValidatorElectionInfo,
@@ -90,6 +91,16 @@ where
     pub(super) inner_ctx: InnerExecutionContext,
     /// assembled system txs.
     pub(crate) assembled_system_txs: SystemTxs,
+    /// Consensus metrics for tracking block height and other consensus stats.
+    pub(super) consensus_metrics: BscConsensusMetrics,
+    /// Blockchain metrics for tracking receipts and block processing.
+    pub(super) blockchain_metrics: BscBlockchainMetrics,
+    /// Vote metrics for tracking attestation errors.
+    pub(super) vote_metrics: BscVoteMetrics,
+    /// Executor metrics for tracking block execution.
+    pub(super) executor_metrics: BscExecutorMetrics,
+    /// Rewards metrics for tracking reward distributions.
+    pub(super) rewards_metrics: BscRewardsMetrics,
 }
 
 impl<'a, DB, EVM, Spec, R: ReceiptBuilder> BscBlockExecutor<'a, EVM, Spec, R>
@@ -150,6 +161,11 @@ where
                 parent_header: None,
             },
             assembled_system_txs: vec![],
+            consensus_metrics: BscConsensusMetrics::default(),
+            blockchain_metrics: BscBlockchainMetrics::default(),
+            vote_metrics: BscVoteMetrics::default(),
+            executor_metrics: BscExecutorMetrics::default(),
+            rewards_metrics: BscRewardsMetrics::default(),
         }
     }
 
@@ -290,6 +306,11 @@ where
             is_miner = self.ctx.is_miner,
             "Start to apply_pre_execution_changes"
         );
+        
+        // Update current block height and header height metrics
+        let block_number = block_env.number.to::<u64>();
+        self.consensus_metrics.current_block_height.set(block_number as f64);
+        self.consensus_metrics.current_header_height.set(block_number as f64);
         
         // pre check and prepare some intermediate data for commit parlia snapshot in finish function.
         if self.ctx.is_miner {
@@ -512,6 +533,40 @@ where
             block_number = self.evm.block().number.to::<u64>(),
             "Merged transitions into bundle state before finish"
         );
+
+        // Update receipt height metric
+        let block_number = self.evm.block().number.to::<u64>();
+        self.blockchain_metrics.current_receipt_height.set(block_number as f64);
+        
+        // Update block execution metrics
+        self.executor_metrics.executed_blocks_total.increment(1);
+        
+        // Update block insert metrics
+        // Calculate total transaction size in bytes (simplified estimation)
+        // Each receipt contributes approximately: 
+        // - Base tx overhead: ~100 bytes
+        // - Per log: ~100 bytes (address + topics + data average)
+        let tx_size_bytes: usize = self.receipts.iter()
+            .map(|r| {
+                let logs_count = r.logs().len();
+                100 + logs_count * 100 // Base + logs estimation
+            })
+            .sum();
+        self.blockchain_metrics.block_tx_size_bytes.set(tx_size_bytes as f64);
+        
+        // Calculate block receive time difference
+        // This is the difference between current block timestamp and parent block timestamp
+        let current_timestamp = self.evm.block().timestamp.to::<u64>();
+        if let Some(parent_header) = &self.inner_ctx.parent_header {
+            let parent_timestamp = parent_header.timestamp;
+            let time_diff = (current_timestamp as i64) - (parent_timestamp as i64);
+            self.blockchain_metrics.block_receive_time_diff_seconds.set(time_diff as f64);
+        }
+        
+        // Note: For gas-related metrics, use reth's ExecutorMetrics:
+        // - sync.execution.gas_used_histogram
+        // - sync.execution.gas_per_second (can be converted to MGas/s)
+        // - sync.execution.execution_duration
 
         Ok((
             self.evm,

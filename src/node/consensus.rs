@@ -7,6 +7,7 @@ use crate::{
         ParliaConsensusErr,
         parlia::{provider::EnhancedDbSnapshotProvider, Parlia, util::calculate_millisecond_timestamp, BscForkChoiceRule, HeaderForForkchoice},
     },
+    metrics::{BscFinalityMetrics, BscConsensusMetrics},
     shared,
 };
 use alloy_consensus::{Header, TxReceipt};
@@ -67,11 +68,17 @@ pub struct BscConsensus<ChainSpec> {
     base: EthBeaconConsensus<ChainSpec>,
     parlia: Arc<Parlia<ChainSpec>>,
     chain_spec: Arc<ChainSpec>,
+    consensus_metrics: BscConsensusMetrics,
 }
 
 impl<ChainSpec: EthChainSpec + BscHardforks + 'static> BscConsensus<ChainSpec> {
     pub fn new(chain_spec: Arc<ChainSpec>) -> Self {
-        Self { base: EthBeaconConsensus::new(chain_spec.clone()), parlia: Arc::new(Parlia::new(chain_spec.clone(), 200)), chain_spec }
+        Self { 
+            base: EthBeaconConsensus::new(chain_spec.clone()), 
+            parlia: Arc::new(Parlia::new(chain_spec.clone(), 200)), 
+            chain_spec,
+            consensus_metrics: BscConsensusMetrics::default(),
+        }
     }
 }
 
@@ -142,9 +149,10 @@ impl<ChainSpec: EthChainSpec<Header = Header> + BscHardforks + 'static> Consensu
         &self,
         block: &SealedBlock<BscBlock>,
     ) -> Result<(), ConsensusError> {
-        // tracing::debug!("Validating block pre-execution, block_number: {:?}", block.header().number);
-        self.parlia.validate_block_pre_execution(block)?;
-        Ok(())
+        let start = std::time::Instant::now();
+        let result = self.parlia.validate_block_pre_execution(block);
+        self.consensus_metrics.validation_duration_seconds.record(start.elapsed().as_secs_f64());
+        result
     }
 }
 
@@ -157,6 +165,8 @@ impl<ChainSpec: EthChainSpec<Header = Header> + BscHardforks + 'static> FullCons
         block: &RecoveredBlock<BscBlock>,
         result: &BlockExecutionResult<Receipt>,
     ) -> Result<(), ConsensusError> {
+        let start = std::time::Instant::now();
+        
         let receipts = &result.receipts;
         let requests = &result.requests;
         let chain_spec = &self.chain_spec;
@@ -165,6 +175,7 @@ impl<ChainSpec: EthChainSpec<Header = Header> + BscHardforks + 'static> FullCons
         let cumulative_gas_used =
             receipts.last().map(|receipt| receipt.cumulative_gas_used).unwrap_or(0);
         if block.header().gas_used != cumulative_gas_used {
+            self.consensus_metrics.validation_duration_seconds.record(start.elapsed().as_secs_f64());
             return Err(ConsensusError::BlockGasUsed {
                 gas: GotExpected { got: cumulative_gas_used, expected: block.header().gas_used },
                 gas_spent_by_tx: gas_spent_by_transactions(receipts),
@@ -183,6 +194,7 @@ impl<ChainSpec: EthChainSpec<Header = Header> + BscHardforks + 'static> FullCons
                     .map(|r| Bytes::from(r.with_bloom_ref().encoded_2718()))
                     .collect::<Vec<_>>();
                 tracing::debug!(%error, ?receipts, "receipts verification failed");
+                self.consensus_metrics.validation_duration_seconds.record(start.elapsed().as_secs_f64());
                 return Err(error)
             }
         }
@@ -190,16 +202,19 @@ impl<ChainSpec: EthChainSpec<Header = Header> + BscHardforks + 'static> FullCons
         // Validate that the header requests hash matches the calculated requests hash
         if chain_spec.is_prague_active_at_block_and_timestamp(block.header().number, block.header().timestamp) {
             let Some(header_requests_hash) = block.header().requests_hash else {
+                self.consensus_metrics.validation_duration_seconds.record(start.elapsed().as_secs_f64());
                 return Err(ConsensusError::RequestsHashMissing)
             };
             let requests_hash = requests.requests_hash();
             if requests_hash != header_requests_hash {
+                self.consensus_metrics.validation_duration_seconds.record(start.elapsed().as_secs_f64());
                 return Err(ConsensusError::BodyRequestsHashDiff(
                     GotExpected::new(requests_hash, header_requests_hash).into(),
                 ))
             }
         }
 
+        self.consensus_metrics.validation_duration_seconds.record(start.elapsed().as_secs_f64());
         Ok(())
     }
 }
@@ -298,6 +313,8 @@ pub struct BscForkChoiceEngine<P> {
     forkchoice_rule: Arc<BscForkChoiceRule>,
     /// Cache for header total difficulties
     header_td_cache: Arc<parking_lot::RwLock<schnellru::LruMap<B256, Option<alloy_primitives::U256>, schnellru::ByLength>>>,
+    /// Finality metrics
+    finality_metrics: BscFinalityMetrics,
 }
 
 impl<P> BscForkChoiceEngine<P>
@@ -316,6 +333,7 @@ where
             chain_spec: chain_spec.clone(),
             forkchoice_rule: Arc::new(BscForkChoiceRule::new(chain_spec)),
             header_td_cache: Arc::new(parking_lot::RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new(128)))),
+            finality_metrics: BscFinalityMetrics::default(),
         }
     }
 
@@ -363,6 +381,11 @@ where
         // ref: https://github.com/bnb-chain/bsc/blob/f70aaa8399ccee429804eecf3fc4c6fd8d9e6cab/eth/api_backend.go#L72
         let (safe_block_number, safe_block_hash) = self.get_justified_number_and_hash(new_canonical_head).unwrap_or((0, B256::ZERO));
         let (finalized_block_number, finalized_block_hash) = self.get_finalized_number_and_hash(new_canonical_head).unwrap_or((0, B256::ZERO));
+        
+        // Update finality metrics
+        self.finality_metrics.justified_block_height.set(safe_block_number as f64);
+        self.finality_metrics.safe_block_height.set(safe_block_number as f64);
+        self.finality_metrics.finalized_block_height.set(finalized_block_number as f64);
         
         let state = ForkchoiceState {
             head_block_hash: new_canonical_head.hash_slow(),

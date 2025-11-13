@@ -263,6 +263,12 @@ where
         transaction: Transaction, 
         sender: Address
     ) -> Result<(), BlockExecutionError> {
+        // Record system contract call
+        self.executor_metrics.system_contract_calls_total.increment(1);
+        
+        // Start timing for system contract duration
+        let start_time = std::time::Instant::now();
+        
         let account = self.evm
             .db_mut()
             .basic(sender)
@@ -289,6 +295,7 @@ where
                 for tx in self.system_txs.iter() {
                     warn!("left system tx: {:?}", tx);
                 }
+                self.executor_metrics.system_contract_errors_total.increment(1);
                 return Err(BscBlockExecutionError::Validation(
                     BscBlockValidationError::UnexpectedSystemTx
                 ).into());
@@ -299,11 +306,13 @@ where
                 Ok(signed) => Some(signed),
                 Err(e) => {
                     tracing::warn!("Failed to sign system transaction: {}", e);
+                    self.executor_metrics.system_contract_errors_total.increment(1);
                     return Err(BscBlockExecutionError::FailedToSignSystemTransaction { error: e.to_string() }.into());
                 }
             }
         } else {
             tracing::warn!("Global signer not initialized for mining mode");
+            self.executor_metrics.system_contract_errors_total.increment(1);
             return Err(BscBlockExecutionError::GlobalSignerNotInitializedForMiningMode.into());
         };
 
@@ -360,6 +369,9 @@ where
 
         let gas_used = result.gas_used();
         self.gas_used += gas_used;
+        
+        // Record system transaction gas usage
+        self.executor_metrics.system_tx_gas_used_total.increment(gas_used);
 
         self.receipts.push(self.receipt_builder.build_receipt(ReceiptBuilderCtx {
             tx: signed_tx.as_ref().unwrap(),
@@ -369,6 +381,10 @@ where
             cumulative_gas_used: self.gas_used,
         }));
         self.evm.db_mut().commit(state);
+
+        // Record system contract execution duration
+        let duration = start_time.elapsed();
+        self.executor_metrics.system_contract_duration_seconds.record(duration.as_secs_f64());
 
         Ok(())
     }
@@ -418,6 +434,11 @@ where
                 let tx = self.system_contracts.distribute_to_system(reward_to_system);
                 self.transact_system_tx(tx, validator)?;
                 tracing::debug!("Distribute to system, block_number: {}, reward_to_system: {}", self.evm.block().number, reward_to_system);
+                
+                // Track system rewards distribution
+                self.rewards_metrics.system_rewards_distributed_total.increment(1);
+                // Note: Truncating to u64 for metrics (large rewards unlikely)
+                self.rewards_metrics.system_rewards_amount_wei_total.increment(reward_to_system.min(u128::from(u64::MAX)) as u64);
             }
 
             block_reward -= reward_to_system;
@@ -427,6 +448,11 @@ where
         let tx = self.system_contracts.distribute_to_validator(validator, block_reward);
         self.transact_system_tx(tx, validator)?;
         tracing::debug!("Distribute to validator, block_number: {}, block_reward: {}", self.evm.block().number, block_reward);
+        
+        // Track validator rewards distribution
+        self.rewards_metrics.validator_rewards_distributed_total.increment(1);
+        // Note: Truncating to u64 for metrics (large rewards unlikely)
+        self.rewards_metrics.validator_rewards_amount_wei_total.increment(block_reward.min(u128::from(u64::MAX)) as u64);
         
         Ok(())
     }

@@ -49,6 +49,7 @@ reth-trie-common = { git = "https://github.com/bnb-chain/reth.git", rev = "87561
 reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", rev = "8756105f9520996629876c3f75bcac5fbce25883" }
 reth-tasks = { git = "https://github.com/bnb-chain/reth.git", rev = "8756105f9520996629876c3f75bcac5fbce25883" }
 reth-transaction-pool = { git = "https://github.com/bnb-chain/reth.git", rev = "8756105f9520996629876c3f75bcac5fbce25883" }
+reth-metrics = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.4" }
 revm = "29.0.0"
 
 # alloy dependencies
@@ -89,6 +90,7 @@ futures = "0.3"
 hex = "0.4"
 lazy_static = "1.4.0"
 lru = "0.12"
+metrics = "0.24"
 phf = { version = "0.11", features = ["macros"] }
 once_cell = { version = "1.19", default-features = false, features = ["alloc"] }
 parity-bytes = { version = "0.1.2", default-features = false }

@@ -138,7 +138,9 @@ static VOTE_POOL: Lazy<RwLock<VotePool>> = Lazy::new(|| RwLock::new(VotePool::ne
 
 /// Insert a single vote into the pool (deduplicated by hash).
 pub fn put_vote(vote: VoteEnvelope) {
-    VOTE_POOL.write().expect("vote pool poisoned").insert(vote);
+    let mut pool = VOTE_POOL.write().expect("vote pool poisoned");
+    pool.insert(vote);
+    // Note: For metrics, call vote_pool::len() after this to get updated size
 }
 
 /// Drain all pending votes.
@@ -149,6 +151,11 @@ pub fn drain() -> Vec<VoteEnvelope> {
 /// Current number of queued votes.
 pub fn len() -> usize { 
     VOTE_POOL.read().expect("vote pool poisoned").len() 
+}
+
+/// Check if the pool is empty.
+pub fn is_empty() -> bool {
+    len() == 0
 }
 
 /// Fetch votes by block hash.

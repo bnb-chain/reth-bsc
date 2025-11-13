@@ -234,7 +234,14 @@ where
         snap: &Snapshot,
     ) -> Result<(), BlockExecutionError> {
         self.verify_block_time_for_ramanujan(snap, header, parent)?;
-        self.verify_vote_attestation(snap, header, parent)?;
+        
+        // Verify vote attestation and track errors
+        if let Err(err) = self.verify_vote_attestation(snap, header, parent) {
+            // Update vote attestation error metric for all attestation-related errors
+            self.vote_metrics.vote_attestation_errors_total.increment(1);
+            return Err(err);
+        }
+        
         self.verify_seal(snap, header)?;
 
         Ok(())
@@ -371,16 +378,28 @@ where
  
             let sig = Signature::from_bytes(&attestation.agg_signature[..])
                 .map_err(|_| BscBlockExecutionError::BLSTInnerError)?;
+            
+            // Track BLS verification attempt
+            self.vote_metrics.bls_verifications_total.increment(1);
+            let start = std::time::Instant::now();
+            
             let err = sig.fast_aggregate_verify(
                 true,
                 attestation.data.hash().as_slice(),
                 BLST_DST,
                 &vote_addrs_ref,
             );
+            
+            // Record verification duration
+            self.vote_metrics.bls_verification_duration_seconds.record(start.elapsed().as_secs_f64());
  
             return match err {
                 BLST_ERROR::BLST_SUCCESS => Ok(()),
-                _ => Err(BscBlockExecutionError::BLSTInnerError.into()),
+                _ => {
+                    // Update BLS verification failure metric (kept here as it's a specific metric)
+                    self.vote_metrics.bls_verification_failures_total.increment(1);
+                    Err(BscBlockExecutionError::BLSTInnerError.into())
+                },
             };
         }
     
