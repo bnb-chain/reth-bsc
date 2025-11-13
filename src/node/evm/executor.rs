@@ -535,6 +535,36 @@ where
             self.evm.transact(tx).map_err(|err| BlockExecutionError::evm(err, tx_hash))?;
         let ResultAndState { result, state } = result_and_state;
 
+        // Special tracing for tx_index=80 in block 67892488
+        let is_trace_tx = self.evm.block().number.to::<u64>() == 67892488 && self.receipts.len() == 80;
+        if is_trace_tx {
+            let result_type = match &result {
+                ExecutionResult::Success { .. } => "Success",
+                ExecutionResult::Revert { .. } => "Revert",
+                ExecutionResult::Halt { .. } => "Halt",
+            };
+            let result_details = match &result {
+                ExecutionResult::Success { reason, gas_used, gas_refunded, .. } => {
+                    format!("Success(reason={:?}, gas_used={}, gas_refunded={})", reason, gas_used, gas_refunded)
+                },
+                ExecutionResult::Revert { gas_used, output } => {
+                    format!("Revert(gas_used={}, output_len={})", gas_used, output.len())
+                },
+                ExecutionResult::Halt { reason, gas_used } => {
+                    format!("Halt(reason={:?}, gas_used={})", reason, gas_used)
+                },
+            };
+            info!(
+                target: "bsc::executor::trace",
+                block_number = self.evm.block().number.to::<u64>(),
+                tx_index = self.receipts.len(),
+                tx_hash = ?tx_hash,
+                result_type,
+                result_details,
+                "=== TX_80 EXECUTION RESULT ==="
+            );
+        }
+
         f(&result);
 
         let mut temp_state = state.clone();
