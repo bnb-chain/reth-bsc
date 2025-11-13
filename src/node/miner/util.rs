@@ -100,16 +100,8 @@ where
     parlia.prepare_turn_length(parent_snap, new_header).
         map_err(|e| SignerError::SigningFailed(format!("Failed to prepare turn length: {}", e)))?;
     
-    // TODO: add BEP-590 changes in fermi hardfork later, it changes the assemble and verify logic.
-    if let Err(e) = parlia.assemble_vote_attestation(parent_snap, parent_header, new_header, snapshot_provider) {
-        tracing::warn!(
-            target: "parlia::assemble_vote_attestation",
-            block_number = new_header.number,
-            parent_hash = ?new_header.parent_hash,
-            error = ?e,
-            "Failed to assemble vote attestation, skipping"
-        );
-    }
+    parlia.assemble_vote_attestation(parent_snap, parent_header, new_header, snapshot_provider).
+        map_err(|e| SignerError::SigningFailed(format!("Failed to assemble vote attestation: {}", e)))?;
 
     {   // seal header
         let mut extra_data = new_header.extra_data.to_vec();

@@ -648,32 +648,33 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
         let mut target_header = parent_header.clone();
         let mut target_header_parent_snap = None;
         for _ in 0..times {
-            if let Some(snap) = snapshot_provider.snapshot_by_hash(&target_header.parent_hash()) {
-                votes = fetch_vote_by_block_hash(target_header.hash_slow());
-                let quorum = usize::div_ceil(snap.validators.len() * 2, 3);
-                if votes.len() >= quorum {
-                    target_header_parent_snap = Some(snap);
-                    break;
-                }
-                let block_hash = target_header.parent_hash();
-                if let Some(header) = crate::shared::get_canonical_header_by_hash_from_provider(&block_hash) {
-                    target_header = header;
-                } else {
-                    return Err(ParliaConsensusError::HeaderNotFound {
-                        block_hash,
-                    });
-                }
-                if target_header.number() <= justified_number {
-                    break;
-                }
-            } else {
-                return Err(ParliaConsensusError::SnapshotNotFound {
+            let snap = snapshot_provider.snapshot_by_hash(&target_header.parent_hash()).
+                ok_or(ParliaConsensusError::SnapshotNotFound {
                     block_hash: target_header.parent_hash(),
+                })?;
+            votes = fetch_vote_by_block_hash(target_header.hash_slow());
+            let quorum = usize::div_ceil(snap.validators.len() * 2, 3);
+            if votes.len() >= quorum {
+                target_header_parent_snap = Some(snap);
+                break;
+            }
+            tracing::debug!(target: "parlia::consensus", "vote count is less than 2/3 of validators, skip assemble vote attestation, number={}, parent ={:?}, vote count={}, validators count={}", 
+                target_header.number(), target_header.hash_slow(), votes.len(), parent_snap.validators.len());
+            let block_hash = target_header.parent_hash();
+            if let Some(header) = crate::shared::get_canonical_header_by_hash_from_provider(&block_hash) {
+                target_header = header;
+            } else {
+                return Err(ParliaConsensusError::HeaderNotFound {
+                    block_hash,
                 });
+            }
+            if target_header.number() <= justified_number {
+                break;
             }
         }
         if target_header_parent_snap.is_none() {
-            warn!("target_header_parent_snap is none");
+            tracing::warn!(target: "parlia::consensus", "cannot collect enough votes, current_block={}, target_header_number={}, justified_number={}", 
+                current_header.number(), target_header.number(), justified_number);
             return Ok(());
         }
 
