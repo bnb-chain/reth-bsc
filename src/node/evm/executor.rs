@@ -548,7 +548,43 @@ where
                     format!("Success(reason={:?}, gas_used={}, gas_refunded={})", reason, gas_used, gas_refunded)
                 },
                 ExecutionResult::Revert { gas_used, output } => {
-                    format!("Revert(gas_used={}, output_len={})", gas_used, output.len())
+                    // Decode revert reason
+                    let revert_reason = if output.len() >= 4 {
+                        // Check if it's Error(string) selector (0x08c379a0)
+                        if output.len() >= 68 && output[0..4] == [0x08, 0xc3, 0x79, 0xa0] {
+                            // Error(string) format:
+                            // 4 bytes: selector
+                            // 32 bytes: offset (usually 0x20)
+                            // 32 bytes: length
+                            // N bytes: string data
+                            if let Some(length_start) = output.get(36..68) {
+                                let length = U256::from_be_slice(length_start).to::<usize>();
+                                if let Some(string_data) = output.get(68..68 + length) {
+                                    format!("Error(string): {}", String::from_utf8_lossy(string_data))
+                                } else {
+                                    format!("Error(string) - invalid length: {}", length)
+                                }
+                            } else {
+                                format!("Error(string) - malformed")
+                            }
+                        } else {
+                            // Other revert types, show as hex
+                            format!("0x{}", hex::encode(output))
+                        }
+                    } else {
+                        format!("0x{}", hex::encode(output))
+                    };
+                    
+                    // Also print full output hex
+                    info!(
+                        target: "bsc::executor::trace",
+                        block_number = self.evm.block().number.to::<u64>(),
+                        tx_index = self.receipts.len(),
+                        "Revert output (hex): 0x{}",
+                        hex::encode(output)
+                    );
+                    
+                    format!("Revert(gas_used={}, output_len={}, reason={})", gas_used, output.len(), revert_reason)
                 },
                 ExecutionResult::Halt { reason, gas_used } => {
                     format!("Halt(reason={:?}, gas_used={})", reason, gas_used)
