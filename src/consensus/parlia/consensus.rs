@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::SystemTime;
 use lazy_static::lazy_static;
@@ -662,28 +661,56 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
                 });
             }
         }
-        // Prepare aggregated vote signature and vote address set
-        let mut vote_addr_set: HashSet<VoteAddress> = HashSet::new();
-        let mut signatures: Vec<VoteSignature> = Vec::new();
+        
+        // Prepare aggregated vote signature and vote bitset
+        let mut unique_by_addr: std::collections::HashMap<VoteAddress, VoteSignature> = std::collections::HashMap::new();
         for vote in votes.iter() {
-            vote_addr_set.insert(vote.vote_address);
-            signatures.push(vote.signature);
+            // Only keep votes from validators in parent snapshot
+            if parent_snap.validators_map.values().any(|vi| vi.vote_addr == vote.vote_address) {
+                // If the same address appears multiple times, keep the first one (stable and deterministic)
+                unique_by_addr.entry(vote.vote_address).or_insert(vote.signature);
+            } else {
+                tracing::debug!(target: "parlia::consensus", "skip vote not in parent snapshot, vote_address={:?}", vote.vote_address);
+            }
         }
-        let sigs: Vec<blst::min_pk::Signature> = signatures.iter().map(|sig| blst::min_pk::Signature::from_bytes(sig.as_slice()).unwrap()).collect();
+        // Build a stable sequence based on the index of validators in parent snapshot (although BLS aggregation order is irrelevant, it is convenient for debugging and consistency)
+        let mut ordered_unique: Vec<(u64, VoteAddress, VoteSignature)> = Vec::new();
+        for (_, info) in parent_snap.validators_map.iter() {
+            let vote_addr = info.vote_addr;
+            if let Some(sig) = unique_by_addr.get(&vote_addr) {
+                ordered_unique.push((info.index, vote_addr, *sig));
+            }
+        }
+        // Must satisfy 2/3 threshold
+        let validators_len = parent_snap.validators.len();
+        let quorum = usize::div_ceil(validators_len * 2, 3);
+        if ordered_unique.len() < quorum {
+            tracing::debug!(target: "parlia::consensus", "not enough unique votes after filtering, have={}, need={}", ordered_unique.len(), quorum);
+            return Ok(()); // If not enough unique votes, do not append attestation
+        }
+        // Aggregate signatures
+        let sigs: Vec<blst::min_pk::Signature> = ordered_unique
+            .iter()
+            .map(|(_, _, sig)| blst::min_pk::Signature::from_bytes(sig.as_slice()).unwrap())
+            .collect();
         let sigs_ref: Vec<&blst::min_pk::Signature> = sigs.iter().collect();
         let aggregate = blst::min_pk::AggregateSignature::aggregate(&sigs_ref, false)
             .map_err(|_| ParliaConsensusError::AggregateSignatureError)?;
         attestation.agg_signature.copy_from_slice(&aggregate.to_signature().to_bytes());
-        // Prepare vote address bitset.
-        for (_, val_info) in parent_snap.validators_map.iter() {
-            if vote_addr_set.contains(&val_info.vote_addr) {
-                attestation.vote_address_set |= 1 << (val_info.index - 1)
-            }
+        // Build vote bitset (strictly equal to the number of aggregated signatures)
+        for (index, vote_addr, _) in ordered_unique.iter() {
+            // index in snapshot is 1-based, the vote bitset offset is index-1
+            attestation.vote_address_set |= 1 << (index - 1);
+            // Tolerance: if there are more than 64 validators in history, this needs to be changed to a larger bit set type; currently BSC limits 64
+            let _ = vote_addr; // Only used for explanation
         }
-        if attestation.vote_address_set.count_ones() < signatures.len() as u32 {
+        // Strict consistency check: the number of 1s in the vote bitset must be equal to the number of aggregated signatures
+        let ones = attestation.vote_address_set.count_ones() as usize;
+        if ones != ordered_unique.len() {
+            tracing::debug!(target: "parlia::consensus", "vote bitset count mismatch, ones={}, sigs={}", ones, ordered_unique.len());
             return Err(ParliaConsensusError::InvalidAttestationVoteCount {
-                got: attestation.vote_address_set.count_ones(),
-                expected: signatures.len() as u32,
+                got: ones as u32,
+                expected: ordered_unique.len() as u32,
             });
         }
         // Append attestation to header extra field.
