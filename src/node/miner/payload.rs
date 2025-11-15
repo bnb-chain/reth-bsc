@@ -403,7 +403,7 @@ where
         let transactions = &sealed_block.body().inner.transactions;
         
         let build_duration = build_start.elapsed();
-        let avg_tx_duration_micros = if transactions.len() > 0 {
+        let avg_tx_duration_micros = if !transactions.is_empty() {
             build_duration.as_micros() / transactions.len() as u128
         } else {
             0
