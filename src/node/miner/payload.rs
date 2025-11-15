@@ -16,7 +16,7 @@ use reth_payload_primitives::{PayloadBuilderError, BuiltPayload};
 use reth::transaction_pool::{TransactionPool, PoolTransaction};
 use reth_primitives::TransactionSigned;
 use reth::transaction_pool::BestTransactionsAttributes;
-use tracing::{debug, info};
+use tracing::{debug, info, trace, warn};
 use reth_evm::block::{BlockExecutionError, BlockValidationError};
 use reth::transaction_pool::error::InvalidPoolTransactionError;
 use reth_primitives::InvalidTransactionError;
@@ -32,7 +32,6 @@ use reth::payload::EthPayloadBuilderAttributes;
 use reth_payload_primitives::PayloadBuilderAttributes;
 use alloy_consensus::{Transaction, BlockHeader};
 use reth_primitives_traits::{SignerRecoverable, BlockBody};
-use tracing::warn;
 use crate::chainspec::{BscChainSpec};
 use reth::transaction_pool::error::Eip4844PoolTransactionError;
 use crate::node::primitives::BscBlobTransactionSidecar;
@@ -91,7 +90,7 @@ pub struct BscBuildArguments<Attributes> {
 }
 
 /// BSC payload builder, used to build payload for bsc miner.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct BscPayloadBuilder<Pool, Client, EvmConfig = BscEvmConfig> {
     /// Client providing access to node state.
     client: Client,
@@ -144,6 +143,7 @@ where
     /// 
     /// Returns a `Result` containing the built payload or an error.
     pub async fn build_payload(&self, args: BscBuildArguments<EthPayloadBuilderAttributes>) -> Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>> {
+        let build_start = std::time::Instant::now();
         let BscBuildArguments { mut cached_reads, config, cancel } = args;
         let PayloadConfig { parent_header, attributes } = config;
 
@@ -204,7 +204,7 @@ where
             // filter out blacklisted transactions before executing.
             if self.chain_spec.is_nano_active_at_block(parent_header.number+1) 
                 && blacklist::check_tx_basic_blacklist(pool_tx.sender(), pool_tx.to()) {
-                tracing::debug!(target: "payload_builder", "Blacklisted transaction: {:?}", pool_tx.hash());
+                debug!(target: "payload_builder", "Blacklisted transaction: {:?}", pool_tx.hash());
                 best_tx_list.mark_invalid(
                     &pool_tx,
                     InvalidPoolTransactionError::other(BlacklistedAddressError()),
@@ -230,8 +230,16 @@ where
             }
 
             let tx = pool_tx.to_consensus();
+            let tx_start = std::time::Instant::now();
             let mut blob_tx_sidecar = None;
-            debug!("debug payload_builder, block_number: {}, tx: {:?}, is_blob_tx: {:?}, tx_type: {:?}", parent_header.number()+1, tx.hash(), tx.is_eip4844(), tx.tx_type());
+            debug!(
+                target: "payload_builder",
+                block_number = parent_header.number() + 1,
+                tx = ?tx.hash(),
+                is_blob_tx = tx.is_eip4844(),
+                tx_type = ?tx.tx_type(),
+                "Processing transaction"
+            );
             if let Some(blob_tx) = tx.as_eip4844() {
                 let tx_blob_count = blob_tx.tx().blob_versioned_hashes.len() as u64;
                 if block_blob_count + tx_blob_count > max_blob_count {
@@ -239,7 +247,14 @@ where
                     // invalid, which removes its dependent transactions from
                     // the iterator. This is similar to the gas limit condition
                     // for regular transactions above.
-                    debug!(target: "payload_builder", tx=?tx.hash(), ?block_blob_count, "skipping blob transaction because it would exceed the max blob count per block");
+                    debug!(
+                        target: "payload_builder",
+                        tx = ?tx.hash(),
+                        block_blob_count,
+                        tx_blob_count,
+                        max_blob_count,
+                        "Skipping blob transaction because it would exceed the max blob count per block"
+                    );
                     best_tx_list.mark_invalid(
                         &pool_tx,
                         InvalidPoolTransactionError::Eip4844(
@@ -287,16 +302,28 @@ where
                         Err(Eip4844PoolTransactionError::UnexpectedEip7594SidecarBeforeOsaka)
                     }
                 };
-                debug!("debug payload_builder, block_number: {}, tx_hash: {:?}, blob_sidecar_result: {:?}", parent_header.number()+1, tx.hash(), blob_sidecar_result);
 
                 blob_tx_sidecar = match blob_sidecar_result {
                     Ok(sidecar) => Some(sidecar),
                     Err(error) => {
+                        warn!(
+                            target: "payload_builder",
+                            block_number = parent_header.number() + 1,
+                            tx = ?tx.hash(),
+                            ?error,
+                            "Skipping blob transaction due to invalid sidecar"
+                        );
                         best_tx_list.mark_invalid(&pool_tx, InvalidPoolTransactionError::Eip4844(error));
                         continue
                     }
                 };
-                debug!("debug payload_builder, block_number: {}, tx_hash: {:?}, blob_tx_sidecar: {:?}", parent_header.number()+1, tx.hash(), blob_tx_sidecar);
+                trace!(
+                    target: "payload_builder",
+                    block_number = parent_header.number() + 1,
+                    tx = ?tx.hash(),
+                    has_sidecar = blob_tx_sidecar.is_some(),
+                    "Blob transaction sidecar prepared"
+                );
             }
             
             let gas_used = match builder.execute_transaction(tx.clone()) {
@@ -337,6 +364,29 @@ where
             let miner_fee = tx.effective_tip_per_gas(base_fee).expect("fee is always valid; execution succeeded");
             total_fees += U256::from(miner_fee) * U256::from(gas_used);
             cumulative_gas_used += gas_used;
+            
+            let tx_duration = tx_start.elapsed();
+            if tx_duration.as_micros() > 3000 {
+                debug!(
+                    target: "payload_builder",
+                    block_number = parent_header.number() + 1,
+                    tx = ?tx.hash(),
+                    gas_used,
+                    cumulative_gas_used,
+                    duration_micros = tx_duration.as_micros(),
+                    "Transaction executed successfully (slow)"
+                );
+            } else {
+                trace!(
+                    target: "payload_builder",
+                    block_number = parent_header.number() + 1,
+                    tx = ?tx.hash(),
+                    gas_used,
+                    cumulative_gas_used,
+                    duration_micros = tx_duration.as_micros(),
+                    "Transaction executed successfully"
+                );
+            }
 
             // Add blob tx sidecar to the payload.
             if let Some(sidecar) = blob_tx_sidecar {
@@ -351,17 +401,38 @@ where
         // set sidecars to seal block
         let mut blob_sidecars:Vec<BscBlobTransactionSidecar>= Vec::new();
         let transactions = &sealed_block.body().inner.transactions;
-        debug!("debug payload_builder, block_number: {}, block_hash: {:?}, txs: {} gas: {}, fees: {}", sealed_block.number(), sealed_block.hash(), transactions.len(), cumulative_gas_used, total_fees);
+        
+        let build_duration = build_start.elapsed();
+        let avg_tx_duration_micros = if transactions.len() > 0 {
+            build_duration.as_micros() / transactions.len() as u128
+        } else {
+            0
+        };
+        
+        debug!(
+            target: "payload_builder",
+            block_number = sealed_block.number(),
+            block_hash = ?sealed_block.hash(),
+            tx_count = transactions.len(),
+            cumulative_gas_used,
+            total_fees = %total_fees,
+            build_duration_ms = build_duration.as_millis(),
+            avg_tx_duration_micros,
+            "Block payload built successfully"
+        );
+        
         for (index, tx) in transactions.iter().enumerate() {
-            debug!("debug payload_builder, transaction {}: hash={:?}, from={:?}, to={:?}, value={:?}, gas_limit={}, gas_price={:?}, nonce={}", 
-                index + 1,
-                tx.hash(),
-                tx.recover_signer().ok(),
-                tx.to(),
-                tx.value(),
-                tx.gas_limit(),
-                tx.gas_price(),
-                tx.nonce()
+            trace!(
+                target: "payload_builder",
+                tx_index = index,
+                tx_hash = ?tx.hash(),
+                from = ?tx.recover_signer().ok(),
+                to = ?tx.to(),
+                value = ?tx.value(),
+                gas_limit = tx.gas_limit(),
+                gas_price = ?tx.gas_price(),
+                nonce = tx.nonce(),
+                "Transaction included in block"
             );
             if tx.is_eip4844() {
                 let sidecar = sidecars_map.get(tx.hash()).unwrap();

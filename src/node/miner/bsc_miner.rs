@@ -25,7 +25,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_stream::StreamExt;
 use tracing::{debug, error, info, warn};
-use reth_basic_payload_builder::PayloadConfig;
+use reth_basic_payload_builder::{PayloadConfig, PrecachedState};
 use crate::node::miner::payload::BscBuildArguments;
 use reth_revm::cancelled::ManualCancel;
 use alloy_primitives::U128;
@@ -38,12 +38,13 @@ use lru::LruCache;
 /// Maximum number of recently mined blocks to track for double signing prevention
 const RECENT_MINED_BLOCKS_CACHE_SIZE: usize = 100;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct MiningContext {
     pub header: Option<reth_primitives::Header>, // tmp header for payload building.
     pub parent_header: reth_primitives::SealedHeader,
     pub parent_snapshot: Arc<crate::consensus::parlia::snapshot::Snapshot>,
     pub is_inturn: bool,
+    pub cached_reads: Option<reth_revm::cached::CachedReads>,
 }
 
 #[derive(Clone)]
@@ -60,6 +61,7 @@ pub struct NewWorkWorker<Provider> {
     snapshot_provider: Arc<dyn SnapshotProvider + Send + Sync>,
     mining_queue_tx: mpsc::UnboundedSender<MiningContext>,
     consensus: Arc<Parlia<BscChainSpec>>,
+    pre_cached: Option<PrecachedState>,
 }
 
 impl<Provider> NewWorkWorker<Provider> 
@@ -87,10 +89,11 @@ where
             snapshot_provider,
             mining_queue_tx,
             consensus,
+            pre_cached: None,
         }
     }
 
-    pub async fn run(self) {
+    pub async fn run(mut self) {
         info!("Succeed to spawn new work worker, address: {}", self.validator_address);
         
         if let Some(tip_header) = self.get_tip_header_at_startup() {
@@ -102,7 +105,6 @@ where
         loop {
             match notifications.next().await {
                 Some(event) => {
-                    // todo: refine it as pre cache to speedup, committed.execution_outcome().
                     let committed = event.committed();
                     let tip = committed.tip();
                     let is_reorg = matches!(event, CanonStateNotification::Reorg { .. });
@@ -188,6 +190,9 @@ where
                             }
                         }
                     }
+                    
+                    self.cache_for_next(&committed);
+                    
                     self.try_new_work(&tip_header).await;
                 }
                 None => {
@@ -284,6 +289,39 @@ where
         Some(tip_header)
     }
 
+    /// Cache state from the current block for building the next block.
+    /// 
+    /// Extracts changed accounts and storage from the execution outcome and stores them
+    /// in a cache associated with the tip block hash for faster subsequent block building.
+    fn cache_for_next(&mut self, committed: &Arc<reth::providers::Chain<<Provider as reth_provider::NodePrimitivesProvider>::Primitives>>) {
+        // Build pre-cache from execution outcome
+        let mut cached = reth_revm::cached::CachedReads::default();
+        let new_execution_outcome = committed.execution_outcome();
+        
+        for (addr, acc) in new_execution_outcome.bundle_accounts_iter() {
+            if let Some(info) = acc.info.clone() {
+                // Pre-cache existing accounts and their storage
+                // This only includes changed accounts and storage but is better than nothing
+                let storage = acc.storage.iter()
+                    .map(|(key, slot)| (*key, slot.present_value))
+                    .collect();
+                cached.insert_account(addr, info, storage);
+            }
+        }
+        
+        self.pre_cached = Some(PrecachedState {
+            block: committed.tip().hash(),
+            cached,
+        });
+    }
+
+    /// Returns the pre-cached reads for the given parent header if it matches the cached state's block.
+    fn maybe_pre_cached(&self, parent: alloy_primitives::B256) -> Option<reth_revm::cached::CachedReads> {
+        self.pre_cached.as_ref()
+            .filter(|pc| pc.block == parent)
+            .map(|pc| pc.cached.clone())
+    }
+
     async fn try_new_work<H>(&self, tip: &SealedHeader<H>) 
     where
         H: alloy_consensus::BlockHeader + Sealable,
@@ -350,11 +388,13 @@ where
             return;
         }
 
+        let parent_hash = parent_header.hash();
         let mining_ctx = MiningContext {
             header: None,
             parent_header,
             parent_snapshot: Arc::new(parent_snapshot),
             is_inturn,
+            cached_reads: self.maybe_pre_cached(parent_hash),
         };
 
         debug!("Queuing mining context, next_block: {}", tip.number() + 1);
@@ -527,7 +567,7 @@ where
             mining_ctx.clone(),
         );
         let build_args = BscBuildArguments {
-            cached_reads: reth_revm::cached::CachedReads::default(),
+            cached_reads: mining_ctx.cached_reads.clone().unwrap_or_default(),
             config: PayloadConfig::new(Arc::new(mining_ctx.parent_header.clone()), attributes),
             cancel: ManualCancel::default(),
         };
