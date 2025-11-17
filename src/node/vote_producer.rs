@@ -10,7 +10,6 @@ use crate::hardforks::BscHardforks;
 use crate::consensus::parlia::util::calculate_millisecond_timestamp;
 use crate::node::evm::util::get_cannonical_header_from_cache;
 use crate::node::vote_journal;
-use crate::consensus::parlia::constants::K_ANCESTOR_GENERATION_DEPTH;
 
 /// Number of blocks to wait after mining becomes enabled before producing votes.
 /// This mirrors geth's VoteManager warm-up (blocksNumberSinceMining = 40) to avoid
@@ -160,12 +159,7 @@ pub fn maybe_produce_and_broadcast_for_head(
 
     // Too-late-to-vote guard: ensure we have time to broadcast before next block assembly
     let cur_ms = calculate_millisecond_timestamp(head);
-    let count = if chain_spec.is_fermi_active_at_timestamp(head.number(), head.timestamp()) {
-        K_ANCESTOR_GENERATION_DEPTH
-    } else {
-        1
-    };
-    let vote_assemble_ms = cur_ms.saturating_add(snap.block_interval * count);
+    let vote_assemble_ms = cur_ms.saturating_add(snap.block_interval);
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)

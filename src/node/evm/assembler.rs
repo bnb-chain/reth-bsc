@@ -168,8 +168,7 @@ where
                 self.parlia.clone(), 
                 &parent_snap, 
                 &parent_header, 
-                &mut header,
-                &snapshot_provider,
+                &mut header
             ).map_err(|e| BlockExecutionError::msg(format!("Failed to finalize header: {}", e)))?;
 
             let header_hash = keccak256(alloy_rlp::encode(&header));
@@ -292,8 +291,7 @@ where
                 self.parlia.clone(), 
                 &parent_snap, 
                 &parent_header, 
-                &mut header,
-                &snapshot_provider,
+                &mut header
             ).map_err(|e| BlockExecutionError::msg(format!("Failed to finalize header: {}", e)))?;
 
             let header_hash = keccak256(alloy_rlp::encode(&header));

@@ -25,9 +25,10 @@ use blst::{
     BLST_ERROR,
 };
 use bit_set::BitSet;
-use crate::consensus::parlia::constants::K_ANCESTOR_GENERATION_DEPTH;
 
 const BLST_DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
+
+const K_ANCESTOR_GENERATION_DEPTH: u64 = 3;
 
 type ValidatorCache = LruMap<BlockHash, (Vec<Address>, Vec<VoteAddress>), ByLength>;
 type TurnLengthCache = LruMap<BlockHash, u8, ByLength>;
@@ -277,12 +278,7 @@ where
             let target_hash = attestation.data.target_hash;
             let mut is_match = false;
             let mut ancestor = parent.clone();
-            let depth = if self.spec.is_fermi_active_at_timestamp(header.number(), header.timestamp) {
-                K_ANCESTOR_GENERATION_DEPTH
-            } else {
-                1
-            };
-            for _ in 0..depth {
+            for _ in 0..self.get_ancestor_generation_depth(header) {
                 if ancestor.number() == target_block && ancestor.hash_slow() == target_hash {
                     is_match = true;
                     break;
@@ -298,8 +294,8 @@ where
             if !is_match {
                 return Err(BscBlockExecutionError::Validation(
                     BscBlockValidationError::InvalidAttestationTarget {
-                        block_number: GotExpected { got: target_block, expected: ancestor.number() },
-                        block_hash: GotExpected { got: target_hash, expected: ancestor.hash_slow() }
+                        block_number: GotExpected { got: target_block, expected: parent.number() },
+                        block_hash: GotExpected { got: target_hash, expected: parent.hash_slow() }
                             .into(),
                     }
                 ).into());
@@ -390,6 +386,14 @@ where
     
         Ok(())
     }
+
+    fn get_ancestor_generation_depth(&self, header: &Header) -> u64 {
+        if self.spec.is_fermi_active_at_timestamp(header.number(),header.timestamp) {
+            return K_ANCESTOR_GENERATION_DEPTH;
+        }
+        1
+    }
+
     
     fn verify_seal(
         &self,
