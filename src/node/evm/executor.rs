@@ -154,7 +154,7 @@ where
 
     /// Applies system contract upgrades if the Feynman fork is not yet active.
     fn upgrade_contracts(&mut self, block_number: BlockNumber, block_timestamp: u64, parent_timestamp: u64) -> Result<(), BlockExecutionError> {
-        debug!(
+        trace!(
             target: "bsc::executor::upgrade",
             block_number,
             block_timestamp,
@@ -169,13 +169,6 @@ where
             parent_timestamp,
         )
         .map_err(|_| BlockExecutionError::msg("Failed to get upgrade system contracts"))?;
-
-        debug!(
-            target: "bsc::executor::upgrade",
-            block_number,
-            contracts_count = contracts.len(),
-            "Got upgrade system contracts"
-        );
 
         for (address, maybe_code) in contracts {
             if let Some(code) = maybe_code {
@@ -194,12 +187,11 @@ where
     }
 
     /// Mimics Geth-BSC's TryUpdateBuildInSystemContract function
-    /// https://github.com/will-2012/bsc/blob/master/core/systemcontracts/upgrade.go#L1060
     fn try_update_build_in_system_contract(&mut self, block_number: BlockNumber, block_timestamp: u64, parent_timestamp: u64, at_block_begin: bool) -> Result<(), BlockExecutionError> {
         if at_block_begin {
             // Upgrade system contracts before Feynman at block begin
             if !self.spec.is_feynman_active_at_timestamp(block_number, parent_timestamp) {
-                debug!(
+                trace!(
                     target: "bsc::executor::upgrade",
                     block_number,
                     parent_timestamp,
@@ -211,7 +203,7 @@ where
             // HistoryStorageAddress is a special system contract in BSC, which can't be upgraded
             // This must be done at block begin when Prague activates
             if self.spec.is_prague_transition_at_block_and_timestamp(block_number, block_timestamp, parent_timestamp) {
-                debug!(
+                info!(
                     target: "bsc::executor::prague",
                     block_number,
                     block_timestamp,
@@ -222,7 +214,7 @@ where
         } else {
             // Upgrade system contracts after Feynman at block end
             if self.spec.is_feynman_active_at_timestamp(block_number, parent_timestamp) {
-                debug!(
+                trace!(
                     target: "bsc::executor::upgrade",
                     block_number,
                     parent_timestamp,
@@ -360,25 +352,11 @@ where
             self.check_new_block(&block_env)?;
         }
         
-        // set state clear flag if the block is after the Spurious Dragon or Nano hardfork.
-        // BSC's Nano hardfork implements EIP-161 (state clearing), similar to Spurious Dragon
+        // set state clear flag if the block is after the Spurious Dragon hardfork.
         let block_number = self.evm.block().number.to();
-        let state_clear_flag = self.spec.is_spurious_dragon_active_at_block(block_number)
-            || self.spec.is_nano_active_at_block(block_number);
+        let state_clear_flag = self.spec.is_spurious_dragon_active_at_block(block_number);
         self.evm.db_mut().set_state_clear_flag(state_clear_flag);
         let parent_timestamp = self.inner_ctx.parent_header.as_ref().unwrap().timestamp;
-        debug!(
-            target: "bsc::executor::upgrade",
-            block_number = self.evm.block().number.to::<u64>(),
-            block_timestamp = self.evm.block().timestamp.to::<u64>(),
-            parent_timestamp,
-            "Calling try_update_build_in_system_contract at block begin"
-        );
-        
-        // TryUpdateBuildInSystemContract with atBlockBegin=true
-        // This handles:
-        // 1. System contract upgrades (before Feynman)
-        // 2. HistoryStorageAddress deployment (Prague transition)
         self.try_update_build_in_system_contract(
             self.evm.block().number.to::<u64>(), 
             self.evm.block().timestamp.to::<u64>(), 
@@ -391,7 +369,7 @@ where
             self.evm.block().number.to::<u64>(), 
             self.evm.block().timestamp.to::<u64>()
         ) {
-            debug!(
+            trace!(
                 target: "bsc::executor::prague",
                 block_number = self.evm.block().number.to::<u64>(),
                 parent_hash = ?self.ctx.base.parent_hash,
@@ -521,15 +499,6 @@ where
         );
 
         let parent_timestamp = self.inner_ctx.parent_header.as_ref().unwrap().timestamp;
-        
-        // TryUpdateBuildInSystemContract with atBlockBegin=false
-        // This handles system contract upgrades after Feynman
-        debug!(
-            target: "bsc::executor::upgrade",
-            block_number = self.evm.block().number.to::<u64>(),
-            parent_timestamp,
-            "Calling try_update_build_in_system_contract at block end"
-        );
         self.try_update_build_in_system_contract(
             self.evm.block().number.to::<u64>(), 
             self.evm.block().timestamp.to::<u64>(), 

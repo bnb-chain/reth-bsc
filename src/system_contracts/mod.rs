@@ -780,9 +780,9 @@ pub fn get_upgrade_system_contracts<ChainSpec>(
 where
     ChainSpec: EthChainSpec + BscHardforks + Hardforks,
 {
-    use tracing::debug;
+    use tracing::trace;
     
-    debug!(
+    trace!(
         target: "bsc::system_contracts::upgrade",
         block_number,
         block_time,
@@ -794,8 +794,7 @@ where
     
     // Apply upgrades in the exact order as Geth-BSC upgradeBuildInSystemContract
     // Each hardfork upgrade will overwrite previous upgrades for the same address
-    
-    // Block-based hardforks (legacy) - use IsOn* semantics via transition methods
+
     if spec.is_ramanujan_transition_at_block(block_number) {
         if let Ok(contracts) = get_system_contract_codes(spec, &BscHardfork::Ramanujan.name()) {
             for (address, v) in &contracts {
@@ -955,9 +954,6 @@ where
             }
         }
     }
-    
-    // Timestamp-based hardforks (newer) - use IsOn* semantics via transition methods
-    // Note: Shanghai has empty upgrade config in Geth
     
     if spec.is_kepler_transition_at_timestamp(block_number, block_time, parent_block_time) {
         if let Ok(contracts) = get_system_contract_codes(spec, &BscHardfork::Kepler.name()) {
