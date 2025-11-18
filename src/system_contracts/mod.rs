@@ -630,10 +630,6 @@ pub enum SystemContractError {
     /// Error when invalid chain spec is provided.
     #[error("Invalid hardfork")]
     InvalidHardfork,
-
-    /// Error when updating the contract fails.
-    #[error("Cannot deploy contract")]
-    FailToUpdate,
 }
 
 /// Return hardforks which contain upgrades of system contracts.
@@ -793,9 +789,9 @@ where
     // Each hardfork upgrade will overwrite previous upgrades for the same address
 
     if spec.is_ramanujan_transition_at_block(block_number) {
-        if let Ok(contracts) = get_system_contract_codes(spec, &BscHardfork::Ramanujan.name()) {
-            for (address, v) in &contracts {
-                m.insert(*address, v.clone());
+        if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Ramanujan.name()) {
+                for (address, v) in &contracts {
+                    m.insert(*address, v.clone());
                 info!(
                     target: "bsc::system_contracts::upgrade",
                     block_number = block_number,
@@ -809,7 +805,7 @@ where
     }
     
     if spec.is_niels_transition_at_block(block_number) {
-        if let Ok(contracts) = get_system_contract_codes(spec, &BscHardfork::Niels.name()) {
+        if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Niels.name()) {
             for (address, v) in &contracts {
                 m.insert(*address, v.clone());
                 info!(
@@ -825,7 +821,7 @@ where
     }
     
     if spec.is_mirror_sync_transition_at_block(block_number) {
-        if let Ok(contracts) = get_system_contract_codes(spec, &BscHardfork::MirrorSync.name()) {
+        if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::MirrorSync.name()) {
             for (address, v) in &contracts {
                 m.insert(*address, v.clone());
                 info!(
@@ -841,7 +837,7 @@ where
     }
     
     if spec.is_bruno_transition_at_block(block_number) {
-        if let Ok(contracts) = get_system_contract_codes(spec, &BscHardfork::Bruno.name()) {
+        if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Bruno.name()) {
             for (address, v) in &contracts {
                 m.insert(*address, v.clone());
                 info!(
@@ -857,7 +853,7 @@ where
     }
     
     if spec.is_euler_transition_at_block(block_number) {
-        if let Ok(contracts) = get_system_contract_codes(spec, &BscHardfork::Euler.name()) {
+        if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Euler.name()) {
             for (address, v) in &contracts {
                 m.insert(*address, v.clone());
                 info!(
@@ -873,7 +869,7 @@ where
     }
     
     if spec.is_gibbs_transition_at_block(block_number) {
-        if let Ok(contracts) = get_system_contract_codes(spec, &BscHardfork::Gibbs.name()) {
+        if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Gibbs.name()) {
             for (address, v) in &contracts {
                 m.insert(*address, v.clone());
                 info!(
@@ -889,7 +885,7 @@ where
     }
     
     if spec.is_moran_transition_at_block(block_number) {
-        if let Ok(contracts) = get_system_contract_codes(spec, &BscHardfork::Moran.name()) {
+        if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Moran.name()) {
             for (address, v) in &contracts {
                 m.insert(*address, v.clone());
                 info!(
@@ -905,7 +901,7 @@ where
     }
     
     if spec.is_planck_transition_at_block(block_number) {
-        if let Ok(contracts) = get_system_contract_codes(spec, &BscHardfork::Planck.name()) {
+        if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Planck.name()) {
             for (address, v) in &contracts {
                 m.insert(*address, v.clone());
                 info!(
@@ -921,7 +917,7 @@ where
     }
     
     if spec.is_luban_transition_at_block(block_number) {
-        if let Ok(contracts) = get_system_contract_codes(spec, &BscHardfork::Luban.name()) {
+        if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Luban.name()) {
             for (address, v) in &contracts {
                 m.insert(*address, v.clone());
                 info!(
@@ -937,7 +933,7 @@ where
     }
     
     if spec.is_plato_transition_at_block(block_number) {
-        if let Ok(contracts) = get_system_contract_codes(spec, &BscHardfork::Plato.name()) {
+        if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Plato.name()) {
             for (address, v) in &contracts {
                 m.insert(*address, v.clone());
                 info!(
@@ -953,7 +949,7 @@ where
     }
     
     if spec.is_kepler_transition_at_timestamp(block_number, block_time, parent_block_time) {
-        if let Ok(contracts) = get_system_contract_codes(spec, &BscHardfork::Kepler.name()) {
+        if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Kepler.name()) {
             for (address, v) in &contracts {
                 m.insert(*address, v.clone());
                 info!(
@@ -969,7 +965,7 @@ where
     }
     
     if spec.is_feynman_transition_at_timestamp(block_number, block_time, parent_block_time) {
-        if let Ok(contracts) = get_system_contract_codes(spec, &BscHardfork::Feynman.name()) {
+        if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Feynman.name()) {
             for (address, v) in &contracts {
                 m.insert(*address, v.clone());
                 info!(
@@ -985,7 +981,7 @@ where
     }
     
     if spec.is_feynman_fix_transition_at_timestamp(block_number, block_time, parent_block_time) {
-        if let Ok(contracts) = get_system_contract_codes(spec, &BscHardfork::FeynmanFix.name()) {
+        if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::FeynmanFix.name()) {
             for (address, v) in &contracts {
                 m.insert(*address, v.clone());
                 info!(
@@ -1001,7 +997,7 @@ where
     }
     
     if spec.is_haber_fix_transition_at_timestamp(block_number, block_time, parent_block_time) {
-        if let Ok(contracts) = get_system_contract_codes(spec, &BscHardfork::HaberFix.name()) {
+        if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::HaberFix.name()) {
             for (address, v) in &contracts {
                 m.insert(*address, v.clone());
                 info!(
@@ -1017,7 +1013,7 @@ where
     }
     
     if spec.is_bohr_transition_at_timestamp(block_number, block_time, parent_block_time) {
-        if let Ok(contracts) = get_system_contract_codes(spec, &BscHardfork::Bohr.name()) {
+        if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Bohr.name()) {
             for (address, v) in &contracts {
                 m.insert(*address, v.clone());
                 info!(
@@ -1033,7 +1029,7 @@ where
     }
     
     if spec.is_pascal_transition_at_timestamp(block_number, block_time, parent_block_time) {
-        if let Ok(contracts) = get_system_contract_codes(spec, &BscHardfork::Pascal.name()) {
+        if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Pascal.name()) {
             for (address, v) in &contracts {
                 m.insert(*address, v.clone());
                 info!(
@@ -1049,7 +1045,7 @@ where
     }
     
     if spec.is_lorentz_transition_at_timestamp(block_number, block_time, parent_block_time) {
-        if let Ok(contracts) = get_system_contract_codes(spec, &BscHardfork::Lorentz.name()) {
+        if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Lorentz.name()) {
             for (address, v) in &contracts {
                 m.insert(*address, v.clone());
                 info!(
@@ -1065,7 +1061,7 @@ where
     }
     
     if spec.is_maxwell_transition_at_timestamp(block_number, block_time, parent_block_time) {
-        if let Ok(contracts) = get_system_contract_codes(spec, &BscHardfork::Maxwell.name()) {
+        if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Maxwell.name()) {
             for (address, v) in &contracts {
                 m.insert(*address, v.clone());
                 info!(
@@ -1081,7 +1077,7 @@ where
     }
     
     if spec.is_fermi_transition_at_timestamp(block_number, block_time, parent_block_time) {
-        if let Ok(contracts) = get_system_contract_codes(spec, &BscHardfork::Fermi.name()) {
+        if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Fermi.name()) {
             for (address, v) in &contracts {
                 m.insert(*address, v.clone());
                 info!(
