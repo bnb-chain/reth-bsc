@@ -762,15 +762,12 @@ where
 /// Get all system contracts to be upgraded.
 /// 
 /// This function follows the exact upgrade order from Geth-BSC:
-/// https://github.com/will-2012/bsc/blob/master/core/systemcontracts/upgrade.go#L1042
+/// https://github.com/bnb-chain/bsc/blob/master/core/systemcontracts/upgrade.go#L1078
 /// 
 /// The order is critical because:
 /// 1. Multiple hardforks may activate at the same block/timestamp
 /// 2. Later hardforks may upgrade the same contract addresses as earlier ones
-/// 3. The final state must match the exact upgrade order in Geth
-/// 
-/// Note: This uses `IsOn*` semantics (checking if fork activates at THIS block)
-/// via the `is_*_transition` methods, which is equivalent to Geth's `IsOn*` methods.
+/// 3. The final state must match the exact upgrade order in Geth-BSC
 pub fn get_upgrade_system_contracts<ChainSpec>(
     spec: &ChainSpec,
     block_number: BlockNumber,

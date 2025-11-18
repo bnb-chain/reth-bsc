@@ -512,7 +512,7 @@ where
             self.evm.block().timestamp.to::<u64>(), 
             parent_timestamp
         ) {
-            debug!(
+            info!(
                 target: "bsc::executor::feynman",
                 block_number = self.evm.block().number.to::<u64>(),
                 "Initializing Feynman contracts"
@@ -522,7 +522,7 @@ where
 
         // Deploy genesis contracts on Block 1
         if self.evm.block().number == uint!(1U256) {
-            debug!(
+            info!(
                 target: "bsc::executor::genesis",
                 "Deploying genesis contracts on Block 1"
             );
