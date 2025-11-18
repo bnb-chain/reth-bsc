@@ -18,6 +18,7 @@ use reth_primitives::{Transaction, TransactionSigned};
 use revm::state::Bytecode;
 use std::collections::HashMap;
 use thiserror::Error;
+use tracing::info;
 
 mod abi;
 mod embedded_contracts;
@@ -638,19 +639,19 @@ pub enum SystemContractError {
 /// Return hardforks which contain upgrades of system contracts.
 fn hardforks_with_system_contracts() -> Vec<BscHardfork> {
     vec![
+        BscHardfork::Ramanujan,
+        BscHardfork::Niels,
+        BscHardfork::MirrorSync,
         BscHardfork::Bruno,
         BscHardfork::Euler,
+        BscHardfork::Gibbs,
+        BscHardfork::Moran,
+        BscHardfork::Planck,
+        BscHardfork::Luban,
+        BscHardfork::Plato,
+        BscHardfork::Kepler,
         BscHardfork::Feynman,
         BscHardfork::FeynmanFix,
-        BscHardfork::Gibbs,
-        BscHardfork::Kepler,
-        BscHardfork::Luban,
-        BscHardfork::MirrorSync,
-        BscHardfork::Moran,
-        BscHardfork::Niels,
-        BscHardfork::Planck,
-        BscHardfork::Plato,
-        BscHardfork::Ramanujan,
         BscHardfork::HaberFix,
         BscHardfork::Bohr,
         BscHardfork::Pascal,
@@ -759,6 +760,17 @@ where
 }
 
 /// Get all system contracts to be upgraded.
+/// 
+/// This function follows the exact upgrade order from Geth-BSC:
+/// https://github.com/will-2012/bsc/blob/master/core/systemcontracts/upgrade.go#L1042
+/// 
+/// The order is critical because:
+/// 1. Multiple hardforks may activate at the same block/timestamp
+/// 2. Later hardforks may upgrade the same contract addresses as earlier ones
+/// 3. The final state must match the exact upgrade order in Geth
+/// 
+/// Note: This uses `IsOn*` semantics (checking if fork activates at THIS block)
+/// via the `is_*_transition` methods, which is equivalent to Geth's `IsOn*` methods.
 pub fn get_upgrade_system_contracts<ChainSpec>(
     spec: &ChainSpec,
     block_number: BlockNumber,
@@ -768,20 +780,329 @@ pub fn get_upgrade_system_contracts<ChainSpec>(
 where
     ChainSpec: EthChainSpec + BscHardforks + Hardforks,
 {
+    use tracing::debug;
+    
+    debug!(
+        target: "bsc::system_contracts::upgrade",
+        block_number,
+        block_time,
+        parent_block_time,
+        "get_upgrade_system_contracts called"
+    );
+    
     let mut m = HashMap::new();
-    for (fork, condition) in spec.forks_iter() {
-        if condition.transitions_at_block(block_number) ||
-            condition.transitions_at_timestamp(block_time, parent_block_time)
-        {
-            if let Ok(contracts) = get_system_contract_codes(spec, fork.name()) {
-                for (address, v) in &contracts {
-                    m.insert(*address, v.clone());
-                }
-            } else {
-                return Err(SystemContractError::FailToUpdate);
+    
+    // Apply upgrades in the exact order as Geth-BSC upgradeBuildInSystemContract
+    // Each hardfork upgrade will overwrite previous upgrades for the same address
+    
+    // Block-based hardforks (legacy) - use IsOn* semantics via transition methods
+    if spec.is_ramanujan_transition_at_block(block_number) {
+        if let Ok(contracts) = get_system_contract_codes(spec, &BscHardfork::Ramanujan.name()) {
+            for (address, v) in &contracts {
+                m.insert(*address, v.clone());
+                info!(
+                    target: "bsc::system_contracts::upgrade",
+                    block_number = block_number,
+                    block_time = block_time,
+                    parent_block_time = parent_block_time,
+                    address = ?address,
+                    "Ramanujan upgrade contract"
+                );
             }
         }
     }
+    
+    if spec.is_niels_transition_at_block(block_number) {
+        if let Ok(contracts) = get_system_contract_codes(spec, &BscHardfork::Niels.name()) {
+            for (address, v) in &contracts {
+                m.insert(*address, v.clone());
+                info!(
+                    target: "bsc::system_contracts::upgrade",
+                    block_number = block_number,
+                    block_time = block_time,
+                    parent_block_time = parent_block_time,
+                    address = ?address,
+                    "Niels upgrade contract"
+                );
+            }
+        }
+    }
+    
+    if spec.is_mirror_sync_transition_at_block(block_number) {
+        if let Ok(contracts) = get_system_contract_codes(spec, &BscHardfork::MirrorSync.name()) {
+            for (address, v) in &contracts {
+                m.insert(*address, v.clone());
+                info!(
+                    target: "bsc::system_contracts::upgrade",
+                    block_number = block_number,
+                    block_time = block_time,
+                    parent_block_time = parent_block_time,
+                    address = ?address,
+                    "MirrorSync upgrade contract"
+                );
+            }
+        }
+    }
+    
+    if spec.is_bruno_transition_at_block(block_number) {
+        if let Ok(contracts) = get_system_contract_codes(spec, &BscHardfork::Bruno.name()) {
+            for (address, v) in &contracts {
+                m.insert(*address, v.clone());
+                info!(
+                    target: "bsc::system_contracts::upgrade",
+                    block_number = block_number,
+                    block_time = block_time,
+                    parent_block_time = parent_block_time,
+                    address = ?address,
+                    "Bruno upgrade contract"
+                );
+            }
+        }
+    }
+    
+    if spec.is_euler_transition_at_block(block_number) {
+        if let Ok(contracts) = get_system_contract_codes(spec, &BscHardfork::Euler.name()) {
+            for (address, v) in &contracts {
+                m.insert(*address, v.clone());
+                info!(
+                    target: "bsc::system_contracts::upgrade",
+                    block_number = block_number,
+                    block_time = block_time,
+                    parent_block_time = parent_block_time,
+                    address = ?address,
+                    "Euler upgrade contract"
+                );
+            }
+        }
+    }
+    
+    if spec.is_gibbs_transition_at_block(block_number) {
+        if let Ok(contracts) = get_system_contract_codes(spec, &BscHardfork::Gibbs.name()) {
+            for (address, v) in &contracts {
+                m.insert(*address, v.clone());
+                info!(
+                    target: "bsc::system_contracts::upgrade",
+                    block_number = block_number,
+                    block_time = block_time,
+                    parent_block_time = parent_block_time,
+                    address = ?address,
+                    "Gibbs upgrade contract"
+                );
+            }
+        }
+    }
+    
+    if spec.is_moran_transition_at_block(block_number) {
+        if let Ok(contracts) = get_system_contract_codes(spec, &BscHardfork::Moran.name()) {
+            for (address, v) in &contracts {
+                m.insert(*address, v.clone());
+                info!(
+                    target: "bsc::system_contracts::upgrade",
+                    block_number = block_number,
+                    block_time = block_time,
+                    parent_block_time = parent_block_time,
+                    address = ?address,
+                    "Moran upgrade contract"
+                );
+            }
+        }
+    }
+    
+    if spec.is_planck_transition_at_block(block_number) {
+        if let Ok(contracts) = get_system_contract_codes(spec, &BscHardfork::Planck.name()) {
+            for (address, v) in &contracts {
+                m.insert(*address, v.clone());
+                info!(
+                    target: "bsc::system_contracts::upgrade",
+                    block_number = block_number,
+                    block_time = block_time,
+                    parent_block_time = parent_block_time,
+                    address = ?address,
+                    "Planck upgrade contract"
+                );
+            }
+        }
+    }
+    
+    if spec.is_luban_transition_at_block(block_number) {
+        if let Ok(contracts) = get_system_contract_codes(spec, &BscHardfork::Luban.name()) {
+            for (address, v) in &contracts {
+                m.insert(*address, v.clone());
+                info!(
+                    target: "bsc::system_contracts::upgrade",
+                    block_number = block_number,
+                    block_time = block_time,
+                    parent_block_time = parent_block_time,
+                    address = ?address,
+                    "Luban upgrade contract"
+                );
+            }
+        }
+    }
+    
+    if spec.is_plato_transition_at_block(block_number) {
+        if let Ok(contracts) = get_system_contract_codes(spec, &BscHardfork::Plato.name()) {
+            for (address, v) in &contracts {
+                m.insert(*address, v.clone());
+                info!(
+                    target: "bsc::system_contracts::upgrade",
+                    block_number = block_number,
+                    block_time = block_time,
+                    parent_block_time = parent_block_time,
+                    address = ?address,
+                    "Plato upgrade contract"
+                );
+            }
+        }
+    }
+    
+    // Timestamp-based hardforks (newer) - use IsOn* semantics via transition methods
+    // Note: Shanghai has empty upgrade config in Geth
+    
+    if spec.is_kepler_transition_at_timestamp(block_number, block_time, parent_block_time) {
+        if let Ok(contracts) = get_system_contract_codes(spec, &BscHardfork::Kepler.name()) {
+            for (address, v) in &contracts {
+                m.insert(*address, v.clone());
+                info!(
+                    target: "bsc::system_contracts::upgrade",
+                    block_number = block_number,
+                    block_time = block_time,
+                    parent_block_time = parent_block_time,
+                    address = ?address,
+                    "Kepler upgrade contract"
+                );
+            }
+        }
+    }
+    
+    if spec.is_feynman_transition_at_timestamp(block_number, block_time, parent_block_time) {
+        if let Ok(contracts) = get_system_contract_codes(spec, &BscHardfork::Feynman.name()) {
+            for (address, v) in &contracts {
+                m.insert(*address, v.clone());
+                info!(
+                    target: "bsc::system_contracts::upgrade",
+                    block_number = block_number,
+                    block_time = block_time,
+                    parent_block_time = parent_block_time,
+                    address = ?address,
+                    "Feynman upgrade contract"
+                );
+            }
+        }
+    }
+    
+    if spec.is_feynman_fix_transition_at_timestamp(block_number, block_time, parent_block_time) {
+        if let Ok(contracts) = get_system_contract_codes(spec, &BscHardfork::FeynmanFix.name()) {
+            for (address, v) in &contracts {
+                m.insert(*address, v.clone());
+                info!(
+                    target: "bsc::system_contracts::upgrade",
+                    block_number = block_number,
+                    block_time = block_time,
+                    parent_block_time = parent_block_time,
+                    address = ?address,
+                    "Feynman fix upgrade contract"
+                );
+            }
+        }
+    }
+    
+    if spec.is_haber_fix_transition_at_timestamp(block_number, block_time, parent_block_time) {
+        if let Ok(contracts) = get_system_contract_codes(spec, &BscHardfork::HaberFix.name()) {
+            for (address, v) in &contracts {
+                m.insert(*address, v.clone());
+                info!(
+                    target: "bsc::system_contracts::upgrade",
+                    block_number = block_number,
+                    block_time = block_time,
+                    parent_block_time = parent_block_time,
+                    address = ?address,
+                    "Haber fix upgrade contract"
+                );
+            }
+        }
+    }
+    
+    if spec.is_bohr_transition_at_timestamp(block_number, block_time, parent_block_time) {
+        if let Ok(contracts) = get_system_contract_codes(spec, &BscHardfork::Bohr.name()) {
+            for (address, v) in &contracts {
+                m.insert(*address, v.clone());
+                info!(
+                    target: "bsc::system_contracts::upgrade",
+                    block_number = block_number,
+                    block_time = block_time,
+                    parent_block_time = parent_block_time,
+                    address = ?address,
+                    "Bohr upgrade contract"
+                );
+            }
+        }
+    }
+    
+    if spec.is_pascal_transition_at_timestamp(block_number, block_time, parent_block_time) {
+        if let Ok(contracts) = get_system_contract_codes(spec, &BscHardfork::Pascal.name()) {
+            for (address, v) in &contracts {
+                m.insert(*address, v.clone());
+                info!(
+                    target: "bsc::system_contracts::upgrade",
+                    block_number = block_number,
+                    block_time = block_time,
+                    parent_block_time = parent_block_time,
+                    address = ?address,
+                    "Pascal upgrade contract"
+                );
+            }
+        }
+    }
+    
+    if spec.is_lorentz_transition_at_timestamp(block_number, block_time, parent_block_time) {
+        if let Ok(contracts) = get_system_contract_codes(spec, &BscHardfork::Lorentz.name()) {
+            for (address, v) in &contracts {
+                m.insert(*address, v.clone());
+                info!(
+                    target: "bsc::system_contracts::upgrade",
+                    block_number = block_number,
+                    block_time = block_time,
+                    parent_block_time = parent_block_time,
+                    address = ?address,
+                    "Lorentz upgrade contract"
+                );
+            }
+        }
+    }
+    
+    if spec.is_maxwell_transition_at_timestamp(block_number, block_time, parent_block_time) {
+        if let Ok(contracts) = get_system_contract_codes(spec, &BscHardfork::Maxwell.name()) {
+            for (address, v) in &contracts {
+                m.insert(*address, v.clone());
+                info!(
+                    target: "bsc::system_contracts::upgrade",
+                    block_number = block_number,
+                    block_time = block_time,
+                    parent_block_time = parent_block_time,
+                    address = ?address,
+                    "Maxwell upgrade contract"
+                );
+            }
+        }
+    }
+    
+    if spec.is_fermi_transition_at_timestamp(block_number, block_time, parent_block_time) {
+        if let Ok(contracts) = get_system_contract_codes(spec, &BscHardfork::Fermi.name()) {
+            for (address, v) in &contracts {
+                m.insert(*address, v.clone());
+                info!(
+                    target: "bsc::system_contracts::upgrade",
+                    block_number = block_number,
+                    block_time = block_time,
+                    parent_block_time = parent_block_time,
+                    address = ?address,
+                    "Fermi upgrade contract"
+                );
+            }
+        }
+    }
+    
     Ok(m)
 }
 

@@ -131,6 +131,14 @@ where
             };
         }
 
+        // baseFee should only be set after London fork (EIP-1559)
+        let block_number = evm_env.block_env.number.saturating_to();
+        let base_fee_per_gas = if self.chain_spec.is_london_active_at_block(block_number) {
+            Some(evm_env.block_env.basefee)
+        } else {
+            None
+        };
+
         let mut header = Header {
             parent_hash: eth_ctx.parent_hash,
             ommers_hash: EMPTY_OMMER_ROOT_HASH,
@@ -143,8 +151,8 @@ where
             timestamp,
             mix_hash: evm_env.block_env.prevrandao.unwrap_or_default(),
             nonce: BEACON_NONCE.into(),
-            base_fee_per_gas: Some(evm_env.block_env.basefee),
-            number: evm_env.block_env.number.saturating_to(),
+            base_fee_per_gas,
+            number: block_number,
             gas_limit: evm_env.block_env.gas_limit,
             difficulty: evm_env.block_env.difficulty,
             gas_used: *gas_used,
@@ -255,6 +263,13 @@ where
             };
         }
 
+        // baseFee should only be set after London fork (EIP-1559)
+        let base_fee_per_gas = if self.chain_spec.is_london_active_at_block(block_number) {
+            Some(evm_env.block_env.basefee)
+        } else {
+            None
+        };
+
         let mut header = Header {
             parent_hash: eth_ctx.parent_hash,
             ommers_hash: EMPTY_OMMER_ROOT_HASH,
@@ -267,7 +282,7 @@ where
             timestamp,
             mix_hash: evm_env.block_env.prevrandao.unwrap_or_default(),
             nonce: BEACON_NONCE.into(),
-            base_fee_per_gas: Some(evm_env.block_env.basefee),
+            base_fee_per_gas,
             number: evm_env.block_env.number.saturating_to(),
             gas_limit: evm_env.block_env.gas_limit,
             difficulty: evm_env.block_env.difficulty,

@@ -153,21 +153,84 @@ where
     }
 
     /// Applies system contract upgrades if the Feynman fork is not yet active.
-    fn upgrade_contracts(&mut self) -> Result<(), BlockExecutionError> {
+    fn upgrade_contracts(&mut self, block_number: BlockNumber, block_timestamp: u64, parent_timestamp: u64) -> Result<(), BlockExecutionError> {
+        debug!(
+            target: "bsc::executor::upgrade",
+            block_number,
+            block_timestamp,
+            parent_timestamp,
+            "Calling get_upgrade_system_contracts"
+        );
+        
         let contracts = get_upgrade_system_contracts(
             &self.spec,
-            self.evm.block().number.to(),
-            self.evm.block().timestamp.to(),
-            self.inner_ctx.parent_header.as_ref().unwrap().timestamp,
+            block_number,
+            block_timestamp,
+            parent_timestamp,
         )
         .map_err(|_| BlockExecutionError::msg("Failed to get upgrade system contracts"))?;
 
+        debug!(
+            target: "bsc::executor::upgrade",
+            block_number,
+            contracts_count = contracts.len(),
+            "Got upgrade system contracts"
+        );
+
         for (address, maybe_code) in contracts {
             if let Some(code) = maybe_code {
+                debug!(
+                    target: "bsc::executor::upgrade",
+                    block_number,
+                    address = ?address,
+                    code_len = code.len(),
+                    "Upgrading system contract"
+                );
                 self.upgrade_system_contract(address, code)?;
             }
         }
 
+        Ok(())
+    }
+
+    /// Mimics Geth-BSC's TryUpdateBuildInSystemContract function
+    /// https://github.com/will-2012/bsc/blob/master/core/systemcontracts/upgrade.go#L1060
+    fn try_update_build_in_system_contract(&mut self, block_number: BlockNumber, block_timestamp: u64, parent_timestamp: u64, at_block_begin: bool) -> Result<(), BlockExecutionError> {
+        if at_block_begin {
+            // Upgrade system contracts before Feynman at block begin
+            if !self.spec.is_feynman_active_at_timestamp(block_number, parent_timestamp) {
+                debug!(
+                    target: "bsc::executor::upgrade",
+                    block_number,
+                    parent_timestamp,
+                    "Upgrading system contracts at block begin (before Feynman)"
+                );
+                self.upgrade_contracts(block_number, block_timestamp, parent_timestamp)?;
+            }
+            
+            // HistoryStorageAddress is a special system contract in BSC, which can't be upgraded
+            // This must be done at block begin when Prague activates
+            if self.spec.is_prague_transition_at_block_and_timestamp(block_number, block_timestamp, parent_timestamp) {
+                debug!(
+                    target: "bsc::executor::prague",
+                    block_number,
+                    block_timestamp,
+                    "Deploying HistoryStorageAddress contract (Prague transition at block begin)"
+                );
+                self.apply_history_storage_account(block_number)?;
+            }
+        } else {
+            // Upgrade system contracts after Feynman at block end
+            if self.spec.is_feynman_active_at_timestamp(block_number, parent_timestamp) {
+                debug!(
+                    target: "bsc::executor::upgrade",
+                    block_number,
+                    parent_timestamp,
+                    "Upgrading system contracts at block end (Feynman active)"
+                );
+                self.upgrade_contracts(block_number, block_timestamp, parent_timestamp)?;
+            }
+        }
         Ok(())
     }
 
@@ -297,52 +360,37 @@ where
             self.check_new_block(&block_env)?;
         }
         
-        // set state clear flag if the block is after the Spurious Dragon hardfork.
-        let state_clear_flag = self.spec.is_spurious_dragon_active_at_block(self.evm.block().number.to());
+        // set state clear flag if the block is after the Spurious Dragon or Nano hardfork.
+        // BSC's Nano hardfork implements EIP-161 (state clearing), similar to Spurious Dragon
+        let block_number = self.evm.block().number.to();
+        let state_clear_flag = self.spec.is_spurious_dragon_active_at_block(block_number)
+            || self.spec.is_nano_active_at_block(block_number);
         self.evm.db_mut().set_state_clear_flag(state_clear_flag);
         let parent_timestamp = self.inner_ctx.parent_header.as_ref().unwrap().timestamp;
         debug!(
-            target: "bsc::executor::prague",
+            target: "bsc::executor::upgrade",
             block_number = self.evm.block().number.to::<u64>(),
             block_timestamp = self.evm.block().timestamp.to::<u64>(),
             parent_timestamp,
-            "Prague hardfork check parameters"
+            "Calling try_update_build_in_system_contract at block begin"
         );
-        // Note: here use a parent timestamp to check if the feynman fork is active. 
-        if !self.spec.is_feynman_active_at_timestamp(self.evm.block().number.to::<u64>(), parent_timestamp) {
-            self.upgrade_contracts()?;
-        }
+        
+        // TryUpdateBuildInSystemContract with atBlockBegin=true
+        // This handles:
+        // 1. System contract upgrades (before Feynman)
+        // 2. HistoryStorageAddress deployment (Prague transition)
+        self.try_update_build_in_system_contract(
+            self.evm.block().number.to::<u64>(), 
+            self.evm.block().timestamp.to::<u64>(), 
+            parent_timestamp, 
+            true
+        )?;
      
-        // enable BEP-440/EIP-2935 for historical block hashes from state
-        let is_prague_transition = self.spec.is_prague_transition_at_block_and_timestamp(self.evm.block().number.to::<u64>(), self.evm.block().timestamp.to::<u64>(), parent_timestamp);
-        let is_prague_active = self.spec.is_prague_active_at_block_and_timestamp(self.evm.block().number.to::<u64>(), self.evm.block().timestamp.to::<u64>());
-        
-        // Check if HistoryStorageAddress contract exists in state
-        let history_contract_exists = self.evm.db_mut().load_cache_account(HISTORY_STORAGE_ADDRESS)
-            .ok()
-            .and_then(|acc| acc.account_info())
-            .map(|info| info.nonce > 0 || !info.code_hash.is_zero())
-            .unwrap_or(false);
-        
-        debug!(
-            target: "bsc::executor::prague",
-            block_number = self.evm.block().number.to::<u64>(),
-            block_hash = ?self.evm.block().blob_excess_gas_and_price,
-            is_prague_transition,
-            is_prague_active,
-            is_miner = self.ctx.is_miner,
-            history_contract_exists,
-            "Prague hardfork check result and contract state"
-        );
-        if is_prague_transition {
-                debug!(
-                    target: "bsc::executor::prague",
-                    block_number = self.evm.block().number.to::<u64>(),
-                    "Calling apply_history_storage_account (Prague transition)"
-                );
-                self.apply_history_storage_account(self.evm.block().number.to::<u64>())?;
-        }
-        if is_prague_active {
+        // Apply historical block hashes if Prague is active
+        if self.spec.is_prague_active_at_block_and_timestamp(
+            self.evm.block().number.to::<u64>(), 
+            self.evm.block().timestamp.to::<u64>()
+        ) {
             debug!(
                 target: "bsc::executor::prague",
                 block_number = self.evm.block().number.to::<u64>(),
@@ -351,12 +399,6 @@ where
             );
             self.system_caller
                 .apply_blockhashes_contract_call(self.ctx.base.parent_hash, &mut self.evm)?;
-        } else {
-            trace!(
-                target: "bsc::executor::prague",
-                block_number = self.evm.block().number.to::<u64>(),
-                "Prague not active, skipping apply_blockhashes_contract_call"
-            );
         }
 
         Ok(())
@@ -478,18 +520,44 @@ where
             "Start to finish"
         );
 
-        // If first block deploy genesis contracts
-        if self.evm.block().number == uint!(1U256) {
-            self.deploy_genesis_contracts(self.evm.block().beneficiary)?;
-        }
         let parent_timestamp = self.inner_ctx.parent_header.as_ref().unwrap().timestamp;
-        // Note: here use a parent timestamp to check if the feynman fork is active. 
-        if self.spec.is_feynman_active_at_timestamp(self.evm.block().number.to::<u64>(), parent_timestamp) {
-            self.upgrade_contracts()?;
+        
+        // TryUpdateBuildInSystemContract with atBlockBegin=false
+        // This handles system contract upgrades after Feynman
+        debug!(
+            target: "bsc::executor::upgrade",
+            block_number = self.evm.block().number.to::<u64>(),
+            parent_timestamp,
+            "Calling try_update_build_in_system_contract at block end"
+        );
+        self.try_update_build_in_system_contract(
+            self.evm.block().number.to::<u64>(), 
+            self.evm.block().timestamp.to::<u64>(), 
+            parent_timestamp, 
+            false
+        )?;
+
+        // Initialize Feynman contracts on transition block
+        if self.spec.is_feynman_transition_at_timestamp(
+            self.evm.block().number.to::<u64>(), 
+            self.evm.block().timestamp.to::<u64>(), 
+            parent_timestamp
+        ) {
+            debug!(
+                target: "bsc::executor::feynman",
+                block_number = self.evm.block().number.to::<u64>(),
+                "Initializing Feynman contracts"
+            );
+            self.initialize_feynman_contracts(self.evm.block().beneficiary)?;
         }
 
-        if self.spec.is_feynman_transition_at_timestamp(self.evm.block().number.to::<u64>(), self.evm.block().timestamp.to::<u64>(), parent_timestamp) {
-            self.initialize_feynman_contracts(self.evm.block().beneficiary)?;
+        // Deploy genesis contracts on Block 1
+        if self.evm.block().number == uint!(1U256) {
+            debug!(
+                target: "bsc::executor::genesis",
+                "Deploying genesis contracts on Block 1"
+            );
+            self.deploy_genesis_contracts(self.evm.block().beneficiary)?;
         }
 
         if self.ctx.is_miner {
