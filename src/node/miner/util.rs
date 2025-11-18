@@ -100,8 +100,13 @@ where
     parlia.prepare_turn_length(parent_snap, new_header).
         map_err(|e| SignerError::SigningFailed(format!("Failed to prepare turn length: {}", e)))?;
     
-    parlia.assemble_vote_attestation(parent_snap, parent_header, new_header, snapshot_provider).
-        map_err(|e| SignerError::SigningFailed(format!("Failed to assemble vote attestation: {}", e)))?;
+    if let Err(e) = parlia.assemble_vote_attestation(parent_snap, parent_header, new_header, snapshot_provider) {
+        tracing::warn!(
+            target: "bsc::miner",
+            error = %e,
+            "Failed to assemble vote attestation, continuing without it"
+        );
+    }
 
     {   // seal header
         let mut extra_data = new_header.extra_data.to_vec();
