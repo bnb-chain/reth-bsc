@@ -872,20 +872,18 @@ where
                 warn!("Failed to send mined block due to import sender not initialised");
                 return Err("Failed to send mined block due to import sender not initialised".into());
             }
-        } else {
-            if let Some(sender) = get_block_import_sender() {
-                let peer_id = get_local_peer_id_or_default();
-                let incoming: IncomingBlock = (msg.clone(), peer_id);
-                if sender.send(incoming).is_err() {
-                    warn!("Failed to send built block to import service due to channel closed");
-                    return Err("Failed to send built block to import service due to channel closed".into());
-                } else {
-                    debug!("Succeed to send built block to import service");
-                }
+        } else if let Some(sender) = get_block_import_sender() {
+            let peer_id = get_local_peer_id_or_default();
+            let incoming: IncomingBlock = (msg.clone(), peer_id);
+            if sender.send(incoming).is_err() {
+                warn!("Failed to send built block to import service due to channel closed");
+                return Err("Failed to send built block to import service due to channel closed".into());
             } else {
-                warn!("Failed to send built block due to import sender not initialised");
-                return Err("Failed to send built block due to import sender not initialised".into());
+                debug!("Succeed to send built block to import service");
             }
+        } else {
+            warn!("Failed to send built block due to import sender not initialised");
+            return Err("Failed to send built block due to import sender not initialised".into());
         }
 
         // Targeted ETH NewBlock/NewBlockHashes to EVN peers for full broadcast parity.

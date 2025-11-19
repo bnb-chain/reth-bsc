@@ -58,14 +58,10 @@ impl BuiltPayload for BscBuiltPayload {
     }
 
     fn executed_block(&self) -> Option<ExecutedBlockWithTrieUpdates<Self::Primitives>> {
-        if let Some(trie) = self.executed_trie.clone() {
-            Some(ExecutedBlockWithTrieUpdates {
-                block: self.executed_block.clone(),
-                trie: trie,
-            })
-        } else {
-            None
-        }
+        self.executed_trie.clone().map(|trie| ExecutedBlockWithTrieUpdates {
+            block: self.executed_block.clone(),
+            trie,
+        })
     }
 }
 

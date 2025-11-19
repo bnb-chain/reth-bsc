@@ -565,6 +565,7 @@ mod tests {
             handle_engine_msg(from_engine, responses).await;
 
             let (to_import, from_network) = mpsc::unbounded_channel();
+            let (to_import_mined, from_builder) = mpsc::unbounded_channel();
             let (to_hashes, from_hashes) = mpsc::unbounded_channel();
             let (to_network, import_outcome) = mpsc::unbounded_channel();
 
@@ -575,6 +576,7 @@ mod tests {
                 chain_spec,
                 engine_handle, 
                 from_network, 
+                from_builder,
                 from_hashes,
                 to_network
             );
