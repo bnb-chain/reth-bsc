@@ -94,8 +94,9 @@ where
             tracing::debug!("Succeed to query cached validator result, block_number: {}, block_hash: {}", parent_header.number, parent_header.hash_slow());
             for addr in addrs {
                 validators.0.push(*addr);
-                validators.1.push(*vote_addrs.get(addr).
-                    ok_or(SignerError::SigningFailed(format!("Vote address not found in custom ctx: {}", addr)))?);
+                if let Some(vote_addr) = vote_addrs.get(addr) {
+                    validators.1.push(*vote_addr);
+                }
             }
             
             parlia.prepare_validators(parent_snap, Some(validators), new_header);
