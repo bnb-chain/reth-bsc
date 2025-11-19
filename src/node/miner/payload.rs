@@ -26,6 +26,8 @@ use reth_revm::cached::CachedReads;
 use reth_primitives::HeaderTy;
 use reth_revm::cancelled::ManualCancel;
 use std::sync::Arc;
+use reth_chain_state::{ExecutedBlock, ExecutedTrieUpdates};
+use reth_evm::execute::ExecutionOutcome;
 use reth_basic_payload_builder::PayloadConfig;
 use tokio::sync::{oneshot, mpsc};
 use reth::payload::EthPayloadBuilderAttributes;
@@ -112,7 +114,12 @@ impl<Pool, Client, EvmConfig> BscPayloadBuilder<Pool, Client, EvmConfig>
 where
     Client: StateProviderFactory + 'static,
     EvmConfig: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
-    <EvmConfig as ConfigureEvm>::Primitives: reth_primitives_traits::NodePrimitives<BlockHeader = alloy_consensus::Header, SignedTx = alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip4844>, Block = crate::node::primitives::BscBlock>,
+    <EvmConfig as ConfigureEvm>::Primitives: reth_primitives_traits::NodePrimitives<
+        BlockHeader = alloy_consensus::Header,
+        SignedTx = alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip4844>,
+        Block = crate::node::primitives::BscBlock,
+        Receipt = reth_ethereum_primitives::Receipt
+    >,
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>> + 'static,
 {
     pub const fn new(
@@ -396,7 +403,7 @@ where
 
         // add system txs to payload.
         let finalize_start = std::time::Instant::now();
-        let BlockBuilderOutcome { execution_result, block, .. } = builder.finish(&state_provider)?;
+        let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } = builder.finish(&state_provider)?;
         let mut sealed_block = Arc::new(block.sealed_block().clone());
         
         // Update miner metrics
@@ -466,9 +473,20 @@ where
         sealed_block = Arc::new(plain.into());
     
         let payload = BscBuiltPayload {
-            block: sealed_block,
+            block: sealed_block.clone(),
             fees: total_fees,
-            requests: Some(execution_result.requests),
+            requests: Some(execution_result.requests.clone()),
+            executed_block: ExecutedBlock {
+                recovered_block: Arc::new(block),
+                execution_output: Arc::new(ExecutionOutcome::new(
+                    db.take_bundle(),
+                    vec![execution_result.receipts.clone()],
+                    sealed_block.header().number(),
+                    vec![execution_result.requests.clone()],
+                )),
+                hashed_state: Arc::new(hashed_state),
+            },
+            executed_trie: Some(ExecutedTrieUpdates::Present(Arc::new(trie_updates))),
         };
         Ok(payload)
     }
@@ -527,7 +545,7 @@ impl<Pool, Client, EvmConfig> BscPayloadJob<Pool, Client, EvmConfig>
 where
     Client: StateProviderFactory + reth_provider::HeaderProvider<Header = alloy_consensus::Header> + reth_provider::BlockHashReader + Clone + 'static,
     EvmConfig: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
-    <EvmConfig as ConfigureEvm>::Primitives: reth_primitives_traits::NodePrimitives<BlockHeader = alloy_consensus::Header, SignedTx = alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip4844>, Block = crate::node::primitives::BscBlock>,
+    <EvmConfig as ConfigureEvm>::Primitives: reth_primitives_traits::NodePrimitives<BlockHeader = alloy_consensus::Header, SignedTx = alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip4844>, Block = crate::node::primitives::BscBlock, Receipt = reth_ethereum_primitives::Receipt>,
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>> + 'static,
 {
     /// Creates a new BscPayloadJob and returns both the job and its handle

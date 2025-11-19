@@ -1,9 +1,6 @@
 use super::handle::ImportHandle;
 use crate::{
-    chainspec::BscChainSpec,
-    consensus::{ParliaConsensusErr, parlia::vote_pool},
-    node::{engine_api::payload::BscPayloadTypes, network::BscNewBlock, consensus::BscForkChoiceEngine},
-    BscBlock, BscBlockBody,
+    BscBlock, BscBlockBody, chainspec::BscChainSpec, consensus::{ParliaConsensusErr, parlia::vote_pool}, node::{consensus::BscForkChoiceEngine, engine::BscBuiltPayload, engine_api::payload::BscPayloadTypes, network::BscNewBlock}
 };
 use alloy_consensus::{BlockBody, Header};
 use alloy_eips::BlockNumberOrTag;
@@ -20,12 +17,13 @@ use reth_network::{
 };
 use reth_network_api::PeerId;
 use reth_node_ethereum::EthEngineTypes;
+use reth_payload_builder_primitives::Events;
 use reth_payload_primitives::{BuiltPayload, EngineApiMessageVersion, PayloadTypes};
 use reth_primitives::NodePrimitives;
 use reth_primitives_traits::{AlloyBlockHeader, Block};
 use reth_provider::{BlockHashReader, BlockNumReader, BlockReaderIdExt, HeaderProvider};
 use reth_eth_wire_types::broadcast::NewBlockHashes;
-use reth_eth_wire::{GetBlockHeaders, BlockHashNumber};
+use reth_eth_wire::{BlockHashNumber, GetBlockHeaders, NewBlock};
 use reth_network::{NetworkHandle, message::{PeerResponse, BlockRequest}, FetchClient};
 use std::{
     future::Future,
@@ -50,6 +48,9 @@ type ImportFut = Pin<Box<dyn Future<Output = Option<Outcome>> + Send + Sync>>;
 /// Channel message type for incoming blocks
 pub(crate) type IncomingBlock = (BlockMsg, PeerId);
 
+/// Channel message type for incoming mined blocks
+pub(crate) type IncomingMinedBlock = (BscBuiltPayload, BlockMsg);
+
 /// Channel message type for incoming block hashes
 pub(crate) type IncomingHashes = (NewBlockHashes, PeerId);
 
@@ -69,6 +70,8 @@ where
     forkchoice_engine: BscForkChoiceEngine<Provider>,
     /// Receive the new block from the network
     from_network: UnboundedReceiver<IncomingBlock>,
+    /// Receive the new block from the network
+    from_builder: UnboundedReceiver<IncomingMinedBlock>,
     /// Receive block hashes from the network for downloading
     from_hashes: UnboundedReceiver<IncomingHashes>,
     /// Send the event of the import to the network
@@ -89,6 +92,7 @@ where
         chain_spec: Arc<BscChainSpec>,
         engine: ConsensusEngineHandle<BscPayloadTypes>,
         from_network: UnboundedReceiver<IncomingBlock>,
+        from_builder: UnboundedReceiver<IncomingMinedBlock>,
         from_hashes: UnboundedReceiver<IncomingHashes>,
         to_network: UnboundedSender<ImportEvent>,
     ) -> Self {
@@ -106,6 +110,7 @@ where
             engine,
             forkchoice_engine,
             from_network,
+            from_builder,
             from_hashes,
             to_network,
             pending_imports: FuturesUnordered::new(),
@@ -147,13 +152,23 @@ where
     }
 
     /// Add a new block import task to the pending imports
-    fn on_new_block(&mut self, block: BlockMsg, peer_id: PeerId) {
-        // When bench-test feature is enabled, skip block import processing
-        #[cfg(feature = "bench-test")]
-        {
-            return;
-        }
+    fn on_new_mined_block(&mut self, payload: BscBuiltPayload, block_msg: NewBlockMessage<BscNewBlock>) {
+        // Send ValidHeader announcement to trigger NewBlock diffusion from few peers
+        let _ = self
+            .to_network
+            .send(BlockImportEvent::Announcement(BlockValidation::ValidHeader { block: block_msg }));
         
+        // Broadcast built payload event for fast consumers
+        // TODO: just set canonical to engine tree, need check FCU later?
+        if let Some(tx) = crate::shared::get_payload_events_tx() {
+            let _ = tx.send(Events::<BscPayloadTypes>::BuiltPayload(payload));
+        } else {
+            tracing::warn!("Failed to send mined block due to payload events channel not initialised");
+        }
+    }
+
+    /// Add a new block import task to the pending imports
+    fn on_new_block(&mut self, block: BlockMsg, peer_id: PeerId) {
         if self.processed_blocks.contains(&block.hash) {
             return;
         }
@@ -233,6 +248,11 @@ where
         // Receive new blocks from network
         while let Poll::Ready(Some((block, peer_id))) = this.from_network.poll_recv(cx) {
             this.on_new_block(block, peer_id);
+        }
+
+        // Receive new mined blocks from builder
+        while let Poll::Ready(Some((payload, block_msg))) = this.from_builder.poll_recv(cx) {
+            this.on_new_mined_block(payload, block_msg);
         }
 
         // Receive new block hashes from network

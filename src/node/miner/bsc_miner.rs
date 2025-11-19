@@ -7,8 +7,8 @@ use crate::{
         miner::{
             config::{MiningConfig, keystore}, payload::{BscPayloadBuilder, BscPayloadJob, BscPayloadJobHandle}, signer::init_global_signer_from_k256, util::prepare_new_attributes
         },
-        network::BscNewBlock,
-    }, shared::{get_block_import_sender, get_local_peer_id_or_default}
+        network::{BscNewBlock, block_import::service::{IncomingBlock, IncomingMinedBlock}},
+    }, shared::{get_block_import_mined_sender, get_block_import_sender, get_local_peer_id_or_default}
 };
 use alloy_consensus::BlockHeader;
 use alloy_primitives::{Address, Sealable};
@@ -652,6 +652,8 @@ pub struct ResultWorkWorker<Provider> {
     recent_mined_blocks: Arc<Mutex<LruCache<u64, Vec<alloy_primitives::B256>>>>,
     /// Consensus metrics for tracking double signs and delays
     consensus_metrics: BscConsensusMetrics,
+    // flag for submitting built payload
+    submit_built_payload: bool,
 }
 
 impl<Provider> ResultWorkWorker<Provider>
@@ -664,9 +666,11 @@ where
         provider: Provider,
         parlia: Arc<crate::consensus::parlia::Parlia<crate::chainspec::BscChainSpec>>,
         payload_rx: mpsc::UnboundedReceiver<SubmitContext>,
+        submit_built_payload: bool,
     ) -> Self {
         let (delay_submit_tx, delay_submit_rx) = mpsc::unbounded_channel::<BscBuiltPayload>();
         let recent_mined_blocks = Arc::new(Mutex::new(LruCache::new(std::num::NonZeroUsize::new(RECENT_MINED_BLOCKS_CACHE_SIZE).unwrap())));
+        tracing::info!("ResultWorkWorker created, submit_built_payload: {}", submit_built_payload);
         Self {
             validator_address,
             provider,
@@ -676,6 +680,7 @@ where
             delay_submit_rx,
             recent_mined_blocks,
             consensus_metrics: BscConsensusMetrics::default(),
+            submit_built_payload,
         }
     }
 
@@ -854,20 +859,33 @@ where
             block: Arc::new(new_block) 
         };
 
-        // TODO: just commit state, handle FCU and send block to P2P, it avoid re-execution again.
-        if let Some(sender) = get_block_import_sender() {
-            let peer_id = get_local_peer_id_or_default();
-            let incoming: crate::node::network::block_import::service::IncomingBlock =
-                (msg.clone(), peer_id);
-            if sender.send(incoming).is_err() {
-                warn!("Failed to send mined block to import service due to channel closed");
-                return Err("Failed to send mined block to import service due to channel closed".into());
+        if self.submit_built_payload {
+            if let Some(sender) = get_block_import_mined_sender() {
+                let incoming: IncomingMinedBlock = (payload, msg.clone());
+                if sender.send(incoming).is_err() {
+                    warn!("Failed to send mined block to import service due to channel closed");
+                    return Err("Failed to send mined block to import service due to channel closed".into());
+                } else {
+                    debug!("Succeed to send mined block to import service");
+                }
             } else {
-                debug!("Succeed to send mined block to import service");
+                warn!("Failed to send mined block due to import sender not initialised");
+                return Err("Failed to send mined block due to import sender not initialised".into());
             }
         } else {
-            warn!("Failed to send mined block due to import sender not initialised");
-            return Err("Failed to send mined block due to import sender not initialised".into());
+            if let Some(sender) = get_block_import_sender() {
+                let peer_id = get_local_peer_id_or_default();
+                let incoming: IncomingBlock = (msg.clone(), peer_id);
+                if sender.send(incoming).is_err() {
+                    warn!("Failed to send built block to import service due to channel closed");
+                    return Err("Failed to send built block to import service due to channel closed".into());
+                } else {
+                    debug!("Succeed to send built block to import service");
+                }
+            } else {
+                warn!("Failed to send built block due to import sender not initialised");
+                return Err("Failed to send built block due to import sender not initialised".into());
+            }
         }
 
         // Targeted ETH NewBlock/NewBlockHashes to EVN peers for full broadcast parity.
@@ -1049,6 +1067,7 @@ where
             provider.clone(),
             parlia.clone(),
             payload_rx,
+            mining_config.submit_built_payload,
         );
         
         let mev_work_worker = MevWorkWorker::new(

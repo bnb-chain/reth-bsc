@@ -203,14 +203,15 @@ impl BscNetworkBuilder {
         }
         discv4.lookup_interval(Duration::from_millis(500));
 
-        let (to_import, from_network) = mpsc::unbounded_channel();
+        let (to_import_net, from_network) = mpsc::unbounded_channel();
+        let (to_import_mined, from_builder) = mpsc::unbounded_channel();
         let (to_network, import_outcome) = mpsc::unbounded_channel();
 
         let (to_hashes, from_hashes) = mpsc::unbounded_channel();
-        let handle = ImportHandle::new(to_import.clone(), to_hashes, import_outcome);
+        let handle = ImportHandle::new(to_import_net.clone(), to_hashes, import_outcome);
 
         // Expose the sender globally so that the miner can submit newly mined blocks
-        if crate::shared::set_block_import_sender(to_import.clone()).is_err() {
+        if crate::shared::set_block_import_mined_sender(to_import_mined.clone()).is_err() {
             warn!(target: "bsc", "Block import sender already initialised; overriding skipped");
         }
         
@@ -236,6 +237,7 @@ impl BscNetworkBuilder {
                 chain_spec,
                 handle,
                 from_network,
+                from_builder,
                 from_hashes,
                 to_network,
             ).await.unwrap();

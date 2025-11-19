@@ -25,6 +25,8 @@ reth-discv4 = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.4", f
 reth-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.4" }
 reth-ethereum-forks = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.4", features = ["serde"] }
 reth-ethereum-payload-builder = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.4" }
+reth-payload-builder-primitives = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.4" }
+reth-chain-state = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.4" }
 reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.4" }
 reth-eth-wire = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.4" }
 reth-eth-wire-types = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.4" }
