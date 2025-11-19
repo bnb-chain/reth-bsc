@@ -77,7 +77,7 @@ impl BscProtocolConnection {
                 let vote_count = votes.len();
                 VotesPacket(votes.as_ref().clone()).encode(&mut buf);
                 
-                tracing::debug!(
+                tracing::trace!(
                     target: "bsc_protocol",
                     vote_count = vote_count,
                     encoded_len = buf.len(),
@@ -94,9 +94,9 @@ impl BscProtocolConnection {
     fn poll_outgoing_commands(&mut self, cx: &mut Context<'_>) -> Option<BytesMut> {
         tracing::trace!(target: "bsc_protocol", "Checking for outgoing commands");
         if let Poll::Ready(Some(cmd)) = self.commands.poll_next_unpin(cx) {
-            tracing::debug!(target: "bsc_protocol", cmd = ?cmd, "Processing outgoing command");
+            tracing::trace!(target: "bsc_protocol", cmd = ?cmd, "Processing outgoing command");
             let encoded = Self::encode_command(cmd);
-            tracing::debug!(target: "bsc_protocol", len = encoded.len(), "Sending encoded command");
+            tracing::trace!(target: "bsc_protocol", len = encoded.len(), "Sending encoded command");
             Some(encoded)
         } else {
             tracing::trace!(target: "bsc_protocol", "No outgoing commands ready");
