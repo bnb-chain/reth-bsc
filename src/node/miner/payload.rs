@@ -395,8 +395,22 @@ where
         }
 
         // add system txs to payload.
+        let finalize_start = std::time::Instant::now();
         let BlockBuilderOutcome { execution_result, block, .. } = builder.finish(&state_provider)?;
         let mut sealed_block = Arc::new(block.sealed_block().clone());
+        
+        // Update miner metrics
+        use once_cell::sync::Lazy;
+        use crate::metrics::BscMinerMetrics;
+        static MINER_METRICS: Lazy<BscMinerMetrics> = Lazy::new(BscMinerMetrics::default);
+        
+        let finalize_duration = finalize_start.elapsed().as_secs_f64();
+        MINER_METRICS.block_finalize_duration_seconds.record(finalize_duration);
+        MINER_METRICS.blocks_produced_total.increment(1);
+        
+        // Update best work gas used (in MGas)
+        let gas_used_mgas = cumulative_gas_used as f64 / 1_000_000.0;
+        MINER_METRICS.best_work_gas_used_mgas.set(gas_used_mgas);
         
         // set sidecars to seal block
         let mut blob_sidecars:Vec<BscBlobTransactionSidecar>= Vec::new();

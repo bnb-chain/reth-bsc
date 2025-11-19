@@ -256,7 +256,7 @@ pub trait BscHardforks: EthereumHardforks {
         self.bsc_fork_activation(BscHardfork::Maxwell).active_at_timestamp(timestamp)
     }
 
-    /// Convenience method to check if [`BscHardfork::Maxwell`] is active at a given timestamp.
+    /// Convenience method to check if [`BscHardfork::Fermi`] is active at a given timestamp.
     fn is_fermi_active_at_timestamp(&self, block_number: u64, timestamp: u64) -> bool {
         self.is_london_active_at_block(block_number) &&
         self.bsc_fork_activation(BscHardfork::Fermi).active_at_timestamp(timestamp)

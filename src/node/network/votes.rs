@@ -111,5 +111,11 @@ pub fn handle_votes_broadcast(packet: VotesPacket) {
     if let Some(first) = packet.0.into_iter().next() {
         tracing::debug!(target: "bsc::vote", "insert first vote into local pool, target_number: {}, target_hash: {}", first.data.target_number, first.data.target_hash);
         votes::put_vote(first);
+        
+        // Update vote pool size metric
+        use once_cell::sync::Lazy;
+        use crate::metrics::BscVoteMetrics;
+        static VOTE_METRICS: Lazy<BscVoteMetrics> = Lazy::new(BscVoteMetrics::default);
+        VOTE_METRICS.vote_pool_size.set(votes::len() as f64);
     }
 }

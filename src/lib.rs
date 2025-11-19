@@ -2,6 +2,7 @@ pub mod chainspec;
 pub mod consensus;
 pub mod evm;
 mod hardforks;
+pub mod metrics;
 pub mod node;
 pub mod rpc;
 pub mod shared;

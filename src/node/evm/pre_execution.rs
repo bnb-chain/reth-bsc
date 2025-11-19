@@ -25,10 +25,9 @@ use blst::{
     BLST_ERROR,
 };
 use bit_set::BitSet;
+use crate::consensus::parlia::constants::K_ANCESTOR_GENERATION_DEPTH;
 
 const BLST_DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
-
-const K_ANCESTOR_GENERATION_DEPTH: u64 = 3;
 
 type ValidatorCache = LruMap<BlockHash, (Vec<Address>, Vec<VoteAddress>), ByLength>;
 type TurnLengthCache = LruMap<BlockHash, u8, ByLength>;
@@ -234,7 +233,14 @@ where
         snap: &Snapshot,
     ) -> Result<(), BlockExecutionError> {
         self.verify_block_time_for_ramanujan(snap, header, parent)?;
-        self.verify_vote_attestation(snap, header, parent)?;
+        
+        // Verify vote attestation and track errors
+        if let Err(err) = self.verify_vote_attestation(snap, header, parent) {
+            // Update vote attestation error metric for all attestation-related errors
+            self.vote_metrics.vote_attestation_errors_total.increment(1);
+            return Err(err);
+        }
+        
         self.verify_seal(snap, header)?;
 
         Ok(())
@@ -278,7 +284,12 @@ where
             let target_hash = attestation.data.target_hash;
             let mut is_match = false;
             let mut ancestor = parent.clone();
-            for _ in 0..self.get_ancestor_generation_depth(header) {
+            let depth = if self.spec.is_fermi_active_at_timestamp(header.number(), header.timestamp) {
+                K_ANCESTOR_GENERATION_DEPTH
+            } else {
+                1
+            };
+            for _ in 0..depth {
                 if ancestor.number() == target_block && ancestor.hash_slow() == target_hash {
                     is_match = true;
                     break;
@@ -294,8 +305,8 @@ where
             if !is_match {
                 return Err(BscBlockExecutionError::Validation(
                     BscBlockValidationError::InvalidAttestationTarget {
-                        block_number: GotExpected { got: target_block, expected: parent.number() },
-                        block_hash: GotExpected { got: target_hash, expected: parent.hash_slow() }
+                        block_number: GotExpected { got: target_block, expected: ancestor.number() },
+                        block_hash: GotExpected { got: target_hash, expected: ancestor.hash_slow() }
                             .into(),
                     }
                 ).into());
@@ -371,29 +382,33 @@ where
  
             let sig = Signature::from_bytes(&attestation.agg_signature[..])
                 .map_err(|_| BscBlockExecutionError::BLSTInnerError)?;
+            
+            // Track BLS verification attempt
+            self.vote_metrics.bls_verifications_total.increment(1);
+            let start = std::time::Instant::now();
+            
             let err = sig.fast_aggregate_verify(
                 true,
                 attestation.data.hash().as_slice(),
                 BLST_DST,
                 &vote_addrs_ref,
             );
+            
+            // Record verification duration
+            self.vote_metrics.bls_verification_duration_seconds.record(start.elapsed().as_secs_f64());
  
             return match err {
                 BLST_ERROR::BLST_SUCCESS => Ok(()),
-                _ => Err(BscBlockExecutionError::BLSTInnerError.into()),
+                _ => {
+                    // Update BLS verification failure metric (kept here as it's a specific metric)
+                    self.vote_metrics.bls_verification_failures_total.increment(1);
+                    Err(BscBlockExecutionError::BLSTInnerError.into())
+                },
             };
         }
     
         Ok(())
     }
-
-    fn get_ancestor_generation_depth(&self, header: &Header) -> u64 {
-        if self.spec.is_fermi_active_at_timestamp(header.number(),header.timestamp) {
-            return K_ANCESTOR_GENERATION_DEPTH;
-        }
-        1
-    }
-
     
     fn verify_seal(
         &self,

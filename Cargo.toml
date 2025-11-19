@@ -30,6 +30,7 @@ reth-eth-wire = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.4" 
 reth-eth-wire-types = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.4" }
 reth-evm = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.4" }
 reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.4" }
+reth-metrics = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.4" }
 reth-node-core = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.4" }
 reth-revm = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.4" }
 reth-network = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.4", features = ["test-utils"] }
@@ -89,6 +90,7 @@ futures = "0.3"
 hex = "0.4"
 lazy_static = "1.4.0"
 lru = "0.12"
+metrics = "0.24"
 phf = { version = "0.11", features = ["macros"] }
 once_cell = { version = "1.19", default-features = false, features = ["alloc"] }
 parity-bytes = { version = "0.1.2", default-features = false }

@@ -10,6 +10,8 @@ use crate::hardforks::BscHardforks;
 use crate::consensus::parlia::util::calculate_millisecond_timestamp;
 use crate::node::evm::util::get_cannonical_header_from_cache;
 use crate::node::vote_journal;
+use crate::metrics::BscVoteMetrics;
+use crate::consensus::parlia::constants::K_ANCESTOR_GENERATION_DEPTH;
 
 /// Number of blocks to wait after mining becomes enabled before producing votes.
 /// This mirrors geth's VoteManager warm-up (blocksNumberSinceMining = 40) to avoid
@@ -26,6 +28,7 @@ static START_VOTE: AtomicBool = AtomicBool::new(true);
 static BLOCKS_SINCE_MINING: AtomicU64 = AtomicU64::new(0);
 static VOTEADDR_INDEX: LazyLock<Mutex<schnellru::LruMap<B256, HashSet<VoteAddress>, schnellru::ByLength>>> =
     LazyLock::new(|| Mutex::new(schnellru::LruMap::new(schnellru::ByLength::new(1024))));
+static VOTE_METRICS: LazyLock<BscVoteMetrics> = LazyLock::new(BscVoteMetrics::default);
 
 /// Control vote production during sync similar to geth's Start/Done/Failed events.
 pub fn set_downloader_active(active: bool) {
@@ -159,7 +162,12 @@ pub fn maybe_produce_and_broadcast_for_head(
 
     // Too-late-to-vote guard: ensure we have time to broadcast before next block assembly
     let cur_ms = calculate_millisecond_timestamp(head);
-    let vote_assemble_ms = cur_ms.saturating_add(snap.block_interval);
+    let count = if chain_spec.is_fermi_active_at_timestamp(head.number(), head.timestamp()) {
+        K_ANCESTOR_GENERATION_DEPTH
+    } else {
+        1
+    };
+    let vote_assemble_ms = cur_ms.saturating_add(snap.block_interval * count);
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -207,6 +215,7 @@ pub fn maybe_produce_and_broadcast_for_head(
             // Persist in journal first to avoid vote loss due to failures.
             if let Err(e) = vote_journal::persist_vote(&envelope) {
                 tracing::error!(target: "bsc::vote", error=%e, "Failed to write vote into journal");
+                VOTE_METRICS.vote_journal_errors_total.increment(1);
                 // Continue despite journal error; do not halt voting pipeline.
             }
             // insert into local pool
@@ -217,6 +226,7 @@ pub fn maybe_produce_and_broadcast_for_head(
         }
         Err(e) => {
             tracing::warn!(target: "bsc::vote", error=%e, "Failed to sign vote");
+            VOTE_METRICS.vote_signing_errors_total.increment(1);
         }
     }
 }

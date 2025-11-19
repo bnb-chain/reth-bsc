@@ -5,6 +5,8 @@ use alloy_primitives::{Address, BlockNumber, BlockHash};
 use serde::{Deserialize, Serialize};
 use reth_db::table::{Compress, Decompress};
 use reth_db::DatabaseError;
+use once_cell::sync::Lazy;
+use crate::metrics::BscVoteMetrics;
 
 /// Number of blocks after which we persist snapshots to DB.
 pub const CHECKPOINT_INTERVAL: u64 = 1024;
@@ -29,6 +31,9 @@ pub const DEFAULT_BLOCK_INTERVAL: u64 = 3000;   // 3000 ms
 pub const LORENTZ_BLOCK_INTERVAL: u64 = 1500;   // 1500 ms
 pub const MAXWELL_BLOCK_INTERVAL: u64 = 750;   //  750 ms
 pub const FERMI_BLOCK_INTERVAL: u64 = 450;   //  450 ms
+
+/// Global metrics for vote attestation operations.
+static VOTE_METRICS: Lazy<BscVoteMetrics> = Lazy::new(BscVoteMetrics::default);
 
 /// `ValidatorInfo` holds metadata for a validator at a given epoch.
 #[derive(Debug, Default, PartialEq, Eq, Clone, Serialize, Deserialize)]
@@ -167,7 +172,7 @@ impl Snapshot {
                 }
             }
         }
-        snap.update_attestation(chain_spec,next_header, attestation);
+        snap.update_attestation(chain_spec, next_header, attestation);
         snap.recent_proposers.insert(block_number, validator);
 
         let is_maxwell_active = chain_spec.is_maxwell_active_at_timestamp(header_number, header_timestamp);
@@ -256,6 +261,7 @@ impl Snapshot {
                 let target_hash = att.data.target_hash;
                 if target_number+1 != header.number() || target_hash != header.parent_hash() {
                     tracing::warn!("Failed to update attestation, target_number: {:?}, target_hash: {:?}, header_number: {:?}, header_parent_hash: {:?}", target_number, target_hash, header.number(), header.parent_hash());
+                    VOTE_METRICS.attestation_update_errors_total.increment(1);
                     return;
                 }
             }
@@ -265,6 +271,8 @@ impl Snapshot {
             } else {
                 self.vote_data = att.data;
             }
+        } else {
+            VOTE_METRICS.attestation_update_errors_total.increment(1);
         }
     }
 

@@ -32,7 +32,8 @@ pub const SYSTEM_TXS_GAS_SOFT_LIMIT: u64 = 1_000_000; // Maximum gas reserved fo
 // Ramanujan HF constants
 pub const FIXED_BACKOFF_TIME_BEFORE_FORK_MILLIS: u64 = 200; // 200 ms
 pub const WIGGLE_TIME_BEFORE_FORK_MILLIS: u64 = 500; // 500 ms
-pub const MILLISECONDS_UNIT: u64 = 250; // 250 ms
+pub const MILLISECONDS_UNIT: u64 = 50; // 50 ms
+pub const K_ANCESTOR_GENERATION_DEPTH: u64 = 3;
 
 // miner config default values
 pub const DEFAULT_MIN_GAS_TIP: u128 = 50_000_000; // 0.05 Gwei

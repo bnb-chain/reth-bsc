@@ -7,7 +7,8 @@ use crate::{
         ParliaConsensusErr,
         parlia::{provider::EnhancedDbSnapshotProvider, Parlia, util::calculate_millisecond_timestamp, BscForkChoiceRule, HeaderForForkchoice},
     },
-    shared,
+    metrics::{BscFinalityMetrics},
+    shared
 };
 use alloy_consensus::{Header, TxReceipt};
 use alloy_primitives::{B256, Bytes};
@@ -71,7 +72,11 @@ pub struct BscConsensus<ChainSpec> {
 
 impl<ChainSpec: EthChainSpec + BscHardforks + 'static> BscConsensus<ChainSpec> {
     pub fn new(chain_spec: Arc<ChainSpec>) -> Self {
-        Self { base: EthBeaconConsensus::new(chain_spec.clone()), parlia: Arc::new(Parlia::new(chain_spec.clone(), 200)), chain_spec }
+        Self { 
+            base: EthBeaconConsensus::new(chain_spec.clone()), 
+            parlia: Arc::new(Parlia::new(chain_spec.clone(), 200)), 
+            chain_spec,
+        }
     }
 }
 
@@ -199,7 +204,6 @@ impl<ChainSpec: EthChainSpec<Header = Header> + BscHardforks + 'static> FullCons
                 ))
             }
         }
-
         Ok(())
     }
 }
@@ -298,6 +302,8 @@ pub struct BscForkChoiceEngine<P> {
     forkchoice_rule: Arc<BscForkChoiceRule>,
     /// Cache for header total difficulties
     header_td_cache: Arc<parking_lot::RwLock<schnellru::LruMap<B256, Option<alloy_primitives::U256>, schnellru::ByLength>>>,
+    /// Finality metrics
+    finality_metrics: BscFinalityMetrics,
 }
 
 impl<P> BscForkChoiceEngine<P>
@@ -316,6 +322,7 @@ where
             chain_spec: chain_spec.clone(),
             forkchoice_rule: Arc::new(BscForkChoiceRule::new(chain_spec)),
             header_td_cache: Arc::new(parking_lot::RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new(128)))),
+            finality_metrics: BscFinalityMetrics::default(),
         }
     }
 
@@ -363,6 +370,11 @@ where
         // ref: https://github.com/bnb-chain/bsc/blob/f70aaa8399ccee429804eecf3fc4c6fd8d9e6cab/eth/api_backend.go#L72
         let (safe_block_number, safe_block_hash) = self.get_justified_number_and_hash(new_canonical_head).unwrap_or((0, B256::ZERO));
         let (finalized_block_number, finalized_block_hash) = self.get_finalized_number_and_hash(new_canonical_head).unwrap_or((0, B256::ZERO));
+        
+        // Update finality metrics
+        self.finality_metrics.justified_block_height.set(safe_block_number as f64);
+        self.finality_metrics.safe_block_height.set(safe_block_number as f64);
+        self.finality_metrics.finalized_block_height.set(finalized_block_number as f64);
         
         let state = ForkchoiceState {
             head_block_hash: new_canonical_head.hash_slow(),

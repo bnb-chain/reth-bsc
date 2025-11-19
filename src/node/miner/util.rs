@@ -10,8 +10,9 @@ use reth::payload::EthPayloadBuilderAttributes;
 use crate::hardforks::BscHardforks;
 use reth_chainspec::EthChainSpec;
 use crate::node::evm::pre_execution::VALIDATOR_CACHE;
-use crate::node::miner::signer::{seal_header_with_global_signer, SignerError};
+use crate::node::miner::signer::{SignerError, seal_header_with_global_signer};
 use crate::node::miner::bsc_miner::MiningContext;
+use crate::consensus::parlia::provider::SnapshotProvider;
 
 pub fn prepare_new_attributes(ctx: &mut MiningContext, parlia: Arc<Parlia<BscChainSpec>>, parent_header: &Header, signer: Address) -> EthPayloadBuilderAttributes {
     let mut new_header = prepare_new_header(parlia.clone(), parent_header, signer);
@@ -61,7 +62,9 @@ pub fn finalize_new_header<ChainSpec>(
     parlia: Arc<Parlia<ChainSpec>>, 
     parent_snap: &Snapshot, 
     parent_header: &Header, 
-    new_header: &mut Header) -> Result<(), crate::node::miner::signer::SignerError>
+    new_header: &mut Header,
+    snapshot_provider: &Arc<dyn SnapshotProvider + Send + Sync>,
+) -> Result<(), crate::node::miner::signer::SignerError>
 where
     ChainSpec: EthChainSpec + crate::hardforks::BscHardforks + 'static,
 {
@@ -97,16 +100,8 @@ where
     parlia.prepare_turn_length(parent_snap, new_header).
         map_err(|e| SignerError::SigningFailed(format!("Failed to prepare turn length: {}", e)))?;
     
-    // TODO: add BEP-590 changes in fermi hardfork later, it changes the assemble and verify logic.
-    if let Err(e) = parlia.assemble_vote_attestation(parent_snap, parent_header, new_header) {
-        tracing::warn!(
-            target: "parlia::assemble_vote_attestation",
-            block_number = new_header.number,
-            parent_hash = ?new_header.parent_hash,
-            error = ?e,
-            "Failed to assemble vote attestation, skipping"
-        );
-    }
+    parlia.assemble_vote_attestation(parent_snap, parent_header, new_header, snapshot_provider).
+        map_err(|e| SignerError::SigningFailed(format!("Failed to assemble vote attestation: {}", e)))?;
 
     {   // seal header
         let mut extra_data = new_header.extra_data.to_vec();

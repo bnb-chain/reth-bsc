@@ -79,6 +79,9 @@ pub struct BidSimulator<Client, Pool> {
     bid_receiving: bool,
     chain_spec: Arc<BscChainSpec>,
     min_gas_price: U256,
+    
+    // MEV metrics
+    mev_metrics: crate::metrics::BscMevMetrics,
 }
 
 impl<Client, Pool> BidSimulator<Client, Pool> 
@@ -99,6 +102,7 @@ Pool: reth::transaction_pool::TransactionPool<Transaction: reth::transaction_poo
             pending_bid: Arc::new(RwLock::new(HashMap::new())),
             bid_receiving: true,
             min_gas_price: U256::ZERO,
+            mev_metrics: crate::metrics::BscMevMetrics::default(),
         }   
     }
 
@@ -116,6 +120,7 @@ Pool: reth::transaction_pool::TransactionPool<Transaction: reth::transaction_poo
     pub fn add_pending_bid(&self, block_number: u64, builder: Address, bid_hash: B256) {
         let key = format!("{}-{}-{}", block_number, builder, bid_hash);
         self.pending_bid.write().insert(key, 1);
+        self.mev_metrics.pending_bids.increment(1);
     }
 
     pub fn commit_new_bid(&self, bid: Bid) -> Option<BidRuntime<Pool, BscEvmConfig>> {
@@ -244,6 +249,7 @@ Pool: reth::transaction_pool::TransactionPool<Transaction: reth::transaction_poo
             // If parsing fails, keep the entry (safe default)
             true
         });
+        self.mev_metrics.pending_bids.set(self.pending_bid.read().len() as f64);
     }
 
     fn new_bid_runtime(&self, _bid: &Bid, _validator_commission: u64, parent_header: SealedHeader, attributes: EthPayloadBuilderAttributes) -> Result<BidRuntime<Pool, BscEvmConfig>, Box<dyn std::error::Error + Send + Sync>>{
@@ -273,10 +279,15 @@ Pool: reth::transaction_pool::TransactionPool<Transaction: reth::transaction_poo
         if !self.bid_receiving {
             return 
         }
+        
+        // Track simulation start time
+        let sim_start = std::time::Instant::now();
+        let is_first_bid = self.best_bid.read().is_empty();
+        
         let mut success = false;
-        //let startTs = std::time::Instant::now();
         let parent_hash = bid_runtime.bid.parent_hash;
         self.simulating_bid.write().insert(parent_hash, bid_runtime.bid.clone());
+        
         let mut txs_except_last = bid_runtime.bid.txs.clone();
         let pay_bid_tx = txs_except_last.pop();
         
@@ -406,6 +417,30 @@ Pool: reth::transaction_pool::TransactionPool<Transaction: reth::transaction_poo
                 best_bid_map.insert(parent_hash, bid_runtime.clone());
                 success = true;
             }
+        }
+        
+        // Update metrics after simulation
+        let sim_duration = sim_start.elapsed().as_secs_f64();
+        self.mev_metrics.bid_simulation_duration_seconds.record(sim_duration);
+        
+        if is_first_bid {
+            self.mev_metrics.first_bid_simulation_seconds.record(sim_duration);
+        }
+        
+        if success {
+            self.mev_metrics.valid_bids_total.increment(1);
+            
+            // Update best bid gas used (in MGas)
+            let gas_used_mgas = bid_runtime.gas_used as f64 / 1_000_000.0;
+            self.mev_metrics.best_bid_gas_used_mgas.set(gas_used_mgas);
+            
+            // Calculate simulation speed (MGas/s)
+            if sim_duration > 0.0 {
+                let mgasps = gas_used_mgas / sim_duration;
+                self.mev_metrics.bid_simulation_speed_mgasps.set(mgasps);
+            }
+        } else {
+            self.mev_metrics.invalid_bids_total.increment(1);
         }
 
         debug!("bidSimulator: sim_bid finished, block number:{}, parent hash:{}, builder:{}, bid hash:{}, gas used:{}, success:{}",

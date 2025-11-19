@@ -1,5 +1,7 @@
 use crate::{
-    chainspec::BscChainSpec, consensus::parlia::{Parlia, provider::SnapshotProvider, vote_pool}, node::{
+    chainspec::BscChainSpec, consensus::parlia::{Parlia, provider::SnapshotProvider, vote_pool}, 
+    metrics::BscConsensusMetrics,
+    node::{
         engine::BscBuiltPayload,
         evm::config::BscEvmConfig,
         miner::{
@@ -62,6 +64,7 @@ pub struct NewWorkWorker<Provider> {
     mining_queue_tx: mpsc::UnboundedSender<MiningContext>,
     consensus: Arc<Parlia<BscChainSpec>>,
     pre_cached: Option<PrecachedState>,
+    blockchain_metrics: crate::metrics::BscBlockchainMetrics,
 }
 
 impl<Provider> NewWorkWorker<Provider> 
@@ -90,6 +93,7 @@ where
             mining_queue_tx,
             consensus,
             pre_cached: None,
+            blockchain_metrics: crate::metrics::BscBlockchainMetrics::default(),
         }
     }
 
@@ -122,6 +126,24 @@ where
                     
                     // If this is a reorg event, validate it using bsc fork choice rules
                     if let CanonStateNotification::Reorg { old, new } = &event {
+                        // Record reorg metrics
+                        let old_len = old.len();
+                        let new_len = new.len();
+                        let reorg_depth = old_len.max(new_len);
+                        
+                        self.blockchain_metrics.reorg_executions_total.increment(1);
+                        self.blockchain_metrics.reorg_blocks_dropped_total.increment(old_len as u64);
+                        self.blockchain_metrics.reorg_blocks_added_total.increment(new_len as u64);
+                        self.blockchain_metrics.latest_reorg_depth.set(reorg_depth as f64);
+                        
+                        debug!(
+                            target: "bsc::miner",
+                            old_len,
+                            new_len,
+                            reorg_depth,
+                            "Reorg metrics recorded"
+                        );
+                        
                         match self.validate_reorg(old, new).await {
                             Ok(true) => {
                                 // Reorg is valid, proceed with mining
@@ -628,6 +650,8 @@ pub struct ResultWorkWorker<Provider> {
     delay_submit_tx: mpsc::UnboundedSender<BscBuiltPayload>,
     /// LRU cache to track recently mined blocks to prevent double signing
     recent_mined_blocks: Arc<Mutex<LruCache<u64, Vec<alloy_primitives::B256>>>>,
+    /// Consensus metrics for tracking double signs and delays
+    consensus_metrics: BscConsensusMetrics,
 }
 
 impl<Provider> ResultWorkWorker<Provider>
@@ -651,6 +675,7 @@ where
             delay_submit_tx,
             delay_submit_rx,
             recent_mined_blocks,
+            consensus_metrics: BscConsensusMetrics::default(),
         }
     }
 
@@ -698,6 +723,9 @@ where
                                     }
                                 }
                             } else {
+                                // Update intentional mining delay metric
+                                self.consensus_metrics.intentional_mining_delays_total.increment(1);
+                                
                                 Self::start_delay_task(
                                     payload,
                                     delay_ms,
@@ -768,6 +796,8 @@ where
                     if *prev_parent == parent_hash {
                         error!("Reject Double Sign!! block: {}, hash: 0x{:x}, root: 0x{:x}, ParentHash: 0x{:x}", 
                             block_number, block_hash, sealed_block.header().state_root, parent_hash);
+                        // Update double sign metric
+                        self.consensus_metrics.double_signs_detected_total.increment(1);
                         double_sign = true;
                         break;
                     }
@@ -786,8 +816,12 @@ where
         let block_hash = sealed_block.hash();
         let difficulty = sealed_block.header().difficulty();
         let turn_status = if difficulty == crate::consensus::parlia::constants::DIFF_INTURN { 
+            // Update in-turn block metric
+            self.consensus_metrics.inturn_blocks_total.increment(1);
             "inturn" 
         } else { 
+            // Update out-of-turn block metric
+            self.consensus_metrics.noturn_blocks_total.increment(1);
             "offturn" 
         };
         debug!(

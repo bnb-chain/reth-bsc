@@ -4,6 +4,7 @@ use std::{collections::{BinaryHeap, HashMap, HashSet}, sync::RwLock, cmp::Revers
 use alloy_primitives::{BlockNumber, B256};
 
 use super::vote::{VoteData, VoteEnvelope};
+use crate::metrics::BscVoteMetrics;
 
 const LOWER_LIMIT_OF_VOTE_BLOCK_NUMBER: u64 = 256;
 
@@ -75,6 +76,9 @@ impl VotePool {
     fn insert(&mut self, vote: VoteEnvelope) {
         let vote_hash = vote.hash();
         if self.received_votes.insert(vote_hash) {
+            // Track received votes count
+            VOTE_METRICS.received_votes_total.increment(1);
+            
             // Use target_hash as the key for organizing votes
             let block_hash = vote.data.target_hash;
             
@@ -136,19 +140,39 @@ impl VotePool {
 /// Global singleton pool.
 static VOTE_POOL: Lazy<RwLock<VotePool>> = Lazy::new(|| RwLock::new(VotePool::new()));
 
+/// Global metrics for vote operations.
+static VOTE_METRICS: Lazy<BscVoteMetrics> = Lazy::new(BscVoteMetrics::default);
+
+/// Update vote pool size metric.
+fn update_vote_pool_size_metric(size: usize) {
+    VOTE_METRICS.vote_pool_size.set(size as f64);
+    VOTE_METRICS.current_votes_count.set(size as f64);
+}
+
 /// Insert a single vote into the pool (deduplicated by hash).
 pub fn put_vote(vote: VoteEnvelope) {
-    VOTE_POOL.write().expect("vote pool poisoned").insert(vote);
+    let mut pool = VOTE_POOL.write().expect("vote pool poisoned");
+    pool.insert(vote);
+    let size = pool.len();
+    drop(pool);
+    update_vote_pool_size_metric(size);
 }
 
 /// Drain all pending votes.
 pub fn drain() -> Vec<VoteEnvelope> {
-    VOTE_POOL.write().expect("vote pool poisoned").drain()
+    let votes = VOTE_POOL.write().expect("vote pool poisoned").drain();
+    update_vote_pool_size_metric(0);
+    votes
 }
 
 /// Current number of queued votes.
 pub fn len() -> usize { 
     VOTE_POOL.read().expect("vote pool poisoned").len() 
+}
+
+/// Check if the pool is empty.
+pub fn is_empty() -> bool {
+    len() == 0
 }
 
 /// Fetch votes by block hash.
@@ -158,7 +182,11 @@ pub fn fetch_vote_by_block_hash(block_hash: B256) -> Vec<VoteEnvelope> {
 
 /// Prune old votes based on the latest block number.
 pub fn prune(latest_block_number: BlockNumber) {
-    VOTE_POOL.write().expect("vote pool poisoned").prune(latest_block_number)
+    let mut pool = VOTE_POOL.write().expect("vote pool poisoned");
+    pool.prune(latest_block_number);
+    let size = pool.len();
+    drop(pool);
+    update_vote_pool_size_metric(size);
 }
 
 
