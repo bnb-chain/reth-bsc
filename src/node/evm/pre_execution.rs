@@ -80,13 +80,13 @@ where
         
         if block_number.is_multiple_of(epoch_length) {
             // fill turn length to inner context.
-            let turn_length = self.get_turn_length(block_number, timestamp)?;
+            let turn_length = self.get_turn_length(parent_header.number, parent_header.timestamp)?;
             self.custom_ctx.shared.borrow_mut().turn_length = Some(turn_length);
             tracing::debug!("Succeed to query turn length, block_number: {}, epoch_length: {}, turn_length: {}", 
                 block_number, epoch_length, turn_length);
             
             // fill current validators to inner context.
-            let (validator_set, vote_addresses) = self.get_current_validators(block_number-1)?;
+            let (validator_set, vote_addresses) = self.get_current_validators(parent_header.number)?;
             tracing::debug!("validator_set: {:?}, vote_addresses: {:?}", validator_set, vote_addresses);
             
             let vote_addrs_map = if vote_addresses.is_empty() {
