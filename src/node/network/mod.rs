@@ -212,7 +212,10 @@ impl BscNetworkBuilder {
 
         // Expose the sender globally so that the miner can submit newly mined blocks
         if crate::shared::set_block_import_mined_sender(to_import_mined.clone()).is_err() {
-            warn!(target: "bsc", "Block import sender already initialised; overriding skipped");
+            warn!(target: "bsc", "Block import mined sender already initialised; overriding skipped");
+        }
+        if crate::shared::set_block_import_sender(to_import_net.clone()).is_err() {
+            warn!(target: "bsc", "Block import network sender already initialised; overriding skipped");
         }
         
         // Import the necessary types for block import service

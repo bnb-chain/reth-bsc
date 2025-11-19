@@ -1,6 +1,6 @@
 use super::handle::ImportHandle;
 use crate::{
-    BscBlock, BscBlockBody, chainspec::BscChainSpec, consensus::{ParliaConsensusErr, parlia::vote_pool}, node::{consensus::BscForkChoiceEngine, engine::BscBuiltPayload, engine_api::payload::BscPayloadTypes, network::BscNewBlock}
+    BscBlock, BscBlockBody, chainspec::BscChainSpec, consensus::{ParliaConsensusErr, parlia::vote_pool}, node::{consensus::BscForkChoiceEngine, engine::BscBuiltPayload, engine_api::payload::BscPayloadTypes, evm::util::insert_header_to_cache, network::BscNewBlock}
 };
 use alloy_consensus::{BlockBody, Header};
 use alloy_eips::BlockNumberOrTag;
@@ -153,6 +153,9 @@ where
 
     /// Add a new block import task to the pending imports
     fn on_new_mined_block(&mut self, payload: BscBuiltPayload, block_msg: NewBlockMessage<BscNewBlock>) {
+        // insert header to cache
+        insert_header_to_cache(block_msg.block.0.block.header.clone());
+        
         // Send ValidHeader announcement to trigger NewBlock diffusion from few peers
         let _ = self
             .to_network
