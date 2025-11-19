@@ -161,12 +161,12 @@ impl BscProtocolConnection {
                 tracing::trace!(
                     target: "bsc_protocol", 
                     is_dialer = self.is_dialer,
-                    "🎉 BSC handshake completed successfully"
+                    "BSC handshake completed successfully"
                 );
                 
                 self.handshake_completed = true;
                 self.handshake_deadline = None;
-                tracing::debug!(target: "bsc_protocol", "BSC handshake completed");
+                tracing::trace!(target: "bsc_protocol", "BSC handshake completed");
                 Poll::Ready(Some(None))
             }
             Err(e) => {
@@ -181,15 +181,15 @@ impl BscProtocolConnection {
         let slice = frame.as_ref();
         let msg_id = slice[0];
 
-        tracing::debug!(target: "bsc_protocol", "Handshake completed, processing normal message, msg_id: {:?}", msg_id);
+        tracing::trace!(target: "bsc_protocol", "Handshake completed, processing normal message, msg_id: {:?}", msg_id);
         match msg_id {
             x if x == BscProtoMessageId::Votes as u8 => {
-                tracing::debug!(target: "bsc_protocol", "Processing votes message");
+                tracing::trace!(target: "bsc_protocol", "Processing votes message");
                 match VotesPacket::decode(&mut &slice[..]) {
                     Ok(packet) => {
                         let count = packet.0.len();
                         handle_votes_broadcast(packet);
-                        tracing::debug!(target: "bsc_protocol", count, "Processed votes packet");
+                        tracing::trace!(target: "bsc_protocol", count, "Processed votes packet");
                     }
                     Err(e) => {
                         tracing::warn!(target: "bsc_protocol", error = %e, "Failed to decode VotesPacket");
