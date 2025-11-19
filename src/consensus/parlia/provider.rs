@@ -211,7 +211,7 @@ impl<DB: Database + 'static> EnhancedDbSnapshotProvider<DB> {
                     break Some(snap);
                 }
                 rebuild_block_hashes.push(parent_block_hash);
-                tracing::debug!("Succeed to walk to parent block, parent_block_number: {}", parent_header.clone().unwrap().number);
+                tracing::trace!("Succeed to walk to parent block, parent_block_number: {}", parent_header.clone().unwrap().number);
                 parent_block_hash = parent_header.clone().unwrap().parent_hash;
             }
         };
@@ -284,7 +284,7 @@ impl<DB: Database + 'static> EnhancedDbSnapshotProvider<DB> {
                 &*self.chain_spec,
             ) {
                 Some(snap) => {
-                    tracing::debug!(
+                    tracing::trace!(
                         "Successfully applied header: block_number={}, epoch_num={}, turn_length={:?}, recent_proposers_count={}, recent_proposers_keys={:?}",
                         snap.block_number, snap.epoch_num, snap.turn_length,
                         snap.recent_proposers.len(), 

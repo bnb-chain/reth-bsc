@@ -86,7 +86,7 @@ pub static HEADER_CACHE_READER: LazyLock<Mutex<HeaderCacheReader>> = LazyLock::n
 /// Get header by hash from the global header provider
 pub fn get_header_by_hash_from_cache(block_hash: &BlockHash) -> Option<Header> {
     let header = HEADER_CACHE_READER.lock().unwrap().get_header_by_hash(block_hash);
-    tracing::debug!("Succeed to fetch header by hash, is_none: {} for hash {}", header.is_none(), block_hash);
+    tracing::trace!("Succeed to fetch header by hash, is_none: {} for hash {}", header.is_none(), block_hash);
     header
 }
 
