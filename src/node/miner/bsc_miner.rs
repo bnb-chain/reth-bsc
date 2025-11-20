@@ -712,14 +712,34 @@ where
                             let block_number = payload.block().number();
                             let block_hash = payload.block().hash();
                             let delay_ms = self.parlia.delay_for_ramanujan_fork(&submit_ctx.mining_ctx.parent_snapshot, payload.block().header());
-                            debug!("Check submit delay, block {} (hash: 0x{:x}), delay_ms: {}", block_number, block_hash, delay_ms);
+                            debug!(
+                                target: "bsc::miner",
+                                block_number = block_number,
+                                block_hash = %block_hash,
+                                is_inturn = submit_ctx.mining_ctx.is_inturn,
+                                delay_ms = delay_ms,
+                                "Check submit delay"
+                            );
                             if delay_ms == 0 {
                                 match self.submit_payload(payload).await {
                                     Ok(()) => {
-                                        info!("Succeed to submit block {} (hash: 0x{:x})", block_number, block_hash);
+                                        info!(
+                                            target: "bsc::miner",
+                                            block_number = block_number,
+                                            block_hash = %block_hash,
+                                            is_inturn = submit_ctx.mining_ctx.is_inturn,
+                                            "Succeed to submit block"
+                                        );
                                     }
                                     Err(e) => {
-                                        error!("Failed to submit block {} (hash: 0x{:x}): {}", block_number, block_hash, e);
+                                        error!(
+                                            target: "bsc::miner",
+                                            block_number = block_number,
+                                            block_hash = %block_hash,
+                                            is_inturn = submit_ctx.mining_ctx.is_inturn,
+                                            error = %e,
+                                            "Failed to submit block"
+                                        );
                                     }
                                 }
                             } else {
@@ -733,13 +753,20 @@ where
                                     submit_ctx.cancel.clone(),
                                 );
                                 info!(
-                                    "Block {} scheduled for delayed submission in {}ms",
-                                    block_number, delay_ms
+                                    target: "bsc::miner",
+                                    block_number = block_number,
+                                    block_hash = %block_hash,
+                                    is_inturn = submit_ctx.mining_ctx.is_inturn,
+                                    delay_ms = delay_ms,
+                                    "Block scheduled for delayed submission"
                                 );
                             }
                         }
                         None => {
-                            warn!("Main payload channel closed, stopping ResultWorkWorker");
+                            warn!(
+                                target: "bsc::miner",
+                                "Main payload channel closed, stopping ResultWorkWorker"
+                            );
                             break;
                         }
                     }
@@ -752,15 +779,29 @@ where
                             let block_hash = payload.block().hash();                            
                             match self.submit_payload(payload).await {
                                 Ok(()) => {
-                                    info!("Succeed to submit delayed block {} (hash: 0x{:x})", block_number, block_hash);
+                                    info!(
+                                        target: "bsc::miner",
+                                        block_number = block_number,
+                                        block_hash = %block_hash,
+                                        "Succeed to submit delayed block"
+                                    );
                                 }
                                 Err(e) => {
-                                    error!("Failed to submit delayed block {} (hash: 0x{:x}): {}", block_number, block_hash, e);
+                                    error!(
+                                        target: "bsc::miner",
+                                        block_number = block_number,
+                                        block_hash = %block_hash,
+                                        error = %e,
+                                        "Failed to submit delayed block"
+                                    );
                                 }
                             }
                         }
                         None => {
-                            warn!("Delay payload channel closed, stopping ResultWorkWorker");
+                            warn!(
+                                target: "bsc::miner",
+                                "Delay payload channel closed, stopping ResultWorkWorker"
+                            );
                             break;
                         }
                     }
@@ -834,6 +875,14 @@ where
             turn_status,
             "Submitting block"
         );
+
+        // Update miner metrics: best work gas used (in MGas)
+        use once_cell::sync::Lazy;
+        use crate::metrics::BscMinerMetrics;
+        static MINER_METRICS: Lazy<BscMinerMetrics> = Lazy::new(BscMinerMetrics::default);
+        
+        let gas_used_mgas = sealed_block.gas_used() as f64 / 1_000_000.0;
+        MINER_METRICS.best_work_gas_used_mgas.set(gas_used_mgas);
 
         // TODO: wait more times when huge chain import.
         // TODO: only canonical head can broadcast, avoid sidechain blocks.

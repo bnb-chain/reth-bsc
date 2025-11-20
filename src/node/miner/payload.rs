@@ -408,10 +408,6 @@ where
         MINER_METRICS.block_finalize_duration_seconds.record(finalize_duration);
         MINER_METRICS.blocks_produced_total.increment(1);
         
-        // Update best work gas used (in MGas)
-        let gas_used_mgas = cumulative_gas_used as f64 / 1_000_000.0;
-        MINER_METRICS.best_work_gas_used_mgas.set(gas_used_mgas);
-        
         // set sidecars to seal block
         let mut blob_sidecars:Vec<BscBlobTransactionSidecar>= Vec::new();
         let transactions = &sealed_block.body().inner.transactions;
@@ -886,6 +882,7 @@ where
         let total_len = self.potential_payloads.len();
         let best_payload = self.potential_payloads.remove(best_index);
         let total_job_duration = self.job_start_time.elapsed();
+        
         info!(
             target: "bsc::miner::payload",
             block_number = best_payload.block().header().number(),
@@ -893,6 +890,8 @@ where
             is_inturn = self.mining_ctx.is_inturn,
             tx_count = best_payload.block().body().transaction_count(),
             fees = %best_payload.fees(),
+            gas_used = best_payload.block().header().gas_used(),
+            gas_limit = best_payload.block().header().gas_limit(),
             pick_index = best_index + 1,
             total_len = total_len,
             total_job_duration_ms = total_job_duration.as_millis(),
