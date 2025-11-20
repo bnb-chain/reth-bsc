@@ -521,6 +521,8 @@ where
     join_handle: tokio::task::JoinSet<Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>>>,
     /// Simulator for bid management (no outer RwLock, each map has its own)
     simulator: Arc<BidSimulator<Client, Pool>>,
+    /// Job start time for tracking total duration
+    job_start_time: std::time::Instant,
 }
 
 impl<Pool, Client, EvmConfig> BscPayloadJob<Pool, Client, EvmConfig>
@@ -572,6 +574,7 @@ where
             retries: 0,
             join_handle: tokio::task::JoinSet::new(),
             simulator,
+            job_start_time: std::time::Instant::now(),
         };
         let handle = BscPayloadJobHandle {
             abort_tx,
@@ -842,10 +845,12 @@ where
                 payload: best_payload,
                 cancel: self.build_args.cancel.clone(),
             }) {
+                let total_job_duration = self.job_start_time.elapsed();
                 warn!(
                     target: "bsc::miner::payload",
                     block_number = self.build_args.config.parent_header.number() + 1,
                     is_inturn = self.mining_ctx.is_inturn,
+                    total_job_duration_ms = total_job_duration.as_millis(),
                     error = %err,
                     "Failed to send best payload to result channel"
                 );
@@ -853,10 +858,12 @@ where
             }
             Ok(())
         } else {
+            let total_job_duration = self.job_start_time.elapsed();
             warn!(
                 target: "bsc::miner::payload",
                 try_mine_block_number = self.build_args.config.parent_header.number() + 1,
                 is_inturn = self.mining_ctx.is_inturn,
+                total_job_duration_ms = total_job_duration.as_millis(),
                 "No best payload available to send"
             );
             Err(Box::new(BscPayloadJobError::NoPayloadsAvailable))
@@ -878,6 +885,7 @@ where
 
         let total_len = self.potential_payloads.len();
         let best_payload = self.potential_payloads.remove(best_index);
+        let total_job_duration = self.job_start_time.elapsed();
         info!(
             target: "bsc::miner::payload",
             block_number = best_payload.block().header().number(),
@@ -887,6 +895,7 @@ where
             fees = %best_payload.fees(),
             pick_index = best_index + 1,
             total_len = total_len,
+            total_job_duration_ms = total_job_duration.as_millis(),
             "Succeed to pick the best payload"
         );
 

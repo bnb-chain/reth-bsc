@@ -135,7 +135,7 @@ where
 
         { // cache turnlength
             let is_bohr = self.spec.is_bohr_active_at_timestamp(header.number, header.timestamp);
-            tracing::debug!(
+            tracing::trace!(
                 "Check turn length cache update: block_number={}, epoch_length={}, is_next_epoch={}, is_bohr={}",
                 header.number, epoch_length, is_next_epoch, is_bohr
             );

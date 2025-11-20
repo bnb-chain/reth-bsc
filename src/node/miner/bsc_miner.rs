@@ -620,10 +620,10 @@ where
         while let Some(result) = self.payload_job_join_set.try_join_next() {
             match result {
                 Ok(Ok(())) => {
-                    debug!("Succeed to execute payload job");
+                    trace!("Succeed to execute payload job");
                 }
                 Ok(Err(e)) => {
-                    debug!("Failed to execute payload job due to {}", e);
+                    trace!("Failed to execute payload job due to {}", e);
                 }
                 Err(join_err) => {
                     error!("Failed to execute payload job due to task panicked or was cancelled, join_err: {}", join_err);
