@@ -591,7 +591,13 @@ where
     pub async fn start(mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut start_time = std::time::Instant::now();
         if let Err(err) = self.try_build_tx.send(()) {
-            warn!("Failed to send to first try build queue due to {}, block_number: {}", err, self.build_args.config.parent_header.number()+1);
+            warn!(
+                target: "bsc::miner::payload",
+                block_number = self.build_args.config.parent_header.number() + 1,
+                is_inturn = self.mining_ctx.is_inturn,
+                error = %err,
+                "Failed to send to first try build queue"
+            );
             return Err(Box::new(BscPayloadJobError::BuildQueueSendError(err.to_string())));
         }
     
@@ -603,8 +609,13 @@ where
                         Some(_) => {
                             self.retries += 1;
                             start_time = std::time::Instant::now();
-                            debug!("Try new build, block_number: {}, retries: {}", 
-                                self.build_args.config.parent_header.number()+1, self.retries);
+                            debug!(
+                                target: "bsc::miner::payload",
+                                block_number = self.build_args.config.parent_header.number() + 1,
+                                is_inturn = self.mining_ctx.is_inturn,
+                                retries = self.retries,
+                                "Try new build"
+                            );
                             
                             let builder = self.builder.clone();
                             let build_args = self.build_args.clone();
@@ -613,7 +624,12 @@ where
                             });
                         }
                         None => {
-                            debug!("Exit payload job by queue closed");
+                            debug!(
+                                target: "bsc::miner::payload",
+                                block_number = self.build_args.config.parent_header.number() + 1,
+                                is_inturn = self.mining_ctx.is_inturn,
+                                "Exit payload job by queue closed"
+                            );
                             return Ok(());
                         }
                     }
@@ -628,13 +644,16 @@ where
                             }
                             let elapsed = start_time.elapsed();
                             let payload_tx_count = payload.block().body().transaction_count();
-                            debug!("Succeed to try new build: {} (hash: 0x{:x}, txs: {}, fees: {}, cost_time: {:?}, retries: {})", 
-                                payload.block().header().number(),
-                                payload.block().hash(),
-                                payload.block().body().transaction_count(),
-                                payload.fees(),
-                                elapsed,
-                                self.retries
+                            debug!(
+                                target: "bsc::miner::payload",
+                                block_number = payload.block().header().number(),
+                                block_hash = %payload.block().hash(),
+                                is_inturn = self.mining_ctx.is_inturn,
+                                tx_count = payload.block().body().transaction_count(),
+                                fees = %payload.fees(),
+                                cost_time = ?elapsed,
+                                retries = self.retries,
+                                "Succeed to try new build"
                             );
                             self.potential_payloads.push(payload);
                             let mut new_tx_count = 0;
@@ -643,15 +662,27 @@ where
                                 tokio::select! {
                                     // Finish timeout by timer.
                                     _ = tokio::time::sleep(self.timeout) => {
-                                        info!("try return best payload due to has no time, cost_time: {:?}, block_number: {}, retries: {}", 
-                                            elapsed, self.build_args.config.parent_header.number()+1, self.retries);
+                                        info!(
+                                            target: "bsc::miner::payload",
+                                            block_number = self.build_args.config.parent_header.number() + 1,
+                                            is_inturn = self.mining_ctx.is_inturn,
+                                            cost_time = ?elapsed,
+                                            retries = self.retries,
+                                            "try return best payload due to has no time"
+                                        );
                                         return self.try_return_best_payload();
                                     }
 
                                     // Abort by new head.
                                     _ = &mut self.abort_rx => {
-                                        info!("Abort payload building by new head, cost_time: {:?}, block_number: {}, retries: {}", 
-                                            elapsed, self.build_args.config.parent_header.number()+1, self.retries);
+                                        info!(
+                                            target: "bsc::miner::payload",
+                                            block_number = self.build_args.config.parent_header.number() + 1,
+                                            is_inturn = self.mining_ctx.is_inturn,
+                                            cost_time = ?elapsed,
+                                            retries = self.retries,
+                                            "Abort payload building by new head"
+                                        );
                                         self.build_args.cancel.clone().cancel();
                                         self.is_aborted = true;
                                         return Err(Box::new(BscPayloadJobError::JobAborted));
@@ -664,26 +695,59 @@ where
                                             self.mining_ctx.header.as_ref().unwrap(), 
                                             DELAY_LEFT_OVER);
                                         if std::time::Duration::from_millis(mining_delay) < elapsed {
-                                            debug!("try return best payload due to mining_delay < elapsed, block_number: {}, retries: {}, mining_delay: {:?}, elapsed: {:?}", 
-                                                self.build_args.config.parent_header.number()+1, self.retries, mining_delay, elapsed);
+                                            debug!(
+                                                target: "bsc::miner::payload",
+                                                block_number = self.build_args.config.parent_header.number() + 1,
+                                                is_inturn = self.mining_ctx.is_inturn,
+                                                retries = self.retries,
+                                                new_mining_delay = ?std::time::Duration::from_millis(mining_delay),
+                                                last_cost_time = ?elapsed,
+                                                "try return best payload due to mining_delay < elapsed"
+                                            );
                                             return self.try_return_best_payload();
                                         } else if std::time::Duration::from_millis(mining_delay) < elapsed * TIME_MULTIPLIER {
                                             if let Err(err) = self.try_build_tx.send(()) {
-                                                warn!("Failed to send to try build queue, block_number: {}, retries: {}, error: {:?}", 
-                                                    self.build_args.config.parent_header.number()+1, self.retries, err);
+                                                warn!(
+                                                    target: "bsc::miner::payload",
+                                                    block_number = self.build_args.config.parent_header.number() + 1,
+                                                    is_inturn = self.mining_ctx.is_inturn,
+                                                    retries = self.retries,
+                                                    error = ?err,
+                                                    "Failed to send to try build queue"
+                                                );
                                                 return self.try_return_best_payload();
                                             }
-                                            debug!("Succeed to send to try build queue, block_number: {}, retries: {}, last_cost_time: {:?}, new_mining_delay: {:?}", 
-                                                    self.build_args.config.parent_header.number()+1, self.retries, elapsed, std::time::Duration::from_millis(mining_delay));
+                                            debug!(
+                                                target: "bsc::miner::payload",
+                                                block_number = self.build_args.config.parent_header.number() + 1,
+                                                is_inturn = self.mining_ctx.is_inturn,
+                                                retries = self.retries,
+                                                last_cost_time = ?elapsed,
+                                                new_mining_delay = ?std::time::Duration::from_millis(mining_delay),
+                                                "Succeed to send to try build queue"
+                                            );
                                             break;  // Break out of the loop and wait for the next payload
                                         } else if new_tx_count >= payload_tx_count {
                                             if let Err(err) = self.try_build_tx.send(()) {
-                                                warn!("Failed to send to try build queue, block_number: {}, retries: {}, error: {:?}", 
-                                                    self.build_args.config.parent_header.number()+1, self.retries, err);
+                                                warn!(
+                                                    target: "bsc::miner::payload",
+                                                    block_number = self.build_args.config.parent_header.number() + 1,
+                                                    is_inturn = self.mining_ctx.is_inturn,
+                                                    retries = self.retries,
+                                                    error = ?err,
+                                                    "Failed to send to try build queue"
+                                                );
                                                 return self.try_return_best_payload();
                                             }
-                                            debug!("Succeed to send to try build queue, block_number: {}, retries: {}, last_cost_time: {:?}, new_mining_delay: {:?}", 
-                                                self.build_args.config.parent_header.number()+1, self.retries, elapsed, std::time::Duration::from_millis(mining_delay));
+                                            debug!(
+                                                target: "bsc::miner::payload",
+                                                block_number = self.build_args.config.parent_header.number() + 1,
+                                                is_inturn = self.mining_ctx.is_inturn,
+                                                retries = self.retries,
+                                                last_cost_time = ?elapsed,
+                                                new_mining_delay = ?std::time::Duration::from_millis(mining_delay),
+                                                "Succeed to send to try build queue"
+                                            );
                                             break; // Break out of the loop and wait for the next payload
                                         }
                                     }
@@ -706,8 +770,15 @@ where
                         },
                         Some(Err(join_err)) => {
                             let elapsed = start_time.elapsed();
-                            warn!("Failed to join payload build task due to {}, cost_time: {:?}, block_number: {}, retries: {}", 
-                                join_err, elapsed, self.build_args.config.parent_header.number()+1, self.retries);
+                            warn!(
+                                target: "bsc::miner::payload",
+                                block_number = self.build_args.config.parent_header.number() + 1,
+                                is_inturn = self.mining_ctx.is_inturn,
+                                cost_time = ?elapsed,
+                                retries = self.retries,
+                                error = %join_err,
+                                "Failed to join payload build task"
+                            );
                             return self.try_return_best_payload();
                         },
                         None => {
@@ -719,8 +790,14 @@ where
                 // Finish timeout by timer.
                 _ = tokio::time::sleep(self.timeout) => {
                     let elapsed = start_time.elapsed();
-                    info!("Try return best payload due to has no time, cost_time: {:?}, block_number: {}, retries: {}", 
-                        elapsed, self.build_args.config.parent_header.number()+1, self.retries);
+                    info!(
+                        target: "bsc::miner::payload",
+                        block_number = self.build_args.config.parent_header.number() + 1,
+                        is_inturn = self.mining_ctx.is_inturn,
+                        cost_time = ?elapsed,
+                        retries = self.retries,
+                        "Try return best payload due to has no time"
+                    );
                     self.build_args.cancel.clone().cancel();
                     return self.try_return_best_payload();
                 }
@@ -728,8 +805,15 @@ where
                 // Abort by new head.
                 _ = &mut self.abort_rx => {
                     let elapsed = start_time.elapsed();
-                    info!("Abort payload building by new head, cost_time: {:?}, block_number: {}, parent_hash: 0x{:x}, retries: {}", 
-                        elapsed, self.build_args.config.parent_header.number()+1, self.build_args.config.parent_header.parent_hash(), self.retries);
+                    info!(
+                        target: "bsc::miner::payload",
+                        block_number = self.build_args.config.parent_header.number() + 1,
+                        is_inturn = self.mining_ctx.is_inturn,
+                        parent_hash = %self.build_args.config.parent_header.parent_hash(),
+                        cost_time = ?elapsed,
+                        retries = self.retries,
+                        "Abort payload building by new head"
+                    );
                     self.build_args.cancel.clone().cancel();
                     self.is_aborted = true;
                     return Err(Box::new(BscPayloadJobError::JobAborted));
@@ -742,7 +826,14 @@ where
     fn try_return_best_payload(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let best_bid = self.simulator.get_best_bid(self.mining_ctx.parent_header.hash());
         if let Some(bid) = best_bid {
-            info!("Found best bid! block: {}, builder: {:?}, gas_fee: {}", bid.bid.block_number, bid.bid.builder, bid.bid.gas_fee);
+            info!(
+                target: "bsc::miner::payload",
+                block_number = bid.bid.block_number,
+                is_inturn = self.mining_ctx.is_inturn,
+                builder = ?bid.bid.builder,
+                gas_fee = %bid.bid.gas_fee,
+                "Found best bid"
+            );
             self.potential_payloads.push(bid.bsc_payload);
         }
         if let Some(best_payload) = self.pick_best_payload() {
@@ -751,12 +842,23 @@ where
                 payload: best_payload,
                 cancel: self.build_args.cancel.clone(),
             }) {
-                warn!("Failed to send best payload to result channel: {}", err);
+                warn!(
+                    target: "bsc::miner::payload",
+                    block_number = self.build_args.config.parent_header.number() + 1,
+                    is_inturn = self.mining_ctx.is_inturn,
+                    error = %err,
+                    "Failed to send best payload to result channel"
+                );
                 return Err(Box::new(BscPayloadJobError::ResultChannelSendError(err.to_string())));
             }
             Ok(())
         } else {
-            warn!("No best payload available to send, try_mine_block_number: {}", self.build_args.config.parent_header.number()+1);
+            warn!(
+                target: "bsc::miner::payload",
+                try_mine_block_number = self.build_args.config.parent_header.number() + 1,
+                is_inturn = self.mining_ctx.is_inturn,
+                "No best payload available to send"
+            );
             Err(Box::new(BscPayloadJobError::NoPayloadsAvailable))
         }
     }
@@ -776,13 +878,16 @@ where
 
         let total_len = self.potential_payloads.len();
         let best_payload = self.potential_payloads.remove(best_index);
-        info!("Succeed to pick the best payload: {} (hash: 0x{:x}, txs: {}, fees: {}), pick the {}th payload as best, total_len: {}", 
-            best_payload.block().header().number(),
-            best_payload.block().hash(),
-            best_payload.block().body().transaction_count(),
-            best_payload.fees(),
-            best_index+1,
-            total_len
+        info!(
+            target: "bsc::miner::payload",
+            block_number = best_payload.block().header().number(),
+            block_hash = %best_payload.block().hash(),
+            is_inturn = self.mining_ctx.is_inturn,
+            tx_count = best_payload.block().body().transaction_count(),
+            fees = %best_payload.fees(),
+            pick_index = best_index + 1,
+            total_len = total_len,
+            "Succeed to pick the best payload"
         );
 
         self.potential_payloads.clear();
