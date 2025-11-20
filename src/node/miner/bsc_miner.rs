@@ -26,7 +26,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_stream::StreamExt;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, warn, trace};
 use reth_basic_payload_builder::{PayloadConfig, PrecachedState};
 use crate::node::miner::payload::BscBuildArguments;
 use reth_revm::cancelled::ManualCancel;
@@ -356,7 +356,7 @@ where
         
         let parent_header = match self.provider.sealed_header_by_hash(tip.hash()) {
             Ok(Some(header)) => {
-                debug!(
+                trace!(
                     target: "bsc::miner",
                     tip_number = tip.number(),
                     tip_hash = ?tip.hash(),

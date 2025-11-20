@@ -282,7 +282,7 @@ impl Snapshot {
         let is_inturn = inturn_val == proposer;
         
         if !is_inturn {
-            tracing::debug!(
+            tracing::trace!(
                 "is_inturn check: proposer=0x{:x}, inturn_validator=0x{:x}, is_inturn={}, validators={:?}",
                 proposer, inturn_val, is_inturn, self.validators
             );

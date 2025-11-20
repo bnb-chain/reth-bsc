@@ -29,7 +29,7 @@ pub fn debug_header(header: &Header, chain_id: u64, context: &str) {
     let block_id = format!("#{}-0x{:x}", header.number, alloy_primitives::keccak256(header.parent_hash.as_slice()));
     let signed_extra_data = &header.extra_data[..header.extra_data.len().saturating_sub(EXTRA_SEAL_LEN)];
     
-    tracing::debug!(
+    tracing::trace!(
         target: "bsc::parlia::util",
         context = context,
         block_id = %block_id,
