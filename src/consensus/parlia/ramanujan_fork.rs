@@ -36,7 +36,7 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
         if header_timestamp > present_timestamp {
             delay_ms = header_timestamp - present_timestamp;
         }
-        tracing::debug!(
+        tracing::trace!(
             target: "bsc::miner",
             block_number = header.number,
             block_timestamp = header_timestamp,

@@ -354,7 +354,7 @@ where
 
     fn apply_pre_execution_changes(&mut self) -> Result<(), BlockExecutionError> {
         let block_env = self.evm.block().clone();
-        debug!(
+        trace!(
             target: "bsc::executor", 
             block_id = %block_env.number,
             is_miner = self.ctx.is_miner,

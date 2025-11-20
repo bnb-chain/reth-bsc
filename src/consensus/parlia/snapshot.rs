@@ -304,7 +304,7 @@ impl Snapshot {
         let offset = (next_block / turn_length) as usize % self.validators.len();
         let next_validator = self.validators[offset];
         
-        tracing::debug!(
+        tracing::trace!(
             "inturn_validator debug info, snapshot_block={}, next_block={}, turn_length={}, offset={}, validators_len={}, next_validator=0x{:x}",
             self.block_number, next_block, turn_length, offset, self.validators.len(), next_validator
         );

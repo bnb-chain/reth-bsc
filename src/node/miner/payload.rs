@@ -232,7 +232,7 @@ where
             let tx = pool_tx.to_consensus();
             let tx_start = std::time::Instant::now();
             let mut blob_tx_sidecar = None;
-            debug!(
+            trace!(
                 target: "payload_builder",
                 block_number = parent_header.number() + 1,
                 tx = ?tx.hash(),
@@ -577,7 +577,13 @@ where
             abort_tx,
         };
 
-        debug!("Succeed to new payload job, block_number: {}, timeout: {:?}", job.mining_ctx.parent_header.number()+1, job.timeout);
+        debug!(
+            target: "bsc::miner::payload",
+            block_number = job.mining_ctx.parent_header.number() + 1,
+            is_inturn = job.mining_ctx.is_inturn,
+            timeout = ?job.timeout,
+            "Succeed to new payload job"
+        );
         (job, handle)
     }
 
