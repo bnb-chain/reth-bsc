@@ -592,6 +592,7 @@ where
             cached_reads: mining_ctx.cached_reads.clone().unwrap_or_default(),
             config: PayloadConfig::new(Arc::new(mining_ctx.parent_header.clone()), attributes),
             cancel: ManualCancel::default(),
+            trace_id: crate::node::miner::payload::generate_trace_id(),
         };
         
         let parent_hash = mining_ctx.parent_header.hash();

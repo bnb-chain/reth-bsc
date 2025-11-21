@@ -273,7 +273,7 @@ where
         let mut basefee = Some(EIP1559_INITIAL_BASE_FEE);
 
         let mut gas_limit = U256::from(parent.gas_limit);
-        let mut is_london_fork = false;
+        //let mut is_london_fork = false;
 
         // If we are on the London fork boundary, we need to multiply the parent's gas limit by the
         // elasticity multiplier to get the new gas limit.
@@ -293,7 +293,7 @@ where
 
             // set the base fee to the initial base fee from the EIP-1559 spec
             basefee = Some(EIP1559_INITIAL_BASE_FEE);
-            is_london_fork = true;
+            //is_london_fork = true;
         }
 
         let block_env = BlockEnv {
@@ -309,7 +309,7 @@ where
             blob_excess_gas_and_price,
         };
 
-        tracing::debug!("Next evm env: {:?}, is_london_fork: {}", block_env, is_london_fork);
+        // tracing::debug!("Next evm env: {:?}, is_london_fork: {}", block_env, is_london_fork);
 
         Ok(EvmEnv { cfg_env, block_env })
     }

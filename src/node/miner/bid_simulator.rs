@@ -570,8 +570,8 @@ EvmConfig: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
                 }
             };
 
-            let _gas_used = match builder.execute_transaction(recovered_tx.clone()) {
-                Ok(gas_used) => gas_used,
+            let tx_gas_used = match builder.execute_transaction(recovered_tx.clone()) {
+                Ok(tx_gas_used) => tx_gas_used,
                 Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
                     error, ..
                 })) => {
@@ -608,8 +608,8 @@ EvmConfig: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
                 } 
             }
 
-            gas_used += _gas_used;
-            gas_fee += (U256::from(tx_effective_gas_price) + U256::from(base_fee)) * U256::from(_gas_used);
+            gas_used += tx_gas_used;
+            gas_fee += (U256::from(tx_effective_gas_price) + U256::from(base_fee)) * U256::from(tx_gas_used);
         }
         
         self.gas_used += gas_used;
