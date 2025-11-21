@@ -655,6 +655,24 @@ where
         }
     
         loop {
+            // Calculate remaining time from job start for outer loop
+            let job_elapsed = self.job_start_time.elapsed();
+            let remaining_duration = if job_elapsed < self.timeout {
+                self.timeout - job_elapsed
+            } else {
+                // Already timeout, return immediately
+                info!(
+                    target: "bsc::miner::payload",
+                    trace_id = self.trace_id,
+                    block_number = self.build_args.config.parent_header.number() + 1,
+                    is_inturn = self.mining_ctx.is_inturn,
+                    job_elapsed_ms = job_elapsed.as_millis(),
+                    timeout_ms = self.timeout.as_millis(),
+                    "Outer loop: Job already timeout, returning best payload"
+                );
+                return self.try_return_best_payload();
+            };
+            
             tokio::select! {
                 // Trigger the async build payload by queue.
                 args = self.try_build_rx.recv() => {
@@ -715,9 +733,28 @@ where
                             let mut new_tx_count = 0;
                             // loop wait new transactions or timeout.
                             loop {
+                                // Calculate remaining time from job start
+                                let job_elapsed = self.job_start_time.elapsed();
+                                let remaining_duration = if job_elapsed < self.timeout {
+                                    self.timeout - job_elapsed
+                                } else {
+                                    // Already timeout, return immediately
+                                    info!(
+                                        target: "bsc::miner::payload",
+                                        trace_id = self.trace_id,
+                                        block_number = self.build_args.config.parent_header.number() + 1,
+                                        is_inturn = self.mining_ctx.is_inturn,
+                                        job_elapsed_ms = job_elapsed.as_millis(),
+                                        timeout_ms = self.timeout.as_millis(),
+                                        retries = self.retries,
+                                        "Job already timeout, returning best payload immediately"
+                                    );
+                                    return self.try_return_best_payload();
+                                };
+                                
                                 tokio::select! {
-                                    // Finish timeout by timer.
-                                    _ = tokio::time::sleep(self.timeout) => {
+                                    // Use remaining time instead of full timeout
+                                    _ = tokio::time::sleep(remaining_duration) => {
                                         info!(
                                             target: "bsc::miner::payload",
                                             trace_id = self.trace_id,
@@ -725,6 +762,7 @@ where
                                             is_inturn = self.mining_ctx.is_inturn,
                                             cost_time = ?elapsed,
                                             retries = self.retries,
+                                            job_elapsed_ms = self.job_start_time.elapsed().as_millis(),
                                             "try return best payload due to has no time"
                                         );
                                         return self.try_return_best_payload();
@@ -852,8 +890,8 @@ where
                     }
                 }
                 
-                // Finish timeout by timer.
-                _ = tokio::time::sleep(self.timeout) => {
+                // Finish timeout by timer using remaining duration
+                _ = tokio::time::sleep(remaining_duration) => {
                     let elapsed = start_time.elapsed();
                     info!(
                         target: "bsc::miner::payload",
@@ -862,6 +900,8 @@ where
                         is_inturn = self.mining_ctx.is_inturn,
                         cost_time = ?elapsed,
                         retries = self.retries,
+                        job_elapsed_ms = self.job_start_time.elapsed().as_millis(),
+                        timeout_ms = self.timeout.as_millis(),
                         "Try return best payload due to has no time"
                     );
                     self.build_args.cancel.clone().cancel();
