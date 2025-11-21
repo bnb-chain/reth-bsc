@@ -333,11 +333,27 @@ where
                 })) => {
                     if error.is_nonce_too_low() {
                         // if the nonce is too low, we can skip this transaction
-                        debug!(target: "payload_builder", %error, ?tx, "skipping nonce too low transaction");
+                        debug!(
+                            target: "bsc::miner::payload",
+                            tx_hash = %tx.hash(),
+                            sender = ?tx.signer(),
+                            nonce = tx.nonce(),
+                            error = %error,
+                            "Skipping nonce too low transaction"
+                        );
                     } else {
                         // if the transaction is invalid, we can skip it and all of its
                         // descendants
-                        debug!(target: "payload_builder", %error, ?tx, "skipping invalid transaction and its descendants");
+                        debug!(
+                            target: "bsc::miner::payload",
+                            tx_hash = %tx.hash(),
+                            sender = ?tx.signer(),
+                            nonce = tx.nonce(),
+                            gas_limit = tx.gas_limit(),
+                            error = %error,
+                            error_type = ?error,
+                            "Skipping invalid transaction and its descendants"
+                        );
                         best_tx_list.mark_invalid(
                             &pool_tx,
                             InvalidPoolTransactionError::Consensus(
