@@ -265,11 +265,15 @@ where
                 BlobExcessGasAndPrice { excess_blob_gas, blob_gasprice }
             });
 
-        let mut basefee = parent.next_block_base_fee(
-            self.chain_spec().base_fee_params_at_timestamp(attributes.timestamp),
-        );
+        // TODO: fix it
+        // let mut basefee = parent.next_block_base_fee(
+        //     self.chain_spec().base_fee_params_at_timestamp(attributes.timestamp),
+        // );
+        // https://github.com/bnb-chain/bsc/blob/master/consensus/misc/eip1559/eip1559.go#L61
+        let mut basefee = Some(EIP1559_INITIAL_BASE_FEE);
 
         let mut gas_limit = U256::from(parent.gas_limit);
+        let mut is_london_fork = false;
 
         // If we are on the London fork boundary, we need to multiply the parent's gas limit by the
         // elasticity multiplier to get the new gas limit.
@@ -288,7 +292,8 @@ where
             gas_limit *= U256::from(elasticity_multiplier);
 
             // set the base fee to the initial base fee from the EIP-1559 spec
-            basefee = Some(EIP1559_INITIAL_BASE_FEE)
+            basefee = Some(EIP1559_INITIAL_BASE_FEE);
+            is_london_fork = true;
         }
 
         let block_env = BlockEnv {
@@ -303,6 +308,8 @@ where
             // calculate excess gas based on parent block's blob gas usage
             blob_excess_gas_and_price,
         };
+
+        tracing::debug!("Next evm env: {:?}, is_london_fork: {}", block_env, is_london_fork);
 
         Ok(EvmEnv { cfg_env, block_env })
     }
