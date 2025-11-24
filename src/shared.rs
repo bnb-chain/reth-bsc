@@ -5,11 +5,14 @@ use alloy_primitives::B256;
 use reth_provider::{HeaderProvider, BlockNumReader};
 use crate::node::network::BscNetworkPrimitives;
 use reth_network::NetworkHandle;
-use crate::node::network::block_import::service::IncomingBlock;
+use crate::node::network::block_import::service::{IncomingBlock, IncomingMinedBlock};
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::broadcast;
 use reth_network_api::PeerId;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
+use reth_payload_builder_primitives::Events;
+use crate::node::engine_api::payload::BscPayloadTypes;
 
 /// Function type for HeaderProvider::header() access (by hash)
 type HeaderByHashFn = Arc<dyn Fn(&B256) -> Option<Header> + Send + Sync>;
@@ -39,6 +42,9 @@ type BestTdFn = Arc<dyn Fn() -> Option<u128> + Send + Sync>;
 static BEST_TD_PROVIDER: OnceLock<BestTdFn> = OnceLock::new();
 
 /// Global sender for submitting mined blocks to the import service
+static BLOCK_IMPORT_MINED_SENDER: OnceLock<UnboundedSender<IncomingMinedBlock>> = OnceLock::new();
+
+/// Global sender for submitting built payload to the import service
 static BLOCK_IMPORT_SENDER: OnceLock<UnboundedSender<IncomingBlock>> = OnceLock::new();
 
 /// Global local peer ID for network identification
@@ -49,6 +55,9 @@ static BID_PACKAGE_QUEUE: OnceLock<Arc<Mutex<VecDeque<crate::node::miner::bid_si
 
 /// Global network handle to interact with P2P (reth).
 static NETWORK_HANDLE: OnceLock<NetworkHandle<BscNetworkPrimitives>> = OnceLock::new();
+
+/// Global payload events broadcast sender
+static PAYLOAD_EVENTS_TX: OnceLock<broadcast::Sender<Events<BscPayloadTypes>>> = OnceLock::new();
 
 /// Trait for fork choice engine operations that can be stored globally
 pub trait ForkChoiceEngineTrait: Send + Sync {
@@ -171,6 +180,16 @@ pub fn get_best_canonical_td() -> Option<u128> {
 }
 
 /// Store the block import sender globally. Returns an error if it was set before.
+pub fn set_block_import_mined_sender(sender: UnboundedSender<IncomingMinedBlock>) -> Result<(), UnboundedSender<IncomingMinedBlock>> {
+    BLOCK_IMPORT_MINED_SENDER.set(sender)
+}
+
+/// Get a reference to the global block import sender, if initialized.
+pub fn get_block_import_mined_sender() -> Option<&'static UnboundedSender<IncomingMinedBlock>> {
+    BLOCK_IMPORT_MINED_SENDER.get()
+}
+
+/// Store the block import sender globally. Returns an error if it was set before.
 pub fn set_block_import_sender(sender: UnboundedSender<IncomingBlock>) -> Result<(), UnboundedSender<IncomingBlock>> {
     BLOCK_IMPORT_SENDER.set(sender)
 }
@@ -179,7 +198,6 @@ pub fn set_block_import_sender(sender: UnboundedSender<IncomingBlock>) -> Result
 pub fn get_block_import_sender() -> Option<&'static UnboundedSender<IncomingBlock>> {
     BLOCK_IMPORT_SENDER.get()
 }
-
 
 /// Store the local peer ID globally. Returns an error if it was set before.
 pub fn set_local_peer_id(peer_id: PeerId) -> Result<(), PeerId> {
@@ -224,6 +242,16 @@ pub fn set_network_handle(handle: NetworkHandle<BscNetworkPrimitives>) -> Result
 /// Get a clone of the global network handle if available.
 pub fn get_network_handle() -> Option<NetworkHandle<BscNetworkPrimitives>> {
     NETWORK_HANDLE.get().cloned()
+}
+
+/// Set global payload events broadcast sender.
+pub fn set_payload_events_tx(tx: broadcast::Sender<Events<BscPayloadTypes>>) -> Result<(), broadcast::Sender<Events<BscPayloadTypes>>> {
+    PAYLOAD_EVENTS_TX.set(tx)
+}
+
+/// Get global payload events broadcast sender if initialized.
+pub fn get_payload_events_tx() -> Option<&'static broadcast::Sender<Events<BscPayloadTypes>>> {
+    PAYLOAD_EVENTS_TX.get()
 }
 
 /// Store the fork choice engine globally.

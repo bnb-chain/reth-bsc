@@ -20,6 +20,8 @@ pub struct MiningConfig {
     pub gas_limit: Option<u64>,
     /// Mining interval in milliseconds
     pub mining_interval_ms: Option<u64>,
+    /// Submit built payload to the import service
+    pub submit_built_payload: bool,
 }
 
 impl std::fmt::Debug for MiningConfig {
@@ -52,6 +54,7 @@ impl Default for MiningConfig {
             private_key_hex: None,
             gas_limit: Some(30_000_000),
             mining_interval_ms: Some(500),
+            submit_built_payload: false,
         }
     }
 }
@@ -103,6 +106,7 @@ impl MiningConfig {
                 keystore_password: None,
                 gas_limit: Some(30_000_000),
                 mining_interval_ms: Some(500),
+                submit_built_payload: false,
             }
         } else {
             // Fallback to default if key generation fails
@@ -162,6 +166,11 @@ impl MiningConfig {
             .ok()
             .and_then(|v| v.parse().ok());
 
+        let submit_built_payload = std::env::var("BSC_SUBMIT_BUILT_PAYLOAD")
+            .ok()
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false);
+
         let mut cfg = Self {
             enabled,
             private_key_hex,
@@ -169,6 +178,7 @@ impl MiningConfig {
             keystore_password,
             gas_limit,
             mining_interval_ms,
+            submit_built_payload,
             ..Default::default()
         };
 

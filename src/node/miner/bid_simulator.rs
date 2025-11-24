@@ -1,8 +1,11 @@
 use alloy_consensus::Transaction;
+use alloy_consensus::BlockHeader;
 use alloy_primitives::U256;
 use alloy_evm::Evm;
+use reth_chain_state::{ExecutedBlock, ExecutedTrieUpdates};
 use crate::node::evm::config::BscEvmConfig;
 use reth_provider::StateProviderFactory;
+use reth_evm::execute::ExecutionOutcome;
 use reth_revm::{database::StateProviderDatabase, db::State};
 use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
 use reth_evm::execute::BlockBuilder;
@@ -377,7 +380,7 @@ Pool: reth::transaction_pool::TransactionPool<Transaction: reth::transaction_poo
         }
         
         // Finish the builder
-        let BlockBuilderOutcome { execution_result, block, .. } = match builder.finish(&state_provider).map_err(PayloadBuilderError::other) {
+        let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } = match builder.finish(&state_provider).map_err(PayloadBuilderError::other) {
             Ok(outcome) => outcome,
             Err(e) => {
                 debug!("Failed to finish builder: {:?}", e);
@@ -397,9 +400,20 @@ Pool: reth::transaction_pool::TransactionPool<Transaction: reth::transaction_poo
         sealed_block = Arc::new(plain.into());
 
         bid_runtime.bsc_payload = BscBuiltPayload {
-            block: sealed_block,
+            block: sealed_block.clone(),
             fees: bid_runtime.gas_fee,
-            requests: Some(execution_result.requests),
+            requests: Some(execution_result.requests.clone()),
+            executed_block: ExecutedBlock {
+                recovered_block: Arc::new(block.clone()),
+                execution_output: Arc::new(ExecutionOutcome::new(
+                    db.take_bundle(),
+                    vec![execution_result.receipts.clone()],
+                    sealed_block.header().number(),
+                    vec![execution_result.requests.clone()],
+                )),
+                hashed_state: Arc::new(hashed_state.clone()),
+            },
+            executed_trie: Some(ExecutedTrieUpdates::Present(Arc::new(trie_updates))),
         };
 
         // Acquire write lock to update best_bid

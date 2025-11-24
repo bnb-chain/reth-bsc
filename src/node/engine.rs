@@ -16,7 +16,9 @@ use reth::{
     transaction_pool::TransactionPool,
 };
 use reth_evm::ConfigureEvm;
+use reth_payload_builder_primitives::Events;
 use reth_payload_primitives::BuiltPayload;
+use reth_chain_state::{ExecutedBlock, ExecutedBlockWithTrieUpdates, ExecutedTrieUpdates};
 use reth_primitives::{SealedBlock, TransactionSigned};
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,6 +36,10 @@ pub struct BscBuiltPayload {
     pub(crate) fees: U256,
     /// The requests of the payload
     pub(crate) requests: Option<Requests>,
+    /// The executed block
+    pub(crate) executed_block: ExecutedBlock<BscPrimitives>,
+    /// The executed trie updates
+    pub(crate) executed_trie: Option<ExecutedTrieUpdates>,
 }
 
 impl BuiltPayload for BscBuiltPayload {
@@ -49,6 +55,13 @@ impl BuiltPayload for BscBuiltPayload {
 
     fn requests(&self) -> Option<Requests> {
         self.requests.clone()
+    }
+
+    fn executed_block(&self) -> Option<ExecutedBlockWithTrieUpdates<Self::Primitives>> {
+        self.executed_trie.clone().map(|trie| ExecutedBlockWithTrieUpdates {
+            block: self.executed_block.clone(),
+            trie,
+        })
     }
 }
 
@@ -128,15 +141,16 @@ where
             });
         }
 
-        // Handle payload service commands (keep minimal compatibility)
+        // Initialize global payload events channel and handler
+        let (events_tx, _events_rx) = broadcast::channel::<Events<BscPayloadTypes>>(100);
+        let _ = crate::shared::set_payload_events_tx(events_tx.clone());
+
+        // Handle payload service commands (keep minimal compatibility but with shared events channel)
         ctx.task_executor().spawn_critical("payload-service-handler", async move {
-            let mut subscriptions = Vec::new();
             while let Some(message) = rx.recv().await {
                 match message {
                     PayloadServiceCommand::Subscribe(tx) => {
-                        let (events_tx, events_rx) = broadcast::channel(100);
-                        subscriptions.push(events_tx);
-                        let _ = tx.send(events_rx);
+                        let _ = tx.send(events_tx.subscribe());
                     }
                     message => debug!(?message, "BSC payload service received engine message"),
                 }
