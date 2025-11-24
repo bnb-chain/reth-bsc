@@ -2,7 +2,10 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 use std::sync::Arc;
 
+use alloy_primitives::U128;
 use once_cell::sync::Lazy;
+use reth_eth_wire::NewBlock;
+use reth_network::message::NewBlockMessage;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -12,6 +15,7 @@ use reth_network_api::PeerId;
 
 use super::stream::BscCommand;
 use reth_network::Peers;
+use crate::node::network::BscNewBlock;
 use crate::node::network::blocks_by_range::{GetBlocksByRangePacket, BlocksByRangePacket, MAX_REQUEST_RANGE_BLOCKS_COUNT};
 use alloy_primitives::B256;
 use std::time::Duration;
@@ -101,42 +105,37 @@ pub async fn batch_request_range_and_await_import(
     start_height: u64,
     start_hash: B256,
     count: u64,
-    request_timeout: Duration,
-    per_block_import_timeout: Duration,
-) -> Result<Vec<B256>, String> {
+    request_timeout: Duration
+) -> Result<(), String> {
     let resp = request_blocks_by_range(peer, start_height, start_hash, count, request_timeout).await?;
-    let mut expected: Vec<B256> = resp.blocks.iter().map(|b| b.header.hash_slow()).collect();
-    // resp.blocks are newest-first; normalize to oldest-first
-    expected.reverse();
+    tracing::debug!(
+        target: "bsc::registry",
+        peer = %peer,
+        start_height = start_height,
+        start_hash = %start_hash,
+        count = count,
+        blocks = resp.blocks.len(),
+        "Batch request range and await importing blocks"
+    );
 
-    let mut rx = crate::shared::subscribe_imported_blocks();
-    let mut imported: Vec<B256> = Vec::with_capacity(expected.len());
-
-    for h in expected.iter().copied() {
-        // Fast path: already canonical
-        if crate::shared::get_canonical_header_by_hash(&h).is_some() {
-            imported.push(h);
-            continue;
-        }
-        // Wait on imported-blocks broadcast for this specific hash
-        let deadline = tokio::time::Instant::now() + per_block_import_timeout;
-        loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                return Err(format!("import timeout for block {h:?}"));
-            }
-            match tokio::time::timeout(remaining, rx.recv()).await {
-                Ok(Ok(seen)) => {
-                    if seen == h { imported.push(h); break; }
-                    // else keep waiting for our target
-                }
-                Ok(Err(_closed)) => return Err("import notification channel closed".to_string()),
-                Err(_elapsed) => return Err(format!("import timeout for block {h:?}")),
+    // Forward blocks to import path (iterate oldest -> newest)
+    if let Some(sender) = crate::shared::get_block_import_sender() {
+        for block in resp.blocks.iter().rev() {
+            let nb = BscNewBlock(NewBlock {
+                block: block.clone(),
+                td: U128::from(0u64),
+            });
+            let hash = block.header.hash_slow();
+            let msg = NewBlockMessage { hash, block: Arc::new(nb) };
+            if let Err(e) = sender.send((msg, peer)) {
+                tracing::error!(target: "bsc::registry", error=%e, "Failed to send block to import path");
             }
         }
+    } else {
+        tracing::debug!(target: "bsc_protocol", "Block import sender not available; dropping range import forward");
     }
 
-    Ok(imported)
+    Ok(())
 }
 
 /// Broadcast votes to all connected peers.

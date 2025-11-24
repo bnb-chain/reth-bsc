@@ -16,7 +16,6 @@ use crate::node::engine_api::payload::BscPayloadTypes;
 use crate::node::primitives::BscBlock;
 use std::sync::RwLock;
 use schnellru::{LruMap, ByLength};
-use tokio::sync::broadcast;
 
 /// Function type for HeaderProvider::header() access (by hash)
 type HeaderByHashFn = Arc<dyn Fn(&B256) -> Option<Header> + Send + Sync>;
@@ -64,6 +63,16 @@ static NETWORK_HANDLE: OnceLock<NetworkHandle<BscNetworkPrimitives>> = OnceLock:
 static PAYLOAD_EVENTS_TX: OnceLock<broadcast::Sender<Events<BscPayloadTypes>>> = OnceLock::new();
 /// Broadcast channel for notifying about successfully imported block hashes
 static IMPORTED_BLOCKS_TX: OnceLock<broadcast::Sender<B256>> = OnceLock::new();
+
+/// Set global imported blocks broadcast sender.
+pub fn set_imported_blocks_tx(tx: broadcast::Sender<B256>) -> Result<(), broadcast::Sender<B256>> {
+    IMPORTED_BLOCKS_TX.set(tx)
+}
+
+/// Get global imported blocks broadcast sender if initialized.
+pub fn get_imported_blocks_tx() -> Option<&'static broadcast::Sender<B256>> {
+    IMPORTED_BLOCKS_TX.get()
+}
 
 /// Trait for fork choice engine operations that can be stored globally
 pub trait ForkChoiceEngineTrait: Send + Sync {
@@ -306,23 +315,6 @@ where
 /// Get a reference to the global fork choice engine.
 pub fn get_fork_choice_engine() -> Option<&'static dyn ForkChoiceEngineTrait> {
     FORK_CHOICE_ENGINE.get().map(|b| &**b)
-}
-
-/// Get or initialize the imported blocks broadcast sender
-fn imported_blocks_sender() -> broadcast::Sender<B256> {
-    IMPORTED_BLOCKS_TX
-        .get_or_init(|| broadcast::channel::<B256>(128).0)
-        .clone()
-}
-
-/// Subscribe to imported block hash notifications
-pub fn subscribe_imported_blocks() -> broadcast::Receiver<B256> {
-    imported_blocks_sender().subscribe()
-}
-
-/// Notify listeners that a block with the given hash has been imported
-pub fn notify_block_imported(hash: B256) {
-    let _ = imported_blocks_sender().send(hash);
 }
 
 /// Set the global full block provider

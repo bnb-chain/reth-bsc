@@ -1,19 +1,18 @@
 use alloy_primitives::bytes::BytesMut;
 use alloy_rlp::{Decodable, Encodable};
-use futures::{Stream, StreamExt};
-use std::{pin::Pin, task::{Context, Poll, ready}};
-use reth_eth_wire::multiplex::ProtocolConnection;
 use bytes::Bytes;
-use tokio::sync::{mpsc::UnboundedReceiver, oneshot};
-use tokio_stream::wrappers::UnboundedReceiverStream;
-use tokio::time::{Duration, Sleep};
 use futures::Future;
-use std::{collections::HashMap, sync::Arc};
+use futures::{Stream, StreamExt};
+use reth_eth_wire::multiplex::ProtocolConnection;
 use reth_network_api::PeerId;
-use alloy_primitives::U128;
-use reth_eth_wire::NewBlock;
-use reth_network::message::NewBlockMessage;
-use crate::node::network::BscNewBlock;
+use std::{collections::HashMap, sync::Arc};
+use std::{
+    pin::Pin,
+    task::{ready, Context, Poll},
+};
+use tokio::sync::{mpsc::UnboundedReceiver, oneshot};
+use tokio::time::{Duration, Sleep};
+use tokio_stream::wrappers::UnboundedReceiverStream;
 
 /// Handshake timeout, mirroring the Go implementation.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -22,15 +21,21 @@ const PENDING_REQ_TTL: Duration = Duration::from_secs(15);
 /// Minimum interval between pending-request pruning passes
 const PRUNE_INTERVAL: Duration = Duration::from_secs(5);
 
-use crate::node::network::votes::{VotesPacket, BscCapPacket, handle_votes_broadcast};
-use crate::node::network::blocks_by_range::{GetBlocksByRangePacket, BlocksByRangePacket, build_blocks_by_range_response, MAX_REQUEST_RANGE_BLOCKS_COUNT};
 use super::protocol::proto::BscProtoMessageId;
+use crate::node::network::blocks_by_range::{
+    build_blocks_by_range_response, BlocksByRangePacket, GetBlocksByRangePacket,
+    MAX_REQUEST_RANGE_BLOCKS_COUNT,
+};
+use crate::node::network::votes::{handle_votes_broadcast, BscCapPacket, VotesPacket};
 
 /// Commands that can be sent to the BSC connection.
 #[allow(dead_code)]
 #[derive(Debug)]
 pub enum BscCommand {
-    Capability { protocol_version: u64, extra: Bytes },
+    Capability {
+        protocol_version: u64,
+        extra: Bytes,
+    },
     Votes(Arc<Vec<crate::consensus::parlia::vote::VoteEnvelope>>),
     GetBlocksByRange(
         crate::node::network::blocks_by_range::GetBlocksByRangePacket,
@@ -48,11 +53,12 @@ pub struct BscProtocolConnection {
     is_dialer: bool,
     initial_capability: Option<BscCommand>,
     /// Pending in-flight GetBlocksByRange requests mapped by request_id
-    pending_range_reqs: HashMap<u64, (oneshot::Sender<Result<BlocksByRangePacket, String>>, std::time::Instant)>,
+    pending_range_reqs:
+        HashMap<u64, (oneshot::Sender<Result<BlocksByRangePacket, String>>, std::time::Instant)>,
     /// Protocol version negotiated for this connection (1 or 2)
     proto_version: u64,
     /// PeerId for this connection, if known
-    peer_id: Option<PeerId>,
+    _peer_id: Option<PeerId>,
     /// Last time we pruned pending requests
     last_prune: std::time::Instant,
 }
@@ -68,21 +74,21 @@ impl BscProtocolConnection {
         let handshake_deadline = Some(Box::pin(tokio::time::sleep(HANDSHAKE_TIMEOUT)));
         // Both sides should send initial capability in BSC protocol
         // BSC sends []byte{00} which in RLP is encoded as a single byte 0x00
-        let initial_capability = Some(BscCommand::Capability { 
-            protocol_version: proto_version, 
-            extra: Bytes::from_static(&[0x00u8]) // Raw RLP: single 0x00 byte represents []byte{00}
+        let initial_capability = Some(BscCommand::Capability {
+            protocol_version: proto_version,
+            extra: Bytes::from_static(&[0x00u8]), // Raw RLP: single 0x00 byte represents []byte{00}
         });
-        
-        Self { 
-            conn, 
-            commands: UnboundedReceiverStream::new(commands), 
-            handshake_deadline, 
+
+        Self {
+            conn,
+            commands: UnboundedReceiverStream::new(commands),
+            handshake_deadline,
             handshake_completed: false,
             is_dialer,
             initial_capability,
             pending_range_reqs: HashMap::new(),
             proto_version,
-            peer_id,
+            _peer_id: peer_id,
             last_prune: std::time::Instant::now(),
         }
     }
@@ -112,7 +118,7 @@ impl BscProtocolConnection {
                 let mut buf = BytesMut::new();
                 let cap_packet = BscCapPacket { protocol_version, extra };
                 cap_packet.encode(&mut buf);
-                
+
                 tracing::trace!(
                     target: "bsc_protocol",
                     version = protocol_version,
@@ -121,14 +127,14 @@ impl BscProtocolConnection {
                     all_bytes = format!("{:02x?}", &buf[..]),
                     "Encoded BSC capability packet"
                 );
-                
+
                 buf
             }
             BscCommand::Votes(votes) => {
                 let mut buf = BytesMut::new();
                 let vote_count = votes.len();
                 VotesPacket(votes.as_ref().clone()).encode(&mut buf);
-                
+
                 tracing::trace!(
                     target: "bsc_protocol",
                     vote_count = vote_count,
@@ -136,7 +142,7 @@ impl BscProtocolConnection {
                     first_bytes = format!("{:02x?}", &buf[..buf.len().min(8)]),
                     "Encoded BSC votes packet"
                 );
-                
+
                 buf
             }
             BscCommand::GetBlocksByRange(req, _tx) => {
@@ -212,7 +218,11 @@ impl BscProtocolConnection {
     }
 
     /// Handle handshake-related frames
-    fn handle_handshake_frame(&mut self, frame: &BytesMut, cx: &mut Context<'_>) -> Poll<Option<Option<BytesMut>>> {
+    fn handle_handshake_frame(
+        &mut self,
+        frame: &BytesMut,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Option<BytesMut>>> {
         tracing::debug!(target: "bsc_protocol", "Handshake not completed, processing handshake frame");
         // Check for handshake timeout
         if let Some(deadline) = self.handshake_deadline.as_mut() {
@@ -238,7 +248,7 @@ impl BscProtocolConnection {
             frame_bytes = format!("{:02x?}", &slice[..slice.len().min(16)]),
             "Raw received frame in handshake"
         );
-        
+
         match BscCapPacket::decode(&mut &slice[..]) {
             Ok(pkt) => {
                 if pkt.protocol_version != self.proto_version {
@@ -247,13 +257,13 @@ impl BscProtocolConnection {
                 }
 
                 tracing::trace!(target: "bsc_protocol", version = pkt.protocol_version, "Received peer capability");
-                
+
                 tracing::trace!(
-                    target: "bsc_protocol", 
+                    target: "bsc_protocol",
                     is_dialer = self.is_dialer,
                     "BSC handshake completed successfully"
                 );
-                
+
                 self.handshake_completed = true;
                 self.handshake_deadline = None;
                 tracing::trace!(target: "bsc_protocol", "BSC handshake completed");
@@ -323,21 +333,6 @@ impl BscProtocolConnection {
                             blocks = res.blocks.len(),
                             "Received BlocksByRange"
                         );
-                // Forward blocks to import path (iterate oldest -> newest)
-                if let Some(sender) = crate::shared::get_block_import_sender() {
-                    if let Some(peer) = self.peer_id {
-                        for block in res.blocks.iter().rev() {
-                            let nb = BscNewBlock(NewBlock { block: block.clone(), td: U128::from(0u64) });
-                            let hash = nb.0.block.header.hash_slow();
-                            let msg = NewBlockMessage { hash, block: Arc::new(nb) };
-                            let _ = sender.send((msg, peer));
-                        }
-                    } else {
-                        tracing::debug!(target: "bsc_protocol", "No peer_id associated with connection; dropping range import forward");
-                    }
-                } else {
-                    tracing::debug!(target: "bsc_protocol", "Block import sender not available; dropping range import forward");
-                }
                         if let Some((waiter, _)) = self.pending_range_reqs.remove(&res.request_id) {
                             let _ = waiter.send(Ok(res));
                         } else {
@@ -368,13 +363,12 @@ impl Stream for BscProtocolConnection {
         // Send initial capability (both dialer and responder)
         if let Some(initial_cmd) = this.initial_capability.take() {
             tracing::trace!(
-                target: "bsc_protocol", 
+                target: "bsc_protocol",
                 is_dialer = this.is_dialer,
                 "Sending initial BSC capability packet"
             );
             return Poll::Ready(Some(Self::encode_command(initial_cmd)));
         }
-
 
         loop {
             // Check for outgoing commands first
