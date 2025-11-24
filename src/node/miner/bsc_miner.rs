@@ -685,17 +685,11 @@ where
         payload: BscBuiltPayload,
         delay_ms: u64,
         delay_submit_tx: mpsc::UnboundedSender<BscBuiltPayload>,
-        cancel: ManualCancel,
     ) {
         tokio::spawn(async move {
             tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
-            if !cancel.is_cancelled() {
-                if let Err(e) = delay_submit_tx.send(payload) {
-                    error!("Failed to send delayed payload to channel: {}", e);
-                }
-            } else {
-                debug!("Delay submit task is cancelled, block_hash: {}, block_number: {}", 
-                    payload.block().hash(), payload.block().number());
+            if let Err(e) = delay_submit_tx.send(payload) {
+                error!("Failed to send delayed payload to channel: {}", e);
             }
         });
     }
@@ -751,7 +745,6 @@ where
                                     payload,
                                     delay_ms,
                                     self.delay_submit_tx.clone(),
-                                    submit_ctx.cancel.clone(),
                                 );
                                 info!(
                                     target: "bsc::miner",
