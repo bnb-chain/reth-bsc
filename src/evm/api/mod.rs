@@ -35,11 +35,12 @@ pub struct BscEvm<DB: revm::database::Database, I> {
         EthFrame,
     >,
     pub inspect: bool,
+    pub trace: bool,
 }
 
 impl<DB: Database, I> BscEvm<DB, I> {
     /// Creates a new [`BscEvm`].
-    pub fn new(env: EvmEnv<BscHardfork>, db: DB, inspector: I, inspect: bool) -> Self {
+    pub fn new(env: EvmEnv<BscHardfork>, db: DB, inspector: I, inspect: bool, trace: bool) -> Self {
         let precompiles =
             PrecompilesMap::from_static(BscPrecompiles::new(env.cfg_env.spec).precompiles());
 
@@ -60,6 +61,7 @@ impl<DB: Database, I> BscEvm<DB, I> {
                 frame_stack: Default::default(),
             },
             inspect,
+            trace,
         }
     }
 }

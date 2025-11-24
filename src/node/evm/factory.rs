@@ -29,7 +29,12 @@ impl EvmFactory for BscEvmFactory {
         db: DB,
         input: EvmEnv<BscHardfork>,
     ) -> Self::Evm<DB, NoOpInspector> {
-        BscEvm::new(input, db, NoOpInspector {}, false)
+        // Check if we're in a trace/debug context by examining the database type
+        // CacheDB is used in trace scenarios where we need to replay transactions
+        let type_name = std::any::type_name::<DB>();
+        let is_trace = type_name.contains("CacheDB");
+        
+        BscEvm::new(input, db, NoOpInspector {}, false, is_trace)
     }
 
     fn create_evm_with_inspector<DB: Database, I: Inspector<Self::Context<DB>>>(
@@ -38,6 +43,6 @@ impl EvmFactory for BscEvmFactory {
         input: EvmEnv<BscHardfork>,
         inspector: I,
     ) -> Self::Evm<DB, I> {
-        BscEvm::new(input, db, inspector, true)
+        BscEvm::new(input, db, inspector, true, true)
     }
 }

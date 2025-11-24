@@ -63,7 +63,7 @@ where
         // Normal execution: BlockExecutor filters system txs before calling transact
         // debug_traceTransaction/debug_traceCall: detect and handle system txs here
 
-        if !tx.is_system_transaction {
+        if self.trace {
             use crate::system_contracts::is_invoke_system_contract;
             use revm::primitives::TxKind;
 
@@ -72,8 +72,9 @@ where
                     && is_invoke_system_contract(&to)
                     && tx.base.gas_price == 0);
             
-            // Increase beneficiary balance for system transactions
-            if self.inspect && tx.is_system_transaction {
+            // Increase beneficiary balance for system transactions in trace context
+            // Only runs when trace=true (CacheDB detected or explicit inspector used)
+            if tx.is_system_transaction {
                 let beneficiary = self.block.beneficiary;
                 if let Ok(account) = self.journal_mut().load_account(beneficiary) {
                     account.data.info.balance = tx.base.value;
