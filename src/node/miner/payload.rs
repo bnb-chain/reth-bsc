@@ -695,7 +695,7 @@ where
         let (try_build_tx, try_build_rx) = mpsc::unbounded_channel();
         let (tx_listener_tx, tx_listener_rx) = mpsc::unbounded_channel();
         
-        let trace_id = build_args.trace_id;  // Get trace_id from build_args
+        let trace_id = build_args.trace_id;
         
         let mining_delay = parlia.clone().delay_for_mining(
             &mining_ctx.parent_snapshot, 
@@ -727,7 +727,7 @@ where
             join_handle: tokio::task::JoinSet::new(),
             simulator,
             job_start_time: std::time::Instant::now(),
-            trace_id,  // Add trace_id field
+            trace_id,
         };
         let handle = BscPayloadJobHandle {
             abort_tx,
@@ -735,7 +735,7 @@ where
 
         debug!(
             target: "bsc::miner::payload",
-            trace_id,  // Add trace_id to log
+            trace_id,
             block_number = job.mining_ctx.parent_header.number() + 1,
             is_inturn = job.mining_ctx.is_inturn,
             timeout = ?job.timeout,
