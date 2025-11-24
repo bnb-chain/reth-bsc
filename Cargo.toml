@@ -184,3 +184,13 @@ codegen-units = 1
 
 [dev-dependencies]
 uuid = { version = "1", features = ["v4"] }
+
+# Patch rust-eth-triedb's dependencies to use local reth crates
+[patch."https://github.com/joey0612/rust-eth-triedb.git"]
+reth-trie-common = { path = "../reth/crates/trie/common" }
+reth-metrics = { path = "../reth/crates/metrics" }
+
+# Also patch the git dependency directly
+[patch."https://github.com/bnb-chain/reth.git"]
+reth-trie-common = { path = "../reth/crates/trie/common" }
+reth-metrics = { path = "../reth/crates/metrics" }
