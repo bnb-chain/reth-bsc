@@ -25,6 +25,7 @@ use reth_provider::{BlockHashReader, BlockNumReader, BlockReaderIdExt, HeaderPro
 use reth_eth_wire_types::broadcast::NewBlockHashes;
 use reth_eth_wire::{BlockHashNumber, GetBlockHeaders, NewBlock};
 use reth_network::{NetworkHandle, message::{PeerResponse, BlockRequest}, FetchClient};
+use schnellru::{ByLength, LruMap};
 use std::{
     future::Future,
     pin::Pin,
@@ -57,6 +58,9 @@ pub(crate) type IncomingHashes = (NewBlockHashes, PeerId);
 /// Size of the LRU cache for processed blocks.
 const LRU_PROCESSED_BLOCKS_SIZE: u32 = 100;
 
+/// Cooldown duration for downloading block hashes to avoid re-downloading the same block.
+const DOWNLOAD_COOLDOWN_DURATION_MS: u128 = 200;
+
 /// A service that handles bidirectional block import communication with the network.
 /// It receives new blocks from the network via `from_network` channel and sends back
 /// import outcomes via `to_network` channel.
@@ -80,6 +84,8 @@ where
     pending_imports: FuturesUnordered<ImportFut>,
     /// Cache of processed block hashes to avoid reprocessing the same block.
     processed_blocks: LruCache<B256>,
+    /// Cache of downloading block hashes to avoid re-downloading the same block.
+    downloading_blocks: LruMap<B256, u128, ByLength>,
 }
 
 impl<Provider> ImportService<Provider>
@@ -115,6 +121,7 @@ where
             to_network,
             pending_imports: FuturesUnordered::new(),
             processed_blocks: LruCache::new(LRU_PROCESSED_BLOCKS_SIZE),
+            downloading_blocks: LruMap::new(ByLength::new(LRU_PROCESSED_BLOCKS_SIZE.try_into().unwrap())),
         }
     }
 
@@ -155,19 +162,40 @@ where
     fn on_new_mined_block(&mut self, payload: BscBuiltPayload, block_msg: NewBlockMessage<BscNewBlock>) {
         // insert header to cache
         insert_header_to_cache(block_msg.block.0.block.header.clone());
-        
+        // Cache the full block body for later range responses.
+        crate::shared::cache_full_block(block_msg.block.0.block.clone());
+        let block_hash = block_msg.hash;
+        // Clone header for FCU update
+        let header_for_fcu = block_msg.block.0.block.header.clone();
+
         // Send ValidHeader announcement to trigger NewBlock diffusion from few peers
         let _ = self
             .to_network
-            .send(BlockImportEvent::Announcement(BlockValidation::ValidHeader { block: block_msg }));
+            .send(BlockImportEvent::Announcement(BlockValidation::ValidHeader { block: block_msg.clone() }));
+        let _ = self
+            .to_network
+            .send(BlockImportEvent::Announcement(BlockValidation::ValidBlock { block: block_msg }));
         
         // Broadcast built payload event for fast consumers
-        // TODO: just set canonical to engine tree, need check FCU later?
         if let Some(tx) = crate::shared::get_payload_events_tx() {
+            tracing::debug!(target: "bsc::block_import", "Sending built payload event for mined block: {:?}", block_hash);
             let _ = tx.send(Events::<BscPayloadTypes>::BuiltPayload(payload));
         } else {
             tracing::warn!("Failed to send mined block due to payload events channel not initialised");
         }
+        
+        // Update fork choice for the mined block
+        {
+            let forkchoice_engine = self.forkchoice_engine.clone();
+            tokio::spawn(async move {
+                tracing::debug!(target: "bsc::block_import", "Updating fork choice for mined block: number = {:?}, hash = {:?}", header_for_fcu.number, header_for_fcu.hash_slow());
+                if let Err(e) = forkchoice_engine.update_forkchoice(&header_for_fcu).await {
+                    tracing::warn!(target: "bsc::block_import", "Failed to update fork choice for mined block: number = {:?}, hash = {:?}, error = {}", header_for_fcu.number, header_for_fcu.hash_slow(), e);
+                }
+            });
+        }
+        // Cache the block hash to avoid re-processing the same block.
+        self.processed_blocks.insert(block_hash);
     }
 
     /// Add a new block import task to the pending imports
@@ -191,18 +219,28 @@ where
         let hash_numbers = hashes.0.clone();
         
         for hash_number in hash_numbers {
+            // Skip if the block is already processed.
             if self.processed_blocks.contains(&hash_number.hash) {
                 continue;
             }
 
-            tracing::trace!(
+            // Check if the block is already being downloaded, if it times out, download it again.
+            let now = std::time::Instant::now().elapsed().as_millis();
+            if let Some(last_requested) = self.downloading_blocks.get(&hash_number.hash) {
+                if *last_requested + DOWNLOAD_COOLDOWN_DURATION_MS < now {
+                    continue;
+                }
+            }
+
+            tracing::debug!(
                 target: "bsc::block_import",
                 peer_id = %peer_id,
                 block_hash = %hash_number.hash,
                 block_number = hash_number.number,
-                "Requesting block download by simulating FCU for NewBlockHashes"
+                "Requesting block download for NewBlockHashes"
             );
 
+            // TODO: avoid to fetch too frequently, maybe add a cooldown mechanism.
             // Try quick range fetch via BSC subprotocol (mimic geth asyncFetchRangeBlocks)
             // Prefer the announcing peer; if it doesn't have bsc extension, fallback to any bsc peer.
             {
@@ -216,55 +254,62 @@ where
                     crate::node::network::bsc_protocol::registry::list_registered_peers().into_iter().next()
                 };
                 if let Some(bsc_peer) = target_peer {
+                    tracing::debug!(
+                        target: "bsc::block_import",
+                        peer_id = %bsc_peer,
+                        block_hash = %start_hash,
+                        block_number = start_height,
+                        "Requesting block with block range for NewBlockHashes"
+                    );
                     tokio::spawn(async move {
                         use std::time::Duration;
                         // Bump request timeout to 1000ms to accommodate slower peers
-                        let req_timeout = Duration::from_millis(1000);
-                        let import_timeout = Duration::from_millis(2000);
+                        let req_timeout = Duration::from_millis(DOWNLOAD_COOLDOWN_DURATION_MS as u64);
                         let _ = crate::node::network::bsc_protocol::registry::batch_request_range_and_await_import(
                             bsc_peer,
                             start_height,
                             start_hash,
                             1,
                             req_timeout,
-                            import_timeout,
                         ).await;
                     });
                 }
             }
 
-            let forkchoice_state = ForkchoiceState {
-                head_block_hash: hash_number.hash,
-                safe_block_hash: B256::ZERO, 
-                finalized_block_hash: B256::ZERO,
-            };
+            // TODO: remove older block download mechanism currently, 
+            // may download block with TreeEvent::Download(DownloadRequest::single_block(target)
+            // let forkchoice_state = ForkchoiceState {
+            //     head_block_hash: hash_number.hash,
+            //     safe_block_hash: B256::ZERO, 
+            //     finalized_block_hash: B256::ZERO,
+            // };
 
-            let engine = self.engine.clone();
-            let block_hash = hash_number.hash;
-            let download_fut = Box::pin(async move {
-                match engine.fork_choice_updated(forkchoice_state, None, EngineApiMessageVersion::V1).await {
-                    Ok(result) => {
-                        tracing::debug!(
-                            target: "bsc::block_import",
-                            block_hash = %block_hash,
-                            status = ?result.payload_status.status,
-                            "FCU result for missing block download"
-                        );
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            target: "bsc::block_import", 
-                            block_hash = %block_hash,
-                            error = %err,
-                            "Failed to trigger block download via FCU"
-                        );
-                    }
-                }
-                None
-            });
+            // let engine = self.engine.clone();
+            // let block_hash = hash_number.hash;
+            // let download_fut = Box::pin(async move {
+            //     match engine.fork_choice_updated(forkchoice_state, None, EngineApiMessageVersion::V1).await {
+            //         Ok(result) => {
+            //             tracing::debug!(
+            //                 target: "bsc::block_import",
+            //                 block_hash = %block_hash,
+            //                 status = ?result.payload_status.status,
+            //                 "FCU result for missing block download"
+            //             );
+            //         }
+            //         Err(err) => {
+            //             tracing::warn!(
+            //                 target: "bsc::block_import", 
+            //                 block_hash = %block_hash,
+            //                 error = %err,
+            //                 "Failed to trigger block download via FCU"
+            //             );
+            //         }
+            //     }
+            //     None
+            // });
 
-            self.pending_imports.push(download_fut);
-            self.processed_blocks.insert(hash_number.hash);
+            // self.pending_imports.push(download_fut);
+            self.downloading_blocks.insert(hash_number.hash, now);
         }
     }
 }
@@ -300,8 +345,6 @@ where
                     this.processed_blocks.insert(block.hash);
                     // Cache the full block body for later range responses.
                     crate::shared::cache_full_block(block.block.0.block.clone());
-                    // Notify listeners about the imported block hash for event-driven waits
-                    crate::shared::notify_block_imported(block.hash);
                     // If from proxied validators, target EVN peers with ETH NewBlockHashes.
                     if let Some(cfg) = crate::node::network::evn::get_global_evn_config() {
                         let header_ref = &block.block.0.block.header;
