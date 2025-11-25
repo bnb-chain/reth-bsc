@@ -15,6 +15,7 @@ use alloy_primitives::{Address, Sealable};
 use k256::ecdsa::SigningKey;
 use reth::transaction_pool::PoolTransaction;
 use reth::transaction_pool::TransactionPool;
+use reth_chainspec::EthChainSpec;
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
 use reth_payload_primitives::BuiltPayload;
 use reth_primitives::TransactionSigned;
@@ -439,6 +440,7 @@ pub struct MainWorkWorker<Pool, Provider> {
     running_job_handle: Option<BscPayloadJobHandle>,
     payload_job_join_set: JoinSet<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
     simulator: Arc<BidSimulator<Provider, Pool>>,  // No outer RwLock, each map has its own lock
+    desired_gas_limit: u64,
 }
 
 impl<Pool, Provider> MainWorkWorker<Pool, Provider>
@@ -465,6 +467,7 @@ where
         mining_queue_rx: mpsc::UnboundedReceiver<MiningContext>,
         simulator: Arc<BidSimulator<Provider, Pool>>,  // No outer RwLock needed
         payload_tx: mpsc::UnboundedSender<SubmitContext>,
+        desired_gas_limit: u64,
     ) -> Self {
         Self {
             pool,
@@ -477,6 +480,7 @@ where
             running_job_handle: None,
             simulator,
             payload_job_join_set: JoinSet::new(),
+            desired_gas_limit,
         }
     }
 
@@ -583,7 +587,7 @@ where
             self.provider.clone(), 
             self.pool.clone(), 
             evm_config, 
-            EthereumBuilderConfig::new(),
+            EthereumBuilderConfig::new().with_gas_limit(self.desired_gas_limit),
             self.chain_spec.clone(),
             self.parlia.clone(),
             mining_ctx.clone(),
@@ -1081,6 +1085,10 @@ where
         let (mining_queue_tx, mining_queue_rx) = mpsc::unbounded_channel::<MiningContext>();
         let (payload_tx, payload_rx) = mpsc::unbounded_channel::<SubmitContext>();
         
+        let chain_id = chain_spec.as_ref().chain().id();
+        let desired_gas_limit = mining_config.get_gas_limit(chain_id);
+        info!("Mining configuration: validator={}, chain_id={}, gas_limit={}", validator_address, chain_id, desired_gas_limit);
+        
         let parlia = Arc::new(crate::consensus::parlia::Parlia::new(chain_spec.clone(), 200));
         let new_work_worker = NewWorkWorker::new(
             validator_address,
@@ -1101,6 +1109,7 @@ where
             mining_queue_rx,
             simulator.clone(),
             payload_tx,
+            desired_gas_limit,
         );
         
         let result_work_worker = ResultWorkWorker::new(

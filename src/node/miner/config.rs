@@ -83,6 +83,21 @@ impl MiningConfig {
         self.enabled && (self.keystore_path.is_some() || self.private_key_hex.is_some())
     }
 
+    /// Get the desired gas limit for the specified chain ID.
+    /// Returns the configured gas_limit if set, otherwise returns chain-specific defaults:
+    /// - BSC Mainnet (56): 140M
+    /// - BSC Testnet (97): 100M  
+    /// - Local/Other: 40M
+    pub fn get_gas_limit(&self, chain_id: u64) -> u64 {
+        self.gas_limit.unwrap_or_else(|| {
+            match chain_id {
+                56 => 140_000_000,  // BSC mainnet
+                97 => 100_000_000,  // BSC testnet  
+                _ => 40_000_000,    // Local development
+            }
+        })
+    }
+
     /// Generate a new validator configuration with random keys
     pub fn generate_for_development() -> Self {
         // use rand::Rng;
@@ -128,11 +143,11 @@ impl MiningConfig {
             self.private_key_hex = generated.private_key_hex;
             
             if let Some(addr) = self.validator_address {
-                tracing::warn!("🔑 AUTO-GENERATED validator keys for development:");
-                tracing::warn!("📍 Validator Address: {}", addr);
-                tracing::warn!("🔐 Private Key: {} (KEEP SECURE!)", 
+                tracing::warn!("AUTO-GENERATED validator keys for development:");
+                tracing::warn!("Validator Address: {}", addr);
+                tracing::warn!("Private Key: {} (KEEP SECURE!)", 
                     self.private_key_hex.as_ref().unwrap());
-                tracing::warn!("⚠️  These are DEVELOPMENT keys - do not use in production!");
+                tracing::warn!("These are DEVELOPMENT keys - do not use in production!");
             }
         }
         

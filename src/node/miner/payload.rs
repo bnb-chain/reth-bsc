@@ -1168,6 +1168,14 @@ where
         let best_payload = self.potential_payloads.remove(best_index);
         let total_job_duration = self.job_start_time.elapsed();
         
+        let gas_used = best_payload.block().header().gas_used();
+        let gas_limit = best_payload.block().header().gas_limit();
+        let gas_usage_percent = if gas_limit > 0 {
+            (gas_used as f64 / gas_limit as f64 * 100.0) as u64
+        } else {
+            0
+        };
+        
         info!(
             target: "bsc::miner::payload",
             trace_id = self.trace_id,
@@ -1176,8 +1184,9 @@ where
             is_inturn = self.mining_ctx.is_inturn,
             tx_count = best_payload.block().body().transaction_count(),
             fees = %best_payload.fees(),
-            gas_used = best_payload.block().header().gas_used(),
-            gas_limit = best_payload.block().header().gas_limit(),
+            gas_used = gas_used,
+            gas_limit = gas_limit,
+            gas_usage_percent = gas_usage_percent,
             pick_index = best_index + 1,
             total_len = total_len,
             total_job_duration_ms = total_job_duration.as_millis(),
