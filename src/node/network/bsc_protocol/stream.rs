@@ -278,7 +278,7 @@ impl BscProtocolConnection {
 
     /// Handle normal protocol messages after handshake
     fn handle_protocol_message(&mut self, frame: &BytesMut) -> Option<BytesMut> {
-        tracing::debug!(target: "bsc_protocol", "Handshake completed, processing normal message");
+        tracing::trace!(target: "bsc_protocol", "Handshake completed, processing normal message");
         let slice = frame.as_ref();
         let msg_id = slice[0];
 

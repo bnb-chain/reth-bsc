@@ -214,8 +214,13 @@ where
                 "Missing header in mining context"
             )) as Box<dyn std::error::Error + Send + Sync>
         })?;
-        if header.excess_blob_gas != Some(0) {
-            blob_fee = Some(calc_blob_fee(&self.chain_spec, header));
+        
+        if BscHardforks::is_cancun_active_at_timestamp(&self.chain_spec, header.number, header.timestamp) {
+            if let Some(excess) = header.excess_blob_gas {
+                if excess != 0 {
+                    blob_fee = Some(calc_blob_fee(&self.chain_spec, header));
+                }
+            }
         }
         let max_blob_count = blob_params.as_ref().map(|params| params.max_blob_count).unwrap_or_default();
         let mut best_tx_list = self.pool.best_transactions_with_attributes(BestTransactionsAttributes::new(base_fee, blob_fee.map(|fee| fee as u64)));
