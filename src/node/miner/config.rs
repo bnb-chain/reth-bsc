@@ -89,7 +89,7 @@ impl MiningConfig {
     /// - BSC Testnet (97): 100M  
     /// - Local/Other: 40M
     pub fn get_gas_limit(&self, chain_id: u64) -> u64 {
-        self.gas_limit.unwrap_or_else(|| {
+        self.gas_limit.unwrap_or({
             match chain_id {
                 56 => 140_000_000,  // BSC mainnet
                 97 => 100_000_000,  // BSC testnet  
