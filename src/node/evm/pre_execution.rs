@@ -356,14 +356,24 @@ where
             }
  
             // check bls aggregate sig
-            let vote_addrs: Vec<PublicKey> = vote_addrs
-                .iter()
-                .map(|addr| PublicKey::from_bytes(addr.as_slice()).unwrap())
-                .collect();
-            let vote_addrs_ref: Vec<&PublicKey> = vote_addrs.iter().collect();
+            let mut pubkeys: Vec<PublicKey> = Vec::with_capacity(vote_addrs.len());
+            for addr in &vote_addrs {
+                match PublicKey::from_bytes(addr.as_slice()) {
+                    Ok(pk) => pubkeys.push(pk),
+                    Err(_) => {
+                        return Err(
+                            BscBlockExecutionError::Validation(
+                                BscBlockValidationError::InvalidAttestationSignature
+                            ).into()
+                        );
+                    }
+                }
+            }
+            let vote_addrs_ref: Vec<&PublicKey> = pubkeys.iter().collect();
  
-            let sig = Signature::from_bytes(&attestation.agg_signature[..])
-                .map_err(|_| BscBlockExecutionError::BLSTInnerError)?;
+            let sig = Signature::from_bytes(&attestation.agg_signature[..]).map_err(|_| {
+                BscBlockExecutionError::Validation(BscBlockValidationError::InvalidAttestationSignature)
+            })?;
             
             // Track BLS verification attempt
             self.vote_metrics.bls_verifications_total.increment(1);
@@ -384,7 +394,9 @@ where
                 _ => {
                     // Update BLS verification failure metric (kept here as it's a specific metric)
                     self.vote_metrics.bls_verification_failures_total.increment(1);
-                    Err(BscBlockExecutionError::BLSTInnerError.into())
+                    Err(BscBlockExecutionError::Validation(
+                        BscBlockValidationError::InvalidAttestationSignature
+                    ).into())
                 },
             };
         }

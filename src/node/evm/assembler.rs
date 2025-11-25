@@ -104,10 +104,12 @@ where
 
         // parlia override header un-used fields.
         let mut withdrawals_root = None;
+        let mut withdrawals = None;
         let mut parent_beacon_block_root = None;
         let mut requests_hash = None;
         if BscHardforks::is_cancun_active_at_timestamp(self.chain_spec.as_ref(), block_number, timestamp) {
             withdrawals_root = Some(EMPTY_WITHDRAWALS_HASH);
+            withdrawals = Some(Withdrawals::new(vec![]));
             if self.chain_spec.is_bohr_active_at_timestamp(block_number, timestamp) {
                 parent_beacon_block_root = Some(B256::default());
             }
@@ -191,7 +193,7 @@ where
         Ok(BscBlock {
             header,
             body: BscBlockBody {
-                inner: BlockBody { transactions, ommers: Default::default(), withdrawals: Some(Withdrawals::new(vec![])) },
+                inner: BlockBody { transactions, ommers: Default::default(), withdrawals },
                 sidecars: None, // BscSidecars is added to the block body in the payload builder.
             },
         })

@@ -59,6 +59,10 @@ pub enum BscBlockValidationError {
     #[error("invalid attestation vote count: {0}")]
     InvalidAttestationVoteCount(GotExpected<u64>),
 
+    /// Error when the attestation's aggregate signature is invalid
+    #[error("invalid attestation signature")]
+    InvalidAttestationSignature,
+
     /// Error when the block's header signer is invalid
     #[error("wrong header signer: block number {block_number}, signer {signer}")]
     WrongHeaderSigner {

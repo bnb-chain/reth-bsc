@@ -121,7 +121,7 @@ where
             to_network,
             pending_imports: FuturesUnordered::new(),
             processed_blocks: LruCache::new(LRU_PROCESSED_BLOCKS_SIZE),
-            downloading_blocks: LruMap::new(ByLength::new(LRU_PROCESSED_BLOCKS_SIZE.try_into().unwrap())),
+            downloading_blocks: LruMap::new(ByLength::new(LRU_PROCESSED_BLOCKS_SIZE)),
         }
     }
 
@@ -278,37 +278,37 @@ where
 
             // TODO: remove older block download mechanism currently, 
             // may download block with TreeEvent::Download(DownloadRequest::single_block(target)
-            // let forkchoice_state = ForkchoiceState {
-            //     head_block_hash: hash_number.hash,
-            //     safe_block_hash: B256::ZERO, 
-            //     finalized_block_hash: B256::ZERO,
-            // };
+            let forkchoice_state = ForkchoiceState {
+                head_block_hash: hash_number.hash,
+                safe_block_hash: B256::ZERO, 
+                finalized_block_hash: B256::ZERO,
+            };
 
-            // let engine = self.engine.clone();
-            // let block_hash = hash_number.hash;
-            // let download_fut = Box::pin(async move {
-            //     match engine.fork_choice_updated(forkchoice_state, None, EngineApiMessageVersion::V1).await {
-            //         Ok(result) => {
-            //             tracing::debug!(
-            //                 target: "bsc::block_import",
-            //                 block_hash = %block_hash,
-            //                 status = ?result.payload_status.status,
-            //                 "FCU result for missing block download"
-            //             );
-            //         }
-            //         Err(err) => {
-            //             tracing::warn!(
-            //                 target: "bsc::block_import", 
-            //                 block_hash = %block_hash,
-            //                 error = %err,
-            //                 "Failed to trigger block download via FCU"
-            //             );
-            //         }
-            //     }
-            //     None
-            // });
+            let engine = self.engine.clone();
+            let block_hash = hash_number.hash;
+            let download_fut = Box::pin(async move {
+                match engine.fork_choice_updated(forkchoice_state, None, EngineApiMessageVersion::V1).await {
+                    Ok(result) => {
+                        tracing::debug!(
+                            target: "bsc::block_import",
+                            block_hash = %block_hash,
+                            status = ?result.payload_status.status,
+                            "FCU result for missing block download"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "bsc::block_import", 
+                            block_hash = %block_hash,
+                            error = %err,
+                            "Failed to trigger block download via FCU"
+                        );
+                    }
+                }
+                None
+            });
 
-            // self.pending_imports.push(download_fut);
+            self.pending_imports.push(download_fut);
             self.downloading_blocks.insert(hash_number.hash, now);
         }
     }
