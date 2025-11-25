@@ -1,15 +1,15 @@
 use super::patch::HertzPatchManager;
 use crate::{
-    consensus::{SYSTEM_ADDRESS, parlia::Parlia},
+    consensus::{SYSTEM_ADDRESS, parlia::{VoteAddress, Snapshot, Parlia}},
     evm::transaction::BscTxEnv,
     hardforks::BscHardforks,
     metrics::{BscConsensusMetrics, BscBlockchainMetrics, BscVoteMetrics, BscExecutorMetrics, BscRewardsMetrics},
-    node::evm::{config::BscExecutionCustomCtx, util::insert_header_to_cache},
     system_contracts::{
         get_upgrade_system_contracts, is_system_transaction, SystemContract,
+        feynman_fork::ValidatorElectionInfo,
     },
 };
-use alloy_consensus::{TxReceipt};
+use alloy_consensus::{Header, Transaction, TxReceipt};
 use alloy_eips::{eip7685::Requests, Encodable2718};
 use alloy_evm::{block::{ExecutableTx, StateChangeSource}, eth::receipt_builder::ReceiptBuilderCtx};
 use alloy_primitives::{uint, Address, U256, BlockNumber, Bytes};
@@ -36,10 +36,27 @@ use revm::{
 use tracing::{error, warn, info, debug, trace};
 use alloy_eips::eip2935::{HISTORY_STORAGE_ADDRESS, HISTORY_STORAGE_CODE};
 use alloy_primitives::keccak256;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc, cell::RefCell};
 use crate::consensus::parlia::SnapshotProvider;
-use alloy_consensus::Transaction;
 
+/// Type alias for system transactions to reduce complexity
+type SystemTxs = Vec<reth_primitives_traits::Recovered<reth_primitives_traits::TxTy<crate::BscPrimitives>>>;
+
+thread_local! {
+    pub static ASSEMBLED_SYSTEM_TXS: RefCell<SystemTxs> = const { RefCell::new(Vec::new()) };
+}
+
+/// Helper type for the input of post execution.
+#[allow(clippy::type_complexity)]
+#[derive(Debug, Clone)]
+pub(crate) struct InnerExecutionContext {
+    pub(crate) current_validators: Option<(Vec<Address>, HashMap<Address, VoteAddress>)>,
+    pub(crate) max_elected_validators: Option<U256>,
+    pub(crate) validators_election_info: Option<Vec<ValidatorElectionInfo>>,
+    pub(crate) snap: Option<Snapshot>,
+    pub(crate) header: Option<Header>,
+    pub(crate) parent_header: Option<Header>,
+}
 
 pub struct BscBlockExecutor<'a, EVM, Spec, R: ReceiptBuilder>
 where
@@ -69,8 +86,10 @@ where
     pub(super) snapshot_provider: Option<Arc<dyn SnapshotProvider + Send + Sync>>,
     /// Parlia consensus instance.
     pub(crate) parlia: Arc<Parlia<Spec>>,
-    /// Custom execution context.
-    pub(super) custom_ctx: BscExecutionCustomCtx,
+    /// Inner execution context.
+    pub(super) inner_ctx: InnerExecutionContext,
+    /// assembled system txs.
+    pub(crate) assembled_system_txs: SystemTxs,
     /// Consensus metrics for tracking block height and other consensus stats.
     pub(super) consensus_metrics: BscConsensusMetrics,
     /// Blockchain metrics for tracking receipts and block processing.
@@ -103,7 +122,6 @@ where
     pub(crate) fn new(
         evm: EVM,
         ctx: BscBlockExecutionCtx<'a>,
-        custom_ctx: BscExecutionCustomCtx,
         spec: Spec,
         receipt_builder: R,
         system_contracts: SystemContract<Spec>,
@@ -113,7 +131,7 @@ where
         
         trace!("Succeed to new block executor, header: {:?}", ctx.header);
         if let Some(ref header) = ctx.header {
-            insert_header_to_cache(header.clone());
+            crate::node::evm::util::HEADER_CACHE_READER.lock().unwrap().insert_header_to_cache(header.clone());
         } else if !ctx.is_miner { // miner has no current header.
             warn!("No header found in the context, block_number: {:?}", evm.block().number.to::<u64>());
         }
@@ -133,7 +151,15 @@ where
             system_caller: SystemCaller::new(spec_clone),
             snapshot_provider: crate::shared::get_snapshot_provider().cloned(),
             parlia,
-            custom_ctx,
+            inner_ctx: InnerExecutionContext {
+                current_validators: None,
+                max_elected_validators: None,
+                validators_election_info: None,
+                snap: None,
+                header: None,
+                parent_header: None,
+            },
+            assembled_system_txs: vec![],
             consensus_metrics: BscConsensusMetrics::default(),
             blockchain_metrics: BscBlockchainMetrics::default(),
             vote_metrics: BscVoteMetrics::default(),
@@ -340,13 +366,17 @@ where
         self.consensus_metrics.current_block_height.set(block_number as f64);
         
         // pre check and prepare some intermediate data for commit parlia snapshot in finish function.
-        self.check_new_block(&block_env)?;
+        if self.ctx.is_miner {
+            self.prepare_new_block(&block_env)?;
+        } else {
+            self.check_new_block(&block_env)?;
+        }
         
         // set state clear flag if the block is after the Spurious Dragon hardfork.
         let block_number = self.evm.block().number.to();
         let state_clear_flag = self.spec.is_spurious_dragon_active_at_block(block_number);
         self.evm.db_mut().set_state_clear_flag(state_clear_flag);
-        let parent_timestamp = self.custom_ctx.parent_header.as_ref().unwrap().timestamp;
+        let parent_timestamp = self.inner_ctx.parent_header.as_ref().unwrap().timestamp;
         self.try_update_build_in_system_contract(
             self.evm.block().number.to::<u64>(), 
             self.evm.block().timestamp.to::<u64>(), 
@@ -488,7 +518,7 @@ where
             "Start to finish"
         );
 
-        let parent_timestamp = self.custom_ctx.parent_header.as_ref().unwrap().timestamp;
+        let parent_timestamp = self.inner_ctx.parent_header.as_ref().unwrap().timestamp;
         self.try_update_build_in_system_contract(
             self.evm.block().number.to::<u64>(), 
             self.evm.block().timestamp.to::<u64>(), 
@@ -525,6 +555,10 @@ where
             self.post_check_new_block(&self.evm.block().clone())?;
         }
 
+        ASSEMBLED_SYSTEM_TXS.with(|txs| {
+            *txs.borrow_mut() = self.assembled_system_txs.clone();
+        });
+
         // Update receipt height metric
         let block_number = self.evm.block().number.to::<u64>();
         self.blockchain_metrics.current_receipt_height.set(block_number as f64);
@@ -548,7 +582,7 @@ where
         // Calculate block receive time difference
         // This is the difference between current block timestamp and parent block timestamp
         let current_timestamp = self.evm.block().timestamp.to::<u64>();
-        if let Some(parent_header) = &self.custom_ctx.parent_header {
+        if let Some(parent_header) = &self.inner_ctx.parent_header {
             let parent_timestamp = parent_header.timestamp;
             let time_diff = (current_timestamp as i64) - (parent_timestamp as i64);
             self.blockchain_metrics.block_receive_time_diff_seconds.set(time_diff as f64);
@@ -581,4 +615,20 @@ where
         &self.evm
     }
 
+}
+
+impl<'a, EVM, Spec, R: ReceiptBuilder> BscBlockExecutor<'a, EVM, Spec, R>
+where
+    Spec: EthChainSpec + EthereumHardforks + BscHardforks + Hardforks + Clone,
+    EVM: alloy_evm::Evm,
+{
+    // miner BscBlockBuilder use this method to fetch system txs.
+    pub(crate) fn finish_with_system_txs<F, T>(self, finish_fn: F) -> Result<(T, SystemTxs), BlockExecutionError>
+    where
+        F: FnOnce(Self) -> Result<T, BlockExecutionError>,
+    {
+        let result = finish_fn(self)?;
+        let system_txs = ASSEMBLED_SYSTEM_TXS.with(|txs| txs.borrow().clone());
+        Ok((result, system_txs))
+    }
 }

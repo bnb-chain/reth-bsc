@@ -1,4 +1,4 @@
-use crate::{BscPrimitives, hardforks::BscHardforks, node::evm::{assembler::{BscBlockAssembler, BscBlockAssemblerInput}, config::{BscBlockExecutionCtx, BscBlockExecutorFactory, BscExecutionCustomCtx}, executor::BscBlockExecutor, factory::BscEvmFactory}};
+use crate::{BscPrimitives, node::evm::{executor::BscBlockExecutor, assembler::{BscBlockAssemblerInput, BscBlockAssembler}, config::{BscBlockExecutionCtx, BscBlockExecutorFactory}, factory::BscEvmFactory}, hardforks::BscHardforks};
 use reth_evm::execute::{BlockBuilder, BlockBuilderOutcome, BlockExecutionError, ExecutorTx};
 use alloy_evm::eth::receipt_builder::ReceiptBuilder;
 use reth_primitives_traits::{HeaderTy, NodePrimitives, Recovered, RecoveredBlock, SealedHeader, SignerRecoverable, TxTy};
@@ -21,8 +21,6 @@ where
     pub transactions: Vec<Recovered<TxTy<BscPrimitives>>>,
     /// The parent block execution context.
     pub ctx: BscBlockExecutionCtx<'a>,
-    /// The custom execution context.
-    pub custom_ctx: BscExecutionCustomCtx,
     /// The sealed parent block header.
     pub parent: &'a SealedHeader<HeaderTy<BscPrimitives>>,
     /// The assembler used to build the block.
@@ -37,7 +35,6 @@ where
     pub fn new(
         executor: BscBlockExecutor<'a, EVM, Spec, R>,
         ctx: BscBlockExecutionCtx<'a>,
-        custom_ctx: BscExecutionCustomCtx,
         assembler: &'a BscBlockAssembler<crate::chainspec::BscChainSpec>,
         parent: &'a SealedHeader<HeaderTy<BscPrimitives>>,
     ) -> Self {
@@ -45,7 +42,6 @@ where
             executor,
             transactions: Vec::new(),
             ctx,
-            custom_ctx,
             parent,
             assembler,
         }
@@ -99,9 +95,9 @@ where
         state: impl StateProvider,
     ) -> Result<BlockBuilderOutcome<BscPrimitives>, BlockExecutionError> {
         let finish_start = std::time::Instant::now();
-        let (evm, result) = self.executor.finish()?;
+        // TODO: remove finish_with_system_txs, keep executor.finish(), system txs can be fetched from executor.
+        let ((evm, result), assembled_system_txs) = self.executor.finish_with_system_txs(|executor| executor.finish())?;
         let (db, evm_env) = evm.finish();
-        let assembled_system_txs = self.custom_ctx.shared.borrow().assembled_system_txs.clone();
 
         // merge all transitions into bundle state
         db.merge_transitions(BundleRetention::Reverts);
@@ -127,7 +123,6 @@ where
         let bsc_input: BscBlockAssemblerInput<'_, '_, BscBlockExecutorFactory> = BscBlockAssemblerInput {
             evm_env,
             execution_ctx: self.ctx,
-            custom_ctx: self.custom_ctx,
             parent: self.parent,
             transactions: transactions.clone(),
             output: &result,

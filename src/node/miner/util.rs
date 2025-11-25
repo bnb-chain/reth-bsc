@@ -1,16 +1,16 @@
 use std::sync::Arc;
 use alloy_consensus::{Header, BlockHeader};
 use alloy_primitives::{Address, Bytes, B256};
-use crate::consensus::parlia::{Snapshot, VoteAddress};
+use crate::consensus::parlia::Snapshot;
 use crate::consensus::parlia::consensus::Parlia;
 use crate::consensus::parlia::util::{calculate_difficulty, debug_header};
 use crate::chainspec::BscChainSpec;
 use crate::consensus::parlia::{EXTRA_VANITY_LEN, EXTRA_SEAL_LEN};
-use crate::node::evm::config::BscExecutionCustomCtx;
 use reth::payload::EthPayloadBuilderAttributes;
 use crate::hardforks::BscHardforks;
 use reth_chainspec::EthChainSpec;
-use crate::node::miner::signer::{seal_header_with_global_signer, SignerError};
+use crate::node::evm::pre_execution::VALIDATOR_CACHE;
+use crate::node::miner::signer::{SignerError, seal_header_with_global_signer};
 use crate::node::miner::bsc_miner::MiningContext;
 use crate::consensus::parlia::provider::SnapshotProvider;
 
@@ -60,7 +60,6 @@ where
 /// finalize a new header and seal it.
 pub fn finalize_new_header<ChainSpec>(
     parlia: Arc<Parlia<ChainSpec>>, 
-    custom_ctx: &BscExecutionCustomCtx,
     parent_snap: &Snapshot, 
     parent_header: &Header, 
     new_header: &mut Header,
@@ -87,23 +86,18 @@ where
         // Use epoch_num from parent snapshot for epoch boundary check
         let epoch_length = parent_snap.epoch_num;
         if (new_header.number).is_multiple_of(epoch_length) {
-            let mut validators: (Vec<Address>, Vec<VoteAddress>) = (vec![], vec![]);
-            let ctx_ref = custom_ctx.shared.borrow();
-            let (addrs, vote_addrs) = ctx_ref.current_validators.as_ref().
-                ok_or(SignerError::SigningFailed("Current validators not found in custom ctx".to_string()))?;
-            tracing::debug!("Succeed to query cached validator result, block_number: {}, block_hash: {}", parent_header.number, parent_header.hash_slow());
-            for addr in addrs {
-                validators.0.push(*addr);
-                if let Some(vote_addr) = vote_addrs.get(addr) {
-                    validators.1.push(*vote_addr);
-                }
+            let mut validators: Option<(Vec<Address>, Vec<crate::consensus::parlia::VoteAddress>)> = None;
+            let mut cache = VALIDATOR_CACHE.lock().unwrap();
+            if let Some(cached_result) = cache.get(&parent_header.hash_slow()) {
+                tracing::debug!("Succeed to query cached validator result, block_number: {}, block_hash: {}", parent_header.number, parent_header.hash_slow());
+                validators = Some(cached_result.clone());
             }
             
-            parlia.prepare_validators(parent_snap, Some(validators), new_header);
+            parlia.prepare_validators(parent_snap, validators, new_header);
         }
     }
 
-    parlia.prepare_turn_length(parent_snap, custom_ctx.shared.borrow().turn_length, new_header).
+    parlia.prepare_turn_length(parent_snap, new_header).
         map_err(|e| SignerError::SigningFailed(format!("Failed to prepare turn length: {}", e)))?;
     
     if let Err(e) = parlia.assemble_vote_attestation(parent_snap, parent_header, new_header, snapshot_provider) {
