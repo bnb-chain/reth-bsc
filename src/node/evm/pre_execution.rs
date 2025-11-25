@@ -1,6 +1,9 @@
 use super::executor::BscBlockExecutor;
-use crate::evm::transaction::BscTxEnv;
+use crate::{evm::transaction::BscTxEnv, node::evm::util::rpc_eth_call};
 
+use alloy_eips::{BlockId, RpcBlockHash};
+use alloy_rpc_types::{TransactionRequest, TransactionInput};
+use tokio::runtime::{Handle, Builder};
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
 use reth_evm::{eth::receipt_builder::ReceiptBuilder, execute::BlockExecutionError, Database, Evm, FromRecoveredTx, FromTxWithEncoded, IntoTxEnv};
 use reth_primitives::TransactionSigned;
@@ -10,7 +13,7 @@ use revm::{
     primitives::{Address, Bytes, TxKind, U256},
 };
 use alloy_consensus::{TxReceipt, Header, BlockHeader};
-use alloy_primitives::{BlockNumber, B256};
+use alloy_primitives::{B256, BlockHash, BlockNumber};
 use crate::consensus::parlia::{VoteAddress, Snapshot, DIFF_INTURN, DIFF_NOTURN};
 use crate::consensus::parlia::util::{is_breathe_block, debug_header};
 use crate::consensus::parlia::vote::MAX_ATTESTATION_EXTRA_LENGTH;
@@ -86,7 +89,7 @@ where
                 block_number, epoch_length, turn_length);
             
             // fill current validators to inner context.
-            let (validator_set, vote_addresses) = self.get_current_validators(parent_header.number)?;
+            let (validator_set, vote_addresses) = self.get_current_validators(parent_header.number, parent_header.hash_slow())?;
             tracing::debug!("validator_set: {:?}, vote_addresses: {:?}", validator_set, vote_addresses);
             
             let vote_addrs_map = if vote_addresses.is_empty() {
@@ -158,19 +161,55 @@ where
 
     pub(crate) fn get_current_validators(
         &mut self, 
-        block_number: BlockNumber
+        block_number: BlockNumber,
+        block_hash: BlockHash
     ) -> Result<(Vec<Address>, Vec<VoteAddress>), BlockExecutionError> {
         let result = if self.spec.is_luban_active_at_block(block_number) {
             let (to, data) = self.system_contracts.get_current_validators();
-            let output = self.eth_call(to, data)?;
+            let output = self.sync_rpc_eth_call(to, data, block_hash)?;
             self.system_contracts.unpack_data_into_validator_set(&output)
         } else {
             let (to, data) = self.system_contracts.get_current_validators_before_luban(block_number);
-            let output = self.eth_call(to, data)?;
+            let output = self.sync_rpc_eth_call(to, data, block_hash)?;
             let validator_set = self.system_contracts.unpack_data_into_validator_set_before_luban(&output);
             (validator_set, Vec::new())
         };
 
+        Ok(result)
+    }
+
+    pub(crate) fn sync_rpc_eth_call(
+        &mut self, 
+        to: Address, 
+        data: Bytes,
+        block_hash: BlockHash,
+    ) -> Result<Bytes, BlockExecutionError> {
+        let req = TransactionRequest::default()
+            .from(Address::default())
+            .to(to)
+            .gas_limit(self.evm.block().gas_limit)
+            .value(U256::ZERO)
+            .gas_price(0)
+            .input(TransactionInput::new(data.clone()));
+        let fut = rpc_eth_call(
+            req,
+            Some(BlockId::Hash(RpcBlockHash::from_hash(block_hash, None))),
+            None,
+            None,
+        );
+        let result = match Handle::try_current() {
+            Ok(handle) => handle
+                .block_on(fut)
+                .map_err(|e| BlockExecutionError::msg(format!("rpc_eth_call failed: {e}")))?,
+            Err(_) => {
+                let rt = Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| BlockExecutionError::msg(format!("failed to build tokio runtime: {e}")))?;
+                rt.block_on(fut)
+                    .map_err(|e| BlockExecutionError::msg(format!("rpc_eth_call failed: {e}")))?    
+            }
+        };
         Ok(result)
     }
 

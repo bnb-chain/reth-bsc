@@ -61,18 +61,6 @@ static NETWORK_HANDLE: OnceLock<NetworkHandle<BscNetworkPrimitives>> = OnceLock:
 
 /// Global payload events broadcast sender
 static PAYLOAD_EVENTS_TX: OnceLock<broadcast::Sender<Events<BscPayloadTypes>>> = OnceLock::new();
-/// Broadcast channel for notifying about successfully imported block hashes
-static IMPORTED_BLOCKS_TX: OnceLock<broadcast::Sender<B256>> = OnceLock::new();
-
-/// Set global imported blocks broadcast sender.
-pub fn set_imported_blocks_tx(tx: broadcast::Sender<B256>) -> Result<(), broadcast::Sender<B256>> {
-    IMPORTED_BLOCKS_TX.set(tx)
-}
-
-/// Get global imported blocks broadcast sender if initialized.
-pub fn get_imported_blocks_tx() -> Option<&'static broadcast::Sender<B256>> {
-    IMPORTED_BLOCKS_TX.get()
-}
 
 /// Trait for fork choice engine operations that can be stored globally
 pub trait ForkChoiceEngineTrait: Send + Sync {
