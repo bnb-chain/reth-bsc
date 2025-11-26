@@ -109,6 +109,11 @@ fn main() -> eyre::Result<()> {
                 return Err(e);
             }
             
+            if !builder.config().rpc.http {
+                panic!("RPC should be enabled, the parlia need to query state with rpc, you can enable it only localhost");
+            }
+            let rpc_url = format!("http://{}:{}", builder.config().rpc.http_addr, builder.config().rpc.http_port);
+
             // Map CLI args into a global MiningConfig override before launching services
             {
                 use reth_bsc::node::miner::{config as mining_config, MiningConfig};
@@ -288,6 +293,7 @@ fn main() -> eyre::Result<()> {
                     })
                     .launch().await?;
 
+            reth_bsc::node::evm::util::set_rpc_client(rpc_url).unwrap_or_else(|e| panic!("Failed to set global RPC client: {e}"));
             // Send the engine handle to the network
             engine_handle_tx.send(node.beacon_engine_handle.clone()).unwrap();
 

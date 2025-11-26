@@ -53,11 +53,6 @@ where
             snapshot_provider as Arc<dyn crate::consensus::parlia::SnapshotProvider + Send + Sync>,
         ).unwrap_or_else(|_| panic!("Failed to set global snapshot provider"));
 
-        if !ctx.config().rpc.http {
-            return Err(eyre::eyre!("RPC is not enabled"));
-        }
-        let rpc_url = format!("http://{}:{}", ctx.config().rpc.http_addr, ctx.config().rpc.http_port);
-        crate::node::evm::util::set_rpc_client(rpc_url).unwrap_or_else(|e| panic!("Failed to set global RPC client: {e}"));
         crate::shared::set_header_provider(Arc::new(ctx.provider().clone()))
             .unwrap_or_else(|e| panic!("Failed to set global header provider: {e}"));
 
