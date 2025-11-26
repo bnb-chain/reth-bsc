@@ -15,7 +15,7 @@ use reth_revm::State;
 use crate::node::evm::ResultAndState;
 use revm::{context::{BlockEnv, TxEnv}, Database as RevmDatabase, DatabaseCommit};
 use alloy_consensus::{Header, TxReceipt, Transaction as AlloyTransaction, SignableTransaction};
-use alloy_primitives::{Address, hex, TxKind, U256};
+use alloy_primitives::{Address, BlockHash, TxKind, U256, hex};
 use std::collections::HashMap;
 use tracing::warn;
 use reth_primitives_traits::{GotExpected, SignerRecoverable};
@@ -201,10 +201,11 @@ where
         &mut self,
         block_number: u64,
         block_timestamp: u64,
+        block_hash: BlockHash,
     ) -> Result<u8, BlockExecutionError> {
         if self.spec.is_bohr_active_at_timestamp(block_number, block_timestamp) {
             let (to, data) = self.system_contracts.get_turn_length();
-            let bz = self.eth_call(to, data)?;
+            let bz = self.sync_rpc_eth_call(to, data, block_hash)?;
 
             let turn_length = self.system_contracts.unpack_data_into_turn_length(bz.as_ref()).to::<u8>();
             return Ok(turn_length);

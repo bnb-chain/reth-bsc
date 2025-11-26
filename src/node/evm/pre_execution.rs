@@ -83,7 +83,7 @@ where
         
         if block_number.is_multiple_of(epoch_length) {
             // fill turn length to inner context.
-            let turn_length = self.get_turn_length(parent_header.number, parent_header.timestamp)?;
+            let turn_length = self.get_turn_length(parent_header.number, parent_header.timestamp, parent_header.hash_slow())?;
             self.custom_ctx.shared.borrow_mut().turn_length = Some(turn_length);
             tracing::debug!("Succeed to query turn length, block_number: {}, epoch_length: {}, turn_length: {}", 
                 block_number, epoch_length, turn_length);
@@ -108,7 +108,7 @@ where
             // Only available after Maxwell hardfork when StakeHub contract's getNodeIDs is deployed
             if self.spec.is_maxwell_active_at_timestamp(block_number, timestamp) {
                 let (to2, data2) = self.system_contracts.get_node_ids(validator_set);
-                if let Ok(output2) = self.eth_call(to2, data2) {
+                if let Ok(output2) = self.sync_rpc_eth_call(to2, data2, parent_header.hash_slow()) {
                     let (_consensus_addrs, node_ids_list) = self.system_contracts.unpack_data_into_node_ids(&output2);
                     let mut flat: Vec<[u8; 32]> = Vec::new();
                     for ids in node_ids_list { for id in ids { flat.push(id); } }
@@ -123,13 +123,13 @@ where
         {
             // fill max elected validators to inner context.
             let (to, data) = self.system_contracts.get_max_elected_validators();
-            let bz = self.eth_call(to, data)?;
+            let bz = self.sync_rpc_eth_call(to, data, parent_header.hash_slow())?;
             let max_elected_validators = self.system_contracts.unpack_data_into_max_elected_validators(bz.as_ref());
             tracing::debug!("max_elected_validators: {:?}", max_elected_validators);
             self.custom_ctx.shared.borrow_mut().max_elected_validators = Some(max_elected_validators);
 
             let (to, data) = self.system_contracts.get_validator_election_info();
-            let bz = self.eth_call(to, data)?;
+            let bz = self.sync_rpc_eth_call(to, data, parent_header.hash_slow())?;
 
             let (validators, voting_powers, vote_addrs, total_length) =
                 self.system_contracts.unpack_data_into_validator_election_info(bz.as_ref());
@@ -191,29 +191,36 @@ where
             .value(U256::ZERO)
             .gas_price(0)
             .input(TransactionInput::new(data.clone()));
-        let fut = rpc_eth_call(
-            req,
-            Some(BlockId::Hash(RpcBlockHash::from_hash(block_hash, None))),
-            None,
-            None,
-        );
         let result = match Handle::try_current() {
-            Ok(handle) => handle
-                .block_on(fut)
-                .map_err(|e| BlockExecutionError::msg(format!("rpc_eth_call failed: {e}")))?,
+            Ok(handle) => {
+                tokio::task::block_in_place(move || {
+                    handle.block_on(rpc_eth_call(
+                        req,
+                        Some(BlockId::Hash(RpcBlockHash::from_hash(block_hash, None))),
+                        None,
+                        None,
+                    ))
+                })
+                .map_err(|e| BlockExecutionError::msg(format!("rpc_eth_call failed: {e}")))?
+            }
             Err(_) => {
                 let rt = Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .map_err(|e| BlockExecutionError::msg(format!("failed to build tokio runtime: {e}")))?;
-                rt.block_on(fut)
+                rt.block_on(rpc_eth_call(
+                    req,
+                    Some(BlockId::Hash(RpcBlockHash::from_hash(block_hash, None))),
+                    None,
+                    None,
+                ))
                     .map_err(|e| BlockExecutionError::msg(format!("rpc_eth_call failed: {e}")))?    
             }
         };
         Ok(result)
     }
 
-    pub(crate) fn eth_call(
+    pub(crate) fn _eth_call(
         &mut self, 
         to: Address, 
         data: Bytes
