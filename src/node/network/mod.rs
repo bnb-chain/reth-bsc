@@ -259,15 +259,22 @@ impl BscNetworkBuilder {
 
         // Spawn the critical ImportService task exactly like the official implementation
         ctx.task_executor().spawn_critical("block import", async move {
-            let handle = engine_handle_rx
+            // Await the engine handle without panicking; if sender was dropped, log and abort task gracefully.
+            let recv = engine_handle_rx
                 .lock()
                 .await
                 .take()
-                .expect("node should only be launched once")
-                .await
-                .unwrap();
+                .expect("node should only be launched once");
+            let handle = match recv.await {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::error!(target: "bsc::block_import", "Failed to receive engine handle: {}", e);
+                    return;
+                }
+            };
 
-            ImportService::new(
+            // Run ImportService; log errors instead of panicking.
+            let service = ImportService::new(
                 provider,
                 chain_spec,
                 handle,
@@ -275,7 +282,10 @@ impl BscNetworkBuilder {
                 from_builder,
                 from_hashes,
                 to_network,
-            ).await.unwrap();
+            );
+            if let Err(e) = service.await {
+                tracing::error!(target: "bsc::block_import", "ImportService exited with error: {}", e);
+            }
         });
 
         // TODO: update network with the latest canonical head, but has a fork id issue, can fix it later.
