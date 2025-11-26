@@ -143,7 +143,7 @@ pub async fn rpc_eth_call(
     block_overrides: Option<Box<BlockOverrides>>,
 ) -> Result<Bytes, eyre::Error> {
     let client = get_rpc_client().ok_or(eyre::eyre!("Failed to get RPC client"))?;
-    Ok(reth_rpc_eth_api::EthApiClient::<
+    reth_rpc_eth_api::EthApiClient::<
         RpcTransactionRequest,
         RpcTransaction,
         RpcBlock,
@@ -151,5 +151,5 @@ pub async fn rpc_eth_call(
         RpcHeader,
     >::call(&client, req, block_id, state_overrides, block_overrides)
     .await
-    .map_err(|e| eyre::eyre!("failed to query chain id from healthy node: {e}"))?)
+    .map_err(|e| eyre::eyre!("failed to query chain id from healthy node: {e}"))
 }
