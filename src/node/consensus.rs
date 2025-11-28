@@ -7,7 +7,7 @@ use crate::{
         ParliaConsensusErr,
         parlia::{provider::EnhancedDbSnapshotProvider, Parlia, util::calculate_millisecond_timestamp, BscForkChoiceRule, HeaderForForkchoice},
     },
-    metrics::{BscFinalityMetrics},
+    metrics::{BscFinalityMetrics, BscBlockchainMetrics},
     shared
 };
 use alloy_consensus::{Header, TxReceipt};
@@ -304,6 +304,8 @@ pub struct BscForkChoiceEngine<P> {
     header_td_cache: Arc<parking_lot::RwLock<schnellru::LruMap<B256, Option<alloy_primitives::U256>, schnellru::ByLength>>>,
     /// Finality metrics
     finality_metrics: BscFinalityMetrics,
+    /// Blockchain metrics (including reorg metrics)
+    blockchain_metrics: BscBlockchainMetrics,
 }
 
 impl<P> BscForkChoiceEngine<P>
@@ -323,6 +325,7 @@ where
             forkchoice_rule: Arc::new(BscForkChoiceRule::new(chain_spec)),
             header_td_cache: Arc::new(parking_lot::RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new(128)))),
             finality_metrics: BscFinalityMetrics::default(),
+            blockchain_metrics: BscBlockchainMetrics::default(),
         }
     }
 
@@ -359,9 +362,33 @@ where
         // Determine if we need to reorg using fork choice rules 
         let need_reorg = self.is_need_reorg(incoming_header, &current_head).await?;
         
+        // Record reorg metrics if reorg is needed
+        if need_reorg {
+            // Calculate reorg depth: the difference between incoming and current head numbers
+            // Note: This is a simplified calculation. The actual reorg depth would require
+            // finding the common ancestor, which is available in the miner's CanonStateNotification
+            let reorg_depth = if incoming_header.number > current_head.number {
+                incoming_header.number - current_head.number
+            } else {
+                current_head.number - incoming_header.number
+            };
+            
+            self.blockchain_metrics.reorg_executions_total.increment(1);
+            self.blockchain_metrics.latest_reorg_depth.set(reorg_depth as f64);
+            
+            tracing::debug!(
+                target: "bsc::forkchoice",
+                incoming_number = incoming_header.number,
+                current_number = current_head.number,
+                reorg_depth,
+                "Reorg detected and metrics recorded"
+            );
+        }
+        
         // The new canonical head is the incoming header if reorg is needed, otherwise current
         let new_canonical_head = if need_reorg {
             incoming_header
+            
         } else {
             &current_head
         };
