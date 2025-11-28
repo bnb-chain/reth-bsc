@@ -657,7 +657,7 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
                 target_header_parent_snap = Some(snap);
                 break;
             }
-            tracing::debug!(target: "parlia::consensus", "vote count is less than 2/3 of validators, skip assemble vote attestation, number={}, parent ={:?}, vote count={}, validators count={}", 
+            tracing::debug!(target: "parlia::consensus", "vote count is less than 2/3 of validators, skip assemble vote attestation, number={}, parent={:?}, vote count={}, validators count={}", 
                 target_header.number(), target_header.hash_slow(), votes.len(), parent_snap.validators.len());
             let block_hash = target_header.parent_hash();
             if let Some(header) = crate::shared::get_canonical_header_by_hash_from_provider(&block_hash) {
