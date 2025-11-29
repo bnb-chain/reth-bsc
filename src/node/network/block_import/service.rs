@@ -161,8 +161,15 @@ where
                         }
                     }
                     .into(),
-                    _ => {
-                        tracing::debug!(target: "bsc::block_import", "New payload is invalid, block = {:?}, peer_id = {:?}", block, peer_id);
+                    status => {
+                        tracing::debug!(
+                            target: "bsc::block_import",
+                            peer_id = %peer_id,
+                            block_hash = %block.block.0.block.header.hash_slow(),
+                            block_number = block.block.0.block.header.number,
+                            payload_status = ?status,
+                            "New payload returned non-actionable status (Syncing/Accepted) - skipping import"
+                        );
                         None
                     }
                 },
