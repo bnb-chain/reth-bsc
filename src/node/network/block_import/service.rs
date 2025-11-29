@@ -138,7 +138,7 @@ where
             match engine.new_payload(payload).await {
                 Ok(payload_status) => match payload_status.status {
                     PayloadStatusEnum::Valid => {
-                        tracing::trace!(target: "bsc::block_import", "New payload is valid, block = {:?}, peer_id = {:?}", block, peer_id);
+                        tracing::debug!(target: "bsc::block_import", "New payload is valid, block = {:?}, peer_id = {:?}", block, peer_id);
                         // handle fork choice update with valid payload
                         if let Err(e) = forkchoice_engine.update_forkchoice(&header).await {
                             tracing::warn!(target: "bsc::block_import", "Failed to update fork choice: {}", e);
@@ -146,14 +146,30 @@ where
                         Outcome { peer: peer_id, result: Ok(BlockValidation::ValidBlock { block }) }
                             .into()
                     }
-                    PayloadStatusEnum::Invalid { validation_error } => Outcome {
-                        peer: peer_id,
-                        result: Err(BlockImportError::Other(validation_error.into())),
+                    PayloadStatusEnum::Invalid { validation_error } => {
+                        tracing::debug!(
+                            target: "bsc::block_import",
+                            peer_id = %peer_id,
+                            block_hash = %block.block.0.block.header.hash_slow(),
+                            block_number = block.block.0.block.header.number,
+                            validation_error = %validation_error,
+                            "Block import failed: invalid payload status"
+                        );
+                        Outcome {
+                            peer: peer_id,
+                            result: Err(BlockImportError::Other(validation_error.into())),
+                        }
                     }
                     .into(),
-                    _ => None,
+                    _ => {
+                        tracing::debug!(target: "bsc::block_import", "New payload is invalid, block = {:?}, peer_id = {:?}", block, peer_id);
+                        None
+                    }
                 },
-                Err(err) => None,
+                Err(err) => {
+                    tracing::debug!(target: "bsc::block_import", "New payload is invalid, block = {:?}, peer_id = {:?}, error = {:?}", block, peer_id, err);
+                    None
+                }
             }
         })
     }
@@ -245,12 +261,25 @@ where
             let start_height = hash_number.number;
             let start_hash = hash_number.hash;
             let announcing_peer = peer_id;
+            
             // Resolve target bsc peer
-            let target_peer = if crate::node::network::bsc_protocol::registry::has_registered_peer(announcing_peer) {
+            let has_announcing_peer = crate::node::network::bsc_protocol::registry::has_registered_peer(announcing_peer);
+            let registered_peers = crate::node::network::bsc_protocol::registry::list_registered_peers();
+            
+            tracing::debug!(
+                target: "bsc::block_import",
+                announcing_peer = %announcing_peer,
+                has_bsc_extension = has_announcing_peer,
+                registered_peers_count = registered_peers.len(),
+                "Checking BSC peer availability for block download"
+            );
+            
+            let target_peer = if has_announcing_peer {
                 Some(announcing_peer)
             } else {
-                crate::node::network::bsc_protocol::registry::list_registered_peers().into_iter().next()
+                registered_peers.into_iter().next()
             };
+            
             if let Some(bsc_peer) = target_peer {
                 tracing::debug!(
                     target: "bsc::block_import",
@@ -271,6 +300,14 @@ where
                         req_timeout,
                     ).await;
                 });
+            } else {
+                tracing::warn!(
+                    target: "bsc::block_import",
+                    announcing_peer = %announcing_peer,
+                    block_hash = %start_hash,
+                    block_number = start_height,
+                    "No BSC peer available for block download - skipping"
+                );
             }
             self.downloading_blocks.insert(hash_number.hash, now);
         }
