@@ -361,12 +361,9 @@ where
         
         // Determine if we need to reorg using fork choice rules 
         let need_reorg = self.is_need_reorg(incoming_header, &current_head).await?;
-        
-        // Record reorg metrics if reorg is needed
         if need_reorg {
             // Calculate reorg depth: the difference between incoming and current head numbers
-            // Note: This is a simplified calculation. The actual reorg depth would require
-            // finding the common ancestor, which is available in the miner's CanonStateNotification
+            // Note: This is a simplified calculation.
             let reorg_depth = if incoming_header.number > current_head.number {
                 incoming_header.number - current_head.number
             } else {
@@ -376,19 +373,19 @@ where
             self.blockchain_metrics.reorg_executions_total.increment(1);
             self.blockchain_metrics.latest_reorg_depth.set(reorg_depth as f64);
             
-            tracing::debug!(
+            tracing::info!(
                 target: "bsc::forkchoice",
                 incoming_number = incoming_header.number,
+                incoming_hash = ?incoming_header.hash_slow(),
                 current_number = current_head.number,
+                current_hash = ?current_head.hash_slow(),
                 reorg_depth,
                 "Reorg detected and metrics recorded"
             );
         }
         
-        // The new canonical head is the incoming header if reorg is needed, otherwise current
         let new_canonical_head = if need_reorg {
             incoming_header
-            
         } else {
             &current_head
         };
