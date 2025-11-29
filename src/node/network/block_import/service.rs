@@ -240,75 +240,38 @@ where
                 "Requesting block download for NewBlockHashes"
             );
 
-            // TODO: avoid to fetch too frequently, maybe add a cooldown mechanism.
             // Try quick range fetch via BSC subprotocol (mimic geth asyncFetchRangeBlocks)
             // Prefer the announcing peer; if it doesn't have bsc extension, fallback to any bsc peer.
-            {
-                let start_height = hash_number.number;
-                let start_hash = hash_number.hash;
-                let announcing_peer = peer_id;
-                // Resolve target bsc peer
-                let target_peer = if crate::node::network::bsc_protocol::registry::has_registered_peer(announcing_peer) {
-                    Some(announcing_peer)
-                } else {
-                    crate::node::network::bsc_protocol::registry::list_registered_peers().into_iter().next()
-                };
-                if let Some(bsc_peer) = target_peer {
-                    tracing::debug!(
-                        target: "bsc::block_import",
-                        peer_id = %bsc_peer,
-                        block_hash = %start_hash,
-                        block_number = start_height,
-                        "Requesting block with block range for NewBlockHashes"
-                    );
-                    tokio::spawn(async move {
-                        use std::time::Duration;
-                        // Bump request timeout to 1000ms to accommodate slower peers
-                        let req_timeout = Duration::from_millis(DOWNLOAD_COOLDOWN_DURATION_MS as u64);
-                        let _ = crate::node::network::bsc_protocol::registry::batch_request_range_and_await_import(
-                            bsc_peer,
-                            start_height,
-                            start_hash,
-                            1,
-                            req_timeout,
-                        ).await;
-                    });
-                }
-            }
-
-            // TODO: remove older block download mechanism currently, 
-            // may download block with TreeEvent::Download(DownloadRequest::single_block(target)
-            let forkchoice_state = ForkchoiceState {
-                head_block_hash: hash_number.hash,
-                safe_block_hash: B256::ZERO, 
-                finalized_block_hash: B256::ZERO,
+            let start_height = hash_number.number;
+            let start_hash = hash_number.hash;
+            let announcing_peer = peer_id;
+            // Resolve target bsc peer
+            let target_peer = if crate::node::network::bsc_protocol::registry::has_registered_peer(announcing_peer) {
+                Some(announcing_peer)
+            } else {
+                crate::node::network::bsc_protocol::registry::list_registered_peers().into_iter().next()
             };
-
-            let engine = self.engine.clone();
-            let block_hash = hash_number.hash;
-            let download_fut = Box::pin(async move {
-                match engine.fork_choice_updated(forkchoice_state, None, EngineApiMessageVersion::V1).await {
-                    Ok(result) => {
-                        tracing::debug!(
-                            target: "bsc::block_import",
-                            block_hash = %block_hash,
-                            status = ?result.payload_status.status,
-                            "FCU result for missing block download"
-                        );
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            target: "bsc::block_import", 
-                            block_hash = %block_hash,
-                            error = %err,
-                            "Failed to trigger block download via FCU"
-                        );
-                    }
-                }
-                None
-            });
-
-            self.pending_imports.push(download_fut);
+            if let Some(bsc_peer) = target_peer {
+                tracing::debug!(
+                    target: "bsc::block_import",
+                    peer_id = %bsc_peer,
+                    block_hash = %start_hash,
+                    block_number = start_height,
+                    "Requesting block with block range for NewBlockHashes"
+                );
+                tokio::spawn(async move {
+                    use std::time::Duration;
+                    // Bump request timeout to 1000ms to accommodate slower peers
+                    let req_timeout = Duration::from_millis(DOWNLOAD_COOLDOWN_DURATION_MS as u64);
+                    let _ = crate::node::network::bsc_protocol::registry::batch_request_range_and_await_import(
+                        bsc_peer,
+                        start_height,
+                        start_hash,
+                        1,
+                        req_timeout,
+                    ).await;
+                });
+            }
             self.downloading_blocks.insert(hash_number.hash, now);
         }
     }
@@ -422,23 +385,6 @@ mod tests {
             })
             .await;
     }
-
-    // FCU has been called after import payload is validated, skip this test now.
-    // #[tokio::test]
-    // async fn can_handle_invalid_fcu() {
-    //     let mut fixture = TestFixture::new(EngineResponses::invalid_fcu()).await;
-    //     fixture
-    //         .assert_block_import(|outcome| {
-    //             matches!(
-    //                 outcome,
-    //                 BlockImportEvent::Outcome(BlockImportOutcome {
-    //                     peer: _,
-    //                     result: Err(BlockImportError::Other(_))
-    //                 })
-    //             )
-    //         })
-    //         .await;
-    // }
 
     #[tokio::test]
     async fn deduplicates_blocks() {
