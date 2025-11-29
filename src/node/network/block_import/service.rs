@@ -161,6 +161,24 @@ where
                         }
                     }
                     .into(),
+                    PayloadStatusEnum::Syncing => {
+                        tracing::debug!(
+                            target: "bsc::block_import",
+                            peer_id = %peer_id,
+                            block_hash = %block.block.0.block.header.hash_slow(),
+                            block_number = block.block.0.block.header.number,
+                            "New payload returned Syncing status - attempting fork choice update"
+                        );
+                        // Even in syncing state, try to update fork choice to help progress
+                        if let Err(e) = forkchoice_engine.update_forkchoice(&header).await {
+                            tracing::debug!(
+                                target: "bsc::block_import",
+                                error = %e,
+                                "Fork choice update failed for syncing block"
+                            );
+                        }
+                        None
+                    }
                     status => {
                         tracing::debug!(
                             target: "bsc::block_import",
@@ -168,7 +186,7 @@ where
                             block_hash = %block.block.0.block.header.hash_slow(),
                             block_number = block.block.0.block.header.number,
                             payload_status = ?status,
-                            "New payload returned non-actionable status (Syncing/Accepted) - skipping import"
+                            "New payload returned non-actionable status - skipping import"
                         );
                         None
                     }
