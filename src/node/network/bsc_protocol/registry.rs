@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
 use std::sync::Arc;
 
@@ -30,6 +30,11 @@ static REGISTRY: Lazy<RwLock<HashMap<PeerId, UnboundedSender<BscCommand>>>> =
 static EVN_REFRESH_TASK: Lazy<RwLock<Option<JoinHandle<()>>>> =
     Lazy::new(|| RwLock::new(None));
 
+/// Global map of proxyed peer IDs for BSC protocol.
+/// This mirrors the same functionality in the main peer manager.
+static PROXYED_PEER_IDS_MAP: Lazy<RwLock<HashSet<PeerId>>> =
+    Lazy::new(|| RwLock::new(HashSet::new()));
+
 static ALL_PEERS_ALLOW_BROADCAST: bool = true;
 
 /// Register a new peer's sender channel.
@@ -57,6 +62,40 @@ pub fn list_registered_peers() -> Vec<PeerId> {
 pub fn has_registered_peer(peer: PeerId) -> bool {
     match REGISTRY.read() {
         Ok(guard) => guard.contains_key(&peer),
+        Err(_) => false,
+    }
+}
+
+/// Initialize the proxyed peer IDs map from a list of peer IDs.
+/// This should be called during network initialization with the same list from config.
+pub fn initialize_proxyed_peers(peer_ids: Vec<PeerId>) {
+    match PROXYED_PEER_IDS_MAP.write() {
+        Ok(mut guard) => {
+            guard.clear();
+            for peer_id in peer_ids {
+                guard.insert(peer_id);
+            }
+            tracing::info!(
+                target: "bsc::registry",
+                count = guard.len(),
+                "Initialized BSC protocol proxyed peer IDs map"
+            );
+        }
+        Err(e) => {
+            tracing::error!(
+                target: "bsc::registry",
+                error=%e,
+                "Failed to initialize proxyed peer IDs map (lock poisoned)"
+            );
+        }
+    }
+}
+
+/// Check if a peer is in the proxyed peers list.
+/// Returns true if the peer is a proxyed peer.
+pub fn is_proxyed_peer(peer_id: &PeerId) -> bool {
+    match PROXYED_PEER_IDS_MAP.read() {
+        Ok(guard) => guard.contains(peer_id),
         Err(_) => false,
     }
 }
@@ -175,9 +214,9 @@ pub fn broadcast_votes(votes: Vec<crate::consensus::parlia::vote::VoteEnvelope>)
 
         let mut to_remove: Vec<PeerId> = Vec::new();
         for (peer, tx) in reg_snapshot {
-            // Always include EVN peers
+            // Always include EVN peers and proxyed peers
             // TODO: fix the allow broadcast logic, it should be based on the peer's TD status, it seems not working.
-            let mut allow = is_evn(&peer);
+            let mut allow = is_evn(&peer) || is_proxyed_peer(&peer);
             if !allow {
                 if let Some(info) = peer_info_map.get(&peer) {
                     tracing::trace!(target: "bsc::vote", peer=%peer, latest_block=info.status.latest_block, 
@@ -203,11 +242,12 @@ pub fn broadcast_votes(votes: Vec<crate::consensus::parlia::vote::VoteEnvelope>)
                     allow = true;
                 }
             }
+
             if ALL_PEERS_ALLOW_BROADCAST {
                 allow = true;
             }
 
-            tracing::trace!(target: "bsc::vote", peer=%peer, allow=allow, "broadcast votes to peer");
+            tracing::trace!(target: "bsc::vote", peer=%peer, allow=allow, is_proxyed=is_proxyed_peer(&peer), "broadcast votes to peer");
             if allow && tx.send(BscCommand::Votes(Arc::clone(&votes_arc))).is_err() {
                 tracing::trace!(target: "bsc::vote", peer=%peer, "failed to send votes to peer, remove from registry");
                 to_remove.push(peer);
