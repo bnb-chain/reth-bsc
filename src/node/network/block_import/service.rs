@@ -151,6 +151,48 @@ where
                         result: Err(BlockImportError::Other(validation_error.into())),
                     }
                     .into(),
+                    PayloadStatusEnum::Syncing => {
+                        // When new_payload returns Syncing status, we need to manually trigger FCU
+                        // to avoid the engine-tree being stuck in syncing state without any driver.
+                        // By calling FCU, we inform the engine about the new head block hash,
+                        // which can help trigger additional sync/download activities in the engine-tree.
+                        let block_hash = header.hash_slow();
+                        let block_number = header.number;
+                        tracing::debug!(
+                            target: "bsc::block_import",
+                            block_hash = %block_hash,
+                            block_number = block_number,
+                            "New payload returned Syncing status - attempting fork choice update"
+                        );
+                        
+                        // Direct FCU call to help sync progress
+                        let forkchoice_state = alloy_rpc_types::engine::ForkchoiceState {
+                            head_block_hash: block_hash,
+                            safe_block_hash: alloy_primitives::B256::ZERO,
+                            finalized_block_hash: alloy_primitives::B256::ZERO,
+                        };
+                        match engine.fork_choice_updated(forkchoice_state, None, reth_payload_primitives::EngineApiMessageVersion::V1).await {
+                            Ok(result) => {
+                                tracing::debug!(
+                                    target: "bsc::block_import",
+                                    block_hash = %block_hash,
+                                    block_number = block_number,
+                                    status = ?result.payload_status.status,
+                                    "FCU result for syncing block"
+                                );
+                            }
+                            Err(err) => {
+                                tracing::trace!(
+                                    target: "bsc::block_import", 
+                                    block_hash = %block_hash,
+                                    block_number = block_number,
+                                    error = %err,
+                                    "Failed to update fork choice for syncing block"
+                                );
+                            }
+                        }
+                        None
+                    }
                     _ => None,
                 },
                 Err(err) => None,
