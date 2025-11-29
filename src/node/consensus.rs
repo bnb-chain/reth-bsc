@@ -364,11 +364,7 @@ where
         if need_reorg {
             // Calculate reorg depth: the difference between incoming and current head numbers
             // Note: This is a simplified calculation.
-            let reorg_depth = if incoming_header.number > current_head.number {
-                incoming_header.number - current_head.number
-            } else {
-                current_head.number - incoming_header.number
-            };
+            let reorg_depth = incoming_header.number.abs_diff(current_head.number);
             
             self.blockchain_metrics.reorg_executions_total.increment(1);
             self.blockchain_metrics.latest_reorg_depth.set(reorg_depth as f64);
