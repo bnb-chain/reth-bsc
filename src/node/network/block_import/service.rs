@@ -84,6 +84,8 @@ where
     pending_imports: FuturesUnordered<ImportFut>,
     /// Cache of processed block hashes to avoid reprocessing the same block.
     processed_blocks: LruCache<B256>,
+    /// Cache of queued block hashes to avoid processing the same block.
+    queued_blocks: LruCache<B256>,
     /// Cache of downloading block hashes to avoid re-downloading the same block.
     downloading_blocks: LruMap<B256, u128, ByLength>,
 }
@@ -121,6 +123,7 @@ where
             to_network,
             pending_imports: FuturesUnordered::new(),
             processed_blocks: LruCache::new(LRU_PROCESSED_BLOCKS_SIZE),
+            queued_blocks: LruCache::new(LRU_PROCESSED_BLOCKS_SIZE),
             downloading_blocks: LruMap::new(ByLength::new(LRU_PROCESSED_BLOCKS_SIZE)),
         }
     }
@@ -247,8 +250,14 @@ where
     /// Add a new block import task to the pending imports
     fn on_new_block(&mut self, block: BlockMsg, peer_id: PeerId) {
         if self.processed_blocks.contains(&block.hash) {
+            tracing::trace!(target: "bsc::block_import", "Block already processed when receiving new block: number = {:?}, hash = {:?}", block.block.0.block.header.number, block.hash);
             return;
         }
+        if self.queued_blocks.contains(&block.hash) {
+            tracing::trace!(target: "bsc::block_import", "Block already queued when receiving new block: number = {:?}, hash = {:?}", block.block.0.block.header.number, block.hash);
+            return;
+        }
+        self.queued_blocks.insert(block.hash);
 
         // Send ValidHeader announcement to trigger NewBlock diffusion from few peers
         // TODO: add header validation later
@@ -267,6 +276,11 @@ where
         for hash_number in hash_numbers {
             // Skip if the block is already processed.
             if self.processed_blocks.contains(&hash_number.hash) {
+                tracing::trace!(target: "bsc::block_import", "Block already processed when requesting block hashes: number = {:?}, hash = {:?}", hash_number.number, hash_number.hash);
+                continue;
+            }
+            if self.queued_blocks.contains(&hash_number.hash) {
+                tracing::trace!(target: "bsc::block_import", "Block already queued when requesting block hashes: number = {:?}, hash = {:?}", hash_number.number, hash_number.hash);
                 continue;
             }
 
@@ -353,7 +367,9 @@ where
         // Process completed imports and send events to network
         while let Poll::Ready(Some(outcome)) = this.pending_imports.poll_next_unpin(cx) {
             if let Some(outcome) = outcome {
+                let mut block_hash = None;
                 if let Ok(BlockValidation::ValidBlock { block }) = &outcome.result {
+                    block_hash = Some(block.hash);
                     this.processed_blocks.insert(block.hash);
                     // Cache the full block body for later range responses.
                     crate::shared::cache_full_block(block.block.0.block.clone());
@@ -374,6 +390,13 @@ where
                         }
                     }
                 }
+
+                // TODO: add queued blocks removal later, to avoid milicious block import, and trigger next download.
+                // now, it must wait backfilling to download the correct block.
+                // the verified header can drop the peer later, it cannot transfer a bad header now.
+                // if let Some(block_hash) = outcome.block.hash {
+                //     this.queued_blocks.remove(&block_hash);
+                // }
 
                 if let Err(e) = this.to_network.send(BlockImportEvent::Outcome(outcome)) {
                     return Poll::Ready(Err(Box::new(e)));
