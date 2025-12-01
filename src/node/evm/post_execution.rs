@@ -480,7 +480,7 @@ where
             let snap = self.snapshot_provider.
                 as_ref().
                 unwrap().
-                snapshot_by_hash(&header.hash_slow()).
+                snapshot_by_hash(&header.parent_hash).
                 ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;
 
             if let Some(attestation) =
