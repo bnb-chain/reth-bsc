@@ -342,7 +342,7 @@ where
                 .snapshot_provider
                 .as_ref()
                 .unwrap()
-                .snapshot_by_hash(&parent.parent_hash)
+                .snapshot_by_hash(&ancestor.parent_hash)
                 .ok_or(BlockExecutionError::msg("Failed to get pre snapshot from snapshot provider"))?;
 
             // query bls keys from snapshot.
