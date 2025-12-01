@@ -776,7 +776,7 @@ mod tests {
         };
         let new_block = BscNewBlock(NewBlock { block, td: U128::from(1) });
         let hash = new_block.0.block.header.hash_slow();
-        NewBlockMessage { hash, block: Arc::new(new_block) }
+        NewBlockMessage { hash, block: Arc::new(new_block), td: Some(U256::from(1)) }
     }
 
     /// Helper function to handle engine messages with specified payload statuses

@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
 use std::sync::Arc;
 
-use alloy_primitives::U128;
+use alloy_primitives::{U128, U256};
 use once_cell::sync::Lazy;
 use reth_eth_wire::NewBlock;
 use reth_network::message::NewBlockMessage;
@@ -34,8 +34,6 @@ static EVN_REFRESH_TASK: Lazy<RwLock<Option<JoinHandle<()>>>> =
 /// This mirrors the same functionality in the main peer manager.
 static PROXYED_PEER_IDS_MAP: Lazy<RwLock<HashSet<PeerId>>> =
     Lazy::new(|| RwLock::new(HashSet::new()));
-
-static ALL_PEERS_ALLOW_BROADCAST: bool = true;
 
 /// Register a new peer's sender channel.
 pub fn register_peer(peer: PeerId, tx: UnboundedSender<BscCommand>) {
@@ -165,7 +163,7 @@ pub async fn batch_request_range_and_await_import(
                 td: U128::from(0u64),
             });
             let hash = block.header.hash_slow();
-            let msg = NewBlockMessage { hash, block: Arc::new(nb) };
+            let msg = NewBlockMessage { hash, block: Arc::new(nb), td: Some(U256::ZERO) };
             if let Err(e) = sender.send((msg, peer)) {
                 tracing::error!(target: "bsc::registry", error=%e, "Failed to send block to import path");
             }
@@ -219,14 +217,14 @@ pub fn broadcast_votes(votes: Vec<crate::consensus::parlia::vote::VoteEnvelope>)
             let mut allow = is_evn(&peer) || is_proxyed_peer(&peer);
             if !allow {
                 if let Some(info) = peer_info_map.get(&peer) {
-                    tracing::trace!(target: "bsc::vote", peer=%peer, latest_block=info.status.latest_block, 
-                        total_difficulty=u256_to_u128(info.status.total_difficulty.unwrap_or_default()), 
-                        "peer info when checking allow broadcast votes");
+                    tracing::debug!(target: "bsc::vote", peer=%peer, latest_block=info.best_number, 
+                        total_difficulty=u256_to_u128(info.best_td.unwrap_or_default()), 
+                        "peer info when checking allow broadcast votes latest_block:{} local best td:{}", info.best_number.unwrap_or_default(), local_best_td.unwrap_or_default());
                     // Prefer Eth69 latest block distance; else use total_difficulty delta if both are known
-                    if let Some(peer_latest) = info.status.latest_block {
+                    if let Some(peer_latest) = info.best_number {
                         let delta = (local_best_number as u128).abs_diff(peer_latest as u128);
                         if delta <= delta_td_threshold { allow = true; }
-                    } else if let (Some(local_td), Some(peer_td)) = (local_best_td, info.status.total_difficulty) {
+                    } else if let (Some(local_td), Some(peer_td)) = (local_best_td, info.best_td) {
                         // Convert peer td (U256 alloy) to u128
                         let peer_td_u128 = u256_to_u128(peer_td);
                         if let Some(peer_td_u128) = peer_td_u128 {
@@ -243,13 +241,9 @@ pub fn broadcast_votes(votes: Vec<crate::consensus::parlia::vote::VoteEnvelope>)
                 }
             }
 
-            if ALL_PEERS_ALLOW_BROADCAST {
-                allow = true;
-            }
-
-            tracing::trace!(target: "bsc::vote", peer=%peer, allow=allow, is_proxyed=is_proxyed_peer(&peer), "broadcast votes to peer");
+            tracing::debug!(target: "bsc::vote", peer=%peer, allow=allow, is_proxyed=is_proxyed_peer(&peer), "broadcast votes to peer");
             if allow && tx.send(BscCommand::Votes(Arc::clone(&votes_arc))).is_err() {
-                tracing::trace!(target: "bsc::vote", peer=%peer, "failed to send votes to peer, remove from registry");
+                tracing::debug!(target: "bsc::vote", peer=%peer, "failed to send votes to peer, remove from registry");
                 to_remove.push(peer);
             }
         }
