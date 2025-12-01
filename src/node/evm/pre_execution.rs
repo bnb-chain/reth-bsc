@@ -374,8 +374,26 @@ where
             }
 
             // check if voted validator count satisfied 2/3 + 1
+            // todo
             let at_least_votes = (validators_count * 2).div_ceil(3); // ceil division
             if vote_addrs.len() < at_least_votes {
+
+                { // print debug info
+                    tracing::info!("Attestation vote validation failed:");
+                    tracing::info!("  validators_count: {}", validators_count);
+                    tracing::info!("  pre_snap.validators: {:?}", pre_snap.validators);
+                    tracing::info!("  vote_bit_set length: {}", vote_bit_set.len());
+                    tracing::info!("  vote_bit_set indices: {:?}", vote_bit_set.iter().collect::<Vec<_>>());
+                    tracing::info!("  attestation.vote_address_set (raw): 0x{:016x}", attestation.vote_address_set);
+                    tracing::info!("  vote_addrs.len(): {}", vote_addrs.len());
+                    tracing::info!("  at_least_votes (required): {}", at_least_votes);
+                    tracing::info!("  Validator vote status:");
+                    for (i, validator) in pre_snap.validators.iter().enumerate() {
+                        let voted = vote_bit_set.contains(i);
+                        tracing::info!("    [{}] validator: {}, voted: {}", i, validator, voted);
+                    }
+                }
+
                 return Err(BscBlockExecutionError::Validation(
                     BscBlockValidationError::InvalidAttestationVoteCount(GotExpected {
                         got: vote_addrs.len() as u64,

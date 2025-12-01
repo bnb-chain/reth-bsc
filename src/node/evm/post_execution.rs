@@ -489,6 +489,8 @@ where
                     BscBlockExecutionError::Validation(BscBlockValidationError::ParliaConsensusError { error: err.into() })
                 })?
             {
+                tracing::info!("try debug attestation data, attestation: {:?}, header_number: {:?}", 
+                    attestation, header.number);
                 self.process_attestation(&attestation, &header, &mut accumulated_weights)?;
             }
             target_hash = header.parent_hash;
@@ -520,7 +522,7 @@ where
         let snapshot = self.snapshot_provider.as_ref().unwrap().snapshot_by_hash(&parent.hash_slow());
         let validators = &snapshot.unwrap().validators;  
         let mut validators_bit_set = BitSet::new();
-        let vote_address_set = attestation.vote_address_set;
+        let vote_address_set = attestation.vote_address_set; // todo:
         for i in 0..64 {
             if (vote_address_set & (1u64 << i)) != 0 {
                 validators_bit_set.insert(i);
@@ -529,9 +531,10 @@ where
 
         if validators_bit_set.len() > validators.len() {
             return Err(BscBlockExecutionError::Validation(
+                // todo:
                 BscBlockValidationError::InvalidAttestationVoteCount(GotExpected {
-                    got: validators_bit_set.len() as u64,
-                    expected: validators.len() as u64,
+                    got: validators_bit_set.len() as u64, //1
+                    expected: validators.len() as u64, // 7
                 })
             ).into());
         }
