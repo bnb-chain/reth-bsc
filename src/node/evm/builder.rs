@@ -106,13 +106,84 @@ where
         // merge all transitions into bundle state
         db.merge_transitions(BundleRetention::Reverts);
 
-        // calculate the state root
-        let state_root_start = std::time::Instant::now();
+        // ========== Detailed State Root Performance Analysis ==========
+        
+        // 1. Analyze bundle state statistics
+        let bundle_stats_start = std::time::Instant::now();
+        let changed_accounts = db.bundle_state.state().len();
+        let changed_storage_count: usize = db.bundle_state.state()
+            .values()
+            .map(|account| account.storage.len())
+            .sum();
+        let bundle_stats_duration = bundle_stats_start.elapsed();
+        
+        tracing::debug!(
+            target: "bsc::builder::perf",
+            changed_accounts = changed_accounts,
+            changed_storage_slots = changed_storage_count,
+            stats_duration_us = bundle_stats_duration.as_micros(),
+            "Bundle state statistics"
+        );
+
+        // 2. Calculate hashed post state (Keccak256 hashing phase)
+        let hash_start = std::time::Instant::now();
         let hashed_state = state.hashed_post_state(&db.bundle_state);
+        let hash_duration = hash_start.elapsed();
+        
+        tracing::debug!(
+            target: "bsc::builder::perf",
+            hash_duration_ms = hash_duration.as_millis(),
+            hash_duration_us = hash_duration.as_micros(),
+            "Hashed post state calculation"
+        );
+
+        // 3. Calculate state root with trie updates (MPT traversal and rebuild)
+        let trie_calc_start = std::time::Instant::now();
         let (state_root, trie_updates) = state
             .state_root_with_updates(hashed_state.clone())
             .map_err(BlockExecutionError::other)?;
-        let state_root_duration = state_root_start.elapsed();
+        let trie_calc_duration = trie_calc_start.elapsed();
+        
+        // 4. Analyze trie updates statistics
+        let trie_stats_start = std::time::Instant::now();
+        let account_nodes_updated = trie_updates.account_nodes.len();
+        let storage_tries_updated = trie_updates.storage_tries.len();
+        let total_storage_nodes: usize = trie_updates.storage_tries
+            .values()
+            .map(|nodes| nodes.len())
+            .sum();
+        let trie_stats_duration = trie_stats_start.elapsed();
+        
+        let state_root_duration = hash_duration + trie_calc_duration + bundle_stats_duration + trie_stats_duration;
+        
+        tracing::debug!(
+            target: "bsc::builder::perf",
+            trie_calc_duration_ms = trie_calc_duration.as_millis(),
+            trie_calc_duration_us = trie_calc_duration.as_micros(),
+            account_nodes_updated = account_nodes_updated,
+            storage_tries_updated = storage_tries_updated,
+            total_storage_nodes_updated = total_storage_nodes,
+            "Trie calculation and updates"
+        );
+        
+        // 5. Overall state root breakdown
+        tracing::info!(
+            target: "bsc::builder::perf",
+            total_duration_ms = state_root_duration.as_millis(),
+            hash_duration_ms = hash_duration.as_millis(),
+            hash_percentage = (hash_duration.as_micros() * 100 / state_root_duration.as_micros().max(1)) as u32,
+            trie_calc_duration_ms = trie_calc_duration.as_millis(),
+            trie_percentage = (trie_calc_duration.as_micros() * 100 / state_root_duration.as_micros().max(1)) as u32,
+            changed_accounts = changed_accounts,
+            changed_storage_slots = changed_storage_count,
+            account_nodes_updated = account_nodes_updated,
+            storage_tries_updated = storage_tries_updated,
+            total_storage_nodes = total_storage_nodes,
+            state_root = %state_root,
+            "State root performance breakdown"
+        );
+        
+        // ========== End of Performance Analysis ==========
 
         let user_tx_len = self.transactions.len();
         let system_tx_len = assembled_system_txs.len();
