@@ -103,6 +103,12 @@ where
         let (db, evm_env) = evm.finish();
 
         let assembled_system_txs = self.shared_ctx.inner.borrow().assembled_system_txs.clone();
+        
+        // Get transaction counts
+        let user_tx_count = self.transactions.len();
+        let system_tx_count = assembled_system_txs.len();
+        let total_tx_count = user_tx_count + system_tx_count;
+        
         // merge all transitions into bundle state
         db.merge_transitions(BundleRetention::Reverts);
 
@@ -169,6 +175,9 @@ where
         // 5. Overall state root breakdown
         tracing::info!(
             target: "bsc::builder::perf",
+            user_tx_count = user_tx_count,
+            system_tx_count = system_tx_count,
+            total_tx_count = total_tx_count,
             total_duration_ms = state_root_duration.as_millis(),
             hash_duration_ms = hash_duration.as_millis(),
             hash_percentage = (hash_duration.as_micros() * 100 / state_root_duration.as_micros().max(1)) as u32,
