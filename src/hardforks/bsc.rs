@@ -112,7 +112,7 @@ impl BscHardfork {
             (Self::Pascal.boxed(), ForkCondition::Timestamp(1742436600)), /* 2025-03-20 02:10:00 AM UTC - deployed with Prague */
             (Self::Lorentz.boxed(), ForkCondition::Timestamp(1745903100)), /* 2025-04-29 05:05:00 AM UTC */
             (Self::Maxwell.boxed(), ForkCondition::Timestamp(1751250600)), /* 2025-06-30 02:30:00 AM UTC */
-            (Self::Fermi.boxed(), ForkCondition::Timestamp(9999999999)), /* 2025-10-30 02:30:00 AM UTC */
+            (Self::Fermi.boxed(), ForkCondition::Timestamp(1768357800)), /* 2026-01-14 02:30:00 AM UTC */
         ])
     }
 
@@ -201,7 +201,7 @@ impl BscHardfork {
             (Self::Pascal.boxed(), ForkCondition::Timestamp(1754967081)),
             (Self::Lorentz.boxed(), ForkCondition::Timestamp(1754967081)),
             (Self::Maxwell.boxed(), ForkCondition::Timestamp(1754967101)),
-            (Self::Fermi.boxed(), ForkCondition::Timestamp(1761030900)), 
+            (Self::Fermi.boxed(), ForkCondition::Timestamp(1761030900)),
         ])
     }
 
@@ -222,7 +222,7 @@ where
 {
     let fork: &dyn Any = &fork;
     if let Some(fork) = fork.downcast_ref::<EthereumHardfork>() {
-        return hardfork_fn(fork)
+        return hardfork_fn(fork);
     }
     fork.downcast_ref::<BscHardfork>().and_then(bsc_hardfork_fn)
 }
@@ -230,28 +230,31 @@ where
 impl From<BscHardfork> for SpecId {
     fn from(spec: BscHardfork) -> Self {
         match spec {
-            BscHardfork::Frontier |
-            BscHardfork::Ramanujan |
-            BscHardfork::Niels |
-            BscHardfork::MirrorSync |
-            BscHardfork::Bruno |
-            BscHardfork::Euler |
-            BscHardfork::Gibbs |
-            BscHardfork::Nano |
-            BscHardfork::Moran |
-            BscHardfork::Planck |
-            BscHardfork::Luban |
-            BscHardfork::Plato => SpecId::MUIR_GLACIER,
+            BscHardfork::Frontier
+            | BscHardfork::Ramanujan
+            | BscHardfork::Niels
+            | BscHardfork::MirrorSync
+            | BscHardfork::Bruno
+            | BscHardfork::Euler
+            | BscHardfork::Gibbs
+            | BscHardfork::Nano
+            | BscHardfork::Moran
+            | BscHardfork::Planck
+            | BscHardfork::Luban
+            | BscHardfork::Plato => SpecId::MUIR_GLACIER,
             BscHardfork::Hertz | BscHardfork::HertzFix => SpecId::LONDON,
             BscHardfork::Kepler | BscHardfork::Feynman | BscHardfork::FeynmanFix => {
                 SpecId::SHANGHAI
             }
-            BscHardfork::Cancun |
-            BscHardfork::Haber |
-            BscHardfork::HaberFix |
-            BscHardfork::Bohr |
-            BscHardfork::Tycho => SpecId::CANCUN,
-            BscHardfork::Pascal | BscHardfork::Lorentz | BscHardfork::Maxwell | BscHardfork::Fermi => SpecId::PRAGUE,
+            BscHardfork::Cancun
+            | BscHardfork::Haber
+            | BscHardfork::HaberFix
+            | BscHardfork::Bohr
+            | BscHardfork::Tycho => SpecId::CANCUN,
+            BscHardfork::Pascal
+            | BscHardfork::Lorentz
+            | BscHardfork::Maxwell
+            | BscHardfork::Fermi => SpecId::PRAGUE,
         }
     }
 }
