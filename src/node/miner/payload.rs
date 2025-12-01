@@ -45,7 +45,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 
 /// Delay left over for mining calculation
-pub const DELAY_LEFT_OVER: u64 = 50;
+pub const DELAY_LEFT_OVER: u64 = 250;
 
 /// Time multiplier for retry condition check
 const TIME_MULTIPLIER: u32 = 2;
