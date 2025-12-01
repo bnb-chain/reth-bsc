@@ -265,6 +265,7 @@ where
             .to_network
             .send(BlockImportEvent::Announcement(BlockValidation::ValidHeader { block: block.clone() }));
 
+        tracing::debug!(target: "bsc::block_import", "Sending new block to import service: number = {:?}, hash = {:?}", block.block.0.block.header.number, block.hash);
         let payload_fut = self.new_payload(block.clone(), peer_id);
         self.pending_imports.push(payload_fut);
     }
