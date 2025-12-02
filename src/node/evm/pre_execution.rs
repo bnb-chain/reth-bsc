@@ -649,6 +649,7 @@ mod tests {
     use crate::consensus::parlia::snapshot::ValidatorInfo;
     use crate::consensus::parlia::vote::{VoteAttestation, VoteData, VoteSignature};
     use alloy_primitives::{Address, U256};
+    use blst::min_pk::SecretKey;
     use bytes::Bytes;
 
     fn b256_from_u64(value: u64) -> B256 {
@@ -659,10 +660,12 @@ mod tests {
         let mut addr_bytes = [0u8; 20];
         addr_bytes[12..].copy_from_slice(&0xdeadbeefu64.to_be_bytes());
         let validator = Address::from(addr_bytes);
-        let mut snapshot = Snapshot::default();
-        snapshot.block_hash = b256_from_u64(block_hash);
-        snapshot.block_number = block_hash;
-        snapshot.validators = vec![validator];
+        let mut snapshot = Snapshot {
+            block_hash: b256_from_u64(block_hash),
+            block_number: block_hash,
+            validators: vec![validator],
+            ..Snapshot::default()
+        };
         snapshot.validators_map.insert(
             validator,
             ValidatorInfo { index: 1, vote_addr: VoteAddress::from([vote_addr_seed; 48]) },
@@ -694,7 +697,8 @@ mod tests {
     #[test]
     fn cached_public_key_reuses_arc() {
         reset_attestation_caches();
-        let vote_addr = VoteAddress::from([7u8; 48]);
+        let secret_key = SecretKey::key_gen(&[1u8; 32], &[]).expect("static seed yields key");
+        let vote_addr = VoteAddress::from(secret_key.sk_to_pk().to_bytes());
         let pk1 = cached_public_key(&vote_addr).unwrap();
         let pk2 = cached_public_key(&vote_addr).unwrap();
         assert!(Arc::ptr_eq(&pk1, &pk2));
