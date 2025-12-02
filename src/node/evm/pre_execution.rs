@@ -53,6 +53,13 @@ static SNAPSHOT_FINGERPRINT_CACHE: LazyLock<Mutex<SnapshotFingerprintCache>> =
 static BLS_PUBKEY_CACHE: LazyLock<Mutex<BlsPublicKeyCache>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+#[cfg(test)]
+fn reset_attestation_caches() {
+    ATTESTATION_VERIFY_CACHE.lock().unwrap().clear();
+    SNAPSHOT_FINGERPRINT_CACHE.lock().unwrap().clear();
+    BLS_PUBKEY_CACHE.lock().unwrap().clear();
+}
+
 fn snapshot_fingerprint(snap: &Snapshot) -> B256 {
     {
         let cache = SNAPSHOT_FINGERPRINT_CACHE.lock().unwrap();
@@ -633,5 +640,89 @@ where
             self.inner_ctx.validators_election_info = Some(validator_election_info);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::consensus::parlia::snapshot::ValidatorInfo;
+    use crate::consensus::parlia::vote::{VoteAttestation, VoteData, VoteSignature};
+    use alloy_primitives::{Address, U256};
+    use bytes::Bytes;
+
+    fn b256_from_u64(value: u64) -> B256 {
+        U256::from(value).into()
+    }
+
+    fn build_snapshot(block_hash: u64, vote_addr_seed: u8) -> Snapshot {
+        let mut addr_bytes = [0u8; 20];
+        addr_bytes[12..].copy_from_slice(&0xdeadbeefu64.to_be_bytes());
+        let validator = Address::from(addr_bytes);
+        let mut snapshot = Snapshot::default();
+        snapshot.block_hash = b256_from_u64(block_hash);
+        snapshot.block_number = block_hash;
+        snapshot.validators = vec![validator];
+        snapshot.validators_map.insert(
+            validator,
+            ValidatorInfo { index: 1, vote_addr: VoteAddress::from([vote_addr_seed; 48]) },
+        );
+        snapshot
+    }
+
+    #[test]
+    fn snapshot_fingerprint_cached_per_block_hash() {
+        reset_attestation_caches();
+
+        let snap = build_snapshot(1, 1);
+        let fp1 = snapshot_fingerprint(&snap);
+        {
+            let cache = SNAPSHOT_FINGERPRINT_CACHE.lock().unwrap();
+            assert_eq!(cache.len(), 1);
+            assert_eq!(cache.get(&snap.block_hash), Some(&fp1));
+        }
+
+        let fp2 = snapshot_fingerprint(&snap);
+        assert_eq!(fp1, fp2);
+        assert_eq!(SNAPSHOT_FINGERPRINT_CACHE.lock().unwrap().len(), 1);
+
+        let snap2 = build_snapshot(2, 2);
+        let _fp3 = snapshot_fingerprint(&snap2);
+        assert_eq!(SNAPSHOT_FINGERPRINT_CACHE.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn cached_public_key_reuses_arc() {
+        reset_attestation_caches();
+        let vote_addr = VoteAddress::from([7u8; 48]);
+        let pk1 = cached_public_key(&vote_addr).unwrap();
+        let pk2 = cached_public_key(&vote_addr).unwrap();
+        assert!(Arc::ptr_eq(&pk1, &pk2));
+    }
+
+    #[test]
+    fn attestation_cache_key_changes_on_input() {
+        let mut attestation = VoteAttestation {
+            vote_address_set: 0b11,
+            agg_signature: VoteSignature::from([9u8; 96]),
+            data: VoteData {
+                source_number: 1,
+                source_hash: b256_from_u64(1),
+                target_number: 2,
+                target_hash: b256_from_u64(2),
+            },
+            extra: Bytes::new(),
+        };
+
+        let fp1 = b256_from_u64(10);
+        let fp2 = b256_from_u64(11);
+
+        let key1 = attestation_cache_key(fp1, &attestation);
+        let key2 = attestation_cache_key(fp2, &attestation);
+        assert_ne!(key1, key2, "snapshot fingerprint participates in the key");
+
+        attestation.vote_address_set = 0b01;
+        let key3 = attestation_cache_key(fp1, &attestation);
+        assert_ne!(key1, key3, "vote bitset participates in the key");
     }
 }
