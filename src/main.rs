@@ -149,6 +149,10 @@ fn main() -> eyre::Result<()> {
                     mining_config.gas_limit = Some(gas_limit);
                 }
 
+                if let Err(err) = mining_config.derive_validator_address_from_keys() {
+                    return Err(eyre::eyre!(err));
+                }
+
                 // Ensure keys are available if enabled but none provided
                 mining_config = mining_config.ensure_keys_available();
 
