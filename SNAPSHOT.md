@@ -4,7 +4,7 @@
 
 Currently, snapshots are available for archive node configurations of the BSC Reth client. Please note that as the client is in active development, snapshot updates do not follow a fixed schedule and will be released as they become available.
 
-The Snapshot for BSC mainnet fullnde configuration will be released soon.
+The Snapshot for BSC mainnet fullnode configuration will be released soon.
 
 ## Building from Source
 
@@ -34,6 +34,8 @@ After building, the binary will be located at `./target/maxperf/reth-bsc`.
 | Archive | BSC-TestNet | [bsc-reth-archivenode-testnet-64665542.tar.gz](https://pub-c0627345c16f47ab858c9469133073a8.r2.dev/bsc-reth-archivenode-testnet-64665542.tar.gz) | 392 GiB | - |
 | Full | BSC-TestNet | [bsc-reth-testnet-63271461.tar.gz](https://pub-c5400abe5bed4adbaf8cd47467747e74.r2.dev/bsc-reth-testnet-63271461.tar.gz) | 232 GiB | - |
 | Full | BSC-MainNet | coming soon | - | - |
+| Full TrieDb | BSC-TestNet | [75105967_testnet_fullnode.tar.zst](https://pub-c5400abe5bed4adbaf8cd47467747e74.r2.dev/75105967_testnet_fullnode.tar.zst) | 259 GiB | - |
+| Full TrieDb | BSC-MainNet | [69615424_mainnet__fullnode.tar.zst](https://pub-c5400abe5bed4adbaf8cd47467747e74.r2.dev/69615424_mainnet__fullnode.tar.zst) | 2.73 TiB | - |
 
 ## Installation Instructions
 
@@ -121,8 +123,9 @@ For single-file snapshots (TestNet Archive, TestNet FullNode):
 
 - **Disk Space**: 
   - MainNet Archive: ~15TB+ free space
-  - TestNet Archive: ~1TB+ free space  
-  - TestNet FullNode: ~500GB+ free space
+  - MainNet FullNode: ~7TB+ free space
+  - TestNet Archive: ~1.5TB+ free space  
+  - TestNet FullNode: ~900GB+ free space
 - **Tools**: `zstd` (for .zst files), `tar`, `gzip` (for .tar.gz files)
 - **Network**: Stable internet connection for large file downloads
 
