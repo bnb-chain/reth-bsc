@@ -92,8 +92,6 @@ After downloading both snapshot files, follow these steps to set up your archive
    
    **Key parameters explained:**
    - `--engine.parallel-sparse-trie`: Enables parallel trie processing for better performance
-   - `--db.max-size=12TB`: Sets maximum database size (adjust based on your disk space)
-   - `--db.page-size=8KB`: Sets database page size for better performance
    - `--trusted-peers`: BSC mainnet trusted peer nodes for faster syncing
    - `--http.api`: Enabled RPC API modules (add/remove as needed)
 
