@@ -13,45 +13,55 @@ name = "reth-bsc"
 path = "src/main.rs"
 
 [dependencies]
-reth = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.5" }
-reth-cli = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.5" }
-reth-cli-commands = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.5" }
-reth-basic-payload-builder = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.5" }
-reth-db = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.5" }
-reth-engine-local = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.5" }
-reth-chainspec = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.5" }
-reth-cli-util = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.5" }
-reth-discv4 = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.5", features = ["test-utils"] }
-reth-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.5" }
-reth-ethereum-forks = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.5", features = ["serde"] }
-reth-ethereum-payload-builder = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.5" }
-reth-payload-builder-primitives = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.5" }
-reth-chain-state = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.5" }
-reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.5" }
-reth-eth-wire = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.5" }
-reth-eth-wire-types = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.5" }
-reth-evm = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.5" }
-reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.5" }
-reth-metrics = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.5" }
-reth-node-core = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.5" }
-reth-revm = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.5" }
-reth-network = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.5", features = ["test-utils"] }
-reth-network-p2p = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.5" }
-reth-network-api = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.5" }
-reth-node-ethereum = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.5", features = ["test-utils"] }
-reth-network-peers = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.5" }
-reth-payload-primitives = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.5" }
-reth-ethereum-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.5" }
-reth-primitives = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.5" }
-reth-primitives-traits = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.5" }
-reth-provider = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.5", features = ["test-utils"] }
-reth-rpc-eth-api = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.5" }
-reth-rpc-engine-api = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.5" }
-reth-tracing = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.5" }
-reth-trie-common = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.5" }
-reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.5" }
-reth-tasks = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.5" }
-reth-transaction-pool = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.5" }
+reth = { git = "https://github.com/bnb-chain/reth", branch = "feat-delay-seal" }
+reth-cli = { git = "https://github.com/bnb-chain/reth", branch = "feat-delay-seal" }
+reth-cli-commands = { git = "https://github.com/bnb-chain/reth", branch = "feat-delay-seal" }
+reth-basic-payload-builder = { git = "https://github.com/bnb-chain/reth", branch = "feat-delay-seal" }
+reth-db = { git = "https://github.com/bnb-chain/reth", branch = "feat-delay-seal" }
+reth-engine-local = { git = "https://github.com/bnb-chain/reth", branch = "feat-delay-seal" }
+reth-chainspec = { git = "https://github.com/bnb-chain/reth", branch = "feat-delay-seal" }
+reth-cli-util = { git = "https://github.com/bnb-chain/reth", branch = "feat-delay-seal" }
+reth-discv4 = { git = "https://github.com/bnb-chain/reth", branch = "feat-delay-seal", features = [
+    "test-utils",
+] }
+reth-engine-primitives = { git = "https://github.com/bnb-chain/reth", branch = "feat-delay-seal" }
+reth-ethereum-forks = { git = "https://github.com/bnb-chain/reth", branch = "feat-delay-seal", features = [
+    "serde",
+] }
+reth-ethereum-payload-builder = { git = "https://github.com/bnb-chain/reth", branch = "feat-delay-seal" }
+reth-payload-builder-primitives = { git = "https://github.com/bnb-chain/reth", branch = "feat-delay-seal" }
+reth-chain-state = { git = "https://github.com/bnb-chain/reth", branch = "feat-delay-seal" }
+reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth", branch = "feat-delay-seal" }
+reth-eth-wire = { git = "https://github.com/bnb-chain/reth", branch = "feat-delay-seal" }
+reth-eth-wire-types = { git = "https://github.com/bnb-chain/reth", branch = "feat-delay-seal" }
+reth-evm = { git = "https://github.com/bnb-chain/reth", branch = "feat-delay-seal" }
+reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth", branch = "feat-delay-seal" }
+reth-metrics = { git = "https://github.com/bnb-chain/reth", branch = "feat-delay-seal" }
+reth-node-core = { git = "https://github.com/bnb-chain/reth", branch = "feat-delay-seal" }
+reth-revm = { git = "https://github.com/bnb-chain/reth", branch = "feat-delay-seal" }
+reth-network = { git = "https://github.com/bnb-chain/reth", branch = "feat-delay-seal", features = [
+    "test-utils",
+] }
+reth-network-p2p = { git = "https://github.com/bnb-chain/reth", branch = "feat-delay-seal" }
+reth-network-api = { git = "https://github.com/bnb-chain/reth", branch = "feat-delay-seal" }
+reth-node-ethereum = { git = "https://github.com/bnb-chain/reth", branch = "feat-delay-seal", features = [
+    "test-utils",
+] }
+reth-network-peers = { git = "https://github.com/bnb-chain/reth", branch = "feat-delay-seal" }
+reth-payload-primitives = { git = "https://github.com/bnb-chain/reth", branch = "feat-delay-seal" }
+reth-ethereum-engine-primitives = { git = "https://github.com/bnb-chain/reth", branch = "feat-delay-seal" }
+reth-primitives = { git = "https://github.com/bnb-chain/reth", branch = "feat-delay-seal" }
+reth-primitives-traits = { git = "https://github.com/bnb-chain/reth", branch = "feat-delay-seal" }
+reth-provider = { git = "https://github.com/bnb-chain/reth", branch = "feat-delay-seal", features = [
+    "test-utils",
+] }
+reth-rpc-eth-api = { git = "https://github.com/bnb-chain/reth", branch = "feat-delay-seal" }
+reth-rpc-engine-api = { git = "https://github.com/bnb-chain/reth", branch = "feat-delay-seal" }
+reth-tracing = { git = "https://github.com/bnb-chain/reth", branch = "feat-delay-seal" }
+reth-trie-common = { git = "https://github.com/bnb-chain/reth", branch = "feat-delay-seal" }
+reth-trie-db = { git = "https://github.com/bnb-chain/reth", branch = "feat-delay-seal" }
+reth-tasks = { git = "https://github.com/bnb-chain/reth", branch = "feat-delay-seal" }
+reth-transaction-pool = { git = "https://github.com/bnb-chain/reth", branch = "feat-delay-seal" }
 revm = "29.0.0"
 
 # alloy dependencies
@@ -160,9 +170,7 @@ asm-keccak = [
     "reth-node-ethereum/asm-keccak",
 ]
 
-io-uring = [
-    "reth/io-uring",
-]
+io-uring = ["reth/io-uring"]
 
 serde = [
     "alloy-chains/serde",
