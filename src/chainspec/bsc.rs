@@ -45,7 +45,8 @@ mod tests {
     fn can_create_forkid() {
         let b = hex::decode("098d24ac").unwrap();
         let expected = [b[0], b[1], b[2], b[3]];
-        let expected_f_id = ForkId { hash: ForkHash(expected), next: 9999999999 };
+        // The next fork after head() (timestamp 1751250600, which is Maxwell fork) is Fermi at 1768357800
+        let expected_f_id = ForkId { hash: ForkHash(expected), next: 1768357800 };
 
         let fork_id = bsc_mainnet().fork_id(&head());
         assert_eq!(fork_id, expected_f_id);
