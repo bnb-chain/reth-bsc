@@ -33,7 +33,7 @@ After building, the binary will be located at `./target/maxperf/reth-bsc`.
 | Archive | BSC-MainNet | [reth_static_files_20251126.tar.zst](https://pub-c5400abe5bed4adbaf8cd47467747e74.r2.dev/reth_static_files_20251126.tar.zst) <br> [reth_db_20251126.tar.zst](https://pub-c5400abe5bed4adbaf8cd47467747e74.r2.dev/reth_db_20251126.tar.zst) | 1.828 TiB <br> 2.286 TiB | `--db.max-size=12TB` <br> `--db.page-size=8KB` |
 | Archive | BSC-TestNet | [bsc-reth-archivenode-testnet-64665542.tar.gz](https://pub-c0627345c16f47ab858c9469133073a8.r2.dev/bsc-reth-archivenode-testnet-64665542.tar.gz) | 392 GiB | - |
 | Full | BSC-TestNet | [bsc-reth-testnet-63271461.tar.gz](https://pub-c5400abe5bed4adbaf8cd47467747e74.r2.dev/bsc-reth-testnet-63271461.tar.gz) | 232 GiB | - |
-| Full | BSC-MainNet | coming soon | - | - |
+| Full | BSC-MainNet | [reth_full_static_files_20251201.tar.zst](https://pub-c5400abe5bed4adbaf8cd47467747e74.r2.dev/reth_full_static_files_20251201.tar.zst) <br> [reth_full_db_20251201.tar.zst](https://pub-c5400abe5bed4adbaf8cd47467747e74.r2.dev/reth_full_db_20251201.tar.zst) | 1.241 TiB <br> 1.095 TiB | - |
 | Full TrieDb | BSC-TestNet | [75105967_testnet_fullnode.tar.zst](https://pub-c5400abe5bed4adbaf8cd47467747e74.r2.dev/75105967_testnet_fullnode.tar.zst) | 259 GiB | - |
 | Full TrieDb | BSC-MainNet | [69615424_mainnet__fullnode.tar.zst](https://pub-c5400abe5bed4adbaf8cd47467747e74.r2.dev/69615424_mainnet__fullnode.tar.zst) | 2.73 TiB | - |
 
