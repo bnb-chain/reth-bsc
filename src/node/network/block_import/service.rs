@@ -132,12 +132,15 @@ where
 
         tracing::debug!(target: "bsc::block_import", "New payload: block = ({:?}, {:?}), peer_id = {:?}", block.block.0.block.header.number, block.block.0.block.header.hash_slow(), peer_id);
         Box::pin(async move {
+            let new_payload_start = std::time::Instant::now();
             let sealed_block = block.block.0.block.clone().seal();
             let header = sealed_block.header().clone();
             let payload = BscPayloadTypes::block_to_payload(sealed_block);
             match engine.new_payload(payload).await {
                 Ok(payload_status) => match payload_status.status {
                     PayloadStatusEnum::Valid => {
+                        let new_payload_duration = new_payload_start.elapsed().as_secs_f64();
+                        forkchoice_engine.blockchain_metrics.new_payload_execution_duration.record(new_payload_duration);
                         tracing::trace!(target: "bsc::block_import", "New payload is valid, block = {:?}, peer_id = {:?}", block, peer_id);
                         // handle fork choice update with valid payload
                         if let Err(e) = forkchoice_engine.update_forkchoice(&header).await {

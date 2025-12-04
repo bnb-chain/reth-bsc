@@ -162,6 +162,15 @@ pub struct BscMinerMetrics {
     
     /// Total number of blocks produced
     pub blocks_produced_total: Counter,
+
+    /// Package tx duration in seconds (equivalent to miner/packageTx/duration)
+    pub package_tx_duration: Histogram,
+
+    /// Build payload duration in seconds (equivalent to miner/buildPayload/duration)
+    pub generate_state_root_duration: Histogram,
+    
+    /// Assemble block duration in seconds (equivalent to miner/assembleBlock/duration)
+    pub assemble_block_duration: Histogram,
 }
 
 /// Metrics for BSC fast finality
@@ -212,6 +221,12 @@ pub struct BscBlockchainMetrics {
     
     /// Depth of the latest chain reorganization
     pub latest_reorg_depth: Gauge,
+
+    /// Fork choice duration in seconds (equivalent to consensus/forkchoice/duration)
+    pub consensus_fcu_duration: Histogram,
+
+    /// New payload execution duration in seconds (equivalent to miner/newPayload/execution)
+    pub new_payload_execution_duration: Histogram,
 }
 
 #[cfg(test)]

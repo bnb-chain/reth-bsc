@@ -470,6 +470,7 @@ where
         let transactions = &sealed_block.body().inner.transactions;
         
         let build_duration = build_start.elapsed();
+        MINER_METRICS.package_tx_duration.record(build_duration.as_secs_f64());
         let avg_tx_duration_micros = if !transactions.is_empty() {
             build_duration.as_micros() / transactions.len() as u128
         } else {
@@ -594,6 +595,7 @@ where
         MINER_METRICS.blocks_produced_total.increment(1);
         
         let build_duration = build_start.elapsed();
+        MINER_METRICS.package_tx_duration.record(build_duration.as_secs_f64());
         
         debug!(
             target: "payload_builder",

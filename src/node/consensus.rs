@@ -305,7 +305,7 @@ pub struct BscForkChoiceEngine<P> {
     /// Finality metrics
     finality_metrics: BscFinalityMetrics,
     /// Blockchain metrics (including reorg metrics)
-    blockchain_metrics: BscBlockchainMetrics,
+    pub(crate) blockchain_metrics: BscBlockchainMetrics,
 }
 
 impl<P> BscForkChoiceEngine<P>
@@ -347,6 +347,7 @@ where
     ///
     /// Returns `Ok(())` if the fork choice was successfully updated, or an error if the update failed.
     pub async fn update_forkchoice(&self, incoming_header: &Header) -> Result<(), ParliaConsensusErr> {
+        let fcu_start = std::time::Instant::now();
         tracing::debug!(
             target: "bsc::forkchoice",
             block_number = incoming_header.number,
@@ -416,10 +417,14 @@ where
         
         match self.engine_handle.fork_choice_updated(state, None, EngineApiMessageVersion::default()).await
         {
-            Ok(response) => match response.payload_status.status {
-                PayloadStatusEnum::Invalid { validation_error } => 
-                    Err(ParliaConsensusErr::ForkChoiceUpdateError(validation_error)),
-                _ => Ok(()),
+            Ok(response) => {
+                let fcu_duration = fcu_start.elapsed().as_secs_f64();
+                self.blockchain_metrics.consensus_fcu_duration.record(fcu_duration);
+                match response.payload_status.status {
+                    PayloadStatusEnum::Invalid { validation_error } => 
+                        Err(ParliaConsensusErr::ForkChoiceUpdateError(validation_error)),
+                    _ => Ok(()),
+                }
             },
             Err(err) => Err(ParliaConsensusErr::ForkChoiceUpdateError(err.to_string())),
         }
