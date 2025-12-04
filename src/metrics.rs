@@ -171,6 +171,12 @@ pub struct BscMinerMetrics {
     
     /// Assemble block duration in seconds (equivalent to miner/assembleBlock/duration)
     pub assemble_block_duration: Histogram,
+
+    /// Finish duration in seconds (equivalent to miner/finish/duration)
+    pub finish_duration: Histogram,
+
+    /// State root duration in seconds (equivalent to miner/stateRoot/duration)
+    pub state_root_duration: Histogram,
 }
 
 /// Metrics for BSC fast finality

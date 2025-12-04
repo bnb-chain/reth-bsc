@@ -230,6 +230,17 @@ where
         let assemble_duration = assemble_start.elapsed();
         
         let finish_duration = finish_start.elapsed();
+
+        // Update miner metrics
+        {
+            use once_cell::sync::Lazy;
+            use crate::metrics::BscMinerMetrics;
+            static MINER_METRICS: Lazy<BscMinerMetrics> = Lazy::new(BscMinerMetrics::default);
+            MINER_METRICS.finish_duration.record(finish_duration.as_secs_f64());
+            MINER_METRICS.state_root_duration.record(state_root_duration.as_secs_f64());
+            MINER_METRICS.assemble_block_duration.record(assemble_duration.as_secs_f64());
+        }
+
         tracing::debug!(
             target: "bsc::builder",
             block_number = %block.header.number,
