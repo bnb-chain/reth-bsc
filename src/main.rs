@@ -30,7 +30,7 @@ pub struct BscCliArgs {
     #[arg(long = "mining.gas-limit")]
     pub mining_gas_limit: Option<u64>,
 
-    /// Target gas limit for mined blocks (e.g., 30000000 for 30M, 140000000 for 140M)
+    /// Minimum gas tip for mined blocks (e.g., 1000000000 for 1G, 1000000000000 for 1T)
     #[arg(long = "mining.min-gas-tip")]
     pub mining_min_gas_tip: Option<u128>,
 
