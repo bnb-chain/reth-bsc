@@ -387,6 +387,14 @@ where
                             error = %error,
                             "Skipping nonce too low transaction"
                         );
+                        best_tx_list.mark_invalid(
+                            &pool_tx,
+                            InvalidPoolTransactionError::Consensus(InvalidTransactionError::NonceNotConsistent {
+                                    tx: tx.nonce(),
+                                    state: 0_u64, // TODO: get the nonce from the state later.
+                                },
+                            ),
+                        );
                     } else {
                         // if the transaction is invalid, we can skip it and all of its
                         // descendants
