@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 use std::path::PathBuf;
 
+use crate::consensus::parlia::DEFAULT_MIN_GAS_TIP;
+
 /// Mining configuration for BSC PoSA
 #[derive(Clone, Serialize, Deserialize)]
 pub struct MiningConfig {
@@ -18,6 +20,8 @@ pub struct MiningConfig {
     pub private_key_hex: Option<String>,
     /// Block gas limit
     pub gas_limit: Option<u64>,
+    /// Minimum gas tip
+    pub min_gas_tip: Option<u128>,
     /// Submit built payload to the import service
     pub submit_built_payload: bool,
 }
@@ -37,6 +41,7 @@ impl std::fmt::Debug for MiningConfig {
                 &self.private_key_hex.as_ref().map(|_| "<redacted>")
             )
             .field("gas_limit", &self.gas_limit)
+            .field("min_gas_tip", &self.min_gas_tip)
             .field("submit_built_payload", &self.submit_built_payload)
             .finish()
     }
@@ -51,6 +56,7 @@ impl Default for MiningConfig {
             keystore_password: None,
             private_key_hex: None,
             gas_limit: Some(30_000_000),
+            min_gas_tip: Some(DEFAULT_MIN_GAS_TIP),
             submit_built_payload: false,
         }
     }
@@ -95,6 +101,10 @@ impl MiningConfig {
         })
     }
 
+    pub fn get_min_gas_tip(&self) -> u128 {
+        self.min_gas_tip.unwrap_or(DEFAULT_MIN_GAS_TIP)
+    }
+
     /// Generate a new validator configuration with random keys
     pub fn generate_for_development() -> Self {
         // use rand::Rng;
@@ -117,6 +127,7 @@ impl MiningConfig {
                 keystore_path: None,
                 keystore_password: None,
                 gas_limit: Some(30_000_000),
+                min_gas_tip: Some(DEFAULT_MIN_GAS_TIP),
                 submit_built_payload: false,
             }
         } else {
@@ -173,6 +184,10 @@ impl MiningConfig {
             .ok()
             .and_then(|v| v.parse().ok());
 
+        let min_gas_tip = std::env::var("BSC_MIN_GAS_TIP")
+            .ok()
+            .and_then(|v| v.parse().ok());
+
         let submit_built_payload = std::env::var("BSC_SUBMIT_BUILT_PAYLOAD")
             .ok()
             .map(|v| v.to_lowercase() == "true")
@@ -184,6 +199,7 @@ impl MiningConfig {
             keystore_path,
             keystore_password,
             gas_limit,
+            min_gas_tip,
             submit_built_payload,
             ..Default::default()
         };
