@@ -22,13 +22,96 @@ impl NodePrimitives for BscPrimitives {
 }
 
 /// BSC representation of a EIP-4844 sidecar.
-#[derive(Debug, Clone, PartialEq, Eq, RlpEncodable, RlpDecodable, Serialize, Deserialize)]
+///
+/// This struct is RLP-compatible with geth's `BlobSidecar` type, which uses
+/// an embedded struct that gets flattened during RLP encoding. The RLP format is:
+/// `[blobs, commitments, proofs, block_number, block_hash, tx_index, tx_hash]`
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BscBlobTransactionSidecar {
     pub inner: BlobTransactionSidecar,
     pub block_number: u64,
     pub block_hash: B256,
     pub tx_index: u64,
     pub tx_hash: B256,
+}
+
+// Manual RLP implementation to match geth's flattened encoding format
+mod sidecar_rlp {
+    use super::*;
+    use alloy_rlp::{Decodable, Encodable, Header};
+    use bytes::BufMut;
+
+    impl Encodable for BscBlobTransactionSidecar {
+        fn encode(&self, out: &mut dyn BufMut) {
+            // Calculate total payload length (flattened fields)
+            let payload_length = self.inner.blobs.length()
+                + self.inner.commitments.length()
+                + self.inner.proofs.length()
+                + self.block_number.length()
+                + self.block_hash.length()
+                + self.tx_index.length()
+                + self.tx_hash.length();
+
+            // Write RLP list header
+            Header { list: true, payload_length }.encode(out);
+
+            // Encode flattened fields (matching geth's embedded struct behavior)
+            self.inner.blobs.encode(out);
+            self.inner.commitments.encode(out);
+            self.inner.proofs.encode(out);
+            self.block_number.encode(out);
+            self.block_hash.encode(out);
+            self.tx_index.encode(out);
+            self.tx_hash.encode(out);
+        }
+
+        fn length(&self) -> usize {
+            let payload_length = self.inner.blobs.length()
+                + self.inner.commitments.length()
+                + self.inner.proofs.length()
+                + self.block_number.length()
+                + self.block_hash.length()
+                + self.tx_index.length()
+                + self.tx_hash.length();
+            Header { list: true, payload_length }.length() + payload_length
+        }
+    }
+
+    impl Decodable for BscBlobTransactionSidecar {
+        fn decode(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
+            let header = Header::decode(buf)?;
+            if !header.list {
+                return Err(alloy_rlp::Error::UnexpectedString);
+            }
+            if buf.len() < header.payload_length {
+                return Err(alloy_rlp::Error::InputTooShort);
+            }
+
+            let remaining = buf.len();
+
+            // Decode flattened fields (matching geth's embedded struct behavior)
+            let blobs = Decodable::decode(buf)?;
+            let commitments = Decodable::decode(buf)?;
+            let proofs = Decodable::decode(buf)?;
+            let block_number = Decodable::decode(buf)?;
+            let block_hash = Decodable::decode(buf)?;
+            let tx_index = Decodable::decode(buf)?;
+            let tx_hash = Decodable::decode(buf)?;
+
+            // Verify we consumed exactly the payload
+            if buf.len() + header.payload_length != remaining {
+                return Err(alloy_rlp::Error::UnexpectedLength);
+            }
+
+            Ok(Self {
+                inner: BlobTransactionSidecar { blobs, commitments, proofs },
+                block_number,
+                block_hash,
+                tx_index,
+                tx_hash,
+            })
+        }
+    }
 }
 
 /// Block body for BSC. It is equivalent to Ethereum [`BlockBody`] but additionally stores sidecars
@@ -238,6 +321,199 @@ mod rlp {
                 },
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::FixedBytes;
+    use alloy_rlp::{Decodable, Encodable};
+    use bytes::BytesMut;
+
+    /// Test that BscBlobTransactionSidecar RLP encoding produces a flattened format
+    /// compatible with geth's embedded struct encoding.
+    #[test]
+    fn test_bsc_blob_sidecar_rlp_roundtrip() {
+        let sidecar = BscBlobTransactionSidecar {
+            inner: BlobTransactionSidecar {
+                blobs: vec![],
+                commitments: vec![],
+                proofs: vec![],
+            },
+            block_number: 12345,
+            block_hash: B256::from([0xab; 32]),
+            tx_index: 7,
+            tx_hash: B256::from([0xcd; 32]),
+        };
+
+        let mut buf = BytesMut::new();
+        sidecar.encode(&mut buf);
+
+        let decoded = BscBlobTransactionSidecar::decode(&mut buf.as_ref()).unwrap();
+        assert_eq!(sidecar, decoded);
+    }
+
+    /// Test that the RLP encoding has the correct flattened structure.
+    /// geth encodes BlobSidecar as: [blobs, commitments, proofs, block_number, block_hash, tx_index, tx_hash]
+    /// This test verifies we produce exactly 7 top-level fields, not a nested structure.
+    #[test]
+    fn test_bsc_blob_sidecar_rlp_flattened_format() {
+        use alloy_rlp::Header;
+
+        let sidecar = BscBlobTransactionSidecar {
+            inner: BlobTransactionSidecar {
+                blobs: vec![],
+                commitments: vec![],
+                proofs: vec![],
+            },
+            block_number: 100,
+            block_hash: B256::ZERO,
+            tx_index: 0,
+            tx_hash: B256::ZERO,
+        };
+
+        let mut buf = BytesMut::new();
+        sidecar.encode(&mut buf);
+
+        // Decode the RLP header to verify it's a list
+        let mut slice = buf.as_ref();
+        let header = Header::decode(&mut slice).unwrap();
+        assert!(header.list, "Should encode as RLP list");
+
+        // Count the number of top-level items in the list
+        // geth format has 7 items: blobs, commitments, proofs, block_number, block_hash, tx_index, tx_hash
+        let mut count = 0;
+        while !slice.is_empty() {
+            let item_header = Header::decode(&mut slice).unwrap();
+            if item_header.list {
+                // Skip list contents
+                slice = &slice[item_header.payload_length..];
+            } else {
+                // Skip string/bytes contents
+                slice = &slice[item_header.payload_length..];
+            }
+            count += 1;
+        }
+
+        assert_eq!(count, 7, "Should have 7 top-level fields (flattened format), got {}", count);
+    }
+
+    /// Test with non-empty blobs to ensure proper encoding
+    #[test]
+    fn test_bsc_blob_sidecar_rlp_with_data() {
+        use alloy_eips::eip4844::{Blob, BYTES_PER_BLOB};
+
+        let blob = Blob::from([0x42; BYTES_PER_BLOB]);
+        let commitment = FixedBytes::<48>::from([0x11; 48]);
+        let proof = FixedBytes::<48>::from([0x22; 48]);
+
+        let sidecar = BscBlobTransactionSidecar {
+            inner: BlobTransactionSidecar {
+                blobs: vec![blob],
+                commitments: vec![commitment],
+                proofs: vec![proof],
+            },
+            block_number: 999999,
+            block_hash: B256::from([0xff; 32]),
+            tx_index: 42,
+            tx_hash: B256::from([0xee; 32]),
+        };
+
+        let mut buf = BytesMut::new();
+        sidecar.encode(&mut buf);
+
+        let decoded = BscBlobTransactionSidecar::decode(&mut buf.as_ref()).unwrap();
+        assert_eq!(sidecar.inner.blobs.len(), decoded.inner.blobs.len());
+        assert_eq!(sidecar.inner.commitments, decoded.inner.commitments);
+        assert_eq!(sidecar.inner.proofs, decoded.inner.proofs);
+        assert_eq!(sidecar.block_number, decoded.block_number);
+        assert_eq!(sidecar.block_hash, decoded.block_hash);
+        assert_eq!(sidecar.tx_index, decoded.tx_index);
+        assert_eq!(sidecar.tx_hash, decoded.tx_hash);
+    }
+
+    /// Test BscBlock RLP roundtrip with sidecars
+    #[test]
+    fn test_bsc_block_rlp_with_sidecars() {
+        use alloy_eips::eip4844::{Blob, BYTES_PER_BLOB};
+        use reth_ethereum_primitives::BlockBody;
+
+        let blob = Blob::from([0x42; BYTES_PER_BLOB]);
+        let commitment = FixedBytes::<48>::from([0x11; 48]);
+        let proof = FixedBytes::<48>::from([0x22; 48]);
+
+        let sidecar = BscBlobTransactionSidecar {
+            inner: BlobTransactionSidecar {
+                blobs: vec![blob],
+                commitments: vec![commitment],
+                proofs: vec![proof],
+            },
+            block_number: 12345,
+            block_hash: B256::from([0xab; 32]),
+            tx_index: 0,
+            tx_hash: B256::from([0xcd; 32]),
+        };
+
+        let block = BscBlock {
+            header: Header::default(),
+            body: BscBlockBody {
+                inner: BlockBody::default(),
+                sidecars: Some(vec![sidecar]),
+            },
+        };
+
+        let mut buf = BytesMut::new();
+        block.encode(&mut buf);
+
+        let decoded = BscBlock::decode(&mut buf.as_ref()).unwrap();
+        assert_eq!(block.header, decoded.header);
+        assert!(decoded.body.sidecars.is_some());
+        let decoded_sidecars = decoded.body.sidecars.unwrap();
+        assert_eq!(decoded_sidecars.len(), 1);
+        assert_eq!(decoded_sidecars[0].block_number, 12345);
+        assert_eq!(decoded_sidecars[0].tx_index, 0);
+    }
+
+    /// Test that BscBlock RLP format matches geth's BlockData format:
+    /// [header, txs, uncles, withdrawals?, sidecars?]
+    #[test]
+    fn test_bsc_block_rlp_format_matches_geth_blockdata() {
+        use alloy_rlp::Header;
+        use reth_ethereum_primitives::BlockBody;
+
+        // Block without optional fields
+        let block = BscBlock {
+            header: alloy_consensus::Header::default(),
+            body: BscBlockBody {
+                inner: BlockBody::default(),
+                sidecars: None,
+            },
+        };
+
+        let mut buf = BytesMut::new();
+        block.encode(&mut buf);
+
+        // Decode RLP structure and count top-level fields
+        let mut slice = buf.as_ref();
+        let header = Header::decode(&mut slice).unwrap();
+        assert!(header.list, "BscBlock should encode as RLP list");
+
+        // Count fields: header, txs, uncles (minimum 3 fields)
+        let mut count = 0;
+        while !slice.is_empty() {
+            let item_header = Header::decode(&mut slice).unwrap();
+            if item_header.list {
+                slice = &slice[item_header.payload_length..];
+            } else {
+                slice = &slice[item_header.payload_length..];
+            }
+            count += 1;
+        }
+
+        // geth's BlockData has: Header, Txs, Uncles, Withdrawals?, Sidecars?
+        // Without optional fields, we should have 3 fields
+        assert!(count >= 3, "BscBlock should have at least 3 fields (header, txs, uncles), got {}", count);
     }
 }
 
