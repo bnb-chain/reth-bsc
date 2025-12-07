@@ -6,7 +6,7 @@ use crate::node::engine::BscBuiltPayload;
 use crate::node::evm::config::BscEvmConfig;
 use crate::node::miner::bid_simulator::BidSimulator;
 use crate::node::miner::bsc_miner::{MiningContext, SubmitContext};
-use crate::node::pool::BlacklistedAddressError;
+use crate::node::pool::{BlacklistedAddressError, StaleNonceError};
 use reth_provider::StateProviderFactory;
 use reth_revm::{database::StateProviderDatabase, db::State};
 use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
@@ -387,14 +387,8 @@ where
                             error = %error,
                             "Skipping nonce too low transaction"
                         );
-                        best_tx_list.mark_invalid(
-                            &pool_tx,
-                            InvalidPoolTransactionError::Consensus(InvalidTransactionError::NonceNotConsistent {
-                                    tx: tx.nonce(),
-                                    state: 0_u64, // TODO: get the nonce from the state later.
-                                },
-                            ),
-                        );
+                        // Mark as a bad transaction so the pool can evict it permanently.
+                        best_tx_list.mark_invalid(&pool_tx, InvalidPoolTransactionError::other(StaleNonceError()));
                     } else {
                         // if the transaction is invalid, we can skip it and all of its
                         // descendants

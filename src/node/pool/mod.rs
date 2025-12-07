@@ -35,6 +35,20 @@ impl reth_transaction_pool::error::PoolTransactionError for BlacklistedAddressEr
 	}
 }
 
+/// Transaction pool stale nonce error: permanently evict txs with nonce lower than state
+#[derive(thiserror::Error, Debug)]
+#[error("stale nonce: tx nonce lower than state")]
+pub struct StaleNonceError ();
+
+impl reth_transaction_pool::error::PoolTransactionError for StaleNonceError {
+	fn is_bad_transaction(&self) -> bool {
+		true
+	}
+	fn as_any(&self) -> &dyn std::any::Any {
+		self
+	}
+}
+
 /// BSC transaction validator: add blacklist validation to the default Ethereum transaction validator.
 #[derive(Debug, Clone)]
 pub struct BscTxValidator<V> {
