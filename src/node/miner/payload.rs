@@ -389,6 +389,8 @@ where
                         );
                         // Mark as a bad transaction so the pool can evict it permanently.
                         best_tx_list.mark_invalid(&pool_tx, InvalidPoolTransactionError::other(StaleNonceError()));
+                        // remove the transaction from the pool so it can be evicted permanently.
+                        self.pool.remove_transactions(vec![*tx.hash()]);
                     } else {
                         // if the transaction is invalid, we can skip it and all of its
                         // descendants
