@@ -17,6 +17,9 @@ pub mod builder;
 pub mod payload;
 pub mod validator;
 
+#[cfg(test)]
+mod validator_tests;
+
 #[derive(Debug, Clone)]
 pub struct BscEngineApi {
     /// Handle to the beacon consensus engine
