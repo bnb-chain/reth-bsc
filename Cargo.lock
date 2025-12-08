@@ -1958,6 +1958,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bzip2-sys"
+version = "0.1.13+1.0.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "225bff33b2141874fe80d71e07d6eec4f85c5c216453dd96388240f96e1acc14"
+dependencies = [
+ "cc",
+ "pkg-config",
+]
+
+[[package]]
 name = "c-kzg"
 version = "2.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5080,6 +5090,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "librocksdb-sys"
+version = "0.17.3+10.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cef2a00ee60fe526157c9023edab23943fae1ce2ab6f4abb2a807c1746835de9"
+dependencies = [
+ "bindgen 0.72.1",
+ "bzip2-sys",
+ "cc",
+ "libc",
+ "libz-sys",
+ "lz4-sys",
+ "tikv-jemalloc-sys",
+ "zstd-sys",
+]
+
+[[package]]
 name = "libsecp256k1"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6900,7 +6926,7 @@ checksum = "6b3789b30bd25ba102de4beabd95d21ac45b69b1be7d14522bab988c526d6799"
 [[package]]
 name = "reth"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-rpc-types",
  "aquamarine",
@@ -6946,7 +6972,7 @@ dependencies = [
 [[package]]
 name = "reth-basic-payload-builder"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -6955,7 +6981,7 @@ dependencies = [
  "futures-util",
  "metrics",
  "reth-chain-state",
- "reth-metrics",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?rev=8f78c91)",
  "reth-payload-builder",
  "reth-payload-builder-primitives",
  "reth-payload-primitives",
@@ -6970,7 +6996,7 @@ dependencies = [
 [[package]]
 name = "reth-chain-state"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -6986,7 +7012,7 @@ dependencies = [
  "reth-errors",
  "reth-ethereum-primitives",
  "reth-execution-types",
- "reth-metrics",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?rev=8f78c91)",
  "reth-primitives-traits",
  "reth-storage-api",
  "reth-trie",
@@ -7001,7 +7027,7 @@ dependencies = [
 [[package]]
 name = "reth-chainspec"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-chains",
  "alloy-consensus",
@@ -7021,7 +7047,7 @@ dependencies = [
 [[package]]
 name = "reth-cli"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-genesis",
  "clap",
@@ -7035,7 +7061,7 @@ dependencies = [
 [[package]]
 name = "reth-cli-commands"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-chains",
  "alloy-consensus",
@@ -7103,6 +7129,7 @@ dependencies = [
  "reth-trie",
  "reth-trie-common",
  "reth-trie-db",
+ "rust-eth-triedb",
  "secp256k1 0.30.0",
  "serde",
  "serde_json",
@@ -7117,7 +7144,7 @@ dependencies = [
 [[package]]
 name = "reth-cli-runner"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "reth-tasks",
  "tokio",
@@ -7127,7 +7154,7 @@ dependencies = [
 [[package]]
 name = "reth-cli-util"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-eips",
  "alloy-primitives",
@@ -7145,7 +7172,7 @@ dependencies = [
 [[package]]
 name = "reth-codecs"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -7165,7 +7192,7 @@ dependencies = [
 [[package]]
 name = "reth-codecs-derive"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "convert_case 0.7.1",
  "proc-macro2",
@@ -7176,7 +7203,7 @@ dependencies = [
 [[package]]
 name = "reth-config"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "eyre",
  "humantime-serde",
@@ -7191,7 +7218,7 @@ dependencies = [
 [[package]]
 name = "reth-consensus"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",
@@ -7204,7 +7231,7 @@ dependencies = [
 [[package]]
 name = "reth-consensus-common"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -7216,7 +7243,7 @@ dependencies = [
 [[package]]
 name = "reth-consensus-debug-client"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -7241,7 +7268,7 @@ dependencies = [
 [[package]]
 name = "reth-db"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-primitives",
  "derive_more 2.0.1",
@@ -7252,7 +7279,7 @@ dependencies = [
  "reth-db-api",
  "reth-fs-util",
  "reth-libmdbx",
- "reth-metrics",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?rev=8f78c91)",
  "reth-nippy-jar",
  "reth-static-file-types",
  "reth-storage-errors",
@@ -7267,7 +7294,7 @@ dependencies = [
 [[package]]
 name = "reth-db-api"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-consensus",
  "alloy-genesis",
@@ -7295,11 +7322,12 @@ dependencies = [
 [[package]]
 name = "reth-db-common"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-consensus",
  "alloy-genesis",
  "alloy-primitives",
+ "alloy-trie",
  "boyer-moore-magiclen",
  "eyre",
  "reth-chainspec",
@@ -7316,6 +7344,9 @@ dependencies = [
  "reth-static-file-types",
  "reth-trie",
  "reth-trie-db",
+ "rust-eth-triedb",
+ "rust-eth-triedb-common",
+ "rust-eth-triedb-state-trie",
  "serde",
  "serde_json",
  "thiserror 2.0.17",
@@ -7325,7 +7356,7 @@ dependencies = [
 [[package]]
 name = "reth-db-models"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-eips",
  "alloy-primitives",
@@ -7340,7 +7371,7 @@ dependencies = [
 [[package]]
 name = "reth-discv4"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -7366,7 +7397,7 @@ dependencies = [
 [[package]]
 name = "reth-discv5"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -7379,7 +7410,7 @@ dependencies = [
  "rand 0.9.2",
  "reth-chainspec",
  "reth-ethereum-forks",
- "reth-metrics",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?rev=8f78c91)",
  "reth-network-peers",
  "secp256k1 0.30.0",
  "thiserror 2.0.17",
@@ -7390,7 +7421,7 @@ dependencies = [
 [[package]]
 name = "reth-dns-discovery"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-primitives",
  "data-encoding",
@@ -7414,7 +7445,7 @@ dependencies = [
 [[package]]
 name = "reth-downloaders"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -7431,7 +7462,7 @@ dependencies = [
  "reth-db",
  "reth-db-api",
  "reth-ethereum-primitives",
- "reth-metrics",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?rev=8f78c91)",
  "reth-network-p2p",
  "reth-network-peers",
  "reth-primitives-traits",
@@ -7449,7 +7480,7 @@ dependencies = [
 [[package]]
 name = "reth-ecies"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "aes",
  "alloy-primitives",
@@ -7480,7 +7511,7 @@ dependencies = [
 [[package]]
 name = "reth-engine-local"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",
@@ -7502,7 +7533,7 @@ dependencies = [
 [[package]]
 name = "reth-engine-primitives"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -7527,7 +7558,7 @@ dependencies = [
 [[package]]
 name = "reth-engine-service"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "futures",
  "pin-project",
@@ -7550,7 +7581,7 @@ dependencies = [
 [[package]]
 name = "reth-engine-tree"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -7573,7 +7604,7 @@ dependencies = [
  "reth-ethereum-primitives",
  "reth-evm",
  "reth-execution-types",
- "reth-metrics",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?rev=8f78c91)",
  "reth-network-p2p",
  "reth-payload-builder",
  "reth-payload-primitives",
@@ -7594,6 +7625,7 @@ dependencies = [
  "reth-trie-sparse-parallel",
  "revm",
  "revm-primitives",
+ "rust-eth-triedb",
  "schnellru",
  "smallvec",
  "thiserror 2.0.17",
@@ -7604,7 +7636,7 @@ dependencies = [
 [[package]]
 name = "reth-engine-util"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-consensus",
  "alloy-rpc-types-engine",
@@ -7632,7 +7664,7 @@ dependencies = [
 [[package]]
 name = "reth-era"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -7648,7 +7680,7 @@ dependencies = [
 [[package]]
 name = "reth-era-downloader"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-primitives",
  "bytes 1.10.1",
@@ -7663,7 +7695,7 @@ dependencies = [
 [[package]]
 name = "reth-era-utils"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",
@@ -7685,7 +7717,7 @@ dependencies = [
 [[package]]
 name = "reth-errors"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "reth-consensus",
  "reth-execution-errors",
@@ -7696,7 +7728,7 @@ dependencies = [
 [[package]]
 name = "reth-eth-wire"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-chains",
  "alloy-primitives",
@@ -7710,7 +7742,7 @@ dependencies = [
  "reth-ecies",
  "reth-eth-wire-types",
  "reth-ethereum-forks",
- "reth-metrics",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?rev=8f78c91)",
  "reth-network-peers",
  "reth-primitives-traits",
  "serde",
@@ -7725,7 +7757,7 @@ dependencies = [
 [[package]]
 name = "reth-eth-wire-types"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-chains",
  "alloy-consensus",
@@ -7749,7 +7781,7 @@ dependencies = [
 [[package]]
 name = "reth-ethereum-cli"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "clap",
  "eyre",
@@ -7771,7 +7803,7 @@ dependencies = [
 [[package]]
 name = "reth-ethereum-consensus"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -7787,7 +7819,7 @@ dependencies = [
 [[package]]
 name = "reth-ethereum-engine-primitives"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-eips",
  "alloy-primitives",
@@ -7805,7 +7837,7 @@ dependencies = [
 [[package]]
 name = "reth-ethereum-forks"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-eip2124",
  "alloy-hardforks",
@@ -7819,7 +7851,7 @@ dependencies = [
 [[package]]
 name = "reth-ethereum-payload-builder"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -7848,7 +7880,7 @@ dependencies = [
 [[package]]
 name = "reth-ethereum-primitives"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -7866,7 +7898,7 @@ dependencies = [
 [[package]]
 name = "reth-etl"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "rayon",
  "reth-db-api",
@@ -7876,7 +7908,7 @@ dependencies = [
 [[package]]
 name = "reth-evm"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -7888,7 +7920,7 @@ dependencies = [
  "metrics",
  "reth-execution-errors",
  "reth-execution-types",
- "reth-metrics",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?rev=8f78c91)",
  "reth-primitives-traits",
  "reth-storage-api",
  "reth-storage-errors",
@@ -7899,7 +7931,7 @@ dependencies = [
 [[package]]
 name = "reth-evm-ethereum"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -7921,7 +7953,7 @@ dependencies = [
 [[package]]
 name = "reth-execution-errors"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-evm",
  "alloy-primitives",
@@ -7934,7 +7966,7 @@ dependencies = [
 [[package]]
 name = "reth-execution-types"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -7952,7 +7984,7 @@ dependencies = [
 [[package]]
 name = "reth-exex"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -7969,7 +8001,7 @@ dependencies = [
  "reth-evm",
  "reth-exex-types",
  "reth-fs-util",
- "reth-metrics",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?rev=8f78c91)",
  "reth-node-api",
  "reth-node-core",
  "reth-payload-builder",
@@ -7990,7 +8022,7 @@ dependencies = [
 [[package]]
 name = "reth-exex-types"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-eips",
  "alloy-primitives",
@@ -8004,7 +8036,7 @@ dependencies = [
 [[package]]
 name = "reth-fs-util"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "serde",
  "serde_json",
@@ -8014,7 +8046,7 @@ dependencies = [
 [[package]]
 name = "reth-invalid-block-hooks"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",
@@ -8041,7 +8073,7 @@ dependencies = [
 [[package]]
 name = "reth-ipc"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "bytes 1.10.1",
  "futures",
@@ -8061,7 +8093,7 @@ dependencies = [
 [[package]]
 name = "reth-libmdbx"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "bitflags 2.10.0",
  "byteorder",
@@ -8078,7 +8110,7 @@ dependencies = [
 [[package]]
 name = "reth-mdbx-sys"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "bindgen 0.70.1",
  "cc",
@@ -8087,7 +8119,19 @@ dependencies = [
 [[package]]
 name = "reth-metrics"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
+dependencies = [
+ "futures",
+ "metrics",
+ "metrics-derive",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "reth-metrics"
+version = "1.7.0"
+source = "git+https://github.com/bnb-chain/reth.git#4a05b101e0759038cb29b261595292532e582be2"
 dependencies = [
  "futures",
  "metrics",
@@ -8099,7 +8143,7 @@ dependencies = [
 [[package]]
 name = "reth-net-banlist"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-primitives",
 ]
@@ -8107,7 +8151,7 @@ dependencies = [
 [[package]]
 name = "reth-net-nat"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "futures-util",
  "if-addrs",
@@ -8121,7 +8165,7 @@ dependencies = [
 [[package]]
 name = "reth-network"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -8150,7 +8194,7 @@ dependencies = [
  "reth-ethereum-forks",
  "reth-ethereum-primitives",
  "reth-fs-util",
- "reth-metrics",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?rev=8f78c91)",
  "reth-net-banlist",
  "reth-network-api",
  "reth-network-p2p",
@@ -8176,7 +8220,7 @@ dependencies = [
 [[package]]
 name = "reth-network-api"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",
@@ -8201,7 +8245,7 @@ dependencies = [
 [[package]]
 name = "reth-network-p2p"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -8224,7 +8268,7 @@ dependencies = [
 [[package]]
 name = "reth-network-peers"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -8239,7 +8283,7 @@ dependencies = [
 [[package]]
 name = "reth-network-types"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-eip2124",
  "humantime-serde",
@@ -8253,7 +8297,7 @@ dependencies = [
 [[package]]
 name = "reth-nippy-jar"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "anyhow",
  "bincode",
@@ -8270,7 +8314,7 @@ dependencies = [
 [[package]]
 name = "reth-node-api"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-rpc-types-engine",
  "eyre",
@@ -8294,7 +8338,7 @@ dependencies = [
 [[package]]
 name = "reth-node-builder"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -8352,6 +8396,7 @@ dependencies = [
  "reth-tokio-util",
  "reth-tracing",
  "reth-transaction-pool",
+ "rust-eth-triedb",
  "secp256k1 0.30.0",
  "serde_json",
  "tokio",
@@ -8362,7 +8407,7 @@ dependencies = [
 [[package]]
 name = "reth-node-core"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -8414,7 +8459,7 @@ dependencies = [
 [[package]]
 name = "reth-node-ethereum"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-eips",
  "alloy-network",
@@ -8452,7 +8497,7 @@ dependencies = [
 [[package]]
 name = "reth-node-ethstats"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",
@@ -8476,7 +8521,7 @@ dependencies = [
 [[package]]
 name = "reth-node-events"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -8500,7 +8545,7 @@ dependencies = [
 [[package]]
 name = "reth-node-metrics"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "eyre",
  "http 1.3.1",
@@ -8510,7 +8555,7 @@ dependencies = [
  "metrics-process",
  "metrics-util",
  "procfs 0.17.0",
- "reth-metrics",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?rev=8f78c91)",
  "reth-tasks",
  "tikv-jemalloc-ctl",
  "tokio",
@@ -8521,7 +8566,7 @@ dependencies = [
 [[package]]
 name = "reth-node-types"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "reth-chainspec",
  "reth-db-api",
@@ -8533,7 +8578,7 @@ dependencies = [
 [[package]]
 name = "reth-optimism-primitives"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -8552,7 +8597,7 @@ dependencies = [
 [[package]]
 name = "reth-payload-builder"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",
@@ -8561,7 +8606,7 @@ dependencies = [
  "metrics",
  "reth-chain-state",
  "reth-ethereum-engine-primitives",
- "reth-metrics",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?rev=8f78c91)",
  "reth-payload-builder-primitives",
  "reth-payload-primitives",
  "reth-primitives-traits",
@@ -8573,7 +8618,7 @@ dependencies = [
 [[package]]
 name = "reth-payload-builder-primitives"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "pin-project",
  "reth-payload-primitives",
@@ -8585,7 +8630,7 @@ dependencies = [
 [[package]]
 name = "reth-payload-primitives"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-eips",
  "alloy-primitives",
@@ -8604,7 +8649,7 @@ dependencies = [
 [[package]]
 name = "reth-payload-validator"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-consensus",
  "alloy-rpc-types-engine",
@@ -8614,7 +8659,7 @@ dependencies = [
 [[package]]
 name = "reth-primitives"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-consensus",
  "c-kzg",
@@ -8628,7 +8673,7 @@ dependencies = [
 [[package]]
 name = "reth-primitives-traits"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -8661,7 +8706,7 @@ dependencies = [
 [[package]]
 name = "reth-provider"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -8685,7 +8730,7 @@ dependencies = [
  "reth-evm",
  "reth-execution-types",
  "reth-fs-util",
- "reth-metrics",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?rev=8f78c91)",
  "reth-nippy-jar",
  "reth-node-types",
  "reth-primitives-traits",
@@ -8698,6 +8743,7 @@ dependencies = [
  "reth-trie-db",
  "revm-database",
  "revm-state",
+ "rust-eth-triedb",
  "strum 0.27.2",
  "tokio",
  "tracing",
@@ -8706,7 +8752,7 @@ dependencies = [
 [[package]]
 name = "reth-prune"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -8719,7 +8765,7 @@ dependencies = [
  "reth-db-api",
  "reth-errors",
  "reth-exex-types",
- "reth-metrics",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?rev=8f78c91)",
  "reth-primitives-traits",
  "reth-provider",
  "reth-prune-types",
@@ -8734,7 +8780,7 @@ dependencies = [
 [[package]]
 name = "reth-prune-types"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-primitives",
  "arbitrary",
@@ -8748,7 +8794,7 @@ dependencies = [
 [[package]]
 name = "reth-ress-protocol"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",
@@ -8767,7 +8813,7 @@ dependencies = [
 [[package]]
 name = "reth-ress-provider"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",
@@ -8794,7 +8840,7 @@ dependencies = [
 [[package]]
 name = "reth-revm"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-primitives",
  "reth-primitives-traits",
@@ -8807,7 +8853,7 @@ dependencies = [
 [[package]]
 name = "reth-rpc"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-consensus",
  "alloy-dyn-abi",
@@ -8851,7 +8897,7 @@ dependencies = [
  "reth-evm",
  "reth-evm-ethereum",
  "reth-execution-types",
- "reth-metrics",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?rev=8f78c91)",
  "reth-network-api",
  "reth-network-peers",
  "reth-network-types",
@@ -8871,6 +8917,7 @@ dependencies = [
  "revm",
  "revm-inspectors",
  "revm-primitives",
+ "rust-eth-triedb",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -8885,7 +8932,7 @@ dependencies = [
 [[package]]
 name = "reth-rpc-api"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-eips",
  "alloy-genesis",
@@ -8913,7 +8960,7 @@ dependencies = [
 [[package]]
 name = "reth-rpc-builder"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-network",
  "alloy-provider",
@@ -8926,7 +8973,7 @@ dependencies = [
  "reth-consensus",
  "reth-evm",
  "reth-ipc",
- "reth-metrics",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?rev=8f78c91)",
  "reth-network-api",
  "reth-node-core",
  "reth-primitives-traits",
@@ -8951,7 +8998,7 @@ dependencies = [
 [[package]]
 name = "reth-rpc-convert"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-consensus",
  "alloy-json-rpc",
@@ -8971,7 +9018,7 @@ dependencies = [
 [[package]]
 name = "reth-rpc-engine-api"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-eips",
  "alloy-primitives",
@@ -8983,7 +9030,7 @@ dependencies = [
  "parking_lot",
  "reth-chainspec",
  "reth-engine-primitives",
- "reth-metrics",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?rev=8f78c91)",
  "reth-payload-builder",
  "reth-payload-builder-primitives",
  "reth-payload-primitives",
@@ -9001,7 +9048,7 @@ dependencies = [
 [[package]]
 name = "reth-rpc-eth-api"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-consensus",
  "alloy-dyn-abi",
@@ -9038,6 +9085,7 @@ dependencies = [
  "reth-trie-common",
  "revm",
  "revm-inspectors",
+ "rust-eth-triedb",
  "tokio",
  "tracing",
 ]
@@ -9045,7 +9093,7 @@ dependencies = [
 [[package]]
 name = "reth-rpc-eth-types"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -9070,7 +9118,7 @@ dependencies = [
  "reth-ethereum-primitives",
  "reth-evm",
  "reth-execution-types",
- "reth-metrics",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?rev=8f78c91)",
  "reth-primitives-traits",
  "reth-revm",
  "reth-rpc-convert",
@@ -9092,7 +9140,7 @@ dependencies = [
 [[package]]
 name = "reth-rpc-layer"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-rpc-types-engine",
  "http 1.3.1",
@@ -9106,7 +9154,7 @@ dependencies = [
 [[package]]
 name = "reth-rpc-server-types"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-eips",
  "alloy-primitives",
@@ -9122,11 +9170,12 @@ dependencies = [
 [[package]]
 name = "reth-stages"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
  "alloy-primitives",
+ "alloy-trie",
  "bincode",
  "eyre",
  "futures-util",
@@ -9160,7 +9209,9 @@ dependencies = [
  "reth-storage-errors",
  "reth-testing-utils",
  "reth-trie",
+ "reth-trie-common",
  "reth-trie-db",
+ "rust-eth-triedb",
  "tempfile",
  "thiserror 2.0.17",
  "tokio",
@@ -9170,7 +9221,7 @@ dependencies = [
 [[package]]
 name = "reth-stages-api"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-eips",
  "alloy-primitives",
@@ -9180,7 +9231,7 @@ dependencies = [
  "metrics",
  "reth-consensus",
  "reth-errors",
- "reth-metrics",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?rev=8f78c91)",
  "reth-network-p2p",
  "reth-primitives-traits",
  "reth-provider",
@@ -9197,7 +9248,7 @@ dependencies = [
 [[package]]
 name = "reth-stages-types"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-primitives",
  "arbitrary",
@@ -9211,7 +9262,7 @@ dependencies = [
 [[package]]
 name = "reth-static-file"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-primitives",
  "parking_lot",
@@ -9231,7 +9282,7 @@ dependencies = [
 [[package]]
 name = "reth-static-file-types"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-primitives",
  "clap",
@@ -9243,7 +9294,7 @@ dependencies = [
 [[package]]
 name = "reth-storage-api"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -9266,7 +9317,7 @@ dependencies = [
 [[package]]
 name = "reth-storage-errors"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-eips",
  "alloy-primitives",
@@ -9282,7 +9333,7 @@ dependencies = [
 [[package]]
 name = "reth-tasks"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "auto_impl",
  "dyn-clone",
@@ -9290,7 +9341,7 @@ dependencies = [
  "metrics",
  "pin-project",
  "rayon",
- "reth-metrics",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?rev=8f78c91)",
  "thiserror 2.0.17",
  "tokio",
  "tracing",
@@ -9300,7 +9351,7 @@ dependencies = [
 [[package]]
 name = "reth-testing-utils"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -9316,7 +9367,7 @@ dependencies = [
 [[package]]
 name = "reth-tokio-util"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "tokio",
  "tokio-stream",
@@ -9326,7 +9377,7 @@ dependencies = [
 [[package]]
 name = "reth-tracing"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "clap",
  "eyre",
@@ -9341,7 +9392,7 @@ dependencies = [
 [[package]]
 name = "reth-transaction-pool"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -9362,7 +9413,7 @@ dependencies = [
  "reth-ethereum-primitives",
  "reth-execution-types",
  "reth-fs-util",
- "reth-metrics",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?rev=8f78c91)",
  "reth-primitives-traits",
  "reth-storage-api",
  "reth-tasks",
@@ -9382,7 +9433,7 @@ dependencies = [
 [[package]]
 name = "reth-trie"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -9393,7 +9444,7 @@ dependencies = [
  "itertools 0.14.0",
  "metrics",
  "reth-execution-errors",
- "reth-metrics",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?rev=8f78c91)",
  "reth-primitives-traits",
  "reth-stages-types",
  "reth-storage-errors",
@@ -9407,7 +9458,7 @@ dependencies = [
 [[package]]
 name = "reth-trie-common"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",
@@ -9426,6 +9477,8 @@ dependencies = [
  "reth-codecs",
  "reth-primitives-traits",
  "revm-database",
+ "rust-eth-triedb",
+ "rust-eth-triedb-state-trie",
  "serde",
  "serde_with",
 ]
@@ -9433,20 +9486,21 @@ dependencies = [
 [[package]]
 name = "reth-trie-db"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-primitives",
  "reth-db-api",
  "reth-execution-errors",
  "reth-primitives-traits",
  "reth-trie",
+ "rust-eth-triedb",
  "tracing",
 ]
 
 [[package]]
 name = "reth-trie-parallel"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -9456,7 +9510,7 @@ dependencies = [
  "rayon",
  "reth-db-api",
  "reth-execution-errors",
- "reth-metrics",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?rev=8f78c91)",
  "reth-provider",
  "reth-storage-errors",
  "reth-trie",
@@ -9471,7 +9525,7 @@ dependencies = [
 [[package]]
 name = "reth-trie-sparse"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -9480,7 +9534,7 @@ dependencies = [
  "metrics",
  "rayon",
  "reth-execution-errors",
- "reth-metrics",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?rev=8f78c91)",
  "reth-primitives-traits",
  "reth-trie-common",
  "smallvec",
@@ -9490,7 +9544,7 @@ dependencies = [
 [[package]]
 name = "reth-trie-sparse-parallel"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -9498,7 +9552,7 @@ dependencies = [
  "metrics",
  "rayon",
  "reth-execution-errors",
- "reth-metrics",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?rev=8f78c91)",
  "reth-trie-common",
  "reth-trie-sparse",
  "smallvec",
@@ -9508,7 +9562,7 @@ dependencies = [
 [[package]]
 name = "reth-zstd-compressors"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?rev=cbdace8f0210f3b0bad454d16d3368607dd4904a#cbdace8f0210f3b0bad454d16d3368607dd4904a"
+source = "git+https://github.com/bnb-chain/reth.git?rev=8f78c91#8f78c9196ab3bd4e544fdfe732a77d0fc868d4ef"
 dependencies = [
  "zstd",
 ]
@@ -9588,7 +9642,7 @@ dependencies = [
  "reth-ethereum-primitives",
  "reth-evm",
  "reth-evm-ethereum",
- "reth-metrics",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?rev=8f78c91)",
  "reth-network",
  "reth-network-api",
  "reth-network-p2p",
@@ -9951,6 +10005,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rocksdb"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ddb7af00d2b17dbd07d82c0063e25411959748ff03e8d4f96134c2ff41fce34f"
+dependencies = [
+ "libc",
+ "librocksdb-sys",
+]
+
+[[package]]
 name = "rolling-file"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10011,6 +10075,75 @@ name = "ruint-macro"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48fd7bd8a6377e15ad9d42a8ec25371b94ddc67abe7c8b9127bec79bebaaae18"
+
+[[package]]
+name = "rust-eth-triedb"
+version = "0.1.0"
+source = "git+https://github.com/bnb-chain/reth-bsc-triedb.git?tag=v0.0.1#2dc40833ebb7fe554a4bf9969abcdd41d2a47ca3"
+dependencies = [
+ "alloy-primitives",
+ "alloy-trie",
+ "metrics",
+ "once_cell",
+ "rayon",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git)",
+ "rust-eth-triedb-common",
+ "rust-eth-triedb-pathdb",
+ "rust-eth-triedb-state-trie",
+ "schnellru",
+ "serde",
+ "thiserror 1.0.69",
+ "tikv-jemallocator",
+ "tracing",
+]
+
+[[package]]
+name = "rust-eth-triedb-common"
+version = "0.1.0"
+source = "git+https://github.com/bnb-chain/reth-bsc-triedb.git?tag=v0.0.1#2dc40833ebb7fe554a4bf9969abcdd41d2a47ca3"
+dependencies = [
+ "alloy-primitives",
+ "auto_impl",
+ "thiserror 1.0.69",
+ "tikv-jemallocator",
+]
+
+[[package]]
+name = "rust-eth-triedb-pathdb"
+version = "0.1.0"
+source = "git+https://github.com/bnb-chain/reth-bsc-triedb.git?tag=v0.0.1#2dc40833ebb7fe554a4bf9969abcdd41d2a47ca3"
+dependencies = [
+ "alloy-primitives",
+ "alloy-trie",
+ "metrics",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git)",
+ "rocksdb",
+ "rust-eth-triedb-common",
+ "schnellru",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tikv-jemallocator",
+ "tracing",
+]
+
+[[package]]
+name = "rust-eth-triedb-state-trie"
+version = "0.1.0"
+source = "git+https://github.com/bnb-chain/reth-bsc-triedb.git?tag=v0.0.1#2dc40833ebb7fe554a4bf9969abcdd41d2a47ca3"
+dependencies = [
+ "alloy-primitives",
+ "alloy-rlp",
+ "alloy-trie",
+ "auto_impl",
+ "hex 0.4.3",
+ "rand 0.8.5",
+ "rayon",
+ "rust-eth-triedb-common",
+ "rust-eth-triedb-pathdb",
+ "thiserror 1.0.69",
+ "tikv-jemallocator",
+ "tracing",
+]
 
 [[package]]
 name = "rustc-demangle"
