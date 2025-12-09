@@ -31,19 +31,22 @@ jobs:
           target: ${{ matrix.target }}
           override: true
 
-      - name: Install MUSL toolchain (Ubuntu)
-        if: matrix.target == 'x86_64-unknown-linux-musl' && startsWith(matrix.os, 'ubuntu')
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Install system dependencies (Ubuntu)
+        if: startsWith(matrix.os, 'ubuntu') && matrix.target != 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y liburing-dev pkg-config libclang-dev
 
-      - name: Configure MUSL environment
+      - name: Install cross for MUSL builds
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: |
-          echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> $GITHUB_ENV
-          echo "AR_x86_64_unknown_linux_musl=ar" >> $GITHUB_ENV
-          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc" >> $GITHUB_ENV
+          cargo install cross --git https://github.com/cross-rs/cross
 
       - name: Build binary
-        run: cargo build --profile maxperf --features jemalloc,asm-keccak --target ${{ matrix.target }}
+        run: |
+          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-musl" ]; then
+            cross build --profile maxperf --features jemalloc,asm-keccak --target ${{ matrix.target }}
+          else
+            cargo build --profile maxperf --features jemalloc,asm-keccak --target ${{ matrix.target }}
+          fi
         env:
           RUSTFLAGS: ${{ matrix.target == 'x86_64-unknown-linux-gnu' && '-C strip=symbols -C target-cpu=native' || matrix.target == 'x86_64-unknown-linux-musl' && '-C strip=symbols -C target-feature=+crt-static -C default-linker-libraries -Clink-arg=-static-libgcc' || '-C strip=symbols' }}
 
