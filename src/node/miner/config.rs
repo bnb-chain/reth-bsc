@@ -1,7 +1,7 @@
 use alloy_primitives::Address;
 use serde::{Deserialize, Serialize};
-use std::sync::OnceLock;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use crate::consensus::parlia::DEFAULT_MIN_GAS_TIP;
 
@@ -24,6 +24,18 @@ pub struct MiningConfig {
     pub min_gas_tip: Option<u128>,
     /// Submit built payload to the import service
     pub submit_built_payload: bool,
+
+    // MEV related parameters
+    /// Validator commission rate (in basis points, 100 = 1%)
+    pub validator_commission: Option<u64>,
+    /// Bid simulation left over time in milliseconds
+    pub bid_simulation_left_over: Option<u64>,
+    /// No interrupt left over time in milliseconds
+    pub no_interrupt_left_over: Option<u64>,
+    /// Maximum bids per builder per block
+    pub max_bids_per_builder: Option<u32>,
+    /// Builder fee ceiling in wei (as hex string for large numbers)
+    pub builder_fee_ceil: Option<u128>,
 }
 
 impl std::fmt::Debug for MiningConfig {
@@ -32,17 +44,16 @@ impl std::fmt::Debug for MiningConfig {
             .field("enabled", &self.enabled)
             .field("validator_address", &self.validator_address)
             .field("keystore_path", &self.keystore_path)
-            .field(
-                "keystore_password",
-                &self.keystore_password.as_ref().map(|_| "<redacted>")
-            )
-            .field(
-                "private_key_hex",
-                &self.private_key_hex.as_ref().map(|_| "<redacted>")
-            )
+            .field("keystore_password", &self.keystore_password.as_ref().map(|_| "<redacted>"))
+            .field("private_key_hex", &self.private_key_hex.as_ref().map(|_| "<redacted>"))
             .field("gas_limit", &self.gas_limit)
             .field("min_gas_tip", &self.min_gas_tip)
             .field("submit_built_payload", &self.submit_built_payload)
+            .field("validator_commission", &self.validator_commission)
+            .field("bid_simulation_left_over", &self.bid_simulation_left_over)
+            .field("no_interrupt_left_over", &self.no_interrupt_left_over)
+            .field("max_bids_per_builder", &self.max_bids_per_builder)
+            .field("builder_fee_ceil", &self.builder_fee_ceil)
             .finish()
     }
 }
@@ -58,6 +69,12 @@ impl Default for MiningConfig {
             gas_limit: Some(30_000_000),
             min_gas_tip: Some(DEFAULT_MIN_GAS_TIP),
             submit_built_payload: false,
+            // MEV defaults
+            validator_commission: Some(400),    // 4%
+            bid_simulation_left_over: Some(50), // 50ms
+            no_interrupt_left_over: Some(500),  // 500ms
+            max_bids_per_builder: Some(3),
+            builder_fee_ceil: Some(1_000_000_000_000_000_000), // 1 BNB
         }
     }
 }
@@ -71,7 +88,9 @@ impl MiningConfig {
 
         // For mining, a key source is required; validator_address can be derived from the key.
         if self.keystore_path.is_none() && self.private_key_hex.is_none() {
-            return Err("Mining enabled but no keystore_path or private_key_hex specified".to_string());
+            return Err(
+                "Mining enabled but no keystore_path or private_key_hex specified".to_string()
+            );
         }
 
         if self.keystore_path.is_some() && self.keystore_password.is_none() {
@@ -94,9 +113,9 @@ impl MiningConfig {
     pub fn get_gas_limit(&self, chain_id: u64) -> u64 {
         self.gas_limit.unwrap_or({
             match chain_id {
-                56 => 140_000_000,  // BSC mainnet
-                97 => 100_000_000,  // BSC testnet  
-                _ => 40_000_000,    // Local development
+                56 => 140_000_000, // BSC mainnet
+                97 => 100_000_000, // BSC testnet
+                _ => 40_000_000,   // Local development
             }
         })
     }
@@ -105,10 +124,37 @@ impl MiningConfig {
         self.min_gas_tip.unwrap_or(DEFAULT_MIN_GAS_TIP)
     }
 
+    // MEV parameter getters with defaults
+
+    /// Get validator commission rate (in basis points, 100 = 1%)
+    pub fn get_validator_commission(&self) -> u64 {
+        self.validator_commission.unwrap_or(400) // Default: 4%
+    }
+
+    /// Get bid simulation left over time in milliseconds
+    pub fn get_bid_simulation_left_over(&self) -> u64 {
+        self.bid_simulation_left_over.unwrap_or(50) // Default: 50ms
+    }
+
+    /// Get no interrupt left over time in milliseconds
+    pub fn get_no_interrupt_left_over(&self) -> u64 {
+        self.no_interrupt_left_over.unwrap_or(500) // Default: 500ms
+    }
+
+    /// Get maximum bids per builder per block
+    pub fn get_max_bids_per_builder(&self) -> u32 {
+        self.max_bids_per_builder.unwrap_or(3) // Default: 3
+    }
+
+    /// Get builder fee ceiling in wei
+    pub fn get_builder_fee_ceil(&self) -> u128 {
+        self.builder_fee_ceil.unwrap_or(1_000_000_000_000_000_000) // Default: 1 BNB
+    }
+
     /// Generate a new validator configuration with random keys
     pub fn generate_for_development() -> Self {
         // use rand::Rng;
-        
+
         // Generate random 32-byte private key
         // let mut rng = rand::rng();
         // let private_key: [u8; 32] = rng.random();
@@ -119,7 +165,7 @@ impl MiningConfig {
         // Derive validator address from private key
         if let Ok(signing_key) = keystore::load_private_key_from_hex(private_key_hex) {
             let validator_address = keystore::get_validator_address(&signing_key);
-            
+
             Self {
                 enabled: true,
                 validator_address: Some(validator_address),
@@ -129,6 +175,12 @@ impl MiningConfig {
                 gas_limit: Some(30_000_000),
                 min_gas_tip: Some(DEFAULT_MIN_GAS_TIP),
                 submit_built_payload: false,
+                // Use default MEV parameters
+                validator_commission: Some(400),
+                bid_simulation_left_over: Some(50),
+                no_interrupt_left_over: Some(500),
+                max_bids_per_builder: Some(3),
+                builder_fee_ceil: Some(1_000_000_000_000_000_000),
             }
         } else {
             // Fallback to default if key generation fails
@@ -138,35 +190,31 @@ impl MiningConfig {
 
     /// Auto-generate keys if mining is enabled but no keys provided
     pub fn ensure_keys_available(mut self) -> Self {
-        if self.enabled && 
-           self.keystore_path.is_none() && 
-           self.private_key_hex.is_none() {
-            
+        if self.enabled && self.keystore_path.is_none() && self.private_key_hex.is_none() {
             tracing::info!("Mining enabled but no keys provided - generating development keys");
             let generated = Self::generate_for_development();
-            
+
             // Keep existing config but use generated keys
             self.validator_address = generated.validator_address;
             self.private_key_hex = generated.private_key_hex;
-            
+
             if let Some(addr) = self.validator_address {
                 tracing::warn!("AUTO-GENERATED validator keys for development:");
                 tracing::warn!("Validator Address: {}", addr);
-                tracing::warn!("Private Key: {} (KEEP SECURE!)", 
-                    self.private_key_hex.as_ref().unwrap());
+                tracing::warn!(
+                    "Private Key: {} (KEEP SECURE!)",
+                    self.private_key_hex.as_ref().unwrap()
+                );
                 tracing::warn!("These are DEVELOPMENT keys - do not use in production!");
             }
         }
-        
+
         self
     }
 
     /// Create a ready-to-use development mining configuration
     pub fn development() -> Self {
-        Self {
-            enabled: true,
-            ..Default::default()
-        }.ensure_keys_available()
+        Self { enabled: true, ..Default::default() }.ensure_keys_available()
     }
 
     /// Load configuration from environment variables
@@ -180,18 +228,30 @@ impl MiningConfig {
         let keystore_path = std::env::var("BSC_KEYSTORE_PATH").ok().map(Into::into);
         let keystore_password = std::env::var("BSC_KEYSTORE_PASSWORD").ok();
 
-        let gas_limit = std::env::var("BSC_GAS_LIMIT")
-            .ok()
-            .and_then(|v| v.parse().ok());
+        let gas_limit = std::env::var("BSC_GAS_LIMIT").ok().and_then(|v| v.parse().ok());
 
-        let min_gas_tip = std::env::var("BSC_MIN_GAS_TIP")
-            .ok()
-            .and_then(|v| v.parse().ok());
+        let min_gas_tip = std::env::var("BSC_MIN_GAS_TIP").ok().and_then(|v| v.parse().ok());
 
         let submit_built_payload = std::env::var("BSC_SUBMIT_BUILT_PAYLOAD")
             .ok()
             .map(|v| v.to_lowercase() == "true")
             .unwrap_or(false);
+
+        // MEV parameters from environment
+        let validator_commission =
+            std::env::var("BSC_VALIDATOR_COMMISSION").ok().and_then(|v| v.parse().ok());
+
+        let bid_simulation_left_over =
+            std::env::var("BSC_BID_SIMULATION_LEFT_OVER").ok().and_then(|v| v.parse().ok());
+
+        let no_interrupt_left_over =
+            std::env::var("BSC_NO_INTERRUPT_LEFT_OVER").ok().and_then(|v| v.parse().ok());
+
+        let max_bids_per_builder =
+            std::env::var("BSC_MAX_BIDS_PER_BUILDER").ok().and_then(|v| v.parse().ok());
+
+        let builder_fee_ceil =
+            std::env::var("BSC_BUILDER_FEE_CEIL").ok().and_then(|v| v.parse().ok());
 
         let mut cfg = Self {
             enabled,
@@ -201,6 +261,11 @@ impl MiningConfig {
             gas_limit,
             min_gas_tip,
             submit_built_payload,
+            validator_commission,
+            bid_simulation_left_over,
+            no_interrupt_left_over,
+            max_bids_per_builder,
+            builder_fee_ceil,
             ..Default::default()
         };
 
@@ -210,7 +275,9 @@ impl MiningConfig {
                 if let Ok(sk) = keystore::load_private_key_from_hex(pk_hex) {
                     cfg.validator_address = Some(keystore::get_validator_address(&sk));
                 }
-            } else if let (Some(ref path), Some(ref pass)) = (&cfg.keystore_path, &cfg.keystore_password) {
+            } else if let (Some(ref path), Some(ref pass)) =
+                (&cfg.keystore_path, &cfg.keystore_password)
+            {
                 if let Ok(sk) = keystore::load_private_key_from_keystore(path, pass) {
                     cfg.validator_address = Some(keystore::get_validator_address(&sk));
                 }
@@ -236,9 +303,9 @@ pub fn get_global_mining_config() -> Option<&'static MiningConfig> {
 
 /// Key management for validators
 pub mod keystore {
-    use alloy_primitives::Address;
-    use k256::ecdsa::{SigningKey, Signature, signature::Signer};
     use alloy_primitives::keccak256;
+    use alloy_primitives::Address;
+    use k256::ecdsa::{signature::Signer, Signature, SigningKey};
     use std::path::Path;
 
     /// Load private key from keystore file
@@ -261,11 +328,12 @@ pub mod keystore {
     pub fn load_private_key_from_hex(
         hex_key: &str,
     ) -> Result<SigningKey, Box<dyn std::error::Error + Send + Sync>> {
-        let key_bytes = alloy_primitives::hex::decode(hex_key.strip_prefix("0x").unwrap_or(hex_key))?;
+        let key_bytes =
+            alloy_primitives::hex::decode(hex_key.strip_prefix("0x").unwrap_or(hex_key))?;
         if key_bytes.len() != 32 {
             return Err("Private key must be 32 bytes".into());
         }
-        
+
         let signing_key = SigningKey::from_slice(&key_bytes)?;
         Ok(signing_key)
     }
@@ -281,8 +349,14 @@ pub mod keystore {
     /// Create signing function with loaded private key
     pub fn create_signing_function(
         signing_key: SigningKey,
-    ) -> impl Fn(Address, &str, &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> + Send + Sync + 'static {
-        move |_addr: Address, _mimetype: &str, data: &[u8]| -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> impl Fn(Address, &str, &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>
+           + Send
+           + Sync
+           + 'static {
+        move |_addr: Address,
+              _mimetype: &str,
+              data: &[u8]|
+              -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
             let hash = keccak256(data);
             let signature: Signature = signing_key.sign(hash.as_slice());
             Ok(signature.to_bytes().to_vec())
@@ -302,10 +376,12 @@ mod tests {
         config.enabled = true;
         assert!(config.validate().is_err()); // Enabled but no signing key configured
 
-        config.validator_address = Some("0x1234567890abcdef1234567890abcdef12345678".parse().unwrap());
+        config.validator_address =
+            Some("0x1234567890abcdef1234567890abcdef12345678".parse().unwrap());
         assert!(config.validate().is_err()); // Still no signing key specified
 
-        config.private_key_hex = Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string());
+        config.private_key_hex =
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string());
         assert!(config.validate().is_ok()); // Now properly configured
     }
 
@@ -314,7 +390,7 @@ mod tests {
         let test_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let signing_key = keystore::load_private_key_from_hex(test_key).unwrap();
         let address = keystore::get_validator_address(&signing_key);
-        
+
         // Verify we can get an address from the key
         assert_ne!(address, Address::ZERO);
     }
@@ -331,7 +407,8 @@ mod tests {
 
         // Write to a temporary file
         let mut path: PathBuf = std::env::temp_dir();
-        let fname = format!("UTC--test-{}--bcdd0d2cda5f6423e57b6a4dcd75decbe31aecf0", Uuid::new_v4());
+        let fname =
+            format!("UTC--test-{}--bcdd0d2cda5f6423e57b6a4dcd75decbe31aecf0", Uuid::new_v4());
         path.push(fname);
         {
             let mut f = fs::File::create(&path).unwrap();

@@ -1,20 +1,20 @@
+use crate::chainspec::BscChainSpec;
+use crate::consensus::parlia::SnapshotProvider;
+use crate::node::miner::bid_simulator::Bid;
+use crate::node::miner::config::keystore;
+use crate::node::miner::config::MiningConfig;
+use alloy_consensus::BlobTransactionSidecar;
+use alloy_consensus::Transaction;
+use alloy_consensus::{transaction::RlpEcdsaDecodableTx, TxEip4844WithSidecar};
+use alloy_primitives::Address;
+use alloy_primitives::{Bytes, B256, U256, U64};
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::proc_macros::rpc;
-use alloy_primitives::{B256,Bytes, U64, U256};
-use alloy_consensus::Transaction;
+use reth_chainspec::EthChainSpec;
 use reth_primitives::TransactionSigned;
 use reth_primitives_traits::SignerRecoverable;
 use std::sync::Arc;
-use crate::node::miner::bid_simulator::Bid;
-use crate::chainspec::BscChainSpec;
-use reth_chainspec::EthChainSpec;
 use tracing::debug;
-use crate::consensus::parlia::SnapshotProvider;
-use alloy_primitives::Address;
-use alloy_consensus::BlobTransactionSidecar;
-use alloy_consensus::{TxEip4844WithSidecar, transaction::RlpEcdsaDecodableTx};
-use crate::node::miner::config::MiningConfig;
-use crate::node::miner::config::keystore;
 
 /// Raw bid data structure from builder
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -59,14 +59,40 @@ pub struct BidArgs {
     pub pay_bid_tx_gas_used: U64,
 }
 
+/// MEV parameters returned by mev_params
+/// Matches geth-bsc implementation
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MevParams {
+    /// Validator commission rate (in basis points, e.g. 100 = 1%)
+    pub validator_commission: u64,
+    /// Time left for bid simulation in milliseconds
+    pub bid_simulation_left_over: U64,
+    /// Time left when bid cannot be interrupted in milliseconds
+    pub no_interrupt_left_over: U64,
+    /// Maximum number of bids allowed per builder per block
+    pub max_bids_per_builder: u32,
+    /// Gas ceiling for blocks (maximum gas limit)
+    pub gas_ceil: U64,
+    /// Minimum average gas price for bid block
+    pub gas_price: U256,
+    /// Maximum builder fee allowed
+    pub builder_fee_ceil: U256,
+    /// MEV service version
+    pub version: String,
+}
+
 /// Custom MEV API server trait - only includes send_bid to avoid conflicts with reth's default MEV API
 #[rpc(server, namespace = "mev")]
 pub trait BscMevApi {
     /// Send a bid to the builder
     #[method(name = "sendBid")]
     async fn send_bid(&self, bid: BidArgs) -> RpcResult<B256>;
-}
 
+    /// Get MEV parameters
+    #[method(name = "params")]
+    async fn params(&self) -> RpcResult<MevParams>;
+}
 
 const PAY_BID_TX_GAS_LIMIT: u64 = 25000;
 
@@ -75,6 +101,14 @@ pub struct MevApiImpl {
     snapshot_provider: Arc<dyn SnapshotProvider + Send + Sync>,
     chain_spec: Arc<BscChainSpec>,
     validator_address: Address,
+    validator_commission: u64,
+    bid_simulation_left_over: u64, // milliseconds
+    no_interrupt_left_over: u64,   // milliseconds
+    max_bids_per_builder: u32,
+    gas_ceil: u64,
+    min_gas_price: U256,
+    builder_fee_ceil: U256,
+    version: String,
 }
 
 impl MevApiImpl {
@@ -84,47 +118,70 @@ impl MevApiImpl {
         chain_spec: Arc<BscChainSpec>,
     ) -> Self {
         let mining_config =
-        if let Some(cfg) = crate::node::miner::config::get_global_mining_config() {
-            cfg.clone()
-        } else {
-            MiningConfig::from_env()
-        };
+            if let Some(cfg) = crate::node::miner::config::get_global_mining_config() {
+                cfg.clone()
+            } else {
+                MiningConfig::from_env()
+            };
 
+        // Get validator address from config
         let mut validator_address = mining_config.validator_address.unwrap_or(Address::ZERO);
-        
-        // Try to load signing key and derive validator address
-        if let Some(keystore_path) = &mining_config.keystore_path {
-            let password = mining_config.keystore_password.as_deref().unwrap_or("");
-            if let Ok(signing_key) = keystore::load_private_key_from_keystore(keystore_path, password) {
-                let derived_address = keystore::get_validator_address(&signing_key);
-                if derived_address != validator_address && validator_address != Address::ZERO {
-                    tracing::warn!(
-                        "Validator address mismatch, configured: {}, derived: {}",
-                        validator_address, derived_address
+
+        // Try to load signing key and derive validator address if not set
+        if validator_address == Address::ZERO {
+            if let Some(keystore_path) = &mining_config.keystore_path {
+                let password = mining_config.keystore_password.as_deref().unwrap_or("");
+                if let Ok(signing_key) =
+                    keystore::load_private_key_from_keystore(keystore_path, password)
+                {
+                    validator_address = keystore::get_validator_address(&signing_key);
+                    tracing::info!(
+                        "Derived validator address from keystore: {}",
+                        validator_address
                     );
                 }
-                validator_address = derived_address;
-                tracing::info!("Derived validator address from keystore: {}", derived_address);
-            } else {
-                tracing::warn!("Failed to load signing key from keystore");
-            }
-        } else if let Some(hex_key) = &mining_config.private_key_hex {
-            if let Ok(signing_key) = keystore::load_private_key_from_hex(hex_key) {
-                let derived_address = keystore::get_validator_address(&signing_key);
-                if derived_address != validator_address && validator_address != Address::ZERO {
-                    tracing::warn!(
-                        "Validator address mismatch, configured: {}, derived: {}",
-                        validator_address, derived_address
-                    );
+            } else if let Some(hex_key) = &mining_config.private_key_hex {
+                if let Ok(signing_key) = keystore::load_private_key_from_hex(hex_key) {
+                    validator_address = keystore::get_validator_address(&signing_key);
+                    tracing::info!("Derived validator address from hex key: {}", validator_address);
                 }
-                validator_address = derived_address;
-                tracing::info!("Derived validator address from hex key: {}", derived_address);
-            } else {
-                tracing::warn!("Failed to load signing key from hex");
             }
         }
-        
-        Self { snapshot_provider, chain_spec, validator_address }
+
+        // Get MEV parameters from config
+        let chain_id = chain_spec.chain().id();
+        let gas_ceil = mining_config.get_gas_limit(chain_id);
+        let min_gas_tip = mining_config.get_min_gas_tip();
+        let min_gas_price = U256::from(min_gas_tip);
+
+        // Get MEV parameters from mining config with fallback to defaults
+        let validator_commission = mining_config.get_validator_commission();
+        let bid_simulation_left_over = mining_config.get_bid_simulation_left_over();
+        let no_interrupt_left_over = mining_config.get_no_interrupt_left_over();
+        let max_bids_per_builder = mining_config.get_max_bids_per_builder();
+        let builder_fee_ceil = U256::from(mining_config.get_builder_fee_ceil());
+
+        // Version string
+        let version = env!("CARGO_PKG_VERSION").to_string();
+
+        tracing::info!(
+            "MEV API initialized: validator_address={}, validator_commission={}({}%), gas_ceil={}, min_gas_price={}, version={}",
+            validator_address, validator_commission, validator_commission as f64 / 100.0, gas_ceil, min_gas_price, version
+        );
+
+        Self {
+            snapshot_provider,
+            chain_spec,
+            validator_address,
+            validator_commission,
+            bid_simulation_left_over,
+            no_interrupt_left_over,
+            max_bids_per_builder,
+            gas_ceil,
+            min_gas_price,
+            builder_fee_ceil,
+            version,
+        }
     }
 
     /// Get header by number from global header provider
@@ -156,8 +213,7 @@ impl MevApiImpl {
 
         // Additional validation: ensure signature is valid
         // This will verify that the transaction can recover a valid signer
-        tx.recover_signer()
-            .map_err(|e| format!("Failed to recover transaction signer: {}", e))?;
+        tx.recover_signer().map_err(|e| format!("Failed to recover transaction signer: {}", e))?;
 
         Ok(tx)
     }
@@ -184,20 +240,20 @@ impl MevApiImpl {
 
         // EIP-2718 typed transaction envelope
         let tx_type = tx_bytes[0];
-        
+
         // For blob transactions (type 0x03), check if sidecar is included
         const BLOB_TX_TYPE: u8 = 0x03;
-        
+
         if tx_type == BLOB_TX_TYPE {
             debug!(
                 "Detected blob transaction, length: {}, first 64 bytes: {}",
                 tx_bytes.len(),
                 hex::encode(&tx_bytes[..tx_bytes.len().min(64)])
             );
-            
+
             // Try to decode with sidecar first
             let payload = &tx_bytes[1..]; // Skip type byte
-            
+
             match Self::try_decode_blob_tx_with_sidecar(payload) {
                 Ok((tx, sidecar)) => {
                     // Validate chain ID
@@ -210,21 +266,18 @@ impl MevApiImpl {
                             ));
                         }
                     }
-                    
+
                     // Validate signature
                     tx.recover_signer()
                         .map_err(|e| format!("Failed to recover transaction signer: {}", e))?;
-                    
+
                     debug!(
                         "Successfully decoded blob tx {:?} with sidecar ({} blobs)",
                         tx.hash(),
                         sidecar.blobs.len()
                     );
-                    
-                    return Ok(DecodedTransaction { 
-                        tx, 
-                        sidecar: Some(sidecar) 
-                    });
+
+                    return Ok(DecodedTransaction { tx, sidecar: Some(sidecar) });
                 }
                 Err(e) => {
                     debug!("Failed to decode with sidecar: {}, trying without", e);
@@ -232,10 +285,10 @@ impl MevApiImpl {
                 }
             }
         }
-        
+
         // Standard decoding (no sidecar)
         let tx = Self::parse_transaction(tx_bytes, chain_spec)?;
-        
+
         Ok(DecodedTransaction { tx, sidecar: None })
     }
 
@@ -245,46 +298,47 @@ impl MevApiImpl {
         payload: &[u8],
     ) -> Result<(TransactionSigned, BlobTransactionSidecar), String> {
         use alloy_consensus::Signed;
-        
+
         debug!(
             "Attempting to decode blob tx with sidecar using TxEip4844WithSidecar, payload length: {}",
             payload.len()
         );
-        
+
         let mut buf = payload;
-        
+
         // Decode using alloy's TxEip4844WithSidecar which handles the format:
         // rlp([tx_fields..., signature_fields, sidecar_fields])
-        let (tx_with_sidecar, signature) = TxEip4844WithSidecar::<BlobTransactionSidecar>::rlp_decode_with_signature(&mut buf)
-            .map_err(|e| {
-                debug!("Failed to decode TxEip4844WithSidecar: {}", e);
-                format!("Failed to decode transaction with sidecar: {}", e)
-            })?;
-        
+        let (tx_with_sidecar, signature) =
+            TxEip4844WithSidecar::<BlobTransactionSidecar>::rlp_decode_with_signature(&mut buf)
+                .map_err(|e| {
+                    debug!("Failed to decode TxEip4844WithSidecar: {}", e);
+                    format!("Failed to decode transaction with sidecar: {}", e)
+                })?;
+
         debug!(
             "Successfully decoded TxEip4844WithSidecar, blobs={}, remaining bytes={}",
             tx_with_sidecar.sidecar.blobs.len(),
             buf.len()
         );
-        
+
         // Convert to TransactionSigned
         // First get the inner TxEip4844 and sidecar
         let (eip4844_tx, sidecar) = tx_with_sidecar.into_parts();
-        
-        // Create a Signed<TxEip4844> 
+
+        // Create a Signed<TxEip4844>
         let signed_eip4844 = Signed::new_unhashed(eip4844_tx, signature);
-        
+
         // Convert to TransactionSigned via TxEnvelope
         use alloy_consensus::TxEnvelope;
         let envelope: TxEnvelope = signed_eip4844.into();
         let tx_signed = TransactionSigned::from(envelope);
-        
+
         debug!(
             "Converted to TransactionSigned: tx_hash={:?}, blobs={}",
             tx_signed.hash(),
             sidecar.blobs.len()
         );
-        
+
         Ok((tx_signed, sidecar))
     }
 
@@ -298,21 +352,25 @@ impl MevApiImpl {
         bid_hash: B256,
     ) -> Result<Bid, String> {
         use std::collections::HashMap;
-        
+
         // 1. Decode transactions from RawBid, extracting sidecars
         let mut txs = Vec::new();
         let mut blob_sidecars = HashMap::new();
-        
+
         for tx_bytes in &bid_args.raw_bid.txs {
             let decoded = Self::decode_transaction_with_sidecar(tx_bytes, chain_spec)?;
-            
+
             // Store sidecar if present
             if let Some(sidecar) = decoded.sidecar {
                 let tx_hash = *decoded.tx.hash();
-                debug!("Found blob sidecar for tx {:?} with {} blobs", tx_hash, sidecar.blobs.len());
+                debug!(
+                    "Found blob sidecar for tx {:?} with {} blobs",
+                    tx_hash,
+                    sidecar.blobs.len()
+                );
                 blob_sidecars.insert(tx_hash, sidecar);
             }
-            
+
             txs.push(decoded.tx);
         }
 
@@ -329,19 +387,27 @@ impl MevApiImpl {
         if !bid_args.pay_bid_tx.is_empty() {
             let decoded = Self::decode_transaction_with_sidecar(&bid_args.pay_bid_tx, chain_spec)
                 .map_err(|e| format!("Failed to parse PayBidTx: {}", e))?;
-            
+
             // Store sidecar if present
             if let Some(sidecar) = decoded.sidecar {
                 let tx_hash = *decoded.tx.hash();
-                debug!("Found blob sidecar for PayBidTx {:?} with {} blobs", tx_hash, sidecar.blobs.len());
+                debug!(
+                    "Found blob sidecar for PayBidTx {:?} with {} blobs",
+                    tx_hash,
+                    sidecar.blobs.len()
+                );
                 blob_sidecars.insert(tx_hash, sidecar);
             }
-            
+
             txs.push(decoded.tx);
         }
 
-        debug!("Decoded {} transactions with {} blob sidecars for bid", txs.len(), blob_sidecars.len());
-        
+        debug!(
+            "Decoded {} transactions with {} blob sidecars for bid",
+            txs.len(),
+            blob_sidecars.len()
+        );
+
         // 4. Create Bid object
         let bid = Bid {
             builder,
@@ -364,12 +430,12 @@ impl MevApiImpl {
     /// This matches the Go implementation: rlpHash(RawBid)
     fn calculate_raw_bid_hash(raw_bid: &RawBid) -> B256 {
         use alloy_primitives::keccak256;
-        use alloy_rlp::{Encodable};
-        
+        use alloy_rlp::Encodable;
+
         // RLP encode the RawBid structure
         // The structure is: [blockNumber, parentHash, txs, unRevertible, gasUsed, gasFee, builderFee]
         let mut rlp_buffer = Vec::new();
-        
+
         // First calculate the length of all encoded items
         let payload_length = raw_bid.block_number.length()
             + raw_bid.parent_hash.length()
@@ -378,14 +444,10 @@ impl MevApiImpl {
             + raw_bid.gas_used.length()
             + raw_bid.gas_fee.length()
             + raw_bid.builder_fee.length();
-        
+
         // Encode the list header
-        alloy_rlp::Header {
-            list: true,
-            payload_length,
-        }
-        .encode(&mut rlp_buffer);
-        
+        alloy_rlp::Header { list: true, payload_length }.encode(&mut rlp_buffer);
+
         // Encode each field
         raw_bid.block_number.encode(&mut rlp_buffer);
         raw_bid.parent_hash.encode(&mut rlp_buffer);
@@ -394,7 +456,7 @@ impl MevApiImpl {
         raw_bid.gas_used.encode(&mut rlp_buffer);
         raw_bid.gas_fee.encode(&mut rlp_buffer);
         raw_bid.builder_fee.encode(&mut rlp_buffer);
-        
+
         // Calculate keccak256 hash
         let hash = keccak256(&rlp_buffer);
         debug!("RawBid RLP encoded length: {}, hash: {:?}", rlp_buffer.len(), hash);
@@ -402,51 +464,52 @@ impl MevApiImpl {
     }
 
     /// Recover builder address from signature
-    fn recover_builder_address(raw_bid: &RawBid, signature: &alloy_primitives::Bytes) -> Result<alloy_primitives::Address, String> {
-        use secp256k1::{Message, Secp256k1};
+    fn recover_builder_address(
+        raw_bid: &RawBid,
+        signature: &alloy_primitives::Bytes,
+    ) -> Result<alloy_primitives::Address, String> {
         use alloy_primitives::keccak256;
-        
+        use secp256k1::{Message, Secp256k1};
+
         if signature.len() != 65 {
             return Err(format!("Invalid signature length: {}", signature.len()));
         }
-        
+
         // Calculate the hash of RawBid
         let hash = Self::calculate_raw_bid_hash(raw_bid);
-        
+
         // Create message from hash
         let message = Message::from_digest_slice(hash.as_slice())
             .map_err(|e| format!("Failed to create message: {}", e))?;
-        
+
         // Parse signature (r, s, v format - Ethereum style)
         let recovery_id = signature[64];
         // Ethereum uses v = 27 or 28, we need to convert to 0 or 1
-        let recovery_id_value = if recovery_id >= 27 {
-            recovery_id - 27
-        } else {
-            recovery_id
-        };
-        
+        let recovery_id_value = if recovery_id >= 27 { recovery_id - 27 } else { recovery_id };
+
         // Create RecoveryId from i32
         let recovery_id = secp256k1::ecdsa::RecoveryId::try_from(i32::from(recovery_id_value))
             .map_err(|e| format!("Invalid recovery id: {:?}", e))?;
-        
+
         let sig_bytes = &signature[..64];
-        let recoverable_sig = secp256k1::ecdsa::RecoverableSignature::from_compact(sig_bytes, recovery_id)
-            .map_err(|e| format!("Failed to parse signature: {}", e))?;
-        
+        let recoverable_sig =
+            secp256k1::ecdsa::RecoverableSignature::from_compact(sig_bytes, recovery_id)
+                .map_err(|e| format!("Failed to parse signature: {}", e))?;
+
         // Recover public key
         let secp = Secp256k1::new();
-        let public_key = secp.recover_ecdsa(&message, &recoverable_sig)
+        let public_key = secp
+            .recover_ecdsa(&message, &recoverable_sig)
             .map_err(|e| format!("Failed to recover public key: {}", e))?;
-        
+
         // Convert public key to address
         let public_key_bytes = public_key.serialize_uncompressed();
         // Skip the first byte (0x04) which is the uncompressed marker
         let public_key_hash = keccak256(&public_key_bytes[1..]);
-        
+
         // Take the last 20 bytes as the address
         let address = alloy_primitives::Address::from_slice(&public_key_hash[12..]);
-        
+
         Ok(address)
     }
 }
@@ -467,13 +530,13 @@ impl BscMevApiServer for MevApiImpl {
         // bid.raw_bid.parent_hash is the hash of the PARENT block (block_number - 1)
         let new_block_number: u64 = bid.raw_bid.block_number.to();
         let parent_block_number = new_block_number.saturating_sub(1);
-        
+
         // Get parent block header from chain (not from snapshot!)
         let parent_header = match self.get_header_by_number(parent_block_number) {
             Some(header) => header,
             None => {
                 tracing::error!(
-                    "Skip bid: parent block {} not found on chain", 
+                    "Skip bid: parent block {} not found on chain",
                     parent_block_number
                 );
                 return Err(jsonrpsee::types::ErrorObject::owned(
@@ -488,7 +551,7 @@ impl BscMevApiServer for MevApiImpl {
         let parent_hash = parent_header.hash_slow();
         if bid.raw_bid.parent_hash != parent_hash {
             tracing::error!(
-                "Skip bid: parent hash mismatch. Expected: {:?}, Got: {:?}, Block: {}", 
+                "Skip bid: parent hash mismatch. Expected: {:?}, Got: {:?}, Block: {}",
                 parent_hash,
                 bid.raw_bid.parent_hash,
                 new_block_number
@@ -500,8 +563,8 @@ impl BscMevApiServer for MevApiImpl {
             ));
         }
 
-         // Recover builder address from signature
-         let builder = match Self::recover_builder_address(&bid.raw_bid, &bid.signature) {
+        // Recover builder address from signature
+        let builder = match Self::recover_builder_address(&bid.raw_bid, &bid.signature) {
             Ok(addr) => addr,
             Err(e) => {
                 tracing::error!("Failed to recover builder address: {}", e);
@@ -513,7 +576,7 @@ impl BscMevApiServer for MevApiImpl {
             }
         };
         debug!("builder: {:?}", builder);
-        
+
         // Calculate bid hash (using RLP hash of RawBid)
         let bid_hash = Self::calculate_raw_bid_hash(&bid.raw_bid);
         debug!("bid_hash: {:?}", bid_hash);
@@ -523,12 +586,16 @@ impl BscMevApiServer for MevApiImpl {
         if let Some(snapshot) = self.snapshot_provider.snapshot_by_hash(&parent_hash) {
             // You can add validator checks here if needed
             tracing::debug!(
-                "Validator snapshot available for block {}, validators: {}", 
+                "Validator snapshot available for block {}, validators: {}",
                 parent_block_number,
                 snapshot.validators.len()
             );
             if !snapshot.is_inturn(self.validator_address) {
-                tracing::error!("Skip bid: validator is not inturn, block number: {}, validator address: {}", new_block_number, self.validator_address);
+                tracing::error!(
+                    "Skip bid: validator is not inturn, block number: {}, validator address: {}",
+                    new_block_number,
+                    self.validator_address
+                );
                 return Err(jsonrpsee::types::ErrorObject::owned(
                     -32602,
                     "Validator is not inturn",
@@ -542,8 +609,11 @@ impl BscMevApiServer for MevApiImpl {
             );
         }
 
-        if bid.raw_bid.gas_fee == 0 || bid.raw_bid.gas_used ==0{
-            tracing::error!("Skip to new bid due to gas fee or gas used is 0, block number: {}", new_block_number);
+        if bid.raw_bid.gas_fee == 0 || bid.raw_bid.gas_used == 0 {
+            tracing::error!(
+                "Skip to new bid due to gas fee or gas used is 0, block number: {}",
+                new_block_number
+            );
             return Err(jsonrpsee::types::ErrorObject::owned(
                 -32602,
                 "Gas fee or gas used is 0",
@@ -554,7 +624,10 @@ impl BscMevApiServer for MevApiImpl {
         if bid.raw_bid.builder_fee != 0 {
             let builder_fee = bid.raw_bid.builder_fee;
             if builder_fee < 0 {
-                tracing::error!("Skip to new bid due to builder fee is less than 0, block number: {}", new_block_number);
+                tracing::error!(
+                    "Skip to new bid due to builder fee is less than 0, block number: {}",
+                    new_block_number
+                );
                 return Err(jsonrpsee::types::ErrorObject::owned(
                     -32602,
                     "Builder fee is less than 0",
@@ -563,7 +636,10 @@ impl BscMevApiServer for MevApiImpl {
             }
 
             if builder_fee > bid.raw_bid.gas_fee {
-                tracing::error!("Skip to new bid due to builder fee is greater than gas fee, block number: {}", new_block_number);
+                tracing::error!(
+                    "Skip to new bid due to builder fee is greater than gas fee, block number: {}",
+                    new_block_number
+                );
                 return Err(jsonrpsee::types::ErrorObject::owned(
                     -32602,
                     "Builder fee is greater than gas fee",
@@ -573,7 +649,10 @@ impl BscMevApiServer for MevApiImpl {
         }
 
         if bid.pay_bid_tx.is_empty() || bid.pay_bid_tx_gas_used == 0 {
-            tracing::error!("Skip to new bid due to pay bid tx is empty or gas used is 0, block number: {}", new_block_number);
+            tracing::error!(
+                "Skip to new bid due to pay bid tx is empty or gas used is 0, block number: {}",
+                new_block_number
+            );
             return Err(jsonrpsee::types::ErrorObject::owned(
                 -32602,
                 "Pay bid tx is empty or gas used is 0",
@@ -613,7 +692,11 @@ impl BscMevApiServer for MevApiImpl {
         );
 
         // Submit to global bid queue
-        debug!("push bid package to queue bid_hash: {:?}, send time: {:?}", bid_hash, std::time::Instant::now());
+        debug!(
+            "push bid package to queue bid_hash: {:?}, send time: {:?}",
+            bid_hash,
+            std::time::Instant::now()
+        );
         if let Err(e) = crate::shared::push_bid_package(bid_obj) {
             tracing::error!("Failed to push bid package to queue: {}", e);
             return Err(jsonrpsee::types::ErrorObject::owned(
@@ -624,5 +707,22 @@ impl BscMevApiServer for MevApiImpl {
         }
 
         Ok(bid_hash)
+    }
+
+    /// Get MEV parameters
+    /// Returns the current MEV configuration matching geth-bsc implementation
+    async fn params(&self) -> RpcResult<MevParams> {
+        tracing::debug!("MEV params requested");
+
+        Ok(MevParams {
+            validator_commission: self.validator_commission,
+            bid_simulation_left_over: U64::from(self.bid_simulation_left_over),
+            no_interrupt_left_over: U64::from(self.no_interrupt_left_over),
+            max_bids_per_builder: self.max_bids_per_builder,
+            gas_ceil: U64::from(self.gas_ceil),
+            gas_price: self.min_gas_price,
+            builder_fee_ceil: self.builder_fee_ceil,
+            version: self.version.clone(),
+        })
     }
 }
