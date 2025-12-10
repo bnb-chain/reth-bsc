@@ -62,24 +62,51 @@ pub struct BidArgs {
 /// MEV parameters returned by mev_params
 /// Matches geth-bsc implementation
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct MevParams {
     /// Validator commission rate (in basis points, e.g. 100 = 1%)
+    #[serde(rename = "ValidatorCommission")]
     pub validator_commission: u64,
-    /// Time left for bid simulation in milliseconds
-    pub bid_simulation_left_over: U64,
-    /// Time left when bid cannot be interrupted in milliseconds
-    pub no_interrupt_left_over: U64,
+    /// Time left for bid simulation in nanoseconds
+    #[serde(rename = "BidSimulationLeftOver")]
+    pub bid_simulation_left_over: u64,
+    /// Time left when bid cannot be interrupted in nanoseconds
+    #[serde(rename = "NoInterruptLeftOver")]
+    pub no_interrupt_left_over: u64,
     /// Maximum number of bids allowed per builder per block
+    #[serde(rename = "MaxBidsPerBuilder")]
     pub max_bids_per_builder: u32,
-    /// Gas ceiling for blocks (maximum gas limit)
-    pub gas_ceil: U64,
-    /// Minimum average gas price for bid block
+    /// Gas ceiling for blocks (maximum gas limit) - decimal number
+    #[serde(rename = "GasCeil")]
+    pub gas_ceil: u64,
+    /// Minimum average gas price for bid block - decimal number
+    #[serde(rename = "GasPrice", serialize_with = "serialize_u256_as_decimal")]
     pub gas_price: U256,
-    /// Maximum builder fee allowed
+    /// Maximum builder fee allowed - decimal number
+    #[serde(rename = "BuilderFeeCeil", serialize_with = "serialize_u256_as_decimal")]
     pub builder_fee_ceil: U256,
     /// MEV service version
+    #[serde(rename = "Version")]
     pub version: String,
+}
+
+/// Serialize U256 as decimal number (not hex string)
+fn serialize_u256_as_decimal<S>(value: &U256, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    // Convert U256 to decimal string, then parse as u128 if possible
+    let decimal_str = value.to_string();
+
+    // Try to serialize as number if it fits in u64 (safe for JSON)
+    if let Ok(num) = decimal_str.parse::<u64>() {
+        serializer.serialize_u64(num)
+    } else if let Ok(num) = decimal_str.parse::<u128>() {
+        // For larger numbers, serialize as u128
+        serializer.serialize_u128(num)
+    } else {
+        // For very large numbers, serialize as string
+        serializer.serialize_str(&decimal_str)
+    }
 }
 
 /// Custom MEV API server trait - only includes send_bid to avoid conflicts with reth's default MEV API
@@ -92,6 +119,10 @@ pub trait BscMevApi {
     /// Get MEV parameters
     #[method(name = "params")]
     async fn params(&self) -> RpcResult<MevParams>;
+
+    /// Check if MEV is running
+    #[method(name = "running")]
+    async fn running(&self) -> RpcResult<bool>;
 }
 
 const PAY_BID_TX_GAS_LIMIT: u64 = 25000;
@@ -716,13 +747,21 @@ impl BscMevApiServer for MevApiImpl {
 
         Ok(MevParams {
             validator_commission: self.validator_commission,
-            bid_simulation_left_over: U64::from(self.bid_simulation_left_over),
-            no_interrupt_left_over: U64::from(self.no_interrupt_left_over),
+            // Convert milliseconds to nanoseconds (1ms = 1,000,000 ns)
+            bid_simulation_left_over: self.bid_simulation_left_over * 1_000_000,
+            no_interrupt_left_over: self.no_interrupt_left_over * 1_000_000,
             max_bids_per_builder: self.max_bids_per_builder,
-            gas_ceil: U64::from(self.gas_ceil),
+            gas_ceil: self.gas_ceil,
             gas_price: self.min_gas_price,
             builder_fee_ceil: self.builder_fee_ceil,
             version: self.version.clone(),
         })
+    }
+
+    /// Check if MEV is running
+    /// Returns true if MEV worker is active and accepting bids
+    async fn running(&self) -> RpcResult<bool> {
+        tracing::debug!("MEV running status requested");
+        Ok(crate::shared::is_mev_running())
     }
 }
