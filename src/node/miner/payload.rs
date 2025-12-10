@@ -724,10 +724,16 @@ where
             DELAY_LEFT_OVER);
 
         // Spawn a background task to listen for new transactions from pool
+        // When tx_listener_rx is dropped (job ends), tx_listener_tx.send() will fail,
+        // causing this task to exit and pool_listener to be dropped,
+        // which triggers cleanup of the listener in txpool via retain_mut.
         let mut pool_listener = builder.pool.pending_transactions_listener();
         tokio::spawn(async move {
             while let Some(tx_hash) = pool_listener.recv().await {
-                let _ = tx_listener_tx.send(tx_hash);
+                // If send fails, receiver is dropped (job ended), exit to cleanup listener
+                if tx_listener_tx.send(tx_hash).is_err() {
+                    break;
+                }
             }
         });
 
