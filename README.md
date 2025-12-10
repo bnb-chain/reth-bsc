@@ -59,6 +59,15 @@ An archive node stores the complete blockchain history and state:
 ./target/${profile}/reth-bsc node --chain bsc --datadir ./data_dir
 ```
 
+### TrieDB Node
+
+An triedb node uses RocksDB store state data:
+
+```bash
+./target/${profile}/reth-bsc node --chain bsc --datadir ./data_dir --statedb.triedb
+```
+
+
 ### BSC Testnet
 
 To run on BSC Testnet instead of Mainnet, simply replace `--chain bsc` with `--chain bsc-testnet` in any of the above commands:
