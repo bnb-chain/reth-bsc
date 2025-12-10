@@ -65,7 +65,6 @@ pub struct NewWorkWorker<Provider> {
     mining_queue_tx: mpsc::UnboundedSender<MiningContext>,
     consensus: Arc<Parlia<BscChainSpec>>,
     pre_cached: Option<PrecachedState>,
-    blockchain_metrics: crate::metrics::BscBlockchainMetrics,
 }
 
 impl<Provider> NewWorkWorker<Provider> 
@@ -94,7 +93,6 @@ where
             mining_queue_tx,
             consensus,
             pre_cached: None,
-            blockchain_metrics: crate::metrics::BscBlockchainMetrics::default(),
         }
     }
 
@@ -127,24 +125,6 @@ where
                     
                     // If this is a reorg event, validate it using bsc fork choice rules
                     if let CanonStateNotification::Reorg { old, new } = &event {
-                        // Record reorg metrics
-                        let old_len = old.len();
-                        let new_len = new.len();
-                        let reorg_depth = old_len.max(new_len);
-                        
-                        self.blockchain_metrics.reorg_executions_total.increment(1);
-                        self.blockchain_metrics.reorg_blocks_dropped_total.increment(old_len as u64);
-                        self.blockchain_metrics.reorg_blocks_added_total.increment(new_len as u64);
-                        self.blockchain_metrics.latest_reorg_depth.set(reorg_depth as f64);
-                        
-                        debug!(
-                            target: "bsc::miner",
-                            old_len,
-                            new_len,
-                            reorg_depth,
-                            "Reorg metrics recorded"
-                        );
-                        
                         match self.validate_reorg(old, new).await {
                             Ok(true) => {
                                 // Reorg is valid, proceed with mining
@@ -349,7 +329,7 @@ where
     where
         H: alloy_consensus::BlockHeader + Sealable,
     {
-        // todo: refine check is_syncing status.
+        // TODO: refine check is_syncing status.
         if tip.timestamp() < SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() - 3 {
             debug!("Skip to mine new block due to maybe in syncing, validator: {}, tip: {}", self.validator_address, tip.number());
             return;
@@ -441,6 +421,7 @@ pub struct MainWorkWorker<Pool, Provider> {
     payload_job_join_set: JoinSet<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
     simulator: Arc<BidSimulator<Provider, Pool>>,  // No outer RwLock, each map has its own lock
     desired_gas_limit: u64,
+    desired_min_gas_tip: u128,
 }
 
 impl<Pool, Provider> MainWorkWorker<Pool, Provider>
@@ -468,6 +449,7 @@ where
         simulator: Arc<BidSimulator<Provider, Pool>>,  // No outer RwLock needed
         payload_tx: mpsc::UnboundedSender<SubmitContext>,
         desired_gas_limit: u64,
+        desired_min_gas_tip: u128,
     ) -> Self {
         Self {
             pool,
@@ -481,6 +463,7 @@ where
             simulator,
             payload_job_join_set: JoinSet::new(),
             desired_gas_limit,
+            desired_min_gas_tip,
         }
     }
 
@@ -597,6 +580,7 @@ where
             config: PayloadConfig::new(Arc::new(mining_ctx.parent_header.clone()), attributes),
             cancel: ManualCancel::default(),
             trace_id: crate::node::miner::payload::generate_trace_id(),
+            min_gas_tip: self.desired_min_gas_tip,
         };
         
         let parent_hash = mining_ctx.parent_header.hash();
@@ -1087,7 +1071,8 @@ where
         
         let chain_id = chain_spec.as_ref().chain().id();
         let desired_gas_limit = mining_config.get_gas_limit(chain_id);
-        info!("Mining configuration: validator={}, chain_id={}, gas_limit={}", validator_address, chain_id, desired_gas_limit);
+        let desired_min_gas_tip = mining_config.get_min_gas_tip();
+        info!("Mining configuration: validator={}, chain_id={}, gas_limit={}, min_gas_tip={}", validator_address, chain_id, desired_gas_limit, desired_min_gas_tip);
         
         let parlia = Arc::new(crate::consensus::parlia::Parlia::new(chain_spec.clone(), 200));
         let new_work_worker = NewWorkWorker::new(
@@ -1110,6 +1095,7 @@ where
             simulator.clone(),
             payload_tx,
             desired_gas_limit,
+            desired_min_gas_tip,
         );
         
         let result_work_worker = ResultWorkWorker::new(

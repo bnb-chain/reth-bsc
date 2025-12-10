@@ -84,6 +84,8 @@ where
     pending_imports: FuturesUnordered<ImportFut>,
     /// Cache of processed block hashes to avoid reprocessing the same block.
     processed_blocks: LruCache<B256>,
+    /// Cache of queued block hashes to avoid processing the same block.
+    queued_blocks: LruCache<B256>,
     /// Cache of downloading block hashes to avoid re-downloading the same block.
     downloading_blocks: LruMap<B256, u128, ByLength>,
 }
@@ -121,6 +123,7 @@ where
             to_network,
             pending_imports: FuturesUnordered::new(),
             processed_blocks: LruCache::new(LRU_PROCESSED_BLOCKS_SIZE),
+            queued_blocks: LruCache::new(LRU_PROCESSED_BLOCKS_SIZE),
             downloading_blocks: LruMap::new(ByLength::new(LRU_PROCESSED_BLOCKS_SIZE)),
         }
     }
@@ -138,10 +141,12 @@ where
             match engine.new_payload(payload).await {
                 Ok(payload_status) => match payload_status.status {
                     PayloadStatusEnum::Valid => {
-                        tracing::trace!(target: "bsc::block_import", "New payload is valid, block = {:?}, peer_id = {:?}", block, peer_id);
+                        tracing::debug!(target: "bsc::block_import", "New payload is valid, block = {:?}, peer_id = {:?}", block, peer_id);
                         // handle fork choice update with valid payload
                         if let Err(e) = forkchoice_engine.update_forkchoice(&header).await {
                             tracing::warn!(target: "bsc::block_import", "Failed to update fork choice: {}", e);
+                        } else {
+                            tracing::debug!(target: "bsc::block_import", "Succeed to update fork choice for new payload: number = {:?}, hash = {:?}", header.number, header.hash_slow());
                         }
                         Outcome { peer: peer_id, result: Ok(BlockValidation::ValidBlock { block }) }
                             .into()
@@ -151,6 +156,48 @@ where
                         result: Err(BlockImportError::Other(validation_error.into())),
                     }
                     .into(),
+                    PayloadStatusEnum::Syncing => {
+                        // When new_payload returns Syncing status, we need to manually trigger FCU
+                        // to avoid the engine-tree being stuck in syncing state without any driver.
+                        // By calling FCU, we inform the engine about the new head block hash,
+                        // which can help trigger additional sync/download activities in the engine-tree.
+                        let block_hash = header.hash_slow();
+                        let block_number = header.number;
+                        tracing::debug!(
+                            target: "bsc::block_import",
+                            block_hash = %block_hash,
+                            block_number = block_number,
+                            "New payload returned Syncing status - attempting fork choice update"
+                        );
+                        
+                        // Direct FCU call to help sync progress
+                        let forkchoice_state = alloy_rpc_types::engine::ForkchoiceState {
+                            head_block_hash: block_hash,
+                            safe_block_hash: alloy_primitives::B256::ZERO,
+                            finalized_block_hash: alloy_primitives::B256::ZERO,
+                        };
+                        match engine.fork_choice_updated(forkchoice_state, None, reth_payload_primitives::EngineApiMessageVersion::V1).await {
+                            Ok(result) => {
+                                tracing::debug!(
+                                    target: "bsc::block_import",
+                                    block_hash = %block_hash,
+                                    block_number = block_number,
+                                    status = ?result.payload_status.status,
+                                    "FCU result for syncing block"
+                                );
+                            }
+                            Err(err) => {
+                                tracing::trace!(
+                                    target: "bsc::block_import", 
+                                    block_hash = %block_hash,
+                                    block_number = block_number,
+                                    error = %err,
+                                    "Failed to update fork choice for syncing block"
+                                );
+                            }
+                        }
+                        None
+                    }
                     _ => None,
                 },
                 Err(err) => None,
@@ -191,6 +238,8 @@ where
                 tracing::debug!(target: "bsc::block_import", "Updating fork choice for mined block: number = {:?}, hash = {:?}", header_for_fcu.number, header_for_fcu.hash_slow());
                 if let Err(e) = forkchoice_engine.update_forkchoice(&header_for_fcu).await {
                     tracing::warn!(target: "bsc::block_import", "Failed to update fork choice for mined block: number = {:?}, hash = {:?}, error = {}", header_for_fcu.number, header_for_fcu.hash_slow(), e);
+                } else {
+                    tracing::debug!(target: "bsc::block_import", "Succeed to update fork choice for mined block: number = {:?}, hash = {:?}", header_for_fcu.number, header_for_fcu.hash_slow());
                 }
             });
         }
@@ -201,8 +250,14 @@ where
     /// Add a new block import task to the pending imports
     fn on_new_block(&mut self, block: BlockMsg, peer_id: PeerId) {
         if self.processed_blocks.contains(&block.hash) {
+            tracing::trace!(target: "bsc::block_import", "Block already processed when receiving new block: number = {:?}, hash = {:?}", block.block.0.block.header.number, block.hash);
             return;
         }
+        if self.queued_blocks.contains(&block.hash) {
+            tracing::trace!(target: "bsc::block_import", "Block already queued when receiving new block: number = {:?}, hash = {:?}", block.block.0.block.header.number, block.hash);
+            return;
+        }
+        self.queued_blocks.insert(block.hash);
 
         // Send ValidHeader announcement to trigger NewBlock diffusion from few peers
         // TODO: add header validation later
@@ -210,6 +265,7 @@ where
             .to_network
             .send(BlockImportEvent::Announcement(BlockValidation::ValidHeader { block: block.clone() }));
 
+        tracing::debug!(target: "bsc::block_import", "Sending new block to import service: number = {:?}, hash = {:?}", block.block.0.block.header.number, block.hash);
         let payload_fut = self.new_payload(block.clone(), peer_id);
         self.pending_imports.push(payload_fut);
     }
@@ -221,13 +277,21 @@ where
         for hash_number in hash_numbers {
             // Skip if the block is already processed.
             if self.processed_blocks.contains(&hash_number.hash) {
+                tracing::trace!(target: "bsc::block_import", "Block already processed when requesting block hashes: number = {:?}, hash = {:?}", hash_number.number, hash_number.hash);
+                continue;
+            }
+            if self.queued_blocks.contains(&hash_number.hash) {
+                tracing::trace!(target: "bsc::block_import", "Block already queued when requesting block hashes: number = {:?}, hash = {:?}", hash_number.number, hash_number.hash);
                 continue;
             }
 
             // Check if the block is already being downloaded, if it times out, download it again.
-            let now = std::time::Instant::now().elapsed().as_millis();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis();
             if let Some(last_requested) = self.downloading_blocks.get(&hash_number.hash) {
-                if *last_requested + DOWNLOAD_COOLDOWN_DURATION_MS < now {
+                if *last_requested + DOWNLOAD_COOLDOWN_DURATION_MS > now {
                     continue;
                 }
             }
@@ -240,75 +304,38 @@ where
                 "Requesting block download for NewBlockHashes"
             );
 
-            // TODO: avoid to fetch too frequently, maybe add a cooldown mechanism.
             // Try quick range fetch via BSC subprotocol (mimic geth asyncFetchRangeBlocks)
             // Prefer the announcing peer; if it doesn't have bsc extension, fallback to any bsc peer.
-            {
-                let start_height = hash_number.number;
-                let start_hash = hash_number.hash;
-                let announcing_peer = peer_id;
-                // Resolve target bsc peer
-                let target_peer = if crate::node::network::bsc_protocol::registry::has_registered_peer(announcing_peer) {
-                    Some(announcing_peer)
-                } else {
-                    crate::node::network::bsc_protocol::registry::list_registered_peers().into_iter().next()
-                };
-                if let Some(bsc_peer) = target_peer {
-                    tracing::debug!(
-                        target: "bsc::block_import",
-                        peer_id = %bsc_peer,
-                        block_hash = %start_hash,
-                        block_number = start_height,
-                        "Requesting block with block range for NewBlockHashes"
-                    );
-                    tokio::spawn(async move {
-                        use std::time::Duration;
-                        // Bump request timeout to 1000ms to accommodate slower peers
-                        let req_timeout = Duration::from_millis(DOWNLOAD_COOLDOWN_DURATION_MS as u64);
-                        let _ = crate::node::network::bsc_protocol::registry::batch_request_range_and_await_import(
-                            bsc_peer,
-                            start_height,
-                            start_hash,
-                            1,
-                            req_timeout,
-                        ).await;
-                    });
-                }
-            }
-
-            // TODO: remove older block download mechanism currently, 
-            // may download block with TreeEvent::Download(DownloadRequest::single_block(target)
-            let forkchoice_state = ForkchoiceState {
-                head_block_hash: hash_number.hash,
-                safe_block_hash: B256::ZERO, 
-                finalized_block_hash: B256::ZERO,
+            let start_height = hash_number.number;
+            let start_hash = hash_number.hash;
+            let announcing_peer = peer_id;
+            // Resolve target bsc peer
+            let target_peer = if crate::node::network::bsc_protocol::registry::has_registered_peer(announcing_peer) {
+                Some(announcing_peer)
+            } else {
+                crate::node::network::bsc_protocol::registry::list_registered_peers().into_iter().next()
             };
-
-            let engine = self.engine.clone();
-            let block_hash = hash_number.hash;
-            let download_fut = Box::pin(async move {
-                match engine.fork_choice_updated(forkchoice_state, None, EngineApiMessageVersion::V1).await {
-                    Ok(result) => {
-                        tracing::debug!(
-                            target: "bsc::block_import",
-                            block_hash = %block_hash,
-                            status = ?result.payload_status.status,
-                            "FCU result for missing block download"
-                        );
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            target: "bsc::block_import", 
-                            block_hash = %block_hash,
-                            error = %err,
-                            "Failed to trigger block download via FCU"
-                        );
-                    }
-                }
-                None
-            });
-
-            self.pending_imports.push(download_fut);
+            if let Some(bsc_peer) = target_peer {
+                tracing::debug!(
+                    target: "bsc::block_import",
+                    peer_id = %bsc_peer,
+                    block_hash = %start_hash,
+                    block_number = start_height,
+                    "Requesting block with block range for NewBlockHashes"
+                );
+                tokio::spawn(async move {
+                    use std::time::Duration;
+                    // Bump request timeout to 1000ms to accommodate slower peers
+                    let req_timeout = Duration::from_millis(DOWNLOAD_COOLDOWN_DURATION_MS as u64);
+                    let _ = crate::node::network::bsc_protocol::registry::batch_request_range_and_await_import(
+                        bsc_peer,
+                        start_height,
+                        start_hash,
+                        1,
+                        req_timeout,
+                    ).await;
+                });
+            }
             self.downloading_blocks.insert(hash_number.hash, now);
         }
     }
@@ -341,7 +368,9 @@ where
         // Process completed imports and send events to network
         while let Poll::Ready(Some(outcome)) = this.pending_imports.poll_next_unpin(cx) {
             if let Some(outcome) = outcome {
+                let mut block_hash = None;
                 if let Ok(BlockValidation::ValidBlock { block }) = &outcome.result {
+                    block_hash = Some(block.hash);
                     this.processed_blocks.insert(block.hash);
                     // Cache the full block body for later range responses.
                     crate::shared::cache_full_block(block.block.0.block.clone());
@@ -362,6 +391,13 @@ where
                         }
                     }
                 }
+
+                // TODO: add queued blocks removal later, to avoid milicious block import, and trigger next download.
+                // now, it must wait backfilling to download the correct block.
+                // the verified header can drop the peer later, it cannot transfer a bad header now.
+                // if let Some(block_hash) = outcome.block.hash {
+                //     this.queued_blocks.remove(&block_hash);
+                // }
 
                 if let Err(e) = this.to_network.send(BlockImportEvent::Outcome(outcome)) {
                     return Poll::Ready(Err(Box::new(e)));
@@ -422,23 +458,6 @@ mod tests {
             })
             .await;
     }
-
-    // FCU has been called after import payload is validated, skip this test now.
-    // #[tokio::test]
-    // async fn can_handle_invalid_fcu() {
-    //     let mut fixture = TestFixture::new(EngineResponses::invalid_fcu()).await;
-    //     fixture
-    //         .assert_block_import(|outcome| {
-    //             matches!(
-    //                 outcome,
-    //                 BlockImportEvent::Outcome(BlockImportOutcome {
-    //                     peer: _,
-    //                     result: Err(BlockImportError::Other(_))
-    //                 })
-    //             )
-    //         })
-    //         .await;
-    // }
 
     #[tokio::test]
     async fn deduplicates_blocks() {

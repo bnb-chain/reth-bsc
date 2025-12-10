@@ -1,5 +1,5 @@
 use alloy_primitives::U256;
-use crate::consensus::parlia::{Parlia, DEFAULT_MIN_GAS_TIP};
+use crate::consensus::parlia::{Parlia};
 use crate::evm::blacklist;
 use crate::hardforks::BscHardforks;
 use crate::node::engine::BscBuiltPayload;
@@ -100,6 +100,8 @@ pub struct BscBuildArguments<Attributes> {
     pub cancel: ManualCancel,
     /// Unique trace ID for this build operation
     pub trace_id: u64,
+    /// Minimum gas tip
+    pub min_gas_tip: u128,
 }
 
 /// BSC payload builder, used to build payload for bsc miner.
@@ -162,7 +164,7 @@ where
     /// Returns a `Result` containing the built payload or an error.
     pub async fn build_payload(&self, args: BscBuildArguments<EthPayloadBuilderAttributes>) -> Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>> {
         let build_start = std::time::Instant::now();
-        let BscBuildArguments { mut cached_reads, config, cancel, trace_id } = args;
+        let BscBuildArguments { mut cached_reads, config, cancel, trace_id, min_gas_tip } = args;
         let PayloadConfig { parent_header, attributes } = config;
 
         let state_provider = self.client.state_by_block_hash(parent_header.hash_slow())?;
@@ -203,8 +205,6 @@ where
         let base_fee = builder.evm_mut().block().basefee;
         
         let mut sidecars_map = HashMap::new();
-        // TODO: add min gas tip to config.
-        let min_gas_tip = DEFAULT_MIN_GAS_TIP;
         let mut block_blob_count = 0;
 
         let mut blob_fee = None;
@@ -247,6 +247,14 @@ where
             // filter out tx with min gas tip.
             if pool_tx.effective_tip_per_gas(base_fee).unwrap_or(0_u128) < min_gas_tip {
                 // Skip packaging underpriced transactions, but do not mark them invalid.
+                trace!(
+                    target: "payload_builder",
+                    trace_id,
+                    tx = ?pool_tx.hash(),
+                    effective_tip_per_gas = pool_tx.effective_tip_per_gas(base_fee).unwrap_or(0_u128),
+                    min_gas_tip,
+                    "Skipping underpriced transaction"
+                );
                 continue
             }
 
@@ -378,6 +386,14 @@ where
                             nonce = tx.nonce(),
                             error = %error,
                             "Skipping nonce too low transaction"
+                        );
+                        best_tx_list.mark_invalid(
+                            &pool_tx,
+                            InvalidPoolTransactionError::Consensus(InvalidTransactionError::NonceNotConsistent {
+                                    tx: tx.nonce(),
+                                    state: 0_u64, // TODO: get the nonce from the state later.
+                                },
+                            ),
                         );
                     } else {
                         // if the transaction is invalid, we can skip it and all of its
@@ -543,7 +559,7 @@ where
     /// Only contains system transactions (if any)
     pub async fn build_empty_payload(&self, args: BscBuildArguments<EthPayloadBuilderAttributes>) -> Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>> {
         let build_start = std::time::Instant::now();
-        let BscBuildArguments { mut cached_reads, config, cancel: _, trace_id } = args;
+        let BscBuildArguments { mut cached_reads, config, cancel: _, trace_id, min_gas_tip: _ } = args;
         let PayloadConfig { parent_header, attributes } = config;
 
         let state_provider = self.client.state_by_block_hash(parent_header.hash_slow())?;
@@ -708,10 +724,16 @@ where
             DELAY_LEFT_OVER);
 
         // Spawn a background task to listen for new transactions from pool
+        // When tx_listener_rx is dropped (job ends), tx_listener_tx.send() will fail,
+        // causing this task to exit and pool_listener to be dropped,
+        // which triggers cleanup of the listener in txpool via retain_mut.
         let mut pool_listener = builder.pool.pending_transactions_listener();
         tokio::spawn(async move {
             while let Some(tx_hash) = pool_listener.recv().await {
-                let _ = tx_listener_tx.send(tx_hash);
+                // If send fails, receiver is dropped (job ended), exit to cleanup listener
+                if tx_listener_tx.send(tx_hash).is_err() {
+                    break;
+                }
             }
         });
 

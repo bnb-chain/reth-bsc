@@ -657,8 +657,9 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
                 target_header_parent_snap = Some(snap);
                 break;
             }
-            tracing::debug!(target: "parlia::consensus", "vote count is less than 2/3 of validators, skip assemble vote attestation, number={}, parent ={:?}, vote count={}, validators count={}", 
-                target_header.number(), target_header.hash_slow(), votes.len(), parent_snap.validators.len());
+
+            tracing::debug!(target: "parlia::consensus", "vote count is less than 2/3 of validators, skip assemble vote attestation, number={}, parent={:?}, vote count={}, validators count={}", 
+                target_header.number(), target_header.hash_slow(), votes.len(), snap.validators.len());
             let block_hash = target_header.parent_hash();
             if let Some(header) = crate::shared::get_canonical_header_by_hash_from_provider(&block_hash) {
                 target_header = header;
@@ -671,11 +672,14 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
                 break;
             }
         }
-        if target_header_parent_snap.is_none() {
-            tracing::warn!(target: "parlia::consensus", "cannot collect enough votes, current_block={}, target_header_number={}, justified_number={}", 
-                current_header.number(), target_header.number(), justified_number);
-            return Ok(());
-        }
+        let target_header_parent_snap = match target_header_parent_snap {
+            Some(snap) => snap,
+            None => {
+                tracing::warn!(target: "parlia::consensus", "cannot collect enough votes, current_block={}, target_header_number={}, justified_number={}", 
+                    current_header.number(), target_header.number(), justified_number);
+                return Ok(());
+            }
+        };
 
         let mut attestation = VoteAttestation::new_with_vote_data(VoteData {
             source_number: justified_number,
@@ -697,7 +701,7 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
         let mut unique_by_addr: std::collections::HashMap<VoteAddress, VoteSignature> = std::collections::HashMap::new();
         for vote in votes.iter() {
             // Only keep votes from validators in parent snapshot
-            if parent_snap.validators_map.values().any(|vi| vi.vote_addr == vote.vote_address) {
+            if target_header_parent_snap.validators_map.values().any(|vi| vi.vote_addr == vote.vote_address) {
                 // If the same address appears multiple times, keep the first one (stable and deterministic)
                 unique_by_addr.entry(vote.vote_address).or_insert(vote.signature);
             } else {
@@ -706,14 +710,14 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
         }
         // Build a stable sequence based on the index of validators in parent snapshot (although BLS aggregation order is irrelevant, it is convenient for debugging and consistency)
         let mut ordered_unique: Vec<(u64, VoteAddress, VoteSignature)> = Vec::new();
-        for (_, info) in parent_snap.validators_map.iter() {
+        for (_, info) in target_header_parent_snap.validators_map.iter() {
             let vote_addr = info.vote_addr;
             if let Some(sig) = unique_by_addr.get(&vote_addr) {
                 ordered_unique.push((info.index, vote_addr, *sig));
             }
         }
         // Must satisfy 2/3 threshold
-        let validators_len = parent_snap.validators.len();
+        let validators_len = target_header_parent_snap.validators.len();
         let quorum = usize::div_ceil(validators_len * 2, 3);
         if ordered_unique.len() < quorum {
             tracing::debug!(target: "parlia::consensus", "not enough unique votes after filtering, have={}, need={}", ordered_unique.len(), quorum);
