@@ -28,7 +28,8 @@ pub struct RawBid {
     /// List of transactions in the bid (may include blob tx with sidecars)
     pub txs: Vec<Bytes>,
     /// List of transaction hashes that cannot be reverted
-    #[serde(default)]
+    /// Note: null values in the array will be filtered out during deserialization
+    #[serde(default, deserialize_with = "deserialize_filter_null_hashes")]
     pub un_revertible: Vec<B256>,
     /// Total gas used
     pub gas_used: U64,
@@ -36,6 +37,16 @@ pub struct RawBid {
     pub gas_fee: U256,
     /// Builder fee
     pub builder_fee: U256,
+}
+
+/// Custom deserializer that filters out null values from a Vec<B256>
+fn deserialize_filter_null_hashes<'de, D>(deserializer: D) -> Result<Vec<B256>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let opt: Option<Vec<Option<B256>>> = Option::deserialize(deserializer)?;
+    Ok(opt.unwrap_or_default().into_iter().flatten().collect())
 }
 
 /// Decoded transaction with optional sidecar
