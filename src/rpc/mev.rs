@@ -28,25 +28,15 @@ pub struct RawBid {
     /// List of transactions in the bid (may include blob tx with sidecars)
     pub txs: Vec<Bytes>,
     /// List of transaction hashes that cannot be reverted
-    /// Note: null values in the array will be filtered out during deserialization
-    #[serde(default, deserialize_with = "deserialize_filter_null_hashes")]
+    #[serde(default)]
     pub un_revertible: Vec<B256>,
     /// Total gas used
     pub gas_used: U64,
     /// Gas fee
     pub gas_fee: U256,
-    /// Builder fee
-    pub builder_fee: U256,
-}
-
-/// Custom deserializer that filters out null values from a Vec<B256>
-fn deserialize_filter_null_hashes<'de, D>(deserializer: D) -> Result<Vec<B256>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::Deserialize;
-    let opt: Option<Vec<Option<B256>>> = Option::deserialize(deserializer)?;
-    Ok(opt.unwrap_or_default().into_iter().flatten().collect())
+    /// Builder fee (optional, None means not provided)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub builder_fee: Option<U256>,
 }
 
 /// Decoded transaction with optional sidecar
@@ -521,7 +511,7 @@ impl MevApiImpl {
             blob_sidecars,
             gas_used: bid_args.raw_bid.gas_used.to(),
             gas_fee: bid_args.raw_bid.gas_fee,
-            builder_fee: bid_args.raw_bid.builder_fee,
+            builder_fee: bid_args.raw_bid.builder_fee.unwrap_or(U256::ZERO),
             committed: false,
             bid_hash,
             interrupt_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -540,6 +530,9 @@ impl MevApiImpl {
         // The structure is: [blockNumber, parentHash, txs, unRevertible, gasUsed, gasFee, builderFee]
         let mut rlp_buffer = Vec::new();
 
+        // Get builder_fee value (use 0 if None)
+        let builder_fee = raw_bid.builder_fee.unwrap_or(U256::ZERO);
+
         // First calculate the length of all encoded items
         let payload_length = raw_bid.block_number.length()
             + raw_bid.parent_hash.length()
@@ -547,7 +540,7 @@ impl MevApiImpl {
             + raw_bid.un_revertible.length()
             + raw_bid.gas_used.length()
             + raw_bid.gas_fee.length()
-            + raw_bid.builder_fee.length();
+            + builder_fee.length();
 
         // Encode the list header
         alloy_rlp::Header { list: true, payload_length }.encode(&mut rlp_buffer);
@@ -559,7 +552,7 @@ impl MevApiImpl {
         raw_bid.un_revertible.encode(&mut rlp_buffer);
         raw_bid.gas_used.encode(&mut rlp_buffer);
         raw_bid.gas_fee.encode(&mut rlp_buffer);
-        raw_bid.builder_fee.encode(&mut rlp_buffer);
+        builder_fee.encode(&mut rlp_buffer);
 
         // Calculate keccak256 hash
         let hash = keccak256(&rlp_buffer);
@@ -739,20 +732,9 @@ impl BscMevApiServer for MevApiImpl {
             ));
         }
 
-        if bid.raw_bid.builder_fee != 0 {
-            let builder_fee = bid.raw_bid.builder_fee;
-            if builder_fee < 0 {
-                tracing::error!(
-                    "Skip to new bid due to builder fee is less than 0, block number: {}",
-                    new_block_number
-                );
-                return Err(jsonrpsee::types::ErrorObject::owned(
-                    -32602,
-                    "Builder fee is less than 0",
-                    None::<()>,
-                ));
-            }
-
+        // Validate builder_fee if provided
+        if let Some(builder_fee) = bid.raw_bid.builder_fee {
+            // U256 is always >= 0, so no need to check for negative values
             if builder_fee > bid.raw_bid.gas_fee {
                 tracing::error!(
                     "Skip to new bid due to builder fee is greater than gas fee, block number: {}",
