@@ -49,6 +49,7 @@ struct DecodedTransaction {
 #[serde(rename_all = "camelCase")]
 pub struct BidArgs {
     /// Raw bid from builder
+    #[serde(alias = "RawBid")]
     pub raw_bid: RawBid,
     /// Signature of the bid from builder
     pub signature: Bytes,
