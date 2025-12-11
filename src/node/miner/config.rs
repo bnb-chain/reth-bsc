@@ -36,6 +36,8 @@ pub struct MiningConfig {
     pub max_bids_per_builder: Option<u32>,
     /// Builder fee ceiling in wei (as hex string for large numbers)
     pub builder_fee_ceil: Option<u128>,
+    /// List of allowed builder addresses (whitelist)
+    pub allowed_builders: Option<Vec<Address>>,
 }
 
 impl std::fmt::Debug for MiningConfig {
@@ -54,6 +56,7 @@ impl std::fmt::Debug for MiningConfig {
             .field("no_interrupt_left_over", &self.no_interrupt_left_over)
             .field("max_bids_per_builder", &self.max_bids_per_builder)
             .field("builder_fee_ceil", &self.builder_fee_ceil)
+            .field("allowed_builders", &self.allowed_builders)
             .finish()
     }
 }
@@ -75,6 +78,7 @@ impl Default for MiningConfig {
             no_interrupt_left_over: Some(500),  // 500ms
             max_bids_per_builder: Some(3),
             builder_fee_ceil: Some(1_000_000_000_000_000_000), // 1 BNB
+            allowed_builders: None, // No whitelist by default (allow all)
         }
     }
 }
@@ -181,6 +185,7 @@ impl MiningConfig {
                 no_interrupt_left_over: Some(500),
                 max_bids_per_builder: Some(3),
                 builder_fee_ceil: Some(1_000_000_000_000_000_000),
+                allowed_builders: None,
             }
         } else {
             // Fallback to default if key generation fails
@@ -253,6 +258,16 @@ impl MiningConfig {
         let builder_fee_ceil =
             std::env::var("BSC_BUILDER_FEE_CEIL").ok().and_then(|v| v.parse().ok());
 
+        // Parse allowed builders from comma-separated addresses
+        let allowed_builders = std::env::var("BSC_ALLOWED_BUILDERS")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .filter_map(|addr| addr.trim().parse::<Address>().ok())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|v| !v.is_empty());
+
         let mut cfg = Self {
             enabled,
             private_key_hex,
@@ -266,6 +281,7 @@ impl MiningConfig {
             no_interrupt_left_over,
             max_bids_per_builder,
             builder_fee_ceil,
+            allowed_builders,
             ..Default::default()
         };
 

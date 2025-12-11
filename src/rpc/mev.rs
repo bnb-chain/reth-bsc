@@ -13,7 +13,8 @@ use jsonrpsee::proc_macros::rpc;
 use reth_chainspec::EthChainSpec;
 use reth_primitives::TransactionSigned;
 use reth_primitives_traits::SignerRecoverable;
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, RwLock};
 use tracing::debug;
 
 /// Raw bid data structure from builder
@@ -123,6 +124,18 @@ pub trait BscMevApi {
     /// Check if MEV is running
     #[method(name = "running")]
     async fn running(&self) -> RpcResult<bool>;
+
+    /// Check if a builder is registered
+    #[method(name = "hasBuilder")]
+    async fn has_builder(&self, builder: Address) -> RpcResult<bool>;
+
+    /// Add a builder to the whitelist
+    #[method(name = "addBuilder")]
+    async fn add_builder(&self, builder: Address) -> RpcResult<bool>;
+
+    /// Remove a builder from the whitelist
+    #[method(name = "removeBuilder")]
+    async fn remove_builder(&self, builder: Address) -> RpcResult<bool>;
 }
 
 const PAY_BID_TX_GAS_LIMIT: u64 = 25000;
@@ -140,6 +153,8 @@ pub struct MevApiImpl {
     min_gas_price: U256,
     builder_fee_ceil: U256,
     version: String,
+    /// Whitelist of allowed builders (empty HashSet means no builders allowed)
+    allowed_builders: Arc<RwLock<HashSet<Address>>>,
 }
 
 impl MevApiImpl {
@@ -195,6 +210,30 @@ impl MevApiImpl {
         // Version string
         let version = env!("CARGO_PKG_VERSION").to_string();
 
+        // Initialize allowed builders from config
+        // If not configured, initialize as empty HashSet (no builders allowed by default)
+        let allowed_builders = mining_config
+            .allowed_builders
+            .map(|addrs| addrs.into_iter().collect::<HashSet<_>>())
+            .unwrap_or_default(); // Empty HashSet if not configured
+
+        if allowed_builders.is_empty() {
+            tracing::warn!(
+                "MEV API initialized with EMPTY builder whitelist - NO builders will be accepted!"
+            );
+            tracing::warn!(
+                "Use mev_addBuilder to add builders or set BSC_ALLOWED_BUILDERS environment variable"
+            );
+        } else {
+            tracing::info!(
+                "MEV API initialized with builder whitelist: {} builders",
+                allowed_builders.len()
+            );
+            for builder in &allowed_builders {
+                tracing::info!("  - Allowed builder: {}", builder);
+            }
+        }
+
         tracing::info!(
             "MEV API initialized: validator_address={}, validator_commission={}({}%), gas_ceil={}, min_gas_price={}, version={}",
             validator_address, validator_commission, validator_commission as f64 / 100.0, gas_ceil, min_gas_price, version
@@ -212,12 +251,34 @@ impl MevApiImpl {
             min_gas_price,
             builder_fee_ceil,
             version,
+            allowed_builders: Arc::new(RwLock::new(allowed_builders)),
         }
     }
 
     /// Get header by number from global header provider
     fn get_header_by_number(&self, block_number: u64) -> Option<alloy_consensus::Header> {
         crate::shared::get_canonical_header_by_number_from_provider(block_number)
+    }
+
+    /// Check if a builder is allowed
+    fn is_builder_allowed(&self, builder: &Address) -> bool {
+        let allowed_builders = self.allowed_builders.read().unwrap();
+        // Empty HashSet means no builders are allowed
+        allowed_builders.contains(builder)
+    }
+
+    /// Add a builder to the whitelist
+    fn add_builder_internal(&self, builder: Address) -> bool {
+        let mut allowed_builders = self.allowed_builders.write().unwrap();
+        // Add to whitelist, returns true if newly added
+        allowed_builders.insert(builder)
+    }
+
+    /// Remove a builder from the whitelist
+    fn remove_builder_internal(&self, builder: &Address) -> bool {
+        let mut allowed_builders = self.allowed_builders.write().unwrap();
+        // Remove from whitelist, returns true if it was present
+        allowed_builders.remove(builder)
     }
 
     /// Parse transaction from bytes with validation
@@ -608,6 +669,20 @@ impl BscMevApiServer for MevApiImpl {
         };
         debug!("builder: {:?}", builder);
 
+        // Check if builder is in whitelist
+        if !self.is_builder_allowed(&builder) {
+            tracing::error!(
+                "Builder {} is not in whitelist, rejecting bid for block {}",
+                builder,
+                new_block_number
+            );
+            return Err(jsonrpsee::types::ErrorObject::owned(
+                -32603,
+                format!("Builder {} is not registered", builder),
+                None::<()>,
+            ));
+        }
+
         // Calculate bid hash (using RLP hash of RawBid)
         let bid_hash = Self::calculate_raw_bid_hash(&bid.raw_bid);
         debug!("bid_hash: {:?}", bid_hash);
@@ -763,5 +838,35 @@ impl BscMevApiServer for MevApiImpl {
     async fn running(&self) -> RpcResult<bool> {
         tracing::debug!("MEV running status requested");
         Ok(crate::shared::is_mev_running())
+    }
+
+    /// Check if a builder is registered in the whitelist
+    async fn has_builder(&self, builder: Address) -> RpcResult<bool> {
+        tracing::debug!("Checking if builder {} is registered", builder);
+        Ok(self.is_builder_allowed(&builder))
+    }
+
+    /// Add a builder to the whitelist
+    async fn add_builder(&self, builder: Address) -> RpcResult<bool> {
+        tracing::info!("Adding builder {} to whitelist", builder);
+        let added = self.add_builder_internal(builder);
+        if added {
+            tracing::info!("Builder {} successfully added to whitelist", builder);
+        } else {
+            tracing::info!("Builder {} was already in whitelist", builder);
+        }
+        Ok(added)
+    }
+
+    /// Remove a builder from the whitelist
+    async fn remove_builder(&self, builder: Address) -> RpcResult<bool> {
+        tracing::info!("Removing builder {} from whitelist", builder);
+        let removed = self.remove_builder_internal(&builder);
+        if removed {
+            tracing::info!("Builder {} successfully removed from whitelist", builder);
+        } else {
+            tracing::info!("Builder {} was not in whitelist", builder);
+        }
+        Ok(removed)
     }
 }
