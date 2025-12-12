@@ -639,15 +639,6 @@ where
             }
             let is_blob_tx = tx.is_eip4844();
             let tx_hash = *tx.hash();
-            // ensure we still have capacity for this transaction
-            if cumulative_gas_used + tx.gas_limit() > block_gas_limit {
-                // we can't fit this transaction into the block, so we need to mark it as invalid
-                // which also removes all dependent transaction from the iterator before we can
-                // continue
-                debug!("bidSimulator: gas limit exceeded, ignore tx:{}, tx gas limit:{}, block gas limit:{}, cumulative_gas_used:{}", tx_hash, tx.gas_limit(), block_gas_limit, cumulative_gas_used);
-                return Err("gas limit exceeded".into());
-            }
-            cumulative_gas_used += tx.gas_limit();
 
             // Check blob transaction limits and retrieve sidecar if needed
             if let Some(blob_tx) = tx.as_eip4844() {
@@ -689,6 +680,16 @@ where
                 }
                 Err(err) => return Err(Box::new(PayloadBuilderError::evm(err))),
             };
+
+            // ensure we still have capacity for this transaction
+            if cumulative_gas_used + tx_gas_used > block_gas_limit {
+                // we can't fit this transaction into the block, so we need to mark it as invalid
+                // which also removes all dependent transaction from the iterator before we can
+                // continue
+                debug!("bidSimulator: gas limit exceeded, ignore tx:{}, tx gas used:{}, block gas limit:{}, cumulative_gas_used:{}", tx_hash, tx_gas_used, block_gas_limit, cumulative_gas_used);
+                return Err("gas limit exceeded".into());
+            }
+            cumulative_gas_used += tx_gas_used;
 
             if is_blob_tx {
                 // Get sidecar from bid.blob_sidecars if available and convert to BscBlobTransactionSidecar
