@@ -32,8 +32,11 @@ const BLST_DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
 type ValidatorCache = LruMap<BlockHash, (Vec<Address>, Vec<VoteAddress>), ByLength>;
 type TurnLengthCache = LruMap<BlockHash, u8, ByLength>;
 type AttestationCache = LruMap<B256, (), ByLength>;
-type SnapshotFingerprintCache = HashMap<BlockHash, B256>;
-type BlsPublicKeyCache = HashMap<VoteAddress, Arc<PublicKey>>;
+type SnapshotFingerprintCache = LruMap<BlockHash, B256, ByLength>;
+type BlsPublicKeyCache = LruMap<VoteAddress, Arc<PublicKey>, ByLength>;
+
+const DEFAULT_FINGERPRINT_CACHE_SIZE: u32 = 4096;
+const DEFAULT_BLS_PUBKEY_CACHE_SIZE: u32 = 256;
 
 pub static VALIDATOR_CACHE: LazyLock<Mutex<ValidatorCache>> = LazyLock::new(|| {
     Mutex::new(LruMap::new(ByLength::new(1024)))
@@ -48,10 +51,10 @@ static ATTESTATION_VERIFY_CACHE: LazyLock<Mutex<AttestationCache>> = LazyLock::n
 });
 
 static SNAPSHOT_FINGERPRINT_CACHE: LazyLock<Mutex<SnapshotFingerprintCache>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+    LazyLock::new(|| Mutex::new(LruMap::new(ByLength::new(DEFAULT_FINGERPRINT_CACHE_SIZE))));
 
 static BLS_PUBKEY_CACHE: LazyLock<Mutex<BlsPublicKeyCache>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+    LazyLock::new(|| Mutex::new(LruMap::new(ByLength::new(DEFAULT_BLS_PUBKEY_CACHE_SIZE))));
 
 #[cfg(test)]
 fn reset_attestation_caches() {
@@ -62,7 +65,7 @@ fn reset_attestation_caches() {
 
 fn snapshot_fingerprint(snap: &Snapshot) -> B256 {
     {
-        let cache = SNAPSHOT_FINGERPRINT_CACHE.lock().unwrap();
+        let mut cache = SNAPSHOT_FINGERPRINT_CACHE.lock().unwrap();
         if let Some(fingerprint) = cache.get(&snap.block_hash) {
             return *fingerprint;
         }
@@ -682,7 +685,7 @@ mod tests {
         {
             let cache = SNAPSHOT_FINGERPRINT_CACHE.lock().unwrap();
             assert_eq!(cache.len(), 1);
-            assert_eq!(cache.get(&snap.block_hash), Some(&fp1));
+            assert_eq!(cache.peek(&snap.block_hash), Some(&fp1));
         }
 
         let fp2 = snapshot_fingerprint(&snap);
