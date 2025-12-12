@@ -88,7 +88,7 @@ where
         let epoch_length = snap.epoch_num;
         if header.number.is_multiple_of(epoch_length) {
             // TODO: need fix it later, it may got error when restart the node?
-            let (validator_set, vote_addresses) = self.get_current_validators(header.number-1, header.parent_hash)?;
+            let (validator_set, vote_addresses) = self.get_current_validators_with_cache(header.number-1, header.parent_hash)?;
             tracing::debug!("validator_set: {:?}, vote_addresses: {:?}", validator_set, vote_addresses);
             
             let vote_addrs_map = if vote_addresses.is_empty() {
@@ -157,7 +157,7 @@ where
         Ok(())
     }
 
-    pub(crate) fn get_current_validators(
+    pub(crate) fn get_current_validators_with_cache(
         &mut self, 
         block_number: BlockNumber,
         block_hash: BlockHash
@@ -171,16 +171,7 @@ where
             }
         }
 
-        let result = if self.spec.is_luban_active_at_block(block_number) {
-            let (to, data) = self.system_contracts.get_current_validators();
-            let output = self.eth_call(to, data)?;
-            self.system_contracts.unpack_data_into_validator_set(&output)
-        } else {
-            let (to, data) = self.system_contracts.get_current_validators_before_luban(block_number);
-            let output = self.eth_call(to, data)?;
-            let validator_set = self.system_contracts.unpack_data_into_validator_set_before_luban(&output);
-            (validator_set, Vec::new())
-        };
+        let result = self.get_current_validators(block_number)?;
 
         {
             let mut cache = VALIDATOR_CACHE.lock().unwrap();
@@ -191,6 +182,7 @@ where
 
         Ok(result)
     }
+
 
     pub(crate) fn eth_call(
         &mut self, 
@@ -226,6 +218,25 @@ where
         Ok(output.clone())
     }
 
+    pub(crate) fn get_current_validators(
+        &mut self, 
+        block_number: BlockNumber
+    ) -> Result<(Vec<Address>, Vec<VoteAddress>), BlockExecutionError> {
+
+        let result = if self.spec.is_luban_active_at_block(block_number) {
+            let (to, data) = self.system_contracts.get_current_validators();
+            let output = self.eth_call(to, data)?;
+            self.system_contracts.unpack_data_into_validator_set(&output)
+        } else {
+            let (to, data) = self.system_contracts.get_current_validators_before_luban(block_number);
+            let output = self.eth_call(to, data)?;
+            let validator_set = self.system_contracts.unpack_data_into_validator_set_before_luban(&output);
+            (validator_set, Vec::new())
+        };
+
+        Ok(result)
+    }
+    
     fn verify_cascading_fields(
         &self,
         header: &Header,
@@ -331,7 +342,7 @@ where
                 .snapshot_provider
                 .as_ref()
                 .unwrap()
-                .snapshot_by_hash(&parent.parent_hash)
+                .snapshot_by_hash(&ancestor.parent_hash)
                 .ok_or(BlockExecutionError::msg("Failed to get pre snapshot from snapshot provider"))?;
 
             // query bls keys from snapshot.

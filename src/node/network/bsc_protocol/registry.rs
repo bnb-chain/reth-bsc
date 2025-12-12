@@ -241,9 +241,9 @@ pub fn broadcast_votes(votes: Vec<crate::consensus::parlia::vote::VoteEnvelope>)
                 }
             }
 
-            tracing::debug!(target: "bsc::vote", peer=%peer, allow=allow, is_proxyed=is_proxyed_peer(&peer), "broadcast votes to peer");
+            tracing::trace!(target: "bsc::vote", peer=%peer, allow=allow, is_proxyed=is_proxyed_peer(&peer), "broadcast votes to peer");
             if allow && tx.send(BscCommand::Votes(Arc::clone(&votes_arc))).is_err() {
-                tracing::debug!(target: "bsc::vote", peer=%peer, "failed to send votes to peer, remove from registry");
+                tracing::trace!(target: "bsc::vote", peer=%peer, "failed to send votes to peer, remove from registry");
                 to_remove.push(peer);
             }
         }

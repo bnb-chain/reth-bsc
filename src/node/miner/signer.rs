@@ -16,8 +16,6 @@ pub struct MinerSigner {
 
 static GLOBAL_SIGNER: OnceCell<Arc<MinerSigner>> = OnceCell::new();
 
-/// tmp signer for sign system transaction and seal block in mining mode.
-/// TODO: refine it to more secure signer.
 #[derive(Debug)]
 pub enum SignerError {
     NotInitialized,

@@ -113,6 +113,12 @@ impl<DB: Database> DbSnapshotProvider<DB> {
         tracing::debug!("Succeed to insert snapshot to db, block_number: {}, block_hash: {}", snap.block_number, snap.block_hash);
         Ok(())
     }
+
+    /// Insert into in-memory cache only (no persistence).
+    /// Used to cache intermediate snapshots during rebuild to avoid repeated long rebuilds.
+    pub fn insert_cache_only(&self, snapshot: &Snapshot) {
+        self.cache_by_hash.write().insert(snapshot.block_hash, snapshot.clone());
+    }
 }
 
 impl<DB: Database + 'static> SnapshotProvider for DbSnapshotProvider<DB> {
@@ -299,6 +305,8 @@ impl<DB: Database + 'static> EnhancedDbSnapshotProvider<DB> {
                         "Successfully applied header: block_number={}, epoch_num={}, validators={}",
                         snap.block_number, snap.epoch_num, snap.validators.len()
                     );
+                    // Cache intermediate snapshots in memory to avoid repeated long rebuilds
+                    self.base.insert_cache_only(&snap);
                     snap
                 },
                 None => {
@@ -307,7 +315,7 @@ impl<DB: Database + 'static> EnhancedDbSnapshotProvider<DB> {
                 }
             };
 
-            // rebuild snapshot is not refresh cache.
+            // Persist at checkpoint boundaries to DB; intermediate snapshots are cached in-memory only.
             if working_snapshot.block_number.is_multiple_of(crate::consensus::parlia::snapshot::CHECKPOINT_INTERVAL) {
                 self.base.persist_to_db(&working_snapshot).ok()?;
             }
