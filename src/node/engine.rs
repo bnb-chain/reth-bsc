@@ -61,6 +61,7 @@ impl BuiltPayload for BscBuiltPayload {
         self.executed_trie.clone().map(|trie| ExecutedBlockWithTrieUpdates {
             block: self.executed_block.clone(),
             trie,
+            difflayer: None,
         })
     }
 }
