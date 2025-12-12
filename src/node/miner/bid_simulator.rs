@@ -1,39 +1,39 @@
-use alloy_consensus::Transaction;
-use alloy_consensus::BlockHeader;
-use alloy_primitives::U256;
-use alloy_evm::Evm;
-use reth_chain_state::{ExecutedBlock, ExecutedTrieUpdates};
+use crate::chainspec::BscChainSpec;
+use crate::consensus::parlia::provider::SnapshotProvider;
+use crate::node::engine::BscBuiltPayload;
 use crate::node::evm::config::BscEvmConfig;
-use reth_provider::StateProviderFactory;
-use reth_evm::execute::ExecutionOutcome;
-use reth_revm::{database::StateProviderDatabase, db::State};
-use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
+use crate::node::miner::bsc_miner::MiningContext;
+use crate::node::miner::payload::DELAY_LEFT_OVER;
+use crate::node::miner::util::prepare_new_attributes;
+use crate::node::primitives::BscBlobTransactionSidecar;
+use alloy_consensus::BlobTransactionSidecar;
+use alloy_consensus::BlockHeader;
+use alloy_consensus::Transaction;
+use alloy_evm::Evm;
+use alloy_primitives::U256;
+use alloy_primitives::{Address, B256};
+use parking_lot::RwLock;
+use reth::payload::EthPayloadBuilderAttributes;
+use reth_chain_state::{ExecutedBlock, ExecutedTrieUpdates};
+use reth_chainspec::EthChainSpec;
+use reth_ethereum_payload_builder::EthereumBuilderConfig;
 use reth_evm::execute::BlockBuilder;
-use reth_payload_primitives::{PayloadBuilderError};
+use reth_evm::execute::BlockBuilderOutcome;
+use reth_evm::execute::ExecutionOutcome;
+use reth_evm::execute::{BlockExecutionError, BlockValidationError};
+use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
+use reth_payload_primitives::PayloadBuilderAttributes;
+use reth_payload_primitives::PayloadBuilderError;
+use reth_primitives::SealedHeader;
 use reth_primitives::TransactionSigned;
 use reth_primitives_traits::SignerRecoverable;
-use tracing::debug;
-use reth_ethereum_payload_builder::EthereumBuilderConfig;
-use std::sync::Arc;
-use reth::payload::EthPayloadBuilderAttributes;
-use reth_payload_primitives::PayloadBuilderAttributes;
-use crate::chainspec::{BscChainSpec};
-use reth_chainspec::EthChainSpec;
+use reth_provider::StateProviderFactory;
+use reth_provider::{BlockHashReader, HeaderProvider};
+use reth_revm::{database::StateProviderDatabase, db::State};
 use std::collections::HashMap;
-use alloy_primitives::{Address, B256};
-use reth_primitives::SealedHeader;
-use crate::node::engine::BscBuiltPayload;
-use reth_evm::execute::BlockBuilderOutcome;
-use reth_provider::{HeaderProvider, BlockHashReader};
-use parking_lot::RwLock;
-use crate::node::miner::util::prepare_new_attributes;
-use crate::node::miner::bsc_miner::MiningContext;
-use crate::consensus::parlia::provider::SnapshotProvider;
 use std::sync::atomic::{AtomicBool, Ordering};
-use crate::node::miner::payload::DELAY_LEFT_OVER;
-use alloy_consensus::BlobTransactionSidecar;
-use crate::node::primitives::BscBlobTransactionSidecar;
-use reth_evm::execute::{BlockExecutionError, BlockValidationError};
+use std::sync::Arc;
+use tracing::debug;
 
 const NO_INTERRUPT_LEFT_OVER: u64 = 500;
 const PAY_BID_TX_GAS_LIMIT: u64 = 25000;
@@ -53,8 +53,7 @@ pub struct Bid {
     pub interrupt_flag: Arc<AtomicBool>,
 }
 
-impl Bid
-{
+impl Bid {
     fn is_committed(&self) -> bool {
         self.committed
     }
@@ -66,7 +65,6 @@ impl Bid
 // 3. find best bid
 // 4. can be interrupt the last bid and commit
 pub struct BidSimulator<Client, Pool> {
-
     client: Client,
     snapshot_provider: Arc<dyn SnapshotProvider + Send + Sync>,
     parlia: Arc<crate::consensus::parlia::Parlia<crate::chainspec::BscChainSpec>>,
@@ -82,17 +80,31 @@ pub struct BidSimulator<Client, Pool> {
     bid_receiving: bool,
     chain_spec: Arc<BscChainSpec>,
     min_gas_price: U256,
-    
+
     // MEV metrics
     mev_metrics: crate::metrics::BscMevMetrics,
 }
 
-impl<Client, Pool> BidSimulator<Client, Pool> 
-where Client: HeaderProvider<Header = alloy_consensus::Header> + BlockHashReader + StateProviderFactory + Clone + 'static,
-Pool: reth::transaction_pool::TransactionPool<Transaction: reth::transaction_pool::PoolTransaction<Consensus = TransactionSigned>> + 'static,
+impl<Client, Pool> BidSimulator<Client, Pool>
+where
+    Client: HeaderProvider<Header = alloy_consensus::Header>
+        + BlockHashReader
+        + StateProviderFactory
+        + Clone
+        + 'static,
+    Pool: reth::transaction_pool::TransactionPool<
+            Transaction: reth::transaction_pool::PoolTransaction<Consensus = TransactionSigned>,
+        > + 'static,
 {
-    pub fn new(client: Client, pool: Pool, chain_spec: Arc<BscChainSpec>, parlia: Arc<crate::consensus::parlia::Parlia<crate::chainspec::BscChainSpec>>, validator_address: Address, snapshot_provider: Arc<dyn SnapshotProvider + Send + Sync>) -> Self {
-        Self { 
+    pub fn new(
+        client: Client,
+        pool: Pool,
+        chain_spec: Arc<BscChainSpec>,
+        parlia: Arc<crate::consensus::parlia::Parlia<crate::chainspec::BscChainSpec>>,
+        validator_address: Address,
+        snapshot_provider: Arc<dyn SnapshotProvider + Send + Sync>,
+    ) -> Self {
+        Self {
             client,
             parlia,
             pool,
@@ -106,10 +118,10 @@ Pool: reth::transaction_pool::TransactionPool<Transaction: reth::transaction_poo
             bid_receiving: true,
             min_gas_price: U256::ZERO,
             mev_metrics: crate::metrics::BscMevMetrics::default(),
-        }   
+        }
     }
 
-    pub fn check_pending_bid(&self, block_number: u64, builder: Address, bid_hash: B256) -> bool{
+    pub fn check_pending_bid(&self, block_number: u64, builder: Address, bid_hash: B256) -> bool {
         let key = format!("{}-{}-{}", block_number, builder, bid_hash);
         let pending_bid = self.pending_bid.read();
         if let Some(exist) = pending_bid.get(&key) {
@@ -132,7 +144,7 @@ Pool: reth::transaction_pool::TransactionPool<Transaction: reth::transaction_poo
             return None;
         }
         self.add_pending_bid(bid.block_number, bid.builder, bid.bid_hash);
-        let final_block_number   = match self.client.finalized_block_number() {
+        let final_block_number = match self.client.finalized_block_number() {
             Ok(Some(final_block_number)) => final_block_number,
             Ok(None) => return None,
             Err(_) => return None,
@@ -147,7 +159,7 @@ Pool: reth::transaction_pool::TransactionPool<Transaction: reth::transaction_poo
             Ok(Some(header)) => {
                 let hash = header.hash_slow();
                 SealedHeader::new(header, hash)
-            },
+            }
             _ => {
                 debug!("Failed to get parent header for hash: {:?}", parent_hash);
                 return None;
@@ -156,7 +168,10 @@ Pool: reth::transaction_pool::TransactionPool<Transaction: reth::transaction_poo
         let parent_snapshot = match self.snapshot_provider.snapshot_by_hash(&parent_hash) {
             Some(snapshot) => snapshot,
             None => {
-                debug!("Skip to mine new block due to no snapshot available, validator: {}, tip: {}", self.validator_address, parent_hash);
+                debug!(
+                    "Skip to mine new block due to no snapshot available, validator: {}, tip: {}",
+                    self.validator_address, parent_hash
+                );
                 return None;
             }
         };
@@ -170,64 +185,79 @@ Pool: reth::transaction_pool::TransactionPool<Transaction: reth::transaction_poo
         let parent_snapshot = mining_ctx.parent_snapshot.clone();
         let attributes = prepare_new_attributes(
             &mut mining_ctx,
-            self.parlia.clone(), 
-            &parent_header, 
+            self.parlia.clone(),
+            &parent_header,
             self.validator_address,
         );
 
-        let mut _bid_runtime = match self.new_bid_runtime(&bid, 100, parent_header.clone(), attributes.clone()) {
-            Ok(bid_runtime   ) => bid_runtime,
-            Err(err) => {
-                debug!("create runtime error:{}",err);
-                return None;
-            }
-        };
+        let mut _bid_runtime =
+            match self.new_bid_runtime(&bid, 100, parent_header.clone(), attributes.clone()) {
+                Ok(bid_runtime) => bid_runtime,
+                Err(err) => {
+                    debug!("create runtime error:{}", err);
+                    return None;
+                }
+            };
         let mut to_commit = true;
         let mut _bid_accepted = true;
-        
+
         // Acquire read lock only when needed
         let best_bid_opt = self.best_bid_to_run.read().get(&parent_hash).cloned();
         if let Some(best_bid) = best_bid_opt {
-            let best_bid_runtime = match self.new_bid_runtime(&best_bid, 100, parent_header.clone(), attributes.clone()) {
+            let best_bid_runtime = match self.new_bid_runtime(
+                &best_bid,
+                100,
+                parent_header.clone(),
+                attributes.clone(),
+            ) {
                 Ok(best_bid_runtime) => best_bid_runtime,
                 Err(err) => {
-                    debug!("create runtime error:{}",err);
+                    debug!("create runtime error:{}", err);
                     return None;
                 }
             };
             if _bid_runtime.is_expected_better_than(&best_bid_runtime) {
-                debug!("new bid has better expectedBlockReward builder:{}, bid_hash:{}", _bid_runtime.bid.builder,"");
+                debug!(
+                    "new bid has better expectedBlockReward builder:{}, bid_hash:{}",
+                    _bid_runtime.bid.builder, ""
+                );
             } else if !best_bid.is_committed() {
                 _bid_runtime = best_bid_runtime;
                 _bid_accepted = false;
                 debug!("discard new bid and to simulate the non-committed bestBidToRun builder:{}, bid_hash:{}", _bid_runtime.bid.builder,"");
-            }else {
+            } else {
                 to_commit = false;
                 _bid_accepted = false;
-                debug!("new bid will be discarded builder:{}, bid_hash:{}",  _bid_runtime.bid.builder,"");
+                debug!(
+                    "new bid will be discarded builder:{}, bid_hash:{}",
+                    _bid_runtime.bid.builder, ""
+                );
             }
         }
 
         if to_commit {
-            self.best_bid_to_run.write().insert(_bid_runtime.bid.parent_hash, _bid_runtime.bid.clone());
+            self.best_bid_to_run
+                .write()
+                .insert(_bid_runtime.bid.parent_hash, _bid_runtime.bid.clone());
 
-            if let Some(simulating_bid) = self.simulating_bid.read().get(&bid.parent_hash).cloned() {
-                let delay_ms = self.parlia.delay_for_mining(&parent_snapshot, &parent_header, DELAY_LEFT_OVER);
+            if let Some(simulating_bid) = self.simulating_bid.read().get(&bid.parent_hash).cloned()
+            {
+                let delay_ms =
+                    self.parlia.delay_for_mining(&parent_snapshot, &parent_header, DELAY_LEFT_OVER);
                 if delay_ms >= NO_INTERRUPT_LEFT_OVER || delay_ms == 0 {
                     simulating_bid.interrupt_flag.store(true, Ordering::Relaxed);
                     let bid_simulate_req = self.commit_bid(5, _bid_runtime);
                     return Some(bid_simulate_req);
-                }else {
+                } else {
                     debug!("simulate in progress, no interrupt after delay_ms:{}, NO_INTERRUPT_LEFT_OVER:{},bid hash:{}", delay_ms, NO_INTERRUPT_LEFT_OVER, _bid_runtime.bid.bid_hash);
                 }
-            }else {
+            } else {
                 let bid_simulate_req = self.commit_bid(5, _bid_runtime);
                 return Some(bid_simulate_req);
             }
         }
 
         None
-        
     }
 
     pub fn clear(&self, block_number: u64) {
@@ -255,10 +285,24 @@ Pool: reth::transaction_pool::TransactionPool<Transaction: reth::transaction_poo
         self.mev_metrics.pending_bids.set(self.pending_bid.read().len() as f64);
     }
 
-    fn new_bid_runtime(&self, _bid: &Bid, _validator_commission: u64, parent_header: SealedHeader, attributes: EthPayloadBuilderAttributes) -> Result<BidRuntime<Pool, BscEvmConfig>, Box<dyn std::error::Error + Send + Sync>>{
-        let mut runtime = BidRuntime::new(_bid.clone(), self.pool.clone(), BscEvmConfig::new(self.chain_spec.clone()), parent_header, attributes, self.chain_spec.clone());
+    fn new_bid_runtime(
+        &self,
+        _bid: &Bid,
+        _validator_commission: u64,
+        parent_header: SealedHeader,
+        attributes: EthPayloadBuilderAttributes,
+    ) -> Result<BidRuntime<Pool, BscEvmConfig>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut runtime = BidRuntime::new(
+            _bid.clone(),
+            self.pool.clone(),
+            BscEvmConfig::new(self.chain_spec.clone()),
+            parent_header,
+            attributes,
+            self.chain_spec.clone(),
+        );
         let expected_block_reward = _bid.gas_fee;
-        let mut expected_validator_reward = expected_block_reward * U256::from(_validator_commission);
+        let mut expected_validator_reward =
+            expected_block_reward * U256::from(_validator_commission);
         expected_validator_reward /= U256::from(10000u64);
         if expected_validator_reward < _bid.builder_fee {
             debug!("BidSimulator: invalid bid, builder fee exceeds validator reward, ignore expected_validator_reward:{} builder_fee:{}", expected_validator_reward, _bid.builder_fee);
@@ -270,8 +314,12 @@ Pool: reth::transaction_pool::TransactionPool<Transaction: reth::transaction_poo
         Ok(runtime)
     }
 
-    fn commit_bid(&self, reason: u32, mut bid_runtime: BidRuntime<Pool, BscEvmConfig>) -> BidRuntime<Pool, BscEvmConfig> {
-        debug!("bid committed reason:{}, bid hash:{}",reason, bid_runtime.bid.bid_hash);
+    fn commit_bid(
+        &self,
+        reason: u32,
+        mut bid_runtime: BidRuntime<Pool, BscEvmConfig>,
+    ) -> BidRuntime<Pool, BscEvmConfig> {
+        debug!("bid committed reason:{}, bid hash:{}", reason, bid_runtime.bid.bid_hash);
         bid_runtime.bid.committed = true;
 
         bid_runtime
@@ -280,32 +328,30 @@ Pool: reth::transaction_pool::TransactionPool<Transaction: reth::transaction_poo
     // sim_bid commit tx and set best bid
     pub fn bid_simulate(&self, mut bid_runtime: BidRuntime<Pool, BscEvmConfig>) {
         if !self.bid_receiving {
-            return 
+            return;
         }
-        
+
         // Track simulation start time
         let sim_start = std::time::Instant::now();
         let is_first_bid = self.best_bid.read().is_empty();
-        
+
         let mut success = false;
         let parent_hash = bid_runtime.bid.parent_hash;
         self.simulating_bid.write().insert(parent_hash, bid_runtime.bid.clone());
-        
+
         let mut txs_except_last = bid_runtime.bid.txs.clone();
         let pay_bid_tx = txs_except_last.pop();
-        
-        let state_provider = match self.client.state_by_block_hash(bid_runtime.parent_header.hash_slow()) {
-            Ok(provider) => provider,
-            Err(e) => {
-                debug!("Failed to get state provider by block hash: {:?}", e);
-                return;
-            }
-        };
+
+        let state_provider =
+            match self.client.state_by_block_hash(bid_runtime.parent_header.hash_slow()) {
+                Ok(provider) => provider,
+                Err(e) => {
+                    debug!("Failed to get state provider by block hash: {:?}", e);
+                    return;
+                }
+            };
         let sp_db = StateProviderDatabase::new(&state_provider);
-        let mut db = State::builder()
-            .with_database(sp_db)
-            .with_bundle_update()
-            .build();
+        let mut db = State::builder().with_database(sp_db).with_bundle_update().build();
 
         // Clone necessary fields to avoid borrow conflicts
         let evm_config = bid_runtime.evm_config.clone();
@@ -313,36 +359,50 @@ Pool: reth::transaction_pool::TransactionPool<Transaction: reth::transaction_poo
         let attributes = bid_runtime.attributes.clone();
         let builder_config = bid_runtime.builder_config.clone();
         let gas_limit = builder_config.gas_limit(parent_header.gas_limit);
-        let system_txs_gas = self.parlia.estimate_gas_reserved_for_system_txs(Some(parent_header.timestamp), parent_header.number+1, attributes.timestamp);
+        let system_txs_gas = self.parlia.estimate_gas_reserved_for_system_txs(
+            Some(parent_header.timestamp),
+            parent_header.number + 1,
+            attributes.timestamp,
+        );
         if bid_runtime.bid.gas_used > gas_limit - system_txs_gas - PAY_BID_TX_GAS_LIMIT {
             debug!("bidSimulator: gas limit exceeded, ignore");
             return;
         }
 
-        let mut builder = match evm_config.builder_for_next_block(&mut db, &parent_header, NextBlockEnvAttributes {
-                timestamp:        attributes.timestamp(),
-                suggested_fee_recipient: attributes.suggested_fee_recipient(),
-                prev_randao:      attributes.prev_randao(),
-                gas_limit,
-                parent_beacon_block_root: attributes.parent_beacon_block_root(),
-                withdrawals:     Some(attributes.withdrawals().clone()),
-            }).map_err(PayloadBuilderError::other) {
+        let mut builder = match evm_config
+            .builder_for_next_block(
+                &mut db,
+                &parent_header,
+                NextBlockEnvAttributes {
+                    timestamp: attributes.timestamp(),
+                    suggested_fee_recipient: attributes.suggested_fee_recipient(),
+                    prev_randao: attributes.prev_randao(),
+                    gas_limit,
+                    parent_beacon_block_root: attributes.parent_beacon_block_root(),
+                    withdrawals: Some(attributes.withdrawals().clone()),
+                },
+            )
+            .map_err(PayloadBuilderError::other)
+        {
             Ok(builder) => builder,
             Err(e) => {
                 debug!("Failed to create builder for next block: {:?}", e);
                 return;
             }
         };
-        let mut block_gas_limit: u64 = builder.evm_mut().block().gas_limit.saturating_sub(system_txs_gas);
-        
+        let mut block_gas_limit: u64 =
+            builder.evm_mut().block().gas_limit.saturating_sub(system_txs_gas);
+
         // todo: prefetch transactions
         if let Err(e) = builder.apply_pre_execution_changes().map_err(PayloadBuilderError::other) {
             debug!("Failed to apply pre-execution changes: {:?}", e);
             return;
         }
-        
+
         // First commit: bid transactions
-        if let Err(e) = bid_runtime.commit_transaction(txs_except_last, &mut builder, block_gas_limit) {
+        if let Err(e) =
+            bid_runtime.commit_transaction(txs_except_last, &mut builder, block_gas_limit)
+        {
             debug!("Failed to commit bid transactions: {:?}", e);
             return;
         }
@@ -356,11 +416,14 @@ Pool: reth::transaction_pool::TransactionPool<Transaction: reth::transaction_poo
             debug!("bidSimulator: invalid bid, ignore");
             return;
         }
-        
+
         if bid_runtime.gas_used != 0 {
             let bid_gas_price = bid_runtime.gas_fee / U256::from(bid_runtime.gas_used);
             if bid_gas_price < self.min_gas_price {
-                debug!("bid gas price is lower than min gas price, bid:{}, min:{}", bid_gas_price, self.min_gas_price);
+                debug!(
+                    "bid gas price is lower than min gas price, bid:{}, min:{}",
+                    bid_gas_price, self.min_gas_price
+                );
                 return;
             }
         }
@@ -370,7 +433,9 @@ Pool: reth::transaction_pool::TransactionPool<Transaction: reth::transaction_poo
         // Second commit: pay bid transaction (gas limit already includes space for this)
         if let Some(pay_bid_tx) = pay_bid_tx {
             let pay_bid_txs = vec![pay_bid_tx];
-            if let Err(e) = bid_runtime.commit_transaction(pay_bid_txs, &mut builder, block_gas_limit) {
+            if let Err(e) =
+                bid_runtime.commit_transaction(pay_bid_txs, &mut builder, block_gas_limit)
+            {
                 debug!("Failed to commit pay bid transaction: {:?}", e);
                 return;
             }
@@ -378,15 +443,16 @@ Pool: reth::transaction_pool::TransactionPool<Transaction: reth::transaction_poo
             debug!("No pay bid transaction found, skipping bid");
             return;
         }
-        
+
         // Finish the builder
-        let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } = match builder.finish(&state_provider).map_err(PayloadBuilderError::other) {
-            Ok(outcome) => outcome,
-            Err(e) => {
-                debug!("Failed to finish builder: {:?}", e);
-                return;
-            }
-        };
+        let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } =
+            match builder.finish(&state_provider).map_err(PayloadBuilderError::other) {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    debug!("Failed to finish builder: {:?}", e);
+                    return;
+                }
+            };
         let mut sealed_block = Arc::new(block.sealed_block().clone());
 
         // Update block_hash for all blob sidecars and insert into pool's blob store
@@ -394,7 +460,7 @@ Pool: reth::transaction_pool::TransactionPool<Transaction: reth::transaction_poo
         for sidecar in bid_runtime.blob_sidecars.iter_mut() {
             sidecar.block_hash = block_hash;
         }
-        
+
         let mut plain = sealed_block.clone_block();
         plain.body.sidecars = Some(bid_runtime.blob_sidecars.clone());
         sealed_block = Arc::new(plain.into());
@@ -424,30 +490,30 @@ Pool: reth::transaction_pool::TransactionPool<Transaction: reth::transaction_poo
                 if best_bid.packed_block_reward < bid_runtime.packed_block_reward {
                     best_bid_map.insert(parent_hash, bid_runtime.clone());
                     success = true;
-                }else {
+                } else {
                     debug!("current best bid is better than new bid, ignore");
                 }
-            }else {
+            } else {
                 best_bid_map.insert(parent_hash, bid_runtime.clone());
                 success = true;
             }
         }
-        
+
         // Update metrics after simulation
         let sim_duration = sim_start.elapsed().as_secs_f64();
         self.mev_metrics.bid_simulation_duration_seconds.record(sim_duration);
-        
+
         if is_first_bid {
             self.mev_metrics.first_bid_simulation_seconds.record(sim_duration);
         }
-        
+
         if success {
             self.mev_metrics.valid_bids_total.increment(1);
-            
+
             // Update best bid gas used (in MGas)
             let gas_used_mgas = bid_runtime.gas_used as f64 / 1_000_000.0;
             self.mev_metrics.best_bid_gas_used_mgas.set(gas_used_mgas);
-            
+
             // Calculate simulation speed (MGas/s)
             if sim_duration > 0.0 {
                 let mgasps = gas_used_mgas / sim_duration;
@@ -495,19 +561,33 @@ pub struct BidRuntime<Pool, EvmConfig = BscEvmConfig> {
     builder_config: EthereumBuilderConfig,
     chain_spec: Arc<BscChainSpec>,
     pub bsc_payload: BscBuiltPayload,
-    
+
     gas_used: u64,
     gas_fee: U256,
     blob_sidecars: Vec<BscBlobTransactionSidecar>,
 }
 
-impl<Pool, EvmConfig> BidRuntime<Pool, EvmConfig> 
-where 
-Pool: reth::transaction_pool::TransactionPool<Transaction: reth::transaction_pool::PoolTransaction<Consensus = TransactionSigned>> + Clone + 'static,
-EvmConfig: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
-<EvmConfig as ConfigureEvm>::Primitives: reth_primitives_traits::NodePrimitives<BlockHeader = alloy_consensus::Header, SignedTx = alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip4844>, Block = crate::node::primitives::BscBlock>,
+impl<Pool, EvmConfig> BidRuntime<Pool, EvmConfig>
+where
+    Pool: reth::transaction_pool::TransactionPool<
+            Transaction: reth::transaction_pool::PoolTransaction<Consensus = TransactionSigned>,
+        > + Clone
+        + 'static,
+    EvmConfig: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
+    <EvmConfig as ConfigureEvm>::Primitives: reth_primitives_traits::NodePrimitives<
+        BlockHeader = alloy_consensus::Header,
+        SignedTx = alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip4844>,
+        Block = crate::node::primitives::BscBlock,
+    >,
 {
-    fn new(bid: Bid, pool: Pool, evm_config: EvmConfig, parent_header: SealedHeader, attributes: EthPayloadBuilderAttributes, chain_spec: Arc<BscChainSpec>) -> Self {
+    fn new(
+        bid: Bid,
+        pool: Pool,
+        evm_config: EvmConfig,
+        parent_header: SealedHeader,
+        attributes: EthPayloadBuilderAttributes,
+        chain_spec: Arc<BscChainSpec>,
+    ) -> Self {
         Self {
             bid,
             pool,
@@ -529,10 +609,16 @@ EvmConfig: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
     }
 
     fn is_expected_better_than(&self, ohter: &BidRuntime<Pool, EvmConfig>) -> bool {
-        self.expected_block_reward >= ohter.expected_block_reward && self.expected_validator_reward >= ohter.expected_validator_reward
+        self.expected_block_reward >= ohter.expected_block_reward
+            && self.expected_validator_reward >= ohter.expected_validator_reward
     }
 
-    fn commit_transaction<B>(&mut self, bid_txs: Vec<TransactionSigned>, builder: &mut B, block_gas_limit: u64) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    fn commit_transaction<B>(
+        &mut self,
+        bid_txs: Vec<TransactionSigned>,
+        builder: &mut B,
+        block_gas_limit: u64,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
         B: BlockBuilder,
         B::Primitives: reth_primitives_traits::NodePrimitives<SignedTx = TransactionSigned>,
@@ -543,7 +629,8 @@ EvmConfig: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
         let base_fee = builder.evm().block().basefee;
         let mut cumulative_gas_used = 0;
         let blob_params = self.chain_spec.blob_params_at_timestamp(self.attributes.timestamp());
-        let max_blob_count = blob_params.as_ref().map(|params| params.max_blob_count).unwrap_or_default();
+        let max_blob_count =
+            blob_params.as_ref().map(|params| params.max_blob_count).unwrap_or_default();
         for (index, tx) in bid_txs.into_iter().enumerate() {
             // Check interrupt flag before processing each transaction
             if self.bid.interrupt_flag.load(Ordering::Relaxed) {
@@ -557,11 +644,11 @@ EvmConfig: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
                 // we can't fit this transaction into the block, so we need to mark it as invalid
                 // which also removes all dependent transaction from the iterator before we can
                 // continue
-                debug!("bidSimulator: gas limit exceeded, ignore");
-                continue;
+                debug!("bidSimulator: gas limit exceeded, ignore tx:{}, tx gas limit:{}, block gas limit:{}, cumulative_gas_used:{}", tx_hash, tx.gas_limit(), block_gas_limit, cumulative_gas_used);
+                return Err("gas limit exceeded".into());
             }
             cumulative_gas_used += tx.gas_limit();
-            
+
             // Check blob transaction limits and retrieve sidecar if needed
             if let Some(blob_tx) = tx.as_eip4844() {
                 let tx_hash = *tx.hash();
@@ -569,12 +656,12 @@ EvmConfig: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
 
                 if block_blob_count + tx_blob_count > max_blob_count {
                     debug!(target: "payload_builder", tx=?tx_hash, ?block_blob_count, "skipping blob transaction because it would exceed the max blob count per block");
-                    continue
+                    return Err("blob transaction limit exceeded".into());
                 }
-                
+
                 block_blob_count += tx_blob_count;
             }
-            
+
             let tx_effective_gas_price = tx.effective_gas_price(Some(base_fee));
             let recovered_tx = match tx.try_into_recovered() {
                 Ok(recovered) => recovered,
@@ -587,7 +674,8 @@ EvmConfig: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
             let tx_gas_used = match builder.execute_transaction(recovered_tx.clone()) {
                 Ok(tx_gas_used) => tx_gas_used,
                 Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
-                    error, ..
+                    error,
+                    ..
                 })) => {
                     if error.is_nonce_too_low() {
                         // if the nonce is too low, we can skip this transaction
@@ -597,7 +685,7 @@ EvmConfig: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
                         // descendants
                         debug!(target: "payload_builder", %error, ?recovered_tx, "skipping invalid transaction and its descendants");
                     }
-                    continue
+                    return Err("invalid transaction".into());
                 }
                 Err(err) => return Err(Box::new(PayloadBuilderError::evm(err))),
             };
@@ -607,7 +695,10 @@ EvmConfig: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
                 if let Some(sidecar) = self.bid.blob_sidecars.get(&tx_hash) {
                     // Insert blob sidecar into pool's blob store
                     use alloy_eips::eip7594::BlobTransactionSidecarVariant;
-                    if let Err(e) = self.pool.insert_blob(tx_hash, BlobTransactionSidecarVariant::Eip4844(sidecar.clone())) {
+                    if let Err(e) = self.pool.insert_blob(
+                        tx_hash,
+                        BlobTransactionSidecarVariant::Eip4844(sidecar.clone()),
+                    ) {
                         debug!("Failed to insert blob sidecar for tx {:?}: {:?}", tx_hash, e);
                         return Err("Failed to insert blob sidecar".into());
                     }
@@ -619,26 +710,33 @@ EvmConfig: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
                         tx_hash,
                     };
                     self.blob_sidecars.push(bsc_sidecar);
-                } 
+                }
             }
 
             gas_used += tx_gas_used;
-            gas_fee += (U256::from(tx_effective_gas_price) + U256::from(base_fee)) * U256::from(tx_gas_used);
+            gas_fee += (U256::from(tx_effective_gas_price) + U256::from(base_fee))
+                * U256::from(tx_gas_used);
         }
-        
+
         self.gas_used += gas_used;
         self.gas_fee += gas_fee;
         Ok(())
     }
 
-    fn pack_reward(&mut self, validator_commission: u64, system_balance: U256) -> Result<(), Box<dyn std::error::Error>> {
+    fn pack_reward(
+        &mut self,
+        validator_commission: u64,
+        system_balance: U256,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         self.packed_block_reward = system_balance;
-        self.packed_validator_reward = self.packed_block_reward * U256::from(validator_commission) / U256::from(10000u64);
+        self.packed_validator_reward =
+            self.packed_block_reward * U256::from(validator_commission) / U256::from(10000u64);
         self.packed_validator_reward -= self.bid.builder_fee;
         Ok(())
     }
 
     fn valid_reward(&self) -> bool {
-        self.packed_block_reward >= self.expected_block_reward && self.packed_validator_reward >= self.expected_validator_reward
+        self.packed_block_reward >= self.expected_block_reward
+            && self.packed_validator_reward >= self.expected_validator_reward
     }
 }
