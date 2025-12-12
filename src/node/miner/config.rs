@@ -162,6 +162,33 @@ impl MiningConfig {
         }.ensure_keys_available()
     }
 
+    /// Ensures `validator_address` is populated by deriving it from the configured key material.
+    /// Returns an error if a key source is configured but cannot be decoded.
+    pub fn derive_validator_address_from_keys(&mut self) -> Result<(), String> {
+        if self.validator_address.is_some() {
+            return Ok(());
+        }
+
+        if let Some(ref pk_hex) = self.private_key_hex {
+            let signing_key = keystore::load_private_key_from_hex(pk_hex)
+                .map_err(|err| format!("Failed to load mining private key: {err}"))?;
+            self.validator_address = Some(keystore::get_validator_address(&signing_key));
+            return Ok(());
+        }
+
+        if let Some(ref path) = self.keystore_path {
+            let password = self
+                .keystore_password
+                .as_deref()
+                .ok_or_else(|| "Keystore password must be provided when deriving validator address".to_string())?;
+            let signing_key = keystore::load_private_key_from_keystore(path, password)
+                .map_err(|err| format!("Failed to decrypt keystore {}: {err}", path.display()))?;
+            self.validator_address = Some(keystore::get_validator_address(&signing_key));
+        }
+
+        Ok(())
+    }
+
     /// Load configuration from environment variables
     pub fn from_env() -> Self {
         let enabled = std::env::var("BSC_MINING_ENABLED")
@@ -197,17 +224,8 @@ impl MiningConfig {
             ..Default::default()
         };
 
-        // If a private key is present but validator_address is not, derive it automatically.
-        if cfg.validator_address.is_none() {
-            if let Some(ref pk_hex) = cfg.private_key_hex {
-                if let Ok(sk) = keystore::load_private_key_from_hex(pk_hex) {
-                    cfg.validator_address = Some(keystore::get_validator_address(&sk));
-                }
-            } else if let (Some(ref path), Some(ref pass)) = (&cfg.keystore_path, &cfg.keystore_password) {
-                if let Ok(sk) = keystore::load_private_key_from_keystore(path, pass) {
-                    cfg.validator_address = Some(keystore::get_validator_address(&sk));
-                }
-            }
+        if let Err(err) = cfg.derive_validator_address_from_keys() {
+            tracing::warn!("Failed to derive validator address from configured keys: {err}");
         }
 
         cfg.ensure_keys_available()
@@ -286,6 +304,23 @@ pub mod keystore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{fs, io::Write, path::PathBuf};
+    use uuid::Uuid;
+
+    const SAMPLE_KEYSTORE_JSON: &str = r#"{"address":"bcdd0d2cda5f6423e57b6a4dcd75decbe31aecf0","crypto":{"cipher":"aes-128-ctr","ciphertext":"f7505ced32fe3037d6dc25ae7e9716858e516bacfb0dc28c9995f01cf7fee84a","cipherparams":{"iv":"d93e5314f18ccfc8330e1ad37534fa29"},"kdf":"scrypt","kdfparams":{"dklen":32,"n":262144,"p":1,"r":8,"salt":"1fb8f954f70fb0ddb8be5b1fb57d821df21dda700682f382baed311dde95a6c7"},"mac":"c501bb033f94cb9efc3c63fe1547555fc1412d3abb8b400cacda37bd9de888ec"},"id":"7246dc9c-d170-4009-8878-8628be169836","version":3}"#;
+    const SAMPLE_KEYSTORE_PASSWORD: &str = "0123456789";
+    const SAMPLE_KEYSTORE_ADDRESS: &str = "0xbcdd0d2cda5f6423e57b6a4dcd75decbe31aecf0";
+
+    fn write_sample_keystore() -> PathBuf {
+        let mut path: PathBuf = std::env::temp_dir();
+        let fname =
+            format!("UTC--test-{}--bcdd0d2cda5f6423e57b6a4dcd75decbe31aecf0", Uuid::new_v4());
+        path.push(fname);
+        let mut file = fs::File::create(&path).unwrap();
+        file.write_all(SAMPLE_KEYSTORE_JSON.as_bytes()).unwrap();
+        file.sync_all().unwrap();
+        path
+    }
 
     #[test]
     fn test_mining_config_validation() {
@@ -314,26 +349,12 @@ mod tests {
 
     #[test]
     fn test_load_private_key_from_keystore_file() {
-        use std::fs;
-        use std::io::Write;
-        use std::path::PathBuf;
-        use uuid::Uuid;
-
-        // This is a real V3 keystore JSON (address bcdd0d2c...) with password "0123456789"
-        let keystore_json = r#"{"address":"bcdd0d2cda5f6423e57b6a4dcd75decbe31aecf0","crypto":{"cipher":"aes-128-ctr","ciphertext":"f7505ced32fe3037d6dc25ae7e9716858e516bacfb0dc28c9995f01cf7fee84a","cipherparams":{"iv":"d93e5314f18ccfc8330e1ad37534fa29"},"kdf":"scrypt","kdfparams":{"dklen":32,"n":262144,"p":1,"r":8,"salt":"1fb8f954f70fb0ddb8be5b1fb57d821df21dda700682f382baed311dde95a6c7"},"mac":"c501bb033f94cb9efc3c63fe1547555fc1412d3abb8b400cacda37bd9de888ec"},"id":"7246dc9c-d170-4009-8878-8628be169836","version":3}"#;
-
         // Write to a temporary file
-        let mut path: PathBuf = std::env::temp_dir();
-        let fname = format!("UTC--test-{}--bcdd0d2cda5f6423e57b6a4dcd75decbe31aecf0", Uuid::new_v4());
-        path.push(fname);
-        {
-            let mut f = fs::File::create(&path).unwrap();
-            f.write_all(keystore_json.as_bytes()).unwrap();
-            f.sync_all().unwrap();
-        }
+        let path = write_sample_keystore();
 
         // Decrypt with the known password
-        let signing_key = keystore::load_private_key_from_keystore(&path, "0123456789").unwrap();
+        let signing_key =
+            keystore::load_private_key_from_keystore(&path, SAMPLE_KEYSTORE_PASSWORD).unwrap();
         // convert signing_key to hex string
         let signing_key_hex = alloy_primitives::hex::encode(signing_key.to_bytes());
         println!("signing_key: 0x{}", signing_key_hex);
@@ -341,10 +362,26 @@ mod tests {
         let address = keystore::get_validator_address(&signing_key);
 
         // Expect derived address to match the keystore address
-        let expected: Address = "0xbcdd0d2cda5f6423e57b6a4dcd75decbe31aecf0".parse().unwrap();
+        let expected: Address = SAMPLE_KEYSTORE_ADDRESS.parse().unwrap();
         assert_eq!(address, expected);
 
         // Cleanup best-effort
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn derive_validator_address_from_keystore_config() {
+        let path = write_sample_keystore();
+        let mut cfg = MiningConfig {
+            enabled: true,
+            validator_address: None,
+            keystore_path: Some(path.clone()),
+            keystore_password: Some(SAMPLE_KEYSTORE_PASSWORD.to_string()),
+            ..Default::default()
+        };
+
+        cfg.derive_validator_address_from_keys().unwrap();
+        assert_eq!(cfg.validator_address, Some(SAMPLE_KEYSTORE_ADDRESS.parse().unwrap()));
+        let _ = fs::remove_file(path);
     }
 }
