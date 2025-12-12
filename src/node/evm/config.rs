@@ -5,16 +5,11 @@ use super::{
     factory::BscEvmFactory,
 };
 use crate::{
-    chainspec::BscChainSpec,
-    evm::transaction::BscTxEnv,
-    hardforks::{bsc::BscHardfork, BscHardforks},
-    node::engine_api::validator::BscExecutionData,
-    system_contracts::SystemContract,
-    BscPrimitives,
+    BscPrimitives, chainspec::BscChainSpec, consensus::parlia::VoteAddress, evm::transaction::BscTxEnv, hardforks::{BscHardforks, bsc::BscHardfork}, node::engine_api::validator::BscExecutionData, system_contracts::{SystemContract, feynman_fork::ValidatorElectionInfo}
 };
 use alloy_consensus::{transaction::SignerRecoverable, BlockHeader, Header, TxReceipt};
 use alloy_eips::eip7840::BlobParams;
-use alloy_primitives::{Log, U256};
+use alloy_primitives::{Address, Log, U256};
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
 use reth_ethereum_forks::EthereumHardfork;
 use reth_evm::{
@@ -28,12 +23,39 @@ use reth_evm_ethereum::RethReceiptBuilder;
 use reth_primitives::{BlockTy, HeaderTy, SealedBlock, SealedHeader, TransactionSigned};
 use reth_revm::State;
 use revm::{
-    context::{BlockEnv, CfgEnv},
-    context_interface::block::BlobExcessGasAndPrice,
-    primitives::hardfork::SpecId,
-    Inspector,
+    Inspector, context::{BlockEnv, CfgEnv}, context_interface::block::BlobExcessGasAndPrice, primitives::{hardfork::SpecId}
 };
-use std::{borrow::Cow, convert::Infallible, sync::Arc};
+use std::{borrow::Cow, cell::RefCell, convert::Infallible, rc::Rc, sync::Arc};
+
+/// Type alias for system transactions to reduce complexity
+type SystemTxs = Vec<reth_primitives_traits::Recovered<reth_primitives_traits::TxTy<crate::BscPrimitives>>>;
+
+#[derive(Debug, Clone, Default)]
+pub struct BscExecutionSharedCtxInner {
+    /// current validators for miner to produce block.
+    pub current_validators: Option<(Vec<Address>, Vec<VoteAddress>)>,
+    /// max elected validators for miner to produce block.
+    pub max_elected_validators: Option<U256>,
+    /// validators election info for miner to produce block.
+    pub validators_election_info: Option<Vec<ValidatorElectionInfo>>,
+    /// turn length for miner to produce block.
+    pub turn_length: Option<u8>,
+    /// assembled system txs.
+    pub assembled_system_txs: SystemTxs,
+}
+
+#[derive(Debug, Clone)]
+pub struct BscExecutionSharedCtx {
+    pub inner: Rc<RefCell<BscExecutionSharedCtxInner>>,
+}
+
+impl Default for BscExecutionSharedCtx {
+    fn default() -> Self {
+        Self {
+            inner: Rc::new(RefCell::new(BscExecutionSharedCtxInner::default())),
+        }
+    }
+}
 
 /// Context for BSC block execution.
 /// Contains all the fields from EthBlockExecutionCtx plus additional header field.
@@ -160,6 +182,7 @@ where
         BscBlockExecutor::new(
             evm,
             ctx,
+            BscExecutionSharedCtx::default(),
             self.spec().clone(),
             self.receipt_builder().clone(),
             SystemContract::new(self.spec().clone()),
@@ -355,9 +378,12 @@ where
         DB: Database,
         I: InspectorFor<Self, &'a mut State<DB>> + 'a,
     {
+        // just init a default custom ctx for mining block.
+        let shared_ctx = BscExecutionSharedCtx::default();
         let bsc_executor = BscBlockExecutor::new(
             evm,
             ctx.clone(),
+            shared_ctx.clone(),
             self.executor_factory.spec().clone(),
             *self.executor_factory.receipt_builder(),
             SystemContract::new(self.executor_factory.spec().clone()),
@@ -366,6 +392,7 @@ where
         BscBlockBuilder::new(
             bsc_executor,
             ctx,
+            shared_ctx,
             &self.block_assembler,
             parent,
         )

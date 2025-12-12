@@ -1,13 +1,8 @@
 use super::patch::HertzPatchManager;
 use crate::{
-    consensus::{SYSTEM_ADDRESS, parlia::{VoteAddress, Snapshot, Parlia}},
-    evm::transaction::BscTxEnv,
-    hardforks::BscHardforks,
-    metrics::{BscConsensusMetrics, BscBlockchainMetrics, BscVoteMetrics, BscExecutorMetrics, BscRewardsMetrics},
-    system_contracts::{
-        get_upgrade_system_contracts, is_system_transaction, SystemContract,
-        feynman_fork::ValidatorElectionInfo,
-    },
+    consensus::{SYSTEM_ADDRESS, parlia::{Parlia, Snapshot, VoteAddress}}, evm::transaction::BscTxEnv, hardforks::BscHardforks, metrics::{BscBlockchainMetrics, BscConsensusMetrics, BscExecutorMetrics, BscRewardsMetrics, BscVoteMetrics}, node::evm::config::BscExecutionSharedCtx, system_contracts::{
+        SystemContract, feynman_fork::ValidatorElectionInfo, get_upgrade_system_contracts, is_system_transaction
+    }
 };
 use alloy_consensus::{Header, Transaction, TxReceipt};
 use alloy_eips::{eip7685::Requests, Encodable2718};
@@ -36,16 +31,8 @@ use revm::{
 use tracing::{error, warn, info, debug, trace};
 use alloy_eips::eip2935::{HISTORY_STORAGE_ADDRESS, HISTORY_STORAGE_CODE};
 use alloy_primitives::keccak256;
-use std::{collections::HashMap, sync::Arc, cell::RefCell};
+use std::{collections::HashMap, sync::Arc};
 use crate::consensus::parlia::SnapshotProvider;
-
-/// Type alias for system transactions to reduce complexity
-type SystemTxs = Vec<reth_primitives_traits::Recovered<reth_primitives_traits::TxTy<crate::BscPrimitives>>>;
-
-thread_local! {
-    pub static ASSEMBLED_SYSTEM_TXS: RefCell<SystemTxs> = const { RefCell::new(Vec::new()) };
-}
-
 /// Helper type for the input of post execution.
 #[allow(clippy::type_complexity)]
 #[derive(Debug, Clone)]
@@ -88,8 +75,8 @@ where
     pub(crate) parlia: Arc<Parlia<Spec>>,
     /// Inner execution context.
     pub(super) inner_ctx: InnerExecutionContext,
-    /// assembled system txs.
-    pub(crate) assembled_system_txs: SystemTxs,
+    /// Shared context for block execution.
+    pub(super) shared_ctx: BscExecutionSharedCtx,
     /// Consensus metrics for tracking block height and other consensus stats.
     pub(super) consensus_metrics: BscConsensusMetrics,
     /// Blockchain metrics for tracking receipts and block processing.
@@ -122,6 +109,7 @@ where
     pub(crate) fn new(
         evm: EVM,
         ctx: BscBlockExecutionCtx<'a>,
+        shared_ctx: BscExecutionSharedCtx,
         spec: Spec,
         receipt_builder: R,
         system_contracts: SystemContract<Spec>,
@@ -148,6 +136,7 @@ where
             system_contracts,
             hertz_patch_manager,
             ctx,
+            shared_ctx,
             system_caller: SystemCaller::new(spec_clone),
             snapshot_provider: crate::shared::get_snapshot_provider().cloned(),
             parlia,
@@ -159,7 +148,6 @@ where
                 header: None,
                 parent_header: None,
             },
-            assembled_system_txs: vec![],
             consensus_metrics: BscConsensusMetrics::default(),
             blockchain_metrics: BscBlockchainMetrics::default(),
             vote_metrics: BscVoteMetrics::default(),
@@ -555,10 +543,6 @@ where
             self.post_check_new_block(&self.evm.block().clone())?;
         }
 
-        ASSEMBLED_SYSTEM_TXS.with(|txs| {
-            *txs.borrow_mut() = self.assembled_system_txs.clone();
-        });
-
         // Update receipt height metric
         let block_number = self.evm.block().number.to::<u64>();
         self.blockchain_metrics.current_receipt_height.set(block_number as f64);
@@ -615,20 +599,4 @@ where
         &self.evm
     }
 
-}
-
-impl<'a, EVM, Spec, R: ReceiptBuilder> BscBlockExecutor<'a, EVM, Spec, R>
-where
-    Spec: EthChainSpec + EthereumHardforks + BscHardforks + Hardforks + Clone,
-    EVM: alloy_evm::Evm,
-{
-    // miner BscBlockBuilder use this method to fetch system txs.
-    pub(crate) fn finish_with_system_txs<F, T>(self, finish_fn: F) -> Result<(T, SystemTxs), BlockExecutionError>
-    where
-        F: FnOnce(Self) -> Result<T, BlockExecutionError>,
-    {
-        let result = finish_fn(self)?;
-        let system_txs = ASSEMBLED_SYSTEM_TXS.with(|txs| txs.borrow().clone());
-        Ok((result, system_txs))
-    }
 }
