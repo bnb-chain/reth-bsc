@@ -13004,39 +13004,3 @@ dependencies = [
  "cc",
  "pkg-config",
 ]
-
-[[patch.unused]]
-name = "reth-e2e-test-utils"
-version = "1.7.0"
-
-[[patch.unused]]
-name = "reth-ethereum"
-version = "1.7.0"
-
-[[patch.unused]]
-name = "reth-exex-test-utils"
-version = "1.7.0"
-
-[[patch.unused]]
-name = "reth-payload-util"
-version = "1.7.0"
-
-[[patch.unused]]
-name = "reth-rpc-api-testing-util"
-version = "1.7.0"
-
-[[patch.unused]]
-name = "reth-rpc-e2e-tests"
-version = "1.7.0"
-
-[[patch.unused]]
-name = "reth-stateless"
-version = "1.7.0"
-
-[[patch.unused]]
-name = "reth-storage-rpc-provider"
-version = "1.7.0"
-
-[[patch.unused]]
-name = "reth-tracing-otlp"
-version = "1.7.0"

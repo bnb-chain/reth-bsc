@@ -322,7 +322,19 @@ where
                     .provider_factory
                     .database_provider_ro()
                     .map_err(BlockExecutionError::other)?;
-                let db_last = provider_ro.last_block_number().map_err(BlockExecutionError::other)?;
+                // Use the highest fully-available DB tip for trie reads.
+                // During persistence, static-file tip can temporarily move ahead of DB tables.
+                let db_last = provider_ro.best_block_number().map_err(BlockExecutionError::other)?;
+                // If the database is ahead of the requested parent (e.g. we're building on an
+                // ancestor due to reorg/stale work), then a forward overlay is not sufficient.
+                // In that case, we must fall back to the serial `StateProvider` view (or implement
+                // a revert-state overlay like engine-tree does).
+                if db_last > self.parent.number {
+                    return Err(BlockExecutionError::other(std::io::Error::other(format!(
+                        "db tip ({db_last}) ahead of parent ({})",
+                        self.parent.number
+                    ))));
+                }
                 let db_tip = provider_ro
                     .sealed_header(db_last)
                     .map_err(BlockExecutionError::other)?
@@ -538,7 +550,19 @@ where
                     .provider_factory
                     .database_provider_ro()
                     .map_err(BlockExecutionError::other)?;
-                let db_last = provider_ro.last_block_number().map_err(BlockExecutionError::other)?;
+                // Use the highest fully-available DB tip for trie reads.
+                // During persistence, static-file tip can temporarily move ahead of DB tables.
+                let db_last = provider_ro.best_block_number().map_err(BlockExecutionError::other)?;
+                // If the database is ahead of the requested parent (e.g. we're building on an
+                // ancestor due to reorg/stale work), then a forward overlay is not sufficient.
+                // In that case, we must fall back to the serial `StateProvider` view (or implement
+                // a revert-state overlay like engine-tree does).
+                if db_last > self.parent.number {
+                    return Err(BlockExecutionError::other(std::io::Error::other(format!(
+                        "db tip ({db_last}) ahead of parent ({})",
+                        self.parent.number
+                    ))));
+                }
                 let db_tip = provider_ro
                     .sealed_header(db_last)
                     .map_err(BlockExecutionError::other)?
