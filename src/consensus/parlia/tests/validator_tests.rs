@@ -51,13 +51,13 @@ fn test_snapshot_with_validators() {
     expected_validators.sort();
     assert_eq!(snapshot.validators, expected_validators);
     
-    // Check validator map entries - when vote_addrs is None, ValidatorInfo uses Default
-    // which sets index=0 and vote_addr=VoteAddress::default()
-    for validator in expected_validators.iter() {
+    // Check validator map entries - when vote_addrs is None, indices are 1-based
+    // Index is based on sorted position: 1, 2, 3, ...
+    for (idx, validator) in expected_validators.iter().enumerate() {
         let info = snapshot.validators_map.get(validator).unwrap();
-        // When no vote_addrs provided, Default::default() is used which has index=0
-        assert_eq!(info.index, 0);
-        assert_eq!(info.vote_addr, VoteAddress::default());
+        // When no vote_addrs provided, indices are assigned as (sorted_position + 1)
+        assert_eq!(info.index, (idx + 1) as u64);
+        assert_eq!(info.vote_addr, VoteAddress::ZERO);
     }
 }
 
