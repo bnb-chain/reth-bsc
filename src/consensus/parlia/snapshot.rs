@@ -29,8 +29,8 @@ pub const MAXWELL_TURN_LENGTH: u8 = 16;
 
 pub const DEFAULT_BLOCK_INTERVAL: u64 = 3000;   // 3000 ms
 pub const LORENTZ_BLOCK_INTERVAL: u64 = 1500;   // 1500 ms
-pub const MAXWELL_BLOCK_INTERVAL: u64 = 750;   //  750 ms
-pub const FERMI_BLOCK_INTERVAL: u64 = 450;   //  450 ms
+pub const MAXWELL_BLOCK_INTERVAL: u64 = 750;    //  750 ms
+pub const FERMI_BLOCK_INTERVAL: u64 = 450;      //  450 ms
 
 /// Global metrics for vote attestation operations.
 static VOTE_METRICS: Lazy<BscVoteMetrics> = Lazy::new(BscVoteMetrics::default);
@@ -83,9 +83,6 @@ impl Snapshot {
         // Ensure epoch_num is never zero to prevent division by zero errors
         let epoch_num = if epoch_num == 0 { DEFAULT_EPOCH_LENGTH } else { epoch_num };
         
-        // Keep validators sorted.
-        validators.sort();
-
         let mut validators_map = HashMap::new();
         if let Some(vote_addrs) = vote_addrs {
             assert_eq!(
@@ -94,14 +91,34 @@ impl Snapshot {
                 "validators and vote_addrs length not equal",
             );
 
+            // Step 1: Build mapping with original order to maintain validator->vote_addr correspondence
             for (i, v) in validators.iter().enumerate() {
-                let info = ValidatorInfo { index: i as u64 + 1, vote_addr: vote_addrs[i] };
+                let info = ValidatorInfo { 
+                    index: 0,  // Will be set after sorting
+                    vote_addr: vote_addrs[i] 
+                };
                 validators_map.insert(*v, info);
+            }
+
+            // Step 2: Sort validators
+            validators.sort();
+
+            // Step 3: Set index based on sorted position
+            for (i, v) in validators.iter().enumerate() {
+                if let Some(info) = validators_map.get_mut(v) {
+                    info.index = i as u64 + 1;
+                }
             }
         } else {
             // Pre-Bohr, vote addresses are unknown.
-            for v in &validators {
-                validators_map.insert(*v, Default::default());
+            // Sort first, then create map with indices
+            validators.sort();
+            for (i, v) in validators.iter().enumerate() {
+                let info = ValidatorInfo {
+                    index: i as u64 + 1,
+                    vote_addr: VoteAddress::ZERO,
+                };
+                validators_map.insert(*v, info);
             }
         }
 
@@ -211,7 +228,6 @@ impl Snapshot {
         let epoch_key = u64::MAX - block_number / epoch_length;
         if !new_validators.is_empty() && (!is_bohr || !snap.recent_proposers.contains_key(&epoch_key)) {
             // Epoch change driven by new validator set / checkpoint header.
-            new_validators.sort();
             if let Some(tl) = turn_length { snap.turn_length = Some(tl) }
 
             if is_bohr {
@@ -237,11 +253,32 @@ impl Snapshot {
                     "validators and vote_addrs length not equal",
                 );
 
+                // Step 1: Build mapping with original order to maintain validator->vote_addr correspondence
                 for (i, v) in new_validators.iter().enumerate() {
-                    validators_map.insert(*v, ValidatorInfo { index: i as u64 + 1, vote_addr: vote_addrs[i] });
+                    validators_map.insert(*v, ValidatorInfo { 
+                        index: 0,  // Will be set after sorting
+                        vote_addr: vote_addrs[i] 
+                    });
+                }
+
+                // Step 2: Sort validators
+                new_validators.sort();
+
+                // Step 3: Set index based on sorted position
+                for (i, v) in new_validators.iter().enumerate() {
+                    if let Some(info) = validators_map.get_mut(v) {
+                        info.index = i as u64 + 1;
+                    }
                 }
             } else {
-                for v in &new_validators { validators_map.insert(*v, Default::default()); }
+                // Pre-Luban: no vote addresses, just sort and create default entries
+                new_validators.sort();
+                for (i, v) in new_validators.iter().enumerate() {
+                    validators_map.insert(*v, ValidatorInfo {
+                        index: i as u64 + 1,
+                        vote_addr: VoteAddress::ZERO,
+                    });
+                }
             }
             snap.validators = new_validators;
             snap.validators_map = validators_map;
