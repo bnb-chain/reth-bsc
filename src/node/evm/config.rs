@@ -1,6 +1,6 @@
 use super::{
     assembler::BscBlockAssembler,
-    builder::BscBlockBuilder,
+    builder::{BscBlockBuilder, BscBlockBuilderWithFactory},
     executor::BscBlockExecutor,
     factory::BscEvmFactory,
 };
@@ -25,6 +25,7 @@ use reth_revm::State;
 use revm::{
     Inspector, context::{BlockEnv, CfgEnv}, context_interface::block::BlobExcessGasAndPrice, primitives::{hardfork::SpecId}
 };
+use reth_provider::{BlockReader, BlockNumReader, DatabaseProviderFactory, HeaderProvider};
 use std::{borrow::Cow, cell::RefCell, convert::Infallible, rc::Rc, sync::Arc};
 
 /// Type alias for system transactions to reduce complexity
@@ -96,6 +97,32 @@ impl BscEvmConfig {
     /// Creates a new Ethereum EVM configuration.
     pub fn bsc(chain_spec: Arc<BscChainSpec>) -> Self {
         Self::new_with_evm_factory(chain_spec, BscEvmFactory::default())
+    }
+
+    /// Wraps this config with a provider factory so the block builder can compute state root using
+    /// `ParallelStateRoot` (requires a consistent DB view).
+    pub fn with_provider_factory<Factory>(self, provider_factory: Factory) -> BscEvmConfigWithFactory<Factory>
+    where
+        Factory: Clone,
+    {
+        BscEvmConfigWithFactory { inner: self, provider_factory }
+    }
+}
+
+/// BSC EVM config wrapper that carries a `DatabaseProviderFactory` for parallel state root.
+#[derive(Clone)]
+pub struct BscEvmConfigWithFactory<Factory> {
+    inner: BscEvmConfig,
+    provider_factory: Factory,
+}
+
+impl<Factory> core::fmt::Debug for BscEvmConfigWithFactory<Factory> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Do not require `Factory: Debug` (provider factory types can be large/non-debug).
+        f.debug_struct("BscEvmConfigWithFactory")
+            .field("inner", &self.inner)
+            .field("provider_factory", &"<opaque>")
+            .finish()
     }
 }
 
@@ -399,6 +426,93 @@ where
     }
 }
 
+impl<Factory> ConfigureEvm for BscEvmConfigWithFactory<Factory>
+where
+    Self: Send + Sync + Unpin + Clone + 'static,
+    Factory: DatabaseProviderFactory<Provider: BlockNumReader + HeaderProvider + BlockReader>
+        + Clone
+        + Send
+        + Sync
+        + Unpin
+        + 'static,
+{
+    type Primitives = BscPrimitives;
+    type Error = Infallible;
+    type NextBlockEnvCtx = NextBlockEnvAttributes;
+    type BlockExecutorFactory = BscBlockExecutorFactory;
+    type BlockAssembler = BscBlockAssembler<BscChainSpec>;
+
+    fn block_executor_factory(&self) -> &Self::BlockExecutorFactory {
+        <BscEvmConfig as ConfigureEvm>::block_executor_factory(&self.inner)
+    }
+
+    fn block_assembler(&self) -> &Self::BlockAssembler {
+        <BscEvmConfig as ConfigureEvm>::block_assembler(&self.inner)
+    }
+
+    fn evm_env(&self, header: &Header) -> EvmEnv<BscHardfork> {
+        <BscEvmConfig as ConfigureEvm>::evm_env(&self.inner, header)
+    }
+
+    fn next_evm_env(
+        &self,
+        parent: &Header,
+        attributes: &Self::NextBlockEnvCtx,
+    ) -> Result<EvmEnv<BscHardfork>, Self::Error> {
+        <BscEvmConfig as ConfigureEvm>::next_evm_env(&self.inner, parent, attributes)
+    }
+
+    fn context_for_block<'a>(
+        &self,
+        block: &'a SealedBlock<BlockTy<Self::Primitives>>,
+    ) -> ExecutionCtxFor<'a, Self> {
+        <BscEvmConfig as ConfigureEvm>::context_for_block(&self.inner, block)
+    }
+
+    fn context_for_next_block(
+        &self,
+        parent: &SealedHeader<HeaderTy<Self::Primitives>>,
+        attributes: Self::NextBlockEnvCtx,
+    ) -> ExecutionCtxFor<'_, Self> {
+        <BscEvmConfig as ConfigureEvm>::context_for_next_block(&self.inner, parent, attributes)
+    }
+
+    fn create_block_builder<'a, DB, I>(
+        &'a self,
+        evm: EvmFor<Self, &'a mut State<DB>, I>,
+        parent: &'a SealedHeader<HeaderTy<Self::Primitives>>,
+        ctx: <Self::BlockExecutorFactory as BlockExecutorFactory>::ExecutionCtx<'a>,
+    ) -> impl BlockBuilder<
+        Primitives = Self::Primitives,
+        Executor: BlockExecutorFor<'a, Self::BlockExecutorFactory, DB, I>,
+    >
+    where
+        DB: Database,
+        I: InspectorFor<Self, &'a mut State<DB>> + 'a,
+    {
+        // Mirror the inner implementation but return the builder variant that has access to the
+        // provider factory, enabling parallel state root.
+        let shared_ctx = BscExecutionSharedCtx::default();
+        let bsc_executor = BscBlockExecutor::new(
+            evm,
+            ctx.clone(),
+            shared_ctx.clone(),
+            self.block_executor_factory().spec().clone(),
+            *self.block_executor_factory().receipt_builder(),
+            SystemContract::new(self.block_executor_factory().spec().clone()),
+        );
+
+        BscBlockBuilderWithFactory::new(
+            bsc_executor,
+            ctx,
+            shared_ctx,
+            self.block_assembler(),
+            parent,
+            self.provider_factory.clone(),
+        )
+    }
+}
+
 impl ConfigureEngineEvm<BscExecutionData> for BscEvmConfig
 where
     Self: Send + Sync + Unpin + Clone + 'static,
@@ -426,6 +540,32 @@ where
         payload: &BscExecutionData,
     ) -> impl ExecutableTxIterator<Self> {
         payload.0.body.inner.transactions.clone().into_iter().map(|tx| tx.try_into_recovered())
+    }
+}
+
+impl<Factory> ConfigureEngineEvm<BscExecutionData> for BscEvmConfigWithFactory<Factory>
+where
+    Self: Send + Sync + Unpin + Clone + 'static,
+    Factory: DatabaseProviderFactory<Provider: BlockNumReader + HeaderProvider + BlockReader>
+        + Clone
+        + Send
+        + Sync
+        + Unpin
+        + 'static,
+{
+    fn evm_env_for_payload(&self, payload: &BscExecutionData) -> EvmEnv<BscHardfork> {
+        <BscEvmConfig as ConfigureEngineEvm<BscExecutionData>>::evm_env_for_payload(&self.inner, payload)
+    }
+
+    fn context_for_payload<'a>(&self, payload: &'a BscExecutionData) -> BscBlockExecutionCtx<'a> {
+        <BscEvmConfig as ConfigureEngineEvm<BscExecutionData>>::context_for_payload(&self.inner, payload)
+    }
+
+    fn tx_iterator_for_payload(
+        &self,
+        payload: &BscExecutionData,
+    ) -> impl ExecutableTxIterator<Self> {
+        <BscEvmConfig as ConfigureEngineEvm<BscExecutionData>>::tx_iterator_for_payload(&self.inner, payload)
     }
 }
 
