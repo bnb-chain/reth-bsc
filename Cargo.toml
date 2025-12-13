@@ -52,6 +52,8 @@ reth-trie-common = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.
 reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.6" }
 reth-trie = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.6" }
 reth-trie-parallel = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.6" }
+reth-trie-sparse = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.6" }
+reth-trie-sparse-parallel = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.6" }
 reth-execution-types = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.6" }
 reth-tasks = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.6" }
 reth-transaction-pool = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.6" }

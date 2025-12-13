@@ -9585,6 +9585,8 @@ dependencies = [
  "reth-trie-common",
  "reth-trie-db",
  "reth-trie-parallel",
+ "reth-trie-sparse",
+ "reth-trie-sparse-parallel",
  "revm",
  "schnellru",
  "scrypt 0.11.0",
