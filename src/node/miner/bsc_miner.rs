@@ -4,7 +4,7 @@ use crate::{
     node::{
         engine::BscBuiltPayload,
         evm::config::BscEvmConfig,
-        trie_overlay::{init_trie_overlay_cache, trie_overlay_cache, TrieOverlayEntry},
+        trie_root::RootSpeederUpdater,
         miner::{
             config::{MiningConfig, keystore}, payload::{BscPayloadBuilder, BscPayloadJob, BscPayloadJobHandle}, signer::init_global_signer_from_k256, util::prepare_new_attributes
         },
@@ -29,7 +29,6 @@ use reth_tasks::TaskExecutor;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
-use tokio::sync::broadcast;
 use tokio::task::JoinSet;
 use tokio_stream::StreamExt;
 use tracing::{debug, error, info, warn, trace};
@@ -42,7 +41,6 @@ use crate::node::miner::bid_simulator::{BidSimulator, BidRuntime};
 use std::time::Duration;
 use std::sync::Mutex;
 use lru::LruCache;
-use reth_chain_state::{ExecutedTrieUpdates, NewCanonicalChain};
 
 /// Maximum number of recently mined blocks to track for double signing prevention
 const RECENT_MINED_BLOCKS_CACHE_SIZE: usize = 100;
@@ -64,13 +62,26 @@ pub struct SubmitContext {
 }
 
 /// NewWorkWorker responsible for listening to canonical state changes and triggering mining.
-pub struct NewWorkWorker<Provider> {
+pub struct NewWorkWorker<Provider>
+where
+    Provider: HeaderProvider<Header = alloy_consensus::Header>
+        + BlockNumReader
+        + reth_provider::StateProviderFactory
+        + CanonStateSubscriptions
+        + NewCanonicalChainSubscriptions
+        + reth_provider::NodePrimitivesProvider
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+{
     validator_address: Address,
     provider: Provider,
     snapshot_provider: Arc<dyn SnapshotProvider + Send + Sync>,
     mining_queue_tx: mpsc::UnboundedSender<MiningContext>,
     consensus: Arc<Parlia<BscChainSpec>>,
     pre_cached: Option<PrecachedState>,
+    root_speeder: RootSpeederUpdater<Provider>,
 }
 
 impl<Provider> NewWorkWorker<Provider> 
@@ -93,6 +104,7 @@ where
         mining_queue_tx: mpsc::UnboundedSender<MiningContext>,
         consensus: Arc<Parlia<BscChainSpec>>,
     ) -> Self {
+        let root_speeder = RootSpeederUpdater::new(&provider, 128);
         Self {
             validator_address,
             provider,
@@ -100,14 +112,12 @@ where
             mining_queue_tx,
             consensus,
             pre_cached: None,
+            root_speeder,
         }
     }
 
     pub async fn run(mut self) {
         info!("Succeed to spawn new work worker, address: {}", self.validator_address);
-
-        // Initialize trie overlay cache once (small: only bridges DB lag).
-        let _ = init_trie_overlay_cache(128);
         
         if let Some(tip_header) = self.get_tip_header_at_startup() {
             debug!("Try new work at startup, tip_block={}", tip_header.number());
@@ -115,19 +125,11 @@ where
         }
         
         let mut notifications = self.provider.canonical_state_stream();
-        let mut new_chain_rx = self.provider.subscribe_to_new_canonical_chain();
         loop {
             match notifications.next().await {
                 Some(event) => {
-                    // Drain raw canonical chain updates first (these carry trie updates).
-                    loop {
-                        match new_chain_rx.try_recv() {
-                            Ok(update) => self.update_trie_overlay_cache(&update),
-                            Err(broadcast::error::TryRecvError::Empty) => break,
-                            Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
-                            Err(broadcast::error::TryRecvError::Closed) => break,
-                        }
-                    }
+                    // Keep trie root overlay cache up-to-date.
+                    self.root_speeder.drain();
 
                     let committed = event.committed();
                     let tip = committed.tip();
@@ -222,44 +224,6 @@ where
                 None => {
                     warn!("Canonical state notification stream ended, exiting...");
                     break;
-                }
-            }
-        }
-    }
-
-    fn update_trie_overlay_cache<N: reth_primitives_traits::NodePrimitives>(
-        &self,
-        event: &NewCanonicalChain<N>,
-    ) {
-        let Some(cache) = trie_overlay_cache() else { return };
-        let mut w = cache.write();
-        match event {
-            NewCanonicalChain::Commit { new } => {
-                for exec in new {
-                    let num = exec.block.block_number();
-                    let hash = exec.block.recovered_block.hash();
-                    let hashed_state = Arc::clone(&exec.block.hashed_state);
-                    let trie_updates = match &exec.trie {
-                        ExecutedTrieUpdates::Present(updates) => Some(Arc::clone(updates)),
-                        ExecutedTrieUpdates::Missing => None,
-                    };
-                    w.insert(TrieOverlayEntry { number: num, hash, hashed_state, trie_updates });
-                }
-            }
-            NewCanonicalChain::Reorg { new, old } => {
-                for exec in old {
-                    let num = exec.block_number();
-                    w.remove_range(num..=num);
-                }
-                for exec in new {
-                    let num = exec.block.block_number();
-                    let hash = exec.block.recovered_block.hash();
-                    let hashed_state = Arc::clone(&exec.block.hashed_state);
-                    let trie_updates = match &exec.trie {
-                        ExecutedTrieUpdates::Present(updates) => Some(Arc::clone(updates)),
-                        ExecutedTrieUpdates::Missing => None,
-                    };
-                    w.insert(TrieOverlayEntry { number: num, hash, hashed_state, trie_updates });
                 }
             }
         }
@@ -1070,7 +1034,19 @@ where
 }
 
 /// Miner that handles block production for BSC.
-pub struct BscMiner<Pool, Provider> {
+pub struct BscMiner<Pool, Provider>
+where
+    Provider: HeaderProvider<Header = alloy_consensus::Header>
+        + BlockNumReader
+        + reth_provider::StateProviderFactory
+        + CanonStateSubscriptions
+        + NewCanonicalChainSubscriptions
+        + reth_provider::NodePrimitivesProvider
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+{
     validator_address: Address,
     signing_key: SigningKey,
     new_work_worker: NewWorkWorker<Provider>,

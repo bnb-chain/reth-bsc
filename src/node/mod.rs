@@ -32,7 +32,7 @@ pub mod miner;
 pub mod network;
 pub mod primitives;
 pub mod storage;
-pub mod trie_overlay;
+pub mod trie_root;
 pub mod vote_producer;
 pub mod vote_journal;
 
