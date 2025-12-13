@@ -485,6 +485,18 @@ pub fn clear_body_cache() {
     }
 }
 
+// ============ MEV Running Status ============
+
+/// Set global MEV running status (called by MevWorkWorker on startup)
+pub fn set_mev_running(running: Arc<AtomicBool>) -> Result<(), Arc<AtomicBool>> {
+    MEV_RUNNING.set(running)
+}
+
+/// Get global MEV running status
+pub fn is_mev_running() -> bool {
+    MEV_RUNNING.get().map(|status| status.load(Ordering::Relaxed)).unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -514,16 +526,4 @@ mod tests {
     // Note: eviction behavior depends on access patterns; an exhaustive eviction
     // test would be flaky here without introspecting the LRU. The cache is covered
     // by basic put/get tests above.
-}
-
-// ============ MEV Running Status ============
-
-/// Set global MEV running status (called by MevWorkWorker on startup)
-pub fn set_mev_running(running: Arc<AtomicBool>) -> Result<(), Arc<AtomicBool>> {
-    MEV_RUNNING.set(running)
-}
-
-/// Get global MEV running status
-pub fn is_mev_running() -> bool {
-    MEV_RUNNING.get().map(|status| status.load(Ordering::Relaxed)).unwrap_or(false)
 }
