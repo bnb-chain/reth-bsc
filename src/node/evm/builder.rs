@@ -300,6 +300,12 @@ where
         // Start accelerated state-root computation in the background BEFORE we run the serial
         // authoritative state-root, so we can compare overlapped timings.
         let compare_state = Arc::new(Mutex::new(StateRootCompareState::default()));
+        {
+            let mut w = compare_state.lock();
+            w.user_tx_len = Some(self.transactions.len());
+            w.system_tx_len = Some(assembled_system_txs.len());
+            w.total_tx_len = Some(self.transactions.len() + assembled_system_txs.len());
+        }
         RootSpeeder::spawn_accelerated_compare(
             self.provider_factory.clone(),
             self.parent.number,

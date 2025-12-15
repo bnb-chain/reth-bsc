@@ -77,9 +77,27 @@ pub struct RootSpeederPrefetch {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct StateRootCompareState {
     pub block_hash: Option<B256>,
+    pub user_tx_len: Option<usize>,
+    pub system_tx_len: Option<usize>,
+    pub total_tx_len: Option<usize>,
     pub serial_root: Option<B256>,
     pub serial_duration_ms: Option<u128>,
 }
+
+#[derive(Debug, Default)]
+struct StateRootCompareStats {
+    samples: u64,
+    serial_faster: u64,
+    accelerated_faster: u64,
+    tie: u64,
+
+    sum_total_tx_len: u128,
+    sum_serial_ms: u128,
+    sum_accel_ms: u128,
+}
+
+static STATE_ROOT_COMPARE_STATS: OnceLock<Arc<Mutex<StateRootCompareStats>>> = OnceLock::new();
+static STATE_ROOT_COMPARE_PRINTER_STARTED: OnceLock<()> = OnceLock::new();
 
 impl RootSpeederPrefetch {
     pub fn new(parent_number: u64, parent_hash: B256) -> Self {
@@ -260,6 +278,56 @@ impl RootSpeederPrefetch {
 }
 
 impl RootSpeeder {
+    fn compare_stats() -> Arc<Mutex<StateRootCompareStats>> {
+        STATE_ROOT_COMPARE_STATS
+            .get_or_init(|| Arc::new(Mutex::new(StateRootCompareStats::default())))
+            .clone()
+    }
+
+    fn start_compare_printer_thread_once() {
+        STATE_ROOT_COMPARE_PRINTER_STARTED.get_or_init(|| {
+            let stats = Self::compare_stats();
+            std::thread::spawn(move || loop {
+                std::thread::sleep(Duration::from_secs(30));
+                let snapshot = {
+                    let s = stats.lock();
+                    (
+                        s.samples,
+                        s.serial_faster,
+                        s.accelerated_faster,
+                        s.tie,
+                        s.sum_total_tx_len,
+                        s.sum_serial_ms,
+                        s.sum_accel_ms,
+                    )
+                };
+
+                let (samples, serial_faster, accelerated_faster, tie, sum_total_tx_len, sum_serial_ms, sum_accel_ms) =
+                    snapshot;
+
+                if samples == 0 {
+                    continue;
+                }
+
+                let avg_tx = (sum_total_tx_len as f64) / (samples as f64);
+                let avg_serial_ms = (sum_serial_ms as f64) / (samples as f64);
+                let avg_accel_ms = (sum_accel_ms as f64) / (samples as f64);
+
+                tracing::info!(
+                    target: "bsc::builder",
+                    samples,
+                    serial_faster,
+                    accelerated_faster,
+                    tie,
+                    avg_total_tx_len = avg_tx,
+                    avg_serial_ms = avg_serial_ms,
+                    avg_accel_ms = avg_accel_ms,
+                    "State root compare summary (last 30s interval is cumulative)"
+                );
+            });
+        });
+    }
+
     fn wait_for_compare_state(
         state: &Mutex<StateRootCompareState>,
     ) -> StateRootCompareState {
@@ -281,6 +349,29 @@ impl RootSpeeder {
         }
     }
 
+    fn record_compare_sample(
+        snapshot: StateRootCompareState,
+        accel_ms: u128,
+    ) {
+        let Some(serial_ms) = snapshot.serial_duration_ms else { return };
+        let total_tx_len = snapshot.total_tx_len.unwrap_or(0) as u128;
+
+        let stats_arc = Self::compare_stats();
+        let mut stats = stats_arc.lock();
+        stats.samples += 1;
+        stats.sum_total_tx_len += total_tx_len;
+        stats.sum_serial_ms += serial_ms;
+        stats.sum_accel_ms += accel_ms;
+
+        if serial_ms < accel_ms {
+            stats.serial_faster += 1;
+        } else if serial_ms > accel_ms {
+            stats.accelerated_faster += 1;
+        } else {
+            stats.tie += 1;
+        }
+    }
+
     /// Spawn an accelerated (sparse/parallel) state-root computation for **comparison only**.
     ///
     /// The caller supplies the authoritative serial root result. We compute the accelerated root
@@ -298,6 +389,9 @@ impl RootSpeeder {
             + Sync
             + 'static,
     {
+        // Ensure the periodic summary thread is running.
+        Self::start_compare_printer_thread_once();
+
         std::thread::spawn(move || {
             let start = std::time::Instant::now();
             let res = Self::compute_accelerated_db_overlay_only(
@@ -309,8 +403,28 @@ impl RootSpeeder {
             let accel_dur = start.elapsed();
             let snapshot = Self::wait_for_compare_state(&compare_state);
             let block_hash = snapshot.block_hash;
+            let user_tx_len = snapshot.user_tx_len;
+            let system_tx_len = snapshot.system_tx_len;
+            let total_tx_len = snapshot.total_tx_len;
             let serial_state_root = snapshot.serial_root;
             let serial_state_root_duration_ms = snapshot.serial_duration_ms;
+            let accel_state_root_duration_ms = accel_dur.as_millis();
+
+            // Update global stats (only if we have the serial duration).
+            Self::record_compare_sample(snapshot, accel_state_root_duration_ms);
+
+            let (faster_side, faster_by_ms) = match serial_state_root_duration_ms {
+                Some(serial_ms) => {
+                    if serial_ms < accel_state_root_duration_ms {
+                        (Some("serial"), Some(accel_state_root_duration_ms - serial_ms))
+                    } else if serial_ms > accel_state_root_duration_ms {
+                        (Some("accelerated"), Some(serial_ms - accel_state_root_duration_ms))
+                    } else {
+                        (Some("tie"), Some(0))
+                    }
+                }
+                None => (None, None),
+            };
 
             match res {
                 Ok((accel_root, accel_mode)) => {
@@ -318,12 +432,17 @@ impl RootSpeeder {
                         target: "bsc::builder",
                         block_number = parent_number + 1,
                         block_hash = ?block_hash,
+                        user_tx_len = ?user_tx_len,
+                        system_tx_len = ?system_tx_len,
+                        total_tx_len = ?total_tx_len,
                         parent_hash = ?parent_hash,
                         serial_state_root = ?serial_state_root,
                         serial_state_root_duration_ms = ?serial_state_root_duration_ms,
                         accel_state_root = ?accel_root,
-                        accel_state_root_duration_ms = accel_dur.as_millis(),
+                        accel_state_root_duration_ms,
                         accel_state_root_mode = ?accel_mode,
+                        faster_side = ?faster_side,
+                        faster_by_ms = ?faster_by_ms,
                         roots_equal = serial_state_root.is_some_and(|r| r == accel_root),
                         "State root comparison (serial vs accelerated)"
                     );
@@ -333,10 +452,15 @@ impl RootSpeeder {
                         target: "bsc::builder",
                         block_number = parent_number + 1,
                         block_hash = ?block_hash,
+                        user_tx_len = ?user_tx_len,
+                        system_tx_len = ?system_tx_len,
+                        total_tx_len = ?total_tx_len,
                         parent_hash = ?parent_hash,
                         serial_state_root = ?serial_state_root,
                         serial_state_root_duration_ms = ?serial_state_root_duration_ms,
-                        accel_state_root_duration_ms = accel_dur.as_millis(),
+                        accel_state_root_duration_ms,
+                        faster_side = ?faster_side,
+                        faster_by_ms = ?faster_by_ms,
                         sparse_err = %sparse_err,
                         parallel_err = %parallel_err,
                         "State root comparison failed (accelerated unavailable)"
