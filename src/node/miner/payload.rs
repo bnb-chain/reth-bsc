@@ -7,6 +7,8 @@ use crate::node::evm::config::BscEvmConfig;
 use crate::node::miner::bid_simulator::BidSimulator;
 use crate::node::miner::bsc_miner::{MiningContext, SubmitContext};
 use crate::node::pool::BlacklistedAddressError;
+use crate::node::trie_root::RootSpeederPrefetch;
+use alloy_evm::block::BlockExecutor;
 use reth_provider::StateProviderFactory;
 use reth_revm::{database::StateProviderDatabase, db::State};
 use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
@@ -125,7 +127,14 @@ pub struct BscPayloadBuilder<Pool, Client, EvmConfig = BscEvmConfig> {
 
 impl<Pool, Client, EvmConfig> BscPayloadBuilder<Pool, Client, EvmConfig> 
 where
-    Client: StateProviderFactory + 'static,
+    Client: StateProviderFactory
+        + reth_provider::DatabaseProviderFactory<
+            Provider: reth_provider::BlockNumReader + reth_provider::HeaderProvider + reth_provider::BlockReader
+        >
+        + Clone
+        + Send
+        + Sync
+        + 'static,
     EvmConfig: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
     <EvmConfig as ConfigureEvm>::Primitives: reth_primitives_traits::NodePrimitives<
         BlockHeader = alloy_consensus::Header,
@@ -196,6 +205,11 @@ where
             PayloadBuilderError::Internal(err.into())
         })?;
 
+        // Stream state changes into RootSpeeder while we assemble the payload.
+        // This enables best-effort background multiproof prefetch for sparse trie computation.
+        let prefetch = RootSpeederPrefetch::new(parent_header.number(), parent_header.hash_slow());
+        builder.executor_mut().set_state_hook(Some(prefetch.state_hook()));
+
         let mut total_fees = U256::ZERO;
         let mut cumulative_gas_used = 0;
         // reserve the systemtx gas
@@ -224,6 +238,7 @@ where
         }
         let max_blob_count = blob_params.as_ref().map(|params| params.max_blob_count).unwrap_or_default();
         let mut best_tx_list = self.pool.best_transactions_with_attributes(BestTransactionsAttributes::new(base_fee, blob_fee.map(|fee| fee as u64)));
+        let mut executed_txs: usize = 0;
         while let Some(pool_tx) = best_tx_list.next() {
             if cancel.is_cancelled() {
                 break;
@@ -422,6 +437,13 @@ where
                 Err(err) => return Err(Box::new(PayloadBuilderError::evm(err))),
             };
 
+            executed_txs += 1;
+            // Opportunistically prefetch proof data in the background while we keep executing txs.
+            // Keep this coarse to avoid too many background tasks.
+            if executed_txs % 64 == 0 {
+                prefetch.kick_prefetch(self.client.clone());
+            }
+
              // add to the total blob gas used if the transaction successfully executed
             if let Some(blob_tx) = tx.as_eip4844() {
                 block_blob_count += blob_tx.tx().blob_versioned_hashes.len() as u64;
@@ -469,6 +491,8 @@ where
 
         // add system txs to payload.
         let finalize_start = std::time::Instant::now();
+        // Final prefetch kick right before finish; if it completes in time, RootSpeeder may reuse it.
+        prefetch.kick_prefetch(self.client.clone());
         let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } = builder.finish(&state_provider)?;
         let mut sealed_block = Arc::new(block.sealed_block().clone());
         
@@ -698,7 +722,16 @@ where
 
 impl<Pool, Client, EvmConfig> BscPayloadJob<Pool, Client, EvmConfig>
 where
-    Client: StateProviderFactory + reth_provider::HeaderProvider<Header = alloy_consensus::Header> + reth_provider::BlockHashReader + Clone + 'static,
+    Client: StateProviderFactory
+        + reth_provider::DatabaseProviderFactory<
+            Provider: reth_provider::BlockNumReader + reth_provider::HeaderProvider + reth_provider::BlockReader
+        >
+        + reth_provider::HeaderProvider<Header = alloy_consensus::Header>
+        + reth_provider::BlockHashReader
+        + Clone
+        + Send
+        + Sync
+        + 'static,
     EvmConfig: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
     <EvmConfig as ConfigureEvm>::Primitives: reth_primitives_traits::NodePrimitives<BlockHeader = alloy_consensus::Header, SignedTx = alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip4844>, Block = crate::node::primitives::BscBlock, Receipt = reth_ethereum_primitives::Receipt>,
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>> + 'static,

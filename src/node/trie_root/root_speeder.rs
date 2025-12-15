@@ -1,6 +1,7 @@
 use super::trie_overlay::{init_trie_overlay_cache, trie_overlay_cache, TrieOverlayEntry};
-use alloy_primitives::{map::B256Set, B256};
+use alloy_primitives::{keccak256, map::B256Set, B256};
 use reth_chain_state::{ExecutedTrieUpdates, NewCanonicalChain};
+use reth_evm::OnStateHook;
 use reth_evm::execute::BlockExecutionError;
 use reth_provider::{
     providers::ConsistentDbView, BlockNumReader, BlockReader, DatabaseProviderFactory, HeaderProvider,
@@ -11,7 +12,7 @@ use reth_trie::{
     proof::{Proof, ProofTrieNodeProviderFactory},
     trie_cursor::InMemoryTrieCursorFactory,
     updates::TrieUpdates,
-    HashedPostState, MultiProofTargets, Nibbles, TrieInput,
+    HashedPostState, MultiProof, MultiProofTargets, Nibbles, TrieInput,
 };
 use reth_trie_db::{DatabaseHashedCursorFactory, DatabaseTrieCursorFactory};
 use reth_trie_parallel::root::ParallelStateRoot;
@@ -20,7 +21,9 @@ use reth_trie_sparse::{
     SparseTrieInterface,
 };
 use reth_trie_sparse_parallel::ParallelSparseTrie;
-use std::sync::Arc;
+use parking_lot::Mutex;
+use revm::state::EvmState;
+use std::{collections::HashMap, sync::{Arc, OnceLock}};
 use tokio::sync::broadcast;
 
 /// Which algorithm produced the state root.
@@ -37,6 +40,216 @@ pub enum RootSpeederMode {
 /// downgrade to serial computation.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RootSpeeder;
+
+/// Key for caching prefetched multiproofs while building a payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PrefetchKey {
+    parent_number: u64,
+    parent_hash: B256,
+}
+
+#[derive(Debug, Clone)]
+struct PrefetchedMultiproof {
+    targets: MultiProofTargets,
+    multiproof: MultiProof,
+}
+
+static PREFETCHED_MULTIPROOFS: OnceLock<Mutex<HashMap<PrefetchKey, PrefetchedMultiproof>>> = OnceLock::new();
+
+fn prefetched_multiproofs() -> &'static Mutex<HashMap<PrefetchKey, PrefetchedMultiproof>> {
+    PREFETCHED_MULTIPROOFS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Collects state changes during payload execution and opportunistically prefetches multiproofs.
+///
+/// This is intentionally best-effort: if the prefetched targets don't exactly match the final
+/// block's proof targets, `RootSpeeder` will ignore it and compute the multiproof synchronously.
+#[derive(Debug, Clone)]
+pub struct RootSpeederPrefetch {
+    key: PrefetchKey,
+    /// Hashed account -> hashed slots.
+    targets: Arc<Mutex<MultiProofTargets>>,
+    /// Hashed accounts whose storage was likely wiped (selfdestruct/clear); used for target expansion.
+    wiped_accounts: Arc<Mutex<B256Set>>,
+}
+
+impl RootSpeederPrefetch {
+    pub fn new(parent_number: u64, parent_hash: B256) -> Self {
+        Self {
+            key: PrefetchKey { parent_number, parent_hash },
+            targets: Arc::new(Mutex::new(MultiProofTargets::default())),
+            wiped_accounts: Arc::new(Mutex::new(B256Set::default())),
+        }
+    }
+
+    /// Hook (1): invoked by the executor after each tx/system transition with the current `EvmState`.
+    ///
+    /// We conservatively treat any touched account + all cached storage keys as proof targets.
+    pub fn state_hook(&self) -> Box<dyn OnStateHook> {
+        let targets = self.targets.clone();
+        let wiped = self.wiped_accounts.clone();
+        Box::new(move |source, state: &EvmState| {
+            // Only transaction sources matter for payload building targets.
+            let reth_evm::block::StateChangeSource::Transaction(_) = source else { return };
+
+            let mut targets = targets.lock();
+            let mut wiped_accounts = wiped.lock();
+
+            for (address, account) in state {
+                // Account trie key = keccak(address)
+                let hashed_address = keccak256(address.as_slice());
+
+                // Any touched account is potentially relevant, even if storage is empty.
+                if account.is_touched() || account.is_selfdestructed() || !account.storage.is_empty() {
+                    targets.entry(hashed_address).or_default();
+                }
+
+                // Mark likely storage wipe to trigger expansion in prefetch task.
+                if account.is_selfdestructed() {
+                    wiped_accounts.insert(hashed_address);
+                }
+
+                // Storage trie keys = keccak(storage_key)
+                if !account.storage.is_empty() {
+                    let mut slots = targets.get(&hashed_address).cloned().unwrap_or_default();
+                    for (slot_key, _) in &account.storage {
+                        let hashed_slot = keccak256(slot_key.to_be_bytes::<32>());
+                        slots.insert(hashed_slot);
+                    }
+                    targets.insert(hashed_address, slots);
+                }
+            }
+        })
+    }
+
+    /// Hook (2): snapshot of the not-yet-finished state.
+    ///
+    /// For now this is the same signal as `state_hook` provides (post-tx), but kept as a separate
+    /// API so we can evolve to more granular snapshots (pre-tx / mid-tx) without changing callers.
+    pub fn state_snapshot_hook(&self) -> Box<dyn OnStateHook> {
+        self.state_hook()
+    }
+
+    /// Best-effort: kick off a background multiproof prefetch for current targets.
+    ///
+    /// Safe to call multiple times; the latest completed proof overwrites older ones for the same key.
+    pub fn kick_prefetch<Factory>(&self, provider_factory: Factory)
+    where
+        Factory: DatabaseProviderFactory<Provider: BlockNumReader + HeaderProvider + BlockReader>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+    {
+        let key = self.key;
+        let targets_snapshot = { self.targets.lock().clone() };
+        let wiped_snapshot = { self.wiped_accounts.lock().clone() };
+
+        // Avoid spawning if we have no targets yet.
+        if targets_snapshot.is_empty() {
+            return;
+        }
+
+        tokio::task::spawn_blocking(move || {
+            let res = (|| -> Result<PrefetchedMultiproof, BlockExecutionError> {
+                let provider_ro = provider_factory
+                    .database_provider_ro()
+                    .map_err(BlockExecutionError::other)?;
+                let db_last = provider_ro.best_block_number().map_err(BlockExecutionError::other)?;
+                if db_last > key.parent_number {
+                    return Err(BlockExecutionError::other(std::io::Error::other(format!(
+                        "db tip ({db_last}) ahead of parent ({})",
+                        key.parent_number
+                    ))));
+                }
+                let db_tip = provider_ro
+                    .sealed_header(db_last)
+                    .map_err(BlockExecutionError::other)?
+                    .ok_or_else(|| BlockExecutionError::other(std::io::Error::other("db tip missing")))?;
+
+                let consistent_view =
+                    ConsistentDbView::new(provider_factory.clone(), Some((db_tip.hash(), db_last)));
+
+                // Build base input (DB + overlay up to parent).
+                let mut base_input = TrieInput::default();
+                if db_last < key.parent_number {
+                    let cache = trie_overlay_cache().ok_or_else(|| {
+                        BlockExecutionError::other(std::io::Error::other("trie overlay cache not initialized"))
+                    })?;
+                    let needed_range = (db_last + 1)..=key.parent_number;
+                    let overlays = cache.read().get_range(needed_range.clone());
+                    if overlays.len() != (key.parent_number - db_last) as usize {
+                        return Err(BlockExecutionError::other(std::io::Error::other(format!(
+                            "missing trie overlay blocks for range {:?} (have {})",
+                            needed_range,
+                            overlays.len()
+                        ))));
+                    }
+                    for entry in overlays {
+                        if entry.number == key.parent_number && entry.hash != key.parent_hash {
+                            return Err(BlockExecutionError::other(std::io::Error::other(format!(
+                                "parent hash mismatch in overlay cache: expected={:?} got={:?}",
+                                key.parent_hash, entry.hash
+                            ))));
+                        }
+                        let Some(nodes) = entry.trie_updates.as_deref() else {
+                            return Err(BlockExecutionError::other(std::io::Error::other(format!(
+                                "missing trie_updates for overlay block {}",
+                                entry.number
+                            ))));
+                        };
+                        base_input.append_cached_ref(nodes, &entry.hashed_state);
+                    }
+                }
+
+                let nodes_sorted = Arc::new(base_input.nodes.clone().into_sorted());
+                let state_sorted = Arc::new(base_input.state.clone().into_sorted());
+
+                // Cursor factories against DB + overlay.
+                let provider_ro = consistent_view.provider_ro().map_err(BlockExecutionError::other)?;
+                let trie_cursor_factory = InMemoryTrieCursorFactory::new(
+                    DatabaseTrieCursorFactory::new(provider_ro.tx_ref()),
+                    &nodes_sorted,
+                );
+                let hashed_cursor_factory = HashedPostStateCursorFactory::new(
+                    DatabaseHashedCursorFactory::new(provider_ro.tx_ref()),
+                    &state_sorted,
+                );
+
+                // Expand wiped accounts: include all existing hashed slots from base view.
+                let mut expanded_targets = targets_snapshot.clone();
+                for hashed_address in wiped_snapshot {
+                    let mut slots: B256Set =
+                        expanded_targets.get(&hashed_address).cloned().unwrap_or_default();
+                    let mut storage_cursor = hashed_cursor_factory
+                        .hashed_storage_cursor(hashed_address)
+                        .map_err(|e| BlockExecutionError::other(std::io::Error::other(e)))?;
+                    let mut current_entry = storage_cursor
+                        .seek(B256::ZERO)
+                        .map_err(|e| BlockExecutionError::other(std::io::Error::other(e)))?;
+                    while let Some((hashed_slot, _)) = current_entry {
+                        slots.insert(hashed_slot);
+                        current_entry = storage_cursor
+                            .next()
+                            .map_err(|e| BlockExecutionError::other(std::io::Error::other(e)))?;
+                    }
+                    expanded_targets.insert(hashed_address, slots);
+                }
+
+                let multiproof = Proof::new(trie_cursor_factory, hashed_cursor_factory)
+                    .with_branch_node_masks(true)
+                    .multiproof(expanded_targets.clone())
+                    .map_err(|e| BlockExecutionError::other(std::io::Error::other(e)))?;
+
+                Ok(PrefetchedMultiproof { targets: expanded_targets, multiproof })
+            })();
+
+            if let Ok(prefetched) = res {
+                prefetched_multiproofs().lock().insert(key, prefetched);
+            }
+        });
+    }
+}
 
 impl RootSpeeder {
     /// Computes `(state_root, trie_updates, mode)` for a block being built on `parent`.
@@ -164,11 +377,18 @@ impl RootSpeeder {
             }
 
             let prefix_sets = hashed_state.construct_prefix_sets();
-            let multiproof = Proof::new(trie_cursor_factory.clone(), hashed_cursor_factory.clone())
-                .with_prefix_sets_mut(prefix_sets.clone())
-                .with_branch_node_masks(true)
-                .multiproof(proof_targets)
-                .map_err(|e| BlockExecutionError::other(std::io::Error::other(e)))?;
+
+            // Try to reuse a prefetched multiproof (built concurrently during tx execution).
+            let key = PrefetchKey { parent_number, parent_hash };
+            let prefetched = prefetched_multiproofs().lock().remove(&key);
+            let multiproof = match prefetched {
+                Some(prefetched) if prefetched.targets == proof_targets => prefetched.multiproof,
+                _ => Proof::new(trie_cursor_factory.clone(), hashed_cursor_factory.clone())
+                    .with_prefix_sets_mut(prefix_sets.clone())
+                    .with_branch_node_masks(true)
+                    .multiproof(proof_targets)
+                    .map_err(|e| BlockExecutionError::other(std::io::Error::other(e)))?,
+            };
 
             // Sparse state trie, with parallel sparse accounts trie.
             let mut sparse = SparseStateTrie::<ParallelSparseTrie, SerialSparseTrie>::new().with_updates(true);
