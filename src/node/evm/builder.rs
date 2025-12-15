@@ -8,7 +8,9 @@ use reth_provider::{
 use revm::database::{State, states::bundle_state::BundleRetention};
 use alloy_evm::{Evm, block::BlockExecutor};
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
-use crate::node::trie_root::RootSpeeder;
+use crate::node::trie_root::{RootSpeeder, RootSpeederMode, StateRootCompareState};
+use parking_lot::Mutex;
+use std::sync::Arc;
 
 
 /// rewrite BasicBlockBuilder, mainly about the finish() trait.
@@ -291,19 +293,32 @@ where
         // merge all transitions into bundle state
         db.merge_transitions(BundleRetention::Reverts);
 
-        // calculate the state root (parallel)
+        // calculate the state root (serial, authoritative)
         let state_root_start = std::time::Instant::now();
         let hashed_state = state.hashed_post_state(&db.bundle_state);
 
-        let (state_root, trie_updates, state_root_mode) = RootSpeeder::compute_state_root_with_updates(
+        // Start accelerated state-root computation in the background BEFORE we run the serial
+        // authoritative state-root, so we can compare overlapped timings.
+        let compare_state = Arc::new(Mutex::new(StateRootCompareState::default()));
+        RootSpeeder::spawn_accelerated_compare(
             self.provider_factory.clone(),
             self.parent.number,
             self.parent.hash(),
-            &hashed_state,
-            &state,
-        )?;
+            hashed_state.clone(),
+            compare_state.clone(),
+        );
+
+        let (state_root, trie_updates) = state
+            .state_root_with_updates(hashed_state.clone())
+            .map_err(BlockExecutionError::other)?;
+        let state_root_mode = RootSpeederMode::Serial;
 
         let state_root_duration = state_root_start.elapsed();
+        {
+            let mut w = compare_state.lock();
+            w.serial_root = Some(state_root);
+            w.serial_duration_ms = Some(state_root_duration.as_millis());
+        }
 
         let user_tx_len = self.transactions.len();
         let system_tx_len = assembled_system_txs.len();
@@ -325,6 +340,10 @@ where
         };
         let assemble_start = std::time::Instant::now();
         let block = self.assembler.assemble_block_bsc(bsc_input)?;
+        let block_hash = block.header.hash_slow();
+
+        // Provide the final block hash to the background compare task for easy grep.
+        compare_state.lock().block_hash = Some(block_hash);
 
         // cache current validators and turn length
         let current_validators = self.shared_ctx.inner.borrow().current_validators.clone();
@@ -342,7 +361,7 @@ where
         tracing::debug!(
             target: "bsc::builder",
             block_number = %block.header.number,
-            block_hash = %block.header.hash_slow(),
+            block_hash = %block_hash,
             user_tx_len = user_tx_len,
             system_tx_len = system_tx_len,
             total_tx_len = total_tx_len,
@@ -350,6 +369,7 @@ where
             state_root_duration_ms = state_root_duration.as_millis(),
             assemble_duration_ms = assemble_duration.as_millis(),
             state_root_mode = ?state_root_mode,
+            serial_mode_used = matches!(state_root_mode, crate::node::trie_root::RootSpeederMode::Serial),
             "Succeed to seal block (state root)"
         );
 

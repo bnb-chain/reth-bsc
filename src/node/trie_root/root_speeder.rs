@@ -23,7 +23,7 @@ use reth_trie_sparse::{
 use reth_trie_sparse_parallel::ParallelSparseTrie;
 use parking_lot::Mutex;
 use revm::state::EvmState;
-use std::{collections::HashMap, sync::{Arc, OnceLock}};
+use std::{collections::HashMap, sync::{Arc, OnceLock}, time::Duration};
 use tokio::sync::broadcast;
 
 /// Which algorithm produced the state root.
@@ -71,6 +71,14 @@ pub struct RootSpeederPrefetch {
     targets: Arc<Mutex<MultiProofTargets>>,
     /// Hashed accounts whose storage was likely wiped (selfdestruct/clear); used for target expansion.
     wiped_accounts: Arc<Mutex<B256Set>>,
+}
+
+/// Shared state used to correlate serial/accelerated state-root computations.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct StateRootCompareState {
+    pub block_hash: Option<B256>,
+    pub serial_root: Option<B256>,
+    pub serial_duration_ms: Option<u128>,
 }
 
 impl RootSpeederPrefetch {
@@ -252,6 +260,356 @@ impl RootSpeederPrefetch {
 }
 
 impl RootSpeeder {
+    fn wait_for_compare_state(
+        state: &Mutex<StateRootCompareState>,
+    ) -> StateRootCompareState {
+        let mut tries = 0usize;
+        loop {
+            let snapshot = *state.lock();
+            if snapshot.block_hash.is_some()
+                && snapshot.serial_root.is_some()
+                && snapshot.serial_duration_ms.is_some()
+            {
+                return snapshot
+            }
+            tries += 1;
+            if tries >= 500 {
+                // ~5s with 10ms sleep
+                return snapshot
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Spawn an accelerated (sparse/parallel) state-root computation for **comparison only**.
+    ///
+    /// The caller supplies the authoritative serial root result. We compute the accelerated root
+    /// on a detached thread, then log both durations + whether roots match, keyed by `block_hash`.
+    pub fn spawn_accelerated_compare<Factory>(
+        provider_factory: Factory,
+        parent_number: u64,
+        parent_hash: B256,
+        hashed_state: HashedPostState,
+        compare_state: Arc<Mutex<StateRootCompareState>>,
+    ) where
+        Factory: DatabaseProviderFactory<Provider: BlockNumReader + HeaderProvider + BlockReader>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+    {
+        std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            let res = Self::compute_accelerated_db_overlay_only(
+                provider_factory,
+                parent_number,
+                parent_hash,
+                &hashed_state,
+            );
+            let accel_dur = start.elapsed();
+            let snapshot = Self::wait_for_compare_state(&compare_state);
+            let block_hash = snapshot.block_hash;
+            let serial_state_root = snapshot.serial_root;
+            let serial_state_root_duration_ms = snapshot.serial_duration_ms;
+
+            match res {
+                Ok((accel_root, accel_mode)) => {
+                    tracing::debug!(
+                        target: "bsc::builder",
+                        block_number = parent_number + 1,
+                        block_hash = ?block_hash,
+                        parent_hash = ?parent_hash,
+                        serial_state_root = ?serial_state_root,
+                        serial_state_root_duration_ms = ?serial_state_root_duration_ms,
+                        accel_state_root = ?accel_root,
+                        accel_state_root_duration_ms = accel_dur.as_millis(),
+                        accel_state_root_mode = ?accel_mode,
+                        roots_equal = serial_state_root.is_some_and(|r| r == accel_root),
+                        "State root comparison (serial vs accelerated)"
+                    );
+                }
+                Err((sparse_err, parallel_err)) => {
+                    tracing::debug!(
+                        target: "bsc::builder",
+                        block_number = parent_number + 1,
+                        block_hash = ?block_hash,
+                        parent_hash = ?parent_hash,
+                        serial_state_root = ?serial_state_root,
+                        serial_state_root_duration_ms = ?serial_state_root_duration_ms,
+                        accel_state_root_duration_ms = accel_dur.as_millis(),
+                        sparse_err = %sparse_err,
+                        parallel_err = %parallel_err,
+                        "State root comparison failed (accelerated unavailable)"
+                    );
+                }
+            }
+        });
+    }
+
+    fn compute_accelerated_db_overlay_only<Factory>(
+        provider_factory: Factory,
+        parent_number: u64,
+        parent_hash: B256,
+        hashed_state: &HashedPostState,
+    ) -> Result<(B256, RootSpeederMode), (BlockExecutionError, BlockExecutionError)>
+    where
+        Factory: DatabaseProviderFactory<Provider: BlockNumReader + HeaderProvider + BlockReader>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+    {
+        // Try sparse first by reusing the exact same code path pieces as the main implementation.
+        let sparse_res = (|| -> Result<B256, BlockExecutionError> {
+            let (root, _updates, _db_last, _overlay_blocks, _account_nodes, _wiped_storage_slots) =
+                (|| -> Result<(B256, TrieUpdates, u64, usize, usize, usize), BlockExecutionError> {
+                    // This is intentionally identical to the "attempt_sparse" closure in the main
+                    // implementation (minus logging).
+                    let provider_ro = provider_factory
+                        .database_provider_ro()
+                        .map_err(BlockExecutionError::other)?;
+                    let db_last = provider_ro.best_block_number().map_err(BlockExecutionError::other)?;
+                    if db_last > parent_number {
+                        return Err(BlockExecutionError::other(std::io::Error::other(format!(
+                            "db tip ({db_last}) ahead of parent ({parent_number})"
+                        ))));
+                    }
+                    let db_tip = provider_ro
+                        .sealed_header(db_last)
+                        .map_err(BlockExecutionError::other)?
+                        .ok_or_else(|| BlockExecutionError::other(std::io::Error::other("db tip missing")))?;
+
+                    let consistent_view =
+                        ConsistentDbView::new(provider_factory.clone(), Some((db_tip.hash(), db_last)));
+
+                    let mut base_input = TrieInput::default();
+                    let mut overlay_blocks = 0usize;
+                    if db_last < parent_number {
+                        let cache = trie_overlay_cache().ok_or_else(|| {
+                            BlockExecutionError::other(std::io::Error::other("trie overlay cache not initialized"))
+                        })?;
+                        let needed_range = (db_last + 1)..=parent_number;
+                        let overlays = cache.read().get_range(needed_range.clone());
+                        overlay_blocks = overlays.len();
+                        if overlays.len() != (parent_number - db_last) as usize {
+                            return Err(BlockExecutionError::other(std::io::Error::other(format!(
+                                "missing trie overlay blocks for range {:?} (have {})",
+                                needed_range,
+                                overlays.len()
+                            ))));
+                        }
+                        for entry in overlays {
+                            if entry.number == parent_number && entry.hash != parent_hash {
+                                return Err(BlockExecutionError::other(std::io::Error::other(format!(
+                                    "parent hash mismatch in overlay cache: expected={:?} got={:?}",
+                                    parent_hash, entry.hash
+                                ))));
+                            }
+                            let Some(nodes) = entry.trie_updates.as_deref() else {
+                                return Err(BlockExecutionError::other(std::io::Error::other(format!(
+                                    "missing trie_updates for overlay block {}",
+                                    entry.number
+                                ))));
+                            };
+                            base_input.append_cached_ref(nodes, &entry.hashed_state);
+                        }
+                    }
+
+                    let nodes_sorted = Arc::new(base_input.nodes.clone().into_sorted());
+                    let state_sorted = Arc::new(base_input.state.clone().into_sorted());
+
+                    let provider_ro = consistent_view.provider_ro().map_err(BlockExecutionError::other)?;
+                    let trie_cursor_factory = InMemoryTrieCursorFactory::new(
+                        DatabaseTrieCursorFactory::new(provider_ro.tx_ref()),
+                        &nodes_sorted,
+                    );
+                    let hashed_cursor_factory = HashedPostStateCursorFactory::new(
+                        DatabaseHashedCursorFactory::new(provider_ro.tx_ref()),
+                        &state_sorted,
+                    );
+
+                    let mut proof_targets: MultiProofTargets = hashed_state.multi_proof_targets();
+                    let mut wiped_storage_slots = 0usize;
+                    for (hashed_address, storage) in &hashed_state.storages {
+                        if !storage.wiped {
+                            continue;
+                        }
+                        let mut slots: B256Set =
+                            proof_targets.get(hashed_address).cloned().unwrap_or_default();
+                        let mut storage_cursor = hashed_cursor_factory
+                            .hashed_storage_cursor(*hashed_address)
+                            .map_err(|e| BlockExecutionError::other(std::io::Error::other(e)))?;
+                        let mut current_entry = storage_cursor
+                            .seek(B256::ZERO)
+                            .map_err(|e| BlockExecutionError::other(std::io::Error::other(e)))?;
+                        while let Some((hashed_slot, _)) = current_entry {
+                            wiped_storage_slots += 1;
+                            slots.insert(hashed_slot);
+                            current_entry = storage_cursor
+                                .next()
+                                .map_err(|e| BlockExecutionError::other(std::io::Error::other(e)))?;
+                        }
+                        proof_targets.insert(*hashed_address, slots);
+                    }
+
+                    let prefix_sets = hashed_state.construct_prefix_sets();
+                    let multiproof = Proof::new(trie_cursor_factory.clone(), hashed_cursor_factory.clone())
+                        .with_prefix_sets_mut(prefix_sets.clone())
+                        .with_branch_node_masks(true)
+                        .multiproof(proof_targets)
+                        .map_err(|e| BlockExecutionError::other(std::io::Error::other(e)))?;
+
+                    let mut sparse =
+                        SparseStateTrie::<ParallelSparseTrie, SerialSparseTrie>::new().with_updates(true);
+                    sparse
+                        .reveal_multiproof(multiproof)
+                        .map_err(|e| BlockExecutionError::other(std::io::Error::other(format!("{e:?}"))))?;
+
+                    let blinded_provider_factory = ProofTrieNodeProviderFactory::new(
+                        trie_cursor_factory,
+                        hashed_cursor_factory,
+                        Arc::new(prefix_sets),
+                    );
+
+                    for (hashed_address, storage) in &hashed_state.storages {
+                        let Some(storage_trie) = sparse.storage_trie_mut(hashed_address) else {
+                            return Err(BlockExecutionError::other(std::io::Error::other(format!(
+                                "sparse storage trie not revealed for account {hashed_address:?}"
+                            ))));
+                        };
+                        if storage.wiped {
+                            storage_trie.wipe();
+                        }
+                        let mut removed_slots: Vec<Nibbles> = Vec::new();
+                        for (slot, value) in &storage.storage {
+                            let slot_nibbles = Nibbles::unpack(slot);
+                            if value.is_zero() {
+                                removed_slots.push(slot_nibbles);
+                                continue;
+                            }
+                            storage_trie
+                                .update_leaf(
+                                    slot_nibbles,
+                                    alloy_rlp::encode_fixed_size(value).to_vec(),
+                                    blinded_provider_factory.storage_node_provider(*hashed_address),
+                                )
+                                .map_err(|e| BlockExecutionError::other(std::io::Error::other(format!("{e:?}"))))?;
+                        }
+                        for slot_nibbles in removed_slots {
+                            storage_trie
+                                .remove_leaf(
+                                    &slot_nibbles,
+                                    blinded_provider_factory.storage_node_provider(*hashed_address),
+                                )
+                                .map_err(|e| BlockExecutionError::other(std::io::Error::other(format!("{e:?}"))))?;
+                        }
+                        storage_trie.root();
+                    }
+
+                    for (hashed_address, maybe_account) in &hashed_state.accounts {
+                        let nibbles = Nibbles::unpack(hashed_address);
+                        match maybe_account {
+                            Some(account) => {
+                                let keep = sparse
+                                    .update_account(*hashed_address, account.clone(), &blinded_provider_factory)
+                                    .map_err(|e| BlockExecutionError::other(std::io::Error::other(format!("{e:?}"))))?;
+                                if !keep {
+                                    sparse
+                                        .remove_account_leaf(&nibbles, &blinded_provider_factory)
+                                        .map_err(|e| BlockExecutionError::other(std::io::Error::other(format!("{e:?}"))))?;
+                                }
+                            }
+                            None => {
+                                sparse
+                                    .remove_account_leaf(&nibbles, &blinded_provider_factory)
+                                    .map_err(|e| BlockExecutionError::other(std::io::Error::other(format!("{e:?}"))))?;
+                            }
+                        }
+                    }
+
+                    let (state_root, trie_updates) = sparse
+                        .root_with_updates(blinded_provider_factory)
+                        .map_err(|e| BlockExecutionError::other(std::io::Error::other(format!("{e:?}"))))?;
+
+                    Ok((
+                        state_root,
+                        trie_updates,
+                        db_last,
+                        overlay_blocks,
+                        nodes_sorted.account_nodes.len(),
+                        wiped_storage_slots,
+                    ))
+                })()?;
+            Ok(root)
+        })();
+
+        if let Ok(root) = sparse_res {
+            return Ok((root, RootSpeederMode::Sparse))
+        }
+
+        let sparse_err = sparse_res.err().expect("checked above");
+
+        let parallel_res = (|| -> Result<B256, BlockExecutionError> {
+            let provider_ro = provider_factory
+                .database_provider_ro()
+                .map_err(BlockExecutionError::other)?;
+            let db_last = provider_ro.best_block_number().map_err(BlockExecutionError::other)?;
+            if db_last > parent_number {
+                return Err(BlockExecutionError::other(std::io::Error::other(format!(
+                    "db tip ({db_last}) ahead of parent ({parent_number})"
+                ))));
+            }
+            let db_tip = provider_ro
+                .sealed_header(db_last)
+                .map_err(BlockExecutionError::other)?
+                .ok_or_else(|| BlockExecutionError::other(std::io::Error::other("db tip missing")))?;
+            let consistent_view =
+                ConsistentDbView::new(provider_factory.clone(), Some((db_tip.hash(), db_last)));
+
+            let mut trie_input = TrieInput::default();
+            if db_last < parent_number {
+                let cache = trie_overlay_cache().ok_or_else(|| {
+                    BlockExecutionError::other(std::io::Error::other("trie overlay cache not initialized"))
+                })?;
+                let needed_range = (db_last + 1)..=parent_number;
+                let overlays = cache.read().get_range(needed_range.clone());
+                if overlays.len() != (parent_number - db_last) as usize {
+                    return Err(BlockExecutionError::other(std::io::Error::other(format!(
+                        "missing trie overlay blocks for range {:?} (have {})",
+                        needed_range,
+                        overlays.len()
+                    ))));
+                }
+                for entry in overlays {
+                    if entry.number == parent_number && entry.hash != parent_hash {
+                        return Err(BlockExecutionError::other(std::io::Error::other(format!(
+                            "parent hash mismatch in overlay cache: expected={:?} got={:?}",
+                            parent_hash, entry.hash
+                        ))));
+                    }
+                    let Some(nodes) = entry.trie_updates.as_deref() else {
+                        return Err(BlockExecutionError::other(std::io::Error::other(format!(
+                            "missing trie_updates for overlay block {}",
+                            entry.number
+                        ))));
+                    };
+                    trie_input.append_cached_ref(nodes, &entry.hashed_state);
+                }
+            }
+
+            trie_input.append(hashed_state.clone());
+            let (state_root, _trie_updates) = ParallelStateRoot::new(consistent_view, trie_input)
+                .incremental_root_with_updates()
+                .map_err(BlockExecutionError::other)?;
+            Ok(state_root)
+        })();
+
+        match parallel_res {
+            Ok(root) => Ok((root, RootSpeederMode::Parallel)),
+            Err(par_err) => Err((sparse_err, par_err)),
+        }
+    }
+
     /// Computes `(state_root, trie_updates, mode)` for a block being built on `parent`.
     ///
     /// - Attempts sparse trie computation first (multiproof + sparse trie with parallel accounts trie)

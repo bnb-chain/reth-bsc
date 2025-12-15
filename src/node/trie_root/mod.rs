@@ -8,5 +8,6 @@ pub mod root_speeder;
 pub mod trie_overlay;
 
 pub use root_speeder::{RootSpeeder, RootSpeederMode, RootSpeederPrefetch, RootSpeederUpdater};
+pub use root_speeder::StateRootCompareState;
 pub use trie_overlay::{TrieOverlayCache, TrieOverlayEntry, init_trie_overlay_cache, trie_overlay_cache};
 
