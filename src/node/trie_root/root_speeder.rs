@@ -1,5 +1,6 @@
 use super::trie_overlay::{init_trie_overlay_cache, trie_overlay_cache, TrieOverlayEntry};
 use alloy_primitives::{keccak256, map::B256Set, B256};
+use rayon::iter::{ParallelBridge, ParallelIterator};
 use reth_chain_state::{ExecutedTrieUpdates, NewCanonicalChain};
 use reth_evm::OnStateHook;
 use reth_evm::execute::BlockExecutionError;
@@ -9,13 +10,16 @@ use reth_provider::{
 };
 use reth_trie::{
     hashed_cursor::{HashedCursor, HashedCursorFactory, HashedPostStateCursorFactory},
-    proof::{Proof, ProofTrieNodeProviderFactory},
-    trie_cursor::InMemoryTrieCursorFactory,
+    prefix_set::TriePrefixSetsMut,
     updates::TrieUpdates,
-    HashedPostState, MultiProof, MultiProofTargets, Nibbles, TrieInput,
+    DecodedMultiProof, HashedPostState, MultiProofTargets, Nibbles, TrieInput,
 };
-use reth_trie_db::{DatabaseHashedCursorFactory, DatabaseTrieCursorFactory};
-use reth_trie_parallel::root::ParallelStateRoot;
+use reth_trie_db::DatabaseHashedCursorFactory;
+use reth_trie_parallel::{
+    proof::ParallelProof,
+    proof_task::{ProofTaskCtx, ProofTaskManager},
+    root::ParallelStateRoot,
+};
 use reth_trie_sparse::{
     provider::TrieNodeProviderFactory, SerialSparseTrie, SparseStateTrie, SparseTrie,
     SparseTrieInterface,
@@ -25,6 +29,10 @@ use parking_lot::Mutex;
 use revm::state::EvmState;
 use std::{collections::HashMap, sync::{Arc, OnceLock}, time::Duration};
 use tokio::sync::broadcast;
+
+/// Same idea as engine-tree payload processor: compute proofs in small account chunks to keep
+/// per-proof overhead bounded and allow better scheduling.
+const MULTIPROOF_TARGETS_CHUNK_SIZE: usize = 10;
 
 /// Which algorithm produced the state root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,13 +59,223 @@ struct PrefetchKey {
 #[derive(Debug, Clone)]
 struct PrefetchedMultiproof {
     targets: MultiProofTargets,
-    multiproof: MultiProof,
+    multiproof: DecodedMultiProof,
 }
 
 static PREFETCHED_MULTIPROOFS: OnceLock<Mutex<HashMap<PrefetchKey, PrefetchedMultiproof>>> = OnceLock::new();
 
 fn prefetched_multiproofs() -> &'static Mutex<HashMap<PrefetchKey, PrefetchedMultiproof>> {
     PREFETCHED_MULTIPROOFS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+static ROOT_SPEEDER_PROOF_RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+
+fn root_speeder_proof_runtime() -> &'static tokio::runtime::Runtime {
+    ROOT_SPEEDER_PROOF_RT.get_or_init(|| {
+        // Dedicated runtime so RootSpeeder can use ProofTaskManager even when called from a plain
+        // std::thread (e.g. background compare).
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            // Keep this small to avoid starving the foreground sealing path.
+            .worker_threads(2)
+            .thread_name("root-speeder-proof")
+            .build()
+            .expect("root-speeder proof runtime build")
+    })
+}
+
+fn chunk_multiproof_targets(
+    targets: &MultiProofTargets,
+    chunk_size: usize,
+) -> Vec<MultiProofTargets> {
+    let mut chunks = Vec::new();
+    let mut current = MultiProofTargets::default();
+    let mut count = 0usize;
+
+    for (addr, slots) in targets.iter() {
+        current.insert(*addr, slots.clone());
+        count += 1;
+        if count >= chunk_size {
+            chunks.push(current);
+            current = MultiProofTargets::default();
+            count = 0;
+        }
+    }
+
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+
+    chunks
+}
+
+fn make_hashed_state_subset_for_targets(
+    hashed_state: &HashedPostState,
+    targets: &MultiProofTargets,
+) -> HashedPostState {
+    let mut subset = HashedPostState::default();
+
+    for (hashed_address, _) in targets.iter() {
+        if let Some(account) = hashed_state.accounts.get(hashed_address) {
+            subset.accounts.insert(*hashed_address, account.clone());
+        }
+        if let Some(storage) = hashed_state.storages.get(hashed_address) {
+            subset.storages.insert(*hashed_address, storage.clone());
+        }
+    }
+
+    subset
+}
+
+fn should_cross_check(parent_hash: B256) -> bool {
+    // ~1/128 sampling based on hash prefix.
+    parent_hash.as_slice()[0] & 0x7f == 0
+}
+
+/// Apply a hashed state update to a revealed sparse state trie.
+///
+/// Mirrors engine-tree's update ordering:
+/// - Update storage tries first (in parallel).
+/// - Update account leaves, ensuring storage roots are reflected even when only storage changed.
+fn apply_hashed_state_update_to_sparse_trie<BPF>(
+    trie: &mut SparseStateTrie<ParallelSparseTrie, SerialSparseTrie>,
+    mut state: HashedPostState,
+    blinded_provider_factory: &BPF,
+) -> Result<(), BlockExecutionError>
+where
+    BPF: TrieNodeProviderFactory + Send + Sync + Clone,
+    BPF::AccountNodeProvider: reth_trie_sparse::provider::TrieNodeProvider + Send + Sync,
+    BPF::StorageNodeProvider: reth_trie_sparse::provider::TrieNodeProvider + Send + Sync,
+{
+    // Update storage slots + compute per-account storage roots in parallel.
+    let (tx, rx) = std::sync::mpsc::channel();
+    state
+        .storages
+        .drain()
+        .map(|(address, storage)| (address, storage, trie.take_storage_trie(&address)))
+        .par_bridge()
+        .map(|(address, storage, storage_trie)| {
+            let storage_provider = blinded_provider_factory.storage_node_provider(address);
+            let mut storage_trie = storage_trie.ok_or_else(|| {
+                BlockExecutionError::other(std::io::Error::other(format!(
+                    "sparse storage trie not revealed for account {address:?}"
+                )))
+            })?;
+
+            if storage.wiped {
+                storage_trie
+                    .wipe()
+                    .map_err(|e| BlockExecutionError::other(std::io::Error::other(format!("{e:?}"))))?;
+            }
+
+            // Defer removals until after updates/additions.
+            let mut removed_slots: Vec<Nibbles> = Vec::new();
+            for (slot, value) in storage.storage {
+                let slot_nibbles = Nibbles::unpack(slot);
+                if value.is_zero() {
+                    removed_slots.push(slot_nibbles);
+                    continue;
+                }
+
+                storage_trie
+                    .update_leaf(
+                        slot_nibbles,
+                        alloy_rlp::encode_fixed_size(&value).to_vec(),
+                        &storage_provider,
+                    )
+                    .map_err(|e| BlockExecutionError::other(std::io::Error::other(format!("{e:?}"))))?;
+            }
+            for slot_nibbles in removed_slots {
+                storage_trie
+                    .remove_leaf(&slot_nibbles, &storage_provider)
+                    .map_err(|e| BlockExecutionError::other(std::io::Error::other(format!("{e:?}"))))?;
+            }
+
+            storage_trie.root();
+
+            Ok::<_, BlockExecutionError>((address, storage_trie))
+        })
+        .for_each_init(|| tx.clone(), |tx, result| {
+            let _ = tx.send(result);
+        });
+    drop(tx);
+
+    // Defer account removals until after updates.
+    let mut removed_accounts: Vec<B256> = Vec::new();
+
+    // First apply any storage-root changes to accounts.
+    for result in rx {
+        let (address, storage_trie) = result?;
+        trie.insert_storage_trie(address, storage_trie);
+
+        if let Some(account) = state.accounts.remove(&address) {
+            match account {
+                Some(account) => {
+                    let keep = trie
+                        .update_account(address, account, blinded_provider_factory)
+                        .map_err(|e| {
+                            BlockExecutionError::other(std::io::Error::other(format!("{e:?}")))
+                        })?;
+                    if !keep {
+                        removed_accounts.push(address);
+                    }
+                }
+                None => {
+                    // Ensure storage trie deletion is reflected in trie updates.
+                    if trie.storage_trie_ref(&address).is_none() {
+                        let mut wiped = SparseTrie::Revealed(Box::new(
+                            SerialSparseTrie::default().with_updates(true),
+                        ));
+                        wiped
+                            .wipe()
+                            .map_err(|e| {
+                                BlockExecutionError::other(std::io::Error::other(format!("{e:?}")))
+                            })?;
+                        trie.insert_storage_trie(address, wiped);
+                    } else {
+                        let t = trie.storage_trie_mut(&address).expect("checked above");
+                        t.wipe();
+                    }
+
+                    removed_accounts.push(address);
+                }
+            }
+        } else if trie.is_account_revealed(address) {
+            // Otherwise, if the account is revealed, update only its storage root.
+            let keep = trie
+                .update_account_storage_root(address, blinded_provider_factory)
+                .map_err(|e| BlockExecutionError::other(std::io::Error::other(format!("{e:?}"))))?;
+            if !keep {
+                removed_accounts.push(address);
+            }
+        }
+    }
+
+    // Apply remaining account changes.
+    for (address, account) in state.accounts.drain() {
+        match account {
+            Some(account) => {
+                let keep = trie
+                    .update_account(address, account, blinded_provider_factory)
+                    .map_err(|e| BlockExecutionError::other(std::io::Error::other(format!("{e:?}"))))?;
+                if !keep {
+                    removed_accounts.push(address);
+                }
+            }
+            None => {
+                removed_accounts.push(address);
+            }
+        }
+    }
+
+    // Remove accounts.
+    for address in removed_accounts {
+        let nibbles = Nibbles::unpack(address);
+        trie.remove_account_leaf(&nibbles, blinded_provider_factory)
+            .map_err(|e| BlockExecutionError::other(std::io::Error::other(format!("{e:?}"))))?;
+    }
+
+    Ok(())
 }
 
 /// Collects state changes during payload execution and opportunistically prefetches multiproofs.
@@ -233,10 +451,6 @@ impl RootSpeederPrefetch {
 
                 // Cursor factories against DB + overlay.
                 let provider_ro = consistent_view.provider_ro().map_err(BlockExecutionError::other)?;
-                let trie_cursor_factory = InMemoryTrieCursorFactory::new(
-                    DatabaseTrieCursorFactory::new(provider_ro.tx_ref()),
-                    &nodes_sorted,
-                );
                 let hashed_cursor_factory = HashedPostStateCursorFactory::new(
                     DatabaseHashedCursorFactory::new(provider_ro.tx_ref()),
                     &state_sorted,
@@ -262,12 +476,30 @@ impl RootSpeederPrefetch {
                     expanded_targets.insert(hashed_address, slots);
                 }
 
-                let multiproof = Proof::new(trie_cursor_factory, hashed_cursor_factory)
-                    .with_branch_node_masks(true)
-                    .multiproof(expanded_targets.clone())
-                    .map_err(|e| BlockExecutionError::other(std::io::Error::other(e)))?;
+                // Use the same parallel proof pipeline as engine-tree so prefetch aligns with
+                // the actual sparse computation path.
+                let prefix_sets = Arc::new(TriePrefixSetsMut::default());
+                let task_ctx = ProofTaskCtx::new(nodes_sorted.clone(), state_sorted.clone(), prefix_sets.clone());
+                let rt = root_speeder_proof_runtime();
+                let handle = rt.handle().clone();
+                let proof_task = ProofTaskManager::new(handle.clone(), consistent_view.clone(), task_ctx, 64);
+                let proof_handle = proof_task.handle();
+                handle.spawn_blocking(move || {
+                    let _ = proof_task.run();
+                });
 
-                Ok(PrefetchedMultiproof { targets: expanded_targets, multiproof })
+                let decoded = ParallelProof::new(
+                    consistent_view.clone(),
+                    nodes_sorted,
+                    state_sorted,
+                    prefix_sets,
+                    proof_handle.clone(),
+                )
+                .with_branch_node_masks(true)
+                .decoded_multiproof(expanded_targets.clone())
+                .map_err(|e| BlockExecutionError::other(std::io::Error::other(format!("{e:?}"))))?;
+
+                Ok(PrefetchedMultiproof { targets: expanded_targets, multiproof: decoded })
             })();
 
             if let Ok(prefetched) = res {
@@ -428,24 +660,66 @@ impl RootSpeeder {
 
             match res {
                 Ok((accel_root, accel_mode)) => {
-                    tracing::debug!(
-                        target: "bsc::builder",
-                        block_number = parent_number + 1,
-                        block_hash = ?block_hash,
-                        user_tx_len = ?user_tx_len,
-                        system_tx_len = ?system_tx_len,
-                        total_tx_len = ?total_tx_len,
-                        parent_hash = ?parent_hash,
-                        serial_state_root = ?serial_state_root,
-                        serial_state_root_duration_ms = ?serial_state_root_duration_ms,
-                        accel_state_root = ?accel_root,
-                        accel_state_root_duration_ms,
-                        accel_state_root_mode = ?accel_mode,
-                        faster_side = ?faster_side,
-                        faster_by_ms = ?faster_by_ms,
-                        roots_equal = serial_state_root.is_some_and(|r| r == accel_root),
-                        "State root comparison (serial vs accelerated)"
-                    );
+                    let roots_equal = serial_state_root.is_some_and(|r| r == accel_root);
+                    let approx_change_units: usize = hashed_state.accounts.len()
+                        + hashed_state
+                            .storages
+                            .values()
+                            .map(|s| s.storage.len())
+                            .sum::<usize>();
+                    let proof_targets = hashed_state.multi_proof_targets();
+                    let proof_target_accounts = proof_targets.len();
+                    let proof_target_slots: usize =
+                        proof_targets.values().map(|s| s.len()).sum::<usize>();
+                    let proof_target_chunks = (proof_target_accounts + MULTIPROOF_TARGETS_CHUNK_SIZE - 1)
+                        / MULTIPROOF_TARGETS_CHUNK_SIZE;
+
+                    if !roots_equal {
+                        tracing::error!(
+                            target: "bsc::builder",
+                            block_number = parent_number + 1,
+                            block_hash = ?block_hash,
+                            user_tx_len = ?user_tx_len,
+                            system_tx_len = ?system_tx_len,
+                            total_tx_len = ?total_tx_len,
+                            parent_hash = ?parent_hash,
+                            approx_change_units,
+                            proof_target_accounts,
+                            proof_target_slots,
+                            proof_target_chunks,
+                            serial_state_root = ?serial_state_root,
+                            serial_state_root_duration_ms = ?serial_state_root_duration_ms,
+                            accel_state_root = ?accel_root,
+                            accel_state_root_duration_ms,
+                            accel_state_root_mode = ?accel_mode,
+                            faster_side = ?faster_side,
+                            faster_by_ms = ?faster_by_ms,
+                            "State root MISMATCH (serial vs accelerated)"
+                        );
+                    } else {
+                        tracing::debug!(
+                            target: "bsc::builder",
+                            block_number = parent_number + 1,
+                            block_hash = ?block_hash,
+                            user_tx_len = ?user_tx_len,
+                            system_tx_len = ?system_tx_len,
+                            total_tx_len = ?total_tx_len,
+                            parent_hash = ?parent_hash,
+                            approx_change_units,
+                            proof_target_accounts,
+                            proof_target_slots,
+                            proof_target_chunks,
+                            serial_state_root = ?serial_state_root,
+                            serial_state_root_duration_ms = ?serial_state_root_duration_ms,
+                            accel_state_root = ?accel_root,
+                            accel_state_root_duration_ms,
+                            accel_state_root_mode = ?accel_mode,
+                            faster_side = ?faster_side,
+                            faster_by_ms = ?faster_by_ms,
+                            roots_equal,
+                            "State root comparison (serial vs accelerated)"
+                        );
+                    }
                 }
                 Err((sparse_err, parallel_err)) => {
                     tracing::debug!(
@@ -483,8 +757,27 @@ impl RootSpeeder {
             + Sync
             + 'static,
     {
+        // Fast path: sparse multiproof + sparse trie has a fixed overhead that often dominates for
+        // very small blocks (few changed accounts/slots). In `sparse_case4.log` this shows up as
+        // serial (0ms) vs sparse (1ms) for thousands of blocks.
+        //
+        // Heuristic: if the post-state touches only a small number of accounts/slots, skip the
+        // sparse path and try the parallel state-root directly.
+        let approx_change_units: usize = hashed_state.accounts.len()
+            + hashed_state
+                .storages
+                .values()
+                .map(|s| s.storage.len())
+                .sum::<usize>();
+        let skip_sparse_small_block = approx_change_units < 256;
+
         // Try sparse first by reusing the exact same code path pieces as the main implementation.
         let sparse_res = (|| -> Result<B256, BlockExecutionError> {
+            if skip_sparse_small_block {
+                return Err(BlockExecutionError::other(std::io::Error::other(format!(
+                    "skip sparse: small post-state (change_units={approx_change_units})"
+                ))));
+            }
             let (root, _updates, _db_last, _overlay_blocks, _account_nodes, _wiped_storage_slots) =
                 (|| -> Result<(B256, TrieUpdates, u64, usize, usize, usize), BlockExecutionError> {
                     // This is intentionally identical to the "attempt_sparse" closure in the main
@@ -543,10 +836,6 @@ impl RootSpeeder {
                     let state_sorted = Arc::new(base_input.state.clone().into_sorted());
 
                     let provider_ro = consistent_view.provider_ro().map_err(BlockExecutionError::other)?;
-                    let trie_cursor_factory = InMemoryTrieCursorFactory::new(
-                        DatabaseTrieCursorFactory::new(provider_ro.tx_ref()),
-                        &nodes_sorted,
-                    );
                     let hashed_cursor_factory = HashedPostStateCursorFactory::new(
                         DatabaseHashedCursorFactory::new(provider_ro.tx_ref()),
                         &state_sorted,
@@ -576,84 +865,83 @@ impl RootSpeeder {
                         proof_targets.insert(*hashed_address, slots);
                     }
 
-                    let prefix_sets = hashed_state.construct_prefix_sets();
-                    let multiproof = Proof::new(trie_cursor_factory.clone(), hashed_cursor_factory.clone())
-                        .with_prefix_sets_mut(prefix_sets.clone())
-                        .with_branch_node_masks(true)
-                        .multiproof(proof_targets)
-                        .map_err(|e| BlockExecutionError::other(std::io::Error::other(e)))?;
+                    // engine-tree style: parallel decoded multiproofs + correct sparse update order.
+                    let prefix_sets = Arc::new(hashed_state.construct_prefix_sets());
+                    let task_ctx = ProofTaskCtx::new(nodes_sorted.clone(), state_sorted.clone(), prefix_sets.clone());
+                    let rt = root_speeder_proof_runtime();
+                    let handle = rt.handle().clone();
+                    let proof_task = ProofTaskManager::new(handle.clone(), consistent_view.clone(), task_ctx, 64);
+                    let proof_handle = proof_task.handle();
+                    handle.spawn_blocking(move || {
+                        let _ = proof_task.run();
+                    });
 
                     let mut sparse =
                         SparseStateTrie::<ParallelSparseTrie, SerialSparseTrie>::new().with_updates(true);
-                    sparse
-                        .reveal_multiproof(multiproof)
-                        .map_err(|e| BlockExecutionError::other(std::io::Error::other(format!("{e:?}"))))?;
 
-                    let blinded_provider_factory = ProofTrieNodeProviderFactory::new(
-                        trie_cursor_factory,
-                        hashed_cursor_factory,
-                        Arc::new(prefix_sets),
-                    );
+                    // Try to reuse a prefetched full decoded multiproof first (fastest, best for fairness).
+                    let key = PrefetchKey { parent_number, parent_hash };
+                    let prefetched = prefetched_multiproofs().lock().remove(&key);
+                    if let Some(prefetched) = prefetched.filter(|p| p.targets == proof_targets) {
+                        sparse
+                            .reveal_decoded_multiproof(prefetched.multiproof)
+                            .map_err(|e| BlockExecutionError::other(std::io::Error::other(format!("{e:?}"))))?;
+                        apply_hashed_state_update_to_sparse_trie(
+                            &mut sparse,
+                            hashed_state.clone(),
+                            &proof_handle,
+                        )?;
+                    } else {
+                        for chunk_targets in
+                            chunk_multiproof_targets(&proof_targets, MULTIPROOF_TARGETS_CHUNK_SIZE)
+                        {
+                            let decoded = ParallelProof::new(
+                                consistent_view.clone(),
+                                nodes_sorted.clone(),
+                                state_sorted.clone(),
+                                prefix_sets.clone(),
+                                proof_handle.clone(),
+                            )
+                            .with_branch_node_masks(true)
+                            .decoded_multiproof(chunk_targets.clone())
+                            .map_err(|e| {
+                                BlockExecutionError::other(std::io::Error::other(format!("{e:?}")))
+                            })?;
 
-                    for (hashed_address, storage) in &hashed_state.storages {
-                        let Some(storage_trie) = sparse.storage_trie_mut(hashed_address) else {
-                            return Err(BlockExecutionError::other(std::io::Error::other(format!(
-                                "sparse storage trie not revealed for account {hashed_address:?}"
-                            ))));
-                        };
-                        if storage.wiped {
-                            storage_trie.wipe();
-                        }
-                        let mut removed_slots: Vec<Nibbles> = Vec::new();
-                        for (slot, value) in &storage.storage {
-                            let slot_nibbles = Nibbles::unpack(slot);
-                            if value.is_zero() {
-                                removed_slots.push(slot_nibbles);
-                                continue;
-                            }
-                            storage_trie
-                                .update_leaf(
-                                    slot_nibbles,
-                                    alloy_rlp::encode_fixed_size(value).to_vec(),
-                                    blinded_provider_factory.storage_node_provider(*hashed_address),
-                                )
-                                .map_err(|e| BlockExecutionError::other(std::io::Error::other(format!("{e:?}"))))?;
-                        }
-                        for slot_nibbles in removed_slots {
-                            storage_trie
-                                .remove_leaf(
-                                    &slot_nibbles,
-                                    blinded_provider_factory.storage_node_provider(*hashed_address),
-                                )
-                                .map_err(|e| BlockExecutionError::other(std::io::Error::other(format!("{e:?}"))))?;
-                        }
-                        storage_trie.root();
-                    }
+                            sparse
+                                .reveal_decoded_multiproof(decoded)
+                                .map_err(|e| {
+                                    BlockExecutionError::other(std::io::Error::other(format!("{e:?}")))
+                                })?;
 
-                    for (hashed_address, maybe_account) in &hashed_state.accounts {
-                        let nibbles = Nibbles::unpack(hashed_address);
-                        match maybe_account {
-                            Some(account) => {
-                                let keep = sparse
-                                    .update_account(*hashed_address, account.clone(), &blinded_provider_factory)
-                                    .map_err(|e| BlockExecutionError::other(std::io::Error::other(format!("{e:?}"))))?;
-                                if !keep {
-                                    sparse
-                                        .remove_account_leaf(&nibbles, &blinded_provider_factory)
-                                        .map_err(|e| BlockExecutionError::other(std::io::Error::other(format!("{e:?}"))))?;
-                                }
-                            }
-                            None => {
-                                sparse
-                                    .remove_account_leaf(&nibbles, &blinded_provider_factory)
-                                    .map_err(|e| BlockExecutionError::other(std::io::Error::other(format!("{e:?}"))))?;
-                            }
+                            let subset =
+                                make_hashed_state_subset_for_targets(hashed_state, &chunk_targets);
+                            apply_hashed_state_update_to_sparse_trie(
+                                &mut sparse,
+                                subset,
+                                &proof_handle,
+                            )?;
                         }
                     }
 
                     let (state_root, trie_updates) = sparse
-                        .root_with_updates(blinded_provider_factory)
+                        .root_with_updates(proof_handle.clone())
                         .map_err(|e| BlockExecutionError::other(std::io::Error::other(format!("{e:?}"))))?;
+
+                    // Cross-check (sampled): compare sparse root against parallel root on the same input.
+                    if should_cross_check(parent_hash) {
+                        let mut trie_input = base_input.clone();
+                        trie_input.append(hashed_state.clone());
+                        let (parallel_root, _parallel_updates) =
+                            ParallelStateRoot::new(consistent_view.clone(), trie_input)
+                                .incremental_root_with_updates()
+                                .map_err(BlockExecutionError::other)?;
+                        if parallel_root != state_root {
+                            return Err(BlockExecutionError::other(std::io::Error::other(format!(
+                                "cross-check mismatch: sparse_root={state_root:?} parallel_root={parallel_root:?}"
+                            ))));
+                        }
+                    }
 
                     Ok((
                         state_root,
@@ -823,10 +1111,6 @@ impl RootSpeeder {
 
             // Generate multiproof against DB + overlay up to parent.
             let provider_ro = consistent_view.provider_ro().map_err(BlockExecutionError::other)?;
-            let trie_cursor_factory = InMemoryTrieCursorFactory::new(
-                DatabaseTrieCursorFactory::new(provider_ro.tx_ref()),
-                &nodes_sorted,
-            );
             let hashed_cursor_factory = HashedPostStateCursorFactory::new(
                 DatabaseHashedCursorFactory::new(provider_ro.tx_ref()),
                 &state_sorted,
@@ -858,111 +1142,62 @@ impl RootSpeeder {
                 proof_targets.insert(*hashed_address, slots);
             }
 
-            let prefix_sets = hashed_state.construct_prefix_sets();
-
             // Try to reuse a prefetched multiproof (built concurrently during tx execution).
             let key = PrefetchKey { parent_number, parent_hash };
             let prefetched = prefetched_multiproofs().lock().remove(&key);
-            let multiproof = match prefetched {
+            // Build a single proof-task manager and reuse its handle for:
+            // - decoding multiproof (if needed)
+            // - serving blind node fetches during sparse updates
+            let prefix_sets = Arc::new(hashed_state.construct_prefix_sets());
+            let task_ctx = ProofTaskCtx::new(nodes_sorted.clone(), state_sorted.clone(), prefix_sets.clone());
+            let rt = root_speeder_proof_runtime();
+            let handle = rt.handle().clone();
+            let proof_task = ProofTaskManager::new(handle.clone(), consistent_view.clone(), task_ctx, 64);
+            let proof_handle = proof_task.handle();
+            handle.spawn_blocking(move || {
+                let _ = proof_task.run();
+            });
+
+            let decoded_multiproof = match prefetched {
                 Some(prefetched) if prefetched.targets == proof_targets => prefetched.multiproof,
-                _ => Proof::new(trie_cursor_factory.clone(), hashed_cursor_factory.clone())
-                    .with_prefix_sets_mut(prefix_sets.clone())
-                    .with_branch_node_masks(true)
-                    .multiproof(proof_targets)
-                    .map_err(|e| BlockExecutionError::other(std::io::Error::other(e)))?,
+                _ => ParallelProof::new(
+                    consistent_view.clone(),
+                    nodes_sorted.clone(),
+                    state_sorted.clone(),
+                    prefix_sets.clone(),
+                    proof_handle.clone(),
+                )
+                .with_branch_node_masks(true)
+                .decoded_multiproof(proof_targets.clone())
+                .map_err(|e| BlockExecutionError::other(std::io::Error::other(format!("{e:?}"))))?,
             };
 
             // Sparse state trie, with parallel sparse accounts trie.
             let mut sparse = SparseStateTrie::<ParallelSparseTrie, SerialSparseTrie>::new().with_updates(true);
             sparse
-                .reveal_multiproof(multiproof)
+                .reveal_decoded_multiproof(decoded_multiproof)
                 .map_err(|e| BlockExecutionError::other(std::io::Error::other(format!("{e:?}"))))?;
 
-            // Provider factory for on-demand reveals during sparse updates.
-            let blinded_provider_factory = ProofTrieNodeProviderFactory::new(
-                trie_cursor_factory,
-                hashed_cursor_factory,
-                Arc::new(prefix_sets),
-            );
-
-            // Apply storage changes first so account updates can compute storage roots.
-            for (hashed_address, storage) in &hashed_state.storages {
-                let Some(storage_trie) = sparse.storage_trie_mut(hashed_address) else {
-                    return Err(BlockExecutionError::other(std::io::Error::other(format!(
-                        "sparse storage trie not revealed for account {hashed_address:?}"
-                    ))));
-                };
-
-                if storage.wiped {
-                    storage_trie.wipe();
-                }
-
-                // Defer removals until after updates.
-                let mut removed_slots: Vec<Nibbles> = Vec::new();
-                for (slot, value) in &storage.storage {
-                    let slot_nibbles = Nibbles::unpack(slot);
-                    if value.is_zero() {
-                        removed_slots.push(slot_nibbles);
-                        continue;
-                    }
-                    storage_trie
-                        .update_leaf(
-                            slot_nibbles,
-                            alloy_rlp::encode_fixed_size(value).to_vec(),
-                            blinded_provider_factory.storage_node_provider(*hashed_address),
-                        )
-                        .map_err(|e| BlockExecutionError::other(std::io::Error::other(format!("{e:?}"))))?;
-                }
-                for slot_nibbles in removed_slots {
-                    storage_trie
-                        .remove_leaf(
-                            &slot_nibbles,
-                            blinded_provider_factory.storage_node_provider(*hashed_address),
-                        )
-                        .map_err(|e| BlockExecutionError::other(std::io::Error::other(format!("{e:?}"))))?;
-                }
-                storage_trie.root();
-            }
-
-            // Apply account changes.
-            for (hashed_address, maybe_account) in &hashed_state.accounts {
-                let nibbles = Nibbles::unpack(hashed_address);
-                match maybe_account {
-                    Some(account) => {
-                        let keep = sparse
-                            .update_account(*hashed_address, account.clone(), &blinded_provider_factory)
-                            .map_err(|e| BlockExecutionError::other(std::io::Error::other(format!("{e:?}"))))?;
-                        if !keep {
-                            sparse
-                                .remove_account_leaf(&nibbles, &blinded_provider_factory)
-                                .map_err(|e| BlockExecutionError::other(std::io::Error::other(format!("{e:?}"))))?;
-                        }
-                    }
-                    None => {
-                        // Ensure storage trie deletion is reflected in trie updates.
-                        if sparse.storage_trie_ref(hashed_address).is_none() {
-                            let mut wiped = SparseTrie::Revealed(Box::new(
-                                SerialSparseTrie::default().with_updates(true),
-                            ));
-                            wiped
-                                .wipe()
-                                .map_err(|e| BlockExecutionError::other(std::io::Error::other(format!("{e:?}"))))?;
-                            sparse.insert_storage_trie(*hashed_address, wiped);
-                        } else {
-                            let trie = sparse.storage_trie_mut(hashed_address).expect("checked above");
-                            trie.wipe();
-                        }
-
-                        sparse
-                            .remove_account_leaf(&nibbles, &blinded_provider_factory)
-                            .map_err(|e| BlockExecutionError::other(std::io::Error::other(format!("{e:?}"))))?;
-                    }
-                }
-            }
+            apply_hashed_state_update_to_sparse_trie(&mut sparse, hashed_state.clone(), &proof_handle)?;
 
             let (state_root, trie_updates) = sparse
-                .root_with_updates(blinded_provider_factory)
+                .root_with_updates(proof_handle.clone())
                 .map_err(|e| BlockExecutionError::other(std::io::Error::other(format!("{e:?}"))))?;
+
+            // Cross-check (sampled): compare sparse root against parallel root on the same input.
+            if should_cross_check(parent_hash) {
+                let mut trie_input = base_input.clone();
+                trie_input.append(hashed_state.clone());
+                let (parallel_root, _parallel_updates) =
+                    ParallelStateRoot::new(consistent_view.clone(), trie_input)
+                        .incremental_root_with_updates()
+                        .map_err(BlockExecutionError::other)?;
+                if parallel_root != state_root {
+                    return Err(BlockExecutionError::other(std::io::Error::other(format!(
+                        "cross-check mismatch: sparse_root={state_root:?} parallel_root={parallel_root:?}"
+                    ))));
+                }
+            }
 
             Ok((
                 state_root,
