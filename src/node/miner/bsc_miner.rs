@@ -104,7 +104,12 @@ where
         mining_queue_tx: mpsc::UnboundedSender<MiningContext>,
         consensus: Arc<Parlia<BscChainSpec>>,
     ) -> Self {
-        let root_speeder = RootSpeederUpdater::new(&provider, 128);
+        // Keep enough canonical block overlays to bridge DB lag.
+        //
+        // If this is too small (e.g. 128), sparse/parallel root computation will frequently fall
+        // back to serial with errors like:
+        // `missing trie overlay blocks for range X..=Y (have 128)`.
+        let root_speeder = RootSpeederUpdater::new(&provider, 4096);
         Self {
             validator_address,
             provider,
