@@ -257,8 +257,11 @@ where
 
             if let Some(simulating_bid) = self.simulating_bid.read().get(&bid.parent_hash).cloned()
             {
-                let delay_ms =
-                    self.parlia.delay_for_mining(&parent_snapshot, &parent_header, DELAY_LEFT_OVER);
+                let delay_ms = self.parlia.delay_for_mining(
+                    &parent_snapshot,
+                    mining_ctx.header.as_ref().unwrap(),
+                    DELAY_LEFT_OVER,
+                );
                 if delay_ms >= NO_INTERRUPT_LEFT_OVER || delay_ms == 0 {
                     simulating_bid.interrupt_flag.store(true, Ordering::Relaxed);
                     let bid_simulate_req = self.commit_bid(5, _bid_runtime);
@@ -447,8 +450,8 @@ where
             let ending_bids_extra = 20;
             let min_time_left_for_ending_bids = DELAY_LEFT_OVER + ending_bids_extra;
             let delay_ms = self.parlia.delay_for_mining(
-                &bid_runtime.parent_snapshot,
-                &parent_header,
+                &bid_runtime.mining_ctx.parent_snapshot,
+                bid_runtime.mining_ctx.header.as_ref().unwrap(),
                 min_time_left_for_ending_bids,
             );
             if delay_ms > 0 {
