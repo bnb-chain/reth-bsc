@@ -325,7 +325,6 @@ impl MevApiImpl {
 
         // Check if it's a legacy transaction (first byte > 0x7f)
         let is_legacy = tx_bytes[0] > 0xc0;
-        debug!("is_legacy: {}, tx_bytes[0]:{:?}", is_legacy, tx_bytes[0]);
         if is_legacy {
             // Legacy transaction - no sidecar possible
             let tx = Self::parse_transaction(tx_bytes, chain_spec)?;
@@ -617,7 +616,6 @@ impl BscMevApiServer for MevApiImpl {
     /// Send a bid to the builder
     /// Returns the bid hash
     async fn send_bid(&self, bid: BidArgs) -> RpcResult<B256> {
-        // todo: check mev run
         tracing::info!(
             "Received bid for block {} with {} txs",
             bid.raw_bid.block_number,

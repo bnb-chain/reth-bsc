@@ -245,6 +245,11 @@ impl MiningConfig {
             .map(|v| v.to_lowercase() == "true")
             .unwrap_or(false);
 
+        let greedy_merge = std::env::var("BSC_GREEDY_MERGE")
+            .ok()
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(true);
+
         // MEV parameters from environment
         let validator_commission =
             std::env::var("BSC_VALIDATOR_COMMISSION").ok().and_then(|v| v.parse().ok());
@@ -279,6 +284,7 @@ impl MiningConfig {
             gas_limit,
             min_gas_tip,
             submit_built_payload,
+            greedy_merge,
             validator_commission,
             bid_simulation_left_over,
             no_interrupt_left_over,

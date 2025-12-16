@@ -588,12 +588,13 @@ where
             self.mev_metrics.invalid_bids_total.increment(1);
         }
 
-        debug!("bidSimulator: sim_bid finished, block number:{}, parent hash:{}, builder:{}, bid hash:{}, gas used:{}, success:{}",
+        debug!("bidSimulator: sim_bid finished, block number:{}, parent hash:{}, builder:{}, bid hash:{}, gas used:{}, gas fee:{}, success:{}",
          bid_runtime.bid.block_number,
          bid_runtime.bid.parent_hash,
          bid_runtime.bid.builder,
          bid_runtime.bid.bid_hash,
          bid_runtime.gas_used,
+         bid_runtime.gas_fee,
          success,
         );
 
