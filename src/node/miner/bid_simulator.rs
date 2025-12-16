@@ -422,8 +422,7 @@ where
             return;
         }
 
-        let system_balance = bid_runtime.gas_fee;
-        if let Err(e) = bid_runtime.pack_reward(self.validator_commission, system_balance) {
+        if let Err(e) = bid_runtime.pack_reward(self.validator_commission, bid_runtime.gas_fee) {
             debug!("Failed to pack reward: {:?}", e);
             return;
         }
@@ -453,12 +452,29 @@ where
                 min_time_left_for_ending_bids,
             );
             if delay_ms > 0 {
+                // Track greedy merge execution time
+                let greedy_merge_start = std::time::Instant::now();
+
                 if let Err(e) =
                     bid_runtime.fill_tx_from_pool(&mut builder, txs_except_last, block_gas_limit)
                 {
                     debug!("Failed to commit tx pool transactions: {:?}", e);
                     return;
                 }
+                if let Err(e) =
+                    bid_runtime.pack_reward(self.validator_commission, bid_runtime.gas_fee)
+                {
+                    debug!("Failed to pack reward: {:?}", e);
+                    return;
+                }
+
+                // Record greedy merge duration
+                let greedy_merge_duration = greedy_merge_start.elapsed().as_secs_f64();
+                self.mev_metrics.greedy_merge_duration_seconds.record(greedy_merge_duration);
+                debug!(
+                    "bidSimulator: greedy merge completed in {:.3}s, block_number: {}",
+                    greedy_merge_duration, bid_runtime.bid.block_number
+                );
             }
         }
 
