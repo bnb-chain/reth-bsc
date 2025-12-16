@@ -4,7 +4,7 @@ use crate::{
     node::{
         engine::BscBuiltPayload,
         evm::config::BscEvmConfig,
-        trie_root::RootSpeederUpdater,
+        trie_root::RootDebuggerUpdater,
         miner::{
             config::{MiningConfig, keystore}, payload::{BscPayloadBuilder, BscPayloadJob, BscPayloadJobHandle}, signer::init_global_signer_from_k256, util::prepare_new_attributes
         },
@@ -81,7 +81,7 @@ where
     mining_queue_tx: mpsc::UnboundedSender<MiningContext>,
     consensus: Arc<Parlia<BscChainSpec>>,
     pre_cached: Option<PrecachedState>,
-    root_speeder: RootSpeederUpdater<Provider>,
+    root_debugger: RootDebuggerUpdater<Provider>,
 }
 
 impl<Provider> NewWorkWorker<Provider> 
@@ -109,7 +109,7 @@ where
         // If this is too small (e.g. 128), sparse/parallel root computation will frequently fall
         // back to serial with errors like:
         // `missing trie overlay blocks for range X..=Y (have 128)`.
-        let root_speeder = RootSpeederUpdater::new(&provider, 4096);
+        let root_debugger = RootDebuggerUpdater::new(&provider, 4096);
         Self {
             validator_address,
             provider,
@@ -117,7 +117,7 @@ where
             mining_queue_tx,
             consensus,
             pre_cached: None,
-            root_speeder,
+            root_debugger,
         }
     }
 
@@ -134,7 +134,7 @@ where
             match notifications.next().await {
                 Some(event) => {
                     // Keep trie root overlay cache up-to-date.
-                    self.root_speeder.drain();
+                    self.root_debugger.drain();
 
                     let committed = event.committed();
                     let tip = committed.tip();

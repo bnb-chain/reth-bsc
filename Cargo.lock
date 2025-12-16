@@ -9674,6 +9674,7 @@ dependencies = [
  "reth-discv4",
  "reth-engine-local",
  "reth-engine-primitives",
+ "reth-engine-tree",
  "reth-eth-wire",
  "reth-eth-wire-types",
  "reth-ethereum-engine-primitives",

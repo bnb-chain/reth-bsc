@@ -57,6 +57,7 @@ reth-trie-sparse-parallel = { git = "https://github.com/bnb-chain/reth.git", bra
 reth-execution-types = { git = "https://github.com/bnb-chain/reth.git", branch = "debug-trie-root" }
 reth-tasks = { git = "https://github.com/bnb-chain/reth.git", branch = "debug-trie-root" }
 reth-transaction-pool = { git = "https://github.com/bnb-chain/reth.git", branch = "debug-trie-root" }
+reth-engine-tree = { git = "https://github.com/bnb-chain/reth.git", branch = "debug-trie-root" }
 revm = "29.0.0"
 
 # alloy dependencies

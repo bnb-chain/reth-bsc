@@ -8,7 +8,9 @@ use reth_provider::{
 use revm::database::{State, states::bundle_state::BundleRetention};
 use alloy_evm::{Evm, block::BlockExecutor};
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
-use crate::node::trie_root::{RootSpeeder, RootSpeederMode, StateRootCompareState};
+use crate::node::trie_root::{
+    insert_payload_processor_hook_drop, PayloadProcessorKey, RootDebugger, StateRootCompareState,
+};
 use parking_lot::Mutex;
 use std::sync::Arc;
 
@@ -155,6 +157,12 @@ where
     ) -> Result<BlockBuilderOutcome<BscPrimitives>, BlockExecutionError> {
         let finish_start = std::time::Instant::now();
         let (evm, result) = self.executor.finish()?;
+        // `executor.finish()` executes system transactions and then drops the executor (and its
+        // state hook sender) on return. Record the time right after system tx execution completes.
+        insert_payload_processor_hook_drop(PayloadProcessorKey::new(self.parent.number, self.parent.hash()), std::time::Instant::now());
+        // NOTE: `executor.finish()` consumes the executor and runs system transactions.
+        // This ensures any installed state hook (e.g. payload_processor) sees user txs + system txs,
+        // and will be dropped automatically after `finish()` returns.
         let (db, evm_env) = evm.finish();
 
         let assembled_system_txs = self.shared_ctx.inner.borrow().assembled_system_txs.clone();
@@ -287,6 +295,9 @@ where
     ) -> Result<BlockBuilderOutcome<BscPrimitives>, BlockExecutionError> {
         let finish_start = std::time::Instant::now();
         let (evm, result) = self.executor.finish()?;
+        // `executor.finish()` executes system transactions and then drops the executor (and its
+        // state hook sender) on return. Record the time right after system tx execution completes.
+        insert_payload_processor_hook_drop(PayloadProcessorKey::new(self.parent.number, self.parent.hash()), std::time::Instant::now());
         let (db, evm_env) = evm.finish();
 
         let assembled_system_txs = self.shared_ctx.inner.borrow().assembled_system_txs.clone();
@@ -294,8 +305,12 @@ where
         db.merge_transitions(BundleRetention::Reverts);
 
         // calculate the state root (serial, authoritative)
+        let execution_duration_ms = finish_start.elapsed().as_millis();
         let state_root_start = std::time::Instant::now();
         let hashed_state = state.hashed_post_state(&db.bundle_state);
+
+        // Keep the provider factory alive/used (the payload_processor path now owns acceleration).
+        let _ = &self.provider_factory;
 
         // Start accelerated state-root computation in the background BEFORE we run the serial
         // authoritative state-root, so we can compare overlapped timings.
@@ -305,9 +320,17 @@ where
             w.user_tx_len = Some(self.transactions.len());
             w.system_tx_len = Some(assembled_system_txs.len());
             w.total_tx_len = Some(self.transactions.len() + assembled_system_txs.len());
+            w.execution_duration_ms = Some(execution_duration_ms);
         }
-        RootSpeeder::spawn_accelerated_compare(
+        // (Background) run ParallelStateRoot for comparison.
+        RootDebugger::spawn_parallel_state_root_compare(
             self.provider_factory.clone(),
+            self.parent.number,
+            self.parent.hash(),
+            hashed_state.clone(),
+        );
+        // (Background) log Serial vs Parallel vs PayloadProcessor once all results are available.
+        RootDebugger::spawn_triple_compare(
             self.parent.number,
             self.parent.hash(),
             hashed_state.clone(),
@@ -317,8 +340,6 @@ where
         let (state_root, trie_updates) = state
             .state_root_with_updates(hashed_state.clone())
             .map_err(BlockExecutionError::other)?;
-        let state_root_mode = RootSpeederMode::Serial;
-
         let state_root_duration = state_root_start.elapsed();
         {
             let mut w = compare_state.lock();
@@ -374,8 +395,7 @@ where
             finish_duration_ms = finish_duration.as_millis(),
             state_root_duration_ms = state_root_duration.as_millis(),
             assemble_duration_ms = assemble_duration.as_millis(),
-            state_root_mode = ?state_root_mode,
-            serial_mode_used = matches!(state_root_mode, crate::node::trie_root::RootSpeederMode::Serial),
+            serial_mode_used = true,
             "Succeed to seal block (state root)"
         );
 

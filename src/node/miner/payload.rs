@@ -7,13 +7,20 @@ use crate::node::evm::config::BscEvmConfig;
 use crate::node::miner::bid_simulator::BidSimulator;
 use crate::node::miner::bsc_miner::{MiningContext, SubmitContext};
 use crate::node::pool::BlacklistedAddressError;
-use crate::node::trie_root::RootSpeederPrefetch;
+use crate::node::trie_root::{
+    insert_payload_processor_state_root, take_payload_processor_hook_drop, PayloadProcessorKey,
+    PayloadProcessorStateRootResult,
+};
 use alloy_evm::block::BlockExecutor;
-use reth_provider::StateProviderFactory;
+use reth_provider::{BlockNumReader, HeaderProvider, StateProviderFactory};
 use reth_revm::{database::StateProviderDatabase, db::State};
 use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
 use reth_evm::execute::BlockBuilder;
 use alloy_evm::Evm;
+use reth_evm::execute::WithTxEnv;
+use reth_evm::TxEnvFor;
+use reth_engine_primitives::TreeConfig;
+use reth_engine_tree::tree::{ExecutionEnv, PayloadProcessor};
 use reth_payload_primitives::{PayloadBuilderError, BuiltPayload};
 use reth::transaction_pool::{TransactionPool, PoolTransaction};
 use reth_primitives::TransactionSigned;
@@ -44,6 +51,8 @@ use reth_chainspec::EthChainSpec;
 use reth_chainspec::EthereumHardforks;
 use crate::consensus::eip4844::{calc_blob_fee, BLOB_TX_BLOB_GAS_PER_BLOB};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::convert::Infallible;
+use crate::node::trie_root::trie_overlay_cache;
 
 
 /// Delay left over for mining calculation
@@ -195,6 +204,146 @@ where
             )
             .map_err(PayloadBuilderError::other)?;
 
+        // Start engine-tree's PayloadProcessor to compute sparse state root concurrently while we
+        // execute txs for payload building. We disable caching+prewarming (no tx execution in
+        // prewarm task) and only use the state update stream via the state_hook.
+        let parent_number = parent_header.number();
+        let parent_hash = parent_header.hash_slow();
+        let key = PayloadProcessorKey::new(parent_number, parent_hash);
+
+        // Provide an empty tx iterator because we don't want PayloadProcessor to execute txs
+        // itself; we only stream state updates from our own executor.
+        type DummyTx<EvmCfg> =
+            WithTxEnv<TxEnvFor<EvmCfg>, reth_primitives_traits::Recovered<reth_primitives_traits::TxTy<<EvmCfg as ConfigureEvm>::Primitives>>>;
+        let empty_txs = std::iter::empty::<Result<DummyTx<EvmConfig>, Infallible>>();
+
+        let tree_cfg = TreeConfig::default()
+            .without_caching_and_prewarming(true)
+            .with_max_proof_task_concurrency(128);
+
+        // Construct a minimal engine-tree ExecutionEnv. Prewarming is disabled so `evm_env` is
+        // effectively unused (still required by the API).
+        let exec_env = ExecutionEnv { evm_env: Default::default(), hash: parent_hash, parent_hash };
+
+        // Use a valid DB tip for the consistent view (parent may not always be persisted yet).
+        let provider_ro = self.client.database_provider_ro().map_err(PayloadBuilderError::other)?;
+        let db_last = provider_ro.best_block_number().map_err(PayloadBuilderError::other)?;
+        let db_tip = provider_ro
+            .sealed_header(db_last)
+            .map_err(PayloadBuilderError::other)?
+            .ok_or_else(|| PayloadBuilderError::other(std::io::Error::other("db tip missing")))?;
+        let consistent_view =
+            reth_provider::providers::ConsistentDbView::new(self.client.clone(), Some((db_tip.hash(), db_last)));
+        // Build trie input for the parent state (DB + overlays up to parent).
+        // If the DB tip is behind the parent and we can't fully cover the gap from trie_overlay,
+        // then we skip starting payload_processor (comparison only; does not affect sealing).
+        let mut trie_input = reth_trie::TrieInput::default();
+        let mut can_start_payload_processor = true;
+        if db_last < parent_number {
+            if let Some(cache) = trie_overlay_cache() {
+                let needed_range = (db_last + 1)..=parent_number;
+                let overlays = cache.read().get_range(needed_range.clone());
+                if overlays.len() != (parent_number - db_last) as usize {
+                    can_start_payload_processor = false;
+                } else {
+                    for entry in overlays {
+                        if entry.number == parent_number && entry.hash != parent_hash {
+                            can_start_payload_processor = false;
+                            break;
+                        }
+                        let Some(nodes) = entry.trie_updates.as_deref() else {
+                            can_start_payload_processor = false;
+                            break;
+                        };
+                        trie_input.append_cached_ref(nodes, &entry.hashed_state);
+                    }
+                }
+            } else {
+                can_start_payload_processor = false;
+            }
+        }
+
+        if can_start_payload_processor {
+            let mut processor = PayloadProcessor::new(
+                Default::default(),
+                self.evm_config.clone(),
+                &tree_cfg,
+                Default::default(),
+            );
+            let mut pp_handle = processor.spawn_without_caching_and_prewarming(
+                exec_env,
+                empty_txs,
+                consistent_view,
+                trie_input,
+                &tree_cfg,
+            );
+
+            // Start time for payload_processor wall-time measurement.
+            let pp_start = std::time::Instant::now();
+
+            // Attach payload_processor state hook to our executor.
+            builder.executor_mut().set_state_hook(Some(Box::new(pp_handle.state_hook())));
+
+            // Wait for the payload processor result on a background thread (do not block payload building).
+            std::thread::spawn(move || {
+                match pp_handle.state_root() {
+                    Ok(outcome) => {
+                        let end = std::time::Instant::now();
+                        let duration_ms_total = end.duration_since(pp_start).as_millis();
+                        // Best-effort: wait briefly for the hook-drop timestamp to be recorded.
+                        let duration_ms_post_exec = {
+                            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
+                            loop {
+                                if let Some(t) = take_payload_processor_hook_drop(key) {
+                                    break Some(end.duration_since(t).as_millis());
+                                }
+                                if std::time::Instant::now() >= deadline {
+                                    break None;
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(1));
+                            }
+                        };
+                        insert_payload_processor_state_root(
+                            key,
+                            PayloadProcessorStateRootResult {
+                                state_root: outcome.state_root,
+                                duration_ms: duration_ms_total,
+                                post_exec_duration_ms: duration_ms_post_exec,
+                            },
+                        );
+                        tracing::debug!(
+                            target: "bsc::builder",
+                            parent_number,
+                            parent_hash = ?parent_hash,
+                            state_root = ?outcome.state_root,
+                            duration_ms_total,
+                            duration_ms_post_exec = ?duration_ms_post_exec,
+                            "PayloadProcessor computed state root"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::debug!(
+                            target: "bsc::builder",
+                            parent_number,
+                            parent_hash = ?parent_hash,
+                            %err,
+                            "PayloadProcessor state root unavailable"
+                        );
+                    }
+                }
+            });
+        } else {
+            tracing::debug!(
+                target: "bsc::builder",
+                parent_number,
+                parent_hash = ?parent_hash,
+                db_last,
+                "Skip starting PayloadProcessor (missing trie_overlay coverage)"
+            );
+        }
+
+        // Apply pre-execution changes AFTER installing the optional payload_processor hook, so the
+        // hook sees any pre-execution system contract state transitions.
         builder.apply_pre_execution_changes().map_err(|err| {
             warn!(
                 target: "payload_builder",
@@ -204,11 +353,6 @@ where
             );
             PayloadBuilderError::Internal(err.into())
         })?;
-
-        // Stream state changes into RootSpeeder while we assemble the payload.
-        // This enables best-effort background multiproof prefetch for sparse trie computation.
-        let prefetch = RootSpeederPrefetch::new(parent_header.number(), parent_header.hash_slow());
-        builder.executor_mut().set_state_hook(Some(prefetch.state_hook()));
 
         let mut total_fees = U256::ZERO;
         let mut cumulative_gas_used = 0;
@@ -238,7 +382,6 @@ where
         }
         let max_blob_count = blob_params.as_ref().map(|params| params.max_blob_count).unwrap_or_default();
         let mut best_tx_list = self.pool.best_transactions_with_attributes(BestTransactionsAttributes::new(base_fee, blob_fee.map(|fee| fee as u64)));
-        let mut executed_txs: usize = 0;
         while let Some(pool_tx) = best_tx_list.next() {
             if cancel.is_cancelled() {
                 break;
@@ -437,12 +580,7 @@ where
                 Err(err) => return Err(Box::new(PayloadBuilderError::evm(err))),
             };
 
-            executed_txs += 1;
-            // Opportunistically prefetch proof data in the background while we keep executing txs.
-            // Keep this coarse to avoid too many background tasks.
-            if executed_txs % 64 == 0 {
-                prefetch.kick_prefetch(self.client.clone());
-            }
+            // payload_processor path: no explicit kick needed
 
              // add to the total blob gas used if the transaction successfully executed
             if let Some(blob_tx) = tx.as_eip4844() {
@@ -491,8 +629,7 @@ where
 
         // add system txs to payload.
         let finalize_start = std::time::Instant::now();
-        // Final prefetch kick right before finish; if it completes in time, RootSpeeder may reuse it.
-        prefetch.kick_prefetch(self.client.clone());
+        // Drop the hook sender so PayloadProcessor can finalize the root.
         let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } = builder.finish(&state_provider)?;
         let mut sealed_block = Arc::new(block.sealed_block().clone());
         
