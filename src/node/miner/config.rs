@@ -24,7 +24,8 @@ pub struct MiningConfig {
     pub min_gas_tip: Option<u128>,
     /// Submit built payload to the import service
     pub submit_built_payload: bool,
-
+    /// Enable greedy merge
+    pub greedy_merge: bool,
     // MEV related parameters
     /// Validator commission rate (in basis points, 100 = 1%)
     pub validator_commission: Option<u64>,
@@ -72,6 +73,7 @@ impl Default for MiningConfig {
             gas_limit: Some(30_000_000),
             min_gas_tip: Some(DEFAULT_MIN_GAS_TIP),
             submit_built_payload: false,
+            greedy_merge: true,
             // MEV defaults
             validator_commission: Some(400),    // 4%
             bid_simulation_left_over: Some(50), // 50ms
@@ -186,6 +188,7 @@ impl MiningConfig {
                 max_bids_per_builder: Some(3),
                 builder_fee_ceil: Some(1_000_000_000_000_000_000),
                 allowed_builders: None,
+                greedy_merge: true,
             }
         } else {
             // Fallback to default if key generation fails

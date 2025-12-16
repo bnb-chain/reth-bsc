@@ -509,6 +509,7 @@ impl MevApiImpl {
             parent_hash: bid_args.raw_bid.parent_hash,
             txs,
             blob_sidecars,
+            un_revertible: bid_args.raw_bid.un_revertible.clone(),
             gas_used: bid_args.raw_bid.gas_used.to(),
             gas_fee: bid_args.raw_bid.gas_fee,
             builder_fee: bid_args.raw_bid.builder_fee.unwrap_or(U256::ZERO),
