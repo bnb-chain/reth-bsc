@@ -3,6 +3,7 @@ use crate::consensus::eip4844::{calc_blob_fee, is_blob_eligible_block, BLOB_TX_B
 use crate::consensus::parlia::Parlia;
 use crate::evm::blacklist;
 use crate::hardforks::BscHardforks;
+use crate::metrics::BscMinerMetrics;
 use crate::node::engine::BscBuiltPayload;
 use crate::node::evm::config::BscEvmConfig;
 use crate::node::miner::bid_simulator::BidSimulator;
@@ -12,6 +13,8 @@ use crate::node::primitives::BscBlobTransactionSidecar;
 use alloy_consensus::{BlockHeader, Transaction};
 use alloy_evm::Evm;
 use alloy_primitives::U256;
+use either::Either;
+use once_cell::sync::Lazy;
 use reth::payload::EthPayloadBuilderAttributes;
 use reth::transaction_pool::error::Eip4844PoolTransactionError;
 use reth::transaction_pool::error::InvalidPoolTransactionError;
@@ -36,7 +39,6 @@ use reth_revm::cached::CachedReads;
 use reth_revm::cancelled::ManualCancel;
 use reth_revm::{database::StateProviderDatabase, db::State};
 use revm::context_interface::block::Block;
-use either::Either;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -68,6 +70,13 @@ fn validate_bsc_sidecar(
     }
 }
 
+/// Result wrapper that also returns updated cached reads.
+pub struct BuildResultWithCachedReads<T> {
+    pub result: Result<T, Box<dyn std::error::Error + Send + Sync>>,
+    pub cached_reads: CachedReads,
+}
+
+static MINER_METRICS: Lazy<BscMinerMetrics> = Lazy::new(BscMinerMetrics::default);
 /// Errors that can occur during payload job execution
 #[derive(Debug, thiserror::Error)]
 pub enum BscPayloadJobError {
@@ -171,199 +180,183 @@ where
     ///
     /// # Returns
     ///
-    /// Returns a `Result` containing the built payload or an error.
+    /// Returns a `BuildResultWithCachedReads` containing the payload result and cached reads.
     pub async fn build_payload(
         &self,
         args: BscBuildArguments<EthPayloadBuilderAttributes>,
-    ) -> Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> BuildResultWithCachedReads<BscBuiltPayload> {
         let build_start = std::time::Instant::now();
         let BscBuildArguments { mut cached_reads, config, cancel, trace_id, min_gas_tip } = args;
-        let PayloadConfig { parent_header, attributes } = config;
 
-        let state_provider = self.client.state_by_block_hash(parent_header.hash_slow())?;
-        let state = StateProviderDatabase::new(&state_provider);
-        let mut db = State::builder()
-            .with_database(cached_reads.as_db_mut(state))
-            .with_bundle_update()
-            .build();
+        let result = (|| -> Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>> {
+            let PayloadConfig { parent_header, attributes } = config;
 
-        let mut builder = self
-            .evm_config
-            .builder_for_next_block(
-                &mut db,
-                &parent_header,
-                NextBlockEnvAttributes {
-                    timestamp: attributes.timestamp(),
-                    suggested_fee_recipient: attributes.suggested_fee_recipient(),
-                    prev_randao: attributes.prev_randao(),
-                    gas_limit: self.builder_config.gas_limit(parent_header.gas_limit),
-                    parent_beacon_block_root: attributes.parent_beacon_block_root(),
-                    withdrawals: Some(attributes.withdrawals().clone()),
-                    extra_data: self.builder_config.extra_data.clone(),
-                },
-            )
-            .map_err(PayloadBuilderError::other)?;
+            let state_provider = self.client.state_by_block_hash(parent_header.hash())?;
+            let state = StateProviderDatabase::new(&state_provider);
+            let mut db = State::builder()
+                .with_database(cached_reads.as_db_mut(state))
+                .with_bundle_update()
+                .build();
 
-        builder.apply_pre_execution_changes().map_err(|err| {
-            warn!(
-                target: "payload_builder",
-                trace_id,
-                %err,
-                "failed to apply pre-execution changes"
+            let mut builder = self
+                .evm_config
+                .builder_for_next_block(
+                    &mut db,
+                    &parent_header,
+                    NextBlockEnvAttributes {
+                        timestamp: attributes.timestamp(),
+                        suggested_fee_recipient: attributes.suggested_fee_recipient(),
+                        prev_randao: attributes.prev_randao(),
+                        gas_limit: self.builder_config.gas_limit(parent_header.gas_limit),
+                        parent_beacon_block_root: attributes.parent_beacon_block_root(),
+                        withdrawals: Some(attributes.withdrawals().clone()),
+                        extra_data: self.builder_config.extra_data.clone(),
+                    },
+                )
+                .map_err(PayloadBuilderError::other)?;
+
+            builder.apply_pre_execution_changes().map_err(|err| {
+                warn!(
+                    target: "payload_builder",
+                    trace_id,
+                    %err,
+                    "failed to apply pre-execution changes"
+                );
+                PayloadBuilderError::Internal(err.into())
+            })?;
+
+            let mut total_fees = U256::ZERO;
+            let mut cumulative_gas_used = 0;
+            // reserve the systemtx gas
+            let system_txs_gas = self.parlia.estimate_gas_reserved_for_system_txs(
+                Some(parent_header.timestamp),
+                parent_header.number + 1,
+                attributes.timestamp,
             );
-            PayloadBuilderError::Internal(err.into())
-        })?;
+            let block_gas_limit: u64 =
+                builder.evm_mut().block().gas_limit().saturating_sub(system_txs_gas);
 
-        let mut total_fees = U256::ZERO;
-        let mut cumulative_gas_used = 0;
-        // reserve the systemtx gas
-        let system_txs_gas = self.parlia.estimate_gas_reserved_for_system_txs(
-            Some(parent_header.timestamp),
-            parent_header.number + 1,
-            attributes.timestamp,
-        );
-        let block_gas_limit: u64 =
-            builder.evm_mut().block().gas_limit().saturating_sub(system_txs_gas);
+            let base_fee = builder.evm_mut().block().basefee();
+            trace!("build_payload: base_fee={}", base_fee);
 
-        let base_fee = builder.evm_mut().block().basefee();
-        trace!("build_payload: base_fee={}", base_fee);
+            let mut sidecars_map = HashMap::new();
+            let mut block_blob_count = 0;
 
-        let mut sidecars_map = HashMap::new();
-        let mut block_blob_count = 0;
+            let mut blob_fee = None;
+            let blob_params = self.chain_spec.blob_params_at_timestamp(attributes.timestamp());
+            let header = self.ctx.header.as_ref().ok_or_else(|| {
+                Box::new(std::io::Error::other("Missing header in mining context"))
+                    as Box<dyn std::error::Error + Send + Sync>
+            })?;
 
-        let mut blob_fee = None;
-        let blob_params = self.chain_spec.blob_params_at_timestamp(attributes.timestamp());
-        let header = self.ctx.header.as_ref().ok_or_else(|| {
-            Box::new(std::io::Error::other("Missing header in mining context"))
-                as Box<dyn std::error::Error + Send + Sync>
-        })?;
-
-        if BscHardforks::is_cancun_active_at_timestamp(
-            &self.chain_spec,
-            header.number,
-            header.timestamp,
-        ) {
-            if let Some(excess) = header.excess_blob_gas {
-                if excess != 0 {
-                    blob_fee = Some(calc_blob_fee(&self.chain_spec, header));
+            if BscHardforks::is_cancun_active_at_timestamp(
+                &self.chain_spec,
+                header.number,
+                header.timestamp,
+            ) {
+                if let Some(excess) = header.excess_blob_gas {
+                    if excess != 0 {
+                        blob_fee = Some(calc_blob_fee(&self.chain_spec, header));
+                    }
                 }
             }
-        }
-        let blob_eligible =
-            is_blob_eligible_block(&self.chain_spec, header.number, header.timestamp);
-        let mut max_blob_count =
-            blob_params.as_ref().map(|params| params.max_blob_count).unwrap_or_default();
-        if !blob_eligible {
-            max_blob_count = 0;
-        }
-        let mut best_tx_list = self.pool.best_transactions_with_attributes(
-            BestTransactionsAttributes::new(base_fee, blob_fee.map(|fee| fee as u64)),
-        );
-        if !blob_eligible {
-            best_tx_list.skip_blobs();
-        }
-        while let Some(pool_tx) = best_tx_list.next() {
-            if cancel.is_cancelled() {
-                break;
+            let blob_eligible =
+                is_blob_eligible_block(&self.chain_spec, header.number, header.timestamp);
+            let mut max_blob_count =
+                blob_params.as_ref().map(|params| params.max_blob_count).unwrap_or_default();
+            if !blob_eligible {
+                max_blob_count = 0;
             }
-
-            // filter out blacklisted transactions before executing.
-            if self.chain_spec.is_nano_active_at_block(parent_header.number + 1)
-                && blacklist::check_tx_basic_blacklist(pool_tx.sender(), pool_tx.to())
-            {
-                debug!(
-                    target: "payload_builder",
-                    trace_id,
-                    tx = ?pool_tx.hash(),
-                    "Blacklisted transaction"
-                );
-                best_tx_list.mark_invalid(
-                    &pool_tx,
-                    &InvalidPoolTransactionError::other(BlacklistedAddressError()),
-                );
-                continue;
-            }
-            // filter out tx with min gas tip.
-            if pool_tx.effective_tip_per_gas(base_fee).unwrap_or(0_u128) < min_gas_tip {
-                // Skip packaging underpriced transactions, but do not mark them invalid.
-                trace!(
-                    target: "payload_builder",
-                    trace_id,
-                    tx = ?pool_tx.hash(),
-                    effective_tip_per_gas = pool_tx.effective_tip_per_gas(base_fee).unwrap_or(0_u128),
-                    min_gas_tip,
-                    "Skipping underpriced transaction"
-                );
-                continue;
-            }
-
-            // ensure we still have capacity for this transaction
-            if cumulative_gas_used + pool_tx.gas_limit() > block_gas_limit {
-                // we can't fit this transaction into the block, so we need to mark it as invalid
-                // which also removes all dependent transaction from the iterator before we can
-                // continue
-                best_tx_list.mark_invalid(
-                    &pool_tx,
-                    &InvalidPoolTransactionError::ExceedsGasLimit(
-                        pool_tx.gas_limit(),
-                        block_gas_limit,
-                    ),
-                );
-                continue;
-            }
-
-            let tx = pool_tx.to_consensus();
-            if tx.is_eip4844() && !blob_eligible {
-                best_tx_list.skip_blobs();
-                continue;
-            }
-            let tx_start = std::time::Instant::now();
-            let mut blob_tx_sidecar: Option<Arc<alloy_eips::eip7594::BlobTransactionSidecarVariant>> = None;
-            trace!(
-                target: "payload_builder",
-                trace_id,
-                block_number = parent_header.number() + 1,
-                tx = ?tx.hash(),
-                is_blob_tx = tx.is_eip4844(),
-                tx_type = ?tx.tx_type(),
-                "Processing transaction"
+            let mut best_tx_list = self.pool.best_transactions_with_attributes(
+                BestTransactionsAttributes::new(base_fee, blob_fee.map(|fee| fee as u64)),
             );
-            if let Some(blob_tx) = tx.as_eip4844() {
-                let tx_blob_count = blob_tx.tx().blob_versioned_hashes.len() as u64;
-                if block_blob_count + tx_blob_count > max_blob_count {
-                    // we can't fit this _blob_ transaction into the block, so we mark it as
-                    // invalid, which removes its dependent transactions from
-                    // the iterator. This is similar to the gas limit condition
-                    // for regular transactions above.
+            if !blob_eligible {
+                best_tx_list.skip_blobs();
+            }
+            while let Some(pool_tx) = best_tx_list.next() {
+                if cancel.is_cancelled() {
+                    break;
+                }
+
+                // filter out blacklisted transactions before executing.
+                if self.chain_spec.is_nano_active_at_block(parent_header.number + 1)
+                    && blacklist::check_tx_basic_blacklist(pool_tx.sender(), pool_tx.to())
+                {
                     debug!(
                         target: "payload_builder",
                         trace_id,
-                        tx = ?tx.hash(),
-                        block_blob_count,
-                        tx_blob_count,
-                        max_blob_count,
-                        "Skipping blob transaction because it would exceed the max blob count per block"
+                        tx = ?pool_tx.hash(),
+                        "Blacklisted transaction"
                     );
                     best_tx_list.mark_invalid(
                         &pool_tx,
-                        &InvalidPoolTransactionError::Eip4844(
-                            Eip4844PoolTransactionError::TooManyEip4844Blobs {
-                                have: block_blob_count + tx_blob_count,
-                                permitted: max_blob_count,
-                            },
+                        &InvalidPoolTransactionError::other(BlacklistedAddressError()),
+                    );
+                    continue;
+                }
+                // filter out tx with min gas tip.
+                if pool_tx.effective_tip_per_gas(base_fee).unwrap_or(0_u128) < min_gas_tip {
+                    // Skip packaging underpriced transactions, but do not mark them invalid.
+                    trace!(
+                        target: "payload_builder",
+                        trace_id,
+                        tx = ?pool_tx.hash(),
+                        effective_tip_per_gas = pool_tx.effective_tip_per_gas(base_fee).unwrap_or(0_u128),
+                        min_gas_tip,
+                        "Skipping underpriced transaction"
+                    );
+                    continue;
+                }
+
+                // ensure we still have capacity for this transaction
+                if cumulative_gas_used + pool_tx.gas_limit() > block_gas_limit {
+                    // we can't fit this transaction into the block, so we need to mark it as invalid
+                    // which also removes all dependent transaction from the iterator before we can
+                    // continue
+                    best_tx_list.mark_invalid(
+                        &pool_tx,
+                        &InvalidPoolTransactionError::ExceedsGasLimit(
+                            pool_tx.gas_limit(),
+                            block_gas_limit,
                         ),
                     );
                     continue;
                 }
 
-                if BscHardforks::is_cancun_active_at_timestamp(
-                    &self.chain_spec,
-                    parent_header.number + 1,
-                    attributes.timestamp(),
-                ) {
-                    let left = max_blob_count - block_blob_count;
-                    if left < blob_tx.tx().blob_gas_used().unwrap_or(0) / BLOB_TX_BLOB_GAS_PER_BLOB
-                    {
+                let tx = pool_tx.to_consensus();
+                if tx.is_eip4844() && !blob_eligible {
+                    best_tx_list.skip_blobs();
+                    continue;
+                }
+                let tx_start = std::time::Instant::now();
+                let mut blob_tx_sidecar: Option<
+                    Arc<alloy_eips::eip7594::BlobTransactionSidecarVariant>,
+                > = None;
+                trace!(
+                    target: "payload_builder",
+                    trace_id,
+                    block_number = parent_header.number() + 1,
+                    tx = ?tx.hash(),
+                    is_blob_tx = tx.is_eip4844(),
+                    tx_type = ?tx.tx_type(),
+                    "Processing transaction"
+                );
+                if let Some(blob_tx) = tx.as_eip4844() {
+                    let tx_blob_count = blob_tx.tx().blob_versioned_hashes.len() as u64;
+                    if block_blob_count + tx_blob_count > max_blob_count {
+                        // we can't fit this _blob_ transaction into the block, so we mark it as
+                        // invalid, which removes its dependent transactions from
+                        // the iterator. This is similar to the gas limit condition
+                        // for regular transactions above.
+                        debug!(
+                            target: "payload_builder",
+                            trace_id,
+                            tx = ?tx.hash(),
+                            block_blob_count,
+                            tx_blob_count,
+                            max_blob_count,
+                            "Skipping blob transaction because it would exceed the max blob count per block"
+                        );
                         best_tx_list.mark_invalid(
                             &pool_tx,
                             &InvalidPoolTransactionError::Eip4844(
@@ -375,235 +368,259 @@ where
                         );
                         continue;
                     }
-                }
 
-                let blob_sidecar_result = 'sidecar: {
-                    let Some(sidecar) =
-                        self.pool.get_blob(*tx.hash()).map_err(PayloadBuilderError::other)?
-                    else {
-                        break 'sidecar Err(Eip4844PoolTransactionError::MissingEip4844BlobSidecar);
+                    if BscHardforks::is_cancun_active_at_timestamp(
+                        &self.chain_spec,
+                        parent_header.number + 1,
+                        attributes.timestamp(),
+                    ) {
+                        let left = max_blob_count - block_blob_count;
+                        if left
+                            < blob_tx.tx().blob_gas_used().unwrap_or(0) / BLOB_TX_BLOB_GAS_PER_BLOB
+                        {
+                            best_tx_list.mark_invalid(
+                                &pool_tx,
+                                &InvalidPoolTransactionError::Eip4844(
+                                    Eip4844PoolTransactionError::TooManyEip4844Blobs {
+                                        have: block_blob_count + tx_blob_count,
+                                        permitted: max_blob_count,
+                                    },
+                                ),
+                            );
+                            continue;
+                        }
+                    }
+
+                    let blob_sidecar_result = 'sidecar: {
+                        let Some(sidecar) =
+                            self.pool.get_blob(*tx.hash()).map_err(PayloadBuilderError::other)?
+                        else {
+                            break 'sidecar Err(
+                                Eip4844PoolTransactionError::MissingEip4844BlobSidecar,
+                            );
+                        };
+
+                        // BSC: Always accept legacy (EIP-4844) sidecars and reject EIP-7594 sidecars.
+                        if let Err(err) = validate_bsc_sidecar(sidecar.as_ref()) {
+                            Err(err)
+                        } else {
+                            Ok(sidecar)
+                        }
                     };
 
-                    // BSC: Always accept legacy (EIP-4844) sidecars and reject EIP-7594 sidecars.
-                    if let Err(err) = validate_bsc_sidecar(sidecar.as_ref()) {
-                        Err(err)
-                    } else {
-                        Ok(sidecar)
-                    }
-                };
+                    blob_tx_sidecar = match blob_sidecar_result {
+                        Ok(sidecar) => Some(sidecar),
+                        Err(error) => {
+                            warn!(
+                                target: "payload_builder",
+                                trace_id,
+                                block_number = parent_header.number() + 1,
+                                tx = ?tx.hash(),
+                                ?error,
+                                "Skipping blob transaction due to invalid sidecar"
+                            );
+                            best_tx_list.mark_invalid(
+                                &pool_tx,
+                                &InvalidPoolTransactionError::Eip4844(error),
+                            );
+                            continue;
+                        }
+                    };
+                    trace!(
+                        target: "payload_builder",
+                        trace_id,
+                        block_number = parent_header.number() + 1,
+                        tx = ?tx.hash(),
+                        has_sidecar = blob_tx_sidecar.is_some(),
+                        "Blob transaction sidecar prepared"
+                    );
+                }
 
-                blob_tx_sidecar = match blob_sidecar_result {
-                    Ok(sidecar) => Some(sidecar),
-                    Err(error) => {
-                        warn!(
-                            target: "payload_builder",
-                            trace_id,
-                            block_number = parent_header.number() + 1,
-                            tx = ?tx.hash(),
-                            ?error,
-                            "Skipping blob transaction due to invalid sidecar"
-                        );
-                        best_tx_list
-                            .mark_invalid(&pool_tx, &InvalidPoolTransactionError::Eip4844(error));
+                let gas_used = match builder.execute_transaction(tx.clone()) {
+                    Ok(gas_used) => gas_used,
+                    Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
+                        error,
+                        ..
+                    })) => {
+                        if error.is_nonce_too_low() {
+                            // if the nonce is too low, we can skip this transaction
+                            debug!(
+                                target: "bsc::miner::payload",
+                                trace_id,
+                                tx_hash = %tx.hash(),
+                                sender = ?tx.signer(),
+                                nonce = tx.nonce(),
+                                error = %error,
+                                "Skipping nonce too low transaction"
+                            );
+                            best_tx_list.mark_invalid(
+                                &pool_tx,
+                                &InvalidPoolTransactionError::Consensus(
+                                    InvalidTransactionError::NonceNotConsistent {
+                                        tx: tx.nonce(),
+                                        state: 0_u64, // TODO: get the nonce from the state later.
+                                    },
+                                ),
+                            );
+                        } else {
+                            // if the transaction is invalid, we can skip it and all of its
+                            // descendants
+                            debug!(
+                                target: "bsc::miner::payload",
+                                trace_id,
+                                tx_hash = %tx.hash(),
+                                sender = ?tx.signer(),
+                                nonce = tx.nonce(),
+                                gas_limit = tx.gas_limit(),
+                                error = %error,
+                                error_type = ?error,
+                                "Skipping invalid transaction and its descendants"
+                            );
+                            best_tx_list.mark_invalid(
+                                &pool_tx,
+                                &InvalidPoolTransactionError::Consensus(
+                                    InvalidTransactionError::TxTypeNotSupported,
+                                ),
+                            );
+                        }
                         continue;
                     }
+                    // this is an error that we should treat as fatal for this attempt
+                    Err(err) => return Err(Box::new(PayloadBuilderError::evm(err))),
                 };
-                trace!(
-                    target: "payload_builder",
-                    trace_id,
-                    block_number = parent_header.number() + 1,
-                    tx = ?tx.hash(),
-                    has_sidecar = blob_tx_sidecar.is_some(),
-                    "Blob transaction sidecar prepared"
-                );
+
+                // add to the total blob gas used if the transaction successfully executed
+                if let Some(blob_tx) = tx.as_eip4844() {
+                    block_blob_count += blob_tx.tx().blob_versioned_hashes.len() as u64;
+
+                    // if we've reached the max blob count, we can skip blob txs entirely
+                    if block_blob_count == max_blob_count {
+                        best_tx_list.skip_blobs();
+                    }
+                }
+                // update and add to total fees
+                let miner_fee = tx
+                    .effective_tip_per_gas(base_fee)
+                    .expect("fee is always valid; execution succeeded");
+                total_fees += U256::from(miner_fee) * U256::from(gas_used);
+                cumulative_gas_used += gas_used;
+
+                let tx_duration = tx_start.elapsed();
+                if tx_duration.as_micros() > 3000 {
+                    debug!(
+                        target: "payload_builder",
+                        trace_id,
+                        block_number = parent_header.number() + 1,
+                        tx = ?tx.hash(),
+                        gas_used,
+                        cumulative_gas_used,
+                        duration_micros = tx_duration.as_micros(),
+                        "Transaction executed successfully (slow)"
+                    );
+                } else {
+                    trace!(
+                        target: "payload_builder",
+                        trace_id,
+                        block_number = parent_header.number() + 1,
+                        tx = ?tx.hash(),
+                        gas_used,
+                        cumulative_gas_used,
+                        duration_micros = tx_duration.as_micros(),
+                        "Transaction executed successfully"
+                    );
+                }
+
+                // Add blob tx sidecar to the payload.
+                if let Some(sidecar) = blob_tx_sidecar {
+                    sidecars_map.insert(*tx.hash(), sidecar);
+                }
             }
 
-            let gas_used = match builder.execute_transaction(tx.clone()) {
-                Ok(gas_used) => gas_used,
-                Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
-                    error,
-                    ..
-                })) => {
-                    if error.is_nonce_too_low() {
-                        // if the nonce is too low, we can skip this transaction
-                        debug!(
-                            target: "bsc::miner::payload",
-                            trace_id,
-                            tx_hash = %tx.hash(),
-                            sender = ?tx.signer(),
-                            nonce = tx.nonce(),
-                            error = %error,
-                            "Skipping nonce too low transaction"
-                        );
-                        best_tx_list.mark_invalid(
-                            &pool_tx,
-                            &InvalidPoolTransactionError::Consensus(
-                                InvalidTransactionError::NonceNotConsistent {
-                                    tx: tx.nonce(),
-                                    state: 0_u64, // TODO: get the nonce from the state later.
-                                },
-                            ),
-                        );
-                    } else {
-                        // if the transaction is invalid, we can skip it and all of its
-                        // descendants
-                        debug!(
-                            target: "bsc::miner::payload",
-                            trace_id,
-                            tx_hash = %tx.hash(),
-                            sender = ?tx.signer(),
-                            nonce = tx.nonce(),
-                            gas_limit = tx.gas_limit(),
-                            error = %error,
-                            error_type = ?error,
-                            "Skipping invalid transaction and its descendants"
-                        );
-                        best_tx_list.mark_invalid(
-                            &pool_tx,
-                            &InvalidPoolTransactionError::Consensus(
-                                InvalidTransactionError::TxTypeNotSupported,
-                            ),
-                        );
-                    }
-                    continue;
-                }
-                // this is an error that we should treat as fatal for this attempt
-                Err(err) => return Err(Box::new(PayloadBuilderError::evm(err))),
+            // add system txs to payload.
+            let finalize_start = std::time::Instant::now();
+            let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } =
+                builder.finish(&state_provider)?;
+            let mut sealed_block = Arc::new(block.sealed_block().clone());
+
+            // Update miner metrics
+            let finalize_duration = finalize_start.elapsed().as_secs_f64();
+            MINER_METRICS.block_finalize_duration_seconds.record(finalize_duration);
+            MINER_METRICS.blocks_produced_total.increment(1);
+
+            // set sidecars to seal block
+            let mut blob_sidecars: Vec<BscBlobTransactionSidecar> = Vec::new();
+            let transactions = &sealed_block.body().inner.transactions;
+
+            let build_duration = build_start.elapsed();
+            let avg_tx_duration_micros = if !transactions.is_empty() {
+                build_duration.as_micros() / transactions.len() as u128
+            } else {
+                0
             };
 
-            // add to the total blob gas used if the transaction successfully executed
-            if let Some(blob_tx) = tx.as_eip4844() {
-                block_blob_count += blob_tx.tx().blob_versioned_hashes.len() as u64;
+            debug!(
+                target: "payload_builder",
+                trace_id,
+                block_number = sealed_block.number(),
+                block_hash = ?sealed_block.hash(),
+                tx_count = transactions.len(),
+                cumulative_gas_used,
+                total_fees = %total_fees,
+                build_duration_ms = build_duration.as_millis(),
+                avg_tx_duration_micros,
+                "Block payload built successfully"
+            );
 
-                // if we've reached the max blob count, we can skip blob txs entirely
-                if block_blob_count == max_blob_count {
-                    best_tx_list.skip_blobs();
-                }
-            }
-            // update and add to total fees
-            let miner_fee = tx
-                .effective_tip_per_gas(base_fee)
-                .expect("fee is always valid; execution succeeded");
-            total_fees += U256::from(miner_fee) * U256::from(gas_used);
-            cumulative_gas_used += gas_used;
-
-            let tx_duration = tx_start.elapsed();
-            if tx_duration.as_micros() > 3000 {
-                debug!(
-                    target: "payload_builder",
-                    trace_id,
-                    block_number = parent_header.number() + 1,
-                    tx = ?tx.hash(),
-                    gas_used,
-                    cumulative_gas_used,
-                    duration_micros = tx_duration.as_micros(),
-                    "Transaction executed successfully (slow)"
-                );
-            } else {
+            for (index, tx) in transactions.iter().enumerate() {
                 trace!(
                     target: "payload_builder",
                     trace_id,
-                    block_number = parent_header.number() + 1,
-                    tx = ?tx.hash(),
-                    gas_used,
-                    cumulative_gas_used,
-                    duration_micros = tx_duration.as_micros(),
-                    "Transaction executed successfully"
+                    tx_index = index,
+                    tx_hash = ?tx.hash(),
+                    from = ?tx.recover_signer().ok(),
+                    to = ?tx.to(),
+                    value = ?tx.value(),
+                    gas_limit = tx.gas_limit(),
+                    gas_price = ?tx.gas_price(),
+                    nonce = tx.nonce(),
+                    "Transaction included in block"
                 );
+                if tx.is_eip4844() {
+                    let sidecar = sidecars_map.get(tx.hash()).unwrap();
+                    let bsc_blob_tx_sidecar = BscBlobTransactionSidecar {
+                        inner: sidecar.as_eip4844().unwrap().clone(),
+                        block_number: sealed_block.header().number(),
+                        block_hash: sealed_block.hash(),
+                        tx_index: index as u64,
+                        tx_hash: *tx.hash(),
+                    };
+                    blob_sidecars.push(bsc_blob_tx_sidecar);
+                }
             }
 
-            // Add blob tx sidecar to the payload.
-            if let Some(sidecar) = blob_tx_sidecar {
-                sidecars_map.insert(*tx.hash(), sidecar);
-            }
-        }
+            let mut plain = sealed_block.clone_block();
+            plain.body.sidecars = Some(blob_sidecars);
+            sealed_block = Arc::new(plain.into());
 
-        // add system txs to payload.
-        let finalize_start = std::time::Instant::now();
-        let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } =
-            builder.finish(&state_provider)?;
-        let mut sealed_block = Arc::new(block.sealed_block().clone());
+            let requests = execution_result.requests.clone();
+            let execution_outcome =
+                BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
+            let executed: BuiltPayloadExecutedBlock<_> = BuiltPayloadExecutedBlock {
+                recovered_block: Arc::new(block),
+                execution_output: Arc::new(execution_outcome),
+                hashed_state: Either::Left(Arc::new(hashed_state)),
+                trie_updates: Either::Left(Arc::new(trie_updates)),
+            };
 
-        // Update miner metrics
-        use crate::metrics::BscMinerMetrics;
-        use once_cell::sync::Lazy;
-        static MINER_METRICS: Lazy<BscMinerMetrics> = Lazy::new(BscMinerMetrics::default);
-
-        let finalize_duration = finalize_start.elapsed().as_secs_f64();
-        MINER_METRICS.block_finalize_duration_seconds.record(finalize_duration);
-        MINER_METRICS.blocks_produced_total.increment(1);
-
-        // set sidecars to seal block
-        let mut blob_sidecars: Vec<BscBlobTransactionSidecar> = Vec::new();
-        let transactions = &sealed_block.body().inner.transactions;
-
-        let build_duration = build_start.elapsed();
-        let avg_tx_duration_micros = if !transactions.is_empty() {
-            build_duration.as_micros() / transactions.len() as u128
-        } else {
-            0
-        };
-
-        debug!(
-            target: "payload_builder",
-            trace_id,
-            block_number = sealed_block.number(),
-            block_hash = ?sealed_block.hash(),
-            tx_count = transactions.len(),
-            cumulative_gas_used,
-            total_fees = %total_fees,
-            build_duration_ms = build_duration.as_millis(),
-            avg_tx_duration_micros,
-            "Block payload built successfully"
-        );
-
-        for (index, tx) in transactions.iter().enumerate() {
-            trace!(
-                target: "payload_builder",
-                trace_id,
-                tx_index = index,
-                tx_hash = ?tx.hash(),
-                from = ?tx.recover_signer().ok(),
-                to = ?tx.to(),
-                value = ?tx.value(),
-                gas_limit = tx.gas_limit(),
-                gas_price = ?tx.gas_price(),
-                nonce = tx.nonce(),
-                "Transaction included in block"
-            );
-            if tx.is_eip4844() {
-                let sidecar = sidecars_map.get(tx.hash()).unwrap();
-                let bsc_blob_tx_sidecar = BscBlobTransactionSidecar {
-                    inner: sidecar.as_eip4844().unwrap().clone(),
-                    block_number: sealed_block.header().number(),
-                    block_hash: sealed_block.hash(),
-                    tx_index: index as u64,
-                    tx_hash: *tx.hash(),
-                };
-                blob_sidecars.push(bsc_blob_tx_sidecar);
-            }
-        }
-
-        let mut plain = sealed_block.clone_block();
-        plain.body.sidecars = Some(blob_sidecars);
-        sealed_block = Arc::new(plain.into());
-
-        let requests = execution_result.requests.clone();
-        let execution_outcome = BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
-        let executed: BuiltPayloadExecutedBlock<_> = BuiltPayloadExecutedBlock {
-            recovered_block: Arc::new(block),
-            execution_output: Arc::new(execution_outcome),
-            hashed_state: Either::Left(Arc::new(hashed_state)),
-            trie_updates: Either::Left(Arc::new(trie_updates)),
-        };
-
-        let payload = BscBuiltPayload {
-            block: sealed_block.clone(),
-            fees: total_fees,
-            requests: Some(requests),
-            executed_block: executed,
-        };
-        Ok(payload)
+            let payload = BscBuiltPayload {
+                block: sealed_block.clone(),
+                fees: total_fees,
+                requests: Some(requests),
+                executed_block: executed,
+            };
+            Ok(payload)
+        })();
+        BuildResultWithCachedReads { result, cached_reads }
     }
 
     /// Build an empty payload without any user transactions from the pool
@@ -611,95 +628,96 @@ where
     pub async fn build_empty_payload(
         &self,
         args: BscBuildArguments<EthPayloadBuilderAttributes>,
-    ) -> Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> BuildResultWithCachedReads<BscBuiltPayload> {
         let build_start = std::time::Instant::now();
         let BscBuildArguments { mut cached_reads, config, cancel: _, trace_id, min_gas_tip: _ } =
             args;
-        let PayloadConfig { parent_header, attributes } = config;
 
-        let state_provider = self.client.state_by_block_hash(parent_header.hash_slow())?;
-        let state = StateProviderDatabase::new(&state_provider);
-        let mut db = State::builder()
-            .with_database(cached_reads.as_db_mut(state))
-            .with_bundle_update()
-            .build();
+        let result = (|| -> Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>> {
+            let PayloadConfig { parent_header, attributes } = config;
 
-        let mut builder = self
-            .evm_config
-            .builder_for_next_block(
-                &mut db,
-                &parent_header,
-                NextBlockEnvAttributes {
-                    timestamp: attributes.timestamp(),
-                    suggested_fee_recipient: attributes.suggested_fee_recipient(),
-                    prev_randao: attributes.prev_randao(),
-                    gas_limit: self.builder_config.gas_limit(parent_header.gas_limit),
-                    parent_beacon_block_root: attributes.parent_beacon_block_root(),
-                    withdrawals: Some(attributes.withdrawals().clone()),
-                    extra_data: self.builder_config.extra_data.clone(),
-                },
-            )
-            .map_err(PayloadBuilderError::other)?;
+            let state_provider = self.client.state_by_block_hash(parent_header.hash())?;
+            let state = StateProviderDatabase::new(&state_provider);
+            let mut db = State::builder()
+                .with_database(cached_reads.as_db_mut(state))
+                .with_bundle_update()
+                .build();
 
-        builder.apply_pre_execution_changes().map_err(|err| {
-            warn!(
+            let mut builder = self
+                .evm_config
+                .builder_for_next_block(
+                    &mut db,
+                    &parent_header,
+                    NextBlockEnvAttributes {
+                        timestamp: attributes.timestamp(),
+                        suggested_fee_recipient: attributes.suggested_fee_recipient(),
+                        prev_randao: attributes.prev_randao(),
+                        gas_limit: self.builder_config.gas_limit(parent_header.gas_limit),
+                        parent_beacon_block_root: attributes.parent_beacon_block_root(),
+                        withdrawals: Some(attributes.withdrawals().clone()),
+                        extra_data: self.builder_config.extra_data.clone(),
+                    },
+                )
+                .map_err(PayloadBuilderError::other)?;
+
+            builder.apply_pre_execution_changes().map_err(|err| {
+                warn!(
+                    target: "payload_builder",
+                    trace_id,
+                    %err,
+                    "failed to apply pre-execution changes for empty payload"
+                );
+                PayloadBuilderError::Internal(err.into())
+            })?;
+
+            // No user transactions - only system transactions will be added by finish()
+            let total_fees = U256::ZERO;
+            let cumulative_gas_used = 0;
+
+            // Add system txs to payload and finalize
+            let finalize_start = std::time::Instant::now();
+            let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } =
+                builder.finish(&state_provider)?;
+            let sealed_block = Arc::new(block.sealed_block().clone());
+
+            // Update miner metrics
+            let finalize_duration = finalize_start.elapsed().as_secs_f64();
+            MINER_METRICS.block_finalize_duration_seconds.record(finalize_duration);
+            MINER_METRICS.blocks_produced_total.increment(1);
+
+            let build_duration = build_start.elapsed();
+
+            debug!(
                 target: "payload_builder",
                 trace_id,
-                %err,
-                "failed to apply pre-execution changes for empty payload"
+                block_number = sealed_block.number(),
+                block_hash = ?sealed_block.hash(),
+                tx_count = sealed_block.body().transactions.len(),
+                cumulative_gas_used,
+                total_fees = %total_fees,
+                build_duration_ms = build_duration.as_millis(),
+                "Empty block payload built successfully (no user transactions)"
             );
-            PayloadBuilderError::Internal(err.into())
-        })?;
 
-        // No user transactions - only system transactions will be added by finish()
-        let total_fees = U256::ZERO;
-        let cumulative_gas_used = 0;
+            let requests = execution_result.requests.clone();
+            let execution_outcome =
+                BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
+            let executed: BuiltPayloadExecutedBlock<_> = BuiltPayloadExecutedBlock {
+                recovered_block: Arc::new(block),
+                execution_output: Arc::new(execution_outcome),
+                hashed_state: Either::Left(Arc::new(hashed_state)),
+                trie_updates: Either::Left(Arc::new(trie_updates)),
+            };
 
-        // Add system txs to payload and finalize
-        let finalize_start = std::time::Instant::now();
-        let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } =
-            builder.finish(&state_provider)?;
-        let sealed_block = Arc::new(block.sealed_block().clone());
-
-        // Update miner metrics
-        use crate::metrics::BscMinerMetrics;
-        use once_cell::sync::Lazy;
-        static MINER_METRICS: Lazy<BscMinerMetrics> = Lazy::new(BscMinerMetrics::default);
-
-        let finalize_duration = finalize_start.elapsed().as_secs_f64();
-        MINER_METRICS.block_finalize_duration_seconds.record(finalize_duration);
-        MINER_METRICS.blocks_produced_total.increment(1);
-
-        let build_duration = build_start.elapsed();
-
-        debug!(
-            target: "payload_builder",
-            trace_id,
-            block_number = sealed_block.number(),
-            block_hash = ?sealed_block.hash(),
-            tx_count = sealed_block.body().transactions.len(),
-            cumulative_gas_used,
-            total_fees = %total_fees,
-            build_duration_ms = build_duration.as_millis(),
-            "Empty block payload built successfully (no user transactions)"
-        );
-
-        let requests = execution_result.requests.clone();
-        let execution_outcome = BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
-        let executed: BuiltPayloadExecutedBlock<_> = BuiltPayloadExecutedBlock {
-            recovered_block: Arc::new(block),
-            execution_output: Arc::new(execution_outcome),
-            hashed_state: Either::Left(Arc::new(hashed_state)),
-            trie_updates: Either::Left(Arc::new(trie_updates)),
-        };
-
-        let payload = BscBuiltPayload {
-            block: sealed_block.clone(),
-            fees: total_fees,
-            requests: Some(requests),
-            executed_block: executed,
-        };
-        Ok(payload)
+            let payload = BscBuiltPayload {
+                block: sealed_block.clone(),
+                fees: total_fees,
+                requests: Some(requests),
+                executed_block: executed,
+            };
+            Ok(payload)
+        })();
+        BuildResultWithCachedReads { result, cached_reads }
     }
 }
 
@@ -740,15 +758,16 @@ where
     is_aborted: bool,
     /// Sender for payload results
     result_tx: mpsc::UnboundedSender<SubmitContext>,
-    /// Potential payloads vector for selecting the best one
-    potential_payloads: Vec<BscBuiltPayload>,
+    /// Best payload so far (by fees)
+    best_payload: Option<BscBuiltPayload>,
     /// Current build arguments
     build_args: BscBuildArguments<EthPayloadBuilderAttributes>,
+    /// True if a build task is currently running.
+    build_in_flight: bool,
     /// Retry count for payload building
     retries: u32,
     /// JoinSet for managing build tasks
-    join_handle:
-        tokio::task::JoinSet<Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>>>,
+    join_handle: tokio::task::JoinSet<BuildResultWithCachedReads<BscBuiltPayload>>,
     /// Simulator for bid management (no outer RwLock, each map has its own)
     simulator: Arc<BidSimulator<Client, Pool>>,
     /// Job start time for tracking total duration
@@ -819,8 +838,9 @@ where
             abort_rx,
             is_aborted: false,
             result_tx,
-            potential_payloads: Vec::new(),
+            best_payload: None,
             build_args,
+            build_in_flight: false,
             retries: 0,
             join_handle: tokio::task::JoinSet::new(),
             simulator,
@@ -838,6 +858,26 @@ where
             "Succeed to new payload job"
         );
         (job, handle)
+    }
+
+    fn build_args_for_attempt(&self) -> BscBuildArguments<EthPayloadBuilderAttributes> {
+        BscBuildArguments {
+            cached_reads: self.build_args.cached_reads.clone(),
+            config: self.build_args.config.clone(),
+            cancel: self.build_args.cancel.clone(),
+            trace_id: self.build_args.trace_id,
+            min_gas_tip: self.build_args.min_gas_tip,
+        }
+    }
+
+    fn update_best_payload(&mut self, candidate: BscBuiltPayload) {
+        let should_replace = match self.best_payload.as_ref() {
+            Some(best) => candidate.fees() > best.fees(),
+            None => true,
+        };
+        if should_replace {
+            self.best_payload = Some(candidate);
+        }
     }
 
     /// Runs the payload job asynchronously with timeout support
@@ -876,7 +916,7 @@ where
 
             tokio::select! {
                 // Trigger the async build payload by queue.
-                args = self.try_build_rx.recv() => {
+                args = self.try_build_rx.recv(), if !self.build_in_flight => {
                     match args {
                         Some(_) => {
                             self.retries += 1;
@@ -891,10 +931,11 @@ where
                             );
 
                             let builder = self.builder.clone();
-                            let build_args = self.build_args.clone();
+                            let build_args = self.build_args_for_attempt();
                             self.join_handle.spawn(async move {
                                 builder.build_payload(build_args).await
                             });
+                            self.build_in_flight = true;
                         }
                         None => {
                             debug!(
@@ -912,7 +953,29 @@ where
                 // Try to join the async payload build task.
                 result = self.join_handle.join_next() => {
                     match result {
-                        Some(Ok(Ok(payload))) => {
+                        Some(Ok(outcome)) => {
+                            self.build_in_flight = false;
+                            // Always restore cached reads from the build attempt.
+                            self.build_args.cached_reads = outcome.cached_reads;
+
+                            let payload = match outcome.result {
+                                Ok(payload) => payload,
+                                Err(e) => {
+                                    let elapsed = start_time.elapsed();
+                                    warn!(
+                                        target: "bsc::miner::payload",
+                                        trace_id = self.trace_id,
+                                        error = %e,
+                                        cost_time = ?elapsed,
+                                        block_number = self.build_args.config.parent_header.number() + 1,
+                                        parent_hash = ?self.build_args.config.parent_header.hash(),
+                                        is_inturn = self.mining_ctx.is_inturn,
+                                        retries = self.retries,
+                                        "Failed to build payload task"
+                                    );
+                                    return self.try_return_best_payload();
+                                }
+                            };
                             if self.is_aborted {
                                 return Err(Box::new(BscPayloadJobError::JobAborted));
                             }
@@ -930,7 +993,7 @@ where
                                 retries = self.retries,
                                 "Succeed to try new build"
                             );
-                            self.potential_payloads.push(payload);
+                            self.update_best_payload(payload);
                             let mut new_tx_count = 0;
                             // loop wait new transactions or timeout.
                             loop {
@@ -1056,22 +1119,8 @@ where
                                 }
                             }
                         },
-                        Some(Ok(Err(e))) => {
-                            let elapsed = start_time.elapsed();
-                            warn!(
-                                target: "bsc::miner::payload",
-                                trace_id = self.trace_id,
-                                error = %e,
-                                cost_time = ?elapsed,
-                                block_number = self.build_args.config.parent_header.number() + 1,
-                                parent_hash = ?self.build_args.config.parent_header.hash(),
-                                is_inturn = self.mining_ctx.is_inturn,
-                                retries = self.retries,
-                                "Failed to build payload task"
-                            );
-                            return self.try_return_best_payload();
-                        },
                         Some(Err(join_err)) => {
+                            self.build_in_flight = false;
                             let elapsed = start_time.elapsed();
                             warn!(
                                 target: "bsc::miner::payload",
@@ -1086,6 +1135,7 @@ where
                             return self.try_return_best_payload();
                         },
                         None => {
+                            self.build_in_flight = false;
                             // No task completed, continue to next iteration
                         },
                     }
@@ -1149,7 +1199,7 @@ where
                     "Found best bid"
                 );
                 bid_block_hash = Some(bsc_payload.block.hash());
-                self.potential_payloads.push(bsc_payload);
+                self.update_best_payload(bsc_payload);
             } else {
                 warn!(
                     target: "bsc::miner::payload",
@@ -1161,7 +1211,29 @@ where
                 );
             }
         }
-        if let Some(best_payload) = self.pick_best_payload() {
+        if let Some(best_payload) = self.best_payload.take() {
+            let total_job_duration = self.job_start_time.elapsed();
+
+            let gas_used = best_payload.block().header().gas_used();
+            let gas_limit = best_payload.block().header().gas_limit();
+            let gas_usage_percent =
+                if gas_limit > 0 { (gas_used as f64 / gas_limit as f64 * 100.0) as u64 } else { 0 };
+
+            info!(
+                target: "bsc::miner::payload",
+                trace_id = self.trace_id,
+                block_number = best_payload.block().header().number(),
+                block_hash = %best_payload.block().hash(),
+                is_inturn = self.mining_ctx.is_inturn,
+                tx_count = best_payload.block().body().transaction_count(),
+                fees = %best_payload.fees(),
+                gas_used = gas_used,
+                gas_limit = gas_limit,
+                gas_usage_percent = gas_usage_percent,
+                total_job_duration_ms = total_job_duration.as_millis(),
+                "Succeed to pick the best payload"
+            );
+
             // Check if the best payload is from a bid BEFORE refresh changes the hash
             let is_bid_winner = bid_block_hash
                 .map(|bid_hash| best_payload.block.hash() == bid_hash)
@@ -1177,7 +1249,6 @@ where
                 payload: best_payload,
                 cancel: self.build_args.cancel.clone(),
             }) {
-                let total_job_duration = self.job_start_time.elapsed();
                 warn!(
                     target: "bsc::miner::payload",
                     trace_id = self.trace_id,
@@ -1223,14 +1294,17 @@ where
 
                 // Build empty payload synchronously (blocking) and measure time
                 let empty_build_start = std::time::Instant::now();
-                let empty_payload_result = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(async {
-                        self.builder.build_empty_payload(self.build_args.clone()).await
-                    })
+                let builder = self.builder.clone();
+                let build_args = self.build_args_for_attempt();
+                let empty_outcome = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current()
+                        .block_on(async move { builder.build_empty_payload(build_args).await })
                 });
                 let empty_build_duration = empty_build_start.elapsed();
+                // Always restore cached reads from the build attempt.
+                self.build_args.cached_reads = empty_outcome.cached_reads;
 
-                match empty_payload_result {
+                match empty_outcome.result {
                     Ok(empty_payload) => {
                         info!(
                             target: "bsc::miner::payload",
@@ -1284,50 +1358,6 @@ where
                 Err(Box::new(BscPayloadJobError::NoPayloadsAvailable))
             }
         }
-    }
-
-    /// Pick the best payload from potential payloads
-    fn pick_best_payload(&mut self) -> Option<BscBuiltPayload> {
-        if self.potential_payloads.is_empty() {
-            return None;
-        }
-
-        // pick the payload with the highest fees as best payload.
-        let best_index = self
-            .potential_payloads
-            .iter()
-            .enumerate()
-            .max_by_key(|(_, payload)| payload.fees())
-            .map(|(index, _)| index)?;
-
-        let total_len = self.potential_payloads.len();
-        let best_payload = self.potential_payloads.remove(best_index);
-        let total_job_duration = self.job_start_time.elapsed();
-
-        let gas_used = best_payload.block().header().gas_used();
-        let gas_limit = best_payload.block().header().gas_limit();
-        let gas_usage_percent =
-            if gas_limit > 0 { (gas_used as f64 / gas_limit as f64 * 100.0) as u64 } else { 0 };
-
-        info!(
-            target: "bsc::miner::payload",
-            trace_id = self.trace_id,
-            block_number = best_payload.block().header().number(),
-            block_hash = %best_payload.block().hash(),
-            is_inturn = self.mining_ctx.is_inturn,
-            tx_count = best_payload.block().body().transaction_count(),
-            fees = %best_payload.fees(),
-            gas_used = gas_used,
-            gas_limit = gas_limit,
-            gas_usage_percent = gas_usage_percent,
-            pick_index = best_index + 1,
-            total_len = total_len,
-            total_job_duration_ms = total_job_duration.as_millis(),
-            "Succeed to pick the best payload"
-        );
-
-        self.potential_payloads.clear();
-        Some(best_payload)
     }
 
     /// Refresh the vote attestation in a payload's header with the latest votes from the pool,
