@@ -37,9 +37,10 @@ use reth_revm::{database::StateProviderDatabase, db::State};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tracing::debug;
+use tracing::{debug, trace};
 const NO_INTERRUPT_LEFT_OVER: u64 = 500;
 const PAY_BID_TX_GAS_LIMIT: u64 = 25000;
+const TX_GAS: u64 = 21000;
 
 #[derive(Clone)]
 pub struct Bid {
@@ -459,9 +460,12 @@ where
                 // Track greedy merge execution time
                 let greedy_merge_start = std::time::Instant::now();
 
-                if let Err(e) =
-                    bid_runtime.fill_tx_from_pool(&mut builder, txs_except_last, block_gas_limit)
-                {
+                if let Err(e) = bid_runtime.fill_tx_from_pool(
+                    &mut builder,
+                    txs_except_last,
+                    block_gas_limit,
+                    delay_ms,
+                ) {
                     debug!("Failed to commit tx pool transactions: {:?}", e);
                     return;
                 }
@@ -716,7 +720,7 @@ where
                 return Err("Failed to recover transaction signature".into());
             }
         };
-        self.commit_transaction_recovered(recovered_txs, builder, block_gas_limit, false)
+        self.commit_transaction_recovered(recovered_txs, builder, block_gas_limit, false, 0)
     }
 
     fn commit_transaction_recovered<B>(
@@ -725,6 +729,7 @@ where
         builder: &mut B,
         block_gas_limit: u64,
         from_pool: bool,
+        delay_ms: u64,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
         B: BlockBuilder,
@@ -735,7 +740,21 @@ where
         let max_blob_count =
             blob_params.as_ref().map(|params| params.max_blob_count).unwrap_or_default();
 
+        let start_time = std::time::Instant::now();
+        let delay_duration = std::time::Duration::from_millis(delay_ms);
+
         for (index, recovered_tx) in recovered_txs.into_iter().enumerate() {
+            if from_pool {
+                let elapsed = start_time.elapsed();
+                if elapsed >= delay_duration {
+                    trace!("Time limit reached ({}ms), processed {} transactions", delay_ms, index);
+                    break;
+                }
+                if block_gas_limit - self.gas_used < TX_GAS {
+                    trace!("block_gas_limit - gas_used < TX_GAS, break");
+                    break;
+                }
+            }
             // Check interrupt flag before processing each transaction
             if self.bid.interrupt_flag.load(Ordering::Relaxed) {
                 debug!("Bid runtime interrupted before processing transaction");
@@ -749,8 +768,8 @@ where
                     // we can't fit this transaction into the block, so we need to mark it as invalid
                     // which also removes all dependent transaction from the iterator before we can
                     // continue
-                    debug!("bidSimulator: gas limit exceeded, ignore tx:{}, tx gas limit:{}, block gas limit:{}, runtime gasused:{}", tx_hash, recovered_tx.gas_limit(), block_gas_limit, self.gas_used);
-                    return Err("gas limit exceeded".into());
+                    trace!("bidSimulator: gas limit exceeded, ignore tx:{}, tx gas limit:{}, block gas limit:{}, runtime gasused:{}", tx_hash, recovered_tx.gas_limit(), block_gas_limit, self.gas_used);
+                    continue;
                 }
             }
 
@@ -759,6 +778,10 @@ where
                 let tx_blob_count = blob_tx.tx().blob_versioned_hashes.len() as u64;
 
                 if self.block_blob_count + tx_blob_count > max_blob_count {
+                    if from_pool {
+                        trace!("bidSimulator: blob transaction limit exceeded, ignore tx:{}, tx blob count:{}, block blob count:{}, max blob count:{}", tx_hash, tx_blob_count, self.block_blob_count, max_blob_count);
+                        continue;
+                    }
                     debug!(target: "payload_builder", tx=?tx_hash, ?self.block_blob_count, "skipping blob transaction because it would exceed the max blob count per block");
                     return Err("blob transaction limit exceeded".into());
                 }
@@ -781,9 +804,19 @@ where
                         // descendants
                         debug!(target: "payload_builder", %error, ?recovered_tx, "skipping invalid transaction and its descendants");
                     }
+                    if from_pool {
+                        trace!("bidSimulator: invalid transaction, ignore tx:{}, error:{}, recovered tx:{:?}", tx_hash, error, recovered_tx);
+                        continue;
+                    }
                     return Err("invalid transaction".into());
                 }
-                Err(err) => return Err(Box::new(PayloadBuilderError::evm(err))),
+                Err(err) => {
+                    if from_pool {
+                        trace!("bidSimulator: invalid transaction, ignore tx:{}, error:{}, recovered tx:{:?}", tx_hash, err, recovered_tx);
+                        continue;
+                    }
+                    return Err(Box::new(PayloadBuilderError::evm(err)));
+                }
             };
 
             if is_blob_tx {
@@ -796,6 +829,10 @@ where
                         BlobTransactionSidecarVariant::Eip4844(sidecar.clone()),
                     ) {
                         debug!("Failed to insert blob sidecar for tx {:?}: {:?}", tx_hash, e);
+                        if from_pool {
+                            trace!("bidSimulator: failed to insert blob sidecar, ignore tx:{}, error:{}, recovered tx:{:?}", tx_hash, e, recovered_tx);
+                            continue;
+                        }
                         return Err("Failed to insert blob sidecar".into());
                     }
                     let bsc_sidecar = BscBlobTransactionSidecar {
@@ -839,6 +876,7 @@ where
         builder: &mut B,
         bid_txs: Vec<reth_primitives::TransactionSigned>,
         block_gas_limit: u64,
+        delay_ms: u64,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
         B: BlockBuilder,
@@ -897,7 +935,13 @@ where
             sender_txs_map.into_values().flatten().map(|pool_tx| pool_tx.to_consensus()).collect();
         debug!("fill_tx_from_pool: pending_txs.len={}", pending_txs.len());
 
-        let result = self.commit_transaction_recovered(pending_txs, builder, block_gas_limit, true);
+        let result = self.commit_transaction_recovered(
+            pending_txs,
+            builder,
+            block_gas_limit,
+            true,
+            delay_ms,
+        );
         if let Err(e) = result {
             debug!("Failed to commit transactions: {:?}", e);
             return Err(e);
