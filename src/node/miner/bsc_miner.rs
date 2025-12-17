@@ -879,7 +879,6 @@ where
             sealed_block.body().transaction_count()
         );
         let sealed_block = sealed_block.set_header(new_header);
-
         let best_block_number = self.provider.best_block_number()?;
         if block_number <= best_block_number {
             debug!(
@@ -961,7 +960,8 @@ where
         let td = U128::from(new_td.to::<u128>());
         let new_block =
             BscNewBlock(reth_eth_wire::NewBlock { block: sealed_block.clone_block(), td });
-        let msg = NewBlockMessage { hash: block_hash, block: Arc::new(new_block) };
+        let msg =
+            NewBlockMessage { hash: block_hash, block: Arc::new(new_block), td: Some(new_td) };
 
         if self.submit_built_payload {
             if let Some(sender) = get_block_import_mined_sender() {
@@ -1156,6 +1156,7 @@ where
             "Mining configuration: validator={}, chain_id={}, gas_limit={}, min_gas_tip={}",
             validator_address, chain_id, desired_gas_limit, desired_min_gas_tip
         );
+
         let parlia = Arc::new(crate::consensus::parlia::Parlia::new(chain_spec.clone(), 200));
         let new_work_worker = NewWorkWorker::new(
             validator_address,

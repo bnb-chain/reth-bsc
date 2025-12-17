@@ -140,10 +140,10 @@ impl<DB: Database + 'static> SnapshotProvider for DbSnapshotProvider<DB> {
         if snapshot.block_number.is_multiple_of(CHECKPOINT_INTERVAL) {
             match self.persist_to_db(&snapshot) {
                 Ok(()) => {
-                    tracing::debug!("Succeed to persist snapshot for block {} to DB", snapshot.block_number);
+                    tracing::debug!("Persisted snapshot for block {} to DB", snapshot.block_number);
                 },
                 Err(e) => {
-                    tracing::error!("Failed to persist snapshot for block {} to DB due to {:?}", snapshot.block_number, e);
+                    tracing::error!("Failed to persist snapshot for block {} to DB: {:?}", snapshot.block_number, e);
                 }
             }
         }
@@ -185,16 +185,22 @@ impl<DB: Database + 'static> EnhancedDbSnapshotProvider<DB> {
                 genesis_header, 
                 self.parlia.epoch)
                 .map_err(|err| {
+                    tracing::error!("Failed to parse validators from genesis header: {:?}", err);
                     BscBlockExecutionError::Validation(BscBlockValidationError::ParliaConsensusError { error: err.into() })
                 })
                 .ok()?;
+        
         let genesis_snapshot = Snapshot::new(
-            consensus_addrs,
+            consensus_addrs.clone(),
             0,
             genesis_header.hash_slow(),
             self.parlia.epoch,
-            vote_addrs,
+            vote_addrs.clone(),
         );
+        
+        tracing::info!("Genesis snapshot initialized: block=0, validators={}", 
+            genesis_snapshot.validators.len());
+        
         self.base.insert(genesis_snapshot.clone());
         Some(genesis_snapshot)
     }
@@ -249,7 +255,12 @@ impl<DB: Database + 'static> EnhancedDbSnapshotProvider<DB> {
                 
                 if let Some(checkpoint_header) = get_cannonical_header_from_cache(checkpoint_block_number) {
                     let parsed = 
-                        self.parlia.parse_validators_from_header(&checkpoint_header, working_snapshot.epoch_num);
+                        self.parlia.parse_validators_from_header(&checkpoint_header, working_snapshot.epoch_num)
+                            .map_err(|err| {
+                                tracing::error!("Failed to parse validators from checkpoint header: {:?}", err);
+                                err
+                            });
+                    
                     turn_length = 
                         self.parlia.get_turn_length_from_header(
                             &checkpoint_header, 
@@ -291,10 +302,8 @@ impl<DB: Database + 'static> EnhancedDbSnapshotProvider<DB> {
             ) {
                 Some(snap) => {
                     tracing::trace!(
-                        "Successfully applied header: block_number={}, epoch_num={}, turn_length={:?}, recent_proposers_count={}, recent_proposers_keys={:?}",
-                        snap.block_number, snap.epoch_num, snap.turn_length,
-                        snap.recent_proposers.len(), 
-                        snap.recent_proposers.keys().collect::<Vec<_>>()
+                        "Successfully applied header: block_number={}, epoch_num={}, validators={}",
+                        snap.block_number, snap.epoch_num, snap.validators.len()
                     );
                     // Cache intermediate snapshots in memory to avoid repeated long rebuilds
                     self.base.insert_cache_only(&snap);
