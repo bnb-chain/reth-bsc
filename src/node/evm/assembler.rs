@@ -77,11 +77,6 @@ where
         &self,
         input: BscBlockAssemblerInput<'_, '_, BscBlockExecutorFactory>,
     ) -> Result<crate::node::primitives::BscBlock, BlockExecutionError> {
-        // Get snapshot provider, return error if not available
-        // let snapshot_provider = crate::shared::get_snapshot_provider()
-        //     .cloned()
-        //     .ok_or_else(|| BlockExecutionError::msg("Snapshot provider not available"))?;
-
         let BscBlockAssemblerInput {
             evm_env,
             execution_ctx: ctx,
