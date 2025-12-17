@@ -427,7 +427,9 @@ where
             return;
         }
 
-        if let Err(e) = bid_runtime.pack_reward(self.validator_commission, bid_runtime.gas_fee) {
+        if let Err(e) =
+            bid_runtime.pack_reward(self.validator_commission, bid_runtime.system_balance)
+        {
             debug!("Failed to pack reward: {:?}", e);
             return;
         }
@@ -470,7 +472,7 @@ where
                     return;
                 }
                 if let Err(e) =
-                    bid_runtime.pack_reward(self.validator_commission, bid_runtime.gas_fee)
+                    bid_runtime.pack_reward(self.validator_commission, bid_runtime.system_balance)
                 {
                     debug!("Failed to pack reward: {:?}", e);
                     return;
@@ -641,6 +643,7 @@ pub struct BidRuntime<Pool, EvmConfig = BscEvmConfig> {
 
     gas_used: u64,
     gas_fee: U256,
+    system_balance: U256,
     blob_sidecars: Vec<BscBlobTransactionSidecar>,
     block_blob_count: u64,
     un_revertible_set: std::collections::HashSet<B256>,
@@ -685,6 +688,7 @@ where
             attributes,
             gas_used: 0,
             gas_fee: U256::ZERO,
+            system_balance: U256::ZERO,
             block_blob_count: 0,
             finished: Arc::new(AtomicBool::new(false)),
             chain_spec,
@@ -789,7 +793,6 @@ where
                 self.block_blob_count += tx_blob_count;
             }
 
-            let tx_effective_gas_price = recovered_tx.effective_gas_price(Some(base_fee));
             let tx_gas_used = match builder.execute_transaction(recovered_tx.clone()) {
                 Ok(tx_gas_used) => tx_gas_used,
                 Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
@@ -847,8 +850,12 @@ where
             }
 
             self.gas_used += tx_gas_used;
+            let tx_effective_gas_price = recovered_tx
+                .effective_tip_per_gas(base_fee)
+                .expect("fee is always valid; execution succeeded");
             self.gas_fee += (U256::from(tx_effective_gas_price) + U256::from(base_fee))
                 * U256::from(tx_gas_used);
+            self.system_balance += U256::from(tx_effective_gas_price) * U256::from(tx_gas_used);
         }
 
         Ok(())
