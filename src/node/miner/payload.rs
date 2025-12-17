@@ -214,6 +214,7 @@ where
             builder.evm_mut().block().gas_limit.saturating_sub(system_txs_gas);
 
         let base_fee = builder.evm_mut().block().basefee;
+        trace!("build_payload: base_fee={}", base_fee);
 
         let mut sidecars_map = HashMap::new();
         let mut block_blob_count = 0;
