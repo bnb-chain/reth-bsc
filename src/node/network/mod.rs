@@ -1,9 +1,17 @@
 #![allow(clippy::owned_cow)]
 use crate::{
-    BscBlock, node::{
-        BscNode, engine_api::payload::BscPayloadTypes, network::{block_import::{BscBlockImport, handle::ImportHandle}, evn_peers::peer_id_to_node_id}, primitives::{BscBlobTransactionSidecar, BscPrimitives}
-    }
+    node::{
+        engine_api::payload::BscPayloadTypes,
+        network::{
+            block_import::{handle::ImportHandle, BscBlockImport},
+            evn_peers::peer_id_to_node_id,
+        },
+        primitives::{BscBlobTransactionSidecar, BscPrimitives},
+        BscNode,
+    },
+    BscBlock,
 };
+use alloy_primitives::U256;
 use alloy_rlp::{Decodable, Encodable};
 use handshake::BscHandshake;
 use reth::{
@@ -13,31 +21,31 @@ use reth::{
 };
 use reth_chainspec::EthChainSpec;
 use reth_discv4::Discv4Config;
+use reth_engine_primitives::ConsensusEngineHandle;
 use reth_eth_wire::{BasicNetworkPrimitives, NewBlock, NewBlockPayload};
 use reth_ethereum_primitives::PooledTransactionVariant;
-use reth_engine_primitives::ConsensusEngineHandle;
 use reth_network::{NetworkConfig, NetworkHandle, NetworkManager};
 use reth_network_api::PeersInfo;
 use reth_provider::{BlockNumReader, HeaderProvider};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot, Mutex};
-use tracing::{info, warn, debug};
+use tracing::{debug, info, warn};
 
 pub mod block_import;
+pub(crate) mod blocks_by_range;
 pub mod bootnodes;
-pub mod handshake;
 pub mod evn;
 pub mod evn_peers;
+pub mod handshake;
 pub(crate) mod upgrade_status;
 pub(crate) mod votes;
-pub(crate) mod blocks_by_range;
 pub(crate) mod bsc_protocol {
     pub mod protocol {
         pub mod handler;
         pub mod proto;
     }
-    pub mod stream;
     pub mod registry;
+    pub mod stream;
 }
 /// BSC `NewBlock` message value.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,6 +148,10 @@ impl NewBlockPayload for BscNewBlock {
     fn block(&self) -> &Self::Block {
         &self.0.block
     }
+
+    fn td(&self) -> Option<U256> {
+        Some(U256::from(self.0.td.to::<u128>()))
+    }
 }
 
 /// Network primitives for BSC.
@@ -149,14 +161,14 @@ pub type BscNetworkPrimitives =
 /// A basic bsc network builder.
 #[derive(Debug)]
 pub struct BscNetworkBuilder {
-    engine_handle_rx: Arc<
-        Mutex<Option<oneshot::Receiver<ConsensusEngineHandle<BscPayloadTypes>>>>,
-    >,
+    engine_handle_rx: Arc<Mutex<Option<oneshot::Receiver<ConsensusEngineHandle<BscPayloadTypes>>>>>,
 }
 
 impl BscNetworkBuilder {
     pub fn new(
-        engine_handle_rx: Arc<Mutex<Option<oneshot::Receiver<ConsensusEngineHandle<BscPayloadTypes>>>>>,
+        engine_handle_rx: Arc<
+            Mutex<Option<oneshot::Receiver<ConsensusEngineHandle<BscPayloadTypes>>>>,
+        >,
     ) -> Self {
         Self { engine_handle_rx }
     }
@@ -218,10 +230,10 @@ impl BscNetworkBuilder {
         if crate::shared::set_block_import_sender(to_import_net.clone()).is_err() {
             warn!(target: "bsc", "Block import network sender already initialised; overriding skipped");
         }
-        
+
         // Import the necessary types for block import service
         use crate::node::network::block_import::service::ImportService;
-        
+
         // Clone needed values before moving into the async closure
         let provider = ctx.provider().clone();
         let chain_spec = ctx.chain_spec().clone();
@@ -230,31 +242,56 @@ impl BscNetworkBuilder {
         // can include full bodies if they were recently imported. External callers
         // can override by setting a richer provider before network starts.
         {
-            use reth_provider::{HeaderProvider, BlockNumReader};
-            struct CachedFullBlockProvider<P> { inner: P }
+            use reth_provider::{BlockNumReader, HeaderProvider};
+            struct CachedFullBlockProvider<P> {
+                inner: P,
+            }
             impl<P> crate::shared::FullBlockProvider for CachedFullBlockProvider<P>
             where
-                P: HeaderProvider<Header = alloy_consensus::Header> + BlockNumReader + Clone + Send + Sync + 'static,
+                P: HeaderProvider<Header = alloy_consensus::Header>
+                    + BlockNumReader
+                    + Clone
+                    + Send
+                    + Sync
+                    + 'static,
             {
-                fn block_by_hash(&self, hash: &alloy_primitives::B256) -> Option<crate::node::primitives::BscBlock> {
+                fn block_by_hash(
+                    &self,
+                    hash: &alloy_primitives::B256,
+                ) -> Option<crate::node::primitives::BscBlock> {
                     crate::shared::get_cached_block_by_hash(hash).or_else(|| {
-                        self.inner.header(hash).ok().flatten().map(|h| crate::node::primitives::BscBlock {
-                            header: h,
-                            body: crate::node::primitives::BscBlockBody { inner: reth_ethereum_primitives::BlockBody::default(), sidecars: None },
+                        self.inner.header(hash).ok().flatten().map(|h| {
+                            crate::node::primitives::BscBlock {
+                                header: h,
+                                body: crate::node::primitives::BscBlockBody {
+                                    inner: reth_ethereum_primitives::BlockBody::default(),
+                                    sidecars: None,
+                                },
+                            }
                         })
                     })
                 }
-                fn block_by_number(&self, number: u64) -> Option<crate::node::primitives::BscBlock> {
+                fn block_by_number(
+                    &self,
+                    number: u64,
+                ) -> Option<crate::node::primitives::BscBlock> {
                     crate::shared::get_cached_block_by_number(number).or_else(|| {
-                        self.inner.header_by_number(number).ok().flatten().map(|h| crate::node::primitives::BscBlock {
-                            header: h,
-                            body: crate::node::primitives::BscBlockBody { inner: reth_ethereum_primitives::BlockBody::default(), sidecars: None },
+                        self.inner.header_by_number(number).ok().flatten().map(|h| {
+                            crate::node::primitives::BscBlock {
+                                header: h,
+                                body: crate::node::primitives::BscBlockBody {
+                                    inner: reth_ethereum_primitives::BlockBody::default(),
+                                    sidecars: None,
+                                },
+                            }
                         })
                     })
                 }
             }
 
-            let _ = crate::shared::set_full_block_provider(Arc::new(CachedFullBlockProvider { inner: provider.clone() }));
+            let _ = crate::shared::set_full_block_provider(Arc::new(CachedFullBlockProvider {
+                inner: provider.clone(),
+            }));
         }
 
         // Spawn the critical ImportService task exactly like the official implementation
@@ -275,11 +312,13 @@ impl BscNetworkBuilder {
                 from_builder,
                 from_hashes,
                 to_network,
-            ).await.unwrap();
+            )
+            .await
+            .unwrap();
         });
 
         // TODO: update network with the latest canonical head, but has a fork id issue, can fix it later.
-        let network_builder = network_builder
+        let mut network_builder = network_builder
             .boot_nodes(ctx.chain_spec().bootnodes().unwrap_or_default())
             .set_head(ctx.chain_spec().head())
             .with_pow()
@@ -289,10 +328,30 @@ impl BscNetworkBuilder {
             // Advertise both bsc/2 (with range messages) and bsc/1 (votes only)
             .add_rlpx_sub_protocol(bsc_protocol::protocol::handler::BscProtocolHandlerV2)
             .add_rlpx_sub_protocol(bsc_protocol::protocol::handler::BscProtocolHandlerV1);
-        
+
+        // Apply proxyed peer IDs if configured
+        if let Some(proxyed_peer_ids) = crate::shared::get_proxyed_peer_ids() {
+            network_builder = network_builder.proxied_peers(proxyed_peer_ids.clone());
+        }
+
         let peer_id = network_builder.get_peer_id();
         let mut network_config = ctx.build_network_config(network_builder);
         network_config.status.forkid = network_config.fork_filter.current();
+
+        // Initialize BSC protocol registry with proxyed peers from config
+        // This mirrors the same functionality in the main peer manager
+        let proxyed_node_ids = network_config.peers_config.proxyed_node_ids.clone();
+        if !proxyed_node_ids.is_empty() {
+            tracing::info!(
+                target: "bsc::net",
+                count = proxyed_node_ids.len(),
+                "Initializing BSC protocol with proxyed peers"
+            );
+            crate::node::network::bsc_protocol::registry::initialize_proxyed_peers(
+                proxyed_node_ids,
+            );
+        }
+
         let provider = ctx.provider();
         if let Ok(number) = provider.best_block_number() {
             let td = provider.header_td_by_number(number).unwrap_or_default();
@@ -334,7 +393,7 @@ where
         let network = NetworkManager::builder(network_config).await?;
         let handle = ctx.start_network(network, pool);
         info!(target: "reth::cli", enode=%handle.local_node_record(), "P2P networking initialized");
-        
+
         let local_peer_id = handle.peer_id();
         if crate::shared::set_local_peer_id(*local_peer_id).is_err() {
             warn!(target: "reth::cli", "Failed to set global local peer ID - already set");
@@ -354,8 +413,10 @@ where
     }
 }
 
-fn spawn_evn_sync_watcher<Node>(ctx: &BuilderContext<Node>, net: NetworkHandle<BscNetworkPrimitives>)
-where
+fn spawn_evn_sync_watcher<Node>(
+    ctx: &BuilderContext<Node>,
+    net: NetworkHandle<BscNetworkPrimitives>,
+) where
     Node: FullNodeTypes<Types = BscNode>,
 {
     use reth_provider::StateProviderFactory;

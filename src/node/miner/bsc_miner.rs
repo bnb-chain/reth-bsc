@@ -1,42 +1,54 @@
+use crate::node::miner::bid_simulator::{BidRuntime, BidSimulator};
+use crate::node::miner::payload::BscBuildArguments;
 use crate::{
-    chainspec::BscChainSpec, consensus::parlia::{Parlia, provider::SnapshotProvider, vote_pool}, 
+    chainspec::BscChainSpec,
+    consensus::parlia::{provider::SnapshotProvider, vote_pool, Parlia},
     metrics::BscConsensusMetrics,
     node::{
         engine::BscBuiltPayload,
         evm::config::BscEvmConfig,
         miner::{
-            config::{MiningConfig, keystore}, payload::{BscPayloadBuilder, BscPayloadJob, BscPayloadJobHandle}, signer::init_global_signer_from_k256, util::prepare_new_attributes
+            config::{keystore, MiningConfig},
+            payload::{BscPayloadBuilder, BscPayloadJob, BscPayloadJobHandle},
+            signer::init_global_signer_from_k256,
+            util::prepare_new_attributes,
         },
-        network::{BscNewBlock, block_import::service::{IncomingBlock, IncomingMinedBlock}},
-    }, shared::{get_block_import_mined_sender, get_block_import_sender, get_local_peer_id_or_default}
+        network::{
+            block_import::service::{IncomingBlock, IncomingMinedBlock},
+            BscNewBlock,
+        },
+    },
+    shared::{
+        get_block_import_mined_sender, get_block_import_sender, get_local_peer_id_or_default,
+    },
 };
 use alloy_consensus::BlockHeader;
+use alloy_primitives::U128;
 use alloy_primitives::{Address, Sealable};
 use k256::ecdsa::SigningKey;
+use lru::LruCache;
 use reth::transaction_pool::PoolTransaction;
 use reth::transaction_pool::TransactionPool;
+use reth_basic_payload_builder::{PayloadConfig, PrecachedState};
 use reth_chainspec::EthChainSpec;
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
+use reth_network::message::{NewBlockMessage, PeerMessage};
 use reth_payload_primitives::BuiltPayload;
 use reth_primitives::TransactionSigned;
-use reth_primitives_traits::{SealedHeader, BlockBody};
-use reth_provider::{BlockNumReader, HeaderProvider, CanonStateSubscriptions, CanonStateNotification};
+use reth_primitives_traits::{BlockBody, SealedHeader};
+use reth_provider::{
+    BlockNumReader, CanonStateNotification, CanonStateSubscriptions, HeaderProvider,
+};
+use reth_revm::cancelled::ManualCancel;
 use reth_tasks::TaskExecutor;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_stream::StreamExt;
-use tracing::{debug, error, info, warn, trace};
-use reth_basic_payload_builder::{PayloadConfig, PrecachedState};
-use crate::node::miner::payload::BscBuildArguments;
-use reth_revm::cancelled::ManualCancel;
-use alloy_primitives::U128;
-use reth_network::message::{NewBlockMessage, PeerMessage};
-use crate::node::miner::bid_simulator::{BidSimulator, BidRuntime};
-use std::time::Duration;
-use std::sync::Mutex;
-use lru::LruCache;
+use tracing::{debug, error, info, trace, warn};
 
 /// Maximum number of recently mined blocks to track for double signing prevention
 const RECENT_MINED_BLOCKS_CACHE_SIZE: usize = 100;
@@ -67,7 +79,7 @@ pub struct NewWorkWorker<Provider> {
     pre_cached: Option<PrecachedState>,
 }
 
-impl<Provider> NewWorkWorker<Provider> 
+impl<Provider> NewWorkWorker<Provider>
 where
     Provider: HeaderProvider<Header = alloy_consensus::Header>
         + BlockNumReader
@@ -98,12 +110,12 @@ where
 
     pub async fn run(mut self) {
         info!("Succeed to spawn new work worker, address: {}", self.validator_address);
-        
+
         if let Some(tip_header) = self.get_tip_header_at_startup() {
             debug!("Try new work at startup, tip_block={}", tip_header.number());
             self.try_new_work(&tip_header).await;
         }
-        
+
         let mut notifications = self.provider.canonical_state_stream();
         loop {
             match notifications.next().await {
@@ -122,7 +134,7 @@ where
                         is_reorg,
                         "Try new work"
                     );
-                    
+
                     // If this is a reorg event, validate it using bsc fork choice rules
                     if let CanonStateNotification::Reorg { old, new } = &event {
                         match self.validate_reorg(old, new).await {
@@ -164,10 +176,11 @@ where
                             }
                         }
                     }
-                    
+
                     let tip_header = tip.clone_sealed_header();
                     // Prune old votes from the vote pool based on the new block number
-                    let block_number = self.provider.last_block_number().ok().unwrap_or(tip_header.number());
+                    let block_number =
+                        self.provider.last_block_number().ok().unwrap_or(tip_header.number());
                     vote_pool::prune(block_number);
 
                     // Produce and broadcast a local vote for this new canonical head, if eligible
@@ -193,9 +206,9 @@ where
                             }
                         }
                     }
-                    
+
                     self.cache_for_next(&committed);
-                    
+
                     self.try_new_work(&tip_header).await;
                 }
                 None => {
@@ -235,12 +248,13 @@ where
             new_tip_hash = ?new.tip().hash(),
             "Reorg detected, validating with fork choice rules"
         );
-        
-        let forkchoice_engine = crate::shared::get_fork_choice_engine()
-            .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
+
+        let forkchoice_engine = crate::shared::get_fork_choice_engine().ok_or_else(
+            || -> Box<dyn std::error::Error + Send + Sync> {
                 "Fork choice engine not initialized".into()
-            })?;
-        
+            },
+        )?;
+
         let old_header = match self.provider.sealed_header_by_hash(old.tip().hash()) {
             Ok(Some(header)) => header,
             Ok(None) => {
@@ -256,15 +270,17 @@ where
                 return Err(format!("Failed to get old header: {}", e).into());
             }
         };
-        
-        let new_header = self.provider.sealed_header_by_hash(new.tip().hash())
+
+        let new_header = self
+            .provider
+            .sealed_header_by_hash(new.tip().hash())
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
                 format!("Failed to get new header: {}", e).into()
             })?
             .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
                 format!("New header not found for block hash {:?}", new.tip().hash()).into()
             })?;
-        
+
         match forkchoice_engine.is_need_reorg(new_header.header(), old_header.header()).await {
             Ok(true) => {
                 debug!(
@@ -280,9 +296,7 @@ where
                 );
                 Ok(false)
             }
-            Err(e) => {
-                Err(format!("Fork choice validation error: {}", e).into())
-            }
+            Err(e) => Err(format!("Fork choice validation error: {}", e).into()),
         }
     }
 
@@ -293,48 +307,56 @@ where
     }
 
     /// Cache state from the current block for building the next block.
-    /// 
+    ///
     /// Extracts changed accounts and storage from the execution outcome and stores them
     /// in a cache associated with the tip block hash for faster subsequent block building.
-    fn cache_for_next(&mut self, committed: &Arc<reth::providers::Chain<<Provider as reth_provider::NodePrimitivesProvider>::Primitives>>) {
+    fn cache_for_next(
+        &mut self,
+        committed: &Arc<
+            reth::providers::Chain<<Provider as reth_provider::NodePrimitivesProvider>::Primitives>,
+        >,
+    ) {
         // Build pre-cache from execution outcome
         let mut cached = reth_revm::cached::CachedReads::default();
         let new_execution_outcome = committed.execution_outcome();
-        
+
         for (addr, acc) in new_execution_outcome.bundle_accounts_iter() {
             if let Some(info) = acc.info.clone() {
                 // Pre-cache existing accounts and their storage
                 // This only includes changed accounts and storage but is better than nothing
-                let storage = acc.storage.iter()
-                    .map(|(key, slot)| (*key, slot.present_value))
-                    .collect();
+                let storage =
+                    acc.storage.iter().map(|(key, slot)| (*key, slot.present_value)).collect();
                 cached.insert_account(addr, info, storage);
             }
         }
-        
-        self.pre_cached = Some(PrecachedState {
-            block: committed.tip().hash(),
-            cached,
-        });
+
+        self.pre_cached = Some(PrecachedState { block: committed.tip().hash(), cached });
     }
 
     /// Returns the pre-cached reads for the given parent header if it matches the cached state's block.
-    fn maybe_pre_cached(&self, parent: alloy_primitives::B256) -> Option<reth_revm::cached::CachedReads> {
-        self.pre_cached.as_ref()
-            .filter(|pc| pc.block == parent)
-            .map(|pc| pc.cached.clone())
+    fn maybe_pre_cached(
+        &self,
+        parent: alloy_primitives::B256,
+    ) -> Option<reth_revm::cached::CachedReads> {
+        self.pre_cached.as_ref().filter(|pc| pc.block == parent).map(|pc| pc.cached.clone())
     }
 
-    async fn try_new_work<H>(&self, tip: &SealedHeader<H>) 
+    async fn try_new_work<H>(&self, tip: &SealedHeader<H>)
     where
         H: alloy_consensus::BlockHeader + Sealable,
     {
         // TODO: refine check is_syncing status.
-        if tip.timestamp() < SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() - 3 {
-            debug!("Skip to mine new block due to maybe in syncing, validator: {}, tip: {}", self.validator_address, tip.number());
+        if tip.timestamp()
+            < SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() - 3
+        {
+            debug!(
+                "Skip to mine new block due to maybe in syncing, validator: {}, tip: {}",
+                self.validator_address,
+                tip.number()
+            );
             return;
         }
-        
+
         let parent_header = match self.provider.sealed_header_by_hash(tip.hash()) {
             Ok(Some(header)) => {
                 trace!(
@@ -370,24 +392,40 @@ where
         let parent_snapshot = match self.snapshot_provider.snapshot_by_hash(&tip.hash()) {
             Some(snapshot) => snapshot,
             None => {
-                debug!("Skip to mine new block due to no snapshot available, validator: {}, tip: {}", self.validator_address, tip.number());
+                debug!(
+                    "Skip to mine new block due to no snapshot available, validator: {}, tip: {}",
+                    self.validator_address,
+                    tip.number()
+                );
                 return;
             }
         };
-        
+
         if !parent_snapshot.validators.contains(&self.validator_address) {
-            debug!("Skip to mine new block due to not authorized, validator: {}, tip: {}", self.validator_address, tip.number());
+            debug!(
+                "Skip to mine new block due to not authorized, validator: {}, tip: {}",
+                self.validator_address,
+                tip.number()
+            );
             return;
         }
 
         let mut is_inturn = true;
         if !parent_snapshot.is_inturn(self.validator_address) {
             is_inturn = false;
-            debug!("Try off-turn mining, validator: {}, next_block: {}", self.validator_address, tip.number() + 1);
+            debug!(
+                "Try off-turn mining, validator: {}, next_block: {}",
+                self.validator_address,
+                tip.number() + 1
+            );
         }
 
         if parent_snapshot.sign_recently(self.validator_address) {
-            debug!("Skip to mine new block due to signed recently, validator: {}, tip: {}", self.validator_address, tip.number());
+            debug!(
+                "Skip to mine new block due to signed recently, validator: {}, tip: {}",
+                self.validator_address,
+                tip.number()
+            );
             return;
         }
 
@@ -419,7 +457,7 @@ pub struct MainWorkWorker<Pool, Provider> {
     payload_tx: mpsc::UnboundedSender<SubmitContext>,
     running_job_handle: Option<BscPayloadJobHandle>,
     payload_job_join_set: JoinSet<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
-    simulator: Arc<BidSimulator<Provider, Pool>>,  // No outer RwLock, each map has its own lock
+    simulator: Arc<BidSimulator<Provider, Pool>>, // No outer RwLock, each map has its own lock
     desired_gas_limit: u64,
     desired_min_gas_tip: u128,
 }
@@ -446,7 +484,7 @@ where
         chain_spec: Arc<crate::chainspec::BscChainSpec>,
         parlia: Arc<crate::consensus::parlia::Parlia<crate::chainspec::BscChainSpec>>,
         mining_queue_rx: mpsc::UnboundedReceiver<MiningContext>,
-        simulator: Arc<BidSimulator<Provider, Pool>>,  // No outer RwLock needed
+        simulator: Arc<BidSimulator<Provider, Pool>>, // No outer RwLock needed
         payload_tx: mpsc::UnboundedSender<SubmitContext>,
         desired_gas_limit: u64,
         desired_min_gas_tip: u128,
@@ -469,7 +507,7 @@ where
 
     pub async fn run(mut self) {
         info!("Succeed to spawn main work worker, address: {}", self.validator_address);
-        
+
         loop {
             tokio::select! {
                 mining_ctx = self.mining_queue_rx.recv() => {
@@ -495,23 +533,23 @@ where
                         }
                     }
                 }
-                
+
                 _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {
                     self.check_payload_job_results().await;
                 }
             }
         }
-        
+
         warn!("Mining worker stopped");
     }
 
     /// Check if the mining context is still valid (parent is still the canonical head).
-    /// 
+    ///
     /// This is a best-effort check to avoid wasting resources on stale mining contexts.
     /// It does NOT guarantee complete accuracy due to:
     /// - Race conditions: The canonical head may change between this check and actual mining
     /// - Time window: Multiple chain events may occur in quick succession
-    /// 
+    ///
     /// Purpose: Skip obviously stale contexts to reduce unnecessary work, not to provide
     /// strict correctness guarantees.
     fn recheck_mining_ctx(&self, ctx: &MiningContext) -> bool {
@@ -520,7 +558,7 @@ where
             Ok(num) => num,
             Err(_) => return true, // On error, proceed to avoid blocking mining
         };
-        
+
         if ctx.parent_header.number() != current_best {
             debug!(
                 target: "bsc::miner",
@@ -531,7 +569,7 @@ where
             );
             return false;
         }
-        
+
         if let Ok(Some(canonical_header)) = self.provider.sealed_header(current_best) {
             if canonical_header.hash() != parent_hash {
                 debug!(
@@ -544,7 +582,7 @@ where
                 return false;
             }
         }
-        
+
         true
     }
 
@@ -555,21 +593,21 @@ where
         if let Some(handle) = self.running_job_handle.take() {
             handle.abort();
         }
-        
+
         let parent_header = mining_ctx.parent_header.clone();
         let block_number = parent_header.number() + 1;
         let attributes = prepare_new_attributes(
             &mut mining_ctx,
-            self.parlia.clone(), 
-            &parent_header, 
-            self.validator_address
+            self.parlia.clone(),
+            &parent_header,
+            self.validator_address,
         );
 
         let evm_config = BscEvmConfig::new(self.chain_spec.clone());
         let payload_builder = BscPayloadBuilder::new(
-            self.provider.clone(), 
-            self.pool.clone(), 
-            evm_config, 
+            self.provider.clone(),
+            self.pool.clone(),
+            evm_config,
             EthereumBuilderConfig::new().with_gas_limit(self.desired_gas_limit),
             self.chain_spec.clone(),
             self.parlia.clone(),
@@ -582,25 +620,23 @@ where
             trace_id: crate::node::miner::payload::generate_trace_id(),
             min_gas_tip: self.desired_min_gas_tip,
         };
-        
+
         let parent_hash = mining_ctx.parent_header.hash();
         let (payload_job, job_handle) = BscPayloadJob::new(
-            self.parlia.clone(), 
+            self.parlia.clone(),
             mining_ctx,
-            payload_builder, 
-            build_args, 
+            payload_builder,
+            build_args,
             self.simulator.clone(),
             self.payload_tx.clone(),
         );
-        
+
         let start_time = std::time::Instant::now();
         self.running_job_handle = Some(job_handle);
-        self.payload_job_join_set.spawn(async move {
-            payload_job.start().await
-        });
+        self.payload_job_join_set.spawn(async move { payload_job.start().await });
         debug!("Succeed to async start payload job, cost_time: {:?}, block_number: {}, parent_hash: 0x{:x}",
             start_time.elapsed(), block_number, parent_hash);
-        
+
         Ok(())
     }
 
@@ -620,7 +656,6 @@ where
             }
         }
     }
-
 }
 
 /// Worker responsible for submitting the seal block to engine-tree and other peers.
@@ -658,7 +693,9 @@ where
         submit_built_payload: bool,
     ) -> Self {
         let (delay_submit_tx, delay_submit_rx) = mpsc::unbounded_channel::<BscBuiltPayload>();
-        let recent_mined_blocks = Arc::new(Mutex::new(LruCache::new(std::num::NonZeroUsize::new(RECENT_MINED_BLOCKS_CACHE_SIZE).unwrap())));
+        let recent_mined_blocks = Arc::new(Mutex::new(LruCache::new(
+            std::num::NonZeroUsize::new(RECENT_MINED_BLOCKS_CACHE_SIZE).unwrap(),
+        )));
         tracing::info!("ResultWorkWorker created, submit_built_payload: {}", submit_built_payload);
         Self {
             validator_address,
@@ -733,7 +770,7 @@ where
                             } else {
                                 // Update intentional mining delay metric
                                 self.consensus_metrics.intentional_mining_delays_total.increment(1);
-                                
+
                                 Self::start_delay_task(
                                     payload,
                                     delay_ms,
@@ -758,12 +795,12 @@ where
                         }
                     }
                 }
-                
+
                 delayed_payload = self.delay_submit_rx.recv() => {
                     match delayed_payload {
                         Some(payload) => {
                             let block_number = payload.block().number();
-                            let block_hash = payload.block().hash();                            
+                            let block_hash = payload.block().hash();
                             match self.submit_payload(payload).await {
                                 Ok(()) => {
                                     info!(
@@ -800,7 +837,10 @@ where
     }
 
     /// Submit a built payload to the engine-tree/network
-    async fn submit_payload(&self, payload: BscBuiltPayload) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn submit_payload(
+        &self,
+        payload: BscBuiltPayload,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let sealed_block = payload.block();
         let block_hash = sealed_block.hash();
         let block_number = sealed_block.number();
@@ -816,7 +856,8 @@ where
             return Ok(());
         }
 
-        {   // check double sign
+        {
+            // check double sign
             let mut cache = self.recent_mined_blocks.lock().unwrap();
             if let Some(prev_parents) = cache.get(&block_number) {
                 let mut double_sign = false;
@@ -843,14 +884,14 @@ where
 
         let block_hash = sealed_block.hash();
         let difficulty = sealed_block.header().difficulty();
-        let turn_status = if difficulty == crate::consensus::parlia::constants::DIFF_INTURN { 
+        let turn_status = if difficulty == crate::consensus::parlia::constants::DIFF_INTURN {
             // Update in-turn block metric
             self.consensus_metrics.inturn_blocks_total.increment(1);
-            "inturn" 
-        } else { 
+            "inturn"
+        } else {
             // Update out-of-turn block metric
             self.consensus_metrics.noturn_blocks_total.increment(1);
-            "offturn" 
+            "offturn"
         };
         debug!(
             target: "bsc::miner",
@@ -864,51 +905,55 @@ where
         );
 
         // Update miner metrics: best work gas used (in MGas)
-        use once_cell::sync::Lazy;
         use crate::metrics::BscMinerMetrics;
+        use once_cell::sync::Lazy;
         static MINER_METRICS: Lazy<BscMinerMetrics> = Lazy::new(BscMinerMetrics::default);
-        
+
         let gas_used_mgas = sealed_block.gas_used() as f64 / 1_000_000.0;
         MINER_METRICS.best_work_gas_used_mgas.set(gas_used_mgas);
 
         // TODO: wait more times when huge chain import.
         // TODO: only canonical head can broadcast, avoid sidechain blocks.
         let parent_number = block_number.saturating_sub(1);
-        let parent_td = self.provider.header_td_by_number(parent_number)
+        let parent_td = self
+            .provider
+            .header_td_by_number(parent_number)
             .map_err(|e| format!("Failed to get parent total difficulty due to {}", e))?
             .unwrap_or_default();
         let current_difficulty = sealed_block.header().difficulty();
         let new_td = parent_td + current_difficulty;
-        
+
         let td = U128::from(new_td.to::<u128>());
-        let new_block = BscNewBlock(reth_eth_wire::NewBlock { 
-            block: sealed_block.clone_block(), 
-            td 
-        });
-        let msg = NewBlockMessage { 
-            hash: block_hash, 
-            block: Arc::new(new_block) 
-        };
+        let new_block =
+            BscNewBlock(reth_eth_wire::NewBlock { block: sealed_block.clone_block(), td });
+        let msg =
+            NewBlockMessage { hash: block_hash, block: Arc::new(new_block), td: Some(new_td) };
 
         if self.submit_built_payload {
             if let Some(sender) = get_block_import_mined_sender() {
                 let incoming: IncomingMinedBlock = (payload, msg.clone());
                 if sender.send(incoming).is_err() {
                     warn!("Failed to send mined block to import service due to channel closed");
-                    return Err("Failed to send mined block to import service due to channel closed".into());
+                    return Err(
+                        "Failed to send mined block to import service due to channel closed".into(),
+                    );
                 } else {
                     debug!("Succeed to send mined block to import service");
                 }
             } else {
                 warn!("Failed to send mined block due to import sender not initialised");
-                return Err("Failed to send mined block due to import sender not initialised".into());
+                return Err(
+                    "Failed to send mined block due to import sender not initialised".into()
+                );
             }
         } else if let Some(sender) = get_block_import_sender() {
             let peer_id = get_local_peer_id_or_default();
             let incoming: IncomingBlock = (msg.clone(), peer_id);
             if sender.send(incoming).is_err() {
                 warn!("Failed to send built block to import service due to channel closed");
-                return Err("Failed to send built block to import service due to channel closed".into());
+                return Err(
+                    "Failed to send built block to import service due to channel closed".into()
+                );
             } else {
                 debug!("Succeed to send built block to import service");
             }
@@ -934,7 +979,7 @@ where
 }
 
 pub struct MevWorkWorker<Provider, Pool> {
-    simulator: Arc<BidSimulator<Provider, Pool>>,  // No outer RwLock, each map has its own lock
+    simulator: Arc<BidSimulator<Provider, Pool>>, // No outer RwLock, each map has its own lock
     bid_simulate_req_rx: mpsc::UnboundedReceiver<BidRuntime<Pool, BscEvmConfig>>,
     bid_simulate_req_tx: mpsc::UnboundedSender<BidRuntime<Pool, BscEvmConfig>>,
     provider: Provider,
@@ -952,11 +997,9 @@ where
         + 'static,
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>> + 'static,
 {
-    pub fn new(
-        simulator: Arc<BidSimulator<Provider, Pool>>,
-        provider: Provider,
-    ) -> Self {
-        let (bid_simulate_req_tx, bid_simulate_req_rx) = mpsc::unbounded_channel::<BidRuntime<Pool, BscEvmConfig>>();
+    pub fn new(simulator: Arc<BidSimulator<Provider, Pool>>, provider: Provider) -> Self {
+        let (bid_simulate_req_tx, bid_simulate_req_rx) =
+            mpsc::unbounded_channel::<BidRuntime<Pool, BscEvmConfig>>();
         Self { simulator, bid_simulate_req_rx, bid_simulate_req_tx, provider }
     }
 
@@ -964,7 +1007,7 @@ where
         info!("Starting MevWorkWorker");
         let mut send_bid_interval = tokio::time::interval(Duration::from_millis(20));
         let mut clear_bid_interval = tokio::time::interval(Duration::from_millis(1000));
-        
+
         loop {
             tokio::select! {
                 bid_runtime = self.bid_simulate_req_rx.recv() => {
@@ -997,7 +1040,10 @@ where
     fn get_bid_and_send(&self) {
         // Read bid packages from the global queue
         if let Some(bid_package) = crate::shared::pop_bid_package() {
-            debug!("Popped bid package from queue, block: {}, committing to simulator", bid_package.block_number);
+            debug!(
+                "Popped bid package from queue, block: {}, committing to simulator",
+                bid_package.block_number
+            );
             if let Some(req) = self.simulator.commit_new_bid(bid_package) {
                 if let Err(e) = self.bid_simulate_req_tx.send(req) {
                     error!("Failed to send bid simulate request due to channel closed: {}", e);
@@ -1065,15 +1111,18 @@ where
             info!("Succeed to derived address from private key, address: {}", derived_address);
             validator_address = derived_address;
         }
-        
+
         let (mining_queue_tx, mining_queue_rx) = mpsc::unbounded_channel::<MiningContext>();
         let (payload_tx, payload_rx) = mpsc::unbounded_channel::<SubmitContext>();
-        
+
         let chain_id = chain_spec.as_ref().chain().id();
         let desired_gas_limit = mining_config.get_gas_limit(chain_id);
         let desired_min_gas_tip = mining_config.get_min_gas_tip();
-        info!("Mining configuration: validator={}, chain_id={}, gas_limit={}, min_gas_tip={}", validator_address, chain_id, desired_gas_limit, desired_min_gas_tip);
-        
+        info!(
+            "Mining configuration: validator={}, chain_id={}, gas_limit={}, min_gas_tip={}",
+            validator_address, chain_id, desired_gas_limit, desired_min_gas_tip
+        );
+
         let parlia = Arc::new(crate::consensus::parlia::Parlia::new(chain_spec.clone(), 200));
         let new_work_worker = NewWorkWorker::new(
             validator_address,
@@ -1082,9 +1131,16 @@ where
             mining_queue_tx.clone(),
             parlia.clone(),
         );
-        
+
         let parlia = Arc::new(crate::consensus::parlia::Parlia::new(chain_spec.clone(), 200));
-        let simulator = Arc::new(BidSimulator::new(provider.clone(), pool.clone(), chain_spec.clone(), parlia.clone(), validator_address, snapshot_provider.clone()));
+        let simulator = Arc::new(BidSimulator::new(
+            provider.clone(),
+            pool.clone(),
+            chain_spec.clone(),
+            parlia.clone(),
+            validator_address,
+            snapshot_provider.clone(),
+        ));
         let main_work_worker = MainWorkWorker::new(
             validator_address,
             pool.clone(),
@@ -1097,7 +1153,7 @@ where
             desired_gas_limit,
             desired_min_gas_tip,
         );
-        
+
         let result_work_worker = ResultWorkWorker::new(
             validator_address,
             provider.clone(),
@@ -1105,11 +1161,8 @@ where
             payload_rx,
             mining_config.submit_built_payload,
         );
-        
-        let mev_work_worker = MevWorkWorker::new(
-            simulator.clone(),
-            provider.clone(),
-        );
+
+        let mev_work_worker = MevWorkWorker::new(simulator.clone(), provider.clone());
 
         let miner = Self {
             validator_address,
