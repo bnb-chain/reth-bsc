@@ -102,7 +102,10 @@ where
         let (evm, result) = self.executor.finish()?;
         let (db, evm_env) = evm.finish();
 
-        let assembled_system_txs = self.shared_ctx.inner.borrow().assembled_system_txs.clone();
+        let assembled_system_txs = {
+            let mut inner = self.shared_ctx.inner.borrow_mut();
+            std::mem::take(&mut inner.assembled_system_txs)
+        };
         // merge all transitions into bundle state
         db.merge_transitions(BundleRetention::Reverts);
 
@@ -128,7 +131,7 @@ where
             evm_env,
             execution_ctx: self.ctx,
             parent: self.parent,
-            transactions: transactions.clone(),
+            transactions,
             output: &result,
             bundle_state: &db.bundle_state,
             state_provider: &state,
@@ -136,16 +139,25 @@ where
         };
         let assemble_start = std::time::Instant::now();
         let block = self.assembler.assemble_block_bsc(bsc_input)?;
+        let block_hash = block.header.hash_slow();
 
         // cache current validators and turn length
         let current_validators = self.shared_ctx.inner.borrow().current_validators.clone();
         if let Some((validators, vote_addresses)) = current_validators {
-            VALIDATOR_CACHE.lock().unwrap().insert(block.header.hash_slow(), (validators, vote_addresses));
-            tracing::debug!("Succeed to update validator cache in builder, block_number: {}, block_hash: {}", block.header.number, block.header.hash_slow());
+            VALIDATOR_CACHE.lock().unwrap().insert(block_hash, (validators, vote_addresses));
+            tracing::debug!(
+                "Succeed to update validator cache in builder, block_number: {}, block_hash: {}",
+                block.header.number,
+                block_hash
+            );
         }
         if let Some(turn_length) = self.shared_ctx.inner.borrow().turn_length {
-            TURN_LENGTH_CACHE.lock().unwrap().insert(block.header.hash_slow(), turn_length);
-            tracing::debug!("Succeed to update turn length cache in builder, block_number: {}, block_hash: {}", block.header.number, block.header.hash_slow());
+            TURN_LENGTH_CACHE.lock().unwrap().insert(block_hash, turn_length);
+            tracing::debug!(
+                "Succeed to update turn length cache in builder, block_number: {}, block_hash: {}",
+                block.header.number,
+                block_hash
+            );
         }
         let assemble_duration = assemble_start.elapsed();
         
@@ -153,7 +165,7 @@ where
         tracing::debug!(
             target: "bsc::builder",
             block_number = %block.header.number,
-            block_hash = %block.header.hash_slow(),
+            block_hash = %block_hash,
             user_tx_len = user_tx_len,
             system_tx_len = system_tx_len,
             total_tx_len = total_tx_len,
