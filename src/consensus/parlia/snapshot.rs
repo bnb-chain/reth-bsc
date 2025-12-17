@@ -1,12 +1,12 @@
 use std::collections::{BTreeMap, HashMap};
 
 use super::vote::{VoteAddress, VoteAttestation, VoteData};
-use alloy_primitives::{Address, BlockNumber, BlockHash};
-use serde::{Deserialize, Serialize};
+use crate::metrics::BscVoteMetrics;
+use alloy_primitives::{Address, BlockHash, BlockNumber};
+use once_cell::sync::Lazy;
 use reth_db::table::{Compress, Decompress};
 use reth_db::DatabaseError;
-use once_cell::sync::Lazy;
-use crate::metrics::BscVoteMetrics;
+use serde::{Deserialize, Serialize};
 
 /// Number of blocks after which we persist snapshots to DB.
 pub const CHECKPOINT_INTERVAL: u64 = 1024;
@@ -82,7 +82,6 @@ impl Snapshot {
     ) -> Self {
         // Ensure epoch_num is never zero to prevent division by zero errors
         let epoch_num = if epoch_num == 0 { DEFAULT_EPOCH_LENGTH } else { epoch_num };
-        
         let mut validators_map = HashMap::new();
         if let Some(vote_addrs) = vote_addrs {
             assert_eq!(
@@ -192,21 +191,26 @@ impl Snapshot {
         snap.update_attestation(chain_spec, next_header, attestation);
         snap.recent_proposers.insert(block_number, validator);
 
-        let is_maxwell_active = chain_spec.is_maxwell_active_at_timestamp(header_number, header_timestamp);
+        let is_maxwell_active =
+            chain_spec.is_maxwell_active_at_timestamp(header_number, header_timestamp);
         if is_maxwell_active {
             let latest_finalized_block_number = snap.get_finalized_number();
-			// BEP-524: Clear entries up to the latest finalized block
-			let blocks_to_remove: Vec<u64> = snap.recent_proposers.keys()
-				.filter(|&&block_number| block_number <= latest_finalized_block_number)
-				.copied()
-				.collect();
-			for block_number in blocks_to_remove {
-				snap.recent_proposers.remove(&block_number);
-			}
+            // BEP-524: Clear entries up to the latest finalized block
+            let blocks_to_remove: Vec<u64> = snap
+                .recent_proposers
+                .keys()
+                .filter(|&&block_number| block_number <= latest_finalized_block_number)
+                .copied()
+                .collect();
+            for block_number in blocks_to_remove {
+                snap.recent_proposers.remove(&block_number);
+            }
         }
 
-        let is_lorentz_active = chain_spec.is_lorentz_active_at_timestamp(header_number, header_timestamp);
-        let is_fermi_active = chain_spec.is_fermi_active_at_timestamp(header_number, header_timestamp);
+        let is_lorentz_active =
+            chain_spec.is_lorentz_active_at_timestamp(header_number, header_timestamp);
+        let is_fermi_active =
+            chain_spec.is_fermi_active_at_timestamp(header_number, header_timestamp);
         if is_fermi_active {
             snap.block_interval = FERMI_BLOCK_INTERVAL;
         } else if is_maxwell_active {
@@ -217,16 +221,24 @@ impl Snapshot {
 
         let epoch_length = snap.epoch_num;
         let next_block_number = block_number + 1;
-        if snap.epoch_num == DEFAULT_EPOCH_LENGTH && is_lorentz_active && next_block_number.is_multiple_of(LORENTZ_EPOCH_LENGTH) {
+        if snap.epoch_num == DEFAULT_EPOCH_LENGTH
+            && is_lorentz_active
+            && next_block_number.is_multiple_of(LORENTZ_EPOCH_LENGTH)
+        {
             snap.epoch_num = LORENTZ_EPOCH_LENGTH;
         }
-        if snap.epoch_num == LORENTZ_EPOCH_LENGTH && is_maxwell_active && next_block_number.is_multiple_of(MAXWELL_EPOCH_LENGTH) {
+        if snap.epoch_num == LORENTZ_EPOCH_LENGTH
+            && is_maxwell_active
+            && next_block_number.is_multiple_of(MAXWELL_EPOCH_LENGTH)
+        {
             snap.epoch_num = MAXWELL_EPOCH_LENGTH;
         }
 
         // change validator set
         let epoch_key = u64::MAX - block_number / epoch_length;
-        if !new_validators.is_empty() && (!is_bohr || !snap.recent_proposers.contains_key(&epoch_key)) {
+        if !new_validators.is_empty()
+            && (!is_bohr || !snap.recent_proposers.contains_key(&epoch_key))
+        {
             // Epoch change driven by new validator set / checkpoint header.
             if let Some(tl) = turn_length { snap.turn_length = Some(tl) }
 
@@ -283,12 +295,21 @@ impl Snapshot {
             snap.validators = new_validators;
             snap.validators_map = validators_map;
         }
-        tracing::trace!("Succeed to apply snapshot, block_number: {:?}, original_snap: {:?}, new_snap: {:?}", block_number, original_snap, snap);
+        tracing::trace!(
+            "Succeed to apply snapshot, block_number: {:?}, original_snap: {:?}, new_snap: {:?}",
+            block_number,
+            original_snap,
+            snap
+        );
         Some(snap)
     }
 
-    pub fn update_attestation<H, BscChainSpec>(&mut self, chain_spec: &BscChainSpec, header: &H, attestation: Option<VoteAttestation>)
-    where
+    pub fn update_attestation<H, BscChainSpec>(
+        &mut self,
+        chain_spec: &BscChainSpec,
+        header: &H,
+        attestation: Option<VoteAttestation>,
+    ) where
         H: alloy_consensus::BlockHeader + alloy_primitives::Sealable,
         BscChainSpec: crate::hardforks::BscHardforks,
     {
@@ -296,13 +317,13 @@ impl Snapshot {
             if !chain_spec.is_fermi_active_at_timestamp(header.number(), header.timestamp()) {
                 let target_number = att.data.target_number;
                 let target_hash = att.data.target_hash;
-                if target_number+1 != header.number() || target_hash != header.parent_hash() {
+                if target_number + 1 != header.number() || target_hash != header.parent_hash() {
                     tracing::warn!("Failed to update attestation, target_number: {:?}, target_hash: {:?}, header_number: {:?}, header_parent_hash: {:?}", target_number, target_hash, header.number(), header.parent_hash());
                     VOTE_METRICS.attestation_update_errors_total.increment(1);
                     return;
                 }
             }
-            if att.data.source_number+1 != att.data.target_number {
+            if att.data.source_number + 1 != att.data.target_number {
                 self.vote_data.target_number = att.data.target_number;
                 self.vote_data.target_hash = att.data.target_hash;
             } else {
@@ -314,17 +335,17 @@ impl Snapshot {
     }
 
     /// Returns `true` if `proposer` is in-turn according to snapshot rules.
-    pub fn is_inturn(&self, proposer: Address) -> bool { 
+    pub fn is_inturn(&self, proposer: Address) -> bool {
         let inturn_val = self.inturn_validator();
         let is_inturn = inturn_val == proposer;
-        
+
         if !is_inturn {
             tracing::trace!(
                 "is_inturn check: proposer=0x{:x}, inturn_validator=0x{:x}, is_inturn={}, validators={:?}",
                 proposer, inturn_val, is_inturn, self.validators
             );
         }
-        
+
         is_inturn
     }
 
@@ -340,12 +361,12 @@ impl Snapshot {
         let next_block = self.block_number + 1;
         let offset = (next_block / turn_length) as usize % self.validators.len();
         let next_validator = self.validators[offset];
-        
+
         tracing::trace!(
             "inturn_validator debug info, snapshot_block={}, next_block={}, turn_length={}, offset={}, validators_len={}, next_validator=0x{:x}",
             self.block_number, next_block, turn_length, offset, self.validators.len(), next_validator
         );
-        
+
         next_validator
     }
 
@@ -358,7 +379,9 @@ impl Snapshot {
     /// When turn_length is 1 (pre-Bohr), every block is considered last in turn.
     pub fn last_block_in_one_turn(&self, block_number: u64) -> bool {
         let tl = u64::from(self.turn_length.unwrap_or(DEFAULT_TURN_LENGTH));
-        if tl <= 1 { return true; }
+        if tl <= 1 {
+            return true;
+        }
         block_number % tl == tl - 1
     }
 
@@ -366,10 +389,14 @@ impl Snapshot {
     pub fn count_recent_proposers(&self) -> HashMap<Address, u8> {
         let left_bound = if self.block_number > self.miner_history_check_len() {
             self.block_number - self.miner_history_check_len()
-        } else { 0 };
+        } else {
+            0
+        };
         let mut counts = HashMap::new();
         for (&block, &v) in &self.recent_proposers {
-            if block <= left_bound || v == Address::default() { continue; }
+            if block <= left_bound || v == Address::default() {
+                continue;
+            }
             *counts.entry(v).or_insert(0) += 1;
             // tracing::debug!("count_recent_proposers, block: {:?}, validator: {:?}, count: {:?}", block, v, counts.get(&v).unwrap());
         }
@@ -382,10 +409,14 @@ impl Snapshot {
     }
 
     /// Helper that takes pre-computed counts.
-    pub fn sign_recently_by_counts(&self, validator: Address, counts: &HashMap<Address, u8>) -> bool {
+    pub fn sign_recently_by_counts(
+        &self,
+        validator: Address,
+        counts: &HashMap<Address, u8>,
+    ) -> bool {
         if let Some(&times) = counts.get(&validator) {
             let allowed = u64::from(self.turn_length.unwrap_or(1));
-            if u64::from(times) >= allowed { 
+            if u64::from(times) >= allowed {
                 tracing::debug!("Recently signed, validator: {:?}, block_number: {:?}, times: {:?}, allowed: {:?}", validator, self.block_number, times, allowed);
                 return true;
             }
@@ -406,7 +437,9 @@ impl Snapshot {
 impl Compress for Snapshot {
     type Compressed = Vec<u8>;
 
-    fn compress(self) -> Self::Compressed { serde_cbor::to_vec(&self).expect("serialize Snapshot") }
+    fn compress(self) -> Self::Compressed {
+        serde_cbor::to_vec(&self).expect("serialize Snapshot")
+    }
 
     fn compress_to_buf<B: bytes::BufMut + AsMut<[u8]>>(&self, buf: &mut B) {
         let bytes = self.clone().compress();
@@ -434,7 +467,8 @@ mod tests {
     fn sign_recently_detects_over_propose() {
         // three validators
         let validators = vec![addr(1), addr(2), addr(3)];
-        let mut snap = Snapshot::new(validators.clone(), 0, BlockHash::default(), DEFAULT_EPOCH_LENGTH, None);
+        let mut snap =
+            Snapshot::new(validators.clone(), 0, BlockHash::default(), DEFAULT_EPOCH_LENGTH, None);
 
         // simulate that validator 1 proposed previous block 0
         snap.recent_proposers.insert(1, addr(1));
@@ -458,24 +492,29 @@ mod tests {
     fn test_snapshot_new_with_zero_epoch_num() {
         // Test that creating a snapshot with epoch_num = 0 defaults to DEFAULT_EPOCH_LENGTH
         let validators = vec![address!("0x1234567890123456789012345678901234567890")];
-        let block_hash = b256!("0x1234567890123456789012345678901234567890123456789012345678901234");
-        
+        let block_hash =
+            b256!("0x1234567890123456789012345678901234567890123456789012345678901234");
+
         let snapshot = Snapshot::new(validators.clone(), 0, block_hash, 0, None);
-        
+
         // Should default to DEFAULT_EPOCH_LENGTH, not 0
         assert_eq!(snapshot.epoch_num, DEFAULT_EPOCH_LENGTH);
-        assert_ne!(snapshot.epoch_num, 0, "epoch_num should never be zero to prevent division by zero");
+        assert_ne!(
+            snapshot.epoch_num, 0,
+            "epoch_num should never be zero to prevent division by zero"
+        );
     }
 
     #[test]
     fn test_snapshot_new_with_valid_epoch_num() {
         // Test that creating a snapshot with valid epoch_num preserves the value
         let validators = vec![address!("0x1234567890123456789012345678901234567890")];
-        let block_hash = b256!("0x1234567890123456789012345678901234567890123456789012345678901234");
+        let block_hash =
+            b256!("0x1234567890123456789012345678901234567890123456789012345678901234");
         let custom_epoch = 500u64;
-        
+
         let snapshot = Snapshot::new(validators.clone(), 0, block_hash, custom_epoch, None);
-        
+
         // Should preserve the custom epoch value
         assert_eq!(snapshot.epoch_num, custom_epoch);
     }
@@ -484,58 +523,101 @@ mod tests {
     fn test_snapshot_apply_no_division_by_zero() {
         // Test that applying a snapshot with epoch operations doesn't cause division by zero
         let validators = vec![address!("0x1234567890123456789012345678901234567890")];
-        let block_hash = b256!("0x1234567890123456789012345678901234567890123456789012345678901234");
-        
+        let block_hash =
+            b256!("0x1234567890123456789012345678901234567890123456789012345678901234");
+
         // Create snapshot with epoch_num = 0 (should be fixed to DEFAULT_EPOCH_LENGTH)
         let snapshot = Snapshot::new(validators.clone(), 0, block_hash, 0, None);
-        
+
         // Create a mock header for apply operation
         struct MockHeader {
             number: u64,
             beneficiary: Address,
             extra_data: alloy_primitives::Bytes,
         }
-        
+
         impl alloy_consensus::BlockHeader for MockHeader {
-            fn number(&self) -> u64 { self.number }
-            fn beneficiary(&self) -> Address { self.beneficiary }
-            fn gas_limit(&self) -> u64 { 8000000 }
-            fn gas_used(&self) -> u64 { 0 }
-            fn timestamp(&self) -> u64 { 1000000 }
-            fn extra_data(&self) -> &alloy_primitives::Bytes { &self.extra_data }
-            fn base_fee_per_gas(&self) -> Option<u64> { None }
-            fn difficulty(&self) -> alloy_primitives::U256 { alloy_primitives::U256::from(1) }
-            fn transactions_root(&self) -> alloy_primitives::B256 { alloy_primitives::B256::ZERO }
-            fn state_root(&self) -> alloy_primitives::B256 { alloy_primitives::B256::ZERO }
-            fn receipts_root(&self) -> alloy_primitives::B256 { alloy_primitives::B256::ZERO }
-            fn logs_bloom(&self) -> alloy_primitives::Bloom { alloy_primitives::Bloom::ZERO }
-            fn parent_hash(&self) -> alloy_primitives::B256 { alloy_primitives::B256::ZERO }
-            fn ommers_hash(&self) -> alloy_primitives::B256 { alloy_primitives::B256::ZERO }
-            fn withdrawals_root(&self) -> Option<alloy_primitives::B256> { None }
-            fn mix_hash(&self) -> Option<alloy_primitives::B256> { None }
-            fn nonce(&self) -> Option<alloy_primitives::FixedBytes<8>> { None }
-            fn blob_gas_used(&self) -> Option<u64> { None }
-            fn excess_blob_gas(&self) -> Option<u64> { None }
-            fn parent_beacon_block_root(&self) -> Option<alloy_primitives::B256> { None }
-            fn requests_hash(&self) -> Option<alloy_primitives::B256> { None }
+            fn number(&self) -> u64 {
+                self.number
+            }
+            fn beneficiary(&self) -> Address {
+                self.beneficiary
+            }
+            fn gas_limit(&self) -> u64 {
+                8000000
+            }
+            fn gas_used(&self) -> u64 {
+                0
+            }
+            fn timestamp(&self) -> u64 {
+                1000000
+            }
+            fn extra_data(&self) -> &alloy_primitives::Bytes {
+                &self.extra_data
+            }
+            fn base_fee_per_gas(&self) -> Option<u64> {
+                None
+            }
+            fn difficulty(&self) -> alloy_primitives::U256 {
+                alloy_primitives::U256::from(1)
+            }
+            fn transactions_root(&self) -> alloy_primitives::B256 {
+                alloy_primitives::B256::ZERO
+            }
+            fn state_root(&self) -> alloy_primitives::B256 {
+                alloy_primitives::B256::ZERO
+            }
+            fn receipts_root(&self) -> alloy_primitives::B256 {
+                alloy_primitives::B256::ZERO
+            }
+            fn logs_bloom(&self) -> alloy_primitives::Bloom {
+                alloy_primitives::Bloom::ZERO
+            }
+            fn parent_hash(&self) -> alloy_primitives::B256 {
+                alloy_primitives::B256::ZERO
+            }
+            fn ommers_hash(&self) -> alloy_primitives::B256 {
+                alloy_primitives::B256::ZERO
+            }
+            fn withdrawals_root(&self) -> Option<alloy_primitives::B256> {
+                None
+            }
+            fn mix_hash(&self) -> Option<alloy_primitives::B256> {
+                None
+            }
+            fn nonce(&self) -> Option<alloy_primitives::FixedBytes<8>> {
+                None
+            }
+            fn blob_gas_used(&self) -> Option<u64> {
+                None
+            }
+            fn excess_blob_gas(&self) -> Option<u64> {
+                None
+            }
+            fn parent_beacon_block_root(&self) -> Option<alloy_primitives::B256> {
+                None
+            }
+            fn requests_hash(&self) -> Option<alloy_primitives::B256> {
+                None
+            }
         }
-        
+
         impl alloy_primitives::Sealable for MockHeader {
             fn hash_slow(&self) -> alloy_primitives::B256 {
                 alloy_primitives::keccak256(format!("mock_header_{}", self.number))
             }
         }
-        
+
         let header = MockHeader {
             number: 1,
             beneficiary: validators[0],
             extra_data: alloy_primitives::Bytes::new(),
         };
-        
+
         // Create a mock chain spec for testing
         use crate::chainspec::{bsc_testnet, BscChainSpec};
         let chain_spec = BscChainSpec::from(bsc_testnet());
-        
+
         // This should not panic due to division by zero
         let result = snapshot.apply(
             validators[0],
@@ -546,11 +628,14 @@ mod tests {
             None,   // turn_length
             &chain_spec,
         );
-        
+
         assert!(result.is_some(), "Apply should succeed without division by zero");
         let new_snapshot = result.unwrap();
         assert_eq!(new_snapshot.block_number, 1);
-        assert_ne!(new_snapshot.epoch_num, 0, "Applied snapshot should maintain non-zero epoch_num");
+        assert_ne!(
+            new_snapshot.epoch_num, 0,
+            "Applied snapshot should maintain non-zero epoch_num"
+        );
     }
 
     #[test]
@@ -560,11 +645,12 @@ mod tests {
             address!("0x1234567890123456789012345678901234567890"),
             address!("0x2345678901234567890123456789012345678901"),
         ];
-        let block_hash = b256!("0x1234567890123456789012345678901234567890123456789012345678901234");
-        
+        let block_hash =
+            b256!("0x1234567890123456789012345678901234567890123456789012345678901234");
+
         // Create snapshot with epoch_num = 0 (should be fixed)
         let snapshot = Snapshot::new(validators.clone(), 0, block_hash, 0, None);
-        
+
         // This should not panic
         let inturn = snapshot.inturn_validator();
         assert!(validators.contains(&inturn), "Should return a valid validator");
@@ -577,12 +663,13 @@ mod tests {
             address!("0x1234567890123456789012345678901234567890"),
             address!("0x2345678901234567890123456789012345678901"),
         ];
-        let block_hash = b256!("0x1234567890123456789012345678901234567890123456789012345678901234");
-        
+        let block_hash =
+            b256!("0x1234567890123456789012345678901234567890123456789012345678901234");
+
         let snapshot = Snapshot::new(validators.clone(), 0, block_hash, 0, None);
-        
+
         // This should not panic and should return a reasonable value
         let check_len = snapshot.miner_history_check_len();
         assert!(check_len > 0, "Check length should be positive");
     }
-} 
+}

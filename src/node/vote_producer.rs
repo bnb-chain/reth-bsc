@@ -1,17 +1,22 @@
 use std::collections::HashSet;
-use std::sync::{Arc, LazyLock, Mutex, atomic::{AtomicBool, AtomicU64, Ordering}};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc, LazyLock, Mutex,
+};
 
-use alloy_consensus::{Header, BlockHeader};
+use alloy_consensus::{BlockHeader, Header};
 use alloy_primitives::B256;
 
 use crate::chainspec::BscChainSpec;
-use crate::consensus::parlia::{bls_signer, provider::SnapshotProvider, vote::VoteData, votes, VoteAddress};
-use crate::hardforks::BscHardforks;
+use crate::consensus::parlia::constants::K_ANCESTOR_GENERATION_DEPTH;
 use crate::consensus::parlia::util::calculate_millisecond_timestamp;
+use crate::consensus::parlia::{
+    bls_signer, provider::SnapshotProvider, vote::VoteData, votes, VoteAddress,
+};
+use crate::hardforks::BscHardforks;
+use crate::metrics::BscVoteMetrics;
 use crate::node::evm::util::get_cannonical_header_from_cache;
 use crate::node::vote_journal;
-use crate::metrics::BscVoteMetrics;
-use crate::consensus::parlia::constants::K_ANCESTOR_GENERATION_DEPTH;
 
 /// Number of blocks to wait after mining becomes enabled before producing votes.
 /// This mirrors geth's VoteManager warm-up (blocksNumberSinceMining = 40) to avoid
@@ -26,8 +31,9 @@ static PRODUCED_TARGETS: LazyLock<Mutex<schnellru::LruMap<B256, (), schnellru::B
 
 static START_VOTE: AtomicBool = AtomicBool::new(true);
 static BLOCKS_SINCE_MINING: AtomicU64 = AtomicU64::new(0);
-static VOTEADDR_INDEX: LazyLock<Mutex<schnellru::LruMap<B256, HashSet<VoteAddress>, schnellru::ByLength>>> =
-    LazyLock::new(|| Mutex::new(schnellru::LruMap::new(schnellru::ByLength::new(1024))));
+static VOTEADDR_INDEX: LazyLock<
+    Mutex<schnellru::LruMap<B256, HashSet<VoteAddress>, schnellru::ByLength>>,
+> = LazyLock::new(|| Mutex::new(schnellru::LruMap::new(schnellru::ByLength::new(1024))));
 static VOTE_METRICS: LazyLock<BscVoteMetrics> = LazyLock::new(BscVoteMetrics::default);
 
 /// Control vote production during sync similar to geth's Start/Done/Failed events.
@@ -202,12 +208,7 @@ pub fn maybe_produce_and_broadcast_for_head(
         return;
     }
 
-    let data = VoteData { 
-        source_number, 
-        source_hash, 
-        target_number, 
-        target_hash 
-    };
+    let data = VoteData { source_number, source_hash, target_number, target_hash };
 
     // Sign and insert/broadcast
     match bls_signer::sign_vote_with_global(data) {

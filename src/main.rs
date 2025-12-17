@@ -95,6 +95,12 @@ pub struct BscCliArgs {
     /// Comma-separated bytes32 NodeIDs to remove in StakeHub (0x-prefixed)
     #[arg(long = "evn.remove-nodeid", value_delimiter = ',')]
     pub evn_remove_nodeids: Vec<String>,
+
+    /// Comma-separated devp2p NodeIDs (enode IDs) to mark as proxyed peers.
+    /// These peers will receive priority block/vote broadcasts.
+    /// Env alternative: `BSC_PROXYED_PEER_IDS` (comma-separated)
+    #[arg(long = "proxyed-peers", value_delimiter = ',')]
+    pub proxyed_peer_ids: Vec<String>,
 }
 
 fn main() -> eyre::Result<()> {
@@ -252,6 +258,47 @@ fn main() -> eyre::Result<()> {
                 tracing::debug!(target: "bsc::init", "EVN is enabled: {}, config: {:?}", evn_enabled, cfg);
                 let _ = reth_bsc::node::network::evn::set_global_evn_config(cfg);
                 if evn_enabled { tracing::info!("EVN features enabled (disable peer tx broadcast)"); }
+            }
+
+            // Collect and parse proxyed peer IDs from CLI/env
+            let proxyed_peer_ids = {
+                let peers_from_env = std::env::var("BSC_PROXYED_PEER_IDS")
+                    .ok()
+                    .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect::<Vec<_>>())
+                    .unwrap_or_default();
+                let mut peer_ids_str = peers_from_env;
+                peer_ids_str.extend(args.proxyed_peer_ids.iter().cloned());
+                
+                let mut parsed_peer_ids = Vec::new();
+                for peer_id_str in peer_ids_str {
+                    // Parse as 64-character hex PeerId (64 bytes total)
+                    let peer_id_str = peer_id_str.trim();
+                    if peer_id_str.is_empty() { continue; }
+                    
+                    let hex = peer_id_str.strip_prefix("0x").unwrap_or(peer_id_str);
+                    match alloy_primitives::hex::decode(hex) {
+                        Ok(bytes) if bytes.len() == 64 => {
+                            let mut arr = [0u8; 64];
+                            arr.copy_from_slice(&bytes);
+                            let peer_id = reth_network_api::PeerId::from(alloy_primitives::FixedBytes::<64>::from(arr));
+                            parsed_peer_ids.push(peer_id);
+                        }
+                        Ok(_) => tracing::warn!("Invalid proxyed peer ID length (need 64 bytes): {}", peer_id_str),
+                        Err(e) => tracing::warn!("Failed to parse proxyed peer ID '{}': {}", peer_id_str, e),
+                    }
+                }
+                
+                if !parsed_peer_ids.is_empty() {
+                    tracing::info!(target: "bsc::init", "Configured {} proxyed peer(s)", parsed_peer_ids.len());
+                }
+                parsed_peer_ids
+            };
+
+            // Store proxyed peer IDs for later use in network configuration
+            if !proxyed_peer_ids.is_empty() {
+                if let Err(e) = reth_bsc::shared::set_proxyed_peer_ids(proxyed_peer_ids) {
+                    tracing::warn!(target: "bsc::init", "Failed to set proxyed peer IDs: {:?}", e);
+                }
             }
 
             let (node, engine_handle_tx) = BscNode::new();
