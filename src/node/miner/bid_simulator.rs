@@ -408,8 +408,9 @@ where
                 return;
             }
         };
-        let block_gas_limit: u64 =
+        let mut block_gas_limit: u64 =
             builder.evm_mut().block().gas_limit.saturating_sub(system_txs_gas);
+        block_gas_limit = block_gas_limit.saturating_sub(PAY_BID_TX_GAS_LIMIT);
 
         // todo: prefetch transactions
         if let Err(e) = builder.apply_pre_execution_changes().map_err(PayloadBuilderError::other) {
@@ -483,6 +484,7 @@ where
 
         // Second commit: pay bid transaction (gas limit already includes space for this)
         if let Some(pay_bid_tx) = pay_bid_tx {
+            block_gas_limit = block_gas_limit.saturating_add(PAY_BID_TX_GAS_LIMIT);
             let pay_bid_txs = vec![pay_bid_tx];
             if let Err(e) =
                 bid_runtime.commit_transaction(pay_bid_txs, &mut builder, block_gas_limit)
@@ -859,9 +861,15 @@ where
                 }
             }
         }
-        let best_tx_list = self.pool.best_transactions_with_attributes(
-            BestTransactionsAttributes::new(base_fee, blob_fee.map(|fee| fee as u64)),
-        );
+        debug!("fill_tx_from_pool: base_fee={}", base_fee);
+        let best_tx_list: Vec<_> = self
+            .pool
+            .best_transactions_with_attributes(BestTransactionsAttributes::new(
+                base_fee,
+                blob_fee.map(|fee| fee as u64),
+            ))
+            .collect();
+        debug!("fill_tx_from_pool: best_tx_list.len={}", best_tx_list.len());
 
         let bid_tx_hashes: std::collections::HashSet<B256> =
             bid_txs.iter().map(|tx| *tx.hash()).collect();
@@ -887,6 +895,7 @@ where
 
         let pending_txs: Vec<reth_primitives_traits::Recovered<TransactionSigned>> =
             sender_txs_map.into_values().flatten().map(|pool_tx| pool_tx.to_consensus()).collect();
+        debug!("fill_tx_from_pool: pending_txs.len={}", pending_txs.len());
 
         let result = self.commit_transaction_recovered(pending_txs, builder, block_gas_limit, true);
         if let Err(e) = result {
