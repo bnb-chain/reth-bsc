@@ -363,10 +363,10 @@ where
 
         let result_and_state = self.evm.transact(tx_env).map_err(BlockExecutionError::other)?;
         let ResultAndState { result, state } = result_and_state;
-        // Remove SYSTEM_ADDRESS from hook updates (legacy behavior).
-        let mut temp_state = state.clone();
-        temp_state.remove(&SYSTEM_ADDRESS);
-        self.system_caller.on_state(StateChangeSource::Transaction(self.receipts.len()), &temp_state);
+        // Forward full state changes to the state hook.
+        //
+        // PayloadProcessor relies on these updates to compute the correct post-state root.
+        self.system_caller.on_state(StateChangeSource::Transaction(self.receipts.len()), &state);
 
         let gas_used = result.gas_used();
         self.gas_used += gas_used;
@@ -415,6 +415,13 @@ where
             .db_mut()
             .increment_balances(balance_increment)
             .map_err(BlockExecutionError::other)?;
+
+        // These balance movements are applied directly (not via `evm.transact`), so we must emit
+        // them to the optional state hook for the background PayloadProcessor comparison.
+        self.emit_state_hook_for_accounts(
+            StateChangeSource::Transaction(self.receipts.len()),
+            [SYSTEM_ADDRESS, validator],
+        )?;
 
         let system_reward_balance = self
             .evm

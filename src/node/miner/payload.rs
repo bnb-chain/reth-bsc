@@ -232,6 +232,7 @@ where
             .sealed_header(db_last)
             .map_err(PayloadBuilderError::other)?
             .ok_or_else(|| PayloadBuilderError::other(std::io::Error::other("db tip missing")))?;
+
         let consistent_view =
             reth_provider::providers::ConsistentDbView::new(self.client.clone(), Some((db_tip.hash(), db_last)));
         // Build trie input for the parent state (DB + overlays up to parent).
@@ -239,6 +240,13 @@ where
         // then we skip starting payload_processor (comparison only; does not affect sealing).
         let mut trie_input = reth_trie::TrieInput::default();
         let mut can_start_payload_processor = true;
+        // If the DB tip is exactly at the parent height but points to a different hash, then the
+        // parent block we're building on is not the DB's canonical tip. In that case we cannot
+        // build a consistent view for `parent_hash` (ConsistentDbView requires tip hash == sealed_header(number)),
+        // so skip starting payload_processor (comparison only).
+        if db_last == parent_number && db_tip.hash() != parent_hash {
+            can_start_payload_processor = false;
+        }
         if db_last < parent_number {
             if let Some(cache) = trie_overlay_cache() {
                 let needed_range = (db_last + 1)..=parent_number;

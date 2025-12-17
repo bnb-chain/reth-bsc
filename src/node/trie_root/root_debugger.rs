@@ -515,6 +515,19 @@ impl RootDebugger {
             .map_err(BlockExecutionError::other)?
             .ok_or_else(|| BlockExecutionError::other(std::io::Error::other("db tip missing")))?;
 
+        // If the DB tip is exactly at the parent height but points to a different hash, then the
+        // parent block we're building on is not the DB's canonical tip. In that case we cannot
+        // build a consistent view for `parent_hash` (ConsistentDbView requires the tip hash to
+        // match `sealed_header(number)`), so any parallel computation would be meaningless.
+        if db_last == parent_number && db_tip.hash() != parent_hash {
+            return Err(BlockExecutionError::other(std::io::Error::other(format!(
+                "db tip hash mismatch at parent height: db_tip_hash={:?} parent_hash={:?} number={}",
+                db_tip.hash(),
+                parent_hash,
+                parent_number
+            ))));
+        }
+
         let consistent_view = ConsistentDbView::new(provider_factory.clone(), Some((db_tip.hash(), db_last)));
 
         let mut trie_input = TrieInput::default();

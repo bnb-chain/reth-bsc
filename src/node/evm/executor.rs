@@ -1,6 +1,5 @@
 use super::patch::HertzPatchManager;
 use crate::{
-    consensus::SYSTEM_ADDRESS,
     consensus::{parlia::{Parlia, Snapshot, VoteAddress}}, evm::transaction::BscTxEnv, hardforks::BscHardforks, metrics::{BscBlockchainMetrics, BscConsensusMetrics, BscExecutorMetrics, BscRewardsMetrics, BscVoteMetrics}, node::evm::config::BscExecutionSharedCtx, system_contracts::{
         SystemContract, feynman_fork::ValidatorElectionInfo, get_upgrade_system_contracts, is_system_transaction
     }
@@ -26,7 +25,8 @@ use revm::{
         result::{ExecutionResult, ResultAndState},
 
     },
-    state::Bytecode,
+    state::{Account as RevmAccount, Bytecode, EvmState},
+    Database as RevmDatabase,
     DatabaseCommit,
 };
 use tracing::{error, warn, info, debug, trace};
@@ -106,6 +106,42 @@ where
     BscTxEnv: IntoTxEnv<<EVM as alloy_evm::Evm>::Tx>,
     R::Transaction: Into<TransactionSigned>,
 {
+    /// Emit an artificial state update to the installed state hook for accounts whose state was
+    /// mutated outside of `evm.transact(...)` (e.g. via `apply_transition`, `increment_balances`).
+    ///
+    /// This is required for the background `PayloadProcessor` comparison, which only observes
+    /// state updates via the hook.
+    pub(crate) fn emit_state_hook_for_accounts(
+        &mut self,
+        source: StateChangeSource,
+        accounts: impl IntoIterator<Item = Address>,
+    ) -> Result<(), BlockExecutionError> {
+        let tx_id = match source {
+            StateChangeSource::Transaction(i) => i,
+            _ => 0,
+        };
+
+        let mut updates: EvmState = EvmState::default();
+        for address in accounts {
+            let info = self
+                .evm
+                .db_mut()
+                .basic(address)
+                .map_err(BlockExecutionError::other)?
+                .unwrap_or_default();
+            let mut account = RevmAccount::default();
+            account.info = info;
+            account.transaction_id = tx_id;
+            account.mark_touch();
+            updates.insert(address, account);
+        }
+
+        if !updates.is_empty() {
+            self.system_caller.on_state(source, &updates);
+        }
+        Ok(())
+    }
+
     /// Creates a new BscBlockExecutor.
     pub(crate) fn new(
         evm: EVM,
@@ -270,6 +306,8 @@ where
 
         let transition = account.change(info, Default::default());
         self.evm.db_mut().apply_transition(vec![(address, transition)]);
+        // Notify payload_processor hook about this direct state mutation.
+        self.emit_state_hook_for_accounts(StateChangeSource::Transaction(self.receipts.len()), [address])?;
         Ok(())
     }
 
@@ -311,6 +349,11 @@ where
 
         let transition = account.change(new_info, Default::default());
         self.evm.db_mut().apply_transition(vec![(HISTORY_STORAGE_ADDRESS, transition)]);
+        // Notify payload_processor hook about this direct state mutation.
+        self.emit_state_hook_for_accounts(
+            StateChangeSource::Transaction(self.receipts.len()),
+            [HISTORY_STORAGE_ADDRESS],
+        )?;
         
         info!(
             target: "bsc::executor::prague",
@@ -418,11 +461,11 @@ where
             return Ok(None);
         }
 
-        // Remove SYSTEM_ADDRESS from hook updates (legacy behavior).
-        let mut temp_state = state.clone();
-        temp_state.remove(&SYSTEM_ADDRESS);
+        // Forward full state changes to the state hook.
+        //
+        // PayloadProcessor relies on these updates to compute the correct post-state root.
         self.system_caller
-            .on_state(StateChangeSource::Transaction(self.receipts.len()), &temp_state);
+            .on_state(StateChangeSource::Transaction(self.receipts.len()), &state);
 
         let gas_used = result.gas_used();
 
@@ -476,10 +519,10 @@ where
 
         f(&result);
 
-        // Remove SYSTEM_ADDRESS from hook updates (legacy behavior).
-        let mut temp_state = state.clone();
-        temp_state.remove(&SYSTEM_ADDRESS);
-        self.system_caller.on_state(StateChangeSource::Transaction(self.receipts.len()), &temp_state);
+        // Forward full state changes to the state hook.
+        //
+        // PayloadProcessor relies on these updates to compute the correct post-state root.
+        self.system_caller.on_state(StateChangeSource::Transaction(self.receipts.len()), &state);
 
         let gas_used = result.gas_used();
         self.gas_used += gas_used;
