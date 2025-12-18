@@ -838,6 +838,11 @@ where
         use once_cell::sync::Lazy;
         static VOTE_METRICS: Lazy<BscVoteMetrics> = Lazy::new(BscVoteMetrics::default);
         VOTE_METRICS.votes_attested_total.increment(votes.len() as u64);
+        debug!(
+            "Succeed to assemble vote attestation, votes={}, attestation={:?}",
+            votes.len(),
+            attestation
+        );
 
         Ok(())
     }

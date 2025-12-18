@@ -1,6 +1,9 @@
 pub mod error;
 pub mod util;
 
+#[cfg(test)]
+mod pre_execution_tests;
+
 use crate::{
     evm::{
         api::{BscContext, BscEvm},
@@ -29,10 +32,10 @@ mod builder;
 pub mod config;
 pub use config::BscEvmConfig;
 mod executor;
-pub mod pre_execution;
-mod post_execution;
 mod factory;
 mod patch;
+mod post_execution;
+pub mod pre_execution;
 
 impl<DB, I> Evm for BscEvm<DB, I>
 where
@@ -71,7 +74,7 @@ where
                 if tx.base.caller == self.block.beneficiary
                     && is_invoke_system_contract(&to)
                     && tx.base.gas_price == 0);
-            
+
             // Increase beneficiary balance for system transactions in trace context
             // Only runs when trace=true (CacheDB detected or explicit inspector used)
             if tx.is_system_transaction {
@@ -95,11 +98,7 @@ where
         };
 
         // Execute transaction
-        let res = if self.inspect {
-            self.inspect_tx(tx)
-        } else {
-            ExecuteEvm::transact(self, tx)
-        };
+        let res = if self.inspect { self.inspect_tx(tx) } else { ExecuteEvm::transact(self, tx) };
 
         // Restore environment for system transactions
         if let Some((gas_limit, basefee, disable_nonce_check)) = saved_env {
@@ -153,7 +152,12 @@ pub struct BscExecutorBuilder;
 impl<Node> ExecutorBuilder<Node> for BscExecutorBuilder
 where
     Node: FullNodeTypes,
-    Node::Types: NodeTypes<Primitives = crate::node::primitives::BscPrimitives, ChainSpec = crate::chainspec::BscChainSpec, Payload = crate::node::engine_api::payload::BscPayloadTypes, Storage = crate::node::storage::BscStorage>,
+    Node::Types: NodeTypes<
+        Primitives = crate::node::primitives::BscPrimitives,
+        ChainSpec = crate::chainspec::BscChainSpec,
+        Payload = crate::node::engine_api::payload::BscPayloadTypes,
+        Storage = crate::node::storage::BscStorage,
+    >,
 {
     type EVM = BscEvmConfig;
 
