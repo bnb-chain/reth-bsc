@@ -68,6 +68,8 @@ static IMPORTED_BLOCKS_TX: OnceLock<broadcast::Sender<B256>> = OnceLock::new();
 
 /// Global MEV running status
 static MEV_RUNNING: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+/// Global proxyed peer IDs list
+static PROXYED_PEER_IDS: OnceLock<Vec<PeerId>> = OnceLock::new();
 
 /// Set global imported blocks broadcast sender.
 pub fn set_imported_blocks_tx(tx: broadcast::Sender<B256>) -> Result<(), broadcast::Sender<B256>> {
@@ -77,6 +79,16 @@ pub fn set_imported_blocks_tx(tx: broadcast::Sender<B256>) -> Result<(), broadca
 /// Get global imported blocks broadcast sender if initialized.
 pub fn get_imported_blocks_tx() -> Option<&'static broadcast::Sender<B256>> {
     IMPORTED_BLOCKS_TX.get()
+}
+
+/// Set global proxyed peer IDs.
+pub fn set_proxyed_peer_ids(peer_ids: Vec<PeerId>) -> Result<(), Vec<PeerId>> {
+    PROXYED_PEER_IDS.set(peer_ids)
+}
+
+/// Get global proxyed peer IDs if initialized.
+pub fn get_proxyed_peer_ids() -> Option<&'static Vec<PeerId>> {
+    PROXYED_PEER_IDS.get()
 }
 
 /// Trait for fork choice engine operations that can be stored globally
