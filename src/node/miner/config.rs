@@ -75,7 +75,7 @@ impl Default for MiningConfig {
             submit_built_payload: false,
             greedy_merge: true,
             // MEV defaults
-            validator_commission: Some(400),    // 4%
+            validator_commission: Some(100),    // 1%
             bid_simulation_left_over: Some(50), // 50ms
             no_interrupt_left_over: Some(500),  // 500ms
             max_bids_per_builder: Some(3),
@@ -134,7 +134,7 @@ impl MiningConfig {
 
     /// Get validator commission rate (in basis points, 100 = 1%)
     pub fn get_validator_commission(&self) -> u64 {
-        self.validator_commission.unwrap_or(400) // Default: 4%
+        self.validator_commission.unwrap_or(100) // Default: 1%
     }
 
     /// Get bid simulation left over time in milliseconds
@@ -182,7 +182,7 @@ impl MiningConfig {
                 min_gas_tip: Some(DEFAULT_MIN_GAS_TIP),
                 submit_built_payload: false,
                 // Use default MEV parameters
-                validator_commission: Some(400),
+                validator_commission: Some(100),
                 bid_simulation_left_over: Some(50),
                 no_interrupt_left_over: Some(500),
                 max_bids_per_builder: Some(3),
