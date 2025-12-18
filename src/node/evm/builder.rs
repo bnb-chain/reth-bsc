@@ -9,8 +9,9 @@ use revm::database::{State, states::bundle_state::BundleRetention};
 use alloy_evm::{Evm, block::BlockExecutor};
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
 use crate::node::trie_root::{
-    insert_payload_processor_hook_drop, payload_processor_was_started,
-    wait_take_payload_processor_state_root_blocking, PayloadProcessorKey, RootDebugger,
+    current_payload_build_attempt, current_payload_build_trace_id,
+    insert_payload_processor_hook_drop, take_payload_processor_started,
+    wait_take_payload_processor_state_root, PayloadProcessorKey, RootDebugger,
     StateRootCompareState,
 };
 use parking_lot::Mutex;
@@ -158,10 +159,19 @@ where
         state: impl StateProvider,
     ) -> Result<BlockBuilderOutcome<BscPrimitives>, BlockExecutionError> {
         let finish_start = std::time::Instant::now();
+        // Build-attempt key used to correlate payload_processor/parallel results.
+        //
+        // Miner may build multiple candidate payloads under the same parent; using only parent
+        // would cause cross-attempt overwrites in global caches.
+        //
+        // IMPORTANT: must be captured before `executor.finish()` consumes the executor.
+        let trace_id = current_payload_build_trace_id().unwrap_or(0);
+        let attempt = current_payload_build_attempt().unwrap_or(0);
+        let key = PayloadProcessorKey::new(self.parent.number, self.parent.hash(), trace_id, attempt);
         let (evm, result) = self.executor.finish()?;
         // `executor.finish()` executes system transactions and then drops the executor (and its
         // state hook sender) on return. Record the time right after system tx execution completes.
-        insert_payload_processor_hook_drop(PayloadProcessorKey::new(self.parent.number, self.parent.hash()), std::time::Instant::now());
+        insert_payload_processor_hook_drop(key, std::time::Instant::now());
         // NOTE: `executor.finish()` consumes the executor and runs system transactions.
         // This ensures any installed state hook (e.g. payload_processor) sees user txs + system txs,
         // and will be dropped automatically after `finish()` returns.
@@ -174,14 +184,28 @@ where
         // calculate the state root
         let state_root_start = std::time::Instant::now();
         let hashed_state = state.hashed_post_state(&db.bundle_state);
-        let key = PayloadProcessorKey::new(self.parent.number, self.parent.hash());
 
         // 1) If payload_processor was started, wait for its sparse trie result (authoritative).
         // 2) Otherwise, fall back to the legacy serial state-root calculation.
-        let state_root_source = if payload_processor_was_started(key) { "payload_processor" } else { "serial" };
+        //
+        // NOTE: This consumes the "started" marker to avoid unbounded growth and to reduce races.
+        let mut state_root_source =
+            if take_payload_processor_started(key) { "payload_processor" } else { "serial" };
         let (state_root, trie_updates) = if state_root_source == "payload_processor" {
-            let pp_res = wait_take_payload_processor_state_root_blocking(key);
-            (pp_res.state_root, pp_res.trie_updates)
+            // payload_processor runs on a background thread; don't wait forever if it failed.
+            if let Some(pp_res) = wait_take_payload_processor_state_root(key, std::time::Duration::from_secs(10)) {
+                (pp_res.state_root, pp_res.trie_updates)
+            } else {
+                tracing::debug!(
+                    target: "bsc::builder",
+                    trace_id,
+                    parent_number = self.parent.number,
+                    parent_hash = ?self.parent.hash(),
+                    "PayloadProcessor state root unavailable (timeout/failed); falling back to serial"
+                );
+                state_root_source = "serial_fallback";
+                state.state_root_with_updates(hashed_state.clone()).map_err(BlockExecutionError::other)?
+            }
         } else {
             state.state_root_with_updates(hashed_state.clone()).map_err(BlockExecutionError::other)?
         };
@@ -225,6 +249,8 @@ where
         let finish_duration = finish_start.elapsed();
         tracing::debug!(
             target: "bsc::builder",
+            trace_id,
+            attempt,
             block_number = %block.header.number,
             block_hash = %block.header.hash_slow(),
             user_tx_len = user_tx_len,
@@ -305,10 +331,19 @@ where
         state: impl StateProvider,
     ) -> Result<BlockBuilderOutcome<BscPrimitives>, BlockExecutionError> {
         let finish_start = std::time::Instant::now();
+        // Build-attempt key used to correlate payload_processor/parallel results.
+        //
+        // Miner may build multiple candidate payloads under the same parent; using only parent
+        // would cause cross-attempt overwrites in global caches.
+        //
+        // IMPORTANT: must be captured before `executor.finish()` consumes the executor.
+        let trace_id = current_payload_build_trace_id().unwrap_or(0);
+        let attempt = current_payload_build_attempt().unwrap_or(0);
+        let key = PayloadProcessorKey::new(self.parent.number, self.parent.hash(), trace_id, attempt);
         let (evm, result) = self.executor.finish()?;
         // `executor.finish()` executes system transactions and then drops the executor (and its
         // state hook sender) on return. Record the time right after system tx execution completes.
-        insert_payload_processor_hook_drop(PayloadProcessorKey::new(self.parent.number, self.parent.hash()), std::time::Instant::now());
+        insert_payload_processor_hook_drop(key, std::time::Instant::now());
         let (db, evm_env) = evm.finish();
 
         let assembled_system_txs = self.shared_ctx.inner.borrow().assembled_system_txs.clone();
@@ -336,25 +371,37 @@ where
         // (Background) run ParallelStateRoot for comparison.
         RootDebugger::spawn_parallel_state_root_compare(
             self.provider_factory.clone(),
-            self.parent.number,
-            self.parent.hash(),
+            key,
             hashed_state.clone(),
         );
         // (Background) log Serial vs Parallel vs PayloadProcessor once all results are available.
         RootDebugger::spawn_triple_compare(
-            self.parent.number,
-            self.parent.hash(),
+            key,
             hashed_state.clone(),
             compare_state.clone(),
         );
 
         // Prefer payload_processor's sparse trie root if it was started for this payload build.
         // Otherwise fall back to serial state_root_with_updates.
-        let key = PayloadProcessorKey::new(self.parent.number, self.parent.hash());
-        let state_root_source = if payload_processor_was_started(key) { "payload_processor" } else { "serial" };
+        // NOTE: consume the started marker (see root_debugger.rs).
+        let mut state_root_source =
+            if take_payload_processor_started(key) { "payload_processor" } else { "serial" };
         let (state_root, trie_updates) = if state_root_source == "payload_processor" {
-            let pp_res = wait_take_payload_processor_state_root_blocking(key);
-            (pp_res.state_root, pp_res.trie_updates)
+            if let Some(pp_res) = wait_take_payload_processor_state_root(key, std::time::Duration::from_secs(10)) {
+                (pp_res.state_root, pp_res.trie_updates)
+            } else {
+                tracing::debug!(
+                    target: "bsc::builder",
+                    trace_id,
+                    parent_number = self.parent.number,
+                    parent_hash = ?self.parent.hash(),
+                    "PayloadProcessor state root unavailable (timeout/failed); falling back to serial"
+                );
+                state_root_source = "serial_fallback";
+                state
+                    .state_root_with_updates(hashed_state.clone())
+                    .map_err(BlockExecutionError::other)?
+            }
         } else {
             state
                 .state_root_with_updates(hashed_state.clone())
@@ -407,6 +454,8 @@ where
         let finish_duration = finish_start.elapsed();
         tracing::debug!(
             target: "bsc::builder",
+            trace_id,
+            attempt,
             block_number = %block.header.number,
             block_hash = %block_hash,
             user_tx_len = user_tx_len,

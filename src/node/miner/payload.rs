@@ -8,7 +8,10 @@ use crate::node::miner::bid_simulator::BidSimulator;
 use crate::node::miner::bsc_miner::{MiningContext, SubmitContext};
 use crate::node::pool::BlacklistedAddressError;
 use crate::node::trie_root::{
-    insert_payload_processor_state_root, mark_payload_processor_started, take_payload_processor_hook_drop,
+    insert_payload_processor_state_root, insert_payload_processor_state_root_error, mark_payload_processor_started, payload_build_trace_id_scope,
+    current_payload_build_attempt,
+    payload_build_attempt_scope,
+    take_payload_processor_hook_drop,
     PayloadProcessorKey, PayloadProcessorStateRootResult,
 };
 use alloy_evm::block::BlockExecutor;
@@ -181,6 +184,11 @@ where
     /// 
     /// Returns a `Result` containing the built payload or an error.
     pub async fn build_payload(&self, args: BscBuildArguments<EthPayloadBuilderAttributes>) -> Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>> {
+        // NOTE: payload building is async and may hop threads; use task-local trace_id so the
+        // synchronous `builder.finish()` can still disambiguate per-attempt root computation.
+        let trace_id_scope = args.trace_id;
+        payload_build_trace_id_scope(trace_id_scope, async move {
+        (|| -> Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>> {
         let build_start = std::time::Instant::now();
         let BscBuildArguments { mut cached_reads, config, cancel, trace_id, min_gas_tip } = args;
         let PayloadConfig { parent_header, attributes } = config;
@@ -209,7 +217,8 @@ where
         // prewarm task) and only use the state update stream via the state_hook.
         let parent_number = parent_header.number();
         let parent_hash = parent_header.hash_slow();
-        let key = PayloadProcessorKey::new(parent_number, parent_hash);
+        let attempt = current_payload_build_attempt().unwrap_or(0);
+        let key = PayloadProcessorKey::new(parent_number, parent_hash, trace_id, attempt);
 
         // Provide an empty tx iterator because we don't want PayloadProcessor to execute txs
         // itself; we only stream state updates from our own executor.
@@ -326,6 +335,7 @@ where
                         );
                         tracing::debug!(
                             target: "bsc::builder",
+                            trace_id,
                             parent_number,
                             parent_hash = ?parent_hash,
                             state_root = ?outcome.state_root,
@@ -335,8 +345,10 @@ where
                         );
                     }
                     Err(err) => {
+                        insert_payload_processor_state_root_error(key, err.to_string());
                         tracing::debug!(
                             target: "bsc::builder",
+                            trace_id,
                             parent_number,
                             parent_hash = ?parent_hash,
                             %err,
@@ -348,6 +360,7 @@ where
         } else {
             tracing::debug!(
                 target: "bsc::builder",
+                trace_id,
                 parent_number,
                 parent_hash = ?parent_hash,
                 db_last,
@@ -727,6 +740,8 @@ where
             executed_trie: Some(ExecutedTrieUpdates::Present(Arc::new(trie_updates))),
         };
         Ok(payload)
+        })()
+        }).await
     }
 
     /// Build an empty payload without any user transactions from the pool
@@ -1006,8 +1021,11 @@ where
                             
                             let builder = self.builder.clone();
                             let build_args = self.build_args.clone();
+                            let attempt = self.retries;
                             self.join_handle.spawn(async move {
-                                builder.build_payload(build_args).await
+                                payload_build_attempt_scope(attempt, async move {
+                                    builder.build_payload(build_args).await
+                                }).await
                             });
                         }
                         None => {

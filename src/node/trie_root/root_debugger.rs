@@ -12,8 +12,60 @@ use reth_trie::{
 use reth_trie::updates::TrieUpdates;
 use reth_trie_parallel::root::ParallelStateRoot;
 use parking_lot::{Condvar, Mutex};
-use std::{collections::{HashMap, HashSet}, sync::{Arc, OnceLock}, time::{Duration, Instant}};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, OnceLock},
+    time::{Duration, Instant},
+};
 use tokio::sync::broadcast;
+
+tokio::task_local! {
+    /// Current payload build attempt id for this async task.
+    ///
+    /// This must be task-local (not thread-local) because payload building is async and may hop
+    /// across runtime worker threads between `.await` points.
+    static CURRENT_PAYLOAD_TRACE_ID: u64;
+}
+
+tokio::task_local! {
+    /// Current payload build attempt counter for this async task.
+    ///
+    /// `trace_id` identifies a *payload job*, but the miner may run multiple build attempts (retries)
+    /// under the same `trace_id`. This disambiguates those attempts.
+    static CURRENT_PAYLOAD_ATTEMPT: u32;
+}
+
+/// Runs `fut` inside a task-local scope where [`current_payload_build_trace_id`] returns `trace_id`.
+pub fn payload_build_trace_id_scope<Fut>(
+    trace_id: u64,
+    fut: Fut,
+) -> impl std::future::Future<Output = Fut::Output>
+where
+    Fut: std::future::Future,
+{
+    CURRENT_PAYLOAD_TRACE_ID.scope(trace_id, fut)
+}
+
+/// Runs `fut` inside a task-local scope where [`current_payload_build_attempt`] returns `attempt`.
+pub fn payload_build_attempt_scope<Fut>(
+    attempt: u32,
+    fut: Fut,
+) -> impl std::future::Future<Output = Fut::Output>
+where
+    Fut: std::future::Future,
+{
+    CURRENT_PAYLOAD_ATTEMPT.scope(attempt, fut)
+}
+
+/// Returns the "current payload build trace_id" for this async task (if set).
+pub fn current_payload_build_trace_id() -> Option<u64> {
+    CURRENT_PAYLOAD_TRACE_ID.try_with(|c| *c).ok()
+}
+
+/// Returns the "current payload build attempt" for this async task (if set).
+pub fn current_payload_build_attempt() -> Option<u32> {
+    CURRENT_PAYLOAD_ATTEMPT.try_with(|c| *c).ok()
+}
 
 /// Trie root accelerator facade.
 ///
@@ -27,11 +79,37 @@ pub struct RootDebugger;
 pub struct PayloadProcessorKey {
     parent_number: u64,
     parent_hash: B256,
+    /// Uniquely identifies a single payload build attempt under the same parent.
+    ///
+    /// Miner can retry payload building multiple times for the same `(parent_number, parent_hash)`
+    /// (different tx set -> different `block_hash`). If we key only by parent, background results
+    /// (payload_processor/parallel) will overwrite each other and cause false mismatches.
+    trace_id: u64,
+    /// Build attempt counter under the same `trace_id`.
+    ///
+    /// `BscPayloadJob` may spawn multiple `build_payload()` runs with the same `trace_id`.
+    attempt: u32,
 }
 
 impl PayloadProcessorKey {
-    pub const fn new(parent_number: u64, parent_hash: B256) -> Self {
-        Self { parent_number, parent_hash }
+    pub const fn new(parent_number: u64, parent_hash: B256, trace_id: u64, attempt: u32) -> Self {
+        Self { parent_number, parent_hash, trace_id, attempt }
+    }
+
+    pub const fn parent_number(&self) -> u64 {
+        self.parent_number
+    }
+
+    pub const fn parent_hash(&self) -> B256 {
+        self.parent_hash
+    }
+
+    pub const fn trace_id(&self) -> u64 {
+        self.trace_id
+    }
+
+    pub const fn attempt(&self) -> u32 {
+        self.attempt
     }
 }
 
@@ -50,12 +128,21 @@ pub struct PayloadProcessorStateRootResult {
 }
 
 #[derive(Debug, Clone)]
+struct PayloadProcessorStateRootEntry {
+    value: Result<PayloadProcessorStateRootResult, String>,
+    /// How many consumers still need to read this result.
+    ///
+    /// We use 2 consumers: block builder (authoritative selection) + comparer (logging).
+    remaining_consumers: u8,
+}
+
+#[derive(Debug, Clone)]
 struct ParallelStateRootResult {
-    pub state_root: B256,
+    pub value: Result<B256, String>,
     pub duration_ms: u128,
 }
 
-static PAYLOAD_PROCESSOR_ROOTS: OnceLock<Mutex<HashMap<PayloadProcessorKey, PayloadProcessorStateRootResult>>> =
+static PAYLOAD_PROCESSOR_ROOTS: OnceLock<Mutex<HashMap<PayloadProcessorKey, PayloadProcessorStateRootEntry>>> =
     OnceLock::new();
 static PAYLOAD_PROCESSOR_ROOTS_CV: OnceLock<Condvar> = OnceLock::new();
 static PAYLOAD_PROCESSOR_STARTED: OnceLock<Mutex<HashSet<PayloadProcessorKey>>> = OnceLock::new();
@@ -64,7 +151,7 @@ static PARALLEL_STATE_ROOTS: OnceLock<Mutex<HashMap<PayloadProcessorKey, Paralle
 static PAYLOAD_PROCESSOR_HOOK_DROPS: OnceLock<Mutex<HashMap<PayloadProcessorKey, Instant>>> =
     OnceLock::new();
 
-fn payload_processor_roots() -> &'static Mutex<HashMap<PayloadProcessorKey, PayloadProcessorStateRootResult>> {
+fn payload_processor_roots() -> &'static Mutex<HashMap<PayloadProcessorKey, PayloadProcessorStateRootEntry>> {
     PAYLOAD_PROCESSOR_ROOTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -97,7 +184,7 @@ pub fn take_payload_processor_hook_drop(key: PayloadProcessorKey) -> Option<Inst
 pub fn take_payload_processor_state_root(
     key: PayloadProcessorKey,
 ) -> Option<PayloadProcessorStateRootResult> {
-    payload_processor_roots().lock().remove(&key)
+    consume_payload_processor_state_root(key)
 }
 
 /// Marks that a payload_processor was started for this key.
@@ -105,9 +192,13 @@ pub fn mark_payload_processor_started(key: PayloadProcessorKey) {
     payload_processor_started().lock().insert(key);
 }
 
-/// Returns true if a payload_processor was started for this key.
-pub fn payload_processor_was_started(key: PayloadProcessorKey) -> bool {
-    payload_processor_started().lock().contains(&key)
+/// Consumes and returns whether a payload_processor was started for this key.
+///
+/// This is designed to be used by the block builder to decide whether it should wait for the
+/// payload_processor result (instead of falling back to serial). Using a take avoids races and
+/// avoids unbounded growth of the started set.
+pub fn take_payload_processor_started(key: PayloadProcessorKey) -> bool {
+    payload_processor_started().lock().remove(&key)
 }
 
 /// Waits (up to `timeout`) for a payload_processor result, and removes it from the internal map.
@@ -118,8 +209,13 @@ pub fn wait_take_payload_processor_state_root(
     let deadline = Instant::now() + timeout;
     let mut guard = payload_processor_roots().lock();
     loop {
-        if let Some(res) = guard.remove(&key) {
-            return Some(res);
+        if let Some(entry) = guard.get_mut(&key) {
+            let res = entry.value.clone().ok();
+            entry.remaining_consumers = entry.remaining_consumers.saturating_sub(1);
+            if entry.remaining_consumers == 0 {
+                guard.remove(&key);
+            }
+            return res;
         }
 
         let now = Instant::now();
@@ -140,10 +236,18 @@ pub fn wait_take_payload_processor_state_root_blocking(
 ) -> PayloadProcessorStateRootResult {
     let mut guard = payload_processor_roots().lock();
     loop {
-        if let Some(res) = guard.remove(&key) {
-            // Once we consumed the result, clear the started marker.
-            payload_processor_started().lock().remove(&key);
-            return res;
+        if let Some(entry) = guard.get_mut(&key) {
+            let res = entry.value.clone().ok();
+            entry.remaining_consumers = entry.remaining_consumers.saturating_sub(1);
+            if entry.remaining_consumers == 0 {
+                guard.remove(&key);
+            }
+            if let Some(res) = res {
+                return res;
+            }
+            // If the payload_processor failed, keep waiting for a successful result.
+            // NOTE: The builder should guard against this by not waiting indefinitely in the
+            // authoritative path (it can fall back to serial).
         }
         payload_processor_roots_cv().wait(&mut guard);
     }
@@ -153,13 +257,33 @@ fn take_parallel_state_root(key: PayloadProcessorKey) -> Option<ParallelStateRoo
     parallel_state_roots().lock().remove(&key)
 }
 
+fn consume_payload_processor_state_root(key: PayloadProcessorKey) -> Option<PayloadProcessorStateRootResult> {
+    let mut guard = payload_processor_roots().lock();
+    let entry = guard.get_mut(&key)?;
+    let res = entry.value.clone().ok();
+    entry.remaining_consumers = entry.remaining_consumers.saturating_sub(1);
+    if entry.remaining_consumers == 0 {
+        guard.remove(&key);
+    }
+    res
+}
+
 pub fn insert_payload_processor_state_root(
     key: PayloadProcessorKey,
     value: PayloadProcessorStateRootResult,
 ) {
-    payload_processor_roots().lock().insert(key, value);
-    // Clear the started marker once the result is available (even if nobody is waiting).
-    payload_processor_started().lock().remove(&key);
+    payload_processor_roots().lock().insert(
+        key,
+        PayloadProcessorStateRootEntry { value: Ok(value), remaining_consumers: 2 },
+    );
+    payload_processor_roots_cv().notify_all();
+}
+
+pub fn insert_payload_processor_state_root_error(key: PayloadProcessorKey, err: String) {
+    payload_processor_roots().lock().insert(
+        key,
+        PayloadProcessorStateRootEntry { value: Err(err), remaining_consumers: 2 },
+    );
     payload_processor_roots_cv().notify_all();
 }
 
@@ -342,8 +466,7 @@ impl RootDebugger {
     /// Spawn a background `ParallelStateRoot` computation (comparison only).
     pub fn spawn_parallel_state_root_compare<Factory>(
         provider_factory: Factory,
-        parent_number: u64,
-        parent_hash: B256,
+        key: PayloadProcessorKey,
         hashed_state: HashedPostState,
     ) where
         Factory: DatabaseProviderFactory<Provider: BlockNumReader + HeaderProvider + BlockReader>
@@ -354,14 +477,24 @@ impl RootDebugger {
     {
         std::thread::spawn(move || {
             let start = std::time::Instant::now();
-            let key = PayloadProcessorKey::new(parent_number, parent_hash);
-            let res = Self::compute_parallel_state_root(provider_factory, parent_number, parent_hash, &hashed_state);
+            let parent_number = key.parent_number();
+            let parent_hash = key.parent_hash();
+            let trace_id = key.trace_id();
+            let attempt = key.attempt();
+            let res = Self::compute_parallel_state_root(
+                provider_factory,
+                parent_number,
+                parent_hash,
+                &hashed_state,
+            );
             match res {
                 Ok(root) => {
                     let duration_ms = start.elapsed().as_millis();
-                    insert_parallel_state_root(key, ParallelStateRootResult { state_root: root, duration_ms });
+                    insert_parallel_state_root(key, ParallelStateRootResult { value: Ok(root), duration_ms });
                     tracing::debug!(
                         target: "bsc::builder",
+                        trace_id,
+                        attempt,
                         parent_number,
                         parent_hash = ?parent_hash,
                         state_root = ?root,
@@ -370,11 +503,16 @@ impl RootDebugger {
                     );
                 }
                 Err(err) => {
+                    let duration_ms = start.elapsed().as_millis();
+                    insert_parallel_state_root(key, ParallelStateRootResult { value: Err(err.to_string()), duration_ms });
                     tracing::debug!(
                         target: "bsc::builder",
+                        trace_id,
+                        attempt,
                         parent_number,
                         parent_hash = ?parent_hash,
                         %err,
+                        duration_ms,
                         "ParallelStateRoot unavailable"
                     );
                 }
@@ -389,8 +527,7 @@ impl RootDebugger {
     /// - PayloadProcessor result is produced during payload building and inserted via
     ///   [`insert_payload_processor_state_root`].
     pub fn spawn_triple_compare(
-        parent_number: u64,
-        parent_hash: B256,
+        key: PayloadProcessorKey,
         hashed_state: HashedPostState,
         compare_state: Arc<Mutex<StateRootCompareState>>,
     ) {
@@ -406,8 +543,10 @@ impl RootDebugger {
             let execution_duration_ms = snapshot.execution_duration_ms;
             let serial_root = snapshot.serial_root;
             let serial_ms = snapshot.serial_duration_ms;
-
-            let key = PayloadProcessorKey::new(parent_number, parent_hash);
+            let parent_number = key.parent_number();
+            let parent_hash = key.parent_hash();
+            let trace_id = key.trace_id();
+            let attempt = key.attempt();
 
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             let mut parallel_res: Option<ParallelStateRootResult> = None;
@@ -435,8 +574,9 @@ impl RootDebugger {
                     .sum::<usize>();
 
             // If we don't have all 3, still log what we have (for debugging).
-            let parallel_root = parallel_res.as_ref().map(|r| r.state_root);
+            let parallel_root = parallel_res.as_ref().and_then(|r| r.value.as_ref().ok().copied());
             let parallel_ms = parallel_res.as_ref().map(|r| r.duration_ms);
+            let parallel_err = parallel_res.as_ref().and_then(|r| r.value.as_ref().err()).map(|s| s.as_str());
             let payload_root = payload_res.as_ref().map(|r| r.state_root);
             let payload_total_ms = payload_res.as_ref().map(|r| r.duration_ms);
             let payload_post_exec_ms = payload_res
@@ -484,6 +624,8 @@ impl RootDebugger {
                 if !all_equal {
                     tracing::error!(
                         target: "bsc::builder",
+                        trace_id,
+                        attempt,
                         block_number = parent_number + 1,
                         block_hash = ?block_hash,
                         user_tx_len = ?user_tx_len,
@@ -508,6 +650,8 @@ impl RootDebugger {
                 } else {
                     tracing::debug!(
                         target: "bsc::builder",
+                        trace_id,
+                        attempt,
                         block_number = parent_number + 1,
                         block_hash = ?block_hash,
                         user_tx_len = ?user_tx_len,
@@ -530,6 +674,8 @@ impl RootDebugger {
             } else {
                 tracing::debug!(
                     target: "bsc::builder",
+                    trace_id,
+                    attempt,
                     block_number = parent_number + 1,
                     block_hash = ?block_hash,
                     user_tx_len = ?user_tx_len,
@@ -542,9 +688,12 @@ impl RootDebugger {
                     serial_state_root_duration_ms = ?serial_ms,
                     parallel_state_root = ?parallel_root,
                     parallel_state_root_duration_ms = ?parallel_ms,
+                    parallel_state_root_err = ?parallel_err,
                     payload_processor_state_root = ?payload_root,
                     payload_processor_state_root_duration_ms_total = ?payload_total_ms,
                     payload_processor_state_root_duration_ms_post_exec = ?payload_post_exec_ms,
+                    missing_parallel = parallel_res.is_none(),
+                    missing_payload_processor = payload_res.is_none(),
                     "State root comparison incomplete (missing parallel/payload_processor result)"
                 );
             }
