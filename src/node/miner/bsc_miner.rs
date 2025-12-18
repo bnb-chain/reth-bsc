@@ -1,4 +1,3 @@
-use crate::node::evm::pre_execution::{TURN_LENGTH_CACHE, VALIDATOR_CACHE};
 use crate::node::miner::bid_simulator::{BidRuntime, BidSimulator};
 use crate::node::miner::payload::BscBuildArguments;
 use crate::node::miner::util::finalize_new_header;
@@ -845,29 +844,6 @@ where
         payload: BscBuiltPayload,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut new_header = payload.block().header().clone();
-        let seal_hash = new_header.hash_slow();
-        let (validators, vote_addresses, validator_cache_hit) =
-            match VALIDATOR_CACHE.lock().unwrap().get(&seal_hash).cloned() {
-                Some(cached) => (cached.0, cached.1, true),
-                None => {
-                    tracing::warn!(
-                        "Validator cache miss for block number: {:?}, using empty validators",
-                        new_header.number
-                    );
-                    (vec![], vec![], false)
-                }
-            };
-        let (turn_length, turn_length_cache_hit) =
-            match TURN_LENGTH_CACHE.lock().unwrap().get(&seal_hash) {
-                Some(cached) => (*cached, true),
-                None => {
-                    tracing::warn!(
-                    "Turn length cache miss for block number: {:?}, using default turn length 0",
-                    new_header.number
-                );
-                    (0, false)
-                }
-            };
         // assmble vote and seal block
         let snapshot_provider = crate::shared::get_snapshot_provider()
             .cloned()
@@ -893,14 +869,6 @@ where
         let block_hash = new_header.hash_slow();
         let block_number = new_header.number;
         let parent_hash = new_header.parent_hash;
-
-        // Only insert back to cache if we successfully retrieved from cache
-        if validator_cache_hit {
-            VALIDATOR_CACHE.lock().unwrap().insert(block_hash, (validators, vote_addresses));
-        }
-        if turn_length_cache_hit {
-            TURN_LENGTH_CACHE.lock().unwrap().insert(block_hash, turn_length);
-        }
 
         let sealed_block = payload.block().clone();
         tracing::debug!(
