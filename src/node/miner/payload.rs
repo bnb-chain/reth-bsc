@@ -8,8 +8,8 @@ use crate::node::miner::bid_simulator::BidSimulator;
 use crate::node::miner::bsc_miner::{MiningContext, SubmitContext};
 use crate::node::pool::BlacklistedAddressError;
 use crate::node::trie_root::{
-    insert_payload_processor_state_root, take_payload_processor_hook_drop, PayloadProcessorKey,
-    PayloadProcessorStateRootResult,
+    insert_payload_processor_state_root, mark_payload_processor_started, take_payload_processor_hook_drop,
+    PayloadProcessorKey, PayloadProcessorStateRootResult,
 };
 use alloy_evm::block::BlockExecutor;
 use reth_provider::{BlockNumReader, HeaderProvider, StateProviderFactory};
@@ -272,6 +272,9 @@ where
         }
 
         if can_start_payload_processor {
+            // Record that payload_processor is started for this parent key so the block builder
+            // can decide whether it should wait for the sparse root or fall back to serial.
+            mark_payload_processor_started(key);
             let mut processor = PayloadProcessor::new(
                 Default::default(),
                 self.evm_config.clone(),
@@ -315,6 +318,8 @@ where
                             key,
                             PayloadProcessorStateRootResult {
                                 state_root: outcome.state_root,
+                                trie_updates: outcome.trie_updates,
+                                completed_at: end,
                                 duration_ms: duration_ms_total,
                                 post_exec_duration_ms: duration_ms_post_exec,
                             },

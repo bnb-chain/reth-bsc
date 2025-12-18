@@ -9,7 +9,11 @@ pub mod trie_overlay;
 
 pub use root_debugger::{
     insert_payload_processor_hook_drop, take_payload_processor_hook_drop,
-    insert_payload_processor_state_root, take_payload_processor_state_root, PayloadProcessorKey,
+    insert_payload_processor_state_root, take_payload_processor_state_root,
+    mark_payload_processor_started, payload_processor_was_started,
+    wait_take_payload_processor_state_root,
+    wait_take_payload_processor_state_root_blocking,
+    PayloadProcessorKey,
     PayloadProcessorStateRootResult, RootDebugger,
     RootDebuggerUpdater,
 };

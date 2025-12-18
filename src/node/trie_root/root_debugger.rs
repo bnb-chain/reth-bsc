@@ -9,9 +9,10 @@ use reth_provider::{
 use reth_trie::{
     HashedPostState, TrieInput,
 };
+use reth_trie::updates::TrieUpdates;
 use reth_trie_parallel::root::ParallelStateRoot;
-use parking_lot::Mutex;
-use std::{collections::HashMap, sync::{Arc, OnceLock}, time::{Duration, Instant}};
+use parking_lot::{Condvar, Mutex};
+use std::{collections::{HashMap, HashSet}, sync::{Arc, OnceLock}, time::{Duration, Instant}};
 use tokio::sync::broadcast;
 
 /// Trie root accelerator facade.
@@ -37,6 +38,8 @@ impl PayloadProcessorKey {
 #[derive(Debug, Clone)]
 pub struct PayloadProcessorStateRootResult {
     pub state_root: B256,
+    pub trie_updates: TrieUpdates,
+    pub completed_at: Instant,
     /// Total wall time from payload_processor start to completion.
     pub duration_ms: u128,
     /// Extra wall time after the hook sender is dropped (i.e. after tx execution completes).
@@ -54,6 +57,8 @@ struct ParallelStateRootResult {
 
 static PAYLOAD_PROCESSOR_ROOTS: OnceLock<Mutex<HashMap<PayloadProcessorKey, PayloadProcessorStateRootResult>>> =
     OnceLock::new();
+static PAYLOAD_PROCESSOR_ROOTS_CV: OnceLock<Condvar> = OnceLock::new();
+static PAYLOAD_PROCESSOR_STARTED: OnceLock<Mutex<HashSet<PayloadProcessorKey>>> = OnceLock::new();
 static PARALLEL_STATE_ROOTS: OnceLock<Mutex<HashMap<PayloadProcessorKey, ParallelStateRootResult>>> =
     OnceLock::new();
 static PAYLOAD_PROCESSOR_HOOK_DROPS: OnceLock<Mutex<HashMap<PayloadProcessorKey, Instant>>> =
@@ -61,6 +66,14 @@ static PAYLOAD_PROCESSOR_HOOK_DROPS: OnceLock<Mutex<HashMap<PayloadProcessorKey,
 
 fn payload_processor_roots() -> &'static Mutex<HashMap<PayloadProcessorKey, PayloadProcessorStateRootResult>> {
     PAYLOAD_PROCESSOR_ROOTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn payload_processor_roots_cv() -> &'static Condvar {
+    PAYLOAD_PROCESSOR_ROOTS_CV.get_or_init(Condvar::new)
+}
+
+fn payload_processor_started() -> &'static Mutex<HashSet<PayloadProcessorKey>> {
+    PAYLOAD_PROCESSOR_STARTED.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
 fn parallel_state_roots() -> &'static Mutex<HashMap<PayloadProcessorKey, ParallelStateRootResult>> {
@@ -87,6 +100,55 @@ pub fn take_payload_processor_state_root(
     payload_processor_roots().lock().remove(&key)
 }
 
+/// Marks that a payload_processor was started for this key.
+pub fn mark_payload_processor_started(key: PayloadProcessorKey) {
+    payload_processor_started().lock().insert(key);
+}
+
+/// Returns true if a payload_processor was started for this key.
+pub fn payload_processor_was_started(key: PayloadProcessorKey) -> bool {
+    payload_processor_started().lock().contains(&key)
+}
+
+/// Waits (up to `timeout`) for a payload_processor result, and removes it from the internal map.
+pub fn wait_take_payload_processor_state_root(
+    key: PayloadProcessorKey,
+    timeout: Duration,
+) -> Option<PayloadProcessorStateRootResult> {
+    let deadline = Instant::now() + timeout;
+    let mut guard = payload_processor_roots().lock();
+    loop {
+        if let Some(res) = guard.remove(&key) {
+            return Some(res);
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            return None;
+        }
+
+        let remaining = deadline - now;
+        let _ = payload_processor_roots_cv().wait_for(&mut guard, remaining);
+    }
+}
+
+/// Waits indefinitely for a payload_processor result, and removes it from the internal map.
+///
+/// Callers should only use this if they have high confidence the payload_processor was started.
+pub fn wait_take_payload_processor_state_root_blocking(
+    key: PayloadProcessorKey,
+) -> PayloadProcessorStateRootResult {
+    let mut guard = payload_processor_roots().lock();
+    loop {
+        if let Some(res) = guard.remove(&key) {
+            // Once we consumed the result, clear the started marker.
+            payload_processor_started().lock().remove(&key);
+            return res;
+        }
+        payload_processor_roots_cv().wait(&mut guard);
+    }
+}
+
 fn take_parallel_state_root(key: PayloadProcessorKey) -> Option<ParallelStateRootResult> {
     parallel_state_roots().lock().remove(&key)
 }
@@ -96,6 +158,9 @@ pub fn insert_payload_processor_state_root(
     value: PayloadProcessorStateRootResult,
 ) {
     payload_processor_roots().lock().insert(key, value);
+    // Clear the started marker once the result is available (even if nobody is waiting).
+    payload_processor_started().lock().remove(&key);
+    payload_processor_roots_cv().notify_all();
 }
 
 fn insert_parallel_state_root(key: PayloadProcessorKey, value: ParallelStateRootResult) {

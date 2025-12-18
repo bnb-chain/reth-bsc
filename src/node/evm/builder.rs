@@ -9,7 +9,9 @@ use revm::database::{State, states::bundle_state::BundleRetention};
 use alloy_evm::{Evm, block::BlockExecutor};
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
 use crate::node::trie_root::{
-    insert_payload_processor_hook_drop, PayloadProcessorKey, RootDebugger, StateRootCompareState,
+    insert_payload_processor_hook_drop, payload_processor_was_started,
+    wait_take_payload_processor_state_root_blocking, PayloadProcessorKey, RootDebugger,
+    StateRootCompareState,
 };
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -172,9 +174,17 @@ where
         // calculate the state root
         let state_root_start = std::time::Instant::now();
         let hashed_state = state.hashed_post_state(&db.bundle_state);
-        let (state_root, trie_updates) = state
-            .state_root_with_updates(hashed_state.clone())
-            .map_err(BlockExecutionError::other)?;
+        let key = PayloadProcessorKey::new(self.parent.number, self.parent.hash());
+
+        // 1) If payload_processor was started, wait for its sparse trie result (authoritative).
+        // 2) Otherwise, fall back to the legacy serial state-root calculation.
+        let state_root_source = if payload_processor_was_started(key) { "payload_processor" } else { "serial" };
+        let (state_root, trie_updates) = if state_root_source == "payload_processor" {
+            let pp_res = wait_take_payload_processor_state_root_blocking(key);
+            (pp_res.state_root, pp_res.trie_updates)
+        } else {
+            state.state_root_with_updates(hashed_state.clone()).map_err(BlockExecutionError::other)?
+        };
         let state_root_duration = state_root_start.elapsed();
 
         let user_tx_len = self.transactions.len();
@@ -223,6 +233,7 @@ where
             finish_duration_ms = finish_duration.as_millis(),
             state_root_duration_ms = state_root_duration.as_millis(),
             assemble_duration_ms = assemble_duration.as_millis(),
+            state_root_source = state_root_source,
             "Succeed to seal block"
         );
 
@@ -337,9 +348,18 @@ where
             compare_state.clone(),
         );
 
-        let (state_root, trie_updates) = state
-            .state_root_with_updates(hashed_state.clone())
-            .map_err(BlockExecutionError::other)?;
+        // Prefer payload_processor's sparse trie root if it was started for this payload build.
+        // Otherwise fall back to serial state_root_with_updates.
+        let key = PayloadProcessorKey::new(self.parent.number, self.parent.hash());
+        let state_root_source = if payload_processor_was_started(key) { "payload_processor" } else { "serial" };
+        let (state_root, trie_updates) = if state_root_source == "payload_processor" {
+            let pp_res = wait_take_payload_processor_state_root_blocking(key);
+            (pp_res.state_root, pp_res.trie_updates)
+        } else {
+            state
+                .state_root_with_updates(hashed_state.clone())
+                .map_err(BlockExecutionError::other)?
+        };
         let state_root_duration = state_root_start.elapsed();
         {
             let mut w = compare_state.lock();
@@ -396,6 +416,7 @@ where
             state_root_duration_ms = state_root_duration.as_millis(),
             assemble_duration_ms = assemble_duration.as_millis(),
             serial_mode_used = true,
+            state_root_source = state_root_source,
             "Succeed to seal block (state root)"
         );
 
