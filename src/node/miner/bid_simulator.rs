@@ -235,7 +235,7 @@ where
             if _bid_runtime.is_expected_better_than(&best_bid_runtime) {
                 debug!(
                     "new bid has better expectedBlockReward builder:{}, bid_hash:{}",
-                    _bid_runtime.bid.builder, ""
+                    _bid_runtime.bid.builder, _bid_runtime.bid.bid_hash,
                 );
             } else if !best_bid.is_committed() {
                 _bid_runtime = best_bid_runtime;
@@ -246,7 +246,7 @@ where
                 _bid_accepted = false;
                 debug!(
                     "new bid will be discarded builder:{}, bid_hash:{}",
-                    _bid_runtime.bid.builder, ""
+                    _bid_runtime.bid.builder, _bid_runtime.bid.bid_hash,
                 );
             }
         }
