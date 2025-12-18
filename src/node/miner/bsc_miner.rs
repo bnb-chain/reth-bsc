@@ -1,5 +1,6 @@
 use crate::node::miner::bid_simulator::{BidRuntime, BidSimulator};
 use crate::node::miner::payload::BscBuildArguments;
+use crate::node::miner::util::finalize_new_header;
 use crate::{
     chainspec::BscChainSpec,
     consensus::parlia::{provider::SnapshotProvider, vote_pool, Parlia},
@@ -24,7 +25,7 @@ use crate::{
 };
 use alloy_consensus::BlockHeader;
 use alloy_primitives::U128;
-use alloy_primitives::{Address, Sealable};
+use alloy_primitives::{keccak256, Address, Sealable};
 use k256::ecdsa::SigningKey;
 use lru::LruCache;
 use reth::transaction_pool::PoolTransaction;
@@ -32,6 +33,7 @@ use reth::transaction_pool::TransactionPool;
 use reth_basic_payload_builder::{PayloadConfig, PrecachedState};
 use reth_chainspec::EthChainSpec;
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
+use reth_evm::block::BlockExecutionError;
 use reth_network::message::{NewBlockMessage, PeerMessage};
 use reth_payload_primitives::BuiltPayload;
 use reth_primitives::TransactionSigned;
@@ -841,10 +843,42 @@ where
         &self,
         payload: BscBuiltPayload,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let sealed_block = payload.block();
-        let block_hash = sealed_block.hash();
-        let block_number = sealed_block.number();
-        let parent_hash = sealed_block.header().parent_hash;
+        let mut new_header = payload.block().header().clone();
+        // assmble vote and seal block
+        let snapshot_provider = crate::shared::get_snapshot_provider()
+            .cloned()
+            .ok_or_else(|| BlockExecutionError::msg("Snapshot provider not available"))?;
+        let parent_header = crate::node::evm::util::HEADER_CACHE_READER
+            .lock()
+            .unwrap()
+            .get_header_by_hash(&new_header.parent_hash)
+            .ok_or(BlockExecutionError::msg("Failed to get header from global header reader"))?;
+        let parent_snap = snapshot_provider
+            .snapshot_by_hash(&new_header.parent_hash)
+            .ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;
+        finalize_new_header(
+            self.parlia.clone(),
+            &parent_snap,
+            &parent_header,
+            &mut new_header,
+            &snapshot_provider,
+        )
+        .map_err(|e| BlockExecutionError::msg(format!("Failed to finalize header: {}", e)))?;
+
+        let header_hash = keccak256(alloy_rlp::encode(&new_header));
+        let block_hash = new_header.hash_slow();
+        let block_number = new_header.number;
+        let parent_hash = new_header.parent_hash;
+
+        let sealed_block = payload.block().clone();
+        tracing::debug!(
+            "Succeed to finalize header, block_number={}, hash=0x{:x}, parent_hash=0x{:x}, txs={}",
+            block_number,
+            header_hash,
+            parent_hash,
+            sealed_block.body().transaction_count()
+        );
+        let sealed_block = sealed_block.set_header(new_header);
         let best_block_number = self.provider.best_block_number()?;
         if block_number <= best_block_number {
             debug!(
