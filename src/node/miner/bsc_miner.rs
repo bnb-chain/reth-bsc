@@ -851,8 +851,8 @@ where
                 Some(cached) => (cached.0, cached.1, true),
                 None => {
                     tracing::warn!(
-                        "Validator cache miss for block hash: {:?}, using empty validators",
-                        seal_hash
+                        "Validator cache miss for block number: {:?}, using empty validators",
+                        new_header.number
                     );
                     (vec![], vec![], false)
                 }
@@ -862,9 +862,9 @@ where
                 Some(cached) => (*cached, true),
                 None => {
                     tracing::warn!(
-                        "Turn length cache miss for block hash: {:?}, using default turn length 0",
-                        seal_hash
-                    );
+                    "Turn length cache miss for block number: {:?}, using default turn length 0",
+                    new_header.number
+                );
                     (0, false)
                 }
             };
