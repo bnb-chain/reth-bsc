@@ -23,8 +23,7 @@ use crate::{
     },
 };
 use alloy_consensus::BlockHeader;
-use alloy_primitives::U128;
-use alloy_primitives::{Address, Sealable};
+use alloy_primitives::{Address, Sealable, U128};
 use k256::ecdsa::SigningKey;
 use lru::LruCache;
 use reth::transaction_pool::PoolTransaction;
@@ -34,8 +33,8 @@ use reth_chainspec::EthChainSpec;
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
 use reth_network::message::{NewBlockMessage, PeerMessage};
 use reth_payload_primitives::BuiltPayload;
-use reth_primitives::TransactionSigned;
-use reth_primitives_traits::{BlockBody, SealedHeader};
+use reth_primitives::{SealedHeader, TransactionSigned};
+use reth_primitives_traits::BlockBody;
 use reth_provider::{
     BlockNumReader, CanonStateNotification, CanonStateSubscriptions, HeaderProvider,
 };
