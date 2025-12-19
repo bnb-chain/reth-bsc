@@ -247,10 +247,12 @@ where
         let assemble_duration = assemble_start.elapsed();
         
         let finish_duration = finish_start.elapsed();
+        let execution_path = if trace_id == 0 { "import_or_other" } else { "payload_build" };
         tracing::debug!(
             target: "bsc::builder",
             trace_id,
             attempt,
+            execution_path,
             block_number = %block.header.number,
             block_hash = %block.header.hash_slow(),
             user_tx_len = user_tx_len,
@@ -452,10 +454,12 @@ where
         let assemble_duration = assemble_start.elapsed();
 
         let finish_duration = finish_start.elapsed();
+        let execution_path = if trace_id == 0 { "import_or_other" } else { "payload_build" };
         tracing::debug!(
             target: "bsc::builder",
             trace_id,
             attempt,
+            execution_path,
             block_number = %block.header.number,
             block_hash = %block_hash,
             user_tx_len = user_tx_len,

@@ -1000,7 +1000,7 @@ where
                     timeout_ms = self.timeout.as_millis(),
                     "Outer loop: Job already timeout, returning best payload"
                 );
-                return self.try_return_best_payload();
+                return self.try_return_best_payload().await;
             };
             
             tokio::select! {
@@ -1082,7 +1082,7 @@ where
                                         retries = self.retries,
                                         "Job already timeout, returning best payload immediately"
                                     );
-                                    return self.try_return_best_payload();
+                                    return self.try_return_best_payload().await;
                                 };
                                 
                                 tokio::select! {
@@ -1098,7 +1098,7 @@ where
                                             job_elapsed_ms = self.job_start_time.elapsed().as_millis(),
                                             "try return best payload due to has no time"
                                         );
-                                        return self.try_return_best_payload();
+                                        return self.try_return_best_payload().await;
                                     }
 
                                     // Abort by new head.
@@ -1134,7 +1134,7 @@ where
                                                 last_cost_time = ?elapsed,
                                                 "try return best payload due to mining_delay < elapsed"
                                             );
-                                            return self.try_return_best_payload();
+                                            return self.try_return_best_payload().await;
                                         } else if std::time::Duration::from_millis(mining_delay) < elapsed * TIME_MULTIPLIER {
                                             if let Err(err) = self.try_build_tx.send(()) {
                                                 warn!(
@@ -1146,7 +1146,7 @@ where
                                                     error = ?err,
                                                     "Failed to send to try build queue"
                                                 );
-                                                return self.try_return_best_payload();
+                                                return self.try_return_best_payload().await;
                                             }
                                             debug!(
                                                 target: "bsc::miner::payload",
@@ -1170,7 +1170,7 @@ where
                                                     error = ?err,
                                                     "Failed to send to try build queue"
                                                 );
-                                                return self.try_return_best_payload();
+                                                return self.try_return_best_payload().await;
                                             }
                                             debug!(
                                                 target: "bsc::miner::payload",
@@ -1201,7 +1201,7 @@ where
                                 retries = self.retries,
                                 "Failed to build payload task"
                             );
-                            return self.try_return_best_payload();
+                            return self.try_return_best_payload().await;
                         },
                         Some(Err(join_err)) => {
                             let elapsed = start_time.elapsed();
@@ -1215,7 +1215,7 @@ where
                                 error = %join_err,
                                 "Failed to join payload build task"
                             );
-                            return self.try_return_best_payload();
+                            return self.try_return_best_payload().await;
                         },
                         None => {
                             // No task completed, continue to next iteration
@@ -1238,7 +1238,7 @@ where
                         "Try return best payload due to has no time"
                     );
                     self.build_args.cancel.clone().cancel();
-                    return self.try_return_best_payload();
+                    return self.try_return_best_payload().await;
                 }
                 
                 // Abort by new head.
@@ -1263,7 +1263,7 @@ where
     }
 
     /// Try to return the best payload to result channel
-    fn try_return_best_payload(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn try_return_best_payload(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let best_bid = self.simulator.get_best_bid(self.mining_ctx.parent_header.hash());
         if let Some(bid) = best_bid {
             info!(
@@ -1302,6 +1302,78 @@ where
             
             // If in-turn, build an empty payload as fallback
             if self.mining_ctx.is_inturn {
+                // If there is an in-flight build task (or a finished one not yet joined), wait for
+                // it briefly before building an empty payload.
+                //
+                // This avoids producing empty blocks while a "real" payload is already being built.
+                if !self.join_handle.is_empty() {
+                    let grace = std::time::Duration::from_millis(200);
+                    let wait_start = std::time::Instant::now();
+                    let wait_until = std::time::Instant::now() + grace;
+
+                    while std::time::Instant::now() < wait_until && !self.join_handle.is_empty() {
+                        let remaining = wait_until.saturating_duration_since(std::time::Instant::now());
+                        match tokio::time::timeout(remaining, self.join_handle.join_next()).await {
+                            Ok(Some(Ok(Ok(payload)))) => {
+                                let payload_tx_count = payload.block().body().transaction_count();
+                                let waited_ms = wait_start.elapsed().as_millis();
+                                info!(
+                                    target: "bsc::miner::payload",
+                                    trace_id = self.trace_id,
+                                    block_number = payload.block().header().number(),
+                                    block_hash = %payload.block().hash(),
+                                    is_inturn = self.mining_ctx.is_inturn,
+                                    tx_count = payload_tx_count,
+                                    waited_ms,
+                                    grace_ms = grace.as_millis(),
+                                    "Received in-flight payload build result during empty-payload fallback; using it"
+                                );
+                                self.potential_payloads.push(payload);
+                                break;
+                            }
+                            Ok(Some(Ok(Err(err)))) => {
+                                warn!(
+                                    target: "bsc::miner::payload",
+                                    trace_id = self.trace_id,
+                                    is_inturn = self.mining_ctx.is_inturn,
+                                    %err,
+                                    "In-flight payload build failed during empty-payload fallback"
+                                );
+                            }
+                            Ok(Some(Err(err))) => {
+                                warn!(
+                                    target: "bsc::miner::payload",
+                                    trace_id = self.trace_id,
+                                    is_inturn = self.mining_ctx.is_inturn,
+                                    %err,
+                                    "Failed to join in-flight payload build task during empty-payload fallback"
+                                );
+                            }
+                            Ok(None) => break, // nothing left to join
+                            Err(_) => break,   // timeout
+                        }
+                    }
+
+                    // If waiting produced a payload, try to send it.
+                    if let Some(best_payload) = self.pick_best_payload() {
+                        if let Err(err) = self.result_tx.send(SubmitContext {
+                            mining_ctx: self.mining_ctx.clone(),
+                            payload: best_payload,
+                            cancel: self.build_args.cancel.clone(),
+                        }) {
+                            warn!(
+                                target: "bsc::miner::payload",
+                                trace_id = self.trace_id,
+                                is_inturn = self.mining_ctx.is_inturn,
+                                error = %err,
+                                "Failed to send joined payload to result channel"
+                            );
+                            return Err(Box::new(BscPayloadJobError::ResultChannelSendError(err.to_string())));
+                        }
+                        return Ok(());
+                    }
+                }
+
                 warn!(
                     target: "bsc::miner::payload",
                     trace_id = self.trace_id,
