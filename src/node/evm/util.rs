@@ -69,8 +69,12 @@ impl HeaderCacheReader {
     }
 
     pub fn insert_header_to_cache(&mut self, header: Header) {
+        self.insert_header_to_cache_with_hash(header, None);
+    }
+
+    pub fn insert_header_to_cache_with_hash(&mut self, header: Header, block_hash: Option<BlockHash>) {
         let block_number = header.number();
-        let block_hash = header.hash_slow();
+        let block_hash = block_hash.unwrap_or_else(|| header.hash_slow());
         let header_clone_for_log = header.clone();
         self.blocknumber_to_header.insert(block_number, header.clone());
         self.blockhash_to_header.insert(block_hash, header);
@@ -100,4 +104,9 @@ pub fn get_cannonical_header_from_cache(number: BlockNumber) -> Option<Header> {
 /// Insert header to cache
 pub fn insert_header_to_cache(header: Header) {
     HEADER_CACHE_READER.lock().unwrap().insert_header_to_cache(header);
+}
+
+/// Insert header with a known hash to avoid re-hashing.
+pub fn insert_header_to_cache_with_hash(header: Header, block_hash: Option<BlockHash>) {
+    HEADER_CACHE_READER.lock().unwrap().insert_header_to_cache_with_hash(header, block_hash);
 }

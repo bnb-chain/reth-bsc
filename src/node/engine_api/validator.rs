@@ -18,7 +18,7 @@ use reth_primitives::{RecoveredBlock, SealedBlock};
 use reth_primitives_traits::Block;
 use reth_trie_common::HashedPostState;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 #[derive(Debug, Default, Clone)]
 #[non_exhaustive]
@@ -53,20 +53,67 @@ impl BscEngineValidator {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BscExecutionData(pub BscBlock);
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BscExecutionData {
+    #[serde(flatten)]
+    pub block: BscBlock,
+    #[serde(skip, default)]
+    hash: OnceLock<B256>,
+}
+
+impl BscExecutionData {
+    pub fn new(block: BscBlock) -> Self {
+        Self { block, hash: OnceLock::new() }
+    }
+
+    pub fn new_with_hash(block: BscBlock, hash: B256) -> Self {
+        let lock = OnceLock::new();
+        let _ = lock.set(hash);
+        Self { block, hash: lock }
+    }
+
+    pub fn block_hash_cached(&self) -> B256 {
+        *self.hash.get_or_init(|| self.block.header.hash_slow())
+    }
+
+    pub fn into_block(self) -> BscBlock {
+        self.block
+    }
+}
+
+impl From<BscBlock> for BscExecutionData {
+    fn from(block: BscBlock) -> Self {
+        Self::new(block)
+    }
+}
+
+impl Default for BscExecutionData {
+    fn default() -> Self {
+        Self::new(BscBlock::default())
+    }
+}
+
+impl Clone for BscExecutionData {
+    fn clone(&self) -> Self {
+        let hash = OnceLock::new();
+        if let Some(value) = self.hash.get() {
+            let _ = hash.set(*value);
+        }
+        Self { block: self.block.clone(), hash }
+    }
+}
 
 impl ExecutionPayload for BscExecutionData {
     fn parent_hash(&self) -> B256 {
-        self.0.header.parent_hash()
+        self.block.header.parent_hash()
     }
 
     fn block_hash(&self) -> B256 {
-        self.0.header.hash_slow()
+        self.block_hash_cached()
     }
 
     fn block_number(&self) -> u64 {
-        self.0.header.number()
+        self.block.header.number()
     }
 
     fn withdrawals(&self) -> Option<&Vec<Withdrawal>> {
@@ -82,11 +129,11 @@ impl ExecutionPayload for BscExecutionData {
     }
 
     fn timestamp(&self) -> u64 {
-        self.0.header.timestamp()
+        self.block.header.timestamp()
     }
 
     fn gas_used(&self) -> u64 {
-        self.0.header.gas_used()
+        self.block.header.gas_used()
     }
 
     fn transaction_count(&self) -> usize {
@@ -137,18 +184,17 @@ where
         &self,
         payload: BscExecutionData,
     ) -> Result<SealedBlock<BscBlock>, PayloadError> {
-        let block = payload.0;
-        let expected_hash = block.header.hash_slow();
-        let sealed_block = block.seal_slow();
-
-        // Ensure the hash included in the payload matches the block hash
-        if expected_hash != sealed_block.hash() {
-            return Err(PayloadError::BlockHash {
-                execution: sealed_block.hash(),
-                consensus: expected_hash,
-            })?
+        let header_hash = payload.block.header.hash_slow();
+        if let Some(cached_hash) = payload.hash.get() {
+            if *cached_hash != header_hash {
+                return Err(PayloadError::BlockHash {
+                    execution: header_hash,
+                    consensus: *cached_hash,
+                })?
+            }
         }
 
-        Ok(sealed_block)
+        let block = payload.into_block();
+        Ok(block.seal_unchecked(header_hash))
     }
 }
