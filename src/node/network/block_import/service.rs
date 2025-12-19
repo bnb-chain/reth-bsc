@@ -224,14 +224,19 @@ where
         payload: BscBuiltPayload,
         block_msg: NewBlockMessage<BscNewBlock>,
     ) {
+        let block = &block_msg.block.0.block;
         // insert header to cache
-        insert_header_to_cache(block_msg.block.0.block.header.clone());
+        insert_header_to_cache(block.header.clone());
         // Cache the full block body for later range responses.
-        crate::shared::cache_full_block(block_msg.block.0.block.clone());
+        crate::shared::cache_full_block(block.clone());
         let block_hash = block_msg.hash;
         // Clone header for FCU update
-        let header_for_fcu = block_msg.block.0.block.header.clone();
+        let header_for_fcu = block.header.clone();
 
+        // send to EVN peers first
+        if let Err(e) = self.transfer_to_evn_peers(block_msg.clone()) {
+            tracing::warn!(target: "bsc::block_import", "Failed to transfer block to EVN peers: number = {:?}, hash = {:?}, error = {}", block.header.number, block.header.hash_slow(), e);
+        }
         // Send ValidHeader announcement to trigger NewBlock diffusion from few peers
         let _ =
             self.to_network.send(BlockImportEvent::Announcement(BlockValidation::ValidHeader {
@@ -269,6 +274,7 @@ where
 
     /// Add a new block import task to the pending imports
     fn on_new_block(&mut self, block: BlockMsg, peer_id: PeerId) {
+        tracing::debug!(target: "bsc::block_import", "Receiving new block from network: number = {:?}, hash = {:?}, peer = {:?}", block.block.0.block.header.number, block.hash, peer_id);
         if self.processed_blocks.contains(&block.hash) {
             tracing::trace!(target: "bsc::block_import", "Block already processed when receiving new block: number = {:?}, hash = {:?}", block.block.0.block.header.number, block.hash);
             return;
@@ -279,6 +285,10 @@ where
         }
         self.queued_blocks.insert(block.hash);
 
+        // send to EVN peers first
+        if let Err(e) = self.transfer_to_evn_peers(block.clone()) {
+            tracing::warn!(target: "bsc::block_import", "Failed to transfer block to EVN peers: number = {:?}, hash = {:?}, error = {}", block.block.0.block.header.number, block.hash, e);
+        }
         // Send ValidHeader announcement to trigger NewBlock diffusion from few peers
         // TODO: add header validation later
         let _ =
@@ -364,6 +374,36 @@ where
             self.downloading_blocks.insert(hash_number.hash, now);
         }
     }
+
+    /// Transfer the block to EVN peers if from proxied validators or validator address.
+    fn transfer_to_evn_peers(&self, block: BlockMsg) -> Result<(), Box<dyn std::error::Error>> {
+        let mining_config = crate::node::miner::config::get_global_mining_config().ok_or("Mining config is not set")?;
+        let cfg = crate::node::network::evn::get_global_evn_config().ok_or("EVN config is not set")?;
+        if !cfg.enabled {
+            return Ok(());
+        }
+        let header_ref = &block.block.0.block.header;
+        let coinbase = header_ref.beneficiary;
+        // If from proxied validators or validator address, target EVN peers with ETH NewBlockHashes.
+        if cfg.proxyed_validators.contains(&coinbase) || (mining_config.enabled && mining_config.validator_address.unwrap_or_default() == coinbase) {
+            if let Some(net) = crate::shared::get_network_handle() {
+                let peers = crate::node::network::evn_peers::snapshot();
+                for (peer_id, info) in peers {
+                    // Send to EVN peers or proxyed peers
+                    let is_proxyed = crate::node::network::bsc_protocol::registry::is_proxyed_peer(&peer_id);
+                    if info.is_evn || is_proxyed {
+                        // Send full NewBlock to EVN/proxyed peers to avoid re-fetching.
+                        net.send_eth_message(
+                            peer_id,
+                            PeerMessage::NewBlock(block.clone()),
+                        );
+                        tracing::debug!(target: "bsc::block_import", "Sent full NewBlock to EVN/proxyed peer: number = {:?}, hash = {:?}, peer = {:?}", block.block.0.block.header.number, block.hash, peer_id);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl<Provider> Future for ImportService<Provider>
@@ -399,26 +439,8 @@ where
                     this.processed_blocks.insert(block.hash);
                     // Cache the full block body for later range responses.
                     crate::shared::cache_full_block(block.block.0.block.clone());
-                    // If from proxied validators, target EVN peers with ETH NewBlockHashes.
-                    if let Some(cfg) = crate::node::network::evn::get_global_evn_config() {
-                        let header_ref = &block.block.0.block.header;
-                        let coinbase = header_ref.beneficiary;
-                        if cfg.proxyed_validators.contains(&coinbase) {
-                            if let Some(net) = crate::shared::get_network_handle() {
-                                let peers = crate::node::network::evn_peers::snapshot();
-                                for (peer_id, info) in peers {
-                                    // Send to EVN peers or proxyed peers
-                                    let is_proxyed = crate::node::network::bsc_protocol::registry::is_proxyed_peer(&peer_id);
-                                    if info.is_evn || is_proxyed {
-                                        // Send full NewBlock to EVN/proxyed peers to avoid re-fetching.
-                                        net.send_eth_message(
-                                            peer_id,
-                                            PeerMessage::NewBlock(block.clone()),
-                                        );
-                                    }
-                                }
-                            }
-                        }
+                    if let Err(e) = this.transfer_to_evn_peers(block.clone()) {
+                        tracing::warn!(target: "bsc::block_import", "Failed to transfer block to EVN peers: number = {:?}, hash = {:?}, error = {}", block.block.0.block.header.number, block.hash, e);
                     }
                 }
 

@@ -311,7 +311,7 @@ pub fn spawn_evn_refresh_listener() {
                                 marked += 1;
                             }
                         }
-                        tracing::info!(target: "bsc::evn", marked, "Applied on-chain EVN NodeIDs to peers");
+                        tracing::info!(target: "bsc::evn", marked = marked, nodeids = ?nodeids, "Applied on-chain EVN NodeIDs to peers");
 
                         // Start periodic refresh every 60s to apply on-chain NodeIDs to existing peers
                         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -334,7 +334,7 @@ pub fn spawn_evn_refresh_listener() {
                                     marked += 1;
                                 }
                             }
-                            tracing::debug!(target: "bsc::evn", marked, "Periodic EVN on-chain NodeIDs applied to peers");
+                            tracing::debug!(target: "bsc::evn", marked = marked, nodeids = ?nodeids, "Periodic EVN on-chain NodeIDs applied to peers");
                         }
                     }
                     Err(broadcast::error::RecvError::Closed) => break,

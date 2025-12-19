@@ -474,7 +474,7 @@ fn spawn_evn_sync_watcher<Node>(
                                                         if let Ok(signed) = sign_system_transaction(tx) {
                                                             next_nonce += 1;
                                                             signed_batch.push(signed);
-                                                            info!(target: "bsc::evn", count = to_add.len(), "Prepared StakeHub.addNodeIDs for broadcast");
+                                                            info!(target: "bsc::evn", to_add = ?to_add, "Prepared StakeHub.addNodeIDs for broadcast");
                                                         }
                                                     }
 
@@ -491,7 +491,7 @@ fn spawn_evn_sync_watcher<Node>(
                                                         });
                                                         if let Ok(signed) = sign_system_transaction(tx) {
                                                             signed_batch.push(signed);
-                                                            info!(target: "bsc::evn", count = to_remove.len(), "Prepared StakeHub.removeNodeIDs for broadcast");
+                                                            info!(target: "bsc::evn", to_remove = ?to_remove, "Prepared StakeHub.removeNodeIDs for broadcast");
                                                         }
                                                     }
 

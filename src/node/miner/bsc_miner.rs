@@ -31,7 +31,7 @@ use reth::transaction_pool::TransactionPool;
 use reth_basic_payload_builder::{PayloadConfig, PrecachedState};
 use reth_chainspec::EthChainSpec;
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
-use reth_network::message::{NewBlockMessage, PeerMessage};
+use reth_network::message::NewBlockMessage;
 use reth_payload_primitives::BuiltPayload;
 use reth_primitives::{SealedHeader, TransactionSigned};
 use reth_primitives_traits::BlockBody;
@@ -960,18 +960,6 @@ where
         } else {
             warn!("Failed to send built block due to import sender not initialised");
             return Err("Failed to send built block due to import sender not initialised".into());
-        }
-
-        // Targeted ETH NewBlock/NewBlockHashes to EVN peers for full broadcast parity.
-        if let Some(net) = crate::shared::get_network_handle() {
-            let peers = crate::node::network::evn_peers::snapshot();
-            let nb_msg = msg.clone();
-            for (peer_id, info) in peers {
-                if info.is_evn {
-                    // Send full NewBlock to EVN peers
-                    net.send_eth_message(peer_id, PeerMessage::NewBlock(nb_msg.clone()));
-                }
-            }
         }
 
         Ok(())

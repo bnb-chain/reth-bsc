@@ -33,6 +33,7 @@ impl BscHandshake {
             let upgrade_msg = UpgradeStatus {
                 extension: UpgradeStatusExtension { disable_peer_tx_broadcast: evn_enabled },
             };
+            tracing::debug!(target: "bsc_handshake", "Sending upgrade status message, EVN enabled: {}", evn_enabled);
             unauth.start_send_unpin(upgrade_msg.into_rlpx())?;
 
             // Receive peer's upgrade status response
