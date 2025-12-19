@@ -1,7 +1,5 @@
-use crate::node::evm::pre_execution::{TURN_LENGTH_CACHE, VALIDATOR_CACHE};
 use crate::node::miner::bid_simulator::{BidRuntime, BidSimulator};
 use crate::node::miner::payload::BscBuildArguments;
-use crate::node::miner::util::finalize_new_header;
 use crate::{
     chainspec::BscChainSpec,
     consensus::parlia::{provider::SnapshotProvider, vote_pool, Parlia},
@@ -25,8 +23,7 @@ use crate::{
     },
 };
 use alloy_consensus::BlockHeader;
-use alloy_primitives::U128;
-use alloy_primitives::{keccak256, Address, Sealable};
+use alloy_primitives::{Address, Sealable, U128};
 use k256::ecdsa::SigningKey;
 use lru::LruCache;
 use reth::transaction_pool::PoolTransaction;
@@ -34,11 +31,10 @@ use reth::transaction_pool::TransactionPool;
 use reth_basic_payload_builder::{PayloadConfig, PrecachedState};
 use reth_chainspec::EthChainSpec;
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
-use reth_evm::block::BlockExecutionError;
 use reth_network::message::{NewBlockMessage, PeerMessage};
 use reth_payload_primitives::BuiltPayload;
-use reth_primitives::TransactionSigned;
-use reth_primitives_traits::{BlockBody, SealedHeader};
+use reth_primitives::{SealedHeader, TransactionSigned};
+use reth_primitives_traits::BlockBody;
 use reth_provider::{
     BlockNumReader, CanonStateNotification, CanonStateSubscriptions, HeaderProvider,
 };
@@ -845,73 +841,10 @@ where
         &self,
         payload: BscBuiltPayload,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let mut new_header = payload.block().header().clone();
-        let seal_hash = new_header.hash_slow();
-        let (validators, vote_addresses, validator_cache_hit) =
-            match VALIDATOR_CACHE.lock().unwrap().get(&seal_hash).cloned() {
-                Some(cached) => (cached.0, cached.1, true),
-                None => {
-                    tracing::warn!(
-                        "Validator cache miss for block number: {:?}, using empty validators",
-                        new_header.number
-                    );
-                    (vec![], vec![], false)
-                }
-            };
-        let (turn_length, turn_length_cache_hit) =
-            match TURN_LENGTH_CACHE.lock().unwrap().get(&seal_hash) {
-                Some(cached) => (*cached, true),
-                None => {
-                    tracing::warn!(
-                    "Turn length cache miss for block number: {:?}, using default turn length 0",
-                    new_header.number
-                );
-                    (0, false)
-                }
-            };
-        // assmble vote and seal block
-        let snapshot_provider = crate::shared::get_snapshot_provider()
-            .cloned()
-            .ok_or_else(|| BlockExecutionError::msg("Snapshot provider not available"))?;
-        let parent_header = crate::node::evm::util::HEADER_CACHE_READER
-            .lock()
-            .unwrap()
-            .get_header_by_hash(&new_header.parent_hash)
-            .ok_or(BlockExecutionError::msg("Failed to get header from global header reader"))?;
-        let parent_snap = snapshot_provider
-            .snapshot_by_hash(&new_header.parent_hash)
-            .ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;
-        finalize_new_header(
-            self.parlia.clone(),
-            &parent_snap,
-            &parent_header,
-            &mut new_header,
-            &snapshot_provider,
-        )
-        .map_err(|e| BlockExecutionError::msg(format!("Failed to finalize header: {}", e)))?;
-
-        let header_hash = keccak256(alloy_rlp::encode(&new_header));
-        let block_hash = new_header.hash_slow();
-        let block_number = new_header.number;
-        let parent_hash = new_header.parent_hash;
-
-        // Only insert back to cache if we successfully retrieved from cache
-        if validator_cache_hit {
-            VALIDATOR_CACHE.lock().unwrap().insert(block_hash, (validators, vote_addresses));
-        }
-        if turn_length_cache_hit {
-            TURN_LENGTH_CACHE.lock().unwrap().insert(block_hash, turn_length);
-        }
-
-        let sealed_block = payload.block().clone();
-        tracing::debug!(
-            "Succeed to finalize header, block_number={}, hash=0x{:x}, parent_hash=0x{:x}, txs={}",
-            block_number,
-            header_hash,
-            parent_hash,
-            sealed_block.body().transaction_count()
-        );
-        let sealed_block = sealed_block.set_header(new_header);
+        let sealed_block = payload.block();
+        let block_hash = sealed_block.hash();
+        let block_number = sealed_block.number();
+        let parent_hash = sealed_block.header().parent_hash;
         let best_block_number = self.provider.best_block_number()?;
         if block_number <= best_block_number {
             debug!(
