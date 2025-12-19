@@ -47,7 +47,7 @@ mod tests {
     fn test_execution_data_parent_hash() {
         let parent_hash = B256::random();
         let block = create_test_block(1, parent_hash);
-        let execution_data = BscExecutionData(block);
+        let execution_data = BscExecutionData::new(block);
         
         assert_eq!(execution_data.parent_hash(), parent_hash);
     }
@@ -57,7 +57,7 @@ mod tests {
         let parent_hash = B256::random();
         let block = create_test_block(1, parent_hash);
         let expected_hash = block.header.hash_slow();
-        let execution_data = BscExecutionData(block);
+        let execution_data = BscExecutionData::new(block);
         
         assert_eq!(execution_data.block_hash(), expected_hash);
     }
@@ -66,7 +66,7 @@ mod tests {
     fn test_execution_data_block_number() {
         let block_number = 12345;
         let block = create_test_block(block_number, B256::random());
-        let execution_data = BscExecutionData(block);
+        let execution_data = BscExecutionData::new(block);
         
         assert_eq!(execution_data.block_number(), block_number);
     }
@@ -75,7 +75,7 @@ mod tests {
     fn test_execution_data_timestamp() {
         let block = create_test_block(1, B256::random());
         let expected_timestamp = block.header.timestamp;
-        let execution_data = BscExecutionData(block);
+        let execution_data = BscExecutionData::new(block);
         
         assert_eq!(execution_data.timestamp(), expected_timestamp);
     }
@@ -84,7 +84,7 @@ mod tests {
     fn test_execution_data_gas_used() {
         let mut block = create_test_block(1, B256::random());
         block.header.gas_used = 1_000_000;
-        let execution_data = BscExecutionData(block);
+        let execution_data = BscExecutionData::new(block);
         
         assert_eq!(execution_data.gas_used(), 1_000_000);
     }
@@ -92,7 +92,7 @@ mod tests {
     #[test]
     fn test_execution_data_withdrawals_none() {
         let block = create_test_block(1, B256::random());
-        let execution_data = BscExecutionData(block);
+        let execution_data = BscExecutionData::new(block);
         
         // BSC doesn't support withdrawals
         assert!(execution_data.withdrawals().is_none());
@@ -101,7 +101,7 @@ mod tests {
     #[test]
     fn test_execution_data_parent_beacon_block_root_none() {
         let block = create_test_block(1, B256::random());
-        let execution_data = BscExecutionData(block);
+        let execution_data = BscExecutionData::new(block);
         
         // BSC doesn't use parent beacon block root
         assert!(execution_data.parent_beacon_block_root().is_none());
@@ -131,7 +131,7 @@ mod tests {
     #[test]
     fn test_execution_data_serialization() {
         let block = create_test_block(1, B256::random());
-        let execution_data = BscExecutionData(block);
+        let execution_data = BscExecutionData::new(block);
         
         // Test that BscExecutionData can be serialized
         let serialized = serde_json::to_string(&execution_data);
@@ -141,7 +141,7 @@ mod tests {
     #[test]
     fn test_execution_data_deserialization() {
         let block = create_test_block(1, B256::random());
-        let execution_data = BscExecutionData(block);
+        let execution_data = BscExecutionData::new(block);
         
         // Serialize and then deserialize
         let serialized = serde_json::to_string(&execution_data).unwrap();
@@ -154,7 +154,7 @@ mod tests {
     fn test_execution_data_with_zero_gas() {
         let mut block = create_test_block(1, B256::random());
         block.header.gas_used = 0;
-        let execution_data = BscExecutionData(block);
+        let execution_data = BscExecutionData::new(block);
         
         assert_eq!(execution_data.gas_used(), 0);
     }
@@ -164,7 +164,7 @@ mod tests {
         let mut block = create_test_block(1, B256::random());
         let gas_limit = block.header.gas_limit;
         block.header.gas_used = gas_limit;
-        let execution_data = BscExecutionData(block);
+        let execution_data = BscExecutionData::new(block);
         
         assert_eq!(execution_data.gas_used(), gas_limit);
     }
@@ -179,7 +179,7 @@ mod tests {
         for difficulty in difficulties {
             let mut block = create_test_block(1, B256::random());
             block.header.difficulty = difficulty;
-            let execution_data = BscExecutionData(block);
+            let execution_data = BscExecutionData::new(block);
             
             assert_eq!(execution_data.block_number(), 1);
         }
@@ -197,7 +197,7 @@ mod tests {
         for timestamp in timestamps {
             let mut block = create_test_block(1, B256::random());
             block.header.timestamp = timestamp;
-            let execution_data = BscExecutionData(block);
+            let execution_data = BscExecutionData::new(block);
             
             assert_eq!(execution_data.timestamp(), timestamp);
         }

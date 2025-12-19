@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use alloy_consensus::{Header, BlockHeader};
+use alloy_consensus::{BlockHeader, Header};
 use alloy_primitives::{Address, Bytes, B256};
 use crate::consensus::parlia::Snapshot;
 use crate::consensus::parlia::consensus::Parlia;
@@ -13,10 +13,11 @@ use crate::node::evm::pre_execution::VALIDATOR_CACHE;
 use crate::node::miner::signer::{SignerError, seal_header_with_global_signer};
 use crate::node::miner::bsc_miner::MiningContext;
 use crate::consensus::parlia::provider::SnapshotProvider;
+use reth_primitives::SealedHeader;
 
-pub fn prepare_new_attributes(ctx: &mut MiningContext, parlia: Arc<Parlia<BscChainSpec>>, parent_header: &Header, signer: Address) -> EthPayloadBuilderAttributes {
+pub fn prepare_new_attributes(ctx: &mut MiningContext, parlia: Arc<Parlia<BscChainSpec>>, parent_header: &SealedHeader, signer: Address) -> EthPayloadBuilderAttributes {
     let mut new_header = prepare_new_header(parlia.clone(), parent_header, signer);
-    parlia.prepare_timestamp(&ctx.parent_snapshot, parent_header, &mut new_header);
+    parlia.prepare_timestamp(&ctx.parent_snapshot, parent_header.header(), &mut new_header);
     let mut attributes = EthPayloadBuilderAttributes{
         parent: new_header.parent_hash,
         timestamp: new_header.timestamp,
@@ -32,7 +33,7 @@ pub fn prepare_new_attributes(ctx: &mut MiningContext, parlia: Arc<Parlia<BscCha
 }
 
 /// prepare a tmp new header for preparing attributes.
-pub fn prepare_new_header<ChainSpec>(parlia: Arc<Parlia<ChainSpec>>, parent_header: &Header, signer: Address) -> Header 
+pub fn prepare_new_header<ChainSpec>(parlia: Arc<Parlia<ChainSpec>>, parent_header: &SealedHeader, signer: Address) -> Header 
 where
     ChainSpec: EthChainSpec + BscHardforks + 'static,
 {
@@ -42,7 +43,7 @@ where
     }
     let mut new_header = Header { 
         number: parent_header.number + 1, 
-        parent_hash: parent_header.hash_slow(), 
+        parent_hash: parent_header.hash(), 
         beneficiary: signer,
         // Set timestamp to present time (or parent + 1 if present time is not greater)
         // This avoids header.timestamp = 0 when back_off_time is called inside prepare_timestamp
@@ -61,7 +62,7 @@ where
 pub fn finalize_new_header<ChainSpec>(
     parlia: Arc<Parlia<ChainSpec>>, 
     parent_snap: &Snapshot, 
-    parent_header: &Header, 
+    parent_header: &SealedHeader, 
     new_header: &mut Header,
     snapshot_provider: &Arc<dyn SnapshotProvider + Send + Sync>,
 ) -> Result<(), crate::node::miner::signer::SignerError>
@@ -88,8 +89,9 @@ where
         if (new_header.number).is_multiple_of(epoch_length) {
             let mut validators: Option<(Vec<Address>, Vec<crate::consensus::parlia::VoteAddress>)> = None;
             let mut cache = VALIDATOR_CACHE.lock().unwrap();
-            if let Some(cached_result) = cache.get(&parent_header.hash_slow()) {
-                tracing::debug!("Succeed to query cached validator result, block_number: {}, block_hash: {}", parent_header.number, parent_header.hash_slow());
+            let parent_hash = parent_header.hash();
+            if let Some(cached_result) = cache.get(&parent_hash) {
+                tracing::debug!("Succeed to query cached validator result, block_number: {}, block_hash: {}", parent_header.number, parent_hash);
                 validators = Some(cached_result.clone());
             }
             
@@ -100,7 +102,7 @@ where
     parlia.prepare_turn_length(parent_snap, new_header).
         map_err(|e| SignerError::SigningFailed(format!("Failed to prepare turn length: {}", e)))?;
     
-    if let Err(e) = parlia.assemble_vote_attestation(parent_snap, parent_header, new_header, snapshot_provider) {
+    if let Err(e) = parlia.assemble_vote_attestation(parent_snap, parent_header.header(), new_header, snapshot_provider) {
         tracing::warn!(
             target: "bsc::miner",
             error = %e,

@@ -169,7 +169,7 @@ where
         let BscBuildArguments { mut cached_reads, config, cancel, trace_id, min_gas_tip } = args;
         let PayloadConfig { parent_header, attributes } = config;
 
-        let state_provider = self.client.state_by_block_hash(parent_header.hash_slow())?;
+        let state_provider = self.client.state_by_block_hash(parent_header.hash())?;
         let state = StateProviderDatabase::new(&state_provider);
         let mut db = State::builder()
             .with_database(cached_reads.as_db_mut(state))
@@ -599,7 +599,7 @@ where
             args;
         let PayloadConfig { parent_header, attributes } = config;
 
-        let state_provider = self.client.state_by_block_hash(parent_header.hash_slow())?;
+        let state_provider = self.client.state_by_block_hash(parent_header.hash())?;
         let state = StateProviderDatabase::new(&state_provider);
         let mut db = State::builder()
             .with_database(cached_reads.as_db_mut(state))

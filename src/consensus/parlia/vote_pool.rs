@@ -8,10 +8,16 @@ use crate::metrics::BscVoteMetrics;
 
 const LOWER_LIMIT_OF_VOTE_BLOCK_NUMBER: u64 = 256;
 
+#[derive(Clone)]
+struct VoteEntry {
+    hash: B256,
+    envelope: VoteEnvelope,
+}
+
 /// Container for votes associated with a specific block hash.
 #[derive(Default)]
 struct VoteMessages {
-    vote_messages: Vec<VoteEnvelope>,
+    vote_messages: Vec<VoteEntry>,
 }
 
 /// Priority queue wrapper for vote data, ordered by target_number (ascending).
@@ -62,6 +68,8 @@ struct VotePool {
     cur_votes: HashMap<B256, VoteMessages>,
     /// Priority queue for efficiently finding votes to prune.
     cur_votes_pq: VotesPriorityQueue,
+    /// Total number of votes stored in the pool.
+    total_votes: usize,
 }
 
 impl VotePool {
@@ -70,6 +78,7 @@ impl VotePool {
             received_votes: HashSet::new(), 
             cur_votes: HashMap::new(),
             cur_votes_pq: VotesPriorityQueue::new(),
+            total_votes: 0,
         }
     }
 
@@ -87,29 +96,61 @@ impl VotePool {
                 self.cur_votes_pq.push(vote.data);
             }
             
-            self.cur_votes.entry(block_hash).or_default().vote_messages.push(vote);
+            self.cur_votes
+                .entry(block_hash)
+                .or_default()
+                .vote_messages
+                .push(VoteEntry { hash: vote_hash, envelope: vote });
+            self.total_votes += 1;
         }
     }
 
     fn drain(&mut self) -> Vec<VoteEnvelope> {
         self.received_votes.clear();
         self.cur_votes_pq = VotesPriorityQueue::new();
+        self.total_votes = 0;
         let mut all_votes = Vec::new();
         for (_, vote_messages) in self.cur_votes.drain() {
-            all_votes.extend(vote_messages.vote_messages);
+            all_votes.extend(vote_messages.vote_messages.into_iter().map(|entry| entry.envelope));
         }
         all_votes
     }
 
     fn len(&self) -> usize { 
-        self.cur_votes.values().map(|vm| vm.vote_messages.len()).sum() 
+        self.total_votes
     }
 
     fn fetch_vote_by_block_hash(&self, block_hash: B256) -> Vec<VoteEnvelope> {
         if let Some(vote_messages) = self.cur_votes.get(&block_hash) {
-            vote_messages.vote_messages.clone()
+            vote_messages
+                .vote_messages
+                .iter()
+                .map(|entry| entry.envelope.clone())
+                .collect()
         } else {
             Vec::new()
+        }
+    }
+
+    fn count_and_fetch_if_quorum(
+        &self,
+        block_hash: B256,
+        quorum: usize,
+    ) -> (usize, Option<Vec<VoteEnvelope>>) {
+        let Some(vote_messages) = self.cur_votes.get(&block_hash) else {
+            return (0, None);
+        };
+
+        let count = vote_messages.vote_messages.len();
+        if count >= quorum {
+            let votes = vote_messages
+                .vote_messages
+                .iter()
+                .map(|entry| entry.envelope.clone())
+                .collect();
+            (count, Some(votes))
+        } else {
+            (count, None)
         }
     }
 
@@ -125,9 +166,9 @@ impl VotePool {
                 
                 // Remove from votes map and received_votes set
                 if let Some(vote_box) = self.cur_votes.remove(&block_hash) {
+                    self.total_votes = self.total_votes.saturating_sub(vote_box.vote_messages.len());
                     for vote in vote_box.vote_messages {
-                        let vote_hash = vote.hash();
-                        self.received_votes.remove(&vote_hash);
+                        self.received_votes.remove(&vote.hash);
                     }
                 }
             } else {
@@ -180,6 +221,17 @@ pub fn fetch_vote_by_block_hash(block_hash: B256) -> Vec<VoteEnvelope> {
     VOTE_POOL.read().expect("vote pool poisoned").fetch_vote_by_block_hash(block_hash)
 }
 
+/// Count votes by block hash and fetch if quorum is met, under a single lock.
+pub fn count_and_fetch_if_quorum(
+    block_hash: B256,
+    quorum: usize,
+) -> (usize, Option<Vec<VoteEnvelope>>) {
+    VOTE_POOL
+        .read()
+        .expect("vote pool poisoned")
+        .count_and_fetch_if_quorum(block_hash, quorum)
+}
+
 /// Prune old votes based on the latest block number.
 pub fn prune(latest_block_number: BlockNumber) {
     let mut pool = VOTE_POOL.write().expect("vote pool poisoned");
@@ -188,5 +240,3 @@ pub fn prune(latest_block_number: BlockNumber) {
     drop(pool);
     update_vote_pool_size_metric(size);
 }
-
-

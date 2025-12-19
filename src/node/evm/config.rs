@@ -9,7 +9,7 @@ use crate::{
 };
 use alloy_consensus::{transaction::SignerRecoverable, BlockHeader, Header, TxReceipt};
 use alloy_eips::eip7840::BlobParams;
-use alloy_primitives::{Address, Log, U256};
+use alloy_primitives::{Address, BlockHash, Log, U256};
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
 use reth_ethereum_forks::EthereumHardfork;
 use reth_evm::{
@@ -65,6 +65,8 @@ pub struct BscBlockExecutionCtx<'a> {
     pub base: EthBlockExecutionCtx<'a>,
     /// Block header (optional for BSC-specific logic).
     pub header: Option<Header>,
+    /// Block hash when known (sealed block), to avoid re-hashing.
+    pub header_hash: Option<BlockHash>,
     /// Whether the block is being mined.
     pub is_miner: bool,
 }
@@ -342,6 +344,7 @@ where
                 withdrawals: block.body().withdrawals.as_ref().map(Cow::Borrowed),
             },
             header: Some(block.header().clone()),
+            header_hash: Some(block.hash()),
             is_miner: false,
         }
     }
@@ -360,6 +363,7 @@ where
                 withdrawals: attributes.withdrawals.map(Cow::Owned),
             },
             header: None, // No header available for next block context
+            header_hash: None,
             is_miner: true,
         }
     }
@@ -404,11 +408,11 @@ where
     Self: Send + Sync + Unpin + Clone + 'static,
 {
     fn evm_env_for_payload(&self, payload: &BscExecutionData) -> EvmEnv<BscHardfork> {
-        self.evm_env(&payload.0.header)
+        self.evm_env(&payload.block.header)
     }
 
     fn context_for_payload<'a>(&self, payload: &'a BscExecutionData) -> BscBlockExecutionCtx<'a> {
-        let block = &payload.0;
+        let block = &payload.block;
         BscBlockExecutionCtx {
             base: EthBlockExecutionCtx {
                 parent_hash: block.header.parent_hash(),
@@ -417,6 +421,7 @@ where
                 withdrawals: block.body.inner.withdrawals.as_ref().map(Cow::Borrowed),
             },
             header: Some(block.header.clone()),
+            header_hash: Some(payload.block_hash_cached()),
             is_miner: false,
         }
     }
@@ -425,7 +430,7 @@ where
         &self,
         payload: &BscExecutionData,
     ) -> impl ExecutableTxIterator<Self> {
-        payload.0.body.inner.transactions.clone().into_iter().map(|tx| tx.try_into_recovered())
+        payload.block.body.inner.transactions.clone().into_iter().map(|tx| tx.try_into_recovered())
     }
 }
 

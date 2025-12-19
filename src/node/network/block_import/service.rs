@@ -4,7 +4,7 @@ use crate::{
     consensus::{parlia::vote_pool, ParliaConsensusErr},
     node::{
         consensus::BscForkChoiceEngine, engine::BscBuiltPayload,
-        engine_api::payload::BscPayloadTypes, evm::util::insert_header_to_cache,
+        engine_api::payload::BscPayloadTypes, evm::util::insert_header_to_cache_with_hash,
         network::BscNewBlock,
     },
     BscBlock, BscBlockBody,
@@ -139,7 +139,8 @@ where
         let engine = self.engine.clone();
         let forkchoice_engine = self.forkchoice_engine.clone();
 
-        tracing::debug!(target: "bsc::block_import", "New payload: block = ({:?}, {:?}), peer_id = {:?}", block.block.0.block.header.number, block.block.0.block.header.hash_slow(), peer_id);
+        let block_hash = block.block.0.block.header.hash_slow();
+        tracing::debug!(target: "bsc::block_import", "New payload: block = ({:?}, {:?}), peer_id = {:?}", block.block.0.block.header.number, block_hash, peer_id);
         Box::pin(async move {
             let sealed_block = block.block.0.block.clone().seal();
             let header = sealed_block.header().clone();
@@ -152,7 +153,7 @@ where
                         if let Err(e) = forkchoice_engine.update_forkchoice(&header).await {
                             tracing::warn!(target: "bsc::block_import", "Failed to update fork choice: {}", e);
                         } else {
-                            tracing::debug!(target: "bsc::block_import", "Succeed to update fork choice for new payload: number = {:?}, hash = {:?}", header.number, header.hash_slow());
+                            tracing::debug!(target: "bsc::block_import", "Succeed to update fork choice for new payload: number = {:?}, hash = {:?}", header.number, block_hash);
                         }
                         Outcome { peer: peer_id, result: Ok(BlockValidation::ValidBlock { block }) }
                             .into()
@@ -167,7 +168,6 @@ where
                         // to avoid the engine-tree being stuck in syncing state without any driver.
                         // By calling FCU, we inform the engine about the new head block hash,
                         // which can help trigger additional sync/download activities in the engine-tree.
-                        let block_hash = header.hash_slow();
                         let block_number = header.number;
                         tracing::debug!(
                             target: "bsc::block_import",
@@ -225,7 +225,7 @@ where
         block_msg: NewBlockMessage<BscNewBlock>,
     ) {
         // insert header to cache
-        insert_header_to_cache(block_msg.block.0.block.header.clone());
+        insert_header_to_cache_with_hash(block_msg.block.0.block.header.clone(), Some(block_msg.hash));
         // Cache the full block body for later range responses.
         crate::shared::cache_full_block(block_msg.block.0.block.clone());
         let block_hash = block_msg.hash;
@@ -255,11 +255,11 @@ where
         {
             let forkchoice_engine = self.forkchoice_engine.clone();
             tokio::spawn(async move {
-                tracing::debug!(target: "bsc::block_import", "Updating fork choice for mined block: number = {:?}, hash = {:?}", header_for_fcu.number, header_for_fcu.hash_slow());
+                tracing::debug!(target: "bsc::block_import", "Updating fork choice for mined block: number = {:?}, hash = {:?}", header_for_fcu.number, block_hash);
                 if let Err(e) = forkchoice_engine.update_forkchoice(&header_for_fcu).await {
-                    tracing::warn!(target: "bsc::block_import", "Failed to update fork choice for mined block: number = {:?}, hash = {:?}, error = {}", header_for_fcu.number, header_for_fcu.hash_slow(), e);
+                    tracing::warn!(target: "bsc::block_import", "Failed to update fork choice for mined block: number = {:?}, hash = {:?}, error = {}", header_for_fcu.number, block_hash, e);
                 } else {
-                    tracing::debug!(target: "bsc::block_import", "Succeed to update fork choice for mined block: number = {:?}, hash = {:?}", header_for_fcu.number, header_for_fcu.hash_slow());
+                    tracing::debug!(target: "bsc::block_import", "Succeed to update fork choice for mined block: number = {:?}, hash = {:?}", header_for_fcu.number, block_hash);
                 }
             });
         }

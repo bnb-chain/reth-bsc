@@ -18,7 +18,6 @@ use crate::consensus::parlia::constants::K_ANCESTOR_GENERATION_DEPTH;
 use crate::consensus::parlia::go_rng::{RngSource, Shuffle};
 use crate::consensus::parlia::provider::SnapshotProvider;
 use crate::consensus::parlia::util::is_breathe_block;
-use crate::consensus::parlia::vote_pool::fetch_vote_by_block_hash;
 use crate::consensus::parlia::VoteData;
 use crate::consensus::parlia::VoteSignature;
 use crate::consensus::parlia::SYSTEM_TXS_GAS_HARD_LIMIT;
@@ -724,19 +723,26 @@ where
         let mut target_header = parent_header.clone();
         let mut target_header_parent_snap = None;
         for _ in 0..times {
-            let snap = snapshot_provider.snapshot_by_hash(&target_header.parent_hash()).ok_or(
-                ParliaConsensusError::SnapshotNotFound { block_hash: target_header.parent_hash() },
+            let parent_hash = target_header.parent_hash();
+            let target_hash = target_header.hash_slow();
+            let snap = snapshot_provider.snapshot_by_hash(&parent_hash).ok_or(
+                ParliaConsensusError::SnapshotNotFound { block_hash: parent_hash },
             )?;
-            votes = fetch_vote_by_block_hash(target_header.hash_slow());
             let quorum = usize::div_ceil(snap.validators.len() * 2, 3);
-            if votes.len() >= quorum {
+            let (vote_count, maybe_votes) =
+                crate::consensus::parlia::vote_pool::count_and_fetch_if_quorum(
+                    target_hash,
+                    quorum,
+                );
+            if let Some(found_votes) = maybe_votes {
+                votes = found_votes;
                 target_header_parent_snap = Some(snap);
                 break;
             }
 
             tracing::debug!(target: "parlia::consensus", "vote count is less than 2/3 of validators, skip assemble vote attestation, number={}, parent={:?}, vote count={}, validators count={}", 
-                target_header.number(), target_header.hash_slow(), votes.len(), snap.validators.len());
-            let block_hash = target_header.parent_hash();
+                target_header.number(), target_hash, vote_count, snap.validators.len());
+            let block_hash = parent_hash;
             if let Some(header) =
                 crate::shared::get_canonical_header_by_hash_from_provider(&block_hash)
             {
