@@ -4,7 +4,10 @@ use crate::node::network::block_import::service::{IncomingBlock, IncomingMinedBl
 use crate::node::network::BscNetworkPrimitives;
 use crate::node::primitives::BscBlock;
 use alloy_consensus::{BlockHeader, Header};
-use alloy_primitives::B256;
+use alloy_rlp::Encodable;
+use alloy_eips::BlockId;
+use alloy_primitives::{B256, Bytes, U256};
+use reth_primitives::TransactionSigned;
 use parking_lot::Mutex;
 use reth_network::NetworkHandle;
 use reth_network_api::PeerId;
@@ -17,6 +20,9 @@ use std::sync::RwLock;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::UnboundedSender;
+use alloy_rpc_types::{
+    Block as RpcBlock, BlockOverrides, Header as RpcHeader, Receipt as RpcReceipt, Transaction as RpcTransaction, TransactionRequest as RpcTransactionRequest, state::StateOverride
+};
 
 /// Function type for HeaderProvider::header() access (by hash)
 type HeaderByHashFn = Arc<dyn Fn(&B256) -> Option<Header> + Send + Sync>;
@@ -507,6 +513,97 @@ pub fn set_mev_running(running: Arc<AtomicBool>) -> Result<(), Arc<AtomicBool>> 
 /// Get global MEV running status
 pub fn is_mev_running() -> bool {
     MEV_RUNNING.get().map(|status| status.load(Ordering::Relaxed)).unwrap_or(false)
+}
+
+// ============= IPC client ===============
+pub static IPC_CLIENT: OnceLock<Arc<jsonrpsee::async_client::Client>> = OnceLock::new();
+
+/// Set the IPC client
+pub async fn set_ipc_client(path: String) -> Result<(), eyre::Error> {
+    let client = reth_ipc::client::IpcClientBuilder::default()
+        .build(&path)
+        .await
+        .map_err(|e| eyre::eyre!("Failed to build RPC client: {:?}", e))?;
+    IPC_CLIENT.set(Arc::new(client)).map_err(|e| eyre::eyre!("Failed to set RPC client: {:?}", e))?;
+    Ok(())
+}
+
+/// Get the IPC client
+pub fn get_ipc_client() -> Option<Arc<jsonrpsee::async_client::Client>> {
+    IPC_CLIENT.get().cloned()
+}
+
+/// Call the IPC client to get the result of an Ethereum call
+/// This is a wrapper around the reth_rpc_eth_api::EthApiClient::call function
+/// It takes a transaction request, a block ID, a state overrides, and a block overrides
+/// It returns the result of the call as a Bytes object
+pub async fn ipc_eth_call(
+    req: RpcTransactionRequest,
+    block_id: Option<BlockId>,
+    state_overrides: Option<StateOverride>,
+    block_overrides: Option<Box<BlockOverrides>>,
+) -> Result<Bytes, eyre::Error> {
+    let client = get_ipc_client().ok_or(eyre::eyre!("Failed to get RPC client"))?;
+    reth_rpc_eth_api::EthApiClient::<
+        RpcTransactionRequest,
+        RpcTransaction,
+        RpcBlock,
+        RpcReceipt,
+        RpcHeader,
+    >::call(client.as_ref(), req, block_id, state_overrides, block_overrides)
+    .await
+    .map_err(|e| eyre::eyre!("failed to query chain id from healthy node: {e}"))
+}
+
+pub async fn ipc_estimate_gas(
+    req: RpcTransactionRequest,
+    block_id: Option<BlockId>,
+    state_overrides: Option<StateOverride>,
+) -> Result<U256, eyre::Error> {
+    let client = get_ipc_client().ok_or(eyre::eyre!("Failed to get RPC client"))?;
+    reth_rpc_eth_api::EthApiClient::<
+        RpcTransactionRequest,
+        RpcTransaction,
+        RpcBlock,
+        RpcReceipt,
+        RpcHeader,
+    >::estimate_gas(client.as_ref(), req, block_id, state_overrides)
+    .await
+    .map_err(|e| eyre::eyre!("failed to query chain id from healthy node: {e}"))
+}
+
+pub async fn ipc_send_transaction(
+    req: RpcTransactionRequest,
+) -> Result<B256, eyre::Error> {
+    let client = get_ipc_client().ok_or(eyre::eyre!("Failed to get RPC client"))?;
+    reth_rpc_eth_api::EthApiClient::<
+        RpcTransactionRequest,
+        RpcTransaction,
+        RpcBlock,
+        RpcReceipt,
+        RpcHeader,
+    >::send_transaction(client.as_ref(), req)
+    .await
+    .map_err(|e| eyre::eyre!("failed to query chain id from healthy node: {e}"))
+}
+
+/// Send a raw signed transaction via IPC (eth_sendRawTransaction)
+pub async fn ipc_send_raw_transaction(
+    tx: TransactionSigned,
+)-> Result<B256, eyre::Error> {
+    let client = get_ipc_client().ok_or(eyre::eyre!("Failed to get RPC client"))?;
+    let mut buf = Vec::new();
+    tx.encode(&mut buf);
+    let bytes = Bytes::from(buf);
+    reth_rpc_eth_api::EthApiClient::<
+        RpcTransactionRequest,
+        RpcTransaction,
+        RpcBlock,
+        RpcReceipt,
+        RpcHeader,
+    >::send_raw_transaction(client.as_ref(), bytes)
+    .await
+    .map_err(|e| eyre::eyre!("failed to query chain id from healthy node: {e}"))
 }
 
 #[cfg(test)]

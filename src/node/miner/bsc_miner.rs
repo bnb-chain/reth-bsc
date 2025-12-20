@@ -8,7 +8,7 @@ use crate::{
         engine::BscBuiltPayload,
         evm::config::BscEvmConfig,
         miner::{
-            config::{keystore, MiningConfig},
+            config::MiningConfig,
             payload::{BscPayloadBuilder, BscPayloadJob, BscPayloadJobHandle},
             signer::init_global_signer_from_k256,
             util::prepare_new_attributes,
@@ -1089,30 +1089,8 @@ where
         task_executor: TaskExecutor,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         mining_config.validate()?;
-
-        // We'll derive and trust the validator address from the configured signing key when possible.
-        // If not available, fall back to configured address (may be ZERO when disabled).
-        let mut validator_address = mining_config.validator_address.unwrap_or(Address::ZERO);
-        let signing_key = if let Some(keystore_path) = &mining_config.keystore_path {
-            let password = mining_config.keystore_password.as_deref().unwrap_or("");
-            keystore::load_private_key_from_keystore(keystore_path, password)?
-        } else if let Some(hex_key) = &mining_config.private_key_hex {
-            keystore::load_private_key_from_hex(hex_key)?
-        } else {
-            return Err("No signing key configured".into());
-        };
-        // Derive validator address from the signing key and prefer it.
-        let derived_address = keystore::get_validator_address(&signing_key);
-        if derived_address != validator_address {
-            if validator_address != Address::ZERO {
-                warn!(
-                    "Validator address mismatch, configured: {}, derived: {}",
-                    validator_address, derived_address
-                );
-            }
-            info!("Succeed to derived address from private key, address: {}", derived_address);
-            validator_address = derived_address;
-        }
+        let validator_address = mining_config.validator_address.ok_or(eyre::eyre!("No validator address configured"))?;
+        let signing_key = mining_config.signing_key.clone().ok_or(eyre::eyre!("No signing key configured"))?;
 
         let (mining_queue_tx, mining_queue_rx) = mpsc::unbounded_channel::<MiningContext>();
         let (payload_tx, payload_rx) = mpsc::unbounded_channel::<SubmitContext>();

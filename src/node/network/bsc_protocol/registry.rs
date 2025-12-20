@@ -299,10 +299,12 @@ pub fn spawn_evn_refresh_listener() {
                         );
                         // Apply on-chain NodeIDs to current peers if available
                         let nodeids = crate::node::network::evn_peers::get_onchain_nodeids_set();
+                        tracing::debug!(target: "bsc::evn", nodeids = ?nodeids, "NodeIDs set");
                         let mut marked = 0usize;
                         for p in peers {
                             let pid = p.to_string();
                             let pid_norm = crate::node::network::evn_peers::normalize_node_id_str(&pid);
+                            tracing::debug!(target: "bsc::evn", pid = pid, pid_norm = pid_norm, "Checking if peer is EVN: {}", nodeids.contains(&pid_norm));
                             if nodeids.contains(&pid_norm) {
                                 crate::node::network::evn_peers::mark_evn_onchain(p);
                                 if let Some(net) = crate::shared::get_network_handle() {
@@ -322,10 +324,12 @@ pub fn spawn_evn_refresh_listener() {
                                 Err(_) => Vec::new(),
                             };
                             let nodeids = crate::node::network::evn_peers::get_onchain_nodeids_set();
+                            tracing::debug!(target: "bsc::evn", nodeids = ?nodeids, "NodeIDs set");
                             let mut marked = 0usize;
                             for p in peers {
                                 let pid = p.to_string();
                                 let pid_norm = crate::node::network::evn_peers::normalize_node_id_str(&pid);
+                                tracing::debug!(target: "bsc::evn", pid = pid, pid_norm = pid_norm, "Checking if peer is EVN: {}", nodeids.contains(&pid_norm));
                                 if nodeids.contains(&pid_norm) {
                                     crate::node::network::evn_peers::mark_evn_onchain(p);
                                     if let Some(net) = crate::shared::get_network_handle() {

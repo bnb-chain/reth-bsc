@@ -30,6 +30,9 @@ use reth_provider::{BlockNumReader, HeaderProvider};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, info, warn};
+use alloy_rpc_types::{
+    TransactionRequest as RpcTransactionRequest,
+};
 
 pub mod block_import;
 pub(crate) mod blocks_by_range;
@@ -462,54 +465,94 @@ fn spawn_evn_sync_watcher<Node>(
 
                                                     if !to_add.is_empty() {
                                                         let (_to, data) = crate::system_contracts::encode_add_node_ids_call(to_add.clone());
-                                                        let tx = reth_primitives::Transaction::Legacy(alloy_consensus::TxLegacy {
+                                                        let mut tx = reth_primitives::Transaction::Legacy(alloy_consensus::TxLegacy {
                                                             chain_id: Some(chain_id),
                                                             nonce: next_nonce,
-                                                            gas_limit: u64::MAX / 2,
-                                                            gas_price: 0,
+                                                            gas_price: 1000000000,
                                                             value: U256::ZERO,
                                                             input: data,
                                                             to: alloy_primitives::TxKind::Call(crate::system_contracts::STAKE_HUB_CONTRACT),
+                                                            ..Default::default()
                                                         });
+                                                        match crate::shared::ipc_estimate_gas(RpcTransactionRequest::from_transaction(tx.clone()), None, None).await {
+                                                            Ok(gas) => {
+                                                                let gas_limit = std::cmp::min(gas, U256::from(u64::MAX / 2)).to::<u64>();
+                                                                debug!(target: "bsc::evn", "Estimated gas for transaction, to_add: {:?}, gas: {}, gas_limit: {}", to_add, gas, gas_limit);
+                                                                if let reth_primitives::Transaction::Legacy(inner) = &mut tx {
+                                                                    inner.gas_limit = gas_limit;
+                                                                }
+                                                            }
+                                                            Err(e) => {
+                                                                warn!(target: "bsc::evn", "Failed to estimate gas for transaction, to_add: {:?}, error: {}", to_add, e);
+                                                            }
+                                                        }
                                                         if let Ok(signed) = sign_system_transaction(tx) {
                                                             next_nonce += 1;
+                                                            let txhash = signed.tx_hash();
+                                                            info!(target: "bsc::evn", to_add = ?to_add, txhash = ?txhash, "Prepared StakeHub.addNodeIDs for broadcast");
                                                             signed_batch.push(signed);
-                                                            info!(target: "bsc::evn", to_add = ?to_add, "Prepared StakeHub.addNodeIDs for broadcast");
                                                         }
                                                     }
 
                                                     if !to_remove.is_empty() {
                                                         let (_to, data) = crate::system_contracts::encode_remove_node_ids_call(to_remove.clone());
-                                                        let tx = reth_primitives::Transaction::Legacy(alloy_consensus::TxLegacy {
+                                                        let mut tx = reth_primitives::Transaction::Legacy(alloy_consensus::TxLegacy {
                                                             chain_id: Some(chain_id),
                                                             nonce: next_nonce,
-                                                            gas_limit: u64::MAX / 2,
-                                                            gas_price: 0,
+                                                            gas_price: 1000000000,
                                                             value: U256::ZERO,
                                                             input: data,
                                                             to: alloy_primitives::TxKind::Call(crate::system_contracts::STAKE_HUB_CONTRACT),
+                                                            ..Default::default()
                                                         });
+                                                        match crate::shared::ipc_estimate_gas(RpcTransactionRequest::from_transaction(tx.clone()), None, None).await {
+                                                            Ok(gas) => {
+                                                                let gas_limit = std::cmp::min(gas, U256::from(u64::MAX / 2)).to::<u64>();
+                                                                debug!(target: "bsc::evn", "Estimated gas for transaction, to_remove: {:?}, gas: {}, gas_limit: {}", to_remove, gas, gas_limit);
+                                                                if let reth_primitives::Transaction::Legacy(inner) = &mut tx {
+                                                                    inner.gas_limit = gas_limit;
+                                                                }
+                                                            }
+                                                            Err(e) => {
+                                                                warn!(target: "bsc::evn", "Failed to estimate gas for transaction, to_remove: {:?}, error: {}", to_remove, e);
+                                                            }
+                                                        }
                                                         if let Ok(signed) = sign_system_transaction(tx) {
+                                                            let txhash = signed.tx_hash();
+                                                            info!(target: "bsc::evn", to_remove = ?to_remove, txhash = ?txhash, "Prepared StakeHub.removeNodeIDs for broadcast");
                                                             signed_batch.push(signed);
-                                                            info!(target: "bsc::evn", to_remove = ?to_remove, "Prepared StakeHub.removeNodeIDs for broadcast");
                                                         }
                                                     }
 
                                                     if !signed_batch.is_empty() {
                                                         if let Some(txh) = net.transactions_handle().await {
                                                             let count = signed_batch.len();
-                                                            txh.broadcast_transactions(signed_batch);
+                                                            txh.broadcast_transactions(signed_batch.clone());
                                                             info!(target: "bsc::evn", n = count, "Broadcasted StakeHub NodeIDs system txs to public network");
                                                         }
+
+                                                        // send the signed transactions to the IPC client (raw)
+                                                        for tx in signed_batch {
+                                                            let txhash = tx.tx_hash();
+                                                            if let Err(e) = crate::shared::ipc_send_raw_transaction(tx.clone()).await {
+                                                                warn!(target: "bsc::evn", "Failed to send transaction to IPC client, txhash: {}, error: {}", txhash, e);
+                                                            }
+                                                        }
                                                     }
+                                                } else {
+                                                    debug!(target: "bsc::evn", "Skipping NodeIDs broadcast: no account found for validator");
                                                 }
                                             }
                                         } else {
                                             info!(target: "bsc::evn", "Skipping NodeIDs broadcast: miner signer not initialised");
                                         }
+                                    } else {
+                                        debug!(target: "bsc::evn", "Skipping NodeIDs broadcast: no validator address configured");
                                     }
                                 }
                             }
+                        } else {
+                            debug!(target: "bsc::evn", "No NodeIDs actions to apply");
                         }
 
                         break;

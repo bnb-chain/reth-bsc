@@ -1,17 +1,19 @@
 use alloy_primitives::Address;
-use serde::{Deserialize, Serialize};
+use k256::ecdsa::SigningKey;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use crate::consensus::parlia::DEFAULT_MIN_GAS_TIP;
 
 /// Mining configuration for BSC PoSA
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 pub struct MiningConfig {
     /// Enable mining
     pub enabled: bool,
     /// Validator address for this node
     pub validator_address: Option<Address>,
+    /// Signing key for this node
+    pub signing_key: Option<SigningKey>,
     /// Path to validator private key file
     pub keystore_path: Option<PathBuf>,
     /// Password for keystore file
@@ -67,6 +69,7 @@ impl Default for MiningConfig {
         Self {
             enabled: false,
             validator_address: None,
+            signing_key: None,
             keystore_path: None,
             keystore_password: None,
             private_key_hex: None,
@@ -175,6 +178,7 @@ impl MiningConfig {
             Self {
                 enabled: true,
                 validator_address: Some(validator_address),
+                signing_key: Some(signing_key),
                 private_key_hex: Some(private_key_hex.to_string()),
                 keystore_path: None,
                 keystore_password: None,

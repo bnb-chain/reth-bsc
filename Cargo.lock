@@ -9680,6 +9680,7 @@ dependencies = [
  "reth-ethereum-primitives",
  "reth-evm",
  "reth-evm-ethereum",
+ "reth-ipc",
  "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?rev=ed9296cdc13d5d431d0dec8dd8f007adf8923a11)",
  "reth-network",
  "reth-network-api",
