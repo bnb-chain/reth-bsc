@@ -36,7 +36,7 @@ pub fn mark_evn_if_whitelisted(peer: PeerId) {
 
         // Compare peer's ID string with whitelist entries
         let node_id = peer_id_to_node_id(peer);
-        let is_whitelisted = cfg.whitelist_nodeids.iter().any(|w| *w == node_id);
+        let is_whitelisted = cfg.whitelist_nodeids.contains(&node_id);
         if is_whitelisted {
             if let Ok(mut map) = EVN_PEERS.write() {
                 map.entry(peer).and_modify(|e| { e.is_evn = true; e.reason = Some(EvnMarkReason::Whitelist); })
