@@ -109,6 +109,7 @@ where
                 let (to2, data2) = self.system_contracts.get_node_ids(self.inner_ctx.current_validators.as_ref().unwrap().0.clone());
                 if let Ok(output2) = self.eth_call(to2, data2) {
                     let (_consensus_addrs, node_ids_list) = self.system_contracts.unpack_data_into_node_ids(&output2);
+                    tracing::debug!("node_ids_list: {:?}", node_ids_list);
                     let mut flat: Vec<[u8; 32]> = Vec::new();
                     for ids in node_ids_list { for id in ids { flat.push(id); } }
                     crate::node::network::evn_peers::update_onchain_nodeids(flat);

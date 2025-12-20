@@ -101,6 +101,10 @@ pub struct BscCliArgs {
     /// Env alternative: `BSC_PROXYED_PEER_IDS` (comma-separated)
     #[arg(long = "proxyed-peers", value_delimiter = ',')]
     pub proxyed_peer_ids: Vec<String>,
+
+    /// Disable TX broadcast forbidden for EVN peers.
+    #[arg(long = "evn.disable-tx-broadcast-forbidden")]
+    pub evn_disable_tx_broadcast_forbidden: bool,
 }
 
 fn main() -> eyre::Result<()> {
@@ -218,6 +222,7 @@ fn main() -> eyre::Result<()> {
                     .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
                     .unwrap_or(false);
                 let evn_enabled = args.evn_enabled || enabled_from_env;
+                let disable_tx_broadcast_forbidden = args.evn_disable_tx_broadcast_forbidden;
                 // Collect whitelist node IDs
                 let whitelist_from_env = std::env::var("BSC_EVN_NODEIDS_WHITELIST")
                     .ok()
@@ -267,6 +272,7 @@ fn main() -> eyre::Result<()> {
 
                 let cfg = reth_bsc::node::network::evn::EvnConfig {
                     enabled: evn_enabled,
+                    disable_tx_broadcast_forbidden,
                     whitelist_nodeids,
                     proxyed_validators: parsed_validators,
                     nodeids_to_add: parse_nodeids(args.evn_add_nodeids.clone()),

@@ -6,6 +6,7 @@ use tokio::sync::broadcast;
 #[derive(Clone, Debug, Default)]
 pub struct EvnConfig {
     pub enabled: bool,
+    pub disable_tx_broadcast_forbidden: bool,
     pub whitelist_nodeids: Vec<String>,
     pub proxyed_validators: Vec<Address>,
     pub nodeids_to_add: Vec<[u8; 32]>,
