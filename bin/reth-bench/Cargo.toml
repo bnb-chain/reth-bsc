@@ -9,13 +9,13 @@ default-run = "reth-bench-bsc"
 
 [dependencies]
 # reth from BSC fork
-reth-cli-runner = { git = "https://github.com/bnb-chain/reth", rev = "b11687867" }
-reth-cli-util = { git = "https://github.com/bnb-chain/reth", rev = "b11687867" }
+reth-cli-runner = { git = "https://github.com/bnb-chain/reth.git", rev = "270a0b739a1bf71845c4669b3a3efd48a11a59d9" }
+reth-cli-util = { git = "https://github.com/bnb-chain/reth.git", rev = "270a0b739a1bf71845c4669b3a3efd48a11a59d9" }
 
-reth-node-api = { git = "https://github.com/bnb-chain/reth", rev = "b11687867" }
-reth-node-core = { git = "https://github.com/bnb-chain/reth", rev = "b11687867" }
-reth-primitives-traits = { git = "https://github.com/bnb-chain/reth", rev = "b11687867" }
-reth-tracing = { git = "https://github.com/bnb-chain/reth", rev = "b11687867" }
+reth-node-api = { git = "https://github.com/bnb-chain/reth.git", rev = "270a0b739a1bf71845c4669b3a3efd48a11a59d9" }
+reth-node-core = { git = "https://github.com/bnb-chain/reth.git", rev = "270a0b739a1bf71845c4669b3a3efd48a11a59d9" }
+reth-primitives-traits = { git = "https://github.com/bnb-chain/reth.git", rev = "270a0b739a1bf71845c4669b3a3efd48a11a59d9" }
+reth-tracing = { git = "https://github.com/bnb-chain/reth.git", rev = "270a0b739a1bf71845c4669b3a3efd48a11a59d9" }
 
 # alloy
 alloy-eips = "1.0"

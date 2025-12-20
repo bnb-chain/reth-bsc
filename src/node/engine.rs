@@ -72,6 +72,7 @@ pub struct BscPayloadServiceBuilder;
 impl<Node, Pool, Evm> PayloadServiceBuilder<Node, Pool, Evm> for BscPayloadServiceBuilder
 where
     Node: FullNodeTypes<Types = BscNode>,
+    <Node as FullNodeTypes>::Provider: reth_chain_state::NewCanonicalChainSubscriptions,
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>>
         + Clone
         + 'static,

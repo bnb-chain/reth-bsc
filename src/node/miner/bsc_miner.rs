@@ -120,6 +120,9 @@ where
         loop {
             match notifications.next().await {
                 Some(event) => {
+                    // Passively update trie overlay cache from canonical state notifications.
+                    crate::node::sparse_integrator::SparseDriver::try_subscribe_trie_changes();
+
                     let committed = event.committed();
                     let tip = committed.tip();
                     let is_reorg = matches!(event, CanonStateNotification::Reorg { .. });
@@ -471,6 +474,7 @@ where
         + BlockNumReader
         + reth_provider::StateProviderFactory
         + CanonStateSubscriptions
+        + reth_chain_state::NewCanonicalChainSubscriptions
         + Clone
         + Send
         + Sync
@@ -1087,6 +1091,7 @@ where
         + BlockNumReader
         + reth_provider::StateProviderFactory
         + CanonStateSubscriptions
+        + reth_chain_state::NewCanonicalChainSubscriptions
         + Clone
         + Send
         + Sync
@@ -1101,6 +1106,10 @@ where
         task_executor: TaskExecutor,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         mining_config.validate()?;
+
+        // Initialize the global sparse driver singleton (passive trigger model).
+        // The overlay itself is updated by draining notifications in `try_subscribe_trie_changes()`.
+        let _ = crate::node::sparse_integrator::SparseDriver::init_global(provider.clone(), 256);
 
         // We'll derive and trust the validator address from the configured signing key when possible.
         // If not available, fall back to configured address (may be ZERO when disabled).

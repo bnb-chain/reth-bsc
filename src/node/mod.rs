@@ -31,6 +31,7 @@ pub mod pool;
 pub mod miner;
 pub mod network;
 pub mod primitives;
+pub mod sparse_integrator;
 pub mod storage;
 pub mod vote_producer;
 pub mod vote_journal;
@@ -79,6 +80,7 @@ impl BscNode {
     >
     where
         Node: FullNodeTypes<Types = Self>,
+        <Node as FullNodeTypes>::Provider: reth_chain_state::NewCanonicalChainSubscriptions,
     {
         ComponentsBuilder::default()
             .node_types::<Node>()
@@ -100,6 +102,7 @@ impl NodeTypes for BscNode {
 impl<N> Node<N> for BscNode
 where
     N: FullNodeTypes<Types = Self>,
+    <N as FullNodeTypes>::Provider: reth_chain_state::NewCanonicalChainSubscriptions,
 {
     type ComponentsBuilder = ComponentsBuilder<
         N,
@@ -124,6 +127,7 @@ where
 impl<N> DebugNode<N> for BscNode
 where
     N: FullNodeComponents<Types = Self>,
+    <N as FullNodeTypes>::Provider: reth_chain_state::NewCanonicalChainSubscriptions,
 {
     type RpcBlock = alloy_rpc_types::Block;
 
