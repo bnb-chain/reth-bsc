@@ -459,7 +459,7 @@ fn spawn_evn_sync_watcher<Node>(
                                                         break;
                                                     }
                                                     Err(e) => {
-                                                        warn!(target: "bsc::evn", "Failed to broadcast NodeIDs, error: {}, added: {:?}, removed: {:?}", e, to_add, to_remove);
+                                                        warn!(target: "bsc::evn", "Failed to broadcast NodeIDs, error: {}, added: {:?}, removed: {:?}, try_times: {}", e, to_add, to_remove, try_times);
                                                     }
                                                 }
                                                 try_times += 1;
