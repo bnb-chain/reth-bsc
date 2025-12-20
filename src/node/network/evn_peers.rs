@@ -1,4 +1,4 @@
-use alloy_primitives::{B256, keccak256};
+use alloy_primitives::keccak256;
 use once_cell::sync::Lazy;
 use reth_network_api::PeerId;
 use std::collections::{HashMap, HashSet};
@@ -24,14 +24,8 @@ static EVN_PEERS: Lazy<RwLock<HashMap<PeerId, EvnPeerInfo>>> =
 static ONCHAIN_NODEIDS: Lazy<RwLock<HashSet<String>>> =
     Lazy::new(|| RwLock::new(HashSet::new()));
 
-/// Normalize an ID string for consistent comparison
-pub fn normalize_node_id_str(s: &str) -> String {
-    let s = s.trim().to_lowercase();
-    s.strip_prefix("0x").unwrap_or(&s).to_string()
-}
-
-pub fn peer_id_to_node_id(peer: PeerId) -> B256 {
-    keccak256(peer.as_slice())
+pub fn peer_id_to_node_id(peer: PeerId) -> String {
+    alloy_primitives::hex::encode(keccak256(peer.as_slice()))
 }
 
 /// Attempt to mark a peer as EVN by whitelist entries in the global EVN config.
@@ -41,9 +35,8 @@ pub fn mark_evn_if_whitelisted(peer: PeerId) {
         if cfg.whitelist_nodeids.is_empty() { return; }
 
         // Compare peer's ID string with whitelist entries
-        let pid = peer.to_string();
-        let pid_norm = normalize_node_id_str(&pid);
-        let is_whitelisted = cfg.whitelist_nodeids.iter().any(|w| normalize_node_id_str(w) == pid_norm);
+        let node_id = peer_id_to_node_id(peer);
+        let is_whitelisted = cfg.whitelist_nodeids.iter().any(|w| *w == node_id);
         if is_whitelisted {
             if let Ok(mut map) = EVN_PEERS.write() {
                 map.entry(peer).and_modify(|e| { e.is_evn = true; e.reason = Some(EvnMarkReason::Whitelist); })

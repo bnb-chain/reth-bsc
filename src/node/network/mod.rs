@@ -3,7 +3,7 @@ use crate::{
     BscBlock, chainspec::BscChainSpec, node::{
         BscNode, engine_api::payload::BscPayloadTypes, network::{
             block_import::{BscBlockImport, handle::ImportHandle},
-            evn_peers::peer_id_to_node_id,
+            evn_peers::{get_onchain_nodeids_set, peer_id_to_node_id},
         }, primitives::{BscBlobTransactionSidecar, BscPrimitives}
     }
 };
@@ -360,7 +360,7 @@ impl BscNetworkBuilder {
         }
         debug!(
             target: "bsc::net",
-            peer_id = ?peer_id_to_node_id(peer_id),
+            peer_id = peer_id_to_node_id(peer_id),
             version = ?network_config.status.version,
             td = ?network_config.status.total_difficulty,
             blockhash = ?network_config.status.blockhash,
@@ -503,6 +503,10 @@ async fn register_nodeids_actions<P: StateProviderFactory>(
     let mut next_nonce = acc.nonce;
     let chain_id = chain_spec.chain().id();
 
+    let onchain_nodeids_set = get_onchain_nodeids_set();
+    let to_add: Vec<[u8; 32]>= to_add.iter().filter(|id| !onchain_nodeids_set.contains(&alloy_primitives::hex::encode(**id))).map(|id| *id).collect();
+    let to_remove: Vec<[u8; 32]>= to_remove.iter().filter(|id| onchain_nodeids_set.contains(&alloy_primitives::hex::encode(**id))).map(|id| *id).collect();
+    debug!(target: "bsc::evn", to_add = ?to_add, to_remove = ?to_remove, onchain_nodeids_set = ?onchain_nodeids_set, "refreshed to_add and to_remove");
     let mut signed_batch: Vec<TransactionSigned> = Vec::new();
     if !to_add.is_empty() {
         let (_to, data) = crate::system_contracts::encode_add_node_ids_call(to_add.clone());

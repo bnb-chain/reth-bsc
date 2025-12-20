@@ -302,10 +302,9 @@ pub fn spawn_evn_refresh_listener() {
                         tracing::debug!(target: "bsc::evn", nodeids = ?nodeids, "NodeIDs set");
                         let mut marked = 0usize;
                         for p in peers {
-                            let pid = p.to_string();
-                            let pid_norm = crate::node::network::evn_peers::normalize_node_id_str(&pid);
-                            tracing::debug!(target: "bsc::evn", pid = pid, pid_norm = pid_norm, "Checking if peer is EVN: {}", nodeids.contains(&pid_norm));
-                            if nodeids.contains(&pid_norm) {
+                            let node_id = crate::node::network::evn_peers::peer_id_to_node_id(p);
+                            tracing::debug!(target: "bsc::evn", peer_id = ?p, node_id = ?node_id, "Checking if peer is EVN: {}", nodeids.contains(&node_id));
+                            if nodeids.contains(&node_id) {
                                 crate::node::network::evn_peers::mark_evn_onchain(p);
                                 if let Some(net) = crate::shared::get_network_handle() {
                                     net.add_trusted_peer_id(p);
@@ -327,10 +326,9 @@ pub fn spawn_evn_refresh_listener() {
                             tracing::debug!(target: "bsc::evn", nodeids = ?nodeids, "NodeIDs set");
                             let mut marked = 0usize;
                             for p in peers {
-                                let pid = p.to_string();
-                                let pid_norm = crate::node::network::evn_peers::normalize_node_id_str(&pid);
-                                tracing::debug!(target: "bsc::evn", pid = pid, pid_norm = pid_norm, "Checking if peer is EVN: {}", nodeids.contains(&pid_norm));
-                                if nodeids.contains(&pid_norm) {
+                                let node_id = crate::node::network::evn_peers::peer_id_to_node_id(p);
+                                tracing::debug!(target: "bsc::evn", peer_id = ?p, node_id = ?node_id, "Checking if peer is EVN: {}", nodeids.contains(&node_id));
+                                if nodeids.contains(&node_id) {
                                     crate::node::network::evn_peers::mark_evn_onchain(p);
                                     if let Some(net) = crate::shared::get_network_handle() {
                                         net.add_trusted_peer_id(p);
