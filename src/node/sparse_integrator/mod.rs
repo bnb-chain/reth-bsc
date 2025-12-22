@@ -12,6 +12,6 @@ pub mod sparse_driver;
 
 pub use trie_overlay::{TrieOverlayCache, TrieOverlayEntry};
 // Note: the overlay cache is no longer a global OnceLock; it is owned by the global SparseDriver.
-pub use sparse_driver::SparseDriver;
+pub use sparse_driver::{SparseDriver, SparseTaskKey, SparseTrieRootWaiterHandle};
 
 

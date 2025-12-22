@@ -4,12 +4,14 @@ use crate::consensus::parlia::Parlia;
 use crate::evm::blacklist;
 use crate::hardforks::BscHardforks;
 use crate::node::engine::BscBuiltPayload;
-use crate::node::evm::config::BscEvmConfig;
+use crate::node::evm::config::{BscEvmConfig, BscNextBlockEnvAttributes};
 use crate::node::miner::bid_simulator::BidSimulator;
 use crate::node::miner::bsc_miner::{MiningContext, SubmitContext};
 use crate::node::pool::BlacklistedAddressError;
 use crate::node::primitives::BscBlobTransactionSidecar;
+use crate::node::sparse_integrator::SparseDriver;
 use alloy_consensus::{BlockHeader, Transaction};
+use alloy_evm::block::BlockExecutor;
 use alloy_evm::Evm;
 use alloy_primitives::U256;
 use reth::payload::EthPayloadBuilderAttributes;
@@ -62,28 +64,28 @@ pub fn generate_trace_id() -> u64 {
 pub enum BscPayloadJobError {
     #[error("Failed to send signal to build queue: {0}")]
     BuildQueueSendError(String),
-
+    
     #[error("Failed to send best payload to result channel: {0}")]
     ResultChannelSendError(String),
-
+    
     #[error("Payload building failed: {0}")]
     PayloadBuildingError(String),
-
+    
     #[error("Task execution failed: {0}")]
     TaskExecutionError(String),
-
+    
     #[error("Job was aborted")]
     JobAborted,
-
+    
     #[error("Timeout occurred during payload building")]
     Timeout,
-
+    
     #[error("No payloads available to select from")]
     NoPayloadsAvailable,
-
+    
     #[error("Build arguments are invalid: {0}")]
     InvalidBuildArguments(String),
-
+    
     #[error("Channel communication failed: {0}")]
     ChannelCommunicationError(String),
 }
@@ -122,10 +124,17 @@ pub struct BscPayloadBuilder<Pool, Client, EvmConfig = BscEvmConfig> {
     ctx: MiningContext,
 }
 
-impl<Pool, Client, EvmConfig> BscPayloadBuilder<Pool, Client, EvmConfig>
+impl<Pool, Client, EvmConfig> BscPayloadBuilder<Pool, Client, EvmConfig> 
 where
-    Client: StateProviderFactory + 'static,
-    EvmConfig: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
+    Client: StateProviderFactory
+        + reth_provider::DatabaseProviderFactory<
+            Provider: reth_provider::BlockReader
+                + reth_provider::BlockNumReader
+                + reth_provider::HeaderProvider,
+        >
+        + Clone
+        + 'static,
+    EvmConfig: ConfigureEvm<NextBlockEnvCtx = BscNextBlockEnvAttributes> + 'static,
     <EvmConfig as ConfigureEvm>::Primitives: reth_primitives_traits::NodePrimitives<
         BlockHeader = alloy_consensus::Header,
         SignedTx = alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip4844>,
@@ -147,19 +156,19 @@ where
     }
 
     /// Builds a payload with the given arguments.
-    ///
+    /// 
     /// # Thread Safety
-    ///
+    /// 
     /// This method takes `&self` and may be called concurrently. The underlying fields
     /// (such as `client`, `pool`, etc.) are designed to be thread-safe, but callers should
     /// ensure that concurrent calls don't cause race conditions in shared state.
-    ///
+    /// 
     /// # Arguments
-    ///
+    /// 
     /// * `args` - Build arguments containing cached reads, config, cancel token
-    ///
+    /// 
     /// # Returns
-    ///
+    /// 
     /// Returns a `Result` containing the built payload or an error.
     pub async fn build_payload(
         &self,
@@ -176,12 +185,21 @@ where
             .with_bundle_update()
             .build();
 
-        let mut builder = self
-            .evm_config
-            .builder_for_next_block(
-                &mut db,
-                &parent_header,
-                NextBlockEnvAttributes {
+        // 在这里调用sparse driver的try_start_sparse_tree方法
+        // 提示：
+        // 1.整体参照 https://github.com/will-2012/reth-bsc/pull/36/files#diff-7fa9fe23064ce31d1cbb42e5fa9d2800fe91f39a28e7b11a1e2402909d784211R215 这里的逻辑
+        // 2.try_start_sparse_tree参数及返回值都可以根据需要调整
+        // 3.逻辑复杂都放在sparse_driver.rs中内部，在payload这里仅仅是一个调用
+        // 4.如果try_start_sparse_tree成功，将返回的hook，设置一下；像builder.executor_mut().set_state_hook(Some(Box::new(pp_handle.state_hook()))); 这样
+        // 5.建议返回两个参数，一个sparse_task_key，一个是hook
+        // 6，sparse_task_key包含，parent_hash+当前块高+traceid+sparse_driver内部一个全局唯一的递增的id
+        // 7.在sparse_driver内部用sparse_task_key和payload_processor实例绑定
+
+        // 1) try_start_sparse_tree first (PR36 style), then create the builder.
+        // If started, we attach a "trie root waiter" into `BscNextBlockEnvAttributes`, which is
+        // forwarded into execution ctx and consumed by `builder.finish()`.
+        let mut next_env_attributes = BscNextBlockEnvAttributes {
+            inner: NextBlockEnvAttributes {
                     timestamp: attributes.timestamp(),
                     suggested_fee_recipient: attributes.suggested_fee_recipient(),
                     prev_randao: attributes.prev_randao(),
@@ -189,8 +207,40 @@ where
                     parent_beacon_block_root: attributes.parent_beacon_block_root(),
                     withdrawals: Some(attributes.withdrawals().clone()),
                 },
-            )
+            sparse_trie_root_waiter: None,
+        };
+
+        let mut sparse_state_hook: Option<Box<dyn reth_evm::OnStateHook>> = None;
+        let _sparse_task_key = SparseDriver::try_start_sparse_tree(
+            parent_header.hash_slow(),
+            parent_header.number + 1,
+            trace_id,
+            parent_header.header(),
+            &next_env_attributes,
+            self.client.clone(),
+                self.evm_config.clone(),
+        )
+        .map(|(key, hook, waiter)| {
+            sparse_state_hook = Some(hook);
+            next_env_attributes.sparse_trie_root_waiter = Some(waiter);
+            key
+        });
+
+        let mut builder = self
+            .evm_config
+            .builder_for_next_block(&mut db, &parent_header, next_env_attributes)
             .map_err(PayloadBuilderError::other)?;
+
+        if let Some(hook) = sparse_state_hook {
+            builder.executor_mut().set_state_hook(Some(hook));
+        }
+
+        // 调整一下这里
+        // 1.先尝试try_start_sparse_tree，然后在创建builder
+        // 2.try_start_sparse_tree把等待trie root那个管道也返回回来
+        // 3.BscNextBlockEnvAttributes新增一个字段防止sparse tree trie root结果接受管道
+        // 4.builder_for_next_block时候，传递给执行ctx
+        // 5.在builder.finish内部，如果有tire root管道，则用这个管道的结果，没有的话还使用原来的串行计算root
 
         builder.apply_pre_execution_changes().map_err(|err| {
             warn!(
@@ -215,7 +265,7 @@ where
 
         let base_fee = builder.evm_mut().block().basefee;
         trace!("build_payload: base_fee={}", base_fee);
-
+        
         let mut sidecars_map = HashMap::new();
         let mut block_blob_count = 0;
 
@@ -398,7 +448,7 @@ where
                     "Blob transaction sidecar prepared"
                 );
             }
-
+            
             let gas_used = match builder.execute_transaction(tx.clone()) {
                 Ok(gas_used) => gas_used,
                 Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
@@ -452,7 +502,7 @@ where
                 Err(err) => return Err(Box::new(PayloadBuilderError::evm(err))),
             };
 
-            // add to the total blob gas used if the transaction successfully executed
+             // add to the total blob gas used if the transaction successfully executed
             if let Some(blob_tx) = tx.as_eip4844() {
                 block_blob_count += blob_tx.tx().blob_versioned_hashes.len() as u64;
 
@@ -467,7 +517,7 @@ where
                 .expect("fee is always valid; execution succeeded");
             total_fees += U256::from(miner_fee) * U256::from(gas_used);
             cumulative_gas_used += gas_used;
-
+            
             let tx_duration = tx_start.elapsed();
             if tx_duration.as_micros() > 3000 {
                 debug!(
@@ -504,27 +554,27 @@ where
         let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } =
             builder.finish(&state_provider)?;
         let mut sealed_block = Arc::new(block.sealed_block().clone());
-
+        
         // Update miner metrics
         use crate::metrics::BscMinerMetrics;
         use once_cell::sync::Lazy;
         static MINER_METRICS: Lazy<BscMinerMetrics> = Lazy::new(BscMinerMetrics::default);
-
+        
         let finalize_duration = finalize_start.elapsed().as_secs_f64();
         MINER_METRICS.block_finalize_duration_seconds.record(finalize_duration);
         MINER_METRICS.blocks_produced_total.increment(1);
-
+        
         // set sidecars to seal block
         let mut blob_sidecars: Vec<BscBlobTransactionSidecar> = Vec::new();
         let transactions = &sealed_block.body().inner.transactions;
-
+        
         let build_duration = build_start.elapsed();
         let avg_tx_duration_micros = if !transactions.is_empty() {
             build_duration.as_micros() / transactions.len() as u128
         } else {
             0
         };
-
+        
         debug!(
             target: "payload_builder",
             trace_id,
@@ -537,7 +587,7 @@ where
             avg_tx_duration_micros,
             "Block payload built successfully"
         );
-
+        
         for (index, tx) in transactions.iter().enumerate() {
             trace!(
                 target: "payload_builder",
@@ -568,7 +618,7 @@ where
         let mut plain = sealed_block.clone_block();
         plain.body.sidecars = Some(blob_sidecars);
         sealed_block = Arc::new(plain.into());
-
+    
         let payload = BscBuiltPayload {
             block: sealed_block.clone(),
             fees: total_fees,
@@ -605,19 +655,22 @@ where
             .with_database(cached_reads.as_db_mut(state))
             .with_bundle_update()
             .build();
-
+        
         let mut builder = self
             .evm_config
             .builder_for_next_block(
                 &mut db,
                 &parent_header,
-                NextBlockEnvAttributes {
+                BscNextBlockEnvAttributes {
+                    inner: NextBlockEnvAttributes {
                     timestamp: attributes.timestamp(),
                     suggested_fee_recipient: attributes.suggested_fee_recipient(),
                     prev_randao: attributes.prev_randao(),
                     gas_limit: self.builder_config.gas_limit(parent_header.gas_limit),
                     parent_beacon_block_root: attributes.parent_beacon_block_root(),
                     withdrawals: Some(attributes.withdrawals().clone()),
+                    },
+                    sparse_trie_root_waiter: None,
                 },
             )
             .map_err(PayloadBuilderError::other)?;
@@ -641,18 +694,18 @@ where
         let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } =
             builder.finish(&state_provider)?;
         let sealed_block = Arc::new(block.sealed_block().clone());
-
+        
         // Update miner metrics
         use crate::metrics::BscMinerMetrics;
         use once_cell::sync::Lazy;
         static MINER_METRICS: Lazy<BscMinerMetrics> = Lazy::new(BscMinerMetrics::default);
-
+        
         let finalize_duration = finalize_start.elapsed().as_secs_f64();
         MINER_METRICS.block_finalize_duration_seconds.record(finalize_duration);
         MINER_METRICS.blocks_produced_total.increment(1);
-
+        
         let build_duration = build_start.elapsed();
-
+        
         debug!(
             target: "payload_builder",
             trace_id,
@@ -664,7 +717,7 @@ where
             build_duration_ms = build_duration.as_millis(),
             "Empty block payload built successfully (no user transactions)"
         );
-
+    
         let payload = BscBuiltPayload {
             block: sealed_block.clone(),
             fees: total_fees,
@@ -698,7 +751,7 @@ impl BscPayloadJobHandle {
 }
 
 /// BscPayloadJob is used to async build payloads to get best payload.
-pub struct BscPayloadJob<Pool, Client, EvmConfig = BscEvmConfig>
+pub struct BscPayloadJob<Pool, Client, EvmConfig = BscEvmConfig> 
 where
     Pool: TransactionPool,
 {
@@ -744,9 +797,14 @@ where
     Client: StateProviderFactory
         + reth_provider::HeaderProvider<Header = alloy_consensus::Header>
         + reth_provider::BlockHashReader
+        + reth_provider::DatabaseProviderFactory<
+            Provider: reth_provider::BlockReader
+                + reth_provider::BlockNumReader
+                + reth_provider::HeaderProvider,
+        >
         + Clone
         + 'static,
-    EvmConfig: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
+    EvmConfig: ConfigureEvm<NextBlockEnvCtx = BscNextBlockEnvAttributes> + 'static,
     <EvmConfig as ConfigureEvm>::Primitives: reth_primitives_traits::NodePrimitives<
         BlockHeader = alloy_consensus::Header,
         SignedTx = alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip4844>,
@@ -767,12 +825,12 @@ where
         let (abort_tx, abort_rx) = oneshot::channel();
         let (try_build_tx, try_build_rx) = mpsc::unbounded_channel();
         let (tx_listener_tx, tx_listener_rx) = mpsc::unbounded_channel();
-
+        
         let trace_id = build_args.trace_id;
-
+        
         let mining_delay = parlia.clone().delay_for_mining(
-            &mining_ctx.parent_snapshot,
-            mining_ctx.header.as_ref().unwrap(),
+            &mining_ctx.parent_snapshot, 
+            mining_ctx.header.as_ref().unwrap(), 
             DELAY_LEFT_OVER,
         );
 
@@ -836,7 +894,7 @@ where
             );
             return Err(Box::new(BscPayloadJobError::BuildQueueSendError(err.to_string())));
         }
-
+    
         loop {
             // Calculate remaining time from job start for outer loop
             let job_elapsed = self.job_start_time.elapsed();
@@ -855,7 +913,7 @@ where
                 );
                 return self.try_return_best_payload();
             };
-
+            
             tokio::select! {
                 // Trigger the async build payload by queue.
                 args = self.try_build_rx.recv() => {
@@ -871,11 +929,11 @@ where
                                 retries = self.retries,
                                 "Try new build"
                             );
-
+                            
                             let builder = self.builder.clone();
                             let build_args = self.build_args.clone();
                             self.join_handle.spawn(async move {
-                                builder.build_payload(build_args).await
+                                    builder.build_payload(build_args).await
                             });
                         }
                         None => {
@@ -890,7 +948,7 @@ where
                         }
                     }
                 }
-
+                
                 // Try to join the async payload build task.
                 result = self.join_handle.join_next() => {
                     match result {
@@ -934,7 +992,7 @@ where
                                     );
                                     return self.try_return_best_payload();
                                 };
-
+                                
                                 tokio::select! {
                                     // Use remaining time instead of full timeout
                                     _ = tokio::time::sleep(remaining_duration) => {
@@ -970,8 +1028,8 @@ where
                                     Some(_tx_hash) = self.tx_listener.recv() => {
                                         new_tx_count+=1;
                                         let mining_delay = self.parlia.delay_for_mining(
-                                            &self.mining_ctx.parent_snapshot,
-                                            self.mining_ctx.header.as_ref().unwrap(),
+                                            &self.mining_ctx.parent_snapshot, 
+                                            self.mining_ctx.header.as_ref().unwrap(), 
                                             DELAY_LEFT_OVER);
                                         if std::time::Duration::from_millis(mining_delay) < elapsed {
                                             debug!(
@@ -1072,7 +1130,7 @@ where
                         },
                     }
                 }
-
+                
                 // Finish timeout by timer using remaining duration
                 _ = tokio::time::sleep(remaining_duration) => {
                     let elapsed = start_time.elapsed();
@@ -1090,7 +1148,7 @@ where
                     self.build_args.cancel.clone().cancel();
                     return self.try_return_best_payload();
                 }
-
+                
                 // Abort by new head.
                 _ = &mut self.abort_rx => {
                     let elapsed = start_time.elapsed();
@@ -1151,7 +1209,7 @@ where
         } else {
             // No best payload available
             let total_job_duration = self.job_start_time.elapsed();
-
+            
             // If in-turn, build an empty payload as fallback
             if self.mining_ctx.is_inturn {
                 warn!(
@@ -1162,7 +1220,7 @@ where
                     total_job_duration_ms = total_job_duration.as_millis(),
                     "No best payload available, building empty payload as in-turn fallback"
                 );
-
+                
                 // Build empty payload synchronously (blocking) and measure time
                 let empty_build_start = std::time::Instant::now();
                 let empty_payload_result = tokio::task::block_in_place(|| {
@@ -1171,7 +1229,7 @@ where
                     })
                 });
                 let empty_build_duration = empty_build_start.elapsed();
-
+                
                 match empty_payload_result {
                     Ok(empty_payload) => {
                         info!(
@@ -1184,7 +1242,7 @@ where
                             empty_build_duration_ms = empty_build_duration.as_millis(),
                             "Successfully built empty payload as in-turn fallback"
                         );
-
+                        
                         if let Err(err) = self.result_tx.send(SubmitContext {
                             mining_ctx: self.mining_ctx.clone(),
                             payload: empty_payload,
@@ -1245,12 +1303,12 @@ where
         let total_len = self.potential_payloads.len();
         let best_payload = self.potential_payloads.remove(best_index);
         let total_job_duration = self.job_start_time.elapsed();
-
+        
         let gas_used = best_payload.block().header().gas_used();
         let gas_limit = best_payload.block().header().gas_limit();
         let gas_usage_percent =
             if gas_limit > 0 { (gas_used as f64 / gas_limit as f64 * 100.0) as u64 } else { 0 };
-
+        
         info!(
             target: "bsc::miner::payload",
             trace_id = self.trace_id,

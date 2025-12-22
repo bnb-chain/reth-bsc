@@ -109,9 +109,30 @@ where
         // calculate the state root
         let state_root_start = std::time::Instant::now();
         let hashed_state = state.hashed_post_state(&db.bundle_state);
-        let (state_root, trie_updates) = state
-            .state_root_with_updates(hashed_state.clone())
-            .map_err(BlockExecutionError::other)?;
+        let (state_root, trie_updates, state_root_source) =
+            if let Some(waiter) = self.ctx.sparse_trie_root_waiter.as_ref() {
+            // If sparse trie root pipeline is available, prefer it. On any error, fall back to the
+            // existing serial computation to preserve correctness.
+            match waiter.lock().wait() {
+                Ok(outcome) => (outcome.state_root, outcome.trie_updates, "sparse"),
+                Err(err) => {
+                    tracing::warn!(
+                        target: "bsc::builder",
+                        ?err,
+                        "Sparse trie root waiter failed; falling back to serial state root"
+                    );
+                    let (root, updates) = state
+                        .state_root_with_updates(hashed_state.clone())
+                        .map_err(BlockExecutionError::other)?;
+                    (root, updates, "sparse_fallback_serial")
+                }
+            }
+        } else {
+            let (root, updates) = state
+                .state_root_with_updates(hashed_state.clone())
+                .map_err(BlockExecutionError::other)?;
+            (root, updates, "serial")
+        };
         let state_root_duration = state_root_start.elapsed();
 
         let user_tx_len = self.transactions.len();
@@ -154,6 +175,7 @@ where
             target: "bsc::builder",
             block_number = %block.header.number,
             block_hash = %block.header.hash_slow(),
+            state_root_source = state_root_source,
             user_tx_len = user_tx_len,
             system_tx_len = system_tx_len,
             total_tx_len = total_tx_len,

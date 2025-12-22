@@ -472,6 +472,11 @@ where
         + 'static,
     Provider: HeaderProvider<Header = alloy_consensus::Header>
         + BlockNumReader
+        + reth_provider::DatabaseProviderFactory<
+            Provider: reth_provider::BlockReader
+                + reth_provider::BlockNumReader
+                + reth_provider::HeaderProvider,
+        >
         + reth_provider::StateProviderFactory
         + CanonStateSubscriptions
         + reth_chain_state::NewCanonicalChainSubscriptions
@@ -1089,6 +1094,11 @@ where
         + 'static,
     Provider: HeaderProvider<Header = alloy_consensus::Header>
         + BlockNumReader
+        + reth_provider::DatabaseProviderFactory<
+            Provider: reth_provider::BlockReader
+                + reth_provider::BlockNumReader
+                + reth_provider::HeaderProvider,
+        >
         + reth_provider::StateProviderFactory
         + CanonStateSubscriptions
         + reth_chain_state::NewCanonicalChainSubscriptions

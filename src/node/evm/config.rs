@@ -27,6 +27,55 @@ use revm::{
 };
 use std::{borrow::Cow, cell::RefCell, convert::Infallible, rc::Rc, sync::Arc};
 
+/// BSC wrapper type around [`NextBlockEnvAttributes`].
+///
+/// This wraps the upstream `reth_evm` type and allows attaching BSC-specific context (such as a
+/// sparse trie root receiver) without modifying upstream.
+#[derive(Clone)]
+pub struct BscNextBlockEnvAttributes {
+    pub inner: NextBlockEnvAttributes,
+    /// Optional sparse trie root waiter that will be forwarded into execution ctx.
+    pub sparse_trie_root_waiter: Option<crate::node::sparse_integrator::SparseTrieRootWaiterHandle>,
+}
+
+impl From<NextBlockEnvAttributes> for BscNextBlockEnvAttributes {
+    fn from(value: NextBlockEnvAttributes) -> Self {
+        Self { inner: value, sparse_trie_root_waiter: None }
+    }
+}
+
+impl From<BscNextBlockEnvAttributes> for NextBlockEnvAttributes {
+    fn from(value: BscNextBlockEnvAttributes) -> Self {
+        value.inner
+    }
+}
+
+impl std::ops::Deref for BscNextBlockEnvAttributes {
+    type Target = NextBlockEnvAttributes;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl core::fmt::Debug for BscNextBlockEnvAttributes {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("BscNextBlockEnvAttributes")
+            .field("inner", &self.inner)
+            .field("has_sparse_trie_root_waiter", &self.sparse_trie_root_waiter.is_some())
+            .finish()
+    }
+}
+
+// Required by the RPC pending-block pipeline.
+impl<H: alloy_consensus::BlockHeader> reth_rpc_eth_api::helpers::pending_block::BuildPendingEnv<H>
+    for BscNextBlockEnvAttributes
+{
+    fn build_pending_env(parent: &reth_primitives_traits::SealedHeader<H>) -> Self {
+        Self { inner: NextBlockEnvAttributes::build_pending_env(parent), sparse_trie_root_waiter: None }
+    }
+}
+
 /// Type alias for system transactions to reduce complexity
 type SystemTxs = Vec<reth_primitives_traits::Recovered<reth_primitives_traits::TxTy<crate::BscPrimitives>>>;
 
@@ -59,7 +108,7 @@ impl Default for BscExecutionSharedCtx {
 
 /// Context for BSC block execution.
 /// Contains all the fields from EthBlockExecutionCtx plus additional header field.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BscBlockExecutionCtx<'a> {
     /// Base Ethereum execution context.
     pub base: EthBlockExecutionCtx<'a>,
@@ -67,8 +116,20 @@ pub struct BscBlockExecutionCtx<'a> {
     pub header: Option<Header>,
     /// Whether the block is being mined.
     pub is_miner: bool,
+    /// Optional sparse trie root waiter for `finish()` to use.
+    pub sparse_trie_root_waiter: Option<crate::node::sparse_integrator::SparseTrieRootWaiterHandle>,
 }
 
+impl<'a> core::fmt::Debug for BscBlockExecutionCtx<'a> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("BscBlockExecutionCtx")
+            .field("base", &"<EthBlockExecutionCtx>")
+            .field("header", &self.header)
+            .field("is_miner", &self.is_miner)
+            .field("has_sparse_trie_root_waiter", &self.sparse_trie_root_waiter.is_some())
+            .finish()
+    }
+}
 impl<'a> BscBlockExecutionCtx<'a> {
     /// Convert to EthBlockExecutionCtx for compatibility with existing BlockAssembler.
     pub fn as_eth_context(&self) -> &EthBlockExecutionCtx<'a> {
@@ -198,7 +259,7 @@ where
 {
     type Primitives = BscPrimitives;
     type Error = Infallible;
-    type NextBlockEnvCtx = NextBlockEnvAttributes;
+    type NextBlockEnvCtx = BscNextBlockEnvAttributes;
     type BlockExecutorFactory = BscBlockExecutorFactory;
     type BlockAssembler = BscBlockAssembler<BscChainSpec>;
 
@@ -343,6 +404,7 @@ where
             },
             header: Some(block.header().clone()),
             is_miner: false,
+            sparse_trie_root_waiter: None,
         }
     }
 
@@ -357,10 +419,11 @@ where
                 parent_hash: parent.hash(),
                 parent_beacon_block_root: attributes.parent_beacon_block_root,
                 ommers: &[],
-                withdrawals: attributes.withdrawals.map(Cow::Owned),
+                withdrawals: attributes.withdrawals.clone().map(Cow::Owned),
             },
             header: None, // No header available for next block context
             is_miner: true,
+            sparse_trie_root_waiter: attributes.sparse_trie_root_waiter,
         }
     }
 
@@ -418,6 +481,7 @@ where
             },
             header: Some(block.header.clone()),
             is_miner: false,
+            sparse_trie_root_waiter: None,
         }
     }
 

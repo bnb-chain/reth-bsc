@@ -4,7 +4,7 @@ use crate::consensus::parlia::provider::SnapshotProvider;
 use crate::consensus::parlia::Snapshot;
 use crate::hardforks::BscHardforks;
 use crate::node::engine::BscBuiltPayload;
-use crate::node::evm::config::BscEvmConfig;
+use crate::node::evm::config::{BscEvmConfig, BscNextBlockEnvAttributes};
 use crate::node::miner::bsc_miner::MiningContext;
 use crate::node::miner::payload::DELAY_LEFT_OVER;
 use crate::node::miner::util::prepare_new_attributes;
@@ -392,13 +392,16 @@ where
             .builder_for_next_block(
                 &mut db,
                 &parent_header,
-                NextBlockEnvAttributes {
+                BscNextBlockEnvAttributes {
+                    inner: NextBlockEnvAttributes {
                     timestamp: attributes.timestamp(),
                     suggested_fee_recipient: attributes.suggested_fee_recipient(),
                     prev_randao: attributes.prev_randao(),
                     gas_limit,
                     parent_beacon_block_root: attributes.parent_beacon_block_root(),
                     withdrawals: Some(attributes.withdrawals().clone()),
+                    },
+                    sparse_trie_root_waiter: None,
                 },
             )
             .map_err(PayloadBuilderError::other)
@@ -655,7 +658,7 @@ where
             Transaction: reth::transaction_pool::PoolTransaction<Consensus = TransactionSigned>,
         > + Clone
         + 'static,
-    EvmConfig: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
+    EvmConfig: ConfigureEvm<NextBlockEnvCtx = BscNextBlockEnvAttributes> + 'static,
     <EvmConfig as ConfigureEvm>::Primitives: reth_primitives_traits::NodePrimitives<
         BlockHeader = alloy_consensus::Header,
         SignedTx = alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip4844>,
