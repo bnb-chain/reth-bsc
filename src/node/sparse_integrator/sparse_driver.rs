@@ -8,6 +8,7 @@
 //! from the component that already receives canonical state notifications (e.g. miner loop).
 
 use super::trie_overlay::TrieOverlayCache;
+use super::trie_overlay::TrieOverlayEntry;
 use alloy_consensus::BlockHeader;
 use parking_lot::RwLock;
 use parking_lot::Mutex;
@@ -26,6 +27,7 @@ use reth_trie::TrieInput;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::ops::RangeInclusive;
 use tokio::sync::broadcast;
 use tracing::{debug, warn};
 
@@ -38,6 +40,7 @@ static SPARSE_TASK_ID: AtomicU64 = AtomicU64::new(1);
 /// Object-safe sparse driver API for a global singleton.
 trait SparseDriverDyn {
     fn try_subscribe_trie_changes(&self);
+    fn overlay_entries(&self, range: RangeInclusive<u64>) -> Vec<TrieOverlayEntry>;
 }
 
 /// A cloneable handle that allows waiting for the sparse trie state root result in `finish()`.
@@ -137,19 +140,111 @@ impl SparseDriver {
         let id = SPARSE_TASK_ID.fetch_add(1, Ordering::Relaxed);
         let key = SparseTaskKey { parent_hash, block_number, trace_id, id };
 
-        // Build a consistent DB view at the latest tip.
-        let consistent_view = match ConsistentDbView::new_with_latest_tip(provider_factory.clone()) {
-            Ok(view) => view,
+        // PR36-style safety gate:
+        // - Only start sparse pipeline if DB tip matches the parent header OR we have a complete
+        //   overlay (hashed_state + trie_updates) for all missing blocks up to parent.
+        //
+        // This prevents producing invalid blocks due to misaligned base state.
+        let parent_number = parent_header.number();
+        let db_provider = match provider_factory.database_provider_ro() {
+            Ok(p) => p,
             Err(err) => {
-                debug!(
-                    target: "bsc::sparse_integrator",
-                    ?key,
-                    %err,
-                    "try_start_sparse_tree skipped: failed to create ConsistentDbView"
-                );
+                debug!(target: "bsc::sparse_integrator", ?key, %err, "try_start_sparse_tree skipped: failed to open db provider");
                 return None
             }
         };
+        let db_last = match db_provider.last_block_number() {
+            Ok(n) => n,
+            Err(err) => {
+                debug!(target: "bsc::sparse_integrator", ?key, %err, "try_start_sparse_tree skipped: failed to read db last_block_number");
+                return None
+            }
+        };
+        let db_tip = match db_provider.sealed_header(db_last) {
+            Ok(h) => h,
+            Err(err) => {
+                debug!(target: "bsc::sparse_integrator", ?key, %err, "try_start_sparse_tree skipped: failed to read db sealed_header");
+                return None
+            }
+        };
+        let Some(db_tip) = db_tip else {
+            debug!(target: "bsc::sparse_integrator", ?key, db_last, "try_start_sparse_tree skipped: db tip header missing");
+            return None
+        };
+
+        // If DB is at parent height but hash differs, parent isn't the db tip -> unsafe.
+        if db_last == parent_number && db_tip.hash() != parent_hash {
+            debug!(
+                target: "bsc::sparse_integrator",
+                ?key,
+                db_last,
+                parent_number,
+                db_tip_hash = ?db_tip.hash(),
+                ?parent_hash,
+                "try_start_sparse_tree skipped: db tip hash mismatch at parent height"
+            );
+            return None
+        }
+
+        // Prepare trie input overlay if DB tip lags behind parent.
+        let mut trie_input = TrieInput::default();
+        if db_last < parent_number {
+            let Some(driver) = GLOBAL_SPARSE_DRIVER.get() else {
+                debug!(
+                    target: "bsc::sparse_integrator",
+                    ?key,
+                    db_last,
+                    parent_number,
+                    "try_start_sparse_tree skipped: no global sparse driver for overlay coverage"
+                );
+                return None
+            };
+
+            let needed_range: RangeInclusive<u64> = (db_last + 1)..=parent_number;
+            let overlays = driver.overlay_entries(needed_range.clone());
+
+            // Require full coverage.
+            if overlays.len() != (parent_number - db_last) as usize {
+                debug!(
+                    target: "bsc::sparse_integrator",
+                    ?key,
+                    db_last,
+                    parent_number,
+                    overlays_len = overlays.len(),
+                    "try_start_sparse_tree skipped: trie overlay cache does not fully cover needed range"
+                );
+                return None
+            }
+
+            // Validate hash chain endpoint and require trie_updates for each block.
+            for entry in overlays.iter() {
+                if entry.number == parent_number && entry.hash != parent_hash {
+                    debug!(
+                        target: "bsc::sparse_integrator",
+                        ?key,
+                        entry_number = entry.number,
+                        entry_hash = ?entry.hash,
+                        ?parent_hash,
+                        "try_start_sparse_tree skipped: overlay hash mismatch at parent"
+                    );
+                    return None
+                }
+                let Some(nodes) = entry.trie_updates.as_deref() else {
+                    debug!(
+                        target: "bsc::sparse_integrator",
+                        ?key,
+                        entry_number = entry.number,
+                        entry_hash = ?entry.hash,
+                        "try_start_sparse_tree skipped: missing trie_updates in overlay entry"
+                    );
+                    return None
+                };
+                trie_input.append_cached_ref(nodes, &entry.hashed_state);
+            }
+        }
+
+        // Build a consistent DB view at the latest on-disk tip (db_last).
+        let consistent_view = ConsistentDbView::new(provider_factory.clone(), Some((db_tip.hash(), db_last)));
 
         // Build the EVM env for the next block and wrap it into engine-tree's execution env.
         let evm_env = match evm_config.next_evm_env(parent_header, next_env_attributes) {
@@ -174,7 +269,6 @@ impl SparseDriver {
             EmptyErr,
         >>();
 
-        let trie_input = TrieInput::default();
         // `spawn_without_caching_and_prewarming` requires this flag to be set (see debug_assert).
         let config = TreeConfig::default().without_caching_and_prewarming(true);
 
@@ -276,5 +370,9 @@ where
 {
     fn try_subscribe_trie_changes(&self) {
         self.drain();
+    }
+
+    fn overlay_entries(&self, range: RangeInclusive<u64>) -> Vec<TrieOverlayEntry> {
+        self.overlay.read().get_range(range)
     }
 }
