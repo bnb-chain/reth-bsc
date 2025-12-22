@@ -153,13 +153,27 @@ impl SparseDriver {
                 return None
             }
         };
-        let db_last = match db_provider.last_block_number() {
+        // PR36 alignment: use canonical best block number as the DB tip reference.
+        let db_last = match db_provider.best_block_number() {
             Ok(n) => n,
             Err(err) => {
                 debug!(target: "bsc::sparse_integrator", ?key, %err, "try_start_sparse_tree skipped: failed to read db last_block_number");
                 return None
             }
         };
+        // If DB tip is ahead of the parent, we cannot safely build a sparse root for the parent
+        // without carefully pinning state to the parent. PR36 simply avoided starting in this
+        // scenario. We do the same.
+        if db_last > parent_number {
+            debug!(
+                target: "bsc::sparse_integrator",
+                ?key,
+                db_last,
+                parent_number,
+                "try_start_sparse_tree skipped: db tip ahead of parent"
+            );
+            return None
+        }
         let db_tip = match db_provider.sealed_header(db_last) {
             Ok(h) => h,
             Err(err) => {
@@ -243,8 +257,15 @@ impl SparseDriver {
             }
         }
 
-        // Build a consistent DB view at the latest on-disk tip (db_last).
-        let consistent_view = ConsistentDbView::new(provider_factory.clone(), Some((db_tip.hash(), db_last)));
+        // Build a consistent DB view pinned to a safe tip.
+        //
+        // - If parent is on-disk and matches the parent hash, pin to parent directly.
+        // - Otherwise (db tip behind parent), pin to db_last and rely on `trie_input` overlays.
+        let consistent_view = if db_last == parent_number && db_tip.hash() == parent_hash {
+            ConsistentDbView::new(provider_factory.clone(), Some((parent_hash, parent_number)))
+        } else {
+            ConsistentDbView::new(provider_factory.clone(), Some((db_tip.hash(), db_last)))
+        };
 
         // Build the EVM env for the next block and wrap it into engine-tree's execution env.
         let evm_env = match evm_config.next_evm_env(parent_header, next_env_attributes) {
@@ -259,7 +280,8 @@ impl SparseDriver {
             }
         };
 
-        let exec_env = ExecutionEnv { evm_env, hash: Default::default(), parent_hash };
+        // PR36 alignment: use parent hash as the execution env hash (used for identification).
+        let exec_env = ExecutionEnv { evm_env, hash: parent_hash, parent_hash };
 
         // In miner integration we only need the state-hook channel; transactions are executed by
         // the block builder itself.
