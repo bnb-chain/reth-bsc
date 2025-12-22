@@ -185,17 +185,7 @@ where
             .with_bundle_update()
             .build();
 
-        // 在这里调用sparse driver的try_start_sparse_tree方法
-        // 提示：
-        // 1.整体参照 https://github.com/will-2012/reth-bsc/pull/36/files#diff-7fa9fe23064ce31d1cbb42e5fa9d2800fe91f39a28e7b11a1e2402909d784211R215 这里的逻辑
-        // 2.try_start_sparse_tree参数及返回值都可以根据需要调整
-        // 3.逻辑复杂都放在sparse_driver.rs中内部，在payload这里仅仅是一个调用
-        // 4.如果try_start_sparse_tree成功，将返回的hook，设置一下；像builder.executor_mut().set_state_hook(Some(Box::new(pp_handle.state_hook()))); 这样
-        // 5.建议返回两个参数，一个sparse_task_key，一个是hook
-        // 6，sparse_task_key包含，parent_hash+当前块高+traceid+sparse_driver内部一个全局唯一的递增的id
-        // 7.在sparse_driver内部用sparse_task_key和payload_processor实例绑定
-
-        // 1) try_start_sparse_tree first (PR36 style), then create the builder.
+        // 1) try_start_sparse_tree first, then create the builder.
         // If started, we attach a "trie root waiter" into `BscNextBlockEnvAttributes`, which is
         // forwarded into execution ctx and consumed by `builder.finish()`.
         let mut next_env_attributes = BscNextBlockEnvAttributes {
@@ -211,7 +201,7 @@ where
         };
 
         let mut sparse_state_hook: Option<Box<dyn reth_evm::OnStateHook>> = None;
-        let _sparse_task_key = SparseDriver::try_start_sparse_tree(
+        SparseDriver::try_start_sparse_tree(
             parent_header.hash_slow(),
             parent_header.number + 1,
             trace_id,
@@ -220,10 +210,9 @@ where
             self.client.clone(),
                 self.evm_config.clone(),
         )
-        .map(|(key, hook, waiter)| {
+        .map(|(hook, waiter)| {
             sparse_state_hook = Some(hook);
             next_env_attributes.sparse_trie_root_waiter = Some(waiter);
-            key
         });
 
         let mut builder = self
@@ -234,13 +223,6 @@ where
         if let Some(hook) = sparse_state_hook {
             builder.executor_mut().set_state_hook(Some(hook));
         }
-
-        // 调整一下这里
-        // 1.先尝试try_start_sparse_tree，然后在创建builder
-        // 2.try_start_sparse_tree把等待trie root那个管道也返回回来
-        // 3.BscNextBlockEnvAttributes新增一个字段防止sparse tree trie root结果接受管道
-        // 4.builder_for_next_block时候，传递给执行ctx
-        // 5.在builder.finish内部，如果有tire root管道，则用这个管道的结果，没有的话还使用原来的串行计算root
 
         builder.apply_pre_execution_changes().map_err(|err| {
             warn!(

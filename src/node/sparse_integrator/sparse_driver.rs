@@ -25,7 +25,6 @@ use reth_primitives_traits::{NodePrimitives, Recovered, TxTy};
 use reth_provider::{providers::ConsistentDbView, BlockNumReader, BlockReader, DatabaseProviderFactory, HeaderProvider};
 use reth_trie::TrieInput;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::ops::RangeInclusive;
 use tokio::sync::broadcast;
@@ -33,9 +32,6 @@ use tracing::{debug, warn};
 
 /// Global, type-erased sparse driver.
 static GLOBAL_SPARSE_DRIVER: OnceLock<Box<dyn SparseDriverDyn + Send + Sync>> = OnceLock::new();
-
-/// Global unique task id generator.
-static SPARSE_TASK_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Object-safe sparse driver API for a global singleton.
 trait SparseDriverDyn {
@@ -68,21 +64,6 @@ where
     }
 }
 
-/// Key that uniquely identifies a sparse-tree payload processor instance.
-///
-/// This is designed for debugging and observability.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct SparseTaskKey {
-    /// Parent hash that this payload build is based on.
-    pub parent_hash: alloy_primitives::B256,
-    /// Number of the block being built.
-    pub block_number: u64,
-    /// Payload build trace id.
-    pub trace_id: u64,
-    /// Global monotonically-increasing id.
-    pub id: u64,
-}
-
 /// Public facade for the global sparse driver.
 ///
 /// This is intentionally **not** generic: we store a type-erased implementation internally so that
@@ -112,10 +93,9 @@ impl SparseDriver {
         }
     }
 
-    /// Try to start the sparse-tree payload processor (PR36: Sparse v1).
+    /// Try to start the sparse-tree payload processor.
     ///
     /// If starting succeeds, returns:
-    /// - a [`SparseTaskKey`] (for tracking/debugging)
     /// - a state hook to be installed into the block executor (`set_state_hook`)
     /// - a waiter handle that `finish()` can use to block for the final trie root result
     ///
@@ -129,18 +109,13 @@ impl SparseDriver {
         next_env_attributes: &Evm::NextBlockEnvCtx,
         provider_factory: P,
         evm_config: Evm,
-    ) -> Option<(SparseTaskKey, Box<dyn OnStateHook>, SparseTrieRootWaiterHandle)>
+    ) -> Option<(Box<dyn OnStateHook>, SparseTrieRootWaiterHandle)>
     where
         Evm: ConfigureEvm<Primitives: NodePrimitives> + 'static,
         P: DatabaseProviderFactory<Provider: BlockReader + BlockNumReader + HeaderProvider>
             + Clone
             + 'static,
     {
-        // Generate a globally unique key for this sparse task.
-        let id = SPARSE_TASK_ID.fetch_add(1, Ordering::Relaxed);
-        let key = SparseTaskKey { parent_hash, block_number, trace_id, id };
-
-        // PR36-style safety gate:
         // - Only start sparse pipeline if DB tip matches the parent header OR we have a complete
         //   overlay (hashed_state + trie_updates) for all missing blocks up to parent.
         //
@@ -149,25 +124,40 @@ impl SparseDriver {
         let db_provider = match provider_factory.database_provider_ro() {
             Ok(p) => p,
             Err(err) => {
-                debug!(target: "bsc::sparse_integrator", ?key, %err, "try_start_sparse_tree skipped: failed to open db provider");
+                debug!(
+                    target: "bsc::sparse_integrator",
+                    ?parent_hash,
+                    block_number,
+                    trace_id,
+                    %err,
+                    "try_start_sparse_tree skipped: failed to open db provider"
+                );
                 return None
             }
         };
-        // PR36 alignment: use canonical best block number as the DB tip reference.
+        // use canonical best block number as the DB tip reference.
         let db_last = match db_provider.best_block_number() {
             Ok(n) => n,
             Err(err) => {
-                debug!(target: "bsc::sparse_integrator", ?key, %err, "try_start_sparse_tree skipped: failed to read db last_block_number");
+                debug!(
+                    target: "bsc::sparse_integrator",
+                    ?parent_hash,
+                    block_number,
+                    trace_id,
+                    %err,
+                    "try_start_sparse_tree skipped: failed to read db best_block_number"
+                );
                 return None
             }
         };
         // If DB tip is ahead of the parent, we cannot safely build a sparse root for the parent
-        // without carefully pinning state to the parent. PR36 simply avoided starting in this
-        // scenario. We do the same.
+        // without carefully pinning state to the parent.
         if db_last > parent_number {
             debug!(
                 target: "bsc::sparse_integrator",
-                ?key,
+                ?parent_hash,
+                block_number,
+                trace_id,
                 db_last,
                 parent_number,
                 "try_start_sparse_tree skipped: db tip ahead of parent"
@@ -177,12 +167,26 @@ impl SparseDriver {
         let db_tip = match db_provider.sealed_header(db_last) {
             Ok(h) => h,
             Err(err) => {
-                debug!(target: "bsc::sparse_integrator", ?key, %err, "try_start_sparse_tree skipped: failed to read db sealed_header");
+                debug!(
+                    target: "bsc::sparse_integrator",
+                    ?parent_hash,
+                    block_number,
+                    trace_id,
+                    %err,
+                    "try_start_sparse_tree skipped: failed to read db sealed_header"
+                );
                 return None
             }
         };
         let Some(db_tip) = db_tip else {
-            debug!(target: "bsc::sparse_integrator", ?key, db_last, "try_start_sparse_tree skipped: db tip header missing");
+            debug!(
+                target: "bsc::sparse_integrator",
+                ?parent_hash,
+                block_number,
+                trace_id,
+                db_last,
+                "try_start_sparse_tree skipped: db tip header missing"
+            );
             return None
         };
 
@@ -190,11 +194,12 @@ impl SparseDriver {
         if db_last == parent_number && db_tip.hash() != parent_hash {
             debug!(
                 target: "bsc::sparse_integrator",
-                ?key,
+                ?parent_hash,
+                block_number,
+                trace_id,
                 db_last,
                 parent_number,
                 db_tip_hash = ?db_tip.hash(),
-                ?parent_hash,
                 "try_start_sparse_tree skipped: db tip hash mismatch at parent height"
             );
             return None
@@ -206,7 +211,9 @@ impl SparseDriver {
             let Some(driver) = GLOBAL_SPARSE_DRIVER.get() else {
                 debug!(
                     target: "bsc::sparse_integrator",
-                    ?key,
+                    ?parent_hash,
+                    block_number,
+                    trace_id,
                     db_last,
                     parent_number,
                     "try_start_sparse_tree skipped: no global sparse driver for overlay coverage"
@@ -221,7 +228,9 @@ impl SparseDriver {
             if overlays.len() != (parent_number - db_last) as usize {
                 debug!(
                     target: "bsc::sparse_integrator",
-                    ?key,
+                    ?parent_hash,
+                    block_number,
+                    trace_id,
                     db_last,
                     parent_number,
                     overlays_len = overlays.len(),
@@ -235,10 +244,11 @@ impl SparseDriver {
                 if entry.number == parent_number && entry.hash != parent_hash {
                     debug!(
                         target: "bsc::sparse_integrator",
-                        ?key,
+                        ?parent_hash,
+                        block_number,
+                        trace_id,
                         entry_number = entry.number,
                         entry_hash = ?entry.hash,
-                        ?parent_hash,
                         "try_start_sparse_tree skipped: overlay hash mismatch at parent"
                     );
                     return None
@@ -246,7 +256,9 @@ impl SparseDriver {
                 let Some(nodes) = entry.trie_updates.as_deref() else {
                     debug!(
                         target: "bsc::sparse_integrator",
-                        ?key,
+                        ?parent_hash,
+                        block_number,
+                        trace_id,
                         entry_number = entry.number,
                         entry_hash = ?entry.hash,
                         "try_start_sparse_tree skipped: missing trie_updates in overlay entry"
@@ -273,14 +285,15 @@ impl SparseDriver {
             Err(_) => {
                 debug!(
                     target: "bsc::sparse_integrator",
-                    ?key,
+                    ?parent_hash,
+                    block_number,
+                    trace_id,
                     "try_start_sparse_tree skipped: failed to build next evm env"
                 );
                 return None
             }
         };
 
-        // PR36 alignment: use parent hash as the execution env hash (used for identification).
         let exec_env = ExecutionEnv { evm_env, hash: parent_hash, parent_hash };
 
         // In miner integration we only need the state-hook channel; transactions are executed by
@@ -318,7 +331,7 @@ impl SparseDriver {
             SparseTrieRootWaiterImpl { handle },
         )));
 
-        Some((key, state_hook, waiter))
+        Some((state_hook, waiter))
     }
 }
 

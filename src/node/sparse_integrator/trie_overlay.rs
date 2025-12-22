@@ -46,7 +46,7 @@ impl TrieOverlayCache {
 
     /// Build and insert a [`TrieOverlayEntry`] from an executed block update.
     ///
-    /// This is the PR36-aligned path: prefer the per-block `hashed_state` and (optional)
+    /// prefer the per-block `hashed_state` and (optional)
     /// `trie_updates` coming from `ExecutedBlockWithTrieUpdates`.
     pub fn insert_from_executed<N: reth_primitives_traits::NodePrimitives>(
         &mut self,

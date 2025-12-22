@@ -25,7 +25,7 @@ use revm::{
         result::{ExecutionResult, ResultAndState},
 
     },
-    state::Bytecode,
+    state::{Account as RevmAccount, Bytecode, EvmState},
     DatabaseCommit,
 };
 use tracing::{error, warn, info, debug, trace};
@@ -269,6 +269,28 @@ where
 
         let transition = account.change(info, Default::default());
         self.evm.db_mut().apply_transition(vec![(address, transition)]);
+
+        // Feed this pre-execution state change into the optional sparse-tree OnStateHook, so sparse
+        // state-root calculation observes system contract upgrades (e.g. Fermi upgrade at height N).
+        //
+        // We tag this as a synthetic transaction update to avoid relying on a specific `PreBlock`
+        // variant in `StateChangeSource` (the hook only uses it for metadata).
+        let mut evm_state = EvmState::default();
+        let mut account = RevmAccount::default();
+        // `info` is moved into transition above; reload the updated info from cache for the hook.
+        let updated = self
+            .evm
+            .db_mut()
+            .load_cache_account(address)
+            .map_err(BlockExecutionError::other)?;
+        account.info = updated.account_info().unwrap_or_default();
+        account.mark_touch();
+        evm_state.insert(address, account);
+        // Ensure SYSTEM_ADDRESS does not leak into the hook input, consistent with tx updates.
+        evm_state.remove(&SYSTEM_ADDRESS);
+        self.system_caller
+            .on_state(StateChangeSource::Transaction(usize::MAX), &evm_state);
+
         Ok(())
     }
 
@@ -408,10 +430,29 @@ where
         }
 
         // Execute transaction.
-        let ResultAndState { result, state } = self
-            .evm
-            .transact(&tx)
-            .map_err(|err| BlockExecutionError::evm(err, tx.tx().trie_hash()))?;
+        let ResultAndState { result, state } = match self.evm.transact(&tx) {
+            Ok(res) => res,
+            Err(err) => {
+                let tx_hash = tx.tx().trie_hash();
+                tracing::warn!(
+                    target: "bsc::executor",
+                    block_number = %self.evm.block().number,
+                    beneficiary = ?self.evm.block().beneficiary,
+                    tx_hash = ?tx_hash,
+                    from = ?tx.signer(),
+                    to = ?tx.tx().to(),
+                    nonce = tx.tx().nonce(),
+                    gas_limit = tx.tx().gas_limit(),
+                    max_fee_per_gas = ?tx.tx().max_fee_per_gas(),
+                    gas_price = ?tx.tx().gas_price(),
+                    max_priority_fee_per_gas = ?tx.tx().max_priority_fee_per_gas(),
+                    is_system = is_system_transaction(tx.tx(), *tx.signer(), self.evm.block().beneficiary),
+                    err = ?err,
+                    "EVM transact failed"
+                );
+                return Err(BlockExecutionError::evm(err, tx_hash));
+            }
+        };
 
         if !f(&result).should_commit() {
             return Ok(None);
@@ -449,8 +490,8 @@ where
             + RecoveredTx<TransactionSigned>,
         f: impl for<'b> FnOnce(&'b ExecutionResult<<E as alloy_evm::Evm>::HaltReason>),
     ) -> Result<u64, BlockExecutionError> {
-        let signer = tx.signer();
-        let is_system = is_system_transaction(tx.tx(), *signer, self.evm.block().beneficiary);
+        let signer = *tx.signer();
+        let is_system = is_system_transaction(tx.tx(), signer, self.evm.block().beneficiary);
         if is_system {
             self.system_txs.push(tx.tx().clone());
             return Ok(0);
@@ -468,9 +509,28 @@ where
         }
         let tx_hash = tx.tx().trie_hash();
         let tx_ref = tx.tx().clone();
-        let result_and_state =
-            self.evm.transact(tx).map_err(|err| BlockExecutionError::evm(err, tx_hash))?;
-        let ResultAndState { result, state } = result_and_state;
+        let ResultAndState { result, state } = match self.evm.transact(tx) {
+            Ok(res) => res,
+            Err(err) => {
+                tracing::warn!(
+                    target: "bsc::executor",
+                    block_number = %self.evm.block().number,
+                    beneficiary = ?self.evm.block().beneficiary,
+                    tx_hash = ?tx_hash,
+                    from = ?signer,
+                    to = ?tx_ref.to(),
+                    nonce = tx_ref.nonce(),
+                    gas_limit = tx_ref.gas_limit(),
+                    max_fee_per_gas = ?tx_ref.max_fee_per_gas(),
+                    gas_price = ?tx_ref.gas_price(),
+                    max_priority_fee_per_gas = ?tx_ref.max_priority_fee_per_gas(),
+                    is_system,
+                    err = ?err,
+                    "EVM transact failed"
+                );
+                return Err(BlockExecutionError::evm(err, tx_hash));
+            }
+        };
 
         f(&result);
 
