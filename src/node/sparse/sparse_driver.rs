@@ -1,11 +1,6 @@
-//! Sparse-trie driver utilities.
-//!
-//! This module provides wiring helpers to maintain a small overlay cache (`TRIE_OVERLAY`)
-//! containing per-block hashed state + trie updates. This overlay can be used to bridge gaps when
-//! the DB tip lags behind the chain head.
-//!
-//! Unlike an always-on background listener, the driver is designed to be **passively triggered**
-//! from the component that already receives canonical state notifications (e.g. miner loop).
+// This file was moved from `src/node/sparse_integrator/sparse_driver.rs`.
+//
+// NOTE: Keep behavior identical; only module path changed.
 
 use super::trie_overlay::TrieOverlayCache;
 use super::trie_overlay::TrieOverlayEntry;
@@ -125,7 +120,7 @@ impl SparseDriver {
             Ok(p) => p,
             Err(err) => {
                 debug!(
-                    target: "bsc::sparse_integrator",
+                    target: "bsc::sparse",
                     ?parent_hash,
                     block_number,
                     trace_id,
@@ -140,7 +135,7 @@ impl SparseDriver {
             Ok(n) => n,
             Err(err) => {
                 debug!(
-                    target: "bsc::sparse_integrator",
+                    target: "bsc::sparse",
                     ?parent_hash,
                     block_number,
                     trace_id,
@@ -154,7 +149,7 @@ impl SparseDriver {
         // without carefully pinning state to the parent.
         if db_last > parent_number {
             debug!(
-                target: "bsc::sparse_integrator",
+                target: "bsc::sparse",
                 ?parent_hash,
                 block_number,
                 trace_id,
@@ -168,7 +163,7 @@ impl SparseDriver {
             Ok(h) => h,
             Err(err) => {
                 debug!(
-                    target: "bsc::sparse_integrator",
+                    target: "bsc::sparse",
                     ?parent_hash,
                     block_number,
                     trace_id,
@@ -180,7 +175,7 @@ impl SparseDriver {
         };
         let Some(db_tip) = db_tip else {
             debug!(
-                target: "bsc::sparse_integrator",
+                target: "bsc::sparse",
                 ?parent_hash,
                 block_number,
                 trace_id,
@@ -193,7 +188,7 @@ impl SparseDriver {
         // If DB is at parent height but hash differs, parent isn't the db tip -> unsafe.
         if db_last == parent_number && db_tip.hash() != parent_hash {
             debug!(
-                target: "bsc::sparse_integrator",
+                target: "bsc::sparse",
                 ?parent_hash,
                 block_number,
                 trace_id,
@@ -210,7 +205,7 @@ impl SparseDriver {
         if db_last < parent_number {
             let Some(driver) = GLOBAL_SPARSE_DRIVER.get() else {
                 debug!(
-                    target: "bsc::sparse_integrator",
+                    target: "bsc::sparse",
                     ?parent_hash,
                     block_number,
                     trace_id,
@@ -227,7 +222,7 @@ impl SparseDriver {
             // Require full coverage.
             if overlays.len() != (parent_number - db_last) as usize {
                 debug!(
-                    target: "bsc::sparse_integrator",
+                    target: "bsc::sparse",
                     ?parent_hash,
                     block_number,
                     trace_id,
@@ -243,7 +238,7 @@ impl SparseDriver {
             for entry in overlays.iter() {
                 if entry.number == parent_number && entry.hash != parent_hash {
                     debug!(
-                        target: "bsc::sparse_integrator",
+                        target: "bsc::sparse",
                         ?parent_hash,
                         block_number,
                         trace_id,
@@ -255,7 +250,7 @@ impl SparseDriver {
                 }
                 let Some(nodes) = entry.trie_updates.as_deref() else {
                     debug!(
-                        target: "bsc::sparse_integrator",
+                        target: "bsc::sparse",
                         ?parent_hash,
                         block_number,
                         trace_id,
@@ -284,7 +279,7 @@ impl SparseDriver {
             Ok(env) => env,
             Err(_) => {
                 debug!(
-                    target: "bsc::sparse_integrator",
+                    target: "bsc::sparse",
                     ?parent_hash,
                     block_number,
                     trace_id,
@@ -322,11 +317,7 @@ impl SparseDriver {
             &config,
         );
 
-        // Create a state hook that can be installed into the executor. This captures a clone of
-        // the underlying sender so it can live independently of the waiter.
         let state_hook: Box<dyn OnStateHook> = Box::new(handle.state_hook());
-
-        // Bind the payload processor instance to the task key by storing it in a waiter.
         let waiter: SparseTrieRootWaiterHandle = Arc::new(Mutex::new(Box::new(
             SparseTrieRootWaiterImpl { handle },
         )));
@@ -387,7 +378,7 @@ where
                 Err(broadcast::error::TryRecvError::Closed) => break,
                 Err(broadcast::error::TryRecvError::Lagged(n)) => {
                     warn!(
-                        target: "bsc::sparse_integrator",
+                        target: "bsc::sparse",
                         lagged = n,
                         "new canonical chain subscription lagged; trie overlay cache may be incomplete"
                     );
@@ -411,3 +402,5 @@ where
         self.overlay.read().get_range(range)
     }
 }
+
+

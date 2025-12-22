@@ -31,7 +31,7 @@ pub mod pool;
 pub mod miner;
 pub mod network;
 pub mod primitives;
-pub mod sparse_integrator;
+pub mod sparse;
 pub mod storage;
 pub mod vote_producer;
 pub mod vote_journal;

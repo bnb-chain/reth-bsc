@@ -121,7 +121,7 @@ where
             match notifications.next().await {
                 Some(event) => {
                     // Passively update trie overlay cache from canonical state notifications.
-                    crate::node::sparse_integrator::SparseDriver::try_subscribe_trie_changes();
+                    crate::node::sparse::SparseDriver::try_subscribe_trie_changes();
 
                     let committed = event.committed();
                     let tip = committed.tip();
@@ -1119,7 +1119,7 @@ where
 
         // Initialize the global sparse driver singleton (passive trigger model).
         // The overlay itself is updated by draining notifications in `try_subscribe_trie_changes()`.
-        let _ = crate::node::sparse_integrator::SparseDriver::init_global(provider.clone(), 256);
+        let _ = crate::node::sparse::SparseDriver::init_global(provider.clone(), 256);
 
         // We'll derive and trust the validator address from the configured signing key when possible.
         // If not available, fall back to configured address (may be ZERO when disabled).

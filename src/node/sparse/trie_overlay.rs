@@ -1,7 +1,9 @@
+// This file was moved from `src/node/sparse_integrator/trie_overlay.rs`.
+
 use alloy_consensus::BlockHeader;
 use alloy_primitives::B256;
-use reth_trie::{updates::TrieUpdates, HashedPostState};
 use reth_chain_state::ExecutedTrieUpdates;
+use reth_trie::{updates::TrieUpdates, HashedPostState};
 use std::{ops::RangeInclusive, sync::Arc};
 
 /// Cached per-block overlay needed to bridge DB lag for trie root computation.
@@ -46,8 +48,8 @@ impl TrieOverlayCache {
 
     /// Build and insert a [`TrieOverlayEntry`] from an executed block update.
     ///
-    /// prefer the per-block `hashed_state` and (optional)
-    /// `trie_updates` coming from `ExecutedBlockWithTrieUpdates`.
+    /// Prefer the per-block `hashed_state` and (optional) `trie_updates` coming from
+    /// `ExecutedBlockWithTrieUpdates`.
     pub fn insert_from_executed<N: reth_primitives_traits::NodePrimitives>(
         &mut self,
         block: &reth_chain_state::ExecutedBlockWithTrieUpdates<N>,
@@ -98,4 +100,5 @@ impl TrieOverlayCache {
         }
     }
 }
+
 

@@ -35,7 +35,7 @@ use std::{borrow::Cow, cell::RefCell, convert::Infallible, rc::Rc, sync::Arc};
 pub struct BscNextBlockEnvAttributes {
     pub inner: NextBlockEnvAttributes,
     /// Optional sparse trie root waiter that will be forwarded into execution ctx.
-    pub sparse_trie_root_waiter: Option<crate::node::sparse_integrator::SparseTrieRootWaiterHandle>,
+    pub sparse_trie_root_waiter: Option<crate::node::sparse::SparseTrieRootWaiterHandle>,
 }
 
 impl From<NextBlockEnvAttributes> for BscNextBlockEnvAttributes {
@@ -117,7 +117,7 @@ pub struct BscBlockExecutionCtx<'a> {
     /// Whether the block is being mined.
     pub is_miner: bool,
     /// Optional sparse trie root waiter for `finish()` to use.
-    pub sparse_trie_root_waiter: Option<crate::node::sparse_integrator::SparseTrieRootWaiterHandle>,
+    pub sparse_trie_root_waiter: Option<crate::node::sparse::SparseTrieRootWaiterHandle>,
 }
 
 impl<'a> core::fmt::Debug for BscBlockExecutionCtx<'a> {

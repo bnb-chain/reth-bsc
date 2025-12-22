@@ -9,7 +9,7 @@ use crate::node::miner::bid_simulator::BidSimulator;
 use crate::node::miner::bsc_miner::{MiningContext, SubmitContext};
 use crate::node::pool::BlacklistedAddressError;
 use crate::node::primitives::BscBlobTransactionSidecar;
-use crate::node::sparse_integrator::SparseDriver;
+use crate::node::sparse::SparseDriver;
 use alloy_consensus::{BlockHeader, Transaction};
 use alloy_evm::block::BlockExecutor;
 use alloy_evm::Evm;
