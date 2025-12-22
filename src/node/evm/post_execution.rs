@@ -393,6 +393,10 @@ where
         &mut self,
         validator: Address,
     ) -> Result<(), BlockExecutionError> {
+        let block_number = self.evm.block().number.to::<u64>();
+        let block_timestamp = self.evm.block().timestamp.to::<u64>();
+        let kepler_active = self.spec.is_kepler_active_at_timestamp(block_number, block_timestamp);
+
         let system_account = self
             .evm
             .db_mut()
@@ -423,13 +427,34 @@ where
             .unwrap_or_default()
             .balance;
 
+        tracing::debug!(
+            target: "bsc::evm::rewards",
+            block_number,
+            block_timestamp,
+            ?validator,
+            kepler_active,
+            system_reward_balance = ?system_reward_balance,
+            max_system_reward = %MAX_SYSTEM_REWARD,
+            system_reward_percent = %SYSTEM_REWARD_PERCENT,
+            block_reward = ?block_reward,
+            "distribute_incoming: starting reward distribution"
+        );
+
         // Kepler introduced a max system reward limit, so we need to pay the system reward to the
         // system contract if the limit is not exceeded.
-        if !self.spec.is_kepler_active_at_timestamp(self.evm.block().number.to(), self.evm.block().timestamp.to()) &&
+        if !kepler_active &&
             system_reward_balance < U256::from(MAX_SYSTEM_REWARD)
         {
             let reward_to_system = block_reward >> SYSTEM_REWARD_PERCENT;
             if reward_to_system > 0 {
+                tracing::debug!(
+                    target: "bsc::evm::rewards",
+                    block_number,
+                    block_timestamp,
+                    ?validator,
+                    reward_to_system = ?reward_to_system,
+                    "distribute_incoming: paying system reward"
+                );
                 // send reward to SYSTEM_REWARD_CONTRACT from miner.
                 let tx = self.system_contracts.distribute_to_system(reward_to_system);
                 self.transact_system_tx(tx, validator)?;
@@ -442,9 +467,27 @@ where
             }
 
             block_reward -= reward_to_system;
+        } else {
+            tracing::debug!(
+                target: "bsc::evm::rewards",
+                block_number,
+                block_timestamp,
+                ?validator,
+                kepler_active,
+                system_reward_balance = ?system_reward_balance,
+                "distribute_incoming: skipping system reward payment"
+            );
         }
 
         // send all left gas fees to VALIDATOR_CONTRACT for distributing & burning.
+        tracing::debug!(
+            target: "bsc::evm::rewards",
+            block_number,
+            block_timestamp,
+            ?validator,
+            block_reward = ?block_reward,
+            "distribute_incoming: paying validator distribution"
+        );
         let tx = self.system_contracts.distribute_to_validator(validator, block_reward);
         self.transact_system_tx(tx, validator)?;
         tracing::debug!("Distribute to validator, block_number: {}, block_reward: {}", self.evm.block().number, block_reward);
