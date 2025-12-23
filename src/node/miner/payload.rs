@@ -1014,7 +1014,7 @@ where
                                 return Err(Box::new(BscPayloadJobError::JobAborted));
                             }
                             let elapsed = start_time.elapsed();
-                            let payload_tx_count = payload.block().body().transaction_count();
+                            let payload_tx_count = payload.block().body().transaction_count() as usize;
                             debug!(
                                 target: "bsc::miner::payload",
                                 trace_id = self.trace_id,
@@ -1028,7 +1028,7 @@ where
                                 "Succeed to try new build"
                             );
                             self.potential_payloads.push(payload);
-                            let mut new_tx_count = 0;
+                            let mut new_tx_count: usize = 0;
                             // For in-turn blocks, it's often better to delay the 2nd build attempt so
                             // mempool has more time to grow, increasing the chance of packing more txs.
                             //
@@ -1166,8 +1166,8 @@ where
                                             // Keep the existing retry triggers (time-based OR new-tx based),
                                             // but only evaluate them once the "not-before" gate is open.
                                             let should_rebuild_by_time =
-                                                std::time::Duration::from_millis(mining_delay) < elapsed * 2;
-                                            let should_rebuild_by_new_txs = new_tx_count >= payload_tx_count;
+                                                std::time::Duration::from_millis(mining_delay) < elapsed;
+                                            let should_rebuild_by_new_txs = new_tx_count >= payload_tx_count * 2;
 
                                             if should_rebuild_by_time || should_rebuild_by_new_txs {
                                             if let Err(err) = self.try_build_tx.send(()) {
