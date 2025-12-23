@@ -1029,30 +1029,6 @@ where
                             );
                             self.potential_payloads.push(payload);
                             let mut new_tx_count: usize = 0;
-                            // For in-turn blocks, it's often better to delay the 2nd build attempt so
-                            // mempool has more time to grow, increasing the chance of packing more txs.
-                            //
-                            // We compute a conservative "not-before" instant for attempt #2 based on:
-                            // - job deadline
-                            // - last attempt cost (`elapsed`)
-                            // - a safety margin for finalization/submit
-                            //
-                            // Before this instant, we only accumulate tx notifications and avoid
-                            // triggering rebuilds (unless we're already too close to the deadline).
-                            let inturn_second_attempt_not_before: Option<std::time::Instant> = if self.mining_ctx.is_inturn
-                                && self.retries == 1
-                            {
-                                let deadline = self.job_start_time + self.timeout;
-                                let safety = std::time::Duration::from_millis(
-                                    DELAY_LEFT_OVER.saturating_add(20),
-                                );
-                                // Additional buffer to account for variance; keep it small so attempt2 is still "late".
-                                let buffer = std::time::Duration::from_millis(15);
-                                let needed = elapsed.saturating_add(safety).saturating_add(buffer);
-                                deadline.checked_sub(needed)
-                            } else {
-                                None
-                            };
 
                             // loop wait new transactions or timeout.
                             loop {
@@ -1154,20 +1130,9 @@ where
                                             self.cancel_outstanding_builds();
                                             return self.try_return_best_payload();
                                         } else {
-                                            // For in-turn blocks, only allow the 2nd attempt after a "not-before" time
-                                            // so the mempool has more time to grow. This makes the retry more likely to
-                                            // include *more* transactions.
-                                            if let Some(not_before) = inturn_second_attempt_not_before {
-                                                if std::time::Instant::now() < not_before {
-                                                    continue;
-                                                }
-                                            }
-
-                                            // Keep the existing retry triggers (time-based OR new-tx based),
-                                            // but only evaluate them once the "not-before" gate is open.
                                             let should_rebuild_by_time =
-                                                std::time::Duration::from_millis(mining_delay) < elapsed;
-                                            let should_rebuild_by_new_txs = new_tx_count >= payload_tx_count * 2;
+                                                std::time::Duration::from_millis(mining_delay) < (elapsed * 3) / 2;
+                                            let should_rebuild_by_new_txs = new_tx_count >= (payload_tx_count * 3) / 2;
 
                                             if should_rebuild_by_time || should_rebuild_by_new_txs {
                                             if let Err(err) = self.try_build_tx.send(()) {
