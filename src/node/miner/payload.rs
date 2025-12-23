@@ -47,7 +47,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, trace, warn};
 
 /// Delay left over for mining calculation
-pub const DELAY_LEFT_OVER: u64 = 50;
+pub const DELAY_LEFT_OVER: u64 = 30;
 
 /// Time multiplier for retry condition check
 const TIME_MULTIPLIER: u32 = 2;
@@ -861,6 +861,12 @@ where
     >,
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>> + 'static,
 {
+    /// Cancels any in-flight build attempts and aborts spawned build tasks.
+    fn cancel_outstanding_builds(&mut self) {
+        self.build_args.cancel.clone().cancel();
+        self.join_handle.abort_all();
+    }
+
     /// Creates a new BscPayloadJob and returns both the job and its handle
     pub fn new(
         parlia: Arc<crate::consensus::parlia::Parlia<crate::chainspec::BscChainSpec>>,
@@ -966,6 +972,7 @@ where
                     timeout_ms = self.timeout.as_millis(),
                     "Outer loop: Job already timeout, returning best payload"
                 );
+                self.cancel_outstanding_builds();
                 return self.try_return_best_payload();
             };
             
@@ -1045,6 +1052,7 @@ where
                                         retries = self.retries,
                                         "Job already timeout, returning best payload immediately"
                                     );
+                                    self.cancel_outstanding_builds();
                                     return self.try_return_best_payload();
                                 };
                                 
@@ -1061,6 +1069,7 @@ where
                                             job_elapsed_ms = self.job_start_time.elapsed().as_millis(),
                                             "try return best payload due to has no time"
                                         );
+                                        self.cancel_outstanding_builds();
                                         return self.try_return_best_payload();
                                     }
 
@@ -1082,6 +1091,31 @@ where
 
                                     Some(_tx_hash) = self.tx_listener.recv() => {
                                         new_tx_count+=1;
+                                        // Guard: do not start a new build attempt if there is not
+                                        // enough time left to reasonably finish it.
+                                        //
+                                        // This prevents late "attempt2 pending" which can waste CPU
+                                        // and create confusing empty-payload logs.
+                                        let time_left = remaining_duration;
+                                        let safety_margin =
+                                            std::time::Duration::from_millis(DELAY_LEFT_OVER.saturating_add(20));
+                                        if time_left <= elapsed.saturating_add(safety_margin) {
+                                            debug!(
+                                                target: "bsc::miner::payload",
+                                                trace_id = self.trace_id,
+                                                block_number = self.build_args.config.parent_header.number() + 1,
+                                                is_inturn = self.mining_ctx.is_inturn,
+                                                retries = self.retries,
+                                                time_left_ms = time_left.as_millis(),
+                                                last_cost_time_ms = elapsed.as_millis(),
+                                                new_tx_count,
+                                                payload_tx_count,
+                                                "Skip rebuild: insufficient time left, finalizing best payload"
+                                            );
+                                            self.cancel_outstanding_builds();
+                                            return self.try_return_best_payload();
+                                        }
+
                                         let mining_delay = self.parlia.delay_for_mining(
                                             &self.mining_ctx.parent_snapshot, 
                                             self.mining_ctx.header.as_ref().unwrap(), 
@@ -1097,6 +1131,7 @@ where
                                                 last_cost_time = ?elapsed,
                                                 "try return best payload due to mining_delay < elapsed"
                                             );
+                                            self.cancel_outstanding_builds();
                                             return self.try_return_best_payload();
                                         } else if std::time::Duration::from_millis(mining_delay) < elapsed * TIME_MULTIPLIER {
                                             if let Err(err) = self.try_build_tx.send(()) {
@@ -1109,6 +1144,7 @@ where
                                                     error = ?err,
                                                     "Failed to send to try build queue"
                                                 );
+                                                self.cancel_outstanding_builds();
                                                 return self.try_return_best_payload();
                                             }
                                             debug!(
@@ -1133,6 +1169,7 @@ where
                                                     error = ?err,
                                                     "Failed to send to try build queue"
                                                 );
+                                                self.cancel_outstanding_builds();
                                                 return self.try_return_best_payload();
                                             }
                                             debug!(
@@ -1164,6 +1201,7 @@ where
                                 retries = self.retries,
                                 "Failed to build payload task"
                             );
+                            self.cancel_outstanding_builds();
                             return self.try_return_best_payload();
                         },
                         Some(Err(join_err)) => {
@@ -1178,6 +1216,7 @@ where
                                 error = %join_err,
                                 "Failed to join payload build task"
                             );
+                            self.cancel_outstanding_builds();
                             return self.try_return_best_payload();
                         },
                         None => {
@@ -1200,7 +1239,7 @@ where
                         timeout_ms = self.timeout.as_millis(),
                         "Try return best payload due to has no time"
                     );
-                    self.build_args.cancel.clone().cancel();
+                    self.cancel_outstanding_builds();
                     return self.try_return_best_payload();
                 }
                 
