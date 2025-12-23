@@ -1194,6 +1194,122 @@ where
             
             // If in-turn, build an empty payload as fallback
             if self.mining_ctx.is_inturn {
+                // If we still have background build tasks running, wait briefly for them to finish
+                // to reduce the chance of producing an empty block.
+                //
+                // This is intentionally bounded (200ms) and still respects new-head aborts.
+                let bg_tasks = self.join_handle.len();
+                if bg_tasks > 0 {
+                    let wait_budget = std::time::Duration::from_millis(200);
+                    let wait_start = std::time::Instant::now();
+
+                    enum WaitOutcome<T> {
+                        Joined(Option<T>),
+                        Timeout,
+                        Aborted,
+                    }
+
+                    let outcome: WaitOutcome<
+                        Result<Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>>, tokio::task::JoinError>,
+                    > = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(async {
+                            tokio::select! {
+                                _ = tokio::time::sleep(wait_budget) => WaitOutcome::Timeout,
+                                _ = &mut self.abort_rx => WaitOutcome::Aborted,
+                                res = self.join_handle.join_next() => WaitOutcome::Joined(res),
+                            }
+                        })
+                    });
+
+                    let waited = wait_start.elapsed();
+                    match outcome {
+                        WaitOutcome::Aborted => {
+                            info!(
+                                target: "bsc::miner::payload",
+                                trace_id = self.trace_id,
+                                block_number = self.build_args.config.parent_header.number() + 1,
+                                is_inturn = self.mining_ctx.is_inturn,
+                                bg_tasks,
+                                waited_ms = waited.as_millis(),
+                                "Abort during background task wait before empty fallback"
+                            );
+                            self.build_args.cancel.clone().cancel();
+                            self.is_aborted = true;
+                            return Err(Box::new(BscPayloadJobError::JobAborted));
+                        }
+                        WaitOutcome::Timeout | WaitOutcome::Joined(None) => {
+                            debug!(
+                                target: "bsc::miner::payload",
+                                trace_id = self.trace_id,
+                                try_mine_block_number = self.build_args.config.parent_header.number() + 1,
+                                is_inturn = self.mining_ctx.is_inturn,
+                                bg_tasks,
+                                waited_ms = waited.as_millis(),
+                                "Waited for background tasks but none finished before empty fallback"
+                            );
+                        }
+                        WaitOutcome::Joined(Some(Ok(Ok(payload)))) => {
+                            debug!(
+                                target: "bsc::miner::payload",
+                                trace_id = self.trace_id,
+                                block_number = payload.block().header().number(),
+                                block_hash = %payload.block().hash(),
+                                is_inturn = self.mining_ctx.is_inturn,
+                                tx_count = payload.block().body().transaction_count(),
+                                fees = %payload.fees(),
+                                bg_tasks,
+                                waited_ms = waited.as_millis(),
+                                "Background payload finished during empty-fallback grace period"
+                            );
+                            self.potential_payloads.push(payload);
+                            if let Some(best_payload) = self.pick_best_payload() {
+                                if let Err(err) = self.result_tx.send(SubmitContext {
+                                    mining_ctx: self.mining_ctx.clone(),
+                                    payload: best_payload,
+                                    cancel: self.build_args.cancel.clone(),
+                                }) {
+                                    warn!(
+                                        target: "bsc::miner::payload",
+                                        trace_id = self.trace_id,
+                                        try_mine_block_number = self.build_args.config.parent_header.number() + 1,
+                                        is_inturn = self.mining_ctx.is_inturn,
+                                        error = %err,
+                                        "Failed to send best payload after background wait"
+                                    );
+                                    return Err(Box::new(BscPayloadJobError::ResultChannelSendError(
+                                        err.to_string(),
+                                    )));
+                                }
+                                return Ok(());
+                            }
+                        }
+                        WaitOutcome::Joined(Some(Ok(Err(err)))) => {
+                            debug!(
+                                target: "bsc::miner::payload",
+                                trace_id = self.trace_id,
+                                try_mine_block_number = self.build_args.config.parent_header.number() + 1,
+                                is_inturn = self.mining_ctx.is_inturn,
+                                bg_tasks,
+                                waited_ms = waited.as_millis(),
+                                error = %err,
+                                "Background payload task failed during empty-fallback grace period"
+                            );
+                        }
+                        WaitOutcome::Joined(Some(Err(err))) => {
+                            debug!(
+                                target: "bsc::miner::payload",
+                                trace_id = self.trace_id,
+                                try_mine_block_number = self.build_args.config.parent_header.number() + 1,
+                                is_inturn = self.mining_ctx.is_inturn,
+                                bg_tasks,
+                                waited_ms = waited.as_millis(),
+                                error = %err,
+                                "Background join failed during empty-fallback grace period"
+                            );
+                        }
+                    }
+                }
+
                 warn!(
                     target: "bsc::miner::payload",
                     trace_id = self.trace_id,
