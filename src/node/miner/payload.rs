@@ -1273,7 +1273,7 @@ where
         // - a fixed 200ms cap
         // - the remaining time left in this job
         let bg_tasks = self.join_handle.len();
-        if self.mining_ctx.is_inturn && !self.potential_payloads.is_empty() && bg_tasks > 0 {
+        if self.mining_ctx.is_inturn && self.potential_payloads.is_empty() && bg_tasks > 0 {
             let job_elapsed = self.job_start_time.elapsed();
             let time_left = if job_elapsed < self.timeout { self.timeout - job_elapsed } else { std::time::Duration::ZERO };
             let wait_budget = std::cmp::min(std::time::Duration::from_millis(200), time_left);
