@@ -32,7 +32,6 @@ impl PerfContext {
                 trace_id,
                 created_at: Instant::now(),
                 attempt_seq: AtomicU64::new(0),
-                job_total_nanos: AtomicU64::new(0),
                 empty_fallback_wait_nanos: AtomicU64::new(0),
                 attempts: Mutex::new(Vec::new()),
             }),
@@ -57,11 +56,6 @@ impl PerfContext {
     /// Returns duration since this context was created.
     pub fn age(&self) -> Duration {
         self.inner.created_at.elapsed()
-    }
-
-    /// Start measuring total job duration (RAII guard).
-    pub fn job_timer(&self) -> PerfTimer {
-        PerfTimer::new(self.clone(), PerfTimerKind::JobTotal)
     }
 
     /// Start measuring the empty-fallback grace wait (RAII guard).
@@ -122,12 +116,12 @@ impl PerfContext {
     /// Snapshot the current perf data for logging.
     pub fn snapshot(&self) -> PerfSnapshot {
         let attempts = self.inner.attempts.lock().expect("perf attempts poisoned").clone();
+        let age_ms = self.age().as_millis() as u64;
         PerfSnapshot {
             block_number: self.block_number(),
             parent_hash: self.parent_hash(),
             trace_id: self.trace_id(),
-            age_ms: self.age().as_millis() as u64,
-            job_total_ms: nanos_to_ms(self.inner.job_total_nanos.load(Ordering::Relaxed)),
+            age_ms,
             empty_fallback_wait_ms: nanos_to_ms(
                 self.inner.empty_fallback_wait_nanos.load(Ordering::Relaxed),
             ),
@@ -156,7 +150,6 @@ struct PerfContextInner {
 
     attempt_seq: AtomicU64,
 
-    job_total_nanos: AtomicU64,
     empty_fallback_wait_nanos: AtomicU64,
 
     attempts: Mutex<Vec<AttemptRecord>>,
@@ -179,9 +172,6 @@ impl Drop for PerfTimer {
     fn drop(&mut self) {
         let nanos = self.started_at.elapsed().as_nanos() as u64;
         match self.kind {
-            PerfTimerKind::JobTotal => {
-                self.ctx.inner.job_total_nanos.fetch_add(nanos, Ordering::Relaxed);
-            }
             PerfTimerKind::EmptyFallbackWait => {
                 self.ctx
                     .inner
@@ -194,7 +184,6 @@ impl Drop for PerfTimer {
 
 #[derive(Debug, Clone, Copy)]
 enum PerfTimerKind {
-    JobTotal,
     EmptyFallbackWait,
 }
 
@@ -289,7 +278,6 @@ pub struct PerfSnapshot {
     pub trace_id: u64,
 
     pub age_ms: u64,
-    pub job_total_ms: u64,
     pub empty_fallback_wait_ms: u64,
 
     pub attempts: Vec<AttemptRecord>,
