@@ -1,6 +1,6 @@
 use super::patch::HertzPatchManager;
 use crate::{
-    consensus::{SYSTEM_ADDRESS, parlia::{Parlia, Snapshot, VoteAddress}}, evm::transaction::BscTxEnv, hardforks::BscHardforks, metrics::{BscBlockchainMetrics, BscConsensusMetrics, BscExecutorMetrics, BscRewardsMetrics, BscVoteMetrics}, node::evm::config::BscExecutionSharedCtx, system_contracts::{
+    consensus::{parlia::{Parlia, Snapshot, VoteAddress}}, evm::transaction::BscTxEnv, hardforks::BscHardforks, metrics::{BscBlockchainMetrics, BscConsensusMetrics, BscExecutorMetrics, BscRewardsMetrics, BscVoteMetrics}, node::evm::config::BscExecutionSharedCtx, system_contracts::{
         SystemContract, feynman_fork::ValidatorElectionInfo, get_upgrade_system_contracts, is_system_transaction
     }
 };
@@ -286,8 +286,6 @@ where
         account.info = updated.account_info().unwrap_or_default();
         account.mark_touch();
         evm_state.insert(address, account);
-        // Ensure SYSTEM_ADDRESS does not leak into the hook input, consistent with tx updates.
-        evm_state.remove(&SYSTEM_ADDRESS);
         self.system_caller
             .on_state(StateChangeSource::Transaction(usize::MAX), &evm_state);
 
@@ -458,10 +456,13 @@ where
             return Ok(None);
         }
 
-        let mut temp_state = state.clone();
-        temp_state.remove(&SYSTEM_ADDRESS);
+        // Feed all touched accounts into the optional sparse-tree OnStateHook.
+        //
+        // NOTE: We intentionally do NOT filter out `SYSTEM_ADDRESS` here. In BSC we use it to
+        // temporarily hold fees and later drain it in post-execution; sparse root correctness
+        // depends on observing these transitions.
         self.system_caller
-            .on_state(StateChangeSource::Transaction(self.receipts.len()), &temp_state);
+            .on_state(StateChangeSource::Transaction(self.receipts.len()), &state);
 
         let gas_used = result.gas_used();
 
@@ -534,9 +535,9 @@ where
 
         f(&result);
 
-        let mut temp_state = state.clone();
-        temp_state.remove(&SYSTEM_ADDRESS);
-        self.system_caller.on_state(StateChangeSource::Transaction(self.receipts.len()), &temp_state);
+        // See note in `execute_transaction_with_commit_condition` regarding `SYSTEM_ADDRESS`.
+        self.system_caller
+            .on_state(StateChangeSource::Transaction(self.receipts.len()), &state);
 
         let gas_used = result.gas_used();
         self.gas_used += gas_used;

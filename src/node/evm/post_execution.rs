@@ -15,6 +15,7 @@ use reth_primitives::{TransactionSigned, Transaction};
 use reth_revm::State;
 use crate::node::evm::ResultAndState;
 use revm::{context::{BlockEnv, TxEnv}, Database as RevmDatabase, DatabaseCommit};
+use revm::state::{Account as RevmAccount, EvmState};
 use alloy_consensus::{Header, TxReceipt, Transaction as AlloyTransaction, SignableTransaction};
 use alloy_primitives::{Address, BlockNumber, TxKind, U256, hex};
 use std::collections::HashMap;
@@ -363,9 +364,11 @@ where
 
         let result_and_state = self.evm.transact(tx_env).map_err(BlockExecutionError::other)?;
         let ResultAndState { result, state } = result_and_state;
-        let mut temp_state = state.clone();
-        temp_state.remove(&SYSTEM_ADDRESS);
-        self.system_caller.on_state(StateChangeSource::Transaction(self.receipts.len()), &temp_state);
+        // NOTE: We intentionally do NOT filter out `SYSTEM_ADDRESS` here. In BSC we use it to
+        // temporarily hold fees and later drain it in post-execution; sparse root correctness
+        // depends on observing these transitions.
+        self.system_caller
+            .on_state(StateChangeSource::Transaction(self.receipts.len()), &state);
 
         let gas_used = result.gas_used();
         self.gas_used += gas_used;
@@ -418,6 +421,39 @@ where
             .db_mut()
             .increment_balances(balance_increment)
             .map_err(BlockExecutionError::other)?;
+
+        // Feed the SYSTEM_ADDRESS drain + validator funding into the optional sparse-tree hook.
+        //
+        // This balance shuffling happens outside of EVM tx execution, so without emitting it here
+        // the sparse state-root pipeline can miss it and compute an incorrect root.
+        let mut hook_state = EvmState::default();
+
+        // SYSTEM_ADDRESS (typically drained to zero / removed)
+        let mut sys_acc = RevmAccount::default();
+        let sys_cached = self
+            .evm
+            .db_mut()
+            .load_cache_account(SYSTEM_ADDRESS)
+            .map_err(BlockExecutionError::other)?;
+        sys_acc.info = sys_cached.account_info().unwrap_or_default();
+        sys_acc.mark_touch();
+        hook_state.insert(SYSTEM_ADDRESS, sys_acc);
+
+        // Beneficiary/validator (funded so it can send value in subsequent system txs)
+        let mut val_acc = RevmAccount::default();
+        let val_cached = self
+            .evm
+            .db_mut()
+            .load_cache_account(validator)
+            .map_err(BlockExecutionError::other)?;
+        val_acc.info = val_cached.account_info().unwrap_or_default();
+        val_acc.mark_touch();
+        hook_state.insert(validator, val_acc);
+
+        // Use a synthetic transaction source id to preserve ordering semantics without colliding
+        // with real tx indices.
+        self.system_caller
+            .on_state(StateChangeSource::Transaction(usize::MAX - 1), &hook_state);
 
         let system_reward_balance = self
             .evm
