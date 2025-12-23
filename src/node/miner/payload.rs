@@ -1087,31 +1087,6 @@ where
 
                                     Some(_tx_hash) = self.tx_listener.recv() => {
                                         new_tx_count+=1;
-                                        // Guard: do not start a new build attempt if there is not
-                                        // enough time left to reasonably finish it.
-                                        //
-                                        // This prevents late "attempt2 pending" which can waste CPU
-                                        // and create confusing empty-payload logs.
-                                        let time_left = remaining_duration;
-                                        let safety_margin =
-                                            std::time::Duration::from_millis(DELAY_LEFT_OVER.saturating_add(20));
-                                        if time_left <= elapsed.saturating_add(safety_margin) {
-                                            debug!(
-                                                target: "bsc::miner::payload",
-                                                trace_id = self.trace_id,
-                                                block_number = self.build_args.config.parent_header.number() + 1,
-                                                is_inturn = self.mining_ctx.is_inturn,
-                                                retries = self.retries,
-                                                time_left_ms = time_left.as_millis(),
-                                                last_cost_time_ms = elapsed.as_millis(),
-                                                new_tx_count,
-                                                payload_tx_count,
-                                                "Skip rebuild: insufficient time left, finalizing best payload"
-                                            );
-                                            self.cancel_outstanding_builds();
-                                            return self.try_return_best_payload();
-                                        }
-
                                         let mining_delay = self.parlia.delay_for_mining(
                                             &self.mining_ctx.parent_snapshot, 
                                             self.mining_ctx.header.as_ref().unwrap(), 
@@ -1135,34 +1110,34 @@ where
                                             let should_rebuild_by_new_txs = new_tx_count >= (payload_tx_count * 3) / 2;
 
                                             if should_rebuild_by_time || should_rebuild_by_new_txs {
-                                            if let Err(err) = self.try_build_tx.send(()) {
-                                                warn!(
+                                                if let Err(err) = self.try_build_tx.send(()) {
+                                                    warn!(
+                                                        target: "bsc::miner::payload",
+                                                        trace_id = self.trace_id,
+                                                        block_number = self.build_args.config.parent_header.number() + 1,
+                                                        is_inturn = self.mining_ctx.is_inturn,
+                                                        retries = self.retries,
+                                                        error = ?err,
+                                                        "Failed to send to try build queue"
+                                                    );
+                                                    self.cancel_outstanding_builds();
+                                                    return self.try_return_best_payload();
+                                                }
+                                                debug!(
                                                     target: "bsc::miner::payload",
                                                     trace_id = self.trace_id,
                                                     block_number = self.build_args.config.parent_header.number() + 1,
                                                     is_inturn = self.mining_ctx.is_inturn,
                                                     retries = self.retries,
-                                                    error = ?err,
-                                                    "Failed to send to try build queue"
+                                                    last_cost_time = ?elapsed,
+                                                    new_mining_delay = ?std::time::Duration::from_millis(mining_delay),
+                                                    new_tx_count,
+                                                    payload_tx_count,
+                                                    should_rebuild_by_time,
+                                                    should_rebuild_by_new_txs,
+                                                    "Succeed to send to try build queue"
                                                 );
-                                                self.cancel_outstanding_builds();
-                                                return self.try_return_best_payload();
-                                            }
-                                            debug!(
-                                                target: "bsc::miner::payload",
-                                                trace_id = self.trace_id,
-                                                block_number = self.build_args.config.parent_header.number() + 1,
-                                                is_inturn = self.mining_ctx.is_inturn,
-                                                retries = self.retries,
-                                                last_cost_time = ?elapsed,
-                                                new_mining_delay = ?std::time::Duration::from_millis(mining_delay),
-                                                new_tx_count,
-                                                payload_tx_count,
-                                                should_rebuild_by_time,
-                                                should_rebuild_by_new_txs,
-                                                "Succeed to send to try build queue"
-                                            );
-                                            break;  // Break out of the loop and wait for the next payload
+                                                break;  // Break out of the loop and wait for the next payload
                                             }
                                         }
                                     }
