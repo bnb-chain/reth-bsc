@@ -32,7 +32,8 @@ impl PerfContext {
                 trace_id,
                 created_at: Instant::now(),
                 attempt_seq: AtomicU64::new(0),
-                empty_fallback_wait_nanos: AtomicU64::new(0),
+                bg_wait_nanos: AtomicU64::new(0),
+                empty_payload_build_nanos: AtomicU64::new(0),
                 attempts: Mutex::new(Vec::new()),
             }),
         }
@@ -58,9 +59,28 @@ impl PerfContext {
         self.inner.created_at.elapsed()
     }
 
-    /// Start measuring the empty-fallback grace wait (RAII guard).
+    /// Start measuring the "background wait" duration (RAII guard).
+    ///
+    /// This timer is used in places where we briefly wait for background payload build tasks
+    /// (e.g. before picking the best payload).
+    pub fn bg_wait_timer(&self) -> PerfTimer {
+        PerfTimer::new(self.clone(), PerfTimerKind::BgWait)
+    }
+
+    /// Backwards-compatible alias; prefer `bg_wait_timer()`.
     pub fn empty_fallback_wait_timer(&self) -> PerfTimer {
-        PerfTimer::new(self.clone(), PerfTimerKind::EmptyFallbackWait)
+        self.bg_wait_timer()
+    }
+
+    /// Record the duration spent building an empty payload (job-level measurement).
+    ///
+    /// This is recorded from the payload job's empty-fallback path (not from the EVM builder),
+    /// and includes any synchronous/block_in_place overhead around the actual empty build.
+    pub fn record_empty_payload_build_duration(&self, duration: Duration) {
+        let nanos = duration.as_nanos().min(u64::MAX as u128) as u64;
+        self.inner
+            .empty_payload_build_nanos
+            .store(nanos, Ordering::Relaxed);
     }
 
     /// Create a new build attempt record. The returned guard should be finalized (or dropped).
@@ -122,8 +142,9 @@ impl PerfContext {
             parent_hash: self.parent_hash(),
             trace_id: self.trace_id(),
             age_ms,
-            empty_fallback_wait_ms: nanos_to_ms(
-                self.inner.empty_fallback_wait_nanos.load(Ordering::Relaxed),
+            bg_wait_ms: nanos_to_ms(self.inner.bg_wait_nanos.load(Ordering::Relaxed)),
+            empty_payload_build_ms: nanos_to_ms(
+                self.inner.empty_payload_build_nanos.load(Ordering::Relaxed),
             ),
             attempts,
         }
@@ -150,7 +171,8 @@ struct PerfContextInner {
 
     attempt_seq: AtomicU64,
 
-    empty_fallback_wait_nanos: AtomicU64,
+    bg_wait_nanos: AtomicU64,
+    empty_payload_build_nanos: AtomicU64,
 
     attempts: Mutex<Vec<AttemptRecord>>,
 }
@@ -172,11 +194,11 @@ impl Drop for PerfTimer {
     fn drop(&mut self) {
         let nanos = self.started_at.elapsed().as_nanos() as u64;
         match self.kind {
-            PerfTimerKind::EmptyFallbackWait => {
+            PerfTimerKind::BgWait => {
                 self.ctx
                     .inner
-                    .empty_fallback_wait_nanos
-                    .fetch_add(nanos, Ordering::Relaxed);
+                    .bg_wait_nanos
+                    .store(nanos, Ordering::Relaxed);
             }
         }
     }
@@ -184,7 +206,7 @@ impl Drop for PerfTimer {
 
 #[derive(Debug, Clone, Copy)]
 enum PerfTimerKind {
-    EmptyFallbackWait,
+    BgWait,
 }
 
 /// Guard for a single build attempt.
@@ -278,7 +300,8 @@ pub struct PerfSnapshot {
     pub trace_id: u64,
 
     pub age_ms: u64,
-    pub empty_fallback_wait_ms: u64,
+    pub bg_wait_ms: u64,
+    pub empty_payload_build_ms: u64,
 
     pub attempts: Vec<AttemptRecord>,
 }
