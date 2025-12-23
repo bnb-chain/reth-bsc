@@ -913,29 +913,31 @@ where
         MINER_METRICS.best_work_gas_used_mgas.set(gas_used_mgas);
 
         // Calculate and record block broadcast delay
-        // This is the time from block timestamp to current broadcast time
+        // This is the time from block timestamp to current broadcast time, in nanoseconds
         let block_timestamp = sealed_block.header().timestamp;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
 
-        // Calculate delay in seconds (broadcast_time - block_timestamp)
-        let broadcast_delay_secs = if now >= block_timestamp {
-            (now - block_timestamp) as f64
+        // Convert block timestamp (seconds) to nanoseconds
+        let block_timestamp_nanos = block_timestamp as u128 * 1_000_000_000;
+        // Get current time in nanoseconds
+        let now_nanos = now.as_nanos();
+
+        // Calculate delay in nanoseconds (broadcast_time - block_timestamp)
+        let broadcast_delay_nanos = if now_nanos >= block_timestamp_nanos {
+            (now_nanos - block_timestamp_nanos) as f64
         } else {
             // In case of clock skew, record as 0
             0.0
         };
 
-        MINER_METRICS.block_broadcast_delay_seconds.record(broadcast_delay_secs);
+        MINER_METRICS.block_broadcast_delay_seconds.record(broadcast_delay_nanos);
 
         debug!(
             target: "bsc::miner",
             block_number,
             block_timestamp,
-            broadcast_time = now,
-            broadcast_delay_secs,
+            broadcast_delay_nanos,
             "Block broadcast delay recorded"
         );
 

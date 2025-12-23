@@ -169,8 +169,9 @@ pub struct BscMinerMetrics {
     /// Total number of blocks produced
     pub blocks_produced_total: Counter,
 
-    /// Block broadcast delay in seconds (time from block timestamp to broadcast time)
+    /// Block broadcast delay in nanoseconds (time from block timestamp to broadcast time)
     /// This measures how long it takes from block creation to network broadcast
+    /// Note: Value is stored in nanoseconds to match Golang implementation
     pub block_broadcast_delay_seconds: Histogram,
 }
 
