@@ -1114,6 +1114,7 @@ where
 
     /// Try to return the best payload to result channel
     fn try_return_best_payload(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut bid_block_hash = None;
         let best_bid = self.simulator.get_best_bid(self.mining_ctx.parent_header.hash());
         if let Some(bid) = best_bid {
             info!(
@@ -1127,9 +1128,11 @@ where
                 gas_fee = %bid.bsc_payload.fees(),
                 "Found best bid"
             );
+            bid_block_hash = Some(bid.bsc_payload.block.hash());
             self.potential_payloads.push(bid.bsc_payload);
         }
         if let Some(best_payload) = self.pick_best_payload() {
+            let best_payload_hash = best_payload.block.hash();
             if let Err(err) = self.result_tx.send(SubmitContext {
                 mining_ctx: self.mining_ctx.clone(),
                 payload: best_payload,
@@ -1147,6 +1150,25 @@ where
                 );
                 return Err(Box::new(BscPayloadJobError::ResultChannelSendError(err.to_string())));
             }
+
+            // Check if the best payload is from a bid and increment bid_win metric
+            if let Some(bid_hash) = bid_block_hash {
+                if best_payload_hash == bid_hash {
+                    use crate::metrics::BscMevMetrics;
+                    use once_cell::sync::Lazy;
+                    static MEV_METRICS: Lazy<BscMevMetrics> = Lazy::new(BscMevMetrics::default);
+                    MEV_METRICS.bid_win_total.increment(1);
+
+                    debug!(
+                        target: "bsc::miner::payload",
+                        trace_id = self.trace_id,
+                        block_number = self.build_args.config.parent_header.number() + 1,
+                        bid_hash = %bid_hash,
+                        "Bid payload won - incrementing bid_win metric"
+                    );
+                }
+            }
+
             Ok(())
         } else {
             // No best payload available

@@ -1,33 +1,37 @@
 use crate::{
-    hardforks::BscHardforks, 
-    node::{BscNode, engine_api::payload::BscPayloadTypes}, 
-    BscBlock, BscBlockBody, BscPrimitives,
     chainspec::BscChainSpec,
     consensus::{
+        parlia::{
+            provider::EnhancedDbSnapshotProvider, util::calculate_millisecond_timestamp,
+            BscForkChoiceRule, HeaderForForkchoice, Parlia,
+        },
         ParliaConsensusErr,
-        parlia::{provider::EnhancedDbSnapshotProvider, Parlia, util::calculate_millisecond_timestamp, BscForkChoiceRule, HeaderForForkchoice},
     },
-    metrics::{BscFinalityMetrics, BscBlockchainMetrics},
-    shared
+    hardforks::BscHardforks,
+    metrics::{BscBlockchainMetrics, BscFinalityMetrics},
+    node::{engine_api::payload::BscPayloadTypes, BscNode},
+    shared, BscBlock, BscBlockBody, BscPrimitives,
 };
 use alloy_consensus::{Header, TxReceipt};
-use alloy_primitives::{B256, Bytes};
 use alloy_eips::Encodable2718;
+use alloy_primitives::{Bytes, B256};
 use alloy_rpc_types::engine::{ForkchoiceState, PayloadStatusEnum};
 use reth::{
     api::FullNodeTypes,
-    builder::{components::ConsensusBuilder, BuilderContext},
-    consensus::{ConsensusError, FullConsensus, Consensus, HeaderValidator},
     beacon_consensus::EthBeaconConsensus,
-    consensus_common::validation::{validate_against_parent_hash_number, validate_against_parent_4844},
-    primitives::{SealedHeader, SealedBlock, RecoveredBlock},
+    builder::{components::ConsensusBuilder, BuilderContext},
+    consensus::{Consensus, ConsensusError, FullConsensus, HeaderValidator},
+    consensus_common::validation::{
+        validate_against_parent_4844, validate_against_parent_hash_number,
+    },
+    primitives::{RecoveredBlock, SealedBlock, SealedHeader},
     providers::BlockExecutionResult,
 };
 use reth_chainspec::EthChainSpec;
-use reth_primitives::{gas_spent_by_transactions, GotExpected};
-use reth_ethereum_primitives::Receipt;
 use reth_engine_primitives::ConsensusEngineHandle;
+use reth_ethereum_primitives::Receipt;
 use reth_payload_primitives::EngineApiMessageVersion;
+use reth_primitives::{gas_spent_by_transactions, GotExpected};
 use reth_provider::{BlockNumReader, HeaderProvider};
 use std::sync::Arc;
 
@@ -44,14 +48,14 @@ where
 
     /// return a parlia consensus instance, automatically called by the ComponentsBuilder framework.
     async fn build_consensus(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::Consensus> {
-        let snapshot_provider = create_snapshot_provider(ctx)
-            .unwrap_or_else(|e| {
-                panic!("Failed to initialize snapshot provider, due to {e}");
-            });
-        
+        let snapshot_provider = create_snapshot_provider(ctx).unwrap_or_else(|e| {
+            panic!("Failed to initialize snapshot provider, due to {e}");
+        });
+
         crate::shared::set_snapshot_provider(
             snapshot_provider as Arc<dyn crate::consensus::parlia::SnapshotProvider + Send + Sync>,
-        ).unwrap_or_else(|_| panic!("Failed to set global snapshot provider"));
+        )
+        .unwrap_or_else(|_| panic!("Failed to set global snapshot provider"));
 
         crate::shared::set_header_provider(Arc::new(ctx.provider().clone()))
             .unwrap_or_else(|e| panic!("Failed to set global header provider: {e}"));
@@ -72,21 +76,26 @@ pub struct BscConsensus<ChainSpec> {
 
 impl<ChainSpec: EthChainSpec + BscHardforks + 'static> BscConsensus<ChainSpec> {
     pub fn new(chain_spec: Arc<ChainSpec>) -> Self {
-        Self { 
-            base: EthBeaconConsensus::new(chain_spec.clone()), 
-            parlia: Arc::new(Parlia::new(chain_spec.clone(), 200)), 
+        Self {
+            base: EthBeaconConsensus::new(chain_spec.clone()),
+            parlia: Arc::new(Parlia::new(chain_spec.clone(), 200)),
             chain_spec,
         }
     }
 }
 
 /// header stage validation.
-impl<ChainSpec: EthChainSpec + BscHardforks + 'static> HeaderValidator<Header> 
-    for BscConsensus<ChainSpec> {
+impl<ChainSpec: EthChainSpec + BscHardforks + 'static> HeaderValidator<Header>
+    for BscConsensus<ChainSpec>
+{
     fn validate_header(&self, header: &SealedHeader) -> Result<(), ConsensusError> {
         // tracing::debug!("Validating header, block_number: {:?}", header.number);
         if let Err(err) = self.parlia.validate_header(header) {
-            tracing::warn!("Failed to validate_header, block_number: {}, err: {:?}", header.number, err);
+            tracing::warn!(
+                "Failed to validate_header, block_number: {}, err: {:?}",
+                header.number,
+                err
+            );
             return Err(err);
         }
         Ok(())
@@ -99,8 +108,12 @@ impl<ChainSpec: EthChainSpec + BscHardforks + 'static> HeaderValidator<Header>
     ) -> Result<(), ConsensusError> {
         // tracing::debug!("Validating header against parent, block_number: {:?}", header.number);
         if let Err(err) = validate_against_parent_hash_number(header.header(), parent) {
-            tracing::warn!("Failed to validate_against_parent_hash_number, block_number: {}, err: {:?}", header.number, err);
-            return Err(err)
+            tracing::warn!(
+                "Failed to validate_against_parent_hash_number, block_number: {}, err: {:?}",
+                header.number,
+                err
+            );
+            return Err(err);
         }
 
         let header_ts = calculate_millisecond_timestamp(header.header());
@@ -110,15 +123,25 @@ impl<ChainSpec: EthChainSpec + BscHardforks + 'static> HeaderValidator<Header>
             return Err(ConsensusError::TimestampIsInPast {
                 parent_timestamp: parent_ts,
                 timestamp: header_ts,
-            })
+            });
         }
 
         // ensure that the blob gas fields for this block
-        if BscHardforks::is_cancun_active_at_timestamp(&*self.chain_spec, header.header().number, header.header().timestamp) {
+        if BscHardforks::is_cancun_active_at_timestamp(
+            &*self.chain_spec,
+            header.header().number,
+            header.header().timestamp,
+        ) {
             if let Some(blob_params) = self.chain_spec.blob_params_at_timestamp(header.timestamp) {
-                if let Err(err) = validate_against_parent_4844(header.header(), parent.header(), blob_params) {
-                    tracing::warn!("Failed to validate_against_parent_4844, block_number: {}, err: {:?}", header.number, err);
-                    return Err(err)
+                if let Err(err) =
+                    validate_against_parent_4844(header.header(), parent.header(), blob_params)
+                {
+                    tracing::warn!(
+                        "Failed to validate_against_parent_4844, block_number: {}, err: {:?}",
+                        header.number,
+                        err
+                    );
+                    return Err(err);
                 }
             }
         }
@@ -173,7 +196,7 @@ impl<ChainSpec: EthChainSpec<Header = Header> + BscHardforks + 'static> FullCons
             return Err(ConsensusError::BlockGasUsed {
                 gas: GotExpected { got: cumulative_gas_used, expected: block.header().gas_used },
                 gas_spent_by_tx: gas_spent_by_transactions(receipts),
-            })
+            });
         }
 
         // Before Byzantium, receipts contained state root that would mean that expensive
@@ -181,27 +204,31 @@ impl<ChainSpec: EthChainSpec<Header = Header> + BscHardforks + 'static> FullCons
         // transaction This was replaced with is_success flag.
         // See more about EIP here: https://eips.ethereum.org/EIPS/eip-658
         if chain_spec.is_byzantium_active_at_block(block.header().number) {
-            if let Err(error) = verify_receipts(block.header().receipts_root, block.header().logs_bloom, receipts)
+            if let Err(error) =
+                verify_receipts(block.header().receipts_root, block.header().logs_bloom, receipts)
             {
                 let receipts = receipts
                     .iter()
                     .map(|r| Bytes::from(r.with_bloom_ref().encoded_2718()))
                     .collect::<Vec<_>>();
                 tracing::debug!(%error, ?receipts, "receipts verification failed");
-                return Err(error)
+                return Err(error);
             }
         }
 
         // Validate that the header requests hash matches the calculated requests hash
-        if chain_spec.is_prague_active_at_block_and_timestamp(block.header().number, block.header().timestamp) {
+        if chain_spec.is_prague_active_at_block_and_timestamp(
+            block.header().number,
+            block.header().timestamp,
+        ) {
             let Some(header_requests_hash) = block.header().requests_hash else {
-                return Err(ConsensusError::RequestsHashMissing)
+                return Err(ConsensusError::RequestsHashMissing);
             };
             let requests_hash = requests.requests_hash();
             if requests_hash != header_requests_hash {
                 return Err(ConsensusError::BodyRequestsHashDiff(
                     GotExpected::new(requests_hash, header_requests_hash).into(),
-                ))
+                ));
             }
         }
         Ok(())
@@ -221,7 +248,9 @@ fn verify_receipts<R: reth_primitives_traits::Receipt>(
     let receipts_root = alloy_consensus::proofs::calculate_receipt_root(&receipts_with_bloom);
 
     // Calculate header logs bloom.
-    let logs_bloom = receipts_with_bloom.iter().fold(alloy_primitives::Bloom::ZERO, |bloom, r| bloom | r.bloom_ref());
+    let logs_bloom = receipts_with_bloom
+        .iter()
+        .fold(alloy_primitives::Bloom::ZERO, |bloom, r| bloom | r.bloom_ref());
 
     compare_receipts_root_and_logs_bloom(
         receipts_root,
@@ -245,13 +274,13 @@ fn compare_receipts_root_and_logs_bloom(
     if calculated_receipts_root != expected_receipts_root {
         return Err(reth::consensus::ConsensusError::BodyReceiptRootDiff(
             GotExpected { got: calculated_receipts_root, expected: expected_receipts_root }.into(),
-        ))
+        ));
     }
 
     if calculated_logs_bloom != expected_logs_bloom {
         return Err(reth::consensus::ConsensusError::BodyBloomLogDiff(
             GotExpected { got: calculated_logs_bloom, expected: expected_logs_bloom }.into(),
-        ))
+        ));
     }
 
     Ok(())
@@ -263,15 +292,14 @@ fn create_snapshot_provider<Node>(
 where
     Node: FullNodeTypes<Types = BscNode>,
 {
-
     let datadir = ctx.config().datadir.clone();
     let main_dir = datadir.resolve_datadir(ctx.chain_spec().chain());
     let db_path = main_dir.data_dir().join("parlia_snapshots");
     use reth_db::{init_db, mdbx::DatabaseArguments};
-    let snapshot_db = Arc::new(init_db(
-        &db_path,
-        DatabaseArguments::new(Default::default())
-    ).map_err(|e| eyre::eyre!("Failed to initialize snapshot database: {}", e))?);
+    let snapshot_db = Arc::new(
+        init_db(&db_path, DatabaseArguments::new(Default::default()))
+            .map_err(|e| eyre::eyre!("Failed to initialize snapshot database: {}", e))?,
+    );
     tracing::info!("Succeed to create a separate database instance for persistent snapshots");
 
     let snapshot_provider = Arc::new(EnhancedDbSnapshotProvider::new(
@@ -285,7 +313,7 @@ where
 }
 
 /// BSC Fork Choice Engine
-/// 
+///
 /// Manages fork choice decisions for BSC/Parlia consensus, including:
 /// - Evaluating incoming blocks against current canonical head
 /// - Applying fast finality rules (justified/finalized blocks)
@@ -301,7 +329,11 @@ pub struct BscForkChoiceEngine<P> {
     /// The fork choice rule
     forkchoice_rule: Arc<BscForkChoiceRule>,
     /// Cache for header total difficulties
-    header_td_cache: Arc<parking_lot::RwLock<schnellru::LruMap<B256, Option<alloy_primitives::U256>, schnellru::ByLength>>>,
+    header_td_cache: Arc<
+        parking_lot::RwLock<
+            schnellru::LruMap<B256, Option<alloy_primitives::U256>, schnellru::ByLength>,
+        >,
+    >,
     /// Finality metrics
     finality_metrics: BscFinalityMetrics,
     /// Blockchain metrics (including reorg metrics)
@@ -323,7 +355,9 @@ where
             engine_handle,
             chain_spec: chain_spec.clone(),
             forkchoice_rule: Arc::new(BscForkChoiceRule::new(chain_spec)),
-            header_td_cache: Arc::new(parking_lot::RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new(128)))),
+            header_td_cache: Arc::new(parking_lot::RwLock::new(schnellru::LruMap::new(
+                schnellru::ByLength::new(128),
+            ))),
             finality_metrics: BscFinalityMetrics::default(),
             blockchain_metrics: BscBlockchainMetrics::default(),
         }
@@ -335,7 +369,7 @@ where
     }
 
     /// Updates the fork choice based on the incoming header.
-    /// 
+    ///
     /// This function evaluates whether the incoming header should become the new canonical head
     /// according to BSC's fork choice rules (Parlia consensus with fast finality).
     ///
@@ -346,7 +380,10 @@ where
     /// # Returns
     ///
     /// Returns `Ok(())` if the fork choice was successfully updated, or an error if the update failed.
-    pub async fn update_forkchoice(&self, incoming_header: &Header) -> Result<(), ParliaConsensusErr> {
+    pub async fn update_forkchoice(
+        &self,
+        incoming_header: &Header,
+    ) -> Result<(), ParliaConsensusErr> {
         tracing::debug!(
             target: "bsc::forkchoice",
             block_number = incoming_header.number,
@@ -356,19 +393,31 @@ where
 
         let current_number = self.provider.chain_info()?.best_number;
         tracing::trace!(target: "bsc::forkchoice", "Best canonical number: {:?}, new_header = {:?}", current_number, incoming_header);
-        
-        let current_head = self.provider.header_by_number(current_number)?.ok_or(ParliaConsensusErr::HeadHashNotFound)?;
-        
-        // Determine if we need to reorg using fork choice rules 
+
+        let current_head = self
+            .provider
+            .header_by_number(current_number)?
+            .ok_or(ParliaConsensusErr::HeadHashNotFound)?;
+
+        // Determine if we need to reorg using fork choice rules
         let need_reorg = self.is_need_reorg(incoming_header, &current_head).await?;
-        if need_reorg {
+
+        // Only count as reorg if:
+        // 1. Fork choice says we need to reorg AND
+        // 2. The incoming block number is <= current head (actual chain reorganization)
+        //    OR the incoming block's parent is not the current head (side chain switch)
+        let is_actual_reorg = need_reorg
+            && (incoming_header.number <= current_head.number
+                || incoming_header.parent_hash != current_head.hash_slow());
+
+        if is_actual_reorg {
             // Calculate reorg depth: the difference between incoming and current head numbers
             // Note: This is a simplified calculation.
             let reorg_depth = incoming_header.number.abs_diff(current_head.number);
-            
+
             self.blockchain_metrics.reorg_executions_total.increment(1);
             self.blockchain_metrics.latest_reorg_depth.set(reorg_depth as f64);
-            
+
             tracing::info!(
                 target: "bsc::forkchoice",
                 incoming_number = incoming_header.number,
@@ -379,23 +428,21 @@ where
                 "Reorg detected and metrics recorded"
             );
         }
-        
-        let new_canonical_head = if need_reorg {
-            incoming_header
-        } else {
-            &current_head
-        };
-        
+
+        let new_canonical_head = if need_reorg { incoming_header } else { &current_head };
+
         // Get safe block and finalized block with new canonical head
         // ref: https://github.com/bnb-chain/bsc/blob/f70aaa8399ccee429804eecf3fc4c6fd8d9e6cab/eth/api_backend.go#L72
-        let (safe_block_number, safe_block_hash) = self.get_justified_number_and_hash(new_canonical_head).unwrap_or((0, B256::ZERO));
-        let (finalized_block_number, finalized_block_hash) = self.get_finalized_number_and_hash(new_canonical_head).unwrap_or((0, B256::ZERO));
-        
+        let (safe_block_number, safe_block_hash) =
+            self.get_justified_number_and_hash(new_canonical_head).unwrap_or((0, B256::ZERO));
+        let (finalized_block_number, finalized_block_hash) =
+            self.get_finalized_number_and_hash(new_canonical_head).unwrap_or((0, B256::ZERO));
+
         // Update finality metrics
         self.finality_metrics.justified_block_height.set(safe_block_number as f64);
         self.finality_metrics.safe_block_height.set(safe_block_number as f64);
         self.finality_metrics.finalized_block_height.set(finalized_block_number as f64);
-        
+
         let state = ForkchoiceState {
             head_block_hash: new_canonical_head.hash_slow(),
             safe_block_hash,
@@ -413,12 +460,16 @@ where
             finalized_block_number,
             "Fork choice updated"
         );
-        
-        match self.engine_handle.fork_choice_updated(state, None, EngineApiMessageVersion::default()).await
+
+        match self
+            .engine_handle
+            .fork_choice_updated(state, None, EngineApiMessageVersion::default())
+            .await
         {
             Ok(response) => match response.payload_status.status {
-                PayloadStatusEnum::Invalid { validation_error } => 
-                    Err(ParliaConsensusErr::ForkChoiceUpdateError(validation_error)),
+                PayloadStatusEnum::Invalid { validation_error } => {
+                    Err(ParliaConsensusErr::ForkChoiceUpdateError(validation_error))
+                }
                 _ => Ok(()),
             },
             Err(err) => Err(ParliaConsensusErr::ForkChoiceUpdateError(err.to_string())),
@@ -448,16 +499,17 @@ where
         incoming_header: &Header,
         current_header: &Header,
     ) -> Result<bool, ParliaConsensusErr> {
-        let (incoming_td, current_td) = self.header_td_fcu(&self.engine_handle, incoming_header, current_header).await?;
-        let incoming_justified_num = self.get_justified_number_and_hash(incoming_header)
-            .map(|(num, _)| num)
-            .unwrap_or(0);
-        let current_justified_num = self.get_justified_number_and_hash(current_header)
-            .map(|(num, _)| num)
-            .unwrap_or(0);
+        let (incoming_td, current_td) =
+            self.header_td_fcu(&self.engine_handle, incoming_header, current_header).await?;
+        let incoming_justified_num =
+            self.get_justified_number_and_hash(incoming_header).map(|(num, _)| num).unwrap_or(0);
+        let current_justified_num =
+            self.get_justified_number_and_hash(current_header).map(|(num, _)| num).unwrap_or(0);
 
-        let incoming_for_fc = HeaderForForkchoice::new(incoming_header, incoming_td, incoming_justified_num);
-        let current_for_fc = HeaderForForkchoice::new(current_header, current_td, current_justified_num);
+        let incoming_for_fc =
+            HeaderForForkchoice::new(incoming_header, incoming_td, incoming_justified_num);
+        let current_for_fc =
+            HeaderForForkchoice::new(current_header, current_td, current_justified_num);
 
         self.forkchoice_rule.is_need_reorg(&incoming_for_fc, &current_for_fc)
     }
@@ -467,9 +519,9 @@ where
         if !self.chain_spec.is_luban_active_at_block(header.number) {
             return None;
         }
-        
+
         let sp = shared::get_snapshot_provider()?;
-        
+
         match sp.snapshot_by_hash(&header.hash_slow()) {
             Some(snap) => Some((snap.vote_data.target_number, snap.vote_data.target_hash)),
             None => {
@@ -488,9 +540,9 @@ where
         if !self.chain_spec.is_plato_active_at_block(header.number) {
             return None;
         }
-        
+
         let sp = shared::get_snapshot_provider()?;
-        
+
         match sp.snapshot_by_hash(&header.hash_slow()) {
             Some(snap) => Some((snap.vote_data.source_number, snap.vote_data.source_hash)),
             None => {
@@ -513,9 +565,11 @@ where
         engine: &ConsensusEngineHandle<BscPayloadTypes>,
         incoming: &Header,
         current: &Header,
-    ) -> Result<(Option<alloy_primitives::U256>, Option<alloy_primitives::U256>), ParliaConsensusErr> {
+    ) -> Result<(Option<alloy_primitives::U256>, Option<alloy_primitives::U256>), ParliaConsensusErr>
+    {
         let current_td = self.header_td(engine, current.number, current.hash_slow()).await?;
-        let incoming_td = match self.header_td(engine, incoming.number, incoming.hash_slow()).await {
+        let incoming_td = match self.header_td(engine, incoming.number, incoming.hash_slow()).await
+        {
             Ok(td) => td,
             Err(e) => {
                 tracing::debug!(target: "bsc::forkchoice", "Failed to get incoming header TD: {:?}, try to query parent block TD", e);
@@ -526,7 +580,7 @@ where
                         None
                     }
                 }
-            },
+            }
         };
         Ok((incoming_td, current_td))
     }

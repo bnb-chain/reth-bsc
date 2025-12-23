@@ -149,6 +149,9 @@ pub struct BscMevMetrics {
 
     /// Greedy merge execution duration in seconds
     pub greedy_merge_duration_seconds: Histogram,
+
+    /// Total number of bid wins (when the final payload is from a bid)
+    pub bid_win_total: Counter,
 }
 
 /// Metrics for BSC miner/worker operations
@@ -165,6 +168,10 @@ pub struct BscMinerMetrics {
 
     /// Total number of blocks produced
     pub blocks_produced_total: Counter,
+
+    /// Block broadcast delay in seconds (time from block timestamp to broadcast time)
+    /// This measures how long it takes from block creation to network broadcast
+    pub block_broadcast_delay_seconds: Histogram,
 }
 
 /// Metrics for BSC fast finality
