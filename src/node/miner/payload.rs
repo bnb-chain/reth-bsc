@@ -1263,16 +1263,17 @@ where
             self.potential_payloads.push(bid.bsc_payload);
         }
 
-        // Regardless of in-turn/off-turn and whether we currently have candidate payloads, if there
-        // are still background build tasks in flight, wait briefly for one to finish. This reduces:
-        // - chance of falling back to empty payload (in-turn)
-        // - wasted "late attempt" work that finishes just after we pick a payload
+        // Only for in-turn blocks, and only when we already have candidate payloads, wait briefly
+        // for a background build to finish before picking the best payload.
+        //
+        // This helps avoid picking a suboptimal payload when a better one is about to complete,
+        // while not delaying the empty-fallback path.
         //
         // The wait is bounded by both:
         // - a fixed 200ms cap
         // - the remaining time left in this job
         let bg_tasks = self.join_handle.len();
-        if bg_tasks > 0 {
+        if self.mining_ctx.is_inturn && !self.potential_payloads.is_empty() && bg_tasks > 0 {
             let job_elapsed = self.job_start_time.elapsed();
             let time_left = if job_elapsed < self.timeout { self.timeout - job_elapsed } else { std::time::Duration::ZERO };
             let wait_budget = std::cmp::min(std::time::Duration::from_millis(200), time_left);
