@@ -402,6 +402,8 @@ where
                     withdrawals: Some(attributes.withdrawals().clone()),
                     },
                     sparse_trie_root_waiter: None,
+                    perf_ctx: None,
+                    perf_attempt_id: None,
                 },
             )
             .map_err(PayloadBuilderError::other)

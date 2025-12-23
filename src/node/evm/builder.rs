@@ -107,8 +107,10 @@ where
         db.merge_transitions(BundleRetention::Reverts);
 
         // calculate the state root
-        let state_root_start = std::time::Instant::now();
+        let hashed_start = std::time::Instant::now();
         let hashed_state = state.hashed_post_state(&db.bundle_state);
+        let hashed_post_state_duration = hashed_start.elapsed();
+        let state_root_start = std::time::Instant::now();
         let (state_root, trie_updates, state_root_source) =
             if let Some(waiter) = self.ctx.sparse_trie_root_waiter.as_ref() {
             // If sparse trie root pipeline is available, prefer it. On any error, fall back to the
@@ -143,6 +145,10 @@ where
         let (transactions, senders): (Vec<_>, Vec<_>) =
             self.transactions.into_iter().map(|tx| tx.into_parts()).unzip();
 
+        // Capture perf context before moving `self.ctx` into the assembler input.
+        let perf_ctx = self.ctx.perf_ctx.clone();
+        let perf_attempt_id = self.ctx.perf_attempt_id;
+
         // BlockAssemblerInput is non_exhaustive. 
         // So define a new struct BscBlockAssemblerInput and a new interface assemble_block_bsc.
         let bsc_input: BscBlockAssemblerInput<'_, '_, BscBlockExecutorFactory> = BscBlockAssemblerInput {
@@ -171,6 +177,18 @@ where
         let assemble_duration = assemble_start.elapsed();
         
         let finish_duration = finish_start.elapsed();
+
+        // Record detailed finish timings into optional perf context (if present).
+        if let (Some(perf), Some(attempt_id)) = (perf_ctx.as_ref(), perf_attempt_id) {
+            perf.record_finish_timings_for_attempt(
+                attempt_id,
+                finish_duration,
+                hashed_post_state_duration,
+                state_root_duration,
+                state_root_source,
+                assemble_duration,
+            );
+        }
         tracing::debug!(
             target: "bsc::builder",
             block_number = %block.header.number,
@@ -181,6 +199,7 @@ where
             total_tx_len = total_tx_len,
             finish_duration_ms = finish_duration.as_millis(),
             state_root_duration_ms = state_root_duration.as_millis(),
+            hashed_post_state_duration_ms = hashed_post_state_duration.as_millis(),
             assemble_duration_ms = assemble_duration.as_millis(),
             "Succeed to seal block"
         );

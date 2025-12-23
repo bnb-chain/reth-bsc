@@ -36,11 +36,15 @@ pub struct BscNextBlockEnvAttributes {
     pub inner: NextBlockEnvAttributes,
     /// Optional sparse trie root waiter that will be forwarded into execution ctx.
     pub sparse_trie_root_waiter: Option<crate::node::sparse::SparseTrieRootWaiterHandle>,
+    /// Optional perf context (per payload job) for detailed timing/debugging.
+    pub perf_ctx: Option<Arc<crate::node::perf::PerfContext>>,
+    /// Optional perf attempt id to attribute EVM/builder timings to a specific build attempt.
+    pub perf_attempt_id: Option<u64>,
 }
 
 impl From<NextBlockEnvAttributes> for BscNextBlockEnvAttributes {
     fn from(value: NextBlockEnvAttributes) -> Self {
-        Self { inner: value, sparse_trie_root_waiter: None }
+        Self { inner: value, sparse_trie_root_waiter: None, perf_ctx: None, perf_attempt_id: None }
     }
 }
 
@@ -63,6 +67,8 @@ impl core::fmt::Debug for BscNextBlockEnvAttributes {
         f.debug_struct("BscNextBlockEnvAttributes")
             .field("inner", &self.inner)
             .field("has_sparse_trie_root_waiter", &self.sparse_trie_root_waiter.is_some())
+            .field("has_perf_ctx", &self.perf_ctx.is_some())
+            .field("perf_attempt_id", &self.perf_attempt_id)
             .finish()
     }
 }
@@ -72,7 +78,12 @@ impl<H: alloy_consensus::BlockHeader> reth_rpc_eth_api::helpers::pending_block::
     for BscNextBlockEnvAttributes
 {
     fn build_pending_env(parent: &reth_primitives_traits::SealedHeader<H>) -> Self {
-        Self { inner: NextBlockEnvAttributes::build_pending_env(parent), sparse_trie_root_waiter: None }
+        Self {
+            inner: NextBlockEnvAttributes::build_pending_env(parent),
+            sparse_trie_root_waiter: None,
+            perf_ctx: None,
+            perf_attempt_id: None,
+        }
     }
 }
 
@@ -118,6 +129,10 @@ pub struct BscBlockExecutionCtx<'a> {
     pub is_miner: bool,
     /// Optional sparse trie root waiter for `finish()` to use.
     pub sparse_trie_root_waiter: Option<crate::node::sparse::SparseTrieRootWaiterHandle>,
+    /// Optional perf context for detailed timing/debugging.
+    pub perf_ctx: Option<Arc<crate::node::perf::PerfContext>>,
+    /// Optional perf attempt id to attribute EVM/builder timings to a specific build attempt.
+    pub perf_attempt_id: Option<u64>,
 }
 
 impl<'a> core::fmt::Debug for BscBlockExecutionCtx<'a> {
@@ -127,6 +142,8 @@ impl<'a> core::fmt::Debug for BscBlockExecutionCtx<'a> {
             .field("header", &self.header)
             .field("is_miner", &self.is_miner)
             .field("has_sparse_trie_root_waiter", &self.sparse_trie_root_waiter.is_some())
+            .field("has_perf_ctx", &self.perf_ctx.is_some())
+            .field("perf_attempt_id", &self.perf_attempt_id)
             .finish()
     }
 }
@@ -405,6 +422,8 @@ where
             header: Some(block.header().clone()),
             is_miner: false,
             sparse_trie_root_waiter: None,
+            perf_ctx: None,
+            perf_attempt_id: None,
         }
     }
 
@@ -424,6 +443,8 @@ where
             header: None, // No header available for next block context
             is_miner: true,
             sparse_trie_root_waiter: attributes.sparse_trie_root_waiter,
+            perf_ctx: attributes.perf_ctx,
+            perf_attempt_id: attributes.perf_attempt_id,
         }
     }
 
@@ -482,6 +503,8 @@ where
             header: Some(block.header.clone()),
             is_miner: false,
             sparse_trie_root_waiter: None,
+            perf_ctx: None,
+            perf_attempt_id: None,
         }
     }
 

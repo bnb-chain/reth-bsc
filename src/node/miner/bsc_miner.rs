@@ -628,6 +628,7 @@ where
             cancel: ManualCancel::default(),
             trace_id: crate::node::miner::payload::generate_trace_id(),
             min_gas_tip: self.desired_min_gas_tip,
+            perf_ctx: None,
         };
 
         let parent_hash = mining_ctx.parent_header.hash();

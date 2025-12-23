@@ -30,6 +30,7 @@ pub mod evm;
 pub mod pool;
 pub mod miner;
 pub mod network;
+pub mod perf;
 pub mod primitives;
 pub mod sparse;
 pub mod storage;

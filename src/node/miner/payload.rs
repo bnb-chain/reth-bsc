@@ -10,6 +10,7 @@ use crate::node::miner::bsc_miner::{MiningContext, SubmitContext};
 use crate::node::pool::BlacklistedAddressError;
 use crate::node::primitives::BscBlobTransactionSidecar;
 use crate::node::sparse::SparseDriver;
+use crate::node::perf::PerfContext;
 use alloy_consensus::{BlockHeader, Transaction};
 use alloy_evm::block::BlockExecutor;
 use alloy_evm::Evm;
@@ -103,6 +104,8 @@ pub struct BscBuildArguments<Attributes> {
     pub trace_id: u64,
     /// Minimum gas tip
     pub min_gas_tip: u128,
+    /// Optional perf context (per payload job) for detailed timing/debugging.
+    pub perf_ctx: Option<std::sync::Arc<PerfContext>>,
 }
 
 /// BSC payload builder, used to build payload for bsc miner.
@@ -175,8 +178,10 @@ where
         args: BscBuildArguments<EthPayloadBuilderAttributes>,
     ) -> Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>> {
         let build_start = std::time::Instant::now();
-        let BscBuildArguments { mut cached_reads, config, cancel, trace_id, min_gas_tip } = args;
+        let BscBuildArguments { mut cached_reads, config, cancel, trace_id, min_gas_tip, perf_ctx } = args;
         let PayloadConfig { parent_header, attributes } = config;
+        let mut attempt_guard = perf_ctx.as_ref().map(|p| p.start_attempt());
+        let perf_attempt_id = attempt_guard.as_ref().map(|g| g.attempt_id());
 
         let state_provider = self.client.state_by_block_hash(parent_header.hash_slow())?;
         let state = StateProviderDatabase::new(&state_provider);
@@ -198,6 +203,8 @@ where
                     withdrawals: Some(attributes.withdrawals().clone()),
                 },
             sparse_trie_root_waiter: None,
+            perf_ctx: perf_ctx.clone(),
+            perf_attempt_id,
         };
 
         let mut sparse_state_hook: Option<Box<dyn reth_evm::OnStateHook>> = None;
@@ -236,6 +243,12 @@ where
 
         let mut total_fees = U256::ZERO;
         let mut cumulative_gas_used = 0;
+        let mut tx_considered: u64 = 0;
+        let mut tx_executed: u64 = 0;
+        let mut tx_skipped_blacklist: u64 = 0;
+        let mut tx_skipped_min_tip: u64 = 0;
+        let mut tx_skipped_gas_or_blob: u64 = 0;
+        let mut tx_invalid: u64 = 0;
         // reserve the systemtx gas
         let system_txs_gas = self.parlia.estimate_gas_reserved_for_system_txs(
             Some(parent_header.timestamp),
@@ -275,6 +288,7 @@ where
             BestTransactionsAttributes::new(base_fee, blob_fee.map(|fee| fee as u64)),
         );
         while let Some(pool_tx) = best_tx_list.next() {
+            tx_considered += 1;
             if cancel.is_cancelled() {
                 break;
             }
@@ -283,6 +297,7 @@ where
             if self.chain_spec.is_nano_active_at_block(parent_header.number + 1)
                 && blacklist::check_tx_basic_blacklist(pool_tx.sender(), pool_tx.to())
             {
+                tx_skipped_blacklist += 1;
                 debug!(
                     target: "payload_builder",
                     trace_id,
@@ -297,6 +312,7 @@ where
             }
             // filter out tx with min gas tip.
             if pool_tx.effective_tip_per_gas(base_fee).unwrap_or(0_u128) < min_gas_tip {
+                tx_skipped_min_tip += 1;
                 // Skip packaging underpriced transactions, but do not mark them invalid.
                 trace!(
                     target: "payload_builder",
@@ -311,6 +327,7 @@ where
 
             // ensure we still have capacity for this transaction
             if cumulative_gas_used + pool_tx.gas_limit() > block_gas_limit {
+                tx_skipped_gas_or_blob += 1;
                 // we can't fit this transaction into the block, so we need to mark it as invalid
                 // which also removes all dependent transaction from the iterator before we can
                 // continue
@@ -339,6 +356,7 @@ where
             if let Some(blob_tx) = tx.as_eip4844() {
                 let tx_blob_count = blob_tx.tx().blob_versioned_hashes.len() as u64;
                 if block_blob_count + tx_blob_count > max_blob_count {
+                    tx_skipped_gas_or_blob += 1;
                     // we can't fit this _blob_ transaction into the block, so we mark it as
                     // invalid, which removes its dependent transactions from
                     // the iterator. This is similar to the gas limit condition
@@ -372,6 +390,7 @@ where
                     let left = max_blob_count - block_blob_count;
                     if left < blob_tx.tx().blob_gas_used().unwrap_or(0) / BLOB_TX_BLOB_GAS_PER_BLOB
                     {
+                        tx_skipped_gas_or_blob += 1;
                         best_tx_list.mark_invalid(
                             &pool_tx,
                             InvalidPoolTransactionError::Eip4844(
@@ -408,6 +427,7 @@ where
                 blob_tx_sidecar = match blob_sidecar_result {
                     Ok(sidecar) => Some(sidecar),
                     Err(error) => {
+                        tx_invalid += 1;
                         warn!(
                             target: "payload_builder",
                             trace_id,
@@ -437,6 +457,7 @@ where
                     error,
                     ..
                 })) => {
+                    tx_invalid += 1;
                     if error.is_nonce_too_low() {
                         // if the nonce is too low, we can skip this transaction
                         debug!(
@@ -483,6 +504,7 @@ where
                 // this is an error that we should treat as fatal for this attempt
                 Err(err) => return Err(Box::new(PayloadBuilderError::evm(err))),
             };
+            tx_executed += 1;
 
              // add to the total blob gas used if the transaction successfully executed
             if let Some(blob_tx) = tx.as_eip4844() {
@@ -617,6 +639,29 @@ where
             },
             executed_trie: Some(ExecutedTrieUpdates::Present(Arc::new(trie_updates))),
         };
+        if let (Some(perf), Some(guard)) = (perf_ctx.as_ref(), attempt_guard.take()) {
+            guard.finish_with_tx_stats(
+                tx_considered,
+                tx_executed,
+                tx_skipped_blacklist,
+                tx_skipped_min_tip,
+                tx_skipped_gas_or_blob,
+                tx_invalid,
+                cumulative_gas_used,
+                total_fees,
+            );
+            // Optional: emit a lightweight snapshot when a build attempt finishes.
+            let snap = perf.snapshot();
+            debug!(
+                target: "bsc::miner::perf",
+                trace_id = snap.trace_id,
+                block_number = snap.block_number,
+                parent_hash = ?snap.parent_hash,
+                age_ms = snap.age_ms,
+                attempts = snap.attempts.len(),
+                "PerfContext snapshot (attempt finished)"
+            );
+        }
         Ok(payload)
     }
 
@@ -627,9 +672,11 @@ where
         args: BscBuildArguments<EthPayloadBuilderAttributes>,
     ) -> Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>> {
         let build_start = std::time::Instant::now();
-        let BscBuildArguments { mut cached_reads, config, cancel: _, trace_id, min_gas_tip: _ } =
+        let BscBuildArguments { mut cached_reads, config, cancel: _, trace_id, min_gas_tip: _, perf_ctx } =
             args;
         let PayloadConfig { parent_header, attributes } = config;
+        let mut attempt_guard = perf_ctx.as_ref().map(|p| p.start_attempt());
+        let perf_attempt_id = attempt_guard.as_ref().map(|g| g.attempt_id());
 
         let state_provider = self.client.state_by_block_hash(parent_header.hash_slow())?;
         let state = StateProviderDatabase::new(&state_provider);
@@ -653,6 +700,8 @@ where
                     withdrawals: Some(attributes.withdrawals().clone()),
                     },
                     sparse_trie_root_waiter: None,
+                    perf_ctx: perf_ctx.clone(),
+                    perf_attempt_id,
                 },
             )
             .map_err(PayloadBuilderError::other)?;
@@ -716,6 +765,19 @@ where
             },
             executed_trie: Some(ExecutedTrieUpdates::Present(Arc::new(trie_updates))),
         };
+        if let (Some(perf), Some(guard)) = (perf_ctx.as_ref(), attempt_guard.take()) {
+            guard.finish_with_tx_stats(0, 0, 0, 0, 0, 0, cumulative_gas_used, total_fees);
+            let snap = perf.snapshot();
+            debug!(
+                target: "bsc::miner::perf",
+                trace_id = snap.trace_id,
+                block_number = snap.block_number,
+                parent_hash = ?snap.parent_hash,
+                age_ms = snap.age_ms,
+                attempts = snap.attempts.len(),
+                "PerfContext snapshot (empty attempt finished)"
+            );
+        }
         Ok(payload)
     }
 }
@@ -772,6 +834,10 @@ where
     job_start_time: std::time::Instant,
     /// Unique trace ID for this payload job
     trace_id: u64,
+    /// Perf context shared across this job and all build attempts.
+    perf_ctx: std::sync::Arc<PerfContext>,
+    /// RAII timer that records total job runtime into `perf_ctx`.
+    _perf_job_timer: crate::node::perf::PerfTimer,
 }
 
 impl<Pool, Client, EvmConfig> BscPayloadJob<Pool, Client, EvmConfig>
@@ -800,7 +866,7 @@ where
         parlia: Arc<crate::consensus::parlia::Parlia<crate::chainspec::BscChainSpec>>,
         mining_ctx: MiningContext,
         builder: BscPayloadBuilder<Pool, Client, EvmConfig>,
-        build_args: BscBuildArguments<EthPayloadBuilderAttributes>,
+        mut build_args: BscBuildArguments<EthPayloadBuilderAttributes>,
         simulator: Arc<BidSimulator<Client, Pool>>, // No outer RwLock needed
         result_tx: mpsc::UnboundedSender<SubmitContext>,
     ) -> (Self, BscPayloadJobHandle) {
@@ -809,6 +875,11 @@ where
         let (tx_listener_tx, tx_listener_rx) = mpsc::unbounded_channel();
         
         let trace_id = build_args.trace_id;
+        let next_block_number = build_args.config.parent_header.number() + 1;
+        let parent_hash = build_args.config.parent_header.hash_slow();
+        let perf_ctx = std::sync::Arc::new(PerfContext::new(next_block_number, parent_hash, trace_id));
+        build_args.perf_ctx = Some(perf_ctx.clone());
+        let perf_job_timer = perf_ctx.job_timer();
         
         let mining_delay = parlia.clone().delay_for_mining(
             &mining_ctx.parent_snapshot, 
@@ -848,6 +919,8 @@ where
             simulator,
             job_start_time: std::time::Instant::now(),
             trace_id,
+            perf_ctx,
+            _perf_job_timer: perf_job_timer,
         };
         let handle = BscPayloadJobHandle { abort_tx };
 
@@ -1200,6 +1273,7 @@ where
                 // This is intentionally bounded (200ms) and still respects new-head aborts.
                 let bg_tasks = self.join_handle.len();
                 if bg_tasks > 0 {
+                    let _wait_timer = self.perf_ctx.empty_fallback_wait_timer();
                     let wait_budget = std::time::Duration::from_millis(200);
                     let wait_start = std::time::Instant::now();
 
@@ -1406,6 +1480,9 @@ where
         let gas_limit = best_payload.block().header().gas_limit();
         let gas_usage_percent =
             if gas_limit > 0 { (gas_used as f64 / gas_limit as f64 * 100.0) as u64 } else { 0 };
+
+        // Attach per-job perf context summary to the main "picked best payload" log.
+        let snap = self.perf_ctx.snapshot();
         
         info!(
             target: "bsc::miner::payload",
@@ -1421,6 +1498,10 @@ where
             pick_index = best_index + 1,
             total_len = total_len,
             total_job_duration_ms = total_job_duration.as_millis(),
+            perf_job_age_ms = snap.age_ms,
+            perf_job_total_ms = snap.job_total_ms,
+            perf_empty_fallback_wait_ms = snap.empty_fallback_wait_ms,
+            perf_attempts = ?snap.attempts,
             "Succeed to pick the best payload"
         );
 
