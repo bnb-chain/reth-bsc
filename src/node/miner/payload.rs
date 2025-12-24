@@ -1311,7 +1311,7 @@ where
         // while not delaying the empty-fallback path.
         let bg_tasks = self.join_handle.len();
         if self.mining_ctx.is_inturn && bg_tasks > 0 {
-            let wait_budget = std::time::Duration::from_millis(200);
+            let wait_budget = std::time::Duration::from_millis(100);
             let _wait_timer = self.perf_ctx.bg_wait_timer();
             let wait_start = std::time::Instant::now();
 
