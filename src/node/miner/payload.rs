@@ -968,6 +968,17 @@ where
     /// Runs the payload job asynchronously with timeout support
     pub async fn start(mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut start_time = std::time::Instant::now();
+        // Tag the first attempt so attempt#1 has a clear trigger in perf logs.
+        self.perf_ctx.set_next_attempt_trigger(crate::node::perf::RetryTriggerInfo {
+            kind: "initial",
+            triggered_at_ms: self.perf_ctx.age().as_millis() as u64,
+            new_tx_count: 0,
+            payload_tx_count: 0,
+            mining_delay_ms: 0,
+            last_attempt_ms: 0,
+            by_time: false,
+            by_new_txs: false,
+        });
         if let Err(err) = self.try_build_tx.send(()) {
             warn!(
                 target: "bsc::miner::payload",
@@ -1149,6 +1160,22 @@ where
                                             let should_rebuild_by_new_txs = new_tx_count >= (payload_tx_count * 3) / 2;
 
                                             if should_rebuild_by_time || should_rebuild_by_new_txs {
+                                                let trigger_kind = match (should_rebuild_by_time, should_rebuild_by_new_txs) {
+                                                    (true, true) => "time|new_txs",
+                                                    (true, false) => "time",
+                                                    (false, true) => "new_txs",
+                                                    (false, false) => "unknown",
+                                                };
+                                                self.perf_ctx.set_next_attempt_trigger(crate::node::perf::RetryTriggerInfo {
+                                                    kind: trigger_kind,
+                                                    triggered_at_ms: self.perf_ctx.age().as_millis() as u64,
+                                                    new_tx_count: new_tx_count as u64,
+                                                    payload_tx_count: payload_tx_count as u64,
+                                                    mining_delay_ms: mining_delay as u64,
+                                                    last_attempt_ms: elapsed.as_millis() as u64,
+                                                    by_time: should_rebuild_by_time,
+                                                    by_new_txs: should_rebuild_by_new_txs,
+                                                });
                                                 if let Err(err) = self.try_build_tx.send(()) {
                                                     warn!(
                                                         target: "bsc::miner::payload",

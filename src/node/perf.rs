@@ -9,6 +9,18 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[derive(Debug, Clone)]
+pub struct RetryTriggerInfo {
+    pub kind: &'static str,
+    pub triggered_at_ms: u64,
+    pub new_tx_count: u64,
+    pub payload_tx_count: u64,
+    pub mining_delay_ms: u64,
+    pub last_attempt_ms: u64,
+    pub by_time: bool,
+    pub by_new_txs: bool,
+}
+
 /// Per-payload-job performance context.
 ///
 /// This is designed to be:
@@ -39,6 +51,7 @@ impl PerfContext {
                 wait_inner_sleep_nanos: AtomicU64::new(0),
                 wait_inner_tx_nanos: AtomicU64::new(0),
                 wait_inner_abort_nanos: AtomicU64::new(0),
+                next_attempt_trigger: Mutex::new(None),
                 attempts: Mutex::new(Vec::new()),
             }),
         }
@@ -113,6 +126,12 @@ impl PerfContext {
         self.inner.wait_inner_abort_nanos.fetch_add(nanos, Ordering::Relaxed);
     }
 
+    /// Set the trigger reason for the *next* build attempt. This is consumed by `start_attempt()`.
+    pub fn set_next_attempt_trigger(&self, info: RetryTriggerInfo) {
+        let mut guard = self.inner.next_attempt_trigger.lock().expect("perf trigger poisoned");
+        *guard = Some(info);
+    }
+
     /// Create a new build attempt record. The returned guard should be finalized (or dropped).
     pub fn start_attempt(&self) -> AttemptGuard {
         let id = self.inner.attempt_seq.fetch_add(1, Ordering::Relaxed) + 1;
@@ -128,6 +147,14 @@ impl PerfContext {
                 duration_ms: 0,
                 pre_exec_ms: 0,
                 tx_exec_ms: 0,
+                trigger_kind: "unknown",
+                trigger_at_ms: 0,
+                trigger_new_tx_count: 0,
+                trigger_payload_tx_count: 0,
+                trigger_mining_delay_ms: 0,
+                trigger_last_attempt_ms: 0,
+                trigger_by_time: false,
+                trigger_by_new_txs: false,
                 tx_considered: 0,
                 tx_executed: 0,
                 tx_skipped_blacklist: 0,
@@ -142,6 +169,22 @@ impl PerfContext {
                 state_root_source: "pending",
                 assemble_ms: 0,
             });
+        }
+        // If the payload job set a retry trigger for the next attempt, attach it now.
+        if let Ok(mut guard) = self.inner.next_attempt_trigger.lock() {
+            if let Some(info) = guard.take() {
+                let mut attempts = self.inner.attempts.lock().expect("perf attempts poisoned");
+                if let Some(rec) = attempts.iter_mut().find(|r| r.attempt_id == id) {
+                    rec.trigger_kind = info.kind;
+                    rec.trigger_at_ms = info.triggered_at_ms;
+                    rec.trigger_new_tx_count = info.new_tx_count;
+                    rec.trigger_payload_tx_count = info.payload_tx_count;
+                    rec.trigger_mining_delay_ms = info.mining_delay_ms;
+                    rec.trigger_last_attempt_ms = info.last_attempt_ms;
+                    rec.trigger_by_time = info.by_time;
+                    rec.trigger_by_new_txs = info.by_new_txs;
+                }
+            }
         }
         AttemptGuard { ctx: self.clone(), attempt_id: id, started_at: Instant::now(), finished: false }
     }
@@ -250,6 +293,8 @@ struct PerfContextInner {
     wait_inner_tx_nanos: AtomicU64,
     wait_inner_abort_nanos: AtomicU64,
 
+    next_attempt_trigger: Mutex<Option<RetryTriggerInfo>>,
+
     attempts: Mutex<Vec<AttemptRecord>>,
 }
 
@@ -356,6 +401,15 @@ pub struct AttemptRecord {
     pub duration_ms: u64,
     pub pre_exec_ms: u64,
     pub tx_exec_ms: u64,
+
+    pub trigger_kind: &'static str,
+    pub trigger_at_ms: u64,
+    pub trigger_new_tx_count: u64,
+    pub trigger_payload_tx_count: u64,
+    pub trigger_mining_delay_ms: u64,
+    pub trigger_last_attempt_ms: u64,
+    pub trigger_by_time: bool,
+    pub trigger_by_new_txs: bool,
 
     pub tx_considered: u64,
     pub tx_executed: u64,
