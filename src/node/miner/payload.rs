@@ -175,7 +175,7 @@ where
     pub async fn build_payload(
         &self,
         args: BscBuildArguments<EthPayloadBuilderAttributes>,
-    ) -> Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(Option<u64>, BscBuiltPayload), Box<dyn std::error::Error + Send + Sync>> {
         let build_start = std::time::Instant::now();
         let BscBuildArguments { mut cached_reads, config, cancel, trace_id, min_gas_tip, perf_ctx } = args;
         let PayloadConfig { parent_header, attributes } = config;
@@ -230,6 +230,7 @@ where
             builder.executor_mut().set_state_hook(Some(hook));
         }
 
+        let pre_exec_start = std::time::Instant::now();
         builder.apply_pre_execution_changes().map_err(|err| {
             warn!(
                 target: "payload_builder",
@@ -239,6 +240,7 @@ where
             );
             PayloadBuilderError::Internal(err.into())
         })?;
+        let pre_exec_duration = pre_exec_start.elapsed();
 
         let mut total_fees = U256::ZERO;
         let mut cumulative_gas_used = 0;
@@ -283,6 +285,7 @@ where
         }
         let max_blob_count =
             blob_params.as_ref().map(|params| params.max_blob_count).unwrap_or_default();
+        let tx_exec_start = std::time::Instant::now();
         let mut best_tx_list = self.pool.best_transactions_with_attributes(
             BestTransactionsAttributes::new(base_fee, blob_fee.map(|fee| fee as u64)),
         );
@@ -551,6 +554,7 @@ where
                 sidecars_map.insert(*tx.hash(), sidecar);
             }
         }
+        let tx_exec_duration = tx_exec_start.elapsed();
 
         // add system txs to payload.
         let finalize_start = std::time::Instant::now();
@@ -639,6 +643,13 @@ where
             executed_trie: Some(ExecutedTrieUpdates::Present(Arc::new(trie_updates))),
         };
         if let (Some(perf), Some(guard)) = (perf_ctx.as_ref(), attempt_guard.take()) {
+            if let Some(attempt_id) = perf_attempt_id {
+                perf.record_build_phase_timings_for_attempt(
+                    attempt_id,
+                    pre_exec_duration,
+                    tx_exec_duration,
+                );
+            }
             guard.finish_with_tx_stats(
                 tx_considered,
                 tx_executed,
@@ -649,6 +660,9 @@ where
                 cumulative_gas_used,
                 total_fees,
             );
+            if let Some(attempt_id) = perf_attempt_id {
+                perf.record_attempt_completed(attempt_id);
+            }
             // Optional: emit a lightweight snapshot when a build attempt finishes.
             let snap = perf.snapshot();
             debug!(
@@ -661,7 +675,7 @@ where
                 "PerfContext snapshot (attempt finished)"
             );
         }
-        Ok(payload)
+        Ok((perf_attempt_id, payload))
     }
 
     /// Build an empty payload without any user transactions from the pool
@@ -669,7 +683,7 @@ where
     pub async fn build_empty_payload(
         &self,
         args: BscBuildArguments<EthPayloadBuilderAttributes>,
-    ) -> Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(Option<u64>, BscBuiltPayload), Box<dyn std::error::Error + Send + Sync>> {
         let build_start = std::time::Instant::now();
         let BscBuildArguments { mut cached_reads, config, cancel: _, trace_id, min_gas_tip: _, perf_ctx } =
             args;
@@ -705,6 +719,7 @@ where
             )
             .map_err(PayloadBuilderError::other)?;
 
+        let pre_exec_start = std::time::Instant::now();
         builder.apply_pre_execution_changes().map_err(|err| {
             warn!(
                 target: "payload_builder",
@@ -714,10 +729,12 @@ where
             );
             PayloadBuilderError::Internal(err.into())
         })?;
+        let pre_exec_duration = pre_exec_start.elapsed();
 
         // No user transactions - only system transactions will be added by finish()
         let total_fees = U256::ZERO;
         let cumulative_gas_used = 0;
+        let tx_exec_duration = std::time::Duration::ZERO;
 
         // Add system txs to payload and finalize
         let finalize_start = std::time::Instant::now();
@@ -765,7 +782,17 @@ where
             executed_trie: Some(ExecutedTrieUpdates::Present(Arc::new(trie_updates))),
         };
         if let (Some(perf), Some(guard)) = (perf_ctx.as_ref(), attempt_guard.take()) {
+            if let Some(attempt_id) = perf_attempt_id {
+                perf.record_build_phase_timings_for_attempt(
+                    attempt_id,
+                    pre_exec_duration,
+                    tx_exec_duration,
+                );
+            }
             guard.finish_with_tx_stats(0, 0, 0, 0, 0, 0, cumulative_gas_used, total_fees);
+            if let Some(attempt_id) = perf_attempt_id {
+                perf.record_attempt_completed(attempt_id);
+            }
             let snap = perf.snapshot();
             debug!(
                 target: "bsc::miner::perf",
@@ -777,7 +804,7 @@ where
                 "PerfContext snapshot (empty attempt finished)"
             );
         }
-        Ok(payload)
+        Ok((perf_attempt_id, payload))
     }
 }
 
@@ -826,7 +853,9 @@ where
     retries: u32,
     /// JoinSet for managing build tasks
     join_handle:
-        tokio::task::JoinSet<Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>>>,
+        tokio::task::JoinSet<
+            Result<(Option<u64>, BscBuiltPayload), Box<dyn std::error::Error + Send + Sync>>,
+        >,
     /// Simulator for bid management (no outer RwLock, each map has its own)
     simulator: Arc<BidSimulator<Client, Pool>>,
     /// Job start time for tracking total duration
@@ -1012,9 +1041,12 @@ where
                 result = self.join_handle.join_next() => {
                     self.perf_ctx.add_wait_outer_join(outer_wait_started.elapsed());
                     match result {
-                        Some(Ok(Ok(payload))) => {
+                        Some(Ok(Ok((attempt_id, payload)))) => {
                             if self.is_aborted {
                                 return Err(Box::new(BscPayloadJobError::JobAborted));
+                            }
+                            if let Some(id) = attempt_id {
+                                self.perf_ctx.record_attempt_joined(id);
                             }
                             let elapsed = start_time.elapsed();
                             let payload_tx_count = payload.block().body().transaction_count() as usize;
@@ -1263,7 +1295,10 @@ where
             }
 
             let outcome: WaitOutcome<
-                Result<Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>>, tokio::task::JoinError>,
+                Result<
+                    Result<(Option<u64>, BscBuiltPayload), Box<dyn std::error::Error + Send + Sync>>,
+                    tokio::task::JoinError,
+                >,
             > = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async {
                     tokio::select! {
@@ -1290,7 +1325,10 @@ where
                     self.is_aborted = true;
                     return Err(Box::new(BscPayloadJobError::JobAborted));
                 }
-                WaitOutcome::Joined(Some(Ok(Ok(payload)))) => {
+                WaitOutcome::Joined(Some(Ok(Ok((attempt_id, payload))))) => {
+                    if let Some(id) = attempt_id {
+                        self.perf_ctx.record_attempt_joined(id);
+                    }
                     debug!(
                         target: "bsc::miner::payload",
                         trace_id = self.trace_id,
@@ -1389,7 +1427,7 @@ where
                     .record_empty_payload_build_duration(empty_build_duration);
                 
                 match empty_payload_result {
-                    Ok(empty_payload) => {
+                    Ok((_attempt_id, empty_payload)) => {
                         let snap = self.perf_ctx.snapshot();
                         info!(
                             target: "bsc::miner::payload",

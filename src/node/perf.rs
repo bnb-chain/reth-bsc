@@ -123,7 +123,11 @@ impl PerfContext {
             attempts.push(AttemptRecord {
                 attempt_id: id,
                 started_at_ms: self.age().as_millis() as u64,
+                completed_at_ms: 0,
+                joined_at_ms: 0,
                 duration_ms: 0,
+                pre_exec_ms: 0,
+                tx_exec_ms: 0,
                 tx_considered: 0,
                 tx_executed: 0,
                 tx_skipped_blacklist: 0,
@@ -140,6 +144,38 @@ impl PerfContext {
             });
         }
         AttemptGuard { ctx: self.clone(), attempt_id: id, started_at: Instant::now(), finished: false }
+    }
+
+    /// Record when the build task finished producing a result (job-relative timestamp).
+    pub fn record_attempt_completed(&self, attempt_id: u64) {
+        let ts = self.age().as_millis() as u64;
+        let mut attempts = self.inner.attempts.lock().expect("perf attempts poisoned");
+        if let Some(rec) = attempts.iter_mut().find(|r| r.attempt_id == attempt_id) {
+            rec.completed_at_ms = ts;
+        }
+    }
+
+    /// Record when the payload job joined the build task (job-relative timestamp).
+    pub fn record_attempt_joined(&self, attempt_id: u64) {
+        let ts = self.age().as_millis() as u64;
+        let mut attempts = self.inner.attempts.lock().expect("perf attempts poisoned");
+        if let Some(rec) = attempts.iter_mut().find(|r| r.attempt_id == attempt_id) {
+            rec.joined_at_ms = ts;
+        }
+    }
+
+    /// Record build-phase timings for a specific attempt.
+    pub fn record_build_phase_timings_for_attempt(
+        &self,
+        attempt_id: u64,
+        pre_exec: Duration,
+        tx_exec: Duration,
+    ) {
+        let mut attempts = self.inner.attempts.lock().expect("perf attempts poisoned");
+        if let Some(rec) = attempts.iter_mut().find(|r| r.attempt_id == attempt_id) {
+            rec.pre_exec_ms = pre_exec.as_millis() as u64;
+            rec.tx_exec_ms = tx_exec.as_millis() as u64;
+        }
     }
 
     /// Called by the EVM builder to attach finish/state-root timing information to a specific
@@ -315,7 +351,11 @@ impl Drop for AttemptGuard {
 pub struct AttemptRecord {
     pub attempt_id: u64,
     pub started_at_ms: u64,
+    pub completed_at_ms: u64,
+    pub joined_at_ms: u64,
     pub duration_ms: u64,
+    pub pre_exec_ms: u64,
+    pub tx_exec_ms: u64,
 
     pub tx_considered: u64,
     pub tx_executed: u64,
