@@ -1157,7 +1157,7 @@ where
                                         } else {
                                             let should_rebuild_by_time =
                                                 std::time::Duration::from_millis(mining_delay) < (elapsed * 3) / 2;
-                                            let should_rebuild_by_new_txs = new_tx_count >= (payload_tx_count * 3) / 2;
+                                            let should_rebuild_by_new_txs = new_tx_count >= payload_tx_count * 2;
 
                                             if should_rebuild_by_time || should_rebuild_by_new_txs {
                                                 let trigger_kind = match (should_rebuild_by_time, should_rebuild_by_new_txs) {
