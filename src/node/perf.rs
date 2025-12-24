@@ -46,6 +46,7 @@ impl PerfContext {
                 attempt_seq: AtomicU64::new(0),
                 bg_wait_nanos: AtomicU64::new(0),
                 empty_payload_build_nanos: AtomicU64::new(0),
+                wait_first_candidate_nanos: AtomicU64::new(0),
                 wait_outer_args_nanos: AtomicU64::new(0),
                 wait_outer_join_nanos: AtomicU64::new(0),
                 wait_inner_sleep_nanos: AtomicU64::new(0),
@@ -124,6 +125,17 @@ impl PerfContext {
     pub fn add_wait_inner_abort(&self, duration: Duration) {
         let nanos = duration.as_nanos().min(u64::MAX as u128) as u64;
         self.inner.wait_inner_abort_nanos.fetch_add(nanos, Ordering::Relaxed);
+    }
+
+    /// Record how long we waited in `try_return_best_payload()` for the first candidate payload
+    /// to appear when `potential_payloads` was empty.
+    ///
+    /// This is a "last value" metric (not cumulative), similar to `bg_wait_ms`.
+    pub fn record_wait_first_candidate(&self, duration: Duration) {
+        let nanos = duration.as_nanos().min(u64::MAX as u128) as u64;
+        self.inner
+            .wait_first_candidate_nanos
+            .store(nanos, Ordering::Relaxed);
     }
 
     /// Set the trigger reason for the *next* build attempt. This is consumed by `start_attempt()`.
@@ -255,6 +267,9 @@ impl PerfContext {
             empty_payload_build_ms: nanos_to_ms(
                 self.inner.empty_payload_build_nanos.load(Ordering::Relaxed),
             ),
+            wait_first_candidate_ms: nanos_to_ms(
+                self.inner.wait_first_candidate_nanos.load(Ordering::Relaxed),
+            ),
             wait_outer_args_ms: nanos_to_ms(self.inner.wait_outer_args_nanos.load(Ordering::Relaxed)),
             wait_outer_join_ms: nanos_to_ms(self.inner.wait_outer_join_nanos.load(Ordering::Relaxed)),
             wait_inner_sleep_ms: nanos_to_ms(self.inner.wait_inner_sleep_nanos.load(Ordering::Relaxed)),
@@ -287,6 +302,7 @@ struct PerfContextInner {
 
     bg_wait_nanos: AtomicU64,
     empty_payload_build_nanos: AtomicU64,
+    wait_first_candidate_nanos: AtomicU64,
     wait_outer_args_nanos: AtomicU64,
     wait_outer_join_nanos: AtomicU64,
     wait_inner_sleep_nanos: AtomicU64,
@@ -436,6 +452,7 @@ pub struct PerfSnapshot {
     pub age_ms: u64,
     pub bg_wait_ms: u64,
     pub empty_payload_build_ms: u64,
+    pub wait_first_candidate_ms: u64,
     pub wait_outer_args_ms: u64,
     pub wait_outer_join_ms: u64,
     pub wait_inner_sleep_ms: u64,
