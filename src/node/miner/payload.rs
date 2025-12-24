@@ -971,9 +971,11 @@ where
                 return self.try_return_best_payload();
             };
             
+            let outer_wait_started = std::time::Instant::now();
             tokio::select! {
                 // Trigger the async build payload by queue.
                 args = self.try_build_rx.recv() => {
+                    self.perf_ctx.add_wait_outer_args(outer_wait_started.elapsed());
                     match args {
                         Some(_) => {
                             self.retries += 1;
@@ -1008,6 +1010,7 @@ where
                 
                 // Try to join the async payload build task.
                 result = self.join_handle.join_next() => {
+                    self.perf_ctx.add_wait_outer_join(outer_wait_started.elapsed());
                     match result {
                         Some(Ok(Ok(payload))) => {
                             if self.is_aborted {
@@ -1052,9 +1055,11 @@ where
                                     return self.try_return_best_payload();
                                 };
                                 
+                                let inner_wait_started = std::time::Instant::now();
                                 tokio::select! {
                                     // Use remaining time instead of full timeout
                                     _ = tokio::time::sleep(remaining_duration) => {
+                                        self.perf_ctx.add_wait_inner_sleep(inner_wait_started.elapsed());
                                         info!(
                                             target: "bsc::miner::payload",
                                             trace_id = self.trace_id,
@@ -1071,6 +1076,7 @@ where
 
                                     // Abort by new head.
                                     _ = &mut self.abort_rx => {
+                                        self.perf_ctx.add_wait_inner_abort(inner_wait_started.elapsed());
                                         info!(
                                             target: "bsc::miner::payload",
                                             trace_id = self.trace_id,
@@ -1086,6 +1092,7 @@ where
                                     }
 
                                     Some(_tx_hash) = self.tx_listener.recv() => {
+                                        self.perf_ctx.add_wait_inner_tx(inner_wait_started.elapsed());
                                         new_tx_count+=1;
                                         let mining_delay = self.parlia.delay_for_mining(
                                             &self.mining_ctx.parent_snapshot, 
@@ -1481,6 +1488,12 @@ where
             total_job_duration_ms = total_job_duration.as_millis(),
             perf_job_age_ms = snap.age_ms,
             perf_bg_wait_ms = snap.bg_wait_ms,
+            perf_wait_outer_args_ms = snap.wait_outer_args_ms,
+            perf_wait_outer_join_ms = snap.wait_outer_join_ms,
+            perf_wait_inner_sleep_ms = snap.wait_inner_sleep_ms,
+            perf_wait_inner_tx_ms = snap.wait_inner_tx_ms,
+            perf_wait_inner_abort_ms = snap.wait_inner_abort_ms,
+            perf_empty_payload_build_ms = snap.empty_payload_build_ms,
             perf_attempts = ?snap.attempts,
             "Succeed to pick the best payload"
         );

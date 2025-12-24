@@ -34,6 +34,11 @@ impl PerfContext {
                 attempt_seq: AtomicU64::new(0),
                 bg_wait_nanos: AtomicU64::new(0),
                 empty_payload_build_nanos: AtomicU64::new(0),
+                wait_outer_args_nanos: AtomicU64::new(0),
+                wait_outer_join_nanos: AtomicU64::new(0),
+                wait_inner_sleep_nanos: AtomicU64::new(0),
+                wait_inner_tx_nanos: AtomicU64::new(0),
+                wait_inner_abort_nanos: AtomicU64::new(0),
                 attempts: Mutex::new(Vec::new()),
             }),
         }
@@ -81,6 +86,31 @@ impl PerfContext {
         self.inner
             .empty_payload_build_nanos
             .store(nanos, Ordering::Relaxed);
+    }
+
+    pub fn add_wait_outer_args(&self, duration: Duration) {
+        let nanos = duration.as_nanos().min(u64::MAX as u128) as u64;
+        self.inner.wait_outer_args_nanos.fetch_add(nanos, Ordering::Relaxed);
+    }
+
+    pub fn add_wait_outer_join(&self, duration: Duration) {
+        let nanos = duration.as_nanos().min(u64::MAX as u128) as u64;
+        self.inner.wait_outer_join_nanos.fetch_add(nanos, Ordering::Relaxed);
+    }
+
+    pub fn add_wait_inner_sleep(&self, duration: Duration) {
+        let nanos = duration.as_nanos().min(u64::MAX as u128) as u64;
+        self.inner.wait_inner_sleep_nanos.fetch_add(nanos, Ordering::Relaxed);
+    }
+
+    pub fn add_wait_inner_tx(&self, duration: Duration) {
+        let nanos = duration.as_nanos().min(u64::MAX as u128) as u64;
+        self.inner.wait_inner_tx_nanos.fetch_add(nanos, Ordering::Relaxed);
+    }
+
+    pub fn add_wait_inner_abort(&self, duration: Duration) {
+        let nanos = duration.as_nanos().min(u64::MAX as u128) as u64;
+        self.inner.wait_inner_abort_nanos.fetch_add(nanos, Ordering::Relaxed);
     }
 
     /// Create a new build attempt record. The returned guard should be finalized (or dropped).
@@ -146,6 +176,11 @@ impl PerfContext {
             empty_payload_build_ms: nanos_to_ms(
                 self.inner.empty_payload_build_nanos.load(Ordering::Relaxed),
             ),
+            wait_outer_args_ms: nanos_to_ms(self.inner.wait_outer_args_nanos.load(Ordering::Relaxed)),
+            wait_outer_join_ms: nanos_to_ms(self.inner.wait_outer_join_nanos.load(Ordering::Relaxed)),
+            wait_inner_sleep_ms: nanos_to_ms(self.inner.wait_inner_sleep_nanos.load(Ordering::Relaxed)),
+            wait_inner_tx_ms: nanos_to_ms(self.inner.wait_inner_tx_nanos.load(Ordering::Relaxed)),
+            wait_inner_abort_ms: nanos_to_ms(self.inner.wait_inner_abort_nanos.load(Ordering::Relaxed)),
             attempts,
         }
     }
@@ -173,6 +208,11 @@ struct PerfContextInner {
 
     bg_wait_nanos: AtomicU64,
     empty_payload_build_nanos: AtomicU64,
+    wait_outer_args_nanos: AtomicU64,
+    wait_outer_join_nanos: AtomicU64,
+    wait_inner_sleep_nanos: AtomicU64,
+    wait_inner_tx_nanos: AtomicU64,
+    wait_inner_abort_nanos: AtomicU64,
 
     attempts: Mutex<Vec<AttemptRecord>>,
 }
@@ -302,6 +342,11 @@ pub struct PerfSnapshot {
     pub age_ms: u64,
     pub bg_wait_ms: u64,
     pub empty_payload_build_ms: u64,
+    pub wait_outer_args_ms: u64,
+    pub wait_outer_join_ms: u64,
+    pub wait_inner_sleep_ms: u64,
+    pub wait_inner_tx_ms: u64,
+    pub wait_inner_abort_ms: u64,
 
     pub attempts: Vec<AttemptRecord>,
 }
