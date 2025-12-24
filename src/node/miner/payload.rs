@@ -698,44 +698,26 @@ where
             .with_bundle_update()
             .build();
         
-        // Enable sparse trie root pipeline for empty payloads as well (same as build_payload).
-        let mut next_env_attributes = BscNextBlockEnvAttributes {
-            inner: NextBlockEnvAttributes {
-                timestamp: attributes.timestamp(),
-                suggested_fee_recipient: attributes.suggested_fee_recipient(),
-                prev_randao: attributes.prev_randao(),
-                gas_limit: self.builder_config.gas_limit(parent_header.gas_limit),
-                parent_beacon_block_root: attributes.parent_beacon_block_root(),
-                withdrawals: Some(attributes.withdrawals().clone()),
-            },
-            sparse_trie_root_waiter: None,
-            perf_ctx: perf_ctx.clone(),
-            perf_attempt_id,
-        };
-
-        let mut sparse_state_hook: Option<Box<dyn reth_evm::OnStateHook>> = None;
-        SparseDriver::try_start_sparse_tree(
-            parent_header.hash_slow(),
-            parent_header.number + 1,
-            trace_id,
-            parent_header.header(),
-            &next_env_attributes,
-            self.client.clone(),
-            self.evm_config.clone(),
-        )
-        .map(|(hook, waiter)| {
-            sparse_state_hook = Some(hook);
-            next_env_attributes.sparse_trie_root_waiter = Some(waiter);
-        });
-
         let mut builder = self
             .evm_config
-            .builder_for_next_block(&mut db, &parent_header, next_env_attributes)
+            .builder_for_next_block(
+                &mut db,
+                &parent_header,
+                BscNextBlockEnvAttributes {
+                    inner: NextBlockEnvAttributes {
+                    timestamp: attributes.timestamp(),
+                    suggested_fee_recipient: attributes.suggested_fee_recipient(),
+                    prev_randao: attributes.prev_randao(),
+                    gas_limit: self.builder_config.gas_limit(parent_header.gas_limit),
+                    parent_beacon_block_root: attributes.parent_beacon_block_root(),
+                    withdrawals: Some(attributes.withdrawals().clone()),
+                    },
+                    sparse_trie_root_waiter: None,
+                    perf_ctx: perf_ctx.clone(),
+                    perf_attempt_id,
+                },
+            )
             .map_err(PayloadBuilderError::other)?;
-
-        if let Some(hook) = sparse_state_hook {
-            builder.executor_mut().set_state_hook(Some(hook));
-        }
 
         let pre_exec_start = std::time::Instant::now();
         builder.apply_pre_execution_changes().map_err(|err| {
@@ -1329,7 +1311,7 @@ where
         // while not delaying the empty-fallback path.
         let bg_tasks = self.join_handle.len();
         if self.mining_ctx.is_inturn && bg_tasks > 0 {
-            let wait_budget = std::time::Duration::from_millis(100);
+            let wait_budget = std::time::Duration::from_millis(200);
             let _wait_timer = self.perf_ctx.bg_wait_timer();
             let wait_start = std::time::Instant::now();
 
