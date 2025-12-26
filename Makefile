@@ -19,7 +19,7 @@ maxperf: ## Builds `reth-bsc` with the most aggressive optimisations.
 
 .PHONY: profiling
 profiling: ## Builds `reth-bsc` with optimisations, but also symbols (useful for backtraces/profiling).
-	RUSTFLAGS="-C target-cpu=native" cargo build --bin reth-bsc --profile profiling --features jemalloc,asm-keccak
+	RUSTFLAGS="-C target-cpu=native -C force-frame-pointers=yes -C force-unwind-tables=yes" cargo build --bin reth-bsc --profile profiling --features jemalloc,asm-keccak
 
 .PHONY: bench-test
 bench-test: ## Builds `reth-bsc` with the bench-test feature.
