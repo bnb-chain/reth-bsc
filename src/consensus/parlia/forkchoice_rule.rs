@@ -154,8 +154,11 @@ impl BscForkChoiceRule {
 
         // TODO: if we don't have the td, we should use the default value.
         // it's a temporary solution to avoid the error.
-        let current_td = current.td.unwrap_or(U256::ZERO);
-        let incoming_td = incoming.td.unwrap_or(U256::ZERO);
+        let (current_td, incoming_td) = if incoming.td.is_none() || current.td.is_none() {
+            (U256::from(current.header.number), U256::from(incoming.header.number))
+        } else {
+            (current.td.unwrap_or(U256::ZERO), incoming.td.unwrap_or(U256::ZERO))
+        };
 
         tracing::debug!(
             target: "bsc::forkchoice",
