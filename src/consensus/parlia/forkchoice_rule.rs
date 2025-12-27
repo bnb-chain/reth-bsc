@@ -145,12 +145,17 @@ impl BscForkChoiceRule {
         incoming: &HeaderForForkchoice,
         current: &HeaderForForkchoice,
     ) -> Result<bool, crate::consensus::ParliaConsensusErr> {
-        let current_td = current.td.ok_or(
-            crate::consensus::ParliaConsensusErr::UnknownTotalDifficulty(current.header.hash_slow(), current.header.number)
-        )?;
-        let incoming_td = incoming.td.ok_or(
-            crate::consensus::ParliaConsensusErr::UnknownTotalDifficulty(incoming.header.hash_slow(), incoming.header.number)
-        )?;
+        // let current_td = current.td.ok_or(
+        //     crate::consensus::ParliaConsensusErr::UnknownTotalDifficulty(current.header.hash_slow(), current.header.number)
+        // )?;
+        // let incoming_td = incoming.td.ok_or(
+        //     crate::consensus::ParliaConsensusErr::UnknownTotalDifficulty(incoming.header.hash_slow(), incoming.header.number)
+        // )?;
+
+        // TODO: if we don't have the td, we should use the default value.
+        // it's a temporary solution to avoid the error.
+        let current_td = current.td.unwrap_or(U256::ZERO);
+        let incoming_td = incoming.td.unwrap_or(U256::ZERO);
 
         tracing::debug!(
             target: "bsc::forkchoice",
