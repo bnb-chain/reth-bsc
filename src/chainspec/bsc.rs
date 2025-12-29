@@ -1,6 +1,6 @@
 //! Chain specification for BSC, credits to: <https://github.com/bnb-chain/reth/blob/main/crates/bsc/chainspec/src/bsc.rs>
 use crate::hardforks::bsc::BscHardfork;
-use alloy_primitives::{BlockHash, U256};
+use alloy_primitives::BlockHash;
 use reth_chainspec::{
     make_genesis_header, BaseFeeParams, BaseFeeParamsKind, Chain, ChainSpec, Head, NamedChain,
 };
@@ -15,7 +15,6 @@ pub fn bsc_mainnet() -> ChainSpec {
         chain: Chain::from_named(NamedChain::BinanceSmartChain),
         genesis: serde_json::from_str(include_str!("genesis.json"))
             .expect("Can't deserialize BSC Mainnet genesis json"),
-        paris_block_and_final_difficulty: Some((0, U256::from(0))),
         hardforks: BscHardfork::bsc_mainnet(),
         deposit_contract: None,
         base_fee_params: BaseFeeParamsKind::Constant(BaseFeeParams::new(1, 1)),
