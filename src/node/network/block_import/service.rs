@@ -346,6 +346,7 @@ where
             ) {
                 Some(announcing_peer)
             } else {
+                // TODO: remove it, cannot pick a random peer here, it may cause the block import to be stuck.
                 crate::node::network::bsc_protocol::registry::list_registered_peers()
                     .into_iter()
                     .next()
@@ -371,9 +372,11 @@ where
                     ).await {
                         tracing::debug!(target: "bsc::block_import", "Failed to request block range: number = {:?}, hash = {:?}, error = {}", start_height, start_hash, e);
                     }
+                    // TODO: add fallback download mechanism later after fetch errors.
                 });
                 self.downloading_blocks.insert(hash_number.hash, now);
             } else {
+                // TODO: add fallback download mechanism later when the peer is not registered for bsc protocol.
                 tracing::debug!(target: "bsc::block_import", "No target peer found for requesting block range: number = {:?}, hash = {:?}", start_height, start_hash);
             }
         }
