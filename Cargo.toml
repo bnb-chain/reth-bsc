@@ -13,56 +13,56 @@ name = "reth-bsc"
 path = "src/main.rs"
 
 [dependencies]
-reth = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-cli = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-cli-commands = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-basic-payload-builder = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-db = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-engine-local = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-chainspec = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-cli-util = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-discv4 = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7", features = [
+reth = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-metrics" }
+reth-cli = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-metrics" }
+reth-cli-commands = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-metrics" }
+reth-basic-payload-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-metrics" }
+reth-db = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-metrics" }
+reth-engine-local = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-metrics" }
+reth-chainspec = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-metrics" }
+reth-cli-util = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-metrics" }
+reth-discv4 = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-metrics", features = [
     "test-utils",
 ] }
-reth-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-ethereum-forks = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7", features = [
+reth-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-metrics" }
+reth-ethereum-forks = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-metrics", features = [
     "serde",
 ] }
-reth-ethereum-payload-builder = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-payload-builder-primitives = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-chain-state = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-eth-wire = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-eth-wire-types = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-evm = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-ipc = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-metrics = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-node-core = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-revm = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-network = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7", features = [
+reth-ethereum-payload-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-metrics" }
+reth-payload-builder-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-metrics" }
+reth-chain-state = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-metrics" }
+reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-metrics" }
+reth-eth-wire = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-metrics" }
+reth-eth-wire-types = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-metrics" }
+reth-evm = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-metrics" }
+reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-metrics" }
+reth-ipc = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-metrics" }
+reth-metrics = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-metrics" }
+reth-node-core = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-metrics" }
+reth-revm = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-metrics" }
+reth-network = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-metrics", features = [
     "test-utils",
 ] }
-reth-network-p2p = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-network-api = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-node-ethereum = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7", features = [
+reth-network-p2p = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-metrics" }
+reth-network-api = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-metrics" }
+reth-node-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-metrics", features = [
     "test-utils",
 ] }
-reth-network-peers = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-payload-primitives = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-ethereum-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-primitives = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-primitives-traits = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-provider = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7", features = [
+reth-network-peers = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-metrics" }
+reth-payload-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-metrics" }
+reth-ethereum-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-metrics" }
+reth-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-metrics" }
+reth-primitives-traits = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-metrics" }
+reth-provider = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-metrics", features = [
     "test-utils",
 ] }
-reth-rpc-eth-api = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-rpc-engine-api = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-tracing = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-trie-common = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-tasks = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-transaction-pool = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
+reth-rpc-eth-api = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-metrics" }
+reth-rpc-engine-api = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-metrics" }
+reth-tracing = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-metrics" }
+reth-trie-common = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-metrics" }
+reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-metrics" }
+reth-tasks = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-metrics" }
+reth-transaction-pool = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-metrics" }
 revm = "29.0.0"
 
 # alloy dependencies
