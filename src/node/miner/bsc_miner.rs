@@ -2,7 +2,9 @@ use crate::node::miner::bid_simulator::{BidRuntime, BidSimulator};
 use crate::node::miner::payload::BscBuildArguments;
 use crate::{
     chainspec::BscChainSpec,
-    consensus::parlia::{provider::SnapshotProvider, vote_pool, Parlia},
+    consensus::parlia::{
+        provider::SnapshotProvider, util::calculate_millisecond_timestamp, vote_pool, Parlia,
+    },
     metrics::BscConsensusMetrics,
     node::{
         engine::BscBuiltPayload,
@@ -914,12 +916,12 @@ where
 
         // Calculate and record block broadcast delay
         // This is the time from block timestamp to current broadcast time, in nanoseconds
-        let block_timestamp = sealed_block.header().timestamp;
+        let block_timestamp_ms = calculate_millisecond_timestamp(sealed_block.header());
         let now =
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
 
-        // Convert block timestamp (seconds) to nanoseconds
-        let block_timestamp_nanos = block_timestamp as u128 * 1_000_000_000;
+        // Convert block timestamp (milliseconds) to nanoseconds
+        let block_timestamp_nanos = block_timestamp_ms as u128 * 1_000_000;
         // Get current time in nanoseconds
         let now_nanos = now.as_nanos();
 
@@ -936,7 +938,7 @@ where
         debug!(
             target: "bsc::miner",
             block_number,
-            block_timestamp,
+            block_timestamp_ms,
             broadcast_delay_nanos,
             "Block broadcast delay recorded"
         );
