@@ -186,6 +186,7 @@ impl BscProtocolConnection {
                     self.pending_range_reqs.insert(req_id, (resp_tx, std::time::Instant::now()));
                     let mut buf = BytesMut::new();
                     req.encode(&mut buf);
+                    tracing::debug!(target: "bsc_protocol", req = ?req, "Sending GetBlocksByRange command");
                     buf
                 }
                 other => Self::encode_command(other),

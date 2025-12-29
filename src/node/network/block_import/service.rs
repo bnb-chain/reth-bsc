@@ -362,16 +362,20 @@ where
                     use std::time::Duration;
                     // Bump request timeout to 1000ms to accommodate slower peers
                     let req_timeout = Duration::from_millis(DOWNLOAD_COOLDOWN_DURATION_MS as u64);
-                    let _ = crate::node::network::bsc_protocol::registry::batch_request_range_and_await_import(
+                    if let Err(e) = crate::node::network::bsc_protocol::registry::batch_request_range_and_await_import(
                         bsc_peer,
                         start_height,
                         start_hash,
                         1,
                         req_timeout,
-                    ).await;
+                    ).await {
+                        tracing::debug!(target: "bsc::block_import", "Failed to request block range: number = {:?}, hash = {:?}, error = {}", start_height, start_hash, e);
+                    }
                 });
+                self.downloading_blocks.insert(hash_number.hash, now);
+            } else {
+                tracing::debug!(target: "bsc::block_import", "No target peer found for requesting block range: number = {:?}, hash = {:?}", start_height, start_hash);
             }
-            self.downloading_blocks.insert(hash_number.hash, now);
         }
     }
 
