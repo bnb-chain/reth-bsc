@@ -225,6 +225,37 @@ pub struct BscBlockchainMetrics {
     pub latest_reorg_depth: Gauge,
 }
 
+/// Metrics for BSC network protocol usage
+///
+/// Tracks which protocol (BSC or ETH) is used for block requests.
+#[derive(Metrics, Clone)]
+#[metrics(scope = "bsc.network")]
+pub struct BscNetworkMetrics {
+    /// Total number of block requests via BSC protocol
+    pub bsc_protocol_requests_total: Counter,
+
+    /// Total number of successful block requests via BSC protocol
+    pub bsc_protocol_success_total: Counter,
+
+    /// Total number of failed block requests via BSC protocol
+    pub bsc_protocol_failures_total: Counter,
+
+    /// Total number of block requests via ETH protocol (fallback)
+    pub eth_protocol_requests_total: Counter,
+
+    /// Total number of successful block requests via ETH protocol
+    pub eth_protocol_success_total: Counter,
+
+    /// Total number of failed block requests via ETH protocol
+    pub eth_protocol_failures_total: Counter,
+
+    /// Total number of times ETH protocol was used as fallback after BSC failure
+    pub eth_fallback_after_bsc_total: Counter,
+
+    /// Total number of times ETH protocol was used directly (no BSC peer available)
+    pub eth_direct_requests_total: Counter,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,5 +271,6 @@ mod tests {
         let _miner_metrics = BscMinerMetrics::default();
         let _finality_metrics = BscFinalityMetrics::default();
         let _blockchain_metrics = BscBlockchainMetrics::default();
+        let _network_metrics = BscNetworkMetrics::default();
     }
 }

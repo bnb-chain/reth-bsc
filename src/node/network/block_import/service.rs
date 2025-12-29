@@ -2,6 +2,7 @@ use super::handle::ImportHandle;
 use crate::{
     chainspec::BscChainSpec,
     consensus::{parlia::vote_pool, ParliaConsensusErr},
+    metrics::BscNetworkMetrics,
     node::{
         consensus::BscForkChoiceEngine, engine::BscBuiltPayload,
         engine_api::payload::BscPayloadTypes, evm::util::insert_header_to_cache,
@@ -98,6 +99,8 @@ where
     queued_blocks: LruCache<B256>,
     /// Cache of downloading block hashes to avoid re-downloading the same block.
     downloading_blocks: LruMap<B256, u128, ByLength>,
+    /// Metrics for tracking network protocol usage
+    network_metrics: BscNetworkMetrics,
 }
 
 impl<Provider> ImportService<Provider>
@@ -131,6 +134,7 @@ where
             processed_blocks: LruCache::new(LRU_PROCESSED_BLOCKS_SIZE),
             queued_blocks: LruCache::new(LRU_PROCESSED_BLOCKS_SIZE),
             downloading_blocks: LruMap::new(ByLength::new(LRU_PROCESSED_BLOCKS_SIZE)),
+            network_metrics: BscNetworkMetrics::default(),
         }
     }
 
@@ -346,10 +350,8 @@ where
             ) {
                 Some(announcing_peer)
             } else {
-                // TODO: remove it, cannot pick a random peer here, it may cause the block import to be stuck.
-                crate::node::network::bsc_protocol::registry::list_registered_peers()
-                    .into_iter()
-                    .next()
+                tracing::warn!(target: "bsc::block_import", "No target peer found for requesting block range: number = {:?}, hash = {:?}", start_height, start_hash);
+                None
             };
             if let Some(bsc_peer) = target_peer {
                 tracing::debug!(
@@ -359,51 +361,122 @@ where
                     block_number = start_height,
                     "Requesting block with block range for NewBlockHashes"
                 );
+                
+                let metrics = self.network_metrics.clone();
                 tokio::spawn(async move {
                     use std::time::Duration;
                     // Bump request timeout to 1000ms to accommodate slower peers
                     let req_timeout = Duration::from_millis(DOWNLOAD_COOLDOWN_DURATION_MS as u64);
-                    if let Err(e) = crate::node::network::bsc_protocol::registry::batch_request_range_and_await_import(
+                    
+                    // Try BSC protocol first
+                    metrics.bsc_protocol_requests_total.increment(1);
+                    let bsc_result = crate::node::network::bsc_protocol::registry::batch_request_range_and_await_import(
                         bsc_peer,
                         start_height,
                         start_hash,
-                        1,
+                        1, 
+                        req_timeout,
+                    ).await;
+                    
+                    // If BSC protocol fails, fallback to ETH protocol
+                    if let Err(e) = bsc_result {
+                        metrics.bsc_protocol_failures_total.increment(1);
+                        tracing::debug!(
+                            target: "bsc::block_import", 
+                            "BSC protocol failed: number = {:?}, hash = {:?}, error = {}, trying ETH protocol fallback", 
+                            start_height, start_hash, e
+                        );
+                        
+                        // Use ETH protocol fallback
+                        metrics.eth_protocol_requests_total.increment(1);
+                        metrics.eth_fallback_after_bsc_total.increment(1);
+                        
+                        if let Err(eth_err) = crate::node::network::bsc_protocol::registry::eth_request_block_and_await_import(
+                            announcing_peer,
+                            start_hash,
+                            start_height,
+                            req_timeout,
+                        ).await {
+                            metrics.eth_protocol_failures_total.increment(1);
+                            tracing::warn!(
+                                target: "bsc::block_import",
+                                "ETH protocol fallback also failed: number = {:?}, hash = {:?}, eth_error = {}",
+                                start_height, start_hash, eth_err
+                            );
+                        } else {
+                            metrics.eth_protocol_success_total.increment(1);
+                        }
+                    } else {
+                        metrics.bsc_protocol_success_total.increment(1);
+                    }
+                });
+            } else {
+                // No BSC peer available, try ETH protocol fallback directly
+                tracing::debug!(
+                    target: "bsc::block_import", 
+                    "No BSC peer available for block: number = {:?}, hash = {:?}, trying ETH protocol fallback", 
+                    start_height, start_hash
+                );
+                
+                let announcing_peer_clone = announcing_peer;
+                let start_hash_clone = start_hash;
+                let start_height_clone = start_height;
+                let metrics = self.network_metrics.clone();
+                
+                tokio::spawn(async move {
+                    use std::time::Duration;
+                    let req_timeout = Duration::from_millis(DOWNLOAD_COOLDOWN_DURATION_MS as u64);
+                    
+                    // Use ETH protocol directly (no BSC peer available)
+                    metrics.eth_protocol_requests_total.increment(1);
+                    metrics.eth_direct_requests_total.increment(1);
+                    
+                    if let Err(eth_err) = crate::node::network::bsc_protocol::registry::eth_request_block_and_await_import(
+                        announcing_peer_clone,
+                        start_hash_clone,
+                        start_height_clone,
                         req_timeout,
                     ).await {
-                        tracing::debug!(target: "bsc::block_import", "Failed to request block range: number = {:?}, hash = {:?}, error = {}", start_height, start_hash, e);
+                        metrics.eth_protocol_failures_total.increment(1);
+                        tracing::warn!(
+                            target: "bsc::block_import",
+                            "ETH protocol fallback also failed: number = {:?}, hash = {:?}, eth_error = {}",
+                            start_height_clone, start_hash_clone, eth_err
+                        );
+                    } else {
+                        metrics.eth_protocol_success_total.increment(1);
                     }
-                    // TODO: add fallback download mechanism later after fetch errors.
                 });
-                self.downloading_blocks.insert(hash_number.hash, now);
-            } else {
-                // TODO: add fallback download mechanism later when the peer is not registered for bsc protocol.
-                tracing::debug!(target: "bsc::block_import", "No target peer found for requesting block range: number = {:?}, hash = {:?}", start_height, start_hash);
             }
+            self.downloading_blocks.insert(hash_number.hash, now);
         }
     }
 
     /// Transfer the block to EVN peers if from proxied validators or validator address.
     fn transfer_to_evn_peers(&self, block: BlockMsg) -> Result<(), Box<dyn std::error::Error>> {
-        let mining_config = crate::node::miner::config::get_global_mining_config().ok_or("Mining config is not set")?;
-        let cfg = crate::node::network::evn::get_global_evn_config().ok_or("EVN config is not set")?;
+        let mining_config = crate::node::miner::config::get_global_mining_config()
+            .ok_or("Mining config is not set")?;
+        let cfg =
+            crate::node::network::evn::get_global_evn_config().ok_or("EVN config is not set")?;
         if !cfg.enabled {
             return Ok(());
         }
         let header_ref = &block.block.0.block.header;
         let coinbase = header_ref.beneficiary;
         // If from proxied validators or validator address, target EVN peers with ETH NewBlockHashes.
-        if cfg.proxyed_validators.contains(&coinbase) || (mining_config.enabled && mining_config.validator_address.unwrap_or_default() == coinbase) {
+        if cfg.proxyed_validators.contains(&coinbase)
+            || (mining_config.enabled
+                && mining_config.validator_address.unwrap_or_default() == coinbase)
+        {
             if let Some(net) = crate::shared::get_network_handle() {
                 let peers = crate::node::network::evn_peers::snapshot();
                 for (peer_id, info) in peers {
                     // Send to EVN peers or proxyed peers
-                    let is_proxyed = crate::node::network::bsc_protocol::registry::is_proxyed_peer(&peer_id);
+                    let is_proxyed =
+                        crate::node::network::bsc_protocol::registry::is_proxyed_peer(&peer_id);
                     if info.is_evn || is_proxyed {
                         // Send full NewBlock to EVN/proxyed peers to avoid re-fetching.
-                        net.send_eth_message(
-                            peer_id,
-                            PeerMessage::NewBlock(block.clone()),
-                        );
+                        net.send_eth_message(peer_id, PeerMessage::NewBlock(block.clone()));
                         tracing::debug!(target: "bsc::block_import", "Sent full NewBlock to EVN/proxyed peer: number = {:?}, hash = {:?}, peer = {:?}", block.block.0.block.header.number, block.hash, peer_id);
                     }
                 }

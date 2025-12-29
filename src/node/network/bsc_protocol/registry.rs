@@ -48,14 +48,6 @@ pub fn register_peer(peer: PeerId, tx: UnboundedSender<BscCommand>) {
     }
 }
 
-/// Snapshot the currently registered BSC protocol peers
-pub fn list_registered_peers() -> Vec<PeerId> {
-    match REGISTRY.read() {
-        Ok(guard) => guard.keys().copied().collect(),
-        Err(_) => Vec::new(),
-    }
-}
-
 /// Returns true if the given peer is registered with the BSC subprotocol
 pub fn has_registered_peer(peer: PeerId) -> bool {
     match REGISTRY.read() {
@@ -172,6 +164,140 @@ pub async fn batch_request_range_and_await_import(
         tracing::debug!(target: "bsc_protocol", "Block import sender not available; dropping range import forward");
     }
 
+    Ok(())
+}
+
+/// Request a block via standard ETH protocol and await import.
+/// This is a fallback mechanism when BSC protocol is not available or fails.
+///
+/// # Implementation using Reth's Native APIs
+///
+/// This function uses Reth's built-in `HeadersClient` and `BodiesClient` traits
+/// to actively fetch the block via standard ETH protocol, similar to BSC protocol.
+pub async fn eth_request_block_and_await_import(
+    peer: PeerId,
+    block_hash: B256,
+    block_number: u64,
+    request_timeout: Duration,
+) -> Result<(), String> {
+    tracing::info!(
+        target: "bsc::registry",
+        peer = %peer,
+        block_hash = %block_hash,
+        block_number = block_number,
+        "BSC protocol failed, attempting ETH protocol fallback using Reth's native APIs"
+    );
+    
+    let net = crate::shared::get_network_handle()
+        .ok_or_else(|| "Network handle not available".to_string())?;
+    
+    use reth_network_api::BlockDownloaderProvider;
+    let fetch_client = net.fetch_client().await
+        .map_err(|e| format!("Failed to get fetch client: {:?}", e))?;
+    
+    use reth_network_p2p::headers::client::{HeadersClient, HeadersRequest};
+    use alloy_eips::BlockHashOrNumber;
+    
+    tracing::debug!(
+        target: "bsc::registry",
+        block_hash = %block_hash,
+        "Requesting block header via ETH protocol"
+    );
+    
+    let header_request = HeadersRequest::one(BlockHashOrNumber::Hash(block_hash));
+    let headers_result = tokio::time::timeout(
+        request_timeout,
+        fetch_client.get_headers(header_request)
+    )
+    .await
+    .map_err(|_| "ETH GetBlockHeaders request timed out".to_string())?
+    .map_err(|e| format!("ETH GetBlockHeaders failed: {:?}", e))?;
+    
+    if headers_result.data().is_empty() {
+        return Err("ETH GetBlockHeaders returned no headers".to_string());
+    }
+    
+    let header = headers_result.data()[0].clone();
+    tracing::debug!(
+        target: "bsc::registry",
+        block_hash = %block_hash,
+        block_number = header.number,
+        "Received block header via ETH protocol"
+    );
+    
+    use reth_network_p2p::bodies::client::BodiesClient;
+    
+    tracing::debug!(
+        target: "bsc::registry",
+        block_hash = %block_hash,
+        "Requesting block body via ETH protocol"
+    );
+    
+    let bodies_result = tokio::time::timeout(
+        request_timeout,
+        fetch_client.get_block_bodies(vec![block_hash])
+    )
+    .await
+    .map_err(|_| "ETH GetBlockBodies request timed out".to_string())?
+    .map_err(|e| format!("ETH GetBlockBodies failed: {:?}", e))?;
+    
+    if bodies_result.data().is_empty() {
+        return Err("ETH GetBlockBodies returned no bodies".to_string());
+    }
+    
+    let body = bodies_result.data()[0].clone();
+    let tx_count = body.transactions.len();
+    tracing::debug!(
+        target: "bsc::registry",
+        block_hash = %block_hash,
+        tx_count = tx_count,
+        "Received block body via ETH protocol"
+    );
+    
+    use crate::node::primitives::BscBlock;
+    use reth_eth_wire::NewBlock;
+    
+    let block = BscBlock {
+        header,
+        body,
+    };
+    
+    let nb = crate::node::network::BscNewBlock(NewBlock {
+        block,
+        td: U128::from(0u64),
+    });
+    
+    let hash = nb.0.block.header.hash_slow();
+    let msg = reth_network::message::NewBlockMessage {
+        hash,
+        block: Arc::new(nb),
+        td: Some(U256::ZERO),
+    };
+    
+    if let Some(sender) = crate::shared::get_block_import_sender() {
+        if let Err(e) = sender.send((msg, peer)) {
+            tracing::error!(
+                target: "bsc::registry",
+                error = %e,
+                "Failed to send ETH block to import path"
+            );
+            return Err("Failed to send block to import path".to_string());
+        }
+    } else {
+        tracing::debug!(
+            target: "bsc::registry",
+            "Block import sender not available; dropping ETH import forward"
+        );
+        return Err("Block import sender not available".to_string());
+    }
+    
+    tracing::info!(
+        target: "bsc::registry",
+        block_hash = %block_hash,
+        block_number = block_number,
+        "Successfully fetched and forwarded block via ETH protocol"
+    );
+    
     Ok(())
 }
 
