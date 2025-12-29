@@ -15,7 +15,6 @@ pub fn bsc_testnet() -> ChainSpec {
         chain: Chain::from_named(NamedChain::BinanceSmartChainTestnet),
         genesis: serde_json::from_str(include_str!("genesis_chapel.json"))
             .expect("Can't deserialize BSC Testnet genesis json"),
-        paris_block_and_final_difficulty: Some((0, U256::from(0))),
         hardforks: BscHardfork::bsc_testnet(),
         deposit_contract: None,
         base_fee_params: BaseFeeParamsKind::Constant(BaseFeeParams::new(1, 1)),
