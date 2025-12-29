@@ -314,8 +314,8 @@ impl BscProtocolConnection {
                         }
 
                         let resp = build_blocks_by_range_response(&req);
+                        tracing::debug!(target: "bsc_protocol", req_id = req.request_id, len = resp.blocks.len(), "Replying BlocksByRange for request");
                         let encoded = Self::encode_command(BscCommand::BlocksByRange(resp));
-                        tracing::debug!(target: "bsc_protocol", "Replying BlocksByRange for request");
                         Some(encoded)
                     }
                     Err(e) => {
@@ -328,6 +328,7 @@ impl BscProtocolConnection {
                 tracing::debug!(target: "bsc_protocol", "Processing BlocksByRange response");
                 match BlocksByRangePacket::decode(&mut &slice[..]) {
                     Ok(res) => {
+                        let req_id = res.request_id;
                         tracing::debug!(
                             target: "bsc_protocol",
                             req_id = res.request_id,
@@ -335,9 +336,11 @@ impl BscProtocolConnection {
                             "Received BlocksByRange"
                         );
                         if let Some((waiter, _)) = self.pending_range_reqs.remove(&res.request_id) {
-                            let _ = waiter.send(Ok(res));
+                            if let Err(e) = waiter.send(Ok(res)) {
+                                tracing::debug!(target: "bsc_protocol", request_id = req_id, "Failed to send BlocksByRange response: {:?}", e);
+                            }
                         } else {
-                            tracing::trace!(target: "bsc_protocol", "No waiter for request_id; dropping BlocksByRange");
+                            tracing::debug!(target: "bsc_protocol", request_id = req_id, "No waiter for request_id; dropping BlocksByRange");
                         }
                         None
                     }

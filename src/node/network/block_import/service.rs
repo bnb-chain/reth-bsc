@@ -332,7 +332,7 @@ where
                 peer_id = %peer_id,
                 block_hash = %hash_number.hash,
                 block_number = hash_number.number,
-                "Requesting block download for NewBlockHashes"
+                "Received NewBlockHashes"
             );
 
             // Try quick range fetch via BSC subprotocol (mimic geth asyncFetchRangeBlocks)
