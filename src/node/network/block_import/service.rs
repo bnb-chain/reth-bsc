@@ -390,7 +390,6 @@ where
                     // Bump request timeout to 500ms to accommodate slower peers
                     let req_timeout = Duration::from_millis(DOWNLOAD_COOLDOWN_DURATION_MS as u64);
 
-                    // 从announcing_peers中读取所有peers
                     let all_peers = {
                         let peers_map = announcing_peers.read();
                         peers_map.get(&start_hash).cloned().unwrap_or_default()
@@ -476,14 +475,18 @@ where
                         return Err("All initial attempts failed");
                     }
                     
+                    // Limit concurrent retries to first 3 peers to avoid overwhelming the network
+                    const MAX_CONCURRENT_PEERS: usize = 3;
+                    let peers_to_try: Vec<_> = remaining_peers.into_iter().take(MAX_CONCURRENT_PEERS).collect();
+                    
                     tracing::debug!(
                         target: "bsc::block_import", 
-                        "Trying {} remaining peers concurrently for block: number = {:?}, hash = {:?}", 
-                        remaining_peers.len(), start_height, start_hash
+                        "Trying {} peers concurrently (max {}) for block: number = {:?}, hash = {:?}", 
+                        peers_to_try.len(), MAX_CONCURRENT_PEERS, start_height, start_hash
                     );
                     
                     let mut futures = FuturesUnordered::new();
-                    for peer in remaining_peers {
+                    for peer in peers_to_try {
                         let metrics_clone = metrics.clone();
                         let fut = async move {
                             metrics_clone.bsc_protocol_requests_total.increment(1);
