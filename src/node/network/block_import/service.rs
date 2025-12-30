@@ -38,6 +38,7 @@ use reth_primitives_traits::{AlloyBlockHeader, Block};
 use reth_provider::{BlockHashReader, BlockNumReader, BlockReaderIdExt, HeaderProvider};
 use schnellru::{ByLength, LruMap};
 use std::{
+    collections::{HashMap, HashSet, VecDeque},
     future::Future,
     pin::Pin,
     sync::Arc,
@@ -70,7 +71,9 @@ pub(crate) type IncomingHashes = (NewBlockHashes, PeerId);
 const LRU_PROCESSED_BLOCKS_SIZE: u32 = 100;
 
 /// Cooldown duration for downloading block hashes to avoid re-downloading the same block.
-const DOWNLOAD_COOLDOWN_DURATION_MS: u128 = 200;
+const DOWNLOAD_COOLDOWN_DURATION_MS: u128 = 500;
+
+const DOWNLOAD_TOTAL_TIMEOUT_MS: u128 = 1000;
 
 /// A service that handles bidirectional block import communication with the network.
 /// It receives new blocks from the network via `from_network` channel and sends back
@@ -99,6 +102,8 @@ where
     queued_blocks: LruCache<B256>,
     /// Cache of downloading block hashes to avoid re-downloading the same block.
     downloading_blocks: LruMap<B256, u128, ByLength>,
+    /// Map of block hashes to announcing peers (in arrival order), protected by RwLock for concurrent access
+    announcing_peers: Arc<RwLock<HashMap<B256, VecDeque<PeerId>>>>,
     /// Metrics for tracking network protocol usage
     network_metrics: BscNetworkMetrics,
 }
@@ -134,6 +139,7 @@ where
             processed_blocks: LruCache::new(LRU_PROCESSED_BLOCKS_SIZE),
             queued_blocks: LruCache::new(LRU_PROCESSED_BLOCKS_SIZE),
             downloading_blocks: LruMap::new(ByLength::new(LRU_PROCESSED_BLOCKS_SIZE)),
+            announcing_peers: Arc::new(RwLock::new(HashMap::new())),
             network_metrics: BscNetworkMetrics::default(),
         }
     }
@@ -320,17 +326,6 @@ where
                 continue;
             }
 
-            // Check if the block is already being downloaded, if it times out, download it again.
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis();
-            if let Some(last_requested) = self.downloading_blocks.get(&hash_number.hash) {
-                if *last_requested + DOWNLOAD_COOLDOWN_DURATION_MS > now {
-                    continue;
-                }
-            }
-
             tracing::debug!(
                 target: "bsc::block_import",
                 peer_id = %peer_id,
@@ -353,102 +348,212 @@ where
                 tracing::warn!(target: "bsc::block_import", "No target peer found for requesting block range: number = {:?}, hash = {:?}", start_height, start_hash);
                 None
             };
-            if let Some(bsc_peer) = target_peer {
-                tracing::debug!(
-                    target: "bsc::block_import",
-                    peer_id = %bsc_peer,
-                    block_hash = %start_hash,
-                    block_number = start_height,
-                    "Requesting block with block range for NewBlockHashes"
-                );
+            if target_peer.is_none() {
+                continue;
+            }
+            let bsc_peer = target_peer.unwrap();
+            tracing::debug!(
+                target: "bsc::block_import",
+                peer_id = %bsc_peer,
+                block_hash = %start_hash,
+                block_number = start_height,
+                "Requesting block with block range for NewBlockHashes"
+            );
+            {
+                let mut peers_map = self.announcing_peers.write();
+                let peers_list = peers_map
+                    .entry(hash_number.hash)
+                    .or_default();
+                if !peers_list.contains(&bsc_peer) {
+                    peers_list.push_back(bsc_peer);
+                }
+            }
+            if self.downloading_blocks.get(&hash_number.hash).is_some() {
+                continue;
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis();
+            self.downloading_blocks.insert(hash_number.hash, now);
+            let metrics = self.network_metrics.clone();
+            let announcing_peers = self.announcing_peers.clone();
+            tokio::spawn(async move {
+                use std::time::Duration;
+                use futures::stream::{FuturesUnordered, StreamExt};
                 
-                let metrics = self.network_metrics.clone();
-                tokio::spawn(async move {
-                    use std::time::Duration;
-                    // Bump request timeout to 1000ms to accommodate slower peers
+                // Total timeout for the entire download process
+                let total_timeout = Duration::from_secs(DOWNLOAD_TOTAL_TIMEOUT_MS as u64);
+                
+                // Wrap the entire download logic with timeout
+                let download_result = tokio::time::timeout(total_timeout, async {
+                    // Bump request timeout to 500ms to accommodate slower peers
                     let req_timeout = Duration::from_millis(DOWNLOAD_COOLDOWN_DURATION_MS as u64);
+
+                    let all_peers = {
+                        let peers_map = announcing_peers.read();
+                        peers_map.get(&start_hash).cloned().unwrap_or_default()
+                    };
                     
-                    // Try BSC protocol first
+                    if all_peers.is_empty() {
+                        tracing::warn!(target: "bsc::block_import", "No announcing peer found for block: number = {:?}, hash = {:?}", start_height, start_hash);
+                        return Err("No announcing peers");
+                    }
+                    
+                    let mut peers_iter = all_peers.into_iter();
+                    let first_peer = peers_iter.next().unwrap(); // Safe because we checked is_empty
+                    
+                    // Step 1: Try first peer with BSC protocol
+                    tracing::debug!(target: "bsc::block_import", "Trying first peer {:?} for block: number = {:?}, hash = {:?}", first_peer, start_height, start_hash);
                     metrics.bsc_protocol_requests_total.increment(1);
                     let bsc_result = crate::node::network::bsc_protocol::registry::batch_request_range_and_await_import(
-                        bsc_peer,
+                        first_peer,
                         start_height,
                         start_hash,
                         1, 
                         req_timeout,
                     ).await;
                     
-                    // If BSC protocol fails, fallback to ETH protocol
-                    if let Err(e) = bsc_result {
-                        metrics.bsc_protocol_failures_total.increment(1);
-                        tracing::debug!(
-                            target: "bsc::block_import", 
-                            "BSC protocol failed: number = {:?}, hash = {:?}, error = {}, trying ETH protocol fallback", 
-                            start_height, start_hash, e
-                        );
-                        
-                        // Use ETH protocol fallback
-                        metrics.eth_protocol_requests_total.increment(1);
-                        metrics.eth_fallback_after_bsc_total.increment(1);
-                        
-                        if let Err(eth_err) = crate::node::network::bsc_protocol::registry::eth_request_block_and_await_import(
-                            announcing_peer,
-                            start_hash,
-                            start_height,
-                            req_timeout,
-                        ).await {
-                            metrics.eth_protocol_failures_total.increment(1);
-                            tracing::warn!(
-                                target: "bsc::block_import",
-                                "ETH protocol fallback also failed: number = {:?}, hash = {:?}, eth_error = {}",
-                                start_height, start_hash, eth_err
-                            );
-                        } else {
-                            metrics.eth_protocol_success_total.increment(1);
-                        }
-                    } else {
+                    // If first peer succeeded
+                    if bsc_result.is_ok() {
                         metrics.bsc_protocol_success_total.increment(1);
+                        tracing::debug!(target: "bsc::block_import", "First peer succeeded for block: number = {:?}, hash = {:?}", start_height, start_hash);
+                        let mut peers_map = announcing_peers.write();
+                        peers_map.remove(&start_hash);
+                        return Ok(());
                     }
-                });
-            } else {
-                // No BSC peer available, try ETH protocol fallback directly
-                tracing::debug!(
-                    target: "bsc::block_import", 
-                    "No BSC peer available for block: number = {:?}, hash = {:?}, trying ETH protocol fallback", 
-                    start_height, start_hash
-                );
-                
-                let announcing_peer_clone = announcing_peer;
-                let start_hash_clone = start_hash;
-                let start_height_clone = start_height;
-                let metrics = self.network_metrics.clone();
-                
-                tokio::spawn(async move {
-                    use std::time::Duration;
-                    let req_timeout = Duration::from_millis(DOWNLOAD_COOLDOWN_DURATION_MS as u64);
                     
-                    // Use ETH protocol directly (no BSC peer available)
+                    // First peer failed
+                    metrics.bsc_protocol_failures_total.increment(1);
+                    tracing::debug!(
+                        target: "bsc::block_import", 
+                        "First peer failed for block: number = {:?}, hash = {:?}, error = {}, trying remaining peers concurrently", 
+                        start_height, start_hash, bsc_result.unwrap_err()
+                    );
+                    
+                    // Step 2: Try ETH protocol with announcing_peer as fallback
+                    tracing::debug!(target: "bsc::block_import", "Trying ETH protocol with announcing_peer {:?}", announcing_peer);
                     metrics.eth_protocol_requests_total.increment(1);
-                    metrics.eth_direct_requests_total.increment(1);
+                    metrics.eth_fallback_after_bsc_total.increment(1);
                     
-                    if let Err(eth_err) = crate::node::network::bsc_protocol::registry::eth_request_block_and_await_import(
-                        announcing_peer_clone,
-                        start_hash_clone,
-                        start_height_clone,
+                    if crate::node::network::bsc_protocol::registry::eth_request_block_and_await_import(
+                        announcing_peer,
+                        start_hash,
+                        start_height,
                         req_timeout,
-                    ).await {
-                        metrics.eth_protocol_failures_total.increment(1);
-                        tracing::warn!(
-                            target: "bsc::block_import",
-                            "ETH protocol fallback also failed: number = {:?}, hash = {:?}, eth_error = {}",
-                            start_height_clone, start_hash_clone, eth_err
-                        );
-                    } else {
+                    ).await.is_ok() {
                         metrics.eth_protocol_success_total.increment(1);
+                        tracing::debug!(target: "bsc::block_import", "ETH protocol succeeded for block: number = {:?}, hash = {:?}", start_height, start_hash);
+                        let mut peers_map = announcing_peers.write();
+                        peers_map.remove(&start_hash);
+                        return Ok(());
                     }
-                });
-            }
-            self.downloading_blocks.insert(hash_number.hash, now);
+                    
+                    metrics.eth_protocol_failures_total.increment(1);
+                    
+                    
+                    // Step 3: Concurrently try all remaining peers
+                    // Re-read announcing_peers to get any new peers that might have been added during Step 1 & 2
+                    let updated_peers = {
+                        let peers_map = announcing_peers.read();
+                        peers_map.get(&start_hash).cloned().unwrap_or_default()
+                    };
+                    
+                    // Track peers we've already tried to avoid duplicates
+                    let mut tried_peers = HashSet::new();
+                    tried_peers.insert(first_peer);
+                    tried_peers.insert(announcing_peer);
+                    
+                    // Filter out already-tried peers
+                    let remaining_peers: Vec<_> = updated_peers
+                        .into_iter()
+                        .filter(|peer| !tried_peers.contains(peer))
+                        .collect();
+                    
+                    if remaining_peers.is_empty() {
+                        tracing::warn!(target: "bsc::block_import", "All attempts failed for block: number = {:?}, hash = {:?}", start_height, start_hash);
+                        return Err("All initial attempts failed");
+                    }
+                    
+                    // Limit concurrent retries to first 3 peers to avoid overwhelming the network
+                    const MAX_CONCURRENT_PEERS: usize = 3;
+                    let peers_to_try: Vec<_> = remaining_peers.into_iter().take(MAX_CONCURRENT_PEERS).collect();
+                    
+                    tracing::debug!(
+                        target: "bsc::block_import", 
+                        "Trying {} peers concurrently (max {}) for block: number = {:?}, hash = {:?}", 
+                        peers_to_try.len(), MAX_CONCURRENT_PEERS, start_height, start_hash
+                    );
+                    
+                    let mut futures = FuturesUnordered::new();
+                    for peer in peers_to_try {
+                        let metrics_clone = metrics.clone();
+                        let fut = async move {
+                            metrics_clone.bsc_protocol_requests_total.increment(1);
+                            let result = crate::node::network::bsc_protocol::registry::batch_request_range_and_await_import(
+                                peer,
+                                start_height,
+                                start_hash,
+                                1,
+                                req_timeout,
+                            ).await;
+                            
+                            if result.is_ok() {
+                                metrics_clone.bsc_protocol_success_total.increment(1);
+                            } else {
+                                metrics_clone.bsc_protocol_failures_total.increment(1);
+                            }
+                            
+                            (peer, result)
+                        };
+                        futures.push(fut);
+                    }
+                    
+                    // Wait for first success or all failures
+                    while let Some((peer, result)) = futures.next().await {
+                        if result.is_ok() {
+                            tracing::debug!(
+                                target: "bsc::block_import", 
+                                "Concurrent download succeeded from peer {:?} for block: number = {:?}, hash = {:?}", 
+                                peer, start_height, start_hash
+                            );
+                            // Success! Clean up and return
+                            let mut peers_map = announcing_peers.write();
+                            peers_map.remove(&start_hash);
+                            return Ok(());
+                        }
+                    }
+                    
+                    // All attempts failed
+                    tracing::warn!(
+                        target: "bsc::block_import", 
+                        "All concurrent download attempts failed for block: number = {:?}, hash = {:?}", 
+                        start_height, start_hash
+                    );
+                    Err("All concurrent attempts failed")
+                }).await;
+                
+                // Check if timeout occurred
+                match download_result {
+                    Err(_) => {
+                        tracing::error!(
+                            target: "bsc::block_import",
+                            "Block download timeout (1s exceeded) for block: number = {:?}, hash = {:?}",
+                            start_height, start_hash
+                        );
+                    }
+                    Ok(Err(err)) => {
+                        tracing::error!(
+                            target: "bsc::block_import",
+                            "Block download failed for block: number = {:?}, hash = {:?}, reason = {}",
+                            start_height, start_hash, err
+                        );
+                    }
+                    Ok(Ok(())) => {
+                        // Success - already logged in inner logic
+                    }
+                }
+            }); 
         }
     }
 
