@@ -8,9 +8,9 @@ use crate::{
         primitives::{BscBlock, BscBlockBody},
     }
 };
-use alloy_consensus::{BlockBody, Header, EMPTY_OMMER_ROOT_HASH, proofs, Transaction, BlockHeader};
+use alloy_consensus::{BlockBody, Header, EMPTY_OMMER_ROOT_HASH, proofs, Transaction, BlockHeader, TxReceipt};
 use alloy_primitives::{keccak256, B256};
-use alloy_eips::{eip7840::BlobParams, merge::BEACON_NONCE};
+use alloy_eips::{eip7840::BlobParams, merge::BEACON_NONCE, Encodable2718};
 use alloy_primitives::Bytes;
 use alloy_rpc_types::Withdrawals;
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
@@ -24,7 +24,7 @@ use reth_primitives_traits::{logs_bloom, SealedHeader};
 use reth_provider::{BlockExecutionResult, StateProvider};
 use revm::database::BundleState;
 use std::sync::Arc;
-
+use tracing::debug;
 
 /// BSC block assembler input that mirrors BlockAssemblerInput but is not #[non_exhaustive]
 /// 
@@ -164,6 +164,29 @@ where
             excess_blob_gas,
             requests_hash,
         };
+
+        // Collect transaction and receipt hashes for debug output
+        let tx_hashes: Vec<String> = transactions.iter().enumerate().map(|(idx, tx)| {
+            format!("[{}] 0x{:x}", idx, tx.hash())
+        }).collect();
+        // Calculate receipt hashes using the same method as receipts_root calculation
+        let receipt_hashes: Vec<String> = receipts.iter().enumerate().map(|(idx, receipt)| {
+            // Encode receipt with bloom using encode_2718 (same as calculate_receipt_root_no_memo)
+            let encoded = receipt.with_bloom_ref().encoded_2718();
+            let receipt_hash = keccak256(&encoded);
+            format!("[{}] 0x{:x}", idx, receipt_hash)
+        }).collect();
+
+        debug!(
+            "slash debug assemble, block_number={}, parent_hash=0x{:x}, header: {:?}, tx_count={}, receipt_count={}, tx_hashes=[{}], receipt_hashes=[{}]",
+            block_number,
+            header.parent_hash,
+            header,
+            transactions.len(),
+            receipts.len(),
+            tx_hashes.join(", "),
+            receipt_hashes.join(", ")
+        );
         
         {   // finalize_new_header
             let parent_header = crate::node::evm::util::HEADER_CACHE_READER
