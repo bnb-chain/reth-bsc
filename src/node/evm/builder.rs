@@ -131,7 +131,12 @@ where
             // Access parent state root through the header
             // SealedHeader derefs to the inner header which has state_root()
             let parent_state_root = (**self.parent).state_root();
-
+            tracing::debug!(
+                target: "bsc::builder",
+                parent_state_root = %parent_state_root,
+                parent_hash = %self.parent.hash(),
+                "Parent state root and hash",
+            );
             // Convert hashed state to triedb format
             let trie_hashed_state = hashed_state.to_triedb_hashed_post_state();
 
@@ -145,8 +150,7 @@ where
                 }
             };
             let difflayer_task = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                let fut =
-                    async { request_difflayer(&engine_api_tx, self.parent.parent_hash).await };
+                let fut = async { request_difflayer(&engine_api_tx, self.parent.hash()).await };
                 tokio::task::block_in_place(|| handle.block_on(fut))
             } else {
                 return Err(BlockExecutionError::other(std::io::Error::new(
@@ -166,7 +170,7 @@ where
             let (new_root, new_difflayer) = triedb
                 .intermediate_and_commit_hashed_post_state(
                     parent_state_root,
-                    Some(&difflayers), // Pass by reference
+                    Some(&difflayers),
                     &trie_hashed_state,
                     None, // No prefetch state
                 )
