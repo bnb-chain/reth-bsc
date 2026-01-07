@@ -503,6 +503,12 @@ where
         let finalize_start = std::time::Instant::now();
         let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } =
             builder.finish(&state_provider)?;
+
+        // Retrieve the difflayer using parent_hash + block_number as key
+        // This ensures correct association even when multiple payloads are built concurrently
+        let block_number = parent_header.number + 1;
+        let difflayer = crate::shared::take_difflayer_for_block(parent_header.hash(), block_number);
+
         let mut sealed_block = Arc::new(block.sealed_block().clone());
 
         // Update miner metrics
@@ -584,6 +590,7 @@ where
                 hashed_state: Arc::new(hashed_state),
             },
             executed_trie: Some(ExecutedTrieUpdates::Present(Arc::new(trie_updates))),
+            difflayer, // Pass the difflayer to payload, reth will store it
         };
         Ok(payload)
     }
@@ -640,6 +647,12 @@ where
         let finalize_start = std::time::Instant::now();
         let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } =
             builder.finish(&state_provider)?;
+
+        // Retrieve the difflayer using parent_hash + block_number as key
+        // This ensures correct association even when multiple payloads are built concurrently
+        let block_number = parent_header.number + 1;
+        let difflayer = crate::shared::take_difflayer_for_block(parent_header.hash(), block_number);
+
         let sealed_block = Arc::new(block.sealed_block().clone());
 
         // Update miner metrics
@@ -680,6 +693,7 @@ where
                 hashed_state: Arc::new(hashed_state),
             },
             executed_trie: Some(ExecutedTrieUpdates::Present(Arc::new(trie_updates))),
+            difflayer, // Pass the difflayer to payload, reth will store it
         };
         Ok(payload)
     }

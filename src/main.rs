@@ -376,6 +376,8 @@ fn main() -> eyre::Result<()> {
 
             // Send the engine handle to the network
             engine_handle_tx.send(node.beacon_engine_handle.clone()).unwrap();
+            reth_bsc::shared::set_engine_api_tx(node.engine_api_tx.clone().unwrap()).unwrap();
+            tracing::debug!("set engine api tx successfully");
 
             // Set the IPC client
             reth_bsc::shared::set_ipc_client(ipc_path).await.unwrap();

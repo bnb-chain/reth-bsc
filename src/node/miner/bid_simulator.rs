@@ -556,6 +556,7 @@ where
                 hashed_state: Arc::new(hashed_state.clone()),
             },
             executed_trie: Some(ExecutedTrieUpdates::Present(Arc::new(trie_updates))),
+            difflayer: None, // Bid simulator doesn't use difflayer
         };
 
         // Acquire write lock to update best_bid

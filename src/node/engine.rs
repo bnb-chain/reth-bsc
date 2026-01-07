@@ -1,3 +1,4 @@
+use crate::BscBlock;
 use crate::{
     node::{
         engine_api::payload::BscPayloadTypes,
@@ -15,16 +16,15 @@ use reth::{
     payload::{PayloadBuilderHandle, PayloadServiceCommand},
     transaction_pool::TransactionPool,
 };
+use reth_chain_state::{ExecutedBlock, ExecutedBlockWithTrieUpdates, ExecutedTrieUpdates};
 use reth_evm::ConfigureEvm;
 use reth_payload_builder_primitives::Events;
 use reth_payload_primitives::BuiltPayload;
-use reth_chain_state::{ExecutedBlock, ExecutedBlockWithTrieUpdates, ExecutedTrieUpdates};
 use reth_primitives::{SealedBlock, TransactionSigned};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info};
-use crate::BscBlock;
 
 /// Built payload for BSC. This is similar to [`EthBuiltPayload`] but without sidecars as those
 /// included into [`BscBlock`].
@@ -40,6 +40,8 @@ pub struct BscBuiltPayload {
     pub(crate) executed_block: ExecutedBlock<BscPrimitives>,
     /// The executed trie updates
     pub(crate) executed_trie: Option<ExecutedTrieUpdates>,
+    /// The diff layer computed during block execution
+    pub(crate) difflayer: Option<Arc<rust_eth_triedb_common::DiffLayer>>,
 }
 
 impl BuiltPayload for BscBuiltPayload {
@@ -59,6 +61,7 @@ impl BuiltPayload for BscBuiltPayload {
 
     fn executed_block(&self) -> Option<ExecutedBlockWithTrieUpdates<Self::Primitives>> {
         self.executed_trie.clone().map(|trie| ExecutedBlockWithTrieUpdates {
+            difflayer: self.difflayer.clone(),
             block: self.executed_block.clone(),
             trie,
         })
@@ -103,7 +106,7 @@ where
             let provider_clone = ctx.provider().clone();
             let chain_spec_clone = Arc::new(ctx.config().chain.clone().as_ref().clone());
             let task_executor_clone = ctx.task_executor().clone();
-            
+
             ctx.task_executor().spawn_critical("bsc-miner-initializer", async move {
                 info!("Waiting for consensus module to initialize snapshot provider...");
                 let mut attempts = 0;

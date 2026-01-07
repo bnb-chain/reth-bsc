@@ -13,56 +13,58 @@ name = "reth-bsc"
 path = "src/main.rs"
 
 [dependencies]
-reth = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-cli = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-cli-commands = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-basic-payload-builder = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-db = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-engine-local = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-chainspec = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-cli-util = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-discv4 = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7", features = [
+reth = { path = "/Users/constbh/rustRepo/reth/bin/reth" }
+reth-cli = { path = "/Users/constbh/rustRepo/reth/crates/cli/cli" }
+reth-cli-commands = { path = "/Users/constbh/rustRepo/reth/crates/cli/commands" }
+reth-basic-payload-builder = { path = "/Users/constbh/rustRepo/reth/crates/payload/basic" }
+reth-db = { path = "/Users/constbh/rustRepo/reth/crates/storage/db" }
+reth-engine-local = { path = "/Users/constbh/rustRepo/reth/crates/engine/local" }
+reth-engine-tree = { path = "/Users/constbh/rustRepo/reth/crates/engine/tree" }
+reth-node-builder = { path = "/Users/constbh/rustRepo/reth/crates/node/builder" }
+reth-chainspec = { path = "/Users/constbh/rustRepo/reth/crates/chainspec" }
+reth-cli-util = { path = "/Users/constbh/rustRepo/reth/crates/cli/util" }
+reth-discv4 = { path = "/Users/constbh/rustRepo/reth/crates/net/discv4", features = [
     "test-utils",
 ] }
-reth-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-ethereum-forks = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7", features = [
+reth-engine-primitives = { path = "/Users/constbh/rustRepo/reth/crates/engine/primitives" }
+reth-ethereum-forks = { path = "/Users/constbh/rustRepo/reth/crates/ethereum/hardforks", features = [
     "serde",
 ] }
-reth-ethereum-payload-builder = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-payload-builder-primitives = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-chain-state = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-eth-wire = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-eth-wire-types = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-evm = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-ipc = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-metrics = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-node-core = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-revm = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-network = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7", features = [
+reth-ethereum-payload-builder = { path = "/Users/constbh/rustRepo/reth/crates/ethereum/payload" }
+reth-payload-builder-primitives = { path = "/Users/constbh/rustRepo/reth/crates/payload/builder-primitives" }
+reth-chain-state = { path = "/Users/constbh/rustRepo/reth/crates/chain-state" }
+reth-ethereum-primitives = { path = "/Users/constbh/rustRepo/reth/crates/ethereum/primitives" }
+reth-eth-wire = { path = "/Users/constbh/rustRepo/reth/crates/net/eth-wire" }
+reth-eth-wire-types = { path = "/Users/constbh/rustRepo/reth/crates/net/eth-wire-types" }
+reth-evm = { path = "/Users/constbh/rustRepo/reth/crates/evm/evm" }
+reth-evm-ethereum = { path = "/Users/constbh/rustRepo/reth/crates/ethereum/evm" }
+reth-ipc = { path = "/Users/constbh/rustRepo/reth/crates/rpc/ipc" }
+reth-metrics = { path = "/Users/constbh/rustRepo/reth/crates/metrics" }
+reth-node-core = { path = "/Users/constbh/rustRepo/reth/crates/node/core" }
+reth-revm = { path = "/Users/constbh/rustRepo/reth/crates/revm" }
+reth-network = { path = "/Users/constbh/rustRepo/reth/crates/net/network", features = [
     "test-utils",
 ] }
-reth-network-p2p = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-network-api = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-node-ethereum = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7", features = [
+reth-network-p2p = { path = "/Users/constbh/rustRepo/reth/crates/net/p2p" }
+reth-network-api = { path = "/Users/constbh/rustRepo/reth/crates/net/network-api" }
+reth-node-ethereum = { path = "/Users/constbh/rustRepo/reth/crates/ethereum/node", features = [
     "test-utils",
 ] }
-reth-network-peers = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-payload-primitives = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-ethereum-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-primitives = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-primitives-traits = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-provider = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7", features = [
+reth-network-peers = { path = "/Users/constbh/rustRepo/reth/crates/net/peers" }
+reth-payload-primitives = { path = "/Users/constbh/rustRepo/reth/crates/payload/primitives" }
+reth-ethereum-engine-primitives = { path = "/Users/constbh/rustRepo/reth/crates/ethereum/engine-primitives" }
+reth-primitives = { path = "/Users/constbh/rustRepo/reth/crates/primitives" }
+reth-primitives-traits = { path = "/Users/constbh/rustRepo/reth/crates/primitives-traits" }
+reth-provider = { path = "/Users/constbh/rustRepo/reth/crates/storage/provider", features = [
     "test-utils",
 ] }
-reth-rpc-eth-api = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-rpc-engine-api = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-tracing = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-trie-common = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-tasks = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
-reth-transaction-pool = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.7" }
+reth-rpc-eth-api = { path = "/Users/constbh/rustRepo/reth/crates/rpc/rpc-eth-api" }
+reth-rpc-engine-api = { path = "/Users/constbh/rustRepo/reth/crates/rpc/rpc-engine-api" }
+reth-tracing = { path = "/Users/constbh/rustRepo/reth/crates/tracing" }
+reth-trie-common = { path = "/Users/constbh/rustRepo/reth/crates/trie/common" }
+reth-trie-db = { path = "/Users/constbh/rustRepo/reth/crates/trie/db" }
+reth-tasks = { path = "/Users/constbh/rustRepo/reth/crates/tasks" }
+reth-transaction-pool = { path = "/Users/constbh/rustRepo/reth/crates/transaction-pool" }
 revm = "29.0.0"
 
 # alloy dependencies
@@ -153,6 +155,10 @@ tendermint = { git = "https://github.com/bnb-chain/tendermint-rs-parlia", rev = 
 signature = "2.2.0"
 k256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
 eth-keystore = "0.5"
+
+# triedb dependencies
+rust-eth-triedb = { git = "https://github.com/bnb-chain/reth-bsc-triedb.git", branch = "triedb_opt" }
+rust-eth-triedb-common = { git = "https://github.com/bnb-chain/reth-bsc-triedb.git", branch = "triedb_opt", package = "rust-eth-triedb-common" }
 
 [target.'cfg(unix)'.dependencies]
 tikv-jemalloc-ctl = "0.6"

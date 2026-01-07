@@ -1,12 +1,34 @@
-use crate::{BscPrimitives, hardforks::BscHardforks, node::evm::{assembler::{BscBlockAssembler, BscBlockAssemblerInput}, config::{BscBlockExecutionCtx, BscBlockExecutorFactory, BscExecutionSharedCtx}, executor::BscBlockExecutor, factory::BscEvmFactory, pre_execution::{TURN_LENGTH_CACHE, VALIDATOR_CACHE}}};
-use reth_evm::execute::{BlockBuilder, BlockBuilderOutcome, BlockExecutionError, ExecutorTx};
+use crate::{
+    hardforks::BscHardforks,
+    node::evm::{
+        assembler::{BscBlockAssembler, BscBlockAssemblerInput},
+        config::{BscBlockExecutionCtx, BscBlockExecutorFactory, BscExecutionSharedCtx},
+        executor::BscBlockExecutor,
+        factory::BscEvmFactory,
+        pre_execution::{TURN_LENGTH_CACHE, VALIDATOR_CACHE},
+    },
+    node::BscNode,
+    BscPrimitives,
+};
+use alloy_consensus::BlockHeader as _;
 use alloy_evm::eth::receipt_builder::ReceiptBuilder;
-use reth_primitives_traits::{HeaderTy, NodePrimitives, Recovered, RecoveredBlock, SealedHeader, SignerRecoverable, TxTy};
-use reth_provider::StateProvider;
-use revm::database::{State, states::bundle_state::BundleRetention};
-use alloy_evm::{Evm, block::BlockExecutor};
+use alloy_evm::{block::BlockExecutor, Evm};
+use alloy_primitives::BlockHash;
+use reth::builder::NodeAdapter;
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
-
+use reth_engine_primitives::BSCEngineMessageError;
+use reth_engine_tree::engine::EngineApiRequest;
+use reth_engine_tree::tree::CustomRequestMessage;
+use reth_evm::execute::{BlockBuilder, BlockBuilderOutcome, BlockExecutionError, ExecutorTx};
+use reth_node_builder::rpc::EngineApiTx;
+use reth_primitives_traits::{
+    HeaderTy, NodePrimitives, Recovered, RecoveredBlock, SealedHeader, SignerRecoverable, TxTy,
+};
+use reth_provider::StateProvider;
+use revm::database::{states::bundle_state::BundleRetention, State};
+use rust_eth_triedb::get_global_triedb;
+use rust_eth_triedb_common::DiffLayers;
+use tokio::sync::oneshot;
 
 /// rewrite BasicBlockBuilder, mainly about the finish() trait.
 /// add system txs to sealed block.
@@ -41,14 +63,7 @@ where
         assembler: &'a BscBlockAssembler<crate::chainspec::BscChainSpec>,
         parent: &'a SealedHeader<HeaderTy<BscPrimitives>>,
     ) -> Self {
-        Self {
-            executor,
-            transactions: Vec::new(),
-            ctx,
-            shared_ctx,
-            parent,
-            assembler,
-        }
+        Self { executor, transactions: Vec::new(), ctx, shared_ctx, parent, assembler }
     }
 }
 
@@ -106,12 +121,76 @@ where
         // merge all transitions into bundle state
         db.merge_transitions(BundleRetention::Reverts);
 
-        // calculate the state root
+        // calculate the state root using triedb
         let state_root_start = std::time::Instant::now();
         let hashed_state = state.hashed_post_state(&db.bundle_state);
-        let (state_root, trie_updates) = state
-            .state_root_with_updates(hashed_state.clone())
-            .map_err(BlockExecutionError::other)?;
+
+        // Use triedb to calculate state root
+        let (state_root, trie_updates) = if rust_eth_triedb::triedb_manager::is_triedb_active() {
+            let mut triedb = get_global_triedb();
+            // Access parent state root through the header
+            // SealedHeader derefs to the inner header which has state_root()
+            let parent_state_root = (**self.parent).state_root();
+
+            // Convert hashed state to triedb format
+            let trie_hashed_state = hashed_state.to_triedb_hashed_post_state();
+
+            let engine_api_tx = match crate::shared::get_engine_api_tx() {
+                Some(tx) => tx,
+                None => {
+                    return Err(BlockExecutionError::other(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "engine api not found",
+                    )))
+                }
+            };
+            let difflayer_task = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let fut =
+                    async { request_difflayer(&engine_api_tx, self.parent.parent_hash).await };
+                tokio::task::block_in_place(|| handle.block_on(fut))
+            } else {
+                return Err(BlockExecutionError::other(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "tokio runtime not found",
+                )));
+            };
+            let difflayers = difflayer_task.map_err(|e| {
+                BlockExecutionError::other(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to request difflayer: {}", e),
+                ))
+            })?;
+
+            // Calculate state root using triedb
+            // Pass parent difflayers from engine tree to get correct state root
+            let (new_root, new_difflayer) = triedb
+                .intermediate_and_commit_hashed_post_state(
+                    parent_state_root,
+                    Some(&difflayers), // Pass by reference
+                    &trie_hashed_state,
+                    None, // No prefetch state
+                )
+                .map_err(BlockExecutionError::other)?;
+
+            tracing::debug!(
+                target: "bsc::builder",
+                parent_state_root = %parent_state_root,
+                new_state_root = %new_root,
+                "Calculated state root using triedb"
+            );
+
+            // Store the new difflayer with parent_hash + block_number as key
+            // This ensures correct association even when multiple payloads are built concurrently
+            let block_number = self.parent.number + 1;
+            crate::shared::set_difflayer_for_block(self.parent.hash(), block_number, new_difflayer);
+
+            (new_root, Default::default())
+        } else {
+            // Fallback to original method if triedb is not active
+            state
+                .state_root_with_updates(hashed_state.clone())
+                .map_err(BlockExecutionError::other)?
+        };
         let state_root_duration = state_root_start.elapsed();
 
         let user_tx_len = self.transactions.len();
@@ -122,33 +201,45 @@ where
         let (transactions, senders): (Vec<_>, Vec<_>) =
             self.transactions.into_iter().map(|tx| tx.into_parts()).unzip();
 
-        // BlockAssemblerInput is non_exhaustive. 
+        // BlockAssemblerInput is non_exhaustive.
         // So define a new struct BscBlockAssemblerInput and a new interface assemble_block_bsc.
-        let bsc_input: BscBlockAssemblerInput<'_, '_, BscBlockExecutorFactory> = BscBlockAssemblerInput {
-            evm_env,
-            execution_ctx: self.ctx,
-            parent: self.parent,
-            transactions: transactions.clone(),
-            output: &result,
-            bundle_state: &db.bundle_state,
-            state_provider: &state,
-            state_root,
-        };
+        let bsc_input: BscBlockAssemblerInput<'_, '_, BscBlockExecutorFactory> =
+            BscBlockAssemblerInput {
+                evm_env,
+                execution_ctx: self.ctx,
+                parent: self.parent,
+                transactions: transactions.clone(),
+                output: &result,
+                bundle_state: &db.bundle_state,
+                state_provider: &state,
+                state_root,
+            };
         let assemble_start = std::time::Instant::now();
         let block = self.assembler.assemble_block_bsc(bsc_input)?;
 
         // cache current validators and turn length
         let current_validators = self.shared_ctx.inner.borrow().current_validators.clone();
         if let Some((validators, vote_addresses)) = current_validators {
-            VALIDATOR_CACHE.lock().unwrap().insert(block.header.hash_slow(), (validators, vote_addresses));
-            tracing::debug!("Succeed to update validator cache in builder, block_number: {}, block_hash: {}", block.header.number, block.header.hash_slow());
+            VALIDATOR_CACHE
+                .lock()
+                .unwrap()
+                .insert(block.header.hash_slow(), (validators, vote_addresses));
+            tracing::debug!(
+                "Succeed to update validator cache in builder, block_number: {}, block_hash: {}",
+                block.header.number,
+                block.header.hash_slow()
+            );
         }
         if let Some(turn_length) = self.shared_ctx.inner.borrow().turn_length {
             TURN_LENGTH_CACHE.lock().unwrap().insert(block.header.hash_slow(), turn_length);
-            tracing::debug!("Succeed to update turn length cache in builder, block_number: {}, block_hash: {}", block.header.number, block.header.hash_slow());
+            tracing::debug!(
+                "Succeed to update turn length cache in builder, block_number: {}, block_hash: {}",
+                block.header.number,
+                block.header.hash_slow()
+            );
         }
         let assemble_duration = assemble_start.elapsed();
-        
+
         let finish_duration = finish_start.elapsed();
         tracing::debug!(
             target: "bsc::builder",
@@ -178,4 +269,17 @@ where
     fn into_executor(self) -> Self::Executor {
         self.executor
     }
+}
+
+pub async fn request_difflayer(
+    engine_api_tx: &EngineApiTx<NodeAdapter<BscNode>>,
+    parent_hash: BlockHash,
+) -> Result<DiffLayers, BSCEngineMessageError> {
+    let (tx, rx) = oneshot::channel();
+    let _ = engine_api_tx.send(EngineApiRequest::Custom(CustomRequestMessage::RequestDiffLayer {
+        parent_hash,
+        tx,
+        _phantom: std::marker::PhantomData,
+    }));
+    rx.await.map_err(BSCEngineMessageError::internal)?.map_err(BSCEngineMessageError::internal)
 }

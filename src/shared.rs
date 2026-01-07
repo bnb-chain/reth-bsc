@@ -3,15 +3,23 @@ use crate::node::engine_api::payload::BscPayloadTypes;
 use crate::node::network::block_import::service::{IncomingBlock, IncomingMinedBlock};
 use crate::node::network::BscNetworkPrimitives;
 use crate::node::primitives::BscBlock;
+use crate::node::BscNode;
 use alloy_consensus::{BlockHeader, Header};
-use alloy_rlp::Encodable;
 use alloy_eips::BlockId;
-use alloy_primitives::{B256, Bytes, U256};
-use reth_primitives::TransactionSigned;
+use alloy_primitives::{Bytes, B256, U256};
+use alloy_rlp::Encodable;
+use alloy_rpc_types::{
+    state::StateOverride, Block as RpcBlock, BlockOverrides, Header as RpcHeader,
+    Receipt as RpcReceipt, Transaction as RpcTransaction,
+    TransactionRequest as RpcTransactionRequest,
+};
 use parking_lot::Mutex;
+use reth::builder::NodeAdapter;
 use reth_network::NetworkHandle;
 use reth_network_api::PeerId;
+use reth_node_builder::rpc::EngineApiTx;
 use reth_payload_builder_primitives::Events;
+use reth_primitives::TransactionSigned;
 use reth_provider::{BlockNumReader, HeaderProvider};
 use schnellru::{ByLength, LruMap};
 use std::collections::VecDeque;
@@ -20,9 +28,6 @@ use std::sync::RwLock;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::UnboundedSender;
-use alloy_rpc_types::{
-    Block as RpcBlock, BlockOverrides, Header as RpcHeader, Receipt as RpcReceipt, Transaction as RpcTransaction, TransactionRequest as RpcTransactionRequest, state::StateOverride
-};
 
 /// Function type for HeaderProvider::header() access (by hash)
 type HeaderByHashFn = Arc<dyn Fn(&B256) -> Option<Header> + Send + Sync>;
@@ -524,7 +529,9 @@ pub async fn set_ipc_client(path: String) -> Result<(), eyre::Error> {
         .build(&path)
         .await
         .map_err(|e| eyre::eyre!("Failed to build RPC client: {:?}", e))?;
-    IPC_CLIENT.set(Arc::new(client)).map_err(|e| eyre::eyre!("Failed to set RPC client: {:?}", e))?;
+    IPC_CLIENT
+        .set(Arc::new(client))
+        .map_err(|e| eyre::eyre!("Failed to set RPC client: {:?}", e))?;
     Ok(())
 }
 
@@ -572,9 +579,7 @@ pub async fn ipc_estimate_gas(
     .map_err(|e| eyre::eyre!("failed to query chain id from healthy node: {e}"))
 }
 
-pub async fn ipc_send_transaction(
-    req: RpcTransactionRequest,
-) -> Result<B256, eyre::Error> {
+pub async fn ipc_send_transaction(req: RpcTransactionRequest) -> Result<B256, eyre::Error> {
     let client = get_ipc_client().ok_or(eyre::eyre!("Failed to get RPC client"))?;
     reth_rpc_eth_api::EthApiClient::<
         RpcTransactionRequest,
@@ -588,9 +593,7 @@ pub async fn ipc_send_transaction(
 }
 
 /// Send a raw signed transaction via IPC (eth_sendRawTransaction)
-pub async fn ipc_send_raw_transaction(
-    tx: TransactionSigned,
-)-> Result<B256, eyre::Error> {
+pub async fn ipc_send_raw_transaction(tx: TransactionSigned) -> Result<B256, eyre::Error> {
     let client = get_ipc_client().ok_or(eyre::eyre!("Failed to get RPC client"))?;
     let mut buf = Vec::new();
     tx.encode(&mut buf);
@@ -604,6 +607,59 @@ pub async fn ipc_send_raw_transaction(
     >::send_raw_transaction(client.as_ref(), bytes)
     .await
     .map_err(|e| eyre::eyre!("failed to query chain id from healthy node: {e}"))
+}
+
+/// Global engine api tx (custom request sender)
+static ENGINE_API_TX: OnceLock<EngineApiTx<NodeAdapter<BscNode>>> = OnceLock::new();
+
+/// Set global engine api tx if present.
+pub fn set_engine_api_tx(
+    tx: EngineApiTx<NodeAdapter<BscNode>>,
+) -> Result<(), EngineApiTx<NodeAdapter<BscNode>>> {
+    ENGINE_API_TX.set(tx)
+}
+
+/// Get global consensus engine handle if initialized.
+pub fn get_engine_api_tx() -> Option<EngineApiTx<NodeAdapter<BscNode>>> {
+    ENGINE_API_TX.get().cloned()
+}
+
+/// Global storage for difflayers computed during payload building
+/// Maps parent_hash + block_number to the computed difflayer
+/// This ensures correct association even when multiple payloads are built concurrently
+static DIFFLAYER_CACHE: OnceLock<
+    parking_lot::RwLock<
+        schnellru::LruMap<(B256, u64), Arc<rust_eth_triedb_common::DiffLayer>, schnellru::ByLength>,
+    >,
+> = OnceLock::new();
+
+fn get_difflayer_cache() -> &'static parking_lot::RwLock<
+    schnellru::LruMap<(B256, u64), Arc<rust_eth_triedb_common::DiffLayer>, schnellru::ByLength>,
+> {
+    DIFFLAYER_CACHE.get_or_init(|| {
+        parking_lot::RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new(128)))
+    })
+}
+
+/// Store a difflayer for a specific block (identified by parent_hash + block_number)
+pub fn set_difflayer_for_block(
+    parent_hash: B256,
+    block_number: u64,
+    difflayer: Arc<rust_eth_triedb_common::DiffLayer>,
+) {
+    let cache = get_difflayer_cache();
+    let mut cache = cache.write();
+    cache.insert((parent_hash, block_number), difflayer);
+}
+
+/// Retrieve and remove a difflayer for a specific block
+pub fn take_difflayer_for_block(
+    parent_hash: B256,
+    block_number: u64,
+) -> Option<Arc<rust_eth_triedb_common::DiffLayer>> {
+    let cache = get_difflayer_cache();
+    let mut cache = cache.write();
+    cache.remove(&(parent_hash, block_number))
 }
 
 #[cfg(test)]
