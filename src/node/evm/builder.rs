@@ -143,8 +143,7 @@ where
             let engine_api_tx = match crate::shared::get_engine_api_tx() {
                 Some(tx) => tx,
                 None => {
-                    return Err(BlockExecutionError::other(std::io::Error::new(
-                        std::io::ErrorKind::Other,
+                    return Err(BlockExecutionError::other(std::io::Error::other(
                         "engine api not found",
                     )))
                 }
@@ -153,16 +152,15 @@ where
                 let fut = async { request_difflayer(&engine_api_tx, self.parent.hash()).await };
                 tokio::task::block_in_place(|| handle.block_on(fut))
             } else {
-                return Err(BlockExecutionError::other(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                return Err(BlockExecutionError::other(std::io::Error::other(
                     "tokio runtime not found",
                 )));
             };
             let difflayers = difflayer_task.map_err(|e| {
-                BlockExecutionError::other(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Failed to request difflayer: {}", e),
-                ))
+                BlockExecutionError::other(std::io::Error::other(format!(
+                    "Failed to request difflayer: {}",
+                    e
+                )))
             })?;
 
             // Calculate state root using triedb

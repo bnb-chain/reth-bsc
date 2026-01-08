@@ -541,6 +541,10 @@ where
         plain.body.sidecars = Some(bid_runtime.blob_sidecars.clone());
         sealed_block = Arc::new(plain.into());
 
+        // Retrieve the difflayer from global cache, same as miner
+        let block_number = parent_header.number + 1;
+        let difflayer = crate::shared::take_difflayer_for_block(parent_header.hash(), block_number);
+
         bid_runtime.bsc_payload = BscBuiltPayload {
             block: sealed_block.clone(),
             fees: bid_runtime.gas_fee,
@@ -556,7 +560,7 @@ where
                 hashed_state: Arc::new(hashed_state.clone()),
             },
             executed_trie: Some(ExecutedTrieUpdates::Present(Arc::new(trie_updates))),
-            difflayer: None, // Bid simulator doesn't use difflayer
+            difflayer,
         };
 
         // Acquire write lock to update best_bid

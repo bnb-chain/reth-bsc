@@ -624,18 +624,17 @@ pub fn get_engine_api_tx() -> Option<EngineApiTx<NodeAdapter<BscNode>>> {
     ENGINE_API_TX.get().cloned()
 }
 
+/// Type alias for the difflayer cache to reduce complexity
+type DiffLayerCache = parking_lot::RwLock<
+    schnellru::LruMap<(B256, u64), Arc<rust_eth_triedb_common::DiffLayer>, schnellru::ByLength>,
+>;
+
 /// Global storage for difflayers computed during payload building
 /// Maps parent_hash + block_number to the computed difflayer
 /// This ensures correct association even when multiple payloads are built concurrently
-static DIFFLAYER_CACHE: OnceLock<
-    parking_lot::RwLock<
-        schnellru::LruMap<(B256, u64), Arc<rust_eth_triedb_common::DiffLayer>, schnellru::ByLength>,
-    >,
-> = OnceLock::new();
+static DIFFLAYER_CACHE: OnceLock<DiffLayerCache> = OnceLock::new();
 
-fn get_difflayer_cache() -> &'static parking_lot::RwLock<
-    schnellru::LruMap<(B256, u64), Arc<rust_eth_triedb_common::DiffLayer>, schnellru::ByLength>,
-> {
+fn get_difflayer_cache() -> &'static DiffLayerCache {
     DIFFLAYER_CACHE.get_or_init(|| {
         parking_lot::RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new(128)))
     })
