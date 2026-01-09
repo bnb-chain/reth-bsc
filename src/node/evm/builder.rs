@@ -152,23 +152,38 @@ where
                 let fut = async { request_difflayer(&engine_api_tx, self.parent.hash()).await };
                 tokio::task::block_in_place(|| handle.block_on(fut))
             } else {
-                return Err(BlockExecutionError::other(std::io::Error::other(
+                tracing::warn!(
+                    target: "bsc::builder",
+                    parent_hash = %self.parent.hash(),
+                    block_number = %(self.parent.number + 1),
+                    "Tokio runtime not found, continuing without parent difflayers"
+                );
+                Err(BSCEngineMessageError::internal(std::io::Error::other(
                     "tokio runtime not found",
-                )));
-            };
-            let difflayers = difflayer_task.map_err(|e| {
-                BlockExecutionError::other(std::io::Error::other(format!(
-                    "Failed to request difflayer: {}",
-                    e
                 )))
-            })?;
+            };
+
+            // Try to get difflayers, but continue with None if failed
+            let difflayers_opt = match difflayer_task {
+                Ok(difflayers) => Some(difflayers),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "bsc::builder",
+                        parent_hash = %self.parent.hash(),
+                        block_number = %(self.parent.number + 1),
+                        error = %e,
+                        "Failed to request parent difflayers, continuing without them"
+                    );
+                    None
+                }
+            };
 
             // Calculate state root using triedb
             // Pass parent difflayers from engine tree to get correct state root
             let (new_root, new_difflayer) = triedb
                 .intermediate_and_commit_hashed_post_state(
                     parent_state_root,
-                    Some(&difflayers),
+                    difflayers_opt.as_ref(),
                     &trie_hashed_state,
                     None, // No prefetch state
                 )
