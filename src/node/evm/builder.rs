@@ -180,6 +180,7 @@ where
 
             // Calculate state root using triedb
             // Pass parent difflayers from engine tree to get correct state root
+            let triedb_calc_started = std::time::Instant::now();
             let (new_root, new_difflayer) = triedb
                 .intermediate_and_commit_hashed_post_state(
                     parent_state_root,
@@ -191,8 +192,21 @@ where
 
             tracing::debug!(
                 target: "bsc::builder",
+                parent_hash = %self.parent.hash(),
+                block_number = %(self.parent.number + 1),
                 parent_state_root = %parent_state_root,
                 new_state_root = %new_root,
+                has_parent_difflayers = difflayers_opt.is_some(),
+                user_tx_count = self.transactions.len(),
+                hashed_accounts = hashed_state.accounts.len(),
+                hashed_storages = hashed_state.storages.len(),
+                hashed_storage_slots = hashed_state
+                    .storages
+                    .values()
+                    .map(|s| s.storage.len())
+                    .sum::<usize>(),
+                triedb_calc_ms = triedb_calc_started.elapsed().as_millis(),
+                triedb_calc_us = triedb_calc_started.elapsed().as_micros(),
                 "Calculated state root using triedb"
             );
 
