@@ -24,7 +24,7 @@ use reth_primitives_traits::{logs_bloom, SealedHeader};
 use reth_provider::{BlockExecutionResult, StateProvider};
 use revm::database::BundleState;
 use std::sync::Arc;
-use tracing::debug;
+use tracing::info;
 
 /// BSC block assembler input that mirrors BlockAssemblerInput but is not #[non_exhaustive]
 /// 
@@ -177,15 +177,21 @@ where
             format!("[{}] 0x{:x}", idx, receipt_hash)
         }).collect();
 
-        debug!(
-            "slash debug assemble, block_number={}, parent_hash=0x{:x}, header: {:?}, tx_count={}, receipt_count={}, tx_hashes=[{}], receipt_hashes=[{}]",
+        // Format receipts with all fields for debug output
+        let receipts_debug: Vec<String> = receipts.iter().enumerate().map(|(idx, receipt)| {
+            format!("[{}] {:?}", idx, receipt)
+        }).collect();
+
+        info!(
+            "slash debug assemble, block_number={}, parent_hash=0x{:x}, header: {:?}, tx_count={}, receipt_count={}, tx_hashes=[{}], receipt_hashes=[{}], receipts=[{}]",
             block_number,
             header.parent_hash,
             header,
             transactions.len(),
             receipts.len(),
             tx_hashes.join(", "),
-            receipt_hashes.join(", ")
+            receipt_hashes.join(", "),
+            receipts_debug.join(", "),
         );
         
         {   // finalize_new_header

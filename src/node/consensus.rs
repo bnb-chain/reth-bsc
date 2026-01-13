@@ -14,7 +14,7 @@ use crate::{
 };
 use alloy_consensus::{Header, TxReceipt};
 use alloy_eips::Encodable2718;
-use alloy_primitives::{Bytes, B256};
+use alloy_primitives::{keccak256, Bytes, B256};
 use alloy_rpc_types::engine::{ForkchoiceState, PayloadStatusEnum};
 use reth::{
     api::FullNodeTypes,
@@ -207,6 +207,37 @@ impl<ChainSpec: EthChainSpec<Header = Header> + BscHardforks + 'static> FullCons
             if let Err(error) =
                 verify_receipts(block.header().receipts_root, block.header().logs_bloom, receipts)
             {
+                // Collect transaction and receipt hashes for debug output (same as assembler.rs)
+                let transactions: Vec<_> = block.body().transactions().collect();
+                let tx_hashes: Vec<String> = transactions.iter().enumerate().map(|(idx, tx)| {
+                    format!("[{}] 0x{:x}", idx, tx.hash())
+                }).collect();
+                // Calculate receipt hashes using the same method as receipts_root calculation
+                let receipt_hashes: Vec<String> = receipts.iter().enumerate().map(|(idx, receipt)| {
+                    // Encode receipt with bloom using encode_2718 (same as calculate_receipt_root_no_memo)
+                    let encoded = receipt.with_bloom_ref().encoded_2718();
+                    let receipt_hash = keccak256(&encoded);
+                    format!("[{}] 0x{:x}", idx, receipt_hash)
+                }).collect();
+                
+                // Format receipts with all fields for debug output
+                let receipts_debug: Vec<String> = receipts.iter().enumerate().map(|(idx, receipt)| {
+                    format!("[{}] {:?}", idx, receipt)
+                }).collect();
+                
+                tracing::error!(
+                    "slash debug verify_receipts, error={:?}, block_number={}, parent_hash=0x{:x}, header: {:?}, tx_count={}, receipt_count={}, tx_hashes=[{}], receipt_hashes=[{}], receipts=[{}]",
+                    error,
+                    block.header().number,
+                    block.header().parent_hash,
+                    block.header(),
+                    transactions.len(),
+                    receipts.len(),
+                    tx_hashes.join(", "),
+                    receipt_hashes.join(", "),
+                    receipts_debug.join(", "),
+                );
+                
                 let receipts = receipts
                     .iter()
                     .map(|r| Bytes::from(r.with_bloom_ref().encoded_2718()))
