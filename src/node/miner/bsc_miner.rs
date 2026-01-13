@@ -44,7 +44,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_stream::StreamExt;
@@ -111,12 +110,31 @@ where
     pub async fn run(mut self) {
         info!("Succeed to spawn new work worker, address: {}", self.validator_address);
 
+        let mut notifications = self.provider.canonical_state_stream();
+        debug!(target: "bsc::miner", "Subscribed to canonical_state_stream");
+
+        // Don't block the canonical notifications loop on potentially slow startup checks (DB
+        // reads / snapshot locks). If this blocks, we can miss the first few canonical commits and
+        // never emit the per-commit "Try new work" log.
         if let Some(tip_header) = self.get_tip_header_at_startup() {
             debug!("Try new work at startup, tip_block={}", tip_header.number());
-            self.try_new_work(&tip_header).await;
+            let validator_address = self.validator_address;
+            let provider = self.provider.clone();
+            let snapshot_provider = Arc::clone(&self.snapshot_provider);
+            let mining_queue_tx = self.mining_queue_tx.clone();
+            let consensus = Arc::clone(&self.consensus);
+            tokio::spawn(async move {
+                let worker = NewWorkWorker::new(
+                    validator_address,
+                    provider,
+                    snapshot_provider,
+                    mining_queue_tx,
+                    consensus,
+                );
+                worker.try_new_work(&tip_header).await;
+            });
         }
 
-        let mut notifications = self.provider.canonical_state_stream();
         loop {
             match notifications.next().await {
                 Some(event) => {
