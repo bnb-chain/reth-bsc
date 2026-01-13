@@ -2327,9 +2327,9 @@ dependencies = [
 
 [[package]]
 name = "comfy-table"
-version = "7.2.1"
+version = "7.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b03b7db8e0b4b2fdad6c551e634134e99ec000e5c8c3b6856c65e8bbaded7a3b"
+checksum = "958c5d6ecf1f214b4c2bbbbf6ab9523a864bd136dcf71a7e8904799acfe1ad47"
 dependencies = [
  "crossterm 0.29.0",
  "unicode-segmentation",
@@ -7021,7 +7021,7 @@ checksum = "1e061d1b48cb8d38042de4ae0a7a6401009d6143dc80d2e2d6f31f0bdd6470c7"
 [[package]]
 name = "reth"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-rpc-types",
  "aquamarine",
@@ -7067,7 +7067,7 @@ dependencies = [
 [[package]]
 name = "reth-basic-payload-builder"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -7076,7 +7076,7 @@ dependencies = [
  "futures-util",
  "metrics",
  "reth-chain-state",
- "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner)",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug)",
  "reth-payload-builder",
  "reth-payload-builder-primitives",
  "reth-payload-primitives",
@@ -7091,7 +7091,7 @@ dependencies = [
 [[package]]
 name = "reth-chain-state"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -7107,7 +7107,7 @@ dependencies = [
  "reth-errors",
  "reth-ethereum-primitives",
  "reth-execution-types",
- "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner)",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug)",
  "reth-primitives-traits",
  "reth-storage-api",
  "reth-trie",
@@ -7123,7 +7123,7 @@ dependencies = [
 [[package]]
 name = "reth-chainspec"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-chains",
  "alloy-consensus",
@@ -7143,7 +7143,7 @@ dependencies = [
 [[package]]
 name = "reth-cli"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-genesis",
  "clap",
@@ -7157,7 +7157,7 @@ dependencies = [
 [[package]]
 name = "reth-cli-commands"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-chains",
  "alloy-consensus",
@@ -7240,7 +7240,7 @@ dependencies = [
 [[package]]
 name = "reth-cli-runner"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "reth-tasks",
  "tokio",
@@ -7250,7 +7250,7 @@ dependencies = [
 [[package]]
 name = "reth-cli-util"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-eips",
  "alloy-primitives",
@@ -7268,7 +7268,7 @@ dependencies = [
 [[package]]
 name = "reth-codecs"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -7288,7 +7288,7 @@ dependencies = [
 [[package]]
 name = "reth-codecs-derive"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "convert_case 0.7.1",
  "proc-macro2",
@@ -7299,7 +7299,7 @@ dependencies = [
 [[package]]
 name = "reth-config"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "eyre",
  "humantime-serde",
@@ -7314,7 +7314,7 @@ dependencies = [
 [[package]]
 name = "reth-consensus"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",
@@ -7327,7 +7327,7 @@ dependencies = [
 [[package]]
 name = "reth-consensus-common"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -7339,7 +7339,7 @@ dependencies = [
 [[package]]
 name = "reth-consensus-debug-client"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -7364,7 +7364,7 @@ dependencies = [
 [[package]]
 name = "reth-db"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-primitives",
  "derive_more 2.1.1",
@@ -7375,7 +7375,7 @@ dependencies = [
  "reth-db-api",
  "reth-fs-util",
  "reth-libmdbx",
- "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner)",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug)",
  "reth-nippy-jar",
  "reth-static-file-types",
  "reth-storage-errors",
@@ -7390,7 +7390,7 @@ dependencies = [
 [[package]]
 name = "reth-db-api"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-consensus",
  "alloy-genesis",
@@ -7418,7 +7418,7 @@ dependencies = [
 [[package]]
 name = "reth-db-common"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-consensus",
  "alloy-genesis",
@@ -7452,7 +7452,7 @@ dependencies = [
 [[package]]
 name = "reth-db-models"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-eips",
  "alloy-primitives",
@@ -7467,7 +7467,7 @@ dependencies = [
 [[package]]
 name = "reth-discv4"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -7493,7 +7493,7 @@ dependencies = [
 [[package]]
 name = "reth-discv5"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -7506,7 +7506,7 @@ dependencies = [
  "rand 0.9.2",
  "reth-chainspec",
  "reth-ethereum-forks",
- "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner)",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug)",
  "reth-network-peers",
  "secp256k1 0.30.0",
  "thiserror 2.0.17",
@@ -7517,7 +7517,7 @@ dependencies = [
 [[package]]
 name = "reth-dns-discovery"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-primitives",
  "data-encoding",
@@ -7541,7 +7541,7 @@ dependencies = [
 [[package]]
 name = "reth-downloaders"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -7558,7 +7558,7 @@ dependencies = [
  "reth-db",
  "reth-db-api",
  "reth-ethereum-primitives",
- "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner)",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug)",
  "reth-network-p2p",
  "reth-network-peers",
  "reth-primitives-traits",
@@ -7576,7 +7576,7 @@ dependencies = [
 [[package]]
 name = "reth-ecies"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "aes",
  "alloy-primitives",
@@ -7607,7 +7607,7 @@ dependencies = [
 [[package]]
 name = "reth-engine-local"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",
@@ -7629,7 +7629,7 @@ dependencies = [
 [[package]]
 name = "reth-engine-primitives"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -7654,7 +7654,7 @@ dependencies = [
 [[package]]
 name = "reth-engine-service"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "futures",
  "pin-project",
@@ -7677,7 +7677,7 @@ dependencies = [
 [[package]]
 name = "reth-engine-tree"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -7700,7 +7700,7 @@ dependencies = [
  "reth-ethereum-primitives",
  "reth-evm",
  "reth-execution-types",
- "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner)",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug)",
  "reth-network-p2p",
  "reth-payload-builder",
  "reth-payload-primitives",
@@ -7735,7 +7735,7 @@ dependencies = [
 [[package]]
 name = "reth-engine-util"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-consensus",
  "alloy-rpc-types-engine",
@@ -7763,7 +7763,7 @@ dependencies = [
 [[package]]
 name = "reth-era"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -7779,7 +7779,7 @@ dependencies = [
 [[package]]
 name = "reth-era-downloader"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-primitives",
  "bytes 1.11.0",
@@ -7794,7 +7794,7 @@ dependencies = [
 [[package]]
 name = "reth-era-utils"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",
@@ -7816,7 +7816,7 @@ dependencies = [
 [[package]]
 name = "reth-errors"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "reth-consensus",
  "reth-execution-errors",
@@ -7827,7 +7827,7 @@ dependencies = [
 [[package]]
 name = "reth-eth-wire"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-chains",
  "alloy-primitives",
@@ -7841,7 +7841,7 @@ dependencies = [
  "reth-ecies",
  "reth-eth-wire-types",
  "reth-ethereum-forks",
- "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner)",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug)",
  "reth-network-peers",
  "reth-primitives-traits",
  "serde",
@@ -7856,7 +7856,7 @@ dependencies = [
 [[package]]
 name = "reth-eth-wire-types"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-chains",
  "alloy-consensus",
@@ -7880,7 +7880,7 @@ dependencies = [
 [[package]]
 name = "reth-ethereum-cli"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "clap",
  "eyre",
@@ -7902,7 +7902,7 @@ dependencies = [
 [[package]]
 name = "reth-ethereum-consensus"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -7918,7 +7918,7 @@ dependencies = [
 [[package]]
 name = "reth-ethereum-engine-primitives"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-eips",
  "alloy-primitives",
@@ -7936,7 +7936,7 @@ dependencies = [
 [[package]]
 name = "reth-ethereum-forks"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-eip2124",
  "alloy-hardforks",
@@ -7950,7 +7950,7 @@ dependencies = [
 [[package]]
 name = "reth-ethereum-payload-builder"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -7979,7 +7979,7 @@ dependencies = [
 [[package]]
 name = "reth-ethereum-primitives"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -7997,7 +7997,7 @@ dependencies = [
 [[package]]
 name = "reth-etl"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "rayon",
  "reth-db-api",
@@ -8007,7 +8007,7 @@ dependencies = [
 [[package]]
 name = "reth-evm"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -8019,7 +8019,7 @@ dependencies = [
  "metrics",
  "reth-execution-errors",
  "reth-execution-types",
- "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner)",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug)",
  "reth-primitives-traits",
  "reth-storage-api",
  "reth-storage-errors",
@@ -8030,7 +8030,7 @@ dependencies = [
 [[package]]
 name = "reth-evm-ethereum"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -8052,7 +8052,7 @@ dependencies = [
 [[package]]
 name = "reth-execution-errors"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-evm",
  "alloy-primitives",
@@ -8065,7 +8065,7 @@ dependencies = [
 [[package]]
 name = "reth-execution-types"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -8083,7 +8083,7 @@ dependencies = [
 [[package]]
 name = "reth-exex"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -8100,7 +8100,7 @@ dependencies = [
  "reth-evm",
  "reth-exex-types",
  "reth-fs-util",
- "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner)",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug)",
  "reth-node-api",
  "reth-node-core",
  "reth-payload-builder",
@@ -8121,7 +8121,7 @@ dependencies = [
 [[package]]
 name = "reth-exex-types"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-eips",
  "alloy-primitives",
@@ -8135,7 +8135,7 @@ dependencies = [
 [[package]]
 name = "reth-fs-util"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "serde",
  "serde_json",
@@ -8145,7 +8145,7 @@ dependencies = [
 [[package]]
 name = "reth-invalid-block-hooks"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",
@@ -8172,7 +8172,7 @@ dependencies = [
 [[package]]
 name = "reth-ipc"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "bytes 1.11.0",
  "futures",
@@ -8192,7 +8192,7 @@ dependencies = [
 [[package]]
 name = "reth-libmdbx"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "bitflags 2.10.0",
  "byteorder",
@@ -8209,7 +8209,7 @@ dependencies = [
 [[package]]
 name = "reth-mdbx-sys"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "bindgen 0.70.1",
  "cc",
@@ -8218,7 +8218,7 @@ dependencies = [
 [[package]]
 name = "reth-metrics"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "futures",
  "metrics",
@@ -8242,7 +8242,7 @@ dependencies = [
 [[package]]
 name = "reth-net-banlist"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-primitives",
 ]
@@ -8250,7 +8250,7 @@ dependencies = [
 [[package]]
 name = "reth-net-nat"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "futures-util",
  "if-addrs",
@@ -8264,7 +8264,7 @@ dependencies = [
 [[package]]
 name = "reth-network"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -8293,7 +8293,7 @@ dependencies = [
  "reth-ethereum-forks",
  "reth-ethereum-primitives",
  "reth-fs-util",
- "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner)",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug)",
  "reth-net-banlist",
  "reth-network-api",
  "reth-network-p2p",
@@ -8319,7 +8319,7 @@ dependencies = [
 [[package]]
 name = "reth-network-api"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",
@@ -8344,7 +8344,7 @@ dependencies = [
 [[package]]
 name = "reth-network-p2p"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -8367,7 +8367,7 @@ dependencies = [
 [[package]]
 name = "reth-network-peers"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -8382,7 +8382,7 @@ dependencies = [
 [[package]]
 name = "reth-network-types"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-eip2124",
  "humantime-serde",
@@ -8396,7 +8396,7 @@ dependencies = [
 [[package]]
 name = "reth-nippy-jar"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "anyhow",
  "bincode",
@@ -8413,7 +8413,7 @@ dependencies = [
 [[package]]
 name = "reth-node-api"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-rpc-types-engine",
  "eyre",
@@ -8437,7 +8437,7 @@ dependencies = [
 [[package]]
 name = "reth-node-builder"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -8506,7 +8506,7 @@ dependencies = [
 [[package]]
 name = "reth-node-core"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -8558,7 +8558,7 @@ dependencies = [
 [[package]]
 name = "reth-node-ethereum"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-eips",
  "alloy-network",
@@ -8596,7 +8596,7 @@ dependencies = [
 [[package]]
 name = "reth-node-ethstats"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",
@@ -8620,7 +8620,7 @@ dependencies = [
 [[package]]
 name = "reth-node-events"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -8644,7 +8644,7 @@ dependencies = [
 [[package]]
 name = "reth-node-metrics"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "eyre",
  "http 1.4.0",
@@ -8654,7 +8654,7 @@ dependencies = [
  "metrics-process",
  "metrics-util",
  "procfs 0.17.0",
- "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner)",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug)",
  "reth-tasks",
  "tikv-jemalloc-ctl",
  "tokio",
@@ -8665,7 +8665,7 @@ dependencies = [
 [[package]]
 name = "reth-node-types"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "reth-chainspec",
  "reth-db-api",
@@ -8677,7 +8677,7 @@ dependencies = [
 [[package]]
 name = "reth-optimism-primitives"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -8696,7 +8696,7 @@ dependencies = [
 [[package]]
 name = "reth-payload-builder"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",
@@ -8705,7 +8705,7 @@ dependencies = [
  "metrics",
  "reth-chain-state",
  "reth-ethereum-engine-primitives",
- "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner)",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug)",
  "reth-payload-builder-primitives",
  "reth-payload-primitives",
  "reth-primitives-traits",
@@ -8717,7 +8717,7 @@ dependencies = [
 [[package]]
 name = "reth-payload-builder-primitives"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "pin-project",
  "reth-payload-primitives",
@@ -8729,7 +8729,7 @@ dependencies = [
 [[package]]
 name = "reth-payload-primitives"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-eips",
  "alloy-primitives",
@@ -8748,7 +8748,7 @@ dependencies = [
 [[package]]
 name = "reth-payload-validator"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-consensus",
  "alloy-rpc-types-engine",
@@ -8758,7 +8758,7 @@ dependencies = [
 [[package]]
 name = "reth-primitives"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-consensus",
  "c-kzg",
@@ -8772,7 +8772,7 @@ dependencies = [
 [[package]]
 name = "reth-primitives-traits"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -8805,7 +8805,7 @@ dependencies = [
 [[package]]
 name = "reth-provider"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -8829,7 +8829,7 @@ dependencies = [
  "reth-evm",
  "reth-execution-types",
  "reth-fs-util",
- "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner)",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug)",
  "reth-nippy-jar",
  "reth-node-types",
  "reth-primitives-traits",
@@ -8851,7 +8851,7 @@ dependencies = [
 [[package]]
 name = "reth-prune"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -8864,7 +8864,7 @@ dependencies = [
  "reth-db-api",
  "reth-errors",
  "reth-exex-types",
- "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner)",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug)",
  "reth-primitives-traits",
  "reth-provider",
  "reth-prune-types",
@@ -8879,7 +8879,7 @@ dependencies = [
 [[package]]
 name = "reth-prune-types"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-primitives",
  "arbitrary",
@@ -8893,7 +8893,7 @@ dependencies = [
 [[package]]
 name = "reth-ress-protocol"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",
@@ -8912,7 +8912,7 @@ dependencies = [
 [[package]]
 name = "reth-ress-provider"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",
@@ -8939,7 +8939,7 @@ dependencies = [
 [[package]]
 name = "reth-revm"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-primitives",
  "reth-primitives-traits",
@@ -8952,7 +8952,7 @@ dependencies = [
 [[package]]
 name = "reth-rpc"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-consensus",
  "alloy-dyn-abi",
@@ -8996,7 +8996,7 @@ dependencies = [
  "reth-evm",
  "reth-evm-ethereum",
  "reth-execution-types",
- "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner)",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug)",
  "reth-network-api",
  "reth-network-peers",
  "reth-network-types",
@@ -9031,7 +9031,7 @@ dependencies = [
 [[package]]
 name = "reth-rpc-api"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-eips",
  "alloy-genesis",
@@ -9059,7 +9059,7 @@ dependencies = [
 [[package]]
 name = "reth-rpc-builder"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-network",
  "alloy-provider",
@@ -9072,7 +9072,7 @@ dependencies = [
  "reth-consensus",
  "reth-evm",
  "reth-ipc",
- "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner)",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug)",
  "reth-network-api",
  "reth-node-core",
  "reth-primitives-traits",
@@ -9097,7 +9097,7 @@ dependencies = [
 [[package]]
 name = "reth-rpc-convert"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-consensus",
  "alloy-json-rpc",
@@ -9117,7 +9117,7 @@ dependencies = [
 [[package]]
 name = "reth-rpc-engine-api"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-eips",
  "alloy-primitives",
@@ -9129,7 +9129,7 @@ dependencies = [
  "parking_lot",
  "reth-chainspec",
  "reth-engine-primitives",
- "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner)",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug)",
  "reth-payload-builder",
  "reth-payload-builder-primitives",
  "reth-payload-primitives",
@@ -9147,7 +9147,7 @@ dependencies = [
 [[package]]
 name = "reth-rpc-eth-api"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-consensus",
  "alloy-dyn-abi",
@@ -9192,7 +9192,7 @@ dependencies = [
 [[package]]
 name = "reth-rpc-eth-types"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -9217,7 +9217,7 @@ dependencies = [
  "reth-ethereum-primitives",
  "reth-evm",
  "reth-execution-types",
- "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner)",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug)",
  "reth-primitives-traits",
  "reth-revm",
  "reth-rpc-convert",
@@ -9239,7 +9239,7 @@ dependencies = [
 [[package]]
 name = "reth-rpc-layer"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-rpc-types-engine",
  "http 1.4.0",
@@ -9253,7 +9253,7 @@ dependencies = [
 [[package]]
 name = "reth-rpc-server-types"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-eips",
  "alloy-primitives",
@@ -9269,7 +9269,7 @@ dependencies = [
 [[package]]
 name = "reth-stages"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -9320,7 +9320,7 @@ dependencies = [
 [[package]]
 name = "reth-stages-api"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-eips",
  "alloy-primitives",
@@ -9330,7 +9330,7 @@ dependencies = [
  "metrics",
  "reth-consensus",
  "reth-errors",
- "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner)",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug)",
  "reth-network-p2p",
  "reth-primitives-traits",
  "reth-provider",
@@ -9347,7 +9347,7 @@ dependencies = [
 [[package]]
 name = "reth-stages-types"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-primitives",
  "arbitrary",
@@ -9361,7 +9361,7 @@ dependencies = [
 [[package]]
 name = "reth-static-file"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-primitives",
  "parking_lot",
@@ -9381,7 +9381,7 @@ dependencies = [
 [[package]]
 name = "reth-static-file-types"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-primitives",
  "clap",
@@ -9393,7 +9393,7 @@ dependencies = [
 [[package]]
 name = "reth-storage-api"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -9416,7 +9416,7 @@ dependencies = [
 [[package]]
 name = "reth-storage-errors"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-eips",
  "alloy-primitives",
@@ -9432,7 +9432,7 @@ dependencies = [
 [[package]]
 name = "reth-tasks"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "auto_impl",
  "dyn-clone",
@@ -9440,7 +9440,7 @@ dependencies = [
  "metrics",
  "pin-project",
  "rayon",
- "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner)",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug)",
  "thiserror 2.0.17",
  "tokio",
  "tracing",
@@ -9450,7 +9450,7 @@ dependencies = [
 [[package]]
 name = "reth-testing-utils"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -9466,7 +9466,7 @@ dependencies = [
 [[package]]
 name = "reth-tokio-util"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "tokio",
  "tokio-stream",
@@ -9476,7 +9476,7 @@ dependencies = [
 [[package]]
 name = "reth-tracing"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "clap",
  "eyre",
@@ -9491,7 +9491,7 @@ dependencies = [
 [[package]]
 name = "reth-transaction-pool"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -9512,7 +9512,7 @@ dependencies = [
  "reth-ethereum-primitives",
  "reth-execution-types",
  "reth-fs-util",
- "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner)",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug)",
  "reth-primitives-traits",
  "reth-storage-api",
  "reth-tasks",
@@ -9532,7 +9532,7 @@ dependencies = [
 [[package]]
 name = "reth-trie"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -9543,7 +9543,7 @@ dependencies = [
  "itertools 0.14.0",
  "metrics",
  "reth-execution-errors",
- "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner)",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug)",
  "reth-primitives-traits",
  "reth-stages-types",
  "reth-storage-errors",
@@ -9557,7 +9557,7 @@ dependencies = [
 [[package]]
 name = "reth-trie-common"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",
@@ -9585,7 +9585,7 @@ dependencies = [
 [[package]]
 name = "reth-trie-db"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-primitives",
  "reth-db-api",
@@ -9599,7 +9599,7 @@ dependencies = [
 [[package]]
 name = "reth-trie-parallel"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -9609,7 +9609,7 @@ dependencies = [
  "rayon",
  "reth-db-api",
  "reth-execution-errors",
- "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner)",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug)",
  "reth-provider",
  "reth-storage-errors",
  "reth-trie",
@@ -9624,7 +9624,7 @@ dependencies = [
 [[package]]
 name = "reth-trie-sparse"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -9633,7 +9633,7 @@ dependencies = [
  "metrics",
  "rayon",
  "reth-execution-errors",
- "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner)",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug)",
  "reth-primitives-traits",
  "reth-trie-common",
  "smallvec",
@@ -9643,7 +9643,7 @@ dependencies = [
 [[package]]
 name = "reth-trie-sparse-parallel"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -9651,7 +9651,7 @@ dependencies = [
  "metrics",
  "rayon",
  "reth-execution-errors",
- "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner)",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug)",
  "reth-trie-common",
  "reth-trie-sparse",
  "smallvec",
@@ -9661,7 +9661,7 @@ dependencies = [
 [[package]]
 name = "reth-zstd-compressors"
 version = "1.7.0"
-source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner#d013cdd59837d146a4f997b452aba520535951e0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug#0e016b3f158ce245bb48be5c625e2d6151d43520"
 dependencies = [
  "zstd",
 ]
@@ -9743,7 +9743,7 @@ dependencies = [
  "reth-evm",
  "reth-evm-ethereum",
  "reth-ipc",
- "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner)",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git?branch=triedb_opt-miner-debug)",
  "reth-network",
  "reth-network-api",
  "reth-network-p2p",
@@ -11487,9 +11487,9 @@ dependencies = [
 
 [[package]]
 name = "time"
-version = "0.3.44"
+version = "0.3.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91e7d9e3bb61134e77bde20dd4825b97c010155709965fedf0f49bb138e52a9d"
+checksum = "f9e442fc33d7fdb45aa9bfeb312c095964abdf596f7567261062b2a7107aaabd"
 dependencies = [
  "deranged",
  "itoa",
@@ -11498,22 +11498,22 @@ dependencies = [
  "num-conv",
  "num_threads",
  "powerfmt",
- "serde",
+ "serde_core",
  "time-core",
  "time-macros",
 ]
 
 [[package]]
 name = "time-core"
-version = "0.1.6"
+version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "40868e7c1d2f0b8d73e4a8c7f0ff63af4f6d19be117e90bd73eb1d62cf831c6b"
+checksum = "8b36ee98fd31ec7426d599183e8fe26932a8dc1fb76ddb6214d05493377d34ca"
 
 [[package]]
 name = "time-macros"
-version = "0.2.24"
+version = "0.2.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "30cfb0125f12d9c277f35663a0a33f8c30190f4e4574868a330595412d34ebf3"
+checksum = "71e552d1249bf61ac2a52db88179fd0673def1e1ad8243a00d9ec9ed71fee3dd"
 dependencies = [
  "num-conv",
  "time-core",
@@ -13158,9 +13158,9 @@ dependencies = [
 
 [[package]]
 name = "zmij"
-version = "1.0.13"
+version = "1.0.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac93432f5b761b22864c774aac244fa5c0fd877678a4c37ebf6cf42208f9c9ec"
+checksum = "bd8f3f50b848df28f887acb68e41201b5aea6bc8a8dacc00fb40635ff9a72fea"
 
 [[package]]
 name = "zstd"

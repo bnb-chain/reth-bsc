@@ -13,58 +13,58 @@ name = "reth-bsc"
 path = "src/main.rs"
 
 [dependencies]
-reth = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner" }
-reth-cli = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner" }
-reth-cli-commands = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner" }
-reth-basic-payload-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner" }
-reth-db = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner" }
-reth-engine-local = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner" }
-reth-engine-tree = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner" }
-reth-node-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner" }
-reth-chainspec = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner" }
-reth-cli-util = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner" }
-reth-discv4 = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner", features = [
+reth = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner-debug" }
+reth-cli = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner-debug" }
+reth-cli-commands = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner-debug" }
+reth-basic-payload-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner-debug" }
+reth-db = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner-debug" }
+reth-engine-local = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner-debug" }
+reth-engine-tree = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner-debug" }
+reth-node-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner-debug" }
+reth-chainspec = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner-debug" }
+reth-cli-util = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner-debug" }
+reth-discv4 = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner-debug", features = [
     "test-utils",
 ] }
-reth-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner" }
-reth-ethereum-forks = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner", features = [
+reth-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner-debug" }
+reth-ethereum-forks = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner-debug", features = [
     "serde",
 ] }
-reth-ethereum-payload-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner" }
-reth-payload-builder-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner" }
-reth-chain-state = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner" }
-reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner" }
-reth-eth-wire = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner" }
-reth-eth-wire-types = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner" }
-reth-evm = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner" }
-reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner" }
-reth-ipc = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner" }
-reth-metrics = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner" }
-reth-node-core = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner" }
-reth-revm = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner" }
-reth-network = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner", features = [
+reth-ethereum-payload-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner-debug" }
+reth-payload-builder-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner-debug" }
+reth-chain-state = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner-debug" }
+reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner-debug" }
+reth-eth-wire = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner-debug" }
+reth-eth-wire-types = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner-debug" }
+reth-evm = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner-debug" }
+reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner-debug" }
+reth-ipc = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner-debug" }
+reth-metrics = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner-debug" }
+reth-node-core = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner-debug" }
+reth-revm = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner-debug" }
+reth-network = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner-debug", features = [
     "test-utils",
 ] }
-reth-network-p2p = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner" }
-reth-network-api = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner" }
-reth-node-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner", features = [
+reth-network-p2p = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner-debug" }
+reth-network-api = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner-debug" }
+reth-node-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner-debug", features = [
     "test-utils",
 ] }
-reth-network-peers = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner" }
-reth-payload-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner" }
-reth-ethereum-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner" }
-reth-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner" }
-reth-primitives-traits = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner" }
-reth-provider = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner", features = [
+reth-network-peers = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner-debug" }
+reth-payload-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner-debug" }
+reth-ethereum-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner-debug" }
+reth-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner-debug" }
+reth-primitives-traits = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner-debug" }
+reth-provider = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner-debug", features = [
     "test-utils",
 ] }
-reth-rpc-eth-api = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner" }
-reth-rpc-engine-api = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner" }
-reth-tracing = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner" }
-reth-trie-common = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner" }
-reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner" }
-reth-tasks = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner" }
-reth-transaction-pool = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner" }
+reth-rpc-eth-api = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner-debug" }
+reth-rpc-engine-api = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner-debug" }
+reth-tracing = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner-debug" }
+reth-trie-common = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner-debug" }
+reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner-debug" }
+reth-tasks = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner-debug" }
+reth-transaction-pool = { git = "https://github.com/bnb-chain/reth.git", branch = "triedb_opt-miner-debug" }
 revm = "29.0.0"
 
 # alloy dependencies
