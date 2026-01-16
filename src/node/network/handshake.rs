@@ -85,6 +85,18 @@ impl EthRlpxHandshake for BscHandshake {
     ) -> Pin<Box<dyn Future<Output = Result<UnifiedStatus, EthStreamError>> + 'a + Send>> {
         Box::pin(async move {
             let fut = async {
+                // Log the exact status we are about to advertise. This is the source of `TD` seen by
+                // geth-bsc during `eth/68` handshake.
+                tracing::debug!(
+                    target: "bsc_handshake",
+                    version = ?status.version,
+                    chain = ?status.chain,
+                    total_difficulty = ?status.total_difficulty,
+                    blockhash = ?status.blockhash,
+                    genesis = ?status.genesis,
+                    forkid = ?status.forkid,
+                    "Sending eth status (UnifiedStatus)"
+                );
                 let negotiated_status =
                     EthereumEthHandshake(unauth).eth_handshake(status, fork_filter).await?;
                 Self::upgrade_status(unauth, negotiated_status).await
