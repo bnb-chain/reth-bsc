@@ -1187,10 +1187,9 @@ where
             self.potential_payloads.push(bid.bsc_payload);
         }
 
-        // sparse_v3-style:
-        // - If in-turn and still no candidates: spawn an empty-payload build into the JoinSet.
+        // If no candidates: spawn an empty-payload build into the JoinSet.
         // - Then wait for the earliest background task to finish (or abort) and proceed immediately.
-        if self.mining_ctx.is_inturn && self.potential_payloads.is_empty() {
+        if self.potential_payloads.is_empty() {
             // Spawn an empty payload build so the "first candidate" wait can pick it up if it wins.
             let builder = self.builder.clone();
             let args = self.build_args.clone();
