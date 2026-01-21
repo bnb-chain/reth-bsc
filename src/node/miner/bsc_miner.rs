@@ -918,6 +918,7 @@ where
             parent_hash = ?parent_hash,
             txs = sealed_block.body().transaction_count(),
             gas_used = sealed_block.gas_used(),
+            build_kind = ?payload.build_kind,
             exec_duration_ms = payload.exec_duration.as_millis(),
             trie_root_duration_ms = payload.trie_root_duration.as_millis(),
             turn_status,
@@ -928,6 +929,12 @@ where
         use crate::metrics::BscMinerMetrics;
         use once_cell::sync::Lazy;
         static MINER_METRICS: Lazy<BscMinerMetrics> = Lazy::new(BscMinerMetrics::default);
+
+        // Count empty-fallback payloads at submission time (this preserves the signal even if the
+        // payload job saw multiple candidates).
+        if payload.build_kind == crate::node::engine::BuildKind::EmptyFallback {
+            MINER_METRICS.empty_fallback_candidates_total.increment(1);
+        }
 
         // Record payload build timings.
         MINER_METRICS

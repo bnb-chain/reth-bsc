@@ -549,6 +549,7 @@ where
             block: sealed_block.clone(),
             fees: bid_runtime.gas_fee,
             requests: Some(execution_result.requests.clone()),
+            build_kind: crate::node::engine::BuildKind::NormalAttempt,
             exec_duration: std::time::Duration::ZERO,
             trie_root_duration: std::time::Duration::ZERO,
             executed_block: ExecutedBlock {

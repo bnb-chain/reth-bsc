@@ -26,6 +26,16 @@ use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info};
 
+/// Distinguishes what kind of payload build produced a [`BscBuiltPayload`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BuildKind {
+    /// A normal build attempt that may include user transactions from the pool.
+    #[default]
+    NormalAttempt,
+    /// An empty-block fallback build (no user transactions; only pre-execution/system changes).
+    EmptyFallback,
+}
+
 /// Built payload for BSC. This is similar to [`EthBuiltPayload`] but without sidecars as those
 /// included into [`BscBlock`].
 #[derive(Debug, Clone, Default)]
@@ -36,6 +46,8 @@ pub struct BscBuiltPayload {
     pub(crate) fees: U256,
     /// The requests of the payload
     pub(crate) requests: Option<Requests>,
+    /// What build path produced this payload.
+    pub build_kind: BuildKind,
     /// Time spent selecting + executing transactions (or pre-execution changes for empty blocks).
     pub exec_duration: Duration,
     /// Time spent computing the trie root (time spent in `finish()` after execution).
