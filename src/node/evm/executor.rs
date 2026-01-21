@@ -472,21 +472,99 @@ where
             self.evm.transact(tx).map_err(|err| BlockExecutionError::evm(err, tx_hash))?;
         let ResultAndState { result, state } = result_and_state;
 
+        {
+            let block_number = self.evm.block().number.to::<u64>();
+            let tx_hash = tx_ref.tx_hash();
+            
+            tracing::info!(
+                "slash debug assemble execute before closure, block_number={}, tx_hash=0x{:x}, receipt_original={:?}",
+                block_number,
+                tx_hash,
+                result.clone(),
+            );
+
+            let receipt_before = self.receipt_builder.build_receipt(ReceiptBuilderCtx {
+                tx: &tx_ref,
+                evm: &self.evm,
+                result: result.clone(),
+                state: &state,
+                cumulative_gas_used: self.gas_used,
+            });
+            // Debug: Log receipt logs for comparison between assembly and validation
+            
+            tracing::info!(
+                "slash debug assemble execute before closure, block_number={}, tx_hash=0x{:x}, receipt={:?}",
+                block_number,
+                tx_hash,
+                receipt_before,
+            );
+        }
+
         f(&result);
+
+        {
+            let receipt_after = self.receipt_builder.build_receipt(ReceiptBuilderCtx {
+                tx: &tx_ref,
+                evm: &self.evm,
+                result: result.clone(),
+                state: &state,
+                cumulative_gas_used: self.gas_used,
+            });
+            // Debug: Log receipt logs for comparison between assembly and validation
+            let block_number = self.evm.block().number.to::<u64>();
+            let tx_hash = tx_ref.tx_hash();
+            tracing::info!(
+                "slash debug assemble execute after closure, block_number={}, tx_hash=0x{:x}, receipt={:?}",
+                block_number,
+                tx_hash,
+                receipt_after,
+            );
+        }
 
         let mut temp_state = state.clone();
         temp_state.remove(&SYSTEM_ADDRESS);
         self.system_caller.on_state(StateChangeSource::Transaction(self.receipts.len()), &temp_state);
 
+        {
+            let receipt_remove = self.receipt_builder.build_receipt(ReceiptBuilderCtx {
+                tx: &tx_ref,
+                evm: &self.evm,
+                result: result.clone(),
+                state: &state,
+                cumulative_gas_used: self.gas_used,
+            });
+            // Debug: Log receipt logs for comparison between assembly and validation
+            let block_number = self.evm.block().number.to::<u64>();
+            let tx_hash = tx_ref.tx_hash();
+            tracing::info!(
+                "slash debug assemble execute after remove system address, block_number={}, tx_hash=0x{:x}, receipt={:?}",
+                block_number,
+                tx_hash,
+                receipt_remove,
+            );
+        }
+
         let gas_used = result.gas_used();
         self.gas_used += gas_used;
-        self.receipts.push(self.receipt_builder.build_receipt(ReceiptBuilderCtx {
+        let receipt = self.receipt_builder.build_receipt(ReceiptBuilderCtx {
             tx: &tx_ref,
             evm: &self.evm,
             result,
             state: &state,
             cumulative_gas_used: self.gas_used,
-        }));
+        });
+        
+        // Debug: Log receipt logs for comparison between assembly and validation
+        let block_number = self.evm.block().number.to::<u64>();
+        let tx_hash = tx_ref.tx_hash();
+        tracing::info!(
+            "slash debug assemble execute, block_number={}, tx_hash=0x{:x}, receipt={:?}",
+            block_number,
+            tx_hash,
+            receipt,
+        );
+        
+        self.receipts.push(receipt);
         self.evm.db_mut().commit(state);
 
         self.hertz_patch_manager.patch_after_tx(&tx_ref, self.evm.db_mut())?;

@@ -226,10 +226,8 @@ impl<ChainSpec: EthChainSpec<Header = Header> + BscHardforks + 'static> FullCons
                 }).collect();
                 
                 tracing::error!(
-                    "slash debug verify_receipts, error={:?}, block_number={}, parent_hash=0x{:x}, header: {:?}, tx_count={}, receipt_count={}, tx_hashes=[{}], receipt_hashes=[{}], receipts=[{}]",
+                    "slash debug verify_receipts, error={:?}, header: {:?}, tx_count={}, receipt_count={}, tx_hashes=[{}], receipt_hashes=[{}], receipts=[{}]",
                     error,
-                    block.header().number,
-                    block.header().parent_hash,
                     block.header(),
                     transactions.len(),
                     receipts.len(),

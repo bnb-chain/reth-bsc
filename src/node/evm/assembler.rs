@@ -191,9 +191,7 @@ where
         }).collect();
 
         info!(
-            "slash debug assemble, block_number={}, parent_hash=0x{:x}, header: {:?}, tx_count={}, receipt_count={}, tx_hashes=[{}], receipt_hashes=[{}], receipts=[{}]",
-            block_number,
-            header.parent_hash,
+            "slash debug assemble, header: {:?}, tx_count={}, receipt_count={}, tx_hashes=[{}], receipt_hashes=[{}], receipts=[{}]",
             header,
             transactions.len(),
             receipts.len(),
