@@ -57,6 +57,18 @@ pub fn generate_trace_id() -> u64 {
     TRACE_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Distinguishes what kind of payload build produced a `BscBuiltPayload`.
+///
+/// This is threaded through the background `JoinSet` so we can unambiguously log whether the
+/// first completed build was an empty fallback or a normal (tx-including) attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildKind {
+    /// A normal build attempt that may include user transactions from the pool.
+    NormalAttempt,
+    /// An empty-block fallback build (no user transactions; only pre-execution/system changes).
+    EmptyFallback,
+}
+
 /// Errors that can occur during payload job execution
 #[derive(Debug, thiserror::Error)]
 pub enum BscPayloadJobError {
@@ -164,7 +176,7 @@ where
     pub async fn build_payload(
         &self,
         args: BscBuildArguments<EthPayloadBuilderAttributes>,
-    ) -> Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(BuildKind, BscBuiltPayload), Box<dyn std::error::Error + Send + Sync>> {
         let build_start = std::time::Instant::now();
         let BscBuildArguments { mut cached_reads, config, cancel, trace_id, min_gas_tip } = args;
         let PayloadConfig { parent_header, attributes } = config;
@@ -588,6 +600,8 @@ where
             block: sealed_block.clone(),
             fees: total_fees,
             requests: Some(execution_result.requests.clone()),
+            exec_duration,
+            trie_root_duration: finalize_elapsed,
             executed_block: ExecutedBlock {
                 recovered_block: Arc::new(block),
                 execution_output: Arc::new(ExecutionOutcome::new(
@@ -601,7 +615,7 @@ where
             executed_trie: Some(ExecutedTrieUpdates::Present(Arc::new(trie_updates))),
             difflayer, // Pass the difflayer to payload, reth will store it
         };
-        Ok(payload)
+        Ok((BuildKind::NormalAttempt, payload))
     }
 
     /// Build an empty payload without any user transactions from the pool
@@ -609,7 +623,7 @@ where
     pub async fn build_empty_payload(
         &self,
         args: BscBuildArguments<EthPayloadBuilderAttributes>,
-    ) -> Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(BuildKind, BscBuiltPayload), Box<dyn std::error::Error + Send + Sync>> {
         let build_start = std::time::Instant::now();
         let BscBuildArguments { mut cached_reads, config, cancel: _, trace_id, min_gas_tip: _ } =
             args;
@@ -700,6 +714,8 @@ where
             block: sealed_block.clone(),
             fees: total_fees,
             requests: Some(execution_result.requests.clone()),
+            exec_duration,
+            trie_root_duration: finalize_elapsed,
             executed_block: ExecutedBlock {
                 recovered_block: Arc::new(block),
                 execution_output: Arc::new(ExecutionOutcome::new(
@@ -713,7 +729,7 @@ where
             executed_trie: Some(ExecutedTrieUpdates::Present(Arc::new(trie_updates))),
             difflayer, // Pass the difflayer to payload, reth will store it
         };
-        Ok(payload)
+        Ok((BuildKind::EmptyFallback, payload))
     }
 }
 
@@ -762,7 +778,9 @@ where
     retries: u32,
     /// JoinSet for managing build tasks
     join_handle:
-        tokio::task::JoinSet<Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>>>,
+        tokio::task::JoinSet<
+            Result<(BuildKind, BscBuiltPayload), Box<dyn std::error::Error + Send + Sync>>,
+        >,
     /// Simulator for bid management (no outer RwLock, each map has its own)
     simulator: Arc<BidSimulator<Client, Pool>>,
     /// Job start time for tracking total duration
@@ -926,7 +944,7 @@ where
                 // Try to join the async payload build task.
                 result = self.join_handle.join_next() => {
                     match result {
-                        Some(Ok(Ok(payload))) => {
+                        Some(Ok(Ok((build_kind, payload)))) => {
                             if self.is_aborted {
                                 return Err(Box::new(BscPayloadJobError::JobAborted));
                             }
@@ -938,6 +956,7 @@ where
                                 block_number = payload.block().header().number(),
                                 block_hash = %payload.block().hash(),
                                 is_inturn = self.mining_ctx.is_inturn,
+                                build_kind = ?build_kind,
                                 tx_count = payload.block().body().transaction_count(),
                                 fees = %payload.fees(),
                                 cost_time = ?elapsed,
@@ -1208,7 +1227,7 @@ where
                         self.is_aborted = true;
                         return Err(Box::new(BscPayloadJobError::JobAborted));
                     }
-                    WaitFirst::Joined(Some(Ok(Ok(payload)))) => {
+                    WaitFirst::Joined(Some(Ok(Ok((build_kind, payload))))) => {
                         let tx_count = payload.block().body().transaction_count();
                         let is_empty_block = tx_count == 0;
                         debug!(
@@ -1217,6 +1236,7 @@ where
                             block_number = payload.block().header().number(),
                             block_hash = %payload.block().hash(),
                             is_inturn = self.mining_ctx.is_inturn,
+                            build_kind = ?build_kind,
                             tx_count,
                             is_empty_block,
                             fees = %payload.fees(),
@@ -1363,6 +1383,8 @@ where
             is_inturn = self.mining_ctx.is_inturn,
             tx_count = best_payload.block().body().transaction_count(),
             fees = %best_payload.fees(),
+            exec_duration_ms = best_payload.exec_duration.as_millis(),
+            trie_root_duration_ms = best_payload.trie_root_duration.as_millis(),
             gas_used = gas_used,
             gas_limit = gas_limit,
             gas_usage_percent = gas_usage_percent,

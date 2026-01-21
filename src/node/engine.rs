@@ -36,6 +36,10 @@ pub struct BscBuiltPayload {
     pub(crate) fees: U256,
     /// The requests of the payload
     pub(crate) requests: Option<Requests>,
+    /// Time spent selecting + executing transactions (or pre-execution changes for empty blocks).
+    pub exec_duration: Duration,
+    /// Time spent computing the trie root (time spent in `finish()` after execution).
+    pub trie_root_duration: Duration,
     /// The executed block
     pub(crate) executed_block: ExecutedBlock<BscPrimitives>,
     /// The executed trie updates

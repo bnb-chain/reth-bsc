@@ -549,6 +549,8 @@ where
             block: sealed_block.clone(),
             fees: bid_runtime.gas_fee,
             requests: Some(execution_result.requests.clone()),
+            exec_duration: std::time::Duration::ZERO,
+            trie_root_duration: std::time::Duration::ZERO,
             executed_block: ExecutedBlock {
                 recovered_block: Arc::new(block.clone()),
                 execution_output: Arc::new(ExecutionOutcome::new(

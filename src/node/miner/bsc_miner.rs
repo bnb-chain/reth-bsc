@@ -918,6 +918,8 @@ where
             parent_hash = ?parent_hash,
             txs = sealed_block.body().transaction_count(),
             gas_used = sealed_block.gas_used(),
+            exec_duration_ms = payload.exec_duration.as_millis(),
+            trie_root_duration_ms = payload.trie_root_duration.as_millis(),
             turn_status,
             "Submitting block"
         );
@@ -926,6 +928,14 @@ where
         use crate::metrics::BscMinerMetrics;
         use once_cell::sync::Lazy;
         static MINER_METRICS: Lazy<BscMinerMetrics> = Lazy::new(BscMinerMetrics::default);
+
+        // Record payload build timings.
+        MINER_METRICS
+            .block_exec_duration_seconds
+            .record(payload.exec_duration.as_secs_f64());
+        MINER_METRICS
+            .block_trie_root_duration_seconds
+            .record(payload.trie_root_duration.as_secs_f64());
 
         let gas_used_mgas = sealed_block.gas_used() as f64 / 1_000_000.0;
         MINER_METRICS.best_work_gas_used_mgas.set(gas_used_mgas);
