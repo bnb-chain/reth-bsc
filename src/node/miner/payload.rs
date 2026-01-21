@@ -1230,6 +1230,13 @@ where
                     WaitFirst::Joined(Some(Ok(Ok((build_kind, payload))))) => {
                         let tx_count = payload.block().body().transaction_count();
                         let is_empty_block = tx_count == 0;
+                        if build_kind == BuildKind::EmptyFallback {
+                            use crate::metrics::BscMinerMetrics;
+                            use once_cell::sync::Lazy;
+                            static MINER_METRICS: Lazy<BscMinerMetrics> =
+                                Lazy::new(BscMinerMetrics::default);
+                            MINER_METRICS.empty_fallback_candidates_total.increment(1);
+                        }
                         debug!(
                             target: "bsc::miner::payload",
                             trace_id = self.trace_id,
@@ -1327,6 +1334,12 @@ where
         } else {
             // No best payload available
             let total_job_duration = self.job_start_time.elapsed();
+            {
+                use crate::metrics::BscMinerMetrics;
+                use once_cell::sync::Lazy;
+                static MINER_METRICS: Lazy<BscMinerMetrics> = Lazy::new(BscMinerMetrics::default);
+                MINER_METRICS.no_best_payload_total.increment(1);
+            }
 
             if self.mining_ctx.is_inturn {
                 warn!(
