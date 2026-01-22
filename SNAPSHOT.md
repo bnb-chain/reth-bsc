@@ -30,10 +30,10 @@ After building, the binary will be located at `./target/maxperf/reth-bsc`.
 
 | Type | Network | File | Size | Special Parameters |
 | ---- | ------- | ---- | ---- | ------------------ |
-| Archive | BSC-MainNet | [reth_static_files_20251126.tar.zst](https://pub-c5400abe5bed4adbaf8cd47467747e74.r2.dev/reth_static_files_20251126.tar.zst) <br> [reth_db_20251126.tar.zst](https://pub-c5400abe5bed4adbaf8cd47467747e74.r2.dev/reth_db_20251126.tar.zst) | 1.828 TiB <br> 2.286 TiB | `--db.max-size=12TB` <br> `--db.page-size=8KB` |
+| Archive | BSC-MainNet | [reth_static_files_20260109.tar.zst](https://pub-c5400abe5bed4adbaf8cd47467747e74.r2.dev/reth_static_files_20260109.tar.zst) <br> [reth_db_20260109.tar.zst](https://pub-c5400abe5bed4adbaf8cd47467747e74.r2.dev/reth_db_20260109.tar.zst) | 1.955 TiB <br> 2.556 TiB | `--db.max-size=12TB` <br> `--db.page-size=8KB` |
 | Archive | BSC-TestNet | [bsc-reth-archivenode-testnet-64665542.tar.gz](https://pub-c0627345c16f47ab858c9469133073a8.r2.dev/bsc-reth-archivenode-testnet-64665542.tar.gz) | 392 GiB | - |
 | Full | BSC-TestNet | [bsc-reth-testnet-63271461.tar.gz](https://pub-c5400abe5bed4adbaf8cd47467747e74.r2.dev/bsc-reth-testnet-63271461.tar.gz) | 232 GiB | - |
-| Full | BSC-MainNet | coming soon | - | - |
+| Full | BSC-MainNet | [reth_full_static_files_20260109.tar.zst](https://pub-c5400abe5bed4adbaf8cd47467747e74.r2.dev/reth_full_static_files_20260109.tar.zst) <br> [reth_full_db_20260109.tar.zst](https://pub-c5400abe5bed4adbaf8cd47467747e74.r2.dev/reth_full_db_20260109.tar.zst) | 1.310 TiB <br> 1.109 TiB | - |
 | Full TrieDB | BSC-TestNet | [75105967_testnet_fullnode.tar.zst](https://pub-c5400abe5bed4adbaf8cd47467747e74.r2.dev/75105967_testnet_fullnode.tar.zst) | 259 GiB | - |
 | Full TrieDB | BSC-MainNet | [69615424_mainnet__fullnode.tar.zst](https://pub-c5400abe5bed4adbaf8cd47467747e74.r2.dev/69615424_mainnet__fullnode.tar.zst) | 2.73 TiB | - |
 | Archive TrieDB | BSC-TestNet | [80135040_testnet_reth_triedb_archive.tar.zst](https://pub-c5400abe5bed4adbaf8cd47467747e74.r2.dev/80135040_testnet_reth_triedb_archive.tar.zst) | 450 GiB | - |
@@ -124,8 +124,8 @@ For single-file snapshots (TestNet Archive, TestNet FullNode):
 ### Requirements
 
 - **Disk Space**: 
-  - MainNet Archive: ~15TB+ free space
-  - MainNet FullNode: ~7TB+ free space
+  - MainNet Archive: ~20TB+ free space
+  - MainNet FullNode: ~8TB+ free space
   - TestNet Archive: ~1.5TB+ free space  
   - TestNet FullNode: ~900GB+ free space
 - **Tools**: `zstd` (for .zst files), `tar`, `gzip` (for .tar.gz files)
