@@ -27,6 +27,7 @@ use reth_evm::{
 use reth_evm_ethereum::RethReceiptBuilder;
 use reth_primitives::{BlockTy, HeaderTy, SealedBlock, SealedHeader, TransactionSigned};
 use reth_revm::State;
+use reth_rpc_eth_api::helpers::pending_block::BuildPendingEnv;
 use revm::{
     context::{BlockEnv, CfgEnv},
     context_interface::block::BlobExcessGasAndPrice,
@@ -34,6 +35,32 @@ use revm::{
     Inspector,
 };
 use std::{borrow::Cow, cell::RefCell, convert::Infallible, rc::Rc, sync::Arc};
+
+/// BSC wrapper around [`NextBlockEnvAttributes`].
+///
+/// This follows the same approach as `sparse_v4`: we keep reth's base attributes unchanged, and
+/// carry extra miner-only data alongside it, while still satisfying upstream RPC trait bounds via
+/// a delegating [`BuildPendingEnv`] implementation.
+#[derive(Debug, Clone)]
+pub struct BscNextBlockEnvAttributes {
+    pub inner: NextBlockEnvAttributes,
+    /// Parent difflayers (from engine tree), used by triedb state root calculation and miner-side
+    /// triedb prefetcher.
+    pub parent_difflayers: Option<rust_eth_triedb_common::DiffLayers>,
+    /// Miner-side triedb prefetcher handle. This is started before execution and consumed in
+    /// `finish()` to obtain `prefetch_state` for triedb root calculation.
+    pub triedb_prefetcher: Option<crate::node::evm::MinerTrieDbPrefetcher>,
+}
+
+impl<H: BlockHeader> BuildPendingEnv<H> for BscNextBlockEnvAttributes {
+    fn build_pending_env(parent: &SealedHeader<H>) -> Self {
+        Self {
+            inner: NextBlockEnvAttributes::build_pending_env(parent),
+            parent_difflayers: None,
+            triedb_prefetcher: None,
+        }
+    }
+}
 
 /// Type alias for system transactions to reduce complexity
 type SystemTxs =
@@ -77,6 +104,11 @@ pub struct BscBlockExecutionCtx<'a> {
     pub header: Option<Header>,
     /// Whether the block is being mined.
     pub is_miner: bool,
+    /// Parent difflayers (from engine tree), used by triedb state root calculation and miner-side
+    /// triedb prefetcher.
+    pub parent_difflayers: Option<rust_eth_triedb_common::DiffLayers>,
+    /// Miner-side triedb prefetcher handle (consumed in `finish()`).
+    pub triedb_prefetcher: Option<crate::node::evm::MinerTrieDbPrefetcher>,
 }
 
 impl<'a> BscBlockExecutionCtx<'a> {
@@ -207,7 +239,7 @@ where
 {
     type Primitives = BscPrimitives;
     type Error = Infallible;
-    type NextBlockEnvCtx = NextBlockEnvAttributes;
+    type NextBlockEnvCtx = BscNextBlockEnvAttributes;
     type BlockExecutorFactory = BscBlockExecutorFactory;
     type BlockAssembler = BscBlockAssembler<BscChainSpec>;
 
@@ -277,6 +309,7 @@ where
         parent: &Header,
         attributes: &Self::NextBlockEnvCtx,
     ) -> Result<EvmEnv<BscHardfork>, Self::Error> {
+        let attributes = &attributes.inner;
         // ensure we're not missing any timestamp based hardforks
         let spec_id = revm_spec_by_timestamp_and_block_number(
             self.chain_spec().clone(),
@@ -355,6 +388,8 @@ where
             },
             header: Some(block.header().clone()),
             is_miner: false,
+            parent_difflayers: None,
+            triedb_prefetcher: None,
         }
     }
 
@@ -371,12 +406,14 @@ where
         BscBlockExecutionCtx {
             base: EthBlockExecutionCtx {
                 parent_hash: parent.hash(),
-                parent_beacon_block_root: attributes.parent_beacon_block_root,
+                parent_beacon_block_root: attributes.inner.parent_beacon_block_root,
                 ommers: &[],
-                withdrawals: attributes.withdrawals.map(Cow::Owned),
+                withdrawals: attributes.inner.withdrawals.map(Cow::Owned),
             },
             header: None, // No header available for next block context
             is_miner: true,
+            parent_difflayers: attributes.parent_difflayers,
+            triedb_prefetcher: attributes.triedb_prefetcher,
         }
     }
 
@@ -398,7 +435,14 @@ where
         let shared_ctx = BscExecutionSharedCtx::default();
         let bsc_executor = BscBlockExecutor::new(
             evm,
-            ctx.clone(),
+            {
+                // Avoid cloning miner-only helpers into the executor context. The block builder keeps
+                // the full ctx and consumes these in `finish()`.
+                let mut exec_ctx = ctx.clone();
+                exec_ctx.parent_difflayers = None;
+                exec_ctx.triedb_prefetcher = None;
+                exec_ctx
+            },
             shared_ctx.clone(),
             self.executor_factory.spec().clone(),
             *self.executor_factory.receipt_builder(),
@@ -428,6 +472,8 @@ where
             },
             header: Some(block.header.clone()),
             is_miner: false,
+            parent_difflayers: None,
+            triedb_prefetcher: None,
         }
     }
 

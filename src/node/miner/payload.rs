@@ -4,12 +4,14 @@ use crate::consensus::parlia::Parlia;
 use crate::evm::blacklist;
 use crate::hardforks::BscHardforks;
 use crate::node::engine::{BscBuiltPayload, BuildKind};
-use crate::node::evm::config::BscEvmConfig;
+use crate::node::evm::config::{BscEvmConfig, BscNextBlockEnvAttributes};
+use crate::node::evm::{request_difflayer, MinerTrieDbPrefetcher};
 use crate::node::miner::bid_simulator::BidSimulator;
 use crate::node::miner::bsc_miner::{MiningContext, SubmitContext};
 use crate::node::pool::BlacklistedAddressError;
 use crate::node::primitives::BscBlobTransactionSidecar;
 use alloy_consensus::{BlockHeader, Transaction};
+use alloy_evm::block::BlockExecutor;
 use alloy_evm::Evm;
 use alloy_primitives::U256;
 use reth::payload::EthPayloadBuilderAttributes;
@@ -36,7 +38,9 @@ use reth_primitives_traits::{BlockBody, SignerRecoverable};
 use reth_provider::StateProviderFactory;
 use reth_revm::cached::CachedReads;
 use reth_revm::cancelled::ManualCancel;
+use reth_revm::state::EvmState as RethEvmState;
 use reth_revm::{database::StateProviderDatabase, db::State};
+use rust_eth_triedb::get_global_triedb;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -125,7 +129,7 @@ pub struct BscPayloadBuilder<Pool, Client, EvmConfig = BscEvmConfig> {
 impl<Pool, Client, EvmConfig> BscPayloadBuilder<Pool, Client, EvmConfig>
 where
     Client: StateProviderFactory + 'static,
-    EvmConfig: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
+    EvmConfig: ConfigureEvm<NextBlockEnvCtx = BscNextBlockEnvAttributes> + 'static,
     <EvmConfig as ConfigureEvm>::Primitives: reth_primitives_traits::NodePrimitives<
         BlockHeader = alloy_consensus::Header,
         SignedTx = alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip4844>,
@@ -169,6 +173,40 @@ where
         let BscBuildArguments { mut cached_reads, config, cancel, trace_id, min_gas_tip } = args;
         let PayloadConfig { parent_header, attributes } = config;
 
+        // If triedb is active, fetch parent difflayers *before* creating the block builder.
+        //
+        // Important: the block builder is not `Send`, and this function is spawned onto a tokio
+        // JoinSet. Therefore we must not hold the builder across any `.await`.
+        let parent_hash = parent_header.hash_slow();
+        let triedb_parent_difflayers = if rust_eth_triedb::triedb_manager::is_triedb_active() {
+            match crate::shared::get_engine_api_tx() {
+                Some(engine_api_tx) => match request_difflayer(&engine_api_tx, parent_hash).await {
+                    Ok(difflayers) => Some(difflayers),
+                    Err(e) => {
+                        warn!(
+                            target: "payload_builder",
+                            trace_id,
+                            parent_hash = ?parent_hash,
+                            error = %e,
+                            "Failed to request parent difflayers for triedb prefetcher, continuing without prefetcher"
+                        );
+                        None
+                    }
+                },
+                None => {
+                    warn!(
+                        target: "payload_builder",
+                        trace_id,
+                        parent_hash = ?parent_hash,
+                        "Engine api tx not found; aborting payload build (triedb active)"
+                    );
+                    return Err(Box::new(std::io::Error::other("engine api tx not found")));
+                }
+            }
+        } else {
+            None
+        };
+
         let state_provider = self.client.state_by_block_hash(parent_header.hash_slow())?;
         let state = StateProviderDatabase::new(&state_provider);
         let mut db = State::builder()
@@ -176,21 +214,51 @@ where
             .with_bundle_update()
             .build();
 
+        // Build triedb prefetcher before creating the block builder so it can be carried via the
+        // custom next-block env ctx into the execution ctx and consumed in `finish()`.
+        let triedb_prefetcher = triedb_parent_difflayers.clone().and_then(|difflayers| {
+            let mut triedb = get_global_triedb();
+            let path_db = triedb.get_mut_path_db_ref().clone();
+            MinerTrieDbPrefetcher::new(parent_header.state_root(), path_db, Some(difflayers)).ok()
+        });
+
+        let next_env_attributes = BscNextBlockEnvAttributes {
+            inner: NextBlockEnvAttributes {
+                timestamp: attributes.timestamp(),
+                suggested_fee_recipient: attributes.suggested_fee_recipient(),
+                prev_randao: attributes.prev_randao(),
+                gas_limit: self.builder_config.gas_limit(parent_header.gas_limit),
+                parent_beacon_block_root: attributes.parent_beacon_block_root(),
+                withdrawals: Some(attributes.withdrawals().clone()),
+            },
+            parent_difflayers: triedb_parent_difflayers.clone(),
+            triedb_prefetcher: triedb_prefetcher.clone(),
+        };
+
         let mut builder = self
             .evm_config
-            .builder_for_next_block(
-                &mut db,
-                &parent_header,
-                NextBlockEnvAttributes {
-                    timestamp: attributes.timestamp(),
-                    suggested_fee_recipient: attributes.suggested_fee_recipient(),
-                    prev_randao: attributes.prev_randao(),
-                    gas_limit: self.builder_config.gas_limit(parent_header.gas_limit),
-                    parent_beacon_block_root: attributes.parent_beacon_block_root(),
-                    withdrawals: Some(attributes.withdrawals().clone()),
-                },
-            )
+            .builder_for_next_block(&mut db, &parent_header, next_env_attributes)
             .map_err(PayloadBuilderError::other)?;
+
+        // Wire miner triedb prefetcher via state hook (if enabled).
+        //
+        // NOTE: This must be set before `apply_pre_execution_changes()` so any state access/touches
+        // performed during pre-execution are also prefetched.
+        if let Some(prefetcher) = triedb_prefetcher.clone() {
+            let pf = prefetcher.clone();
+            builder
+                .executor_mut()
+                .set_state_hook(Some(Box::new(move |_, update: &RethEvmState| {
+                    pf.on_state_update(update);
+                })));
+            debug!(
+                target: "payload_builder",
+                trace_id,
+                parent_hash = ?parent_hash,
+                "Started triedb prefetcher for miner payload build"
+            );
+        }
+
         builder.apply_pre_execution_changes().map_err(|err| {
             warn!(
                 target: "payload_builder",
@@ -453,7 +521,9 @@ where
                     continue;
                 }
                 // this is an error that we should treat as fatal for this attempt
-                Err(err) => return Err(Box::new(PayloadBuilderError::evm(err))),
+                Err(err) => {
+                    return Err(Box::new(std::io::Error::other(err.to_string())));
+                }
             };
 
             // add to the total blob gas used if the transaction successfully executed
@@ -479,8 +549,8 @@ where
                     trace_id,
                     block_number = parent_header.number() + 1,
                     tx = ?tx.hash(),
-                    gas_used,
-                    cumulative_gas_used,
+                    gas_used = ?gas_used,
+                    cumulative_gas_used = ?cumulative_gas_used,
                     duration_micros = tx_duration.as_micros(),
                     "Transaction executed successfully (slow)"
                 );
@@ -490,8 +560,8 @@ where
                     trace_id,
                     block_number = parent_header.number() + 1,
                     tx = ?tx.hash(),
-                    gas_used,
-                    cumulative_gas_used,
+                    gas_used = ?gas_used,
+                    cumulative_gas_used = ?cumulative_gas_used,
                     duration_micros = tx_duration.as_micros(),
                     "Transaction executed successfully"
                 );
@@ -573,7 +643,7 @@ where
                     inner: sidecar.as_eip4844().unwrap().clone(),
                     block_number: sealed_block.header().number(),
                     block_hash: sealed_block.hash(),
-                    tx_index: index as u64,
+                    tx_index: u64::try_from(index).unwrap_or(u64::MAX),
                     tx_hash: *tx.hash(),
                 };
                 blob_sidecars.push(bsc_blob_tx_sidecar);
@@ -618,6 +688,40 @@ where
             args;
         let PayloadConfig { parent_header, attributes } = config;
 
+        // If triedb is active, fetch parent difflayers *before* creating the block builder.
+        //
+        // Important: the block builder is not `Send`, and this function may be spawned onto a tokio
+        // JoinSet. Therefore we must not hold the builder across any `.await`.
+        let parent_hash = parent_header.hash_slow();
+        let triedb_parent_difflayers = if rust_eth_triedb::triedb_manager::is_triedb_active() {
+            match crate::shared::get_engine_api_tx() {
+                Some(engine_api_tx) => match request_difflayer(&engine_api_tx, parent_hash).await {
+                    Ok(difflayers) => Some(difflayers),
+                    Err(e) => {
+                        warn!(
+                            target: "payload_builder",
+                            trace_id,
+                            parent_hash = ?parent_hash,
+                            error = %e,
+                            "Failed to request parent difflayers for triedb prefetcher (empty payload), continuing without prefetcher"
+                        );
+                        None
+                    }
+                },
+                None => {
+                    warn!(
+                        target: "payload_builder",
+                        trace_id,
+                        parent_hash = ?parent_hash,
+                        "Engine api tx not found; aborting empty payload build (triedb active)"
+                    );
+                    return Err(Box::new(std::io::Error::other("engine api tx not found")));
+                }
+            }
+        } else {
+            None
+        };
+
         let state_provider = self.client.state_by_block_hash(parent_header.hash_slow())?;
         let state = StateProviderDatabase::new(&state_provider);
         let mut db = State::builder()
@@ -625,21 +729,52 @@ where
             .with_bundle_update()
             .build();
 
+        // Build triedb prefetcher before creating the block builder so it can be carried via the
+        // custom next-block env ctx into the execution ctx and consumed in `finish()`.
+        let triedb_prefetcher = triedb_parent_difflayers.clone().and_then(|difflayers| {
+            let mut triedb = get_global_triedb();
+            let path_db = triedb.get_mut_path_db_ref().clone();
+            MinerTrieDbPrefetcher::new(parent_header.state_root(), path_db, Some(difflayers)).ok()
+        });
+
         let mut builder = self
             .evm_config
             .builder_for_next_block(
                 &mut db,
                 &parent_header,
-                NextBlockEnvAttributes {
-                    timestamp: attributes.timestamp(),
-                    suggested_fee_recipient: attributes.suggested_fee_recipient(),
-                    prev_randao: attributes.prev_randao(),
-                    gas_limit: self.builder_config.gas_limit(parent_header.gas_limit),
-                    parent_beacon_block_root: attributes.parent_beacon_block_root(),
-                    withdrawals: Some(attributes.withdrawals().clone()),
+                BscNextBlockEnvAttributes {
+                    inner: NextBlockEnvAttributes {
+                        timestamp: attributes.timestamp(),
+                        suggested_fee_recipient: attributes.suggested_fee_recipient(),
+                        prev_randao: attributes.prev_randao(),
+                        gas_limit: self.builder_config.gas_limit(parent_header.gas_limit),
+                        parent_beacon_block_root: attributes.parent_beacon_block_root(),
+                        withdrawals: Some(attributes.withdrawals().clone()),
+                    },
+                    parent_difflayers: triedb_parent_difflayers.clone(),
+                    triedb_prefetcher: triedb_prefetcher.clone(),
                 },
             )
             .map_err(PayloadBuilderError::other)?;
+
+        // Wire miner triedb prefetcher via state hook (if enabled).
+        //
+        // NOTE: This must be set before `apply_pre_execution_changes()` so any state access/touches
+        // performed during pre-execution are also prefetched.
+        if let Some(prefetcher) = triedb_prefetcher.clone() {
+            let pf = prefetcher.clone();
+            builder
+                .executor_mut()
+                .set_state_hook(Some(Box::new(move |_, update: &RethEvmState| {
+                    pf.on_state_update(update);
+                })));
+            debug!(
+                target: "payload_builder",
+                trace_id,
+                parent_hash = ?parent_hash,
+                "Started triedb prefetcher for miner empty payload build"
+            );
+        }
 
         // Total time spent executing pre-execution changes (no user txs for empty payloads).
         let exec_start = std::time::Instant::now();
@@ -788,7 +923,7 @@ where
         + reth_provider::BlockHashReader
         + Clone
         + 'static,
-    EvmConfig: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
+    EvmConfig: ConfigureEvm<NextBlockEnvCtx = BscNextBlockEnvAttributes> + 'static,
     <EvmConfig as ConfigureEvm>::Primitives: reth_primitives_traits::NodePrimitives<
         BlockHeader = alloy_consensus::Header,
         SignedTx = alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip4844>,
@@ -877,7 +1012,7 @@ where
     }
 
     /// Runs the payload job asynchronously with timeout support
-    pub async fn start(mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn start(mut self) -> Result<(), Box<BscPayloadJobError>> {
         let mut start_time = std::time::Instant::now();
         if let Err(err) = self.try_build_tx.send(()) {
             warn!(
@@ -1168,7 +1303,7 @@ where
     }
 
     /// Try to return the best payload to result channel
-    fn try_return_best_payload(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    fn try_return_best_payload(&mut self) -> Result<(), Box<BscPayloadJobError>> {
         let mut bid_block_hash = None;
         let best_bid = self.simulator.get_best_bid(self.mining_ctx.parent_header.hash());
         if let Some(bid) = best_bid {

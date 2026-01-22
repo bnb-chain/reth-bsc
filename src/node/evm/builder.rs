@@ -128,6 +128,8 @@ where
         // Use triedb to calculate state root
         let (state_root, trie_updates) = if rust_eth_triedb::triedb_manager::is_triedb_active() {
             let mut triedb = get_global_triedb();
+            // Miner-side: try to use triedb prefetcher + parent difflayers from execution ctx.
+            let prefetch_state = self.ctx.triedb_prefetcher.take().and_then(|p| p.finish());
             // Access parent state root through the header
             // SealedHeader derefs to the inner header which has state_root()
             let parent_state_root = (**self.parent).state_root();
@@ -140,43 +142,8 @@ where
             // Convert hashed state to triedb format
             let trie_hashed_state = hashed_state.to_triedb_hashed_post_state();
 
-            let engine_api_tx = match crate::shared::get_engine_api_tx() {
-                Some(tx) => tx,
-                None => {
-                    return Err(BlockExecutionError::other(std::io::Error::other(
-                        "engine api not found",
-                    )))
-                }
-            };
-            let difflayer_task = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                let fut = async { request_difflayer(&engine_api_tx, self.parent.hash()).await };
-                tokio::task::block_in_place(|| handle.block_on(fut))
-            } else {
-                tracing::warn!(
-                    target: "bsc::builder",
-                    parent_hash = %self.parent.hash(),
-                    block_number = %(self.parent.number + 1),
-                    "Tokio runtime not found, continuing without parent difflayers"
-                );
-                Err(BSCEngineMessageError::internal(std::io::Error::other(
-                    "tokio runtime not found",
-                )))
-            };
-
-            // Try to get difflayers, but continue with None if failed
-            let difflayers_opt = match difflayer_task {
-                Ok(difflayers) => Some(difflayers),
-                Err(e) => {
-                    tracing::warn!(
-                        target: "bsc::builder",
-                        parent_hash = %self.parent.hash(),
-                        block_number = %(self.parent.number + 1),
-                        error = %e,
-                        "Failed to request parent difflayers, continuing without them"
-                    );
-                    None
-                }
-            };
+            // Keep it simple: miner must provide parent difflayers via execution ctx.
+            let difflayers_opt = self.ctx.parent_difflayers.as_ref();
 
             // Calculate state root using triedb
             // Pass parent difflayers from engine tree to get correct state root
@@ -184,9 +151,9 @@ where
             let (new_root, new_difflayer) = triedb
                 .intermediate_and_commit_hashed_post_state(
                     parent_state_root,
-                    difflayers_opt.as_ref(),
+                    difflayers_opt,
                     &trie_hashed_state,
-                    None, // No prefetch state
+                    prefetch_state,
                 )
                 .map_err(BlockExecutionError::other)?;
 
