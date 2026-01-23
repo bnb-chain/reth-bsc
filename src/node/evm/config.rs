@@ -78,9 +78,6 @@ pub struct BscExecutionSharedCtxInner {
     pub turn_length: Option<u8>,
     /// assembled system txs.
     pub assembled_system_txs: SystemTxs,
-    /// diff layer computed during block execution
-    /// This is stored here to pass from BscBlockBuilder to payload builder
-    pub difflayer: Option<Arc<rust_eth_triedb_common::DiffLayer>>,
 }
 
 #[derive(Debug, Clone)]

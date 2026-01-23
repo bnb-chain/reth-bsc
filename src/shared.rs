@@ -624,42 +624,8 @@ pub fn get_engine_api_tx() -> Option<EngineApiTx<NodeAdapter<BscNode>>> {
     ENGINE_API_TX.get().cloned()
 }
 
-/// Type alias for the difflayer cache to reduce complexity
-type DiffLayerCache = parking_lot::RwLock<
-    schnellru::LruMap<(B256, u64), Arc<rust_eth_triedb_common::DiffLayer>, schnellru::ByLength>,
->;
-
-/// Global storage for difflayers computed during payload building
-/// Maps parent_hash + block_number to the computed difflayer
-/// This ensures correct association even when multiple payloads are built concurrently
-static DIFFLAYER_CACHE: OnceLock<DiffLayerCache> = OnceLock::new();
-
-fn get_difflayer_cache() -> &'static DiffLayerCache {
-    DIFFLAYER_CACHE.get_or_init(|| {
-        parking_lot::RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new(128)))
-    })
-}
-
-/// Store a difflayer for a specific block (identified by parent_hash + block_number)
-pub fn set_difflayer_for_block(
-    parent_hash: B256,
-    block_number: u64,
-    difflayer: Arc<rust_eth_triedb_common::DiffLayer>,
-) {
-    let cache = get_difflayer_cache();
-    let mut cache = cache.write();
-    cache.insert((parent_hash, block_number), difflayer);
-}
-
-/// Retrieve and remove a difflayer for a specific block
-pub fn take_difflayer_for_block(
-    parent_hash: B256,
-    block_number: u64,
-) -> Option<Arc<rust_eth_triedb_common::DiffLayer>> {
-    let cache = get_difflayer_cache();
-    let mut cache = cache.write();
-    cache.remove(&(parent_hash, block_number))
-}
+// Note: difflayers are now returned directly from the BSC block builder (`finish_bsc`) and carried
+// through `BscBuiltPayload` / `ExecutedBlockWithTrieUpdates`. We no longer use a global cache.
 
 #[cfg(test)]
 mod tests {

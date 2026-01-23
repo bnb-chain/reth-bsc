@@ -576,13 +576,9 @@ where
 
         // add system txs to payload.
         let finalize_start = std::time::Instant::now();
-        let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } =
-            builder.finish(&state_provider)?;
-
-        // Retrieve the difflayer using parent_hash + block_number as key
-        // This ensures correct association even when multiple payloads are built concurrently
-        let block_number = parent_header.number + 1;
-        let difflayer = crate::shared::take_difflayer_for_block(parent_header.hash(), block_number);
+        let out = builder.finish_with_difflayer(&state_provider)?;
+        let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } = out.inner;
+        let difflayer = out.difflayer;
 
         let mut sealed_block = Arc::new(block.sealed_block().clone());
 
@@ -797,14 +793,10 @@ where
 
         // Add system txs to payload and finalize
         let finalize_start = std::time::Instant::now();
-        let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } =
-            builder.finish(&state_provider)?;
+        let out = builder.finish_with_difflayer(&state_provider)?;
+        let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } = out.inner;
+        let difflayer = out.difflayer;
         let finalize_elapsed = finalize_start.elapsed();
-
-        // Retrieve the difflayer using parent_hash + block_number as key
-        // This ensures correct association even when multiple payloads are built concurrently
-        let block_number = parent_header.number + 1;
-        let difflayer = crate::shared::take_difflayer_for_block(parent_header.hash(), block_number);
 
         let sealed_block = Arc::new(block.sealed_block().clone());
 

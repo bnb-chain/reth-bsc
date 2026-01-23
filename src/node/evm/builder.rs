@@ -19,12 +19,16 @@ use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
 use reth_engine_primitives::BSCEngineMessageError;
 use reth_engine_tree::engine::EngineApiRequest;
 use reth_engine_tree::tree::CustomRequestMessage;
-use reth_evm::execute::{BlockBuilder, BlockBuilderOutcome, BlockExecutionError, ExecutorTx};
+use reth_evm::execute::{
+    BlockBuilder, BlockBuilderOutcome, BlockBuilderOutcomeWithDiffLayer, BlockExecutionError,
+    ExecutorTx,
+};
 use reth_node_builder::rpc::EngineApiTx;
 use reth_primitives_traits::{
     HeaderTy, NodePrimitives, Recovered, RecoveredBlock, SealedHeader, SignerRecoverable, TxTy,
 };
 use reth_provider::StateProvider;
+use reth_trie_common::updates::TrieUpdates;
 use revm::database::{states::bundle_state::BundleRetention, State};
 use rust_eth_triedb::get_global_triedb;
 use rust_eth_triedb_common::DiffLayers;
@@ -110,9 +114,16 @@ where
 
     // fetch assembled_system_txs and add into sealed block.
     fn finish(
-        mut self,
+        self,
         state: impl StateProvider,
     ) -> Result<BlockBuilderOutcome<BscPrimitives>, BlockExecutionError> {
+        Ok(self.finish_with_difflayer(state)?.inner)
+    }
+
+    fn finish_with_difflayer(
+        mut self,
+        state: impl StateProvider,
+    ) -> Result<BlockBuilderOutcomeWithDiffLayer<BscPrimitives>, BlockExecutionError> {
         let finish_start = std::time::Instant::now();
         let (evm, result) = self.executor.finish()?;
         let (db, evm_env) = evm.finish();
@@ -126,27 +137,14 @@ where
         let hashed_state = state.hashed_post_state(&db.bundle_state);
 
         // Use triedb to calculate state root
-        let (state_root, trie_updates) = if rust_eth_triedb::triedb_manager::is_triedb_active() {
+        let (state_root, trie_updates, produced_difflayer) = if rust_eth_triedb::triedb_manager::is_triedb_active() {
             let mut triedb = get_global_triedb();
             // Miner-side: try to use triedb prefetcher + parent difflayers from execution ctx.
             let prefetch_state = self.ctx.triedb_prefetcher.take().and_then(|p| p.finish());
-            // Access parent state root through the header
-            // SealedHeader derefs to the inner header which has state_root()
             let parent_state_root = (**self.parent).state_root();
-            tracing::debug!(
-                target: "bsc::builder",
-                parent_state_root = %parent_state_root,
-                parent_hash = %self.parent.hash(),
-                "Parent state root and hash",
-            );
-            // Convert hashed state to triedb format
             let trie_hashed_state = hashed_state.to_triedb_hashed_post_state();
-
-            // Keep it simple: miner must provide parent difflayers via execution ctx.
             let difflayers_opt = self.ctx.parent_difflayers.as_ref();
 
-            // Calculate state root using triedb
-            // Pass parent difflayers from engine tree to get correct state root
             let triedb_calc_started = std::time::Instant::now();
             let (new_root, new_difflayer) = triedb
                 .intermediate_and_commit_hashed_post_state(
@@ -177,17 +175,11 @@ where
                 "Calculated state root using triedb"
             );
 
-            // Store the new difflayer with parent_hash + block_number as key
-            // This ensures correct association even when multiple payloads are built concurrently
-            let block_number = self.parent.number + 1;
-            crate::shared::set_difflayer_for_block(self.parent.hash(), block_number, new_difflayer);
-
-            (new_root, Default::default())
+            (new_root, TrieUpdates::default(), Some(new_difflayer))
         } else {
-            // Fallback to original method if triedb is not active
-            state
-                .state_root_with_updates(hashed_state.clone())
-                .map_err(BlockExecutionError::other)?
+            let (root, updates) =
+                state.state_root_with_updates(hashed_state.clone()).map_err(BlockExecutionError::other)?;
+            (root, updates, None)
         };
         let state_root_duration = state_root_start.elapsed();
 
@@ -199,8 +191,6 @@ where
         let (transactions, senders): (Vec<_>, Vec<_>) =
             self.transactions.into_iter().map(|tx| tx.into_parts()).unzip();
 
-        // BlockAssemblerInput is non_exhaustive.
-        // So define a new struct BscBlockAssemblerInput and a new interface assemble_block_bsc.
         let bsc_input: BscBlockAssemblerInput<'_, '_, BscBlockExecutorFactory> =
             BscBlockAssemblerInput {
                 evm_env,
@@ -222,19 +212,9 @@ where
                 .lock()
                 .unwrap()
                 .insert(block.header.hash_slow(), (validators, vote_addresses));
-            tracing::debug!(
-                "Succeed to update validator cache in builder, block_number: {}, block_hash: {}",
-                block.header.number,
-                block.header.hash_slow()
-            );
         }
         if let Some(turn_length) = self.shared_ctx.inner.borrow().turn_length {
             TURN_LENGTH_CACHE.lock().unwrap().insert(block.header.hash_slow(), turn_length);
-            tracing::debug!(
-                "Succeed to update turn length cache in builder, block_number: {}, block_hash: {}",
-                block.header.number,
-                block.header.hash_slow()
-            );
         }
         let assemble_duration = assemble_start.elapsed();
 
@@ -253,7 +233,10 @@ where
         );
 
         let block = RecoveredBlock::new_unhashed(block, senders);
-        Ok(BlockBuilderOutcome { execution_result: result, hashed_state, trie_updates, block })
+        Ok(BlockBuilderOutcomeWithDiffLayer {
+            inner: BlockBuilderOutcome { execution_result: result, hashed_state, trie_updates, block },
+            difflayer: produced_difflayer,
+        })
     }
 
     fn executor_mut(&mut self) -> &mut Self::Executor {

@@ -507,15 +507,16 @@ where
             return;
         }
 
-        // Finish the builder
-        let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } =
-            match builder.finish(&state_provider).map_err(PayloadBuilderError::other) {
-                Ok(outcome) => outcome,
-                Err(e) => {
-                    debug!("Failed to finish builder: {:?}", e);
-                    return;
-                }
-            };
+        // Finish the builder (also returns triedb difflayer when enabled)
+        let out = match builder.finish_with_difflayer(&state_provider).map_err(PayloadBuilderError::other) {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                debug!("Failed to finish builder: {:?}", e);
+                return;
+            }
+        };
+        let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } = out.inner;
+        let difflayer = out.difflayer;
         let mut sealed_block = Arc::new(block.sealed_block().clone());
 
         // Check if any un_revertible transaction failed
@@ -544,10 +545,6 @@ where
         let mut plain = sealed_block.clone_block();
         plain.body.sidecars = Some(bid_runtime.blob_sidecars.clone());
         sealed_block = Arc::new(plain.into());
-
-        // Retrieve the difflayer from global cache, same as miner
-        let block_number = parent_header.number + 1;
-        let difflayer = crate::shared::take_difflayer_for_block(parent_header.hash(), block_number);
 
         bid_runtime.bsc_payload = BscBuiltPayload {
             block: sealed_block.clone(),
