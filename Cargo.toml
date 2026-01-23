@@ -228,5 +228,12 @@ inherits = "release"
 lto = "fat"
 codegen-units = 1
 
+[build-dependencies]
+# Pin vergen to a 9.0.x release to avoid pulling `vergen` 9.1.x (which uses `vergen-lib` 9.x) while
+# `vergen-git2` 1.0.x still depends on `vergen-lib` 0.1.x. Otherwise reth's build scripts can fail
+# with a `vergen_lib::entries::Add` trait mismatch.
+vergen = "=9.0.6"
+vergen-git2 = "=1.0.7"
+
 [dev-dependencies]
 uuid = { version = "1", features = ["v4"] }
