@@ -48,7 +48,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, trace, warn};
 
 /// Delay left over for mining calculation
-pub const DELAY_LEFT_OVER: u64 = 50;
+pub const DELAY_LEFT_OVER: u64 = 100; // triedb root is not stable.
 
 /// Time multiplier for retry condition check
 const TIME_MULTIPLIER: u32 = 2;
