@@ -1432,7 +1432,16 @@ where
                 }
 
                 // Remaining time we can still spend waiting for background builds.
-                let remaining_ms = (self.expected_end_timestamp_ms - now_ms) as u64;
+                let try_mine_block_number = self.build_args.config.parent_header.number() + 1;
+                let remaining_ms = if self
+                    .mining_ctx
+                    .parent_snapshot
+                    .last_block_in_one_turn(try_mine_block_number)
+                {
+                    (self.expected_end_timestamp_ms - now_ms) as u64
+                } else {
+                    ((self.expected_end_timestamp_ms - now_ms) as u64) * 2 // wait more when not the last block in turn
+                };
                 let remaining = std::time::Duration::from_millis(remaining_ms);
 
                 enum WaitMore<T> {

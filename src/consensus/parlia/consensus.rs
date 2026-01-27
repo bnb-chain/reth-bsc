@@ -567,7 +567,7 @@ where
             delay_ms -= left_over_ms;
         }
 
-        let mut time_for_mining_ms = period_ms / 3; // triedb root is not stable.
+        let mut time_for_mining_ms = period_ms / 4; // triedb root is not stable.
         let last_block_in_turn = snap.last_block_in_one_turn(header.number);
         if !last_block_in_turn {
             time_for_mining_ms = period_ms;
