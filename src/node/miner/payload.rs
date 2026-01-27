@@ -48,7 +48,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, trace, warn};
 
 /// Delay left over for mining calculation
-pub const DELAY_LEFT_OVER: u64 = 100; // triedb root is not stable.
+pub const DELAY_LEFT_OVER: u64 = 120; // triedb root is not stable.
 
 /// Time multiplier for retry condition check
 const TIME_MULTIPLIER: u32 = 2;
@@ -1424,7 +1424,7 @@ where
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis();
-                if now_ms >= self.expected_end_timestamp_ms {
+                if now_ms >= self.expected_end_timestamp_ms + 200 {
                     break;
                 }
                 if self.join_handle.len() == 0 {
@@ -1433,15 +1433,18 @@ where
 
                 // Remaining time we can still spend waiting for background builds.
                 let try_mine_block_number = self.build_args.config.parent_header.number() + 1;
-                let remaining_ms = if self
+                let mut remaining_ms = if self
                     .mining_ctx
                     .parent_snapshot
                     .last_block_in_one_turn(try_mine_block_number)
                 {
                     (self.expected_end_timestamp_ms - now_ms) as u64
                 } else {
-                    ((self.expected_end_timestamp_ms - now_ms) as u64) * 2 // wait more when not the last block in turn
+                    ((self.expected_end_timestamp_ms - now_ms) as u64) * 3 // wait more when not the last block in turn
                 };
+                if remaining_ms > 200 {
+                    remaining_ms = 200;
+                }
                 let remaining = std::time::Duration::from_millis(remaining_ms);
 
                 enum WaitMore<T> {
