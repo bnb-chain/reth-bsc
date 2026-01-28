@@ -141,7 +141,7 @@ where
             let mut triedb = get_global_triedb();
             // Miner-side: try to use triedb prefetcher + parent difflayers from execution ctx.
             let prefetch_state = self.ctx.triedb_prefetcher.take().and_then(|p| p.finish());
-            let had_prefetch_state = prefetch_state.is_some();
+            // let had_prefetch_state = prefetch_state.is_some();
             let parent_state_root = (**self.parent).state_root();
             let trie_hashed_state = hashed_state.to_triedb_hashed_post_state();
             let difflayers_opt = self.ctx.parent_difflayers.as_ref();
@@ -183,73 +183,73 @@ where
             //
             // Note: `get_global_triedb()` returns a cloned/owned triedb instance, so this doesn't
             // contend with the main thread's triedb.
-            if had_prefetch_state {
-                let parent_hash = self.parent.hash();
-                let block_number = self.parent.number + 1;
-                let parent_state_root_diag = parent_state_root;
-                let difflayers_diag = self.ctx.parent_difflayers.clone();
-                let trie_hashed_state_diag = trie_hashed_state.clone();
-                let root_with_prefetch = new_root;
-                let triedb_calc_with_prefetch_ms = triedb_calc_with_prefetch_ms;
+            // if had_prefetch_state {
+            //     let parent_hash = self.parent.hash();
+            //     let block_number = self.parent.number + 1;
+            //     let parent_state_root_diag = parent_state_root;
+            //     let difflayers_diag = self.ctx.parent_difflayers.clone();
+            //     let trie_hashed_state_diag = trie_hashed_state.clone();
+            //     let root_with_prefetch = new_root;
+            //     let triedb_calc_with_prefetch_ms = triedb_calc_with_prefetch_ms;
 
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    let _ = handle.spawn_blocking(move || {
-                    let diag_started = std::time::Instant::now();
-                    let mut triedb = get_global_triedb();
-                    match triedb.intermediate_hashed_post_state(
-                        parent_state_root_diag,
-                        difflayers_diag.as_ref(),
-                        &trie_hashed_state_diag,
-                        None,
-                    ) {
-                        Ok(root_no_prefetch) => {
-                            let diag_ms = diag_started.elapsed().as_millis();
-                            if root_no_prefetch != root_with_prefetch {
-                                tracing::warn!(
-                                    target: "bsc::builder",
-                                    parent_hash = %parent_hash,
-                                    block_number = %block_number,
-                                    parent_state_root = %parent_state_root_diag,
-                                    got = %root_with_prefetch,
-                                    got_no_prefetch = %root_no_prefetch,
-                                    has_parent_difflayers = difflayers_diag.is_some(),
-                                    calc_with_prefetch_ms = triedb_calc_with_prefetch_ms,
-                                    recompute_no_prefetch_ms = diag_ms,
-                                    "triedb root differs when recomputing without prefetch_state"
-                                );
-                            } else {
-                                tracing::debug!(
-                                    target: "bsc::builder",
-                                    parent_hash = %parent_hash,
-                                    block_number = %block_number,
-                                    calc_with_prefetch_ms = triedb_calc_with_prefetch_ms,
-                                    recompute_no_prefetch_ms = diag_ms,
-                                    "triedb recompute without prefetch_state matches"
-                                );
-                            }
-                        }
-                        Err(err) => {
-                            tracing::warn!(
-                                target: "bsc::builder",
-                                parent_hash = %parent_hash,
-                                block_number = %block_number,
-                                error = ?err,
-                                calc_with_prefetch_ms = triedb_calc_with_prefetch_ms,
-                                diag_ms = diag_started.elapsed().as_millis(),
-                                "failed to recompute triedb root without prefetch_state"
-                            );
-                        }
-                    }
-                    });
-                } else {
-                    tracing::debug!(
-                        target: "bsc::builder",
-                        parent_hash = %parent_hash,
-                        block_number = %block_number,
-                        "tokio runtime not available; skipping triedb recompute without prefetch_state"
-                    );
-                }
-            }
+            //     if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            //         let _ = handle.spawn_blocking(move || {
+            //         let diag_started = std::time::Instant::now();
+            //         let mut triedb = get_global_triedb();
+            //         match triedb.intermediate_hashed_post_state(
+            //             parent_state_root_diag,
+            //             difflayers_diag.as_ref(),
+            //             &trie_hashed_state_diag,
+            //             None,
+            //         ) {
+            //             Ok(root_no_prefetch) => {
+            //                 let diag_ms = diag_started.elapsed().as_millis();
+            //                 if root_no_prefetch != root_with_prefetch {
+            //                     tracing::warn!(
+            //                         target: "bsc::builder",
+            //                         parent_hash = %parent_hash,
+            //                         block_number = %block_number,
+            //                         parent_state_root = %parent_state_root_diag,
+            //                         got = %root_with_prefetch,
+            //                         got_no_prefetch = %root_no_prefetch,
+            //                         has_parent_difflayers = difflayers_diag.is_some(),
+            //                         calc_with_prefetch_ms = triedb_calc_with_prefetch_ms,
+            //                         recompute_no_prefetch_ms = diag_ms,
+            //                         "triedb root differs when recomputing without prefetch_state"
+            //                     );
+            //                 } else {
+            //                     tracing::debug!(
+            //                         target: "bsc::builder",
+            //                         parent_hash = %parent_hash,
+            //                         block_number = %block_number,
+            //                         calc_with_prefetch_ms = triedb_calc_with_prefetch_ms,
+            //                         recompute_no_prefetch_ms = diag_ms,
+            //                         "triedb recompute without prefetch_state matches"
+            //                     );
+            //                 }
+            //             }
+            //             Err(err) => {
+            //                 tracing::warn!(
+            //                     target: "bsc::builder",
+            //                     parent_hash = %parent_hash,
+            //                     block_number = %block_number,
+            //                     error = ?err,
+            //                     calc_with_prefetch_ms = triedb_calc_with_prefetch_ms,
+            //                     diag_ms = diag_started.elapsed().as_millis(),
+            //                     "failed to recompute triedb root without prefetch_state"
+            //                 );
+            //             }
+            //         }
+            //         });
+            //     } else {
+            //         tracing::debug!(
+            //             target: "bsc::builder",
+            //             parent_hash = %parent_hash,
+            //             block_number = %block_number,
+            //             "tokio runtime not available; skipping triedb recompute without prefetch_state"
+            //         );
+            //     }
+            // }
 
             (new_root, TrieUpdates::default(), Some(new_difflayer))
         } else {
