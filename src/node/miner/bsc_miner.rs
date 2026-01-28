@@ -954,14 +954,26 @@ where
 
         // TODO: wait more times when huge chain import.
         // TODO: only canonical head can broadcast, avoid sidechain blocks.
-        let parent_number = block_number.saturating_sub(1);
+        // Use header_td by hash instead of by number to ensure we get the correct parent's TD.
+        // This fixes the issue where header_td_by_number might return TD from a side chain block
+        // at the same height, causing TD mismatch in fork choice decisions.
         let parent_td = self
             .provider
-            .header_td_by_number(parent_number)
+            .header_td(&parent_hash)
             .map_err(|e| format!("Failed to get parent total difficulty due to {}", e))?
             .unwrap_or_default();
         let current_difficulty = sealed_block.header().difficulty();
         let new_td = parent_td + current_difficulty;
+        
+        tracing::debug!(
+            target: "bsc::miner",
+            block_number,
+            parent_hash = ?parent_hash,
+            parent_td = ?parent_td,
+            current_difficulty = ?current_difficulty,
+            new_td = ?new_td,
+            "Calculated TD for new block"
+        );
 
         let td = U128::from(new_td.to::<u128>());
         let new_block =
