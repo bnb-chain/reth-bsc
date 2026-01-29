@@ -81,6 +81,23 @@ where
             .unwrap()
             .snapshot_by_hash(&header.parent_hash)
             .ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;
+        
+        // Enhanced snapshot diagnostic logging for debugging receipt root mismatch
+        tracing::debug!(
+            target: "bsc::snapshot_debug",
+            block_number = header.number,
+            parent_hash = ?header.parent_hash,
+            snap_hash = ?snap.block_hash,
+            snap_number = snap.block_number,
+            snap_epoch = snap.epoch_num,
+            snap_validators_count = snap.validators.len(),
+            snap_recent_proposers_count = snap.recent_proposers.len(),
+            snap_turn_length = ?snap.turn_length,
+            inturn_validator = ?snap.inturn_validator(),
+            is_miner = self.ctx.is_miner,
+            "Snapshot loaded for block validation (fullnode mode)"
+        );
+        
         self.inner_ctx.snap = Some(snap.clone());
 
         self.verify_cascading_fields(&header, &parent_header, &snap)?;
@@ -536,10 +553,27 @@ where
             .unwrap()
             .snapshot_by_hash(&self.ctx.base.parent_hash)
             .ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;
-        self.inner_ctx.snap = Some(snap.clone());
-
+        
+        // Enhanced snapshot diagnostic logging for debugging receipt root mismatch
         let header_number = block.number.to::<u64>();
         let header_timestamp = block.timestamp.to::<u64>();
+        tracing::debug!(
+            target: "bsc::snapshot_debug",
+            block_number = header_number,
+            parent_hash = ?self.ctx.base.parent_hash,
+            snap_hash = ?snap.block_hash,
+            snap_number = snap.block_number,
+            snap_epoch = snap.epoch_num,
+            snap_validators_count = snap.validators.len(),
+            snap_recent_proposers_count = snap.recent_proposers.len(),
+            snap_turn_length = ?snap.turn_length,
+            inturn_validator = ?snap.inturn_validator(),
+            is_miner = self.ctx.is_miner,
+            "Snapshot loaded for block construction (miner mode)"
+        );
+        
+        self.inner_ctx.snap = Some(snap.clone());
+
         if self.spec.is_feynman_active_at_timestamp(header_number, header_timestamp) &&
             !self.spec.is_feynman_transition_at_timestamp(header_number, header_timestamp, parent_header.timestamp) &&
             is_breathe_block(parent_header.timestamp, header_timestamp)

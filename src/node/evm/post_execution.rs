@@ -50,16 +50,58 @@ where
         self.verify_turn_length(self.inner_ctx.header.clone())?;
 
         // check the system txs.
-        if self.inner_ctx.header.as_ref().unwrap().difficulty != DIFF_INTURN {
-            tracing::debug!("Start to slash spoiled validator, block_number: {}, block_difficulty: {:?}, diff_inturn: {:?}", 
-                block.number, self.inner_ctx.header.as_ref().unwrap().difficulty, DIFF_INTURN);
-            let snap = self.inner_ctx.snap.as_ref().unwrap();
-            let spoiled_validator = snap.inturn_validator();
-            let signed_recently = if self.spec.is_plato_active_at_block(block.number.to()) {
+        let header = self.inner_ctx.header.as_ref().unwrap();
+        let snap = self.inner_ctx.snap.as_ref().unwrap();
+        let inturn_validator = snap.inturn_validator();
+        let is_offturn = header.difficulty != DIFF_INTURN;
+        
+        // Enhanced diagnostic logging for slash decision
+        tracing::debug!(
+            target: "bsc::slash_debug",
+            block_number = %block.number,
+            block_difficulty = ?header.difficulty,
+            diff_inturn = ?DIFF_INTURN,
+            is_offturn = is_offturn,
+            block_beneficiary = ?block.beneficiary,
+            inturn_validator = ?inturn_validator,
+            snap_hash = ?snap.block_hash,
+            snap_number = snap.block_number,
+            recent_proposers_count = snap.recent_proposers.len(),
+            is_miner = self.ctx.is_miner,
+            "Slash decision check (fullnode mode)"
+        );
+        
+        if is_offturn {
+            let spoiled_validator = inturn_validator;
+            let is_plato_active = self.spec.is_plato_active_at_block(block.number.to());
+            let recent_proposer_counts = snap.count_recent_proposers();
+            let signed_recently = if is_plato_active {
                 snap.sign_recently(spoiled_validator)
             } else {
                 snap.recent_proposers.iter().any(|(_, v)| *v == spoiled_validator)
             };
+            
+            // Enhanced logging with recent_proposers details
+            let recent_proposers_str: Vec<String> = snap.recent_proposers
+                .iter()
+                .map(|(block_num, addr)| format!("{}:{:?}", block_num, addr))
+                .collect();
+            
+            tracing::debug!(
+                target: "bsc::slash_debug",
+                block_number = %block.number,
+                spoiled_validator = ?spoiled_validator,
+                is_plato_active = is_plato_active,
+                signed_recently = signed_recently,
+                will_slash = !signed_recently,
+                turn_length = ?snap.turn_length,
+                miner_history_check_len = snap.miner_history_check_len(),
+                recent_proposers = ?recent_proposers_str,
+                recent_proposer_counts = ?recent_proposer_counts,
+                is_miner = self.ctx.is_miner,
+                "Slash decision detail (fullnode mode)"
+            );
+            
             if !signed_recently {
                 self.slash_spoiled_validator(block.beneficiary, spoiled_validator)?;
                 let block_hash = self.inner_ctx.header.as_ref().map(|h| h.hash_slow());
@@ -102,13 +144,34 @@ where
         }
 
         if !self.system_txs.is_empty() {
+            use crate::system_contracts::{SLASH_CONTRACT, VALIDATOR_CONTRACT, STAKE_HUB_CONTRACT, SYSTEM_REWARD_CONTRACT};
             tracing::error!(
-                "Remaining system txs after block execution, block_number: {}, len: {}",
-                block.number,
-                self.system_txs.len()
+                target: "bsc::system_tx_debug",
+                block_number = %block.number,
+                remaining_count = self.system_txs.len(),
+                is_miner = self.ctx.is_miner,
+                "UNEXPECTED_SYSTEM_TX: Block contains more system txs than fullnode expects"
             );
-            for tx in self.system_txs.iter() {
-                tracing::error!("remaining system tx: {:?}", tx);
+            for (idx, tx) in self.system_txs.iter().enumerate() {
+                let target = tx.to();
+                let target_name = match target {
+                    Some(addr) if addr == SLASH_CONTRACT => "SLASH_CONTRACT",
+                    Some(addr) if addr == VALIDATOR_CONTRACT => "VALIDATOR_CONTRACT",
+                    Some(addr) if addr == STAKE_HUB_CONTRACT => "STAKE_HUB_CONTRACT",
+                    Some(addr) if addr == SYSTEM_REWARD_CONTRACT => "SYSTEM_REWARD_CONTRACT",
+                    Some(_) => "OTHER_CONTRACT",
+                    None => "NO_TARGET",
+                };
+                tracing::error!(
+                    target: "bsc::system_tx_debug",
+                    block_number = %block.number,
+                    tx_index = idx,
+                    tx_target = ?target,
+                    target_name = target_name,
+                    tx_hash = ?tx.signature_hash(),
+                    tx_input_len = tx.input().len(),
+                    "Remaining system tx that was NOT expected by fullnode"
+                );
             }
             return Err(BscBlockExecutionError::Validation(BscBlockValidationError::UnexpectedSystemTx).into());
         }
@@ -250,6 +313,23 @@ where
         validator: Address,
         spoiled_val: Address
     ) -> Result<(), BlockExecutionError> {
+        // Debug log the nonce before slash transaction
+        let validator_account = self.evm
+            .db_mut()
+            .basic(validator)
+            .map_err(BlockExecutionError::other)?
+            .unwrap_or_default();
+        
+        tracing::info!(
+            target: "bsc::system_tx_debug",
+            block_number = self.evm.block().number.to::<u64>(),
+            validator = ?validator,
+            spoiled_val = ?spoiled_val,
+            validator_nonce = validator_account.nonce,
+            is_miner = self.ctx.is_miner,
+            "SLASH TRANSACTION - attempting to slash spoiled validator"
+        );
+        
         self.transact_system_tx(
             self.system_contracts.slash(spoiled_val),
             validator,
@@ -276,22 +356,75 @@ where
             .unwrap_or_default();
 
         let transaction = set_nonce(transaction, account.nonce);
+        
+        // Enhanced debug logging for system transaction details
+        {
+            use crate::system_contracts::{SLASH_CONTRACT, VALIDATOR_CONTRACT, STAKE_HUB_CONTRACT};
+            let tx_target = transaction.to();
+            let target_name = match tx_target {
+                Some(addr) if addr == SLASH_CONTRACT => "SLASH",
+                Some(addr) if addr == VALIDATOR_CONTRACT => "VALIDATOR",
+                Some(addr) if addr == STAKE_HUB_CONTRACT => "STAKE_HUB",
+                Some(_) => "OTHER",
+                None => "NONE",
+            };
+            tracing::debug!(
+                target: "bsc::system_tx_debug",
+                block_number = self.evm.block().number.to::<u64>(),
+                sender = ?sender,
+                sender_nonce = account.nonce,
+                tx_type = target_name,
+                tx_target = ?tx_target,
+                tx_value = ?transaction.value(),
+                tx_signature_hash = ?transaction.signature_hash(),
+                tx_input_len = transaction.input().len(),
+                is_miner = self.ctx.is_miner,
+                "System transaction details"
+            );
+        }
 
         let signed_tx = if !self.ctx.is_miner {
             let hash = transaction.signature_hash();
+            let tx_target = transaction.to();
+            let expected_hash = self.system_txs.first().map(|tx| tx.signature_hash());
+            let expected_target = self.system_txs.first().and_then(|tx| tx.to());
+            
             if self.system_txs.is_empty() || hash != self.system_txs[0].signature_hash() {
                 // slash tx could fail and not in the block
-                if let Some(to) = transaction.to() {
+                if let Some(to) = tx_target {
                     if to == SLASH_CONTRACT &&
                         (self.system_txs.is_empty() ||
-                            self.system_txs[0].to().unwrap_or_default() !=
-                                SLASH_CONTRACT)
+                            expected_target.unwrap_or_default() != SLASH_CONTRACT)
                     {
-                        warn!("slash validator failed");
+                        let block_number = self.evm.block().number.to::<u64>();
+                        tracing::warn!(
+                            target: "bsc::slash_debug",
+                            block_number = block_number,
+                            tx_target = ?tx_target,
+                            tx_hash = ?hash,
+                            expected_target = ?expected_target,
+                            expected_hash = ?expected_hash,
+                            system_txs_count = self.system_txs.len(),
+                            receipts_count = self.receipts.len(),
+                            is_miner = self.ctx.is_miner,
+                            "Slash transaction skipped (not in block) - potential miner/fullnode mismatch"
+                        );
                         return Ok(());
                     }
                 }
-                warn!("unexpected transaction: {:?}", transaction);
+                let block_number = self.evm.block().number.to::<u64>();
+                tracing::warn!(
+                    target: "bsc::slash_debug",
+                    block_number = block_number,
+                    tx_target = ?tx_target,
+                    tx_hash = ?hash,
+                    expected_target = ?expected_target,
+                    expected_hash = ?expected_hash,
+                    system_txs_count = self.system_txs.len(),
+                    receipts_count = self.receipts.len(),
+                    is_miner = self.ctx.is_miner,
+                    "Unexpected system transaction"
+                );
                 for tx in self.system_txs.iter() {
                     warn!("left system tx: {:?}", tx);
                 }
@@ -446,6 +579,24 @@ where
 
         // send all left gas fees to VALIDATOR_CONTRACT for distributing & burning.
         let tx = self.system_contracts.distribute_to_validator(validator, block_reward);
+        
+        // Debug log the nonce that will be used
+        let validator_account = self.evm
+            .db_mut()
+            .basic(validator)
+            .map_err(BlockExecutionError::other)?
+            .unwrap_or_default();
+        
+        tracing::debug!(
+            target: "bsc::system_tx_debug",
+            block_number = self.evm.block().number.to::<u64>(),
+            validator = ?validator,
+            block_reward = block_reward,
+            validator_nonce = validator_account.nonce,
+            is_miner = self.ctx.is_miner,
+            "Distribute to validator - pre transact"
+        );
+        
         self.transact_system_tx(tx, validator)?;
         tracing::debug!("Distribute to validator, block_number: {}, block_reward: {}", self.evm.block().number, block_reward);
         
@@ -472,16 +623,47 @@ where
         let start = (block_number - FF_REWARD_DISTRIBUTION_INTERVAL).max(1);
         let end = block_number;
 
+        tracing::debug!(
+            target: "bsc::finality_debug",
+            block_number = block_number,
+            start = start,
+            end = end,
+            parent_hash = ?self.ctx.base.parent_hash,
+            is_miner = self.ctx.is_miner,
+            "Starting finality reward distribution"
+        );
+
         // query block header and snapshot by hash from cache.
         let mut target_hash = self.ctx.base.parent_hash;
+        let mut processed_blocks = 0u64;
         for _ in (start..end).rev() {
             let header = get_header_by_hash_from_cache(&target_hash).
-                ok_or_else(|| BlockExecutionError::msg(format!("Header not found for block hash: {target_hash}")))?;
+                ok_or_else(|| {
+                    tracing::error!(
+                        target: "bsc::finality_debug",
+                        block_number = block_number,
+                        missing_hash = ?target_hash,
+                        processed_blocks = processed_blocks,
+                        is_miner = self.ctx.is_miner,
+                        "Header not found in cache during finality reward calculation"
+                    );
+                    BlockExecutionError::msg(format!("Header not found for block hash: {target_hash}"))
+                })?;
             let snap = self.snapshot_provider.
                 as_ref().
                 unwrap().
                 snapshot_by_hash(&header.parent_hash).
-                ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;
+                ok_or_else(|| {
+                    tracing::error!(
+                        target: "bsc::finality_debug",
+                        block_number = block_number,
+                        header_number = header.number,
+                        missing_hash = ?header.parent_hash,
+                        is_miner = self.ctx.is_miner,
+                        "Snapshot not found during finality reward calculation"
+                    );
+                    BlockExecutionError::msg("Failed to get snapshot from snapshot provider")
+                })?;
 
             if let Some(attestation) =
                 self.parlia.get_vote_attestation_from_header(&header, snap.epoch_num).map_err(|err| {
@@ -492,11 +674,22 @@ where
                 self.process_attestation(&attestation, &header, &mut accumulated_weights)?;
             }
             target_hash = header.parent_hash;
+            processed_blocks += 1;
         }
 
         let mut validators: Vec<Address> = accumulated_weights.keys().copied().collect();
         validators.sort();
         let weights: Vec<U256> = validators.iter().map(|val| accumulated_weights[val]).collect();
+
+        tracing::debug!(
+            target: "bsc::finality_debug",
+            block_number = block_number,
+            validators_count = validators.len(),
+            total_weight = ?weights.iter().fold(U256::ZERO, |acc, w| acc + *w),
+            processed_blocks = processed_blocks,
+            is_miner = self.ctx.is_miner,
+            "Finality reward distribution prepared"
+        );
 
         self.transact_system_tx(
             self.system_contracts.distribute_finality_reward(validators, weights),
@@ -582,26 +775,86 @@ where
         let snap = self.inner_ctx.snap.as_ref().unwrap();
         let epoch_length = snap.epoch_num;
         let expected_validator = snap.inturn_validator();
-        if block.beneficiary != expected_validator {
-            let signed_recently = if self.spec.is_plato_active_at_block(block.number.to()) {
-                snap.sign_recently(expected_validator)
+        
+        // Keep original logic: use beneficiary check (same as before)
+        let is_offturn = block.beneficiary != expected_validator;
+        
+        // Log if difficulty check would give different result (for debugging only)
+        let difficulty_check = block.difficulty != DIFF_INTURN;
+        if is_offturn != difficulty_check {
+            tracing::warn!(
+                target: "bsc::slash_debug",
+                block_number = %block.number,
+                is_offturn_by_beneficiary = is_offturn,
+                is_offturn_by_difficulty = difficulty_check,
+                block_difficulty = ?block.difficulty,
+                block_beneficiary = ?block.beneficiary,
+                expected_validator = ?expected_validator,
+                "DEBUG: difficulty-based and beneficiary-based offturn checks differ!"
+            );
+        }
+        
+        // Enhanced diagnostic logging for slash decision (miner mode)
+        tracing::debug!(
+            target: "bsc::slash_debug",
+            block_number = %block.number,
+            block_difficulty = ?block.difficulty,
+            diff_inturn = ?DIFF_INTURN,
+            is_offturn = is_offturn,
+            block_beneficiary = ?block.beneficiary,
+            expected_validator = ?expected_validator,
+            snap_hash = ?snap.block_hash,
+            snap_number = snap.block_number,
+            recent_proposers_count = snap.recent_proposers.len(),
+            is_miner = self.ctx.is_miner,
+            "Slash decision check (miner mode)"
+        );
+        
+        if is_offturn {
+            let spoiled_validator = expected_validator;
+            let is_plato_active = self.spec.is_plato_active_at_block(block.number.to());
+            let recent_proposer_counts = snap.count_recent_proposers();
+            let signed_recently = if is_plato_active {
+                snap.sign_recently(spoiled_validator)
             } else {
-                snap.recent_proposers.iter().any(|(_, v)| *v == expected_validator)
+                snap.recent_proposers.iter().any(|(_, v)| *v == spoiled_validator)
             };
+            
+            // Enhanced logging with recent_proposers details (miner mode)
+            let recent_proposers_str: Vec<String> = snap.recent_proposers
+                .iter()
+                .map(|(block_num, addr)| format!("{}:{:?}", block_num, addr))
+                .collect();
+            
+            tracing::debug!(
+                target: "bsc::slash_debug",
+                block_number = %block.number,
+                spoiled_validator = ?spoiled_validator,
+                is_plato_active = is_plato_active,
+                signed_recently = signed_recently,
+                will_slash = !signed_recently,
+                turn_length = ?snap.turn_length,
+                miner_history_check_len = snap.miner_history_check_len(),
+                recent_proposers = ?recent_proposers_str,
+                recent_proposer_counts = ?recent_proposer_counts,
+                is_miner = self.ctx.is_miner,
+                "Slash decision detail (miner mode)"
+            );
+            
             if !signed_recently {
                 // Note: If this is a backoff (offturn) validator trying to slash the inturn validator,
                 // this block may not become part of the canonical chain. The inturn validator's block
                 // has higher difficulty (DIFF_INTURN=2) and will be preferred by fork choice rules.
                 // This slash attempt will only succeed if the inturn validator truly failed to produce a block.
-                self.slash_spoiled_validator(block.beneficiary, expected_validator)?;
+                self.slash_spoiled_validator(block.beneficiary, spoiled_validator)?;
                 let block_hash = self.inner_ctx.header.as_ref().map(|h| h.hash_slow());
-                tracing::trace!(
+                tracing::info!(
                     target: "bsc::evm",
                     block_number = %block.number,
                     block_hash = ?block_hash,
-                    spoiled_validator = ?expected_validator,
+                    spoiled_validator = ?spoiled_validator,
                     backoff_validator = ?block.beneficiary,
-                    "Try slash spoiled validator by miner"
+                    "Slash spoiled validator by miner"
                 );
             }
         }
