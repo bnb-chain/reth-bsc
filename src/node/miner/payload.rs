@@ -1424,7 +1424,19 @@ where
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis();
-                if now_ms >= self.expected_end_timestamp_ms + 200 {
+                if now_ms >= self.expected_end_timestamp_ms + 150 {
+                    if self.join_handle.len() != 0 {
+                        debug!(
+                            target: "bsc::miner::payload",
+                            trace_id = self.trace_id,
+                            try_mine_block_number = self.build_args.config.parent_header.number() + 1,
+                            is_inturn = self.mining_ctx.is_inturn,
+                            bg_tasks = self.join_handle.len(),
+                            now_ms,
+                            expected_end_timestamp_ms = self.expected_end_timestamp_ms,
+                            "Skip waiting for additional payload candidates due to timeout"
+                        );
+                    }
                     break;
                 }
                 if self.join_handle.len() == 0 {
@@ -1442,8 +1454,8 @@ where
                 } else {
                     ((self.expected_end_timestamp_ms - now_ms) as u64) * 3 // wait more when not the last block in turn
                 };
-                if remaining_ms > 200 {
-                    remaining_ms = 200;
+                if remaining_ms > 50 {
+                    remaining_ms = 50;
                 }
                 let remaining = std::time::Duration::from_millis(remaining_ms);
 
@@ -1476,9 +1488,12 @@ where
                             is_inturn = self.mining_ctx.is_inturn,
                             waited_ms = waited.as_millis(),
                             bg_tasks = self.join_handle.len(),
-                            "Reached expected_end_timestamp_ms while waiting for background payload candidates"
+                            expected_end_timestamp_ms = self.expected_end_timestamp_ms,
+                            "No background payload candidate finished within wait slice"
                         );
-                        break;
+                        // Keep waiting in further slices until we hit the expected end timestamp (+grace)
+                        // or until all background tasks have completed.
+                        continue;
                     }
                     WaitMore::Aborted => {
                         info!(
