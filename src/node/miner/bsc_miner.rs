@@ -349,16 +349,16 @@ where
         H: alloy_consensus::BlockHeader + Sealable,
     {
         // TODO: refine check is_syncing status.
-        if tip.timestamp()
-            < SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() - 3
-        {
-            debug!(
-                "Skip to mine new block due to maybe in syncing, validator: {}, tip: {}",
-                self.validator_address,
-                tip.number()
-            );
-            return;
-        }
+        // if tip.timestamp()
+        //     < SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() - 3
+        // {
+        //     debug!(
+        //         "Skip to mine new block due to maybe in syncing, validator: {}, tip: {}",
+        //         self.validator_address,
+        //         tip.number()
+        //     );
+        //     return;
+        // }
 
         let parent_header = match self.provider.sealed_header_by_hash(tip.hash()) {
             Ok(Some(header)) => {
