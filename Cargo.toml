@@ -13,57 +13,57 @@ name = "reth-bsc"
 path = "src/main.rs"
 
 [dependencies]
-reth = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/triedb-gap" }
-reth-cli = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/triedb-gap" }
-reth-cli-commands = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/triedb-gap" }
-reth-basic-payload-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/triedb-gap" }
-reth-db = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/triedb-gap" }
-reth-engine-local = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/triedb-gap" }
-reth-chainspec = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/triedb-gap" }
-reth-cli-util = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/triedb-gap" }
-reth-discv4 = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/triedb-gap", features = [
+reth = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb-const" }
+reth-cli = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb-const" }
+reth-cli-commands = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb-const" }
+reth-basic-payload-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb-const" }
+reth-db = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb-const" }
+reth-engine-local = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb-const" }
+reth-chainspec = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb-const" }
+reth-cli-util = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb-const" }
+reth-discv4 = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb-const", features = [
     "test-utils",
 ] }
-reth-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/triedb-gap" }
-reth-ethereum-forks = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/triedb-gap", features = [
+reth-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb-const" }
+reth-ethereum-forks = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb-const", features = [
     "serde",
 ] }
-reth-ethereum-payload-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/triedb-gap" }
-reth-payload-builder-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/triedb-gap" }
-reth-chain-state = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/triedb-gap" }
-reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/triedb-gap" }
-reth-eth-wire = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/triedb-gap" }
-reth-eth-wire-types = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/triedb-gap" }
-reth-evm = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/triedb-gap" }
-reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/triedb-gap" }
-reth-execution-types = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/triedb-gap" }
-reth-ipc = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/triedb-gap" }
-reth-metrics = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/triedb-gap" }
-reth-node-core = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/triedb-gap" }
-reth-revm = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/triedb-gap" }
-reth-network = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/triedb-gap", features = [
+reth-ethereum-payload-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb-const" }
+reth-payload-builder-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb-const" }
+reth-chain-state = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb-const" }
+reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb-const" }
+reth-eth-wire = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb-const" }
+reth-eth-wire-types = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb-const" }
+reth-evm = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb-const" }
+reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb-const" }
+reth-execution-types = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb-const" }
+reth-ipc = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb-const" }
+reth-metrics = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb-const" }
+reth-node-core = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb-const" }
+reth-revm = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb-const" }
+reth-network = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb-const", features = [
     "test-utils",
 ] }
-reth-network-p2p = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/triedb-gap" }
-reth-network-api = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/triedb-gap" }
-reth-node-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/triedb-gap", features = [
+reth-network-p2p = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb-const" }
+reth-network-api = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb-const" }
+reth-node-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb-const", features = [
     "test-utils",
 ] }
-reth-network-peers = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/triedb-gap" }
-reth-payload-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/triedb-gap" }
-reth-ethereum-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/triedb-gap" }
-reth-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/triedb-gap" }
-reth-primitives-traits = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/triedb-gap" }
-reth-provider = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/triedb-gap", features = [
+reth-network-peers = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb-const" }
+reth-payload-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb-const" }
+reth-ethereum-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb-const" }
+reth-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb-const" }
+reth-primitives-traits = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb-const" }
+reth-provider = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb-const", features = [
     "test-utils",
 ] }
-reth-rpc-eth-api = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/triedb-gap" }
-reth-rpc-convert = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/triedb-gap" }
-reth-rpc-engine-api = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/triedb-gap" }
-reth-trie-common = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/triedb-gap" }
-reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/triedb-gap" }
-reth-tasks = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/triedb-gap" }
-reth-transaction-pool = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/triedb-gap" }
+reth-rpc-eth-api = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb-const" }
+reth-rpc-convert = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb-const" }
+reth-rpc-engine-api = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb-const" }
+reth-trie-common = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb-const" }
+reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb-const" }
+reth-tasks = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb-const" }
+reth-transaction-pool = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb-const" }
 revm = "34.0.0"
 revm-context-interface = "14.0.0"
 revm-database = "10.0.0"
