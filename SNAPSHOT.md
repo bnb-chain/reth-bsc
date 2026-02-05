@@ -1,4 +1,4 @@
-# BSC Reth client snapshot download link
+# BSC Reth Client Snapshot Usage
 
 ## About BSC Reth client snapshot
 
@@ -28,16 +28,7 @@ After building, the binary will be located at `./target/maxperf/reth-bsc`.
 
 **Snapshots**
 
-| Type | Network | File | Size | Special Parameters |
-| ---- | ------- | ---- | ---- | ------------------ |
-| Archive | BSC-MainNet | [reth_static_files_20260109.tar.zst](https://pub-c5400abe5bed4adbaf8cd47467747e74.r2.dev/reth_static_files_20260109.tar.zst) <br> [reth_db_20260109.tar.zst](https://pub-c5400abe5bed4adbaf8cd47467747e74.r2.dev/reth_db_20260109.tar.zst) | 1.955 TiB <br> 2.556 TiB | `--db.max-size=12TB` <br> `--db.page-size=8KB` |
-| Archive | BSC-TestNet | [bsc-reth-archivenode-testnet-64665542.tar.gz](https://pub-c0627345c16f47ab858c9469133073a8.r2.dev/bsc-reth-archivenode-testnet-64665542.tar.gz) | 392 GiB | - |
-| Full | BSC-TestNet | [bsc-reth-testnet-63271461.tar.gz](https://pub-c5400abe5bed4adbaf8cd47467747e74.r2.dev/bsc-reth-testnet-63271461.tar.gz) | 232 GiB | - |
-| Full | BSC-MainNet | [reth_full_static_files_20260109.tar.zst](https://pub-c5400abe5bed4adbaf8cd47467747e74.r2.dev/reth_full_static_files_20260109.tar.zst) <br> [reth_full_db_20260109.tar.zst](https://pub-c5400abe5bed4adbaf8cd47467747e74.r2.dev/reth_full_db_20260109.tar.zst) | 1.310 TiB <br> 1.109 TiB | - |
-| Full TrieDB | BSC-TestNet | [75105967_testnet_fullnode.tar.zst](https://pub-c5400abe5bed4adbaf8cd47467747e74.r2.dev/75105967_testnet_fullnode.tar.zst) | 259 GiB | - |
-| Full TrieDB | BSC-MainNet | [69615424_mainnet__fullnode.tar.zst](https://pub-c5400abe5bed4adbaf8cd47467747e74.r2.dev/69615424_mainnet__fullnode.tar.zst) | 2.73 TiB | - |
-| Archive TrieDB | BSC-TestNet | [80135040_testnet_reth_triedb_archive.tar.zst](https://pub-c5400abe5bed4adbaf8cd47467747e74.r2.dev/80135040_testnet_reth_triedb_archive.tar.zst) | 450 GiB | - |
-| Archive TrieDB | BSC-MainNet | [71340054_mainnet_reth_triedb_static_files_archive.tar.zst](https://pub-c5400abe5bed4adbaf8cd47467747e74.r2.dev/71340054_mainnet_reth_triedb_static_files_archive.tar.zst) <br> [71340054_mainnet_reth_triedb_db_archive.tar.zst](https://pub-c5400abe5bed4adbaf8cd47467747e74.r2.dev/71340054_mainnet_reth_triedb_db_archive.tar.zst) <br> [71340054_mainnet_reth_triedb_triedb_archive.tar.zst](https://pub-c5400abe5bed4adbaf8cd47467747e74.r2.dev/71340054_mainnet_reth_triedb_triedb_archive.tar.zst) | 2.5 TiB <br> 3.0 TiB <br> 711 GiB | `--db.max-size=12TB` <br> `--db.page-size=8KB` |
+All reth-bsc snapshots are moved to [BSC Reth Snapshots](https://github.com/bnb-chain/bsc-snapshots#source-4-bsc-reth-snapshots) to download.
 
 ## Installation Instructions
 
