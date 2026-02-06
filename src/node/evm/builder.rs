@@ -140,9 +140,13 @@ where
         let (state_root, trie_updates, produced_difflayer) = if rust_eth_triedb::triedb_manager::is_triedb_active() {
             let mut triedb = get_global_triedb();
             let trie_hashed_state = hashed_state.to_triedb_hashed_post_state();
+            let block_num_hash = (self.parent.number + 1, self.parent.hash());
 
             // Miner-side: feed one-shot targets derived from the final triedb hashed post state,
             // then finish the prefetcher.
+            let mut prefetch_finish_ms: Option<u128> = None;
+            let mut prefetch_storage_roots_len: Option<usize> = None;
+            let mut prefetch_storage_tries_len: Option<usize> = None;
             let prefetch_state = self.ctx.triedb_prefetcher.take().and_then(|p| {
                 use alloy_primitives::map::B256Set;
                 use reth_trie::MultiProofTargets;
@@ -171,6 +175,7 @@ where
 
                 tracing::debug!(
                     target: "bsc::builder",
+                    block_num_hash = ?block_num_hash,
                     one_shot_build_ms = build_started.elapsed().as_millis(),
                     accounts = trie_hashed_state.states.len(),
                     storage_accounts,
@@ -181,10 +186,16 @@ where
                 p.prefetch_targets(targets);
                 let finish_started = std::time::Instant::now();
                 let res = p.finish();
+                prefetch_finish_ms = Some(finish_started.elapsed().as_millis());
+                prefetch_storage_roots_len = res.as_ref().map(|s| s.storage_roots.len());
+                prefetch_storage_tries_len = res.as_ref().map(|s| s.storage_tries.len());
                 tracing::debug!(
                     target: "bsc::builder",
-                    prefetch_finish_ms = finish_started.elapsed().as_millis(),
+                    block_num_hash = ?block_num_hash,
+                    prefetch_finish_ms = prefetch_finish_ms,
                     had_prefetch_state = res.is_some(),
+                    prefetch_storage_roots_len,
+                    prefetch_storage_tries_len,
                     "Finished triedb prefetcher"
                 );
                 res
@@ -206,11 +217,15 @@ where
 
             tracing::debug!(
                 target: "bsc::builder",
+                block_num_hash = ?block_num_hash,
                 parent_hash = %self.parent.hash(),
                 block_number = %(self.parent.number + 1),
                 parent_state_root = %parent_state_root,
                 new_state_root = %new_root,
                 has_parent_difflayers = difflayers_opt.is_some(),
+                prefetch_finish_ms = prefetch_finish_ms,
+                prefetch_storage_roots_len,
+                prefetch_storage_tries_len,
                 user_tx_count = self.transactions.len(),
                 hashed_accounts = hashed_state.accounts.len(),
                 hashed_storages = hashed_state.storages.len(),
