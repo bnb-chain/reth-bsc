@@ -139,11 +139,58 @@ where
         // Use triedb to calculate state root
         let (state_root, trie_updates, produced_difflayer) = if rust_eth_triedb::triedb_manager::is_triedb_active() {
             let mut triedb = get_global_triedb();
-            // Miner-side: try to use triedb prefetcher + parent difflayers from execution ctx.
-            let prefetch_state = self.ctx.triedb_prefetcher.take().and_then(|p| p.finish());
+            let trie_hashed_state = hashed_state.to_triedb_hashed_post_state();
+
+            // Miner-side: feed one-shot targets derived from the final triedb hashed post state,
+            // then finish the prefetcher.
+            let prefetch_state = self.ctx.triedb_prefetcher.take().and_then(|p| {
+                use alloy_primitives::map::B256Set;
+                use reth_trie::MultiProofTargets;
+
+                let build_started = std::time::Instant::now();
+                let mut targets = MultiProofTargets::with_capacity(trie_hashed_state.states.len());
+                let mut storage_accounts: usize = 0;
+                let mut storage_slots: usize = 0;
+
+                for (hashed_address, slots) in trie_hashed_state.storage_states.iter() {
+                    let mut storage_set =
+                        B256Set::with_capacity_and_hasher(slots.len(), Default::default());
+                    for (hashed_slot, _) in slots.iter() {
+                        storage_set.insert(*hashed_slot);
+                    }
+                    storage_slots += storage_set.len();
+                    if !storage_set.is_empty() {
+                        storage_accounts += 1;
+                    }
+                    targets.insert(*hashed_address, storage_set);
+                }
+
+                for hashed_address in trie_hashed_state.states.keys() {
+                    targets.entry(*hashed_address).or_insert_with(B256Set::default);
+                }
+
+                tracing::debug!(
+                    target: "bsc::builder",
+                    one_shot_build_ms = build_started.elapsed().as_millis(),
+                    accounts = trie_hashed_state.states.len(),
+                    storage_accounts,
+                    storage_slots,
+                    "Submitting one-shot triedb prefetch targets"
+                );
+
+                p.prefetch_targets(targets);
+                let finish_started = std::time::Instant::now();
+                let res = p.finish();
+                tracing::debug!(
+                    target: "bsc::builder",
+                    prefetch_finish_ms = finish_started.elapsed().as_millis(),
+                    had_prefetch_state = res.is_some(),
+                    "Finished triedb prefetcher"
+                );
+                res
+            });
             // let had_prefetch_state = prefetch_state.is_some();
             let parent_state_root = (**self.parent).state_root();
-            let trie_hashed_state = hashed_state.to_triedb_hashed_post_state();
             let difflayers_opt = self.ctx.parent_difflayers.as_ref();
 
             let triedb_calc_started = std::time::Instant::now();
