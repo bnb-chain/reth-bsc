@@ -142,12 +142,12 @@ where
             let trie_hashed_state = hashed_state.to_triedb_hashed_post_state();
             let block_num_hash = (self.parent.number + 1, self.parent.hash());
 
-            // Miner-side: feed one-shot targets derived from the final triedb hashed post state,
-            // then finish the prefetcher.
-            let mut prefetch_finish_ms: Option<u128> = None;
-            let mut prefetch_storage_roots_len: Option<usize> = None;
-            let mut prefetch_storage_tries_len: Option<usize> = None;
-            let prefetch_state = self.ctx.triedb_prefetcher.take().and_then(|p| {
+            // Miner-side: feed one-shot targets derived from the final triedb hashed post state.
+            //
+            // IMPORTANT: do NOT stop the prefetcher before we calculate the root.
+            // We want it to keep warming caches during trie traversal. We'll stop it after root.
+            let mut prefetcher = self.ctx.triedb_prefetcher.take();
+            if let Some(p) = prefetcher.as_ref() {
                 use alloy_primitives::map::B256Set;
                 use reth_trie::MultiProofTargets;
 
@@ -184,25 +184,32 @@ where
                 );
 
                 p.prefetch_targets(targets);
-                let finish_started = std::time::Instant::now();
-                let res = p.finish();
-                prefetch_finish_ms = Some(finish_started.elapsed().as_millis());
-                prefetch_storage_roots_len = res.as_ref().map(|s| s.storage_roots.len());
-                prefetch_storage_tries_len = res.as_ref().map(|s| s.storage_tries.len());
+            }
+            // We no longer block waiting for a `prefetch_state` before root calculation.
+            //
+            // But we can opportunistically reuse a best-effort snapshot published by the
+            // prefetcher. This is non-blocking: if nothing is published yet, we fall back to
+            // `None` and only benefit from cache warming.
+            let parent_state_root = (**self.parent).state_root();
+            let prefetch_state = prefetcher
+                .as_ref()
+                .and_then(|p| p.try_snapshot_for_root(parent_state_root));
+            let difflayers_opt = self.ctx.parent_difflayers.as_ref();
+            if let Some(state) = prefetch_state.as_ref() {
                 tracing::debug!(
                     target: "bsc::builder",
                     block_num_hash = ?block_num_hash,
-                    prefetch_finish_ms = prefetch_finish_ms,
-                    had_prefetch_state = res.is_some(),
-                    prefetch_storage_roots_len,
-                    prefetch_storage_tries_len,
-                    "Finished triedb prefetcher"
+                    prefetch_snapshot_storage_roots = state.storage_roots.len(),
+                    prefetch_snapshot_storage_tries = state.storage_tries.len(),
+                    "Using triedb prefetch snapshot for root computation"
                 );
-                res
-            });
-            // let had_prefetch_state = prefetch_state.is_some();
-            let parent_state_root = (**self.parent).state_root();
-            let difflayers_opt = self.ctx.parent_difflayers.as_ref();
+            } else {
+                tracing::debug!(
+                    target: "bsc::builder",
+                    block_num_hash = ?block_num_hash,
+                    "No triedb prefetch snapshot available for root computation"
+                );
+            }
 
             let triedb_calc_started = std::time::Instant::now();
             let (new_root, new_difflayer) = triedb
@@ -215,6 +222,30 @@ where
                 .map_err(BlockExecutionError::other)?;
             let triedb_calc_with_prefetch_ms = triedb_calc_started.elapsed().as_millis();
 
+            // Stop triedb prefetching after root calculation.
+            //
+            // We intentionally keep it running through trie-root calculation to maximize overlap.
+            // To avoid adding latency to block production, we stop it in the background if a tokio
+            // runtime is available.
+            let mut prefetch_stop_spawned: Option<bool> = None;
+            let mut prefetch_stop_inline_ms: Option<u128> = None;
+            if let Some(p) = prefetcher.take() {
+                match tokio::runtime::Handle::try_current() {
+                    Ok(handle) => {
+                        prefetch_stop_spawned = Some(true);
+                        let _ = handle.spawn_blocking(move || {
+                            let _ = p.finish();
+                        });
+                    }
+                    Err(_) => {
+                        prefetch_stop_spawned = Some(false);
+                        let stop_started = std::time::Instant::now();
+                        let _ = p.finish();
+                        prefetch_stop_inline_ms = Some(stop_started.elapsed().as_millis());
+                    }
+                }
+            }
+
             tracing::debug!(
                 target: "bsc::builder",
                 block_num_hash = ?block_num_hash,
@@ -223,9 +254,8 @@ where
                 parent_state_root = %parent_state_root,
                 new_state_root = %new_root,
                 has_parent_difflayers = difflayers_opt.is_some(),
-                prefetch_finish_ms = prefetch_finish_ms,
-                prefetch_storage_roots_len,
-                prefetch_storage_tries_len,
+                prefetch_stop_spawned,
+                prefetch_stop_inline_ms,
                 user_tx_count = self.transactions.len(),
                 hashed_accounts = hashed_state.accounts.len(),
                 hashed_storages = hashed_state.storages.len(),
