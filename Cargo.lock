@@ -7126,7 +7126,7 @@ dependencies = [
  "reth-trie",
  "revm-database",
  "revm-state",
- "rust-eth-triedb-common",
+ "rust-eth-triedb-common 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=2ee553918383d55e95843dda1c6063ac5bc57972)",
  "serde",
  "tokio",
  "tokio-stream",
@@ -7238,7 +7238,7 @@ dependencies = [
  "reth-trie",
  "reth-trie-common",
  "reth-trie-db",
- "rust-eth-triedb",
+ "rust-eth-triedb 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=2ee553918383d55e95843dda1c6063ac5bc57972)",
  "secp256k1 0.30.0",
  "serde",
  "serde_json",
@@ -7453,9 +7453,9 @@ dependencies = [
  "reth-static-file-types",
  "reth-trie",
  "reth-trie-db",
- "rust-eth-triedb",
- "rust-eth-triedb-common",
- "rust-eth-triedb-state-trie",
+ "rust-eth-triedb 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=2ee553918383d55e95843dda1c6063ac5bc57972)",
+ "rust-eth-triedb-common 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=2ee553918383d55e95843dda1c6063ac5bc57972)",
+ "rust-eth-triedb-state-trie 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=2ee553918383d55e95843dda1c6063ac5bc57972)",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -7734,10 +7734,10 @@ dependencies = [
  "reth-trie-sparse-parallel",
  "revm",
  "revm-primitives",
- "rust-eth-triedb",
- "rust-eth-triedb-common",
- "rust-eth-triedb-pathdb",
- "rust-eth-triedb-state-trie",
+ "rust-eth-triedb 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=2ee553918383d55e95843dda1c6063ac5bc57972)",
+ "rust-eth-triedb-common 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=2ee553918383d55e95843dda1c6063ac5bc57972)",
+ "rust-eth-triedb-pathdb 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=2ee553918383d55e95843dda1c6063ac5bc57972)",
+ "rust-eth-triedb-state-trie 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=2ee553918383d55e95843dda1c6063ac5bc57972)",
  "schnellru",
  "smallvec",
  "thiserror 2.0.18",
@@ -8038,7 +8038,7 @@ dependencies = [
  "reth-storage-errors",
  "reth-trie-common",
  "revm",
- "rust-eth-triedb-common",
+ "rust-eth-triedb-common 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=2ee553918383d55e95843dda1c6063ac5bc57972)",
 ]
 
 [[package]]
@@ -8509,7 +8509,7 @@ dependencies = [
  "reth-tokio-util",
  "reth-tracing",
  "reth-transaction-pool",
- "rust-eth-triedb",
+ "rust-eth-triedb 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=2ee553918383d55e95843dda1c6063ac5bc57972)",
  "secp256k1 0.30.0",
  "serde_json",
  "tokio",
@@ -8856,7 +8856,7 @@ dependencies = [
  "reth-trie-db",
  "revm-database",
  "revm-state",
- "rust-eth-triedb",
+ "rust-eth-triedb 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=2ee553918383d55e95843dda1c6063ac5bc57972)",
  "strum 0.27.2",
  "tokio",
  "tracing",
@@ -9030,7 +9030,7 @@ dependencies = [
  "revm",
  "revm-inspectors",
  "revm-primitives",
- "rust-eth-triedb",
+ "rust-eth-triedb 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=2ee553918383d55e95843dda1c6063ac5bc57972)",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -9198,7 +9198,7 @@ dependencies = [
  "reth-trie-common",
  "revm",
  "revm-inspectors",
- "rust-eth-triedb",
+ "rust-eth-triedb 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=2ee553918383d55e95843dda1c6063ac5bc57972)",
  "tokio",
  "tracing",
 ]
@@ -9324,7 +9324,7 @@ dependencies = [
  "reth-trie",
  "reth-trie-common",
  "reth-trie-db",
- "rust-eth-triedb",
+ "rust-eth-triedb 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=2ee553918383d55e95843dda1c6063ac5bc57972)",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -9590,8 +9590,8 @@ dependencies = [
  "reth-codecs",
  "reth-primitives-traits",
  "revm-database",
- "rust-eth-triedb",
- "rust-eth-triedb-state-trie",
+ "rust-eth-triedb 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=2ee553918383d55e95843dda1c6063ac5bc57972)",
+ "rust-eth-triedb-state-trie 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=2ee553918383d55e95843dda1c6063ac5bc57972)",
  "serde",
  "serde_with",
 ]
@@ -9606,7 +9606,7 @@ dependencies = [
  "reth-execution-errors",
  "reth-primitives-traits",
  "reth-trie",
- "rust-eth-triedb",
+ "rust-eth-triedb 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=2ee553918383d55e95843dda1c6063ac5bc57972)",
  "tracing",
 ]
 
@@ -9780,9 +9780,9 @@ dependencies = [
  "reth-trie-common",
  "reth-trie-db",
  "revm",
- "rust-eth-triedb",
- "rust-eth-triedb-common",
- "rust-eth-triedb-pathdb",
+ "rust-eth-triedb 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=43ff426c7dc4f149f513a92380d4d4db5505f2d1)",
+ "rust-eth-triedb-common 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=43ff426c7dc4f149f513a92380d4d4db5505f2d1)",
+ "rust-eth-triedb-pathdb 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=43ff426c7dc4f149f513a92380d4d4db5505f2d1)",
  "schnellru",
  "scrypt 0.11.0",
  "secp256k1 0.30.0",
@@ -10198,6 +10198,7 @@ checksum = "48fd7bd8a6377e15ad9d42a8ec25371b94ddc67abe7c8b9127bec79bebaaae18"
 [[package]]
 name = "rust-eth-triedb"
 version = "0.1.0"
+source = "git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=2ee553918383d55e95843dda1c6063ac5bc57972#2ee553918383d55e95843dda1c6063ac5bc57972"
 dependencies = [
  "alloy-primitives",
  "alloy-trie",
@@ -10205,9 +10206,9 @@ dependencies = [
  "once_cell",
  "rayon",
  "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git)",
- "rust-eth-triedb-common",
- "rust-eth-triedb-pathdb",
- "rust-eth-triedb-state-trie",
+ "rust-eth-triedb-common 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=2ee553918383d55e95843dda1c6063ac5bc57972)",
+ "rust-eth-triedb-pathdb 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=2ee553918383d55e95843dda1c6063ac5bc57972)",
+ "rust-eth-triedb-state-trie 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=2ee553918383d55e95843dda1c6063ac5bc57972)",
  "schnellru",
  "serde",
  "thiserror 1.0.69",
@@ -10216,8 +10217,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "rust-eth-triedb"
+version = "0.1.0"
+source = "git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=43ff426c7dc4f149f513a92380d4d4db5505f2d1#43ff426c7dc4f149f513a92380d4d4db5505f2d1"
+dependencies = [
+ "alloy-primitives",
+ "alloy-trie",
+ "metrics",
+ "once_cell",
+ "rayon",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git)",
+ "rust-eth-triedb-common 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=43ff426c7dc4f149f513a92380d4d4db5505f2d1)",
+ "rust-eth-triedb-pathdb 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=43ff426c7dc4f149f513a92380d4d4db5505f2d1)",
+ "rust-eth-triedb-state-trie 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=43ff426c7dc4f149f513a92380d4d4db5505f2d1)",
+ "schnellru",
+ "serde",
+ "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
 name = "rust-eth-triedb-common"
 version = "0.1.0"
+source = "git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=2ee553918383d55e95843dda1c6063ac5bc57972#2ee553918383d55e95843dda1c6063ac5bc57972"
 dependencies = [
  "alloy-primitives",
  "auto_impl",
@@ -10226,8 +10248,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rust-eth-triedb-common"
+version = "0.1.0"
+source = "git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=43ff426c7dc4f149f513a92380d4d4db5505f2d1#43ff426c7dc4f149f513a92380d4d4db5505f2d1"
+dependencies = [
+ "alloy-primitives",
+ "auto_impl",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "rust-eth-triedb-pathdb"
 version = "0.1.0"
+source = "git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=2ee553918383d55e95843dda1c6063ac5bc57972#2ee553918383d55e95843dda1c6063ac5bc57972"
 dependencies = [
  "alloy-primitives",
  "alloy-trie",
@@ -10235,7 +10268,7 @@ dependencies = [
  "mini-moka",
  "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git)",
  "rocksdb",
- "rust-eth-triedb-common",
+ "rust-eth-triedb-common 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=2ee553918383d55e95843dda1c6063ac5bc57972)",
  "schnellru",
  "tempfile",
  "thiserror 1.0.69",
@@ -10244,8 +10277,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "rust-eth-triedb-pathdb"
+version = "0.1.0"
+source = "git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=43ff426c7dc4f149f513a92380d4d4db5505f2d1#43ff426c7dc4f149f513a92380d4d4db5505f2d1"
+dependencies = [
+ "alloy-primitives",
+ "alloy-trie",
+ "metrics",
+ "mini-moka",
+ "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git)",
+ "rocksdb",
+ "rust-eth-triedb-common 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=43ff426c7dc4f149f513a92380d4d4db5505f2d1)",
+ "schnellru",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
 name = "rust-eth-triedb-state-trie"
 version = "0.1.0"
+source = "git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=2ee553918383d55e95843dda1c6063ac5bc57972#2ee553918383d55e95843dda1c6063ac5bc57972"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -10254,10 +10306,28 @@ dependencies = [
  "hex 0.4.3",
  "rand 0.8.5",
  "rayon",
- "rust-eth-triedb-common",
- "rust-eth-triedb-pathdb",
+ "rust-eth-triedb-common 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=2ee553918383d55e95843dda1c6063ac5bc57972)",
+ "rust-eth-triedb-pathdb 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=2ee553918383d55e95843dda1c6063ac5bc57972)",
  "thiserror 1.0.69",
  "tikv-jemallocator",
+ "tracing",
+]
+
+[[package]]
+name = "rust-eth-triedb-state-trie"
+version = "0.1.0"
+source = "git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=43ff426c7dc4f149f513a92380d4d4db5505f2d1#43ff426c7dc4f149f513a92380d4d4db5505f2d1"
+dependencies = [
+ "alloy-primitives",
+ "alloy-rlp",
+ "alloy-trie",
+ "auto_impl",
+ "hex 0.4.3",
+ "rand 0.8.5",
+ "rayon",
+ "rust-eth-triedb-common 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=43ff426c7dc4f149f513a92380d4d4db5505f2d1)",
+ "rust-eth-triedb-pathdb 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=43ff426c7dc4f149f513a92380d4d4db5505f2d1)",
+ "thiserror 1.0.69",
  "tracing",
 ]
 
