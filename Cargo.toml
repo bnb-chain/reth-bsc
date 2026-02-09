@@ -239,7 +239,3 @@ vergen-git2 = "=1.0.7"
 [dev-dependencies]
 uuid = { version = "1", features = ["v4"] }
 
-# Patch crates.io `alloy-evm` to a vendored copy that includes a compatibility
-# fix for `BlockOverrides` (ignore newly added fields like `blob_base_fee`).
-[patch.crates-io]
-alloy-evm = { path = "patched/alloy-evm" }
