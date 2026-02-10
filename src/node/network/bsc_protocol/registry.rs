@@ -219,7 +219,10 @@ pub fn broadcast_votes(votes: Vec<crate::consensus::parlia::vote::VoteEnvelope>)
                 if let Some(info) = peer_info_map.get(&peer) {
                     tracing::debug!(target: "bsc::vote", peer=%peer, latest_block=info.best_number, 
                         total_difficulty=u256_to_u128(info.best_td.unwrap_or_default()), 
-                        "peer info when checking allow broadcast votes latest_block:{} local best td:{}", info.best_number.unwrap_or_default(), local_best_td.unwrap_or_default());
+                        local_best_number=local_best_number,
+                        local_best_td=local_best_td,
+                        "peer info when checking allow broadcast votes"
+                    );
                     // Prefer Eth69 latest block distance; else use total_difficulty delta if both are known
                     if let Some(peer_latest) = info.best_number {
                         let delta = (local_best_number as u128).abs_diff(peer_latest as u128);
@@ -241,9 +244,9 @@ pub fn broadcast_votes(votes: Vec<crate::consensus::parlia::vote::VoteEnvelope>)
                 }
             }
 
-            tracing::trace!(target: "bsc::vote", peer=%peer, allow=allow, is_proxyed=is_proxyed_peer(&peer), "broadcast votes to peer");
+            tracing::debug!(target: "bsc::vote", peer=%peer, allow=allow, is_proxyed=is_proxyed_peer(&peer), "broadcast votes to peer");
             if allow && tx.send(BscCommand::Votes(Arc::clone(&votes_arc))).is_err() {
-                tracing::trace!(target: "bsc::vote", peer=%peer, "failed to send votes to peer, remove from registry");
+                tracing::warn!(target: "bsc::vote", peer=%peer, "failed to send votes to peer, remove from registry");
                 to_remove.push(peer);
             }
         }

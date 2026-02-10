@@ -18,6 +18,7 @@ use parking_lot::RwLock;
 use reth::consensus::HeaderValidator;
 use reth::network::cache::LruCache;
 use reth_engine_primitives::{ConsensusEngineHandle, EngineTypes};
+use reth_engine_tree::engine::{EngineApiRequest, ExecutedBlockRequest};
 use reth_eth_wire::{BlockHashNumber, GetBlockHeaders, NewBlock};
 use reth_eth_wire_types::broadcast::NewBlockHashes;
 use reth_network::{
@@ -42,7 +43,7 @@ use std::{
     sync::Arc,
     task::{Context, Poll},
 };
-use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::{mpsc::{self, UnboundedReceiver, UnboundedSender}, oneshot};
 
 /// Network message containing a new block
 pub(crate) type BlockMsg = NewBlockMessage<BscNewBlock>;
@@ -138,8 +139,16 @@ where
     fn new_payload(&self, block: BlockMsg, peer_id: PeerId) -> ImportFut {
         let engine = self.engine.clone();
         let forkchoice_engine = self.forkchoice_engine.clone();
-
-        tracing::debug!(target: "bsc::block_import", "New payload: block = ({:?}, {:?}), peer_id = {:?}", block.block.0.block.header.number, block.block.0.block.header.hash_slow(), peer_id);
+        tracing::debug!(target: "bsc::block_import",
+            block_number = %block.block.0.block.header.number,
+            block_hash = %block.block.0.block.header.hash_slow(),
+            parent_hash = %block.block.0.block.header.parent_hash,
+            miner = %block.block.0.block.header.beneficiary,
+            difficulty = %block.block.0.block.header.difficulty,
+            txs = block.block.0.block.body.transactions.len(),
+            peer_id = %peer_id,
+            "New payload"
+        );
         Box::pin(async move {
             let sealed_block = block.block.0.block.clone().seal();
             let header = sealed_block.header().clone();
@@ -147,7 +156,7 @@ where
             match engine.new_payload(payload).await {
                 Ok(payload_status) => match payload_status.status {
                     PayloadStatusEnum::Valid => {
-                        tracing::debug!(target: "bsc::block_import", "New payload is valid, block = {:?}, peer_id = {:?}", block, peer_id);
+                        tracing::debug!(target: "bsc::block_import", "New payload is valid, block_number = {:?}, block_hash = {:?}, peer_id = {:?}", header.number, block.hash, peer_id);
                         // handle fork choice update with valid payload
                         if let Err(e) = forkchoice_engine.update_forkchoice(&header).await {
                             tracing::warn!(target: "bsc::block_import", "Failed to update fork choice: {}", e);
@@ -172,7 +181,7 @@ where
                         tracing::debug!(
                             target: "bsc::block_import",
                             block_hash = %block_hash,
-                            block_number = block_number,
+                            block_number = %block_number,
                             "New payload returned Syncing status - attempting fork choice update"
                         );
 
@@ -194,7 +203,7 @@ where
                                 tracing::debug!(
                                     target: "bsc::block_import",
                                     block_hash = %block_hash,
-                                    block_number = block_number,
+                                    block_number = %block_number,
                                     status = ?result.payload_status.status,
                                     "FCU result for syncing block"
                                 );
@@ -203,7 +212,7 @@ where
                                 tracing::trace!(
                                     target: "bsc::block_import",
                                     block_hash = %block_hash,
-                                    block_number = block_number,
+                                    block_number = %block_number,
                                     error = %err,
                                     "Failed to update fork choice for syncing block"
                                 );
@@ -247,26 +256,44 @@ where
             .send(BlockImportEvent::Announcement(BlockValidation::ValidBlock { block: block_msg }));
 
         // Broadcast built payload event for fast consumers
-        if let Some(tx) = crate::shared::get_payload_events_tx() {
+        if let Some(tx) = crate::shared::get_engine_api_tx() {
             tracing::debug!(target: "bsc::block_import", "Sending built payload event for mined block: {:?}", block_hash);
-            let _ = tx.send(Events::<BscPayloadTypes>::BuiltPayload(payload));
-        } else {
-            tracing::warn!(
-                "Failed to send mined block due to payload events channel not initialised"
-            );
-        }
+            let (req_tx, req_rx) = oneshot::channel();
+            if let Err(e) = tx.send(EngineApiRequest::InsertExecutedBlock(ExecutedBlockRequest {
+                block: payload.executed_block().unwrap(),
+                tx: Some(req_tx),
+            })) {
+                tracing::warn!(target: "bsc::block_import", "Failed to send executed block request: number = {:?}, hash = {:?}, error = {}", payload.block.number, payload.block.hash(), e);
+                return;
+            }
 
-        // Update fork choice for the mined block
-        {
+            let block_number = payload.block.number;
+            let block_hash = payload.block.hash();
             let forkchoice_engine = self.forkchoice_engine.clone();
             tokio::spawn(async move {
-                tracing::debug!(target: "bsc::block_import", "Updating fork choice for mined block: number = {:?}, hash = {:?}", header_for_fcu.number, header_for_fcu.hash_slow());
-                if let Err(e) = forkchoice_engine.update_forkchoice(&header_for_fcu).await {
-                    tracing::warn!(target: "bsc::block_import", "Failed to update fork choice for mined block: number = {:?}, hash = {:?}, error = {}", header_for_fcu.number, header_for_fcu.hash_slow(), e);
-                } else {
-                    tracing::debug!(target: "bsc::block_import", "Succeed to update fork choice for mined block: number = {:?}, hash = {:?}", header_for_fcu.number, header_for_fcu.hash_slow());
+                match req_rx.await {
+                    Ok(Ok(())) => {
+                        tracing::debug!(target: "bsc::block_import", "Succeed to insert executed block: number = {:?}, hash = {:?}", block_number, block_hash);
+                        // Update fork choice for the mined block
+                        tokio::spawn(async move {
+                            tracing::debug!(target: "bsc::block_import", "Updating fork choice for mined block: number = {:?}, hash = {:?}", block_number, block_hash);
+                            if let Err(e) = forkchoice_engine.update_forkchoice(&header_for_fcu).await {
+                                tracing::warn!(target: "bsc::block_import", "Failed to update fork choice for mined block: number = {:?}, hash = {:?}, error = {}", block_number, block_hash, e);
+                            } else {
+                                tracing::debug!(target: "bsc::block_import", "Succeed to update fork choice for mined block: number = {:?}, hash = {:?}", block_number, block_hash);
+                            }
+                        });
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(target: "bsc::block_import", "Failed to insert executed block: number = {:?}, hash = {:?}, error = {}", block_number, block_hash, e);
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "bsc::block_import", "Executed block request channel closed: number = {:?}, hash = {:?}, error = {}", block_number, block_hash, e);
+                    }
                 }
             });
+        }else {
+            tracing::warn!(target: "bsc::block_import", "the engine api tx is not initialized, block will be dropped: number = {:?}, hash = {:?}", payload.block.number, payload.block.hash());
         }
         // Cache the block hash to avoid re-processing the same block.
         self.processed_blocks.insert(block_hash);
@@ -379,7 +406,7 @@ where
     fn transfer_to_evn_peers(&self, block: BlockMsg) -> Result<(), Box<dyn std::error::Error>> {
         let mining_config = crate::node::miner::config::get_global_mining_config().ok_or("Mining config is not set")?;
         let cfg = crate::node::network::evn::get_global_evn_config().ok_or("EVN config is not set")?;
-        if !cfg.enabled {
+        if !cfg.enabled && cfg.whitelist_nodeids.is_empty() {
             return Ok(());
         }
         let header_ref = &block.block.0.block.header;
@@ -437,6 +464,8 @@ where
                 if let Ok(BlockValidation::ValidBlock { block }) = &outcome.result {
                     block_hash = Some(block.hash);
                     this.processed_blocks.insert(block.hash);
+                    // insert header to cache
+                    insert_header_to_cache(block.block.0.block.header.clone());
                     // Cache the full block body for later range responses.
                     crate::shared::cache_full_block(block.block.0.block.clone());
                     if let Err(e) = this.transfer_to_evn_peers(block.clone()) {
@@ -451,6 +480,7 @@ where
                 //     this.queued_blocks.remove(&block_hash);
                 // }
 
+                // just keep a fallback notification here, to avoid block sending failed.
                 if let Err(e) = this.to_network.send(BlockImportEvent::Outcome(outcome)) {
                     return Poll::Ready(Err(Box::new(e)));
                 }

@@ -1,4 +1,5 @@
 use lazy_static::lazy_static;
+use once_cell::sync::Lazy;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::SystemTime;
@@ -17,6 +18,7 @@ use super::{
 use crate::consensus::parlia::constants::K_ANCESTOR_GENERATION_DEPTH;
 use crate::consensus::parlia::go_rng::{RngSource, Shuffle};
 use crate::consensus::parlia::provider::SnapshotProvider;
+use crate::consensus::parlia::util::calculate_millisecond_timestamp;
 use crate::consensus::parlia::util::is_breathe_block;
 use crate::consensus::parlia::vote_pool::fetch_vote_by_block_hash;
 use crate::consensus::parlia::VoteData;
@@ -25,9 +27,12 @@ use crate::consensus::parlia::SYSTEM_TXS_GAS_HARD_LIMIT;
 use crate::consensus::parlia::SYSTEM_TXS_GAS_SOFT_LIMIT;
 use crate::hardforks::BscHardforks;
 use crate::node::evm::pre_execution::TURN_LENGTH_CACHE;
+use crate::node::evm::util::get_cannonical_header_from_cache;
+use crate::node::evm::util::get_header_by_hash_from_cache;
 use alloy_consensus::{BlockHeader, Header};
 use alloy_primitives::{Address, B256};
 use alloy_rlp::Decodable;
+use crate::metrics::BscFinalityMetrics;
 use reth_chainspec::EthChainSpec;
 use schnellru::ByLength;
 use schnellru::LruMap;
@@ -35,7 +40,7 @@ use secp256k1::{
     ecdsa::{RecoverableSignature, RecoveryId},
     Message, SECP256K1,
 };
-use tracing::{debug, trace, warn};
+use tracing::{debug, warn};
 
 const RECOVERED_PROPOSER_CACHE_NUM: usize = 4096;
 const ADDRESS_LENGTH: usize = 20; // Ethereum address length in bytes
@@ -44,6 +49,9 @@ lazy_static! {
     // recovered proposer cache map by block_number: proposer_address
     static ref RECOVERED_PROPOSER_CACHE: RwLock<LruMap<B256, Address, ByLength>> = RwLock::new(LruMap::new(ByLength::new(RECOVERED_PROPOSER_CACHE_NUM as u32)));
 }
+
+pub static FINALITY_METRICS: Lazy<BscFinalityMetrics> =
+    Lazy::new(BscFinalityMetrics::default);
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Parlia<ChainSpec> {
@@ -413,13 +421,12 @@ where
     pub fn back_off_time(&self, snap: &Snapshot, parent: &Header, header: &Header) -> u64 {
         let validator = header.beneficiary;
 
-        tracing::trace!(
+        tracing::debug!(
             target: "bsc::consensus::back_off_time",
             block_number = header.number,
             validator = ?validator,
             snapshot_block = snap.block_number,
             recent_proposers_count = snap.recent_proposers.len(),
-            recent_proposers = ?snap.recent_proposers,
             "Calculating back_off_time"
         );
 
@@ -438,11 +445,12 @@ where
         if self.spec.is_planck_active_at_block(header.number) {
             let counts = snap.count_recent_proposers();
 
+            // Avoid dumping the entire counts map at debug level to reduce per-block logging overhead.
             tracing::trace!(
                 target: "bsc::consensus::back_off_time",
                 block_number = header.number,
-                counts = ?counts,
-                "Counted recent proposers"
+                counts_len = counts.len(),
+                "Counted recent proposers (trace)"
             );
 
             if snap.sign_recently_by_counts(validator, &counts) {
@@ -452,7 +460,7 @@ where
 
             let inturn_addr = snap.inturn_validator();
             if snap.sign_recently_by_counts(inturn_addr, &counts) {
-                trace!(
+                debug!(
                     "in turn validator({:?}) has recently signed, skip initialBackOffTime",
                     inturn_addr
                 );
@@ -534,7 +542,7 @@ where
                     delay + back_off_steps[idx] * BACKOFF_TIME_OF_WIGGLE
                 };
 
-                tracing::trace!(
+                tracing::debug!(
                     target: "bsc::consensus::back_off_time",
                     block_number = header.number,
                     validator = ?validator,
@@ -567,14 +575,15 @@ where
             delay_ms -= left_over_ms;
         }
 
-        let mut time_for_mining_ms = period_ms / 2;
-        let last_block_in_turn = snap.last_block_in_one_turn(header.number);
-        if !last_block_in_turn {
-            time_for_mining_ms = period_ms;
-        }
-        if delay_ms > time_for_mining_ms {
-            delay_ms = time_for_mining_ms;
-        }
+        // TODO: remove it now, miner can produce block until timeout.
+        // let mut time_for_mining_ms = period_ms / 2;
+        // let last_block_in_turn = snap.last_block_in_one_turn(header.number);
+        // if !last_block_in_turn {
+        //     time_for_mining_ms = period_ms;
+        // }
+        // if delay_ms > time_for_mining_ms {
+        //     delay_ms = time_for_mining_ms;
+        // }
 
         delay_ms
     }
@@ -655,6 +664,7 @@ where
         new_header: &mut Header,
     ) -> Result<(), ParliaConsensusError> {
         let epoch_length = parent_snap.epoch_num;
+        tracing::debug!("Prepare turn length: block_number={}, epoch_length={}, is_bohr={}", new_header.number, epoch_length, self.spec.is_bohr_active_at_timestamp(new_header.number, new_header.timestamp));
         if !new_header.number.is_multiple_of(epoch_length)
             || !self.spec.is_bohr_active_at_timestamp(new_header.number, new_header.timestamp)
         {
@@ -711,7 +721,7 @@ where
         }
 
         // get justified number and hash from parent snapshot
-        let (justified_number, justified_hash) =
+        let (mut justified_number, mut justified_hash) =
             (parent_snap.vote_data.target_number, parent_snap.vote_data.target_hash);
         let mut times = 1;
         if self
@@ -756,7 +766,20 @@ where
                 return Ok(());
             }
         };
-
+        // if justified_hash is zero, it loads genesis hash as source.
+        // once one attestation generated, attestation of snap would not be nil forever basically
+        // ref: https://github.com/bnb-chain/bsc/blob/583cfec3ea811fb124e6812aabd190555d5aeabc/consensus/parlia/parlia.go#L2161
+        if justified_hash == B256::ZERO {
+            match get_cannonical_header_from_cache(0) {
+                Some(genesis_header) => {
+                    justified_number = genesis_header.number();
+                    justified_hash = genesis_header.hash_slow();
+                }
+                None => {
+                    return Err(ParliaConsensusError::HeaderNotFound { block_hash: B256::ZERO });
+                }
+            }
+        }
         let mut attestation = VoteAttestation::new_with_vote_data(VoteData {
             source_number: justified_number,
             source_hash: justified_hash,
@@ -802,6 +825,19 @@ where
             tracing::debug!(target: "parlia::consensus", "not enough unique votes after filtering, have={}, need={}", ordered_unique.len(), quorum);
             return Ok(()); // If not enough unique votes, do not append attestation
         }
+
+        // record finality duration in header
+        let finalized_header = get_header_by_hash_from_cache(&justified_hash)
+            .ok_or(ParliaConsensusError::HeaderNotFound { block_hash: justified_hash })?;
+        let finalized_ms = calculate_millisecond_timestamp(&finalized_header) as u128;
+        let now_ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        FINALITY_METRICS
+            .finality_duration_ms
+            .record(now_ms.abs_diff(finalized_ms) as f64);
+
         // Aggregate signatures
         let sigs: Vec<blst::min_pk::Signature> = ordered_unique
             .iter()

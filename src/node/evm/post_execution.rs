@@ -1,6 +1,7 @@
 use super::executor::BscBlockExecutor;
 use super::error::{BscBlockExecutionError, BscBlockValidationError};
 use super::util::set_nonce;
+use crate::consensus::parlia::snapshot::{LORENTZ_EPOCH_LENGTH, MAXWELL_EPOCH_LENGTH};
 use crate::consensus::parlia::{FF_REWARD_DISTRIBUTION_INTERVAL};
 use crate::node::evm::pre_execution::TURN_LENGTH_CACHE;
 use crate::node::evm::util::get_header_by_hash_from_cache;
@@ -8,7 +9,11 @@ use crate::node::miner::signer::{sign_system_transaction, is_signer_initialized}
 use crate::consensus::parlia::{DIFF_INTURN, VoteAddress, VoteAttestation, snapshot::DEFAULT_TURN_LENGTH, constants::COLLECT_ADDITIONAL_VOTES_REWARD_RATIO, util::is_breathe_block};
 use crate::consensus::{SYSTEM_ADDRESS, MAX_SYSTEM_REWARD, SYSTEM_REWARD_PERCENT};
 use crate::evm::transaction::BscTxEnv;
-use crate::system_contracts::{SLASH_CONTRACT, SYSTEM_REWARD_CONTRACT, STAKE_HUB_CONTRACT, feynman_fork::{ValidatorElectionInfo, get_top_validators_by_voting_power, ElectedValidators}};
+use crate::system_contracts::{
+    SLASH_CONTRACT, STAKE_HUB_CONTRACT,
+    SYSTEM_REWARD_CONTRACT,
+    feynman_fork::{ValidatorElectionInfo, get_top_validators_by_voting_power, ElectedValidators},
+};
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
 use reth_evm::{eth::receipt_builder::{ReceiptBuilder, ReceiptBuilderCtx}, execute::BlockExecutionError, Database, Evm, FromRecoveredTx, FromTxWithEncoded, IntoTxEnv, block::StateChangeSource};
 use reth_primitives::{TransactionSigned, Transaction};
@@ -134,7 +139,8 @@ where
         }
 
         { // cache turnlength
-            let is_bohr = self.spec.is_bohr_active_at_timestamp(header.number, header.timestamp);
+            // TODO: isbohr should be checked on next block, and timestamp should be the timestamp of next block.
+            let is_bohr = self.spec.is_bohr_active_at_timestamp(header.number+1, header.timestamp+3);
             tracing::debug!(
                 "Check turn length cache update: block_number={}, epoch_length={}, is_next_epoch={}, is_bohr={}",
                 header.number, epoch_length, is_next_epoch, is_bohr
@@ -167,6 +173,7 @@ where
         let (mut validators, mut vote_addrs_map) =
             current_validators.ok_or(BlockExecutionError::msg("Invalid current validators data"))?;
         validators.sort();
+        tracing::debug!("current validators, block_number: {}, validators: {:?}", header_ref.number, validators);
 
         let validator_num = validators.len();
         if self.spec.is_luban_transition_at_block(header_ref.number) {
@@ -552,6 +559,15 @@ where
                 U256::from(reward);
         }
 
+        tracing::debug!(
+            target: "bsc::evm::post_execution",
+            block_number = parent_header.number,
+            block_hash = ?parent_header.hash_slow(),
+            miner = ?parent_header.beneficiary,
+            quorum = quorum,
+            valid_vote_count = valid_vote_count,
+            "Processed header attestation"
+        );
         Ok(())
     
     }   
@@ -636,7 +652,10 @@ where
         
         // TODO: remove post cache later.
         // Use epoch_num from current snapshot (after apply) for epoch boundary check
-        let is_next_epoch = (header_number + 1).is_multiple_of(epoch_length);
+        let is_next_epoch = (header_number + 1).is_multiple_of(epoch_length)
+            // TODO: temporary fix for lorentz and maxwell epoch length, it may miss epoch consensus data when mining the boundary block.
+            || (header_number + 1).is_multiple_of(LORENTZ_EPOCH_LENGTH)
+            || (header_number + 1).is_multiple_of(MAXWELL_EPOCH_LENGTH);
         if is_next_epoch {  
             // cache validators
             tracing::debug!(
@@ -648,8 +667,8 @@ where
         }
 
         { 
-            // cache turnlength
-            let is_bohr = self.spec.is_bohr_active_at_timestamp(header_number, header_timestamp);
+            // TODO: cache turnlength for next block.
+            let is_bohr = self.spec.is_bohr_active_at_timestamp(header_number+1, header_timestamp+3);
             tracing::debug!(
                 "Check turn length cache update: block_number={}, epoch_length={}, is_next_epoch={}, is_bohr={}",
                 header_number, epoch_length, is_next_epoch, is_bohr

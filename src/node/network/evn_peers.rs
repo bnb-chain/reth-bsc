@@ -31,7 +31,7 @@ pub fn peer_id_to_node_id(peer: PeerId) -> String {
 /// Attempt to mark a peer as EVN by whitelist entries in the global EVN config.
 pub fn mark_evn_if_whitelisted(peer: PeerId) {
     if let Some(cfg) = crate::node::network::evn::get_global_evn_config() {
-        if !cfg.enabled { return; }
+        if !cfg.enabled && cfg.whitelist_nodeids.is_empty() { return; }
         if cfg.whitelist_nodeids.is_empty() { return; }
 
         // Compare peer's ID string with whitelist entries

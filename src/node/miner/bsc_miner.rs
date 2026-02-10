@@ -1,5 +1,6 @@
 use crate::node::miner::bid_simulator::{BidRuntime, BidSimulator};
 use crate::node::miner::payload::BscBuildArguments;
+use crate::BscPrimitives;
 use crate::{
     chainspec::BscChainSpec,
     consensus::parlia::{provider::SnapshotProvider, vote_pool, Parlia},
@@ -36,7 +37,8 @@ use reth_payload_primitives::BuiltPayload;
 use reth_primitives::{SealedHeader, TransactionSigned};
 use reth_primitives_traits::BlockBody;
 use reth_provider::{
-    BlockNumReader, CanonStateNotification, CanonStateSubscriptions, HeaderProvider,
+    BlockNumReader, BlockReader, CanonStateNotification, CanonStateSubscriptions, HeaderProvider,
+    NodePrimitivesProvider,
 };
 use reth_revm::cancelled::ManualCancel;
 use reth_tasks::TaskExecutor;
@@ -52,6 +54,8 @@ use tracing::{debug, error, info, trace, warn};
 
 /// Maximum number of recently mined blocks to track for double signing prevention
 const RECENT_MINED_BLOCKS_CACHE_SIZE: usize = 100;
+
+const SYNCING_THRESHOLD_SECONDS: u64 = 60; // 60 seconds
 
 #[derive(Clone, Debug)]
 pub struct MiningContext {
@@ -85,7 +89,8 @@ where
         + BlockNumReader
         + reth_provider::StateProviderFactory
         + CanonStateSubscriptions
-        + reth_provider::NodePrimitivesProvider
+        + reth_provider::NodePrimitivesProvider<Primitives = BscPrimitives>
+        + BlockReader
         + Clone
         + Send
         + Sync
@@ -126,10 +131,11 @@ where
                     debug!(
                         target: "bsc::miner",
                         tip_block = committed.tip().number(),
-                        hash = ?committed.tip().hash(),
-                        parent_hash = ?committed.tip().parent_hash(),
-                        miner = ?committed.tip().beneficiary(),
-                        diff = %committed.tip().difficulty(),
+                        tip_hash = ?committed.tip().hash(),
+                        tip_parent_hash = ?committed.tip().parent_hash(),
+                        tip_miner = ?committed.tip().beneficiary(),
+                        tip_difficulty = %committed.tip().difficulty(),
+                        tip_timestamp = %committed.tip().timestamp(),
                         committed_blocks = committed.len(),
                         is_reorg,
                         "Try new work"
@@ -346,13 +352,14 @@ where
         H: alloy_consensus::BlockHeader + Sealable,
     {
         // TODO: refine check is_syncing status.
-        if tip.timestamp()
-            < SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() - 3
-        {
+        let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        if tip.timestamp() < now_secs - SYNCING_THRESHOLD_SECONDS {
             debug!(
-                "Skip to mine new block due to maybe in syncing, validator: {}, tip: {}",
+                "Skip to mine new block due to maybe in syncing, validator: {}, tip: {}, tip_timestamp: {}, now_secs: {}",
                 self.validator_address,
-                tip.number()
+                tip.number(),
+                tip.timestamp(),
+                now_secs,
             );
             return;
         }
@@ -420,6 +427,14 @@ where
             );
         }
 
+        tracing::debug!(target: "bsc::miner",
+            block_number = tip.number()+1,
+            parent_hash = ?tip.hash(),
+            miner = ?self.validator_address,
+            is_inturn = is_inturn,
+            inturn_miner = ?parent_snapshot.inturn_validator(),
+            "Try to mine new block"
+        );
         if parent_snapshot.sign_recently(self.validator_address) {
             debug!(
                 "Skip to mine new block due to signed recently, validator: {}, tip: {}",
@@ -898,6 +913,8 @@ where
             block_number,
             hash = ?block_hash,
             parent_hash = ?parent_hash,
+            miner = ?sealed_block.header().beneficiary,
+            difficulty = ?difficulty,
             txs = sealed_block.body().transaction_count(),
             gas_used = sealed_block.gas_used(),
             turn_status,
@@ -1102,7 +1119,9 @@ where
         + 'static,
     Provider: HeaderProvider<Header = alloy_consensus::Header>
         + BlockNumReader
+        + BlockReader
         + reth_provider::StateProviderFactory
+        + NodePrimitivesProvider<Primitives = BscPrimitives>
         + CanonStateSubscriptions
         + Clone
         + Send

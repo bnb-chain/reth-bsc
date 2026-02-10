@@ -25,7 +25,7 @@ use reth_provider::{BlockNumReader, HeaderProvider, StateProviderFactory};
 use reth_primitives::TransactionSigned;
 use std::{sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot, Mutex};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, warn, error};
 use alloy_rpc_types::{
     TransactionRequest as RpcTransactionRequest,
 };
@@ -297,15 +297,21 @@ impl BscNetworkBuilder {
 
         // Spawn the critical ImportService task exactly like the official implementation
         ctx.task_executor().spawn_critical("block import", async move {
-            let handle = engine_handle_rx
+            let handle = match engine_handle_rx
                 .lock()
                 .await
                 .take()
                 .expect("node should only be launched once")
                 .await
-                .unwrap();
+            {
+                Ok(h) => h,
+                Err(_) => {
+                    error!(target: "bsc::net", "Failed to receive ConsensusEngineHandle: sender dropped");
+                    return;
+                }
+            };
 
-            ImportService::new(
+            if let Err(err) = ImportService::new(
                 provider,
                 chain_spec,
                 handle,
@@ -315,7 +321,9 @@ impl BscNetworkBuilder {
                 to_network,
             )
             .await
-            .unwrap();
+            {
+                error!(target: "bsc::net", error = %err, "ImportService terminated with error");
+            }
         });
 
         // TODO: update network with the latest canonical head, but has a fork id issue, can fix it later.
@@ -323,8 +331,17 @@ impl BscNetworkBuilder {
             .boot_nodes(ctx.chain_spec().bootnodes().unwrap_or_default())
             .set_head(ctx.chain_spec().head())
             .with_pow()
-            .block_import(Box::new(BscBlockImport::new(handle)))
-            .discovery(discv4)
+            .block_import(Box::new(BscBlockImport::new(handle)));
+
+        let discovery_disabled = {
+            let discovery = &ctx.config().network.discovery;
+            discovery.disable_discovery || discovery.disable_discv4_discovery
+        };
+        if !discovery_disabled {
+            network_builder = network_builder.discovery(discv4);
+        }
+
+        network_builder = network_builder
             .eth_rlpx_handshake(Arc::new(BscHandshake::default()))
             // Advertise both bsc/2 (with range messages) and bsc/1 (votes only)
             .add_rlpx_sub_protocol(bsc_protocol::protocol::handler::BscProtocolHandlerV2)

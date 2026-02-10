@@ -3,7 +3,8 @@ use crate::consensus::eip4844::calc_blob_fee;
 use crate::consensus::parlia::provider::SnapshotProvider;
 use crate::consensus::parlia::Snapshot;
 use crate::hardforks::BscHardforks;
-use crate::node::engine::BscBuiltPayload;
+use crate::node::evm::assembler::BscBlockBuiltResult;
+use crate::node::evm::config::BscBlockExecutorFactory;
 use crate::node::evm::config::BscEvmConfig;
 use crate::node::miner::bsc_miner::MiningContext;
 use crate::node::miner::payload::DELAY_LEFT_OVER;
@@ -18,12 +19,9 @@ use alloy_primitives::{Address, B256};
 use parking_lot::RwLock;
 use reth::payload::EthPayloadBuilderAttributes;
 use reth::transaction_pool::BestTransactionsAttributes;
-use reth_chain_state::{ExecutedBlock, ExecutedTrieUpdates};
 use reth_chainspec::EthChainSpec;
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
 use reth_evm::execute::BlockBuilder;
-use reth_evm::execute::BlockBuilderOutcome;
-use reth_evm::execute::ExecutionOutcome;
 use reth_evm::execute::{BlockExecutionError, BlockValidationError};
 use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
 use reth_payload_primitives::PayloadBuilderAttributes;
@@ -389,7 +387,7 @@ where
         }
 
         let mut builder = match evm_config
-            .builder_for_next_block(
+            .bsc_builder_for_next_block(
                 &mut db,
                 &parent_header,
                 NextBlockEnvAttributes {
@@ -503,21 +501,25 @@ where
             return;
         }
 
+        // capture shared ctx before consuming builder
+        let shared_ctx = builder.shared_ctx.clone();
+
+        let current_validators = shared_ctx.inner.borrow().current_validators.clone();
+        let turn_length = shared_ctx.inner.borrow().turn_length.clone();
+
         // Finish the builder
-        let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } =
-            match builder.finish(&state_provider).map_err(PayloadBuilderError::other) {
+        let bsc_block_result = match builder.finish_not_sealed(&state_provider).map_err(PayloadBuilderError::other) {
                 Ok(outcome) => outcome,
                 Err(e) => {
                     debug!("Failed to finish builder: {:?}", e);
                     return;
                 }
             };
-        let mut sealed_block = Arc::new(block.sealed_block().clone());
 
         // Check if any un_revertible transaction failed
         // Receipts and transactions are in the same order, so we can zip them together
-        let transactions: Vec<_> = sealed_block.body().transactions().collect();
-        for (receipt, tx) in execution_result.receipts.iter().zip(transactions.iter()) {
+        let transactions: Vec<_> = bsc_block_result.transactions.iter().collect();
+        for (receipt, tx) in bsc_block_result.output.receipts.iter().zip(transactions.iter()) {
             let tx_hash = *tx.hash();
             // Check if this is an un_revertible transaction that failed
             if !receipt.success && bid_runtime.un_revertible_set.contains(&tx_hash) {
@@ -531,32 +533,16 @@ where
             }
         }
 
-        // Update block_hash for all blob sidecars and insert into pool's blob store
-        let block_hash = sealed_block.hash();
-        for sidecar in bid_runtime.blob_sidecars.iter_mut() {
-            sidecar.block_hash = block_hash;
-        }
-
-        let mut plain = sealed_block.clone_block();
-        plain.body.sidecars = Some(bid_runtime.blob_sidecars.clone());
-        sealed_block = Arc::new(plain.into());
-
-        bid_runtime.bsc_payload = BscBuiltPayload {
-            block: sealed_block.clone(),
-            fees: bid_runtime.gas_fee,
-            requests: Some(execution_result.requests.clone()),
-            executed_block: ExecutedBlock {
-                recovered_block: Arc::new(block.clone()),
-                execution_output: Arc::new(ExecutionOutcome::new(
-                    db.take_bundle(),
-                    vec![execution_result.receipts.clone()],
-                    sealed_block.header().number(),
-                    vec![execution_result.requests.clone()],
-                )),
-                hashed_state: Arc::new(hashed_state.clone()),
-            },
-            executed_trie: Some(ExecutedTrieUpdates::Present(Arc::new(trie_updates))),
-        };
+        bid_runtime.bsc_payload = Some(BscBlockBuiltResult {
+            number: parent_header.number() + 1,
+            bundle: db.take_bundle(),
+            assembled: bsc_block_result,
+            blob_sidecars: bid_runtime.blob_sidecars.clone(),
+            total_fees: bid_runtime.gas_fee,
+            current_validators,
+            turn_length,
+            is_bid: true,
+        });
 
         // Acquire write lock to update best_bid
         {
@@ -639,7 +625,7 @@ pub struct BidRuntime<Pool, EvmConfig = BscEvmConfig> {
     attributes: EthPayloadBuilderAttributes,
     builder_config: EthereumBuilderConfig,
     chain_spec: Arc<BscChainSpec>,
-    pub bsc_payload: BscBuiltPayload,
+    pub bsc_payload: Option<BscBlockBuiltResult<BscBlockExecutorFactory>>,
 
     gas_used: u64,
     gas_fee: U256,
@@ -679,7 +665,7 @@ where
             pool,
             evm_config,
             builder_config: EthereumBuilderConfig::default(),
-            bsc_payload: BscBuiltPayload::default(),
+            bsc_payload: None,
             expected_block_reward: U256::ZERO,
             expected_validator_reward: U256::ZERO,
             packed_block_reward: U256::ZERO,

@@ -173,6 +173,9 @@ pub struct BscMinerMetrics {
     /// This measures how long it takes from block creation to network broadcast
     /// Note: Value is stored in nanoseconds to match Golang implementation
     pub block_broadcast_delay_seconds: Histogram,
+
+    /// Total number of trading txs collected
+    pub trading_txs_count: Histogram,
 }
 
 /// Metrics for BSC fast finality
@@ -189,6 +192,12 @@ pub struct BscFinalityMetrics {
 
     /// Current safe block height (equivalent to chain/head/safe)
     pub safe_block_height: Gauge,
+
+    /// Finality duration in milliseconds
+    pub finality_duration_ms: Histogram,
+
+    /// Fast attestation finality duration in milliseconds
+    pub fast_atteatation_finality_duration_ms: Histogram,
 }
 
 /// Metrics for BSC blockchain operations

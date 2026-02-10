@@ -16,7 +16,7 @@ use reth_chainspec::{ChainSpec, EthChainSpec};
 use reth_ethereum_forks::Hardforks;
 use reth_primitives::{Transaction, TransactionSigned};
 use revm::state::Bytecode;
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::LazyLock};
 use thiserror::Error;
 use tracing::info;
 
@@ -24,6 +24,16 @@ mod abi;
 mod embedded_contracts;
 pub mod feynman_fork;
 
+pub static CONTRACT_ABI_CACHE: LazyLock<HashMap<String, JsonAbi>> = LazyLock::new(|| {
+    let mut cache = HashMap::new();
+    cache.insert("validator_abi_before_luban".to_string(), serde_json::from_str(*VALIDATOR_SET_ABI_BEFORE_LUBAN).unwrap());
+    cache.insert("validator_abi".to_string(), serde_json::from_str(*VALIDATOR_SET_ABI).unwrap());
+    cache.insert("slash_abi".to_string(), serde_json::from_str(*SLASH_INDICATOR_ABI).unwrap());
+    cache.insert("stake_hub_abi".to_string(), serde_json::from_str(*STAKE_HUB_ABI).unwrap());
+    cache
+});
+
+#[derive(Debug, Clone)]
 pub(crate) struct SystemContract<Spec: EthChainSpec> {
     /// The validator set abi before luban.
     validator_abi_before_luban: JsonAbi,
@@ -39,10 +49,10 @@ pub(crate) struct SystemContract<Spec: EthChainSpec> {
 
 impl<Spec: EthChainSpec + crate::hardforks::BscHardforks> SystemContract<Spec> {
     pub(crate) fn new(chain_spec: Spec) -> Self {
-        let validator_abi_before_luban = serde_json::from_str(*VALIDATOR_SET_ABI_BEFORE_LUBAN).unwrap();
-        let validator_abi = serde_json::from_str(*VALIDATOR_SET_ABI).unwrap();
-        let slash_abi = serde_json::from_str(*SLASH_INDICATOR_ABI).unwrap();
-        let stake_hub_abi = serde_json::from_str(*STAKE_HUB_ABI).unwrap();
+        let validator_abi_before_luban = CONTRACT_ABI_CACHE.get("validator_abi_before_luban").unwrap().clone();
+        let validator_abi = CONTRACT_ABI_CACHE.get("validator_abi").unwrap().clone();
+        let slash_abi = CONTRACT_ABI_CACHE.get("slash_abi").unwrap().clone();
+        let stake_hub_abi = CONTRACT_ABI_CACHE.get("stake_hub_abi").unwrap().clone();
         Self { validator_abi_before_luban, validator_abi, slash_abi, stake_hub_abi, chain_spec }
     }
 

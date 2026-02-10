@@ -1,3 +1,4 @@
+use crate::BscPrimitives;
 use crate::consensus::parlia::SnapshotProvider;
 use crate::node::engine_api::payload::BscPayloadTypes;
 use crate::node::network::block_import::service::{IncomingBlock, IncomingMinedBlock};
@@ -7,6 +8,7 @@ use alloy_consensus::{BlockHeader, Header};
 use alloy_rlp::Encodable;
 use alloy_eips::BlockId;
 use alloy_primitives::{B256, Bytes, U256};
+use reth_engine_tree::engine::EngineApiRequest;
 use reth_primitives::TransactionSigned;
 use parking_lot::Mutex;
 use reth_network::NetworkHandle;
@@ -606,6 +608,15 @@ pub async fn ipc_send_raw_transaction(
     .map_err(|e| eyre::eyre!("failed to query chain id from healthy node: {e}"))
 }
 
+static ENGINE_API_TX: OnceLock<UnboundedSender<EngineApiRequest<BscPayloadTypes, BscPrimitives>>> = OnceLock::new();
+
+pub fn set_engine_api_tx(tx: UnboundedSender<EngineApiRequest<BscPayloadTypes, BscPrimitives>>) -> Result<(), UnboundedSender<EngineApiRequest<BscPayloadTypes, BscPrimitives>>> {
+    ENGINE_API_TX.set(tx)
+}
+
+pub fn get_engine_api_tx() -> Option<&'static UnboundedSender<EngineApiRequest<BscPayloadTypes, BscPrimitives>>> {
+    ENGINE_API_TX.get()
+}
 #[cfg(test)]
 mod tests {
     use super::*;

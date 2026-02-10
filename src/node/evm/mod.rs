@@ -27,10 +27,11 @@ use revm::{
     Context, ExecuteEvm, InspectEvm, Inspector, SystemCallEvm,
 };
 
-mod assembler;
+pub mod assembler;
 mod builder;
 pub mod config;
 pub use config::BscEvmConfig;
+pub use factory::BscEvmFactory;
 mod executor;
 mod factory;
 mod patch;

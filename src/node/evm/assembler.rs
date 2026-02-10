@@ -1,15 +1,12 @@
 use crate::{
-    chainspec::BscChainSpec, 
-    consensus::parlia::{Parlia, EMPTY_REQUESTS_HASH, EMPTY_WITHDRAWALS_HASH}, 
-    hardforks::BscHardforks, 
-    node::{
-        evm::config::{BscBlockExecutionCtx, BscBlockExecutorFactory},
+    BscBlobTransactionSidecar, chainspec::BscChainSpec, consensus::parlia::{EMPTY_REQUESTS_HASH, EMPTY_WITHDRAWALS_HASH, Parlia, VoteAddress}, hardforks::BscHardforks, node::{
+        evm::{config::{BscBlockExecutionCtx, BscBlockExecutorFactory}},
         miner::util::finalize_new_header,
         primitives::{BscBlock, BscBlockBody},
     }
 };
 use alloy_consensus::{BlockBody, Header, EMPTY_OMMER_ROOT_HASH, proofs, Transaction, BlockHeader};
-use alloy_primitives::{keccak256, B256};
+use alloy_primitives::{Address, B256, U256, keccak256};
 use alloy_eips::{eip7840::BlobParams, merge::BEACON_NONCE};
 use alloy_primitives::Bytes;
 use alloy_rpc_types::Withdrawals;
@@ -21,7 +18,8 @@ use reth_evm::{
     EvmEnv,
 };
 use reth_primitives_traits::{logs_bloom, SealedHeader};
-use reth_provider::{BlockExecutionResult, StateProvider};
+use reth_provider::BlockExecutionResult;
+use reth_trie_common::{HashedPostState, updates::TrieUpdates};
 use revm::database::BundleState;
 use std::sync::Arc;
 
@@ -30,23 +28,62 @@ use std::sync::Arc;
 /// 
 /// This allows us to construct the input in external crates without being limited by
 /// the #[non_exhaustive] attribute on the original BlockAssemblerInput.
-pub struct BscBlockAssemblerInput<'a, 'b, F: BlockExecutorFactory, H = Header> {
+pub struct BscBlockAssemblerInput<'a, F: BlockExecutorFactory> {
     /// Configuration of EVM used when executing the block.
     pub evm_env: EvmEnv<<F::EvmFactory as reth_evm::EvmFactory>::Spec>,
-    /// BlockExecutorFactory::ExecutionCtx used to execute the block.
-    pub execution_ctx: F::ExecutionCtx<'a>,
-    /// Parent block header.
-    pub parent: &'a SealedHeader<H>,
+    pub parent_hash: B256,
     /// Transactions that were executed in this block.
     pub transactions: Vec<F::Transaction>,
     /// Output of block execution.
-    pub output: &'b BlockExecutionResult<F::Receipt>,
-    /// BundleState after the block execution.
-    pub bundle_state: &'a BundleState,
-    /// Provider with access to state.
-    pub state_provider: &'b dyn StateProvider,
+    pub output: &'a BlockExecutionResult<F::Receipt>,
     /// State root for this block.
     pub state_root: alloy_primitives::B256,
+}
+
+#[derive(Clone)]
+pub struct BscBlockAssembleResult<F: BlockExecutorFactory + Clone> {
+    /// Configuration of EVM used when executing the block.
+    pub evm_env: EvmEnv<<F::EvmFactory as reth_evm::EvmFactory>::Spec>,
+    /// Parent block hash.
+    pub parent_hash: B256,
+    /// Transactions that were executed in this block.
+    pub transactions: Vec<F::Transaction>,
+    /// Senders of the transactions.
+    pub senders: Vec<Address>,
+    /// Output of block execution.
+    pub output: BlockExecutionResult<F::Receipt>,
+    /// State root for this block.
+    pub state_root: alloy_primitives::B256,
+    /// Hashed state for this block.
+    pub hashed_state: HashedPostState,
+    /// Trie updates for this block.
+    pub trie_updates: TrieUpdates,
+}
+
+#[derive(Clone)]
+pub struct BscBlockBuiltResult<F>
+where
+    F: BlockExecutorFactory + Clone,
+    F::Transaction: Clone,
+    F::Receipt: Clone,
+    F::EvmFactory: Clone,
+{
+    /// Block number.
+    pub number: u64,
+    /// Bundle state for this block.
+    pub bundle: BundleState,
+    /// Assembled block result.
+    pub assembled: BscBlockAssembleResult<F>,
+    /// Blob sidecars for this block.
+    pub blob_sidecars: Vec<BscBlobTransactionSidecar>,
+    /// Total fees for this block.
+    pub total_fees: U256,
+    /// current validators for miner to produce block.
+    pub current_validators: Option<(Vec<Address>, Vec<VoteAddress>)>,
+    /// turn length for miner to produce block.
+    pub turn_length: Option<u8>,
+    /// Whether the block is a bid block.
+    pub is_bid: bool,
 }
 
 /// Block assembler for BSC, mainly for support BscBlockExecutionCtx.
@@ -74,7 +111,7 @@ where
 
     /// BSC-specific assemble_block method that accepts BscBlockAssemblerInput.
     /// This method is completely aligned with the standard assemble_block implementation.
-    pub fn assemble_block_bsc(&self, input: BscBlockAssemblerInput<'_, '_, BscBlockExecutorFactory>) -> 
+    pub fn assemble_block_bsc(&self, input: BscBlockAssemblerInput<BscBlockExecutorFactory>, parent: &SealedHeader<Header>) -> 
         Result<crate::node::primitives::BscBlock, BlockExecutionError>
     {
         // Get snapshot provider, return error if not available
@@ -84,8 +121,7 @@ where
 
         let BscBlockAssemblerInput {
             evm_env,
-            execution_ctx: ctx,
-            parent,
+            parent_hash,
             transactions,
             output: BlockExecutionResult { receipts, requests: _, gas_used },
             state_root,
@@ -93,10 +129,9 @@ where
         } = input;
 
         // Use the base EthBlockExecutionCtx for compatibility
-        let eth_ctx = ctx.as_eth_context();
         let timestamp = evm_env.block_env.timestamp.saturating_to();
         let transactions_root = proofs::calculate_transaction_root(&transactions);
-        let receipts_root = Receipt::calculate_receipt_root_no_memo(receipts);
+        let receipts_root = Receipt::calculate_receipt_root_no_memo(&receipts);
         let logs_bloom = logs_bloom(receipts.iter().flat_map(|r| &r.logs));
         let block_number = evm_env.block_env.number.saturating_to();
 
@@ -142,7 +177,7 @@ where
         };
 
         let mut header = Header {
-            parent_hash: eth_ctx.parent_hash,
+            parent_hash,
             ommers_hash: EMPTY_OMMER_ROOT_HASH,
             beneficiary: evm_env.block_env.beneficiary,
             state_root,

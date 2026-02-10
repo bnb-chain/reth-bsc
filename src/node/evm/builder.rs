@@ -1,4 +1,4 @@
-use crate::{BscPrimitives, hardforks::BscHardforks, node::evm::{assembler::{BscBlockAssembler, BscBlockAssemblerInput}, config::{BscBlockExecutionCtx, BscBlockExecutorFactory, BscExecutionSharedCtx}, executor::BscBlockExecutor, factory::BscEvmFactory, pre_execution::{TURN_LENGTH_CACHE, VALIDATOR_CACHE}}};
+use crate::{BscPrimitives, hardforks::BscHardforks, node::evm::{assembler::{BscBlockAssembler, BscBlockAssemblerInput, BscBlockAssembleResult}, config::{BscBlockExecutionCtx, BscBlockExecutorFactory, BscExecutionSharedCtx}, executor::BscBlockExecutor, factory::BscEvmFactory, pre_execution::{TURN_LENGTH_CACHE, VALIDATOR_CACHE}}};
 use reth_evm::execute::{BlockBuilder, BlockBuilderOutcome, BlockExecutionError, ExecutorTx};
 use alloy_evm::eth::receipt_builder::ReceiptBuilder;
 use reth_primitives_traits::{HeaderTy, NodePrimitives, Recovered, RecoveredBlock, SealedHeader, SignerRecoverable, TxTy};
@@ -29,10 +29,22 @@ where
     pub assembler: &'a BscBlockAssembler<crate::chainspec::BscChainSpec>,
 }
 
-impl<'a, EVM, Spec, R> BscBlockBuilder<'a, EVM, Spec, R>
+impl<'a, DB, EVM, Spec, R> BscBlockBuilder<'a, EVM, Spec, R>
 where
-    R: ReceiptBuilder,
+    BscBlockExecutor<'a, EVM, Spec, R>: alloy_evm::block::BlockExecutor<
+        Evm: alloy_evm::Evm<
+            Spec = <BscEvmFactory as reth_evm::EvmFactory>::Spec,
+            HaltReason = <BscEvmFactory as reth_evm::EvmFactory>::HaltReason,
+            DB = &'a mut State<DB>,
+        >,
+        Transaction = <BscPrimitives as NodePrimitives>::SignedTx,
+        Receipt = <BscPrimitives as NodePrimitives>::Receipt,
+    >,
+    DB: reth_evm::Database + 'a,
+    R: ReceiptBuilder<Transaction = <BscPrimitives as NodePrimitives>::SignedTx>,
     Spec: EthChainSpec + EthereumHardforks + BscHardforks + Hardforks + Clone,
+    R::Transaction: Clone + SignerRecoverable,
+    EVM: alloy_evm::Evm,
 {
     pub fn new(
         executor: BscBlockExecutor<'a, EVM, Spec, R>,
@@ -49,6 +61,49 @@ where
             parent,
             assembler,
         }
+    }
+
+    pub fn finish_not_sealed(
+        mut self,
+        state: impl StateProvider,
+    ) -> Result<BscBlockAssembleResult<BscBlockExecutorFactory>, BlockExecutionError> {
+        let finish_start = std::time::Instant::now();
+        let (evm, result) = self.executor.finish()?;
+        let (db, evm_env) = evm.finish();
+
+        let assembled_system_txs = self.shared_ctx.inner.borrow().assembled_system_txs.clone();
+        // merge all transitions into bundle state
+        db.merge_transitions(BundleRetention::Reverts);
+
+        // calculate the state root (must be correct - block header is validated against it)
+        let state_root_start = std::time::Instant::now();
+        let hashed_state = state.hashed_post_state(&db.bundle_state);
+        let (state_root, trie_updates) = state
+            .state_root_with_updates(hashed_state.clone())
+            .map_err(BlockExecutionError::other)?;
+        let state_root_duration = state_root_start.elapsed();
+
+        let user_tx_len = self.transactions.len();
+        let system_tx_len = assembled_system_txs.len();
+        self.transactions.extend(assembled_system_txs);
+        let total_tx_len = self.transactions.len();
+
+        let (transactions, senders): (Vec<_>, Vec<_>) =
+            self.transactions.into_iter().map(|tx| tx.into_parts()).unzip();
+
+        let finish_duration = finish_start.elapsed();
+        tracing::debug!(
+            target: "bsc::builder",
+            block_number = %evm_env.block_env.number.saturating_to::<u64>(),
+            user_tx_len = user_tx_len,
+            system_tx_len = system_tx_len,
+            total_tx_len = total_tx_len,
+            finish_duration_ms = finish_duration.as_millis(),
+            state_root_duration_ms = state_root_duration.as_millis(),
+            "Succeed to finish not sealed block"
+        );
+
+        Ok(BscBlockAssembleResult { evm_env, parent_hash: self.parent.hash(), transactions, senders, output: result, state_root, hashed_state, trie_updates })
     }
 }
 
@@ -124,18 +179,15 @@ where
 
         // BlockAssemblerInput is non_exhaustive. 
         // So define a new struct BscBlockAssemblerInput and a new interface assemble_block_bsc.
-        let bsc_input: BscBlockAssemblerInput<'_, '_, BscBlockExecutorFactory> = BscBlockAssemblerInput {
+        let bsc_input: BscBlockAssemblerInput<BscBlockExecutorFactory> = BscBlockAssemblerInput {
             evm_env,
-            execution_ctx: self.ctx,
-            parent: self.parent,
+            parent_hash: self.parent.hash(),
             transactions: transactions.clone(),
             output: &result,
-            bundle_state: &db.bundle_state,
-            state_provider: &state,
             state_root,
         };
         let assemble_start = std::time::Instant::now();
-        let block = self.assembler.assemble_block_bsc(bsc_input)?;
+        let block = self.assembler.assemble_block_bsc(bsc_input, self.parent)?;
 
         // cache current validators and turn length
         let current_validators = self.shared_ctx.inner.borrow().current_validators.clone();

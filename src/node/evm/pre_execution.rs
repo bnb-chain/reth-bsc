@@ -420,7 +420,16 @@ where
             self.vote_metrics.bls_verification_duration_seconds.record(start.elapsed().as_secs_f64());
  
             return match err {
-                BLST_ERROR::BLST_SUCCESS => Ok(()),
+                BLST_ERROR::BLST_SUCCESS => {
+                    tracing::debug!(
+                        target: "bsc::validation",
+                        block_number = header.number(),
+                        block_hash = ?header.hash_slow(),
+                        attestation = ?attestation,
+                        "Attestation verification succeeded"
+                    );
+                    Ok(())
+                }
                 _ => {
                     // Update BLS verification failure metric (kept here as it's a specific metric)
                     self.vote_metrics.bls_verification_failures_total.increment(1);

@@ -118,13 +118,55 @@ impl BscEvmConfig {
     }
 }
 
+impl BscEvmConfig {
+    pub fn bsc_builder_for_next_block<'a, DB: Database + 'a>(
+        &'a self,
+        db: &'a mut State<DB>,
+        parent: &'a SealedHeader<HeaderTy<BscPrimitives>>,
+        attributes: NextBlockEnvAttributes,
+    ) -> Result<
+        BscBlockBuilder<
+            'a,
+            EvmFor<Self, &'a mut State<DB>>,
+            Arc<BscChainSpec>,
+            RethReceiptBuilder,
+        >,
+        Infallible,
+    > {
+        let evm_env = self.next_evm_env(parent, &attributes)?;
+        let evm = self.evm_with_env(db, evm_env);
+        let ctx = self.context_for_next_block(parent, attributes);
+        // just init a default custom ctx for mining block.
+        let shared_ctx = BscExecutionSharedCtx::default();
+        let bsc_executor = BscBlockExecutor::new(
+            evm,
+            ctx.clone(),
+            shared_ctx.clone(),
+            self.executor_factory.spec().clone(),
+            *self.executor_factory.receipt_builder(),
+            SystemContract::new(self.chain_spec().clone()),
+        );
+        
+        Ok(BscBlockBuilder::new(
+            bsc_executor,
+            ctx,
+            shared_ctx,
+            &self.block_assembler,
+            parent,
+        ))
+    }
+}
+
 /// Ethereum block executor factory.
-#[derive(Debug, Clone, Default, Copy)]
+#[derive(Debug, Clone)]
 pub struct BscBlockExecutorFactory<
     R = RethReceiptBuilder,
     Spec = Arc<BscChainSpec>,
     EvmFactory = BscEvmFactory,
-> {
+>
+where
+    Spec: reth_chainspec::EthChainSpec + crate::hardforks::BscHardforks + Clone,
+{
     /// Receipt builder.
     receipt_builder: R,
     /// Chain specification.
@@ -133,10 +175,13 @@ pub struct BscBlockExecutorFactory<
     evm_factory: EvmFactory,
 }
 
-impl<R, Spec, EvmFactory> BscBlockExecutorFactory<R, Spec, EvmFactory> {
+impl<R, Spec, EvmFactory> BscBlockExecutorFactory<R, Spec, EvmFactory>
+where
+    Spec: reth_chainspec::EthChainSpec + crate::hardforks::BscHardforks + Clone,
+{
     /// Creates a new [`BscBlockExecutorFactory`] with the given spec, [`EvmFactory`], and
     /// [`ReceiptBuilder`].
-    pub const fn new(receipt_builder: R, spec: Spec, evm_factory: EvmFactory) -> Self {
+    pub fn new(receipt_builder: R, spec: Spec, evm_factory: EvmFactory) -> Self {
         Self { receipt_builder, spec, evm_factory }
     }
 
@@ -386,7 +431,7 @@ where
             shared_ctx.clone(),
             self.executor_factory.spec().clone(),
             *self.executor_factory.receipt_builder(),
-            SystemContract::new(self.executor_factory.spec().clone()),
+            SystemContract::new(self.chain_spec().clone()),
         );
         
         BscBlockBuilder::new(
