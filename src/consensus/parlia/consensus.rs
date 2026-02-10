@@ -834,9 +834,7 @@ where
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_millis();
-        FINALITY_METRICS
-            .finality_duration_ms
-            .record(now_ms.abs_diff(finalized_ms) as f64);
+        FINALITY_METRICS.finality_duration_ms.record(now_ms.abs_diff(finalized_ms) as f64);
 
         // Aggregate signatures
         let sigs: Vec<blst::min_pk::Signature> = ordered_unique

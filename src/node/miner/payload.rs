@@ -499,7 +499,7 @@ where
         let finalize_start = std::time::Instant::now();
         // capture shared ctx before consuming builder
         let shared_ctx = builder.shared_ctx.clone();
-        let bsc_block_result = builder.finish_not_sealed(&state_provider)?;
+        let bsc_block_result = builder.finish_with_no_seal(&state_provider)?;
 
         // Update miner metrics
         use crate::metrics::BscMinerMetrics;

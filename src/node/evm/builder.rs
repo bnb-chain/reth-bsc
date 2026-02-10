@@ -63,7 +63,7 @@ where
         }
     }
 
-    pub fn finish_not_sealed(
+    pub fn finish_with_no_seal(
         mut self,
         state: impl StateProvider,
     ) -> Result<BscBlockAssembleResult<BscBlockExecutorFactory>, BlockExecutionError> {

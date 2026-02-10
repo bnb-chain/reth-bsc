@@ -173,9 +173,6 @@ pub struct BscMinerMetrics {
     /// This measures how long it takes from block creation to network broadcast
     /// Note: Value is stored in nanoseconds to match Golang implementation
     pub block_broadcast_delay_seconds: Histogram,
-
-    /// Total number of trading txs collected
-    pub trading_txs_count: Histogram,
 }
 
 /// Metrics for BSC fast finality

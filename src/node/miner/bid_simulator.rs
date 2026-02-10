@@ -508,7 +508,7 @@ where
         let turn_length = shared_ctx.inner.borrow().turn_length.clone();
 
         // Finish the builder
-        let bsc_block_result = match builder.finish_not_sealed(&state_provider).map_err(PayloadBuilderError::other) {
+        let bsc_block_result = match builder.finish_with_no_seal(&state_provider).map_err(PayloadBuilderError::other) {
                 Ok(outcome) => outcome,
                 Err(e) => {
                     debug!("Failed to finish builder: {:?}", e);
