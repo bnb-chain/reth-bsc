@@ -505,7 +505,7 @@ where
         let shared_ctx = builder.shared_ctx.clone();
 
         let current_validators = shared_ctx.inner.borrow().current_validators.clone();
-        let turn_length = shared_ctx.inner.borrow().turn_length.clone();
+        let turn_length = shared_ctx.inner.borrow().turn_length;
 
         // Finish the builder
         let bsc_block_result = match builder.finish_with_no_seal(&state_provider).map_err(PayloadBuilderError::other) {

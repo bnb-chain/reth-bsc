@@ -450,7 +450,7 @@ where
                 target: "bsc::consensus::back_off_time",
                 block_number = header.number,
                 counts_len = counts.len(),
-                "Counted recent proposers (trace)"
+                "Counted recent proposers"
             );
 
             if snap.sign_recently_by_counts(validator, &counts) {

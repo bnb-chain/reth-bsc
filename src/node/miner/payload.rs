@@ -511,7 +511,7 @@ where
         MINER_METRICS.blocks_produced_total.increment(1);
 
         let current_validators = shared_ctx.inner.borrow().current_validators.clone();
-        let turn_length = shared_ctx.inner.borrow().turn_length.clone();
+        let turn_length = shared_ctx.inner.borrow().turn_length;
         let mut blob_sidecars: Vec<BscBlobTransactionSidecar> = Vec::new();
         for (index, tx) in  bsc_block_result.transactions.iter().enumerate() {
             trace!(

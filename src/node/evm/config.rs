@@ -30,6 +30,10 @@ use std::{borrow::Cow, cell::RefCell, convert::Infallible, rc::Rc, sync::Arc};
 /// Type alias for system transactions to reduce complexity
 type SystemTxs = Vec<reth_primitives_traits::Recovered<reth_primitives_traits::TxTy<crate::BscPrimitives>>>;
 
+/// Type alias for the block builder returned by `bsc_builder_for_next_block` to reduce type complexity.
+type BscNextBlockBuilder<'a, Evm> =
+    BscBlockBuilder<'a, Evm, Arc<BscChainSpec>, RethReceiptBuilder>;
+
 #[derive(Debug, Clone, Default)]
 pub struct BscExecutionSharedCtxInner {
     /// current validators for miner to produce block.
@@ -125,12 +129,7 @@ impl BscEvmConfig {
         parent: &'a SealedHeader<HeaderTy<BscPrimitives>>,
         attributes: NextBlockEnvAttributes,
     ) -> Result<
-        BscBlockBuilder<
-            'a,
-            EvmFor<Self, &'a mut State<DB>>,
-            Arc<BscChainSpec>,
-            RethReceiptBuilder,
-        >,
+        BscNextBlockBuilder<'a, EvmFor<Self, &'a mut State<DB>>>,
         Infallible,
     > {
         let evm_env = self.next_evm_env(parent, &attributes)?;

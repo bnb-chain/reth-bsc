@@ -131,7 +131,7 @@ where
         // Use the base EthBlockExecutionCtx for compatibility
         let timestamp = evm_env.block_env.timestamp.saturating_to();
         let transactions_root = proofs::calculate_transaction_root(&transactions);
-        let receipts_root = Receipt::calculate_receipt_root_no_memo(&receipts);
+        let receipts_root = Receipt::calculate_receipt_root_no_memo(receipts);
         let logs_bloom = logs_bloom(receipts.iter().flat_map(|r| &r.logs));
         let block_number = evm_env.block_env.number.saturating_to();
 
