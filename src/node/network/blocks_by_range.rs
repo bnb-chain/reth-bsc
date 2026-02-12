@@ -1,9 +1,10 @@
 use alloy_primitives::B256;
 use alloy_rlp::{Decodable, Encodable, RlpDecodable, RlpEncodable};
+use alloy_rpc_types::Withdrawals;
 use bytes::BufMut;
 
-use crate::node::primitives::BscBlock;
 use crate::node::network::bsc_protocol::protocol::proto::BscProtoMessageId;
+use crate::node::primitives::BscBlock;
 
 /// Max range allowed in a single request, mirroring geth's constant.
 pub const MAX_REQUEST_RANGE_BLOCKS_COUNT: u64 = 64;
@@ -75,7 +76,7 @@ impl Decodable for BlocksByRangePacket {
 /// via global providers. It prioritizes `start_block_hash` if non-zero, otherwise uses
 /// `start_block_height`. The traversal follows parent hashes up to `count` blocks.
 pub fn build_blocks_by_range_response(req: &GetBlocksByRangePacket) -> BlocksByRangePacket {
-    use crate::shared::{ get_cached_block_by_hash, get_cached_block_by_number };
+    use crate::shared::{get_cached_block_by_hash, get_cached_block_by_number};
 
     let mut blocks: Vec<BscBlock> = Vec::new();
 
@@ -89,15 +90,16 @@ pub fn build_blocks_by_range_response(req: &GetBlocksByRangePacket) -> BlocksByR
     // Walk back by parents up to count
     let mut remaining = req.count.min(MAX_REQUEST_RANGE_BLOCKS_COUNT);
     while let (Some(block), r) = (current_block.clone(), remaining) {
-        if r == 0 { break; }
+        if r == 0 {
+            break;
+        }
         // Push the current full block
         blocks.push(block.clone());
 
         // Prepare next parent
         let parent_hash = block.header.parent_hash;
-        current_block = if parent_hash != B256::ZERO {
-            get_cached_block_by_hash(&parent_hash)
-        } else { None };
+        current_block =
+            if parent_hash != B256::ZERO { get_cached_block_by_hash(&parent_hash) } else { None };
         remaining -= 1;
     }
 
@@ -155,7 +157,21 @@ struct BlocksByRangePacketInner {
 
 impl From<&BlocksByRangePacket> for BlocksByRangePacketInner {
     fn from(v: &BlocksByRangePacket) -> Self {
-        Self { request_id: v.request_id, blocks: v.blocks.clone() }
+        // Geth decodes sidecar-carrying `BlocksByRangePacket.Blocks[i].Withdrawals` as a list type.
+        // Ensure absent withdrawals are encoded as an empty list (`[]`) instead of RLP null (`0x80`)
+        // only when sidecars are present, to preserve pre-Cancun semantics for historical blocks.
+        let blocks = v
+            .blocks
+            .iter()
+            .cloned()
+            .map(|mut block| {
+                if block.body.sidecars.is_some() && block.body.inner.withdrawals.is_none() {
+                    block.body.inner.withdrawals = Some(Withdrawals::default());
+                }
+                block
+            })
+            .collect();
+        Self { request_id: v.request_id, blocks }
     }
 }
 
@@ -168,8 +184,11 @@ impl From<BlocksByRangePacketInner> for BlocksByRangePacket {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_consensus::Header;
+    use crate::node::primitives::BscBlobTransactionSidecar;
     use crate::BscBlockBody;
+    use alloy_consensus::Header;
+    use alloy_rlp::RlpDecodable;
+    use reth_primitives::TransactionSigned;
     use bytes::BytesMut;
 
     #[test]
@@ -187,7 +206,13 @@ mod tests {
         assert_eq!(req, dec);
 
         // Response roundtrip with 1 block
-        let b = BscBlock { header: Header::default(), body: BscBlockBody { inner: reth_ethereum_primitives::BlockBody::default(), sidecars: None } };
+        let b = BscBlock {
+            header: Header::default(),
+            body: BscBlockBody {
+                inner: reth_ethereum_primitives::BlockBody::default(),
+                sidecars: None,
+            },
+        };
         let res = BlocksByRangePacket { request_id: 7, blocks: vec![b.clone()] };
         let mut bytes = BytesMut::new();
         res.encode(&mut bytes);
@@ -198,6 +223,73 @@ mod tests {
         assert_eq!(res.blocks[0].header.hash_slow(), dec.blocks[0].header.hash_slow());
     }
 
+    #[derive(Debug, RlpDecodable)]
+    #[rlp(trailing)]
+    struct BlockWithListWithdrawals {
+        header: Header,
+        transactions: Vec<TransactionSigned>,
+        ommers: Vec<Header>,
+        withdrawals: Withdrawals,
+        sidecars: Option<Vec<BscBlobTransactionSidecar>>,
+    }
+
+    #[derive(Debug, RlpDecodable)]
+    #[rlp(trailing)]
+    struct BlocksByRangeInnerWithListWithdrawals {
+        request_id: u64,
+        blocks: Vec<BlockWithListWithdrawals>,
+    }
+
+    #[test]
+    fn test_blocks_by_range_encodes_absent_withdrawals_as_empty_list_when_sidecars_present() {
+        let block = BscBlock {
+            header: Header::default(),
+            body: BscBlockBody {
+                inner: reth_ethereum_primitives::BlockBody::default(),
+                sidecars: Some(Vec::new()),
+            },
+        };
+        let resp = BlocksByRangePacket { request_id: 11, blocks: vec![block] };
+
+        let mut bytes = BytesMut::new();
+        resp.encode(&mut bytes);
+
+        // Strip message id (0x03), then decode payload as a type that requires withdrawals to be a list.
+        let mut payload = &bytes[1..];
+        let decoded = BlocksByRangeInnerWithListWithdrawals::decode(&mut payload).unwrap();
+
+        assert_eq!(decoded.request_id, 11);
+        assert_eq!(decoded.blocks.len(), 1);
+        assert_eq!(decoded.blocks[0].header.number, 0);
+        assert!(decoded.blocks[0].transactions.is_empty());
+        assert!(decoded.blocks[0].ommers.is_empty());
+        assert!(decoded.blocks[0].withdrawals.is_empty());
+        assert!(decoded.blocks[0].sidecars.is_some());
+    }
+
+    #[test]
+    fn test_blocks_by_range_keeps_absent_withdrawals_when_no_sidecars() {
+        let block = BscBlock {
+            header: Header::default(),
+            body: BscBlockBody {
+                inner: reth_ethereum_primitives::BlockBody::default(),
+                sidecars: None,
+            },
+        };
+        let resp = BlocksByRangePacket { request_id: 12, blocks: vec![block] };
+
+        let mut bytes = BytesMut::new();
+        resp.encode(&mut bytes);
+
+        let mut payload = bytes.as_ref();
+        let decoded = BlocksByRangePacket::decode(&mut payload).unwrap();
+
+        assert_eq!(decoded.request_id, 12);
+        assert_eq!(decoded.blocks.len(), 1);
+        assert!(decoded.blocks[0].body.inner.withdrawals.is_none());
+        assert!(decoded.blocks[0].body.sidecars.is_none());
+    }
+
     #[test]
     fn test_build_blocks_by_range_uses_cache() {
         // Clear cache to ensure test isolation
@@ -205,18 +297,35 @@ mod tests {
 
         // Build a 2-block chain: parent <- child
         let parent_header = Header { number: 1, ..Default::default() };
-        let parent_block = BscBlock { header: parent_header, body: BscBlockBody { inner: reth_ethereum_primitives::BlockBody::default(), sidecars: None } };
+        let parent_block = BscBlock {
+            header: parent_header,
+            body: BscBlockBody {
+                inner: reth_ethereum_primitives::BlockBody::default(),
+                sidecars: None,
+            },
+        };
         let parent_hash = parent_block.header.hash_slow();
 
         let child_header = Header { parent_hash, number: 2, ..Default::default() };
-        let child_block = BscBlock { header: child_header, body: BscBlockBody { inner: reth_ethereum_primitives::BlockBody::default(), sidecars: None } };
+        let child_block = BscBlock {
+            header: child_header,
+            body: BscBlockBody {
+                inner: reth_ethereum_primitives::BlockBody::default(),
+                sidecars: None,
+            },
+        };
         let child_hash = child_block.header.hash_slow();
 
         // Cache both blocks so builder can fetch full bodies from cache
         crate::shared::cache_full_block(parent_block.clone());
         crate::shared::cache_full_block(child_block.clone());
 
-        let req = GetBlocksByRangePacket { request_id: 1, start_block_height: 0, start_block_hash: child_hash, count: 2 };
+        let req = GetBlocksByRangePacket {
+            request_id: 1,
+            start_block_height: 0,
+            start_block_hash: child_hash,
+            count: 2,
+        };
         let resp = build_blocks_by_range_response(&req);
         assert_eq!(resp.request_id, 1);
         assert_eq!(resp.blocks.len(), 2);
@@ -232,17 +341,34 @@ mod tests {
 
         // Build a 2-block chain but cache only the child
         let parent_header = Header::default();
-        let parent_block = BscBlock { header: parent_header, body: BscBlockBody { inner: reth_ethereum_primitives::BlockBody::default(), sidecars: None } };
+        let parent_block = BscBlock {
+            header: parent_header,
+            body: BscBlockBody {
+                inner: reth_ethereum_primitives::BlockBody::default(),
+                sidecars: None,
+            },
+        };
         let parent_hash = parent_block.header.hash_slow();
 
         let child_header = Header { parent_hash, ..Default::default() };
-        let child_block = BscBlock { header: child_header, body: BscBlockBody { inner: reth_ethereum_primitives::BlockBody::default(), sidecars: None } };
+        let child_block = BscBlock {
+            header: child_header,
+            body: BscBlockBody {
+                inner: reth_ethereum_primitives::BlockBody::default(),
+                sidecars: None,
+            },
+        };
         let child_hash = child_block.header.hash_slow();
 
         // Cache only child block
         crate::shared::cache_full_block(child_block.clone());
 
-        let req = GetBlocksByRangePacket { request_id: 2, start_block_height: 0, start_block_hash: child_hash, count: 2 };
+        let req = GetBlocksByRangePacket {
+            request_id: 2,
+            start_block_height: 0,
+            start_block_hash: child_hash,
+            count: 2,
+        };
         let resp = build_blocks_by_range_response(&req);
         assert_eq!(resp.request_id, 2);
         // Parent missing => only child should be included

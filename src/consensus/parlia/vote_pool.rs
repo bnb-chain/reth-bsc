@@ -1,6 +1,11 @@
 use lru::LruCache;
 use once_cell::sync::Lazy;
-use std::{cmp::Reverse, collections::{BinaryHeap, HashMap, HashSet}, num::NonZero, sync::RwLock};
+use std::{
+    cmp::Reverse,
+    collections::{BinaryHeap, HashMap, HashSet},
+    num::NonZero,
+    sync::RwLock,
+};
 
 use alloy_primitives::{BlockNumber, B256};
 
@@ -70,8 +75,8 @@ struct VotePool {
 
 impl VotePool {
     fn new() -> Self {
-        Self { 
-            received_votes: HashSet::new(), 
+        Self {
+            received_votes: HashSet::new(),
             cur_votes: HashMap::new(),
             cur_votes_pq: VotesPriorityQueue::new(),
         }
@@ -82,15 +87,15 @@ impl VotePool {
         if self.received_votes.insert(vote_hash) {
             // Track received votes count
             VOTE_METRICS.received_votes_total.increment(1);
-            
+
             // Use target_hash as the key for organizing votes
             let block_hash = vote.data.target_hash;
-            
+
             // Add to priority queue if this is a new block
             if !self.cur_votes.contains_key(&block_hash) {
                 self.cur_votes_pq.push(vote.data);
             }
-            
+
             self.cur_votes.entry(block_hash).or_default().vote_messages.push(vote);
         }
     }
@@ -105,15 +110,20 @@ impl VotePool {
         all_votes
     }
 
-    fn len(&self) -> usize { 
-        self.cur_votes.values().map(|vm| vm.vote_messages.len()).sum() 
+    fn get_votes(&self) -> Vec<VoteEnvelope> {
+        let mut all_votes = Vec::new();
+        for vote_messages in self.cur_votes.values() {
+            all_votes.extend(vote_messages.vote_messages.clone());
+        }
+        all_votes
+    }
+
+    fn len(&self) -> usize {
+        self.cur_votes.values().map(|vm| vm.vote_messages.len()).sum()
     }
 
     fn len_for_block(&self, block_hash: &B256) -> usize {
-        self.cur_votes
-            .get(block_hash)
-            .map(|vm| vm.vote_messages.len())
-            .unwrap_or(0)
+        self.cur_votes.get(block_hash).map(|vm| vm.vote_messages.len()).unwrap_or(0)
     }
 
     fn fetch_vote_by_block_hash(&self, block_hash: B256) -> Vec<VoteEnvelope> {
@@ -124,16 +134,28 @@ impl VotePool {
         }
     }
 
+    fn fetch_vote_by_block_hash_and_source_number(
+        &self,
+        block_hash: B256,
+        source_number: BlockNumber,
+    ) -> Vec<VoteEnvelope> {
+        self.fetch_vote_by_block_hash(block_hash)
+            .into_iter()
+            .filter(|vote| vote.data.source_number == source_number)
+            .collect()
+    }
+
     /// Prune old votes based on the latest block number.
     /// Removes votes where targetNumber + LOWER_LIMIT_OF_VOTE_BLOCK_NUMBER - 1 < latestBlockNumber
     fn prune(&mut self, latest_block_number: BlockNumber) {
         // Remove votes in the range [, latestBlockNumber - LOWER_LIMIT_OF_VOTE_BLOCK_NUMBER]
         while let Some(vote_data) = self.cur_votes_pq.peek() {
-            if vote_data.target_number + LOWER_LIMIT_OF_VOTE_BLOCK_NUMBER - 1 < latest_block_number {
+            if vote_data.target_number + LOWER_LIMIT_OF_VOTE_BLOCK_NUMBER - 1 < latest_block_number
+            {
                 // Remove from priority queue
                 let vote_data = self.cur_votes_pq.pop().unwrap();
                 let block_hash = vote_data.target_hash;
-                
+
                 // Remove from votes map and received_votes set
                 if let Some(vote_box) = self.cur_votes.remove(&block_hash) {
                     for vote in vote_box.vote_messages {
@@ -156,9 +178,8 @@ static VOTE_METRICS: Lazy<BscVoteMetrics> = Lazy::new(BscVoteMetrics::default);
 
 /// LRU cache to track which blocks have already been notified for finality.
 /// This prevents repeated update_forkchoice calls for the same block (matches geth's finalizedNotified).
-static FINALIZED_NOTIFIED: Lazy<RwLock<LruCache<B256, ()>>> = Lazy::new(|| {
-    RwLock::new(LruCache::new(NonZero::new(FINALIZED_NOTIFIED_CACHE_SIZE).unwrap()))
-});
+static FINALIZED_NOTIFIED: Lazy<RwLock<LruCache<B256, ()>>> =
+    Lazy::new(|| RwLock::new(LruCache::new(NonZero::new(FINALIZED_NOTIFIED_CACHE_SIZE).unwrap())));
 
 /// Update vote pool size metric.
 fn update_vote_pool_size_metric(size: usize) {
@@ -185,9 +206,14 @@ pub fn drain() -> Vec<VoteEnvelope> {
     votes
 }
 
+/// Snapshot all pending votes without removing them.
+pub fn get_votes() -> Vec<VoteEnvelope> {
+    VOTE_POOL.read().expect("vote pool poisoned").get_votes()
+}
+
 /// Current number of queued votes.
-pub fn len() -> usize { 
-    VOTE_POOL.read().expect("vote pool poisoned").len() 
+pub fn len() -> usize {
+    VOTE_POOL.read().expect("vote pool poisoned").len()
 }
 
 /// Check if the pool is empty.
@@ -198,6 +224,17 @@ pub fn is_empty() -> bool {
 /// Fetch votes by block hash.
 pub fn fetch_vote_by_block_hash(block_hash: B256) -> Vec<VoteEnvelope> {
     VOTE_POOL.read().expect("vote pool poisoned").fetch_vote_by_block_hash(block_hash)
+}
+
+/// Fetch votes by block hash and source block number.
+pub fn fetch_vote_by_block_hash_and_source_number(
+    block_hash: B256,
+    source_number: BlockNumber,
+) -> Vec<VoteEnvelope> {
+    VOTE_POOL
+        .read()
+        .expect("vote pool poisoned")
+        .fetch_vote_by_block_hash_and_source_number(block_hash, source_number)
 }
 
 /// Prune old votes based on the latest block number.
@@ -274,5 +311,58 @@ fn maybe_notify_finality(target_hash: B256, votes_for_block: usize) {
         tokio::spawn(async move {
             let _ = engine.update_forkchoice(&head).await;
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::consensus::parlia::vote::{VoteAddress, VoteData, VoteEnvelope, VoteSignature};
+    use alloy_primitives::B256;
+
+    fn vote_with_source(target_hash: B256, source_number: u64, unique: u8) -> VoteEnvelope {
+        let mut address = VoteAddress::default();
+        address[0] = unique;
+        let mut signature = VoteSignature::default();
+        signature[0] = unique;
+        VoteEnvelope {
+            vote_address: address,
+            signature,
+            data: VoteData {
+                source_number,
+                source_hash: B256::from([source_number as u8; 32]),
+                target_number: 100,
+                target_hash,
+            },
+        }
+    }
+
+    #[test]
+    fn fetch_votes_filters_by_source_number() {
+        // Ensure global pool has a clean state across tests.
+        let _ = drain();
+
+        let target_hash = B256::from([0x11; 32]);
+        let other_target_hash = B256::from([0x22; 32]);
+
+        put_vote(vote_with_source(target_hash, 10, 1));
+        put_vote(vote_with_source(target_hash, 11, 2));
+        put_vote(vote_with_source(other_target_hash, 10, 3));
+
+        let all_for_target = fetch_vote_by_block_hash(target_hash);
+        assert_eq!(all_for_target.len(), 2);
+
+        let source_10 = fetch_vote_by_block_hash_and_source_number(target_hash, 10);
+        assert_eq!(source_10.len(), 1);
+        assert_eq!(source_10[0].data.source_number, 10);
+
+        let source_11 = fetch_vote_by_block_hash_and_source_number(target_hash, 11);
+        assert_eq!(source_11.len(), 1);
+        assert_eq!(source_11[0].data.source_number, 11);
+
+        let source_12 = fetch_vote_by_block_hash_and_source_number(target_hash, 12);
+        assert!(source_12.is_empty());
+
+        let _ = drain();
     }
 }

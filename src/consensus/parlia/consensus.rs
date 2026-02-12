@@ -18,7 +18,7 @@ use crate::consensus::parlia::constants::K_ANCESTOR_GENERATION_DEPTH;
 use crate::consensus::parlia::go_rng::{RngSource, Shuffle};
 use crate::consensus::parlia::provider::SnapshotProvider;
 use crate::consensus::parlia::util::is_breathe_block;
-use crate::consensus::parlia::vote_pool::fetch_vote_by_block_hash;
+use crate::consensus::parlia::vote_pool::fetch_vote_by_block_hash_and_source_number;
 use crate::consensus::parlia::VoteData;
 use crate::consensus::parlia::VoteSignature;
 use crate::consensus::parlia::SYSTEM_TXS_GAS_HARD_LIMIT;
@@ -751,7 +751,10 @@ where
             let snap = snapshot_provider.snapshot_by_hash(&target_header.parent_hash()).ok_or(
                 ParliaConsensusError::SnapshotNotFound { block_hash: target_header.parent_hash() },
             )?;
-            votes = fetch_vote_by_block_hash(target_header.hash_slow());
+            votes = fetch_vote_by_block_hash_and_source_number(
+                target_header.hash_slow(),
+                justified_number,
+            );
             let quorum = usize::div_ceil(snap.validators.len() * 2, 3);
             if votes.len() >= quorum {
                 target_header_parent_snap = Some(snap);
@@ -775,8 +778,13 @@ where
         let target_header_parent_snap = match target_header_parent_snap {
             Some(snap) => snap,
             None => {
-                tracing::warn!(target: "parlia::consensus", "cannot collect enough votes, current_block={}, target_header_number={}, justified_number={}", 
-                    current_header.number(), target_header.number(), justified_number);
+                tracing::warn!(
+                    target: "parlia::consensus",
+                    "cannot collect enough votes, current_block={}, target_header_number={}, justified_number={}",
+                    current_header.number(),
+                    target_header.number(),
+                    justified_number
+                );
                 return Ok(());
             }
         };
