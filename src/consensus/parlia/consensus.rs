@@ -40,6 +40,33 @@ use tracing::{debug, trace, warn};
 const RECOVERED_PROPOSER_CACHE_NUM: usize = 4096;
 const ADDRESS_LENGTH: usize = 20; // Ethereum address length in bytes
 
+#[inline]
+fn apply_mining_delay_with_leftover(
+    mut delay_ms: u64,
+    period_ms: u64,
+    last_block_in_turn: bool,
+    left_over_ms: u64,
+) -> u64 {
+    let mut time_for_mining_ms = period_ms / 2;
+    if !last_block_in_turn {
+        time_for_mining_ms = period_ms;
+    }
+    if delay_ms > time_for_mining_ms {
+        delay_ms = time_for_mining_ms;
+    }
+
+    // Keep parity with go-bsc: apply left-over reservation after delay capping.
+    if left_over_ms >= period_ms {
+        warn!("Delay invalid argument: left_over_ms={}, period_ms={}", left_over_ms, period_ms);
+    } else if left_over_ms >= delay_ms {
+        delay_ms = 0;
+    } else {
+        delay_ms -= left_over_ms;
+    }
+
+    delay_ms
+}
+
 lazy_static! {
     // recovered proposer cache map by block_number: proposer_address
     static ref RECOVERED_PROPOSER_CACHE: RwLock<LruMap<B256, Address, ByLength>> = RwLock::new(LruMap::new(ByLength::new(RECOVERED_PROPOSER_CACHE_NUM as u32)));
@@ -273,11 +300,19 @@ where
         &self,
         header: &Header,
     ) -> Result<usize, ParliaConsensusError> {
-        if !header.number.is_multiple_of(self.get_epoch_length(header)) {
-            return Ok(0);
-        }
+        let is_epoch = header.number.is_multiple_of(self.get_epoch_length(header));
 
         let extra_len = header.extra_data.len();
+
+        if !is_epoch {
+            // Keep parity with go-bsc:
+            // - pre-Luban non-epoch blocks must not carry validator bytes (len must be 0)
+            // - post-Luban non-epoch blocks may contain attestation bytes, so validator bytes len is always 0
+            if self.spec.is_luban_active_at_block(header.number) {
+                return Ok(0);
+            }
+            return Ok(extra_len - EXTRA_VANITY_LEN - EXTRA_SEAL_LEN);
+        }
 
         if !self.spec.is_luban_active_at_block(header.number) {
             return Ok(extra_len - EXTRA_VANITY_LEN - EXTRA_SEAL_LEN);
@@ -555,28 +590,12 @@ where
     /// - `snap.block_interval` is used as the period (milliseconds).
     /// - Applies `left_over_ms` reservation for finalization work.
     /// - Caps blocking time to half the period when last block in one turn (or tl == 1),
-    ///   otherwise 4/5 of the period.
+    ///   otherwise a full period.
     pub fn delay_for_mining(&self, snap: &Snapshot, header: &Header, left_over_ms: u64) -> u64 {
         let period_ms = snap.block_interval;
-        let mut delay_ms = self.delay_for_ramanujan_fork(snap, header);
-        if left_over_ms >= period_ms {
-            warn!("Delay invalid argument: left_over_ms={}, period_ms={}", left_over_ms, period_ms);
-        } else if left_over_ms >= delay_ms {
-            delay_ms = 0;
-        } else {
-            delay_ms -= left_over_ms;
-        }
-
-        let mut time_for_mining_ms = period_ms / 2;
         let last_block_in_turn = snap.last_block_in_one_turn(header.number);
-        if !last_block_in_turn {
-            time_for_mining_ms = period_ms;
-        }
-        if delay_ms > time_for_mining_ms {
-            delay_ms = time_for_mining_ms;
-        }
-
-        delay_ms
+        let delay_ms = self.delay_for_ramanujan_fork(snap, header);
+        apply_mining_delay_with_leftover(delay_ms, period_ms, last_block_in_turn, left_over_ms)
     }
 
     pub fn prepare_timestamp(
@@ -850,5 +869,69 @@ where
         );
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chainspec::BscChainSpec;
+    use crate::hardforks::bsc::BscHardfork;
+    use reth_chainspec::{ChainSpecBuilder, ForkCondition};
+
+    #[test]
+    fn pre_luban_non_epoch_rejects_extra_validator_bytes() {
+        let chain_spec = Arc::new(BscChainSpec::from(ChainSpecBuilder::mainnet().build()));
+        let parlia = Parlia::new(chain_spec, 200);
+        let header = Header {
+            number: 1,
+            timestamp: 1,
+            extra_data: alloy_primitives::Bytes::from(vec![
+                0u8;
+                EXTRA_VANITY_LEN + EXTRA_SEAL_LEN + 1
+            ]),
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            parlia.check_header_extra(&header),
+            Err(ParliaConsensusError::InvalidHeaderExtraValidatorBytesLen {
+                is_epoch: false,
+                validator_bytes_len: 1,
+            })
+        ));
+    }
+
+    #[test]
+    fn post_luban_non_epoch_allows_attestation_bytes() {
+        let chain_spec = Arc::new(BscChainSpec::from(
+            ChainSpecBuilder::mainnet()
+                .with_fork(BscHardfork::Luban, ForkCondition::Block(0))
+                .build(),
+        ));
+        let parlia = Parlia::new(chain_spec, 200);
+        let header = Header {
+            number: 1,
+            timestamp: 1,
+            extra_data: alloy_primitives::Bytes::from(vec![
+                0u8;
+                EXTRA_VANITY_LEN + EXTRA_SEAL_LEN + 64
+            ]),
+            ..Default::default()
+        };
+
+        assert!(parlia.check_header_extra(&header).is_ok());
+    }
+
+    #[test]
+    fn mining_delay_caps_before_leftover_is_applied() {
+        // Raw delay (2500) is first capped to half-period (1500), then left-over makes it zero.
+        assert_eq!(apply_mining_delay_with_leftover(2500, 3000, true, 2000), 0);
+    }
+
+    #[test]
+    fn mining_delay_uses_full_period_cap_when_not_last_block_in_turn() {
+        // Not-last block uses full-period cap: min(3500, 3000) - 200 = 2800.
+        assert_eq!(apply_mining_delay_with_leftover(3500, 3000, false, 200), 2800);
     }
 }

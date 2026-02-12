@@ -84,6 +84,7 @@ where
             .snapshot_by_hash(&header.parent_hash)
             .ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;
         self.inner_ctx.snap = Some(snap.clone());
+        self.inner_ctx.expected_turn_length = None;
 
         self.verify_cascading_fields(&header, &parent_header, &snap)?;
 
@@ -104,6 +105,13 @@ where
             };
             tracing::debug!("vote_addrs_map: {:?}", vote_addrs_map);
             self.inner_ctx.current_validators = Some((validator_set, vote_addrs_map));
+
+            if self.spec.is_bohr_active_at_timestamp(header.number, header.timestamp) {
+                // Keep parity with go-bsc: turn length is read from parent state.
+                let expected_turn_length =
+                    self.get_turn_length(parent_header.number, parent_header.timestamp)?;
+                self.inner_ctx.expected_turn_length = Some(expected_turn_length);
+            }
 
             // Also fetch on-chain NodeIDs for validators (EVN identification) and update cache.
             // Only available after Maxwell hardfork when StakeHub contract's getNodeIDs is deployed

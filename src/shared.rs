@@ -263,8 +263,6 @@ where
 pub fn get_canonical_header_by_hash_from_provider(block_hash: &B256) -> Option<Header> {
     let provider_fn = HEADER_BY_HASH_PROVIDER.get()?;
     provider_fn(block_hash)
-        // Fallback to in-memory header cache when persistence lags
-        .or_else(|| crate::node::evm::util::get_header_by_hash_from_cache(block_hash))
 }
 
 /// Get header by number from the global header provider

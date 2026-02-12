@@ -39,6 +39,7 @@ use crate::consensus::parlia::SnapshotProvider;
 #[derive(Debug, Clone)]
 pub(crate) struct InnerExecutionContext {
     pub(crate) current_validators: Option<(Vec<Address>, HashMap<Address, VoteAddress>)>,
+    pub(crate) expected_turn_length: Option<u8>,
     pub(crate) max_elected_validators: Option<U256>,
     pub(crate) validators_election_info: Option<Vec<ValidatorElectionInfo>>,
     pub(crate) snap: Option<Snapshot>,
@@ -147,6 +148,7 @@ where
             parlia,
             inner_ctx: InnerExecutionContext {
                 current_validators: None,
+                expected_turn_length: None,
                 max_elected_validators: None,
                 validators_election_info: None,
                 snap: None,

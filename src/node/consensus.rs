@@ -34,6 +34,7 @@ use reth_engine_primitives::ConsensusEngineHandle;
 use reth_ethereum_primitives::Receipt;
 use reth_payload_primitives::EngineApiMessageVersion;
 use reth_primitives::{gas_spent_by_transactions, GotExpected};
+use reth_primitives_traits::constants::{GAS_LIMIT_BOUND_DIVISOR, MINIMUM_GAS_LIMIT};
 use reth_provider::{BlockNumReader, HeaderProvider};
 use std::sync::Arc;
 
@@ -74,6 +75,50 @@ pub struct BscConsensus<ChainSpec> {
     base: EthBeaconConsensus<ChainSpec>,
     parlia: Arc<Parlia<ChainSpec>>,
     chain_spec: Arc<ChainSpec>,
+}
+
+const GAS_LIMIT_CAPACITY: u64 = 0x7fff_ffff_ffff_ffff;
+const GAS_LIMIT_BOUND_DIVISOR_BEFORE_LORENTZ: u64 = 256;
+
+fn validate_bsc_gas_limit_against_parent<ChainSpec: BscHardforks>(
+    header: &Header,
+    parent: &Header,
+    chain_spec: &ChainSpec,
+) -> Result<(), ConsensusError> {
+    // Keep parity with go-bsc's Parlia checks.
+    if header.gas_limit > GAS_LIMIT_CAPACITY {
+        return Err(ConsensusError::Other(format!(
+            "invalid gasLimit: have {}, max {}",
+            header.gas_limit, GAS_LIMIT_CAPACITY
+        )));
+    }
+
+    if header.gas_used > header.gas_limit {
+        return Err(ConsensusError::HeaderGasUsedExceedsGasLimit {
+            gas_used: header.gas_used,
+            gas_limit: header.gas_limit,
+        });
+    }
+
+    let diff = parent.gas_limit.abs_diff(header.gas_limit);
+    let bound_divisor = if chain_spec.is_lorentz_active_at_timestamp(header.number, header.timestamp)
+    {
+        GAS_LIMIT_BOUND_DIVISOR
+    } else {
+        GAS_LIMIT_BOUND_DIVISOR_BEFORE_LORENTZ
+    };
+    let limit = parent.gas_limit / bound_divisor;
+
+    if diff >= limit || header.gas_limit < MINIMUM_GAS_LIMIT {
+        return Err(ConsensusError::Other(format!(
+            "invalid gas limit: have {}, want {} += {}",
+            header.gas_limit,
+            parent.gas_limit,
+            limit.saturating_sub(1)
+        )));
+    }
+
+    Ok(())
 }
 
 impl<ChainSpec: EthChainSpec + BscHardforks + 'static> BscConsensus<ChainSpec> {
@@ -127,6 +172,8 @@ impl<ChainSpec: EthChainSpec + BscHardforks + 'static> HeaderValidator<Header>
                 timestamp: header_ts,
             });
         }
+
+        validate_bsc_gas_limit_against_parent(header.header(), parent.header(), &*self.chain_spec)?;
 
         // ensure that the blob gas fields for this block
         if BscHardforks::is_cancun_active_at_timestamp(
@@ -356,6 +403,127 @@ mod tests {
                 m.insert(snapshot.block_hash, snapshot);
             }
         }
+    }
+
+    fn test_chain_spec_with_lorentz(fork_condition: ForkCondition) -> BscChainSpec {
+        BscChainSpec::from(
+            ChainSpecBuilder::mainnet()
+                .with_fork(BscHardfork::Lorentz, fork_condition)
+                .build(),
+        )
+    }
+
+    const LONDON_ACTIVE_BLOCK: u64 = 20_000_000;
+
+    #[test]
+    fn gas_limit_validation_enforces_capacity_and_gas_used_bounds() {
+        let chain_spec = test_chain_spec_with_lorentz(ForkCondition::Timestamp(u64::MAX));
+        let parent = Header {
+            number: LONDON_ACTIVE_BLOCK,
+            timestamp: 1,
+            gas_limit: 30_000_000,
+            ..Default::default()
+        };
+
+        let over_capacity = Header {
+            number: LONDON_ACTIVE_BLOCK + 1,
+            timestamp: 2,
+            gas_limit: GAS_LIMIT_CAPACITY + 1,
+            gas_used: 0,
+            ..Default::default()
+        };
+        assert!(validate_bsc_gas_limit_against_parent(&over_capacity, &parent, &chain_spec).is_err());
+
+        let gas_used_over_limit = Header {
+            number: LONDON_ACTIVE_BLOCK + 1,
+            timestamp: 2,
+            gas_limit: 30_000_000,
+            gas_used: 30_000_001,
+            ..Default::default()
+        };
+        assert!(matches!(
+            validate_bsc_gas_limit_against_parent(&gas_used_over_limit, &parent, &chain_spec),
+            Err(ConsensusError::HeaderGasUsedExceedsGasLimit { .. })
+        ));
+    }
+
+    #[test]
+    fn gas_limit_validation_uses_pre_lorentz_divisor_256() {
+        let chain_spec = test_chain_spec_with_lorentz(ForkCondition::Timestamp(u64::MAX));
+        let parent = Header {
+            number: LONDON_ACTIVE_BLOCK,
+            timestamp: 1,
+            gas_limit: 30_000_000,
+            ..Default::default()
+        };
+        let pre_lorentz_limit = parent.gas_limit / 256;
+
+        let invalid = Header {
+            number: LONDON_ACTIVE_BLOCK + 1,
+            timestamp: 2,
+            gas_limit: parent.gas_limit + pre_lorentz_limit,
+            gas_used: 0,
+            ..Default::default()
+        };
+        assert!(validate_bsc_gas_limit_against_parent(&invalid, &parent, &chain_spec).is_err());
+
+        let valid = Header {
+            number: LONDON_ACTIVE_BLOCK + 1,
+            timestamp: 2,
+            gas_limit: parent.gas_limit + pre_lorentz_limit - 1,
+            gas_used: 0,
+            ..Default::default()
+        };
+        assert!(validate_bsc_gas_limit_against_parent(&valid, &parent, &chain_spec).is_ok());
+    }
+
+    #[test]
+    fn gas_limit_validation_uses_lorentz_divisor_1024() {
+        let chain_spec = test_chain_spec_with_lorentz(ForkCondition::Timestamp(0));
+        let parent = Header {
+            number: LONDON_ACTIVE_BLOCK,
+            timestamp: 1,
+            gas_limit: 30_000_000,
+            ..Default::default()
+        };
+        let lorentz_limit = parent.gas_limit / GAS_LIMIT_BOUND_DIVISOR;
+
+        let invalid = Header {
+            number: LONDON_ACTIVE_BLOCK + 1,
+            timestamp: 2,
+            gas_limit: parent.gas_limit + lorentz_limit,
+            gas_used: 0,
+            ..Default::default()
+        };
+        assert!(validate_bsc_gas_limit_against_parent(&invalid, &parent, &chain_spec).is_err());
+
+        let valid = Header {
+            number: LONDON_ACTIVE_BLOCK + 1,
+            timestamp: 2,
+            gas_limit: parent.gas_limit + lorentz_limit - 1,
+            gas_used: 0,
+            ..Default::default()
+        };
+        assert!(validate_bsc_gas_limit_against_parent(&valid, &parent, &chain_spec).is_ok());
+    }
+
+    #[test]
+    fn gas_limit_validation_enforces_minimum_limit() {
+        let chain_spec = test_chain_spec_with_lorentz(ForkCondition::Timestamp(0));
+        let parent = Header {
+            number: LONDON_ACTIVE_BLOCK,
+            timestamp: 1,
+            gas_limit: 30_000_000,
+            ..Default::default()
+        };
+        let invalid = Header {
+            number: LONDON_ACTIVE_BLOCK + 1,
+            timestamp: 2,
+            gas_limit: MINIMUM_GAS_LIMIT - 1,
+            gas_used: 0,
+            ..Default::default()
+        };
+        assert!(validate_bsc_gas_limit_against_parent(&invalid, &parent, &chain_spec).is_err());
     }
 
     #[test]

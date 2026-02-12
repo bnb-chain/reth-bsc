@@ -4,13 +4,14 @@ use reth_chainspec::{EthChainSpec, EthereumHardforks, EthereumHardfork};
 use crate::consensus::parlia::util::calculate_millisecond_timestamp;
 use crate::hardforks::BscHardforks;
 use crate::consensus::eip4844::is_blob_eligible_block;
-use super::Parlia;
+use super::{Parlia, EMPTY_WITHDRAWALS_HASH};
 use alloy_consensus::{Header, Transaction, EMPTY_OMMER_ROOT_HASH};
 use alloy_primitives::B256;
 use reth_primitives::GotExpected;
 use alloy_eips::eip4844::{DATA_GAS_PER_BLOB, MAX_DATA_GAS_PER_BLOCK_DENCUN};
 use crate::BscBlock;
 use reth_primitives_traits::Block;
+use std::time::SystemTime;
 
 const MAX_RLP_BLOCK_SIZE_OSAKA: usize = 8 * 1024 * 1024;
 
@@ -83,17 +84,92 @@ pub fn validate_4844_header_of_bsc<ChainSpec: BscHardforks>(
     Ok(())
 }
 
+#[inline]
+fn present_unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_secs()
+}
+
+#[inline]
+fn validate_header_not_from_future(
+    header: &SealedHeader,
+    present_timestamp_secs: u64,
+) -> Result<(), ConsensusError> {
+    // Keep parity with go-bsc: only second-level timestamp is checked here.
+    if header.timestamp > present_timestamp_secs {
+        return Err(ConsensusError::TimestampIsInFuture {
+            timestamp: header.timestamp,
+            present_timestamp: present_timestamp_secs,
+        });
+    }
+    Ok(())
+}
+
+#[inline]
+fn validate_mix_digest_for_parlia(
+    header: &SealedHeader,
+    lorentz_active: bool,
+) -> Result<(), ConsensusError> {
+    if !lorentz_active {
+        if header.mix_hash != B256::ZERO {
+            return Err(ConsensusError::Other("non-zero mix digest".to_string()));
+        }
+        return Ok(());
+    }
+
+    // In Lorentz+, mix digest carries the millisecond remainder. It must not overflow seconds.
+    if calculate_millisecond_timestamp(header) / 1000 != header.timestamp {
+        return Err(ConsensusError::Other(
+            "invalid mix digest milliseconds component".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[inline]
+fn validate_withdrawals_root_for_bsc(
+    header: &SealedHeader,
+    cancun_active: bool,
+) -> Result<(), ConsensusError> {
+    if !cancun_active {
+        if header.withdrawals_root.is_some() {
+            return Err(ConsensusError::WithdrawalsRootUnexpected);
+        }
+        return Ok(());
+    }
+
+    let got = header
+        .withdrawals_root
+        .ok_or(ConsensusError::WithdrawalsRootMissing)?;
+    if got != EMPTY_WITHDRAWALS_HASH {
+        return Err(ConsensusError::BodyWithdrawalsRootDiff(
+            GotExpected { got, expected: EMPTY_WITHDRAWALS_HASH }.into(),
+        ));
+    }
+    Ok(())
+}
+
+#[inline]
+fn validate_requests_hash_for_bsc(
+    header: &SealedHeader,
+    prague_active: bool,
+) -> Result<(), ConsensusError> {
+    if prague_active {
+        if header.requests_hash.is_none() {
+            return Err(ConsensusError::RequestsHashMissing);
+        }
+    } else if header.requests_hash.is_some() {
+        return Err(ConsensusError::RequestsHashUnexpected);
+    }
+    Ok(())
+}
+
 impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 'static> HeaderValidator for Parlia<ChainSpec> {
     fn validate_header(&self, header: &SealedHeader) -> Result<(), ConsensusError> {
-        // Don't waste time checking blocks from the future
-        let present_timestamp = self.present_millis_timestamp();
-        let header_timestamp = calculate_millisecond_timestamp(header);
-        if header_timestamp > present_timestamp {
-            return Err(ConsensusError::TimestampIsInFuture {
-               timestamp: header_timestamp,
-               present_timestamp,
-            });
-        }
+        // Don't waste time checking blocks from the future.
+        validate_header_not_from_future(header, present_unix_seconds())?;
 
         // Check extra data
         self.check_header_extra(header).map_err(|e| ConsensusError::Other(format!("Invalid header extra: {e}")))?;
@@ -108,14 +184,22 @@ impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 's
         validate_header_gas(header)?;
         validate_header_base_fee(header, &self.spec)?;
 
+        let cancun_active =
+            BscHardforks::is_cancun_active_at_timestamp(&*self.spec, header.number, header.timestamp);
+        validate_withdrawals_root_for_bsc(header, cancun_active)?;
+
         // Ensures that EIP-4844 fields are valid once cancun is active.
-        if BscHardforks::is_cancun_active_at_timestamp(&*self.spec, header.number, header.timestamp) {
+        if cancun_active {
             validate_4844_header_of_bsc(header, &*self.spec)?;
         } else if header.blob_gas_used.is_some() {
             return Err(ConsensusError::BlobGasUsedUnexpected)
         } else if header.excess_blob_gas.is_some() {
             return Err(ConsensusError::ExcessBlobGasUnexpected)
         }
+
+        let lorentz_active =
+            self.spec.is_lorentz_active_at_timestamp(header.number, header.timestamp);
+        validate_mix_digest_for_parlia(header, lorentz_active)?;
 
         if self.spec.is_bohr_active_at_timestamp(header.number, header.timestamp) {
             if header.parent_beacon_block_root.is_none() ||
@@ -126,6 +210,10 @@ impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 's
         } else if header.parent_beacon_block_root.is_some() {
            return Err(ConsensusError::ParentBeaconBlockRootUnexpected)
         }
+
+        let prague_active =
+            self.spec.is_prague_active_at_block_and_timestamp(header.number, header.timestamp);
+        validate_requests_hash_for_bsc(header, prague_active)?;
 
        Ok(())
     }
@@ -202,5 +290,100 @@ impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 's
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::B256;
+    use reth_primitives::SealedHeader as RethSealedHeader;
+
+    fn sealed(header: Header) -> SealedHeader {
+        RethSealedHeader::new(header, B256::ZERO)
+    }
+
+    #[test]
+    fn future_timestamp_check_uses_seconds_parity() {
+        let header = sealed(Header { timestamp: 101, ..Default::default() });
+        assert!(validate_header_not_from_future(&header, 100).is_err());
+
+        let header = sealed(Header { timestamp: 100, ..Default::default() });
+        assert!(validate_header_not_from_future(&header, 100).is_ok());
+    }
+
+    #[test]
+    fn pre_lorentz_requires_zero_mix_digest() {
+        let header = sealed(Header { mix_hash: B256::from([1u8; 32]), ..Default::default() });
+        assert!(validate_mix_digest_for_parlia(&header, false).is_err());
+
+        let header = sealed(Header { mix_hash: B256::ZERO, ..Default::default() });
+        assert!(validate_mix_digest_for_parlia(&header, false).is_ok());
+    }
+
+    #[test]
+    fn lorentz_mix_digest_milliseconds_must_not_overflow_seconds() {
+        // 999ms remainder => valid
+        let mut valid_mix = [0u8; 32];
+        valid_mix[24..].copy_from_slice(&999u64.to_be_bytes());
+        let header = sealed(Header {
+            timestamp: 10,
+            mix_hash: B256::from(valid_mix),
+            ..Default::default()
+        });
+        assert!(validate_mix_digest_for_parlia(&header, true).is_ok());
+
+        // 1000ms remainder => invalid (would spill into next second)
+        let mut invalid_mix = [0u8; 32];
+        invalid_mix[24..].copy_from_slice(&1000u64.to_be_bytes());
+        let header = sealed(Header {
+            timestamp: 10,
+            mix_hash: B256::from(invalid_mix),
+            ..Default::default()
+        });
+        assert!(validate_mix_digest_for_parlia(&header, true).is_err());
+    }
+
+    #[test]
+    fn cancun_requires_empty_withdrawals_root() {
+        let header = sealed(Header::default());
+        assert!(matches!(
+            validate_withdrawals_root_for_bsc(&header, true),
+            Err(ConsensusError::WithdrawalsRootMissing)
+        ));
+
+        let header = sealed(Header { withdrawals_root: Some(B256::from([1u8; 32])), ..Default::default() });
+        assert!(validate_withdrawals_root_for_bsc(&header, true).is_err());
+
+        let header =
+            sealed(Header { withdrawals_root: Some(EMPTY_WITHDRAWALS_HASH), ..Default::default() });
+        assert!(validate_withdrawals_root_for_bsc(&header, true).is_ok());
+    }
+
+    #[test]
+    fn pre_cancun_rejects_withdrawals_root() {
+        let header =
+            sealed(Header { withdrawals_root: Some(EMPTY_WITHDRAWALS_HASH), ..Default::default() });
+        assert!(matches!(
+            validate_withdrawals_root_for_bsc(&header, false),
+            Err(ConsensusError::WithdrawalsRootUnexpected)
+        ));
+    }
+
+    #[test]
+    fn prague_requests_hash_presence_rules() {
+        let header = sealed(Header::default());
+
+        assert!(matches!(
+            validate_requests_hash_for_bsc(&header, true),
+            Err(ConsensusError::RequestsHashMissing)
+        ));
+
+        let header = sealed(Header { requests_hash: Some(B256::from([2u8; 32])), ..Default::default() });
+        assert!(validate_requests_hash_for_bsc(&header, true).is_ok());
+        assert!(matches!(
+            validate_requests_hash_for_bsc(&header, false),
+            Err(ConsensusError::RequestsHashUnexpected)
+        ));
     }
 }
