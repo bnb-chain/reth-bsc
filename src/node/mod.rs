@@ -13,6 +13,7 @@ use evm::BscExecutorBuilder;
 use network::BscNetworkBuilder;
 use reth::{
     api::{FullNodeComponents, FullNodeTypes, NodeTypes},
+    builder::rpc::EthApiCtx,
     builder::{
         components::ComponentsBuilder,
         rpc::{EthApiBuilder, RpcAddOns, RpcContext},
@@ -28,6 +29,7 @@ use reth_rpc_eth_api::helpers::config::{EthConfigApiServer, EthConfigHandler};
 use reth_rpc_server_types::RethRpcModule;
 use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex};
+use tracing::trace;
 
 pub mod consensus;
 pub mod engine;
@@ -44,11 +46,50 @@ pub mod vote_journal;
 /// Bsc addons configuring RPC types
 pub type BscNodeAddOns<N> = RpcAddOns<
     N,
-    EthereumEthApiBuilder,  // Use standard Ethereum API builder
+    BscEthApiBuilder,
     BscPayloadValidatorBuilder,
     BscEngineApiBuilder,
     BscEngineValidatorBuilder,
 >;
+
+#[derive(Debug, Default)]
+pub struct BscEthApiBuilder;
+
+impl<N> EthApiBuilder<N> for BscEthApiBuilder
+where
+    N: FullNodeComponents,
+    EthereumEthApiBuilder: EthApiBuilder<N>,
+{
+    type EthApi = <EthereumEthApiBuilder as EthApiBuilder<N>>::EthApi;
+
+    async fn build_eth_api(self, ctx: EthApiCtx<'_, N>) -> eyre::Result<Self::EthApi> {
+        let eth_api = ctx
+            .eth_api_builder()
+            .with_current_validators_len(move || {
+                let count = (|| {
+                    let best_block = crate::shared::get_best_canonical_block_number()?;
+                    let header = crate::shared::get_canonical_header_by_number(best_block)?;
+                    let snapshot_provider = crate::shared::get_snapshot_provider()?;
+                    Some(
+                        snapshot_provider
+                            .snapshot_by_hash(&header.hash_slow())?
+                            .validators
+                            .len(),
+                    )
+                })();
+
+                if count.is_none() {
+                    trace!(target: "rpc::eth", "validator count unavailable for finalized-header callbacks");
+                }
+
+                count
+            })
+            .map_converter(|r| r.with_network())
+            .build();
+
+        Ok(eth_api)
+    }
+}
 
 /// Type configuration for a regular BSC node.
 #[derive(Debug, Clone)]
@@ -124,7 +165,7 @@ where
 
     fn add_ons(&self) -> Self::AddOns {
         BscNodeAddOns::default().extend_rpc_modules(
-            |ctx: RpcContext<'_, NodeAdapter<N>, <EthereumEthApiBuilder as EthApiBuilder<NodeAdapter<N>>>::EthApi>| {
+            |ctx: RpcContext<'_, NodeAdapter<N>, <BscEthApiBuilder as EthApiBuilder<NodeAdapter<N>>>::EthApi>| {
                 let eth_config = EthConfigHandler::new(
                     ctx.node().provider().clone(),
                     ctx.node().evm_config().clone(),
