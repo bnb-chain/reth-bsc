@@ -12,17 +12,22 @@ use engine::BscPayloadServiceBuilder;
 use evm::BscExecutorBuilder;
 use network::BscNetworkBuilder;
 use reth::{
-    api::{FullNodeComponents, FullNodeTypes, NodeTypes},
+    api::{FullNodeComponents, FullNodeTypes, HeaderTy, NodeTypes, PrimitivesTy},
     builder::rpc::EthApiCtx,
     builder::{
         components::ComponentsBuilder,
         rpc::{EthApiBuilder, RpcAddOns, RpcContext},
         DebugNode, Node, NodeAdapter,
     },
+    rpc::eth::core::{EthApiFor, EthRpcConverterFor},
 };
+use reth_chainspec::{EthereumHardforks, Hardforks};
+use reth_evm::ConfigureEvm;
+use reth::rpc::server_types::eth::EthApiError;
+use reth_rpc_eth_api::{helpers::pending_block::BuildPendingEnv, RpcConvert, FromEvmError};
 use reth_engine_local::LocalPayloadAttributesBuilder;
 use reth_engine_primitives::ConsensusEngineHandle;
-use reth_node_ethereum::EthereumEthApiBuilder;
+
 use reth_payload_primitives::{PayloadAttributesBuilder, PayloadTypes};
 use reth_primitives::BlockBody;
 use reth_rpc_eth_api::helpers::config::{EthConfigApiServer, EthConfigHandler};
@@ -57,10 +62,18 @@ pub struct BscEthApiBuilder;
 
 impl<N> EthApiBuilder<N> for BscEthApiBuilder
 where
-    N: FullNodeComponents,
-    EthereumEthApiBuilder: EthApiBuilder<N>,
+    N: FullNodeComponents<
+        Types: NodeTypes<ChainSpec: Hardforks + EthereumHardforks>,
+        Evm: ConfigureEvm<NextBlockEnvCtx: BuildPendingEnv<HeaderTy<N::Types>>>,
+    >,
+    EthRpcConverterFor<N>: RpcConvert<
+        Primitives = PrimitivesTy<N::Types>,
+        Error = EthApiError,
+        Evm = N::Evm,
+    >,
+    EthApiError: FromEvmError<N::Evm>,
 {
-    type EthApi = <EthereumEthApiBuilder as EthApiBuilder<N>>::EthApi;
+    type EthApi = EthApiFor<N>;
 
     async fn build_eth_api(self, ctx: EthApiCtx<'_, N>) -> eyre::Result<Self::EthApi> {
         let eth_api = ctx

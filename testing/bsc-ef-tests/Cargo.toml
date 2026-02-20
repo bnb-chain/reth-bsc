@@ -14,23 +14,23 @@ asm-keccak = ["alloy-primitives/asm-keccak"]
 reth_bsc = { path = "../.." }
 
 # reth dependencies aligned with workspace branch to avoid duplicate crate versions
-reth-chainspec = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb" }
-reth-consensus = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb" }
-reth-ethereum-forks = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb" }
-reth-db = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb", features = ["mdbx", "test-utils", "disable-lock"] }
-reth-db-api = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb" }
-reth-db-common = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb" }
-reth-ethereum-consensus = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb" }
-reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb" }
-reth-evm = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb" }
-reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb" }
-reth-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb" }
-reth-primitives-traits = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb" }
-reth-provider = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb", features = ["test-utils"] }
-reth-revm = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb", features = ["std"] }
-reth-tracing = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb" }
-reth-trie = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb" }
-reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", branch = "rebase-v1.10.2-bnb" }
+reth-chainspec = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/eth_getFinalizedHeader-bsc-fix" }
+reth-consensus = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/eth_getFinalizedHeader-bsc-fix" }
+reth-ethereum-forks = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/eth_getFinalizedHeader-bsc-fix" }
+reth-db = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/eth_getFinalizedHeader-bsc-fix", features = ["mdbx", "test-utils", "disable-lock"] }
+reth-db-api = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/eth_getFinalizedHeader-bsc-fix" }
+reth-db-common = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/eth_getFinalizedHeader-bsc-fix" }
+reth-ethereum-consensus = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/eth_getFinalizedHeader-bsc-fix" }
+reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/eth_getFinalizedHeader-bsc-fix" }
+reth-evm = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/eth_getFinalizedHeader-bsc-fix" }
+reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/eth_getFinalizedHeader-bsc-fix" }
+reth-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/eth_getFinalizedHeader-bsc-fix" }
+reth-primitives-traits = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/eth_getFinalizedHeader-bsc-fix" }
+reth-provider = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/eth_getFinalizedHeader-bsc-fix", features = ["test-utils"] }
+reth-revm = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/eth_getFinalizedHeader-bsc-fix", features = ["std"] }
+reth-tracing = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/eth_getFinalizedHeader-bsc-fix" }
+reth-trie = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/eth_getFinalizedHeader-bsc-fix" }
+reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/eth_getFinalizedHeader-bsc-fix" }
 
 # revm
 revm = { version = "34.0.0", features = ["secp256k1", "blst", "c-kzg", "memory_limit"] }
