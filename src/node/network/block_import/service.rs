@@ -157,25 +157,11 @@ where
                         Outcome { peer: peer_id, result: Ok(BlockValidation::ValidBlock { block }) }
                             .into()
                     }
-                    PayloadStatusEnum::Invalid { validation_error } => {
-                        if validation_error.contains("BSC validation error:") {
-                            tracing::warn!(
-                                target: "bsc::block_import",
-                                %validation_error,
-                                peer = %peer_id,
-                                block_number = header.number,
-                                block_hash = %header.hash_slow(),
-                                "Block rejected due to BSC-specific validation error, skipping peer penalty"
-                            );
-                            None
-                        } else {
-                            Outcome {
-                                peer: peer_id,
-                                result: Err(BlockImportError::Other(validation_error.into())),
-                            }
-                            .into()
-                        }
+                    PayloadStatusEnum::Invalid { validation_error } => Outcome {
+                        peer: peer_id,
+                        result: Err(BlockImportError::Other(validation_error.into())),
                     }
+                    .into(),
                     PayloadStatusEnum::Syncing => {
                         // When new_payload returns Syncing status, we need to manually trigger FCU
                         // to avoid the engine-tree being stuck in syncing state without any driver.
@@ -391,29 +377,26 @@ where
 
     /// Transfer the block to EVN peers if from proxied validators or validator address.
     fn transfer_to_evn_peers(&self, block: BlockMsg) -> Result<(), Box<dyn std::error::Error>> {
-        let mining_config = crate::node::miner::config::get_global_mining_config()
-            .ok_or("Mining config is not set")?;
-        let cfg =
-            crate::node::network::evn::get_global_evn_config().ok_or("EVN config is not set")?;
+        let mining_config = crate::node::miner::config::get_global_mining_config().ok_or("Mining config is not set")?;
+        let cfg = crate::node::network::evn::get_global_evn_config().ok_or("EVN config is not set")?;
         if !cfg.enabled {
             return Ok(());
         }
         let header_ref = &block.block.0.block.header;
         let coinbase = header_ref.beneficiary;
         // If from proxied validators or validator address, target EVN peers with ETH NewBlockHashes.
-        if cfg.proxyed_validators.contains(&coinbase)
-            || (mining_config.enabled
-                && mining_config.validator_address.unwrap_or_default() == coinbase)
-        {
+        if cfg.proxyed_validators.contains(&coinbase) || (mining_config.enabled && mining_config.validator_address.unwrap_or_default() == coinbase) {
             if let Some(net) = crate::shared::get_network_handle() {
                 let peers = crate::node::network::evn_peers::snapshot();
                 for (peer_id, info) in peers {
                     // Send to EVN peers or proxyed peers
-                    let is_proxyed =
-                        crate::node::network::bsc_protocol::registry::is_proxyed_peer(&peer_id);
+                    let is_proxyed = crate::node::network::bsc_protocol::registry::is_proxyed_peer(&peer_id);
                     if info.is_evn || is_proxyed {
                         // Send full NewBlock to EVN/proxyed peers to avoid re-fetching.
-                        net.send_eth_message(peer_id, PeerMessage::NewBlock(block.clone()));
+                        net.send_eth_message(
+                            peer_id,
+                            PeerMessage::NewBlock(block.clone()),
+                        );
                         tracing::debug!(target: "bsc::block_import", "Sent full NewBlock to EVN/proxyed peer: number = {:?}, hash = {:?}, peer = {:?}", block.block.0.block.header.number, block.hash, peer_id);
                     }
                 }
