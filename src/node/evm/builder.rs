@@ -140,7 +140,8 @@ where
         let (state_root, trie_updates, produced_difflayer) = if rust_eth_triedb::triedb_manager::is_triedb_active() {
             let mut triedb = get_global_triedb();
             // Miner-side: try to use triedb prefetcher + parent difflayers from execution ctx.
-            let prefetch_state = self.ctx.triedb_prefetcher.take().and_then(|p| p.finish());
+            let block_tx_count = self.transactions.len().try_into().ok();
+            let prefetch_state = self.ctx.triedb_prefetcher.take().and_then(|p| p.finish(block_tx_count));
             // let had_prefetch_state = prefetch_state.is_some();
             let parent_state_root = (**self.parent).state_root();
             let trie_hashed_state = hashed_state.to_triedb_hashed_post_state();
