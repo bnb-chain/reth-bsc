@@ -7126,7 +7126,7 @@ dependencies = [
  "reth-trie",
  "revm-database",
  "revm-state",
- "rust-eth-triedb-common 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=b1099b4)",
+ "rust-eth-triedb-common",
  "serde",
  "tokio",
  "tokio-stream",
@@ -7238,7 +7238,7 @@ dependencies = [
  "reth-trie",
  "reth-trie-common",
  "reth-trie-db",
- "rust-eth-triedb 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=b1099b4)",
+ "rust-eth-triedb",
  "secp256k1 0.30.0",
  "serde",
  "serde_json",
@@ -7453,9 +7453,9 @@ dependencies = [
  "reth-static-file-types",
  "reth-trie",
  "reth-trie-db",
- "rust-eth-triedb 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=b1099b4)",
- "rust-eth-triedb-common 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=b1099b4)",
- "rust-eth-triedb-state-trie 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=b1099b4)",
+ "rust-eth-triedb",
+ "rust-eth-triedb-common",
+ "rust-eth-triedb-state-trie",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -7734,10 +7734,10 @@ dependencies = [
  "reth-trie-sparse-parallel",
  "revm",
  "revm-primitives",
- "rust-eth-triedb 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=b1099b4)",
- "rust-eth-triedb-common 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=b1099b4)",
- "rust-eth-triedb-pathdb 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=b1099b4)",
- "rust-eth-triedb-state-trie 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=b1099b4)",
+ "rust-eth-triedb",
+ "rust-eth-triedb-common",
+ "rust-eth-triedb-pathdb",
+ "rust-eth-triedb-state-trie",
  "schnellru",
  "smallvec",
  "thiserror 2.0.18",
@@ -8038,7 +8038,7 @@ dependencies = [
  "reth-storage-errors",
  "reth-trie-common",
  "revm",
- "rust-eth-triedb-common 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=b1099b4)",
+ "rust-eth-triedb-common",
 ]
 
 [[package]]
@@ -8509,7 +8509,7 @@ dependencies = [
  "reth-tokio-util",
  "reth-tracing",
  "reth-transaction-pool",
- "rust-eth-triedb 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=b1099b4)",
+ "rust-eth-triedb",
  "secp256k1 0.30.0",
  "serde_json",
  "tokio",
@@ -8856,7 +8856,7 @@ dependencies = [
  "reth-trie-db",
  "revm-database",
  "revm-state",
- "rust-eth-triedb 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=b1099b4)",
+ "rust-eth-triedb",
  "strum 0.27.2",
  "tokio",
  "tracing",
@@ -9030,7 +9030,7 @@ dependencies = [
  "revm",
  "revm-inspectors",
  "revm-primitives",
- "rust-eth-triedb 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=b1099b4)",
+ "rust-eth-triedb",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -9198,7 +9198,7 @@ dependencies = [
  "reth-trie-common",
  "revm",
  "revm-inspectors",
- "rust-eth-triedb 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=b1099b4)",
+ "rust-eth-triedb",
  "tokio",
  "tracing",
 ]
@@ -9324,7 +9324,7 @@ dependencies = [
  "reth-trie",
  "reth-trie-common",
  "reth-trie-db",
- "rust-eth-triedb 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=b1099b4)",
+ "rust-eth-triedb",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -9590,8 +9590,8 @@ dependencies = [
  "reth-codecs",
  "reth-primitives-traits",
  "revm-database",
- "rust-eth-triedb 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=b1099b4)",
- "rust-eth-triedb-state-trie 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=b1099b4)",
+ "rust-eth-triedb",
+ "rust-eth-triedb-state-trie",
  "serde",
  "serde_with",
 ]
@@ -9606,7 +9606,7 @@ dependencies = [
  "reth-execution-errors",
  "reth-primitives-traits",
  "reth-trie",
- "rust-eth-triedb 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=b1099b4)",
+ "rust-eth-triedb",
  "tracing",
 ]
 
@@ -9779,9 +9779,9 @@ dependencies = [
  "reth-trie-common",
  "reth-trie-db",
  "revm",
- "rust-eth-triedb 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?branch=perf%2Fflamegraph-optimizations)",
- "rust-eth-triedb-common 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?branch=perf%2Fflamegraph-optimizations)",
- "rust-eth-triedb-pathdb 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?branch=perf%2Fflamegraph-optimizations)",
+ "rust-eth-triedb",
+ "rust-eth-triedb-common",
+ "rust-eth-triedb-pathdb",
  "schnellru",
  "scrypt 0.11.0",
  "secp256k1 0.30.0",
@@ -10197,26 +10197,6 @@ checksum = "48fd7bd8a6377e15ad9d42a8ec25371b94ddc67abe7c8b9127bec79bebaaae18"
 [[package]]
 name = "rust-eth-triedb"
 version = "0.1.0"
-source = "git+https://github.com/bnb-chain/reth-bsc-triedb.git?branch=perf%2Fflamegraph-optimizations#b1099b4cc1ec1b65ad9e58ce191c84ee0ca9198c"
-dependencies = [
- "alloy-primitives",
- "alloy-trie",
- "metrics",
- "once_cell",
- "rayon",
- "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git)",
- "rust-eth-triedb-common 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?branch=perf%2Fflamegraph-optimizations)",
- "rust-eth-triedb-pathdb 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?branch=perf%2Fflamegraph-optimizations)",
- "rust-eth-triedb-state-trie 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?branch=perf%2Fflamegraph-optimizations)",
- "schnellru",
- "serde",
- "thiserror 1.0.69",
- "tracing",
-]
-
-[[package]]
-name = "rust-eth-triedb"
-version = "0.1.0"
 source = "git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=b1099b4#b1099b4cc1ec1b65ad9e58ce191c84ee0ca9198c"
 dependencies = [
  "alloy-primitives",
@@ -10225,24 +10205,14 @@ dependencies = [
  "once_cell",
  "rayon",
  "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git)",
- "rust-eth-triedb-common 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=b1099b4)",
- "rust-eth-triedb-pathdb 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=b1099b4)",
- "rust-eth-triedb-state-trie 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=b1099b4)",
+ "rust-eth-triedb-common",
+ "rust-eth-triedb-pathdb",
+ "rust-eth-triedb-state-trie",
  "schnellru",
  "serde",
  "thiserror 1.0.69",
  "tikv-jemallocator",
  "tracing",
-]
-
-[[package]]
-name = "rust-eth-triedb-common"
-version = "0.1.0"
-source = "git+https://github.com/bnb-chain/reth-bsc-triedb.git?branch=perf%2Fflamegraph-optimizations#b1099b4cc1ec1b65ad9e58ce191c84ee0ca9198c"
-dependencies = [
- "alloy-primitives",
- "auto_impl",
- "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -10259,25 +10229,6 @@ dependencies = [
 [[package]]
 name = "rust-eth-triedb-pathdb"
 version = "0.1.0"
-source = "git+https://github.com/bnb-chain/reth-bsc-triedb.git?branch=perf%2Fflamegraph-optimizations#b1099b4cc1ec1b65ad9e58ce191c84ee0ca9198c"
-dependencies = [
- "alloy-primitives",
- "alloy-trie",
- "metrics",
- "mini-moka",
- "parking_lot",
- "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git)",
- "rocksdb",
- "rust-eth-triedb-common 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?branch=perf%2Fflamegraph-optimizations)",
- "schnellru",
- "tempfile",
- "thiserror 1.0.69",
- "tracing",
-]
-
-[[package]]
-name = "rust-eth-triedb-pathdb"
-version = "0.1.0"
 source = "git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=b1099b4#b1099b4cc1ec1b65ad9e58ce191c84ee0ca9198c"
 dependencies = [
  "alloy-primitives",
@@ -10287,7 +10238,7 @@ dependencies = [
  "parking_lot",
  "reth-metrics 1.7.0 (git+https://github.com/bnb-chain/reth.git)",
  "rocksdb",
- "rust-eth-triedb-common 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=b1099b4)",
+ "rust-eth-triedb-common",
  "schnellru",
  "tempfile",
  "thiserror 1.0.69",
@@ -10298,24 +10249,6 @@ dependencies = [
 [[package]]
 name = "rust-eth-triedb-state-trie"
 version = "0.1.0"
-source = "git+https://github.com/bnb-chain/reth-bsc-triedb.git?branch=perf%2Fflamegraph-optimizations#b1099b4cc1ec1b65ad9e58ce191c84ee0ca9198c"
-dependencies = [
- "alloy-primitives",
- "alloy-rlp",
- "alloy-trie",
- "auto_impl",
- "hex 0.4.3",
- "rand 0.8.5",
- "rayon",
- "rust-eth-triedb-common 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?branch=perf%2Fflamegraph-optimizations)",
- "rust-eth-triedb-pathdb 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?branch=perf%2Fflamegraph-optimizations)",
- "thiserror 1.0.69",
- "tracing",
-]
-
-[[package]]
-name = "rust-eth-triedb-state-trie"
-version = "0.1.0"
 source = "git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=b1099b4#b1099b4cc1ec1b65ad9e58ce191c84ee0ca9198c"
 dependencies = [
  "alloy-primitives",
@@ -10325,8 +10258,8 @@ dependencies = [
  "hex 0.4.3",
  "rand 0.8.5",
  "rayon",
- "rust-eth-triedb-common 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=b1099b4)",
- "rust-eth-triedb-pathdb 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?rev=b1099b4)",
+ "rust-eth-triedb-common",
+ "rust-eth-triedb-pathdb",
  "thiserror 1.0.69",
  "tikv-jemallocator",
  "tracing",
