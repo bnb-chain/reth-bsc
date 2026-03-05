@@ -151,7 +151,7 @@ where
                 .intermediate_and_commit_hashed_post_state(
                     parent_state_root,
                     difflayers_opt,
-                    &trie_hashed_state,
+                    trie_hashed_state,
                     prefetch_state,
                 )
                 .map_err(BlockExecutionError::other)?;
