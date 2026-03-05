@@ -1450,9 +1450,9 @@ where
                     .parent_snapshot
                     .last_block_in_one_turn(try_mine_block_number)
                 {
-                    (self.expected_end_timestamp_ms - now_ms) as u64
+                    self.expected_end_timestamp_ms.saturating_sub(now_ms) as u64
                 } else {
-                    ((self.expected_end_timestamp_ms - now_ms) as u64) * 3 // wait more when not the last block in turn
+                    (self.expected_end_timestamp_ms.saturating_sub(now_ms) as u64) * 3 // wait more when not the last block in turn
                 };
                 if remaining_ms > 50 {
                     remaining_ms = 50;
