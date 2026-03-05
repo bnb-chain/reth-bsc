@@ -148,7 +148,7 @@ where
 
             let triedb_calc_started = std::time::Instant::now();
             let (new_root, new_difflayer) = triedb
-                .intermediate_and_commit_hashed_post_state_v2(
+                .intermediate_and_commit_hashed_post_state(
                     parent_state_root,
                     difflayers_opt,
                     &trie_hashed_state,
