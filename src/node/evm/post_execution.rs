@@ -45,6 +45,29 @@ where
         &mut self, 
         block: &BlockEnv
     ) -> Result<(), BlockExecutionError> {
+        let parent_hash = self.ctx.base.parent_hash;
+        let parent_number = self.inner_ctx.parent_header.as_ref().map(|h| h.number);
+        let sys_balance_at_post_check = self
+            .evm
+            .db_mut()
+            .basic(SYSTEM_ADDRESS)
+            .map_err(BlockExecutionError::other)?
+            .unwrap_or_default()
+            .balance;
+
+        tracing::info!(
+            target: "bsc::slash_debug",
+            block_number = %block.number,
+            ?parent_hash,
+            ?parent_number,
+            %sys_balance_at_post_check,
+            system_txs_count = self.system_txs.len(),
+            gas_used_so_far = self.gas_used,
+            beneficiary = ?block.beneficiary,
+            difficulty = %self.inner_ctx.header.as_ref().map(|h| h.difficulty).unwrap_or_default(),
+            "post_check_new_block entry state"
+        );
+
         tracing::debug!("Start to post check new block, block_number: {}, is_miner: {}", block.number, self.ctx.is_miner); 
         self.verify_validators(self.inner_ctx.current_validators.clone(), self.inner_ctx.header.clone())?;
         self.verify_turn_length(self.inner_ctx.header.clone())?;
@@ -291,6 +314,32 @@ where
                         return Ok(());
                     }
                 }
+
+                let block_number = self.evm.block().number.to::<u64>();
+                tracing::warn!(
+                    target: "bsc::slash_debug",
+                    block_number,
+                    computed_to = ?transaction.to(),
+                    computed_value = %transaction.value(),
+                    computed_nonce = transaction.nonce(),
+                    computed_sig_hash = ?hash,
+                    system_txs_remaining = self.system_txs.len(),
+                    "transact_system_tx MISMATCH: computed tx does not match block's system tx"
+                );
+                if !self.system_txs.is_empty() {
+                    let block_tx = &self.system_txs[0];
+                    tracing::warn!(
+                        target: "bsc::slash_debug",
+                        block_number,
+                        block_tx_to = ?block_tx.to(),
+                        block_tx_value = %block_tx.value(),
+                        block_tx_nonce = block_tx.nonce(),
+                        block_tx_sig_hash = ?block_tx.signature_hash(),
+                        value_diff = %(transaction.value().abs_diff(block_tx.value())),
+                        "transact_system_tx MISMATCH: block system tx[0] detail"
+                    );
+                }
+
                 warn!("unexpected transaction: {:?}", transaction);
                 for tx in self.system_txs.iter() {
                     warn!("left system tx: {:?}", tx);
@@ -393,11 +442,28 @@ where
         &mut self,
         validator: Address,
     ) -> Result<(), BlockExecutionError> {
+        let block_number = self.evm.block().number.to::<u64>();
         let system_account = self
             .evm
             .db_mut()
             .load_cache_account(SYSTEM_ADDRESS)
             .map_err(BlockExecutionError::other)?;
+
+        let sys_balance = system_account
+            .account
+            .as_ref()
+            .map(|a| a.info.balance)
+            .unwrap_or(U256::ZERO);
+
+        tracing::info!(
+            target: "bsc::slash_debug",
+            block_number,
+            %sys_balance,
+            is_miner = self.ctx.is_miner,
+            ?validator,
+            sys_account_exists = system_account.account.is_some(),
+            "distribute_incoming SYSTEM_ADDRESS balance before drain"
+        );
 
         if system_account.account.is_none() ||
             system_account.account.as_ref().unwrap().info.balance == U256::ZERO
@@ -406,6 +472,14 @@ where
         }
 
         let (mut block_reward, mut transition) = system_account.drain_balance();
+
+        tracing::info!(
+            target: "bsc::slash_debug",
+            block_number,
+            block_reward,
+            is_miner = self.ctx.is_miner,
+            "distribute_incoming drained block_reward"
+        );
         transition.info = None;
         self.evm.db_mut().apply_transition(vec![(SYSTEM_ADDRESS, transition)]);
         let balance_increment = vec![(validator, block_reward)];
@@ -578,6 +652,27 @@ where
         &mut self, 
         block: &BlockEnv
     ) -> Result<(), BlockExecutionError> {
+        let parent_hash = self.ctx.base.parent_hash;
+        let parent_number = self.inner_ctx.parent_header.as_ref().map(|h| h.number);
+        let sys_balance_at_finalize = self
+            .evm
+            .db_mut()
+            .basic(SYSTEM_ADDRESS)
+            .map_err(BlockExecutionError::other)?
+            .unwrap_or_default()
+            .balance;
+
+        tracing::info!(
+            target: "bsc::slash_debug",
+            block_number = %block.number,
+            ?parent_hash,
+            ?parent_number,
+            %sys_balance_at_finalize,
+            gas_used_so_far = self.gas_used,
+            beneficiary = ?block.beneficiary,
+            "finalize_new_block (miner) entry state"
+        );
+
         tracing::debug!("Start to finalize new block, block_number: {}, is_miner: {}", block.number, self.ctx.is_miner);
         let snap = self.inner_ctx.snap.as_ref().unwrap();
         let epoch_length = snap.epoch_num;

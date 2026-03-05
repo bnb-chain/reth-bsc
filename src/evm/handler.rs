@@ -5,7 +5,7 @@ use crate::evm::{
     blacklist,
 };
 
-use alloy_primitives::{U256};
+use alloy_primitives::U256;
 use reth_evm::Database;
 use revm::{bytecode::Bytecode, primitives::eip7702};
 
@@ -164,9 +164,17 @@ impl<DB: Database, INSP> Handler for BscHandler<DB, INSP> {
             return Ok(());
         }
 
+        let block_number = ctx.block().number.to::<u64>();
         let effective_gas_price = ctx.effective_gas_price();
         let gas = exec_result.gas();
-        let mut tx_fee = U256::from(gas.spent() - gas.refunded() as u64) * effective_gas_price;
+        let gas_spent = gas.spent();
+        let gas_refunded_raw = gas.refunded();
+        let gas_used_for_fee = gas_spent - gas_refunded_raw as u64;
+        let mut tx_fee = U256::from(gas_used_for_fee) * effective_gas_price;
+
+        let tx_type = tx.tx_type() as u8;
+        let tx_gas_price = tx.gas_price();
+        let tx_gas_priority_fee = tx.max_priority_fee_per_gas().unwrap_or(0);
 
         // EIP-4844
         let is_cancun = SpecId::from(ctx.cfg().spec()).is_enabled_in(SpecId::CANCUN);
@@ -176,8 +184,27 @@ impl<DB: Database, INSP> Handler for BscHandler<DB, INSP> {
         }
 
         let system_account = ctx.journal_mut().load_account(SYSTEM_ADDRESS)?;
+        let balance_before = system_account.data.info.balance;
         system_account.data.mark_touch();
         system_account.data.info.balance = system_account.data.info.balance.saturating_add(tx_fee);
+        let balance_after = system_account.data.info.balance;
+
+        tracing::info!(
+            target: "bsc::slash_debug",
+            block_number,
+            gas_spent,
+            gas_refunded_raw,
+            gas_used_for_fee,
+            %effective_gas_price,
+            %tx_fee,
+            %balance_before,
+            %balance_after,
+            tx_type,
+            tx_gas_price,
+            tx_gas_priority_fee,
+            "reward_beneficiary per-tx detail"
+        );
+
         Ok(())
     }
 
@@ -192,10 +219,28 @@ impl<DB: Database, INSP> Handler for BscHandler<DB, INSP> {
             Ok(_) => (),
         }
 
+        let is_system_tx = evm.ctx().tx().is_system_transaction;
+        let block_number = evm.ctx().block().number.to::<u64>();
+        let gas_spent = result.gas().spent();
+        let gas_refunded_in_result = result.gas().refunded();
+
         // used gas with refund calculated.
-        let gas_refunded =
-            if evm.ctx().tx().is_system_transaction { 0 } else { result.gas().refunded() as u64 };
-        let final_gas_used = result.gas().spent() - gas_refunded;
+        let gas_refunded = if is_system_tx { 0 } else { gas_refunded_in_result as u64 };
+        let final_gas_used = gas_spent - gas_refunded;
+
+        if !is_system_tx {
+            tracing::info!(
+                target: "bsc::slash_debug",
+                block_number,
+                gas_spent,
+                gas_refunded_in_result,
+                gas_refunded,
+                final_gas_used,
+                is_system_tx,
+                "execution_result gas refund detail"
+            );
+        }
+
         let output = result.output();
         let instruction_result = result.into_interpreter_result();
 
