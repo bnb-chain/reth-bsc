@@ -1,3 +1,4 @@
+use crate::node::evm::config::BscEvmConfig;
 use crate::BscBlock;
 use crate::{
     node::{
@@ -8,6 +9,9 @@ use crate::{
     BscPrimitives,
 };
 use alloy_eips::eip7685::Requests;
+use reth_engine_primitives::TreeConfig;
+use reth_engine_tree::tree::precompile_cache::PrecompileCacheMap;
+use reth_engine_tree::tree::{PayloadProcessor, WorkloadExecutor};
 use alloy_primitives::U256;
 use reth::transaction_pool::PoolTransaction;
 use reth::{
@@ -17,7 +21,6 @@ use reth::{
     transaction_pool::TransactionPool,
 };
 use reth_chain_state::{ExecutedBlock, ExecutedBlockWithTrieUpdates, ExecutedTrieUpdates};
-use reth_evm::ConfigureEvm;
 use reth_payload_builder_primitives::Events;
 use reth_payload_primitives::BuiltPayload;
 use reth_primitives::{SealedBlock, TransactionSigned};
@@ -88,22 +91,21 @@ impl BuiltPayload for BscBuiltPayload {
 #[non_exhaustive]
 pub struct BscPayloadServiceBuilder;
 
-impl<Node, Pool, Evm> PayloadServiceBuilder<Node, Pool, Evm> for BscPayloadServiceBuilder
+/// BSC node uses BscEvmConfig; we create a PayloadProcessor for miner prewarm (tree/prewarm bridge).
+impl<Node, Pool> PayloadServiceBuilder<Node, Pool, BscEvmConfig> for BscPayloadServiceBuilder
 where
     Node: FullNodeTypes<Types = BscNode>,
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>>
         + Clone
         + 'static,
-    Evm: ConfigureEvm,
 {
     async fn spawn_payload_builder_service(
         self,
         ctx: &BuilderContext<Node>,
         pool: Pool,
-        _evm_config: Evm,
+        evm_config: BscEvmConfig,
     ) -> eyre::Result<PayloadBuilderHandle<BscPayloadTypes>> {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        // Load mining configuration from environment, allow override via CLI if set globally
         let mining_config =
             if let Some(cfg) = crate::node::miner::config::get_global_mining_config() {
                 cfg.clone()
@@ -111,7 +113,6 @@ where
                 MiningConfig::from_env()
             };
 
-        // Skip mining setup if disabled
         if !mining_config.is_mining_enabled() {
             info!("Mining is disabled in configuration");
         } else {
@@ -122,6 +123,14 @@ where
             let provider_clone = ctx.provider().clone();
             let chain_spec_clone = Arc::new(ctx.config().chain.clone().as_ref().clone());
             let task_executor_clone = ctx.task_executor().clone();
+
+            let payload_processor_for_miner: Option<Arc<PayloadProcessor<BscEvmConfig>>> =
+                Some(Arc::new(PayloadProcessor::new(
+                    WorkloadExecutor::default(),
+                    evm_config,
+                    &TreeConfig::default(),
+                    PrecompileCacheMap::default(),
+                )));
 
             ctx.task_executor().spawn_critical("bsc-miner-initializer", async move {
                 info!("Waiting for consensus module to initialize snapshot provider...");
@@ -146,6 +155,7 @@ where
                     chain_spec_clone,
                     mining_config_clone,
                     task_executor_clone,
+                    payload_processor_for_miner,
                 ) {
                     Ok(miner) => {
                         info!("BSC miner created successfully, starting mining loop");
@@ -160,11 +170,9 @@ where
             });
         }
 
-        // Initialize global payload events channel and handler
         let (events_tx, _events_rx) = broadcast::channel::<Events<BscPayloadTypes>>(100);
         let _ = crate::shared::set_payload_events_tx(events_tx.clone());
 
-        // Handle payload service commands (keep minimal compatibility but with shared events channel)
         ctx.task_executor().spawn_critical("payload-service-handler", async move {
             while let Some(message) = rx.recv().await {
                 match message {

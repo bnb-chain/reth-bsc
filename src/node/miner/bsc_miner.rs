@@ -38,6 +38,7 @@ use reth_primitives_traits::BlockBody;
 use reth_provider::{
     BlockNumReader, CanonStateNotification, CanonStateSubscriptions, HeaderProvider,
 };
+use reth_engine_tree::tree::PayloadProcessor;
 use reth_revm::cancelled::ManualCancel;
 use reth_tasks::TaskExecutor;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -479,6 +480,8 @@ pub struct MainWorkWorker<Pool, Provider> {
     simulator: Arc<BidSimulator<Provider, Pool>>, // No outer RwLock, each map has its own lock
     desired_gas_limit: u64,
     desired_min_gas_tip: u128,
+    /// When set (from tree engine / payload service), used for miner prewarm in build_payload.
+    payload_processor: Option<Arc<PayloadProcessor<BscEvmConfig>>>,
 }
 
 impl<Pool, Provider> MainWorkWorker<Pool, Provider>
@@ -488,6 +491,8 @@ where
         + 'static,
     Provider: HeaderProvider<Header = alloy_consensus::Header>
         + BlockNumReader
+        + reth_provider::BlockReader
+        + reth_provider::StateReader
         + reth_provider::StateProviderFactory
         + CanonStateSubscriptions
         + Clone
@@ -507,6 +512,7 @@ where
         payload_tx: mpsc::UnboundedSender<SubmitContext>,
         desired_gas_limit: u64,
         desired_min_gas_tip: u128,
+        payload_processor: Option<Arc<PayloadProcessor<BscEvmConfig>>>,
     ) -> Self {
         Self {
             pool,
@@ -521,6 +527,7 @@ where
             payload_job_join_set: JoinSet::new(),
             desired_gas_limit,
             desired_min_gas_tip,
+            payload_processor,
         }
     }
 
@@ -631,6 +638,7 @@ where
             self.chain_spec.clone(),
             self.parlia.clone(),
             mining_ctx.clone(),
+            self.payload_processor.clone(),
         );
         let build_args = BscBuildArguments {
             cached_reads: mining_ctx.cached_reads.clone().unwrap_or_default(),
@@ -1138,6 +1146,8 @@ where
         + 'static,
     Provider: HeaderProvider<Header = alloy_consensus::Header>
         + BlockNumReader
+        + reth_provider::BlockReader
+        + reth_provider::StateReader
         + reth_provider::StateProviderFactory
         + CanonStateSubscriptions
         + Clone
@@ -1152,6 +1162,7 @@ where
         chain_spec: Arc<crate::chainspec::BscChainSpec>,
         mining_config: MiningConfig,
         task_executor: TaskExecutor,
+        payload_processor: Option<Arc<PayloadProcessor<BscEvmConfig>>>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         mining_config.validate()?;
         let validator_address = mining_config
@@ -1202,6 +1213,7 @@ where
             payload_tx,
             desired_gas_limit,
             desired_min_gas_tip,
+            payload_processor,
         );
 
         let result_work_worker = ResultWorkWorker::new(

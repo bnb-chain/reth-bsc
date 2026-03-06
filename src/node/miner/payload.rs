@@ -6,6 +6,11 @@ use crate::hardforks::BscHardforks;
 use crate::node::engine::{BscBuiltPayload, BuildKind};
 use crate::node::evm::config::{BscEvmConfig, BscNextBlockEnvAttributes};
 use crate::node::evm::{request_difflayer, MinerTrieDbPrefetcher};
+use alloy_evm::ToTxEnv;
+use reth_engine_tree::tree::{ExecutionEnv, PayloadProcessor, StateProviderBuilder};
+use reth_evm::execute::WithTxEnv;
+use reth_evm::TxEnvFor;
+use reth_provider::{BlockReader, StateReader};
 use crate::node::miner::bid_simulator::BidSimulator;
 use crate::node::miner::bsc_miner::{MiningContext, SubmitContext};
 use crate::node::pool::BlacklistedAddressError;
@@ -34,7 +39,7 @@ use reth_payload_primitives::{BuiltPayload, PayloadBuilderError};
 use reth_primitives::HeaderTy;
 use reth_primitives::InvalidTransactionError;
 use reth_primitives::TransactionSigned;
-use reth_primitives_traits::{BlockBody, SignerRecoverable};
+use reth_primitives_traits::{BlockBody, Recovered, SignerRecoverable};
 use reth_provider::StateProviderFactory;
 use reth_revm::cached::CachedReads;
 use reth_revm::cancelled::ManualCancel;
@@ -108,8 +113,11 @@ pub struct BscBuildArguments<Attributes> {
 }
 
 /// BSC payload builder, used to build payload for bsc miner.
-#[derive(Debug, Clone)]
-pub struct BscPayloadBuilder<Pool, Client, EvmConfig = BscEvmConfig> {
+#[derive(Clone)]
+pub struct BscPayloadBuilder<Pool, Client, EvmConfig = BscEvmConfig>
+where
+    EvmConfig: ConfigureEvm,
+{
     /// Client providing access to node state.
     client: Client,
     /// Transaction pool.
@@ -122,13 +130,35 @@ pub struct BscPayloadBuilder<Pool, Client, EvmConfig = BscEvmConfig> {
     chain_spec: Arc<BscChainSpec>,
     /// Parlia consensus engine.
     parlia: Arc<Parlia<BscChainSpec>>,
-    // Mining context containing header information for blob fee calculation
+    /// Mining context containing header information for blob fee calculation.
     ctx: MiningContext,
+    /// When set, miner uses prewarm (txs → prewarm → PrefetchProofs → prefetcher), same as fullnode.
+    payload_processor: Option<Arc<PayloadProcessor<EvmConfig>>>,
+}
+
+impl<Pool, Client, EvmConfig> std::fmt::Debug for BscPayloadBuilder<Pool, Client, EvmConfig>
+where
+    EvmConfig: ConfigureEvm + std::fmt::Debug,
+    Pool: std::fmt::Debug,
+    Client: std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BscPayloadBuilder")
+            .field("client", &self.client)
+            .field("pool", &self.pool)
+            .field("evm_config", &self.evm_config)
+            .field("builder_config", &self.builder_config)
+            .field("chain_spec", &self.chain_spec)
+            .field("parlia", &self.parlia)
+            .field("ctx", &self.ctx)
+            .field("payload_processor", &self.payload_processor.as_ref().map(|_| "Some"))
+            .finish()
+    }
 }
 
 impl<Pool, Client, EvmConfig> BscPayloadBuilder<Pool, Client, EvmConfig>
 where
-    Client: StateProviderFactory + 'static,
+    Client: StateProviderFactory + BlockReader + StateReader + Clone + 'static,
     EvmConfig: ConfigureEvm<NextBlockEnvCtx = BscNextBlockEnvAttributes> + 'static,
     <EvmConfig as ConfigureEvm>::Primitives: reth_primitives_traits::NodePrimitives<
         BlockHeader = alloy_consensus::Header,
@@ -138,7 +168,7 @@ where
     >,
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>> + 'static,
 {
-    pub const fn new(
+    pub fn new(
         client: Client,
         pool: Pool,
         evm_config: EvmConfig,
@@ -146,8 +176,18 @@ where
         chain_spec: Arc<BscChainSpec>,
         parlia: Arc<Parlia<BscChainSpec>>,
         ctx: MiningContext,
+        payload_processor: Option<Arc<PayloadProcessor<EvmConfig>>>,
     ) -> Self {
-        Self { client, pool, evm_config, builder_config, chain_spec, parlia, ctx }
+        Self {
+            client,
+            pool,
+            evm_config,
+            builder_config,
+            chain_spec,
+            parlia,
+            ctx,
+            payload_processor,
+        }
     }
 
     /// Builds a payload with the given arguments.
@@ -214,13 +254,50 @@ where
             .with_bundle_update()
             .build();
 
-        // Build triedb prefetcher before creating the block builder so it can be carried via the
-        // custom next-block env ctx into the execution ctx and consumed in `finish()`.
-        let triedb_prefetcher = triedb_parent_difflayers.clone().and_then(|difflayers| {
+        // Build triedb prefetcher via bridge only: prewarm path (txs → prewarm → PrefetchProofs)
+        // plus on_state_update path, same as fullnode. Requires payload_processor and parent difflayers.
+        let (triedb_prefetcher, prewarm_tx_sender): (
+            Option<MinerTrieDbPrefetcher>,
+            Option<std::sync::mpsc::Sender<
+                WithTxEnv<TxEnvFor<EvmConfig>, Recovered<TransactionSigned>>,
+            >>,
+        ) = if let (Some(processor), Some(difflayers)) =
+            (&self.payload_processor, &triedb_parent_difflayers)
+        {
             let mut triedb = get_global_triedb();
             let path_db = triedb.get_mut_path_db_ref().clone();
-            MinerTrieDbPrefetcher::new(parent_header.state_root(), path_db, Some(difflayers)).ok()
-        });
+            let env = ExecutionEnv {
+                evm_env: Default::default(),
+                hash: parent_hash,
+                parent_hash: parent_header.parent_hash(),
+            };
+            let provider_builder =
+                StateProviderBuilder::new(self.client.clone(), parent_hash, None);
+            match processor.new_miner_triedb_prefetcher_with_prewarm::<
+                Client,
+                Recovered<TransactionSigned>,
+            >(
+                parent_header.state_root(),
+                path_db,
+                Some(difflayers.clone()),
+                env,
+                provider_builder,
+            ) {
+                Ok((prefetcher, sender)) => (Some(prefetcher), Some(sender)),
+                Err(e) => {
+                    warn!(
+                        target: "payload_builder",
+                        trace_id,
+                        parent_hash = ?parent_hash,
+                        error = %e,
+                        "Bridge prefetcher failed, continuing without prefetcher"
+                    );
+                    (None, None)
+                }
+            }
+        } else {
+            (None, None)
+        };
 
         let next_env_attributes = BscNextBlockEnvAttributes {
             inner: NextBlockEnvAttributes {
@@ -249,7 +326,7 @@ where
             builder
                 .executor_mut()
                 .set_state_hook(Some(Box::new(move |_, update: &RethEvmState| {
-                    pf.on_state_update(update);
+                    pf.send_state_update(update);
                 })));
             debug!(
                 target: "payload_builder",
@@ -365,6 +442,13 @@ where
             }
 
             let tx = pool_tx.to_consensus();
+            if let Some(ref sender) = prewarm_tx_sender {
+                // Pool's to_consensus() returns Recovered<TransactionSigned>; send as-is.
+                let _ = sender.send(WithTxEnv {
+                    tx_env: tx.to_tx_env(),
+                    tx: tx.clone(),
+                });
+            }
             let tx_start = std::time::Instant::now();
             let mut blob_tx_sidecar = None;
             trace!(
@@ -574,6 +658,10 @@ where
         }
         let exec_duration = exec_start.elapsed();
 
+        // Signal no more txs to prewarm so it can exit; prefetcher's forwarder will then send
+        // PrefetchFinished. Must do this before finish_with_difflayer (which calls prefetcher.finish()).
+        drop(prewarm_tx_sender);
+
         // add system txs to payload.
         let finalize_start = std::time::Instant::now();
         let out = builder.finish_with_difflayer(&state_provider)?;
@@ -730,7 +818,15 @@ where
         let triedb_prefetcher = triedb_parent_difflayers.clone().and_then(|difflayers| {
             let mut triedb = get_global_triedb();
             let path_db = triedb.get_mut_path_db_ref().clone();
-            MinerTrieDbPrefetcher::new(parent_header.state_root(), path_db, Some(difflayers)).ok()
+            let executor = reth_engine_tree::tree::WorkloadExecutor::default();
+            MinerTrieDbPrefetcher::new(
+                parent_header.state_root(),
+                path_db,
+                Some(difflayers),
+                executor,
+            )
+            .ok()
+            .map(|(handle, _)| handle)
         });
 
         let mut builder = self
@@ -762,7 +858,7 @@ where
             builder
                 .executor_mut()
                 .set_state_hook(Some(Box::new(move |_, update: &RethEvmState| {
-                    pf.on_state_update(update);
+                    pf.send_state_update(update);
                 })));
             debug!(
                 target: "payload_builder",
@@ -865,6 +961,7 @@ impl BscPayloadJobHandle {
 /// BscPayloadJob is used to async build payloads to get best payload.
 pub struct BscPayloadJob<Pool, Client, EvmConfig = BscEvmConfig>
 where
+    EvmConfig: ConfigureEvm,
     Pool: TransactionPool,
 {
     /// Parlia consensus engine
@@ -913,6 +1010,8 @@ where
     Client: StateProviderFactory
         + reth_provider::HeaderProvider<Header = alloy_consensus::Header>
         + reth_provider::BlockHashReader
+        + reth_provider::BlockReader
+        + reth_provider::StateReader
         + Clone
         + 'static,
     EvmConfig: ConfigureEvm<NextBlockEnvCtx = BscNextBlockEnvAttributes> + 'static,
