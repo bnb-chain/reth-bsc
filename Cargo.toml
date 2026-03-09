@@ -13,58 +13,58 @@ name = "reth-bsc"
 path = "src/main.rs"
 
 [dependencies]
-reth = { git = "https://github.com/bnb-chain/reth.git", branch = "new-perf-triedb-matus" }
-reth-cli = { git = "https://github.com/bnb-chain/reth.git", branch = "new-perf-triedb-matus" }
-reth-cli-commands = { git = "https://github.com/bnb-chain/reth.git", branch = "new-perf-triedb-matus" }
-reth-basic-payload-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "new-perf-triedb-matus" }
-reth-db = { git = "https://github.com/bnb-chain/reth.git", branch = "new-perf-triedb-matus" }
-reth-engine-local = { git = "https://github.com/bnb-chain/reth.git", branch = "new-perf-triedb-matus" }
-reth-engine-tree = { git = "https://github.com/bnb-chain/reth.git", branch = "new-perf-triedb-matus" }
-reth-node-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "new-perf-triedb-matus" }
-reth-chainspec = { git = "https://github.com/bnb-chain/reth.git", branch = "new-perf-triedb-matus" }
-reth-cli-util = { git = "https://github.com/bnb-chain/reth.git", branch = "new-perf-triedb-matus" }
-reth-discv4 = { git = "https://github.com/bnb-chain/reth.git", branch = "new-perf-triedb-matus", features = [
+reth = { git = "https://github.com/bnb-chain/reth.git", rev = "3a21fd40ab8a24a02b1f6e122e1cd62d3f73187b" }
+reth-cli = { git = "https://github.com/bnb-chain/reth.git", rev = "3a21fd40ab8a24a02b1f6e122e1cd62d3f73187b" }
+reth-cli-commands = { git = "https://github.com/bnb-chain/reth.git", rev = "3a21fd40ab8a24a02b1f6e122e1cd62d3f73187b" }
+reth-basic-payload-builder = { git = "https://github.com/bnb-chain/reth.git", rev = "3a21fd40ab8a24a02b1f6e122e1cd62d3f73187b" }
+reth-db = { git = "https://github.com/bnb-chain/reth.git", rev = "3a21fd40ab8a24a02b1f6e122e1cd62d3f73187b" }
+reth-engine-local = { git = "https://github.com/bnb-chain/reth.git", rev = "3a21fd40ab8a24a02b1f6e122e1cd62d3f73187b" }
+reth-engine-tree = { git = "https://github.com/bnb-chain/reth.git", rev = "3a21fd40ab8a24a02b1f6e122e1cd62d3f73187b" }
+reth-node-builder = { git = "https://github.com/bnb-chain/reth.git", rev = "3a21fd40ab8a24a02b1f6e122e1cd62d3f73187b" }
+reth-chainspec = { git = "https://github.com/bnb-chain/reth.git", rev = "3a21fd40ab8a24a02b1f6e122e1cd62d3f73187b" }
+reth-cli-util = { git = "https://github.com/bnb-chain/reth.git", rev = "3a21fd40ab8a24a02b1f6e122e1cd62d3f73187b" }
+reth-discv4 = { git = "https://github.com/bnb-chain/reth.git", rev = "3a21fd40ab8a24a02b1f6e122e1cd62d3f73187b", features = [
     "test-utils",
 ] }
-reth-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "new-perf-triedb-matus" }
-reth-ethereum-forks = { git = "https://github.com/bnb-chain/reth.git", branch = "new-perf-triedb-matus", features = [
+reth-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", rev = "3a21fd40ab8a24a02b1f6e122e1cd62d3f73187b" }
+reth-ethereum-forks = { git = "https://github.com/bnb-chain/reth.git", rev = "3a21fd40ab8a24a02b1f6e122e1cd62d3f73187b", features = [
     "serde",
 ] }
-reth-ethereum-payload-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "new-perf-triedb-matus" }
-reth-payload-builder-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "new-perf-triedb-matus" }
-reth-chain-state = { git = "https://github.com/bnb-chain/reth.git", branch = "new-perf-triedb-matus" }
-reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "new-perf-triedb-matus" }
-reth-eth-wire = { git = "https://github.com/bnb-chain/reth.git", branch = "new-perf-triedb-matus" }
-reth-eth-wire-types = { git = "https://github.com/bnb-chain/reth.git", branch = "new-perf-triedb-matus" }
-reth-evm = { git = "https://github.com/bnb-chain/reth.git", branch = "new-perf-triedb-matus" }
-reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "new-perf-triedb-matus" }
-reth-ipc = { git = "https://github.com/bnb-chain/reth.git", branch = "new-perf-triedb-matus" }
-reth-metrics = { git = "https://github.com/bnb-chain/reth.git", branch = "new-perf-triedb-matus" }
-reth-node-core = { git = "https://github.com/bnb-chain/reth.git", branch = "new-perf-triedb-matus" }
-reth-revm = { git = "https://github.com/bnb-chain/reth.git", branch = "new-perf-triedb-matus" }
-reth-network = { git = "https://github.com/bnb-chain/reth.git", branch = "new-perf-triedb-matus", features = [
+reth-ethereum-payload-builder = { git = "https://github.com/bnb-chain/reth.git", rev = "3a21fd40ab8a24a02b1f6e122e1cd62d3f73187b" }
+reth-payload-builder-primitives = { git = "https://github.com/bnb-chain/reth.git", rev = "3a21fd40ab8a24a02b1f6e122e1cd62d3f73187b" }
+reth-chain-state = { git = "https://github.com/bnb-chain/reth.git", rev = "3a21fd40ab8a24a02b1f6e122e1cd62d3f73187b" }
+reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth.git", rev = "3a21fd40ab8a24a02b1f6e122e1cd62d3f73187b" }
+reth-eth-wire = { git = "https://github.com/bnb-chain/reth.git", rev = "3a21fd40ab8a24a02b1f6e122e1cd62d3f73187b" }
+reth-eth-wire-types = { git = "https://github.com/bnb-chain/reth.git", rev = "3a21fd40ab8a24a02b1f6e122e1cd62d3f73187b" }
+reth-evm = { git = "https://github.com/bnb-chain/reth.git", rev = "3a21fd40ab8a24a02b1f6e122e1cd62d3f73187b" }
+reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth.git", rev = "3a21fd40ab8a24a02b1f6e122e1cd62d3f73187b" }
+reth-ipc = { git = "https://github.com/bnb-chain/reth.git", rev = "3a21fd40ab8a24a02b1f6e122e1cd62d3f73187b" }
+reth-metrics = { git = "https://github.com/bnb-chain/reth.git", rev = "3a21fd40ab8a24a02b1f6e122e1cd62d3f73187b" }
+reth-node-core = { git = "https://github.com/bnb-chain/reth.git", rev = "3a21fd40ab8a24a02b1f6e122e1cd62d3f73187b" }
+reth-revm = { git = "https://github.com/bnb-chain/reth.git", rev = "3a21fd40ab8a24a02b1f6e122e1cd62d3f73187b" }
+reth-network = { git = "https://github.com/bnb-chain/reth.git", rev = "3a21fd40ab8a24a02b1f6e122e1cd62d3f73187b", features = [
     "test-utils",
 ] }
-reth-network-p2p = { git = "https://github.com/bnb-chain/reth.git", branch = "new-perf-triedb-matus" }
-reth-network-api = { git = "https://github.com/bnb-chain/reth.git", branch = "new-perf-triedb-matus" }
-reth-node-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "new-perf-triedb-matus", features = [
+reth-network-p2p = { git = "https://github.com/bnb-chain/reth.git", rev = "3a21fd40ab8a24a02b1f6e122e1cd62d3f73187b" }
+reth-network-api = { git = "https://github.com/bnb-chain/reth.git", rev = "3a21fd40ab8a24a02b1f6e122e1cd62d3f73187b" }
+reth-node-ethereum = { git = "https://github.com/bnb-chain/reth.git", rev = "3a21fd40ab8a24a02b1f6e122e1cd62d3f73187b", features = [
     "test-utils",
 ] }
-reth-network-peers = { git = "https://github.com/bnb-chain/reth.git", branch = "new-perf-triedb-matus" }
-reth-payload-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "new-perf-triedb-matus" }
-reth-ethereum-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "new-perf-triedb-matus" }
-reth-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "new-perf-triedb-matus" }
-reth-primitives-traits = { git = "https://github.com/bnb-chain/reth.git", branch = "new-perf-triedb-matus" }
-reth-provider = { git = "https://github.com/bnb-chain/reth.git", branch = "new-perf-triedb-matus", features = [
+reth-network-peers = { git = "https://github.com/bnb-chain/reth.git", rev = "3a21fd40ab8a24a02b1f6e122e1cd62d3f73187b" }
+reth-payload-primitives = { git = "https://github.com/bnb-chain/reth.git", rev = "3a21fd40ab8a24a02b1f6e122e1cd62d3f73187b" }
+reth-ethereum-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", rev = "3a21fd40ab8a24a02b1f6e122e1cd62d3f73187b" }
+reth-primitives = { git = "https://github.com/bnb-chain/reth.git", rev = "3a21fd40ab8a24a02b1f6e122e1cd62d3f73187b" }
+reth-primitives-traits = { git = "https://github.com/bnb-chain/reth.git", rev = "3a21fd40ab8a24a02b1f6e122e1cd62d3f73187b" }
+reth-provider = { git = "https://github.com/bnb-chain/reth.git", rev = "3a21fd40ab8a24a02b1f6e122e1cd62d3f73187b", features = [
     "test-utils",
 ] }
-reth-rpc-eth-api = { git = "https://github.com/bnb-chain/reth.git", branch = "new-perf-triedb-matus" }
-reth-rpc-engine-api = { git = "https://github.com/bnb-chain/reth.git", branch = "new-perf-triedb-matus" }
-reth-tracing = { git = "https://github.com/bnb-chain/reth.git", branch = "new-perf-triedb-matus" }
-reth-trie-common = { git = "https://github.com/bnb-chain/reth.git", branch = "new-perf-triedb-matus" }
-reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", branch = "new-perf-triedb-matus" }
-reth-tasks = { git = "https://github.com/bnb-chain/reth.git", branch = "new-perf-triedb-matus" }
-reth-transaction-pool = { git = "https://github.com/bnb-chain/reth.git", branch = "new-perf-triedb-matus" }
+reth-rpc-eth-api = { git = "https://github.com/bnb-chain/reth.git", rev = "3a21fd40ab8a24a02b1f6e122e1cd62d3f73187b" }
+reth-rpc-engine-api = { git = "https://github.com/bnb-chain/reth.git", rev = "3a21fd40ab8a24a02b1f6e122e1cd62d3f73187b" }
+reth-tracing = { git = "https://github.com/bnb-chain/reth.git", rev = "3a21fd40ab8a24a02b1f6e122e1cd62d3f73187b" }
+reth-trie-common = { git = "https://github.com/bnb-chain/reth.git", rev = "3a21fd40ab8a24a02b1f6e122e1cd62d3f73187b" }
+reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", rev = "3a21fd40ab8a24a02b1f6e122e1cd62d3f73187b" }
+reth-tasks = { git = "https://github.com/bnb-chain/reth.git", rev = "3a21fd40ab8a24a02b1f6e122e1cd62d3f73187b" }
+reth-transaction-pool = { git = "https://github.com/bnb-chain/reth.git", rev = "3a21fd40ab8a24a02b1f6e122e1cd62d3f73187b" }
 revm = "29.0.0"
 
 # alloy dependencies
@@ -157,9 +157,9 @@ k256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
 eth-keystore = "0.5"
 
 # triedb dependencies
-rust-eth-triedb = { git = "https://github.com/bnb-chain/reth-bsc-triedb.git", rev = "1bcfd1e8a3c498ef08812f2c66463c79542f6d6e" }
-rust-eth-triedb-common = { git = "https://github.com/bnb-chain/reth-bsc-triedb.git", rev = "1bcfd1e8a3c498ef08812f2c66463c79542f6d6e", package = "rust-eth-triedb-common" }
-rust-eth-triedb-pathdb = { git = "https://github.com/bnb-chain/reth-bsc-triedb.git", rev = "1bcfd1e8a3c498ef08812f2c66463c79542f6d6e", package = "rust-eth-triedb-pathdb" }
+rust-eth-triedb = { git = "https://github.com/bnb-chain/reth-bsc-triedb.git", rev = "b631dbd0700f3567584400721e082321428ff7c6" }
+rust-eth-triedb-common = { git = "https://github.com/bnb-chain/reth-bsc-triedb.git", rev = "b631dbd0700f3567584400721e082321428ff7c6", package = "rust-eth-triedb-common" }
+rust-eth-triedb-pathdb = { git = "https://github.com/bnb-chain/reth-bsc-triedb.git", rev = "b631dbd0700f3567584400721e082321428ff7c6", package = "rust-eth-triedb-pathdb" }
 
 [target.'cfg(unix)'.dependencies]
 tikv-jemalloc-ctl = "0.6"
