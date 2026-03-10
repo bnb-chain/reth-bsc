@@ -588,6 +588,8 @@ where
     /// Gets the total difficulty for a specific header.
     ///
     /// This private method queries the TD from the engine and caches it for future use.
+    /// Only caches `Some(td)` values; `None` results are not cached to allow
+    /// retry once the persistence pipeline catches up.
     async fn header_td(
         &self,
         engine: &ConsensusEngineHandle<BscPayloadTypes>,
@@ -598,7 +600,9 @@ where
             return Ok(*td);
         }
         let td = engine.query_td(number, hash).await.map_err(ParliaConsensusErr::internal)?;
-        self.header_td_cache.write().insert(hash, td);
+        if td.is_some() {
+            self.header_td_cache.write().insert(hash, td);
+        }
         Ok(td)
     }
 }

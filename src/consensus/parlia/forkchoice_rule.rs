@@ -76,22 +76,44 @@ impl BscForkChoiceRule {
         }
 
         // Fallback to TD-based comparison
-        let result = self.head_choice_with_td(incoming, current)?;
-        
-        tracing::info!(
-            target: "bsc::forkchoice",
-            need_reorg = result,
-            incoming_number = incoming.header.number,
-            incoming_hash = ?incoming.header.hash_slow(),
-            incoming_td = ?incoming.td,
-            current_number = current.header.number,
-            current_hash = ?current.header.hash_slow(),
-            current_td = ?current.td,
-            method = "total_difficulty",
-            "Fork choice decision made by total difficulty comparison"
-        );
-        
-        Ok(result)
+        match self.head_choice_with_td(incoming, current) {
+            Ok(result) => {
+                tracing::info!(
+                    target: "bsc::forkchoice",
+                    need_reorg = result,
+                    incoming_number = incoming.header.number,
+                    incoming_hash = ?incoming.header.hash_slow(),
+                    incoming_td = ?incoming.td,
+                    current_number = current.header.number,
+                    current_hash = ?current.header.hash_slow(),
+                    current_td = ?current.td,
+                    method = "total_difficulty",
+                    "Fork choice decision made by total difficulty comparison"
+                );
+                Ok(result)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "bsc::forkchoice",
+                    error = ?e,
+                    incoming_number = incoming.header.number,
+                    incoming_difficulty = ?incoming.header.difficulty,
+                    current_number = current.header.number,
+                    current_difficulty = ?current.header.difficulty,
+                    "TD unavailable, falling back to block number comparison"
+                );
+                let result = self.head_choice_without_td(incoming, current);
+                tracing::info!(
+                    target: "bsc::forkchoice",
+                    need_reorg = result,
+                    incoming_number = incoming.header.number,
+                    current_number = current.header.number,
+                    method = "fallback_without_td",
+                    "Fork choice decision made by fallback (no TD)"
+                );
+                Ok(result)
+            }
+        }
     }
 
     /// Implements BSC fast finality fork choice similar to geth's `ReorgNeededWithFastFinality`.
@@ -135,6 +157,31 @@ impl BscForkChoiceRule {
 
         // Justified numbers are equal, need to fallback to TD comparison
         None
+    }
+
+    /// Fallback fork choice when TD is unavailable.
+    ///
+    /// Uses block number as proxy for chain weight: higher number = more accumulated work.
+    /// When numbers are equal, higher difficulty (in-turn) wins.
+    /// This prevents FCU failures from blocking the miner when static files have TD gaps.
+    pub fn head_choice_without_td(
+        &self,
+        incoming: &HeaderForForkchoice,
+        current: &HeaderForForkchoice,
+    ) -> bool {
+        if incoming.header.number != current.header.number {
+            return incoming.header.number > current.header.number;
+        }
+        // Same height: prefer the in-turn block (higher difficulty)
+        if incoming.header.difficulty != current.header.difficulty {
+            return incoming.header.difficulty > current.header.difficulty;
+        }
+        // Same height, same difficulty: prefer earlier timestamp
+        if incoming.header.timestamp != current.header.timestamp {
+            return incoming.header.timestamp < current.header.timestamp;
+        }
+        // Last resort: deterministic tie-break by hash
+        incoming.header.hash_slow() < current.header.hash_slow()
     }
 
     /// Implements BSC fork choice similar to geth's `ReorgNeeded`.
