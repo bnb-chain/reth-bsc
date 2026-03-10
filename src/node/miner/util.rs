@@ -2,7 +2,9 @@ use crate::chainspec::BscChainSpec;
 use crate::consensus::eip4844::next_block_excess_blob_gas_with_mendel;
 use crate::consensus::parlia::consensus::Parlia;
 use crate::consensus::parlia::provider::SnapshotProvider;
-use crate::consensus::parlia::util::{calculate_difficulty, debug_header};
+use crate::consensus::parlia::util::{
+    calculate_difficulty, debug_header, set_millisecond_part_of_timestamp,
+};
 use crate::consensus::parlia::{Snapshot, VoteAddress};
 use crate::consensus::parlia::{EXTRA_SEAL_LEN, EXTRA_VANITY_LEN};
 use crate::hardforks::BscHardforks;
@@ -67,11 +69,15 @@ pub fn prepare_new_attributes(
 ) -> EthPayloadBuilderAttributes {
     let mut new_header = prepare_new_header(parlia.clone(), parent_header, signer);
     parlia.prepare_timestamp(&ctx.parent_snapshot, parent_header, &mut new_header);
+    // BSC uses the PREVRANDAO opcode to return difficulty (not a random value like
+    // Ethereum PoS). The validation path in BscEvmConfig::evm_env sets
+    // `prevrandao = header.difficulty()`, so the building path must match.
+    let difficulty = calculate_difficulty(&ctx.parent_snapshot, signer);
     let mut attributes = EthPayloadBuilderAttributes {
         parent: new_header.parent_hash,
         timestamp: new_header.timestamp,
         suggested_fee_recipient: new_header.beneficiary,
-        prev_randao: new_header.mix_hash,
+        prev_randao: difficulty.into(),
         ..Default::default()
     };
     if BscHardforks::is_bohr_active_at_timestamp(
@@ -137,6 +143,18 @@ where
     ChainSpec: EthChainSpec + crate::hardforks::BscHardforks + 'static,
 {
     new_header.difficulty = calculate_difficulty(parent_snap, new_header.beneficiary);
+
+    // Restore correct mix_hash for the sealed header. The assembler may have set
+    // mix_hash from BlockEnv.prevrandao (which is the difficulty value for EVM
+    // execution). BSC encodes the millisecond timestamp part in mix_hash post-Lorentz,
+    // or uses B256::ZERO pre-Lorentz.
+    let millisecond_timestamp =
+        parlia.block_time_for_ramanujan_fork(parent_snap, parent_header, new_header);
+    if parlia.spec.is_lorentz_active_at_timestamp(new_header.number, new_header.timestamp) {
+        set_millisecond_part_of_timestamp(millisecond_timestamp, new_header);
+    } else {
+        new_header.mix_hash = B256::ZERO;
+    }
 
     if new_header.extra_data.len() < EXTRA_VANITY_LEN {
         new_header.extra_data = Bytes::from(vec![0u8; EXTRA_VANITY_LEN]);
