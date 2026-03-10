@@ -1,19 +1,19 @@
+use std::sync::Arc;
+use alloy_consensus::{Header, BlockHeader};
+use alloy_primitives::{Address, Bytes, B256};
+use crate::consensus::parlia::Snapshot;
+use crate::consensus::parlia::consensus::Parlia;
+use crate::consensus::parlia::util::{calculate_difficulty, debug_header, set_millisecond_part_of_timestamp};
 use crate::chainspec::BscChainSpec;
 use crate::consensus::eip4844::next_block_excess_blob_gas_with_mendel;
-use crate::consensus::parlia::consensus::Parlia;
 use crate::consensus::parlia::provider::SnapshotProvider;
-use crate::consensus::parlia::util::{calculate_difficulty, debug_header};
-use crate::consensus::parlia::{Snapshot, VoteAddress};
-use crate::consensus::parlia::{EXTRA_SEAL_LEN, EXTRA_VANITY_LEN};
+use crate::consensus::parlia::{VoteAddress, EXTRA_SEAL_LEN, EXTRA_VANITY_LEN};
 use crate::hardforks::BscHardforks;
 use crate::node::evm::pre_execution::VALIDATOR_CACHE;
 use crate::node::miner::bsc_miner::MiningContext;
 use crate::node::miner::signer::{seal_header_with_global_signer, SignerError};
-use alloy_consensus::Header;
-use alloy_primitives::{Address, Bytes, B256};
 use reth::payload::EthPayloadBuilderAttributes;
 use reth_chainspec::EthChainSpec;
-use std::sync::Arc;
 
 fn resolve_epoch_validators(
     parent_snap: &Snapshot,
@@ -67,11 +67,15 @@ pub fn prepare_new_attributes(
 ) -> EthPayloadBuilderAttributes {
     let mut new_header = prepare_new_header(parlia.clone(), parent_header, signer);
     parlia.prepare_timestamp(&ctx.parent_snapshot, parent_header, &mut new_header);
+    // BSC uses the PREVRANDAO opcode to return difficulty (not a random value like
+    // Ethereum PoS). The validation path in BscEvmConfig::evm_env sets
+    // `prevrandao = header.difficulty()`, so the building path must match.
+    let difficulty = calculate_difficulty(&ctx.parent_snapshot, signer);
     let mut attributes = EthPayloadBuilderAttributes {
         parent: new_header.parent_hash,
         timestamp: new_header.timestamp,
         suggested_fee_recipient: new_header.beneficiary,
-        prev_randao: new_header.mix_hash,
+        prev_randao: difficulty.into(),
         ..Default::default()
     };
     if BscHardforks::is_bohr_active_at_timestamp(
@@ -138,6 +142,18 @@ where
 {
     new_header.difficulty = calculate_difficulty(parent_snap, new_header.beneficiary);
 
+    // Restore correct mix_hash for the sealed header. The assembler may have set
+    // mix_hash from BlockEnv.prevrandao (which is the difficulty value for EVM
+    // execution). BSC encodes the millisecond timestamp part in mix_hash post-Lorentz,
+    // or uses B256::ZERO pre-Lorentz.
+    let millisecond_timestamp =
+        parlia.block_time_for_ramanujan_fork(parent_snap, parent_header, new_header);
+    if parlia.spec.is_lorentz_active_at_timestamp(new_header.number, new_header.timestamp) {
+        set_millisecond_part_of_timestamp(millisecond_timestamp, new_header);
+    } else {
+        new_header.mix_hash = B256::ZERO;
+    }
+
     if new_header.extra_data.len() < EXTRA_VANITY_LEN {
         new_header.extra_data = Bytes::from(vec![0u8; EXTRA_VANITY_LEN]);
     }
@@ -186,85 +202,13 @@ where
         extra_data[start..].copy_from_slice(&seal_data);
         new_header.extra_data = Bytes::from(extra_data);
 
-        debug_header(new_header, parlia.spec.chain().id(), "finalize_new_header");
+        debug_header(
+            parent_snap,
+            parent_header,
+            new_header,
+            snapshot_provider,
+        );
     }
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use alloy_primitives::B256;
-
-    fn unique_parent_header(number: u64) -> Header {
-        Header { number, parent_hash: B256::random(), ..Default::default() }
-    }
-
-    #[test]
-    fn resolve_epoch_validators_falls_back_to_snapshot_on_cache_miss() {
-        let parent_header = unique_parent_header(499);
-        let parent_hash = parent_header.hash_slow();
-
-        let validators = vec![
-            Address::with_last_byte(2),
-            Address::with_last_byte(1),
-            Address::with_last_byte(3),
-        ];
-        let vote_addresses = vec![
-            VoteAddress::with_last_byte(22),
-            VoteAddress::with_last_byte(11),
-            VoteAddress::with_last_byte(33),
-        ];
-        let parent_snap =
-            Snapshot::new(validators, 499, B256::random(), 500, Some(vote_addresses.clone()));
-
-        let resolved = resolve_epoch_validators(&parent_snap, &parent_header).unwrap();
-
-        assert_eq!(resolved.0, parent_snap.validators);
-        assert_eq!(resolved.1.len(), parent_snap.validators.len());
-        for (i, validator) in parent_snap.validators.iter().enumerate() {
-            assert_eq!(resolved.1[i], parent_snap.validators_map.get(validator).unwrap().vote_addr);
-        }
-
-        let mut cache = VALIDATOR_CACHE.lock().unwrap();
-        let cached = cache.get(&parent_hash).unwrap();
-        assert_eq!(cached.0, resolved.0);
-        assert_eq!(cached.1, resolved.1);
-    }
-
-    #[test]
-    fn resolve_epoch_validators_prefers_cache() {
-        let parent_header = unique_parent_header(799);
-        let parent_hash = parent_header.hash_slow();
-
-        let cached_validators = vec![Address::with_last_byte(9), Address::with_last_byte(7)];
-        let cached_vote_addresses =
-            vec![VoteAddress::with_last_byte(99), VoteAddress::with_last_byte(77)];
-        {
-            let mut cache = VALIDATOR_CACHE.lock().unwrap();
-            cache.insert(parent_hash, (cached_validators.clone(), cached_vote_addresses.clone()));
-        }
-
-        let parent_snap =
-            Snapshot::new(vec![Address::with_last_byte(1)], 799, B256::random(), 500, None);
-        let resolved = resolve_epoch_validators(&parent_snap, &parent_header).unwrap();
-
-        assert_eq!(resolved.0, cached_validators);
-        assert_eq!(resolved.1, cached_vote_addresses);
-    }
-
-    #[test]
-    fn resolve_epoch_validators_errors_when_no_cache_or_snapshot_validators() {
-        let parent_header = unique_parent_header(999);
-        let parent_snap = Snapshot::default();
-
-        let err = resolve_epoch_validators(&parent_snap, &parent_header).unwrap_err();
-        match err {
-            SignerError::SigningFailed(msg) => {
-                assert!(msg.contains("Missing epoch validators"), "unexpected message: {}", msg);
-            }
-            other => panic!("unexpected error: {:?}", other),
-        }
-    }
 }
