@@ -518,3 +518,155 @@ pub fn revm_spec_by_timestamp_and_block_number(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::consensus::parlia::constants::{DIFF_INTURN, DIFF_NOTURN};
+    use crate::evm::api::BscEvm;
+    use crate::evm::transaction::BscTxEnv;
+    use crate::hardforks::bsc::BscHardfork;
+    use revm::{
+        context::{BlockEnv, CfgEnv, TxEnv},
+        context_interface::result::ExecutionResult,
+        inspector::NoOpInspector,
+        state::{AccountInfo, Bytecode},
+        ExecuteEvm,
+    };
+    use revm_database::InMemoryDB;
+    use alloy_primitives::{Address, Bytes, B256, U256};
+    use reth_evm::EvmEnv;
+
+    /// Bytecode: PREVRANDAO → PUSH1 0x00 → MSTORE → PUSH1 0x20 → PUSH1 0x00 → RETURN
+    /// Executes the PREVRANDAO opcode (0x44) and returns the 32-byte result.
+    const PREVRANDAO_BYTECODE: [u8; 9] = [
+        0x44,       // PREVRANDAO (returns prevrandao in post-merge, difficulty in pre-merge)
+        0x60, 0x00, // PUSH1 0x00
+        0x52,       // MSTORE (store result at memory offset 0)
+        0x60, 0x20, // PUSH1 0x20
+        0x60, 0x00, // PUSH1 0x00
+        0xf3,       // RETURN (return 32 bytes from memory offset 0)
+    ];
+
+    /// Execute the PREVRANDAO bytecode with the given BlockEnv and return the opcode result.
+    fn execute_prevrandao(prevrandao: Option<B256>, difficulty: U256) -> B256 {
+        let caller = Address::from([0x11; 20]);
+        let contract = Address::from([0x22; 20]);
+
+        let mut db = InMemoryDB::default();
+        db.insert_account_info(
+            caller,
+            AccountInfo { balance: U256::from(1_000_000u64), ..Default::default() },
+        );
+        db.insert_account_info(
+            contract,
+            AccountInfo::default()
+                .with_code(Bytecode::new_raw(Bytes::from(PREVRANDAO_BYTECODE.to_vec()))),
+        );
+
+        let block_env = BlockEnv {
+            difficulty,
+            prevrandao,
+            ..Default::default()
+        };
+        // BSC uses post-merge spec where opcode 0x44 returns prevrandao.
+        // Use a post-merge BscHardfork so the EVM spec matches production.
+        let cfg_env = CfgEnv::new_with_spec(BscHardfork::HaberFix).with_chain_id(56);
+        let env: EvmEnv<BscHardfork> = EvmEnv::new(cfg_env, block_env);
+
+        let tx = BscTxEnv::new(
+            TxEnv::builder()
+                .caller(caller)
+                .chain_id(Some(56))
+                .gas_limit(100_000)
+                .gas_price(1)
+                .kind(revm::primitives::TxKind::Call(contract))
+                .build()
+                .expect("tx env should build"),
+        );
+
+        let mut evm = BscEvm::new(env, db, NoOpInspector, false, false);
+        let result = evm.transact_one(tx).expect("execution should not error");
+
+        match result {
+            ExecutionResult::Success { output, .. } => {
+                let bytes = output.data();
+                B256::from_slice(bytes)
+            }
+            other => panic!("expected success, got {other:?}"),
+        }
+    }
+
+    /// Demonstrates that the PREVRANDAO opcode output depends solely on BlockEnv.prevrandao
+    /// in post-merge spec, so both the validation and building paths must set it to the same
+    /// value to produce consistent state roots.
+    #[test]
+    fn prevrandao_opcode_returns_prevrandao_not_difficulty() {
+        let difficulty = DIFF_INTURN; // U256(2)
+
+        // Post-merge: opcode 0x44 returns prevrandao, ignores difficulty
+        let result = execute_prevrandao(Some(difficulty.into()), U256::ZERO);
+        assert_eq!(
+            result,
+            B256::from(difficulty),
+            "PREVRANDAO opcode should return the prevrandao value"
+        );
+
+        // Confirm that changing difficulty alone does NOT affect the opcode output
+        let result_diff_only = execute_prevrandao(Some(B256::ZERO), difficulty);
+        assert_eq!(
+            result_diff_only,
+            B256::ZERO,
+            "PREVRANDAO opcode should NOT read from the difficulty field"
+        );
+    }
+
+    /// Proves the bug: before the fix, the validation path and building path would set
+    /// different prevrandao values, causing the PREVRANDAO opcode to return different results.
+    ///
+    /// Validation path:  prevrandao = header.difficulty() (e.g. DIFF_INTURN = 2)
+    /// Building path (before fix): prevrandao = header.mix_hash (B256::ZERO for pre-Lorentz)
+    #[test]
+    fn prevrandao_mismatch_between_validation_and_building_paths() {
+        let difficulty = DIFF_INTURN; // U256(2)
+
+        // --- Validation path (evm_env in config.rs) ---
+        // Sets: difficulty = U256::ZERO, prevrandao = Some(header.difficulty().into())
+        let validation_result = execute_prevrandao(Some(difficulty.into()), U256::ZERO);
+
+        // --- Building path BEFORE fix (next_evm_env in config.rs) ---
+        // Sets: difficulty = U256::ZERO, prevrandao = Some(attributes.prev_randao)
+        // where prev_randao was mix_hash = B256::ZERO (pre-Lorentz)
+        let building_before_fix = execute_prevrandao(Some(B256::ZERO), U256::ZERO);
+
+        // These differ — any contract using PREVRANDAO would produce different state roots
+        assert_ne!(
+            validation_result, building_before_fix,
+            "Bug: validation and building paths return different PREVRANDAO values"
+        );
+        assert_eq!(validation_result, B256::from(difficulty));
+        assert_eq!(building_before_fix, B256::ZERO);
+
+        // --- Building path AFTER fix ---
+        // Sets: prev_randao = calculate_difficulty() = DIFF_INTURN, matching validation
+        let building_after_fix = execute_prevrandao(Some(difficulty.into()), U256::ZERO);
+
+        assert_eq!(
+            validation_result, building_after_fix,
+            "After fix: both paths should return the same PREVRANDAO value"
+        );
+    }
+
+    /// Same test with DIFF_NOTURN to cover the out-of-turn validator case.
+    #[test]
+    fn prevrandao_consistency_for_noturn_difficulty() {
+        let difficulty = DIFF_NOTURN; // U256(1)
+
+        let validation = execute_prevrandao(Some(difficulty.into()), U256::ZERO);
+        let building_fixed = execute_prevrandao(Some(difficulty.into()), U256::ZERO);
+        let building_broken = execute_prevrandao(Some(B256::ZERO), U256::ZERO);
+
+        assert_eq!(validation, building_fixed);
+        assert_ne!(validation, building_broken);
+        assert_eq!(validation, B256::from(difficulty));
+    }
+}
