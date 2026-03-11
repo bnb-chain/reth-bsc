@@ -114,6 +114,7 @@ phf = { version = "0.11", features = ["macros"] }
 once_cell = { version = "1.19", default-features = false, features = ["alloc"] }
 parity-bytes = { version = "0.1.2", default-features = false }
 parking_lot = "0.12"
+rayon = "1"
 secp256k1 = { version = "0.30", features = [
     "global-context",
     "std",

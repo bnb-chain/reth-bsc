@@ -207,6 +207,24 @@ where
             None
         };
 
+        // ── Miner EVM state cache prewarm (Phase 1) ──────────────────────────────────────────────
+        // Must run BEFORE cached_reads is consumed by State::builder().as_db_mut().
+        // Reads from/to/access_list accounts and slots for top pending txs into cached_reads,
+        // reducing cold DB reads during the real build loop.
+        // See payload_prewarm.rs for Phase 2 (full speculative execution) TODO.
+        {
+            use crate::node::miner::payload_prewarm::{prewarm_miner_evm_cache, MinerPrewarmConfig};
+            let base_fee = parent_header.base_fee_per_gas().unwrap_or(0);
+            prewarm_miner_evm_cache(
+                &self.client,
+                &self.pool,
+                parent_hash,
+                base_fee,
+                &mut cached_reads,
+                &MinerPrewarmConfig::default(),
+            );
+        }
+
         let state_provider = self.client.state_by_block_hash(parent_header.hash_slow())?;
         let state = StateProviderDatabase::new(&state_provider);
         let mut db = State::builder()
