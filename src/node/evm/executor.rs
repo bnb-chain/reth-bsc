@@ -40,7 +40,7 @@ pub(crate) struct InnerExecutionContext {
     pub(crate) current_validators: Option<(Vec<Address>, HashMap<Address, VoteAddress>)>,
     pub(crate) max_elected_validators: Option<U256>,
     pub(crate) validators_election_info: Option<Vec<ValidatorElectionInfo>>,
-    pub(crate) snap: Option<Snapshot>,
+    pub(crate) snap: Option<Arc<Snapshot>>,
     pub(crate) header: Option<Header>,
     pub(crate) parent_header: Option<Header>,
 }

@@ -128,7 +128,7 @@ where
         let (evm, result) = self.executor.finish()?;
         let (db, evm_env) = evm.finish();
 
-        let assembled_system_txs = self.shared_ctx.inner.borrow().assembled_system_txs.clone();
+        let assembled_system_txs = std::mem::take(&mut self.shared_ctx.inner.borrow_mut().assembled_system_txs);
         // merge all transitions into bundle state
         db.merge_transitions(BundleRetention::Reverts);
 
@@ -272,7 +272,7 @@ where
                 evm_env,
                 execution_ctx: self.ctx,
                 parent: self.parent,
-                transactions: transactions.clone(),
+                transactions,
                 output: &result,
                 bundle_state: &db.bundle_state,
                 state_provider: &state,

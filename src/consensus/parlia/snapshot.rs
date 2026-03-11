@@ -392,7 +392,7 @@ impl Snapshot {
         if tl <= 1 {
             return true;
         }
-        block_number % tl == 0
+        block_number.is_multiple_of(tl)
     }
 
     /// Count how many times each validator has signed in the recent window.

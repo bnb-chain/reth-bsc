@@ -4,7 +4,7 @@ use super::{
 };
 use crate::{
     chainspec::BscChainSpec,
-    consensus::parlia::VoteAddress,
+    consensus::parlia::{snapshot::Snapshot, VoteAddress},
     evm::transaction::BscTxEnv,
     hardforks::{bsc::BscHardfork, BscHardforks},
     node::engine_api::validator::BscExecutionData,
@@ -34,7 +34,26 @@ use revm::{
     primitives::hardfork::SpecId,
     Inspector,
 };
-use std::{borrow::Cow, cell::RefCell, convert::Infallible, rc::Rc, sync::Arc};
+use std::{borrow::Cow, cell::RefCell, convert::Infallible, rc::Rc, sync::{Arc, Mutex}};
+
+#[derive(Debug, Clone, Default)]
+pub struct BscMinerRetryCacheInner {
+    /// Parent header for the current mining job.
+    pub parent_header: Option<Header>,
+    /// Parent snapshot for the current mining job.
+    pub parent_snapshot: Option<Arc<Snapshot>>,
+    /// Whether the breathe-block Feynman prep has already been evaluated for this parent.
+    pub feynman_prep_checked: bool,
+    /// Cached max elected validators for breathe-block miner retries.
+    pub max_elected_validators: Option<U256>,
+    /// Cached validator election info for breathe-block miner retries.
+    pub validators_election_info: Option<Vec<ValidatorElectionInfo>>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BscMinerRetryCache {
+    pub inner: Arc<Mutex<BscMinerRetryCacheInner>>,
+}
 
 /// BSC wrapper around [`NextBlockEnvAttributes`].
 ///
@@ -50,6 +69,8 @@ pub struct BscNextBlockEnvAttributes {
     /// Miner-side triedb prefetcher handle. This is started before execution and consumed in
     /// `finish()` to obtain `prefetch_state` for triedb root calculation.
     pub triedb_prefetcher: Option<crate::node::evm::MinerTrieDbPrefetcher>,
+    /// Retry-stable miner cache shared across payload rebuilds for the same parent.
+    pub miner_retry_cache: Option<BscMinerRetryCache>,
 }
 
 impl<H: BlockHeader> BuildPendingEnv<H> for BscNextBlockEnvAttributes {
@@ -58,6 +79,7 @@ impl<H: BlockHeader> BuildPendingEnv<H> for BscNextBlockEnvAttributes {
             inner: NextBlockEnvAttributes::build_pending_env(parent),
             parent_difflayers: None,
             triedb_prefetcher: None,
+            miner_retry_cache: None,
         }
     }
 }
@@ -106,6 +128,8 @@ pub struct BscBlockExecutionCtx<'a> {
     pub parent_difflayers: Option<rust_eth_triedb_common::DiffLayers>,
     /// Miner-side triedb prefetcher handle (consumed in `finish()`).
     pub triedb_prefetcher: Option<crate::node::evm::MinerTrieDbPrefetcher>,
+    /// Retry-stable miner cache shared across payload rebuilds for the same parent.
+    pub miner_retry_cache: Option<BscMinerRetryCache>,
 }
 
 impl<'a> BscBlockExecutionCtx<'a> {
@@ -387,6 +411,7 @@ where
             is_miner: false,
             parent_difflayers: None,
             triedb_prefetcher: None,
+            miner_retry_cache: None,
         }
     }
 
@@ -411,6 +436,7 @@ where
             is_miner: true,
             parent_difflayers: attributes.parent_difflayers,
             triedb_prefetcher: attributes.triedb_prefetcher,
+            miner_retry_cache: attributes.miner_retry_cache,
         }
     }
 
@@ -471,6 +497,7 @@ where
             is_miner: false,
             parent_difflayers: None,
             triedb_prefetcher: None,
+            miner_retry_cache: None,
         }
     }
 

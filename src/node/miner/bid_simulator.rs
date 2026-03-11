@@ -403,6 +403,7 @@ where
                     },
                     parent_difflayers: None,
                     triedb_prefetcher: None,
+                    miner_retry_cache: None,
                 },
             )
             .map_err(PayloadBuilderError::other)

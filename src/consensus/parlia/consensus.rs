@@ -553,27 +553,31 @@ where
     }
 
     /// - `snap.block_interval` is used as the period (milliseconds).
-    /// - Applies `left_over_ms` reservation for finalization work.
-    /// - Caps blocking time to half the period when last block in one turn (or tl == 1),
-    ///   otherwise 4/5 of the period.
+    /// - First caps the mining window like upstream BSC Parlia, then reserves `left_over_ms` for
+    ///   finalization and submission slack.
+    /// - For the last block in a turn, caps the mining window to half the period on fast forks
+    ///   (`<= 500ms` block interval, matching upstream BSC Fermi-era behavior), otherwise 1/5.
+    /// - For non-last blocks, allows the full period.
     pub fn delay_for_mining(&self, snap: &Snapshot, header: &Header, left_over_ms: u64) -> u64 {
         let period_ms = snap.block_interval;
         let mut delay_ms = self.delay_for_ramanujan_fork(snap, header);
+
+        let last_block_in_turn = snap.last_block_in_one_turn(header.number);
+        let time_for_mining_ms = if last_block_in_turn {
+            if period_ms <= 500 { period_ms / 2 } else { period_ms / 5 }
+        } else {
+            period_ms
+        };
+        if delay_ms > time_for_mining_ms {
+            delay_ms = time_for_mining_ms;
+        }
+
         if left_over_ms >= period_ms {
             warn!("Delay invalid argument: left_over_ms={}, period_ms={}", left_over_ms, period_ms);
         } else if left_over_ms >= delay_ms {
             delay_ms = 0;
         } else {
             delay_ms -= left_over_ms;
-        }
-
-        let mut time_for_mining_ms = period_ms / 5; // triedb root is not stable.
-        let last_block_in_turn = snap.last_block_in_one_turn(header.number);
-        if !last_block_in_turn {
-            time_for_mining_ms = period_ms;
-        }
-        if delay_ms > time_for_mining_ms {
-            delay_ms = time_for_mining_ms;
         }
         if delay_ms == 0 && snap.first_block_in_one_turn(header.number) {
             delay_ms = 50; // avoid the first block is empty.
