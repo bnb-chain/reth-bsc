@@ -211,7 +211,8 @@ where
         // Must run BEFORE cached_reads is consumed by State::builder().as_db_mut().
         // Speculatively executes top-N pending txs across PREWARM_WORKERS parallel threads,
         // populating CachedReads with all touched accounts and storage slots.
-        {
+        // Returns Phase 2 handles for background trie warming (joined before finish_with_difflayer).
+        let trie_prewarm_handles = {
             use crate::node::miner::payload_prewarm::{prewarm_miner_evm_cache, MinerPrewarmConfig};
             let base_fee = parent_header.base_fee_per_gas().unwrap_or(0);
             prewarm_miner_evm_cache(
@@ -224,8 +225,8 @@ where
                 base_fee,
                 &mut cached_reads,
                 &MinerPrewarmConfig::default(),
-            );
-        }
+            )
+        };
 
         let state_provider = self.client.state_by_block_hash(parent_header.hash_slow())?;
         let state = StateProviderDatabase::new(&state_provider);
@@ -596,6 +597,11 @@ where
 
         // add system txs to payload.
         let finalize_start = std::time::Instant::now();
+        // Join Phase 2 trie prewarm handles before root hash computation to guarantee MokaCache
+        // is fully warm. These threads ran concurrently with the build loop above.
+        for h in trie_prewarm_handles {
+            let _ = h.join();
+        }
         let out = builder.finish_with_difflayer(&state_provider)?;
         let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } = out.inner;
         let difflayer = out.difflayer;

@@ -9,32 +9,34 @@
 //!
 //! Mirrors geth-bsc's `PrefetchMining()` full `ApplyMessage()` speculative execution approach.
 //!
-//! # Implementation
+//! # Two-phase design
+//!
+//! ## Phase 1 – EVM speculative execution (blocks until `cached_reads` is ready)
 //!
 //! Top-N pending txs are distributed round-robin across PREWARM_WORKERS threads.  Each thread:
 //!   1. Opens its own read-only `StateProvider` (MDBX supports concurrent readers).
-//!   2. Builds an EVM with `disable_nonce_check = true` and `disable_base_fee = true`.
-//!   3. Executes its tx slice speculatively; all DB reads are cached in a local `CachedReads`.
-//!   4. If triedb is active, computes trie hash (without committing) to warm PathDB MokaCache.
+//!   2. Builds an EVM backed by `State<CachedReadsDbMut>` (bundle tracking enabled).
+//!   3. Executes its tx slice with `disable_nonce_check = true` / `disable_base_fee = true`.
+//!   4. Returns `(worker_cached, trie_hashed_state)`.
 //!
-//! Worker-0 also pre-warms fixed BSC system contract accounts (called every block in
-//! `apply_pre_execution_changes()`).
+//! After Phase 1, all `CachedReads` are merged and returned to the build loop.
 //!
-//! The main thread merges all per-worker `CachedReads` into the caller's `cached_reads`.
+//! ## Phase 2 – Trie traversal (background, concurrent with build loop)
+//!
+//! Each worker's `TrieDBHashedPostState` is handed to a non-scoped background thread that
+//! calls `intermediate_hashed_post_state` (no DiffLayer commit) to warm PathDB MokaCache.
+//! All `get_global_triedb()` clones share `Arc<MokaCache>`, so warming from prewarm workers
+//! directly benefits the real root calculation in `finish_with_difflayer()`.
+//!
+//! The caller receives a `Vec<JoinHandle<()>>` and **must join them before** calling
+//! `finish_with_difflayer()` to guarantee the MokaCache is fully warm.
 //!
 //! # Correctness guarantees
 //!
 //! - No external state mutations: only `StateProvider` reads, `CachedReads` writes.
-//! - Speculative results are discarded; only the read-path cache is kept.
-//! - System contract writes go into `State.bundle` (which shadows `CachedReads`) in the real
-//!   build loop, so stale values here are harmless.
-//! - `disable_nonce_check` / `disable_base_fee` maximise tx execution coverage.
-//!   These flags are safe for prewarm because we throw away execution results.
+//! - Trie warming uses `intermediate_hashed_post_state` (read-only traversal, no commit).
+//! - Speculative bundle states are discarded after extracting `TrieDBHashedPostState`.
 //! - Build loop starts with a fresh `State`; `CachedReads` is a read cache only.
-//! - Trie hash computation uses `intermediate_hashed_post_state` (no DiffLayer commit),
-//!   so PathDB MokaCache is warmed without mutating the global trie state.
-//!   PathDB clones share `Arc<MokaCache>`, so warming in prewarm workers benefits the
-//!   real root calculation in `finish()`.
 
 use alloy_consensus::{transaction::Recovered, Header as ConsensusHeader};
 use alloy_evm::{Evm as EvmTrait, IntoTxEnv};
@@ -50,6 +52,7 @@ use reth_revm::database::StateProviderDatabase;
 use revm::bytecode::Bytecode;
 use revm::database::{states::bundle_state::BundleRetention, State};
 use revm::state::AccountInfo;
+use rust_eth_triedb::TrieDBHashedPostState;
 use tracing::{debug, trace, warn};
 
 /// Number of parallel worker threads for prewarm DB reads.
@@ -88,11 +91,18 @@ impl Default for MinerPrewarmConfig {
     }
 }
 
-/// Pre-warms the miner's `CachedReads` via full speculative EVM execution across
-/// `PREWARM_WORKERS` parallel threads.
+/// Pre-warms the miner's `CachedReads` and PathDB `MokaCache` in two concurrent phases.
 ///
-/// If triedb is active, each worker also traverses the trie (without committing) to warm
-/// the shared PathDB `MokaCache`, reducing root-hash latency during the real build.
+/// **Phase 1** (blocking): speculative EVM execution across `PREWARM_WORKERS` threads populates
+/// `cached_reads` and extracts per-worker `TrieDBHashedPostState`.
+///
+/// **Phase 2** (background): returns `Vec<JoinHandle<()>>` for trie traversal threads that warm
+/// PathDB `MokaCache` concurrently with the build loop.
+///
+/// # Caller contract
+///
+/// The caller **must join all returned handles before calling `finish_with_difflayer()`**
+/// to guarantee the MokaCache is warm when root hash is computed.
 ///
 /// Must be called BEFORE `cached_reads` is consumed by `State::builder().as_db_mut()`.
 pub fn prewarm_miner_evm_cache<Client, Pool, EvmConfig>(
@@ -105,7 +115,8 @@ pub fn prewarm_miner_evm_cache<Client, Pool, EvmConfig>(
     base_fee: u64,
     cached_reads: &mut CachedReads,
     config: &MinerPrewarmConfig,
-) where
+) -> Vec<std::thread::JoinHandle<()>>
+where
     Client: StateProviderFactory,
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>>,
     EvmConfig: ConfigureEvm + Sync,
@@ -133,109 +144,92 @@ pub fn prewarm_miner_evm_cache<Client, Pool, EvmConfig>(
     let prewarm_system = config.prewarm_system_contracts;
     let trie_active = rust_eth_triedb::triedb_manager::is_triedb_active();
 
-    // ── 3. Parallel speculative EVM execution + trie prewarm ──────────────────────────────────
+    // ── 3. Phase 1: EVM speculative execution (scoped, blocks until cached_reads ready) ───────
     //
-    // Each worker opens its own StateProvider (MDBX supports concurrent readers), builds an
-    // EVM backed by State<CachedReadsDbMut> with bundle tracking, executes its tx slice, and:
-    //   a) Returns the reads captured in a local CachedReads (EVM state cache prewarm).
-    //   b) If triedb is active: calls intermediate_hashed_post_state (no commit) to warm the
-    //      PathDB MokaCache.  All PathDB clones share Arc<MokaCache>, so this benefits the
-    //      real root calculation in finish().
-    let partial_results: Vec<CachedReads> = std::thread::scope(|s| {
-        let handles: Vec<_> = buckets
-            .into_iter()
-            .enumerate()
-            .map(|(worker_id, txs)| {
-                s.spawn(move || {
-                    let sp = match client.state_by_block_hash(parent_hash) {
-                        Ok(sp) => sp,
-                        Err(e) => {
-                            warn!(
-                                target: "bsc::miner::prewarm",
-                                worker = worker_id, err = %e,
-                                "Worker failed to open state provider"
-                            );
-                            return CachedReads::default();
-                        }
-                    };
-
-                    let mut worker_cached = CachedReads::default();
-
-                    // Worker-0: warm BSC system contracts via direct account reads.
-                    // These are not in the pending pool but are touched every block.
-                    if worker_id == 0 && prewarm_system {
-                        for &addr in BSC_SYSTEM_CONTRACTS {
-                            warm_account_and_code(&sp, &mut worker_cached, addr);
-                        }
-                    }
-
-                    // Speculative EVM execution with bundle state tracking.
-                    //
-                    // We wrap CachedReadsDbMut in State<..> so we can:
-                    //   - Warm worker_cached (via CachedReadsDbMut read fallthrough).
-                    //   - Collect bundle_state for trie traversal afterward.
-                    //
-                    // `&mut state_db` implements Database (revm: impl<DB: Database> Database
-                    // for &mut DB), so evm_with_env accepts it while keeping state_db accessible
-                    // after the EVM is dropped.
-                    {
-                        let sp_db = StateProviderDatabase::new(&sp);
-                        let cached_db = worker_cached.as_db_mut(sp_db);
-                        let mut state_db = State::builder()
-                            .with_database(cached_db)
-                            .with_bundle_update()
-                            .build();
-
-                        let mut evm_env = evm_config.evm_env(parent_header);
-                        // Disable validation so txs execute regardless of nonce/base-fee.
-                        // Safe because we discard all execution results.
-                        evm_env.cfg_env.disable_nonce_check = true;
-                        evm_env.cfg_env.disable_base_fee = true;
-
-                        {
-                            let mut evm = evm_config.evm_with_env(&mut state_db, evm_env);
-                            for tx in txs {
-                                // Ignore errors: reads that happened before any error are
-                                // already captured in worker_cached.
-                                let _ = evm.transact(tx);
+    // Each worker returns (worker_cached, Option<TrieDBHashedPostState>).
+    // The trie state is extracted from the speculative bundle and passed to Phase 2 background
+    // threads; it is NOT used to update real trie state.
+    let pairs: Vec<(CachedReads, Option<TrieDBHashedPostState>)> =
+        std::thread::scope(|s| {
+            let handles: Vec<_> = buckets
+                .into_iter()
+                .enumerate()
+                .map(|(worker_id, txs)| {
+                    s.spawn(move || {
+                        let sp = match client.state_by_block_hash(parent_hash) {
+                            Ok(sp) => sp,
+                            Err(e) => {
+                                warn!(
+                                    target: "bsc::miner::prewarm",
+                                    worker = worker_id, err = %e,
+                                    "Worker failed to open state provider"
+                                );
+                                return (CachedReads::default(), None);
                             }
-                            // evm + &mut borrow of state_db drop here
+                        };
+
+                        let mut worker_cached = CachedReads::default();
+
+                        // Worker-0: warm BSC system contracts via direct account reads.
+                        if worker_id == 0 && prewarm_system {
+                            for &addr in BSC_SYSTEM_CONTRACTS {
+                                warm_account_and_code(&sp, &mut worker_cached, addr);
+                            }
                         }
 
-                        // ── Trie prewarm: warm PathDB MokaCache via trie traversal ──────────
-                        //
-                        // intermediate_hashed_post_state traverses trie nodes for the changed
-                        // accounts/storage without creating a DiffLayer or committing.
-                        // The PathDB MokaCache (Arc-shared across all clones) is populated,
-                        // which reduces cold-node latency for the real root calculation.
-                        if trie_active {
-                            state_db.merge_transitions(BundleRetention::PlainState);
-                            let hashed_state = sp.hashed_post_state(&state_db.bundle_state);
-                            let trie_hashed_state =
-                                hashed_state.to_triedb_hashed_post_state();
-                            let mut triedb = rust_eth_triedb::get_global_triedb();
-                            let _ = triedb.intermediate_hashed_post_state(
-                                parent_state_root,
-                                None, // no difflayers for speculative prewarm
-                                &trie_hashed_state,
-                                None, // no prefetcher
-                            );
-                        }
-                        // state_db drops here → releases &mut worker_cached
-                    }
+                        // Speculative EVM execution with bundle tracking.
+                        // &mut state_db implements Database (revm: impl<DB: Database> Database
+                        // for &mut DB), so evm_with_env accepts it while keeping state_db
+                        // accessible after the EVM drops for trie state extraction.
+                        let trie_state = {
+                            let sp_db = StateProviderDatabase::new(&sp);
+                            let cached_db = worker_cached.as_db_mut(sp_db);
+                            let mut state_db = State::builder()
+                                .with_database(cached_db)
+                                .with_bundle_update()
+                                .build();
 
-                    worker_cached
+                            let mut evm_env = evm_config.evm_env(parent_header);
+                            evm_env.cfg_env.disable_nonce_check = true;
+                            evm_env.cfg_env.disable_base_fee = true;
+
+                            {
+                                let mut evm =
+                                    evm_config.evm_with_env(&mut state_db, evm_env);
+                                for tx in txs {
+                                    let _ = evm.transact(tx);
+                                }
+                                // evm drops → releases &mut state_db
+                            }
+
+                            // Extract TrieDBHashedPostState for Phase 2 background trie warming.
+                            // The bundle state is consumed here; speculative writes are NOT
+                            // propagated anywhere — only the hashed representation is kept.
+                            if trie_active {
+                                state_db.merge_transitions(BundleRetention::PlainState);
+                                let hashed_state =
+                                    sp.hashed_post_state(&state_db.bundle_state);
+                                Some(hashed_state.to_triedb_hashed_post_state())
+                            } else {
+                                None
+                            }
+                            // state_db drops → releases worker_cached
+                        };
+
+                        (worker_cached, trie_state)
+                    })
                 })
-            })
-            .collect();
+                .collect();
 
-        handles.into_iter().filter_map(|h| h.join().ok()).collect()
-    });
+            handles.into_iter().filter_map(|h| h.join().ok()).collect()
+        });
 
-    // ── 4. Merge per-worker CachedReads into the caller's cached_reads ────────────────────────
+    // ── 4. Merge per-worker CachedReads (cached_reads ready; build loop can start) ───────────
     let mut accounts_warmed = 0usize;
     let mut contracts_warmed = 0usize;
-    for partial in partial_results {
+    let mut trie_states: Vec<TrieDBHashedPostState> = Vec::new();
+
+    for (partial, trie_state) in pairs {
         accounts_warmed += partial.accounts.len();
         contracts_warmed += partial.contracts.len();
         for (addr, acc) in partial.accounts {
@@ -243,6 +237,9 @@ pub fn prewarm_miner_evm_cache<Client, Pool, EvmConfig>(
         }
         for (hash, code) in partial.contracts {
             cached_reads.contracts.entry(hash).or_insert(code);
+        }
+        if let Some(ts) = trie_state {
+            trie_states.push(ts);
         }
     }
 
@@ -252,9 +249,34 @@ pub fn prewarm_miner_evm_cache<Client, Pool, EvmConfig>(
         accounts_warmed,
         contracts_warmed,
         workers = PREWARM_WORKERS,
-        trie_prewarm = trie_active,
-        "Miner EVM prewarm (Phase 2 speculative) complete"
+        trie_workers = trie_states.len(),
+        "Phase 1 (EVM) complete; spawning Phase 2 (trie) background workers"
     );
+
+    // ── 5. Phase 2: Trie traversal (background, concurrent with build loop) ─────────────────
+    //
+    // Each background thread calls intermediate_hashed_post_state (no commit) to warm the
+    // shared PathDB MokaCache (Arc-shared across all get_global_triedb() clones).
+    // The caller MUST join these handles before finish_with_difflayer() to guarantee
+    // the MokaCache is fully warm when root hash is computed.
+    if !trie_active {
+        return Vec::new();
+    }
+
+    trie_states
+        .into_iter()
+        .map(|trie_state| {
+            std::thread::spawn(move || {
+                let mut triedb = rust_eth_triedb::get_global_triedb();
+                let _ = triedb.intermediate_hashed_post_state(
+                    parent_state_root,
+                    None, // no difflayers for speculative prewarm
+                    &trie_state,
+                    None, // no prefetcher
+                );
+            })
+        })
+        .collect()
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────────────────────
@@ -284,7 +306,8 @@ where
             {
                 match sp.bytecode_by_hash(&code_hash) {
                     Ok(Some(bytes)) => {
-                        cr.contracts.insert(code_hash, Bytecode::new_raw(bytes.original_bytes()));
+                        cr.contracts
+                            .insert(code_hash, Bytecode::new_raw(bytes.original_bytes()));
                     }
                     Ok(None) => {}
                     Err(e) => trace!(
@@ -296,7 +319,8 @@ where
             }
         }
         Ok(None) => {
-            cr.accounts.insert(address, CachedAccount { info: None, storage: HashMap::default() });
+            cr.accounts
+                .insert(address, CachedAccount { info: None, storage: HashMap::default() });
         }
         Err(e) => trace!(
             target: "bsc::miner::prewarm",
