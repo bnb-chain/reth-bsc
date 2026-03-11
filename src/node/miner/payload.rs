@@ -220,6 +220,7 @@ where
                 &self.evm_config,
                 &parent_header,
                 parent_hash,
+                parent_header.state_root(),
                 base_fee,
                 &mut cached_reads,
                 &MinerPrewarmConfig::default(),
