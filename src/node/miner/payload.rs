@@ -207,7 +207,7 @@ where
             None
         };
 
-        // ── Miner EVM state cache prewarm (Phase 2 speculative) ──────────────────────────────────
+        // ── Miner EVM state cache prewarm ────────────────────────────────────────────────────────
         // Must run BEFORE cached_reads is consumed by State::builder().as_db_mut().
         // Speculatively executes top-N pending txs across PREWARM_WORKERS parallel threads,
         // populating CachedReads with all touched accounts and storage slots.
