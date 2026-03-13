@@ -1,3 +1,5 @@
+#[cfg(feature = "bench-test")]
+pub mod bench;
 pub mod chainspec;
 pub mod consensus;
 pub mod evm;

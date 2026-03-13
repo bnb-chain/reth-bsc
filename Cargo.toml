@@ -15,12 +15,18 @@ path = "src/lib.rs"
 name = "reth-bsc"
 path = "src/main.rs"
 
+[[bin]]
+name = "miner-bench"
+path = "src/bench_main.rs"
+required-features = ["bench-test"]
+
 [dependencies]
 reth = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
 reth-cli = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
 reth-cli-commands = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
 reth-basic-payload-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
 reth-db = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
+reth-db-common = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
 reth-engine-local = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
 reth-engine-tree = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
 reth-node-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
