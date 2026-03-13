@@ -4,8 +4,8 @@ use crate::{
     consensus::{parlia::vote_pool, ParliaConsensusErr},
     node::{
         consensus::BscForkChoiceEngine, engine::BscBuiltPayload,
-        engine_api::payload::BscPayloadTypes, evm::util::insert_header_to_cache,
-        network::BscNewBlock,
+        engine_api::payload::BscPayloadTypes, evm::error::BSC_VALIDATION_ERROR_PREFIX,
+        evm::util::insert_header_to_cache, network::BscNewBlock,
     },
     BscBlock, BscBlockBody,
 };
@@ -53,8 +53,8 @@ pub(crate) type Outcome = BlockImportOutcome<BscNewBlock>;
 /// Import event for a block
 pub(crate) type ImportEvent = BlockImportEvent<BscNewBlock>;
 
-/// Future that processes a block import and returns its outcome
-type ImportFut = Pin<Box<dyn Future<Output = Option<Outcome>> + Send + Sync>>;
+/// Future that processes a block import and returns its outcome along with the block hash for cleanup.
+type ImportFut = Pin<Box<dyn Future<Output = (Option<Outcome>, B256)> + Send + Sync>>;
 
 /// Channel message type for incoming blocks
 pub(crate) type IncomingBlock = (BlockMsg, PeerId);
@@ -138,13 +138,14 @@ where
     fn new_payload(&self, block: BlockMsg, peer_id: PeerId) -> ImportFut {
         let engine = self.engine.clone();
         let forkchoice_engine = self.forkchoice_engine.clone();
+        let block_hash = block.hash;
 
         tracing::debug!(target: "bsc::block_import", "New payload: block = ({:?}, {:?}), peer_id = {:?}", block.block.0.block.header.number, block.block.0.block.header.hash_slow(), peer_id);
         Box::pin(async move {
             let sealed_block = block.block.0.block.clone().seal();
             let header = sealed_block.header().clone();
             let payload = BscPayloadTypes::block_to_payload(sealed_block);
-            match engine.new_payload(payload).await {
+            let outcome = match engine.new_payload(payload).await {
                 Ok(payload_status) => match payload_status.status {
                     PayloadStatusEnum::Valid => {
                         tracing::debug!(target: "bsc::block_import", "New payload is valid, block = {:?}, peer_id = {:?}", block, peer_id);
@@ -158,14 +159,11 @@ where
                             .into()
                     }
                     PayloadStatusEnum::Invalid { validation_error } => {
-                        if validation_error.contains("BSC validation error:") {
-                            tracing::warn!(
+                        if validation_error.starts_with(BSC_VALIDATION_ERROR_PREFIX) {
+                            tracing::debug!(
                                 target: "bsc::block_import",
-                                %validation_error,
-                                peer = %peer_id,
-                                block_number = header.number,
-                                block_hash = %header.hash_slow(),
-                                "Block rejected due to BSC-specific validation error, skipping peer penalty"
+                                error = %validation_error,
+                                "Skipping block with BSC validation error without penalizing peer"
                             );
                             None
                         } else {
@@ -228,7 +226,8 @@ where
                     _ => None,
                 },
                 Err(err) => None,
-            }
+            };
+            (outcome, block_hash)
         })
     }
 
@@ -454,11 +453,15 @@ where
         }
 
         // Process completed imports and send events to network
-        while let Poll::Ready(Some(outcome)) = this.pending_imports.poll_next_unpin(cx) {
+        while let Poll::Ready(Some((outcome, import_block_hash))) =
+            this.pending_imports.poll_next_unpin(cx)
+        {
+            // Always clean up queued_blocks for the imported block hash,
+            // regardless of the outcome (valid, invalid, skipped).
+            this.queued_blocks.remove(&import_block_hash);
+
             if let Some(outcome) = outcome {
-                let mut block_hash = None;
                 if let Ok(BlockValidation::ValidBlock { block }) = &outcome.result {
-                    block_hash = Some(block.hash);
                     this.processed_blocks.insert(block.hash);
                     // Cache the full block body for later range responses.
                     crate::shared::cache_full_block(block.block.0.block.clone());
@@ -466,13 +469,6 @@ where
                         tracing::warn!(target: "bsc::block_import", "Failed to transfer block to EVN peers: number = {:?}, hash = {:?}, error = {}", block.block.0.block.header.number, block.hash, e);
                     }
                 }
-
-                // TODO: add queued blocks removal later, to avoid milicious block import, and trigger next download.
-                // now, it must wait backfilling to download the correct block.
-                // the verified header can drop the peer later, it cannot transfer a bad header now.
-                // if let Some(block_hash) = outcome.block.hash {
-                //     this.queued_blocks.remove(&block_hash);
-                // }
 
                 if let Err(e) = this.to_network.send(BlockImportEvent::Outcome(outcome)) {
                     return Poll::Ready(Err(Box::new(e)));
@@ -534,6 +530,35 @@ mod tests {
                 )
             })
             .await;
+    }
+
+    #[tokio::test]
+    async fn bsc_validation_error_skips_peer_punishment() {
+        let mut fixture =
+            TestFixture::new(EngineResponses::bsc_invalid_new_payload()).await;
+
+        let block_msg = create_test_block();
+        fixture.handle.send_block(block_msg, PeerId::random()).unwrap();
+
+        // Wait briefly for the import to be processed
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        // BSC validation errors return None, so no Outcome event should be produced.
+        // Only Announcement events (ValidHeader) are expected.
+        loop {
+            match fixture.handle.poll_outcome(&mut cx) {
+                Poll::Ready(Some(event)) => {
+                    assert!(
+                        !matches!(event, BlockImportEvent::Outcome(_)),
+                        "BSC validation error should not produce an Outcome event"
+                    );
+                }
+                Poll::Ready(None) | Poll::Pending => break,
+            }
+        }
     }
 
     #[tokio::test]
@@ -741,6 +766,18 @@ mod tests {
             Self {
                 new_payload: PayloadStatusEnum::Valid,
                 fcu: PayloadStatusEnum::Invalid { validation_error: "fcu error".into() },
+            }
+        }
+
+        fn bsc_invalid_new_payload() -> Self {
+            Self {
+                new_payload: PayloadStatusEnum::Invalid {
+                    validation_error: format!(
+                        "{} unexpected system tx",
+                        BSC_VALIDATION_ERROR_PREFIX
+                    ),
+                },
+                fcu: PayloadStatusEnum::Valid,
             }
         }
     }

@@ -6,6 +6,9 @@ use reth_evm::execute::{BlockExecutionError, BlockValidationError};
 use reth_provider::ProviderError;
 use reth_primitives::{GotExpected, GotExpectedBoxed};
 
+/// Prefix used to identify BSC validation errors in error messages.
+pub const BSC_VALIDATION_ERROR_PREFIX: &str = "BSC validation error:";
+
 /// BSC specific block validation error
 #[derive(thiserror::Error, Debug, Clone)]
 pub enum BscBlockValidationError {
@@ -206,7 +209,7 @@ impl From<BscBlockExecutionError> for BlockExecutionError {
                 // but we should refine it by rewrite some validation error types in reth engine-tree.
                 // Note: Validation errors will be identified in the engine-tree and treated as invalid blocks. 
                 Self::Validation(BlockValidationError::DepositRequestDecode(
-                    format!("BSC validation error: {}", validation_err)
+                    format!("{} {}", BSC_VALIDATION_ERROR_PREFIX, validation_err)
                 ))
             }
             
