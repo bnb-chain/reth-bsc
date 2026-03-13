@@ -1,5 +1,5 @@
 use crate::chainspec::BscChainSpec;
-use crate::consensus::eip4844::{calc_blob_fee, BLOB_TX_BLOB_GAS_PER_BLOB};
+use crate::consensus::eip4844::{calc_blob_fee, is_blob_eligible_block, BLOB_TX_BLOB_GAS_PER_BLOB};
 use crate::consensus::parlia::Parlia;
 use crate::evm::blacklist;
 use crate::hardforks::BscHardforks;
@@ -19,7 +19,6 @@ use reth::transaction_pool::BestTransactionsAttributes;
 use reth::transaction_pool::{PoolTransaction, TransactionPool};
 use reth_basic_payload_builder::PayloadConfig;
 use reth_chainspec::EthChainSpec;
-use reth_chainspec::EthereumHardforks;
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
 use reth_evm::block::{BlockExecutionError, BlockValidationError};
 use reth_evm::execute::BlockBuilder;
@@ -56,6 +55,17 @@ static TRACE_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 /// Generate a unique trace ID for payload building
 pub fn generate_trace_id() -> u64 {
     TRACE_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+fn validate_bsc_sidecar(
+    sidecar: &alloy_eips::eip7594::BlobTransactionSidecarVariant,
+) -> Result<(), Eip4844PoolTransactionError> {
+    // BSC only accepts legacy (EIP-4844) sidecars.
+    if sidecar.is_eip4844() {
+        Ok(())
+    } else {
+        Err(Eip4844PoolTransactionError::UnexpectedEip7594SidecarBeforeOsaka)
+    }
 }
 
 /// Errors that can occur during payload job execution
@@ -239,11 +249,19 @@ where
                 }
             }
         }
-        let max_blob_count =
+        let blob_eligible =
+            is_blob_eligible_block(&self.chain_spec, header.number, header.timestamp);
+        let mut max_blob_count =
             blob_params.as_ref().map(|params| params.max_blob_count).unwrap_or_default();
+        if !blob_eligible {
+            max_blob_count = 0;
+        }
         let mut best_tx_list = self.pool.best_transactions_with_attributes(
             BestTransactionsAttributes::new(base_fee, blob_fee.map(|fee| fee as u64)),
         );
+        if !blob_eligible {
+            best_tx_list.skip_blobs();
+        }
         while let Some(pool_tx) = best_tx_list.next() {
             if cancel.is_cancelled() {
                 break;
@@ -295,8 +313,12 @@ where
             }
 
             let tx = pool_tx.to_consensus();
+            if tx.is_eip4844() && !blob_eligible {
+                best_tx_list.skip_blobs();
+                continue;
+            }
             let tx_start = std::time::Instant::now();
-            let mut blob_tx_sidecar = None;
+            let mut blob_tx_sidecar: Option<Arc<alloy_eips::eip7594::BlobTransactionSidecarVariant>> = None;
             trace!(
                 target: "payload_builder",
                 trace_id,
@@ -362,16 +384,11 @@ where
                         break 'sidecar Err(Eip4844PoolTransactionError::MissingEip4844BlobSidecar);
                     };
 
-                    if self.chain_spec.is_osaka_active_at_timestamp(attributes.timestamp()) {
-                        if sidecar.is_eip7594() {
-                            Ok(sidecar)
-                        } else {
-                            Err(Eip4844PoolTransactionError::UnexpectedEip4844SidecarAfterOsaka)
-                        }
-                    } else if sidecar.is_eip4844() {
-                        Ok(sidecar)
+                    // BSC: Always accept legacy (EIP-4844) sidecars and reject EIP-7594 sidecars.
+                    if let Err(err) = validate_bsc_sidecar(sidecar.as_ref()) {
+                        Err(err)
                     } else {
-                        Err(Eip4844PoolTransactionError::UnexpectedEip7594SidecarBeforeOsaka)
+                        Ok(sidecar)
                     }
                 };
 
@@ -1305,5 +1322,37 @@ where
 
         self.potential_payloads.clear();
         Some(best_payload)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_bsc_sidecar;
+    use alloy_consensus::BlobTransactionSidecar;
+    use alloy_eips::eip4844::{Blob, Bytes48};
+    use alloy_eips::eip7594::{
+        BlobTransactionSidecarEip7594, BlobTransactionSidecarVariant, CELLS_PER_EXT_BLOB,
+    };
+    use reth::transaction_pool::error::Eip4844PoolTransactionError;
+
+    #[test]
+    fn bsc_sidecar_accepts_eip4844() {
+        let sidecar = BlobTransactionSidecar::default();
+        let variant = BlobTransactionSidecarVariant::Eip4844(sidecar);
+        assert!(validate_bsc_sidecar(&variant).is_ok());
+    }
+
+    #[test]
+    fn bsc_sidecar_rejects_eip7594() {
+        let blob = Blob::default();
+        let commitment = Bytes48::default();
+        let cell_proofs = vec![Bytes48::default(); CELLS_PER_EXT_BLOB];
+        let sidecar = BlobTransactionSidecarEip7594::new(vec![blob], vec![commitment], cell_proofs);
+        let variant = BlobTransactionSidecarVariant::Eip7594(sidecar);
+
+        assert!(matches!(
+            validate_bsc_sidecar(&variant),
+            Err(Eip4844PoolTransactionError::UnexpectedEip7594SidecarBeforeOsaka)
+        ));
     }
 }

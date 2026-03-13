@@ -65,6 +65,10 @@ hardfork!(
         /// BSC `Fermi` hardfork
         #[default]
         Fermi,
+        /// BSC `Osaka` hardfork
+        Osaka,
+        /// BSC `Mendel` hardfork
+        Mendel,
     }
 );
 
@@ -255,6 +259,7 @@ impl From<BscHardfork> for SpecId {
             | BscHardfork::Lorentz
             | BscHardfork::Maxwell
             | BscHardfork::Fermi => SpecId::PRAGUE,
+            BscHardfork::Osaka | BscHardfork::Mendel => SpecId::OSAKA,
         }
     }
 }

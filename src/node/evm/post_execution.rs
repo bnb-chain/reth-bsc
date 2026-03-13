@@ -30,6 +30,14 @@ use tracing::warn;
 use reth_primitives_traits::{GotExpected, SignerRecoverable};
 use bit_set::BitSet;
 
+#[inline]
+fn turn_length_matches(turn_length_from_header: Option<u8>, expected_turn_length: Option<u8>) -> bool {
+    matches!(
+        (turn_length_from_header, expected_turn_length),
+        (Some(header), Some(expected)) if header == expected
+    )
+}
+
 
 impl<'a, DB, EVM, Spec, R: ReceiptBuilder> BscBlockExecutor<'a, EVM, Spec, R>
 where
@@ -218,27 +226,33 @@ where
             tracing::trace!("Skip verify turn length, block_number {} is not an epoch boundary, epoch_length: {}", header_ref.number, epoch_length);
             return Ok(());
         }
-        let turn_length_from_header = {
-            match self.parlia.get_turn_length_from_header(header_ref, epoch_length) {
-                Ok(Some(length)) => length,
-                Ok(None) => return Ok(()),
-                Err(err) => return Err(BscBlockExecutionError::Validation(BscBlockValidationError::ParliaConsensusError { error: Box::new(err) }).into()),
-            }
-        };
-        let turn_length_from_contract = self.get_turn_length(header_ref.number, header_ref.timestamp)?;
-        if turn_length_from_header == turn_length_from_contract {
+        let turn_length_from_header = self
+            .parlia
+            .get_turn_length_from_header(header_ref, epoch_length)
+            .map_err(|err| {
+                BscBlockExecutionError::Validation(BscBlockValidationError::ParliaConsensusError {
+                    error: Box::new(err),
+                })
+            })?;
+        let expected_turn_length = self.inner_ctx.expected_turn_length;
+        if turn_length_matches(turn_length_from_header, expected_turn_length) {
             tracing::debug!("Succeed to verify turn length, block_number: {}", header_ref.number);
             return Ok(())
         }
 
-        tracing::warn!("Failed to verify turn length, block_number: {}, turn_length_from_header: {}, turn_length_from_contract: {}, epoch_length: {}", 
-            header_ref.number, turn_length_from_header, turn_length_from_contract, epoch_length);
+        tracing::warn!(
+            "Failed to verify turn length, block_number: {}, turn_length_from_header: {:?}, expected_turn_length: {:?}, epoch_length: {}",
+            header_ref.number,
+            turn_length_from_header,
+            expected_turn_length,
+            epoch_length
+        );
         Err(BscBlockExecutionError::Validation(
             BscBlockValidationError::MismatchingEpochTurnLengthError
         ).into())
     }
 
-    fn get_turn_length(
+    pub(crate) fn get_turn_length(
         &mut self,
         header_number: BlockNumber,
         header_timestamp: u64
@@ -700,5 +714,19 @@ where
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::turn_length_matches;
+
+    #[test]
+    fn turn_length_match_requires_both_values_present_and_equal() {
+        assert!(turn_length_matches(Some(8), Some(8)));
+        assert!(!turn_length_matches(Some(8), Some(7)));
+        assert!(!turn_length_matches(None, Some(8)));
+        assert!(!turn_length_matches(Some(8), None));
+        assert!(!turn_length_matches(None, None));
     }
 }

@@ -84,6 +84,7 @@ where
             .snapshot_by_hash(&header.parent_hash)
             .ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;
         self.inner_ctx.snap = Some(snap.clone());
+        self.inner_ctx.expected_turn_length = None;
 
         self.verify_cascading_fields(&header, &parent_header, &snap)?;
 
@@ -104,6 +105,13 @@ where
             };
             tracing::debug!("vote_addrs_map: {:?}", vote_addrs_map);
             self.inner_ctx.current_validators = Some((validator_set, vote_addrs_map));
+
+            if self.spec.is_bohr_active_at_timestamp(header.number, header.timestamp) {
+                // Keep parity with go-bsc: turn length is read from parent state.
+                let expected_turn_length =
+                    self.get_turn_length(parent_header.number, parent_header.timestamp)?;
+                self.inner_ctx.expected_turn_length = Some(expected_turn_length);
+            }
 
             // Also fetch on-chain NodeIDs for validators (EVN identification) and update cache.
             // Only available after Maxwell hardfork when StakeHub contract's getNodeIDs is deployed
@@ -188,10 +196,22 @@ where
 
 
     pub(crate) fn eth_call(
-        &mut self, 
-        to: Address, 
+        &mut self,
+        to: Address,
         data: Bytes
     ) -> Result<Bytes, BlockExecutionError> {
+        // Use block gas limit (~36M on BSC) to match GASLIMIT opcode semantics.
+        // Mark as system transaction to bypass EIP-7825 gas limit cap (16M),
+        // since block gas limit exceeds the cap and these are internal queries.
+        //
+        // Trade-off accepted: is_system_transaction causes transact_raw to:
+        // - Set basefee to 0 (BASEFEE opcode returns 0 instead of actual basefee)
+        // - Disable nonce checks
+        // - Replace block.gas_limit with tx.gas_limit
+        //
+        // For BSC system contract reads (get_current_validators, get_validator_election_info, etc.),
+        // these side effects are acceptable because the contracts don't use BASEFEE in view functions.
+        // If future contracts depend on BASEFEE, this approach would need revisiting.
         let tx_env = BscTxEnv {
             base: TxEnv {
                 caller: Address::default(),
@@ -209,7 +229,7 @@ where
                 tx_type: 0,
                 authorization_list: Default::default(),
             },
-            is_system_transaction: false,
+            is_system_transaction: true,
         };
 
         let result_and_state = self.evm.transact(tx_env).map_err(BlockExecutionError::other)?;

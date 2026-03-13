@@ -867,6 +867,46 @@ where
             return Ok(());
         }
 
+        // Check if parent is still canonical (handles reorg during delayed submission)
+        let parent_number = block_number.saturating_sub(1);
+        match self.provider.sealed_header(parent_number) {
+            Ok(Some(canonical_parent)) => {
+                if canonical_parent.hash() != parent_hash {
+                    debug!(
+                        target: "bsc::miner",
+                        block_number,
+                        parent_number,
+                        expected_parent_hash = %parent_hash,
+                        canonical_parent_hash = %canonical_parent.hash(),
+                        "Skip to submit block due to parent no longer canonical (reorg occurred)"
+                    );
+                    return Ok(());
+                }
+            }
+            Ok(None) => {
+                // Parent header not found - likely reorged away
+                debug!(
+                    target: "bsc::miner",
+                    block_number,
+                    parent_number,
+                    parent_hash = %parent_hash,
+                    "Skip to submit block due to parent not found in canonical chain"
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                // Provider/DB error - log warning and skip to avoid potential issues
+                warn!(
+                    target: "bsc::miner",
+                    block_number,
+                    parent_number,
+                    error = %e,
+                    "Failed to query canonical parent header, skipping block submission"
+                );
+                return Ok(());
+            }
+        }
+
         {
             // check double sign
             let mut cache = self.recent_mined_blocks.lock().unwrap();
@@ -953,8 +993,7 @@ where
         );
 
         // TODO: wait more times when huge chain import.
-        // TODO: only canonical head can broadcast, avoid sidechain blocks.
-        let parent_number = block_number.saturating_sub(1);
+        // Note: sidechain blocks are already filtered by parent canonical check above.
         let parent_td = self
             .provider
             .header_td_by_number(parent_number)

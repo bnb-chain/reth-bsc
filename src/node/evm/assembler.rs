@@ -1,6 +1,9 @@
 use crate::{
     chainspec::BscChainSpec, 
-    consensus::parlia::{Parlia, EMPTY_REQUESTS_HASH, EMPTY_WITHDRAWALS_HASH}, 
+    consensus::{
+        eip4844::next_block_excess_blob_gas_with_mendel,
+        parlia::{Parlia, EMPTY_REQUESTS_HASH, EMPTY_WITHDRAWALS_HASH},
+    },
     hardforks::BscHardforks, 
     node::{
         evm::config::{BscBlockExecutionCtx, BscBlockExecutorFactory},
@@ -8,11 +11,9 @@ use crate::{
         primitives::{BscBlock, BscBlockBody},
     }
 };
-use alloy_consensus::{
-    proofs, BlockBody, BlockHeader, Header, Transaction, TxReceipt, EMPTY_OMMER_ROOT_HASH,
-};
+use alloy_consensus::{proofs, BlockBody, Header, Transaction, TxReceipt, EMPTY_OMMER_ROOT_HASH};
 use alloy_primitives::{keccak256, B256};
-use alloy_eips::{eip7840::BlobParams, merge::BEACON_NONCE};
+use alloy_eips::merge::BEACON_NONCE;
 use alloy_primitives::Bytes;
 use alloy_rpc_types::Withdrawals;
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
@@ -134,15 +135,13 @@ where
         if BscHardforks::is_cancun_active_at_timestamp(self.chain_spec.as_ref(), block_number, timestamp) {
             blob_gas_used =
                 Some(transactions.iter().map(|tx| tx.blob_gas_used().unwrap_or_default()).sum());
-            excess_blob_gas = if BscHardforks::is_cancun_active_at_timestamp(self.chain_spec.as_ref(), parent.number, parent.timestamp) {
-                parent.maybe_next_block_excess_blob_gas(
-                    self.chain_spec.blob_params_at_timestamp(timestamp),
-                )
-            } else {
-                // for the first post-fork block, both parent.blob_gas_used and
-                // parent.excess_blob_gas are evaluated as 0
-                Some(BlobParams::cancun().next_block_excess_blob_gas_osaka(0, 0, 0))
-            };
+            excess_blob_gas = next_block_excess_blob_gas_with_mendel(
+                self.chain_spec.as_ref(),
+                block_number,
+                timestamp,
+                parent.header(),
+                self.chain_spec.blob_params_at_timestamp(timestamp),
+            );
         }
 
         // baseFee should only be set after London fork (EIP-1559)
@@ -266,15 +265,13 @@ where
         if BscHardforks::is_cancun_active_at_timestamp(&*self.chain_spec, block_number, timestamp) {
             blob_gas_used =
                 Some(transactions.iter().map(|tx| tx.blob_gas_used().unwrap_or_default()).sum());
-            excess_blob_gas = if BscHardforks::is_cancun_active_at_timestamp(&*self.chain_spec, parent.number, parent.timestamp) {
-                parent.maybe_next_block_excess_blob_gas(
-                    self.chain_spec.blob_params_at_timestamp(timestamp),
-                )
-            } else {
-                // for the first post-fork block, both parent.blob_gas_used and
-                // parent.excess_blob_gas are evaluated as 0
-                Some(BlobParams::cancun().next_block_excess_blob_gas_osaka(0, 0, 0))
-            };
+            excess_blob_gas = next_block_excess_blob_gas_with_mendel(
+                self.chain_spec.as_ref(),
+                block_number,
+                timestamp,
+                parent.header(),
+                self.chain_spec.blob_params_at_timestamp(timestamp),
+            );
         }
 
         // baseFee should only be set after London fork (EIP-1559)

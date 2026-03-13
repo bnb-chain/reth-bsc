@@ -142,6 +142,14 @@ impl From<ChainSpec> for BscChainSpec {
 
 impl EthereumHardforks for BscChainSpec {
     fn ethereum_fork_activation(&self, fork: EthereumHardfork) -> ForkCondition {
+        // BscHardfork::Osaka and EthereumHardfork::Osaka share the same name() = "Osaka",
+        // so ChainHardforks would match BscHardfork::Osaka when queried for EthereumHardfork::Osaka.
+        // BSC does not support EIP-7594 (PeerDAS), which is gated on EthereumHardfork::Osaka in
+        // upstream reth (RPC sidecar conversion and pool validation). Returning Never here
+        // prevents the upstream EIP-4844 → EIP-7594 sidecar auto-conversion.
+        if matches!(fork, EthereumHardfork::Osaka) {
+            return ForkCondition::Never;
+        }
         self.inner.ethereum_fork_activation(fork)
     }
 }

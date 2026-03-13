@@ -1,5 +1,5 @@
 use crate::chainspec::BscChainSpec;
-use crate::consensus::eip4844::calc_blob_fee;
+use crate::consensus::eip4844::{calc_blob_fee, is_blob_eligible_block};
 use crate::consensus::parlia::provider::SnapshotProvider;
 use crate::consensus::parlia::Snapshot;
 use crate::hardforks::BscHardforks;
@@ -741,8 +741,13 @@ where
     {
         let base_fee: u64 = builder.evm().block().basefee();
         let blob_params = self.chain_spec.blob_params_at_timestamp(self.attributes.timestamp());
-        let max_blob_count =
+        let header = self.mining_ctx.header.as_ref().unwrap();
+        let blob_eligible = is_blob_eligible_block(&self.chain_spec, header.number, header.timestamp);
+        let mut max_blob_count =
             blob_params.as_ref().map(|params| params.max_blob_count).unwrap_or_default();
+        if !blob_eligible {
+            max_blob_count = 0;
+        }
 
         let start_time = std::time::Instant::now();
         let delay_duration = std::time::Duration::from_millis(delay_ms);
@@ -766,6 +771,12 @@ where
             }
             let is_blob_tx = recovered_tx.is_eip4844();
             let tx_hash = *recovered_tx.hash();
+            if is_blob_tx && !blob_eligible {
+                if from_pool {
+                    continue;
+                }
+                return Err("blob transactions not allowed in this block".into());
+            }
             if from_pool {
                 // ensure we still have capacity for this transaction
                 if self.gas_used + recovered_tx.gas_limit() > block_gas_limit {

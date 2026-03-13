@@ -302,6 +302,9 @@ fn decode_consensus_state(input: &Bytes) -> DecodeConsensusStateResult {
     {
         return Err(BscPrecompileError::InvalidInput.into());
     }
+    if input_length > MAX_CONSENSUS_STATE_LENGTH {
+        return Err(BscPrecompileError::InvalidInput.into());
+    }
 
     let mut pos = 0_u64;
     let chain_id = &input[..CHAIN_ID_LENGTH as usize];

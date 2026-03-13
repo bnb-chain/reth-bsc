@@ -8,9 +8,8 @@ use revm::{
     context::Cfg,
     handler::EthPrecompiles,
     precompile::{
-        bls12_381, kzg_point_evaluation, modexp, secp256r1, u64_to_address, Precompile,
-        PrecompileError, PrecompileFn, PrecompileId, PrecompileOutput, PrecompileResult,
-        Precompiles,
+        bls12_381, kzg_point_evaluation, modexp, secp256r1, u64_to_address, Precompile, PrecompileError, PrecompileFn,
+        PrecompileId, PrecompileOutput, PrecompileResult, Precompiles,
     },
     primitives::{hardfork::SpecId, Address as RevmAddress},
 };
@@ -88,11 +87,7 @@ impl PrecompileTraceContext {
         tx_to: Option<AlloyAddress>,
         tx_input: &[u8],
     ) -> Self {
-        let tx_selector = if tx_input.len() >= 4 {
-            Some(hex::encode(&tx_input[..4]))
-        } else {
-            None
-        };
+        let tx_selector = if tx_input.len() >= 4 { Some(hex::encode(&tx_input[..4])) } else { None };
 
         Self::from_parts(block_number, spec, is_system_tx, tx_hash, tx_to, tx_selector, tx_input.len())
     }
@@ -333,10 +328,7 @@ fn install_precompile_tracing(precompiles: &mut Precompiles) -> PrecompileTraceM
         };
 
         let (id, address, original) = precompile.into();
-        trace_map.insert(
-            address,
-            PrecompileTraceEntry { id: id.clone(), original },
-        );
+        trace_map.insert(address, PrecompileTraceEntry { id: id.clone(), original });
 
         if let Some(wrapper) = traced_wrapper_for_address(address) {
             precompiles.extend([Precompile::new(id, address, wrapper)]);
@@ -355,46 +347,31 @@ fn build_traced_precompiles(mut precompiles: Precompiles) -> TracedPrecompiles {
 
 fn build_istanbul_precompiles() -> Precompiles {
     let mut precompiles = Precompiles::istanbul().clone();
-    precompiles.extend([
-        tendermint::TENDERMINT_HEADER_VALIDATION,
-        iavl::IAVL_PROOF_VALIDATION,
-    ]);
+    precompiles.extend([tendermint::TENDERMINT_HEADER_VALIDATION, iavl::IAVL_PROOF_VALIDATION]);
     precompiles
 }
 
 fn build_nano_precompiles() -> Precompiles {
     let mut precompiles = build_istanbul_precompiles();
-    precompiles.extend([
-        tendermint::TENDERMINT_HEADER_VALIDATION_NANO,
-        iavl::IAVL_PROOF_VALIDATION_NANO,
-    ]);
+    precompiles.extend([tendermint::TENDERMINT_HEADER_VALIDATION_NANO, iavl::IAVL_PROOF_VALIDATION_NANO]);
     precompiles
 }
 
 fn build_moran_precompiles() -> Precompiles {
     let mut precompiles = build_istanbul_precompiles();
-    precompiles.extend([
-        tendermint::TENDERMINT_HEADER_VALIDATION,
-        iavl::IAVL_PROOF_VALIDATION_MORAN,
-    ]);
+    precompiles.extend([tendermint::TENDERMINT_HEADER_VALIDATION, iavl::IAVL_PROOF_VALIDATION_MORAN]);
     precompiles
 }
 
 fn build_planck_precompiles() -> Precompiles {
     let mut precompiles = build_istanbul_precompiles();
-    precompiles.extend([
-        tendermint::TENDERMINT_HEADER_VALIDATION,
-        iavl::IAVL_PROOF_VALIDATION_PLANCK,
-    ]);
+    precompiles.extend([tendermint::TENDERMINT_HEADER_VALIDATION, iavl::IAVL_PROOF_VALIDATION_PLANCK]);
     precompiles
 }
 
 fn build_luban_precompiles() -> Precompiles {
     let mut precompiles = build_planck_precompiles();
-    precompiles.extend([
-        bls::BLS_SIGNATURE_VALIDATION,
-        cometbft::COMETBFT_LIGHT_BLOCK_VALIDATION_BEFORE_HERTZ,
-    ]);
+    precompiles.extend([bls::BLS_SIGNATURE_VALIDATION, cometbft::COMETBFT_LIGHT_BLOCK_VALIDATION_BEFORE_HERTZ]);
     precompiles
 }
 
@@ -406,19 +383,13 @@ fn build_plato_precompiles() -> Precompiles {
 
 fn build_hertz_precompiles() -> Precompiles {
     let mut precompiles = build_plato_precompiles();
-    precompiles.extend([
-        cometbft::COMETBFT_LIGHT_BLOCK_VALIDATION,
-        modexp::BERLIN,
-    ]);
+    precompiles.extend([cometbft::COMETBFT_LIGHT_BLOCK_VALIDATION, modexp::BERLIN]);
     precompiles
 }
 
 fn build_feynman_precompiles() -> Precompiles {
     let mut precompiles = build_hertz_precompiles();
-    precompiles.extend([
-        double_sign::DOUBLE_SIGN_EVIDENCE_VALIDATION,
-        tm_secp256k1::TM_SECP256K1_SIGNATURE_RECOVER,
-    ]);
+    precompiles.extend([double_sign::DOUBLE_SIGN_EVIDENCE_VALIDATION, tm_secp256k1::TM_SECP256K1_SIGNATURE_RECOVER]);
     precompiles
 }
 
@@ -437,6 +408,15 @@ fn build_haber_precompiles() -> Precompiles {
 fn build_pascal_precompiles() -> Precompiles {
     let mut precompiles = build_haber_precompiles();
     precompiles.extend(bls12_381::precompiles());
+    precompiles
+}
+
+fn build_mendel_precompiles() -> Precompiles {
+    let mut precompiles = build_pascal_precompiles();
+    // EIP-7823 (MODEXP bounds) + EIP-7883 (MODEXP gas cost increase)
+    precompiles.extend([modexp::OSAKA]);
+    // EIP-7951/BEP-659: P256VERIFY gas cost increase (3450 -> 6900)
+    precompiles.extend([secp256r1::P256VERIFY_OSAKA]);
     precompiles
 }
 
@@ -497,8 +477,16 @@ fn pascal_traced() -> &'static TracedPrecompiles {
     INSTANCE.get_or_init(|| Box::new(build_traced_precompiles(build_pascal_precompiles())))
 }
 
+fn mendel_traced() -> &'static TracedPrecompiles {
+    static INSTANCE: OnceBox<TracedPrecompiles> = OnceBox::new();
+    INSTANCE.get_or_init(|| Box::new(build_traced_precompiles(build_mendel_precompiles())))
+}
+
 fn traced_precompiles_for_spec(spec: BscHardfork) -> &'static TracedPrecompiles {
-    if spec >= BscHardfork::Pascal {
+    // Osaka uses updated precompiles (EIP-7823/7883 MODEXP, EIP-7951 P256VERIFY)
+    if spec >= BscHardfork::Mendel {
+        mendel_traced()
+    } else if spec >= BscHardfork::Pascal {
         pascal_traced()
     } else if spec >= BscHardfork::Haber {
         haber_traced()
@@ -582,6 +570,12 @@ pub fn haber() -> &'static Precompiles {
 /// Returns precompiles for Pascal spec.
 pub fn pascal() -> &'static Precompiles {
     pascal_traced().precompiles()
+}
+
+/// Returns precompiles for Mendel spec.
+/// Includes EIP-7823/7883 (MODEXP) and EIP-7951 (P256VERIFY gas increase).
+pub fn mendel() -> &'static Precompiles {
+    mendel_traced().precompiles()
 }
 
 // BSC precompile provider

@@ -323,14 +323,18 @@ impl Snapshot {
                     return;
                 }
             }
-            if att.data.source_number + 1 != att.data.target_number {
+            // Keep parity with go-bsc:
+            // only perform target-only update when the snapshot already has attestation data.
+            let has_existing_attestation = self.vote_data.source_number != 0
+                || self.vote_data.source_hash != BlockHash::ZERO
+                || self.vote_data.target_number != 0
+                || self.vote_data.target_hash != BlockHash::ZERO;
+            if has_existing_attestation && att.data.source_number + 1 != att.data.target_number {
                 self.vote_data.target_number = att.data.target_number;
                 self.vote_data.target_hash = att.data.target_hash;
             } else {
                 self.vote_data = att.data;
             }
-        } else {
-            VOTE_METRICS.attestation_update_errors_total.increment(1);
         }
     }
 
@@ -456,6 +460,8 @@ impl Decompress for Snapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chainspec::{bsc_testnet, BscChainSpec};
+    use alloy_consensus::Header;
     use alloy_primitives::{address, b256};
 
     fn addr(n: u64) -> Address {
@@ -671,5 +677,97 @@ mod tests {
         // This should not panic and should return a reasonable value
         let check_len = snapshot.miner_history_check_len();
         assert!(check_len > 0, "Check length should be positive");
+    }
+
+    #[test]
+    fn update_attestation_first_non_consecutive_vote_replaces_full_data() {
+        let validators = vec![addr(1), addr(2), addr(3)];
+        let mut snapshot =
+            Snapshot::new(validators, 20, BlockHash::from([9u8; 32]), DEFAULT_EPOCH_LENGTH, None);
+        let chain_spec = BscChainSpec::from(bsc_testnet());
+
+        let vote_data = VoteData {
+            source_number: 10,
+            source_hash: BlockHash::from([1u8; 32]),
+            target_number: 20,
+            target_hash: BlockHash::from([2u8; 32]),
+        };
+        let attestation = VoteAttestation::new_with_vote_data(vote_data);
+        let header = Header {
+            number: 21,
+            timestamp: 1,
+            parent_hash: vote_data.target_hash,
+            ..Default::default()
+        };
+
+        snapshot.update_attestation(&chain_spec, &header, Some(attestation));
+        assert_eq!(snapshot.vote_data, vote_data);
+    }
+
+    #[test]
+    fn update_attestation_non_consecutive_vote_updates_only_target_when_existing_data_present() {
+        let validators = vec![addr(1), addr(2), addr(3)];
+        let mut snapshot =
+            Snapshot::new(validators, 20, BlockHash::from([9u8; 32]), DEFAULT_EPOCH_LENGTH, None);
+        let chain_spec = BscChainSpec::from(bsc_testnet());
+
+        snapshot.vote_data = VoteData {
+            source_number: 8,
+            source_hash: BlockHash::from([3u8; 32]),
+            target_number: 9,
+            target_hash: BlockHash::from([4u8; 32]),
+        };
+
+        let vote_data = VoteData {
+            source_number: 10,
+            source_hash: BlockHash::from([1u8; 32]),
+            target_number: 20,
+            target_hash: BlockHash::from([2u8; 32]),
+        };
+        let attestation = VoteAttestation::new_with_vote_data(vote_data);
+        let header = Header {
+            number: 21,
+            timestamp: 1,
+            parent_hash: vote_data.target_hash,
+            ..Default::default()
+        };
+
+        snapshot.update_attestation(&chain_spec, &header, Some(attestation));
+        assert_eq!(snapshot.vote_data.source_number, 8);
+        assert_eq!(snapshot.vote_data.source_hash, BlockHash::from([3u8; 32]));
+        assert_eq!(snapshot.vote_data.target_number, 20);
+        assert_eq!(snapshot.vote_data.target_hash, BlockHash::from([2u8; 32]));
+    }
+
+    #[test]
+    fn update_attestation_consecutive_vote_replaces_full_data() {
+        let validators = vec![addr(1), addr(2), addr(3)];
+        let mut snapshot =
+            Snapshot::new(validators, 20, BlockHash::from([9u8; 32]), DEFAULT_EPOCH_LENGTH, None);
+        let chain_spec = BscChainSpec::from(bsc_testnet());
+
+        snapshot.vote_data = VoteData {
+            source_number: 8,
+            source_hash: BlockHash::from([3u8; 32]),
+            target_number: 9,
+            target_hash: BlockHash::from([4u8; 32]),
+        };
+
+        let vote_data = VoteData {
+            source_number: 20,
+            source_hash: BlockHash::from([5u8; 32]),
+            target_number: 21,
+            target_hash: BlockHash::from([6u8; 32]),
+        };
+        let attestation = VoteAttestation::new_with_vote_data(vote_data);
+        let header = Header {
+            number: 22,
+            timestamp: 1,
+            parent_hash: vote_data.target_hash,
+            ..Default::default()
+        };
+
+        snapshot.update_attestation(&chain_spec, &header, Some(attestation));
+        assert_eq!(snapshot.vote_data, vote_data);
     }
 }

@@ -17,7 +17,7 @@ use revm::{
         transaction::TransactionType,
         Cfg, ContextError, ContextTr, LocalContextTr, Transaction,
     },
-    context_interface::{transaction::eip7702::AuthorizationTr, JournalTr},
+    context_interface::{transaction::eip7702::AuthorizationTr, Block, JournalTr},
     handler::{EthFrame, EvmTr, FrameResult, Handler, MainnetHandler},
     inspector::{Inspector, InspectorHandler},
     interpreter::{interpreter::EthInterpreter, Host, InitialAndFloorGas, SuccessOrHalt},
@@ -46,6 +46,34 @@ impl<DB: Database, INSP> Handler for BscHandler<DB, INSP> {
     type Evm = BscEvm<DB, INSP>;
     type Error = EVMError<DB::Error>;
     type HaltReason = HaltReason;
+
+    /// Override validate_env to skip gas limit cap validation for system transactions.
+    /// System transactions in BSC use i64::MAX as gas limit, which would fail the
+    /// EIP-7825 gas limit cap check. This is consistent with go-bsc behavior where
+    /// system transactions set SkipTransactionChecks=true.
+    fn validate_env(&self, evm: &mut Self::Evm) -> Result<(), Self::Error> {
+        let is_system_tx = evm.ctx_ref().tx().is_system_transaction;
+
+        if is_system_tx {
+            // For system transactions, only validate block-level requirements
+            // Skip transaction-level validation including gas limit cap
+            let ctx = evm.ctx_ref();
+            let spec: SpecId = (*ctx.cfg().spec()).into();
+
+            // `prevrandao` is required for the merge
+            if spec.is_enabled_in(SpecId::MERGE) && ctx.block().prevrandao().is_none() {
+                return Err(revm::context_interface::result::InvalidHeader::PrevrandaoNotSet.into());
+            }
+            // `excess_blob_gas` is required for Cancun
+            if spec.is_enabled_in(SpecId::CANCUN) && ctx.block().blob_excess_gas_and_price().is_none() {
+                return Err(revm::context_interface::result::InvalidHeader::ExcessBlobGasNotSet.into());
+            }
+            Ok(())
+        } else {
+            // For non-system transactions, use default validation
+            self.mainnet.validate_env(evm)
+        }
+    }
 
     // This function is based on the implementation of the EIP-7702.
     // https://github.com/bluealloy/revm/blob/df467931c4b1b8b620ff2cb9f62501c7abc3ea03/crates/handler/src/pre_execution.rs#L186
@@ -288,4 +316,210 @@ where
     INSP: Inspector<BscContext<DB>>,
 {
     type IT = EthInterpreter;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{evm::transaction::BscTxEnv, hardforks::bsc::BscHardfork};
+    use reth_evm::EvmEnv;
+    use revm::{
+        context::{BlockEnv, CfgEnv, TxEnv},
+        context_interface::result::InvalidTransaction,
+        handler::Handler,
+        inspector::NoOpInspector,
+        primitives::{Address, TxKind, U256},
+        state::AccountInfo,
+    };
+    use revm_database::InMemoryDB;
+
+    use crate::evm::api::BscEvm;
+
+    /// The EIP-7825 gas limit cap (2^24 = 16777216)
+    const MAX_TX_GAS_LIMIT_OSAKA: u64 = 2u64.pow(24);
+
+    fn make_db_with_funded_caller(caller: Address) -> InMemoryDB {
+        let mut db = InMemoryDB::default();
+        db.insert_account_info(
+            caller,
+            AccountInfo { balance: U256::from(1_000_000_000_000u64), ..AccountInfo::default() },
+        );
+        db
+    }
+
+    #[test]
+    fn test_system_tx_bypasses_gas_limit_cap_validation() {
+        // Use Osaka spec which has the gas limit cap enabled
+        let spec = BscHardfork::Osaka;
+        let mut cfg_env = CfgEnv::new_with_spec(spec).with_chain_id(56);
+        // Set the gas limit cap
+        cfg_env.tx_gas_limit_cap = Some(MAX_TX_GAS_LIMIT_OSAKA);
+
+        let block_env = BlockEnv {
+            prevrandao: Some(U256::from(1).into()), // Required for post-merge
+            ..Default::default()
+        };
+        let env = EvmEnv::new(cfg_env, block_env);
+
+        let caller = Address::from([0x11; 20]);
+        let contract = Address::from([0x22; 20]);
+
+        // Create a system transaction with gas limit exceeding the cap (i64::MAX)
+        let system_tx_gas_limit = i64::MAX as u64;
+        assert!(system_tx_gas_limit > MAX_TX_GAS_LIMIT_OSAKA);
+
+        let mut tx = BscTxEnv::new(
+            TxEnv::builder()
+                .caller(caller)
+                .chain_id(Some(56))
+                .gas_limit(system_tx_gas_limit)
+                .gas_price(0) // System txs have 0 gas price
+                .kind(TxKind::Call(contract))
+                .build()
+                .expect("tx env should build"),
+        );
+        // Mark as system transaction
+        tx.is_system_transaction = true;
+
+        let mut evm = BscEvm::new(
+            env,
+            make_db_with_funded_caller(caller),
+            NoOpInspector,
+            false,
+            false,
+        );
+
+        // Set the transaction directly on the inner context
+        evm.inner.ctx.tx = tx;
+
+        // Create handler and validate env
+        let handler = BscHandler::<InMemoryDB, NoOpInspector>::new();
+        let result = handler.validate_env(&mut evm);
+
+        // System transaction should pass validation despite exceeding gas limit cap
+        assert!(
+            result.is_ok(),
+            "System transaction should bypass gas limit cap validation, got error: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_non_system_tx_fails_gas_limit_cap_validation() {
+        // Use Osaka spec which has the gas limit cap enabled
+        let spec = BscHardfork::Osaka;
+        let mut cfg_env = CfgEnv::new_with_spec(spec).with_chain_id(56);
+        // Set the gas limit cap
+        cfg_env.tx_gas_limit_cap = Some(MAX_TX_GAS_LIMIT_OSAKA);
+
+        let block_env = BlockEnv {
+            prevrandao: Some(U256::from(1).into()), // Required for post-merge
+            ..Default::default()
+        };
+        let env = EvmEnv::new(cfg_env, block_env);
+
+        let caller = Address::from([0x11; 20]);
+        let contract = Address::from([0x22; 20]);
+
+        // Create a non-system transaction with gas limit exceeding the cap
+        let excessive_gas_limit = MAX_TX_GAS_LIMIT_OSAKA + 1;
+
+        let tx = BscTxEnv::new(
+            TxEnv::builder()
+                .caller(caller)
+                .chain_id(Some(56))
+                .gas_limit(excessive_gas_limit)
+                .gas_price(1) // Non-zero gas price
+                .kind(TxKind::Call(contract))
+                .build()
+                .expect("tx env should build"),
+        );
+        // is_system_transaction defaults to false
+
+        let mut evm = BscEvm::new(
+            env,
+            make_db_with_funded_caller(caller),
+            NoOpInspector,
+            false,
+            false,
+        );
+
+        // Set the transaction directly on the inner context
+        evm.inner.ctx.tx = tx;
+
+        // Create handler and validate env
+        let handler = BscHandler::<InMemoryDB, NoOpInspector>::new();
+        let result = handler.validate_env(&mut evm);
+
+        // Non-system transaction should fail validation
+        assert!(
+            result.is_err(),
+            "Non-system transaction exceeding gas limit cap should fail validation"
+        );
+
+        // Verify it's the correct error type
+        if let Err(e) = result {
+            match e {
+                revm::context::result::EVMError::Transaction(InvalidTransaction::TxGasLimitGreaterThanCap { gas_limit, cap }) => {
+                    assert_eq!(gas_limit, excessive_gas_limit);
+                    assert_eq!(cap, MAX_TX_GAS_LIMIT_OSAKA);
+                }
+                _ => panic!("Expected TxGasLimitGreaterThanCap error, got: {:?}", e),
+            }
+        }
+    }
+
+    #[test]
+    fn test_non_system_tx_within_cap_passes_validation() {
+        // Use Osaka spec which has the gas limit cap enabled
+        let spec = BscHardfork::Osaka;
+        let mut cfg_env = CfgEnv::new_with_spec(spec).with_chain_id(56);
+        // Set the gas limit cap
+        cfg_env.tx_gas_limit_cap = Some(MAX_TX_GAS_LIMIT_OSAKA);
+
+        let block_env = BlockEnv {
+            prevrandao: Some(U256::from(1).into()), // Required for post-merge
+            ..Default::default()
+        };
+        let env = EvmEnv::new(cfg_env, block_env);
+
+        let caller = Address::from([0x11; 20]);
+        let contract = Address::from([0x22; 20]);
+
+        // Create a non-system transaction with gas limit within the cap
+        let valid_gas_limit = MAX_TX_GAS_LIMIT_OSAKA - 1;
+
+        let tx = BscTxEnv::new(
+            TxEnv::builder()
+                .caller(caller)
+                .chain_id(Some(56))
+                .gas_limit(valid_gas_limit)
+                .gas_price(1)
+                .kind(TxKind::Call(contract))
+                .build()
+                .expect("tx env should build"),
+        );
+
+        let mut evm = BscEvm::new(
+            env,
+            make_db_with_funded_caller(caller),
+            NoOpInspector,
+            false,
+            false,
+        );
+
+        // Set the transaction directly on the inner context
+        evm.inner.ctx.tx = tx;
+
+        // Create handler and validate env
+        let handler = BscHandler::<InMemoryDB, NoOpInspector>::new();
+        let result = handler.validate_env(&mut evm);
+
+        // Non-system transaction within cap should pass validation
+        assert!(
+            result.is_ok(),
+            "Non-system transaction within gas limit cap should pass validation, got error: {:?}",
+            result.err()
+        );
+    }
 }
