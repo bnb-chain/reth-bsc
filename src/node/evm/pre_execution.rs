@@ -12,6 +12,7 @@ use revm::{
 };
 use alloy_consensus::{TxReceipt, Header, BlockHeader};
 use alloy_primitives::{BlockHash, BlockNumber, B256};
+use std::sync::Arc;
 use crate::consensus::parlia::{VoteAddress, Snapshot, DIFF_INTURN, DIFF_NOTURN};
 use crate::consensus::parlia::util::{is_breathe_block, debug_header};
 use crate::consensus::parlia::vote::MAX_ATTESTATION_EXTRA_LENGTH;
@@ -83,7 +84,7 @@ where
             .unwrap()
             .snapshot_by_hash(&header.parent_hash)
             .ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;
-        self.inner_ctx.snap = Some(snap.clone());
+        self.inner_ctx.snap = Some(Arc::new(snap.clone()));
         self.inner_ctx.expected_turn_length = None;
 
         self.verify_cascading_fields(&header, &parent_header, &snap)?;
@@ -558,7 +559,7 @@ where
             .unwrap()
             .snapshot_by_hash(&self.ctx.base.parent_hash)
             .ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;
-        self.inner_ctx.snap = Some(snap.clone());
+        self.inner_ctx.snap = Some(Arc::new(snap.clone()));
 
         let header_number = block.number().to::<u64>();
         let header_timestamp = block.timestamp().to::<u64>();

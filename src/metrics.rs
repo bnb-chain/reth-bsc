@@ -184,6 +184,24 @@ pub struct BscMinerMetrics {
     /// Total number of blocks produced
     pub blocks_produced_total: Counter,
 
+    /// Total number of rebuild attempts after the initial payload build.
+    pub payload_retries_total: Counter,
+
+    /// Time spent waiting between a completed candidate and the next rebuild/seal decision.
+    pub payload_retry_wait_seconds: Histogram,
+
+    /// Time spent waiting for the first viable candidate during best-payload return.
+    pub payload_first_candidate_wait_seconds: Histogram,
+
+    /// Time from a candidate becoming ready until it is submitted to the result worker.
+    pub payload_ready_to_submit_seconds: Histogram,
+
+    /// Total number of times a rebuild was skipped because the remaining budget was too small.
+    pub payload_rebuild_skipped_total: Counter,
+
+    /// Total number of times no payload candidate was available when the job tried to submit.
+    pub no_best_payload_total: Counter,
+
     /// Block broadcast delay in nanoseconds (time from block timestamp to broadcast time)
     /// This measures how long it takes from block creation to network broadcast
     /// Note: Value is stored in nanoseconds to match Golang implementation
