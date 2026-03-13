@@ -4,7 +4,7 @@ use reth_db::transaction::{DbTx, DbTxMut};
 use reth_provider::{
     providers::{ChainStorage, NodeTypesForProvider},
     BlockBodyReader, BlockBodyWriter, ChainSpecProvider, ChainStorageReader, ChainStorageWriter,
-    DBProvider, DatabaseProvider, EthStorage, ProviderResult, ReadBodyInput, StorageLocation,
+    DBProvider, DatabaseProvider, EthStorage, ProviderResult, ReadBodyInput,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -18,20 +18,17 @@ where
     fn write_block_bodies(
         &self,
         provider: &Provider,
-        bodies: Vec<(u64, Option<BscBlockBody>)>,
-        write_to: StorageLocation,
+        bodies: Vec<(u64, Option<&BscBlockBody>)>,
     ) -> ProviderResult<()> {
         let (eth_bodies, _sidecars) = bodies
             .into_iter()
             .map(|(block_number, body)| {
-                if let Some(BscBlockBody { inner, sidecars }) = body {
-                    ((block_number, Some(inner)), (block_number, Some(sidecars)))
-                } else {
-                    ((block_number, None), (block_number, None))
-                }
+                let inner = body.map(|b| &b.inner);
+                let sidecars = body.and_then(|b| b.sidecars.as_ref());
+                ((block_number, inner), (block_number, sidecars))
             })
             .unzip::<_, _, Vec<_>, Vec<_>>();
-        self.0.write_block_bodies(provider, eth_bodies, write_to)?;
+        self.0.write_block_bodies(provider, eth_bodies)?;
 
         // TODO: Write sidecars
 
@@ -42,9 +39,8 @@ where
         &self,
         provider: &Provider,
         block: u64,
-        remove_from: StorageLocation,
     ) -> ProviderResult<()> {
-        self.0.remove_block_bodies_above(provider, block, remove_from)?;
+        self.0.remove_block_bodies_above(provider, block)?;
 
         // TODO: Remove sidecars
 

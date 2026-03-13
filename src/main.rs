@@ -1,9 +1,10 @@
 use clap::{Args, Parser};
-use reth::{builder::NodeHandle, cli::Cli};
+use reth::{builder::NodeHandle, cli::Cli, consensus::FullConsensus};
 use reth_bsc::node::consensus::BscConsensus;
 use reth_bsc::{
     chainspec::{parser::BscChainSpecParser, genesis_override},
     node::{evm::config::BscEvmConfig, BscNode},
+    BscPrimitives,
 };
 use reth_bsc::consensus::parlia::bls_signer;
 use std::sync::Arc;
@@ -119,7 +120,13 @@ fn main() -> eyre::Result<()> {
     reth_bsc::shared::init_bid_package_queue();
 
     Cli::<BscChainSpecParser, BscCliArgs>::parse().run_with_components::<BscNode>(
-        |spec| (BscEvmConfig::new(spec.clone()), BscConsensus::new(spec)),
+        |spec| {
+            (
+                BscEvmConfig::new(spec.clone()),
+                Arc::new(BscConsensus::new(spec))
+                    as Arc<dyn FullConsensus<BscPrimitives>>,
+            )
+        },
         async move |builder, args| {
             // Set genesis hash override if provided
             if let Err(e) = genesis_override::set_genesis_hash_override(args.genesis_hash) {

@@ -187,7 +187,7 @@ where
                     if let Some(sp) = crate::shared::get_snapshot_provider() {
                         let sp = Arc::clone(sp);
                         let spec = self.consensus.spec.clone();
-                        match self.provider.header(&tip_header.hash()) {
+                        match self.provider.header(tip_header.hash()) {
                             Ok(Some(h)) => {
                                 tracing::debug!(target: "bsc::vote", "Succeed to get header for tip block, validator: {}, tip: {}", self.validator_address, tip_header.number());
                                 tokio::spawn(async move {
@@ -198,11 +198,22 @@ where
                                     );
                                 });
                             }
+                            Ok(None) => {
+                                if let Some(h) = crate::node::evm::util::get_header_by_hash_from_cache(&tip_header.hash()) {
+                                    tracing::debug!(target: "bsc::vote", "Succeed to get header for tip block from cache, validator: {}, tip: {}", self.validator_address, tip_header.number());
+                                    tokio::spawn(async move {
+                                        crate::node::vote_producer::maybe_produce_and_broadcast_for_head(
+                                            spec,
+                                            sp.as_ref(),
+                                            &h,
+                                        );
+                                    });
+                                } else {
+                                    tracing::error!(target: "bsc::vote", "Failed to get header for tip block, validator: {}, tip: {}", self.validator_address, tip_header.number());
+                                }
+                            }
                             Err(e) => {
                                 tracing::error!(target: "bsc::vote", "Failed to get header for tip block, validator: {}, tip: {}, due to {}", self.validator_address, tip_header.number(), e);
-                            }
-                            _ => {
-                                tracing::error!(target: "bsc::vote", "Failed to get header for tip block, validator: {}, tip: {}", self.validator_address, tip_header.number());
                             }
                         }
                     }
@@ -856,6 +867,46 @@ where
             return Ok(());
         }
 
+        // Check if parent is still canonical (handles reorg during delayed submission)
+        let parent_number = block_number.saturating_sub(1);
+        match self.provider.sealed_header(parent_number) {
+            Ok(Some(canonical_parent)) => {
+                if canonical_parent.hash() != parent_hash {
+                    debug!(
+                        target: "bsc::miner",
+                        block_number,
+                        parent_number,
+                        expected_parent_hash = %parent_hash,
+                        canonical_parent_hash = %canonical_parent.hash(),
+                        "Skip to submit block due to parent no longer canonical (reorg occurred)"
+                    );
+                    return Ok(());
+                }
+            }
+            Ok(None) => {
+                // Parent header not found - likely reorged away
+                debug!(
+                    target: "bsc::miner",
+                    block_number,
+                    parent_number,
+                    parent_hash = %parent_hash,
+                    "Skip to submit block due to parent not found in canonical chain"
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                // Provider/DB error - log warning and skip to avoid potential issues
+                warn!(
+                    target: "bsc::miner",
+                    block_number,
+                    parent_number,
+                    error = %e,
+                    "Failed to query canonical parent header, skipping block submission"
+                );
+                return Ok(());
+            }
+        }
+
         {
             // check double sign
             let mut cache = self.recent_mined_blocks.lock().unwrap();
@@ -942,8 +993,7 @@ where
         );
 
         // TODO: wait more times when huge chain import.
-        // TODO: only canonical head can broadcast, avoid sidechain blocks.
-        let parent_number = block_number.saturating_sub(1);
+        // Note: sidechain blocks are already filtered by parent canonical check above.
         let parent_td = self
             .provider
             .header_td_by_number(parent_number)

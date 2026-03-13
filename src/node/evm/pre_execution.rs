@@ -7,6 +7,7 @@ use reth_primitives::TransactionSigned;
 use reth_revm::State;
 use revm::{
     context::{BlockEnv, TxEnv},
+    context_interface::block::Block,
     primitives::{Address, Bytes, TxKind, U256},
 };
 use alloy_consensus::{TxReceipt, Header, BlockHeader};
@@ -48,6 +49,7 @@ where
         Tx: FromRecoveredTx<R::Transaction>
                 + FromRecoveredTx<TransactionSigned>
                 + FromTxWithEncoded<TransactionSigned>,
+        BlockEnv = BlockEnv,
     >,
     Spec: EthereumHardforks + crate::hardforks::BscHardforks + EthChainSpec + Hardforks + Clone + 'static,
     R: ReceiptBuilder<Transaction = TransactionSigned, Receipt: TxReceipt>,
@@ -62,7 +64,7 @@ where
         &mut self, 
         block: &BlockEnv
     ) -> Result<(), BlockExecutionError> {
-        let block_number = block.number.to::<u64>();
+        let block_number = block.number().to::<u64>();
         tracing::trace!("Check new block, block_number: {}", block_number);
 
         self.inner_ctx.header = self.ctx.header.clone();
@@ -82,6 +84,7 @@ where
             .snapshot_by_hash(&header.parent_hash)
             .ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;
         self.inner_ctx.snap = Some(snap.clone());
+        self.inner_ctx.expected_turn_length = None;
 
         self.verify_cascading_fields(&header, &parent_header, &snap)?;
 
@@ -102,6 +105,13 @@ where
             };
             tracing::debug!("vote_addrs_map: {:?}", vote_addrs_map);
             self.inner_ctx.current_validators = Some((validator_set, vote_addrs_map));
+
+            if self.spec.is_bohr_active_at_timestamp(header.number, header.timestamp) {
+                // Keep parity with go-bsc: turn length is read from parent state.
+                let expected_turn_length =
+                    self.get_turn_length(parent_header.number, parent_header.timestamp)?;
+                self.inner_ctx.expected_turn_length = Some(expected_turn_length);
+            }
 
             // Also fetch on-chain NodeIDs for validators (EVN identification) and update cache.
             // Only available after Maxwell hardfork when StakeHub contract's getNodeIDs is deployed
@@ -167,7 +177,7 @@ where
             let mut cache = VALIDATOR_CACHE.lock().unwrap();
             if let Some(cached_result) = cache.get(&block_hash) {
                 tracing::debug!("Succeed to query cached validator result, block_number: {}, block_hash: {}, evm_block_number: {}", 
-                block_number, block_hash, self.evm.block().number);
+                block_number, block_hash, self.evm.block().number());
                 return Ok(cached_result.clone());
             }
         }
@@ -178,7 +188,7 @@ where
             let mut cache = VALIDATOR_CACHE.lock().unwrap();
             cache.insert(block_hash, result.clone());
             tracing::debug!("Succeed to update cache, block_number: {}, block_hash: {}, evm_block_number: {}", 
-                block_number, block_hash, self.evm.block().number);
+                block_number, block_hash, self.evm.block().number());
         }
 
         Ok(result)
@@ -186,16 +196,28 @@ where
 
 
     pub(crate) fn eth_call(
-        &mut self, 
-        to: Address, 
+        &mut self,
+        to: Address,
         data: Bytes
     ) -> Result<Bytes, BlockExecutionError> {
+        // Use block gas limit (~36M on BSC) to match GASLIMIT opcode semantics.
+        // Mark as system transaction to bypass EIP-7825 gas limit cap (16M),
+        // since block gas limit exceeds the cap and these are internal queries.
+        //
+        // Trade-off accepted: is_system_transaction causes transact_raw to:
+        // - Set basefee to 0 (BASEFEE opcode returns 0 instead of actual basefee)
+        // - Disable nonce checks
+        // - Replace block.gas_limit with tx.gas_limit
+        //
+        // For BSC system contract reads (get_current_validators, get_validator_election_info, etc.),
+        // these side effects are acceptable because the contracts don't use BASEFEE in view functions.
+        // If future contracts depend on BASEFEE, this approach would need revisiting.
         let tx_env = BscTxEnv {
             base: TxEnv {
                 caller: Address::default(),
                 kind: TxKind::Call(to),
                 nonce: 0,
-                gas_limit: self.evm.block().gas_limit,
+                gas_limit: self.evm.block().gas_limit(),
                 value: U256::ZERO,
                 data: data.clone(),
                 gas_price: 0,
@@ -207,7 +229,7 @@ where
                 tx_type: 0,
                 authorization_list: Default::default(),
             },
-            is_system_transaction: false,
+            is_system_transaction: true,
         };
 
         let result_and_state = self.evm.transact(tx_env).map_err(BlockExecutionError::other)?;
@@ -538,8 +560,8 @@ where
             .ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;
         self.inner_ctx.snap = Some(snap.clone());
 
-        let header_number = block.number.to::<u64>();
-        let header_timestamp = block.timestamp.to::<u64>();
+        let header_number = block.number().to::<u64>();
+        let header_timestamp = block.timestamp().to::<u64>();
         if self.spec.is_feynman_active_at_timestamp(header_number, header_timestamp) &&
             !self.spec.is_feynman_transition_at_timestamp(header_number, header_timestamp, parent_header.timestamp) &&
             is_breathe_block(parent_header.timestamp, header_timestamp)

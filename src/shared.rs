@@ -210,7 +210,7 @@ where
     // Create function for header by hash
     let provider_clone = provider.clone();
     let header_by_hash_fn = Arc::new(move |block_hash: &B256| -> Option<Header> {
-        match provider_clone.header(block_hash) {
+        match provider_clone.header(*block_hash) {
             Ok(Some(header)) => Some(header),
             _ => None,
         }
@@ -550,6 +550,7 @@ pub async fn ipc_eth_call(
         RpcBlock,
         RpcReceipt,
         RpcHeader,
+        TransactionSigned,
     >::call(client.as_ref(), req, block_id, state_overrides, block_overrides)
     .await
     .map_err(|e| eyre::eyre!("failed to query chain id from healthy node: {e}"))
@@ -567,6 +568,7 @@ pub async fn ipc_estimate_gas(
         RpcBlock,
         RpcReceipt,
         RpcHeader,
+        TransactionSigned,
     >::estimate_gas(client.as_ref(), req, block_id, state_overrides)
     .await
     .map_err(|e| eyre::eyre!("failed to query chain id from healthy node: {e}"))
@@ -582,6 +584,7 @@ pub async fn ipc_send_transaction(
         RpcBlock,
         RpcReceipt,
         RpcHeader,
+        TransactionSigned,
     >::send_transaction(client.as_ref(), req)
     .await
     .map_err(|e| eyre::eyre!("failed to query chain id from healthy node: {e}"))
@@ -601,6 +604,7 @@ pub async fn ipc_send_raw_transaction(
         RpcBlock,
         RpcReceipt,
         RpcHeader,
+        TransactionSigned,
     >::send_raw_transaction(client.as_ref(), bytes)
     .await
     .map_err(|e| eyre::eyre!("failed to query chain id from healthy node: {e}"))

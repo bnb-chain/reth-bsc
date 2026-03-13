@@ -65,6 +65,10 @@ hardfork!(
         /// BSC `Fermi` hardfork
         #[default]
         Fermi,
+        /// BSC `Osaka` hardfork
+        Osaka,
+        /// BSC `Mendel` hardfork
+        Mendel,
     }
 );
 
@@ -158,6 +162,8 @@ impl BscHardfork {
             (Self::Lorentz.boxed(), ForkCondition::Timestamp(1744097580)),
             (Self::Maxwell.boxed(), ForkCondition::Timestamp(1748243100)),
             (Self::Fermi.boxed(), ForkCondition::Timestamp(1762741500)),
+            (Self::Osaka.boxed(), ForkCondition::Timestamp(1774319400)),
+            (Self::Mendel.boxed(), ForkCondition::Timestamp(1774319400)),
         ])
     }
 
@@ -255,6 +261,7 @@ impl From<BscHardfork> for SpecId {
             | BscHardfork::Lorentz
             | BscHardfork::Maxwell
             | BscHardfork::Fermi => SpecId::PRAGUE,
+            BscHardfork::Osaka | BscHardfork::Mendel => SpecId::OSAKA,
         }
     }
 }

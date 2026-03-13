@@ -34,3 +34,30 @@ check-features:
 		--package reth-primitives-traits \
 		--package reth-primitives \
 		--feature-powerset
+
+##@ EVM Tests
+
+# Execution spec tests configuration
+EEST_VERSION ?= v5.4.0
+EEST_URL := https://github.com/ethereum/execution-spec-tests/releases/download/$(EEST_VERSION)/fixtures_stable.tar.gz
+EEST_DIR := ./testing/bsc-ef-tests/execution-spec-tests
+
+$(EEST_DIR):
+	@echo "Downloading execution spec tests $(EEST_VERSION)..."
+	mkdir -p $(EEST_DIR)
+	curl -sL $(EEST_URL) | tar -xzf - --strip-components=1 -C $(EEST_DIR)
+
+.PHONY: download-eest
+download-eest: $(EEST_DIR) ## Download execution spec test fixtures
+
+.PHONY: ef-tests
+ef-tests: $(EEST_DIR) ## Run BSC EVM execution spec tests
+	cargo test -p bsc-ef-tests --release --features ef-tests,jemalloc,asm-keccak
+
+.PHONY: ef-tests-nextest
+ef-tests-nextest: $(EEST_DIR) ## Run BSC EVM execution spec tests with nextest (faster)
+	cargo nextest run -p bsc-ef-tests --release --features ef-tests,jemalloc,asm-keccak
+
+.PHONY: clean-eest
+clean-eest: ## Remove downloaded execution spec test fixtures
+	rm -rf $(EEST_DIR)

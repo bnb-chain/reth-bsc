@@ -2,12 +2,12 @@ use jsonrpsee::core::RpcResult;
 use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::types::ErrorObject;
 use alloy_primitives::B256;
+use alloy_consensus::transaction::TxHashRef;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use reth_transaction_pool::{BlobStoreError, TransactionPool};
 use alloy_eips::eip7594::BlobTransactionSidecarVariant;
-use reth_provider::{BlockNumReader, TransactionsProvider};
-use reth_primitives_traits::SignedTransaction;
+use reth_provider::{BlockNumReader, BlockReader, TransactionsProvider};
 
 /// Inner blob sidecar data
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -233,7 +233,7 @@ where
 impl<Pool, Provider> BlobApiServer for BlobApiImpl<Pool, Provider>
 where
     Pool: TransactionPool + Clone + Send + Sync + 'static,
-    Provider: TransactionsProvider + BlockNumReader + Clone + Send + Sync + 'static,
+    Provider: TransactionsProvider + BlockNumReader + BlockReader + Clone + Send + Sync + 'static,
 {
     /// Get blob sidecar by transaction hash
     async fn get_blob_sidecar_by_tx_hash(
@@ -272,7 +272,7 @@ where
 
         // Try to get transaction metadata (block number, hash, index)
         let (block_number, block_hash, index) = if let Ok(Some(tx_id)) = self.provider.transaction_id(tx_hash) {
-            if let Ok(Some(block_num)) = self.provider.transaction_block(tx_id) {
+            if let Ok(Some(block_num)) = self.provider.block_by_transaction_id(tx_id) {
                 // Get block hash
                 let block_hash = self.provider.block_hash(block_num).ok().flatten();
                 
@@ -408,4 +408,3 @@ mod tests {
         assert!(json.contains("txIndex"));
     }
 }
-

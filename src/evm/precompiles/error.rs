@@ -16,15 +16,15 @@ pub enum BscPrecompileError {
 impl From<BscPrecompileError> for PrecompileError {
     fn from(error: BscPrecompileError) -> Self {
         match error {
-            BscPrecompileError::InvalidInput => PrecompileError::Other("invalid input".to_string()),
+            BscPrecompileError::InvalidInput => PrecompileError::Other("invalid input".into()),
             BscPrecompileError::CometBftApplyBlockFailed => {
-                PrecompileError::Other("apply block failed".to_string())
+                PrecompileError::Other("apply block failed".into())
             }
             BscPrecompileError::CometBftEncodeConsensusStateFailed => {
-                PrecompileError::Other("encode consensus state failed".to_string())
+                PrecompileError::Other("encode consensus state failed".into())
             }
             BscPrecompileError::DoubleSignInvalidEvidence => {
-                PrecompileError::Other("double sign invalid evidence".to_string())
+                PrecompileError::Other("double sign invalid evidence".into())
             }
         }
     }

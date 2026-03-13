@@ -5,7 +5,13 @@ use super::{
     factory::BscEvmFactory,
 };
 use crate::{
-    BscPrimitives, chainspec::BscChainSpec, consensus::parlia::VoteAddress, evm::transaction::BscTxEnv, hardforks::{BscHardforks, bsc::BscHardfork}, node::engine_api::validator::BscExecutionData, system_contracts::{SystemContract, feynman_fork::ValidatorElectionInfo}
+    BscPrimitives,
+    chainspec::BscChainSpec,
+    consensus::{eip4844::next_block_excess_blob_gas_with_mendel, parlia::VoteAddress},
+    evm::transaction::BscTxEnv,
+    hardforks::{bsc::BscHardfork, BscHardforks},
+    node::engine_api::validator::BscExecutionData,
+    system_contracts::{feynman_fork::ValidatorElectionInfo, SystemContract},
 };
 use alloy_consensus::{transaction::SignerRecoverable, BlockHeader, Header, TxReceipt};
 use alloy_eips::eip7840::BlobParams;
@@ -21,6 +27,7 @@ use reth_evm::{
 };
 use reth_evm_ethereum::RethReceiptBuilder;
 use reth_primitives::{BlockTy, HeaderTy, SealedBlock, SealedHeader, TransactionSigned};
+use reth_primitives_traits::constants::MAX_TX_GAS_LIMIT_OSAKA;
 use reth_revm::State;
 use revm::{
     Inspector, context::{BlockEnv, CfgEnv}, context_interface::block::BlobExcessGasAndPrice, primitives::{hardfork::SpecId}
@@ -155,7 +162,10 @@ impl<R, Spec, EvmF> BlockExecutorFactory for BscBlockExecutorFactory<R, Spec, Ev
 where
     R: ReceiptBuilder<Transaction = TransactionSigned, Receipt: TxReceipt<Log = Log>> + Clone,
     Spec: EthereumHardforks + BscHardforks + EthChainSpec + Hardforks + Clone,
-    EvmF: EvmFactory<Tx: FromRecoveredTx<TransactionSigned> + FromTxWithEncoded<TransactionSigned>>,
+    EvmF: EvmFactory<
+        Tx: FromRecoveredTx<TransactionSigned> + FromTxWithEncoded<TransactionSigned>,
+        BlockEnv = BlockEnv,
+    >,
     R::Transaction: From<TransactionSigned> + Clone,
     Self: 'static,
     BscTxEnv: IntoTxEnv<<EvmF as EvmFactory>::Tx>,
@@ -210,7 +220,7 @@ where
         &self.block_assembler
     }
 
-    fn evm_env(&self, header: &Header) -> EvmEnv<BscHardfork> {
+    fn evm_env(&self, header: &Header) -> Result<EvmEnv<BscHardfork>, Self::Error> {
         let mut blob_params = None;
         if BscHardforks::is_cancun_active_at_timestamp(self.chain_spec(), header.number, header.timestamp) {
             blob_params = self.chain_spec().blob_params_at_timestamp(header.timestamp);
@@ -220,13 +230,16 @@ where
             header.timestamp(),
             header.number(),
         );
+        let spec_id = SpecId::from(spec);
 
         // configure evm env based on parent block
-        let mut cfg_env =
-            CfgEnv::new().with_chain_id(self.chain_spec().chain().id()).with_spec(spec);
+        let mut cfg_env = CfgEnv::new_with_spec(spec).with_chain_id(self.chain_spec().chain().id());
 
         if let Some(blob_params) = &blob_params {
             cfg_env.set_max_blobs_per_tx(blob_params.max_blobs_per_tx);
+        }
+        if BscHardforks::is_osaka_active_at_timestamp(self.chain_spec(), header.number, header.timestamp) {
+            cfg_env.tx_gas_limit_cap = Some(MAX_TX_GAS_LIMIT_OSAKA);
         }
 
         // derive the EIP-4844 blob fees from the header's `excess_blob_gas` and the current
@@ -237,7 +250,7 @@ where
                 BlobExcessGasAndPrice { excess_blob_gas, blob_gasprice }
             });
 
-        let eth_spec = SpecId::from(spec);
+        let eth_spec = spec_id;
 
         let block_env = BlockEnv {
             number: U256::from(header.number()),
@@ -256,7 +269,7 @@ where
             blob_excess_gas_and_price,
         };
 
-        EvmEnv { cfg_env, block_env }
+        Ok(EvmEnv { cfg_env, block_env })
     }
 
     fn next_evm_env(
@@ -272,21 +285,29 @@ where
         );
 
         // configure evm env based on parent block
-        let cfg_env =
-            CfgEnv::new().with_chain_id(self.chain_spec().chain().id()).with_spec(spec_id);
+        let mut cfg_env =
+            CfgEnv::new_with_spec(spec_id).with_chain_id(self.chain_spec().chain().id());
 
         let blob_params = self.chain_spec().blob_params_at_timestamp(attributes.timestamp);
 
         // if the parent block did not have excess blob gas (i.e. it was pre-cancun), but it is
         // cancun now, we need to set the excess blob gas to the default value(0)
-        let blob_excess_gas_and_price = parent
-            .maybe_next_block_excess_blob_gas(blob_params)
-            .or_else(|| (SpecId::from(spec_id).is_enabled_in(SpecId::CANCUN)).then_some(0))
-            .map(|excess_blob_gas| {
-                let blob_gasprice =
-                    blob_params.unwrap_or_else(BlobParams::cancun).calc_blob_fee(excess_blob_gas);
-                BlobExcessGasAndPrice { excess_blob_gas, blob_gasprice }
-            });
+        let blob_excess_gas_and_price = next_block_excess_blob_gas_with_mendel(
+            self.chain_spec(),
+            parent.number + 1,
+            attributes.timestamp,
+            parent,
+            blob_params,
+        )
+        .map(|excess_blob_gas| {
+            let blob_gasprice =
+                blob_params.unwrap_or_else(BlobParams::cancun).calc_blob_fee(excess_blob_gas);
+            BlobExcessGasAndPrice { excess_blob_gas, blob_gasprice }
+        });
+
+        if BscHardforks::is_osaka_active_at_timestamp(self.chain_spec(), parent.number + 1, attributes.timestamp) {
+            cfg_env.tx_gas_limit_cap = Some(MAX_TX_GAS_LIMIT_OSAKA);
+        }
 
   
         // Refer to geth-bsc: https://github.com/bnb-chain/bsc/blob/master/consensus/misc/eip1559/eip1559.go#L61
@@ -333,35 +354,39 @@ where
     fn context_for_block<'a>(
         &self,
         block: &'a SealedBlock<BlockTy<Self::Primitives>>,
-    ) -> ExecutionCtxFor<'a, Self> {
-        BscBlockExecutionCtx {
+    ) -> Result<ExecutionCtxFor<'a, Self>, Self::Error> {
+        Ok(BscBlockExecutionCtx {
             base: EthBlockExecutionCtx {
+                tx_count_hint: Some(block.transaction_count()),
                 parent_hash: block.header().parent_hash,
                 parent_beacon_block_root: block.header().parent_beacon_block_root,
                 ommers: &block.body().ommers,
                 withdrawals: block.body().withdrawals.as_ref().map(Cow::Borrowed),
+                extra_data: block.header().extra_data.clone(),
             },
             header: Some(block.header().clone()),
             is_miner: false,
-        }
+        })
     }
 
     fn context_for_next_block(
         &self,
         parent: &SealedHeader<HeaderTy<Self::Primitives>>,
         attributes: Self::NextBlockEnvCtx,
-    ) -> ExecutionCtxFor<'_, Self> {
+    ) -> Result<ExecutionCtxFor<'_, Self>, Self::Error> {
         tracing::trace!("Try to create next block ctx for miner, next_block_numer={}, parent_hash={}", parent.number+1, parent.hash());
-        BscBlockExecutionCtx {
+        Ok(BscBlockExecutionCtx {
             base: EthBlockExecutionCtx {
+                tx_count_hint: None,
                 parent_hash: parent.hash(),
                 parent_beacon_block_root: attributes.parent_beacon_block_root,
                 ommers: &[],
                 withdrawals: attributes.withdrawals.map(Cow::Owned),
+                extra_data: attributes.extra_data,
             },
             header: None, // No header available for next block context
             is_miner: true,
-        }
+        })
     }
 
     // payload builder use this method to create BscBlockBuilder.
@@ -403,29 +428,35 @@ impl ConfigureEngineEvm<BscExecutionData> for BscEvmConfig
 where
     Self: Send + Sync + Unpin + Clone + 'static,
 {
-    fn evm_env_for_payload(&self, payload: &BscExecutionData) -> EvmEnv<BscHardfork> {
+    fn evm_env_for_payload(&self, payload: &BscExecutionData) -> Result<EvmEnv<BscHardfork>, Self::Error> {
         self.evm_env(&payload.0.header)
     }
 
-    fn context_for_payload<'a>(&self, payload: &'a BscExecutionData) -> BscBlockExecutionCtx<'a> {
+    fn context_for_payload<'a>(
+        &self,
+        payload: &'a BscExecutionData,
+    ) -> Result<BscBlockExecutionCtx<'a>, Self::Error> {
         let block = &payload.0;
-        BscBlockExecutionCtx {
+        Ok(BscBlockExecutionCtx {
             base: EthBlockExecutionCtx {
+                tx_count_hint: Some(block.body.inner.transactions.len()),
                 parent_hash: block.header.parent_hash(),
                 parent_beacon_block_root: block.header.parent_beacon_block_root,
                 ommers: &block.body.inner.ommers,
                 withdrawals: block.body.inner.withdrawals.as_ref().map(Cow::Borrowed),
+                extra_data: block.header.extra_data.clone(),
             },
             header: Some(block.header.clone()),
             is_miner: false,
-        }
+        })
     }
 
     fn tx_iterator_for_payload(
         &self,
         payload: &BscExecutionData,
-    ) -> impl ExecutableTxIterator<Self> {
-        payload.0.body.inner.transactions.clone().into_iter().map(|tx| tx.try_into_recovered())
+    ) -> Result<impl ExecutableTxIterator<Self>, Self::Error> {
+        let txs = payload.0.body.inner.transactions.clone();
+        Ok((txs, |tx: TransactionSigned| tx.try_into_recovered()))
     }
 }
 
@@ -435,7 +466,11 @@ pub fn revm_spec_by_timestamp_and_block_number(
     timestamp: u64,
     block_number: u64,
 ) -> BscHardfork {
-    if chain_spec.is_fermi_active_at_timestamp(block_number, timestamp) {
+    if chain_spec.is_mendel_active_at_timestamp(block_number, timestamp) {
+        BscHardfork::Mendel
+    } else if BscHardforks::is_osaka_active_at_timestamp(&chain_spec, block_number, timestamp) {
+        BscHardfork::Osaka
+    } else if chain_spec.is_fermi_active_at_timestamp(block_number, timestamp) {
         BscHardfork::Fermi
     } else if chain_spec.is_maxwell_active_at_timestamp(block_number, timestamp) {
         BscHardfork::Maxwell

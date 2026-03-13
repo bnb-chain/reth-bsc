@@ -1,8 +1,10 @@
 use crate::{
     chainspec::BscChainSpec,
     consensus::{
+        eip4844::should_recalculate_excess_blob_gas,
         parlia::{
             provider::EnhancedDbSnapshotProvider, util::calculate_millisecond_timestamp,
+            vote_pool,
             BscForkChoiceRule, HeaderForForkchoice, Parlia,
         },
         ParliaConsensusErr,
@@ -20,7 +22,7 @@ use reth::{
     api::FullNodeTypes,
     beacon_consensus::EthBeaconConsensus,
     builder::{components::ConsensusBuilder, BuilderContext},
-    consensus::{Consensus, ConsensusError, FullConsensus, HeaderValidator},
+    consensus::{Consensus, ConsensusError, FullConsensus, HeaderValidator, ReceiptRootBloom},
     consensus_common::validation::{
         validate_against_parent_4844, validate_against_parent_hash_number,
     },
@@ -32,6 +34,7 @@ use reth_engine_primitives::ConsensusEngineHandle;
 use reth_ethereum_primitives::Receipt;
 use reth_payload_primitives::EngineApiMessageVersion;
 use reth_primitives::{gas_spent_by_transactions, GotExpected};
+use reth_primitives_traits::constants::{GAS_LIMIT_BOUND_DIVISOR, MINIMUM_GAS_LIMIT};
 use reth_provider::{BlockNumReader, HeaderProvider};
 use std::sync::Arc;
 
@@ -44,7 +47,7 @@ impl<Node> ConsensusBuilder<Node> for BscConsensusBuilder
 where
     Node: FullNodeTypes<Types = BscNode>,
 {
-    type Consensus = Arc<dyn FullConsensus<BscPrimitives, Error = ConsensusError>>;
+    type Consensus = Arc<dyn FullConsensus<BscPrimitives>>;
 
     /// return a parlia consensus instance, automatically called by the ComponentsBuilder framework.
     async fn build_consensus(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::Consensus> {
@@ -72,6 +75,50 @@ pub struct BscConsensus<ChainSpec> {
     base: EthBeaconConsensus<ChainSpec>,
     parlia: Arc<Parlia<ChainSpec>>,
     chain_spec: Arc<ChainSpec>,
+}
+
+const GAS_LIMIT_CAPACITY: u64 = 0x7fff_ffff_ffff_ffff;
+const GAS_LIMIT_BOUND_DIVISOR_BEFORE_LORENTZ: u64 = 256;
+
+fn validate_bsc_gas_limit_against_parent<ChainSpec: BscHardforks>(
+    header: &Header,
+    parent: &Header,
+    chain_spec: &ChainSpec,
+) -> Result<(), ConsensusError> {
+    // Keep parity with go-bsc's Parlia checks.
+    if header.gas_limit > GAS_LIMIT_CAPACITY {
+        return Err(ConsensusError::Other(format!(
+            "invalid gasLimit: have {}, max {}",
+            header.gas_limit, GAS_LIMIT_CAPACITY
+        )));
+    }
+
+    if header.gas_used > header.gas_limit {
+        return Err(ConsensusError::HeaderGasUsedExceedsGasLimit {
+            gas_used: header.gas_used,
+            gas_limit: header.gas_limit,
+        });
+    }
+
+    let diff = parent.gas_limit.abs_diff(header.gas_limit);
+    let bound_divisor = if chain_spec.is_lorentz_active_at_timestamp(header.number, header.timestamp)
+    {
+        GAS_LIMIT_BOUND_DIVISOR
+    } else {
+        GAS_LIMIT_BOUND_DIVISOR_BEFORE_LORENTZ
+    };
+    let limit = parent.gas_limit / bound_divisor;
+
+    if diff >= limit || header.gas_limit < MINIMUM_GAS_LIMIT {
+        return Err(ConsensusError::Other(format!(
+            "invalid gas limit: have {}, want {} += {}",
+            header.gas_limit,
+            parent.gas_limit,
+            limit.saturating_sub(1)
+        )));
+    }
+
+    Ok(())
 }
 
 impl<ChainSpec: EthChainSpec + BscHardforks + 'static> BscConsensus<ChainSpec> {
@@ -126,6 +173,8 @@ impl<ChainSpec: EthChainSpec + BscHardforks + 'static> HeaderValidator<Header>
             });
         }
 
+        validate_bsc_gas_limit_against_parent(header.header(), parent.header(), &*self.chain_spec)?;
+
         // ensure that the blob gas fields for this block
         if BscHardforks::is_cancun_active_at_timestamp(
             &*self.chain_spec,
@@ -133,7 +182,26 @@ impl<ChainSpec: EthChainSpec + BscHardforks + 'static> HeaderValidator<Header>
             header.header().timestamp,
         ) {
             if let Some(blob_params) = self.chain_spec.blob_params_at_timestamp(header.timestamp) {
-                if let Err(err) =
+                if self.chain_spec.is_mendel_active_at_timestamp(header.number, header.timestamp)
+                    && !should_recalculate_excess_blob_gas(
+                        &*self.chain_spec,
+                        header.number,
+                        header.timestamp,
+                    )
+                {
+                    let expected = parent.header().excess_blob_gas.unwrap_or(0);
+                    let got = header
+                        .header()
+                        .excess_blob_gas
+                        .ok_or(ConsensusError::ExcessBlobGasMissing)?;
+                    if got != expected {
+                        return Err(ConsensusError::ExcessBlobGasDiff {
+                            diff: GotExpected { got, expected },
+                            parent_excess_blob_gas: expected,
+                            parent_blob_gas_used: parent.header().blob_gas_used.unwrap_or(0),
+                        });
+                    }
+                } else if let Err(err) =
                     validate_against_parent_4844(header.header(), parent.header(), blob_params)
                 {
                     tracing::warn!(
@@ -153,8 +221,6 @@ impl<ChainSpec: EthChainSpec + BscHardforks + 'static> HeaderValidator<Header>
 impl<ChainSpec: EthChainSpec<Header = Header> + BscHardforks + 'static> Consensus<BscBlock>
     for BscConsensus<ChainSpec>
 {
-    type Error = ConsensusError;
-
     /// live-sync validation.
     fn validate_body_against_header(
         &self,
@@ -184,6 +250,7 @@ impl<ChainSpec: EthChainSpec<Header = Header> + BscHardforks + 'static> FullCons
         &self,
         block: &RecoveredBlock<BscBlock>,
         result: &BlockExecutionResult<Receipt>,
+        _receipt_root_bloom: Option<ReceiptRootBloom>,
     ) -> Result<(), ConsensusError> {
         let receipts = &result.receipts;
         let requests = &result.requests;
@@ -232,6 +299,732 @@ impl<ChainSpec: EthChainSpec<Header = Header> + BscHardforks + 'static> FullCons
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::consensus::parlia::{
+        provider::SnapshotProvider, vote_pool, Snapshot, VoteAddress, VoteData, VoteEnvelope,
+        VoteSignature,
+    };
+    use crate::hardforks::bsc::BscHardfork;
+    use alloy_consensus::Header;
+    use alloy_primitives::{Address, B256};
+    use reth_chainspec::{ChainInfo, ChainSpecBuilder, ForkCondition};
+    use reth_engine_primitives::BeaconEngineMessage;
+    use reth_provider::{BlockHashReader, BlockNumReader, HeaderProvider};
+    use std::collections::HashMap;
+    use std::sync::{Arc, RwLock};
+    use tokio::sync::mpsc;
+
+    #[derive(Clone, Default)]
+    struct TestProvider;
+
+    impl BlockHashReader for TestProvider {
+        fn block_hash(&self, _number: u64) -> reth_provider::ProviderResult<Option<B256>> {
+            Ok(None)
+        }
+
+        fn canonical_hashes_range(
+            &self,
+            _start: u64,
+            _end: u64,
+        ) -> reth_provider::ProviderResult<Vec<B256>> {
+            Ok(Vec::new())
+        }
+    }
+
+    impl BlockNumReader for TestProvider {
+        fn chain_info(&self) -> reth_provider::ProviderResult<ChainInfo> {
+            Ok(ChainInfo::default())
+        }
+
+        fn best_block_number(&self) -> reth_provider::ProviderResult<u64> {
+            Ok(0)
+        }
+
+        fn last_block_number(&self) -> reth_provider::ProviderResult<u64> {
+            Ok(0)
+        }
+
+        fn block_number(&self, _hash: B256) -> reth_provider::ProviderResult<Option<u64>> {
+            Ok(None)
+        }
+    }
+
+    impl HeaderProvider for TestProvider {
+        type Header = Header;
+
+        fn header(&self, _block_hash: B256) -> reth_provider::ProviderResult<Option<Self::Header>> {
+            Ok(None)
+        }
+
+        fn header_by_number(&self, _num: u64) -> reth_provider::ProviderResult<Option<Self::Header>> {
+            Ok(None)
+        }
+
+        fn headers_range(
+            &self,
+            _range: impl core::ops::RangeBounds<u64>,
+        ) -> reth_provider::ProviderResult<Vec<Self::Header>> {
+            Ok(Vec::new())
+        }
+
+        fn sealed_header(
+            &self,
+            _number: u64,
+        ) -> reth_provider::ProviderResult<Option<reth_primitives::SealedHeader<Self::Header>>> {
+            Ok(None)
+        }
+
+        fn sealed_headers_while(
+            &self,
+            _range: impl core::ops::RangeBounds<u64>,
+            _predicate: impl FnMut(&reth_primitives::SealedHeader<Self::Header>) -> bool,
+        ) -> reth_provider::ProviderResult<Vec<reth_primitives::SealedHeader<Self::Header>>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[derive(Default)]
+    struct TestSnapshotProvider {
+        snaps: RwLock<HashMap<B256, Snapshot>>,
+    }
+
+    impl SnapshotProvider for TestSnapshotProvider {
+        fn snapshot_by_hash(&self, block_hash: &B256) -> Option<Snapshot> {
+            self.snaps.read().ok().and_then(|m| m.get(block_hash).cloned())
+        }
+
+        fn insert(&self, snapshot: Snapshot) {
+            if let Ok(mut m) = self.snaps.write() {
+                m.insert(snapshot.block_hash, snapshot);
+            }
+        }
+    }
+
+    fn test_chain_spec_with_lorentz(fork_condition: ForkCondition) -> BscChainSpec {
+        BscChainSpec::from(
+            ChainSpecBuilder::mainnet()
+                .with_fork(BscHardfork::Lorentz, fork_condition)
+                .build(),
+        )
+    }
+
+    const LONDON_ACTIVE_BLOCK: u64 = 20_000_000;
+
+    #[test]
+    fn gas_limit_validation_enforces_capacity_and_gas_used_bounds() {
+        let chain_spec = test_chain_spec_with_lorentz(ForkCondition::Timestamp(u64::MAX));
+        let parent = Header {
+            number: LONDON_ACTIVE_BLOCK,
+            timestamp: 1,
+            gas_limit: 30_000_000,
+            ..Default::default()
+        };
+
+        let over_capacity = Header {
+            number: LONDON_ACTIVE_BLOCK + 1,
+            timestamp: 2,
+            gas_limit: GAS_LIMIT_CAPACITY + 1,
+            gas_used: 0,
+            ..Default::default()
+        };
+        assert!(validate_bsc_gas_limit_against_parent(&over_capacity, &parent, &chain_spec).is_err());
+
+        let gas_used_over_limit = Header {
+            number: LONDON_ACTIVE_BLOCK + 1,
+            timestamp: 2,
+            gas_limit: 30_000_000,
+            gas_used: 30_000_001,
+            ..Default::default()
+        };
+        assert!(matches!(
+            validate_bsc_gas_limit_against_parent(&gas_used_over_limit, &parent, &chain_spec),
+            Err(ConsensusError::HeaderGasUsedExceedsGasLimit { .. })
+        ));
+    }
+
+    #[test]
+    fn gas_limit_validation_uses_pre_lorentz_divisor_256() {
+        let chain_spec = test_chain_spec_with_lorentz(ForkCondition::Timestamp(u64::MAX));
+        let parent = Header {
+            number: LONDON_ACTIVE_BLOCK,
+            timestamp: 1,
+            gas_limit: 30_000_000,
+            ..Default::default()
+        };
+        let pre_lorentz_limit = parent.gas_limit / 256;
+
+        let invalid = Header {
+            number: LONDON_ACTIVE_BLOCK + 1,
+            timestamp: 2,
+            gas_limit: parent.gas_limit + pre_lorentz_limit,
+            gas_used: 0,
+            ..Default::default()
+        };
+        assert!(validate_bsc_gas_limit_against_parent(&invalid, &parent, &chain_spec).is_err());
+
+        let valid = Header {
+            number: LONDON_ACTIVE_BLOCK + 1,
+            timestamp: 2,
+            gas_limit: parent.gas_limit + pre_lorentz_limit - 1,
+            gas_used: 0,
+            ..Default::default()
+        };
+        assert!(validate_bsc_gas_limit_against_parent(&valid, &parent, &chain_spec).is_ok());
+    }
+
+    #[test]
+    fn gas_limit_validation_uses_lorentz_divisor_1024() {
+        let chain_spec = test_chain_spec_with_lorentz(ForkCondition::Timestamp(0));
+        let parent = Header {
+            number: LONDON_ACTIVE_BLOCK,
+            timestamp: 1,
+            gas_limit: 30_000_000,
+            ..Default::default()
+        };
+        let lorentz_limit = parent.gas_limit / GAS_LIMIT_BOUND_DIVISOR;
+
+        let invalid = Header {
+            number: LONDON_ACTIVE_BLOCK + 1,
+            timestamp: 2,
+            gas_limit: parent.gas_limit + lorentz_limit,
+            gas_used: 0,
+            ..Default::default()
+        };
+        assert!(validate_bsc_gas_limit_against_parent(&invalid, &parent, &chain_spec).is_err());
+
+        let valid = Header {
+            number: LONDON_ACTIVE_BLOCK + 1,
+            timestamp: 2,
+            gas_limit: parent.gas_limit + lorentz_limit - 1,
+            gas_used: 0,
+            ..Default::default()
+        };
+        assert!(validate_bsc_gas_limit_against_parent(&valid, &parent, &chain_spec).is_ok());
+    }
+
+    #[test]
+    fn gas_limit_validation_enforces_minimum_limit() {
+        let chain_spec = test_chain_spec_with_lorentz(ForkCondition::Timestamp(0));
+        let parent = Header {
+            number: LONDON_ACTIVE_BLOCK,
+            timestamp: 1,
+            gas_limit: 30_000_000,
+            ..Default::default()
+        };
+        let invalid = Header {
+            number: LONDON_ACTIVE_BLOCK + 1,
+            timestamp: 2,
+            gas_limit: MINIMUM_GAS_LIMIT - 1,
+            gas_used: 0,
+            ..Default::default()
+        };
+        assert!(validate_bsc_gas_limit_against_parent(&invalid, &parent, &chain_spec).is_err());
+    }
+
+    #[test]
+    fn finalized_uses_vote_pool_quorum_for_head_child() {
+        vote_pool::drain();
+
+        let chain_spec = Arc::new(BscChainSpec::from(
+            ChainSpecBuilder::mainnet()
+                .with_fork(BscHardfork::Plato, ForkCondition::Block(0))
+                .build(),
+        ));
+
+        let (tx, _rx) =
+            mpsc::unbounded_channel::<BeaconEngineMessage<BscPayloadTypes>>();
+        let engine = BscForkChoiceEngine::new(
+            TestProvider,
+            ConsensusEngineHandle::new(tx),
+            chain_spec,
+        );
+
+        let parent = Header { number: 9, timestamp: 1, ..Default::default() };
+        let parent_hash = parent.hash_slow();
+
+        let head = Header {
+            number: 10,
+            timestamp: 2,
+            parent_hash,
+            ..Default::default()
+        };
+        let head_hash = head.hash_slow();
+
+        let fallback_hash = B256::from([7u8; 32]);
+        let validators = vec![
+            Address::from([1u8; 20]),
+            Address::from([2u8; 20]),
+            Address::from([3u8; 20]),
+        ];
+
+        let mut snap = Snapshot::new(validators.clone(), head.number, head_hash, 200, None);
+        snap.vote_data = VoteData {
+            source_number: 7,
+            source_hash: fallback_hash,
+            target_number: 9,
+            target_hash: parent_hash,
+        };
+
+        // Parent snapshot used for quorum calculation
+        let parent_snap = Snapshot::new(validators, parent.number, parent_hash, 200, None);
+
+        let provider: Arc<dyn SnapshotProvider + Send + Sync> =
+            if let Some(existing) = crate::shared::get_snapshot_provider() {
+                existing.clone()
+            } else {
+                let p: Arc<dyn SnapshotProvider + Send + Sync> =
+                    Arc::new(TestSnapshotProvider::default());
+                let _ = crate::shared::set_snapshot_provider(p.clone());
+                p
+            };
+        provider.insert(snap);
+        provider.insert(parent_snap);
+
+        let baseline = engine.get_finalized_number_and_hash(&head).unwrap();
+        assert_eq!(baseline, (7, fallback_hash));
+
+        let vote_data = VoteData {
+            source_number: 9,
+            source_hash: parent_hash,
+            target_number: 10,
+            target_hash: head_hash,
+        };
+        let vote1 = VoteEnvelope {
+            vote_address: VoteAddress::from([1u8; 48]),
+            signature: VoteSignature::default(),
+            data: vote_data,
+        };
+        let vote2 = VoteEnvelope {
+            vote_address: VoteAddress::from([2u8; 48]),
+            signature: VoteSignature::default(),
+            data: vote_data,
+        };
+
+        vote_pool::put_vote(vote1);
+        vote_pool::put_vote(vote2);
+
+        let finalized = engine.get_finalized_number_and_hash(&head).unwrap();
+        assert_eq!(finalized, (9, parent_hash));
+
+        vote_pool::drain();
+    }
+
+    #[test]
+    fn finalized_requires_quorum_not_reached_with_one_vote() {
+        // With 3 validators, quorum is ceil(3 * 2 / 3) = 2
+        // Only 1 vote should NOT advance finality
+        vote_pool::drain();
+
+        let chain_spec = Arc::new(BscChainSpec::from(
+            ChainSpecBuilder::mainnet()
+                .with_fork(BscHardfork::Plato, ForkCondition::Block(0))
+                .build(),
+        ));
+
+        let (tx, _rx) = mpsc::unbounded_channel::<BeaconEngineMessage<BscPayloadTypes>>();
+        let engine = BscForkChoiceEngine::new(
+            TestProvider,
+            ConsensusEngineHandle::new(tx),
+            chain_spec,
+        );
+
+        let parent = Header { number: 9, timestamp: 1, ..Default::default() };
+        let parent_hash = parent.hash_slow();
+
+        let head = Header {
+            number: 10,
+            timestamp: 2,
+            parent_hash,
+            ..Default::default()
+        };
+        let head_hash = head.hash_slow();
+
+        let fallback_hash = B256::from([7u8; 32]);
+        let validators = vec![
+            Address::from([1u8; 20]),
+            Address::from([2u8; 20]),
+            Address::from([3u8; 20]),
+        ];
+        let mut snap = Snapshot::new(validators.clone(), head.number, head_hash, 200, None);
+        snap.vote_data = VoteData {
+            source_number: 7,
+            source_hash: fallback_hash,
+            target_number: 9,
+            target_hash: parent_hash,
+        };
+
+        let parent_snap = Snapshot::new(validators, parent.number, parent_hash, 200, None);
+
+        let provider: Arc<dyn SnapshotProvider + Send + Sync> =
+            if let Some(existing) = crate::shared::get_snapshot_provider() {
+                existing.clone()
+            } else {
+                let p: Arc<dyn SnapshotProvider + Send + Sync> =
+                    Arc::new(TestSnapshotProvider::default());
+                let _ = crate::shared::set_snapshot_provider(p.clone());
+                p
+            };
+        provider.insert(snap);
+        provider.insert(parent_snap);
+
+        // Add only ONE vote (quorum requires 2)
+        let vote_data = VoteData {
+            source_number: 9,
+            source_hash: parent_hash,
+            target_number: 10,
+            target_hash: head_hash,
+        };
+        let vote1 = VoteEnvelope {
+            vote_address: VoteAddress::from([1u8; 48]),
+            signature: VoteSignature::default(),
+            data: vote_data,
+        };
+        vote_pool::put_vote(vote1);
+
+        // Finality should NOT advance - still returns fallback
+        let finalized = engine.get_finalized_number_and_hash(&head).unwrap();
+        assert_eq!(finalized, (7, fallback_hash), "1 vote should not reach quorum of 2");
+
+        vote_pool::drain();
+    }
+
+    #[test]
+    fn finalized_ignores_votes_with_wrong_source_number() {
+        vote_pool::drain();
+
+        let chain_spec = Arc::new(BscChainSpec::from(
+            ChainSpecBuilder::mainnet()
+                .with_fork(BscHardfork::Plato, ForkCondition::Block(0))
+                .build(),
+        ));
+
+        let (tx, _rx) = mpsc::unbounded_channel::<BeaconEngineMessage<BscPayloadTypes>>();
+        let engine = BscForkChoiceEngine::new(
+            TestProvider,
+            ConsensusEngineHandle::new(tx),
+            chain_spec,
+        );
+
+        let parent = Header { number: 9, timestamp: 1, ..Default::default() };
+        let parent_hash = parent.hash_slow();
+
+        let head = Header {
+            number: 10,
+            timestamp: 2,
+            parent_hash,
+            ..Default::default()
+        };
+        let head_hash = head.hash_slow();
+
+        let fallback_hash = B256::from([7u8; 32]);
+        let validators = vec![
+            Address::from([1u8; 20]),
+            Address::from([2u8; 20]),
+            Address::from([3u8; 20]),
+        ];
+        let mut snap = Snapshot::new(validators.clone(), head.number, head_hash, 200, None);
+        snap.vote_data = VoteData {
+            source_number: 7,
+            source_hash: fallback_hash,
+            target_number: 9,
+            target_hash: parent_hash,
+        };
+
+        let parent_snap = Snapshot::new(validators, parent.number, parent_hash, 200, None);
+
+        let provider: Arc<dyn SnapshotProvider + Send + Sync> =
+            if let Some(existing) = crate::shared::get_snapshot_provider() {
+                existing.clone()
+            } else {
+                let p: Arc<dyn SnapshotProvider + Send + Sync> =
+                    Arc::new(TestSnapshotProvider::default());
+                let _ = crate::shared::set_snapshot_provider(p.clone());
+                p
+            };
+        provider.insert(snap);
+        provider.insert(parent_snap);
+
+        // Add votes with WRONG source_number (8 instead of 9)
+        let wrong_vote_data = VoteData {
+            source_number: 8, // Wrong! Should be 9 (current_justified_number)
+            source_hash: parent_hash,
+            target_number: 10,
+            target_hash: head_hash,
+        };
+        let vote1 = VoteEnvelope {
+            vote_address: VoteAddress::from([1u8; 48]),
+            signature: VoteSignature::default(),
+            data: wrong_vote_data,
+        };
+        let vote2 = VoteEnvelope {
+            vote_address: VoteAddress::from([2u8; 48]),
+            signature: VoteSignature::default(),
+            data: wrong_vote_data,
+        };
+        vote_pool::put_vote(vote1);
+        vote_pool::put_vote(vote2);
+
+        // Finality should NOT advance - votes have wrong source
+        let finalized = engine.get_finalized_number_and_hash(&head).unwrap();
+        assert_eq!(finalized, (7, fallback_hash), "votes with wrong source should be ignored");
+
+        vote_pool::drain();
+    }
+
+    #[test]
+    fn finalized_ignores_votes_with_wrong_target_number() {
+        vote_pool::drain();
+
+        let chain_spec = Arc::new(BscChainSpec::from(
+            ChainSpecBuilder::mainnet()
+                .with_fork(BscHardfork::Plato, ForkCondition::Block(0))
+                .build(),
+        ));
+
+        let (tx, _rx) = mpsc::unbounded_channel::<BeaconEngineMessage<BscPayloadTypes>>();
+        let engine = BscForkChoiceEngine::new(
+            TestProvider,
+            ConsensusEngineHandle::new(tx),
+            chain_spec,
+        );
+
+        let parent = Header { number: 9, timestamp: 1, ..Default::default() };
+        let parent_hash = parent.hash_slow();
+
+        let head = Header {
+            number: 10,
+            timestamp: 2,
+            parent_hash,
+            ..Default::default()
+        };
+        let head_hash = head.hash_slow();
+
+        let fallback_hash = B256::from([7u8; 32]);
+        let validators = vec![
+            Address::from([1u8; 20]),
+            Address::from([2u8; 20]),
+            Address::from([3u8; 20]),
+        ];
+        let mut snap = Snapshot::new(validators.clone(), head.number, head_hash, 200, None);
+        snap.vote_data = VoteData {
+            source_number: 7,
+            source_hash: fallback_hash,
+            target_number: 9,
+            target_hash: parent_hash,
+        };
+
+        let parent_snap = Snapshot::new(validators, parent.number, parent_hash, 200, None);
+
+        let provider: Arc<dyn SnapshotProvider + Send + Sync> =
+            if let Some(existing) = crate::shared::get_snapshot_provider() {
+                existing.clone()
+            } else {
+                let p: Arc<dyn SnapshotProvider + Send + Sync> =
+                    Arc::new(TestSnapshotProvider::default());
+                let _ = crate::shared::set_snapshot_provider(p.clone());
+                p
+            };
+        provider.insert(snap);
+        provider.insert(parent_snap);
+
+        // Add votes with WRONG target_number (11 instead of 10)
+        let wrong_vote_data = VoteData {
+            source_number: 9,
+            source_hash: parent_hash,
+            target_number: 11, // Wrong! Should be 10 (head.number)
+            target_hash: head_hash,
+        };
+        let vote1 = VoteEnvelope {
+            vote_address: VoteAddress::from([1u8; 48]),
+            signature: VoteSignature::default(),
+            data: wrong_vote_data,
+        };
+        let vote2 = VoteEnvelope {
+            vote_address: VoteAddress::from([2u8; 48]),
+            signature: VoteSignature::default(),
+            data: wrong_vote_data,
+        };
+        vote_pool::put_vote(vote1);
+        vote_pool::put_vote(vote2);
+
+        // Finality should NOT advance - votes have wrong target
+        let finalized = engine.get_finalized_number_and_hash(&head).unwrap();
+        assert_eq!(finalized, (7, fallback_hash), "votes with wrong target should be ignored");
+
+        vote_pool::drain();
+    }
+
+    #[test]
+    fn finalized_no_advance_when_head_not_direct_child_of_justified() {
+        // BEP-648 requires head.number - 1 == current_justified_number
+        // If there's a gap, finality should not advance via vote pool
+        vote_pool::drain();
+
+        let chain_spec = Arc::new(BscChainSpec::from(
+            ChainSpecBuilder::mainnet()
+                .with_fork(BscHardfork::Plato, ForkCondition::Block(0))
+                .build(),
+        ));
+
+        let (tx, _rx) = mpsc::unbounded_channel::<BeaconEngineMessage<BscPayloadTypes>>();
+        let engine = BscForkChoiceEngine::new(
+            TestProvider,
+            ConsensusEngineHandle::new(tx),
+            chain_spec,
+        );
+
+        // Head is at 12
+        let head = Header { number: 12, timestamp: 2, ..Default::default() };
+        let head_hash = head.hash_slow();
+
+        let fallback_hash = B256::from([7u8; 32]);
+        let validators = vec![
+            Address::from([1u8; 20]),
+            Address::from([2u8; 20]),
+            Address::from([3u8; 20]),
+        ];
+        let mut snap = Snapshot::new(validators, head.number, head_hash, 200, None);
+        snap.vote_data = VoteData {
+            source_number: 7,
+            source_hash: fallback_hash,
+            target_number: 9, // Justified is at 9, but head is at 12 (gap of 2)
+            target_hash: B256::from([9u8; 32]),
+        };
+
+        let provider: Arc<dyn SnapshotProvider + Send + Sync> =
+            if let Some(existing) = crate::shared::get_snapshot_provider() {
+                existing.clone()
+            } else {
+                let p: Arc<dyn SnapshotProvider + Send + Sync> =
+                    Arc::new(TestSnapshotProvider::default());
+                let _ = crate::shared::set_snapshot_provider(p.clone());
+                p
+            };
+        provider.insert(snap);
+
+        // Add valid votes for head
+        let vote_data = VoteData {
+            source_number: 9,
+            source_hash: B256::from([9u8; 32]),
+            target_number: 12,
+            target_hash: head_hash,
+        };
+        let vote1 = VoteEnvelope {
+            vote_address: VoteAddress::from([1u8; 48]),
+            signature: VoteSignature::default(),
+            data: vote_data,
+        };
+        let vote2 = VoteEnvelope {
+            vote_address: VoteAddress::from([2u8; 48]),
+            signature: VoteSignature::default(),
+            data: vote_data,
+        };
+        vote_pool::put_vote(vote1);
+        vote_pool::put_vote(vote2);
+
+        // Finality should NOT advance because head.number - 1 (11) != current_justified_number (9)
+        let finalized = engine.get_finalized_number_and_hash(&head).unwrap();
+        assert_eq!(finalized, (7, fallback_hash), "should not advance when head is not direct child");
+
+        vote_pool::drain();
+    }
+
+    #[test]
+    fn finalized_with_larger_validator_set() {
+        // Test with 21 validators (typical BSC validator set)
+        // Quorum = ceil(21 * 2 / 3) = 14
+        vote_pool::drain();
+
+        let chain_spec = Arc::new(BscChainSpec::from(
+            ChainSpecBuilder::mainnet()
+                .with_fork(BscHardfork::Plato, ForkCondition::Block(0))
+                .build(),
+        ));
+
+        let (tx, _rx) = mpsc::unbounded_channel::<BeaconEngineMessage<BscPayloadTypes>>();
+        let engine = BscForkChoiceEngine::new(
+            TestProvider,
+            ConsensusEngineHandle::new(tx),
+            chain_spec,
+        );
+
+        let parent = Header { number: 99, timestamp: 1, ..Default::default() };
+        let parent_hash = parent.hash_slow();
+
+        let head = Header {
+            number: 100,
+            timestamp: 2,
+            parent_hash,
+            ..Default::default()
+        };
+        let head_hash = head.hash_slow();
+
+        let fallback_hash = B256::from([7u8; 32]);
+
+        // 21 validators
+        let validators: Vec<Address> = (1..=21)
+            .map(|i| Address::from([i as u8; 20]))
+            .collect();
+
+        let mut snap = Snapshot::new(validators.clone(), head.number, head_hash, 200, None);
+        snap.vote_data = VoteData {
+            source_number: 97,
+            source_hash: fallback_hash,
+            target_number: 99,
+            target_hash: parent_hash,
+        };
+
+        let parent_snap = Snapshot::new(validators, parent.number, parent_hash, 200, None);
+
+        let provider: Arc<dyn SnapshotProvider + Send + Sync> =
+            if let Some(existing) = crate::shared::get_snapshot_provider() {
+                existing.clone()
+            } else {
+                let p: Arc<dyn SnapshotProvider + Send + Sync> =
+                    Arc::new(TestSnapshotProvider::default());
+                let _ = crate::shared::set_snapshot_provider(p.clone());
+                p
+            };
+        provider.insert(snap);
+        provider.insert(parent_snap);
+
+        let vote_data = VoteData {
+            source_number: 99,
+            source_hash: parent_hash,
+            target_number: 100,
+            target_hash: head_hash,
+        };
+
+        // Add 13 votes (not enough, quorum is 14)
+        for i in 1..=13 {
+            let vote = VoteEnvelope {
+                vote_address: VoteAddress::from([i as u8; 48]),
+                signature: VoteSignature::default(),
+                data: vote_data,
+            };
+            vote_pool::put_vote(vote);
+        }
+
+        let finalized = engine.get_finalized_number_and_hash(&head).unwrap();
+        assert_eq!(finalized, (97, fallback_hash), "13 votes should not reach quorum of 14");
+
+        // Add 14th vote to reach quorum
+        let vote14 = VoteEnvelope {
+            vote_address: VoteAddress::from([14u8; 48]),
+            signature: VoteSignature::default(),
+            data: vote_data,
+        };
+        vote_pool::put_vote(vote14);
+
+        let finalized = engine.get_finalized_number_and_hash(&head).unwrap();
+        assert_eq!(finalized, (99, parent_hash), "14 votes should reach quorum");
+
+        vote_pool::drain();
     }
 }
 
@@ -342,7 +1135,7 @@ pub struct BscForkChoiceEngine<P> {
 
 impl<P> BscForkChoiceEngine<P>
 where
-    P: BlockNumReader + HeaderProvider<Header = Header> + Clone,
+    P: BlockNumReader + HeaderProvider<Header = Header> + Clone + Send + Sync,
 {
     /// Creates a new `BscForkChoiceEngine` instance.
     pub fn new(
@@ -501,6 +1294,21 @@ where
     ) -> Result<bool, ParliaConsensusErr> {
         let (incoming_td, current_td) =
             self.header_td_fcu(&self.engine_handle, incoming_header, current_header).await?;
+
+        // Ensure monotonic TD when incoming is a direct child of current.
+        let incoming_td = if incoming_header.parent_hash == current_header.hash_slow() {
+            if let (Some(in_td), Some(cur_td)) = (incoming_td, current_td) {
+                if in_td <= cur_td {
+                    Some(cur_td + incoming_header.difficulty)
+                } else {
+                    Some(in_td)
+                }
+            } else {
+                incoming_td
+            }
+        } else {
+            incoming_td
+        };
         let incoming_justified_num =
             self.get_justified_number_and_hash(incoming_header).map(|(num, _)| num).unwrap_or(0);
         let current_justified_num =
@@ -544,7 +1352,41 @@ where
         let sp = shared::get_snapshot_provider()?;
 
         match sp.snapshot_by_hash(&header.hash_slow()) {
-            Some(snap) => Some((snap.vote_data.source_number, snap.vote_data.source_hash)),
+            Some(snap) => {
+                let current_justified_number = snap.vote_data.target_number;
+                let current_justified_hash = snap.vote_data.target_hash;
+
+                if header.number > 0 && header.number - 1 == current_justified_number {
+                    // Use parent snapshot for quorum calculation to avoid
+                    // incorrect thresholds during epoch validator-set transitions.
+                    if let Some(parent_snap) = sp.snapshot_by_hash(&header.parent_hash) {
+                        if !parent_snap.validators.is_empty() {
+                            let quorum =
+                                usize::div_ceil(parent_snap.validators.len() * 2, 3);
+                            let eligible_votes =
+                                vote_pool::fetch_vote_by_block_hash(header.hash_slow())
+                                    .into_iter()
+                                    .filter(|vote| {
+                                        vote.data.source_number == current_justified_number
+                                            && vote.data.target_number == header.number
+                                    })
+                                    .count();
+                            if eligible_votes >= quorum {
+                                return Some((current_justified_number, current_justified_hash));
+                            }
+                        }
+                    } else {
+                        tracing::error!(
+                            target: "bsc::forkchoice",
+                            parent_hash = ?header.parent_hash,
+                            block_number = header.number,
+                            "Failed to get parent snapshot for finality check"
+                        );
+                    }
+                }
+
+                Some((snap.vote_data.source_number, snap.vote_data.source_hash))
+            }
             None => {
                 tracing::warn!(
                     target: "bsc::forkchoice",

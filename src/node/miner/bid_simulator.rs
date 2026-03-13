@@ -1,5 +1,5 @@
 use crate::chainspec::BscChainSpec;
-use crate::consensus::eip4844::calc_blob_fee;
+use crate::consensus::eip4844::{calc_blob_fee, is_blob_eligible_block};
 use crate::consensus::parlia::provider::SnapshotProvider;
 use crate::consensus::parlia::Snapshot;
 use crate::hardforks::BscHardforks;
@@ -10,7 +10,6 @@ use crate::node::miner::payload::DELAY_LEFT_OVER;
 use crate::node::miner::util::prepare_new_attributes;
 use crate::node::primitives::BscBlobTransactionSidecar;
 use alloy_consensus::BlobTransactionSidecar;
-use alloy_consensus::BlockHeader;
 use alloy_consensus::Transaction;
 use alloy_evm::Evm;
 use alloy_primitives::U256;
@@ -18,22 +17,23 @@ use alloy_primitives::{Address, B256};
 use parking_lot::RwLock;
 use reth::payload::EthPayloadBuilderAttributes;
 use reth::transaction_pool::BestTransactionsAttributes;
-use reth_chain_state::{ExecutedBlock, ExecutedTrieUpdates};
 use reth_chainspec::EthChainSpec;
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
 use reth_evm::execute::BlockBuilder;
 use reth_evm::execute::BlockBuilderOutcome;
-use reth_evm::execute::ExecutionOutcome;
 use reth_evm::execute::{BlockExecutionError, BlockValidationError};
 use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
+use reth_execution_types::BlockExecutionOutput;
 use reth_payload_primitives::PayloadBuilderAttributes;
-use reth_payload_primitives::PayloadBuilderError;
+use reth_payload_primitives::{BuiltPayloadExecutedBlock, PayloadBuilderError};
 use reth_primitives::SealedHeader;
 use reth_primitives::TransactionSigned;
 use reth_primitives_traits::SignerRecoverable;
 use reth_provider::StateProviderFactory;
 use reth_provider::{BlockHashReader, HeaderProvider};
 use reth_revm::{database::StateProviderDatabase, db::State};
+use revm::context_interface::block::Block;
+use either::Either;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -167,7 +167,7 @@ where
         }
 
         let parent_hash = bid.parent_hash;
-        let parent_header = match self.client.header(&parent_hash) {
+        let parent_header = match self.client.header(parent_hash) {
             Ok(Some(header)) => {
                 let hash = header.hash_slow();
                 SealedHeader::new(header, hash)
@@ -399,6 +399,7 @@ where
                     gas_limit,
                     parent_beacon_block_root: attributes.parent_beacon_block_root(),
                     withdrawals: Some(attributes.withdrawals().clone()),
+                    extra_data: builder_config.extra_data.clone(),
                 },
             )
             .map_err(PayloadBuilderError::other)
@@ -410,7 +411,7 @@ where
             }
         };
         let mut block_gas_limit: u64 =
-            builder.evm_mut().block().gas_limit.saturating_sub(system_txs_gas);
+            builder.evm_mut().block().gas_limit().saturating_sub(system_txs_gas);
         block_gas_limit = block_gas_limit.saturating_sub(PAY_BID_TX_GAS_LIMIT);
 
         // todo: prefetch transactions
@@ -541,22 +542,21 @@ where
         plain.body.sidecars = Some(bid_runtime.blob_sidecars.clone());
         sealed_block = Arc::new(plain.into());
 
-        bid_runtime.bsc_payload = BscBuiltPayload {
+        let requests = execution_result.requests.clone();
+        let execution_outcome = BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
+        let executed: BuiltPayloadExecutedBlock<_> = BuiltPayloadExecutedBlock {
+            recovered_block: Arc::new(block),
+            execution_output: Arc::new(execution_outcome),
+            hashed_state: Either::Left(Arc::new(hashed_state)),
+            trie_updates: Either::Left(Arc::new(trie_updates)),
+        };
+
+        bid_runtime.bsc_payload = Some(BscBuiltPayload {
             block: sealed_block.clone(),
             fees: bid_runtime.gas_fee,
-            requests: Some(execution_result.requests.clone()),
-            executed_block: ExecutedBlock {
-                recovered_block: Arc::new(block.clone()),
-                execution_output: Arc::new(ExecutionOutcome::new(
-                    db.take_bundle(),
-                    vec![execution_result.receipts.clone()],
-                    sealed_block.header().number(),
-                    vec![execution_result.requests.clone()],
-                )),
-                hashed_state: Arc::new(hashed_state.clone()),
-            },
-            executed_trie: Some(ExecutedTrieUpdates::Present(Arc::new(trie_updates))),
-        };
+            requests: Some(requests),
+            executed_block: executed,
+        });
 
         // Acquire write lock to update best_bid
         {
@@ -639,7 +639,7 @@ pub struct BidRuntime<Pool, EvmConfig = BscEvmConfig> {
     attributes: EthPayloadBuilderAttributes,
     builder_config: EthereumBuilderConfig,
     chain_spec: Arc<BscChainSpec>,
-    pub bsc_payload: BscBuiltPayload,
+    pub bsc_payload: Option<BscBuiltPayload>,
 
     gas_used: u64,
     gas_fee: U256,
@@ -679,7 +679,7 @@ where
             pool,
             evm_config,
             builder_config: EthereumBuilderConfig::default(),
-            bsc_payload: BscBuiltPayload::default(),
+            bsc_payload: None,
             expected_block_reward: U256::ZERO,
             expected_validator_reward: U256::ZERO,
             packed_block_reward: U256::ZERO,
@@ -739,10 +739,15 @@ where
         B: BlockBuilder,
         B::Primitives: reth_primitives_traits::NodePrimitives<SignedTx = TransactionSigned>,
     {
-        let base_fee: u64 = builder.evm().block().basefee;
+        let base_fee: u64 = builder.evm().block().basefee();
         let blob_params = self.chain_spec.blob_params_at_timestamp(self.attributes.timestamp());
-        let max_blob_count =
+        let header = self.mining_ctx.header.as_ref().unwrap();
+        let blob_eligible = is_blob_eligible_block(&self.chain_spec, header.number, header.timestamp);
+        let mut max_blob_count =
             blob_params.as_ref().map(|params| params.max_blob_count).unwrap_or_default();
+        if !blob_eligible {
+            max_blob_count = 0;
+        }
 
         let start_time = std::time::Instant::now();
         let delay_duration = std::time::Duration::from_millis(delay_ms);
@@ -766,6 +771,12 @@ where
             }
             let is_blob_tx = recovered_tx.is_eip4844();
             let tx_hash = *recovered_tx.hash();
+            if is_blob_tx && !blob_eligible {
+                if from_pool {
+                    continue;
+                }
+                return Err("blob transactions not allowed in this block".into());
+            }
             if from_pool {
                 // ensure we still have capacity for this transaction
                 if self.gas_used + recovered_tx.gas_limit() > block_gas_limit {
@@ -889,7 +900,7 @@ where
         B: BlockBuilder,
         B::Primitives: reth_primitives_traits::NodePrimitives<SignedTx = TransactionSigned>,
     {
-        let base_fee = builder.evm_mut().block().basefee;
+        let base_fee = builder.evm_mut().block().basefee();
         let mut blob_fee = None;
 
         if BscHardforks::is_cancun_active_at_timestamp(

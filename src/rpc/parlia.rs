@@ -527,7 +527,7 @@ mod tests {
 
         fn header(
             &self,
-            _block_hash: &alloy_primitives::BlockHash,
+            _block_hash: alloy_primitives::BlockHash,
         ) -> ProviderResult<Option<Self::Header>> {
             Ok(None)
         }

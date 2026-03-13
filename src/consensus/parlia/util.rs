@@ -85,19 +85,18 @@ pub fn encode_header_with_chain_id(header: &Header, out: &mut dyn BufMut, chain_
     Encodable::encode(&header.mix_hash, out);
     Encodable::encode(&header.nonce, out);
 
-    if header.parent_beacon_block_root.is_some() &&
-        header.parent_beacon_block_root.unwrap() == B256::default()
-    {
-        Encodable::encode(&U256::from(header.base_fee_per_gas.unwrap()), out);
-        Encodable::encode(&header.withdrawals_root.unwrap(), out);
-        Encodable::encode(&header.blob_gas_used.unwrap(), out);
-        Encodable::encode(&header.excess_blob_gas.unwrap(), out);
-        Encodable::encode(&header.parent_beacon_block_root.unwrap(), out);
-        // https://github.com/bnb-chain/BEPs/blob/master/BEPs/BEP-466.md
-        if header.requests_hash.is_some() {
-            Encodable::encode(&header.requests_hash.unwrap(), out);
+    if let Some(parent_beacon_block_root) = header.parent_beacon_block_root {
+        if parent_beacon_block_root == B256::default() {
+            Encodable::encode(&U256::from(header.base_fee_per_gas.unwrap()), out);
+            Encodable::encode(&header.withdrawals_root.unwrap(), out);
+            Encodable::encode(&header.blob_gas_used.unwrap(), out);
+            Encodable::encode(&header.excess_blob_gas.unwrap(), out);
+            Encodable::encode(&parent_beacon_block_root, out);
+            // https://github.com/bnb-chain/BEPs/blob/master/BEPs/BEP-466.md
+            if let Some(requests_hash) = header.requests_hash {
+                Encodable::encode(&requests_hash, out);
+            }
         }
-        
     }
 }
 
@@ -123,17 +122,17 @@ fn rlp_header(header: &Header, chain_id: u64) -> alloy_rlp::Header {
     rlp_head.payload_length += header.mix_hash.length(); // mix_hash
     rlp_head.payload_length += header.nonce.length(); // nonce
 
-    if header.parent_beacon_block_root.is_some() &&
-        header.parent_beacon_block_root.unwrap() == B256::default()
-    {
-        rlp_head.payload_length += U256::from(header.base_fee_per_gas.unwrap()).length();
-        rlp_head.payload_length += header.withdrawals_root.unwrap().length();
-        rlp_head.payload_length += header.blob_gas_used.unwrap().length();
-        rlp_head.payload_length += header.excess_blob_gas.unwrap().length();
-        rlp_head.payload_length += header.parent_beacon_block_root.unwrap().length();
-        // https://github.com/bnb-chain/BEPs/blob/master/BEPs/BEP-466.md
-        if header.requests_hash.is_some() {
-            rlp_head.payload_length += header.requests_hash.unwrap().length();
+    if let Some(parent_beacon_block_root) = header.parent_beacon_block_root {
+        if parent_beacon_block_root == B256::default() {
+            rlp_head.payload_length += U256::from(header.base_fee_per_gas.unwrap()).length();
+            rlp_head.payload_length += header.withdrawals_root.unwrap().length();
+            rlp_head.payload_length += header.blob_gas_used.unwrap().length();
+            rlp_head.payload_length += header.excess_blob_gas.unwrap().length();
+            rlp_head.payload_length += parent_beacon_block_root.length();
+            // https://github.com/bnb-chain/BEPs/blob/master/BEPs/BEP-466.md
+            if let Some(requests_hash) = header.requests_hash {
+                rlp_head.payload_length += requests_hash.length();
+            }
         }
     }
     rlp_head

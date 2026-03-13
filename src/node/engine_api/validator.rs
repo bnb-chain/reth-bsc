@@ -2,7 +2,7 @@ use super::payload::BscPayloadTypes;
 use crate::{chainspec::BscChainSpec, hardforks::BscHardforks, BscBlock, BscPrimitives};
 use alloy_consensus::BlockHeader;
 use alloy_eips::eip4895::Withdrawal;
-use alloy_primitives::B256;
+use alloy_primitives::{Bytes, B256};
 use alloy_rpc_types_engine::PayloadError;
 use reth::{
     api::{FullNodeComponents, NodeTypes},
@@ -73,6 +73,10 @@ impl ExecutionPayload for BscExecutionData {
         None
     }
 
+    fn block_access_list(&self) -> Option<&Bytes> {
+        None
+    }
+
     fn parent_beacon_block_root(&self) -> Option<B256> {
         None
     }
@@ -84,17 +88,27 @@ impl ExecutionPayload for BscExecutionData {
     fn gas_used(&self) -> u64 {
         self.0.header.gas_used()
     }
+
+    fn transaction_count(&self) -> usize {
+        self.0.body.inner.transactions.len()
+    }
 }
 
 impl PayloadValidator<BscPayloadTypes> for BscEngineValidator {
     type Block = BscBlock;
 
+    fn convert_payload_to_block(
+        &self,
+        payload: BscExecutionData,
+    ) -> Result<SealedBlock<Self::Block>, NewPayloadError> {
+        self.inner.ensure_well_formed_payload(payload).map_err(NewPayloadError::other)
+    }
+
     fn ensure_well_formed_payload(
         &self,
         payload: BscExecutionData,
     ) -> Result<RecoveredBlock<Self::Block>, NewPayloadError> {
-        let sealed_block =
-            self.inner.ensure_well_formed_payload(payload).map_err(NewPayloadError::other)?;
+        let sealed_block = self.convert_payload_to_block(payload)?;
         sealed_block.try_recover().map_err(|e| NewPayloadError::Other(e.into()))
     }
 

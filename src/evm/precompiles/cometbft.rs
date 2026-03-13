@@ -302,6 +302,9 @@ fn decode_consensus_state(input: &Bytes) -> DecodeConsensusStateResult {
     {
         return Err(BscPrecompileError::InvalidInput.into());
     }
+    if input_length > MAX_CONSENSUS_STATE_LENGTH {
+        return Err(BscPrecompileError::InvalidInput.into());
+    }
 
     let mut pos = 0_u64;
     let chain_id = &input[..CHAIN_ID_LENGTH as usize];
@@ -395,7 +398,7 @@ mod tests {
             ));
 
             let result = cometbft_light_block_validation_run(&input, 100_000);
-            let PrecompileOutput { gas_used, bytes, reverted } = match result {
+            let PrecompileOutput { gas_used, bytes, reverted, .. } = match result {
                 Ok(output) => output,
                 Err(_) => panic!("cometbft_light_block_validation_run failed"),
             };
@@ -681,7 +684,7 @@ mod tests {
         ));
 
         let result = cometbft_light_block_validation_run_before_hertz(&input, 100_000);
-        let PrecompileOutput { gas_used, bytes, reverted } = match result {
+        let PrecompileOutput { gas_used, bytes, reverted, .. } = match result {
             Ok(output) => output,
             Err(_) => panic!("cometbft_light_block_validation_run failed"),
         };

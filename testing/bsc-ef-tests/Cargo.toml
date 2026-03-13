@@ -1,0 +1,51 @@
+[package]
+name = "bsc-ef-tests"
+version = "0.1.0"
+edition = "2021"
+description = "Execution Spec Tests for BSC EVM"
+
+[features]
+ef-tests = []
+jemalloc = ["dep:tikv-jemallocator"]
+asm-keccak = ["alloy-primitives/asm-keccak"]
+
+[dependencies]
+# BSC crate
+reth_bsc = { path = "../.." }
+
+# reth dependencies aligned with workspace branch to avoid duplicate crate versions
+reth-chainspec = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/eth_getFinalizedHeader-bsc-fix" }
+reth-consensus = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/eth_getFinalizedHeader-bsc-fix" }
+reth-ethereum-forks = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/eth_getFinalizedHeader-bsc-fix" }
+reth-db = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/eth_getFinalizedHeader-bsc-fix", features = ["mdbx", "test-utils", "disable-lock"] }
+reth-db-api = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/eth_getFinalizedHeader-bsc-fix" }
+reth-db-common = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/eth_getFinalizedHeader-bsc-fix" }
+reth-ethereum-consensus = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/eth_getFinalizedHeader-bsc-fix" }
+reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/eth_getFinalizedHeader-bsc-fix" }
+reth-evm = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/eth_getFinalizedHeader-bsc-fix" }
+reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/eth_getFinalizedHeader-bsc-fix" }
+reth-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/eth_getFinalizedHeader-bsc-fix" }
+reth-primitives-traits = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/eth_getFinalizedHeader-bsc-fix" }
+reth-provider = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/eth_getFinalizedHeader-bsc-fix", features = ["test-utils"] }
+reth-revm = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/eth_getFinalizedHeader-bsc-fix", features = ["std"] }
+reth-tracing = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/eth_getFinalizedHeader-bsc-fix" }
+reth-trie = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/eth_getFinalizedHeader-bsc-fix" }
+reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/eth_getFinalizedHeader-bsc-fix" }
+
+# revm
+revm = { version = "34.0.0", features = ["secp256k1", "blst", "c-kzg", "memory_limit"] }
+
+# alloy
+alloy-consensus = "1.1.3"
+alloy-eips = "1.1.3"
+alloy-genesis = "1.1.3"
+alloy-primitives = "1.4.1"
+alloy-rlp = "0.3.12"
+
+# misc
+rayon = "1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tikv-jemallocator = { version = "0.6", optional = true }
+walkdir = "2"

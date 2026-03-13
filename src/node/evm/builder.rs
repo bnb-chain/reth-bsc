@@ -4,7 +4,8 @@ use alloy_evm::eth::receipt_builder::ReceiptBuilder;
 use reth_primitives_traits::{HeaderTy, NodePrimitives, Recovered, RecoveredBlock, SealedHeader, SignerRecoverable, TxTy};
 use reth_provider::StateProvider;
 use revm::database::{State, states::bundle_state::BundleRetention};
-use alloy_evm::{Evm, block::BlockExecutor};
+use revm::context::BlockEnv;
+use alloy_evm::block::BlockExecutor;
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
 
 
@@ -55,19 +56,20 @@ where
 impl<'a, DB, EVM, Spec, R> BlockBuilder for BscBlockBuilder<'a, EVM, Spec, R>
 where
     BscBlockExecutor<'a, EVM, Spec, R>: alloy_evm::block::BlockExecutor<
-        Evm: alloy_evm::Evm<
-            Spec = <BscEvmFactory as reth_evm::EvmFactory>::Spec,
-            HaltReason = <BscEvmFactory as reth_evm::EvmFactory>::HaltReason,
-            DB = &'a mut State<DB>,
-        >,
+        Evm = EVM,
         Transaction = <BscPrimitives as NodePrimitives>::SignedTx,
         Receipt = <BscPrimitives as NodePrimitives>::Receipt,
+    >,
+    EVM: alloy_evm::Evm<
+        Spec = <BscEvmFactory as reth_evm::EvmFactory>::Spec,
+        HaltReason = <BscEvmFactory as reth_evm::EvmFactory>::HaltReason,
+        DB = &'a mut State<DB>,
+        BlockEnv = BlockEnv,
     >,
     DB: reth_evm::Database + 'a,
     R: ReceiptBuilder<Transaction = <BscPrimitives as NodePrimitives>::SignedTx>,
     Spec: EthChainSpec + EthereumHardforks + BscHardforks + Hardforks + Clone,
     R::Transaction: Clone + SignerRecoverable,
-    EVM: alloy_evm::Evm,
 {
     type Primitives = BscPrimitives;
     type Executor = BscBlockExecutor<'a, EVM, Spec, R>;

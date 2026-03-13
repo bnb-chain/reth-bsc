@@ -120,11 +120,21 @@ impl Block for BscBlock {
     }
 
     fn rlp_length(header: &Self::Header, body: &Self::Body) -> usize {
+        // Treat empty withdrawals as None for size computation to match geth behavior.
+        // Geth computes block size as if empty withdrawals are absent, even though it
+        // returns withdrawals: [] in the JSON response.
+        let withdrawals = body
+            .inner
+            .withdrawals
+            .as_ref()
+            .filter(|w| !w.is_empty())
+            .map(Cow::Borrowed);
+
         rlp::BlockHelper {
             header: Cow::Borrowed(header),
             transactions: Cow::Borrowed(&body.inner.transactions),
             ommers: Cow::Borrowed(&body.inner.ommers),
-            withdrawals: body.inner.withdrawals.as_ref().map(Cow::Borrowed),
+            withdrawals,
             sidecars: body.sidecars.as_ref().map(Cow::Borrowed),
         }
         .length()
@@ -284,5 +294,172 @@ pub mod serde_bincode_compat {
             let BscBlockBincode { header, body } = repr;
             Self { header: Header::from_repr(header), body: BscBlockBody::from_repr(body) }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_consensus::Header;
+    use alloy_eips::eip4895::Withdrawals;
+    use reth_primitives_traits::Block;
+
+    fn create_test_header() -> Header {
+        Header::default()
+    }
+
+    fn create_test_body_no_withdrawals() -> BscBlockBody {
+        BscBlockBody {
+            inner: BlockBody {
+                transactions: vec![],
+                ommers: vec![],
+                withdrawals: None,
+            },
+            sidecars: None,
+        }
+    }
+
+    fn create_test_body_empty_withdrawals() -> BscBlockBody {
+        BscBlockBody {
+            inner: BlockBody {
+                transactions: vec![],
+                ommers: vec![],
+                withdrawals: Some(Withdrawals::default()),
+            },
+            sidecars: None,
+        }
+    }
+
+    fn create_test_body_with_withdrawal() -> BscBlockBody {
+        use alloy_eips::eip4895::Withdrawal;
+        BscBlockBody {
+            inner: BlockBody {
+                transactions: vec![],
+                ommers: vec![],
+                withdrawals: Some(Withdrawals::new(vec![Withdrawal {
+                    index: 0,
+                    validator_index: 0,
+                    address: Default::default(),
+                    amount: 1000,
+                }])),
+            },
+            sidecars: None,
+        }
+    }
+
+    #[test]
+    fn test_rlp_length_empty_withdrawals_equals_no_withdrawals() {
+        // This test verifies that empty withdrawals (Some([])) are treated as None
+        // for size computation, matching geth's behavior.
+        let header = create_test_header();
+        let body_none = create_test_body_no_withdrawals();
+        let body_empty = create_test_body_empty_withdrawals();
+
+        let size_none = BscBlock::rlp_length(&header, &body_none);
+        let size_empty = BscBlock::rlp_length(&header, &body_empty);
+
+        assert_eq!(
+            size_none, size_empty,
+            "Empty withdrawals should have same RLP length as no withdrawals"
+        );
+    }
+
+    #[test]
+    fn test_rlp_length_non_empty_withdrawals_larger() {
+        // Non-empty withdrawals should increase the RLP length
+        let header = create_test_header();
+        let body_empty = create_test_body_empty_withdrawals();
+        let body_with_withdrawal = create_test_body_with_withdrawal();
+
+        let size_empty = BscBlock::rlp_length(&header, &body_empty);
+        let size_with_withdrawal = BscBlock::rlp_length(&header, &body_with_withdrawal);
+
+        assert!(
+            size_with_withdrawal > size_empty,
+            "Non-empty withdrawals should have larger RLP length than empty withdrawals"
+        );
+    }
+
+    #[test]
+    fn test_rlp_length_sidecars_none_no_impact() {
+        // Verify that sidecars: None doesn't add to the RLP length
+        let header = create_test_header();
+        let body = create_test_body_no_withdrawals();
+
+        let block = BscBlock { header: header.clone(), body };
+        let size = block.body.sidecars.is_none();
+
+        assert!(size, "Sidecars should be None");
+
+        // The size should be deterministic
+        let size1 = BscBlock::rlp_length(&header, &block.body);
+        let size2 = BscBlock::rlp_length(&header, &block.body);
+        assert_eq!(size1, size2, "RLP length should be deterministic");
+    }
+
+    #[test]
+    fn test_rlp_encode_decode_roundtrip() {
+        use alloy_rlp::{Decodable, Encodable};
+
+        let header = create_test_header();
+        let body = create_test_body_empty_withdrawals();
+        let block = BscBlock { header, body };
+
+        // Encode
+        let mut buf = Vec::new();
+        block.encode(&mut buf);
+
+        // Decode
+        let decoded = BscBlock::decode(&mut buf.as_slice()).expect("Failed to decode block");
+
+        assert_eq!(block, decoded, "Block should roundtrip through RLP encoding");
+    }
+
+    #[test]
+    fn test_rlp_length_matches_encoded_length() {
+        use alloy_rlp::Encodable;
+
+        let header = create_test_header();
+        let body = create_test_body_with_withdrawal();
+        let block = BscBlock { header: header.clone(), body: body.clone() };
+
+        // Get computed length
+        let computed_length = BscBlock::rlp_length(&header, &body);
+
+        // Get actual encoded length
+        let mut buf = Vec::new();
+        block.encode(&mut buf);
+        let actual_length = buf.len();
+
+        // Note: For blocks with non-empty withdrawals, computed length should match actual length
+        // For empty withdrawals, computed length may be less (treating empty as None)
+        assert_eq!(
+            computed_length, actual_length,
+            "Computed RLP length should match actual encoded length for non-empty withdrawals"
+        );
+    }
+
+    #[test]
+    fn test_rlp_length_empty_withdrawals_less_than_encoded() {
+        use alloy_rlp::Encodable;
+
+        let header = create_test_header();
+        let body = create_test_body_empty_withdrawals();
+        let block = BscBlock { header: header.clone(), body: body.clone() };
+
+        // Get computed length (treats empty withdrawals as None)
+        let computed_length = BscBlock::rlp_length(&header, &body);
+
+        // Get actual encoded length (includes empty withdrawals as 0xc0)
+        let mut buf = Vec::new();
+        block.encode(&mut buf);
+        let actual_length = buf.len();
+
+        // Computed length should be 1 byte less (the 0xc0 for empty list)
+        assert_eq!(
+            computed_length + 1,
+            actual_length,
+            "Computed RLP length for empty withdrawals should be 1 byte less than actual encoded length"
+        );
     }
 }

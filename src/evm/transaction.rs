@@ -1,9 +1,9 @@
-use alloy_rpc_types::{AccessList, TransactionRequest};
+use alloy_evm::{rpc::TryIntoTxEnv, EvmEnv};
+use alloy_rpc_types_eth::{AccessList, TransactionRequest};
 use reth_evm::{FromRecoveredTx, FromTxWithEncoded, IntoTxEnv, TransactionEnv};
 use reth_primitives::TransactionSigned;
-use reth_rpc_eth_api::transaction::TryIntoTxEnv;
 use revm::{
-    context::{BlockEnv, CfgEnv, TxEnv},
+    context::TxEnv,
     context_interface::transaction::Transaction,
     handler::SystemCallTx,
     primitives::{Address, Bytes, TxKind, B256, U256},
@@ -162,11 +162,10 @@ impl TryIntoTxEnv<BscTxEnv> for TransactionRequest {
 
     fn try_into_tx_env<Spec>(
         self,
-        cfg_env: &CfgEnv<Spec>,
-        block_env: &BlockEnv,
-    ) -> Result<BscTxEnv, Self::Err> {
+        evm_env: &EvmEnv<Spec>,
+    ) -> Result<BscTxEnv, <TransactionRequest as TryIntoTxEnv<TxEnv>>::Err> {
         Ok(BscTxEnv {
-            base: self.try_into_tx_env(cfg_env, block_env)?,
+            base: <TransactionRequest as TryIntoTxEnv<TxEnv>>::try_into_tx_env(self, evm_env)?,
             is_system_transaction: false,
         })
     }
