@@ -162,6 +162,8 @@ impl BscHardfork {
             (Self::Lorentz.boxed(), ForkCondition::Timestamp(1744097580)),
             (Self::Maxwell.boxed(), ForkCondition::Timestamp(1748243100)),
             (Self::Fermi.boxed(), ForkCondition::Timestamp(1762741500)),
+            (Self::Osaka.boxed(), ForkCondition::Timestamp(1774319400)),
+            (Self::Mendel.boxed(), ForkCondition::Timestamp(1774319400)),
         ])
     }
 
