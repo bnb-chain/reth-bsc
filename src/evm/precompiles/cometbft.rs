@@ -14,15 +14,21 @@ use cometbft_light_client_verifier::{
 use cometbft_proto::types::v1::LightBlock as TmLightBlock;
 use prost::Message;
 use revm::precompile::{
-    u64_to_address, PrecompileError, PrecompileOutput, PrecompileResult, Precompile, PrecompileId,
+    u64_to_address, Precompile, PrecompileError, PrecompileId, PrecompileOutput, PrecompileResult,
 };
 use std::{borrow::ToOwned, string::String, vec::Vec};
 
-pub(crate) const COMETBFT_LIGHT_BLOCK_VALIDATION: Precompile =
-    Precompile::new(PrecompileId::Identity, u64_to_address(103), cometbft_light_block_validation_run);
+pub(crate) const COMETBFT_LIGHT_BLOCK_VALIDATION: Precompile = Precompile::new(
+    PrecompileId::Identity,
+    u64_to_address(103),
+    cometbft_light_block_validation_run,
+);
 
-pub(crate) const COMETBFT_LIGHT_BLOCK_VALIDATION_BEFORE_HERTZ: Precompile =
-    Precompile::new(PrecompileId::Identity, u64_to_address(103), cometbft_light_block_validation_run_before_hertz);
+pub(crate) const COMETBFT_LIGHT_BLOCK_VALIDATION_BEFORE_HERTZ: Precompile = Precompile::new(
+    PrecompileId::Identity,
+    u64_to_address(103),
+    cometbft_light_block_validation_run_before_hertz,
+);
 
 const UINT64_TYPE_LENGTH: u64 = 8;
 const CONSENSUS_STATE_LENGTH_BYTES_LENGTH: u64 = 32;
@@ -36,15 +42,15 @@ const VALIDATOR_VOTING_POWER_LENGTH: u64 = 8;
 const RELAYER_ADDRESS_LENGTH: u64 = 20;
 const RELAYER_BLS_KEY_LENGTH: u64 = 48;
 
-const SINGLE_VALIDATOR_BYTES_LENGTH: u64 = VALIDATOR_PUBKEY_LENGTH +
-    VALIDATOR_VOTING_POWER_LENGTH +
-    RELAYER_ADDRESS_LENGTH +
-    RELAYER_BLS_KEY_LENGTH;
+const SINGLE_VALIDATOR_BYTES_LENGTH: u64 = VALIDATOR_PUBKEY_LENGTH
+    + VALIDATOR_VOTING_POWER_LENGTH
+    + RELAYER_ADDRESS_LENGTH
+    + RELAYER_BLS_KEY_LENGTH;
 
-const MAX_CONSENSUS_STATE_LENGTH: u64 = CHAIN_ID_LENGTH +
-    HEIGHT_LENGTH +
-    VALIDATOR_SET_HASH_LENGTH +
-    99 * SINGLE_VALIDATOR_BYTES_LENGTH;
+const MAX_CONSENSUS_STATE_LENGTH: u64 = CHAIN_ID_LENGTH
+    + HEIGHT_LENGTH
+    + VALIDATOR_SET_HASH_LENGTH
+    + 99 * SINGLE_VALIDATOR_BYTES_LENGTH;
 
 fn cometbft_light_block_validation_run(input: &[u8], gas_limit: u64) -> PrecompileResult {
     cometbft_light_block_validation_run_inner(input, gas_limit, true)
@@ -112,8 +118,8 @@ fn decode_light_block_validation_input(input: &[u8]) -> DecodeLightBlockResult {
     }
 
     let cs_length = u64::from_be_bytes(
-        input[CONSENSUS_STATE_LENGTH_BYTES_LENGTH as usize - UINT64_TYPE_LENGTH as usize..
-            CONSENSUS_STATE_LENGTH_BYTES_LENGTH as usize]
+        input[CONSENSUS_STATE_LENGTH_BYTES_LENGTH as usize - UINT64_TYPE_LENGTH as usize
+            ..CONSENSUS_STATE_LENGTH_BYTES_LENGTH as usize]
             .try_into()
             .unwrap(),
     );
@@ -128,8 +134,8 @@ fn decode_light_block_validation_input(input: &[u8]) -> DecodeLightBlockResult {
     }
 
     let decode_input = Bytes::from(
-        input[CONSENSUS_STATE_LENGTH_BYTES_LENGTH as usize..
-            (CONSENSUS_STATE_LENGTH_BYTES_LENGTH + cs_length) as usize]
+        input[CONSENSUS_STATE_LENGTH_BYTES_LENGTH as usize
+            ..(CONSENSUS_STATE_LENGTH_BYTES_LENGTH + cs_length) as usize]
             .to_vec(),
     );
     let consensus_state = decode_consensus_state(&decode_input)?;
@@ -234,10 +240,10 @@ impl ConsensusState {
 
     fn encode(&self) -> Result<Bytes, PrecompileError> {
         let validator_set_length = self.validators.validators().len();
-        let serialize_length = (CHAIN_ID_LENGTH +
-            HEIGHT_LENGTH +
-            VALIDATOR_SET_HASH_LENGTH +
-            validator_set_length as u64 * SINGLE_VALIDATOR_BYTES_LENGTH)
+        let serialize_length = (CHAIN_ID_LENGTH
+            + HEIGHT_LENGTH
+            + VALIDATOR_SET_HASH_LENGTH
+            + validator_set_length as u64 * SINGLE_VALIDATOR_BYTES_LENGTH)
             as usize;
         if serialize_length > MAX_CONSENSUS_STATE_LENGTH as usize {
             return Err(BscPrecompileError::CometBftEncodeConsensusStateFailed.into());
@@ -297,8 +303,8 @@ type DecodeConsensusStateResult = Result<ConsensusState, PrecompileError>;
 fn decode_consensus_state(input: &Bytes) -> DecodeConsensusStateResult {
     let minimum_length = CHAIN_ID_LENGTH + HEIGHT_LENGTH + VALIDATOR_SET_HASH_LENGTH;
     let input_length = input.len() as u64;
-    if input_length <= minimum_length ||
-        !(input_length - minimum_length).is_multiple_of(SINGLE_VALIDATOR_BYTES_LENGTH)
+    if input_length <= minimum_length
+        || !(input_length - minimum_length).is_multiple_of(SINGLE_VALIDATOR_BYTES_LENGTH)
     {
         return Err(BscPrecompileError::InvalidInput.into());
     }
@@ -324,25 +330,25 @@ fn decode_consensus_state(input: &Bytes) -> DecodeConsensusStateResult {
     let validator_set_bytes = input[pos as usize..].to_vec();
     let mut validator_set = Vec::with_capacity(validator_set_length as usize);
     for i in 0..validator_set_length {
-        let validator = &validator_set_bytes[i as usize * SINGLE_VALIDATOR_BYTES_LENGTH as usize..
-            (i + 1) as usize * SINGLE_VALIDATOR_BYTES_LENGTH as usize];
+        let validator = &validator_set_bytes[i as usize * SINGLE_VALIDATOR_BYTES_LENGTH as usize
+            ..(i + 1) as usize * SINGLE_VALIDATOR_BYTES_LENGTH as usize];
 
         let voting_power = u64::from_be_bytes(
-            validator[VALIDATOR_PUBKEY_LENGTH as usize..
-                (VALIDATOR_PUBKEY_LENGTH + VALIDATOR_VOTING_POWER_LENGTH) as usize]
+            validator[VALIDATOR_PUBKEY_LENGTH as usize
+                ..(VALIDATOR_PUBKEY_LENGTH + VALIDATOR_VOTING_POWER_LENGTH) as usize]
                 .try_into()
                 .unwrap(),
         );
         let relayer_address = Bytes::from(
-            validator[(VALIDATOR_PUBKEY_LENGTH + VALIDATOR_VOTING_POWER_LENGTH) as usize..
-                (VALIDATOR_PUBKEY_LENGTH + VALIDATOR_VOTING_POWER_LENGTH + RELAYER_ADDRESS_LENGTH)
+            validator[(VALIDATOR_PUBKEY_LENGTH + VALIDATOR_VOTING_POWER_LENGTH) as usize
+                ..(VALIDATOR_PUBKEY_LENGTH + VALIDATOR_VOTING_POWER_LENGTH + RELAYER_ADDRESS_LENGTH)
                     as usize]
                 .to_vec(),
         );
         let relayer_bls_key = Bytes::from(
-            validator[(VALIDATOR_PUBKEY_LENGTH +
-                VALIDATOR_VOTING_POWER_LENGTH +
-                RELAYER_ADDRESS_LENGTH) as usize..]
+            validator[(VALIDATOR_PUBKEY_LENGTH
+                + VALIDATOR_VOTING_POWER_LENGTH
+                + RELAYER_ADDRESS_LENGTH) as usize..]
                 .to_vec(),
         );
         let pk = match PublicKey::from_raw_ed25519(&validator[..VALIDATOR_PUBKEY_LENGTH as usize]) {

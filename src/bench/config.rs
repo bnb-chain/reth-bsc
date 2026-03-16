@@ -22,8 +22,10 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Run the benchmark
+    /// Run the block-execution microbenchmark (direct pipeline)
     Run(RunArgs),
+    /// Reserved payload-job benchmark command (currently unavailable on this branch)
+    PayloadJobRun(PayloadJobRunArgs),
     /// Compare two benchmark CSV outputs
     Compare(CompareArgs),
 }
@@ -54,8 +56,8 @@ pub struct RunArgs {
     #[arg(long, default_value = "5")]
     pub storage_slots_per_account: usize,
 
-    /// Enable difflayer chain (warm trieDB path)
-    #[arg(long, default_value = "true")]
+    /// Enable difflayer chain (unsupported on this branch; ignored by the direct benchmark)
+    #[arg(long, default_value = "false")]
     pub chain_difflayers: bool,
 
     /// Enable trieDB for state root calculation
@@ -67,6 +69,84 @@ pub struct RunArgs {
     pub output: PathBuf,
 
     /// Label for this benchmark run
+    #[arg(long, default_value = "default")]
+    pub label: String,
+}
+
+#[derive(Parser, Debug)]
+pub struct PayloadJobRunArgs {
+    /// Path to genesis JSON file
+    #[arg(long, default_value = DEFAULT_GENESIS)]
+    pub genesis: PathBuf,
+
+    /// Number of payload-job iterations to run
+    #[arg(long, default_value = "20")]
+    pub iterations: usize,
+
+    /// Number of transactions to populate in the pool per iteration
+    #[arg(long, default_value = "200")]
+    pub txs_per_iteration: usize,
+
+    /// Number of funded accounts for tx generation
+    #[arg(long, default_value = "500")]
+    pub funded_accounts: usize,
+
+    /// Number of extra background accounts to inflate the state trie
+    #[arg(long, default_value = "0")]
+    pub background_accounts: usize,
+
+    /// Number of storage slots per background account
+    #[arg(long, default_value = "5")]
+    pub storage_slots_per_account: usize,
+
+    /// Enable difflayer chaining between payload-job iterations
+    #[arg(long, default_value = "false")]
+    pub chain_difflayers: bool,
+
+    /// Enable trieDB for payload finalization
+    #[arg(long, default_value = "false")]
+    pub triedb: bool,
+
+    // --- Wait-Slice Parameters ---
+    /// DELAY_LEFT_OVER: ms reserved for finalization (default: 120)
+    #[arg(long, default_value = "120")]
+    pub delay_left_over_ms: u64,
+
+    /// TIME_MULTIPLIER: retry threshold multiplier (default: 2)
+    #[arg(long, default_value = "2")]
+    pub time_multiplier: u32,
+
+    /// Grace period past expected_end_timestamp_ms in ms (default: 150)
+    #[arg(long, default_value = "150")]
+    pub grace_period_ms: u128,
+
+    /// Max wait-slice duration per iteration in ms (default: 50)
+    #[arg(long, default_value = "50")]
+    pub max_wait_slice_ms: u64,
+
+    /// Override mining delay in ms (default: use parlia computation).
+    /// Set to e.g. 330 to simulate a realistic BSC block period.
+    #[arg(long)]
+    pub mining_delay_ms: Option<u64>,
+
+    /// Percentage of txs to pre-load before starting the job (0-100, default: 100).
+    /// Remaining txs are drip-fed mid-job to trigger retries and concurrent builds.
+    #[arg(long, default_value = "100")]
+    pub initial_tx_pct: u32,
+
+    /// Delay in ms before starting to drip-feed remaining txs (default: 50).
+    #[arg(long, default_value = "50")]
+    pub tx_drip_delay_ms: u64,
+
+    /// Interval in ms between drip-feed batches (default: 20).
+    #[arg(long, default_value = "20")]
+    pub tx_drip_interval_ms: u64,
+
+    /// Output CSV file
+    #[arg(long, default_value = "payload_job_benchmark.csv")]
+    pub output: PathBuf,
+
+    /// Label for this run
     #[arg(long, default_value = "default")]
     pub label: String,
 }

@@ -1,20 +1,28 @@
 #![allow(clippy::owned_cow)]
+use crate::node::miner::signer::{is_signer_initialized, sign_system_transaction};
 use crate::{
-    BscBlock, chainspec::BscChainSpec, node::{
-        BscNode, engine_api::payload::BscPayloadTypes, network::{
-            block_import::{BscBlockImport, handle::ImportHandle},
+    chainspec::BscChainSpec,
+    node::{
+        engine_api::payload::BscPayloadTypes,
+        network::{
+            block_import::{handle::ImportHandle, BscBlockImport},
             evn_peers::{get_onchain_nodeids_set, peer_id_to_node_id},
-        }, primitives::{BscBlobTransactionSidecar, BscPrimitives}
-    }
+        },
+        primitives::{BscBlobTransactionSidecar, BscPrimitives},
+        BscNode,
+    },
+    BscBlock,
 };
 use alloy_primitives::{Address, U256};
 use alloy_rlp::{Decodable, Encodable};
+use alloy_rpc_types::TransactionRequest as RpcTransactionRequest;
 use handshake::BscHandshake;
 use reth::{
     api::{FullNodeTypes, TxTy},
     builder::{components::NetworkBuilder, BuilderContext},
     transaction_pool::{PoolTransaction, TransactionPool},
 };
+use reth_chainspec::EthChainSpec;
 use reth_discv4::Discv4Config;
 use reth_engine_primitives::ConsensusEngineHandle;
 use reth_eth_wire::{BasicNetworkPrimitives, NewBlock, NewBlockPayload};
@@ -27,11 +35,6 @@ use reth_primitives::TransactionSigned;
 use std::{sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, info, warn};
-use alloy_rpc_types::{
-    TransactionRequest as RpcTransactionRequest,
-};
-use crate::node::miner::signer::{is_signer_initialized, sign_system_transaction};
-use reth_chainspec::EthChainSpec;
 
 pub mod block_import;
 pub(crate) mod blocks_by_range;
@@ -510,16 +513,27 @@ async fn register_nodeids_actions<P: StateProviderFactory>(
     to_add: Vec<[u8; 32]>,
     to_remove: Vec<[u8; 32]>,
 ) -> Result<(), eyre::Error> {
-    let best_block_number = crate::shared::get_best_canonical_block_number().ok_or(eyre::eyre!("Best block number not found"))?;
-    let h = crate::shared::get_canonical_header_by_number(best_block_number).ok_or(eyre::eyre!("Header not found"))?;
+    let best_block_number = crate::shared::get_best_canonical_block_number()
+        .ok_or(eyre::eyre!("Best block number not found"))?;
+    let h = crate::shared::get_canonical_header_by_number(best_block_number)
+        .ok_or(eyre::eyre!("Header not found"))?;
     let state = provider.state_by_block_hash(h.hash_slow())?;
-    let acc = state.basic_account(&validator)?.ok_or(eyre::eyre!("Account not found for validator"))?;
+    let acc =
+        state.basic_account(&validator)?.ok_or(eyre::eyre!("Account not found for validator"))?;
     let mut next_nonce = acc.nonce;
     let chain_id = chain_spec.chain().id();
 
     let onchain_nodeids_set = get_onchain_nodeids_set();
-    let to_add: Vec<[u8; 32]>= to_add.iter().filter(|id| !onchain_nodeids_set.contains(&alloy_primitives::hex::encode(**id))).copied().collect();
-    let to_remove: Vec<[u8; 32]>= to_remove.iter().filter(|id| onchain_nodeids_set.contains(&alloy_primitives::hex::encode(**id))).copied().collect();
+    let to_add: Vec<[u8; 32]> = to_add
+        .iter()
+        .filter(|id| !onchain_nodeids_set.contains(&alloy_primitives::hex::encode(**id)))
+        .copied()
+        .collect();
+    let to_remove: Vec<[u8; 32]> = to_remove
+        .iter()
+        .filter(|id| onchain_nodeids_set.contains(&alloy_primitives::hex::encode(**id)))
+        .copied()
+        .collect();
     debug!(target: "bsc::evn", to_add = ?to_add, to_remove = ?to_remove, onchain_nodeids_set = ?onchain_nodeids_set, "refreshed to_add and to_remove");
     let mut signed_batch: Vec<TransactionSigned> = Vec::new();
     if !to_add.is_empty() {

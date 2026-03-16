@@ -3,7 +3,7 @@
 use alloy_primitives::Bytes;
 use parity_bytes::BytesRef;
 use revm::precompile::{
-    u64_to_address, PrecompileError, PrecompileOutput, PrecompileResult, Precompile, PrecompileId,
+    u64_to_address, Precompile, PrecompileError, PrecompileId, PrecompileOutput, PrecompileResult,
 };
 use tendermint::lite::light_client;
 
@@ -12,8 +12,11 @@ pub(crate) const TENDERMINT_HEADER_VALIDATION: Precompile =
     Precompile::new(PrecompileId::Identity, u64_to_address(100), tendermint_header_validation_run);
 
 /// Tendermint precompile for BSC after Nano hardfork.
-pub(crate) const TENDERMINT_HEADER_VALIDATION_NANO: Precompile =
-    Precompile::new(PrecompileId::Identity, u64_to_address(100), tendermint_header_validation_run_nano);
+pub(crate) const TENDERMINT_HEADER_VALIDATION_NANO: Precompile = Precompile::new(
+    PrecompileId::Identity,
+    u64_to_address(100),
+    tendermint_header_validation_run_nano,
+);
 
 /// Run the Tendermint header validation precompile after Nano hardfork.
 fn tendermint_header_validation_run_nano(input: &[u8], _gas_limit: u64) -> PrecompileResult {

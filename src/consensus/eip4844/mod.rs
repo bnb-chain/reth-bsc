@@ -4,9 +4,7 @@ mod blob_fee;
 mod bep657;
 
 pub use blob_fee::{
-    calc_blob_fee,
-    CANCUN_UPDATE_FRACTION, MIN_BLOB_GAS_PRICE,
-    BLOB_TX_BLOB_GAS_PER_BLOB,
+    calc_blob_fee, BLOB_TX_BLOB_GAS_PER_BLOB, CANCUN_UPDATE_FRACTION, MIN_BLOB_GAS_PRICE,
 };
 pub use bep657::{
     is_blob_eligible_block, next_block_excess_blob_gas_with_mendel,

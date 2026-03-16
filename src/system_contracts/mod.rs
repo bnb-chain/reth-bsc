@@ -1,11 +1,14 @@
 #![allow(missing_docs)]
 //! Credits to <https://github.com/bnb-chain/reth/blob/main/crates/bsc/primitives/src/system_contracts/mod.rs>
 use crate::{
-    chainspec::{bsc::bsc_mainnet, bsc_chapel::bsc_testnet, bsc_rialto::bsc_qanet, bsc_rialto::RIALTO_CHAIN_ID},
+    chainspec::{
+        bsc::bsc_mainnet, bsc_chapel::bsc_testnet, bsc_rialto::bsc_qanet,
+        bsc_rialto::RIALTO_CHAIN_ID,
+    },
     consensus::parlia::VoteAddress,
     hardforks::{bsc::BscHardfork, BscHardforks},
 };
-use abi::{STAKE_HUB_ABI, VALIDATOR_SET_ABI, VALIDATOR_SET_ABI_BEFORE_LUBAN, SLASH_INDICATOR_ABI};
+use abi::{SLASH_INDICATOR_ABI, STAKE_HUB_ABI, VALIDATOR_SET_ABI, VALIDATOR_SET_ABI_BEFORE_LUBAN};
 use alloy_chains::Chain;
 use alloy_consensus::TxLegacy;
 use alloy_dyn_abi::{DynSolValue, FunctionExt, JsonAbiExt};
@@ -65,7 +68,10 @@ impl<Spec: EthChainSpec + crate::hardforks::BscHardforks> SystemContract<Spec> {
     }
 
     /// Return system address and input which is used to query current validators before luban.
-    pub fn get_current_validators_before_luban(&self, block_number: BlockNumber) -> (Address, Bytes) {
+    pub fn get_current_validators_before_luban(
+        &self,
+        block_number: BlockNumber,
+    ) -> (Address, Bytes) {
         let function = if self.chain_spec.is_euler_active_at_block(block_number) {
             self.validator_abi_before_luban
                 .function("getMiningValidators")
@@ -154,10 +160,7 @@ impl<Spec: EthChainSpec + crate::hardforks::BscHardforks> SystemContract<Spec> {
             STAKE_HUB_CONTRACT,
             Bytes::from(
                 function
-                    .abi_encode_input(&[
-                        DynSolValue::from(offset),
-                        DynSolValue::from(limit),
-                    ])
+                    .abi_encode_input(&[DynSolValue::from(offset), DynSolValue::from(limit)])
                     .unwrap(),
             ),
         )
@@ -331,9 +334,7 @@ impl<Spec: EthChainSpec + crate::hardforks::BscHardforks> SystemContract<Spec> {
                 DynSolValue::FixedBytes(fb, 32)
             })
             .collect();
-        let input = function
-            .abi_encode_input(&[DynSolValue::Array(node_ids_values)])
-            .unwrap();
+        let input = function.abi_encode_input(&[DynSolValue::Array(node_ids_values)]).unwrap();
 
         Transaction::Legacy(TxLegacy {
             chain_id: Some(self.chain_spec.chain().id()),
@@ -360,9 +361,7 @@ impl<Spec: EthChainSpec + crate::hardforks::BscHardforks> SystemContract<Spec> {
                 DynSolValue::FixedBytes(fb, 32)
             })
             .collect();
-        let input = function
-            .abi_encode_input(&[DynSolValue::Array(node_ids_values)])
-            .unwrap();
+        let input = function.abi_encode_input(&[DynSolValue::Array(node_ids_values)]).unwrap();
 
         Transaction::Legacy(TxLegacy {
             chain_id: Some(self.chain_spec.chain().id()),
@@ -518,9 +517,7 @@ pub fn encode_add_node_ids_call(node_ids: Vec<[u8; 32]>) -> (Address, Bytes) {
             DynSolValue::FixedBytes(fb, 32)
         })
         .collect();
-    let input = function
-        .abi_encode_input(&[DynSolValue::Array(node_ids_values)])
-        .unwrap();
+    let input = function.abi_encode_input(&[DynSolValue::Array(node_ids_values)]).unwrap();
     (STAKE_HUB_CONTRACT, Bytes::from(input))
 }
 
@@ -535,9 +532,7 @@ pub fn encode_remove_node_ids_call(node_ids: Vec<[u8; 32]>) -> (Address, Bytes) 
             DynSolValue::FixedBytes(fb, 32)
         })
         .collect();
-    let input = function
-        .abi_encode_input(&[DynSolValue::Array(node_ids_values)])
-        .unwrap();
+    let input = function.abi_encode_input(&[DynSolValue::Array(node_ids_values)]).unwrap();
     (STAKE_HUB_CONTRACT, Bytes::from(input))
 }
 
@@ -774,10 +769,10 @@ where
 }
 
 /// Get all system contracts to be upgraded.
-/// 
+///
 /// This function follows the exact upgrade order from Geth-BSC:
 /// https://github.com/bnb-chain/bsc/blob/master/core/systemcontracts/upgrade.go#L1078
-/// 
+///
 /// The order is critical because:
 /// 1. Multiple hardforks may activate at the same block/timestamp
 /// 2. Later hardforks may upgrade the same contract addresses as earlier ones
@@ -792,7 +787,7 @@ where
     ChainSpec: EthChainSpec + BscHardforks + Hardforks,
 {
     use tracing::trace;
-    
+
     trace!(
         target: "bsc::system_contracts::upgrade",
         block_number,
@@ -800,16 +795,16 @@ where
         parent_block_time,
         "get_upgrade_system_contracts called"
     );
-    
+
     let mut m = HashMap::new();
-    
+
     // Apply upgrades in the exact order as Geth-BSC upgradeBuildInSystemContract
     // Each hardfork upgrade will overwrite previous upgrades for the same address
 
     if spec.is_ramanujan_transition_at_block(block_number) {
         if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Ramanujan.name()) {
-                for (address, v) in &contracts {
-                    m.insert(*address, v.clone());
+            for (address, v) in &contracts {
+                m.insert(*address, v.clone());
                 info!(
                     target: "bsc::system_contracts::upgrade",
                     block_number = block_number,
@@ -821,7 +816,7 @@ where
             }
         }
     }
-    
+
     if spec.is_niels_transition_at_block(block_number) {
         if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Niels.name()) {
             for (address, v) in &contracts {
@@ -837,7 +832,7 @@ where
             }
         }
     }
-    
+
     if spec.is_mirror_sync_transition_at_block(block_number) {
         if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::MirrorSync.name()) {
             for (address, v) in &contracts {
@@ -853,7 +848,7 @@ where
             }
         }
     }
-    
+
     if spec.is_bruno_transition_at_block(block_number) {
         if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Bruno.name()) {
             for (address, v) in &contracts {
@@ -869,7 +864,7 @@ where
             }
         }
     }
-    
+
     if spec.is_euler_transition_at_block(block_number) {
         if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Euler.name()) {
             for (address, v) in &contracts {
@@ -885,7 +880,7 @@ where
             }
         }
     }
-    
+
     if spec.is_gibbs_transition_at_block(block_number) {
         if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Gibbs.name()) {
             for (address, v) in &contracts {
@@ -901,7 +896,7 @@ where
             }
         }
     }
-    
+
     if spec.is_moran_transition_at_block(block_number) {
         if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Moran.name()) {
             for (address, v) in &contracts {
@@ -917,7 +912,7 @@ where
             }
         }
     }
-    
+
     if spec.is_planck_transition_at_block(block_number) {
         if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Planck.name()) {
             for (address, v) in &contracts {
@@ -933,7 +928,7 @@ where
             }
         }
     }
-    
+
     if spec.is_luban_transition_at_block(block_number) {
         if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Luban.name()) {
             for (address, v) in &contracts {
@@ -949,7 +944,7 @@ where
             }
         }
     }
-    
+
     if spec.is_plato_transition_at_block(block_number) {
         if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Plato.name()) {
             for (address, v) in &contracts {
@@ -965,7 +960,7 @@ where
             }
         }
     }
-    
+
     if spec.is_kepler_transition_at_timestamp(block_number, block_time, parent_block_time) {
         if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Kepler.name()) {
             for (address, v) in &contracts {
@@ -981,7 +976,7 @@ where
             }
         }
     }
-    
+
     if spec.is_feynman_transition_at_timestamp(block_number, block_time, parent_block_time) {
         if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Feynman.name()) {
             for (address, v) in &contracts {
@@ -997,7 +992,7 @@ where
             }
         }
     }
-    
+
     if spec.is_feynman_fix_transition_at_timestamp(block_number, block_time, parent_block_time) {
         if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::FeynmanFix.name()) {
             for (address, v) in &contracts {
@@ -1013,7 +1008,7 @@ where
             }
         }
     }
-    
+
     if spec.is_haber_fix_transition_at_timestamp(block_number, block_time, parent_block_time) {
         if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::HaberFix.name()) {
             for (address, v) in &contracts {
@@ -1029,7 +1024,7 @@ where
             }
         }
     }
-    
+
     if spec.is_bohr_transition_at_timestamp(block_number, block_time, parent_block_time) {
         if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Bohr.name()) {
             for (address, v) in &contracts {
@@ -1045,7 +1040,7 @@ where
             }
         }
     }
-    
+
     if spec.is_pascal_transition_at_timestamp(block_number, block_time, parent_block_time) {
         if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Pascal.name()) {
             for (address, v) in &contracts {
@@ -1061,7 +1056,7 @@ where
             }
         }
     }
-    
+
     if spec.is_lorentz_transition_at_timestamp(block_number, block_time, parent_block_time) {
         if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Lorentz.name()) {
             for (address, v) in &contracts {
@@ -1077,7 +1072,7 @@ where
             }
         }
     }
-    
+
     if spec.is_maxwell_transition_at_timestamp(block_number, block_time, parent_block_time) {
         if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Maxwell.name()) {
             for (address, v) in &contracts {
@@ -1093,7 +1088,7 @@ where
             }
         }
     }
-    
+
     if spec.is_fermi_transition_at_timestamp(block_number, block_time, parent_block_time) {
         if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Fermi.name()) {
             for (address, v) in &contracts {
@@ -1109,7 +1104,7 @@ where
             }
         }
     }
-    
+
     Ok(m)
 }
 

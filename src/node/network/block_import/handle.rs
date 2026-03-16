@@ -1,13 +1,13 @@
 use std::task::{Context, Poll};
 
 use reth_engine_primitives::EngineTypes;
+use reth_eth_wire_types::broadcast::NewBlockHashes;
 use reth_network::import::BlockImportError;
 use reth_network_api::PeerId;
 use reth_payload_primitives::PayloadTypes;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
-use reth_eth_wire_types::broadcast::NewBlockHashes;
 
-use super::service::{BlockMsg, ImportEvent, IncomingBlock, Outcome, IncomingHashes};
+use super::service::{BlockMsg, ImportEvent, IncomingBlock, IncomingHashes, Outcome};
 
 /// A handle for interacting with the block import service.
 ///
@@ -46,7 +46,11 @@ impl ImportHandle {
 
     /// Sends block hashes to the service for downloading.
     /// Returns a [`BlockImportError`] if the channel to the import service is closed.
-    pub fn send_hashes(&self, hashes: NewBlockHashes, peer_id: PeerId) -> Result<(), BlockImportError> {
+    pub fn send_hashes(
+        &self,
+        hashes: NewBlockHashes,
+        peer_id: PeerId,
+    ) -> Result<(), BlockImportError> {
         self.to_hashes
             .send((hashes, peer_id))
             .map_err(|_| BlockImportError::Other("block hash service channel closed".into()))

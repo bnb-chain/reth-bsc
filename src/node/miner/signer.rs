@@ -1,13 +1,13 @@
 use once_cell::sync::OnceCell;
-use std::sync::Arc;
 use reth_primitives::{Transaction, TransactionSigned};
+use std::sync::Arc;
 // reth signing helper avoided to not materialize a B256 from secret
-use alloy_primitives::B256;
-use alloy_consensus::{SignableTransaction, Header};
 use crate::consensus::parlia::{hash_with_chain_id, EXTRA_SEAL_LEN};
-use secp256k1::{SECP256K1, Message, SecretKey};
-use zeroize::Zeroizing;
+use alloy_consensus::{Header, SignableTransaction};
+use alloy_primitives::B256;
 use k256::ecdsa::SigningKey as K256SigningKey;
+use secp256k1::{Message, SecretKey, SECP256K1};
+use zeroize::Zeroizing;
 
 pub struct MinerSigner {
     // Wrap raw key bytes to ensure zeroize-on-drop; reconstruct SecretKey as needed
@@ -40,7 +40,10 @@ impl MinerSigner {
         Self { secret_bytes: Zeroizing::new(secret_key.secret_bytes()) }
     }
 
-    pub fn sign_transaction(&self, transaction: Transaction) -> Result<TransactionSigned, SignerError> {
+    pub fn sign_transaction(
+        &self,
+        transaction: Transaction,
+    ) -> Result<TransactionSigned, SignerError> {
         // Sign directly with libsecp256k1 using the in-memory secret to avoid constructing B256 of the key.
         let msg_hash = transaction.signature_hash();
         let message = Message::from_digest(msg_hash.0);
@@ -59,20 +62,24 @@ impl MinerSigner {
         Ok(signed)
     }
 
-    pub fn seal_header(&self, header: &Header, chain_id: u64) -> Result<[u8; EXTRA_SEAL_LEN], SignerError> {
+    pub fn seal_header(
+        &self,
+        header: &Header,
+        chain_id: u64,
+    ) -> Result<[u8; EXTRA_SEAL_LEN], SignerError> {
         let hash_data = hash_with_chain_id(header, chain_id);
         let message = Message::from_digest(hash_data.0);
         let sk = SecretKey::from_slice(self.secret_bytes.as_slice())
             .map_err(|e| SignerError::SigningFailed(format!("Invalid private key: {}", e)))?;
         let recoverable_sig = SECP256K1.sign_ecdsa_recoverable(&message, &sk);
         let (recovery_id, signature_bytes) = recoverable_sig.serialize_compact();
-        
+
         // [r(32) + s(32) + recovery_id(1)]
         let mut sig_bytes = [0u8; EXTRA_SEAL_LEN];
         sig_bytes[0..64].copy_from_slice(&signature_bytes);
         let raw_recovery_id = i32::from(recovery_id) as u8;
         sig_bytes[64] = raw_recovery_id;
-        
+
         Ok(sig_bytes)
     }
 }
@@ -82,9 +89,7 @@ pub fn init_global_signer(private_key: B256) -> Result<(), SignerError> {
     let sk = SecretKey::from_slice(private_key.as_ref())
         .map_err(|e| SignerError::SigningFailed(format!("Invalid private key: {}", e)))?;
     let signer = Arc::new(MinerSigner::new(sk));
-    GLOBAL_SIGNER
-        .set(signer)
-        .map_err(|_| SignerError::AlreadyInitialized)
+    GLOBAL_SIGNER.set(signer).map_err(|_| SignerError::AlreadyInitialized)
 }
 
 /// Preferred initializer: use a k256 SigningKey to avoid exposing raw bytes.
@@ -94,9 +99,7 @@ pub fn init_global_signer_from_k256(signing_key: &K256SigningKey) -> Result<(), 
     let sk = SecretKey::from_slice(&raw)
         .map_err(|e| SignerError::SigningFailed(format!("Invalid private key: {}", e)))?;
     let signer = Arc::new(MinerSigner::new(sk));
-    GLOBAL_SIGNER
-        .set(signer)
-        .map_err(|_| SignerError::AlreadyInitialized)
+    GLOBAL_SIGNER.set(signer).map_err(|_| SignerError::AlreadyInitialized)
 }
 
 pub fn get_global_signer() -> Option<&'static Arc<MinerSigner>> {
@@ -104,9 +107,8 @@ pub fn get_global_signer() -> Option<&'static Arc<MinerSigner>> {
 }
 
 pub fn sign_system_transaction(tx: Transaction) -> Result<TransactionSigned, SignerError> {
-    let signer = GLOBAL_SIGNER.get()
-        .ok_or(SignerError::NotInitialized)?;
-    
+    let signer = GLOBAL_SIGNER.get().ok_or(SignerError::NotInitialized)?;
+
     signer.sign_transaction(tx)
 }
 
@@ -114,9 +116,11 @@ pub fn is_signer_initialized() -> bool {
     GLOBAL_SIGNER.get().is_some()
 }
 
-pub fn seal_header_with_global_signer(header: &Header, chain_id: u64) -> Result<[u8; EXTRA_SEAL_LEN], SignerError> {
-    let signer = GLOBAL_SIGNER.get()
-        .ok_or(SignerError::NotInitialized)?;
+pub fn seal_header_with_global_signer(
+    header: &Header,
+    chain_id: u64,
+) -> Result<[u8; EXTRA_SEAL_LEN], SignerError> {
+    let signer = GLOBAL_SIGNER.get().ok_or(SignerError::NotInitialized)?;
     signer.seal_header(header, chain_id)
 }
 
@@ -126,8 +130,8 @@ mod tests {
     use crate::consensus::parlia::{hash_with_chain_id, EXTRA_SEAL_LEN};
     use crate::node::miner::config::keystore::get_validator_address;
     use alloy_consensus::Header;
-    use alloy_primitives::{keccak256, Address, Bytes, TxKind, U256};
     use alloy_consensus::TxLegacy;
+    use alloy_primitives::{keccak256, Address, Bytes, TxKind, U256};
     use reth_primitives::Transaction;
     use reth_primitives_traits::SignerRecoverable;
     use secp256k1::{ecdsa::RecoverableSignature, ecdsa::RecoveryId};

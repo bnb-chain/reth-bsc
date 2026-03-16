@@ -5,13 +5,16 @@ use alloy_primitives::{keccak256, BlockNumber, Bytes, ChainId, B256, B512, U256}
 use alloy_rlp::{Decodable, RlpDecodable, RlpEncodable};
 use core::cmp::Ordering;
 use revm::precompile::{
-    secp256k1, u64_to_address, PrecompileError, PrecompileOutput, PrecompileResult,
-    Precompile, PrecompileId,
+    secp256k1, u64_to_address, Precompile, PrecompileError, PrecompileId, PrecompileOutput,
+    PrecompileResult,
 };
 
 /// Double sign evidence validation precompile for BSC.
-pub(crate) const DOUBLE_SIGN_EVIDENCE_VALIDATION: Precompile =
-    Precompile::new(PrecompileId::Identity, u64_to_address(104), double_sign_evidence_validation_run);
+pub(crate) const DOUBLE_SIGN_EVIDENCE_VALIDATION: Precompile = Precompile::new(
+    PrecompileId::Identity,
+    u64_to_address(104),
+    double_sign_evidence_validation_run,
+);
 
 const EXTRA_SEAL_LENGTH: usize = 65;
 
@@ -85,7 +88,7 @@ fn double_sign_evidence_validation_run(input: &[u8], gas_limit: u64) -> Precompi
     };
 
     let Ok(evidence) = DoubleSignEvidence::decode(&mut input.iter().as_ref()) else {
-        return revert()
+        return revert();
     };
 
     let Ok(header1) = Header::decode(&mut evidence.header_bytes1.as_ref()) else { return revert() };

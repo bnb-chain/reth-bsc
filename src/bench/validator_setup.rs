@@ -1,16 +1,16 @@
+use crate::node::miner::signer::MinerSigner;
 use alloy_consensus::TxLegacy;
 use alloy_primitives::{Address, Bytes, Keccak256, TxKind, U256};
 use alloy_sol_macro::sol;
 use alloy_sol_types::SolCall;
 use blst::min_pk::SecretKey as BlsSecretKey;
-use crate::node::miner::signer::MinerSigner;
 use reth_primitives::{Transaction, TransactionSigned};
 use secp256k1::SecretKey;
 
 /// StakeHub contract address
 const STAKE_HUB: Address = Address::new([
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x20, 0x02,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x20, 0x02,
 ]);
 
 /// Delegation amount: 20001 BNB (matches create-validator script)
@@ -97,11 +97,7 @@ pub fn create_validator_tx(
         consensusAddress: validator_addr,
         voteAddress: Bytes::from(bls_key.pubkey_bytes.clone()),
         blsProof: Bytes::from(proof),
-        commission: Commission {
-            rate: 100,
-            maxRate: 1000,
-            maxChangeRate: 100,
-        },
+        commission: Commission { rate: 100, maxRate: 1000, maxChangeRate: 100 },
         description: Description {
             moniker: format!("BenchVal{}", nonce),
             identity: String::new(),

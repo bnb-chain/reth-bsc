@@ -24,7 +24,9 @@ struct VoteDataLru {
 }
 
 impl VoteDataLru {
-    fn new(capacity: usize) -> Self { Self { capacity, order: VecDeque::new(), map: HashMap::new() } }
+    fn new(capacity: usize) -> Self {
+        Self { capacity, order: VecDeque::new(), map: HashMap::new() }
+    }
 
     fn add(&mut self, key: u64, value: VoteData) {
         if !self.map.contains_key(&key) {
@@ -38,9 +40,13 @@ impl VoteDataLru {
         self.map.insert(key, value);
     }
 
-    fn contains(&self, key: u64) -> bool { self.map.contains_key(&key) }
+    fn contains(&self, key: u64) -> bool {
+        self.map.contains_key(&key)
+    }
 
-    fn get(&self, key: u64) -> Option<VoteData> { self.map.get(&key).cloned() }
+    fn get(&self, key: u64) -> Option<VoteData> {
+        self.map.get(&key).cloned()
+    }
 
     // no additional methods
 }
@@ -54,13 +60,19 @@ pub struct VoteJournal {
 impl VoteJournal {
     fn resolve_default_path() -> PathBuf {
         // Priority: BSC_VOTE_JOURNAL_DIR -> RETH_DATADIR -> ./voteJournal
-        if let Ok(dir) = std::env::var("BSC_VOTE_JOURNAL_DIR") { return PathBuf::from(dir).join("votes.jsonl"); }
-        if let Ok(reth_dir) = std::env::var("RETH_DATADIR") { return PathBuf::from(reth_dir).join("voteJournal").join("votes.jsonl"); }
+        if let Ok(dir) = std::env::var("BSC_VOTE_JOURNAL_DIR") {
+            return PathBuf::from(dir).join("votes.jsonl");
+        }
+        if let Ok(reth_dir) = std::env::var("RETH_DATADIR") {
+            return PathBuf::from(reth_dir).join("voteJournal").join("votes.jsonl");
+        }
         PathBuf::from("voteJournal").join("votes.jsonl")
     }
 
     fn ensure_parent_dir(path: &Path) {
-        if let Some(parent) = path.parent() { let _ = fs::create_dir_all(parent); }
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
     }
 
     fn open_file_append(path: &Path) -> std::io::Result<File> {
@@ -68,7 +80,9 @@ impl VoteJournal {
         OpenOptions::new().create(true).append(true).open(path)
     }
 
-    fn open_file_read(path: &Path) -> std::io::Result<File> { OpenOptions::new().read(true).open(path) }
+    fn open_file_read(path: &Path) -> std::io::Result<File> {
+        OpenOptions::new().read(true).open(path)
+    }
 
     fn load_from_disk(path: &Path) -> VoteDataLru {
         let mut lru = VoteDataLru::new(MAX_RECENT_ENTRIES);
@@ -78,13 +92,19 @@ impl VoteJournal {
             // Each line is expected to be a JSON-serialized VoteEnvelope
             let mut buf: Vec<VoteData> = Vec::with_capacity(MAX_RECENT_ENTRIES);
             for line in reader.lines().map_while(Result::ok) {
-                if line.is_empty() { continue; }
+                if line.is_empty() {
+                    continue;
+                }
                 if let Ok(env) = serde_json::from_str::<VoteEnvelope>(&line) {
                     buf.push(env.data);
-                    if buf.len() > MAX_RECENT_ENTRIES { buf.remove(0); }
+                    if buf.len() > MAX_RECENT_ENTRIES {
+                        buf.remove(0);
+                    }
                 }
             }
-            for vd in buf { lru.add(vd.target_number, vd); }
+            for vd in buf {
+                lru.add(vd.target_number, vd);
+            }
         }
         lru
     }
@@ -98,9 +118,9 @@ impl VoteJournal {
     /// Returns true if the vote is allowed under rules, along with the provided source/target context.
     pub fn under_rules(&self, source_number: u64, target_number: u64) -> bool {
         // Rule 1: must not publish two distinct votes for the same height
-        if self.lru.contains(target_number) { 
+        if self.lru.contains(target_number) {
             tracing::trace!(target: "bsc::vote", reason = "duplicate-height", target_number=target_number, "skip vote production");
-            return false; 
+            return false;
         }
 
         // Rule 2: must not vote within the span of its other votes
@@ -111,9 +131,9 @@ impl VoteJournal {
         }
         while block_number < target_number {
             if let Some(vd) = self.lru.get(block_number) {
-                if vd.source_number > source_number { 
+                if vd.source_number > source_number {
                     tracing::trace!(target: "bsc::vote", reason = "backward-window", block_number=block_number, source_number=source_number, vd.source_number=vd.source_number, "skip vote production");
-                    return false; 
+                    return false;
                 }
             }
             block_number += 1;
@@ -123,9 +143,9 @@ impl VoteJournal {
         let upper = target_number + UPPER_LIMIT_OF_VOTE_BLOCK_NUMBER;
         while bn <= upper {
             if let Some(vd) = self.lru.get(bn) {
-                if vd.source_number < source_number { 
+                if vd.source_number < source_number {
                     tracing::trace!(target: "bsc::vote", reason = "forward-window", block_number=bn, source_number=source_number, vd.source_number=vd.source_number, "skip vote production");
-                    return false; 
+                    return false;
                 }
             }
             bn += 1;
@@ -160,10 +180,14 @@ static GLOBAL_JOURNAL: LazyLock<Mutex<VoteJournal>> = LazyLock::new(|| {
 });
 
 /// Get a guard to the global vote journal.
-pub fn global() -> std::sync::MutexGuard<'static, VoteJournal> { GLOBAL_JOURNAL.lock().expect("vote journal poisoned") }
+pub fn global() -> std::sync::MutexGuard<'static, VoteJournal> {
+    GLOBAL_JOURNAL.lock().expect("vote journal poisoned")
+}
 
 /// Helper for external modules to check the rules via global journal.
-pub fn under_rules(source_number: u64, target_number: u64) -> bool { global().under_rules(source_number, target_number) }
+pub fn under_rules(source_number: u64, target_number: u64) -> bool {
+    global().under_rules(source_number, target_number)
+}
 
 /// Helper for external modules to persist a signed vote via global journal.
 pub fn persist_vote(env: &VoteEnvelope) -> Result<(), String> {
@@ -176,10 +200,8 @@ mod tests {
     use alloy_primitives::B256;
 
     fn tmp_path(name: &str) -> PathBuf {
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let ts =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         std::env::temp_dir().join(format!("{}_{}.jsonl", name, ts))
     }
 
@@ -187,7 +209,12 @@ mod tests {
         VoteEnvelope {
             vote_address: Default::default(),
             signature: Default::default(),
-            data: VoteData { source_number: src_n, source_hash: src_h, target_number: tgt_n, target_hash: tgt_h },
+            data: VoteData {
+                source_number: src_n,
+                source_hash: src_h,
+                target_number: tgt_n,
+                target_hash: tgt_h,
+            },
         }
     }
 

@@ -1,13 +1,14 @@
+use crate::node::miner::signer::MinerSigner;
+use alloy_consensus::Transaction as TxTrait;
 use alloy_consensus::TxLegacy;
-use alloy_primitives::{Address, Bytes, B256, TxKind, U256};
+use alloy_primitives::{Address, Bytes, TxKind, B256, U256};
 use alloy_sol_macro::sol;
 use alloy_sol_types::SolCall;
-use crate::node::miner::signer::MinerSigner;
-use reth_primitives::{Transaction, TransactionSigned};
-use reth_primitives_traits::SignerRecoverable;
-use alloy_consensus::Transaction as TxTrait;
-use secp256k1::SecretKey;
 use rand::Rng;
+use reth_primitives::{Transaction, TransactionSigned};
+use alloy_consensus::transaction::Recovered;
+use reth_primitives_traits::SignerRecoverable;
+use secp256k1::SecretKey;
 use std::collections::HashMap;
 
 // Simple ERC20 contract - minimal implementation for benchmarking
@@ -46,10 +47,14 @@ pub const SIMPLE_ERC20_BYTECODE: &str = concat!(
     "6001600160a01b038116811461019b57600080fd5b94602093909301359350505056fea264"
 );
 
-/// Pre-generated pool of signed transactions.
+/// Pre-generated pool of pre-recovered transactions.
+///
+/// Transactions are recovered (ecrecover) eagerly during pool generation so that the
+/// benchmark loop only measures block-building work — matching production where txs arrive
+/// pre-recovered from the P2P mempool.
 pub struct TxPool {
-    /// Transactions grouped by block. Each entry is a Vec of signed txs for one block.
-    pub blocks: Vec<Vec<TransactionSigned>>,
+    /// Transactions grouped by block. Each entry is a Vec of pre-recovered txs for one block.
+    pub blocks: Vec<Vec<Recovered<TransactionSigned>>>,
     /// ERC20 contract address (deployed in genesis or block 0)
     pub erc20_address: Address,
 }
@@ -111,14 +116,16 @@ pub fn generate_tx_pool(
             let signed = signer.sign_transaction(tx).expect("signing failed");
 
             *nonce += 1;
-            block_txs.push(signed);
+
+            // Pre-recover immediately (mirrors production: txs enter mempool pre-recovered)
+            let recovered = signed.try_into_recovered().expect("just-signed tx must recover");
+            block_txs.push(recovered);
         }
 
-        // Sort by (sender, nonce) so the EVM processes each sender's txs in order
+        // Sort by (sender, nonce) so the EVM processes each sender's txs in order.
+        // No ecrecover needed — signer is already cached in Recovered.
         block_txs.sort_by(|a, b| {
-            let sa = a.recover_signer().unwrap_or_default();
-            let sb = b.recover_signer().unwrap_or_default();
-            sa.cmp(&sb).then(a.nonce().cmp(&b.nonce()))
+            a.signer().cmp(&b.signer()).then(a.nonce().cmp(&b.nonce()))
         });
 
         blocks.push(block_txs);
@@ -136,7 +143,11 @@ pub fn generate_tx_pool(
 
 /// Get the deploy transaction for a simple ERC20 contract.
 /// The deployer gets max balance minted in the constructor.
-pub fn erc20_deploy_tx(deployer_key: &B256, nonce: u64, chain_id: u64) -> (TransactionSigned, Address) {
+pub fn erc20_deploy_tx(
+    deployer_key: &B256,
+    nonce: u64,
+    chain_id: u64,
+) -> (Recovered<TransactionSigned>, Address) {
     let bytecode = hex::decode(SIMPLE_ERC20_BYTECODE).expect("valid hex bytecode");
 
     let tx = Transaction::Legacy(TxLegacy {
@@ -152,12 +163,13 @@ pub fn erc20_deploy_tx(deployer_key: &B256, nonce: u64, chain_id: u64) -> (Trans
     let sk = SecretKey::from_slice(deployer_key.as_ref()).expect("valid key");
     let signer = MinerSigner::new(sk);
     let signed = signer.sign_transaction(tx).expect("signing failed");
+    let recovered = signed.try_into_recovered().expect("just-signed tx must recover");
 
     // Compute contract address: keccak256(rlp([sender, nonce]))[12..]
     let deployer_addr = crate::bench::db_init::address_from_private_key(deployer_key);
     let contract_addr = deployer_addr.create(nonce);
 
-    (signed, contract_addr)
+    (recovered, contract_addr)
 }
 
 /// Create ERC20 transfer transactions to distribute initial tokens to all funded accounts.
@@ -168,7 +180,7 @@ pub fn erc20_distribution_txs(
     erc20_address: Address,
     start_nonce: u64,
     chain_id: u64,
-) -> Vec<TransactionSigned> {
+) -> Vec<Recovered<TransactionSigned>> {
     let sk = SecretKey::from_slice(deployer_key.as_ref()).expect("valid key");
     let signer = MinerSigner::new(sk);
     let mut txs = Vec::with_capacity(funded_accounts.len());
@@ -188,7 +200,7 @@ pub fn erc20_distribution_txs(
         });
 
         let signed = signer.sign_transaction(tx).expect("signing failed");
-        txs.push(signed);
+        txs.push(signed.try_into_recovered().expect("just-signed tx must recover"));
     }
 
     txs

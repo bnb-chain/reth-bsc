@@ -15,17 +15,17 @@ impl Encodable for BscCapPacket {
     fn encode(&self, out: &mut dyn BufMut) {
         // Message ID should be sent as raw byte, not RLP-encoded
         out.put_u8(BscProtoMessageId::Capability as u8);
-        
+
         // Encode as RLP list: [protocol_version, extra]
         // Extra is raw RLP data (like Go's rlp.RawValue), so insert directly
         let protocol_version_encoded = alloy_rlp::encode(self.protocol_version);
-        
+
         // Calculate list payload length (protocol_version + raw extra data)
         let payload_length = protocol_version_encoded.len() + self.extra.len();
-        
-        // Encode list header  
+
+        // Encode list header
         alloy_rlp::Header { list: true, payload_length }.encode(out);
-        
+
         // Encode protocol version
         out.put_slice(&protocol_version_encoded);
         // Insert raw extra data directly (no additional RLP encoding)
@@ -50,9 +50,9 @@ impl Decodable for BscCapPacket {
         if !header.list {
             return Err(alloy_rlp::Error::UnexpectedString);
         }
-        
+
         let protocol_version = u64::decode(buf)?;
-        
+
         // Extra is raw RLP data - read remaining bytes directly
         let remaining_len = header.payload_length - 1; // -1 for protocol_version (single byte)
         if buf.len() < remaining_len {
@@ -111,10 +111,10 @@ pub fn handle_votes_broadcast(packet: VotesPacket) {
     if let Some(first) = packet.0.into_iter().next() {
         tracing::trace!(target: "bsc::vote", "insert first vote into local pool, target_number: {}, target_hash: {}", first.data.target_number, first.data.target_hash);
         votes::put_vote(first);
-        
+
         // Update vote pool size metric
-        use once_cell::sync::Lazy;
         use crate::metrics::BscVoteMetrics;
+        use once_cell::sync::Lazy;
         static VOTE_METRICS: Lazy<BscVoteMetrics> = Lazy::new(BscVoteMetrics::default);
         VOTE_METRICS.vote_pool_size.set(votes::len() as f64);
     }

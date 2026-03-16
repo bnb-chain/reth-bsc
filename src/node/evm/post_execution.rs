@@ -1,5 +1,5 @@
-use super::executor::BscBlockExecutor;
 use super::error::{BscBlockExecutionError, BscBlockValidationError};
+use super::executor::BscBlockExecutor;
 use super::util::set_nonce;
 use super::config::revm_spec_by_timestamp_and_block_number;
 use crate::consensus::parlia::{FF_REWARD_DISTRIBUTION_INTERVAL};
@@ -49,7 +49,12 @@ where
                 + FromTxWithEncoded<TransactionSigned>,
         BlockEnv = BlockEnv,
     >,
-    Spec: EthereumHardforks + crate::hardforks::BscHardforks + EthChainSpec + Hardforks + Clone + 'static,
+    Spec: EthereumHardforks
+        + crate::hardforks::BscHardforks
+        + EthChainSpec
+        + Hardforks
+        + Clone
+        + 'static,
     R: ReceiptBuilder<Transaction = TransactionSigned, Receipt: TxReceipt>,
     <R as ReceiptBuilder>::Transaction: Unpin + From<TransactionSigned>,
     <EVM as alloy_evm::Evm>::Tx: FromTxWithEncoded<<R as ReceiptBuilder>::Transaction>,
@@ -59,8 +64,8 @@ where
     /// post check the new block, post check some parlia field and the system txs.
     /// depends on parlia, header and snapshot.
     pub(crate) fn post_check_new_block(
-        &mut self, 
-        block: &BlockEnv
+        &mut self,
+        block: &BlockEnv,
     ) -> Result<(), BlockExecutionError> {
         tracing::debug!("Start to post check new block, block_number: {}, is_miner: {}", block.number(), self.ctx.is_miner); 
         self.verify_validators(self.inner_ctx.current_validators.clone(), self.inner_ctx.header.clone())?;
@@ -102,18 +107,24 @@ where
         let header_timestamp = self.evm.block().timestamp().to::<u64>();
         let header_beneficiary = self.evm.block().beneficiary();
         let parent_header = self.inner_ctx.parent_header.as_ref().unwrap().clone();
-        if self.spec.is_feynman_active_at_timestamp(header_number, header_timestamp) &&
-            is_breathe_block(parent_header.timestamp, header_timestamp) &&
-            !self.spec.is_feynman_transition_at_timestamp(header_number, header_timestamp, parent_header.timestamp)
+        if self.spec.is_feynman_active_at_timestamp(header_number, header_timestamp)
+            && is_breathe_block(parent_header.timestamp, header_timestamp)
+            && !self.spec.is_feynman_transition_at_timestamp(
+                header_number,
+                header_timestamp,
+                parent_header.timestamp,
+            )
         {
-            let max_elected_validators = self.inner_ctx.max_elected_validators.unwrap_or(U256::from(21));
-            let validators_election_info = self.inner_ctx.validators_election_info.clone().unwrap_or_default();
- 
+            let max_elected_validators =
+                self.inner_ctx.max_elected_validators.unwrap_or(U256::from(21));
+            let validators_election_info =
+                self.inner_ctx.validators_election_info.clone().unwrap_or_default();
+
             self.update_validator_set_v2(
-                 max_elected_validators,
-                 validators_election_info.clone(),
-                 header_beneficiary,
-             )?;
+                max_elected_validators,
+                validators_election_info.clone(),
+                header_beneficiary,
+            )?;
             tracing::debug!("Update validator set, block_number: {}, max_elected_validators: {}, validators_election_info: {:?}", 
                 header_number, max_elected_validators, validators_election_info);
         }
@@ -127,36 +138,39 @@ where
             for tx in self.system_txs.iter() {
                 tracing::error!("remaining system tx: {:?}", tx);
             }
-            return Err(BscBlockExecutionError::Validation(BscBlockValidationError::UnexpectedSystemTx).into());
+            return Err(BscBlockExecutionError::Validation(
+                BscBlockValidationError::UnexpectedSystemTx,
+            )
+            .into());
         }
 
         let header = self.inner_ctx.header.as_ref().unwrap().clone();
-        
+
         // Notes: here we get the current block's snapshot (after applying this block's header) to prepare cache.
         // This is important because epoch_num may change during block application
-        let current_snap = self
-            .snapshot_provider
-            .as_ref()
-            .unwrap()
-            .snapshot_by_hash(&header.hash_slow())
-            .ok_or(BlockExecutionError::msg("Failed to get current snapshot from snapshot provider"))?;
-        
+        let current_snap =
+            self.snapshot_provider.as_ref().unwrap().snapshot_by_hash(&header.hash_slow()).ok_or(
+                BlockExecutionError::msg("Failed to get current snapshot from snapshot provider"),
+            )?;
+
         // Use epoch_num from current snapshot (after apply) for epoch boundary check
         let epoch_length = current_snap.epoch_num;
         let is_next_epoch = (header.number + 1).is_multiple_of(epoch_length);
-        if is_next_epoch {  // cache validators
+        if is_next_epoch {
+            // cache validators
             // cache it on pre block.
             // for verify validators in post-check of fullnode mode and prepare new header in miner mode.
             self.get_current_validators_with_cache(header.number, header.hash_slow())?;
         }
 
-        { // cache turnlength
+        {
+            // cache turnlength
             let is_bohr = self.spec.is_bohr_active_at_timestamp(header.number, header.timestamp);
             tracing::debug!(
                 "Check turn length cache update: block_number={}, epoch_length={}, is_next_epoch={}, is_bohr={}",
                 header.number, epoch_length, is_next_epoch, is_bohr
             );
-            
+
             if is_next_epoch && is_bohr {
                 let turn_length = self.get_turn_length(header.number, header.timestamp)?;
                 let mut cache = TURN_LENGTH_CACHE.lock().unwrap();
@@ -170,19 +184,23 @@ where
     }
 
     fn verify_validators(
-        &mut self, 
-        current_validators: Option<(Vec<Address>, HashMap<Address, VoteAddress>)>, 
-        header: Option<Header>
+        &mut self,
+        current_validators: Option<(Vec<Address>, HashMap<Address, VoteAddress>)>,
+        header: Option<Header>,
     ) -> Result<(), BlockExecutionError> {
         let header_ref = header.as_ref().unwrap();
         let epoch_length = self.inner_ctx.snap.as_ref().unwrap().epoch_num;
         if !header_ref.number.is_multiple_of(epoch_length) {
-            tracing::trace!("Skip verify validator, block_number {} is not an epoch boundary, epoch_length: {}", header_ref.number, epoch_length);
+            tracing::trace!(
+                "Skip verify validator, block_number {} is not an epoch boundary, epoch_length: {}",
+                header_ref.number,
+                epoch_length
+            );
             return Ok(());
         }
 
-        let (mut validators, mut vote_addrs_map) =
-            current_validators.ok_or(BlockExecutionError::msg("Invalid current validators data"))?;
+        let (mut validators, mut vote_addrs_map) = current_validators
+            .ok_or(BlockExecutionError::msg("Invalid current validators data"))?;
         validators.sort();
 
         let validator_num = validators.len();
@@ -205,24 +223,28 @@ where
             })
             .collect();
 
-        let expected = self.parlia.get_validator_bytes_from_header(header_ref, epoch_length).unwrap();
+        let expected =
+            self.parlia.get_validator_bytes_from_header(header_ref, epoch_length).unwrap();
         if !validator_bytes.as_slice().eq(expected.as_slice()) {
             warn!("validator bytes: {:?}", hex::encode(validator_bytes));
             warn!("expected: {:?}", hex::encode(expected));
             return Err(BlockExecutionError::msg("Invalid validators"));
         }
-        tracing::debug!("Succeed to verify validators, block_number: {}, epoch_length: {}", header_ref.number, epoch_length);
+        tracing::debug!(
+            "Succeed to verify validators, block_number: {}, epoch_length: {}",
+            header_ref.number,
+            epoch_length
+        );
 
         Ok(())
     }
 
-    fn verify_turn_length(
-        &mut self, 
-        header: Option<Header>
-    ) -> Result<(), BlockExecutionError> {
+    fn verify_turn_length(&mut self, header: Option<Header>) -> Result<(), BlockExecutionError> {
         let header_ref = header.as_ref().unwrap();
         let epoch_length = self.inner_ctx.snap.as_ref().unwrap().epoch_num;
-        if !header_ref.number.is_multiple_of(epoch_length) || !self.spec.is_bohr_active_at_timestamp(header_ref.number, header_ref.timestamp) {
+        if !header_ref.number.is_multiple_of(epoch_length)
+            || !self.spec.is_bohr_active_at_timestamp(header_ref.number, header_ref.timestamp)
+        {
             tracing::trace!("Skip verify turn length, block_number {} is not an epoch boundary, epoch_length: {}", header_ref.number, epoch_length);
             return Ok(());
         }
@@ -237,7 +259,7 @@ where
         let expected_turn_length = self.inner_ctx.expected_turn_length;
         if turn_length_matches(turn_length_from_header, expected_turn_length) {
             tracing::debug!("Succeed to verify turn length, block_number: {}", header_ref.number);
-            return Ok(())
+            return Ok(());
         }
 
         tracing::warn!(
@@ -248,20 +270,22 @@ where
             epoch_length
         );
         Err(BscBlockExecutionError::Validation(
-            BscBlockValidationError::MismatchingEpochTurnLengthError
-        ).into())
+            BscBlockValidationError::MismatchingEpochTurnLengthError,
+        )
+        .into())
     }
 
     pub(crate) fn get_turn_length(
         &mut self,
         header_number: BlockNumber,
-        header_timestamp: u64
+        header_timestamp: u64,
     ) -> Result<u8, BlockExecutionError> {
         if self.spec.is_bohr_active_at_timestamp(header_number, header_timestamp) {
             let (to, data) = self.system_contracts.get_turn_length();
             let bz = self.eth_call(to, data)?;
 
-            let turn_length = self.system_contracts.unpack_data_into_turn_length(bz.as_ref()).to::<u8>();
+            let turn_length =
+                self.system_contracts.unpack_data_into_turn_length(bz.as_ref()).to::<u8>();
             return Ok(turn_length);
         }
 
@@ -271,28 +295,26 @@ where
     fn slash_spoiled_validator(
         &mut self,
         validator: Address,
-        spoiled_val: Address
+        spoiled_val: Address,
     ) -> Result<(), BlockExecutionError> {
-        self.transact_system_tx(
-            self.system_contracts.slash(spoiled_val),
-            validator,
-        )?;
+        self.transact_system_tx(self.system_contracts.slash(spoiled_val), validator)?;
 
         Ok(())
     }
 
     pub(crate) fn transact_system_tx(
-        &mut self, 
-        transaction: Transaction, 
-        sender: Address
+        &mut self,
+        transaction: Transaction,
+        sender: Address,
     ) -> Result<(), BlockExecutionError> {
         // Record system contract call
         self.executor_metrics.system_contract_calls_total.increment(1);
-        
+
         // Start timing for system contract duration
         let start_time = std::time::Instant::now();
-        
-        let account = self.evm
+
+        let account = self
+            .evm
             .db_mut()
             .basic(sender)
             .map_err(BlockExecutionError::other)?
@@ -305,10 +327,9 @@ where
             if self.system_txs.is_empty() || hash != self.system_txs[0].signature_hash() {
                 // slash tx could fail and not in the block
                 if let Some(to) = transaction.to() {
-                    if to == SLASH_CONTRACT &&
-                        (self.system_txs.is_empty() ||
-                            self.system_txs[0].to().unwrap_or_default() !=
-                                SLASH_CONTRACT)
+                    if to == SLASH_CONTRACT
+                        && (self.system_txs.is_empty()
+                            || self.system_txs[0].to().unwrap_or_default() != SLASH_CONTRACT)
                     {
                         warn!("slash validator failed");
                         return Ok(());
@@ -320,8 +341,9 @@ where
                 }
                 self.executor_metrics.system_contract_errors_total.increment(1);
                 return Err(BscBlockExecutionError::Validation(
-                    BscBlockValidationError::UnexpectedSystemTx
-                ).into());
+                    BscBlockValidationError::UnexpectedSystemTx,
+                )
+                .into());
             }
             Some(self.system_txs.remove(0))
         } else if is_signer_initialized() {
@@ -330,7 +352,10 @@ where
                 Err(e) => {
                     tracing::warn!("Failed to sign system transaction: {}", e);
                     self.executor_metrics.system_contract_errors_total.increment(1);
-                    return Err(BscBlockExecutionError::FailedToSignSystemTransaction { error: e.to_string() }.into());
+                    return Err(BscBlockExecutionError::FailedToSignSystemTransaction {
+                        error: e.to_string(),
+                    }
+                    .into());
                 }
             }
         } else {
@@ -341,9 +366,10 @@ where
 
         if self.ctx.is_miner {
             if let Some(signed) = signed_tx.clone() {
-                let recovered = signed.clone().try_into_recovered_unchecked().unwrap_or_else(|_| {
-                    panic!("Failed to recover system transaction signature")
-                });
+                let recovered = signed
+                    .clone()
+                    .try_into_recovered_unchecked()
+                    .unwrap_or_else(|_| panic!("Failed to recover system transaction signature"));
                 self.shared_ctx.inner.borrow_mut().assembled_system_txs.push(recovered);
 
                 if transaction.to() == Some(STAKE_HUB_CONTRACT) {
@@ -418,11 +444,12 @@ where
         let ResultAndState { result, state } = result_and_state;
         let mut temp_state = state.clone();
         temp_state.remove(&SYSTEM_ADDRESS);
-        self.system_caller.on_state(StateChangeSource::Transaction(self.receipts.len()), &temp_state);
+        self.system_caller
+            .on_state(StateChangeSource::Transaction(self.receipts.len()), &temp_state);
 
         let gas_used = result.gas_used();
         self.gas_used += gas_used;
-        
+
         // Record system transaction gas usage
         self.executor_metrics.system_tx_gas_used_total.increment(gas_used);
 
@@ -442,18 +469,15 @@ where
         Ok(())
     }
 
-    fn distribute_incoming(
-        &mut self,
-        validator: Address,
-    ) -> Result<(), BlockExecutionError> {
+    fn distribute_incoming(&mut self, validator: Address) -> Result<(), BlockExecutionError> {
         let system_account = self
             .evm
             .db_mut()
             .load_cache_account(SYSTEM_ADDRESS)
             .map_err(BlockExecutionError::other)?;
 
-        if system_account.account.is_none() ||
-            system_account.account.as_ref().unwrap().info.balance == U256::ZERO
+        if system_account.account.is_none()
+            || system_account.account.as_ref().unwrap().info.balance == U256::ZERO
         {
             return Ok(());
         }
@@ -491,7 +515,9 @@ where
                 // Track system rewards distribution
                 self.rewards_metrics.system_rewards_distributed_total.increment(1);
                 // Note: Truncating to u64 for metrics (large rewards unlikely)
-                self.rewards_metrics.system_rewards_amount_wei_total.increment(reward_to_system.min(u128::from(u64::MAX)) as u64);
+                self.rewards_metrics
+                    .system_rewards_amount_wei_total
+                    .increment(reward_to_system.min(u128::from(u64::MAX)) as u64);
             }
 
             block_reward -= reward_to_system;
@@ -505,14 +531,14 @@ where
         // Track validator rewards distribution
         self.rewards_metrics.validator_rewards_distributed_total.increment(1);
         // Note: Truncating to u64 for metrics (large rewards unlikely)
-        self.rewards_metrics.validator_rewards_amount_wei_total.increment(block_reward.min(u128::from(u64::MAX)) as u64);
-        
+        self.rewards_metrics
+            .validator_rewards_amount_wei_total
+            .increment(block_reward.min(u128::from(u64::MAX)) as u64);
+
         Ok(())
     }
 
-    fn distribute_finality_reward(
-        &mut self,
-    ) -> Result<(), BlockExecutionError> {
+    fn distribute_finality_reward(&mut self) -> Result<(), BlockExecutionError> {
         // distribute finality reward per FF_REWARD_DISTRIBUTION_INTERVAL blocks.
         let block_number = self.evm.block().number().to::<u64>();
         if !block_number.is_multiple_of(FF_REWARD_DISTRIBUTION_INTERVAL) {
@@ -528,13 +554,15 @@ where
         // query block header and snapshot by hash from cache.
         let mut target_hash = self.ctx.base.parent_hash;
         for _ in (start..end).rev() {
-            let header = get_header_by_hash_from_cache(&target_hash).
-                ok_or_else(|| BlockExecutionError::msg(format!("Header not found for block hash: {target_hash}")))?;
-            let snap = self.snapshot_provider.
-                as_ref().
-                unwrap().
-                snapshot_by_hash(&header.parent_hash).
-                ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;
+            let header = get_header_by_hash_from_cache(&target_hash).ok_or_else(|| {
+                BlockExecutionError::msg(format!("Header not found for block hash: {target_hash}"))
+            })?;
+            let snap = self
+                .snapshot_provider
+                .as_ref()
+                .unwrap()
+                .snapshot_by_hash(&header.parent_hash)
+                .ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;
 
             if let Some(attestation) =
                 self.parlia.get_vote_attestation_from_header(&header, snap.epoch_num).map_err(|err| {
@@ -567,11 +595,22 @@ where
         accumulated_weights: &mut std::collections::HashMap<Address, U256>,
     ) -> Result<(), BlockExecutionError> {
         let justified_header = get_header_by_hash_from_cache(&attestation.data.target_hash)
-            .ok_or_else(|| BlockExecutionError::msg(format!("Header not found, block_hash: {}", attestation.data.target_hash)))?;
-        let parent = get_header_by_hash_from_cache(&justified_header.parent_hash)
-            .ok_or_else(|| BlockExecutionError::msg(format!("Header not found, block_hash: {}", justified_header.parent_hash)))?;
-        let snapshot = self.snapshot_provider.as_ref().unwrap().snapshot_by_hash(&parent.hash_slow());
-        let validators = &snapshot.unwrap().validators;  
+            .ok_or_else(|| {
+                BlockExecutionError::msg(format!(
+                    "Header not found, block_hash: {}",
+                    attestation.data.target_hash
+                ))
+            })?;
+        let parent =
+            get_header_by_hash_from_cache(&justified_header.parent_hash).ok_or_else(|| {
+                BlockExecutionError::msg(format!(
+                    "Header not found, block_hash: {}",
+                    justified_header.parent_hash
+                ))
+            })?;
+        let snapshot =
+            self.snapshot_provider.as_ref().unwrap().snapshot_by_hash(&parent.hash_slow());
+        let validators = &snapshot.unwrap().validators;
         let mut validators_bit_set = BitSet::new();
         let vote_address_set = attestation.vote_address_set;
         for i in 0..64 {
@@ -585,8 +624,9 @@ where
                 BscBlockValidationError::InvalidAttestationVoteCount(GotExpected {
                     got: validators_bit_set.len() as u64,
                     expected: validators.len() as u64,
-                })
-            ).into());
+                }),
+            )
+            .into());
         }
 
         let mut valid_vote_count = 0;
@@ -606,8 +646,7 @@ where
         }
 
         Ok(())
-    
-    }   
+    }
 
     fn update_validator_set_v2(
         &mut self,
@@ -628,8 +667,8 @@ where
 
     /// generate system txs and apply them, used by miner.
     pub(crate) fn finalize_new_block(
-        &mut self, 
-        block: &BlockEnv
+        &mut self,
+        block: &BlockEnv,
     ) -> Result<(), BlockExecutionError> {
         tracing::debug!("Start to finalize new block, block_number: {}, is_miner: {}", block.number(), self.ctx.is_miner);
         let snap = self.inner_ctx.snap.as_ref().unwrap();
@@ -670,44 +709,52 @@ where
         let header_timestamp = self.evm.block().timestamp().to::<u64>();
         let header_beneficiary = self.evm.block().beneficiary();
         let parent_header = self.inner_ctx.parent_header.as_ref().unwrap().clone();
-        if self.spec.is_feynman_active_at_timestamp(header_number, header_timestamp) &&
-            is_breathe_block(parent_header.timestamp, header_timestamp) &&
-            !self.spec.is_feynman_transition_at_timestamp(header_number, header_timestamp, parent_header.timestamp)
+        if self.spec.is_feynman_active_at_timestamp(header_number, header_timestamp)
+            && is_breathe_block(parent_header.timestamp, header_timestamp)
+            && !self.spec.is_feynman_transition_at_timestamp(
+                header_number,
+                header_timestamp,
+                parent_header.timestamp,
+            )
         {
-            let max_elected_validators = self.inner_ctx.max_elected_validators.unwrap_or(U256::from(21));
-            let validators_election_info = self.inner_ctx.validators_election_info.clone().unwrap_or_default();
- 
+            let max_elected_validators =
+                self.inner_ctx.max_elected_validators.unwrap_or(U256::from(21));
+            let validators_election_info =
+                self.inner_ctx.validators_election_info.clone().unwrap_or_default();
+
             self.update_validator_set_v2(
-                 max_elected_validators,
-                 validators_election_info.clone(),
-                 header_beneficiary,
-             )?;
+                max_elected_validators,
+                validators_election_info.clone(),
+                header_beneficiary,
+            )?;
             tracing::debug!("Update validator set, block_number: {}, max_elected_validators: {}, validators_election_info: {:?}", 
                 header_number, max_elected_validators, validators_election_info);
         }
 
-        
         // TODO: remove post cache later.
         // Use epoch_num from current snapshot (after apply) for epoch boundary check
         let is_next_epoch = (header_number + 1).is_multiple_of(epoch_length);
-        if is_next_epoch {  
+        if is_next_epoch {
             // cache validators
             tracing::debug!(
                 "Check validator cache update: block_number={}, epoch_length={}, is_next_epoch={}",
-                header_number, epoch_length, is_next_epoch
+                header_number,
+                epoch_length,
+                is_next_epoch
             );
             let (validators, vote_addresses) = self.get_current_validators(header_number)?;
-            self.shared_ctx.inner.borrow_mut().current_validators = Some((validators, vote_addresses));
+            self.shared_ctx.inner.borrow_mut().current_validators =
+                Some((validators, vote_addresses));
         }
 
-        { 
+        {
             // cache turnlength
             let is_bohr = self.spec.is_bohr_active_at_timestamp(header_number, header_timestamp);
             tracing::debug!(
                 "Check turn length cache update: block_number={}, epoch_length={}, is_next_epoch={}, is_bohr={}",
                 header_number, epoch_length, is_next_epoch, is_bohr
             );
-            
+
             if is_next_epoch && is_bohr {
                 let turn_length = self.get_turn_length(header_number, header_timestamp)?;
                 self.shared_ctx.inner.borrow_mut().turn_length = Some(turn_length);

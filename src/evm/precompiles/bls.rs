@@ -3,7 +3,7 @@
 use alloy_primitives::Bytes;
 use bls_on_arkworks as bls;
 use revm::precompile::{
-    u64_to_address, PrecompileError, PrecompileOutput, PrecompileResult, Precompile, PrecompileId,
+    u64_to_address, Precompile, PrecompileError, PrecompileId, PrecompileOutput, PrecompileResult,
 };
 use std::vec::Vec;
 
@@ -32,10 +32,10 @@ fn bls_signature_validation_run(input: &[u8], gas_limit: u64) -> PrecompileResul
 
     let msg_and_sig_length = BLS_MSG_HASH_LENGTH + BLS_SIGNATURE_LENGTH;
     let input_length = input.len() as u64;
-    if (input_length <= msg_and_sig_length) ||
-        !((input_length - msg_and_sig_length).is_multiple_of(BLS_SINGLE_PUBKEY_LENGTH))
+    if (input_length <= msg_and_sig_length)
+        || !((input_length - msg_and_sig_length).is_multiple_of(BLS_SINGLE_PUBKEY_LENGTH))
     {
-        return revert()
+        return revert();
     }
 
     let msg_hash: &Vec<u8> = &input[..BLS_MSG_HASH_LENGTH as usize].to_vec();
@@ -44,7 +44,7 @@ fn bls_signature_validation_run(input: &[u8], gas_limit: u64) -> PrecompileResul
 
     // check signature format
     if bls::signature_to_point(&signature.to_vec()).is_err() {
-        return revert()
+        return revert();
     }
 
     let pub_key_count = (input_length - msg_and_sig_length) / BLS_SINGLE_PUBKEY_LENGTH;
@@ -53,22 +53,22 @@ fn bls_signature_validation_run(input: &[u8], gas_limit: u64) -> PrecompileResul
 
     // check pubkey format and push to pub_keys
     for i in 0..pub_key_count {
-        let pub_key = &pub_keys_data[i as usize * BLS_SINGLE_PUBKEY_LENGTH as usize..
-            (i + 1) as usize * BLS_SINGLE_PUBKEY_LENGTH as usize];
+        let pub_key = &pub_keys_data[i as usize * BLS_SINGLE_PUBKEY_LENGTH as usize
+            ..(i + 1) as usize * BLS_SINGLE_PUBKEY_LENGTH as usize];
         if !bls::key_validate(&pub_key.to_vec()) {
-            return revert()
+            return revert();
         }
         pub_keys.push(pub_key.to_vec());
         msg_hashes.push(msg_hash.clone().to_vec());
     }
     if pub_keys.is_empty() {
-        return revert()
+        return revert();
     }
 
     // verify signature
     let mut output = Bytes::from(vec![1]);
-    if (pub_keys.len() == 1 && !bls::verify(&pub_keys[0], msg_hash, signature, &BLS_DST.to_vec())) ||
-        !bls::aggregate_verify(pub_keys, msg_hashes, signature, &BLS_DST.to_vec())
+    if (pub_keys.len() == 1 && !bls::verify(&pub_keys[0], msg_hash, signature, &BLS_DST.to_vec()))
+        || !bls::aggregate_verify(pub_keys, msg_hashes, signature, &BLS_DST.to_vec())
     {
         output = Bytes::from(vec![]);
     }
@@ -84,8 +84,8 @@ fn calc_gas_cost(input: &[u8]) -> u64 {
     let single_pubkey_length = BLS_SINGLE_PUBKEY_LENGTH;
     let input_length = input.len() as u64;
 
-    if (input_length <= msg_length) ||
-        !((input_length - msg_length).is_multiple_of(single_pubkey_length))
+    if (input_length <= msg_length)
+        || !((input_length - msg_length).is_multiple_of(single_pubkey_length))
     {
         return BLS_SIGNATURE_VALIDATION_BASE;
     }

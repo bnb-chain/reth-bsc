@@ -1,10 +1,13 @@
-use std::{path::{Path, PathBuf}, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
-use alloy_primitives::{hex, B256, FixedBytes};
+use alloy_primitives::{hex, FixedBytes, B256};
 use once_cell::sync::OnceCell;
-use zeroize::{Zeroize, Zeroizing};
 use serde_json::Value as JsonValue;
 use std::fs;
+use zeroize::{Zeroize, Zeroizing};
 
 use super::vote::{VoteAddress, VoteData, VoteEnvelope, VoteSignature};
 use blst::min_pk::SecretKey;
@@ -42,12 +45,14 @@ pub struct BlsVoteSigner {
 impl BlsVoteSigner {
     pub fn new_from_bytes(bytes: [u8; 32]) -> Result<Self, BlsSignerError> {
         // Validate secret key by attempting to parse
-        SecretKey::from_bytes(&bytes).map_err(|e| BlsSignerError::InvalidSecret(format!("{e:?}")))?;
+        SecretKey::from_bytes(&bytes)
+            .map_err(|e| BlsSignerError::InvalidSecret(format!("{e:?}")))?;
         Ok(Self { sk_bytes: Zeroizing::new(bytes) })
     }
 
     fn secret_key(&self) -> Result<SecretKey, BlsSignerError> {
-        SecretKey::from_bytes(self.sk_bytes.as_slice()).map_err(|e| BlsSignerError::InvalidSecret(format!("{e:?}")))
+        SecretKey::from_bytes(self.sk_bytes.as_slice())
+            .map_err(|e| BlsSignerError::InvalidSecret(format!("{e:?}")))
     }
 
     pub fn public_key(&self) -> Result<VoteAddress, BlsSignerError> {
@@ -77,9 +82,7 @@ static GLOBAL_BLS_SIGNER: OnceCell<Arc<BlsVoteSigner>> = OnceCell::new();
 pub fn init_global_bls_signer_from_bytes(bytes: [u8; 32]) -> Result<(), BlsSignerError> {
     let signer = Arc::new(BlsVoteSigner::new_from_bytes(bytes)?);
     let vote_addr = signer.public_key()?;
-    GLOBAL_BLS_SIGNER
-        .set(signer)
-        .map_err(|_| BlsSignerError::AlreadyInitialized)?;
+    GLOBAL_BLS_SIGNER.set(signer).map_err(|_| BlsSignerError::AlreadyInitialized)?;
     tracing::info!(
         target: "bsc::bls",
         vote_address = %format!("0x{}", hex::encode(vote_addr)),
@@ -91,29 +94,42 @@ pub fn init_global_bls_signer_from_bytes(bytes: [u8; 32]) -> Result<(), BlsSigne
 pub fn init_global_bls_signer_from_hex(hex_key: &str) -> Result<(), BlsSignerError> {
     let mut raw = hex::decode(hex_key.strip_prefix("0x").unwrap_or(hex_key))
         .map_err(|e| BlsSignerError::InvalidSecret(e.to_string()))?;
-    if raw.len() != 32 { return Err(BlsSignerError::InvalidSecret("BLS secret must be 32 bytes".into())); }
+    if raw.len() != 32 {
+        return Err(BlsSignerError::InvalidSecret("BLS secret must be 32 bytes".into()));
+    }
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&raw);
     raw.zeroize();
     init_global_bls_signer_from_bytes(arr)
 }
 
-pub fn init_global_bls_signer_from_keystore(path: &Path, password: &str) -> Result<(), BlsSignerError> {
+pub fn init_global_bls_signer_from_keystore(
+    path: &Path,
+    password: &str,
+) -> Result<(), BlsSignerError> {
     // If path is a directory (Prysm wallet), search keys/* for keystore(s)
     let target = if path.is_dir() {
         let mut keyfile: Option<PathBuf> = None;
         let keys_dir = path.join("keys");
         if keys_dir.is_dir() {
-            for entry in fs::read_dir(&keys_dir).map_err(|e| BlsSignerError::InvalidSecret(e.to_string()))? {
+            for entry in
+                fs::read_dir(&keys_dir).map_err(|e| BlsSignerError::InvalidSecret(e.to_string()))?
+            {
                 let entry = entry.map_err(|e| BlsSignerError::InvalidSecret(e.to_string()))?;
                 let p = entry.path();
-                if p.extension().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case("json")).unwrap_or(false) {
+                if p.extension()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.eq_ignore_ascii_case("json"))
+                    .unwrap_or(false)
+                {
                     keyfile = Some(p);
                     break;
                 }
             }
         }
-        keyfile.ok_or_else(|| BlsSignerError::InvalidSecret("No keystore JSON found under wallet/keys".into()))?
+        keyfile.ok_or_else(|| {
+            BlsSignerError::InvalidSecret("No keystore JSON found under wallet/keys".into())
+        })?
     } else {
         path.to_path_buf()
     };
@@ -129,15 +145,25 @@ pub fn init_global_bls_signer_from_keystore(path: &Path, password: &str) -> Resu
             tracing::debug!("Reading BLS keystore password from file via file: prefix",);
             match fs::read_to_string(p) {
                 Ok(s) => s.trim_end_matches(['\n', '\r']).to_string(),
-                Err(e) => return Err(BlsSignerError::InvalidSecret(format!("failed to read password file: {e}"))),
+                Err(e) => {
+                    return Err(BlsSignerError::InvalidSecret(format!(
+                        "failed to read password file: {e}"
+                    )))
+                }
             }
         } else {
             let p = Path::new(password);
             if p.is_file() {
-                tracing::warn!("Interpreting BLS keystore password as file path; prefer 'file:<path>' prefix");
+                tracing::warn!(
+                    "Interpreting BLS keystore password as file path; prefer 'file:<path>' prefix"
+                );
                 match fs::read_to_string(p) {
                     Ok(s) => s.trim_end_matches(['\n', '\r']).to_string(),
-                    Err(e) => return Err(BlsSignerError::InvalidSecret(format!("failed to read password file: {e}"))),
+                    Err(e) => {
+                        return Err(BlsSignerError::InvalidSecret(format!(
+                            "failed to read password file: {e}"
+                        )))
+                    }
                 }
             } else {
                 password.to_string()
@@ -160,7 +186,9 @@ pub fn init_global_bls_signer_from_keystore(path: &Path, password: &str) -> Resu
     // Otherwise, try Ethereum V3 keystore
     let mut key_bytes = eth_keystore::decrypt_key(&target, &actual_password)
         .map_err(|e| BlsSignerError::InvalidSecret(e.to_string()))?;
-    if key_bytes.len() != 32 { return Err(BlsSignerError::InvalidSecret("BLS secret must be 32 bytes".into())); }
+    if key_bytes.len() != 32 {
+        return Err(BlsSignerError::InvalidSecret("BLS secret must be 32 bytes".into()));
+    }
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&key_bytes);
     key_bytes.zeroize();
@@ -168,36 +196,72 @@ pub fn init_global_bls_signer_from_keystore(path: &Path, password: &str) -> Resu
 }
 
 fn decrypt_eip2335_keystore(path: &Path, password: &str) -> Result<[u8; 32], BlsSignerError> {
-    let contents = fs::read_to_string(path).map_err(|e| BlsSignerError::InvalidSecret(e.to_string()))?;
-    let v: JsonValue = serde_json::from_str(&contents).map_err(|e| BlsSignerError::InvalidSecret(e.to_string()))?;
+    let contents =
+        fs::read_to_string(path).map_err(|e| BlsSignerError::InvalidSecret(e.to_string()))?;
+    let v: JsonValue = serde_json::from_str(&contents)
+        .map_err(|e| BlsSignerError::InvalidSecret(e.to_string()))?;
 
-    let version = v.get("version").and_then(|x| x.as_u64()).ok_or_else(|| BlsSignerError::InvalidSecret("missing version".into()))?;
-    if version != 4 { return Err(BlsSignerError::InvalidSecret("not EIP-2335 v4".into())); }
+    let version = v
+        .get("version")
+        .and_then(|x| x.as_u64())
+        .ok_or_else(|| BlsSignerError::InvalidSecret("missing version".into()))?;
+    if version != 4 {
+        return Err(BlsSignerError::InvalidSecret("not EIP-2335 v4".into()));
+    }
 
-    let crypto = v.get("crypto").ok_or_else(|| BlsSignerError::InvalidSecret("missing crypto".into()))?;
-    let kdf = crypto.get("kdf").ok_or_else(|| BlsSignerError::InvalidSecret("missing kdf".into()))?;
-    let kdf_fn = kdf.get("function").and_then(|x| x.as_str()).ok_or_else(|| BlsSignerError::InvalidSecret("missing kdf.function".into()))?;
-    let kdf_params = kdf.get("params").ok_or_else(|| BlsSignerError::InvalidSecret("missing kdf.params".into()))?;
+    let crypto =
+        v.get("crypto").ok_or_else(|| BlsSignerError::InvalidSecret("missing crypto".into()))?;
+    let kdf =
+        crypto.get("kdf").ok_or_else(|| BlsSignerError::InvalidSecret("missing kdf".into()))?;
+    let kdf_fn = kdf
+        .get("function")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| BlsSignerError::InvalidSecret("missing kdf.function".into()))?;
+    let kdf_params = kdf
+        .get("params")
+        .ok_or_else(|| BlsSignerError::InvalidSecret("missing kdf.params".into()))?;
     let dklen = kdf_params.get("dklen").and_then(|x| x.as_u64()).unwrap_or(32) as usize;
-    let salt_hex = kdf_params.get("salt").and_then(|x| x.as_str()).ok_or_else(|| BlsSignerError::InvalidSecret("missing kdf.params.salt".into()))?;
+    let salt_hex = kdf_params
+        .get("salt")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| BlsSignerError::InvalidSecret("missing kdf.params.salt".into()))?;
     let mut salt = decode_hex_noprefix(salt_hex)?;
 
     // Derive key
     let mut dk = vec![0u8; dklen];
     match kdf_fn.to_ascii_lowercase().as_str() {
         "scrypt" => {
-            let n = kdf_params.get("n").and_then(|x| x.as_u64()).ok_or_else(|| BlsSignerError::InvalidSecret("missing kdf.params.n".into()))?;
-            let r = kdf_params.get("r").and_then(|x| x.as_u64()).ok_or_else(|| BlsSignerError::InvalidSecret("missing kdf.params.r".into()))? as u32;
-            let p = kdf_params.get("p").and_then(|x| x.as_u64()).ok_or_else(|| BlsSignerError::InvalidSecret("missing kdf.params.p".into()))? as u32;
+            let n = kdf_params
+                .get("n")
+                .and_then(|x| x.as_u64())
+                .ok_or_else(|| BlsSignerError::InvalidSecret("missing kdf.params.n".into()))?;
+            let r = kdf_params
+                .get("r")
+                .and_then(|x| x.as_u64())
+                .ok_or_else(|| BlsSignerError::InvalidSecret("missing kdf.params.r".into()))?
+                as u32;
+            let p = kdf_params
+                .get("p")
+                .and_then(|x| x.as_u64())
+                .ok_or_else(|| BlsSignerError::InvalidSecret("missing kdf.params.p".into()))?
+                as u32;
             // scrypt crate uses log2(N)
-            if n == 0 || (n & (n - 1)) != 0 { return Err(BlsSignerError::InvalidSecret("scrypt N must be power of two".into())); }
+            if n == 0 || (n & (n - 1)) != 0 {
+                return Err(BlsSignerError::InvalidSecret("scrypt N must be power of two".into()));
+            }
             // log2(N) for power-of-two N. Using trailing_zeros avoids magic constants like 64 (u64::BITS).
             let log_n: u8 = n.trailing_zeros() as u8;
-            let params = scrypt::Params::new(log_n, r, p, dklen).map_err(|e| BlsSignerError::InvalidSecret(e.to_string()))?;
-            scrypt::scrypt(password.as_bytes(), &salt, &params, &mut dk).map_err(|e| BlsSignerError::InvalidSecret(e.to_string()))?;
+            let params = scrypt::Params::new(log_n, r, p, dklen)
+                .map_err(|e| BlsSignerError::InvalidSecret(e.to_string()))?;
+            scrypt::scrypt(password.as_bytes(), &salt, &params, &mut dk)
+                .map_err(|e| BlsSignerError::InvalidSecret(e.to_string()))?;
         }
         "pbkdf2" => {
-            let c = kdf_params.get("c").and_then(|x| x.as_u64()).ok_or_else(|| BlsSignerError::InvalidSecret("missing kdf.params.c".into()))? as u32;
+            let c = kdf_params
+                .get("c")
+                .and_then(|x| x.as_u64())
+                .ok_or_else(|| BlsSignerError::InvalidSecret("missing kdf.params.c".into()))?
+                as u32;
             use pbkdf2::pbkdf2_hmac;
             use sha2::Sha256;
             pbkdf2_hmac::<Sha256>(password.as_bytes(), &salt, c, &mut dk);
@@ -208,26 +272,44 @@ fn decrypt_eip2335_keystore(path: &Path, password: &str) -> Result<[u8; 32], Bls
     salt.zeroize();
 
     // Parse cipher params and ciphertext
-    let cipher = crypto.get("cipher").ok_or_else(|| BlsSignerError::InvalidSecret("missing cipher".into()))?;
+    let cipher = crypto
+        .get("cipher")
+        .ok_or_else(|| BlsSignerError::InvalidSecret("missing cipher".into()))?;
     let cipher_fn = cipher.get("function").and_then(|x| x.as_str()).unwrap_or("");
-    let cipher_params = cipher.get("params").ok_or_else(|| BlsSignerError::InvalidSecret("missing cipher.params".into()))?;
-    let iv_hex = cipher_params.get("iv").and_then(|x| x.as_str()).ok_or_else(|| BlsSignerError::InvalidSecret("missing cipher.params.iv".into()))?;
+    let cipher_params = cipher
+        .get("params")
+        .ok_or_else(|| BlsSignerError::InvalidSecret("missing cipher.params".into()))?;
+    let iv_hex = cipher_params
+        .get("iv")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| BlsSignerError::InvalidSecret("missing cipher.params.iv".into()))?;
     let mut iv = decode_hex_noprefix(iv_hex)?;
-    if iv.len() != 16 { return Err(BlsSignerError::InvalidSecret("iv must be 16 bytes".into())); }
-    let ct_hex = cipher.get("message").and_then(|x| x.as_str()).ok_or_else(|| BlsSignerError::InvalidSecret("missing cipher.message".into()))?;
+    if iv.len() != 16 {
+        return Err(BlsSignerError::InvalidSecret("iv must be 16 bytes".into()));
+    }
+    let ct_hex = cipher
+        .get("message")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| BlsSignerError::InvalidSecret("missing cipher.message".into()))?;
     let mut ct = decode_hex_noprefix(ct_hex)?;
 
     // Verify checksum first: sha256(derived_key[16..32] || ciphertext)
-    let checksum = crypto.get("checksum").ok_or_else(|| BlsSignerError::InvalidSecret("missing checksum".into()))?;
+    let checksum = crypto
+        .get("checksum")
+        .ok_or_else(|| BlsSignerError::InvalidSecret("missing checksum".into()))?;
     let checksum_msg = checksum.get("message").and_then(|x| x.as_str()).unwrap_or("");
-    use sha2::{Sha256, Digest};
-    if dklen < 32 { return Err(BlsSignerError::InvalidSecret("dklen too small".into())); }
+    use sha2::{Digest, Sha256};
+    if dklen < 32 {
+        return Err(BlsSignerError::InvalidSecret("dklen too small".into()));
+    }
     let mut hasher = Sha256::new();
     hasher.update(&dk[16..32]);
     hasher.update(&ct);
     let calc = hasher.finalize();
     let calc_hex = hex::encode(calc);
-    if !eq_hex_noprefix(&calc_hex, checksum_msg) { return Err(BlsSignerError::InvalidSecret("checksum mismatch".into())); }
+    if !eq_hex_noprefix(&calc_hex, checksum_msg) {
+        return Err(BlsSignerError::InvalidSecret("checksum mismatch".into()));
+    }
 
     // Decrypt AES-CTR after checksum validation
     use aes::{Aes128, Aes256};
@@ -246,7 +328,9 @@ fn decrypt_eip2335_keystore(path: &Path, password: &str) -> Result<[u8; 32], Bls
         return Err(BlsSignerError::InvalidSecret("unsupported cipher".into()));
     }
 
-    if ct.len() != 32 { return Err(BlsSignerError::InvalidSecret("decrypted secret wrong length".into())); }
+    if ct.len() != 32 {
+        return Err(BlsSignerError::InvalidSecret("decrypted secret wrong length".into()));
+    }
 
     let mut out = [0u8; 32];
     out.copy_from_slice(&ct);
@@ -267,9 +351,13 @@ fn decode_hex_noprefix(s: &str) -> Result<Vec<u8>, BlsSignerError> {
     hex::decode(ss).map_err(|e| BlsSignerError::InvalidSecret(e.to_string()))
 }
 
-pub fn get_global_bls_signer() -> Option<&'static Arc<BlsVoteSigner>> { GLOBAL_BLS_SIGNER.get() }
+pub fn get_global_bls_signer() -> Option<&'static Arc<BlsVoteSigner>> {
+    GLOBAL_BLS_SIGNER.get()
+}
 
-pub fn is_bls_signer_initialized() -> bool { GLOBAL_BLS_SIGNER.get().is_some() }
+pub fn is_bls_signer_initialized() -> bool {
+    GLOBAL_BLS_SIGNER.get().is_some()
+}
 
 pub fn global_bls_public_key() -> Result<VoteAddress, BlsSignerError> {
     get_global_bls_signer().ok_or(BlsSignerError::NotInitialized)?.public_key()
@@ -287,7 +375,9 @@ pub fn init_from_env_if_present() {
     let keystore_password = std::env::var("BSC_BLS_KEYSTORE_PASSWORD").ok();
     let bls_hex = std::env::var("BSC_BLS_PRIVATE_KEY").ok();
 
-    if is_bls_signer_initialized() { return; }
+    if is_bls_signer_initialized() {
+        return;
+    }
 
     if let (Some(path), Some(pass)) = (keystore_path, keystore_password) {
         match init_global_bls_signer_from_keystore(Path::new(&path), &pass) {
@@ -299,7 +389,9 @@ pub fn init_from_env_if_present() {
 
     if let Some(hex_key) = bls_hex {
         match init_global_bls_signer_from_hex(&hex_key) {
-            Ok(()) => tracing::warn!("Initialized BLS signer from hex (not recommended for production)"),
+            Ok(()) => {
+                tracing::warn!("Initialized BLS signer from hex (not recommended for production)")
+            }
             Err(e) => tracing::warn!("Failed to init BLS signer from hex: {}", e),
         }
     }
@@ -308,7 +400,10 @@ pub fn init_from_env_if_present() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use blst::{min_pk::{PublicKey, Signature}, BLST_ERROR};
+    use blst::{
+        min_pk::{PublicKey, Signature},
+        BLST_ERROR,
+    };
 
     #[test]
     fn bls_sign_and_verify_single_key() {

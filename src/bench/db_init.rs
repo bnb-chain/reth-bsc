@@ -9,7 +9,7 @@ use crate::node::BscNode;
 
 use alloy_consensus::Header;
 use alloy_genesis::Genesis;
-use alloy_primitives::{Address, B256, Keccak256, U256};
+use alloy_primitives::{Address, Keccak256, B256, U256};
 use reth::api::NodeTypesWithDBAdapter;
 use reth_chainspec::{
     make_genesis_header, BaseFeeParams, BaseFeeParamsKind, Chain, ChainSpec, NamedChain,
@@ -18,6 +18,7 @@ use reth_db::{init_db, mdbx::DatabaseArguments, DatabaseEnv};
 use reth_db_common::init::init_genesis;
 use reth_primitives::SealedHeader;
 use reth_provider::{providers::StaticFileProvider, ProviderFactory};
+use rust_eth_triedb::triedb_manager::init_global_triedb_manager;
 use secp256k1::{PublicKey, SecretKey, SECP256K1};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -92,16 +93,18 @@ pub fn init_benchmark(config: &BenchConfig) -> eyre::Result<InitResult> {
     let balance = U256::from(1_000_000u64) * U256::from(10u64).pow(U256::from(18)); // 1M BNB
     let mut genesis = genesis;
     for (_, addr) in &funded_accounts {
-        genesis.alloc.entry(*addr).or_insert_with(|| alloy_genesis::GenesisAccount {
-            balance,
-            ..Default::default()
-        });
+        genesis
+            .alloc
+            .entry(*addr)
+            .or_insert_with(|| alloy_genesis::GenesisAccount { balance, ..Default::default() });
     }
 
     // 3b. Inject background accounts to inflate the state trie (simulates mainnet state size)
     if config.background_accounts > 0 {
-        println!("  Generating {} background accounts with {} storage slots each...",
-            config.background_accounts, config.storage_slots_per_account);
+        println!(
+            "  Generating {} background accounts with {} storage slots each...",
+            config.background_accounts, config.storage_slots_per_account
+        );
         let small_balance = U256::from(1u64) * U256::from(10u64).pow(U256::from(18)); // 1 BNB
         for i in 0..config.background_accounts {
             let mut key_bytes = [0u8; 32];
@@ -160,6 +163,16 @@ pub fn init_benchmark(config: &BenchConfig) -> eyre::Result<InitResult> {
     let static_files_path = temp_dir.join("static_files");
     std::fs::create_dir_all(&static_files_path)?;
 
+    // Production initializes the global triedb manager before any genesis/state writes.
+    // The benchmark must do the same or `is_triedb_active()` stays false and no difflayers
+    // or prefetchers are ever produced during block finalization.
+    if config.triedb {
+        let triedb_path = temp_dir.join("rust_eth_triedb");
+        std::fs::create_dir_all(&triedb_path)?;
+        let triedb_path_str = triedb_path.to_string_lossy();
+        init_global_triedb_manager(triedb_path_str.as_ref());
+    }
+
     // 5. Create MDBX database
     let db = Arc::new(
         init_db(&db_path, DatabaseArguments::new(Default::default()))
@@ -182,8 +195,8 @@ pub fn init_benchmark(config: &BenchConfig) -> eyre::Result<InitResult> {
 
     // 8. Write genesis state to the database
     //    When trieDB is active, this writes state to trieDB PathDB instead of MDBX trie tables
-    let genesis_hash = init_genesis(&factory)
-        .map_err(|e| eyre::eyre!("Failed to initialize genesis: {}", e))?;
+    let genesis_hash =
+        init_genesis(&factory).map_err(|e| eyre::eyre!("Failed to initialize genesis: {}", e))?;
 
     println!("Genesis initialized in MDBX, hash: {}", genesis_hash);
 
@@ -207,7 +220,8 @@ pub fn init_benchmark(config: &BenchConfig) -> eyre::Result<InitResult> {
     insert_header_to_cache(genesis_header_ref.clone());
 
     // 13. Create genesis snapshot from header validators
-    let genesis_snapshot = create_genesis_snapshot(&parlia, genesis_header_ref, &validator_addresses);
+    let genesis_snapshot =
+        create_genesis_snapshot(&parlia, genesis_header_ref, &validator_addresses);
 
     // 14. Create snapshot provider and insert genesis snapshot
     let snapshot_provider =
@@ -215,7 +229,9 @@ pub fn init_benchmark(config: &BenchConfig) -> eyre::Result<InitResult> {
     snapshot_provider.insert(genesis_snapshot.clone());
 
     // 15. Register snapshot provider globally (needed by BscBlockExecutor::prepare_new_block)
-    let _ = crate::shared::set_snapshot_provider(snapshot_provider.clone() as Arc<dyn SnapshotProvider + Send + Sync>);
+    let _ = crate::shared::set_snapshot_provider(
+        snapshot_provider.clone() as Arc<dyn SnapshotProvider + Send + Sync>
+    );
 
     println!(
         "Database initialized: {} funded accounts, genesis hash: {}",
@@ -260,13 +276,7 @@ fn create_genesis_snapshot(
         }
     };
 
-    Snapshot::new(
-        addrs,
-        0,
-        genesis_header.hash_slow(),
-        epoch_length,
-        vote_addrs,
-    )
+    Snapshot::new(addrs, 0, genesis_header.hash_slow(), epoch_length, vote_addrs)
 }
 
 /// Generate N funded accounts, returning (private_key, address) pairs.
@@ -295,24 +305,12 @@ pub fn build_funded_alloc(
     let balance = U256::from(1_000_000u64) * U256::from(10u64).pow(U256::from(18)); // 1M BNB each
 
     for (_, addr) in funded_accounts {
-        alloc.insert(
-            *addr,
-            alloy_genesis::GenesisAccount {
-                balance,
-                ..Default::default()
-            },
-        );
+        alloc.insert(*addr, alloy_genesis::GenesisAccount { balance, ..Default::default() });
     }
 
     // Also fund validators
     for addr in validators {
-        alloc.insert(
-            *addr,
-            alloy_genesis::GenesisAccount {
-                balance,
-                ..Default::default()
-            },
-        );
+        alloc.insert(*addr, alloy_genesis::GenesisAccount { balance, ..Default::default() });
     }
 
     alloc

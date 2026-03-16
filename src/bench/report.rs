@@ -12,27 +12,35 @@ pub struct BlockTiming {
     // Phase timings (microseconds)
     pub state_setup_us: u128,
     pub pre_execution_us: u128,
+    /// Time spent inside builder.execute_transaction() only (per-tx sum).
+    pub execute_only_us: u128,
+    /// Aggregate execution bucket (all tx execution).
     pub tx_execution_us: u128,
-    pub post_execution_us: u128,
-    pub merge_transitions_us: u128,
-    pub hashed_state_us: u128,
-    pub triedb_convert_us: u128,
-    pub triedb_root_us: u128,
-    pub block_assembly_us: u128,
+    /// Time spent inserting the built block into storage.
+    pub insert_block_us: u128,
+    /// Time spent writing the execution outcome / state changes.
+    pub write_state_us: u128,
+    /// Time spent flushing triedb/PathDB difflayers.
+    pub triedb_flush_us: u128,
+    /// Time spent committing the database transaction.
+    pub provider_commit_us: u128,
+    /// Aggregate persistence bucket = insert_block + write_state + triedb_flush + provider_commit.
+    pub commit_us: u128,
+    /// finish_with_difflayer() time: merge_transitions + hashed_state + triedb/state_root + assembly.
+    /// Excludes provider creation overhead (factory.latest()).
     pub finish_us: u128,
     pub total_us: u128,
     // State metrics
     pub hashed_accounts: usize,
     pub hashed_storage_slots: usize,
-    pub has_difflayer: bool,
     pub has_cached_reads: bool,
 }
 
 const CSV_HEADER: &str = "block_number,validator_index,tx_count,gas_used,\
-    state_setup_us,pre_execution_us,tx_execution_us,post_execution_us,\
-    merge_transitions_us,hashed_state_us,triedb_convert_us,triedb_root_us,\
-    block_assembly_us,finish_us,total_us,\
-    hashed_accounts,hashed_storage_slots,has_difflayer,has_cached_reads";
+    state_setup_us,pre_execution_us,execute_only_us,tx_execution_us,\
+    insert_block_us,write_state_us,triedb_flush_us,provider_commit_us,commit_us,\
+    finish_us,total_us,\
+    hashed_accounts,hashed_storage_slots,has_cached_reads";
 
 /// Write timing results to a CSV file.
 pub fn write_csv(timings: &[BlockTiming], path: &Path, label: &str) -> eyre::Result<()> {
@@ -44,7 +52,7 @@ pub fn write_csv(timings: &[BlockTiming], path: &Path, label: &str) -> eyre::Res
     for t in timings {
         writeln!(
             file,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             label,
             t.block_number,
             t.validator_index,
@@ -52,18 +60,17 @@ pub fn write_csv(timings: &[BlockTiming], path: &Path, label: &str) -> eyre::Res
             t.gas_used,
             t.state_setup_us,
             t.pre_execution_us,
+            t.execute_only_us,
             t.tx_execution_us,
-            t.post_execution_us,
-            t.merge_transitions_us,
-            t.hashed_state_us,
-            t.triedb_convert_us,
-            t.triedb_root_us,
-            t.block_assembly_us,
+            t.insert_block_us,
+            t.write_state_us,
+            t.triedb_flush_us,
+            t.provider_commit_us,
+            t.commit_us,
             t.finish_us,
             t.total_us,
             t.hashed_accounts,
             t.hashed_storage_slots,
-            t.has_difflayer,
             t.has_cached_reads,
         )?;
     }
@@ -83,30 +90,53 @@ pub fn read_csv(path: &Path) -> eyre::Result<Vec<BlockTiming>> {
 
     for line in lines {
         let fields: Vec<&str> = line.split(',').collect();
-        if fields.len() < 20 {
+        if fields.len() < 16 {
             continue;
         }
-        // Skip label field (index 0)
-        let t = BlockTiming {
-            block_number: fields[1].parse().unwrap_or(0),
-            validator_index: fields[2].parse().unwrap_or(0),
-            tx_count: fields[3].parse().unwrap_or(0),
-            gas_used: fields[4].parse().unwrap_or(0),
-            state_setup_us: fields[5].parse().unwrap_or(0),
-            pre_execution_us: fields[6].parse().unwrap_or(0),
-            tx_execution_us: fields[7].parse().unwrap_or(0),
-            post_execution_us: fields[8].parse().unwrap_or(0),
-            merge_transitions_us: fields[9].parse().unwrap_or(0),
-            hashed_state_us: fields[10].parse().unwrap_or(0),
-            triedb_convert_us: fields[11].parse().unwrap_or(0),
-            triedb_root_us: fields[12].parse().unwrap_or(0),
-            block_assembly_us: fields[13].parse().unwrap_or(0),
-            finish_us: fields[14].parse().unwrap_or(0),
-            total_us: fields[15].parse().unwrap_or(0),
-            hashed_accounts: fields[16].parse().unwrap_or(0),
-            hashed_storage_slots: fields[17].parse().unwrap_or(0),
-            has_difflayer: fields[18].parse().unwrap_or(false),
-            has_cached_reads: fields[19].parse().unwrap_or(false),
+        // Skip label field (index 0). Current layout: 19 fields.
+        let t = if fields.len() >= 19 {
+            BlockTiming {
+                block_number: fields[1].parse().unwrap_or(0),
+                validator_index: fields[2].parse().unwrap_or(0),
+                tx_count: fields[3].parse().unwrap_or(0),
+                gas_used: fields[4].parse().unwrap_or(0),
+                state_setup_us: fields[5].parse().unwrap_or(0),
+                pre_execution_us: fields[6].parse().unwrap_or(0),
+                execute_only_us: fields[7].parse().unwrap_or(0),
+                tx_execution_us: fields[8].parse().unwrap_or(0),
+                insert_block_us: fields[9].parse().unwrap_or(0),
+                write_state_us: fields[10].parse().unwrap_or(0),
+                triedb_flush_us: fields[11].parse().unwrap_or(0),
+                provider_commit_us: fields[12].parse().unwrap_or(0),
+                commit_us: fields[13].parse().unwrap_or(0),
+                finish_us: fields[14].parse().unwrap_or(0),
+                total_us: fields[15].parse().unwrap_or(0),
+                hashed_accounts: fields[16].parse().unwrap_or(0),
+                hashed_storage_slots: fields[17].parse().unwrap_or(0),
+                has_cached_reads: fields[18].parse().unwrap_or(false),
+            }
+        } else {
+            // Legacy format fallback
+            BlockTiming {
+                block_number: fields[1].parse().unwrap_or(0),
+                validator_index: fields[2].parse().unwrap_or(0),
+                tx_count: fields[3].parse().unwrap_or(0),
+                gas_used: fields[4].parse().unwrap_or(0),
+                state_setup_us: fields[5].parse().unwrap_or(0),
+                pre_execution_us: fields[6].parse().unwrap_or(0),
+                execute_only_us: 0,
+                tx_execution_us: fields[7].parse().unwrap_or(0),
+                insert_block_us: 0,
+                write_state_us: 0,
+                triedb_flush_us: 0,
+                provider_commit_us: 0,
+                commit_us: fields[8].parse().unwrap_or(0),
+                finish_us: fields[9].parse().unwrap_or(0),
+                total_us: fields[10].parse().unwrap_or(0),
+                hashed_accounts: fields.get(11).and_then(|f| f.parse().ok()).unwrap_or(0),
+                hashed_storage_slots: fields.get(12).and_then(|f| f.parse().ok()).unwrap_or(0),
+                has_cached_reads: fields.get(15).and_then(|f| f.parse().ok()).unwrap_or(false),
+            }
         };
         timings.push(t);
     }
@@ -129,44 +159,29 @@ pub fn print_summary(timings: &[BlockTiming], label: &str) {
     let phases: Vec<(&str, Vec<u128>)> = vec![
         ("state_setup", timings.iter().map(|t| t.state_setup_us).collect()),
         ("pre_execution", timings.iter().map(|t| t.pre_execution_us).collect()),
+        ("execute_only", timings.iter().map(|t| t.execute_only_us).collect()),
         ("tx_execution", timings.iter().map(|t| t.tx_execution_us).collect()),
-        ("post_execution", timings.iter().map(|t| t.post_execution_us).collect()),
-        ("merge_transitions", timings.iter().map(|t| t.merge_transitions_us).collect()),
-        ("hashed_state", timings.iter().map(|t| t.hashed_state_us).collect()),
-        ("triedb_convert", timings.iter().map(|t| t.triedb_convert_us).collect()),
-        ("triedb_root", timings.iter().map(|t| t.triedb_root_us).collect()),
-        ("block_assembly", timings.iter().map(|t| t.block_assembly_us).collect()),
-        ("finish (total)", timings.iter().map(|t| t.finish_us).collect()),
+        ("insert_block", timings.iter().map(|t| t.insert_block_us).collect()),
+        ("write_state", timings.iter().map(|t| t.write_state_us).collect()),
+        ("triedb_flush", timings.iter().map(|t| t.triedb_flush_us).collect()),
+        ("provider_commit", timings.iter().map(|t| t.provider_commit_us).collect()),
+        ("finish (root+asm)", timings.iter().map(|t| t.finish_us).collect()),
+        ("commit (mdbx)", timings.iter().map(|t| t.commit_us).collect()),
         ("TOTAL", timings.iter().map(|t| t.total_us).collect()),
     ];
 
-    println!("{:<20} {:>10} {:>10} {:>10} {:>10} {:>10}",
-        "Phase", "Mean(us)", "P50(us)", "P90(us)", "P95(us)", "P99(us)");
+    println!(
+        "{:<20} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "Phase", "Mean(us)", "P50(us)", "P90(us)", "P95(us)", "P99(us)"
+    );
     println!("{}", "-".repeat(80));
 
     for (name, values) in &phases {
         let stats = compute_stats(values);
-        println!("{:<20} {:>10.0} {:>10.0} {:>10.0} {:>10.0} {:>10.0}",
-            name, stats.mean, stats.p50, stats.p90, stats.p95, stats.p99);
-    }
-
-    // Cold vs Warm comparison
-    let cold: Vec<&BlockTiming> = timings.iter().filter(|t| !t.has_cached_reads).collect();
-    let warm: Vec<&BlockTiming> = timings.iter().filter(|t| t.has_cached_reads).collect();
-
-    if !cold.is_empty() && !warm.is_empty() {
-        println!("\n  Cold vs Warm (finish phase):");
-        let cold_finish: Vec<u128> = cold.iter().map(|t| t.finish_us).collect();
-        let warm_finish: Vec<u128> = warm.iter().map(|t| t.finish_us).collect();
-        let cold_stats = compute_stats(&cold_finish);
-        let warm_stats = compute_stats(&warm_finish);
-        println!("    Cold ({:>3} blocks): mean={:.0}us, p50={:.0}us",
-            cold.len(), cold_stats.mean, cold_stats.p50);
-        println!("    Warm ({:>3} blocks): mean={:.0}us, p50={:.0}us",
-            warm.len(), warm_stats.mean, warm_stats.p50);
-        if warm_stats.mean > 0.0 {
-            println!("    Cold/Warm ratio: {:.2}x", cold_stats.mean / warm_stats.mean);
-        }
+        println!(
+            "{:<20} {:>10.0} {:>10.0} {:>10.0} {:>10.0} {:>10.0}",
+            name, stats.mean, stats.p50, stats.p90, stats.p95, stats.p99
+        );
     }
 
     // Throughput
@@ -194,25 +209,40 @@ pub fn compare(baseline_path: &Path, optimized_path: &Path) -> eyre::Result<()> 
 
     // Side-by-side comparison
     let phases = [
-        "state_setup", "pre_execution", "tx_execution", "post_execution",
-        "merge_transitions", "hashed_state", "triedb_convert", "triedb_root",
-        "block_assembly", "finish", "TOTAL",
+        "state_setup",
+        "pre_execution",
+        "execute_only",
+        "tx_execution",
+        "insert_block",
+        "write_state",
+        "triedb_flush",
+        "provider_commit",
+        "finish",
+        "commit",
+        "TOTAL",
     ];
 
     let baseline_means = phase_means(&baseline);
     let optimized_means = phase_means(&optimized);
 
-    println!("\n{:<20} {:>12} {:>12} {:>10}",
-        "Phase", "Baseline(us)", "Optimized(us)", "Change(%)");
+    println!(
+        "\n{:<20} {:>12} {:>12} {:>10}",
+        "Phase", "Baseline(us)", "Optimized(us)", "Change(%)"
+    );
     println!("{}", "-".repeat(60));
 
     for phase in &phases {
         let b = baseline_means.get(*phase).copied().unwrap_or(0.0);
         let o = optimized_means.get(*phase).copied().unwrap_or(0.0);
         let pct = if b > 0.0 { ((o - b) / b) * 100.0 } else { 0.0 };
-        let indicator = if pct < -1.0 { " FASTER" } else if pct > 1.0 { " SLOWER" } else { "" };
-        println!("{:<20} {:>12.0} {:>12.0} {:>+9.1}%{}",
-            phase, b, o, pct, indicator);
+        let indicator = if pct < -1.0 {
+            " FASTER"
+        } else if pct > 1.0 {
+            " SLOWER"
+        } else {
+            ""
+        };
+        println!("{:<20} {:>12.0} {:>12.0} {:>+9.1}%{}", phase, b, o, pct, indicator);
     }
 
     Ok(())
@@ -226,14 +256,17 @@ fn phase_means(timings: &[BlockTiming]) -> HashMap<&'static str, f64> {
     let mut m = HashMap::new();
     m.insert("state_setup", timings.iter().map(|t| t.state_setup_us as f64).sum::<f64>() / n);
     m.insert("pre_execution", timings.iter().map(|t| t.pre_execution_us as f64).sum::<f64>() / n);
+    m.insert("execute_only", timings.iter().map(|t| t.execute_only_us as f64).sum::<f64>() / n);
     m.insert("tx_execution", timings.iter().map(|t| t.tx_execution_us as f64).sum::<f64>() / n);
-    m.insert("post_execution", timings.iter().map(|t| t.post_execution_us as f64).sum::<f64>() / n);
-    m.insert("merge_transitions", timings.iter().map(|t| t.merge_transitions_us as f64).sum::<f64>() / n);
-    m.insert("hashed_state", timings.iter().map(|t| t.hashed_state_us as f64).sum::<f64>() / n);
-    m.insert("triedb_convert", timings.iter().map(|t| t.triedb_convert_us as f64).sum::<f64>() / n);
-    m.insert("triedb_root", timings.iter().map(|t| t.triedb_root_us as f64).sum::<f64>() / n);
-    m.insert("block_assembly", timings.iter().map(|t| t.block_assembly_us as f64).sum::<f64>() / n);
+    m.insert("insert_block", timings.iter().map(|t| t.insert_block_us as f64).sum::<f64>() / n);
+    m.insert("write_state", timings.iter().map(|t| t.write_state_us as f64).sum::<f64>() / n);
+    m.insert("triedb_flush", timings.iter().map(|t| t.triedb_flush_us as f64).sum::<f64>() / n);
+    m.insert(
+        "provider_commit",
+        timings.iter().map(|t| t.provider_commit_us as f64).sum::<f64>() / n,
+    );
     m.insert("finish", timings.iter().map(|t| t.finish_us as f64).sum::<f64>() / n);
+    m.insert("commit", timings.iter().map(|t| t.commit_us as f64).sum::<f64>() / n);
     m.insert("TOTAL", timings.iter().map(|t| t.total_us as f64).sum::<f64>() / n);
     m
 }
