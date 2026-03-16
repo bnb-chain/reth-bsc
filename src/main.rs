@@ -374,6 +374,15 @@ fn main() -> eyre::Result<()> {
                         ctx.modules.merge_configured(miner_api.into_rpc())?;
                         tracing::info!("Succeed to register Miner RPC API");
 
+                        tracing::info!("Start to register BSC Eth extension API (eth_coinbase, eth_health)...");
+                        use reth_bsc::rpc::eth_ext::{BscEthExtApiImpl, BscEthExtApiServer};
+
+                        // Remove the default unimplemented eth_coinbase before registering our version
+                        ctx.modules.remove_method_from_configured("eth_coinbase");
+                        let eth_ext_api = BscEthExtApiImpl::new();
+                        ctx.modules.merge_configured(eth_ext_api.into_rpc())?;
+                        tracing::info!("Succeed to register BSC Eth extension API");
+
                         tracing::info!("Start to register Blob RPC API...");
                         use reth_bsc::rpc::blob::{BlobApiImpl, BlobApiServer};
 
