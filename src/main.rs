@@ -1,14 +1,14 @@
 use clap::{Args, Parser};
 use reth::{builder::NodeHandle, cli::Cli, consensus::FullConsensus};
+use reth_bsc::consensus::parlia::bls_signer;
 use reth_bsc::node::consensus::BscConsensus;
 use reth_bsc::{
-    chainspec::{parser::BscChainSpecParser, genesis_override},
+    chainspec::{genesis_override, parser::BscChainSpecParser},
     node::{evm::config::BscEvmConfig, BscNode},
     BscPrimitives,
 };
-use reth_bsc::consensus::parlia::bls_signer;
-use std::sync::Arc;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 // We use jemalloc for performance reasons
 #[cfg(all(feature = "jemalloc", unix))]
@@ -366,6 +366,13 @@ fn main() -> eyre::Result<()> {
                         let mev_api = MevApiImpl::new(snapshot_provider, chain_spec);
                         ctx.modules.merge_configured(mev_api.into_rpc())?;
                         tracing::info!("Succeed to register MEV RPC API");
+
+                        tracing::info!("Start to register Miner RPC API...");
+                        use reth_bsc::rpc::miner::{BscMinerApiImpl, BscMinerApiServer};
+
+                        let miner_api = BscMinerApiImpl::new();
+                        ctx.modules.merge_configured(miner_api.into_rpc())?;
+                        tracing::info!("Succeed to register Miner RPC API");
 
                         tracing::info!("Start to register Blob RPC API...");
                         use reth_bsc::rpc::blob::{BlobApiImpl, BlobApiServer};

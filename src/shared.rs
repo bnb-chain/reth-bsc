@@ -4,14 +4,19 @@ use crate::node::network::block_import::service::{IncomingBlock, IncomingMinedBl
 use crate::node::network::BscNetworkPrimitives;
 use crate::node::primitives::BscBlock;
 use alloy_consensus::{BlockHeader, Header};
-use alloy_rlp::Encodable;
 use alloy_eips::BlockId;
-use alloy_primitives::{B256, Bytes, U256};
-use reth_primitives::TransactionSigned;
+use alloy_primitives::{Bytes, B256, U256};
+use alloy_rlp::Encodable;
+use alloy_rpc_types::{
+    state::StateOverride, Block as RpcBlock, BlockOverrides, Header as RpcHeader,
+    Receipt as RpcReceipt, Transaction as RpcTransaction,
+    TransactionRequest as RpcTransactionRequest,
+};
 use parking_lot::Mutex;
 use reth_network::NetworkHandle;
 use reth_network_api::PeerId;
 use reth_payload_builder_primitives::Events;
+use reth_primitives::TransactionSigned;
 use reth_provider::{BlockNumReader, HeaderProvider};
 use schnellru::{ByLength, LruMap};
 use std::collections::VecDeque;
@@ -20,9 +25,6 @@ use std::sync::RwLock;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::UnboundedSender;
-use alloy_rpc_types::{
-    Block as RpcBlock, BlockOverrides, Header as RpcHeader, Receipt as RpcReceipt, Transaction as RpcTransaction, TransactionRequest as RpcTransactionRequest, state::StateOverride
-};
 
 /// Function type for HeaderProvider::header() access (by hash)
 type HeaderByHashFn = Arc<dyn Fn(&B256) -> Option<Header> + Send + Sync>;
@@ -74,6 +76,10 @@ static IMPORTED_BLOCKS_TX: OnceLock<broadcast::Sender<B256>> = OnceLock::new();
 
 /// Global MEV running status
 static MEV_RUNNING: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+/// Global builder whitelist shared between miner and mev RPC namespaces
+static BUILDER_WHITELIST: OnceLock<
+    Arc<RwLock<std::collections::HashSet<alloy_primitives::Address>>>,
+> = OnceLock::new();
 /// Global proxyed peer IDs list
 static PROXYED_PEER_IDS: OnceLock<Vec<PeerId>> = OnceLock::new();
 
@@ -515,6 +521,67 @@ pub fn is_mev_running() -> bool {
     MEV_RUNNING.get().map(|status| status.load(Ordering::Relaxed)).unwrap_or(false)
 }
 
+/// Start MEV - set the global MEV running status to true
+pub fn start_mev() {
+    if let Some(status) = MEV_RUNNING.get() {
+        status.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Stop MEV - set the global MEV running status to false
+pub fn stop_mev() {
+    if let Some(status) = MEV_RUNNING.get() {
+        status.store(false, Ordering::Relaxed);
+    }
+}
+
+// ============ Builder Whitelist ============
+
+/// Initialize the global builder whitelist (called once during setup)
+pub fn init_builder_whitelist(
+    builders: std::collections::HashSet<alloy_primitives::Address>,
+) -> Arc<RwLock<std::collections::HashSet<alloy_primitives::Address>>> {
+    let whitelist = Arc::new(RwLock::new(builders));
+    let _ = BUILDER_WHITELIST.set(whitelist.clone());
+    whitelist
+}
+
+/// Get the global builder whitelist
+pub fn get_builder_whitelist(
+) -> Option<&'static Arc<RwLock<std::collections::HashSet<alloy_primitives::Address>>>> {
+    BUILDER_WHITELIST.get()
+}
+
+/// Add a builder to the global whitelist
+pub fn add_builder(builder: alloy_primitives::Address) -> bool {
+    if let Some(whitelist) = BUILDER_WHITELIST.get() {
+        if let Ok(mut set) = whitelist.write() {
+            return set.insert(builder);
+        }
+    }
+    false
+}
+
+/// Remove a builder from the global whitelist
+pub fn remove_builder(builder: &alloy_primitives::Address) -> bool {
+    if let Some(whitelist) = BUILDER_WHITELIST.get() {
+        if let Ok(mut set) = whitelist.write() {
+            return set.remove(builder);
+        }
+    }
+    false
+}
+
+/// Check if a builder is in the global whitelist
+pub fn is_builder_allowed(builder: &alloy_primitives::Address) -> bool {
+    if let Some(whitelist) = BUILDER_WHITELIST.get() {
+        if let Ok(set) = whitelist.read() {
+            return set.contains(builder);
+        }
+    }
+    false
+}
+
 // ============= IPC client ===============
 pub static IPC_CLIENT: OnceLock<Arc<jsonrpsee::async_client::Client>> = OnceLock::new();
 
@@ -524,7 +591,9 @@ pub async fn set_ipc_client(path: String) -> Result<(), eyre::Error> {
         .build(&path)
         .await
         .map_err(|e| eyre::eyre!("Failed to build RPC client: {:?}", e))?;
-    IPC_CLIENT.set(Arc::new(client)).map_err(|e| eyre::eyre!("Failed to set RPC client: {:?}", e))?;
+    IPC_CLIENT
+        .set(Arc::new(client))
+        .map_err(|e| eyre::eyre!("Failed to set RPC client: {:?}", e))?;
     Ok(())
 }
 
@@ -574,9 +643,7 @@ pub async fn ipc_estimate_gas(
     .map_err(|e| eyre::eyre!("failed to query chain id from healthy node: {e}"))
 }
 
-pub async fn ipc_send_transaction(
-    req: RpcTransactionRequest,
-) -> Result<B256, eyre::Error> {
+pub async fn ipc_send_transaction(req: RpcTransactionRequest) -> Result<B256, eyre::Error> {
     let client = get_ipc_client().ok_or(eyre::eyre!("Failed to get RPC client"))?;
     reth_rpc_eth_api::EthApiClient::<
         RpcTransactionRequest,
@@ -591,9 +658,7 @@ pub async fn ipc_send_transaction(
 }
 
 /// Send a raw signed transaction via IPC (eth_sendRawTransaction)
-pub async fn ipc_send_raw_transaction(
-    tx: TransactionSigned,
-)-> Result<B256, eyre::Error> {
+pub async fn ipc_send_raw_transaction(tx: TransactionSigned) -> Result<B256, eyre::Error> {
     let client = get_ipc_client().ok_or(eyre::eyre!("Failed to get RPC client"))?;
     let mut buf = Vec::new();
     tx.encode(&mut buf);
