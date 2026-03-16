@@ -155,9 +155,12 @@ pub struct MevApiImpl {
     min_gas_price: U256,
     builder_fee_ceil: U256,
     version: String,
-    /// Whitelist of allowed builders (empty HashSet means no builders allowed)
+    /// Whitelist of allowed builders (shared with miner_ namespace via shared.rs)
     allowed_builders: Arc<RwLock<HashSet<Address>>>,
 }
+
+// NOTE: The allowed_builders is now also accessible via crate::shared::get_builder_whitelist()
+// so that the miner_ RPC namespace can manage builders too.
 
 impl MevApiImpl {
     /// Create a new MEV API instance
@@ -219,19 +222,20 @@ impl MevApiImpl {
             .map(|addrs| addrs.into_iter().collect::<HashSet<_>>())
             .unwrap_or_default(); // Empty HashSet if not configured
 
-        if allowed_builders.is_empty() {
+        // Register the whitelist in shared state so miner_ namespace can also access it
+        let allowed_builders = crate::shared::init_builder_whitelist(allowed_builders);
+
+        if allowed_builders.read().unwrap().is_empty() {
             tracing::warn!(
                 "MEV API initialized with EMPTY builder whitelist - NO builders will be accepted!"
             );
             tracing::warn!(
-                "Use mev_addBuilder to add builders or set BSC_ALLOWED_BUILDERS environment variable"
+                "Use mev_addBuilder or miner_addBuilder to add builders, or set BSC_ALLOWED_BUILDERS environment variable"
             );
         } else {
-            tracing::info!(
-                "MEV API initialized with builder whitelist: {} builders",
-                allowed_builders.len()
-            );
-            for builder in &allowed_builders {
+            let count = allowed_builders.read().unwrap().len();
+            tracing::info!("MEV API initialized with builder whitelist: {} builders", count);
+            for builder in allowed_builders.read().unwrap().iter() {
                 tracing::info!("  - Allowed builder: {}", builder);
             }
         }
@@ -253,7 +257,7 @@ impl MevApiImpl {
             min_gas_price,
             builder_fee_ceil,
             version,
-            allowed_builders: Arc::new(RwLock::new(allowed_builders)),
+            allowed_builders,
         }
     }
 
