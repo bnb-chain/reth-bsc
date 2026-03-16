@@ -74,7 +74,7 @@ fn create_bls_proof(
     let mut hasher = Keccak256::new();
     hasher.update(consensus_addr.as_slice());
     hasher.update(bls_pubkey);
-    hasher.update(&chain_id_padded);
+    hasher.update(chain_id_padded);
     let msg_hash = hasher.finalize();
 
     let dst = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";

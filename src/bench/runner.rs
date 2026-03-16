@@ -388,8 +388,8 @@ pub fn run_benchmark(config: BenchConfig) -> eyre::Result<Vec<BlockTiming>> {
             has_cached_reads,
         };
 
-        if block_number % 10 == 0 || block_number <= 2 {
-            let flags = format!("{}", if has_cached_reads { "C" } else { "-" },);
+        if block_number.is_multiple_of(10) || block_number <= 2 {
+            let flags = if has_cached_reads { "C" } else { "-" };
             println!(
                 "  Block {:>4} | v[{}] {} | txs: {:>3} | gas: {:>8} | finish: {:>6}us | commit: {:>6}us | total: {:>6}us",
                 block_number,

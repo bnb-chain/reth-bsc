@@ -1,25 +1,25 @@
 use crate::bench::config::BenchConfig;
 use crate::chainspec::BscChainSpec;
+use crate::consensus::parlia::Parlia;
 use crate::consensus::parlia::provider::{EnhancedDbSnapshotProvider, SnapshotProvider};
 use crate::consensus::parlia::snapshot::Snapshot;
-use crate::consensus::parlia::Parlia;
 use crate::hardforks::bsc::BscHardfork;
-use crate::node::evm::util::insert_header_to_cache;
 use crate::node::BscNode;
+use crate::node::evm::util::insert_header_to_cache;
 
 use alloy_consensus::Header;
 use alloy_genesis::Genesis;
-use alloy_primitives::{Address, Keccak256, B256, U256};
+use alloy_primitives::{Address, B256, Keccak256, U256};
 use reth::api::NodeTypesWithDBAdapter;
 use reth_chainspec::{
-    make_genesis_header, BaseFeeParams, BaseFeeParamsKind, Chain, ChainSpec, NamedChain,
+    BaseFeeParams, BaseFeeParamsKind, Chain, ChainSpec, NamedChain, make_genesis_header,
 };
-use reth_db::{init_db, mdbx::DatabaseArguments, DatabaseEnv};
+use reth_db::{DatabaseEnv, init_db, mdbx::DatabaseArguments};
 use reth_db_common::init::init_genesis;
 use reth_primitives::SealedHeader;
-use reth_provider::{providers::StaticFileProvider, ProviderFactory};
+use reth_provider::{ProviderFactory, providers::StaticFileProvider};
 use rust_eth_triedb::triedb_manager::init_global_triedb_manager;
-use secp256k1::{PublicKey, SecretKey, SECP256K1};
+use secp256k1::{PublicKey, SECP256K1, SecretKey};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -143,7 +143,7 @@ pub fn init_benchmark(config: &BenchConfig) -> eyre::Result<InitResult> {
 
     // 5. Get validator addresses from private keys
     let validator_addresses: Vec<Address> =
-        config.private_keys.iter().map(|k| address_from_private_key(k)).collect();
+        config.private_keys.iter().map(address_from_private_key).collect();
 
     println!("Validators:");
     for (i, addr) in validator_addresses.iter().enumerate() {
@@ -184,14 +184,15 @@ pub fn init_benchmark(config: &BenchConfig) -> eyre::Result<InitResult> {
         .map_err(|e| eyre::eyre!("Failed to create static file provider: {}", e))?;
 
     // 7. Create ProviderFactory
-    let rocksdb_provider = reth_provider::providers::RocksDBProvider::new(&temp_dir.join("rocksdb"))
+    let rocksdb_provider = reth_provider::providers::RocksDBProvider::new(temp_dir.join("rocksdb"))
         .map_err(|e| eyre::eyre!("Failed to create RocksDB provider: {}", e))?;
     let factory = ProviderFactory::<BscNodeTypes>::new(
         db.clone(),
         chain_spec.clone(),
         static_file_provider,
         rocksdb_provider,
-    ).map_err(|e| eyre::eyre!("Failed to create ProviderFactory: {}", e))?;
+    )
+    .map_err(|e| eyre::eyre!("Failed to create ProviderFactory: {}", e))?;
 
     // 8. Write genesis state to the database
     //    When trieDB is active, this writes state to trieDB PathDB instead of MDBX trie tables

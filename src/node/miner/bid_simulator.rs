@@ -1,7 +1,7 @@
 use crate::chainspec::BscChainSpec;
 use crate::consensus::eip4844::{calc_blob_fee, is_blob_eligible_block};
-use crate::consensus::parlia::provider::SnapshotProvider;
 use crate::consensus::parlia::Snapshot;
+use crate::consensus::parlia::provider::SnapshotProvider;
 use crate::hardforks::BscHardforks;
 use crate::node::engine::BscBuiltPayload;
 use crate::node::evm::config::{BscEvmConfig, BscNextBlockEnvAttributes, ValidatorCacheSink};
@@ -14,6 +14,7 @@ use alloy_consensus::Transaction;
 use alloy_evm::Evm;
 use alloy_primitives::U256;
 use alloy_primitives::{Address, B256};
+use either::Either;
 use parking_lot::RwLock;
 use reth::payload::EthPayloadBuilderAttributes;
 use reth::transaction_pool::BestTransactionsAttributes;
@@ -243,7 +244,10 @@ where
             } else if !best_bid.is_committed() {
                 _bid_runtime = best_bid_runtime;
                 _bid_accepted = false;
-                debug!("discard new bid and to simulate the non-committed bestBidToRun builder:{}, bid_hash:{}", _bid_runtime.bid.builder,"");
+                debug!(
+                    "discard new bid and to simulate the non-committed bestBidToRun builder:{}, bid_hash:{}",
+                    _bid_runtime.bid.builder, ""
+                );
             } else {
                 to_commit = false;
                 _bid_accepted = false;
@@ -271,7 +275,10 @@ where
                     let bid_simulate_req = self.commit_bid(5, _bid_runtime);
                     return Some(bid_simulate_req);
                 } else {
-                    debug!("simulate in progress, no interrupt after delay_ms:{}, NO_INTERRUPT_LEFT_OVER:{},bid hash:{}", delay_ms, NO_INTERRUPT_LEFT_OVER, _bid_runtime.bid.bid_hash);
+                    debug!(
+                        "simulate in progress, no interrupt after delay_ms:{}, NO_INTERRUPT_LEFT_OVER:{},bid hash:{}",
+                        delay_ms, NO_INTERRUPT_LEFT_OVER, _bid_runtime.bid.bid_hash
+                    );
                 }
             } else {
                 let bid_simulate_req = self.commit_bid(5, _bid_runtime);
@@ -327,7 +334,10 @@ where
             expected_block_reward * U256::from(_validator_commission);
         expected_validator_reward /= U256::from(10000u64);
         if expected_validator_reward < _bid.builder_fee {
-            debug!("BidSimulator: invalid bid, builder fee exceeds validator reward, ignore expected_validator_reward:{} builder_fee:{}", expected_validator_reward, _bid.builder_fee);
+            debug!(
+                "BidSimulator: invalid bid, builder fee exceeds validator reward, ignore expected_validator_reward:{} builder_fee:{}",
+                expected_validator_reward, _bid.builder_fee
+            );
             return Err("invalid bid: builder fee exceeds validator reward".into());
         }
         expected_validator_reward -= _bid.builder_fee;
@@ -577,9 +587,7 @@ where
             if !receipt.success && bid_runtime.un_revertible_set.contains(&tx_hash) {
                 debug!(
                     "bidSimulator: un_revertible transaction failed, rejecting bid. tx_hash: {:?}, bid_hash: {:?}, block_number: {}",
-                    tx_hash,
-                    bid_runtime.bid.bid_hash,
-                    bid_runtime.bid.block_number
+                    tx_hash, bid_runtime.bid.bid_hash, bid_runtime.bid.block_number
                 );
                 return;
             }
@@ -596,7 +604,8 @@ where
         sealed_block = Arc::new(plain.into());
 
         let requests = execution_result.requests.clone();
-        let execution_outcome = BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
+        let execution_outcome =
+            BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
         let executed: BuiltPayloadExecutedBlock<_> = BuiltPayloadExecutedBlock {
             recovered_block: Arc::new(block.clone()),
             execution_output: Arc::new(execution_outcome),
@@ -664,14 +673,15 @@ where
             self.mev_metrics.invalid_bids_total.increment(1);
         }
 
-        debug!("bidSimulator: sim_bid finished, block number:{}, parent hash:{}, builder:{}, bid hash:{}, gas used:{}, gas fee:{}, success:{}",
-         bid_runtime.bid.block_number,
-         bid_runtime.bid.parent_hash,
-         bid_runtime.bid.builder,
-         bid_runtime.bid.bid_hash,
-         bid_runtime.gas_used,
-         bid_runtime.gas_fee,
-         success,
+        debug!(
+            "bidSimulator: sim_bid finished, block number:{}, parent hash:{}, builder:{}, bid hash:{}, gas used:{}, gas fee:{}, success:{}",
+            bid_runtime.bid.block_number,
+            bid_runtime.bid.parent_hash,
+            bid_runtime.bid.builder,
+            bid_runtime.bid.bid_hash,
+            bid_runtime.gas_used,
+            bid_runtime.gas_fee,
+            success,
         );
 
         self.simulating_bid.write().remove(&parent_hash);
@@ -722,10 +732,10 @@ where
         + 'static,
     EvmConfig: ConfigureEvm<NextBlockEnvCtx = BscNextBlockEnvAttributes> + 'static,
     <EvmConfig as ConfigureEvm>::Primitives: reth_primitives_traits::NodePrimitives<
-        BlockHeader = alloy_consensus::Header,
-        SignedTx = alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip4844>,
-        Block = crate::node::primitives::BscBlock,
-    >,
+            BlockHeader = alloy_consensus::Header,
+            SignedTx = alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip4844>,
+            Block = crate::node::primitives::BscBlock,
+        >,
 {
     fn new(
         bid: Bid,
@@ -807,7 +817,8 @@ where
         let base_fee: u64 = builder.evm().block().basefee();
         let blob_params = self.chain_spec.blob_params_at_timestamp(self.attributes.timestamp());
         let header = self.mining_ctx.header.as_ref().unwrap();
-        let blob_eligible = is_blob_eligible_block(&self.chain_spec, header.number, header.timestamp);
+        let blob_eligible =
+            is_blob_eligible_block(&self.chain_spec, header.number, header.timestamp);
         let mut max_blob_count =
             blob_params.as_ref().map(|params| params.max_blob_count).unwrap_or_default();
         if !blob_eligible {
@@ -848,7 +859,13 @@ where
                     // we can't fit this transaction into the block, so we need to mark it as invalid
                     // which also removes all dependent transaction from the iterator before we can
                     // continue
-                    trace!("bidSimulator: gas limit exceeded, ignore tx:{}, tx gas limit:{}, block gas limit:{}, runtime gasused:{}", tx_hash, recovered_tx.gas_limit(), block_gas_limit, self.gas_used);
+                    trace!(
+                        "bidSimulator: gas limit exceeded, ignore tx:{}, tx gas limit:{}, block gas limit:{}, runtime gasused:{}",
+                        tx_hash,
+                        recovered_tx.gas_limit(),
+                        block_gas_limit,
+                        self.gas_used
+                    );
                     continue;
                 }
             }
@@ -859,7 +876,10 @@ where
 
                 if self.block_blob_count + tx_blob_count > max_blob_count {
                     if from_pool {
-                        trace!("bidSimulator: blob transaction limit exceeded, ignore tx:{}, tx blob count:{}, block blob count:{}, max blob count:{}", tx_hash, tx_blob_count, self.block_blob_count, max_blob_count);
+                        trace!(
+                            "bidSimulator: blob transaction limit exceeded, ignore tx:{}, tx blob count:{}, block blob count:{}, max blob count:{}",
+                            tx_hash, tx_blob_count, self.block_blob_count, max_blob_count
+                        );
                         continue;
                     }
                     debug!(target: "payload_builder", tx=?tx_hash, ?self.block_blob_count, "skipping blob transaction because it would exceed the max blob count per block");
@@ -884,14 +904,20 @@ where
                         debug!(target: "payload_builder", %error, ?recovered_tx, "skipping invalid transaction and its descendants");
                     }
                     if from_pool {
-                        trace!("bidSimulator: invalid transaction, ignore tx:{}, error:{}, recovered tx:{:?}", tx_hash, error, recovered_tx);
+                        trace!(
+                            "bidSimulator: invalid transaction, ignore tx:{}, error:{}, recovered tx:{:?}",
+                            tx_hash, error, recovered_tx
+                        );
                         continue;
                     }
                     return Err("invalid transaction".into());
                 }
                 Err(err) => {
                     if from_pool {
-                        trace!("bidSimulator: invalid transaction, ignore tx:{}, error:{}, recovered tx:{:?}", tx_hash, err, recovered_tx);
+                        trace!(
+                            "bidSimulator: invalid transaction, ignore tx:{}, error:{}, recovered tx:{:?}",
+                            tx_hash, err, recovered_tx
+                        );
                         continue;
                     }
                     return Err(Box::new(PayloadBuilderError::evm(err)));
@@ -909,7 +935,10 @@ where
                     ) {
                         debug!("Failed to insert blob sidecar for tx {:?}: {:?}", tx_hash, e);
                         if from_pool {
-                            trace!("bidSimulator: failed to insert blob sidecar, ignore tx:{}, error:{}, recovered tx:{:?}", tx_hash, e, recovered_tx);
+                            trace!(
+                                "bidSimulator: failed to insert blob sidecar, ignore tx:{}, error:{}, recovered tx:{:?}",
+                                tx_hash, e, recovered_tx
+                            );
                             continue;
                         }
                         return Err("Failed to insert blob sidecar".into());
