@@ -9,7 +9,11 @@ use std::{
 
 use alloy_primitives::{BlockNumber, B256};
 
-use super::vote::{VoteData, VoteEnvelope};
+use super::{
+    block_stats,
+    malicious_vote_monitor::MaliciousVoteMonitor,
+    vote::{VoteData, VoteEnvelope},
+};
 use crate::metrics::BscVoteMetrics;
 use crate::shared;
 
@@ -71,6 +75,8 @@ struct VotePool {
     cur_votes: HashMap<B256, VoteMessages>,
     /// Priority queue for efficiently finding votes to prune.
     cur_votes_pq: VotesPriorityQueue,
+    /// Malicious vote monitor for detecting rule violations.
+    malicious_vote_monitor: MaliciousVoteMonitor,
 }
 
 impl VotePool {
@@ -79,14 +85,20 @@ impl VotePool {
             received_votes: HashSet::new(),
             cur_votes: HashMap::new(),
             cur_votes_pq: VotesPriorityQueue::new(),
+            malicious_vote_monitor: MaliciousVoteMonitor::new(),
         }
     }
 
-    fn insert(&mut self, vote: VoteEnvelope) {
+    /// Insert a vote and return the new vote count for its target block (0 if duplicate).
+    fn insert(&mut self, vote: VoteEnvelope, pending_block_number: BlockNumber) -> usize {
         let vote_hash = vote.hash();
         if self.received_votes.insert(vote_hash) {
-            // Track received votes count
+            // Track received votes count (geth-compatible)
             VOTE_METRICS.received_votes_total.increment(1);
+            metrics::counter!("curVotes.local").increment(1);
+
+            // Check for malicious votes
+            self.malicious_vote_monitor.conflict_detect(&vote, pending_block_number);
 
             // Use target_hash as the key for organizing votes
             let block_hash = vote.data.target_hash;
@@ -97,6 +109,15 @@ impl VotePool {
             }
 
             self.cur_votes.entry(block_hash).or_default().vote_messages.push(vote);
+
+            // Update geth-compatible gauges
+            metrics::gauge!("curVotesPq.local").set(self.cur_votes_pq.heap.len() as f64);
+            metrics::gauge!("receivedVotes.local").set(self.received_votes.len() as f64);
+
+            // Return the new vote count for this block
+            self.len_for_block(&block_hash)
+        } else {
+            0 // duplicate vote
         }
     }
 
@@ -107,6 +128,9 @@ impl VotePool {
         for (_, vote_messages) in self.cur_votes.drain() {
             all_votes.extend(vote_messages.vote_messages);
         }
+        // Update geth-compatible gauges
+        metrics::gauge!("curVotesPq.local").set(0.0);
+        metrics::gauge!("receivedVotes.local").set(0.0);
         all_votes
     }
 
@@ -167,6 +191,9 @@ impl VotePool {
                 break;
             }
         }
+        // Update geth-compatible gauges after pruning
+        metrics::gauge!("curVotesPq.local").set(self.cur_votes_pq.heap.len() as f64);
+        metrics::gauge!("receivedVotes.local").set(self.received_votes.len() as f64);
     }
 }
 
@@ -190,13 +217,21 @@ fn update_vote_pool_size_metric(size: usize) {
 /// Insert a single vote into the pool (deduplicated by hash).
 pub fn put_vote(vote: VoteEnvelope) {
     let target_hash = vote.data.target_hash;
+
+    // Get pending block number for malicious vote detection scope
+    let pending_block_number = shared::get_best_canonical_block_number().unwrap_or(0);
+
     let mut pool = VOTE_POOL.write().expect("vote pool poisoned");
-    pool.insert(vote);
-    let votes_for_block = pool.len_for_block(&target_hash);
+    let votes_for_block = pool.insert(vote, pending_block_number);
     let size = pool.len();
     drop(pool);
     update_vote_pool_size_metric(size);
-    maybe_notify_finality(target_hash, votes_for_block);
+
+    // Report chain delay vote metrics
+    if votes_for_block > 0 {
+        block_stats::on_vote_received(target_hash, votes_for_block);
+        maybe_notify_finality(target_hash, votes_for_block);
+    }
 }
 
 /// Drain all pending votes.

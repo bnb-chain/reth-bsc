@@ -916,8 +916,9 @@ where
                     if *prev_parent == parent_hash {
                         error!("Reject Double Sign!! block: {}, hash: 0x{:x}, root: 0x{:x}, ParentHash: 0x{:x}", 
                             block_number, block_hash, sealed_block.header().state_root, parent_hash);
-                        // Update double sign metric
+                        // Update double sign metrics (both reth-bsc native and geth-compatible)
                         self.consensus_metrics.double_signs_detected_total.increment(1);
+                        metrics::counter!("parlia.doublesign").increment(1);
                         double_sign = true;
                         break;
                     }

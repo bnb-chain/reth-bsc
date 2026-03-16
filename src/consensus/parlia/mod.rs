@@ -12,6 +12,8 @@ pub mod go_rng;
 pub mod ramanujan_fork;
 pub mod bls_signer;
 pub mod forkchoice_rule;
+pub mod block_stats;
+pub mod malicious_vote_monitor;
 
 #[cfg(test)]     
 mod tests;  
