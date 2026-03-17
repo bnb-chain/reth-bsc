@@ -297,15 +297,21 @@ impl BscNetworkBuilder {
 
         // Spawn the critical ImportService task exactly like the official implementation
         ctx.task_executor().spawn_critical("block import", async move {
-            let handle = engine_handle_rx
+            let handle = match engine_handle_rx
                 .lock()
                 .await
                 .take()
                 .expect("node should only be launched once")
                 .await
-                .unwrap();
+            {
+                Ok(handle) => handle,
+                Err(_) => {
+                    tracing::error!(target: "bsc::net", "Failed to receive engine handle - node may have shut down during startup");
+                    return;
+                }
+            };
 
-            ImportService::new(
+            if let Err(e) = ImportService::new(
                 provider,
                 chain_spec,
                 handle,
@@ -315,7 +321,9 @@ impl BscNetworkBuilder {
                 to_network,
             )
             .await
-            .unwrap();
+            {
+                tracing::error!(target: "bsc::net", ?e, "Import service terminated with error");
+            }
         });
 
         // TODO: update network with the latest canonical head, but has a fork id issue, can fix it later.
