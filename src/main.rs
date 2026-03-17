@@ -370,6 +370,11 @@ fn main() -> eyre::Result<()> {
                         tracing::info!("Start to register Miner RPC API...");
                         use reth_bsc::rpc::miner::{BscMinerApiImpl, BscMinerApiServer};
 
+                        // Remove reth's built-in MinerApi methods (registered on IPC by default)
+                        // to avoid conflicts with our BscMinerApi which redefines them
+                        ctx.modules.remove_method_from_configured("miner_setExtra");
+                        ctx.modules.remove_method_from_configured("miner_setGasPrice");
+                        ctx.modules.remove_method_from_configured("miner_setGasLimit");
                         let miner_api = BscMinerApiImpl::new();
                         ctx.modules.merge_configured(miner_api.into_rpc())?;
                         tracing::info!("Succeed to register Miner RPC API");
