@@ -593,9 +593,28 @@ where
     ///   otherwise a full period.
     pub fn delay_for_mining(&self, snap: &Snapshot, header: &Header, left_over_ms: u64) -> u64 {
         let period_ms = snap.block_interval;
+        let mut delay_ms = self.delay_for_ramanujan_fork(snap, header);
+        if left_over_ms >= period_ms {
+            warn!("Delay invalid argument: left_over_ms={}, period_ms={}", left_over_ms, period_ms);
+        } else if left_over_ms >= delay_ms {
+            delay_ms = 0;
+        } else {
+            delay_ms -= left_over_ms;
+        }
+
+        let mut time_for_mining_ms = period_ms / 5; // triedb root is not stable.
         let last_block_in_turn = snap.last_block_in_one_turn(header.number);
-        let delay_ms = self.delay_for_ramanujan_fork(snap, header);
-        apply_mining_delay_with_leftover(delay_ms, period_ms, last_block_in_turn, left_over_ms)
+        if !last_block_in_turn {
+            time_for_mining_ms = period_ms;
+        }
+        if delay_ms > time_for_mining_ms {
+            delay_ms = time_for_mining_ms;
+        }
+        if delay_ms == 0 && snap.first_block_in_one_turn(header.number) {
+            delay_ms = 50; // avoid the first block is empty.
+        }
+
+        delay_ms
     }
 
     pub fn prepare_timestamp(

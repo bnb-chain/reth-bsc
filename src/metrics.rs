@@ -166,6 +166,21 @@ pub struct BscMinerMetrics {
     /// Block finalize duration in seconds (equivalent to worker/finalizeblock)
     pub block_finalize_duration_seconds: Histogram,
 
+    /// Block execution duration in seconds (tx selection + execution; empty blocks include pre-exec changes).
+    pub block_exec_duration_seconds: Histogram,
+
+    /// Trie root computation duration in seconds (time spent in `finish()` after execution).
+    pub block_trie_root_duration_seconds: Histogram,
+
+    /// Total number of empty-payload candidates produced via the empty-fallback path.
+    ///
+    /// This is incremented when the payload job receives a completed build with
+    /// `BuildKind::EmptyFallback`.
+    pub empty_fallback_candidates_total: Counter,
+
+    /// Total number of times we ultimately failed to pick/send a best payload (block production failed).
+    pub no_best_payload_total: Counter,
+
     /// Total number of blocks produced
     pub blocks_produced_total: Counter,
 

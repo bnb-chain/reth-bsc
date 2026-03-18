@@ -1424,6 +1424,52 @@ where
                 }
             }
         };
+
+        // Diagnostic: if `incoming` is the direct child of `current`, TD should be monotonic:
+        // incoming_td ≈ current_td + incoming.difficulty (modulo any TD definition differences).
+        //
+        // Under high contention / forks, we have observed `incoming_td < current_td`, which
+        // makes forkchoice reject the incoming header. Log the ingredients so we can identify
+        // whether TD lookup is returning the canonical TD for a different hash at the same height.
+        if incoming.number == current.number + 1 && incoming.parent_hash == current.hash_slow() {
+            let parent_td = self.header_td(engine, incoming.number - 1, incoming.parent_hash).await?;
+            let expected_td = parent_td.map(|td| td + incoming.difficulty);
+
+            // Keep this low-noise: only emit when the monotonicity expectation is violated.
+            if incoming_td.is_some()
+                && current_td.is_some()
+                && incoming_td.unwrap() < current_td.unwrap()
+            {
+                tracing::warn!(
+                    target: "bsc::forkchoice",
+                    incoming_number = incoming.number,
+                    incoming_hash = ?incoming.hash_slow(),
+                    incoming_parent_hash = ?incoming.parent_hash,
+                    incoming_difficulty = ?incoming.difficulty,
+                    current_number = current.number,
+                    current_hash = ?current.hash_slow(),
+                    incoming_td = ?incoming_td,
+                    current_td = ?current_td,
+                    parent_td = ?parent_td,
+                    expected_td = ?expected_td,
+                    "Non-monotonic TD observed for direct-child incoming header; TD lookup may be inconsistent"
+                );
+            } else {
+                tracing::debug!(
+                    target: "bsc::forkchoice",
+                    incoming_number = incoming.number,
+                    incoming_hash = ?incoming.hash_slow(),
+                    incoming_difficulty = ?incoming.difficulty,
+                    current_number = current.number,
+                    current_hash = ?current.hash_slow(),
+                    incoming_td = ?incoming_td,
+                    current_td = ?current_td,
+                    parent_td = ?parent_td,
+                    expected_td = ?expected_td,
+                    "FCU TD diagnostic (direct child)"
+                );
+            }
+        }
         Ok((incoming_td, current_td))
     }
 

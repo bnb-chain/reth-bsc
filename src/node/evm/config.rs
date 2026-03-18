@@ -1,7 +1,5 @@
 use super::{
-    assembler::BscBlockAssembler,
-    builder::BscBlockBuilder,
-    executor::BscBlockExecutor,
+    assembler::BscBlockAssembler, builder::BscBlockBuilder, executor::BscBlockExecutor,
     factory::BscEvmFactory,
 };
 use crate::{
@@ -22,20 +20,52 @@ use reth_evm::{
     block::{BlockExecutorFactory, BlockExecutorFor},
     eth::{receipt_builder::ReceiptBuilder, EthBlockExecutionCtx},
     execute::BlockBuilder,
-    ConfigureEngineEvm, ConfigureEvm, Database, EvmEnv, EvmFactory, EvmFor, ExecutableTxIterator, ExecutionCtxFor,
-    FromRecoveredTx, FromTxWithEncoded, InspectorFor, IntoTxEnv, NextBlockEnvAttributes,
+    ConfigureEngineEvm, ConfigureEvm, Database, EvmEnv, EvmFactory, EvmFor, ExecutableTxIterator,
+    ExecutionCtxFor, FromRecoveredTx, FromTxWithEncoded, InspectorFor, IntoTxEnv,
+    NextBlockEnvAttributes,
 };
 use reth_evm_ethereum::RethReceiptBuilder;
 use reth_primitives::{BlockTy, HeaderTy, SealedBlock, SealedHeader, TransactionSigned};
 use reth_primitives_traits::constants::MAX_TX_GAS_LIMIT_OSAKA;
 use reth_revm::State;
+use reth_rpc_eth_api::helpers::pending_block::BuildPendingEnv;
 use revm::{
-    Inspector, context::{BlockEnv, CfgEnv}, context_interface::block::BlobExcessGasAndPrice, primitives::{hardfork::SpecId}
+    context::{BlockEnv, CfgEnv},
+    context_interface::block::BlobExcessGasAndPrice,
+    primitives::hardfork::SpecId,
+    Inspector,
 };
 use std::{borrow::Cow, cell::RefCell, convert::Infallible, rc::Rc, sync::Arc};
 
+/// BSC wrapper around [`NextBlockEnvAttributes`].
+///
+/// This follows the same approach as `sparse_v4`: we keep reth's base attributes unchanged, and
+/// carry extra miner-only data alongside it, while still satisfying upstream RPC trait bounds via
+/// a delegating [`BuildPendingEnv`] implementation.
+#[derive(Debug, Clone)]
+pub struct BscNextBlockEnvAttributes {
+    pub inner: NextBlockEnvAttributes,
+    /// Parent difflayers (from engine tree), used by triedb state root calculation and miner-side
+    /// triedb prefetcher.
+    pub parent_difflayers: Option<rust_eth_triedb_common::DiffLayers>,
+    /// Miner-side triedb prefetcher handle. This is started before execution and consumed in
+    /// `finish()` to obtain `prefetch_state` for triedb root calculation.
+    pub triedb_prefetcher: Option<crate::node::evm::MinerTrieDbPrefetcher>,
+}
+
+impl<H: BlockHeader> BuildPendingEnv<H> for BscNextBlockEnvAttributes {
+    fn build_pending_env(parent: &SealedHeader<H>) -> Self {
+        Self {
+            inner: NextBlockEnvAttributes::build_pending_env(parent),
+            parent_difflayers: None,
+            triedb_prefetcher: None,
+        }
+    }
+}
+
 /// Type alias for system transactions to reduce complexity
-type SystemTxs = Vec<reth_primitives_traits::Recovered<reth_primitives_traits::TxTy<crate::BscPrimitives>>>;
+type SystemTxs =
+    Vec<reth_primitives_traits::Recovered<reth_primitives_traits::TxTy<crate::BscPrimitives>>>;
 
 #[derive(Debug, Clone, Default)]
 pub struct BscExecutionSharedCtxInner {
@@ -58,9 +88,7 @@ pub struct BscExecutionSharedCtx {
 
 impl Default for BscExecutionSharedCtx {
     fn default() -> Self {
-        Self {
-            inner: Rc::new(RefCell::new(BscExecutionSharedCtxInner::default())),
-        }
+        Self { inner: Rc::new(RefCell::new(BscExecutionSharedCtxInner::default())) }
     }
 }
 
@@ -74,6 +102,11 @@ pub struct BscBlockExecutionCtx<'a> {
     pub header: Option<Header>,
     /// Whether the block is being mined.
     pub is_miner: bool,
+    /// Parent difflayers (from engine tree), used by triedb state root calculation and miner-side
+    /// triedb prefetcher.
+    pub parent_difflayers: Option<rust_eth_triedb_common::DiffLayers>,
+    /// Miner-side triedb prefetcher handle (consumed in `finish()`).
+    pub triedb_prefetcher: Option<crate::node::evm::MinerTrieDbPrefetcher>,
 }
 
 impl<'a> BscBlockExecutionCtx<'a> {
@@ -82,7 +115,6 @@ impl<'a> BscBlockExecutionCtx<'a> {
         &self.base
     }
 }
-
 
 /// Ethereum-related EVM configuration.
 #[derive(Debug, Clone)]
@@ -208,7 +240,7 @@ where
 {
     type Primitives = BscPrimitives;
     type Error = Infallible;
-    type NextBlockEnvCtx = NextBlockEnvAttributes;
+    type NextBlockEnvCtx = BscNextBlockEnvAttributes;
     type BlockExecutorFactory = BscBlockExecutorFactory;
     type BlockAssembler = BscBlockAssembler<BscChainSpec>;
 
@@ -222,7 +254,11 @@ where
 
     fn evm_env(&self, header: &Header) -> Result<EvmEnv<BscHardfork>, Self::Error> {
         let mut blob_params = None;
-        if BscHardforks::is_cancun_active_at_timestamp(self.chain_spec(), header.number, header.timestamp) {
+        if BscHardforks::is_cancun_active_at_timestamp(
+            self.chain_spec(),
+            header.number,
+            header.timestamp,
+        ) {
             blob_params = self.chain_spec().blob_params_at_timestamp(header.timestamp);
         }
         let spec = revm_spec_by_timestamp_and_block_number(
@@ -277,6 +313,7 @@ where
         parent: &Header,
         attributes: &Self::NextBlockEnvCtx,
     ) -> Result<EvmEnv<BscHardfork>, Self::Error> {
+        let attributes = &attributes.inner;
         // ensure we're not missing any timestamp based hardforks
         let spec_id = revm_spec_by_timestamp_and_block_number(
             self.chain_spec().clone(),
@@ -309,7 +346,6 @@ where
             cfg_env.tx_gas_limit_cap = Some(MAX_TX_GAS_LIMIT_OSAKA);
         }
 
-  
         // Refer to geth-bsc: https://github.com/bnb-chain/bsc/blob/master/consensus/misc/eip1559/eip1559.go#L61
         let mut basefee = Some(EIP1559_INITIAL_BASE_FEE);
 
@@ -354,39 +390,43 @@ where
     fn context_for_block<'a>(
         &self,
         block: &'a SealedBlock<BlockTy<Self::Primitives>>,
-    ) -> Result<ExecutionCtxFor<'a, Self>, Self::Error> {
-        Ok(BscBlockExecutionCtx {
+    ) -> ExecutionCtxFor<'a, Self> {
+        BscBlockExecutionCtx {
             base: EthBlockExecutionCtx {
-                tx_count_hint: Some(block.transaction_count()),
                 parent_hash: block.header().parent_hash,
                 parent_beacon_block_root: block.header().parent_beacon_block_root,
                 ommers: &block.body().ommers,
                 withdrawals: block.body().withdrawals.as_ref().map(Cow::Borrowed),
-                extra_data: block.header().extra_data.clone(),
             },
             header: Some(block.header().clone()),
             is_miner: false,
-        })
+            parent_difflayers: None,
+            triedb_prefetcher: None,
+        }
     }
 
     fn context_for_next_block(
         &self,
         parent: &SealedHeader<HeaderTy<Self::Primitives>>,
         attributes: Self::NextBlockEnvCtx,
-    ) -> Result<ExecutionCtxFor<'_, Self>, Self::Error> {
-        tracing::trace!("Try to create next block ctx for miner, next_block_numer={}, parent_hash={}", parent.number+1, parent.hash());
-        Ok(BscBlockExecutionCtx {
+    ) -> ExecutionCtxFor<'_, Self> {
+        tracing::trace!(
+            "Try to create next block ctx for miner, next_block_numer={}, parent_hash={}",
+            parent.number + 1,
+            parent.hash()
+        );
+        BscBlockExecutionCtx {
             base: EthBlockExecutionCtx {
-                tx_count_hint: None,
                 parent_hash: parent.hash(),
-                parent_beacon_block_root: attributes.parent_beacon_block_root,
+                parent_beacon_block_root: attributes.inner.parent_beacon_block_root,
                 ommers: &[],
-                withdrawals: attributes.withdrawals.map(Cow::Owned),
-                extra_data: attributes.extra_data,
+                withdrawals: attributes.inner.withdrawals.map(Cow::Owned),
             },
             header: None, // No header available for next block context
             is_miner: true,
-        })
+            parent_difflayers: attributes.parent_difflayers,
+            triedb_prefetcher: attributes.triedb_prefetcher,
+        }
     }
 
     // payload builder use this method to create BscBlockBuilder.
@@ -407,20 +447,21 @@ where
         let shared_ctx = BscExecutionSharedCtx::default();
         let bsc_executor = BscBlockExecutor::new(
             evm,
-            ctx.clone(),
+            {
+                // Avoid cloning miner-only helpers into the executor context. The block builder keeps
+                // the full ctx and consumes these in `finish()`.
+                let mut exec_ctx = ctx.clone();
+                exec_ctx.parent_difflayers = None;
+                exec_ctx.triedb_prefetcher = None;
+                exec_ctx
+            },
             shared_ctx.clone(),
             self.executor_factory.spec().clone(),
             *self.executor_factory.receipt_builder(),
             SystemContract::new(self.executor_factory.spec().clone()),
         );
-        
-        BscBlockBuilder::new(
-            bsc_executor,
-            ctx,
-            shared_ctx,
-            &self.block_assembler,
-            parent,
-        )
+
+        BscBlockBuilder::new(bsc_executor, ctx, shared_ctx, &self.block_assembler, parent)
     }
 }
 
@@ -428,27 +469,27 @@ impl ConfigureEngineEvm<BscExecutionData> for BscEvmConfig
 where
     Self: Send + Sync + Unpin + Clone + 'static,
 {
-    fn evm_env_for_payload(&self, payload: &BscExecutionData) -> Result<EvmEnv<BscHardfork>, Self::Error> {
+    fn evm_env_for_payload(&self, payload: &BscExecutionData) -> EvmEnv<BscHardfork> {
         self.evm_env(&payload.0.header)
     }
 
     fn context_for_payload<'a>(
         &self,
         payload: &'a BscExecutionData,
-    ) -> Result<BscBlockExecutionCtx<'a>, Self::Error> {
+    ) -> BscBlockExecutionCtx<'a> {
         let block = &payload.0;
-        Ok(BscBlockExecutionCtx {
+        BscBlockExecutionCtx {
             base: EthBlockExecutionCtx {
-                tx_count_hint: Some(block.body.inner.transactions.len()),
                 parent_hash: block.header.parent_hash(),
                 parent_beacon_block_root: block.header.parent_beacon_block_root,
                 ommers: &block.body.inner.ommers,
                 withdrawals: block.body.inner.withdrawals.as_ref().map(Cow::Borrowed),
-                extra_data: block.header.extra_data.clone(),
             },
             header: Some(block.header.clone()),
             is_miner: false,
-        })
+            parent_difflayers: None,
+            triedb_prefetcher: None,
+        }
     }
 
     fn tx_iterator_for_payload(

@@ -1,11 +1,16 @@
 use crate::{
-    BscBlock, BscBlockBody, chainspec::BscChainSpec, node::{
+    chainspec::BscChainSpec,
+    node::{
         engine_api::{
             builder::BscEngineApiBuilder,
             payload::BscPayloadTypes,
             validator::{BscEngineValidatorBuilder, BscPayloadValidatorBuilder},
-        }, pool::BscPoolBuilder, primitives::BscPrimitives, storage::BscStorage
-    }
+        },
+        pool::BscPoolBuilder,
+        primitives::BscPrimitives,
+        storage::BscStorage,
+    },
+    BscBlock, BscBlockBody,
 };
 use consensus::BscConsensusBuilder;
 use engine::BscPayloadServiceBuilder;
@@ -40,18 +45,18 @@ pub mod consensus;
 pub mod engine;
 pub mod engine_api;
 pub mod evm;
-pub mod pool;
 pub mod miner;
 pub mod network;
+pub mod pool;
 pub mod primitives;
 pub mod storage;
-pub mod vote_producer;
 pub mod vote_journal;
+pub mod vote_producer;
 
 /// Bsc addons configuring RPC types
 pub type BscNodeAddOns<N> = RpcAddOns<
     N,
-    BscEthApiBuilder,
+    EthereumEthApiBuilder, // Use standard Ethereum API builder
     BscPayloadValidatorBuilder,
     BscEngineApiBuilder,
     BscEngineValidatorBuilder,
@@ -107,8 +112,7 @@ where
 /// Type configuration for a regular BSC node.
 #[derive(Debug, Clone)]
 pub struct BscNode {
-    engine_handle_rx:
-        Arc<Mutex<Option<oneshot::Receiver<ConsensusEngineHandle<BscPayloadTypes>>>>>,
+    engine_handle_rx: Arc<Mutex<Option<oneshot::Receiver<ConsensusEngineHandle<BscPayloadTypes>>>>>,
 }
 
 impl BscNode {
@@ -146,7 +150,7 @@ impl BscNode {
             .executor(BscExecutorBuilder::default())
             .payload(BscPayloadServiceBuilder::default())
             .network(BscNetworkBuilder::new(self.engine_handle_rx.clone()))
-            .consensus(BscConsensusBuilder::default())  
+            .consensus(BscConsensusBuilder::default())
     }
 }
 
@@ -155,6 +159,15 @@ impl NodeTypes for BscNode {
     type ChainSpec = BscChainSpec;
     type Storage = BscStorage;
     type Payload = BscPayloadTypes;
+}
+
+// Provide FullNodeTypes for BscNode so EngineApiTx<BscNode> can be used.
+impl reth::api::FullNodeTypes for BscNode {
+    type Types = Self;
+    type DB = std::sync::Arc<reth_db::DatabaseEnv>;
+    type Provider = reth_provider::providers::BlockchainProvider<
+        reth::api::NodeTypesWithDBAdapter<Self, Self::DB>,
+    >;
 }
 
 impl<N> Node<N> for BscNode

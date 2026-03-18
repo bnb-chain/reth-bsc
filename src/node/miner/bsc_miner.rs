@@ -44,7 +44,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_stream::StreamExt;
@@ -111,12 +110,31 @@ where
     pub async fn run(mut self) {
         info!("Succeed to spawn new work worker, address: {}", self.validator_address);
 
+        let mut notifications = self.provider.canonical_state_stream();
+        debug!(target: "bsc::miner", "Subscribed to canonical_state_stream");
+
+        // Don't block the canonical notifications loop on potentially slow startup checks (DB
+        // reads / snapshot locks). If this blocks, we can miss the first few canonical commits and
+        // never emit the per-commit "Try new work" log.
         if let Some(tip_header) = self.get_tip_header_at_startup() {
             debug!("Try new work at startup, tip_block={}", tip_header.number());
-            self.try_new_work(&tip_header).await;
+            let validator_address = self.validator_address;
+            let provider = self.provider.clone();
+            let snapshot_provider = Arc::clone(&self.snapshot_provider);
+            let mining_queue_tx = self.mining_queue_tx.clone();
+            let consensus = Arc::clone(&self.consensus);
+            tokio::spawn(async move {
+                let worker = NewWorkWorker::new(
+                    validator_address,
+                    provider,
+                    snapshot_provider,
+                    mining_queue_tx,
+                    consensus,
+                );
+                worker.try_new_work(&tip_header).await;
+            });
         }
 
-        let mut notifications = self.provider.canonical_state_stream();
         loop {
             match notifications.next().await {
                 Some(event) => {
@@ -357,16 +375,16 @@ where
         H: alloy_consensus::BlockHeader + Sealable,
     {
         // TODO: refine check is_syncing status.
-        if tip.timestamp()
-            < SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() - 3
-        {
-            debug!(
-                "Skip to mine new block due to maybe in syncing, validator: {}, tip: {}",
-                self.validator_address,
-                tip.number()
-            );
-            return;
-        }
+        // if tip.timestamp()
+        //     < SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() - 3
+        // {
+        //     debug!(
+        //         "Skip to mine new block due to maybe in syncing, validator: {}, tip: {}",
+        //         self.validator_address,
+        //         tip.number()
+        //     );
+        //     return;
+        // }
 
         let parent_header = match self.provider.sealed_header_by_hash(tip.hash()) {
             Ok(Some(header)) => {
@@ -467,7 +485,8 @@ pub struct MainWorkWorker<Pool, Provider> {
     mining_queue_rx: mpsc::UnboundedReceiver<MiningContext>,
     payload_tx: mpsc::UnboundedSender<SubmitContext>,
     running_job_handle: Option<BscPayloadJobHandle>,
-    payload_job_join_set: JoinSet<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
+    payload_job_join_set:
+        JoinSet<Result<(), Box<crate::node::miner::payload::BscPayloadJobError>>>,
     simulator: Arc<BidSimulator<Provider, Pool>>, // No outer RwLock, each map has its own lock
     desired_gas_limit: u64,
     desired_min_gas_tip: u128,
@@ -951,6 +970,9 @@ where
             parent_hash = ?parent_hash,
             txs = sealed_block.body().transaction_count(),
             gas_used = sealed_block.gas_used(),
+            build_kind = ?payload.build_kind,
+            exec_duration_ms = payload.exec_duration.as_millis(),
+            trie_root_duration_ms = payload.trie_root_duration.as_millis(),
             turn_status,
             "Submitting block"
         );
@@ -959,6 +981,20 @@ where
         use crate::metrics::BscMinerMetrics;
         use once_cell::sync::Lazy;
         static MINER_METRICS: Lazy<BscMinerMetrics> = Lazy::new(BscMinerMetrics::default);
+
+        // Count empty-fallback payloads at submission time (this preserves the signal even if the
+        // payload job saw multiple candidates).
+        if payload.build_kind == crate::node::engine::BuildKind::EmptyFallback {
+            MINER_METRICS.empty_fallback_candidates_total.increment(1);
+        }
+
+        // Record payload build timings.
+        MINER_METRICS
+            .block_exec_duration_seconds
+            .record(payload.exec_duration.as_secs_f64());
+        MINER_METRICS
+            .block_trie_root_duration_seconds
+            .record(payload.trie_root_duration.as_secs_f64());
 
         let gas_used_mgas = sealed_block.gas_used() as f64 / 1_000_000.0;
         MINER_METRICS.best_work_gas_used_mgas.set(gas_used_mgas);

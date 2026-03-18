@@ -4,7 +4,7 @@ use crate::consensus::parlia::provider::SnapshotProvider;
 use crate::consensus::parlia::Snapshot;
 use crate::hardforks::BscHardforks;
 use crate::node::engine::BscBuiltPayload;
-use crate::node::evm::config::BscEvmConfig;
+use crate::node::evm::config::{BscEvmConfig, BscNextBlockEnvAttributes};
 use crate::node::miner::bsc_miner::MiningContext;
 use crate::node::miner::payload::DELAY_LEFT_OVER;
 use crate::node::miner::util::prepare_new_attributes;
@@ -392,14 +392,17 @@ where
             .builder_for_next_block(
                 &mut db,
                 &parent_header,
-                NextBlockEnvAttributes {
-                    timestamp: attributes.timestamp(),
-                    suggested_fee_recipient: attributes.suggested_fee_recipient(),
-                    prev_randao: attributes.prev_randao(),
-                    gas_limit,
-                    parent_beacon_block_root: attributes.parent_beacon_block_root(),
-                    withdrawals: Some(attributes.withdrawals().clone()),
-                    extra_data: builder_config.extra_data.clone(),
+                BscNextBlockEnvAttributes {
+                    inner: NextBlockEnvAttributes {
+                        timestamp: attributes.timestamp(),
+                        suggested_fee_recipient: attributes.suggested_fee_recipient(),
+                        prev_randao: attributes.prev_randao(),
+                        gas_limit,
+                        parent_beacon_block_root: attributes.parent_beacon_block_root(),
+                        withdrawals: Some(attributes.withdrawals().clone()),
+                    },
+                    parent_difflayers: None,
+                    triedb_prefetcher: None,
                 },
             )
             .map_err(PayloadBuilderError::other)
@@ -504,15 +507,16 @@ where
             return;
         }
 
-        // Finish the builder
-        let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } =
-            match builder.finish(&state_provider).map_err(PayloadBuilderError::other) {
-                Ok(outcome) => outcome,
-                Err(e) => {
-                    debug!("Failed to finish builder: {:?}", e);
-                    return;
-                }
-            };
+        // Finish the builder (also returns triedb difflayer when enabled)
+        let out = match builder.finish_with_difflayer(&state_provider).map_err(PayloadBuilderError::other) {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                debug!("Failed to finish builder: {:?}", e);
+                return;
+            }
+        };
+        let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } = out.inner;
+        let difflayer = out.difflayer;
         let mut sealed_block = Arc::new(block.sealed_block().clone());
 
         // Check if any un_revertible transaction failed
@@ -542,20 +546,25 @@ where
         plain.body.sidecars = Some(bid_runtime.blob_sidecars.clone());
         sealed_block = Arc::new(plain.into());
 
-        let requests = execution_result.requests.clone();
-        let execution_outcome = BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
-        let executed: BuiltPayloadExecutedBlock<_> = BuiltPayloadExecutedBlock {
-            recovered_block: Arc::new(block),
-            execution_output: Arc::new(execution_outcome),
-            hashed_state: Either::Left(Arc::new(hashed_state)),
-            trie_updates: Either::Left(Arc::new(trie_updates)),
-        };
-
         bid_runtime.bsc_payload = Some(BscBuiltPayload {
             block: sealed_block.clone(),
             fees: bid_runtime.gas_fee,
-            requests: Some(requests),
-            executed_block: executed,
+            requests: Some(execution_result.requests.clone()),
+            build_kind: crate::node::engine::BuildKind::NormalAttempt,
+            exec_duration: std::time::Duration::ZERO,
+            trie_root_duration: std::time::Duration::ZERO,
+            executed_block: ExecutedBlock {
+                recovered_block: Arc::new(block.clone()),
+                execution_output: Arc::new(ExecutionOutcome::new(
+                    db.take_bundle(),
+                    vec![execution_result.receipts.clone()],
+                    sealed_block.header().number(),
+                    vec![execution_result.requests.clone()],
+                )),
+                hashed_state: Arc::new(hashed_state.clone()),
+            },
+            executed_trie: Some(ExecutedTrieUpdates::Present(Arc::new(trie_updates))),
+            difflayer,
         });
 
         // Acquire write lock to update best_bid
@@ -655,7 +664,7 @@ where
             Transaction: reth::transaction_pool::PoolTransaction<Consensus = TransactionSigned>,
         > + Clone
         + 'static,
-    EvmConfig: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
+    EvmConfig: ConfigureEvm<NextBlockEnvCtx = BscNextBlockEnvAttributes> + 'static,
     <EvmConfig as ConfigureEvm>::Primitives: reth_primitives_traits::NodePrimitives<
         BlockHeader = alloy_consensus::Header,
         SignedTx = alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip4844>,
