@@ -73,128 +73,83 @@ impl BscMinerApiImpl {
 
 #[async_trait::async_trait]
 impl BscMinerApiServer for BscMinerApiImpl {
-    /// Start mining
-    /// Note: In reth-bsc, mining is controlled by the node configuration and Parlia consensus.
-    /// This method is provided for API compatibility with geth-bsc.
     async fn start(&self) -> RpcResult<()> {
-        tracing::warn!(target: "bsc::rpc", "miner_start called - mining lifecycle is managed by node configuration in reth-bsc");
-        Err(jsonrpsee::types::ErrorObject::owned(
-            -32000,
-            "miner_start is not supported: mining lifecycle is managed by node configuration",
-            None::<()>,
-        ))
+        tracing::info!(target: "bsc::rpc", "miner_start called");
+        crate::shared::set_mining_enabled(true);
+        Ok(())
     }
 
-    /// Stop mining
-    /// Note: In reth-bsc, mining is controlled by the node configuration and Parlia consensus.
-    /// This method is provided for API compatibility with geth-bsc.
     async fn stop(&self) -> RpcResult<()> {
-        tracing::warn!(target: "bsc::rpc", "miner_stop called - mining lifecycle is managed by node configuration in reth-bsc");
-        Err(jsonrpsee::types::ErrorObject::owned(
-            -32000,
-            "miner_stop is not supported: mining lifecycle is managed by node configuration",
-            None::<()>,
-        ))
+        tracing::info!(target: "bsc::rpc", "miner_stop called");
+        crate::shared::set_mining_enabled(false);
+        Ok(())
     }
 
-    /// Set extra data for mined blocks
-    /// Note: Extra data is determined by Parlia consensus in reth-bsc.
     async fn set_extra(&self, extra: String) -> RpcResult<bool> {
-        tracing::warn!(target: "bsc::rpc", "miner_setExtra called with: {} - extra data is managed by Parlia consensus", extra);
-        Err(jsonrpsee::types::ErrorObject::owned(
-            -32000,
-            "miner_setExtra is not supported: extra data is managed by Parlia consensus",
-            None::<()>,
-        ))
+        tracing::info!(target: "bsc::rpc", "miner_setExtra called with: {}", extra);
+        let bytes = alloy_primitives::Bytes::from(extra.into_bytes());
+        if bytes.len() > 32 {
+            return Err(jsonrpsee::types::ErrorObject::owned(
+                -32000,
+                "extra data too long (max 32 bytes)",
+                None::<()>,
+            ));
+        }
+        crate::shared::set_miner_extra(bytes);
+        Ok(true)
     }
 
-    /// Set minimum accepted gas price
-    /// Note: Gas price is configured via environment variables in reth-bsc.
     async fn set_gas_price(&self, gas_price: alloy_primitives::U256) -> RpcResult<bool> {
-        tracing::warn!(target: "bsc::rpc", "miner_setGasPrice called with: {} - use BSC_MIN_GAS_TIP env var", gas_price);
-        Err(jsonrpsee::types::ErrorObject::owned(
-            -32000,
-            "miner_setGasPrice is not supported: use BSC_MIN_GAS_TIP environment variable",
-            None::<()>,
-        ))
+        tracing::info!(target: "bsc::rpc", "miner_setGasPrice called with: {}", gas_price);
+        // Convert U256 to u64 (gas tip in wei); saturate if it exceeds u64::MAX
+        let tip: u64 = gas_price.try_into().unwrap_or(u64::MAX);
+        crate::shared::set_miner_gas_tip(tip);
+        Ok(true)
     }
 
-    /// Set gas limit target for mining
-    /// Note: Gas limit is configured via environment variables in reth-bsc.
     async fn set_gas_limit(&self, gas_limit: u64) -> RpcResult<bool> {
-        tracing::warn!(target: "bsc::rpc", "miner_setGasLimit called with: {} - use BSC_GAS_LIMIT env var", gas_limit);
-        Err(jsonrpsee::types::ErrorObject::owned(
-            -32000,
-            "miner_setGasLimit is not supported: use BSC_GAS_LIMIT environment variable",
-            None::<()>,
-        ))
+        tracing::info!(target: "bsc::rpc", "miner_setGasLimit called with: {}", gas_limit);
+        crate::shared::set_miner_gas_limit(gas_limit);
+        Ok(true)
     }
 
-    /// Set etherbase (validator address)
-    /// Note: Validator address is configured via keystore/private key in reth-bsc.
     async fn set_etherbase(&self, etherbase: Address) -> RpcResult<bool> {
-        tracing::warn!(target: "bsc::rpc", "miner_setEtherbase called with: {} - use BSC_PRIVATE_KEY or BSC_KEYSTORE_PATH env var", etherbase);
-        Err(jsonrpsee::types::ErrorObject::owned(
-            -32000,
-            "miner_setEtherbase is not supported: validator address is derived from the configured private key",
-            None::<()>,
-        ))
+        tracing::info!(target: "bsc::rpc", "miner_setEtherbase called with: {}", etherbase);
+        crate::shared::set_miner_etherbase(etherbase);
+        Ok(true)
     }
 
-    /// Set recommit interval for miner sealing work
-    /// Note: Not currently supported in reth-bsc.
     async fn set_recommit_interval(&self, interval: u64) -> RpcResult<()> {
-        tracing::warn!(target: "bsc::rpc", "miner_setRecommitInterval called with: {}ms - not supported", interval);
-        Err(jsonrpsee::types::ErrorObject::owned(
-            -32000,
-            "miner_setRecommitInterval is not supported",
-            None::<()>,
-        ))
+        tracing::info!(target: "bsc::rpc", "miner_setRecommitInterval called with: {}ms", interval);
+        crate::shared::set_miner_recommit_interval_ms(interval);
+        Ok(())
     }
 
-    /// Check if MEV is running (validator accepting bids from builders)
     async fn mev_running(&self) -> RpcResult<bool> {
         Ok(crate::shared::is_mev_running())
     }
 
-    /// Start MEV - begin accepting bids from builders
     async fn start_mev(&self) -> RpcResult<()> {
-        tracing::info!(target: "bsc::rpc", "miner_startMev called - enabling MEV bid acceptance");
+        tracing::info!(target: "bsc::rpc", "miner_startMev called");
         crate::shared::start_mev();
         Ok(())
     }
 
-    /// Stop MEV - stop accepting new bids from builders
-    /// Previously received bids are still considered.
     async fn stop_mev(&self) -> RpcResult<()> {
-        tracing::info!(target: "bsc::rpc", "miner_stopMev called - disabling MEV bid acceptance");
+        tracing::info!(target: "bsc::rpc", "miner_stopMev called");
         crate::shared::stop_mev();
         Ok(())
     }
 
-    /// Add a builder to the bid simulator whitelist
     async fn add_builder(&self, builder: Address, url: String) -> RpcResult<()> {
-        tracing::info!(target: "bsc::rpc", "miner_addBuilder called: builder={}, url={}", builder, url);
-        // Note: url is accepted for API compatibility with geth-bsc but not used currently
-        // as reth-bsc's bid simulator doesn't connect to builder endpoints
-        let added = crate::shared::add_builder(builder);
-        if added {
-            tracing::info!(target: "bsc::rpc", "Builder {} added to whitelist", builder);
-        } else {
-            tracing::info!(target: "bsc::rpc", "Builder {} was already in whitelist", builder);
-        }
+        tracing::info!(target: "bsc::rpc", "miner_addBuilder: builder={}, url={}", builder, url);
+        crate::shared::add_builder(builder);
         Ok(())
     }
 
-    /// Remove a builder from the bid simulator whitelist
     async fn remove_builder(&self, builder: Address) -> RpcResult<()> {
-        tracing::info!(target: "bsc::rpc", "miner_removeBuilder called: builder={}", builder);
-        let removed = crate::shared::remove_builder(&builder);
-        if removed {
-            tracing::info!(target: "bsc::rpc", "Builder {} removed from whitelist", builder);
-        } else {
-            tracing::info!(target: "bsc::rpc", "Builder {} was not in whitelist", builder);
-        }
+        tracing::info!(target: "bsc::rpc", "miner_removeBuilder: builder={}", builder);
+        crate::shared::remove_builder(&builder);
         Ok(())
     }
 }

@@ -80,6 +80,26 @@ static MEV_RUNNING: OnceLock<Arc<AtomicBool>> = OnceLock::new();
 static BUILDER_WHITELIST: OnceLock<
     Arc<RwLock<std::collections::HashSet<alloy_primitives::Address>>>,
 > = OnceLock::new();
+
+// ============ Miner Dynamic Config ============
+// These allow miner_* RPC methods to update mining parameters at runtime.
+// Initialized from MiningConfig at startup; read by the miner workers.
+
+use std::sync::atomic::AtomicU64;
+
+/// Dynamic gas limit (set by miner_setGasLimit)
+static MINER_GAS_LIMIT: OnceLock<AtomicU64> = OnceLock::new();
+/// Dynamic min gas tip in wei (set by miner_setGasPrice), stored as u64
+static MINER_GAS_TIP: OnceLock<AtomicU64> = OnceLock::new();
+/// Dynamic etherbase / coinbase address (set by miner_setEtherbase)
+static MINER_ETHERBASE: OnceLock<RwLock<alloy_primitives::Address>> = OnceLock::new();
+/// Dynamic extra data bytes (set by miner_setExtra)
+static MINER_EXTRA: OnceLock<RwLock<alloy_primitives::Bytes>> = OnceLock::new();
+/// Dynamic recommit interval in milliseconds (set by miner_setRecommitInterval)
+static MINER_RECOMMIT_INTERVAL_MS: OnceLock<AtomicU64> = OnceLock::new();
+/// Mining enabled flag (set by miner_start / miner_stop)
+static MINING_ENABLED: OnceLock<AtomicBool> = OnceLock::new();
+
 /// Global proxyed peer IDs list
 static PROXYED_PEER_IDS: OnceLock<Vec<PeerId>> = OnceLock::new();
 
@@ -580,6 +600,99 @@ pub fn is_builder_allowed(builder: &alloy_primitives::Address) -> bool {
         }
     }
     false
+}
+
+// ============ Miner Dynamic Config Accessors ============
+
+/// Initialize all miner dynamic config from MiningConfig (called once at miner startup).
+/// If not called, getters return the fallback defaults.
+pub fn init_miner_dynamic_config(
+    gas_limit: u64,
+    gas_tip: u64,
+    validator_address: alloy_primitives::Address,
+) {
+    let _ = MINER_GAS_LIMIT.set(AtomicU64::new(gas_limit));
+    let _ = MINER_GAS_TIP.set(AtomicU64::new(gas_tip));
+    let _ = MINER_ETHERBASE.set(RwLock::new(validator_address));
+    let _ = MINER_EXTRA.set(RwLock::new(alloy_primitives::Bytes::new()));
+    let _ = MINER_RECOMMIT_INTERVAL_MS.set(AtomicU64::new(0));
+    let _ = MINING_ENABLED.set(AtomicBool::new(true));
+}
+
+// --- gas limit ---
+
+pub fn set_miner_gas_limit(val: u64) {
+    if let Some(v) = MINER_GAS_LIMIT.get() {
+        v.store(val, Ordering::Relaxed);
+    }
+}
+
+pub fn get_miner_gas_limit() -> Option<u64> {
+    MINER_GAS_LIMIT.get().map(|v| v.load(Ordering::Relaxed))
+}
+
+// --- gas tip (gas price) ---
+
+pub fn set_miner_gas_tip(val: u64) {
+    if let Some(v) = MINER_GAS_TIP.get() {
+        v.store(val, Ordering::Relaxed);
+    }
+}
+
+pub fn get_miner_gas_tip() -> Option<u64> {
+    MINER_GAS_TIP.get().map(|v| v.load(Ordering::Relaxed))
+}
+
+// --- etherbase ---
+
+pub fn set_miner_etherbase(addr: alloy_primitives::Address) {
+    if let Some(lock) = MINER_ETHERBASE.get() {
+        if let Ok(mut guard) = lock.write() {
+            *guard = addr;
+        }
+    }
+}
+
+pub fn get_miner_etherbase() -> Option<alloy_primitives::Address> {
+    MINER_ETHERBASE.get().and_then(|lock| lock.read().ok().map(|g| *g))
+}
+
+// --- extra data ---
+
+pub fn set_miner_extra(data: alloy_primitives::Bytes) {
+    if let Some(lock) = MINER_EXTRA.get() {
+        if let Ok(mut guard) = lock.write() {
+            *guard = data;
+        }
+    }
+}
+
+pub fn get_miner_extra() -> Option<alloy_primitives::Bytes> {
+    MINER_EXTRA.get().and_then(|lock| lock.read().ok().map(|g| g.clone()))
+}
+
+// --- recommit interval ---
+
+pub fn set_miner_recommit_interval_ms(val: u64) {
+    if let Some(v) = MINER_RECOMMIT_INTERVAL_MS.get() {
+        v.store(val, Ordering::Relaxed);
+    }
+}
+
+pub fn get_miner_recommit_interval_ms() -> Option<u64> {
+    MINER_RECOMMIT_INTERVAL_MS.get().map(|v| v.load(Ordering::Relaxed))
+}
+
+// --- mining enabled ---
+
+pub fn set_mining_enabled(val: bool) {
+    if let Some(v) = MINING_ENABLED.get() {
+        v.store(val, Ordering::Relaxed);
+    }
+}
+
+pub fn is_mining_enabled() -> bool {
+    MINING_ENABLED.get().map(|v| v.load(Ordering::Relaxed)).unwrap_or(false)
 }
 
 // ============= IPC client ===============
