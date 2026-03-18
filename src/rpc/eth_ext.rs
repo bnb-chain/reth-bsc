@@ -43,8 +43,11 @@ impl BscEthExtApiServer for BscEthExtApiImpl {
     /// Returns the validator address (coinbase/etherbase).
     /// In geth-bsc, Coinbase() is an alias for Etherbase() which returns
     /// the address that mining rewards will be sent to.
+    /// Reflects updates from miner_setEtherbase if called.
     async fn coinbase(&self) -> RpcResult<Address> {
-        Ok(self.validator_address)
+        // Prefer dynamic value (set by miner_setEtherbase), fall back to startup value
+        let addr = crate::shared::get_miner_etherbase().unwrap_or(self.validator_address);
+        Ok(addr)
     }
 
     /// Returns true if the node is healthy.
