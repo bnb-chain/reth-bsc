@@ -16,7 +16,7 @@ use reth::{
     payload::{PayloadBuilderHandle, PayloadServiceCommand},
     transaction_pool::TransactionPool,
 };
-use reth_chain_state::{ExecutedBlock, ExecutedBlockWithTrieUpdates, ExecutedTrieUpdates};
+use reth_chain_state::ExecutedBlock;
 use reth_evm::ConfigureEvm;
 use reth_payload_builder_primitives::Events;
 use reth_payload_primitives::BuiltPayload;
@@ -52,12 +52,8 @@ pub struct BscBuiltPayload {
     pub exec_duration: Duration,
     /// Time spent computing the trie root (time spent in `finish()` after execution).
     pub trie_root_duration: Duration,
-    /// The executed block
+    /// The executed block (includes difflayer if triedb produced one)
     pub(crate) executed_block: ExecutedBlock<BscPrimitives>,
-    /// The executed trie updates
-    pub(crate) executed_trie: Option<ExecutedTrieUpdates>,
-    /// The diff layer computed during block execution
-    pub(crate) difflayer: Option<Arc<rust_eth_triedb_common::DiffLayer>>,
 }
 
 impl BuiltPayload for BscBuiltPayload {
@@ -73,14 +69,6 @@ impl BuiltPayload for BscBuiltPayload {
 
     fn requests(&self) -> Option<Requests> {
         self.requests.clone()
-    }
-
-    fn executed_block(&self) -> Option<ExecutedBlockWithTrieUpdates<Self::Primitives>> {
-        self.executed_trie.clone().map(|trie| ExecutedBlockWithTrieUpdates {
-            difflayer: self.difflayer.clone(),
-            block: self.executed_block.clone(),
-            trie,
-        })
     }
 }
 

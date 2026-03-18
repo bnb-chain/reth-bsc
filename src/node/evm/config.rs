@@ -390,43 +390,47 @@ where
     fn context_for_block<'a>(
         &self,
         block: &'a SealedBlock<BlockTy<Self::Primitives>>,
-    ) -> ExecutionCtxFor<'a, Self> {
-        BscBlockExecutionCtx {
+    ) -> Result<ExecutionCtxFor<'a, Self>, Self::Error> {
+        Ok(BscBlockExecutionCtx {
             base: EthBlockExecutionCtx {
                 parent_hash: block.header().parent_hash,
                 parent_beacon_block_root: block.header().parent_beacon_block_root,
                 ommers: &block.body().ommers,
                 withdrawals: block.body().withdrawals.as_ref().map(Cow::Borrowed),
+                extra_data: block.header().extra_data.clone(),
+                tx_count_hint: Some(block.body().inner.transactions.len()),
             },
             header: Some(block.header().clone()),
             is_miner: false,
             parent_difflayers: None,
             triedb_prefetcher: None,
-        }
+        })
     }
 
     fn context_for_next_block(
         &self,
         parent: &SealedHeader<HeaderTy<Self::Primitives>>,
         attributes: Self::NextBlockEnvCtx,
-    ) -> ExecutionCtxFor<'_, Self> {
+    ) -> Result<ExecutionCtxFor<'_, Self>, Self::Error> {
         tracing::trace!(
             "Try to create next block ctx for miner, next_block_numer={}, parent_hash={}",
             parent.number + 1,
             parent.hash()
         );
-        BscBlockExecutionCtx {
+        Ok(BscBlockExecutionCtx {
             base: EthBlockExecutionCtx {
                 parent_hash: parent.hash(),
                 parent_beacon_block_root: attributes.inner.parent_beacon_block_root,
                 ommers: &[],
                 withdrawals: attributes.inner.withdrawals.map(Cow::Owned),
+                extra_data: attributes.inner.extra_data,
+                tx_count_hint: None,
             },
             header: None, // No header available for next block context
             is_miner: true,
             parent_difflayers: attributes.parent_difflayers,
             triedb_prefetcher: attributes.triedb_prefetcher,
-        }
+        })
     }
 
     // payload builder use this method to create BscBlockBuilder.
@@ -469,27 +473,29 @@ impl ConfigureEngineEvm<BscExecutionData> for BscEvmConfig
 where
     Self: Send + Sync + Unpin + Clone + 'static,
 {
-    fn evm_env_for_payload(&self, payload: &BscExecutionData) -> EvmEnv<BscHardfork> {
+    fn evm_env_for_payload(&self, payload: &BscExecutionData) -> Result<EvmEnv<BscHardfork>, Self::Error> {
         self.evm_env(&payload.0.header)
     }
 
     fn context_for_payload<'a>(
         &self,
         payload: &'a BscExecutionData,
-    ) -> BscBlockExecutionCtx<'a> {
+    ) -> Result<BscBlockExecutionCtx<'a>, Self::Error> {
         let block = &payload.0;
-        BscBlockExecutionCtx {
+        Ok(BscBlockExecutionCtx {
             base: EthBlockExecutionCtx {
                 parent_hash: block.header.parent_hash(),
                 parent_beacon_block_root: block.header.parent_beacon_block_root,
                 ommers: &block.body.inner.ommers,
                 withdrawals: block.body.inner.withdrawals.as_ref().map(Cow::Borrowed),
+                extra_data: block.header.extra_data.clone(),
+                tx_count_hint: Some(block.body.inner.transactions.len()),
             },
             header: Some(block.header.clone()),
             is_miner: false,
             parent_difflayers: None,
             triedb_prefetcher: None,
-        }
+        })
     }
 
     fn tx_iterator_for_payload(

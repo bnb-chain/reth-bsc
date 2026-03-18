@@ -18,6 +18,7 @@ use parking_lot::RwLock;
 use reth::consensus::HeaderValidator;
 use reth::network::cache::LruCache;
 use reth_engine_primitives::{ConsensusEngineHandle, EngineTypes};
+use reth_engine_tree::engine::EngineApiRequest;
 use reth_eth_wire::{BlockHashNumber, GetBlockHeaders, NewBlock};
 use reth_eth_wire_types::broadcast::NewBlockHashes;
 use reth_network::{
@@ -251,6 +252,13 @@ where
         let _ = self
             .to_network
             .send(BlockImportEvent::Announcement(BlockValidation::ValidBlock { block: block_msg }));
+
+        // Insert the executed block (with difflayer) directly into the engine tree.
+        // This must happen before ForkChoiceUpdate so the engine has the pre-executed state.
+        if let Some(engine_tx) = crate::shared::get_engine_api_tx() {
+            tracing::debug!(target: "bsc::block_import", "Inserting mined block into engine tree with difflayer: {:?}", block_hash);
+            let _ = engine_tx.send(EngineApiRequest::InsertExecutedBlock(payload.executed_block.clone()));
+        }
 
         // Broadcast built payload event for fast consumers
         if let Some(tx) = crate::shared::get_payload_events_tx() {

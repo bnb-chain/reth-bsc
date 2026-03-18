@@ -26,9 +26,11 @@ use reth_evm::block::{BlockExecutionError, BlockValidationError};
 use reth_evm::execute::BlockBuilder;
 use reth_evm::execute::BlockBuilderOutcome;
 use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
+use reth_chain_state::{ComputedTrieData, ExecutedBlock};
 use reth_execution_types::BlockExecutionOutput;
 use reth_payload_primitives::PayloadBuilderAttributes;
-use reth_payload_primitives::{BuiltPayload, BuiltPayloadExecutedBlock, PayloadBuilderError};
+use reth_payload_primitives::{BuiltPayload, PayloadBuilderError};
+use revm_context_interface::Block as EvmBlock;
 use reth_primitives::HeaderTy;
 use reth_primitives::InvalidTransactionError;
 use reth_primitives::TransactionSigned;
@@ -239,6 +241,7 @@ where
                 gas_limit: self.builder_config.gas_limit(parent_header.gas_limit),
                 parent_beacon_block_root: attributes.parent_beacon_block_root(),
                 withdrawals: Some(attributes.withdrawals().clone()),
+                extra_data: self.builder_config.extra_data.clone(),
             },
             parent_difflayers: triedb_parent_difflayers.clone(),
             triedb_prefetcher: triedb_prefetcher.clone(),
@@ -663,25 +666,24 @@ where
         plain.body.sidecars = Some(blob_sidecars);
         sealed_block = Arc::new(plain.into());
 
+        let mut executed_block = ExecutedBlock::new(
+            Arc::new(block),
+            Arc::new(BlockExecutionOutput { state: db.take_bundle(), result: execution_result }),
+            ComputedTrieData::without_trie_input(
+                Arc::new(hashed_state.into_sorted()),
+                Arc::new(trie_updates.into_sorted()),
+            ),
+        );
+        executed_block.difflayer = difflayer;
+
         let payload = BscBuiltPayload {
             block: sealed_block.clone(),
             fees: total_fees,
-            requests: Some(execution_result.requests.clone()),
+            requests: Some(executed_block.execution_output.result.requests.clone()),
             build_kind: BuildKind::NormalAttempt,
             exec_duration,
             trie_root_duration: finalize_elapsed,
-            executed_block: ExecutedBlock {
-                recovered_block: Arc::new(block),
-                execution_output: Arc::new(ExecutionOutcome::new(
-                    db.take_bundle(),
-                    vec![execution_result.receipts.clone()],
-                    sealed_block.header().number(),
-                    vec![execution_result.requests.clone()],
-                )),
-                hashed_state: Arc::new(hashed_state),
-            },
-            executed_trie: Some(ExecutedTrieUpdates::Present(Arc::new(trie_updates))),
-            difflayer, // Pass the difflayer to payload, reth will store it
+            executed_block,
         };
         Ok(payload)
     }
@@ -759,6 +761,7 @@ where
                         gas_limit: self.builder_config.gas_limit(parent_header.gas_limit),
                         parent_beacon_block_root: attributes.parent_beacon_block_root(),
                         withdrawals: Some(attributes.withdrawals().clone()),
+                        extra_data: self.builder_config.extra_data.clone(),
                     },
                     parent_difflayers: triedb_parent_difflayers.clone(),
                     triedb_prefetcher: triedb_prefetcher.clone(),
@@ -839,25 +842,24 @@ where
             "Empty block payload built successfully (no user transactions)"
         );
 
+        let mut executed_block = ExecutedBlock::new(
+            Arc::new(block),
+            Arc::new(BlockExecutionOutput { state: db.take_bundle(), result: execution_result }),
+            ComputedTrieData::without_trie_input(
+                Arc::new(hashed_state.into_sorted()),
+                Arc::new(trie_updates.into_sorted()),
+            ),
+        );
+        executed_block.difflayer = difflayer;
+
         let payload = BscBuiltPayload {
             block: sealed_block.clone(),
             fees: total_fees,
-            requests: Some(execution_result.requests.clone()),
+            requests: Some(executed_block.execution_output.result.requests.clone()),
             build_kind: BuildKind::EmptyFallback,
             exec_duration,
             trie_root_duration: finalize_elapsed,
-            executed_block: ExecutedBlock {
-                recovered_block: Arc::new(block),
-                execution_output: Arc::new(ExecutionOutcome::new(
-                    db.take_bundle(),
-                    vec![execution_result.receipts.clone()],
-                    sealed_block.header().number(),
-                    vec![execution_result.requests.clone()],
-                )),
-                hashed_state: Arc::new(hashed_state),
-            },
-            executed_trie: Some(ExecutedTrieUpdates::Present(Arc::new(trie_updates))),
-            difflayer, // Pass the difflayer to payload, reth will store it
+            executed_block,
         };
         Ok(payload)
     }

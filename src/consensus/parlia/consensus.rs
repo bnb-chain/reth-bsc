@@ -40,6 +40,7 @@ use tracing::{debug, trace, warn};
 const RECOVERED_PROPOSER_CACHE_NUM: usize = 4096;
 const ADDRESS_LENGTH: usize = 20; // Ethereum address length in bytes
 
+#[cfg(test)]
 #[inline]
 fn apply_mining_delay_with_leftover(
     mut delay_ms: u64,

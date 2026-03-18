@@ -7,14 +7,13 @@ use crate::{
         factory::BscEvmFactory,
         pre_execution::{TURN_LENGTH_CACHE, VALIDATOR_CACHE},
     },
-    node::BscNode,
     BscPrimitives,
 };
 use alloy_consensus::BlockHeader as _;
 use alloy_evm::eth::receipt_builder::ReceiptBuilder;
-use alloy_evm::{block::BlockExecutor, Evm};
+use alloy_evm::block::BlockExecutor;
 use alloy_primitives::BlockHash;
-use reth::builder::NodeAdapter;
+use revm::context::BlockEnv;
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
 use reth_engine_primitives::BSCEngineMessageError;
 use reth_engine_tree::engine::EngineApiRequest;
@@ -23,7 +22,7 @@ use reth_evm::execute::{
     BlockBuilder, BlockBuilderOutcome, BlockBuilderOutcomeWithDiffLayer, BlockExecutionError,
     ExecutorTx,
 };
-use reth_node_builder::rpc::EngineApiTx;
+use crate::shared::BscEngineApiTx;
 use reth_primitives_traits::{
     HeaderTy, NodePrimitives, Recovered, RecoveredBlock, SealedHeader, SignerRecoverable, TxTy,
 };
@@ -330,7 +329,7 @@ where
 }
 
 pub async fn request_difflayer(
-    engine_api_tx: &EngineApiTx<NodeAdapter<BscNode>>,
+    engine_api_tx: &BscEngineApiTx,
     parent_hash: BlockHash,
 ) -> Result<DiffLayers, BSCEngineMessageError> {
     let (tx, rx) = oneshot::channel();

@@ -23,17 +23,17 @@ use reth_evm::execute::BlockBuilder;
 use reth_evm::execute::BlockBuilderOutcome;
 use reth_evm::execute::{BlockExecutionError, BlockValidationError};
 use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
+use reth_chain_state::{ComputedTrieData, ExecutedBlock};
 use reth_execution_types::BlockExecutionOutput;
 use reth_payload_primitives::PayloadBuilderAttributes;
-use reth_payload_primitives::{BuiltPayloadExecutedBlock, PayloadBuilderError};
+use reth_payload_primitives::PayloadBuilderError;
+use revm_context_interface::Block as EvmBlock;
 use reth_primitives::SealedHeader;
 use reth_primitives::TransactionSigned;
 use reth_primitives_traits::SignerRecoverable;
 use reth_provider::StateProviderFactory;
 use reth_provider::{BlockHashReader, HeaderProvider};
 use reth_revm::{database::StateProviderDatabase, db::State};
-use revm::context_interface::block::Block;
-use either::Either;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -400,6 +400,7 @@ where
                         gas_limit,
                         parent_beacon_block_root: attributes.parent_beacon_block_root(),
                         withdrawals: Some(attributes.withdrawals().clone()),
+                        extra_data: builder_config.extra_data.clone(),
                     },
                     parent_difflayers: None,
                     triedb_prefetcher: None,
@@ -546,25 +547,24 @@ where
         plain.body.sidecars = Some(bid_runtime.blob_sidecars.clone());
         sealed_block = Arc::new(plain.into());
 
+        let mut executed_block = ExecutedBlock::new(
+            Arc::new(block.clone()),
+            Arc::new(BlockExecutionOutput { state: db.take_bundle(), result: execution_result }),
+            ComputedTrieData::without_trie_input(
+                Arc::new(hashed_state.into_sorted()),
+                Arc::new(trie_updates.into_sorted()),
+            ),
+        );
+        executed_block.difflayer = difflayer;
+
         bid_runtime.bsc_payload = Some(BscBuiltPayload {
             block: sealed_block.clone(),
             fees: bid_runtime.gas_fee,
-            requests: Some(execution_result.requests.clone()),
+            requests: Some(executed_block.execution_output.result.requests.clone()),
             build_kind: crate::node::engine::BuildKind::NormalAttempt,
             exec_duration: std::time::Duration::ZERO,
             trie_root_duration: std::time::Duration::ZERO,
-            executed_block: ExecutedBlock {
-                recovered_block: Arc::new(block.clone()),
-                execution_output: Arc::new(ExecutionOutcome::new(
-                    db.take_bundle(),
-                    vec![execution_result.receipts.clone()],
-                    sealed_block.header().number(),
-                    vec![execution_result.requests.clone()],
-                )),
-                hashed_state: Arc::new(hashed_state.clone()),
-            },
-            executed_trie: Some(ExecutedTrieUpdates::Present(Arc::new(trie_updates))),
-            difflayer,
+            executed_block,
         });
 
         // Acquire write lock to update best_bid
