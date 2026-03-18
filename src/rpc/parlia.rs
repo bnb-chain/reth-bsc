@@ -33,18 +33,17 @@ pub struct SnapshotResult {
     pub epoch_length: u64,
     pub block_interval: u64,
     pub turn_length: u8,
-    pub validators: std::collections::HashMap<String, ValidatorInfo>,
-    pub recents: std::collections::HashMap<String, String>,
-    pub recent_fork_hashes: std::collections::HashMap<String, String>,
+    pub validators: std::collections::BTreeMap<String, ValidatorInfo>,
+    pub recents: std::collections::BTreeMap<String, String>,
+    pub recent_fork_hashes: std::collections::BTreeMap<String, String>,
     #[serde(rename = "attestation:omitempty")]
     pub attestation: Option<serde_json::Value>,
 }
 
 impl From<Snapshot> for SnapshotResult {
     fn from(snapshot: Snapshot) -> Self {
-        // Convert validators to the expected format: address -> ValidatorInfo
-        // Use validators_map to get actual index and vote_address data
-        let validators: std::collections::HashMap<String, ValidatorInfo> = snapshot
+        // Convert validators to the expected format: address -> ValidatorInfo (BTreeMap for sorted output)
+        let validators: std::collections::BTreeMap<String, ValidatorInfo> = snapshot
             .validators
             .iter()
             .map(|addr| {
@@ -59,32 +58,27 @@ impl From<Snapshot> for SnapshotResult {
             })
             .collect();
 
-        // Convert recent proposers to string format: block_number -> address
-        let recents: std::collections::HashMap<String, String> = snapshot
+        // Convert recent proposers to string format: block_number -> address (BTreeMap for sorted output)
+        let recents: std::collections::BTreeMap<String, String> = snapshot
             .recent_proposers
             .iter()
             .map(|(block_num, addr)| (block_num.to_string(), format!("0x{addr:040x}")))
             .collect();
 
-        // Generate recent fork hashes (simplified - all zeros like in BSC example)
-        let recent_fork_hashes: std::collections::HashMap<String, String> = snapshot
-            .recent_proposers
-            .keys()
-            .map(|block_num| {
-                (
-                    block_num.to_string(),
-                    "00000000".to_string(), // Simplified fork hash
-                )
-            })
+        // Convert recent fork hashes from snapshot data (BTreeMap for sorted output)
+        let recent_fork_hashes: std::collections::BTreeMap<String, String> = snapshot
+            .recent_fork_hashes
+            .iter()
+            .map(|(block_num, hash)| (block_num.to_string(), hash.clone()))
             .collect();
 
-        // Convert vote_data to attestation format
+        // Convert vote_data to attestation format (PascalCase to match geth-bsc)
         let attestation = if snapshot.vote_data.target_number > 0 {
             Some(serde_json::json!({
-                "sourceNumber": snapshot.vote_data.source_number,
-                "sourceHash": format!("0x{:064x}", snapshot.vote_data.source_hash),
-                "targetNumber": snapshot.vote_data.target_number,
-                "targetHash": format!("0x{:064x}", snapshot.vote_data.target_hash),
+                "SourceNumber": snapshot.vote_data.source_number,
+                "SourceHash": format!("0x{:064x}", snapshot.vote_data.source_hash),
+                "TargetNumber": snapshot.vote_data.target_number,
+                "TargetHash": format!("0x{:064x}", snapshot.vote_data.target_hash),
             }))
         } else {
             None
