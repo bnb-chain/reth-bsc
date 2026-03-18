@@ -186,17 +186,19 @@ where
     }
 
     fn add_ons(&self) -> Self::AddOns {
-        BscNodeAddOns::default().extend_rpc_modules(
-            |ctx: RpcContext<'_, NodeAdapter<N>, <BscEthApiBuilder as EthApiBuilder<NodeAdapter<N>>>::EthApi>| {
-                let eth_config = EthConfigHandler::new(
-                    ctx.node().provider().clone(),
-                    ctx.node().evm_config().clone(),
-                );
-            ctx.modules
-                .merge_if_module_configured(RethRpcModule::Eth, eth_config.into_rpc())?;
-            Ok(())
-            },
-        )
+        BscNodeAddOns::default()
+            .with_receipt_filter(Arc::new(crate::rpc::BscReceiptFilter))
+            .extend_rpc_modules(
+                |ctx: RpcContext<'_, NodeAdapter<N>, <BscEthApiBuilder as EthApiBuilder<NodeAdapter<N>>>::EthApi>| {
+                    let eth_config = EthConfigHandler::new(
+                        ctx.node().provider().clone(),
+                        ctx.node().evm_config().clone(),
+                    );
+                ctx.modules
+                    .merge_if_module_configured(RethRpcModule::Eth, eth_config.into_rpc())?;
+                Ok(())
+                },
+            )
     }
 }
 
