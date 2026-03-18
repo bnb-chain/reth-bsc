@@ -307,6 +307,12 @@ where
         }
         self.queued_blocks.insert(block.hash);
 
+        // Record chain delay metrics: time from block creation to first network reception
+        crate::consensus::parlia::block_stats::on_block_received(
+            block.hash,
+            block.block.0.block.header.timestamp,
+        );
+
         // send to EVN peers first
         if let Err(e) = self.transfer_to_evn_peers(block.clone()) {
             tracing::warn!(target: "bsc::block_import", "Failed to transfer block to EVN peers: number = {:?}, hash = {:?}, error = {}", block.block.0.block.header.number, block.hash, e);
