@@ -1560,7 +1560,7 @@ dependencies = [
  "bitflags 2.11.0",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools 0.12.1",
  "proc-macro2",
  "quote",
  "regex",
@@ -1578,7 +1578,7 @@ dependencies = [
  "bitflags 2.11.0",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools 0.12.1",
  "proc-macro2",
  "quote",
  "regex",
@@ -6826,7 +6826,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.12.1",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -8997,6 +8997,18 @@ dependencies = [
 
 [[package]]
 name = "reth-metrics"
+version = "1.7.0"
+source = "git+https://github.com/bnb-chain/reth.git#012ffc045031c923a757444f6cdbc1e72fa0c269"
+dependencies = [
+ "futures",
+ "metrics",
+ "metrics-derive",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "reth-metrics"
 version = "1.10.2"
 source = "git+https://github.com/bnb-chain/reth.git?tag=v0.0.8#b02940f65fe1e12a4224452c7cdfaa9e56ce8f0f"
 dependencies = [
@@ -9014,18 +9026,6 @@ source = "git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinaliz
 dependencies = [
  "metrics",
  "metrics-derive",
-]
-
-[[package]]
-name = "reth-metrics"
-version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git#b02940f65fe1e12a4224452c7cdfaa9e56ce8f0f"
-dependencies = [
- "futures",
- "metrics",
- "metrics-derive",
- "tokio",
- "tokio-util",
 ]
 
 [[package]]
@@ -11448,7 +11448,7 @@ dependencies = [
  "metrics",
  "once_cell",
  "rayon",
- "reth-metrics 1.10.2 (git+https://github.com/bnb-chain/reth.git)",
+ "reth-metrics 1.7.0",
  "rust-eth-triedb-common",
  "rust-eth-triedb-pathdb",
  "rust-eth-triedb-state-trie",
@@ -11478,7 +11478,7 @@ dependencies = [
  "alloy-primitives",
  "alloy-trie",
  "metrics",
- "reth-metrics 1.10.2 (git+https://github.com/bnb-chain/reth.git)",
+ "reth-metrics 1.7.0",
  "rocksdb",
  "rust-eth-triedb-common",
  "schnellru",
