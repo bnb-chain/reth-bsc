@@ -1,0 +1,121 @@
+问题概述
+
+  节点运行中突然丢失所有 peer 连接，无法自动恢复。有两个触发场景：
+  1. Scenario 1：系统交易验证失败（"unexpected system tx"）后 peer 全部归零
+  2. Scenario 2：无明显错误日志，peer 无声断开
+
+  ---
+  根因 1（主因）：验证错误 → peer 声誉惩罚级联
+
+  整个错误传播链如下：
+
+  Step 1 — 系统交易验证失败
+
+  src/node/evm/post_execution.rs:121-130：
+  if !self.system_txs.is_empty() {
+      // 块执行后仍有未消费的系统交易
+      return Err(BscBlockExecutionError::Validation(
+          BscBlockValidationError::UnexpectedSystemTx
+      ).into());
+  }
+
+  这意味着 reth-bsc 本地生成的系统交易与区块中实际包含的系统交易不匹配。
+
+  Step 2 — 错误类型强转：借用 DepositRequestDecode 做载体
+
+  src/node/evm/error.rs:200-210：
+  BscBlockExecutionError::Validation(validation_err) => {
+      // TODO: now use DepositRequestDecode as the validation error carrier,
+      // but we should refine it by rewrite some validation error types in reth engine-tree.
+      Self::Validation(BlockValidationError::DepositRequestDecode(
+          format!("BSC validation error: {}", validation_err)
+      ))
+  }
+
+  注意这个 TODO 注释——BSC 验证错误被伪装成以太坊的 DepositRequestDecode 错误。这导致 reth 的 engine-tree 将其识别为 invalid block。
+
+  Step 3 — Engine 返回 Invalid 状态
+
+  src/node/network/block_import/service.rs:160-164：
+  PayloadStatusEnum::Invalid { validation_error } => Outcome {
+      peer: peer_id,
+      result: Err(BlockImportError::Other(validation_error.into())),
+  }.into(),
+
+  Block import 将 invalid payload 结果返回给网络层。
+
+  Step 4 — 网络层对 peer 施加 BadBlock 声誉惩罚
+
+  reth 上游 network/src/manager.rs:579-584：
+  Err(_err) => {
+      self.swarm.state_mut().peers_mut()
+          .apply_reputation_change(&peer, ReputationChangeKind::BadBlock);
+  }
+
+  Step 5 — 声誉累积导致 ban
+
+  reth 上游声誉系统 (network-types/src/peers/reputation.rs)：
+  初始声誉:     DEFAULT_REPUTATION = 0
+  每次 BadBlock: -16,384  (= 16 × REPUTATION_UNIT)
+  Ban 阈值:     BANNED_REPUTATION = -51,200 (= 50 × REPUTATION_UNIT)
+
+  → 同一 peer 发来 4 个 invalid block 后: 4 × (-16384) = -65536 < -51200 → 被 BAN
+
+  级联效应：
+  区块 N 的系统交易验证失败
+    → 区块 N 被标记为 invalid
+    → 发送区块 N 的 peer A 声誉 -16384
+    → 区块 N+1 到达，但因区块 N 无法处理，N+1 也可能失败
+    → peer A 继续被扣分
+    → peer B, C, D... 发送同一区域的区块也失败
+    → 所有活跃 peer 声誉逐步降至 ban 阈值以下
+    → connected_peers = 0
+
+  为什么无法自动恢复：根本问题（系统交易不匹配）未被修复，新连接的 peer 发来的区块仍然会验证失败，新 peer 又会被惩罚断开。
+
+  ---
+  根因 2（副因）：硬编码 head() 影响 Fork ID
+
+  src/chainspec/bsc.rs:33-34：
+  pub fn head() -> Head {
+      Head { number: 40_000_000, timestamp: 1751250600, ..Default::default() }
+  }
+
+  src/chainspec/mod.rs:127-130：
+  fn latest_fork_id(&self) -> ForkId {
+      let head = self.head();           // ← 使用硬编码的 head
+      self.inner.fork_id(&head)
+  }
+
+  latest_fork_id() 用于网络层的 fork filter，在与 peer 握手时校验 fork 兼容性。这个硬编码的 head 表示：
+
+  - 网络层的 fork filter 基于 block 40M 计算 fork ID
+  - 如果节点正在同步（远未到 40M），实际链状态与 fork ID 不匹配
+  - 这可能导致 peer 在握手阶段就拒绝连接，或在网络状态不一致时断开
+
+  这解释了 issue #258 评论中提到的 "hardcoded peer connection logic that activates only after approximately 40 million blocks"。
+
+  ---
+  问题总结
+
+  ┌─────────────────────────────────────────┬──────────────────────────────────────────────────────────────┬────────┐
+  │                  因素                   │                             影响                             │ 严重度 │
+  ├─────────────────────────────────────────┼──────────────────────────────────────────────────────────────┼────────┤
+  │ 系统交易验证不匹配 (UnexpectedSystemTx) │ 触发 invalid block → peer 声誉级联降到 ban                   │ 核心   │
+  ├─────────────────────────────────────────┼──────────────────────────────────────────────────────────────┼────────┤
+  │ 错误类型伪装 (DepositRequestDecode)     │ Engine-tree 无法区分"BSC 暂时性错误"和"真正的 invalid block" │ 关键   │
+  ├─────────────────────────────────────────┼──────────────────────────────────────────────────────────────┼────────┤
+  │ BadBlock 声誉惩罚无上限累积             │ 4 次即 ban，所有发送相关区块的 peer 都受影响                 │ 放大器 │
+  ├─────────────────────────────────────────┼──────────────────────────────────────────────────────────────┼────────┤
+  │ 硬编码 head(40M) 用于 fork filter       │ 同步阶段或 fork 变更时握手不兼容                             │ 副因   │
+  ├─────────────────────────────────────────┼──────────────────────────────────────────────────────────────┼────────┤
+  │ 无错误恢复/重试机制                     │ ban 后新 peer 遇到同样问题继续被 ban                         │ 恶化   │
+  └─────────────────────────────────────────┴──────────────────────────────────────────────────────────────┴────────┘
+
+  ---
+  修复方向
+
+  1. 修复系统交易生成逻辑——确保 reth-bsc 生成的系统交易与 go-bsc 完全一致，这是最根本的修复
+  2. 区分错误类型——不要将所有 BSC 验证错误都转为 DepositRequestDecode（这是以太坊的 deposit 解码错误），应该定义专门的 BSC 错误类型，让 engine-tree 能区分"可恢复的暂时性错误"和"真正的 invalid block"
+  3. 限制 BadBlock 惩罚——对于 BSC 特定的验证错误（如系统交易不匹配），不应该对 peer 施加 BadBlock 惩罚（问题出在本地验证逻辑，不是 peer 的错）
+  4. 动态计算 fork ID——latest_fork_id() 应该基于实际链头状态而非硬编码值

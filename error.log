@@ -1,0 +1,300 @@
+2026-01-31T21:50:13.395455Z DEBUG bsc::forkchoice: Updating fork choice with incoming header block_number=750763 block_hash=0xd7184c77ca6de9dd5f913304d7124e1fa400352d6eb28d411083de7843037192
+2026-01-31T21:50:13.395540Z DEBUG engine::tree: received new engine message msg=Request(QueryHeaderWithTd { number: 750763, hash: 0xd7184c77ca6de9dd5f913304d7124e1fa400352d6eb28d411083de7843037192 })
+2026-01-31T21:50:13.395544Z DEBUG engine::tree: querying header and TD by engine message number=750763 hash=0xd7184c77ca6de9dd5f913304d7124e1fa400352d6eb28d411083de7843037192
+2026-01-31T21:50:13.395581Z DEBUG engine::tree: querying TD from fork headers number=750763 hash=0xd7184c77ca6de9dd5f913304d7124e1fa400352d6eb28d411083de7843037192
+2026-01-31T21:50:13.395772Z DEBUG bsc::forkchoice: BscForkChoiceRule: Checking whether reorg is needed incoming_number=750763 incoming_hash=0xd7184c77ca6de9dd5f913304d7124e1fa400352d6eb28d411083de7843037192 incoming_td=Some(260) incoming_justified=750762 current_number=750762 current_hash=0x723abd6f3eafd51b8187e323ea8ca869937c54354e1041753aa3bebeea01d893 current_td=Some(258) current_justified=750761
+2026-01-31T21:50:13.395781Z DEBUG bsc::forkchoice: Head choice with fast finality incoming_justified_num=750762 current_justified_num=750761
+2026-01-31T21:50:13.395808Z  INFO bsc::forkchoice: Fork choice decision made by fast finality need_reorg=true incoming_number=750763 incoming_hash=0xd7184c77ca6de9dd5f913304d7124e1fa400352d6eb28d411083de7843037192 current_number=750762 current_hash=0x723abd6f3eafd51b8187e323ea8ca869937c54354e1041753aa3bebeea01d893 method="fast_finality"
+2026-01-31T21:50:13.395843Z DEBUG bsc::forkchoice: Fork choice updated state=ForkchoiceState { head_block_hash: 0xd7184c77ca6de9dd5f913304d7124e1fa400352d6eb28d411083de7843037192, safe_block_hash: 0x723abd6f3eafd51b8187e323ea8ca869937c54354e1041753aa3bebeea01d893, finalized_block_hash: 0x59822f59f65fb02fe9c2fd11e4996411f1750163e988f9e292001d70c3655986 } new_canonical_head_number=750763 new_canonical_head_hash=0xd7184c77ca6de9dd5f913304d7124e1fa400352d6eb28d411083de7843037192 incoming_header_number=750763 incoming_header_hash=0xd7184c77ca6de9dd5f913304d7124e1fa400352d6eb28d411083de7843037192 safe_block_number=750762 finalized_block_number=750761
+2026-01-31T21:50:13.395865Z DEBUG engine::tree: received new engine message msg=Request(ForkchoiceUpdated { state: ForkchoiceState { head_block_hash: 0xd7184c77ca6de9dd5f913304d7124e1fa400352d6eb28d411083de7843037192, safe_block_hash: 0x723abd6f3eafd51b8187e323ea8ca869937c54354e1041753aa3bebeea01d893, finalized_block_hash: 0x59822f59f65fb02fe9c2fd11e4996411f1750163e988f9e292001d70c3655986 }, has_payload_attributes: false })
+2026-01-31T21:50:13.407184Z DEBUG bsc::executor: Start to finish block_id=750763 is_miner=true
+2026-01-31T21:50:13.407215Z DEBUG reth_bsc::node::evm::post_execution: Start to finalize new block, block_number: 750763, is_miner: true
+2026-01-31T21:50:13.407261Z  WARN reth_bsc::node::evm::post_execution: Global signer not initialized for mining mode
+2026-01-31T21:50:13.407549Z DEBUG rpc: Failed to build pending block: Internal(Execution(Internal(Other(GlobalSignerNotInitializedForMiningMode))))
+2026-01-31T21:50:13.423654Z DEBUG bsc::executor: Start to finish block_id=750763 is_miner=true
+2026-01-31T21:50:13.423684Z DEBUG reth_bsc::node::evm::post_execution: Start to finalize new block, block_number: 750763, is_miner: true
+2026-01-31T21:50:13.423726Z  WARN reth_bsc::node::evm::post_execution: Global signer not initialized for mining mode
+2026-01-31T21:50:13.424056Z DEBUG rpc: Failed to build pending block: Internal(Execution(Internal(Other(GlobalSignerNotInitializedForMiningMode))))
+2026-01-31T21:50:13.434693Z DEBUG bsc::executor: Start to finish block_id=750763 is_miner=true
+2026-01-31T21:50:13.434718Z DEBUG reth_bsc::node::evm::post_execution: Start to finalize new block, block_number: 750763, is_miner: true
+2026-01-31T21:50:13.434751Z  WARN reth_bsc::node::evm::post_execution: Global signer not initialized for mining mode
+2026-01-31T21:50:13.434956Z DEBUG rpc: Failed to build pending block: Internal(Execution(Internal(Other(GlobalSignerNotInitializedForMiningMode))))
+2026-01-31T21:50:13.444571Z DEBUG bsc::executor: Start to finish block_id=750763 is_miner=true
+2026-01-31T21:50:13.444595Z DEBUG reth_bsc::node::evm::post_execution: Start to finalize new block, block_number: 750763, is_miner: true
+2026-01-31T21:50:13.444629Z  WARN reth_bsc::node::evm::post_execution: Global signer not initialized for mining mode
+2026-01-31T21:50:13.444840Z DEBUG rpc: Failed to build pending block: Internal(Execution(Internal(Other(GlobalSignerNotInitializedForMiningMode))))
+2026-01-31T21:50:13.458471Z DEBUG bsc::executor: Start to finish block_id=750763 is_miner=true
+2026-01-31T21:50:13.458502Z DEBUG reth_bsc::node::evm::post_execution: Start to finalize new block, block_number: 750763, is_miner: true
+2026-01-31T21:50:13.458539Z  WARN reth_bsc::node::evm::post_execution: Global signer not initialized for mining mode
+2026-01-31T21:50:13.458788Z DEBUG rpc: Failed to build pending block: Internal(Execution(Internal(Other(GlobalSignerNotInitializedForMiningMode))))
+2026-01-31T21:50:13.471228Z DEBUG bsc::executor: Start to finish block_id=750763 is_miner=true
+2026-01-31T21:50:13.471257Z DEBUG reth_bsc::node::evm::post_execution: Start to finalize new block, block_number: 750763, is_miner: true
+2026-01-31T21:50:13.471294Z  WARN reth_bsc::node::evm::post_execution: Global signer not initialized for mining mode
+2026-01-31T21:50:13.471586Z DEBUG rpc: Failed to build pending block: Internal(Execution(Internal(Other(GlobalSignerNotInitializedForMiningMode))))
+2026-01-31T21:50:13.482518Z DEBUG reth::cli: Event: Handler(CanonicalChainCommitted(NumHash { number: 750763, hash: 0xd7184c77ca6de9dd5f913304d7124e1fa400352d6eb28d411083de7843037192 }, 85.84435ms))
+2026-01-31T21:50:13.482549Z DEBUG reth::cli: Event: Handler(ForkchoiceUpdated(ForkchoiceState { head_block_hash: 0xd7184c77ca6de9dd5f913304d7124e1fa400352d6eb28d411083de7843037192, safe_block_hash: 0x723abd6f3eafd51b8187e323ea8ca869937c54354e1041753aa3bebeea01d893, finalized_block_hash: 0x59822f59f65fb02fe9c2fd11e4996411f1750163e988f9e292001d70c3655986 }, Valid))
+2026-01-31T21:50:13.482598Z  INFO reth_node_events::node: Canonical chain committed number=750763 hash=0xd7184c77ca6de9dd5f913304d7124e1fa400352d6eb28d411083de7843037192 elapsed=85.84435ms
+2026-01-31T21:50:13.482612Z  INFO reth_node_events::node: Forkchoice updated head_block_hash=0xd7184c77ca6de9dd5f913304d7124e1fa400352d6eb28d411083de7843037192 safe_block_hash=0x723abd6f3eafd51b8187e323ea8ca869937c54354e1041753aa3bebeea01d893 finalized_block_hash=0x59822f59f65fb02fe9c2fd11e4996411f1750163e988f9e292001d70c3655986
+2026-01-31T21:50:13.482644Z DEBUG bsc::block_import: Succeed to update fork choice for new payload: number = 750763, hash = 0xd7184c77ca6de9dd5f913304d7124e1fa400352d6eb28d411083de7843037192
+2026-01-31T21:50:13.483819Z DEBUG compute_trie_input_task{block_number=750763}: engine::tree::changeset: Computed and caching changesets block_number=750763 elapsed=2.118344ms
+2026-01-31T21:50:13.483834Z DEBUG compute_trie_input_task{block_number=750763}: trie::changeset_cache: Inserting changeset into cache block_hash=0xd7184c77ca6de9dd5f913304d7124e1fa400352d6eb28d411083de7843037192 block_number=750763 cache_size_before=194
+2026-01-31T21:50:13.483841Z DEBUG compute_trie_input_task{block_number=750763}: trie::changeset_cache: Changeset inserted into cache block_hash=0xd7184c77ca6de9dd5f913304d7124e1fa400352d6eb28d411083de7843037192 block_number=750763 cache_size_after=195
+2026-01-31T21:50:13.485464Z DEBUG bsc::executor: Start to finish block_id=750763 is_miner=true
+2026-01-31T21:50:13.485490Z DEBUG reth_bsc::node::evm::post_execution: Start to finalize new block, block_number: 750763, is_miner: true
+2026-01-31T21:50:13.485526Z  WARN reth_bsc::node::evm::post_execution: Global signer not initialized for mining mode
+2026-01-31T21:50:13.485809Z DEBUG rpc: Failed to build pending block: Internal(Execution(Internal(Other(GlobalSignerNotInitializedForMiningMode))))
+2026-01-31T21:50:13.491786Z DEBUG bsc::executor: Start to finish block_id=750763 is_miner=true
+2026-01-31T21:50:13.491807Z DEBUG reth_bsc::node::evm::post_execution: Start to finalize new block, block_number: 750763, is_miner: true
+2026-01-31T21:50:13.491840Z  WARN reth_bsc::node::evm::post_execution: Global signer not initialized for mining mode
+2026-01-31T21:50:13.492127Z DEBUG rpc: Failed to build pending block: Internal(Execution(Internal(Other(GlobalSignerNotInitializedForMiningMode))))
+2026-01-31T21:50:13.498218Z DEBUG bsc::executor: Start to finish block_id=750763 is_miner=true
+2026-01-31T21:50:13.498243Z DEBUG reth_bsc::node::evm::post_execution: Start to finalize new block, block_number: 750763, is_miner: true
+2026-01-31T21:50:13.498278Z  WARN reth_bsc::node::evm::post_execution: Global signer not initialized for mining mode
+2026-01-31T21:50:13.498499Z DEBUG rpc: Failed to build pending block: Internal(Execution(Internal(Other(GlobalSignerNotInitializedForMiningMode))))
+2026-01-31T21:50:13.504644Z DEBUG bsc::executor: Start to finish block_id=750763 is_miner=true
+2026-01-31T21:50:13.504668Z DEBUG reth_bsc::node::evm::post_execution: Start to finalize new block, block_number: 750763, is_miner: true
+2026-01-31T21:50:13.504699Z  WARN reth_bsc::node::evm::post_execution: Global signer not initialized for mining mode
+2026-01-31T21:50:13.504898Z DEBUG rpc: Failed to build pending block: Internal(Execution(Internal(Other(GlobalSignerNotInitializedForMiningMode))))
+2026-01-31T21:50:13.511239Z DEBUG bsc::executor: Start to finish block_id=750764 is_miner=true
+2026-01-31T21:50:13.511261Z DEBUG reth_bsc::node::evm::post_execution: Start to finalize new block, block_number: 750764, is_miner: true
+2026-01-31T21:50:13.511293Z  WARN reth_bsc::node::evm::post_execution: Global signer not initialized for mining mode
+2026-01-31T21:50:13.511523Z DEBUG rpc: Failed to build pending block: Internal(Execution(Internal(Other(GlobalSignerNotInitializedForMiningMode))))
+2026-01-31T21:50:13.520352Z DEBUG bsc::executor: Start to finish block_id=750764 is_miner=true
+2026-01-31T21:50:13.520378Z DEBUG reth_bsc::node::evm::post_execution: Start to finalize new block, block_number: 750764, is_miner: true
+2026-01-31T21:50:13.520411Z  WARN reth_bsc::node::evm::post_execution: Global signer not initialized for mining mode
+2026-01-31T21:50:13.520661Z DEBUG rpc: Failed to build pending block: Internal(Execution(Internal(Other(GlobalSignerNotInitializedForMiningMode))))
+2026-01-31T21:50:13.527262Z DEBUG bsc::executor: Start to finish block_id=750764 is_miner=true
+2026-01-31T21:50:13.527286Z DEBUG reth_bsc::node::evm::post_execution: Start to finalize new block, block_number: 750764, is_miner: true
+2026-01-31T21:50:13.527320Z  WARN reth_bsc::node::evm::post_execution: Global signer not initialized for mining mode
+2026-01-31T21:50:13.527501Z DEBUG rpc: Failed to build pending block: Internal(Execution(Internal(Other(GlobalSignerNotInitializedForMiningMode))))
+2026-01-31T21:50:13.534061Z DEBUG bsc::executor: Start to finish block_id=750764 is_miner=true
+2026-01-31T21:50:13.534084Z DEBUG reth_bsc::node::evm::post_execution: Start to finalize new block, block_number: 750764, is_miner: true
+2026-01-31T21:50:13.534118Z  WARN reth_bsc::node::evm::post_execution: Global signer not initialized for mining mode
+2026-01-31T21:50:13.534328Z DEBUG rpc: Failed to build pending block: Internal(Execution(Internal(Other(GlobalSignerNotInitializedForMiningMode))))
+2026-01-31T21:50:13.541449Z DEBUG bsc::executor: Start to finish block_id=750764 is_miner=true
+2026-01-31T21:50:13.541482Z DEBUG reth_bsc::node::evm::post_execution: Start to finalize new block, block_number: 750764, is_miner: true
+2026-01-31T21:50:13.541524Z  WARN reth_bsc::node::evm::post_execution: Global signer not initialized for mining mode
+2026-01-31T21:50:13.541834Z DEBUG rpc: Failed to build pending block: Internal(Execution(Internal(Other(GlobalSignerNotInitializedForMiningMode))))
+2026-01-31T21:50:13.548378Z DEBUG bsc::executor: Start to finish block_id=750764 is_miner=true
+2026-01-31T21:50:13.548405Z DEBUG reth_bsc::node::evm::post_execution: Start to finalize new block, block_number: 750764, is_miner: true
+2026-01-31T21:50:13.548440Z  WARN reth_bsc::node::evm::post_execution: Global signer not initialized for mining mode
+2026-01-31T21:50:13.548666Z DEBUG rpc: Failed to build pending block: Internal(Execution(Internal(Other(GlobalSignerNotInitializedForMiningMode))))
+2026-01-31T21:50:13.558206Z DEBUG bsc::executor: Start to finish block_id=750764 is_miner=true
+2026-01-31T21:50:13.558230Z DEBUG reth_bsc::node::evm::post_execution: Start to finalize new block, block_number: 750764, is_miner: true
+2026-01-31T21:50:13.558274Z  WARN reth_bsc::node::evm::post_execution: Global signer not initialized for mining mode
+2026-01-31T21:50:13.558480Z DEBUG rpc: Failed to build pending block: Internal(Execution(Internal(Other(GlobalSignerNotInitializedForMiningMode))))
+2026-01-31T21:50:13.565667Z DEBUG bsc::executor: Start to finish block_id=750764 is_miner=true
+2026-01-31T21:50:13.565690Z DEBUG reth_bsc::node::evm::post_execution: Start to finalize new block, block_number: 750764, is_miner: true
+2026-01-31T21:50:13.565741Z  WARN reth_bsc::node::evm::post_execution: Global signer not initialized for mining mode
+2026-01-31T21:50:13.565954Z DEBUG rpc: Failed to build pending block: Internal(Execution(Internal(Other(GlobalSignerNotInitializedForMiningMode))))
+2026-01-31T21:50:13.572732Z DEBUG bsc::executor: Start to finish block_id=750764 is_miner=true
+2026-01-31T21:50:13.572752Z DEBUG reth_bsc::node::evm::post_execution: Start to finalize new block, block_number: 750764, is_miner: true
+2026-01-31T21:50:13.572788Z  WARN reth_bsc::node::evm::post_execution: Global signer not initialized for mining mode
+2026-01-31T21:50:13.572986Z DEBUG rpc: Failed to build pending block: Internal(Execution(Internal(Other(GlobalSignerNotInitializedForMiningMode))))
+2026-01-31T21:50:13.581158Z DEBUG bsc::executor: Start to finish block_id=750764 is_miner=true
+2026-01-31T21:50:13.581179Z DEBUG reth_bsc::node::evm::post_execution: Start to finalize new block, block_number: 750764, is_miner: true
+2026-01-31T21:50:13.581208Z  WARN reth_bsc::node::evm::post_execution: Global signer not initialized for mining mode
+2026-01-31T21:50:13.581396Z DEBUG rpc: Failed to build pending block: Internal(Execution(Internal(Other(GlobalSignerNotInitializedForMiningMode))))
+2026-01-31T21:50:13.590754Z DEBUG bsc::executor: Start to finish block_id=750764 is_miner=true
+2026-01-31T21:50:13.590775Z DEBUG reth_bsc::node::evm::post_execution: Start to finalize new block, block_number: 750764, is_miner: true
+2026-01-31T21:50:13.590814Z  WARN reth_bsc::node::evm::post_execution: Global signer not initialized for mining mode
+2026-01-31T21:50:13.591036Z DEBUG rpc: Failed to build pending block: Internal(Execution(Internal(Other(GlobalSignerNotInitializedForMiningMode))))
+2026-01-31T21:50:13.600110Z DEBUG bsc::executor: Start to finish block_id=750764 is_miner=true
+2026-01-31T21:50:13.600136Z DEBUG reth_bsc::node::evm::post_execution: Start to finalize new block, block_number: 750764, is_miner: true
+2026-01-31T21:50:13.600171Z  WARN reth_bsc::node::evm::post_execution: Global signer not initialized for mining mode
+2026-01-31T21:50:13.600384Z DEBUG rpc: Failed to build pending block: Internal(Execution(Internal(Other(GlobalSignerNotInitializedForMiningMode))))
+2026-01-31T21:50:13.602478Z DEBUG net::session: session command buffer full, dropping message peer_id=0xbecb471d76593d8af34279df4218bc8e4b3ea3db8a39ca270cd4d68fcb431fdcb66278f91da68a194bb1d874fc5c05c92b84b033ca6b75b8180619fdb3c71610
+2026-01-31T21:50:13.602495Z DEBUG net::session: session command buffer full, dropping message peer_id=0x8bb4d6571fad1fcf56358ca4db480a25b65e86240fc5c0c426b0a11e8cd09cc63ca2c85a4e01e571f9d32eb46ea48aa4ad07ff7b56aa722d361e2f97efb0d373
+2026-01-31T21:50:13.602515Z DEBUG net::session: session command buffer full, dropping message peer_id=0x53ee9436a958c1c36f0b9943d5a80382fa8c9d51a616a054f23dcf6792073bd5b133df77e5fc6046c6e0e328e3d0f6ec0cb1a238cf62123d4261189be105f3d8
+2026-01-31T21:50:13.610369Z DEBUG bsc::executor: Start to finish block_id=750764 is_miner=true
+2026-01-31T21:50:13.610394Z DEBUG reth_bsc::node::evm::post_execution: Start to finalize new block, block_number: 750764, is_miner: true
+2026-01-31T21:50:13.610428Z  WARN reth_bsc::node::evm::post_execution: Global signer not initialized for mining mode
+2026-01-31T21:50:13.610629Z DEBUG rpc: Failed to build pending block: Internal(Execution(Internal(Other(GlobalSignerNotInitializedForMiningMode))))
+2026-01-31T21:50:13.612642Z DEBUG net::session: session command buffer full, dropping message peer_id=0x8bb4d6571fad1fcf56358ca4db480a25b65e86240fc5c0c426b0a11e8cd09cc63ca2c85a4e01e571f9d32eb46ea48aa4ad07ff7b56aa722d361e2f97efb0d373
+2026-01-31T21:50:13.612660Z DEBUG net::session: session command buffer full, dropping message peer_id=0x6b563b30e92579d00ffdcdbdd4f235aa620c9efafc9764ce0c9c9d767e67860be5bdcb12ebdd2201a87bc306c46ecd24ce2b24cf2a8e2a854b04bf16d769fbd0
+2026-01-31T21:50:13.612669Z DEBUG net::session: session command buffer full, dropping message peer_id=0x6e0223db843c947e20e5a7fe46f9da55152b54b496bd1867f6d2c1c6b61776b09ffd51fc456510a292407a590e050e3a9a18a7ec0e2b9bb358109c746ccbb5db
+2026-01-31T21:50:13.612671Z DEBUG net::session: session command buffer full, dropping message peer_id=0x53ee9436a958c1c36f0b9943d5a80382fa8c9d51a616a054f23dcf6792073bd5b133df77e5fc6046c6e0e328e3d0f6ec0cb1a238cf62123d4261189be105f3d8
+2026-01-31T21:50:13.625560Z DEBUG bsc::executor: Start to finish block_id=750764 is_miner=true
+2026-01-31T21:50:13.625591Z DEBUG reth_bsc::node::evm::post_execution: Start to finalize new block, block_number: 750764, is_miner: true
+2026-01-31T21:50:13.625634Z  WARN reth_bsc::node::evm::post_execution: Global signer not initialized for mining mode
+2026-01-31T21:50:13.626080Z DEBUG rpc: Failed to build pending block: Internal(Execution(Internal(Other(GlobalSignerNotInitializedForMiningMode))))
+2026-01-31T21:50:13.628064Z DEBUG net::session: session command buffer full, dropping message peer_id=0x8bb4d6571fad1fcf56358ca4db480a25b65e86240fc5c0c426b0a11e8cd09cc63ca2c85a4e01e571f9d32eb46ea48aa4ad07ff7b56aa722d361e2f97efb0d373
+2026-01-31T21:50:13.628077Z DEBUG net::session: session command buffer full, dropping message peer_id=0x6b563b30e92579d00ffdcdbdd4f235aa620c9efafc9764ce0c9c9d767e67860be5bdcb12ebdd2201a87bc306c46ecd24ce2b24cf2a8e2a854b04bf16d769fbd0
+2026-01-31T21:50:13.628087Z DEBUG net::session: session command buffer full, dropping message peer_id=0x6e0223db843c947e20e5a7fe46f9da55152b54b496bd1867f6d2c1c6b61776b09ffd51fc456510a292407a590e050e3a9a18a7ec0e2b9bb358109c746ccbb5db
+2026-01-31T21:50:13.628091Z DEBUG net::session: session command buffer full, dropping message peer_id=0x53ee9436a958c1c36f0b9943d5a80382fa8c9d51a616a054f23dcf6792073bd5b133df77e5fc6046c6e0e328e3d0f6ec0cb1a238cf62123d4261189be105f3d8
+2026-01-31T21:50:13.637832Z DEBUG bsc::executor: Start to finish block_id=750764 is_miner=true
+2026-01-31T21:50:13.637861Z DEBUG reth_bsc::node::evm::post_execution: Start to finalize new block, block_number: 750764, is_miner: true
+2026-01-31T21:50:13.637901Z  WARN reth_bsc::node::evm::post_execution: Global signer not initialized for mining mode
+2026-01-31T21:50:13.638181Z DEBUG rpc: Failed to build pending block: Internal(Execution(Internal(Other(GlobalSignerNotInitializedForMiningMode))))
+2026-01-31T21:50:13.640331Z DEBUG net::session: session command buffer full, dropping message peer_id=0x8bb4d6571fad1fcf56358ca4db480a25b65e86240fc5c0c426b0a11e8cd09cc63ca2c85a4e01e571f9d32eb46ea48aa4ad07ff7b56aa722d361e2f97efb0d373
+2026-01-31T21:50:13.640345Z DEBUG net::session: session command buffer full, dropping message peer_id=0x6b563b30e92579d00ffdcdbdd4f235aa620c9efafc9764ce0c9c9d767e67860be5bdcb12ebdd2201a87bc306c46ecd24ce2b24cf2a8e2a854b04bf16d769fbd0
+2026-01-31T21:50:13.640353Z DEBUG net::session: session command buffer full, dropping message peer_id=0x6e0223db843c947e20e5a7fe46f9da55152b54b496bd1867f6d2c1c6b61776b09ffd51fc456510a292407a590e050e3a9a18a7ec0e2b9bb358109c746ccbb5db
+2026-01-31T21:50:13.640355Z DEBUG net::session: session command buffer full, dropping message peer_id=0x53ee9436a958c1c36f0b9943d5a80382fa8c9d51a616a054f23dcf6792073bd5b133df77e5fc6046c6e0e328e3d0f6ec0cb1a238cf62123d4261189be105f3d8
+2026-01-31T21:50:13.645500Z DEBUG bsc::executor: Start to finish block_id=750764 is_miner=true
+2026-01-31T21:50:13.645527Z DEBUG reth_bsc::node::evm::post_execution: Start to finalize new block, block_number: 750764, is_miner: true
+2026-01-31T21:50:13.645575Z  WARN reth_bsc::node::evm::post_execution: Global signer not initialized for mining mode
+2026-01-31T21:50:13.645885Z DEBUG rpc: Failed to build pending block: Internal(Execution(Internal(Other(GlobalSignerNotInitializedForMiningMode))))
+2026-01-31T21:50:13.647926Z DEBUG net::session: session command buffer full, dropping message peer_id=0x8bb4d6571fad1fcf56358ca4db480a25b65e86240fc5c0c426b0a11e8cd09cc63ca2c85a4e01e571f9d32eb46ea48aa4ad07ff7b56aa722d361e2f97efb0d373
+2026-01-31T21:50:13.647943Z DEBUG net::session: session command buffer full, dropping message peer_id=0x6e0223db843c947e20e5a7fe46f9da55152b54b496bd1867f6d2c1c6b61776b09ffd51fc456510a292407a590e050e3a9a18a7ec0e2b9bb358109c746ccbb5db
+2026-01-31T21:50:13.647949Z DEBUG net::session: session command buffer full, dropping message peer_id=0x53ee9436a958c1c36f0b9943d5a80382fa8c9d51a616a054f23dcf6792073bd5b133df77e5fc6046c6e0e328e3d0f6ec0cb1a238cf62123d4261189be105f3d8
+2026-01-31T21:50:13.653815Z DEBUG bsc::executor: Start to finish block_id=750764 is_miner=true
+2026-01-31T21:50:13.653835Z DEBUG reth_bsc::node::evm::post_execution: Start to finalize new block, block_number: 750764, is_miner: true
+2026-01-31T21:50:13.653869Z  WARN reth_bsc::node::evm::post_execution: Global signer not initialized for mining mode
+2026-01-31T21:50:13.654073Z DEBUG rpc: Failed to build pending block: Internal(Execution(Internal(Other(GlobalSignerNotInitializedForMiningMode))))
+2026-01-31T21:50:13.656119Z DEBUG net::session: session command buffer full, dropping message peer_id=0x8bb4d6571fad1fcf56358ca4db480a25b65e86240fc5c0c426b0a11e8cd09cc63ca2c85a4e01e571f9d32eb46ea48aa4ad07ff7b56aa722d361e2f97efb0d373
+2026-01-31T21:50:13.656144Z DEBUG net::session: session command buffer full, dropping message peer_id=0x6e0223db843c947e20e5a7fe46f9da55152b54b496bd1867f6d2c1c6b61776b09ffd51fc456510a292407a590e050e3a9a18a7ec0e2b9bb358109c746ccbb5db
+2026-01-31T21:50:13.656150Z DEBUG net::session: session command buffer full, dropping message peer_id=0x53ee9436a958c1c36f0b9943d5a80382fa8c9d51a616a054f23dcf6792073bd5b133df77e5fc6046c6e0e328e3d0f6ec0cb1a238cf62123d4261189be105f3d8
+2026-01-31T21:50:13.661651Z DEBUG bsc::executor: Start to finish block_id=750764 is_miner=true
+2026-01-31T21:50:13.661675Z DEBUG reth_bsc::node::evm::post_execution: Start to finalize new block, block_number: 750764, is_miner: true
+2026-01-31T21:50:13.661708Z  WARN reth_bsc::node::evm::post_execution: Global signer not initialized for mining mode
+2026-01-31T21:50:13.661936Z DEBUG rpc: Failed to build pending block: Internal(Execution(Internal(Other(GlobalSignerNotInitializedForMiningMode))))
+2026-01-31T21:50:13.670325Z DEBUG bsc::executor: Start to finish block_id=750764 is_miner=true
+2026-01-31T21:50:13.670351Z DEBUG reth_bsc::node::evm::post_execution: Start to finalize new block, block_number: 750764, is_miner: true
+2026-01-31T21:50:13.670383Z  WARN reth_bsc::node::evm::post_execution: Global signer not initialized for mining mode
+2026-01-31T21:50:13.670591Z DEBUG rpc: Failed to build pending block: Internal(Execution(Internal(Other(GlobalSignerNotInitializedForMiningMode))))
+2026-01-31T21:50:13.670619Z DEBUG net::session: session command buffer full, dropping message peer_id=0x8bb4d6571fad1fcf56358ca4db480a25b65e86240fc5c0c426b0a11e8cd09cc63ca2c85a4e01e571f9d32eb46ea48aa4ad07ff7b56aa722d361e2f97efb0d373
+2026-01-31T21:50:13.670637Z DEBUG net::session: session command buffer full, dropping message peer_id=0x6e0223db843c947e20e5a7fe46f9da55152b54b496bd1867f6d2c1c6b61776b09ffd51fc456510a292407a590e050e3a9a18a7ec0e2b9bb358109c746ccbb5db
+2026-01-31T21:50:13.670645Z DEBUG net::session: session command buffer full, dropping message peer_id=0x53ee9436a958c1c36f0b9943d5a80382fa8c9d51a616a054f23dcf6792073bd5b133df77e5fc6046c6e0e328e3d0f6ec0cb1a238cf62123d4261189be105f3d8
+2026-01-31T21:50:13.672501Z DEBUG net::session: session command buffer full, dropping message peer_id=0x8bb4d6571fad1fcf56358ca4db480a25b65e86240fc5c0c426b0a11e8cd09cc63ca2c85a4e01e571f9d32eb46ea48aa4ad07ff7b56aa722d361e2f97efb0d373
+2026-01-31T21:50:13.672522Z DEBUG net::session: session command buffer full, dropping message peer_id=0x6e0223db843c947e20e5a7fe46f9da55152b54b496bd1867f6d2c1c6b61776b09ffd51fc456510a292407a590e050e3a9a18a7ec0e2b9bb358109c746ccbb5db
+2026-01-31T21:50:13.672528Z DEBUG net::session: session command buffer full, dropping message peer_id=0x53ee9436a958c1c36f0b9943d5a80382fa8c9d51a616a054f23dcf6792073bd5b133df77e5fc6046c6e0e328e3d0f6ec0cb1a238cf62123d4261189be105f3d8
+2026-01-31T21:50:13.672532Z DEBUG net::session: session command buffer full, dropping message peer_id=0x8bb4d6571fad1fcf56358ca4db480a25b65e86240fc5c0c426b0a11e8cd09cc63ca2c85a4e01e571f9d32eb46ea48aa4ad07ff7b56aa722d361e2f97efb0d373
+2026-01-31T21:50:13.672537Z DEBUG net::session: session command buffer full, dropping message peer_id=0x6e0223db843c947e20e5a7fe46f9da55152b54b496bd1867f6d2c1c6b61776b09ffd51fc456510a292407a590e050e3a9a18a7ec0e2b9bb358109c746ccbb5db
+2026-01-31T21:50:13.672540Z DEBUG net::session: session command buffer full, dropping message peer_id=0x53ee9436a958c1c36f0b9943d5a80382fa8c9d51a616a054f23dcf6792073bd5b133df77e5fc6046c6e0e328e3d0f6ec0cb1a238cf62123d4261189be105f3d8
+2026-01-31T21:50:13.677316Z DEBUG storage::db::mdbx: Commit total_duration=432.490528ms commit_latency=Some(CommitLatency(MDBX_commit_latency { preparation: 0, gc_wallclock: 3, audit: 0, write: 0, sync: 28336, ending: 0, whole: 28341, gc_cputime: 0, gc_prof: MDBX_commit_latency__bindgen_ty_1 { wloops: 0, coalescences: 0, wipes: 0, flushes: 0, kicks: 0, work_counter: 0, work_rtime_monotonic: 0, work_xtime_cpu: 0, work_rsteps: 0, work_xpages: 0, work_majflt: 0, self_counter: 0, self_rtime_monotonic: 0, self_xtime_cpu: 0, self_rsteps: 0, self_xpages: 0, self_majflt: 0, pnl_merge_work: MDBX_commit_latency__bindgen_ty_1__bindgen_ty_1 { time: 0, volume: 0, calls: 0 }, pnl_merge_self: MDBX_commit_latency__bindgen_ty_1__bindgen_ty_1 { time: 0, volume: 0, calls: 0 } } })) is_read_only=false
+2026-01-31T21:50:13.677347Z DEBUG engine::persistence: Saved range of blocks first=Some(NumHash { number: 750634, hash: 0x8d2588c38daddea5c4616fa1598daa8c44a4d2ac87b076784e41a82dacdf104f }) last=Some(NumHash { number: 750634, hash: 0x8d2588c38daddea5c4616fa1598daa8c44a4d2ac87b076784e41a82dacdf104f })
+2026-01-31T21:50:13.677366Z DEBUG pruner: Minimum pruning interval reached previous_tip_block_number=Some(750629) tip_block_number=750634
+2026-01-31T21:50:13.677374Z DEBUG engine::persistence: Running pruner block_num=750634
+2026-01-31T21:50:13.677376Z DEBUG engine::tree: Finished persisting, calling finish last_persisted_block_hash=0x8d2588c38daddea5c4616fa1598daa8c44a4d2ac87b076784e41a82dacdf104f last_persisted_block_number=750634 elapsed=454.021594ms
+2026-01-31T21:50:13.677386Z DEBUG engine::tree: Evicting changesets below threshold last_persisted=750634 finalized_number=750761 eviction_threshold=750570
+2026-01-31T21:50:13.677389Z DEBUG trie::changeset_cache: Starting cache eviction up_to_block=750570 cache_size_before=195
+2026-01-31T21:50:13.677394Z DEBUG trie::changeset_cache: Evicting block from cache block_number=750569 num_hashes=1
+2026-01-31T21:50:13.677437Z DEBUG pruner: Pruner started tip_block_number=750634
+2026-01-31T21:50:13.677442Z DEBUG pruner: Segment pruning started segment=AccountHistory purpose=User to_block=740570 prune_mode=Distance(10064)
+2026-01-31T21:50:13.677465Z DEBUG reth_node_events::node: Pruner started tip_block_number=750634
+2026-01-31T21:50:13.677580Z DEBUG trie::changeset_cache: Finished cache eviction up_to_block=750570 evicted_count=1 cache_size_after=194
+2026-01-31T21:50:13.677692Z DEBUG engine::tree: Removing blocks from the tree upper_bound=NumHash { number: 750634, hash: 0x8d2588c38daddea5c4616fa1598daa8c44a4d2ac87b076784e41a82dacdf104f } finalized_num_hash=Some(NumHash { number: 750761, hash: 0x59822f59f65fb02fe9c2fd11e4996411f1750163e988f9e292001d70c3655986 })
+2026-01-31T21:50:13.677699Z DEBUG engine::tree: Adjusted upper bound finalized=NumHash { number: 750634, hash: 0x8d2588c38daddea5c4616fa1598daa8c44a4d2ac87b076784e41a82dacdf104f }
+2026-01-31T21:50:13.677700Z DEBUG engine::tree: Removing canonical blocks from the tree upper_bound=750634 last_persisted_hash=0x8d2588c38daddea5c4616fa1598daa8c44a4d2ac87b076784e41a82dacdf104f
+2026-01-31T21:50:13.677708Z DEBUG engine::tree: Attempting to remove block walking back from the head num_hash=NumHash { number: 750634, hash: 0x8d2588c38daddea5c4616fa1598daa8c44a4d2ac87b076784e41a82dacdf104f }
+2026-01-31T21:50:13.677712Z DEBUG engine::tree: Removed canonical blocks from the tree upper_bound=750634 last_persisted_hash=0x8d2588c38daddea5c4616fa1598daa8c44a4d2ac87b076784e41a82dacdf104f
+2026-01-31T21:50:13.677803Z DEBUG engine::tree: Returning canonical blocks to persist current_hash=0xd7184c77ca6de9dd5f913304d7124e1fa400352d6eb28d411083de7843037192 last_persisted_number=750634 canonical_head_number=750763 target_number=750635
+2026-01-31T21:50:13.677813Z DEBUG engine::tree: Persisting blocks count=1 blocks=[NumHash { number: 750635, hash: 0x93f304eb70eba2b954eed5973c25172847090c3f98dc3602ab60fed8ee61e8ec }]
+2026-01-31T21:50:13.679317Z DEBUG pruner: Segment pruning finished segment=AccountHistory purpose=User to_block=740570 prune_mode=Distance(10064) segment_output.pruned=271
+2026-01-31T21:50:13.679330Z DEBUG pruner: Segment pruning started segment=StorageHistory purpose=User to_block=740570 prune_mode=Distance(10064)
+2026-01-31T21:50:13.681599Z DEBUG bsc::executor: Start to finish block_id=750764 is_miner=true
+2026-01-31T21:50:13.681620Z DEBUG reth_bsc::node::evm::post_execution: Start to finalize new block, block_number: 750764, is_miner: true
+2026-01-31T21:50:13.681650Z  WARN reth_bsc::node::evm::post_execution: Global signer not initialized for mining mode
+2026-01-31T21:50:13.682554Z DEBUG rpc: Failed to build pending block: Internal(Execution(Internal(Other(GlobalSignerNotInitializedForMiningMode))))
+2026-01-31T21:50:13.684738Z DEBUG net::session: session command buffer full, dropping message peer_id=0x8bb4d6571fad1fcf56358ca4db480a25b65e86240fc5c0c426b0a11e8cd09cc63ca2c85a4e01e571f9d32eb46ea48aa4ad07ff7b56aa722d361e2f97efb0d373
+2026-01-31T21:50:13.684758Z DEBUG net::session: session command buffer full, dropping message peer_id=0x6e0223db843c947e20e5a7fe46f9da55152b54b496bd1867f6d2c1c6b61776b09ffd51fc456510a292407a590e050e3a9a18a7ec0e2b9bb358109c746ccbb5db
+2026-01-31T21:50:13.684763Z DEBUG net::session: session command buffer full, dropping message peer_id=0x53ee9436a958c1c36f0b9943d5a80382fa8c9d51a616a054f23dcf6792073bd5b133df77e5fc6046c6e0e328e3d0f6ec0cb1a238cf62123d4261189be105f3d8
+2026-01-31T21:50:13.689537Z DEBUG pruner: Segment pruning finished segment=StorageHistory purpose=User to_block=740570 prune_mode=Distance(10064) segment_output.pruned=1059
+2026-01-31T21:50:13.689554Z DEBUG pruner: Segment pruning started segment=Receipts purpose=User to_block=740570 prune_mode=Distance(10064)
+2026-01-31T21:50:13.689576Z DEBUG prune{input=PruneInput { previous_checkpoint: Some(PruneCheckpoint { block_number: Some(740565), tx_number: Some(16723511), prune_mode: Distance(10064) }), to_block: 740570, limiter: PruneLimiter { deleted_entries_limit: Some(PruneDeletedEntriesLimit { limit: 18446744073709551615, deleted: 1330 }), time_limit: None } }}: pruner: Pruning receipts from database.
+2026-01-31T21:50:13.689886Z DEBUG pruner: Segment pruning finished segment=Receipts purpose=User to_block=740570 prune_mode=Distance(10064) segment_output.pruned=278
+2026-01-31T21:50:13.689892Z DEBUG pruner: Segment pruning started segment=SenderRecovery purpose=User to_block=750634 prune_mode=Full
+2026-01-31T21:50:13.689908Z DEBUG pruner: Segment pruning finished segment=SenderRecovery purpose=User to_block=750634 prune_mode=Full segment_output.pruned=0
+2026-01-31T21:50:13.689913Z DEBUG pruner: Pruner finished tip_block_number=750634 elapsed=12.471655ms deleted_entries=1608 limiter=PruneLimiter { deleted_entries_limit: Some(PruneDeletedEntriesLimit { limit: 18446744073709551615, deleted: 1608 }), time_limit: None } output=PrunerOutput { progress: Finished, segments: [(AccountHistory, SegmentOutput { progress: Finished, pruned: 271, checkpoint: Some(SegmentOutputCheckpoint { block_number: Some(740570), tx_number: None }) }), (StorageHistory, SegmentOutput { progress: Finished, pruned: 1059, checkpoint: Some(SegmentOutputCheckpoint { block_number: Some(740570), tx_number: None }) }), (Receipts, SegmentOutput { progress: Finished, pruned: 278, checkpoint: Some(SegmentOutputCheckpoint { block_number: Some(740570), tx_number: Some(16723789) }) }), (SenderRecovery, SegmentOutput { progress: Finished, pruned: 0, checkpoint: Some(SegmentOutputCheckpoint { block_number: Some(750634), tx_number: Some(17292932) }) })] } stats=[PrunedSegmentInfo { segment: AccountHistory, pruned: 271, progress: Finished }, PrunedSegmentInfo { segment: StorageHistory, pruned: 1059, progress: Finished }, PrunedSegmentInfo { segment: Receipts, pruned: 278, progress: Finished }]
+2026-01-31T21:50:13.689935Z DEBUG provider::static_file: Finalizing all static file segments into disk
+2026-01-31T21:50:13.689936Z DEBUG provider::static_file: Finalized all static file segments into disk
+2026-01-31T21:50:13.689981Z DEBUG reth_node_events::node: Pruner finished tip_block_number=750634 elapsed=12.471655ms pruned_segments=[(table=AccountHistory, pruned=271, status=Finished), (table=StorageHistory, pruned=1059, status=Finished), (table=Receipts, pruned=278, status=Finished)]
+2026-01-31T21:50:13.691579Z DEBUG bsc::executor: Start to finish block_id=750764 is_miner=true
+2026-01-31T21:50:13.691600Z DEBUG reth_bsc::node::evm::post_execution: Start to finalize new block, block_number: 750764, is_miner: true
+2026-01-31T21:50:13.691635Z  WARN reth_bsc::node::evm::post_execution: Global signer not initialized for mining mode
+2026-01-31T21:50:13.691897Z DEBUG rpc: Failed to build pending block: Internal(Execution(Internal(Other(GlobalSignerNotInitializedForMiningMode))))
+2026-01-31T21:50:13.693969Z DEBUG net::session: session command buffer full, dropping message peer_id=0x8bb4d6571fad1fcf56358ca4db480a25b65e86240fc5c0c426b0a11e8cd09cc63ca2c85a4e01e571f9d32eb46ea48aa4ad07ff7b56aa722d361e2f97efb0d373
+2026-01-31T21:50:13.693993Z DEBUG net::session: session command buffer full, dropping message peer_id=0x6e0223db843c947e20e5a7fe46f9da55152b54b496bd1867f6d2c1c6b61776b09ffd51fc456510a292407a590e050e3a9a18a7ec0e2b9bb358109c746ccbb5db
+2026-01-31T21:50:13.694004Z DEBUG net::session: session command buffer full, dropping message peer_id=0x53ee9436a958c1c36f0b9943d5a80382fa8c9d51a616a054f23dcf6792073bd5b133df77e5fc6046c6e0e328e3d0f6ec0cb1a238cf62123d4261189be105f3d8
+2026-01-31T21:50:13.701329Z DEBUG bsc::executor: Start to finish block_id=750764 is_miner=true
+2026-01-31T21:50:13.701355Z DEBUG reth_bsc::node::evm::post_execution: Start to finalize new block, block_number: 750764, is_miner: true
+2026-01-31T21:50:13.701389Z  WARN reth_bsc::node::evm::post_execution: Global signer not initialized for mining mode
+2026-01-31T21:50:13.701766Z DEBUG rpc: Failed to build pending block: Internal(Execution(Internal(Other(GlobalSignerNotInitializedForMiningMode))))
+2026-01-31T21:50:13.703792Z DEBUG net::session: session command buffer full, dropping message peer_id=0x8bb4d6571fad1fcf56358ca4db480a25b65e86240fc5c0c426b0a11e8cd09cc63ca2c85a4e01e571f9d32eb46ea48aa4ad07ff7b56aa722d361e2f97efb0d373
+2026-01-31T21:50:13.703814Z DEBUG net::session: session command buffer full, dropping message peer_id=0x6e0223db843c947e20e5a7fe46f9da55152b54b496bd1867f6d2c1c6b61776b09ffd51fc456510a292407a590e050e3a9a18a7ec0e2b9bb358109c746ccbb5db
+2026-01-31T21:50:13.703817Z DEBUG net::session: session command buffer full, dropping message peer_id=0x53ee9436a958c1c36f0b9943d5a80382fa8c9d51a616a054f23dcf6792073bd5b133df77e5fc6046c6e0e328e3d0f6ec0cb1a238cf62123d4261189be105f3d8
+2026-01-31T21:50:13.710422Z DEBUG bsc::executor: Start to finish block_id=750764 is_miner=true
+2026-01-31T21:50:13.710445Z DEBUG reth_bsc::node::evm::post_execution: Start to finalize new block, block_number: 750764, is_miner: true
+2026-01-31T21:50:13.710475Z  WARN reth_bsc::node::evm::post_execution: Global signer not initialized for mining mode
+2026-01-31T21:50:13.710761Z DEBUG rpc: Failed to build pending block: Internal(Execution(Internal(Other(GlobalSignerNotInitializedForMiningMode))))
+2026-01-31T21:50:13.712805Z DEBUG net::session: session command buffer full, dropping message peer_id=0x6e0223db843c947e20e5a7fe46f9da55152b54b496bd1867f6d2c1c6b61776b09ffd51fc456510a292407a590e050e3a9a18a7ec0e2b9bb358109c746ccbb5db
+2026-01-31T21:50:13.712857Z DEBUG net::session: session command buffer full, dropping message peer_id=0x53ee9436a958c1c36f0b9943d5a80382fa8c9d51a616a054f23dcf6792073bd5b133df77e5fc6046c6e0e328e3d0f6ec0cb1a238cf62123d4261189be105f3d8
+2026-01-31T21:50:13.721410Z DEBUG bsc::executor: Start to finish block_id=750764 is_miner=true
+2026-01-31T21:50:13.721436Z DEBUG reth_bsc::node::evm::post_execution: Start to finalize new block, block_number: 750764, is_miner: true
+2026-01-31T21:50:13.721468Z  WARN reth_bsc::node::evm::post_execution: Global signer not initialized for mining mode
+2026-01-31T21:50:13.721701Z DEBUG rpc: Failed to build pending block: Internal(Execution(Internal(Other(GlobalSignerNotInitializedForMiningMode))))
+2026-01-31T21:50:13.723810Z DEBUG net::session: session command buffer full, dropping message peer_id=0x6e0223db843c947e20e5a7fe46f9da55152b54b496bd1867f6d2c1c6b61776b09ffd51fc456510a292407a590e050e3a9a18a7ec0e2b9bb358109c746ccbb5db
+2026-01-31T21:50:13.723824Z DEBUG net::session: session command buffer full, dropping message peer_id=0x53ee9436a958c1c36f0b9943d5a80382fa8c9d51a616a054f23dcf6792073bd5b133df77e5fc6046c6e0e328e3d0f6ec0cb1a238cf62123d4261189be105f3d8
+2026-01-31T21:50:13.731430Z DEBUG bsc::executor: Start to finish block_id=750764 is_miner=true
+2026-01-31T21:50:13.731455Z DEBUG reth_bsc::node::evm::post_execution: Start to finalize new block, block_number: 750764, is_miner: true
+2026-01-31T21:50:13.731488Z  WARN reth_bsc::node::evm::post_execution: Global signer not initialized for mining mode
+2026-01-31T21:50:13.731703Z DEBUG rpc: Failed to build pending block: Internal(Execution(Internal(Other(GlobalSignerNotInitializedForMiningMode))))
+2026-01-31T21:50:13.733732Z DEBUG net::session: session command buffer full, dropping message peer_id=0x6e0223db843c947e20e5a7fe46f9da55152b54b496bd1867f6d2c1c6b61776b09ffd51fc456510a292407a590e050e3a9a18a7ec0e2b9bb358109c746ccbb5db
+2026-01-31T21:50:13.733752Z DEBUG net::session: session command buffer full, dropping message peer_id=0x53ee9436a958c1c36f0b9943d5a80382fa8c9d51a616a054f23dcf6792073bd5b133df77e5fc6046c6e0e328e3d0f6ec0cb1a238cf62123d4261189be105f3d8
+2026-01-31T21:50:13.735574Z DEBUG net::session: session command buffer full, dropping message peer_id=0x6e0223db843c947e20e5a7fe46f9da55152b54b496bd1867f6d2c1c6b61776b09ffd51fc456510a292407a590e050e3a9a18a7ec0e2b9bb358109c746ccbb5db
+2026-01-31T21:50:13.735589Z DEBUG net::session: session command buffer full, dropping message peer_id=0x53ee9436a958c1c36f0b9943d5a80382fa8c9d51a616a054f23dcf6792073bd5b133df77e5fc6046c6e0e328e3d0f6ec0cb1a238cf62123d4261189be105f3d8
+2026-01-31T21:50:13.737489Z DEBUG net::session: session command buffer full, dropping message peer_id=0x6e0223db843c947e20e5a7fe46f9da55152b54b496bd1867f6d2c1c6b61776b09ffd51fc456510a292407a590e050e3a9a18a7ec0e2b9bb358109c746ccbb5db
+2026-01-31T21:50:13.737506Z DEBUG net::session: session command buffer full, dropping message peer_id=0x53ee9436a958c1c36f0b9943d5a80382fa8c9d51a616a054f23dcf6792073bd5b133df77e5fc6046c6e0e328e3d0f6ec0cb1a238cf62123d4261189be105f3d8
+2026-01-31T21:50:13.742028Z DEBUG bsc::executor: Start to finish block_id=750764 is_miner=true
+2026-01-31T21:50:13.742057Z DEBUG reth_bsc::node::evm::post_execution: Start to finalize new block, block_number: 750764, is_miner: true
+2026-01-31T21:50:13.742093Z  WARN reth_bsc::node::evm::post_execution: Global signer not initialized for mining mode
+2026-01-31T21:50:13.742313Z DEBUG rpc: Failed to build pending block: Internal(Execution(Internal(Other(GlobalSignerNotInitializedForMiningMode))))
+2026-01-31T21:50:13.746095Z DEBUG net::session: session command buffer full, dropping message peer_id=0x53ee9436a958c1c36f0b9943d5a80382fa8c9d51a616a054f23dcf6792073bd5b133df77e5fc6046c6e0e328e3d0f6ec0cb1a238cf62123d4261189be105f3d8
+2026-01-31T21:50:13.747999Z DEBUG net::session: session command buffer full, dropping message peer_id=0x53ee9436a958c1c36f0b9943d5a80382fa8c9d51a616a054f23dcf6792073bd5b133df77e5fc6046c6e0e328e3d0f6ec0cb1a238cf62123d4261189be105f3d8
+2026-01-31T21:50:13.751564Z DEBUG bsc::executor: Start to finish block_id=750764 is_miner=true
+2026-01-31T21:50:13.751587Z DEBUG reth_bsc::node::evm::post_execution: Start to finalize new block, block_number: 750764, is_miner: true
+2026-01-31T21:50:13.751620Z  WARN reth_bsc::node::evm::post_execution: Global signer not initialized for mining mode
+2026-01-31T21:50:13.751832Z DEBUG rpc: Failed to build pending block: Internal(Execution(Internal(Other(GlobalSignerNotInitializedForMiningMode))))
+2026-01-31T21:50:13.753852Z DEBUG net::session: session command buffer full, dropping message peer_id=0x53ee9436a958c1c36f0b9943d5a80382fa8c9d51a616a054f23dcf6792073bd5b133df77e5fc6046c6e0e328e3d0f6ec0cb1a238cf62123d4261189be105f3d8
+2026-01-31T21:50:13.765489Z DEBUG bsc::executor: Start to finish block_id=750764 is_miner=true
+2026-01-31T21:50:13.765514Z DEBUG reth_bsc::node::evm::post_execution: Start to finalize new block, block_number: 750764, is_miner: true
+2026-01-31T21:50:13.765546Z  WARN reth_bsc::node::evm::post_execution: Global signer not initialized for mining mode
+2026-01-31T21:50:13.765752Z DEBUG rpc: Failed to build pending block: Internal(Execution(Internal(Other(GlobalSignerNotInitializedForMiningMode))))
+2026-01-31T21:50:13.774363Z DEBUG bsc::executor: Start to finish block_id=750764 is_miner=true
+2026-01-31T21:50:13.774382Z DEBUG reth_bsc::node::evm::post_execution: Start to finalize new block, block_number: 750764, is_miner: true
+2026-01-31T21:50:13.774408Z  WARN reth_bsc::node::evm::post_execution: Global signer not initialized for mining mode
+2026-01-31T21:50:13.774604Z DEBUG rpc: Failed to build pending block: Internal(Execution(Internal(Other(GlobalSignerNotInitializedForMiningMode))))
+2026-01-31T21:50:13.782694Z DEBUG bsc::executor: Start to finish block_id=750764 is_miner=true
+2026-01-31T21:50:13.782712Z DEBUG reth_bsc::node::evm::post_execution: Start to finalize new block, block_number: 750764, is_miner: true
+2026-01-31T21:50:13.782735Z  WARN reth_bsc::node::evm::post_execution: Global signer not initialized for mining mode
+2026-01-31T21:50:13.782908Z DEBUG rpc: Failed to build pending block: Internal(Execution(Internal(Other(GlobalSignerNotInitializedForMiningMode))))
+2026-01-31T21:50:13.790688Z DEBUG bsc::executor: Start to finish block_id=750764 is_miner=true
+2026-01-31T21:50:13.790703Z DEBUG reth_bsc::node::evm::post_execution: Start to finalize new block, block_number: 750764, is_miner: true
+2026-01-31T21:50:13.790722Z  WARN reth_bsc::node::evm::post_execution: Global signer not initialized for mining mode
+2026-01-31T21:50:13.790880Z DEBUG rpc: Failed to build pending block: Internal(Execution(Internal(Other(GlobalSignerNotInitializedForMiningMode))))
+2026-01-31T21:50:13.800969Z DEBUG bsc::executor: Start to finish block_id=750764 is_miner=true
+2026-01-31T21:50:13.800984Z DEBUG reth_bsc::node::evm::post_execution: Start to finalize new block, block_number: 750764, is_miner: true
+2026-01-31T21:50:13.801006Z  WARN reth_bsc::node::evm::post_execution: Global signer not initialized for mining mode
+2026-01-31T21:50:13.801239Z DEBUG rpc: Failed to build pending block: Internal(Execution(Internal(Other(GlobalSignerNotInitializedForMiningMode))))
+2026-01-31T21:50:13.801468Z DEBUG bsc::block_import: Requesting block download for NewBlockHashes peer_id=0x4c983187454c632312d35ccbbb5b801ec0081c202eb2fa4a506e218492f46312285c66aa7b470b43a1d0f90e1a1c7247e3ad2c6971ae8bcda9ad063f9c54af6b block_hash=0x38bc4bbc15e80965c27cb43b664c26da3d16f81978b12ded9d67da43b99171de block_number=750764
+2026-01-31T21:50:13.801481Z DEBUG bsc::block_import: Requesting block with block range for NewBlockHashes peer_id=0x4c983187454c632312d35ccbbb5b801ec0081c202eb2fa4a506e218492f46312285c66aa7b470b43a1d0f90e1a1c7247e3ad2c6971ae8bcda9ad063f9c54af6b block_hash=0x38bc4bbc15e80965c27cb43b664c26da3d16f81978b12ded9d67da43b99171de block_number=750764
+2026-01-31T21:50:13.802393Z DEBUG bsc_protocol: Processing BlocksByRange response
+2026-01-31T21:50:13.802479Z DEBUG bsc_protocol: Received BlocksByRange req_id=340903 blocks=1
+2026-01-31T21:50:13.802492Z DEBUG bsc::registry: Batch request range and await importing blocks peer=0x4c983187454c632312d35ccbbb5b801ec0081c202eb2fa4a506e218492f46312285c66aa7b470b43a1d0f90e1a1c7247e3ad2c6971ae8bcda9ad063f9c54af6b start_height=750764 start_hash=0x38bc4bbc15e80965c27cb43b664c26da3d16f81978b12ded9d67da43b99171de count=1 blocks=1
+2026-01-31T21:50:13.802548Z DEBUG bsc::block_import: Receiving new block from network: number = 750764, hash = 0x38bc4bbc15e80965c27cb43b664c26da3d16f81978b12ded9d67da43b99171de, peer = 0x4c983187454c632312d35ccbbb5b801ec0081c202eb2fa4a506e218492f46312285c66aa7b470b43a1d0f90e1a1c7247e3ad2c6971ae8bcda9ad063f9c54af6b
+2026-01-31T21:50:13.802561Z DEBUG bsc::block_import: Sending new block to import service: number = 750764, hash = 0x38bc4bbc15e80965c27cb43b664c26da3d16f81978b12ded9d67da43b99171de
+2026-01-31T21:50:13.802568Z DEBUG bsc::block_import: New payload: block = (750764, 0x38bc4bbc15e80965c27cb43b664c26da3d16f81978b12ded9d67da43b99171de), peer_id = 0x4c983187454c632312d35ccbbb5b801ec0081c202eb2fa4a506e218492f46312285c66aa7b470b43a1d0f90e1a1c7247e3ad2c6971ae8bcda9ad063f9c54af6b
+2026-01-31T21:50:13.802620Z DEBUG reth_network::state: Propagated block hash:0x38bc4bbc15e80965c27cb43b664c26da3d16f81978b12ded9d67da43b99171de, count:4, proxyed_peer_count:0
+2026-01-31T21:50:13.802619Z DEBUG engine::tree: received new engine message msg=Request(NewPayload(parent: 0xd7184c77ca6de9dd5f913304d7124e1fa400352d6eb28d411083de7843037192, number: 750764, hash: 0x38bc4bbc15e80965c27cb43b664c26da3d16f81978b12ded9d67da43b99171de))
+2026-01-31T21:50:13.802671Z DEBUG reth::cli: Event: Handler(BlockReceived(NumHash { number: 750764, hash: 0x38bc4bbc15e80965c27cb43b664c26da3d16f81978b12ded9d67da43b99171de }))
+2026-01-31T21:50:13.802683Z DEBUG on_new_payload{block_hash=0x38bc4bbc15e80965c27cb43b664c26da3d16f81978b12ded9d67da43b99171de block_num=750764}:try_insert_payload:insert_block_or_payload: engine::tree: Inserting new block into tree block=NumHash { number: 750764, hash: 0x38bc4bbc15e80965c27cb43b664c26da3d16f81978b12ded9d67da43b99171de } parent=0xd7184c77ca6de9dd5f913304d7124e1fa400352d6eb28d411083de7843037192
+2026-01-31T21:50:13.802747Z DEBUG bsc::block_import: Receiving new block from network: number = 750764, hash = 0x38bc4bbc15e80965c27cb43b664c26da3d16f81978b12ded9d67da43b99171de, peer = 0xc1362b6d4a9693d9372c0c82f3186bfb9383a6ffe3e147507e5515474e61bf192cbf0599a7a00b878cc154582b96174cc6d53cccdcd88d110f721d6b30443388
+2026-01-31T21:50:13.802779Z  INFO reth_node_events::node: Received block from consensus engine number=750764 hash=0x38bc4bbc15e80965c27cb43b664c26da3d16f81978b12ded9d67da43b99171de
+2026-01-31T21:50:13.802795Z DEBUG on_new_payload{block_hash=0x38bc4bbc15e80965c27cb43b664c26da3d16f81978b12ded9d67da43b99171de block_num=750764}:try_insert_payload:insert_block_or_payload: engine::tree: found canonical state for block in memory, creating provider builder hash=0xd7184c77ca6de9dd5f913304d7124e1fa400352d6eb28d411083de7843037192 historical=0x8d2588c38daddea5c4616fa1598daa8c44a4d2ac87b076784e41a82dacdf104f
+2026-01-31T21:50:13.802831Z DEBUG on_new_payload{block_hash=0x38bc4bbc15e80965c27cb43b664c26da3d16f81978b12ded9d67da43b99171de block_num=750764}:try_insert_payload:insert_block_or_payload:validate_block_with_state{parent=0xd7184c77ca6de9dd5f913304d7124e1fa400352d6eb28d411083de7843037192 type_name="payload"}:state provider: engine::tree::payload_validator: found canonical state for block in memory, creating provider builder hash=0xd7184c77ca6de9dd5f913304d7124e1fa400352d6eb28d411083de7843037192 historical=0x8d2588c38daddea5c4616fa1598daa8c44a4d2ac87b076784e41a82dacdf104f
+2026-01-31T21:50:13.802886Z DEBUG on_new_payload{block_hash=0x38bc4bbc15e80965c27cb43b664c26da3d16f81978b12ded9d67da43b99171de block_num=750764}:try_insert_payload:insert_block_or_payload:validate_block_with_state{parent=0xd7184c77ca6de9dd5f913304d7124e1fa400352d6eb28d411083de7843037192 type_name="payload"}: engine::tree::payload_validator: Decided which state root algorithm to run strategy=StateRootTask
+2026-01-31T21:50:13.802935Z DEBUG on_new_payload{block_hash=0x38bc4bbc15e80965c27cb43b664c26da3d16f81978b12ded9d67da43b99171de block_num=750764}:try_insert_payload:insert_block_or_payload:validate_block_with_state{parent=0xd7184c77ca6de9dd5f913304d7124e1fa400352d6eb28d411083de7843037192 type_name="payload"}: engine::tree::payload_validator: Creating lazy overlay for in-memory blocks anchor_hash=0x8d2588c38daddea5c4616fa1598daa8c44a4d2ac87b076784e41a82dacdf104f num_blocks=129
+2026-01-31T21:50:13.803005Z DEBUG on_new_payload{block_hash=0x38bc4bbc15e80965c27cb43b664c26da3d16f81978b12ded9d67da43b99171de block_num=750764}:try_insert_payload:insert_block_or_payload:validate_block_with_state{parent=0xd7184c77ca6de9dd5f913304d7124e1fa400352d6eb28d411083de7843037192 type_name="payload"}:spawn_payload_processor:payload processor:cache_for{parent_hash=0xd7184c77ca6de9dd5f913304d7124e1fa400352d6eb28d411083de7843037192}:get_cache_for{parent_hash=0xd7184c77ca6de9dd5f913304d7124e1fa400352d6eb28d411083de7843037192}: engine::caching: No cache found parent_hash=0xd7184c77ca6de9dd5f913304d7124e1fa400352d6eb28d411083de7843037192
+2026-01-31T21:50:13.803017Z DEBUG on_new_payload{block_hash=0x38bc4bbc15e80965c27cb43b664c26da3d16f81978b12ded9d67da43b99171de block_num=750764}:try_insert_payload:insert_block_or_payload:validate_block_with_state{parent=0xd7184c77ca6de9dd5f913304d7124e1fa400352d6eb28d411083de7843037192 type_name="payload"}:spawn_payload_processor:payload processor:cache_for{parent_hash=0xd7184c77ca6de9dd5f913304d7124e1fa400352d6eb28d411083de7843037192}: reth_engine_tree::tree::payload_processor: creating new execution cache on cache miss
+2026-01-31T21:50:13.803079Z DEBUG on_new_payload{block_hash=0x38bc4bbc15e80965c27cb43b664c26da3d16f81978b12ded9d67da43b99171de block_num=750764}:try_insert_payload:insert_block_or_payload:validate_block_with_state{parent=0xd7184c77ca6de9dd5f913304d7124e1fa400352d6eb28d411083de7843037192 type_name="payload"}:spawn_payload_processor:payload processor: trie::proof_task: Spawning proof worker pools storage_worker_count=16 account_worker_count=16 v2_proofs_enabled=false
+2026-01-31T21:50:13.803239Z DEBUG on_new_payload{block_hash=0x38bc4bbc15e80965c27cb43b664c26da3d16f81978b12ded9d67da43b99171de block_num=750764}:try_insert_payload:insert_block_or_payload:validate_block_with_state{parent=0xd7184c77ca6de9dd5f913304d7124e1fa400352d6eb28d411083de7843037192 type_name="payload"}:spawn_payload_processor:payload processor:storage proof workers{storage_worker_count=16}:storage worker{worker_id=0}:database_provider_ro:get_overlay:calculate_overlay: chain_state::lazy_overlay: Anchor mismatch, falling back to merge computed_anchor=0xbc9bb1f0902889ca3a1f9adb5e0d3982972af7d1821c4f9b478ebceb9cb4d2d7 anchor_hash=0x8d2588c38daddea5c4616fa1598daa8c44a4d2ac87b076784e41a82dacdf104f
+2026-01-31T21:50:13.803249Z DEBUG on_new_payload{block_hash=0x38bc4bbc15e80965c27cb43b664c26da3d16f81978b12ded9d67da43b99171de block_num=750764}:try_insert_payload:insert_block_or_payload:validate_block_with_state{parent=0xd7184c77ca6de9dd5f913304d7124e1fa400352d6eb28d411083de7843037192 type_name="payload"}:spawn_payload_processor:payload processor:storage proof workers{storage_worker_count=16}:storage worker{worker_id=0}:database_provider_ro:get_overlay:calculate_overlay: chain_state::lazy_overlay: Merging blocks (slow path) num_blocks=129
+2026-01-31T21:50:13.804908Z DEBUG bsc::block_import: Receiving new block from network: number = 750764, hash = 0x38bc4bbc15e80965c27cb43b664c26da3d16f81978b12ded9d67da43b99171de, peer = 0xbecb471d76593d8af34279df4218bc8e4b3ea3db8a39ca270cd4d68fcb431fdcb66278f91da68a194bb1d874fc5c05c92b84b033ca6b75b8180619fdb3c71610
+2026-01-31T21:50:13.806996Z DEBUG on_new_payload{block_hash=0x38bc4bbc15e80965c27cb43b664c26da3d16f81978b12ded9d67da43b99171de block_num=750764}:try_insert_payload:insert_block_or_payload:validate_block_with_state{parent=0xd7184c77ca6de9dd5f913304d7124e1fa400352d6eb28d411083de7843037192 type_name="payload"}:execute_block: engine::tree::payload_validator: Executing block
+2026-01-31T21:50:13.807227Z DEBUG on_new_payload{block_hash=0x38bc4bbc15e80965c27cb43b664c26da3d16f81978b12ded9d67da43b99171de block_num=750764}:try_insert_payload:insert_block_or_payload:validate_block_with_state{parent=0xd7184c77ca6de9dd5f913304d7124e1fa400352d6eb28d411083de7843037192 type_name="payload"}:spawn_payload_processor:payload processor:MultiProofTask::run: engine::tree::payload_processor::multiproof: Started state root calculation
+2026-01-31T21:50:13.814937Z DEBUG bsc::executor: Start to finish block_id=750764 is_miner=true
+2026-01-31T21:50:13.814951Z DEBUG reth_bsc::node::evm::post_execution: Start to finalize new block, block_number: 750764, is_miner: true
+2026-01-31T21:50:13.814979Z  WARN reth_bsc::node::evm::post_execution: Global signer not initialized for mining mode
+2026-01-31T21:50:13.815184Z DEBUG rpc: Failed to build pending block: Internal(Execution(Internal(Other(GlobalSignerNotInitializedForMiningMode))))
+2026-01-31T21:50:13.816290Z DEBUG on_new_payload{block_hash=0x38bc4bbc15e80965c27cb43b664c26da3d16f81978b12ded9d67da43b99171de block_num=750764}:try_insert_payload:insert_block_or_payload:validate_block_with_state{parent=0xd7184c77ca6de9dd5f913304d7124e1fa400352d6eb28d411083de7843037192 type_name="payload"}:execute_block:finish: bsc::executor: Start to finish block_id=750764 is_miner=false
+2026-01-31T21:50:13.816305Z DEBUG on_new_payload{block_hash=0x38bc4bbc15e80965c27cb43b664c26da3d16f81978b12ded9d67da43b99171de block_num=750764}:try_insert_payload:insert_block_or_payload:validate_block_with_state{parent=0xd7184c77ca6de9dd5f913304d7124e1fa400352d6eb28d411083de7843037192 type_name="payload"}:execute_block:finish: reth_bsc::node::evm::post_execution: Start to post check new block, block_number: 750764, is_miner: false
