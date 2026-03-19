@@ -26,10 +26,10 @@ use reth_evm::block::{BlockExecutionError, BlockValidationError};
 use reth_evm::execute::BlockBuilder;
 use reth_evm::execute::BlockBuilderOutcome;
 use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
-use reth_chain_state::{ComputedTrieData, ExecutedBlock};
 use reth_execution_types::BlockExecutionOutput;
 use reth_payload_primitives::PayloadBuilderAttributes;
-use reth_payload_primitives::{BuiltPayload, PayloadBuilderError};
+use reth_payload_primitives::{BuiltPayload, BuiltPayloadExecutedBlock, PayloadBuilderError};
+use either::Either;
 use revm_context_interface::Block as EvmBlock;
 use reth_primitives::HeaderTy;
 use reth_primitives::InvalidTransactionError;
@@ -47,8 +47,12 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, trace, warn};
 
-/// Delay left over for mining calculation
-pub const DELAY_LEFT_OVER: u64 = 120; // triedb root is not stable.
+/// Milliseconds reserved at the end of each block period for state-root computation.
+///
+/// Geth-BSC uses 50ms because its native hashdb-based trie is faster and more predictable.
+/// reth-bsc's TrieDB root calculation has higher and less stable latency, so we reserve
+/// 120ms to avoid missing the block deadline or eating into the next block's time budget.
+pub const DELAY_LEFT_OVER: u64 = 120;
 
 /// Time multiplier for retry condition check
 const TIME_MULTIPLIER: u32 = 2;
@@ -326,6 +330,9 @@ where
         let mut best_tx_list = self.pool.best_transactions_with_attributes(
             BestTransactionsAttributes::new(base_fee, blob_fee.map(|fee| fee as u64)),
         );
+        if !blob_eligible {
+            best_tx_list.skip_blobs();
+        }
 
         // Total time spent selecting + executing user transactions.
         let exec_start = std::time::Instant::now();
@@ -666,20 +673,21 @@ where
         plain.body.sidecars = Some(blob_sidecars);
         sealed_block = Arc::new(plain.into());
 
-        let mut executed_block = ExecutedBlock::new(
-            Arc::new(block),
-            Arc::new(BlockExecutionOutput { state: db.take_bundle(), result: execution_result }),
-            ComputedTrieData::without_trie_input(
-                Arc::new(hashed_state.into_sorted()),
-                Arc::new(trie_updates.into_sorted()),
-            ),
-        );
+        let requests = execution_result.requests.clone();
+        let execution_outcome = BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
+        let executed: BuiltPayloadExecutedBlock<_> = BuiltPayloadExecutedBlock {
+            recovered_block: Arc::new(block),
+            execution_output: Arc::new(execution_outcome),
+            hashed_state: Either::Left(Arc::new(hashed_state)),
+            trie_updates: Either::Left(Arc::new(trie_updates)),
+        };
+        let mut executed_block = executed.into_executed_payload();
         executed_block.difflayer = difflayer;
 
         let payload = BscBuiltPayload {
             block: sealed_block.clone(),
             fees: total_fees,
-            requests: Some(executed_block.execution_output.result.requests.clone()),
+            requests: Some(requests),
             build_kind: BuildKind::NormalAttempt,
             exec_duration,
             trie_root_duration: finalize_elapsed,
@@ -842,20 +850,21 @@ where
             "Empty block payload built successfully (no user transactions)"
         );
 
-        let mut executed_block = ExecutedBlock::new(
-            Arc::new(block),
-            Arc::new(BlockExecutionOutput { state: db.take_bundle(), result: execution_result }),
-            ComputedTrieData::without_trie_input(
-                Arc::new(hashed_state.into_sorted()),
-                Arc::new(trie_updates.into_sorted()),
-            ),
-        );
+        let requests = execution_result.requests.clone();
+        let execution_outcome = BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
+        let executed: BuiltPayloadExecutedBlock<_> = BuiltPayloadExecutedBlock {
+            recovered_block: Arc::new(block),
+            execution_output: Arc::new(execution_outcome),
+            hashed_state: Either::Left(Arc::new(hashed_state)),
+            trie_updates: Either::Left(Arc::new(trie_updates)),
+        };
+        let mut executed_block = executed.into_executed_payload();
         executed_block.difflayer = difflayer;
 
         let payload = BscBuiltPayload {
             block: sealed_block.clone(),
             fees: total_fees,
-            requests: Some(executed_block.execution_output.result.requests.clone()),
+            requests: Some(requests),
             build_kind: BuildKind::EmptyFallback,
             exec_duration,
             trie_root_duration: finalize_elapsed,

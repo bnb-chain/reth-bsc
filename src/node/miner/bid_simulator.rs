@@ -23,10 +23,10 @@ use reth_evm::execute::BlockBuilder;
 use reth_evm::execute::BlockBuilderOutcome;
 use reth_evm::execute::{BlockExecutionError, BlockValidationError};
 use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
-use reth_chain_state::{ComputedTrieData, ExecutedBlock};
 use reth_execution_types::BlockExecutionOutput;
 use reth_payload_primitives::PayloadBuilderAttributes;
-use reth_payload_primitives::PayloadBuilderError;
+use reth_payload_primitives::{BuiltPayloadExecutedBlock, PayloadBuilderError};
+use either::Either;
 use revm_context_interface::Block as EvmBlock;
 use reth_primitives::SealedHeader;
 use reth_primitives::TransactionSigned;
@@ -547,20 +547,21 @@ where
         plain.body.sidecars = Some(bid_runtime.blob_sidecars.clone());
         sealed_block = Arc::new(plain.into());
 
-        let mut executed_block = ExecutedBlock::new(
-            Arc::new(block.clone()),
-            Arc::new(BlockExecutionOutput { state: db.take_bundle(), result: execution_result }),
-            ComputedTrieData::without_trie_input(
-                Arc::new(hashed_state.into_sorted()),
-                Arc::new(trie_updates.into_sorted()),
-            ),
-        );
+        let requests = execution_result.requests.clone();
+        let execution_outcome = BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
+        let executed: BuiltPayloadExecutedBlock<_> = BuiltPayloadExecutedBlock {
+            recovered_block: Arc::new(block.clone()),
+            execution_output: Arc::new(execution_outcome),
+            hashed_state: Either::Left(Arc::new(hashed_state)),
+            trie_updates: Either::Left(Arc::new(trie_updates)),
+        };
+        let mut executed_block = executed.into_executed_payload();
         executed_block.difflayer = difflayer;
 
         bid_runtime.bsc_payload = Some(BscBuiltPayload {
             block: sealed_block.clone(),
             fees: bid_runtime.gas_fee,
-            requests: Some(executed_block.execution_output.result.requests.clone()),
+            requests: Some(requests),
             build_kind: crate::node::engine::BuildKind::NormalAttempt,
             exec_duration: std::time::Duration::ZERO,
             trie_root_duration: std::time::Duration::ZERO,
