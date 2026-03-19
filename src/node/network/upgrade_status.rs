@@ -28,7 +28,7 @@ impl Decodable for UpgradeStatus {
         if message_id != UPGRADE_STATUS_MESSAGE_ID {
             return Err(alloy_rlp::Error::Custom("Invalid message ID"));
         }
-
+        
         // BSC sends: 0x0b (message id) followed by [[disable_peer_tx_broadcast]]
         // The remaining bytes should be the extension wrapped in an extra list
         let extension: Vec<UpgradeStatusExtension> = Decodable::decode(buf)?;

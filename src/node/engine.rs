@@ -1,4 +1,3 @@
-use crate::BscBlock;
 use crate::{
     node::{
         engine_api::payload::BscPayloadTypes,
@@ -7,6 +6,7 @@ use crate::{
     },
     BscPrimitives,
 };
+use crate::BscBlock;
 use alloy_eips::eip7685::Requests;
 use alloy_primitives::U256;
 use reth::transaction_pool::PoolTransaction;
