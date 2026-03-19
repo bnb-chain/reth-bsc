@@ -354,48 +354,9 @@ impl BscNetworkBuilder {
         }
 
         let provider = ctx.provider();
-        match provider.best_block_number() {
-            Ok(number) => {
-                match provider.header_td_by_number(number) {
-                    Ok(Some(td)) => {
-                        tracing::debug!(
-                            target: "bsc::net",
-                            best_number = number,
-                            td = ?td,
-                            "Using provider TD for eth status"
-                        );
-                        network_config.status.total_difficulty = Some(td);
-                    }
-                    Ok(None) => {
-                        // Do NOT overwrite the existing status TD with `None`, because `eth/68`
-                        // will then advertise TD=0 to peers, which breaks sync peer selection.
-                        tracing::warn!(
-                            target: "bsc::net",
-                            best_number = number,
-                            current_status_td = ?network_config.status.total_difficulty,
-                            "Provider returned no TD for best block; keeping existing status TD"
-                        );
-                    }
-                    Err(err) => {
-                        // Same rationale as above: avoid silently advertising TD=0 on errors.
-                        tracing::warn!(
-                            target: "bsc::net",
-                            best_number = number,
-                            current_status_td = ?network_config.status.total_difficulty,
-                            %err,
-                            "Failed to query TD for best block; keeping existing status TD"
-                        );
-                    }
-                }
-            }
-            Err(err) => {
-                tracing::warn!(
-                    target: "bsc::net",
-                    current_status_td = ?network_config.status.total_difficulty,
-                    %err,
-                    "Failed to query best block number; status TD may be stale"
-                );
-            }
+        if let Ok(number) = provider.best_block_number() {
+            let td = provider.header_td_by_number(number).unwrap_or_default();
+            network_config.status.total_difficulty = td;
         }
         debug!(
             target: "bsc::net",
