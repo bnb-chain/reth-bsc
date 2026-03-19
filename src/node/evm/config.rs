@@ -39,9 +39,14 @@ use std::{borrow::Cow, cell::RefCell, convert::Infallible, rc::Rc, sync::Arc};
 
 /// BSC wrapper around [`NextBlockEnvAttributes`].
 ///
-/// This follows the same approach as `sparse_v4`: we keep reth's base attributes unchanged, and
-/// carry extra miner-only data alongside it, while still satisfying upstream RPC trait bounds via
-/// a delegating [`BuildPendingEnv`] implementation.
+/// Extends the upstream attributes with TrieDB-specific context for the miner:
+/// - `parent_difflayers`: incremental trie diffs from the engine tree, used as input for
+///   the next state-root calculation via TrieDB.
+/// - `triedb_prefetcher`: a background trie-prefetch handle started before block execution
+///   so that trie nodes are warmed up by the time `finish()` computes the state root.
+///
+/// The struct still satisfies upstream RPC trait bounds via a delegating [`BuildPendingEnv`]
+/// implementation, keeping reth's base attributes unchanged.
 #[derive(Debug, Clone)]
 pub struct BscNextBlockEnvAttributes {
     pub inner: NextBlockEnvAttributes,
@@ -64,8 +69,7 @@ impl<H: BlockHeader> BuildPendingEnv<H> for BscNextBlockEnvAttributes {
 }
 
 /// Type alias for system transactions to reduce complexity
-type SystemTxs =
-    Vec<reth_primitives_traits::Recovered<reth_primitives_traits::TxTy<crate::BscPrimitives>>>;
+type SystemTxs = Vec<reth_primitives_traits::Recovered<reth_primitives_traits::TxTy<crate::BscPrimitives>>>;
 
 #[derive(Debug, Clone, Default)]
 pub struct BscExecutionSharedCtxInner {
@@ -88,7 +92,9 @@ pub struct BscExecutionSharedCtx {
 
 impl Default for BscExecutionSharedCtx {
     fn default() -> Self {
-        Self { inner: Rc::new(RefCell::new(BscExecutionSharedCtxInner::default())) }
+        Self {
+            inner: Rc::new(RefCell::new(BscExecutionSharedCtxInner::default())),
+        }
     }
 }
 
@@ -393,12 +399,12 @@ where
     ) -> Result<ExecutionCtxFor<'a, Self>, Self::Error> {
         Ok(BscBlockExecutionCtx {
             base: EthBlockExecutionCtx {
+                tx_count_hint: Some(block.transaction_count()),
                 parent_hash: block.header().parent_hash,
                 parent_beacon_block_root: block.header().parent_beacon_block_root,
                 ommers: &block.body().ommers,
                 withdrawals: block.body().withdrawals.as_ref().map(Cow::Borrowed),
                 extra_data: block.header().extra_data.clone(),
-                tx_count_hint: Some(block.body().inner.transactions.len()),
             },
             header: Some(block.header().clone()),
             is_miner: false,
@@ -412,19 +418,15 @@ where
         parent: &SealedHeader<HeaderTy<Self::Primitives>>,
         attributes: Self::NextBlockEnvCtx,
     ) -> Result<ExecutionCtxFor<'_, Self>, Self::Error> {
-        tracing::trace!(
-            "Try to create next block ctx for miner, next_block_numer={}, parent_hash={}",
-            parent.number + 1,
-            parent.hash()
-        );
+        tracing::trace!("Try to create next block ctx for miner, next_block_numer={}, parent_hash={}", parent.number+1, parent.hash());
         Ok(BscBlockExecutionCtx {
             base: EthBlockExecutionCtx {
+                tx_count_hint: None,
                 parent_hash: parent.hash(),
                 parent_beacon_block_root: attributes.inner.parent_beacon_block_root,
                 ommers: &[],
                 withdrawals: attributes.inner.withdrawals.map(Cow::Owned),
                 extra_data: attributes.inner.extra_data,
-                tx_count_hint: None,
             },
             header: None, // No header available for next block context
             is_miner: true,
@@ -465,7 +467,13 @@ where
             SystemContract::new(self.executor_factory.spec().clone()),
         );
 
-        BscBlockBuilder::new(bsc_executor, ctx, shared_ctx, &self.block_assembler, parent)
+        BscBlockBuilder::new(
+            bsc_executor,
+            ctx,
+            shared_ctx,
+            &self.block_assembler,
+            parent,
+        )
     }
 }
 
@@ -484,12 +492,12 @@ where
         let block = &payload.0;
         Ok(BscBlockExecutionCtx {
             base: EthBlockExecutionCtx {
+                tx_count_hint: Some(block.body.inner.transactions.len()),
                 parent_hash: block.header.parent_hash(),
                 parent_beacon_block_root: block.header.parent_beacon_block_root,
                 ommers: &block.body.inner.ommers,
                 withdrawals: block.body.inner.withdrawals.as_ref().map(Cow::Borrowed),
                 extra_data: block.header.extra_data.clone(),
-                tx_count_hint: Some(block.body.inner.transactions.len()),
             },
             header: Some(block.header.clone()),
             is_miner: false,
