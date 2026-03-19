@@ -1,34 +1,19 @@
-use crate::{
-    hardforks::BscHardforks,
-    node::evm::{
-        assembler::{BscBlockAssembler, BscBlockAssemblerInput},
-        config::{BscBlockExecutionCtx, BscBlockExecutorFactory, BscExecutionSharedCtx},
-        executor::BscBlockExecutor,
-        factory::BscEvmFactory,
-        pre_execution::{TURN_LENGTH_CACHE, VALIDATOR_CACHE},
-    },
-    BscPrimitives,
-};
+use crate::{BscPrimitives, hardforks::BscHardforks, node::evm::{assembler::{BscBlockAssembler, BscBlockAssemblerInput}, config::{BscBlockExecutionCtx, BscBlockExecutorFactory, BscExecutionSharedCtx}, executor::BscBlockExecutor, factory::BscEvmFactory, pre_execution::{TURN_LENGTH_CACHE, VALIDATOR_CACHE}}};
+use crate::shared::BscEngineApiTx;
+use reth_evm::execute::{BlockBuilder, BlockBuilderOutcome, BlockBuilderOutcomeWithDiffLayer, BlockExecutionError, ExecutorTx};
 use alloy_consensus::BlockHeader as _;
 use alloy_evm::eth::receipt_builder::ReceiptBuilder;
-use alloy_evm::block::BlockExecutor;
 use alloy_primitives::BlockHash;
+use reth_primitives_traits::{HeaderTy, NodePrimitives, Recovered, RecoveredBlock, SealedHeader, SignerRecoverable, TxTy};
+use reth_provider::StateProvider;
+use revm::database::{State, states::bundle_state::BundleRetention};
 use revm::context::BlockEnv;
+use alloy_evm::block::BlockExecutor;
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
 use reth_engine_primitives::BSCEngineMessageError;
 use reth_engine_tree::engine::EngineApiRequest;
 use reth_engine_tree::tree::CustomRequestMessage;
-use reth_evm::execute::{
-    BlockBuilder, BlockBuilderOutcome, BlockBuilderOutcomeWithDiffLayer, BlockExecutionError,
-    ExecutorTx,
-};
-use crate::shared::BscEngineApiTx;
-use reth_primitives_traits::{
-    HeaderTy, NodePrimitives, Recovered, RecoveredBlock, SealedHeader, SignerRecoverable, TxTy,
-};
-use reth_provider::StateProvider;
 use reth_trie_common::updates::TrieUpdates;
-use revm::database::{states::bundle_state::BundleRetention, State};
 use rust_eth_triedb::get_global_triedb;
 use rust_eth_triedb_common::DiffLayers;
 use tokio::sync::oneshot;
@@ -66,7 +51,14 @@ where
         assembler: &'a BscBlockAssembler<crate::chainspec::BscChainSpec>,
         parent: &'a SealedHeader<HeaderTy<BscPrimitives>>,
     ) -> Self {
-        Self { executor, transactions: Vec::new(), ctx, shared_ctx, parent, assembler }
+        Self {
+            executor,
+            transactions: Vec::new(),
+            ctx,
+            shared_ctx,
+            parent,
+            assembler,
+        }
     }
 }
 
@@ -120,6 +112,11 @@ where
         Ok(self.finish_with_difflayer(state)?.inner)
     }
 
+    /// Finalize the block and compute the state root, supporting both MDBX-only and
+    /// TrieDB modes. When TrieDB is active the returned `difflayer` is `Some`, carrying
+    /// the precomputed diff layer that can be committed directly to the TrieDB backend;
+    /// otherwise `difflayer` is `None` and the caller falls back to the standard
+    /// hashed-state + trie-updates path.
     fn finish_with_difflayer(
         mut self,
         state: impl StateProvider,
@@ -132,7 +129,6 @@ where
         // merge all transitions into bundle state
         db.merge_transitions(BundleRetention::Reverts);
 
-        // calculate the state root using triedb
         let state_root_start = std::time::Instant::now();
         let hashed_state = state.hashed_post_state(&db.bundle_state);
 
@@ -141,7 +137,6 @@ where
             let mut triedb = get_global_triedb();
             // Miner-side: try to use triedb prefetcher + parent difflayers from execution ctx.
             let prefetch_state = self.ctx.triedb_prefetcher.take().and_then(|p| p.finish());
-            // let had_prefetch_state = prefetch_state.is_some();
             let parent_state_root = (**self.parent).state_root();
             let trie_hashed_state = hashed_state.to_triedb_hashed_post_state();
             let difflayers_opt = self.ctx.parent_difflayers.as_ref();
@@ -176,81 +171,6 @@ where
                 triedb_calc_us = triedb_calc_started.elapsed().as_micros(),
                 "Calculated state root using triedb"
             );
-
-            // Diagnostic: on a background thread, recompute the root without prefetch_state and
-            // compare it with the prefetched root. This helps validate that prefetching only
-            // affects performance, not correctness.
-            //
-            // Note: `get_global_triedb()` returns a cloned/owned triedb instance, so this doesn't
-            // contend with the main thread's triedb.
-            // if had_prefetch_state {
-            //     let parent_hash = self.parent.hash();
-            //     let block_number = self.parent.number + 1;
-            //     let parent_state_root_diag = parent_state_root;
-            //     let difflayers_diag = self.ctx.parent_difflayers.clone();
-            //     let trie_hashed_state_diag = trie_hashed_state.clone();
-            //     let root_with_prefetch = new_root;
-            //     let triedb_calc_with_prefetch_ms = triedb_calc_with_prefetch_ms;
-
-            //     if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            //         let _ = handle.spawn_blocking(move || {
-            //         let diag_started = std::time::Instant::now();
-            //         let mut triedb = get_global_triedb();
-            //         match triedb.intermediate_hashed_post_state(
-            //             parent_state_root_diag,
-            //             difflayers_diag.as_ref(),
-            //             &trie_hashed_state_diag,
-            //             None,
-            //         ) {
-            //             Ok(root_no_prefetch) => {
-            //                 let diag_ms = diag_started.elapsed().as_millis();
-            //                 if root_no_prefetch != root_with_prefetch {
-            //                     tracing::warn!(
-            //                         target: "bsc::builder",
-            //                         parent_hash = %parent_hash,
-            //                         block_number = %block_number,
-            //                         parent_state_root = %parent_state_root_diag,
-            //                         got = %root_with_prefetch,
-            //                         got_no_prefetch = %root_no_prefetch,
-            //                         has_parent_difflayers = difflayers_diag.is_some(),
-            //                         calc_with_prefetch_ms = triedb_calc_with_prefetch_ms,
-            //                         recompute_no_prefetch_ms = diag_ms,
-            //                         "triedb root differs when recomputing without prefetch_state"
-            //                     );
-            //                 } else {
-            //                     tracing::debug!(
-            //                         target: "bsc::builder",
-            //                         parent_hash = %parent_hash,
-            //                         block_number = %block_number,
-            //                         calc_with_prefetch_ms = triedb_calc_with_prefetch_ms,
-            //                         recompute_no_prefetch_ms = diag_ms,
-            //                         "triedb recompute without prefetch_state matches"
-            //                     );
-            //                 }
-            //             }
-            //             Err(err) => {
-            //                 tracing::warn!(
-            //                     target: "bsc::builder",
-            //                     parent_hash = %parent_hash,
-            //                     block_number = %block_number,
-            //                     error = ?err,
-            //                     calc_with_prefetch_ms = triedb_calc_with_prefetch_ms,
-            //                     diag_ms = diag_started.elapsed().as_millis(),
-            //                     "failed to recompute triedb root without prefetch_state"
-            //                 );
-            //             }
-            //         }
-            //         });
-            //     } else {
-            //         tracing::debug!(
-            //             target: "bsc::builder",
-            //             parent_hash = %parent_hash,
-            //             block_number = %block_number,
-            //             "tokio runtime not available; skipping triedb recompute without prefetch_state"
-            //         );
-            //     }
-            // }
-
             (new_root, TrieUpdates::default(), Some(new_difflayer))
         } else {
             let (root, updates) =
@@ -267,33 +187,33 @@ where
         let (transactions, senders): (Vec<_>, Vec<_>) =
             self.transactions.into_iter().map(|tx| tx.into_parts()).unzip();
 
-        let bsc_input: BscBlockAssemblerInput<'_, '_, BscBlockExecutorFactory> =
-            BscBlockAssemblerInput {
-                evm_env,
-                execution_ctx: self.ctx,
-                parent: self.parent,
-                transactions: transactions.clone(),
-                output: &result,
-                bundle_state: &db.bundle_state,
-                state_provider: &state,
-                state_root,
-            };
+        // BlockAssemblerInput is non_exhaustive. 
+        // So define a new struct BscBlockAssemblerInput and a new interface assemble_block_bsc.
+        let bsc_input: BscBlockAssemblerInput<'_, '_, BscBlockExecutorFactory> = BscBlockAssemblerInput {
+            evm_env,
+            execution_ctx: self.ctx,
+            parent: self.parent,
+            transactions: transactions.clone(),
+            output: &result,
+            bundle_state: &db.bundle_state,
+            state_provider: &state,
+            state_root,
+        };
         let assemble_start = std::time::Instant::now();
         let block = self.assembler.assemble_block_bsc(bsc_input)?;
 
         // cache current validators and turn length
         let current_validators = self.shared_ctx.inner.borrow().current_validators.clone();
         if let Some((validators, vote_addresses)) = current_validators {
-            VALIDATOR_CACHE
-                .lock()
-                .unwrap()
-                .insert(block.header.hash_slow(), (validators, vote_addresses));
+            VALIDATOR_CACHE.lock().unwrap().insert(block.header.hash_slow(), (validators, vote_addresses));
+            tracing::debug!("Succeed to update validator cache in builder, block_number: {}, block_hash: {}", block.header.number, block.header.hash_slow());
         }
         if let Some(turn_length) = self.shared_ctx.inner.borrow().turn_length {
             TURN_LENGTH_CACHE.lock().unwrap().insert(block.header.hash_slow(), turn_length);
+            tracing::debug!("Succeed to update turn length cache in builder, block_number: {}, block_hash: {}", block.header.number, block.header.hash_slow());
         }
+        
         let assemble_duration = assemble_start.elapsed();
-
         let finish_duration = finish_start.elapsed();
         tracing::debug!(
             target: "bsc::builder",
@@ -328,6 +248,11 @@ where
     }
 }
 
+/// Request the parent block's diff layers from the engine (TrieDB mode only).
+///
+/// Diff layers capture the trie-node changes produced by prior blocks and serve as
+/// incremental input for computing the next state root via TrieDB, avoiding a full
+/// trie traversal from disk.
 pub async fn request_difflayer(
     engine_api_tx: &BscEngineApiTx,
     parent_hash: BlockHash,
