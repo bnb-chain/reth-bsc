@@ -35,6 +35,7 @@ use reth_ethereum_primitives::Receipt;
 use reth_payload_primitives::EngineApiMessageVersion;
 use reth_primitives::{gas_spent_by_transactions, GotExpected};
 use reth_primitives_traits::constants::{GAS_LIMIT_BOUND_DIVISOR, MINIMUM_GAS_LIMIT};
+use reth_ethereum_forks::Head;
 use reth_provider::{BlockNumReader, HeaderProvider};
 use std::sync::Arc;
 
@@ -1263,7 +1264,31 @@ where
                 PayloadStatusEnum::Invalid { validation_error } => {
                     Err(ParliaConsensusErr::ForkChoiceUpdateError(validation_error))
                 }
-                _ => Ok(()),
+                _ => {
+                    // Update P2P network status so peers see our current chain head.
+                    // Without this, the Status advertised to peers stays at the startup
+                    // value and peers will consider us stale/stalling.
+                    let td = self
+                        .header_td(
+                            &self.engine_handle,
+                            new_canonical_head.number,
+                            new_canonical_head.hash_slow(),
+                        )
+                        .await
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default();
+                    if let Some(network_handle) = shared::get_network_handle() {
+                        network_handle.update_status(Head {
+                            number: new_canonical_head.number,
+                            hash: new_canonical_head.hash_slow(),
+                            difficulty: new_canonical_head.difficulty,
+                            timestamp: new_canonical_head.timestamp,
+                            total_difficulty: td,
+                        });
+                    }
+                    Ok(())
+                }
             },
             Err(err) => Err(ParliaConsensusErr::ForkChoiceUpdateError(err.to_string())),
         }
