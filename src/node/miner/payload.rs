@@ -41,6 +41,7 @@ use reth_revm::cancelled::ManualCancel;
 use reth_revm::state::EvmState as RethEvmState;
 use reth_revm::{database::StateProviderDatabase, db::State};
 use rust_eth_triedb::get_global_triedb;
+use rust_eth_triedb_common::DiffLayers;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -120,6 +121,11 @@ pub struct BscBuildArguments<Attributes> {
     pub trace_id: u64,
     /// Minimum gas tip
     pub min_gas_tip: u128,
+    /// Parent block diff layers for triedb state root computation.
+    ///
+    /// Fetched once at job creation and shared across all build attempts for the same parent.
+    /// `None` when triedb is inactive or the fetch failed (graceful degradation to full trie).
+    pub parent_difflayers: Option<DiffLayers>,
 }
 
 /// BSC payload builder, used to build payload for bsc miner.
@@ -185,42 +191,12 @@ where
         args: BscBuildArguments<EthPayloadBuilderAttributes>,
     ) -> Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>> {
         let build_start = std::time::Instant::now();
-        let BscBuildArguments { mut cached_reads, config, cancel, trace_id, min_gas_tip } = args;
+        let BscBuildArguments { mut cached_reads, config, cancel, trace_id, min_gas_tip, parent_difflayers } = args;
         let PayloadConfig { parent_header, attributes } = config;
 
-        // If triedb is active, fetch parent difflayers *before* creating the block builder.
-        //
-        // Important: the block builder is not `Send`, and this function is spawned onto a tokio
-        // JoinSet. Therefore we must not hold the builder across any `.await`.
         let parent_hash = parent_header.hash_slow();
-        let triedb_parent_difflayers = if rust_eth_triedb::triedb_manager::is_triedb_active() {
-            match crate::shared::get_engine_api_tx() {
-                Some(engine_api_tx) => match request_difflayer(&engine_api_tx, parent_hash).await {
-                    Ok(difflayers) => Some(difflayers),
-                    Err(e) => {
-                        warn!(
-                            target: "payload_builder",
-                            trace_id,
-                            parent_hash = ?parent_hash,
-                            error = %e,
-                            "Failed to request parent difflayers for triedb prefetcher, continuing without prefetcher"
-                        );
-                        None
-                    }
-                },
-                None => {
-                    warn!(
-                        target: "payload_builder",
-                        trace_id,
-                        parent_hash = ?parent_hash,
-                        "Engine api tx not found; aborting payload build (triedb active)"
-                    );
-                    return Err(Box::new(std::io::Error::other("engine api tx not found")));
-                }
-            }
-        } else {
-            None
-        };
+        // Parent difflayers were fetched once at job start; reuse across all retry attempts.
+        let triedb_parent_difflayers = parent_difflayers;
 
         let state_provider = self.client.state_by_block_hash(parent_header.hash_slow())?;
         let state = StateProviderDatabase::new(&state_provider);
@@ -703,43 +679,13 @@ where
         args: BscBuildArguments<EthPayloadBuilderAttributes>,
     ) -> Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>> {
         let build_start = std::time::Instant::now();
-        let BscBuildArguments { mut cached_reads, config, cancel: _, trace_id, min_gas_tip: _ } =
+        let BscBuildArguments { mut cached_reads, config, cancel: _, trace_id, min_gas_tip: _, parent_difflayers } =
             args;
         let PayloadConfig { parent_header, attributes } = config;
 
-        // If triedb is active, fetch parent difflayers *before* creating the block builder.
-        //
-        // Important: the block builder is not `Send`, and this function may be spawned onto a tokio
-        // JoinSet. Therefore we must not hold the builder across any `.await`.
         let parent_hash = parent_header.hash_slow();
-        let triedb_parent_difflayers = if rust_eth_triedb::triedb_manager::is_triedb_active() {
-            match crate::shared::get_engine_api_tx() {
-                Some(engine_api_tx) => match request_difflayer(&engine_api_tx, parent_hash).await {
-                    Ok(difflayers) => Some(difflayers),
-                    Err(e) => {
-                        warn!(
-                            target: "payload_builder",
-                            trace_id,
-                            parent_hash = ?parent_hash,
-                            error = %e,
-                            "Failed to request parent difflayers for triedb prefetcher (empty payload), continuing without prefetcher"
-                        );
-                        None
-                    }
-                },
-                None => {
-                    warn!(
-                        target: "payload_builder",
-                        trace_id,
-                        parent_hash = ?parent_hash,
-                        "Engine api tx not found; aborting empty payload build (triedb active)"
-                    );
-                    return Err(Box::new(std::io::Error::other("engine api tx not found")));
-                }
-            }
-        } else {
-            None
-        };
+        // Parent difflayers were fetched once at job start; reuse across all retry attempts.
+        let triedb_parent_difflayers = parent_difflayers;
 
         let state_provider = self.client.state_by_block_hash(parent_header.hash_slow())?;
         let state = StateProviderDatabase::new(&state_provider);
@@ -871,6 +817,39 @@ where
             executed_block,
         };
         Ok(payload)
+    }
+}
+
+/// Fetch the parent block's diff layers for triedb state-root computation.
+///
+/// Called once per payload job at startup; the result is stored in [`BscBuildArguments`] and
+/// shared across all build attempts (normal and empty) for the same parent block.
+/// Returns `None` on any failure — callers degrade gracefully to the full-trie path.
+async fn fetch_triedb_difflayers(trace_id: u64, parent_hash: alloy_primitives::B256) -> Option<DiffLayers> {
+    if !rust_eth_triedb::triedb_manager::is_triedb_active() {
+        return None;
+    }
+    let Some(engine_api_tx) = crate::shared::get_engine_api_tx() else {
+        warn!(
+            target: "payload_builder",
+            trace_id,
+            %parent_hash,
+            "engine_api_tx not available; proceeding without triedb difflayers"
+        );
+        return None;
+    };
+    match request_difflayer(&engine_api_tx, parent_hash).await {
+        Ok(difflayers) => Some(difflayers),
+        Err(e) => {
+            warn!(
+                target: "payload_builder",
+                trace_id,
+                %parent_hash,
+                error = %e,
+                "Failed to fetch parent difflayers; triedb state root falls back to full trie traversal"
+            );
+            None
+        }
     }
 }
 
@@ -1029,6 +1008,14 @@ where
 
     /// Runs the payload job asynchronously with timeout support
     pub async fn start(mut self) -> Result<(), Box<BscPayloadJobError>> {
+        // Fetch parent difflayers once for all build attempts in this job.
+        // Stored in build_args so retries and empty-payload fallback share the same value.
+        self.build_args.parent_difflayers = fetch_triedb_difflayers(
+            self.trace_id,
+            self.build_args.config.parent_header.hash_slow(),
+        )
+        .await;
+
         let mut start_time = std::time::Instant::now();
         if let Err(err) = self.try_build_tx.send(()) {
             warn!(
