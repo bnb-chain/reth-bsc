@@ -41,9 +41,8 @@ use reth_provider::{
 use reth_revm::cancelled::ManualCancel;
 use reth_tasks::TaskExecutor;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_stream::StreamExt;
@@ -51,6 +50,16 @@ use tracing::{debug, error, info, trace, warn};
 
 /// Maximum number of recently mined blocks to track for double signing prevention
 const RECENT_MINED_BLOCKS_CACHE_SIZE: usize = 100;
+
+/// After this many seconds of `is_syncing() == true` with no canonical events, allow mining
+/// anyway. This breaks the deadlock that occurs when all validators restart simultaneously:
+/// no one produces blocks → no FCU → is_syncing never clears → no mining → deadlock.
+/// 30s = 10 BSC slots, enough time for a peer to come up and send FCU if any are running.
+const SYNC_GATE_TIMEOUT_SECS: u64 = 30;
+
+/// Tracks when the miner first encountered the sync gate. Used for timeout-based deadlock
+/// recovery when all validators restart simultaneously.
+static SYNC_GATE_FIRST_HIT: OnceLock<Instant> = OnceLock::new();
 
 #[derive(Clone, Debug)]
 pub struct MiningContext {
@@ -116,13 +125,15 @@ where
         // Don't block the canonical notifications loop on potentially slow startup checks (DB
         // reads / snapshot locks). If this blocks, we can miss the first few canonical commits and
         // never emit the per-commit "Try new work" log.
-        if let Some(tip_header) = self.get_tip_header_at_startup() {
+        let startup_tip = self.get_tip_header_at_startup();
+        if let Some(ref tip_header) = startup_tip {
             debug!("Try new work at startup, tip_block={}", tip_header.number());
             let validator_address = self.validator_address;
             let provider = self.provider.clone();
             let snapshot_provider = Arc::clone(&self.snapshot_provider);
             let mining_queue_tx = self.mining_queue_tx.clone();
             let consensus = Arc::clone(&self.consensus);
+            let tip_header = tip_header.clone();
             tokio::spawn(async move {
                 let worker = NewWorkWorker::new(
                     validator_address,
@@ -135,9 +146,25 @@ where
             });
         }
 
+        // Periodic ticker: retries try_new_work when no canonical events arrive.
+        // This is essential for deadlock recovery when all validators restart simultaneously
+        // and the sync gate times out — without this ticker, try_new_work would never be
+        // re-invoked after the startup attempt.
+        let mut periodic_tick =
+            tokio::time::interval(Duration::from_secs(3));
+        periodic_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Burn the first immediate tick so we don't double-fire with the startup spawn above.
+        periodic_tick.tick().await;
+
         loop {
-            match notifications.next().await {
-                Some(event) => {
+            tokio::select! {
+            biased; // prefer canonical events over the ticker
+            notification = notifications.next() => {
+            let Some(event) = notification else {
+                warn!("Canonical state notification stream ended, exiting...");
+                break;
+            };
+            let event = event; // rebind to avoid move issues
                     let committed = event.committed();
                     let tip = committed.tip();
                     let is_reorg = matches!(event, CanonStateNotification::Reorg { .. });
@@ -240,11 +267,21 @@ where
 
                     self.try_new_work(&tip_header).await;
                 }
-                None => {
-                    warn!("Canonical state notification stream ended, exiting...");
-                    break;
+            _ = periodic_tick.tick() => {
+                // Periodic retry: fires when no canonical events have arrived recently.
+                // Critical for breaking the all-validators-restart deadlock: once the
+                // sync gate timeout elapses, this ticker drives try_new_work to actually
+                // attempt mining.
+                if let Some(tip) = self.get_tip_header_at_startup() {
+                    debug!(
+                        target: "bsc::miner",
+                        tip_number = tip.number(),
+                        "Periodic sync-gate retry"
+                    );
+                    self.try_new_work(&tip).await;
                 }
             }
+            } // end tokio::select!
         }
     }
 
@@ -375,15 +412,29 @@ where
         H: alloy_consensus::BlockHeader + Sealable,
     {
         // Gate mining on live sync: skip if the node is still backfill-syncing.
+        // Exception: if all validators restart simultaneously, is_syncing() never clears
+        // because no FCU arrives. After SYNC_GATE_TIMEOUT_SECS we allow mining to break
+        // the deadlock.
         if let Some(network) = crate::shared::get_network_handle() {
             use reth_network_p2p::sync::SyncStateProvider;
             if network.is_syncing() {
-                debug!(
+                let first_hit = SYNC_GATE_FIRST_HIT.get_or_init(Instant::now);
+                let elapsed = first_hit.elapsed();
+                if elapsed < Duration::from_secs(SYNC_GATE_TIMEOUT_SECS) {
+                    debug!(
+                        target: "bsc::miner",
+                        tip_number = tip.number(),
+                        elapsed_secs = elapsed.as_secs(),
+                        "Skip mining: node is syncing (backfill active)"
+                    );
+                    return;
+                }
+                warn!(
                     target: "bsc::miner",
                     tip_number = tip.number(),
-                    "Skip mining: node is syncing (backfill active)"
+                    elapsed_secs = elapsed.as_secs(),
+                    "Sync gate timeout reached, allowing mining to break potential all-validators-restart deadlock"
                 );
-                return;
             }
         }
 
