@@ -1039,6 +1039,12 @@ where
         // payload job saw multiple candidates).
         if payload.build_kind == crate::node::engine::BuildKind::EmptyFallback {
             MINER_METRICS.empty_fallback_candidates_total.increment(1);
+            warn!(
+                target: "bsc::miner",
+                block_hash = %sealed_block.hash(),
+                block_number = sealed_block.number(),
+                "Submitting empty-fallback block"
+            );
         }
 
         // Record payload build timings.
