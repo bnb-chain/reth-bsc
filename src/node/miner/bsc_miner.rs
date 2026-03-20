@@ -85,6 +85,9 @@ pub struct NewWorkWorker<Provider> {
     mining_queue_tx: mpsc::UnboundedSender<MiningContext>,
     consensus: Arc<Parlia<BscChainSpec>>,
     pre_cached: Option<PrecachedState>,
+    /// Hash of the tip block for which mining was last triggered, used to suppress
+    /// periodic-tick retries when no new canonical head has arrived.
+    last_triggered_tip: Option<alloy_primitives::B256>,
 }
 
 impl<Provider> NewWorkWorker<Provider>
@@ -113,6 +116,7 @@ where
             mining_queue_tx,
             consensus,
             pre_cached: None,
+            last_triggered_tip: None,
         }
     }
 
@@ -265,6 +269,7 @@ where
 
                     self.cache_for_next(&committed);
 
+                    self.last_triggered_tip = Some(tip_header.hash());
                     self.try_new_work(&tip_header).await;
                 }
             _ = periodic_tick.tick() => {
@@ -273,11 +278,17 @@ where
                 // sync gate timeout elapses, this ticker drives try_new_work to actually
                 // attempt mining.
                 if let Some(tip) = self.get_tip_header_at_startup() {
+                    if self.last_triggered_tip == Some(tip.hash()) {
+                        // Mining already triggered for this tip via a canonical event;
+                        // skip to avoid duplicate payload submissions.
+                        continue;
+                    }
                     debug!(
                         target: "bsc::miner",
                         tip_number = tip.number(),
                         "Periodic sync-gate retry"
                     );
+                    self.last_triggered_tip = Some(tip.hash());
                     self.try_new_work(&tip).await;
                 }
             }
