@@ -374,6 +374,19 @@ where
     where
         H: alloy_consensus::BlockHeader + Sealable,
     {
+        // Gate mining on live sync: skip if the node is still backfill-syncing.
+        if let Some(network) = crate::shared::get_network_handle() {
+            use reth_network_p2p::sync::SyncStateProvider;
+            if network.is_syncing() {
+                debug!(
+                    target: "bsc::miner",
+                    tip_number = tip.number(),
+                    "Skip mining: node is syncing (backfill active)"
+                );
+                return;
+            }
+        }
+
         let parent_header = match self.provider.sealed_header_by_hash(tip.hash()) {
             Ok(Some(header)) => {
                 trace!(
