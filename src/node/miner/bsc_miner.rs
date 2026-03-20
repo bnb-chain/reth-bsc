@@ -1182,7 +1182,10 @@ where
                 bid_runtime = self.bid_simulate_req_rx.recv() => {
                     match bid_runtime {
                         Some(bid_runtime) => {
-                            self.simulator.bid_simulate(bid_runtime);
+                            let parent_difflayers =
+                                Self::fetch_parent_difflayers_for_bid(&bid_runtime.bid.parent_hash)
+                                    .await;
+                            self.simulator.bid_simulate(bid_runtime, parent_difflayers);
                         }
                         None => {
                             warn!("Bid simulate request channel closed");
@@ -1201,6 +1204,32 @@ where
                     let last_block_number = self.provider.last_block_number().unwrap_or(0);
                     self.simulator.clear(last_block_number);
                 }
+            }
+        }
+    }
+
+    /// Fetch parent difflayers for a bid simulation (TrieDB mode only).
+    ///
+    /// Returns `None` when TrieDB is inactive, engine_api_tx is unavailable, or the
+    /// request fails. In all fallback cases `bid_simulate` degrades gracefully (slower
+    /// state root via full trie traversal, no triedb prefetching).
+    async fn fetch_parent_difflayers_for_bid(
+        parent_hash: &alloy_primitives::B256,
+    ) -> Option<rust_eth_triedb_common::DiffLayers> {
+        if !rust_eth_triedb::triedb_manager::is_triedb_active() {
+            return None;
+        }
+        let engine_api_tx = crate::shared::get_engine_api_tx()?;
+        match crate::node::evm::request_difflayer(&engine_api_tx, *parent_hash).await {
+            Ok(difflayers) => Some(difflayers),
+            Err(e) => {
+                warn!(
+                    target: "bsc::mev",
+                    %parent_hash,
+                    error = %e,
+                    "Failed to fetch parent difflayers for bid simulation; triedb state root will fall back to full trie traversal"
+                );
+                None
             }
         }
     }

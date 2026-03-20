@@ -34,10 +34,14 @@ use reth_primitives_traits::SignerRecoverable;
 use reth_provider::StateProviderFactory;
 use reth_provider::{BlockHashReader, HeaderProvider};
 use reth_revm::{database::StateProviderDatabase, db::State};
+use rust_eth_triedb::get_global_triedb;
+use rust_eth_triedb_common::DiffLayers;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tracing::{debug, trace};
+use alloy_consensus::BlockHeader as _;
+use crate::node::evm::MinerTrieDbPrefetcher;
 const NO_INTERRUPT_LEFT_OVER: u64 = 500;
 const PAY_BID_TX_GAS_LIMIT: u64 = 25000;
 const TX_GAS: u64 = 21000;
@@ -345,7 +349,11 @@ where
     }
 
     // sim_bid commit tx and set best bid
-    pub fn bid_simulate(&self, mut bid_runtime: BidRuntime<Pool, BscEvmConfig>) {
+    pub fn bid_simulate(
+        &self,
+        mut bid_runtime: BidRuntime<Pool, BscEvmConfig>,
+        parent_difflayers: Option<DiffLayers>,
+    ) {
         if !self.bid_receiving {
             return;
         }
@@ -388,6 +396,38 @@ where
             return;
         }
 
+        // Two execution paths for state-root computation:
+        //
+        // TrieDB mode (is_triedb_active):
+        //   - `parent_difflayers` feeds `finish_with_difflayer` so triedb can compute the
+        //     state root incrementally without a full disk trie traversal.
+        //   - A `MinerTrieDbPrefetcher` is also spun up to pre-load trie nodes in the
+        //     background using the difflayer warm-cache, reducing `finish()` latency.
+        //     (Per-tx state hook is not wired here; bid txs are externally pre-built so
+        //     incremental prefetching is less valuable than for miner-built payloads.)
+        //
+        // Non-TrieDB mode (original path):
+        //   - Both fields stay `None`; `finish_with_difflayer` falls through to the standard
+        //     `state_root_with_updates` calculation, identical to the pre-triedb behavior.
+        let (triedb_env_difflayers, triedb_prefetcher) =
+            if rust_eth_triedb::triedb_manager::is_triedb_active() {
+                let prefetcher = parent_difflayers.clone().and_then(|difflayers| {
+                    let mut triedb = get_global_triedb();
+                    let path_db = triedb.get_mut_path_db_ref().clone();
+                    MinerTrieDbPrefetcher::new(
+                        parent_header.state_root(),
+                        path_db,
+                        Some(difflayers),
+                    )
+                    .ok()
+                });
+                (parent_difflayers, prefetcher)
+            } else {
+                // Non-triedb: discard any difflayers passed in and use the original
+                // state_root_with_updates path inside finish_with_difflayer.
+                (None, None)
+            };
+
         let mut builder = match evm_config
             .builder_for_next_block(
                 &mut db,
@@ -402,8 +442,8 @@ where
                         withdrawals: Some(attributes.withdrawals().clone()),
                         extra_data: builder_config.extra_data.clone(),
                     },
-                    parent_difflayers: None,
-                    triedb_prefetcher: None,
+                    parent_difflayers: triedb_env_difflayers,
+                    triedb_prefetcher,
                 },
             )
             .map_err(PayloadBuilderError::other)
