@@ -41,14 +41,6 @@ const RECOVERED_PROPOSER_CACHE_NUM: usize = 4096;
 const ADDRESS_LENGTH: usize = 20; // Ethereum address length in bytes
 
 /// Applies left-over reservation and mining-time cap to raw delay.
-///
-/// Unlike go-bsc (which uses `period / 2`), reth-bsc uses `period / 5` for the
-/// last-block-in-turn cap because trie root computation is significantly slower
-/// and needs more reserved time to avoid spilling into the next validator's slot.
-///
-/// For the first block in a turn, a minimum 50ms delay is enforced so the block
-/// is not empty — validator switches require re-execution and root recomputation,
-/// leaving very little time for transaction inclusion.
 #[inline]
 fn apply_mining_delay_with_leftover(
     mut delay_ms: u64,
@@ -65,6 +57,9 @@ fn apply_mining_delay_with_leftover(
         delay_ms -= left_over_ms;
     }
 
+    // Unlike go-bsc (which uses `period / 2`), reth-bsc uses `period / 5` for the
+    // last-block-in-turn cap because trie root computation is significantly slower
+    // and needs more reserved time to avoid spilling into the next validator's slot.
     let mut time_for_mining_ms = period_ms / 5;
     if !last_block_in_turn {
         time_for_mining_ms = period_ms;
@@ -73,6 +68,9 @@ fn apply_mining_delay_with_leftover(
         delay_ms = time_for_mining_ms;
     }
 
+    // For the first block in a turn, a minimum 50ms delay is enforced so the block
+    // is not empty — validator switches require re-execution and root recomputation,
+    // leaving very little time for transaction inclusion.
     if delay_ms == 0 && first_block_in_turn {
         delay_ms = 50;
     }
