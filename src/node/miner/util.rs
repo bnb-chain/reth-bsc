@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use alloy_consensus::{Header, BlockHeader};
+use alloy_consensus::Header;
 use alloy_primitives::{Address, Bytes, B256};
 use crate::consensus::parlia::Snapshot;
 use crate::consensus::parlia::consensus::Parlia;
@@ -202,12 +202,7 @@ where
         extra_data[start..].copy_from_slice(&seal_data);
         new_header.extra_data = Bytes::from(extra_data);
 
-        debug_header(
-            parent_snap,
-            parent_header,
-            new_header,
-            snapshot_provider,
-        );
+        debug_header(new_header, parlia.spec.chain().id(), "finalize_new_header");
     }
 
     Ok(())
