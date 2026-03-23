@@ -180,11 +180,32 @@ where
                         Outcome { peer: peer_id, result: Ok(BlockValidation::ValidBlock { block }) }
                             .into()
                     }
-                    PayloadStatusEnum::Invalid { validation_error } => Outcome {
-                        peer: peer_id,
-                        result: Err(BlockImportError::Other(validation_error.into())),
+                    PayloadStatusEnum::Invalid { validation_error } => {
+                        // Do NOT penalize the peer for Invalid blocks.
+                        //
+                        // In BSC's PoSA with devp2p block propagation, Invalid
+                        // frequently results from timing issues during concurrent
+                        // reorgs — the block itself is legitimate but was executed
+                        // against the wrong state. Penalizing the peer with BadBlock
+                        // (-16384 reputation) for this drains peers rapidly,
+                        // especially under BSC's fast block time (0.45s), where
+                        // concurrent forks are routine.
+                        //
+                        // This aligns with geth's behavior: geth's fetcher only
+                        // drops a peer when header verification fails
+                        // (verifyHeader), never when block execution fails
+                        // (insertChain). Truly malicious peers are still caught by
+                        // the network layer's BadMessage / BadProtocol penalties.
+                        tracing::debug!(
+                            target: "bsc::block_import",
+                            block_hash = %header.hash_slow(),
+                            block_number = header.number,
+                            %validation_error,
+                            peer = %peer_id,
+                            "New payload returned Invalid - not penalizing peer"
+                        );
+                        None
                     }
-                    .into(),
                     PayloadStatusEnum::Syncing => {
                         // When new_payload returns Syncing status, we need to manually trigger FCU
                         // to avoid the engine-tree being stuck in syncing state without any driver.
