@@ -1196,6 +1196,37 @@ where
         // Determine if we need to reorg using fork choice rules
         let need_reorg = self.is_need_reorg(incoming_header, &current_head).await?;
 
+        // Guard: if fork choice wants to switch to a block far ahead of the canonical
+        // head AND the block is not a direct child of the current head, defer the FCU.
+        // Sending an FCU for a distant block whose ancestors the engine-tree hasn't
+        // processed yet will trigger the missing-block path and, if the gap exceeds the
+        // pipeline threshold (32 blocks), start a heavyweight pipeline/backfill sync
+        // that stalls live sync.
+        //
+        // Instead, we skip the FCU and let intermediate blocks arrive through normal
+        // P2P propagation. Once the chain is connected, a subsequent update_forkchoice
+        // call for a closer block will apply the reorg correctly.
+        const MAX_FCU_AHEAD_DISTANCE: u64 = 16;
+        if need_reorg
+            && incoming_header.number > current_head.number
+            && incoming_header.parent_hash != current_head.hash_slow()
+        {
+            let gap = incoming_header.number - current_head.number;
+            if gap > MAX_FCU_AHEAD_DISTANCE {
+                tracing::warn!(
+                    target: "bsc::forkchoice",
+                    incoming_number = incoming_header.number,
+                    incoming_hash = ?incoming_header.hash_slow(),
+                    current_number = current_head.number,
+                    current_hash = ?current_head.hash_slow(),
+                    gap,
+                    "Skipping FCU for distant reorg target to avoid pipeline sync; \
+                     waiting for intermediate blocks"
+                );
+                return Ok(());
+            }
+        }
+
         // Only count as reorg if:
         // 1. Fork choice says we need to reorg AND
         // 2. The incoming block number is <= current head (actual chain reorganization)

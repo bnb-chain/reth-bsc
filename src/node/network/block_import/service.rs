@@ -163,52 +163,31 @@ where
                     }
                     .into(),
                     PayloadStatusEnum::Syncing => {
-                        // When new_payload returns Syncing status, we need to manually trigger FCU
-                        // to avoid the engine-tree being stuck in syncing state without any driver.
-                        // By calling FCU, we inform the engine about the new head block hash,
-                        // which can help trigger additional sync/download activities in the engine-tree.
+                        // The engine-tree has buffered this disconnected block and will
+                        // request downloads of its missing ancestors automatically.
+                        //
+                        // We intentionally do NOT send an FCU here. Sending an FCU with
+                        // the disconnected block's hash causes the engine-tree to enter
+                        // handle_missing_block(), which triggers a download request. If
+                        // the gap between the canonical tip and this block exceeds the
+                        // pipeline threshold (default 32 blocks), the engine falls back
+                        // to pipeline/backfill sync — a heavyweight operation that stalls
+                        // live sync for seconds to minutes.
+                        //
+                        // Instead, we rely on the engine-tree's built-in mechanism: when
+                        // the missing parent blocks arrive (via normal P2P block
+                        // propagation or NewBlockHashes download), the buffered block
+                        // will be connected and processed through a regular FCU on the
+                        // next valid block import.
                         let block_hash = header.hash_slow();
                         let block_number = header.number;
                         tracing::debug!(
                             target: "bsc::block_import",
                             block_hash = %block_hash,
                             block_number = block_number,
-                            "New payload returned Syncing status - attempting fork choice update"
+                            "New payload returned Syncing status - block buffered, \
+                             skipping FCU to avoid unnecessary pipeline sync"
                         );
-
-                        // Direct FCU call to help sync progress
-                        let forkchoice_state = alloy_rpc_types::engine::ForkchoiceState {
-                            head_block_hash: block_hash,
-                            safe_block_hash: alloy_primitives::B256::ZERO,
-                            finalized_block_hash: alloy_primitives::B256::ZERO,
-                        };
-                        match engine
-                            .fork_choice_updated(
-                                forkchoice_state,
-                                None,
-                                reth_payload_primitives::EngineApiMessageVersion::V1,
-                            )
-                            .await
-                        {
-                            Ok(result) => {
-                                tracing::debug!(
-                                    target: "bsc::block_import",
-                                    block_hash = %block_hash,
-                                    block_number = block_number,
-                                    status = ?result.payload_status.status,
-                                    "FCU result for syncing block"
-                                );
-                            }
-                            Err(err) => {
-                                tracing::trace!(
-                                    target: "bsc::block_import",
-                                    block_hash = %block_hash,
-                                    block_number = block_number,
-                                    error = %err,
-                                    "Failed to update fork choice for syncing block"
-                                );
-                            }
-                        }
                         None
                     }
                     _ => None,
@@ -726,6 +705,10 @@ mod tests {
                 fcu: PayloadStatusEnum::Invalid { validation_error: "fcu error".into() },
             }
         }
+
+        fn syncing_new_payload() -> Self {
+            Self { new_payload: PayloadStatusEnum::Syncing, fcu: PayloadStatusEnum::Valid }
+        }
     }
 
     /// Test fixture for block import tests
@@ -856,5 +839,94 @@ mod tests {
                 }
             }
         }));
+    }
+
+    /// Same as `handle_engine_msg` but tracks how many FCU messages were received.
+    async fn handle_engine_msg_with_fcu_counter(
+        mut from_engine: mpsc::UnboundedReceiver<BeaconEngineMessage<BscPayloadTypes>>,
+        responses: EngineResponses,
+        fcu_count: Arc<std::sync::atomic::AtomicU64>,
+    ) {
+        tokio::spawn(Box::pin(async move {
+            while let Some(message) = from_engine.recv().await {
+                match message {
+                    BeaconEngineMessage::NewPayload { payload: _, tx } => {
+                        tx.send(Ok(PayloadStatus::new(responses.new_payload.clone(), None)))
+                            .unwrap();
+                    }
+                    BeaconEngineMessage::ForkchoiceUpdated {
+                        state: _,
+                        payload_attrs: _,
+                        version: _,
+                        tx,
+                    } => {
+                        fcu_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        tx.send(Ok(OnForkChoiceUpdated::valid(PayloadStatus::new(
+                            responses.fcu.clone(),
+                            None,
+                        ))))
+                        .unwrap();
+                    }
+                    _ => {}
+                }
+            }
+        }));
+    }
+
+    /// Verifies that when new_payload returns Syncing (disconnected block), no FCU
+    /// is sent to the engine. This prevents unnecessary pipeline sync for blocks
+    /// whose parents haven't arrived yet.
+    #[tokio::test]
+    async fn syncing_payload_does_not_trigger_fcu() {
+        let fcu_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        let provider = MockProvider::new();
+        let chain_spec = Arc::new(crate::chainspec::BscChainSpec::from(
+            crate::chainspec::bsc::bsc_mainnet(),
+        ));
+
+        let (to_engine, from_engine) = mpsc::unbounded_channel();
+        let engine_handle = ConsensusEngineHandle::new(to_engine);
+
+        handle_engine_msg_with_fcu_counter(
+            from_engine,
+            EngineResponses::syncing_new_payload(),
+            fcu_count.clone(),
+        )
+        .await;
+
+        let (to_import, from_network) = mpsc::unbounded_channel();
+        let (_, from_builder) = mpsc::unbounded_channel();
+        let (_, from_hashes) = mpsc::unbounded_channel();
+        let (to_network, _import_outcome) = mpsc::unbounded_channel();
+
+        let _handle = ImportHandle::new(to_import.clone(), mpsc::unbounded_channel().0, _import_outcome);
+
+        let service = ImportService::new(
+            provider,
+            chain_spec,
+            engine_handle,
+            from_network,
+            from_builder,
+            from_hashes,
+            to_network,
+        );
+        tokio::spawn(Box::pin(async move {
+            service.await.unwrap();
+        }));
+
+        // Send a block that will get a Syncing response
+        let block_msg = create_test_block();
+        to_import.send((block_msg, PeerId::random())).unwrap();
+
+        // Give enough time for the async processing
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        // No FCU should have been sent — only new_payload was called
+        assert_eq!(
+            fcu_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "FCU should not be sent when new_payload returns Syncing"
+        );
     }
 }
