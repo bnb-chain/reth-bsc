@@ -227,7 +227,7 @@ impl BscProtocolConnection {
         // Check for handshake timeout
         if let Some(deadline) = self.handshake_deadline.as_mut() {
             if Future::poll(deadline.as_mut(), cx).is_ready() {
-                tracing::warn!(target: "bsc_protocol", "BSC handshake timed out");
+                tracing::warn!(target: "bsc_protocol", peer_id = ?self._peer_id, "BSC sub-protocol handshake timed out — this will tear down the entire P2P connection");
                 return Poll::Ready(None);
             }
         }
@@ -237,7 +237,7 @@ impl BscProtocolConnection {
 
         tracing::debug!(target: "bsc_protocol", "Handshake not completed, processing handshake frame, msg_id: {:?}", msg_id);
         if msg_id != BscProtoMessageId::Capability as u8 {
-            tracing::warn!(target: "bsc_protocol", got = format_args!("{:#04x}", msg_id), "Expected capability during handshake");
+            tracing::warn!(target: "bsc_protocol", peer_id = ?self._peer_id, got = format_args!("{:#04x}", msg_id), "Expected capability during BSC handshake, got unexpected msg — this will tear down the entire P2P connection");
             return Poll::Ready(None);
         }
 
@@ -252,7 +252,7 @@ impl BscProtocolConnection {
         match BscCapPacket::decode(&mut &slice[..]) {
             Ok(pkt) => {
                 if pkt.protocol_version != self.proto_version {
-                    tracing::warn!(target: "bsc_protocol", "Protocol version mismatch: {} != {}", pkt.protocol_version, self.proto_version);
+                    tracing::warn!(target: "bsc_protocol", peer_id = ?self._peer_id, ours = self.proto_version, theirs = pkt.protocol_version, "BSC protocol version mismatch — this will tear down the entire P2P connection");
                     return Poll::Ready(None);
                 }
 
@@ -270,7 +270,7 @@ impl BscProtocolConnection {
                 Poll::Ready(Some(None))
             }
             Err(e) => {
-                tracing::warn!(target: "bsc_protocol", error = %e, "Failed to decode BSC capability during handshake");
+                tracing::warn!(target: "bsc_protocol", peer_id = ?self._peer_id, error = %e, frame_hex = format!("{:02x?}", &slice[..slice.len().min(32)]), "Failed to decode BSC capability during handshake — this will tear down the entire P2P connection");
                 Poll::Ready(None)
             }
         }
