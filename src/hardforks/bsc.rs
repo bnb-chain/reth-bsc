@@ -117,6 +117,8 @@ impl BscHardfork {
             (Self::Lorentz.boxed(), ForkCondition::Timestamp(1745903100)), /* 2025-04-29 05:05:00 AM UTC */
             (Self::Maxwell.boxed(), ForkCondition::Timestamp(1751250600)), /* 2025-06-30 02:30:00 AM UTC */
             (Self::Fermi.boxed(), ForkCondition::Timestamp(1768357800)), /* 2026-01-14 02:30:00 AM UTC */
+            (Self::Osaka.boxed(), ForkCondition::Timestamp(1777343400)),
+            (Self::Mendel.boxed(), ForkCondition::Timestamp(1777343400)),
         ])
     }
 
@@ -162,8 +164,8 @@ impl BscHardfork {
             (Self::Lorentz.boxed(), ForkCondition::Timestamp(1744097580)),
             (Self::Maxwell.boxed(), ForkCondition::Timestamp(1748243100)),
             (Self::Fermi.boxed(), ForkCondition::Timestamp(1762741500)),
-            (Self::Osaka.boxed(), ForkCondition::Timestamp(1777343400)),
-            (Self::Mendel.boxed(), ForkCondition::Timestamp(1777343400)),
+            (Self::Osaka.boxed(), ForkCondition::Timestamp(1774319400)),
+            (Self::Mendel.boxed(), ForkCondition::Timestamp(1774319400)),
         ])
     }
 
