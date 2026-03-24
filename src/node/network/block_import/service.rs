@@ -255,6 +255,12 @@ where
         // Clone header for FCU update
         let header_for_fcu = block.header.clone();
 
+        // Register block stats for chain delay vote metrics (mined blocks also receive votes)
+        crate::consensus::parlia::block_stats::on_block_received(
+            block_hash,
+            block.header.timestamp,
+        );
+
         // send to EVN peers first
         if let Err(e) = self.transfer_to_evn_peers(block_msg.clone()) {
             tracing::warn!(target: "bsc::block_import", "Failed to transfer block to EVN peers: number = {:?}, hash = {:?}, error = {}", block.header.number, block_hash, e);
