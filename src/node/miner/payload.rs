@@ -1162,7 +1162,16 @@ where
             }
         }
         if let Some(best_payload) = self.pick_best_payload() {
-            let best_payload_hash = best_payload.block.hash();
+            // Check if the best payload is from a bid BEFORE refresh changes the hash
+            let is_bid_winner = bid_block_hash
+                .map(|bid_hash| best_payload.block.hash() == bid_hash)
+                .unwrap_or(false);
+
+            // Refresh vote attestation with the latest votes from the pool.
+            // In Go BSC, vote attestation is assembled in Seal() AFTER the sealing delay,
+            // giving maximum time for votes to propagate. Here we re-assemble to match
+            // that behavior, since the payload was built earlier when fewer votes were available.
+            let best_payload = self.refresh_payload_votes(best_payload);
             if let Err(err) = self.result_tx.send(SubmitContext {
                 mining_ctx: self.mining_ctx.clone(),
                 payload: best_payload,
@@ -1181,22 +1190,19 @@ where
                 return Err(Box::new(BscPayloadJobError::ResultChannelSendError(err.to_string())));
             }
 
-            // Check if the best payload is from a bid and increment bid_win metric
-            if let Some(bid_hash) = bid_block_hash {
-                if best_payload_hash == bid_hash {
-                    use crate::metrics::BscMevMetrics;
-                    use once_cell::sync::Lazy;
-                    static MEV_METRICS: Lazy<BscMevMetrics> = Lazy::new(BscMevMetrics::default);
-                    MEV_METRICS.bid_win_total.increment(1);
+            if is_bid_winner {
+                use crate::metrics::BscMevMetrics;
+                use once_cell::sync::Lazy;
+                static MEV_METRICS: Lazy<BscMevMetrics> = Lazy::new(BscMevMetrics::default);
+                MEV_METRICS.bid_win_total.increment(1);
 
-                    debug!(
-                        target: "bsc::miner::payload",
-                        trace_id = self.trace_id,
-                        block_number = self.build_args.config.parent_header.number() + 1,
-                        bid_hash = %bid_hash,
-                        "Bid payload won - incrementing bid_win metric"
-                    );
-                }
+                debug!(
+                    target: "bsc::miner::payload",
+                    trace_id = self.trace_id,
+                    block_number = self.build_args.config.parent_header.number() + 1,
+                    bid_hash = ?bid_block_hash,
+                    "Bid payload won - incrementing bid_win metric"
+                );
             }
 
             Ok(())
@@ -1322,6 +1328,100 @@ where
 
         self.potential_payloads.clear();
         Some(best_payload)
+    }
+
+    /// Refresh the vote attestation in a payload's header with the latest votes from the pool,
+    /// then re-seal the header and return a new payload with updated block hash.
+    ///
+    /// This is necessary because the payload was built earlier in the mining window when fewer
+    /// votes may have been available. By refreshing right before submission, we capture the
+    /// maximum number of votes—matching Go BSC's behavior where vote attestation is assembled
+    /// in Seal() after the full sealing delay.
+    fn refresh_payload_votes(&self, payload: BscBuiltPayload) -> BscBuiltPayload {
+        let snapshot_provider = match crate::shared::get_snapshot_provider() {
+            Some(sp) => Arc::clone(sp),
+            None => {
+                warn!(
+                    target: "bsc::miner::payload",
+                    trace_id = self.trace_id,
+                    "Cannot refresh votes: snapshot provider not available"
+                );
+                return payload;
+            }
+        };
+
+        let parent_header = self.mining_ctx.parent_header.header();
+        let parent_snap = &self.mining_ctx.parent_snapshot;
+
+        // Clone the block so we can modify the header
+        let mut plain_block = payload.block.clone_block();
+        let old_hash = payload.block.hash();
+
+        if let Err(e) = crate::node::miner::util::refresh_vote_attestation_and_seal(
+            self.parlia.clone(),
+            parent_snap,
+            parent_header,
+            &mut plain_block.header,
+            &snapshot_provider,
+        ) {
+            warn!(
+                target: "bsc::miner::payload",
+                trace_id = self.trace_id,
+                error = %e,
+                "Failed to refresh vote attestation, using original payload"
+            );
+            return payload;
+        }
+
+        // Update blob sidecar block_hash fields to match the new header hash.
+        // Sidecars were populated from the original sealed block (build_payload L576-579)
+        // and would otherwise carry a stale hash.
+        if let Some(ref mut sidecars) = plain_block.body.sidecars {
+            // Compute the new hash before sealing the block (seal_slow happens in .into())
+            // We need to compute it from the updated header.
+            let new_hash_preview = plain_block.header.hash_slow();
+            for sc in sidecars.iter_mut() {
+                sc.block_hash = new_hash_preview;
+            }
+        }
+
+        // Create new sealed block with updated header (recomputes hash)
+        let new_sealed_block: Arc<reth_primitives_traits::SealedBlock<_>> =
+            Arc::new(plain_block.into());
+        let new_hash = new_sealed_block.hash();
+
+        // Rebuild executed_block with the new sealed block so the recovered_block hash
+        // matches. The execution output / hashed state / trie updates are unchanged
+        // because only extra_data (vote attestation + seal) was modified—the state root,
+        // receipts, and transaction set are identical.
+        let old_executed = &payload.executed_block;
+        let senders = old_executed.recovered_block.senders().to_vec();
+        let new_recovered_block = reth_primitives_traits::RecoveredBlock::new_sealed(
+            (*new_sealed_block).clone(),
+            senders,
+        );
+        let new_executed = BuiltPayloadExecutedBlock {
+            recovered_block: Arc::new(new_recovered_block),
+            execution_output: Arc::clone(&old_executed.execution_output),
+            hashed_state: old_executed.hashed_state.clone(),
+            trie_updates: old_executed.trie_updates.clone(),
+        };
+
+        debug!(
+            target: "bsc::miner::payload",
+            trace_id = self.trace_id,
+            block_number = new_sealed_block.header().number(),
+            old_hash = %old_hash,
+            new_hash = %new_hash,
+            "Refreshed vote attestation in payload"
+        );
+
+        BscBuiltPayload {
+            block: new_sealed_block,
+            fees: payload.fees,
+            requests: payload.requests,
+            executed_block: new_executed,
+        }
     }
 }
 
