@@ -54,8 +54,8 @@ const RECENT_MINED_BLOCKS_CACHE_SIZE: usize = 100;
 /// After this many seconds of `is_syncing() == true` with no canonical events, allow mining
 /// anyway. This breaks the deadlock that occurs when all validators restart simultaneously:
 /// no one produces blocks → no FCU → is_syncing never clears → no mining → deadlock.
-/// 30s = 10 BSC slots, enough time for a peer to come up and send FCU if any are running.
-const SYNC_GATE_TIMEOUT_SECS: u64 = 30;
+/// 5s ≈ 11 Fermi slots (450 ms each), enough time for a peer to send FCU if any are running.
+const SYNC_GATE_TIMEOUT_SECS: u64 = 5;
 
 /// Tracks when the miner first encountered the sync gate. Used for timeout-based deadlock
 /// recovery when all validators restart simultaneously.
@@ -279,8 +279,11 @@ where
                 // attempt mining.
                 if let Some(tip) = self.get_tip_header_at_startup() {
                     if self.last_triggered_tip == Some(tip.hash()) {
-                        // Mining already triggered for this tip via a canonical event;
-                        // skip to avoid duplicate payload submissions.
+                        // A canonical event already triggered mining for this tip.
+                        // But if no new canonical events are arriving (all-validators-restart
+                        // deadlock), we must keep retrying via the ticker. Clear the guard
+                        // so the next tick fires even if the tip hasn't changed.
+                        self.last_triggered_tip = None;
                         continue;
                     }
                     debug!(
@@ -290,6 +293,10 @@ where
                     );
                     self.last_triggered_tip = Some(tip.hash());
                     self.try_new_work(&tip).await;
+                    // Clear so the next tick retries if try_new_work was skipped (e.g.
+                    // backfill still active). If a canonical event fires before the next
+                    // tick it will set last_triggered_tip again, preventing a duplicate.
+                    self.last_triggered_tip = None;
                 }
             }
             } // end tokio::select!
