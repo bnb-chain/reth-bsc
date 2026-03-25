@@ -265,3 +265,22 @@ pub async fn request_difflayer(
     }));
     rx.await.map_err(BSCEngineMessageError::internal)?.map_err(BSCEngineMessageError::internal)
 }
+
+/// Request the engine's execution cache for the given parent block hash.
+///
+/// Returns a cheap clone of the moka-based [`ExecutionCache`] accumulated by the engine
+/// during block import.  The clone is O(1) (Arc refcount bump only).  Returns `None` when
+/// triedb / the engine cache is unavailable.
+pub async fn request_execution_cache(
+    engine_api_tx: &BscEngineApiTx,
+    parent_hash: BlockHash,
+) -> Option<reth_engine_tree::tree::ExecutionCache> {
+    let (tx, rx) = oneshot::channel();
+    let _ = engine_api_tx
+        .send(EngineApiRequest::Custom(CustomRequestMessage::RequestExecutionCache {
+            parent_hash,
+            tx,
+            _phantom: std::marker::PhantomData,
+        }));
+    rx.await.ok().flatten()
+}

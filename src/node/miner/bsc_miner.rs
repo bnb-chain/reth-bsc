@@ -712,7 +712,8 @@ where
             cancel: ManualCancel::default(),
             trace_id: crate::node::miner::payload::generate_trace_id(),
             min_gas_tip: self.desired_min_gas_tip,
-            parent_difflayers: None, // populated once at job start via fetch_triedb_difflayers
+            parent_difflayers: None,    // populated once at job start via fetch_triedb_difflayers
+            parent_exec_cache: None,    // populated once at job start via fetch_execution_cache
         };
 
         let parent_hash = mining_ctx.parent_header.hash();

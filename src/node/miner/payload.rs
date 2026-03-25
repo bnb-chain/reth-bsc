@@ -126,6 +126,12 @@ pub struct BscBuildArguments<Attributes> {
     /// Fetched once at job creation and shared across all build attempts for the same parent.
     /// `None` when triedb is inactive or the fetch failed (graceful degradation to full trie).
     pub parent_difflayers: Option<DiffLayers>,
+    /// Engine execution cache snapshot for the parent block.
+    ///
+    /// Fetched once at job start; inserted as a middle DB layer between `CachedReads` and
+    /// `StateProviderDatabase` so that miner EVM reads hit the warm engine cache before
+    /// falling through to MDBX.  `None` when not available (graceful degradation).
+    pub parent_exec_cache: Option<reth_engine_tree::tree::ExecutionCache>,
 }
 
 /// BSC payload builder, used to build payload for bsc miner.
@@ -191,7 +197,7 @@ where
         args: BscBuildArguments<EthPayloadBuilderAttributes>,
     ) -> Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>> {
         let build_start = std::time::Instant::now();
-        let BscBuildArguments { mut cached_reads, config, cancel, trace_id, min_gas_tip, parent_difflayers } = args;
+        let BscBuildArguments { mut cached_reads, config, cancel, trace_id, min_gas_tip, parent_difflayers, parent_exec_cache } = args;
         let PayloadConfig { parent_header, attributes } = config;
 
         let parent_hash = parent_header.hash_slow();
@@ -200,8 +206,12 @@ where
 
         let state_provider = self.client.state_by_block_hash(parent_header.hash_slow())?;
         let state = StateProviderDatabase::new(&state_provider);
+        // Wrap state with the engine execution cache as a middle layer (if available) so that
+        // miner EVM reads hit the warm cache before falling through to MDBX.
+        let cache_db =
+            crate::node::miner::execution_cache_db::ExecutionCacheDb { cache: parent_exec_cache, inner: state };
         let mut db = State::builder()
-            .with_database(cached_reads.as_db_mut(state))
+            .with_database(cached_reads.as_db_mut(cache_db))
             .with_bundle_update()
             .build();
 
@@ -679,7 +689,7 @@ where
         args: BscBuildArguments<EthPayloadBuilderAttributes>,
     ) -> Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>> {
         let build_start = std::time::Instant::now();
-        let BscBuildArguments { mut cached_reads, config, cancel: _, trace_id, min_gas_tip: _, parent_difflayers } =
+        let BscBuildArguments { mut cached_reads, config, cancel: _, trace_id, min_gas_tip: _, parent_difflayers, parent_exec_cache } =
             args;
         let PayloadConfig { parent_header, attributes } = config;
 
@@ -689,8 +699,11 @@ where
 
         let state_provider = self.client.state_by_block_hash(parent_header.hash_slow())?;
         let state = StateProviderDatabase::new(&state_provider);
+        // Wrap state with the engine execution cache as a middle layer (if available).
+        let cache_db =
+            crate::node::miner::execution_cache_db::ExecutionCacheDb { cache: parent_exec_cache, inner: state };
         let mut db = State::builder()
-            .with_database(cached_reads.as_db_mut(state))
+            .with_database(cached_reads.as_db_mut(cache_db))
             .with_bundle_update()
             .build();
 
@@ -853,6 +866,30 @@ async fn fetch_triedb_difflayers(trace_id: u64, parent_hash: alloy_primitives::B
     }
 }
 
+/// Fetch the engine's execution cache for the given parent block.
+///
+/// Called once per payload job at startup; the result is stored in [`BscBuildArguments`] and
+/// shared across all build attempts for the same parent block.
+/// Returns `None` when the engine cache is unavailable — callers use the plain DB stack.
+async fn fetch_execution_cache(
+    trace_id: u64,
+    parent_hash: alloy_primitives::B256,
+) -> Option<reth_engine_tree::tree::ExecutionCache> {
+    let Some(engine_api_tx) = crate::shared::get_engine_api_tx() else {
+        return None;
+    };
+    let cache = crate::node::evm::request_execution_cache(&engine_api_tx, parent_hash).await;
+    if cache.is_none() {
+        debug!(
+            target: "payload_builder",
+            trace_id,
+            %parent_hash,
+            "Engine execution cache not available for parent; miner uses plain DB stack"
+        );
+    }
+    cache
+}
+
 /// Handle for aborting a BscPayloadJob
 pub struct BscPayloadJobHandle {
     abort_tx: oneshot::Sender<()>,
@@ -1008,13 +1045,14 @@ where
 
     /// Runs the payload job asynchronously with timeout support
     pub async fn start(mut self) -> Result<(), Box<BscPayloadJobError>> {
-        // Fetch parent difflayers once for all build attempts in this job.
-        // Stored in build_args so retries and empty-payload fallback share the same value.
-        self.build_args.parent_difflayers = fetch_triedb_difflayers(
-            self.trace_id,
-            self.build_args.config.parent_header.hash_slow(),
-        )
-        .await;
+        // Fetch parent difflayers and engine execution cache once for all build attempts in this
+        // job.  Both are stored in build_args so retries and empty-payload fallback share the
+        // same values.
+        let parent_hash = self.build_args.config.parent_header.hash_slow();
+        self.build_args.parent_difflayers =
+            fetch_triedb_difflayers(self.trace_id, parent_hash).await;
+        self.build_args.parent_exec_cache =
+            fetch_execution_cache(self.trace_id, parent_hash).await;
 
         let mut start_time = std::time::Instant::now();
         if let Err(err) = self.try_build_tx.send(()) {
