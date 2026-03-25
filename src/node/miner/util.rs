@@ -339,7 +339,8 @@ mod tests {
         let parent_snap =
             Snapshot::new(validators, 499, B256::random(), 500, Some(vote_addresses.clone()));
 
-        let resolved = resolve_epoch_validators(&parent_snap, &parent_header).unwrap();
+        let resolved =
+            resolve_epoch_validators(&parent_snap, &SealedHeader::seal_slow(parent_header)).unwrap();
 
         assert_eq!(resolved.0, parent_snap.validators);
         assert_eq!(resolved.1.len(), parent_snap.validators.len());
@@ -368,7 +369,8 @@ mod tests {
 
         let parent_snap =
             Snapshot::new(vec![Address::with_last_byte(1)], 799, B256::random(), 500, None);
-        let resolved = resolve_epoch_validators(&parent_snap, &parent_header).unwrap();
+        let resolved =
+            resolve_epoch_validators(&parent_snap, &SealedHeader::seal_slow(parent_header)).unwrap();
 
         assert_eq!(resolved.0, cached_validators);
         assert_eq!(resolved.1, cached_vote_addresses);
@@ -379,7 +381,9 @@ mod tests {
         let parent_header = unique_parent_header(999);
         let parent_snap = Snapshot::default();
 
-        let err = resolve_epoch_validators(&parent_snap, &parent_header).unwrap_err();
+        let err =
+            resolve_epoch_validators(&parent_snap, &SealedHeader::seal_slow(parent_header))
+                .unwrap_err();
         match err {
             SignerError::SigningFailed(msg) => {
                 assert!(msg.contains("Missing epoch validators"), "unexpected message: {}", msg);

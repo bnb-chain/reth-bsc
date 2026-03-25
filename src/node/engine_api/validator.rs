@@ -137,7 +137,7 @@ impl ExecutionPayload for BscExecutionData {
     }
 
     fn transaction_count(&self) -> usize {
-        self.0.body.inner.transactions.len()
+        self.block.body.inner.transactions.len()
     }
 }
 

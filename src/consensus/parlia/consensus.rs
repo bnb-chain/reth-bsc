@@ -761,7 +761,7 @@ where
             }
 
             tracing::debug!(target: "parlia::consensus", "vote count is less than 2/3 of validators, skip assemble vote attestation, number={}, parent={:?}, vote count={}, validators count={}", 
-                target_header.number(), target_hash, vote_count, snap.validators.len());
+                target_header.number(), target_hash, votes.len(), snap.validators.len());
             let block_hash = parent_hash;
             if let Some(header) =
                 crate::shared::get_canonical_header_by_hash_from_provider(&block_hash)
