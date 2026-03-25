@@ -548,18 +548,40 @@ mod tests {
 
     #[tokio::test]
     async fn can_handle_invalid_new_payload() {
+        // When new_payload returns Invalid, the peer should NOT be penalized.
+        // The only event emitted is the early ValidHeader announcement from
+        // on_new_block; no BlockImportOutcome error should follow.
         let mut fixture = TestFixture::new(EngineResponses::invalid_new_payload()).await;
         fixture
             .assert_block_import(|outcome| {
-                matches!(
-                    outcome,
-                    BlockImportEvent::Outcome(BlockImportOutcome {
-                        peer: _,
-                        result: Err(BlockImportError::Other(_))
-                    })
-                )
+                matches!(outcome, BlockImportEvent::Announcement(BlockValidation::ValidHeader { .. }))
             })
             .await;
+
+        // Verify no error outcome was emitted
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut extra = Vec::new();
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(200);
+        loop {
+            match fixture.handle.poll_outcome(&mut cx) {
+                Poll::Ready(Some(event)) => extra.push(event),
+                Poll::Ready(None) => break,
+                Poll::Pending => {
+                    if tokio::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+        assert!(
+            !extra.iter().any(|e| matches!(
+                e,
+                BlockImportEvent::Outcome(BlockImportOutcome { result: Err(_), .. })
+            )),
+            "Should not penalize peer for Invalid new_payload. Extra events: {extra:?}"
+        );
     }
 
     #[tokio::test]
