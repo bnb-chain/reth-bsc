@@ -1447,7 +1447,7 @@ where
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis();
-                if now_ms >= self.expected_end_timestamp_ms + 150 {
+                if now_ms >= self.expected_end_timestamp_ms {
                     if self.join_handle.len() != 0 {
                         debug!(
                             target: "bsc::miner::payload",
@@ -1475,7 +1475,7 @@ where
                 {
                     (self.expected_end_timestamp_ms - now_ms) as u64
                 } else {
-                    ((self.expected_end_timestamp_ms - now_ms) as u64) * 3 // wait more when not the last block in turn
+                    ((self.expected_end_timestamp_ms - now_ms) as u64) * 2 // wait more when not the last block in turn
                 };
                 if remaining_ms > 50 {
                     remaining_ms = 50;
