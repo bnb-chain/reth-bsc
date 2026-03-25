@@ -141,7 +141,8 @@ fn duration_mul_ratio(
     numerator: u32,
     denominator: u32,
 ) -> std::time::Duration {
-    let scaled_millis = duration.as_millis().saturating_mul(numerator as u128) / denominator as u128;
+    let scaled_millis =
+        duration.as_millis().saturating_mul(numerator as u128) / denominator as u128;
     std::time::Duration::from_millis(scaled_millis.min(u64::MAX as u128) as u64)
 }
 
@@ -1347,63 +1348,62 @@ where
                                             std::time::Duration::ZERO
                                         };
 
-                                        match self.evaluate_local_rebuild_action(fresh_remaining_duration) {
-                                            Some(action) => {
-                                                self.record_local_rebuild_decision_metrics(action);
-                                                match action {
-                                                    LocalRebuildAction::RebuildNow { final_shot } => {
-                                                        if final_shot {
-                                                            self.final_shot_used = true;
-                                                        }
-                                                        if let Err(err) = self.try_build_tx.send(()) {
-                                                            warn!(
-                                                                target: "bsc::miner::payload",
-                                                                trace_id = self.trace_id,
-                                                                block_number = self.build_args.config.parent_header.number() + 1,
-                                                                is_inturn = self.mining_ctx.is_inturn,
-                                                                retries = self.retries,
-                                                                error = ?err,
-                                                                "Failed to send to try build queue"
-                                                            );
-                                                            return self.try_return_best_payload();
-                                                        }
-                                                        debug!(
-                                                            target: "bsc::miner::payload",
-                                                            trace_id = self.trace_id,
-                                                            block_number = self.build_args.config.parent_header.number() + 1,
-                                                            is_inturn = self.mining_ctx.is_inturn,
-                                                            retries = self.retries,
-                                                            estimated_new_local_fees = %self.estimated_new_local_fees,
-                                                            current_local_payload_fees = %self.current_local_payload_fees,
-                                                            remaining_duration_ms = fresh_remaining_duration.as_millis(),
-                                                            last_cost_time = ?elapsed,
-                                                            final_shot,
-                                                            "Queued another payload build after local uplift re-evaluation"
-                                                        );
-                                                        break;
+                                        if let Some(action) =
+                                            self.evaluate_local_rebuild_action(fresh_remaining_duration)
+                                        {
+                                            self.record_local_rebuild_decision_metrics(action);
+                                            match action {
+                                                LocalRebuildAction::RebuildNow { final_shot } => {
+                                                    if final_shot {
+                                                        self.final_shot_used = true;
                                                     }
-                                                    LocalRebuildAction::ReturnBestPayload => {
-                                                        debug!(
+                                                    if let Err(err) = self.try_build_tx.send(()) {
+                                                        warn!(
                                                             target: "bsc::miner::payload",
                                                             trace_id = self.trace_id,
                                                             block_number = self.build_args.config.parent_header.number() + 1,
                                                             is_inturn = self.mining_ctx.is_inturn,
                                                             retries = self.retries,
-                                                            estimated_new_local_fees = %self.estimated_new_local_fees,
-                                                            current_local_payload_fees = %self.current_local_payload_fees,
-                                                            remaining_duration_ms = fresh_remaining_duration.as_millis(),
-                                                            last_cost_time = ?elapsed,
-                                                            "Returning best payload because there is not enough time left for another value-gated rebuild"
+                                                            error = ?err,
+                                                            "Failed to send to try build queue"
                                                         );
                                                         return self.try_return_best_payload();
                                                     }
-                                                    LocalRebuildAction::WaitForCooldown(wait_duration) => {
-                                                        wait_for_more_txs = Some(wait_duration);
-                                                    }
-                                                    LocalRebuildAction::WaitForMoreValue => {}
+                                                    debug!(
+                                                        target: "bsc::miner::payload",
+                                                        trace_id = self.trace_id,
+                                                        block_number = self.build_args.config.parent_header.number() + 1,
+                                                        is_inturn = self.mining_ctx.is_inturn,
+                                                        retries = self.retries,
+                                                        estimated_new_local_fees = %self.estimated_new_local_fees,
+                                                        current_local_payload_fees = %self.current_local_payload_fees,
+                                                        remaining_duration_ms = fresh_remaining_duration.as_millis(),
+                                                        last_cost_time = ?elapsed,
+                                                        final_shot,
+                                                        "Queued another payload build after local uplift re-evaluation"
+                                                    );
+                                                    break;
                                                 }
+                                                LocalRebuildAction::ReturnBestPayload => {
+                                                    debug!(
+                                                        target: "bsc::miner::payload",
+                                                        trace_id = self.trace_id,
+                                                        block_number = self.build_args.config.parent_header.number() + 1,
+                                                        is_inturn = self.mining_ctx.is_inturn,
+                                                        retries = self.retries,
+                                                        estimated_new_local_fees = %self.estimated_new_local_fees,
+                                                        current_local_payload_fees = %self.current_local_payload_fees,
+                                                        remaining_duration_ms = fresh_remaining_duration.as_millis(),
+                                                        last_cost_time = ?elapsed,
+                                                        "Returning best payload because there is not enough time left for another value-gated rebuild"
+                                                    );
+                                                    return self.try_return_best_payload();
+                                                }
+                                                LocalRebuildAction::WaitForCooldown(wait_duration) => {
+                                                    wait_for_more_txs = Some(wait_duration);
+                                                }
+                                                LocalRebuildAction::WaitForMoreValue => {}
                                             }
-                                            None => {}
                                         }
                                     }
 
@@ -1624,12 +1624,10 @@ where
 
     fn record_local_rebuild_decision_metrics(&self, action: LocalRebuildAction) {
         let metrics = miner_metrics();
-        metrics.payload_rebuild_estimated_uplift_bps.set(
-            estimated_uplift_bps(
-                self.current_local_payload_fees,
-                self.estimated_new_local_fees,
-            ) as f64,
-        );
+        metrics.payload_rebuild_estimated_uplift_bps.set(estimated_uplift_bps(
+            self.current_local_payload_fees,
+            self.estimated_new_local_fees,
+        ) as f64);
 
         match action {
             LocalRebuildAction::RebuildNow { final_shot } => {
@@ -2143,12 +2141,12 @@ mod tests {
                         rebuilds += 1;
                         return rebuilds;
                     }
-                    LocalRebuildAction::ReturnBestPayload | LocalRebuildAction::WaitForMoreValue => {
+                    LocalRebuildAction::ReturnBestPayload
+                    | LocalRebuildAction::WaitForMoreValue => {
                         break;
                     }
                     LocalRebuildAction::WaitForCooldown(wait_duration) => {
-                        wait_deadline_ms =
-                            Some(deadline_ms + wait_duration.as_millis() as u64);
+                        wait_deadline_ms = Some(deadline_ms + wait_duration.as_millis() as u64);
                     }
                 }
             }
