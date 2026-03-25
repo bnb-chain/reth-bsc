@@ -17,10 +17,16 @@ const LOWER_LIMIT_OF_VOTE_BLOCK_NUMBER: u64 = 256;
 /// Size of the LRU cache for tracking finality notifications (matches geth's finalizedNotified)
 const FINALIZED_NOTIFIED_CACHE_SIZE: usize = 21;
 
+#[derive(Clone)]
+struct VoteEntry {
+    hash: B256,
+    envelope: VoteEnvelope,
+}
+
 /// Container for votes associated with a specific block hash.
 #[derive(Default)]
 struct VoteMessages {
-    vote_messages: Vec<VoteEnvelope>,
+    vote_messages: Vec<VoteEntry>,
 }
 
 /// Priority queue wrapper for vote data, ordered by target_number (ascending).
@@ -71,6 +77,8 @@ struct VotePool {
     cur_votes: HashMap<B256, VoteMessages>,
     /// Priority queue for efficiently finding votes to prune.
     cur_votes_pq: VotesPriorityQueue,
+    /// Total number of votes stored in the pool.
+    total_votes: usize,
 }
 
 impl VotePool {
@@ -79,6 +87,7 @@ impl VotePool {
             received_votes: HashSet::new(),
             cur_votes: HashMap::new(),
             cur_votes_pq: VotesPriorityQueue::new(),
+            total_votes: 0,
         }
     }
 
@@ -95,17 +104,22 @@ impl VotePool {
             if !self.cur_votes.contains_key(&block_hash) {
                 self.cur_votes_pq.push(vote.data);
             }
-
-            self.cur_votes.entry(block_hash).or_default().vote_messages.push(vote);
+            self.cur_votes
+                .entry(block_hash)
+                .or_default()
+                .vote_messages
+                .push(VoteEntry { hash: vote_hash, envelope: vote });
+            self.total_votes += 1;
         }
     }
 
     fn drain(&mut self) -> Vec<VoteEnvelope> {
         self.received_votes.clear();
         self.cur_votes_pq = VotesPriorityQueue::new();
+        self.total_votes = 0;
         let mut all_votes = Vec::new();
         for (_, vote_messages) in self.cur_votes.drain() {
-            all_votes.extend(vote_messages.vote_messages);
+            all_votes.extend(vote_messages.vote_messages.into_iter().map(|entry| entry.envelope));
         }
         all_votes
     }
@@ -113,13 +127,13 @@ impl VotePool {
     fn get_votes(&self) -> Vec<VoteEnvelope> {
         let mut all_votes = Vec::new();
         for vote_messages in self.cur_votes.values() {
-            all_votes.extend(vote_messages.vote_messages.clone());
+            all_votes.extend(vote_messages.vote_messages.iter().map(|entry| entry.envelope.clone()));
         }
         all_votes
     }
 
     fn len(&self) -> usize {
-        self.cur_votes.values().map(|vm| vm.vote_messages.len()).sum()
+        self.total_votes
     }
 
     fn len_for_block(&self, block_hash: &B256) -> usize {
@@ -128,7 +142,11 @@ impl VotePool {
 
     fn fetch_vote_by_block_hash(&self, block_hash: B256) -> Vec<VoteEnvelope> {
         if let Some(vote_messages) = self.cur_votes.get(&block_hash) {
-            vote_messages.vote_messages.clone()
+            vote_messages
+                .vote_messages
+                .iter()
+                .map(|entry| entry.envelope.clone())
+                .collect()
         } else {
             Vec::new()
         }
@@ -158,9 +176,9 @@ impl VotePool {
 
                 // Remove from votes map and received_votes set
                 if let Some(vote_box) = self.cur_votes.remove(&block_hash) {
+                    self.total_votes = self.total_votes.saturating_sub(vote_box.vote_messages.len());
                     for vote in vote_box.vote_messages {
-                        let vote_hash = vote.hash();
-                        self.received_votes.remove(&vote_hash);
+                        self.received_votes.remove(&vote.hash);
                     }
                 }
             } else {

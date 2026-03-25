@@ -12,22 +12,23 @@ use crate::hardforks::BscHardforks;
 use crate::node::evm::pre_execution::VALIDATOR_CACHE;
 use crate::node::miner::bsc_miner::MiningContext;
 use crate::node::miner::signer::{seal_header_with_global_signer, SignerError};
-use alloy_consensus::Header;
+use alloy_consensus::{BlockHeader, Header};
 use alloy_primitives::{Address, Bytes, B256};
 use reth::payload::EthPayloadBuilderAttributes;
 use reth_chainspec::EthChainSpec;
+use reth_primitives::SealedHeader;
 use std::sync::Arc;
 
 fn resolve_epoch_validators(
     parent_snap: &Snapshot,
-    parent_header: &Header,
+    parent_header: &SealedHeader,
 ) -> Result<(Vec<Address>, Vec<VoteAddress>), SignerError> {
-    let parent_hash = parent_header.hash_slow();
+    let parent_hash = parent_header.hash();
     let mut cache = VALIDATOR_CACHE.lock().unwrap();
     if let Some(cached_result) = cache.get(&parent_hash) {
         tracing::debug!(
             "Succeed to query cached validator result, block_number: {}, block_hash: {}",
-            parent_header.number,
+            parent_header.number(),
             parent_hash
         );
         return Ok(cached_result.clone());
@@ -36,7 +37,7 @@ fn resolve_epoch_validators(
     if parent_snap.validators.is_empty() {
         return Err(SignerError::SigningFailed(format!(
             "Missing epoch validators for parent block {} ({})",
-            parent_header.number, parent_hash
+            parent_header.number(), parent_hash
         )));
     }
 
@@ -54,7 +55,7 @@ fn resolve_epoch_validators(
 
     tracing::warn!(
         target: "bsc::miner",
-        block_number = parent_header.number,
+        block_number = parent_header.number(),
         block_hash = %parent_hash,
         "Validator cache miss on epoch boundary, falling back to parent snapshot validators"
     );
@@ -65,11 +66,11 @@ fn resolve_epoch_validators(
 pub fn prepare_new_attributes(
     ctx: &mut MiningContext,
     parlia: Arc<Parlia<BscChainSpec>>,
-    parent_header: &Header,
+    parent_header: &SealedHeader,
     signer: Address,
 ) -> EthPayloadBuilderAttributes {
     let mut new_header = prepare_new_header(parlia.clone(), parent_header, signer);
-    parlia.prepare_timestamp(&ctx.parent_snapshot, parent_header, &mut new_header);
+    parlia.prepare_timestamp(&ctx.parent_snapshot, parent_header.header(), &mut new_header);
     let mut attributes = EthPayloadBuilderAttributes {
         parent: new_header.parent_hash,
         timestamp: new_header.timestamp,
@@ -91,19 +92,19 @@ pub fn prepare_new_attributes(
 /// prepare a tmp new header for preparing attributes.
 pub fn prepare_new_header<ChainSpec>(
     parlia: Arc<Parlia<ChainSpec>>,
-    parent_header: &Header,
+    parent_header: &SealedHeader,
     signer: Address,
 ) -> Header
 where
     ChainSpec: EthChainSpec + BscHardforks + 'static,
 {
     let mut timestamp = parlia.present_millis_timestamp() / 1000;
-    if parent_header.timestamp >= timestamp {
-        timestamp = parent_header.timestamp + 1;
+    if parent_header.timestamp() >= timestamp {
+        timestamp = parent_header.timestamp() + 1;
     }
     let mut new_header = Header {
-        number: parent_header.number + 1,
-        parent_hash: parent_header.hash_slow(),
+        number: parent_header.number() + 1,
+        parent_hash: parent_header.hash(),
         beneficiary: signer,
         // Set timestamp to present time (or parent + 1 if present time is not greater)
         // This avoids header.timestamp = 0 when back_off_time is called inside prepare_timestamp
@@ -120,7 +121,7 @@ where
             parlia.spec.as_ref(),
             new_header.number,
             new_header.timestamp,
-            parent_header,
+            parent_header.header(),
             blob_params,
         );
     }
@@ -132,7 +133,7 @@ where
 pub fn finalize_new_header<ChainSpec>(
     parlia: Arc<Parlia<ChainSpec>>,
     parent_snap: &Snapshot,
-    parent_header: &Header,
+    parent_header: &SealedHeader,
     new_header: &mut Header,
     snapshot_provider: &Arc<dyn SnapshotProvider + Send + Sync>,
 ) -> Result<(), crate::node::miner::signer::SignerError>
@@ -168,7 +169,7 @@ where
         .map_err(|e| SignerError::SigningFailed(format!("Failed to prepare turn length: {}", e)))?;
 
     if let Err(e) =
-        parlia.assemble_vote_attestation(parent_snap, parent_header, new_header, snapshot_provider)
+        parlia.assemble_vote_attestation(parent_snap, parent_header.header(), new_header, snapshot_provider)
     {
         tracing::warn!(
             target: "bsc::miner",
@@ -338,7 +339,8 @@ mod tests {
         let parent_snap =
             Snapshot::new(validators, 499, B256::random(), 500, Some(vote_addresses.clone()));
 
-        let resolved = resolve_epoch_validators(&parent_snap, &parent_header).unwrap();
+        let resolved =
+            resolve_epoch_validators(&parent_snap, &SealedHeader::seal_slow(parent_header)).unwrap();
 
         assert_eq!(resolved.0, parent_snap.validators);
         assert_eq!(resolved.1.len(), parent_snap.validators.len());
@@ -367,7 +369,8 @@ mod tests {
 
         let parent_snap =
             Snapshot::new(vec![Address::with_last_byte(1)], 799, B256::random(), 500, None);
-        let resolved = resolve_epoch_validators(&parent_snap, &parent_header).unwrap();
+        let resolved =
+            resolve_epoch_validators(&parent_snap, &SealedHeader::seal_slow(parent_header)).unwrap();
 
         assert_eq!(resolved.0, cached_validators);
         assert_eq!(resolved.1, cached_vote_addresses);
@@ -378,7 +381,9 @@ mod tests {
         let parent_header = unique_parent_header(999);
         let parent_snap = Snapshot::default();
 
-        let err = resolve_epoch_validators(&parent_snap, &parent_header).unwrap_err();
+        let err =
+            resolve_epoch_validators(&parent_snap, &SealedHeader::seal_slow(parent_header))
+                .unwrap_err();
         match err {
             SignerError::SigningFailed(msg) => {
                 assert!(msg.contains("Missing epoch validators"), "unexpected message: {}", msg);

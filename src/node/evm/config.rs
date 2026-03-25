@@ -15,7 +15,7 @@ use crate::{
 };
 use alloy_consensus::{transaction::SignerRecoverable, BlockHeader, Header, TxReceipt};
 use alloy_eips::eip7840::BlobParams;
-use alloy_primitives::{Address, Log, U256};
+use alloy_primitives::{Address, BlockHash, Log, U256};
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
 use reth_ethereum_forks::EthereumHardfork;
 use reth_evm::{
@@ -72,6 +72,8 @@ pub struct BscBlockExecutionCtx<'a> {
     pub base: EthBlockExecutionCtx<'a>,
     /// Block header (optional for BSC-specific logic).
     pub header: Option<Header>,
+    /// Block hash when known (sealed block), to avoid re-hashing.
+    pub header_hash: Option<BlockHash>,
     /// Whether the block is being mined.
     pub is_miner: bool,
 }
@@ -365,6 +367,7 @@ where
                 extra_data: block.header().extra_data.clone(),
             },
             header: Some(block.header().clone()),
+            header_hash: Some(block.hash()),
             is_miner: false,
         })
     }
@@ -385,6 +388,7 @@ where
                 extra_data: attributes.extra_data,
             },
             header: None, // No header available for next block context
+            header_hash: None,
             is_miner: true,
         })
     }
@@ -429,14 +433,14 @@ where
     Self: Send + Sync + Unpin + Clone + 'static,
 {
     fn evm_env_for_payload(&self, payload: &BscExecutionData) -> Result<EvmEnv<BscHardfork>, Self::Error> {
-        self.evm_env(&payload.0.header)
+        self.evm_env(&payload.block.header)
     }
 
     fn context_for_payload<'a>(
         &self,
         payload: &'a BscExecutionData,
     ) -> Result<BscBlockExecutionCtx<'a>, Self::Error> {
-        let block = &payload.0;
+        let block = &payload.block;
         Ok(BscBlockExecutionCtx {
             base: EthBlockExecutionCtx {
                 tx_count_hint: Some(block.body.inner.transactions.len()),
@@ -447,6 +451,7 @@ where
                 extra_data: block.header.extra_data.clone(),
             },
             header: Some(block.header.clone()),
+            header_hash: Some(payload.block_hash_cached()),
             is_miner: false,
         })
     }
@@ -455,7 +460,7 @@ where
         &self,
         payload: &BscExecutionData,
     ) -> Result<impl ExecutableTxIterator<Self>, Self::Error> {
-        let txs = payload.0.body.inner.transactions.clone();
+        let txs = payload.block.body.inner.transactions.clone();
         Ok((txs, |tx: TransactionSigned| tx.try_into_recovered()))
     }
 }
