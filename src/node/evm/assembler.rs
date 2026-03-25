@@ -182,7 +182,7 @@ where
                 .unwrap()
                 .get_header_by_hash(&header.parent_hash)
                 .ok_or(BlockExecutionError::msg("Failed to get header from global header reader"))?;
-            let parent_header = SealedHeader::seal_slow(parent_header);
+            let parent_header = SealedHeader::new(parent_header, header.parent_hash);
             let parent_snap = snapshot_provider
                 .snapshot_by_hash(&header.parent_hash)
                 .ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;
@@ -312,7 +312,7 @@ where
                 .unwrap()
                 .get_header_by_hash(&header.parent_hash)
                 .ok_or(BlockExecutionError::msg("Failed to get header from global header reader"))?;
-            let parent_header = SealedHeader::seal_slow(parent_header);
+            let parent_header = SealedHeader::new(parent_header, header.parent_hash);
             let parent_snap = snapshot_provider
                 .snapshot_by_hash(&header.parent_hash)
                 .ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;

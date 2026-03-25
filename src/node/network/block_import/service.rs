@@ -139,10 +139,32 @@ where
         let engine = self.engine.clone();
         let forkchoice_engine = self.forkchoice_engine.clone();
 
+        let announced_hash = block.hash;
         let block_hash = block.block.0.block.header.hash_slow();
         tracing::debug!(target: "bsc::block_import", "New payload: block = ({:?}, {:?}), peer_id = {:?}", block.block.0.block.header.number, block_hash, peer_id);
         Box::pin(async move {
-            let sealed_block = block.block.0.block.clone().seal();
+            if announced_hash != block_hash {
+                tracing::warn!(
+                    target: "bsc::block_import",
+                    number = block.block.0.block.header.number,
+                    announced_hash = %announced_hash,
+                    computed_hash = %block_hash,
+                    peer_id = %peer_id,
+                    "Rejecting new payload with mismatched announced hash"
+                );
+                return Outcome {
+                    peer: peer_id,
+                    result: Err(BlockImportError::Other(
+                        std::io::Error::other(format!(
+                            "announced block hash {announced_hash} does not match computed header hash {block_hash}"
+                        ))
+                        .into(),
+                    )),
+                }
+                .into()
+            }
+
+            let sealed_block = block.block.0.block.clone().seal_unchecked(block_hash);
             let header = sealed_block.header().clone();
             let payload = BscPayloadTypes::block_to_payload(sealed_block);
             match engine.new_payload(payload).await {
@@ -235,7 +257,7 @@ where
 
         // send to EVN peers first
         if let Err(e) = self.transfer_to_evn_peers(block_msg.clone()) {
-            tracing::warn!(target: "bsc::block_import", "Failed to transfer block to EVN peers: number = {:?}, hash = {:?}, error = {}", block.header.number, block.header.hash_slow(), e);
+            tracing::warn!(target: "bsc::block_import", "Failed to transfer block to EVN peers: number = {:?}, hash = {:?}, error = {}", block.header.number, block_hash, e);
         }
         // Send ValidHeader announcement to trigger NewBlock diffusion from few peers
         let _ =
@@ -520,6 +542,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_new_payload_with_mismatched_announced_hash() {
+        let mut fixture = TestFixture::new(EngineResponses::both_valid()).await;
+        let mut block_msg = create_test_block();
+        block_msg.hash = B256::random();
+
+        fixture
+            .assert_block_import_with_block(block_msg, |outcome| {
+                matches!(
+                    outcome,
+                    BlockImportEvent::Outcome(BlockImportOutcome {
+                        peer: _,
+                        result: Err(BlockImportError::Other(_))
+                    })
+                )
+            })
+            .await;
+    }
+
+    #[tokio::test]
     async fn deduplicates_blocks() {
         let mut fixture = TestFixture::new(EngineResponses::both_valid()).await;
 
@@ -776,6 +817,16 @@ mod tests {
             F: Fn(&BlockImportEvent<BscNewBlock>) -> bool,
         {
             let block_msg = create_test_block();
+            self.assert_block_import_with_block(block_msg, assert_fn).await;
+        }
+
+        async fn assert_block_import_with_block<F>(
+            &mut self,
+            block_msg: NewBlockMessage<BscNewBlock>,
+            assert_fn: F,
+        ) where
+            F: Fn(&BlockImportEvent<BscNewBlock>) -> bool,
+        {
             self.handle.send_block(block_msg, PeerId::random()).unwrap();
 
             let waker = futures::task::noop_waker();

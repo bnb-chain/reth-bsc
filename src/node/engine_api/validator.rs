@@ -66,7 +66,8 @@ impl BscExecutionData {
         Self { block, hash: OnceLock::new() }
     }
 
-    pub fn new_with_hash(block: BscBlock, hash: B256) -> Self {
+    /// Seeds the hash cache from a trusted sealed-block source.
+    pub(crate) fn new_with_hash(block: BscBlock, hash: B256) -> Self {
         let lock = OnceLock::new();
         let _ = lock.set(hash);
         Self { block, hash: lock }
@@ -74,6 +75,10 @@ impl BscExecutionData {
 
     pub fn block_hash_cached(&self) -> B256 {
         *self.hash.get_or_init(|| self.block.header.hash_slow())
+    }
+
+    pub(crate) fn cached_hash(&self) -> Option<B256> {
+        self.hash.get().copied()
     }
 
     pub fn into_block(self) -> BscBlock {
@@ -184,15 +189,24 @@ where
         &self,
         payload: BscExecutionData,
     ) -> Result<SealedBlock<BscBlock>, PayloadError> {
-        let header_hash = payload.block.header.hash_slow();
-        if let Some(cached_hash) = payload.hash.get() {
-            if *cached_hash != header_hash {
-                return Err(PayloadError::BlockHash {
-                    execution: header_hash,
-                    consensus: *cached_hash,
-                })?
+        let header_hash = if let Some(cached_hash) = payload.cached_hash() {
+            // Cached hashes are seeded only from trusted internal sealed-block producers.
+            // Keep a debug assertion here to catch any future misuse without paying the
+            // recomputation cost on the hot path in release builds.
+            #[cfg(debug_assertions)]
+            {
+                let computed_hash = payload.block.header.hash_slow();
+                if cached_hash != computed_hash {
+                    return Err(PayloadError::BlockHash {
+                        execution: computed_hash,
+                        consensus: cached_hash,
+                    })?
+                }
             }
-        }
+            cached_hash
+        } else {
+            payload.block.header.hash_slow()
+        };
 
         let block = payload.into_block();
         Ok(block.seal_unchecked(header_hash))

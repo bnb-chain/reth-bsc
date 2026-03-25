@@ -2,15 +2,18 @@
 
 #[cfg(test)]
 mod tests {
+    use crate::node::engine_api::payload::BscPayloadTypes;
     use crate::node::engine_api::validator::{BscEngineValidator, BscExecutionData};
     use crate::chainspec::bsc::bsc_mainnet;
     use crate::{BscBlock, BscBlockBody};
     use crate::chainspec::BscChainSpec;
     use alloy_consensus::Header;
     use alloy_primitives::{Address, B256, U256};
-    use std::sync::Arc;
     use reth_ethereum_primitives::BlockBody;
     use reth_engine_primitives::ExecutionPayload;
+    use reth_payload_primitives::PayloadTypes;
+    use reth_primitives_traits::Block;
+    use std::sync::Arc;
 
     /// Helper function to create a test block
     fn create_test_block(number: u64, parent_hash: B256) -> BscBlock {
@@ -59,6 +62,35 @@ mod tests {
         let expected_hash = block.header.hash_slow();
         let execution_data = BscExecutionData::new(block);
         
+        assert_eq!(execution_data.block_hash(), expected_hash);
+    }
+
+    #[test]
+    fn test_execution_data_new_with_hash_uses_seeded_hash() {
+        let block = create_test_block(1, B256::random());
+        let expected_hash = block.header.hash_slow();
+        let execution_data = BscExecutionData::new_with_hash(block, expected_hash);
+
+        assert_eq!(execution_data.block_hash(), expected_hash);
+    }
+
+    #[test]
+    fn test_execution_data_clone_preserves_seeded_hash() {
+        let block = create_test_block(1, B256::random());
+        let expected_hash = block.header.hash_slow();
+        let execution_data = BscExecutionData::new_with_hash(block, expected_hash);
+        let cloned = execution_data.clone();
+
+        assert_eq!(cloned.block_hash(), expected_hash);
+    }
+
+    #[test]
+    fn test_block_to_payload_preserves_known_hash() {
+        let block = create_test_block(1, B256::random());
+        let expected_hash = block.header.hash_slow();
+        let sealed_block = block.seal_unchecked(expected_hash);
+        let execution_data = BscPayloadTypes::block_to_payload(sealed_block);
+
         assert_eq!(execution_data.block_hash(), expected_hash);
     }
 
