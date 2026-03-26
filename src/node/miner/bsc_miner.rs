@@ -1082,6 +1082,7 @@ where
         MINER_METRICS
             .block_trie_root_duration_seconds
             .record(payload.trie_root_duration.as_secs_f64());
+        MINER_METRICS.blocks_produced_total.increment(1);
 
         let gas_used_mgas = sealed_block.gas_used() as f64 / 1_000_000.0;
         MINER_METRICS.best_work_gas_used_mgas.set(gas_used_mgas);
