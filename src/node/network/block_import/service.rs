@@ -29,7 +29,7 @@ use reth_network::{
     message::{BlockRequest, PeerResponse},
     FetchClient, NetworkHandle,
 };
-use reth_network_api::PeerId;
+use reth_network_api::{PeerId, Peers, ReputationChangeKind};
 use reth_node_ethereum::EthEngineTypes;
 use reth_payload_builder_primitives::Events;
 use reth_payload_primitives::{BuiltPayload, EngineApiMessageVersion, PayloadTypes};
@@ -311,6 +311,34 @@ where
     /// Add a new block import task to the pending imports
     fn on_new_block(&mut self, block: BlockMsg, peer_id: PeerId) {
         tracing::debug!(target: "bsc::block_import", "Receiving new block from network: number = {:?}, hash = {:?}, peer = {:?}", block.block.0.block.header.number, block.hash, peer_id);
+
+        // Drop blocks that are far behind the canonical head early to avoid wasting
+        // resources on stale blocks from misbehaving or out-of-sync peers. Without this
+        // guard, proof workers open read transactions against cold historical trie pages,
+        // blocking until db.read-transaction-timeout (5 min default) is hit.
+        const MAX_STALE_BLOCK_DISTANCE: u64 = 64;
+        if let Ok(info) = self.forkchoice_engine.provider.chain_info() {
+            let block_number = block.block.0.block.header.number;
+            if block_number + MAX_STALE_BLOCK_DISTANCE < info.best_number {
+                tracing::debug!(
+                    target: "bsc::block_import",
+                    block_number,
+                    block_hash = %block.hash,
+                    canonical_head = info.best_number,
+                    gap = info.best_number - block_number,
+                    peer_id = %peer_id,
+                    "Dropping stale block far behind canonical head"
+                );
+                // Apply a lightweight reputation penalty so peers that repeatedly send
+                // stale blocks are gradually deprioritized (BadAnnouncement = -1024,
+                // needs ~50 hits to reach ban threshold).
+                if let Some(net) = crate::shared::get_network_handle() {
+                    net.reputation_change(peer_id, ReputationChangeKind::BadAnnouncement);
+                }
+                return;
+            }
+        }
+
         if self.processed_blocks.contains(&block.hash) {
             tracing::trace!(target: "bsc::block_import", "Block already processed when receiving new block: number = {:?}, hash = {:?}", block.block.0.block.header.number, block.hash);
             return;
