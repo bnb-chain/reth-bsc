@@ -4,10 +4,14 @@ use crate::node::network::block_import::service::{IncomingBlock, IncomingMinedBl
 use crate::node::network::BscNetworkPrimitives;
 use crate::node::primitives::BscBlock;
 use alloy_consensus::{BlockHeader, Header};
-use alloy_rlp::Encodable;
 use alloy_eips::BlockId;
-use alloy_primitives::{B256, Bytes, U256};
-use reth_primitives::TransactionSigned;
+use alloy_primitives::{Bytes, B256, U256};
+use alloy_rlp::Encodable;
+use alloy_rpc_types::{
+    state::StateOverride, Block as RpcBlock, BlockOverrides, Header as RpcHeader,
+    Receipt as RpcReceipt, Transaction as RpcTransaction,
+    TransactionRequest as RpcTransactionRequest,
+};
 use parking_lot::Mutex;
 use reth::api::NodeTypesWithDBAdapter;
 use reth_engine_tree::engine::EngineApiRequest;
@@ -15,6 +19,7 @@ use reth_network::NetworkHandle;
 use reth_network_api::PeerId;
 use reth_provider::providers::BlockchainProvider;
 use reth_payload_builder_primitives::Events;
+use reth_primitives::TransactionSigned;
 use reth_provider::{BlockNumReader, HeaderProvider};
 use schnellru::{ByLength, LruMap};
 use std::collections::VecDeque;
@@ -23,9 +28,6 @@ use std::sync::RwLock;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::UnboundedSender;
-use alloy_rpc_types::{
-    Block as RpcBlock, BlockOverrides, Header as RpcHeader, Receipt as RpcReceipt, Transaction as RpcTransaction, TransactionRequest as RpcTransactionRequest, state::StateOverride
-};
 
 /// Public type alias for the BSC engine API sender (replaces private reth EngineApiTx).
 pub type BscEngineApiTx = UnboundedSender<
@@ -87,6 +89,30 @@ static IMPORTED_BLOCKS_TX: OnceLock<broadcast::Sender<B256>> = OnceLock::new();
 
 /// Global MEV running status
 static MEV_RUNNING: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+/// Global builder whitelist shared between miner and mev RPC namespaces
+static BUILDER_WHITELIST: OnceLock<
+    Arc<RwLock<std::collections::HashSet<alloy_primitives::Address>>>,
+> = OnceLock::new();
+
+// ============ Miner Dynamic Config ============
+// These allow miner_* RPC methods to update mining parameters at runtime.
+// Initialized from MiningConfig at startup; read by the miner workers.
+
+use std::sync::atomic::AtomicU64;
+
+/// Dynamic gas limit (set by miner_setGasLimit)
+static MINER_GAS_LIMIT: OnceLock<AtomicU64> = OnceLock::new();
+/// Dynamic min gas tip in wei (set by miner_setGasPrice), stored as u64
+static MINER_GAS_TIP: OnceLock<AtomicU64> = OnceLock::new();
+/// Dynamic etherbase / coinbase address (set by miner_setEtherbase)
+static MINER_ETHERBASE: OnceLock<RwLock<alloy_primitives::Address>> = OnceLock::new();
+/// Dynamic extra data bytes (set by miner_setExtra)
+static MINER_EXTRA: OnceLock<RwLock<alloy_primitives::Bytes>> = OnceLock::new();
+/// Dynamic recommit interval in milliseconds (set by miner_setRecommitInterval)
+static MINER_RECOMMIT_INTERVAL_MS: OnceLock<AtomicU64> = OnceLock::new();
+/// Mining enabled flag (set by miner_start / miner_stop)
+static MINING_ENABLED: OnceLock<AtomicBool> = OnceLock::new();
+
 /// Global proxyed peer IDs list
 static PROXYED_PEER_IDS: OnceLock<Vec<PeerId>> = OnceLock::new();
 
@@ -528,6 +554,160 @@ pub fn is_mev_running() -> bool {
     MEV_RUNNING.get().map(|status| status.load(Ordering::Relaxed)).unwrap_or(false)
 }
 
+/// Start MEV - set the global MEV running status to true
+pub fn start_mev() {
+    if let Some(status) = MEV_RUNNING.get() {
+        status.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Stop MEV - set the global MEV running status to false
+pub fn stop_mev() {
+    if let Some(status) = MEV_RUNNING.get() {
+        status.store(false, Ordering::Relaxed);
+    }
+}
+
+// ============ Builder Whitelist ============
+
+/// Initialize the global builder whitelist (called once during setup)
+pub fn init_builder_whitelist(
+    builders: std::collections::HashSet<alloy_primitives::Address>,
+) -> Arc<RwLock<std::collections::HashSet<alloy_primitives::Address>>> {
+    let whitelist = Arc::new(RwLock::new(builders));
+    let _ = BUILDER_WHITELIST.set(whitelist.clone());
+    whitelist
+}
+
+/// Get the global builder whitelist
+pub fn get_builder_whitelist(
+) -> Option<&'static Arc<RwLock<std::collections::HashSet<alloy_primitives::Address>>>> {
+    BUILDER_WHITELIST.get()
+}
+
+/// Add a builder to the global whitelist
+pub fn add_builder(builder: alloy_primitives::Address) -> bool {
+    if let Some(whitelist) = BUILDER_WHITELIST.get() {
+        if let Ok(mut set) = whitelist.write() {
+            return set.insert(builder);
+        }
+    }
+    false
+}
+
+/// Remove a builder from the global whitelist
+pub fn remove_builder(builder: &alloy_primitives::Address) -> bool {
+    if let Some(whitelist) = BUILDER_WHITELIST.get() {
+        if let Ok(mut set) = whitelist.write() {
+            return set.remove(builder);
+        }
+    }
+    false
+}
+
+/// Check if a builder is in the global whitelist
+pub fn is_builder_allowed(builder: &alloy_primitives::Address) -> bool {
+    if let Some(whitelist) = BUILDER_WHITELIST.get() {
+        if let Ok(set) = whitelist.read() {
+            return set.contains(builder);
+        }
+    }
+    false
+}
+
+// ============ Miner Dynamic Config Accessors ============
+
+/// Initialize all miner dynamic config from MiningConfig (called once at miner startup).
+/// If not called, getters return the fallback defaults.
+pub fn init_miner_dynamic_config(
+    gas_limit: u64,
+    gas_tip: u64,
+    validator_address: alloy_primitives::Address,
+) {
+    let _ = MINER_GAS_LIMIT.set(AtomicU64::new(gas_limit));
+    let _ = MINER_GAS_TIP.set(AtomicU64::new(gas_tip));
+    let _ = MINER_ETHERBASE.set(RwLock::new(validator_address));
+    let _ = MINER_EXTRA.set(RwLock::new(alloy_primitives::Bytes::new()));
+    let _ = MINER_RECOMMIT_INTERVAL_MS.set(AtomicU64::new(0));
+    let _ = MINING_ENABLED.set(AtomicBool::new(true));
+}
+
+// --- gas limit ---
+
+pub fn set_miner_gas_limit(val: u64) {
+    if let Some(v) = MINER_GAS_LIMIT.get() {
+        v.store(val, Ordering::Relaxed);
+    }
+}
+
+pub fn get_miner_gas_limit() -> Option<u64> {
+    MINER_GAS_LIMIT.get().map(|v| v.load(Ordering::Relaxed))
+}
+
+// --- gas tip (gas price) ---
+
+pub fn set_miner_gas_tip(val: u64) {
+    if let Some(v) = MINER_GAS_TIP.get() {
+        v.store(val, Ordering::Relaxed);
+    }
+}
+
+pub fn get_miner_gas_tip() -> Option<u64> {
+    MINER_GAS_TIP.get().map(|v| v.load(Ordering::Relaxed))
+}
+
+// --- etherbase ---
+
+pub fn set_miner_etherbase(addr: alloy_primitives::Address) {
+    if let Some(lock) = MINER_ETHERBASE.get() {
+        if let Ok(mut guard) = lock.write() {
+            *guard = addr;
+        }
+    }
+}
+
+pub fn get_miner_etherbase() -> Option<alloy_primitives::Address> {
+    MINER_ETHERBASE.get().and_then(|lock| lock.read().ok().map(|g| *g))
+}
+
+// --- extra data ---
+
+pub fn set_miner_extra(data: alloy_primitives::Bytes) {
+    if let Some(lock) = MINER_EXTRA.get() {
+        if let Ok(mut guard) = lock.write() {
+            *guard = data;
+        }
+    }
+}
+
+pub fn get_miner_extra() -> Option<alloy_primitives::Bytes> {
+    MINER_EXTRA.get().and_then(|lock| lock.read().ok().map(|g| g.clone()))
+}
+
+// --- recommit interval ---
+
+pub fn set_miner_recommit_interval_ms(val: u64) {
+    if let Some(v) = MINER_RECOMMIT_INTERVAL_MS.get() {
+        v.store(val, Ordering::Relaxed);
+    }
+}
+
+pub fn get_miner_recommit_interval_ms() -> Option<u64> {
+    MINER_RECOMMIT_INTERVAL_MS.get().map(|v| v.load(Ordering::Relaxed))
+}
+
+// --- mining enabled ---
+
+pub fn set_mining_enabled(val: bool) {
+    if let Some(v) = MINING_ENABLED.get() {
+        v.store(val, Ordering::Relaxed);
+    }
+}
+
+pub fn is_mining_enabled() -> bool {
+    MINING_ENABLED.get().map(|v| v.load(Ordering::Relaxed)).unwrap_or(false)
+}
+
 // ============= IPC client ===============
 pub static IPC_CLIENT: OnceLock<Arc<jsonrpsee::async_client::Client>> = OnceLock::new();
 
@@ -537,7 +717,9 @@ pub async fn set_ipc_client(path: String) -> Result<(), eyre::Error> {
         .build(&path)
         .await
         .map_err(|e| eyre::eyre!("Failed to build RPC client: {:?}", e))?;
-    IPC_CLIENT.set(Arc::new(client)).map_err(|e| eyre::eyre!("Failed to set RPC client: {:?}", e))?;
+    IPC_CLIENT
+        .set(Arc::new(client))
+        .map_err(|e| eyre::eyre!("Failed to set RPC client: {:?}", e))?;
     Ok(())
 }
 
@@ -587,9 +769,7 @@ pub async fn ipc_estimate_gas(
     .map_err(|e| eyre::eyre!("failed to query chain id from healthy node: {e}"))
 }
 
-pub async fn ipc_send_transaction(
-    req: RpcTransactionRequest,
-) -> Result<B256, eyre::Error> {
+pub async fn ipc_send_transaction(req: RpcTransactionRequest) -> Result<B256, eyre::Error> {
     let client = get_ipc_client().ok_or(eyre::eyre!("Failed to get RPC client"))?;
     reth_rpc_eth_api::EthApiClient::<
         RpcTransactionRequest,
@@ -604,9 +784,7 @@ pub async fn ipc_send_transaction(
 }
 
 /// Send a raw signed transaction via IPC (eth_sendRawTransaction)
-pub async fn ipc_send_raw_transaction(
-    tx: TransactionSigned,
-)-> Result<B256, eyre::Error> {
+pub async fn ipc_send_raw_transaction(tx: TransactionSigned) -> Result<B256, eyre::Error> {
     let client = get_ipc_client().ok_or(eyre::eyre!("Failed to get RPC client"))?;
     let mut buf = Vec::new();
     tx.encode(&mut buf);

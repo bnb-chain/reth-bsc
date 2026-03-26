@@ -240,6 +240,31 @@ pub struct BscBlockchainMetrics {
     pub latest_reorg_depth: Gauge,
 }
 
+/// Chain delay metrics matching geth `chain/delay/*` metrics.
+///
+/// These track the delay between block creation (timestamp) and various events.
+/// Values are recorded in milliseconds to match geth's behavior.
+#[derive(Metrics, Clone)]
+#[metrics(scope = "chain.delay")]
+pub struct BscChainDelayMetrics {
+    /// Delay from block timestamp to when block was first received from network
+    pub block_recv: Histogram,
+    /// Delay from block timestamp to first vote received for the block
+    pub vote_first: Histogram,
+    /// Delay from block timestamp to majority (14+) votes received for the block
+    pub vote_majority: Histogram,
+}
+
+/// Parlia consensus metrics with geth-compatible naming.
+///
+/// Separated from `BscConsensusMetrics` to match geth's `parlia/*` metric namespace.
+#[derive(Metrics, Clone)]
+#[metrics(scope = "parlia")]
+pub struct BscParliaGethMetrics {
+    /// Double sign events detected (matches geth `parlia/doublesign`)
+    pub doublesign: Counter,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -3,6 +3,7 @@ use crate::consensus::eip4844::{calc_blob_fee, is_blob_eligible_block, BLOB_TX_B
 use crate::consensus::parlia::Parlia;
 use crate::evm::blacklist;
 use crate::hardforks::BscHardforks;
+use crate::metrics::BscMinerMetrics;
 use crate::node::engine::{BscBuiltPayload, BuildKind};
 use crate::node::evm::config::{BscEvmConfig, BscNextBlockEnvAttributes};
 use crate::node::evm::{request_difflayer, MinerTrieDbPrefetcher};
@@ -60,6 +61,10 @@ const TIME_MULTIPLIER: u32 = 2;
 
 /// Global trace ID counter for payload building operations
 static TRACE_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Module-level miner metrics singleton
+static MINER_METRICS: once_cell::sync::Lazy<BscMinerMetrics> =
+    once_cell::sync::Lazy::new(BscMinerMetrics::default);
 
 /// Generate a unique trace ID for payload building
 pub fn generate_trace_id() -> u64 {
@@ -582,10 +587,6 @@ where
         let mut sealed_block = Arc::new(block.sealed_block().clone());
 
         // Update miner metrics
-        use crate::metrics::BscMinerMetrics;
-        use once_cell::sync::Lazy;
-        static MINER_METRICS: Lazy<BscMinerMetrics> = Lazy::new(BscMinerMetrics::default);
-
         let finalize_elapsed = finalize_start.elapsed();
         let finalize_duration = finalize_elapsed.as_secs_f64();
         MINER_METRICS.block_finalize_duration_seconds.record(finalize_duration);
@@ -771,10 +772,6 @@ where
         let sealed_block = Arc::new(block.sealed_block().clone());
 
         // Update miner metrics
-        use crate::metrics::BscMinerMetrics;
-        use once_cell::sync::Lazy;
-        static MINER_METRICS: Lazy<BscMinerMetrics> = Lazy::new(BscMinerMetrics::default);
-
         let finalize_duration = finalize_start.elapsed().as_secs_f64();
         MINER_METRICS.block_finalize_duration_seconds.record(finalize_duration);
         MINER_METRICS.blocks_produced_total.increment(1);
@@ -1622,12 +1619,7 @@ where
         } else {
             // No best payload available
             let total_job_duration = self.job_start_time.elapsed();
-            {
-                use crate::metrics::BscMinerMetrics;
-                use once_cell::sync::Lazy;
-                static MINER_METRICS: Lazy<BscMinerMetrics> = Lazy::new(BscMinerMetrics::default);
-                MINER_METRICS.no_best_payload_total.increment(1);
-            }
+            MINER_METRICS.no_best_payload_total.increment(1);
 
             if self.mining_ctx.is_inturn {
                 warn!(

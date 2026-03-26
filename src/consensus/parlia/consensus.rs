@@ -767,13 +767,12 @@ where
         let mut target_header = parent_header.clone();
         let mut target_header_parent_snap = None;
         for _ in 0..times {
-            let snap = snapshot_provider.snapshot_by_hash(&target_header.parent_hash()).ok_or(
-                ParliaConsensusError::SnapshotNotFound { block_hash: target_header.parent_hash() },
+            let parent_hash = target_header.parent_hash();
+            let target_hash = target_header.hash_slow();
+            let snap = snapshot_provider.snapshot_by_hash(&parent_hash).ok_or(
+                ParliaConsensusError::SnapshotNotFound { block_hash: parent_hash },
             )?;
-            votes = fetch_vote_by_block_hash_and_source_number(
-                target_header.hash_slow(),
-                justified_number,
-            );
+            votes = fetch_vote_by_block_hash_and_source_number(target_hash, justified_number);
             let quorum = usize::div_ceil(snap.validators.len() * 2, 3);
             if votes.len() >= quorum {
                 target_header_parent_snap = Some(snap);
@@ -781,8 +780,8 @@ where
             }
 
             tracing::debug!(target: "parlia::consensus", "vote count is less than 2/3 of validators, skip assemble vote attestation, number={}, parent={:?}, vote count={}, validators count={}", 
-                target_header.number(), target_header.hash_slow(), votes.len(), snap.validators.len());
-            let block_hash = target_header.parent_hash();
+                target_header.number(), target_hash, votes.len(), snap.validators.len());
+            let block_hash = parent_hash;
             if let Some(header) =
                 crate::shared::get_canonical_header_by_hash_from_provider(&block_hash)
             {

@@ -16,7 +16,7 @@ use reth_chainspec::{ChainSpec, EthChainSpec};
 use reth_ethereum_forks::Hardforks;
 use reth_primitives::{Transaction, TransactionSigned};
 use revm::state::Bytecode;
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 use thiserror::Error;
 use tracing::info;
 
@@ -26,23 +26,41 @@ pub mod feynman_fork;
 
 pub(crate) struct SystemContract<Spec: EthChainSpec> {
     /// The validator set abi before luban.
-    validator_abi_before_luban: JsonAbi,
+    validator_abi_before_luban: Arc<JsonAbi>,
     /// The validator contract abi.
-    validator_abi: JsonAbi,
+    validator_abi: Arc<JsonAbi>,
     /// The slash abi.
-    slash_abi: JsonAbi,
+    slash_abi: Arc<JsonAbi>,
     /// The stake hub abi.
-    stake_hub_abi: JsonAbi,
+    stake_hub_abi: Arc<JsonAbi>,
     /// The chain spec.
     chain_spec: Spec,
 }
 
+lazy_static! {
+    static ref VALIDATOR_SET_ABI_BEFORE_LUBAN_JSON: Arc<JsonAbi> = Arc::new(
+        serde_json::from_str(*VALIDATOR_SET_ABI_BEFORE_LUBAN)
+            .expect("validator set ABI before Luban JSON is valid")
+    );
+    static ref VALIDATOR_SET_ABI_JSON: Arc<JsonAbi> = Arc::new(
+        serde_json::from_str(*VALIDATOR_SET_ABI)
+            .expect("validator set ABI JSON is valid")
+    );
+    static ref SLASH_INDICATOR_ABI_JSON: Arc<JsonAbi> = Arc::new(
+        serde_json::from_str(*SLASH_INDICATOR_ABI)
+            .expect("slash indicator ABI JSON is valid")
+    );
+    static ref STAKE_HUB_ABI_JSON: Arc<JsonAbi> = Arc::new(
+        serde_json::from_str(*STAKE_HUB_ABI).expect("stake hub ABI JSON is valid")
+    );
+}
+
 impl<Spec: EthChainSpec + crate::hardforks::BscHardforks> SystemContract<Spec> {
     pub(crate) fn new(chain_spec: Spec) -> Self {
-        let validator_abi_before_luban = serde_json::from_str(*VALIDATOR_SET_ABI_BEFORE_LUBAN).unwrap();
-        let validator_abi = serde_json::from_str(*VALIDATOR_SET_ABI).unwrap();
-        let slash_abi = serde_json::from_str(*SLASH_INDICATOR_ABI).unwrap();
-        let stake_hub_abi = serde_json::from_str(*STAKE_HUB_ABI).unwrap();
+        let validator_abi_before_luban = Arc::clone(&VALIDATOR_SET_ABI_BEFORE_LUBAN_JSON);
+        let validator_abi = Arc::clone(&VALIDATOR_SET_ABI_JSON);
+        let slash_abi = Arc::clone(&SLASH_INDICATOR_ABI_JSON);
+        let stake_hub_abi = Arc::clone(&STAKE_HUB_ABI_JSON);
         Self { validator_abi_before_luban, validator_abi, slash_abi, stake_hub_abi, chain_spec }
     }
 
