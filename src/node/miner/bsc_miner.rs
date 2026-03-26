@@ -356,6 +356,12 @@ where
     where
         H: alloy_consensus::BlockHeader + Sealable,
     {
+        // Check if mining is disabled via miner_stop RPC
+        if !crate::shared::is_mining_enabled() {
+            debug!("Skip mining: mining is disabled via miner_stop RPC");
+            return;
+        }
+
         // TODO: refine check is_syncing status.
         if tip.timestamp()
             < SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() - 3
@@ -614,12 +620,17 @@ where
             self.validator_address,
         );
 
+        // Read dynamic config from shared state (updated by miner_* RPC), fall back to init values
+        let gas_limit = crate::shared::get_miner_gas_limit().unwrap_or(self.desired_gas_limit);
+        let min_gas_tip =
+            crate::shared::get_miner_gas_tip().map(|v| v as u128).unwrap_or(self.desired_min_gas_tip);
+
         let evm_config = BscEvmConfig::new(self.chain_spec.clone());
         let payload_builder = BscPayloadBuilder::new(
             self.provider.clone(),
             self.pool.clone(),
             evm_config,
-            EthereumBuilderConfig::new().with_gas_limit(self.desired_gas_limit),
+            EthereumBuilderConfig::new().with_gas_limit(gas_limit),
             self.chain_spec.clone(),
             self.parlia.clone(),
             mining_ctx.clone(),
@@ -629,7 +640,7 @@ where
             config: PayloadConfig::new(Arc::new(mining_ctx.parent_header.clone()), attributes),
             cancel: ManualCancel::default(),
             trace_id: crate::node::miner::payload::generate_trace_id(),
-            min_gas_tip: self.desired_min_gas_tip,
+            min_gas_tip,
         };
 
         let parent_hash = mining_ctx.parent_header.hash();
@@ -916,8 +927,9 @@ where
                     if *prev_parent == parent_hash {
                         error!("Reject Double Sign!! block: {}, hash: 0x{:x}, root: 0x{:x}, ParentHash: 0x{:x}", 
                             block_number, block_hash, sealed_block.header().state_root, parent_hash);
-                        // Update double sign metric
+                        // Update double sign metrics (both reth-bsc native and geth-compatible)
                         self.consensus_metrics.double_signs_detected_total.increment(1);
+                        metrics::counter!("parlia.doublesign").increment(1);
                         double_sign = true;
                         break;
                     }
@@ -1183,6 +1195,13 @@ where
         info!(
             "Mining configuration: validator={}, chain_id={}, gas_limit={}, min_gas_tip={}",
             validator_address, chain_id, desired_gas_limit, desired_min_gas_tip
+        );
+
+        // Initialize dynamic miner config in shared state so miner_* RPC can update them
+        crate::shared::init_miner_dynamic_config(
+            desired_gas_limit,
+            desired_min_gas_tip as u64,
+            validator_address,
         );
 
         let parlia = Arc::new(crate::consensus::parlia::Parlia::new(chain_spec.clone(), 200));
