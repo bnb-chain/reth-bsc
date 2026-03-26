@@ -1435,7 +1435,7 @@ where
             }
         }
 
-        if self.join_handle.len() > 0 {
+        if !self.join_handle.is_empty() {
             // Keep waiting for additional background build results as long as we haven't hit the
             // expected end timestamp. This maximizes the chance of getting a better (non-empty /
             // higher-fee) payload without exceeding our time budget.
@@ -1445,7 +1445,7 @@ where
                     .unwrap_or_default()
                     .as_millis();
                 if now_ms >= self.expected_end_timestamp_ms + 150 {
-                    if self.join_handle.len() != 0 {
+                    if !self.join_handle.is_empty() {
                         debug!(
                             target: "bsc::miner::payload",
                             trace_id = self.trace_id,
@@ -1459,7 +1459,7 @@ where
                     }
                     break;
                 }
-                if self.join_handle.len() == 0 {
+                if self.join_handle.is_empty() {
                     break;
                 }
 
