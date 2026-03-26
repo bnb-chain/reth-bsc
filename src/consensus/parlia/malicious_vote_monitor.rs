@@ -25,6 +25,7 @@ const UPPER_LIMIT_OF_VOTE_BLOCK_NUMBER: u64 = 11;
 
 /// Monitors incoming votes for rule violations and increments geth-compatible metrics
 /// (`monitor/maliciousVote/violateRule1`, `monitor/maliciousVote/violateRule2`).
+#[derive(Default)]
 pub struct MaliciousVoteMonitor {
     /// Per-validator LRU cache mapping target_number → VoteEnvelope.
     cur_votes: HashMap<VoteAddress, LruCache<u64, VoteEnvelope>>,
@@ -53,13 +54,13 @@ impl MaliciousVoteMonitor {
         let target_number = new_vote.data.target_number;
 
         // Basic scope check
-        if !(target_number + MALICIOUS_VOTE_SLASH_SCOPE > pending_block_number) {
+        if target_number + MALICIOUS_VOTE_SLASH_SCOPE <= pending_block_number {
             return false;
         }
 
         // Determine scan range
         let mut block_number = source_number + 1;
-        if !(block_number + MALICIOUS_VOTE_SLASH_SCOPE > pending_block_number) {
+        if block_number + MALICIOUS_VOTE_SLASH_SCOPE <= pending_block_number {
             block_number = pending_block_number - MALICIOUS_VOTE_SLASH_SCOPE + 1;
         }
 
