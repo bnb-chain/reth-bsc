@@ -1952,23 +1952,23 @@ dependencies = [
  "alloy-primitives",
  "alloy-rlp",
  "rayon",
- "reth-chainspec 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-consensus 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-db 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-db-api 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-db-common 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-ethereum-consensus 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-ethereum-forks 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-ethereum-primitives 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-evm 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-evm-ethereum 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-primitives 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-provider 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-revm 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-tracing 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-trie 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-trie-db 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
+ "reth-chainspec 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-consensus 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-db 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-db-api 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-db-common 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-ethereum-consensus 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-ethereum-forks 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-ethereum-primitives 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-evm 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-evm-ethereum 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-primitives 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-provider 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-revm 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-tracing 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-trie 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-trie-db 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
  "reth_bsc",
  "revm",
  "serde",
@@ -7423,7 +7423,7 @@ dependencies = [
 [[package]]
 name = "reth-chain-state"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix#c511fff6df7cafc4f74f9c2742bb7974782044c0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=develop#ce412182343d2ee7625055c8df84db4547f72efd"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -7435,14 +7435,14 @@ dependencies = [
  "parking_lot",
  "pin-project",
  "rand 0.9.2",
- "reth-chainspec 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-errors 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-ethereum-primitives 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-execution-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-metrics 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-storage-api 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-trie 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
+ "reth-chainspec 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-errors 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-ethereum-primitives 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-execution-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-metrics 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-storage-api 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-trie 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
  "revm-database",
  "revm-state",
  "tokio",
@@ -7485,7 +7485,7 @@ dependencies = [
 [[package]]
 name = "reth-chainspec"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix#c511fff6df7cafc4f74f9c2742bb7974782044c0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=develop#ce412182343d2ee7625055c8df84db4547f72efd"
 dependencies = [
  "alloy-chains",
  "alloy-consensus",
@@ -7496,9 +7496,9 @@ dependencies = [
  "alloy-trie",
  "auto_impl",
  "derive_more 2.1.1",
- "reth-ethereum-forks 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-network-peers 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
+ "reth-ethereum-forks 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-network-peers 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
  "serde_json",
 ]
 
@@ -7653,7 +7653,7 @@ dependencies = [
 [[package]]
 name = "reth-codecs"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix#c511fff6df7cafc4f74f9c2742bb7974782044c0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=develop#ce412182343d2ee7625055c8df84db4547f72efd"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -7664,8 +7664,8 @@ dependencies = [
  "bytes 1.11.1",
  "modular-bitfield",
  "op-alloy-consensus",
- "reth-codecs-derive 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-zstd-compressors 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
+ "reth-codecs-derive 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-zstd-compressors 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
  "serde",
  "visibility",
 ]
@@ -7693,7 +7693,7 @@ dependencies = [
 [[package]]
 name = "reth-codecs-derive"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix#c511fff6df7cafc4f74f9c2742bb7974782044c0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=develop#ce412182343d2ee7625055c8df84db4547f72efd"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -7713,13 +7713,13 @@ dependencies = [
 [[package]]
 name = "reth-config"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix#c511fff6df7cafc4f74f9c2742bb7974782044c0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=develop#ce412182343d2ee7625055c8df84db4547f72efd"
 dependencies = [
  "eyre",
- "reth-network-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-prune-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-stages-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-static-file-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
+ "reth-network-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-prune-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-stages-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-static-file-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
  "url",
 ]
 
@@ -7742,13 +7742,13 @@ dependencies = [
 [[package]]
 name = "reth-consensus"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix#c511fff6df7cafc4f74f9c2742bb7974782044c0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=develop#ce412182343d2ee7625055c8df84db4547f72efd"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",
  "auto_impl",
- "reth-execution-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
+ "reth-execution-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
  "thiserror 2.0.18",
 ]
 
@@ -7768,13 +7768,13 @@ dependencies = [
 [[package]]
 name = "reth-consensus-common"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix#c511fff6df7cafc4f74f9c2742bb7974782044c0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=develop#ce412182343d2ee7625055c8df84db4547f72efd"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
- "reth-chainspec 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-consensus 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
+ "reth-chainspec 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-consensus 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
 ]
 
 [[package]]
@@ -7818,7 +7818,7 @@ dependencies = [
 [[package]]
 name = "reth-db"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix#c511fff6df7cafc4f74f9c2742bb7974782044c0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=develop#ce412182343d2ee7625055c8df84db4547f72efd"
 dependencies = [
  "alloy-primitives",
  "derive_more 2.1.1",
@@ -7826,14 +7826,14 @@ dependencies = [
  "metrics",
  "page_size",
  "parking_lot",
- "reth-db-api 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-fs-util 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-libmdbx 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-metrics 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-nippy-jar 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-static-file-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-storage-errors 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-tracing 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
+ "reth-db-api 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-fs-util 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-libmdbx 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-metrics 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-nippy-jar 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-static-file-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-storage-errors 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-tracing 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
  "rustc-hash",
  "strum 0.27.2",
  "sysinfo",
@@ -7870,7 +7870,7 @@ dependencies = [
 [[package]]
 name = "reth-db-api"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix#c511fff6df7cafc4f74f9c2742bb7974782044c0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=develop#ce412182343d2ee7625055c8df84db4547f72efd"
 dependencies = [
  "alloy-consensus",
  "alloy-genesis",
@@ -7882,15 +7882,15 @@ dependencies = [
  "modular-bitfield",
  "parity-scale-codec",
  "proptest",
- "reth-codecs 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-db-models 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-ethereum-primitives 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-optimism-primitives 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-prune-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-stages-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-storage-errors 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-trie-common 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
+ "reth-codecs 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-db-models 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-ethereum-primitives 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-optimism-primitives 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-prune-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-stages-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-storage-errors 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-trie-common 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
  "roaring",
  "serde",
 ]
@@ -7926,7 +7926,7 @@ dependencies = [
 [[package]]
 name = "reth-db-common"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix#c511fff6df7cafc4f74f9c2742bb7974782044c0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=develop#ce412182343d2ee7625055c8df84db4547f72efd"
 dependencies = [
  "alloy-consensus",
  "alloy-genesis",
@@ -7934,20 +7934,20 @@ dependencies = [
  "alloy-trie",
  "boyer-moore-magiclen",
  "eyre",
- "reth-chainspec 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-codecs 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-config 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-db-api 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-etl 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-execution-errors 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-fs-util 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-node-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-provider 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-stages-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-static-file-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-trie 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-trie-db 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
+ "reth-chainspec 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-codecs 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-config 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-db-api 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-etl 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-execution-errors 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-fs-util 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-node-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-provider 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-stages-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-static-file-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-trie 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-trie-db 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
  "rust-eth-triedb 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?tag=v0.0.1)",
  "rust-eth-triedb-common 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?tag=v0.0.1)",
  "rust-eth-triedb-state-trie 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?tag=v0.0.1)",
@@ -7994,15 +7994,15 @@ dependencies = [
 [[package]]
 name = "reth-db-models"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix#c511fff6df7cafc4f74f9c2742bb7974782044c0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=develop#ce412182343d2ee7625055c8df84db4547f72efd"
 dependencies = [
  "alloy-eips",
  "alloy-primitives",
  "arbitrary",
  "bytes 1.11.1",
  "modular-bitfield",
- "reth-codecs 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
+ "reth-codecs 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
  "serde",
 ]
 
@@ -8183,7 +8183,7 @@ dependencies = [
 [[package]]
 name = "reth-engine-primitives"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix#c511fff6df7cafc4f74f9c2742bb7974782044c0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=develop#ce412182343d2ee7625055c8df84db4547f72efd"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -8191,15 +8191,15 @@ dependencies = [
  "alloy-rpc-types-engine",
  "auto_impl",
  "futures",
- "reth-chain-state 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-errors 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-ethereum-primitives 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-evm 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-execution-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-payload-builder-primitives 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-payload-primitives 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-trie-common 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
+ "reth-chain-state 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-errors 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-ethereum-primitives 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-evm 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-execution-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-payload-builder-primitives 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-payload-primitives 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-trie-common 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
  "serde",
  "thiserror 2.0.18",
  "tokio",
@@ -8400,11 +8400,11 @@ dependencies = [
 [[package]]
 name = "reth-errors"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix#c511fff6df7cafc4f74f9c2742bb7974782044c0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=develop#ce412182343d2ee7625055c8df84db4547f72efd"
 dependencies = [
- "reth-consensus 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-execution-errors 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-storage-errors 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
+ "reth-consensus 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-execution-errors 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-storage-errors 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
  "thiserror 2.0.18",
 ]
 
@@ -8497,16 +8497,16 @@ dependencies = [
 [[package]]
 name = "reth-ethereum-consensus"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix#c511fff6df7cafc4f74f9c2742bb7974782044c0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=develop#ce412182343d2ee7625055c8df84db4547f72efd"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
  "alloy-primitives",
- "reth-chainspec 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-consensus 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-consensus-common 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-execution-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
+ "reth-chainspec 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-consensus 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-consensus-common 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-execution-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
  "tracing",
 ]
 
@@ -8529,16 +8529,16 @@ dependencies = [
 [[package]]
 name = "reth-ethereum-engine-primitives"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix#c511fff6df7cafc4f74f9c2742bb7974782044c0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=develop#ce412182343d2ee7625055c8df84db4547f72efd"
 dependencies = [
  "alloy-eips",
  "alloy-primitives",
  "alloy-rlp",
  "alloy-rpc-types-engine",
- "reth-engine-primitives 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-ethereum-primitives 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-payload-primitives 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
+ "reth-engine-primitives 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-ethereum-primitives 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-payload-primitives 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
  "serde",
  "sha2 0.10.9",
  "thiserror 2.0.18",
@@ -8565,7 +8565,7 @@ dependencies = [
 [[package]]
 name = "reth-ethereum-forks"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix#c511fff6df7cafc4f74f9c2742bb7974782044c0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=develop#ce412182343d2ee7625055c8df84db4547f72efd"
 dependencies = [
  "alloy-eip2124",
  "alloy-hardforks",
@@ -8621,7 +8621,7 @@ dependencies = [
 [[package]]
 name = "reth-ethereum-primitives"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix#c511fff6df7cafc4f74f9c2742bb7974782044c0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=develop#ce412182343d2ee7625055c8df84db4547f72efd"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -8631,9 +8631,9 @@ dependencies = [
  "alloy-serde",
  "arbitrary",
  "modular-bitfield",
- "reth-codecs 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-zstd-compressors 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
+ "reth-codecs 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-zstd-compressors 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
  "serde",
  "serde_with",
 ]
@@ -8661,10 +8661,10 @@ dependencies = [
 [[package]]
 name = "reth-etl"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix#c511fff6df7cafc4f74f9c2742bb7974782044c0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=develop#ce412182343d2ee7625055c8df84db4547f72efd"
 dependencies = [
  "rayon",
- "reth-db-api 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
+ "reth-db-api 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
  "tempfile",
 ]
 
@@ -8681,7 +8681,7 @@ dependencies = [
 [[package]]
 name = "reth-evm"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix#c511fff6df7cafc4f74f9c2742bb7974782044c0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=develop#ce412182343d2ee7625055c8df84db4547f72efd"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -8691,12 +8691,12 @@ dependencies = [
  "derive_more 2.1.1",
  "futures-util",
  "rayon",
- "reth-execution-errors 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-execution-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-storage-api 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-storage-errors 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-trie-common 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
+ "reth-execution-errors 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-execution-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-storage-api 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-storage-errors 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-trie-common 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
  "revm",
 ]
 
@@ -8728,7 +8728,7 @@ dependencies = [
 [[package]]
 name = "reth-evm-ethereum"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix#c511fff6df7cafc4f74f9c2742bb7974782044c0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=develop#ce412182343d2ee7625055c8df84db4547f72efd"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -8736,13 +8736,13 @@ dependencies = [
  "alloy-primitives",
  "alloy-rpc-types-engine",
  "derive_more 2.1.1",
- "reth-chainspec 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-ethereum-forks 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-ethereum-primitives 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-evm 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-execution-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-storage-errors 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
+ "reth-chainspec 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-ethereum-forks 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-ethereum-primitives 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-evm 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-execution-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-storage-errors 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
  "revm",
 ]
 
@@ -8771,13 +8771,13 @@ dependencies = [
 [[package]]
 name = "reth-execution-errors"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix#c511fff6df7cafc4f74f9c2742bb7974782044c0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=develop#ce412182343d2ee7625055c8df84db4547f72efd"
 dependencies = [
  "alloy-evm",
  "alloy-primitives",
  "alloy-rlp",
  "nybbles",
- "reth-storage-errors 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
+ "reth-storage-errors 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
  "thiserror 2.0.18",
 ]
 
@@ -8797,16 +8797,16 @@ dependencies = [
 [[package]]
 name = "reth-execution-types"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix#c511fff6df7cafc4f74f9c2742bb7974782044c0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=develop#ce412182343d2ee7625055c8df84db4547f72efd"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
  "alloy-evm",
  "alloy-primitives",
  "derive_more 2.1.1",
- "reth-ethereum-primitives 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-trie-common 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
+ "reth-ethereum-primitives 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-trie-common 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
  "revm",
  "serde",
  "serde_with",
@@ -8885,7 +8885,7 @@ dependencies = [
 [[package]]
 name = "reth-fs-util"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix#c511fff6df7cafc4f74f9c2742bb7974782044c0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=develop#ce412182343d2ee7625055c8df84db4547f72efd"
 dependencies = [
  "serde",
  "serde_json",
@@ -8953,14 +8953,14 @@ dependencies = [
 [[package]]
 name = "reth-libmdbx"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix#c511fff6df7cafc4f74f9c2742bb7974782044c0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=develop#ce412182343d2ee7625055c8df84db4547f72efd"
 dependencies = [
  "bitflags 2.11.0",
  "byteorder",
  "dashmap 6.1.0",
  "derive_more 2.1.1",
  "parking_lot",
- "reth-mdbx-sys 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
+ "reth-mdbx-sys 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
  "smallvec",
  "thiserror 2.0.18",
  "tracing",
@@ -8985,7 +8985,7 @@ dependencies = [
 [[package]]
 name = "reth-mdbx-sys"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix#c511fff6df7cafc4f74f9c2742bb7974782044c0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=develop#ce412182343d2ee7625055c8df84db4547f72efd"
 dependencies = [
  "bindgen 0.71.1",
  "cc",
@@ -9015,7 +9015,7 @@ dependencies = [
 [[package]]
 name = "reth-metrics"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix#c511fff6df7cafc4f74f9c2742bb7974782044c0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=develop#ce412182343d2ee7625055c8df84db4547f72efd"
 dependencies = [
  "metrics",
  "metrics-derive",
@@ -9036,7 +9036,7 @@ dependencies = [
 [[package]]
 name = "reth-net-banlist"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix#c511fff6df7cafc4f74f9c2742bb7974782044c0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=develop#ce412182343d2ee7625055c8df84db4547f72efd"
 dependencies = [
  "alloy-primitives",
  "ipnet",
@@ -9172,7 +9172,7 @@ dependencies = [
 [[package]]
 name = "reth-network-peers"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix#c511fff6df7cafc4f74f9c2742bb7974782044c0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=develop#ce412182343d2ee7625055c8df84db4547f72efd"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -9200,11 +9200,11 @@ dependencies = [
 [[package]]
 name = "reth-network-types"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix#c511fff6df7cafc4f74f9c2742bb7974782044c0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=develop#ce412182343d2ee7625055c8df84db4547f72efd"
 dependencies = [
  "alloy-eip2124",
- "reth-net-banlist 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-network-peers 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
+ "reth-net-banlist 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-network-peers 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
  "serde_json",
  "tracing",
 ]
@@ -9226,14 +9226,14 @@ dependencies = [
 [[package]]
 name = "reth-nippy-jar"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix#c511fff6df7cafc4f74f9c2742bb7974782044c0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=develop#ce412182343d2ee7625055c8df84db4547f72efd"
 dependencies = [
  "anyhow",
  "bincode",
  "derive_more 2.1.1",
  "lz4_flex",
  "memmap2",
- "reth-fs-util 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
+ "reth-fs-util 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
  "serde",
  "thiserror 2.0.18",
  "tracing",
@@ -9520,13 +9520,13 @@ dependencies = [
 [[package]]
 name = "reth-node-types"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix#c511fff6df7cafc4f74f9c2742bb7974782044c0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=develop#ce412182343d2ee7625055c8df84db4547f72efd"
 dependencies = [
- "reth-chainspec 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-db-api 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-engine-primitives 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-payload-primitives 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
+ "reth-chainspec 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-db-api 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-engine-primitives 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-payload-primitives 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
 ]
 
 [[package]]
@@ -9544,14 +9544,14 @@ dependencies = [
 [[package]]
 name = "reth-optimism-primitives"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix#c511fff6df7cafc4f74f9c2742bb7974782044c0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=develop#ce412182343d2ee7625055c8df84db4547f72efd"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
  "alloy-primitives",
  "alloy-rlp",
  "op-alloy-consensus",
- "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
+ "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
  "serde",
  "serde_with",
 ]
@@ -9595,10 +9595,10 @@ dependencies = [
 [[package]]
 name = "reth-payload-builder-primitives"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix#c511fff6df7cafc4f74f9c2742bb7974782044c0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=develop#ce412182343d2ee7625055c8df84db4547f72efd"
 dependencies = [
  "pin-project",
- "reth-payload-primitives 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
+ "reth-payload-primitives 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
  "tokio",
  "tokio-stream",
  "tracing",
@@ -9619,7 +9619,7 @@ dependencies = [
 [[package]]
 name = "reth-payload-primitives"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix#c511fff6df7cafc4f74f9c2742bb7974782044c0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=develop#ce412182343d2ee7625055c8df84db4547f72efd"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -9628,12 +9628,12 @@ dependencies = [
  "auto_impl",
  "either",
  "op-alloy-rpc-types-engine",
- "reth-chain-state 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-chainspec 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-errors 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-execution-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-trie-common 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
+ "reth-chain-state 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-chainspec 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-errors 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-execution-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-trie-common 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
  "serde",
  "thiserror 2.0.18",
  "tokio",
@@ -9675,15 +9675,15 @@ dependencies = [
 [[package]]
 name = "reth-primitives"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix#c511fff6df7cafc4f74f9c2742bb7974782044c0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=develop#ce412182343d2ee7625055c8df84db4547f72efd"
 dependencies = [
  "alloy-consensus",
  "c-kzg",
  "once_cell",
- "reth-ethereum-forks 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-ethereum-primitives 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-static-file-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
+ "reth-ethereum-forks 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-ethereum-primitives 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-static-file-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
 ]
 
 [[package]]
@@ -9703,7 +9703,7 @@ dependencies = [
 [[package]]
 name = "reth-primitives-traits"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix#c511fff6df7cafc4f74f9c2742bb7974782044c0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=develop#ce412182343d2ee7625055c8df84db4547f72efd"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -9722,7 +9722,7 @@ dependencies = [
  "op-alloy-consensus",
  "proptest",
  "proptest-arbitrary-interop",
- "reth-codecs 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
+ "reth-codecs 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
  "revm-bytecode",
  "revm-primitives",
  "revm-state",
@@ -9768,7 +9768,7 @@ dependencies = [
 [[package]]
 name = "reth-provider"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix#c511fff6df7cafc4f74f9c2742bb7974782044c0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=develop#ce412182343d2ee7625055c8df84db4547f72efd"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -9781,26 +9781,26 @@ dependencies = [
  "notify",
  "parking_lot",
  "rayon",
- "reth-chain-state 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-chainspec 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-codecs 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-db 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-db-api 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-errors 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-ethereum-engine-primitives 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-ethereum-primitives 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-execution-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-metrics 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-nippy-jar 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-node-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-prune-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-stages-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-static-file-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-storage-api 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-storage-errors 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-trie 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-trie-db 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
+ "reth-chain-state 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-chainspec 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-codecs 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-db 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-db-api 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-errors 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-ethereum-engine-primitives 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-ethereum-primitives 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-execution-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-metrics 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-nippy-jar 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-node-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-prune-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-stages-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-static-file-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-storage-api 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-storage-errors 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-trie 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-trie-db 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
  "revm-database",
  "revm-state",
  "rust-eth-triedb 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?tag=v0.0.1)",
@@ -9884,13 +9884,13 @@ dependencies = [
 [[package]]
 name = "reth-prune-types"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix#c511fff6df7cafc4f74f9c2742bb7974782044c0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=develop#ce412182343d2ee7625055c8df84db4547f72efd"
 dependencies = [
  "alloy-primitives",
  "arbitrary",
  "derive_more 2.1.1",
  "modular-bitfield",
- "reth-codecs 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
+ "reth-codecs 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
  "serde",
  "strum 0.27.2",
  "thiserror 2.0.18",
@@ -9960,12 +9960,12 @@ dependencies = [
 [[package]]
 name = "reth-revm"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix#c511fff6df7cafc4f74f9c2742bb7974782044c0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=develop#ce412182343d2ee7625055c8df84db4547f72efd"
 dependencies = [
  "alloy-primitives",
- "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-storage-api 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-storage-errors 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
+ "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-storage-api 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-storage-errors 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
  "revm",
 ]
 
@@ -10393,14 +10393,14 @@ dependencies = [
 [[package]]
 name = "reth-stages-types"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix#c511fff6df7cafc4f74f9c2742bb7974782044c0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=develop#ce412182343d2ee7625055c8df84db4547f72efd"
 dependencies = [
  "alloy-primitives",
  "arbitrary",
  "bytes 1.11.1",
  "modular-bitfield",
- "reth-codecs 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-trie-common 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
+ "reth-codecs 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-trie-common 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
  "serde",
 ]
 
@@ -10441,7 +10441,7 @@ dependencies = [
 [[package]]
 name = "reth-static-file-types"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix#c511fff6df7cafc4f74f9c2742bb7974782044c0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=develop#ce412182343d2ee7625055c8df84db4547f72efd"
 dependencies = [
  "alloy-primitives",
  "derive_more 2.1.1",
@@ -10466,23 +10466,23 @@ dependencies = [
 [[package]]
 name = "reth-storage-api"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix#c511fff6df7cafc4f74f9c2742bb7974782044c0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=develop#ce412182343d2ee7625055c8df84db4547f72efd"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
  "alloy-primitives",
  "alloy-rpc-types-engine",
  "auto_impl",
- "reth-chainspec 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-db-api 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-db-models 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-ethereum-primitives 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-execution-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-prune-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-stages-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-storage-errors 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-trie-common 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
+ "reth-chainspec 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-db-api 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-db-models 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-ethereum-primitives 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-execution-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-prune-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-stages-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-storage-errors 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-trie-common 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
  "revm-database",
  "serde_json",
 ]
@@ -10514,15 +10514,15 @@ dependencies = [
 [[package]]
 name = "reth-storage-errors"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix#c511fff6df7cafc4f74f9c2742bb7974782044c0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=develop#ce412182343d2ee7625055c8df84db4547f72efd"
 dependencies = [
  "alloy-eips",
  "alloy-primitives",
  "alloy-rlp",
  "derive_more 2.1.1",
- "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-prune-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-static-file-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
+ "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-prune-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-static-file-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
  "revm-database-interface",
  "revm-state",
  "thiserror 2.0.18",
@@ -10592,11 +10592,11 @@ dependencies = [
 [[package]]
 name = "reth-tracing"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix#c511fff6df7cafc4f74f9c2742bb7974782044c0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=develop#ce412182343d2ee7625055c8df84db4547f72efd"
 dependencies = [
  "clap",
  "eyre",
- "reth-tracing-otlp 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
+ "reth-tracing-otlp 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
  "rolling-file",
  "tracing",
  "tracing-appender",
@@ -10622,7 +10622,7 @@ dependencies = [
 [[package]]
 name = "reth-tracing-otlp"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix#c511fff6df7cafc4f74f9c2742bb7974782044c0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=develop#ce412182343d2ee7625055c8df84db4547f72efd"
 dependencies = [
  "clap",
  "eyre",
@@ -10698,7 +10698,7 @@ dependencies = [
 [[package]]
 name = "reth-trie"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix#c511fff6df7cafc4f74f9c2742bb7974782044c0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=develop#ce412182343d2ee7625055c8df84db4547f72efd"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -10709,13 +10709,13 @@ dependencies = [
  "itertools 0.14.0",
  "metrics",
  "parking_lot",
- "reth-execution-errors 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-metrics 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-stages-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-storage-errors 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-trie-common 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-trie-sparse 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
+ "reth-execution-errors 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-metrics 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-stages-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-storage-errors 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-trie-common 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-trie-sparse 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
  "revm-database",
  "tracing",
  "triehash",
@@ -10750,7 +10750,7 @@ dependencies = [
 [[package]]
 name = "reth-trie-common"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix#c511fff6df7cafc4f74f9c2742bb7974782044c0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=develop#ce412182343d2ee7625055c8df84db4547f72efd"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",
@@ -10767,8 +10767,8 @@ dependencies = [
  "nybbles",
  "plain_hasher",
  "rayon",
- "reth-codecs 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
+ "reth-codecs 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
  "revm-database",
  "rust-eth-triedb 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?tag=v0.0.1)",
  "rust-eth-triedb-state-trie 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?tag=v0.0.1)",
@@ -10808,20 +10808,20 @@ dependencies = [
 [[package]]
 name = "reth-trie-db"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix#c511fff6df7cafc4f74f9c2742bb7974782044c0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=develop#ce412182343d2ee7625055c8df84db4547f72efd"
 dependencies = [
  "alloy-primitives",
  "metrics",
  "parking_lot",
- "reth-db-api 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-execution-errors 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-metrics 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-stages-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-storage-api 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-storage-errors 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-trie 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-trie-common 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
+ "reth-db-api 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-execution-errors 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-metrics 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-stages-types 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-storage-api 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-storage-errors 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-trie 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-trie-common 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
  "rust-eth-triedb 0.1.0 (git+https://github.com/bnb-chain/reth-bsc-triedb.git?tag=v0.0.1)",
  "tracing",
 ]
@@ -10875,16 +10875,16 @@ dependencies = [
 [[package]]
 name = "reth-trie-sparse"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix#c511fff6df7cafc4f74f9c2742bb7974782044c0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=develop#ce412182343d2ee7625055c8df84db4547f72efd"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
  "alloy-trie",
  "auto_impl",
  "rayon",
- "reth-execution-errors 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
- "reth-trie-common 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix)",
+ "reth-execution-errors 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-primitives-traits 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
+ "reth-trie-common 1.10.2 (git+https://github.com/bnb-chain/reth.git?branch=develop)",
  "smallvec",
  "tracing",
 ]
@@ -10929,7 +10929,7 @@ dependencies = [
 [[package]]
 name = "reth-zstd-compressors"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git?branch=feat%2Feth_getFinalizedHeader-bsc-fix#c511fff6df7cafc4f74f9c2742bb7974782044c0"
+source = "git+https://github.com/bnb-chain/reth.git?branch=develop#ce412182343d2ee7625055c8df84db4547f72efd"
 dependencies = [
  "zstd",
 ]

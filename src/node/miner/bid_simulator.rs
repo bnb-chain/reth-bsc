@@ -173,8 +173,7 @@ where
         let parent_hash = bid.parent_hash;
         let parent_header = match self.client.header(parent_hash) {
             Ok(Some(header)) => {
-                let hash = header.hash_slow();
-                SealedHeader::new(header, hash)
+                SealedHeader::new(header, parent_hash)
             }
             _ => {
                 debug!("Failed to get parent header for hash: {:?}", parent_hash);
@@ -370,7 +369,7 @@ where
         let pay_bid_tx = txs_except_last.pop();
 
         let state_provider =
-            match self.client.state_by_block_hash(bid_runtime.parent_header.hash_slow()) {
+            match self.client.state_by_block_hash(bid_runtime.parent_header.hash()) {
                 Ok(provider) => provider,
                 Err(e) => {
                     debug!("Failed to get state provider by block hash: {:?}", e);
