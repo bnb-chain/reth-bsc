@@ -31,6 +31,7 @@ use reth_execution_types::BlockExecutionOutput;
 use reth_payload_primitives::PayloadBuilderAttributes;
 use reth_payload_primitives::{BuiltPayload, BuiltPayloadExecutedBlock, PayloadBuilderError};
 use either::Either;
+use once_cell::sync::Lazy;
 use revm_context_interface::Block as EvmBlock;
 use reth_primitives::HeaderTy;
 use reth_primitives::InvalidTransactionError;
@@ -62,9 +63,8 @@ const TIME_MULTIPLIER: u32 = 2;
 /// Global trace ID counter for payload building operations
 static TRACE_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
-/// Module-level miner metrics singleton
-static MINER_METRICS: once_cell::sync::Lazy<BscMinerMetrics> =
-    once_cell::sync::Lazy::new(BscMinerMetrics::default);
+/// Module-level miner metrics instance shared across all payload builds.
+static MINER_METRICS: Lazy<BscMinerMetrics> = Lazy::new(BscMinerMetrics::default);
 
 /// Generate a unique trace ID for payload building
 pub fn generate_trace_id() -> u64 {
@@ -1435,7 +1435,7 @@ where
             }
         }
 
-        if self.join_handle.len() > 0 {
+        if !self.join_handle.is_empty() {
             // Keep waiting for additional background build results as long as we haven't hit the
             // expected end timestamp. This maximizes the chance of getting a better (non-empty /
             // higher-fee) payload without exceeding our time budget.
@@ -1445,7 +1445,7 @@ where
                     .unwrap_or_default()
                     .as_millis();
                 if now_ms >= self.expected_end_timestamp_ms + 150 {
-                    if self.join_handle.len() != 0 {
+                    if !self.join_handle.is_empty() {
                         debug!(
                             target: "bsc::miner::payload",
                             trace_id = self.trace_id,
@@ -1459,7 +1459,7 @@ where
                     }
                     break;
                 }
-                if self.join_handle.len() == 0 {
+                if self.join_handle.is_empty() {
                     break;
                 }
 

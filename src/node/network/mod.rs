@@ -355,7 +355,7 @@ impl BscNetworkBuilder {
 
         // Initialize BSC protocol registry with proxied peers from config
         // This mirrors the same functionality in the main peer manager
-        let proxied_node_ids = network_config.peers_config.proxyed_node_ids.clone();
+        let proxied_node_ids = network_config.peers_config.proxied_node_ids.clone();
         if !proxied_node_ids.is_empty() {
             tracing::info!(
                 target: "bsc::net",
