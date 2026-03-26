@@ -157,6 +157,15 @@ impl NodeTypes for BscNode {
     type Payload = BscPayloadTypes;
 }
 
+// Provide FullNodeTypes for BscNode so EngineApiTx<BscNode> can be used.
+impl reth::api::FullNodeTypes for BscNode {
+    type Types = Self;
+    type DB = std::sync::Arc<reth_db::DatabaseEnv>;
+    type Provider = reth_provider::providers::BlockchainProvider<
+        reth::api::NodeTypesWithDBAdapter<Self, Self::DB>,
+    >;
+}
+
 impl<N> Node<N> for BscNode
 where
     N: FullNodeTypes<Types = Self>,

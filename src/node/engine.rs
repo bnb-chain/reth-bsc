@@ -6,6 +6,7 @@ use crate::{
     },
     BscPrimitives,
 };
+use crate::BscBlock;
 use alloy_eips::eip7685::Requests;
 use alloy_primitives::U256;
 use reth::transaction_pool::PoolTransaction;
@@ -15,15 +16,25 @@ use reth::{
     payload::{PayloadBuilderHandle, PayloadServiceCommand},
     transaction_pool::TransactionPool,
 };
+use reth_chain_state::ExecutedBlock;
 use reth_evm::ConfigureEvm;
 use reth_payload_builder_primitives::Events;
-use reth_payload_primitives::{BuiltPayload, BuiltPayloadExecutedBlock};
+use reth_payload_primitives::BuiltPayload;
 use reth_primitives::{SealedBlock, TransactionSigned};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info};
-use crate::BscBlock;
+
+/// Distinguishes what kind of payload build produced a [`BscBuiltPayload`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BuildKind {
+    /// A normal build attempt that may include user transactions from the pool.
+    #[default]
+    NormalAttempt,
+    /// An empty-block fallback build (no user transactions; only pre-execution/system changes).
+    EmptyFallback,
+}
 
 /// Built payload for BSC. This is similar to [`EthBuiltPayload`] but without sidecars as those
 /// included into [`BscBlock`].
@@ -35,8 +46,14 @@ pub struct BscBuiltPayload {
     pub(crate) fees: U256,
     /// The requests of the payload
     pub(crate) requests: Option<Requests>,
-    /// The executed block
-    pub(crate) executed_block: BuiltPayloadExecutedBlock<BscPrimitives>,
+    /// What build path produced this payload.
+    pub build_kind: BuildKind,
+    /// Time spent selecting + executing transactions (or pre-execution changes for empty blocks).
+    pub exec_duration: Duration,
+    /// Time spent computing the trie root (time spent in `finish()` after execution).
+    pub trie_root_duration: Duration,
+    /// The executed block (includes difflayer if triedb produced one)
+    pub(crate) executed_block: ExecutedBlock<BscPrimitives>,
 }
 
 impl BuiltPayload for BscBuiltPayload {
@@ -52,10 +69,6 @@ impl BuiltPayload for BscBuiltPayload {
 
     fn requests(&self) -> Option<Requests> {
         self.requests.clone()
-    }
-
-    fn executed_block(&self) -> Option<BuiltPayloadExecutedBlock<Self::Primitives>> {
-        Some(self.executed_block.clone())
     }
 }
 
@@ -97,7 +110,7 @@ where
             let provider_clone = ctx.provider().clone();
             let chain_spec_clone = Arc::new(ctx.config().chain.clone().as_ref().clone());
             let task_executor_clone = ctx.task_executor().clone();
-            
+
             ctx.task_executor().spawn_critical("bsc-miner-initializer", async move {
                 info!("Waiting for consensus module to initialize snapshot provider...");
                 let mut attempts = 0;

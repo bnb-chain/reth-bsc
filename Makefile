@@ -15,7 +15,7 @@ build: ## Build the reth binary into `target` directory.
 
 .PHONY: maxperf
 maxperf: ## Builds `reth-bsc` with the most aggressive optimisations.
-	RUSTFLAGS="-C target-cpu=native" cargo build --bin reth-bsc --profile maxperf --features jemalloc,asm-keccak
+	RUSTFLAGS="-C target-cpu=native" cargo build --bin reth-bsc --profile maxperf --features jemalloc,asm-keccak,io-uring
 
 .PHONY: bench-test
 bench-test: ## Builds `reth-bsc` with the bench-test feature.
