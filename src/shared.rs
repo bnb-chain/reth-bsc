@@ -13,8 +13,11 @@ use alloy_rpc_types::{
     TransactionRequest as RpcTransactionRequest,
 };
 use parking_lot::Mutex;
+use reth::api::NodeTypesWithDBAdapter;
+use reth_engine_tree::engine::EngineApiRequest;
 use reth_network::NetworkHandle;
 use reth_network_api::PeerId;
+use reth_provider::providers::BlockchainProvider;
 use reth_payload_builder_primitives::Events;
 use reth_primitives::TransactionSigned;
 use reth_provider::{BlockNumReader, HeaderProvider};
@@ -25,6 +28,16 @@ use std::sync::RwLock;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::UnboundedSender;
+
+/// Public type alias for the BSC engine API sender (replaces private reth EngineApiTx).
+pub type BscEngineApiTx = UnboundedSender<
+    EngineApiRequest<
+        crate::node::engine_api::payload::BscPayloadTypes,
+        crate::BscPrimitives,
+        BlockchainProvider<NodeTypesWithDBAdapter<crate::node::BscNode, Arc<reth_db::DatabaseEnv>>>,
+        crate::node::evm::config::BscEvmConfig,
+    >,
+>;
 
 /// Function type for HeaderProvider::header() access (by hash)
 type HeaderByHashFn = Arc<dyn Fn(&B256) -> Option<Header> + Send + Sync>;
@@ -787,6 +800,24 @@ pub async fn ipc_send_raw_transaction(tx: TransactionSigned) -> Result<B256, eyr
     .await
     .map_err(|e| eyre::eyre!("failed to query chain id from healthy node: {e}"))
 }
+
+/// Global engine api tx (custom request sender)
+static ENGINE_API_TX: OnceLock<BscEngineApiTx> = OnceLock::new();
+
+/// Set global engine api tx if present.
+pub fn set_engine_api_tx(
+    tx: BscEngineApiTx,
+) -> Result<(), BscEngineApiTx> {
+    ENGINE_API_TX.set(tx)
+}
+
+/// Get global consensus engine handle if initialized.
+pub fn get_engine_api_tx() -> Option<BscEngineApiTx> {
+    ENGINE_API_TX.get().cloned()
+}
+
+// Note: difflayers are now returned directly from the BSC block builder (`finish_bsc`) and carried
+// through `BscBuiltPayload` / `ExecutedBlockWithTrieUpdates`. We no longer use a global cache.
 
 #[cfg(test)]
 mod tests {

@@ -41,10 +41,8 @@ use reth_provider::{
 use reth_revm::cancelled::ManualCancel;
 use reth_tasks::TaskExecutor;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_stream::StreamExt;
@@ -52,6 +50,16 @@ use tracing::{debug, error, info, trace, warn};
 
 /// Maximum number of recently mined blocks to track for double signing prevention
 const RECENT_MINED_BLOCKS_CACHE_SIZE: usize = 100;
+
+/// After this many seconds of `is_syncing() == true` with no canonical events, allow mining
+/// anyway. This breaks the deadlock that occurs when all validators restart simultaneously:
+/// no one produces blocks → no FCU → is_syncing never clears → no mining → deadlock.
+/// 5s ≈ 11 Fermi slots (450 ms each), enough time for a peer to send FCU if any are running.
+const SYNC_GATE_TIMEOUT_SECS: u64 = 5;
+
+/// Tracks when the miner first encountered the sync gate. Used for timeout-based deadlock
+/// recovery when all validators restart simultaneously.
+static SYNC_GATE_FIRST_HIT: OnceLock<Instant> = OnceLock::new();
 
 #[derive(Clone, Debug)]
 pub struct MiningContext {
@@ -77,6 +85,9 @@ pub struct NewWorkWorker<Provider> {
     mining_queue_tx: mpsc::UnboundedSender<MiningContext>,
     consensus: Arc<Parlia<BscChainSpec>>,
     pre_cached: Option<PrecachedState>,
+    /// Hash of the tip block for which mining was last triggered, used to suppress
+    /// periodic-tick retries when no new canonical head has arrived.
+    last_triggered_tip: Option<alloy_primitives::B256>,
 }
 
 impl<Provider> NewWorkWorker<Provider>
@@ -105,21 +116,59 @@ where
             mining_queue_tx,
             consensus,
             pre_cached: None,
+            last_triggered_tip: None,
         }
     }
 
     pub async fn run(mut self) {
         info!("Succeed to spawn new work worker, address: {}", self.validator_address);
 
-        if let Some(tip_header) = self.get_tip_header_at_startup() {
+        let mut notifications = self.provider.canonical_state_stream();
+        debug!(target: "bsc::miner", "Subscribed to canonical_state_stream");
+
+        // Don't block the canonical notifications loop on potentially slow startup checks (DB
+        // reads / snapshot locks). If this blocks, we can miss the first few canonical commits and
+        // never emit the per-commit "Try new work" log.
+        let startup_tip = self.get_tip_header_at_startup();
+        if let Some(ref tip_header) = startup_tip {
             debug!("Try new work at startup, tip_block={}", tip_header.number());
-            self.try_new_work(&tip_header).await;
+            let validator_address = self.validator_address;
+            let provider = self.provider.clone();
+            let snapshot_provider = Arc::clone(&self.snapshot_provider);
+            let mining_queue_tx = self.mining_queue_tx.clone();
+            let consensus = Arc::clone(&self.consensus);
+            let tip_header = tip_header.clone();
+            tokio::spawn(async move {
+                let worker = NewWorkWorker::new(
+                    validator_address,
+                    provider,
+                    snapshot_provider,
+                    mining_queue_tx,
+                    consensus,
+                );
+                worker.try_new_work(&tip_header).await;
+            });
         }
 
-        let mut notifications = self.provider.canonical_state_stream();
+        // Periodic ticker: retries try_new_work when no canonical events arrive.
+        // This is essential for deadlock recovery when all validators restart simultaneously
+        // and the sync gate times out — without this ticker, try_new_work would never be
+        // re-invoked after the startup attempt.
+        let mut periodic_tick =
+            tokio::time::interval(Duration::from_secs(3));
+        periodic_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Burn the first immediate tick so we don't double-fire with the startup spawn above.
+        periodic_tick.tick().await;
+
         loop {
-            match notifications.next().await {
-                Some(event) => {
+            tokio::select! {
+            biased; // prefer canonical events over the ticker
+            notification = notifications.next() => {
+            let Some(event) = notification else {
+                warn!("Canonical state notification stream ended, exiting...");
+                break;
+            };
+            let event = event; // rebind to avoid move issues
                     let committed = event.committed();
                     let tip = committed.tip();
                     let is_reorg = matches!(event, CanonStateNotification::Reorg { .. });
@@ -220,13 +269,37 @@ where
 
                     self.cache_for_next(&committed);
 
+                    self.last_triggered_tip = Some(tip_header.hash());
                     self.try_new_work(&tip_header).await;
                 }
-                None => {
-                    warn!("Canonical state notification stream ended, exiting...");
-                    break;
+            _ = periodic_tick.tick() => {
+                // Periodic retry: fires when no canonical events have arrived recently.
+                // Critical for breaking the all-validators-restart deadlock: once the
+                // sync gate timeout elapses, this ticker drives try_new_work to actually
+                // attempt mining.
+                if let Some(tip) = self.get_tip_header_at_startup() {
+                    if self.last_triggered_tip == Some(tip.hash()) {
+                        // A canonical event already triggered mining for this tip.
+                        // But if no new canonical events are arriving (all-validators-restart
+                        // deadlock), we must keep retrying via the ticker. Clear the guard
+                        // so the next tick fires even if the tip hasn't changed.
+                        self.last_triggered_tip = None;
+                        continue;
+                    }
+                    debug!(
+                        target: "bsc::miner",
+                        tip_number = tip.number(),
+                        "Periodic sync-gate retry"
+                    );
+                    self.last_triggered_tip = Some(tip.hash());
+                    self.try_new_work(&tip).await;
+                    // Clear so the next tick retries if try_new_work was skipped (e.g.
+                    // backfill still active). If a canonical event fires before the next
+                    // tick it will set last_triggered_tip again, preventing a duplicate.
+                    self.last_triggered_tip = None;
                 }
             }
+            } // end tokio::select!
         }
     }
 
@@ -362,16 +435,31 @@ where
             return;
         }
 
-        // TODO: refine check is_syncing status.
-        if tip.timestamp()
-            < SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() - 3
-        {
-            debug!(
-                "Skip to mine new block due to maybe in syncing, validator: {}, tip: {}",
-                self.validator_address,
-                tip.number()
-            );
-            return;
+        // Gate mining on live sync: skip if the node is still backfill-syncing.
+        // Exception: if all validators restart simultaneously, is_syncing() never clears
+        // because no FCU arrives. After SYNC_GATE_TIMEOUT_SECS we allow mining to break
+        // the deadlock.
+        if let Some(network) = crate::shared::get_network_handle() {
+            use reth_network_p2p::sync::SyncStateProvider;
+            if network.is_syncing() {
+                let first_hit = SYNC_GATE_FIRST_HIT.get_or_init(Instant::now);
+                let elapsed = first_hit.elapsed();
+                if elapsed < Duration::from_secs(SYNC_GATE_TIMEOUT_SECS) {
+                    debug!(
+                        target: "bsc::miner",
+                        tip_number = tip.number(),
+                        elapsed_secs = elapsed.as_secs(),
+                        "Skip mining: node is syncing (backfill active)"
+                    );
+                    return;
+                }
+                warn!(
+                    target: "bsc::miner",
+                    tip_number = tip.number(),
+                    elapsed_secs = elapsed.as_secs(),
+                    "Sync gate timeout reached, allowing mining to break potential all-validators-restart deadlock"
+                );
+            }
         }
 
         let parent_header = match self.provider.sealed_header_by_hash(tip.hash()) {
@@ -473,7 +561,8 @@ pub struct MainWorkWorker<Pool, Provider> {
     mining_queue_rx: mpsc::UnboundedReceiver<MiningContext>,
     payload_tx: mpsc::UnboundedSender<SubmitContext>,
     running_job_handle: Option<BscPayloadJobHandle>,
-    payload_job_join_set: JoinSet<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
+    payload_job_join_set:
+        JoinSet<Result<(), Box<crate::node::miner::payload::BscPayloadJobError>>>,
     simulator: Arc<BidSimulator<Provider, Pool>>, // No outer RwLock, each map has its own lock
     desired_gas_limit: u64,
     desired_min_gas_tip: u128,
@@ -622,8 +711,6 @@ where
 
         // Read dynamic config from shared state (updated by miner_* RPC), fall back to init values
         let gas_limit = crate::shared::get_miner_gas_limit().unwrap_or(self.desired_gas_limit);
-        let min_gas_tip =
-            crate::shared::get_miner_gas_tip().map(|v| v as u128).unwrap_or(self.desired_min_gas_tip);
 
         let evm_config = BscEvmConfig::new(self.chain_spec.clone());
         let payload_builder = BscPayloadBuilder::new(
@@ -640,7 +727,8 @@ where
             config: PayloadConfig::new(Arc::new(mining_ctx.parent_header.clone()), attributes),
             cancel: ManualCancel::default(),
             trace_id: crate::node::miner::payload::generate_trace_id(),
-            min_gas_tip,
+            min_gas_tip: self.desired_min_gas_tip,
+            parent_difflayers: None, // populated once at job start via fetch_triedb_difflayers
         };
 
         let parent_hash = mining_ctx.parent_header.hash();
@@ -963,6 +1051,9 @@ where
             parent_hash = ?parent_hash,
             txs = sealed_block.body().transaction_count(),
             gas_used = sealed_block.gas_used(),
+            build_kind = ?payload.build_kind,
+            exec_duration_ms = payload.exec_duration.as_millis(),
+            trie_root_duration_ms = payload.trie_root_duration.as_millis(),
             turn_status,
             "Submitting block"
         );
@@ -971,6 +1062,26 @@ where
         use crate::metrics::BscMinerMetrics;
         use once_cell::sync::Lazy;
         static MINER_METRICS: Lazy<BscMinerMetrics> = Lazy::new(BscMinerMetrics::default);
+
+        // Count empty-fallback payloads at submission time (this preserves the signal even if the
+        // payload job saw multiple candidates).
+        if payload.build_kind == crate::node::engine::BuildKind::EmptyFallback {
+            MINER_METRICS.empty_fallback_candidates_total.increment(1);
+            warn!(
+                target: "bsc::miner",
+                block_hash = %sealed_block.hash(),
+                block_number = sealed_block.number(),
+                "Submitting empty-fallback block"
+            );
+        }
+
+        // Record payload build timings.
+        MINER_METRICS
+            .block_exec_duration_seconds
+            .record(payload.exec_duration.as_secs_f64());
+        MINER_METRICS
+            .block_trie_root_duration_seconds
+            .record(payload.trie_root_duration.as_secs_f64());
 
         let gas_used_mgas = sealed_block.gas_used() as f64 / 1_000_000.0;
         MINER_METRICS.best_work_gas_used_mgas.set(gas_used_mgas);
@@ -1106,7 +1217,10 @@ where
                 bid_runtime = self.bid_simulate_req_rx.recv() => {
                     match bid_runtime {
                         Some(bid_runtime) => {
-                            self.simulator.bid_simulate(bid_runtime);
+                            let parent_difflayers =
+                                Self::fetch_parent_difflayers_for_bid(&bid_runtime.bid.parent_hash)
+                                    .await;
+                            self.simulator.bid_simulate(bid_runtime, parent_difflayers);
                         }
                         None => {
                             warn!("Bid simulate request channel closed");
@@ -1125,6 +1239,32 @@ where
                     let last_block_number = self.provider.last_block_number().unwrap_or(0);
                     self.simulator.clear(last_block_number);
                 }
+            }
+        }
+    }
+
+    /// Fetch parent difflayers for a bid simulation (TrieDB mode only).
+    ///
+    /// Returns `None` when TrieDB is inactive, engine_api_tx is unavailable, or the
+    /// request fails. In all fallback cases `bid_simulate` degrades gracefully (slower
+    /// state root via full trie traversal, no triedb prefetching).
+    async fn fetch_parent_difflayers_for_bid(
+        parent_hash: &alloy_primitives::B256,
+    ) -> Option<rust_eth_triedb_common::DiffLayers> {
+        if !rust_eth_triedb::triedb_manager::is_triedb_active() {
+            return None;
+        }
+        let engine_api_tx = crate::shared::get_engine_api_tx()?;
+        match crate::node::evm::request_difflayer(&engine_api_tx, *parent_hash).await {
+            Ok(difflayers) => Some(difflayers),
+            Err(e) => {
+                warn!(
+                    target: "bsc::mev",
+                    %parent_hash,
+                    error = %e,
+                    "Failed to fetch parent difflayers for bid simulation; triedb state root will fall back to full trie traversal"
+                );
+                None
             }
         }
     }

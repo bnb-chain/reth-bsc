@@ -40,14 +40,27 @@ use tracing::{debug, trace, warn};
 const RECOVERED_PROPOSER_CACHE_NUM: usize = 4096;
 const ADDRESS_LENGTH: usize = 20; // Ethereum address length in bytes
 
+/// Applies left-over reservation and mining-time cap to raw delay.
 #[inline]
 fn apply_mining_delay_with_leftover(
     mut delay_ms: u64,
     period_ms: u64,
     last_block_in_turn: bool,
+    first_block_in_turn: bool,
     left_over_ms: u64,
 ) -> u64 {
-    let mut time_for_mining_ms = period_ms / 2;
+    if left_over_ms >= period_ms {
+        warn!("Delay invalid argument: left_over_ms={}, period_ms={}", left_over_ms, period_ms);
+    } else if left_over_ms >= delay_ms {
+        delay_ms = 0;
+    } else {
+        delay_ms -= left_over_ms;
+    }
+
+    // Unlike go-bsc (which uses `period / 2`), reth-bsc uses `period / 5` for the
+    // last-block-in-turn cap because trie root computation is significantly slower
+    // and needs more reserved time to avoid spilling into the next validator's slot.
+    let mut time_for_mining_ms = period_ms / 5;
     if !last_block_in_turn {
         time_for_mining_ms = period_ms;
     }
@@ -55,13 +68,11 @@ fn apply_mining_delay_with_leftover(
         delay_ms = time_for_mining_ms;
     }
 
-    // Keep parity with go-bsc: apply left-over reservation after delay capping.
-    if left_over_ms >= period_ms {
-        warn!("Delay invalid argument: left_over_ms={}, period_ms={}", left_over_ms, period_ms);
-    } else if left_over_ms >= delay_ms {
-        delay_ms = 0;
-    } else {
-        delay_ms -= left_over_ms;
+    // For the first block in a turn, a minimum 50ms delay is enforced so the block
+    // is not empty — validator switches require re-execution and root recomputation,
+    // leaving very little time for transaction inclusion.
+    if delay_ms == 0 && first_block_in_turn {
+        delay_ms = 50;
     }
 
     delay_ms
@@ -589,13 +600,21 @@ where
 
     /// - `snap.block_interval` is used as the period (milliseconds).
     /// - Applies `left_over_ms` reservation for finalization work.
-    /// - Caps blocking time to half the period when last block in one turn (or tl == 1),
-    ///   otherwise a full period.
+    /// - Caps blocking time to `period / 5` when last block in turn to reserve
+    ///   time for trie root computation; otherwise a full period.
+    /// - Ensures first block in turn gets at least 50ms for transaction inclusion.
     pub fn delay_for_mining(&self, snap: &Snapshot, header: &Header, left_over_ms: u64) -> u64 {
         let period_ms = snap.block_interval;
         let last_block_in_turn = snap.last_block_in_one_turn(header.number);
+        let first_block_in_turn = snap.first_block_in_one_turn(header.number);
         let delay_ms = self.delay_for_ramanujan_fork(snap, header);
-        apply_mining_delay_with_leftover(delay_ms, period_ms, last_block_in_turn, left_over_ms)
+        apply_mining_delay_with_leftover(
+            delay_ms,
+            period_ms,
+            last_block_in_turn,
+            first_block_in_turn,
+            left_over_ms,
+        )
     }
 
     pub fn prepare_timestamp(
@@ -931,14 +950,30 @@ mod tests {
     }
 
     #[test]
-    fn mining_delay_caps_before_leftover_is_applied() {
-        // Raw delay (2500) is first capped to half-period (1500), then left-over makes it zero.
-        assert_eq!(apply_mining_delay_with_leftover(2500, 3000, true, 2000), 0);
+    fn mining_delay_last_block_in_turn_caps_to_period_div_5() {
+        // last_block_in_turn: left_over applied first (2500 - 2000 = 500),
+        // then cap to period/5 = 600; 500 <= 600 so result is 500.
+        assert_eq!(apply_mining_delay_with_leftover(2500, 3000, true, false, 2000), 500);
     }
 
     #[test]
-    fn mining_delay_uses_full_period_cap_when_not_last_block_in_turn() {
-        // Not-last block uses full-period cap: min(3500, 3000) - 200 = 2800.
-        assert_eq!(apply_mining_delay_with_leftover(3500, 3000, false, 200), 2800);
+    fn mining_delay_last_block_in_turn_capped() {
+        // last_block_in_turn: left_over applied first (2500 - 100 = 2400),
+        // then cap to period/5 = 600; 2400 > 600 so result is 600.
+        assert_eq!(apply_mining_delay_with_leftover(2500, 3000, true, false, 100), 600);
+    }
+
+    #[test]
+    fn mining_delay_not_last_block_uses_full_period_cap() {
+        // not last_block_in_turn: left_over applied first (3500 - 200 = 3300),
+        // then cap to full period = 3000; result is 3000.
+        assert_eq!(apply_mining_delay_with_leftover(3500, 3000, false, false, 200), 3000);
+    }
+
+    #[test]
+    fn mining_delay_first_block_in_turn_gets_minimum_50ms() {
+        // first_block_in_turn: left_over (600) >= delay (500), so delay = 0,
+        // then first_block_in_turn minimum kicks in: result is 50.
+        assert_eq!(apply_mining_delay_with_leftover(500, 3000, false, true, 600), 50);
     }
 }
