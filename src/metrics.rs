@@ -188,6 +188,24 @@ pub struct BscMinerMetrics {
     /// This measures how long it takes from block creation to network broadcast
     /// Note: Value is stored in nanoseconds to match Golang implementation
     pub block_broadcast_delay_seconds: Histogram,
+
+    /// Total number of local payload rebuilds that were actually queued
+    pub payload_rebuilds_attempted_total: Counter,
+
+    /// Total number of rebuild evaluations skipped because cooldown had not elapsed
+    pub payload_rebuilds_skipped_cooldown_total: Counter,
+
+    /// Total number of rebuild evaluations skipped because estimated uplift was too low
+    pub payload_rebuilds_skipped_value_total: Counter,
+
+    /// Total number of rebuild evaluations skipped because there was not enough time left
+    pub payload_rebuilds_skipped_time_total: Counter,
+
+    /// Total number of near-deadline final-shot rebuilds used
+    pub payload_rebuilds_final_shot_total: Counter,
+
+    /// Current estimated uplift over the last local payload, in basis points
+    pub payload_rebuild_estimated_uplift_bps: Gauge,
 }
 
 /// Metrics for BSC fast finality

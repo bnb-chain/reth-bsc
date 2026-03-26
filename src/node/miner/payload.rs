@@ -1,5 +1,6 @@
 use crate::chainspec::BscChainSpec;
 use crate::consensus::eip4844::{calc_blob_fee, is_blob_eligible_block, BLOB_TX_BLOB_GAS_PER_BLOB};
+use crate::consensus::parlia::util::calculate_millisecond_timestamp;
 use crate::consensus::parlia::Parlia;
 use crate::evm::blacklist;
 use crate::hardforks::BscHardforks;
@@ -57,8 +58,34 @@ use tracing::{debug, info, trace, warn};
 /// 120ms to avoid missing the block deadline or eating into the next block's time budget.
 pub const DELAY_LEFT_OVER: u64 = 120;
 
-/// Time multiplier for retry condition check
-const TIME_MULTIPLIER: u32 = 2;
+/// Minimum estimated fee uplift required for a normal rebuild, expressed in basis points.
+const NORMAL_REBUILD_UPLIFT_BPS: u64 = 1_500;
+
+/// Higher uplift threshold required for the single near-deadline rebuild.
+const FINAL_SHOT_UPLIFT_BPS: u64 = 3_000;
+
+/// Normal rebuild cooldown, expressed as a fraction of the last completed build duration.
+const NORMAL_COOLDOWN_NUM: u32 = 1;
+const NORMAL_COOLDOWN_DEN: u32 = 2;
+
+/// Minimum time left required for the final-shot rebuild, expressed as a multiple of the last
+/// completed build duration.
+const FINAL_SHOT_TIME_NUM: u32 = 115;
+const FINAL_SHOT_TIME_DEN: u32 = 100;
+
+/// Final-shot rebuilds are only allowed in the near-deadline window.
+const FINAL_SHOT_WINDOW_NUM: u32 = 2;
+const FINAL_SHOT_WINDOW_DEN: u32 = 1;
+
+/// Safety margin that must remain after a rebuild finishes.
+const FINALIZE_MARGIN_MS: u64 = 40;
+
+/// Synthetic comparison base for empty payloads so dust does not look infinitely valuable.
+const EMPTY_PAYLOAD_COMPARISON_BASE_WEI: u128 = 50_000_000_000_000;
+
+/// Cap the per-tx fee estimate so a single high-gas transaction does not dominate the uplift
+/// accumulator.
+const ESTIMATED_FEE_GAS_CAP: u64 = 210_000;
 
 /// Global trace ID counter for payload building operations
 static TRACE_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -71,6 +98,129 @@ pub fn generate_trace_id() -> u64 {
     TRACE_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
+fn initial_out_of_turn_build_wait(
+    parlia: &Parlia<BscChainSpec>,
+    mining_ctx: &MiningContext,
+) -> std::time::Duration {
+    if mining_ctx.is_inturn {
+        return std::time::Duration::ZERO;
+    }
+
+    let Some(header) = mining_ctx.header.as_ref() else {
+        return std::time::Duration::ZERO;
+    };
+
+    let present_timestamp = parlia.present_millis_timestamp();
+    let block_timestamp = calculate_millisecond_timestamp(header);
+    let before_sealing = block_timestamp.saturating_sub(present_timestamp);
+    let wait_ms = before_sealing.saturating_sub(mining_ctx.parent_snapshot.block_interval);
+
+    std::time::Duration::from_millis(wait_ms)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LocalRebuildPolicyInput {
+    current_payload_fees: U256,
+    estimated_new_fees: U256,
+    last_build_duration: std::time::Duration,
+    since_last_build: std::time::Duration,
+    remaining_duration: std::time::Duration,
+    final_shot_used: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalRebuildAction {
+    ReturnBestPayload,
+    RebuildNow { final_shot: bool },
+    WaitForMoreValue,
+    WaitForCooldown(std::time::Duration),
+}
+
+fn duration_mul_ratio(
+    duration: std::time::Duration,
+    numerator: u32,
+    denominator: u32,
+) -> std::time::Duration {
+    let scaled_millis =
+        duration.as_millis().saturating_mul(numerator as u128) / denominator as u128;
+    std::time::Duration::from_millis(scaled_millis.min(u64::MAX as u128) as u64)
+}
+
+fn local_rebuild_comparison_base(current_payload_fees: U256) -> U256 {
+    if current_payload_fees.is_zero() {
+        U256::from(EMPTY_PAYLOAD_COMPARISON_BASE_WEI)
+    } else {
+        current_payload_fees
+    }
+}
+
+fn estimated_uplift_meets_threshold(
+    estimated_new_fees: U256,
+    comparison_base: U256,
+    threshold_bps: u64,
+) -> bool {
+    estimated_new_fees.saturating_mul(U256::from(10_000_u64))
+        >= comparison_base.saturating_mul(U256::from(threshold_bps))
+}
+
+fn estimated_uplift_bps(current_payload_fees: U256, estimated_new_fees: U256) -> u64 {
+    let comparison_base = local_rebuild_comparison_base(current_payload_fees);
+    if comparison_base.is_zero() {
+        return 0;
+    }
+
+    (estimated_new_fees.saturating_mul(U256::from(10_000_u64)) / comparison_base).to::<u64>()
+}
+
+fn miner_metrics() -> &'static crate::metrics::BscMinerMetrics {
+    use once_cell::sync::Lazy;
+    static MINER_METRICS: Lazy<crate::metrics::BscMinerMetrics> =
+        Lazy::new(crate::metrics::BscMinerMetrics::default);
+    &MINER_METRICS
+}
+
+fn local_rebuild_action(input: LocalRebuildPolicyInput) -> LocalRebuildAction {
+    let finalize_margin = std::time::Duration::from_millis(FINALIZE_MARGIN_MS);
+    if input.remaining_duration < input.last_build_duration.saturating_add(finalize_margin) {
+        return LocalRebuildAction::ReturnBestPayload;
+    }
+
+    let comparison_base = local_rebuild_comparison_base(input.current_payload_fees);
+    let normal_cooldown =
+        duration_mul_ratio(input.last_build_duration, NORMAL_COOLDOWN_NUM, NORMAL_COOLDOWN_DEN);
+    let final_shot_min_remaining =
+        duration_mul_ratio(input.last_build_duration, FINAL_SHOT_TIME_NUM, FINAL_SHOT_TIME_DEN);
+    let final_shot_max_remaining =
+        duration_mul_ratio(input.last_build_duration, FINAL_SHOT_WINDOW_NUM, FINAL_SHOT_WINDOW_DEN);
+
+    if !input.final_shot_used
+        && input.remaining_duration >= final_shot_min_remaining
+        && input.remaining_duration <= final_shot_max_remaining
+        && estimated_uplift_meets_threshold(
+            input.estimated_new_fees,
+            comparison_base,
+            FINAL_SHOT_UPLIFT_BPS,
+        )
+    {
+        return LocalRebuildAction::RebuildNow { final_shot: true };
+    }
+
+    if input.since_last_build < normal_cooldown {
+        return LocalRebuildAction::WaitForCooldown(
+            normal_cooldown.saturating_sub(input.since_last_build),
+        );
+    }
+
+    if estimated_uplift_meets_threshold(
+        input.estimated_new_fees,
+        comparison_base,
+        NORMAL_REBUILD_UPLIFT_BPS,
+    ) {
+        return LocalRebuildAction::RebuildNow { final_shot: false };
+    }
+
+    LocalRebuildAction::WaitForMoreValue
+}
 fn validate_bsc_sidecar(
     sidecar: &alloy_eips::eip7594::BlobTransactionSidecarVariant,
 ) -> Result<(), Eip4844PoolTransactionError> {
@@ -904,6 +1054,18 @@ where
     simulator: Arc<BidSimulator<Client, Pool>>,
     /// Job start time for tracking total duration
     job_start_time: std::time::Instant,
+    /// Pending block base fee used for cheap tx uplift estimates
+    pending_basefee: u64,
+    /// Duration of the last completed local build
+    last_local_build_duration: Option<std::time::Duration>,
+    /// Completion time of the last completed local build
+    last_local_build_finished_at: Option<std::time::Instant>,
+    /// Fees of the latest local payload snapshot used as the rebuild comparison baseline
+    current_local_payload_fees: U256,
+    /// Estimated fees from txs that arrived since the last completed local build
+    estimated_new_local_fees: U256,
+    /// Whether the job has already used its single near-deadline rebuild
+    final_shot_used: bool,
     /// Unique trace ID for this payload job
     trace_id: u64,
 }
@@ -944,6 +1106,7 @@ where
             mining_ctx.header.as_ref().unwrap(),
             DELAY_LEFT_OVER,
         );
+        let pending_basefee = builder.pool.block_info().pending_basefee;
 
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -987,6 +1150,12 @@ where
             join_handle: tokio::task::JoinSet::new(),
             simulator,
             job_start_time: std::time::Instant::now(),
+            pending_basefee,
+            last_local_build_duration: None,
+            last_local_build_finished_at: None,
+            current_local_payload_fees: U256::ZERO,
+            estimated_new_local_fees: U256::ZERO,
+            final_shot_used: false,
             trace_id,
         };
         let handle = BscPayloadJobHandle { abort_tx };
@@ -1014,6 +1183,30 @@ where
         .await;
 
         let mut start_time = std::time::Instant::now();
+        let initial_wait = initial_out_of_turn_build_wait(&self.parlia, &self.mining_ctx);
+        if !initial_wait.is_zero() {
+            debug!(
+                target: "bsc::miner::payload",
+                trace_id = self.trace_id,
+                block_number = self.build_args.config.parent_header.number() + 1,
+                wait_ms = initial_wait.as_millis(),
+                "Applying out-of-turn backoff before starting payload build"
+            );
+            tokio::select! {
+                _ = tokio::time::sleep(initial_wait) => {}
+                _ = &mut self.abort_rx => {
+                    self.build_args.cancel.clone().cancel();
+                    self.is_aborted = true;
+                    return Err(Box::new(BscPayloadJobError::JobAborted));
+                }
+            }
+        }
+
+        // The job timeout is the budget for payload building attempts. When we intentionally
+        // back off out-of-turn to match go-bsc behavior, start accounting that budget only
+        // after the wait completes.
+        self.job_start_time = std::time::Instant::now();
+
         if let Err(err) = self.try_build_tx.send(()) {
             warn!(
                 target: "bsc::miner::payload",
@@ -1088,7 +1281,6 @@ where
                                 return Err(Box::new(BscPayloadJobError::JobAborted));
                             }
                             let elapsed = start_time.elapsed();
-                            let payload_tx_count = payload.block().body().transaction_count();
                             debug!(
                                 target: "bsc::miner::payload",
                                 trace_id = self.trace_id,
@@ -1102,8 +1294,9 @@ where
                                 retries = self.retries,
                                 "Succeed to try new build"
                             );
+                            self.record_local_build(&payload, elapsed);
                             self.potential_payloads.push(payload);
-                            let mut new_tx_count = 0;
+                            let mut wait_for_more_txs = None;
                             // loop wait new transactions or timeout.
                             loop {
                                 // Calculate remaining time from job start
@@ -1141,6 +1334,79 @@ where
                                         return self.try_return_best_payload();
                                     }
 
+                                    _ = async {
+                                        let wait_duration =
+                                            wait_for_more_txs.expect("guarded by wait_for_more_txs.is_some()");
+                                        tokio::time::sleep(wait_duration).await;
+                                    }, if wait_for_more_txs.is_some() => {
+                                        wait_for_more_txs = None;
+
+                                        let fresh_job_elapsed = self.job_start_time.elapsed();
+                                        let fresh_remaining_duration = if fresh_job_elapsed < self.timeout {
+                                            self.timeout - fresh_job_elapsed
+                                        } else {
+                                            std::time::Duration::ZERO
+                                        };
+
+                                        if let Some(action) =
+                                            self.evaluate_local_rebuild_action(fresh_remaining_duration)
+                                        {
+                                            self.record_local_rebuild_decision_metrics(action);
+                                            match action {
+                                                LocalRebuildAction::RebuildNow { final_shot } => {
+                                                    if final_shot {
+                                                        self.final_shot_used = true;
+                                                    }
+                                                    if let Err(err) = self.try_build_tx.send(()) {
+                                                        warn!(
+                                                            target: "bsc::miner::payload",
+                                                            trace_id = self.trace_id,
+                                                            block_number = self.build_args.config.parent_header.number() + 1,
+                                                            is_inturn = self.mining_ctx.is_inturn,
+                                                            retries = self.retries,
+                                                            error = ?err,
+                                                            "Failed to send to try build queue"
+                                                        );
+                                                        return self.try_return_best_payload();
+                                                    }
+                                                    debug!(
+                                                        target: "bsc::miner::payload",
+                                                        trace_id = self.trace_id,
+                                                        block_number = self.build_args.config.parent_header.number() + 1,
+                                                        is_inturn = self.mining_ctx.is_inturn,
+                                                        retries = self.retries,
+                                                        estimated_new_local_fees = %self.estimated_new_local_fees,
+                                                        current_local_payload_fees = %self.current_local_payload_fees,
+                                                        remaining_duration_ms = fresh_remaining_duration.as_millis(),
+                                                        last_cost_time = ?elapsed,
+                                                        final_shot,
+                                                        "Queued another payload build after local uplift re-evaluation"
+                                                    );
+                                                    break;
+                                                }
+                                                LocalRebuildAction::ReturnBestPayload => {
+                                                    debug!(
+                                                        target: "bsc::miner::payload",
+                                                        trace_id = self.trace_id,
+                                                        block_number = self.build_args.config.parent_header.number() + 1,
+                                                        is_inturn = self.mining_ctx.is_inturn,
+                                                        retries = self.retries,
+                                                        estimated_new_local_fees = %self.estimated_new_local_fees,
+                                                        current_local_payload_fees = %self.current_local_payload_fees,
+                                                        remaining_duration_ms = fresh_remaining_duration.as_millis(),
+                                                        last_cost_time = ?elapsed,
+                                                        "Returning best payload because there is not enough time left for another value-gated rebuild"
+                                                    );
+                                                    return self.try_return_best_payload();
+                                                }
+                                                LocalRebuildAction::WaitForCooldown(wait_duration) => {
+                                                    wait_for_more_txs = Some(wait_duration);
+                                                }
+                                                LocalRebuildAction::WaitForMoreValue => {}
+                                            }
+                                        }
+                                    }
+
                                     // Abort by new head.
                                     _ = &mut self.abort_rx => {
                                         info!(
@@ -1157,72 +1423,84 @@ where
                                         return Err(Box::new(BscPayloadJobError::JobAborted));
                                     }
 
-                                    Some(_tx_hash) = self.tx_listener.recv() => {
-                                        new_tx_count+=1;
-                                        let mining_delay = self.parlia.delay_for_mining(
-                                            &self.mining_ctx.parent_snapshot,
-                                            self.mining_ctx.header.as_ref().unwrap(),
-                                            DELAY_LEFT_OVER);
-                                        if std::time::Duration::from_millis(mining_delay) < elapsed {
-                                            debug!(
-                                                target: "bsc::miner::payload",
-                                                trace_id = self.trace_id,
-                                                block_number = self.build_args.config.parent_header.number() + 1,
-                                                is_inturn = self.mining_ctx.is_inturn,
-                                                retries = self.retries,
-                                                new_mining_delay = ?std::time::Duration::from_millis(mining_delay),
-                                                last_cost_time = ?elapsed,
-                                                "try return best payload due to mining_delay < elapsed"
-                                            );
-                                            return self.try_return_best_payload();
-                                        } else if std::time::Duration::from_millis(mining_delay) < elapsed * TIME_MULTIPLIER {
-                                            if let Err(err) = self.try_build_tx.send(()) {
-                                                warn!(
-                                                    target: "bsc::miner::payload",
-                                                    trace_id = self.trace_id,
-                                                    block_number = self.build_args.config.parent_header.number() + 1,
-                                                    is_inturn = self.mining_ctx.is_inturn,
-                                                    retries = self.retries,
-                                                    error = ?err,
-                                                    "Failed to send to try build queue"
-                                                );
-                                                return self.try_return_best_payload();
+                                    Some(tx_hash) = self.tx_listener.recv() => {
+                                        self.estimated_new_local_fees = self
+                                            .estimated_new_local_fees
+                                            .saturating_add(self.estimate_pending_tx_fee_uplift(&tx_hash));
+                                        while let Ok(tx_hash) = self.tx_listener.try_recv() {
+                                            self.estimated_new_local_fees = self
+                                                .estimated_new_local_fees
+                                                .saturating_add(self.estimate_pending_tx_fee_uplift(&tx_hash));
+                                        }
+
+                                        let fresh_job_elapsed = self.job_start_time.elapsed();
+                                        let fresh_remaining_duration = if fresh_job_elapsed < self.timeout {
+                                            self.timeout - fresh_job_elapsed
+                                        } else {
+                                            std::time::Duration::ZERO
+                                        };
+
+                                        match self.evaluate_local_rebuild_action(fresh_remaining_duration) {
+                                            Some(action) => {
+                                                self.record_local_rebuild_decision_metrics(action);
+                                                match action {
+                                                    LocalRebuildAction::RebuildNow { final_shot } => {
+                                                        if final_shot {
+                                                            self.final_shot_used = true;
+                                                        }
+                                                        if let Err(err) = self.try_build_tx.send(()) {
+                                                            warn!(
+                                                                target: "bsc::miner::payload",
+                                                                trace_id = self.trace_id,
+                                                                block_number = self.build_args.config.parent_header.number() + 1,
+                                                                is_inturn = self.mining_ctx.is_inturn,
+                                                                retries = self.retries,
+                                                                error = ?err,
+                                                                "Failed to send to try build queue"
+                                                            );
+                                                            return self.try_return_best_payload();
+                                                        }
+                                                        debug!(
+                                                            target: "bsc::miner::payload",
+                                                            trace_id = self.trace_id,
+                                                            block_number = self.build_args.config.parent_header.number() + 1,
+                                                            is_inturn = self.mining_ctx.is_inturn,
+                                                            retries = self.retries,
+                                                            estimated_new_local_fees = %self.estimated_new_local_fees,
+                                                            current_local_payload_fees = %self.current_local_payload_fees,
+                                                            remaining_duration_ms = fresh_remaining_duration.as_millis(),
+                                                            last_cost_time = ?elapsed,
+                                                            final_shot,
+                                                            "Queued another payload build after batching local fee uplift"
+                                                        );
+                                                        break;
+                                                    }
+                                                    LocalRebuildAction::ReturnBestPayload => {
+                                                        debug!(
+                                                            target: "bsc::miner::payload",
+                                                            trace_id = self.trace_id,
+                                                            block_number = self.build_args.config.parent_header.number() + 1,
+                                                            is_inturn = self.mining_ctx.is_inturn,
+                                                            retries = self.retries,
+                                                            estimated_new_local_fees = %self.estimated_new_local_fees,
+                                                            current_local_payload_fees = %self.current_local_payload_fees,
+                                                            remaining_duration_ms = fresh_remaining_duration.as_millis(),
+                                                            last_cost_time = ?elapsed,
+                                                            "Returning best payload because there is not enough time left for another value-gated rebuild"
+                                                        );
+                                                        return self.try_return_best_payload();
+                                                    }
+                                                    LocalRebuildAction::WaitForCooldown(wait_duration) => {
+                                                        wait_for_more_txs = Some(wait_duration);
+                                                    }
+                                                    LocalRebuildAction::WaitForMoreValue => {
+                                                        wait_for_more_txs = None;
+                                                    }
+                                                }
                                             }
-                                            debug!(
-                                                target: "bsc::miner::payload",
-                                                trace_id = self.trace_id,
-                                                block_number = self.build_args.config.parent_header.number() + 1,
-                                                is_inturn = self.mining_ctx.is_inturn,
-                                                retries = self.retries,
-                                                last_cost_time = ?elapsed,
-                                                new_mining_delay = ?std::time::Duration::from_millis(mining_delay),
-                                                "Succeed to send to try build queue"
-                                            );
-                                            break;  // Break out of the loop and wait for the next payload
-                                        } else if new_tx_count >= payload_tx_count {
-                                            if let Err(err) = self.try_build_tx.send(()) {
-                                                warn!(
-                                                    target: "bsc::miner::payload",
-                                                    trace_id = self.trace_id,
-                                                    block_number = self.build_args.config.parent_header.number() + 1,
-                                                    is_inturn = self.mining_ctx.is_inturn,
-                                                    retries = self.retries,
-                                                    error = ?err,
-                                                    "Failed to send to try build queue"
-                                                );
-                                                return self.try_return_best_payload();
+                                            None => {
+                                                wait_for_more_txs = None;
                                             }
-                                            debug!(
-                                                target: "bsc::miner::payload",
-                                                trace_id = self.trace_id,
-                                                block_number = self.build_args.config.parent_header.number() + 1,
-                                                is_inturn = self.mining_ctx.is_inturn,
-                                                retries = self.retries,
-                                                last_cost_time = ?elapsed,
-                                                new_mining_delay = ?std::time::Duration::from_millis(mining_delay),
-                                                "Succeed to send to try build queue"
-                                            );
-                                            break; // Break out of the loop and wait for the next payload
                                         }
                                     }
                                 }
@@ -1298,6 +1576,74 @@ where
                     self.is_aborted = true;
                     return Err(Box::new(BscPayloadJobError::JobAborted));
                 }
+            }
+        }
+    }
+
+    fn record_local_build(
+        &mut self,
+        payload: &BscBuiltPayload,
+        build_duration: std::time::Duration,
+    ) {
+        self.last_local_build_duration = Some(build_duration);
+        self.last_local_build_finished_at = Some(std::time::Instant::now());
+        self.current_local_payload_fees = payload.fees();
+        self.estimated_new_local_fees = U256::ZERO;
+    }
+
+    fn estimate_pending_tx_fee_uplift(&self, tx_hash: &alloy_primitives::B256) -> U256 {
+        let Some(pool_tx) = self.builder.pool.get(tx_hash) else {
+            return U256::ZERO;
+        };
+
+        let effective_tip = pool_tx.effective_tip_per_gas(self.pending_basefee).unwrap_or_default();
+        if effective_tip < self.build_args.min_gas_tip {
+            return U256::ZERO;
+        }
+
+        U256::from(effective_tip)
+            .saturating_mul(U256::from(pool_tx.gas_limit().min(ESTIMATED_FEE_GAS_CAP)))
+    }
+
+    fn evaluate_local_rebuild_action(
+        &self,
+        remaining_duration: std::time::Duration,
+    ) -> Option<LocalRebuildAction> {
+        let last_build_duration = self.last_local_build_duration?;
+        let last_build_finished_at = self.last_local_build_finished_at?;
+
+        Some(local_rebuild_action(LocalRebuildPolicyInput {
+            current_payload_fees: self.current_local_payload_fees,
+            estimated_new_fees: self.estimated_new_local_fees,
+            last_build_duration,
+            since_last_build: last_build_finished_at.elapsed(),
+            remaining_duration,
+            final_shot_used: self.final_shot_used,
+        }))
+    }
+
+    fn record_local_rebuild_decision_metrics(&self, action: LocalRebuildAction) {
+        let metrics = miner_metrics();
+        metrics.payload_rebuild_estimated_uplift_bps.set(estimated_uplift_bps(
+            self.current_local_payload_fees,
+            self.estimated_new_local_fees,
+        ) as f64);
+
+        match action {
+            LocalRebuildAction::RebuildNow { final_shot } => {
+                metrics.payload_rebuilds_attempted_total.increment(1);
+                if final_shot {
+                    metrics.payload_rebuilds_final_shot_total.increment(1);
+                }
+            }
+            LocalRebuildAction::WaitForCooldown(_) => {
+                metrics.payload_rebuilds_skipped_cooldown_total.increment(1);
+            }
+            LocalRebuildAction::WaitForMoreValue => {
+                metrics.payload_rebuilds_skipped_value_total.increment(1);
+            }
+            LocalRebuildAction::ReturnBestPayload => {
+                metrics.payload_rebuilds_skipped_time_total.increment(1);
             }
         }
     }
@@ -1694,13 +2040,163 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::validate_bsc_sidecar;
+    use super::{
+        initial_out_of_turn_build_wait, local_rebuild_action, validate_bsc_sidecar,
+        LocalRebuildAction, LocalRebuildPolicyInput,
+    };
+    use crate::chainspec::BscChainSpec;
+    use crate::consensus::parlia::Parlia;
+    use crate::consensus::parlia::Snapshot;
+    use crate::node::miner::bsc_miner::MiningContext;
     use alloy_consensus::BlobTransactionSidecar;
+    use alloy_consensus::Header;
     use alloy_eips::eip4844::{Blob, Bytes48};
     use alloy_eips::eip7594::{
         BlobTransactionSidecarEip7594, BlobTransactionSidecarVariant, CELLS_PER_EXT_BLOB,
     };
+    use alloy_primitives::{Address, B256, U256};
     use reth::transaction_pool::error::Eip4844PoolTransactionError;
+    use reth_primitives::SealedHeader;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn test_parlia() -> Parlia<BscChainSpec> {
+        let chain_spec = Arc::new(BscChainSpec { inner: crate::chainspec::bsc::bsc_mainnet() });
+        Parlia::new(chain_spec, 200)
+    }
+
+    fn test_mining_context(
+        parlia: &Parlia<BscChainSpec>,
+        block_interval: u64,
+        delay_ms: u64,
+        is_inturn: bool,
+    ) -> MiningContext {
+        let now_ms = parlia.present_millis_timestamp();
+        let parent_ts_ms = now_ms.saturating_sub(block_interval);
+        let parent_header = Header {
+            number: 1,
+            timestamp: parent_ts_ms / 1000,
+            mix_hash: B256::ZERO,
+            ..Default::default()
+        };
+        let mut header = Header {
+            number: 2,
+            parent_hash: parent_header.hash_slow(),
+            beneficiary: Address::with_last_byte(1),
+            timestamp: (now_ms + delay_ms) / 1000,
+            ..Default::default()
+        };
+        crate::consensus::parlia::util::set_millisecond_part_of_timestamp(
+            now_ms + delay_ms,
+            &mut header,
+        );
+
+        let mut snapshot = Snapshot::new(
+            vec![Address::with_last_byte(1)],
+            1,
+            parent_header.hash_slow(),
+            200,
+            None,
+        );
+        snapshot.block_interval = block_interval;
+
+        MiningContext {
+            header: Some(header),
+            parent_header: SealedHeader::new(parent_header.clone(), parent_header.hash_slow()),
+            parent_snapshot: Arc::new(snapshot),
+            is_inturn,
+            cached_reads: None,
+        }
+    }
+
+    fn simulate_value_gated_rebuilds_after_first_build(
+        current_payload_fees: U256,
+        tx_arrivals: &[(u64, U256)],
+        build_duration: Duration,
+        timeout: Duration,
+    ) -> usize {
+        let mut rebuilds = 0;
+        let mut estimated_new_fees = U256::ZERO;
+        let mut wait_deadline_ms: Option<u64> = None;
+        let final_shot_used = false;
+
+        for &(arrival_ms, estimated_fees) in tx_arrivals {
+            loop {
+                let Some(deadline_ms) = wait_deadline_ms else {
+                    break;
+                };
+                if deadline_ms > arrival_ms {
+                    break;
+                }
+
+                match local_rebuild_action(LocalRebuildPolicyInput {
+                    current_payload_fees,
+                    estimated_new_fees,
+                    last_build_duration: build_duration,
+                    since_last_build: Duration::from_millis(deadline_ms),
+                    remaining_duration: timeout.saturating_sub(Duration::from_millis(deadline_ms)),
+                    final_shot_used,
+                }) {
+                    LocalRebuildAction::RebuildNow { final_shot: _ } => {
+                        rebuilds += 1;
+                        return rebuilds;
+                    }
+                    LocalRebuildAction::ReturnBestPayload
+                    | LocalRebuildAction::WaitForMoreValue => {
+                        break;
+                    }
+                    LocalRebuildAction::WaitForCooldown(wait_duration) => {
+                        wait_deadline_ms = Some(deadline_ms + wait_duration.as_millis() as u64);
+                    }
+                }
+            }
+
+            estimated_new_fees = estimated_new_fees.saturating_add(estimated_fees);
+            match local_rebuild_action(LocalRebuildPolicyInput {
+                current_payload_fees,
+                estimated_new_fees,
+                last_build_duration: build_duration,
+                since_last_build: Duration::from_millis(arrival_ms),
+                remaining_duration: timeout.saturating_sub(Duration::from_millis(arrival_ms)),
+                final_shot_used,
+            }) {
+                LocalRebuildAction::RebuildNow { final_shot: _ } => {
+                    rebuilds += 1;
+                    return rebuilds;
+                }
+                LocalRebuildAction::ReturnBestPayload | LocalRebuildAction::WaitForMoreValue => {
+                    wait_deadline_ms = None;
+                }
+                LocalRebuildAction::WaitForCooldown(wait_duration) => {
+                    wait_deadline_ms = Some(arrival_ms + wait_duration.as_millis() as u64);
+                }
+            }
+        }
+
+        while let Some(deadline_ms) = wait_deadline_ms {
+            match local_rebuild_action(LocalRebuildPolicyInput {
+                current_payload_fees,
+                estimated_new_fees,
+                last_build_duration: build_duration,
+                since_last_build: Duration::from_millis(deadline_ms),
+                remaining_duration: timeout.saturating_sub(Duration::from_millis(deadline_ms)),
+                final_shot_used,
+            }) {
+                LocalRebuildAction::RebuildNow { final_shot: _ } => {
+                    rebuilds += 1;
+                    return rebuilds;
+                }
+                LocalRebuildAction::ReturnBestPayload | LocalRebuildAction::WaitForMoreValue => {
+                    return rebuilds;
+                }
+                LocalRebuildAction::WaitForCooldown(wait_duration) => {
+                    wait_deadline_ms = Some(deadline_ms + wait_duration.as_millis() as u64);
+                }
+            }
+        }
+
+        rebuilds
+    }
 
     #[test]
     fn bsc_sidecar_accepts_eip4844() {
@@ -1721,5 +2217,158 @@ mod tests {
             validate_bsc_sidecar(&variant),
             Err(Eip4844PoolTransactionError::UnexpectedEip7594SidecarBeforeOsaka)
         ));
+    }
+
+    #[test]
+    fn out_of_turn_wait_matches_geth_style_backoff() {
+        let parlia = test_parlia();
+        let ctx = test_mining_context(&parlia, 450, 900, false);
+        let wait = initial_out_of_turn_build_wait(&parlia, &ctx);
+        assert!(wait >= Duration::from_millis(449));
+        assert!(wait <= Duration::from_millis(450));
+
+        let inturn_ctx = test_mining_context(&parlia, 450, 900, true);
+        assert_eq!(initial_out_of_turn_build_wait(&parlia, &inturn_ctx), Duration::ZERO);
+    }
+
+    #[test]
+    fn local_rebuild_policy_skips_when_uplift_is_below_threshold() {
+        let action = local_rebuild_action(LocalRebuildPolicyInput {
+            current_payload_fees: U256::from(1_000_000_u64),
+            estimated_new_fees: U256::from(100_000_u64),
+            last_build_duration: Duration::from_millis(100),
+            since_last_build: Duration::from_millis(60),
+            remaining_duration: Duration::from_millis(300),
+            final_shot_used: false,
+        });
+
+        assert_eq!(action, LocalRebuildAction::WaitForMoreValue);
+    }
+
+    #[test]
+    fn local_rebuild_policy_rebuilds_after_cooldown_when_uplift_is_high_enough() {
+        let action = local_rebuild_action(LocalRebuildPolicyInput {
+            current_payload_fees: U256::from(1_000_000_u64),
+            estimated_new_fees: U256::from(200_000_u64),
+            last_build_duration: Duration::from_millis(100),
+            since_last_build: Duration::from_millis(60),
+            remaining_duration: Duration::from_millis(300),
+            final_shot_used: false,
+        });
+
+        assert_eq!(action, LocalRebuildAction::RebuildNow { final_shot: false });
+    }
+
+    #[test]
+    fn local_rebuild_policy_returns_best_when_remaining_time_cannot_cover_rebuild() {
+        let action = local_rebuild_action(LocalRebuildPolicyInput {
+            current_payload_fees: U256::from(1_000_000_u64),
+            estimated_new_fees: U256::from(500_000_u64),
+            last_build_duration: Duration::from_millis(100),
+            since_last_build: Duration::from_millis(80),
+            remaining_duration: Duration::from_millis(139),
+            final_shot_used: false,
+        });
+
+        assert_eq!(action, LocalRebuildAction::ReturnBestPayload);
+    }
+
+    #[test]
+    fn local_rebuild_policy_allows_one_final_shot_in_near_deadline_window() {
+        let action = local_rebuild_action(LocalRebuildPolicyInput {
+            current_payload_fees: U256::from(1_000_000_u64),
+            estimated_new_fees: U256::from(350_000_u64),
+            last_build_duration: Duration::from_millis(100),
+            since_last_build: Duration::from_millis(20),
+            remaining_duration: Duration::from_millis(180),
+            final_shot_used: false,
+        });
+
+        assert_eq!(action, LocalRebuildAction::RebuildNow { final_shot: true });
+    }
+
+    #[test]
+    fn local_rebuild_policy_does_not_allow_second_final_shot() {
+        let action = local_rebuild_action(LocalRebuildPolicyInput {
+            current_payload_fees: U256::from(1_000_000_u64),
+            estimated_new_fees: U256::from(350_000_u64),
+            last_build_duration: Duration::from_millis(100),
+            since_last_build: Duration::from_millis(20),
+            remaining_duration: Duration::from_millis(180),
+            final_shot_used: true,
+        });
+
+        assert_eq!(action, LocalRebuildAction::WaitForCooldown(Duration::from_millis(30)));
+    }
+
+    #[test]
+    fn local_rebuild_policy_uses_synthetic_baseline_for_empty_payloads() {
+        let action = local_rebuild_action(LocalRebuildPolicyInput {
+            current_payload_fees: U256::ZERO,
+            estimated_new_fees: U256::from(1_000_000_000_000_u64),
+            last_build_duration: Duration::from_millis(100),
+            since_last_build: Duration::from_millis(60),
+            remaining_duration: Duration::from_millis(300),
+            final_shot_used: false,
+        });
+
+        assert_eq!(action, LocalRebuildAction::WaitForMoreValue);
+    }
+
+    #[test]
+    fn trickle_load_with_low_estimated_uplift_does_not_rebuild() {
+        let arrivals: Vec<(u64, U256)> =
+            (10..=200).step_by(10).map(|ms| (ms, U256::from(5_000_u64))).collect();
+        let rebuilds = simulate_value_gated_rebuilds_after_first_build(
+            U256::from(1_000_000_u64),
+            &arrivals,
+            Duration::from_millis(100),
+            Duration::from_millis(300),
+        );
+
+        assert_eq!(rebuilds, 0);
+    }
+
+    #[test]
+    fn meaningful_uplift_after_cooldown_triggers_exactly_one_rebuild() {
+        let arrivals = vec![(60, U256::from(200_000_u64))];
+        let rebuilds = simulate_value_gated_rebuilds_after_first_build(
+            U256::from(1_000_000_u64),
+            &arrivals,
+            Duration::from_millis(100),
+            Duration::from_millis(300),
+        );
+
+        assert_eq!(rebuilds, 1);
+    }
+
+    #[test]
+    fn cooldown_timer_can_trigger_rebuild_without_another_tx_arrival() {
+        let arrivals = vec![
+            (10, U256::from(50_000_u64)),
+            (20, U256::from(50_000_u64)),
+            (30, U256::from(50_000_u64)),
+        ];
+        let rebuilds = simulate_value_gated_rebuilds_after_first_build(
+            U256::from(1_000_000_u64),
+            &arrivals,
+            Duration::from_millis(100),
+            Duration::from_millis(300),
+        );
+
+        assert_eq!(rebuilds, 1);
+    }
+
+    #[test]
+    fn realistic_short_slot_with_slow_first_build_skips_second_rebuild() {
+        let arrivals = vec![(20, U256::from(200_000_u64))];
+        let rebuilds = simulate_value_gated_rebuilds_after_first_build(
+            U256::from(1_000_000_u64),
+            &arrivals,
+            Duration::from_millis(331),
+            Duration::from_millis(419),
+        );
+
+        assert_eq!(rebuilds, 0);
     }
 }
