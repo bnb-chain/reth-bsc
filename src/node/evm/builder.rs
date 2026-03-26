@@ -1,13 +1,24 @@
-use crate::{BscPrimitives, hardforks::BscHardforks, node::evm::{assembler::{BscBlockAssembler, BscBlockAssemblerInput}, config::{BscBlockExecutionCtx, BscBlockExecutorFactory, BscExecutionSharedCtx}, executor::BscBlockExecutor, factory::BscEvmFactory, pre_execution::{TURN_LENGTH_CACHE, VALIDATOR_CACHE}}};
-use reth_evm::execute::{BlockBuilder, BlockBuilderOutcome, BlockExecutionError, ExecutorTx};
-use alloy_evm::eth::receipt_builder::ReceiptBuilder;
-use reth_primitives_traits::{HeaderTy, NodePrimitives, Recovered, RecoveredBlock, SealedHeader, SignerRecoverable, TxTy};
-use reth_provider::StateProvider;
-use revm::database::{State, states::bundle_state::BundleRetention};
-use revm::context::BlockEnv;
+use crate::{
+    hardforks::BscHardforks,
+    node::evm::{
+        assembler::{BscBlockAssembler, BscBlockAssemblerInput},
+        config::{BscBlockExecutionCtx, BscBlockExecutorFactory, BscExecutionSharedCtx},
+        executor::BscBlockExecutor,
+        factory::BscEvmFactory,
+        pre_execution::{TURN_LENGTH_CACHE, VALIDATOR_CACHE},
+    },
+    BscPrimitives,
+};
 use alloy_evm::block::BlockExecutor;
+use alloy_evm::eth::receipt_builder::ReceiptBuilder;
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
-
+use reth_evm::execute::{BlockBuilder, BlockBuilderOutcome, BlockExecutionError, ExecutorTx};
+use reth_primitives_traits::{
+    HeaderTy, NodePrimitives, Recovered, RecoveredBlock, SealedHeader, SignerRecoverable, TxTy,
+};
+use reth_provider::StateProvider;
+use revm::context::BlockEnv;
+use revm::database::{states::bundle_state::BundleRetention, State};
 
 /// rewrite BasicBlockBuilder, mainly about the finish() trait.
 /// add system txs to sealed block.
@@ -42,14 +53,7 @@ where
         assembler: &'a BscBlockAssembler<crate::chainspec::BscChainSpec>,
         parent: &'a SealedHeader<HeaderTy<BscPrimitives>>,
     ) -> Self {
-        Self {
-            executor,
-            transactions: Vec::new(),
-            ctx,
-            shared_ctx,
-            parent,
-            assembler,
-        }
+        Self { executor, transactions: Vec::new(), ctx, shared_ctx, parent, assembler }
     }
 }
 
@@ -104,7 +108,10 @@ where
         let (evm, result) = self.executor.finish()?;
         let (db, evm_env) = evm.finish();
 
-        let assembled_system_txs = self.shared_ctx.inner.borrow().assembled_system_txs.clone();
+        let assembled_system_txs = {
+            let mut inner = self.shared_ctx.inner.borrow_mut();
+            std::mem::take(&mut inner.assembled_system_txs)
+        };
         // merge all transitions into bundle state
         db.merge_transitions(BundleRetention::Reverts);
 
@@ -124,38 +131,48 @@ where
         let (transactions, senders): (Vec<_>, Vec<_>) =
             self.transactions.into_iter().map(|tx| tx.into_parts()).unzip();
 
-        // BlockAssemblerInput is non_exhaustive. 
+        // BlockAssemblerInput is non_exhaustive.
         // So define a new struct BscBlockAssemblerInput and a new interface assemble_block_bsc.
-        let bsc_input: BscBlockAssemblerInput<'_, '_, BscBlockExecutorFactory> = BscBlockAssemblerInput {
-            evm_env,
-            execution_ctx: self.ctx,
-            parent: self.parent,
-            transactions: transactions.clone(),
-            output: &result,
-            bundle_state: &db.bundle_state,
-            state_provider: &state,
-            state_root,
-        };
+        let bsc_input: BscBlockAssemblerInput<'_, '_, BscBlockExecutorFactory> =
+            BscBlockAssemblerInput {
+                evm_env,
+                execution_ctx: self.ctx,
+                parent: self.parent,
+                transactions,
+                output: &result,
+                bundle_state: &db.bundle_state,
+                state_provider: &state,
+                state_root,
+            };
         let assemble_start = std::time::Instant::now();
         let block = self.assembler.assemble_block_bsc(bsc_input)?;
+        let block_hash = block.header.hash_slow();
 
         // cache current validators and turn length
         let current_validators = self.shared_ctx.inner.borrow().current_validators.clone();
         if let Some((validators, vote_addresses)) = current_validators {
-            VALIDATOR_CACHE.lock().unwrap().insert(block.header.hash_slow(), (validators, vote_addresses));
-            tracing::debug!("Succeed to update validator cache in builder, block_number: {}, block_hash: {}", block.header.number, block.header.hash_slow());
+            VALIDATOR_CACHE.lock().unwrap().insert(block_hash, (validators, vote_addresses));
+            tracing::debug!(
+                "Succeed to update validator cache in builder, block_number: {}, block_hash: {}",
+                block.header.number,
+                block_hash
+            );
         }
         if let Some(turn_length) = self.shared_ctx.inner.borrow().turn_length {
-            TURN_LENGTH_CACHE.lock().unwrap().insert(block.header.hash_slow(), turn_length);
-            tracing::debug!("Succeed to update turn length cache in builder, block_number: {}, block_hash: {}", block.header.number, block.header.hash_slow());
+            TURN_LENGTH_CACHE.lock().unwrap().insert(block_hash, turn_length);
+            tracing::debug!(
+                "Succeed to update turn length cache in builder, block_number: {}, block_hash: {}",
+                block.header.number,
+                block_hash
+            );
         }
         let assemble_duration = assemble_start.elapsed();
-        
+
         let finish_duration = finish_start.elapsed();
         tracing::debug!(
             target: "bsc::builder",
             block_number = %block.header.number,
-            block_hash = %block.header.hash_slow(),
+            block_hash = %block_hash,
             user_tx_len = user_tx_len,
             system_tx_len = system_tx_len,
             total_tx_len = total_tx_len,

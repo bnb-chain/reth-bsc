@@ -22,6 +22,7 @@ impl PayloadTypes for BscPayloadTypes {
             <<Self::BuiltPayload as BuiltPayload>::Primitives as NodePrimitives>::Block,
         >,
     ) -> Self::ExecutionData {
-        BscExecutionData(block.into_block())
+        let hash = block.hash();
+        BscExecutionData::new_with_hash(block.into_block(), hash)
     }
 }

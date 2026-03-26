@@ -2,15 +2,18 @@
 
 #[cfg(test)]
 mod tests {
+    use crate::node::engine_api::payload::BscPayloadTypes;
     use crate::node::engine_api::validator::{BscEngineValidator, BscExecutionData};
     use crate::chainspec::bsc::bsc_mainnet;
     use crate::{BscBlock, BscBlockBody};
     use crate::chainspec::BscChainSpec;
     use alloy_consensus::Header;
     use alloy_primitives::{Address, B256, U256};
-    use std::sync::Arc;
     use reth_ethereum_primitives::BlockBody;
     use reth_engine_primitives::ExecutionPayload;
+    use reth_payload_primitives::PayloadTypes;
+    use reth_primitives_traits::Block;
+    use std::sync::Arc;
 
     /// Helper function to create a test block
     fn create_test_block(number: u64, parent_hash: B256) -> BscBlock {
@@ -47,7 +50,7 @@ mod tests {
     fn test_execution_data_parent_hash() {
         let parent_hash = B256::random();
         let block = create_test_block(1, parent_hash);
-        let execution_data = BscExecutionData(block);
+        let execution_data = BscExecutionData::new(block);
         
         assert_eq!(execution_data.parent_hash(), parent_hash);
     }
@@ -57,8 +60,37 @@ mod tests {
         let parent_hash = B256::random();
         let block = create_test_block(1, parent_hash);
         let expected_hash = block.header.hash_slow();
-        let execution_data = BscExecutionData(block);
+        let execution_data = BscExecutionData::new(block);
         
+        assert_eq!(execution_data.block_hash(), expected_hash);
+    }
+
+    #[test]
+    fn test_execution_data_new_with_hash_uses_seeded_hash() {
+        let block = create_test_block(1, B256::random());
+        let expected_hash = block.header.hash_slow();
+        let execution_data = BscExecutionData::new_with_hash(block, expected_hash);
+
+        assert_eq!(execution_data.block_hash(), expected_hash);
+    }
+
+    #[test]
+    fn test_execution_data_clone_preserves_seeded_hash() {
+        let block = create_test_block(1, B256::random());
+        let expected_hash = block.header.hash_slow();
+        let execution_data = BscExecutionData::new_with_hash(block, expected_hash);
+        let cloned = execution_data.clone();
+
+        assert_eq!(cloned.block_hash(), expected_hash);
+    }
+
+    #[test]
+    fn test_block_to_payload_preserves_known_hash() {
+        let block = create_test_block(1, B256::random());
+        let expected_hash = block.header.hash_slow();
+        let sealed_block = block.seal_unchecked(expected_hash);
+        let execution_data = BscPayloadTypes::block_to_payload(sealed_block);
+
         assert_eq!(execution_data.block_hash(), expected_hash);
     }
 
@@ -66,7 +98,7 @@ mod tests {
     fn test_execution_data_block_number() {
         let block_number = 12345;
         let block = create_test_block(block_number, B256::random());
-        let execution_data = BscExecutionData(block);
+        let execution_data = BscExecutionData::new(block);
         
         assert_eq!(execution_data.block_number(), block_number);
     }
@@ -75,7 +107,7 @@ mod tests {
     fn test_execution_data_timestamp() {
         let block = create_test_block(1, B256::random());
         let expected_timestamp = block.header.timestamp;
-        let execution_data = BscExecutionData(block);
+        let execution_data = BscExecutionData::new(block);
         
         assert_eq!(execution_data.timestamp(), expected_timestamp);
     }
@@ -84,7 +116,7 @@ mod tests {
     fn test_execution_data_gas_used() {
         let mut block = create_test_block(1, B256::random());
         block.header.gas_used = 1_000_000;
-        let execution_data = BscExecutionData(block);
+        let execution_data = BscExecutionData::new(block);
         
         assert_eq!(execution_data.gas_used(), 1_000_000);
     }
@@ -92,7 +124,7 @@ mod tests {
     #[test]
     fn test_execution_data_withdrawals_none() {
         let block = create_test_block(1, B256::random());
-        let execution_data = BscExecutionData(block);
+        let execution_data = BscExecutionData::new(block);
         
         // BSC doesn't support withdrawals
         assert!(execution_data.withdrawals().is_none());
@@ -101,7 +133,7 @@ mod tests {
     #[test]
     fn test_execution_data_parent_beacon_block_root_none() {
         let block = create_test_block(1, B256::random());
-        let execution_data = BscExecutionData(block);
+        let execution_data = BscExecutionData::new(block);
         
         // BSC doesn't use parent beacon block root
         assert!(execution_data.parent_beacon_block_root().is_none());
@@ -131,7 +163,7 @@ mod tests {
     #[test]
     fn test_execution_data_serialization() {
         let block = create_test_block(1, B256::random());
-        let execution_data = BscExecutionData(block);
+        let execution_data = BscExecutionData::new(block);
         
         // Test that BscExecutionData can be serialized
         let serialized = serde_json::to_string(&execution_data);
@@ -141,7 +173,7 @@ mod tests {
     #[test]
     fn test_execution_data_deserialization() {
         let block = create_test_block(1, B256::random());
-        let execution_data = BscExecutionData(block);
+        let execution_data = BscExecutionData::new(block);
         
         // Serialize and then deserialize
         let serialized = serde_json::to_string(&execution_data).unwrap();
@@ -154,7 +186,7 @@ mod tests {
     fn test_execution_data_with_zero_gas() {
         let mut block = create_test_block(1, B256::random());
         block.header.gas_used = 0;
-        let execution_data = BscExecutionData(block);
+        let execution_data = BscExecutionData::new(block);
         
         assert_eq!(execution_data.gas_used(), 0);
     }
@@ -164,7 +196,7 @@ mod tests {
         let mut block = create_test_block(1, B256::random());
         let gas_limit = block.header.gas_limit;
         block.header.gas_used = gas_limit;
-        let execution_data = BscExecutionData(block);
+        let execution_data = BscExecutionData::new(block);
         
         assert_eq!(execution_data.gas_used(), gas_limit);
     }
@@ -179,7 +211,7 @@ mod tests {
         for difficulty in difficulties {
             let mut block = create_test_block(1, B256::random());
             block.header.difficulty = difficulty;
-            let execution_data = BscExecutionData(block);
+            let execution_data = BscExecutionData::new(block);
             
             assert_eq!(execution_data.block_number(), 1);
         }
@@ -197,7 +229,7 @@ mod tests {
         for timestamp in timestamps {
             let mut block = create_test_block(1, B256::random());
             block.header.timestamp = timestamp;
-            let execution_data = BscExecutionData(block);
+            let execution_data = BscExecutionData::new(block);
             
             assert_eq!(execution_data.timestamp(), timestamp);
         }

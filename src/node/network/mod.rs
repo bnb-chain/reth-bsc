@@ -21,6 +21,7 @@ use reth_eth_wire::{BasicNetworkPrimitives, NewBlock, NewBlockPayload};
 use reth_ethereum_primitives::PooledTransactionVariant;
 use reth_network::{NetworkConfig, NetworkHandle, NetworkManager};
 use reth_network_api::PeersInfo;
+use reth_network_peers::NodeRecord;
 use reth_provider::{BlockNumReader, HeaderProvider, StateProviderFactory};
 use reth_primitives::TransactionSigned;
 use std::{sync::Arc, time::Duration};
@@ -165,6 +166,22 @@ pub struct BscNetworkBuilder {
     engine_handle_rx: Arc<Mutex<Option<oneshot::Receiver<ConsensusEngineHandle<BscPayloadTypes>>>>>,
 }
 
+fn apply_bsc_discv4_overrides<I>(
+    discv4_config: &mut Option<Discv4Config>,
+    boot_nodes: Option<I>,
+) where
+    I: IntoIterator<Item = NodeRecord>,
+{
+    let Some(discv4_config) = discv4_config.as_mut() else {
+        return;
+    };
+
+    if let Some(boot_nodes) = boot_nodes {
+        discv4_config.bootstrap_nodes.extend(boot_nodes);
+    }
+    discv4_config.lookup_interval = Duration::from_millis(500);
+}
+
 impl BscNetworkBuilder {
     pub fn new(
         engine_handle_rx: Arc<
@@ -210,12 +227,6 @@ impl BscNetworkBuilder {
         }
 
         let network_builder = ctx.network_config_builder()?;
-        let mut discv4 = Discv4Config::builder();
-
-        if let Some(boot_nodes) = ctx.chain_spec().bootnodes() {
-            discv4.add_boot_nodes(boot_nodes);
-        }
-        discv4.lookup_interval(Duration::from_millis(500));
 
         let (to_import_net, from_network) = mpsc::unbounded_channel();
         let (to_import_mined, from_builder) = mpsc::unbounded_channel();
@@ -324,7 +335,6 @@ impl BscNetworkBuilder {
             .set_head(ctx.chain_spec().head())
             .with_pow()
             .block_import(Box::new(BscBlockImport::new(handle)))
-            .discovery(discv4)
             .eth_rlpx_handshake(Arc::new(BscHandshake::default()))
             // Advertise both bsc/2 (with range messages) and bsc/1 (votes only)
             .add_rlpx_sub_protocol(bsc_protocol::protocol::handler::BscProtocolHandlerV2)
@@ -337,11 +347,15 @@ impl BscNetworkBuilder {
 
         let peer_id = network_builder.get_peer_id();
         let mut network_config = ctx.build_network_config(network_builder);
+        apply_bsc_discv4_overrides(
+            &mut network_config.discovery_v4_config,
+            ctx.chain_spec().bootnodes(),
+        );
         network_config.status.forkid = network_config.fork_filter.current();
 
         // Initialize BSC protocol registry with proxied peers from config
         // This mirrors the same functionality in the main peer manager
-        let proxied_node_ids = network_config.peers_config.proxyed_node_ids.clone();
+        let proxied_node_ids = network_config.peers_config.proxied_node_ids.clone();
         if !proxied_node_ids.is_empty() {
             tracing::info!(
                 target: "bsc::net",
@@ -576,4 +590,30 @@ async fn register_nodeids_actions<P: StateProviderFactory>(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_bsc_discv4_overrides;
+    use reth_discv4::{Discv4Config, NatResolver};
+    use reth_network_peers::NodeRecord;
+    use std::{
+        net::{IpAddr, Ipv4Addr},
+        time::Duration,
+    };
+
+    #[test]
+    fn bsc_discv4_overrides_preserve_external_ip_resolver() {
+        let external_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10));
+        let mut discv4 = Discv4Config::builder();
+        discv4.external_ip_resolver(Some(NatResolver::ExternalIp(external_ip)));
+
+        let mut discv4 = Some(discv4.build());
+
+        apply_bsc_discv4_overrides(&mut discv4, None::<Vec<NodeRecord>>);
+
+        let discv4 = discv4.expect("discv4 config should remain enabled");
+        assert_eq!(discv4.external_ip_resolver, Some(NatResolver::ExternalIp(external_ip)));
+        assert_eq!(discv4.lookup_interval, Duration::from_millis(500));
+    }
 }
