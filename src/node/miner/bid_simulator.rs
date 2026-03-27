@@ -443,6 +443,9 @@ where
                     },
                     parent_difflayers: triedb_env_difflayers,
                     triedb_prefetcher,
+                    // Bids are finalized in pick_best_payload(); no sinks needed here.
+                    validator_cache_sink: None,
+                    turn_length_sink: None,
                 },
             )
             .map_err(PayloadBuilderError::other)
@@ -605,6 +608,9 @@ where
             exec_duration: std::time::Duration::ZERO,
             trie_root_duration: std::time::Duration::ZERO,
             executed_block,
+            pending_validators: None,
+            pending_turn_length: None,
+            is_bid: true,
         });
 
         // Acquire write lock to update best_bid

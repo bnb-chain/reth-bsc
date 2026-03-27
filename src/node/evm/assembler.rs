@@ -79,9 +79,117 @@ where
         }
     }
 
+    /// Assemble the block body only — build header fields and transaction/receipt roots but
+    /// skip `finalize_new_header()` (no difficulty, no validators, no attestation, no seal).
+    ///
+    /// The returned block has:
+    /// - `difficulty = 0`
+    /// - `extra_data = self.extra_data` (raw assembler default, no seal bytes)
+    ///
+    /// Callers must invoke `finalize_new_header()` later (e.g. in `pick_best_payload()`)
+    /// once the best payload has been chosen and all FF votes have been collected.
+    pub fn assemble_block_body_only(&self, input: BscBlockAssemblerInput<'_, '_, BscBlockExecutorFactory>) ->
+        Result<crate::node::primitives::BscBlock, BlockExecutionError>
+    {
+        let BscBlockAssemblerInput {
+            evm_env,
+            execution_ctx: ctx,
+            parent,
+            transactions,
+            output: BlockExecutionResult { receipts, requests: _, gas_used, .. },
+            state_root,
+            ..
+        } = input;
+
+        let eth_ctx = ctx.as_eth_context();
+        let timestamp = evm_env.block_env.timestamp().saturating_to();
+        let transactions_root = proofs::calculate_transaction_root(&transactions);
+        let block_number = evm_env.block_env.number().saturating_to();
+
+        let receipts_with_bloom = receipts.iter().map(TxReceipt::with_bloom_ref).collect::<Vec<_>>();
+        let receipts_root = alloy_consensus::proofs::calculate_receipt_root(&receipts_with_bloom);
+
+        let logs_bloom = receipts_with_bloom
+            .iter()
+            .fold(alloy_primitives::Bloom::ZERO, |bloom, r| bloom | r.bloom_ref());
+
+        let mut withdrawals_root = None;
+        let mut withdrawals = None;
+        let mut parent_beacon_block_root = None;
+        let mut requests_hash = None;
+        if BscHardforks::is_cancun_active_at_timestamp(self.chain_spec.as_ref(), block_number, timestamp) {
+            withdrawals_root = Some(EMPTY_WITHDRAWALS_HASH);
+            withdrawals = Some(Withdrawals::new(vec![]));
+            if self.chain_spec.is_bohr_active_at_timestamp(block_number, timestamp) {
+                parent_beacon_block_root = Some(B256::default());
+            }
+            if self.chain_spec.is_prague_active_at_block_and_timestamp(block_number, timestamp) {
+                requests_hash = Some(EMPTY_REQUESTS_HASH);
+            }
+        }
+
+        let mut excess_blob_gas = None;
+        let mut blob_gas_used = None;
+
+        if BscHardforks::is_cancun_active_at_timestamp(self.chain_spec.as_ref(), block_number, timestamp) {
+            blob_gas_used =
+                Some(transactions.iter().map(|tx| tx.blob_gas_used().unwrap_or_default()).sum());
+            excess_blob_gas = next_block_excess_blob_gas_with_mendel(
+                self.chain_spec.as_ref(),
+                block_number,
+                timestamp,
+                parent.header(),
+                self.chain_spec.blob_params_at_timestamp(timestamp),
+            );
+        }
+
+        let base_fee_per_gas = if self.chain_spec.is_london_active_at_block(block_number) {
+            Some(evm_env.block_env.basefee())
+        } else {
+            None
+        };
+
+        let header = Header {
+            parent_hash: eth_ctx.parent_hash,
+            ommers_hash: EMPTY_OMMER_ROOT_HASH,
+            beneficiary: evm_env.block_env.beneficiary(),
+            state_root,
+            transactions_root,
+            receipts_root,
+            withdrawals_root,
+            logs_bloom,
+            timestamp,
+            mix_hash: evm_env.block_env.prevrandao().unwrap_or_default(),
+            nonce: BEACON_NONCE.into(),
+            base_fee_per_gas,
+            number: block_number,
+            gas_limit: evm_env.block_env.gas_limit(),
+            difficulty: evm_env.block_env.difficulty(),
+            gas_used: *gas_used,
+            extra_data: self.extra_data.clone(),
+            parent_beacon_block_root,
+            blob_gas_used,
+            excess_blob_gas,
+            requests_hash,
+        };
+
+        tracing::debug!(
+            "Assembled block body only (pre-finalize), block_number={}, parent_hash=0x{:x}, txs={}",
+            header.number, header.parent_hash, transactions.len()
+        );
+
+        Ok(BscBlock {
+            header,
+            body: BscBlockBody {
+                inner: BlockBody { transactions, ommers: Default::default(), withdrawals },
+                sidecars: None,
+            },
+        })
+    }
+
     /// BSC-specific assemble_block method that accepts BscBlockAssemblerInput.
     /// This method is completely aligned with the standard assemble_block implementation.
-    pub fn assemble_block_bsc(&self, input: BscBlockAssemblerInput<'_, '_, BscBlockExecutorFactory>) -> 
+    pub fn assemble_block_bsc(&self, input: BscBlockAssemblerInput<'_, '_, BscBlockExecutorFactory>) ->
         Result<crate::node::primitives::BscBlock, BlockExecutionError>
     {
         // Get snapshot provider, return error if not available

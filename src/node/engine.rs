@@ -7,6 +7,8 @@ use crate::{
     BscPrimitives,
 };
 use crate::BscBlock;
+use crate::consensus::parlia::VoteAddress;
+use alloy_primitives::Address;
 use alloy_eips::eip7685::Requests;
 use alloy_primitives::U256;
 use reth::transaction_pool::PoolTransaction;
@@ -54,6 +56,15 @@ pub struct BscBuiltPayload {
     pub trie_root_duration: Duration,
     /// The executed block (includes difflayer if triedb produced one)
     pub(crate) executed_block: ExecutedBlock<BscPrimitives>,
+    /// Validators from execution context, to be written to VALIDATOR_CACHE after finalization.
+    /// `None` for bid payloads and non-epoch blocks.
+    pub(crate) pending_validators: Option<(Vec<Address>, Vec<VoteAddress>)>,
+    /// Turn length from execution context, to be written to TURN_LENGTH_CACHE after finalization.
+    /// `None` for bid payloads and blocks without turn-length changes.
+    pub(crate) pending_turn_length: Option<u8>,
+    /// Whether this payload originated from an external bid (MEV bundle) rather than a local
+    /// transaction pool build.  Used to track bid-win metrics in `try_return_best_payload()`.
+    pub(crate) is_bid: bool,
 }
 
 impl BuiltPayload for BscBuiltPayload {

@@ -5,7 +5,6 @@ use crate::{
         config::{BscBlockExecutionCtx, BscBlockExecutorFactory, BscExecutionSharedCtx},
         executor::BscBlockExecutor,
         factory::BscEvmFactory,
-        pre_execution::{TURN_LENGTH_CACHE, VALIDATOR_CACHE},
     },
     shared::BscEngineApiTx,
     BscPrimitives,
@@ -195,6 +194,10 @@ where
         let (transactions, senders): (Vec<_>, Vec<_>) =
             self.transactions.into_iter().map(|tx| tx.into_parts()).unzip();
 
+        // Extract sinks from ctx before it is moved into BscBlockAssemblerInput.
+        let validator_cache_sink = self.ctx.validator_cache_sink.take();
+        let turn_length_sink = self.ctx.turn_length_sink.take();
+
         // BlockAssemblerInput is non_exhaustive.
         // So define a new struct BscBlockAssemblerInput and a new interface assemble_block_bsc.
         let bsc_input: BscBlockAssemblerInput<'_, '_, BscBlockExecutorFactory> =
@@ -209,26 +212,23 @@ where
                 state_root,
             };
         let assemble_start = std::time::Instant::now();
-        let block = self.assembler.assemble_block_bsc(bsc_input)?;
-        let block_hash = block.header.hash_slow();
+        // Assemble block body only — finalize_new_header() is deferred to pick_best_payload()
+        // so that FF votes can be collected right up to the moment the best payload is chosen.
+        let block = self.assembler.assemble_block_body_only(bsc_input)?;
 
-        // cache current validators and turn length
+        // Transport validator and turn-length data to the payload layer via sinks.
+        // The final block hash is not yet known here (finalize_new_header hasn't run),
+        // so we cannot write to VALIDATOR_CACHE / TURN_LENGTH_CACHE yet.
         let current_validators = self.shared_ctx.inner.borrow().current_validators.clone();
         if let Some((validators, vote_addresses)) = current_validators {
-            VALIDATOR_CACHE.lock().unwrap().insert(block_hash, (validators, vote_addresses));
-            tracing::debug!(
-                "Succeed to update validator cache in builder, block_number: {}, block_hash: {}",
-                block.header.number,
-                block_hash
-            );
+            if let Some(sink) = &validator_cache_sink {
+                *sink.lock().unwrap() = Some((validators, vote_addresses));
+            }
         }
         if let Some(turn_length) = self.shared_ctx.inner.borrow().turn_length {
-            TURN_LENGTH_CACHE.lock().unwrap().insert(block_hash, turn_length);
-            tracing::debug!(
-                "Succeed to update turn length cache in builder, block_number: {}, block_hash: {}",
-                block.header.number,
-                block_hash
-            );
+            if let Some(sink) = &turn_length_sink {
+                *sink.lock().unwrap() = Some(turn_length);
+            }
         }
         let assemble_duration = assemble_start.elapsed();
 
@@ -236,14 +236,13 @@ where
         tracing::debug!(
             target: "bsc::builder",
             block_number = %block.header.number,
-            block_hash = %block_hash,
             user_tx_len = user_tx_len,
             system_tx_len = system_tx_len,
             total_tx_len = total_tx_len,
             finish_duration_ms = finish_duration.as_millis(),
             state_root_duration_ms = state_root_duration.as_millis(),
             assemble_duration_ms = assemble_duration.as_millis(),
-            "Succeed to seal block"
+            "Assembled block body (pre-finalize)"
         );
 
         let block = RecoveredBlock::new_unhashed(block, senders);

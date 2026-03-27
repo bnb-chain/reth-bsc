@@ -35,7 +35,7 @@ use revm::{
     primitives::hardfork::SpecId,
     Inspector,
 };
-use std::{borrow::Cow, cell::RefCell, convert::Infallible, rc::Rc, sync::Arc};
+use std::{borrow::Cow, cell::RefCell, convert::Infallible, rc::Rc, sync::{Arc, Mutex}};
 
 /// BSC wrapper around [`NextBlockEnvAttributes`].
 ///
@@ -56,6 +56,12 @@ pub struct BscNextBlockEnvAttributes {
     /// Miner-side triedb prefetcher handle. This is started before execution and consumed in
     /// `finish()` to obtain `prefetch_state` for triedb root calculation.
     pub triedb_prefetcher: Option<crate::node::evm::MinerTrieDbPrefetcher>,
+    /// Sink for transporting `current_validators` from builder to payload layer without writing
+    /// to VALIDATOR_CACHE prematurely (hash not yet final at build time).
+    pub validator_cache_sink: Option<Arc<Mutex<Option<(Vec<Address>, Vec<VoteAddress>)>>>>,
+    /// Sink for transporting `turn_length` from builder to payload layer without writing to
+    /// TURN_LENGTH_CACHE prematurely.
+    pub turn_length_sink: Option<Arc<Mutex<Option<u8>>>>,
 }
 
 impl<H: BlockHeader> BuildPendingEnv<H> for BscNextBlockEnvAttributes {
@@ -64,6 +70,8 @@ impl<H: BlockHeader> BuildPendingEnv<H> for BscNextBlockEnvAttributes {
             inner: NextBlockEnvAttributes::build_pending_env(parent),
             parent_difflayers: None,
             triedb_prefetcher: None,
+            validator_cache_sink: None,
+            turn_length_sink: None,
         }
     }
 }
@@ -115,6 +123,11 @@ pub struct BscBlockExecutionCtx<'a> {
     pub parent_difflayers: Option<rust_eth_triedb_common::DiffLayers>,
     /// Miner-side triedb prefetcher handle (consumed in `finish()`).
     pub triedb_prefetcher: Option<crate::node::evm::MinerTrieDbPrefetcher>,
+    /// Sink for `current_validators` — written by builder in `finish_with_difflayer()` and
+    /// read by payload layer after the builder is consumed.  `None` for non-miner paths.
+    pub validator_cache_sink: Option<Arc<Mutex<Option<(Vec<Address>, Vec<VoteAddress>)>>>>,
+    /// Sink for `turn_length` — same lifecycle as `validator_cache_sink`.
+    pub turn_length_sink: Option<Arc<Mutex<Option<u8>>>>,
 }
 
 impl<'a> BscBlockExecutionCtx<'a> {
@@ -413,6 +426,8 @@ where
             is_miner: false,
             parent_difflayers: None,
             triedb_prefetcher: None,
+            validator_cache_sink: None,
+            turn_length_sink: None,
         })
     }
 
@@ -436,6 +451,8 @@ where
             is_miner: true,
             parent_difflayers: attributes.parent_difflayers,
             triedb_prefetcher: attributes.triedb_prefetcher,
+            validator_cache_sink: attributes.validator_cache_sink,
+            turn_length_sink: attributes.turn_length_sink,
         })
     }
 
@@ -508,6 +525,8 @@ where
             is_miner: false,
             parent_difflayers: None,
             triedb_prefetcher: None,
+            validator_cache_sink: None,
+            turn_length_sink: None,
         })
     }
 

@@ -1,21 +1,23 @@
 use crate::chainspec::BscChainSpec;
 use crate::consensus::eip4844::{calc_blob_fee, is_blob_eligible_block, BLOB_TX_BLOB_GAS_PER_BLOB};
 use crate::consensus::parlia::util::calculate_millisecond_timestamp;
-use crate::consensus::parlia::Parlia;
+use crate::consensus::parlia::{Parlia, VoteAddress};
 use crate::evm::blacklist;
 use crate::hardforks::BscHardforks;
 use crate::metrics::{BscConsensusMetrics, BscMinerMetrics};
 use crate::node::engine::{BscBuiltPayload, BuildKind};
 use crate::node::evm::config::{BscEvmConfig, BscNextBlockEnvAttributes};
+use crate::node::evm::pre_execution::{TURN_LENGTH_CACHE, VALIDATOR_CACHE};
 use crate::node::evm::{request_difflayer, MinerTrieDbPrefetcher};
 use crate::node::miner::bid_simulator::BidSimulator;
 use crate::node::miner::bsc_miner::{MiningContext, SubmitContext};
+use crate::node::miner::util::finalize_new_header;
 use crate::node::pool::BlacklistedAddressError;
 use crate::node::primitives::BscBlobTransactionSidecar;
 use alloy_consensus::{BlockHeader, Transaction};
 use alloy_evm::block::BlockExecutor;
 use alloy_evm::Evm;
-use alloy_primitives::U256;
+use alloy_primitives::{Address, U256};
 use reth::payload::EthPayloadBuilderAttributes;
 use reth::transaction_pool::error::Eip4844PoolTransactionError;
 use reth::transaction_pool::error::InvalidPoolTransactionError;
@@ -37,7 +39,7 @@ use revm_context_interface::Block as EvmBlock;
 use reth_primitives::HeaderTy;
 use reth_primitives::InvalidTransactionError;
 use reth_primitives::TransactionSigned;
-use reth_primitives_traits::{BlockBody, SignerRecoverable};
+use reth_primitives_traits::{BlockBody, RecoveredBlock, SignerRecoverable};
 use reth_provider::StateProviderFactory;
 use reth_revm::cached::CachedReads;
 use reth_revm::cancelled::ManualCancel;
@@ -46,8 +48,8 @@ use reth_revm::{database::StateProviderDatabase, db::State};
 use rust_eth_triedb::get_global_triedb;
 use rust_eth_triedb_common::DiffLayers;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, trace, warn};
 
@@ -371,6 +373,13 @@ where
             MinerTrieDbPrefetcher::new(parent_header.state_root(), path_db, Some(difflayers)).ok()
         });
 
+        // Sinks transport current_validators / turn_length from the builder (which is consumed by
+        // finish_with_difflayer) back to this layer so they can be written to cache after
+        // finalize_new_header() assigns the definitive block hash.
+        let validator_cache_sink: Arc<Mutex<Option<(Vec<Address>, Vec<VoteAddress>)>>> =
+            Arc::new(Mutex::new(None));
+        let turn_length_sink: Arc<Mutex<Option<u8>>> = Arc::new(Mutex::new(None));
+
         let next_env_attributes = BscNextBlockEnvAttributes {
             inner: NextBlockEnvAttributes {
                 timestamp: attributes.timestamp(),
@@ -383,6 +392,8 @@ where
             },
             parent_difflayers: triedb_parent_difflayers.clone(),
             triedb_prefetcher: triedb_prefetcher.clone(),
+            validator_cache_sink: Some(validator_cache_sink.clone()),
+            turn_length_sink: Some(turn_length_sink.clone()),
         };
 
         let mut builder = self
@@ -814,6 +825,10 @@ where
         let mut executed_block = executed.into_executed_payload();
         executed_block.difflayer = difflayer;
 
+        // Read validator/turn-length data transported via sinks from the now-consumed builder.
+        let pending_validators = validator_cache_sink.lock().unwrap().take();
+        let pending_turn_length = turn_length_sink.lock().unwrap().take();
+
         let payload = BscBuiltPayload {
             block: sealed_block.clone(),
             fees: total_fees,
@@ -822,6 +837,9 @@ where
             exec_duration,
             trie_root_duration: finalize_elapsed,
             executed_block,
+            pending_validators,
+            pending_turn_length,
+            is_bid: false,
         };
         Ok(payload)
     }
@@ -856,6 +874,11 @@ where
             MinerTrieDbPrefetcher::new(parent_header.state_root(), path_db, Some(difflayers)).ok()
         });
 
+        // Sinks for empty-payload builds (same delayed-seal mechanism as normal builds).
+        let validator_cache_sink: Arc<Mutex<Option<(Vec<Address>, Vec<VoteAddress>)>>> =
+            Arc::new(Mutex::new(None));
+        let turn_length_sink: Arc<Mutex<Option<u8>>> = Arc::new(Mutex::new(None));
+
         let mut builder = self
             .evm_config
             .builder_for_next_block(
@@ -873,6 +896,8 @@ where
                     },
                     parent_difflayers: triedb_parent_difflayers.clone(),
                     triedb_prefetcher: triedb_prefetcher.clone(),
+                    validator_cache_sink: Some(validator_cache_sink.clone()),
+                    turn_length_sink: Some(turn_length_sink.clone()),
                 },
             )
             .map_err(PayloadBuilderError::other)?;
@@ -957,6 +982,10 @@ where
         let mut executed_block = executed.into_executed_payload();
         executed_block.difflayer = difflayer;
 
+        // Read validator/turn-length data transported via sinks from the now-consumed builder.
+        let pending_validators = validator_cache_sink.lock().unwrap().take();
+        let pending_turn_length = turn_length_sink.lock().unwrap().take();
+
         let payload = BscBuiltPayload {
             block: sealed_block.clone(),
             fees: total_fees,
@@ -965,6 +994,9 @@ where
             exec_duration,
             trie_root_duration: finalize_elapsed,
             executed_block,
+            pending_validators,
+            pending_turn_length,
+            is_bid: false,
         };
         Ok(payload)
     }
@@ -1926,132 +1958,152 @@ where
             }
         }
 
-        if let Some(best_payload) = self.pick_best_payload() {
-            let best_payload_hash = best_payload.block.hash();
-            let block_number = best_payload.block().number();
-            let is_inturn = self.mining_ctx.is_inturn;
+        let best_payload = match self.pick_best_payload() {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                let total_job_duration = self.job_start_time.elapsed();
+                MINER_METRICS.no_best_payload_total.increment(1);
+                if self.mining_ctx.is_inturn {
+                    warn!(
+                        target: "bsc::miner::payload",
+                        trace_id = self.trace_id,
+                        try_mine_block_number = self.build_args.config.parent_header.number() + 1,
+                        is_inturn = self.mining_ctx.is_inturn,
+                        total_job_duration_ms = total_job_duration.as_millis(),
+                        "No best payload available (inturn)"
+                    );
+                } else {
+                    info!(
+                        target: "bsc::miner::payload",
+                        trace_id = self.trace_id,
+                        try_mine_block_number = self.build_args.config.parent_header.number() + 1,
+                        is_inturn = self.mining_ctx.is_inturn,
+                        total_job_duration_ms = total_job_duration.as_millis(),
+                        "No best payload available to send (off-turn)"
+                    );
+                }
+                return Err(Box::new(BscPayloadJobError::NoPayloadsAvailable));
+            }
+            Err(e) => {
+                let total_job_duration = self.job_start_time.elapsed();
+                warn!(
+                    target: "bsc::miner::payload",
+                    trace_id = self.trace_id,
+                    try_mine_block_number = self.build_args.config.parent_header.number() + 1,
+                    total_job_duration_ms = total_job_duration.as_millis(),
+                    error = %e,
+                    "Failed to finalize best payload"
+                );
+                return Err(Box::new(BscPayloadJobError::PayloadBuildingError(e.to_string())));
+            }
+        };
 
-            // Decide how long to wait before releasing the payload to the submitter.
-            // delay_for_ramanujan_fork returns 0 for in-turn validators and a positive
-            // back-off duration for out-of-turn ones.
-            let delay_ms = self.parlia.delay_for_ramanujan_fork(
-                &self.mining_ctx.parent_snapshot,
-                best_payload.block().header(),
-            );
+        let best_payload_hash = best_payload.block.hash();
+        let block_number = best_payload.block().number();
+        let is_inturn = self.mining_ctx.is_inturn;
+
+        // Decide how long to wait before releasing the payload to the submitter.
+        // delay_for_ramanujan_fork returns 0 for in-turn validators and a positive
+        // back-off duration for out-of-turn ones.
+        let delay_ms = self.parlia.delay_for_ramanujan_fork(
+            &self.mining_ctx.parent_snapshot,
+            best_payload.block().header(),
+        );
+
+        debug!(
+            target: "bsc::miner::payload",
+            trace_id = self.trace_id,
+            block_number,
+            block_hash = %best_payload_hash,
+            is_inturn,
+            delay_ms,
+            "Check submit delay"
+        );
+
+        // Check if the best payload is from a bid and increment bid_win metric
+        if bid_block_hash.is_some() && best_payload.is_bid {
+            use crate::metrics::BscMevMetrics;
+            use once_cell::sync::Lazy;
+            static MEV_METRICS: Lazy<BscMevMetrics> = Lazy::new(BscMevMetrics::default);
+            MEV_METRICS.bid_win_total.increment(1);
 
             debug!(
                 target: "bsc::miner::payload",
                 trace_id = self.trace_id,
                 block_number,
                 block_hash = %best_payload_hash,
-                is_inturn,
-                delay_ms,
-                "Check submit delay"
+                "Bid payload won - incrementing bid_win metric"
             );
+        }
 
-            let submit_ctx = SubmitContext {
-                mining_ctx: self.mining_ctx.clone(),
-                payload: best_payload,
-                cancel: self.build_args.cancel.clone(),
-            };
+        let submit_ctx = SubmitContext {
+            mining_ctx: self.mining_ctx.clone(),
+            payload: best_payload,
+            cancel: self.build_args.cancel.clone(),
+        };
 
-            if delay_ms == 0 {
-                if let Err(err) = self.result_tx.send(submit_ctx) {
-                    let total_job_duration = self.job_start_time.elapsed();
-                    warn!(
-                        target: "bsc::miner::payload",
-                        trace_id = self.trace_id,
-                        block_number,
-                        is_inturn,
-                        total_job_duration_ms = total_job_duration.as_millis(),
-                        error = %err,
-                        "Failed to send best payload to result channel"
-                    );
-                    return Err(Box::new(BscPayloadJobError::ResultChannelSendError(err.to_string())));
-                }
-            } else {
-                // Out-of-turn: wait the back-off delay before handing the payload to the
-                // submitter.  A background task holds the SubmitContext and sends it after
-                // the sleep; submit_payload() re-validates canonical state on arrival so
-                // stale contexts (e.g. a reorg happened during the wait) are discarded safely.
-                CONSENSUS_METRICS.intentional_mining_delays_total.increment(1);
-                let result_tx = self.result_tx.clone();
-                let trace_id = self.trace_id;
-                info!(
-                    target: "bsc::miner::payload",
-                    trace_id,
-                    block_number,
-                    block_hash = %best_payload_hash,
-                    is_inturn,
-                    delay_ms,
-                    "Block scheduled for delayed submission"
-                );
-                tokio::spawn(async move {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
-                    if let Err(e) = result_tx.send(submit_ctx) {
-                        warn!(
-                            target: "bsc::miner::payload",
-                            trace_id,
-                            block_number,
-                            error = %e,
-                            "Failed to send delayed payload to result channel"
-                        );
-                    }
-                });
-            }
-
-            // Check if the best payload is from a bid and increment bid_win metric
-            if let Some(bid_hash) = bid_block_hash {
-                if best_payload_hash == bid_hash {
-                    use crate::metrics::BscMevMetrics;
-                    use once_cell::sync::Lazy;
-                    static MEV_METRICS: Lazy<BscMevMetrics> = Lazy::new(BscMevMetrics::default);
-                    MEV_METRICS.bid_win_total.increment(1);
-
-                    debug!(
-                        target: "bsc::miner::payload",
-                        trace_id = self.trace_id,
-                        block_number,
-                        bid_hash = %bid_hash,
-                        "Bid payload won - incrementing bid_win metric"
-                    );
-                }
-            }
-
-            Ok(())
-        } else {
-            // No best payload available
-            let total_job_duration = self.job_start_time.elapsed();
-            MINER_METRICS.no_best_payload_total.increment(1);
-
-            if self.mining_ctx.is_inturn {
+        if delay_ms == 0 {
+            if let Err(err) = self.result_tx.send(submit_ctx) {
+                let total_job_duration = self.job_start_time.elapsed();
                 warn!(
                     target: "bsc::miner::payload",
                     trace_id = self.trace_id,
-                    try_mine_block_number = self.build_args.config.parent_header.number() + 1,
-                    is_inturn = self.mining_ctx.is_inturn,
+                    block_number,
+                    is_inturn,
                     total_job_duration_ms = total_job_duration.as_millis(),
-                    "No best payload available (inturn)"
+                    error = %err,
+                    "Failed to send best payload to result channel"
                 );
-            } else {
-                info!(
-                    target: "bsc::miner::payload",
-                    trace_id = self.trace_id,
-                    try_mine_block_number = self.build_args.config.parent_header.number() + 1,
-                    is_inturn = self.mining_ctx.is_inturn,
-                    total_job_duration_ms = total_job_duration.as_millis(),
-                    "No best payload available to send (off-turn)"
-                );
+                return Err(Box::new(BscPayloadJobError::ResultChannelSendError(err.to_string())));
             }
-
-            Err(Box::new(BscPayloadJobError::NoPayloadsAvailable))
+        } else {
+            // Out-of-turn: wait the back-off delay before handing the payload to the
+            // submitter.  A background task holds the SubmitContext and sends it after
+            // the sleep; submit_payload() re-validates canonical state on arrival so
+            // stale contexts (e.g. a reorg happened during the wait) are discarded safely.
+            CONSENSUS_METRICS.intentional_mining_delays_total.increment(1);
+            let result_tx = self.result_tx.clone();
+            let trace_id = self.trace_id;
+            info!(
+                target: "bsc::miner::payload",
+                trace_id,
+                block_number,
+                block_hash = %best_payload_hash,
+                is_inturn,
+                delay_ms,
+                "Block scheduled for delayed submission"
+            );
+            tokio::spawn(async move {
+                tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                if let Err(e) = result_tx.send(submit_ctx) {
+                    warn!(
+                        target: "bsc::miner::payload",
+                        trace_id,
+                        block_number,
+                        error = %e,
+                        "Failed to send delayed payload to result channel"
+                    );
+                }
+            });
         }
+
+        Ok(())
     }
 
-    /// Pick the best payload from potential payloads
-    fn pick_best_payload(&mut self) -> Option<BscBuiltPayload> {
+    /// Pick the best payload from potential payloads, then finalize it.
+    ///
+    /// Finalization runs `finalize_new_header()` on the selected payload's header to set
+    /// difficulty, assemble vote attestation, and add the ECDSA seal.  This is intentionally
+    /// deferred from build time so that more FF votes can be collected up to the moment the
+    /// best candidate is chosen.
+    ///
+    /// After finalization the definitive block hash is known, so VALIDATOR_CACHE and
+    /// TURN_LENGTH_CACHE are updated here rather than inside the builder.
+    fn pick_best_payload(
+        &mut self,
+    ) -> Result<Option<BscBuiltPayload>, Box<dyn std::error::Error + Send + Sync>> {
         if self.potential_payloads.is_empty() {
-            return None;
+            return Ok(None);
         }
 
         // pick the payload with the highest fees as best payload.
@@ -2060,16 +2112,68 @@ where
             .iter()
             .enumerate()
             .max_by_key(|(_, payload)| payload.fees())
-            .map(|(index, _)| index)?;
+            .map(|(index, _)| index)
+            .ok_or_else(|| Box::new(std::io::Error::other("no payloads")) as Box<dyn std::error::Error + Send + Sync>)?;
 
         let total_len = self.potential_payloads.len();
-        let best_payload = self.potential_payloads.remove(best_index);
+        let mut best_payload = self.potential_payloads.remove(best_index);
         let total_job_duration = self.job_start_time.elapsed();
 
         let gas_used = best_payload.block().header().gas_used();
         let gas_limit = best_payload.block().header().gas_limit();
         let gas_usage_percent =
             if gas_limit > 0 { (gas_used as f64 / gas_limit as f64 * 100.0) as u64 } else { 0 };
+
+        // Finalize the selected payload: set difficulty, prepare validators (epoch blocks),
+        // assemble vote attestation, and ECDSA-seal the header.
+        let snapshot_provider = crate::shared::get_snapshot_provider()
+            .cloned()
+            .ok_or_else(|| Box::new(std::io::Error::other("Snapshot provider not available")) as Box<dyn std::error::Error + Send + Sync>)?;
+
+        // Extract the senders and plain block from executed_block before consuming it.
+        let senders = best_payload.executed_block.recovered_block.senders().to_vec();
+        // Preserve sidecars from best_payload.block (set after finish_with_difflayer).
+        let existing_sidecars = best_payload.block.clone_block().body.sidecars;
+        // Get the pre-finalization plain block (without sidecars).
+        let mut plain_block =
+            best_payload.executed_block.recovered_block.sealed_block().clone_block();
+
+        finalize_new_header(
+            self.parlia.clone(),
+            &self.mining_ctx.parent_snapshot,
+            &self.mining_ctx.parent_header,
+            &mut plain_block.header,
+            &snapshot_provider,
+        )
+        .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as Box<dyn std::error::Error + Send + Sync>)?;
+
+        // Now the final block hash is deterministic — update the caches.
+        let final_hash = plain_block.header.hash_slow();
+        if let Some((validators, vote_addresses)) = best_payload.pending_validators.take() {
+            VALIDATOR_CACHE.lock().unwrap().insert(final_hash, (validators, vote_addresses));
+            tracing::debug!(
+                "Updated validator cache after finalize, block_number: {}, block_hash: {}",
+                plain_block.header.number,
+                final_hash
+            );
+        }
+        if let Some(turn_length) = best_payload.pending_turn_length.take() {
+            TURN_LENGTH_CACHE.lock().unwrap().insert(final_hash, turn_length);
+            tracing::debug!(
+                "Updated turn length cache after finalize, block_number: {}, block_hash: {}",
+                plain_block.header.number,
+                final_hash
+            );
+        }
+
+        // Rebuild executed_block.recovered_block with the finalized header.
+        let new_recovered = RecoveredBlock::new_unhashed(plain_block.clone(), senders);
+        best_payload.executed_block.recovered_block = Arc::new(new_recovered);
+
+        // Rebuild the sealed block (with sidecars) with the finalized header.
+        let mut finalized_with_sidecars = plain_block;
+        finalized_with_sidecars.body.sidecars = existing_sidecars;
+        best_payload.block = Arc::new(finalized_with_sidecars.into());
 
         info!(
             target: "bsc::miner::payload",
@@ -2087,11 +2191,11 @@ where
             pick_index = best_index + 1,
             total_len = total_len,
             total_job_duration_ms = total_job_duration.as_millis(),
-            "Succeed to pick the best payload"
+            "Succeed to pick and finalize the best payload"
         );
 
         self.potential_payloads.clear();
-        Some(best_payload)
+        Ok(Some(best_payload))
     }
 }
 
