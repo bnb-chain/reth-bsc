@@ -36,9 +36,10 @@ use reth_provider::{BlockHashReader, HeaderProvider};
 use reth_revm::{database::StateProviderDatabase, db::State};
 use rust_eth_triedb::get_global_triedb;
 use rust_eth_triedb_common::DiffLayers;
+use crate::consensus::parlia::VoteAddress;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tracing::{debug, trace};
 use alloy_consensus::BlockHeader as _;
 use crate::node::evm::MinerTrieDbPrefetcher;
@@ -427,6 +428,13 @@ where
                 (None, None)
             };
 
+        // Sinks transport current_validators / turn_length from the builder so that
+        // pick_best_payload() can write to VALIDATOR_CACHE / TURN_LENGTH_CACHE with the
+        // definitive block hash after finalize_new_header() runs.
+        let bid_validator_cache_sink: Arc<Mutex<Option<(Vec<Address>, Vec<VoteAddress>)>>> =
+            Arc::new(Mutex::new(None));
+        let bid_turn_length_sink: Arc<Mutex<Option<u8>>> = Arc::new(Mutex::new(None));
+
         let mut builder = match evm_config
             .builder_for_next_block(
                 &mut db,
@@ -443,9 +451,8 @@ where
                     },
                     parent_difflayers: triedb_env_difflayers,
                     triedb_prefetcher,
-                    // Bids are finalized in pick_best_payload(); no sinks needed here.
-                    validator_cache_sink: None,
-                    turn_length_sink: None,
+                    validator_cache_sink: Some(bid_validator_cache_sink.clone()),
+                    turn_length_sink: Some(bid_turn_length_sink.clone()),
                 },
             )
             .map_err(PayloadBuilderError::other)
@@ -600,6 +607,10 @@ where
         let mut executed_block = executed.into_executed_payload();
         executed_block.difflayer = difflayer;
 
+        // Read validator/turn-length data transported via sinks from the now-consumed builder.
+        let pending_validators = bid_validator_cache_sink.lock().unwrap().take();
+        let pending_turn_length = bid_turn_length_sink.lock().unwrap().take();
+
         bid_runtime.bsc_payload = Some(BscBuiltPayload {
             block: sealed_block.clone(),
             fees: bid_runtime.gas_fee,
@@ -608,8 +619,8 @@ where
             exec_duration: std::time::Duration::ZERO,
             trie_root_duration: std::time::Duration::ZERO,
             executed_block,
-            pending_validators: None,
-            pending_turn_length: None,
+            pending_validators,
+            pending_turn_length,
             is_bid: true,
         });
 
