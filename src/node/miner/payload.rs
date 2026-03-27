@@ -1683,362 +1683,321 @@ where
         }
     }
 
-    /// Try to return the best payload to result channel
-    fn try_return_best_payload(&mut self) -> Result<(), Box<BscPayloadJobError>> {
-        let mut bid_block_hash = None;
-        let best_bid = self.simulator.get_best_bid(self.mining_ctx.parent_header.hash());
-        if let Some(bid) = best_bid {
-            let bid_info = bid.bid;
-            if let Some(bsc_payload) = bid.bsc_payload {
-                info!(
-                    target: "bsc::miner::payload",
-                    trace_id = self.trace_id,
-                    block_number = bid_info.block_number,
-                    is_inturn = self.mining_ctx.is_inturn,
-                    builder = ?bid_info.builder,
-                    gas_fee = %bid_info.gas_fee,
-                    bid_hash = %bid_info.bid_hash,
-                    gas_fee = %bsc_payload.fees(),
-                    "Found best bid"
-                );
-                bid_block_hash = Some(bsc_payload.block.hash());
-                self.potential_payloads.push(bsc_payload);
-            } else {
-                warn!(
-                    target: "bsc::miner::payload",
-                    trace_id = self.trace_id,
-                    block_number = bid_info.block_number,
-                    builder = ?bid_info.builder,
-                    bid_hash = %bid_info.bid_hash,
-                    "Best bid missing built payload"
-                );
-            }
+    /// Fetch the best bid for the current parent block, push it into `potential_payloads`,
+    /// and return its block hash (or `None` if no valid bid exists).
+    fn collect_best_bid(&mut self) {
+        let Some(best_bid) = self.simulator.get_best_bid(self.mining_ctx.parent_header.hash())
+        else {
+            return;
+        };
+        let bid_info = best_bid.bid;
+        if let Some(bsc_payload) = best_bid.bsc_payload {
+            info!(
+                target: "bsc::miner::payload",
+                trace_id = self.trace_id,
+                block_number = bid_info.block_number,
+                is_inturn = self.mining_ctx.is_inturn,
+                builder = ?bid_info.builder,
+                bid_gas_fee = %bid_info.gas_fee,
+                bid_hash = %bid_info.bid_hash,
+                payload_fees = %bsc_payload.fees(),
+                "Found best bid"
+            );
+            self.potential_payloads.push(bsc_payload);
+        } else {
+            warn!(
+                target: "bsc::miner::payload",
+                trace_id = self.trace_id,
+                block_number = bid_info.block_number,
+                builder = ?bid_info.builder,
+                bid_hash = %bid_info.bid_hash,
+                "Best bid missing built payload"
+            );
         }
+    }
 
-        // If no candidates: spawn an empty-payload build into the JoinSet.
-        // - Then wait for the earliest background task to finish (or abort) and proceed immediately.
+    /// Ensure `potential_payloads` has at least one candidate, then drain background build tasks
+    /// within the submission deadline to maximise the chance of a better (non-empty / higher-fee)
+    /// payload.
+    ///
+    /// Phase 1 — guarantee a candidate: if `potential_payloads` is empty, spawn an empty-block
+    /// build and block until its result (or an abort signal) arrives.
+    ///
+    /// Phase 2 — collect better candidates: loop over remaining background builds in 50 ms slices
+    /// until the pre-computed `expected_end_timestamp_ms` deadline (+ 150 ms grace) is reached or
+    /// all background tasks finish, whichever comes first.
+    fn collect_payload_candidates(&mut self) -> Result<(), Box<BscPayloadJobError>> {
+        // Phase 1: guarantee at least one candidate.
         if self.potential_payloads.is_empty() {
-            // Spawn an empty payload build so the "first candidate" wait can pick it up if it wins.
             let builder = self.builder.clone();
             let args = self.build_args.clone();
             self.join_handle.spawn(async move { builder.build_empty_payload(args).await });
 
+            // JoinSet::len() counts tasks whose results have not yet been collected via
+            // join_next(), regardless of whether the task has already finished executing.
+            // After spawn() above, len() is guaranteed ≥ 1.
             let bg_tasks = self.join_handle.len();
-            if bg_tasks > 0 {
-                enum WaitFirst<T> {
-                    Aborted,
-                    Joined(T),
-                }
 
-                let abort_rx = &mut self.abort_rx;
-                let join_handle = &mut self.join_handle;
-                let wait_started = std::time::Instant::now();
-                let outcome = tokio::task::block_in_place(move || {
-                    tokio::runtime::Handle::current().block_on(async move {
-                        tokio::select! {
-                            _ = abort_rx => WaitFirst::Aborted,
-                            res = join_handle.join_next() => WaitFirst::Joined(res),
-                        }
-                    })
-                });
-
-                let waited = wait_started.elapsed();
-                match outcome {
-                    WaitFirst::Aborted => {
-                        info!(
-                            target: "bsc::miner::payload",
-                            trace_id = self.trace_id,
-                            block_number = self.build_args.config.parent_header.number() + 1,
-                            is_inturn = self.mining_ctx.is_inturn,
-                            bg_tasks,
-                            waited_ms = waited.as_millis(),
-                            "Abort while waiting for first payload candidate"
-                        );
-                        self.build_args.cancel.clone().cancel();
-                        self.is_aborted = true;
-                        return Err(Box::new(BscPayloadJobError::JobAborted));
-                    }
-                    WaitFirst::Joined(Some(Ok(Ok(payload)))) => {
-                        let tx_count = payload.block().body().transaction_count();
-                        let is_empty_block = tx_count == 0;
-                        debug!(
-                            target: "bsc::miner::payload",
-                            trace_id = self.trace_id,
-                            block_number = payload.block().header().number(),
-                            block_hash = %payload.block().hash(),
-                            is_inturn = self.mining_ctx.is_inturn,
-                            build_kind = ?payload.build_kind,
-                            tx_count,
-                            is_empty_block,
-                            fees = %payload.fees(),
-                            bg_tasks,
-                            waited_ms = waited.as_millis(),
-                            "Received first payload candidate while returning best payload"
-                        );
-                        self.potential_payloads.push(payload);
-                    }
-                    WaitFirst::Joined(Some(Ok(Err(err)))) => {
-                        debug!(
-                            target: "bsc::miner::payload",
-                            trace_id = self.trace_id,
-                            try_mine_block_number = self.build_args.config.parent_header.number() + 1,
-                            is_inturn = self.mining_ctx.is_inturn,
-                            bg_tasks,
-                            waited_ms = waited.as_millis(),
-                            error = %err,
-                            "Candidate build task failed while waiting for first payload candidate"
-                        );
-                    }
-                    WaitFirst::Joined(Some(Err(err))) => {
-                        debug!(
-                            target: "bsc::miner::payload",
-                            trace_id = self.trace_id,
-                            try_mine_block_number = self.build_args.config.parent_header.number() + 1,
-                            is_inturn = self.mining_ctx.is_inturn,
-                            bg_tasks,
-                            waited_ms = waited.as_millis(),
-                            error = %err,
-                            "Join failed while waiting for first payload candidate"
-                        );
-                    }
-                    WaitFirst::Joined(None) => {
-                        debug!(
-                            target: "bsc::miner::payload",
-                            trace_id = self.trace_id,
-                            try_mine_block_number = self.build_args.config.parent_header.number() + 1,
-                            is_inturn = self.mining_ctx.is_inturn,
-                            bg_tasks,
-                            waited_ms = waited.as_millis(),
-                            "No background tasks available while waiting for first payload candidate"
-                        );
-                    }
-                }
+            enum WaitFirst<T> {
+                Aborted,
+                Joined(T),
             }
-        }
 
-        if !self.join_handle.is_empty() {
-            // Keep waiting for additional background build results as long as we haven't hit the
-            // expected end timestamp. This maximizes the chance of getting a better (non-empty /
-            // higher-fee) payload without exceeding our time budget.
-            loop {
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis();
-                if now_ms >= self.expected_end_timestamp_ms + 150 {
-                    if !self.join_handle.is_empty() {
-                        debug!(
-                            target: "bsc::miner::payload",
-                            trace_id = self.trace_id,
-                            try_mine_block_number = self.build_args.config.parent_header.number() + 1,
-                            is_inturn = self.mining_ctx.is_inturn,
-                            bg_tasks = self.join_handle.len(),
-                            now_ms,
-                            expected_end_timestamp_ms = self.expected_end_timestamp_ms,
-                            "Skip waiting for additional payload candidates due to timeout"
-                        );
+            let abort_rx = &mut self.abort_rx;
+            let join_handle = &mut self.join_handle;
+            let wait_started = std::time::Instant::now();
+            let outcome = tokio::task::block_in_place(move || {
+                tokio::runtime::Handle::current().block_on(async move {
+                    tokio::select! {
+                        _ = abort_rx => WaitFirst::Aborted,
+                        res = join_handle.join_next() => WaitFirst::Joined(res),
                     }
-                    break;
+                })
+            });
+
+            let waited = wait_started.elapsed();
+            match outcome {
+                WaitFirst::Aborted => {
+                    info!(
+                        target: "bsc::miner::payload",
+                        trace_id = self.trace_id,
+                        block_number = self.build_args.config.parent_header.number() + 1,
+                        is_inturn = self.mining_ctx.is_inturn,
+                        bg_tasks,
+                        waited_ms = waited.as_millis(),
+                        "Abort while waiting for first payload candidate"
+                    );
+                    self.build_args.cancel.clone().cancel();
+                    self.is_aborted = true;
+                    return Err(Box::new(BscPayloadJobError::JobAborted));
                 }
-                if self.join_handle.is_empty() {
-                    break;
+                WaitFirst::Joined(Some(Ok(Ok(payload)))) => {
+                    let tx_count = payload.block().body().transaction_count();
+                    let is_empty_block = tx_count == 0;
+                    debug!(
+                        target: "bsc::miner::payload",
+                        trace_id = self.trace_id,
+                        block_number = payload.block().header().number(),
+                        block_hash = %payload.block().hash(),
+                        is_inturn = self.mining_ctx.is_inturn,
+                        build_kind = ?payload.build_kind,
+                        tx_count,
+                        is_empty_block,
+                        fees = %payload.fees(),
+                        bg_tasks,
+                        waited_ms = waited.as_millis(),
+                        "Received first payload candidate while returning best payload"
+                    );
+                    self.potential_payloads.push(payload);
                 }
-
-                // Remaining time we can still spend waiting for background builds.
-                let try_mine_block_number = self.build_args.config.parent_header.number() + 1;
-                let mut remaining_ms = if self
-                    .mining_ctx
-                    .parent_snapshot
-                    .last_block_in_one_turn(try_mine_block_number)
-                {
-                    (self.expected_end_timestamp_ms - now_ms) as u64
-                } else {
-                    ((self.expected_end_timestamp_ms - now_ms) as u64) * 3 // wait more when not the last block in turn
-                };
-                if remaining_ms > 50 {
-                    remaining_ms = 50;
-                }
-                let remaining = std::time::Duration::from_millis(remaining_ms);
-
-                enum WaitMore<T> {
-                    Deadline,
-                    Aborted,
-                    Joined(T),
-                }
-
-                let abort_rx = &mut self.abort_rx;
-                let join_handle = &mut self.join_handle;
-                let wait_started = std::time::Instant::now();
-                let outcome = tokio::task::block_in_place(move || {
-                    tokio::runtime::Handle::current().block_on(async move {
-                        tokio::select! {
-                            _ = abort_rx => WaitMore::Aborted,
-                            _ = tokio::time::sleep(remaining) => WaitMore::Deadline,
-                            res = join_handle.join_next() => WaitMore::Joined(res),
-                        }
-                    })
-                });
-
-                let waited = wait_started.elapsed();
-                match outcome {
-                    WaitMore::Deadline => {
-                        debug!(
-                            target: "bsc::miner::payload",
-                            trace_id = self.trace_id,
-                            try_mine_block_number = self.build_args.config.parent_header.number() + 1,
-                            is_inturn = self.mining_ctx.is_inturn,
-                            waited_ms = waited.as_millis(),
-                            bg_tasks = self.join_handle.len(),
-                            expected_end_timestamp_ms = self.expected_end_timestamp_ms,
-                            "No background payload candidate finished within wait slice"
-                        );
-                        // Keep waiting in further slices until we hit the expected end timestamp (+grace)
-                        // or until all background tasks have completed.
-                        continue;
-                    }
-                    WaitMore::Aborted => {
-                        info!(
-                            target: "bsc::miner::payload",
-                            trace_id = self.trace_id,
-                            try_mine_block_number = self.build_args.config.parent_header.number() + 1,
-                            is_inturn = self.mining_ctx.is_inturn,
-                            waited_ms = waited.as_millis(),
-                            "Abort while waiting for additional payload candidates"
-                        );
-                        self.build_args.cancel.clone().cancel();
-                        self.is_aborted = true;
-                        return Err(Box::new(BscPayloadJobError::JobAborted));
-                    }
-                    WaitMore::Joined(Some(Ok(Ok(payload)))) => {
-                        let tx_count = payload.block().body().transaction_count();
-                        debug!(
-                            target: "bsc::miner::payload",
-                            trace_id = self.trace_id,
-                            block_number = payload.block().header().number(),
-                            block_hash = %payload.block().hash(),
-                            is_inturn = self.mining_ctx.is_inturn,
-                            build_kind = ?payload.build_kind,
-                            tx_count,
-                            fees = %payload.fees(),
-                            waited_ms = waited.as_millis(),
-                            "Received additional payload candidate while returning best payload"
-                        );
-                        self.potential_payloads.push(payload);
-                        // Continue loop until deadline or no more bg tasks.
-                    }
-                    WaitMore::Joined(Some(Ok(Err(err)))) => {
-                        debug!(
-                            target: "bsc::miner::payload",
-                            trace_id = self.trace_id,
-                            try_mine_block_number = self.build_args.config.parent_header.number() + 1,
-                            is_inturn = self.mining_ctx.is_inturn,
-                            waited_ms = waited.as_millis(),
-                            error = %err,
-                            "Candidate build task failed while waiting for additional payload candidates"
-                        );
-                        // Continue waiting, as other tasks may still succeed.
-                    }
-                    WaitMore::Joined(Some(Err(err))) => {
-                        debug!(
-                            target: "bsc::miner::payload",
-                            trace_id = self.trace_id,
-                            try_mine_block_number = self.build_args.config.parent_header.number() + 1,
-                            is_inturn = self.mining_ctx.is_inturn,
-                            waited_ms = waited.as_millis(),
-                            error = %err,
-                            "Join failed while waiting for additional payload candidates"
-                        );
-                        // Continue waiting, as other tasks may still succeed.
-                    }
-                    WaitMore::Joined(None) => {
-                        // No task finished at the moment; break to avoid spinning.
-                        break;
-                    }
-                }
-            }
-        }
-
-        let best_payload = match self.pick_best_payload() {
-            Ok(Some(p)) => p,
-            Ok(None) => {
-                let total_job_duration = self.job_start_time.elapsed();
-                MINER_METRICS.no_best_payload_total.increment(1);
-                if self.mining_ctx.is_inturn {
-                    warn!(
+                WaitFirst::Joined(Some(Ok(Err(err)))) => {
+                    debug!(
                         target: "bsc::miner::payload",
                         trace_id = self.trace_id,
                         try_mine_block_number = self.build_args.config.parent_header.number() + 1,
                         is_inturn = self.mining_ctx.is_inturn,
-                        total_job_duration_ms = total_job_duration.as_millis(),
-                        "No best payload available (inturn)"
+                        bg_tasks,
+                        waited_ms = waited.as_millis(),
+                        error = %err,
+                        "Candidate build task failed while waiting for first payload candidate"
                     );
-                } else {
+                }
+                WaitFirst::Joined(Some(Err(err))) => {
+                    debug!(
+                        target: "bsc::miner::payload",
+                        trace_id = self.trace_id,
+                        try_mine_block_number = self.build_args.config.parent_header.number() + 1,
+                        is_inturn = self.mining_ctx.is_inturn,
+                        bg_tasks,
+                        waited_ms = waited.as_millis(),
+                        error = %err,
+                        "Join failed while waiting for first payload candidate"
+                    );
+                }
+                WaitFirst::Joined(None) => {
+                    // Should not happen: we just spawned a task above, so JoinSet is non-empty.
+                    debug!(
+                        target: "bsc::miner::payload",
+                        trace_id = self.trace_id,
+                        try_mine_block_number = self.build_args.config.parent_header.number() + 1,
+                        is_inturn = self.mining_ctx.is_inturn,
+                        bg_tasks,
+                        waited_ms = waited.as_millis(),
+                        "Unexpected: JoinSet empty while waiting for first payload candidate"
+                    );
+                }
+            }
+        }
+
+        // Phase 2: collect better candidates until deadline.
+        while !self.join_handle.is_empty() {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            if now_ms >= self.expected_end_timestamp_ms + 150 {
+                debug!(
+                    target: "bsc::miner::payload",
+                    trace_id = self.trace_id,
+                    try_mine_block_number = self.build_args.config.parent_header.number() + 1,
+                    is_inturn = self.mining_ctx.is_inturn,
+                    bg_tasks = self.join_handle.len(),
+                    now_ms,
+                    expected_end_timestamp_ms = self.expected_end_timestamp_ms,
+                    "Skip waiting for additional payload candidates due to timeout"
+                );
+                break;
+            }
+
+            // Remaining time we can still spend waiting for background builds.
+            let try_mine_block_number = self.build_args.config.parent_header.number() + 1;
+            let mut remaining_ms = if self
+                .mining_ctx
+                .parent_snapshot
+                .last_block_in_one_turn(try_mine_block_number)
+            {
+                (self.expected_end_timestamp_ms - now_ms) as u64
+            } else {
+                ((self.expected_end_timestamp_ms - now_ms) as u64) * 3 // wait more when not the last block in turn
+            };
+            if remaining_ms > 50 {
+                remaining_ms = 50;
+            }
+            let remaining = std::time::Duration::from_millis(remaining_ms);
+
+            enum WaitMore<T> {
+                Deadline,
+                Aborted,
+                Joined(T),
+            }
+
+            let abort_rx = &mut self.abort_rx;
+            let join_handle = &mut self.join_handle;
+            let wait_started = std::time::Instant::now();
+            let outcome = tokio::task::block_in_place(move || {
+                tokio::runtime::Handle::current().block_on(async move {
+                    tokio::select! {
+                        _ = abort_rx => WaitMore::Aborted,
+                        _ = tokio::time::sleep(remaining) => WaitMore::Deadline,
+                        res = join_handle.join_next() => WaitMore::Joined(res),
+                    }
+                })
+            });
+
+            let waited = wait_started.elapsed();
+            match outcome {
+                WaitMore::Deadline => {
+                    debug!(
+                        target: "bsc::miner::payload",
+                        trace_id = self.trace_id,
+                        try_mine_block_number = self.build_args.config.parent_header.number() + 1,
+                        is_inturn = self.mining_ctx.is_inturn,
+                        waited_ms = waited.as_millis(),
+                        bg_tasks = self.join_handle.len(),
+                        expected_end_timestamp_ms = self.expected_end_timestamp_ms,
+                        "No background payload candidate finished within wait slice"
+                    );
+                    // Keep waiting in further slices until we hit the expected end timestamp (+grace)
+                    // or until all background tasks have completed.
+                    continue;
+                }
+                WaitMore::Aborted => {
                     info!(
                         target: "bsc::miner::payload",
                         trace_id = self.trace_id,
                         try_mine_block_number = self.build_args.config.parent_header.number() + 1,
                         is_inturn = self.mining_ctx.is_inturn,
-                        total_job_duration_ms = total_job_duration.as_millis(),
-                        "No best payload available to send (off-turn)"
+                        waited_ms = waited.as_millis(),
+                        "Abort while waiting for additional payload candidates"
                     );
+                    self.build_args.cancel.clone().cancel();
+                    self.is_aborted = true;
+                    return Err(Box::new(BscPayloadJobError::JobAborted));
                 }
-                return Err(Box::new(BscPayloadJobError::NoPayloadsAvailable));
+                WaitMore::Joined(Some(Ok(Ok(payload)))) => {
+                    let tx_count = payload.block().body().transaction_count();
+                    debug!(
+                        target: "bsc::miner::payload",
+                        trace_id = self.trace_id,
+                        block_number = payload.block().header().number(),
+                        block_hash = %payload.block().hash(),
+                        is_inturn = self.mining_ctx.is_inturn,
+                        build_kind = ?payload.build_kind,
+                        tx_count,
+                        fees = %payload.fees(),
+                        waited_ms = waited.as_millis(),
+                        "Received additional payload candidate while returning best payload"
+                    );
+                    self.potential_payloads.push(payload);
+                    // Continue loop until deadline or no more bg tasks.
+                }
+                WaitMore::Joined(Some(Ok(Err(err)))) => {
+                    debug!(
+                        target: "bsc::miner::payload",
+                        trace_id = self.trace_id,
+                        try_mine_block_number = self.build_args.config.parent_header.number() + 1,
+                        is_inturn = self.mining_ctx.is_inturn,
+                        waited_ms = waited.as_millis(),
+                        error = %err,
+                        "Candidate build task failed while waiting for additional payload candidates"
+                    );
+                    // Continue waiting, as other tasks may still succeed.
+                }
+                WaitMore::Joined(Some(Err(err))) => {
+                    debug!(
+                        target: "bsc::miner::payload",
+                        trace_id = self.trace_id,
+                        try_mine_block_number = self.build_args.config.parent_header.number() + 1,
+                        is_inturn = self.mining_ctx.is_inturn,
+                        waited_ms = waited.as_millis(),
+                        error = %err,
+                        "Join failed while waiting for additional payload candidates"
+                    );
+                    // Continue waiting, as other tasks may still succeed.
+                }
+                WaitMore::Joined(None) => {
+                    // No task finished at the moment; break to avoid spinning.
+                    break;
+                }
             }
-            Err(e) => {
-                let total_job_duration = self.job_start_time.elapsed();
-                warn!(
-                    target: "bsc::miner::payload",
-                    trace_id = self.trace_id,
-                    try_mine_block_number = self.build_args.config.parent_header.number() + 1,
-                    total_job_duration_ms = total_job_duration.as_millis(),
-                    error = %e,
-                    "Failed to finalize best payload"
-                );
-                return Err(Box::new(BscPayloadJobError::PayloadBuildingError(e.to_string())));
-            }
-        };
+        }
 
-        let best_payload_hash = best_payload.block.hash();
-        let block_number = best_payload.block().number();
+        Ok(())
+    }
+
+    /// Try to return the best payload to result channel
+    fn try_return_best_payload(&mut self) -> Result<(), Box<BscPayloadJobError>> {
+        self.collect_best_bid();
+
+        self.collect_payload_candidates()?;
+
+        let best_payload = self.pick_best_payload_and_finalize()?;
+
+        self.submit_payload(best_payload)?;
+
+        Ok(())
+    }
+
+    /// Send `payload` to the result channel, respecting the submission deadline.
+    ///
+    /// If the deadline has already passed (`delay_ms == 0`) the payload is sent immediately;
+    /// otherwise it is handed off to a background task that sleeps for the remaining duration
+    /// before sending.  The submitter re-validates canonical state on receipt, so stale
+    /// contexts (e.g. a reorg occurred during the delay) are discarded safely.
+    fn submit_payload(&mut self, payload: BscBuiltPayload) -> Result<(), Box<BscPayloadJobError>> {
+        let block_number = payload.block().number();
+        let block_hash = payload.block.hash();
         let is_inturn = self.mining_ctx.is_inturn;
 
-        // Decide how long to wait before releasing the payload to the submitter.
-        // delay_for_ramanujan_fork returns 0 for in-turn validators and a positive
-        // back-off duration for out-of-turn ones.
-        let delay_ms = self.parlia.delay_for_ramanujan_fork(
-            &self.mining_ctx.parent_snapshot,
-            best_payload.block().header(),
-        );
-
-        debug!(
-            target: "bsc::miner::payload",
-            trace_id = self.trace_id,
-            block_number,
-            block_hash = %best_payload_hash,
-            is_inturn,
-            delay_ms,
-            "Check submit delay"
-        );
-
-        // Check if the best payload is from a bid and increment bid_win metric
-        if bid_block_hash.is_some() && best_payload.is_bid {
-            use crate::metrics::BscMevMetrics;
-            use once_cell::sync::Lazy;
-            static MEV_METRICS: Lazy<BscMevMetrics> = Lazy::new(BscMevMetrics::default);
-            MEV_METRICS.bid_win_total.increment(1);
-
-            debug!(
-                target: "bsc::miner::payload",
-                trace_id = self.trace_id,
-                block_number,
-                block_hash = %best_payload_hash,
-                "Bid payload won - incrementing bid_win metric"
-            );
-        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let delay_ms = self.expected_end_timestamp_ms.saturating_sub(now_ms) as u64;
 
         let submit_ctx = SubmitContext {
             mining_ctx: self.mining_ctx.clone(),
-            payload: best_payload,
+            payload,
             cancel: self.build_args.cancel.clone(),
         };
 
@@ -2057,10 +2016,9 @@ where
                 return Err(Box::new(BscPayloadJobError::ResultChannelSendError(err.to_string())));
             }
         } else {
-            // Out-of-turn: wait the back-off delay before handing the payload to the
-            // submitter.  A background task holds the SubmitContext and sends it after
-            // the sleep; submit_payload() re-validates canonical state on arrival so
-            // stale contexts (e.g. a reorg happened during the wait) are discarded safely.
+            // Out-of-turn: a background task holds the SubmitContext and sends it after the
+            // sleep; submit_payload() re-validates canonical state on arrival so stale
+            // contexts (e.g. a reorg happened during the wait) are discarded safely.
             CONSENSUS_METRICS.intentional_mining_delays_total.increment(1);
             let result_tx = self.result_tx.clone();
             let trace_id = self.trace_id;
@@ -2068,7 +2026,7 @@ where
                 target: "bsc::miner::payload",
                 trace_id,
                 block_number,
-                block_hash = %best_payload_hash,
+                block_hash = %block_hash,
                 is_inturn,
                 delay_ms,
                 "Block scheduled for delayed submission"
@@ -2094,11 +2052,32 @@ where
     ///
     /// Selection is by fees only; finalization (difficulty, vote attestation, ECDSA seal,
     /// cache updates) is delegated to [`finalize_payload`].
-    fn pick_best_payload(
-        &mut self,
-    ) -> Result<Option<BscBuiltPayload>, Box<dyn std::error::Error + Send + Sync>> {
+    fn pick_best_payload_and_finalize(&mut self) -> Result<BscBuiltPayload, Box<BscPayloadJobError>> {
+        let total_job_duration = self.job_start_time.elapsed();
+        let try_mine_block_number = self.build_args.config.parent_header.number() + 1;
+
         if self.potential_payloads.is_empty() {
-            return Ok(None);
+            MINER_METRICS.no_best_payload_total.increment(1);
+            if self.mining_ctx.is_inturn {
+                warn!(
+                    target: "bsc::miner::payload",
+                    trace_id = self.trace_id,
+                    try_mine_block_number,
+                    is_inturn = self.mining_ctx.is_inturn,
+                    total_job_duration_ms = total_job_duration.as_millis(),
+                    "No best payload available (inturn)"
+                );
+            } else {
+                info!(
+                    target: "bsc::miner::payload",
+                    trace_id = self.trace_id,
+                    try_mine_block_number,
+                    is_inturn = self.mining_ctx.is_inturn,
+                    total_job_duration_ms = total_job_duration.as_millis(),
+                    "No best payload available to send (off-turn)"
+                );
+            }
+            return Err(Box::new(BscPayloadJobError::NoPayloadsAvailable));
         }
 
         let best_index = self
@@ -2107,11 +2086,11 @@ where
             .enumerate()
             .max_by_key(|(_, payload)| payload.fees())
             .map(|(index, _)| index)
-            .ok_or_else(|| Box::new(std::io::Error::other("no payloads")) as Box<dyn std::error::Error + Send + Sync>)?;
+            .expect("potential_payloads is non-empty");
 
         let total_len = self.potential_payloads.len();
         let mut best_payload = self.potential_payloads.remove(best_index);
-        let total_job_duration = self.job_start_time.elapsed();
+        self.potential_payloads.clear();
 
         let gas_used = best_payload.block().header().gas_used();
         let gas_limit = best_payload.block().header().gas_limit();
@@ -2123,7 +2102,25 @@ where
             self.parlia.clone(),
             &self.mining_ctx.parent_snapshot,
             &self.mining_ctx.parent_header,
-        )?;
+        )
+        .map_err(|e| {
+            warn!(
+                target: "bsc::miner::payload",
+                trace_id = self.trace_id,
+                try_mine_block_number,
+                total_job_duration_ms = total_job_duration.as_millis(),
+                error = %e,
+                "Failed to finalize best payload"
+            );
+            Box::new(BscPayloadJobError::PayloadBuildingError(e.to_string()))
+        })?;
+
+        if best_payload.is_bid {
+            use crate::metrics::BscMevMetrics;
+            use once_cell::sync::Lazy;
+            static MEV_METRICS: Lazy<BscMevMetrics> = Lazy::new(BscMevMetrics::default);
+            MEV_METRICS.bid_win_total.increment(1);
+        }
 
         info!(
             target: "bsc::miner::payload",
@@ -2131,21 +2128,21 @@ where
             block_number = best_payload.block().header().number(),
             block_hash = %best_payload.block().hash(),
             is_inturn = self.mining_ctx.is_inturn,
+            is_bid = best_payload.is_bid,
             tx_count = best_payload.block().body().transaction_count(),
             fees = %best_payload.fees(),
             exec_duration_ms = best_payload.exec_duration.as_millis(),
             trie_root_duration_ms = best_payload.trie_root_duration.as_millis(),
-            gas_used = gas_used,
-            gas_limit = gas_limit,
-            gas_usage_percent = gas_usage_percent,
+            gas_used,
+            gas_limit,
+            gas_usage_percent,
             pick_index = best_index + 1,
-            total_len = total_len,
+            total_len,
             total_job_duration_ms = total_job_duration.as_millis(),
             "Succeed to pick and finalize the best payload"
         );
 
-        self.potential_payloads.clear();
-        Ok(Some(best_payload))
+        Ok(best_payload)
     }
 }
 
@@ -2161,7 +2158,7 @@ where
 /// 3. Rebuilds `block` (sealed block with sidecars) with the finalized header.
 ///
 /// This function is intentionally separate from the builder path so that finalization is
-/// deferred until `pick_best_payload()` chooses the winning payload — giving more time for
+/// deferred until `pick_best_payload_and_finalize()` chooses the winning payload — giving more time for
 /// FF votes to arrive.
 fn finalize_payload(
     payload: &mut BscBuiltPayload,
