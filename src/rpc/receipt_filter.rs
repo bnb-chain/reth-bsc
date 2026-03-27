@@ -37,7 +37,7 @@ impl ReceiptFilter for BscReceiptFilter {
         // Check if this is a system transaction:
         // signer == coinbase && to is system contract && max_fee_per_gas == 0
         let is_system_tx = tx_signer == beneficiary
-            && tx_to.map_or(false, |to| SYSTEM_CONTRACTS_SET.contains(&to))
+            && tx_to.is_some_and(|to| SYSTEM_CONTRACTS_SET.contains(&to))
             && tx_max_fee_per_gas == 0;
 
         // Include the receipt only if it's NOT a system transaction
