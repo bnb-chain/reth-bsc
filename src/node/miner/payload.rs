@@ -1,7 +1,7 @@
 use crate::chainspec::BscChainSpec;
 use crate::consensus::eip4844::{calc_blob_fee, is_blob_eligible_block, BLOB_TX_BLOB_GAS_PER_BLOB};
 use crate::consensus::parlia::util::calculate_millisecond_timestamp;
-use crate::consensus::parlia::{Parlia, VoteAddress};
+use crate::consensus::parlia::{Parlia, Snapshot, VoteAddress};
 use crate::evm::blacklist;
 use crate::hardforks::BscHardforks;
 use crate::metrics::{BscConsensusMetrics, BscMinerMetrics};
@@ -36,7 +36,7 @@ use reth_payload_primitives::{BuiltPayload, BuiltPayloadExecutedBlock, PayloadBu
 use either::Either;
 use once_cell::sync::Lazy;
 use revm_context_interface::Block as EvmBlock;
-use reth_primitives::HeaderTy;
+use reth_primitives::{HeaderTy, SealedHeader};
 use reth_primitives::InvalidTransactionError;
 use reth_primitives::TransactionSigned;
 use reth_primitives_traits::{BlockBody, RecoveredBlock, SignerRecoverable};
@@ -2090,15 +2090,10 @@ where
         Ok(())
     }
 
-    /// Pick the best payload from potential payloads, then finalize it.
+    /// Select the highest-fee payload from `potential_payloads`, finalize it, then return it.
     ///
-    /// Finalization runs `finalize_new_header()` on the selected payload's header to set
-    /// difficulty, assemble vote attestation, and add the ECDSA seal.  This is intentionally
-    /// deferred from build time so that more FF votes can be collected up to the moment the
-    /// best candidate is chosen.
-    ///
-    /// After finalization the definitive block hash is known, so VALIDATOR_CACHE and
-    /// TURN_LENGTH_CACHE are updated here rather than inside the builder.
+    /// Selection is by fees only; finalization (difficulty, vote attestation, ECDSA seal,
+    /// cache updates) is delegated to [`finalize_payload`].
     fn pick_best_payload(
         &mut self,
     ) -> Result<Option<BscBuiltPayload>, Box<dyn std::error::Error + Send + Sync>> {
@@ -2106,7 +2101,6 @@ where
             return Ok(None);
         }
 
-        // pick the payload with the highest fees as best payload.
         let best_index = self
             .potential_payloads
             .iter()
@@ -2124,56 +2118,12 @@ where
         let gas_usage_percent =
             if gas_limit > 0 { (gas_used as f64 / gas_limit as f64 * 100.0) as u64 } else { 0 };
 
-        // Finalize the selected payload: set difficulty, prepare validators (epoch blocks),
-        // assemble vote attestation, and ECDSA-seal the header.
-        let snapshot_provider = crate::shared::get_snapshot_provider()
-            .cloned()
-            .ok_or_else(|| Box::new(std::io::Error::other("Snapshot provider not available")) as Box<dyn std::error::Error + Send + Sync>)?;
-
-        // Extract the senders and plain block from executed_block before consuming it.
-        let senders = best_payload.executed_block.recovered_block.senders().to_vec();
-        // Preserve sidecars from best_payload.block (set after finish_with_difflayer).
-        let existing_sidecars = best_payload.block.clone_block().body.sidecars;
-        // Get the pre-finalization plain block (without sidecars).
-        let mut plain_block =
-            best_payload.executed_block.recovered_block.sealed_block().clone_block();
-
-        finalize_new_header(
+        finalize_payload(
+            &mut best_payload,
             self.parlia.clone(),
             &self.mining_ctx.parent_snapshot,
             &self.mining_ctx.parent_header,
-            &mut plain_block.header,
-            &snapshot_provider,
-        )
-        .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as Box<dyn std::error::Error + Send + Sync>)?;
-
-        // Now the final block hash is deterministic — update the caches.
-        let final_hash = plain_block.header.hash_slow();
-        if let Some((validators, vote_addresses)) = best_payload.pending_validators.take() {
-            VALIDATOR_CACHE.lock().unwrap().insert(final_hash, (validators, vote_addresses));
-            tracing::debug!(
-                "Updated validator cache after finalize, block_number: {}, block_hash: {}",
-                plain_block.header.number,
-                final_hash
-            );
-        }
-        if let Some(turn_length) = best_payload.pending_turn_length.take() {
-            TURN_LENGTH_CACHE.lock().unwrap().insert(final_hash, turn_length);
-            tracing::debug!(
-                "Updated turn length cache after finalize, block_number: {}, block_hash: {}",
-                plain_block.header.number,
-                final_hash
-            );
-        }
-
-        // Rebuild executed_block.recovered_block with the finalized header.
-        let new_recovered = RecoveredBlock::new_unhashed(plain_block.clone(), senders);
-        best_payload.executed_block.recovered_block = Arc::new(new_recovered);
-
-        // Rebuild the sealed block (with sidecars) with the finalized header.
-        let mut finalized_with_sidecars = plain_block;
-        finalized_with_sidecars.body.sidecars = existing_sidecars;
-        best_payload.block = Arc::new(finalized_with_sidecars.into());
+        )?;
 
         info!(
             target: "bsc::miner::payload",
@@ -2197,6 +2147,71 @@ where
         self.potential_payloads.clear();
         Ok(Some(best_payload))
     }
+}
+
+/// Finalize a built payload in-place.
+///
+/// Runs `finalize_new_header()` on the payload's header (sets difficulty, prepares validators
+/// for epoch blocks, assembles vote attestation, and ECDSA-seals the header), then:
+///
+/// 1. Writes `pending_validators` / `pending_turn_length` to the global caches keyed by
+///    the now-deterministic final block hash.
+/// 2. Rebuilds `executed_block.recovered_block` with the finalized header so the engine
+///    tree can identify the block by its correct hash.
+/// 3. Rebuilds `block` (sealed block with sidecars) with the finalized header.
+///
+/// This function is intentionally separate from the builder path so that finalization is
+/// deferred until `pick_best_payload()` chooses the winning payload — giving more time for
+/// FF votes to arrive.
+fn finalize_payload(
+    payload: &mut BscBuiltPayload,
+    parlia: Arc<Parlia<BscChainSpec>>,
+    parent_snapshot: &Snapshot,
+    parent_header: &SealedHeader<alloy_consensus::Header>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let snapshot_provider = crate::shared::get_snapshot_provider()
+        .cloned()
+        .ok_or_else(|| {
+            Box::new(std::io::Error::other("Snapshot provider not available"))
+                as Box<dyn std::error::Error + Send + Sync>
+        })?;
+
+    let senders = payload.executed_block.recovered_block.senders().to_vec();
+    let existing_sidecars = payload.block.clone_block().body.sidecars;
+    let mut plain_block = payload.executed_block.recovered_block.sealed_block().clone_block();
+
+    finalize_new_header(parlia, parent_snapshot, parent_header, &mut plain_block.header, &snapshot_provider)
+        .map_err(|e| {
+            Box::new(std::io::Error::other(e.to_string()))
+                as Box<dyn std::error::Error + Send + Sync>
+        })?;
+
+    let final_hash = plain_block.header.hash_slow();
+    if let Some((validators, vote_addresses)) = payload.pending_validators.take() {
+        VALIDATOR_CACHE.lock().unwrap().insert(final_hash, (validators, vote_addresses));
+        tracing::debug!(
+            "Updated validator cache after finalize, block_number: {}, block_hash: {}",
+            plain_block.header.number,
+            final_hash
+        );
+    }
+    if let Some(turn_length) = payload.pending_turn_length.take() {
+        TURN_LENGTH_CACHE.lock().unwrap().insert(final_hash, turn_length);
+        tracing::debug!(
+            "Updated turn length cache after finalize, block_number: {}, block_hash: {}",
+            plain_block.header.number,
+            final_hash
+        );
+    }
+
+    payload.executed_block.recovered_block =
+        Arc::new(RecoveredBlock::new_unhashed(plain_block.clone(), senders));
+
+    let mut finalized_with_sidecars = plain_block;
+    finalized_with_sidecars.body.sidecars = existing_sidecars;
+    payload.block = Arc::new(finalized_with_sidecars.into());
+
+    Ok(())
 }
 
 #[cfg(test)]
