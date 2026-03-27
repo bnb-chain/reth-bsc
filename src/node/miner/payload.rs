@@ -2174,7 +2174,7 @@ fn finalize_payload(
         })?;
 
     let senders = payload.executed_block.recovered_block.senders().to_vec();
-    let existing_sidecars = payload.block.clone_block().body.sidecars;
+    let mut existing_sidecars = payload.block.clone_block().body.sidecars;
     let mut plain_block = payload.executed_block.recovered_block.sealed_block().clone_block();
 
     finalize_new_header(parlia, parent_snapshot, parent_header, &mut plain_block.header, &snapshot_provider)
