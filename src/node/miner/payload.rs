@@ -4,7 +4,7 @@ use crate::consensus::parlia::util::calculate_millisecond_timestamp;
 use crate::consensus::parlia::Parlia;
 use crate::evm::blacklist;
 use crate::hardforks::BscHardforks;
-use crate::metrics::BscMinerMetrics;
+use crate::metrics::{BscConsensusMetrics, BscMinerMetrics};
 use crate::node::engine::{BscBuiltPayload, BuildKind};
 use crate::node::evm::config::{BscEvmConfig, BscNextBlockEnvAttributes};
 use crate::node::evm::{request_difflayer, MinerTrieDbPrefetcher};
@@ -89,6 +89,9 @@ const ESTIMATED_FEE_GAS_CAP: u64 = 210_000;
 
 /// Global trace ID counter for payload building operations
 static TRACE_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Consensus metrics shared across all payload jobs (tracks intentional mining delays).
+static CONSENSUS_METRICS: Lazy<BscConsensusMetrics> = Lazy::new(BscConsensusMetrics::default);
 
 /// Module-level miner metrics instance shared across all payload builds.
 static MINER_METRICS: Lazy<BscMinerMetrics> = Lazy::new(BscMinerMetrics::default);
@@ -1925,22 +1928,76 @@ where
 
         if let Some(best_payload) = self.pick_best_payload() {
             let best_payload_hash = best_payload.block.hash();
-            if let Err(err) = self.result_tx.send(SubmitContext {
+            let block_number = best_payload.block().number();
+            let is_inturn = self.mining_ctx.is_inturn;
+
+            // Decide how long to wait before releasing the payload to the submitter.
+            // delay_for_ramanujan_fork returns 0 for in-turn validators and a positive
+            // back-off duration for out-of-turn ones.
+            let delay_ms = self.parlia.delay_for_ramanujan_fork(
+                &self.mining_ctx.parent_snapshot,
+                best_payload.block().header(),
+            );
+
+            debug!(
+                target: "bsc::miner::payload",
+                trace_id = self.trace_id,
+                block_number,
+                block_hash = %best_payload_hash,
+                is_inturn,
+                delay_ms,
+                "Check submit delay"
+            );
+
+            let submit_ctx = SubmitContext {
                 mining_ctx: self.mining_ctx.clone(),
                 payload: best_payload,
                 cancel: self.build_args.cancel.clone(),
-            }) {
-                let total_job_duration = self.job_start_time.elapsed();
-                warn!(
+            };
+
+            if delay_ms == 0 {
+                if let Err(err) = self.result_tx.send(submit_ctx) {
+                    let total_job_duration = self.job_start_time.elapsed();
+                    warn!(
+                        target: "bsc::miner::payload",
+                        trace_id = self.trace_id,
+                        block_number,
+                        is_inturn,
+                        total_job_duration_ms = total_job_duration.as_millis(),
+                        error = %err,
+                        "Failed to send best payload to result channel"
+                    );
+                    return Err(Box::new(BscPayloadJobError::ResultChannelSendError(err.to_string())));
+                }
+            } else {
+                // Out-of-turn: wait the back-off delay before handing the payload to the
+                // submitter.  A background task holds the SubmitContext and sends it after
+                // the sleep; submit_payload() re-validates canonical state on arrival so
+                // stale contexts (e.g. a reorg happened during the wait) are discarded safely.
+                CONSENSUS_METRICS.intentional_mining_delays_total.increment(1);
+                let result_tx = self.result_tx.clone();
+                let trace_id = self.trace_id;
+                info!(
                     target: "bsc::miner::payload",
-                    trace_id = self.trace_id,
-                    block_number = self.build_args.config.parent_header.number() + 1,
-                    is_inturn = self.mining_ctx.is_inturn,
-                    total_job_duration_ms = total_job_duration.as_millis(),
-                    error = %err,
-                    "Failed to send best payload to result channel"
+                    trace_id,
+                    block_number,
+                    block_hash = %best_payload_hash,
+                    is_inturn,
+                    delay_ms,
+                    "Block scheduled for delayed submission"
                 );
-                return Err(Box::new(BscPayloadJobError::ResultChannelSendError(err.to_string())));
+                tokio::spawn(async move {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                    if let Err(e) = result_tx.send(submit_ctx) {
+                        warn!(
+                            target: "bsc::miner::payload",
+                            trace_id,
+                            block_number,
+                            error = %e,
+                            "Failed to send delayed payload to result channel"
+                        );
+                    }
+                });
             }
 
             // Check if the best payload is from a bid and increment bid_win metric
@@ -1954,7 +2011,7 @@ where
                     debug!(
                         target: "bsc::miner::payload",
                         trace_id = self.trace_id,
-                        block_number = self.build_args.config.parent_header.number() + 1,
+                        block_number,
                         bid_hash = %bid_hash,
                         "Bid payload won - incrementing bid_win metric"
                     );
