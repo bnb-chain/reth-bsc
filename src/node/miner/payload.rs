@@ -2205,6 +2205,15 @@ fn finalize_payload(
         Arc::new(RecoveredBlock::new_unhashed(plain_block.clone(), senders));
 
     let mut finalized_with_sidecars = plain_block;
+    // Update block_hash in each sidecar to reflect the final (post-seal) hash.
+    // The sidecar block_hash was set to the pre-finalization hash at build time;
+    // finalize_new_header() changes the header (difficulty, extra_data, ECDSA seal),
+    // so the hash must be patched here before the sidecars are transmitted over P2P.
+    if let Some(ref mut sidecars) = existing_sidecars {
+        for sidecar in sidecars.iter_mut() {
+            sidecar.block_hash = final_hash;
+        }
+    }
     finalized_with_sidecars.body.sidecars = existing_sidecars;
     payload.block = Arc::new(finalized_with_sidecars.into());
 

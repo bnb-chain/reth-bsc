@@ -198,8 +198,8 @@ where
         let validator_cache_sink = self.ctx.validator_cache_sink.take();
         let turn_length_sink = self.ctx.turn_length_sink.take();
 
-        // BlockAssemblerInput is non_exhaustive.
-        // So define a new struct BscBlockAssemblerInput and a new interface assemble_block_bsc.
+        // BlockAssemblerInput is non_exhaustive, so we use BscBlockAssemblerInput with
+        // assemble_block_body_only() which skips finalize_new_header() at build time.
         let bsc_input: BscBlockAssemblerInput<'_, '_, BscBlockExecutorFactory> =
             BscBlockAssemblerInput {
                 evm_env,
