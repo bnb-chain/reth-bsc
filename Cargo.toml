@@ -22,6 +22,8 @@ reth-cli-commands = { git = "https://github.com/bnb-chain/reth.git", branch = "f
 reth-basic-payload-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-getlogs" }
 reth-db = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-getlogs" }
 reth-engine-local = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-getlogs" }
+reth-engine-tree = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-getlogs" }
+reth-node-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-getlogs" }
 reth-chainspec = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-getlogs" }
 reth-cli-util = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-getlogs" }
 reth-discv4 = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-getlogs", features = [
