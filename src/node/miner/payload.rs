@@ -740,7 +740,6 @@ where
         let finalize_elapsed = finalize_start.elapsed();
         let finalize_duration = finalize_elapsed.as_secs_f64();
         MINER_METRICS.block_finalize_duration_seconds.record(finalize_duration);
-        MINER_METRICS.blocks_produced_total.increment(1);
 
         // set sidecars to seal block
         let mut blob_sidecars: Vec<BscBlobTransactionSidecar> = Vec::new();
@@ -924,7 +923,6 @@ where
         // Update miner metrics
         let finalize_duration = finalize_start.elapsed().as_secs_f64();
         MINER_METRICS.block_finalize_duration_seconds.record(finalize_duration);
-        MINER_METRICS.blocks_produced_total.increment(1);
 
         let build_duration = build_start.elapsed();
 
