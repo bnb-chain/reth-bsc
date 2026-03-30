@@ -11,7 +11,8 @@ use crate::node::miner::bsc_miner::MiningContext;
 use crate::node::miner::signer::init_global_signer;
 use crate::node::miner::util::prepare_new_attributes;
 
-use alloy_consensus::transaction::Recovered;
+use alloy_consensus::{transaction::Recovered, BlockHeader};
+use alloy_primitives::B256;
 use reth_evm::execute::{BlockBuilder, BlockBuilderOutcome};
 use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
 use reth_payload_primitives::PayloadBuilderAttributes;
@@ -26,6 +27,98 @@ use reth_revm::database::StateProviderDatabase;
 use revm::database::{BundleState, State};
 use std::sync::Arc;
 use std::time::Instant;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BenchBuildSource {
+    Canonical,
+    Speculative,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingCommitTarget {
+    block_number: u64,
+    block_hash: B256,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BenchSpeculativeState {
+    durable_base_hash: B256,
+    durable_base_number: u64,
+    next_build_source: BenchBuildSource,
+    pending_commit_target: Option<PendingCommitTarget>,
+}
+
+impl BenchSpeculativeState {
+    fn new(durable_base_hash: B256, durable_base_number: u64) -> Self {
+        Self {
+            durable_base_hash,
+            durable_base_number,
+            next_build_source: BenchBuildSource::Canonical,
+            pending_commit_target: None,
+        }
+    }
+
+    fn state_base_hash(&self) -> B256 {
+        self.durable_base_hash
+    }
+
+    fn state_base_number(&self) -> u64 {
+        self.durable_base_number
+    }
+
+    fn next_build_source(&self) -> BenchBuildSource {
+        self.next_build_source
+    }
+
+    fn on_submitted_parent(
+        &mut self,
+        block_hash: B256,
+        block_number: u64,
+        build_source: BenchBuildSource,
+    ) {
+        self.pending_commit_target = Some(PendingCommitTarget { block_number, block_hash });
+        self.next_build_source = match build_source {
+            BenchBuildSource::Canonical => BenchBuildSource::Speculative,
+            BenchBuildSource::Speculative => BenchBuildSource::Canonical,
+        };
+    }
+
+    fn on_commit_finished(&mut self, block_hash: B256, block_number: u64) {
+        self.durable_base_hash = block_hash;
+        self.durable_base_number = block_number;
+
+        if self.pending_commit_target
+            == Some(PendingCommitTarget { block_number, block_hash })
+        {
+            self.pending_commit_target = None;
+        }
+    }
+
+    fn requires_canonical_wait(&self) -> bool {
+        matches!(self.next_build_source, BenchBuildSource::Canonical)
+            && self.pending_commit_target.is_some()
+    }
+}
+
+fn record_commit_result(
+    speculative_state: &mut BenchSpeculativeState,
+    pending_commit_hashes: &mut std::collections::HashMap<u64, B256>,
+    commit_results: &mut std::collections::HashMap<u64, CommitResult>,
+    commit_result: CommitResult,
+) -> eyre::Result<()> {
+    let block_hash = pending_commit_hashes
+        .remove(&commit_result.block_number)
+        .ok_or_else(|| {
+            eyre::eyre!(
+                "Missing pending commit hash for block {}",
+                commit_result.block_number
+            )
+        })?;
+
+    speculative_state.on_commit_finished(block_hash, commit_result.block_number);
+    commit_results.insert(commit_result.block_number, commit_result);
+    Ok(())
+}
 
 /// Run the full miner pipeline benchmark.
 pub fn run_benchmark(config: BenchConfig) -> eyre::Result<Vec<BlockTiming>> {
@@ -143,9 +236,13 @@ pub fn run_benchmark(config: BenchConfig) -> eyre::Result<Vec<BlockTiming>> {
 
     // === Execute blocks ===
     let mut timings = Vec::with_capacity(config.num_blocks);
+    let mut commit_results: std::collections::HashMap<u64, CommitResult> =
+        std::collections::HashMap::new();
+    let mut pending_commit_hashes: std::collections::HashMap<u64, B256> =
+        std::collections::HashMap::new();
 
     // Difflayer from previous block for triedb warm cache
-    let mut prev_difflayer: Option<std::sync::Arc<rust_eth_triedb_common::DiffLayer>> = None;
+    let mut _prev_difflayer: Option<std::sync::Arc<rust_eth_triedb_common::DiffLayer>> = None;
 
     // Pipeline state: previous block's bundle for overlay
     let mut prev_bundle: Option<BundleState> = None;
@@ -171,6 +268,8 @@ pub fn run_benchmark(config: BenchConfig) -> eyre::Result<Vec<BlockTiming>> {
 
     let turn_length = parent_snapshot.turn_length.unwrap_or(1) as usize;
     let num_validators = init.validator_addresses.len();
+    let mut speculative_state =
+        BenchSpeculativeState::new(parent_header.hash(), parent_header.number());
 
     // Total blocks: 1 setup + N benchmark
     let total_blocks = config.num_blocks + 1;
@@ -178,14 +277,46 @@ pub fn run_benchmark(config: BenchConfig) -> eyre::Result<Vec<BlockTiming>> {
     for block_idx in start_block_idx..total_blocks {
         let block_number = block_idx as u64 + 1;
         let is_setup_block = block_idx == 0;
+        let block_start = Instant::now();
+        let build_source = if is_setup_block {
+            BenchBuildSource::Canonical
+        } else {
+            speculative_state.next_build_source()
+        };
+        let mut wait_for_base_us = 0u128;
+
+        if !is_setup_block && speculative_state.requires_canonical_wait() {
+            let wait_start = Instant::now();
+            while speculative_state.requires_canonical_wait() {
+                let commit_result = result_rx
+                    .recv()
+                    .map_err(|_| eyre::eyre!("Commit thread exited before result was returned"))?
+                    .map_err(|e| eyre::eyre!("Commit error: {}", e))?;
+                record_commit_result(
+                    &mut speculative_state,
+                    &mut pending_commit_hashes,
+                    &mut commit_results,
+                    commit_result,
+                )?;
+            }
+            wait_for_base_us = wait_start.elapsed().as_micros();
+        }
 
         // Determine the in-turn validator using Parlia rotation logic
         let validator_index = determine_validator_index(block_number, num_validators, turn_length);
         let validator_addr = init.validator_addresses[validator_index];
 
         let has_cached_reads = cached_reads.is_some();
-
-        let block_start = Instant::now();
+        let state_base_hash = if is_setup_block {
+            parent_header.hash()
+        } else {
+            speculative_state.state_base_hash()
+        };
+        let state_base_number = if is_setup_block {
+            parent_header.number()
+        } else {
+            speculative_state.state_base_number()
+        };
 
         // Create MiningContext
         let mut mining_ctx = MiningContext {
@@ -194,8 +325,15 @@ pub fn run_benchmark(config: BenchConfig) -> eyre::Result<Vec<BlockTiming>> {
             parent_snapshot: Arc::new(parent_snapshot.clone()),
             is_inturn: true,
             cached_reads: None,
-            source: crate::node::miner::speculative::MiningContextSource::Canonical,
-            state_base_hash: None,
+            source: match build_source {
+                BenchBuildSource::Canonical => {
+                    crate::node::miner::speculative::MiningContextSource::Canonical
+                }
+                BenchBuildSource::Speculative => {
+                    crate::node::miner::speculative::MiningContextSource::Speculative
+                }
+            },
+            state_base_hash: (state_base_hash != parent_header.hash()).then_some(state_base_hash),
             prev_bundle_state: None,
         };
 
@@ -214,7 +352,7 @@ pub fn run_benchmark(config: BenchConfig) -> eyre::Result<Vec<BlockTiming>> {
         // After genesis init or each committed block, latest() returns the correct parent state.
         let state_provider = init
             .factory
-            .latest()
+            .history_by_block_hash(state_base_hash)
             .map_err(|e| eyre::eyre!("Failed to get state for block {}: {:?}", block_number, e))?;
 
         // Wrap state provider for the EVM State DB.
@@ -315,7 +453,7 @@ pub fn run_benchmark(config: BenchConfig) -> eyre::Result<Vec<BlockTiming>> {
         // TIME: Finish (post-exec + state root + assembly)
         // Get a separate state provider BEFORE timing starts to exclude MDBX overhead
         // (production finalize timing in payload.rs:623-625 doesn't include provider creation).
-        let finish_state_provider = init.factory.latest().map_err(|e| {
+        let finish_state_provider = init.factory.history_by_block_hash(state_base_hash).map_err(|e| {
             eyre::eyre!("Failed to get finish state for block {}: {:?}", block_number, e)
         })?;
 
@@ -415,8 +553,9 @@ pub fn run_benchmark(config: BenchConfig) -> eyre::Result<Vec<BlockTiming>> {
             parent_snapshot.block_hash = new_hash;
 
             // Update difflayer chain for next block
-            prev_difflayer = produced_difflayer;
+            _prev_difflayer = produced_difflayer;
             prev_bundle = None; // setup block committed synchronously, no overlay needed
+            speculative_state = BenchSpeculativeState::new(new_hash, block_number);
 
             db_init::persist_post_setup_cache(&config, &init, &parent_header, &parent_snapshot)?;
             println!(
@@ -491,8 +630,11 @@ pub fn run_benchmark(config: BenchConfig) -> eyre::Result<Vec<BlockTiming>> {
         // Set overlay bundle so the next block can read from memory while commit is in flight
         prev_bundle = Some(next_bundle);
 
+        pending_commit_hashes.insert(block_number, new_hash);
+        speculative_state.on_submitted_parent(new_hash, block_number, build_source);
+
         // Chain difflayer for triedb warm cache
-        prev_difflayer = produced_difflayer;
+        _prev_difflayer = produced_difflayer;
 
         // Record timing for benchmark blocks (commit sub-fields are placeholders;
         // they will be merged from CommitResult after the block loop).
@@ -501,6 +643,9 @@ pub fn run_benchmark(config: BenchConfig) -> eyre::Result<Vec<BlockTiming>> {
             validator_index,
             tx_count: tx_count as usize,
             gas_used,
+            is_speculative: matches!(build_source, BenchBuildSource::Speculative),
+            state_base_number,
+            wait_for_base_us,
             state_setup_us,
             pre_execution_us,
             execute_only_us,
@@ -521,12 +666,14 @@ pub fn run_benchmark(config: BenchConfig) -> eyre::Result<Vec<BlockTiming>> {
         if block_number.is_multiple_of(10) || block_number <= 2 {
             let flags = if has_cached_reads { "C" } else { "-" };
             println!(
-                "  Block {:>4} | v[{}] {} | txs: {:>3} | gas: {:>8} | finish: {:>6}us | send: {:>6}us | total: {:>6}us",
+                "  Block {:>4} | v[{}] {}{} | txs: {:>3} | gas: {:>8} | wait: {:>6}us | finish: {:>6}us | send: {:>6}us | total: {:>6}us",
                 block_number,
                 validator_index,
                 flags,
+                if matches!(build_source, BenchBuildSource::Speculative) { "S" } else { "-" },
                 tx_count,
                 gas_used,
+                wait_for_base_us,
                 finish_us,
                 pipeline_send_us,
                 total_us,
@@ -540,12 +687,15 @@ pub fn run_benchmark(config: BenchConfig) -> eyre::Result<Vec<BlockTiming>> {
     drop(commit_tx);
     let _ = commit_thread.join();
 
-    let mut commit_results: std::collections::HashMap<u64, CommitResult> =
-        std::collections::HashMap::new();
     while let Ok(result) = result_rx.try_recv() {
         match result {
             Ok(cr) => {
-                commit_results.insert(cr.block_number, cr);
+                record_commit_result(
+                    &mut speculative_state,
+                    &mut pending_commit_hashes,
+                    &mut commit_results,
+                    cr,
+                )?;
             }
             Err(e) => return Err(eyre::eyre!("Commit error: {}", e)),
         }
@@ -578,6 +728,11 @@ fn determine_validator_index(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_primitives::B256;
+
+    fn example_hash(number: u64) -> B256 {
+        B256::with_last_byte(number as u8)
+    }
 
     #[test]
     fn test_validator_rotation() {
@@ -593,6 +748,26 @@ mod tests {
         assert_eq!(determine_validator_index(5, 3, 2), 2);
         assert_eq!(determine_validator_index(6, 3, 2), 2);
         assert_eq!(determine_validator_index(7, 3, 2), 0);
+    }
+
+    #[test]
+    fn bench_pipeline_keeps_durable_base_one_commit_behind_speculative_parent() {
+        let mut state = BenchSpeculativeState::new(example_hash(99), 99);
+        state.on_submitted_parent(example_hash(100), 100, BenchBuildSource::Canonical);
+
+        assert_eq!(state.state_base_hash(), example_hash(99));
+        assert_eq!(state.state_base_number(), 99);
+        assert_eq!(state.next_build_source(), BenchBuildSource::Speculative);
+    }
+
+    #[test]
+    fn bench_pipeline_advances_durable_base_after_commit_result() {
+        let mut state = BenchSpeculativeState::new(example_hash(99), 99);
+        state.on_submitted_parent(example_hash(100), 100, BenchBuildSource::Canonical);
+        state.on_commit_finished(example_hash(100), 100);
+
+        assert_eq!(state.state_base_hash(), example_hash(100));
+        assert_eq!(state.state_base_number(), 100);
     }
 
     #[test]

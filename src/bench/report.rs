@@ -9,6 +9,9 @@ pub struct BlockTiming {
     pub validator_index: usize,
     pub tx_count: usize,
     pub gas_used: u64,
+    pub is_speculative: bool,
+    pub state_base_number: u64,
+    pub wait_for_base_us: u128,
     // Phase timings (microseconds)
     pub state_setup_us: u128,
     pub pre_execution_us: u128,
@@ -40,6 +43,7 @@ pub struct BlockTiming {
 }
 
 const CSV_HEADER: &str = "block_number,validator_index,tx_count,gas_used,\
+    is_speculative,state_base_number,wait_for_base_us,\
     state_setup_us,pre_execution_us,execute_only_us,tx_execution_us,\
     insert_block_us,write_state_us,triedb_flush_us,provider_commit_us,commit_us,\
     pipeline_send_us,finish_us,total_us,\
@@ -55,12 +59,15 @@ pub fn write_csv(timings: &[BlockTiming], path: &Path, label: &str) -> eyre::Res
     for t in timings {
         writeln!(
             file,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             label,
             t.block_number,
             t.validator_index,
             t.tx_count,
             t.gas_used,
+            t.is_speculative,
+            t.state_base_number,
+            t.wait_for_base_us,
             t.state_setup_us,
             t.pre_execution_us,
             t.execute_only_us,
@@ -97,13 +104,41 @@ pub fn read_csv(path: &Path) -> eyre::Result<Vec<BlockTiming>> {
         if fields.len() < 16 {
             continue;
         }
-        // Skip label field (index 0). Current layout: 20 fields (with pipeline_send_us).
-        let t = if fields.len() >= 20 {
+        // Skip label field (index 0). Current layout: 23 fields.
+        let t = if fields.len() >= 23 {
             BlockTiming {
                 block_number: fields[1].parse().unwrap_or(0),
                 validator_index: fields[2].parse().unwrap_or(0),
                 tx_count: fields[3].parse().unwrap_or(0),
                 gas_used: fields[4].parse().unwrap_or(0),
+                is_speculative: fields[5].parse().unwrap_or(false),
+                state_base_number: fields[6].parse().unwrap_or(0),
+                wait_for_base_us: fields[7].parse().unwrap_or(0),
+                state_setup_us: fields[8].parse().unwrap_or(0),
+                pre_execution_us: fields[9].parse().unwrap_or(0),
+                execute_only_us: fields[10].parse().unwrap_or(0),
+                tx_execution_us: fields[11].parse().unwrap_or(0),
+                insert_block_us: fields[12].parse().unwrap_or(0),
+                write_state_us: fields[13].parse().unwrap_or(0),
+                triedb_flush_us: fields[14].parse().unwrap_or(0),
+                provider_commit_us: fields[15].parse().unwrap_or(0),
+                commit_us: fields[16].parse().unwrap_or(0),
+                pipeline_send_us: fields[17].parse().unwrap_or(0),
+                finish_us: fields[18].parse().unwrap_or(0),
+                total_us: fields[19].parse().unwrap_or(0),
+                hashed_accounts: fields[20].parse().unwrap_or(0),
+                hashed_storage_slots: fields[21].parse().unwrap_or(0),
+                has_cached_reads: fields[22].parse().unwrap_or(false),
+            }
+        } else if fields.len() >= 20 {
+            BlockTiming {
+                block_number: fields[1].parse().unwrap_or(0),
+                validator_index: fields[2].parse().unwrap_or(0),
+                tx_count: fields[3].parse().unwrap_or(0),
+                gas_used: fields[4].parse().unwrap_or(0),
+                is_speculative: false,
+                state_base_number: 0,
+                wait_for_base_us: 0,
                 state_setup_us: fields[5].parse().unwrap_or(0),
                 pre_execution_us: fields[6].parse().unwrap_or(0),
                 execute_only_us: fields[7].parse().unwrap_or(0),
@@ -127,6 +162,9 @@ pub fn read_csv(path: &Path) -> eyre::Result<Vec<BlockTiming>> {
                 validator_index: fields[2].parse().unwrap_or(0),
                 tx_count: fields[3].parse().unwrap_or(0),
                 gas_used: fields[4].parse().unwrap_or(0),
+                is_speculative: false,
+                state_base_number: 0,
+                wait_for_base_us: 0,
                 state_setup_us: fields[5].parse().unwrap_or(0),
                 pre_execution_us: fields[6].parse().unwrap_or(0),
                 execute_only_us: fields[7].parse().unwrap_or(0),
@@ -150,6 +188,9 @@ pub fn read_csv(path: &Path) -> eyre::Result<Vec<BlockTiming>> {
                 validator_index: fields[2].parse().unwrap_or(0),
                 tx_count: fields[3].parse().unwrap_or(0),
                 gas_used: fields[4].parse().unwrap_or(0),
+                is_speculative: false,
+                state_base_number: 0,
+                wait_for_base_us: 0,
                 state_setup_us: fields[5].parse().unwrap_or(0),
                 pre_execution_us: fields[6].parse().unwrap_or(0),
                 execute_only_us: 0,
@@ -190,6 +231,7 @@ pub fn print_summary(timings: &[BlockTiming], label: &str) {
         ("pre_execution", timings.iter().map(|t| t.pre_execution_us).collect()),
         ("execute_only", timings.iter().map(|t| t.execute_only_us).collect()),
         ("tx_execution", timings.iter().map(|t| t.tx_execution_us).collect()),
+        ("wait_for_base", timings.iter().map(|t| t.wait_for_base_us).collect()),
         ("insert_block", timings.iter().map(|t| t.insert_block_us).collect()),
         ("write_state", timings.iter().map(|t| t.write_state_us).collect()),
         ("triedb_flush", timings.iter().map(|t| t.triedb_flush_us).collect()),
@@ -225,6 +267,15 @@ pub fn print_summary(timings: &[BlockTiming], label: &str) {
     println!("    Gas/sec:        {:.0}", total_gas as f64 / total_time_s);
     println!("    Total gas:      {}", total_gas);
     println!("    Total txs:      {}", total_txs);
+    println!(
+        "    Speculative:    {} / {}",
+        timings.iter().filter(|t| t.is_speculative).count(),
+        timings.len()
+    );
+    println!(
+        "    Waited for DB:  {} blocks",
+        timings.iter().filter(|t| t.wait_for_base_us > 0).count()
+    );
 }
 
 /// Compare two benchmark runs side-by-side.
@@ -243,6 +294,7 @@ pub fn compare(baseline_path: &Path, optimized_path: &Path) -> eyre::Result<()> 
         "pre_execution",
         "execute_only",
         "tx_execution",
+        "wait_for_base",
         "insert_block",
         "write_state",
         "triedb_flush",
@@ -289,6 +341,7 @@ fn phase_means(timings: &[BlockTiming]) -> HashMap<&'static str, f64> {
     m.insert("pre_execution", timings.iter().map(|t| t.pre_execution_us as f64).sum::<f64>() / n);
     m.insert("execute_only", timings.iter().map(|t| t.execute_only_us as f64).sum::<f64>() / n);
     m.insert("tx_execution", timings.iter().map(|t| t.tx_execution_us as f64).sum::<f64>() / n);
+    m.insert("wait_for_base", timings.iter().map(|t| t.wait_for_base_us as f64).sum::<f64>() / n);
     m.insert("insert_block", timings.iter().map(|t| t.insert_block_us as f64).sum::<f64>() / n);
     m.insert("write_state", timings.iter().map(|t| t.write_state_us as f64).sum::<f64>() / n);
     m.insert("triedb_flush", timings.iter().map(|t| t.triedb_flush_us as f64).sum::<f64>() / n);
