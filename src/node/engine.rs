@@ -23,6 +23,7 @@ use reth_evm::ConfigureEvm;
 use reth_payload_builder_primitives::Events;
 use reth_payload_primitives::BuiltPayload;
 use reth_primitives::{SealedBlock, TransactionSigned};
+use reth_revm::cached::CachedReads;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
@@ -62,6 +63,10 @@ pub struct BscBuiltPayload {
     /// Turn length from execution context, to be written to TURN_LENGTH_CACHE after finalization.
     /// `None` for bid payloads and blocks without turn-length changes.
     pub(crate) pending_turn_length: Option<u8>,
+    /// Cached reads derived from this block's post-state for the next build attempt.
+    pub(crate) next_cached_reads: Option<CachedReads>,
+    /// In-memory post-state bundle used for speculative overlay reads in the next build.
+    pub(crate) next_bundle_state: Option<revm::database::BundleState>,
     /// Whether this payload originated from an external bid (MEV bundle) rather than a local
     /// transaction pool build.  Used to track bid-win metrics in `try_return_best_payload()`.
     pub(crate) is_bid: bool,

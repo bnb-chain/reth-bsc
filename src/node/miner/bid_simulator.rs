@@ -7,6 +7,7 @@ use crate::node::engine::BscBuiltPayload;
 use crate::node::evm::config::{BscEvmConfig, BscNextBlockEnvAttributes, ValidatorCacheSink};
 use crate::node::miner::bsc_miner::MiningContext;
 use crate::node::miner::payload::DELAY_LEFT_OVER;
+use crate::node::miner::speculative::MiningContextSource;
 use crate::node::miner::util::prepare_new_attributes;
 use crate::node::primitives::BscBlobTransactionSidecar;
 use alloy_consensus::BlobTransactionSidecar;
@@ -196,6 +197,7 @@ where
             header: None,
             is_inturn: true,
             cached_reads: None,
+            source: MiningContextSource::Canonical,
             state_base_hash: None,
             prev_bundle_state: None,
         };
@@ -604,6 +606,18 @@ where
         plain.body.sidecars = Some(bid_runtime.blob_sidecars.clone());
         sealed_block = Arc::new(plain.into());
 
+        let next_bundle_state = db.bundle_state.clone();
+        let next_cached_reads = {
+            let mut cached_reads = reth_revm::cached::CachedReads::default();
+            for (addr, acc) in next_bundle_state.state.iter() {
+                if let Some(info) = acc.info.clone() {
+                    let storage =
+                        acc.storage.iter().map(|(key, slot)| (*key, slot.present_value)).collect();
+                    cached_reads.insert_account(*addr, info, storage);
+                }
+            }
+            cached_reads
+        };
         let requests = execution_result.requests.clone();
         let execution_outcome =
             BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
@@ -631,6 +645,8 @@ where
             executed_block,
             pending_validators,
             pending_turn_length,
+            next_cached_reads: Some(next_cached_reads),
+            next_bundle_state: Some(next_bundle_state),
             is_bid: true,
         });
 

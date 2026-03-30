@@ -1,5 +1,9 @@
 use crate::node::miner::bid_simulator::{BidRuntime, BidSimulator};
 use crate::node::miner::payload::BscBuildArguments;
+use crate::node::miner::speculative::{
+    derive_speculative_child_context, MiningContextSource, PendingLocalHead,
+    PendingLocalHeadTracker,
+};
 use crate::{
     chainspec::BscChainSpec,
     consensus::parlia::{provider::SnapshotProvider, vote_pool, Parlia},
@@ -68,6 +72,7 @@ pub struct MiningContext {
     pub parent_snapshot: Arc<crate::consensus::parlia::snapshot::Snapshot>,
     pub is_inturn: bool,
     pub cached_reads: Option<reth_revm::cached::CachedReads>,
+    pub source: MiningContextSource,
     /// Explicit durable MDBX base for state reads.
     /// `None` means "use the parent hash" which is the canonical path.
     pub state_base_hash: Option<alloy_primitives::B256>,
@@ -573,6 +578,7 @@ where
             parent_snapshot: Arc::new(parent_snapshot),
             is_inturn,
             cached_reads: self.maybe_pre_cached(parent_hash),
+            source: MiningContextSource::Canonical,
             state_base_hash: None,
             prev_bundle_state: self.maybe_pre_bundle_state(parent_hash),
         };
@@ -699,27 +705,58 @@ where
             Err(_) => return true, // On error, proceed to avoid blocking mining
         };
 
-        if ctx.parent_header.number() != current_best {
-            debug!(
-                target: "bsc::miner",
-                ctx_parent_number = ctx.parent_header.number(),
-                ctx_parent_hash = ?parent_hash,
-                current_best_number = current_best,
-                "Discarding stale mining context due to chain head number changed"
-            );
-            return false;
-        }
+        match ctx.source {
+            MiningContextSource::Canonical => {
+                if ctx.parent_header.number() != current_best {
+                    debug!(
+                        target: "bsc::miner",
+                        ctx_parent_number = ctx.parent_header.number(),
+                        ctx_parent_hash = ?parent_hash,
+                        current_best_number = current_best,
+                        "Discarding stale mining context due to chain head number changed"
+                    );
+                    return false;
+                }
 
-        if let Ok(Some(canonical_header)) = self.provider.sealed_header(current_best) {
-            if canonical_header.hash() != parent_hash {
-                debug!(
-                    target: "bsc::miner",
-                    ctx_parent_number = ctx.parent_header.number(),
-                    ctx_parent_hash = ?parent_hash,
-                    canonical_hash = ?canonical_header.hash(),
-                    "Discarding stale mining context due to same-height reorg"
-                );
-                return false;
+                if let Ok(Some(canonical_header)) = self.provider.sealed_header(current_best) {
+                    if canonical_header.hash() != parent_hash {
+                        debug!(
+                            target: "bsc::miner",
+                            ctx_parent_number = ctx.parent_header.number(),
+                            ctx_parent_hash = ?parent_hash,
+                            canonical_hash = ?canonical_header.hash(),
+                            "Discarding stale mining context due to same-height reorg"
+                        );
+                        return false;
+                    }
+                }
+            }
+            MiningContextSource::Speculative => {
+                if ctx.parent_header.number() != current_best.saturating_add(1) {
+                    debug!(
+                        target: "bsc::miner",
+                        ctx_parent_number = ctx.parent_header.number(),
+                        ctx_parent_hash = ?parent_hash,
+                        current_best_number = current_best,
+                        "Discarding speculative mining context because canonical head is not one block behind"
+                    );
+                    return false;
+                }
+
+                if let Ok(Some(canonical_header)) = self.provider.sealed_header(current_best) {
+                    if canonical_header.hash() != ctx.parent_header.parent_hash
+                        || ctx.state_base_hash != Some(canonical_header.hash())
+                    {
+                        debug!(
+                            target: "bsc::miner",
+                            ctx_parent_number = ctx.parent_header.number(),
+                            ctx_parent_hash = ?parent_hash,
+                            canonical_hash = ?canonical_header.hash(),
+                            "Discarding speculative mining context because canonical base no longer matches"
+                        );
+                        return false;
+                    }
+                }
             }
         }
 
@@ -813,10 +850,16 @@ pub struct ResultWorkWorker<Provider> {
     validator_address: Address,
     /// Provider for blockchain data
     provider: Provider,
+    /// Snapshot provider used to derive speculative parent snapshots from cached headers.
+    snapshot_provider: Arc<dyn SnapshotProvider + Send + Sync>,
     /// Receiver for payloads that are ready to submit (delay already applied by payload job)
     payload_rx: mpsc::UnboundedReceiver<SubmitContext>,
+    /// Sender for speculative next-work contexts.
+    mining_queue_tx: mpsc::UnboundedSender<MiningContext>,
     /// LRU cache to track recently mined blocks to prevent double signing
     recent_mined_blocks: Arc<Mutex<LruCache<u64, Vec<alloy_primitives::B256>>>>,
+    /// Current locally submitted pending head.
+    pending_local_head: PendingLocalHeadTracker,
     /// Consensus metrics for tracking double signs and block turn stats
     consensus_metrics: BscConsensusMetrics,
     /// Flag for submitting built payload
@@ -831,7 +874,9 @@ where
     pub fn new(
         validator_address: Address,
         provider: Provider,
+        snapshot_provider: Arc<dyn SnapshotProvider + Send + Sync>,
         payload_rx: mpsc::UnboundedReceiver<SubmitContext>,
+        mining_queue_tx: mpsc::UnboundedSender<MiningContext>,
         submit_built_payload: bool,
     ) -> Self {
         let recent_mined_blocks = Arc::new(Mutex::new(LruCache::new(
@@ -841,8 +886,11 @@ where
         Self {
             validator_address,
             provider,
+            snapshot_provider,
             payload_rx,
+            mining_queue_tx,
             recent_mined_blocks,
+            pending_local_head: PendingLocalHeadTracker::default(),
             consensus_metrics: BscConsensusMetrics::default(),
             submit_built_payload,
         }
@@ -858,7 +906,7 @@ where
                     let is_inturn = submit_ctx.mining_ctx.is_inturn;
                     let block_number = submit_ctx.payload.block().number();
                     let block_hash = submit_ctx.payload.block().hash();
-                    match self.submit_payload(submit_ctx.payload).await {
+                    match self.submit_payload(submit_ctx).await {
                         Ok(()) => {
                             info!(
                                 target: "bsc::miner",
@@ -895,13 +943,15 @@ where
 
     /// Submit a built payload to the engine-tree/network
     async fn submit_payload(
-        &self,
-        payload: BscBuiltPayload,
+        &mut self,
+        submit_ctx: SubmitContext,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let SubmitContext { mining_ctx, payload, cancel: _ } = submit_ctx;
         let sealed_block = payload.block();
         let block_hash = sealed_block.hash();
         let block_number = sealed_block.number();
         let parent_hash = sealed_block.header().parent_hash;
+        let durable_base_hash = mining_ctx.state_base_hash.unwrap_or(mining_ctx.parent_header.hash());
         let best_block_number = self.provider.best_block_number()?;
         if block_number <= best_block_number {
             debug!(
@@ -1078,38 +1128,87 @@ where
             BscNewBlock(reth_eth_wire::NewBlock { block: sealed_block.clone_block(), td });
         let msg =
             NewBlockMessage { hash: block_hash, block: Arc::new(new_block), td: Some(new_td) };
+        let should_spawn_speculative = mining_ctx.source == MiningContextSource::Canonical;
+        let speculative_parent_header =
+            reth_primitives::SealedHeader::new(sealed_block.header().clone(), block_hash);
+        let speculative_next_cached_reads = payload.next_cached_reads.clone();
+        let speculative_next_bundle_state = payload.next_bundle_state.clone();
 
-        if self.submit_built_payload {
+        let send_result: Result<(), Box<dyn std::error::Error + Send + Sync>> =
+            if self.submit_built_payload {
             if let Some(sender) = get_block_import_mined_sender() {
                 let incoming: IncomingMinedBlock = (payload, msg);
                 if sender.send(incoming).is_err() {
                     warn!("Failed to send mined block to import service due to channel closed");
-                    return Err(
+                    Err(
                         "Failed to send mined block to import service due to channel closed".into(),
-                    );
+                    )
                 } else {
                     debug!("Succeed to send mined block to import service");
+                    Ok(())
                 }
             } else {
                 warn!("Failed to send mined block due to import sender not initialised");
-                return Err(
+                Err(
                     "Failed to send mined block due to import sender not initialised".into()
-                );
+                )
             }
         } else if let Some(sender) = get_block_import_sender() {
             let peer_id = get_local_peer_id_or_default();
             let incoming: IncomingBlock = (msg, peer_id);
             if sender.send(incoming).is_err() {
                 warn!("Failed to send built block to import service due to channel closed");
-                return Err(
+                Err(
                     "Failed to send built block to import service due to channel closed".into()
-                );
+                )
             } else {
                 debug!("Succeed to send built block to import service");
+                Ok(())
             }
-        } else {
-            warn!("Failed to send built block due to import sender not initialised");
-            return Err("Failed to send built block due to import sender not initialised".into());
+            } else {
+                warn!("Failed to send built block due to import sender not initialised");
+                Err("Failed to send built block due to import sender not initialised".into())
+            };
+
+        send_result?;
+
+        self.pending_local_head.record_submitted_head(PendingLocalHead {
+            block_number,
+            block_hash,
+            parent_hash,
+            durable_base_hash,
+            child_spawned: false,
+        });
+
+        if should_spawn_speculative {
+            crate::node::evm::util::insert_header_to_cache_with_hash(
+                speculative_parent_header.header().clone(),
+                Some(block_hash),
+            );
+
+            if let (Some(cached_reads), Some(prev_bundle_state)) =
+                (speculative_next_cached_reads, speculative_next_bundle_state)
+            {
+                if let Some(parent_snapshot) = self.snapshot_provider.snapshot_by_hash(&block_hash) {
+                    if parent_snapshot.validators.contains(&self.validator_address)
+                        && !parent_snapshot.sign_recently(self.validator_address)
+                        && self.pending_local_head.can_spawn_child(block_number.saturating_add(1))
+                    {
+                        let next_ctx = derive_speculative_child_context(
+                            speculative_parent_header,
+                            Arc::new(parent_snapshot.clone()),
+                            parent_snapshot.is_inturn(self.validator_address),
+                            Some(cached_reads),
+                            durable_base_hash,
+                            Some(prev_bundle_state),
+                        );
+
+                        if self.mining_queue_tx.send(next_ctx).is_ok() {
+                            let _ = self.pending_local_head.mark_child_spawned();
+                        }
+                    }
+                }
+            }
         }
 
         Ok(())
@@ -1328,7 +1427,9 @@ where
         let result_work_worker = ResultWorkWorker::new(
             validator_address,
             provider.clone(),
+            snapshot_provider.clone(),
             payload_rx,
+            mining_queue_tx.clone(),
             mining_config.submit_built_payload,
         );
 

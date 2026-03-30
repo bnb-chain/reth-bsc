@@ -1,4 +1,9 @@
 use alloy_primitives::B256;
+use crate::consensus::parlia::snapshot::Snapshot;
+use crate::node::miner::bsc_miner::MiningContext;
+use reth_primitives::SealedHeader;
+use reth_revm::cached::CachedReads;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MiningContextSource {
@@ -83,11 +88,39 @@ impl From<PendingLocalHead> for PendingLocalHeadTracker {
     }
 }
 
+pub fn derive_speculative_child_context(
+    parent_header: SealedHeader,
+    parent_snapshot: Arc<Snapshot>,
+    is_inturn: bool,
+    cached_reads: Option<CachedReads>,
+    durable_base_hash: B256,
+    prev_bundle_state: Option<revm::database::BundleState>,
+) -> MiningContext {
+    MiningContext {
+        header: None,
+        parent_header,
+        parent_snapshot,
+        is_inturn,
+        cached_reads,
+        source: MiningContextSource::Speculative,
+        state_base_hash: Some(durable_base_hash),
+        prev_bundle_state,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use alloy_primitives::B256;
+    use alloy_primitives::Address;
+    use alloy_consensus::Header;
+    use reth_primitives::SealedHeader;
+    use std::sync::Arc;
 
-    use super::{PendingLocalHead, PendingLocalHeadTracker, ReconcileDecision};
+    use super::{
+        derive_speculative_child_context, MiningContextSource, PendingLocalHead,
+        PendingLocalHeadTracker, ReconcileDecision,
+    };
+    use crate::consensus::parlia::Snapshot;
 
     fn example_hash(number: u64) -> B256 {
         B256::with_last_byte(number as u8)
@@ -117,5 +150,30 @@ mod tests {
         let decision = tracker.reconcile_canonical_head(example_hash(200), 100);
         assert_eq!(decision, ReconcileDecision::ClearPending);
         assert!(tracker.current().is_none());
+    }
+
+    #[test]
+    fn derive_speculative_child_context_keeps_durable_base_on_parent() {
+        let parent_hash = example_hash(100);
+        let parent_header = Header {
+            number: 100,
+            parent_hash: example_hash(99),
+            beneficiary: Address::with_last_byte(1),
+            ..Default::default()
+        };
+        let parent_snapshot = Snapshot::new(vec![Address::with_last_byte(1)], 100, parent_hash, 200, None);
+
+        let ctx = derive_speculative_child_context(
+            SealedHeader::new(parent_header, parent_hash),
+            Arc::new(parent_snapshot),
+            true,
+            None,
+            example_hash(99),
+            None,
+        );
+
+        assert_eq!(ctx.parent_header.number, 100);
+        assert_eq!(ctx.state_base_hash, Some(example_hash(99)));
+        assert_eq!(ctx.source, MiningContextSource::Speculative);
     }
 }

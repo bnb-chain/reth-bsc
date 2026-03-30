@@ -1164,6 +1164,8 @@ mod tests {
             executed_block: Default::default(),
             pending_validators: None,
             pending_turn_length: None,
+            next_cached_reads: None,
+            next_bundle_state: None,
             is_bid: false,
         }
     }

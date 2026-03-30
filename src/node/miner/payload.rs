@@ -183,6 +183,17 @@ fn resolve_state_provider_hash(state_base_hash: Option<B256>, parent_hash: B256)
     state_base_hash.unwrap_or(parent_hash)
 }
 
+fn cached_reads_from_bundle(bundle: &revm::database::BundleState) -> CachedReads {
+    let mut cached_reads = CachedReads::default();
+    for (addr, acc) in bundle.state.iter() {
+        if let Some(info) = acc.info.clone() {
+            let storage = acc.storage.iter().map(|(key, slot)| (*key, slot.present_value)).collect();
+            cached_reads.insert_account(*addr, info, storage);
+        }
+    }
+    cached_reads
+}
+
 fn estimated_uplift_meets_threshold(
     estimated_new_fees: U256,
     comparison_base: U256,
@@ -857,6 +868,8 @@ where
         plain.body.sidecars = Some(blob_sidecars);
         sealed_block = Arc::new(plain.into());
 
+        let next_bundle_state = db.bundle_state.clone();
+        let next_cached_reads = cached_reads_from_bundle(&next_bundle_state);
         let requests = execution_result.requests.clone();
         let execution_outcome =
             BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
@@ -883,6 +896,8 @@ where
             executed_block,
             pending_validators,
             pending_turn_length,
+            next_cached_reads: Some(next_cached_reads),
+            next_bundle_state: Some(next_bundle_state),
             is_bid: false,
         };
         Ok(payload)
@@ -1025,6 +1040,8 @@ where
             "Empty block payload built successfully (no user transactions)"
         );
 
+        let next_bundle_state = db.bundle_state.clone();
+        let next_cached_reads = cached_reads_from_bundle(&next_bundle_state);
         let requests = execution_result.requests.clone();
         let execution_outcome =
             BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
@@ -1051,6 +1068,8 @@ where
             executed_block,
             pending_validators,
             pending_turn_length,
+            next_cached_reads: Some(next_cached_reads),
+            next_bundle_state: Some(next_bundle_state),
             is_bid: false,
         };
         Ok(payload)
@@ -2340,6 +2359,7 @@ mod tests {
             parent_snapshot: Arc::new(snapshot),
             is_inturn,
             cached_reads: None,
+            source: crate::node::miner::speculative::MiningContextSource::Canonical,
             state_base_hash: None,
             prev_bundle_state: None,
         }
