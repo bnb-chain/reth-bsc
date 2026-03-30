@@ -222,6 +222,18 @@ pub struct BscFinalityMetrics {
 
     /// Current safe block height (equivalent to chain/head/safe)
     pub safe_block_height: Gauge,
+
+    /// Early finalization latency in milliseconds (BEP-648 fast path via VotePool).
+    /// Measures the time from the finalized block's millisecond timestamp to when the
+    /// forkchoice update is triggered, equivalent to chain/finalized/latency/early in geth.
+    pub finalized_latency_early_ms: Gauge,
+
+    /// Normal finalization latency in milliseconds (attestation assembly path).
+    /// Measures the time from the source block's millisecond timestamp to when the
+    /// miner successfully assembles a vote attestation confirming it as finalized.
+    /// Equivalent to chain/finalized/latency/normal in geth (measured at assembly
+    /// time rather than import time, so slightly earlier in the pipeline).
+    pub finalized_latency_normal_ms: Gauge,
 }
 
 /// Metrics for BSC blockchain operations

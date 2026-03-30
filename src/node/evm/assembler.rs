@@ -79,16 +79,18 @@ where
         }
     }
 
-    /// BSC-specific assemble_block method that accepts BscBlockAssemblerInput.
-    /// This method is completely aligned with the standard assemble_block implementation.
-    pub fn assemble_block_bsc(&self, input: BscBlockAssemblerInput<'_, '_, BscBlockExecutorFactory>) -> 
+    /// Assemble the block body only — build header fields and transaction/receipt roots but
+    /// skip `finalize_new_header()` (no difficulty, no validators, no attestation, no seal).
+    ///
+    /// The returned block has:
+    /// - `difficulty = 0`
+    /// - `extra_data = self.extra_data` (raw assembler default, no seal bytes)
+    ///
+    /// Callers must invoke `finalize_new_header()` later (e.g. in `pick_best_payload()`)
+    /// once the best payload has been chosen and all FF votes have been collected.
+    pub fn assemble_block_body_only(&self, input: BscBlockAssemblerInput<'_, '_, BscBlockExecutorFactory>) ->
         Result<crate::node::primitives::BscBlock, BlockExecutionError>
     {
-        // Get snapshot provider, return error if not available
-        let snapshot_provider = crate::shared::get_snapshot_provider()
-            .cloned()
-            .ok_or_else(|| BlockExecutionError::msg("Snapshot provider not available"))?;
-
         let BscBlockAssemblerInput {
             evm_env,
             execution_ctx: ctx,
@@ -99,7 +101,6 @@ where
             ..
         } = input;
 
-        // Use the base EthBlockExecutionCtx for compatibility
         let eth_ctx = ctx.as_eth_context();
         let timestamp = evm_env.block_env.timestamp().saturating_to();
         let transactions_root = proofs::calculate_transaction_root(&transactions);
@@ -107,13 +108,11 @@ where
 
         let receipts_with_bloom = receipts.iter().map(TxReceipt::with_bloom_ref).collect::<Vec<_>>();
         let receipts_root = alloy_consensus::proofs::calculate_receipt_root(&receipts_with_bloom);
-    
-        // Calculate header logs bloom.
+
         let logs_bloom = receipts_with_bloom
             .iter()
             .fold(alloy_primitives::Bloom::ZERO, |bloom, r| bloom | r.bloom_ref());
 
-        // parlia override header un-used fields.
         let mut withdrawals_root = None;
         let mut withdrawals = None;
         let mut parent_beacon_block_root = None;
@@ -144,15 +143,13 @@ where
             );
         }
 
-        // baseFee should only be set after London fork (EIP-1559)
-        let block_number = evm_env.block_env.number().saturating_to();
         let base_fee_per_gas = if self.chain_spec.is_london_active_at_block(block_number) {
             Some(evm_env.block_env.basefee())
         } else {
             None
         };
 
-        let mut header = Header {
+        let header = Header {
             parent_hash: eth_ctx.parent_hash,
             ommers_hash: EMPTY_OMMER_ROOT_HASH,
             beneficiary: evm_env.block_env.beneficiary(),
@@ -175,35 +172,17 @@ where
             excess_blob_gas,
             requests_hash,
         };
-        
-        {   // finalize_new_header
-            let parent_header = crate::node::evm::util::HEADER_CACHE_READER
-                .lock()
-                .unwrap()
-                .get_header_by_hash(&header.parent_hash)
-                .ok_or(BlockExecutionError::msg("Failed to get header from global header reader"))?;
-            let parent_header = SealedHeader::new(parent_header, header.parent_hash);
-            let parent_snap = snapshot_provider
-                .snapshot_by_hash(&header.parent_hash)
-                .ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;
-            finalize_new_header(
-                self.parlia.clone(), 
-                &parent_snap, 
-                &parent_header, 
-                &mut header,
-                &snapshot_provider,
-            ).map_err(|e| BlockExecutionError::msg(format!("Failed to finalize header: {}", e)))?;
 
-            let header_hash = keccak256(alloy_rlp::encode(&header));
-            tracing::debug!("Succeed to finalize header, block_number={}, hash=0x{:x}, parent_hash=0x{:x}, txs={}", 
-                header.number, header_hash, header.parent_hash, transactions.len())
-        }
+        tracing::debug!(
+            "Assembled block body only (pre-finalize), block_number={}, parent_hash=0x{:x}, txs={}",
+            header.number, header.parent_hash, transactions.len()
+        );
 
         Ok(BscBlock {
             header,
             body: BscBlockBody {
                 inner: BlockBody { transactions, ommers: Default::default(), withdrawals },
-                sidecars: None, // BscSidecars is added to the block body in the payload builder.
+                sidecars: None,
             },
         })
     }
