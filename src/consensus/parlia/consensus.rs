@@ -17,7 +17,7 @@ use super::{
 use crate::consensus::parlia::constants::K_ANCESTOR_GENERATION_DEPTH;
 use crate::consensus::parlia::go_rng::{RngSource, Shuffle};
 use crate::consensus::parlia::provider::SnapshotProvider;
-use crate::consensus::parlia::util::is_breathe_block;
+use crate::consensus::parlia::util::{calculate_millisecond_timestamp, is_breathe_block};
 use crate::consensus::parlia::vote_pool::fetch_vote_by_block_hash_and_source_number;
 use crate::consensus::parlia::VoteData;
 use crate::consensus::parlia::VoteSignature;
@@ -899,10 +899,29 @@ where
         current_header.extra_data = alloy_primitives::Bytes::from(extra_data);
 
         // Update metric: successfully assembled vote attestation
-        use crate::metrics::BscVoteMetrics;
+        use crate::metrics::{BscFinalityMetrics, BscVoteMetrics};
         use once_cell::sync::Lazy;
         static VOTE_METRICS: Lazy<BscVoteMetrics> = Lazy::new(BscVoteMetrics::default);
+        static FINALITY_METRICS: Lazy<BscFinalityMetrics> = Lazy::new(BscFinalityMetrics::default);
         VOTE_METRICS.votes_attested_total.increment(votes.len() as u64);
+
+        // Record normal-path finality latency: time from the source (finalized) block's
+        // millisecond timestamp to when this attestation is assembled.
+        // Equivalent to chain/finalized/latency/normal in geth (measured at assembly
+        // time; justified_hash == source_hash == the block now being finalized).
+        if let Some(source_header) =
+            crate::shared::get_canonical_header_by_number(justified_number)
+        {
+            let now_ms = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let block_ms = calculate_millisecond_timestamp(&source_header);
+            FINALITY_METRICS
+                .finalized_latency_normal_ms
+                .set(now_ms.saturating_sub(block_ms) as f64);
+        }
+
         debug!(
             "Succeed to assemble vote attestation, votes={}, attestation={:?}",
             votes.len(),
