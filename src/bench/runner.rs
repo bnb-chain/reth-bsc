@@ -194,6 +194,7 @@ pub fn run_benchmark(config: BenchConfig) -> eyre::Result<Vec<BlockTiming>> {
             parent_snapshot: Arc::new(parent_snapshot.clone()),
             is_inturn: true,
             cached_reads: None,
+            state_base_hash: None,
             prev_bundle_state: None,
         };
 

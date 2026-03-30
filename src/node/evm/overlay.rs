@@ -110,3 +110,102 @@ impl<DB: DatabaseRef> DatabaseRef for MaybeOverlay<DB> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::BundleStateOverlay;
+    use alloy_primitives::{Address, B256, U256};
+    use revm::database::{
+        states::{AccountStatus, BundleAccount, StorageSlot},
+        BundleState,
+    };
+    use revm::state::{AccountInfo, Bytecode};
+    use revm::DatabaseRef;
+    use std::collections::HashMap;
+    use std::convert::Infallible;
+
+    #[derive(Clone, Default)]
+    struct FakeDb {
+        storage: HashMap<(Address, U256), U256>,
+    }
+
+    impl DatabaseRef for FakeDb {
+        type Error = Infallible;
+
+        fn basic_ref(&self, _address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+            Ok(None)
+        }
+
+        fn code_by_hash_ref(&self, _code_hash: B256) -> Result<Bytecode, Self::Error> {
+            Ok(Bytecode::default())
+        }
+
+        fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
+            Ok(self.storage.get(&(address, index)).copied().unwrap_or(U256::ZERO))
+        }
+
+        fn block_hash_ref(&self, _number: u64) -> Result<B256, Self::Error> {
+            Ok(B256::ZERO)
+        }
+    }
+
+    fn example_address() -> Address {
+        Address::with_last_byte(1)
+    }
+
+    fn bundle_with_slot(slot: U256, value: U256) -> BundleState {
+        let mut storage = HashMap::default();
+        storage.insert(slot, StorageSlot::new_changed(U256::ZERO, value));
+
+        let mut bundle = BundleState::default();
+        bundle.state.insert(
+            example_address(),
+            BundleAccount::new(
+                Some(AccountInfo::default()),
+                Some(AccountInfo::default()),
+                storage,
+                AccountStatus::Changed,
+            ),
+        );
+        bundle
+    }
+
+    fn destroyed_bundle() -> BundleState {
+        let mut bundle = BundleState::default();
+        bundle.state.insert(
+            example_address(),
+            BundleAccount::new(
+                Some(AccountInfo::default()),
+                None,
+                HashMap::default(),
+                AccountStatus::Destroyed,
+            ),
+        );
+        bundle
+    }
+
+    fn fake_db_with_slot(slot: U256, value: U256) -> FakeDb {
+        let mut db = FakeDb::default();
+        db.storage.insert((example_address(), slot), value);
+        db
+    }
+
+    #[test]
+    fn overlay_returns_present_storage_before_inner_db() {
+        let overlay =
+            BundleStateOverlay::new(bundle_with_slot(U256::from(7), U256::from(9)), FakeDb::default());
+        assert_eq!(
+            overlay.storage_ref(example_address(), U256::from(7)).unwrap(),
+            U256::from(9)
+        );
+    }
+
+    #[test]
+    fn destroyed_account_storage_falls_back_to_zero_not_inner_db() {
+        let overlay = BundleStateOverlay::new(
+            destroyed_bundle(),
+            fake_db_with_slot(U256::from(7), U256::from(99)),
+        );
+        assert_eq!(overlay.storage_ref(example_address(), U256::from(7)).unwrap(), U256::ZERO);
+    }
+}

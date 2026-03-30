@@ -68,6 +68,9 @@ pub struct MiningContext {
     pub parent_snapshot: Arc<crate::consensus::parlia::snapshot::Snapshot>,
     pub is_inturn: bool,
     pub cached_reads: Option<reth_revm::cached::CachedReads>,
+    /// Explicit durable MDBX base for state reads.
+    /// `None` means "use the parent hash" which is the canonical path.
+    pub state_base_hash: Option<alloy_primitives::B256>,
     /// Previous block's bundle state for in-memory overlay.
     /// When `Some`, the next block can start execution immediately without
     /// waiting for the previous block's MDBX commit to complete.
@@ -570,6 +573,7 @@ where
             parent_snapshot: Arc::new(parent_snapshot),
             is_inturn,
             cached_reads: self.maybe_pre_cached(parent_hash),
+            state_base_hash: None,
             prev_bundle_state: self.maybe_pre_bundle_state(parent_hash),
         };
 
@@ -759,6 +763,7 @@ where
             trace_id: crate::node::miner::payload::generate_trace_id(),
             min_gas_tip: self.desired_min_gas_tip,
             parent_difflayers: None, // populated once at job start via fetch_triedb_difflayers
+            state_base_hash: mining_ctx.state_base_hash,
             prev_bundle_state: mining_ctx.prev_bundle_state.clone(),
         };
 

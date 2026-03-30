@@ -17,7 +17,7 @@ use crate::node::primitives::BscBlobTransactionSidecar;
 use alloy_consensus::{BlockHeader, Transaction};
 use alloy_evm::block::BlockExecutor;
 use alloy_evm::Evm;
-use alloy_primitives::U256;
+use alloy_primitives::{B256, U256};
 use either::Either;
 use reth::payload::EthPayloadBuilderAttributes;
 use reth::transaction_pool::BestTransactionsAttributes;
@@ -179,6 +179,10 @@ fn local_rebuild_comparison_base(current_payload_fees: U256) -> U256 {
     }
 }
 
+fn resolve_state_provider_hash(state_base_hash: Option<B256>, parent_hash: B256) -> B256 {
+    state_base_hash.unwrap_or(parent_hash)
+}
+
 fn estimated_uplift_meets_threshold(
     estimated_new_fees: U256,
     comparison_base: U256,
@@ -304,6 +308,9 @@ pub struct BscBuildArguments<Attributes> {
     /// Fetched once at job creation and shared across all build attempts for the same parent.
     /// `None` when triedb is inactive or the fetch failed (graceful degradation to full trie).
     pub parent_difflayers: Option<DiffLayers>,
+    /// Explicit durable MDBX base used for state reads.
+    /// `None` falls back to the logical parent hash (canonical path).
+    pub state_base_hash: Option<B256>,
     /// Previous block's bundle state for in-memory overlay.
     /// When `Some`, block execution can start immediately without waiting for the
     /// previous block's MDBX commit to complete.
@@ -373,14 +380,23 @@ where
         args: BscBuildArguments<EthPayloadBuilderAttributes>,
     ) -> Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>> {
         let build_start = std::time::Instant::now();
-        let BscBuildArguments { mut cached_reads, config, cancel, trace_id, min_gas_tip, parent_difflayers, prev_bundle_state } = args;
+        let BscBuildArguments {
+            mut cached_reads,
+            config,
+            cancel,
+            trace_id,
+            min_gas_tip,
+            parent_difflayers,
+            state_base_hash,
+            prev_bundle_state,
+        } = args;
         let PayloadConfig { parent_header, attributes } = config;
 
         let parent_hash = parent_header.hash_slow();
         // Parent difflayers were fetched once at job start; reuse across all retry attempts.
         let triedb_parent_difflayers = parent_difflayers;
-
-        let state_provider = self.client.state_by_block_hash(parent_header.hash_slow())?;
+        let state_provider_hash = resolve_state_provider_hash(state_base_hash, parent_hash);
+        let state_provider = self.client.state_by_block_hash(state_provider_hash)?;
         let state = StateProviderDatabase::new(&state_provider);
         let maybe_overlay = if let Some(bundle) = prev_bundle_state {
             crate::node::evm::overlay::MaybeOverlay::Overlay(
@@ -879,15 +895,23 @@ where
         args: BscBuildArguments<EthPayloadBuilderAttributes>,
     ) -> Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>> {
         let build_start = std::time::Instant::now();
-        let BscBuildArguments { mut cached_reads, config, cancel: _, trace_id, min_gas_tip: _, parent_difflayers, prev_bundle_state } =
-            args;
+        let BscBuildArguments {
+            mut cached_reads,
+            config,
+            cancel: _,
+            trace_id,
+            min_gas_tip: _,
+            parent_difflayers,
+            state_base_hash,
+            prev_bundle_state,
+        } = args;
         let PayloadConfig { parent_header, attributes } = config;
 
         let parent_hash = parent_header.hash_slow();
         // Parent difflayers were fetched once at job start; reuse across all retry attempts.
         let triedb_parent_difflayers = parent_difflayers;
-
-        let state_provider = self.client.state_by_block_hash(parent_header.hash_slow())?;
+        let state_provider_hash = resolve_state_provider_hash(state_base_hash, parent_hash);
+        let state_provider = self.client.state_by_block_hash(state_provider_hash)?;
         let state = StateProviderDatabase::new(&state_provider);
         let maybe_overlay = if let Some(bundle) = prev_bundle_state {
             crate::node::evm::overlay::MaybeOverlay::Overlay(
@@ -2250,7 +2274,8 @@ fn finalize_payload(
 #[cfg(test)]
 mod tests {
     use super::{
-        initial_out_of_turn_build_wait, local_rebuild_action, validate_bsc_sidecar,
+        initial_out_of_turn_build_wait, local_rebuild_action, resolve_state_provider_hash,
+        validate_bsc_sidecar,
         LocalRebuildAction, LocalRebuildPolicyInput,
     };
     use crate::chainspec::BscChainSpec;
@@ -2315,6 +2340,7 @@ mod tests {
             parent_snapshot: Arc::new(snapshot),
             is_inturn,
             cached_reads: None,
+            state_base_hash: None,
             prev_bundle_state: None,
         }
     }
@@ -2406,6 +2432,15 @@ mod tests {
         }
 
         rebuilds
+    }
+
+    #[test]
+    fn speculative_build_uses_state_base_hash_not_parent_hash() {
+        let parent_hash = B256::with_last_byte(100);
+        let state_base_hash = B256::with_last_byte(99);
+
+        assert_eq!(resolve_state_provider_hash(Some(state_base_hash), parent_hash), state_base_hash);
+        assert_eq!(resolve_state_provider_hash(None, parent_hash), parent_hash);
     }
 
     #[test]
