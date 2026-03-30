@@ -222,6 +222,11 @@ pub struct BscFinalityMetrics {
 
     /// Current safe block height (equivalent to chain/head/safe)
     pub safe_block_height: Gauge,
+
+    /// Early finalization latency in milliseconds (BEP-648 fast path via VotePool).
+    /// Measures the time from the finalized block's millisecond timestamp to when the
+    /// forkchoice update is triggered, equivalent to chain/finalized/latency/early in geth.
+    pub finalized_latency_early_ms: Gauge,
 }
 
 /// Metrics for BSC blockchain operations
