@@ -3,6 +3,7 @@ pub mod bsc_miner;
 pub mod config;
 pub mod payload;
 pub mod signer;
+pub mod speculative;
 pub mod util;
 
 pub use bsc_miner::BscMiner;
