@@ -196,6 +196,7 @@ where
             header: None,
             is_inturn: true,
             cached_reads: None,
+            prev_bundle_state: None,
         };
         let parent_snapshot = mining_ctx.parent_snapshot.clone();
         let attributes = prepare_new_attributes(

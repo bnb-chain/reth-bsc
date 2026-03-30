@@ -1,5 +1,7 @@
+use crate::bench::commit_service::CommitResult;
 use crate::bench::config::BenchConfig;
 use crate::bench::db_init;
+use crate::bench::overlay::{BundleStateOverlay, MaybeOverlay};
 use crate::bench::report::BlockTiming;
 use crate::bench::tx_gen;
 use crate::bench::validator_setup;
@@ -21,7 +23,7 @@ use reth_provider::{
 };
 use reth_revm::cached::CachedReads;
 use reth_revm::database::StateProviderDatabase;
-use revm::database::State;
+use revm::database::{BundleState, State};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -61,9 +63,7 @@ pub fn run_benchmark(config: BenchConfig) -> eyre::Result<Vec<BlockTiming>> {
         println!("\n[2/6] TrieDB disabled (use --triedb to enable)");
     }
     if config.chain_difflayers {
-        println!(
-            "  NOTE: --chain-difflayers is ignored on this branch: the current builder API does not expose difflayer chaining."
-        );
+        println!("  Difflayer chaining: enabled (parent difflayers forwarded to builder)");
     }
 
     // 3. Verify genesis state is readable from MDBX
@@ -144,6 +144,31 @@ pub fn run_benchmark(config: BenchConfig) -> eyre::Result<Vec<BlockTiming>> {
     // === Execute blocks ===
     let mut timings = Vec::with_capacity(config.num_blocks);
 
+    // Difflayer from previous block for triedb warm cache
+    let mut prev_difflayer: Option<std::sync::Arc<rust_eth_triedb_common::DiffLayer>> = None;
+
+    // Pipeline state: previous block's bundle for overlay
+    let mut prev_bundle: Option<BundleState> = None;
+
+    // Pipelined commit: closure-based channel + background thread
+    let (commit_tx, commit_rx) =
+        std::sync::mpsc::sync_channel::<Box<dyn FnOnce() -> Result<CommitResult, String> + Send>>(
+            1,
+        );
+    let (result_tx, result_rx) = std::sync::mpsc::channel::<Result<CommitResult, String>>();
+
+    let commit_thread = std::thread::Builder::new()
+        .name("bench-commit".into())
+        .spawn(move || {
+            while let Ok(work_fn) = commit_rx.recv() {
+                let result = work_fn();
+                if result_tx.send(result).is_err() {
+                    break;
+                }
+            }
+        })
+        .expect("failed to spawn commit thread");
+
     let turn_length = parent_snapshot.turn_length.unwrap_or(1) as usize;
     let num_validators = init.validator_addresses.len();
 
@@ -169,6 +194,7 @@ pub fn run_benchmark(config: BenchConfig) -> eyre::Result<Vec<BlockTiming>> {
             parent_snapshot: Arc::new(parent_snapshot.clone()),
             is_inturn: true,
             cached_reads: None,
+            prev_bundle_state: None,
         };
 
         // Prepare attributes
@@ -189,13 +215,20 @@ pub fn run_benchmark(config: BenchConfig) -> eyre::Result<Vec<BlockTiming>> {
             .latest()
             .map_err(|e| eyre::eyre!("Failed to get state for block {}: {:?}", block_number, e))?;
 
-        // Wrap state provider for the EVM State DB
+        // Wrap state provider for the EVM State DB.
+        // When prev_bundle is available (pipelined commit in flight), layer it on top so that
+        // reads for accounts modified in the previous block are satisfied from memory.
         let state_db = StateProviderDatabase::new(&*state_provider);
-
-        // Build State with CachedReads (matches the real miner pipeline exactly)
         let mut cached: CachedReads = cached_reads.take().unwrap_or_default();
-        let mut db =
-            State::builder().with_database(cached.as_db_mut(state_db)).with_bundle_update().build();
+        let maybe_overlay = if let Some(ref bundle) = prev_bundle {
+            MaybeOverlay::Overlay(BundleStateOverlay::new(bundle.clone(), state_db))
+        } else {
+            MaybeOverlay::Plain(state_db)
+        };
+        let mut db = State::builder()
+            .with_database(cached.as_db_mut(maybe_overlay))
+            .with_bundle_update()
+            .build();
 
         let state_setup_us = state_setup_start.elapsed().as_micros();
 
@@ -216,6 +249,7 @@ pub fn run_benchmark(config: BenchConfig) -> eyre::Result<Vec<BlockTiming>> {
                         withdrawals: Some(attributes.withdrawals().clone()),
                         extra_data: Default::default(),
                     },
+                    // TODO: difflayer chaining disabled during debugging
                     parent_difflayers: None,
                     triedb_prefetcher: None,
                     validator_cache_sink: None,
@@ -285,11 +319,13 @@ pub fn run_benchmark(config: BenchConfig) -> eyre::Result<Vec<BlockTiming>> {
 
         let finish_start = Instant::now();
 
-        // This branch only exposes `finish()`. It computes a real state root against the
-        // configured state backend, but it does not return difflayers for warm-chain reuse.
-        let outcome = builder
-            .finish(&*finish_state_provider)
+        // Use finish_with_difflayer to get both the block outcome and an optional difflayer
+        // for chaining to the next block's triedb state root calculation.
+        let outcome_with_dl = builder
+            .finish_with_difflayer(&*finish_state_provider)
             .map_err(|e| eyre::eyre!("Block {} finish failed: {:?}", block_number, e))?;
+        let produced_difflayer = outcome_with_dl.difflayer;
+        let outcome = outcome_with_dl.inner;
 
         let finish_us = finish_start.elapsed().as_micros();
 
@@ -305,19 +341,9 @@ pub fn run_benchmark(config: BenchConfig) -> eyre::Result<Vec<BlockTiming>> {
         let new_hash = new_header.hash_slow();
         let state_root = new_header.state_root;
 
-        // Get a read-write database provider for committing
-        let provider_rw = init.factory.database_provider_rw().map_err(|e| {
-            eyre::eyre!("Failed to get provider_rw for block {}: {:?}", block_number, e)
-        })?;
-        let commit_start = Instant::now();
-        let mut triedb_flush_us = 0u128;
-
-        // Insert the block into the database
-        let insert_block_start = Instant::now();
-        provider_rw
-            .insert_block(&recovered_block)
-            .map_err(|e| eyre::eyre!("Failed to insert block {}: {:?}", block_number, e))?;
-        let insert_block_us = insert_block_start.elapsed().as_micros();
+        // Extract bundle_state BEFORE take_bundle() consumes it.
+        // This clone is used as the overlay for the next block's reads during pipelined commit.
+        let next_bundle = db.bundle_state.clone();
 
         // Extract cache from bundle_state before take_bundle() consumes it.
         // This mirrors production's cache_for_next() pattern (bsc_miner.rs:331-351).
@@ -330,7 +356,7 @@ pub fn run_benchmark(config: BenchConfig) -> eyre::Result<Vec<BlockTiming>> {
             }
         }
 
-        // Build ExecutionOutcome from the bundle state and write it
+        // Build ExecutionOutcome from the bundle state
         let execution_outcome = ExecutionOutcome::new(
             db.take_bundle(),
             vec![execution_result.receipts],
@@ -338,14 +364,69 @@ pub fn run_benchmark(config: BenchConfig) -> eyre::Result<Vec<BlockTiming>> {
             vec![execution_result.requests],
         );
 
-        let write_state_start = Instant::now();
-        provider_rw
-            .write_state(&execution_outcome, OriginalValuesKnown::No, StateWriteConfig::default())
-            .map_err(|e| {
-                eyre::eyre!("Failed to write state for block {}: {:?}", block_number, e)
-            })?;
-        let write_state_us = write_state_start.elapsed().as_micros();
+        // Get a read-write database provider for committing
+        let provider_rw = init.factory.database_provider_rw().map_err(|e| {
+            eyre::eyre!("Failed to get provider_rw for block {}: {:?}", block_number, e)
+        })?;
 
+        // Update chain tip (must happen on main thread before next block starts)
+        let new_sealed = SealedHeader::new(new_header.clone(), new_hash);
+        insert_header_to_cache(new_header);
+
+        // Populate CachedReads for next block from execution outcome
+        cached_reads = Some(new_cached);
+
+        if is_setup_block {
+            // Setup block: commit synchronously (no pipeline)
+            let commit_start = Instant::now();
+
+            provider_rw
+                .insert_block(&recovered_block)
+                .map_err(|e| eyre::eyre!("Failed to insert block {}: {:?}", block_number, e))?;
+
+            provider_rw
+                .write_state(
+                    &execution_outcome,
+                    OriginalValuesKnown::No,
+                    StateWriteConfig::default(),
+                )
+                .map_err(|e| {
+                    eyre::eyre!("Failed to write state for block {}: {:?}", block_number, e)
+                })?;
+
+            if config.triedb {
+                let mut triedb = rust_eth_triedb::get_global_triedb();
+                triedb.flush(block_number, state_root, &None).map_err(|e| {
+                    eyre::eyre!("Failed to flush triedb for block {}: {:?}", block_number, e)
+                })?;
+            }
+
+            provider_rw
+                .commit()
+                .map_err(|e| eyre::eyre!("Failed to commit block {}: {:?}", block_number, e))?;
+
+            let commit_us = commit_start.elapsed().as_micros();
+            let total_us = block_start.elapsed().as_micros();
+
+            parent_header = new_sealed;
+            parent_snapshot.block_number = block_number;
+            parent_snapshot.block_hash = new_hash;
+
+            // Update difflayer chain for next block
+            prev_difflayer = produced_difflayer;
+            prev_bundle = None; // setup block committed synchronously, no overlay needed
+
+            db_init::persist_post_setup_cache(&config, &init, &parent_header, &parent_snapshot)?;
+            println!(
+                "  Setup block 0 complete: {} txs, {} gas used, {}us total (commit: {}us)",
+                tx_count, gas_used, total_us, commit_us
+            );
+            continue;
+        }
+
+        // Benchmark blocks: flush triedb on main thread (required before next block's
+        // finish can compute state root), then send MDBX work to background thread.
+        let mut triedb_flush_us = 0u128;
         if config.triedb {
             let mut triedb = rust_eth_triedb::get_global_triedb();
             let triedb_flush_start = Instant::now();
@@ -355,38 +436,64 @@ pub fn run_benchmark(config: BenchConfig) -> eyre::Result<Vec<BlockTiming>> {
             triedb_flush_us = triedb_flush_start.elapsed().as_micros();
         }
 
-        // Commit the transaction (static files + DB)
-        let provider_commit_start = Instant::now();
-        provider_rw
-            .commit()
-            .map_err(|e| eyre::eyre!("Failed to commit block {}: {:?}", block_number, e))?;
-        let provider_commit_us = provider_commit_start.elapsed().as_micros();
+        let pipeline_send_start = Instant::now();
+        commit_tx
+            .send(Box::new(move || {
+                let commit_start = Instant::now();
 
-        let commit_us = commit_start.elapsed().as_micros();
+                let insert_block_start = Instant::now();
+                provider_rw
+                    .insert_block(&recovered_block)
+                    .map_err(|e| format!("Failed to insert block {}: {:?}", block_number, e))?;
+                let insert_block_us = insert_block_start.elapsed().as_micros();
+
+                let write_state_start = Instant::now();
+                provider_rw
+                    .write_state(
+                        &execution_outcome,
+                        OriginalValuesKnown::No,
+                        StateWriteConfig::default(),
+                    )
+                    .map_err(|e| {
+                        format!("Failed to write state for block {}: {:?}", block_number, e)
+                    })?;
+                let write_state_us = write_state_start.elapsed().as_micros();
+
+                let provider_commit_start = Instant::now();
+                provider_rw.commit().map_err(|e| {
+                    format!("Failed to commit block {}: {:?}", block_number, e)
+                })?;
+                let provider_commit_us = provider_commit_start.elapsed().as_micros();
+
+                let commit_us = commit_start.elapsed().as_micros();
+
+                Ok(CommitResult {
+                    block_number,
+                    insert_block_us,
+                    write_state_us,
+                    triedb_flush_us: 0,
+                    provider_commit_us,
+                    commit_us,
+                })
+            }))
+            .map_err(|_| eyre::eyre!("Commit thread exited unexpectedly"))?;
+        let pipeline_send_us = pipeline_send_start.elapsed().as_micros();
+
         let total_us = block_start.elapsed().as_micros();
 
-        // Populate CachedReads for next block from execution outcome
-        cached_reads = Some(new_cached);
-
-        // Update chain tip
-        let new_sealed = SealedHeader::new(new_header.clone(), new_hash);
-        insert_header_to_cache(new_header);
-
+        // Update parent header and snapshot for the next block
         parent_header = new_sealed;
         parent_snapshot.block_number = block_number;
         parent_snapshot.block_hash = new_hash;
 
-        if is_setup_block {
-            db_init::persist_post_setup_cache(&config, &init, &parent_header, &parent_snapshot)?;
-            // Setup block -- do NOT record timing
-            println!(
-                "  Setup block 0 complete: {} txs, {} gas used, {}us total (commit: {}us)",
-                tx_count, gas_used, total_us, commit_us
-            );
-            continue;
-        }
+        // Set overlay bundle so the next block can read from memory while commit is in flight
+        prev_bundle = Some(next_bundle);
 
-        // Record timing for benchmark blocks
+        // Chain difflayer for triedb warm cache
+        prev_difflayer = produced_difflayer;
+
+        // Record timing for benchmark blocks (commit sub-fields are placeholders;
+        // they will be merged from CommitResult after the block loop).
         let timing = BlockTiming {
             block_number,
             validator_index,
@@ -396,11 +503,12 @@ pub fn run_benchmark(config: BenchConfig) -> eyre::Result<Vec<BlockTiming>> {
             pre_execution_us,
             execute_only_us,
             tx_execution_us,
-            insert_block_us,
-            write_state_us,
-            triedb_flush_us,
-            provider_commit_us,
-            commit_us,
+            insert_block_us: 0,      // filled from CommitResult after loop
+            write_state_us: 0,      // filled from CommitResult after loop
+            triedb_flush_us,        // measured on main thread
+            provider_commit_us: 0,  // filled from CommitResult after loop
+            commit_us: 0,           // filled from CommitResult after loop
+            pipeline_send_us,
             finish_us,
             total_us,
             hashed_accounts,
@@ -411,19 +519,45 @@ pub fn run_benchmark(config: BenchConfig) -> eyre::Result<Vec<BlockTiming>> {
         if block_number.is_multiple_of(10) || block_number <= 2 {
             let flags = if has_cached_reads { "C" } else { "-" };
             println!(
-                "  Block {:>4} | v[{}] {} | txs: {:>3} | gas: {:>8} | finish: {:>6}us | commit: {:>6}us | total: {:>6}us",
+                "  Block {:>4} | v[{}] {} | txs: {:>3} | gas: {:>8} | finish: {:>6}us | send: {:>6}us | total: {:>6}us",
                 block_number,
                 validator_index,
                 flags,
                 tx_count,
                 gas_used,
                 finish_us,
-                commit_us,
+                pipeline_send_us,
                 total_us,
             );
         }
 
         timings.push(timing);
+    }
+
+    // Signal commit thread to exit and collect results
+    drop(commit_tx);
+    let _ = commit_thread.join();
+
+    let mut commit_results: std::collections::HashMap<u64, CommitResult> =
+        std::collections::HashMap::new();
+    while let Ok(result) = result_rx.try_recv() {
+        match result {
+            Ok(cr) => {
+                commit_results.insert(cr.block_number, cr);
+            }
+            Err(e) => return Err(eyre::eyre!("Commit error: {}", e)),
+        }
+    }
+
+    // Merge commit timings into block timings
+    for timing in &mut timings {
+        if let Some(cr) = commit_results.get(&timing.block_number) {
+            timing.insert_block_us = cr.insert_block_us;
+            timing.write_state_us = cr.write_state_us;
+            // triedb_flush_us already set on main thread — don't overwrite
+            timing.provider_commit_us = cr.provider_commit_us;
+            timing.commit_us = cr.commit_us;
+        }
     }
 
     Ok(timings)

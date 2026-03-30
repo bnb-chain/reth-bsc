@@ -1,4 +1,5 @@
 pub mod error;
+pub mod overlay;
 pub mod util;
 
 #[cfg(test)]

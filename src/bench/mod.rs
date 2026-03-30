@@ -1,7 +1,9 @@
 pub mod cache;
+pub mod commit_service;
 pub mod config;
 pub mod db_init;
 pub mod main_entry;
+pub mod overlay;
 pub mod payload_job_report;
 pub mod payload_job_runner;
 pub mod pool_setup;

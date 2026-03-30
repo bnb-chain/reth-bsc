@@ -304,6 +304,10 @@ pub struct BscBuildArguments<Attributes> {
     /// Fetched once at job creation and shared across all build attempts for the same parent.
     /// `None` when triedb is inactive or the fetch failed (graceful degradation to full trie).
     pub parent_difflayers: Option<DiffLayers>,
+    /// Previous block's bundle state for in-memory overlay.
+    /// When `Some`, block execution can start immediately without waiting for the
+    /// previous block's MDBX commit to complete.
+    pub prev_bundle_state: Option<revm::database::BundleState>,
 }
 
 /// BSC payload builder, used to build payload for bsc miner.
@@ -369,7 +373,7 @@ where
         args: BscBuildArguments<EthPayloadBuilderAttributes>,
     ) -> Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>> {
         let build_start = std::time::Instant::now();
-        let BscBuildArguments { mut cached_reads, config, cancel, trace_id, min_gas_tip, parent_difflayers } = args;
+        let BscBuildArguments { mut cached_reads, config, cancel, trace_id, min_gas_tip, parent_difflayers, prev_bundle_state } = args;
         let PayloadConfig { parent_header, attributes } = config;
 
         let parent_hash = parent_header.hash_slow();
@@ -378,8 +382,15 @@ where
 
         let state_provider = self.client.state_by_block_hash(parent_header.hash_slow())?;
         let state = StateProviderDatabase::new(&state_provider);
+        let maybe_overlay = if let Some(bundle) = prev_bundle_state {
+            crate::node::evm::overlay::MaybeOverlay::Overlay(
+                crate::node::evm::overlay::BundleStateOverlay::new(bundle, state),
+            )
+        } else {
+            crate::node::evm::overlay::MaybeOverlay::Plain(state)
+        };
         let mut db = State::builder()
-            .with_database(cached_reads.as_db_mut(state))
+            .with_database(cached_reads.as_db_mut(maybe_overlay))
             .with_bundle_update()
             .build();
 
@@ -868,7 +879,7 @@ where
         args: BscBuildArguments<EthPayloadBuilderAttributes>,
     ) -> Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>> {
         let build_start = std::time::Instant::now();
-        let BscBuildArguments { mut cached_reads, config, cancel: _, trace_id, min_gas_tip: _, parent_difflayers } =
+        let BscBuildArguments { mut cached_reads, config, cancel: _, trace_id, min_gas_tip: _, parent_difflayers, prev_bundle_state } =
             args;
         let PayloadConfig { parent_header, attributes } = config;
 
@@ -878,8 +889,15 @@ where
 
         let state_provider = self.client.state_by_block_hash(parent_header.hash_slow())?;
         let state = StateProviderDatabase::new(&state_provider);
+        let maybe_overlay = if let Some(bundle) = prev_bundle_state {
+            crate::node::evm::overlay::MaybeOverlay::Overlay(
+                crate::node::evm::overlay::BundleStateOverlay::new(bundle, state),
+            )
+        } else {
+            crate::node::evm::overlay::MaybeOverlay::Plain(state)
+        };
         let mut db = State::builder()
-            .with_database(cached_reads.as_db_mut(state))
+            .with_database(cached_reads.as_db_mut(maybe_overlay))
             .with_bundle_update()
             .build();
 
@@ -2297,6 +2315,7 @@ mod tests {
             parent_snapshot: Arc::new(snapshot),
             is_inturn,
             cached_reads: None,
+            prev_bundle_state: None,
         }
     }
 

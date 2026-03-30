@@ -26,6 +26,9 @@ pub struct BlockTiming {
     pub provider_commit_us: u128,
     /// Aggregate persistence bucket = insert_block + write_state + triedb_flush + provider_commit.
     pub commit_us: u128,
+    /// Time the main thread spent waiting to send commit work to background thread.
+    /// Non-zero means backpressure (commit thread is slower than main thread).
+    pub pipeline_send_us: u128,
     /// finish_with_difflayer() time: merge_transitions + hashed_state + triedb/state_root + assembly.
     /// Excludes provider creation overhead (factory.latest()).
     pub finish_us: u128,
@@ -39,7 +42,7 @@ pub struct BlockTiming {
 const CSV_HEADER: &str = "block_number,validator_index,tx_count,gas_used,\
     state_setup_us,pre_execution_us,execute_only_us,tx_execution_us,\
     insert_block_us,write_state_us,triedb_flush_us,provider_commit_us,commit_us,\
-    finish_us,total_us,\
+    pipeline_send_us,finish_us,total_us,\
     hashed_accounts,hashed_storage_slots,has_cached_reads";
 
 /// Write timing results to a CSV file.
@@ -52,7 +55,7 @@ pub fn write_csv(timings: &[BlockTiming], path: &Path, label: &str) -> eyre::Res
     for t in timings {
         writeln!(
             file,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             label,
             t.block_number,
             t.validator_index,
@@ -67,6 +70,7 @@ pub fn write_csv(timings: &[BlockTiming], path: &Path, label: &str) -> eyre::Res
             t.triedb_flush_us,
             t.provider_commit_us,
             t.commit_us,
+            t.pipeline_send_us,
             t.finish_us,
             t.total_us,
             t.hashed_accounts,
@@ -93,8 +97,8 @@ pub fn read_csv(path: &Path) -> eyre::Result<Vec<BlockTiming>> {
         if fields.len() < 16 {
             continue;
         }
-        // Skip label field (index 0). Current layout: 19 fields.
-        let t = if fields.len() >= 19 {
+        // Skip label field (index 0). Current layout: 20 fields (with pipeline_send_us).
+        let t = if fields.len() >= 20 {
             BlockTiming {
                 block_number: fields[1].parse().unwrap_or(0),
                 validator_index: fields[2].parse().unwrap_or(0),
@@ -109,6 +113,30 @@ pub fn read_csv(path: &Path) -> eyre::Result<Vec<BlockTiming>> {
                 triedb_flush_us: fields[11].parse().unwrap_or(0),
                 provider_commit_us: fields[12].parse().unwrap_or(0),
                 commit_us: fields[13].parse().unwrap_or(0),
+                pipeline_send_us: fields[14].parse().unwrap_or(0),
+                finish_us: fields[15].parse().unwrap_or(0),
+                total_us: fields[16].parse().unwrap_or(0),
+                hashed_accounts: fields[17].parse().unwrap_or(0),
+                hashed_storage_slots: fields[18].parse().unwrap_or(0),
+                has_cached_reads: fields[19].parse().unwrap_or(false),
+            }
+        } else if fields.len() >= 19 {
+            // Legacy format without pipeline_send_us
+            BlockTiming {
+                block_number: fields[1].parse().unwrap_or(0),
+                validator_index: fields[2].parse().unwrap_or(0),
+                tx_count: fields[3].parse().unwrap_or(0),
+                gas_used: fields[4].parse().unwrap_or(0),
+                state_setup_us: fields[5].parse().unwrap_or(0),
+                pre_execution_us: fields[6].parse().unwrap_or(0),
+                execute_only_us: fields[7].parse().unwrap_or(0),
+                tx_execution_us: fields[8].parse().unwrap_or(0),
+                insert_block_us: fields[9].parse().unwrap_or(0),
+                write_state_us: fields[10].parse().unwrap_or(0),
+                triedb_flush_us: fields[11].parse().unwrap_or(0),
+                provider_commit_us: fields[12].parse().unwrap_or(0),
+                commit_us: fields[13].parse().unwrap_or(0),
+                pipeline_send_us: 0,
                 finish_us: fields[14].parse().unwrap_or(0),
                 total_us: fields[15].parse().unwrap_or(0),
                 hashed_accounts: fields[16].parse().unwrap_or(0),
@@ -131,6 +159,7 @@ pub fn read_csv(path: &Path) -> eyre::Result<Vec<BlockTiming>> {
                 triedb_flush_us: 0,
                 provider_commit_us: 0,
                 commit_us: fields[8].parse().unwrap_or(0),
+                pipeline_send_us: 0,
                 finish_us: fields[9].parse().unwrap_or(0),
                 total_us: fields[10].parse().unwrap_or(0),
                 hashed_accounts: fields.get(11).and_then(|f| f.parse().ok()).unwrap_or(0),
@@ -165,6 +194,7 @@ pub fn print_summary(timings: &[BlockTiming], label: &str) {
         ("write_state", timings.iter().map(|t| t.write_state_us).collect()),
         ("triedb_flush", timings.iter().map(|t| t.triedb_flush_us).collect()),
         ("provider_commit", timings.iter().map(|t| t.provider_commit_us).collect()),
+        ("pipeline_send", timings.iter().map(|t| t.pipeline_send_us).collect()),
         ("finish (root+asm)", timings.iter().map(|t| t.finish_us).collect()),
         ("commit (mdbx)", timings.iter().map(|t| t.commit_us).collect()),
         ("TOTAL", timings.iter().map(|t| t.total_us).collect()),
@@ -217,6 +247,7 @@ pub fn compare(baseline_path: &Path, optimized_path: &Path) -> eyre::Result<()> 
         "write_state",
         "triedb_flush",
         "provider_commit",
+        "pipeline_send",
         "finish",
         "commit",
         "TOTAL",
@@ -265,6 +296,7 @@ fn phase_means(timings: &[BlockTiming]) -> HashMap<&'static str, f64> {
         "provider_commit",
         timings.iter().map(|t| t.provider_commit_us as f64).sum::<f64>() / n,
     );
+    m.insert("pipeline_send", timings.iter().map(|t| t.pipeline_send_us as f64).sum::<f64>() / n);
     m.insert("finish", timings.iter().map(|t| t.finish_us as f64).sum::<f64>() / n);
     m.insert("commit", timings.iter().map(|t| t.commit_us as f64).sum::<f64>() / n);
     m.insert("TOTAL", timings.iter().map(|t| t.total_us as f64).sum::<f64>() / n);

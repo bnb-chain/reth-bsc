@@ -68,6 +68,10 @@ pub struct MiningContext {
     pub parent_snapshot: Arc<crate::consensus::parlia::snapshot::Snapshot>,
     pub is_inturn: bool,
     pub cached_reads: Option<reth_revm::cached::CachedReads>,
+    /// Previous block's bundle state for in-memory overlay.
+    /// When `Some`, the next block can start execution immediately without
+    /// waiting for the previous block's MDBX commit to complete.
+    pub prev_bundle_state: Option<revm::database::BundleState>,
 }
 
 #[derive(Clone)]
@@ -541,6 +545,7 @@ where
             parent_snapshot: Arc::new(parent_snapshot),
             is_inturn,
             cached_reads: self.maybe_pre_cached(parent_hash),
+            prev_bundle_state: None,
         };
 
         debug!("Queuing mining context, next_block: {}", tip.number() + 1);
@@ -729,6 +734,7 @@ where
             trace_id: crate::node::miner::payload::generate_trace_id(),
             min_gas_tip: self.desired_min_gas_tip,
             parent_difflayers: None, // populated once at job start via fetch_triedb_difflayers
+            prev_bundle_state: None,
         };
 
         let parent_hash = mining_ctx.parent_header.hash();
