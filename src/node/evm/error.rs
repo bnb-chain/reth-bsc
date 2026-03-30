@@ -196,20 +196,28 @@ impl From<BscBlockExecutionError> for BlockExecutionError {
         static CONSENSUS_METRICS: Lazy<BscConsensusMetrics> = Lazy::new(BscConsensusMetrics::default);
         static EXECUTOR_METRICS: Lazy<BscExecutorMetrics> = Lazy::new(BscExecutorMetrics::default);
         EXECUTOR_METRICS.execution_errors_total.increment(1);
-        
+
         match err {
+            // Transient validation error: the block proposer is in the backoff period
+            // and the block will become valid after a short delay. Must NOT be cached
+            // in engine-tree's invalid_headers to avoid poisoning the chain.
+            BscBlockExecutionError::Validation(
+                BscBlockValidationError::FutureBlock { .. }
+            ) => Self::other(err),
+
             BscBlockExecutionError::Validation(validation_err) => {
-                // Update bad blocks metric
+                // Permanent validation errors: the block genuinely violates consensus
+                // rules and will never become valid. Safe to cache in invalid_headers.
                 CONSENSUS_METRICS.bad_blocks_total.increment(1);
-                
+
                 // TODO: now use DepositRequestDecode as the validation error carrier,
                 // but we should refine it by rewrite some validation error types in reth engine-tree.
-                // Note: Validation errors will be identified in the engine-tree and treated as invalid blocks. 
+                // Note: Validation errors will be identified in the engine-tree and treated as invalid blocks.
                 Self::Validation(BlockValidationError::DepositRequestDecode(
                     format!("BSC validation error: {}", validation_err)
                 ))
             }
-            
+
             BscBlockExecutionError::SnapshotNotFound |
             BscBlockExecutionError::EthCallFailed |
             BscBlockExecutionError::GetTopValidatorsFailed |
@@ -222,8 +230,8 @@ impl From<BscBlockExecutionError> for BlockExecutionError {
             BscBlockExecutionError::SystemContractUpgradeError |
             BscBlockExecutionError::FailedToSignSystemTransaction { .. } |
             BscBlockExecutionError::GlobalSignerNotInitializedForMiningMode => {
-                // Note: Internal errors will be identified in the engine-tree, 
-                // and the entire program will exit.
+                // Internal errors: mapped to BlockExecutionError::Internal, which
+                // engine-tree handles without caching in invalid_headers.
                 Self::other(err)
             }
         }
