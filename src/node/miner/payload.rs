@@ -226,6 +226,7 @@ fn local_rebuild_action(input: LocalRebuildPolicyInput) -> LocalRebuildAction {
 
     LocalRebuildAction::WaitForMoreValue
 }
+
 fn validate_bsc_sidecar(
     sidecar: &alloy_eips::eip7594::BlobTransactionSidecarVariant,
 ) -> Result<(), Eip4844PoolTransactionError> {
