@@ -1,8 +1,8 @@
 use crate::node::miner::bid_simulator::{BidRuntime, BidSimulator};
 use crate::node::miner::payload::BscBuildArguments;
 use crate::node::miner::speculative::{
-    derive_speculative_child_context, MiningContextSource, PendingLocalHead,
-    PendingLocalHeadTracker,
+    derive_speculative_child_context, on_canonical_tip, ContextDecision,
+    MiningContextSource, PendingLocalHead, PendingLocalHeadTracker,
 };
 use crate::{
     chainspec::BscChainSpec,
@@ -97,6 +97,7 @@ pub struct NewWorkWorker<Provider> {
     mining_queue_tx: mpsc::UnboundedSender<MiningContext>,
     consensus: Arc<Parlia<BscChainSpec>>,
     pre_cached: Option<PrecachedState>,
+    pending_local_head: Arc<Mutex<PendingLocalHeadTracker>>,
     /// Previous block's bundle state for in-memory overlay, keyed by block hash.
     /// When the next block builds on this parent, the overlay lets `build_payload()` read
     /// from memory instead of waiting for MDBX commit.
@@ -124,6 +125,7 @@ where
         snapshot_provider: Arc<dyn SnapshotProvider + Send + Sync>,
         mining_queue_tx: mpsc::UnboundedSender<MiningContext>,
         consensus: Arc<Parlia<BscChainSpec>>,
+        pending_local_head: Arc<Mutex<PendingLocalHeadTracker>>,
     ) -> Self {
         Self {
             validator_address,
@@ -132,6 +134,7 @@ where
             mining_queue_tx,
             consensus,
             pre_cached: None,
+            pending_local_head,
             pre_bundle_state: None,
             last_triggered_tip: None,
         }
@@ -154,6 +157,7 @@ where
             let snapshot_provider = Arc::clone(&self.snapshot_provider);
             let mining_queue_tx = self.mining_queue_tx.clone();
             let consensus = Arc::clone(&self.consensus);
+            let pending_local_head = Arc::clone(&self.pending_local_head);
             let tip_header = tip_header.clone();
             tokio::spawn(async move {
                 let worker = NewWorkWorker::new(
@@ -162,6 +166,7 @@ where
                     snapshot_provider,
                     mining_queue_tx,
                     consensus,
+                    pending_local_head,
                 );
                 worker.try_new_work(&tip_header).await;
             });
@@ -244,6 +249,11 @@ where
                     }
 
                     let tip_header = tip.clone_sealed_header();
+                    let reconcile_decision = {
+                        let mut pending_local_head =
+                            crate::shared::lock_or_recover(&*self.pending_local_head);
+                        on_canonical_tip(&mut pending_local_head, tip_header.hash(), tip_header.number())
+                    };
                     // Prune old votes from the vote pool based on the new block number
                     let block_number =
                         self.provider.last_block_number().ok().unwrap_or(tip_header.number());
@@ -287,6 +297,15 @@ where
                     self.cache_for_next(&committed);
 
                     self.last_triggered_tip = Some(tip_header.hash());
+                    if reconcile_decision == ContextDecision::KeepSpeculative {
+                        debug!(
+                            target: "bsc::miner",
+                            tip_number = tip_header.number(),
+                            tip_hash = ?tip_header.hash(),
+                            "Skipping canonical mining trigger because matching speculative child is already in flight"
+                        );
+                        continue;
+                    }
                     self.try_new_work(&tip_header).await;
                 }
             _ = periodic_tick.tick() => {
@@ -859,7 +878,7 @@ pub struct ResultWorkWorker<Provider> {
     /// LRU cache to track recently mined blocks to prevent double signing
     recent_mined_blocks: Arc<Mutex<LruCache<u64, Vec<alloy_primitives::B256>>>>,
     /// Current locally submitted pending head.
-    pending_local_head: PendingLocalHeadTracker,
+    pending_local_head: Arc<Mutex<PendingLocalHeadTracker>>,
     /// Consensus metrics for tracking double signs and block turn stats
     consensus_metrics: BscConsensusMetrics,
     /// Flag for submitting built payload
@@ -877,6 +896,7 @@ where
         snapshot_provider: Arc<dyn SnapshotProvider + Send + Sync>,
         payload_rx: mpsc::UnboundedReceiver<SubmitContext>,
         mining_queue_tx: mpsc::UnboundedSender<MiningContext>,
+        pending_local_head: Arc<Mutex<PendingLocalHeadTracker>>,
         submit_built_payload: bool,
     ) -> Self {
         let recent_mined_blocks = Arc::new(Mutex::new(LruCache::new(
@@ -890,7 +910,7 @@ where
             payload_rx,
             mining_queue_tx,
             recent_mined_blocks,
-            pending_local_head: PendingLocalHeadTracker::default(),
+            pending_local_head,
             consensus_metrics: BscConsensusMetrics::default(),
             submit_built_payload,
         }
@@ -1172,13 +1192,16 @@ where
 
         send_result?;
 
-        self.pending_local_head.record_submitted_head(PendingLocalHead {
-            block_number,
-            block_hash,
-            parent_hash,
-            durable_base_hash,
-            child_spawned: false,
-        });
+        {
+            let mut pending_local_head = crate::shared::lock_or_recover(&*self.pending_local_head);
+            pending_local_head.record_submitted_head(PendingLocalHead {
+                block_number,
+                block_hash,
+                parent_hash,
+                durable_base_hash,
+                child_spawned: false,
+            });
+        }
 
         if should_spawn_speculative {
             crate::node::evm::util::insert_header_to_cache_with_hash(
@@ -1190,9 +1213,15 @@ where
                 (speculative_next_cached_reads, speculative_next_bundle_state)
             {
                 if let Some(parent_snapshot) = self.snapshot_provider.snapshot_by_hash(&block_hash) {
+                    let can_spawn_child = {
+                        let pending_local_head =
+                            crate::shared::lock_or_recover(&*self.pending_local_head);
+                        pending_local_head.can_spawn_child(block_number.saturating_add(1))
+                    };
+
                     if parent_snapshot.validators.contains(&self.validator_address)
                         && !parent_snapshot.sign_recently(self.validator_address)
-                        && self.pending_local_head.can_spawn_child(block_number.saturating_add(1))
+                        && can_spawn_child
                     {
                         let next_ctx = derive_speculative_child_context(
                             speculative_parent_header,
@@ -1204,7 +1233,9 @@ where
                         );
 
                         if self.mining_queue_tx.send(next_ctx).is_ok() {
-                            let _ = self.pending_local_head.mark_child_spawned();
+                            let mut pending_local_head =
+                                crate::shared::lock_or_recover(&*self.pending_local_head);
+                            let _ = pending_local_head.mark_child_spawned();
                         }
                     }
                 }
@@ -1392,12 +1423,14 @@ where
         );
 
         let parlia = Arc::new(crate::consensus::parlia::Parlia::new(chain_spec.clone(), 200));
+        let pending_local_head = Arc::new(Mutex::new(PendingLocalHeadTracker::default()));
         let new_work_worker = NewWorkWorker::new(
             validator_address,
             provider.clone(),
             snapshot_provider.clone(),
             mining_queue_tx.clone(),
             parlia.clone(),
+            Arc::clone(&pending_local_head),
         );
 
         let parlia = Arc::new(crate::consensus::parlia::Parlia::new(chain_spec.clone(), 200));
@@ -1430,6 +1463,7 @@ where
             snapshot_provider.clone(),
             payload_rx,
             mining_queue_tx.clone(),
+            pending_local_head,
             mining_config.submit_built_payload,
         );
 

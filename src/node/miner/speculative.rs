@@ -31,6 +31,13 @@ pub enum ReconcileDecision {
     ClearPending,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextDecision {
+    UseCanonical,
+    KeepSpeculative,
+    ClearAndAbortSpeculative,
+}
+
 impl PendingLocalHeadTracker {
     pub fn current(&self) -> Option<&PendingLocalHead> {
         self.current.as_ref()
@@ -108,6 +115,48 @@ pub fn derive_speculative_child_context(
     }
 }
 
+pub fn choose_next_context(
+    canonical_ctx: &MiningContext,
+    speculative_ctx: Option<&MiningContext>,
+) -> ContextDecision {
+    if canonical_ctx.source != MiningContextSource::Canonical {
+        return ContextDecision::UseCanonical;
+    }
+
+    match speculative_ctx {
+        Some(speculative_ctx)
+            if speculative_ctx.source == MiningContextSource::Speculative
+                && speculative_ctx.parent_header.hash() == canonical_ctx.parent_header.hash() =>
+        {
+            ContextDecision::KeepSpeculative
+        }
+        Some(_) | None => ContextDecision::UseCanonical,
+    }
+}
+
+pub fn on_canonical_tip(
+    tracker: &mut PendingLocalHeadTracker,
+    canonical_hash: B256,
+    canonical_number: u64,
+) -> ContextDecision {
+    match tracker.reconcile_canonical_head(canonical_hash, canonical_number) {
+        ReconcileDecision::ClearPending => ContextDecision::ClearAndAbortSpeculative,
+        ReconcileDecision::KeepPending => tracker.current().map_or(
+            ContextDecision::UseCanonical,
+            |head| {
+                if head.block_hash == canonical_hash
+                    && head.block_number == canonical_number
+                    && head.child_spawned
+                {
+                    ContextDecision::KeepSpeculative
+                } else {
+                    ContextDecision::UseCanonical
+                }
+            },
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use alloy_primitives::B256;
@@ -117,10 +166,12 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        derive_speculative_child_context, MiningContextSource, PendingLocalHead,
-        PendingLocalHeadTracker, ReconcileDecision,
+        choose_next_context, derive_speculative_child_context, on_canonical_tip,
+        ContextDecision, MiningContextSource, PendingLocalHead, PendingLocalHeadTracker,
+        ReconcileDecision,
     };
     use crate::consensus::parlia::Snapshot;
+    use crate::node::miner::bsc_miner::MiningContext;
 
     fn example_hash(number: u64) -> B256 {
         B256::with_last_byte(number as u8)
@@ -133,6 +184,39 @@ mod tests {
             parent_hash: example_hash(block_number.saturating_sub(1)),
             durable_base_hash: example_hash(durable_base_number),
             child_spawned: false,
+        }
+    }
+
+    fn example_ctx(
+        source: MiningContextSource,
+        parent_number: u64,
+        parent_hash_number: u64,
+    ) -> MiningContext {
+        let parent_hash = example_hash(parent_hash_number);
+        let parent_header = Header {
+            number: parent_number,
+            parent_hash: example_hash(parent_number.saturating_sub(1)),
+            beneficiary: Address::with_last_byte(1),
+            ..Default::default()
+        };
+        let parent_snapshot = Snapshot::new(
+            vec![Address::with_last_byte(1)],
+            parent_number,
+            parent_hash,
+            200,
+            None,
+        );
+
+        MiningContext {
+            header: None,
+            parent_header: SealedHeader::new(parent_header, parent_hash),
+            parent_snapshot: Arc::new(parent_snapshot),
+            is_inturn: true,
+            cached_reads: None,
+            source,
+            state_base_hash: (source == MiningContextSource::Speculative)
+                .then_some(example_hash(parent_number.saturating_sub(1))),
+            prev_bundle_state: None,
         }
     }
 
@@ -149,6 +233,27 @@ mod tests {
         let mut tracker = PendingLocalHeadTracker::from(example_pending_head(100, 99));
         let decision = tracker.reconcile_canonical_head(example_hash(200), 100);
         assert_eq!(decision, ReconcileDecision::ClearPending);
+        assert!(tracker.current().is_none());
+    }
+
+    #[test]
+    fn canonical_context_wins_over_stale_speculative_context() {
+        let canonical_ctx = example_ctx(MiningContextSource::Canonical, 100, 100);
+        let speculative_ctx = example_ctx(MiningContextSource::Speculative, 100, 200);
+
+        let decision = choose_next_context(&canonical_ctx, Some(&speculative_ctx));
+
+        assert_eq!(decision, ContextDecision::UseCanonical);
+    }
+
+    #[test]
+    fn mismatched_canonical_tip_clears_pending_head_and_aborts_child() {
+        let mut tracker = PendingLocalHeadTracker::from(example_pending_head(100, 99));
+
+        assert_eq!(
+            on_canonical_tip(&mut tracker, example_hash(500), 100),
+            ContextDecision::ClearAndAbortSpeculative
+        );
         assert!(tracker.current().is_none());
     }
 
