@@ -72,6 +72,46 @@ const LRU_PROCESSED_BLOCKS_SIZE: u32 = 100;
 /// Cooldown duration for downloading block hashes to avoid re-downloading the same block.
 const DOWNLOAD_COOLDOWN_DURATION_MS: u128 = 200;
 
+/// How long to wait for the engine tree to expose an inserted mined block before sending FCU.
+const ENGINE_INSERT_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Poll interval for checking whether an inserted mined block is visible via `query_td`.
+const ENGINE_INSERT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
+
+async fn wait_for_inserted_block(
+    engine: &ConsensusEngineHandle<BscPayloadTypes>,
+    number: u64,
+    hash: B256,
+    timeout: std::time::Duration,
+    poll_interval: std::time::Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    loop {
+        match engine.query_td(number, hash).await {
+            Ok(Some(_)) => return true,
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!(
+                    target: "bsc::block_import",
+                    block_number = number,
+                    block_hash = %hash,
+                    error = %err,
+                    "Failed to query engine TD while waiting for mined block insert"
+                );
+                return false;
+            }
+        }
+
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return false;
+        }
+
+        tokio::time::sleep(std::cmp::min(poll_interval, deadline - now)).await;
+    }
+}
+
 /// A service that handles bidirectional block import communication with the network.
 /// It receives new blocks from the network via `from_network` channel and sends back
 /// import outcomes via `to_network` channel.
@@ -296,22 +336,20 @@ where
             .to_network
             .send(BlockImportEvent::Announcement(BlockValidation::ValidBlock { block: block_msg }));
 
-        // Insert the executed block into the engine tree, then update fork choice.
+        // Insert the executed block into the engine tree, broadcast the built payload event, then
+        // update fork choice.
         //
-        // Ordering guarantee: InsertExecutedBlock MUST be processed by the engine before FCU.
-        // Both messages travel through separate channels (engine_api_tx vs consensus_engine_tx)
-        // that feed into the same engine service via a tokio::select! loop. Without explicit
-        // ordering, the engine may process FCU before the block is indexed, causing it to be
-        // rejected or ignored.
-        //
-        // Fix: run both in a single spawned task. After sending InsertExecutedBlock, call
-        // yield_now() so the engine service task can pick up and process the insert from
-        // engine_api_rx before we send FCU through the separate consensus channel.
+        // `InsertExecutedBlock` and FCU still travel over separate channels, so we wait until the
+        // engine exposes the inserted block via `query_td()` before sending FCU. This gives an
+        // observable ordering check instead of relying on scheduler timing.
         {
             let engine_tx_opt = crate::shared::get_engine_api_tx();
+            let engine = self.engine.clone();
             let executed_block = payload.executed_block.clone();
+            let payload_for_event = payload;
             let forkchoice_engine = self.forkchoice_engine.clone();
             tokio::spawn(async move {
+                let mut should_send_fcu = true;
                 if let Some(engine_tx) = engine_tx_opt {
                     tracing::debug!(
                         target: "bsc::block_import",
@@ -327,13 +365,24 @@ where
                             error = %e,
                             "Failed to insert executed block into engine tree, block will be dropped"
                         );
-                        return;
+                        should_send_fcu = false;
+                    } else if !wait_for_inserted_block(
+                        &engine,
+                        header_for_fcu.number,
+                        block_hash,
+                        ENGINE_INSERT_WAIT_TIMEOUT,
+                        ENGINE_INSERT_POLL_INTERVAL,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            target: "bsc::block_import",
+                            block_number = %header_for_fcu.number,
+                            block_hash = %block_hash,
+                            timeout_ms = ENGINE_INSERT_WAIT_TIMEOUT.as_millis(),
+                            "Timed out waiting for mined block to become visible in engine tree before FCU"
+                        );
                     }
-                    // Yield to the tokio runtime so the engine service loop processes
-                    // InsertExecutedBlock from engine_api_rx before FCU is enqueued in
-                    // the separate consensus_engine channel. This closes the race window
-                    // where FCU could arrive at the engine tree before the block is indexed.
-                    tokio::task::yield_now().await;
                 } else {
                     tracing::warn!(
                         target: "bsc::block_import",
@@ -341,6 +390,27 @@ where
                         block_hash = %block_hash,
                         "engine_api_tx not initialized, skipping InsertExecutedBlock"
                     );
+                }
+
+                if let Some(tx) = crate::shared::get_payload_events_tx() {
+                    tracing::debug!(
+                        target: "bsc::block_import",
+                        block_number = %header_for_fcu.number,
+                        block_hash = %block_hash,
+                        "Broadcasting built payload event for mined block"
+                    );
+                    let _ = tx.send(Events::<BscPayloadTypes>::BuiltPayload(payload_for_event));
+                } else {
+                    tracing::warn!(
+                        target: "bsc::block_import",
+                        block_number = %header_for_fcu.number,
+                        block_hash = %block_hash,
+                        "Payload events channel not initialized for mined block"
+                    );
+                }
+
+                if !should_send_fcu {
+                    return;
                 }
 
                 tracing::debug!(
@@ -606,6 +676,7 @@ where
 #[cfg(test)]
 mod tests {
     use crate::chainspec::bsc::bsc_mainnet;
+    use crate::node::engine::BuildKind;
 
     use super::*;
     use alloy_primitives::{BlockHash, BlockNumber, B256, U128, U256};
@@ -615,11 +686,14 @@ mod tests {
     use reth_eth_wire::NewBlock;
     use reth_node_ethereum::EthEngineTypes;
     use reth_primitives::{Block, SealedHeader};
+    use reth_primitives_traits::Block as _;
     use reth_provider::ProviderError;
     use schnellru::{ByLength, LruMap};
     use std::{
         collections::HashMap,
+        collections::VecDeque,
         sync::Arc,
+        time::Duration,
         task::{Context, Poll},
     };
 
@@ -739,6 +813,50 @@ mod tests {
             Poll::Ready(None) | Poll::Pending => {
                 // This is expected - no additional outcomes
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_for_inserted_block_retries_until_td_visible() {
+        let (to_engine, from_engine) = mpsc::unbounded_channel();
+        let engine_handle = ConsensusEngineHandle::new(to_engine);
+
+        handle_engine_msg(from_engine, EngineResponses::query_td(vec![None, None, Some(U256::from(7))]))
+            .await;
+
+        assert!(
+            wait_for_inserted_block(
+                &engine_handle,
+                1,
+                B256::with_last_byte(1),
+                Duration::from_millis(50),
+                Duration::from_millis(1),
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn mined_blocks_broadcast_built_payload_events() {
+        let mut fixture = TestFixture::new(EngineResponses::both_valid()).await;
+        let payload_events_tx = payload_events_sender();
+        let mut payload_events_rx = payload_events_tx.subscribe();
+        while payload_events_rx.try_recv().is_ok() {}
+
+        let block_msg = create_test_block();
+        let block_hash = block_msg.hash;
+        fixture
+            .send_mined_block(create_test_payload(&block_msg), block_msg)
+            .unwrap();
+
+        let event = tokio::time::timeout(Duration::from_secs(1), payload_events_rx.recv())
+            .await
+            .expect("timed out waiting for BuiltPayload event")
+            .expect("payload events channel closed");
+
+        match event {
+            Events::BuiltPayload(payload) => assert_eq!(payload.block().hash(), block_hash),
+            other => panic!("expected BuiltPayload event, got {other:?}"),
         }
     }
 
@@ -883,17 +1001,23 @@ mod tests {
     struct EngineResponses {
         new_payload: PayloadStatusEnum,
         fcu: PayloadStatusEnum,
+        query_td: VecDeque<Option<U256>>,
     }
 
     impl EngineResponses {
         fn both_valid() -> Self {
-            Self { new_payload: PayloadStatusEnum::Valid, fcu: PayloadStatusEnum::Valid }
+            Self {
+                new_payload: PayloadStatusEnum::Valid,
+                fcu: PayloadStatusEnum::Valid,
+                query_td: VecDeque::from([Some(U256::from(1))]),
+            }
         }
 
         fn invalid_new_payload() -> Self {
             Self {
                 new_payload: PayloadStatusEnum::Invalid { validation_error: "test error".into() },
                 fcu: PayloadStatusEnum::Valid,
+                query_td: VecDeque::from([Some(U256::from(1))]),
             }
         }
 
@@ -901,13 +1025,19 @@ mod tests {
             Self {
                 new_payload: PayloadStatusEnum::Valid,
                 fcu: PayloadStatusEnum::Invalid { validation_error: "fcu error".into() },
+                query_td: VecDeque::from([Some(U256::from(1))]),
             }
+        }
+
+        fn query_td(query_td: Vec<Option<U256>>) -> Self {
+            Self { query_td: query_td.into(), ..Self::both_valid() }
         }
     }
 
     /// Test fixture for block import tests
     struct TestFixture {
         handle: ImportHandle,
+        to_import_mined: mpsc::UnboundedSender<IncomingMinedBlock>,
     }
 
     impl TestFixture {
@@ -944,7 +1074,7 @@ mod tests {
                 service.await.unwrap();
             }));
 
-            Self { handle }
+            Self { handle, to_import_mined }
         }
 
         /// Run a block import test with the given event assertion
@@ -995,6 +1125,14 @@ mod tests {
                 "No outcome matched the expected criteria. Outcomes: {outcomes:?}"
             );
         }
+
+        fn send_mined_block(
+            &self,
+            payload: BscBuiltPayload,
+            block_msg: NewBlockMessage<BscNewBlock>,
+        ) -> Result<(), mpsc::error::SendError<IncomingMinedBlock>> {
+            self.to_import_mined.send((payload, block_msg))
+        }
     }
 
     /// Creates a test block message
@@ -1015,10 +1153,35 @@ mod tests {
         NewBlockMessage { hash, block: Arc::new(new_block), td: Some(U256::from(1)) }
     }
 
+    fn create_test_payload(block_msg: &NewBlockMessage<BscNewBlock>) -> BscBuiltPayload {
+        BscBuiltPayload {
+            block: Arc::new(block_msg.block.0.block.clone().seal_unchecked(block_msg.hash)),
+            fees: U256::ZERO,
+            requests: None,
+            build_kind: BuildKind::NormalAttempt,
+            exec_duration: Duration::ZERO,
+            trie_root_duration: Duration::ZERO,
+            executed_block: Default::default(),
+            pending_validators: None,
+            pending_turn_length: None,
+            is_bid: false,
+        }
+    }
+
+    fn payload_events_sender() -> tokio::sync::broadcast::Sender<Events<BscPayloadTypes>> {
+        if let Some(tx) = crate::shared::get_payload_events_tx() {
+            return tx.clone();
+        }
+
+        let (tx, _) = tokio::sync::broadcast::channel(16);
+        let _ = crate::shared::set_payload_events_tx(tx.clone());
+        tx
+    }
+
     /// Helper function to handle engine messages with specified payload statuses
     async fn handle_engine_msg(
         mut from_engine: mpsc::UnboundedReceiver<BeaconEngineMessage<BscPayloadTypes>>,
-        responses: EngineResponses,
+        mut responses: EngineResponses,
     ) {
         tokio::spawn(Box::pin(async move {
             while let Some(message) = from_engine.recv().await {
@@ -1038,6 +1201,10 @@ mod tests {
                             None,
                         ))))
                         .unwrap();
+                    }
+                    BeaconEngineMessage::QueryTd { tx, .. } => {
+                        let td = responses.query_td.pop_front().flatten();
+                        tx.send(Ok(td)).unwrap();
                     }
                     _ => {}
                 }

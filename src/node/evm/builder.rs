@@ -222,12 +222,12 @@ where
         let current_validators = self.shared_ctx.inner.borrow().current_validators.clone();
         if let Some((validators, vote_addresses)) = current_validators {
             if let Some(sink) = &validator_cache_sink {
-                *sink.lock().unwrap() = Some((validators, vote_addresses));
+                *crate::shared::lock_or_recover(sink) = Some((validators, vote_addresses));
             }
         }
         if let Some(turn_length) = self.shared_ctx.inner.borrow().turn_length {
             if let Some(sink) = &turn_length_sink {
-                *sink.lock().unwrap() = Some(turn_length);
+                *crate::shared::lock_or_recover(sink) = Some(turn_length);
             }
         }
         let assemble_duration = assemble_start.elapsed();

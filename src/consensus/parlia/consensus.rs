@@ -1,5 +1,6 @@
 use lazy_static::lazy_static;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::RwLock;
 use std::time::SystemTime;
 
@@ -39,6 +40,19 @@ use tracing::{debug, trace, warn};
 
 const RECOVERED_PROPOSER_CACHE_NUM: usize = 4096;
 const ADDRESS_LENGTH: usize = 20; // Ethereum address length in bytes
+static GENESIS_HASH: OnceLock<B256> = OnceLock::new();
+
+fn cached_genesis_hash() -> Result<B256, ParliaConsensusError> {
+    if let Some(hash) = GENESIS_HASH.get() {
+        return Ok(*hash);
+    }
+
+    let genesis = crate::shared::get_canonical_header_by_number(0)
+        .ok_or(ParliaConsensusError::HeaderNotFound { block_hash: B256::ZERO })?;
+    let hash = genesis.hash_slow();
+    let _ = GENESIS_HASH.set(hash);
+    Ok(hash)
+}
 
 /// Applies left-over reservation and mining-time cap to raw delay.
 #[inline]
@@ -761,15 +775,8 @@ where
         // Fall back to genesis as the source, matching geth's behaviour:
         // ref: https://github.com/bnb-chain/bsc/blob/583cfec3ea811fb124e6812aabd190555d5aeabc/consensus/parlia/parlia.go#L2161
         if justified_hash == B256::ZERO {
-            match crate::shared::get_canonical_header_by_number(0) {
-                Some(genesis) => {
-                    justified_number = genesis.number;
-                    justified_hash = genesis.hash_slow();
-                }
-                None => {
-                    return Err(ParliaConsensusError::HeaderNotFound { block_hash: B256::ZERO });
-                }
-            }
+            justified_number = 0;
+            justified_hash = cached_genesis_hash()?;
         }
         let mut times = 1;
         if self

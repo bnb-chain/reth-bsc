@@ -64,6 +64,9 @@ pub fn main() -> eyre::Result<()> {
                 triedb: args.triedb,
                 output_csv: output_path.clone(),
                 label: label.clone(),
+                cache_dir: None,
+                reuse_genesis_db: false,
+                reuse_post_setup_db: false,
             };
 
             let rt = tokio::runtime::Builder::new_multi_thread()

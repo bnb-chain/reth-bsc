@@ -816,6 +816,13 @@ pub fn get_engine_api_tx() -> Option<BscEngineApiTx> {
     ENGINE_API_TX.get().cloned()
 }
 
+/// Acquire a `std::sync::Mutex` guard, recovering the inner value if the mutex is poisoned.
+pub fn lock_or_recover<T>(
+    mutex: &std::sync::Mutex<T>,
+) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|err| err.into_inner())
+}
+
 // Note: difflayers are now returned directly from the BSC block builder (`finish_bsc`) and carried
 // through `BscBuiltPayload` / `ExecutedBlockWithTrieUpdates`. We no longer use a global cache.
 
@@ -843,6 +850,21 @@ mod tests {
         cache_full_block(genesis.clone());
         assert_eq!(get_cached_block_by_hash(&ghash).unwrap().header.hash_slow(), ghash);
         assert_eq!(get_cached_block_by_number(0).unwrap().header.hash_slow(), ghash);
+    }
+
+    #[test]
+    fn lock_or_recover_returns_guard_after_poison() {
+        let mutex = Arc::new(std::sync::Mutex::new(1_u64));
+        let clone = Arc::clone(&mutex);
+
+        let _ = std::thread::spawn(move || {
+            let _guard = clone.lock().unwrap();
+            panic!("poison test mutex");
+        })
+        .join();
+
+        let guard = lock_or_recover(&mutex);
+        assert_eq!(*guard, 1);
     }
 
     // Note: eviction behavior depends on access patterns; an exhaustive eviction

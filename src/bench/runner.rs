@@ -34,8 +34,18 @@ pub fn run_benchmark(config: BenchConfig) -> eyre::Result<Vec<BlockTiming>> {
     );
 
     // 1. Initialize infrastructure (parlia, snapshot, header cache, MDBX + ProviderFactory)
-    println!("\n[1/6] Initializing infrastructure from genesis...");
-    let init = db_init::init_benchmark(&config)?;
+    let restored_setup = db_init::try_restore_post_setup(&config)?;
+    let (init, mut parent_header, mut parent_snapshot, mut cached_reads, start_block_idx) =
+        if let Some(restored) = restored_setup {
+            println!("\n[1/6] Reusing cached post-setup benchmark state...");
+            (restored.init, restored.parent_header, restored.parent_snapshot, None, 1usize)
+        } else {
+            println!("\n[1/6] Initializing infrastructure from genesis...");
+            let init = db_init::init_benchmark(&config)?;
+            let parent_header = init.genesis_header.clone();
+            let parent_snapshot = init.genesis_snapshot.clone();
+            (init, parent_header, parent_snapshot, None, 0usize)
+        };
 
     let chain_id = init.chain_spec.inner.chain.id();
     let evm_config = BscEvmConfig::new(init.chain_spec.clone());
@@ -75,42 +85,48 @@ pub fn run_benchmark(config: BenchConfig) -> eyre::Result<Vec<BlockTiming>> {
         }
     }
 
-    // 4. Generate BLS keys and createValidator transactions
-    println!("\n[4/6] Generating BLS keys and registering validators...");
-    let (create_val_txs, _bls_keys) = validator_setup::create_all_validator_txs(
-        &config.private_keys,
-        &init.validator_addresses,
-        chain_id,
-    );
-    println!("  Generated {} createValidator transactions", create_val_txs.len());
-
-    // 5. Deploy ERC20 and prepare distribution transactions
-    println!("\n[5/6] Preparing ERC20 deployment and distribution...");
     let deployer_key = &config.deployer_key;
-    let (deploy_tx, erc20_address) = tx_gen::erc20_deploy_tx(deployer_key, 0, chain_id);
-    println!("  ERC20 contract will be at: {}", erc20_address);
 
-    let distribution_txs = tx_gen::erc20_distribution_txs(
-        deployer_key,
-        &init.funded_accounts,
-        erc20_address,
-        1, // deployer nonce 1 (after deploy tx at nonce 0)
-        chain_id,
-    );
-    println!("  Generated {} distribution transactions", distribution_txs.len());
+    // 4. Generate setup transactions unless we resumed from a post-setup cache
+    let (setup_txs, erc20_address): (Vec<Recovered<reth_primitives::TransactionSigned>>, _) =
+        if start_block_idx == 0 {
+            println!("\n[4/6] Generating BLS keys and registering validators...");
+            let (create_val_txs, _bls_keys) = validator_setup::create_all_validator_txs(
+                &config.private_keys,
+                &init.validator_addresses,
+                chain_id,
+            );
+            println!("  Generated {} createValidator transactions", create_val_txs.len());
 
-    // Pre-recover setup txs (createValidator + deploy + distribution)
-    let setup_txs: Vec<Recovered<reth_primitives::TransactionSigned>> = {
-        let mut txs = Vec::new();
-        for tx in &create_val_txs {
-            if let Ok(r) = tx.clone().try_into_recovered() {
-                txs.push(r);
+            println!("\n[5/6] Preparing ERC20 deployment and distribution...");
+            let (deploy_tx, erc20_address) = tx_gen::erc20_deploy_tx(deployer_key, 0, chain_id);
+            println!("  ERC20 contract will be at: {}", erc20_address);
+
+            let distribution_txs = tx_gen::erc20_distribution_txs(
+                deployer_key,
+                &init.funded_accounts,
+                erc20_address,
+                1,
+                chain_id,
+            );
+            println!("  Generated {} distribution transactions", distribution_txs.len());
+
+            let mut setup_txs = Vec::new();
+            for tx in &create_val_txs {
+                if let Ok(r) = tx.clone().try_into_recovered() {
+                    setup_txs.push(r);
+                }
             }
-        }
-        txs.push(deploy_tx);
-        txs.extend(distribution_txs);
-        txs
-    };
+            setup_txs.push(deploy_tx);
+            setup_txs.extend(distribution_txs);
+            (setup_txs, erc20_address)
+        } else {
+            println!("\n[4/6] Reusing cached validator registration and ERC20 setup...");
+            let (_deploy_tx, erc20_address) = tx_gen::erc20_deploy_tx(deployer_key, 0, chain_id);
+            println!("  ERC20 contract already deployed at: {}", erc20_address);
+            println!("\n[5/6] Skipping setup transaction generation due to post-setup cache");
+            (Vec::new(), erc20_address)
+        };
 
     // 6. Pre-generate benchmark transaction pool
     println!(
@@ -127,9 +143,6 @@ pub fn run_benchmark(config: BenchConfig) -> eyre::Result<Vec<BlockTiming>> {
 
     // === Execute blocks ===
     let mut timings = Vec::with_capacity(config.num_blocks);
-    let mut parent_header = init.genesis_header.clone();
-    let mut parent_snapshot = init.genesis_snapshot.clone();
-    let mut cached_reads: Option<CachedReads> = None;
 
     let turn_length = parent_snapshot.turn_length.unwrap_or(1) as usize;
     let num_validators = init.validator_addresses.len();
@@ -137,7 +150,7 @@ pub fn run_benchmark(config: BenchConfig) -> eyre::Result<Vec<BlockTiming>> {
     // Total blocks: 1 setup + N benchmark
     let total_blocks = config.num_blocks + 1;
 
-    for block_idx in 0..total_blocks {
+    for block_idx in start_block_idx..total_blocks {
         let block_number = block_idx as u64 + 1;
         let is_setup_block = block_idx == 0;
 
@@ -180,7 +193,7 @@ pub fn run_benchmark(config: BenchConfig) -> eyre::Result<Vec<BlockTiming>> {
         let state_db = StateProviderDatabase::new(&*state_provider);
 
         // Build State with CachedReads (matches the real miner pipeline exactly)
-        let mut cached = cached_reads.take().unwrap_or_default();
+        let mut cached: CachedReads = cached_reads.take().unwrap_or_default();
         let mut db =
             State::builder().with_database(cached.as_db_mut(state_db)).with_bundle_update().build();
 
@@ -364,6 +377,7 @@ pub fn run_benchmark(config: BenchConfig) -> eyre::Result<Vec<BlockTiming>> {
         parent_snapshot.block_hash = new_hash;
 
         if is_setup_block {
+            db_init::persist_post_setup_cache(&config, &init, &parent_header, &parent_snapshot)?;
             // Setup block -- do NOT record timing
             println!(
                 "  Setup block 0 complete: {} txs, {} gas used, {}us total (commit: {}us)",

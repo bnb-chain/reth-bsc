@@ -39,7 +39,7 @@ use revm_context_interface::Block as EvmBlock;
 use reth_primitives::{HeaderTy, SealedHeader};
 use reth_primitives::InvalidTransactionError;
 use reth_primitives::TransactionSigned;
-use reth_primitives_traits::{BlockBody, RecoveredBlock, SignerRecoverable};
+use reth_primitives_traits::{Block, BlockBody, RecoveredBlock, SignerRecoverable};
 use reth_provider::StateProviderFactory;
 use reth_revm::cached::CachedReads;
 use reth_revm::cancelled::ManualCancel;
@@ -98,9 +98,29 @@ static CONSENSUS_METRICS: Lazy<BscConsensusMetrics> = Lazy::new(BscConsensusMetr
 /// Module-level miner metrics instance shared across all payload builds.
 static MINER_METRICS: Lazy<BscMinerMetrics> = Lazy::new(BscMinerMetrics::default);
 
+#[derive(Debug)]
+enum WaitFirst<T> {
+    Aborted,
+    Joined(T),
+}
+
+#[derive(Debug)]
+enum WaitMore<T> {
+    Deadline,
+    Aborted,
+    Joined(T),
+}
+
 /// Generate a unique trace ID for payload building
 pub fn generate_trace_id() -> u64 {
     TRACE_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+fn unix_now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
 }
 
 fn initial_out_of_turn_build_wait(
@@ -178,9 +198,6 @@ fn estimated_uplift_bps(current_payload_fees: U256, estimated_new_fees: U256) ->
 }
 
 fn miner_metrics() -> &'static crate::metrics::BscMinerMetrics {
-    use once_cell::sync::Lazy;
-    static MINER_METRICS: Lazy<crate::metrics::BscMinerMetrics> =
-        Lazy::new(crate::metrics::BscMinerMetrics::default);
     &MINER_METRICS
 }
 
@@ -753,10 +770,7 @@ where
 
         let mut sealed_block = Arc::new(block.sealed_block().clone());
 
-        // Update miner metrics
         let finalize_elapsed = finalize_start.elapsed();
-        let finalize_duration = finalize_elapsed.as_secs_f64();
-        MINER_METRICS.block_finalize_duration_seconds.record(finalize_duration);
 
         // set sidecars to seal block
         let mut blob_sidecars: Vec<BscBlobTransactionSidecar> = Vec::new();
@@ -829,8 +843,8 @@ where
         executed_block.difflayer = difflayer;
 
         // Read validator/turn-length data transported via sinks from the now-consumed builder.
-        let pending_validators = validator_cache_sink.lock().unwrap().take();
-        let pending_turn_length = turn_length_sink.lock().unwrap().take();
+        let pending_validators = crate::shared::lock_or_recover(&validator_cache_sink).take();
+        let pending_turn_length = crate::shared::lock_or_recover(&turn_length_sink).take();
 
         let payload = BscBuiltPayload {
             block: sealed_block.clone(),
@@ -952,10 +966,6 @@ where
 
         let sealed_block = Arc::new(block.sealed_block().clone());
 
-        // Update miner metrics
-        let finalize_duration = finalize_start.elapsed().as_secs_f64();
-        MINER_METRICS.block_finalize_duration_seconds.record(finalize_duration);
-
         let build_duration = build_start.elapsed();
 
         debug!(
@@ -986,8 +996,8 @@ where
         executed_block.difflayer = difflayer;
 
         // Read validator/turn-length data transported via sinks from the now-consumed builder.
-        let pending_validators = validator_cache_sink.lock().unwrap().take();
-        let pending_turn_length = turn_length_sink.lock().unwrap().take();
+        let pending_validators = crate::shared::lock_or_recover(&validator_cache_sink).take();
+        let pending_turn_length = crate::shared::lock_or_recover(&turn_length_sink).take();
 
         let payload = BscBuiltPayload {
             block: sealed_block.clone(),
@@ -1063,10 +1073,12 @@ where
     builder: Arc<BscPayloadBuilder<Pool, Client, EvmConfig>>,
     /// Timeout for payload building
     timeout: std::time::Duration,
-    /// Expected end timestamp (milliseconds since UNIX epoch).
+    /// Expected end timestamp (milliseconds since UNIX epoch) used for tracing/logging.
     ///
     /// Initialized in `new()` as: `now_ms + parlia.delay_for_ramanujan_fork(... )`.
     expected_end_timestamp_ms: u128,
+    /// Monotonic counterpart to `expected_end_timestamp_ms`, used for relative waits.
+    expected_end_at: std::time::Instant,
     /// Message queue for processing build arguments
     try_build_rx: mpsc::UnboundedReceiver<()>,
     /// Sender for sending arguments back to queue
@@ -1146,15 +1158,14 @@ where
         );
         let pending_basefee = builder.pool.block_info().pending_basefee;
 
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
+        let now_ms = unix_now_ms();
         let expected_end_delay_ms = parlia.delay_for_ramanujan_fork(
             &mining_ctx.parent_snapshot,
             mining_ctx.header.as_ref().unwrap(),
         );
         let expected_end_timestamp_ms = now_ms + expected_end_delay_ms as u128;
+        let expected_end_at =
+            std::time::Instant::now() + std::time::Duration::from_millis(expected_end_delay_ms);
 
         // Spawn a background task to listen for new transactions from pool
         // When tx_listener_rx is dropped (job ends), tx_listener_tx.send() will fail,
@@ -1176,6 +1187,7 @@ where
             builder: Arc::new(builder),
             timeout: std::time::Duration::from_millis(mining_delay),
             expected_end_timestamp_ms,
+            expected_end_at,
             try_build_rx,
             try_build_tx: try_build_tx.clone(),
             tx_listener: tx_listener_rx,
@@ -1686,8 +1698,8 @@ where
         }
     }
 
-    /// Fetch the best bid for the current parent block, push it into `potential_payloads`,
-    /// and return its block hash (or `None` if no valid bid exists).
+    /// Fetch the best bid for the current parent block and push its built payload into
+    /// `potential_payloads` when available.
     fn collect_best_bid(&mut self) {
         let Some(best_bid) = self.simulator.get_best_bid(self.mining_ctx.parent_header.hash())
         else {
@@ -1740,11 +1752,6 @@ where
             // join_next(), regardless of whether the task has already finished executing.
             // After spawn() above, len() is guaranteed ≥ 1.
             let bg_tasks = self.join_handle.len();
-
-            enum WaitFirst<T> {
-                Aborted,
-                Joined(T),
-            }
 
             let abort_rx = &mut self.abort_rx;
             let join_handle = &mut self.join_handle;
@@ -1834,11 +1841,10 @@ where
 
         // Phase 2: collect better candidates until deadline.
         while !self.join_handle.is_empty() {
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis();
-            if now_ms >= self.expected_end_timestamp_ms + 150 {
+            if std::time::Instant::now() >=
+                self.expected_end_at + std::time::Duration::from_millis(150)
+            {
+                let now_ms = unix_now_ms();
                 debug!(
                     target: "bsc::miner::payload",
                     trace_id = self.trace_id,
@@ -1854,24 +1860,20 @@ where
 
             // Remaining time we can still spend waiting for background builds.
             let try_mine_block_number = self.build_args.config.parent_header.number() + 1;
-            let mut remaining_ms = if self
+            let mut remaining = self
+                .expected_end_at
+                .checked_duration_since(std::time::Instant::now())
+                .unwrap_or_default();
+            if !self
                 .mining_ctx
                 .parent_snapshot
                 .last_block_in_one_turn(try_mine_block_number)
             {
-                (self.expected_end_timestamp_ms - now_ms) as u64
-            } else {
-                ((self.expected_end_timestamp_ms - now_ms) as u64) * 3 // wait more when not the last block in turn
-            };
-            if remaining_ms > 50 {
-                remaining_ms = 50;
+                // Off-turn and not last in turn: keep giving background builders a bit more time.
+                remaining = remaining.saturating_mul(3);
             }
-            let remaining = std::time::Duration::from_millis(remaining_ms);
-
-            enum WaitMore<T> {
-                Deadline,
-                Aborted,
-                Joined(T),
+            if remaining > std::time::Duration::from_millis(50) {
+                remaining = std::time::Duration::from_millis(50);
             }
 
             let abort_rx = &mut self.abort_rx;
@@ -1983,20 +1985,20 @@ where
 
     /// Send `payload` to the result channel, respecting the submission deadline.
     ///
-    /// If the deadline has already passed (`delay_ms == 0`) the payload is sent immediately;
+    /// If the precomputed submission target has already passed, the payload is sent immediately;
     /// otherwise it is handed off to a background task that sleeps for the remaining duration
-    /// before sending.  The submitter re-validates canonical state on receipt, so stale
-    /// contexts (e.g. a reorg occurred during the delay) are discarded safely.
+    /// before sending. The submitter re-validates canonical state on receipt, so stale contexts
+    /// (e.g. a reorg occurred during the delay) are discarded safely.
     fn submit_payload(&mut self, payload: BscBuiltPayload) -> Result<(), Box<BscPayloadJobError>> {
         let block_number = payload.block().number();
         let block_hash = payload.block.hash();
         let is_inturn = self.mining_ctx.is_inturn;
 
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        let delay_ms = self.expected_end_timestamp_ms.saturating_sub(now_ms) as u64;
+        let remaining = self
+            .expected_end_at
+            .checked_duration_since(std::time::Instant::now())
+            .unwrap_or_default();
+        let delay_ms = remaining.as_millis() as u64;
 
         let submit_ctx = SubmitContext {
             mining_ctx: self.mining_ctx.clone(),
@@ -2100,6 +2102,7 @@ where
         let gas_usage_percent =
             if gas_limit > 0 { (gas_used as f64 / gas_limit as f64 * 100.0) as u64 } else { 0 };
 
+        let finalize_start = std::time::Instant::now();
         finalize_payload(
             &mut best_payload,
             self.parlia.clone(),
@@ -2117,6 +2120,9 @@ where
             );
             Box::new(BscPayloadJobError::PayloadBuildingError(e.to_string()))
         })?;
+        MINER_METRICS
+            .block_finalize_duration_seconds
+            .record(finalize_start.elapsed().as_secs_f64());
 
         if best_payload.is_bid {
             use crate::metrics::BscMevMetrics;
@@ -2171,24 +2177,25 @@ fn finalize_payload(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let snapshot_provider = crate::shared::get_snapshot_provider()
         .cloned()
-        .ok_or_else(|| {
-            Box::new(std::io::Error::other("Snapshot provider not available"))
-                as Box<dyn std::error::Error + Send + Sync>
-        })?;
+        .ok_or_else(|| std::io::Error::other("Snapshot provider not available"))?;
 
     let senders = payload.executed_block.recovered_block.senders().to_vec();
-    let mut existing_sidecars = payload.block.clone_block().body.sidecars;
+    let mut existing_sidecars = payload.block.body().sidecars.clone();
     let mut plain_block = payload.executed_block.recovered_block.sealed_block().clone_block();
 
-    finalize_new_header(parlia, parent_snapshot, parent_header, &mut plain_block.header, &snapshot_provider)
-        .map_err(|e| {
-            Box::new(std::io::Error::other(e.to_string()))
-                as Box<dyn std::error::Error + Send + Sync>
-        })?;
+    finalize_new_header(
+        parlia,
+        parent_snapshot,
+        parent_header,
+        &mut plain_block.header,
+        &snapshot_provider,
+    )
+    .map_err(|e| std::io::Error::other(e.to_string()))?;
 
     let final_hash = plain_block.header.hash_slow();
     if let Some((validators, vote_addresses)) = payload.pending_validators.take() {
-        VALIDATOR_CACHE.lock().unwrap().insert(final_hash, (validators, vote_addresses));
+        crate::shared::lock_or_recover(&*VALIDATOR_CACHE)
+            .insert(final_hash, (validators, vote_addresses));
         tracing::debug!(
             "Updated validator cache after finalize, block_number: {}, block_hash: {}",
             plain_block.header.number,
@@ -2196,7 +2203,7 @@ fn finalize_payload(
         );
     }
     if let Some(turn_length) = payload.pending_turn_length.take() {
-        TURN_LENGTH_CACHE.lock().unwrap().insert(final_hash, turn_length);
+        crate::shared::lock_or_recover(&*TURN_LENGTH_CACHE).insert(final_hash, turn_length);
         tracing::debug!(
             "Updated turn length cache after finalize, block_number: {}, block_hash: {}",
             plain_block.header.number,
@@ -2204,10 +2211,6 @@ fn finalize_payload(
         );
     }
 
-    payload.executed_block.recovered_block =
-        Arc::new(RecoveredBlock::new_unhashed(plain_block.clone(), senders));
-
-    let mut finalized_with_sidecars = plain_block;
     // Update block_hash in each sidecar to reflect the final (post-seal) hash.
     // The sidecar block_hash was set to the pre-finalization hash at build time;
     // finalize_new_header() changes the header (difficulty, extra_data, ECDSA seal),
@@ -2217,8 +2220,11 @@ fn finalize_payload(
             sidecar.block_hash = final_hash;
         }
     }
-    finalized_with_sidecars.body.sidecars = existing_sidecars;
-    payload.block = Arc::new(finalized_with_sidecars.into());
+    plain_block.body.sidecars = existing_sidecars;
+    let sealed_block = plain_block.seal_unchecked(final_hash);
+    payload.executed_block.recovered_block =
+        Arc::new(RecoveredBlock::new_sealed(sealed_block.clone(), senders));
+    payload.block = Arc::new(sealed_block);
 
     Ok(())
 }
@@ -2555,5 +2561,10 @@ mod tests {
         );
 
         assert_eq!(rebuilds, 0);
+    }
+
+    #[test]
+    fn miner_metrics_returns_module_static() {
+        assert!(std::ptr::eq(super::miner_metrics(), &*super::MINER_METRICS));
     }
 }

@@ -615,8 +615,9 @@ where
         executed_block.difflayer = difflayer;
 
         // Read validator/turn-length data transported via sinks from the now-consumed builder.
-        let pending_validators = bid_validator_cache_sink.lock().unwrap().take();
-        let pending_turn_length = bid_turn_length_sink.lock().unwrap().take();
+        let pending_validators = crate::shared::lock_or_recover(&bid_validator_cache_sink).take();
+        let pending_turn_length =
+            crate::shared::lock_or_recover(&bid_turn_length_sink).take();
 
         bid_runtime.bsc_payload = Some(BscBuiltPayload {
             block: sealed_block.clone(),

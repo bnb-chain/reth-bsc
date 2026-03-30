@@ -30,7 +30,7 @@ pub enum Commands {
     Compare(CompareArgs),
 }
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 pub struct RunArgs {
     /// Path to genesis JSON file
     #[arg(long, default_value = DEFAULT_GENESIS)]
@@ -71,6 +71,18 @@ pub struct RunArgs {
     /// Label for this benchmark run
     #[arg(long, default_value = "default")]
     pub label: String,
+
+    /// Directory where reusable benchmark DB snapshots are stored
+    #[arg(long)]
+    pub cache_dir: Option<PathBuf>,
+
+    /// Reuse a cached post-genesis benchmark DB if present, otherwise create and cache it
+    #[arg(long, default_value = "false")]
+    pub reuse_genesis_db: bool,
+
+    /// Reuse a cached post-setup benchmark DB if present, otherwise create and cache it
+    #[arg(long, default_value = "false")]
+    pub reuse_post_setup_db: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -162,6 +174,7 @@ pub struct CompareArgs {
     pub optimized: PathBuf,
 }
 
+#[derive(Debug, Clone)]
 pub struct BenchConfig {
     pub genesis_path: PathBuf,
     pub private_keys: Vec<B256>,
@@ -175,6 +188,9 @@ pub struct BenchConfig {
     pub triedb: bool,
     pub output_csv: PathBuf,
     pub label: String,
+    pub cache_dir: Option<PathBuf>,
+    pub reuse_genesis_db: bool,
+    pub reuse_post_setup_db: bool,
 }
 
 fn parse_key(hex: &str) -> B256 {
@@ -183,6 +199,10 @@ fn parse_key(hex: &str) -> B256 {
 
 impl BenchConfig {
     pub fn from_run_args(args: RunArgs) -> eyre::Result<Self> {
+        if (args.reuse_genesis_db || args.reuse_post_setup_db) && args.cache_dir.is_none() {
+            eyre::bail!("--cache-dir is required when using --reuse-genesis-db or --reuse-post-setup-db");
+        }
+
         Ok(Self {
             genesis_path: args.genesis,
             private_keys: vec![
@@ -200,6 +220,132 @@ impl BenchConfig {
             triedb: args.triedb,
             output_csv: args.output,
             label: args.label,
+            cache_dir: args.cache_dir,
+            reuse_genesis_db: args.reuse_genesis_db,
+            reuse_post_setup_db: args.reuse_post_setup_db,
         })
+    }
+
+    pub fn wants_genesis_cache(&self) -> bool {
+        self.reuse_genesis_db || self.reuse_post_setup_db
+    }
+
+    pub fn wants_post_setup_cache(&self) -> bool {
+        self.reuse_post_setup_db
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bench::cache::state_cache_key;
+    use clap::Parser;
+
+    fn parse_run_args(args: &[&str]) -> RunArgs {
+        let cli = Cli::try_parse_from(args).expect("cli args should parse");
+        match cli.command {
+            Commands::Run(run_args) => run_args,
+            _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn run_args_parse_cache_flags() {
+        let args = parse_run_args(&[
+            "miner-bench",
+            "run",
+            "--cache-dir",
+            "/tmp/bench-cache",
+            "--reuse-genesis-db",
+            "--reuse-post-setup-db",
+        ]);
+
+        assert_eq!(args.cache_dir, Some(PathBuf::from("/tmp/bench-cache")));
+        assert!(args.reuse_genesis_db);
+        assert!(args.reuse_post_setup_db);
+    }
+
+    #[test]
+    fn from_run_args_requires_cache_dir_when_reuse_is_enabled() {
+        let args = RunArgs {
+            genesis: PathBuf::from(DEFAULT_GENESIS),
+            num_blocks: 100,
+            txs_per_block: 200,
+            funded_accounts: 500,
+            background_accounts: 0,
+            storage_slots_per_account: 5,
+            chain_difflayers: false,
+            triedb: false,
+            output: PathBuf::from("benchmark.csv"),
+            label: "default".to_string(),
+            cache_dir: None,
+            reuse_genesis_db: true,
+            reuse_post_setup_db: false,
+        };
+
+        let err = BenchConfig::from_run_args(args).expect_err("cache-dir should be required");
+        assert!(err.to_string().contains("--cache-dir"));
+    }
+
+    #[test]
+    fn state_cache_key_ignores_run_length_and_output_fields() {
+        let config_a = BenchConfig {
+            genesis_path: PathBuf::from(DEFAULT_GENESIS),
+            private_keys: vec![],
+            deployer_key: B256::ZERO,
+            num_blocks: 100,
+            txs_per_block: 6000,
+            funded_accounts: 5_000,
+            background_accounts: 10_000_000,
+            storage_slots_per_account: 1,
+            chain_difflayers: false,
+            triedb: true,
+            output_csv: PathBuf::from("first.csv"),
+            label: "first".to_string(),
+            cache_dir: Some(PathBuf::from("/tmp/cache")),
+            reuse_genesis_db: true,
+            reuse_post_setup_db: true,
+        };
+
+        let config_b = BenchConfig {
+            num_blocks: 1,
+            txs_per_block: 1,
+            output_csv: PathBuf::from("second.csv"),
+            label: "second".to_string(),
+            ..config_a.clone()
+        };
+
+        let genesis_json = "{\"alloc\":{},\"config\":{},\"gasLimit\":\"0x1\",\"difficulty\":\"0x1\"}";
+
+        assert_eq!(
+            state_cache_key(&config_a, genesis_json),
+            state_cache_key(&config_b, genesis_json)
+        );
+    }
+
+    #[test]
+    fn state_cache_key_changes_when_state_shape_changes() {
+        let base = BenchConfig {
+            genesis_path: PathBuf::from(DEFAULT_GENESIS),
+            private_keys: vec![],
+            deployer_key: B256::ZERO,
+            num_blocks: 100,
+            txs_per_block: 6000,
+            funded_accounts: 5_000,
+            background_accounts: 1_000_000,
+            storage_slots_per_account: 1,
+            chain_difflayers: false,
+            triedb: true,
+            output_csv: PathBuf::from("out.csv"),
+            label: "label".to_string(),
+            cache_dir: Some(PathBuf::from("/tmp/cache")),
+            reuse_genesis_db: true,
+            reuse_post_setup_db: false,
+        };
+
+        let changed = BenchConfig { background_accounts: 10_000_000, ..base.clone() };
+        let genesis_json = "{\"alloc\":{},\"config\":{},\"gasLimit\":\"0x1\",\"difficulty\":\"0x1\"}";
+
+        assert_ne!(state_cache_key(&base, genesis_json), state_cache_key(&changed, genesis_json));
     }
 }

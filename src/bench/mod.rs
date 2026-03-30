@@ -1,3 +1,4 @@
+pub mod cache;
 pub mod config;
 pub mod db_init;
 pub mod main_entry;
