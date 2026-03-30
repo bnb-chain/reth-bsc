@@ -18,10 +18,11 @@ use alloy_consensus::{BlockHeader, Transaction};
 use alloy_evm::block::BlockExecutor;
 use alloy_evm::Evm;
 use alloy_primitives::U256;
+use either::Either;
 use reth::payload::EthPayloadBuilderAttributes;
+use reth::transaction_pool::BestTransactionsAttributes;
 use reth::transaction_pool::error::Eip4844PoolTransactionError;
 use reth::transaction_pool::error::InvalidPoolTransactionError;
-use reth::transaction_pool::BestTransactionsAttributes;
 use reth::transaction_pool::{PoolTransaction, TransactionPool};
 use reth_basic_payload_builder::PayloadConfig;
 use reth_chainspec::EthChainSpec;
@@ -33,7 +34,6 @@ use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
 use reth_execution_types::BlockExecutionOutput;
 use reth_payload_primitives::PayloadBuilderAttributes;
 use reth_payload_primitives::{BuiltPayload, BuiltPayloadExecutedBlock, PayloadBuilderError};
-use either::Either;
 use once_cell::sync::Lazy;
 use revm_context_interface::Block as EvmBlock;
 use reth_primitives::{HeaderTy, SealedHeader};
@@ -313,11 +313,11 @@ where
     Client: StateProviderFactory + 'static,
     EvmConfig: ConfigureEvm<NextBlockEnvCtx = BscNextBlockEnvAttributes> + 'static,
     <EvmConfig as ConfigureEvm>::Primitives: reth_primitives_traits::NodePrimitives<
-        BlockHeader = alloy_consensus::Header,
-        SignedTx = alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip4844>,
-        Block = crate::node::primitives::BscBlock,
-        Receipt = reth_ethereum_primitives::Receipt,
-    >,
+            BlockHeader = alloy_consensus::Header,
+            SignedTx = alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip4844>,
+            Block = crate::node::primitives::BscBlock,
+            Receipt = reth_ethereum_primitives::Receipt,
+        >,
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>> + 'static,
 {
     pub const fn new(
@@ -540,7 +540,9 @@ where
                 continue;
             }
             let tx_start = std::time::Instant::now();
-            let mut blob_tx_sidecar: Option<Arc<alloy_eips::eip7594::BlobTransactionSidecarVariant>> = None;
+            let mut blob_tx_sidecar: Option<
+                Arc<alloy_eips::eip7594::BlobTransactionSidecarVariant>,
+            > = None;
             trace!(
                 target: "payload_builder",
                 trace_id,
@@ -815,7 +817,8 @@ where
         sealed_block = Arc::new(plain.into());
 
         let requests = execution_result.requests.clone();
-        let execution_outcome = BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
+        let execution_outcome =
+            BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
         let executed: BuiltPayloadExecutedBlock<_> = BuiltPayloadExecutedBlock {
             recovered_block: Arc::new(block),
             execution_output: Arc::new(execution_outcome),
@@ -971,7 +974,8 @@ where
         );
 
         let requests = execution_result.requests.clone();
-        let execution_outcome = BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
+        let execution_outcome =
+            BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
         let executed: BuiltPayloadExecutedBlock<_> = BuiltPayloadExecutedBlock {
             recovered_block: Arc::new(block),
             execution_output: Arc::new(execution_outcome),
@@ -1113,11 +1117,11 @@ where
         + 'static,
     EvmConfig: ConfigureEvm<NextBlockEnvCtx = BscNextBlockEnvAttributes> + 'static,
     <EvmConfig as ConfigureEvm>::Primitives: reth_primitives_traits::NodePrimitives<
-        BlockHeader = alloy_consensus::Header,
-        SignedTx = alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip4844>,
-        Block = crate::node::primitives::BscBlock,
-        Receipt = reth_ethereum_primitives::Receipt,
-    >,
+            BlockHeader = alloy_consensus::Header,
+            SignedTx = alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip4844>,
+            Block = crate::node::primitives::BscBlock,
+            Receipt = reth_ethereum_primitives::Receipt,
+        >,
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>> + 'static,
 {
     /// Creates a new BscPayloadJob and returns both the job and its handle

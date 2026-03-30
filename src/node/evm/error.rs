@@ -1,10 +1,10 @@
 //! Error types for the Bsc EVM module.
 
-use alloy_primitives::{Address, BlockHash, BlockNumber, B256, U256};
 use crate::consensus::parlia::error::ParliaConsensusError;
+use alloy_primitives::{Address, BlockHash, BlockNumber, B256, U256};
 use reth_evm::execute::{BlockExecutionError, BlockValidationError};
-use reth_provider::ProviderError;
 use reth_primitives::{GotExpected, GotExpectedBoxed};
+use reth_provider::ProviderError;
 
 /// BSC specific block validation error
 #[derive(thiserror::Error, Debug, Clone)]
@@ -17,7 +17,7 @@ pub enum BscBlockValidationError {
         /// The block hash
         hash: B256,
     },
-    
+
     /// Error when the system txs are more than expected
     #[error("unexpected system tx")]
     UnexpectedSystemTx,
@@ -191,38 +191,40 @@ pub enum BscBlockExecutionError {
 impl From<BscBlockExecutionError> for BlockExecutionError {
     fn from(err: BscBlockExecutionError) -> Self {
         // Update execution errors metric for all types of errors
-        use once_cell::sync::Lazy;
         use crate::metrics::{BscConsensusMetrics, BscExecutorMetrics};
-        static CONSENSUS_METRICS: Lazy<BscConsensusMetrics> = Lazy::new(BscConsensusMetrics::default);
+        use once_cell::sync::Lazy;
+        static CONSENSUS_METRICS: Lazy<BscConsensusMetrics> =
+            Lazy::new(BscConsensusMetrics::default);
         static EXECUTOR_METRICS: Lazy<BscExecutorMetrics> = Lazy::new(BscExecutorMetrics::default);
         EXECUTOR_METRICS.execution_errors_total.increment(1);
-        
+
         match err {
             BscBlockExecutionError::Validation(validation_err) => {
                 // Update bad blocks metric
                 CONSENSUS_METRICS.bad_blocks_total.increment(1);
-                
+
                 // TODO: now use DepositRequestDecode as the validation error carrier,
                 // but we should refine it by rewrite some validation error types in reth engine-tree.
-                // Note: Validation errors will be identified in the engine-tree and treated as invalid blocks. 
-                Self::Validation(BlockValidationError::DepositRequestDecode(
-                    format!("BSC validation error: {}", validation_err)
-                ))
+                // Note: Validation errors will be identified in the engine-tree and treated as invalid blocks.
+                Self::Validation(BlockValidationError::DepositRequestDecode(format!(
+                    "BSC validation error: {}",
+                    validation_err
+                )))
             }
-            
-            BscBlockExecutionError::SnapshotNotFound |
-            BscBlockExecutionError::EthCallFailed |
-            BscBlockExecutionError::GetTopValidatorsFailed |
-            BscBlockExecutionError::ParentUnknown { .. } |
-            BscBlockExecutionError::ApplySnapshotFailed |
-            BscBlockExecutionError::UnknownHeader { .. } |
-            BscBlockExecutionError::VoteAddrNotFoundInSnap { .. } |
-            BscBlockExecutionError::BLSTInnerError |
-            BscBlockExecutionError::ProviderInnerError { .. } |
-            BscBlockExecutionError::SystemContractUpgradeError |
-            BscBlockExecutionError::FailedToSignSystemTransaction { .. } |
-            BscBlockExecutionError::GlobalSignerNotInitializedForMiningMode => {
-                // Note: Internal errors will be identified in the engine-tree, 
+
+            BscBlockExecutionError::SnapshotNotFound
+            | BscBlockExecutionError::EthCallFailed
+            | BscBlockExecutionError::GetTopValidatorsFailed
+            | BscBlockExecutionError::ParentUnknown { .. }
+            | BscBlockExecutionError::ApplySnapshotFailed
+            | BscBlockExecutionError::UnknownHeader { .. }
+            | BscBlockExecutionError::VoteAddrNotFoundInSnap { .. }
+            | BscBlockExecutionError::BLSTInnerError
+            | BscBlockExecutionError::ProviderInnerError { .. }
+            | BscBlockExecutionError::SystemContractUpgradeError
+            | BscBlockExecutionError::FailedToSignSystemTransaction { .. }
+            | BscBlockExecutionError::GlobalSignerNotInitializedForMiningMode => {
+                // Note: Internal errors will be identified in the engine-tree,
                 // and the entire program will exit.
                 Self::other(err)
             }

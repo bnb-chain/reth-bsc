@@ -1,12 +1,14 @@
-use reth_network_api::{PeerId, Direction};
+use reth_eth_wire::{
+    capability::SharedCapabilities, multiplex::ProtocolConnection, protocol::Protocol,
+};
 use reth_network::protocol::{ConnectionHandler, OnNotSupported, ProtocolHandler};
-use reth_eth_wire::{capability::SharedCapabilities, multiplex::ProtocolConnection, protocol::Protocol};
+use reth_network_api::{Direction, PeerId};
 use std::net::SocketAddr;
 use tokio::sync::mpsc;
 
 use super::proto::BscProtoMessage;
-use crate::node::network::bsc_protocol::stream::{BscProtocolConnection};
 use crate::node::network::bsc_protocol::registry;
+use crate::node::network::bsc_protocol::stream::BscProtocolConnection;
 use reth_network::Peers;
 
 #[derive(Clone, Debug, Default)]
@@ -18,15 +20,25 @@ pub struct BscConnectionHandlerV2;
 impl ProtocolHandler for BscProtocolHandlerV2 {
     type ConnectionHandler = BscConnectionHandlerV2;
 
-    fn on_incoming(&self, _socket_addr: SocketAddr) -> Option<Self::ConnectionHandler> { Some(BscConnectionHandlerV2) }
+    fn on_incoming(&self, _socket_addr: SocketAddr) -> Option<Self::ConnectionHandler> {
+        Some(BscConnectionHandlerV2)
+    }
 
-    fn on_outgoing(&self, _socket_addr: SocketAddr, _peer_id: PeerId) -> Option<Self::ConnectionHandler> { Some(BscConnectionHandlerV2) }
+    fn on_outgoing(
+        &self,
+        _socket_addr: SocketAddr,
+        _peer_id: PeerId,
+    ) -> Option<Self::ConnectionHandler> {
+        Some(BscConnectionHandlerV2)
+    }
 }
 
 impl ConnectionHandler for BscConnectionHandlerV2 {
     type Connection = BscProtocolConnection;
 
-    fn protocol(&self) -> Protocol { BscProtoMessage::protocol_for(2) }
+    fn protocol(&self) -> Protocol {
+        BscProtoMessage::protocol_for(2)
+    }
 
     fn on_unsupported_by_peer(
         self,
@@ -78,7 +90,11 @@ impl ProtocolHandler for BscProtocolHandlerV1 {
         Some(BscConnectionHandlerV1)
     }
 
-    fn on_outgoing(&self, _socket_addr: SocketAddr, _peer_id: PeerId) -> Option<Self::ConnectionHandler> {
+    fn on_outgoing(
+        &self,
+        _socket_addr: SocketAddr,
+        _peer_id: PeerId,
+    ) -> Option<Self::ConnectionHandler> {
         Some(BscConnectionHandlerV1)
     }
 }
@@ -86,7 +102,9 @@ impl ProtocolHandler for BscProtocolHandlerV1 {
 impl ConnectionHandler for BscConnectionHandlerV1 {
     type Connection = BscProtocolConnection;
 
-    fn protocol(&self) -> Protocol { BscProtoMessage::protocol_for(1) }
+    fn protocol(&self) -> Protocol {
+        BscProtoMessage::protocol_for(1)
+    }
 
     fn on_unsupported_by_peer(
         self,

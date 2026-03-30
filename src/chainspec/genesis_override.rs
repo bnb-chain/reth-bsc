@@ -1,6 +1,6 @@
-use std::sync::OnceLock;
 use alloy_primitives::B256;
 use eyre::Result;
+use std::sync::OnceLock;
 
 /// Global storage for genesis hash override
 static GENESIS_HASH_OVERRIDE: OnceLock<Option<B256>> = OnceLock::new();
@@ -9,20 +9,21 @@ static GENESIS_HASH_OVERRIDE: OnceLock<Option<B256>> = OnceLock::new();
 pub fn set_genesis_hash_override(hash_str: Option<String>) -> Result<()> {
     let hash = match hash_str {
         Some(s) => {
-            let hash = s.parse::<B256>()
-                .map_err(|e| eyre::eyre!("Invalid genesis hash format: {}", e))?;
+            let hash =
+                s.parse::<B256>().map_err(|e| eyre::eyre!("Invalid genesis hash format: {}", e))?;
             Some(hash)
         }
         None => None,
     };
-    
-    GENESIS_HASH_OVERRIDE.set(hash)
+
+    GENESIS_HASH_OVERRIDE
+        .set(hash)
         .map_err(|_| eyre::eyre!("Genesis hash override already set"))?;
-    
+
     if let Some(hash) = hash {
         tracing::info!("Genesis hash override set to: {:#x}", hash);
     }
-    
+
     Ok(())
 }
 
@@ -60,13 +61,14 @@ mod tests {
 
     #[test]
     fn test_genesis_hash_parsing() {
-        let hash_str = "0xb4844167d735617495363867c84affa9f4069bcdae48411ae3badbe1d227d3e5".to_string();
+        let hash_str =
+            "0xb4844167d735617495363867c84affa9f4069bcdae48411ae3badbe1d227d3e5".to_string();
         set_genesis_hash_override(Some(hash_str)).expect("Should set genesis hash override");
-        
+
         let expected = "0xb4844167d735617495363867c84affa9f4069bcdae48411ae3badbe1d227d3e5"
             .parse::<B256>()
             .unwrap();
-        
+
         assert_eq!(get_genesis_hash_override(), Some(expected));
     }
 
@@ -77,10 +79,10 @@ mod tests {
         let test_hash = "0xb4844167d735617495363867c84affa9f4069bcdae48411ae3badbe1d227d3e5"
             .parse::<B256>()
             .unwrap();
-        
+
         // Test validation when no hash is set (should always pass)
         assert!(validate_genesis_hash(test_hash));
-        
+
         // Test validation when hash matches
         // (This test would need a way to reset global state to work properly)
     }

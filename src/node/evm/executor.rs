@@ -1,15 +1,18 @@
+use super::config::BscBlockExecutionCtx;
 use super::patch::HertzPatchManager;
+use crate::consensus::parlia::SnapshotProvider;
 use crate::{
     consensus::{SYSTEM_ADDRESS, parlia::{Parlia, Snapshot, VoteAddress}}, evm::{precompiles, transaction::BscTxEnv}, hardforks::BscHardforks, metrics::{BscBlockchainMetrics, BscConsensusMetrics, BscExecutorMetrics, BscRewardsMetrics, BscVoteMetrics}, node::evm::config::BscExecutionSharedCtx, system_contracts::{
         SystemContract, feynman_fork::ValidatorElectionInfo, get_upgrade_system_contracts, is_system_transaction
     }
 };
 use alloy_consensus::{Header, Transaction, TxReceipt};
+use alloy_eips::eip2935::{HISTORY_STORAGE_ADDRESS, HISTORY_STORAGE_CODE};
 use alloy_eips::{eip7685::Requests, Encodable2718};
 use alloy_evm::{block::{ExecutableTx, StateChangeSource}, eth::receipt_builder::ReceiptBuilderCtx};
-use alloy_primitives::{hex, uint, Address, U256, BlockNumber, Bytes};
+use alloy_primitives::{hex, keccak256, uint, Address, U256, BlockNumber, Bytes};
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
-use super::config::{BscBlockExecutionCtx, revm_spec_by_timestamp_and_block_number};
+use super::config::revm_spec_by_timestamp_and_block_number;
 use reth_evm::{
     block::{BlockValidationError, CommitChanges},
     eth::receipt_builder::ReceiptBuilder,
@@ -29,11 +32,8 @@ use revm::{
     state::Bytecode,
     DatabaseCommit,
 };
-use tracing::{error, warn, info, debug, trace};
-use alloy_eips::eip2935::{HISTORY_STORAGE_ADDRESS, HISTORY_STORAGE_CODE};
-use alloy_primitives::keccak256;
 use std::{collections::HashMap, sync::Arc};
-use crate::consensus::parlia::SnapshotProvider;
+use tracing::{debug, error, info, trace, warn};
 /// Helper type for the input of post execution.
 #[allow(clippy::type_complexity)]
 #[derive(Debug, Clone)]
@@ -42,7 +42,7 @@ pub(crate) struct InnerExecutionContext {
     pub(crate) expected_turn_length: Option<u8>,
     pub(crate) max_elected_validators: Option<U256>,
     pub(crate) validators_election_info: Option<Vec<ValidatorElectionInfo>>,
-    pub(crate) snap: Option<Snapshot>,
+    pub(crate) snap: Option<Arc<Snapshot>>,
     pub(crate) header: Option<Header>,
     pub(crate) parent_header: Option<Header>,
 }
@@ -121,7 +121,7 @@ where
     ) -> Self {
         let is_mainnet = spec.chain().id() == 56; // BSC mainnet chain ID
         let hertz_patch_manager = HertzPatchManager::new(is_mainnet);
-        
+
         trace!("Succeed to new block executor, header: {:?}", ctx.header);
         if let Some(ref header) = ctx.header {
             crate::node::evm::util::HEADER_CACHE_READER
@@ -181,7 +181,12 @@ where
     }
 
     /// Applies system contract upgrades if the Feynman fork is not yet active.
-    fn upgrade_contracts(&mut self, block_number: BlockNumber, block_timestamp: u64, parent_timestamp: u64) -> Result<(), BlockExecutionError> {
+    fn upgrade_contracts(
+        &mut self,
+        block_number: BlockNumber,
+        block_timestamp: u64,
+        parent_timestamp: u64,
+    ) -> Result<(), BlockExecutionError> {
         trace!(
             target: "bsc::executor::upgrade",
             block_number,
@@ -189,7 +194,7 @@ where
             parent_timestamp,
             "Calling get_upgrade_system_contracts"
         );
-        
+
         let contracts = get_upgrade_system_contracts(
             &self.spec,
             block_number,
@@ -215,7 +220,13 @@ where
     }
 
     /// Mimics Geth-BSC's TryUpdateBuildInSystemContract function
-    fn try_update_build_in_system_contract(&mut self, block_number: BlockNumber, block_timestamp: u64, parent_timestamp: u64, at_block_begin: bool) -> Result<(), BlockExecutionError> {
+    fn try_update_build_in_system_contract(
+        &mut self,
+        block_number: BlockNumber,
+        block_timestamp: u64,
+        parent_timestamp: u64,
+        at_block_begin: bool,
+    ) -> Result<(), BlockExecutionError> {
         if at_block_begin {
             // Upgrade system contracts before Feynman at block begin
             if !self.spec.is_feynman_active_at_timestamp(block_number, parent_timestamp) {
@@ -227,10 +238,14 @@ where
                 );
                 self.upgrade_contracts(block_number, block_timestamp, parent_timestamp)?;
             }
-            
+
             // HistoryStorageAddress is a special system contract in BSC, which can't be upgraded
             // This must be done at block begin when Prague activates
-            if self.spec.is_prague_transition_at_block_and_timestamp(block_number, block_timestamp, parent_timestamp) {
+            if self.spec.is_prague_transition_at_block_and_timestamp(
+                block_number,
+                block_timestamp,
+                parent_timestamp,
+            ) {
                 info!(
                     target: "bsc::executor::prague",
                     block_number,
@@ -272,7 +287,7 @@ where
         beneficiary: Address,
     ) -> Result<(), BlockExecutionError> {
         let txs = self.system_contracts.genesis_contracts_txs();
-        for  tx in txs {
+        for tx in txs {
             self.transact_system_tx(tx.into(), beneficiary)?;
         }
         Ok(())
@@ -307,15 +322,16 @@ where
             "Deploying HistoryStorageAddress contract (Prague transition)"
         );
 
-        let account = self.evm.db_mut().load_cache_account(HISTORY_STORAGE_ADDRESS).map_err(|err| {
-            error!(
-                target: "bsc::executor::prague",
-                block_number,
-                error = ?err,
-                "Failed to load HistoryStorageAddress account",
-            );
-            BlockExecutionError::other(err)
-        })?;
+        let account =
+            self.evm.db_mut().load_cache_account(HISTORY_STORAGE_ADDRESS).map_err(|err| {
+                error!(
+                    target: "bsc::executor::prague",
+                    block_number,
+                    error = ?err,
+                    "Failed to load HistoryStorageAddress account",
+                );
+                BlockExecutionError::other(err)
+            })?;
 
         let old_info = account.account_info();
         debug!(
@@ -334,7 +350,7 @@ where
 
         let transition = account.change(new_info, Default::default());
         self.evm.db_mut().apply_transition(vec![(HISTORY_STORAGE_ADDRESS, transition)]);
-        
+
         info!(
             target: "bsc::executor::prague",
             block_number,
@@ -373,7 +389,7 @@ where
             is_miner = self.ctx.is_miner,
             "Start to apply_pre_execution_changes"
         );
-        
+
         // Update current block height and header height metrics
         let block_number = block_env.number().to::<u64>();
         self.consensus_metrics.current_block_height.set(block_number as f64);
@@ -384,7 +400,7 @@ where
         } else {
             self.check_new_block(&block_env)?;
         }
-        
+
         // set state clear flag if the block is after the Spurious Dragon hardfork.
         let block_number = self.evm.block().number().to::<u64>();
         let state_clear_flag = self.spec.is_spurious_dragon_active_at_block(block_number);
@@ -396,7 +412,7 @@ where
             parent_timestamp, 
             true
         )?;
-     
+
         // Apply historical block hashes if Prague is active
         if self.spec.is_prague_active_at_block_and_timestamp(
             self.evm.block().number().to::<u64>(), 
@@ -644,7 +660,8 @@ where
 
         let mut temp_state = state.clone();
         temp_state.remove(&SYSTEM_ADDRESS);
-        self.system_caller.on_state(StateChangeSource::Transaction(self.receipts.len()), &temp_state);
+        self.system_caller
+            .on_state(StateChangeSource::Transaction(self.receipts.len()), &temp_state);
 
         let gas_used = result.gas_used();
         self.gas_used += gas_used;
@@ -662,7 +679,6 @@ where
 
         Ok(gas_used)
     }
-
 
     fn finish(
         mut self,
@@ -715,23 +731,25 @@ where
         // Update receipt height metric
         let block_number = self.evm.block().number().to::<u64>();
         self.blockchain_metrics.current_receipt_height.set(block_number as f64);
-        
+
         // Update block execution metrics
         self.executor_metrics.executed_blocks_total.increment(1);
-        
+
         // Update block insert metrics
         // Calculate total transaction size in bytes (simplified estimation)
-        // Each receipt contributes approximately: 
+        // Each receipt contributes approximately:
         // - Base tx overhead: ~100 bytes
         // - Per log: ~100 bytes (address + topics + data average)
-        let tx_size_bytes: usize = self.receipts.iter()
+        let tx_size_bytes: usize = self
+            .receipts
+            .iter()
             .map(|r| {
                 let logs_count = r.logs().len();
                 100 + logs_count * 100 // Base + logs estimation
             })
             .sum();
         self.blockchain_metrics.block_tx_size_bytes.set(tx_size_bytes as f64);
-        
+
         // Calculate block receive time difference
         // This is the difference between current block timestamp and parent block timestamp
         let current_timestamp = self.evm.block().timestamp().to::<u64>();
@@ -740,7 +758,7 @@ where
             let time_diff = (current_timestamp as i64) - (parent_timestamp as i64);
             self.blockchain_metrics.block_receive_time_diff_seconds.set(time_diff as f64);
         }
-        
+
         // Note: For gas-related metrics, use reth's ExecutorMetrics:
         // - sync.execution.gas_used_histogram
         // - sync.execution.gas_per_second (can be converted to MGas/s)

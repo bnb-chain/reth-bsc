@@ -784,7 +784,11 @@ impl HertzPatchManager {
         Self { is_mainnet }
     }
 
-    pub fn patch_before_tx<T, DB>(&self, transaction: &T, state: &mut State<DB>) -> Result<(), BlockExecutionError>
+    pub fn patch_before_tx<T, DB>(
+        &self,
+        transaction: &T,
+        state: &mut State<DB>,
+    ) -> Result<(), BlockExecutionError>
     where
         T: SignedTransaction,
         DB: Database,
@@ -797,9 +801,13 @@ impl HertzPatchManager {
         }
         Ok(())
     }
-    
+
     /// Apply patches after transaction execution
-    pub fn patch_after_tx<T, DB>(&self, transaction: &T, state: &mut State<DB>) -> Result<(), BlockExecutionError>
+    pub fn patch_after_tx<T, DB>(
+        &self,
+        transaction: &T,
+        state: &mut State<DB>,
+    ) -> Result<(), BlockExecutionError>
     where
         T: SignedTransaction,
         DB: Database,

@@ -1,12 +1,8 @@
 //! Unit tests for Parlia snapshot database persistence and retrieval.
 
-use super::super::{
-    provider::DbSnapshotProvider,
-    snapshot::Snapshot,
-    provider::SnapshotProvider,
-};
-use alloy_primitives::{Address, B256, BlockHash};
-use reth_db::{init_db, mdbx::DatabaseArguments, Database, transaction::DbTx, cursor::DbCursorRO};
+use super::super::{provider::DbSnapshotProvider, provider::SnapshotProvider, snapshot::Snapshot};
+use alloy_primitives::{Address, BlockHash, B256};
+use reth_db::{cursor::DbCursorRO, init_db, mdbx::DatabaseArguments, transaction::DbTx, Database};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -16,15 +12,15 @@ fn test_snapshot_database_persistence() -> eyre::Result<()> {
     // Initialize test database
     let db_path = std::env::temp_dir().join(format!("bsc_test_db_{}", Uuid::new_v4()));
     std::fs::create_dir_all(&db_path)?;
-    
+
     let database = Arc::new(init_db(&db_path, DatabaseArguments::new(Default::default()))?);
-    
+
     // Cleanup guard to ensure database is removed even if test fails
     let _cleanup_guard = TestCleanup { path: db_path.clone() };
-    
+
     // Create DbSnapshotProvider
     let provider = DbSnapshotProvider::new(database.clone(), 256);
-    
+
     // Create test snapshots at checkpoint intervals
     let mut test_snapshots = Vec::new();
     for i in 0..5 {
@@ -32,36 +28,33 @@ fn test_snapshot_database_persistence() -> eyre::Result<()> {
         let snapshot = Snapshot {
             block_number,
             block_hash: B256::random(),
-            validators: vec![
-                Address::random(),
-                Address::random(), 
-                Address::random(),
-            ],
+            validators: vec![Address::random(), Address::random(), Address::random()],
             epoch_num: 200,
             turn_length: Some(1),
             ..Default::default()
         };
-        
+
         test_snapshots.push(snapshot);
     }
-    
+
     // Insert snapshots
     for snapshot in &test_snapshots {
         provider.insert(snapshot.clone());
     }
-    
+
     // Verify snapshots can be retrieved
     for expected in &test_snapshots {
-        let retrieved = provider.snapshot_by_hash(&expected.block_hash)
+        let retrieved = provider
+            .snapshot_by_hash(&expected.block_hash)
             .unwrap_or_else(|| panic!("Snapshot at block {} should exist", expected.block_number));
-        
+
         assert_eq!(retrieved.block_number, expected.block_number);
         assert_eq!(retrieved.block_hash, expected.block_hash);
         assert_eq!(retrieved.validators.len(), expected.validators.len());
         assert_eq!(retrieved.epoch_num, expected.epoch_num);
         assert_eq!(retrieved.turn_length, expected.turn_length);
     }
-    
+
     Ok(())
 }
 
@@ -70,12 +63,12 @@ fn test_snapshot_database_persistence() -> eyre::Result<()> {
 fn test_snapshot_range_queries() -> eyre::Result<()> {
     let db_path = std::env::temp_dir().join(format!("bsc_test_db_{}", Uuid::new_v4()));
     std::fs::create_dir_all(&db_path)?;
-    
+
     let database = Arc::new(init_db(&db_path, DatabaseArguments::new(Default::default()))?);
     let _cleanup_guard = TestCleanup { path: db_path.clone() };
-    
+
     let provider = DbSnapshotProvider::new(database.clone(), 256);
-    
+
     // Insert snapshots at blocks 1024, 2048, 3072, 4096, 5120
     let mut test_snapshots = Vec::new();
     for i in 1..=6 {
@@ -87,42 +80,45 @@ fn test_snapshot_range_queries() -> eyre::Result<()> {
             epoch_num: 200,
             ..Default::default()
         };
-        
+
         test_snapshots.push(snapshot.clone());
         // only save 3 snapshots to DB
         if [1, 2, 5].contains(&i) {
             provider.insert(snapshot);
         }
     }
-    
+
     // Test range queries - should find nearest predecessor
     let test_cases = vec![
-        (BlockHash::random(), None),                   // Before first snapshot
-        (test_snapshots[0].block_hash, Some(1024)),    // Exact match
-        (test_snapshots[1].block_hash, Some(2048)),    // Exact match
-        (test_snapshots[2].block_hash, None),          // not exist
-        (test_snapshots[3].block_hash, None),    // not exist
-        (test_snapshots[4].block_hash, Some(5120)),    // Last snapshot
-        (test_snapshots[5].block_hash, None),    // After last snapshot - should find 5120
+        (BlockHash::random(), None),                // Before first snapshot
+        (test_snapshots[0].block_hash, Some(1024)), // Exact match
+        (test_snapshots[1].block_hash, Some(2048)), // Exact match
+        (test_snapshots[2].block_hash, None),       // not exist
+        (test_snapshots[3].block_hash, None),       // not exist
+        (test_snapshots[4].block_hash, Some(5120)), // Last snapshot
+        (test_snapshots[5].block_hash, None),       // After last snapshot - should find 5120
     ];
-    
+
     for (query_block, expected_block) in test_cases {
         let result = provider.snapshot_by_hash(&query_block);
         match expected_block {
             Some(expected) => {
-                let snapshot = result.unwrap_or_else(|| panic!("Should find snapshot for block {query_block}"));
+                let snapshot = result
+                    .unwrap_or_else(|| panic!("Should find snapshot for block {query_block}"));
                 assert_eq!(snapshot.block_number, expected,
                     "Query for block {query_block} should return snapshot at block {expected}, got {}", 
                     snapshot.block_number);
             }
             None => {
-                assert!(result.is_none(), 
-                    "Query for block {query_block} should return None, got snapshot at block {}", 
-                    result.map(|s| s.block_number).unwrap_or(0));
+                assert!(
+                    result.is_none(),
+                    "Query for block {query_block} should return None, got snapshot at block {}",
+                    result.map(|s| s.block_number).unwrap_or(0)
+                );
             }
         }
     }
-    
+
     Ok(())
 }
 
@@ -131,12 +127,12 @@ fn test_snapshot_range_queries() -> eyre::Result<()> {
 fn test_direct_database_access() -> eyre::Result<()> {
     let db_path = std::env::temp_dir().join(format!("bsc_test_db_{}", Uuid::new_v4()));
     std::fs::create_dir_all(&db_path)?;
-    
+
     let database = Arc::new(init_db(&db_path, DatabaseArguments::new(Default::default()))?);
     let _cleanup_guard = TestCleanup { path: db_path.clone() };
-    
+
     let provider = DbSnapshotProvider::new(database.clone(), 256);
-    
+
     // Insert test snapshots
     let snapshot_count = 3;
     for i in 1..=snapshot_count {
@@ -148,23 +144,25 @@ fn test_direct_database_access() -> eyre::Result<()> {
             epoch_num: 200,
             ..Default::default()
         };
-        
+
         provider.insert(snapshot);
     }
-    
+
     // Check raw database table
     let tx = database.tx()?;
     let mut cursor = tx.cursor_read::<crate::consensus::parlia::db::ParliaSnapshotsByHash>()?;
     let mut count = 0;
-    
+
     for item in cursor.walk(None)? {
         let (_key, _value) = item?;
         count += 1;
     }
-    
-    assert_eq!(count, snapshot_count, 
-        "Database should contain {snapshot_count} snapshot entries, found {count}");
-    
+
+    assert_eq!(
+        count, snapshot_count,
+        "Database should contain {snapshot_count} snapshot entries, found {count}"
+    );
+
     Ok(())
 }
 
@@ -173,13 +171,13 @@ fn test_direct_database_access() -> eyre::Result<()> {
 fn test_snapshot_cache_behavior() -> eyre::Result<()> {
     let db_path = std::env::temp_dir().join(format!("bsc_test_db_{}", Uuid::new_v4()));
     std::fs::create_dir_all(&db_path)?;
-    
+
     let database = Arc::new(init_db(&db_path, DatabaseArguments::new(Default::default()))?);
     let _cleanup_guard = TestCleanup { path: db_path.clone() };
-    
+
     // Small cache size to test eviction
     let provider = DbSnapshotProvider::new(database.clone(), 2);
-    
+
     // Insert more snapshots than cache size
     let mut test_snapshots = Vec::new();
     for i in 1..=5 {
@@ -194,18 +192,19 @@ fn test_snapshot_cache_behavior() -> eyre::Result<()> {
         test_snapshots.push(snapshot.clone());
         provider.insert(snapshot);
     }
-    
+
     // All snapshots should still be retrievable (from DB if not in cache)
     for expected in &test_snapshots {
-        let snapshot = provider.snapshot_by_hash(&expected.block_hash)
-            .unwrap_or_else(|| panic!("Snapshot at block {} should be retrievable", expected.block_hash));
+        let snapshot = provider.snapshot_by_hash(&expected.block_hash).unwrap_or_else(|| {
+            panic!("Snapshot at block {} should be retrievable", expected.block_hash)
+        });
         assert_eq!(snapshot.block_number, expected.block_number);
         assert_eq!(snapshot.block_hash, expected.block_hash);
         assert_eq!(snapshot.validators.len(), expected.validators.len());
         assert_eq!(snapshot.epoch_num, expected.epoch_num);
         assert_eq!(snapshot.turn_length, expected.turn_length);
     }
-    
+
     Ok(())
 }
 

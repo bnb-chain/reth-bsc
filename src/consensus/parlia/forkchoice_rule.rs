@@ -1,7 +1,7 @@
 use crate::{chainspec::BscChainSpec, hardforks::BscHardforks};
 use alloy_consensus::Header;
 use alloy_primitives::U256;
-use std::{sync::Arc, cmp::Ordering};
+use std::{cmp::Ordering, sync::Arc};
 
 /// Header with additional fork choice metadata.
 ///
@@ -20,11 +20,7 @@ pub struct HeaderForForkchoice<'a> {
 impl<'a> HeaderForForkchoice<'a> {
     /// Creates a new `HeaderForForkchoice` instance.
     pub fn new(header: &'a Header, td: Option<U256>, justified_num: u64) -> Self {
-        Self {
-            header,
-            td,
-            justified_num,
-        }
+        Self { header, td, justified_num }
     }
 }
 
@@ -77,7 +73,7 @@ impl BscForkChoiceRule {
 
         // Fallback to TD-based comparison
         let result = self.head_choice_with_td(incoming, current)?;
-        
+
         tracing::info!(
             target: "bsc::forkchoice",
             need_reorg = result,
@@ -90,7 +86,7 @@ impl BscForkChoiceRule {
             method = "total_difficulty",
             "Fork choice decision made by total difficulty comparison"
         );
-        
+
         Ok(result)
     }
 
@@ -104,8 +100,9 @@ impl BscForkChoiceRule {
         current: &HeaderForForkchoice,
     ) -> Option<bool> {
         // Check if Plato fork is active for either header
-        if !self.spec.as_ref().is_plato_active_at_block(incoming.header.number) &&
-           !self.spec.as_ref().is_plato_active_at_block(current.header.number) {
+        if !self.spec.as_ref().is_plato_active_at_block(incoming.header.number)
+            && !self.spec.as_ref().is_plato_active_at_block(current.header.number)
+        {
             return None;
         }
 
@@ -118,7 +115,9 @@ impl BscForkChoiceRule {
 
         // If justified numbers differ, use fast finality rule
         if incoming.justified_num != current.justified_num {
-            if incoming.justified_num > current.justified_num && incoming.header.number <= current.header.number {
+            if incoming.justified_num > current.justified_num
+                && incoming.header.number <= current.header.number
+            {
                 tracing::info!(
                     target: "bsc::forkchoice",
                     from_height = current.header.number,
@@ -145,12 +144,16 @@ impl BscForkChoiceRule {
         incoming: &HeaderForForkchoice,
         current: &HeaderForForkchoice,
     ) -> Result<bool, crate::consensus::ParliaConsensusErr> {
-        let current_td = current.td.ok_or(
-            crate::consensus::ParliaConsensusErr::UnknownTotalDifficulty(current.header.hash_slow(), current.header.number)
-        )?;
-        let incoming_td = incoming.td.ok_or(
-            crate::consensus::ParliaConsensusErr::UnknownTotalDifficulty(incoming.header.hash_slow(), incoming.header.number)
-        )?;
+        let current_td =
+            current.td.ok_or(crate::consensus::ParliaConsensusErr::UnknownTotalDifficulty(
+                current.header.hash_slow(),
+                current.header.number,
+            ))?;
+        let incoming_td =
+            incoming.td.ok_or(crate::consensus::ParliaConsensusErr::UnknownTotalDifficulty(
+                incoming.header.hash_slow(),
+                incoming.header.number,
+            ))?;
 
         tracing::debug!(
             target: "bsc::forkchoice",
@@ -199,7 +202,9 @@ impl BscForkChoiceRule {
 mod tests {
     use super::*;
     use crate::chainspec::{bsc::bsc_mainnet, bsc_rialto::bsc_qanet};
-    use crate::consensus::parlia::{Snapshot, VoteData, VoteAttestation, EXTRA_VANITY_LEN, EXTRA_SEAL_LEN};
+    use crate::consensus::parlia::{
+        Snapshot, VoteAttestation, VoteData, EXTRA_SEAL_LEN, EXTRA_VANITY_LEN,
+    };
     use alloy_consensus::Header;
     use alloy_primitives::{B256, U256};
 
@@ -219,11 +224,7 @@ mod tests {
         let mut extra = vec![0u8; EXTRA_VANITY_LEN];
         extra.extend_from_slice(alloy_rlp::encode(&att).as_ref());
         extra.extend_from_slice(&[0u8; EXTRA_SEAL_LEN]);
-        Header { 
-            number, 
-            extra_data: alloy_primitives::Bytes::from(extra), 
-            ..Default::default() 
-        }
+        Header { number, extra_data: alloy_primitives::Bytes::from(extra), ..Default::default() }
     }
 
     #[test]
@@ -233,19 +234,19 @@ mod tests {
 
         let test_cases = [
             // ((current_number, current_td), (new_number, new_td), should_reorg)
-            ((1, 2), (2, 4), true),   // Higher TD wins
-            ((1, 2), (2, 1), false),  // Lower TD loses
-            ((1, 2), (2, 2), false),  // Same TD, higher number loses (current stays)
-            ((2, 2), (1, 2), true),   // Same TD, lower number wins
+            ((1, 2), (2, 4), true),  // Higher TD wins
+            ((1, 2), (2, 1), false), // Lower TD loses
+            ((1, 2), (2, 2), false), // Same TD, higher number loses (current stays)
+            ((2, 2), (1, 2), true),  // Same TD, lower number wins
         ];
 
         for ((curr_number, curr_td), (new_number, new_td), should_reorg) in test_cases {
             let curr_header = Header { number: curr_number, ..Default::default() };
             let new_header = Header { number: new_number, ..Default::default() };
-            
+
             let current = HeaderForForkchoice::new(&curr_header, Some(U256::from(curr_td)), 0);
             let incoming = HeaderForForkchoice::new(&new_header, Some(U256::from(new_td)), 0);
-            
+
             let result = rule.is_need_reorg(&incoming, &current).unwrap();
             assert_eq!(
                 result, should_reorg,
@@ -263,9 +264,9 @@ mod tests {
         // Setup snapshot provider for fast finality tests
         if crate::shared::get_snapshot_provider().is_none() {
             // Create a simple in-memory snapshot provider for tests
+            use crate::consensus::parlia::SnapshotProvider;
             use std::collections::HashMap as StdHashMap;
             use std::sync::RwLock;
-            use crate::consensus::parlia::SnapshotProvider;
 
             #[derive(Debug)]
             struct TestSnapProvider {
@@ -293,7 +294,7 @@ mod tests {
             }
 
             let sp = Arc::new(TestSnapProvider::new());
-            
+
             // Insert snapshots with vote data
             let test_cases = [
                 // (number, source_num, target_num)
@@ -304,7 +305,7 @@ mod tests {
                 (30, 28, 29),
                 (31, 27, 28),
             ];
-            
+
             for (number, source_num, target_num) in test_cases {
                 let header = header_with_attestation(number, source_num, target_num);
                 let snapshot = Snapshot {
@@ -320,26 +321,33 @@ mod tests {
                 };
                 sp.insert_snap(snapshot);
             }
-            
+
             let _ = crate::shared::set_snapshot_provider(sp);
         }
 
         let test_scenarios = [
-            // ((current_number, current_td, current_source, current_target), 
+            // ((current_number, current_td, current_source, current_target),
             //  (incoming_number, incoming_td, incoming_source, incoming_target), should_reorg)
-            ((10, 20, 8, 9), (11, 22, 9, 10), true),   // Higher justified number
+            ((10, 20, 8, 9), (11, 22, 9, 10), true), // Higher justified number
             ((20, 40, 18, 19), (21, 40, 18, 19), false), // Equal justified, equal TD
             ((20, 40, 18, 19), (21, 42, 18, 19), true), // Equal justified, higher TD
             ((30, 60, 28, 29), (31, 62, 27, 28), false), // Lower justified, higher TD
         ];
 
-        for ((curr_num, curr_td, curr_src, curr_tgt), (inc_num, inc_td, inc_src, inc_tgt), should_reorg) in test_scenarios {
+        for (
+            (curr_num, curr_td, curr_src, curr_tgt),
+            (inc_num, inc_td, inc_src, inc_tgt),
+            should_reorg,
+        ) in test_scenarios
+        {
             let current_header = header_with_attestation(curr_num, curr_src, curr_tgt);
             let incoming_header = header_with_attestation(inc_num, inc_src, inc_tgt);
-            
-            let current = HeaderForForkchoice::new(&current_header, Some(U256::from(curr_td)), curr_tgt);
-            let incoming = HeaderForForkchoice::new(&incoming_header, Some(U256::from(inc_td)), inc_tgt);
-            
+
+            let current =
+                HeaderForForkchoice::new(&current_header, Some(U256::from(curr_td)), curr_tgt);
+            let incoming =
+                HeaderForForkchoice::new(&incoming_header, Some(U256::from(inc_td)), inc_tgt);
+
             let result = rule.is_need_reorg(&incoming, &current).unwrap();
             assert_eq!(
                 result, should_reorg,

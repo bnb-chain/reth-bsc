@@ -1,15 +1,14 @@
-use std::sync::OnceLock;
-use reth_discv4::NodeRecord;
 use eyre::Result;
+use reth_discv4::NodeRecord;
+use std::sync::OnceLock;
 
 /// Global storage for bootnode override
 static BOOTNODE_OVERRIDE: OnceLock<Option<Vec<NodeRecord>>> = OnceLock::new();
 
 /// Set the global bootnode override
 pub fn set_bootnode_override(bootnodes: Option<Vec<NodeRecord>>) -> Result<()> {
-    BOOTNODE_OVERRIDE.set(bootnodes)
-        .map_err(|_| eyre::eyre!("Bootnode override already set"))?;
-    
+    BOOTNODE_OVERRIDE.set(bootnodes).map_err(|_| eyre::eyre!("Bootnode override already set"))?;
+
     Ok(())
 }
 

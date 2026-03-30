@@ -85,14 +85,29 @@ impl Decodable for UpgradeStatusExtension {
 mod tests {
     use super::*;
     use alloy_primitives::hex;
-    
+
     #[test]
     fn test_decode_bsc_upgrade_status() {
         // Raw wire message captured from a BSC peer.
         let cases = vec![
-            ("0bc180", UpgradeStatus { extension: UpgradeStatusExtension { disable_peer_tx_broadcast: false } }),
-            ("0bc2c180", UpgradeStatus { extension: UpgradeStatusExtension { disable_peer_tx_broadcast: false } }),
-            ("0bc2c101", UpgradeStatus { extension: UpgradeStatusExtension { disable_peer_tx_broadcast: true } }),
+            (
+                "0bc180",
+                UpgradeStatus {
+                    extension: UpgradeStatusExtension { disable_peer_tx_broadcast: false },
+                },
+            ),
+            (
+                "0bc2c180",
+                UpgradeStatus {
+                    extension: UpgradeStatusExtension { disable_peer_tx_broadcast: false },
+                },
+            ),
+            (
+                "0bc2c101",
+                UpgradeStatus {
+                    extension: UpgradeStatusExtension { disable_peer_tx_broadcast: true },
+                },
+            ),
         ];
         for (raw, expected) in cases {
             let raw = hex::decode(raw).unwrap();
@@ -101,7 +116,10 @@ mod tests {
             println!("decoded: {:?}", decoded);
             assert_eq!(expected, decoded);
             let mut enc = BytesMut::new();
-            UpgradeStatus { extension: UpgradeStatusExtension { disable_peer_tx_broadcast: false } }.encode(&mut enc);
+            UpgradeStatus {
+                extension: UpgradeStatusExtension { disable_peer_tx_broadcast: false },
+            }
+            .encode(&mut enc);
             println!("enc: {:x?}", enc.freeze());
         }
     }

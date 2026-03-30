@@ -1045,7 +1045,7 @@ where
 
         if self.submit_built_payload {
             if let Some(sender) = get_block_import_mined_sender() {
-                let incoming: IncomingMinedBlock = (payload, msg.clone());
+                let incoming: IncomingMinedBlock = (payload, msg);
                 if sender.send(incoming).is_err() {
                     warn!("Failed to send mined block to import service due to channel closed");
                     return Err(
@@ -1062,7 +1062,7 @@ where
             }
         } else if let Some(sender) = get_block_import_sender() {
             let peer_id = get_local_peer_id_or_default();
-            let incoming: IncomingBlock = (msg.clone(), peer_id);
+            let incoming: IncomingBlock = (msg, peer_id);
             if sender.send(incoming).is_err() {
                 warn!("Failed to send built block to import service due to channel closed");
                 return Err(

@@ -54,8 +54,9 @@ pub struct BscBlockBody {
 
 impl InMemorySize for BscBlockBody {
     fn size(&self) -> usize {
-        self.inner.size() +
-            self.sidecars
+        self.inner.size()
+            + self
+                .sidecars
                 .as_ref()
                 .map_or(0, |s| s.capacity() * core::mem::size_of::<BscBlobTransactionSidecar>())
     }
