@@ -5,11 +5,13 @@ use crate::bench::tx_gen;
 use crate::bench::validator_setup;
 use crate::node::evm::config::{BscEvmConfig, BscNextBlockEnvAttributes};
 use crate::node::evm::util::insert_header_to_cache;
+use crate::node::evm::MinerTrieDbPrefetcher;
 use crate::node::miner::bsc_miner::MiningContext;
 use crate::node::miner::signer::init_global_signer;
 use crate::node::miner::util::prepare_new_attributes;
 
-use alloy_consensus::transaction::Recovered;
+use alloy_consensus::{transaction::Recovered, BlockHeader as _};
+use alloy_evm::block::BlockExecutor;
 use reth_evm::execute::{BlockBuilder, BlockBuilderOutcome};
 use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
 use reth_payload_primitives::PayloadBuilderAttributes;
@@ -21,9 +23,56 @@ use reth_provider::{
 };
 use reth_revm::cached::CachedReads;
 use reth_revm::database::StateProviderDatabase;
+use reth_revm::state::EvmState as RethEvmState;
 use revm::database::State;
+use rust_eth_triedb::get_global_triedb;
+use rust_eth_triedb_common::{DiffLayer, DiffLayers};
 use std::sync::Arc;
 use std::time::Instant;
+
+/// Benchmark-local triedb reuse context.
+///
+/// The direct benchmark commits every block to triedb immediately, so older diff layers are
+/// already persisted to disk. Carrying only the latest parent difflayer still gives the next block
+/// access to the miner's warm in-memory overlay and prefetch path without growing an unbounded
+/// in-memory chain.
+#[derive(Debug, Default, Clone)]
+struct BenchTriedbContext {
+    parent_difflayers: Option<DiffLayers>,
+}
+
+impl BenchTriedbContext {
+    fn next_block_context(
+        &self,
+        triedb_enabled: bool,
+        parent_header: &SealedHeader,
+    ) -> (Option<DiffLayers>, Option<MinerTrieDbPrefetcher>) {
+        if !triedb_enabled {
+            return (None, None);
+        }
+
+        let parent_difflayers = self.parent_difflayers();
+        let triedb_prefetcher = parent_difflayers.clone().and_then(|difflayers| {
+            let mut triedb = get_global_triedb();
+            let path_db = triedb.get_mut_path_db_ref().clone();
+            MinerTrieDbPrefetcher::new(parent_header.state_root(), path_db, Some(difflayers)).ok()
+        });
+
+        (parent_difflayers, triedb_prefetcher)
+    }
+
+    fn record_finished_block(&mut self, difflayer: Option<Arc<DiffLayer>>) {
+        self.parent_difflayers = difflayer.map(|difflayer| {
+            let mut layers = DiffLayers::default();
+            layers.insert_difflayer(difflayer);
+            layers
+        });
+    }
+
+    fn parent_difflayers(&self) -> Option<DiffLayers> {
+        self.parent_difflayers.clone()
+    }
+}
 
 /// Run the full miner pipeline benchmark.
 pub fn run_benchmark(config: BenchConfig) -> eyre::Result<Vec<BlockTiming>> {
@@ -56,14 +105,9 @@ pub fn run_benchmark(config: BenchConfig) -> eyre::Result<Vec<BlockTiming>> {
 
     // 2. TrieDB status (initialized in db_init if --triedb was set)
     if config.triedb {
-        println!("\n[2/6] TrieDB enabled (initialized during genesis)");
+        println!("\n[2/6] TrieDB enabled (difflayer flush + prefetch fast path active)");
     } else {
         println!("\n[2/6] TrieDB disabled (use --triedb to enable)");
-    }
-    if config.chain_difflayers {
-        println!(
-            "  NOTE: --chain-difflayers is ignored on this branch: the current builder API does not expose difflayer chaining."
-        );
     }
 
     // 3. Verify genesis state is readable from MDBX
@@ -146,6 +190,7 @@ pub fn run_benchmark(config: BenchConfig) -> eyre::Result<Vec<BlockTiming>> {
 
     let turn_length = parent_snapshot.turn_length.unwrap_or(1) as usize;
     let num_validators = init.validator_addresses.len();
+    let mut triedb_ctx = BenchTriedbContext::default();
 
     // Total blocks: 1 setup + N benchmark
     let total_blocks = config.num_blocks + 1;
@@ -201,6 +246,8 @@ pub fn run_benchmark(config: BenchConfig) -> eyre::Result<Vec<BlockTiming>> {
 
         // Build the block using the EVM config pipeline
         let pre_exec_start = Instant::now();
+        let (parent_difflayers, triedb_prefetcher) =
+            triedb_ctx.next_block_context(config.triedb, &parent_header);
 
         let mut builder = evm_config
             .builder_for_next_block(
@@ -216,8 +263,8 @@ pub fn run_benchmark(config: BenchConfig) -> eyre::Result<Vec<BlockTiming>> {
                         withdrawals: Some(attributes.withdrawals().clone()),
                         extra_data: Default::default(),
                     },
-                    parent_difflayers: None,
-                    triedb_prefetcher: None,
+                    parent_difflayers,
+                    triedb_prefetcher: triedb_prefetcher.clone(),
                     validator_cache_sink: None,
                     turn_length_sink: None,
                 },
@@ -225,6 +272,15 @@ pub fn run_benchmark(config: BenchConfig) -> eyre::Result<Vec<BlockTiming>> {
             .map_err(|e| {
                 eyre::eyre!("Failed to create block builder for block {}: {:?}", block_number, e)
             })?;
+
+        if let Some(prefetcher) = triedb_prefetcher {
+            let pf = prefetcher.clone();
+            builder.executor_mut().set_state_hook(Some(Box::new(
+                move |_, update: &RethEvmState| {
+                    pf.on_state_update(update);
+                },
+            )));
+        }
 
         // Apply pre-execution changes (system contract calls)
         builder
@@ -285,20 +341,19 @@ pub fn run_benchmark(config: BenchConfig) -> eyre::Result<Vec<BlockTiming>> {
 
         let finish_start = Instant::now();
 
-        // This branch only exposes `finish()`. It computes a real state root against the
-        // configured state backend, but it does not return difflayers for warm-chain reuse.
         let outcome = builder
-            .finish(&*finish_state_provider)
+            .finish_with_difflayer(&*finish_state_provider)
             .map_err(|e| eyre::eyre!("Block {} finish failed: {:?}", block_number, e))?;
 
         let finish_us = finish_start.elapsed().as_micros();
 
         // Extract metrics from the outcome before committing
-        let hashed_accounts = outcome.hashed_state.accounts.len();
+        let hashed_accounts = outcome.inner.hashed_state.accounts.len();
         let hashed_storage_slots: usize =
-            outcome.hashed_state.storages.values().map(|s| s.storage.len()).sum();
+            outcome.inner.hashed_state.storages.values().map(|s| s.storage.len()).sum();
 
-        let BlockBuilderOutcome { execution_result, block: recovered_block, .. } = outcome;
+        let difflayer = outcome.difflayer;
+        let BlockBuilderOutcome { execution_result, block: recovered_block, .. } = outcome.inner;
 
         // Get the block header info we need before consuming the block
         let new_header = recovered_block.header().clone();
@@ -349,6 +404,9 @@ pub fn run_benchmark(config: BenchConfig) -> eyre::Result<Vec<BlockTiming>> {
         if config.triedb {
             let mut triedb = rust_eth_triedb::get_global_triedb();
             let triedb_flush_start = Instant::now();
+            // Keep the direct benchmark's persistence semantics unchanged: reuse the latest
+            // difflayer in-memory to speed up the next block's finish path, but continue to
+            // persist only the canonical root metadata here.
             triedb.flush(block_number, state_root, &None).map_err(|e| {
                 eyre::eyre!("Failed to flush triedb for block {}: {:?}", block_number, e)
             })?;
@@ -367,6 +425,7 @@ pub fn run_benchmark(config: BenchConfig) -> eyre::Result<Vec<BlockTiming>> {
 
         // Populate CachedReads for next block from execution outcome
         cached_reads = Some(new_cached);
+        triedb_ctx.record_finished_block(difflayer.clone());
 
         // Update chain tip
         let new_sealed = SealedHeader::new(new_header.clone(), new_hash);
@@ -442,6 +501,16 @@ fn determine_validator_index(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_primitives::B256;
+    use rust_eth_triedb_common::DiffLayer;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn sample_difflayer(marker: u8) -> Arc<DiffLayer> {
+        let mut storage_roots = HashMap::new();
+        storage_roots.insert(B256::repeat_byte(marker), B256::repeat_byte(marker.wrapping_add(1)));
+        Arc::new(DiffLayer::new(Arc::new(HashMap::new()), Arc::new(storage_roots)))
+    }
 
     #[test]
     fn test_validator_rotation() {
@@ -457,6 +526,34 @@ mod tests {
         assert_eq!(determine_validator_index(5, 3, 2), 2);
         assert_eq!(determine_validator_index(6, 3, 2), 2);
         assert_eq!(determine_validator_index(7, 3, 2), 0);
+    }
+
+    #[test]
+    fn triedb_context_keeps_only_latest_parent_difflayer() {
+        let mut ctx = BenchTriedbContext::default();
+        let first = sample_difflayer(0x11);
+        let second = sample_difflayer(0x22);
+
+        ctx.record_finished_block(Some(first.clone()));
+        let first_layers = ctx.parent_difflayers().expect("first difflayer should be tracked");
+        assert_eq!(first_layers.diff_layers.len(), 1);
+        assert_eq!(first_layers.diff_layers[0].diff_storage_roots, first.diff_storage_roots);
+
+        ctx.record_finished_block(Some(second.clone()));
+        let second_layers =
+            ctx.parent_difflayers().expect("second difflayer should replace the first");
+        assert_eq!(second_layers.diff_layers.len(), 1);
+        assert_eq!(second_layers.diff_layers[0].diff_storage_roots, second.diff_storage_roots);
+    }
+
+    #[test]
+    fn triedb_context_clears_parent_difflayers_when_finish_produces_none() {
+        let mut ctx = BenchTriedbContext::default();
+        ctx.record_finished_block(Some(sample_difflayer(0x33)));
+
+        ctx.record_finished_block(None);
+
+        assert!(ctx.parent_difflayers().is_none());
     }
 
     #[test]
