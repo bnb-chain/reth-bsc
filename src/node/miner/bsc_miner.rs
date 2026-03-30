@@ -89,6 +89,10 @@ pub struct NewWorkWorker<Provider> {
     mining_queue_tx: mpsc::UnboundedSender<MiningContext>,
     consensus: Arc<Parlia<BscChainSpec>>,
     pre_cached: Option<PrecachedState>,
+    /// Previous block's bundle state for in-memory overlay, keyed by block hash.
+    /// When the next block builds on this parent, the overlay lets `build_payload()` read
+    /// from memory instead of waiting for MDBX commit.
+    pre_bundle_state: Option<(alloy_primitives::B256, revm::database::BundleState)>,
     /// Hash of the tip block for which mining was last triggered, used to suppress
     /// periodic-tick retries when no new canonical head has arrived.
     last_triggered_tip: Option<alloy_primitives::B256>,
@@ -120,6 +124,7 @@ where
             mining_queue_tx,
             consensus,
             pre_cached: None,
+            pre_bundle_state: None,
             last_triggered_tip: None,
         }
     }
@@ -418,7 +423,16 @@ where
             }
         }
 
-        self.pre_cached = Some(PrecachedState { block: committed.tip().hash(), cached });
+        let tip_hash = committed.tip().hash();
+        self.pre_cached = Some(PrecachedState { block: tip_hash, cached });
+
+        // Build a BundleState from the execution outcome for the overlay.
+        // This lets the next block's build_payload() read from memory instead of MDBX.
+        let mut bundle = revm::database::BundleState::default();
+        for (addr, acc) in new_execution_outcome.bundle_accounts_iter() {
+            bundle.state.insert(addr, acc.clone());
+        }
+        self.pre_bundle_state = Some((tip_hash, bundle));
     }
 
     /// Returns the pre-cached reads for the given parent header if it matches the cached state's block.
@@ -427,6 +441,17 @@ where
         parent: alloy_primitives::B256,
     ) -> Option<reth_revm::cached::CachedReads> {
         self.pre_cached.as_ref().filter(|pc| pc.block == parent).map(|pc| pc.cached.clone())
+    }
+
+    /// Returns the pre-cached bundle state for the given parent hash.
+    fn maybe_pre_bundle_state(
+        &self,
+        parent: alloy_primitives::B256,
+    ) -> Option<revm::database::BundleState> {
+        self.pre_bundle_state
+            .as_ref()
+            .filter(|(hash, _)| *hash == parent)
+            .map(|(_, bundle)| bundle.clone())
     }
 
     async fn try_new_work<H>(&self, tip: &SealedHeader<H>)
@@ -545,7 +570,7 @@ where
             parent_snapshot: Arc::new(parent_snapshot),
             is_inturn,
             cached_reads: self.maybe_pre_cached(parent_hash),
-            prev_bundle_state: None,
+            prev_bundle_state: self.maybe_pre_bundle_state(parent_hash),
         };
 
         debug!("Queuing mining context, next_block: {}", tip.number() + 1);
@@ -734,7 +759,7 @@ where
             trace_id: crate::node::miner::payload::generate_trace_id(),
             min_gas_tip: self.desired_min_gas_tip,
             parent_difflayers: None, // populated once at job start via fetch_triedb_difflayers
-            prev_bundle_state: None,
+            prev_bundle_state: mining_ctx.prev_bundle_state.clone(),
         };
 
         let parent_hash = mining_ctx.parent_header.hash();
