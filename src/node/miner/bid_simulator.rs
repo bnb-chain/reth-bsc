@@ -4,7 +4,7 @@ use crate::consensus::parlia::provider::SnapshotProvider;
 use crate::consensus::parlia::Snapshot;
 use crate::hardforks::BscHardforks;
 use crate::node::engine::BscBuiltPayload;
-use crate::node::evm::config::{BscEvmConfig, BscNextBlockEnvAttributes};
+use crate::node::evm::config::{BscEvmConfig, BscNextBlockEnvAttributes, ValidatorCacheSink};
 use crate::node::miner::bsc_miner::MiningContext;
 use crate::node::miner::payload::DELAY_LEFT_OVER;
 use crate::node::miner::util::prepare_new_attributes;
@@ -36,7 +36,6 @@ use reth_provider::{BlockHashReader, HeaderProvider};
 use reth_revm::{database::StateProviderDatabase, db::State};
 use rust_eth_triedb::get_global_triedb;
 use rust_eth_triedb_common::DiffLayers;
-use crate::consensus::parlia::VoteAddress;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -431,7 +430,7 @@ where
         // Sinks transport current_validators / turn_length from the builder so that
         // pick_best_payload() can write to VALIDATOR_CACHE / TURN_LENGTH_CACHE with the
         // definitive block hash after finalize_new_header() runs.
-        let bid_validator_cache_sink: Arc<Mutex<Option<(Vec<Address>, Vec<VoteAddress>)>>> =
+        let bid_validator_cache_sink: ValidatorCacheSink =
             Arc::new(Mutex::new(None));
         let bid_turn_length_sink: Arc<Mutex<Option<u8>>> = Arc::new(Mutex::new(None));
 

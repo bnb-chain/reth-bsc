@@ -37,6 +37,11 @@ use revm::{
 };
 use std::{borrow::Cow, cell::RefCell, convert::Infallible, rc::Rc, sync::{Arc, Mutex}};
 
+/// Shared sink type for transporting `(current_validators, vote_addresses)` from the builder to
+/// the payload/bid layer so that VALIDATOR_CACHE can be written after the definitive block hash
+/// is known.
+pub type ValidatorCacheSink = Arc<Mutex<Option<(Vec<Address>, Vec<VoteAddress>)>>>;
+
 /// BSC wrapper around [`NextBlockEnvAttributes`].
 ///
 /// Extends the upstream attributes with TrieDB-specific context for the miner:
@@ -58,7 +63,7 @@ pub struct BscNextBlockEnvAttributes {
     pub triedb_prefetcher: Option<crate::node::evm::MinerTrieDbPrefetcher>,
     /// Sink for transporting `current_validators` from builder to payload layer without writing
     /// to VALIDATOR_CACHE prematurely (hash not yet final at build time).
-    pub validator_cache_sink: Option<Arc<Mutex<Option<(Vec<Address>, Vec<VoteAddress>)>>>>,
+    pub validator_cache_sink: Option<ValidatorCacheSink>,
     /// Sink for transporting `turn_length` from builder to payload layer without writing to
     /// TURN_LENGTH_CACHE prematurely.
     pub turn_length_sink: Option<Arc<Mutex<Option<u8>>>>,
@@ -125,7 +130,7 @@ pub struct BscBlockExecutionCtx<'a> {
     pub triedb_prefetcher: Option<crate::node::evm::MinerTrieDbPrefetcher>,
     /// Sink for `current_validators` — written by builder in `finish_with_difflayer()` and
     /// read by payload layer after the builder is consumed.  `None` for non-miner paths.
-    pub validator_cache_sink: Option<Arc<Mutex<Option<(Vec<Address>, Vec<VoteAddress>)>>>>,
+    pub validator_cache_sink: Option<ValidatorCacheSink>,
     /// Sink for `turn_length` — same lifecycle as `validator_cache_sink`.
     pub turn_length_sink: Option<Arc<Mutex<Option<u8>>>>,
 }
