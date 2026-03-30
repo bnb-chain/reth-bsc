@@ -3,7 +3,7 @@ use crate::bench::db_init;
 use crate::bench::report::BlockTiming;
 use crate::bench::tx_gen;
 use crate::bench::validator_setup;
-use crate::node::evm::config::BscEvmConfig;
+use crate::node::evm::config::{BscEvmConfig, BscNextBlockEnvAttributes};
 use crate::node::evm::util::insert_header_to_cache;
 use crate::node::miner::bsc_miner::MiningContext;
 use crate::node::miner::signer::init_global_signer;
@@ -162,7 +162,7 @@ pub fn run_benchmark(config: BenchConfig) -> eyre::Result<Vec<BlockTiming>> {
         let attributes = prepare_new_attributes(
             &mut mining_ctx,
             init.parlia.clone(),
-            parent_header.header(),
+            &parent_header,
             validator_addr,
         );
 
@@ -193,14 +193,20 @@ pub fn run_benchmark(config: BenchConfig) -> eyre::Result<Vec<BlockTiming>> {
             .builder_for_next_block(
                 &mut db,
                 &parent_header,
-                NextBlockEnvAttributes {
-                    timestamp: attributes.timestamp(),
-                    suggested_fee_recipient: attributes.suggested_fee_recipient(),
-                    prev_randao: attributes.prev_randao(),
-                    gas_limit: parent_header.gas_limit,
-                    parent_beacon_block_root: attributes.parent_beacon_block_root(),
-                    withdrawals: Some(attributes.withdrawals().clone()),
-                    extra_data: Default::default(),
+                BscNextBlockEnvAttributes {
+                    inner: NextBlockEnvAttributes {
+                        timestamp: attributes.timestamp(),
+                        suggested_fee_recipient: attributes.suggested_fee_recipient(),
+                        prev_randao: attributes.prev_randao(),
+                        gas_limit: parent_header.gas_limit,
+                        parent_beacon_block_root: attributes.parent_beacon_block_root(),
+                        withdrawals: Some(attributes.withdrawals().clone()),
+                        extra_data: Default::default(),
+                    },
+                    parent_difflayers: None,
+                    triedb_prefetcher: None,
+                    validator_cache_sink: None,
+                    turn_length_sink: None,
                 },
             )
             .map_err(|e| {

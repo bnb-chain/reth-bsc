@@ -199,9 +199,6 @@ pub struct BscMinerMetrics {
     /// Total number of times a rebuild was skipped because the remaining budget was too small.
     pub payload_rebuild_skipped_total: Counter,
 
-    /// Total number of times no payload candidate was available when the job tried to submit.
-    pub no_best_payload_total: Counter,
-
     /// Block broadcast delay in nanoseconds (time from block timestamp to broadcast time)
     /// This measures how long it takes from block creation to network broadcast
     /// Note: Value is stored in nanoseconds to match Golang implementation

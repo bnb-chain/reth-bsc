@@ -743,12 +743,7 @@ where
 
         let start_time = std::time::Instant::now();
         self.running_job_handle = Some(job_handle);
-        self.payload_job_join_set.spawn(async move {
-            payload_job
-                .start()
-                .await
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e })
-        });
+        self.payload_job_join_set.spawn(async move { payload_job.start().await });
         debug!("Succeed to async start payload job, cost_time: {:?}, block_number: {}, parent_hash: 0x{:x}",
             start_time.elapsed(), block_number, parent_hash);
 

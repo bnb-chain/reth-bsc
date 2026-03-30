@@ -7,7 +7,6 @@ use crate::{
         miner::{BscMiner, MiningConfig},
     },
 };
-use crate::BscBlock;
 use crate::consensus::parlia::VoteAddress;
 use alloy_primitives::Address;
 use alloy_eips::eip7685::Requests;

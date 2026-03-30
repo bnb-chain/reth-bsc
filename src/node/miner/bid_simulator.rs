@@ -27,7 +27,6 @@ use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
 use reth_execution_types::BlockExecutionOutput;
 use reth_payload_primitives::PayloadBuilderAttributes;
 use reth_payload_primitives::{BuiltPayloadExecutedBlock, PayloadBuilderError};
-use either::Either;
 use revm_context_interface::Block as EvmBlock;
 use reth_primitives::SealedHeader;
 use reth_primitives::TransactionSigned;
