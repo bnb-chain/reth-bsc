@@ -181,11 +181,32 @@ where
                         Outcome { peer: peer_id, result: Ok(BlockValidation::ValidBlock { block }) }
                             .into()
                     }
-                    PayloadStatusEnum::Invalid { validation_error } => Outcome {
-                        peer: peer_id,
-                        result: Err(BlockImportError::Other(validation_error.into())),
+                    PayloadStatusEnum::Invalid { validation_error } => {
+                        // Do NOT penalize the peer for Invalid blocks.
+                        //
+                        // In BSC's PoSA with devp2p block propagation, Invalid
+                        // frequently results from timing issues during concurrent
+                        // reorgs — the block itself is legitimate but was executed
+                        // against the wrong state. Penalizing the peer with BadBlock
+                        // (-16384 reputation) for this drains peers rapidly,
+                        // especially under BSC's fast block time (0.45s), where
+                        // concurrent forks are routine.
+                        //
+                        // This aligns with geth's behavior: geth's fetcher only
+                        // drops a peer when header verification fails
+                        // (verifyHeader), never when block execution fails
+                        // (insertChain). Truly malicious peers are still caught by
+                        // the network layer's BadMessage / BadProtocol penalties.
+                        tracing::debug!(
+                            target: "bsc::block_import",
+                            block_hash = %header.hash_slow(),
+                            block_number = header.number,
+                            %validation_error,
+                            peer = %peer_id,
+                            "New payload returned Invalid - not penalizing peer"
+                        );
+                        None
                     }
-                    .into(),
                     PayloadStatusEnum::Syncing => {
                         // When new_payload returns Syncing status, we need to manually trigger FCU
                         // to avoid the engine-tree being stuck in syncing state without any driver.
@@ -575,18 +596,40 @@ mod tests {
 
     #[tokio::test]
     async fn can_handle_invalid_new_payload() {
+        // When new_payload returns Invalid, the peer should NOT be penalized.
+        // The only event emitted is the early ValidHeader announcement from
+        // on_new_block; no BlockImportOutcome error should follow.
         let mut fixture = TestFixture::new(EngineResponses::invalid_new_payload()).await;
         fixture
             .assert_block_import(|outcome| {
-                matches!(
-                    outcome,
-                    BlockImportEvent::Outcome(BlockImportOutcome {
-                        peer: _,
-                        result: Err(BlockImportError::Other(_))
-                    })
-                )
+                matches!(outcome, BlockImportEvent::Announcement(BlockValidation::ValidHeader { .. }))
             })
             .await;
+
+        // Verify no error outcome was emitted
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut extra = Vec::new();
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(200);
+        loop {
+            match fixture.handle.poll_outcome(&mut cx) {
+                Poll::Ready(Some(event)) => extra.push(event),
+                Poll::Ready(None) => break,
+                Poll::Pending => {
+                    if tokio::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+        assert!(
+            !extra.iter().any(|e| matches!(
+                e,
+                BlockImportEvent::Outcome(BlockImportOutcome { result: Err(_), .. })
+            )),
+            "Should not penalize peer for Invalid new_payload. Extra events: {extra:?}"
+        );
     }
 
     #[tokio::test]
