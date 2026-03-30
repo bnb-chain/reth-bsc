@@ -754,8 +754,23 @@ where
         }
 
         // get justified number and hash from parent snapshot
-        let (justified_number, justified_hash) =
+        let (mut justified_number, mut justified_hash) =
             (parent_snap.vote_data.target_number, parent_snap.vote_data.target_hash);
+
+        // If justified_hash is zero, no attestation has been produced yet.
+        // Fall back to genesis as the source, matching geth's behaviour:
+        // ref: https://github.com/bnb-chain/bsc/blob/583cfec3ea811fb124e6812aabd190555d5aeabc/consensus/parlia/parlia.go#L2161
+        if justified_hash == B256::ZERO {
+            match crate::shared::get_canonical_header_by_number(0) {
+                Some(genesis) => {
+                    justified_number = genesis.number;
+                    justified_hash = genesis.hash_slow();
+                }
+                None => {
+                    return Err(ParliaConsensusError::HeaderNotFound { block_hash: B256::ZERO });
+                }
+            }
+        }
         let mut times = 1;
         if self
             .spec
