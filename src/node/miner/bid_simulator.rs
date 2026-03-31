@@ -452,6 +452,7 @@ where
                     triedb_prefetcher,
                     validator_cache_sink: Some(bid_validator_cache_sink.clone()),
                     turn_length_sink: Some(bid_turn_length_sink.clone()),
+                    precomputed_storage_sink: None,
                 },
             )
             .map_err(PayloadBuilderError::other)

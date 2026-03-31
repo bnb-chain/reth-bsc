@@ -6,7 +6,7 @@ use crate::evm::blacklist;
 use crate::hardforks::BscHardforks;
 use crate::metrics::{BscConsensusMetrics, BscMinerMetrics};
 use crate::node::engine::{BscBuiltPayload, BuildKind};
-use crate::node::evm::config::{BscEvmConfig, BscNextBlockEnvAttributes, ValidatorCacheSink};
+use crate::node::evm::config::{BscEvmConfig, BscNextBlockEnvAttributes, PrecomputedStorageSink, ValidatorCacheSink};
 use crate::node::evm::pre_execution::{TURN_LENGTH_CACHE, VALIDATOR_CACHE};
 use crate::node::evm::{request_difflayer, MinerTrieDbPrefetcher};
 use crate::node::miner::bid_simulator::BidSimulator;
@@ -374,12 +374,31 @@ where
             MinerTrieDbPrefetcher::new(parent_header.state_root(), path_db, Some(difflayers)).ok()
         });
 
+        // Create streaming storage trie updater for pipelined state root.
+        let streaming_updater = if rust_eth_triedb::triedb_manager::is_triedb_active() {
+            triedb_parent_difflayers.as_ref().and_then(|difflayers| {
+                let mut triedb = get_global_triedb();
+                let path_db = triedb.get_mut_path_db_ref().clone();
+                drop(triedb); // release global lock ASAP
+                Some(rust_eth_triedb::StreamingTrieUpdater::new(
+                    parent_header.state_root(),
+                    path_db,
+                    Some(difflayers.clone()),
+                    None, // prefetcher state not available yet at this point
+                ))
+            })
+        } else {
+            None
+        };
+        let streaming_sender = streaming_updater.as_ref().map(|u| u.sender());
+
         // Sinks transport current_validators / turn_length from the builder (which is consumed by
         // finish_with_difflayer) back to this layer so they can be written to cache after
         // finalize_new_header() assigns the definitive block hash.
         let validator_cache_sink: ValidatorCacheSink =
             Arc::new(Mutex::new(None));
         let turn_length_sink: Arc<Mutex<Option<u8>>> = Arc::new(Mutex::new(None));
+        let precomputed_storage_sink = PrecomputedStorageSink::default();
 
         let next_env_attributes = BscNextBlockEnvAttributes {
             inner: NextBlockEnvAttributes {
@@ -395,6 +414,7 @@ where
             triedb_prefetcher: triedb_prefetcher.clone(),
             validator_cache_sink: Some(validator_cache_sink.clone()),
             turn_length_sink: Some(turn_length_sink.clone()),
+            precomputed_storage_sink: Some(precomputed_storage_sink.clone()),
         };
 
         let mut builder = self
@@ -402,23 +422,52 @@ where
             .builder_for_next_block(&mut db, &parent_header, next_env_attributes)
             .map_err(PayloadBuilderError::other)?;
 
-        // Wire miner triedb prefetcher via state hook (if enabled).
-        //
-        // NOTE: This must be set before `apply_pre_execution_changes()` so any state access/touches
-        // performed during pre-execution are also prefetched.
-        if let Some(prefetcher) = triedb_prefetcher.clone() {
-            let pf = prefetcher.clone();
-            builder
-                .executor_mut()
-                .set_state_hook(Some(Box::new(move |_, update: &RethEvmState| {
-                    pf.on_state_update(update);
-                })));
-            debug!(
-                target: "payload_builder",
-                trace_id,
-                parent_hash = ?parent_hash,
-                "Started triedb prefetcher for miner payload build"
-            );
+        // Wire state hooks: feed both prefetcher (read-only warm-up) and
+        // streaming storage trie updater (actual trie writes).
+        {
+            let prefetcher_for_hook = triedb_prefetcher.clone();
+            let sender_for_hook = streaming_sender.clone();
+            let has_prefetcher = prefetcher_for_hook.is_some();
+            let has_streaming = sender_for_hook.is_some();
+            if has_prefetcher || has_streaming {
+                builder.executor_mut().set_state_hook(Some(Box::new(
+                    move |_, update: &RethEvmState| {
+                        if let Some(ref pf) = prefetcher_for_hook {
+                            pf.on_state_update(update);
+                        }
+                        if let Some(ref sender) = sender_for_hook {
+                            for (address, account) in update.iter() {
+                                if account.storage.is_empty() {
+                                    continue;
+                                }
+                                let hashed_address = alloy_primitives::keccak256(address.as_slice());
+                                let slots: Vec<_> = account.storage.iter().map(|(key, slot)| {
+                                    let hashed_slot = alloy_primitives::keccak256(
+                                        alloy_primitives::B256::from(*key).as_slice(),
+                                    );
+                                    if slot.present_value.is_zero() {
+                                        (hashed_slot, None)
+                                    } else {
+                                        (hashed_slot, Some(slot.present_value))
+                                    }
+                                }).collect();
+                                let _ = sender.send(rust_eth_triedb::StorageTrieMsg::Update {
+                                    hashed_address,
+                                    slots,
+                                });
+                            }
+                        }
+                    },
+                )));
+                debug!(
+                    target: "payload_builder",
+                    trace_id,
+                    parent_hash = ?parent_hash,
+                    has_prefetcher,
+                    has_streaming,
+                    "Started triedb prefetcher and streaming updater for miner payload build"
+                );
+            }
         }
 
         builder.apply_pre_execution_changes().map_err(|err| {
@@ -743,6 +792,35 @@ where
         }
         let exec_duration = exec_start.elapsed();
 
+        // Finish the streaming updater before finish_with_difflayer.
+        let precomputed_storage = streaming_updater.and_then(|updater| {
+            match updater.finish() {
+                Ok(result) => {
+                    debug!(
+                        target: "payload_builder",
+                        trace_id,
+                        precomputed_accounts = result.storage_roots.len(),
+                        "Streaming storage trie updater finished"
+                    );
+                    Some(result)
+                }
+                Err(e) => {
+                    warn!(
+                        target: "payload_builder",
+                        trace_id,
+                        error = %e,
+                        "Streaming storage trie updater failed, falling back"
+                    );
+                    None
+                }
+            }
+        });
+
+        // Set precomputed storage via the shared sink so finish_with_difflayer can pick it up.
+        if let Some(precomputed) = precomputed_storage {
+            *precomputed_storage_sink.0.lock().unwrap() = Some(precomputed);
+        }
+
         // add system txs to payload.
         let finalize_start = std::time::Instant::now();
         let out = builder.finish_with_difflayer(&state_provider)?;
@@ -874,10 +952,29 @@ where
             MinerTrieDbPrefetcher::new(parent_header.state_root(), path_db, Some(difflayers)).ok()
         });
 
+        // Create streaming storage trie updater for pipelined state root.
+        let streaming_updater = if rust_eth_triedb::triedb_manager::is_triedb_active() {
+            triedb_parent_difflayers.as_ref().and_then(|difflayers| {
+                let mut triedb = get_global_triedb();
+                let path_db = triedb.get_mut_path_db_ref().clone();
+                drop(triedb); // release global lock ASAP
+                Some(rust_eth_triedb::StreamingTrieUpdater::new(
+                    parent_header.state_root(),
+                    path_db,
+                    Some(difflayers.clone()),
+                    None, // prefetcher state not available yet at this point
+                ))
+            })
+        } else {
+            None
+        };
+        let streaming_sender = streaming_updater.as_ref().map(|u| u.sender());
+
         // Sinks for empty-payload builds (same delayed-seal mechanism as normal builds).
         let validator_cache_sink: ValidatorCacheSink =
             Arc::new(Mutex::new(None));
         let turn_length_sink: Arc<Mutex<Option<u8>>> = Arc::new(Mutex::new(None));
+        let precomputed_storage_sink = PrecomputedStorageSink::default();
 
         let mut builder = self
             .evm_config
@@ -898,27 +995,57 @@ where
                     triedb_prefetcher: triedb_prefetcher.clone(),
                     validator_cache_sink: Some(validator_cache_sink.clone()),
                     turn_length_sink: Some(turn_length_sink.clone()),
+                    precomputed_storage_sink: Some(precomputed_storage_sink.clone()),
                 },
             )
             .map_err(PayloadBuilderError::other)?;
 
-        // Wire miner triedb prefetcher via state hook (if enabled).
-        //
-        // NOTE: This must be set before `apply_pre_execution_changes()` so any state access/touches
-        // performed during pre-execution are also prefetched.
-        if let Some(prefetcher) = triedb_prefetcher.clone() {
-            let pf = prefetcher.clone();
-            builder
-                .executor_mut()
-                .set_state_hook(Some(Box::new(move |_, update: &RethEvmState| {
-                    pf.on_state_update(update);
-                })));
-            debug!(
-                target: "payload_builder",
-                trace_id,
-                parent_hash = ?parent_hash,
-                "Started triedb prefetcher for miner empty payload build"
-            );
+        // Wire state hooks: feed both prefetcher (read-only warm-up) and
+        // streaming storage trie updater (actual trie writes).
+        {
+            let prefetcher_for_hook = triedb_prefetcher.clone();
+            let sender_for_hook = streaming_sender.clone();
+            let has_prefetcher = prefetcher_for_hook.is_some();
+            let has_streaming = sender_for_hook.is_some();
+            if has_prefetcher || has_streaming {
+                builder.executor_mut().set_state_hook(Some(Box::new(
+                    move |_, update: &RethEvmState| {
+                        if let Some(ref pf) = prefetcher_for_hook {
+                            pf.on_state_update(update);
+                        }
+                        if let Some(ref sender) = sender_for_hook {
+                            for (address, account) in update.iter() {
+                                if account.storage.is_empty() {
+                                    continue;
+                                }
+                                let hashed_address = alloy_primitives::keccak256(address.as_slice());
+                                let slots: Vec<_> = account.storage.iter().map(|(key, slot)| {
+                                    let hashed_slot = alloy_primitives::keccak256(
+                                        alloy_primitives::B256::from(*key).as_slice(),
+                                    );
+                                    if slot.present_value.is_zero() {
+                                        (hashed_slot, None)
+                                    } else {
+                                        (hashed_slot, Some(slot.present_value))
+                                    }
+                                }).collect();
+                                let _ = sender.send(rust_eth_triedb::StorageTrieMsg::Update {
+                                    hashed_address,
+                                    slots,
+                                });
+                            }
+                        }
+                    },
+                )));
+                debug!(
+                    target: "payload_builder",
+                    trace_id,
+                    parent_hash = ?parent_hash,
+                    has_prefetcher,
+                    has_streaming,
+                    "Started triedb prefetcher and streaming updater for miner empty payload build"
+                );
+            }
         }
 
         // Total time spent executing pre-execution changes (no user txs for empty payloads).
@@ -939,6 +1066,35 @@ where
         // No user transactions - only system transactions will be added by finish()
         let total_fees = U256::ZERO;
         let cumulative_gas_used = 0;
+
+        // Finish the streaming updater before finish_with_difflayer.
+        let precomputed_storage = streaming_updater.and_then(|updater| {
+            match updater.finish() {
+                Ok(result) => {
+                    debug!(
+                        target: "payload_builder",
+                        trace_id,
+                        precomputed_accounts = result.storage_roots.len(),
+                        "Streaming storage trie updater finished (empty payload)"
+                    );
+                    Some(result)
+                }
+                Err(e) => {
+                    warn!(
+                        target: "payload_builder",
+                        trace_id,
+                        error = %e,
+                        "Streaming storage trie updater failed (empty payload), falling back"
+                    );
+                    None
+                }
+            }
+        });
+
+        // Set precomputed storage via the shared sink so finish_with_difflayer can pick it up.
+        if let Some(precomputed) = precomputed_storage {
+            *precomputed_storage_sink.0.lock().unwrap() = Some(precomputed);
+        }
 
         // Add system txs to payload and finalize
         let finalize_start = std::time::Instant::now();

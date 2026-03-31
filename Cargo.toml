@@ -112,6 +112,7 @@ jsonrpsee-core = { version = "0.26.0", features = ["server"] }
 jsonrpsee-types = "0.26.0"
 
 # misc dependencies
+crossbeam-channel = "0.5"
 auto_impl = "1"
 async-trait = "0.1"
 bytes = "1.5"

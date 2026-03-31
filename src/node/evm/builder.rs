@@ -149,14 +149,35 @@ where
             let difflayers_opt = self.ctx.parent_difflayers.as_ref();
 
             let triedb_calc_started = std::time::Instant::now();
-            let (new_root, new_difflayer) = triedb
-                .intermediate_and_commit_hashed_post_state(
-                    parent_state_root,
-                    difflayers_opt,
-                    &trie_hashed_state,
-                    prefetch_state,
-                )
-                .map_err(BlockExecutionError::other)?;
+
+            // Fast path: use pre-computed storage tries from StreamingTrieUpdater.
+            let precomputed = self.ctx.precomputed_storage_sink.as_ref().and_then(|sink| sink.0.lock().unwrap().take());
+            let (new_root, new_difflayer) = if let Some(precomputed) = precomputed {
+                tracing::debug!(
+                    target: "bsc::builder",
+                    precomputed_accounts = precomputed.storage_roots.len(),
+                    "Using streaming precomputed storage for state root"
+                );
+                triedb
+                    .commit_with_precomputed_storage(
+                        parent_state_root,
+                        difflayers_opt,
+                        &trie_hashed_state,
+                        prefetch_state,
+                        precomputed,
+                    )
+                    .map_err(BlockExecutionError::other)?
+            } else {
+                // Standard path: compute everything from scratch.
+                triedb
+                    .intermediate_and_commit_hashed_post_state(
+                        parent_state_root,
+                        difflayers_opt,
+                        &trie_hashed_state,
+                        prefetch_state,
+                    )
+                    .map_err(BlockExecutionError::other)?
+            };
             let triedb_calc_with_prefetch_ms = triedb_calc_started.elapsed().as_millis();
 
             tracing::debug!(

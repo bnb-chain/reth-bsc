@@ -10164,6 +10164,7 @@ dependencies = [
  "cometbft-light-client",
  "cometbft-light-client-verifier",
  "cometbft-proto",
+ "crossbeam-channel",
  "ctr",
  "derive_more 0.99.20",
  "either",

@@ -35,12 +35,34 @@ use revm::{
     primitives::hardfork::SpecId,
     Inspector,
 };
+use rust_eth_triedb_pathdb::PathDB;
 use std::{borrow::Cow, cell::RefCell, convert::Infallible, rc::Rc, sync::{Arc, Mutex}};
 
 /// Shared sink type for transporting `(current_validators, vote_addresses)` from the builder to
 /// the payload/bid layer so that VALIDATOR_CACHE can be written after the definitive block hash
 /// is known.
 pub type ValidatorCacheSink = Arc<Mutex<Option<(Vec<Address>, Vec<VoteAddress>)>>>;
+
+/// Sender for streaming storage trie updates during block building.
+pub type StorageTrieMsgSender = crossbeam_channel::Sender<rust_eth_triedb::StorageTrieMsg>;
+
+/// Shared sink for passing pre-computed storage trie results from the payload layer into the
+/// builder's `finish_with_difflayer`. The payload code sets the `Option` to `Some(...)` just
+/// before `finish_with_difflayer` is called; the builder takes it inside the triedb path.
+///
+/// Wrapped in a newtype because `PrecomputedStorageResult` does not implement `Debug` / `Clone`,
+/// and the outer structs derive those traits.
+#[derive(Clone, Default)]
+pub struct PrecomputedStorageSink(pub Arc<Mutex<Option<rust_eth_triedb::PrecomputedStorageResult<PathDB>>>>);
+
+impl std::fmt::Debug for PrecomputedStorageSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let has_value = self.0.lock().ok().map_or(false, |g| g.is_some());
+        f.debug_tuple("PrecomputedStorageSink")
+            .field(&has_value)
+            .finish()
+    }
+}
 
 /// BSC wrapper around [`NextBlockEnvAttributes`].
 ///
@@ -67,6 +89,8 @@ pub struct BscNextBlockEnvAttributes {
     /// Sink for transporting `turn_length` from builder to payload layer without writing to
     /// TURN_LENGTH_CACHE prematurely.
     pub turn_length_sink: Option<Arc<Mutex<Option<u8>>>>,
+    /// Shared sink for passing pre-computed storage trie results into the builder.
+    pub precomputed_storage_sink: Option<PrecomputedStorageSink>,
 }
 
 impl<H: BlockHeader> BuildPendingEnv<H> for BscNextBlockEnvAttributes {
@@ -77,6 +101,7 @@ impl<H: BlockHeader> BuildPendingEnv<H> for BscNextBlockEnvAttributes {
             triedb_prefetcher: None,
             validator_cache_sink: None,
             turn_length_sink: None,
+            precomputed_storage_sink: None,
         }
     }
 }
@@ -133,6 +158,11 @@ pub struct BscBlockExecutionCtx<'a> {
     pub validator_cache_sink: Option<ValidatorCacheSink>,
     /// Sink for `turn_length` — same lifecycle as `validator_cache_sink`.
     pub turn_length_sink: Option<Arc<Mutex<Option<u8>>>>,
+    /// Shared sink for pre-computed storage trie results from the streaming updater.
+    /// The payload layer sets this to `Some(...)` before `finish_with_difflayer`; the builder
+    /// takes it inside the triedb path. Using a shared `Arc<Mutex>` avoids needing direct
+    /// field access on the opaque `impl BlockBuilder` return type.
+    pub precomputed_storage_sink: Option<PrecomputedStorageSink>,
 }
 
 impl<'a> BscBlockExecutionCtx<'a> {
@@ -433,6 +463,7 @@ where
             triedb_prefetcher: None,
             validator_cache_sink: None,
             turn_length_sink: None,
+            precomputed_storage_sink: None,
         })
     }
 
@@ -458,6 +489,7 @@ where
             triedb_prefetcher: attributes.triedb_prefetcher,
             validator_cache_sink: attributes.validator_cache_sink,
             turn_length_sink: attributes.turn_length_sink,
+            precomputed_storage_sink: attributes.precomputed_storage_sink,
         })
     }
 
@@ -532,6 +564,7 @@ where
             triedb_prefetcher: None,
             validator_cache_sink: None,
             turn_length_sink: None,
+            precomputed_storage_sink: None,
         })
     }
 
