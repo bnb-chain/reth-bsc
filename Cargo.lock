@@ -968,7 +968,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -979,7 +979,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1582,7 +1582,7 @@ dependencies = [
  "bitflags 2.11.0",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools 0.12.1",
  "proc-macro2",
  "quote",
  "regex",
@@ -1600,7 +1600,7 @@ dependencies = [
  "bitflags 2.11.0",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools 0.12.1",
  "proc-macro2",
  "quote",
  "regex",
@@ -3181,7 +3181,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3498,7 +3498,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4534,7 +4534,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -5803,7 +5803,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6936,7 +6936,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls 0.23.37",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -6973,7 +6973,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -8628,7 +8628,7 @@ dependencies = [
 [[package]]
 name = "reth-metrics"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git?branch=develop#798291c9041a5401ef8b94cb3ce6c41cf3e86d3c"
+source = "git+https://github.com/bnb-chain/reth.git?tag=v0.0.8#b02940f65fe1e12a4224452c7cdfaa9e56ce8f0f"
 dependencies = [
  "futures",
  "metrics",
@@ -8640,7 +8640,7 @@ dependencies = [
 [[package]]
 name = "reth-metrics"
 version = "1.10.2"
-source = "git+https://github.com/bnb-chain/reth.git#b02940f65fe1e12a4224452c7cdfaa9e56ce8f0f"
+source = "git+https://github.com/bnb-chain/reth.git?branch=develop#798291c9041a5401ef8b94cb3ce6c41cf3e86d3c"
 dependencies = [
  "futures",
  "metrics",
@@ -10639,14 +10639,14 @@ checksum = "48fd7bd8a6377e15ad9d42a8ec25371b94ddc67abe7c8b9127bec79bebaaae18"
 [[package]]
 name = "rust-eth-triedb"
 version = "0.1.0"
-source = "git+https://github.com/bnb-chain/reth-bsc-triedb.git?branch=develop#cc5c8e2322329df69f65f2d689d8cd98baa2228e"
 dependencies = [
  "alloy-primitives",
  "alloy-trie",
+ "crossbeam-channel",
  "metrics",
  "once_cell",
  "rayon",
- "reth-metrics 1.10.2 (git+https://github.com/bnb-chain/reth.git)",
+ "reth-metrics 1.10.2 (git+https://github.com/bnb-chain/reth.git?tag=v0.0.8)",
  "rust-eth-triedb-common",
  "rust-eth-triedb-pathdb",
  "rust-eth-triedb-state-trie",
@@ -10660,7 +10660,6 @@ dependencies = [
 [[package]]
 name = "rust-eth-triedb-common"
 version = "0.1.0"
-source = "git+https://github.com/bnb-chain/reth-bsc-triedb.git?branch=develop#cc5c8e2322329df69f65f2d689d8cd98baa2228e"
 dependencies = [
  "alloy-primitives",
  "auto_impl",
@@ -10671,13 +10670,12 @@ dependencies = [
 [[package]]
 name = "rust-eth-triedb-pathdb"
 version = "0.1.0"
-source = "git+https://github.com/bnb-chain/reth-bsc-triedb.git?branch=develop#cc5c8e2322329df69f65f2d689d8cd98baa2228e"
 dependencies = [
  "alloy-primitives",
  "alloy-trie",
  "metrics",
  "mini-moka",
- "reth-metrics 1.10.2 (git+https://github.com/bnb-chain/reth.git)",
+ "reth-metrics 1.10.2 (git+https://github.com/bnb-chain/reth.git?tag=v0.0.8)",
  "rocksdb",
  "rust-eth-triedb-common",
  "schnellru",
@@ -10690,7 +10688,6 @@ dependencies = [
 [[package]]
 name = "rust-eth-triedb-state-trie"
 version = "0.1.0"
-source = "git+https://github.com/bnb-chain/reth-bsc-triedb.git?branch=develop#cc5c8e2322329df69f65f2d689d8cd98baa2228e"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -10777,7 +10774,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -11560,7 +11557,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -11816,7 +11813,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -13032,7 +13029,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
