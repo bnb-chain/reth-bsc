@@ -40,7 +40,8 @@ fn resolve_epoch_validators(
     if parent_snap.validators.is_empty() {
         return Err(SignerError::SigningFailed(format!(
             "Missing epoch validators for parent block {} ({})",
-            parent_header.number(), parent_hash
+            parent_header.number(),
+            parent_hash
         )));
     }
 
@@ -186,9 +187,12 @@ where
         .prepare_turn_length(parent_snap, new_header)
         .map_err(|e| SignerError::SigningFailed(format!("Failed to prepare turn length: {}", e)))?;
 
-    if let Err(e) =
-        parlia.assemble_vote_attestation(parent_snap, parent_header.header(), new_header, snapshot_provider)
-    {
+    if let Err(e) = parlia.assemble_vote_attestation(
+        parent_snap,
+        parent_header.header(),
+        new_header,
+        snapshot_provider,
+    ) {
         tracing::warn!(
             target: "bsc::miner",
             error = %e,
@@ -358,7 +362,8 @@ mod tests {
             Snapshot::new(validators, 499, B256::random(), 500, Some(vote_addresses.clone()));
 
         let resolved =
-            resolve_epoch_validators(&parent_snap, &SealedHeader::seal_slow(parent_header)).unwrap();
+            resolve_epoch_validators(&parent_snap, &SealedHeader::seal_slow(parent_header))
+                .unwrap();
 
         assert_eq!(resolved.0, parent_snap.validators);
         assert_eq!(resolved.1.len(), parent_snap.validators.len());
@@ -388,7 +393,8 @@ mod tests {
         let parent_snap =
             Snapshot::new(vec![Address::with_last_byte(1)], 799, B256::random(), 500, None);
         let resolved =
-            resolve_epoch_validators(&parent_snap, &SealedHeader::seal_slow(parent_header)).unwrap();
+            resolve_epoch_validators(&parent_snap, &SealedHeader::seal_slow(parent_header))
+                .unwrap();
 
         assert_eq!(resolved.0, cached_validators);
         assert_eq!(resolved.1, cached_vote_addresses);
@@ -399,9 +405,8 @@ mod tests {
         let parent_header = unique_parent_header(999);
         let parent_snap = Snapshot::default();
 
-        let err =
-            resolve_epoch_validators(&parent_snap, &SealedHeader::seal_slow(parent_header))
-                .unwrap_err();
+        let err = resolve_epoch_validators(&parent_snap, &SealedHeader::seal_slow(parent_header))
+            .unwrap_err();
         match err {
             SignerError::SigningFailed(msg) => {
                 assert!(msg.contains("Missing epoch validators"), "unexpected message: {}", msg);
@@ -465,22 +470,14 @@ mod tests {
         let mut extra = vec![0u8; EXTRA_VANITY_LEN];
         extra.extend_from_slice(alloy_rlp::encode(&att).as_ref());
         extra.extend_from_slice(&[0u8; EXTRA_SEAL_LEN]);
-        Header {
-            number,
-            extra_data: alloy_primitives::Bytes::from(extra),
-            ..Default::default()
-        }
+        Header { number, extra_data: alloy_primitives::Bytes::from(extra), ..Default::default() }
     }
 
     /// Build a non-epoch header with no attestation (just vanity + seal).
     fn header_without_attestation(number: u64) -> Header {
         let mut extra = vec![0u8; EXTRA_VANITY_LEN];
         extra.extend_from_slice(&[0u8; EXTRA_SEAL_LEN]);
-        Header {
-            number,
-            extra_data: alloy_primitives::Bytes::from(extra),
-            ..Default::default()
-        }
+        Header { number, extra_data: alloy_primitives::Bytes::from(extra), ..Default::default() }
     }
 
     #[test]
@@ -490,20 +487,14 @@ mod tests {
         let chain_spec = Arc::new(BscChainSpec::from(ChainSpecBuilder::mainnet().build()));
         let parlia = Arc::new(Parlia::new(chain_spec, 200));
 
-        let parent_snap = Snapshot::new(
-            vec![Address::with_last_byte(1)],
-            0,
-            B256::random(),
-            200,
-            None,
-        );
+        let parent_snap =
+            Snapshot::new(vec![Address::with_last_byte(1)], 0, B256::random(), 200, None);
         let parent_header = unique_parent_header(0);
         let mut header = header_without_attestation(1);
         let original_extra = header.extra_data.clone();
 
-        let sp: Arc<dyn SnapshotProvider + Send + Sync> = Arc::new(MockSnapshotProvider {
-            snapshot: parent_snap.clone(),
-        });
+        let sp: Arc<dyn SnapshotProvider + Send + Sync> =
+            Arc::new(MockSnapshotProvider { snapshot: parent_snap.clone() });
 
         let result = refresh_vote_attestation_and_seal(
             parlia,
@@ -528,21 +519,15 @@ mod tests {
         let chain_spec = luban_chain_spec();
         let parlia = Arc::new(Parlia::new(chain_spec, 200));
 
-        let parent_snap = Snapshot::new(
-            vec![Address::with_last_byte(1)],
-            0,
-            B256::random(),
-            200,
-            None,
-        );
+        let parent_snap =
+            Snapshot::new(vec![Address::with_last_byte(1)], 0, B256::random(), 200, None);
         let parent_header = unique_parent_header(0);
         // Block 1: non-epoch, number < 3 so assemble skips → tests pure stripping
         let mut header = header_with_fake_attestation(1);
         let original_extra_len = header.extra_data.len();
 
-        let sp: Arc<dyn SnapshotProvider + Send + Sync> = Arc::new(MockSnapshotProvider {
-            snapshot: parent_snap.clone(),
-        });
+        let sp: Arc<dyn SnapshotProvider + Send + Sync> =
+            Arc::new(MockSnapshotProvider { snapshot: parent_snap.clone() });
 
         let result = refresh_vote_attestation_and_seal(
             parlia,
@@ -574,20 +559,14 @@ mod tests {
         let chain_spec = luban_chain_spec();
         let parlia = Arc::new(Parlia::new(chain_spec, 200));
 
-        let parent_snap = Snapshot::new(
-            vec![Address::with_last_byte(1)],
-            0,
-            B256::random(),
-            200,
-            None,
-        );
+        let parent_snap =
+            Snapshot::new(vec![Address::with_last_byte(1)], 0, B256::random(), 200, None);
         let parent_header = unique_parent_header(0);
         // Block 1, no attestation (vanity + seal only)
         let mut header = header_without_attestation(1);
 
-        let sp: Arc<dyn SnapshotProvider + Send + Sync> = Arc::new(MockSnapshotProvider {
-            snapshot: parent_snap.clone(),
-        });
+        let sp: Arc<dyn SnapshotProvider + Send + Sync> =
+            Arc::new(MockSnapshotProvider { snapshot: parent_snap.clone() });
 
         let result = refresh_vote_attestation_and_seal(
             parlia,
@@ -658,14 +637,12 @@ mod tests {
             ..Default::default()
         };
 
-        let expected_base_len = EXTRA_VANITY_LEN
-            + VALIDATOR_NUMBER_SIZE
-            + 3 * VALIDATOR_BYTES_LEN_AFTER_LUBAN;
+        let expected_base_len =
+            EXTRA_VANITY_LEN + VALIDATOR_NUMBER_SIZE + 3 * VALIDATOR_BYTES_LEN_AFTER_LUBAN;
         let original_extra_len = header.extra_data.len();
 
-        let sp: Arc<dyn SnapshotProvider + Send + Sync> = Arc::new(MockSnapshotProvider {
-            snapshot: parent_snap.clone(),
-        });
+        let sp: Arc<dyn SnapshotProvider + Send + Sync> =
+            Arc::new(MockSnapshotProvider { snapshot: parent_snap.clone() });
 
         let result = refresh_vote_attestation_and_seal(
             parlia,
@@ -696,13 +673,8 @@ mod tests {
         let chain_spec = luban_chain_spec();
         let parlia = Arc::new(Parlia::new(chain_spec, 200));
 
-        let parent_snap = Snapshot::new(
-            vec![Address::with_last_byte(1)],
-            0,
-            B256::random(),
-            200,
-            None,
-        );
+        let parent_snap =
+            Snapshot::new(vec![Address::with_last_byte(1)], 0, B256::random(), 200, None);
         let parent_header = unique_parent_header(0);
         let mut header = Header {
             number: 1,
@@ -711,9 +683,8 @@ mod tests {
         };
         let original_extra = header.extra_data.clone();
 
-        let sp: Arc<dyn SnapshotProvider + Send + Sync> = Arc::new(MockSnapshotProvider {
-            snapshot: parent_snap.clone(),
-        });
+        let sp: Arc<dyn SnapshotProvider + Send + Sync> =
+            Arc::new(MockSnapshotProvider { snapshot: parent_snap.clone() });
 
         let result = refresh_vote_attestation_and_seal(
             parlia,
@@ -734,20 +705,14 @@ mod tests {
         let chain_spec = luban_chain_spec();
         let parlia = Arc::new(Parlia::new(chain_spec.clone(), 200));
 
-        let parent_snap = Snapshot::new(
-            vec![Address::with_last_byte(1)],
-            0,
-            B256::random(),
-            200,
-            None,
-        );
+        let parent_snap =
+            Snapshot::new(vec![Address::with_last_byte(1)], 0, B256::random(), 200, None);
         let parent_header = unique_parent_header(0);
         // Block 1 with fake attestation
         let mut header = header_with_fake_attestation(1);
 
-        let sp: Arc<dyn SnapshotProvider + Send + Sync> = Arc::new(MockSnapshotProvider {
-            snapshot: parent_snap.clone(),
-        });
+        let sp: Arc<dyn SnapshotProvider + Send + Sync> =
+            Arc::new(MockSnapshotProvider { snapshot: parent_snap.clone() });
 
         let result = refresh_vote_attestation_and_seal(
             parlia.clone(),
@@ -776,21 +741,15 @@ mod tests {
         let chain_spec = luban_chain_spec();
         let parlia = Arc::new(Parlia::new(chain_spec, 200));
 
-        let parent_snap = Snapshot::new(
-            vec![Address::with_last_byte(1)],
-            2,
-            B256::random(),
-            200,
-            None,
-        );
+        let parent_snap =
+            Snapshot::new(vec![Address::with_last_byte(1)], 2, B256::random(), 200, None);
         let parent_header = unique_parent_header(2);
         // Block 3: assemble_vote_attestation will fail (no global header provider)
         let mut header = header_with_fake_attestation(3);
         let original_extra = header.extra_data.clone();
 
-        let sp: Arc<dyn SnapshotProvider + Send + Sync> = Arc::new(MockSnapshotProvider {
-            snapshot: parent_snap.clone(),
-        });
+        let sp: Arc<dyn SnapshotProvider + Send + Sync> =
+            Arc::new(MockSnapshotProvider { snapshot: parent_snap.clone() });
 
         let result = refresh_vote_attestation_and_seal(
             parlia,

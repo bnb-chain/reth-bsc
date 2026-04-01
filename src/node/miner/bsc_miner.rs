@@ -1,8 +1,8 @@
 use crate::node::miner::bid_simulator::{BidRuntime, BidSimulator};
 use crate::node::miner::payload::BscBuildArguments;
 use crate::node::miner::speculative::{
-    derive_speculative_child_context, on_canonical_tip, ContextDecision,
-    MiningContextSource, PendingLocalHead, PendingLocalHeadTracker,
+    derive_speculative_child_context, on_canonical_tip, ContextDecision, MiningContextSource,
+    PendingLocalHead, PendingLocalHeadTracker,
 };
 use crate::{
     chainspec::BscChainSpec,
@@ -44,6 +44,7 @@ use reth_provider::{
 };
 use reth_revm::cancelled::ManualCancel;
 use reth_tasks::TaskExecutor;
+use rust_eth_triedb_common::DiffLayers;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -72,6 +73,8 @@ pub struct MiningContext {
     pub parent_snapshot: Arc<crate::consensus::parlia::snapshot::Snapshot>,
     pub is_inturn: bool,
     pub cached_reads: Option<reth_revm::cached::CachedReads>,
+    /// Parent difflayers to use for triedb root computation.
+    pub parent_difflayers: Option<DiffLayers>,
     pub source: MiningContextSource,
     /// Explicit durable MDBX base for state reads.
     /// `None` means "use the parent hash" which is the canonical path.
@@ -176,8 +179,7 @@ where
         // This is essential for deadlock recovery when all validators restart simultaneously
         // and the sync gate times out — without this ticker, try_new_work would never be
         // re-invoked after the startup attempt.
-        let mut periodic_tick =
-            tokio::time::interval(Duration::from_secs(3));
+        let mut periodic_tick = tokio::time::interval(Duration::from_secs(3));
         periodic_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // Burn the first immediate tick so we don't double-fire with the startup spawn above.
         periodic_tick.tick().await;
@@ -597,6 +599,7 @@ where
             parent_snapshot: Arc::new(parent_snapshot),
             is_inturn,
             cached_reads: self.maybe_pre_cached(parent_hash),
+            parent_difflayers: None,
             source: MiningContextSource::Canonical,
             state_base_hash: None,
             prev_bundle_state: self.maybe_pre_bundle_state(parent_hash),
@@ -607,6 +610,22 @@ where
             error!("Failed to send mining context to queue due to {}", e);
         }
     }
+}
+
+fn merge_parent_difflayers(
+    parent_difflayers: Option<DiffLayers>,
+    difflayer: Option<Arc<rust_eth_triedb_common::DiffLayer>>,
+) -> Option<DiffLayers> {
+    let difflayer = difflayer?;
+    let mut diff_layers = Vec::with_capacity(
+        1 + parent_difflayers.as_ref().map_or(0, |layers| layers.diff_layers.len()),
+    );
+    diff_layers.push(difflayer);
+    if let Some(parent_difflayers) = parent_difflayers {
+        diff_layers.extend(parent_difflayers.diff_layers);
+    }
+
+    Some(DiffLayers { diff_layers })
 }
 
 /// MainWorkWorker responsible for processing mining tasks and block building.
@@ -620,8 +639,7 @@ pub struct MainWorkWorker<Pool, Provider> {
     mining_queue_rx: mpsc::UnboundedReceiver<MiningContext>,
     payload_tx: mpsc::UnboundedSender<SubmitContext>,
     running_job_handle: Option<BscPayloadJobHandle>,
-    payload_job_join_set:
-        JoinSet<Result<(), Box<crate::node::miner::payload::BscPayloadJobError>>>,
+    payload_job_join_set: JoinSet<Result<(), Box<crate::node::miner::payload::BscPayloadJobError>>>,
     simulator: Arc<BidSimulator<Provider, Pool>>, // No outer RwLock, each map has its own lock
     desired_gas_limit: u64,
     desired_min_gas_tip: u128,
@@ -818,7 +836,7 @@ where
             cancel: ManualCancel::default(),
             trace_id: crate::node::miner::payload::generate_trace_id(),
             min_gas_tip: self.desired_min_gas_tip,
-            parent_difflayers: None, // populated once at job start via fetch_triedb_difflayers
+            parent_difflayers: mining_ctx.parent_difflayers.clone(),
             state_base_hash: mining_ctx.state_base_hash,
             prev_bundle_state: mining_ctx.prev_bundle_state.clone(),
         };
@@ -971,7 +989,8 @@ where
         let block_hash = sealed_block.hash();
         let block_number = sealed_block.number();
         let parent_hash = sealed_block.header().parent_hash;
-        let durable_base_hash = mining_ctx.state_base_hash.unwrap_or(mining_ctx.parent_header.hash());
+        let durable_base_hash =
+            mining_ctx.state_base_hash.unwrap_or(mining_ctx.parent_header.hash());
         let best_block_number = self.provider.best_block_number()?;
         if block_number <= best_block_number {
             debug!(
@@ -1093,9 +1112,7 @@ where
         }
 
         // Record payload build timings.
-        MINER_METRICS
-            .block_exec_duration_seconds
-            .record(payload.exec_duration.as_secs_f64());
+        MINER_METRICS.block_exec_duration_seconds.record(payload.exec_duration.as_secs_f64());
         MINER_METRICS
             .block_trie_root_duration_seconds
             .record(payload.trie_root_duration.as_secs_f64());
@@ -1153,42 +1170,41 @@ where
             reth_primitives::SealedHeader::new(sealed_block.header().clone(), block_hash);
         let speculative_next_cached_reads = payload.next_cached_reads.clone();
         let speculative_next_bundle_state = payload.next_bundle_state.clone();
+        let speculative_parent_difflayers = merge_parent_difflayers(
+            mining_ctx.parent_difflayers.clone(),
+            payload.executed_block.difflayer.clone(),
+        );
 
-        let send_result: Result<(), Box<dyn std::error::Error + Send + Sync>> =
-            if self.submit_built_payload {
+        let send_result: Result<(), Box<dyn std::error::Error + Send + Sync>> = if self
+            .submit_built_payload
+        {
             if let Some(sender) = get_block_import_mined_sender() {
                 let incoming: IncomingMinedBlock = (payload, msg);
                 if sender.send(incoming).is_err() {
                     warn!("Failed to send mined block to import service due to channel closed");
-                    Err(
-                        "Failed to send mined block to import service due to channel closed".into(),
-                    )
+                    Err("Failed to send mined block to import service due to channel closed".into())
                 } else {
                     debug!("Succeed to send mined block to import service");
                     Ok(())
                 }
             } else {
                 warn!("Failed to send mined block due to import sender not initialised");
-                Err(
-                    "Failed to send mined block due to import sender not initialised".into()
-                )
+                Err("Failed to send mined block due to import sender not initialised".into())
             }
         } else if let Some(sender) = get_block_import_sender() {
             let peer_id = get_local_peer_id_or_default();
             let incoming: IncomingBlock = (msg, peer_id);
             if sender.send(incoming).is_err() {
                 warn!("Failed to send built block to import service due to channel closed");
-                Err(
-                    "Failed to send built block to import service due to channel closed".into()
-                )
+                Err("Failed to send built block to import service due to channel closed".into())
             } else {
                 debug!("Succeed to send built block to import service");
                 Ok(())
             }
-            } else {
-                warn!("Failed to send built block due to import sender not initialised");
-                Err("Failed to send built block due to import sender not initialised".into())
-            };
+        } else {
+            warn!("Failed to send built block due to import sender not initialised");
+            Err("Failed to send built block due to import sender not initialised".into())
+        };
 
         send_result?;
 
@@ -1212,7 +1228,8 @@ where
             if let (Some(cached_reads), Some(prev_bundle_state)) =
                 (speculative_next_cached_reads, speculative_next_bundle_state)
             {
-                if let Some(parent_snapshot) = self.snapshot_provider.snapshot_by_hash(&block_hash) {
+                if let Some(parent_snapshot) = self.snapshot_provider.snapshot_by_hash(&block_hash)
+                {
                     let can_spawn_child = {
                         let pending_local_head =
                             crate::shared::lock_or_recover(&*self.pending_local_head);
@@ -1228,6 +1245,7 @@ where
                             Arc::new(parent_snapshot.clone()),
                             parent_snapshot.is_inturn(self.validator_address),
                             Some(cached_reads),
+                            speculative_parent_difflayers.clone(),
                             durable_base_hash,
                             Some(prev_bundle_state),
                         );
@@ -1243,6 +1261,41 @@ where
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::merge_parent_difflayers;
+    use alloy_primitives::B256;
+    use rust_eth_triedb_common::{DiffLayer, DiffLayers};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    #[test]
+    fn merge_parent_difflayers_keeps_executed_layer_first() {
+        let oldest = Arc::new(DiffLayer::new(
+            Arc::new(HashMap::new()),
+            Arc::new(HashMap::from([(B256::with_last_byte(1), B256::with_last_byte(11))])),
+        ));
+        let newer = Arc::new(DiffLayer::new(
+            Arc::new(HashMap::new()),
+            Arc::new(HashMap::from([(B256::with_last_byte(2), B256::with_last_byte(22))])),
+        ));
+        let newest = Arc::new(DiffLayer::new(
+            Arc::new(HashMap::new()),
+            Arc::new(HashMap::from([(B256::with_last_byte(3), B256::with_last_byte(33))])),
+        ));
+
+        let wrapped = merge_parent_difflayers(
+            Some(DiffLayers { diff_layers: vec![newer.clone(), oldest.clone()] }),
+            Some(newest.clone()),
+        );
+
+        assert_eq!(
+            wrapped,
+            Some(DiffLayers { diff_layers: vec![newest, newer, oldest] })
+        );
     }
 }
 

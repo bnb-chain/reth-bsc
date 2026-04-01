@@ -791,9 +791,9 @@ where
         for _ in 0..times {
             let parent_hash = target_header.parent_hash();
             let target_hash = target_header.hash_slow();
-            let snap = snapshot_provider.snapshot_by_hash(&parent_hash).ok_or(
-                ParliaConsensusError::SnapshotNotFound { block_hash: parent_hash },
-            )?;
+            let snap = snapshot_provider
+                .snapshot_by_hash(&parent_hash)
+                .ok_or(ParliaConsensusError::SnapshotNotFound { block_hash: parent_hash })?;
             votes = fetch_vote_by_block_hash_and_source_number(target_hash, justified_number);
             let quorum = usize::div_ceil(snap.validators.len() * 2, 3);
             if votes.len() >= quorum {
@@ -916,8 +916,7 @@ where
         // millisecond timestamp to when this attestation is assembled.
         // Equivalent to chain/finalized/latency/normal in geth (measured at assembly
         // time; justified_hash == source_hash == the block now being finalized).
-        if let Some(source_header) =
-            crate::shared::get_canonical_header_by_number(justified_number)
+        if let Some(source_header) = crate::shared::get_canonical_header_by_number(justified_number)
         {
             let now_ms = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)

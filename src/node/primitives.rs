@@ -124,12 +124,8 @@ impl Block for BscBlock {
         // Treat empty withdrawals as None for size computation to match geth behavior.
         // Geth computes block size as if empty withdrawals are absent, even though it
         // returns withdrawals: [] in the JSON response.
-        let withdrawals = body
-            .inner
-            .withdrawals
-            .as_ref()
-            .filter(|w| !w.is_empty())
-            .map(Cow::Borrowed);
+        let withdrawals =
+            body.inner.withdrawals.as_ref().filter(|w| !w.is_empty()).map(Cow::Borrowed);
 
         rlp::BlockHelper {
             header: Cow::Borrowed(header),
@@ -311,11 +307,7 @@ mod tests {
 
     fn create_test_body_no_withdrawals() -> BscBlockBody {
         BscBlockBody {
-            inner: BlockBody {
-                transactions: vec![],
-                ommers: vec![],
-                withdrawals: None,
-            },
+            inner: BlockBody { transactions: vec![], ommers: vec![], withdrawals: None },
             sidecars: None,
         }
     }

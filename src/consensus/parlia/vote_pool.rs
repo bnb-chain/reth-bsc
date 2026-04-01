@@ -153,7 +153,8 @@ impl VotePool {
     fn get_votes(&self) -> Vec<VoteEnvelope> {
         let mut all_votes = Vec::new();
         for vote_messages in self.cur_votes.values() {
-            all_votes.extend(vote_messages.vote_messages.iter().map(|entry| entry.envelope.clone()));
+            all_votes
+                .extend(vote_messages.vote_messages.iter().map(|entry| entry.envelope.clone()));
         }
         all_votes
     }
@@ -168,11 +169,7 @@ impl VotePool {
 
     fn fetch_vote_by_block_hash(&self, block_hash: B256) -> Vec<VoteEnvelope> {
         if let Some(vote_messages) = self.cur_votes.get(&block_hash) {
-            vote_messages
-                .vote_messages
-                .iter()
-                .map(|entry| entry.envelope.clone())
-                .collect()
+            vote_messages.vote_messages.iter().map(|entry| entry.envelope.clone()).collect()
         } else {
             Vec::new()
         }
@@ -202,7 +199,8 @@ impl VotePool {
 
                 // Remove from votes map and received_votes set
                 if let Some(vote_box) = self.cur_votes.remove(&block_hash) {
-                    self.total_votes = self.total_votes.saturating_sub(vote_box.vote_messages.len());
+                    self.total_votes =
+                        self.total_votes.saturating_sub(vote_box.vote_messages.len());
                     for vote in vote_box.vote_messages {
                         self.received_votes.remove(&vote.hash);
                     }
@@ -368,7 +366,8 @@ fn maybe_notify_finality(target_hash: B256, votes_for_block: usize) {
     // Record early finalization latency: time from the finalized block's millisecond
     // timestamp to now, equivalent to chain/finalized/latency/early in geth.
     // The finalized block is current_justified (head - 1), identified by current_justified_number.
-    if let Some(justified_header) = shared::get_canonical_header_by_number(current_justified_number) {
+    if let Some(justified_header) = shared::get_canonical_header_by_number(current_justified_number)
+    {
         let now_ms = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()

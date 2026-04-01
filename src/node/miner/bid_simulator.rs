@@ -1,16 +1,18 @@
 use crate::chainspec::BscChainSpec;
 use crate::consensus::eip4844::{calc_blob_fee, is_blob_eligible_block};
-use crate::consensus::parlia::Snapshot;
 use crate::consensus::parlia::provider::SnapshotProvider;
+use crate::consensus::parlia::Snapshot;
 use crate::hardforks::BscHardforks;
 use crate::node::engine::BscBuiltPayload;
 use crate::node::evm::config::{BscEvmConfig, BscNextBlockEnvAttributes, ValidatorCacheSink};
+use crate::node::evm::MinerTrieDbPrefetcher;
 use crate::node::miner::bsc_miner::MiningContext;
 use crate::node::miner::payload::DELAY_LEFT_OVER;
 use crate::node::miner::speculative::MiningContextSource;
 use crate::node::miner::util::prepare_new_attributes;
 use crate::node::primitives::BscBlobTransactionSidecar;
 use alloy_consensus::BlobTransactionSidecar;
+use alloy_consensus::BlockHeader as _;
 use alloy_consensus::Transaction;
 use alloy_evm::Evm;
 use alloy_primitives::U256;
@@ -28,21 +30,19 @@ use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
 use reth_execution_types::BlockExecutionOutput;
 use reth_payload_primitives::PayloadBuilderAttributes;
 use reth_payload_primitives::{BuiltPayloadExecutedBlock, PayloadBuilderError};
-use revm_context_interface::Block as EvmBlock;
 use reth_primitives::SealedHeader;
 use reth_primitives::TransactionSigned;
 use reth_primitives_traits::SignerRecoverable;
 use reth_provider::StateProviderFactory;
 use reth_provider::{BlockHashReader, HeaderProvider};
 use reth_revm::{database::StateProviderDatabase, db::State};
+use revm_context_interface::Block as EvmBlock;
 use rust_eth_triedb::get_global_triedb;
 use rust_eth_triedb_common::DiffLayers;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{debug, trace};
-use alloy_consensus::BlockHeader as _;
-use crate::node::evm::MinerTrieDbPrefetcher;
 const NO_INTERRUPT_LEFT_OVER: u64 = 500;
 const PAY_BID_TX_GAS_LIMIT: u64 = 25000;
 const TX_GAS: u64 = 21000;
@@ -173,9 +173,7 @@ where
 
         let parent_hash = bid.parent_hash;
         let parent_header = match self.client.header(parent_hash) {
-            Ok(Some(header)) => {
-                SealedHeader::new(header, parent_hash)
-            }
+            Ok(Some(header)) => SealedHeader::new(header, parent_hash),
             _ => {
                 debug!("Failed to get parent header for hash: {:?}", parent_hash);
                 return None;
@@ -197,6 +195,7 @@ where
             header: None,
             is_inturn: true,
             cached_reads: None,
+            parent_difflayers: None,
             source: MiningContextSource::Canonical,
             state_base_hash: None,
             prev_bundle_state: None,
@@ -381,14 +380,14 @@ where
         let mut txs_except_last = bid_runtime.bid.txs.clone();
         let pay_bid_tx = txs_except_last.pop();
 
-        let state_provider =
-            match self.client.state_by_block_hash(bid_runtime.parent_header.hash()) {
-                Ok(provider) => provider,
-                Err(e) => {
-                    debug!("Failed to get state provider by block hash: {:?}", e);
-                    return;
-                }
-            };
+        let state_provider = match self.client.state_by_block_hash(bid_runtime.parent_header.hash())
+        {
+            Ok(provider) => provider,
+            Err(e) => {
+                debug!("Failed to get state provider by block hash: {:?}", e);
+                return;
+            }
+        };
         let sp_db = StateProviderDatabase::new(&state_provider);
         let mut db = State::builder().with_database(sp_db).with_bundle_update().build();
 
@@ -443,8 +442,7 @@ where
         // Sinks transport current_validators / turn_length from the builder so that
         // pick_best_payload() can write to VALIDATOR_CACHE / TURN_LENGTH_CACHE with the
         // definitive block hash after finalize_new_header() runs.
-        let bid_validator_cache_sink: ValidatorCacheSink =
-            Arc::new(Mutex::new(None));
+        let bid_validator_cache_sink: ValidatorCacheSink = Arc::new(Mutex::new(None));
         let bid_turn_length_sink: Arc<Mutex<Option<u8>>> = Arc::new(Mutex::new(None));
 
         let mut builder = match evm_config
@@ -570,7 +568,10 @@ where
         }
 
         // Finish the builder (also returns triedb difflayer when enabled)
-        let out = match builder.finish_with_difflayer(&state_provider).map_err(PayloadBuilderError::other) {
+        let out = match builder
+            .finish_with_difflayer(&state_provider)
+            .map_err(PayloadBuilderError::other)
+        {
             Ok(outcome) => outcome,
             Err(e) => {
                 debug!("Failed to finish builder: {:?}", e);
@@ -632,8 +633,7 @@ where
 
         // Read validator/turn-length data transported via sinks from the now-consumed builder.
         let pending_validators = crate::shared::lock_or_recover(&bid_validator_cache_sink).take();
-        let pending_turn_length =
-            crate::shared::lock_or_recover(&bid_turn_length_sink).take();
+        let pending_turn_length = crate::shared::lock_or_recover(&bid_turn_length_sink).take();
 
         bid_runtime.bsc_payload = Some(BscBuiltPayload {
             block: sealed_block.clone(),
@@ -750,10 +750,10 @@ where
         + 'static,
     EvmConfig: ConfigureEvm<NextBlockEnvCtx = BscNextBlockEnvAttributes> + 'static,
     <EvmConfig as ConfigureEvm>::Primitives: reth_primitives_traits::NodePrimitives<
-            BlockHeader = alloy_consensus::Header,
-            SignedTx = alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip4844>,
-            Block = crate::node::primitives::BscBlock,
-        >,
+        BlockHeader = alloy_consensus::Header,
+        SignedTx = alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip4844>,
+        Block = crate::node::primitives::BscBlock,
+    >,
 {
     fn new(
         bid: Bid,

@@ -223,6 +223,23 @@ pub struct BscMinerMetrics {
     pub payload_rebuild_estimated_uplift_bps: Gauge,
 }
 
+/// Metrics for local mined-block import handoff.
+#[derive(Metrics, Clone)]
+#[metrics(scope = "bsc.block_import")]
+pub struct BscBlockImportMetrics {
+    /// Total number of times a locally mined block became visible before FCU.
+    pub engine_insert_wait_visible_total: Counter,
+
+    /// Total number of times the visibility wait reached its timeout budget.
+    pub engine_insert_wait_timeout_total: Counter,
+
+    /// Total number of visibility waits that timed out after ending on an engine TD query error.
+    pub engine_insert_wait_query_error_total: Counter,
+
+    /// Duration spent waiting for a locally mined block to become visible.
+    pub engine_insert_wait_duration_seconds: Histogram,
+}
+
 /// Metrics for BSC fast finality
 ///
 /// Tracks fast finality operations and finalized blocks.
@@ -323,6 +340,7 @@ mod tests {
         let _vote_metrics = BscVoteMetrics::default();
         let _mev_metrics = BscMevMetrics::default();
         let _miner_metrics = BscMinerMetrics::default();
+        let _block_import_metrics = BscBlockImportMetrics::default();
         let _finality_metrics = BscFinalityMetrics::default();
         let _blockchain_metrics = BscBlockchainMetrics::default();
     }

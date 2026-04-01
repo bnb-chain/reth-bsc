@@ -1,4 +1,5 @@
 use crate::node::miner::signer::MinerSigner;
+use alloy_consensus::transaction::Recovered;
 use alloy_consensus::Transaction as TxTrait;
 use alloy_consensus::TxLegacy;
 use alloy_primitives::{Address, Bytes, TxKind, B256, U256};
@@ -6,7 +7,6 @@ use alloy_sol_macro::sol;
 use alloy_sol_types::SolCall;
 use rand::Rng;
 use reth_primitives::{Transaction, TransactionSigned};
-use alloy_consensus::transaction::Recovered;
 use reth_primitives_traits::SignerRecoverable;
 use secp256k1::SecretKey;
 use std::collections::HashMap;
@@ -124,9 +124,7 @@ pub fn generate_tx_pool(
 
         // Sort by (sender, nonce) so the EVM processes each sender's txs in order.
         // No ecrecover needed — signer is already cached in Recovered.
-        block_txs.sort_by(|a, b| {
-            a.signer().cmp(&b.signer()).then(a.nonce().cmp(&b.nonce()))
-        });
+        block_txs.sort_by(|a, b| a.signer().cmp(&b.signer()).then(a.nonce().cmp(&b.nonce())));
 
         blocks.push(block_txs);
     }

@@ -424,12 +424,7 @@ mod tests {
 
     #[test]
     fn allow_vote_broadcast_when_td_missing() {
-        assert!(should_allow_vote_broadcast(
-            false,
-            Some(10_000u128),
-            None,
-            1000
-        ));
+        assert!(should_allow_vote_broadcast(false, Some(10_000u128), None, 1000));
         assert!(should_allow_vote_broadcast(
             false,
             None,

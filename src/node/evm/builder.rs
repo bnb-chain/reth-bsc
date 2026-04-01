@@ -17,16 +17,19 @@ use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
 use reth_engine_primitives::BSCEngineMessageError;
 use reth_engine_tree::engine::EngineApiRequest;
 use reth_engine_tree::tree::CustomRequestMessage;
-use reth_evm::execute::{BlockBuilder, BlockBuilderOutcome, BlockBuilderOutcomeWithDiffLayer, BlockExecutionError, ExecutorTx};
+use reth_evm::execute::{
+    BlockBuilder, BlockBuilderOutcome, BlockBuilderOutcomeWithDiffLayer, BlockExecutionError,
+    ExecutorTx,
+};
 use reth_primitives_traits::{
     HeaderTy, NodePrimitives, Recovered, RecoveredBlock, SealedHeader, SignerRecoverable, TxTy,
 };
 use reth_provider::StateProvider;
 use reth_trie_common::updates::TrieUpdates;
-use rust_eth_triedb::get_global_triedb;
-use rust_eth_triedb_common::DiffLayers;
 use revm::context::BlockEnv;
 use revm::database::{states::bundle_state::BundleRetention, State};
+use rust_eth_triedb::get_global_triedb;
+use rust_eth_triedb_common::DiffLayers;
 use tokio::sync::oneshot;
 
 /// rewrite BasicBlockBuilder, mainly about the finish() trait.
@@ -140,50 +143,52 @@ where
         let hashed_state = state.hashed_post_state(&db.bundle_state);
 
         // Use triedb to calculate state root
-        let (state_root, trie_updates, produced_difflayer) = if rust_eth_triedb::triedb_manager::is_triedb_active() {
-            let mut triedb = get_global_triedb();
-            // Miner-side: try to use triedb prefetcher + parent difflayers from execution ctx.
-            let prefetch_state = self.ctx.triedb_prefetcher.take().and_then(|p| p.finish());
-            let parent_state_root = (**self.parent).state_root();
-            let trie_hashed_state = hashed_state.to_triedb_hashed_post_state();
-            let difflayers_opt = self.ctx.parent_difflayers.as_ref();
+        let (state_root, trie_updates, produced_difflayer) =
+            if rust_eth_triedb::triedb_manager::is_triedb_active() {
+                let mut triedb = get_global_triedb();
+                // Miner-side: try to use triedb prefetcher + parent difflayers from execution ctx.
+                let prefetch_state = self.ctx.triedb_prefetcher.take().and_then(|p| p.finish());
+                let parent_state_root = (**self.parent).state_root();
+                let trie_hashed_state = hashed_state.to_triedb_hashed_post_state();
+                let difflayers_opt = self.ctx.parent_difflayers.as_ref();
 
-            let triedb_calc_started = std::time::Instant::now();
-            let (new_root, new_difflayer) = triedb
-                .intermediate_and_commit_hashed_post_state(
-                    parent_state_root,
-                    difflayers_opt,
-                    &trie_hashed_state,
-                    prefetch_state,
-                )
-                .map_err(BlockExecutionError::other)?;
-            let triedb_calc_with_prefetch_ms = triedb_calc_started.elapsed().as_millis();
+                let triedb_calc_started = std::time::Instant::now();
+                let (new_root, new_difflayer) = triedb
+                    .intermediate_and_commit_hashed_post_state(
+                        parent_state_root,
+                        difflayers_opt,
+                        &trie_hashed_state,
+                        prefetch_state,
+                    )
+                    .map_err(BlockExecutionError::other)?;
+                let triedb_calc_with_prefetch_ms = triedb_calc_started.elapsed().as_millis();
 
-            tracing::debug!(
-                target: "bsc::builder",
-                parent_hash = %self.parent.hash(),
-                block_number = %(self.parent.number + 1),
-                parent_state_root = %parent_state_root,
-                new_state_root = %new_root,
-                has_parent_difflayers = difflayers_opt.is_some(),
-                user_tx_count = self.transactions.len(),
-                hashed_accounts = hashed_state.accounts.len(),
-                hashed_storages = hashed_state.storages.len(),
-                hashed_storage_slots = hashed_state
-                    .storages
-                    .values()
-                    .map(|s| s.storage.len())
-                    .sum::<usize>(),
-                triedb_calc_ms = triedb_calc_with_prefetch_ms,
-                triedb_calc_us = triedb_calc_started.elapsed().as_micros(),
-                "Calculated state root using triedb"
-            );
-            (new_root, TrieUpdates::default(), Some(new_difflayer))
-        } else {
-            let (root, updates) =
-                state.state_root_with_updates(hashed_state.clone()).map_err(BlockExecutionError::other)?;
-            (root, updates, None)
-        };
+                tracing::debug!(
+                    target: "bsc::builder",
+                    parent_hash = %self.parent.hash(),
+                    block_number = %(self.parent.number + 1),
+                    parent_state_root = %parent_state_root,
+                    new_state_root = %new_root,
+                    has_parent_difflayers = difflayers_opt.is_some(),
+                    user_tx_count = self.transactions.len(),
+                    hashed_accounts = hashed_state.accounts.len(),
+                    hashed_storages = hashed_state.storages.len(),
+                    hashed_storage_slots = hashed_state
+                        .storages
+                        .values()
+                        .map(|s| s.storage.len())
+                        .sum::<usize>(),
+                    triedb_calc_ms = triedb_calc_with_prefetch_ms,
+                    triedb_calc_us = triedb_calc_started.elapsed().as_micros(),
+                    "Calculated state root using triedb"
+                );
+                (new_root, TrieUpdates::default(), Some(new_difflayer))
+            } else {
+                let (root, updates) = state
+                    .state_root_with_updates(hashed_state.clone())
+                    .map_err(BlockExecutionError::other)?;
+                (root, updates, None)
+            };
         let state_root_duration = state_root_start.elapsed();
 
         let user_tx_len = self.transactions.len();
@@ -247,7 +252,12 @@ where
 
         let block = RecoveredBlock::new_unhashed(block, senders);
         Ok(BlockBuilderOutcomeWithDiffLayer {
-            inner: BlockBuilderOutcome { execution_result: result, hashed_state, trie_updates, block },
+            inner: BlockBuilderOutcome {
+                execution_result: result,
+                hashed_state,
+                trie_updates,
+                block,
+            },
             difflayer: produced_difflayer,
         })
     }

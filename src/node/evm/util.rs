@@ -78,7 +78,11 @@ impl HeaderCacheReader {
         self.insert_header_to_cache_with_hash(header, None);
     }
 
-    pub fn insert_header_to_cache_with_hash(&mut self, header: Header, block_hash: Option<BlockHash>) {
+    pub fn insert_header_to_cache_with_hash(
+        &mut self,
+        header: Header,
+        block_hash: Option<BlockHash>,
+    ) {
         let block_number = header.number();
         let block_hash = block_hash.unwrap_or_else(|| header.hash_slow());
         let header_clone_for_log = header.clone();

@@ -57,10 +57,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chainspec::BscChainSpec;
     use crate::hardforks::bsc::BscHardfork;
     use alloy_consensus::Header;
-    use reth_chainspec::{ChainSpecBuilder, ForkCondition, EthereumHardfork};
-    use crate::chainspec::BscChainSpec;
+    use reth_chainspec::{ChainSpecBuilder, EthereumHardfork, ForkCondition};
     use std::sync::Arc;
 
     /// Creates a chain spec with Mendel active at timestamp 1000
@@ -222,11 +222,7 @@ mod tests {
         let parent = Header::default();
 
         let result = next_block_excess_blob_gas_with_mendel(
-            &*spec,
-            10,
-            2000,
-            &parent,
-            None, // No blob params
+            &*spec, 10, 2000, &parent, None, // No blob params
         );
 
         assert!(result.is_none());
@@ -243,13 +239,8 @@ mod tests {
         let blob_params = Some(BlobParams::cancun());
 
         // Block 2 should NOT recalculate (2 % 5 != 1), so it inherits parent's value
-        let result = next_block_excess_blob_gas_with_mendel(
-            &*spec,
-            2,
-            timestamp,
-            &parent,
-            blob_params,
-        );
+        let result =
+            next_block_excess_blob_gas_with_mendel(&*spec, 2, timestamp, &parent, blob_params);
 
         assert_eq!(result, Some(12345));
     }
@@ -264,13 +255,8 @@ mod tests {
         let blob_params = Some(BlobParams::cancun());
 
         // Block 3 should NOT recalculate, inherit 0
-        let result = next_block_excess_blob_gas_with_mendel(
-            &*spec,
-            3,
-            timestamp,
-            &parent,
-            blob_params,
-        );
+        let result =
+            next_block_excess_blob_gas_with_mendel(&*spec, 3, timestamp, &parent, blob_params);
 
         assert_eq!(result, Some(0));
     }
@@ -281,22 +267,14 @@ mod tests {
         let timestamp = 2000;
 
         // Create parent with blob gas values for recalculation
-        let parent = Header {
-            excess_blob_gas: Some(0),
-            blob_gas_used: Some(0),
-            ..Default::default()
-        };
+        let parent =
+            Header { excess_blob_gas: Some(0), blob_gas_used: Some(0), ..Default::default() };
 
         let blob_params = Some(BlobParams::cancun());
 
         // Block 6 should recalculate (6 % 5 == 1)
-        let result = next_block_excess_blob_gas_with_mendel(
-            &*spec,
-            6,
-            timestamp,
-            &parent,
-            blob_params,
-        );
+        let result =
+            next_block_excess_blob_gas_with_mendel(&*spec, 6, timestamp, &parent, blob_params);
 
         // With 0 excess and 0 used, recalculation should return 0
         assert!(result.is_some());
@@ -307,11 +285,8 @@ mod tests {
         let spec = mendel_inactive_chain_spec();
         let timestamp = 500; // Before Mendel
 
-        let parent = Header {
-            excess_blob_gas: Some(1000),
-            blob_gas_used: Some(0),
-            ..Default::default()
-        };
+        let parent =
+            Header { excess_blob_gas: Some(1000), blob_gas_used: Some(0), ..Default::default() };
 
         let blob_params = Some(BlobParams::cancun());
 

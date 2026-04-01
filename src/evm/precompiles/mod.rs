@@ -8,8 +8,9 @@ use revm::{
     context::Cfg,
     handler::EthPrecompiles,
     precompile::{
-        bls12_381, kzg_point_evaluation, modexp, secp256r1, u64_to_address, Precompile, PrecompileError, PrecompileFn,
-        PrecompileId, PrecompileOutput, PrecompileResult, Precompiles,
+        bls12_381, kzg_point_evaluation, modexp, secp256r1, u64_to_address, Precompile,
+        PrecompileError, PrecompileFn, PrecompileId, PrecompileOutput, PrecompileResult,
+        Precompiles,
     },
     primitives::{hardfork::SpecId, Address as RevmAddress},
 };
@@ -87,9 +88,18 @@ impl PrecompileTraceContext {
         tx_to: Option<AlloyAddress>,
         tx_input: &[u8],
     ) -> Self {
-        let tx_selector = if tx_input.len() >= 4 { Some(hex::encode(&tx_input[..4])) } else { None };
+        let tx_selector =
+            if tx_input.len() >= 4 { Some(hex::encode(&tx_input[..4])) } else { None };
 
-        Self::from_parts(block_number, spec, is_system_tx, tx_hash, tx_to, tx_selector, tx_input.len())
+        Self::from_parts(
+            block_number,
+            spec,
+            is_system_tx,
+            tx_hash,
+            tx_to,
+            tx_selector,
+            tx_input.len(),
+        )
     }
 
     /// Construct a new trace context from derived tx parts (avoids cloning tx input).
@@ -353,25 +363,31 @@ fn build_istanbul_precompiles() -> Precompiles {
 
 fn build_nano_precompiles() -> Precompiles {
     let mut precompiles = build_istanbul_precompiles();
-    precompiles.extend([tendermint::TENDERMINT_HEADER_VALIDATION_NANO, iavl::IAVL_PROOF_VALIDATION_NANO]);
+    precompiles
+        .extend([tendermint::TENDERMINT_HEADER_VALIDATION_NANO, iavl::IAVL_PROOF_VALIDATION_NANO]);
     precompiles
 }
 
 fn build_moran_precompiles() -> Precompiles {
     let mut precompiles = build_istanbul_precompiles();
-    precompiles.extend([tendermint::TENDERMINT_HEADER_VALIDATION, iavl::IAVL_PROOF_VALIDATION_MORAN]);
+    precompiles
+        .extend([tendermint::TENDERMINT_HEADER_VALIDATION, iavl::IAVL_PROOF_VALIDATION_MORAN]);
     precompiles
 }
 
 fn build_planck_precompiles() -> Precompiles {
     let mut precompiles = build_istanbul_precompiles();
-    precompiles.extend([tendermint::TENDERMINT_HEADER_VALIDATION, iavl::IAVL_PROOF_VALIDATION_PLANCK]);
+    precompiles
+        .extend([tendermint::TENDERMINT_HEADER_VALIDATION, iavl::IAVL_PROOF_VALIDATION_PLANCK]);
     precompiles
 }
 
 fn build_luban_precompiles() -> Precompiles {
     let mut precompiles = build_planck_precompiles();
-    precompiles.extend([bls::BLS_SIGNATURE_VALIDATION, cometbft::COMETBFT_LIGHT_BLOCK_VALIDATION_BEFORE_HERTZ]);
+    precompiles.extend([
+        bls::BLS_SIGNATURE_VALIDATION,
+        cometbft::COMETBFT_LIGHT_BLOCK_VALIDATION_BEFORE_HERTZ,
+    ]);
     precompiles
 }
 
@@ -389,7 +405,10 @@ fn build_hertz_precompiles() -> Precompiles {
 
 fn build_feynman_precompiles() -> Precompiles {
     let mut precompiles = build_hertz_precompiles();
-    precompiles.extend([double_sign::DOUBLE_SIGN_EVIDENCE_VALIDATION, tm_secp256k1::TM_SECP256K1_SIGNATURE_RECOVER]);
+    precompiles.extend([
+        double_sign::DOUBLE_SIGN_EVIDENCE_VALIDATION,
+        tm_secp256k1::TM_SECP256K1_SIGNATURE_RECOVER,
+    ]);
     precompiles
 }
 

@@ -1,16 +1,22 @@
 use crate::{
-    BscBlock, BscBlockBody, chainspec::BscChainSpec, node::{
+    chainspec::BscChainSpec,
+    node::{
         engine_api::{
             builder::BscEngineApiBuilder,
             payload::BscPayloadTypes,
             validator::{BscEngineValidatorBuilder, BscPayloadValidatorBuilder},
-        }, pool::BscPoolBuilder, primitives::BscPrimitives, storage::BscStorage
-    }
+        },
+        pool::BscPoolBuilder,
+        primitives::BscPrimitives,
+        storage::BscStorage,
+    },
+    BscBlock, BscBlockBody,
 };
 use consensus::BscConsensusBuilder;
 use engine::BscPayloadServiceBuilder;
 use evm::BscExecutorBuilder;
 use network::BscNetworkBuilder;
+use reth::rpc::server_types::eth::EthApiError;
 use reth::{
     api::{FullNodeComponents, FullNodeTypes, HeaderTy, NodeTypes, PrimitivesTy},
     builder::rpc::EthApiCtx,
@@ -22,11 +28,10 @@ use reth::{
     rpc::eth::core::{EthApiFor, EthRpcConverterFor},
 };
 use reth_chainspec::{EthereumHardforks, Hardforks};
-use reth_evm::ConfigureEvm;
-use reth::rpc::server_types::eth::EthApiError;
-use reth_rpc_eth_api::{helpers::pending_block::BuildPendingEnv, RpcConvert, FromEvmError};
 use reth_engine_local::LocalPayloadAttributesBuilder;
 use reth_engine_primitives::ConsensusEngineHandle;
+use reth_evm::ConfigureEvm;
+use reth_rpc_eth_api::{helpers::pending_block::BuildPendingEnv, FromEvmError, RpcConvert};
 
 use reth_payload_primitives::{PayloadAttributesBuilder, PayloadTypes};
 use reth_primitives::BlockBody;
@@ -40,13 +45,13 @@ pub mod consensus;
 pub mod engine;
 pub mod engine_api;
 pub mod evm;
-pub mod pool;
 pub mod miner;
 pub mod network;
+pub mod pool;
 pub mod primitives;
 pub mod storage;
-pub mod vote_producer;
 pub mod vote_journal;
+pub mod vote_producer;
 
 /// Bsc addons configuring RPC types
 pub type BscNodeAddOns<N> = RpcAddOns<
@@ -66,11 +71,8 @@ where
         Types: NodeTypes<ChainSpec: Hardforks + EthereumHardforks>,
         Evm: ConfigureEvm<NextBlockEnvCtx: BuildPendingEnv<HeaderTy<N::Types>>>,
     >,
-    EthRpcConverterFor<N>: RpcConvert<
-        Primitives = PrimitivesTy<N::Types>,
-        Error = EthApiError,
-        Evm = N::Evm,
-    >,
+    EthRpcConverterFor<N>:
+        RpcConvert<Primitives = PrimitivesTy<N::Types>, Error = EthApiError, Evm = N::Evm>,
     EthApiError: FromEvmError<N::Evm>,
 {
     type EthApi = EthApiFor<N>;
@@ -107,8 +109,7 @@ where
 /// Type configuration for a regular BSC node.
 #[derive(Debug, Clone)]
 pub struct BscNode {
-    engine_handle_rx:
-        Arc<Mutex<Option<oneshot::Receiver<ConsensusEngineHandle<BscPayloadTypes>>>>>,
+    engine_handle_rx: Arc<Mutex<Option<oneshot::Receiver<ConsensusEngineHandle<BscPayloadTypes>>>>>,
 }
 
 impl BscNode {
@@ -146,7 +147,7 @@ impl BscNode {
             .executor(BscExecutorBuilder::default())
             .payload(BscPayloadServiceBuilder::default())
             .network(BscNetworkBuilder::new(self.engine_handle_rx.clone()))
-            .consensus(BscConsensusBuilder::default())  
+            .consensus(BscConsensusBuilder::default())
     }
 }
 
@@ -189,14 +190,18 @@ where
         BscNodeAddOns::default()
             .with_receipt_filter(Arc::new(crate::rpc::BscReceiptFilter))
             .extend_rpc_modules(
-                |ctx: RpcContext<'_, NodeAdapter<N>, <BscEthApiBuilder as EthApiBuilder<NodeAdapter<N>>>::EthApi>| {
+                |ctx: RpcContext<
+                    '_,
+                    NodeAdapter<N>,
+                    <BscEthApiBuilder as EthApiBuilder<NodeAdapter<N>>>::EthApi,
+                >| {
                     let eth_config = EthConfigHandler::new(
                         ctx.node().provider().clone(),
                         ctx.node().evm_config().clone(),
                     );
-                ctx.modules
-                    .merge_if_module_configured(RethRpcModule::Eth, eth_config.into_rpc())?;
-                Ok(())
+                    ctx.modules
+                        .merge_if_module_configured(RethRpcModule::Eth, eth_config.into_rpc())?;
+                    Ok(())
                 },
             )
     }

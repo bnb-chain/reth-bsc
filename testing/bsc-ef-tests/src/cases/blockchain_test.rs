@@ -309,8 +309,7 @@ pub fn should_skip(path: &Path) -> bool {
     matches!(
         name,
         // funky test with `bigint 0x00` value in json
-        | "ValueOverflow.json"
-        | "ValueOverflowParis.json"
+        |"ValueOverflow.json"| "ValueOverflowParis.json"
         // txbyte is of type 02 and we don't parse tx bytes for this test to fail.
         | "typeTwoBerlin.json"
         // Test checks if nonce overflows.

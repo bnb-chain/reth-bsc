@@ -1,27 +1,29 @@
 use crate::bench::cache::{self, CacheKind, CacheMetadata};
 use crate::bench::config::BenchConfig;
 use crate::chainspec::BscChainSpec;
-use crate::consensus::parlia::Parlia;
 use crate::consensus::parlia::provider::{EnhancedDbSnapshotProvider, SnapshotProvider};
 use crate::consensus::parlia::snapshot::Snapshot;
+use crate::consensus::parlia::Parlia;
 use crate::hardforks::bsc::BscHardfork;
-use crate::node::BscNode;
 use crate::node::evm::util::insert_header_to_cache;
+use crate::node::BscNode;
 
 use alloy_consensus::Header;
 use alloy_genesis::Genesis;
-use alloy_primitives::{Address, B256, Keccak256, U256};
+use alloy_primitives::{Address, Keccak256, B256, U256};
 use eyre::Context;
 use reth::api::NodeTypesWithDBAdapter;
 use reth_chainspec::{
-    BaseFeeParams, BaseFeeParamsKind, Chain, ChainSpec, NamedChain, make_genesis_header,
+    make_genesis_header, BaseFeeParams, BaseFeeParamsKind, Chain, ChainSpec, NamedChain,
 };
-use reth_db::{DatabaseEnv, init_db, mdbx::DatabaseArguments};
+use reth_db::{init_db, mdbx::DatabaseArguments, DatabaseEnv};
 use reth_db_common::init::init_genesis;
 use reth_primitives::SealedHeader;
-use reth_provider::{BlockNumReader, HeaderProvider, ProviderFactory, providers::StaticFileProvider};
+use reth_provider::{
+    providers::StaticFileProvider, BlockNumReader, HeaderProvider, ProviderFactory,
+};
 use rust_eth_triedb::triedb_manager::init_global_triedb_manager;
-use secp256k1::{PublicKey, SECP256K1, SecretKey};
+use secp256k1::{PublicKey, SecretKey, SECP256K1};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -102,14 +104,8 @@ pub fn init_benchmark(config: &BenchConfig) -> eyre::Result<InitResult> {
     let temp_dir = cache::create_work_dir()?;
     cache::write_materialized_genesis(&temp_dir, &genesis)?;
 
-    let init = open_runtime(
-        config,
-        source_genesis.clone(),
-        temp_dir,
-        genesis,
-        funded_accounts,
-        true,
-    )?;
+    let init =
+        open_runtime(config, source_genesis.clone(), temp_dir, genesis, funded_accounts, true)?;
 
     if config.wants_genesis_cache() {
         cache::persist_cache(
@@ -130,8 +126,7 @@ pub fn try_restore_post_setup(config: &BenchConfig) -> eyre::Result<Option<Resto
     }
 
     let source_genesis = read_source_genesis(config)?;
-    let Some(restored) =
-        cache::try_restore_cache(config, CacheKind::PostSetup, &source_genesis)?
+    let Some(restored) = cache::try_restore_cache(config, CacheKind::PostSetup, &source_genesis)?
     else {
         return Ok(None);
     };
@@ -156,10 +151,7 @@ pub fn try_restore_post_setup(config: &BenchConfig) -> eyre::Result<Option<Resto
         .sealed_header(parent_block_number)
         .wrap_err("failed to query cached post-setup header")?
         .ok_or_else(|| {
-            eyre::eyre!(
-                "cached post-setup header {} not found in restored DB",
-                parent_block_number
-            )
+            eyre::eyre!("cached post-setup header {} not found in restored DB", parent_block_number)
         })?;
 
     if parent_header.hash() != expected_parent_hash {
@@ -185,8 +177,11 @@ pub fn persist_post_setup_cache(
         return Ok(());
     }
 
-    let metadata =
-        CacheMetadata::post_setup(parent_header.number, parent_header.hash(), parent_snapshot.clone());
+    let metadata = CacheMetadata::post_setup(
+        parent_header.number,
+        parent_header.hash(),
+        parent_snapshot.clone(),
+    );
 
     cache::persist_cache(
         config,
@@ -281,7 +276,8 @@ fn open_runtime(
 
     insert_header_to_cache(genesis_header_ref.clone());
 
-    let genesis_snapshot = create_genesis_snapshot(&parlia, genesis_header_ref, &validator_addresses);
+    let genesis_snapshot =
+        create_genesis_snapshot(&parlia, genesis_header_ref, &validator_addresses);
 
     let snapshot_provider =
         Arc::new(EnhancedDbSnapshotProvider::new(snapshot_db.clone(), 2048, chain_spec.clone()));

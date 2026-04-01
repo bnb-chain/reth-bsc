@@ -19,10 +19,11 @@ use alloy_evm::block::BlockExecutor;
 use alloy_evm::Evm;
 use alloy_primitives::{B256, U256};
 use either::Either;
+use once_cell::sync::Lazy;
 use reth::payload::EthPayloadBuilderAttributes;
-use reth::transaction_pool::BestTransactionsAttributes;
 use reth::transaction_pool::error::Eip4844PoolTransactionError;
 use reth::transaction_pool::error::InvalidPoolTransactionError;
+use reth::transaction_pool::BestTransactionsAttributes;
 use reth::transaction_pool::{PoolTransaction, TransactionPool};
 use reth_basic_payload_builder::PayloadConfig;
 use reth_chainspec::EthChainSpec;
@@ -34,22 +35,21 @@ use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
 use reth_execution_types::BlockExecutionOutput;
 use reth_payload_primitives::PayloadBuilderAttributes;
 use reth_payload_primitives::{BuiltPayload, BuiltPayloadExecutedBlock, PayloadBuilderError};
-use once_cell::sync::Lazy;
-use revm_context_interface::Block as EvmBlock;
-use reth_primitives::{HeaderTy, SealedHeader};
 use reth_primitives::InvalidTransactionError;
 use reth_primitives::TransactionSigned;
+use reth_primitives::{HeaderTy, SealedHeader};
 use reth_primitives_traits::{Block, BlockBody, RecoveredBlock, SignerRecoverable};
 use reth_provider::StateProviderFactory;
 use reth_revm::cached::CachedReads;
 use reth_revm::cancelled::ManualCancel;
 use reth_revm::state::EvmState as RethEvmState;
 use reth_revm::{database::StateProviderDatabase, db::State};
+use revm_context_interface::Block as EvmBlock;
 use rust_eth_triedb::get_global_triedb;
 use rust_eth_triedb_common::DiffLayers;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, trace, warn};
 
@@ -183,11 +183,21 @@ fn resolve_state_provider_hash(state_base_hash: Option<B256>, parent_hash: B256)
     state_base_hash.unwrap_or(parent_hash)
 }
 
+fn mining_ctx_for_submission(
+    mining_ctx: &MiningContext,
+    parent_difflayers: Option<DiffLayers>,
+) -> MiningContext {
+    let mut submit_ctx = mining_ctx.clone();
+    submit_ctx.parent_difflayers = parent_difflayers;
+    submit_ctx
+}
+
 fn cached_reads_from_bundle(bundle: &revm::database::BundleState) -> CachedReads {
     let mut cached_reads = CachedReads::default();
     for (addr, acc) in bundle.state.iter() {
         if let Some(info) = acc.info.clone() {
-            let storage = acc.storage.iter().map(|(key, slot)| (*key, slot.present_value)).collect();
+            let storage =
+                acc.storage.iter().map(|(key, slot)| (*key, slot.present_value)).collect();
             cached_reads.insert_account(*addr, info, storage);
         }
     }
@@ -352,11 +362,11 @@ where
     Client: StateProviderFactory + 'static,
     EvmConfig: ConfigureEvm<NextBlockEnvCtx = BscNextBlockEnvAttributes> + 'static,
     <EvmConfig as ConfigureEvm>::Primitives: reth_primitives_traits::NodePrimitives<
-            BlockHeader = alloy_consensus::Header,
-            SignedTx = alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip4844>,
-            Block = crate::node::primitives::BscBlock,
-            Receipt = reth_ethereum_primitives::Receipt,
-        >,
+        BlockHeader = alloy_consensus::Header,
+        SignedTx = alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip4844>,
+        Block = crate::node::primitives::BscBlock,
+        Receipt = reth_ethereum_primitives::Receipt,
+    >,
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>> + 'static,
 {
     pub const fn new(
@@ -432,8 +442,7 @@ where
         // Sinks transport current_validators / turn_length from the builder (which is consumed by
         // finish_with_difflayer) back to this layer so they can be written to cache after
         // finalize_new_header() assigns the definitive block hash.
-        let validator_cache_sink: ValidatorCacheSink =
-            Arc::new(Mutex::new(None));
+        let validator_cache_sink: ValidatorCacheSink = Arc::new(Mutex::new(None));
         let turn_length_sink: Arc<Mutex<Option<u8>>> = Arc::new(Mutex::new(None));
 
         let next_env_attributes = BscNextBlockEnvAttributes {
@@ -463,11 +472,11 @@ where
         // performed during pre-execution are also prefetched.
         if let Some(prefetcher) = triedb_prefetcher.clone() {
             let pf = prefetcher.clone();
-            builder
-                .executor_mut()
-                .set_state_hook(Some(Box::new(move |_, update: &RethEvmState| {
+            builder.executor_mut().set_state_hook(Some(Box::new(
+                move |_, update: &RethEvmState| {
                     pf.on_state_update(update);
-                })));
+                },
+            )));
             debug!(
                 target: "payload_builder",
                 trace_id,
@@ -949,8 +958,7 @@ where
         });
 
         // Sinks for empty-payload builds (same delayed-seal mechanism as normal builds).
-        let validator_cache_sink: ValidatorCacheSink =
-            Arc::new(Mutex::new(None));
+        let validator_cache_sink: ValidatorCacheSink = Arc::new(Mutex::new(None));
         let turn_length_sink: Arc<Mutex<Option<u8>>> = Arc::new(Mutex::new(None));
 
         let mut builder = self
@@ -982,11 +990,11 @@ where
         // performed during pre-execution are also prefetched.
         if let Some(prefetcher) = triedb_prefetcher.clone() {
             let pf = prefetcher.clone();
-            builder
-                .executor_mut()
-                .set_state_hook(Some(Box::new(move |_, update: &RethEvmState| {
+            builder.executor_mut().set_state_hook(Some(Box::new(
+                move |_, update: &RethEvmState| {
                     pf.on_state_update(update);
-                })));
+                },
+            )));
             debug!(
                 target: "payload_builder",
                 trace_id,
@@ -1081,7 +1089,10 @@ where
 /// Called once per payload job at startup; the result is stored in [`BscBuildArguments`] and
 /// shared across all build attempts (normal and empty) for the same parent block.
 /// Returns `None` on any failure — callers degrade gracefully to the full-trie path.
-async fn fetch_triedb_difflayers(trace_id: u64, parent_hash: alloy_primitives::B256) -> Option<DiffLayers> {
+async fn fetch_triedb_difflayers(
+    trace_id: u64,
+    parent_hash: alloy_primitives::B256,
+) -> Option<DiffLayers> {
     if !rust_eth_triedb::triedb_manager::is_triedb_active() {
         return None;
     }
@@ -1190,11 +1201,11 @@ where
         + 'static,
     EvmConfig: ConfigureEvm<NextBlockEnvCtx = BscNextBlockEnvAttributes> + 'static,
     <EvmConfig as ConfigureEvm>::Primitives: reth_primitives_traits::NodePrimitives<
-            BlockHeader = alloy_consensus::Header,
-            SignedTx = alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip4844>,
-            Block = crate::node::primitives::BscBlock,
-            Receipt = reth_ethereum_primitives::Receipt,
-        >,
+        BlockHeader = alloy_consensus::Header,
+        SignedTx = alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip4844>,
+        Block = crate::node::primitives::BscBlock,
+        Receipt = reth_ethereum_primitives::Receipt,
+    >,
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>> + 'static,
 {
     /// Creates a new BscPayloadJob and returns both the job and its handle
@@ -1287,11 +1298,13 @@ where
     pub async fn start(mut self) -> Result<(), Box<BscPayloadJobError>> {
         // Fetch parent difflayers once for all build attempts in this job.
         // Stored in build_args so retries and empty-payload fallback share the same value.
-        self.build_args.parent_difflayers = fetch_triedb_difflayers(
-            self.trace_id,
-            self.build_args.config.parent_header.hash_slow(),
-        )
-        .await;
+        if self.build_args.parent_difflayers.is_none() {
+            self.build_args.parent_difflayers = fetch_triedb_difflayers(
+                self.trace_id,
+                self.build_args.config.parent_header.hash_slow(),
+            )
+            .await;
+        }
 
         let mut start_time = std::time::Instant::now();
         let initial_wait = initial_out_of_turn_build_wait(&self.parlia, &self.mining_ctx);
@@ -1902,8 +1915,8 @@ where
 
         // Phase 2: collect better candidates until deadline.
         while !self.join_handle.is_empty() {
-            if std::time::Instant::now() >=
-                self.expected_end_at + std::time::Duration::from_millis(150)
+            if std::time::Instant::now()
+                >= self.expected_end_at + std::time::Duration::from_millis(150)
             {
                 let now_ms = unix_now_ms();
                 debug!(
@@ -1925,11 +1938,7 @@ where
                 .expected_end_at
                 .checked_duration_since(std::time::Instant::now())
                 .unwrap_or_default();
-            if !self
-                .mining_ctx
-                .parent_snapshot
-                .last_block_in_one_turn(try_mine_block_number)
-            {
+            if !self.mining_ctx.parent_snapshot.last_block_in_one_turn(try_mine_block_number) {
                 // Off-turn and not last in turn: keep giving background builders a bit more time.
                 remaining = remaining.saturating_mul(3);
             }
@@ -2062,7 +2071,10 @@ where
         let delay_ms = remaining.as_millis() as u64;
 
         let submit_ctx = SubmitContext {
-            mining_ctx: self.mining_ctx.clone(),
+            mining_ctx: mining_ctx_for_submission(
+                &self.mining_ctx,
+                self.build_args.parent_difflayers.clone(),
+            ),
             payload,
             cancel: self.build_args.cancel.clone(),
         };
@@ -2118,7 +2130,9 @@ where
     ///
     /// Selection is by fees only; finalization (difficulty, vote attestation, ECDSA seal,
     /// cache updates) is delegated to [`finalize_payload`].
-    fn pick_best_payload_and_finalize(&mut self) -> Result<BscBuiltPayload, Box<BscPayloadJobError>> {
+    fn pick_best_payload_and_finalize(
+        &mut self,
+    ) -> Result<BscBuiltPayload, Box<BscPayloadJobError>> {
         let total_job_duration = self.job_start_time.elapsed();
         let try_mine_block_number = self.build_args.config.parent_header.number() + 1;
 
@@ -2293,9 +2307,9 @@ fn finalize_payload(
 #[cfg(test)]
 mod tests {
     use super::{
-        initial_out_of_turn_build_wait, local_rebuild_action, resolve_state_provider_hash,
-        validate_bsc_sidecar,
-        LocalRebuildAction, LocalRebuildPolicyInput,
+        initial_out_of_turn_build_wait, local_rebuild_action, mining_ctx_for_submission,
+        resolve_state_provider_hash, validate_bsc_sidecar, LocalRebuildAction,
+        LocalRebuildPolicyInput,
     };
     use crate::chainspec::BscChainSpec;
     use crate::consensus::parlia::Parlia;
@@ -2310,6 +2324,7 @@ mod tests {
     use alloy_primitives::{Address, B256, U256};
     use reth::transaction_pool::error::Eip4844PoolTransactionError;
     use reth_primitives::SealedHeader;
+    use rust_eth_triedb_common::{DiffLayer, DiffLayers};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -2359,6 +2374,7 @@ mod tests {
             parent_snapshot: Arc::new(snapshot),
             is_inturn,
             cached_reads: None,
+            parent_difflayers: None,
             source: crate::node::miner::speculative::MiningContextSource::Canonical,
             state_base_hash: None,
             prev_bundle_state: None,
@@ -2459,7 +2475,10 @@ mod tests {
         let parent_hash = B256::with_last_byte(100);
         let state_base_hash = B256::with_last_byte(99);
 
-        assert_eq!(resolve_state_provider_hash(Some(state_base_hash), parent_hash), state_base_hash);
+        assert_eq!(
+            resolve_state_provider_hash(Some(state_base_hash), parent_hash),
+            state_base_hash
+        );
         assert_eq!(resolve_state_provider_hash(None, parent_hash), parent_hash);
     }
 
@@ -2640,5 +2659,19 @@ mod tests {
     #[test]
     fn miner_metrics_returns_module_static() {
         assert!(std::ptr::eq(super::miner_metrics(), &*super::MINER_METRICS));
+    }
+
+    #[test]
+    fn submit_mining_ctx_uses_build_arg_parent_difflayers() {
+        let parlia = test_parlia();
+        let mining_ctx = test_mining_context(&parlia, 200, 0, true);
+        let expected_parent_difflayers =
+            Some(DiffLayers { diff_layers: vec![Arc::new(DiffLayer::default())] });
+
+        let submit_ctx =
+            mining_ctx_for_submission(&mining_ctx, expected_parent_difflayers.clone());
+
+        assert!(mining_ctx.parent_difflayers.is_none());
+        assert_eq!(submit_ctx.parent_difflayers, expected_parent_difflayers);
     }
 }

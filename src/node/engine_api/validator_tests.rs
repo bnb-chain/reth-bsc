@@ -2,15 +2,15 @@
 
 #[cfg(test)]
 mod tests {
+    use crate::chainspec::bsc::bsc_mainnet;
+    use crate::chainspec::BscChainSpec;
     use crate::node::engine_api::payload::BscPayloadTypes;
     use crate::node::engine_api::validator::{BscEngineValidator, BscExecutionData};
-    use crate::chainspec::bsc::bsc_mainnet;
     use crate::{BscBlock, BscBlockBody};
-    use crate::chainspec::BscChainSpec;
     use alloy_consensus::Header;
     use alloy_primitives::{Address, B256, U256};
-    use reth_ethereum_primitives::BlockBody;
     use reth_engine_primitives::ExecutionPayload;
+    use reth_ethereum_primitives::BlockBody;
     use reth_payload_primitives::PayloadTypes;
     use reth_primitives_traits::Block;
     use std::sync::Arc;
@@ -28,13 +28,7 @@ mod tests {
             ..Default::default()
         };
 
-        BscBlock {
-            header,
-            body: BscBlockBody {
-                inner: BlockBody::default(),
-                sidecars: None,
-            },
-        }
+        BscBlock { header, body: BscBlockBody { inner: BlockBody::default(), sidecars: None } }
     }
 
     #[test]
@@ -203,10 +197,7 @@ mod tests {
 
     #[test]
     fn test_execution_data_with_different_difficulties() {
-        let difficulties = vec![
-            U256::from(1),
-            U256::from(2),
-        ];
+        let difficulties = vec![U256::from(1), U256::from(2)];
 
         for difficulty in difficulties {
             let mut block = create_test_block(1, B256::random());
@@ -219,12 +210,7 @@ mod tests {
 
     #[test]
     fn test_execution_data_with_different_timestamps() {
-        let timestamps = vec![
-            1234567890u64,
-            1640000000u64,
-            1700000000u64,
-            1740000000u64,
-        ];
+        let timestamps = vec![1234567890u64, 1640000000u64, 1700000000u64, 1740000000u64];
 
         for timestamp in timestamps {
             let mut block = create_test_block(1, B256::random());

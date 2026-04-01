@@ -17,9 +17,9 @@ use reth::api::NodeTypesWithDBAdapter;
 use reth_engine_tree::engine::EngineApiRequest;
 use reth_network::NetworkHandle;
 use reth_network_api::PeerId;
-use reth_provider::providers::BlockchainProvider;
 use reth_payload_builder_primitives::Events;
 use reth_primitives::TransactionSigned;
+use reth_provider::providers::BlockchainProvider;
 use reth_provider::{BlockNumReader, HeaderProvider};
 use schnellru::{ByLength, LruMap};
 use std::collections::VecDeque;
@@ -805,9 +805,7 @@ pub async fn ipc_send_raw_transaction(tx: TransactionSigned) -> Result<B256, eyr
 static ENGINE_API_TX: OnceLock<BscEngineApiTx> = OnceLock::new();
 
 /// Set global engine api tx if present.
-pub fn set_engine_api_tx(
-    tx: BscEngineApiTx,
-) -> Result<(), BscEngineApiTx> {
+pub fn set_engine_api_tx(tx: BscEngineApiTx) -> Result<(), BscEngineApiTx> {
     ENGINE_API_TX.set(tx)
 }
 
@@ -817,9 +815,7 @@ pub fn get_engine_api_tx() -> Option<BscEngineApiTx> {
 }
 
 /// Acquire a `std::sync::Mutex` guard, recovering the inner value if the mutex is poisoned.
-pub fn lock_or_recover<T>(
-    mutex: &std::sync::Mutex<T>,
-) -> std::sync::MutexGuard<'_, T> {
+pub fn lock_or_recover<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|err| err.into_inner())
 }
 

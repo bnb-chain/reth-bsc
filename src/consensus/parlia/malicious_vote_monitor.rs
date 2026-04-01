@@ -46,9 +46,10 @@ impl MaliciousVoteMonitor {
         let vote_address = new_vote.vote_address;
 
         // Ensure LRU cache exists for this validator
-        let vote_buffer = self.cur_votes.entry(vote_address).or_insert_with(|| {
-            LruCache::new(NonZero::new(MAX_SIZE_OF_RECENT_ENTRY).unwrap())
-        });
+        let vote_buffer = self
+            .cur_votes
+            .entry(vote_address)
+            .or_insert_with(|| LruCache::new(NonZero::new(MAX_SIZE_OF_RECENT_ENTRY).unwrap()));
 
         let source_number = new_vote.data.source_number;
         let target_number = new_vote.data.target_number;

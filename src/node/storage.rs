@@ -35,11 +35,7 @@ where
         Ok(())
     }
 
-    fn remove_block_bodies_above(
-        &self,
-        provider: &Provider,
-        block: u64,
-    ) -> ProviderResult<()> {
+    fn remove_block_bodies_above(&self, provider: &Provider, block: u64) -> ProviderResult<()> {
         self.0.remove_block_bodies_above(provider, block)?;
 
         // TODO: Remove sidecars

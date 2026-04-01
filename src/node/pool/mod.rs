@@ -1,6 +1,6 @@
 use std::sync::{
-    Arc,
     atomic::{AtomicBool, Ordering},
+    Arc,
 };
 
 use alloy_consensus::{BlockHeader, Transaction};
@@ -14,8 +14,8 @@ use reth::builder::{
 use reth_chainspec::{EthChainSpec, EthereumHardforks, ForkCondition, Hardforks};
 use reth_ethereum_primitives::TransactionSigned as EthTxSigned;
 use reth_payload_primitives::PayloadTypes;
-use reth_primitives_traits::SignedTransaction;
 use reth_primitives_traits::constants::MAX_TX_GAS_LIMIT_OSAKA;
+use reth_primitives_traits::SignedTransaction;
 use reth_transaction_pool::{
     blobstore::DiskFileBlobStore, error::InvalidPoolTransactionError, PoolTransaction,
     TransactionOrigin, TransactionValidationOutcome, TransactionValidationTaskExecutor,
@@ -147,10 +147,8 @@ where
         B: reth_primitives_traits::Block,
     {
         if let Some(osaka_ts) = self.osaka_timestamp {
-            self.osaka_activated.store(
-                new_tip_block.header().timestamp() >= osaka_ts,
-                Ordering::Relaxed,
-            );
+            self.osaka_activated
+                .store(new_tip_block.header().timestamp() >= osaka_ts, Ordering::Relaxed);
         }
         self.inner.on_new_head_block(new_tip_block)
     }
@@ -224,8 +222,7 @@ where
             ForkCondition::Timestamp(ts) => Some(ts),
             _ => None,
         };
-        let osaka_activated = osaka_timestamp
-            .is_some_and(|ts| ctx.head().timestamp >= ts);
+        let osaka_activated = osaka_timestamp.is_some_and(|ts| ctx.head().timestamp >= ts);
 
         let validator = validator.map(|v| BscTxValidator::new(v, osaka_activated, osaka_timestamp));
 

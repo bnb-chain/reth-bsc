@@ -1,5 +1,5 @@
-use reth_primitives::TransactionSigned;
 use alloy_consensus::transaction::Recovered;
+use reth_primitives::TransactionSigned;
 use reth_transaction_pool::blobstore::InMemoryBlobStore;
 use reth_transaction_pool::noop::MockTransactionValidator;
 use reth_transaction_pool::{

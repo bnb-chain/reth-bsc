@@ -1,10 +1,10 @@
 use crate::{
-    chainspec::BscChainSpec, 
+    chainspec::BscChainSpec,
     consensus::{
         eip4844::next_block_excess_blob_gas_with_mendel,
         parlia::{Parlia, EMPTY_REQUESTS_HASH, EMPTY_WITHDRAWALS_HASH},
     },
-    hardforks::BscHardforks, 
+    hardforks::BscHardforks,
     node::{
         evm::config::{BscBlockExecutionCtx, BscBlockExecutorFactory},
         miner::util::finalize_new_header,
@@ -12,9 +12,9 @@ use crate::{
     },
 };
 use alloy_consensus::{proofs, BlockBody, Header, Transaction, TxReceipt, EMPTY_OMMER_ROOT_HASH};
-use alloy_primitives::{keccak256, B256};
 use alloy_eips::merge::BEACON_NONCE;
 use alloy_primitives::Bytes;
+use alloy_primitives::{keccak256, B256};
 use alloy_rpc_types::Withdrawals;
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_ethereum_primitives::{Receipt, TransactionSigned};
@@ -87,9 +87,10 @@ where
     ///
     /// Callers must invoke `finalize_new_header()` later (e.g. in `pick_best_payload()`)
     /// once the best payload has been chosen and all FF votes have been collected.
-    pub fn assemble_block_body_only(&self, input: BscBlockAssemblerInput<'_, '_, BscBlockExecutorFactory>) ->
-        Result<crate::node::primitives::BscBlock, BlockExecutionError>
-    {
+    pub fn assemble_block_body_only(
+        &self,
+        input: BscBlockAssemblerInput<'_, '_, BscBlockExecutorFactory>,
+    ) -> Result<crate::node::primitives::BscBlock, BlockExecutionError> {
         let BscBlockAssemblerInput {
             evm_env,
             execution_ctx: ctx,
@@ -105,7 +106,8 @@ where
         let transactions_root = proofs::calculate_transaction_root(&transactions);
         let block_number = evm_env.block_env.number().saturating_to();
 
-        let receipts_with_bloom = receipts.iter().map(TxReceipt::with_bloom_ref).collect::<Vec<_>>();
+        let receipts_with_bloom =
+            receipts.iter().map(TxReceipt::with_bloom_ref).collect::<Vec<_>>();
         let receipts_root = alloy_consensus::proofs::calculate_receipt_root(&receipts_with_bloom);
 
         let logs_bloom = receipts_with_bloom
@@ -182,7 +184,9 @@ where
 
         tracing::debug!(
             "Assembled block body only (pre-finalize), block_number={}, parent_hash=0x{:x}, txs={}",
-            header.number, header.parent_hash, transactions.len()
+            header.number,
+            header.parent_hash,
+            transactions.len()
         );
 
         Ok(BscBlock {
@@ -298,7 +302,9 @@ where
                 .lock()
                 .unwrap()
                 .get_header_by_hash(&header.parent_hash)
-                .ok_or(BlockExecutionError::msg("Failed to get header from global header reader"))?;
+                .ok_or(BlockExecutionError::msg(
+                    "Failed to get header from global header reader",
+                ))?;
             let parent_header = SealedHeader::new(parent_header, header.parent_hash);
             let parent_snap = snapshot_provider
                 .snapshot_by_hash(&header.parent_hash)

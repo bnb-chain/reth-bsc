@@ -46,16 +46,13 @@ lazy_static! {
             .expect("validator set ABI before Luban JSON is valid")
     );
     static ref VALIDATOR_SET_ABI_JSON: Arc<JsonAbi> = Arc::new(
-        serde_json::from_str(*VALIDATOR_SET_ABI)
-            .expect("validator set ABI JSON is valid")
+        serde_json::from_str(*VALIDATOR_SET_ABI).expect("validator set ABI JSON is valid")
     );
     static ref SLASH_INDICATOR_ABI_JSON: Arc<JsonAbi> = Arc::new(
-        serde_json::from_str(*SLASH_INDICATOR_ABI)
-            .expect("slash indicator ABI JSON is valid")
+        serde_json::from_str(*SLASH_INDICATOR_ABI).expect("slash indicator ABI JSON is valid")
     );
-    static ref STAKE_HUB_ABI_JSON: Arc<JsonAbi> = Arc::new(
-        serde_json::from_str(*STAKE_HUB_ABI).expect("stake hub ABI JSON is valid")
-    );
+    static ref STAKE_HUB_ABI_JSON: Arc<JsonAbi> =
+        Arc::new(serde_json::from_str(*STAKE_HUB_ABI).expect("stake hub ABI JSON is valid"));
 }
 
 impl<Spec: EthChainSpec + crate::hardforks::BscHardforks> SystemContract<Spec> {

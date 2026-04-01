@@ -2,8 +2,7 @@
 
 use crate::evm::{
     api::{BscContext, BscEvm},
-    blacklist,
-    precompiles,
+    blacklist, precompiles,
 };
 
 use alloy_primitives::{hex, TxKind, U256};
@@ -65,8 +64,12 @@ impl<DB: Database, INSP> Handler for BscHandler<DB, INSP> {
                 return Err(revm::context_interface::result::InvalidHeader::PrevrandaoNotSet.into());
             }
             // `excess_blob_gas` is required for Cancun
-            if spec.is_enabled_in(SpecId::CANCUN) && ctx.block().blob_excess_gas_and_price().is_none() {
-                return Err(revm::context_interface::result::InvalidHeader::ExcessBlobGasNotSet.into());
+            if spec.is_enabled_in(SpecId::CANCUN)
+                && ctx.block().blob_excess_gas_and_price().is_none()
+            {
+                return Err(
+                    revm::context_interface::result::InvalidHeader::ExcessBlobGasNotSet.into()
+                );
             }
             Ok(())
         } else {
@@ -178,11 +181,7 @@ impl<DB: Database, INSP> Handler for BscHandler<DB, INSP> {
                 _ => None,
             };
             let input = tx.base.data.as_ref();
-            let selector = if input.len() >= 4 {
-                Some(hex::encode(&input[..4]))
-            } else {
-                None
-            };
+            let selector = if input.len() >= 4 { Some(hex::encode(&input[..4])) } else { None };
             (
                 ctx.block().number.to::<u64>(),
                 *ctx.cfg().spec(),
@@ -193,15 +192,17 @@ impl<DB: Database, INSP> Handler for BscHandler<DB, INSP> {
             )
         };
 
-        precompiles::push_precompile_trace_context(precompiles::PrecompileTraceContext::from_parts(
-            block_number,
-            spec,
-            is_system_tx,
-            None,
-            to,
-            selector,
-            input_len,
-        ));
+        precompiles::push_precompile_trace_context(
+            precompiles::PrecompileTraceContext::from_parts(
+                block_number,
+                spec,
+                is_system_tx,
+                None,
+                to,
+                selector,
+                input_len,
+            ),
+        );
 
         let res = if is_system_tx {
             Ok(InitialAndFloorGas { initial_gas: 0, floor_gas: 0 })
@@ -381,13 +382,8 @@ mod tests {
         // Mark as system transaction
         tx.is_system_transaction = true;
 
-        let mut evm = BscEvm::new(
-            env,
-            make_db_with_funded_caller(caller),
-            NoOpInspector,
-            false,
-            false,
-        );
+        let mut evm =
+            BscEvm::new(env, make_db_with_funded_caller(caller), NoOpInspector, false, false);
 
         // Set the transaction directly on the inner context
         evm.inner.ctx.tx = tx;
@@ -436,13 +432,8 @@ mod tests {
         );
         // is_system_transaction defaults to false
 
-        let mut evm = BscEvm::new(
-            env,
-            make_db_with_funded_caller(caller),
-            NoOpInspector,
-            false,
-            false,
-        );
+        let mut evm =
+            BscEvm::new(env, make_db_with_funded_caller(caller), NoOpInspector, false, false);
 
         // Set the transaction directly on the inner context
         evm.inner.ctx.tx = tx;
@@ -460,7 +451,9 @@ mod tests {
         // Verify it's the correct error type
         if let Err(e) = result {
             match e {
-                revm::context::result::EVMError::Transaction(InvalidTransaction::TxGasLimitGreaterThanCap { gas_limit, cap }) => {
+                revm::context::result::EVMError::Transaction(
+                    InvalidTransaction::TxGasLimitGreaterThanCap { gas_limit, cap },
+                ) => {
                     assert_eq!(gas_limit, excessive_gas_limit);
                     assert_eq!(cap, MAX_TX_GAS_LIMIT_OSAKA);
                 }
@@ -500,13 +493,8 @@ mod tests {
                 .expect("tx env should build"),
         );
 
-        let mut evm = BscEvm::new(
-            env,
-            make_db_with_funded_caller(caller),
-            NoOpInspector,
-            false,
-            false,
-        );
+        let mut evm =
+            BscEvm::new(env, make_db_with_funded_caller(caller), NoOpInspector, false, false);
 
         // Set the transaction directly on the inner context
         evm.inner.ctx.tx = tx;

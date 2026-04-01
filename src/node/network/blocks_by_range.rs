@@ -188,8 +188,8 @@ mod tests {
     use crate::BscBlockBody;
     use alloy_consensus::Header;
     use alloy_rlp::RlpDecodable;
-    use reth_primitives::TransactionSigned;
     use bytes::BytesMut;
+    use reth_primitives::TransactionSigned;
 
     #[test]
     fn test_get_blocks_by_range_codec_roundtrip() {

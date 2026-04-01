@@ -2,7 +2,7 @@ use crate::bench::config::BenchConfig;
 use crate::consensus::parlia::snapshot::Snapshot;
 
 use alloy_genesis::Genesis;
-use alloy_primitives::{B256, Keccak256};
+use alloy_primitives::{Keccak256, B256};
 use eyre::Context;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -329,8 +329,12 @@ mod tests {
     fn state_cache_key_changes_when_triedb_changes() {
         let baseline = config();
         let changed = BenchConfig { triedb: false, ..baseline.clone() };
-        let genesis_json = "{\"alloc\":{},\"config\":{},\"gasLimit\":\"0x1\",\"difficulty\":\"0x1\"}";
+        let genesis_json =
+            "{\"alloc\":{},\"config\":{},\"gasLimit\":\"0x1\",\"difficulty\":\"0x1\"}";
 
-        assert_ne!(state_cache_key(&baseline, genesis_json), state_cache_key(&changed, genesis_json));
+        assert_ne!(
+            state_cache_key(&baseline, genesis_json),
+            state_cache_key(&changed, genesis_json)
+        );
     }
 }

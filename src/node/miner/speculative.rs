@@ -1,8 +1,9 @@
-use alloy_primitives::B256;
 use crate::consensus::parlia::snapshot::Snapshot;
 use crate::node::miner::bsc_miner::MiningContext;
+use alloy_primitives::B256;
 use reth_primitives::SealedHeader;
 use reth_revm::cached::CachedReads;
+use rust_eth_triedb_common::DiffLayers;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,6 +101,7 @@ pub fn derive_speculative_child_context(
     parent_snapshot: Arc<Snapshot>,
     is_inturn: bool,
     cached_reads: Option<CachedReads>,
+    parent_difflayers: Option<DiffLayers>,
     durable_base_hash: B256,
     prev_bundle_state: Option<revm::database::BundleState>,
 ) -> MiningContext {
@@ -109,6 +111,7 @@ pub fn derive_speculative_child_context(
         parent_snapshot,
         is_inturn,
         cached_reads,
+        parent_difflayers,
         source: MiningContextSource::Speculative,
         state_base_hash: Some(durable_base_hash),
         prev_bundle_state,
@@ -141,9 +144,8 @@ pub fn on_canonical_tip(
 ) -> ContextDecision {
     match tracker.reconcile_canonical_head(canonical_hash, canonical_number) {
         ReconcileDecision::ClearPending => ContextDecision::ClearAndAbortSpeculative,
-        ReconcileDecision::KeepPending => tracker.current().map_or(
-            ContextDecision::UseCanonical,
-            |head| {
+        ReconcileDecision::KeepPending => {
+            tracker.current().map_or(ContextDecision::UseCanonical, |head| {
                 if head.block_hash == canonical_hash
                     && head.block_number == canonical_number
                     && head.child_spawned
@@ -152,23 +154,22 @@ pub fn on_canonical_tip(
                 } else {
                     ContextDecision::UseCanonical
                 }
-            },
-        ),
+            })
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use alloy_primitives::B256;
-    use alloy_primitives::Address;
     use alloy_consensus::Header;
+    use alloy_primitives::Address;
+    use alloy_primitives::B256;
     use reth_primitives::SealedHeader;
     use std::sync::Arc;
 
     use super::{
-        choose_next_context, derive_speculative_child_context, on_canonical_tip,
-        ContextDecision, MiningContextSource, PendingLocalHead, PendingLocalHeadTracker,
-        ReconcileDecision,
+        choose_next_context, derive_speculative_child_context, on_canonical_tip, ContextDecision,
+        MiningContextSource, PendingLocalHead, PendingLocalHeadTracker, ReconcileDecision,
     };
     use crate::consensus::parlia::Snapshot;
     use crate::node::miner::bsc_miner::MiningContext;
@@ -199,13 +200,8 @@ mod tests {
             beneficiary: Address::with_last_byte(1),
             ..Default::default()
         };
-        let parent_snapshot = Snapshot::new(
-            vec![Address::with_last_byte(1)],
-            parent_number,
-            parent_hash,
-            200,
-            None,
-        );
+        let parent_snapshot =
+            Snapshot::new(vec![Address::with_last_byte(1)], parent_number, parent_hash, 200, None);
 
         MiningContext {
             header: None,
@@ -213,6 +209,7 @@ mod tests {
             parent_snapshot: Arc::new(parent_snapshot),
             is_inturn: true,
             cached_reads: None,
+            parent_difflayers: None,
             source,
             state_base_hash: (source == MiningContextSource::Speculative)
                 .then_some(example_hash(parent_number.saturating_sub(1))),
@@ -266,12 +263,14 @@ mod tests {
             beneficiary: Address::with_last_byte(1),
             ..Default::default()
         };
-        let parent_snapshot = Snapshot::new(vec![Address::with_last_byte(1)], 100, parent_hash, 200, None);
+        let parent_snapshot =
+            Snapshot::new(vec![Address::with_last_byte(1)], 100, parent_hash, 200, None);
 
         let ctx = derive_speculative_child_context(
             SealedHeader::new(parent_header, parent_hash),
             Arc::new(parent_snapshot),
             true,
+            None,
             None,
             example_hash(99),
             None,

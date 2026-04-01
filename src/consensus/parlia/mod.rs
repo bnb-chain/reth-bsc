@@ -1,12 +1,12 @@
+pub mod block_stats;
 pub mod bls_signer;
 pub mod consensus;
 pub mod constants;
 pub mod db;
 pub mod error;
 pub mod forkchoice_rule;
-pub mod block_stats;
-pub mod malicious_vote_monitor;
 pub mod go_rng;
+pub mod malicious_vote_monitor;
 pub mod provider;
 pub mod ramanujan_fork;
 pub mod snapshot;

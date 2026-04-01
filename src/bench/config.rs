@@ -200,7 +200,9 @@ fn parse_key(hex: &str) -> B256 {
 impl BenchConfig {
     pub fn from_run_args(args: RunArgs) -> eyre::Result<Self> {
         if (args.reuse_genesis_db || args.reuse_post_setup_db) && args.cache_dir.is_none() {
-            eyre::bail!("--cache-dir is required when using --reuse-genesis-db or --reuse-post-setup-db");
+            eyre::bail!(
+                "--cache-dir is required when using --reuse-genesis-db or --reuse-post-setup-db"
+            );
         }
 
         Ok(Self {
@@ -315,7 +317,8 @@ mod tests {
             ..config_a.clone()
         };
 
-        let genesis_json = "{\"alloc\":{},\"config\":{},\"gasLimit\":\"0x1\",\"difficulty\":\"0x1\"}";
+        let genesis_json =
+            "{\"alloc\":{},\"config\":{},\"gasLimit\":\"0x1\",\"difficulty\":\"0x1\"}";
 
         assert_eq!(
             state_cache_key(&config_a, genesis_json),
@@ -344,7 +347,8 @@ mod tests {
         };
 
         let changed = BenchConfig { background_accounts: 10_000_000, ..base.clone() };
-        let genesis_json = "{\"alloc\":{},\"config\":{},\"gasLimit\":\"0x1\",\"difficulty\":\"0x1\"}";
+        let genesis_json =
+            "{\"alloc\":{},\"config\":{},\"gasLimit\":\"0x1\",\"difficulty\":\"0x1\"}";
 
         assert_ne!(state_cache_key(&base, genesis_json), state_cache_key(&changed, genesis_json));
     }

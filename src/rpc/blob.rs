@@ -1,13 +1,13 @@
+use alloy_consensus::transaction::TxHashRef;
+use alloy_eips::eip7594::BlobTransactionSidecarVariant;
+use alloy_primitives::B256;
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::types::ErrorObject;
-use alloy_primitives::B256;
-use alloy_consensus::transaction::TxHashRef;
+use reth_provider::{BlockNumReader, BlockReader, TransactionsProvider};
+use reth_transaction_pool::{BlobStoreError, TransactionPool};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use reth_transaction_pool::{BlobStoreError, TransactionPool};
-use alloy_eips::eip7594::BlobTransactionSidecarVariant;
-use reth_provider::{BlockNumReader, BlockReader, TransactionsProvider};
 
 /// Inner blob sidecar data
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,7 +44,7 @@ pub struct BlobSidecarResponse {
 #[rpc(server, namespace = "eth")]
 pub trait BlobApi {
     /// Get blob sidecar by transaction hash
-    /// 
+    ///
     /// # Parameters
     /// - `tx_hash`: Transaction hash
     /// - `full_blob_flag`: If true returns full blob, if false returns first 32 bytes (default: true)
@@ -56,7 +56,7 @@ pub trait BlobApi {
     ) -> RpcResult<Option<BlobSidecarResponse>>;
 
     /// Get blob sidecars for a block
-    /// 
+    ///
     /// # Parameters
     /// - `block_number`: Block number (hex), hash, or tag ("latest", "earliest", "safe", "finalized")
     /// - `full_blob_flag`: If true returns full blob, if false returns first 32 bytes (default: true)
@@ -107,7 +107,10 @@ where
                             format!("0x{}", hex::encode(blob.as_slice()))
                         } else {
                             // Return first 32 bytes only
-                            format!("0x{}", hex::encode(&blob.as_slice()[..32.min(blob.as_slice().len())]))
+                            format!(
+                                "0x{}",
+                                hex::encode(&blob.as_slice()[..32.min(blob.as_slice().len())])
+                            )
                         }
                     })
                     .collect();
@@ -135,7 +138,10 @@ where
                             format!("0x{}", hex::encode(blob.as_slice()))
                         } else {
                             // Return first 32 bytes only
-                            format!("0x{}", hex::encode(&blob.as_slice()[..32.min(blob.as_slice().len())]))
+                            format!(
+                                "0x{}",
+                                hex::encode(&blob.as_slice()[..32.min(blob.as_slice().len())])
+                            )
                         }
                     })
                     .collect();
@@ -158,11 +164,7 @@ where
         };
 
         BlobSidecarResponse {
-            blob_sidecar: BlobSidecarData {
-                blobs,
-                commitments,
-                proofs,
-            },
+            blob_sidecar: BlobSidecarData { blobs, commitments, proofs },
             block_hash: block_hash.map(|h| format!("0x{:x}", h)),
             block_number: block_number.map(|n| format!("0x{:x}", n)),
             tx_hash: format!("0x{:x}", tx_hash),
@@ -175,22 +177,24 @@ where
         // Handle tags
         match block_str {
             "latest" => {
-                return self.provider.best_block_number()
-                    .map_err(|e| ErrorObject::owned(
+                return self.provider.best_block_number().map_err(|e| {
+                    ErrorObject::owned(
                         -32603,
                         format!("Failed to get latest block: {}", e),
                         None::<()>,
-                    ))
+                    )
+                })
             }
             "earliest" => return Ok(0),
             "safe" | "finalized" => {
                 // For BSC, treat safe/finalized as latest
-                return self.provider.best_block_number()
-                    .map_err(|e| ErrorObject::owned(
+                return self.provider.best_block_number().map_err(|e| {
+                    ErrorObject::owned(
                         -32603,
                         format!("Failed to get latest block: {}", e),
                         None::<()>,
-                    ))
+                    )
+                });
             }
             _ => {}
         }
@@ -271,19 +275,20 @@ where
         };
 
         // Try to get transaction metadata (block number, hash, index)
-        let (block_number, block_hash, index) = if let Ok(Some(tx_id)) = self.provider.transaction_id(tx_hash) {
+        let (block_number, block_hash, index) = if let Ok(Some(tx_id)) =
+            self.provider.transaction_id(tx_hash)
+        {
             if let Ok(Some(block_num)) = self.provider.block_by_transaction_id(tx_id) {
                 // Get block hash
                 let block_hash = self.provider.block_hash(block_num).ok().flatten();
-                
+
                 // Try to get transaction index in block
-                let index = if let Ok(Some(txs)) = self.provider.transactions_by_block(block_num.into()) {
-                    txs.iter()
-                        .position(|tx| *tx.tx_hash() == tx_hash)
-                        .map(|pos| pos as u64)
-                } else {
-                    None
-                };
+                let index =
+                    if let Ok(Some(txs)) = self.provider.transactions_by_block(block_num.into()) {
+                        txs.iter().position(|tx| *tx.tx_hash() == tx_hash).map(|pos| pos as u64)
+                    } else {
+                        None
+                    };
 
                 (Some(block_num), block_hash, index)
             } else {
@@ -293,14 +298,8 @@ where
             (None, None, None)
         };
 
-        let response = Self::sidecar_to_response(
-            tx_hash,
-            sidecar,
-            full_blob,
-            block_number,
-            block_hash,
-            index,
-        );
+        let response =
+            Self::sidecar_to_response(tx_hash, sidecar, full_blob, block_number, block_hash, index);
 
         Ok(Some(response))
     }
@@ -323,16 +322,13 @@ where
         let block_num = self.parse_block_number(&block_number)?;
 
         // Get all transactions in the block
-        let transactions = self
-            .provider
-            .transactions_by_block(block_num.into())
-            .map_err(|e| {
-                ErrorObject::owned(
-                    -32603,
-                    format!("Failed to get transactions for block {}: {}", block_num, e),
-                    None::<()>,
-                )
-            })?;
+        let transactions = self.provider.transactions_by_block(block_num.into()).map_err(|e| {
+            ErrorObject::owned(
+                -32603,
+                format!("Failed to get transactions for block {}: {}", block_num, e),
+                None::<()>,
+            )
+        })?;
 
         let Some(txs) = transactions else {
             tracing::debug!("Block {} not found", block_num);
@@ -372,11 +368,7 @@ where
             responses.push(response);
         }
 
-        tracing::debug!(
-            "Found {} blob sidecars for block {}",
-            responses.len(),
-            block_num
-        );
+        tracing::debug!("Found {} blob sidecars for block {}", responses.len(), block_num);
 
         Ok(responses)
     }
@@ -394,9 +386,12 @@ mod tests {
                 commitments: vec!["0x01".to_string()],
                 proofs: vec!["0x02".to_string()],
             },
-            block_hash: Some("0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890".to_string()),
+            block_hash: Some(
+                "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890".to_string(),
+            ),
             block_number: Some("0x100".to_string()),
-            tx_hash: "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef".to_string(),
+            tx_hash: "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+                .to_string(),
             tx_index: Some("0x0".to_string()),
         };
 

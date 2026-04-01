@@ -8,10 +8,9 @@ use alloy_rpc_types_engine::{ForkchoiceState, PayloadStatusEnum};
 #[cfg(feature = "bench-test")]
 use jsonrpsee_types::ErrorObjectOwned;
 #[cfg(feature = "bench-test")]
-use reth_payload_primitives::EngineApiMessageVersion;
-#[cfg(feature = "bench-test")]
 use reth_node_ethereum::engine::EthPayloadAttributes;
-
+#[cfg(feature = "bench-test")]
+use reth_payload_primitives::EngineApiMessageVersion;
 
 pub mod builder;
 pub mod payload;
@@ -24,8 +23,7 @@ mod validator_tests;
 pub struct BscEngineApi {
     /// Handle to the beacon consensus engine
     #[allow(dead_code)]
-    engine_handle:
-        Arc<ConsensusEngineHandle<crate::node::engine_api::payload::BscPayloadTypes>>,
+    engine_handle: Arc<ConsensusEngineHandle<crate::node::engine_api::payload::BscPayloadTypes>>,
 }
 
 impl BscEngineApi {
@@ -59,7 +57,11 @@ impl IntoEngineApiRpcModule for BscEngineApi {
                             ForkchoiceState,
                             Option<EthPayloadAttributes>,
                         ) = params.parse().map_err(|e| {
-                            ErrorObjectOwned::owned(-32602, format!("Parse error: {}", e), None::<()>)
+                            ErrorObjectOwned::owned(
+                                -32602,
+                                format!("Parse error: {}", e),
+                                None::<()>,
+                            )
                         })?;
 
                         let engine = engine_handle.clone();
@@ -83,7 +85,10 @@ impl IntoEngineApiRpcModule for BscEngineApi {
                                 }
                                 _ => Err(ErrorObjectOwned::owned(
                                     -32603,
-                                    format!("Engine status error: {}", response.payload_status.status),
+                                    format!(
+                                        "Engine status error: {}",
+                                        response.payload_status.status
+                                    ),
                                     None::<()>,
                                 )),
                             },

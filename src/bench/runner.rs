@@ -87,9 +87,7 @@ impl BenchSpeculativeState {
         self.durable_base_hash = block_hash;
         self.durable_base_number = block_number;
 
-        if self.pending_commit_target
-            == Some(PendingCommitTarget { block_number, block_hash })
-        {
+        if self.pending_commit_target == Some(PendingCommitTarget { block_number, block_hash }) {
             self.pending_commit_target = None;
         }
     }
@@ -106,13 +104,9 @@ fn record_commit_result(
     commit_results: &mut std::collections::HashMap<u64, CommitResult>,
     commit_result: CommitResult,
 ) -> eyre::Result<()> {
-    let block_hash = pending_commit_hashes
-        .remove(&commit_result.block_number)
-        .ok_or_else(|| {
-            eyre::eyre!(
-                "Missing pending commit hash for block {}",
-                commit_result.block_number
-            )
+    let block_hash =
+        pending_commit_hashes.remove(&commit_result.block_number).ok_or_else(|| {
+            eyre::eyre!("Missing pending commit hash for block {}", commit_result.block_number)
         })?;
 
     speculative_state.on_commit_finished(block_hash, commit_result.block_number);
@@ -248,10 +242,9 @@ pub fn run_benchmark(config: BenchConfig) -> eyre::Result<Vec<BlockTiming>> {
     let mut prev_bundle: Option<BundleState> = None;
 
     // Pipelined commit: closure-based channel + background thread
-    let (commit_tx, commit_rx) =
-        std::sync::mpsc::sync_channel::<Box<dyn FnOnce() -> Result<CommitResult, String> + Send>>(
-            1,
-        );
+    let (commit_tx, commit_rx) = std::sync::mpsc::sync_channel::<
+        Box<dyn FnOnce() -> Result<CommitResult, String> + Send>,
+    >(1);
     let (result_tx, result_rx) = std::sync::mpsc::channel::<Result<CommitResult, String>>();
 
     let commit_thread = std::thread::Builder::new()
@@ -307,11 +300,8 @@ pub fn run_benchmark(config: BenchConfig) -> eyre::Result<Vec<BlockTiming>> {
         let validator_addr = init.validator_addresses[validator_index];
 
         let has_cached_reads = cached_reads.is_some();
-        let state_base_hash = if is_setup_block {
-            parent_header.hash()
-        } else {
-            speculative_state.state_base_hash()
-        };
+        let state_base_hash =
+            if is_setup_block { parent_header.hash() } else { speculative_state.state_base_hash() };
         let state_base_number = if is_setup_block {
             parent_header.number()
         } else {
@@ -325,6 +315,7 @@ pub fn run_benchmark(config: BenchConfig) -> eyre::Result<Vec<BlockTiming>> {
             parent_snapshot: Arc::new(parent_snapshot.clone()),
             is_inturn: true,
             cached_reads: None,
+            parent_difflayers: None,
             source: match build_source {
                 BenchBuildSource::Canonical => {
                     crate::node::miner::speculative::MiningContextSource::Canonical
@@ -453,9 +444,10 @@ pub fn run_benchmark(config: BenchConfig) -> eyre::Result<Vec<BlockTiming>> {
         // TIME: Finish (post-exec + state root + assembly)
         // Get a separate state provider BEFORE timing starts to exclude MDBX overhead
         // (production finalize timing in payload.rs:623-625 doesn't include provider creation).
-        let finish_state_provider = init.factory.history_by_block_hash(state_base_hash).map_err(|e| {
-            eyre::eyre!("Failed to get finish state for block {}: {:?}", block_number, e)
-        })?;
+        let finish_state_provider =
+            init.factory.history_by_block_hash(state_base_hash).map_err(|e| {
+                eyre::eyre!("Failed to get finish state for block {}: {:?}", block_number, e)
+            })?;
 
         let finish_start = Instant::now();
 
@@ -601,9 +593,9 @@ pub fn run_benchmark(config: BenchConfig) -> eyre::Result<Vec<BlockTiming>> {
                 let write_state_us = write_state_start.elapsed().as_micros();
 
                 let provider_commit_start = Instant::now();
-                provider_rw.commit().map_err(|e| {
-                    format!("Failed to commit block {}: {:?}", block_number, e)
-                })?;
+                provider_rw
+                    .commit()
+                    .map_err(|e| format!("Failed to commit block {}: {:?}", block_number, e))?;
                 let provider_commit_us = provider_commit_start.elapsed().as_micros();
 
                 let commit_us = commit_start.elapsed().as_micros();
@@ -650,11 +642,11 @@ pub fn run_benchmark(config: BenchConfig) -> eyre::Result<Vec<BlockTiming>> {
             pre_execution_us,
             execute_only_us,
             tx_execution_us,
-            insert_block_us: 0,      // filled from CommitResult after loop
-            write_state_us: 0,      // filled from CommitResult after loop
-            triedb_flush_us,        // measured on main thread
-            provider_commit_us: 0,  // filled from CommitResult after loop
-            commit_us: 0,           // filled from CommitResult after loop
+            insert_block_us: 0,    // filled from CommitResult after loop
+            write_state_us: 0,     // filled from CommitResult after loop
+            triedb_flush_us,       // measured on main thread
+            provider_commit_us: 0, // filled from CommitResult after loop
+            commit_us: 0,          // filled from CommitResult after loop
             pipeline_send_us,
             finish_us,
             total_us,

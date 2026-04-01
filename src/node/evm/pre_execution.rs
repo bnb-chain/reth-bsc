@@ -28,8 +28,8 @@ use revm::{
     context_interface::block::Block,
     primitives::{Address, Bytes, TxKind, U256},
 };
-use std::sync::Arc;
 use schnellru::{ByLength, LruMap};
+use std::sync::Arc;
 use std::{
     collections::HashMap,
     sync::{LazyLock, Mutex},
@@ -70,10 +70,7 @@ where
 {
     /// check the new block, pre check and prepare some intermediate data for finish function.
     /// depends on parlia, header and snapshot.
-    pub(crate) fn check_new_block(
-        &mut self, 
-        block: &BlockEnv
-    ) -> Result<(), BlockExecutionError> {
+    pub(crate) fn check_new_block(&mut self, block: &BlockEnv) -> Result<(), BlockExecutionError> {
         let block_number = block.number().to::<u64>();
         tracing::trace!("Check new block, block_number: {}", block_number);
 
@@ -89,12 +86,12 @@ where
             ))?;
         self.inner_ctx.parent_header = Some(parent_header.clone());
 
-        let snap = self
-            .snapshot_provider
-            .as_ref()
-            .unwrap()
-            .snapshot_by_hash(&header.parent_hash)
-            .ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;
+        let snap =
+            self.snapshot_provider
+                .as_ref()
+                .unwrap()
+                .snapshot_by_hash(&header.parent_hash)
+                .ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;
         self.inner_ctx.snap = Some(Arc::new(snap.clone()));
         self.inner_ctx.expected_turn_length = None;
 
@@ -216,8 +213,12 @@ where
         {
             let mut cache = VALIDATOR_CACHE.lock().unwrap();
             cache.insert(block_hash, result.clone());
-            tracing::debug!("Succeed to update cache, block_number: {}, block_hash: {}, evm_block_number: {}", 
-                block_number, block_hash, self.evm.block().number());
+            tracing::debug!(
+                "Succeed to update cache, block_number: {}, block_hash: {}, evm_block_number: {}",
+                block_number,
+                block_hash,
+                self.evm.block().number()
+            );
         }
 
         Ok(result)
@@ -226,7 +227,7 @@ where
     pub(crate) fn eth_call(
         &mut self,
         to: Address,
-        data: Bytes
+        data: Bytes,
     ) -> Result<Bytes, BlockExecutionError> {
         // Use block gas limit (~36M on BSC) to match GASLIMIT opcode semantics.
         // Mark as system transaction to bypass EIP-7825 gas limit cap (16M),
@@ -637,9 +638,13 @@ where
 
         let header_number = block.number().to::<u64>();
         let header_timestamp = block.timestamp().to::<u64>();
-        if self.spec.is_feynman_active_at_timestamp(header_number, header_timestamp) &&
-            !self.spec.is_feynman_transition_at_timestamp(header_number, header_timestamp, parent_header.timestamp) &&
-            is_breathe_block(parent_header.timestamp, header_timestamp)
+        if self.spec.is_feynman_active_at_timestamp(header_number, header_timestamp)
+            && !self.spec.is_feynman_transition_at_timestamp(
+                header_number,
+                header_timestamp,
+                parent_header.timestamp,
+            )
+            && is_breathe_block(parent_header.timestamp, header_timestamp)
         {
             let (to, data) = self.system_contracts.get_max_elected_validators();
             let bz = self.eth_call(to, data)?;

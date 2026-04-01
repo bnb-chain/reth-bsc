@@ -192,12 +192,11 @@ mod tests {
 
     #[test]
     fn overlay_returns_present_storage_before_inner_db() {
-        let overlay =
-            BundleStateOverlay::new(bundle_with_slot(U256::from(7), U256::from(9)), FakeDb::default());
-        assert_eq!(
-            overlay.storage_ref(example_address(), U256::from(7)).unwrap(),
-            U256::from(9)
+        let overlay = BundleStateOverlay::new(
+            bundle_with_slot(U256::from(7), U256::from(9)),
+            FakeDb::default(),
         );
+        assert_eq!(overlay.storage_ref(example_address(), U256::from(7)).unwrap(), U256::from(9));
     }
 
     #[test]

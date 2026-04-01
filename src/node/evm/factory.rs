@@ -6,9 +6,12 @@ use crate::{
     hardforks::bsc::BscHardfork,
 };
 use reth_evm::{precompiles::PrecompilesMap, Database, EvmEnv, EvmFactory};
-use revm::Inspector;
-use revm::context::{BlockEnv, result::{EVMError, HaltReason}};
+use revm::context::{
+    result::{EVMError, HaltReason},
+    BlockEnv,
+};
 use revm::inspector::NoOpInspector;
+use revm::Inspector;
 
 /// Factory producing [`BscEvm`].
 #[derive(Debug, Default, Clone, Copy)]

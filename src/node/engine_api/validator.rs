@@ -200,7 +200,7 @@ where
                     return Err(PayloadError::BlockHash {
                         execution: computed_hash,
                         consensus: cached_hash,
-                    })?
+                    })?;
                 }
             }
             cached_hash

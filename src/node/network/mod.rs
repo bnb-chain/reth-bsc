@@ -30,8 +30,8 @@ use reth_ethereum_primitives::PooledTransactionVariant;
 use reth_network::{NetworkConfig, NetworkHandle, NetworkManager};
 use reth_network_api::PeersInfo;
 use reth_network_peers::NodeRecord;
-use reth_provider::{BlockNumReader, HeaderProvider, StateProviderFactory};
 use reth_primitives::TransactionSigned;
+use reth_provider::{BlockNumReader, HeaderProvider, StateProviderFactory};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, info, warn};
@@ -169,10 +169,8 @@ pub struct BscNetworkBuilder {
     engine_handle_rx: Arc<Mutex<Option<oneshot::Receiver<ConsensusEngineHandle<BscPayloadTypes>>>>>,
 }
 
-fn apply_bsc_discv4_overrides<I>(
-    discv4_config: &mut Option<Discv4Config>,
-    boot_nodes: Option<I>,
-) where
+fn apply_bsc_discv4_overrides<I>(discv4_config: &mut Option<Discv4Config>, boot_nodes: Option<I>)
+where
     I: IntoIterator<Item = NodeRecord>,
 {
     let Some(discv4_config) = discv4_config.as_mut() else {

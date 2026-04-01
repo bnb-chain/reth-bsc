@@ -2,6 +2,7 @@ use super::handle::ImportHandle;
 use crate::{
     chainspec::BscChainSpec,
     consensus::{parlia::vote_pool, ParliaConsensusErr},
+    metrics::BscBlockImportMetrics,
     node::{
         consensus::BscForkChoiceEngine, engine::BscBuiltPayload,
         engine_api::payload::BscPayloadTypes, evm::util::insert_header_to_cache_with_hash,
@@ -14,6 +15,7 @@ use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::{B256, U128};
 use alloy_rpc_types::engine::{ForkchoiceState, PayloadStatusEnum};
 use futures::{future::Either, stream::FuturesUnordered, StreamExt};
+use once_cell::sync::Lazy;
 use parking_lot::RwLock;
 use reth::consensus::HeaderValidator;
 use reth::network::cache::LruCache;
@@ -78,34 +80,53 @@ const ENGINE_INSERT_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::fro
 /// Poll interval for checking whether an inserted mined block is visible via `query_td`.
 const ENGINE_INSERT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
 
+static BLOCK_IMPORT_METRICS: Lazy<BscBlockImportMetrics> =
+    Lazy::new(BscBlockImportMetrics::default);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InsertWaitOutcome {
+    Visible,
+    TimedOut { last_query_error: Option<String> },
+}
+
 async fn wait_for_inserted_block(
     engine: &ConsensusEngineHandle<BscPayloadTypes>,
     number: u64,
     hash: B256,
     timeout: std::time::Duration,
     poll_interval: std::time::Duration,
-) -> bool {
+) -> InsertWaitOutcome {
+    let wait_start = tokio::time::Instant::now();
     let deadline = tokio::time::Instant::now() + timeout;
+    let mut last_query_error = None;
 
     loop {
         match engine.query_td(number, hash).await {
-            Ok(Some(_)) => return true,
-            Ok(None) => {}
+            Ok(Some(_)) => {
+                BLOCK_IMPORT_METRICS.engine_insert_wait_visible_total.increment(1);
+                BLOCK_IMPORT_METRICS
+                    .engine_insert_wait_duration_seconds
+                    .record(wait_start.elapsed().as_secs_f64());
+                return InsertWaitOutcome::Visible;
+            }
+            Ok(None) => {
+                last_query_error = None;
+            }
             Err(err) => {
-                tracing::warn!(
-                    target: "bsc::block_import",
-                    block_number = number,
-                    block_hash = %hash,
-                    error = %err,
-                    "Failed to query engine TD while waiting for mined block insert"
-                );
-                return false;
+                last_query_error = Some(err.to_string());
             }
         }
 
         let now = tokio::time::Instant::now();
         if now >= deadline {
-            return false;
+            BLOCK_IMPORT_METRICS.engine_insert_wait_timeout_total.increment(1);
+            if last_query_error.is_some() {
+                BLOCK_IMPORT_METRICS.engine_insert_wait_query_error_total.increment(1);
+            }
+            BLOCK_IMPORT_METRICS
+                .engine_insert_wait_duration_seconds
+                .record(wait_start.elapsed().as_secs_f64());
+            return InsertWaitOutcome::TimedOut { last_query_error };
         }
 
         tokio::time::sleep(std::cmp::min(poll_interval, deadline - now)).await;
@@ -202,7 +223,7 @@ where
                         .into(),
                     )),
                 }
-                .into()
+                .into();
             }
 
             let sealed_block = block.block.0.block.clone().seal_unchecked(block_hash);
@@ -340,8 +361,9 @@ where
         // update fork choice.
         //
         // `InsertExecutedBlock` and FCU still travel over separate channels, so we wait until the
-        // engine exposes the inserted block via `query_td()` before sending FCU. This gives an
-        // observable ordering check instead of relying on scheduler timing.
+        // engine exposes the inserted block via `query_td()` before sending FCU. Transient
+        // `query_td()` misses are treated as "not visible yet" and only surface if the whole wait
+        // budget expires.
         {
             let engine_tx_opt = crate::shared::get_engine_api_tx();
             let engine = self.engine.clone();
@@ -357,7 +379,9 @@ where
                         block_hash = %block_hash,
                         "Inserting mined block into engine tree"
                     );
-                    if let Err(e) = engine_tx.send(EngineApiRequest::InsertExecutedBlock(executed_block)) {
+                    if let Err(e) =
+                        engine_tx.send(EngineApiRequest::InsertExecutedBlock(executed_block))
+                    {
                         tracing::warn!(
                             target: "bsc::block_import",
                             block_number = %header_for_fcu.number,
@@ -366,22 +390,28 @@ where
                             "Failed to insert executed block into engine tree, block will be dropped"
                         );
                         should_send_fcu = false;
-                    } else if !wait_for_inserted_block(
-                        &engine,
-                        header_for_fcu.number,
-                        block_hash,
-                        ENGINE_INSERT_WAIT_TIMEOUT,
-                        ENGINE_INSERT_POLL_INTERVAL,
-                    )
-                    .await
-                    {
-                        tracing::warn!(
-                            target: "bsc::block_import",
-                            block_number = %header_for_fcu.number,
-                            block_hash = %block_hash,
-                            timeout_ms = ENGINE_INSERT_WAIT_TIMEOUT.as_millis(),
-                            "Timed out waiting for mined block to become visible in engine tree before FCU"
-                        );
+                    } else {
+                        match wait_for_inserted_block(
+                            &engine,
+                            header_for_fcu.number,
+                            block_hash,
+                            ENGINE_INSERT_WAIT_TIMEOUT,
+                            ENGINE_INSERT_POLL_INTERVAL,
+                        )
+                        .await
+                        {
+                            InsertWaitOutcome::Visible => {}
+                            InsertWaitOutcome::TimedOut { last_query_error } => {
+                                tracing::warn!(
+                                    target: "bsc::block_import",
+                                    block_number = %header_for_fcu.number,
+                                    block_hash = %block_hash,
+                                    timeout_ms = ENGINE_INSERT_WAIT_TIMEOUT.as_millis(),
+                                    last_query_error = last_query_error.as_deref(),
+                                    "Timed out waiting for mined block to become visible in engine tree before FCU"
+                                );
+                            }
+                        }
                     }
                 } else {
                     tracing::warn!(
@@ -614,13 +644,8 @@ where
 
 impl<Provider> Future for ImportService<Provider>
 where
-    Provider: BlockNumReader
-        + HeaderProvider<Header = Header>
-        + Clone
-        + Send
-        + Sync
-        + 'static
-        + Unpin,
+    Provider:
+        BlockNumReader + HeaderProvider<Header = Header> + Clone + Send + Sync + 'static + Unpin,
 {
     type Output = Result<(), Box<dyn std::error::Error>>;
 
@@ -693,8 +718,8 @@ mod tests {
         collections::HashMap,
         collections::VecDeque,
         sync::Arc,
-        time::Duration,
         task::{Context, Poll},
+        time::Duration,
     };
 
     #[tokio::test]
@@ -721,7 +746,10 @@ mod tests {
         let mut fixture = TestFixture::new(EngineResponses::invalid_new_payload()).await;
         fixture
             .assert_block_import(|outcome| {
-                matches!(outcome, BlockImportEvent::Announcement(BlockValidation::ValidHeader { .. }))
+                matches!(
+                    outcome,
+                    BlockImportEvent::Announcement(BlockValidation::ValidHeader { .. })
+                )
             })
             .await;
 
@@ -821,10 +849,13 @@ mod tests {
         let (to_engine, from_engine) = mpsc::unbounded_channel();
         let engine_handle = ConsensusEngineHandle::new(to_engine);
 
-        handle_engine_msg(from_engine, EngineResponses::query_td(vec![None, None, Some(U256::from(7))]))
-            .await;
+        handle_engine_msg(
+            from_engine,
+            EngineResponses::query_td(vec![None, None, Some(U256::from(7))]),
+        )
+        .await;
 
-        assert!(
+        assert_eq!(
             wait_for_inserted_block(
                 &engine_handle,
                 1,
@@ -832,7 +863,57 @@ mod tests {
                 Duration::from_millis(50),
                 Duration::from_millis(1),
             )
-            .await
+            .await,
+            InsertWaitOutcome::Visible
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_inserted_block_reports_real_timeout() {
+        let (to_engine, from_engine) = mpsc::unbounded_channel();
+        let engine_handle = ConsensusEngineHandle::new(to_engine);
+
+        handle_engine_msg(from_engine, EngineResponses::query_td(vec![None, None, None, None]))
+            .await;
+
+        assert_eq!(
+            wait_for_inserted_block(
+                &engine_handle,
+                1,
+                B256::with_last_byte(2),
+                Duration::from_millis(5),
+                Duration::from_millis(1),
+            )
+            .await,
+            InsertWaitOutcome::TimedOut { last_query_error: None }
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_inserted_block_ignores_transient_query_errors() {
+        let (to_engine, from_engine) = mpsc::unbounded_channel();
+        let engine_handle = ConsensusEngineHandle::new(to_engine);
+
+        handle_engine_msg(
+            from_engine,
+            EngineResponses::query_td_results(vec![
+                Err("no header found for Hash(0x01)"),
+                Ok(None),
+                Ok(Some(U256::from(7))),
+            ]),
+        )
+        .await;
+
+        assert_eq!(
+            wait_for_inserted_block(
+                &engine_handle,
+                1,
+                B256::with_last_byte(3),
+                Duration::from_millis(50),
+                Duration::from_millis(1),
+            )
+            .await,
+            InsertWaitOutcome::Visible
         );
     }
 
@@ -845,9 +926,7 @@ mod tests {
 
         let block_msg = create_test_block();
         let block_hash = block_msg.hash;
-        fixture
-            .send_mined_block(create_test_payload(&block_msg), block_msg)
-            .unwrap();
+        fixture.send_mined_block(create_test_payload(&block_msg), block_msg).unwrap();
 
         let event = tokio::time::timeout(Duration::from_secs(1), payload_events_rx.recv())
             .await
@@ -1001,7 +1080,7 @@ mod tests {
     struct EngineResponses {
         new_payload: PayloadStatusEnum,
         fcu: PayloadStatusEnum,
-        query_td: VecDeque<Option<U256>>,
+        query_td: VecDeque<Result<Option<U256>, &'static str>>,
     }
 
     impl EngineResponses {
@@ -1009,7 +1088,7 @@ mod tests {
             Self {
                 new_payload: PayloadStatusEnum::Valid,
                 fcu: PayloadStatusEnum::Valid,
-                query_td: VecDeque::from([Some(U256::from(1))]),
+                query_td: VecDeque::from([Ok(Some(U256::from(1)))]),
             }
         }
 
@@ -1017,7 +1096,7 @@ mod tests {
             Self {
                 new_payload: PayloadStatusEnum::Invalid { validation_error: "test error".into() },
                 fcu: PayloadStatusEnum::Valid,
-                query_td: VecDeque::from([Some(U256::from(1))]),
+                query_td: VecDeque::from([Ok(Some(U256::from(1)))]),
             }
         }
 
@@ -1025,11 +1104,20 @@ mod tests {
             Self {
                 new_payload: PayloadStatusEnum::Valid,
                 fcu: PayloadStatusEnum::Invalid { validation_error: "fcu error".into() },
-                query_td: VecDeque::from([Some(U256::from(1))]),
+                query_td: VecDeque::from([Ok(Some(U256::from(1)))]),
             }
         }
 
         fn query_td(query_td: Vec<Option<U256>>) -> Self {
+            Self {
+                query_td: query_td.into_iter().map(Ok).collect(),
+                ..Self::both_valid()
+            }
+        }
+
+        fn query_td_results(
+            query_td: Vec<Result<Option<U256>, &'static str>>,
+        ) -> Self {
             Self { query_td: query_td.into(), ..Self::both_valid() }
         }
     }
@@ -1205,8 +1293,15 @@ mod tests {
                         .unwrap();
                     }
                     BeaconEngineMessage::QueryTd { tx, .. } => {
-                        let td = responses.query_td.pop_front().flatten();
-                        tx.send(Ok(td)).unwrap();
+                        match responses.query_td.pop_front().unwrap_or(Ok(None)) {
+                            Ok(td) => tx.send(Ok(td)).unwrap(),
+                            Err(_) => tx
+                                .send(Err(reth_provider::ProviderError::HeaderNotFound(
+                                    alloy_eips::BlockHashOrNumber::Hash(B256::with_last_byte(1)),
+                                )
+                                .into()))
+                                .unwrap(),
+                        }
                     }
                     _ => {}
                 }
