@@ -150,8 +150,33 @@ where
 
             let triedb_calc_started = std::time::Instant::now();
 
+            // Finish the streaming updater HERE — after executor.finish() has executed
+            // all post-execution system txs (distribute_incoming, finality_reward, etc.)
+            // so that the precomputed storage roots include ALL state changes.
+            let precomputed = self.ctx.streaming_updater_sink.as_ref().and_then(|sink| {
+                sink.0.lock().unwrap().take().and_then(|updater| {
+                    match updater.finish() {
+                        Ok(result) => {
+                            tracing::debug!(
+                                target: "bsc::builder",
+                                precomputed_accounts = result.storage_roots.len(),
+                                "Streaming storage trie updater finished inside finish_with_difflayer"
+                            );
+                            Some(result)
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "bsc::builder",
+                                error = %e,
+                                "Streaming storage trie updater failed, falling back to standard path"
+                            );
+                            None
+                        }
+                    }
+                })
+            });
+
             // Fast path: use pre-computed storage tries from StreamingTrieUpdater.
-            let precomputed = self.ctx.precomputed_storage_sink.as_ref().and_then(|sink| sink.0.lock().unwrap().take());
             let (new_root, new_difflayer) = if let Some(precomputed) = precomputed {
                 tracing::debug!(
                     target: "bsc::builder",

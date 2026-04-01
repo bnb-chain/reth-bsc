@@ -6,7 +6,7 @@ use crate::evm::blacklist;
 use crate::hardforks::BscHardforks;
 use crate::metrics::{BscConsensusMetrics, BscMinerMetrics};
 use crate::node::engine::{BscBuiltPayload, BuildKind};
-use crate::node::evm::config::{BscEvmConfig, BscNextBlockEnvAttributes, PrecomputedStorageSink, ValidatorCacheSink};
+use crate::node::evm::config::{BscEvmConfig, BscNextBlockEnvAttributes, StreamingUpdaterSink, ValidatorCacheSink};
 use crate::node::evm::pre_execution::{TURN_LENGTH_CACHE, VALIDATOR_CACHE};
 use crate::node::evm::{request_difflayer, MinerTrieDbPrefetcher};
 use crate::node::miner::bid_simulator::BidSimulator;
@@ -398,7 +398,7 @@ where
         let validator_cache_sink: ValidatorCacheSink =
             Arc::new(Mutex::new(None));
         let turn_length_sink: Arc<Mutex<Option<u8>>> = Arc::new(Mutex::new(None));
-        let precomputed_storage_sink = PrecomputedStorageSink::default();
+        let streaming_updater_sink = StreamingUpdaterSink::default();
 
         let next_env_attributes = BscNextBlockEnvAttributes {
             inner: NextBlockEnvAttributes {
@@ -414,7 +414,7 @@ where
             triedb_prefetcher: triedb_prefetcher.clone(),
             validator_cache_sink: Some(validator_cache_sink.clone()),
             turn_length_sink: Some(turn_length_sink.clone()),
-            precomputed_storage_sink: Some(precomputed_storage_sink.clone()),
+            streaming_updater_sink: Some(streaming_updater_sink.clone()),
         };
 
         let mut builder = self
@@ -792,33 +792,12 @@ where
         }
         let exec_duration = exec_start.elapsed();
 
-        // Finish the streaming updater before finish_with_difflayer.
-        let precomputed_storage = streaming_updater.and_then(|updater| {
-            match updater.finish() {
-                Ok(result) => {
-                    debug!(
-                        target: "payload_builder",
-                        trace_id,
-                        precomputed_accounts = result.storage_roots.len(),
-                        "Streaming storage trie updater finished"
-                    );
-                    Some(result)
-                }
-                Err(e) => {
-                    warn!(
-                        target: "payload_builder",
-                        trace_id,
-                        error = %e,
-                        "Streaming storage trie updater failed, falling back"
-                    );
-                    None
-                }
-            }
-        });
-
-        // Set precomputed storage via the shared sink so finish_with_difflayer can pick it up.
-        if let Some(precomputed) = precomputed_storage {
-            *precomputed_storage_sink.0.lock().unwrap() = Some(precomputed);
+        // Pass the streaming updater to finish_with_difflayer via the sink.
+        // The updater must be finished AFTER executor.finish() (which executes
+        // post-execution system txs) so that precomputed storage roots include
+        // all state changes.
+        if let Some(updater) = streaming_updater {
+            *streaming_updater_sink.0.lock().unwrap() = Some(updater);
         }
 
         // add system txs to payload.
@@ -974,7 +953,7 @@ where
         let validator_cache_sink: ValidatorCacheSink =
             Arc::new(Mutex::new(None));
         let turn_length_sink: Arc<Mutex<Option<u8>>> = Arc::new(Mutex::new(None));
-        let precomputed_storage_sink = PrecomputedStorageSink::default();
+        let streaming_updater_sink = StreamingUpdaterSink::default();
 
         let mut builder = self
             .evm_config
@@ -995,7 +974,7 @@ where
                     triedb_prefetcher: triedb_prefetcher.clone(),
                     validator_cache_sink: Some(validator_cache_sink.clone()),
                     turn_length_sink: Some(turn_length_sink.clone()),
-                    precomputed_storage_sink: Some(precomputed_storage_sink.clone()),
+                    streaming_updater_sink: Some(streaming_updater_sink.clone()),
                 },
             )
             .map_err(PayloadBuilderError::other)?;
@@ -1067,33 +1046,9 @@ where
         let total_fees = U256::ZERO;
         let cumulative_gas_used = 0;
 
-        // Finish the streaming updater before finish_with_difflayer.
-        let precomputed_storage = streaming_updater.and_then(|updater| {
-            match updater.finish() {
-                Ok(result) => {
-                    debug!(
-                        target: "payload_builder",
-                        trace_id,
-                        precomputed_accounts = result.storage_roots.len(),
-                        "Streaming storage trie updater finished (empty payload)"
-                    );
-                    Some(result)
-                }
-                Err(e) => {
-                    warn!(
-                        target: "payload_builder",
-                        trace_id,
-                        error = %e,
-                        "Streaming storage trie updater failed (empty payload), falling back"
-                    );
-                    None
-                }
-            }
-        });
-
-        // Set precomputed storage via the shared sink so finish_with_difflayer can pick it up.
-        if let Some(precomputed) = precomputed_storage {
-            *precomputed_storage_sink.0.lock().unwrap() = Some(precomputed);
+        // Pass the streaming updater to finish_with_difflayer via the sink.
+        if let Some(updater) = streaming_updater {
+            *streaming_updater_sink.0.lock().unwrap() = Some(updater);
         }
 
         // Add system txs to payload and finalize
