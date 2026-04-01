@@ -73,9 +73,9 @@ reth-tasks = { git = "https://github.com/bnb-chain/reth.git", branch = "develop"
 reth-transaction-pool = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
 
 # triedb dependencies
-rust-eth-triedb = { git = "https://github.com/bnb-chain/reth-bsc-triedb.git", branch = "develop" }
-rust-eth-triedb-common = { git = "https://github.com/bnb-chain/reth-bsc-triedb.git", branch = "develop", package = "rust-eth-triedb-common" }
-rust-eth-triedb-pathdb = { git = "https://github.com/bnb-chain/reth-bsc-triedb.git", branch = "develop", package = "rust-eth-triedb-pathdb" }
+rust-eth-triedb = { git = "ssh://git@github.com/bnb-chain/reth-bsc-triedb.git", branch = "feat/streaming-storage-trie" }
+rust-eth-triedb-common = { git = "ssh://git@github.com/bnb-chain/reth-bsc-triedb.git", branch = "feat/streaming-storage-trie", package = "rust-eth-triedb-common" }
+rust-eth-triedb-pathdb = { git = "ssh://git@github.com/bnb-chain/reth-bsc-triedb.git", branch = "feat/streaming-storage-trie", package = "rust-eth-triedb-pathdb" }
 
 revm = "34.0.0"
 revm-context-interface = "14.0.0"
@@ -242,8 +242,10 @@ codegen-units = 1
 [dev-dependencies]
 uuid = { version = "1", features = ["v4"] }
 
+# Override reth's transitive triedb dependency (HTTPS) to use the same feature branch
+# as our direct dependency (SSH). This ensures type identity across the dependency graph.
 [patch."https://github.com/bnb-chain/reth-bsc-triedb.git"]
-rust-eth-triedb = { path = "../reth-bsc-triedb/triedb" }
-rust-eth-triedb-common = { path = "../reth-bsc-triedb/common" }
-rust-eth-triedb-pathdb = { path = "../reth-bsc-triedb/db/pathdb" }
-rust-eth-triedb-state-trie = { path = "../reth-bsc-triedb/state-trie" }
+rust-eth-triedb = { git = "ssh://git@github.com/bnb-chain/reth-bsc-triedb.git", branch = "feat/streaming-storage-trie" }
+rust-eth-triedb-common = { git = "ssh://git@github.com/bnb-chain/reth-bsc-triedb.git", branch = "feat/streaming-storage-trie" }
+rust-eth-triedb-pathdb = { git = "ssh://git@github.com/bnb-chain/reth-bsc-triedb.git", branch = "feat/streaming-storage-trie" }
+rust-eth-triedb-state-trie = { git = "ssh://git@github.com/bnb-chain/reth-bsc-triedb.git", branch = "feat/streaming-storage-trie" }
