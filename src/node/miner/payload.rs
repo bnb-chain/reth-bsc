@@ -389,7 +389,9 @@ where
                 gas_limit: self.builder_config.gas_limit(parent_header.gas_limit),
                 parent_beacon_block_root: attributes.parent_beacon_block_root(),
                 withdrawals: Some(attributes.withdrawals().clone()),
-                extra_data: self.builder_config.extra_data.clone(),
+                extra_data: crate::shared::get_miner_extra()
+                    .filter(|b| !b.is_empty())
+                    .unwrap_or_else(|| self.builder_config.extra_data.clone()),
             },
             parent_difflayers: triedb_parent_difflayers.clone(),
             triedb_prefetcher: triedb_prefetcher.clone(),
@@ -892,7 +894,9 @@ where
                         gas_limit: self.builder_config.gas_limit(parent_header.gas_limit),
                         parent_beacon_block_root: attributes.parent_beacon_block_root(),
                         withdrawals: Some(attributes.withdrawals().clone()),
-                        extra_data: self.builder_config.extra_data.clone(),
+                        extra_data: crate::shared::get_miner_extra()
+                            .filter(|b| !b.is_empty())
+                            .unwrap_or_else(|| self.builder_config.extra_data.clone()),
                     },
                     parent_difflayers: triedb_parent_difflayers.clone(),
                     triedb_prefetcher: triedb_prefetcher.clone(),

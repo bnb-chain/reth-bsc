@@ -25,7 +25,7 @@ pub trait BscMinerApi {
 
     /// Sets the gaslimit to target towards during mining.
     #[method(name = "setGasLimit")]
-    async fn set_gas_limit(&self, gas_limit: u64) -> RpcResult<bool>;
+    async fn set_gas_limit(&self, gas_limit: alloy_primitives::U256) -> RpcResult<bool>;
 
     /// Sets the etherbase of the miner.
     #[method(name = "setEtherbase")]
@@ -107,9 +107,10 @@ impl BscMinerApiServer for BscMinerApiImpl {
         Ok(true)
     }
 
-    async fn set_gas_limit(&self, gas_limit: u64) -> RpcResult<bool> {
+    async fn set_gas_limit(&self, gas_limit: alloy_primitives::U256) -> RpcResult<bool> {
         tracing::info!(target: "bsc::rpc", "miner_setGasLimit called with: {}", gas_limit);
-        crate::shared::set_miner_gas_limit(gas_limit);
+        let limit: u64 = gas_limit.try_into().unwrap_or(u64::MAX);
+        crate::shared::set_miner_gas_limit(limit);
         Ok(true)
     }
 
