@@ -126,28 +126,43 @@ where
         state: impl StateProvider,
     ) -> Result<BlockBuilderOutcomeWithDiffLayer<BscPrimitives>, BlockExecutionError> {
         let finish_start = std::time::Instant::now();
+
+        // Step 1: executor.finish() — executes post-execution system txs
+        let step = std::time::Instant::now();
         let (evm, result) = self.executor.finish()?;
         let (db, evm_env) = evm.finish();
+        let executor_finish_ms = step.elapsed().as_millis();
 
         let assembled_system_txs = {
             let mut inner = self.shared_ctx.inner.borrow_mut();
             std::mem::take(&mut inner.assembled_system_txs)
         };
-        // merge all transitions into bundle state
-        db.merge_transitions(BundleRetention::Reverts);
 
+        // Step 2: merge_transitions
+        let step = std::time::Instant::now();
+        db.merge_transitions(BundleRetention::Reverts);
+        let merge_transitions_ms = step.elapsed().as_millis();
+
+        // Step 3: hashed_post_state
+        let step = std::time::Instant::now();
         let state_root_start = std::time::Instant::now();
         let hashed_state = state.hashed_post_state(&db.bundle_state);
+        let hashed_post_state_ms = step.elapsed().as_millis();
 
         // Use triedb to calculate state root
         let (state_root, trie_updates, produced_difflayer) = if rust_eth_triedb::triedb_manager::is_triedb_active() {
             let mut triedb = get_global_triedb();
-            // Miner-side: try to use triedb prefetcher + parent difflayers from execution ctx.
             let prefetch_state = self.ctx.triedb_prefetcher.take().and_then(|p| p.finish());
             let parent_state_root = (**self.parent).state_root();
+
+            // Step 4: to_triedb_hashed_post_state conversion
+            let step = std::time::Instant::now();
             let trie_hashed_state = hashed_state.to_triedb_hashed_post_state();
+            let to_triedb_state_ms = step.elapsed().as_millis();
+
             let difflayers_opt = self.ctx.parent_difflayers.as_ref();
 
+            // Step 5: triedb computation (state_at + intermediate + commit)
             let triedb_calc_started = std::time::Instant::now();
             let (new_root, new_difflayer) = triedb
                 .intermediate_and_commit_hashed_post_state(
@@ -157,16 +172,20 @@ where
                     prefetch_state,
                 )
                 .map_err(BlockExecutionError::other)?;
-            let triedb_calc_with_prefetch_ms = triedb_calc_started.elapsed().as_millis();
+            let triedb_calc_ms = triedb_calc_started.elapsed().as_millis();
 
             tracing::debug!(
-                target: "bsc::builder",
+                target: "bsc::builder::timing",
                 parent_hash = %self.parent.hash(),
                 block_number = %(self.parent.number + 1),
-                parent_state_root = %parent_state_root,
-                new_state_root = %new_root,
+                executor_finish_ms,
+                merge_transitions_ms,
+                hashed_post_state_ms,
+                to_triedb_state_ms,
+                triedb_calc_ms,
                 has_parent_difflayers = difflayers_opt.is_some(),
                 user_tx_count = self.transactions.len(),
+                system_tx_count = assembled_system_txs.len(),
                 hashed_accounts = hashed_state.accounts.len(),
                 hashed_storages = hashed_state.storages.len(),
                 hashed_storage_slots = hashed_state
@@ -174,9 +193,7 @@ where
                     .values()
                     .map(|s| s.storage.len())
                     .sum::<usize>(),
-                triedb_calc_ms = triedb_calc_with_prefetch_ms,
-                triedb_calc_us = triedb_calc_started.elapsed().as_micros(),
-                "Calculated state root using triedb"
+                "finish_with_difflayer timing breakdown"
             );
             (new_root, TrieUpdates::default(), Some(new_difflayer))
         } else {
