@@ -23,6 +23,7 @@ use reth_db::{Database, DatabaseError};
 use reth_db::table::{Compress, Decompress};
 use reth_db::models::ParliaSnapshotBlob;
 use reth_db::transaction::{DbTx, DbTxMut};
+use reth_db::tables::{HeaderNumbers, Headers};
 use schnellru::{ByLength, LruMap};
 
 pub trait SnapshotProvider: Send + Sync {
@@ -119,6 +120,21 @@ impl<DB: Database> DbSnapshotProvider<DB> {
     pub fn insert_cache_only(&self, snapshot: &Snapshot) {
         self.cache_by_hash.write().insert(snapshot.block_hash, snapshot.clone());
     }
+
+    /// Fetch a header by hash directly from the DB.
+    /// Used as fallback when the in-memory header cache is empty (e.g. at startup).
+    fn get_header_by_hash_from_db(&self, block_hash: &BlockHash) -> Option<Header> {
+        let tx = self.db.tx().ok()?;
+        let block_number = tx.get::<HeaderNumbers>(*block_hash).ok()??;
+        tx.get::<Headers<alloy_consensus::Header>>(block_number).ok()?
+    }
+
+    /// Fetch a canonical header by block number directly from the DB.
+    /// Used as fallback when the in-memory header cache is empty (e.g. at startup).
+    fn get_canonical_header_by_number_from_db(&self, block_number: u64) -> Option<Header> {
+        let tx = self.db.tx().ok()?;
+        tx.get::<Headers<alloy_consensus::Header>>(block_number).ok()?
+    }
 }
 
 impl<DB: Database + 'static> SnapshotProvider for DbSnapshotProvider<DB> {
@@ -157,20 +173,18 @@ impl<DB: Database + 'static> SnapshotProvider for EnhancedDbSnapshotProvider<DB>
     fn snapshot_by_hash(&self, block_hash: &BlockHash) -> Option<Snapshot> {
         // query snapshot from cache or db
         if let Some(snap) = self.base.snapshot_by_hash(block_hash) {
-            Some(snap)
-        } else if let Some(target_header) = get_header_by_hash_from_cache(block_hash) {
-            if target_header.number == 0 {
-                return self.init_genesis_snapshot(&target_header);
-            }
-            let snap= self.try_rebuild(&target_header);
-            if let Some(s) = snap.as_ref() {
-                self.base.insert(s.clone());
-            }
-            snap
-        } else {
-            tracing::warn!("Failed to query snapshot by hash due to not found header, block_hash: {}", block_hash);
-            None
+            return Some(snap);
         }
+        // Header cache first, then fallback to DB so this works at startup when cache is empty.
+        let target_header = self.get_header_by_hash(block_hash)?;
+        if target_header.number == 0 {
+            return self.init_genesis_snapshot(&target_header);
+        }
+        let snap = self.try_rebuild(&target_header);
+        if let Some(s) = snap.as_ref() {
+            self.base.insert(s.clone());
+        }
+        snap
     }
 
     fn insert(&self, snapshot: Snapshot) {
@@ -179,6 +193,28 @@ impl<DB: Database + 'static> SnapshotProvider for EnhancedDbSnapshotProvider<DB>
 }
 
 impl<DB: Database + 'static> EnhancedDbSnapshotProvider<DB> {
+    /// Get header by hash: in-memory cache first, DB as fallback.
+    fn get_header_by_hash(&self, block_hash: &BlockHash) -> Option<Header> {
+        get_header_by_hash_from_cache(block_hash).or_else(|| {
+            let h = self.base.get_header_by_hash_from_db(block_hash);
+            if h.is_some() {
+                tracing::debug!(target: "parlia::snapshot", "Header cache miss, loaded from DB for hash {}", block_hash);
+            }
+            h
+        })
+    }
+
+    /// Get canonical header by number: in-memory cache first, DB as fallback.
+    fn get_canonical_header_by_number(&self, number: u64) -> Option<Header> {
+        get_cannonical_header_from_cache(number).or_else(|| {
+            let h = self.base.get_canonical_header_by_number_from_db(number);
+            if h.is_some() {
+                tracing::debug!(target: "parlia::snapshot", "Canonical header cache miss, loaded from DB for number {}", number);
+            }
+            h
+        })
+    }
+
     fn init_genesis_snapshot(&self, genesis_header: &Header) -> Option<Snapshot> {
         let ValidatorsInfo { consensus_addrs, vote_addrs } =
             self.parlia.parse_validators_from_header(
@@ -211,7 +247,7 @@ impl<DB: Database + 'static> EnhancedDbSnapshotProvider<DB> {
             let mut parent_block_hash = target_header.parent_hash;
             rebuild_block_hashes.push(target_header.hash_slow());
             loop {
-                let parent_header = get_header_by_hash_from_cache(&parent_block_hash);
+                let parent_header = self.get_header_by_hash(&parent_block_hash);
                 if parent_header.is_none() {
                     tracing::warn!("Failed to query snapshot by hash due to not found header, block_hash: {}", parent_block_hash);
                     break None;
@@ -237,7 +273,7 @@ impl<DB: Database + 'static> EnhancedDbSnapshotProvider<DB> {
         rebuild_block_hashes.reverse();
         let mut working_snapshot = base_snapshot.clone().unwrap();
         for block_hash in rebuild_block_hashes {
-            let apply_header = get_header_by_hash_from_cache(&block_hash);
+            let apply_header = self.get_header_by_hash(&block_hash);
             if apply_header.is_none() {
                 tracing::warn!("Failed to query snapshot by hash due to not found header, block_hash: {}", block_hash);
                 return None;
@@ -247,13 +283,13 @@ impl<DB: Database + 'static> EnhancedDbSnapshotProvider<DB> {
             let miner_check_len = working_snapshot.miner_history_check_len();
             let is_epoch_boundary = header.number > 0 && epoch_remainder == miner_check_len;
             let mut turn_length = None;
-                
+
             let validators_info = if is_epoch_boundary {
                 let checkpoint_block_number = header.number - miner_check_len;
-                tracing::debug!("Updating validator set at epoch boundary, checkpoint_block: {}, current_block: {}", 
+                tracing::debug!("Updating validator set at epoch boundary, checkpoint_block: {}, current_block: {}",
                     checkpoint_block_number, header.number);
-                
-                if let Some(checkpoint_header) = get_cannonical_header_from_cache(checkpoint_block_number) {
+
+                if let Some(checkpoint_header) = self.get_canonical_header_by_number(checkpoint_block_number) {
                     let parsed = 
                         self.parlia.parse_validators_from_header(&checkpoint_header, working_snapshot.epoch_num)
                             .map_err(|err| {

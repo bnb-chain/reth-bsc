@@ -181,11 +181,32 @@ where
                         Outcome { peer: peer_id, result: Ok(BlockValidation::ValidBlock { block }) }
                             .into()
                     }
-                    PayloadStatusEnum::Invalid { validation_error } => Outcome {
-                        peer: peer_id,
-                        result: Err(BlockImportError::Other(validation_error.into())),
+                    PayloadStatusEnum::Invalid { validation_error } => {
+                        // Do NOT penalize the peer for Invalid blocks.
+                        //
+                        // In BSC's PoSA with devp2p block propagation, Invalid
+                        // frequently results from timing issues during concurrent
+                        // reorgs — the block itself is legitimate but was executed
+                        // against the wrong state. Penalizing the peer with BadBlock
+                        // (-16384 reputation) for this drains peers rapidly,
+                        // especially under BSC's fast block time (0.45s), where
+                        // concurrent forks are routine.
+                        //
+                        // This aligns with geth's behavior: geth's fetcher only
+                        // drops a peer when header verification fails
+                        // (verifyHeader), never when block execution fails
+                        // (insertChain). Truly malicious peers are still caught by
+                        // the network layer's BadMessage / BadProtocol penalties.
+                        tracing::debug!(
+                            target: "bsc::block_import",
+                            block_hash = %header.hash_slow(),
+                            block_number = header.number,
+                            %validation_error,
+                            peer = %peer_id,
+                            "New payload returned Invalid - not penalizing peer"
+                        );
+                        None
                     }
-                    .into(),
                     PayloadStatusEnum::Syncing => {
                         // When new_payload returns Syncing status, we need to manually trigger FCU
                         // to avoid the engine-tree being stuck in syncing state without any driver.
@@ -275,32 +296,74 @@ where
             .to_network
             .send(BlockImportEvent::Announcement(BlockValidation::ValidBlock { block: block_msg }));
 
-        // Insert the executed block (with difflayer) directly into the engine tree.
-        // This must happen before ForkChoiceUpdate so the engine has the pre-executed state.
-        if let Some(engine_tx) = crate::shared::get_engine_api_tx() {
-            tracing::debug!(target: "bsc::block_import", "Inserting mined block into engine tree with difflayer: {:?}", block_hash);
-            let _ = engine_tx.send(EngineApiRequest::InsertExecutedBlock(payload.executed_block.clone()));
-        }
-
-        // Broadcast built payload event for fast consumers
-        if let Some(tx) = crate::shared::get_payload_events_tx() {
-            tracing::debug!(target: "bsc::block_import", "Sending built payload event for mined block: {:?}", block_hash);
-            let _ = tx.send(Events::<BscPayloadTypes>::BuiltPayload(payload));
-        } else {
-            tracing::warn!(
-                "Failed to send mined block due to payload events channel not initialised"
-            );
-        }
-
-        // Update fork choice for the mined block
+        // Insert the executed block into the engine tree, then update fork choice.
+        //
+        // Ordering guarantee: InsertExecutedBlock MUST be processed by the engine before FCU.
+        // Both messages travel through separate channels (engine_api_tx vs consensus_engine_tx)
+        // that feed into the same engine service via a tokio::select! loop. Without explicit
+        // ordering, the engine may process FCU before the block is indexed, causing it to be
+        // rejected or ignored.
+        //
+        // Fix: run both in a single spawned task. After sending InsertExecutedBlock, call
+        // yield_now() so the engine service task can pick up and process the insert from
+        // engine_api_rx before we send FCU through the separate consensus channel.
         {
+            let engine_tx_opt = crate::shared::get_engine_api_tx();
+            let executed_block = payload.executed_block.clone();
             let forkchoice_engine = self.forkchoice_engine.clone();
             tokio::spawn(async move {
-                tracing::debug!(target: "bsc::block_import", "Updating fork choice for mined block: number = {:?}, hash = {:?}", header_for_fcu.number, block_hash);
-                if let Err(e) = forkchoice_engine.update_forkchoice(&header_for_fcu).await {
-                    tracing::warn!(target: "bsc::block_import", "Failed to update fork choice for mined block: number = {:?}, hash = {:?}, error = {}", header_for_fcu.number, block_hash, e);
+                if let Some(engine_tx) = engine_tx_opt {
+                    tracing::debug!(
+                        target: "bsc::block_import",
+                        block_number = %header_for_fcu.number,
+                        block_hash = %block_hash,
+                        "Inserting mined block into engine tree"
+                    );
+                    if let Err(e) = engine_tx.send(EngineApiRequest::InsertExecutedBlock(executed_block)) {
+                        tracing::warn!(
+                            target: "bsc::block_import",
+                            block_number = %header_for_fcu.number,
+                            block_hash = %block_hash,
+                            error = %e,
+                            "Failed to insert executed block into engine tree, block will be dropped"
+                        );
+                        return;
+                    }
+                    // Yield to the tokio runtime so the engine service loop processes
+                    // InsertExecutedBlock from engine_api_rx before FCU is enqueued in
+                    // the separate consensus_engine channel. This closes the race window
+                    // where FCU could arrive at the engine tree before the block is indexed.
+                    tokio::task::yield_now().await;
                 } else {
-                    tracing::debug!(target: "bsc::block_import", "Succeed to update fork choice for mined block: number = {:?}, hash = {:?}", header_for_fcu.number, block_hash);
+                    tracing::warn!(
+                        target: "bsc::block_import",
+                        block_number = %header_for_fcu.number,
+                        block_hash = %block_hash,
+                        "engine_api_tx not initialized, skipping InsertExecutedBlock"
+                    );
+                }
+
+                tracing::debug!(
+                    target: "bsc::block_import",
+                    block_number = %header_for_fcu.number,
+                    block_hash = %block_hash,
+                    "Updating fork choice for mined block"
+                );
+                if let Err(e) = forkchoice_engine.update_forkchoice(&header_for_fcu).await {
+                    tracing::warn!(
+                        target: "bsc::block_import",
+                        block_number = %header_for_fcu.number,
+                        block_hash = %block_hash,
+                        error = %e,
+                        "Failed to update fork choice for mined block"
+                    );
+                } else {
+                    tracing::debug!(
+                        target: "bsc::block_import",
+                        block_number = %header_for_fcu.number,
+                        block_hash = %block_hash,
+                        "Succeeded to update fork choice for mined block"
+                    );
                 }
             });
         }
@@ -575,18 +638,40 @@ mod tests {
 
     #[tokio::test]
     async fn can_handle_invalid_new_payload() {
+        // When new_payload returns Invalid, the peer should NOT be penalized.
+        // The only event emitted is the early ValidHeader announcement from
+        // on_new_block; no BlockImportOutcome error should follow.
         let mut fixture = TestFixture::new(EngineResponses::invalid_new_payload()).await;
         fixture
             .assert_block_import(|outcome| {
-                matches!(
-                    outcome,
-                    BlockImportEvent::Outcome(BlockImportOutcome {
-                        peer: _,
-                        result: Err(BlockImportError::Other(_))
-                    })
-                )
+                matches!(outcome, BlockImportEvent::Announcement(BlockValidation::ValidHeader { .. }))
             })
             .await;
+
+        // Verify no error outcome was emitted
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut extra = Vec::new();
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(200);
+        loop {
+            match fixture.handle.poll_outcome(&mut cx) {
+                Poll::Ready(Some(event)) => extra.push(event),
+                Poll::Ready(None) => break,
+                Poll::Pending => {
+                    if tokio::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+        assert!(
+            !extra.iter().any(|e| matches!(
+                e,
+                BlockImportEvent::Outcome(BlockImportOutcome { result: Err(_), .. })
+            )),
+            "Should not penalize peer for Invalid new_payload. Extra events: {extra:?}"
+        );
     }
 
     #[tokio::test]

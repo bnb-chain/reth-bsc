@@ -14,8 +14,10 @@ use super::{
     malicious_vote_monitor::MaliciousVoteMonitor,
     vote::{VoteData, VoteEnvelope},
 };
-use crate::metrics::BscVoteMetrics;
+use crate::consensus::parlia::util::calculate_millisecond_timestamp;
+use crate::metrics::{BscFinalityMetrics, BscVoteMetrics};
 use crate::shared;
+use std::time::SystemTime;
 
 const LOWER_LIMIT_OF_VOTE_BLOCK_NUMBER: u64 = 256;
 /// Size of the LRU cache for tracking finality notifications (matches geth's finalizedNotified)
@@ -221,6 +223,9 @@ static VOTE_POOL: Lazy<RwLock<VotePool>> = Lazy::new(|| RwLock::new(VotePool::ne
 /// Global metrics for vote operations.
 static VOTE_METRICS: Lazy<BscVoteMetrics> = Lazy::new(BscVoteMetrics::default);
 
+/// Global metrics for finality operations (shared with consensus layer).
+static FINALITY_METRICS: Lazy<BscFinalityMetrics> = Lazy::new(BscFinalityMetrics::default);
+
 /// LRU cache to track which blocks have already been notified for finality.
 /// This prevents repeated update_forkchoice calls for the same block (matches geth's finalizedNotified).
 static FINALIZED_NOTIFIED: Lazy<RwLock<LruCache<B256, ()>>> =
@@ -358,6 +363,19 @@ fn maybe_notify_finality(target_hash: B256, votes_for_block: usize) {
     {
         let mut cache = FINALIZED_NOTIFIED.write().expect("finalized notified cache poisoned");
         cache.put(target_hash, ());
+    }
+
+    // Record early finalization latency: time from the finalized block's millisecond
+    // timestamp to now, equivalent to chain/finalized/latency/early in geth.
+    // The finalized block is current_justified (head - 1), identified by current_justified_number.
+    if let Some(justified_header) = shared::get_canonical_header_by_number(current_justified_number) {
+        let now_ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let block_ms = calculate_millisecond_timestamp(&justified_header);
+        let latency_ms = now_ms.saturating_sub(block_ms) as f64;
+        FINALITY_METRICS.finalized_latency_early_ms.set(latency_ms);
     }
 
     if let Some(engine) = shared::get_fork_choice_engine() {
