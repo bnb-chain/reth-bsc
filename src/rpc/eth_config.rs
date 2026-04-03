@@ -22,15 +22,14 @@ use alloy_eips::{
 use alloy_evm::precompiles::Precompile;
 use alloy_primitives::Address;
 use jsonrpsee::core::RpcResult;
+use jsonrpsee::types::{error::INTERNAL_ERROR_CODE, ErrorObject};
 use reth_chainspec::{ChainSpecProvider, EthChainSpec, EthereumHardforks, Hardforks, Head};
-use reth_errors::{ProviderError, RethError};
 use reth_evm::{precompiles::PrecompilesMap, ConfigureEvm, Evm};
-use reth_node_api::NodePrimitives;
+use reth_primitives::NodePrimitives;
 use reth_primitives_traits::header::HeaderMut;
+use reth_provider::BlockReaderIdExt;
 use reth_revm::db::EmptyDB;
 use reth_rpc_eth_api::helpers::config::EthConfigApiServer;
-use reth_rpc_eth_types::EthApiError;
-use reth_storage_api::BlockReaderIdExt;
 use std::collections::BTreeMap;
 
 /// BSC-specific handler for the `eth_config` RPC endpoint.
@@ -186,18 +185,19 @@ where
     }
 
     /// Main config method - builds current, next, and last fork configurations.
-    fn config(&self) -> Result<EthConfig, RethError> {
+    fn config(&self) -> RpcResult<EthConfig> {
         let chain_spec = self.provider.chain_spec();
         let latest = self
             .provider
-            .latest_header()?
-            .ok_or_else(|| ProviderError::BestBlockNotFound)?
+            .latest_header()
+            .map_err(|e| internal_err(e.to_string()))?
+            .ok_or_else(|| internal_err("best block not found"))?
             .into_header();
 
         let current_precompiles = evm_to_precompiles_map(
             self.evm_config
                 .evm_for_block(EmptyDB::default(), &latest)
-                .map_err(RethError::other)?,
+                .map_err(|e| internal_err(e.to_string()))?,
         );
 
         let mut fork_timestamps = chain_spec
@@ -218,7 +218,7 @@ where
             };
         let (current_fork_idx, current_fork_timestamp) = current_fork_idx
             .and_then(|idx| fork_timestamps.get(idx).map(|ts| (idx, *ts)))
-            .ok_or_else(|| RethError::msg("no active timestamp fork found"))?;
+            .ok_or_else(|| internal_err("no active timestamp fork found"))?;
 
         let current = self.build_fork_config_at(current_fork_timestamp, current_precompiles);
 
@@ -233,7 +233,7 @@ where
             let next_precompiles = evm_to_precompiles_map(
                 self.evm_config
                     .evm_for_block(EmptyDB::default(), &fake_header)
-                    .map_err(RethError::other)?,
+                    .map_err(|e| internal_err(e.to_string()))?,
             );
 
             config.next =
@@ -252,7 +252,7 @@ where
         let last_precompiles = evm_to_precompiles_map(
             self.evm_config
                 .evm_for_block(EmptyDB::default(), &fake_header)
-                .map_err(RethError::other)?,
+                .map_err(|e| internal_err(e.to_string()))?,
         );
 
         config.last =
@@ -271,8 +271,13 @@ where
         ConfigureEvm<Primitives: NodePrimitives<BlockHeader = Provider::Header>> + 'static,
 {
     fn config(&self) -> RpcResult<EthConfig> {
-        Ok(self.config().map_err(EthApiError::from)?)
+        BscEthConfigHandler::config(self)
     }
+}
+
+/// Helper to create a jsonrpsee internal error.
+fn internal_err(msg: impl Into<String>) -> jsonrpsee::types::ErrorObjectOwned {
+    ErrorObject::owned(INTERNAL_ERROR_CODE, msg.into(), None::<()>)
 }
 
 /// Converts EVM precompile addresses into a name→address map for the RPC response.
