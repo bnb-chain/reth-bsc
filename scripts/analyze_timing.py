@@ -415,6 +415,7 @@ def main():
     parser = argparse.ArgumentParser(description="Analyze reth-bsc miner timing logs")
     parser.add_argument("logfile", help="Log file path, or '-' for stdin")
     parser.add_argument("--last", type=int, default=None, help="Analyze only the last N blocks")
+    parser.add_argument("--min-tx", type=int, default=0, help="Only include blocks with >= N transactions")
     args = parser.parse_args()
 
     if args.logfile == "-":
@@ -424,6 +425,10 @@ def main():
             lines = f.readlines()
 
     blocks = parse_logs(lines, last_n=args.last)
+    if args.min_tx > 0:
+        before = len(blocks)
+        blocks = [b for b in blocks if b.tx_count >= args.min_tx]
+        print(f"  [filter: --min-tx {args.min_tx} kept {len(blocks)}/{before} blocks]")
     analyze(blocks)
 
 
