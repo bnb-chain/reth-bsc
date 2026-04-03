@@ -400,6 +400,7 @@ fn main() -> eyre::Result<()> {
                         tracing::info!("Succeed to register Blob RPC API");
 
                         tracing::info!("Start to register eth_config (EIP-7910) RPC API...");
+                        use reth::api::FullNodeComponents;
                         use reth_bsc::rpc::eth_config::BscEthConfigHandler;
                         use reth_rpc_eth_api::helpers::config::EthConfigApiServer;
 

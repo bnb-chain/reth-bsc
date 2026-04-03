@@ -16,7 +16,7 @@ use reth::{
     builder::rpc::EthApiCtx,
     builder::{
         components::ComponentsBuilder,
-        rpc::{EthApiBuilder, RpcAddOns, RpcContext},
+        rpc::{EthApiBuilder, RpcAddOns},
         DebugNode, Node, NodeAdapter,
     },
     rpc::eth::core::{EthApiFor, EthRpcConverterFor},
