@@ -174,7 +174,20 @@ pub async fn batch_request_range_and_await_import(
     request_timeout: Duration,
 ) -> Result<(), String> {
     let resp =
-        request_blocks_by_range(peer, start_height, start_hash, count, request_timeout).await?;
+        request_blocks_by_range(peer, start_height, start_hash, count, request_timeout)
+            .await
+            .map_err(|e| {
+                tracing::warn!(
+                    target: "bsc::registry",
+                    peer = %peer,
+                    start_height,
+                    start_hash = %start_hash,
+                    count,
+                    error = %e,
+                    "Batch request range failed"
+                );
+                e
+            })?;
     tracing::debug!(
         target: "bsc::registry",
         peer = %peer,
