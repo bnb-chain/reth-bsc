@@ -493,8 +493,10 @@ where
                 );
                 tokio::spawn(async move {
                     use std::time::Duration;
-                    // Bump request timeout to 1000ms to accommodate slower peers
-                    let req_timeout = Duration::from_millis(DOWNLOAD_COOLDOWN_DURATION_MS as u64);
+                    // Use a generous request timeout separate from the cooldown interval.
+                    // DOWNLOAD_COOLDOWN_DURATION_MS (200ms) is intentionally short to avoid
+                    // duplicate downloads, but a block fetch across the network needs more time.
+                    let req_timeout = Duration::from_millis(1000);
                     let _ = crate::node::network::bsc_protocol::registry::batch_request_range_and_await_import(
                         bsc_peer,
                         start_height,
