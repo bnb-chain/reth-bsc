@@ -11,6 +11,7 @@ use crate::hardforks::BscHardforks;
 use alloy_consensus::BlockHeader;
 use alloy_eips::eip2935::HISTORY_STORAGE_ADDRESS;
 use alloy_eips::eip7840::BlobParams;
+use alloy_evm::precompiles::Precompile;
 use alloy_primitives::{Address, Bytes};
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::proc_macros::rpc;
