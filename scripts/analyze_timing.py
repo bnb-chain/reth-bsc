@@ -5,11 +5,12 @@ Analyze reth-bsc miner timing logs to identify state root computation bottleneck
 Usage:
     python3 scripts/analyze_timing.py <logfile>
     python3 scripts/analyze_timing.py <logfile> --last 100   # only last N blocks
-    cat reth.log | grep -E "timing|payload_builder" | python3 scripts/analyze_timing.py -
+    cat reth.log | grep -E "timing|payload_builder|tx_timing" | python3 scripts/analyze_timing.py -
 
 Expects log lines containing these targets:
   - "payload_builder"        → Block payload built successfully (overall build timing)
   - "bsc::builder::timing"   → finish_with_difflayer breakdown
+  - "bsc::miner::tx_timing"  → per-block tx execution summary + slow tx details
   - "triedb::timing"         → intermediate_and_commit, intermediate_inner, update_state_objects, commit_inner
 """
 
@@ -58,6 +59,19 @@ class BlockTiming:
     # triedb: commit_inner breakdown
     commit_state_objects_ms: int = 0
     storage_tries_count: int = 0
+
+    # per-tx execution breakdown
+    tx_p50_us: int = 0
+    tx_p95_us: int = 0
+    tx_p99_us: int = 0
+    tx_max_us: int = 0
+    tx_min_us: int = 0
+    tx_avg_us: int = 0
+    slow_tx_1ms: int = 0
+    very_slow_tx_5ms: int = 0
+    total_gas: int = 0
+    avg_gas: int = 0
+    max_gas: int = 0
 
 
 def extract_kv(line: str) -> dict:
@@ -122,6 +136,22 @@ def parse_logs(lines, last_n=None):
             bt.hashed_storages = kv.get("hashed_storages", 0)
             bt.hashed_storage_slots = kv.get("hashed_storage_slots", 0)
             bt.system_tx_count = kv.get("system_tx_count", 0)
+
+        # --- bsc::miner::tx_timing: per-block tx execution summary ---
+        elif "per-block tx execution summary" in line:
+            bn = kv.get("block_number", 0)
+            bt = blocks.setdefault(bn, BlockTiming(block_number=bn))
+            bt.tx_p50_us = kv.get("p50_us", 0)
+            bt.tx_p95_us = kv.get("p95_us", 0)
+            bt.tx_p99_us = kv.get("p99_us", 0)
+            bt.tx_max_us = kv.get("max_us", 0)
+            bt.tx_min_us = kv.get("min_us", 0)
+            bt.tx_avg_us = kv.get("avg_us", 0)
+            bt.slow_tx_1ms = kv.get("slow_tx_1ms", 0)
+            bt.very_slow_tx_5ms = kv.get("very_slow_tx_5ms", 0)
+            bt.total_gas = kv.get("total_gas", 0)
+            bt.avg_gas = kv.get("avg_gas", 0)
+            bt.max_gas = kv.get("max_gas", 0)
 
         # --- triedb::timing: intermediate_and_commit breakdown ---
         elif "intermediate_and_commit_hashed_post_state breakdown" in line:
@@ -243,8 +273,45 @@ def analyze(blocks):
         print_stats_table("  storage_tries_count", stats([b.storage_tries_count for b in blocks]), unit="")
         print()
 
+    # --- Per-tx execution analysis ---
+    has_tx = any(b.tx_p50_us > 0 for b in blocks)
+    if has_tx:
+        print("6. PER-TX EXECUTION ANALYSIS")
+        print("-" * 80)
+        print_stats_table("  tx duration p50", stats([b.tx_p50_us for b in blocks]), unit="us")
+        print_stats_table("  tx duration p95", stats([b.tx_p95_us for b in blocks]), unit="us")
+        print_stats_table("  tx duration p99", stats([b.tx_p99_us for b in blocks]), unit="us")
+        print_stats_table("  tx duration max", stats([b.tx_max_us for b in blocks]), unit="us")
+        print_stats_table("  tx duration min", stats([b.tx_min_us for b in blocks]), unit="us")
+        print_stats_table("  slow txs (>1ms)", stats([b.slow_tx_1ms for b in blocks]), unit="")
+        print_stats_table("  very slow txs (>5ms)", stats([b.very_slow_tx_5ms for b in blocks]), unit="")
+        print()
+        print_stats_table("  total gas / block", stats([b.total_gas for b in blocks]), unit="")
+        print_stats_table("  avg gas / tx", stats([b.avg_gas for b in blocks]), unit="")
+        print_stats_table("  max gas / tx (in block)", stats([b.max_gas for b in blocks]), unit="")
+        print()
+
+        # Slow tx impact analysis
+        blocks_with_slow = [b for b in blocks if b.very_slow_tx_5ms > 0]
+        blocks_without_slow = [b for b in blocks if b.very_slow_tx_5ms == 0]
+        if blocks_with_slow and blocks_without_slow:
+            avg_exec_with = sum(b.exec_ms for b in blocks_with_slow) / len(blocks_with_slow)
+            avg_exec_without = sum(b.exec_ms for b in blocks_without_slow) / len(blocks_without_slow)
+            avg_txcount_with = sum(b.tx_count for b in blocks_with_slow) / len(blocks_with_slow)
+            avg_txcount_without = sum(b.tx_count for b in blocks_without_slow) / len(blocks_without_slow)
+            print(f"  SLOW TX IMPACT:")
+            print(f"    Blocks with >5ms txs:    {len(blocks_with_slow):>4} blocks, avg exec={avg_exec_with:.0f}ms, avg tx_count={avg_txcount_with:.0f}")
+            print(f"    Blocks without >5ms txs: {len(blocks_without_slow):>4} blocks, avg exec={avg_exec_without:.0f}ms, avg tx_count={avg_txcount_without:.0f}")
+            if avg_txcount_with > 0 and avg_txcount_without > 0:
+                per_tx_with = avg_exec_with / avg_txcount_with * 1000
+                per_tx_without = avg_exec_without / avg_txcount_without * 1000
+                print(f"    Per-tx avg (with slow):  {per_tx_with:.0f}μs")
+                print(f"    Per-tx avg (without):    {per_tx_without:.0f}μs")
+                print(f"    Slow tx overhead:        +{per_tx_with - per_tx_without:.0f}μs/tx")
+            print()
+
     # --- Bottleneck analysis ---
-    print("6. BOTTLENECK ANALYSIS")
+    print("7. BOTTLENECK ANALYSIS")
     print("-" * 80)
 
     # Compute average percentages of build_ms

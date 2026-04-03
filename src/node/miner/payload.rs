@@ -484,6 +484,13 @@ where
         let exec_start = std::time::Instant::now();
         // Everything before `exec_start` is treated as "prepare" time for this payload attempt.
         let prepare_duration = exec_start.duration_since(build_start);
+
+        // Per-tx timing instrumentation: collect per-tx durations and gas for analysis.
+        let mut tx_timings_us: Vec<u128> = Vec::new();
+        let mut tx_gas_used_list: Vec<u64> = Vec::new();
+        let mut slow_tx_count: u64 = 0;        // > 1ms
+        let mut very_slow_tx_count: u64 = 0;   // > 5ms
+
         while let Some(pool_tx) = best_tx_list.next() {
             if cancel.is_cancelled() {
                 break;
@@ -712,6 +719,26 @@ where
             cumulative_gas_used += gas_used;
 
             let tx_duration = tx_start.elapsed();
+            let tx_us = tx_duration.as_micros();
+            tx_timings_us.push(tx_us);
+            tx_gas_used_list.push(gas_used);
+            if tx_us > 5000 {
+                very_slow_tx_count += 1;
+                debug!(
+                    target: "bsc::miner::tx_timing",
+                    trace_id,
+                    block_number = parent_header.number() + 1,
+                    tx_hash = %tx.hash(),
+                    sender = ?tx.signer(),
+                    to = ?tx.to(),
+                    gas_used,
+                    gas_limit = tx.gas_limit(),
+                    duration_us = tx_us,
+                    "very slow tx (>5ms)"
+                );
+            } else if tx_us > 1000 {
+                slow_tx_count += 1;
+            }
             if tx_duration.as_micros() > 3000 {
                 debug!(
                     target: "payload_builder",
@@ -742,6 +769,44 @@ where
             }
         }
         let exec_duration = exec_start.elapsed();
+
+        // Per-block tx execution summary with percentile breakdown.
+        if !tx_timings_us.is_empty() {
+            tx_timings_us.sort_unstable();
+            let n = tx_timings_us.len();
+            let p50 = tx_timings_us[n / 2];
+            let p95 = tx_timings_us[(n as f64 * 0.95) as usize];
+            let p99 = tx_timings_us[std::cmp::min((n as f64 * 0.99) as usize, n - 1)];
+            let max_us = tx_timings_us[n - 1];
+            let min_us = tx_timings_us[0];
+            let total_us: u128 = tx_timings_us.iter().sum();
+            let avg_us = total_us / n as u128;
+
+            // Gas-weighted analysis: find top gas consumers
+            let total_gas: u64 = tx_gas_used_list.iter().sum();
+            let avg_gas: u64 = if n > 0 { total_gas / n as u64 } else { 0 };
+            let max_gas = tx_gas_used_list.iter().max().copied().unwrap_or(0);
+
+            debug!(
+                target: "bsc::miner::tx_timing",
+                trace_id,
+                block_number = parent_header.number() + 1,
+                tx_count = n,
+                exec_ms = exec_duration.as_millis(),
+                avg_us,
+                p50_us = p50,
+                p95_us = p95,
+                p99_us = p99,
+                max_us,
+                min_us,
+                slow_tx_1ms = slow_tx_count,
+                very_slow_tx_5ms = very_slow_tx_count,
+                total_gas,
+                avg_gas,
+                max_gas,
+                "per-block tx execution summary"
+            );
+        }
 
         // add system txs to payload.
         let finalize_start = std::time::Instant::now();
