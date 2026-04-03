@@ -30,9 +30,6 @@ use reth_engine_primitives::ConsensusEngineHandle;
 
 use reth_payload_primitives::{PayloadAttributesBuilder, PayloadTypes};
 use reth_primitives::BlockBody;
-use crate::rpc::eth_config::BscEthConfigHandler;
-use reth_rpc_eth_api::helpers::config::EthConfigApiServer;
-use reth_rpc_server_types::RethRpcModule;
 use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex};
 use tracing::trace;
@@ -187,17 +184,10 @@ where
     }
 
     fn add_ons(&self) -> Self::AddOns {
-        BscNodeAddOns::default().extend_rpc_modules(
-            |ctx: RpcContext<'_, NodeAdapter<N>, <BscEthApiBuilder as EthApiBuilder<NodeAdapter<N>>>::EthApi>| {
-                let eth_config = BscEthConfigHandler::new(
-                    ctx.node().provider().clone(),
-                    ctx.node().evm_config().clone(),
-                );
-            ctx.modules
-                .merge_if_module_configured(RethRpcModule::Eth, eth_config.into_rpc())?;
-            Ok(())
-            },
-        )
+        // NOTE: eth_config (EIP-7910) is registered in main.rs's extend_rpc_modules closure,
+        // because the builder-level extend_rpc_modules REPLACES (not appends) the add_ons one.
+        // All BSC-specific RPC registrations live in main.rs to avoid being overwritten.
+        BscNodeAddOns::default()
     }
 }
 
