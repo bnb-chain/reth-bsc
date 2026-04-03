@@ -63,17 +63,27 @@ class BlockTiming:
 def extract_kv(line: str) -> dict:
     """Extract key=value pairs from a structured tracing log line."""
     kv = {}
-    # Match key=value patterns (value can be number, string, bool, or quoted)
-    for m in re.finditer(r'(\w+)=([\d.]+|true|false|"[^"]*"|\S+)', line):
+    # Match key=value patterns. Order matters:
+    #   1. 0x-prefixed hex strings (hashes, addresses)
+    #   2. Quoted strings
+    #   3. true/false
+    #   4. Numbers (int or float)
+    #   5. Any non-whitespace token
+    for m in re.finditer(r'(\w+)=(0x[0-9a-fA-F]+|"[^"]*"|true|false|[\d.]+|\S+)', line):
         k, v = m.group(1), m.group(2)
         v = v.strip('"')
-        try:
-            if '.' in v:
-                kv[k] = float(v)
-            else:
-                kv[k] = int(v)
-        except (ValueError, TypeError):
-            kv[k] = v
+        if v.startswith('0x'):
+            kv[k] = v  # keep hex as string
+        elif v in ('true', 'false'):
+            kv[k] = v == 'true'
+        else:
+            try:
+                if '.' in v:
+                    kv[k] = float(v)
+                else:
+                    kv[k] = int(v)
+            except (ValueError, TypeError):
+                kv[k] = v
     return kv
 
 
