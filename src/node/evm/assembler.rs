@@ -149,6 +149,11 @@ where
             None
         };
 
+        let extra_data = {
+            let ctx_extra = eth_ctx.extra_data.clone();
+            if ctx_extra.is_empty() { self.extra_data.clone() } else { ctx_extra }
+        };
+
         let header = Header {
             parent_hash: eth_ctx.parent_hash,
             ommers_hash: EMPTY_OMMER_ROOT_HASH,
@@ -166,7 +171,7 @@ where
             gas_limit: evm_env.block_env.gas_limit(),
             difficulty: evm_env.block_env.difficulty(),
             gas_used: *gas_used,
-            extra_data: self.extra_data.clone(),
+            extra_data,
             parent_beacon_block_root,
             blob_gas_used,
             excess_blob_gas,
@@ -261,6 +266,11 @@ where
             None
         };
 
+        let extra_data = {
+            let ctx_extra = eth_ctx.extra_data.clone();
+            if ctx_extra.is_empty() { self.extra_data.clone() } else { ctx_extra }
+        };
+
         let mut header = Header {
             parent_hash: eth_ctx.parent_hash,
             ommers_hash: EMPTY_OMMER_ROOT_HASH,
@@ -278,7 +288,7 @@ where
             gas_limit: evm_env.block_env.gas_limit(),
             difficulty: evm_env.block_env.difficulty(),
             gas_used: *gas_used,
-            extra_data: self.extra_data.clone(),
+            extra_data,
             parent_beacon_block_root: eth_ctx.parent_beacon_block_root,
             blob_gas_used,
             excess_blob_gas,

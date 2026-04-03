@@ -161,7 +161,9 @@ where
     }
 
     if new_header.extra_data.len() < EXTRA_VANITY_LEN {
-        new_header.extra_data = Bytes::from(vec![0u8; EXTRA_VANITY_LEN]);
+        let mut padded = new_header.extra_data.to_vec();
+        padded.resize(EXTRA_VANITY_LEN, 0u8);
+        new_header.extra_data = Bytes::from(padded);
     }
     // TODO: add vanity data, and fork hash.
     // set default header extra with Reth version.

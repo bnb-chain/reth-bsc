@@ -94,6 +94,17 @@ where
             );
         }
 
+        // Check miner gas price floor (set by miner_setGasPrice RPC).
+        // Reject transactions whose max_fee_per_gas is below the miner's configured minimum.
+        if let Some(min_gas_price) = crate::shared::get_miner_gas_tip() {
+            if transaction.max_fee_per_gas() < min_gas_price as u128 {
+                return TransactionValidationOutcome::Invalid(
+                    transaction,
+                    InvalidPoolTransactionError::Underpriced,
+                );
+            }
+        }
+
         // Delegate to internal validator
         self.inner.validate_transaction(origin, transaction).await
     }
@@ -182,7 +193,10 @@ where
     >;
 
     async fn build_pool(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::Pool> {
-        let pool_config = ctx.pool_config();
+        // Disable the upstream protocol base fee check (MIN_PROTOCOL_BASE_FEE = 7 wei)
+        // because BSC handles min gas price dynamically via miner_setGasPrice RPC
+        // and enforces it in BscTxValidator instead.
+        let pool_config = ctx.pool_config().with_disabled_protocol_base_fee();
 
         // Same as upstream: derive blob cache size based on time
         let blob_cache_size = if let Some(blob_cache_size) = pool_config.blob_cache_size {
