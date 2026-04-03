@@ -1,27 +1,19 @@
 //! BSC-specific implementation of EIP-7910 `eth_config` RPC endpoint.
 //!
-//! This overrides the upstream `EthConfigHandler` to include BSC system contracts
-//! and correctly handle BSC's chain-specific configuration (e.g., no deposit contract,
-//! BSC-specific blob params, BSC system contracts from genesis).
+//! This overrides the upstream `EthConfigHandler` to:
+//! - Return BSC-compatible precompile names (geth's `Name()` convention)
+//! - Return standard Ethereum system contracts only (not BSC system contracts)
+//! - Return null for `blobSchedule` (BSC doesn't support EIP-4844 blobs)
+//!
+//! Ref: <https://eips.ethereum.org/EIPS/eip-7910>
 
-use crate::{
-    hardforks::BscHardforks,
-    system_contracts::{
-        CROSS_CHAIN_CONTRACT, GOV_HUB_CONTRACT, GOV_TOKEN_CONTRACT, GOVERNOR_CONTRACT,
-        LIGHT_CLIENT_CONTRACT, RELAYER_HUB_CONTRACT, RELAYER_INCENTIVIZE_CONTRACT,
-        SLASH_CONTRACT, STAKE_CREDIT_CONTRACT, STAKE_HUB_CONTRACT, STAKING_CONTRACT,
-        SYSTEM_REWARD_CONTRACT, TIMELOCK_CONTRACT, TOKEN_HUB_CONTRACT,
-        TOKEN_MANAGER_CONTRACT, TOKEN_RECOVER_PORTAL_CONTRACT, VALIDATOR_CONTRACT,
-    },
-};
+use crate::hardforks::BscHardforks;
 use alloy_consensus::BlockHeader;
-use alloy_eips::{
-    eip7840::BlobParams,
-    eip7910::{EthConfig, EthForkConfig, SystemContract},
-};
-use alloy_evm::precompiles::Precompile;
-use alloy_primitives::Address;
+use alloy_eips::eip2935::HISTORY_STORAGE_ADDRESS;
+use alloy_eips::eip7840::BlobParams;
+use alloy_primitives::{Address, Bytes};
 use jsonrpsee::core::RpcResult;
+use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::types::{error::INTERNAL_ERROR_CODE, ErrorObject};
 use reth_chainspec::{ChainSpecProvider, EthChainSpec, EthereumHardforks, Hardforks, Head};
 use reth_evm::{precompiles::PrecompilesMap, ConfigureEvm, Evm};
@@ -29,17 +21,71 @@ use reth_primitives::NodePrimitives;
 use reth_primitives_traits::header::HeaderMut;
 use reth_provider::BlockReaderIdExt;
 use reth_revm::db::EmptyDB;
-use reth_rpc_eth_api::helpers::config::EthConfigApiServer;
+use serde::Serialize;
 use std::collections::BTreeMap;
+
+// ---- BSC-specific RPC trait (replaces upstream EthConfigApiServer) ----
+
+/// BSC-specific `eth_config` RPC trait.
+///
+/// Replaces the upstream `EthConfigApiServer` to support:
+/// - Nullable `blobSchedule` (BSC doesn't use EIP-4844 blobs)
+/// - BSC-compatible precompile naming
+/// - Standard Ethereum system contracts only (not BSC system contracts)
+#[rpc(server, namespace = "eth")]
+pub trait BscEthConfigApi {
+    /// Returns the chain configuration for the current, next, and last forks.
+    #[method(name = "config")]
+    fn config(&self) -> RpcResult<BscEthConfig>;
+}
+
+// ---- Response types ----
+
+/// BSC eth_config response with current, next, and last fork configurations.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BscEthConfig {
+    pub current: BscEthForkConfig,
+    pub next: Option<BscEthForkConfig>,
+    pub last: Option<BscEthForkConfig>,
+}
+
+/// BSC fork configuration.
+///
+/// Unlike the upstream `EthForkConfig`, this uses `Option<BlobParams>` for
+/// `blob_schedule` so it can serialize as `null` for BSC (which doesn't
+/// support EIP-4844 blob transactions).
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BscEthForkConfig {
+    pub activation_time: u64,
+    /// Nullable blob schedule. BSC returns `null` since it doesn't use EIP-4844 blobs.
+    pub blob_schedule: Option<BlobParams>,
+    /// Chain ID serialized as hex string (e.g., `"0x61"`) to match geth format.
+    #[serde(serialize_with = "serialize_chain_id_hex")]
+    pub chain_id: u64,
+    /// Fork identifier hash.
+    pub fork_id: Bytes,
+    /// Active precompiles: name → address.
+    pub precompiles: BTreeMap<String, Address>,
+    /// Active system contracts: name → address.
+    pub system_contracts: BTreeMap<String, Address>,
+}
+
+/// Serialize chain_id as hex string with `0x` prefix to match geth format.
+fn serialize_chain_id_hex<S: serde::Serializer>(id: &u64, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&format!("0x{:x}", id))
+}
+
+// ---- Handler ----
 
 /// BSC-specific handler for the `eth_config` RPC endpoint.
 ///
 /// Extends the upstream EIP-7910 implementation with:
-/// - BSC system contracts (ValidatorSet, Slash, StakeHub, etc.)
-/// - Correct blob param handling (BSC doesn't modify params at Prague)
-/// - BSC hardfork-aware system contract activation
-///
-/// Ref: <https://eips.ethereum.org/EIPS/eip-7910>
+/// - BSC-compatible precompile names (HEADER_VALIDATE, BLS_SIGNATURE_VERIFY, etc.)
+/// - Standard Ethereum system contracts only (HISTORY_STORAGE_ADDRESS at Prague)
+/// - Null blob schedule (BSC doesn't modify blob params)
+/// - BSC hardfork-aware fork configuration
 #[derive(Debug, Clone)]
 pub struct BscEthConfigHandler<Provider, Evm> {
     provider: Provider,
@@ -59,110 +105,37 @@ where
         Self { provider, evm_config }
     }
 
-    /// Returns BSC system contracts active at the given timestamp.
+    /// Returns standard Ethereum system contracts active at the given timestamp.
     ///
-    /// BSC has a rich set of system contracts deployed at genesis and extended
-    /// at specific hardforks. Unlike Ethereum, BSC does not have beacon/deposit
-    /// contracts but instead has validator management, staking, and cross-chain
-    /// bridge contracts.
-    ///
-    /// We use `u64::MAX` for block_number when checking hardfork activation because
-    /// all timestamp-based BSC forks also require London to be active (block-based),
-    /// and `u64::MAX` always satisfies the block condition. This is consistent with
-    /// the upstream fork_id calculation: `Head { timestamp, number: u64::MAX, .. }`.
-    fn bsc_system_contracts_at(&self, timestamp: u64) -> BTreeMap<SystemContract, Address> {
+    /// Matches geth-bsc behavior: only standard Ethereum system contracts are returned.
+    /// BSC-specific system contracts (ValidatorSet, Slash, StakeHub, etc.) are NOT
+    /// included, matching geth's `ActiveSystemContracts(timestamp)` output.
+    fn system_contracts_at(&self, timestamp: u64) -> BTreeMap<String, Address> {
         let chain_spec = self.provider.chain_spec();
         let mut contracts = BTreeMap::new();
 
-        // Core system contracts - present from genesis
-        contracts.insert(
-            SystemContract::Other("ValidatorSet".to_string()),
-            VALIDATOR_CONTRACT,
-        );
-        contracts.insert(
-            SystemContract::Other("SlashIndicator".to_string()),
-            SLASH_CONTRACT,
-        );
-        contracts.insert(
-            SystemContract::Other("SystemReward".to_string()),
-            SYSTEM_REWARD_CONTRACT,
-        );
-        contracts.insert(
-            SystemContract::Other("LightClient".to_string()),
-            LIGHT_CLIENT_CONTRACT,
-        );
-        contracts.insert(
-            SystemContract::Other("TokenHub".to_string()),
-            TOKEN_HUB_CONTRACT,
-        );
-        contracts.insert(
-            SystemContract::Other("RelayerIncentivize".to_string()),
-            RELAYER_INCENTIVIZE_CONTRACT,
-        );
-        contracts.insert(
-            SystemContract::Other("RelayerHub".to_string()),
-            RELAYER_HUB_CONTRACT,
-        );
-        contracts.insert(
-            SystemContract::Other("GovHub".to_string()),
-            GOV_HUB_CONTRACT,
-        );
-        contracts.insert(
-            SystemContract::Other("TokenManager".to_string()),
-            TOKEN_MANAGER_CONTRACT,
-        );
-        contracts.insert(
-            SystemContract::Other("CrossChain".to_string()),
-            CROSS_CHAIN_CONTRACT,
-        );
-        contracts.insert(
-            SystemContract::Other("Staking".to_string()),
-            STAKING_CONTRACT,
-        );
-
-        // Staking v2 contracts - activated at Feynman hardfork.
-        // Use u64::MAX for block_number since all timestamp-based BSC forks
-        // require London to be active (block-based), and u64::MAX always
-        // satisfies that block condition.
-        if chain_spec.is_feynman_active_at_timestamp(u64::MAX, timestamp) {
+        // EIP-2935: HISTORY_STORAGE_ADDRESS - activated at Prague equivalent.
+        // BSC doesn't have beacon roots, deposit contract, withdrawal request, or
+        // consolidation request contracts since it uses Parlia consensus, not PoS.
+        if chain_spec.is_prague_active_at_timestamp(timestamp) {
             contracts.insert(
-                SystemContract::Other("StakeHub".to_string()),
-                STAKE_HUB_CONTRACT,
-            );
-            contracts.insert(
-                SystemContract::Other("StakeCredit".to_string()),
-                STAKE_CREDIT_CONTRACT,
-            );
-            contracts.insert(
-                SystemContract::Other("Governor".to_string()),
-                GOVERNOR_CONTRACT,
-            );
-            contracts.insert(
-                SystemContract::Other("GovToken".to_string()),
-                GOV_TOKEN_CONTRACT,
-            );
-            contracts.insert(
-                SystemContract::Other("Timelock".to_string()),
-                TIMELOCK_CONTRACT,
-            );
-            contracts.insert(
-                SystemContract::Other("TokenRecoverPortal".to_string()),
-                TOKEN_RECOVER_PORTAL_CONTRACT,
+                "HISTORY_STORAGE_ADDRESS".to_string(),
+                HISTORY_STORAGE_ADDRESS,
             );
         }
 
         contracts
     }
 
-    /// Builds fork config for a specific timestamp, including BSC system contracts.
+    /// Builds fork config for a specific timestamp, including BSC-named precompiles.
     fn build_fork_config_at(
         &self,
         timestamp: u64,
         precompiles: BTreeMap<String, Address>,
-    ) -> EthForkConfig {
+    ) -> BscEthForkConfig {
         let chain_spec = self.provider.chain_spec();
 
-        let system_contracts = self.bsc_system_contracts_at(timestamp);
+        let system_contracts = self.system_contracts_at(timestamp);
 
         // Fork config only exists for timestamp-based hardforks.
         let fork_id = chain_spec
@@ -171,12 +144,13 @@ where
             .0
             .into();
 
-        EthForkConfig {
+        // BSC doesn't support EIP-4844 blobs, so blobSchedule is always null.
+        // This matches geth-bsc behavior where ActiveBlobSchedule returns nil for BSC.
+        let blob_schedule = None;
+
+        BscEthForkConfig {
             activation_time: timestamp,
-            blob_schedule: chain_spec
-                .blob_params_at_timestamp(timestamp)
-                // no blob support, so we set this to original cancun values as defined in eip-4844
-                .unwrap_or_else(BlobParams::cancun),
+            blob_schedule,
             chain_id: chain_spec.chain().id(),
             fork_id,
             precompiles,
@@ -185,7 +159,7 @@ where
     }
 
     /// Main config method - builds current, next, and last fork configurations.
-    fn config(&self) -> RpcResult<EthConfig> {
+    fn config_impl(&self) -> RpcResult<BscEthConfig> {
         let chain_spec = self.provider.chain_spec();
         let latest = self
             .provider
@@ -194,7 +168,7 @@ where
             .ok_or_else(|| internal_err("best block not found"))?
             .into_header();
 
-        let current_precompiles = evm_to_precompiles_map(
+        let current_precompiles = bsc_precompiles_map(
             self.evm_config
                 .evm_for_block(EmptyDB::default(), &latest)
                 .map_err(|e| internal_err(e.to_string()))?,
@@ -222,7 +196,7 @@ where
 
         let current = self.build_fork_config_at(current_fork_timestamp, current_precompiles);
 
-        let mut config = EthConfig { current, next: None, last: None };
+        let mut config = BscEthConfig { current, next: None, last: None };
 
         if let Some(next_fork_timestamp) = fork_timestamps.get(current_fork_idx + 1).copied() {
             let fake_header = {
@@ -230,7 +204,7 @@ where
                 header.set_timestamp(next_fork_timestamp);
                 header
             };
-            let next_precompiles = evm_to_precompiles_map(
+            let next_precompiles = bsc_precompiles_map(
                 self.evm_config
                     .evm_for_block(EmptyDB::default(), &fake_header)
                     .map_err(|e| internal_err(e.to_string()))?,
@@ -249,7 +223,7 @@ where
             header.set_timestamp(last_fork_timestamp);
             header
         };
-        let last_precompiles = evm_to_precompiles_map(
+        let last_precompiles = bsc_precompiles_map(
             self.evm_config
                 .evm_for_block(EmptyDB::default(), &fake_header)
                 .map_err(|e| internal_err(e.to_string()))?,
@@ -262,7 +236,7 @@ where
     }
 }
 
-impl<Provider, EvmConfig> EthConfigApiServer for BscEthConfigHandler<Provider, EvmConfig>
+impl<Provider, EvmConfig> BscEthConfigApiServer for BscEthConfigHandler<Provider, EvmConfig>
 where
     Provider: ChainSpecProvider<ChainSpec: Hardforks + EthereumHardforks + BscHardforks>
         + BlockReaderIdExt<Header: HeaderMut>
@@ -270,28 +244,94 @@ where
     EvmConfig:
         ConfigureEvm<Primitives: NodePrimitives<BlockHeader = Provider::Header>> + 'static,
 {
-    fn config(&self) -> RpcResult<EthConfig> {
-        BscEthConfigHandler::config(self)
+    fn config(&self) -> RpcResult<BscEthConfig> {
+        self.config_impl()
     }
 }
+
+// ---- Helper functions ----
 
 /// Helper to create a jsonrpsee internal error.
 fn internal_err(msg: impl Into<String>) -> jsonrpsee::types::ErrorObjectOwned {
     ErrorObject::owned(INTERNAL_ERROR_CODE, msg.into(), None::<()>)
 }
 
-/// Converts EVM precompile addresses into a name→address map for the RPC response.
-fn evm_to_precompiles_map(
+/// Maps a precompile address to its geth-compatible name.
+///
+/// Names match geth-bsc's precompile `Name()` methods exactly:
+/// - Standard Ethereum precompiles: ECREC, SHA256, RIPEMD160, ID, MODEXP, etc.
+/// - BSC custom precompiles: HEADER_VALIDATE, BLS_SIGNATURE_VERIFY, etc.
+/// - EIP-2537 BLS12-381 precompiles: BLS12_G1ADD, BLS12_G1MSM, etc.
+///
+/// Returns None for unknown addresses, in which case the caller should
+/// fall back to `precompile_id().name()`.
+fn address_to_precompile_name(address: &Address) -> Option<&'static str> {
+    let bytes = address.as_slice();
+    // Precompile addresses have zeros in the first 12 bytes
+    if bytes[..12].iter().any(|&b| b != 0) {
+        return None;
+    }
+    let n = u64::from_be_bytes(bytes[12..20].try_into().ok()?);
+
+    match n {
+        // Standard Ethereum precompiles (Istanbul)
+        1 => Some("ECREC"),
+        2 => Some("SHA256"),
+        3 => Some("RIPEMD160"),
+        4 => Some("ID"),
+        5 => Some("MODEXP"),
+        6 => Some("BN254_ADD"),
+        7 => Some("BN254_MUL"),
+        8 => Some("BN254_PAIRING"),
+        9 => Some("BLAKE2F"),
+        // EIP-4844: KZG point evaluation (Cancun)
+        0x0a => Some("KZG_POINT_EVALUATION"),
+        // EIP-2537: BLS12-381 precompiles (Pascal/Prague)
+        0x0b => Some("BLS12_G1ADD"),
+        0x0c => Some("BLS12_G1MSM"),
+        0x0d => Some("BLS12_G2ADD"),
+        0x0e => Some("BLS12_G2MSM"),
+        0x0f => Some("BLS12_PAIRING_CHECK"),
+        0x10 => Some("BLS12_MAP_FP_TO_G1"),
+        0x11 => Some("BLS12_MAP_FP2_TO_G2"),
+        // BSC custom precompiles
+        // Names match geth-bsc's Name() methods for the latest active fork versions.
+        // At current BSC forks (post-Hertz, post-Plato), these are the correct names.
+        100 => Some("HEADER_VALIDATE"),                          // tendermint header validation
+        101 => Some("IAVL_MERKLE_PROOF_VALIDATE_PLATO"),         // IAVL proof (Plato+ version)
+        102 => Some("BLS_SIGNATURE_VERIFY"),                     // BLS signature verify
+        103 => Some("COMET_BFT_LIGHT_BLOCK_VALIDATE_HERTZ"),     // CometBFT (Hertz+ version)
+        104 => Some("VERIFY_DOUBLE_SIGN_EVIDENCE"),              // double sign evidence
+        105 => Some("SECP256K1_SIGNATURE_RECOVER"),              // secp256k1 signature recover
+        // EIP-7212: P256VERIFY (secp256r1, Haber+)
+        0x100 => Some("P256VERIFY"),
+        _ => None,
+    }
+}
+
+/// Extracts precompile name→address map from the EVM, using BSC-compatible names.
+///
+/// Uses [`address_to_precompile_name`] for known precompile addresses (matching geth's
+/// `Name()` convention), and falls back to `precompile_id().name()` for any unknown
+/// addresses.
+///
+/// This fixes the issue where all BSC custom precompiles use `PrecompileId::Identity`,
+/// which would cause name collisions (all mapping to "Identity") and override the
+/// standard Identity precompile at address 0x04.
+fn bsc_precompiles_map(
     evm: impl Evm<Precompiles = PrecompilesMap>,
 ) -> BTreeMap<String, Address> {
     let precompiles = evm.precompiles();
     precompiles
         .addresses()
         .filter_map(|address| {
-            Some((
-                precompiles.get(address)?.precompile_id().name().to_string(),
-                *address,
-            ))
+            let name = if let Some(n) = address_to_precompile_name(address) {
+                n.to_string()
+            } else {
+                // Fallback for unknown precompiles
+                precompiles.get(address)?.precompile_id().name().to_string()
+            };
+            Some((name, *address))
         })
         .collect()
 }
