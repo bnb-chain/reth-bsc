@@ -196,7 +196,11 @@ impl Snapshot {
         let header_number = next_header.number();
         let is_bohr = chain_spec.is_bohr_active_at_timestamp(header_number, header_timestamp);
         if is_bohr {
-            if snap.sign_recently(validator) {
+            // Use original_snap (block_number = N-1) to match geth's countRecents window.
+            // snap.block_number was already updated to N, which shifts left_bound to N-1 and
+            // causes the N-1 entry to be excluded (N-1 > N-1 is false), allowing consecutive
+            // blocks by the same validator to bypass this check.
+            if original_snap.sign_recently(validator) {
                 tracing::warn!("Failed to apply block due to over-proposed, validator: {:?}, block_number: {:?}", validator, block_number);
                 return None;
             }
