@@ -37,11 +37,13 @@ use reth_primitives::NodePrimitives;
 use reth_primitives_traits::{AlloyBlockHeader, Block};
 use reth_provider::{BlockHashReader, BlockNumReader, BlockReaderIdExt, HeaderProvider};
 use schnellru::{ByLength, LruMap};
+use super::gap_checker::GapChecker;
 use std::{
     future::Future,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
+    time::Duration,
 };
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
@@ -99,6 +101,8 @@ where
     queued_blocks: LruCache<B256>,
     /// Cache of downloading block hashes to avoid re-downloading the same block.
     downloading_blocks: LruMap<B256, u128, ByLength>,
+    /// Periodic gap detector – see [`GapChecker`] for design rationale.
+    gap_checker: GapChecker<Provider>,
 }
 
 impl<Provider> ImportService<Provider>
@@ -115,6 +119,7 @@ where
         from_hashes: UnboundedReceiver<IncomingHashes>,
         to_network: UnboundedSender<ImportEvent>,
     ) -> Self {
+        let gap_checker = GapChecker::new(provider.clone());
         let forkchoice_engine = BscForkChoiceEngine::new(provider, engine.clone(), chain_spec);
 
         if let Err(e) = crate::shared::set_fork_choice_engine(forkchoice_engine.clone()) {
@@ -132,6 +137,7 @@ where
             processed_blocks: LruCache::new(LRU_PROCESSED_BLOCKS_SIZE),
             queued_blocks: LruCache::new(LRU_PROCESSED_BLOCKS_SIZE),
             downloading_blocks: LruMap::new(ByLength::new(LRU_PROCESSED_BLOCKS_SIZE)),
+            gap_checker,
         }
     }
 
@@ -578,6 +584,7 @@ where
                 if let Ok(BlockValidation::ValidBlock { block }) = &outcome.result {
                     block_hash = Some(block.hash);
                     this.processed_blocks.insert(block.hash);
+                    this.gap_checker.on_block_imported();
                     // Cache the full block body for later range responses.
                     crate::shared::cache_full_block(block.block.0.block.clone());
                     if let Err(e) = this.transfer_to_evn_peers(block.clone()) {
@@ -597,6 +604,9 @@ where
                 }
             }
         }
+
+        // Drive the periodic gap checker (see gap_checker.rs for full rationale).
+        this.gap_checker.poll(cx, this.pending_imports.is_empty());
 
         Poll::Pending
     }

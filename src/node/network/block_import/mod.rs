@@ -13,6 +13,7 @@ use std::{
 
 use crate::node::network::BscNewBlock;
 
+pub mod gap_checker;
 pub mod handle;
 pub mod service;
 
