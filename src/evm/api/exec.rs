@@ -32,6 +32,8 @@ where
     }
 
     fn transact_one(&mut self, tx: Self::Tx) -> Result<Self::ExecutionResult, Self::Error> {
+        let mut tx = tx;
+        self.prepare_tx_for_execution(&mut tx);
         self.inner.ctx.set_tx(tx);
         BscHandler::new().run(self)
     }
@@ -41,6 +43,7 @@ where
     }
 
     fn replay(&mut self) -> Result<ResultAndState, Self::Error> {
+        self.prepare_current_tx_for_execution();
         BscHandler::new().run(self).map(|result| {
             let state = self.finalize();
             ResultAndState::new(result, state)
@@ -69,6 +72,8 @@ where
     }
 
     fn inspect_one_tx(&mut self, tx: Self::Tx) -> Result<Self::ExecutionResult, Self::Error> {
+        let mut tx = tx;
+        self.prepare_tx_for_execution(&mut tx);
         self.inner.ctx.set_tx(tx);
         BscHandler::new().inspect_run(self)
     }

@@ -80,6 +80,25 @@ impl<DB: Database, I> BscEvm<DB, I> {
     pub fn ctx_mut(&mut self) -> &mut BscContext<DB> {
         &mut self.inner.ctx
     }
+
+    fn detect_system_transaction(&self, tx: &BscTxEnv) -> bool {
+        use crate::system_contracts::is_invoke_system_contract;
+        use revm::primitives::TxKind;
+
+        matches!(tx.base.kind, TxKind::Call(to)
+            if tx.base.caller == self.block.beneficiary
+                && is_invoke_system_contract(&to)
+                && tx.base.gas_price == 0)
+    }
+
+    pub(crate) fn prepare_tx_for_execution(&self, tx: &mut BscTxEnv) {
+        tx.is_system_transaction = self.detect_system_transaction(tx);
+    }
+
+    pub(crate) fn prepare_current_tx_for_execution(&mut self) {
+        let is_system_transaction = self.detect_system_transaction(&self.inner.ctx.tx);
+        self.inner.ctx.tx.is_system_transaction = is_system_transaction;
+    }
 }
 
 impl<DB: Database, I> Deref for BscEvm<DB, I> {
@@ -235,7 +254,7 @@ mod tests {
     use reth_evm::EvmEnv;
     use revm::{
         context::{BlockEnv, CfgEnv, TxEnv},
-        context_interface::result::{ExecutionResult, HaltReason},
+        context_interface::result::{ExecutionResult, HaltReason, InvalidTransaction},
         handler::instructions::EthInstructions,
         inspector::NoOpInspector,
         primitives::{hardfork::SpecId, Address, Bytes, TxKind, U256},
@@ -343,6 +362,61 @@ mod tests {
         assert!(
             mismatched_result.is_success(),
             "latest-spec instruction table should succeed with this gas limit"
+        );
+    }
+
+    #[test]
+    fn replay_marks_system_tx_before_validation() {
+        use crate::hardforks::bsc::BscHardfork;
+
+        let spec = BscHardfork::Osaka;
+        let mut cfg_env = CfgEnv::new_with_spec(spec).with_chain_id(56);
+        cfg_env.tx_gas_limit_cap = Some(2u64.pow(24));
+
+        let beneficiary = Address::from([0x10; 20]);
+        let system_contract = Address::from([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00]);
+
+        let block_env = BlockEnv {
+            beneficiary,
+            prevrandao: Some(U256::from(1).into()),
+            ..Default::default()
+        };
+        let env = EvmEnv::new(cfg_env, block_env);
+
+        let mut db = InMemoryDB::default();
+        db.insert_account_info(
+            beneficiary,
+            AccountInfo { balance: U256::from(1_000_000_000_000u64), ..AccountInfo::default() },
+        );
+        db.insert_account_info(system_contract, AccountInfo::default());
+
+        let tx = BscTxEnv::new(
+            TxEnv::builder()
+                .caller(beneficiary)
+                .chain_id(Some(56))
+                .gas_limit(i64::MAX as u64)
+                .gas_price(0)
+                .kind(TxKind::Call(system_contract))
+                .build()
+                .expect("tx env should build"),
+        );
+
+        let mut evm = BscEvm::new(env, db, NoOpInspector, false, true);
+        evm.inner.ctx.tx = tx;
+        evm.prepare_current_tx_for_execution();
+
+        let result = evm.replay();
+        match result {
+            Err(revm::context::result::EVMError::Transaction(
+                InvalidTransaction::TxGasLimitGreaterThanCap { .. },
+            )) => panic!("system transaction was not classified before validation"),
+            _ => {}
+        }
+
+        assert!(
+            evm.inner.ctx.tx.is_system_transaction,
+            "system transaction should be classified before replay validation"
         );
     }
 }
