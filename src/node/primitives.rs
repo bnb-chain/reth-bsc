@@ -1,7 +1,7 @@
 #![allow(clippy::owned_cow)]
 use alloy_consensus::{BlobTransactionSidecar, Header};
 use alloy_primitives::B256;
-use alloy_rlp::{Encodable, RlpDecodable, RlpEncodable};
+use alloy_rlp::{Decodable, Encodable};
 use reth_ethereum_primitives::{BlockBody, Receipt};
 use reth_primitives::{NodePrimitives, TransactionSigned};
 use reth_primitives_traits::{Block, BlockBody as BlockBodyTrait, InMemorySize};
@@ -22,13 +22,63 @@ impl NodePrimitives for BscPrimitives {
 }
 
 /// BSC representation of a EIP-4844 sidecar.
-#[derive(Debug, Clone, PartialEq, Eq, RlpEncodable, RlpDecodable, Serialize, Deserialize)]
+///
+/// RLP encoding matches go-bsc's `BlobSidecar` flat layout:
+///   `[blobs, commitments, proofs, block_number, block_hash, tx_index, tx_hash]`
+/// This is achieved by inlining `inner`'s fields rather than nesting them in a
+/// sub-list (which the derived `RlpEncodable` would produce).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BscBlobTransactionSidecar {
     pub inner: BlobTransactionSidecar,
     pub block_number: u64,
     pub block_hash: B256,
     pub tx_index: u64,
     pub tx_hash: B256,
+}
+
+impl Encodable for BscBlobTransactionSidecar {
+    fn encode(&self, out: &mut dyn bytes::BufMut) {
+        let payload_len = self.inner.rlp_encoded_fields_length()
+            + self.block_number.length()
+            + self.block_hash.length()
+            + self.tx_index.length()
+            + self.tx_hash.length();
+        alloy_rlp::Header { list: true, payload_length: payload_len }.encode(out);
+        self.inner.rlp_encode_fields(out);
+        self.block_number.encode(out);
+        self.block_hash.encode(out);
+        self.tx_index.encode(out);
+        self.tx_hash.encode(out);
+    }
+
+    fn length(&self) -> usize {
+        let payload_len = self.inner.rlp_encoded_fields_length()
+            + self.block_number.length()
+            + self.block_hash.length()
+            + self.tx_index.length()
+            + self.tx_hash.length();
+        alloy_rlp::Header { list: true, payload_length: payload_len }.length() + payload_len
+    }
+}
+
+impl Decodable for BscBlobTransactionSidecar {
+    fn decode(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
+        let header = alloy_rlp::Header::decode(buf)?;
+        if !header.list {
+            return Err(alloy_rlp::Error::UnexpectedString);
+        }
+        let remaining_before = buf.len();
+        let inner = BlobTransactionSidecar::rlp_decode_fields(buf)?;
+        let block_number = u64::decode(buf)?;
+        let block_hash = B256::decode(buf)?;
+        let tx_index = u64::decode(buf)?;
+        let tx_hash = B256::decode(buf)?;
+        let consumed = remaining_before - buf.len();
+        if consumed != header.payload_length {
+            return Err(alloy_rlp::Error::UnexpectedLength);
+        }
+        Ok(Self { inner, block_number, block_hash, tx_index, tx_hash })
+    }
 }
 
 /// Block body for BSC. It is equivalent to Ethereum [`BlockBody`] but additionally stores sidecars
@@ -144,7 +194,7 @@ impl Block for BscBlock {
 mod rlp {
     use super::*;
     use alloy_eips::eip4895::Withdrawals;
-    use alloy_rlp::Decodable;
+    use alloy_rlp::{Decodable, RlpDecodable, RlpEncodable};
 
     #[derive(RlpEncodable, RlpDecodable)]
     #[rlp(trailing)]
