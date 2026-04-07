@@ -1,6 +1,6 @@
 //! Chain specification for BSC, credits to: <https://github.com/bnb-chain/reth/blob/main/crates/bsc/chainspec/src/bsc.rs>
 use crate::hardforks::bsc::BscHardfork;
-use alloy_primitives::BlockHash;
+use alloy_primitives::{BlockHash, U256};
 use reth_chainspec::{
     make_genesis_header, BaseFeeParams, BaseFeeParamsKind, Chain, ChainSpec, Head, NamedChain,
 };
@@ -31,7 +31,13 @@ pub fn bsc_mainnet() -> ChainSpec {
 }
 
 pub fn head() -> Head {
-    Head { number: 40_000_000, timestamp: 1751250600, ..Default::default() }
+    Head {
+        number: 40_000_000,
+        difficulty: U256::from(2),
+        total_difficulty: U256::from(79_800_000),
+        timestamp: 1751250600,
+        ..Default::default()
+    }
 }
 
 #[cfg(test)]

@@ -367,8 +367,18 @@ impl BscNetworkBuilder {
             );
         }
 
+        // Update network status from the actual chain state in the database, instead of
+        // relying solely on the hardcoded chainspec head(). This is critical for custom genesis
+        // chains where head() returns block 0 / TD=0, and also ensures correct status after
+        // node restarts when the database already contains blocks.
         let provider = ctx.provider();
         if let Ok(number) = provider.best_block_number() {
+            if number > 0 {
+                if let Ok(Some(header)) = provider.sealed_header(number) {
+                    network_config.status.blockhash = header.hash();
+                    network_config.status.latest_block = Some(number);
+                }
+            }
             let td = provider.header_td_by_number(number).unwrap_or_default();
             network_config.status.total_difficulty = td;
         }
@@ -378,6 +388,7 @@ impl BscNetworkBuilder {
             version = ?network_config.status.version,
             td = ?network_config.status.total_difficulty,
             blockhash = ?network_config.status.blockhash,
+            latest_block = ?network_config.status.latest_block,
             genesis = ?network_config.status.genesis,
             "Initialized BSC network configuration"
         );
