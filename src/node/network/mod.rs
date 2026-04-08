@@ -380,6 +380,18 @@ impl BscNetworkBuilder {
                 }
             }
             let td = provider.header_td_by_number(number).unwrap_or_default();
+            // BSC does not go through the Merge, so reth's static-file pipeline may never
+            // persist TD.  When the database returns None, estimate TD from the block number.
+            // In Parlia each block has difficulty 2 (in-turn) or 1 (out-of-turn); using
+            // number * 2 is a safe upper-bound that is close enough for the eth Status
+            // handshake — peers only need a non-zero value to accept us as a sync candidate.
+            let td = td.or_else(|| {
+                if number > 0 {
+                    Some(U256::from(number) * U256::from(2))
+                } else {
+                    None
+                }
+            });
             network_config.status.total_difficulty = td;
         }
         debug!(
