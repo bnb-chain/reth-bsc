@@ -374,6 +374,42 @@ where
             MinerTrieDbPrefetcher::new(parent_header.state_root(), path_db, Some(difflayers)).ok()
         });
 
+        // Pre-load account state for pending transactions into CachedReads.
+        // Turns cold PathDB reads during tx execution into warm HashMap cache hits.
+        {
+            use revm::database::Database;
+            use std::collections::HashSet;
+
+            let preload_start = std::time::Instant::now();
+            let pending = self.pool.pending_transactions();
+            let mut seen = HashSet::with_capacity(pending.len() * 2);
+            let mut preloaded = 0u32;
+            for ptx in pending.iter().take(2000) {
+                let sender = ptx.sender();
+                if seen.insert(sender) {
+                    let _ = db.basic(sender);
+                    preloaded += 1;
+                }
+                if let Some(to) = ptx.to() {
+                    if seen.insert(to) {
+                        let _ = db.basic(to);
+                        preloaded += 1;
+                    }
+                }
+            }
+            let preload_ms = preload_start.elapsed().as_millis();
+            if preloaded > 0 {
+                debug!(
+                    target: "bsc::miner::tx_timing",
+                    trace_id,
+                    preloaded_accounts = preloaded,
+                    pending_txs = pending.len(),
+                    preload_ms,
+                    "Pre-loaded account state from mempool"
+                );
+            }
+        }
+
         // Sinks transport current_validators / turn_length from the builder (which is consumed by
         // finish_with_difflayer) back to this layer so they can be written to cache after
         // finalize_new_header() assigns the definitive block hash.
