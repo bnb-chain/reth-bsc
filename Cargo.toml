@@ -16,60 +16,60 @@ name = "reth-bsc"
 path = "src/main.rs"
 
 [dependencies]
-reth = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-cli = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-cli-commands = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-basic-payload-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-db = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-engine-local = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-engine-tree = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-node-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-chainspec = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-cli-util = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-discv4 = { git = "https://github.com/bnb-chain/reth.git", branch = "develop", features = [
+reth = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-p2p" }
+reth-cli = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-p2p" }
+reth-cli-commands = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-p2p" }
+reth-basic-payload-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-p2p" }
+reth-db = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-p2p" }
+reth-engine-local = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-p2p" }
+reth-engine-tree = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-p2p" }
+reth-node-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-p2p" }
+reth-chainspec = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-p2p" }
+reth-cli-util = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-p2p" }
+reth-discv4 = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-p2p", features = [
     "test-utils",
 ] }
-reth-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-ethereum-forks = { git = "https://github.com/bnb-chain/reth.git", branch = "develop", features = [
+reth-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-p2p" }
+reth-ethereum-forks = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-p2p", features = [
     "serde",
 ] }
-reth-ethereum-payload-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-payload-builder-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-chain-state = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-eth-wire = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-eth-wire-types = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-evm = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-execution-types = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-ipc = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-metrics = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-node-core = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-revm = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-network = { git = "https://github.com/bnb-chain/reth.git", branch = "develop", features = [
+reth-ethereum-payload-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-p2p" }
+reth-payload-builder-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-p2p" }
+reth-chain-state = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-p2p" }
+reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-p2p" }
+reth-eth-wire = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-p2p" }
+reth-eth-wire-types = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-p2p" }
+reth-evm = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-p2p" }
+reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-p2p" }
+reth-execution-types = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-p2p" }
+reth-ipc = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-p2p" }
+reth-metrics = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-p2p" }
+reth-node-core = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-p2p" }
+reth-revm = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-p2p" }
+reth-network = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-p2p", features = [
     "test-utils",
 ] }
-reth-network-p2p = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-network-api = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-node-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "develop", features = [
+reth-network-p2p = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-p2p" }
+reth-network-api = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-p2p" }
+reth-node-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-p2p", features = [
     "test-utils",
 ] }
-reth-network-peers = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-payload-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-ethereum-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-primitives-traits = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-provider = { git = "https://github.com/bnb-chain/reth.git", branch = "develop", features = [
+reth-network-peers = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-p2p" }
+reth-payload-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-p2p" }
+reth-ethereum-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-p2p" }
+reth-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-p2p" }
+reth-primitives-traits = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-p2p" }
+reth-provider = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-p2p", features = [
     "test-utils",
 ] }
-reth-rpc-eth-api = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-rpc-convert = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-rpc-engine-api = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-rpc-server-types = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-trie-common = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-tasks = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-transaction-pool = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
+reth-rpc-eth-api = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-p2p" }
+reth-rpc-convert = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-p2p" }
+reth-rpc-engine-api = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-p2p" }
+reth-rpc-server-types = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-p2p" }
+reth-trie-common = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-p2p" }
+reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-p2p" }
+reth-tasks = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-p2p" }
+reth-transaction-pool = { git = "https://github.com/bnb-chain/reth.git", branch = "fix-p2p" }
 
 # triedb dependencies
 rust-eth-triedb = { git = "https://github.com/bnb-chain/reth-bsc-triedb.git", branch = "develop" }
