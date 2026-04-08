@@ -374,6 +374,42 @@ where
             MinerTrieDbPrefetcher::new(parent_header.state_root(), path_db, Some(difflayers)).ok()
         });
 
+        // [Optimization B] Pre-load account state for pending transactions into CachedReads.
+        // Turns cold PathDB reads during tx execution into warm HashMap cache hits.
+        {
+            use revm::database::Database;
+            use std::collections::HashSet;
+
+            let preload_start = std::time::Instant::now();
+            let pending = self.pool.pending_transactions();
+            let mut seen = HashSet::with_capacity(pending.len() * 2);
+            let mut preloaded = 0u32;
+            for ptx in pending.iter().take(2000) {
+                let sender = ptx.sender();
+                if seen.insert(sender) {
+                    let _ = db.basic(sender);
+                    preloaded += 1;
+                }
+                if let Some(to) = ptx.to() {
+                    if seen.insert(to) {
+                        let _ = db.basic(to);
+                        preloaded += 1;
+                    }
+                }
+            }
+            let preload_ms = preload_start.elapsed().as_millis();
+            if preloaded > 0 {
+                debug!(
+                    target: "bsc::miner::tx_timing",
+                    trace_id,
+                    preloaded_accounts = preloaded,
+                    pending_txs = pending.len(),
+                    preload_ms,
+                    "Pre-loaded account state from mempool"
+                );
+            }
+        }
+
         // Sinks transport current_validators / turn_length from the builder (which is consumed by
         // finish_with_difflayer) back to this layer so they can be written to cache after
         // finalize_new_header() assigns the definitive block hash.
@@ -402,24 +438,20 @@ where
             .builder_for_next_block(&mut db, &parent_header, next_env_attributes)
             .map_err(PayloadBuilderError::other)?;
 
-        // Wire miner triedb prefetcher via state hook (if enabled).
+        // [Optimization A] Prefetcher state_hook is DISABLED for miner builds.
         //
-        // NOTE: This must be set before `apply_pre_execution_changes()` so any state access/touches
-        // performed during pre-execution are also prefetched.
-        if let Some(prefetcher) = triedb_prefetcher.clone() {
-            let pf = prefetcher.clone();
-            builder
-                .executor_mut()
-                .set_state_hook(Some(Box::new(move |_, update: &RethEvmState| {
-                    pf.on_state_update(update);
-                })));
-            debug!(
-                target: "payload_builder",
-                trace_id,
-                parent_hash = ?parent_hash,
-                "Started triedb prefetcher for miner payload build"
-            );
-        }
+        // The hook fires per-tx: clone state diff + keccak256 hash all addresses/slots + channel
+        // send. At ~20μs/tx overhead × 560 txs = ~11ms/block. Since state root is only 20% of
+        // build time (50ms) and the prefetcher saves ~5ms there, net effect is negative.
+        // The prefetcher is still created (for finish_with_difflayer) but not fed per-tx updates.
+        //
+        // Disabled code:
+        // if let Some(prefetcher) = triedb_prefetcher.clone() {
+        //     let pf = prefetcher.clone();
+        //     builder.executor_mut().set_state_hook(Some(Box::new(move |_, update: &RethEvmState| {
+        //         pf.on_state_update(update);
+        //     })));
+        // }
 
         builder.apply_pre_execution_changes().map_err(|err| {
             warn!(
@@ -967,24 +999,8 @@ where
             )
             .map_err(PayloadBuilderError::other)?;
 
-        // Wire miner triedb prefetcher via state hook (if enabled).
-        //
-        // NOTE: This must be set before `apply_pre_execution_changes()` so any state access/touches
-        // performed during pre-execution are also prefetched.
-        if let Some(prefetcher) = triedb_prefetcher.clone() {
-            let pf = prefetcher.clone();
-            builder
-                .executor_mut()
-                .set_state_hook(Some(Box::new(move |_, update: &RethEvmState| {
-                    pf.on_state_update(update);
-                })));
-            debug!(
-                target: "payload_builder",
-                trace_id,
-                parent_hash = ?parent_hash,
-                "Started triedb prefetcher for miner empty payload build"
-            );
-        }
+        // [Optimization A] Prefetcher state_hook disabled for empty payload builds too.
+        // See normal build_payload() for rationale.
 
         // Total time spent executing pre-execution changes (no user txs for empty payloads).
         let exec_start = std::time::Instant::now();
