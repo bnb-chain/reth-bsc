@@ -131,7 +131,7 @@ fn read_sidecars_from_blob_store(
         .map(|(i, h)| (*h, i as u64))
         .collect();
 
-    let sidecars: Vec<_> = blobs
+    let mut sidecars: Vec<_> = blobs
         .into_iter()
         .filter_map(|(tx_hash, variant)| {
             let inner = match variant.as_ref() {
@@ -142,6 +142,11 @@ fn read_sidecars_from_blob_store(
             Some(BscBlobTransactionSidecar { inner, block_number, block_hash, tx_index, tx_hash })
         })
         .collect();
+
+    // get_all() does not guarantee input order (cache-hits precede disk-reads).
+    // go-bsc validates sidecars[i].TxHash == blobTxs[i].Hash(), so order must
+    // match the tx position in the block.
+    sidecars.sort_unstable_by_key(|s| s.tx_index);
 
     if sidecars.is_empty() { None } else { Some(sidecars) }
 }

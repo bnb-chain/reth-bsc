@@ -220,10 +220,20 @@ mod rlp {
             let BscBlockBody { inner: BlockBody { transactions, ommers, withdrawals }, sidecars } =
                 value;
 
+            // Geth decodes withdrawals as a list type. When sidecars are present but
+            // withdrawals are absent, encode empty withdrawals as `[]` (0xC0) instead of
+            // relying on the `#[rlp(trailing)]` placeholder `0x80` which Go rejects as
+            // "wrong kind of empty value (got String, want List)".
+            let withdrawals = match (withdrawals.as_ref(), sidecars.as_ref()) {
+                (None, Some(_)) => Some(Cow::Owned(Withdrawals::default())),
+                (Some(w), _) => Some(Cow::Borrowed(w)),
+                (None, None) => None,
+            };
+
             Self {
                 transactions: Cow::Borrowed(transactions),
                 ommers: Cow::Borrowed(ommers),
-                withdrawals: withdrawals.as_ref().map(Cow::Borrowed),
+                withdrawals,
                 sidecars: sidecars.as_ref().map(Cow::Borrowed),
             }
         }
@@ -237,11 +247,18 @@ mod rlp {
                     BscBlockBody { inner: BlockBody { transactions, ommers, withdrawals }, sidecars },
             } = value;
 
+            // Same withdrawals backfill as BlockBodyHelper — see comment there.
+            let withdrawals = match (withdrawals.as_ref(), sidecars.as_ref()) {
+                (None, Some(_)) => Some(Cow::Owned(Withdrawals::default())),
+                (Some(w), _) => Some(Cow::Borrowed(w)),
+                (None, None) => None,
+            };
+
             Self {
                 header: Cow::Borrowed(header),
                 transactions: Cow::Borrowed(transactions),
                 ommers: Cow::Borrowed(ommers),
-                withdrawals: withdrawals.as_ref().map(Cow::Borrowed),
+                withdrawals,
                 sidecars: sidecars.as_ref().map(Cow::Borrowed),
             }
         }
@@ -487,6 +504,111 @@ mod tests {
             computed_length, actual_length,
             "Computed RLP length should match actual encoded length for non-empty withdrawals"
         );
+    }
+
+    #[test]
+    fn test_body_encodes_empty_withdrawals_as_list_when_sidecars_present() {
+        // Regression test: when sidecars are present but withdrawals is None,
+        // the encoder must produce an empty list (0xC0) for withdrawals, NOT the
+        // RLP empty string (0x80). Go's decoder rejects 0x80 for slice/struct
+        // pointer types because nilKind = List.
+        use alloy_rlp::{Decodable, Encodable};
+
+        let body = BscBlockBody {
+            inner: BlockBody {
+                transactions: vec![],
+                ommers: vec![],
+                withdrawals: None,  // <-- None, but sidecars present
+            },
+            sidecars: Some(Vec::new()),
+        };
+
+        let mut buf = Vec::new();
+        body.encode(&mut buf);
+
+        // Decode the body back
+        let decoded = BscBlockBody::decode(&mut buf.as_slice())
+            .expect("Failed to decode body with backfilled withdrawals");
+
+        // The decoded body should have withdrawals = Some(empty), not None
+        assert!(
+            decoded.inner.withdrawals.is_some(),
+            "withdrawals should be Some after backfill"
+        );
+        assert!(
+            decoded.inner.withdrawals.as_ref().unwrap().is_empty(),
+            "withdrawals should be empty"
+        );
+        assert!(decoded.sidecars.is_some(), "sidecars should be preserved");
+
+        // Verify the raw RLP bytes do NOT contain 0x80 as a withdrawals placeholder.
+        // After [txs_list, ommers_list], the next byte should be 0xC0 (empty list),
+        // not 0x80 (empty string).
+        // The outer list header is the first few bytes, then txs=0xC0, ommers=0xC0,
+        // so the 4th byte (index 3) should be 0xC0 (empty withdrawals list).
+        // Outer header for small body: 0xC0 + len => 1 byte header
+        // Then: txs=0xC0, ommers=0xC0, withdrawals=?, sidecars=0xC0
+        assert!(
+            !buf.windows(2).any(|w| w == [0x80, 0xC0]),
+            "Should not have 0x80 (empty string) followed by 0xC0 — withdrawals must be 0xC0 (empty list)"
+        );
+    }
+
+    #[test]
+    fn test_block_encodes_empty_withdrawals_as_list_when_sidecars_present() {
+        // Same test but for BscBlock encoding (BlockHelper path)
+        use alloy_rlp::{Decodable, Encodable};
+
+        let block = BscBlock {
+            header: Header::default(),
+            body: BscBlockBody {
+                inner: BlockBody {
+                    transactions: vec![],
+                    ommers: vec![],
+                    withdrawals: None,
+                },
+                sidecars: Some(Vec::new()),
+            },
+        };
+
+        let mut buf = Vec::new();
+        block.encode(&mut buf);
+
+        let decoded = BscBlock::decode(&mut buf.as_slice())
+            .expect("Failed to decode block with backfilled withdrawals");
+
+        assert!(
+            decoded.body.inner.withdrawals.is_some(),
+            "withdrawals should be Some after backfill"
+        );
+        assert!(decoded.body.sidecars.is_some(), "sidecars should be preserved");
+    }
+
+    #[test]
+    fn test_body_no_backfill_when_no_sidecars() {
+        // When sidecars are None, withdrawals=None should remain None (no backfill)
+        use alloy_rlp::{Decodable, Encodable};
+
+        let body = BscBlockBody {
+            inner: BlockBody {
+                transactions: vec![],
+                ommers: vec![],
+                withdrawals: None,
+            },
+            sidecars: None,
+        };
+
+        let mut buf = Vec::new();
+        body.encode(&mut buf);
+
+        let decoded = BscBlockBody::decode(&mut buf.as_slice())
+            .expect("Failed to decode body without sidecars");
+
+        assert!(
+            decoded.inner.withdrawals.is_none(),
+            "withdrawals should remain None when no sidecars"
+        );
+        assert!(decoded.sidecars.is_none(), "sidecars should remain None");
     }
 
     #[test]
