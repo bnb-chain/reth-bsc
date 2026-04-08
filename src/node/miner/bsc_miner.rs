@@ -727,7 +727,9 @@ where
             config: PayloadConfig::new(Arc::new(mining_ctx.parent_header.clone()), attributes),
             cancel: ManualCancel::default(),
             trace_id: crate::node::miner::payload::generate_trace_id(),
-            min_gas_tip: self.desired_min_gas_tip,
+            min_gas_tip: crate::shared::get_miner_gas_tip()
+                .map(|v| v as u128)
+                .unwrap_or(self.desired_min_gas_tip),
             parent_difflayers: None, // populated once at job start via fetch_triedb_difflayers
         };
 
