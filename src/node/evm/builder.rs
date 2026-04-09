@@ -126,26 +126,42 @@ where
         state: impl StateProvider,
     ) -> Result<BlockBuilderOutcomeWithDiffLayer<BscPrimitives>, BlockExecutionError> {
         let finish_start = std::time::Instant::now();
-        let (evm, result) = self.executor.finish()?;
-        let (db, evm_env) = evm.finish();
 
+        let step = std::time::Instant::now();
+        let (evm, result) = self.executor.finish()?;
+        let executor_finish_ms = step.elapsed().as_millis();
+
+        let step = std::time::Instant::now();
+        let (db, evm_env) = evm.finish();
         let assembled_system_txs = {
             let mut inner = self.shared_ctx.inner.borrow_mut();
             std::mem::take(&mut inner.assembled_system_txs)
         };
         // merge all transitions into bundle state
         db.merge_transitions(BundleRetention::Reverts);
+        let merge_transitions_ms = step.elapsed().as_millis();
 
+        // -- state root computation starts --
         let state_root_start = std::time::Instant::now();
+
+        let step = std::time::Instant::now();
         let hashed_state = state.hashed_post_state(&db.bundle_state);
+        let hashed_post_state_ms = step.elapsed().as_millis();
 
         // Use triedb to calculate state root
         let (state_root, trie_updates, produced_difflayer) = if rust_eth_triedb::triedb_manager::is_triedb_active() {
             let mut triedb = get_global_triedb();
-            // Miner-side: try to use triedb prefetcher + parent difflayers from execution ctx.
+
+            let step = std::time::Instant::now();
             let prefetch_state = self.ctx.triedb_prefetcher.take().and_then(|p| p.finish());
+            let prefetcher_finish_ms = step.elapsed().as_millis();
+
             let parent_state_root = (**self.parent).state_root();
+
+            let step = std::time::Instant::now();
             let trie_hashed_state = hashed_state.to_triedb_hashed_post_state();
+            let to_triedb_state_ms = step.elapsed().as_millis();
+
             let difflayers_opt = self.ctx.parent_difflayers.as_ref();
 
             let triedb_calc_started = std::time::Instant::now();
@@ -157,15 +173,13 @@ where
                     prefetch_state,
                 )
                 .map_err(BlockExecutionError::other)?;
-            let triedb_calc_with_prefetch_ms = triedb_calc_started.elapsed().as_millis();
+            let triedb_calc_ms = triedb_calc_started.elapsed().as_millis();
+
+            let state_root_total_ms = state_root_start.elapsed().as_millis();
 
             tracing::debug!(
-                target: "bsc::builder",
-                parent_hash = %self.parent.hash(),
+                target: "bsc::builder::timing",
                 block_number = %(self.parent.number + 1),
-                parent_state_root = %parent_state_root,
-                new_state_root = %new_root,
-                has_parent_difflayers = difflayers_opt.is_some(),
                 user_tx_count = self.transactions.len(),
                 hashed_accounts = hashed_state.accounts.len(),
                 hashed_storages = hashed_state.storages.len(),
@@ -174,9 +188,12 @@ where
                     .values()
                     .map(|s| s.storage.len())
                     .sum::<usize>(),
-                triedb_calc_ms = triedb_calc_with_prefetch_ms,
-                triedb_calc_us = triedb_calc_started.elapsed().as_micros(),
-                "Calculated state root using triedb"
+                state_root_total_ms,
+                hashed_post_state_ms,
+                prefetcher_finish_ms,
+                to_triedb_state_ms,
+                triedb_calc_ms,
+                "state root breakdown"
             );
             (new_root, TrieUpdates::default(), Some(new_difflayer))
         } else {
@@ -184,7 +201,6 @@ where
                 state.state_root_with_updates(hashed_state.clone()).map_err(BlockExecutionError::other)?;
             (root, updates, None)
         };
-        let state_root_duration = state_root_start.elapsed();
 
         let user_tx_len = self.transactions.len();
         let system_tx_len = assembled_system_txs.len();
@@ -198,8 +214,6 @@ where
         let validator_cache_sink = self.ctx.validator_cache_sink.take();
         let turn_length_sink = self.ctx.turn_length_sink.take();
 
-        // BlockAssemblerInput is non_exhaustive, so we use BscBlockAssemblerInput with
-        // assemble_block_body_only() which skips finalize_new_header() at build time.
         let bsc_input: BscBlockAssemblerInput<'_, '_, BscBlockExecutorFactory> =
             BscBlockAssemblerInput {
                 evm_env,
@@ -212,13 +226,9 @@ where
                 state_root,
             };
         let assemble_start = std::time::Instant::now();
-        // Assemble block body only — finalize_new_header() is deferred to pick_best_payload()
-        // so that FF votes can be collected right up to the moment the best payload is chosen.
         let block = self.assembler.assemble_block_body_only(bsc_input)?;
 
         // Transport validator and turn-length data to the payload layer via sinks.
-        // The final block hash is not yet known here (finalize_new_header hasn't run),
-        // so we cannot write to VALIDATOR_CACHE / TURN_LENGTH_CACHE yet.
         let current_validators = self.shared_ctx.inner.borrow().current_validators.clone();
         if let Some((validators, vote_addresses)) = current_validators {
             if let Some(sink) = &validator_cache_sink {
@@ -234,15 +244,16 @@ where
 
         let finish_duration = finish_start.elapsed();
         tracing::debug!(
-            target: "bsc::builder",
+            target: "bsc::builder::timing",
             block_number = %block.header.number,
             user_tx_len = user_tx_len,
             system_tx_len = system_tx_len,
             total_tx_len = total_tx_len,
-            finish_duration_ms = finish_duration.as_millis(),
-            state_root_duration_ms = state_root_duration.as_millis(),
-            assemble_duration_ms = assemble_duration.as_millis(),
-            "Assembled block body (pre-finalize)"
+            finish_total_ms = finish_duration.as_millis(),
+            executor_finish_ms,
+            merge_transitions_ms,
+            assemble_ms = assemble_duration.as_millis(),
+            "finish_with_difflayer breakdown"
         );
 
         let block = RecoveredBlock::new_unhashed(block, senders);

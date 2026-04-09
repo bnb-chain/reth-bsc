@@ -239,3 +239,10 @@ codegen-units = 1
 
 [dev-dependencies]
 uuid = { version = "1", features = ["v4"] }
+
+# Override triedb for transitive deps (reth → triedb) to use instrumentation branch
+[patch."https://github.com/bnb-chain/reth-bsc-triedb.git"]
+rust-eth-triedb = { path = "../reth-bsc-triedb/triedb" }
+rust-eth-triedb-common = { path = "../reth-bsc-triedb/common" }
+rust-eth-triedb-pathdb = { path = "../reth-bsc-triedb/db/pathdb" }
+rust-eth-triedb-state-trie = { path = "../reth-bsc-triedb/state-trie" }
