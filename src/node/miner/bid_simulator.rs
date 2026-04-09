@@ -592,7 +592,7 @@ where
         }
 
         let mut plain = sealed_block.clone_block();
-        plain.body.sidecars = Some(bid_runtime.blob_sidecars.clone());
+        plain.body.sidecars = if bid_runtime.blob_sidecars.is_empty() { None } else { Some(bid_runtime.blob_sidecars.clone()) };
         sealed_block = Arc::new(plain.into());
 
         let requests = execution_result.requests.clone();

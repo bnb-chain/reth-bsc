@@ -811,7 +811,7 @@ where
         }
 
         let mut plain = sealed_block.clone_block();
-        plain.body.sidecars = Some(blob_sidecars);
+        plain.body.sidecars = if blob_sidecars.is_empty() { None } else { Some(blob_sidecars) };
         sealed_block = Arc::new(plain.into());
 
         let requests = execution_result.requests.clone();

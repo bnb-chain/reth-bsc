@@ -3,6 +3,7 @@ use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::types::ErrorObject;
 use alloy_primitives::B256;
 use alloy_consensus::transaction::TxHashRef;
+use alloy_eips::eip2718::{EIP4844_TX_TYPE_ID, Typed2718};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use reth_transaction_pool::{BlobStoreError, TransactionPool};
@@ -346,11 +347,19 @@ where
         // Get block hash
         let block_hash = self.provider.block_hash(block_num).ok().flatten();
 
-        // Collect transaction hashes
-        let tx_hashes: Vec<B256> = txs.iter().map(|tx| *tx.tx_hash()).collect();
+        // Collect only blob (type-3) tx hashes with their block-level index.
+        let blob_txs: Vec<(B256, u64)> = txs.iter()
+            .enumerate()
+            .filter(|(_, tx)| tx.ty() == EIP4844_TX_TYPE_ID)
+            .map(|(idx, tx)| (*tx.tx_hash(), idx as u64))
+            .collect();
+        let blob_tx_hashes: Vec<B256> = blob_txs.iter().map(|(h, _)| *h).collect();
 
-        // Get all blobs for these transactions
-        let blob_results = self.pool.get_all_blobs(tx_hashes).map_err(|e| {
+        // Build hash → block-level tx_index map.
+        let hash_to_idx: std::collections::HashMap<B256, u64> = blob_txs.into_iter().collect();
+
+        // Get blobs only for blob transactions.
+        let blob_results = self.pool.get_all_blobs(blob_tx_hashes).map_err(|e| {
             ErrorObject::owned(
                 -32603,
                 format!("Failed to get blobs for block {}: {}", block_num, e),
@@ -358,16 +367,17 @@ where
             )
         })?;
 
-        // Convert to responses
+        // Convert to responses with correct block-level tx_index.
         let mut responses = Vec::new();
-        for (index, (tx_hash, sidecar)) in blob_results.into_iter().enumerate() {
+        for (tx_hash, sidecar) in blob_results.into_iter() {
+            let tx_index = hash_to_idx.get(&tx_hash).copied();
             let response = Self::sidecar_to_response(
                 tx_hash,
                 sidecar,
                 full_blob,
                 Some(block_num),
                 block_hash,
-                Some(index as u64),
+                tx_index,
             );
             responses.push(response);
         }

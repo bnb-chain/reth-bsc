@@ -1,7 +1,7 @@
 use crate::{BscBlock, BscBlockBody, BscPrimitives};
 use crate::node::primitives::BscBlobTransactionSidecar;
 use alloy_consensus::BlockHeader;
-use alloy_eips::eip2718::Typed2718;
+use alloy_eips::eip2718::{EIP4844_TX_TYPE_ID, Typed2718};
 use alloy_eips::eip7594::BlobTransactionSidecarVariant;
 use alloy_primitives::B256;
 use reth_chainspec::EthereumHardforks;
@@ -97,14 +97,14 @@ where
         provider: &Provider,
         inputs: Vec<ReadBodyInput<'_, Self::Block>>,
     ) -> ProviderResult<Vec<BscBlockBody>> {
-        // Pre-extract block metadata and tx hashes before `inputs` is consumed.
-        let block_info: Vec<(u64, B256, Vec<B256>)> = inputs
+        // Pre-extract block metadata and per-tx (hash, type) before `inputs` is consumed.
+        let block_info: Vec<(u64, B256, Vec<(B256, u8)>)> = inputs
             .iter()
             .map(|(header, txs)| {
                 (
                     header.number(),
                     header.hash_slow(),
-                    txs.iter().map(|tx| *tx.hash()).collect(),
+                    txs.iter().map(|tx| (*tx.hash(), tx.ty())).collect(),
                 )
             })
             .collect();
@@ -115,14 +115,21 @@ where
         let bodies = eth_bodies
             .into_iter()
             .zip(block_info.into_iter())
-            .map(|(inner, (block_number, block_hash, tx_hashes))| {
-                let blob_tx_hashes: Vec<B256> = inner.transactions.iter()
-                    .filter(|tx| tx.ty() == 3)
-                    .map(|tx| *tx.hash())
+            .map(|(inner, (block_number, block_hash, tx_info))| {
+                // Collect blob tx hashes and their position in the full block tx list.
+                let blob_txs: Vec<(B256, u64)> = tx_info.iter()
+                    .enumerate()
+                    .filter(|(_, (_, ty))| *ty == EIP4844_TX_TYPE_ID)
+                    .map(|(idx, (hash, _))| (*hash, idx as u64))
                     .collect();
-                let sidecars = blob_store.as_ref().and_then(|store| {
-                    read_sidecars_from_blob_store(store, block_number, block_hash, &tx_hashes)
-                });
+                let blob_tx_hashes: Vec<B256> = blob_txs.iter().map(|(h, _)| *h).collect();
+                let sidecars = if blob_txs.is_empty() {
+                    None
+                } else {
+                    blob_store.as_ref().and_then(|store| {
+                        read_sidecars_from_blob_store(store, block_number, block_hash, &blob_txs)
+                    })
+                };
                 if !blob_tx_hashes.is_empty() {
                     let found = sidecars.as_ref().map_or(0, |s| s.len());
                     tracing::debug!(
@@ -151,22 +158,20 @@ where
     }
 }
 
-/// Look up blob sidecars for all transactions in a block from the blob store.
+/// Look up blob sidecars from the blob store.
+/// `blob_txs` contains `(tx_hash, tx_index_in_block)` pairs — only type-3 txs.
 fn read_sidecars_from_blob_store(
     blob_store: &Arc<dyn BlobStore>,
     block_number: u64,
     block_hash: B256,
-    tx_hashes: &[B256],
+    blob_txs: &[(B256, u64)],
 ) -> Option<Vec<BscBlobTransactionSidecar>> {
-    let blobs = blob_store.get_all(tx_hashes.to_vec()).ok()?;
+    let tx_hashes: Vec<B256> = blob_txs.iter().map(|(h, _)| *h).collect();
+    let blobs = blob_store.get_all(tx_hashes).ok()?;
     if blobs.is_empty() {
         return None;
     }
-    let hash_to_idx: HashMap<B256, u64> = tx_hashes
-        .iter()
-        .enumerate()
-        .map(|(i, h)| (*h, i as u64))
-        .collect();
+    let hash_to_idx: HashMap<B256, u64> = blob_txs.iter().copied().collect();
 
     let mut sidecars: Vec<_> = blobs
         .into_iter()
