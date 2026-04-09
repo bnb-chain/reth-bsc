@@ -1,6 +1,7 @@
 use crate::{BscBlock, BscBlockBody, BscPrimitives};
 use crate::node::primitives::BscBlobTransactionSidecar;
 use alloy_consensus::BlockHeader;
+use alloy_eips::eip2718::Typed2718;
 use alloy_eips::eip7594::BlobTransactionSidecarVariant;
 use alloy_primitives::B256;
 use reth_chainspec::EthereumHardforks;
@@ -51,11 +52,22 @@ where
                 }
             }
             if !to_insert.is_empty() {
-                if let Err(e) = blob_store.insert_all(to_insert) {
-                    tracing::warn!(
-                        target: "bsc::storage",
-                        "Failed to insert blob sidecars into blob store: {e}"
-                    );
+                let tx_hashes: Vec<_> = to_insert.iter().map(|(h, _)| *h).collect();
+                match blob_store.insert_all(to_insert) {
+                    Ok(()) => {
+                        tracing::debug!(
+                            target: "bsc::storage",
+                            ?tx_hashes,
+                            "blob_store_write: inserted sidecars"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "bsc::storage",
+                            ?tx_hashes,
+                            "blob_store_write: failed to insert sidecars: {e}"
+                        );
+                    }
                 }
             }
         }
@@ -104,9 +116,34 @@ where
             .into_iter()
             .zip(block_info.into_iter())
             .map(|(inner, (block_number, block_hash, tx_hashes))| {
+                let blob_tx_hashes: Vec<B256> = inner.transactions.iter()
+                    .filter(|tx| tx.ty() == 3)
+                    .map(|tx| *tx.hash())
+                    .collect();
                 let sidecars = blob_store.as_ref().and_then(|store| {
                     read_sidecars_from_blob_store(store, block_number, block_hash, &tx_hashes)
                 });
+                if !blob_tx_hashes.is_empty() {
+                    let found = sidecars.as_ref().map_or(0, |s| s.len());
+                    tracing::debug!(
+                        target: "bsc::storage",
+                        block_number,
+                        ?block_hash,
+                        ?blob_tx_hashes,
+                        found,
+                        blob_store_available = blob_store.is_some(),
+                        "blob_store_read: queried sidecars for blob txs"
+                    );
+                    if found == 0 {
+                        tracing::warn!(
+                            target: "bsc::storage",
+                            block_number,
+                            ?block_hash,
+                            ?blob_tx_hashes,
+                            "blob_store_read: block has blob txs but no sidecars found!"
+                        );
+                    }
+                }
                 BscBlockBody { inner, sidecars }
             })
             .collect();
