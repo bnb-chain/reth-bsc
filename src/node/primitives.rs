@@ -266,28 +266,34 @@ mod rlp {
 
     impl Encodable for BscBlockBody {
         fn encode(&self, out: &mut dyn bytes::BufMut) {
-            // Temporary diagnostic: dump encoded sidecar RLP header bytes
-            if let Some(ref sidecars) = self.sidecars {
-                for sc in sidecars {
-                    let mut sc_buf = Vec::new();
-                    sc.encode(&mut sc_buf);
-                    let hex_head: String = sc_buf.iter().take(16)
-                        .map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
-                    tracing::warn!(
-                        target: "bsc::rlp",
-                        tx_hash = ?sc.tx_hash,
-                        block_number = sc.block_number,
-                        tx_index = sc.tx_index,
-                        blobs = sc.inner.blobs.len(),
-                        commitments = sc.inner.commitments.len(),
-                        proofs = sc.inner.proofs.len(),
-                        encoded_len = sc_buf.len(),
-                        rlp_head = %hex_head,
-                        "encoding sidecar in BlockBody"
-                    );
-                }
+            if self.sidecars.as_ref().is_some_and(|s| !s.is_empty()) {
+                // Encode to temporary buffer so we can inspect + roundtrip test
+                let helper = BlockBodyHelper::from(self);
+                let mut body_buf = Vec::with_capacity(helper.length());
+                helper.encode(&mut body_buf);
+
+                // Dump the first 20 bytes of the full body encoding
+                let hex_head: String = body_buf.iter().take(20)
+                    .map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
+
+                // Roundtrip test: can we decode what we just encoded?
+                let rt_ok = Decodable::decode(&mut body_buf.as_slice())
+                    .map(|decoded: BscBlockBody| {
+                        decoded.sidecars.as_ref().map_or(0, |s| s.len())
+                    });
+
+                tracing::warn!(
+                    target: "bsc::rlp",
+                    body_encoded_len = body_buf.len(),
+                    body_rlp_head = %hex_head,
+                    roundtrip = ?rt_ok,
+                    "encoding BlockBody with sidecars"
+                );
+
+                out.put_slice(&body_buf);
+            } else {
+                BlockBodyHelper::from(self).encode(out);
             }
-            BlockBodyHelper::from(self).encode(out);
         }
 
         fn length(&self) -> usize {
