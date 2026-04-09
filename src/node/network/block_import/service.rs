@@ -99,6 +99,8 @@ where
     queued_blocks: LruCache<B256>,
     /// Cache of downloading block hashes to avoid re-downloading the same block.
     downloading_blocks: LruMap<B256, u128, ByLength>,
+    /// Periodic timer for head announcement.
+    announce_interval: tokio::time::Interval,
 }
 
 impl<Provider> ImportService<Provider>
@@ -132,6 +134,11 @@ where
             processed_blocks: LruCache::new(LRU_PROCESSED_BLOCKS_SIZE),
             queued_blocks: LruCache::new(LRU_PROCESSED_BLOCKS_SIZE),
             downloading_blocks: LruMap::new(ByLength::new(LRU_PROCESSED_BLOCKS_SIZE)),
+            announce_interval: {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                interval
+            },
         }
     }
 
@@ -208,19 +215,62 @@ where
                         None
                     }
                     PayloadStatusEnum::Syncing => {
-                        // When new_payload returns Syncing status, we need to manually trigger FCU
-                        // to avoid the engine-tree being stuck in syncing state without any driver.
-                        // By calling FCU, we inform the engine about the new head block hash,
-                        // which can help trigger additional sync/download activities in the engine-tree.
+                        // Parent block is missing. Actively fetch ancestor blocks
+                        // from the announcing peer via BSC GetBlocksByRange to bridge
+                        // the gap, rather than waiting passively.
                         let block_number = header.number;
-                        tracing::debug!(
+                        let parent_hash = header.parent_hash;
+                        tracing::info!(
                             target: "bsc::block_import",
                             block_hash = %block_hash,
                             block_number = block_number,
-                            "New payload returned Syncing status - attempting fork choice update"
+                            parent_hash = %parent_hash,
+                            peer = %peer_id,
+                            "New payload returned Syncing - fetching ancestor blocks from peer"
                         );
 
-                        // Direct FCU call to help sync progress
+                        // Determine how many blocks to request.
+                        let local_tip = forkchoice_engine.provider
+                            .best_block_number()
+                            .unwrap_or(0);
+                        let gap = block_number.saturating_sub(local_tip);
+                        let count = gap.clamp(1, 64);
+
+                        // Spawn async range fetch from the originating peer
+                        let fetch_peer = peer_id;
+                        tokio::spawn(async move {
+                            let target_peer = if crate::node::network::bsc_protocol::registry::has_registered_peer(fetch_peer) {
+                                Some(fetch_peer)
+                            } else {
+                                crate::node::network::bsc_protocol::registry::list_registered_peers()
+                                    .into_iter()
+                                    .next()
+                            };
+                            if let Some(bsc_peer) = target_peer {
+                                tracing::debug!(
+                                    target: "bsc::block_import",
+                                    peer = %bsc_peer,
+                                    block_hash = %block_hash,
+                                    block_number = block_number,
+                                    count = count,
+                                    "Requesting ancestor block range for syncing block"
+                                );
+                                let _ = crate::node::network::bsc_protocol::registry::batch_request_range_and_await_import(
+                                    bsc_peer,
+                                    block_number,
+                                    block_hash,
+                                    count,
+                                    std::time::Duration::from_secs(5),
+                                ).await;
+                            } else {
+                                tracing::debug!(
+                                    target: "bsc::block_import",
+                                    "No BSC protocol peer available for ancestor fetch"
+                                );
+                            }
+                        });
+
+                        // Also send FCU to inform the engine-tree about the new head
                         let forkchoice_state = alloy_rpc_types::engine::ForkchoiceState {
                             head_block_hash: block_hash,
                             safe_block_hash: alloy_primitives::B256::ZERO,
@@ -483,25 +533,29 @@ where
                     .into_iter()
                     .next()
             };
+            // Compute how many blocks to request based on the gap to local tip.
+            let local_tip = self.forkchoice_engine.provider
+                .best_block_number()
+                .unwrap_or(0);
+            let gap = start_height.saturating_sub(local_tip);
+            let count = gap.clamp(1, 64);
             if let Some(bsc_peer) = target_peer {
                 tracing::debug!(
                     target: "bsc::block_import",
                     peer_id = %bsc_peer,
                     block_hash = %start_hash,
                     block_number = start_height,
-                    "Requesting block with block range for NewBlockHashes"
+                    count = count,
+                    "Requesting block range for NewBlockHashes"
                 );
                 tokio::spawn(async move {
                     use std::time::Duration;
-                    // Use a generous request timeout separate from the cooldown interval.
-                    // DOWNLOAD_COOLDOWN_DURATION_MS (200ms) is intentionally short to avoid
-                    // duplicate downloads, but a block fetch across the network needs more time.
-                    let req_timeout = Duration::from_millis(1000);
+                    let req_timeout = Duration::from_secs(5);
                     let _ = crate::node::network::bsc_protocol::registry::batch_request_range_and_await_import(
                         bsc_peer,
                         start_height,
                         start_hash,
-                        1,
+                        count,
                         req_timeout,
                     ).await;
                 });
@@ -594,6 +648,46 @@ where
 
                 if let Err(e) = this.to_network.send(BlockImportEvent::Outcome(outcome)) {
                     return Poll::Ready(Err(Box::new(e)));
+                }
+            }
+        }
+
+        // Periodic head announcement (every 5s) so that peers learn about our chain.
+        // After restart when no new blocks are produced, this ensures peers discover
+        // our tip and can push their (potentially longer) chain back to us.
+        // Using tokio Interval so the waker is properly registered.
+        if this.announce_interval.poll_tick(cx).is_ready() {
+            if let Some(net) = crate::shared::get_network_handle() {
+                if let Ok(info) = this.forkchoice_engine.provider.chain_info() {
+                    if let Ok(Some(header)) = this.forkchoice_engine.provider.header_by_number(info.best_number) {
+                        let hash = header.hash_slow();
+                        let td = this.forkchoice_engine.provider
+                            .header_td_by_number(info.best_number)
+                            .ok()
+                            .flatten()
+                            .unwrap_or_default();
+                        let block = crate::node::primitives::BscBlock {
+                            header: header.clone(),
+                            body: crate::node::primitives::BscBlockBody {
+                                inner: reth_ethereum_primitives::BlockBody::default(),
+                                sidecars: None,
+                            },
+                        };
+                        let new_block = crate::node::network::BscNewBlock(
+                            reth_eth_wire::NewBlock {
+                                block,
+                                td: alloy_primitives::U128::from(td.to::<u128>()),
+                            },
+                        );
+                        tracing::debug!(
+                            target: "bsc::block_import",
+                            number = info.best_number,
+                            hash = %hash,
+                            td = %td,
+                            "Periodic head announcement"
+                        );
+                        net.announce_block(new_block, hash, Some(td));
+                    }
                 }
             }
         }
