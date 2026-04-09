@@ -70,6 +70,8 @@ def main():
     parser = argparse.ArgumentParser(description="Analyze state root timing")
     parser.add_argument("--last", type=int, default=0, help="Only analyze last N blocks")
     parser.add_argument("--min-tx", type=int, default=0, help="Only analyze blocks with >= N user txs")
+    parser.add_argument("--caller", choices=["miner", "import", "all"], default="all",
+                        help="Filter triedb entries by caller (miner/import/all)")
     args = parser.parse_args()
 
     # Collect log entries by type
@@ -95,6 +97,12 @@ def main():
             commit_entries.append(parse_kv(line))
         elif "slow storage trie update" in line:
             slow_storage.append(parse_kv(line))
+
+    # Apply --caller filter to triedb entries
+    if args.caller != "all":
+        triedb_top_entries = [e for e in triedb_top_entries if e.get('caller') == args.caller]
+        triedb_inner_entries = [e for e in triedb_inner_entries if e.get('caller') == args.caller]
+        commit_entries = [e for e in commit_entries if e.get('caller') == args.caller]
 
     # Apply --last filter
     if args.last > 0:
