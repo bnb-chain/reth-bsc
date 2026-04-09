@@ -23,10 +23,10 @@ impl NodePrimitives for BscPrimitives {
 
 /// BSC representation of a EIP-4844 sidecar.
 ///
-/// RLP encoding matches go-bsc's `BlobSidecar` flat layout:
-///   `[blobs, commitments, proofs, block_number, block_hash, tx_index, tx_hash]`
-/// This is achieved by inlining `inner`'s fields rather than nesting them in a
-/// sub-list (which the derived `RlpEncodable` would produce).
+/// RLP encoding matches go-bsc's `BlobSidecar` nested layout:
+///   `[[blobs, commitments, proofs], block_number, block_hash, tx_index, tx_hash]`
+/// The inner `BlobTxSidecar` is encoded as a sub-list, matching the Go struct
+/// `BlobSidecar { BlobTxSidecar, BlockNumber, BlockHash, TxIndex, TxHash }`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BscBlobTransactionSidecar {
     pub inner: BlobTransactionSidecar,
@@ -38,12 +38,18 @@ pub struct BscBlobTransactionSidecar {
 
 impl Encodable for BscBlobTransactionSidecar {
     fn encode(&self, out: &mut dyn bytes::BufMut) {
-        let payload_len = self.inner.rlp_encoded_fields_length()
+        // Inner BlobTxSidecar encoded as a nested sub-list: [blobs, commitments, proofs]
+        let inner_fields_len = self.inner.rlp_encoded_fields_length();
+        let inner_header =
+            alloy_rlp::Header { list: true, payload_length: inner_fields_len };
+
+        let payload_len = inner_header.length() + inner_fields_len
             + self.block_number.length()
             + self.block_hash.length()
             + self.tx_index.length()
             + self.tx_hash.length();
         alloy_rlp::Header { list: true, payload_length: payload_len }.encode(out);
+        inner_header.encode(out);
         self.inner.rlp_encode_fields(out);
         self.block_number.encode(out);
         self.block_hash.encode(out);
@@ -52,7 +58,11 @@ impl Encodable for BscBlobTransactionSidecar {
     }
 
     fn length(&self) -> usize {
-        let payload_len = self.inner.rlp_encoded_fields_length()
+        let inner_fields_len = self.inner.rlp_encoded_fields_length();
+        let inner_header =
+            alloy_rlp::Header { list: true, payload_length: inner_fields_len };
+
+        let payload_len = inner_header.length() + inner_fields_len
             + self.block_number.length()
             + self.block_hash.length()
             + self.tx_index.length()
@@ -68,7 +78,19 @@ impl Decodable for BscBlobTransactionSidecar {
             return Err(alloy_rlp::Error::UnexpectedString);
         }
         let remaining_before = buf.len();
+
+        // Decode inner BlobTxSidecar from a nested sub-list
+        let inner_header = alloy_rlp::Header::decode(buf)?;
+        if !inner_header.list {
+            return Err(alloy_rlp::Error::UnexpectedString);
+        }
+        let inner_remaining = buf.len();
         let inner = BlobTransactionSidecar::rlp_decode_fields(buf)?;
+        let inner_consumed = inner_remaining - buf.len();
+        if inner_consumed != inner_header.payload_length {
+            return Err(alloy_rlp::Error::UnexpectedLength);
+        }
+
         let block_number = u64::decode(buf)?;
         let block_hash = B256::decode(buf)?;
         let tx_index = u64::decode(buf)?;
@@ -266,51 +288,7 @@ mod rlp {
 
     impl Encodable for BscBlockBody {
         fn encode(&self, out: &mut dyn bytes::BufMut) {
-            if self.sidecars.as_ref().is_some_and(|s| !s.is_empty()) {
-                let helper = BlockBodyHelper::from(self);
-                let mut body_buf = Vec::with_capacity(helper.length());
-                helper.encode(&mut body_buf);
-
-                // Walk the RLP structure and log each field boundary
-                let mut cursor = body_buf.as_slice();
-                let outer = alloy_rlp::Header::decode(&mut cursor).ok();
-                // txs
-                let txs_pos = body_buf.len() - cursor.len();
-                let txs_hdr = alloy_rlp::Header::decode(&mut cursor).ok();
-                if let Some(ref h) = txs_hdr { cursor = &cursor[h.payload_length..]; }
-                // ommers
-                let ommers_pos = body_buf.len() - cursor.len();
-                let ommers_hdr = alloy_rlp::Header::decode(&mut cursor).ok();
-                if let Some(ref h) = ommers_hdr { cursor = &cursor[h.payload_length..]; }
-                // withdrawals
-                let wd_pos = body_buf.len() - cursor.len();
-                let wd_byte = cursor.first().copied();
-                let wd_hdr = alloy_rlp::Header::decode(&mut cursor).ok();
-                if let Some(ref h) = wd_hdr { cursor = &cursor[h.payload_length..]; }
-                // sidecars
-                let sc_pos = body_buf.len() - cursor.len();
-                let sc_first_16: String = cursor.iter().take(16)
-                    .map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
-
-                tracing::warn!(
-                    target: "bsc::rlp",
-                    body_len = body_buf.len(),
-                    txs_at = txs_pos,
-                    txs_payload = txs_hdr.as_ref().map(|h| h.payload_length),
-                    ommers_at = ommers_pos,
-                    ommers_payload = ommers_hdr.as_ref().map(|h| h.payload_length),
-                    wd_at = wd_pos,
-                    wd_byte = wd_byte.map(|b| format!("0x{:02x}", b)),
-                    wd_payload = wd_hdr.as_ref().map(|h| h.payload_length),
-                    sc_at = sc_pos,
-                    sc_hex = %sc_first_16,
-                    "body field layout"
-                );
-
-                out.put_slice(&body_buf);
-            } else {
-                BlockBodyHelper::from(self).encode(out);
-            }
+            BlockBodyHelper::from(self).encode(out);
         }
 
         fn length(&self) -> usize {
@@ -676,6 +654,68 @@ mod tests {
             computed_length + 1,
             actual_length,
             "Computed RLP length for empty withdrawals should be 1 byte less than actual encoded length"
+        );
+    }
+
+    #[test]
+    fn test_blob_sidecar_nested_rlp_layout() {
+        // Regression test: BscBlobTransactionSidecar must encode BlobTxSidecar as a
+        // nested sub-list to match go-bsc's struct layout:
+        //   BlobSidecar { BlobTxSidecar, BlockNumber, BlockHash, TxIndex, TxHash }
+        //
+        // Expected RLP: [[blobs, commitments, proofs], block_number, block_hash, tx_index, tx_hash]
+        // NOT the flat:  [blobs, commitments, proofs, block_number, block_hash, tx_index, tx_hash]
+        //
+        // go-bsc decodes field-by-field: it reads the first element as BlobTxSidecar
+        // (expecting a list), then block_number, etc. A flat encoding causes:
+        //   "rlp: expected input list for []kzg4844.Blob"
+        use alloy_rlp::{Decodable, Encodable};
+
+        let sidecar = BscBlobTransactionSidecar {
+            inner: BlobTransactionSidecar {
+                blobs: vec![alloy_eips::eip4844::Blob::default()],
+                commitments: vec![alloy_eips::eip4844::Bytes48::default()],
+                proofs: vec![alloy_eips::eip4844::Bytes48::default()],
+            },
+            block_number: 42,
+            block_hash: B256::repeat_byte(0xab),
+            tx_index: 7,
+            tx_hash: B256::repeat_byte(0xcd),
+        };
+
+        // Encode
+        let mut buf = Vec::new();
+        sidecar.encode(&mut buf);
+
+        // Verify nested structure: outer list → first element must be a list (BlobTxSidecar)
+        let mut cursor = buf.as_slice();
+        let outer = alloy_rlp::Header::decode(&mut cursor).unwrap();
+        assert!(outer.list, "outer should be a list");
+
+        let first_elem = alloy_rlp::Header::decode(&mut cursor).unwrap();
+        assert!(
+            first_elem.list,
+            "first element (BlobTxSidecar) must be a nested list, not a raw field — \
+             go-bsc expects struct BlobSidecar {{ BlobTxSidecar, ... }}"
+        );
+
+        // Inside the nested BlobTxSidecar list, first sub-element should also be a list (blobs)
+        let blobs_hdr = alloy_rlp::Header::decode(&mut cursor).unwrap();
+        assert!(
+            blobs_hdr.list,
+            "blobs field inside BlobTxSidecar must be a list of Blob items"
+        );
+
+        // Roundtrip
+        let decoded = BscBlobTransactionSidecar::decode(&mut buf.as_slice())
+            .expect("Failed to decode sidecar");
+        assert_eq!(sidecar, decoded, "sidecar should roundtrip through RLP");
+
+        // Verify length() matches actual encoded size
+        assert_eq!(
+            sidecar.length(),
+            buf.len(),
+            "length() must match actual encoded size"
         );
     }
 }
