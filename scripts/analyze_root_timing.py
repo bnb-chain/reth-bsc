@@ -81,6 +81,7 @@ def main():
     triedb_inner_entries = [] # intermediate_inner breakdown
     commit_entries = []       # commit_inner breakdown
     slow_storage = []         # slow storage trie updates
+    slow_account_trie = []    # slow update_account_trie (>10ms)
 
     for line in sys.stdin:
         line = ANSI_RE.sub('', line)
@@ -91,6 +92,8 @@ def main():
             root_entries.append(parse_kv(line))
         elif "intermediate_and_commit_hashed_post_state breakdown" in line:
             triedb_top_entries.append(parse_kv(line))
+        elif "slow update_account_trie" in line:
+            slow_account_trie.append(parse_kv(line))
         elif "intermediate_inner breakdown" in line:
             triedb_inner_entries.append(parse_kv(line))
         elif "commit_inner breakdown" in line:
@@ -177,6 +180,28 @@ def main():
         print(f"  update_state_objects_ms : {stats_str(extract(triedb_inner_entries, 'update_state_objects_ms'))}")
         print(f"  update_account_trie_ms  : {stats_str(extract(triedb_inner_entries, 'update_account_trie_ms'))}")
         print(f"  account_hash_ms         : {stats_str(extract(triedb_inner_entries, 'account_hash_ms'))}")
+        resolves = extract(triedb_inner_entries, 'hash_resolves')
+        acct_counts = extract(triedb_inner_entries, 'account_count')
+        if resolves:
+            print(f"  hash_resolves           : {stats_str(resolves)}")
+        if acct_counts:
+            print(f"  account_count           : {stats_str(acct_counts)}")
+
+    # ===== Section 4b: Slow account trie updates =====
+    if slow_account_trie:
+        print()
+        print("=" * 70)
+        print(f"SLOW UPDATE_ACCOUNT_TRIE (>10ms)  (n={len(slow_account_trie)})")
+        print("=" * 70)
+        print(f"  update_account_trie_ms  : {stats_str(extract(slow_account_trie, 'update_account_trie_ms'))}")
+        print(f"  account_count           : {stats_str(extract(slow_account_trie, 'account_count'))}")
+        print(f"  hash_resolves           : {stats_str(extract(slow_account_trie, 'hash_resolves'))}")
+        # Correlation: resolves per ms
+        pairs = [(e.get('hash_resolves', 0), e.get('update_account_trie_ms', 1))
+                 for e in slow_account_trie if e.get('update_account_trie_ms', 0) > 0]
+        if pairs:
+            avg_resolves_per_ms = statistics.mean([r / max(t, 1) for r, t in pairs])
+            print(f"  avg resolves/ms         : {avg_resolves_per_ms:.1f}")
 
     # ===== Section 5: TrieDB commit =====
     print()
