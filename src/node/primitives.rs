@@ -266,9 +266,13 @@ mod rlp {
 
     impl Encodable for BscBlockBody {
         fn encode(&self, out: &mut dyn bytes::BufMut) {
-            // Temporary diagnostic: log sidecar structure before encoding
+            // Temporary diagnostic: dump encoded sidecar RLP header bytes
             if let Some(ref sidecars) = self.sidecars {
                 for sc in sidecars {
+                    let mut sc_buf = Vec::new();
+                    sc.encode(&mut sc_buf);
+                    let hex_head: String = sc_buf.iter().take(16)
+                        .map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
                     tracing::warn!(
                         target: "bsc::rlp",
                         tx_hash = ?sc.tx_hash,
@@ -277,6 +281,8 @@ mod rlp {
                         blobs = sc.inner.blobs.len(),
                         commitments = sc.inner.commitments.len(),
                         proofs = sc.inner.proofs.len(),
+                        encoded_len = sc_buf.len(),
+                        rlp_head = %hex_head,
                         "encoding sidecar in BlockBody"
                     );
                 }
