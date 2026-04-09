@@ -267,27 +267,44 @@ mod rlp {
     impl Encodable for BscBlockBody {
         fn encode(&self, out: &mut dyn bytes::BufMut) {
             if self.sidecars.as_ref().is_some_and(|s| !s.is_empty()) {
-                // Encode to temporary buffer so we can inspect + roundtrip test
                 let helper = BlockBodyHelper::from(self);
                 let mut body_buf = Vec::with_capacity(helper.length());
                 helper.encode(&mut body_buf);
 
-                // Dump the first 20 bytes of the full body encoding
-                let hex_head: String = body_buf.iter().take(20)
+                // Walk the RLP structure and log each field boundary
+                let mut cursor = body_buf.as_slice();
+                let outer = alloy_rlp::Header::decode(&mut cursor).ok();
+                // txs
+                let txs_pos = body_buf.len() - cursor.len();
+                let txs_hdr = alloy_rlp::Header::decode(&mut cursor).ok();
+                if let Some(ref h) = txs_hdr { cursor = &cursor[h.payload_length..]; }
+                // ommers
+                let ommers_pos = body_buf.len() - cursor.len();
+                let ommers_hdr = alloy_rlp::Header::decode(&mut cursor).ok();
+                if let Some(ref h) = ommers_hdr { cursor = &cursor[h.payload_length..]; }
+                // withdrawals
+                let wd_pos = body_buf.len() - cursor.len();
+                let wd_byte = cursor.first().copied();
+                let wd_hdr = alloy_rlp::Header::decode(&mut cursor).ok();
+                if let Some(ref h) = wd_hdr { cursor = &cursor[h.payload_length..]; }
+                // sidecars
+                let sc_pos = body_buf.len() - cursor.len();
+                let sc_first_16: String = cursor.iter().take(16)
                     .map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
-
-                // Roundtrip test: can we decode what we just encoded?
-                let rt_ok = Decodable::decode(&mut body_buf.as_slice())
-                    .map(|decoded: BscBlockBody| {
-                        decoded.sidecars.as_ref().map_or(0, |s| s.len())
-                    });
 
                 tracing::warn!(
                     target: "bsc::rlp",
-                    body_encoded_len = body_buf.len(),
-                    body_rlp_head = %hex_head,
-                    roundtrip = ?rt_ok,
-                    "encoding BlockBody with sidecars"
+                    body_len = body_buf.len(),
+                    txs_at = txs_pos,
+                    txs_payload = txs_hdr.as_ref().map(|h| h.payload_length),
+                    ommers_at = ommers_pos,
+                    ommers_payload = ommers_hdr.as_ref().map(|h| h.payload_length),
+                    wd_at = wd_pos,
+                    wd_byte = wd_byte.map(|b| format!("0x{:02x}", b)),
+                    wd_payload = wd_hdr.as_ref().map(|h| h.payload_length),
+                    sc_at = sc_pos,
+                    sc_hex = %sc_first_16,
+                    "body field layout"
                 );
 
                 out.put_slice(&body_buf);
