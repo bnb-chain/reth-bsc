@@ -178,9 +178,38 @@ fn read_sidecars_from_blob_store(
         .filter_map(|(tx_hash, variant)| {
             let inner = match variant.as_ref() {
                 BlobTransactionSidecarVariant::Eip4844(s) => s.clone(),
-                _ => return None,
+                _ => {
+                    tracing::warn!(
+                        target: "bsc::storage",
+                        block_number,
+                        ?tx_hash,
+                        "blob_store_read: sidecar is NOT Eip4844 variant, skipping"
+                    );
+                    return None;
+                }
             };
             let tx_index = *hash_to_idx.get(&tx_hash)?;
+            tracing::debug!(
+                target: "bsc::storage",
+                block_number,
+                ?tx_hash,
+                tx_index,
+                blobs = inner.blobs.len(),
+                commitments = inner.commitments.len(),
+                proofs = inner.proofs.len(),
+                "blob_store_read: sidecar detail"
+            );
+            if inner.blobs.is_empty() || inner.commitments.is_empty() || inner.proofs.is_empty() {
+                tracing::error!(
+                    target: "bsc::storage",
+                    block_number,
+                    ?tx_hash,
+                    blobs = inner.blobs.len(),
+                    commitments = inner.commitments.len(),
+                    proofs = inner.proofs.len(),
+                    "blob_store_read: sidecar has EMPTY fields!"
+                );
+            }
             Some(BscBlobTransactionSidecar { inner, block_number, block_hash, tx_index, tx_hash })
         })
         .collect();

@@ -266,6 +266,21 @@ mod rlp {
 
     impl Encodable for BscBlockBody {
         fn encode(&self, out: &mut dyn bytes::BufMut) {
+            // Temporary diagnostic: log sidecar structure before encoding
+            if let Some(ref sidecars) = self.sidecars {
+                for sc in sidecars {
+                    tracing::warn!(
+                        target: "bsc::rlp",
+                        tx_hash = ?sc.tx_hash,
+                        block_number = sc.block_number,
+                        tx_index = sc.tx_index,
+                        blobs = sc.inner.blobs.len(),
+                        commitments = sc.inner.commitments.len(),
+                        proofs = sc.inner.proofs.len(),
+                        "encoding sidecar in BlockBody"
+                    );
+                }
+            }
             BlockBodyHelper::from(self).encode(out);
         }
 
