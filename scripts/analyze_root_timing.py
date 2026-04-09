@@ -49,7 +49,11 @@ def parse_kv(line):
 def percentile(data, p):
     if not data:
         return 0
-    return statistics.quantiles(data, n=100)[p - 1] if len(data) >= 2 else data[0]
+    s = sorted(data)
+    k = (len(s) - 1) * p / 100.0
+    f = int(k)
+    c = f + 1 if f + 1 < len(s) else f
+    return s[f] + (s[c] - s[f]) * (k - f)
 
 
 def stats_str(values):
