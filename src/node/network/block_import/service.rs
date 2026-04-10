@@ -101,8 +101,6 @@ where
     downloading_blocks: LruMap<B256, u128, ByLength>,
     /// Periodic timer for head announcement and peer chain discovery.
     announce_interval: tokio::time::Interval,
-    /// Last announced head hash — skip re-announce if unchanged.
-    last_announced_hash: B256,
     /// Guard to ensure only one peer discovery task runs at a time.
     /// Prevents accumulating concurrent tasks when GetBlocksByRange is slow.
     discovery_in_flight: Arc<std::sync::atomic::AtomicBool>,
@@ -148,7 +146,6 @@ where
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 interval
             },
-            last_announced_hash: B256::ZERO,
             discovery_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
@@ -669,51 +666,50 @@ where
         // their invalid_headers cache.  NewBlockHashes triggers peers to download the
         // full block via GetBlocksByRange, ensuring they always receive complete data.
         if this.announce_interval.poll_tick(cx).is_ready() {
-            // --- Part A: Announce our head to peers (only when head changes) ---
+            // --- Part A: Announce our head hash to all peers ---
+            // Sends NewBlockHashes (hash+number) every tick. Peers that already
+            // know this hash ignore it (geth: fetcher dedup, reth-bsc: processed_blocks).
+            // No last_announced_hash guard — ensures newly connected peers discover
+            // our chain head within 1s even if the head hasn't changed.
             if let Ok(info) = this.forkchoice_engine.provider.chain_info() {
                 if let Ok(Some(header)) = this.forkchoice_engine.provider.header_by_number(info.best_number) {
                     let hash = header.hash_slow();
-                    // Only announce when the head has changed, avoiding repeated
-                    // NewBlockHashes for the same hash every tick.
-                    if hash != this.last_announced_hash {
-                        this.last_announced_hash = hash;
-                        let number = header.number;
-                        let td = this.forkchoice_engine.provider
-                            .header_td_by_number(info.best_number)
-                            .ok()
-                            .flatten()
-                            .unwrap_or_default();
-                        tracing::debug!(
-                            target: "bsc::block_import",
-                            number,
-                            hash = %hash,
-                            td = %td,
-                            "Periodic head hash announcement (NewBlockHashes to all peers)"
-                        );
-                        let block = crate::node::primitives::BscBlock {
-                            header,
-                            body: crate::node::primitives::BscBlockBody {
-                                inner: reth_ethereum_primitives::BlockBody::default(),
-                                sidecars: None,
-                            },
-                        };
-                        let new_block = crate::node::network::BscNewBlock(
-                            reth_eth_wire::NewBlock {
-                                block,
-                                td: alloy_primitives::U128::from(td.to::<u128>()),
-                            },
-                        );
-                        let msg = NewBlockMessage {
-                            hash,
-                            block: std::sync::Arc::new(new_block),
-                            td: Some(td),
-                        };
-                        let _ = this.to_network.send(
-                            BlockImportEvent::Announcement(BlockValidation::ValidBlock {
-                                block: msg,
-                            }),
-                        );
-                    }
+                    let number = header.number;
+                    let td = this.forkchoice_engine.provider
+                        .header_td_by_number(info.best_number)
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default();
+                    tracing::debug!(
+                        target: "bsc::block_import",
+                        number,
+                        hash = %hash,
+                        td = %td,
+                        "Periodic head hash announcement (NewBlockHashes to all peers)"
+                    );
+                    let block = crate::node::primitives::BscBlock {
+                        header,
+                        body: crate::node::primitives::BscBlockBody {
+                            inner: reth_ethereum_primitives::BlockBody::default(),
+                            sidecars: None,
+                        },
+                    };
+                    let new_block = crate::node::network::BscNewBlock(
+                        reth_eth_wire::NewBlock {
+                            block,
+                            td: alloy_primitives::U128::from(td.to::<u128>()),
+                        },
+                    );
+                    let msg = NewBlockMessage {
+                        hash,
+                        block: std::sync::Arc::new(new_block),
+                        td: Some(td),
+                    };
+                    let _ = this.to_network.send(
+                        BlockImportEvent::Announcement(BlockValidation::ValidBlock {
+                            block: msg,
+                        }),
+                    );
                 }
             }
 
