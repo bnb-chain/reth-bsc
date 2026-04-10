@@ -766,13 +766,28 @@ where
                             .next()
                     };
                     if let Some(bsc_peer) = target {
-                        let _ = crate::node::network::bsc_protocol::registry::batch_request_range_and_await_import(
+                        if let Err(e) = crate::node::network::bsc_protocol::registry::batch_request_range_and_await_import(
                             bsc_peer,
                             peer_number,
                             peer_hash,
                             count,
                             std::time::Duration::from_secs(5),
-                        ).await;
+                        ).await {
+                            tracing::warn!(
+                                target: "bsc::block_import",
+                                peer = %bsc_peer,
+                                peer_hash = %peer_hash,
+                                peer_number,
+                                error = %e,
+                                "GetBlocksByRange failed for peer head discovery"
+                            );
+                        }
+                    } else {
+                        tracing::debug!(
+                            target: "bsc::block_import",
+                            peer = %peer_info.remote_id,
+                            "No BSC sub-protocol peer available, relying on FCU fallback"
+                        );
                     }
                     // Path 2: FCU to engine tree → standard eth download manager
                     // (recursive ancestor fetching via GetBlockHeaders/GetBlockBodies).
