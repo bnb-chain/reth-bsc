@@ -359,6 +359,32 @@ where
         // Parent difflayers were fetched once at job start; reuse across all retry attempts.
         let triedb_parent_difflayers = parent_difflayers;
 
+        // Safety guard: when triedb is active but no difflayers are available, verify that the
+        // parent state root matches the pathdb disk layer.  If they diverge (e.g. after a
+        // restart where in-memory difflayers were lost), building on this parent would produce
+        // a block with an incorrect state root.  Skip building to avoid polluting the network.
+        if rust_eth_triedb::triedb_manager::is_triedb_active() && triedb_parent_difflayers.is_none() {
+            let triedb = get_global_triedb();
+            let (persist_block, persist_root) = triedb
+                .latest_persist_state()
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            if parent_header.state_root() != persist_root {
+                warn!(
+                    target: "payload_builder",
+                    trace_id,
+                    parent_hash = %parent_hash,
+                    parent_number = parent_header.number(),
+                    parent_state_root = %parent_header.state_root(),
+                    pathdb_block = persist_block,
+                    pathdb_root = %persist_root,
+                    "Skipping build_payload: no difflayers and parent state root diverges from pathdb disk layer"
+                );
+                return Err(Box::from(
+                    "triedb pathdb gap: no difflayers and parent state root != pathdb disk layer root",
+                ));
+            }
+        }
+
         let state_provider = self.client.state_by_block_hash(parent_header.hash_slow())?;
         let state = StateProviderDatabase::new(&state_provider);
         let mut db = State::builder()
@@ -858,6 +884,30 @@ where
         let parent_hash = parent_header.hash_slow();
         // Parent difflayers were fetched once at job start; reuse across all retry attempts.
         let triedb_parent_difflayers = parent_difflayers;
+
+        // Safety guard: same as build_payload — refuse to build on a parent whose state root
+        // cannot be correctly resolved by pathdb without difflayers.
+        if rust_eth_triedb::triedb_manager::is_triedb_active() && triedb_parent_difflayers.is_none() {
+            let triedb = get_global_triedb();
+            let (persist_block, persist_root) = triedb
+                .latest_persist_state()
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            if parent_header.state_root() != persist_root {
+                warn!(
+                    target: "payload_builder",
+                    trace_id,
+                    parent_hash = %parent_hash,
+                    parent_number = parent_header.number(),
+                    parent_state_root = %parent_header.state_root(),
+                    pathdb_block = persist_block,
+                    pathdb_root = %persist_root,
+                    "Skipping build_empty_payload: no difflayers and parent state root diverges from pathdb disk layer"
+                );
+                return Err(Box::from(
+                    "triedb pathdb gap: no difflayers and parent state root != pathdb disk layer root",
+                ));
+            }
+        }
 
         let state_provider = self.client.state_by_block_hash(parent_header.hash_slow())?;
         let state = StateProviderDatabase::new(&state_provider);
