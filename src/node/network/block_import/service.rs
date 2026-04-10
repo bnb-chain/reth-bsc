@@ -660,7 +660,7 @@ where
             }
         }
 
-        // Periodic head hash announcement (every 5s) so that peers learn about our
+        // Periodic head hash announcement (every 1s) so that peers learn about our
         // chain tip.  We only broadcast NewBlockHashes (not full NewBlock) to avoid
         // injecting empty-body blocks into peers' block buffers, which could poison
         // their invalid_headers cache.  NewBlockHashes triggers peers to download the
@@ -721,106 +721,113 @@ where
             // and the peer is skipped on subsequent ticks — natural dedup.
             // Guard: skip if a previous discovery task is still running.
             if !this.discovery_in_flight.load(std::sync::atomic::Ordering::Relaxed) {
-            let provider = this.forkchoice_engine.provider.clone();
-            let engine = this.engine.clone();
-            let in_flight = this.discovery_in_flight.clone();
-            in_flight.store(true, std::sync::atomic::Ordering::Relaxed);
-            tokio::spawn(async move {
-                use reth_network_api::Peers;
-                // Inner async block so we can use ? / early-return freely;
-                // in_flight is always cleared in the outer scope afterwards.
-                let discover = async {
-                    let net = crate::shared::get_network_handle()?;
-                    let peers = net.get_all_peers().await.ok()?;
-                    for peer_info in peers {
-                        let peer_hash = peer_info.best_hash;
-                        if peer_hash.is_zero() {
-                            continue;
-                        }
-                        if provider.block_number(peer_hash).ok().flatten().is_some() {
-                            continue;
-                        }
-                        let peer_number = peer_info.best_number.unwrap_or(0);
-                        if peer_number == 0 {
-                            continue;
-                        }
-                        let local_tip = provider.best_block_number().unwrap_or(0);
-                        let local_td = provider.header_td_by_number(local_tip)
-                            .ok().flatten().unwrap_or_default();
-                        let peer_td = peer_info.best_td;
-                        let count = peer_number.saturating_sub(local_tip).clamp(1, 16);
-                        tracing::info!(
-                            target: "bsc::block_import",
-                            peer = %peer_info.remote_id,
-                            peer_hash = %peer_hash,
-                            peer_number,
-                            peer_td = ?peer_td,
-                            local_tip,
-                            local_td = %local_td,
-                            count,
-                            "Peer has unknown head block — fetching via GetBlocksByRange + FCU"
-                        );
-                        let target = if crate::node::network::bsc_protocol::registry::has_registered_peer(peer_info.remote_id) {
-                            Some(peer_info.remote_id)
-                        } else {
-                            crate::node::network::bsc_protocol::registry::list_registered_peers()
-                                .into_iter()
-                                .next()
-                        };
-                        if let Some(bsc_peer) = target {
-                            if let Err(e) = crate::node::network::bsc_protocol::registry::batch_request_range_and_await_import(
-                                bsc_peer,
-                                peer_number,
-                                peer_hash,
-                                count,
-                                std::time::Duration::from_secs(5),
-                            ).await {
-                                tracing::warn!(
-                                    target: "bsc::block_import",
-                                    peer = %bsc_peer,
-                                    peer_hash = %peer_hash,
-                                    peer_number,
-                                    error = %e,
-                                    "GetBlocksByRange failed for peer head discovery"
-                                );
+                let provider = this.forkchoice_engine.provider.clone();
+                let engine = this.engine.clone();
+                let in_flight = this.discovery_in_flight.clone();
+                in_flight.store(true, std::sync::atomic::Ordering::Relaxed);
+                tokio::spawn(async move {
+                    use reth_network_api::Peers;
+                    // Inner async block so early returns don't skip in_flight cleanup.
+                    let discover = async {
+                        let net = crate::shared::get_network_handle()?;
+                        let peers = net.get_all_peers().await.ok()?;
+                        for peer_info in peers {
+                            let peer_hash = peer_info.best_hash;
+                            if peer_hash.is_zero() {
+                                continue;
                             }
-                        } else {
-                            tracing::debug!(
-                                target: "bsc::block_import",
-                                peer = %peer_info.remote_id,
-                                "No BSC sub-protocol peer available, relying on FCU fallback"
-                            );
-                        }
-                        let fcu_state = ForkchoiceState {
-                            head_block_hash: peer_hash,
-                            safe_block_hash: B256::ZERO,
-                            finalized_block_hash: B256::ZERO,
-                        };
-                        if let Err(e) = engine
-                            .fork_choice_updated(
-                                fcu_state,
-                                None,
-                                EngineApiMessageVersion::default(),
-                            )
-                            .await
-                        {
-                            tracing::warn!(
+                            if provider.block_number(peer_hash).ok().flatten().is_some() {
+                                continue;
+                            }
+                            let peer_number = peer_info.best_number.unwrap_or(0);
+                            if peer_number == 0 {
+                                continue;
+                            }
+                            let local_tip = provider.best_block_number().unwrap_or(0);
+                            let local_td = provider
+                                .header_td_by_number(local_tip)
+                                .ok()
+                                .flatten()
+                                .unwrap_or_default();
+                            let peer_td = peer_info.best_td;
+                            let count =
+                                peer_number.saturating_sub(local_tip).clamp(1, 16);
+                            tracing::info!(
                                 target: "bsc::block_import",
                                 peer = %peer_info.remote_id,
                                 peer_hash = %peer_hash,
-                                error = %e,
-                                "FCU for peer head discovery failed"
+                                peer_number,
+                                peer_td = ?peer_td,
+                                local_tip,
+                                local_td = %local_td,
+                                count,
+                                "Peer has unknown head block — fetching via \
+                                 GetBlocksByRange + FCU"
                             );
+                            // Path 1: BSC sub-protocol GetBlocksByRange
+                            let target = if crate::node::network::bsc_protocol::registry::has_registered_peer(peer_info.remote_id) {
+                                Some(peer_info.remote_id)
+                            } else {
+                                crate::node::network::bsc_protocol::registry::list_registered_peers()
+                                    .into_iter()
+                                    .next()
+                            };
+                            if let Some(bsc_peer) = target {
+                                if let Err(e) = crate::node::network::bsc_protocol::registry::batch_request_range_and_await_import(
+                                    bsc_peer,
+                                    peer_number,
+                                    peer_hash,
+                                    count,
+                                    std::time::Duration::from_secs(5),
+                                ).await {
+                                    tracing::warn!(
+                                        target: "bsc::block_import",
+                                        peer = %bsc_peer,
+                                        peer_hash = %peer_hash,
+                                        peer_number,
+                                        error = %e,
+                                        "GetBlocksByRange failed for peer head discovery"
+                                    );
+                                }
+                            } else {
+                                tracing::debug!(
+                                    target: "bsc::block_import",
+                                    peer = %peer_info.remote_id,
+                                    "No BSC sub-protocol peer available, \
+                                     relying on FCU fallback"
+                                );
+                            }
+                            // Path 2: FCU → engine tree standard eth download
+                            let fcu_state = ForkchoiceState {
+                                head_block_hash: peer_hash,
+                                safe_block_hash: B256::ZERO,
+                                finalized_block_hash: B256::ZERO,
+                            };
+                            if let Err(e) = engine
+                                .fork_choice_updated(
+                                    fcu_state,
+                                    None,
+                                    EngineApiMessageVersion::default(),
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    target: "bsc::block_import",
+                                    peer = %peer_info.remote_id,
+                                    peer_hash = %peer_hash,
+                                    error = %e,
+                                    "FCU for peer head discovery failed"
+                                );
+                            }
+                            // One peer per tick to avoid flooding
+                            break;
                         }
-                        // One peer per tick to avoid flooding
-                        break;
-                    }
-                    Some(())
-                };
-                let _ = discover.await;
-                in_flight.store(false, std::sync::atomic::Ordering::Relaxed);
-            });
-            } // end discovery_in_flight guard
+                        Some(())
+                    };
+                    let _ = discover.await;
+                    in_flight.store(false, std::sync::atomic::Ordering::Relaxed);
+                });
+            }
         }
 
         Poll::Pending
