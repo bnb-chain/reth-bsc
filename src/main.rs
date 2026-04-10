@@ -410,7 +410,37 @@ fn main() -> eyre::Result<()> {
             // Set the IPC client
             reth_bsc::shared::set_ipc_client(ipc_path).await.unwrap();
 
-            exit_future.await
+            let result = exit_future.await;
+
+            // Graceful shutdown: persist all remaining in-memory blocks to MDBX + pathdb
+            // before exit. Without this, `safe-no-sync` mode can lose unfsynced MDBX data
+            // while pathdb (RocksDB) retains it, causing a gap on restart.
+            //
+            // finish_termination runs synchronously inside the engine tree's event handler,
+            // so no new blocks are accepted during persistence. The 30s timeout prevents
+            // hanging if persistence is stuck.
+            tracing::info!(target: "reth::cli", "SIGTERM received, persisting remaining blocks before exit...");
+            let engine_shutdown = node.add_ons_handle.engine_shutdown.clone();
+            if let Some(done_rx) = engine_shutdown.shutdown() {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    done_rx,
+                ).await {
+                    Ok(Ok(())) => {
+                        tracing::info!(target: "reth::cli", "Graceful shutdown complete — all blocks persisted");
+                    }
+                    Ok(Err(_)) => {
+                        tracing::warn!(target: "reth::cli", "Engine shutdown channel dropped before completion");
+                    }
+                    Err(_) => {
+                        tracing::error!(target: "reth::cli", "Engine shutdown timed out after 30s — some blocks may not be persisted");
+                    }
+                }
+            } else {
+                tracing::debug!(target: "reth::cli", "Engine shutdown already triggered, skipping");
+            }
+
+            result
         },
     )?;
     Ok(())
