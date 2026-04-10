@@ -199,14 +199,29 @@ pub async fn batch_request_range_and_await_import(
     );
 
     // Forward blocks to import path (iterate oldest -> newest).
-    // TD is unknown for range-fetched blocks (the BSC GetBlocksByRange response
-    // doesn't include TD). We set td to None rather than Some(ZERO) so that
-    // downstream code treats it as "unknown" instead of "zero".
+    // Compute TD incrementally: look up the first block's parent TD from our DB,
+    // then accumulate each block's difficulty. If parent TD is unavailable (block
+    // is on a fork we don't have), fall back to None.
     if let Some(sender) = crate::shared::get_block_import_sender() {
+        let mut running_td: Option<alloy_primitives::U256> = None;
+        let mut td_initialized = false;
         for block in resp.blocks.iter().rev() {
-            let nb = BscNewBlock(NewBlock { block: block.clone(), td: U128::ZERO });
+            if !td_initialized {
+                // Try to seed TD from the parent block's TD in our local DB
+                let parent_number = block.header.number.saturating_sub(1);
+                if let Some(parent_td) = crate::shared::get_header_td_by_number(parent_number) {
+                    running_td = Some(parent_td + alloy_primitives::U256::from(block.header.difficulty));
+                }
+                td_initialized = true;
+            } else if let Some(prev_td) = running_td {
+                running_td = Some(prev_td + alloy_primitives::U256::from(block.header.difficulty));
+            }
+            let td_u128 = running_td
+                .map(|td| td.to::<u128>())
+                .unwrap_or(0);
+            let nb = BscNewBlock(NewBlock { block: block.clone(), td: U128::from(td_u128) });
             let hash = block.header.hash_slow();
-            let msg = NewBlockMessage { hash, block: Arc::new(nb), td: None };
+            let msg = NewBlockMessage { hash, block: Arc::new(nb), td: running_td };
             if let Err(e) = sender.send((msg, peer)) {
                 tracing::error!(target: "bsc::registry", error=%e, "Failed to send block to import path");
             }

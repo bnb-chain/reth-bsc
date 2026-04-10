@@ -66,6 +66,12 @@ type BestTdFn = Arc<dyn Fn() -> Option<u128> + Send + Sync>;
 /// Global best total difficulty provider
 static BEST_TD_PROVIDER: OnceLock<BestTdFn> = OnceLock::new();
 
+/// Function type for header TD by number
+type HeaderTdByNumberFn = Arc<dyn Fn(u64) -> Option<alloy_primitives::U256> + Send + Sync>;
+
+/// Global header TD by number provider
+static HEADER_TD_BY_NUMBER_PROVIDER: OnceLock<HeaderTdByNumberFn> = OnceLock::new();
+
 /// Global sender for submitting mined blocks to the import service
 static BLOCK_IMPORT_MINED_SENDER: OnceLock<UnboundedSender<IncomingMinedBlock>> = OnceLock::new();
 
@@ -311,6 +317,15 @@ where
     });
     BEST_TD_PROVIDER.set(best_td_fn).map_err(|_| "Failed to set best td provider")?;
 
+    // Create function for header TD by number
+    let provider_clone5 = provider.clone();
+    let header_td_by_number_fn = Arc::new(move |block_number: u64| -> Option<alloy_primitives::U256> {
+        provider_clone5.header_td_by_number(block_number).ok().flatten()
+    });
+    HEADER_TD_BY_NUMBER_PROVIDER
+        .set(header_td_by_number_fn)
+        .map_err(|_| "Failed to set header td by number provider")?;
+
     Ok(())
 }
 
@@ -346,6 +361,11 @@ pub fn get_best_canonical_block_number() -> Option<u64> {
 /// Get the best total difficulty (u128 approximation) if available
 pub fn get_best_canonical_td() -> Option<u128> {
     BEST_TD_PROVIDER.get().and_then(|f| f())
+}
+
+/// Get header total difficulty by block number from the global provider
+pub fn get_header_td_by_number(block_number: u64) -> Option<alloy_primitives::U256> {
+    HEADER_TD_BY_NUMBER_PROVIDER.get().and_then(|f| f(block_number))
 }
 
 /// Store the block import sender globally. Returns an error if it was set before.
