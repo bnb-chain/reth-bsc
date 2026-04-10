@@ -99,8 +99,10 @@ where
     queued_blocks: LruCache<B256>,
     /// Cache of downloading block hashes to avoid re-downloading the same block.
     downloading_blocks: LruMap<B256, u128, ByLength>,
-    /// Periodic timer for head announcement.
+    /// Periodic timer for head announcement and peer chain discovery.
     announce_interval: tokio::time::Interval,
+    /// Last announced head hash — skip re-announce if unchanged.
+    last_announced_hash: B256,
 }
 
 impl<Provider> ImportService<Provider>
@@ -137,12 +139,13 @@ where
             announce_interval: {
                 // Announce head hash every 1s so newly connected peers discover our
                 // chain tip quickly.  Only NewBlockHashes (hash+number) is sent, so
-                // the overhead is negligible. The import service deduplicates via
-                // processed_blocks, preventing redundant downloads.
+                // the overhead is negligible. Deduplication via last_announced_hash
+                // ensures we don't re-send the same hash to all peers every tick.
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 interval
             },
+            last_announced_hash: B256::ZERO,
         }
     }
 
@@ -662,58 +665,63 @@ where
         // their invalid_headers cache.  NewBlockHashes triggers peers to download the
         // full block via GetBlocksByRange, ensuring they always receive complete data.
         if this.announce_interval.poll_tick(cx).is_ready() {
+            // --- Part A: Announce our head to peers (only when head changes) ---
             if let Ok(info) = this.forkchoice_engine.provider.chain_info() {
                 if let Ok(Some(header)) = this.forkchoice_engine.provider.header_by_number(info.best_number) {
                     let hash = header.hash_slow();
-                    let number = header.number;
-                    let td = this.forkchoice_engine.provider
-                        .header_td_by_number(info.best_number)
-                        .ok()
-                        .flatten()
-                        .unwrap_or_default();
-                    tracing::debug!(
-                        target: "bsc::block_import",
-                        number,
-                        hash = %hash,
-                        td = %td,
-                        "Periodic head hash announcement (NewBlockHashes to all peers)"
-                    );
-                    // Emit as ValidBlock event — the network layer's
-                    // announce_new_block_hash sends NewBlockHashes to ALL active peers
-                    // that haven't seen this hash yet.
-                    // Note: the block body is empty because only hash and number are
-                    // extracted by announce_new_block_hash; the body is never sent.
-                    let block = crate::node::primitives::BscBlock {
-                        header,
-                        body: crate::node::primitives::BscBlockBody {
-                            inner: reth_ethereum_primitives::BlockBody::default(),
-                            sidecars: None,
-                        },
-                    };
-                    let new_block = crate::node::network::BscNewBlock(
-                        reth_eth_wire::NewBlock {
-                            block,
-                            td: alloy_primitives::U128::from(td.to::<u128>()),
-                        },
-                    );
-                    let msg = NewBlockMessage {
-                        hash,
-                        block: std::sync::Arc::new(new_block),
-                        td: Some(td),
-                    };
-                    let _ = this.to_network.send(
-                        BlockImportEvent::Announcement(BlockValidation::ValidBlock {
-                            block: msg,
-                        }),
-                    );
+                    // Only announce when the head has changed, avoiding repeated
+                    // NewBlockHashes for the same hash every tick.
+                    if hash != this.last_announced_hash {
+                        this.last_announced_hash = hash;
+                        let number = header.number;
+                        let td = this.forkchoice_engine.provider
+                            .header_td_by_number(info.best_number)
+                            .ok()
+                            .flatten()
+                            .unwrap_or_default();
+                        tracing::debug!(
+                            target: "bsc::block_import",
+                            number,
+                            hash = %hash,
+                            td = %td,
+                            "Periodic head hash announcement (NewBlockHashes to all peers)"
+                        );
+                        let block = crate::node::primitives::BscBlock {
+                            header,
+                            body: crate::node::primitives::BscBlockBody {
+                                inner: reth_ethereum_primitives::BlockBody::default(),
+                                sidecars: None,
+                            },
+                        };
+                        let new_block = crate::node::network::BscNewBlock(
+                            reth_eth_wire::NewBlock {
+                                block,
+                                td: alloy_primitives::U128::from(td.to::<u128>()),
+                            },
+                        );
+                        let msg = NewBlockMessage {
+                            hash,
+                            block: std::sync::Arc::new(new_block),
+                            td: Some(td),
+                        };
+                        let _ = this.to_network.send(
+                            BlockImportEvent::Announcement(BlockValidation::ValidBlock {
+                                block: msg,
+                            }),
+                        );
+                    }
                 }
             }
 
-            // Active peer chain discovery: check if any connected peer has a head
-            // block we don't know about, and trigger GetBlocksByRange to pull it.
-            // This handles the case where a peer (e.g. geth-bsc) has a better chain
-            // but isn't actively broadcasting — similar to geth's synchronise()
-            // triggered on peer connection when peer TD > local TD.
+            // --- Part B: Discover and fetch unknown peer chain heads ---
+            // Check if any connected peer has a head block we don't know about.
+            // Similar to geth's synchronise() triggered when peer TD > local TD.
+            // --- Part B: Discover and fetch unknown peer chain heads ---
+            // Check if any connected peer has a head block we don't know about.
+            // Similar to geth's synchronise() triggered when peer TD > local TD.
+            // At most 1 fetch per tick (break after first unknown peer).
+            // Once the block is downloaded, provider.block_number() returns Some
+            // and the peer is skipped on subsequent ticks — natural dedup.
             let provider = this.forkchoice_engine.provider.clone();
             let engine = this.engine.clone();
             tokio::spawn(async move {
@@ -722,15 +730,13 @@ where
                 let Ok(peers) = net.get_all_peers().await else { return };
                 for peer_info in peers {
                     let peer_hash = peer_info.best_hash;
-                    // Skip zero hash (peer hasn't announced a head yet)
                     if peer_hash.is_zero() {
                         continue;
                     }
-                    // Check if we already have this block locally
+                    // Skip if we already have this block locally
                     if provider.block_number(peer_hash).ok().flatten().is_some() {
                         continue;
                     }
-                    // We don't have this peer's head block — fetch it.
                     let peer_number = peer_info.best_number.unwrap_or(0);
                     if peer_number == 0 {
                         continue;
@@ -744,9 +750,9 @@ where
                         peer_number,
                         local_tip,
                         count,
-                        "Peer has unknown head block — fetching via GetBlocksByRange"
+                        "Peer has unknown head block — fetching via GetBlocksByRange + FCU"
                     );
-                    // Fetch via BSC sub-protocol GetBlocksByRange
+                    // Path 1: BSC sub-protocol GetBlocksByRange (fast, if peer supports it)
                     let target = if crate::node::network::bsc_protocol::registry::has_registered_peer(peer_info.remote_id) {
                         Some(peer_info.remote_id)
                     } else {
@@ -763,8 +769,9 @@ where
                             std::time::Duration::from_secs(5),
                         ).await;
                     }
-                    // Also send FCU with the peer's head hash so the engine tree's
-                    // download manager kicks in for recursive ancestor fetching.
+                    // Path 2: FCU to engine tree → standard eth download manager
+                    // (recursive ancestor fetching via GetBlockHeaders/GetBlockBodies).
+                    // Works with all eth peers including geth-bsc.
                     let fcu_state = ForkchoiceState {
                         head_block_hash: peer_hash,
                         safe_block_hash: B256::ZERO,
@@ -777,7 +784,7 @@ where
                             EngineApiMessageVersion::default(),
                         )
                         .await;
-                    // Only process one unknown peer head per tick to avoid flooding
+                    // One peer per tick to avoid flooding
                     break;
                 }
             });
