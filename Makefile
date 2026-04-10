@@ -11,7 +11,7 @@ help: ## Display this help.
 
 .PHONY: build
 build: ## Build the reth binary into `target` directory.
-	cargo build --bin reth-bsc --features "$(FEATURES)" --profile "$(PROFILE)"
+	RUSTFLAGS="-C target-cpu=native" cargo build --bin reth-bsc --features "$(FEATURES)" --profile "$(PROFILE)"
 
 .PHONY: maxperf
 maxperf: ## Builds `reth-bsc` with the most aggressive optimisations.
