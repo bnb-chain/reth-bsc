@@ -103,6 +103,9 @@ where
     announce_interval: tokio::time::Interval,
     /// Last announced head hash — skip re-announce if unchanged.
     last_announced_hash: B256,
+    /// Guard to ensure only one peer discovery task runs at a time.
+    /// Prevents accumulating concurrent tasks when GetBlocksByRange is slow.
+    discovery_in_flight: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl<Provider> ImportService<Provider>
@@ -146,6 +149,7 @@ where
                 interval
             },
             last_announced_hash: B256::ZERO,
+            discovery_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -716,14 +720,15 @@ where
             // --- Part B: Discover and fetch unknown peer chain heads ---
             // Check if any connected peer has a head block we don't know about.
             // Similar to geth's synchronise() triggered when peer TD > local TD.
-            // --- Part B: Discover and fetch unknown peer chain heads ---
-            // Check if any connected peer has a head block we don't know about.
-            // Similar to geth's synchronise() triggered when peer TD > local TD.
             // At most 1 fetch per tick (break after first unknown peer).
             // Once the block is downloaded, provider.block_number() returns Some
             // and the peer is skipped on subsequent ticks — natural dedup.
+            // Guard: skip if a previous discovery task is still running.
+            if !this.discovery_in_flight.load(std::sync::atomic::Ordering::Relaxed) {
             let provider = this.forkchoice_engine.provider.clone();
             let engine = this.engine.clone();
+            let in_flight = this.discovery_in_flight.clone();
+            in_flight.store(true, std::sync::atomic::Ordering::Relaxed);
             tokio::spawn(async move {
                 use reth_network_api::Peers;
                 let Some(net) = crate::shared::get_network_handle() else { return };
@@ -816,7 +821,9 @@ where
                     // One peer per tick to avoid flooding
                     break;
                 }
+                in_flight.store(false, std::sync::atomic::Ordering::Relaxed);
             });
+            } // end discovery_in_flight guard
         }
 
         Poll::Pending
