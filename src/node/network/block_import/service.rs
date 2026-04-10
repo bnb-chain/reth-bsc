@@ -652,42 +652,48 @@ where
             }
         }
 
-        // Periodic head announcement (every 5s) so that peers learn about our chain.
-        // After restart when no new blocks are produced, this ensures peers discover
-        // our tip and can push their (potentially longer) chain back to us.
-        // Using tokio Interval so the waker is properly registered.
+        // Periodic head hash announcement (every 5s) so that peers learn about our
+        // chain tip.  We only broadcast NewBlockHashes (not full NewBlock) to avoid
+        // injecting empty-body blocks into peers' block buffers, which could poison
+        // their invalid_headers cache.  NewBlockHashes triggers peers to download the
+        // full block via GetBlocksByRange, ensuring they always receive complete data.
         if this.announce_interval.poll_tick(cx).is_ready() {
-            if let Some(net) = crate::shared::get_network_handle() {
-                if let Ok(info) = this.forkchoice_engine.provider.chain_info() {
-                    if let Ok(Some(header)) = this.forkchoice_engine.provider.header_by_number(info.best_number) {
-                        let hash = header.hash_slow();
-                        let td = this.forkchoice_engine.provider
-                            .header_td_by_number(info.best_number)
-                            .ok()
-                            .flatten()
-                            .unwrap_or_default();
-                        let block = crate::node::primitives::BscBlock {
-                            header: header.clone(),
-                            body: crate::node::primitives::BscBlockBody {
-                                inner: reth_ethereum_primitives::BlockBody::default(),
-                                sidecars: None,
-                            },
-                        };
-                        let new_block = crate::node::network::BscNewBlock(
-                            reth_eth_wire::NewBlock {
-                                block,
-                                td: alloy_primitives::U128::from(td.to::<u128>()),
-                            },
-                        );
-                        tracing::debug!(
-                            target: "bsc::block_import",
-                            number = info.best_number,
-                            hash = %hash,
-                            td = %td,
-                            "Periodic head announcement"
-                        );
-                        net.announce_block(new_block, hash, Some(td));
-                    }
+            if let Ok(info) = this.forkchoice_engine.provider.chain_info() {
+                if let Ok(Some(header)) = this.forkchoice_engine.provider.header_by_number(info.best_number) {
+                    let hash = header.hash_slow();
+                    let number = header.number;
+                    tracing::debug!(
+                        target: "bsc::block_import",
+                        number,
+                        hash = %hash,
+                        "Periodic head hash announcement (NewBlockHashes to all peers)"
+                    );
+                    // Emit as ValidBlock event — the network layer's
+                    // announce_new_block_hash sends NewBlockHashes to ALL active peers
+                    // that haven't seen this hash yet.
+                    let block = crate::node::primitives::BscBlock {
+                        header,
+                        body: crate::node::primitives::BscBlockBody {
+                            inner: reth_ethereum_primitives::BlockBody::default(),
+                            sidecars: None,
+                        },
+                    };
+                    let new_block = crate::node::network::BscNewBlock(
+                        reth_eth_wire::NewBlock {
+                            block,
+                            td: alloy_primitives::U128::ZERO,
+                        },
+                    );
+                    let msg = NewBlockMessage {
+                        hash,
+                        block: std::sync::Arc::new(new_block),
+                        td: None,
+                    };
+                    let _ = this.to_network.send(
+                        BlockImportEvent::Announcement(BlockValidation::ValidBlock {
+                            block: msg,
+                        }),
+                    );
                 }
             }
         }
