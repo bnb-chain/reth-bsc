@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::RwLock;
 
-use alloy_primitives::{U128, U256};
+use alloy_primitives::U128;
 use once_cell::sync::Lazy;
 use reth_eth_wire::NewBlock;
 use reth_network::message::NewBlockMessage;
@@ -198,12 +198,15 @@ pub async fn batch_request_range_and_await_import(
         "Batch request range and await importing blocks"
     );
 
-    // Forward blocks to import path (iterate oldest -> newest)
+    // Forward blocks to import path (iterate oldest -> newest).
+    // TD is unknown for range-fetched blocks (the BSC GetBlocksByRange response
+    // doesn't include TD). We set td to None rather than Some(ZERO) so that
+    // downstream code treats it as "unknown" instead of "zero".
     if let Some(sender) = crate::shared::get_block_import_sender() {
         for block in resp.blocks.iter().rev() {
-            let nb = BscNewBlock(NewBlock { block: block.clone(), td: U128::from(0u64) });
+            let nb = BscNewBlock(NewBlock { block: block.clone(), td: U128::ZERO });
             let hash = block.header.hash_slow();
-            let msg = NewBlockMessage { hash, block: Arc::new(nb), td: Some(U256::ZERO) };
+            let msg = NewBlockMessage { hash, block: Arc::new(nb), td: None };
             if let Err(e) = sender.send((msg, peer)) {
                 tracing::error!(target: "bsc::registry", error=%e, "Failed to send block to import path");
             }
