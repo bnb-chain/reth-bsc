@@ -708,6 +708,79 @@ where
                     );
                 }
             }
+
+            // Active peer chain discovery: check if any connected peer has a head
+            // block we don't know about, and trigger GetBlocksByRange to pull it.
+            // This handles the case where a peer (e.g. geth-bsc) has a better chain
+            // but isn't actively broadcasting — similar to geth's synchronise()
+            // triggered on peer connection when peer TD > local TD.
+            let provider = this.forkchoice_engine.provider.clone();
+            let engine = this.engine.clone();
+            tokio::spawn(async move {
+                use reth_network_api::Peers;
+                let Some(net) = crate::shared::get_network_handle() else { return };
+                let Ok(peers) = net.get_all_peers().await else { return };
+                for peer_info in peers {
+                    let peer_hash = peer_info.best_hash;
+                    // Skip zero hash (peer hasn't announced a head yet)
+                    if peer_hash.is_zero() {
+                        continue;
+                    }
+                    // Check if we already have this block locally
+                    if provider.block_number(peer_hash).ok().flatten().is_some() {
+                        continue;
+                    }
+                    // We don't have this peer's head block — fetch it.
+                    let peer_number = peer_info.best_number.unwrap_or(0);
+                    if peer_number == 0 {
+                        continue;
+                    }
+                    let local_tip = provider.best_block_number().unwrap_or(0);
+                    let count = peer_number.saturating_sub(local_tip).clamp(1, 64);
+                    tracing::info!(
+                        target: "bsc::block_import",
+                        peer = %peer_info.remote_id,
+                        peer_hash = %peer_hash,
+                        peer_number,
+                        local_tip,
+                        count,
+                        "Peer has unknown head block — fetching via GetBlocksByRange"
+                    );
+                    // Fetch via BSC sub-protocol GetBlocksByRange
+                    let target = if crate::node::network::bsc_protocol::registry::has_registered_peer(peer_info.remote_id) {
+                        Some(peer_info.remote_id)
+                    } else {
+                        crate::node::network::bsc_protocol::registry::list_registered_peers()
+                            .into_iter()
+                            .next()
+                    };
+                    if let Some(bsc_peer) = target {
+                        let _ = crate::node::network::bsc_protocol::registry::batch_request_range_and_await_import(
+                            bsc_peer,
+                            peer_number,
+                            peer_hash,
+                            count,
+                            std::time::Duration::from_secs(5),
+                        ).await;
+                    }
+                    // Also send FCU with the peer's head hash so the engine tree's
+                    // download manager kicks in for recursive ancestor fetching.
+                    let fcu_state = ForkchoiceState {
+                        head_block_hash: peer_hash,
+                        safe_block_hash: B256::ZERO,
+                        finalized_block_hash: B256::ZERO,
+                    };
+                    let _ = engine
+                        .fork_choice_updated(
+                            fcu_state,
+                            None,
+                            EngineApiMessageVersion::default(),
+                        )
+                        .await;
+                    // Only process one unknown peer head per tick to avoid flooding
+                    break;
+                }
+            });
         }
 
         Poll::Pending
