@@ -204,15 +204,13 @@ pub async fn batch_request_range_and_await_import(
     // is on a fork we don't have), fall back to None.
     if let Some(sender) = crate::shared::get_block_import_sender() {
         let mut running_td: Option<alloy_primitives::U256> = None;
-        let mut td_initialized = false;
         for block in resp.blocks.iter().rev() {
-            if !td_initialized {
-                // Try to seed TD from the parent block's TD in our local DB
-                let parent_number = block.header.number.saturating_sub(1);
-                if let Some(parent_td) = crate::shared::get_header_td_by_number(parent_number) {
+            if running_td.is_none() {
+                // Seed TD from the parent block's TD in our local DB (by hash,
+                // which works for both canonical and fork blocks).
+                if let Some(parent_td) = crate::shared::get_header_td_by_hash(&block.header.parent_hash) {
                     running_td = Some(parent_td + alloy_primitives::U256::from(block.header.difficulty));
                 }
-                td_initialized = true;
             } else if let Some(prev_td) = running_td {
                 running_td = Some(prev_td + alloy_primitives::U256::from(block.header.difficulty));
             }

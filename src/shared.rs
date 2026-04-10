@@ -72,6 +72,12 @@ type HeaderTdByNumberFn = Arc<dyn Fn(u64) -> Option<alloy_primitives::U256> + Se
 /// Global header TD by number provider
 static HEADER_TD_BY_NUMBER_PROVIDER: OnceLock<HeaderTdByNumberFn> = OnceLock::new();
 
+/// Function type for header TD by hash
+type HeaderTdByHashFn = Arc<dyn Fn(&B256) -> Option<alloy_primitives::U256> + Send + Sync>;
+
+/// Global header TD by hash provider
+static HEADER_TD_BY_HASH_PROVIDER: OnceLock<HeaderTdByHashFn> = OnceLock::new();
+
 /// Global sender for submitting mined blocks to the import service
 static BLOCK_IMPORT_MINED_SENDER: OnceLock<UnboundedSender<IncomingMinedBlock>> = OnceLock::new();
 
@@ -326,6 +332,15 @@ where
         .set(header_td_by_number_fn)
         .map_err(|_| "Failed to set header td by number provider")?;
 
+    // Create function for header TD by hash
+    let provider_clone6 = provider.clone();
+    let header_td_by_hash_fn = Arc::new(move |block_hash: &B256| -> Option<alloy_primitives::U256> {
+        provider_clone6.header_td(block_hash).ok().flatten()
+    });
+    HEADER_TD_BY_HASH_PROVIDER
+        .set(header_td_by_hash_fn)
+        .map_err(|_| "Failed to set header td by hash provider")?;
+
     Ok(())
 }
 
@@ -366,6 +381,11 @@ pub fn get_best_canonical_td() -> Option<u128> {
 /// Get header total difficulty by block number from the global provider
 pub fn get_header_td_by_number(block_number: u64) -> Option<alloy_primitives::U256> {
     HEADER_TD_BY_NUMBER_PROVIDER.get().and_then(|f| f(block_number))
+}
+
+/// Get header total difficulty by block hash from the global provider
+pub fn get_header_td_by_hash(block_hash: &B256) -> Option<alloy_primitives::U256> {
+    HEADER_TD_BY_HASH_PROVIDER.get().and_then(|f| f(block_hash))
 }
 
 /// Store the block import sender globally. Returns an error if it was set before.
