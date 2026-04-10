@@ -135,7 +135,11 @@ where
             queued_blocks: LruCache::new(LRU_PROCESSED_BLOCKS_SIZE),
             downloading_blocks: LruMap::new(ByLength::new(LRU_PROCESSED_BLOCKS_SIZE)),
             announce_interval: {
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+                // Announce head hash every 1s so newly connected peers discover our
+                // chain tip quickly.  Only NewBlockHashes (hash+number) is sent, so
+                // the overhead is negligible. The import service deduplicates via
+                // processed_blocks, preventing redundant downloads.
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 interval
             },
