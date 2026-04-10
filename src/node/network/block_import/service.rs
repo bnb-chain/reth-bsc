@@ -742,13 +742,18 @@ where
                         continue;
                     }
                     let local_tip = provider.best_block_number().unwrap_or(0);
+                    let local_td = provider.header_td_by_number(local_tip)
+                        .ok().flatten().unwrap_or_default();
+                    let peer_td = peer_info.best_td;
                     let count = peer_number.saturating_sub(local_tip).clamp(1, 64);
                     tracing::info!(
                         target: "bsc::block_import",
                         peer = %peer_info.remote_id,
                         peer_hash = %peer_hash,
                         peer_number,
+                        peer_td = ?peer_td,
                         local_tip,
+                        local_td = %local_td,
                         count,
                         "Peer has unknown head block — fetching via GetBlocksByRange + FCU"
                     );
