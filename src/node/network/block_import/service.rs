@@ -254,9 +254,10 @@ where
                             let target_peer = if crate::node::network::bsc_protocol::registry::has_registered_peer(fetch_peer) {
                                 Some(fetch_peer)
                             } else {
-                                crate::node::network::bsc_protocol::registry::list_registered_peers()
-                                    .into_iter()
-                                    .next()
+                                // Don't fall back to a random BSC peer — it likely
+                                // has a different chain fork and would return wrong
+                                // blocks.
+                                None
                             };
                             if let Some(bsc_peer) = target_peer {
                                 tracing::debug!(
@@ -769,12 +770,14 @@ where
                                  GetBlocksByRange + FCU"
                             );
                             // Path 1: BSC sub-protocol GetBlocksByRange
+                            // Only fetch from the peer that actually reported the
+                            // unknown hash.  Falling back to a random BSC peer would
+                            // fetch blocks from a different fork, wasting bandwidth
+                            // and poisoning queued_blocks.
                             let target = if crate::node::network::bsc_protocol::registry::has_registered_peer(peer_info.remote_id) {
                                 Some(peer_info.remote_id)
                             } else {
-                                crate::node::network::bsc_protocol::registry::list_registered_peers()
-                                    .into_iter()
-                                    .next()
+                                None
                             };
                             if let Some(bsc_peer) = target {
                                 if let Err(e) = crate::node::network::bsc_protocol::registry::batch_request_range_and_await_import(
