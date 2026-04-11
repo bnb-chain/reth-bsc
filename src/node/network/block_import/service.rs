@@ -549,9 +549,10 @@ where
             ) {
                 Some(announcing_peer)
             } else {
-                crate::node::network::bsc_protocol::registry::list_registered_peers()
-                    .into_iter()
-                    .next()
+                // Don't fall back to a random BSC peer — it likely
+                // has a different chain fork and would return wrong
+                // blocks.
+                None
             };
             // Compute how many blocks to request based on the gap to local tip.
             let local_tip = self.forkchoice_engine.provider
