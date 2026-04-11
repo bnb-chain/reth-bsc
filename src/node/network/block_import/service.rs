@@ -742,7 +742,23 @@ where
                             if peer_hash.is_zero() {
                                 continue;
                             }
-                            if provider.block_number(peer_hash).ok().flatten().is_some() {
+                            // Only skip if this hash is part of our canonical chain.
+                            // A non-canonical sidechain block that happens to be in
+                            // the DB should NOT suppress discovery — the peer's chain
+                            // may be the correct fork we need to switch to.
+                            let is_canonical = provider
+                                .block_number(peer_hash)
+                                .ok()
+                                .flatten()
+                                .and_then(|num| {
+                                    provider
+                                        .block_hash(num)
+                                        .ok()
+                                        .flatten()
+                                        .map(|canonical_hash| canonical_hash == peer_hash)
+                                })
+                                .unwrap_or(false);
+                            if is_canonical {
                                 continue;
                             }
                             let peer_number = peer_info.best_number.unwrap_or(0);
