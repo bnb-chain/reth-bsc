@@ -2034,8 +2034,13 @@ where
                 delay_ms,
                 "Block scheduled for delayed submission"
             );
-            tokio::spawn(async move {
-                tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+            // Use a dedicated OS thread instead of tokio::spawn + tokio::time::sleep.
+            // tokio::time::sleep depends on tokio worker threads to poll the future;
+            // if all workers are blocked on disk I/O (EBS stall), the sleep cannot
+            // fire on time. std::thread::sleep is managed by the OS kernel scheduler
+            // and wakes up reliably regardless of I/O pressure on other threads.
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
                 if let Err(e) = result_tx.send(submit_ctx) {
                     warn!(
                         target: "bsc::miner::payload",
