@@ -16,60 +16,60 @@ name = "reth-bsc"
 path = "src/main.rs"
 
 [dependencies]
-reth = { git = "https://github.com/bnb-chain/reth.git", branch = "perf/parallel-triedb-flush" }
-reth-cli = { git = "https://github.com/bnb-chain/reth.git", branch = "perf/parallel-triedb-flush" }
-reth-cli-commands = { git = "https://github.com/bnb-chain/reth.git", branch = "perf/parallel-triedb-flush" }
-reth-basic-payload-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "perf/parallel-triedb-flush" }
-reth-db = { git = "https://github.com/bnb-chain/reth.git", branch = "perf/parallel-triedb-flush" }
-reth-engine-local = { git = "https://github.com/bnb-chain/reth.git", branch = "perf/parallel-triedb-flush" }
-reth-engine-tree = { git = "https://github.com/bnb-chain/reth.git", branch = "perf/parallel-triedb-flush" }
-reth-node-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "perf/parallel-triedb-flush" }
-reth-chainspec = { git = "https://github.com/bnb-chain/reth.git", branch = "perf/parallel-triedb-flush" }
-reth-cli-util = { git = "https://github.com/bnb-chain/reth.git", branch = "perf/parallel-triedb-flush" }
-reth-discv4 = { git = "https://github.com/bnb-chain/reth.git", branch = "perf/parallel-triedb-flush", features = [
+reth = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
+reth-cli = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
+reth-cli-commands = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
+reth-basic-payload-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
+reth-db = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
+reth-engine-local = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
+reth-engine-tree = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
+reth-node-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
+reth-chainspec = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
+reth-cli-util = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
+reth-discv4 = { git = "https://github.com/bnb-chain/reth.git", branch = "develop", features = [
     "test-utils",
 ] }
-reth-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "perf/parallel-triedb-flush" }
-reth-ethereum-forks = { git = "https://github.com/bnb-chain/reth.git", branch = "perf/parallel-triedb-flush", features = [
+reth-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
+reth-ethereum-forks = { git = "https://github.com/bnb-chain/reth.git", branch = "develop", features = [
     "serde",
 ] }
-reth-ethereum-payload-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "perf/parallel-triedb-flush" }
-reth-payload-builder-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "perf/parallel-triedb-flush" }
-reth-chain-state = { git = "https://github.com/bnb-chain/reth.git", branch = "perf/parallel-triedb-flush" }
-reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "perf/parallel-triedb-flush" }
-reth-eth-wire = { git = "https://github.com/bnb-chain/reth.git", branch = "perf/parallel-triedb-flush" }
-reth-eth-wire-types = { git = "https://github.com/bnb-chain/reth.git", branch = "perf/parallel-triedb-flush" }
-reth-evm = { git = "https://github.com/bnb-chain/reth.git", branch = "perf/parallel-triedb-flush" }
-reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "perf/parallel-triedb-flush" }
-reth-execution-types = { git = "https://github.com/bnb-chain/reth.git", branch = "perf/parallel-triedb-flush" }
-reth-ipc = { git = "https://github.com/bnb-chain/reth.git", branch = "perf/parallel-triedb-flush" }
-reth-metrics = { git = "https://github.com/bnb-chain/reth.git", branch = "perf/parallel-triedb-flush" }
-reth-node-core = { git = "https://github.com/bnb-chain/reth.git", branch = "perf/parallel-triedb-flush" }
-reth-revm = { git = "https://github.com/bnb-chain/reth.git", branch = "perf/parallel-triedb-flush" }
-reth-network = { git = "https://github.com/bnb-chain/reth.git", branch = "perf/parallel-triedb-flush", features = [
+reth-ethereum-payload-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
+reth-payload-builder-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
+reth-chain-state = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
+reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
+reth-eth-wire = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
+reth-eth-wire-types = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
+reth-evm = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
+reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
+reth-execution-types = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
+reth-ipc = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
+reth-metrics = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
+reth-node-core = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
+reth-revm = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
+reth-network = { git = "https://github.com/bnb-chain/reth.git", branch = "develop", features = [
     "test-utils",
 ] }
-reth-network-p2p = { git = "https://github.com/bnb-chain/reth.git", branch = "perf/parallel-triedb-flush" }
-reth-network-api = { git = "https://github.com/bnb-chain/reth.git", branch = "perf/parallel-triedb-flush" }
-reth-node-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "perf/parallel-triedb-flush", features = [
+reth-network-p2p = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
+reth-network-api = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
+reth-node-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "develop", features = [
     "test-utils",
 ] }
-reth-network-peers = { git = "https://github.com/bnb-chain/reth.git", branch = "perf/parallel-triedb-flush" }
-reth-payload-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "perf/parallel-triedb-flush" }
-reth-ethereum-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "perf/parallel-triedb-flush" }
-reth-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "perf/parallel-triedb-flush" }
-reth-primitives-traits = { git = "https://github.com/bnb-chain/reth.git", branch = "perf/parallel-triedb-flush" }
-reth-provider = { git = "https://github.com/bnb-chain/reth.git", branch = "perf/parallel-triedb-flush", features = [
+reth-network-peers = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
+reth-payload-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
+reth-ethereum-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
+reth-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
+reth-primitives-traits = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
+reth-provider = { git = "https://github.com/bnb-chain/reth.git", branch = "develop", features = [
     "test-utils",
 ] }
-reth-rpc-eth-api = { git = "https://github.com/bnb-chain/reth.git", branch = "perf/parallel-triedb-flush" }
-reth-rpc-convert = { git = "https://github.com/bnb-chain/reth.git", branch = "perf/parallel-triedb-flush" }
-reth-rpc-engine-api = { git = "https://github.com/bnb-chain/reth.git", branch = "perf/parallel-triedb-flush" }
-reth-rpc-server-types = { git = "https://github.com/bnb-chain/reth.git", branch = "perf/parallel-triedb-flush" }
-reth-trie-common = { git = "https://github.com/bnb-chain/reth.git", branch = "perf/parallel-triedb-flush" }
-reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", branch = "perf/parallel-triedb-flush" }
-reth-tasks = { git = "https://github.com/bnb-chain/reth.git", branch = "perf/parallel-triedb-flush" }
-reth-transaction-pool = { git = "https://github.com/bnb-chain/reth.git", branch = "perf/parallel-triedb-flush" }
+reth-rpc-eth-api = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
+reth-rpc-convert = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
+reth-rpc-engine-api = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
+reth-rpc-server-types = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
+reth-trie-common = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
+reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
+reth-tasks = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
+reth-transaction-pool = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
 
 # triedb dependencies
 rust-eth-triedb = { git = "https://github.com/bnb-chain/reth-bsc-triedb.git", branch = "develop" }
