@@ -138,14 +138,21 @@ where
 
         let state_root_start = std::time::Instant::now();
         let hashed_state = state.hashed_post_state(&db.bundle_state);
+        let hashed_post_state_us = state_root_start.elapsed().as_micros();
 
         // Use triedb to calculate state root
         let (state_root, trie_updates, produced_difflayer) = if rust_eth_triedb::triedb_manager::is_triedb_active() {
             let mut triedb = get_global_triedb();
+            let get_triedb_us = state_root_start.elapsed().as_micros();
+
             // Miner-side: try to use triedb prefetcher + parent difflayers from execution ctx.
             let prefetch_state = self.ctx.triedb_prefetcher.take().and_then(|p| p.finish());
+            let prefetch_finish_us = state_root_start.elapsed().as_micros();
+
             let parent_state_root = (**self.parent).state_root();
             let trie_hashed_state = hashed_state.to_triedb_hashed_post_state();
+            let to_triedb_state_us = state_root_start.elapsed().as_micros();
+
             let difflayers_opt = self.ctx.parent_difflayers.as_ref();
 
             let triedb_calc_started = std::time::Instant::now();
@@ -158,6 +165,16 @@ where
                 )
                 .map_err(BlockExecutionError::other)?;
             let triedb_calc_with_prefetch_ms = triedb_calc_started.elapsed().as_millis();
+            let total_us = state_root_start.elapsed().as_micros();
+
+            // Sum of measured steps vs wall clock — a large gap means the thread was
+            // descheduled by the OS (I/O stall, writeback storm, etc.)
+            let measured_sum_us = hashed_post_state_us
+                + (get_triedb_us - hashed_post_state_us)
+                + (prefetch_finish_us - get_triedb_us)
+                + (to_triedb_state_us - prefetch_finish_us)
+                + triedb_calc_started.elapsed().as_micros();
+            let os_stall_us = total_us.saturating_sub(measured_sum_us);
 
             tracing::debug!(
                 target: "bsc::builder",
@@ -174,10 +191,32 @@ where
                     .values()
                     .map(|s| s.storage.len())
                     .sum::<usize>(),
+                hashed_post_state_us,
+                get_triedb_us = get_triedb_us - hashed_post_state_us,
+                prefetch_finish_us = prefetch_finish_us - get_triedb_us,
+                to_triedb_state_us = to_triedb_state_us - prefetch_finish_us,
                 triedb_calc_ms = triedb_calc_with_prefetch_ms,
                 triedb_calc_us = triedb_calc_started.elapsed().as_micros(),
+                total_state_root_us = total_us,
+                os_stall_us,
                 "Calculated state root using triedb"
             );
+
+            if total_us > 50_000 {
+                tracing::warn!(
+                    target: "bsc::builder",
+                    block_number = %(self.parent.number + 1),
+                    total_state_root_ms = total_us / 1000,
+                    hashed_post_state_us,
+                    get_triedb_us = get_triedb_us - hashed_post_state_us,
+                    prefetch_finish_us = prefetch_finish_us - get_triedb_us,
+                    to_triedb_state_us = to_triedb_state_us - prefetch_finish_us,
+                    triedb_calc_us = triedb_calc_started.elapsed().as_micros(),
+                    os_stall_us,
+                    "Slow state root calculation detected"
+                );
+            }
+
             (new_root, TrieUpdates::default(), Some(new_difflayer))
         } else {
             let (root, updates) =
