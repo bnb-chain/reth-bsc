@@ -227,95 +227,25 @@ where
                         None
                     }
                     PayloadStatusEnum::Syncing => {
-                        // Parent block is missing. Actively fetch ancestor blocks
-                        // from the announcing peer via BSC GetBlocksByRange to bridge
-                        // the gap, rather than waiting passively.
-                        let block_number = header.number;
-                        let parent_hash = header.parent_hash;
-                        tracing::info!(
+                        // Parent block is missing. Do NOT fetch ancestors here.
+                        //
+                        // Ancestor fetching is handled by Part B (periodic peer head
+                        // discovery, 1s interval, rate-limited by discovery_in_flight).
+                        // Fetching from every Syncing response created an exponential
+                        // cascade: 64 Syncing blocks → 64 concurrent fetches → each
+                        // returns 64 more Syncing blocks → snowball that overwhelms
+                        // the peer and prevents reth's pipeline sync from triggering.
+                        //
+                        // For large gaps, reth's pipeline sync handles it via stages.
+                        // For small gaps, Part B catches up within 1 second.
+                        tracing::debug!(
                             target: "bsc::block_import",
                             block_hash = %block_hash,
-                            block_number = block_number,
-                            parent_hash = %parent_hash,
+                            block_number = header.number,
+                            parent_hash = %header.parent_hash,
                             peer = %peer_id,
-                            "New payload returned Syncing - fetching ancestor blocks from peer"
+                            "New payload returned Syncing — deferring to Part B / pipeline"
                         );
-
-                        // Determine how many blocks to request.
-                        let local_tip = forkchoice_engine.provider
-                            .best_block_number()
-                            .unwrap_or(0);
-                        let gap = block_number.saturating_sub(local_tip);
-                        let count = gap.clamp(1, 64);
-
-                        // Spawn async range fetch from the originating peer
-                        let fetch_peer = peer_id;
-                        tokio::spawn(async move {
-                            let target_peer = if crate::node::network::bsc_protocol::registry::has_registered_peer(fetch_peer) {
-                                Some(fetch_peer)
-                            } else {
-                                // Don't fall back to a random BSC peer — it likely
-                                // has a different chain fork and would return wrong
-                                // blocks.
-                                None
-                            };
-                            if let Some(bsc_peer) = target_peer {
-                                tracing::debug!(
-                                    target: "bsc::block_import",
-                                    peer = %bsc_peer,
-                                    block_hash = %block_hash,
-                                    block_number = block_number,
-                                    count = count,
-                                    "Requesting ancestor block range for syncing block"
-                                );
-                                let _ = crate::node::network::bsc_protocol::registry::batch_request_range_and_await_import(
-                                    bsc_peer,
-                                    block_number,
-                                    block_hash,
-                                    count,
-                                    std::time::Duration::from_secs(5),
-                                ).await;
-                            } else {
-                                tracing::debug!(
-                                    target: "bsc::block_import",
-                                    "No BSC protocol peer available for ancestor fetch"
-                                );
-                            }
-                        });
-
-                        // Also send FCU to inform the engine-tree about the new head
-                        let forkchoice_state = alloy_rpc_types::engine::ForkchoiceState {
-                            head_block_hash: block_hash,
-                            safe_block_hash: alloy_primitives::B256::ZERO,
-                            finalized_block_hash: alloy_primitives::B256::ZERO,
-                        };
-                        match engine
-                            .fork_choice_updated(
-                                forkchoice_state,
-                                None,
-                                reth_payload_primitives::EngineApiMessageVersion::V1,
-                            )
-                            .await
-                        {
-                            Ok(result) => {
-                                tracing::debug!(
-                                    target: "bsc::block_import",
-                                    block_hash = %block_hash,
-                                    block_number = block_number,
-                                    status = ?result.payload_status.status,
-                                    "FCU result for syncing block"
-                                );
-                            }
-                            Err(err) => {
-                                tracing::trace!(
-                                    target: "bsc::block_import",
-                                    block_hash = %block_hash,
-                                    block_number = block_number,
-                                    error = %err,
-                                    "Failed to update fork choice for syncing block"
-                                );
-                            }
-                        }
                         queued_blocks.write().remove(&block.hash);
                         None
                     }
@@ -725,8 +655,18 @@ where
             // At most 1 fetch per tick (break after first unknown peer).
             // Once the block is downloaded, provider.block_number() returns Some
             // and the peer is skipped on subsequent ticks — natural dedup.
-            // Guard: skip if a previous discovery task is still running.
-            if !this.discovery_in_flight.load(std::sync::atomic::Ordering::Relaxed) {
+            //
+            // Guard 1: skip when reth is pipeline-syncing. The pipeline handles
+            // large gaps via stage sync; our batch fetch + scattered new_payload
+            // calls would interfere and prevent the pipeline from triggering.
+            // Guard 2: skip if a previous discovery task is still running.
+            let is_node_syncing = crate::shared::get_network_handle()
+                .map(|net| {
+                    use reth_network_p2p::sync::SyncStateProvider;
+                    net.is_syncing()
+                })
+                .unwrap_or(false);
+            if !is_node_syncing && !this.discovery_in_flight.load(std::sync::atomic::Ordering::Relaxed) {
                 let provider = this.forkchoice_engine.provider.clone();
                 let engine = this.engine.clone();
                 let in_flight = this.discovery_in_flight.clone();
