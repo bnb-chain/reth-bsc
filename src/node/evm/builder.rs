@@ -156,6 +156,22 @@ where
             let prefetch_state = self.ctx.triedb_prefetcher.take().and_then(|p| p.finish());
             let prefetcher_finish_ms = step.elapsed().as_millis();
 
+            // Log prefetch coverage: how many of the needed storage accounts were prefetched?
+            let needed_storage_accounts = hashed_state.storages.len();
+            let prefetched_storage_tries = prefetch_state.as_ref().map(|p| p.storage_tries.len()).unwrap_or(0);
+            let prefetched_storage_roots = prefetch_state.as_ref().map(|p| p.storage_roots.len()).unwrap_or(0);
+            if needed_storage_accounts > 0 {
+                tracing::debug!(
+                    target: "bsc::builder::timing",
+                    block_number = %(self.parent.number + 1),
+                    needed_storage_accounts,
+                    prefetched_storage_tries,
+                    prefetched_storage_roots,
+                    coverage_pct = prefetched_storage_tries * 100 / needed_storage_accounts.max(1),
+                    "prefetch storage coverage"
+                );
+            }
+
             let parent_state_root = (**self.parent).state_root();
 
             let step = std::time::Instant::now();
