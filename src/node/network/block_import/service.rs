@@ -652,46 +652,6 @@ where
             }
         }
 
-        // Periodic head announcement (every 5s) so that peers learn about our chain.
-        // After restart when no new blocks are produced, this ensures peers discover
-        // our tip and can push their (potentially longer) chain back to us.
-        // Using tokio Interval so the waker is properly registered.
-        if this.announce_interval.poll_tick(cx).is_ready() {
-            if let Some(net) = crate::shared::get_network_handle() {
-                if let Ok(info) = this.forkchoice_engine.provider.chain_info() {
-                    if let Ok(Some(header)) = this.forkchoice_engine.provider.header_by_number(info.best_number) {
-                        let hash = header.hash_slow();
-                        let td = this.forkchoice_engine.provider
-                            .header_td_by_number(info.best_number)
-                            .ok()
-                            .flatten()
-                            .unwrap_or_default();
-                        let block = crate::node::primitives::BscBlock {
-                            header: header.clone(),
-                            body: crate::node::primitives::BscBlockBody {
-                                inner: reth_ethereum_primitives::BlockBody::default(),
-                                sidecars: None,
-                            },
-                        };
-                        let new_block = crate::node::network::BscNewBlock(
-                            reth_eth_wire::NewBlock {
-                                block,
-                                td: alloy_primitives::U128::from(td.to::<u128>()),
-                            },
-                        );
-                        tracing::debug!(
-                            target: "bsc::block_import",
-                            number = info.best_number,
-                            hash = %hash,
-                            td = %td,
-                            "Periodic head announcement"
-                        );
-                        net.announce_block(new_block, hash, Some(td));
-                    }
-                }
-            }
-        }
-
         Poll::Pending
     }
 }
