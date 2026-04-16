@@ -488,8 +488,10 @@ where
             let local_tip = self.forkchoice_engine.provider
                 .best_block_number()
                 .unwrap_or(0);
-            let gap = start_height.saturating_sub(local_tip);
-            let count = gap.clamp(1, 64);
+            // Only fetch the single announced block. Large gaps are handled
+            // by reth's pipeline sync; requesting wide ranges here would send
+            // blocks whose parents are missing, all returning Syncing.
+            let count = 1u64;
             if let Some(bsc_peer) = target_peer {
                 tracing::debug!(
                     target: "bsc::block_import",
@@ -718,8 +720,10 @@ where
                                 .flatten()
                                 .unwrap_or_default();
                             let peer_td = peer_info.best_td;
-                            let count =
-                                peer_number.saturating_sub(local_tip).clamp(1, 16);
+                            // Only fetch the single head block. Large gaps are
+                            // handled by reth's pipeline sync; wide range
+                            // requests would flood the peer with Syncing blocks.
+                            let count = 1u64;
                             tracing::info!(
                                 target: "bsc::block_import",
                                 peer = %peer_info.remote_id,
