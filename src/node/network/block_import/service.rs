@@ -671,7 +671,7 @@ where
         // injecting empty-body blocks into peers' block buffers, which could poison
         // their invalid_headers cache.  NewBlockHashes triggers peers to download the
         // full block via GetBlocksByRange, ensuring they always receive complete data.
-        if this.announce_interval.poll_tick(cx).is_ready() {
+        while this.announce_interval.poll_tick(cx).is_ready() {
             // --- Part A: Announce our head hash to all peers ---
             // Sends NewBlockHashes (hash+number) every tick. Peers that already
             // know this hash ignore it (geth: fetcher dedup, reth-bsc: processed_blocks).
