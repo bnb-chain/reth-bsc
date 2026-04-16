@@ -623,6 +623,12 @@ where
                         td = %td,
                         "Periodic head hash announcement (NewBlockHashes to all peers)"
                     );
+                    // Use ValidHeader (sends only NewBlockHashes: hash+number)
+                    // instead of ValidBlock (which sends full NewBlock with body).
+                    // Part A constructs blocks with empty bodies, so sending
+                    // ValidBlock would inject invalid blocks (empty body but
+                    // non-empty transactions_root in header) into peers' buffers,
+                    // causing them to mark us as bad and disconnect.
                     let block = crate::node::primitives::BscBlock {
                         header,
                         body: crate::node::primitives::BscBlockBody {
@@ -642,7 +648,7 @@ where
                         td: Some(td),
                     };
                     let _ = this.to_network.send(
-                        BlockImportEvent::Announcement(BlockValidation::ValidBlock {
+                        BlockImportEvent::Announcement(BlockValidation::ValidHeader {
                             block: msg,
                         }),
                     );
