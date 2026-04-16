@@ -132,6 +132,8 @@ def main():
         # Cache stats
         hits = extract(triedb_top, 'cache_hits')
         misses = extract(triedb_top, 'cache_misses')
+        acct_m = extract(triedb_top, 'acct_misses')
+        stor_m = extract(triedb_top, 'stor_misses')
         if hits and misses:
             print()
             print("  {:24s}: {}".format("cache_hits", stats_str(hits)))
@@ -141,6 +143,13 @@ def main():
             rate = total_h / max(total_h + total_m, 1) * 100
             print("  overall hit rate        : {:.1f}%  ({} hits / {} total)".format(
                 rate, total_h, total_h + total_m))
+        if acct_m and stor_m:
+            total_acct = sum(acct_m)
+            total_stor = sum(stor_m)
+            total_miss = total_acct + total_stor
+            print("  miss breakdown          : account={} ({:.0f}%)  storage={} ({:.0f}%)".format(
+                total_acct, total_acct / max(total_miss, 1) * 100,
+                total_stor, total_stor / max(total_miss, 1) * 100))
 
     # === intermediate_inner ===
     print("\n" + "=" * W)
