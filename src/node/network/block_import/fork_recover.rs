@@ -33,6 +33,15 @@ pub const FORK_RECOVER_HOP_COUNT: u64 = 4;
 /// Per-hop network timeout.
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Max peer attempts per hop before `BscRangeFetcher` gives up. Attempts are
+/// sequential, so worst-case per-hop stall is
+/// `MAX_PEER_ATTEMPTS * FETCH_TIMEOUT` (~15s at current values); a full
+/// recovery is bounded by
+/// `FORK_RECOVER_HOP_COUNT * MAX_PEER_ATTEMPTS * FETCH_TIMEOUT` in adversarial
+/// conditions. The announcing peer is tried first; failover rotates through
+/// other registered BSC peers.
+pub const MAX_PEER_ATTEMPTS: usize = 3;
+
 /// Error kinds produced by `recover_ancestors` / `discover_fork_blocks`.
 #[derive(Debug, thiserror::Error)]
 pub enum ForkRecoverError {
@@ -62,7 +71,8 @@ pub enum ForkRecoverError {
 }
 
 /// Abstraction over `GetBlocksByRange`. Tests substitute a fake; production
-/// forwards to `bsc_protocol::registry::request_blocks_by_range`.
+/// forwards to `bsc_protocol::registry::request_blocks_by_range_with_failover`,
+/// which rotates through registered BSC peers on empty/error responses.
 pub trait RangeFetcher: Send + Sync {
     /// Fetch up to `count` blocks starting at `(start_num, start_hash)` and
     /// walking backwards via `parent_hash`. Response is ordered
@@ -89,12 +99,13 @@ impl RangeFetcher for BscRangeFetcher {
         count: u64,
     ) -> BoxFuture<'a, Result<Vec<BscBlock>, String>> {
         Box::pin(async move {
-            let resp = crate::node::network::bsc_protocol::registry::request_blocks_by_range(
+            let resp = crate::node::network::bsc_protocol::registry::request_blocks_by_range_with_failover(
                 peer,
                 start_num,
                 start_hash,
                 count,
                 FETCH_TIMEOUT,
+                MAX_PEER_ATTEMPTS,
             )
             .await?;
             Ok(resp.blocks)

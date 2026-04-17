@@ -357,6 +357,116 @@ pub fn spawn_evn_refresh_listener() {
     }
 }
 
+/// Compute a failover peer ordering: `preferred` first, then up to
+/// `max_attempts - 1` other peers from `registered`, preserving order and
+/// deduplicating. Returns at most `max_attempts` entries.
+pub(crate) fn plan_failover_peers(
+    preferred: PeerId,
+    registered: Vec<PeerId>,
+    max_attempts: usize,
+) -> Vec<PeerId> {
+    if max_attempts == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(max_attempts);
+    out.push(preferred);
+    for p in registered {
+        if out.len() >= max_attempts {
+            break;
+        }
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// Like [`request_blocks_by_range`], but rotates through other registered BSC
+/// peers on `Err` or empty response. Returns the first non-empty success,
+/// otherwise the last seen result (preserving the original error for
+/// diagnostics).
+pub async fn request_blocks_by_range_with_failover(
+    preferred: PeerId,
+    start_height: u64,
+    start_hash: B256,
+    count: u64,
+    timeout_dur: Duration,
+    max_attempts: usize,
+) -> Result<BlocksByRangePacket, String> {
+    let peers = plan_failover_peers(preferred, list_registered_peers(), max_attempts);
+    if peers.is_empty() {
+        return Err("no BSC peers available for range request".to_string());
+    }
+
+    let mut last: Result<BlocksByRangePacket, String> =
+        Err("uninitialised failover".to_string());
+    for (idx, peer) in peers.iter().enumerate() {
+        match request_blocks_by_range(*peer, start_height, start_hash, count, timeout_dur).await {
+            Ok(resp) if !resp.blocks.is_empty() => return Ok(resp),
+            Ok(empty_resp) => {
+                tracing::debug!(
+                    target: "bsc_protocol",
+                    %peer,
+                    attempt = idx + 1,
+                    total = peers.len(),
+                    start_height,
+                    %start_hash,
+                    "Empty BlocksByRange response, trying next peer"
+                );
+                last = Ok(empty_resp);
+            }
+            Err(err) => {
+                tracing::debug!(
+                    target: "bsc_protocol",
+                    %peer,
+                    attempt = idx + 1,
+                    total = peers.len(),
+                    start_height,
+                    %start_hash,
+                    %err,
+                    "BlocksByRange request failed, trying next peer"
+                );
+                last = Err(err);
+            }
+        }
+    }
+    last
+}
+
+#[cfg(test)]
+mod failover_tests {
+    use super::*;
+    use alloy_primitives::B512;
+
+    fn pid(byte: u8) -> PeerId {
+        B512::repeat_byte(byte)
+    }
+
+    #[test]
+    fn plan_puts_preferred_first_and_dedups() {
+        let plan = plan_failover_peers(pid(1), vec![pid(2), pid(1), pid(3)], 3);
+        assert_eq!(plan, vec![pid(1), pid(2), pid(3)]);
+    }
+
+    #[test]
+    fn plan_respects_max_attempts() {
+        let plan = plan_failover_peers(pid(1), vec![pid(2), pid(3), pid(4)], 2);
+        assert_eq!(plan, vec![pid(1), pid(2)]);
+    }
+
+    #[test]
+    fn plan_handles_zero_attempts() {
+        let plan = plan_failover_peers(pid(1), vec![pid(2)], 0);
+        assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn plan_handles_empty_registered() {
+        let plan = plan_failover_peers(pid(1), vec![], 5);
+        assert_eq!(plan, vec![pid(1)]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
