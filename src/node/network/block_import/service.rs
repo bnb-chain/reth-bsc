@@ -96,6 +96,11 @@ where
     /// Heads currently being fork-recovered. Prevents duplicate spawned tasks
     /// when the same head is announced repeatedly.
     recovering_heads: crate::node::network::block_import::fork_recover::RecoveringHeads,
+    /// Heads whose most recent recovery attempt failed. Suppresses
+    /// re-spawning recovery until the cooldown elapses. Prevents storm
+    /// behaviour when the 3s head-announce tick re-announces the same
+    /// unreachable head.
+    failed_heads: crate::node::network::block_import::fork_recover::FailedHeadsCooler,
     /// Periodic timer for head announcement.
     announce_interval: tokio::time::Interval,
 }
@@ -143,6 +148,9 @@ where
             recovering_heads: crate::node::network::block_import::fork_recover::new_recovering_heads(
                 LRU_PROCESSED_BLOCKS_SIZE,
             ),
+            failed_heads: crate::node::network::block_import::fork_recover::new_failed_heads_cooler(
+                LRU_PROCESSED_BLOCKS_SIZE,
+            ),
             announce_interval: {
                 // 3s ≈ 6-7 BSC slots (450ms each). Fast enough to break fork
                 // livelocks, slow enough to be negligible overhead.
@@ -158,6 +166,7 @@ where
         let engine = self.engine.clone();
         let forkchoice_engine = self.forkchoice_engine.clone();
         let recovering_heads = self.recovering_heads.clone();
+        let failed_heads = self.failed_heads.clone();
 
         let announced_hash = block.hash;
         let block_hash = block.block.0.block.header.hash_slow();
@@ -240,6 +249,16 @@ where
                             "New payload returned Syncing - spawning fork recovery"
                         );
 
+                        if failed_heads.is_cooling(&block_hash) {
+                            tracing::debug!(
+                                target: "bsc::block_import",
+                                %block_hash,
+                                block_number,
+                                "Skipping fork recovery: head is in cooldown after recent failure"
+                            );
+                            return None;
+                        }
+
                         // Fire-and-forget spawn; `recover_ancestors` runs its
                         // own Phase-1 local checks so it's correct even if the
                         // head is already on chain by the time the task starts.
@@ -255,6 +274,7 @@ where
                         let forkchoice_engine_clone = forkchoice_engine.clone();
                         let recovering = recovering_heads.clone();
                         let peer = resolve_bsc_peer_static(peer_id);
+                        let failed_heads = failed_heads.clone();
                         tokio::spawn(async move {
                             let _guard = crate::node::network::block_import::fork_recover::RecoveringHeadGuard::new(
                                 block_hash, recovering,
@@ -280,6 +300,7 @@ where
                                     error = %err,
                                     "Fork recovery failed (Syncing path)"
                                 );
+                                failed_heads.mark_failed(block_hash);
                             }
                         });
                         None
@@ -473,6 +494,15 @@ where
             if self.queued_blocks.contains(&hash_number.hash) {
                 continue;
             }
+            if self.failed_heads.is_cooling(&hash_number.hash) {
+                tracing::debug!(
+                    target: "bsc::block_import",
+                    block_hash = %hash_number.hash,
+                    block_number = hash_number.number,
+                    "Skipping fork recovery: head is in cooldown after recent failure"
+                );
+                continue;
+            }
             // Concurrent-dedup: one recovery per head at a time.
             {
                 let mut guard = self.recovering_heads.lock();
@@ -495,6 +525,7 @@ where
             let engine = self.engine.clone();
             let forkchoice_engine = self.forkchoice_engine.clone();
             let recovering = self.recovering_heads.clone();
+            let failed_heads = self.failed_heads.clone();
             let head_hash = hash_number.hash;
             let head_num = hash_number.number;
 
@@ -530,6 +561,7 @@ where
                         error = %err,
                         "Fork recovery failed"
                     );
+                    failed_heads.mark_failed(head_hash);
                 }
             });
         }
