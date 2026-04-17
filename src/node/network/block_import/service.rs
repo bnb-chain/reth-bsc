@@ -105,7 +105,7 @@ where
 
 impl<Provider> ImportService<Provider>
 where
-    Provider: BlockNumReader + HeaderProvider<Header = Header> + Clone + Send + Sync + 'static,
+    Provider: BlockNumReader + BlockHashReader + HeaderProvider<Header = Header> + Clone + Send + Sync + 'static,
 {
     /// Create a new block import service
     pub fn new(
@@ -703,6 +703,7 @@ fn plan_head_announcements(
 impl<Provider> Future for ImportService<Provider>
 where
     Provider: BlockNumReader
+        + BlockHashReader
         + HeaderProvider<Header = Header>
         + Clone
         + Send
