@@ -135,7 +135,9 @@ where
             queued_blocks: LruCache::new(LRU_PROCESSED_BLOCKS_SIZE),
             downloading_blocks: LruMap::new(ByLength::new(LRU_PROCESSED_BLOCKS_SIZE)),
             announce_interval: {
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+                // 3s ≈ 6-7 BSC slots (450ms each). Fast enough to break fork
+                // livelocks, slow enough to be negligible overhead.
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 interval
             },
@@ -593,6 +595,85 @@ where
         }
         Ok(())
     }
+
+    /// Read local head and spawn a detached task that announces it to every
+    /// connected peer that is not more than 64 blocks ahead of us.
+    ///
+    /// Runs on every `announce_interval` tick. This is the livelock-breaking
+    /// mechanism for the case where two validators are forked and both are
+    /// blocked from producing new blocks: without this, neither learns of the
+    /// other's head after the initial handshake.
+    fn spawn_head_announcement(&self) {
+        let provider = self.forkchoice_engine.provider.clone();
+
+        tokio::spawn(async move {
+            // Resolve local head.
+            let num = match provider.best_block_number() {
+                Ok(n) if n > 0 => n,
+                Ok(_) => {
+                    tracing::trace!(target: "bsc::block_import", "Skip head announce: local best_block_number is 0");
+                    return;
+                }
+                Err(e) => {
+                    tracing::trace!(target: "bsc::block_import", error = %e, "Skip head announce: failed to read best_block_number");
+                    return;
+                }
+            };
+            let hash = match provider.block_hash(num) {
+                Ok(Some(h)) => h,
+                Ok(None) => {
+                    tracing::trace!(target: "bsc::block_import", num, "Skip head announce: no hash for best_block_number");
+                    return;
+                }
+                Err(e) => {
+                    tracing::trace!(target: "bsc::block_import", num, error = %e, "Skip head announce: block_hash lookup failed");
+                    return;
+                }
+            };
+
+            // Resolve network handle.
+            let net = match crate::shared::get_network_handle() {
+                Some(n) => n,
+                None => {
+                    tracing::trace!(target: "bsc::block_import", "Skip head announce: network handle not yet initialized");
+                    return;
+                }
+            };
+
+            // Query peers.
+            let peers = match net.get_all_peers().await {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::trace!(target: "bsc::block_import", error = %e, "Skip head announce: get_all_peers failed");
+                    return;
+                }
+            };
+            if peers.is_empty() {
+                return;
+            }
+
+            let peer_tuples: Vec<(PeerId, Option<u64>)> =
+                peers.iter().map(|p| (p.remote_id, p.best_number)).collect();
+            let targets = plan_head_announcements(num, &peer_tuples);
+
+            if targets.is_empty() {
+                return;
+            }
+
+            let hashes = NewBlockHashes(vec![BlockHashNumber { hash, number: num }]);
+            let target_count = targets.len();
+            for peer_id in targets {
+                net.send_eth_message(peer_id, PeerMessage::NewBlockHashes(hashes.clone()));
+            }
+            tracing::trace!(
+                target: "bsc::block_import",
+                local_num = num,
+                sent_to = target_count,
+                total_peers = peers.len(),
+                "Announced head to peers"
+            );
+        });
+    }
 }
 
 /// Decide which peers to send `NewBlockHashes(local_head)` to.
@@ -674,6 +755,13 @@ where
                     return Poll::Ready(Err(Box::new(e)));
                 }
             }
+        }
+
+        // Drive periodic head announcement to break forked-validator livelocks.
+        // Each tick spawns a detached task so we never block the poll loop on
+        // the async `get_all_peers()` query.
+        while this.announce_interval.poll_tick(cx).is_ready() {
+            this.spawn_head_announcement();
         }
 
         Poll::Pending
