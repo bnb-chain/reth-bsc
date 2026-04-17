@@ -135,6 +135,12 @@ pub async fn discover_fork_blocks<
         // Pre-hop local checks: if this cursor is already local, we've
         // reached the common ancestor (or short-circuited on an already-known
         // head).
+        //
+        // The side-chain hit (`provider.header(cursor_hash).is_some()`) is
+        // safe to treat as "ancestor reached" because engine-tree only stores
+        // a header when its parent was already Valid via a prior new_payload.
+        // Transitively, any side-block in our provider is rooted at the
+        // canonical chain, so no further walking is required.
         let cursor_is_local = provider.block_hash(cursor_num)? == Some(cursor_hash)
             || provider.header(cursor_hash)?.is_some();
         if cursor_is_local {
@@ -179,6 +185,9 @@ pub async fn discover_fork_blocks<
         }
 
         // Advance cursor to the block just below the oldest in this response.
+        // saturating_sub: if we're already at block 0 with no match, the next
+        // pre-hop check fails and `walked >= MAX_FORK_DEPTH` eventually trips
+        // ForkTooDeep rather than panicking on underflow.
         let oldest = resp.last().unwrap();
         walked += resp.len() as u64;
         cursor_num = oldest.header.number.saturating_sub(1);
@@ -514,6 +523,10 @@ mod tests {
 
         assert!(matches!(out.outcome, DiscoveryOutcome::AncestorFound));
         let nums: Vec<u64> = out.fork_blocks.iter().map(|b| b.header.number).collect();
+        // Non-contiguous fork_blocks: 97Y is omitted because it's already a
+        // known side-block. Task 4's import loop must therefore tolerate gaps
+        // — it imports [96, 98, 99] oldest-first and relies on engine-tree
+        // already holding 97Y as Valid (which is why the side-block exists).
         assert_eq!(nums, vec![99, 98, 96], "97Y skipped because already on side-chain");
         assert_eq!(fetcher.calls().len(), 1);
     }
