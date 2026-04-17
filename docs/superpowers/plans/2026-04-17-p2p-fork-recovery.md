@@ -41,12 +41,12 @@ No other files change. No wire-protocol changes. No new dependencies (`once_cell
 
 Goal: land an empty-but-compilable module so subsequent tasks can add one concept at a time.
 
-- [ ] **Step 1.1: Inspect existing `mod.rs`**
+- [x] **Step 1.1: Inspect existing `mod.rs`**
 
 Run: `cat src/node/network/block_import/mod.rs`
 Expected: see `pub mod handle;` and `pub mod service;` (or similar). Note exact visibility so we match.
 
-- [ ] **Step 1.2: Create the new module file with only constants + the error enum**
+- [x] **Step 1.2: Create the new module file with only constants + the error enum**
 
 Create `src/node/network/block_import/fork_recover.rs`:
 
@@ -104,7 +104,7 @@ Check that `thiserror` is already a dependency:
 Run: `grep -q '^thiserror' Cargo.toml && echo yes || echo no`
 Expected: `yes`. If `no`, use `grep thiserror Cargo.toml` to find the actual key; reth-bsc pulls it via the workspace.
 
-- [ ] **Step 1.3: Register the module**
+- [x] **Step 1.3: Register the module**
 
 Edit `src/node/network/block_import/mod.rs`. Add (matching surrounding visibility — inspect Step 1.1):
 
@@ -112,12 +112,12 @@ Edit `src/node/network/block_import/mod.rs`. Add (matching surrounding visibilit
 pub(crate) mod fork_recover;
 ```
 
-- [ ] **Step 1.4: Verify the crate still builds**
+- [x] **Step 1.4: Verify the crate still builds**
 
 Run: `cargo check -p reth-bsc --lib`
 Expected: no errors. Warnings about unused items (`MAX_FORK_DEPTH`, `FORK_RECOVER_HOP_COUNT`, etc.) are fine — later tasks use them.
 
-- [ ] **Step 1.5: Commit**
+- [x] **Step 1.5: Commit** (commit `cfad327`)
 
 ```bash
 git add src/node/network/block_import/fork_recover.rs src/node/network/block_import/mod.rs
@@ -133,7 +133,7 @@ git commit -m "feat(p2p): scaffold fork_recover module with error types and cons
 
 The trait lets unit tests inject a fake fetcher instead of running the real BSC sub-protocol. The prod impl is a thin adapter over `crate::node::network::bsc_protocol::registry::request_blocks_by_range`.
 
-- [ ] **Step 2.1: Add the trait definition and the production impl**
+- [x] **Step 2.1: Add the trait definition and the production impl**
 
 Append to `fork_recover.rs` (keep it above the tests module that task 3 will add):
 
@@ -186,12 +186,12 @@ impl RangeFetcher for BscRangeFetcher {
 }
 ```
 
-- [ ] **Step 2.2: Verify it compiles**
+- [x] **Step 2.2: Verify it compiles**
 
 Run: `cargo check -p reth-bsc --lib`
 Expected: no errors.
 
-- [ ] **Step 2.3: Commit**
+- [x] **Step 2.3: Commit** (commit `18f8ac9`)
 
 ```bash
 git add src/node/network/block_import/fork_recover.rs
@@ -209,7 +209,7 @@ git commit -m "feat(p2p): add RangeFetcher trait and BscRangeFetcher prod impl"
 
 ### Step 3.1: Write the failing tests first
 
-- [ ] **Step 3.1.1: Add the test scaffolding and a fake fetcher**
+- [x] **Step 3.1.1: Add the test scaffolding and a fake fetcher**
 
 Append to `fork_recover.rs`:
 
@@ -372,7 +372,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3.1.2: Add the spec's test cases as failing tests**
+- [x] **Step 3.1.2: Add the spec's test cases as failing tests**
 
 Append inside the same `mod tests` block. Each test asserts on what `discover_fork_blocks` *should* produce; they will fail to compile until Step 3.2 adds the function.
 
@@ -543,14 +543,14 @@ Append inside the same `mod tests` block. Each test asserts on what `discover_fo
     }
 ```
 
-- [ ] **Step 3.1.3: Run tests to confirm they fail to compile**
+- [x] **Step 3.1.3: Run tests to confirm they fail to compile**
 
 Run: `cargo test -p reth-bsc --lib fork_recover:: 2>&1 | head -40`
 Expected: compilation errors about `discover_fork_blocks`, `DiscoveryOutcome`, `DiscoveryResult` being undefined.
 
 ### Step 3.2: Implement `discover_fork_blocks`
 
-- [ ] **Step 3.2.1: Add the output types + function**
+- [x] **Step 3.2.1: Add the output types + function**
 
 Add **above** the `#[cfg(test)] mod tests` block in `fork_recover.rs`:
 
@@ -653,12 +653,12 @@ pub async fn discover_fork_blocks<P: BlockHashReader + HeaderProvider<Header = a
 }
 ```
 
-- [ ] **Step 3.2.2: Run the tests**
+- [x] **Step 3.2.2: Run the tests**
 
 Run: `cargo test -p reth-bsc --lib fork_recover:: 2>&1 | tail -40`
 Expected: all six tests pass. If a compile error surfaces about `HeaderProvider::header` signature (the real trait may name it differently), consult the actual trait (grep `pub trait HeaderProvider` in reth dependencies) and adjust; the codebase's `MockProvider` uses `.header(B256)` (see `service.rs:987`), which is the right method.
 
-- [ ] **Step 3.2.3: Commit**
+- [x] **Step 3.2.3: Commit**
 
 ```bash
 git add src/node/network/block_import/fork_recover.rs
