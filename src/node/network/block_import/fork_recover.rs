@@ -6,12 +6,18 @@
 use std::time::Duration;
 
 use alloy_primitives::B256;
+use alloy_rpc_types::engine::PayloadStatusEnum;
 use futures::future::BoxFuture;
+use reth_engine_primitives::ConsensusEngineHandle;
 use reth_network_api::PeerId;
-use reth_primitives_traits::AlloyBlockHeader;
-use reth_provider::{BlockHashReader, HeaderProvider};
+use reth_payload_primitives::PayloadTypes;
+use reth_primitives_traits::{AlloyBlockHeader, Block as _};
+use reth_provider::{BlockHashReader, BlockNumReader, HeaderProvider};
 
-use crate::BscBlock;
+use crate::{
+    node::{consensus::BscForkChoiceEngine, engine_api::payload::BscPayloadTypes},
+    BscBlock,
+};
 
 /// Hard cap on how many blocks we will walk back from the peer's announced
 /// head before giving up. ~2 BSC validator turn cycles.
@@ -195,14 +201,6 @@ pub async fn discover_fork_blocks<
     }
 }
 
-use alloy_rpc_types::engine::PayloadStatusEnum;
-use reth_engine_primitives::ConsensusEngineHandle;
-use reth_payload_primitives::PayloadTypes;
-use reth_primitives_traits::Block as _;
-use reth_provider::BlockNumReader;
-
-use crate::node::{consensus::BscForkChoiceEngine, engine_api::payload::BscPayloadTypes};
-
 /// Top-level recovery entry point.
 ///
 /// 1. Walks back via `discover_fork_blocks` to find the common ancestor.
@@ -228,7 +226,7 @@ where
         + Sync
         + 'static,
 {
-    tracing::debug!(
+    tracing::info!(
         target: "bsc::fork_recover",
         %peer,
         %head_hash,
@@ -304,7 +302,7 @@ where
             "fork_choice_updated returned error after recovery"
         );
     } else {
-        tracing::debug!(
+        tracing::info!(
             target: "bsc::fork_recover",
             %head_hash,
             head_num,
