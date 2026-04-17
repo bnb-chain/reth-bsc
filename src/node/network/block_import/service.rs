@@ -99,6 +99,9 @@ where
     queued_blocks: LruCache<B256>,
     /// Cache of downloading block hashes to avoid re-downloading the same block.
     downloading_blocks: LruMap<B256, u128, ByLength>,
+    /// Heads currently being fork-recovered. Prevents duplicate spawned tasks
+    /// when the same head is announced repeatedly.
+    recovering_heads: crate::node::network::block_import::fork_recover::RecoveringHeads,
     /// Periodic timer for head announcement.
     announce_interval: tokio::time::Interval,
 }
@@ -134,6 +137,9 @@ where
             processed_blocks: LruCache::new(LRU_PROCESSED_BLOCKS_SIZE),
             queued_blocks: LruCache::new(LRU_PROCESSED_BLOCKS_SIZE),
             downloading_blocks: LruMap::new(ByLength::new(LRU_PROCESSED_BLOCKS_SIZE)),
+            recovering_heads: crate::node::network::block_import::fork_recover::new_recovering_heads(
+                LRU_PROCESSED_BLOCKS_SIZE,
+            ),
             announce_interval: {
                 // 3s ≈ 6-7 BSC slots (450ms each). Fast enough to break fork
                 // livelocks, slow enough to be negligible overhead.

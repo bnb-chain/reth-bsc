@@ -3,11 +3,13 @@
 //!
 //! See `docs/superpowers/specs/2026-04-17-p2p-fork-recovery-design.md`.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use alloy_primitives::B256;
 use alloy_rpc_types::engine::PayloadStatusEnum;
 use futures::future::BoxFuture;
+use parking_lot::Mutex;
+use reth::network::cache::LruCache;
 use reth_engine_primitives::ConsensusEngineHandle;
 use reth_network_api::PeerId;
 use reth_payload_primitives::PayloadTypes;
@@ -311,6 +313,33 @@ where
     }
 
     Ok(())
+}
+
+/// RAII guard that removes a head hash from the dedup cache on drop, even on
+/// task panic or early return.
+pub struct RecoveringHeadGuard {
+    hash: B256,
+    set: Arc<Mutex<LruCache<B256>>>,
+}
+
+impl RecoveringHeadGuard {
+    pub fn new(hash: B256, set: Arc<Mutex<LruCache<B256>>>) -> Self {
+        Self { hash, set }
+    }
+}
+
+impl Drop for RecoveringHeadGuard {
+    fn drop(&mut self) {
+        self.set.lock().remove(&self.hash);
+    }
+}
+
+/// Shared dedup set — one entry per in-flight recovery.
+pub type RecoveringHeads = Arc<Mutex<LruCache<B256>>>;
+
+/// Convenience constructor matching `LRU_PROCESSED_BLOCKS_SIZE` cap.
+pub fn new_recovering_heads(cap: u32) -> RecoveringHeads {
+    Arc::new(Mutex::new(LruCache::new(cap)))
 }
 
 #[cfg(test)]

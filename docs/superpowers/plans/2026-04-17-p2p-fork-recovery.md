@@ -816,7 +816,7 @@ git commit -m "feat(p2p): implement recover_ancestors end-to-end pipeline"
 - Modify: `src/node/network/block_import/service.rs`
 - Modify: `src/node/network/block_import/fork_recover.rs`
 
-- [ ] **Step 5.1: Add the guard type**
+- [x] **Step 5.1: Add the guard type**
 
 Append to `fork_recover.rs` (above `#[cfg(test)]`):
 
@@ -853,7 +853,7 @@ pub fn new_recovering_heads(cap: u32) -> RecoveringHeads {
 }
 ```
 
-- [ ] **Step 5.2: Thread the dedup set through `ImportService`**
+- [x] **Step 5.2: Thread the dedup set through `ImportService`**
 
 Edit `src/node/network/block_import/service.rs`:
 
@@ -873,7 +873,7 @@ Add to `ImportService::new`, in the struct literal (around line 126):
             ),
 ```
 
-- [ ] **Step 5.3: Verify compilation (no behavioural change yet)**
+- [x] **Step 5.3: Verify compilation (no behavioural change yet)**
 
 Run: `cargo check -p reth-bsc --lib`
 Expected: no errors. Existing tests still pass because `recovering_heads` is only read in later tasks.
@@ -881,7 +881,7 @@ Expected: no errors. Existing tests still pass because `recovering_heads` is onl
 Run: `cargo test -p reth-bsc --lib block_import::`
 Expected: all existing tests pass.
 
-- [ ] **Step 5.4: Commit**
+- [x] **Step 5.4: Commit**
 
 ```bash
 git add src/node/network/block_import/fork_recover.rs src/node/network/block_import/service.rs
