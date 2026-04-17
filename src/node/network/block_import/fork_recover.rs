@@ -42,6 +42,11 @@ pub const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 /// other registered BSC peers.
 pub const MAX_PEER_ATTEMPTS: usize = 3;
 
+/// How long a head stays suppressed after `recover_ancestors` fails.
+/// Prevents the 3s periodic head-announce tick from re-spawning a
+/// doomed recovery every loop.
+pub const FAILED_HEAD_COOLDOWN: Duration = Duration::from_secs(30);
+
 /// Error kinds produced by `recover_ancestors` / `discover_fork_blocks`.
 #[derive(Debug, thiserror::Error)]
 pub enum ForkRecoverError {
@@ -324,6 +329,51 @@ where
     }
 
     Ok(())
+}
+
+/// Bounded LRU of recently-failed recovery heads with per-entry deadlines.
+///
+/// `is_cooling` returns true only for entries whose deadline has not yet
+/// expired. Expired entries are lazily removed on access. Capacity eviction
+/// is handled by the underlying `schnellru::LruMap` and matches the
+/// `BODY_CACHE` / `RecoveringHeads` pattern elsewhere in the codebase.
+#[derive(Clone)]
+pub struct FailedHeadsCooler {
+    inner: Arc<Mutex<schnellru::LruMap<B256, std::time::Instant, schnellru::ByLength>>>,
+    cooldown: Duration,
+}
+
+impl FailedHeadsCooler {
+    pub fn new(capacity: u32, cooldown: Duration) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(schnellru::LruMap::new(
+                schnellru::ByLength::new(capacity),
+            ))),
+            cooldown,
+        }
+    }
+
+    pub fn mark_failed(&self, head: B256) {
+        let mut g = self.inner.lock();
+        g.insert(head, std::time::Instant::now() + self.cooldown);
+    }
+
+    pub fn is_cooling(&self, head: &B256) -> bool {
+        let mut g = self.inner.lock();
+        match g.get(head).copied() {
+            None => false,
+            Some(deadline) if std::time::Instant::now() >= deadline => {
+                g.remove(head);
+                false
+            }
+            Some(_) => true,
+        }
+    }
+}
+
+/// Factory matching the shape of `new_recovering_heads`.
+pub fn new_failed_heads_cooler(capacity: u32) -> FailedHeadsCooler {
+    FailedHeadsCooler::new(capacity, FAILED_HEAD_COOLDOWN)
 }
 
 /// RAII guard that removes a head hash from the dedup cache on drop, even on
@@ -687,5 +737,52 @@ mod tests {
         // already holding 97Y as Valid (which is why the side-block exists).
         assert_eq!(nums, vec![99, 98, 96], "97Y skipped because already on side-chain");
         assert_eq!(fetcher.calls().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod cooler_tests {
+    use super::{FailedHeadsCooler, FAILED_HEAD_COOLDOWN};
+    use alloy_primitives::B256;
+    use std::time::Duration;
+
+    #[test]
+    fn is_cooling_is_false_before_mark_failed() {
+        let cooler = FailedHeadsCooler::new(8, FAILED_HEAD_COOLDOWN);
+        assert!(!cooler.is_cooling(&B256::repeat_byte(0x11)));
+    }
+
+    #[test]
+    fn is_cooling_is_true_right_after_mark_failed() {
+        let cooler = FailedHeadsCooler::new(8, FAILED_HEAD_COOLDOWN);
+        let h = B256::repeat_byte(0x22);
+        cooler.mark_failed(h);
+        assert!(cooler.is_cooling(&h));
+    }
+
+    #[test]
+    fn cooldown_expires_after_duration() {
+        // Use a 0-length cooldown so expiry fires immediately.
+        let cooler = FailedHeadsCooler::new(8, Duration::from_millis(0));
+        let h = B256::repeat_byte(0x33);
+        cooler.mark_failed(h);
+        // With 0ms cooldown the next check must not consider it cooling.
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(!cooler.is_cooling(&h));
+    }
+
+    #[test]
+    fn capacity_evicts_oldest_entries() {
+        let cooler = FailedHeadsCooler::new(2, Duration::from_secs(60));
+        let a = B256::repeat_byte(0xaa);
+        let b = B256::repeat_byte(0xbb);
+        let c = B256::repeat_byte(0xcc);
+        cooler.mark_failed(a);
+        cooler.mark_failed(b);
+        cooler.mark_failed(c);
+        // `a` must be evicted; `b` and `c` must remain.
+        assert!(!cooler.is_cooling(&a));
+        assert!(cooler.is_cooling(&b));
+        assert!(cooler.is_cooling(&c));
     }
 }
