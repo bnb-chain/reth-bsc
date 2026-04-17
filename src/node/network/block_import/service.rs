@@ -1122,8 +1122,6 @@ mod tests {
         }));
     }
 
-    use super::plan_head_announcements;
-
     fn peer(tag: u8, best_number: Option<u64>) -> (PeerId, Option<u64>) {
         // `PeerId` is `alloy_primitives::B512`. Build a deterministic 64-byte
         // value from the tag via the `From<[u8; 64]>` impl.
