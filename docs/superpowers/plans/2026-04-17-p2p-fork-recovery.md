@@ -1017,12 +1017,12 @@ git commit -m "refactor(p2p): route on_new_block_hashes through fork recovery"
 **Files:**
 - Modify: `src/node/network/block_import/service.rs`
 
-- [ ] **Step 7.1: Confirm the current `Syncing` arm**
+- [x] **Step 7.1: Confirm the current `Syncing` arm**
 
 Run: `sed -n '219,310p' src/node/network/block_import/service.rs`
 Expected: the arm still contains `batch_request_range_and_await_import` and the immediate `engine.fork_choice_updated` call — this is exactly what we delete.
 
-- [ ] **Step 7.2: Rewrite the arm**
+- [x] **Step 7.2: Rewrite the arm**
 
 Replace the entire `PayloadStatusEnum::Syncing => { ... }` block in `new_payload` (around lines 219-309) with:
 
@@ -1087,7 +1087,7 @@ Replace the entire `PayloadStatusEnum::Syncing => { ... }` block in `new_payload
                     }
 ```
 
-- [ ] **Step 7.3: Wire `recovering_heads` into the `new_payload` closure**
+- [x] **Step 7.3: Wire `recovering_heads` into the `new_payload` closure**
 
 The `new_payload` method (around service.rs:148) builds an `async move { ... }` closure that captures `engine` and `forkchoice_engine`. It must also now capture `recovering_heads`. At the top of `new_payload` (next to the `engine` / `forkchoice_engine` clones at lines ~149-150), add:
 
@@ -1095,7 +1095,7 @@ The `new_payload` method (around service.rs:148) builds an `async move { ... }` 
         let recovering_heads = self.recovering_heads.clone();
 ```
 
-- [ ] **Step 7.4: Add the static peer-resolver helper used inside the async block**
+- [x] **Step 7.4: Add the static peer-resolver helper used inside the async block**
 
 Because `&self` is not available inside `async move`, extract the peer-selection logic to a free function. Add near the top of `service.rs` (above the `impl` block):
 
@@ -1119,7 +1119,7 @@ Then have the instance method `resolve_bsc_peer` (added in Task 6.3) delegate to
     }
 ```
 
-- [ ] **Step 7.5: Verify the full crate builds**
+- [x] **Step 7.5: Verify the full crate builds**
 
 Run: `cargo check -p reth-bsc --lib`
 Expected: no errors.
@@ -1127,7 +1127,7 @@ Expected: no errors.
 Run: `cargo test -p reth-bsc --lib block_import::`
 Expected: all existing tests pass (no behavioural regression in the non-fork happy paths; fork recovery paths are covered by the fork_recover module tests).
 
-- [ ] **Step 7.6: Commit**
+- [x] **Step 7.6: Commit**
 
 ```bash
 git add src/node/network/block_import/service.rs

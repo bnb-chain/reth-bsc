@@ -106,6 +106,16 @@ where
     announce_interval: tokio::time::Interval,
 }
 
+fn resolve_bsc_peer_static(announcer: PeerId) -> Option<PeerId> {
+    if crate::node::network::bsc_protocol::registry::has_registered_peer(announcer) {
+        Some(announcer)
+    } else {
+        crate::node::network::bsc_protocol::registry::list_registered_peers()
+            .into_iter()
+            .next()
+    }
+}
+
 impl<Provider> ImportService<Provider>
 where
     Provider: BlockNumReader + BlockHashReader + HeaderProvider<Header = Header> + Clone + Send + Sync + 'static,
@@ -154,6 +164,7 @@ where
     fn new_payload(&self, block: BlockMsg, peer_id: PeerId) -> ImportFut {
         let engine = self.engine.clone();
         let forkchoice_engine = self.forkchoice_engine.clone();
+        let recovering_heads = self.recovering_heads.clone();
 
         let announced_hash = block.hash;
         let block_hash = block.block.0.block.header.hash_slow();
@@ -223,94 +234,61 @@ where
                         None
                     }
                     PayloadStatusEnum::Syncing => {
-                        // Parent block is missing. Actively fetch ancestor blocks
-                        // from the announcing peer via BSC GetBlocksByRange to bridge
-                        // the gap, rather than waiting passively.
+                        // Parent block is missing. Launch fork-aware ancestor
+                        // recovery rather than a naive range fetch + premature
+                        // FCU. The recovery task also owns the final FCU.
                         let block_number = header.number;
-                        let parent_hash = header.parent_hash;
                         tracing::info!(
                             target: "bsc::block_import",
-                            block_hash = %block_hash,
-                            block_number = block_number,
-                            parent_hash = %parent_hash,
+                            %block_hash,
+                            block_number,
+                            parent_hash = %header.parent_hash,
                             peer = %peer_id,
-                            "New payload returned Syncing - fetching ancestor blocks from peer"
+                            "New payload returned Syncing - spawning fork recovery"
                         );
 
-                        // Determine how many blocks to request.
-                        let local_tip = forkchoice_engine.provider
-                            .best_block_number()
-                            .unwrap_or(0);
-                        let gap = block_number.saturating_sub(local_tip);
-                        let count = gap.clamp(1, 64);
-
-                        // Spawn async range fetch from the originating peer
-                        let fetch_peer = peer_id;
+                        // Fire-and-forget spawn; `recover_ancestors` runs its
+                        // own Phase-1 local checks so it's correct even if the
+                        // head is already on chain by the time the task starts.
+                        {
+                            let mut guard = recovering_heads.lock();
+                            if guard.contains(&block_hash) {
+                                return None;
+                            }
+                            guard.insert(block_hash);
+                        }
+                        let provider = forkchoice_engine.provider.clone();
+                        let engine_clone = engine.clone();
+                        let forkchoice_engine_clone = forkchoice_engine.clone();
+                        let recovering = recovering_heads.clone();
+                        let peer = resolve_bsc_peer_static(peer_id);
                         tokio::spawn(async move {
-                            let target_peer = if crate::node::network::bsc_protocol::registry::has_registered_peer(fetch_peer) {
-                                Some(fetch_peer)
-                            } else {
-                                crate::node::network::bsc_protocol::registry::list_registered_peers()
-                                    .into_iter()
-                                    .next()
-                            };
-                            if let Some(bsc_peer) = target_peer {
-                                tracing::debug!(
-                                    target: "bsc::block_import",
-                                    peer = %bsc_peer,
-                                    block_hash = %block_hash,
-                                    block_number = block_number,
-                                    count = count,
-                                    "Requesting ancestor block range for syncing block"
-                                );
-                                let _ = crate::node::network::bsc_protocol::registry::batch_request_range_and_await_import(
-                                    bsc_peer,
-                                    block_number,
+                            let _guard = crate::node::network::block_import::fork_recover::RecoveringHeadGuard::new(
+                                block_hash, recovering,
+                            );
+                            let fetcher = crate::node::network::block_import::fork_recover::BscRangeFetcher;
+                            let Some(target) = peer else { return; };
+                            if let Err(err) =
+                                crate::node::network::block_import::fork_recover::recover_ancestors(
+                                    target,
                                     block_hash,
-                                    count,
-                                    std::time::Duration::from_secs(5),
-                                ).await;
-                            } else {
-                                tracing::debug!(
+                                    block_number,
+                                    provider,
+                                    engine_clone,
+                                    forkchoice_engine_clone,
+                                    &fetcher,
+                                )
+                                .await
+                            {
+                                tracing::warn!(
                                     target: "bsc::block_import",
-                                    "No BSC protocol peer available for ancestor fetch"
+                                    %block_hash,
+                                    block_number,
+                                    error = %err,
+                                    "Fork recovery failed (Syncing path)"
                                 );
                             }
                         });
-
-                        // Also send FCU to inform the engine-tree about the new head
-                        let forkchoice_state = alloy_rpc_types::engine::ForkchoiceState {
-                            head_block_hash: block_hash,
-                            safe_block_hash: alloy_primitives::B256::ZERO,
-                            finalized_block_hash: alloy_primitives::B256::ZERO,
-                        };
-                        match engine
-                            .fork_choice_updated(
-                                forkchoice_state,
-                                None,
-                                reth_payload_primitives::EngineApiMessageVersion::V1,
-                            )
-                            .await
-                        {
-                            Ok(result) => {
-                                tracing::debug!(
-                                    target: "bsc::block_import",
-                                    block_hash = %block_hash,
-                                    block_number = block_number,
-                                    status = ?result.payload_status.status,
-                                    "FCU result for syncing block"
-                                );
-                            }
-                            Err(err) => {
-                                tracing::trace!(
-                                    target: "bsc::block_import",
-                                    block_hash = %block_hash,
-                                    block_number = block_number,
-                                    error = %err,
-                                    "Failed to update fork choice for syncing block"
-                                );
-                            }
-                        }
                         None
                     }
                     _ => None,
@@ -567,13 +545,7 @@ where
     /// Pick a peer to route `GetBlocksByRange` to. Prefer the announcing peer
     /// if it speaks the BSC sub-protocol; otherwise any registered BSC peer.
     fn resolve_bsc_peer(&self, announcer: PeerId) -> Option<PeerId> {
-        if crate::node::network::bsc_protocol::registry::has_registered_peer(announcer) {
-            Some(announcer)
-        } else {
-            crate::node::network::bsc_protocol::registry::list_registered_peers()
-                .into_iter()
-                .next()
-        }
+        resolve_bsc_peer_static(announcer)
     }
 
     /// Transfer the block to EVN peers if from proxied validators or validator address.
