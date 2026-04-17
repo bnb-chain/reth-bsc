@@ -16,7 +16,7 @@ use reth::{
     builder::rpc::EthApiCtx,
     builder::{
         components::ComponentsBuilder,
-        rpc::{EthApiBuilder, RpcAddOns, RpcContext},
+        rpc::{EthApiBuilder, RpcAddOns},
         DebugNode, Node, NodeAdapter,
     },
     rpc::eth::core::{EthApiFor, EthRpcConverterFor},
@@ -30,8 +30,6 @@ use reth_engine_primitives::ConsensusEngineHandle;
 
 use reth_payload_primitives::{PayloadAttributesBuilder, PayloadTypes};
 use reth_primitives::BlockBody;
-use reth_rpc_eth_api::helpers::config::{EthConfigApiServer, EthConfigHandler};
-use reth_rpc_server_types::RethRpcModule;
 use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex};
 use tracing::trace;
@@ -186,17 +184,7 @@ where
     }
 
     fn add_ons(&self) -> Self::AddOns {
-        BscNodeAddOns::default().extend_rpc_modules(
-            |ctx: RpcContext<'_, NodeAdapter<N>, <BscEthApiBuilder as EthApiBuilder<NodeAdapter<N>>>::EthApi>| {
-                let eth_config = EthConfigHandler::new(
-                    ctx.node().provider().clone(),
-                    ctx.node().evm_config().clone(),
-                );
-            ctx.modules
-                .merge_if_module_configured(RethRpcModule::Eth, eth_config.into_rpc())?;
-            Ok(())
-            },
-        )
+        BscNodeAddOns::default()
     }
 }
 

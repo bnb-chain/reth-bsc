@@ -394,10 +394,23 @@ fn main() -> eyre::Result<()> {
                         // Get pool and provider from context
                         let pool = ctx.pool().clone();
                         let provider = ctx.provider().clone();
-                        
+
                         let blob_api = BlobApiImpl::new(pool, provider);
                         ctx.modules.merge_configured(blob_api.into_rpc())?;
                         tracing::info!("Succeed to register Blob RPC API");
+
+                        tracing::info!("Start to register eth_config (EIP-7910) API...");
+                        use reth::api::FullNodeComponents;
+                        use reth_bsc::rpc::BscEthConfigHandler;
+                        use reth_rpc_eth_api::helpers::config::EthConfigApiServer;
+                        use reth_rpc_server_types::RethRpcModule;
+
+                        let eth_config = BscEthConfigHandler::new(
+                            ctx.provider().clone(),
+                            ctx.node().evm_config().clone(),
+                        );
+                        ctx.modules.merge_if_module_configured(RethRpcModule::Eth, eth_config.into_rpc())?;
+                        tracing::info!("Succeed to register eth_config (EIP-7910) API");
                         Ok(())
                     })
                     .launch().await?;
