@@ -61,7 +61,7 @@ Replace both fetch sites with a single fork-aware recovery primitive that:
 2. **Local-first checks.** Before every hop, and for every returned block, we consult `BlockHashReader` / `HeaderProvider` to avoid re-fetching or re-importing blocks we already have.
 3. **Drive import directly via `engine.new_payload`.** The recovery task does not go through `block_import_sender`, because the main `ImportService` loop drives `pending_imports` in parallel and provides no ordering guarantee. Sequential `.await` on `new_payload` is the only way to guarantee "parent Valid before child submitted."
 4. **FCU last, always.** No FCU fires until the full ancestor → head chain has been validated. This eliminates the existing FCU-before-import race.
-5. **Bounded work.** `MAX_FORK_DEPTH = 256`, implying at most `ceil(256 / MAX_REQUEST_RANGE_BLOCKS_COUNT) = 4` hops and 4 bounded `new_payload` rounds. Recovery either succeeds or gives up within this envelope; it never loops unbounded.
+5. **Bounded work.** `MAX_FORK_DEPTH = 256` and `FORK_RECOVER_HOP_COUNT = 4`, implying at most `256 / 4 = 64` hops. Hops are small (4 blocks each) because BSC blocks carry full transactions and sidecars — asking for 64 in one shot ties the task up on a fat response even when the ancestor is just a handful of blocks away. With hop=4, the typical (short) fork resolves in 1–2 round-trips; deep recovery trades more round-trips for faster individual responses and bounded wasted bandwidth if we overshoot the ancestor.
 
 ## Architecture
 
@@ -101,7 +101,7 @@ loop:
 
     if walked >= MAX_FORK_DEPTH: return Err(ForkTooDeep)
 
-    count = min(MAX_REQUEST_RANGE_BLOCKS_COUNT = 64, MAX_FORK_DEPTH - walked)
+    count = min(FORK_RECOVER_HOP_COUNT = 4, MAX_FORK_DEPTH - walked)
     resp  = request_blocks_by_range(peer_id, cursor.num, cursor.hash,
                                     count, FETCH_TIMEOUT).await?
     if resp.blocks.is_empty(): return Err(EmptyResponse)
@@ -116,7 +116,7 @@ loop:
     cursor = (oldest.number - 1, oldest.header.parent_hash)
 ```
 
-With this structure, `MAX_FORK_DEPTH = 256` means any fork depth ≤ 256 is recoverable: hop 4 walks 256 blocks, then the next iteration's pre-hop check covers the ancestor sitting exactly at `peer_head - 256`. Fork depth 257+ returns `ForkTooDeep`.
+With this structure, `MAX_FORK_DEPTH = 256` and `FORK_RECOVER_HOP_COUNT = 4` mean any fork depth ≤ 256 is recoverable: the 64th hop walks the total to 256 blocks, then the next iteration's pre-hop check covers the ancestor sitting exactly at `peer_head - 256`. Fork depth 257+ returns `ForkTooDeep`.
 
 The loop uses **`request_blocks_by_range`** (`registry.rs:140-165`), which only performs the wire round-trip. It does not use `batch_request_range_and_await_import`, which would enqueue blocks into the import pipeline and defeat our ordering.
 
@@ -188,7 +188,8 @@ Unchanged from the current code: try the announcing peer first via `has_register
 | Constant | Value | Rationale |
 |----------|-------|-----------|
 | `MAX_FORK_DEPTH` | 256 blocks | ~2 validator turn cycles on BSC; sufficient for all realistic validator livelocks while bounding work. |
-| `MAX_REQUEST_RANGE_BLOCKS_COUNT` | 64 (existing) | Per-request cap enforced by server; recovery uses this to size each hop. |
+| `FORK_RECOVER_HOP_COUNT` | 4 blocks | Per-hop fetch size. Smaller than the protocol cap on purpose: BSC blocks are large (full tx bodies + sidecars), so a 64-block response is slow to transmit and wasteful when the ancestor is 1–5 blocks away. 4 blocks gives quick response times in the common short-fork case at the cost of more round-trips on deep forks (worst case `256 / 4 = 64` hops, still bounded). |
+| `MAX_REQUEST_RANGE_BLOCKS_COUNT` | 64 (existing, protocol-level) | Server-enforced per-request cap. Recovery stays well under this (`FORK_RECOVER_HOP_COUNT = 4`). |
 | `FETCH_TIMEOUT` | 5s (existing for `batch_request_range_and_await_import`) | Matches existing range-fetch timeout. |
 | `RECOVERING_HEADS_CAP` | `LRU_PROCESSED_BLOCKS_SIZE` (=100) | Reuses the existing constant (`service.rs:70`) so all three head-dedup caches share sizing. 100 is ample: in-flight recoveries typically number in the low single digits. |
 
@@ -214,18 +215,17 @@ Unchanged from the current code: try the announcing peer first via `has_register
 
 Unit tests in `fork_recover.rs`:
 
-1. **Single-hop happy path.** Mock provider with canonical `[0..100]`; mock peer serving canonical `[0..100]`. Announce head 100. Expect: no fetch issued (cursor matches local via `block_hash`), zero imports, single FCU.
-2. **Simple linear-ahead.** Mock canonical `[0..100]`; peer has `[0..101]`. Announce head 101. Expect: one hop fetching `[101]`; one `new_payload(101)` returning Valid; FCU(101).
-3. **Short fork within one hop.** Local canonical `[0..=95, 96X..=100X]`; peer chain `[0..=95, 96Y..=102Y]` (divergence at 95, fork depth 7). Announce `(hash=102Y, num=102)`. Expect: one hop with `count=64` returning `[102Y, 101Y, ..., 96Y, 95, 94, ..., 39]`; per-block loop pushes `[102Y..=96Y]` into `fork_blocks`, hits `block_hash(95) == 95_hash` on the 8th element and breaks; reverses to `[96Y..=102Y]` and imports in order; FCU(102Y).
-4. **Fork deeper than one hop.** Local canonical `[0..=100]`, peer head at 200 with divergence at 120 (fork depth 80). Expect two hops (first covers `[200..=137]`, second covers `[136..=120]` with ancestor at 120 hit mid-batch). Verify hop count and final import order `[121Y..=200Y]`.
-5. **Fork at exactly `MAX_FORK_DEPTH`.** Fork depth 256 (ancestor at `peer_head - 256`). Expect success via the post-loop pre-hop check on cursor `(peer_head - 256, ancestor_hash)`; 4 full hops + 1 extra pre-hop lookup; no 5th fetch issued.
+1. **Head already on canonical.** Mock provider with canonical `[0..=100]`; mock peer also at canonical `[0..=100]`. Announce head 100. Expect: no fetch issued (cursor pre-hop check matches `block_hash(100) == Some(100_hash)`), zero imports, single FCU(100).
+2. **Simple linear-ahead, one hop covers it.** Mock canonical `[0..=100]`; peer has `[0..=104]`. Announce head 104, fork depth 4. Expect: one hop with `count=4` returning `[104, 103, 102, 101]`; all 4 pushed to `fork_blocks` (no match); pre-hop on cursor `(100, 101.parent_hash=100_hash)` matches canonical → ancestor found, no second fetch; reverse and import `[101..=104]`; FCU(104).
+3. **Short fork, two hops.** Local canonical `[0..=95, 96X..=100X]`; peer chain `[0..=95, 96Y..=102Y]` (divergence at 95, fork depth 7). Announce `(hash=102Y, num=102)`. Expect: hop 1 returns `[102Y, 101Y, 100Y, 99Y]`, all 4 pushed; hop 2 on cursor `(98, 99Y.parent_hash=98Y)` returns `[98Y, 97Y, 96Y, 95]`, pushes 98Y/97Y/96Y then hits `block_hash(95) == 95_hash` on the 4th element → break; reverse to `[96Y..=102Y]`; import in order; FCU(102Y). Total: 2 fetches, 7 imports.
+4. **Fork deeper than a handful of hops.** Local canonical `[0..=150]`, peer chain `[0..=120, 121Y..=200Y]` (divergence at 120, fork depth 80). Expect 20 full hops of 4 blocks covering `[200Y..=121Y]`, then a post-loop pre-hop check on cursor `(120, 121Y.parent_hash=120_hash)` that matches canonical. Verify hop count = 20, final import order `[121Y..=200Y]`.
+5. **Fork at exactly `MAX_FORK_DEPTH`.** Fork depth 256 (ancestor at `peer_head - 256`). Expect success via the post-loop pre-hop check; 64 full hops + 1 extra pre-hop lookup; no 65th fetch issued.
 6. **Fork deeper than `MAX_FORK_DEPTH`.** Fork depth 257. Expect `ForkTooDeep`, no imports, no FCU.
-7. **Head already on canonical.** `block_hash(head_num) == head_hash`. Expect zero network requests, zero imports, FCU(head).
-8. **Head already in tree as side-chain.** `header_by_hash(head_hash).is_some()` but not canonical. Expect zero requests, zero imports, **FCU fired anyway** (re-evaluation requirement from §Goal #5).
-9. **Mid-chain already-present side block.** Fork chain contains one block whose hash we already have from a prior recovery; verify it's skipped in the `fork_blocks` accumulation but ancestor walk continues correctly.
-10. **`new_payload` returns Invalid on one block.** Verify abort, no FCU, no further imports.
-11. **Empty hop response.** Peer returns zero blocks. Verify `EmptyResponse` error path cleans up `recovering_heads`.
-12. **Concurrent announces for same head.** Second announce arrives while first recovery is in flight. Verify only one task spawned, second announce is a no-op.
+7. **Head already in tree as side-chain.** `header_by_hash(head_hash).is_some()` but not canonical. Expect zero requests, zero imports, **FCU fired anyway** (re-evaluation requirement from §Goal #5).
+8. **Mid-chain already-present side block.** Fork chain contains one block whose hash we already have from a prior recovery; verify it's skipped in the `fork_blocks` accumulation but ancestor walk continues correctly.
+9. **`new_payload` returns Invalid on one block.** Verify abort, no FCU, no further imports.
+10. **Empty hop response.** Peer returns zero blocks. Verify `EmptyResponse` error path cleans up `recovering_heads`.
+11. **Concurrent announces for same head.** Second announce arrives while first recovery is in flight. Verify only one task spawned, second announce is a no-op.
 
 Integration testing — minimum: a two-node testbed where node A and node B produce divergent chains (simulated by freezing peer visibility during fork generation), then reconnected. Verify both converge on the higher-TD tip within 2× the announce interval.
 
