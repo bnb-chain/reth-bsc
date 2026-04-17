@@ -611,22 +611,22 @@ where
             let num = match provider.best_block_number() {
                 Ok(n) if n > 0 => n,
                 Ok(_) => {
-                    tracing::trace!(target: "bsc::block_import", "Skip head announce: local best_block_number is 0");
+                    tracing::debug!(target: "bsc::block_import", "Skip head announce: local best_block_number is 0");
                     return;
                 }
                 Err(e) => {
-                    tracing::trace!(target: "bsc::block_import", error = %e, "Skip head announce: failed to read best_block_number");
+                    tracing::debug!(target: "bsc::block_import", error = %e, "Skip head announce: failed to read best_block_number");
                     return;
                 }
             };
             let hash = match provider.block_hash(num) {
                 Ok(Some(h)) => h,
                 Ok(None) => {
-                    tracing::trace!(target: "bsc::block_import", num, "Skip head announce: no hash for best_block_number");
+                    tracing::debug!(target: "bsc::block_import", num, "Skip head announce: no hash for best_block_number");
                     return;
                 }
                 Err(e) => {
-                    tracing::trace!(target: "bsc::block_import", num, error = %e, "Skip head announce: block_hash lookup failed");
+                    tracing::debug!(target: "bsc::block_import", num, error = %e, "Skip head announce: block_hash lookup failed");
                     return;
                 }
             };
@@ -635,7 +635,7 @@ where
             let net = match crate::shared::get_network_handle() {
                 Some(n) => n,
                 None => {
-                    tracing::trace!(target: "bsc::block_import", "Skip head announce: network handle not yet initialized");
+                    tracing::debug!(target: "bsc::block_import", "Skip head announce: network handle not yet initialized");
                     return;
                 }
             };
@@ -644,7 +644,7 @@ where
             let peers = match net.get_all_peers().await {
                 Ok(p) => p,
                 Err(e) => {
-                    tracing::trace!(target: "bsc::block_import", error = %e, "Skip head announce: get_all_peers failed");
+                    tracing::debug!(target: "bsc::block_import", error = %e, "Skip head announce: get_all_peers failed");
                     return;
                 }
             };
@@ -663,9 +663,16 @@ where
             let hashes = NewBlockHashes(vec![BlockHashNumber { hash, number: num }]);
             let target_count = targets.len();
             for peer_id in targets {
+                tracing::debug!(
+                    target: "bsc::block_import",
+                    %peer_id,
+                    local_num = num,
+                    %hash,
+                    "Sending head announce to peer"
+                );
                 net.send_eth_message(peer_id, PeerMessage::NewBlockHashes(hashes.clone()));
             }
-            tracing::trace!(
+            tracing::debug!(
                 target: "bsc::block_import",
                 local_num = num,
                 sent_to = target_count,
