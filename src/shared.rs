@@ -459,6 +459,11 @@ pub fn set_full_block_provider(
     FULL_BLOCK_PROVIDER.set(provider)
 }
 
+/// Get a clone of the installed [`FullBlockProvider`], if any.
+pub fn get_full_block_provider() -> Option<Arc<dyn FullBlockProvider + Send + Sync>> {
+    FULL_BLOCK_PROVIDER.get().cloned()
+}
+
 /// Try to get a full block by hash from the global provider
 pub fn get_full_block_by_hash(hash: &B256) -> Option<BscBlock> {
     FULL_BLOCK_PROVIDER.get().and_then(|p| p.block_by_hash(hash))
