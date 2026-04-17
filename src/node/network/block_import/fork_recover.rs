@@ -1,5 +1,5 @@
 //! Fork recovery: ancestor-aware block pull that replaces the naive
-//! `batch_request_range_and_await_import` call in the import service.
+//! batch range-request call in the import service.
 //!
 //! See `docs/superpowers/specs/2026-04-17-p2p-fork-recovery-design.md`.
 

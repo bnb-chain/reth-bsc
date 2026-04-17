@@ -12,7 +12,7 @@ use crate::{
 use alloy_consensus::{BlockBody, Header};
 use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::{B256, U128};
-use alloy_rpc_types::engine::{ForkchoiceState, PayloadStatusEnum};
+use alloy_rpc_types::engine::PayloadStatusEnum;
 use futures::{future::Either, stream::FuturesUnordered, StreamExt};
 use parking_lot::RwLock;
 use reth::consensus::HeaderValidator;
@@ -32,11 +32,10 @@ use reth_network::{
 use reth_network_api::{PeerId, Peers, ReputationChangeKind};
 use reth_node_ethereum::EthEngineTypes;
 use reth_payload_builder_primitives::Events;
-use reth_payload_primitives::{BuiltPayload, EngineApiMessageVersion, PayloadTypes};
+use reth_payload_primitives::{BuiltPayload, PayloadTypes};
 use reth_primitives::NodePrimitives;
 use reth_primitives_traits::{AlloyBlockHeader, Block};
 use reth_provider::{BlockHashReader, BlockNumReader, BlockReaderIdExt, HeaderProvider};
-use schnellru::{ByLength, LruMap};
 use std::{
     future::Future,
     pin::Pin,
@@ -69,9 +68,6 @@ pub(crate) type IncomingHashes = (NewBlockHashes, PeerId);
 /// Size of the LRU cache for processed blocks.
 const LRU_PROCESSED_BLOCKS_SIZE: u32 = 100;
 
-/// Cooldown duration for downloading block hashes to avoid re-downloading the same block.
-const DOWNLOAD_COOLDOWN_DURATION_MS: u128 = 200;
-
 /// A service that handles bidirectional block import communication with the network.
 /// It receives new blocks from the network via `from_network` channel and sends back
 /// import outcomes via `to_network` channel.
@@ -97,8 +93,6 @@ where
     processed_blocks: LruCache<B256>,
     /// Cache of queued block hashes to avoid processing the same block.
     queued_blocks: LruCache<B256>,
-    /// Cache of downloading block hashes to avoid re-downloading the same block.
-    downloading_blocks: LruMap<B256, u128, ByLength>,
     /// Heads currently being fork-recovered. Prevents duplicate spawned tasks
     /// when the same head is announced repeatedly.
     recovering_heads: crate::node::network::block_import::fork_recover::RecoveringHeads,
@@ -146,7 +140,6 @@ where
             pending_imports: FuturesUnordered::new(),
             processed_blocks: LruCache::new(LRU_PROCESSED_BLOCKS_SIZE),
             queued_blocks: LruCache::new(LRU_PROCESSED_BLOCKS_SIZE),
-            downloading_blocks: LruMap::new(ByLength::new(LRU_PROCESSED_BLOCKS_SIZE)),
             recovering_heads: crate::node::network::block_import::fork_recover::new_recovering_heads(
                 LRU_PROCESSED_BLOCKS_SIZE,
             ),

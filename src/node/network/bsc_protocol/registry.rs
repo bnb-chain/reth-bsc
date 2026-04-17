@@ -2,10 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::RwLock;
 
-use alloy_primitives::{U128, U256};
 use once_cell::sync::Lazy;
-use reth_eth_wire::NewBlock;
-use reth_network::message::NewBlockMessage;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
@@ -17,7 +14,6 @@ use super::stream::BscCommand;
 use crate::node::network::blocks_by_range::{
     BlocksByRangePacket, GetBlocksByRangePacket, MAX_REQUEST_RANGE_BLOCKS_COUNT,
 };
-use crate::node::network::BscNewBlock;
 use alloy_primitives::B256;
 use reth_network::Peers;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -162,57 +158,6 @@ pub async fn request_blocks_by_range(
         Ok(Err(_canceled)) => Err("request canceled".to_string()),
         Err(_elapsed) => Err("request timed out".to_string()),
     }
-}
-
-/// Batch request a range and wait for import of the returned blocks.
-/// Returns the list of imported block hashes in ascending order (oldest -> newest).
-pub async fn batch_request_range_and_await_import(
-    peer: PeerId,
-    start_height: u64,
-    start_hash: B256,
-    count: u64,
-    request_timeout: Duration,
-) -> Result<(), String> {
-    let resp =
-        request_blocks_by_range(peer, start_height, start_hash, count, request_timeout)
-            .await
-            .map_err(|e| {
-                tracing::warn!(
-                    target: "bsc::registry",
-                    peer = %peer,
-                    start_height,
-                    start_hash = %start_hash,
-                    count,
-                    error = %e,
-                    "Batch request range failed"
-                );
-                e
-            })?;
-    tracing::debug!(
-        target: "bsc::registry",
-        peer = %peer,
-        start_height = start_height,
-        start_hash = %start_hash,
-        count = count,
-        blocks = resp.blocks.len(),
-        "Batch request range and await importing blocks"
-    );
-
-    // Forward blocks to import path (iterate oldest -> newest)
-    if let Some(sender) = crate::shared::get_block_import_sender() {
-        for block in resp.blocks.iter().rev() {
-            let nb = BscNewBlock(NewBlock { block: block.clone(), td: U128::from(0u64) });
-            let hash = block.header.hash_slow();
-            let msg = NewBlockMessage { hash, block: Arc::new(nb), td: Some(U256::ZERO) };
-            if let Err(e) = sender.send((msg, peer)) {
-                tracing::error!(target: "bsc::registry", error=%e, "Failed to send block to import path");
-            }
-        }
-    } else {
-        tracing::debug!(target: "bsc_protocol", "Block import sender not available; dropping range import forward");
-    }
-
-    Ok(())
 }
 
 /// Broadcast votes to all connected peers.

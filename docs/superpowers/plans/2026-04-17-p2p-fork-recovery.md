@@ -1141,7 +1141,7 @@ git commit -m "refactor(p2p): route Syncing arm through fork recovery"
 **Files:**
 - Modify: `src/node/network/block_import/service.rs`
 
-- [ ] **Step 8.1: Check for unused items**
+- [x] **Step 8.1: Check for unused items**
 
 Run: `cargo check -p reth-bsc --lib 2>&1 | grep -E 'unused|dead_code'`
 
@@ -1150,7 +1150,7 @@ Expected: likely `DOWNLOAD_COOLDOWN_DURATION_MS`, possibly `downloading_blocks`,
 - If still referenced by any code path → keep it.
 - If strictly unused → delete.
 
-- [ ] **Step 8.2: Delete truly-unused items**
+- [x] **Step 8.2: Delete truly-unused items**
 
 Example edits (adjust to match what the compiler actually reports):
 
@@ -1158,7 +1158,7 @@ Example edits (adjust to match what the compiler actually reports):
 - Remove the `downloading_blocks: LruMap<B256, u128, ByLength>` field and its initializer (and the `schnellru::{ByLength, LruMap}` import if no longer needed).
 - Remove stale imports flagged by the compiler.
 
-- [ ] **Step 8.3: Run the full test suite**
+- [x] **Step 8.3: Run the full test suite**
 
 Run: `cargo test -p reth-bsc --lib`
 Expected: pass. New tests in `fork_recover::tests` plus all pre-existing ones.
@@ -1166,12 +1166,12 @@ Expected: pass. New tests in `fork_recover::tests` plus all pre-existing ones.
 Run: `cargo clippy -p reth-bsc --lib -- -D warnings 2>&1 | tail -40`
 Expected: clean (if the project's CI treats clippy as errors). If warnings surface that are not from our diff, leave them alone — they're pre-existing.
 
-- [ ] **Step 8.4: Smoke build**
+- [x] **Step 8.4: Smoke build** (deferred to CI — release build skipped locally this iteration)
 
 Run: `cargo build -p reth-bsc --release 2>&1 | tail -20`
 Expected: builds. (Full release build may take time; run only if the CI gates it.)
 
-- [ ] **Step 8.5: Commit cleanup**
+- [x] **Step 8.5: Commit cleanup**
 
 ```bash
 git add src/node/network/block_import/service.rs
