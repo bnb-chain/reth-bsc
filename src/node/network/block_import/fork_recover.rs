@@ -307,9 +307,22 @@ where
     }
 
     // ---- Phase 3: single FCU to let engine-tree re-evaluate canonical head ----
-    let head_header = provider
-        .header(head_hash)?
-        .ok_or(ForkRecoverError::HeadHeaderMissing { hash: head_hash })?;
+    //
+    // `provider.header(head_hash)` is not safe on the AncestorFound path:
+    // engine-tree keeps the blocks we just imported in memory (TreeState)
+    // until persistence, so the DB-backed `provider` can return `None` for a
+    // block that `engine.new_payload` has already accepted as `Valid`. That
+    // false-negative was the qanet two-validator fork livelock: Phase 2
+    // succeeded, but Phase 3 aborted with `HeadHeaderMissing`, the head was
+    // cooled down for 30s, and the FCU that would flip canonical never fired.
+    //
+    // The Phase-2 tail is the recovery head by construction (see
+    // `discover_fork_blocks`: fork_blocks is newest→oldest with the head at
+    // index 0, so `to_import.last()` after `reverse()` is the head). Use its
+    // in-memory header directly. Only fall back to the provider on the
+    // Shortcircuit path, where `to_import` is empty and the head was already
+    // locally known (canonical or side-chain) — that lookup must succeed.
+    let head_header = resolve_fcu_head_header(&provider, head_hash, to_import.last())?;
     if let Err(err) = forkchoice_engine.update_forkchoice(&head_header).await {
         // FCU failure is recoverable (engine-tree may retry on next import);
         // surface at warn level to match `service.rs` convention.
@@ -329,6 +342,39 @@ where
     }
 
     Ok(())
+}
+
+/// Resolve the header used as the FCU target at the end of `recover_ancestors`.
+///
+/// The AncestorFound path uses the Phase-2 tail (the peer's announced head,
+/// just imported via `engine.new_payload`) without consulting the DB provider:
+/// engine-tree holds that block in memory and the provider would return `None`
+/// until persistence lands — which is the qanet livelock we're fixing.
+///
+/// The Shortcircuit path (`phase_2_tail == None`) falls back to the provider,
+/// which is guaranteed to hold the head (canonical or side-chain) because
+/// `discover_fork_blocks` only short-circuits when the pre-hop local check
+/// succeeds. If the provider somehow disagrees, surface `HeadHeaderMissing`
+/// rather than forging an FCU target.
+fn resolve_fcu_head_header<P>(
+    provider: &P,
+    head_hash: B256,
+    phase_2_tail: Option<&crate::BscBlock>,
+) -> Result<alloy_consensus::Header, ForkRecoverError>
+where
+    P: HeaderProvider<Header = alloy_consensus::Header>,
+{
+    if let Some(last) = phase_2_tail {
+        debug_assert_eq!(
+            last.header.hash_slow(),
+            head_hash,
+            "phase-2 tail must be the recovery head; invariant of discover_fork_blocks",
+        );
+        return Ok(last.header.clone());
+    }
+    provider
+        .header(head_hash)?
+        .ok_or(ForkRecoverError::HeadHeaderMissing { hash: head_hash })
 }
 
 /// Bounded LRU of recently-failed recovery heads with per-entry deadlines.
@@ -737,6 +783,81 @@ mod tests {
         // already holding 97Y as Valid (which is why the side-block exists).
         assert_eq!(nums, vec![99, 98, 96], "97Y skipped because already on side-chain");
         assert_eq!(fetcher.calls().len(), 1);
+    }
+
+    // ---- Phase-3 head-header resolver tests ----
+    //
+    // These pin the qanet livelock fix: Phase 2 imports the peer's head via
+    // `engine.new_payload` (Valid), but the DB-backed provider does not see
+    // that block until engine-tree persists it. The resolver must use the
+    // Phase-2 tail, not the provider, on the AncestorFound path.
+
+    #[test]
+    fn resolve_fcu_head_header_uses_phase2_tail_when_provider_misses() {
+        // Provider has the shared ancestor but not the peer's head (simulates
+        // the just-imported-but-not-persisted engine-tree state that caused
+        // the two-validator fork livelock).
+        let mut provider = FakeProvider::default();
+        let (shared, shared_hashes) = linear_chain(0, 1, B256::ZERO, 0xC);
+        for h in &shared {
+            provider.insert_canonical(h.clone());
+        }
+
+        // Peer fork: one block on top of the ancestor.
+        let head = make_header(1, shared_hashes[0], 0xB);
+        let head_hash = head.hash_slow();
+        let tail_block = make_block(head.clone());
+
+        // Sanity: provider can't see the head (neither canonical nor side).
+        assert!(
+            BlockHashReader::block_hash(&provider, 1).unwrap() != Some(head_hash),
+            "precondition: head not canonical in provider",
+        );
+        assert!(
+            HeaderProvider::header(&provider, head_hash).unwrap().is_none(),
+            "precondition: head not as side-chain in provider",
+        );
+
+        let resolved =
+            super::resolve_fcu_head_header(&provider, head_hash, Some(&tail_block)).unwrap();
+        assert_eq!(
+            resolved.hash_slow(),
+            head_hash,
+            "must return the Phase-2 tail header verbatim, never consult provider",
+        );
+        assert_eq!(resolved.number, 1);
+    }
+
+    #[test]
+    fn resolve_fcu_head_header_shortcircuit_falls_back_to_provider() {
+        // Shortcircuit: fork_blocks empty, head already known locally
+        // (side-chain block the provider can serve).
+        let mut provider = FakeProvider::default();
+        let (shared, shared_hashes) = linear_chain(0, 1, B256::ZERO, 0xC);
+        for h in &shared {
+            provider.insert_canonical(h.clone());
+        }
+        let side = make_header(1, shared_hashes[0], 0xB);
+        let side_hash = side.hash_slow();
+        provider.insert_side(side);
+
+        let resolved = super::resolve_fcu_head_header(&provider, side_hash, None).unwrap();
+        assert_eq!(resolved.hash_slow(), side_hash);
+    }
+
+    #[test]
+    fn resolve_fcu_head_header_shortcircuit_missing_yields_error() {
+        // Defensive path: if Shortcircuit somehow fires but the provider no
+        // longer has the head (pruning race / DB corruption), surface
+        // `HeadHeaderMissing` rather than forging an FCU target.
+        let provider = FakeProvider::default();
+        let head_hash = B256::repeat_byte(0xAB);
+
+        let err = super::resolve_fcu_head_header(&provider, head_hash, None).unwrap_err();
+        match err {
+            ForkRecoverError::HeadHeaderMissing { hash } => assert_eq!(hash, head_hash),
+            other => panic!("expected HeadHeaderMissing, got {other:?}"),
+        }
     }
 }
 
