@@ -595,6 +595,30 @@ where
     }
 }
 
+/// Decide which peers to send `NewBlockHashes(local_head)` to.
+///
+/// A peer is skipped when its known `best_number` is more than
+/// `MAX_STALE_BLOCK_DISTANCE` (64) blocks ahead of the local head: announcing a
+/// stale hash to such a peer would be dropped and trigger a `BadAnnouncement`
+/// reputation penalty on us.
+///
+/// A peer with `best_number = None` (head not yet observed) is announced to:
+/// there's no evidence it is ahead, and the worst case is the peer ignores the
+/// hint.
+fn plan_head_announcements(
+    local_head: u64,
+    peers: &[(PeerId, Option<u64>)],
+) -> Vec<PeerId> {
+    const MAX_STALE_BLOCK_DISTANCE: u64 = 64;
+    peers
+        .iter()
+        .filter_map(|(peer_id, peer_best)| match peer_best {
+            Some(peer_best) if local_head + MAX_STALE_BLOCK_DISTANCE < *peer_best => None,
+            _ => Some(*peer_id),
+        })
+        .collect()
+}
+
 impl<Provider> Future for ImportService<Provider>
 where
     Provider: BlockNumReader
@@ -1096,5 +1120,70 @@ mod tests {
                 }
             }
         }));
+    }
+
+    use super::plan_head_announcements;
+
+    fn peer(tag: u8, best_number: Option<u64>) -> (PeerId, Option<u64>) {
+        // `PeerId` is `alloy_primitives::B512`. Build a deterministic 64-byte
+        // value from the tag via the `From<[u8; 64]>` impl.
+        let mut bytes = [0u8; 64];
+        bytes[0] = tag;
+        (PeerId::from(bytes), best_number)
+    }
+
+    #[test]
+    fn planner_announces_when_we_are_ahead() {
+        let peers = vec![peer(1, Some(100))];
+        let result = plan_head_announcements(200, &peers);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], peers[0].0);
+    }
+
+    #[test]
+    fn planner_announces_at_exact_64_gap_boundary() {
+        // Receiver drops only on strict `num + 64 < peer_best`, so gap == 64 is still fine.
+        let local = 100;
+        let peers = vec![peer(1, Some(local + 64))];
+        let result = plan_head_announcements(local, &peers);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn planner_skips_peer_more_than_64_ahead() {
+        let local = 100;
+        let peers = vec![peer(1, Some(local + 65))];
+        let result = plan_head_announcements(local, &peers);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn planner_announces_when_peer_best_number_unknown() {
+        // best_number is None before any head info has been observed; announce is the right default.
+        let peers = vec![peer(1, None)];
+        let result = plan_head_announcements(100, &peers);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn planner_mixes_skip_and_announce_across_peers() {
+        let local = 1000;
+        let p_ahead = peer(1, Some(local + 65));   // skipped
+        let p_at_boundary = peer(2, Some(local + 64)); // announced
+        let p_behind = peer(3, Some(local - 10));  // announced
+        let p_unknown = peer(4, None);             // announced
+        let peers = vec![p_ahead.clone(), p_at_boundary.clone(), p_behind.clone(), p_unknown.clone()];
+        let result = plan_head_announcements(local, &peers);
+        assert_eq!(result.len(), 3);
+        assert!(result.contains(&p_at_boundary.0));
+        assert!(result.contains(&p_behind.0));
+        assert!(result.contains(&p_unknown.0));
+        assert!(!result.contains(&p_ahead.0));
+    }
+
+    #[test]
+    fn planner_returns_empty_on_no_peers() {
+        let result = plan_head_announcements(100, &[]);
+        assert!(result.is_empty());
     }
 }
