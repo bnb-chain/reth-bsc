@@ -674,7 +674,7 @@ git commit -m "feat(p2p): implement Phase-1 discover_fork_blocks with unit tests
 
 Phase 2 drives `engine.new_payload` sequentially; Phase 3 issues the single FCU. Unit tests for this end-to-end function require mocking `ConsensusEngineHandle` and `BscForkChoiceEngine`, which is impractical — we cover it via the existing `TestFixture`-style integration test in Task 7 instead.
 
-- [ ] **Step 4.1: Add the Phase-2+3 glue**
+- [x] **Step 4.1: Add the Phase-2+3 glue**
 
 Append to `fork_recover.rs`, above the `#[cfg(test)]` block:
 
@@ -791,7 +791,7 @@ where
 }
 ```
 
-- [ ] **Step 4.2: Verify compilation**
+- [x] **Step 4.2: Verify compilation**
 
 Run: `cargo check -p reth-bsc --lib`
 Expected: no errors.
@@ -801,7 +801,7 @@ Notes on likely fixups:
 - `block_to_payload` lives on the `BscPayloadTypes` associated trait — confirm via `grep -R "fn block_to_payload" src/`.
 - If `forkchoice_engine.update_forkchoice(&Header)` has a different header parameter form in `BscForkChoiceEngine`, align with `service.rs:185` which calls the same method.
 
-- [ ] **Step 4.3: Commit**
+- [x] **Step 4.3: Commit**
 
 ```bash
 git add src/node/network/block_import/fork_recover.rs

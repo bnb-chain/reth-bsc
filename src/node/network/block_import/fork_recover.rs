@@ -195,6 +195,126 @@ pub async fn discover_fork_blocks<
     }
 }
 
+use alloy_rpc_types::engine::PayloadStatusEnum;
+use reth_engine_primitives::ConsensusEngineHandle;
+use reth_payload_primitives::PayloadTypes;
+use reth_primitives_traits::Block as _;
+use reth_provider::BlockNumReader;
+
+use crate::node::{consensus::BscForkChoiceEngine, engine_api::payload::BscPayloadTypes};
+
+/// Top-level recovery entry point.
+///
+/// 1. Walks back via `discover_fork_blocks` to find the common ancestor.
+/// 2. Imports fork blocks oldest → newest via `engine.new_payload`, awaiting
+///    `Valid` on each before submitting the next.
+/// 3. Issues a final `fork_choice_updated` for `head_hash`, so engine-tree
+///    re-evaluates canonical selection.
+pub async fn recover_ancestors<P>(
+    peer: PeerId,
+    head_hash: B256,
+    head_num: u64,
+    provider: P,
+    engine: ConsensusEngineHandle<BscPayloadTypes>,
+    forkchoice_engine: BscForkChoiceEngine<P>,
+    fetcher: &dyn RangeFetcher,
+) -> Result<(), ForkRecoverError>
+where
+    P: BlockHashReader
+        + BlockNumReader
+        + HeaderProvider<Header = alloy_consensus::Header>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+{
+    tracing::debug!(
+        target: "bsc::fork_recover",
+        %peer,
+        %head_hash,
+        head_num,
+        "Starting fork recovery"
+    );
+
+    // ---- Phase 1 ----
+    let discovery = discover_fork_blocks(peer, head_hash, head_num, &provider, fetcher).await?;
+    tracing::debug!(
+        target: "bsc::fork_recover",
+        %peer,
+        %head_hash,
+        head_num,
+        fork_blocks = discovery.fork_blocks.len(),
+        outcome = ?discovery.outcome,
+        "Phase 1 complete"
+    );
+
+    // ---- Phase 2: import oldest → newest via new_payload ----
+    let mut to_import = discovery.fork_blocks;
+    to_import.reverse();
+    for block in &to_import {
+        let block_hash = block.header.hash_slow();
+        let block_num = block.header.number;
+        let sealed = block.clone().seal_unchecked(block_hash);
+        let payload = BscPayloadTypes::block_to_payload(sealed);
+
+        match engine.new_payload(payload).await {
+            Ok(status) => match status.status {
+                PayloadStatusEnum::Valid => {
+                    tracing::debug!(
+                        target: "bsc::fork_recover",
+                        %block_hash,
+                        block_num,
+                        "Fork block imported Valid"
+                    );
+                }
+                PayloadStatusEnum::Invalid { validation_error } => {
+                    return Err(ForkRecoverError::ImportInvalid {
+                        num: block_num,
+                        reason: validation_error,
+                    });
+                }
+                PayloadStatusEnum::Syncing => {
+                    // Sequencing guarantees parents were already Valid, so
+                    // Syncing here means a parent failed silently.
+                    return Err(ForkRecoverError::ImportSyncingMidChain { num: block_num });
+                }
+                other => {
+                    return Err(ForkRecoverError::EngineCall(format!(
+                        "unexpected new_payload status {other:?}"
+                    )));
+                }
+            },
+            Err(err) => {
+                return Err(ForkRecoverError::EngineCall(err.to_string()));
+            }
+        }
+    }
+
+    // ---- Phase 3: single FCU to let engine-tree re-evaluate canonical head ----
+    let head_header = provider
+        .header(head_hash)?
+        .ok_or(ForkRecoverError::HeadHeaderMissing { hash: head_hash })?;
+    if let Err(err) = forkchoice_engine.update_forkchoice(&head_header).await {
+        // FCU failure is recoverable (engine-tree may retry on next import);
+        // surface at warn level to match `service.rs` convention.
+        tracing::warn!(
+            target: "bsc::fork_recover",
+            %head_hash,
+            error = %err,
+            "fork_choice_updated returned error after recovery"
+        );
+    } else {
+        tracing::debug!(
+            target: "bsc::fork_recover",
+            %head_hash,
+            head_num,
+            "Fork recovery FCU succeeded"
+        );
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
