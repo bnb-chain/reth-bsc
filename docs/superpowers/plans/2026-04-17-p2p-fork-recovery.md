@@ -895,12 +895,12 @@ git commit -m "feat(p2p): add recovering_heads dedup set to ImportService"
 **Files:**
 - Modify: `src/node/network/block_import/service.rs`
 
-- [ ] **Step 6.1: Read the current `on_new_block_hashes` to confirm line numbers**
+- [x] **Step 6.1: Read the current `on_new_block_hashes` to confirm line numbers**
 
 Run: `sed -n '489,568p' src/node/network/block_import/service.rs`
 Expected: you see the function body unchanged since commit `e3ec8fa`.
 
-- [ ] **Step 6.2: Replace the function body**
+- [x] **Step 6.2: Replace the function body**
 
 In `service.rs`, replace the entire body of `on_new_block_hashes` (from the `for hash_number in hash_numbers { ... }` block through the closing brace of the function) with the new version. The surrounding function signature and doc comment stay the same:
 
@@ -978,7 +978,7 @@ In `service.rs`, replace the entire body of `on_new_block_hashes` (from the `for
     }
 ```
 
-- [ ] **Step 6.3: Add the `resolve_bsc_peer` helper**
+- [x] **Step 6.3: Add the `resolve_bsc_peer` helper**
 
 Inside the same `impl<Provider> ImportService<Provider>` block, add a small helper that mirrors the current peer selection (existing code at `service.rs:528-537`):
 
@@ -996,14 +996,14 @@ Inside the same `impl<Provider> ImportService<Provider>` block, add a small help
     }
 ```
 
-- [ ] **Step 6.4: Drop now-unused imports and the `downloading_blocks` cooldown logic**
+- [x] **Step 6.4: Drop now-unused imports and the `downloading_blocks` cooldown logic**
 
 Because `on_new_block_hashes` no longer uses `downloading_blocks`, `DOWNLOAD_COOLDOWN_DURATION_MS`, or `std::time::SystemTime`, the compiler will emit dead-code warnings. Do NOT delete `downloading_blocks` yet — the `Syncing` arm (rewritten in Task 7) also referenced it. After Task 7, if it's truly unused, Task 8 cleans it up.
 
 For now, run: `cargo check -p reth-bsc --lib 2>&1 | grep -E 'warning|error'`
 Expected: warnings only about `DOWNLOAD_COOLDOWN_DURATION_MS` unused. No errors.
 
-- [ ] **Step 6.5: Commit**
+- [x] **Step 6.5: Commit**
 
 ```bash
 git add src/node/network/block_import/service.rs

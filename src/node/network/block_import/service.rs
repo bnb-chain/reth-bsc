@@ -492,83 +492,87 @@ where
         self.pending_imports.push(payload_fut);
     }
 
-    /// Handle incoming block hashes by using Reth engine-tree download mechanism
+    /// Handle incoming block hashes by spawning fork-aware ancestor recovery
+    /// for any head we do not already have.
     fn on_new_block_hashes(&mut self, hashes: NewBlockHashes, peer_id: PeerId) {
-        let hash_numbers = hashes.0.clone();
-
-        for hash_number in hash_numbers {
-            // Skip if the block is already processed.
+        for hash_number in hashes.0 {
             if self.processed_blocks.contains(&hash_number.hash) {
-                tracing::trace!(target: "bsc::block_import", "Block already processed when requesting block hashes: number = {:?}, hash = {:?}", hash_number.number, hash_number.hash);
                 continue;
             }
             if self.queued_blocks.contains(&hash_number.hash) {
-                tracing::trace!(target: "bsc::block_import", "Block already queued when requesting block hashes: number = {:?}, hash = {:?}", hash_number.number, hash_number.hash);
                 continue;
             }
-
-            // Check if the block is already being downloaded, if it times out, download it again.
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis();
-            if let Some(last_requested) = self.downloading_blocks.get(&hash_number.hash) {
-                if *last_requested + DOWNLOAD_COOLDOWN_DURATION_MS > now {
+            // Concurrent-dedup: one recovery per head at a time.
+            {
+                let mut guard = self.recovering_heads.lock();
+                if guard.contains(&hash_number.hash) {
                     continue;
                 }
+                guard.insert(hash_number.hash);
             }
 
             tracing::debug!(
                 target: "bsc::block_import",
-                peer_id = %peer_id,
+                %peer_id,
                 block_hash = %hash_number.hash,
                 block_number = hash_number.number,
-                "Requesting block download for NewBlockHashes"
+                "Spawning fork recovery for announced head"
             );
 
-            // Try quick range fetch via BSC subprotocol (mimic geth asyncFetchRangeBlocks)
-            // Prefer the announcing peer; if it doesn't have bsc extension, fallback to any bsc peer.
-            let start_height = hash_number.number;
-            let start_hash = hash_number.hash;
-            let announcing_peer = peer_id;
-            // Resolve target bsc peer
-            let target_peer = if crate::node::network::bsc_protocol::registry::has_registered_peer(
-                announcing_peer,
-            ) {
-                Some(announcing_peer)
-            } else {
-                crate::node::network::bsc_protocol::registry::list_registered_peers()
-                    .into_iter()
-                    .next()
-            };
-            // Compute how many blocks to request based on the gap to local tip.
-            let local_tip = self.forkchoice_engine.provider
-                .best_block_number()
-                .unwrap_or(0);
-            let gap = start_height.saturating_sub(local_tip);
-            let count = gap.clamp(1, 64);
-            if let Some(bsc_peer) = target_peer {
-                tracing::debug!(
-                    target: "bsc::block_import",
-                    peer_id = %bsc_peer,
-                    block_hash = %start_hash,
-                    block_number = start_height,
-                    count = count,
-                    "Requesting block range for NewBlockHashes"
+            let peer = self.resolve_bsc_peer(peer_id);
+            let provider = self.forkchoice_engine.provider.clone();
+            let engine = self.engine.clone();
+            let forkchoice_engine = self.forkchoice_engine.clone();
+            let recovering = self.recovering_heads.clone();
+            let head_hash = hash_number.hash;
+            let head_num = hash_number.number;
+
+            tokio::spawn(async move {
+                let _guard = crate::node::network::block_import::fork_recover::RecoveringHeadGuard::new(
+                    head_hash, recovering,
                 );
-                tokio::spawn(async move {
-                    use std::time::Duration;
-                    let req_timeout = Duration::from_secs(5);
-                    let _ = crate::node::network::bsc_protocol::registry::batch_request_range_and_await_import(
-                        bsc_peer,
-                        start_height,
-                        start_hash,
-                        count,
-                        req_timeout,
-                    ).await;
-                });
-            }
-            self.downloading_blocks.insert(hash_number.hash, now);
+                let fetcher = crate::node::network::block_import::fork_recover::BscRangeFetcher;
+                let Some(target) = peer else {
+                    tracing::debug!(
+                        target: "bsc::block_import",
+                        %head_hash,
+                        "No BSC protocol peer available for fork recovery"
+                    );
+                    return;
+                };
+                if let Err(err) =
+                    crate::node::network::block_import::fork_recover::recover_ancestors(
+                        target,
+                        head_hash,
+                        head_num,
+                        provider,
+                        engine,
+                        forkchoice_engine,
+                        &fetcher,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        target: "bsc::block_import",
+                        %head_hash,
+                        head_num,
+                        error = %err,
+                        "Fork recovery failed"
+                    );
+                }
+            });
+        }
+    }
+
+    /// Pick a peer to route `GetBlocksByRange` to. Prefer the announcing peer
+    /// if it speaks the BSC sub-protocol; otherwise any registered BSC peer.
+    fn resolve_bsc_peer(&self, announcer: PeerId) -> Option<PeerId> {
+        if crate::node::network::bsc_protocol::registry::has_registered_peer(announcer) {
+            Some(announcer)
+        } else {
+            crate::node::network::bsc_protocol::registry::list_registered_peers()
+                .into_iter()
+                .next()
         }
     }
 
