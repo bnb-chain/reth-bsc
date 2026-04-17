@@ -5,6 +5,12 @@
 
 use std::time::Duration;
 
+use alloy_primitives::B256;
+use futures::future::BoxFuture;
+use reth_network_api::PeerId;
+
+use crate::BscBlock;
+
 /// Hard cap on how many blocks we will walk back from the peer's announced
 /// head before giving up. ~2 BSC validator turn cycles.
 pub const MAX_FORK_DEPTH: u64 = 256;
@@ -43,4 +49,45 @@ pub enum ForkRecoverError {
 
     #[error("head header {hash} not in provider after recovery")]
     HeadHeaderMissing { hash: alloy_primitives::B256 },
+}
+
+/// Abstraction over `GetBlocksByRange`. Tests substitute a fake; production
+/// forwards to `bsc_protocol::registry::request_blocks_by_range`.
+pub trait RangeFetcher: Send + Sync {
+    /// Fetch up to `count` blocks starting at `(start_num, start_hash)` and
+    /// walking backwards via `parent_hash`. Response is ordered
+    /// **newest -> oldest**.
+    fn fetch<'a>(
+        &'a self,
+        peer: PeerId,
+        start_num: u64,
+        start_hash: B256,
+        count: u64,
+    ) -> BoxFuture<'a, Result<Vec<BscBlock>, String>>;
+}
+
+/// Production fetcher that calls into the BSC sub-protocol registry.
+#[derive(Clone, Default)]
+pub struct BscRangeFetcher;
+
+impl RangeFetcher for BscRangeFetcher {
+    fn fetch<'a>(
+        &'a self,
+        peer: PeerId,
+        start_num: u64,
+        start_hash: B256,
+        count: u64,
+    ) -> BoxFuture<'a, Result<Vec<BscBlock>, String>> {
+        Box::pin(async move {
+            let resp = crate::node::network::bsc_protocol::registry::request_blocks_by_range(
+                peer,
+                start_num,
+                start_hash,
+                count,
+                FETCH_TIMEOUT,
+            )
+            .await?;
+            Ok(resp.blocks)
+        })
+    }
 }
