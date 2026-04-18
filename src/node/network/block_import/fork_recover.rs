@@ -22,8 +22,8 @@ use crate::{
 };
 
 /// Hard cap on how many blocks we will walk back from the peer's announced
-/// head before giving up. ~2 BSC validator turn cycles.
-pub const MAX_FORK_DEPTH: u64 = 256;
+/// head before giving up.
+pub const MAX_FORK_DEPTH: u64 = 2048;
 
 /// Blocks fetched per `GetBlocksByRange` hop. Kept small because BSC blocks
 /// are large (full tx bodies + sidecars); a 64-block response is slow to
@@ -686,7 +686,7 @@ mod tests {
         assert_eq!(fetcher.calls()[1].0, 98, "second hop starts at 99Y.parent_hash num = 98");
     }
 
-    // ---- Spec test #6: fork too deep (depth 257 → ForkTooDeep) ----
+    // ---- Spec test #6: fork too deep (depth MAX_FORK_DEPTH + 1 → ForkTooDeep) ----
     #[tokio::test]
     async fn discover_fork_too_deep() {
         let mut provider = FakeProvider::default();
@@ -695,23 +695,27 @@ mod tests {
             provider.insert_canonical(h.clone());
         }
 
-        // Peer chain: genesis + 300 fork blocks. None of the fork blocks
-        // match canonical (which only has block 0).
-        let (peer, peer_hashes) = linear_chain(1, 300, shared_hashes[0], 0xB);
+        // Peer chain: genesis + (MAX_FORK_DEPTH + FORK_RECOVER_HOP_COUNT) fork
+        // blocks. None match canonical (which only has block 0).
+        let peer_len = MAX_FORK_DEPTH + FORK_RECOVER_HOP_COUNT;
+        let (peer, peer_hashes) = linear_chain(1, peer_len, shared_hashes[0], 0xB);
 
-        // Script: return 4 fork blocks per hop; 64 hops total = 256 blocks
-        // walked. On the 65th iteration the pre-hop check runs with cursor at
-        // (44, peer[43].hash_slow()) — neither in canonical nor as a side
-        // block — and then `walked == MAX_FORK_DEPTH` triggers ForkTooDeep.
+        // Script: return FORK_RECOVER_HOP_COUNT fork blocks per hop; after
+        // `MAX_FORK_DEPTH / FORK_RECOVER_HOP_COUNT` hops, `walked ==
+        // MAX_FORK_DEPTH`, so the next iteration's pre-hop check trips
+        // ForkTooDeep.
         //
-        // `peer` is indexed 0..=299 with peer[idx] at height idx+1. For hop
-        // `i` (0-indexed), the top height served is `300 - 4*i` and the
-        // response covers heights `(top - 3)..=top` in newest→oldest order.
+        // `peer` is indexed `0..=peer_len-1` with peer[idx] at height idx+1.
+        // For hop `i` (0-indexed), the top height served is
+        // `peer_len - FORK_RECOVER_HOP_COUNT * i` and the response covers
+        // heights `(top - FORK_RECOVER_HOP_COUNT + 1)..=top` newest→oldest.
+        let hops = (MAX_FORK_DEPTH / FORK_RECOVER_HOP_COUNT) as usize;
+        let hop = FORK_RECOVER_HOP_COUNT as usize;
+        let peer_len_usize = peer_len as usize;
         let mut responses: Vec<Result<Vec<BscBlock>, String>> = Vec::new();
-        for i in 0..64usize {
-            let top_height = 300 - 4 * i; // e.g. 300, 296, 292, ...
-                                          // Indices of heights (top-3)..=top in `peer`: (top-4)..=(top-1).
-            let slice: Vec<BscBlock> = peer[(top_height - 4)..=(top_height - 1)]
+        for i in 0..hops {
+            let top_height = peer_len_usize - hop * i;
+            let slice: Vec<BscBlock> = peer[(top_height - hop)..=(top_height - 1)]
                 .iter()
                 .cloned()
                 .rev()
@@ -721,12 +725,17 @@ mod tests {
         }
         let fetcher = ScriptedFetcher::new(responses);
 
-        let err =
-            discover_fork_blocks(fake_peer(), peer_hashes[299], 300, &provider, fetcher.as_ref())
-                .await
-                .unwrap_err();
+        let err = discover_fork_blocks(
+            fake_peer(),
+            peer_hashes[peer_len_usize - 1],
+            peer_len,
+            &provider,
+            fetcher.as_ref(),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, ForkRecoverError::ForkTooDeep));
-        assert_eq!(fetcher.calls().len(), 64);
+        assert_eq!(fetcher.calls().len(), hops);
     }
 
     // ---- Spec test #7: head already present as side-chain (short-circuit, empty fork_blocks) ----
