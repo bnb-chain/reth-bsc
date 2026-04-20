@@ -51,7 +51,6 @@ use tracing::{debug, error, info, trace, warn};
 /// Maximum number of recently mined blocks to track for double signing prevention
 const RECENT_MINED_BLOCKS_CACHE_SIZE: usize = 100;
 
-
 #[derive(Clone, Debug)]
 pub struct MiningContext {
     pub header: Option<reth_primitives::Header>, // tmp header for payload building.
@@ -83,14 +82,14 @@ pub struct NewWorkWorker<Provider> {
 
 /// Returns `true` when network conditions allow block production.
 ///
-/// Two gates prevent mining. If either fires, this returns `false` and
-/// emits a `DEBUG` log naming the specific gate so a stuck validator
-/// can be diagnosed from logs alone.
+/// Three early-return paths skip mining — two semantic gates plus a
+/// startup-safety skip. Each emits a `DEBUG` log naming the specific
+/// path so a stuck validator can be diagnosed from logs alone.
 ///
 /// 1. **No connected peers.** Mining while alone produces a fork chain
 ///    that the rest of the network cannot accept back after reconnect:
-///    the peer's pathdb disk layer is pinned at its own tip with no
-///    diff layers retained, so it cannot execute blocks built on an
+///    the remote peer's pathdb disk layer is pinned at its own tip with
+///    no diff layers retained, so it cannot execute blocks built on an
 ///    older common ancestor. See
 ///    `docs/superpowers/specs/2026-04-18-pathdb-gap-fork-livelock-scenario.md`
 ///    for the full scenario analysis.
