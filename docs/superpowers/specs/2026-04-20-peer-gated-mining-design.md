@@ -31,6 +31,7 @@ The mechanism: refuse to mine while the node has no connected peers. In scenario
 - **Does not support fresh-genesis bootstrap** with a single validator. Making it work requires a dedicated bootstrap mode (CLI flag or env var); that is explicitly deferred.
 - **Does not tighten `fork_recover.rs:292`** Phase-2 first-block Syncing semantics. That is a separate, independent improvement.
 - **Does not add new metrics or persistent state.**
+- **Does not gate mining on `NetworkHandle::is_syncing()`.** An earlier draft of this design included that gate, but it caused a cold-start deadlock in `N = 2` qanet where both validators restarted with aligned backends (no backfill target). `is_syncing` is set to `Syncing` at process start (`reth/crates/node/builder/src/launch/engine.rs:165`) and only clears to `Idle` on a `CanonicalChainCommitted` event (`reth/crates/engine/primitives/src/event.rs:40`) — i.e., after a block is committed. With the peer gate also blocking mining, neither validator could ever produce the first block that would clear the flag, and the network stayed frozen at the restart tip indefinitely. The trade-off of removing this gate: during a *real* backfill window the miner may briefly produce blocks on a stale tip; peers will reject those as out-of-date, so the observed cost is wasted work, not a correctness defect. If a future state-layer fix (e.g., pathdb journal) re-opens this question, the gate can be reintroduced behind a fresher signal such as "local tip within K blocks of the best peer head".
 
 ## Design Principles
 
@@ -44,31 +45,33 @@ A single file change, confined to `src/node/miner/bsc_miner.rs`.
 
 ### New function: `is_network_ready_to_mine`
 
-Introduce a free function in the same module that returns `true` when mining is safe to proceed. The function checks three conditions in order and emits a targeted DEBUG log on each skip path, so a stuck validator can be diagnosed from logs alone.
+Introduce a free function in the same module that returns `true` when mining is safe to proceed. The function checks two conditions in order and emits a targeted DEBUG log on each skip path, so a stuck validator can be diagnosed from logs alone.
 
 ```rust
 /// Returns `true` when network conditions allow block production.
 ///
-/// Two gates prevent mining. If either fires, this returns `false` and
-/// emits a `DEBUG` log naming the specific gate so a stuck validator
-/// can be diagnosed from logs alone.
+/// One semantic gate plus a startup-safety skip. Each early-return emits
+/// a `DEBUG` log naming the specific path so a stuck validator can be
+/// diagnosed from logs alone.
 ///
-/// 1. **No connected peers.** Mining while alone produces a fork chain
-///    that the rest of the network cannot accept back after reconnect:
-///    the peer's pathdb disk layer is pinned at its own tip with no
-///    diff layers retained, so it cannot execute blocks built on an
-///    older common ancestor. See
-///    `docs/superpowers/specs/2026-04-18-pathdb-gap-fork-livelock-scenario.md`
-///    for the full scenario analysis.
+/// **No connected peers.** Mining while alone produces a fork chain
+/// that the rest of the network cannot accept back after reconnect:
+/// the remote peer's pathdb disk layer is pinned at its own tip with no
+/// diff layers retained, so it cannot execute blocks built on an older
+/// common ancestor. See
+/// `docs/superpowers/specs/2026-04-18-pathdb-gap-fork-livelock-scenario.md`
+/// for the full scenario analysis.
 ///
-/// 2. **Node is in backfill (`is_syncing`).** Local state is not yet
-///    aligned with the network tip; mining here would also create a
-///    fork, just a less dramatic one.
+/// Intentional limitations:
 ///
-/// Intentional limitation: a fresh-genesis bootstrap where no peers
-/// exist anywhere yet will skip mining forever. Bootstrapping a
-/// brand-new network with this code is **not supported today**;
-/// revisit if/when an explicit bootstrap mode is added.
+/// - A fresh-genesis bootstrap where no peers exist anywhere yet will
+///   skip mining forever. Not supported today.
+/// - This function intentionally does not gate on `is_syncing()`; the
+///   full rationale lives in the Non-Goals section above. In short:
+///   that flag never clears on a cold-start with aligned backends,
+///   and gating on it produced a circular deadlock with the peer
+///   gate. The trade-off is that during a real backfill window the
+///   miner may briefly produce stale blocks that peers reject.
 ///
 /// Also returns `false` (skip) when the network handle is not yet
 /// installed. That window exists briefly at startup; skipping during
@@ -84,21 +87,12 @@ fn is_network_ready_to_mine(tip_number: u64) -> bool {
         return false;
     };
 
+    use reth_network::PeersInfo;
     if network.num_connected_peers() == 0 {
         debug!(
             target: "bsc::miner",
             tip_number,
             "Skip mining: no peers connected"
-        );
-        return false;
-    }
-
-    use reth_network_p2p::sync::SyncStateProvider;
-    if network.is_syncing() {
-        debug!(
-            target: "bsc::miner",
-            tip_number,
-            "Skip mining: node is syncing (backfill active)"
         );
         return false;
     }
@@ -118,7 +112,7 @@ if !crate::shared::is_mining_enabled() {
     return;
 }
 
-// New: peer + backfill guard.
+// New: peer guard.
 if !is_network_ready_to_mine(tip.number()) {
     return;
 }
@@ -137,16 +131,15 @@ The following items become unused after the change and must be deleted:
 
 ### Behaviour matrix
 
-| Network handle | Peer count | `is_syncing()` | Result |
-|----------------|------------|----------------|--------|
-| None (startup) | —          | —              | Skip (new DEBUG: "network handle not yet available") |
-| Some           | 0          | —              | Skip (new DEBUG: "no peers connected") |
-| Some           | ≥1         | true           | Skip (existing DEBUG: "node is syncing (backfill active)") |
-| Some           | ≥1         | false          | **Proceed with mining** |
+| Network handle | Peer count | Result |
+|----------------|------------|--------|
+| None (startup) | —          | Skip (DEBUG: "network handle not yet available") |
+| Some           | 0          | Skip (DEBUG: "no peers connected") |
+| Some           | ≥1         | **Proceed with mining** |
 
-Rows 1 and 2 are new skip paths. Row 3 is existing behaviour. Row 4 is the fast path.
+`is_syncing()` is no longer consulted; see Non-Goals.
 
-Previously, row 3 would eventually self-override after `SYNC_GATE_TIMEOUT_SECS` and emit a WARN and proceed. That override is gone.
+Rows 1 and 2 are skip paths; row 3 is the fast path. Previously the call site also had an `is_syncing()` gate with a 5-second `SYNC_GATE_TIMEOUT_SECS` self-override that emitted a WARN and proceeded; both the gate and the override are gone.
 
 ## Testing Strategy
 
@@ -186,7 +179,6 @@ A future change that modifies the gate conditions in a subtle way should reopen 
 | Log message | Meaning |
 |-------------|---------|
 | `Skip mining: no peers connected` (DEBUG, `bsc::miner`) | Miner is gated on peer count. Expected briefly at startup; persistent ≥60 s indicates the node is isolated. |
-| `Skip mining: node is syncing (backfill active)` (DEBUG, `bsc::miner`) | Backfill in progress, unchanged from before. |
 | `Skip mining: network handle not yet available` (DEBUG, `bsc::miner`) | Startup-transient. Should disappear within seconds of node start. |
 
 ### Alerting
@@ -216,6 +208,6 @@ The matrix makes the scope deliberately narrow. Preserving that narrowness is a 
 
 This design is accepted when:
 
-1. A reviewer can read this doc and the code change together and confirm the three behaviour-matrix rows that currently read "Skip" all correspond to code paths in `is_network_ready_to_mine`, and the one "Proceed" row is the only path that returns `true`.
+1. A reviewer can read this doc and the code change together and confirm the two behaviour-matrix rows that currently read "Skip" all correspond to code paths in `is_network_ready_to_mine`, and the one "Proceed" row is the only path that returns `true`.
 2. Integration test #2 (T0→T5 reproduction) passes on a qanet harness.
 3. The doc comment on `is_network_ready_to_mine` explicitly names the fresh-genesis bootstrap limitation, so a new reader of `bsc_miner.rs` does not have to chase down `docs/superpowers/specs/`.

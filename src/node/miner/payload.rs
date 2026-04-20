@@ -1077,7 +1077,8 @@ async fn fetch_triedb_difflayers(trace_id: u64, parent_hash: alloy_primitives::B
                 trace_id,
                 %parent_hash,
                 error = %e,
-                "Failed to fetch parent difflayers; triedb state root falls back to full trie traversal"
+                "Failed to fetch parent difflayers; triedb state root falls back to full trie traversal \
+                 (typically only seen shortly after node startup, before difflayers for recent blocks have been cached)"
             );
             None
         }
