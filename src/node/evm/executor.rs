@@ -33,7 +33,33 @@ use tracing::{error, warn, info, debug, trace};
 use alloy_eips::eip2935::{HISTORY_STORAGE_ADDRESS, HISTORY_STORAGE_CODE};
 use alloy_primitives::keccak256;
 use std::{collections::HashMap, sync::Arc};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 use crate::consensus::parlia::SnapshotProvider;
+
+/// Process-global per-tx sub-step timing accumulators.
+/// Units are nanoseconds. Snapshot + delta in miner's build_payload to get per-block breakdown.
+static TX_PRE_EXEC_NS: AtomicU64 = AtomicU64::new(0);
+static TX_EVM_TRANSACT_NS: AtomicU64 = AtomicU64::new(0);
+static TX_STATE_CLONE_NS: AtomicU64 = AtomicU64::new(0);
+static TX_PREFETCHER_HOOK_NS: AtomicU64 = AtomicU64::new(0);
+static TX_RECEIPT_BUILD_NS: AtomicU64 = AtomicU64::new(0);
+static TX_COMMIT_NS: AtomicU64 = AtomicU64::new(0);
+static TX_EXEC_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot per-tx sub-step counters. Returns in order:
+/// (pre_exec, evm_transact, state_clone, prefetcher_hook, receipt_build, commit, count).
+pub fn tx_exec_counter_snapshot() -> (u64, u64, u64, u64, u64, u64, u64) {
+    (
+        TX_PRE_EXEC_NS.load(Ordering::Relaxed),
+        TX_EVM_TRANSACT_NS.load(Ordering::Relaxed),
+        TX_STATE_CLONE_NS.load(Ordering::Relaxed),
+        TX_PREFETCHER_HOOK_NS.load(Ordering::Relaxed),
+        TX_RECEIPT_BUILD_NS.load(Ordering::Relaxed),
+        TX_COMMIT_NS.load(Ordering::Relaxed),
+        TX_EXEC_COUNT.load(Ordering::Relaxed),
+    )
+}
 /// Helper type for the input of post execution.
 #[allow(clippy::type_complexity)]
 #[derive(Debug, Clone)]
@@ -499,6 +525,8 @@ where
         tx: impl ExecutableTx<Self>,
         f: impl FnOnce(&ExecutionResult<<Self::Evm as Evm>::HaltReason>) -> CommitChanges,
     ) -> Result<Option<u64>, BlockExecutionError> {
+        let pre_exec_start = Instant::now();
+
         // The sum of the transaction's gas limit, Tg, and the gas utilized in this block prior,
         // must be no greater than the block's gasLimit.
         let block_available_gas = self.evm.block().gas_limit() - self.gas_used;
@@ -543,20 +571,29 @@ where
         }
         let _precompile_trace_pop_guard = PrecompileTracePopGuard;
 
+        TX_PRE_EXEC_NS.fetch_add(pre_exec_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+
         // Execute transaction.
+        let evm_transact_start = Instant::now();
         let ResultAndState { result, state } = self
             .evm
             .transact(&tx)
             .map_err(|err| BlockExecutionError::evm(err, tx_hash))?;
+        TX_EVM_TRANSACT_NS.fetch_add(evm_transact_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
         if !f(&result).should_commit() {
             return Ok(None);
         }
 
+        let state_clone_start = Instant::now();
         let mut temp_state = state.clone();
         temp_state.remove(&SYSTEM_ADDRESS);
+        TX_STATE_CLONE_NS.fetch_add(state_clone_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+
+        let prefetcher_hook_start = Instant::now();
         self.system_caller
             .on_state(StateChangeSource::Transaction(self.receipts.len()), &temp_state);
+        TX_PREFETCHER_HOOK_NS.fetch_add(prefetcher_hook_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
         let gas_used = result.gas_used();
 
@@ -565,6 +602,7 @@ where
         self.accumulate_blob_gas_used(tx.tx());
 
         // Push transaction changeset and calculate header bloom filter for receipt.
+        let receipt_build_start = Instant::now();
         self.receipts.push(self.receipt_builder.build_receipt(ReceiptBuilderCtx {
             tx: tx.tx(),
             evm: &self.evm,
@@ -572,9 +610,14 @@ where
             state: &state,
             cumulative_gas_used: self.gas_used,
         }));
+        TX_RECEIPT_BUILD_NS.fetch_add(receipt_build_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
         // Commit the state changes.
+        let commit_start = Instant::now();
         self.evm.db_mut().commit(state);
+        TX_COMMIT_NS.fetch_add(commit_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+
+        TX_EXEC_COUNT.fetch_add(1, Ordering::Relaxed);
 
         Ok(Some(gas_used))
     }
