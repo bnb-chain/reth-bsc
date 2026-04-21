@@ -12,7 +12,7 @@ use crate::{
 use alloy_consensus::{BlockBody, Header};
 use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::{B256, U128};
-use alloy_rpc_types::engine::PayloadStatusEnum;
+use alloy_rpc_types::engine::{ForkchoiceState, PayloadStatusEnum};
 use futures::{future::Either, stream::FuturesUnordered, StreamExt};
 use parking_lot::RwLock;
 use reth::consensus::HeaderValidator;
@@ -32,7 +32,7 @@ use reth_network::{
 use reth_network_api::{PeerId, Peers, ReputationChangeKind};
 use reth_node_ethereum::EthEngineTypes;
 use reth_payload_builder_primitives::Events;
-use reth_payload_primitives::{BuiltPayload, PayloadTypes};
+use reth_payload_primitives::{BuiltPayload, EngineApiMessageVersion, PayloadTypes};
 use reth_primitives::NodePrimitives;
 use reth_primitives_traits::{AlloyBlockHeader, Block};
 use reth_provider::{BlockHashReader, BlockNumReader, BlockReaderIdExt, HeaderProvider};
@@ -67,6 +67,19 @@ pub(crate) type IncomingHashes = (NewBlockHashes, PeerId);
 
 /// Size of the LRU cache for processed blocks.
 const LRU_PROCESSED_BLOCKS_SIZE: u32 = 100;
+
+/// Announcements whose height exceeds the local canonical tip by more than
+/// this many blocks are routed to the staged backfill pipeline (via a
+/// synthesized FCU) instead of `fork_recover`.
+///
+/// Matches `fork_recover::MAX_FORK_DEPTH`: at or below that cap, `fork_recover`
+/// can reach a common ancestor and resolve the reorg itself; beyond it, the
+/// ancestor walk must fail (`ForkTooDeep`), so we skip the doomed attempt and
+/// hand off to the pipeline via engine-tree's optimistic-sync branch.
+///
+/// See `docs/superpowers/specs/2026-04-21-far-behind-pipeline-trigger-design.md`.
+const PIPELINE_TRIGGER_DELTA: u64 =
+    crate::node::network::block_import::fork_recover::MAX_FORK_DEPTH;
 
 /// A service that handles bidirectional block import communication with the network.
 /// It receives new blocks from the network via `from_network` channel and sends back
@@ -109,15 +122,19 @@ fn resolve_bsc_peer_static(announcer: PeerId) -> Option<PeerId> {
     if crate::node::network::bsc_protocol::registry::has_registered_peer(announcer) {
         Some(announcer)
     } else {
-        crate::node::network::bsc_protocol::registry::list_registered_peers()
-            .into_iter()
-            .next()
+        crate::node::network::bsc_protocol::registry::list_registered_peers().into_iter().next()
     }
 }
 
 impl<Provider> ImportService<Provider>
 where
-    Provider: BlockNumReader + BlockHashReader + HeaderProvider<Header = Header> + Clone + Send + Sync + 'static,
+    Provider: BlockNumReader
+        + BlockHashReader
+        + HeaderProvider<Header = Header>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
 {
     /// Create a new block import service
     pub fn new(
@@ -145,9 +162,10 @@ where
             pending_imports: FuturesUnordered::new(),
             processed_blocks: LruCache::new(LRU_PROCESSED_BLOCKS_SIZE),
             queued_blocks: LruCache::new(LRU_PROCESSED_BLOCKS_SIZE),
-            recovering_heads: crate::node::network::block_import::fork_recover::new_recovering_heads(
-                LRU_PROCESSED_BLOCKS_SIZE,
-            ),
+            recovering_heads:
+                crate::node::network::block_import::fork_recover::new_recovering_heads(
+                    LRU_PROCESSED_BLOCKS_SIZE,
+                ),
             failed_heads: crate::node::network::block_import::fork_recover::new_failed_heads_cooler(
                 LRU_PROCESSED_BLOCKS_SIZE,
             ),
@@ -190,7 +208,7 @@ where
                         .into(),
                     )),
                 }
-                .into()
+                .into();
             }
 
             let sealed_block = block.block.0.block.clone().seal_unchecked(block_hash);
@@ -279,8 +297,11 @@ where
                             let _guard = crate::node::network::block_import::fork_recover::RecoveringHeadGuard::new(
                                 block_hash, recovering,
                             );
-                            let fetcher = crate::node::network::block_import::fork_recover::BscRangeFetcher;
-                            let Some(target) = peer else { return; };
+                            let fetcher =
+                                crate::node::network::block_import::fork_recover::BscRangeFetcher;
+                            let Some(target) = peer else {
+                                return;
+                            };
                             if let Err(err) =
                                 crate::node::network::block_import::fork_recover::recover_ancestors(
                                     target,
@@ -369,7 +390,9 @@ where
                         block_hash = %block_hash,
                         "Inserting mined block into engine tree"
                     );
-                    if let Err(e) = engine_tx.send(EngineApiRequest::InsertExecutedBlock(executed_block)) {
+                    if let Err(e) =
+                        engine_tx.send(EngineApiRequest::InsertExecutedBlock(executed_block))
+                    {
                         tracing::warn!(
                             target: "bsc::block_import",
                             block_number = %header_for_fcu.number,
@@ -485,8 +508,23 @@ where
     }
 
     /// Handle incoming block hashes by spawning fork-aware ancestor recovery
-    /// for any head we do not already have.
+    /// for any head we do not already have. Announcements whose height exceeds
+    /// the local tip by more than `PIPELINE_TRIGGER_DELTA` are instead routed
+    /// to the staged backfill pipeline via a synthesized FCU — `fork_recover`
+    /// cannot close gaps that deep.
     fn on_new_block_hashes(&mut self, hashes: NewBlockHashes, peer_id: PeerId) {
+        let local_tip = match self.forkchoice_engine.provider.best_block_number() {
+            Ok(tip) => tip,
+            Err(err) => {
+                tracing::warn!(
+                    target: "bsc::block_import",
+                    error = %err,
+                    "Failed to read local best_block_number; skipping hash announcements"
+                );
+                return;
+            }
+        };
+
         for hash_number in hashes.0 {
             if self.processed_blocks.contains(&hash_number.hash) {
                 continue;
@@ -503,6 +541,26 @@ where
                 );
                 continue;
             }
+
+            let delta = hash_number.number.saturating_sub(local_tip);
+            if delta > PIPELINE_TRIGGER_DELTA {
+                // Far-behind: fork_recover's 2048-ancestor walk cannot close
+                // this gap. Mark processed so subsequent announcements of the
+                // same head are deduped, then synthesize an FCU. Engine-tree's
+                // optimistic-sync branch treats `head_block_hash` as a
+                // backfill target when `finalized_block_hash` is zero (BSC has
+                // no CL to supply one).
+                self.processed_blocks.insert(hash_number.hash);
+                self.spawn_pipeline_trigger_fcu(
+                    peer_id,
+                    hash_number.hash,
+                    hash_number.number,
+                    local_tip,
+                    delta,
+                );
+                continue;
+            }
+
             // Concurrent-dedup: one recovery per head at a time.
             {
                 let mut guard = self.recovering_heads.lock();
@@ -530,9 +588,10 @@ where
             let head_num = hash_number.number;
 
             tokio::spawn(async move {
-                let _guard = crate::node::network::block_import::fork_recover::RecoveringHeadGuard::new(
-                    head_hash, recovering,
-                );
+                let _guard =
+                    crate::node::network::block_import::fork_recover::RecoveringHeadGuard::new(
+                        head_hash, recovering,
+                    );
                 let fetcher = crate::node::network::block_import::fork_recover::BscRangeFetcher;
                 let Some(target) = peer else {
                     tracing::debug!(
@@ -573,28 +632,78 @@ where
         resolve_bsc_peer_static(announcer)
     }
 
+    /// Synthesize a `forkchoiceUpdated` call targeting the announced peer head
+    /// so engine-tree's optimistic-sync branch can start the staged backfill
+    /// pipeline. Used for announcements whose gap exceeds
+    /// `PIPELINE_TRIGGER_DELTA`, where `fork_recover` cannot help.
+    fn spawn_pipeline_trigger_fcu(
+        &self,
+        peer_id: PeerId,
+        head_hash: B256,
+        head_num: u64,
+        local_tip: u64,
+        delta: u64,
+    ) {
+        let engine = self.engine.clone();
+        tracing::info!(
+            target: "bsc::block_import",
+            %peer_id,
+            %head_hash,
+            head_num,
+            local_tip,
+            delta,
+            "Far-behind gap detected; dispatching pipeline-trigger FCU"
+        );
+        tokio::spawn(async move {
+            let state = ForkchoiceState {
+                head_block_hash: head_hash,
+                safe_block_hash: B256::ZERO,
+                finalized_block_hash: B256::ZERO,
+            };
+            match engine.fork_choice_updated(state, None, EngineApiMessageVersion::V1).await {
+                Ok(ret) => tracing::info!(
+                    target: "bsc::block_import",
+                    %head_hash,
+                    head_num,
+                    status = ?ret.payload_status.status,
+                    "Pipeline-trigger FCU dispatched"
+                ),
+                Err(err) => tracing::warn!(
+                    target: "bsc::block_import",
+                    %head_hash,
+                    head_num,
+                    error = %err,
+                    "Pipeline-trigger FCU failed"
+                ),
+            }
+        });
+    }
+
     /// Transfer the block to EVN peers if from proxied validators or validator address.
     fn transfer_to_evn_peers(&self, block: BlockMsg) -> Result<(), Box<dyn std::error::Error>> {
-        let mining_config = crate::node::miner::config::get_global_mining_config().ok_or("Mining config is not set")?;
-        let cfg = crate::node::network::evn::get_global_evn_config().ok_or("EVN config is not set")?;
+        let mining_config = crate::node::miner::config::get_global_mining_config()
+            .ok_or("Mining config is not set")?;
+        let cfg =
+            crate::node::network::evn::get_global_evn_config().ok_or("EVN config is not set")?;
         if !cfg.enabled {
             return Ok(());
         }
         let header_ref = &block.block.0.block.header;
         let coinbase = header_ref.beneficiary;
         // If from proxied validators or validator address, target EVN peers with ETH NewBlockHashes.
-        if cfg.proxyed_validators.contains(&coinbase) || (mining_config.enabled && mining_config.validator_address.unwrap_or_default() == coinbase) {
+        if cfg.proxyed_validators.contains(&coinbase)
+            || (mining_config.enabled
+                && mining_config.validator_address.unwrap_or_default() == coinbase)
+        {
             if let Some(net) = crate::shared::get_network_handle() {
                 let peers = crate::node::network::evn_peers::snapshot();
                 for (peer_id, info) in peers {
                     // Send to EVN peers or proxyed peers
-                    let is_proxyed = crate::node::network::bsc_protocol::registry::is_proxyed_peer(&peer_id);
+                    let is_proxyed =
+                        crate::node::network::bsc_protocol::registry::is_proxyed_peer(&peer_id);
                     if info.is_evn || is_proxyed {
                         // Send full NewBlock to EVN/proxyed peers to avoid re-fetching.
-                        net.send_eth_message(
-                            peer_id,
-                            PeerMessage::NewBlock(block.clone()),
-                        );
+                        net.send_eth_message(peer_id, PeerMessage::NewBlock(block.clone()));
                         tracing::debug!(target: "bsc::block_import", "Sent full NewBlock to EVN/proxyed peer: number = {:?}, hash = {:?}, peer = {:?}", block.block.0.block.header.number, block.hash, peer_id);
                     }
                 }
@@ -700,10 +809,7 @@ where
 /// A peer with `best_number = None` (head not yet observed) is announced to:
 /// there's no evidence it is ahead, and the worst case is the peer ignores the
 /// hint.
-fn plan_head_announcements(
-    local_head: u64,
-    peers: &[(PeerId, Option<u64>)],
-) -> Vec<PeerId> {
+fn plan_head_announcements(local_head: u64, peers: &[(PeerId, Option<u64>)]) -> Vec<PeerId> {
     const MAX_STALE_BLOCK_DISTANCE: u64 = 64;
     peers
         .iter()
@@ -827,7 +933,10 @@ mod tests {
         let mut fixture = TestFixture::new(EngineResponses::invalid_new_payload()).await;
         fixture
             .assert_block_import(|outcome| {
-                matches!(outcome, BlockImportEvent::Announcement(BlockValidation::ValidHeader { .. }))
+                matches!(
+                    outcome,
+                    BlockImportEvent::Announcement(BlockValidation::ValidHeader { .. })
+                )
             })
             .await;
 
@@ -1225,6 +1334,143 @@ mod tests {
         }));
     }
 
+    /// Spawn an `ImportService` with `MockProvider::best_block_number = local_tip`
+    /// and an engine handler that forwards every observed `ForkchoiceState`
+    /// into the returned channel, and every `NewPayload` into the other.
+    /// Replies Valid to both kinds of message so the service doesn't block.
+    async fn spawn_service_with_tip(
+        local_tip: u64,
+    ) -> (ImportHandle, mpsc::UnboundedReceiver<ForkchoiceState>, mpsc::UnboundedReceiver<()>) {
+        let mut provider = MockProvider::new();
+        let header = Header { number: local_tip, ..Default::default() };
+        provider.insert(header, U256::from(1));
+        let chain_spec =
+            Arc::new(crate::chainspec::BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet()));
+
+        let (to_engine, mut from_engine) = mpsc::unbounded_channel();
+        let engine_handle = ConsensusEngineHandle::new(to_engine);
+
+        let (fcu_tx, fcu_rx) = mpsc::unbounded_channel();
+        let (np_tx, np_rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(message) = from_engine.recv().await {
+                match message {
+                    BeaconEngineMessage::NewPayload { payload: _, tx } => {
+                        let _ = np_tx.send(());
+                        let _ = tx.send(Ok(PayloadStatus::new(PayloadStatusEnum::Valid, None)));
+                    }
+                    BeaconEngineMessage::ForkchoiceUpdated {
+                        state,
+                        payload_attrs: _,
+                        version: _,
+                        tx,
+                    } => {
+                        let _ = fcu_tx.send(state);
+                        let _ = tx.send(Ok(OnForkChoiceUpdated::valid(PayloadStatus::new(
+                            PayloadStatusEnum::Valid,
+                            None,
+                        ))));
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let (to_import, from_network) = mpsc::unbounded_channel();
+        let (_to_import_mined, from_builder) = mpsc::unbounded_channel();
+        let (to_hashes, from_hashes) = mpsc::unbounded_channel();
+        let (to_network, import_outcome) = mpsc::unbounded_channel();
+        let handle = ImportHandle::new(to_import, to_hashes, import_outcome);
+
+        let service = ImportService::new(
+            provider,
+            chain_spec,
+            engine_handle,
+            from_network,
+            from_builder,
+            from_hashes,
+            to_network,
+        );
+        tokio::spawn(Box::pin(async move {
+            service.await.unwrap();
+        }));
+
+        (handle, fcu_rx, np_rx)
+    }
+
+    /// Try to receive a FCU from the observation channel within `timeout`.
+    async fn recv_fcu_within(
+        fcu_rx: &mut mpsc::UnboundedReceiver<ForkchoiceState>,
+        timeout: tokio::time::Duration,
+    ) -> Option<ForkchoiceState> {
+        tokio::time::timeout(timeout, fcu_rx.recv()).await.ok().flatten()
+    }
+
+    #[tokio::test]
+    async fn routes_far_behind_announcement_to_pipeline_fcu() {
+        // Local tip = 100. Announce a head whose gap exceeds the threshold by
+        // one. Expect the engine to see exactly one FCU with the announced
+        // hash as `head_block_hash` and zeroed safe/finalized.
+        let (handle, mut fcu_rx, _np_rx) = spawn_service_with_tip(100).await;
+
+        let head_hash = B256::from([0xAA; 32]);
+        let head_num = 100 + PIPELINE_TRIGGER_DELTA + 1;
+        let hashes = NewBlockHashes(vec![BlockHashNumber { hash: head_hash, number: head_num }]);
+        handle.send_hashes(hashes, PeerId::random()).unwrap();
+
+        let fcu = recv_fcu_within(&mut fcu_rx, tokio::time::Duration::from_millis(500))
+            .await
+            .expect("expected a pipeline-trigger FCU");
+        assert_eq!(fcu.head_block_hash, head_hash);
+        assert_eq!(fcu.safe_block_hash, B256::ZERO);
+        assert_eq!(fcu.finalized_block_hash, B256::ZERO);
+    }
+
+    #[tokio::test]
+    async fn routes_at_threshold_to_fork_recover_not_pipeline() {
+        // Equality case: gap == PIPELINE_TRIGGER_DELTA (2048). Threshold is a
+        // strict `>`, so this announcement must NOT dispatch an FCU — it goes
+        // to fork_recover (which will itself no-op here since the MockProvider
+        // has no BSC peer and no ancestry, but we only assert absence of FCU).
+        let (handle, mut fcu_rx, _np_rx) = spawn_service_with_tip(100).await;
+
+        let head_hash = B256::from([0xBB; 32]);
+        let head_num = 100 + PIPELINE_TRIGGER_DELTA;
+        let hashes = NewBlockHashes(vec![BlockHashNumber { hash: head_hash, number: head_num }]);
+        handle.send_hashes(hashes, PeerId::random()).unwrap();
+
+        assert!(
+            recv_fcu_within(&mut fcu_rx, tokio::time::Duration::from_millis(200)).await.is_none(),
+            "announcement at the exact threshold must not dispatch an FCU"
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_fcu_deduped_by_processed_blocks_cache() {
+        // Same head announced twice from two peers should dispatch exactly
+        // one FCU — the Option-A concurrency policy relies on
+        // `processed_blocks.insert(..)` right before spawning the FCU.
+        let (handle, mut fcu_rx, _np_rx) = spawn_service_with_tip(100).await;
+
+        let head_hash = B256::from([0xCC; 32]);
+        let head_num = 100 + PIPELINE_TRIGGER_DELTA + 10;
+        let hashes = NewBlockHashes(vec![BlockHashNumber { hash: head_hash, number: head_num }]);
+
+        handle.send_hashes(hashes.clone(), PeerId::random()).unwrap();
+        // Let the first FCU be dispatched and recorded.
+        let first = recv_fcu_within(&mut fcu_rx, tokio::time::Duration::from_millis(500))
+            .await
+            .expect("expected one FCU");
+        assert_eq!(first.head_block_hash, head_hash);
+
+        // Re-announce the same head. Must be deduped.
+        handle.send_hashes(hashes, PeerId::random()).unwrap();
+        assert!(
+            recv_fcu_within(&mut fcu_rx, tokio::time::Duration::from_millis(200)).await.is_none(),
+            "duplicate head announcement must not dispatch a second FCU"
+        );
+    }
+
     fn peer(tag: u8, best_number: Option<u64>) -> (PeerId, Option<u64>) {
         // `PeerId` is `alloy_primitives::B512`. Build a deterministic 64-byte
         // value from the tag via the `From<[u8; 64]>` impl.
@@ -1269,11 +1515,12 @@ mod tests {
     #[test]
     fn planner_mixes_skip_and_announce_across_peers() {
         let local = 1000;
-        let p_ahead = peer(1, Some(local + 65));   // skipped
+        let p_ahead = peer(1, Some(local + 65)); // skipped
         let p_at_boundary = peer(2, Some(local + 64)); // announced
-        let p_behind = peer(3, Some(local - 10));  // announced
-        let p_unknown = peer(4, None);             // announced
-        let peers = vec![p_ahead.clone(), p_at_boundary.clone(), p_behind.clone(), p_unknown.clone()];
+        let p_behind = peer(3, Some(local - 10)); // announced
+        let p_unknown = peer(4, None); // announced
+        let peers =
+            vec![p_ahead.clone(), p_at_boundary.clone(), p_behind.clone(), p_unknown.clone()];
         let result = plan_head_announcements(local, &peers);
         assert_eq!(result.len(), 3);
         assert!(result.contains(&p_at_boundary.0));
