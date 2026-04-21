@@ -152,21 +152,8 @@ where
     // mix_hash from BlockEnv.prevrandao (which is the difficulty value for EVM
     // execution). BSC encodes the millisecond timestamp part in mix_hash post-Lorentz,
     // or uses B256::ZERO pre-Lorentz.
-    //
-    // IMPORTANT: we must keep `new_header.timestamp` (seconds) in sync with the
-    // `millisecond_timestamp` we compute here, because `calculate_millisecond_timestamp`
-    // on the verifier side reconstructs the block time as `seconds * 1000 + ms_part`.
-    // If we only overwrite the ms part in mix_hash without also writing the seconds
-    // part back into `timestamp`, and this call returns a different value than the one
-    // produced earlier by `prepare_timestamp` (because wall-clock advanced past a
-    // `MILLISECONDS_UNIT` boundary during payload building), the resulting block time
-    // can drift by up to one `MILLISECONDS_UNIT` and fall below
-    // `parent_ts + block_interval + back_off_time`, causing other validators to reject
-    // the block with "proposer is in the backoff period". This mirrors the logic in
-    // `Parlia::prepare_timestamp` which also writes both fields atomically.
     let millisecond_timestamp =
         parlia.block_time_for_ramanujan_fork(parent_snap, parent_header, new_header);
-    new_header.timestamp = millisecond_timestamp / 1000;
     if parlia.spec.is_lorentz_active_at_timestamp(new_header.number, new_header.timestamp) {
         set_millisecond_part_of_timestamp(millisecond_timestamp, new_header);
     } else {
