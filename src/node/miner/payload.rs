@@ -1228,8 +1228,26 @@ where
                 trace_id = self.trace_id,
                 block_number = self.build_args.config.parent_header.number() + 1,
                 wait_ms = initial_wait.as_millis(),
-                "Applying out-of-turn backoff before starting payload build"
+                "Applying out-of-turn backoff; starting speculative build to warm TrieDB prefetcher"
             );
+
+            // Kick off a speculative build before sleeping so the TrieDB prefetcher
+            // can warm the storage slots state-root will need. Without this the
+            // prefetcher only starts after the backoff ends, leaving ~one slot for
+            // both cache warm-up and state-root computation over thousands of txs —
+            // which repeatedly times out and degrades the block to EmptyFallback.
+            // The spawned build's result is picked up by the outer loop's
+            // join_next() branch, so the try_build_tx kickoff below is skipped when
+            // a speculative build is already in flight.
+            self.retries += 1;
+            start_time = std::time::Instant::now();
+            {
+                let builder = self.builder.clone();
+                let build_args = self.build_args.clone();
+                self.join_handle
+                    .spawn(async move { builder.build_payload(build_args).await });
+            }
+
             tokio::select! {
                 _ = tokio::time::sleep(initial_wait) => {}
                 _ = &mut self.abort_rx => {
@@ -1245,16 +1263,20 @@ where
         // after the wait completes.
         self.job_start_time = std::time::Instant::now();
 
-        if let Err(err) = self.try_build_tx.send(()) {
-            warn!(
-                target: "bsc::miner::payload",
-                trace_id = self.trace_id,
-                block_number = self.build_args.config.parent_header.number() + 1,
-                is_inturn = self.mining_ctx.is_inturn,
-                error = %err,
-                "Failed to send to first try build queue"
-            );
-            return Err(Box::new(BscPayloadJobError::BuildQueueSendError(err.to_string())));
+        // Skip the normal first-build kickoff if a speculative build from the
+        // out-of-turn backoff is already running or has completed into the JoinSet.
+        if self.join_handle.is_empty() {
+            if let Err(err) = self.try_build_tx.send(()) {
+                warn!(
+                    target: "bsc::miner::payload",
+                    trace_id = self.trace_id,
+                    block_number = self.build_args.config.parent_header.number() + 1,
+                    is_inturn = self.mining_ctx.is_inturn,
+                    error = %err,
+                    "Failed to send to first try build queue"
+                );
+                return Err(Box::new(BscPayloadJobError::BuildQueueSendError(err.to_string())));
+            }
         }
 
         loop {
