@@ -2152,6 +2152,7 @@ where
             self.parlia.clone(),
             &self.mining_ctx.parent_snapshot,
             &self.mining_ctx.parent_header,
+            self.mining_ctx.planned_block_ts_ms,
         )
         .map_err(|e| {
             warn!(
@@ -2215,6 +2216,7 @@ fn finalize_payload(
     parlia: Arc<Parlia<BscChainSpec>>,
     parent_snapshot: &Snapshot,
     parent_header: &SealedHeader<alloy_consensus::Header>,
+    planned_block_ts_ms: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let snapshot_provider = crate::shared::get_snapshot_provider()
         .cloned()
@@ -2227,11 +2229,18 @@ fn finalize_payload(
     let mut existing_sidecars = payload.block.clone_block().body.sidecars;
     let mut plain_block = payload.executed_block.recovered_block.sealed_block().clone_block();
 
-    finalize_new_header(parlia, parent_snapshot, parent_header, &mut plain_block.header, &snapshot_provider)
-        .map_err(|e| {
-            Box::new(std::io::Error::other(e.to_string()))
-                as Box<dyn std::error::Error + Send + Sync>
-        })?;
+    finalize_new_header(
+        parlia,
+        parent_snapshot,
+        parent_header,
+        &mut plain_block.header,
+        &snapshot_provider,
+        planned_block_ts_ms,
+    )
+    .map_err(|e| {
+        Box::new(std::io::Error::other(e.to_string()))
+            as Box<dyn std::error::Error + Send + Sync>
+    })?;
 
     let final_hash = plain_block.header.hash_slow();
     if let Some((validators, vote_addresses)) = payload.pending_validators.take() {
@@ -2338,6 +2347,7 @@ mod tests {
             parent_snapshot: Arc::new(snapshot),
             is_inturn,
             cached_reads: None,
+            planned_block_ts_ms: now_ms + delay_ms,
         }
     }
 
