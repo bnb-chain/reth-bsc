@@ -68,6 +68,13 @@ pub struct MiningContext {
     pub parent_snapshot: Arc<crate::consensus::parlia::snapshot::Snapshot>,
     pub is_inturn: bool,
     pub cached_reads: Option<reth_revm::cached::CachedReads>,
+    /// Millisecond timestamp fixed by `prepare_timestamp` for this block. `finalize_new_header`
+    /// uses this cached value instead of re-running `block_time_for_ramanujan_fork` — the
+    /// recomputation at sealing time can fall into the wall-clock ceiling branch, cross a
+    /// second boundary, and desync `header.timestamp` (seconds) from the mix_hash ms, producing
+    /// a header that fails `block_time_verify_for_ramanujan_fork` on every peer.
+    /// Populated by `prepare_new_attributes`.
+    pub planned_block_ts_ms: u64,
 }
 
 #[derive(Clone)]
@@ -541,6 +548,8 @@ where
             parent_snapshot: Arc::new(parent_snapshot),
             is_inturn,
             cached_reads: self.maybe_pre_cached(parent_hash),
+            // Populated by prepare_new_attributes once the payload job starts.
+            planned_block_ts_ms: 0,
         };
 
         debug!("Queuing mining context, next_block: {}", tip.number() + 1);
