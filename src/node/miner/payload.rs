@@ -486,6 +486,8 @@ where
         let exec_start = std::time::Instant::now();
         // Everything before `exec_start` is treated as "prepare" time for this payload attempt.
         let prepare_duration = exec_start.duration_since(build_start);
+        // Snapshot per-tx sub-step counters to compute the per-block delta after the loop.
+        let tx_counters_before = crate::node::evm::executor::tx_exec_counter_snapshot();
         while let Some(pool_tx) = best_tx_list.next() {
             if cancel.is_cancelled() {
                 break;
@@ -745,6 +747,39 @@ where
         }
         let exec_duration = exec_start.elapsed();
 
+        // Per-tx sub-step breakdown for this block (delta between the snapshots we
+        // took around the tx loop). Let the analysis script correlate by block_number.
+        let tx_counters_after = crate::node::evm::executor::tx_exec_counter_snapshot();
+        let dx_count = tx_counters_after.6.saturating_sub(tx_counters_before.6);
+        if dx_count > 0 {
+            let d_pre_exec_ns = tx_counters_after.0.saturating_sub(tx_counters_before.0);
+            let d_evm_transact_ns = tx_counters_after.1.saturating_sub(tx_counters_before.1);
+            let d_state_clone_ns = tx_counters_after.2.saturating_sub(tx_counters_before.2);
+            let d_pref_hook_ns = tx_counters_after.3.saturating_sub(tx_counters_before.3);
+            let d_receipt_ns = tx_counters_after.4.saturating_sub(tx_counters_before.4);
+            let d_commit_ns = tx_counters_after.5.saturating_sub(tx_counters_before.5);
+            let avg_per_tx_us = |ns: u64| (ns / dx_count).saturating_div(1_000);
+            debug!(
+                target: "bsc::builder::timing",
+                block_number = parent_header.number + 1,
+                tx_count = dx_count,
+                exec_duration_ms = exec_duration.as_millis(),
+                avg_pre_exec_us = avg_per_tx_us(d_pre_exec_ns),
+                avg_evm_transact_us = avg_per_tx_us(d_evm_transact_ns),
+                avg_state_clone_us = avg_per_tx_us(d_state_clone_ns),
+                avg_prefetcher_hook_us = avg_per_tx_us(d_pref_hook_ns),
+                avg_receipt_build_us = avg_per_tx_us(d_receipt_ns),
+                avg_commit_us = avg_per_tx_us(d_commit_ns),
+                total_pre_exec_ms = d_pre_exec_ns / 1_000_000,
+                total_evm_transact_ms = d_evm_transact_ns / 1_000_000,
+                total_state_clone_ms = d_state_clone_ns / 1_000_000,
+                total_prefetcher_hook_ms = d_pref_hook_ns / 1_000_000,
+                total_receipt_build_ms = d_receipt_ns / 1_000_000,
+                total_commit_ms = d_commit_ns / 1_000_000,
+                "per-tx exec breakdown"
+            );
+        }
+
         // add system txs to payload.
         let finalize_start = std::time::Instant::now();
         let out = builder.finish_with_difflayer(&state_provider)?;
@@ -783,6 +818,27 @@ where
             build_duration_ms = build_duration.as_millis(),
             avg_tx_duration_micros,
             "Block payload built successfully"
+        );
+
+        // P-2: how close did this block come to the 450ms slot budget?
+        // overrun_ms > 0 means we blew past the budget — the analysis script
+        // turns these into stage-level "% of blocks over budget" stats.
+        const BSC_BLOCK_BUDGET_MS: u128 = 450;
+        let build_ms = build_duration.as_millis();
+        let overrun_ms = build_ms.saturating_sub(BSC_BLOCK_BUDGET_MS);
+        let deadline_used_pct = build_ms * 100 / BSC_BLOCK_BUDGET_MS;
+        debug!(
+            target: "bsc::builder::deadline",
+            block_number = sealed_block.number(),
+            tx_count = transactions.len(),
+            build_duration_ms = build_ms,
+            prepare_duration_ms = prepare_duration.as_millis(),
+            exec_duration_ms = exec_duration.as_millis(),
+            trie_root_duration_ms = finalize_elapsed.as_millis(),
+            deadline_used_pct,
+            overrun_ms,
+            over_budget = overrun_ms > 0,
+            "build deadline snapshot"
         );
 
         for (index, tx) in transactions.iter().enumerate() {

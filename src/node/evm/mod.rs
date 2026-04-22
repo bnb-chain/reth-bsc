@@ -34,7 +34,7 @@ pub use config::BscEvmConfig;
 /// Miner-side triedb prefetcher type (reused from `reth-engine-tree`).
 pub type MinerTrieDbPrefetcher = reth_engine_tree::tree::triedb_prefetcher::TrieDBStatePrefetcher;
 pub(crate) use builder::request_difflayer;
-mod executor;
+pub mod executor;
 pub use executor::BscBlockExecutor;
 mod factory;
 pub use factory::BscEvmFactory;

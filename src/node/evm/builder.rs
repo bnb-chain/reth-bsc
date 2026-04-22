@@ -126,26 +126,61 @@ where
         state: impl StateProvider,
     ) -> Result<BlockBuilderOutcomeWithDiffLayer<BscPrimitives>, BlockExecutionError> {
         let finish_start = std::time::Instant::now();
-        let (evm, result) = self.executor.finish()?;
-        let (db, evm_env) = evm.finish();
 
+        let step = std::time::Instant::now();
+        let (evm, result) = self.executor.finish()?;
+        let executor_finish_ms = step.elapsed().as_millis();
+
+        let step = std::time::Instant::now();
+        let (db, evm_env) = evm.finish();
         let assembled_system_txs = {
             let mut inner = self.shared_ctx.inner.borrow_mut();
             std::mem::take(&mut inner.assembled_system_txs)
         };
         // merge all transitions into bundle state
         db.merge_transitions(BundleRetention::Reverts);
+        let merge_transitions_ms = step.elapsed().as_millis();
 
+        // -- state root computation starts --
         let state_root_start = std::time::Instant::now();
+
+        let step = std::time::Instant::now();
         let hashed_state = state.hashed_post_state(&db.bundle_state);
+        let hashed_post_state_ms = step.elapsed().as_millis();
 
         // Use triedb to calculate state root
         let (state_root, trie_updates, produced_difflayer) = if rust_eth_triedb::triedb_manager::is_triedb_active() {
             let mut triedb = get_global_triedb();
-            // Miner-side: try to use triedb prefetcher + parent difflayers from execution ctx.
+
+            let step = std::time::Instant::now();
             let prefetch_state = self.ctx.triedb_prefetcher.take().and_then(|p| p.finish());
+            let prefetcher_finish_ms = step.elapsed().as_millis();
+
+            // Prefetcher coverage: how many of the storage accounts hashed_post_state
+            // ended up needing were actually warmed by the prefetcher?
+            let needed_storage_accounts = hashed_state.storages.len();
+            let prefetched_storage_tries =
+                prefetch_state.as_ref().map(|p| p.storage_tries.len()).unwrap_or(0);
+            let prefetched_storage_roots =
+                prefetch_state.as_ref().map(|p| p.storage_roots.len()).unwrap_or(0);
+            if needed_storage_accounts > 0 {
+                tracing::debug!(
+                    target: "bsc::builder::timing",
+                    block_number = %(self.parent.number + 1),
+                    needed_storage_accounts,
+                    prefetched_storage_tries,
+                    prefetched_storage_roots,
+                    coverage_pct = prefetched_storage_tries * 100 / needed_storage_accounts.max(1),
+                    "prefetch storage coverage"
+                );
+            }
+
             let parent_state_root = (**self.parent).state_root();
+
+            let step = std::time::Instant::now();
             let trie_hashed_state = hashed_state.to_triedb_hashed_post_state();
+            let to_triedb_state_ms = step.elapsed().as_millis();
+
             let difflayers_opt = self.ctx.parent_difflayers.as_ref();
 
             let triedb_calc_started = std::time::Instant::now();
@@ -157,7 +192,30 @@ where
                     prefetch_state,
                 )
                 .map_err(BlockExecutionError::other)?;
-            let triedb_calc_with_prefetch_ms = triedb_calc_started.elapsed().as_millis();
+            let triedb_calc_ms = triedb_calc_started.elapsed().as_millis();
+
+            let state_root_total_ms = state_root_start.elapsed().as_millis();
+
+            tracing::debug!(
+                target: "bsc::builder::timing",
+                block_number = %(self.parent.number + 1),
+                user_tx_count = self.transactions.len(),
+                hashed_accounts = hashed_state.accounts.len(),
+                hashed_storages = hashed_state.storages.len(),
+                hashed_storage_slots = hashed_state
+                    .storages
+                    .values()
+                    .map(|s| s.storage.len())
+                    .sum::<usize>(),
+                state_root_total_ms,
+                executor_finish_ms,
+                merge_transitions_ms,
+                hashed_post_state_ms,
+                prefetcher_finish_ms,
+                to_triedb_state_ms,
+                triedb_calc_ms,
+                "state root breakdown"
+            );
 
             tracing::debug!(
                 target: "bsc::builder",
@@ -174,7 +232,7 @@ where
                     .values()
                     .map(|s| s.storage.len())
                     .sum::<usize>(),
-                triedb_calc_ms = triedb_calc_with_prefetch_ms,
+                triedb_calc_ms,
                 triedb_calc_us = triedb_calc_started.elapsed().as_micros(),
                 "Calculated state root using triedb"
             );
