@@ -42,6 +42,39 @@ use std::{borrow::Cow, cell::RefCell, convert::Infallible, rc::Rc, sync::{Arc, M
 /// is known.
 pub type ValidatorCacheSink = Arc<Mutex<Option<(Vec<Address>, Vec<VoteAddress>)>>>;
 
+/// Per-build-payload per-tx sub-step timing counters (nanoseconds). Each
+/// `build_payload` call creates a fresh `Arc<TxExecCounters>` so concurrent
+/// speculative + normal builds don't contaminate each other's snapshot. The
+/// miner keeps a clone, passes another via the `BscBlockExecutionCtx` to the
+/// executor, and reads the totals right before `finish_with_difflayer`.
+#[derive(Debug, Default)]
+pub struct TxExecCounters {
+    pub pre_exec_ns: std::sync::atomic::AtomicU64,
+    pub evm_transact_ns: std::sync::atomic::AtomicU64,
+    pub state_clone_ns: std::sync::atomic::AtomicU64,
+    pub prefetcher_hook_ns: std::sync::atomic::AtomicU64,
+    pub receipt_build_ns: std::sync::atomic::AtomicU64,
+    pub commit_ns: std::sync::atomic::AtomicU64,
+    pub count: std::sync::atomic::AtomicU64,
+}
+
+impl TxExecCounters {
+    /// Snapshot all counters as (pre_exec, evm_transact, state_clone,
+    /// prefetcher_hook, receipt_build, commit, count). Time values in ns.
+    pub fn snapshot(&self) -> (u64, u64, u64, u64, u64, u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.pre_exec_ns.load(Relaxed),
+            self.evm_transact_ns.load(Relaxed),
+            self.state_clone_ns.load(Relaxed),
+            self.prefetcher_hook_ns.load(Relaxed),
+            self.receipt_build_ns.load(Relaxed),
+            self.commit_ns.load(Relaxed),
+            self.count.load(Relaxed),
+        )
+    }
+}
+
 /// BSC wrapper around [`NextBlockEnvAttributes`].
 ///
 /// Extends the upstream attributes with TrieDB-specific context for the miner:
@@ -67,6 +100,9 @@ pub struct BscNextBlockEnvAttributes {
     /// Sink for transporting `turn_length` from builder to payload layer without writing to
     /// TURN_LENGTH_CACHE prematurely.
     pub turn_length_sink: Option<Arc<Mutex<Option<u8>>>>,
+    /// Per-tx sub-step timing counters, created by the miner for each
+    /// build_payload invocation. `None` for non-miner paths (import etc.).
+    pub tx_exec_counters: Option<Arc<TxExecCounters>>,
 }
 
 impl<H: BlockHeader> BuildPendingEnv<H> for BscNextBlockEnvAttributes {
@@ -77,6 +113,7 @@ impl<H: BlockHeader> BuildPendingEnv<H> for BscNextBlockEnvAttributes {
             triedb_prefetcher: None,
             validator_cache_sink: None,
             turn_length_sink: None,
+            tx_exec_counters: None,
         }
     }
 }
@@ -133,6 +170,9 @@ pub struct BscBlockExecutionCtx<'a> {
     pub validator_cache_sink: Option<ValidatorCacheSink>,
     /// Sink for `turn_length` — same lifecycle as `validator_cache_sink`.
     pub turn_length_sink: Option<Arc<Mutex<Option<u8>>>>,
+    /// Per-tx sub-step timing counters, shared with the miner.  `None` for
+    /// non-miner paths (import, etc.).
+    pub tx_exec_counters: Option<Arc<TxExecCounters>>,
 }
 
 impl<'a> BscBlockExecutionCtx<'a> {
@@ -433,6 +473,7 @@ where
             triedb_prefetcher: None,
             validator_cache_sink: None,
             turn_length_sink: None,
+            tx_exec_counters: None,
         })
     }
 
@@ -458,6 +499,7 @@ where
             triedb_prefetcher: attributes.triedb_prefetcher,
             validator_cache_sink: attributes.validator_cache_sink,
             turn_length_sink: attributes.turn_length_sink,
+            tx_exec_counters: attributes.tx_exec_counters,
         })
     }
 
@@ -532,6 +574,7 @@ where
             triedb_prefetcher: None,
             validator_cache_sink: None,
             turn_length_sink: None,
+            tx_exec_counters: None,
         })
     }
 

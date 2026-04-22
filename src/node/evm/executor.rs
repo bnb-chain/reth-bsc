@@ -33,35 +33,8 @@ use tracing::{error, warn, info, debug, trace};
 use alloy_eips::eip2935::{HISTORY_STORAGE_ADDRESS, HISTORY_STORAGE_CODE};
 use alloy_primitives::keccak256;
 use std::{collections::HashMap, sync::Arc};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use crate::consensus::parlia::SnapshotProvider;
-
-// Process-global per-tx sub-step timing accumulators (nanoseconds). Miner
-// snapshots these before/after its tx loop to compute a per-block breakdown
-// (see `tx_exec_counter_snapshot`). Relaxed ordering is fine: we only need
-// monotone delta per thread; ordering across threads is not observed.
-static TX_PRE_EXEC_NS: AtomicU64 = AtomicU64::new(0);
-static TX_EVM_TRANSACT_NS: AtomicU64 = AtomicU64::new(0);
-static TX_STATE_CLONE_NS: AtomicU64 = AtomicU64::new(0);
-static TX_PREFETCHER_HOOK_NS: AtomicU64 = AtomicU64::new(0);
-static TX_RECEIPT_BUILD_NS: AtomicU64 = AtomicU64::new(0);
-static TX_COMMIT_NS: AtomicU64 = AtomicU64::new(0);
-static TX_EXEC_COUNT: AtomicU64 = AtomicU64::new(0);
-
-/// Snapshot per-tx sub-step counters. Returns in order:
-/// (pre_exec, evm_transact, state_clone, prefetcher_hook, receipt_build, commit, count).
-pub fn tx_exec_counter_snapshot() -> (u64, u64, u64, u64, u64, u64, u64) {
-    (
-        TX_PRE_EXEC_NS.load(Ordering::Relaxed),
-        TX_EVM_TRANSACT_NS.load(Ordering::Relaxed),
-        TX_STATE_CLONE_NS.load(Ordering::Relaxed),
-        TX_PREFETCHER_HOOK_NS.load(Ordering::Relaxed),
-        TX_RECEIPT_BUILD_NS.load(Ordering::Relaxed),
-        TX_COMMIT_NS.load(Ordering::Relaxed),
-        TX_EXEC_COUNT.load(Ordering::Relaxed),
-    )
-}
 
 /// Helper type for the input of post execution.
 #[allow(clippy::type_complexity)]
@@ -574,7 +547,13 @@ where
         }
         let _precompile_trace_pop_guard = PrecompileTracePopGuard;
 
-        TX_PRE_EXEC_NS.fetch_add(pre_exec_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let tx_counters = self.ctx.tx_exec_counters.clone();
+        if let Some(c) = tx_counters.as_ref() {
+            c.pre_exec_ns.fetch_add(
+                pre_exec_start.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
 
         // Execute transaction.
         let evm_transact_start = Instant::now();
@@ -582,8 +561,12 @@ where
             .evm
             .transact(&tx)
             .map_err(|err| BlockExecutionError::evm(err, tx_hash))?;
-        TX_EVM_TRANSACT_NS
-            .fetch_add(evm_transact_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        if let Some(c) = tx_counters.as_ref() {
+            c.evm_transact_ns.fetch_add(
+                evm_transact_start.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
 
         if !f(&result).should_commit() {
             return Ok(None);
@@ -592,14 +575,22 @@ where
         let state_clone_start = Instant::now();
         let mut temp_state = state.clone();
         temp_state.remove(&SYSTEM_ADDRESS);
-        TX_STATE_CLONE_NS
-            .fetch_add(state_clone_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        if let Some(c) = tx_counters.as_ref() {
+            c.state_clone_ns.fetch_add(
+                state_clone_start.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
 
         let prefetcher_hook_start = Instant::now();
         self.system_caller
             .on_state(StateChangeSource::Transaction(self.receipts.len()), &temp_state);
-        TX_PREFETCHER_HOOK_NS
-            .fetch_add(prefetcher_hook_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        if let Some(c) = tx_counters.as_ref() {
+            c.prefetcher_hook_ns.fetch_add(
+                prefetcher_hook_start.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
 
         let gas_used = result.gas_used();
 
@@ -616,15 +607,23 @@ where
             state: &state,
             cumulative_gas_used: self.gas_used,
         }));
-        TX_RECEIPT_BUILD_NS
-            .fetch_add(receipt_build_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        if let Some(c) = tx_counters.as_ref() {
+            c.receipt_build_ns.fetch_add(
+                receipt_build_start.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
 
         // Commit the state changes.
         let commit_start = Instant::now();
         self.evm.db_mut().commit(state);
-        TX_COMMIT_NS.fetch_add(commit_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
-
-        TX_EXEC_COUNT.fetch_add(1, Ordering::Relaxed);
+        if let Some(c) = tx_counters.as_ref() {
+            c.commit_ns.fetch_add(
+                commit_start.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            c.count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
         Ok(Some(gas_used))
     }

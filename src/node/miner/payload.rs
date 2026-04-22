@@ -380,6 +380,9 @@ where
         let validator_cache_sink: ValidatorCacheSink =
             Arc::new(Mutex::new(None));
         let turn_length_sink: Arc<Mutex<Option<u8>>> = Arc::new(Mutex::new(None));
+        // Fresh per-tx counters per build_payload; shared with the executor via
+        // ctx so concurrent speculative / retry builds don't contaminate.
+        let tx_exec_counters = Arc::new(crate::node::evm::config::TxExecCounters::default());
 
         let next_env_attributes = BscNextBlockEnvAttributes {
             inner: NextBlockEnvAttributes {
@@ -397,6 +400,7 @@ where
             triedb_prefetcher: triedb_prefetcher.clone(),
             validator_cache_sink: Some(validator_cache_sink.clone()),
             turn_length_sink: Some(turn_length_sink.clone()),
+            tx_exec_counters: Some(tx_exec_counters.clone()),
         };
 
         let mut builder = self
@@ -486,8 +490,6 @@ where
         let exec_start = std::time::Instant::now();
         // Everything before `exec_start` is treated as "prepare" time for this payload attempt.
         let prepare_duration = exec_start.duration_since(build_start);
-        // Snapshot per-tx sub-step counters to compute the per-block delta after the loop.
-        let tx_counters_before = crate::node::evm::executor::tx_exec_counter_snapshot();
         while let Some(pool_tx) = best_tx_list.next() {
             if cancel.is_cancelled() {
                 break;
@@ -747,23 +749,24 @@ where
         }
         let exec_duration = exec_start.elapsed();
 
-        // Per-tx sub-step breakdown for this block (delta between the snapshots we
-        // took around the tx loop). Let the analysis script correlate by block_number.
-        let tx_counters_after = crate::node::evm::executor::tx_exec_counter_snapshot();
-        let dx_count = tx_counters_after.6.saturating_sub(tx_counters_before.6);
+        // Per-tx sub-step breakdown for this block. The Arc is per-build, so
+        // concurrent speculative / retry builds don't contaminate each other.
+        let (
+            d_pre_exec_ns,
+            d_evm_transact_ns,
+            d_state_clone_ns,
+            d_pref_hook_ns,
+            d_receipt_ns,
+            d_commit_ns,
+            dx_count,
+        ) = tx_exec_counters.snapshot();
         if dx_count > 0 {
-            let d_pre_exec_ns = tx_counters_after.0.saturating_sub(tx_counters_before.0);
-            let d_evm_transact_ns = tx_counters_after.1.saturating_sub(tx_counters_before.1);
-            let d_state_clone_ns = tx_counters_after.2.saturating_sub(tx_counters_before.2);
-            let d_pref_hook_ns = tx_counters_after.3.saturating_sub(tx_counters_before.3);
-            let d_receipt_ns = tx_counters_after.4.saturating_sub(tx_counters_before.4);
-            let d_commit_ns = tx_counters_after.5.saturating_sub(tx_counters_before.5);
             let avg_per_tx_us = |ns: u64| (ns / dx_count).saturating_div(1_000);
             debug!(
                 target: "bsc::builder::timing",
                 block_number = parent_header.number + 1,
                 tx_count = dx_count,
-                exec_duration_ms = exec_duration.as_millis(),
+                exec_duration_ms = exec_duration.as_millis() as u64,
                 avg_pre_exec_us = avg_per_tx_us(d_pre_exec_ns),
                 avg_evm_transact_us = avg_per_tx_us(d_evm_transact_ns),
                 avg_state_clone_us = avg_per_tx_us(d_state_clone_ns),
@@ -958,6 +961,7 @@ where
                     triedb_prefetcher: triedb_prefetcher.clone(),
                     validator_cache_sink: Some(validator_cache_sink.clone()),
                     turn_length_sink: Some(turn_length_sink.clone()),
+                    tx_exec_counters: None,
                 },
             )
             .map_err(PayloadBuilderError::other)?;

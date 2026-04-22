@@ -129,7 +129,7 @@ where
 
         let step = std::time::Instant::now();
         let (evm, result) = self.executor.finish()?;
-        let executor_finish_ms = step.elapsed().as_millis();
+        let executor_finish_us = step.elapsed().as_micros() as u64;
 
         let step = std::time::Instant::now();
         let (db, evm_env) = evm.finish();
@@ -139,14 +139,14 @@ where
         };
         // merge all transitions into bundle state
         db.merge_transitions(BundleRetention::Reverts);
-        let merge_transitions_ms = step.elapsed().as_millis();
+        let merge_transitions_us = step.elapsed().as_micros() as u64;
 
         // -- state root computation starts --
         let state_root_start = std::time::Instant::now();
 
         let step = std::time::Instant::now();
         let hashed_state = state.hashed_post_state(&db.bundle_state);
-        let hashed_post_state_ms = step.elapsed().as_millis();
+        let hashed_post_state_us = step.elapsed().as_micros() as u64;
 
         // Use triedb to calculate state root
         let (state_root, trie_updates, produced_difflayer) = if rust_eth_triedb::triedb_manager::is_triedb_active() {
@@ -154,7 +154,7 @@ where
 
             let step = std::time::Instant::now();
             let prefetch_state = self.ctx.triedb_prefetcher.take().and_then(|p| p.finish());
-            let prefetcher_finish_ms = step.elapsed().as_millis();
+            let prefetcher_finish_us = step.elapsed().as_micros() as u64;
 
             // Prefetcher coverage: how many of the storage accounts hashed_post_state
             // ended up needing were actually warmed by the prefetcher?
@@ -166,7 +166,7 @@ where
             if needed_storage_accounts > 0 {
                 tracing::debug!(
                     target: "bsc::builder::timing",
-                    block_number = %(self.parent.number + 1),
+                    block_number = self.parent.number + 1,
                     needed_storage_accounts,
                     prefetched_storage_tries,
                     prefetched_storage_roots,
@@ -179,7 +179,7 @@ where
 
             let step = std::time::Instant::now();
             let trie_hashed_state = hashed_state.to_triedb_hashed_post_state();
-            let to_triedb_state_ms = step.elapsed().as_millis();
+            let to_triedb_state_us = step.elapsed().as_micros() as u64;
 
             let difflayers_opt = self.ctx.parent_difflayers.as_ref();
 
@@ -192,13 +192,15 @@ where
                     prefetch_state,
                 )
                 .map_err(BlockExecutionError::other)?;
-            let triedb_calc_ms = triedb_calc_started.elapsed().as_millis();
+            let triedb_calc_us = triedb_calc_started.elapsed().as_micros() as u64;
 
-            let state_root_total_ms = state_root_start.elapsed().as_millis();
+            let state_root_total_us = state_root_start.elapsed().as_micros() as u64;
 
+            // All timings logged as u64 microseconds to avoid u128 / ms-truncation
+            // oddities seen at high TPS. The analysis script divides by 1000 to get ms.
             tracing::debug!(
                 target: "bsc::builder::timing",
-                block_number = %(self.parent.number + 1),
+                block_number = self.parent.number + 1,
                 user_tx_count = self.transactions.len(),
                 hashed_accounts = hashed_state.accounts.len(),
                 hashed_storages = hashed_state.storages.len(),
@@ -207,20 +209,20 @@ where
                     .values()
                     .map(|s| s.storage.len())
                     .sum::<usize>(),
-                state_root_total_ms,
-                executor_finish_ms,
-                merge_transitions_ms,
-                hashed_post_state_ms,
-                prefetcher_finish_ms,
-                to_triedb_state_ms,
-                triedb_calc_ms,
+                state_root_total_us,
+                executor_finish_us,
+                merge_transitions_us,
+                hashed_post_state_us,
+                prefetcher_finish_us,
+                to_triedb_state_us,
+                triedb_calc_us,
                 "state root breakdown"
             );
 
             tracing::debug!(
                 target: "bsc::builder",
                 parent_hash = %self.parent.hash(),
-                block_number = %(self.parent.number + 1),
+                block_number = self.parent.number + 1,
                 parent_state_root = %parent_state_root,
                 new_state_root = %new_root,
                 has_parent_difflayers = difflayers_opt.is_some(),
@@ -232,8 +234,7 @@ where
                     .values()
                     .map(|s| s.storage.len())
                     .sum::<usize>(),
-                triedb_calc_ms,
-                triedb_calc_us = triedb_calc_started.elapsed().as_micros(),
+                triedb_calc_us,
                 "Calculated state root using triedb"
             );
             (new_root, TrieUpdates::default(), Some(new_difflayer))
