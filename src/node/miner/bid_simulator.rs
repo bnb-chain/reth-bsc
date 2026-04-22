@@ -4,7 +4,7 @@ use crate::consensus::parlia::provider::SnapshotProvider;
 use crate::consensus::parlia::Snapshot;
 use crate::hardforks::BscHardforks;
 use crate::node::engine::BscBuiltPayload;
-use crate::node::evm::config::BscEvmConfig;
+use crate::node::evm::config::{BscEvmConfig, BscNextBlockEnvAttributes, ValidatorCacheSink};
 use crate::node::miner::bsc_miner::MiningContext;
 use crate::node::miner::payload::DELAY_LEFT_OVER;
 use crate::node::miner::util::prepare_new_attributes;
@@ -26,18 +26,22 @@ use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
 use reth_execution_types::BlockExecutionOutput;
 use reth_payload_primitives::PayloadBuilderAttributes;
 use reth_payload_primitives::{BuiltPayloadExecutedBlock, PayloadBuilderError};
+use either::Either;
+use revm_context_interface::Block as EvmBlock;
 use reth_primitives::SealedHeader;
 use reth_primitives::TransactionSigned;
 use reth_primitives_traits::SignerRecoverable;
 use reth_provider::StateProviderFactory;
 use reth_provider::{BlockHashReader, HeaderProvider};
 use reth_revm::{database::StateProviderDatabase, db::State};
-use revm::context_interface::block::Block;
-use either::Either;
+use rust_eth_triedb::get_global_triedb;
+use rust_eth_triedb_common::DiffLayers;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tracing::{debug, trace};
+use alloy_consensus::BlockHeader as _;
+use crate::node::evm::MinerTrieDbPrefetcher;
 const NO_INTERRUPT_LEFT_OVER: u64 = 500;
 const PAY_BID_TX_GAS_LIMIT: u64 = 25000;
 const TX_GAS: u64 = 21000;
@@ -169,8 +173,7 @@ where
         let parent_hash = bid.parent_hash;
         let parent_header = match self.client.header(parent_hash) {
             Ok(Some(header)) => {
-                let hash = header.hash_slow();
-                SealedHeader::new(header, hash)
+                SealedHeader::new(header, parent_hash)
             }
             _ => {
                 debug!("Failed to get parent header for hash: {:?}", parent_hash);
@@ -345,7 +348,11 @@ where
     }
 
     // sim_bid commit tx and set best bid
-    pub fn bid_simulate(&self, mut bid_runtime: BidRuntime<Pool, BscEvmConfig>) {
+    pub fn bid_simulate(
+        &self,
+        mut bid_runtime: BidRuntime<Pool, BscEvmConfig>,
+        parent_difflayers: Option<DiffLayers>,
+    ) {
         if !self.bid_receiving {
             return;
         }
@@ -362,7 +369,7 @@ where
         let pay_bid_tx = txs_except_last.pop();
 
         let state_provider =
-            match self.client.state_by_block_hash(bid_runtime.parent_header.hash_slow()) {
+            match self.client.state_by_block_hash(bid_runtime.parent_header.hash()) {
                 Ok(provider) => provider,
                 Err(e) => {
                     debug!("Failed to get state provider by block hash: {:?}", e);
@@ -388,18 +395,63 @@ where
             return;
         }
 
+        // Two execution paths for state-root computation:
+        //
+        // TrieDB mode (is_triedb_active):
+        //   - `parent_difflayers` feeds `finish_with_difflayer` so triedb can compute the
+        //     state root incrementally without a full disk trie traversal.
+        //   - A `MinerTrieDbPrefetcher` is also spun up to pre-load trie nodes in the
+        //     background using the difflayer warm-cache, reducing `finish()` latency.
+        //     (Per-tx state hook is not wired here; bid txs are externally pre-built so
+        //     incremental prefetching is less valuable than for miner-built payloads.)
+        //
+        // Non-TrieDB mode (original path):
+        //   - Both fields stay `None`; `finish_with_difflayer` falls through to the standard
+        //     `state_root_with_updates` calculation, identical to the pre-triedb behavior.
+        let (triedb_env_difflayers, triedb_prefetcher) =
+            if rust_eth_triedb::triedb_manager::is_triedb_active() {
+                let prefetcher = parent_difflayers.clone().and_then(|difflayers| {
+                    let mut triedb = get_global_triedb();
+                    let path_db = triedb.get_mut_path_db_ref().clone();
+                    MinerTrieDbPrefetcher::new(
+                        parent_header.state_root(),
+                        path_db,
+                        Some(difflayers),
+                    )
+                    .ok()
+                });
+                (parent_difflayers, prefetcher)
+            } else {
+                // Non-triedb: discard any difflayers passed in and use the original
+                // state_root_with_updates path inside finish_with_difflayer.
+                (None, None)
+            };
+
+        // Sinks transport current_validators / turn_length from the builder so that
+        // pick_best_payload() can write to VALIDATOR_CACHE / TURN_LENGTH_CACHE with the
+        // definitive block hash after finalize_new_header() runs.
+        let bid_validator_cache_sink: ValidatorCacheSink =
+            Arc::new(Mutex::new(None));
+        let bid_turn_length_sink: Arc<Mutex<Option<u8>>> = Arc::new(Mutex::new(None));
+
         let mut builder = match evm_config
             .builder_for_next_block(
                 &mut db,
                 &parent_header,
-                NextBlockEnvAttributes {
-                    timestamp: attributes.timestamp(),
-                    suggested_fee_recipient: attributes.suggested_fee_recipient(),
-                    prev_randao: attributes.prev_randao(),
-                    gas_limit,
-                    parent_beacon_block_root: attributes.parent_beacon_block_root(),
-                    withdrawals: Some(attributes.withdrawals().clone()),
-                    extra_data: builder_config.extra_data.clone(),
+                BscNextBlockEnvAttributes {
+                    inner: NextBlockEnvAttributes {
+                        timestamp: attributes.timestamp(),
+                        suggested_fee_recipient: attributes.suggested_fee_recipient(),
+                        prev_randao: attributes.prev_randao(),
+                        gas_limit,
+                        parent_beacon_block_root: attributes.parent_beacon_block_root(),
+                        withdrawals: Some(attributes.withdrawals().clone()),
+                        extra_data: builder_config.extra_data.clone(),
+                    },
+                    parent_difflayers: triedb_env_difflayers,
+                    triedb_prefetcher,
+                    validator_cache_sink: Some(bid_validator_cache_sink.clone()),
+                    turn_length_sink: Some(bid_turn_length_sink.clone()),
                 },
             )
             .map_err(PayloadBuilderError::other)
@@ -504,15 +556,16 @@ where
             return;
         }
 
-        // Finish the builder
-        let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } =
-            match builder.finish(&state_provider).map_err(PayloadBuilderError::other) {
-                Ok(outcome) => outcome,
-                Err(e) => {
-                    debug!("Failed to finish builder: {:?}", e);
-                    return;
-                }
-            };
+        // Finish the builder (also returns triedb difflayer when enabled)
+        let out = match builder.finish_with_difflayer(&state_provider).map_err(PayloadBuilderError::other) {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                debug!("Failed to finish builder: {:?}", e);
+                return;
+            }
+        };
+        let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } = out.inner;
+        let difflayer = out.difflayer;
         let mut sealed_block = Arc::new(block.sealed_block().clone());
 
         // Check if any un_revertible transaction failed
@@ -545,17 +598,29 @@ where
         let requests = execution_result.requests.clone();
         let execution_outcome = BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
         let executed: BuiltPayloadExecutedBlock<_> = BuiltPayloadExecutedBlock {
-            recovered_block: Arc::new(block),
+            recovered_block: Arc::new(block.clone()),
             execution_output: Arc::new(execution_outcome),
             hashed_state: Either::Left(Arc::new(hashed_state)),
             trie_updates: Either::Left(Arc::new(trie_updates)),
         };
+        let mut executed_block = executed.into_executed_payload();
+        executed_block.difflayer = difflayer;
+
+        // Read validator/turn-length data transported via sinks from the now-consumed builder.
+        let pending_validators = bid_validator_cache_sink.lock().unwrap().take();
+        let pending_turn_length = bid_turn_length_sink.lock().unwrap().take();
 
         bid_runtime.bsc_payload = Some(BscBuiltPayload {
             block: sealed_block.clone(),
             fees: bid_runtime.gas_fee,
             requests: Some(requests),
-            executed_block: executed,
+            build_kind: crate::node::engine::BuildKind::NormalAttempt,
+            exec_duration: std::time::Duration::ZERO,
+            trie_root_duration: std::time::Duration::ZERO,
+            executed_block,
+            pending_validators,
+            pending_turn_length,
+            is_bid: true,
         });
 
         // Acquire write lock to update best_bid
@@ -655,7 +720,7 @@ where
             Transaction: reth::transaction_pool::PoolTransaction<Consensus = TransactionSigned>,
         > + Clone
         + 'static,
-    EvmConfig: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes> + 'static,
+    EvmConfig: ConfigureEvm<NextBlockEnvCtx = BscNextBlockEnvAttributes> + 'static,
     <EvmConfig as ConfigureEvm>::Primitives: reth_primitives_traits::NodePrimitives<
         BlockHeader = alloy_consensus::Header,
         SignedTx = alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip4844>,

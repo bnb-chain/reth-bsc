@@ -17,7 +17,7 @@ use super::{
 use crate::consensus::parlia::constants::K_ANCESTOR_GENERATION_DEPTH;
 use crate::consensus::parlia::go_rng::{RngSource, Shuffle};
 use crate::consensus::parlia::provider::SnapshotProvider;
-use crate::consensus::parlia::util::is_breathe_block;
+use crate::consensus::parlia::util::{calculate_millisecond_timestamp, is_breathe_block};
 use crate::consensus::parlia::vote_pool::fetch_vote_by_block_hash_and_source_number;
 use crate::consensus::parlia::VoteData;
 use crate::consensus::parlia::VoteSignature;
@@ -40,14 +40,27 @@ use tracing::{debug, trace, warn};
 const RECOVERED_PROPOSER_CACHE_NUM: usize = 4096;
 const ADDRESS_LENGTH: usize = 20; // Ethereum address length in bytes
 
+/// Applies left-over reservation and mining-time cap to raw delay.
 #[inline]
 fn apply_mining_delay_with_leftover(
     mut delay_ms: u64,
     period_ms: u64,
     last_block_in_turn: bool,
+    first_block_in_turn: bool,
     left_over_ms: u64,
 ) -> u64 {
-    let mut time_for_mining_ms = period_ms / 2;
+    if left_over_ms >= period_ms {
+        warn!("Delay invalid argument: left_over_ms={}, period_ms={}", left_over_ms, period_ms);
+    } else if left_over_ms >= delay_ms {
+        delay_ms = 0;
+    } else {
+        delay_ms -= left_over_ms;
+    }
+
+    // Unlike go-bsc (which uses `period / 2`), reth-bsc uses `period / 5` for the
+    // last-block-in-turn cap because trie root computation is significantly slower
+    // and needs more reserved time to avoid spilling into the next validator's slot.
+    let mut time_for_mining_ms = period_ms / 5;
     if !last_block_in_turn {
         time_for_mining_ms = period_ms;
     }
@@ -55,13 +68,11 @@ fn apply_mining_delay_with_leftover(
         delay_ms = time_for_mining_ms;
     }
 
-    // Keep parity with go-bsc: apply left-over reservation after delay capping.
-    if left_over_ms >= period_ms {
-        warn!("Delay invalid argument: left_over_ms={}, period_ms={}", left_over_ms, period_ms);
-    } else if left_over_ms >= delay_ms {
-        delay_ms = 0;
-    } else {
-        delay_ms -= left_over_ms;
+    // For the first block in a turn, a minimum 50ms delay is enforced so the block
+    // is not empty — validator switches require re-execution and root recomputation,
+    // leaving very little time for transaction inclusion.
+    if delay_ms == 0 && first_block_in_turn {
+        delay_ms = 50;
     }
 
     delay_ms
@@ -589,13 +600,21 @@ where
 
     /// - `snap.block_interval` is used as the period (milliseconds).
     /// - Applies `left_over_ms` reservation for finalization work.
-    /// - Caps blocking time to half the period when last block in one turn (or tl == 1),
-    ///   otherwise a full period.
+    /// - Caps blocking time to `period / 5` when last block in turn to reserve
+    ///   time for trie root computation; otherwise a full period.
+    /// - Ensures first block in turn gets at least 50ms for transaction inclusion.
     pub fn delay_for_mining(&self, snap: &Snapshot, header: &Header, left_over_ms: u64) -> u64 {
         let period_ms = snap.block_interval;
         let last_block_in_turn = snap.last_block_in_one_turn(header.number);
+        let first_block_in_turn = snap.first_block_in_one_turn(header.number);
         let delay_ms = self.delay_for_ramanujan_fork(snap, header);
-        apply_mining_delay_with_leftover(delay_ms, period_ms, last_block_in_turn, left_over_ms)
+        apply_mining_delay_with_leftover(
+            delay_ms,
+            period_ms,
+            last_block_in_turn,
+            first_block_in_turn,
+            left_over_ms,
+        )
     }
 
     pub fn prepare_timestamp(
@@ -735,8 +754,23 @@ where
         }
 
         // get justified number and hash from parent snapshot
-        let (justified_number, justified_hash) =
+        let (mut justified_number, mut justified_hash) =
             (parent_snap.vote_data.target_number, parent_snap.vote_data.target_hash);
+
+        // If justified_hash is zero, no attestation has been produced yet.
+        // Fall back to genesis as the source, matching geth's behaviour:
+        // ref: https://github.com/bnb-chain/bsc/blob/583cfec3ea811fb124e6812aabd190555d5aeabc/consensus/parlia/parlia.go#L2161
+        if justified_hash == B256::ZERO {
+            match crate::shared::get_canonical_header_by_number(0) {
+                Some(genesis) => {
+                    justified_number = genesis.number;
+                    justified_hash = genesis.hash_slow();
+                }
+                None => {
+                    return Err(ParliaConsensusError::HeaderNotFound { block_hash: B256::ZERO });
+                }
+            }
+        }
         let mut times = 1;
         if self
             .spec
@@ -748,13 +782,12 @@ where
         let mut target_header = parent_header.clone();
         let mut target_header_parent_snap = None;
         for _ in 0..times {
-            let snap = snapshot_provider.snapshot_by_hash(&target_header.parent_hash()).ok_or(
-                ParliaConsensusError::SnapshotNotFound { block_hash: target_header.parent_hash() },
+            let parent_hash = target_header.parent_hash();
+            let target_hash = target_header.hash_slow();
+            let snap = snapshot_provider.snapshot_by_hash(&parent_hash).ok_or(
+                ParliaConsensusError::SnapshotNotFound { block_hash: parent_hash },
             )?;
-            votes = fetch_vote_by_block_hash_and_source_number(
-                target_header.hash_slow(),
-                justified_number,
-            );
+            votes = fetch_vote_by_block_hash_and_source_number(target_hash, justified_number);
             let quorum = usize::div_ceil(snap.validators.len() * 2, 3);
             if votes.len() >= quorum {
                 target_header_parent_snap = Some(snap);
@@ -762,8 +795,8 @@ where
             }
 
             tracing::debug!(target: "parlia::consensus", "vote count is less than 2/3 of validators, skip assemble vote attestation, number={}, parent={:?}, vote count={}, validators count={}", 
-                target_header.number(), target_header.hash_slow(), votes.len(), snap.validators.len());
-            let block_hash = target_header.parent_hash();
+                target_header.number(), target_hash, votes.len(), snap.validators.len());
+            let block_hash = parent_hash;
             if let Some(header) =
                 crate::shared::get_canonical_header_by_hash_from_provider(&block_hash)
             {
@@ -866,10 +899,29 @@ where
         current_header.extra_data = alloy_primitives::Bytes::from(extra_data);
 
         // Update metric: successfully assembled vote attestation
-        use crate::metrics::BscVoteMetrics;
+        use crate::metrics::{BscFinalityMetrics, BscVoteMetrics};
         use once_cell::sync::Lazy;
         static VOTE_METRICS: Lazy<BscVoteMetrics> = Lazy::new(BscVoteMetrics::default);
+        static FINALITY_METRICS: Lazy<BscFinalityMetrics> = Lazy::new(BscFinalityMetrics::default);
         VOTE_METRICS.votes_attested_total.increment(votes.len() as u64);
+
+        // Record normal-path finality latency: time from the source (finalized) block's
+        // millisecond timestamp to when this attestation is assembled.
+        // Equivalent to chain/finalized/latency/normal in geth (measured at assembly
+        // time; justified_hash == source_hash == the block now being finalized).
+        if let Some(source_header) =
+            crate::shared::get_canonical_header_by_number(justified_number)
+        {
+            let now_ms = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let block_ms = calculate_millisecond_timestamp(&source_header);
+            FINALITY_METRICS
+                .finalized_latency_normal_ms
+                .set(now_ms.saturating_sub(block_ms) as f64);
+        }
+
         debug!(
             "Succeed to assemble vote attestation, votes={}, attestation={:?}",
             votes.len(),
@@ -932,14 +984,30 @@ mod tests {
     }
 
     #[test]
-    fn mining_delay_caps_before_leftover_is_applied() {
-        // Raw delay (2500) is first capped to half-period (1500), then left-over makes it zero.
-        assert_eq!(apply_mining_delay_with_leftover(2500, 3000, true, 2000), 0);
+    fn mining_delay_last_block_in_turn_caps_to_period_div_5() {
+        // last_block_in_turn: left_over applied first (2500 - 2000 = 500),
+        // then cap to period/5 = 600; 500 <= 600 so result is 500.
+        assert_eq!(apply_mining_delay_with_leftover(2500, 3000, true, false, 2000), 500);
     }
 
     #[test]
-    fn mining_delay_uses_full_period_cap_when_not_last_block_in_turn() {
-        // Not-last block uses full-period cap: min(3500, 3000) - 200 = 2800.
-        assert_eq!(apply_mining_delay_with_leftover(3500, 3000, false, 200), 2800);
+    fn mining_delay_last_block_in_turn_capped() {
+        // last_block_in_turn: left_over applied first (2500 - 100 = 2400),
+        // then cap to period/5 = 600; 2400 > 600 so result is 600.
+        assert_eq!(apply_mining_delay_with_leftover(2500, 3000, true, false, 100), 600);
+    }
+
+    #[test]
+    fn mining_delay_not_last_block_uses_full_period_cap() {
+        // not last_block_in_turn: left_over applied first (3500 - 200 = 3300),
+        // then cap to full period = 3000; result is 3000.
+        assert_eq!(apply_mining_delay_with_leftover(3500, 3000, false, false, 200), 3000);
+    }
+
+    #[test]
+    fn mining_delay_first_block_in_turn_gets_minimum_50ms() {
+        // first_block_in_turn: left_over (600) >= delay (500), so delay = 0,
+        // then first_block_in_turn minimum kicks in: result is 50.
+        assert_eq!(apply_mining_delay_with_leftover(500, 3000, false, true, 600), 50);
     }
 }

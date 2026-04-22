@@ -67,6 +67,10 @@ pub struct Snapshot {
 
     /// Expected block interval in milliseconds.
     pub block_interval: u64,
+
+    /// Recent fork hashes extracted from block headers' extra data (bytes 28..32 of vanity).
+    #[serde(default)]
+    pub recent_fork_hashes: BTreeMap<BlockNumber, String>,
 }
 
 impl Snapshot {
@@ -131,6 +135,7 @@ impl Snapshot {
             vote_data: Default::default(),
             turn_length: Some(DEFAULT_TURN_LENGTH),
             block_interval: DEFAULT_BLOCK_INTERVAL,
+            recent_fork_hashes: Default::default(),
         }
     }
 
@@ -165,6 +170,21 @@ impl Snapshot {
         let limit = self.miner_history_check_len() + 1;
         if block_number >= limit {
             snap.recent_proposers.remove(&(block_number - limit));
+        }
+
+        // Maintain recent fork hash window.
+        let version_limit = self.version_history_check_len();
+        if block_number >= version_limit {
+            snap.recent_fork_hashes.remove(&(block_number - version_limit));
+        }
+
+        // Extract fork hash from header extra data bytes [28..32] (last 4 bytes of vanity).
+        let extra = next_header.extra_data();
+        if extra.len() >= super::constants::EXTRA_VANITY_LEN {
+            let fork_hash = hex::encode(
+                &extra[super::constants::EXTRA_VANITY_LEN - 4..super::constants::EXTRA_VANITY_LEN],
+            );
+            snap.recent_fork_hashes.insert(block_number, fork_hash);
         }
 
         // Validate proposer belongs to validator set and hasn't over-proposed.
@@ -292,6 +312,15 @@ impl Snapshot {
                     });
                 }
             }
+            // Clean up fork hashes that exceed the new window after validator set change
+            let old_version_len = original_snap.version_history_check_len();
+            let new_version_len = snap.version_history_check_len();
+            if new_version_len < old_version_len {
+                for i in new_version_len..old_version_len {
+                    snap.recent_fork_hashes.remove(&(block_number.saturating_sub(i)));
+                }
+            }
+
             snap.validators = new_validators;
             snap.validators_map = validators_map;
         }
@@ -359,6 +388,13 @@ impl Snapshot {
         (self.validators.len() / 2 + 1) as u64 * turn - 1
     }
 
+    /// Number of blocks to track fork hash history.
+    /// Matches geth: validators_count * turn_length
+    pub fn version_history_check_len(&self) -> u64 {
+        let turn = u64::from(self.turn_length.unwrap_or(1));
+        self.validators.len() as u64 * turn
+    }
+
     /// Validator that should propose the **next** block.
     pub fn inturn_validator(&self) -> Address {
         let turn_length = u64::from(self.turn_length.unwrap_or(DEFAULT_TURN_LENGTH));
@@ -387,6 +423,16 @@ impl Snapshot {
             return true;
         }
         block_number % tl == tl - 1
+    }
+
+    /// Returns true if `block_number` is the first block of the current turn window.
+    /// When turn_length is 1 (pre-Bohr), every block is considered first in turn.
+    pub fn first_block_in_one_turn(&self, block_number: u64) -> bool {
+        let tl = u64::from(self.turn_length.unwrap_or(DEFAULT_TURN_LENGTH));
+        if tl <= 1 {
+            return true;
+        }
+        block_number.is_multiple_of(tl)
     }
 
     /// Count how many times each validator has signed in the recent window.

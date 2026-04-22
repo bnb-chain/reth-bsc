@@ -1,14 +1,14 @@
 use clap::{Args, Parser};
 use reth::{builder::NodeHandle, cli::Cli, consensus::FullConsensus};
+use reth_bsc::consensus::parlia::bls_signer;
 use reth_bsc::node::consensus::BscConsensus;
 use reth_bsc::{
-    chainspec::{parser::BscChainSpecParser, genesis_override},
+    chainspec::{genesis_override, parser::BscChainSpecParser},
     node::{evm::config::BscEvmConfig, BscNode},
     BscPrimitives,
 };
-use reth_bsc::consensus::parlia::bls_signer;
-use std::sync::Arc;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 // We use jemalloc for performance reasons
 #[cfg(all(feature = "jemalloc", unix))]
@@ -367,22 +367,58 @@ fn main() -> eyre::Result<()> {
                         ctx.modules.merge_configured(mev_api.into_rpc())?;
                         tracing::info!("Succeed to register MEV RPC API");
 
+                        tracing::info!("Start to register Miner RPC API...");
+                        use reth_bsc::rpc::miner::{BscMinerApiImpl, BscMinerApiServer};
+
+                        // Remove reth's built-in MinerApi methods (registered on IPC by default)
+                        // to avoid conflicts with our BscMinerApi which redefines them
+                        ctx.modules.remove_method_from_configured("miner_setExtra");
+                        ctx.modules.remove_method_from_configured("miner_setGasPrice");
+                        ctx.modules.remove_method_from_configured("miner_setGasLimit");
+                        let miner_api = BscMinerApiImpl::new();
+                        ctx.modules.merge_configured(miner_api.into_rpc())?;
+                        tracing::info!("Succeed to register Miner RPC API");
+
+                        tracing::info!("Start to register BSC Eth extension API (eth_coinbase, eth_health)...");
+                        use reth_bsc::rpc::eth_ext::{BscEthExtApiImpl, BscEthExtApiServer};
+
+                        // Remove the default unimplemented eth_coinbase before registering our version
+                        ctx.modules.remove_method_from_configured("eth_coinbase");
+                        let eth_ext_api = BscEthExtApiImpl::new();
+                        ctx.modules.merge_configured(eth_ext_api.into_rpc())?;
+                        tracing::info!("Succeed to register BSC Eth extension API");
+
                         tracing::info!("Start to register Blob RPC API...");
                         use reth_bsc::rpc::blob::{BlobApiImpl, BlobApiServer};
 
                         // Get pool and provider from context
                         let pool = ctx.pool().clone();
                         let provider = ctx.provider().clone();
-                        
+
                         let blob_api = BlobApiImpl::new(pool, provider);
                         ctx.modules.merge_configured(blob_api.into_rpc())?;
                         tracing::info!("Succeed to register Blob RPC API");
+
+                        tracing::info!("Start to register eth_config (EIP-7910) API...");
+                        use reth::api::FullNodeComponents;
+                        use reth_bsc::rpc::BscEthConfigHandler;
+                        use reth_rpc_eth_api::helpers::config::EthConfigApiServer;
+                        use reth_rpc_server_types::RethRpcModule;
+
+                        let eth_config = BscEthConfigHandler::new(
+                            ctx.provider().clone(),
+                            ctx.node().evm_config().clone(),
+                        );
+                        ctx.modules.merge_if_module_configured(RethRpcModule::Eth, eth_config.into_rpc())?;
+                        tracing::info!("Succeed to register eth_config (EIP-7910) API");
                         Ok(())
                     })
                     .launch().await?;
 
             // Send the engine handle to the network
             engine_handle_tx.send(node.beacon_engine_handle.clone()).unwrap();
+            reth_bsc::shared::set_engine_api_tx(node.engine_api_tx.clone().unwrap()).unwrap();
+            tracing::debug!("set engine api tx successfully");
 
             // Set the IPC client
             reth_bsc::shared::set_ipc_client(ipc_path).await.unwrap();

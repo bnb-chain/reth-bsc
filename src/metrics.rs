@@ -166,6 +166,21 @@ pub struct BscMinerMetrics {
     /// Block finalize duration in seconds (equivalent to worker/finalizeblock)
     pub block_finalize_duration_seconds: Histogram,
 
+    /// Block execution duration in seconds (tx selection + execution; empty blocks include pre-exec changes).
+    pub block_exec_duration_seconds: Histogram,
+
+    /// Trie root computation duration in seconds (time spent in `finish()` after execution).
+    pub block_trie_root_duration_seconds: Histogram,
+
+    /// Total number of empty-payload candidates produced via the empty-fallback path.
+    ///
+    /// This is incremented when the payload job receives a completed build with
+    /// `BuildKind::EmptyFallback`.
+    pub empty_fallback_candidates_total: Counter,
+
+    /// Total number of times we ultimately failed to pick/send a best payload (block production failed).
+    pub no_best_payload_total: Counter,
+
     /// Total number of blocks produced
     pub blocks_produced_total: Counter,
 
@@ -173,6 +188,24 @@ pub struct BscMinerMetrics {
     /// This measures how long it takes from block creation to network broadcast
     /// Note: Value is stored in nanoseconds to match Golang implementation
     pub block_broadcast_delay_seconds: Histogram,
+
+    /// Total number of local payload rebuilds that were actually queued
+    pub payload_rebuilds_attempted_total: Counter,
+
+    /// Total number of rebuild evaluations skipped because cooldown had not elapsed
+    pub payload_rebuilds_skipped_cooldown_total: Counter,
+
+    /// Total number of rebuild evaluations skipped because estimated uplift was too low
+    pub payload_rebuilds_skipped_value_total: Counter,
+
+    /// Total number of rebuild evaluations skipped because there was not enough time left
+    pub payload_rebuilds_skipped_time_total: Counter,
+
+    /// Total number of near-deadline final-shot rebuilds used
+    pub payload_rebuilds_final_shot_total: Counter,
+
+    /// Current estimated uplift over the last local payload, in basis points
+    pub payload_rebuild_estimated_uplift_bps: Gauge,
 }
 
 /// Metrics for BSC fast finality
@@ -189,6 +222,18 @@ pub struct BscFinalityMetrics {
 
     /// Current safe block height (equivalent to chain/head/safe)
     pub safe_block_height: Gauge,
+
+    /// Early finalization latency in milliseconds (BEP-648 fast path via VotePool).
+    /// Measures the time from the finalized block's millisecond timestamp to when the
+    /// forkchoice update is triggered, equivalent to chain/finalized/latency/early in geth.
+    pub finalized_latency_early_ms: Gauge,
+
+    /// Normal finalization latency in milliseconds (attestation assembly path).
+    /// Measures the time from the source block's millisecond timestamp to when the
+    /// miner successfully assembles a vote attestation confirming it as finalized.
+    /// Equivalent to chain/finalized/latency/normal in geth (measured at assembly
+    /// time rather than import time, so slightly earlier in the pipeline).
+    pub finalized_latency_normal_ms: Gauge,
 }
 
 /// Metrics for BSC blockchain operations
@@ -223,6 +268,31 @@ pub struct BscBlockchainMetrics {
 
     /// Depth of the latest chain reorganization
     pub latest_reorg_depth: Gauge,
+}
+
+/// Chain delay metrics matching geth `chain/delay/*` metrics.
+///
+/// These track the delay between block creation (timestamp) and various events.
+/// Values are recorded in milliseconds to match geth's behavior.
+#[derive(Metrics, Clone)]
+#[metrics(scope = "chain.delay")]
+pub struct BscChainDelayMetrics {
+    /// Delay from block timestamp to when block was first received from network
+    pub block_recv: Histogram,
+    /// Delay from block timestamp to first vote received for the block
+    pub vote_first: Histogram,
+    /// Delay from block timestamp to majority (14+) votes received for the block
+    pub vote_majority: Histogram,
+}
+
+/// Parlia consensus metrics with geth-compatible naming.
+///
+/// Separated from `BscConsensusMetrics` to match geth's `parlia/*` metric namespace.
+#[derive(Metrics, Clone)]
+#[metrics(scope = "parlia")]
+pub struct BscParliaGethMetrics {
+    /// Double sign events detected (matches geth `parlia/doublesign`)
+    pub doublesign: Counter,
 }
 
 #[cfg(test)]

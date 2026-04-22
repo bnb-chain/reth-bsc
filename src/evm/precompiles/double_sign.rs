@@ -8,10 +8,11 @@ use revm::precompile::{
     secp256k1, u64_to_address, PrecompileError, PrecompileOutput, PrecompileResult,
     Precompile, PrecompileId,
 };
+use std::borrow::Cow;
 
 /// Double sign evidence validation precompile for BSC.
 pub(crate) const DOUBLE_SIGN_EVIDENCE_VALIDATION: Precompile =
-    Precompile::new(PrecompileId::Identity, u64_to_address(104), double_sign_evidence_validation_run);
+    Precompile::new(PrecompileId::Custom(Cow::Borrowed("VERIFY_DOUBLE_SIGN_EVIDENCE")), u64_to_address(104), double_sign_evidence_validation_run);
 
 const EXTRA_SEAL_LENGTH: usize = 65;
 

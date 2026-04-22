@@ -9,18 +9,30 @@ use std::{
 
 use alloy_primitives::{BlockNumber, B256};
 
-use super::vote::{VoteData, VoteEnvelope};
-use crate::metrics::BscVoteMetrics;
+use super::{
+    block_stats,
+    malicious_vote_monitor::MaliciousVoteMonitor,
+    vote::{VoteData, VoteEnvelope},
+};
+use crate::consensus::parlia::util::calculate_millisecond_timestamp;
+use crate::metrics::{BscFinalityMetrics, BscVoteMetrics};
 use crate::shared;
+use std::time::SystemTime;
 
 const LOWER_LIMIT_OF_VOTE_BLOCK_NUMBER: u64 = 256;
 /// Size of the LRU cache for tracking finality notifications (matches geth's finalizedNotified)
 const FINALIZED_NOTIFIED_CACHE_SIZE: usize = 21;
 
+#[derive(Clone)]
+struct VoteEntry {
+    hash: B256,
+    envelope: VoteEnvelope,
+}
+
 /// Container for votes associated with a specific block hash.
 #[derive(Default)]
 struct VoteMessages {
-    vote_messages: Vec<VoteEnvelope>,
+    vote_messages: Vec<VoteEntry>,
 }
 
 /// Priority queue wrapper for vote data, ordered by target_number (ascending).
@@ -71,6 +83,10 @@ struct VotePool {
     cur_votes: HashMap<B256, VoteMessages>,
     /// Priority queue for efficiently finding votes to prune.
     cur_votes_pq: VotesPriorityQueue,
+    /// Total number of votes stored in the pool.
+    total_votes: usize,
+    /// Malicious vote monitor for detecting rule violations.
+    malicious_vote_monitor: MaliciousVoteMonitor,
 }
 
 impl VotePool {
@@ -79,14 +95,21 @@ impl VotePool {
             received_votes: HashSet::new(),
             cur_votes: HashMap::new(),
             cur_votes_pq: VotesPriorityQueue::new(),
+            total_votes: 0,
+            malicious_vote_monitor: MaliciousVoteMonitor::new(),
         }
     }
 
-    fn insert(&mut self, vote: VoteEnvelope) {
+    /// Insert a vote and return the new vote count for its target block (0 if duplicate).
+    fn insert(&mut self, vote: VoteEnvelope, pending_block_number: BlockNumber) -> usize {
         let vote_hash = vote.hash();
         if self.received_votes.insert(vote_hash) {
-            // Track received votes count
+            // Track received votes count (geth-compatible)
             VOTE_METRICS.received_votes_total.increment(1);
+            metrics::counter!("curVotes.local").increment(1);
+
+            // Check for malicious votes
+            self.malicious_vote_monitor.conflict_detect(&vote, pending_block_number);
 
             // Use target_hash as the key for organizing votes
             let block_hash = vote.data.target_hash;
@@ -95,31 +118,48 @@ impl VotePool {
             if !self.cur_votes.contains_key(&block_hash) {
                 self.cur_votes_pq.push(vote.data);
             }
+            self.cur_votes
+                .entry(block_hash)
+                .or_default()
+                .vote_messages
+                .push(VoteEntry { hash: vote_hash, envelope: vote });
+            self.total_votes += 1;
 
-            self.cur_votes.entry(block_hash).or_default().vote_messages.push(vote);
+            // Update geth-compatible gauges
+            metrics::gauge!("curVotesPq.local").set(self.cur_votes_pq.heap.len() as f64);
+            metrics::gauge!("receivedVotes.local").set(self.received_votes.len() as f64);
+
+            // Return the new vote count for this block
+            self.len_for_block(&block_hash)
+        } else {
+            0 // duplicate vote
         }
     }
 
     fn drain(&mut self) -> Vec<VoteEnvelope> {
         self.received_votes.clear();
         self.cur_votes_pq = VotesPriorityQueue::new();
+        self.total_votes = 0;
         let mut all_votes = Vec::new();
         for (_, vote_messages) in self.cur_votes.drain() {
-            all_votes.extend(vote_messages.vote_messages);
+            all_votes.extend(vote_messages.vote_messages.into_iter().map(|entry| entry.envelope));
         }
+        // Update geth-compatible gauges
+        metrics::gauge!("curVotesPq.local").set(0.0);
+        metrics::gauge!("receivedVotes.local").set(0.0);
         all_votes
     }
 
     fn get_votes(&self) -> Vec<VoteEnvelope> {
         let mut all_votes = Vec::new();
         for vote_messages in self.cur_votes.values() {
-            all_votes.extend(vote_messages.vote_messages.clone());
+            all_votes.extend(vote_messages.vote_messages.iter().map(|entry| entry.envelope.clone()));
         }
         all_votes
     }
 
     fn len(&self) -> usize {
-        self.cur_votes.values().map(|vm| vm.vote_messages.len()).sum()
+        self.total_votes
     }
 
     fn len_for_block(&self, block_hash: &B256) -> usize {
@@ -128,7 +168,11 @@ impl VotePool {
 
     fn fetch_vote_by_block_hash(&self, block_hash: B256) -> Vec<VoteEnvelope> {
         if let Some(vote_messages) = self.cur_votes.get(&block_hash) {
-            vote_messages.vote_messages.clone()
+            vote_messages
+                .vote_messages
+                .iter()
+                .map(|entry| entry.envelope.clone())
+                .collect()
         } else {
             Vec::new()
         }
@@ -158,15 +202,18 @@ impl VotePool {
 
                 // Remove from votes map and received_votes set
                 if let Some(vote_box) = self.cur_votes.remove(&block_hash) {
+                    self.total_votes = self.total_votes.saturating_sub(vote_box.vote_messages.len());
                     for vote in vote_box.vote_messages {
-                        let vote_hash = vote.hash();
-                        self.received_votes.remove(&vote_hash);
+                        self.received_votes.remove(&vote.hash);
                     }
                 }
             } else {
                 break;
             }
         }
+        // Update geth-compatible gauges after pruning
+        metrics::gauge!("curVotesPq.local").set(self.cur_votes_pq.heap.len() as f64);
+        metrics::gauge!("receivedVotes.local").set(self.received_votes.len() as f64);
     }
 }
 
@@ -175,6 +222,9 @@ static VOTE_POOL: Lazy<RwLock<VotePool>> = Lazy::new(|| RwLock::new(VotePool::ne
 
 /// Global metrics for vote operations.
 static VOTE_METRICS: Lazy<BscVoteMetrics> = Lazy::new(BscVoteMetrics::default);
+
+/// Global metrics for finality operations (shared with consensus layer).
+static FINALITY_METRICS: Lazy<BscFinalityMetrics> = Lazy::new(BscFinalityMetrics::default);
 
 /// LRU cache to track which blocks have already been notified for finality.
 /// This prevents repeated update_forkchoice calls for the same block (matches geth's finalizedNotified).
@@ -190,13 +240,21 @@ fn update_vote_pool_size_metric(size: usize) {
 /// Insert a single vote into the pool (deduplicated by hash).
 pub fn put_vote(vote: VoteEnvelope) {
     let target_hash = vote.data.target_hash;
+
+    // Get pending block number for malicious vote detection scope
+    let pending_block_number = shared::get_best_canonical_block_number().unwrap_or(0);
+
     let mut pool = VOTE_POOL.write().expect("vote pool poisoned");
-    pool.insert(vote);
-    let votes_for_block = pool.len_for_block(&target_hash);
+    let votes_for_block = pool.insert(vote, pending_block_number);
     let size = pool.len();
     drop(pool);
     update_vote_pool_size_metric(size);
-    maybe_notify_finality(target_hash, votes_for_block);
+
+    // Report chain delay vote metrics
+    if votes_for_block > 0 {
+        block_stats::on_vote_received(target_hash, votes_for_block);
+        maybe_notify_finality(target_hash, votes_for_block);
+    }
 }
 
 /// Drain all pending votes.
@@ -305,6 +363,19 @@ fn maybe_notify_finality(target_hash: B256, votes_for_block: usize) {
     {
         let mut cache = FINALIZED_NOTIFIED.write().expect("finalized notified cache poisoned");
         cache.put(target_hash, ());
+    }
+
+    // Record early finalization latency: time from the finalized block's millisecond
+    // timestamp to now, equivalent to chain/finalized/latency/early in geth.
+    // The finalized block is current_justified (head - 1), identified by current_justified_number.
+    if let Some(justified_header) = shared::get_canonical_header_by_number(current_justified_number) {
+        let now_ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let block_ms = calculate_millisecond_timestamp(&justified_header);
+        let latency_ms = now_ms.saturating_sub(block_ms) as f64;
+        FINALITY_METRICS.finalized_latency_early_ms.set(latency_ms);
     }
 
     if let Some(engine) = shared::get_fork_choice_engine() {
