@@ -236,6 +236,19 @@ codegen-units = 16
 inherits = "release"
 lto = "fat"
 codegen-units = 1
+# Keep line-tables so flamegraph frames carry Rust function names. Without this
+# the maxperf binary is stripped (inherited from [profile.release]) and every
+# reth-bsc frame collapses to a single `[reth-bsc]` bar in the SVG.
+debug = "line-tables-only"
+strip = false
+split-debuginfo = "off"
+
+# Apply the same to every transitive dependency so triedb/revm/rayon frames
+# also resolve. Without this, only reth-bsc's own symbols show up and the
+# whole state-root path still looks opaque.
+[profile.maxperf.package."*"]
+debug = "line-tables-only"
+strip = false
 
 [dev-dependencies]
 uuid = { version = "1", features = ["v4"] }
