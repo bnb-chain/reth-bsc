@@ -603,6 +603,7 @@ pub fn revm_spec_by_timestamp_and_block_number(
             (moran_block, BscHardfork::Moran),
             (nano_block, BscHardfork::Nano),
         ];
+        #[allow(clippy::unnecessary_sort_by)]
         forks.sort_by(|a, b| b.0.cmp(&a.0));
         for &(_, fork) in &forks {
             if chain_spec.bsc_fork_activation(fork).active_at_block(block_number) {
