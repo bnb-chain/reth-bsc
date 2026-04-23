@@ -24,7 +24,7 @@ reth-ethereum-consensus = { git = "https://github.com/bnb-chain/reth.git", branc
 reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "develop-v2" }
 reth-evm = { git = "https://github.com/bnb-chain/reth.git", branch = "develop-v2" }
 reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "develop-v2" }
-reth-primitives-traits = { version = "0.1.1", default-features = false }
+reth-primitives-traits = { git = "https://github.com/bnb-chain/reth-core.git", tag = "v0.1.1", default-features = false }
 reth-provider = { git = "https://github.com/bnb-chain/reth.git", branch = "develop-v2", features = ["test-utils"] }
 reth-revm = { git = "https://github.com/bnb-chain/reth.git", branch = "develop-v2", features = ["std"] }
 reth-tracing = { git = "https://github.com/bnb-chain/reth.git", branch = "develop-v2" }
