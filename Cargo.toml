@@ -57,7 +57,7 @@ reth-node-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "
 reth-network-peers = { git = "https://github.com/bnb-chain/reth.git", branch = "develop-v2" }
 reth-payload-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "develop-v2" }
 reth-ethereum-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "develop-v2" }
-reth-primitives-traits = { git = "https://github.com/bnb-chain/reth-core.git", branch = "main", default-features = false }
+reth-primitives-traits = { version = "0.1.1", default-features = false }
 reth-provider = { git = "https://github.com/bnb-chain/reth.git", branch = "develop-v2", features = [
     "test-utils",
 ] }
