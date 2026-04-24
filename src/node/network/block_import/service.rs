@@ -187,30 +187,76 @@ where
                             .into()
                     }
                     PayloadStatusEnum::Invalid { validation_error } => {
-                        // Do NOT penalize the peer for Invalid blocks.
+                        // Issue #320 / PR #297 context: on BSC's fast block time
+                        // (post-Lorentz down to 0.45s) concurrent reorgs are
+                        // routine. When two peers relay racing siblings, the
+                        // loser returns Invalid from new_payload — but the block
+                        // itself is legitimate, just executed against the wrong
+                        // parent state. Reth's NetworkManager::on_block_imported
+                        // penalizes EVERY Err with BadBlock (-16384 reputation),
+                        // regardless of variant; 4 hits = peer banned (threshold
+                        // -51200), recovery +1/sec = 4.5h to re-earn. Under BSC
+                        // tip-follow, races arrive faster than that recovery, so
+                        // the peer pool drains to zero (#320).
                         //
-                        // In BSC's PoSA with devp2p block propagation, Invalid
-                        // frequently results from timing issues during concurrent
-                        // reorgs — the block itself is legitimate but was executed
-                        // against the wrong state. Penalizing the peer with BadBlock
-                        // (-16384 reputation) for this drains peers rapidly,
-                        // especially under BSC's fast block time (0.45s), where
-                        // concurrent forks are routine.
+                        // PR #297 suppressed the penalty for EVERY Invalid.
+                        // That's too blunt: a truly malformed block from a bad
+                        // peer (wrong Parlia signature, structural hash
+                        // mismatch, etc.) now also escapes the BadBlock
+                        // mechanism. We classify the error string instead —
+                        // race-shaped failures skip the penalty, structural
+                        // failures keep the original behaviour so BadBlock
+                        // still catches real offenders.
                         //
-                        // This aligns with geth's behavior: geth's fetcher only
-                        // drops a peer when header verification fails
-                        // (verifyHeader), never when block execution fails
-                        // (insertChain). Truly malicious peers are still caught by
-                        // the network layer's BadMessage / BadProtocol penalties.
-                        tracing::debug!(
-                            target: "bsc::block_import",
-                            block_hash = %header.hash_slow(),
-                            block_number = header.number,
-                            %validation_error,
-                            peer = %peer_id,
-                            "New payload returned Invalid - not penalizing peer"
-                        );
-                        None
+                        // Aligns with geth's fetcher semantics: drop on header
+                        // verification failure, not on execution failure.
+                        let msg = validation_error.to_string();
+                        let lower = msg.to_ascii_lowercase();
+                        let looks_like_reorg_race = [
+                            // EVM state root mismatch — classic "executed
+                            // against wrong parent" race.
+                            "state root",
+                            "receipts root",
+                            // Parent resolution failures — the engine didn't
+                            // have the parent tip by the time we executed.
+                            "parent block",
+                            "unknown parent",
+                            "missing trie",
+                            // Canonical insertion races.
+                            "insert_canonical",
+                            "reorg",
+                        ]
+                        .iter()
+                        .any(|needle| lower.contains(needle));
+
+                        if looks_like_reorg_race {
+                            tracing::debug!(
+                                target: "bsc::block_import",
+                                block_hash = %header.hash_slow(),
+                                block_number = header.number,
+                                peer = %peer_id,
+                                error = %msg,
+                                "Invalid attributed to reorg race; not penalizing peer",
+                            );
+                            // No Outcome → NetworkManager never sees an Err →
+                            // no BadBlock penalty applied. Early ValidHeader
+                            // announcement from on_new_block still stands.
+                            None
+                        } else {
+                            tracing::info!(
+                                target: "bsc::block_import",
+                                block_hash = %header.hash_slow(),
+                                block_number = header.number,
+                                peer = %peer_id,
+                                error = %msg,
+                                "Invalid treated as structural; peer will be penalized",
+                            );
+                            Outcome {
+                                peer: peer_id,
+                                result: Err(BlockImportError::Other(msg.into())),
+                            }
+                            .into()
+                        }
                     }
                     PayloadStatusEnum::Syncing => {
                         // When new_payload returns Syncing status, we need to manually trigger FCU
@@ -644,39 +690,65 @@ mod tests {
 
     #[tokio::test]
     async fn can_handle_invalid_new_payload() {
-        // When new_payload returns Invalid, the peer should NOT be penalized.
-        // The only event emitted is the early ValidHeader announcement from
-        // on_new_block; no BlockImportOutcome error should follow.
+        // "test error" doesn't hit any of the race-shaped heuristic needles,
+        // so it flows through the "structural" branch and must still emit an
+        // Err outcome — the BadBlock penalty path is preserved for genuine
+        // structural invalidity (bad signature, wrong turn difficulty, etc.).
         let mut fixture = TestFixture::new(EngineResponses::invalid_new_payload()).await;
         fixture
             .assert_block_import(|outcome| {
-                matches!(outcome, BlockImportEvent::Announcement(BlockValidation::ValidHeader { .. }))
+                matches!(
+                    outcome,
+                    BlockImportEvent::Outcome(BlockImportOutcome {
+                        peer: _,
+                        result: Err(BlockImportError::Other(_))
+                    })
+                )
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn reorg_race_invalid_does_not_penalize() {
+        // Error string contains "state root" — our heuristic classifies this
+        // as a reorg race, so NO Err outcome should be emitted. Only the
+        // early ValidHeader announcement (from on_new_block) is observed.
+        let mut fixture = TestFixture::new(EngineResponses {
+            new_payload: PayloadStatusEnum::Invalid {
+                validation_error: "invalid state root (local != remote)".into(),
+            },
+            fcu: PayloadStatusEnum::Syncing,
+        })
+        .await;
+
+        fixture
+            .assert_block_import(|outcome| {
+                matches!(
+                    outcome,
+                    BlockImportEvent::Announcement(BlockValidation::ValidHeader { .. })
+                )
             })
             .await;
 
-        // Verify no error outcome was emitted
+        // Give the service time to process and confirm no follow-up Err
+        // outcome is emitted.
         let waker = futures::task::noop_waker();
         let mut cx = Context::from_waker(&waker);
-        let mut extra = Vec::new();
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(200);
-        loop {
+        let mut extras = Vec::new();
+        while tokio::time::Instant::now() < deadline {
             match fixture.handle.poll_outcome(&mut cx) {
-                Poll::Ready(Some(event)) => extra.push(event),
+                Poll::Ready(Some(ev)) => extras.push(ev),
                 Poll::Ready(None) => break,
-                Poll::Pending => {
-                    if tokio::time::Instant::now() >= deadline {
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                }
+                Poll::Pending => tokio::task::yield_now().await,
             }
         }
         assert!(
-            !extra.iter().any(|e| matches!(
-                e,
+            !extras.iter().any(|ev| matches!(
+                ev,
                 BlockImportEvent::Outcome(BlockImportOutcome { result: Err(_), .. })
             )),
-            "Should not penalize peer for Invalid new_payload. Extra events: {extra:?}"
+            "race-shaped Invalid must not emit an Err outcome (would drain peer reputation). extras = {extras:?}",
         );
     }
 
