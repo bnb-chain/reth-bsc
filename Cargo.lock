@@ -7625,7 +7625,7 @@ dependencies = [
 [[package]]
 name = "reth-codecs"
 version = "0.1.1"
-source = "git+https://github.com/bnb-chain/reth-core.git?tag=v0.1.1#4d055dd54756c824f7dc37e288f993d9c27cc72a"
+source = "git+https://github.com/bnb-chain/reth-core.git?branch=v0.1.1-v2#5e11acfdc8e02201f3e83635b7ff9724ab36f63a"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -7645,7 +7645,7 @@ dependencies = [
 [[package]]
 name = "reth-codecs-derive"
 version = "0.1.1"
-source = "git+https://github.com/bnb-chain/reth-core.git?tag=v0.1.1#4d055dd54756c824f7dc37e288f993d9c27cc72a"
+source = "git+https://github.com/bnb-chain/reth-core.git?branch=v0.1.1-v2#5e11acfdc8e02201f3e83635b7ff9724ab36f63a"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -9107,7 +9107,7 @@ dependencies = [
 [[package]]
 name = "reth-primitives-traits"
 version = "0.1.1"
-source = "git+https://github.com/bnb-chain/reth-core.git?tag=v0.1.1#4d055dd54756c824f7dc37e288f993d9c27cc72a"
+source = "git+https://github.com/bnb-chain/reth-core.git?branch=v0.1.1-v2#5e11acfdc8e02201f3e83635b7ff9724ab36f63a"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -9577,7 +9577,7 @@ dependencies = [
 [[package]]
 name = "reth-rpc-traits"
 version = "0.1.1"
-source = "git+https://github.com/bnb-chain/reth-core.git?tag=v0.1.1#4d055dd54756c824f7dc37e288f993d9c27cc72a"
+source = "git+https://github.com/bnb-chain/reth-core.git?branch=v0.1.1-v2#5e11acfdc8e02201f3e83635b7ff9724ab36f63a"
 dependencies = [
  "alloy-consensus",
  "alloy-network",
@@ -10015,7 +10015,7 @@ dependencies = [
 [[package]]
 name = "reth-zstd-compressors"
 version = "0.1.1"
-source = "git+https://github.com/bnb-chain/reth-core.git?tag=v0.1.1#4d055dd54756c824f7dc37e288f993d9c27cc72a"
+source = "git+https://github.com/bnb-chain/reth-core.git?branch=v0.1.1-v2#5e11acfdc8e02201f3e83635b7ff9724ab36f63a"
 dependencies = [
  "zstd",
 ]
