@@ -18,7 +18,7 @@ use alloy_consensus::{BlockHeader, Transaction};
 use alloy_evm::block::BlockExecutor;
 use alloy_evm::Evm;
 use alloy_primitives::U256;
-use reth::payload::EthPayloadBuilderAttributes;
+use reth_node_ethereum::engine::EthPayloadAttributes;
 use reth::transaction_pool::error::Eip4844PoolTransactionError;
 use reth::transaction_pool::error::InvalidPoolTransactionError;
 use reth::transaction_pool::BestTransactionsAttributes;
@@ -31,8 +31,8 @@ use reth_evm::execute::BlockBuilder;
 use reth_evm::execute::BlockBuilderOutcome;
 use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
 use reth_execution_types::BlockExecutionOutput;
-use reth_payload_primitives::PayloadBuilderAttributes;
 use reth_payload_primitives::{BuiltPayload, BuiltPayloadExecutedBlock, PayloadBuilderError};
+use alloy_eips::eip4895::Withdrawals;
 use either::Either;
 use once_cell::sync::Lazy;
 use revm::context_interface::Block as EvmBlock;
@@ -306,6 +306,8 @@ pub struct BscPayloadBuilder<Pool, Client, EvmConfig = BscEvmConfig> {
     parlia: Arc<Parlia<BscChainSpec>>,
     // Mining context containing header information for blob fee calculation
     ctx: MiningContext,
+    /// Task executor for spawning blocking tasks (e.g., trie prefetcher).
+    task_executor: reth_tasks::TaskExecutor,
 }
 
 impl<Pool, Client, EvmConfig> BscPayloadBuilder<Pool, Client, EvmConfig>
@@ -320,7 +322,7 @@ where
     >,
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>> + 'static,
 {
-    pub const fn new(
+    pub fn new(
         client: Client,
         pool: Pool,
         evm_config: EvmConfig,
@@ -328,8 +330,9 @@ where
         chain_spec: Arc<BscChainSpec>,
         parlia: Arc<Parlia<BscChainSpec>>,
         ctx: MiningContext,
+        task_executor: reth_tasks::TaskExecutor,
     ) -> Self {
-        Self { client, pool, evm_config, builder_config, chain_spec, parlia, ctx }
+        Self { client, pool, evm_config, builder_config, chain_spec, parlia, ctx, task_executor }
     }
 
     /// Builds a payload with the given arguments.
@@ -349,11 +352,11 @@ where
     /// Returns a `Result` containing the built payload or an error.
     pub async fn build_payload(
         &self,
-        args: BscBuildArguments<EthPayloadBuilderAttributes>,
+        args: BscBuildArguments<EthPayloadAttributes>,
     ) -> Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>> {
         let build_start = std::time::Instant::now();
         let BscBuildArguments { mut cached_reads, config, cancel, trace_id, min_gas_tip, parent_difflayers } = args;
-        let PayloadConfig { parent_header, attributes } = config;
+        let PayloadConfig { parent_header, attributes, payload_id: _ } = config;
 
         let parent_hash = parent_header.hash_slow();
         // Parent difflayers were fetched once at job start; reuse across all retry attempts.
@@ -371,7 +374,7 @@ where
         let triedb_prefetcher = triedb_parent_difflayers.clone().and_then(|difflayers| {
             let mut triedb = get_global_triedb();
             let path_db = triedb.get_mut_path_db_ref().clone();
-            MinerTrieDbPrefetcher::new(parent_header.state_root(), path_db, Some(difflayers)).ok()
+            MinerTrieDbPrefetcher::new(parent_header.state_root(), path_db, Some(difflayers), self.task_executor.clone()).ok()
         });
 
         // Sinks transport current_validators / turn_length from the builder (which is consumed by
@@ -383,12 +386,12 @@ where
 
         let next_env_attributes = BscNextBlockEnvAttributes {
             inner: NextBlockEnvAttributes {
-                timestamp: attributes.timestamp(),
-                suggested_fee_recipient: attributes.suggested_fee_recipient(),
-                prev_randao: attributes.prev_randao(),
+                timestamp: attributes.timestamp,
+                suggested_fee_recipient: attributes.suggested_fee_recipient,
+                prev_randao: attributes.prev_randao,
                 gas_limit: self.builder_config.gas_limit(parent_header.gas_limit),
-                parent_beacon_block_root: attributes.parent_beacon_block_root(),
-                withdrawals: Some(attributes.withdrawals().clone()),
+                parent_beacon_block_root: attributes.parent_beacon_block_root,
+                withdrawals: attributes.withdrawals.as_ref().map(|w| Withdrawals::new(w.clone())),
                 extra_data: crate::shared::get_miner_extra()
                     .filter(|b| !b.is_empty())
                     .unwrap_or_else(|| self.builder_config.extra_data.clone()),
@@ -451,7 +454,7 @@ where
         let mut block_blob_count = 0;
 
         let mut blob_fee = None;
-        let blob_params = self.chain_spec.blob_params_at_timestamp(attributes.timestamp());
+        let blob_params = self.chain_spec.blob_params_at_timestamp(attributes.timestamp);
         let header = self.ctx.header.as_ref().ok_or_else(|| {
             Box::new(std::io::Error::other("Missing header in mining context"))
                 as Box<dyn std::error::Error + Send + Sync>
@@ -583,7 +586,7 @@ where
                 if BscHardforks::is_cancun_active_at_timestamp(
                     &self.chain_spec,
                     parent_header.number + 1,
-                    attributes.timestamp(),
+                    attributes.timestamp,
                 ) {
                     let left = max_blob_count - block_blob_count;
                     if left < blob_tx.tx().blob_gas_used().unwrap_or(0) / BLOB_TX_BLOB_GAS_PER_BLOB
@@ -850,12 +853,12 @@ where
     /// Only contains system transactions (if any)
     pub async fn build_empty_payload(
         &self,
-        args: BscBuildArguments<EthPayloadBuilderAttributes>,
+        args: BscBuildArguments<EthPayloadAttributes>,
     ) -> Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>> {
         let build_start = std::time::Instant::now();
         let BscBuildArguments { mut cached_reads, config, cancel: _, trace_id, min_gas_tip: _, parent_difflayers } =
             args;
-        let PayloadConfig { parent_header, attributes } = config;
+        let PayloadConfig { parent_header, attributes, payload_id: _ } = config;
 
         let parent_hash = parent_header.hash_slow();
         // Parent difflayers were fetched once at job start; reuse across all retry attempts.
@@ -873,7 +876,7 @@ where
         let triedb_prefetcher = triedb_parent_difflayers.clone().and_then(|difflayers| {
             let mut triedb = get_global_triedb();
             let path_db = triedb.get_mut_path_db_ref().clone();
-            MinerTrieDbPrefetcher::new(parent_header.state_root(), path_db, Some(difflayers)).ok()
+            MinerTrieDbPrefetcher::new(parent_header.state_root(), path_db, Some(difflayers), self.task_executor.clone()).ok()
         });
 
         // Sinks for empty-payload builds (same delayed-seal mechanism as normal builds).
@@ -888,12 +891,12 @@ where
                 &parent_header,
                 BscNextBlockEnvAttributes {
                     inner: NextBlockEnvAttributes {
-                        timestamp: attributes.timestamp(),
-                        suggested_fee_recipient: attributes.suggested_fee_recipient(),
-                        prev_randao: attributes.prev_randao(),
+                        timestamp: attributes.timestamp,
+                        suggested_fee_recipient: attributes.suggested_fee_recipient,
+                        prev_randao: attributes.prev_randao,
                         gas_limit: self.builder_config.gas_limit(parent_header.gas_limit),
-                        parent_beacon_block_root: attributes.parent_beacon_block_root(),
-                        withdrawals: Some(attributes.withdrawals().clone()),
+                        parent_beacon_block_root: attributes.parent_beacon_block_root,
+                        withdrawals: attributes.withdrawals.as_ref().map(|w| Withdrawals::new(w.clone())),
                         extra_data: crate::shared::get_miner_extra()
                             .filter(|b| !b.is_empty())
                             .unwrap_or_else(|| self.builder_config.extra_data.clone()),
@@ -1082,7 +1085,7 @@ where
     /// Potential payloads vector for selecting the best one
     potential_payloads: Vec<BscBuiltPayload>,
     /// Current build arguments
-    build_args: BscBuildArguments<EthPayloadBuilderAttributes>,
+    build_args: BscBuildArguments<EthPayloadAttributes>,
     /// Retry count for payload building
     retries: u32,
     /// JoinSet for managing build tasks
@@ -1129,7 +1132,7 @@ where
         parlia: Arc<crate::consensus::parlia::Parlia<crate::chainspec::BscChainSpec>>,
         mining_ctx: MiningContext,
         builder: BscPayloadBuilder<Pool, Client, EvmConfig>,
-        build_args: BscBuildArguments<EthPayloadBuilderAttributes>,
+        build_args: BscBuildArguments<EthPayloadAttributes>,
         simulator: Arc<BidSimulator<Client, Pool>>, // No outer RwLock needed
         result_tx: mpsc::UnboundedSender<SubmitContext>,
     ) -> (Self, BscPayloadJobHandle) {

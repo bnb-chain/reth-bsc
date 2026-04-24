@@ -15,7 +15,7 @@ use alloy_evm::Evm;
 use alloy_primitives::U256;
 use alloy_primitives::{Address, B256};
 use parking_lot::RwLock;
-use reth::payload::EthPayloadBuilderAttributes;
+use reth_node_ethereum::engine::EthPayloadAttributes;
 use reth::transaction_pool::BestTransactionsAttributes;
 use reth_chainspec::EthChainSpec;
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
@@ -24,8 +24,8 @@ use reth_evm::execute::BlockBuilderOutcome;
 use reth_evm::execute::{BlockExecutionError, BlockValidationError};
 use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
 use reth_execution_types::BlockExecutionOutput;
-use reth_payload_primitives::PayloadBuilderAttributes;
 use reth_payload_primitives::{BuiltPayloadExecutedBlock, PayloadBuilderError};
+use alloy_eips::eip4895::Withdrawals;
 use either::Either;
 use revm::context_interface::Block as EvmBlock;
 use reth_primitives_traits::SealedHeader;
@@ -79,6 +79,7 @@ pub struct BidSimulator<Client, Pool> {
     parlia: Arc<crate::consensus::parlia::Parlia<crate::chainspec::BscChainSpec>>,
     pool: Pool,
     validator_address: Address,
+    task_executor: reth_tasks::TaskExecutor,
 
     // Each map has its own lock for fine-grained concurrency control
     // This avoids writer starvation when one operation needs write access
@@ -117,12 +118,14 @@ where
         snapshot_provider: Arc<dyn SnapshotProvider + Send + Sync>,
         validator_commission: u64,
         greedy_merge: bool,
+        task_executor: reth_tasks::TaskExecutor,
     ) -> Self {
         Self {
             client,
             parlia,
             pool,
             validator_address,
+            task_executor,
             chain_spec,
             snapshot_provider,
             best_bid_to_run: Arc::new(RwLock::new(HashMap::new())),
@@ -311,7 +314,7 @@ where
         &self,
         _bid: &Bid,
         _validator_commission: u64,
-        attributes: EthPayloadBuilderAttributes,
+        attributes: EthPayloadAttributes,
         mining_ctx: MiningContext,
     ) -> Result<BidRuntime<Pool, BscEvmConfig>, Box<dyn std::error::Error + Send + Sync>> {
         let mut runtime = BidRuntime::new(
@@ -417,6 +420,7 @@ where
                         parent_header.state_root(),
                         path_db,
                         Some(difflayers),
+                        self.task_executor.clone(),
                     )
                     .ok()
                 });
@@ -440,12 +444,12 @@ where
                 &parent_header,
                 BscNextBlockEnvAttributes {
                     inner: NextBlockEnvAttributes {
-                        timestamp: attributes.timestamp(),
-                        suggested_fee_recipient: attributes.suggested_fee_recipient(),
-                        prev_randao: attributes.prev_randao(),
+                        timestamp: attributes.timestamp,
+                        suggested_fee_recipient: attributes.suggested_fee_recipient,
+                        prev_randao: attributes.prev_randao,
                         gas_limit,
-                        parent_beacon_block_root: attributes.parent_beacon_block_root(),
-                        withdrawals: Some(attributes.withdrawals().clone()),
+                        parent_beacon_block_root: attributes.parent_beacon_block_root,
+                        withdrawals: attributes.withdrawals.as_ref().map(|w| Withdrawals::new(w.clone())),
                         extra_data: builder_config.extra_data.clone(),
                     },
                     parent_difflayers: triedb_env_difflayers,
@@ -701,7 +705,7 @@ pub struct BidRuntime<Pool, EvmConfig = BscEvmConfig> {
     pool: Pool,
     evm_config: EvmConfig,
     parent_header: SealedHeader,
-    attributes: EthPayloadBuilderAttributes,
+    attributes: EthPayloadAttributes,
     builder_config: EthereumBuilderConfig,
     chain_spec: Arc<BscChainSpec>,
     pub bsc_payload: Option<BscBuiltPayload>,
@@ -731,7 +735,7 @@ where
         bid: Bid,
         pool: Pool,
         evm_config: EvmConfig,
-        attributes: EthPayloadBuilderAttributes,
+        attributes: EthPayloadAttributes,
         chain_spec: Arc<BscChainSpec>,
         mining_ctx: MiningContext,
     ) -> Self {
@@ -805,7 +809,7 @@ where
         B::Primitives: reth_primitives_traits::NodePrimitives<SignedTx = TransactionSigned>,
     {
         let base_fee: u64 = builder.evm().block().basefee();
-        let blob_params = self.chain_spec.blob_params_at_timestamp(self.attributes.timestamp());
+        let blob_params = self.chain_spec.blob_params_at_timestamp(self.attributes.timestamp);
         let header = self.mining_ctx.header.as_ref().unwrap();
         let blob_eligible = is_blob_eligible_block(&self.chain_spec, header.number, header.timestamp);
         let mut max_blob_count =

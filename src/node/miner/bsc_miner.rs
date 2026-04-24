@@ -722,10 +722,11 @@ where
             self.chain_spec.clone(),
             self.parlia.clone(),
             mining_ctx.clone(),
+            self.task_executor.clone(),
         );
         let build_args = BscBuildArguments {
             cached_reads: mining_ctx.cached_reads.clone().unwrap_or_default(),
-            config: PayloadConfig::new(Arc::new(mining_ctx.parent_header.clone()), attributes),
+            config: PayloadConfig::new(Arc::new(mining_ctx.parent_header.clone()), attributes, alloy_rpc_types_engine::PayloadId::new([0u8; 8])),
             cancel: ManualCancel::default(),
             trace_id: crate::node::miner::payload::generate_trace_id(),
             min_gas_tip: crate::shared::get_miner_gas_tip()
@@ -1278,6 +1279,7 @@ where
             snapshot_provider.clone(),
             mining_config.validator_commission.unwrap_or(100),
             mining_config.greedy_merge,
+            task_executor.clone(),
         ));
         let main_work_worker = MainWorkWorker::new(
             validator_address,

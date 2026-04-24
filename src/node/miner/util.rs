@@ -17,7 +17,7 @@ use crate::node::miner::bsc_miner::MiningContext;
 use crate::node::miner::signer::{seal_header_with_global_signer, SignerError};
 use alloy_consensus::{BlockHeader, Header};
 use alloy_primitives::{Address, Bytes, B256};
-use reth::payload::EthPayloadBuilderAttributes;
+use reth_node_ethereum::engine::EthPayloadAttributes;
 use reth_chainspec::EthChainSpec;
 use reth_primitives_traits::SealedHeader;
 use std::sync::Arc;
@@ -71,19 +71,19 @@ pub fn prepare_new_attributes(
     parlia: Arc<Parlia<BscChainSpec>>,
     parent_header: &SealedHeader,
     signer: Address,
-) -> EthPayloadBuilderAttributes {
+) -> EthPayloadAttributes {
     let mut new_header = prepare_new_header(parlia.clone(), parent_header, signer);
     parlia.prepare_timestamp(&ctx.parent_snapshot, parent_header.header(), &mut new_header);
     // BSC uses the PREVRANDAO opcode to return difficulty (not a random value like
     // Ethereum PoS). The validation path in BscEvmConfig::evm_env sets
     // `prevrandao = header.difficulty()`, so the building path must match.
     let difficulty = calculate_difficulty(&ctx.parent_snapshot, signer);
-    let mut attributes = EthPayloadBuilderAttributes {
-        parent: new_header.parent_hash,
+    let mut attributes = EthPayloadAttributes {
         timestamp: new_header.timestamp,
         suggested_fee_recipient: new_header.beneficiary,
         prev_randao: difficulty.into(),
-        ..Default::default()
+        withdrawals: None,
+        parent_beacon_block_root: None,
     };
     if BscHardforks::is_bohr_active_at_timestamp(
         &parlia.spec,
