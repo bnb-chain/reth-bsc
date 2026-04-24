@@ -28,8 +28,8 @@ use reth_payload_primitives::PayloadBuilderAttributes;
 use reth_payload_primitives::{BuiltPayloadExecutedBlock, PayloadBuilderError};
 use either::Either;
 use revm_context_interface::Block as EvmBlock;
-use reth_primitives::SealedHeader;
-use reth_primitives::TransactionSigned;
+use reth_primitives_traits::SealedHeader;
+use reth_ethereum_primitives::TransactionSigned;
 use reth_primitives_traits::SignerRecoverable;
 use reth_provider::StateProviderFactory;
 use reth_provider::{BlockHashReader, HeaderProvider};
@@ -51,7 +51,7 @@ pub struct Bid {
     pub builder: Address,
     pub block_number: u64,
     pub parent_hash: B256,
-    pub txs: Vec<reth_primitives::TransactionSigned>,
+    pub txs: Vec<TransactionSigned>,
     pub blob_sidecars: HashMap<B256, BlobTransactionSidecar>,
     pub un_revertible: Vec<B256>,
     pub gas_used: u64,
@@ -957,7 +957,7 @@ where
     fn fill_tx_from_pool<B>(
         &mut self,
         builder: &mut B,
-        bid_txs: Vec<reth_primitives::TransactionSigned>,
+        bid_txs: Vec<TransactionSigned>,
         block_gas_limit: u64,
         delay_ms: u64,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>

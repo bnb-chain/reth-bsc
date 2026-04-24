@@ -19,7 +19,7 @@ use alloy_consensus::{BlockHeader, Header};
 use alloy_primitives::{Address, Bytes, B256};
 use reth::payload::EthPayloadBuilderAttributes;
 use reth_chainspec::EthChainSpec;
-use reth_primitives::SealedHeader;
+use reth_primitives_traits::SealedHeader;
 use std::sync::Arc;
 
 fn resolve_epoch_validators(

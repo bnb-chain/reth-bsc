@@ -1,7 +1,7 @@
 use alloy_evm::{rpc::TryIntoTxEnv, EvmEnv};
 use alloy_rpc_types_eth::{AccessList, TransactionRequest};
 use reth_evm::{FromRecoveredTx, FromTxWithEncoded, IntoTxEnv, TransactionEnv};
-use reth_primitives::TransactionSigned;
+use reth_ethereum_primitives::TransactionSigned;
 use revm::{
     context::TxEnv,
     context_interface::transaction::Transaction,
@@ -110,11 +110,11 @@ impl FromRecoveredTx<TransactionSigned> for BscTxEnv {
 impl FromTxWithEncoded<TransactionSigned> for BscTxEnv {
     fn from_encoded_tx(tx: &TransactionSigned, sender: Address, _encoded: Bytes) -> Self {
         let base = match tx.clone().into_typed_transaction() {
-            reth_primitives::Transaction::Legacy(tx) => TxEnv::from_recovered_tx(&tx, sender),
-            reth_primitives::Transaction::Eip2930(tx) => TxEnv::from_recovered_tx(&tx, sender),
-            reth_primitives::Transaction::Eip1559(tx) => TxEnv::from_recovered_tx(&tx, sender),
-            reth_primitives::Transaction::Eip4844(tx) => TxEnv::from_recovered_tx(&tx, sender),
-            reth_primitives::Transaction::Eip7702(tx) => TxEnv::from_recovered_tx(&tx, sender),
+            reth_ethereum_primitives::Transaction::Legacy(tx) => TxEnv::from_recovered_tx(&tx, sender),
+            reth_ethereum_primitives::Transaction::Eip2930(tx) => TxEnv::from_recovered_tx(&tx, sender),
+            reth_ethereum_primitives::Transaction::Eip1559(tx) => TxEnv::from_recovered_tx(&tx, sender),
+            reth_ethereum_primitives::Transaction::Eip4844(tx) => TxEnv::from_recovered_tx(&tx, sender),
+            reth_ethereum_primitives::Transaction::Eip7702(tx) => TxEnv::from_recovered_tx(&tx, sender),
         };
 
         Self { base, is_system_transaction: false }

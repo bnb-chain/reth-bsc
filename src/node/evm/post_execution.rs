@@ -13,7 +13,7 @@ use crate::evm::transaction::BscTxEnv;
 use crate::system_contracts::{SLASH_CONTRACT, SYSTEM_REWARD_CONTRACT, STAKE_HUB_CONTRACT, feynman_fork::{ValidatorElectionInfo, get_top_validators_by_voting_power, ElectedValidators}};
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
 use reth_evm::{eth::receipt_builder::{ReceiptBuilder, ReceiptBuilderCtx}, execute::BlockExecutionError, Database, Evm, FromRecoveredTx, FromTxWithEncoded, IntoTxEnv, block::StateChangeSource};
-use reth_primitives::{TransactionSigned, Transaction};
+use reth_ethereum_primitives::{TransactionSigned, Transaction};
 use reth_revm::State;
 use crate::node::evm::ResultAndState;
 use revm::{

@@ -4,7 +4,7 @@ use alloy_primitives::{Address, BlockHash, BlockNumber, B256, U256};
 use crate::consensus::parlia::error::ParliaConsensusError;
 use reth_evm::execute::{BlockExecutionError, BlockValidationError};
 use reth_provider::ProviderError;
-use reth_primitives::{GotExpected, GotExpectedBoxed};
+use reth_primitives_traits::{GotExpected, GotExpectedBoxed};
 
 /// BSC specific block validation error
 #[derive(thiserror::Error, Debug, Clone)]

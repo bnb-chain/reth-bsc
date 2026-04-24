@@ -17,7 +17,7 @@ use reth_evm::{
     system_calls::SystemCaller,
     Database, Evm, FromRecoveredTx, FromTxWithEncoded, IntoTxEnv, OnStateHook, RecoveredTx,
 };
-use reth_primitives::TransactionSigned;
+use reth_ethereum_primitives::TransactionSigned;
 use reth_provider::BlockExecutionResult;
 use reth_revm::State;
 use revm::{

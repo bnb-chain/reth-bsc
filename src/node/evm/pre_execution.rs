@@ -3,7 +3,7 @@ use crate::evm::transaction::BscTxEnv;
 
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
 use reth_evm::{eth::receipt_builder::ReceiptBuilder, execute::BlockExecutionError, Database, Evm, FromRecoveredTx, FromTxWithEncoded, IntoTxEnv};
-use reth_primitives::TransactionSigned;
+use reth_ethereum_primitives::TransactionSigned;
 use reth_revm::State;
 use revm::{
     context::{BlockEnv, TxEnv},
@@ -20,7 +20,7 @@ use crate::node::evm::util::HEADER_CACHE_READER;
 use crate::system_contracts::feynman_fork::ValidatorElectionInfo;
 use std::{collections::HashMap, sync::{LazyLock, Mutex}};
 use schnellru::{ByLength, LruMap};
-use reth_primitives::GotExpected;
+use reth_primitives_traits::GotExpected;
 use blst::{
     min_pk::{PublicKey, Signature},
     BLST_ERROR,

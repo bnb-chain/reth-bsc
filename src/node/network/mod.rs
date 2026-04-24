@@ -23,7 +23,7 @@ use reth_network::{NetworkConfig, NetworkHandle, NetworkManager};
 use reth_network_api::PeersInfo;
 use reth_network_peers::NodeRecord;
 use reth_provider::{BlockNumReader, HeaderProvider, StateProviderFactory};
-use reth_primitives::TransactionSigned;
+use reth_ethereum_primitives::TransactionSigned;
 use std::{sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, info, warn};
@@ -60,7 +60,7 @@ mod rlp {
     use alloy_primitives::U128;
     use alloy_rlp::{RlpDecodable, RlpEncodable};
     use alloy_rpc_types::Withdrawals;
-    use reth_primitives::TransactionSigned;
+    use reth_ethereum_primitives::TransactionSigned;
     use std::borrow::Cow;
 
     #[derive(RlpEncodable, RlpDecodable)]
@@ -524,7 +524,7 @@ async fn register_nodeids_actions<P: StateProviderFactory>(
     let mut signed_batch: Vec<TransactionSigned> = Vec::new();
     if !to_add.is_empty() {
         let (_to, data) = crate::system_contracts::encode_add_node_ids_call(to_add.clone());
-        let mut tx = reth_primitives::Transaction::Legacy(alloy_consensus::TxLegacy {
+        let mut tx = reth_ethereum_primitives::Transaction::Legacy(alloy_consensus::TxLegacy {
             chain_id: Some(chain_id),
             nonce: next_nonce,
             gas_price: 1000000000,
@@ -539,7 +539,7 @@ async fn register_nodeids_actions<P: StateProviderFactory>(
         let gas = crate::shared::ipc_estimate_gas(req, None, None).await?;
         let gas_limit = std::cmp::min(gas, U256::from(u64::MAX / 2)).to::<u64>();
         debug!(target: "bsc::evn", "Estimated gas for transaction, to_add: {:?}, gas: {}, gas_limit: {}", to_add, gas, gas_limit);
-        if let reth_primitives::Transaction::Legacy(inner) = &mut tx {
+        if let reth_ethereum_primitives::Transaction::Legacy(inner) = &mut tx {
             inner.gas_limit = gas_limit;
         }
         let signed = sign_system_transaction(tx)?;
@@ -551,7 +551,7 @@ async fn register_nodeids_actions<P: StateProviderFactory>(
 
     if !to_remove.is_empty() {
         let (_to, data) = crate::system_contracts::encode_remove_node_ids_call(to_remove.clone());
-        let mut tx = reth_primitives::Transaction::Legacy(alloy_consensus::TxLegacy {
+        let mut tx = reth_ethereum_primitives::Transaction::Legacy(alloy_consensus::TxLegacy {
             chain_id: Some(chain_id),
             nonce: next_nonce,
             gas_price: 1000000000,
@@ -566,7 +566,7 @@ async fn register_nodeids_actions<P: StateProviderFactory>(
         let gas = crate::shared::ipc_estimate_gas(req, None, None).await?;
         let gas_limit = std::cmp::min(gas, U256::from(u64::MAX / 2)).to::<u64>();
         debug!(target: "bsc::evn", "Estimated gas for transaction, to_remove: {:?}, gas: {}, gas_limit: {}", to_remove, gas, gas_limit);
-        if let reth_primitives::Transaction::Legacy(inner) = &mut tx {
+        if let reth_ethereum_primitives::Transaction::Legacy(inner) = &mut tx {
             inner.gas_limit = gas_limit;
         }
         let signed = sign_system_transaction(tx)?;

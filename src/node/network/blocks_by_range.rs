@@ -188,7 +188,7 @@ mod tests {
     use crate::BscBlockBody;
     use alloy_consensus::Header;
     use alloy_rlp::RlpDecodable;
-    use reth_primitives::TransactionSigned;
+    use reth_ethereum_primitives::TransactionSigned;
     use bytes::BytesMut;
 
     #[test]

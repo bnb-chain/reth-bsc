@@ -7,7 +7,7 @@ use crate::consensus::eip4844::is_blob_eligible_block;
 use super::{Parlia, EMPTY_WITHDRAWALS_HASH};
 use alloy_consensus::{Header, Transaction, EMPTY_OMMER_ROOT_HASH};
 use alloy_primitives::B256;
-use reth_primitives::GotExpected;
+use reth_primitives_traits::GotExpected;
 use alloy_eips::eip4844::{DATA_GAS_PER_BLOB, MAX_DATA_GAS_PER_BLOCK_DENCUN};
 use crate::BscBlock;
 use reth_primitives_traits::Block;
@@ -297,7 +297,7 @@ impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 's
 mod tests {
     use super::*;
     use alloy_primitives::B256;
-    use reth_primitives::SealedHeader as RethSealedHeader;
+    use reth_primitives_traits::SealedHeader as RethSealedHeader;
 
     fn sealed(header: Header) -> SealedHeader {
         RethSealedHeader::new(header, B256::ZERO)

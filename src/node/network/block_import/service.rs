@@ -33,7 +33,7 @@ use reth_network_api::{PeerId, Peers, ReputationChangeKind};
 use reth_node_ethereum::EthEngineTypes;
 use reth_payload_builder_primitives::Events;
 use reth_payload_primitives::{BuiltPayload, EngineApiMessageVersion, PayloadTypes};
-use reth_primitives::NodePrimitives;
+use reth_primitives_traits::NodePrimitives;
 use reth_primitives_traits::{AlloyBlockHeader, Block};
 use reth_provider::{BlockHashReader, BlockNumReader, BlockReaderIdExt, HeaderProvider};
 use schnellru::{ByLength, LruMap};
@@ -611,7 +611,8 @@ mod tests {
     use reth_engine_primitives::{BeaconEngineMessage, OnForkChoiceUpdated};
     use reth_eth_wire::NewBlock;
     use reth_node_ethereum::EthEngineTypes;
-    use reth_primitives::{Block, SealedHeader};
+    use reth_ethereum_primitives::Block;
+    use reth_primitives_traits::SealedHeader;
     use reth_provider::ProviderError;
     use schnellru::{ByLength, LruMap};
     use std::{

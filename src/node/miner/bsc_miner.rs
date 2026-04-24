@@ -33,7 +33,8 @@ use reth_chainspec::EthChainSpec;
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
 use reth_network::message::NewBlockMessage;
 use reth_payload_primitives::BuiltPayload;
-use reth_primitives::{SealedHeader, TransactionSigned};
+use reth_primitives_traits::SealedHeader;
+use reth_ethereum_primitives::TransactionSigned;
 use reth_primitives_traits::BlockBody;
 use reth_provider::{
     BlockNumReader, CanonStateNotification, CanonStateSubscriptions, HeaderProvider,
@@ -63,8 +64,8 @@ static SYNC_GATE_FIRST_HIT: OnceLock<Instant> = OnceLock::new();
 
 #[derive(Clone, Debug)]
 pub struct MiningContext {
-    pub header: Option<reth_primitives::Header>, // tmp header for payload building.
-    pub parent_header: reth_primitives::SealedHeader,
+    pub header: Option<alloy_consensus::Header>, // tmp header for payload building.
+    pub parent_header: reth_primitives_traits::SealedHeader,
     pub parent_snapshot: Arc<crate::consensus::parlia::snapshot::Snapshot>,
     pub is_inturn: bool,
     pub cached_reads: Option<reth_revm::cached::CachedReads>,
@@ -384,7 +385,7 @@ where
         }
     }
 
-    fn get_tip_header_at_startup(&self) -> Option<reth_primitives::SealedHeader> {
+    fn get_tip_header_at_startup(&self) -> Option<reth_primitives_traits::SealedHeader> {
         let best_number = self.provider.best_block_number().ok()?;
         let tip_header = self.provider.sealed_header(best_number).ok()??;
         Some(tip_header)

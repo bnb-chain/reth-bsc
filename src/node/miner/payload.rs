@@ -36,9 +36,9 @@ use reth_payload_primitives::{BuiltPayload, BuiltPayloadExecutedBlock, PayloadBu
 use either::Either;
 use once_cell::sync::Lazy;
 use revm_context_interface::Block as EvmBlock;
-use reth_primitives::{HeaderTy, SealedHeader};
-use reth_primitives::InvalidTransactionError;
-use reth_primitives::TransactionSigned;
+use reth_primitives_traits::{HeaderTy, SealedHeader};
+use reth_primitives_traits::transaction::error::InvalidTransactionError;
+use reth_ethereum_primitives::TransactionSigned;
 use reth_primitives_traits::{BlockBody, RecoveredBlock, SignerRecoverable};
 use reth_provider::StateProviderFactory;
 use reth_revm::cached::CachedReads;
@@ -2241,7 +2241,7 @@ mod tests {
     };
     use alloy_primitives::{Address, B256, U256};
     use reth::transaction_pool::error::Eip4844PoolTransactionError;
-    use reth_primitives::SealedHeader;
+    use reth_primitives_traits::SealedHeader;
     use std::sync::Arc;
     use std::time::Duration;
 
