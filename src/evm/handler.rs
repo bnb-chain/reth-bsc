@@ -23,7 +23,7 @@ use revm::{
     interpreter::{interpreter::EthInterpreter, Host, InitialAndFloorGas, SuccessOrHalt},
     primitives::hardfork::SpecId,
 };
-use revm_context_interface::journaled_state::account::JournaledAccountTr;
+use revm::context_interface::journaled_state::account::JournaledAccountTr;
 
 use crate::consensus::SYSTEM_ADDRESS;
 pub struct BscHandler<DB: revm::Database, INSP> {

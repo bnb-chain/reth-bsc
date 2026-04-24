@@ -27,7 +27,7 @@ use reth_execution_types::BlockExecutionOutput;
 use reth_payload_primitives::PayloadBuilderAttributes;
 use reth_payload_primitives::{BuiltPayloadExecutedBlock, PayloadBuilderError};
 use either::Either;
-use revm_context_interface::Block as EvmBlock;
+use revm::context_interface::Block as EvmBlock;
 use reth_primitives_traits::SealedHeader;
 use reth_ethereum_primitives::TransactionSigned;
 use reth_primitives_traits::SignerRecoverable;
