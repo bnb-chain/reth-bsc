@@ -359,6 +359,32 @@ where
         // Parent difflayers were fetched once at job start; reuse across all retry attempts.
         let triedb_parent_difflayers = parent_difflayers;
 
+        // Safety guard: when triedb is active but no difflayers are available, verify that the
+        // parent state root matches the pathdb disk layer.  If they diverge (e.g. after a
+        // restart where in-memory difflayers were lost), building on this parent would produce
+        // a block with an incorrect state root.  Skip building to avoid polluting the network.
+        if rust_eth_triedb::triedb_manager::is_triedb_active() && triedb_parent_difflayers.is_none() {
+            let triedb = get_global_triedb();
+            let (persist_block, persist_root) = triedb
+                .latest_persist_state()
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            if parent_header.state_root() != persist_root {
+                warn!(
+                    target: "payload_builder",
+                    trace_id,
+                    parent_hash = %parent_hash,
+                    parent_number = parent_header.number(),
+                    parent_state_root = %parent_header.state_root(),
+                    pathdb_block = persist_block,
+                    pathdb_root = %persist_root,
+                    "Skipping build_payload: no difflayers and parent state root diverges from pathdb disk layer"
+                );
+                return Err(Box::from(
+                    "triedb pathdb gap: no difflayers and parent state root != pathdb disk layer root",
+                ));
+            }
+        }
+
         let state_provider = self.client.state_by_block_hash(parent_header.hash_slow())?;
         let state = StateProviderDatabase::new(&state_provider);
         let mut db = State::builder()
@@ -389,9 +415,7 @@ where
                 gas_limit: self.builder_config.gas_limit(parent_header.gas_limit),
                 parent_beacon_block_root: attributes.parent_beacon_block_root(),
                 withdrawals: Some(attributes.withdrawals().clone()),
-                extra_data: crate::shared::get_miner_extra()
-                    .filter(|b| !b.is_empty())
-                    .unwrap_or_else(|| self.builder_config.extra_data.clone()),
+                extra_data: self.builder_config.extra_data.clone(),
             },
             parent_difflayers: triedb_parent_difflayers.clone(),
             triedb_prefetcher: triedb_prefetcher.clone(),
@@ -813,7 +837,7 @@ where
         }
 
         let mut plain = sealed_block.clone_block();
-        plain.body.sidecars = Some(blob_sidecars);
+        plain.body.sidecars = if blob_sidecars.is_empty() { None } else { Some(blob_sidecars) };
         sealed_block = Arc::new(plain.into());
 
         let requests = execution_result.requests.clone();
@@ -861,6 +885,30 @@ where
         // Parent difflayers were fetched once at job start; reuse across all retry attempts.
         let triedb_parent_difflayers = parent_difflayers;
 
+        // Safety guard: same as build_payload — refuse to build on a parent whose state root
+        // cannot be correctly resolved by pathdb without difflayers.
+        if rust_eth_triedb::triedb_manager::is_triedb_active() && triedb_parent_difflayers.is_none() {
+            let triedb = get_global_triedb();
+            let (persist_block, persist_root) = triedb
+                .latest_persist_state()
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            if parent_header.state_root() != persist_root {
+                warn!(
+                    target: "payload_builder",
+                    trace_id,
+                    parent_hash = %parent_hash,
+                    parent_number = parent_header.number(),
+                    parent_state_root = %parent_header.state_root(),
+                    pathdb_block = persist_block,
+                    pathdb_root = %persist_root,
+                    "Skipping build_empty_payload: no difflayers and parent state root diverges from pathdb disk layer"
+                );
+                return Err(Box::from(
+                    "triedb pathdb gap: no difflayers and parent state root != pathdb disk layer root",
+                ));
+            }
+        }
+
         let state_provider = self.client.state_by_block_hash(parent_header.hash_slow())?;
         let state = StateProviderDatabase::new(&state_provider);
         let mut db = State::builder()
@@ -894,9 +942,7 @@ where
                         gas_limit: self.builder_config.gas_limit(parent_header.gas_limit),
                         parent_beacon_block_root: attributes.parent_beacon_block_root(),
                         withdrawals: Some(attributes.withdrawals().clone()),
-                        extra_data: crate::shared::get_miner_extra()
-                            .filter(|b| !b.is_empty())
-                            .unwrap_or_else(|| self.builder_config.extra_data.clone()),
+                        extra_data: self.builder_config.extra_data.clone(),
                     },
                     parent_difflayers: triedb_parent_difflayers.clone(),
                     triedb_prefetcher: triedb_prefetcher.clone(),
@@ -1031,7 +1077,8 @@ async fn fetch_triedb_difflayers(trace_id: u64, parent_hash: alloy_primitives::B
                 trace_id,
                 %parent_hash,
                 error = %e,
-                "Failed to fetch parent difflayers; triedb state root falls back to full trie traversal"
+                "Failed to fetch parent difflayers; triedb state root falls back to full trie traversal \
+                 (typically only seen shortly after node startup, before difflayers for recent blocks have been cached)"
             );
             None
         }
@@ -1859,9 +1906,9 @@ where
                 .parent_snapshot
                 .last_block_in_one_turn(try_mine_block_number)
             {
-                (self.expected_end_timestamp_ms - now_ms) as u64
+                self.expected_end_timestamp_ms.saturating_sub(now_ms) as u64
             } else {
-                ((self.expected_end_timestamp_ms - now_ms) as u64) * 3 // wait more when not the last block in turn
+                (self.expected_end_timestamp_ms.saturating_sub(now_ms) as u64).saturating_mul(3)
             };
             if remaining_ms > 50 {
                 remaining_ms = 50;
@@ -2105,6 +2152,7 @@ where
             self.parlia.clone(),
             &self.mining_ctx.parent_snapshot,
             &self.mining_ctx.parent_header,
+            self.mining_ctx.planned_block_ts_ms,
         )
         .map_err(|e| {
             warn!(
@@ -2168,6 +2216,7 @@ fn finalize_payload(
     parlia: Arc<Parlia<BscChainSpec>>,
     parent_snapshot: &Snapshot,
     parent_header: &SealedHeader<alloy_consensus::Header>,
+    planned_block_ts_ms: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let snapshot_provider = crate::shared::get_snapshot_provider()
         .cloned()
@@ -2180,11 +2229,18 @@ fn finalize_payload(
     let mut existing_sidecars = payload.block.clone_block().body.sidecars;
     let mut plain_block = payload.executed_block.recovered_block.sealed_block().clone_block();
 
-    finalize_new_header(parlia, parent_snapshot, parent_header, &mut plain_block.header, &snapshot_provider)
-        .map_err(|e| {
-            Box::new(std::io::Error::other(e.to_string()))
-                as Box<dyn std::error::Error + Send + Sync>
-        })?;
+    finalize_new_header(
+        parlia,
+        parent_snapshot,
+        parent_header,
+        &mut plain_block.header,
+        &snapshot_provider,
+        planned_block_ts_ms,
+    )
+    .map_err(|e| {
+        Box::new(std::io::Error::other(e.to_string()))
+            as Box<dyn std::error::Error + Send + Sync>
+    })?;
 
     let final_hash = plain_block.header.hash_slow();
     if let Some((validators, vote_addresses)) = payload.pending_validators.take() {
@@ -2291,6 +2347,7 @@ mod tests {
             parent_snapshot: Arc::new(snapshot),
             is_inturn,
             cached_reads: None,
+            planned_block_ts_ms: now_ms + delay_ms,
         }
     }
 
@@ -2306,7 +2363,6 @@ mod tests {
         let final_shot_used = false;
 
         for &(arrival_ms, estimated_fees) in tx_arrivals {
-            #[allow(clippy::while_let_loop)]
             loop {
                 let Some(deadline_ms) = wait_deadline_ms else {
                     break;

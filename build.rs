@@ -1,6 +1,26 @@
-use std::{collections::BTreeMap, fs};
+use std::{collections::BTreeMap, fs, process::Command};
 
 fn main() {
+    // Emit reth-bsc git SHA for startup version logging.
+    let git_sha_short = Command::new("git")
+        .args(["rev-parse", "--short=7", "HEAD"])
+        .output()
+        .ok()
+        .and_then(|o| if o.status.success() { String::from_utf8(o.stdout).ok() } else { None })
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let git_sha_long = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .and_then(|o| if o.status.success() { String::from_utf8(o.stdout).ok() } else { None })
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rustc-env=RETH_BSC_GIT_SHA={git_sha_short}");
+    println!("cargo:rustc-env=RETH_BSC_GIT_SHA_LONG={git_sha_long}");
+    println!("cargo:rerun-if-changed=.git/HEAD");
+    println!("cargo:rerun-if-changed=.git/refs/heads");
+
     // Define hardforks that contain system contracts (matching hardfork_to_dir_name function)
     let hardforks = vec![
         "bruno",

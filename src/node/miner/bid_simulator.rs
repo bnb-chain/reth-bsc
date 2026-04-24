@@ -196,6 +196,8 @@ where
             header: None,
             is_inturn: true,
             cached_reads: None,
+            // Populated by prepare_new_attributes below.
+            planned_block_ts_ms: 0,
         };
         let parent_snapshot = mining_ctx.parent_snapshot.clone();
         let attributes = prepare_new_attributes(
@@ -592,7 +594,7 @@ where
         }
 
         let mut plain = sealed_block.clone_block();
-        plain.body.sidecars = Some(bid_runtime.blob_sidecars.clone());
+        plain.body.sidecars = if bid_runtime.blob_sidecars.is_empty() { None } else { Some(bid_runtime.blob_sidecars.clone()) };
         sealed_block = Arc::new(plain.into());
 
         let requests = execution_result.requests.clone();

@@ -41,8 +41,8 @@ use reth_provider::{
 use reth_revm::cancelled::ManualCancel;
 use reth_tasks::TaskExecutor;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_stream::StreamExt;
@@ -51,16 +51,6 @@ use tracing::{debug, error, info, trace, warn};
 /// Maximum number of recently mined blocks to track for double signing prevention
 const RECENT_MINED_BLOCKS_CACHE_SIZE: usize = 100;
 
-/// After this many seconds of `is_syncing() == true` with no canonical events, allow mining
-/// anyway. This breaks the deadlock that occurs when all validators restart simultaneously:
-/// no one produces blocks → no FCU → is_syncing never clears → no mining → deadlock.
-/// 5s ≈ 11 Fermi slots (450 ms each), enough time for a peer to send FCU if any are running.
-const SYNC_GATE_TIMEOUT_SECS: u64 = 5;
-
-/// Tracks when the miner first encountered the sync gate. Used for timeout-based deadlock
-/// recovery when all validators restart simultaneously.
-static SYNC_GATE_FIRST_HIT: OnceLock<Instant> = OnceLock::new();
-
 #[derive(Clone, Debug)]
 pub struct MiningContext {
     pub header: Option<reth_primitives::Header>, // tmp header for payload building.
@@ -68,6 +58,13 @@ pub struct MiningContext {
     pub parent_snapshot: Arc<crate::consensus::parlia::snapshot::Snapshot>,
     pub is_inturn: bool,
     pub cached_reads: Option<reth_revm::cached::CachedReads>,
+    /// Millisecond timestamp fixed by `prepare_timestamp` for this block. `finalize_new_header`
+    /// uses this cached value instead of re-running `block_time_for_ramanujan_fork` — the
+    /// recomputation at sealing time can fall into the wall-clock ceiling branch, cross a
+    /// second boundary, and desync `header.timestamp` (seconds) from the mix_hash ms, producing
+    /// a header that fails `block_time_verify_for_ramanujan_fork` on every peer.
+    /// Populated by `prepare_new_attributes`.
+    pub planned_block_ts_ms: u64,
 }
 
 #[derive(Clone)]
@@ -88,6 +85,72 @@ pub struct NewWorkWorker<Provider> {
     /// Hash of the tip block for which mining was last triggered, used to suppress
     /// periodic-tick retries when no new canonical head has arrived.
     last_triggered_tip: Option<alloy_primitives::B256>,
+}
+
+/// Returns `true` when network conditions allow block production.
+///
+/// One semantic gate plus a startup-safety skip. Each early-return emits
+/// a `DEBUG` log naming the specific path so a stuck validator can be
+/// diagnosed from logs alone.
+///
+/// **No connected peers.** Mining while alone produces a fork chain
+/// that the rest of the network cannot accept back after reconnect:
+/// the remote peer's pathdb disk layer is pinned at its own tip with no
+/// diff layers retained, so it cannot execute blocks built on an older
+/// common ancestor. See
+/// `docs/superpowers/specs/2026-04-18-pathdb-gap-fork-livelock-scenario.md`
+/// for the full scenario analysis.
+///
+/// Intentional limitations:
+///
+/// - A fresh-genesis bootstrap where no peers exist anywhere yet will
+///   skip mining forever. Bootstrapping a brand-new network with this
+///   code is **not supported today**; revisit if/when an explicit
+///   bootstrap mode is added.
+///
+/// - This function intentionally does **not** gate on
+///   `NetworkHandle::is_syncing()`. That flag is set to `Syncing` at
+///   process start (`reth/crates/node/builder/src/launch/engine.rs:165`)
+///   and is only cleared to `Idle` on a `CanonicalChainCommitted`
+///   event — i.e., after a block has been committed to the canonical
+///   chain. In a small-validator-count network (e.g. `N = 2` on
+///   qanet) where all validators restart together and the backends
+///   are already aligned, no backfill is kicked off and no block is
+///   committed post-startup, so the flag never flips back. Combined
+///   with the peer gate above, that produced a hard deadlock: miner
+///   waits on `is_syncing == false`, which needs a committed block,
+///   which needs a miner to run — circular. The trade-off of removing
+///   the gate: during a *real* backfill window the miner may briefly
+///   produce blocks on a stale tip; peers will reject them as
+///   out-of-date, so the cost is wasted work rather than a
+///   correctness issue. See the "Non-Goals" section of
+///   `docs/superpowers/specs/2026-04-20-peer-gated-mining-design.md`.
+///
+/// Also returns `false` (skip) when the network handle is not yet
+/// installed. That window exists briefly at startup; skipping during
+/// it is safer than defaulting to "allow mining" when we cannot even
+/// check peer count.
+fn is_network_ready_to_mine(tip_number: u64) -> bool {
+    let Some(network) = crate::shared::get_network_handle() else {
+        debug!(
+            target: "bsc::miner",
+            tip_number,
+            "Skip mining: network handle not yet available"
+        );
+        return false;
+    };
+
+    use reth_network::PeersInfo;
+    if network.num_connected_peers() == 0 {
+        debug!(
+            target: "bsc::miner",
+            tip_number,
+            "Skip mining: no peers connected"
+        );
+        return false;
+    }
+
+    true
 }
 
 impl<Provider> NewWorkWorker<Provider>
@@ -435,31 +498,8 @@ where
             return;
         }
 
-        // Gate mining on live sync: skip if the node is still backfill-syncing.
-        // Exception: if all validators restart simultaneously, is_syncing() never clears
-        // because no FCU arrives. After SYNC_GATE_TIMEOUT_SECS we allow mining to break
-        // the deadlock.
-        if let Some(network) = crate::shared::get_network_handle() {
-            use reth_network_p2p::sync::SyncStateProvider;
-            if network.is_syncing() {
-                let first_hit = SYNC_GATE_FIRST_HIT.get_or_init(Instant::now);
-                let elapsed = first_hit.elapsed();
-                if elapsed < Duration::from_secs(SYNC_GATE_TIMEOUT_SECS) {
-                    debug!(
-                        target: "bsc::miner",
-                        tip_number = tip.number(),
-                        elapsed_secs = elapsed.as_secs(),
-                        "Skip mining: node is syncing (backfill active)"
-                    );
-                    return;
-                }
-                warn!(
-                    target: "bsc::miner",
-                    tip_number = tip.number(),
-                    elapsed_secs = elapsed.as_secs(),
-                    "Sync gate timeout reached, allowing mining to break potential all-validators-restart deadlock"
-                );
-            }
+        if !is_network_ready_to_mine(tip.number()) {
+            return;
         }
 
         let parent_header = match self.provider.sealed_header_by_hash(tip.hash()) {
@@ -541,6 +581,8 @@ where
             parent_snapshot: Arc::new(parent_snapshot),
             is_inturn,
             cached_reads: self.maybe_pre_cached(parent_hash),
+            // Populated by prepare_new_attributes once the payload job starts.
+            planned_block_ts_ms: 0,
         };
 
         debug!("Queuing mining context, next_block: {}", tip.number() + 1);
@@ -727,9 +769,7 @@ where
             config: PayloadConfig::new(Arc::new(mining_ctx.parent_header.clone()), attributes),
             cancel: ManualCancel::default(),
             trace_id: crate::node::miner::payload::generate_trace_id(),
-            min_gas_tip: crate::shared::get_miner_gas_tip()
-                .map(|v| v as u128)
-                .unwrap_or(self.desired_min_gas_tip),
+            min_gas_tip: self.desired_min_gas_tip,
             parent_difflayers: None, // populated once at job start via fetch_triedb_difflayers
         };
 
