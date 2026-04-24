@@ -39,6 +39,7 @@ pub mod bootnodes;
 pub mod evn;
 pub mod evn_peers;
 pub mod handshake;
+pub mod peer_metrics;
 pub(crate) mod upgrade_status;
 pub(crate) mod votes;
 pub(crate) mod bsc_protocol {
