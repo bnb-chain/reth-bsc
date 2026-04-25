@@ -1110,10 +1110,6 @@ where
     builder: Arc<BscPayloadBuilder<Pool, Client, EvmConfig>>,
     /// Timeout for payload building
     timeout: std::time::Duration,
-    /// Expected end timestamp (milliseconds since UNIX epoch).
-    ///
-    /// Initialized in `new()` as: `now_ms + parlia.delay_for_ramanujan_fork(... )`.
-    expected_end_timestamp_ms: u128,
     /// Message queue for processing build arguments
     try_build_rx: mpsc::UnboundedReceiver<()>,
     /// Sender for sending arguments back to queue
@@ -1193,16 +1189,6 @@ where
         );
         let pending_basefee = builder.pool.block_info().pending_basefee;
 
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        let expected_end_delay_ms = parlia.delay_for_ramanujan_fork(
-            &mining_ctx.parent_snapshot,
-            mining_ctx.header.as_ref().unwrap(),
-        );
-        let expected_end_timestamp_ms = now_ms + expected_end_delay_ms as u128;
-
         // Spawn a background task to listen for new transactions from pool
         // When tx_listener_rx is dropped (job ends), tx_listener_tx.send() will fail,
         // causing this task to exit and pool_listener to be dropped,
@@ -1222,7 +1208,6 @@ where
             mining_ctx,
             builder: Arc::new(builder),
             timeout: std::time::Duration::from_millis(mining_delay),
-            expected_end_timestamp_ms,
             try_build_rx,
             try_build_tx: try_build_tx.clone(),
             tx_listener: tx_listener_rx,
@@ -1251,7 +1236,7 @@ where
             block_number = job.mining_ctx.parent_header.number() + 1,
             is_inturn = job.mining_ctx.is_inturn,
             timeout = ?job.timeout,
-            expected_end_timestamp_ms = job.expected_end_timestamp_ms,
+            end_mining_timestamp_ms = job.mining_ctx.end_mining_timestamp_ms,
             "Succeed to new payload job"
         );
         (job, handle)
@@ -1774,7 +1759,7 @@ where
     /// build and block until its result (or an abort signal) arrives.
     ///
     /// Phase 2 — collect better candidates: loop over remaining background builds in 50 ms slices
-    /// until the pre-computed `expected_end_timestamp_ms` deadline (+ 150 ms grace) is reached or
+    /// until the pre-computed `end_mining_timestamp_ms` deadline (+ 150 ms grace) is reached or
     /// all background tasks finish, whichever comes first.
     fn collect_payload_candidates(&mut self) -> Result<(), Box<BscPayloadJobError>> {
         // Phase 1: guarantee at least one candidate.
@@ -1885,7 +1870,7 @@ where
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis();
-            if now_ms >= self.expected_end_timestamp_ms + 150 {
+            if now_ms >= self.mining_ctx.end_mining_timestamp_ms + 150 {
                 debug!(
                     target: "bsc::miner::payload",
                     trace_id = self.trace_id,
@@ -1893,7 +1878,7 @@ where
                     is_inturn = self.mining_ctx.is_inturn,
                     bg_tasks = self.join_handle.len(),
                     now_ms,
-                    expected_end_timestamp_ms = self.expected_end_timestamp_ms,
+                    end_mining_timestamp_ms = self.mining_ctx.end_mining_timestamp_ms,
                     "Skip waiting for additional payload candidates due to timeout"
                 );
                 break;
@@ -1906,9 +1891,10 @@ where
                 .parent_snapshot
                 .last_block_in_one_turn(try_mine_block_number)
             {
-                self.expected_end_timestamp_ms.saturating_sub(now_ms) as u64
+                self.mining_ctx.end_mining_timestamp_ms.saturating_sub(now_ms) as u64
             } else {
-                (self.expected_end_timestamp_ms.saturating_sub(now_ms) as u64).saturating_mul(3)
+                (self.mining_ctx.end_mining_timestamp_ms.saturating_sub(now_ms) as u64)
+                    .saturating_mul(3)
             };
             if remaining_ms > 50 {
                 remaining_ms = 50;
@@ -1944,7 +1930,7 @@ where
                         is_inturn = self.mining_ctx.is_inturn,
                         waited_ms = waited.as_millis(),
                         bg_tasks = self.join_handle.len(),
-                        expected_end_timestamp_ms = self.expected_end_timestamp_ms,
+                        end_mining_timestamp_ms = self.mining_ctx.end_mining_timestamp_ms,
                         "No background payload candidate finished within wait slice"
                     );
                     // Keep waiting in further slices until we hit the expected end timestamp (+grace)
@@ -2043,7 +2029,7 @@ where
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis();
-        let delay_ms = self.expected_end_timestamp_ms.saturating_sub(now_ms) as u64;
+        let delay_ms = self.mining_ctx.end_mining_timestamp_ms.saturating_sub(now_ms) as u64;
 
         let submit_ctx = SubmitContext {
             mining_ctx: self.mining_ctx.clone(),
@@ -2152,7 +2138,7 @@ where
             self.parlia.clone(),
             &self.mining_ctx.parent_snapshot,
             &self.mining_ctx.parent_header,
-            self.mining_ctx.planned_block_ts_ms,
+            self.mining_ctx.block_timestamp_ms,
         )
         .map_err(|e| {
             warn!(
@@ -2216,7 +2202,7 @@ fn finalize_payload(
     parlia: Arc<Parlia<BscChainSpec>>,
     parent_snapshot: &Snapshot,
     parent_header: &SealedHeader<alloy_consensus::Header>,
-    planned_block_ts_ms: u64,
+    block_timestamp_ms: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let snapshot_provider = crate::shared::get_snapshot_provider()
         .cloned()
@@ -2235,7 +2221,7 @@ fn finalize_payload(
         parent_header,
         &mut plain_block.header,
         &snapshot_provider,
-        planned_block_ts_ms,
+        block_timestamp_ms,
     )
     .map_err(|e| {
         Box::new(std::io::Error::other(e.to_string()))
@@ -2347,7 +2333,8 @@ mod tests {
             parent_snapshot: Arc::new(snapshot),
             is_inturn,
             cached_reads: None,
-            planned_block_ts_ms: now_ms + delay_ms,
+            block_timestamp_ms: now_ms + delay_ms,
+            end_mining_timestamp_ms: 0,
         }
     }
 

@@ -306,9 +306,9 @@ where
                 .snapshot_by_hash(&header.parent_hash)
                 .ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;
             // `assemble_block` is not used by the miner pipeline (see note above). No
-            // cached planned ms is available here, so compute one locally via the same
+            // cached block timestamp is available here, so compute one locally via the same
             // formula prepare_timestamp uses.
-            let planned_block_ts_ms = self.parlia.block_time_for_ramanujan_fork(
+            let block_timestamp_ms = self.parlia.block_time_for_ramanujan_fork(
                 &parent_snap,
                 parent_header.header(),
                 &header,
@@ -319,7 +319,7 @@ where
                 &parent_header,
                 &mut header,
                 &snapshot_provider,
-                planned_block_ts_ms,
+                block_timestamp_ms,
             ).map_err(|e| BlockExecutionError::msg(format!("Failed to finalize header: {}", e)))?;
 
             let header_hash = keccak256(alloy_rlp::encode(&header));

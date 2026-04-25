@@ -66,6 +66,14 @@ fn resolve_epoch_validators(
     Ok((validators, vote_addresses))
 }
 
+/// Prepare a new block's header and derive the payload builder attributes.
+///
+/// Populates on `ctx`:
+/// - `header`: the freshly constructed unsealed header for this block.
+/// - `block_timestamp_ms`: block timestamp in ms fixed by `prepare_timestamp`, reused
+///   verbatim by `finalize_new_header` to avoid seconds/ms drift at sealing time.
+/// - `end_mining_timestamp_ms`: wall-clock deadline for this mining job, computed as
+///   `now_ms + parlia.delay_for_ramanujan_fork(...)`.
 pub fn prepare_new_attributes(
     ctx: &mut MiningContext,
     parlia: Arc<Parlia<BscChainSpec>>,
@@ -74,10 +82,17 @@ pub fn prepare_new_attributes(
 ) -> EthPayloadBuilderAttributes {
     let mut new_header = prepare_new_header(parlia.clone(), parent_header, signer);
     // Cache the planned millisecond timestamp so finalize_new_header can reuse it verbatim.
-    // Recomputing at sealing time can hit block_time_for_ramanujan_fork's ceiling path and
-    // desync the header's seconds/ms halves — the root cause of the 2026-04-20 qanet stall.
-    ctx.planned_block_ts_ms =
+    ctx.block_timestamp_ms =
         parlia.prepare_timestamp(&ctx.parent_snapshot, parent_header.header(), &mut new_header);
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let end_mining_delay_ms =
+        parlia.delay_for_ramanujan_fork(&ctx.parent_snapshot, &new_header);
+    ctx.end_mining_timestamp_ms = now_ms + end_mining_delay_ms as u128;
+
     // BSC uses the PREVRANDAO opcode to return difficulty (not a random value like
     // Ethereum PoS). The validation path in BscEvmConfig::evm_env sets
     // `prevrandao = header.difficulty()`, so the building path must match.
@@ -142,7 +157,7 @@ where
 
 /// finalize a new header and seal it.
 ///
-/// `planned_block_ts_ms` is the millisecond timestamp decided by `prepare_timestamp` and
+/// `block_timestamp_ms` is the millisecond timestamp decided by `prepare_timestamp` and
 /// cached on `MiningContext`. This function never recomputes it via
 /// `block_time_for_ramanujan_fork`: recomputation at sealing time can fall into the
 /// wall-clock ceiling branch (`new_block_ts < now`) and cross a second boundary,
@@ -155,14 +170,14 @@ pub fn finalize_new_header<ChainSpec>(
     parent_header: &SealedHeader,
     new_header: &mut Header,
     snapshot_provider: &Arc<dyn SnapshotProvider + Send + Sync>,
-    planned_block_ts_ms: u64,
+    block_timestamp_ms: u64,
 ) -> Result<(), crate::node::miner::signer::SignerError>
 where
     ChainSpec: EthChainSpec + crate::hardforks::BscHardforks + 'static,
 {
     new_header.difficulty = calculate_difficulty(parent_snap, new_header.beneficiary);
     if parlia.spec.is_lorentz_active_at_timestamp(new_header.number, new_header.timestamp) {
-        set_millisecond_part_of_timestamp(planned_block_ts_ms, new_header);
+        set_millisecond_part_of_timestamp(block_timestamp_ms, new_header);
     } else {
         new_header.mix_hash = B256::ZERO;
     }
