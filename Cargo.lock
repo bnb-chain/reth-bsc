@@ -10084,6 +10084,7 @@ dependencies = [
  "reth-cli",
  "reth-cli-commands",
  "reth-cli-util",
+ "reth-codecs",
  "reth-db",
  "reth-discv4",
  "reth-engine-local",

@@ -230,7 +230,6 @@ where
                             .fork_choice_updated(
                                 forkchoice_state,
                                 None,
-                                reth_payload_primitives::EngineApiMessageVersion::V1,
                             )
                             .await
                         {
@@ -1028,7 +1027,6 @@ mod tests {
                     BeaconEngineMessage::ForkchoiceUpdated {
                         state: _,
                         payload_attrs: _,
-                        version: _,
                         tx,
                     } => {
                         tx.send(Ok(OnForkChoiceUpdated::valid(PayloadStatus::new(

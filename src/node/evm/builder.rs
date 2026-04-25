@@ -98,10 +98,11 @@ where
             &revm::context::result::ExecutionResult<<<Self::Executor as alloy_evm::block::BlockExecutor>::Evm as alloy_evm::Evm>::HaltReason>,
         ) -> alloy_evm::block::CommitChanges,
     ) -> Result<Option<u64>, BlockExecutionError> {
+        let (tx_env, recovered) = tx.into_parts();
         if let Some(gas_used) =
-            self.executor.execute_transaction_with_commit_condition(tx.as_executable(), f)?
+            self.executor.execute_transaction_with_commit_condition((tx_env, &recovered), f)?
         {
-            self.transactions.push(tx.into_recovered());
+            self.transactions.push(recovered);
             Ok(Some(gas_used))
         } else {
             Ok(None)
@@ -112,6 +113,7 @@ where
     fn finish(
         self,
         state: impl StateProvider,
+        _state_root_precomputed: Option<(alloy_primitives::B256, TrieUpdates)>,
     ) -> Result<BlockBuilderOutcome<BscPrimitives>, BlockExecutionError> {
         Ok(self.finish_with_difflayer(state)?.inner)
     }

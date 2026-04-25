@@ -307,7 +307,7 @@ impl BscNetworkBuilder {
         }
 
         // Spawn the critical ImportService task exactly like the official implementation
-        ctx.task_executor().spawn_critical("block import", async move {
+        ctx.task_executor().spawn_critical_task("block import", async move {
             let handle = engine_handle_rx
                 .lock()
                 .await
@@ -440,7 +440,7 @@ fn spawn_evn_sync_watcher<Node>(
         .unwrap_or(30);
     let provider = ctx.provider().clone();
     let chain_spec = ctx.chain_spec().clone();
-    ctx.task_executor().spawn_critical("evn-sync-watcher", async move {
+    ctx.task_executor().spawn_critical_task("evn-sync-watcher", async move {
         use std::time::{SystemTime, UNIX_EPOCH, Duration};
         use alloy_consensus::BlockHeader;
 

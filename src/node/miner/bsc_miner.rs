@@ -567,6 +567,7 @@ pub struct MainWorkWorker<Pool, Provider> {
     simulator: Arc<BidSimulator<Provider, Pool>>, // No outer RwLock, each map has its own lock
     desired_gas_limit: u64,
     desired_min_gas_tip: u128,
+    task_executor: reth_tasks::TaskExecutor,
 }
 
 impl<Pool, Provider> MainWorkWorker<Pool, Provider>
@@ -595,6 +596,7 @@ where
         payload_tx: mpsc::UnboundedSender<SubmitContext>,
         desired_gas_limit: u64,
         desired_min_gas_tip: u128,
+        task_executor: reth_tasks::TaskExecutor,
     ) -> Self {
         Self {
             pool,
@@ -609,6 +611,7 @@ where
             payload_job_join_set: JoinSet::new(),
             desired_gas_limit,
             desired_min_gas_tip,
+            task_executor,
         }
     }
 
@@ -1292,6 +1295,7 @@ where
             payload_tx,
             desired_gas_limit,
             desired_min_gas_tip,
+            task_executor.clone(),
         );
 
         let result_work_worker = ResultWorkWorker::new(
@@ -1326,10 +1330,10 @@ where
     }
 
     fn spawn_workers(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.task_executor.spawn_critical("mev_work_worker", self.mev_work_worker.run());
-        self.task_executor.spawn_critical("new_work_worker", self.new_work_worker.run());
-        self.task_executor.spawn_critical("main_work_worker", self.main_work_worker.run());
-        self.task_executor.spawn_critical("result_work_worker", self.result_work_worker.run());
+        self.task_executor.spawn_critical_task("mev_work_worker", self.mev_work_worker.run());
+        self.task_executor.spawn_critical_task("new_work_worker", self.new_work_worker.run());
+        self.task_executor.spawn_critical_task("main_work_worker", self.main_work_worker.run());
+        self.task_executor.spawn_critical_task("result_work_worker", self.result_work_worker.run());
         info!("Succeed to start mining, address: {}", self.validator_address);
         Ok(())
     }

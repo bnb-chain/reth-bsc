@@ -32,7 +32,6 @@ use reth::{
 use reth_chainspec::EthChainSpec;
 use reth_engine_primitives::ConsensusEngineHandle;
 use reth_ethereum_primitives::Receipt;
-use reth_payload_primitives::EngineApiMessageVersion;
 use reth_primitives_traits::{receipt::gas_spent_by_transactions, GotExpected};
 use reth_primitives_traits::constants::{GAS_LIMIT_BOUND_DIVISOR, MINIMUM_GAS_LIMIT};
 use reth_provider::{BlockNumReader, HeaderProvider};
@@ -1256,7 +1255,7 @@ where
 
         match self
             .engine_handle
-            .fork_choice_updated(state, None, EngineApiMessageVersion::default())
+            .fork_choice_updated(state, None)
             .await
         {
             Ok(response) => match response.payload_status.status {

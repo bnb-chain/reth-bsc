@@ -1,6 +1,7 @@
 use alloy_evm::{rpc::TryIntoTxEnv, EvmEnv};
 use alloy_rpc_types_eth::{AccessList, TransactionRequest};
-use reth_evm::{FromRecoveredTx, FromTxWithEncoded, IntoTxEnv, TransactionEnv};
+use alloy_evm::TransactionEnvMut;
+use reth_evm::{FromRecoveredTx, FromTxWithEncoded, IntoTxEnv};
 use reth_ethereum_primitives::TransactionSigned;
 use revm::{
     context::TxEnv,
@@ -121,13 +122,9 @@ impl FromTxWithEncoded<TransactionSigned> for BscTxEnv {
     }
 }
 
-impl TransactionEnv for BscTxEnv {
+impl TransactionEnvMut for BscTxEnv {
     fn set_gas_limit(&mut self, gas_limit: u64) {
         self.base.set_gas_limit(gas_limit);
-    }
-
-    fn nonce(&self) -> u64 {
-        TransactionEnv::nonce(&self.base)
     }
 
     fn set_nonce(&mut self, nonce: u64) {
@@ -157,15 +154,19 @@ impl SystemCallTx for BscTxEnv {
     }
 }
 
-impl TryIntoTxEnv<BscTxEnv> for TransactionRequest {
-    type Err = <TransactionRequest as TryIntoTxEnv<TxEnv>>::Err;
+impl<Spec, BlockEnv: alloy_evm::env::BlockEnvironment> TryIntoTxEnv<BscTxEnv, Spec, BlockEnv>
+    for TransactionRequest
+{
+    type Err = <TransactionRequest as TryIntoTxEnv<TxEnv, Spec, BlockEnv>>::Err;
 
-    fn try_into_tx_env<Spec>(
+    fn try_into_tx_env(
         self,
-        evm_env: &EvmEnv<Spec>,
-    ) -> Result<BscTxEnv, <TransactionRequest as TryIntoTxEnv<TxEnv>>::Err> {
+        evm_env: &EvmEnv<Spec, BlockEnv>,
+    ) -> Result<BscTxEnv, Self::Err> {
         Ok(BscTxEnv {
-            base: <TransactionRequest as TryIntoTxEnv<TxEnv>>::try_into_tx_env(self, evm_env)?,
+            base: <TransactionRequest as TryIntoTxEnv<TxEnv, Spec, BlockEnv>>::try_into_tx_env(
+                self, evm_env,
+            )?,
             is_system_transaction: false,
         })
     }

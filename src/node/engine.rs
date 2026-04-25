@@ -123,7 +123,7 @@ where
             let chain_spec_clone = Arc::new(ctx.config().chain.clone().as_ref().clone());
             let task_executor_clone = ctx.task_executor().clone();
 
-            ctx.task_executor().spawn_critical("bsc-miner-initializer", async move {
+            ctx.task_executor().spawn_critical_task("bsc-miner-initializer", async move {
                 info!("Waiting for consensus module to initialize snapshot provider...");
                 let mut attempts = 0;
                 let snapshot_provider = loop {
@@ -165,7 +165,7 @@ where
         let _ = crate::shared::set_payload_events_tx(events_tx.clone());
 
         // Handle payload service commands (keep minimal compatibility but with shared events channel)
-        ctx.task_executor().spawn_critical("payload-service-handler", async move {
+        ctx.task_executor().spawn_critical_task("payload-service-handler", async move {
             while let Some(message) = rx.recv().await {
                 match message {
                     PayloadServiceCommand::Subscribe(tx) => {
