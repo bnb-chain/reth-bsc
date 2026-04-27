@@ -1,7 +1,5 @@
 //! Fork recovery: ancestor-aware block pull that replaces the naive
 //! batch range-request call in the import service.
-//!
-//! See `docs/superpowers/specs/2026-04-17-p2p-fork-recovery-design.md`.
 
 use std::{sync::Arc, time::Duration};
 
@@ -26,8 +24,7 @@ use crate::{
 pub const MAX_FORK_DEPTH: u64 = 2048;
 
 /// Blocks fetched per `GetBlocksByRange` hop. Kept small because BSC blocks
-/// are large (full tx bodies + sidecars); a 64-block response is slow to
-/// transmit and wasteful when the ancestor is a handful of blocks away.
+/// are large (full tx bodies + sidecars).
 pub const FORK_RECOVER_HOP_COUNT: u64 = 4;
 
 /// Per-hop network timeout.

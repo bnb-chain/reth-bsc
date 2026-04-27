@@ -76,8 +76,6 @@ const LRU_PROCESSED_BLOCKS_SIZE: u32 = 100;
 /// can reach a common ancestor and resolve the reorg itself; beyond it, the
 /// ancestor walk must fail (`ForkTooDeep`), so we skip the doomed attempt and
 /// hand off to the pipeline via engine-tree's optimistic-sync branch.
-///
-/// See `docs/superpowers/specs/2026-04-21-far-behind-pipeline-trigger-design.md`.
 const PIPELINE_TRIGGER_DELTA: u64 =
     crate::node::network::block_import::fork_recover::MAX_FORK_DEPTH;
 

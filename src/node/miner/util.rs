@@ -158,12 +158,7 @@ where
 /// finalize a new header and seal it.
 ///
 /// `block_timestamp_ms` is the millisecond timestamp decided by `prepare_timestamp` and
-/// cached on `MiningContext`. This function never recomputes it via
-/// `block_time_for_ramanujan_fork`: recomputation at sealing time can fall into the
-/// wall-clock ceiling branch (`new_block_ts < now`) and cross a second boundary,
-/// desyncing the already-fixed `header.timestamp` from `mix_hash`'s ms part. That drift
-/// was the root cause of the 2026-04-20 bsc-qanet stall. Mirrors go-bsc's
-/// `Prepare`-decides-once / `Seal`-never-recomputes discipline.
+/// cached on `MiningContext`.
 pub fn finalize_new_header<ChainSpec>(
     parlia: Arc<Parlia<ChainSpec>>,
     parent_snap: &Snapshot,
@@ -183,7 +178,9 @@ where
     }
 
     if new_header.extra_data.len() < EXTRA_VANITY_LEN {
-        new_header.extra_data = Bytes::from(vec![0u8; EXTRA_VANITY_LEN]);
+        let mut padded = new_header.extra_data.to_vec();
+        padded.resize(EXTRA_VANITY_LEN, 0u8);
+        new_header.extra_data = Bytes::from(padded);
     }
     // TODO: add vanity data, and fork hash.
     // set default header extra with Reth version.
