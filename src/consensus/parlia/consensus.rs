@@ -620,8 +620,7 @@ where
     /// Set `new_header.timestamp` (seconds) and `mix_hash` (Lorentz-era ms) based on
     /// `parent + block_interval + back_off_time` (with a wall-clock ceiling fallback).
     /// Returns the computed millisecond timestamp so callers can cache it and feed the
-    /// same value back into `finalize_new_header`, avoiding the seconds/ms drift bug
-    /// triggered when the ceiling path fires again at sealing time.
+    /// same value back into `finalize_new_header`.
     pub fn prepare_timestamp(
         &self,
         parent_snap: &Snapshot,

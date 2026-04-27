@@ -305,9 +305,6 @@ where
             let parent_snap = snapshot_provider
                 .snapshot_by_hash(&header.parent_hash)
                 .ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;
-            // `assemble_block` is not used by the miner pipeline (see note above). No
-            // cached block timestamp is available here, so compute one locally via the same
-            // formula prepare_timestamp uses.
             let block_timestamp_ms = self.parlia.block_time_for_ramanujan_fork(
                 &parent_snap,
                 parent_header.header(),
