@@ -58,11 +58,9 @@ pub struct MiningContext {
     pub parent_snapshot: Arc<crate::consensus::parlia::snapshot::Snapshot>,
     pub is_inturn: bool,
     pub cached_reads: Option<reth_revm::cached::CachedReads>,
-    /// Block timestamp in milliseconds, computed via `block_time_for_ramanujan_fork`
-    /// during mining context initialization.
+    /// Block timestamp in milliseconds, computed via `block_time_for_ramanujan_fork`.
     pub block_timestamp_ms: u64,
-    /// End timestamp of the mining job (UNIX epoch ms), computed via `delay_for_ramanujan_fork`
-    /// during mining context initialization.
+    /// End timestamp of the mining job (UNIX epoch ms), computed via `delay_for_ramanujan_fork`.
     pub end_mining_timestamp_ms: u128,
 }
 
@@ -87,13 +85,13 @@ pub struct NewWorkWorker<Provider> {
 }
 
 /// Skip mining when isolated (no peers or network handle not yet installed) to avoid
-/// producing a small fork-chain that peers can't reconcile after reconnect.
+/// producing a small fork-chain that peers do not know about after reconnect.
 fn is_network_ready_to_mine(tip_number: u64) -> bool {
     let Some(network) = crate::shared::get_network_handle() else {
         debug!(
             target: "bsc::miner",
             tip_number,
-            "Skip mining: network handle not yet available"
+            "Skip mining due to network handle not yet available"
         );
         return false;
     };
@@ -103,7 +101,7 @@ fn is_network_ready_to_mine(tip_number: u64) -> bool {
         debug!(
             target: "bsc::miner",
             tip_number,
-            "Skip mining: no peers connected"
+            "Skip mining due to no peers connected"
         );
         return false;
     }
@@ -539,7 +537,6 @@ where
             parent_snapshot: Arc::new(parent_snapshot),
             is_inturn,
             cached_reads: self.maybe_pre_cached(parent_hash),
-            // Both populated by prepare_new_attributes once the payload job starts.
             block_timestamp_ms: 0,
             end_mining_timestamp_ms: 0,
         };

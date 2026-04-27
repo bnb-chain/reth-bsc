@@ -2354,10 +2354,7 @@ mod tests {
         let final_shot_used = false;
 
         for &(arrival_ms, estimated_fees) in tx_arrivals {
-            loop {
-                let Some(deadline_ms) = wait_deadline_ms else {
-                    break;
-                };
+            while let Some(deadline_ms) = wait_deadline_ms {
                 if deadline_ms > arrival_ms {
                     break;
                 }

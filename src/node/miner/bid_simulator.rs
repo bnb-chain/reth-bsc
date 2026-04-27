@@ -196,7 +196,6 @@ where
             header: None,
             is_inturn: true,
             cached_reads: None,
-            // Both populated by prepare_new_attributes below.
             block_timestamp_ms: 0,
             end_mining_timestamp_ms: 0,
         };
