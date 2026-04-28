@@ -617,12 +617,16 @@ where
         )
     }
 
+    /// Set `new_header.timestamp` (seconds) and `mix_hash` (Lorentz-era ms) based on
+    /// `parent + block_interval + back_off_time` (with a wall-clock ceiling fallback).
+    /// Returns the computed millisecond timestamp so callers can cache it and feed the
+    /// same value back into `finalize_new_header`.
     pub fn prepare_timestamp(
         &self,
         parent_snap: &Snapshot,
         parent_header: &Header,
         new_header: &mut Header,
-    ) {
+    ) -> u64 {
         let millisecond_timestamp =
             self.block_time_for_ramanujan_fork(parent_snap, parent_header, new_header);
         new_header.timestamp = millisecond_timestamp / 1000;
@@ -631,6 +635,7 @@ where
         } else {
             new_header.mix_hash = B256::ZERO;
         }
+        millisecond_timestamp
     }
 
     pub fn prepare_validators(

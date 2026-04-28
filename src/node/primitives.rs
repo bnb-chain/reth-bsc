@@ -1,7 +1,7 @@
 #![allow(clippy::owned_cow)]
 use alloy_consensus::{BlobTransactionSidecar, Header};
 use alloy_primitives::B256;
-use alloy_rlp::{Encodable, RlpDecodable, RlpEncodable};
+use alloy_rlp::{Decodable, Encodable};
 use reth_ethereum_primitives::{BlockBody, Receipt};
 use reth_primitives::{NodePrimitives, TransactionSigned};
 use reth_primitives_traits::{Block, BlockBody as BlockBodyTrait, InMemorySize};
@@ -22,13 +22,85 @@ impl NodePrimitives for BscPrimitives {
 }
 
 /// BSC representation of a EIP-4844 sidecar.
-#[derive(Debug, Clone, PartialEq, Eq, RlpEncodable, RlpDecodable, Serialize, Deserialize)]
+///
+/// RLP encoding matches go-bsc's `BlobSidecar` nested layout:
+///   `[[blobs, commitments, proofs], block_number, block_hash, tx_index, tx_hash]`
+/// The inner `BlobTxSidecar` is encoded as a sub-list, matching the Go struct
+/// `BlobSidecar { BlobTxSidecar, BlockNumber, BlockHash, TxIndex, TxHash }`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BscBlobTransactionSidecar {
     pub inner: BlobTransactionSidecar,
     pub block_number: u64,
     pub block_hash: B256,
     pub tx_index: u64,
     pub tx_hash: B256,
+}
+
+impl Encodable for BscBlobTransactionSidecar {
+    fn encode(&self, out: &mut dyn bytes::BufMut) {
+        // Inner BlobTxSidecar encoded as a nested sub-list: [blobs, commitments, proofs]
+        let inner_fields_len = self.inner.rlp_encoded_fields_length();
+        let inner_header =
+            alloy_rlp::Header { list: true, payload_length: inner_fields_len };
+
+        let payload_len = inner_header.length() + inner_fields_len
+            + self.block_number.length()
+            + self.block_hash.length()
+            + self.tx_index.length()
+            + self.tx_hash.length();
+        alloy_rlp::Header { list: true, payload_length: payload_len }.encode(out);
+        inner_header.encode(out);
+        self.inner.rlp_encode_fields(out);
+        self.block_number.encode(out);
+        self.block_hash.encode(out);
+        self.tx_index.encode(out);
+        self.tx_hash.encode(out);
+    }
+
+    fn length(&self) -> usize {
+        let inner_fields_len = self.inner.rlp_encoded_fields_length();
+        let inner_header =
+            alloy_rlp::Header { list: true, payload_length: inner_fields_len };
+
+        let payload_len = inner_header.length() + inner_fields_len
+            + self.block_number.length()
+            + self.block_hash.length()
+            + self.tx_index.length()
+            + self.tx_hash.length();
+        alloy_rlp::Header { list: true, payload_length: payload_len }.length() + payload_len
+    }
+}
+
+impl Decodable for BscBlobTransactionSidecar {
+    fn decode(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
+        let header = alloy_rlp::Header::decode(buf)?;
+        if !header.list {
+            return Err(alloy_rlp::Error::UnexpectedString);
+        }
+        let remaining_before = buf.len();
+
+        // Decode inner BlobTxSidecar from a nested sub-list
+        let inner_header = alloy_rlp::Header::decode(buf)?;
+        if !inner_header.list {
+            return Err(alloy_rlp::Error::UnexpectedString);
+        }
+        let inner_remaining = buf.len();
+        let inner = BlobTransactionSidecar::rlp_decode_fields(buf)?;
+        let inner_consumed = inner_remaining - buf.len();
+        if inner_consumed != inner_header.payload_length {
+            return Err(alloy_rlp::Error::UnexpectedLength);
+        }
+
+        let block_number = u64::decode(buf)?;
+        let block_hash = B256::decode(buf)?;
+        let tx_index = u64::decode(buf)?;
+        let tx_hash = B256::decode(buf)?;
+        let consumed = remaining_before - buf.len();
+        if consumed != header.payload_length {
+            return Err(alloy_rlp::Error::UnexpectedLength);
+        }
+        Ok(Self { inner, block_number, block_hash, tx_index, tx_hash })
+    }
 }
 
 /// Block body for BSC. It is equivalent to Ethereum [`BlockBody`] but additionally stores sidecars
@@ -144,7 +216,7 @@ impl Block for BscBlock {
 mod rlp {
     use super::*;
     use alloy_eips::eip4895::Withdrawals;
-    use alloy_rlp::Decodable;
+    use alloy_rlp::{Decodable, RlpDecodable, RlpEncodable};
 
     #[derive(RlpEncodable, RlpDecodable)]
     #[rlp(trailing)]
@@ -170,10 +242,20 @@ mod rlp {
             let BscBlockBody { inner: BlockBody { transactions, ommers, withdrawals }, sidecars } =
                 value;
 
+            // Geth decodes withdrawals as a list type. When sidecars are present but
+            // withdrawals are absent, encode empty withdrawals as `[]` (0xC0) instead of
+            // relying on the `#[rlp(trailing)]` placeholder `0x80` which Go rejects as
+            // "wrong kind of empty value (got String, want List)".
+            let withdrawals = match (withdrawals.as_ref(), sidecars.as_ref()) {
+                (None, Some(_)) => Some(Cow::Owned(Withdrawals::default())),
+                (Some(w), _) => Some(Cow::Borrowed(w)),
+                (None, None) => None,
+            };
+
             Self {
                 transactions: Cow::Borrowed(transactions),
                 ommers: Cow::Borrowed(ommers),
-                withdrawals: withdrawals.as_ref().map(Cow::Borrowed),
+                withdrawals,
                 sidecars: sidecars.as_ref().map(Cow::Borrowed),
             }
         }
@@ -187,11 +269,18 @@ mod rlp {
                     BscBlockBody { inner: BlockBody { transactions, ommers, withdrawals }, sidecars },
             } = value;
 
+            // Same withdrawals backfill as BlockBodyHelper — see comment there.
+            let withdrawals = match (withdrawals.as_ref(), sidecars.as_ref()) {
+                (None, Some(_)) => Some(Cow::Owned(Withdrawals::default())),
+                (Some(w), _) => Some(Cow::Borrowed(w)),
+                (None, None) => None,
+            };
+
             Self {
                 header: Cow::Borrowed(header),
                 transactions: Cow::Borrowed(transactions),
                 ommers: Cow::Borrowed(ommers),
-                withdrawals: withdrawals.as_ref().map(Cow::Borrowed),
+                withdrawals,
                 sidecars: sidecars.as_ref().map(Cow::Borrowed),
             }
         }
@@ -440,6 +529,111 @@ mod tests {
     }
 
     #[test]
+    fn test_body_encodes_empty_withdrawals_as_list_when_sidecars_present() {
+        // Regression test: when sidecars are present but withdrawals is None,
+        // the encoder must produce an empty list (0xC0) for withdrawals, NOT the
+        // RLP empty string (0x80). Go's decoder rejects 0x80 for slice/struct
+        // pointer types because nilKind = List.
+        use alloy_rlp::{Decodable, Encodable};
+
+        let body = BscBlockBody {
+            inner: BlockBody {
+                transactions: vec![],
+                ommers: vec![],
+                withdrawals: None,  // <-- None, but sidecars present
+            },
+            sidecars: Some(Vec::new()),
+        };
+
+        let mut buf = Vec::new();
+        body.encode(&mut buf);
+
+        // Decode the body back
+        let decoded = BscBlockBody::decode(&mut buf.as_slice())
+            .expect("Failed to decode body with backfilled withdrawals");
+
+        // The decoded body should have withdrawals = Some(empty), not None
+        assert!(
+            decoded.inner.withdrawals.is_some(),
+            "withdrawals should be Some after backfill"
+        );
+        assert!(
+            decoded.inner.withdrawals.as_ref().unwrap().is_empty(),
+            "withdrawals should be empty"
+        );
+        assert!(decoded.sidecars.is_some(), "sidecars should be preserved");
+
+        // Verify the raw RLP bytes do NOT contain 0x80 as a withdrawals placeholder.
+        // After [txs_list, ommers_list], the next byte should be 0xC0 (empty list),
+        // not 0x80 (empty string).
+        // The outer list header is the first few bytes, then txs=0xC0, ommers=0xC0,
+        // so the 4th byte (index 3) should be 0xC0 (empty withdrawals list).
+        // Outer header for small body: 0xC0 + len => 1 byte header
+        // Then: txs=0xC0, ommers=0xC0, withdrawals=?, sidecars=0xC0
+        assert!(
+            !buf.windows(2).any(|w| w == [0x80, 0xC0]),
+            "Should not have 0x80 (empty string) followed by 0xC0 — withdrawals must be 0xC0 (empty list)"
+        );
+    }
+
+    #[test]
+    fn test_block_encodes_empty_withdrawals_as_list_when_sidecars_present() {
+        // Same test but for BscBlock encoding (BlockHelper path)
+        use alloy_rlp::{Decodable, Encodable};
+
+        let block = BscBlock {
+            header: Header::default(),
+            body: BscBlockBody {
+                inner: BlockBody {
+                    transactions: vec![],
+                    ommers: vec![],
+                    withdrawals: None,
+                },
+                sidecars: Some(Vec::new()),
+            },
+        };
+
+        let mut buf = Vec::new();
+        block.encode(&mut buf);
+
+        let decoded = BscBlock::decode(&mut buf.as_slice())
+            .expect("Failed to decode block with backfilled withdrawals");
+
+        assert!(
+            decoded.body.inner.withdrawals.is_some(),
+            "withdrawals should be Some after backfill"
+        );
+        assert!(decoded.body.sidecars.is_some(), "sidecars should be preserved");
+    }
+
+    #[test]
+    fn test_body_no_backfill_when_no_sidecars() {
+        // When sidecars are None, withdrawals=None should remain None (no backfill)
+        use alloy_rlp::{Decodable, Encodable};
+
+        let body = BscBlockBody {
+            inner: BlockBody {
+                transactions: vec![],
+                ommers: vec![],
+                withdrawals: None,
+            },
+            sidecars: None,
+        };
+
+        let mut buf = Vec::new();
+        body.encode(&mut buf);
+
+        let decoded = BscBlockBody::decode(&mut buf.as_slice())
+            .expect("Failed to decode body without sidecars");
+
+        assert!(
+            decoded.inner.withdrawals.is_none(),
+            "withdrawals should remain None when no sidecars"
+        );
+        assert!(decoded.sidecars.is_none(), "sidecars should remain None");
+    }
+
+    #[test]
     fn test_rlp_length_empty_withdrawals_less_than_encoded() {
         use alloy_rlp::Encodable;
 
@@ -460,6 +654,68 @@ mod tests {
             computed_length + 1,
             actual_length,
             "Computed RLP length for empty withdrawals should be 1 byte less than actual encoded length"
+        );
+    }
+
+    #[test]
+    fn test_blob_sidecar_nested_rlp_layout() {
+        // Regression test: BscBlobTransactionSidecar must encode BlobTxSidecar as a
+        // nested sub-list to match go-bsc's struct layout:
+        //   BlobSidecar { BlobTxSidecar, BlockNumber, BlockHash, TxIndex, TxHash }
+        //
+        // Expected RLP: [[blobs, commitments, proofs], block_number, block_hash, tx_index, tx_hash]
+        // NOT the flat:  [blobs, commitments, proofs, block_number, block_hash, tx_index, tx_hash]
+        //
+        // go-bsc decodes field-by-field: it reads the first element as BlobTxSidecar
+        // (expecting a list), then block_number, etc. A flat encoding causes:
+        //   "rlp: expected input list for []kzg4844.Blob"
+        use alloy_rlp::{Decodable, Encodable};
+
+        let sidecar = BscBlobTransactionSidecar {
+            inner: BlobTransactionSidecar {
+                blobs: vec![alloy_eips::eip4844::Blob::default()],
+                commitments: vec![alloy_eips::eip4844::Bytes48::default()],
+                proofs: vec![alloy_eips::eip4844::Bytes48::default()],
+            },
+            block_number: 42,
+            block_hash: B256::repeat_byte(0xab),
+            tx_index: 7,
+            tx_hash: B256::repeat_byte(0xcd),
+        };
+
+        // Encode
+        let mut buf = Vec::new();
+        sidecar.encode(&mut buf);
+
+        // Verify nested structure: outer list → first element must be a list (BlobTxSidecar)
+        let mut cursor = buf.as_slice();
+        let outer = alloy_rlp::Header::decode(&mut cursor).unwrap();
+        assert!(outer.list, "outer should be a list");
+
+        let first_elem = alloy_rlp::Header::decode(&mut cursor).unwrap();
+        assert!(
+            first_elem.list,
+            "first element (BlobTxSidecar) must be a nested list, not a raw field — \
+             go-bsc expects struct BlobSidecar {{ BlobTxSidecar, ... }}"
+        );
+
+        // Inside the nested BlobTxSidecar list, first sub-element should also be a list (blobs)
+        let blobs_hdr = alloy_rlp::Header::decode(&mut cursor).unwrap();
+        assert!(
+            blobs_hdr.list,
+            "blobs field inside BlobTxSidecar must be a list of Blob items"
+        );
+
+        // Roundtrip
+        let decoded = BscBlobTransactionSidecar::decode(&mut buf.as_slice())
+            .expect("Failed to decode sidecar");
+        assert_eq!(sidecar, decoded, "sidecar should roundtrip through RLP");
+
+        // Verify length() matches actual encoded size
+        assert_eq!(
+            sidecar.length(),
+            buf.len(),
+            "length() must match actual encoded size"
         );
     }
 }
