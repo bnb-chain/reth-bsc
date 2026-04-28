@@ -1981,7 +1981,7 @@ dependencies = [
  "reth-ethereum-primitives",
  "reth-evm",
  "reth-evm-ethereum",
- "reth-primitives-traits 0.1.1 (git+https://github.com/bnb-chain/reth-core.git?branch=v0.1.1-v2)",
+ "reth-primitives-traits",
  "reth-provider",
  "reth-revm",
  "reth-tracing",
@@ -7396,7 +7396,7 @@ dependencies = [
  "reth-node-metrics",
  "reth-payload-builder",
  "reth-payload-primitives",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "reth-provider",
  "reth-revm",
  "reth-rpc",
@@ -7427,7 +7427,7 @@ dependencies = [
  "reth-payload-builder",
  "reth-payload-builder-primitives",
  "reth-payload-primitives",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "reth-revm",
  "reth-storage-api",
  "reth-tasks",
@@ -7458,7 +7458,7 @@ dependencies = [
  "reth-ethereum-primitives",
  "reth-execution-types",
  "reth-metrics 2.0.0",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "reth-storage-api",
  "reth-trie",
  "revm-database",
@@ -7486,7 +7486,7 @@ dependencies = [
  "derive_more 2.1.1",
  "reth-ethereum-forks",
  "reth-network-peers",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "serde_json",
 ]
 
@@ -7537,7 +7537,7 @@ dependencies = [
  "reth-cli",
  "reth-cli-runner",
  "reth-cli-util",
- "reth-codecs 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-codecs",
  "reth-config",
  "reth-consensus",
  "reth-db",
@@ -7566,7 +7566,7 @@ dependencies = [
  "reth-node-core",
  "reth-node-events",
  "reth-node-metrics",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "reth-provider",
  "reth-prune",
  "reth-prune-types",
@@ -7625,8 +7625,7 @@ dependencies = [
 [[package]]
 name = "reth-codecs"
 version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a96e584e01478c951911946a7864f18e967c1cd90965e136e2d1b51aa3da9126"
+source = "git+https://github.com/bnb-chain/reth-core.git?branch=v0.1.1-v2#5e11acfdc8e02201f3e83635b7ff9724ab36f63a"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -7637,39 +7636,10 @@ dependencies = [
  "bytes 1.11.1",
  "modular-bitfield",
  "parity-scale-codec",
- "reth-codecs-derive 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
- "reth-zstd-compressors 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-codecs-derive",
+ "reth-zstd-compressors",
  "serde",
  "visibility",
-]
-
-[[package]]
-name = "reth-codecs"
-version = "0.1.1"
-source = "git+https://github.com/bnb-chain/reth-core.git?branch=v0.1.1-v2#5e11acfdc8e02201f3e83635b7ff9724ab36f63a"
-dependencies = [
- "alloy-consensus",
- "alloy-eips",
- "alloy-genesis",
- "alloy-primitives",
- "alloy-trie",
- "bytes 1.11.1",
- "modular-bitfield",
- "parity-scale-codec",
- "reth-codecs-derive 0.1.1 (git+https://github.com/bnb-chain/reth-core.git?branch=v0.1.1-v2)",
- "reth-zstd-compressors 0.1.1 (git+https://github.com/bnb-chain/reth-core.git?branch=v0.1.1-v2)",
- "serde",
-]
-
-[[package]]
-name = "reth-codecs-derive"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c342ae46f5a886b8bf506205b9501b1032b896defd0f4f156edb423007fef880"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
 ]
 
 [[package]]
@@ -7707,7 +7677,7 @@ dependencies = [
  "alloy-primitives",
  "auto_impl",
  "reth-execution-types",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "thiserror 2.0.18",
 ]
 
@@ -7721,7 +7691,7 @@ dependencies = [
  "alloy-primitives",
  "reth-chainspec",
  "reth-consensus",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
 ]
 
 [[package]]
@@ -7742,7 +7712,7 @@ dependencies = [
  "futures",
  "reqwest 0.13.2",
  "reth-node-api",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "reth-tracing",
  "ringbuffer",
  "serde",
@@ -7792,10 +7762,10 @@ dependencies = [
  "metrics",
  "modular-bitfield",
  "proptest",
- "reth-codecs 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-codecs",
  "reth-db-models",
  "reth-ethereum-primitives",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "reth-prune-types",
  "reth-stages-types",
  "reth-storage-errors",
@@ -7816,14 +7786,14 @@ dependencies = [
  "boyer-moore-magiclen",
  "eyre",
  "reth-chainspec",
- "reth-codecs 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-codecs",
  "reth-config",
  "reth-db-api",
  "reth-etl",
  "reth-execution-errors",
  "reth-fs-util",
  "reth-node-types",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "reth-provider",
  "reth-stages-types",
  "reth-static-file-types",
@@ -7848,8 +7818,8 @@ dependencies = [
  "arbitrary",
  "bytes 1.11.1",
  "modular-bitfield",
- "reth-codecs 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-codecs",
+ "reth-primitives-traits",
  "serde",
 ]
 
@@ -7948,7 +7918,7 @@ dependencies = [
  "reth-metrics 2.0.0",
  "reth-network-p2p",
  "reth-network-peers",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "reth-provider",
  "reth-storage-api",
  "reth-tasks",
@@ -8004,7 +7974,7 @@ dependencies = [
  "reth-ethereum-engine-primitives",
  "reth-payload-builder",
  "reth-payload-primitives",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "reth-storage-api",
  "reth-transaction-pool",
  "tokio",
@@ -8030,7 +8000,7 @@ dependencies = [
  "reth-execution-types",
  "reth-payload-builder-primitives",
  "reth-payload-primitives",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "reth-trie-common",
  "serde",
  "thiserror 2.0.18",
@@ -8070,7 +8040,7 @@ dependencies = [
  "reth-network-p2p",
  "reth-payload-builder",
  "reth-payload-primitives",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "reth-provider",
  "reth-prune",
  "reth-prune-types",
@@ -8115,7 +8085,7 @@ dependencies = [
  "reth-evm",
  "reth-fs-util",
  "reth-payload-primitives",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "reth-revm",
  "reth-storage-api",
  "serde",
@@ -8170,7 +8140,7 @@ dependencies = [
  "reth-era-downloader",
  "reth-etl",
  "reth-fs-util",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "reth-provider",
  "reth-stages-types",
  "reth-storage-api",
@@ -8202,13 +8172,13 @@ dependencies = [
  "derive_more 2.1.1",
  "futures",
  "pin-project",
- "reth-codecs 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-codecs",
  "reth-ecies",
  "reth-eth-wire-types",
  "reth-ethereum-forks",
  "reth-metrics 2.0.0",
  "reth-network-peers",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "serde",
  "snap",
  "thiserror 2.0.18",
@@ -8235,9 +8205,9 @@ dependencies = [
  "proptest",
  "proptest-arbitrary-interop",
  "reth-chainspec",
- "reth-codecs-derive 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-codecs-derive",
  "reth-ethereum-primitives",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "serde",
  "thiserror 2.0.18",
 ]
@@ -8277,7 +8247,7 @@ dependencies = [
  "reth-consensus",
  "reth-consensus-common",
  "reth-execution-types",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "tracing",
 ]
 
@@ -8292,7 +8262,7 @@ dependencies = [
  "reth-engine-primitives",
  "reth-ethereum-primitives",
  "reth-payload-primitives",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "serde",
  "thiserror 2.0.18",
 ]
@@ -8333,7 +8303,7 @@ dependencies = [
  "reth-payload-builder-primitives",
  "reth-payload-primitives",
  "reth-payload-validator",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "reth-revm",
  "reth-storage-api",
  "reth-transaction-pool",
@@ -8350,8 +8320,8 @@ dependencies = [
  "alloy-eips",
  "alloy-primitives",
  "alloy-rpc-types-eth",
- "reth-codecs 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-codecs",
+ "reth-primitives-traits",
  "serde",
 ]
 
@@ -8382,7 +8352,7 @@ dependencies = [
  "reth-execution-errors",
  "reth-execution-types",
  "reth-metrics 2.0.0",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "reth-storage-api",
  "reth-storage-errors",
  "reth-trie-common",
@@ -8405,7 +8375,7 @@ dependencies = [
  "reth-ethereum-primitives",
  "reth-evm",
  "reth-execution-types",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "reth-storage-errors",
  "revm",
 ]
@@ -8421,7 +8391,7 @@ dependencies = [
  "parking_lot",
  "reth-errors",
  "reth-metrics 2.0.0",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "reth-provider",
  "reth-revm",
  "reth-trie",
@@ -8453,7 +8423,7 @@ dependencies = [
  "alloy-rlp",
  "derive_more 2.1.1",
  "reth-ethereum-primitives",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "reth-trie-common",
  "revm",
  "serde",
@@ -8484,7 +8454,7 @@ dependencies = [
  "reth-node-api",
  "reth-node-core",
  "reth-payload-builder",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "reth-provider",
  "reth-prune-types",
  "reth-revm",
@@ -8507,7 +8477,7 @@ dependencies = [
  "alloy-primitives",
  "reth-chain-state",
  "reth-execution-types",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "serde",
  "serde_with",
 ]
@@ -8537,7 +8507,7 @@ dependencies = [
  "pretty_assertions",
  "reth-engine-primitives",
  "reth-evm",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "reth-provider",
  "reth-revm",
  "reth-rpc-api",
@@ -8683,7 +8653,7 @@ dependencies = [
  "reth-network-p2p",
  "reth-network-peers",
  "reth-network-types",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "reth-storage-api",
  "reth-tasks",
  "reth-tokio-util",
@@ -8742,7 +8712,7 @@ dependencies = [
  "reth-ethereum-primitives",
  "reth-network-peers",
  "reth-network-types",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "reth-storage-errors",
  "tokio",
  "tracing",
@@ -8863,7 +8833,7 @@ dependencies = [
  "reth-node-events",
  "reth-node-metrics",
  "reth-payload-builder",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "reth-provider",
  "reth-prune",
  "reth-rpc",
@@ -8919,7 +8889,7 @@ dependencies = [
  "reth-network",
  "reth-network-p2p",
  "reth-network-peers",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "reth-prune-types",
  "reth-rpc-convert",
  "reth-rpc-eth-types",
@@ -8965,7 +8935,7 @@ dependencies = [
  "reth-node-api",
  "reth-node-builder",
  "reth-payload-primitives",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "reth-provider",
  "reth-revm",
  "reth-rpc",
@@ -8991,7 +8961,7 @@ dependencies = [
  "futures-util",
  "reth-chain-state",
  "reth-network-api",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "reth-storage-api",
  "reth-transaction-pool",
  "serde",
@@ -9019,7 +8989,7 @@ dependencies = [
  "pin-project",
  "reth-engine-primitives",
  "reth-network-api",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "reth-prune-types",
  "reth-stages",
  "reth-static-file-types",
@@ -9061,7 +9031,7 @@ dependencies = [
  "reth-db-api",
  "reth-engine-primitives",
  "reth-payload-primitives",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
 ]
 
 [[package]]
@@ -9081,7 +9051,7 @@ dependencies = [
  "reth-metrics 2.0.0",
  "reth-payload-builder-primitives",
  "reth-payload-primitives",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "reth-trie-parallel",
  "tokio",
  "tokio-stream",
@@ -9116,7 +9086,7 @@ dependencies = [
  "reth-chainspec",
  "reth-errors",
  "reth-execution-types",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "reth-trie-common",
  "serde",
  "sha2 0.10.9",
@@ -9131,14 +9101,13 @@ source = "git+https://github.com/bnb-chain/reth.git?branch=develop-v2#6fe9c72caf
 dependencies = [
  "alloy-consensus",
  "alloy-rpc-types-engine",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
 ]
 
 [[package]]
 name = "reth-primitives-traits"
 version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ca36e245593498020c31e707154fc13391164eb90444da76d67361f646e7669"
+source = "git+https://github.com/bnb-chain/reth-core.git?branch=v0.1.1-v2#5e11acfdc8e02201f3e83635b7ff9724ab36f63a"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -9158,32 +9127,7 @@ dependencies = [
  "proptest-arbitrary-interop",
  "quanta",
  "rayon",
- "reth-codecs 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
- "revm-bytecode",
- "revm-primitives",
- "revm-state",
- "secp256k1 0.30.0",
- "serde",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "reth-primitives-traits"
-version = "0.1.1"
-source = "git+https://github.com/bnb-chain/reth-core.git?branch=v0.1.1-v2#5e11acfdc8e02201f3e83635b7ff9724ab36f63a"
-dependencies = [
- "alloy-consensus",
- "alloy-eips",
- "alloy-genesis",
- "alloy-primitives",
- "alloy-rlp",
- "alloy-rpc-types-eth",
- "alloy-trie",
- "bytes 1.11.1",
- "dashmap 6.1.0",
- "derive_more 2.1.1",
- "once_cell",
- "reth-codecs 0.1.1 (git+https://github.com/bnb-chain/reth-core.git?branch=v0.1.1-v2)",
+ "reth-codecs",
  "revm-bytecode",
  "revm-primitives",
  "revm-state",
@@ -9210,7 +9154,7 @@ dependencies = [
  "rayon",
  "reth-chain-state",
  "reth-chainspec",
- "reth-codecs 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-codecs",
  "reth-db",
  "reth-db-api",
  "reth-errors",
@@ -9221,7 +9165,7 @@ dependencies = [
  "reth-metrics 2.0.0",
  "reth-nippy-jar",
  "reth-node-types",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "reth-prune-types",
  "reth-stages-types",
  "reth-static-file-types",
@@ -9255,7 +9199,7 @@ dependencies = [
  "reth-errors",
  "reth-exex-types",
  "reth-metrics 2.0.0",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "reth-provider",
  "reth-prune-types",
  "reth-stages-types",
@@ -9277,7 +9221,7 @@ dependencies = [
  "arbitrary",
  "derive_more 2.1.1",
  "modular-bitfield",
- "reth-codecs 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-codecs",
  "serde",
  "strum",
  "thiserror 2.0.18",
@@ -9292,7 +9236,7 @@ dependencies = [
  "alloy-primitives",
  "alloy-rlp",
  "alloy-rpc-types-debug",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "reth-storage-api",
  "reth-storage-errors",
  "reth-trie",
@@ -9351,7 +9295,7 @@ dependencies = [
  "reth-network-peers",
  "reth-network-types",
  "reth-node-api",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "reth-revm",
  "reth-rpc-api",
  "reth-rpc-convert",
@@ -9431,7 +9375,7 @@ dependencies = [
  "reth-network-api",
  "reth-node-core",
  "reth-payload-primitives",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "reth-rpc",
  "reth-rpc-api",
  "reth-rpc-engine-api",
@@ -9467,7 +9411,7 @@ dependencies = [
  "dyn-clone",
  "jsonrpsee-types",
  "reth-evm",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "reth-rpc-traits",
  "serde",
  "thiserror 2.0.18",
@@ -9493,7 +9437,7 @@ dependencies = [
  "reth-payload-builder",
  "reth-payload-builder-primitives",
  "reth-payload-primitives",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "reth-rpc-api",
  "reth-storage-api",
  "reth-tasks",
@@ -9535,7 +9479,7 @@ dependencies = [
  "reth-evm",
  "reth-network-api",
  "reth-node-api",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "reth-revm",
  "reth-rpc-convert",
  "reth-rpc-eth-types",
@@ -9581,7 +9525,7 @@ dependencies = [
  "reth-evm",
  "reth-execution-types",
  "reth-metrics 2.0.0",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "reth-revm",
  "reth-rpc-convert",
  "reth-rpc-server-types",
@@ -9633,15 +9577,14 @@ dependencies = [
 [[package]]
 name = "reth-rpc-traits"
 version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "66ebbc3cc6f1808c2838bf8da9928f3ef9b8a6f969c6522174c1598ddb34bc0f"
+source = "git+https://github.com/bnb-chain/reth-core.git?branch=v0.1.1-v2#5e11acfdc8e02201f3e83635b7ff9724ab36f63a"
 dependencies = [
  "alloy-consensus",
  "alloy-network",
  "alloy-primitives",
  "alloy-rpc-types-eth",
  "alloy-signer",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "thiserror 2.0.18",
 ]
 
@@ -9663,7 +9606,7 @@ dependencies = [
  "rayon",
  "reqwest 0.13.2",
  "reth-chainspec",
- "reth-codecs 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-codecs",
  "reth-config",
  "reth-consensus",
  "reth-db",
@@ -9679,7 +9622,7 @@ dependencies = [
  "reth-fs-util",
  "reth-libmdbx",
  "reth-network-p2p",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "reth-provider",
  "reth-prune",
  "reth-prune-types",
@@ -9711,12 +9654,12 @@ dependencies = [
  "auto_impl",
  "futures-util",
  "metrics",
- "reth-codecs 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-codecs",
  "reth-consensus",
  "reth-errors",
  "reth-metrics 2.0.0",
  "reth-network-p2p",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "reth-provider",
  "reth-prune",
  "reth-stages-types",
@@ -9737,7 +9680,7 @@ dependencies = [
  "arbitrary",
  "bytes 1.11.1",
  "modular-bitfield",
- "reth-codecs 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-codecs",
  "reth-trie-common",
  "serde",
 ]
@@ -9750,9 +9693,9 @@ dependencies = [
  "alloy-primitives",
  "parking_lot",
  "rayon",
- "reth-codecs 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-codecs",
  "reth-db-api",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "reth-provider",
  "reth-prune-types",
  "reth-stages-types",
@@ -9792,7 +9735,7 @@ dependencies = [
  "reth-db-models",
  "reth-ethereum-primitives",
  "reth-execution-types",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "reth-prune-types",
  "reth-stages-types",
  "reth-storage-errors",
@@ -9810,8 +9753,8 @@ dependencies = [
  "alloy-primitives",
  "alloy-rlp",
  "derive_more 2.1.1",
- "reth-codecs 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-codecs",
+ "reth-primitives-traits",
  "reth-prune-types",
  "reth-static-file-types",
  "revm-database-interface",
@@ -9852,7 +9795,7 @@ dependencies = [
  "rand 0.8.6",
  "rand 0.9.4",
  "reth-ethereum-primitives",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "secp256k1 0.30.0",
 ]
 
@@ -9926,7 +9869,7 @@ dependencies = [
  "reth-execution-types",
  "reth-fs-util",
  "reth-metrics 2.0.0",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "reth-storage-api",
  "reth-tasks",
  "revm",
@@ -9959,7 +9902,7 @@ dependencies = [
  "parking_lot",
  "reth-execution-errors",
  "reth-metrics 2.0.0",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "reth-stages-types",
  "reth-storage-errors",
  "reth-trie-common",
@@ -9989,8 +9932,8 @@ dependencies = [
  "nybbles",
  "plain_hasher",
  "rayon",
- "reth-codecs 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-codecs",
+ "reth-primitives-traits",
  "revm-database",
  "rust-eth-triedb",
  "rust-eth-triedb-state-trie",
@@ -10009,7 +9952,7 @@ dependencies = [
  "reth-db-api",
  "reth-execution-errors",
  "reth-metrics 2.0.0",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "reth-stages-types",
  "reth-storage-api",
  "reth-storage-errors",
@@ -10036,7 +9979,7 @@ dependencies = [
  "rayon",
  "reth-execution-errors",
  "reth-metrics 2.0.0",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "reth-provider",
  "reth-storage-errors",
  "reth-tasks",
@@ -10060,22 +10003,13 @@ dependencies = [
  "rayon",
  "reth-execution-errors",
  "reth-metrics 2.0.0",
- "reth-primitives-traits 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reth-primitives-traits",
  "reth-trie-common",
  "serde",
  "serde_json",
  "slotmap",
  "smallvec",
  "tracing",
-]
-
-[[package]]
-name = "reth-zstd-compressors"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a621aef55fe4da8935abede9d1d105f227bcb673f212b3575a748a6a2f8f688e"
-dependencies = [
- "zstd",
 ]
 
 [[package]]
@@ -10150,7 +10084,7 @@ dependencies = [
  "reth-cli",
  "reth-cli-commands",
  "reth-cli-util",
- "reth-codecs 0.1.1 (git+https://github.com/bnb-chain/reth-core.git?branch=v0.1.1-v2)",
+ "reth-codecs",
  "reth-db",
  "reth-discv4",
  "reth-engine-local",
@@ -10176,7 +10110,7 @@ dependencies = [
  "reth-node-ethereum",
  "reth-payload-builder-primitives",
  "reth-payload-primitives",
- "reth-primitives-traits 0.1.1 (git+https://github.com/bnb-chain/reth-core.git?branch=v0.1.1-v2)",
+ "reth-primitives-traits",
  "reth-provider",
  "reth-revm",
  "reth-rpc-convert",
