@@ -18,7 +18,7 @@ use crate::{
         SystemContract,
     },
 };
-use alloy_consensus::{Header, Transaction, TxReceipt, TxType};
+use alloy_consensus::{Header, TxReceipt, TxType};
 use alloy_eips::eip2935::{HISTORY_STORAGE_ADDRESS, HISTORY_STORAGE_CODE};
 use alloy_eips::{eip7685::Requests, Encodable2718};
 use alloy_evm::{
@@ -200,20 +200,6 @@ where
             executor_metrics: BscExecutorMetrics::default(),
             rewards_metrics: BscRewardsMetrics::default(),
         }
-    }
-
-    /// Accumulate blob gas used for Cancun blocks.
-    fn accumulate_blob_gas_used<T: Transaction>(&mut self, tx: &T) {
-        if !BscHardforks::is_cancun_active_at_timestamp(
-            &self.spec,
-            self.evm.block().number().to::<u64>(),
-            self.evm.block().timestamp().to::<u64>(),
-        ) {
-            return;
-        }
-
-        self.blob_gas_used =
-            self.blob_gas_used.saturating_add(tx.blob_gas_used().unwrap_or_default());
     }
 
     /// Applies system contract upgrades if the Feynman fork is not yet active.
@@ -477,7 +463,7 @@ where
         // Detect system transactions: skip EVM execution, accumulate for later.
         let is_system = is_system_transaction(&tx_signed, signer, self.evm.block().beneficiary());
         if is_system {
-            self.system_txs.push(tx_signed.clone().into());
+            self.system_txs.push(tx_signed.clone());
             let dummy = ResultAndState {
                 result: ExecutionResult::Success {
                     reason: SuccessReason::Stop,

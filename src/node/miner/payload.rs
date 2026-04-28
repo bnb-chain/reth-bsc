@@ -322,6 +322,7 @@ where
     >,
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>> + 'static,
 {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         client: Client,
         pool: Pool,
