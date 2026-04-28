@@ -244,10 +244,4 @@ codegen-units = 1
 [dev-dependencies]
 uuid = { version = "1", features = ["v4"] }
 
-[patch.crates-io]
-reth-primitives-traits = { git = "https://github.com/bnb-chain/reth-core.git", branch = "v0.1.1-v2" }
-reth-codecs = { git = "https://github.com/bnb-chain/reth-core.git", branch = "v0.1.1-v2" }
-reth-codecs-derive = { git = "https://github.com/bnb-chain/reth-core.git", branch = "v0.1.1-v2" }
-reth-rpc-traits = { git = "https://github.com/bnb-chain/reth-core.git", branch = "v0.1.1-v2" }
-reth-zstd-compressors = { git = "https://github.com/bnb-chain/reth-core.git", branch = "v0.1.1-v2" }
 
