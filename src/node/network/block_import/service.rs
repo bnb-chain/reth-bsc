@@ -99,6 +99,9 @@ where
     queued_blocks: LruCache<B256>,
     /// Cache of downloading block hashes to avoid re-downloading the same block.
     downloading_blocks: LruMap<B256, u128, ByLength>,
+    /// Per-outcome counters for `engine.new_payload` results. Cloned into each
+    /// import future since `Counter` is a cheap handle into the global registry.
+    metrics: crate::metrics::BscBlockImportMetrics,
 }
 
 impl<Provider> ImportService<Provider>
@@ -132,6 +135,7 @@ where
             processed_blocks: LruCache::new(LRU_PROCESSED_BLOCKS_SIZE),
             queued_blocks: LruCache::new(LRU_PROCESSED_BLOCKS_SIZE),
             downloading_blocks: LruMap::new(ByLength::new(LRU_PROCESSED_BLOCKS_SIZE)),
+            metrics: crate::metrics::BscBlockImportMetrics::default(),
         }
     }
 
@@ -139,12 +143,14 @@ where
     fn new_payload(&self, block: BlockMsg, peer_id: PeerId) -> ImportFut {
         let engine = self.engine.clone();
         let forkchoice_engine = self.forkchoice_engine.clone();
+        let metrics = self.metrics.clone();
 
         let announced_hash = block.hash;
         let block_hash = block.block.0.block.header.hash_slow();
         tracing::debug!(target: "bsc::block_import", "New payload: block = ({:?}, {:?}), peer_id = {:?}", block.block.0.block.header.number, block_hash, peer_id);
         Box::pin(async move {
             if announced_hash != block_hash {
+                metrics.hash_mismatch.increment(1);
                 tracing::warn!(
                     target: "bsc::block_import",
                     number = block.block.0.block.header.number,
@@ -171,6 +177,7 @@ where
             match engine.new_payload(payload).await {
                 Ok(payload_status) => match payload_status.status {
                     PayloadStatusEnum::Valid => {
+                        metrics.valid.increment(1);
                         tracing::debug!(target: "bsc::block_import", "New payload is valid, block_hash = {:?}, block_number = {}, peer_id = {:?}", block.hash, header.number, peer_id);
                         // handle fork choice update with valid payload
                         if let Err(e) = forkchoice_engine.update_forkchoice(&header).await {
@@ -225,6 +232,7 @@ where
                         .any(|needle| lower.contains(needle));
 
                         if looks_like_reorg_race {
+                            metrics.invalid_race.increment(1);
                             tracing::debug!(
                                 target: "bsc::block_import",
                                 block_hash = %header.hash_slow(),
@@ -238,6 +246,7 @@ where
                             // announcement from on_new_block still stands.
                             None
                         } else {
+                            metrics.invalid_structural.increment(1);
                             tracing::info!(
                                 target: "bsc::block_import",
                                 block_hash = %header.hash_slow(),
@@ -254,6 +263,7 @@ where
                         }
                     }
                     PayloadStatusEnum::Syncing => {
+                        metrics.syncing.increment(1);
                         // When new_payload returns Syncing status, we need to manually trigger FCU
                         // to avoid the engine-tree being stuck in syncing state without any driver.
                         // By calling FCU, we inform the engine about the new head block hash,
