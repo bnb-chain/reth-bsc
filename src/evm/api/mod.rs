@@ -335,7 +335,7 @@ mod tests {
             false,
             false,
         );
-        mismatched.inner.instruction = EthInstructions::new_mainnet();
+        mismatched.inner.instruction = EthInstructions::new_mainnet_with_spec(SpecId::default());
 
         let mismatched_result = mismatched
             .transact_one(tx)

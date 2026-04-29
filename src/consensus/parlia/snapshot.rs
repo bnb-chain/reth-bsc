@@ -4,8 +4,7 @@ use super::vote::{VoteAddress, VoteAttestation, VoteData};
 use crate::metrics::BscVoteMetrics;
 use alloy_primitives::{Address, BlockHash, BlockNumber};
 use once_cell::sync::Lazy;
-use reth_db::table::{Compress, Decompress};
-use reth_db::DatabaseError;
+use reth_codecs::{Compress, Decompress, DecompressError};
 use serde::{Deserialize, Serialize};
 
 /// Number of blocks after which we persist snapshots to DB.
@@ -498,8 +497,8 @@ impl Compress for Snapshot {
 }
 
 impl Decompress for Snapshot {
-    fn decompress(value: &[u8]) -> Result<Self, DatabaseError> {
-        serde_cbor::from_slice(value).map_err(|_| DatabaseError::Decode)
+    fn decompress(value: &[u8]) -> Result<Self, DecompressError> {
+        serde_cbor::from_slice(value).map_err(DecompressError::new)
     }
 }
 

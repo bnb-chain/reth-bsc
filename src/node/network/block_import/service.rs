@@ -32,8 +32,8 @@ use reth_network::{
 use reth_network_api::{PeerId, Peers, ReputationChangeKind};
 use reth_node_ethereum::EthEngineTypes;
 use reth_payload_builder_primitives::Events;
-use reth_payload_primitives::{BuiltPayload, EngineApiMessageVersion, PayloadTypes};
-use reth_primitives::NodePrimitives;
+use reth_payload_primitives::{BuiltPayload, PayloadTypes};
+use reth_primitives_traits::NodePrimitives;
 use reth_primitives_traits::{AlloyBlockHeader, Block};
 use reth_provider::{BlockHashReader, BlockNumReader, BlockReaderIdExt, HeaderProvider};
 use std::{
@@ -658,7 +658,7 @@ where
                 safe_block_hash: B256::ZERO,
                 finalized_block_hash: B256::ZERO,
             };
-            match engine.fork_choice_updated(state, None, EngineApiMessageVersion::V1).await {
+            match engine.fork_choice_updated(state, None).await {
                 Ok(ret) => tracing::info!(
                     target: "bsc::block_import",
                     %head_hash,
@@ -898,7 +898,8 @@ mod tests {
     use reth_engine_primitives::{BeaconEngineMessage, OnForkChoiceUpdated};
     use reth_eth_wire::NewBlock;
     use reth_node_ethereum::EthEngineTypes;
-    use reth_primitives::{Block, SealedHeader};
+    use reth_ethereum_primitives::Block;
+    use reth_primitives_traits::SealedHeader;
     use reth_provider::ProviderError;
     use schnellru::{ByLength, LruMap};
     use std::{
@@ -1317,7 +1318,6 @@ mod tests {
                     BeaconEngineMessage::ForkchoiceUpdated {
                         state: _,
                         payload_attrs: _,
-                        version: _,
                         tx,
                     } => {
                         tx.send(Ok(OnForkChoiceUpdated::valid(PayloadStatus::new(
@@ -1360,7 +1360,6 @@ mod tests {
                     BeaconEngineMessage::ForkchoiceUpdated {
                         state,
                         payload_attrs: _,
-                        version: _,
                         tx,
                     } => {
                         let _ = fcu_tx.send(state);

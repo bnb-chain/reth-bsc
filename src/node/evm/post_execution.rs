@@ -12,17 +12,16 @@ use crate::evm::precompiles;
 use crate::evm::transaction::BscTxEnv;
 use crate::system_contracts::{SLASH_CONTRACT, SYSTEM_REWARD_CONTRACT, STAKE_HUB_CONTRACT, feynman_fork::{ValidatorElectionInfo, get_top_validators_by_voting_power, ElectedValidators}};
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
-use reth_evm::{eth::receipt_builder::{ReceiptBuilder, ReceiptBuilderCtx}, execute::BlockExecutionError, Database, Evm, FromRecoveredTx, FromTxWithEncoded, IntoTxEnv, block::StateChangeSource};
-use reth_primitives::{TransactionSigned, Transaction};
-use reth_revm::State;
+use reth_evm::{eth::receipt_builder::{ReceiptBuilder, ReceiptBuilderCtx}, execute::BlockExecutionError, Evm, FromRecoveredTx, FromTxWithEncoded, IntoTxEnv, block::StateChangeSource};
+use reth_ethereum_primitives::{TransactionSigned, Transaction};
 use crate::node::evm::ResultAndState;
 use revm::{
     context::{BlockEnv, TxEnv},
     context_interface::block::Block,
-    Database as RevmDatabase,
+    Database as _,
     DatabaseCommit,
+    state::{Account as RevmAccount, EvmState},
 };
-use revm_database::DatabaseCommitExt;
 use alloy_consensus::{Header, TxReceipt, Transaction as AlloyTransaction, SignableTransaction};
 use alloy_primitives::{Address, BlockNumber, TxKind, U256, hex};
 use std::collections::HashMap;
@@ -39,11 +38,10 @@ fn turn_length_matches(turn_length_from_header: Option<u8>, expected_turn_length
 }
 
 
-impl<'a, DB, EVM, Spec, R: ReceiptBuilder> BscBlockExecutor<'a, EVM, Spec, R>
+impl<'a, EVM, Spec, R: ReceiptBuilder> BscBlockExecutor<'a, EVM, Spec, R>
 where
-    DB: Database + 'a,
     EVM: Evm<
-        DB = &'a mut State<DB>,
+        DB: alloy_evm::block::StateDB + 'a,
         Tx: FromRecoveredTx<R::Transaction>
                 + FromRecoveredTx<TransactionSigned>
                 + FromTxWithEncoded<TransactionSigned>,
@@ -414,7 +412,7 @@ where
         }
         let _precompile_trace_pop_guard = PrecompileTracePopGuard;
 
-        let result_and_state = self.evm.transact(tx_env).map_err(BlockExecutionError::other)?;
+        let result_and_state = self.evm.transact(tx_env.into_tx_env()).map_err(BlockExecutionError::other)?;
         let ResultAndState { result, state } = result_and_state;
         let mut temp_state = state.clone();
         temp_state.remove(&SYSTEM_ADDRESS);
@@ -422,12 +420,16 @@ where
 
         let gas_used = result.gas_used();
         self.gas_used += gas_used;
-        
+
         // Record system transaction gas usage
         self.executor_metrics.system_tx_gas_used_total.increment(gas_used);
 
+        let tx_type = {
+            use alloy_consensus::TxType;
+            signed_tx.as_ref().map(|tx| tx.tx_type()).unwrap_or(TxType::Legacy)
+        };
         self.receipts.push(self.receipt_builder.build_receipt(ReceiptBuilderCtx {
-            tx: signed_tx.as_ref().unwrap(),
+            tx_type,
             evm: &self.evm,
             result,
             state: &state,
@@ -446,27 +448,37 @@ where
         &mut self,
         validator: Address,
     ) -> Result<(), BlockExecutionError> {
-        let system_account = self
-            .evm
-            .db_mut()
-            .load_cache_account(SYSTEM_ADDRESS)
-            .map_err(BlockExecutionError::other)?;
+        let system_info = self.evm.db_mut().basic(SYSTEM_ADDRESS)
+            .map_err(BlockExecutionError::other)?
+            .unwrap_or_default();
+        let mut block_reward = system_info.balance.to::<u128>();
 
-        if system_account.account.is_none() ||
-            system_account.account.as_ref().unwrap().info.balance == U256::ZERO
-        {
+        if block_reward == 0 {
             return Ok(());
         }
 
-        let (mut block_reward, mut transition) = system_account.drain_balance();
-        transition.info = None;
-        self.evm.db_mut().apply_transition(vec![(SYSTEM_ADDRESS, transition)]);
-        let balance_increment = vec![(validator, block_reward)];
+        // Zero out SYSTEM_ADDRESS balance
+        {
+            let mut system_account = RevmAccount::from(system_info);
+            system_account.mark_touch();
+            system_account.info.balance = U256::ZERO;
+            let mut changes: EvmState = Default::default();
+            changes.insert(SYSTEM_ADDRESS, system_account);
+            self.evm.db_mut().commit(changes);
+        }
 
-        self.evm
-            .db_mut()
-            .increment_balances(balance_increment)
-            .map_err(BlockExecutionError::other)?;
+        // Credit validator with the block reward
+        {
+            let validator_info = self.evm.db_mut().basic(validator)
+                .map_err(BlockExecutionError::other)?
+                .unwrap_or_default();
+            let mut validator_account = RevmAccount::from(validator_info);
+            validator_account.mark_touch();
+            validator_account.info.balance = validator_account.info.balance.saturating_add(U256::from(block_reward));
+            let mut changes: EvmState = Default::default();
+            changes.insert(validator, validator_account);
+            self.evm.db_mut().commit(changes);
+        }
 
         let system_reward_balance = self
             .evm
@@ -491,7 +503,7 @@ where
                 // Track system rewards distribution
                 self.rewards_metrics.system_rewards_distributed_total.increment(1);
                 // Note: Truncating to u64 for metrics (large rewards unlikely)
-                self.rewards_metrics.system_rewards_amount_wei_total.increment(reward_to_system.min(u128::from(u64::MAX)) as u64);
+                self.rewards_metrics.system_rewards_amount_wei_total.increment(reward_to_system.min(u64::MAX as u128) as u64);
             }
 
             block_reward -= reward_to_system;
@@ -505,7 +517,7 @@ where
         // Track validator rewards distribution
         self.rewards_metrics.validator_rewards_distributed_total.increment(1);
         // Note: Truncating to u64 for metrics (large rewards unlikely)
-        self.rewards_metrics.validator_rewards_amount_wei_total.increment(block_reward.min(u128::from(u64::MAX)) as u64);
+        self.rewards_metrics.validator_rewards_amount_wei_total.increment(block_reward.min(u64::MAX as u128) as u64);
         
         Ok(())
     }

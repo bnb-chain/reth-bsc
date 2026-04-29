@@ -14,7 +14,7 @@ use alloy_primitives::{address, hex, Address, BlockNumber, Bytes, Signature, TxK
 use lazy_static::lazy_static;
 use reth_chainspec::{ChainSpec, EthChainSpec};
 use reth_ethereum_forks::Hardforks;
-use reth_primitives::{Transaction, TransactionSigned};
+use reth_ethereum_primitives::{Transaction, TransactionSigned};
 use revm::state::Bytecode;
 use std::{collections::HashMap, sync::Arc};
 use thiserror::Error;

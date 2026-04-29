@@ -25,7 +25,7 @@ use revm::{
     context_interface::JournalTr,
     Context, ExecuteEvm, InspectEvm, Inspector, SystemCallEvm,
 };
-use revm_context_interface::journaled_state::account::JournaledAccountTr;
+use revm::context_interface::journaled_state::account::JournaledAccountTr;
 
 mod assembler;
 mod builder;

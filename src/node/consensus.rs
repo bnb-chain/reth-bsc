@@ -32,8 +32,7 @@ use reth::{
 use reth_chainspec::EthChainSpec;
 use reth_engine_primitives::ConsensusEngineHandle;
 use reth_ethereum_primitives::Receipt;
-use reth_payload_primitives::EngineApiMessageVersion;
-use reth_primitives::{gas_spent_by_transactions, GotExpected};
+use reth_primitives_traits::{receipt::gas_spent_by_transactions, GotExpected};
 use reth_primitives_traits::constants::{GAS_LIMIT_BOUND_DIVISOR, MINIMUM_GAS_LIMIT};
 use reth_provider::{BlockNumReader, HeaderProvider};
 use std::sync::Arc;
@@ -375,15 +374,15 @@ mod tests {
         fn sealed_header(
             &self,
             _number: u64,
-        ) -> reth_provider::ProviderResult<Option<reth_primitives::SealedHeader<Self::Header>>> {
+        ) -> reth_provider::ProviderResult<Option<reth_primitives_traits::SealedHeader<Self::Header>>> {
             Ok(None)
         }
 
         fn sealed_headers_while(
             &self,
             _range: impl core::ops::RangeBounds<u64>,
-            _predicate: impl FnMut(&reth_primitives::SealedHeader<Self::Header>) -> bool,
-        ) -> reth_provider::ProviderResult<Vec<reth_primitives::SealedHeader<Self::Header>>> {
+            _predicate: impl FnMut(&reth_primitives_traits::SealedHeader<Self::Header>) -> bool,
+        ) -> reth_provider::ProviderResult<Vec<reth_primitives_traits::SealedHeader<Self::Header>>> {
             Ok(Vec::new())
         }
     }
@@ -1256,7 +1255,7 @@ where
 
         match self
             .engine_handle
-            .fork_choice_updated(state, None, EngineApiMessageVersion::default())
+            .fork_choice_updated(state, None)
             .await
         {
             Ok(response) => match response.payload_status.status {

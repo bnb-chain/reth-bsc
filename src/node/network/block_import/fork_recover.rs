@@ -518,14 +518,14 @@ mod tests {
         fn sealed_header(
             &self,
             _number: u64,
-        ) -> Result<Option<reth_primitives::SealedHeader<Self::Header>>, ProviderError> {
+        ) -> Result<Option<reth_primitives_traits::SealedHeader<Self::Header>>, ProviderError> {
             Ok(None)
         }
         fn sealed_headers_while(
             &self,
             _range: impl core::ops::RangeBounds<u64>,
-            _predicate: impl FnMut(&reth_primitives::SealedHeader<Self::Header>) -> bool,
-        ) -> Result<Vec<reth_primitives::SealedHeader<Self::Header>>, ProviderError> {
+            _predicate: impl FnMut(&reth_primitives_traits::SealedHeader<Self::Header>) -> bool,
+        ) -> Result<Vec<reth_primitives_traits::SealedHeader<Self::Header>>, ProviderError> {
             Ok(vec![])
         }
     }

@@ -1,10 +1,10 @@
 #![allow(clippy::owned_cow)]
 use alloy_consensus::{BlobTransactionSidecar, Header};
+use alloy_eips::eip4895::Withdrawals;
 use alloy_primitives::B256;
 use alloy_rlp::{Decodable, Encodable};
-use reth_ethereum_primitives::{BlockBody, Receipt};
-use reth_primitives::{NodePrimitives, TransactionSigned};
-use reth_primitives_traits::{Block, BlockBody as BlockBodyTrait, InMemorySize};
+use reth_ethereum_primitives::{BlockBody, Receipt, TransactionSigned};
+use reth_primitives_traits::{Block, BlockBody as BlockBodyTrait, InMemorySize, NodePrimitives};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 
@@ -149,7 +149,7 @@ impl BlockBodyTrait for BscBlockBody {
         self.inner.into_transactions()
     }
 
-    fn withdrawals(&self) -> Option<&alloy_rpc_types::Withdrawals> {
+    fn withdrawals(&self) -> Option<&Withdrawals> {
         self.inner.withdrawals()
     }
 
@@ -340,58 +340,12 @@ mod rlp {
     }
 }
 
-pub mod serde_bincode_compat {
-    use super::*;
-    use reth_primitives_traits::serde_bincode_compat::{BincodeReprFor, SerdeBincodeCompat};
-
-    #[derive(Debug, Serialize, Deserialize)]
-    pub struct BscBlockBodyBincode<'a> {
-        inner: BincodeReprFor<'a, BlockBody>,
-        sidecars: Option<Cow<'a, Vec<BscBlobTransactionSidecar>>>,
-    }
-
-    #[derive(Debug, Serialize, Deserialize)]
-    pub struct BscBlockBincode<'a> {
-        header: BincodeReprFor<'a, Header>,
-        body: BincodeReprFor<'a, BscBlockBody>,
-    }
-
-    impl SerdeBincodeCompat for BscBlockBody {
-        type BincodeRepr<'a> = BscBlockBodyBincode<'a>;
-
-        fn as_repr(&self) -> Self::BincodeRepr<'_> {
-            BscBlockBodyBincode {
-                inner: self.inner.as_repr(),
-                sidecars: self.sidecars.as_ref().map(Cow::Borrowed),
-            }
-        }
-
-        fn from_repr(repr: Self::BincodeRepr<'_>) -> Self {
-            let BscBlockBodyBincode { inner, sidecars } = repr;
-            Self { inner: BlockBody::from_repr(inner), sidecars: sidecars.map(|s| s.into_owned()) }
-        }
-    }
-
-    impl SerdeBincodeCompat for BscBlock {
-        type BincodeRepr<'a> = BscBlockBincode<'a>;
-
-        fn as_repr(&self) -> Self::BincodeRepr<'_> {
-            BscBlockBincode { header: self.header.as_repr(), body: self.body.as_repr() }
-        }
-
-        fn from_repr(repr: Self::BincodeRepr<'_>) -> Self {
-            let BscBlockBincode { header, body } = repr;
-            Self { header: Header::from_repr(header), body: BscBlockBody::from_repr(body) }
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloy_consensus::Header;
     use alloy_eips::eip4895::Withdrawals;
-    use reth_primitives_traits::Block;
 
     fn create_test_header() -> Header {
         Header::default()

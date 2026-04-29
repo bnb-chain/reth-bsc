@@ -14,7 +14,7 @@ use reth::{
 };
 use reth_engine_primitives::{ExecutionPayload, PayloadValidator};
 use reth_payload_primitives::NewPayloadError;
-use reth_primitives::{RecoveredBlock, SealedBlock};
+use reth_primitives_traits::{RecoveredBlock, SealedBlock};
 use reth_primitives_traits::Block;
 use reth_trie_common::HashedPostState;
 use serde::{Deserialize, Serialize};
