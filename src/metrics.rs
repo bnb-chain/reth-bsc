@@ -295,6 +295,41 @@ pub struct BscParliaGethMetrics {
     pub doublesign: Counter,
 }
 
+/// Metrics for the BSC block import service (`block_import/service.rs`).
+///
+/// Exposes the per-outcome distribution of `engine.new_payload` results so the
+/// reorg-race vs. structural-invalid ratio is visible at the Prometheus layer.
+/// This is the diagnostic surface that lets us tune the race-shaped error
+/// classifier in `service.rs` without grepping logs, and tells us whether a
+/// peer-drop incident is correlated with a spike of structural rejects (which
+/// trigger the BadBlock penalty path) versus race rejects (which do not).
+#[derive(Metrics, Clone)]
+#[metrics(scope = "bsc.block_import")]
+pub struct BscBlockImportMetrics {
+    /// `Invalid` outcomes whose error string matched a reorg-race heuristic
+    /// (`state root`, `parent block`, `unknown parent`, `missing trie`,
+    /// `receipts root`, `insert_canonical`, `reorg`). These do NOT emit an Err
+    /// outcome to the network manager and therefore do NOT trigger the
+    /// `BadBlock` reputation penalty.
+    pub invalid_race: Counter,
+
+    /// `Invalid` outcomes whose error string did NOT match any race heuristic.
+    /// These are treated as structural failures and DO emit an Err outcome,
+    /// which means reth's `NetworkManager::on_block_imported` applies a
+    /// `BadBlock` reputation change to the source peer.
+    pub invalid_structural: Counter,
+
+    /// `Valid` outcomes — block accepted by the engine.
+    pub valid: Counter,
+
+    /// `Syncing` outcomes — engine couldn't validate yet, FCU was forced.
+    pub syncing: Counter,
+
+    /// Payloads rejected before reaching the engine because the
+    /// announced-hash and computed-hash diverged.
+    pub hash_mismatch: Counter,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,5 +345,6 @@ mod tests {
         let _miner_metrics = BscMinerMetrics::default();
         let _finality_metrics = BscFinalityMetrics::default();
         let _blockchain_metrics = BscBlockchainMetrics::default();
+        let _block_import_metrics = BscBlockImportMetrics::default();
     }
 }
