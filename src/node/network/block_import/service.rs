@@ -32,7 +32,7 @@ use reth_network::{
 use reth_network_api::{PeerId, Peers, ReputationChangeKind};
 use reth_node_ethereum::EthEngineTypes;
 use reth_payload_builder_primitives::Events;
-use reth_payload_primitives::{BuiltPayload, EngineApiMessageVersion, PayloadTypes};
+use reth_payload_primitives::{BuiltPayload, PayloadTypes};
 use reth_primitives_traits::NodePrimitives;
 use reth_primitives_traits::{AlloyBlockHeader, Block};
 use reth_provider::{BlockHashReader, BlockNumReader, BlockReaderIdExt, HeaderProvider};
@@ -658,7 +658,7 @@ where
                 safe_block_hash: B256::ZERO,
                 finalized_block_hash: B256::ZERO,
             };
-            match engine.fork_choice_updated(state, None, EngineApiMessageVersion::V1).await {
+            match engine.fork_choice_updated(state, None).await {
                 Ok(ret) => tracing::info!(
                     target: "bsc::block_import",
                     %head_hash,
