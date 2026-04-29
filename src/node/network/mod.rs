@@ -250,18 +250,17 @@ impl BscNetworkBuilder {
         let provider = ctx.provider().clone();
         let chain_spec = ctx.chain_spec().clone();
 
-        // Install a cached full block provider so that BSC BlocksByRange replies
-        // can include full bodies if they were recently imported. External callers
-        // can override by setting a richer provider before network starts.
+        // Install a cached full block provider so BSC BlocksByRange replies can include
+        // full bodies when blocks are in the provider (DB + canonical in-memory state),
+        // not just the broadcast-populated BODY_CACHE.
         {
-            use reth_provider::{BlockNumReader, HeaderProvider};
+            use reth_provider::BlockReader;
             struct CachedFullBlockProvider<P> {
                 inner: P,
             }
             impl<P> crate::shared::FullBlockProvider for CachedFullBlockProvider<P>
             where
-                P: HeaderProvider<Header = alloy_consensus::Header>
-                    + BlockNumReader
+                P: BlockReader<Block = crate::node::primitives::BscBlock>
                     + Clone
                     + Send
                     + Sync
@@ -271,33 +270,15 @@ impl BscNetworkBuilder {
                     &self,
                     hash: &alloy_primitives::B256,
                 ) -> Option<crate::node::primitives::BscBlock> {
-                    crate::shared::get_cached_block_by_hash(hash).or_else(|| {
-                        self.inner.header(*hash).ok().flatten().map(|h| {
-                            crate::node::primitives::BscBlock {
-                                header: h,
-                                body: crate::node::primitives::BscBlockBody {
-                                    inner: reth_ethereum_primitives::BlockBody::default(),
-                                    sidecars: None,
-                                },
-                            }
-                        })
-                    })
+                    crate::shared::get_cached_block_by_hash(hash)
+                        .or_else(|| self.inner.block_by_hash(*hash).ok().flatten())
                 }
                 fn block_by_number(
                     &self,
                     number: u64,
                 ) -> Option<crate::node::primitives::BscBlock> {
-                    crate::shared::get_cached_block_by_number(number).or_else(|| {
-                        self.inner.header_by_number(number).ok().flatten().map(|h| {
-                            crate::node::primitives::BscBlock {
-                                header: h,
-                                body: crate::node::primitives::BscBlockBody {
-                                    inner: reth_ethereum_primitives::BlockBody::default(),
-                                    sidecars: None,
-                                },
-                            }
-                        })
-                    })
+                    crate::shared::get_cached_block_by_number(number)
+                        .or_else(|| self.inner.block_by_number(number).ok().flatten())
                 }
             }
 

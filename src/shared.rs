@@ -205,6 +205,23 @@ pub trait FullBlockProvider: Send + Sync {
 /// Global full block provider instance
 static FULL_BLOCK_PROVIDER: OnceLock<Arc<dyn FullBlockProvider + Send + Sync>> = OnceLock::new();
 
+/// Global blob store shared between the tx pool and the block body serving path.
+static GLOBAL_BLOB_STORE: OnceLock<Arc<dyn reth_transaction_pool::blobstore::BlobStore>> =
+    OnceLock::new();
+
+/// Register the node-wide blob store so that block-body serving can read blob sidecars.
+pub fn set_global_blob_store(
+    store: Arc<dyn reth_transaction_pool::blobstore::BlobStore>,
+) {
+    let _ = GLOBAL_BLOB_STORE.set(store);
+}
+
+/// Return a reference to the global blob store, if one has been registered.
+pub fn get_global_blob_store(
+) -> Option<&'static Arc<dyn reth_transaction_pool::blobstore::BlobStore>> {
+    GLOBAL_BLOB_STORE.get()
+}
+
 /// In-memory cache for recently seen full blocks (hash -> block), and number -> hash mapping.
 /// This allows answering range requests with full bodies if they were recently imported.
 static BODY_CACHE: OnceLock<RwLock<BodyCache>> = OnceLock::new();
@@ -440,6 +457,11 @@ pub fn set_full_block_provider(
     provider: Arc<dyn FullBlockProvider + Send + Sync>,
 ) -> Result<(), Arc<dyn FullBlockProvider + Send + Sync>> {
     FULL_BLOCK_PROVIDER.set(provider)
+}
+
+/// Get a clone of the installed [`FullBlockProvider`], if any.
+pub fn get_full_block_provider() -> Option<Arc<dyn FullBlockProvider + Send + Sync>> {
+    FULL_BLOCK_PROVIDER.get().cloned()
 }
 
 /// Try to get a full block by hash from the global provider

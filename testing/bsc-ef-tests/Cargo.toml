@@ -13,7 +13,7 @@ asm-keccak = ["alloy-primitives/asm-keccak"]
 # BSC crate
 reth_bsc = { path = "../.." }
 
-# reth dependencies aligned with root crate tag to avoid duplicate crate versions
+# reth dependencies aligned with root crate branch to avoid duplicate crate versions
 reth-chainspec = { git = "https://github.com/bnb-chain/reth.git", branch = "develop-v2" }
 reth-consensus = { git = "https://github.com/bnb-chain/reth.git", branch = "develop-v2" }
 reth-ethereum-forks = { git = "https://github.com/bnb-chain/reth.git", branch = "develop-v2" }

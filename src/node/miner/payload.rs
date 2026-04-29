@@ -363,6 +363,32 @@ where
         // Parent difflayers were fetched once at job start; reuse across all retry attempts.
         let triedb_parent_difflayers = parent_difflayers;
 
+        // Safety guard: when triedb is active but no difflayers are available, verify that the
+        // parent state root matches the pathdb disk layer.  If they diverge (e.g. after a
+        // restart where in-memory difflayers were lost), building on this parent would produce
+        // a block with an incorrect state root.  Skip building to avoid polluting the network.
+        if rust_eth_triedb::triedb_manager::is_triedb_active() && triedb_parent_difflayers.is_none() {
+            let triedb = get_global_triedb();
+            let (persist_block, persist_root) = triedb
+                .latest_persist_state()
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            if parent_header.state_root() != persist_root {
+                warn!(
+                    target: "payload_builder",
+                    trace_id,
+                    parent_hash = %parent_hash,
+                    parent_number = parent_header.number(),
+                    parent_state_root = %parent_header.state_root(),
+                    pathdb_block = persist_block,
+                    pathdb_root = %persist_root,
+                    "Skipping build_payload: no difflayers and parent state root diverges from pathdb disk layer"
+                );
+                return Err(Box::from(
+                    "triedb pathdb gap: no difflayers and parent state root != pathdb disk layer root",
+                ));
+            }
+        }
+
         let state_provider = self.client.state_by_block_hash(parent_header.hash_slow())?;
         let state = StateProviderDatabase::new(&state_provider);
         let mut db = State::builder()
@@ -817,7 +843,7 @@ where
         }
 
         let mut plain = sealed_block.clone_block();
-        plain.body.sidecars = Some(blob_sidecars);
+        plain.body.sidecars = if blob_sidecars.is_empty() { None } else { Some(blob_sidecars) };
         sealed_block = Arc::new(plain.into());
 
         let requests = execution_result.requests.clone();
@@ -864,6 +890,30 @@ where
         let parent_hash = parent_header.hash_slow();
         // Parent difflayers were fetched once at job start; reuse across all retry attempts.
         let triedb_parent_difflayers = parent_difflayers;
+
+        // Safety guard: same as build_payload — refuse to build on a parent whose state root
+        // cannot be correctly resolved by pathdb without difflayers.
+        if rust_eth_triedb::triedb_manager::is_triedb_active() && triedb_parent_difflayers.is_none() {
+            let triedb = get_global_triedb();
+            let (persist_block, persist_root) = triedb
+                .latest_persist_state()
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            if parent_header.state_root() != persist_root {
+                warn!(
+                    target: "payload_builder",
+                    trace_id,
+                    parent_hash = %parent_hash,
+                    parent_number = parent_header.number(),
+                    parent_state_root = %parent_header.state_root(),
+                    pathdb_block = persist_block,
+                    pathdb_root = %persist_root,
+                    "Skipping build_empty_payload: no difflayers and parent state root diverges from pathdb disk layer"
+                );
+                return Err(Box::from(
+                    "triedb pathdb gap: no difflayers and parent state root != pathdb disk layer root",
+                ));
+            }
+        }
 
         let state_provider = self.client.state_by_block_hash(parent_header.hash_slow())?;
         let state = StateProviderDatabase::new(&state_provider);
@@ -1035,7 +1085,8 @@ async fn fetch_triedb_difflayers(trace_id: u64, parent_hash: alloy_primitives::B
                 trace_id,
                 %parent_hash,
                 error = %e,
-                "Failed to fetch parent difflayers; triedb state root falls back to full trie traversal"
+                "Failed to fetch parent difflayers; triedb state root falls back to full trie traversal \
+                 (typically only seen shortly after node startup, before difflayers for recent blocks have been cached)"
             );
             None
         }
@@ -1067,10 +1118,6 @@ where
     builder: Arc<BscPayloadBuilder<Pool, Client, EvmConfig>>,
     /// Timeout for payload building
     timeout: std::time::Duration,
-    /// Expected end timestamp (milliseconds since UNIX epoch).
-    ///
-    /// Initialized in `new()` as: `now_ms + parlia.delay_for_ramanujan_fork(... )`.
-    expected_end_timestamp_ms: u128,
     /// Message queue for processing build arguments
     try_build_rx: mpsc::UnboundedReceiver<()>,
     /// Sender for sending arguments back to queue
@@ -1150,16 +1197,6 @@ where
         );
         let pending_basefee = builder.pool.block_info().pending_basefee;
 
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        let expected_end_delay_ms = parlia.delay_for_ramanujan_fork(
-            &mining_ctx.parent_snapshot,
-            mining_ctx.header.as_ref().unwrap(),
-        );
-        let expected_end_timestamp_ms = now_ms + expected_end_delay_ms as u128;
-
         // Spawn a background task to listen for new transactions from pool
         // When tx_listener_rx is dropped (job ends), tx_listener_tx.send() will fail,
         // causing this task to exit and pool_listener to be dropped,
@@ -1179,7 +1216,6 @@ where
             mining_ctx,
             builder: Arc::new(builder),
             timeout: std::time::Duration::from_millis(mining_delay),
-            expected_end_timestamp_ms,
             try_build_rx,
             try_build_tx: try_build_tx.clone(),
             tx_listener: tx_listener_rx,
@@ -1208,7 +1244,7 @@ where
             block_number = job.mining_ctx.parent_header.number() + 1,
             is_inturn = job.mining_ctx.is_inturn,
             timeout = ?job.timeout,
-            expected_end_timestamp_ms = job.expected_end_timestamp_ms,
+            end_mining_timestamp_ms = job.mining_ctx.end_mining_timestamp_ms,
             "Succeed to new payload job"
         );
         (job, handle)
@@ -1731,7 +1767,7 @@ where
     /// build and block until its result (or an abort signal) arrives.
     ///
     /// Phase 2 — collect better candidates: loop over remaining background builds in 50 ms slices
-    /// until the pre-computed `expected_end_timestamp_ms` deadline (+ 150 ms grace) is reached or
+    /// until the pre-computed `end_mining_timestamp_ms` deadline (+ 150 ms grace) is reached or
     /// all background tasks finish, whichever comes first.
     fn collect_payload_candidates(&mut self) -> Result<(), Box<BscPayloadJobError>> {
         // Phase 1: guarantee at least one candidate.
@@ -1842,7 +1878,7 @@ where
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis();
-            if now_ms >= self.expected_end_timestamp_ms + 150 {
+            if now_ms >= self.mining_ctx.end_mining_timestamp_ms + 150 {
                 debug!(
                     target: "bsc::miner::payload",
                     trace_id = self.trace_id,
@@ -1850,7 +1886,7 @@ where
                     is_inturn = self.mining_ctx.is_inturn,
                     bg_tasks = self.join_handle.len(),
                     now_ms,
-                    expected_end_timestamp_ms = self.expected_end_timestamp_ms,
+                    end_mining_timestamp_ms = self.mining_ctx.end_mining_timestamp_ms,
                     "Skip waiting for additional payload candidates due to timeout"
                 );
                 break;
@@ -1863,9 +1899,10 @@ where
                 .parent_snapshot
                 .last_block_in_one_turn(try_mine_block_number)
             {
-                (self.expected_end_timestamp_ms - now_ms) as u64
+                self.mining_ctx.end_mining_timestamp_ms.saturating_sub(now_ms) as u64
             } else {
-                ((self.expected_end_timestamp_ms - now_ms) as u64) * 3 // wait more when not the last block in turn
+                (self.mining_ctx.end_mining_timestamp_ms.saturating_sub(now_ms) as u64)
+                    .saturating_mul(3)
             };
             if remaining_ms > 50 {
                 remaining_ms = 50;
@@ -1901,7 +1938,7 @@ where
                         is_inturn = self.mining_ctx.is_inturn,
                         waited_ms = waited.as_millis(),
                         bg_tasks = self.join_handle.len(),
-                        expected_end_timestamp_ms = self.expected_end_timestamp_ms,
+                        end_mining_timestamp_ms = self.mining_ctx.end_mining_timestamp_ms,
                         "No background payload candidate finished within wait slice"
                     );
                     // Keep waiting in further slices until we hit the expected end timestamp (+grace)
@@ -2000,7 +2037,7 @@ where
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis();
-        let delay_ms = self.expected_end_timestamp_ms.saturating_sub(now_ms) as u64;
+        let delay_ms = self.mining_ctx.end_mining_timestamp_ms.saturating_sub(now_ms) as u64;
 
         let submit_ctx = SubmitContext {
             mining_ctx: self.mining_ctx.clone(),
@@ -2109,6 +2146,7 @@ where
             self.parlia.clone(),
             &self.mining_ctx.parent_snapshot,
             &self.mining_ctx.parent_header,
+            self.mining_ctx.block_timestamp_ms,
         )
         .map_err(|e| {
             warn!(
@@ -2172,6 +2210,7 @@ fn finalize_payload(
     parlia: Arc<Parlia<BscChainSpec>>,
     parent_snapshot: &Snapshot,
     parent_header: &SealedHeader<alloy_consensus::Header>,
+    block_timestamp_ms: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let snapshot_provider = crate::shared::get_snapshot_provider()
         .cloned()
@@ -2184,11 +2223,18 @@ fn finalize_payload(
     let mut existing_sidecars = payload.block.clone_block().body.sidecars;
     let mut plain_block = payload.executed_block.recovered_block.sealed_block().clone_block();
 
-    finalize_new_header(parlia, parent_snapshot, parent_header, &mut plain_block.header, &snapshot_provider)
-        .map_err(|e| {
-            Box::new(std::io::Error::other(e.to_string()))
-                as Box<dyn std::error::Error + Send + Sync>
-        })?;
+    finalize_new_header(
+        parlia,
+        parent_snapshot,
+        parent_header,
+        &mut plain_block.header,
+        &snapshot_provider,
+        block_timestamp_ms,
+    )
+    .map_err(|e| {
+        Box::new(std::io::Error::other(e.to_string()))
+            as Box<dyn std::error::Error + Send + Sync>
+    })?;
 
     let final_hash = plain_block.header.hash_slow();
     if let Some((validators, vote_addresses)) = payload.pending_validators.take() {
@@ -2295,6 +2341,8 @@ mod tests {
             parent_snapshot: Arc::new(snapshot),
             is_inturn,
             cached_reads: None,
+            block_timestamp_ms: now_ms + delay_ms,
+            end_mining_timestamp_ms: 0,
         }
     }
 
@@ -2310,11 +2358,7 @@ mod tests {
         let final_shot_used = false;
 
         for &(arrival_ms, estimated_fees) in tx_arrivals {
-            #[allow(clippy::while_let_loop)]
-            loop {
-                let Some(deadline_ms) = wait_deadline_ms else {
-                    break;
-                };
+            while let Some(deadline_ms) = wait_deadline_ms {
                 if deadline_ms > arrival_ms {
                     break;
                 }

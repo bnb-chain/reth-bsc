@@ -15,6 +15,7 @@ use crate::node::network::BscNewBlock;
 
 pub mod handle;
 pub mod service;
+pub(crate) mod fork_recover;
 
 #[derive(Debug)]
 pub struct BscBlockImport {

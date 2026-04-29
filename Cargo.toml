@@ -72,10 +72,10 @@ reth-tasks = { git = "https://github.com/bnb-chain/reth.git", branch = "develop-
 reth-transaction-pool = { git = "https://github.com/bnb-chain/reth.git", branch = "develop-v2" }
 
 # triedb dependencies
-rust-eth-triedb = { git = "https://github.com/bnb-chain/reth-bsc-triedb.git", branch = "develop" }
-rust-eth-triedb-common = { git = "https://github.com/bnb-chain/reth-bsc-triedb.git", branch = "develop", package = "rust-eth-triedb-common" }
-rust-eth-triedb-pathdb = { git = "https://github.com/bnb-chain/reth-bsc-triedb.git", branch = "develop", package = "rust-eth-triedb-pathdb" }
-rust-eth-triedb-state-trie = { git = "https://github.com/bnb-chain/reth-bsc-triedb.git", branch = "develop", package = "rust-eth-triedb-state-trie" }
+rust-eth-triedb = { git = "https://github.com/bnb-chain/reth-bsc-triedb.git", tag = "v0.0.2" }
+rust-eth-triedb-common = { git = "https://github.com/bnb-chain/reth-bsc-triedb.git", tag = "v0.0.2", package = "rust-eth-triedb-common" }
+rust-eth-triedb-pathdb = { git = "https://github.com/bnb-chain/reth-bsc-triedb.git", tag = "v0.0.2", package = "rust-eth-triedb-pathdb" }
+rust-eth-triedb-state-trie = { git = "https://github.com/bnb-chain/reth-bsc-triedb.git", tag = "v0.0.2", package = "rust-eth-triedb-state-trie" }
 
 revm = "36.0.0"
 revm-database = "12.0.0"
