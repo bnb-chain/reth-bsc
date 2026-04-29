@@ -1360,7 +1360,6 @@ mod tests {
                     BeaconEngineMessage::ForkchoiceUpdated {
                         state,
                         payload_attrs: _,
-                        version: _,
                         tx,
                     } => {
                         let _ = fcu_tx.send(state);
