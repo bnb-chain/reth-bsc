@@ -66,6 +66,14 @@ fn resolve_epoch_validators(
     Ok((validators, vote_addresses))
 }
 
+/// Prepare a new block's header and derive the payload builder attributes.
+///
+/// Populates on `ctx`:
+/// - `header`: the freshly constructed unsealed header for this block.
+/// - `block_timestamp_ms`: block timestamp in ms fixed by `prepare_timestamp`, reused
+///   verbatim by `finalize_new_header` to avoid seconds/ms drift at sealing time.
+/// - `end_mining_timestamp_ms`: wall-clock deadline for this mining job, computed as
+///   `now_ms + parlia.delay_for_ramanujan_fork(...)`.
 pub fn prepare_new_attributes(
     ctx: &mut MiningContext,
     parlia: Arc<Parlia<BscChainSpec>>,
@@ -73,7 +81,18 @@ pub fn prepare_new_attributes(
     signer: Address,
 ) -> EthPayloadBuilderAttributes {
     let mut new_header = prepare_new_header(parlia.clone(), parent_header, signer);
-    parlia.prepare_timestamp(&ctx.parent_snapshot, parent_header.header(), &mut new_header);
+    // Cache the planned millisecond timestamp so finalize_new_header can reuse it verbatim.
+    ctx.block_timestamp_ms =
+        parlia.prepare_timestamp(&ctx.parent_snapshot, parent_header.header(), &mut new_header);
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let end_mining_delay_ms =
+        parlia.delay_for_ramanujan_fork(&ctx.parent_snapshot, &new_header);
+    ctx.end_mining_timestamp_ms = now_ms + end_mining_delay_ms as u128;
+
     // BSC uses the PREVRANDAO opcode to return difficulty (not a random value like
     // Ethereum PoS). The validation path in BscEvmConfig::evm_env sets
     // `prevrandao = header.difficulty()`, so the building path must match.
@@ -137,25 +156,23 @@ where
 }
 
 /// finalize a new header and seal it.
+///
+/// `block_timestamp_ms` is the millisecond timestamp decided by `prepare_timestamp` and
+/// cached on `MiningContext`.
 pub fn finalize_new_header<ChainSpec>(
     parlia: Arc<Parlia<ChainSpec>>,
     parent_snap: &Snapshot,
     parent_header: &SealedHeader,
     new_header: &mut Header,
     snapshot_provider: &Arc<dyn SnapshotProvider + Send + Sync>,
+    block_timestamp_ms: u64,
 ) -> Result<(), crate::node::miner::signer::SignerError>
 where
     ChainSpec: EthChainSpec + crate::hardforks::BscHardforks + 'static,
 {
     new_header.difficulty = calculate_difficulty(parent_snap, new_header.beneficiary);
-    // Restore correct mix_hash for the sealed header. The assembler may have set
-    // mix_hash from BlockEnv.prevrandao (which is the difficulty value for EVM
-    // execution). BSC encodes the millisecond timestamp part in mix_hash post-Lorentz,
-    // or uses B256::ZERO pre-Lorentz.
-    let millisecond_timestamp =
-        parlia.block_time_for_ramanujan_fork(parent_snap, parent_header, new_header);
     if parlia.spec.is_lorentz_active_at_timestamp(new_header.number, new_header.timestamp) {
-        set_millisecond_part_of_timestamp(millisecond_timestamp, new_header);
+        set_millisecond_part_of_timestamp(block_timestamp_ms, new_header);
     } else {
         new_header.mix_hash = B256::ZERO;
     }
@@ -808,5 +825,88 @@ mod tests {
             header.extra_data, original_extra,
             "original extra_data must be preserved when vote re-assembly fails"
         );
+    }
+
+    // --- Tests for finalize_new_header millisecond-timestamp invariant ---
+
+    /// Post-Luban, post-Lorentz chainspec so `finalize_new_header` takes the Lorentz branch
+    /// that writes the millisecond part into `mix_hash`. Lorentz activation is gated on
+    /// `is_london_active_at_block`, so London is also forced to block 0.
+    fn lorentz_chain_spec() -> Arc<BscChainSpec> {
+        use reth_chainspec::EthereumHardfork;
+        Arc::new(BscChainSpec::from(
+            ChainSpecBuilder::mainnet()
+                .with_fork(EthereumHardfork::London, ForkCondition::Block(0))
+                .with_fork(BscHardfork::Luban, ForkCondition::Block(0))
+                .with_fork(BscHardfork::Lorentz, ForkCondition::Timestamp(0))
+                .build(),
+        ))
+    }
+
+    /// Regression for the bsc-qanet stall of 2026-04-20. When `finalize_new_header` ran
+    /// slightly past the planned block timestamp, the wall-clock ceiling branch in
+    /// `block_time_for_ramanujan_fork` recomputed a millisecond_timestamp that crossed a
+    /// second boundary, so `set_millisecond_part_of_timestamp` wrote a stale ms onto the
+    /// already-fixed `header.timestamp` (seconds). The sealed header's effective
+    /// millisecond timestamp was 1 second behind the required floor and every peer
+    /// rejected it with "Block time is too early" / "timestamp in the past".
+    ///
+    /// Fix: `finalize_new_header` takes the planned ms cached by `prepare_timestamp` and
+    /// uses it directly; it never re-runs `block_time_for_ramanujan_fork`. This matches
+    /// go-bsc where `Prepare()` decides the timestamp once and `Seal()` never recomputes.
+    #[test]
+    fn finalize_new_header_preserves_planned_ms_regardless_of_wall_clock() {
+        use crate::consensus::parlia::util::calculate_millisecond_timestamp;
+        ensure_test_signer();
+        let parlia = Arc::new(Parlia::new(lorentz_chain_spec(), 200));
+
+        // Parent: seconds 1_776_727_552, ms 500 → parent_ms = 1_776_727_552_500
+        let mut parent_hdr =
+            Header { number: 1, timestamp: 1_776_727_552, ..Default::default() };
+        set_millisecond_part_of_timestamp(1_776_727_552_500, &mut parent_hdr);
+        let parent_sealed = SealedHeader::seal_slow(parent_hdr);
+
+        let validator = Address::with_last_byte(1);
+        let mut parent_snap =
+            Snapshot::new(vec![validator], 1, parent_sealed.hash(), 500, None);
+        parent_snap.block_interval = 450; // Fermi
+
+        // Single-validator snapshot ⇒ sole validator is always in-turn ⇒ back_off_time = 0.
+        // Planned ms = parent_ms + block_interval + back_off_time.
+        let planned_ms: u64 = 1_776_727_552_500 + 450; // 1_776_727_552_950
+
+        // Simulate the header state right before finalize runs: prepare_timestamp has
+        // fixed header.timestamp (seconds) and mix_hash (ms), then the EVM assembler
+        // overwrote mix_hash with BlockEnv.prevrandao (= difficulty in BSC).
+        let mut header = Header {
+            number: 2, // <3: assemble_vote_attestation short-circuits to Ok(())
+            parent_hash: parent_sealed.hash(),
+            beneficiary: validator,
+            timestamp: planned_ms / 1000,
+            mix_hash: B256::repeat_byte(0xAB), // prevrandao garbage from assembler
+            extra_data: Bytes::from(vec![0u8; EXTRA_VANITY_LEN]),
+            ..Default::default()
+        };
+
+        let sp: Arc<dyn SnapshotProvider + Send + Sync> =
+            Arc::new(MockSnapshotProvider { snapshot: parent_snap.clone() });
+
+        finalize_new_header(
+            parlia,
+            &parent_snap,
+            &parent_sealed,
+            &mut header,
+            &sp,
+            planned_ms,
+        )
+        .expect("finalize_new_header should succeed");
+
+        assert_eq!(
+            calculate_millisecond_timestamp(&header),
+            planned_ms,
+            "finalize_new_header must preserve the planned millisecond timestamp exactly — \
+             the wall-clock ceiling path that caused the 2026-04-20 qanet stall must not apply"
+        );
+        assert_eq!(header.timestamp, planned_ms / 1000);
     }
 }

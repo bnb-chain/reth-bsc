@@ -2,10 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::RwLock;
 
-use alloy_primitives::{U128, U256};
 use once_cell::sync::Lazy;
-use reth_eth_wire::NewBlock;
-use reth_network::message::NewBlockMessage;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
@@ -17,7 +14,6 @@ use super::stream::BscCommand;
 use crate::node::network::blocks_by_range::{
     BlocksByRangePacket, GetBlocksByRangePacket, MAX_REQUEST_RANGE_BLOCKS_COUNT,
 };
-use crate::node::network::BscNewBlock;
 use alloy_primitives::B256;
 use reth_network::Peers;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -162,44 +158,6 @@ pub async fn request_blocks_by_range(
         Ok(Err(_canceled)) => Err("request canceled".to_string()),
         Err(_elapsed) => Err("request timed out".to_string()),
     }
-}
-
-/// Batch request a range and wait for import of the returned blocks.
-/// Returns the list of imported block hashes in ascending order (oldest -> newest).
-pub async fn batch_request_range_and_await_import(
-    peer: PeerId,
-    start_height: u64,
-    start_hash: B256,
-    count: u64,
-    request_timeout: Duration,
-) -> Result<(), String> {
-    let resp =
-        request_blocks_by_range(peer, start_height, start_hash, count, request_timeout).await?;
-    tracing::debug!(
-        target: "bsc::registry",
-        peer = %peer,
-        start_height = start_height,
-        start_hash = %start_hash,
-        count = count,
-        blocks = resp.blocks.len(),
-        "Batch request range and await importing blocks"
-    );
-
-    // Forward blocks to import path (iterate oldest -> newest)
-    if let Some(sender) = crate::shared::get_block_import_sender() {
-        for block in resp.blocks.iter().rev() {
-            let nb = BscNewBlock(NewBlock { block: block.clone(), td: U128::from(0u64) });
-            let hash = block.header.hash_slow();
-            let msg = NewBlockMessage { hash, block: Arc::new(nb), td: Some(U256::ZERO) };
-            if let Err(e) = sender.send((msg, peer)) {
-                tracing::error!(target: "bsc::registry", error=%e, "Failed to send block to import path");
-            }
-        }
-    } else {
-        tracing::debug!(target: "bsc_protocol", "Block import sender not available; dropping range import forward");
-    }
-
-    Ok(())
 }
 
 /// Broadcast votes to all connected peers.
@@ -396,6 +354,116 @@ pub fn spawn_evn_refresh_listener() {
             }
         });
         *guard = Some(handle);
+    }
+}
+
+/// Compute a failover peer ordering: `preferred` first, then up to
+/// `max_attempts - 1` other peers from `registered`, preserving order and
+/// deduplicating. Returns at most `max_attempts` entries.
+pub(crate) fn plan_failover_peers(
+    preferred: PeerId,
+    registered: Vec<PeerId>,
+    max_attempts: usize,
+) -> Vec<PeerId> {
+    if max_attempts == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(max_attempts);
+    out.push(preferred);
+    for p in registered {
+        if out.len() >= max_attempts {
+            break;
+        }
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// Like [`request_blocks_by_range`], but rotates through other registered BSC
+/// peers on `Err` or empty response. Returns the first non-empty success,
+/// otherwise the last seen result (preserving the original error for
+/// diagnostics).
+pub async fn request_blocks_by_range_with_failover(
+    preferred: PeerId,
+    start_height: u64,
+    start_hash: B256,
+    count: u64,
+    timeout_dur: Duration,
+    max_attempts: usize,
+) -> Result<BlocksByRangePacket, String> {
+    let peers = plan_failover_peers(preferred, list_registered_peers(), max_attempts);
+    if peers.is_empty() {
+        return Err("no BSC peers available for range request".to_string());
+    }
+
+    let mut last: Result<BlocksByRangePacket, String> =
+        Err("uninitialised failover".to_string());
+    for (idx, peer) in peers.iter().enumerate() {
+        match request_blocks_by_range(*peer, start_height, start_hash, count, timeout_dur).await {
+            Ok(resp) if !resp.blocks.is_empty() => return Ok(resp),
+            Ok(empty_resp) => {
+                tracing::debug!(
+                    target: "bsc_protocol",
+                    %peer,
+                    attempt = idx + 1,
+                    total = peers.len(),
+                    start_height,
+                    %start_hash,
+                    "Empty BlocksByRange response, trying next peer"
+                );
+                last = Ok(empty_resp);
+            }
+            Err(err) => {
+                tracing::debug!(
+                    target: "bsc_protocol",
+                    %peer,
+                    attempt = idx + 1,
+                    total = peers.len(),
+                    start_height,
+                    %start_hash,
+                    %err,
+                    "BlocksByRange request failed, trying next peer"
+                );
+                last = Err(err);
+            }
+        }
+    }
+    last
+}
+
+#[cfg(test)]
+mod failover_tests {
+    use super::*;
+    use alloy_primitives::B512;
+
+    fn pid(byte: u8) -> PeerId {
+        B512::repeat_byte(byte)
+    }
+
+    #[test]
+    fn plan_puts_preferred_first_and_dedups() {
+        let plan = plan_failover_peers(pid(1), vec![pid(2), pid(1), pid(3)], 3);
+        assert_eq!(plan, vec![pid(1), pid(2), pid(3)]);
+    }
+
+    #[test]
+    fn plan_respects_max_attempts() {
+        let plan = plan_failover_peers(pid(1), vec![pid(2), pid(3), pid(4)], 2);
+        assert_eq!(plan, vec![pid(1), pid(2)]);
+    }
+
+    #[test]
+    fn plan_handles_zero_attempts() {
+        let plan = plan_failover_peers(pid(1), vec![pid(2)], 0);
+        assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn plan_handles_empty_registered() {
+        let plan = plan_failover_peers(pid(1), vec![], 5);
+        assert_eq!(plan, vec![pid(1)]);
     }
 }
 
