@@ -114,14 +114,9 @@ where
     failed_heads: crate::node::network::block_import::fork_recover::FailedHeadsCooler,
     /// Periodic timer for head announcement.
     announce_interval: tokio::time::Interval,
-}
-
-fn resolve_bsc_peer_static(announcer: PeerId) -> Option<PeerId> {
-    if crate::node::network::bsc_protocol::registry::has_registered_peer(announcer) {
-        Some(announcer)
-    } else {
-        crate::node::network::bsc_protocol::registry::list_registered_peers().into_iter().next()
-    }
+    /// Per-outcome counters for `engine.new_payload` results. Cloned into each
+    /// import future since `Counter` is a cheap handle into the global registry.
+    metrics: crate::metrics::BscBlockImportMetrics,
 }
 
 impl<Provider> ImportService<Provider>
@@ -174,6 +169,7 @@ where
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 interval
             },
+            metrics: crate::metrics::BscBlockImportMetrics::default(),
         }
     }
 
@@ -183,12 +179,14 @@ where
         let forkchoice_engine = self.forkchoice_engine.clone();
         let recovering_heads = self.recovering_heads.clone();
         let failed_heads = self.failed_heads.clone();
+        let metrics = self.metrics.clone();
 
         let announced_hash = block.hash;
         let block_hash = block.block.0.block.header.hash_slow();
         tracing::debug!(target: "bsc::block_import", "New payload: block = ({:?}, {:?}), peer_id = {:?}", block.block.0.block.header.number, block_hash, peer_id);
         Box::pin(async move {
             if announced_hash != block_hash {
+                metrics.hash_mismatch.increment(1);
                 tracing::warn!(
                     target: "bsc::block_import",
                     number = block.block.0.block.header.number,
@@ -215,6 +213,7 @@ where
             match engine.new_payload(payload).await {
                 Ok(payload_status) => match payload_status.status {
                     PayloadStatusEnum::Valid => {
+                        metrics.valid.increment(1);
                         tracing::debug!(target: "bsc::block_import", "New payload is valid, block_hash = {:?}, block_number = {}, peer_id = {:?}", block.hash, header.number, peer_id);
                         // handle fork choice update with valid payload
                         if let Err(e) = forkchoice_engine.update_forkchoice(&header).await {
@@ -274,6 +273,7 @@ where
                         .any(|needle| lower.contains(needle));
 
                         if looks_like_reorg_race {
+                            metrics.invalid_race.increment(1);
                             tracing::debug!(
                                 target: "bsc::block_import",
                                 block_hash = %header.hash_slow(),
@@ -287,6 +287,7 @@ where
                             // announcement from on_new_block still stands.
                             None
                         } else {
+                            metrics.invalid_structural.increment(1);
                             tracing::info!(
                                 target: "bsc::block_import",
                                 block_hash = %header.hash_slow(),
@@ -303,6 +304,7 @@ where
                         }
                     }
                     PayloadStatusEnum::Syncing => {
+                        metrics.syncing.increment(1);
                         // Parent block is missing. Launch fork-aware ancestor
                         // recovery rather than a naive range fetch + premature
                         // FCU. The recovery task also owns the final FCU.

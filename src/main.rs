@@ -448,11 +448,6 @@ fn main() -> eyre::Result<()> {
             // Set the IPC client
             reth_bsc::shared::set_ipc_client(ipc_path).await.unwrap();
 
-            // Subscribe to peer-lifecycle events and emit an aggregated INFO
-            // summary per minute. Built to diagnose the "peers drop to zero
-            // after sync" drain (reth-bsc #320) without spamming logs.
-            reth_bsc::node::network::peer_metrics::spawn(&node.network);
-
             exit_future.await
         },
     )?;
