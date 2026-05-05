@@ -32,12 +32,12 @@ reth-trie = { git = "https://github.com/bnb-chain/reth.git", branch = "develop-v
 reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", branch = "develop-v2.1" }
 
 # revm
-revm = { version = "36.0.0", features = ["secp256k1", "blst", "c-kzg", "memory_limit"] }
+revm = { version = "38.0.0", features = ["secp256k1", "blst", "c-kzg", "memory_limit"] }
 
 # alloy
-alloy-consensus = "1.8.2"
-alloy-eips = "1.8.2"
-alloy-genesis = "1.8.2"
+alloy-consensus = "2.0.0"
+alloy-eips = "2.0.0"
+alloy-genesis = "2.0.0"
 alloy-primitives = "1.5.6"
 alloy-rlp = "0.3.13"
 

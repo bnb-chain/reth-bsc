@@ -418,7 +418,7 @@ where
         temp_state.remove(&SYSTEM_ADDRESS);
         self.system_caller.on_state(StateChangeSource::Transaction(self.receipts.len()), &temp_state);
 
-        let gas_used = result.gas_used();
+        let gas_used = result.tx_gas_used();
         self.gas_used += gas_used;
 
         // Record system transaction gas usage

@@ -467,7 +467,7 @@ where
             let dummy = ResultAndState {
                 result: ExecutionResult::Success {
                     reason: SuccessReason::Stop,
-                    gas: ResultGas::new(0, 0, 0),
+                    gas: ResultGas::default(),
                     logs: vec![],
                     output: Output::Call(Bytes::new()),
                 },
@@ -561,7 +561,7 @@ where
         self.system_caller
             .on_state(StateChangeSource::Transaction(self.receipts.len()), &temp_state);
 
-        let gas_used = result.gas_used();
+        let gas_used = result.tx_gas_used();
         self.gas_used += gas_used;
         self.blob_gas_used = self.blob_gas_used.saturating_add(output.blob_gas_used);
 

@@ -231,7 +231,7 @@ impl<DB: Database, INSP> Handler for BscHandler<DB, INSP> {
 
         let effective_gas_price = ctx.effective_gas_price();
         let gas = exec_result.gas();
-        let mut tx_fee = U256::from(gas.spent() - gas.refunded() as u64) * effective_gas_price;
+        let mut tx_fee = U256::from(gas.spent_sub_refunded()) * effective_gas_price;
 
         // EIP-4844
         let is_cancun = SpecId::from(*ctx.cfg().spec()).is_enabled_in(SpecId::CANCUN);
