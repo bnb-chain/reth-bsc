@@ -35,6 +35,7 @@ use reth_payload_builder_primitives::Events;
 use reth_payload_primitives::{BuiltPayload, EngineApiMessageVersion, PayloadTypes};
 use reth_primitives::NodePrimitives;
 use reth_primitives_traits::{AlloyBlockHeader, Block};
+use reth_chainspec::Head;
 use reth_provider::{BlockHashReader, BlockNumReader, BlockReaderIdExt, HeaderProvider};
 use std::{
     future::Future,
@@ -221,6 +222,20 @@ where
                             tracing::warn!(target: "bsc::block_import", "Failed to update fork choice: {}", e);
                         } else {
                             tracing::debug!(target: "bsc::block_import", "Succeed to update fork choice for new payload: number = {:?}, hash = {:?}", header.number, block_hash);
+                            if let Some(net) = crate::shared::get_network_handle() {
+                                let td = forkchoice_engine.provider
+                                    .header_td_by_number(header.number)
+                                    .ok()
+                                    .flatten()
+                                    .unwrap_or_default();
+                                net.update_status(Head {
+                                    number: header.number,
+                                    hash: block_hash,
+                                    timestamp: header.timestamp,
+                                    difficulty: header.difficulty,
+                                    total_difficulty: td,
+                                });
+                            }
                         }
                         Outcome { peer: peer_id, result: Ok(BlockValidation::ValidBlock { block }) }
                             .into()
@@ -435,6 +450,20 @@ where
                         block_hash = %block_hash,
                         "Succeeded to update fork choice for mined block"
                     );
+                    if let Some(net) = crate::shared::get_network_handle() {
+                        let td = forkchoice_engine.provider
+                            .header_td_by_number(header_for_fcu.number)
+                            .ok()
+                            .flatten()
+                            .unwrap_or_default();
+                        net.update_status(Head {
+                            number: header_for_fcu.number,
+                            hash: block_hash,
+                            timestamp: header_for_fcu.timestamp,
+                            difficulty: header_for_fcu.difficulty,
+                            total_difficulty: td,
+                        });
+                    }
                 }
             });
         }

@@ -310,10 +310,9 @@ impl BscNetworkBuilder {
             .unwrap();
         });
 
-        // TODO: update network with the latest canonical head, but has a fork id issue, can fix it later.
         let mut network_builder = network_builder
             .boot_nodes(ctx.chain_spec().bootnodes().unwrap_or_default())
-            .set_head(ctx.chain_spec().head())
+            .set_head(ctx.head())
             .with_pow()
             .block_import(Box::new(BscBlockImport::new(handle)))
             .eth_rlpx_handshake(Arc::new(BscHandshake::default()))
@@ -332,8 +331,6 @@ impl BscNetworkBuilder {
             &mut network_config.discovery_v4_config,
             ctx.chain_spec().bootnodes(),
         );
-        network_config.status.forkid = network_config.fork_filter.current();
-
         // Initialize BSC protocol registry with proxied peers from config
         // This mirrors the same functionality in the main peer manager
         let proxied_node_ids = network_config.peers_config.proxied_node_ids.clone();
