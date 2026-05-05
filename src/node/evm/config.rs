@@ -428,6 +428,7 @@ where
                 ommers: &block.body().ommers,
                 withdrawals: block.body().withdrawals.as_ref().map(|w| Cow::Borrowed(w.as_slice())),
                 extra_data: block.header().extra_data.clone(),
+                slot_number: None,
             },
             header: Some(block.header().clone()),
             header_hash: Some(block.hash()),
@@ -453,6 +454,7 @@ where
                 ommers: &[],
                 withdrawals: attributes.inner.withdrawals.map(|w| Cow::Owned(w.into_inner())),
                 extra_data: attributes.inner.extra_data,
+                slot_number: attributes.inner.slot_number,
             },
             header: None, // No header available for next block context
             header_hash: None,
@@ -527,6 +529,7 @@ where
                 ommers: &block.body.inner.ommers,
                 withdrawals: block.body.inner.withdrawals.as_ref().map(|w| Cow::Borrowed(w.as_slice())),
                 extra_data: block.header.extra_data.clone(),
+                slot_number: None,
             },
             header: Some(block.header.clone()),
             header_hash: Some(payload.block_hash_cached()),

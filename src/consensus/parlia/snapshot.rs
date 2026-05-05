@@ -651,6 +651,12 @@ mod tests {
             fn requests_hash(&self) -> Option<alloy_primitives::B256> {
                 None
             }
+            fn block_access_list_hash(&self) -> Option<alloy_primitives::B256> {
+                None
+            }
+            fn slot_number(&self) -> Option<u64> {
+                None
+            }
         }
 
         impl alloy_primitives::Sealable for MockHeader {

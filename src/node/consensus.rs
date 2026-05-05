@@ -17,7 +17,7 @@ use crate::{
 use alloy_consensus::{Header, TxReceipt};
 use alloy_eips::Encodable2718;
 use alloy_primitives::{Bytes, B256};
-use alloy_rpc_types::engine::{ForkchoiceState, PayloadStatusEnum};
+use alloy_rpc_types_engine::{ForkchoiceState, PayloadStatusEnum};
 use reth::{
     api::FullNodeTypes,
     beacon_consensus::EthBeaconConsensus,

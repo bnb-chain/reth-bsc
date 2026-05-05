@@ -103,6 +103,7 @@ pub fn prepare_new_attributes(
         prev_randao: difficulty.into(),
         withdrawals: None,
         parent_beacon_block_root: None,
+        slot_number: None,
     };
     if BscHardforks::is_bohr_active_at_timestamp(
         &parlia.spec,

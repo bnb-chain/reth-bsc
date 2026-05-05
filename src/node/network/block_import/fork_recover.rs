@@ -4,7 +4,7 @@
 use std::{sync::Arc, time::Duration};
 
 use alloy_primitives::B256;
-use alloy_rpc_types::engine::PayloadStatusEnum;
+use alloy_rpc_types_engine::PayloadStatusEnum;
 use futures::future::BoxFuture;
 use parking_lot::Mutex;
 use reth::network::cache::LruCache;

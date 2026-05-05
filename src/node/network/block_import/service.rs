@@ -12,7 +12,7 @@ use crate::{
 use alloy_consensus::{BlockBody, Header};
 use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::{B256, U128};
-use alloy_rpc_types::engine::{ForkchoiceState, PayloadStatusEnum};
+use alloy_rpc_types_engine::{ForkchoiceState, PayloadStatusEnum};
 use futures::{future::Either, stream::FuturesUnordered, StreamExt};
 use parking_lot::RwLock;
 use reth::consensus::HeaderValidator;
