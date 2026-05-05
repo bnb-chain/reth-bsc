@@ -94,16 +94,14 @@ where
     fn execute_transaction_with_commit_condition(
         &mut self,
         tx: impl ExecutorTx<Self::Executor>,
-        f: impl FnOnce(
-            &revm::context::result::ExecutionResult<<<Self::Executor as alloy_evm::block::BlockExecutor>::Evm as alloy_evm::Evm>::HaltReason>,
-        ) -> alloy_evm::block::CommitChanges,
+        f: impl FnOnce(&<Self::Executor as alloy_evm::block::BlockExecutor>::Result) -> alloy_evm::block::CommitChanges,
     ) -> Result<Option<u64>, BlockExecutionError> {
         let (tx_env, recovered) = tx.into_parts();
-        if let Some(gas_used) =
+        if let Some(gas_output) =
             self.executor.execute_transaction_with_commit_condition((tx_env, &recovered), f)?
         {
             self.transactions.push(recovered);
-            Ok(Some(gas_used))
+            Ok(Some(gas_output.tx_gas_used()))
         } else {
             Ok(None)
         }

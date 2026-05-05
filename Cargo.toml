@@ -77,26 +77,26 @@ rust-eth-triedb-common = { git = "https://github.com/bnb-chain/reth-bsc-triedb.g
 rust-eth-triedb-pathdb = { git = "https://github.com/bnb-chain/reth-bsc-triedb.git", tag = "v0.0.2", package = "rust-eth-triedb-pathdb" }
 rust-eth-triedb-state-trie = { git = "https://github.com/bnb-chain/reth-bsc-triedb.git", tag = "v0.0.2", package = "rust-eth-triedb-state-trie" }
 
-revm = "36.0.0"
-revm-database = "12.0.0"
-revm-bytecode = "9.0.0"
-revm-state = "10.0.0"
-revm-primitives = { version = "22.1.0", default-features = false }
-revm-interpreter = "34.0.0"
-revm-database-interface = "10.0.0"
+revm = "38.0.0"
+revm-database = "13.0.0"
+revm-bytecode = "10.0.0"
+revm-state = "11.0.0"
+revm-primitives = { version = "23.0.0", default-features = false }
+revm-interpreter = "35.0.0"
+revm-database-interface = "11.0.0"
 
 # alloy dependencies
-alloy-evm = "0.30.0"
+alloy-evm = { version = "0.33.0", features = ["rpc"] }
 
-alloy-genesis = "1.8.2"
-alloy-consensus = "1.8.2"
-alloy-eips = "1.8.2"
-alloy-network = "1.8.2"
-alloy-rpc-types = { version = "1.8.2", features = ["eth"] }
-alloy-rpc-types-eth = "1.8.2"
-alloy-rpc-types-engine = "1.8.2"
-alloy-rpc-types-mev = "1.8.2"
-alloy-signer = "1.8.2"
+alloy-genesis = "2.0.0"
+alloy-consensus = "2.0.0"
+alloy-eips = "2.0.0"
+alloy-network = "2.0.0"
+alloy-rpc-types = { version = "2.0.0", features = ["eth"] }
+alloy-rpc-types-eth = "2.0.0"
+alloy-rpc-types-engine = "2.0.0"
+alloy-rpc-types-mev = "2.0.0"
+alloy-signer = "2.0.0"
 
 alloy-chains = "0.2.33"
 alloy-rlp = { version = "0.3.13", default-features = false, features = [

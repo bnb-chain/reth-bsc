@@ -141,6 +141,14 @@ impl ExecutionPayload for BscExecutionData {
         self.block.header.gas_used()
     }
 
+    fn gas_limit(&self) -> u64 {
+        self.block.header.gas_limit()
+    }
+
+    fn slot_number(&self) -> Option<u64> {
+        None
+    }
+
     fn transaction_count(&self) -> usize {
         self.block.body.inner.transactions.len()
     }

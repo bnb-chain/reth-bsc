@@ -453,6 +453,7 @@ where
                         parent_beacon_block_root: attributes.parent_beacon_block_root,
                         withdrawals: attributes.withdrawals.as_ref().map(|w| Withdrawals::new(w.clone())),
                         extra_data: builder_config.extra_data.clone(),
+                        slot_number: None,
                     },
                     parent_difflayers: triedb_env_difflayers,
                     triedb_prefetcher,

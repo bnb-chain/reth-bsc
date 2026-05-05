@@ -176,6 +176,8 @@ where
             blob_gas_used,
             excess_blob_gas,
             requests_hash,
+            block_access_list_hash: Default::default(),
+            slot_number: None,
         };
 
         tracing::debug!(
@@ -296,6 +298,8 @@ where
             blob_gas_used,
             excess_blob_gas,
             requests_hash,
+            block_access_list_hash: Default::default(),
+            slot_number: None,
         };
         
         {   // finalize_new_header

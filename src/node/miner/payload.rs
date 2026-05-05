@@ -422,6 +422,7 @@ where
                 extra_data: crate::shared::get_miner_extra()
                     .filter(|b| !b.is_empty())
                     .unwrap_or_else(|| self.builder_config.extra_data.clone()),
+                slot_number: None,
             },
             parent_difflayers: triedb_parent_difflayers.clone(),
             triedb_prefetcher: triedb_prefetcher.clone(),
@@ -951,6 +952,7 @@ where
                         extra_data: crate::shared::get_miner_extra()
                             .filter(|b| !b.is_empty())
                             .unwrap_or_else(|| self.builder_config.extra_data.clone()),
+                        slot_number: None,
                     },
                     parent_difflayers: triedb_parent_difflayers.clone(),
                     triedb_prefetcher: triedb_prefetcher.clone(),

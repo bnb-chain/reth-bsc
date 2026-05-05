@@ -22,7 +22,7 @@ use alloy_consensus::{Header, TxReceipt, TxType};
 use alloy_eips::eip2935::{HISTORY_STORAGE_ADDRESS, HISTORY_STORAGE_CODE};
 use alloy_eips::{eip7685::Requests, Encodable2718};
 use alloy_evm::{
-    block::{ExecutableTx, StateChangeSource, TxResult},
+    block::{ExecutableTx, GasOutput, StateChangeSource, TxResult},
     eth::receipt_builder::ReceiptBuilderCtx,
 };
 use alloy_primitives::keccak256;
@@ -467,7 +467,7 @@ where
             let dummy = ResultAndState {
                 result: ExecutionResult::Success {
                     reason: SuccessReason::Stop,
-                    gas: ResultGas::new(0, 0, 0, 0, 0),
+                    gas: ResultGas::new(0, 0, 0),
                     logs: vec![],
                     output: Output::Call(Bytes::new()),
                 },
@@ -549,9 +549,9 @@ where
     fn commit_transaction(
         &mut self,
         output: BscTxResult<E::HaltReason>,
-    ) -> Result<u64, BlockExecutionError> {
+    ) -> Result<GasOutput, BlockExecutionError> {
         if output.is_system {
-            return Ok(0);
+            return Ok(GasOutput::new(0));
         }
 
         let ResultAndState { result, state } = output.inner;
@@ -580,7 +580,7 @@ where
             self.hertz_patch_manager.patch_after_tx(&output.tx, self.evm.db_mut())?;
         }
 
-        Ok(gas_used)
+        Ok(GasOutput::new(gas_used))
     }
 
     fn finish(
