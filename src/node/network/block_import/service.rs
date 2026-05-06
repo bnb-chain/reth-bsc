@@ -326,7 +326,17 @@ where
                     }
                     _ => None,
                 },
-                Err(err) => None,
+                Err(err) => {
+                    tracing::debug!(
+                        target: "bsc::block_import",
+                        block_number = header.number,
+                        block_hash = %block_hash,
+                        peer = %peer_id,
+                        error = %err,
+                        "engine.new_payload returned error"
+                    );
+                    None
+                }
             }
         })
     }
@@ -454,19 +464,28 @@ where
         if let Ok(info) = self.forkchoice_engine.provider.chain_info() {
             let block_number = block.block.0.block.header.number;
             if block_number + MAX_STALE_BLOCK_DISTANCE < info.best_number {
+                let gap = info.best_number - block_number;
                 tracing::debug!(
                     target: "bsc::block_import",
                     block_number,
                     block_hash = %block.hash,
                     canonical_head = info.best_number,
-                    gap = info.best_number - block_number,
+                    gap,
                     peer_id = %peer_id,
                     "Dropping stale block far behind canonical head"
                 );
                 // Apply a lightweight reputation penalty so peers that repeatedly send
                 // stale blocks are gradually deprioritized (BadAnnouncement = -1024,
                 // needs ~50 hits to reach ban threshold).
+                //
+                // Surface this at INFO under `bsc::peers` so #312-style peer-loss
+                // investigations can attribute drift to this guard without DEBUG logs.
                 if let Some(net) = crate::shared::get_network_handle() {
+                    tracing::info!(
+                        target: "bsc::peers",
+                        peer = %peer_id, gap, threshold = MAX_STALE_BLOCK_DISTANCE,
+                        "applying BadAnnouncement: stale-block guard"
+                    );
                     net.reputation_change(peer_id, ReputationChangeKind::BadAnnouncement);
                 }
                 return;

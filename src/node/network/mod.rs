@@ -39,6 +39,7 @@ pub mod bootnodes;
 pub mod evn;
 pub mod evn_peers;
 pub mod handshake;
+pub mod peer_dump;
 pub(crate) mod upgrade_status;
 pub(crate) mod votes;
 pub(crate) mod bsc_protocol {
@@ -403,6 +404,21 @@ where
 
         if crate::node::network::evn::is_evn_enabled() {
             spawn_evn_sync_watcher(ctx, handle.clone());
+        }
+
+        // Periodic p2p diagnostics: connected peers + ban / backoff state +
+        // recent disconnect reasons. Period configurable via
+        // `BSC_PEER_DIAG_PERIOD_SECS` (default 60s, 0 to disable).
+        let diag_period = std::env::var("BSC_PEER_DIAG_PERIOD_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(60);
+        if diag_period > 0 {
+            crate::node::network::peer_dump::spawn_peer_diagnostic_task(
+                handle.clone(),
+                Duration::from_secs(diag_period),
+            );
+            info!(target: "bsc::peers", period_secs = diag_period, "peer diagnostics task spawned");
         }
 
         Ok(handle)
