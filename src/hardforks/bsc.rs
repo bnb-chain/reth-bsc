@@ -101,22 +101,34 @@ impl BscHardfork {
             (Self::Hertz.boxed(), ForkCondition::Block(31302048)),
             (Self::HertzFix.boxed(), ForkCondition::Block(34140700)),
             (EthereumHardfork::Shanghai.boxed(), ForkCondition::Timestamp(1705996800)), /* 2024-01-23 08:00:00 AM UTC */
-            (Self::Kepler.boxed(), ForkCondition::Timestamp(1705996800)), /* 2024-01-23 08:00:00 AM UTC */
-            (Self::Feynman.boxed(), ForkCondition::Timestamp(1713419340)), /* 2024-04-18 05:49:00 AM UTC */
+            (Self::Kepler.boxed(), ForkCondition::Timestamp(1705996800)), /* 2024-01-23 08:00:00
+                                                                           * AM UTC */
+            (Self::Feynman.boxed(), ForkCondition::Timestamp(1713419340)), /* 2024-04-18
+                                                                            * 05:49:00 AM UTC */
             (Self::FeynmanFix.boxed(), ForkCondition::Timestamp(1713419340)), /* 2024-04-18 05:49:00 AM UTC */
             (EthereumHardfork::Cancun.boxed(), ForkCondition::Timestamp(1718863500)), /* 2024-06-20 06:05:00 AM UTC */
-            (Self::Cancun.boxed(), ForkCondition::Timestamp(1718863500)), /* 2024-06-20 06:05:00 AM UTC */
-            (Self::Haber.boxed(), ForkCondition::Timestamp(1718863500)), /* 2024-06-20 06:05:00 AM UTC */
-            (Self::Tycho.boxed(), ForkCondition::Timestamp(1718863500)), /* 2024-06-20 06:05:00 AM UTC - Tycho hardfork with blob transactions */
+            (Self::Cancun.boxed(), ForkCondition::Timestamp(1718863500)), /* 2024-06-20 06:05:00
+                                                                           * AM UTC */
+            (Self::Haber.boxed(), ForkCondition::Timestamp(1718863500)), /* 2024-06-20 06:05:00
+                                                                          * AM UTC */
+            (Self::Tycho.boxed(), ForkCondition::Timestamp(1718863500)), /* 2024-06-20 06:05:00
+                                                                          * AM UTC - Tycho
+                                                                          * hardfork with blob
+                                                                          * transactions */
             (Self::HaberFix.boxed(), ForkCondition::Timestamp(1727316120)), /* 2024-09-26 02:02:00 AM UTC */
             (Self::Bohr.boxed(), ForkCondition::Timestamp(1727317200)),     /* 2024-09-26
                                                                              * 02:20:00
                                                                              * AM UTC */
             (EthereumHardfork::Prague.boxed(), ForkCondition::Timestamp(1742436600)), /* 2025-03-20 02:10:00 AM UTC */
-            (Self::Pascal.boxed(), ForkCondition::Timestamp(1742436600)), /* 2025-03-20 02:10:00 AM UTC - deployed with Prague */
-            (Self::Lorentz.boxed(), ForkCondition::Timestamp(1745903100)), /* 2025-04-29 05:05:00 AM UTC */
-            (Self::Maxwell.boxed(), ForkCondition::Timestamp(1751250600)), /* 2025-06-30 02:30:00 AM UTC */
-            (Self::Fermi.boxed(), ForkCondition::Timestamp(1768357800)), /* 2026-01-14 02:30:00 AM UTC */
+            (Self::Pascal.boxed(), ForkCondition::Timestamp(1742436600)), /* 2025-03-20 02:10:00
+                                                                           * AM UTC - deployed
+                                                                           * with Prague */
+            (Self::Lorentz.boxed(), ForkCondition::Timestamp(1745903100)), /* 2025-04-29
+                                                                            * 05:05:00 AM UTC */
+            (Self::Maxwell.boxed(), ForkCondition::Timestamp(1751250600)), /* 2025-06-30
+                                                                            * 02:30:00 AM UTC */
+            (Self::Fermi.boxed(), ForkCondition::Timestamp(1768357800)), /* 2026-01-14 02:30:00
+                                                                          * AM UTC */
             (Self::Osaka.boxed(), ForkCondition::Timestamp(1777343400)),
             (Self::Mendel.boxed(), ForkCondition::Timestamp(1777343400)),
         ])
@@ -161,7 +173,9 @@ impl BscHardfork {
             // after Bohr made it count as an extra fork in the CRC32 chain, producing a forkid
             // that disagreed with bsc-geth and broke handshakes with the rest of the chapel
             // network.
-            (Self::Tycho.boxed(), ForkCondition::Timestamp(1713330442)), /* 2024-04-17 05:07:22 AM UTC - Tycho testnet */
+            (Self::Tycho.boxed(), ForkCondition::Timestamp(1713330442)), /* 2024-04-17 05:07:22
+                                                                          * AM UTC - Tycho
+                                                                          * testnet */
             (Self::Haber.boxed(), ForkCondition::Timestamp(1716962820)),
             (Self::HaberFix.boxed(), ForkCondition::Timestamp(1719986788)),
             (Self::Bohr.boxed(), ForkCondition::Timestamp(1724116996)),
@@ -244,31 +258,31 @@ where
 impl From<BscHardfork> for SpecId {
     fn from(spec: BscHardfork) -> Self {
         match spec {
-            BscHardfork::Frontier
-            | BscHardfork::Ramanujan
-            | BscHardfork::Niels
-            | BscHardfork::MirrorSync
-            | BscHardfork::Bruno
-            | BscHardfork::Euler
-            | BscHardfork::Gibbs
-            | BscHardfork::Nano
-            | BscHardfork::Moran
-            | BscHardfork::Planck
-            | BscHardfork::Luban
-            | BscHardfork::Plato => SpecId::MUIR_GLACIER,
+            BscHardfork::Frontier |
+            BscHardfork::Ramanujan |
+            BscHardfork::Niels |
+            BscHardfork::MirrorSync |
+            BscHardfork::Bruno |
+            BscHardfork::Euler |
+            BscHardfork::Gibbs |
+            BscHardfork::Nano |
+            BscHardfork::Moran |
+            BscHardfork::Planck |
+            BscHardfork::Luban |
+            BscHardfork::Plato => SpecId::MUIR_GLACIER,
             BscHardfork::Hertz | BscHardfork::HertzFix => SpecId::LONDON,
             BscHardfork::Kepler | BscHardfork::Feynman | BscHardfork::FeynmanFix => {
                 SpecId::SHANGHAI
             }
-            BscHardfork::Cancun
-            | BscHardfork::Haber
-            | BscHardfork::HaberFix
-            | BscHardfork::Bohr
-            | BscHardfork::Tycho => SpecId::CANCUN,
-            BscHardfork::Pascal
-            | BscHardfork::Lorentz
-            | BscHardfork::Maxwell
-            | BscHardfork::Fermi => SpecId::PRAGUE,
+            BscHardfork::Cancun |
+            BscHardfork::Haber |
+            BscHardfork::HaberFix |
+            BscHardfork::Bohr |
+            BscHardfork::Tycho => SpecId::CANCUN,
+            BscHardfork::Pascal |
+            BscHardfork::Lorentz |
+            BscHardfork::Maxwell |
+            BscHardfork::Fermi => SpecId::PRAGUE,
             BscHardfork::Osaka | BscHardfork::Mendel => SpecId::OSAKA,
         }
     }

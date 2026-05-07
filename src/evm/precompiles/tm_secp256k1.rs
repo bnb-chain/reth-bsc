@@ -2,15 +2,18 @@
 
 use alloy_primitives::Bytes;
 use revm::precompile::{
-    u64_to_address, PrecompileError, PrecompileOutput, PrecompileResult, Precompile, PrecompileId,
+    u64_to_address, Precompile, PrecompileError, PrecompileId, PrecompileOutput, PrecompileResult,
 };
 use secp256k1::{ecdsa, Message, PublicKey};
 use std::borrow::Cow;
 use tendermint::{account, public_key};
 
 /// Tendermint SECP256K1 signature recover precompile for BSC.
-pub(crate) const TM_SECP256K1_SIGNATURE_RECOVER: Precompile =
-    Precompile::new(PrecompileId::Custom(Cow::Borrowed("SECP256K1_SIGNATURE_RECOVER")), u64_to_address(105), tm_secp256k1_signature_recover_run);
+pub(crate) const TM_SECP256K1_SIGNATURE_RECOVER: Precompile = Precompile::new(
+    PrecompileId::Custom(Cow::Borrowed("SECP256K1_SIGNATURE_RECOVER")),
+    u64_to_address(105),
+    tm_secp256k1_signature_recover_run,
+);
 
 const SECP256K1_PUBKEY_LENGTH: usize = 33;
 const SECP256K1_SIGNATURE_LENGTH: usize = 64;

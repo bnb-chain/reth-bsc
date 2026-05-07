@@ -109,12 +109,7 @@ where
 
     fn all(
         &self,
-    ) -> (
-        &Self::Context,
-        &Self::Instructions,
-        &Self::Precompiles,
-        &FrameStack<Self::Frame>,
-    ) {
+    ) -> (&Self::Context, &Self::Instructions, &Self::Precompiles, &FrameStack<Self::Frame>) {
         self.inner.all()
     }
 
@@ -328,18 +323,11 @@ mod tests {
 
         // Mismatched instruction table (defaults to the latest spec): should undercharge and
         // succeed with the same gas limit.
-        let mut mismatched = BscEvm::new(
-            env,
-            make_db(caller, contract, repetitions),
-            NoOpInspector,
-            false,
-            false,
-        );
+        let mut mismatched =
+            BscEvm::new(env, make_db(caller, contract, repetitions), NoOpInspector, false, false);
         mismatched.inner.instruction = EthInstructions::new_mainnet();
 
-        let mismatched_result = mismatched
-            .transact_one(tx)
-            .expect("execution should not error");
+        let mismatched_result = mismatched.transact_one(tx).expect("execution should not error");
         assert!(
             mismatched_result.is_success(),
             "latest-spec instruction table should succeed with this gas limit"

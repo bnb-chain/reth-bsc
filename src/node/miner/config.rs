@@ -1,7 +1,6 @@
 use alloy_primitives::Address;
 use k256::ecdsa::SigningKey;
-use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::{path::PathBuf, sync::OnceLock};
 
 use crate::consensus::parlia::DEFAULT_MIN_GAS_TIP;
 
@@ -83,7 +82,8 @@ impl Default for MiningConfig {
             no_interrupt_left_over: Some(500),  // 500ms
             max_bids_per_builder: Some(3),
             builder_fee_ceil: Some(1_000_000_000_000_000_000), // 1 BNB
-            allowed_builders: None, // No whitelist by default (allow all)
+            allowed_builders: None,                            /* No whitelist by default (allow
+                                                                * all) */
         }
     }
 }
@@ -117,7 +117,7 @@ impl MiningConfig {
     /// Get the desired gas limit for the specified chain ID.
     /// Returns the configured gas_limit if set, otherwise returns chain-specific defaults:
     /// - BSC Mainnet (56): 140M
-    /// - BSC Testnet (97): 100M  
+    /// - BSC Testnet (97): 100M
     /// - Local/Other: 40M
     pub fn get_gas_limit(&self, chain_id: u64) -> u64 {
         self.gas_limit.unwrap_or({
@@ -332,8 +332,7 @@ pub fn get_global_mining_config() -> Option<&'static MiningConfig> {
 
 /// Key management for validators
 pub mod keystore {
-    use alloy_primitives::keccak256;
-    use alloy_primitives::Address;
+    use alloy_primitives::{keccak256, Address};
     use k256::ecdsa::{signature::Signer, Signature, SigningKey};
     use std::path::Path;
 
@@ -426,9 +425,7 @@ mod tests {
 
     #[test]
     fn test_load_private_key_from_keystore_file() {
-        use std::fs;
-        use std::io::Write;
-        use std::path::PathBuf;
+        use std::{fs, io::Write, path::PathBuf};
         use uuid::Uuid;
 
         // This is a real V3 keystore JSON (address bcdd0d2c...) with password "0123456789"

@@ -1,8 +1,9 @@
-use crate::{BscBlock, BscBlockBody, BscPrimitives};
-use crate::node::primitives::BscBlobTransactionSidecar;
+use crate::{node::primitives::BscBlobTransactionSidecar, BscBlock, BscBlockBody, BscPrimitives};
 use alloy_consensus::BlockHeader;
-use alloy_eips::eip2718::{EIP4844_TX_TYPE_ID, Typed2718};
-use alloy_eips::eip7594::BlobTransactionSidecarVariant;
+use alloy_eips::{
+    eip2718::{Typed2718, EIP4844_TX_TYPE_ID},
+    eip7594::BlobTransactionSidecarVariant,
+};
 use alloy_primitives::B256;
 use reth_chainspec::EthereumHardforks;
 use reth_db::transaction::{DbTx, DbTxMut};
@@ -12,8 +13,7 @@ use reth_provider::{
     DBProvider, DatabaseProvider, EthStorage, ProviderResult, ReadBodyInput,
 };
 use reth_transaction_pool::blobstore::BlobStore;
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
@@ -75,11 +75,7 @@ where
         Ok(())
     }
 
-    fn remove_block_bodies_above(
-        &self,
-        provider: &Provider,
-        block: u64,
-    ) -> ProviderResult<()> {
+    fn remove_block_bodies_above(&self, provider: &Provider, block: u64) -> ProviderResult<()> {
         self.0.remove_block_bodies_above(provider, block)?;
         // Blob store cleanup is handled by the pool maintenance task (finality-based eviction).
         Ok(())
@@ -118,7 +114,8 @@ where
             .zip(block_info)
             .map(|(inner, (block_number, block_hash, tx_info))| {
                 // Collect blob tx hashes and their position in the full block tx list.
-                let blob_txs: Vec<(B256, u64)> = tx_info.iter()
+                let blob_txs: Vec<(B256, u64)> = tx_info
+                    .iter()
                     .enumerate()
                     .filter(|(_, (_, ty))| *ty == EIP4844_TX_TYPE_ID)
                     .map(|(idx, (hash, _))| (*hash, idx as u64))
@@ -220,7 +217,11 @@ fn read_sidecars_from_blob_store(
     // match the tx position in the block.
     sidecars.sort_unstable_by_key(|s| s.tx_index);
 
-    if sidecars.is_empty() { None } else { Some(sidecars) }
+    if sidecars.is_empty() {
+        None
+    } else {
+        Some(sidecars)
+    }
 }
 
 impl ChainStorage<BscPrimitives> for BscStorage {

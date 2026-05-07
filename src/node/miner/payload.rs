@@ -1,55 +1,69 @@
-use crate::chainspec::BscChainSpec;
-use crate::consensus::eip4844::{calc_blob_fee, is_blob_eligible_block, BLOB_TX_BLOB_GAS_PER_BLOB};
-use crate::consensus::parlia::util::calculate_millisecond_timestamp;
-use crate::consensus::parlia::{Parlia, Snapshot};
-use crate::evm::blacklist;
-use crate::hardforks::BscHardforks;
-use crate::metrics::{BscConsensusMetrics, BscMinerMetrics};
-use crate::node::engine::{BscBuiltPayload, BuildKind};
-use crate::node::evm::config::{BscEvmConfig, BscNextBlockEnvAttributes, ValidatorCacheSink};
-use crate::node::evm::pre_execution::{TURN_LENGTH_CACHE, VALIDATOR_CACHE};
-use crate::node::evm::{request_difflayer, MinerTrieDbPrefetcher};
-use crate::node::miner::bid_simulator::BidSimulator;
-use crate::node::miner::bsc_miner::{MiningContext, SubmitContext};
-use crate::node::miner::util::finalize_new_header;
-use crate::node::pool::BlacklistedAddressError;
-use crate::node::primitives::BscBlobTransactionSidecar;
+use crate::{
+    chainspec::BscChainSpec,
+    consensus::{
+        eip4844::{calc_blob_fee, is_blob_eligible_block, BLOB_TX_BLOB_GAS_PER_BLOB},
+        parlia::{util::calculate_millisecond_timestamp, Parlia, Snapshot},
+    },
+    evm::blacklist,
+    hardforks::BscHardforks,
+    metrics::{BscConsensusMetrics, BscMinerMetrics},
+    node::{
+        engine::{BscBuiltPayload, BuildKind},
+        evm::{
+            config::{BscEvmConfig, BscNextBlockEnvAttributes, ValidatorCacheSink},
+            pre_execution::{TURN_LENGTH_CACHE, VALIDATOR_CACHE},
+            request_difflayer, MinerTrieDbPrefetcher,
+        },
+        miner::{
+            bid_simulator::BidSimulator,
+            bsc_miner::{MiningContext, SubmitContext},
+            util::finalize_new_header,
+        },
+        pool::BlacklistedAddressError,
+        primitives::BscBlobTransactionSidecar,
+    },
+};
 use alloy_consensus::{BlockHeader, Transaction};
-use alloy_evm::block::BlockExecutor;
-use alloy_evm::Evm;
+use alloy_evm::{block::BlockExecutor, Evm};
 use alloy_primitives::U256;
-use reth::payload::EthPayloadBuilderAttributes;
-use reth::transaction_pool::error::Eip4844PoolTransactionError;
-use reth::transaction_pool::error::InvalidPoolTransactionError;
-use reth::transaction_pool::BestTransactionsAttributes;
-use reth::transaction_pool::{PoolTransaction, TransactionPool};
+use either::Either;
+use once_cell::sync::Lazy;
+use reth::{
+    payload::EthPayloadBuilderAttributes,
+    transaction_pool::{
+        error::{Eip4844PoolTransactionError, InvalidPoolTransactionError},
+        BestTransactionsAttributes, PoolTransaction, TransactionPool,
+    },
+};
 use reth_basic_payload_builder::PayloadConfig;
 use reth_chainspec::EthChainSpec;
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
-use reth_evm::block::{BlockExecutionError, BlockValidationError};
-use reth_evm::execute::BlockBuilder;
-use reth_evm::execute::BlockBuilderOutcome;
-use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
+use reth_evm::{
+    block::{BlockExecutionError, BlockValidationError},
+    execute::{BlockBuilder, BlockBuilderOutcome},
+    ConfigureEvm, NextBlockEnvAttributes,
+};
 use reth_execution_types::BlockExecutionOutput;
-use reth_payload_primitives::PayloadBuilderAttributes;
-use reth_payload_primitives::{BuiltPayload, BuiltPayloadExecutedBlock, PayloadBuilderError};
-use either::Either;
-use once_cell::sync::Lazy;
-use revm_context_interface::Block as EvmBlock;
-use reth_primitives::{HeaderTy, SealedHeader};
-use reth_primitives::InvalidTransactionError;
-use reth_primitives::TransactionSigned;
+use reth_payload_primitives::{
+    BuiltPayload, BuiltPayloadExecutedBlock, PayloadBuilderAttributes, PayloadBuilderError,
+};
+use reth_primitives::{HeaderTy, InvalidTransactionError, SealedHeader, TransactionSigned};
 use reth_primitives_traits::{BlockBody, RecoveredBlock, SignerRecoverable};
 use reth_provider::StateProviderFactory;
-use reth_revm::cached::CachedReads;
-use reth_revm::cancelled::ManualCancel;
-use reth_revm::state::EvmState as RethEvmState;
-use reth_revm::{database::StateProviderDatabase, db::State};
+use reth_revm::{
+    cached::CachedReads, cancelled::ManualCancel, database::StateProviderDatabase, db::State,
+    state::EvmState as RethEvmState,
+};
+use revm_context_interface::Block as EvmBlock;
 use rust_eth_triedb::get_global_triedb;
 use rust_eth_triedb_common::DiffLayers;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
+};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, trace, warn};
 
@@ -164,8 +178,8 @@ fn estimated_uplift_meets_threshold(
     comparison_base: U256,
     threshold_bps: u64,
 ) -> bool {
-    estimated_new_fees.saturating_mul(U256::from(10_000_u64))
-        >= comparison_base.saturating_mul(U256::from(threshold_bps))
+    estimated_new_fees.saturating_mul(U256::from(10_000_u64)) >=
+        comparison_base.saturating_mul(U256::from(threshold_bps))
 }
 
 fn estimated_uplift_bps(current_payload_fees: U256, estimated_new_fees: U256) -> u64 {
@@ -198,10 +212,10 @@ fn local_rebuild_action(input: LocalRebuildPolicyInput) -> LocalRebuildAction {
     let final_shot_max_remaining =
         duration_mul_ratio(input.last_build_duration, FINAL_SHOT_WINDOW_NUM, FINAL_SHOT_WINDOW_DEN);
 
-    if !input.final_shot_used
-        && input.remaining_duration >= final_shot_min_remaining
-        && input.remaining_duration <= final_shot_max_remaining
-        && estimated_uplift_meets_threshold(
+    if !input.final_shot_used &&
+        input.remaining_duration >= final_shot_min_remaining &&
+        input.remaining_duration <= final_shot_max_remaining &&
+        estimated_uplift_meets_threshold(
             input.estimated_new_fees,
             comparison_base,
             FINAL_SHOT_UPLIFT_BPS,
@@ -352,7 +366,14 @@ where
         args: BscBuildArguments<EthPayloadBuilderAttributes>,
     ) -> Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>> {
         let build_start = std::time::Instant::now();
-        let BscBuildArguments { mut cached_reads, config, cancel, trace_id, min_gas_tip, parent_difflayers } = args;
+        let BscBuildArguments {
+            mut cached_reads,
+            config,
+            cancel,
+            trace_id,
+            min_gas_tip,
+            parent_difflayers,
+        } = args;
         let PayloadConfig { parent_header, attributes } = config;
 
         let parent_hash = parent_header.hash_slow();
@@ -363,7 +384,8 @@ where
         // parent state root matches the pathdb disk layer.  If they diverge (e.g. after a
         // restart where in-memory difflayers were lost), building on this parent would produce
         // a block with an incorrect state root.  Skip building to avoid polluting the network.
-        if rust_eth_triedb::triedb_manager::is_triedb_active() && triedb_parent_difflayers.is_none() {
+        if rust_eth_triedb::triedb_manager::is_triedb_active() && triedb_parent_difflayers.is_none()
+        {
             let triedb = get_global_triedb();
             let (persist_block, persist_root) = triedb
                 .latest_persist_state()
@@ -403,8 +425,7 @@ where
         // Sinks transport current_validators / turn_length from the builder (which is consumed by
         // finish_with_difflayer) back to this layer so they can be written to cache after
         // finalize_new_header() assigns the definitive block hash.
-        let validator_cache_sink: ValidatorCacheSink =
-            Arc::new(Mutex::new(None));
+        let validator_cache_sink: ValidatorCacheSink = Arc::new(Mutex::new(None));
         let turn_length_sink: Arc<Mutex<Option<u8>>> = Arc::new(Mutex::new(None));
 
         let next_env_attributes = BscNextBlockEnvAttributes {
@@ -436,11 +457,11 @@ where
         // performed during pre-execution are also prefetched.
         if let Some(prefetcher) = triedb_prefetcher.clone() {
             let pf = prefetcher.clone();
-            builder
-                .executor_mut()
-                .set_state_hook(Some(Box::new(move |_, update: &RethEvmState| {
+            builder.executor_mut().set_state_hook(Some(Box::new(
+                move |_, update: &RethEvmState| {
                     pf.on_state_update(update);
-                })));
+                },
+            )));
             debug!(
                 target: "payload_builder",
                 trace_id,
@@ -518,8 +539,8 @@ where
             }
 
             // filter out blacklisted transactions before executing.
-            if self.chain_spec.is_nano_active_at_block(parent_header.number + 1)
-                && blacklist::check_tx_basic_blacklist(pool_tx.sender(), pool_tx.to())
+            if self.chain_spec.is_nano_active_at_block(parent_header.number + 1) &&
+                blacklist::check_tx_basic_blacklist(pool_tx.sender(), pool_tx.to())
             {
                 debug!(
                     target: "payload_builder",
@@ -568,7 +589,9 @@ where
                 continue;
             }
             let tx_start = std::time::Instant::now();
-            let mut blob_tx_sidecar: Option<Arc<alloy_eips::eip7594::BlobTransactionSidecarVariant>> = None;
+            let mut blob_tx_sidecar: Option<
+                Arc<alloy_eips::eip7594::BlobTransactionSidecarVariant>,
+            > = None;
             trace!(
                 target: "payload_builder",
                 trace_id,
@@ -843,7 +866,8 @@ where
         sealed_block = Arc::new(plain.into());
 
         let requests = execution_result.requests.clone();
-        let execution_outcome = BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
+        let execution_outcome =
+            BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
         let executed: BuiltPayloadExecutedBlock<_> = BuiltPayloadExecutedBlock {
             recovered_block: Arc::new(block),
             execution_output: Arc::new(execution_outcome),
@@ -879,8 +903,14 @@ where
         args: BscBuildArguments<EthPayloadBuilderAttributes>,
     ) -> Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>> {
         let build_start = std::time::Instant::now();
-        let BscBuildArguments { mut cached_reads, config, cancel: _, trace_id, min_gas_tip: _, parent_difflayers } =
-            args;
+        let BscBuildArguments {
+            mut cached_reads,
+            config,
+            cancel: _,
+            trace_id,
+            min_gas_tip: _,
+            parent_difflayers,
+        } = args;
         let PayloadConfig { parent_header, attributes } = config;
 
         let parent_hash = parent_header.hash_slow();
@@ -889,7 +919,8 @@ where
 
         // Safety guard: same as build_payload — refuse to build on a parent whose state root
         // cannot be correctly resolved by pathdb without difflayers.
-        if rust_eth_triedb::triedb_manager::is_triedb_active() && triedb_parent_difflayers.is_none() {
+        if rust_eth_triedb::triedb_manager::is_triedb_active() && triedb_parent_difflayers.is_none()
+        {
             let triedb = get_global_triedb();
             let (persist_block, persist_root) = triedb
                 .latest_persist_state()
@@ -927,8 +958,7 @@ where
         });
 
         // Sinks for empty-payload builds (same delayed-seal mechanism as normal builds).
-        let validator_cache_sink: ValidatorCacheSink =
-            Arc::new(Mutex::new(None));
+        let validator_cache_sink: ValidatorCacheSink = Arc::new(Mutex::new(None));
         let turn_length_sink: Arc<Mutex<Option<u8>>> = Arc::new(Mutex::new(None));
 
         let mut builder = self
@@ -962,11 +992,11 @@ where
         // performed during pre-execution are also prefetched.
         if let Some(prefetcher) = triedb_prefetcher.clone() {
             let pf = prefetcher.clone();
-            builder
-                .executor_mut()
-                .set_state_hook(Some(Box::new(move |_, update: &RethEvmState| {
+            builder.executor_mut().set_state_hook(Some(Box::new(
+                move |_, update: &RethEvmState| {
                     pf.on_state_update(update);
-                })));
+                },
+            )));
             debug!(
                 target: "payload_builder",
                 trace_id,
@@ -977,7 +1007,8 @@ where
 
         // Total time spent executing pre-execution changes (no user txs for empty payloads).
         let exec_start = std::time::Instant::now();
-        // Everything before `exec_start` is treated as "prepare" time for this empty payload attempt.
+        // Everything before `exec_start` is treated as "prepare" time for this empty payload
+        // attempt.
         let prepare_duration = exec_start.duration_since(build_start);
         builder.apply_pre_execution_changes().map_err(|err| {
             warn!(
@@ -1025,7 +1056,8 @@ where
         );
 
         let requests = execution_result.requests.clone();
-        let execution_outcome = BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
+        let execution_outcome =
+            BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
         let executed: BuiltPayloadExecutedBlock<_> = BuiltPayloadExecutedBlock {
             recovered_block: Arc::new(block),
             execution_output: Arc::new(execution_outcome),
@@ -1060,7 +1092,10 @@ where
 /// Called once per payload job at startup; the result is stored in [`BscBuildArguments`] and
 /// shared across all build attempts (normal and empty) for the same parent block.
 /// Returns `None` on any failure — callers degrade gracefully to the full-trie path.
-async fn fetch_triedb_difflayers(trace_id: u64, parent_hash: alloy_primitives::B256) -> Option<DiffLayers> {
+async fn fetch_triedb_difflayers(
+    trace_id: u64,
+    parent_hash: alloy_primitives::B256,
+) -> Option<DiffLayers> {
     if !rust_eth_triedb::triedb_manager::is_triedb_active() {
         return None;
     }
@@ -1890,16 +1925,13 @@ where
 
             // Remaining time we can still spend waiting for background builds.
             let try_mine_block_number = self.build_args.config.parent_header.number() + 1;
-            let mut remaining_ms = if self
-                .mining_ctx
-                .parent_snapshot
-                .last_block_in_one_turn(try_mine_block_number)
-            {
-                self.mining_ctx.end_mining_timestamp_ms.saturating_sub(now_ms) as u64
-            } else {
-                (self.mining_ctx.end_mining_timestamp_ms.saturating_sub(now_ms) as u64)
-                    .saturating_mul(3)
-            };
+            let mut remaining_ms =
+                if self.mining_ctx.parent_snapshot.last_block_in_one_turn(try_mine_block_number) {
+                    self.mining_ctx.end_mining_timestamp_ms.saturating_sub(now_ms) as u64
+                } else {
+                    (self.mining_ctx.end_mining_timestamp_ms.saturating_sub(now_ms) as u64)
+                        .saturating_mul(3)
+                };
             if remaining_ms > 50 {
                 remaining_ms = 50;
             }
@@ -1937,8 +1969,8 @@ where
                         end_mining_timestamp_ms = self.mining_ctx.end_mining_timestamp_ms,
                         "No background payload candidate finished within wait slice"
                     );
-                    // Keep waiting in further slices until we hit the expected end timestamp (+grace)
-                    // or until all background tasks have completed.
+                    // Keep waiting in further slices until we hit the expected end timestamp
+                    // (+grace) or until all background tasks have completed.
                     continue;
                 }
                 WaitMore::Aborted => {
@@ -2092,7 +2124,9 @@ where
     ///
     /// Selection is by fees only; finalization (difficulty, vote attestation, ECDSA seal,
     /// cache updates) is delegated to [`finalize_payload`].
-    fn pick_best_payload_and_finalize(&mut self) -> Result<BscBuiltPayload, Box<BscPayloadJobError>> {
+    fn pick_best_payload_and_finalize(
+        &mut self,
+    ) -> Result<BscBuiltPayload, Box<BscPayloadJobError>> {
         let total_job_duration = self.job_start_time.elapsed();
         let try_mine_block_number = self.build_args.config.parent_header.number() + 1;
 
@@ -2192,15 +2226,15 @@ where
 /// Runs `finalize_new_header()` on the payload's header (sets difficulty, prepares validators
 /// for epoch blocks, assembles vote attestation, and ECDSA-seals the header), then:
 ///
-/// 1. Writes `pending_validators` / `pending_turn_length` to the global caches keyed by
-///    the now-deterministic final block hash.
-/// 2. Rebuilds `executed_block.recovered_block` with the finalized header so the engine
-///    tree can identify the block by its correct hash.
+/// 1. Writes `pending_validators` / `pending_turn_length` to the global caches keyed by the
+///    now-deterministic final block hash.
+/// 2. Rebuilds `executed_block.recovered_block` with the finalized header so the engine tree can
+///    identify the block by its correct hash.
 /// 3. Rebuilds `block` (sealed block with sidecars) with the finalized header.
 ///
 /// This function is intentionally separate from the builder path so that finalization is
-/// deferred until `pick_best_payload_and_finalize()` chooses the winning payload — giving more time for
-/// FF votes to arrive.
+/// deferred until `pick_best_payload_and_finalize()` chooses the winning payload — giving more time
+/// for FF votes to arrive.
 fn finalize_payload(
     payload: &mut BscBuiltPayload,
     parlia: Arc<Parlia<BscChainSpec>>,
@@ -2208,12 +2242,10 @@ fn finalize_payload(
     parent_header: &SealedHeader<alloy_consensus::Header>,
     block_timestamp_ms: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let snapshot_provider = crate::shared::get_snapshot_provider()
-        .cloned()
-        .ok_or_else(|| {
-            Box::new(std::io::Error::other("Snapshot provider not available"))
-                as Box<dyn std::error::Error + Send + Sync>
-        })?;
+    let snapshot_provider = crate::shared::get_snapshot_provider().cloned().ok_or_else(|| {
+        Box::new(std::io::Error::other("Snapshot provider not available"))
+            as Box<dyn std::error::Error + Send + Sync>
+    })?;
 
     let senders = payload.executed_block.recovered_block.senders().to_vec();
     let mut existing_sidecars = payload.block.clone_block().body.sidecars;
@@ -2228,8 +2260,7 @@ fn finalize_payload(
         block_timestamp_ms,
     )
     .map_err(|e| {
-        Box::new(std::io::Error::other(e.to_string()))
-            as Box<dyn std::error::Error + Send + Sync>
+        Box::new(std::io::Error::other(e.to_string())) as Box<dyn std::error::Error + Send + Sync>
     })?;
 
     let final_hash = plain_block.header.hash_slow();
@@ -2275,21 +2306,22 @@ mod tests {
         initial_out_of_turn_build_wait, local_rebuild_action, validate_bsc_sidecar,
         LocalRebuildAction, LocalRebuildPolicyInput,
     };
-    use crate::chainspec::BscChainSpec;
-    use crate::consensus::parlia::Parlia;
-    use crate::consensus::parlia::Snapshot;
-    use crate::node::miner::bsc_miner::MiningContext;
-    use alloy_consensus::BlobTransactionSidecar;
-    use alloy_consensus::Header;
-    use alloy_eips::eip4844::{Blob, Bytes48};
-    use alloy_eips::eip7594::{
-        BlobTransactionSidecarEip7594, BlobTransactionSidecarVariant, CELLS_PER_EXT_BLOB,
+    use crate::{
+        chainspec::BscChainSpec,
+        consensus::parlia::{Parlia, Snapshot},
+        node::miner::bsc_miner::MiningContext,
+    };
+    use alloy_consensus::{BlobTransactionSidecar, Header};
+    use alloy_eips::{
+        eip4844::{Blob, Bytes48},
+        eip7594::{
+            BlobTransactionSidecarEip7594, BlobTransactionSidecarVariant, CELLS_PER_EXT_BLOB,
+        },
     };
     use alloy_primitives::{Address, B256, U256};
     use reth::transaction_pool::error::Eip4844PoolTransactionError;
     use reth_primitives::SealedHeader;
-    use std::sync::Arc;
-    use std::time::Duration;
+    use std::{sync::Arc, time::Duration};
 
     fn test_parlia() -> Parlia<BscChainSpec> {
         let chain_spec = Arc::new(BscChainSpec { inner: crate::chainspec::bsc::bsc_mainnet() });
@@ -2371,8 +2403,8 @@ mod tests {
                         rebuilds += 1;
                         return rebuilds;
                     }
-                    LocalRebuildAction::ReturnBestPayload
-                    | LocalRebuildAction::WaitForMoreValue => {
+                    LocalRebuildAction::ReturnBestPayload |
+                    LocalRebuildAction::WaitForMoreValue => {
                         break;
                     }
                     LocalRebuildAction::WaitForCooldown(wait_duration) => {

@@ -1,20 +1,22 @@
-use reth::consensus::{Consensus, ConsensusError, HeaderValidator};
-use reth::primitives::SealedHeader;
-use reth_chainspec::{EthChainSpec, EthereumHardforks, EthereumHardfork};
-use crate::consensus::parlia::util::calculate_millisecond_timestamp;
-use crate::hardforks::BscHardforks;
-use crate::consensus::eip4844::is_blob_eligible_block;
 use super::{Parlia, EMPTY_WITHDRAWALS_HASH};
+use crate::{
+    consensus::{eip4844::is_blob_eligible_block, parlia::util::calculate_millisecond_timestamp},
+    hardforks::BscHardforks,
+    BscBlock,
+};
 use alloy_consensus::{Header, Transaction, EMPTY_OMMER_ROOT_HASH};
-use alloy_primitives::B256;
-use reth_primitives::GotExpected;
 use alloy_eips::eip4844::{DATA_GAS_PER_BLOB, MAX_DATA_GAS_PER_BLOCK_DENCUN};
-use crate::BscBlock;
+use alloy_primitives::B256;
+use reth::{
+    consensus::{Consensus, ConsensusError, HeaderValidator},
+    primitives::SealedHeader,
+};
+use reth_chainspec::{EthChainSpec, EthereumHardfork, EthereumHardforks};
+use reth_primitives::GotExpected;
 use reth_primitives_traits::Block;
 use std::time::SystemTime;
 
 const MAX_RLP_BLOCK_SIZE_OSAKA: usize = 8 * 1024 * 1024;
-
 
 pub const fn validate_header_gas(header: &Header) -> Result<(), ConsensusError> {
     if header.gas_used > header.gas_limit {
@@ -121,9 +123,7 @@ fn validate_mix_digest_for_parlia(
 
     // In Lorentz+, mix digest carries the millisecond remainder. It must not overflow seconds.
     if calculate_millisecond_timestamp(header) / 1000 != header.timestamp {
-        return Err(ConsensusError::Other(
-            "invalid mix digest milliseconds component".to_string(),
-        ));
+        return Err(ConsensusError::Other("invalid mix digest milliseconds component".to_string()));
     }
     Ok(())
 }
@@ -140,9 +140,7 @@ fn validate_withdrawals_root_for_bsc(
         return Ok(());
     }
 
-    let got = header
-        .withdrawals_root
-        .ok_or(ConsensusError::WithdrawalsRootMissing)?;
+    let got = header.withdrawals_root.ok_or(ConsensusError::WithdrawalsRootMissing)?;
     if got != EMPTY_WITHDRAWALS_HASH {
         return Err(ConsensusError::BodyWithdrawalsRootDiff(
             GotExpected { got, expected: EMPTY_WITHDRAWALS_HASH }.into(),
@@ -166,13 +164,16 @@ fn validate_requests_hash_for_bsc(
     Ok(())
 }
 
-impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 'static> HeaderValidator for Parlia<ChainSpec> {
+impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 'static>
+    HeaderValidator for Parlia<ChainSpec>
+{
     fn validate_header(&self, header: &SealedHeader) -> Result<(), ConsensusError> {
         // Don't waste time checking blocks from the future.
         validate_header_not_from_future(header, present_unix_seconds())?;
 
         // Check extra data
-        self.check_header_extra(header).map_err(|e| ConsensusError::Other(format!("Invalid header extra: {e}")))?;
+        self.check_header_extra(header)
+            .map_err(|e| ConsensusError::Other(format!("Invalid header extra: {e}")))?;
 
         // Ensure that the block with no uncles
         if header.ommers_hash != EMPTY_OMMER_ROOT_HASH {
@@ -184,8 +185,11 @@ impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 's
         validate_header_gas(header)?;
         validate_header_base_fee(header, &self.spec)?;
 
-        let cancun_active =
-            BscHardforks::is_cancun_active_at_timestamp(&*self.spec, header.number, header.timestamp);
+        let cancun_active = BscHardforks::is_cancun_active_at_timestamp(
+            &*self.spec,
+            header.number,
+            header.timestamp,
+        );
         validate_withdrawals_root_for_bsc(header, cancun_active)?;
 
         // Ensures that EIP-4844 fields are valid once cancun is active.
@@ -203,19 +207,19 @@ impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 's
 
         if self.spec.is_bohr_active_at_timestamp(header.number, header.timestamp) {
             if header.parent_beacon_block_root.is_none() ||
-               header.parent_beacon_block_root.unwrap() != B256::default()
+                header.parent_beacon_block_root.unwrap() != B256::default()
             {
                 return Err(ConsensusError::ParentBeaconBlockRootUnexpected)
             }
         } else if header.parent_beacon_block_root.is_some() {
-           return Err(ConsensusError::ParentBeaconBlockRootUnexpected)
+            return Err(ConsensusError::ParentBeaconBlockRootUnexpected)
         }
 
         let prague_active =
             self.spec.is_prague_active_at_block_and_timestamp(header.number, header.timestamp);
         validate_requests_hash_for_bsc(header, prague_active)?;
 
-       Ok(())
+        Ok(())
     }
 
     fn validate_header_against_parent(
@@ -228,8 +232,9 @@ impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 's
     }
 }
 
-
-impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 'static> Consensus<BscBlock> for Parlia<ChainSpec> {
+impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 'static>
+    Consensus<BscBlock> for Parlia<ChainSpec>
+{
     fn validate_body_against_header(
         &self,
         _body: &<BscBlock as Block>::Body,
@@ -265,8 +270,8 @@ impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 's
 
         // EIP-4844: Shard Blob Transactions
         if BscHardforks::is_cancun_active_at_timestamp(&*self.spec, block.number, block.timestamp) {
-            if !is_blob_eligible_block(&*self.spec, block.number, block.timestamp)
-                && block.body().transactions().any(|tx| tx.is_eip4844())
+            if !is_blob_eligible_block(&*self.spec, block.number, block.timestamp) &&
+                block.body().transactions().any(|tx| tx.is_eip4844())
             {
                 return Err(ConsensusError::Other(
                     "blob transactions not allowed in this block".to_string(),
@@ -276,11 +281,8 @@ impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 's
             // each blob tx
             let header_blob_gas_used =
                 block.blob_gas_used.ok_or(ConsensusError::BlobGasUsedMissing)?;
-            let total_blob_gas: u64 = block
-                .body()
-                .transactions()
-                .map(|tx| tx.blob_gas_used().unwrap_or(0))
-                .sum();
+            let total_blob_gas: u64 =
+                block.body().transactions().map(|tx| tx.blob_gas_used().unwrap_or(0)).sum();
             if total_blob_gas != header_blob_gas_used {
                 return Err(ConsensusError::BlobGasUsedDiff(GotExpected {
                     got: header_blob_gas_used,
@@ -326,11 +328,8 @@ mod tests {
         // 999ms remainder => valid
         let mut valid_mix = [0u8; 32];
         valid_mix[24..].copy_from_slice(&999u64.to_be_bytes());
-        let header = sealed(Header {
-            timestamp: 10,
-            mix_hash: B256::from(valid_mix),
-            ..Default::default()
-        });
+        let header =
+            sealed(Header { timestamp: 10, mix_hash: B256::from(valid_mix), ..Default::default() });
         assert!(validate_mix_digest_for_parlia(&header, true).is_ok());
 
         // 1000ms remainder => invalid (would spill into next second)
@@ -352,7 +351,8 @@ mod tests {
             Err(ConsensusError::WithdrawalsRootMissing)
         ));
 
-        let header = sealed(Header { withdrawals_root: Some(B256::from([1u8; 32])), ..Default::default() });
+        let header =
+            sealed(Header { withdrawals_root: Some(B256::from([1u8; 32])), ..Default::default() });
         assert!(validate_withdrawals_root_for_bsc(&header, true).is_err());
 
         let header =
@@ -379,7 +379,8 @@ mod tests {
             Err(ConsensusError::RequestsHashMissing)
         ));
 
-        let header = sealed(Header { requests_hash: Some(B256::from([2u8; 32])), ..Default::default() });
+        let header =
+            sealed(Header { requests_hash: Some(B256::from([2u8; 32])), ..Default::default() });
         assert!(validate_requests_hash_for_bsc(&header, true).is_ok());
         assert!(matches!(
             validate_requests_hash_for_bsc(&header, false),

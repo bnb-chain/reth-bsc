@@ -1,11 +1,14 @@
-use super::{bsc::bsc_mainnet, bsc_chapel::bsc_testnet, bsc_rialto::bsc_qanet, local::bsc_local, BscChainSpec};
-use reth_cli::chainspec::ChainSpecParser;
-use std::{sync::Arc, path::Path};
+use super::{
+    bsc::bsc_mainnet, bsc_chapel::bsc_testnet, bsc_rialto::bsc_qanet, local::bsc_local,
+    BscChainSpec,
+};
+use crate::hardforks::bsc::BscHardfork;
 use alloy_genesis::Genesis;
 use reth_chainspec::{ChainSpec, ForkCondition};
+use reth_cli::chainspec::ChainSpecParser;
 use reth_ethereum_forks::EthereumHardfork;
-use crate::hardforks::bsc::BscHardfork;
 use serde_json::Value;
+use std::{path::Path, sync::Arc};
 
 /// Bsc chain specification parser.
 #[derive(Debug, Clone, Default)]
@@ -56,10 +59,10 @@ pub fn parse_genesis_file(path: &str) -> eyre::Result<Arc<BscChainSpec>> {
 pub fn parse_genesis_json(json_str: &str) -> eyre::Result<Arc<BscChainSpec>> {
     let genesis: Genesis = serde_json::from_str(json_str)
         .map_err(|e| eyre::eyre!("Failed to parse genesis JSON: {}", e))?;
-    
+
     let value: Value = serde_json::from_str(json_str)
         .map_err(|e| eyre::eyre!("Failed to parse genesis JSON as Value: {}", e))?;
-    
+
     let mut chain_spec = ChainSpec::builder()
         .chain(genesis.config.chain_id.into())
         .genesis(genesis)
@@ -72,7 +75,7 @@ pub fn parse_genesis_json(json_str: &str) -> eyre::Result<Arc<BscChainSpec>> {
         .with_fork(EthereumHardfork::Petersburg, ForkCondition::Block(0))
         .with_fork(EthereumHardfork::Istanbul, ForkCondition::Block(0))
         .with_fork(EthereumHardfork::MuirGlacier, ForkCondition::Block(0));
-    
+
     // Extract and add hard fork configuration from the genesis config
     if let Some(config) = value.get("config") {
         chain_spec = add_hardforks_to_chainspec(chain_spec, config)?;
@@ -80,28 +83,29 @@ pub fn parse_genesis_json(json_str: &str) -> eyre::Result<Arc<BscChainSpec>> {
         // Add local development hardforks - just add Bohr at block 0 for development
         chain_spec = chain_spec.with_fork(BscHardfork::Bohr, ForkCondition::Block(0));
     }
-    
+
     let chain_spec = chain_spec.build();
     Ok(Arc::new(BscChainSpec { inner: chain_spec }))
 }
 
-
 /// Add hard forks from genesis config to chain spec builder
 fn add_hardforks_to_chainspec(
-    mut chain_spec: reth_chainspec::ChainSpecBuilder, 
-    config: &Value
+    mut chain_spec: reth_chainspec::ChainSpecBuilder,
+    config: &Value,
 ) -> eyre::Result<reth_chainspec::ChainSpecBuilder> {
     // Handle BSC-specific hard forks with timestamps
     if let Some(ramanujan_block) = config.get("ramanujanBlock").and_then(|v| v.as_u64()) {
-        chain_spec = chain_spec.with_fork(BscHardfork::Ramanujan, ForkCondition::Block(ramanujan_block));
+        chain_spec =
+            chain_spec.with_fork(BscHardfork::Ramanujan, ForkCondition::Block(ramanujan_block));
     }
-    
+
     if let Some(niels_block) = config.get("nielsBlock").and_then(|v| v.as_u64()) {
         chain_spec = chain_spec.with_fork(BscHardfork::Niels, ForkCondition::Block(niels_block));
     }
 
     if let Some(mirror_sync_block) = config.get("mirrorSyncBlock").and_then(|v| v.as_u64()) {
-        chain_spec = chain_spec.with_fork(BscHardfork::MirrorSync, ForkCondition::Block(mirror_sync_block));
+        chain_spec =
+            chain_spec.with_fork(BscHardfork::MirrorSync, ForkCondition::Block(mirror_sync_block));
     }
 
     if let Some(bruno_block) = config.get("brunoBlock").and_then(|v| v.as_u64()) {
@@ -141,48 +145,58 @@ fn add_hardforks_to_chainspec(
     }
 
     if let Some(hertz_fix_block) = config.get("hertzfixBlock").and_then(|v| v.as_u64()) {
-        chain_spec = chain_spec.with_fork(BscHardfork::HertzFix, ForkCondition::Block(hertz_fix_block));
+        chain_spec =
+            chain_spec.with_fork(BscHardfork::HertzFix, ForkCondition::Block(hertz_fix_block));
     }
 
     // Handle block-based forks from geth genesis format
     if let Some(berlin_block) = config.get("berlinBlock").and_then(|v| v.as_u64()) {
-        chain_spec = chain_spec.with_fork(EthereumHardfork::Berlin, ForkCondition::Block(berlin_block));
+        chain_spec =
+            chain_spec.with_fork(EthereumHardfork::Berlin, ForkCondition::Block(berlin_block));
     }
-    
+
     if let Some(london_block) = config.get("londonBlock").and_then(|v| v.as_u64()) {
-        chain_spec = chain_spec.with_fork(EthereumHardfork::London, ForkCondition::Block(london_block));
+        chain_spec =
+            chain_spec.with_fork(EthereumHardfork::London, ForkCondition::Block(london_block));
     }
-    
+
     // Handle timestamp-based forks
     if let Some(shanghai_time) = config.get("shanghaiTime").and_then(|v| v.as_u64()) {
-        chain_spec = chain_spec.with_fork(EthereumHardfork::Shanghai, ForkCondition::Timestamp(shanghai_time));
+        chain_spec = chain_spec
+            .with_fork(EthereumHardfork::Shanghai, ForkCondition::Timestamp(shanghai_time));
     }
-    
+
     if let Some(kepler_time) = config.get("keplerTime").and_then(|v| v.as_u64()) {
-        chain_spec = chain_spec.with_fork(BscHardfork::Kepler, ForkCondition::Timestamp(kepler_time));
+        chain_spec =
+            chain_spec.with_fork(BscHardfork::Kepler, ForkCondition::Timestamp(kepler_time));
     }
-    
+
     if let Some(feynman_time) = config.get("feynmanTime").and_then(|v| v.as_u64()) {
-        chain_spec = chain_spec.with_fork(BscHardfork::Feynman, ForkCondition::Timestamp(feynman_time));
+        chain_spec =
+            chain_spec.with_fork(BscHardfork::Feynman, ForkCondition::Timestamp(feynman_time));
     }
-    
+
     if let Some(feynman_fix_time) = config.get("feynmanFixTime").and_then(|v| v.as_u64()) {
-        chain_spec = chain_spec.with_fork(BscHardfork::FeynmanFix, ForkCondition::Timestamp(feynman_fix_time));
+        chain_spec = chain_spec
+            .with_fork(BscHardfork::FeynmanFix, ForkCondition::Timestamp(feynman_fix_time));
     }
-    
+
     if let Some(cancun_time) = config.get("cancunTime").and_then(|v| v.as_u64()) {
-        chain_spec = chain_spec.with_fork(EthereumHardfork::Cancun, ForkCondition::Timestamp(cancun_time));
-        chain_spec = chain_spec.with_fork(BscHardfork::Cancun, ForkCondition::Timestamp(cancun_time));
+        chain_spec =
+            chain_spec.with_fork(EthereumHardfork::Cancun, ForkCondition::Timestamp(cancun_time));
+        chain_spec =
+            chain_spec.with_fork(BscHardfork::Cancun, ForkCondition::Timestamp(cancun_time));
     }
-    
+
     if let Some(haber_time) = config.get("haberTime").and_then(|v| v.as_u64()) {
         chain_spec = chain_spec.with_fork(BscHardfork::Haber, ForkCondition::Timestamp(haber_time));
     }
-    
+
     if let Some(haber_fix_time) = config.get("haberFixTime").and_then(|v| v.as_u64()) {
-        chain_spec = chain_spec.with_fork(BscHardfork::HaberFix, ForkCondition::Timestamp(haber_fix_time));
+        chain_spec =
+            chain_spec.with_fork(BscHardfork::HaberFix, ForkCondition::Timestamp(haber_fix_time));
     }
-    
+
     if let Some(bohr_time) = config.get("bohrTime").and_then(|v| v.as_u64()) {
         chain_spec = chain_spec.with_fork(BscHardfork::Bohr, ForkCondition::Timestamp(bohr_time));
     }
@@ -190,9 +204,10 @@ fn add_hardforks_to_chainspec(
     if let Some(tycho_time) = config.get("tychoTime").and_then(|v| v.as_u64()) {
         chain_spec = chain_spec.with_fork(BscHardfork::Tycho, ForkCondition::Timestamp(tycho_time));
     }
-    
+
     if let Some(prague_time) = config.get("pragueTime").and_then(|v| v.as_u64()) {
-        chain_spec = chain_spec.with_fork(EthereumHardfork::Prague, ForkCondition::Timestamp(prague_time));
+        chain_spec =
+            chain_spec.with_fork(EthereumHardfork::Prague, ForkCondition::Timestamp(prague_time));
     }
 
     if let Some(osaka_time) = config.get("osakaTime").and_then(|v| v.as_u64()) {
@@ -202,26 +217,30 @@ fn add_hardforks_to_chainspec(
         // so the ChainHardforks map key collision is handled at the trait level.
         chain_spec = chain_spec.with_fork(BscHardfork::Osaka, ForkCondition::Timestamp(osaka_time));
     }
-    
+
     if let Some(pascal_time) = config.get("pascalTime").and_then(|v| v.as_u64()) {
-        chain_spec = chain_spec.with_fork(BscHardfork::Pascal, ForkCondition::Timestamp(pascal_time));
+        chain_spec =
+            chain_spec.with_fork(BscHardfork::Pascal, ForkCondition::Timestamp(pascal_time));
     }
-    
+
     if let Some(lorentz_time) = config.get("lorentzTime").and_then(|v| v.as_u64()) {
-        chain_spec = chain_spec.with_fork(BscHardfork::Lorentz, ForkCondition::Timestamp(lorentz_time));
+        chain_spec =
+            chain_spec.with_fork(BscHardfork::Lorentz, ForkCondition::Timestamp(lorentz_time));
     }
-    
+
     if let Some(maxwell_time) = config.get("maxwellTime").and_then(|v| v.as_u64()) {
-        chain_spec = chain_spec.with_fork(BscHardfork::Maxwell, ForkCondition::Timestamp(maxwell_time));
+        chain_spec =
+            chain_spec.with_fork(BscHardfork::Maxwell, ForkCondition::Timestamp(maxwell_time));
     }
-    
+
     if let Some(fermi_time) = config.get("fermiTime").and_then(|v| v.as_u64()) {
         chain_spec = chain_spec.with_fork(BscHardfork::Fermi, ForkCondition::Timestamp(fermi_time));
     }
 
     if let Some(mendel_time) = config.get("mendelTime").and_then(|v| v.as_u64()) {
-        chain_spec = chain_spec.with_fork(BscHardfork::Mendel, ForkCondition::Timestamp(mendel_time));
+        chain_spec =
+            chain_spec.with_fork(BscHardfork::Mendel, ForkCondition::Timestamp(mendel_time));
     }
-    
+
     Ok(chain_spec)
 }

@@ -14,15 +14,25 @@ use cometbft_light_client_verifier::{
 use cometbft_proto::types::v1::LightBlock as TmLightBlock;
 use prost::Message;
 use revm::precompile::{
-    u64_to_address, PrecompileError, PrecompileOutput, PrecompileResult, Precompile, PrecompileId,
+    u64_to_address, Precompile, PrecompileError, PrecompileId, PrecompileOutput, PrecompileResult,
 };
-use std::{borrow::{Cow, ToOwned}, string::String, vec::Vec};
+use std::{
+    borrow::{Cow, ToOwned},
+    string::String,
+    vec::Vec,
+};
 
-pub(crate) const COMETBFT_LIGHT_BLOCK_VALIDATION: Precompile =
-    Precompile::new(PrecompileId::Custom(Cow::Borrowed("COMET_BFT_LIGHT_BLOCK_VALIDATE_HERTZ")), u64_to_address(103), cometbft_light_block_validation_run);
+pub(crate) const COMETBFT_LIGHT_BLOCK_VALIDATION: Precompile = Precompile::new(
+    PrecompileId::Custom(Cow::Borrowed("COMET_BFT_LIGHT_BLOCK_VALIDATE_HERTZ")),
+    u64_to_address(103),
+    cometbft_light_block_validation_run,
+);
 
-pub(crate) const COMETBFT_LIGHT_BLOCK_VALIDATION_BEFORE_HERTZ: Precompile =
-    Precompile::new(PrecompileId::Custom(Cow::Borrowed("COMET_BFT_LIGHT_BLOCK_VALIDATE")), u64_to_address(103), cometbft_light_block_validation_run_before_hertz);
+pub(crate) const COMETBFT_LIGHT_BLOCK_VALIDATION_BEFORE_HERTZ: Precompile = Precompile::new(
+    PrecompileId::Custom(Cow::Borrowed("COMET_BFT_LIGHT_BLOCK_VALIDATE")),
+    u64_to_address(103),
+    cometbft_light_block_validation_run_before_hertz,
+);
 
 const UINT64_TYPE_LENGTH: u64 = 8;
 const CONSENSUS_STATE_LENGTH_BYTES_LENGTH: u64 = 32;

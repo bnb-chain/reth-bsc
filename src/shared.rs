@@ -1,8 +1,14 @@
-use crate::consensus::parlia::SnapshotProvider;
-use crate::node::engine_api::payload::BscPayloadTypes;
-use crate::node::network::block_import::service::{IncomingBlock, IncomingMinedBlock};
-use crate::node::network::BscNetworkPrimitives;
-use crate::node::primitives::BscBlock;
+use crate::{
+    consensus::parlia::SnapshotProvider,
+    node::{
+        engine_api::payload::BscPayloadTypes,
+        network::{
+            block_import::service::{IncomingBlock, IncomingMinedBlock},
+            BscNetworkPrimitives,
+        },
+        primitives::BscBlock,
+    },
+};
 use alloy_consensus::{BlockHeader, Header};
 use alloy_eips::BlockId;
 use alloy_primitives::{Bytes, B256, U256};
@@ -17,17 +23,18 @@ use reth::api::NodeTypesWithDBAdapter;
 use reth_engine_tree::engine::EngineApiRequest;
 use reth_network::NetworkHandle;
 use reth_network_api::PeerId;
-use reth_provider::providers::BlockchainProvider;
 use reth_payload_builder_primitives::Events;
 use reth_primitives::TransactionSigned;
-use reth_provider::{BlockNumReader, HeaderProvider};
+use reth_provider::{providers::BlockchainProvider, BlockNumReader, HeaderProvider};
 use schnellru::{ByLength, LruMap};
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::RwLock;
-use std::sync::{Arc, OnceLock};
-use tokio::sync::broadcast;
-use tokio::sync::mpsc::UnboundedSender;
+use std::{
+    collections::VecDeque,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, OnceLock, RwLock,
+    },
+};
+use tokio::sync::{broadcast, mpsc::UnboundedSender};
 
 /// Public type alias for the BSC engine API sender (replaces private reth EngineApiTx).
 pub type BscEngineApiTx = UnboundedSender<
@@ -210,9 +217,7 @@ static GLOBAL_BLOB_STORE: OnceLock<Arc<dyn reth_transaction_pool::blobstore::Blo
     OnceLock::new();
 
 /// Register the node-wide blob store so that block-body serving can read blob sidecars.
-pub fn set_global_blob_store(
-    store: Arc<dyn reth_transaction_pool::blobstore::BlobStore>,
-) {
+pub fn set_global_blob_store(store: Arc<dyn reth_transaction_pool::blobstore::BlobStore>) {
     let _ = GLOBAL_BLOB_STORE.set(store);
 }
 
@@ -256,7 +261,8 @@ pub fn get_snapshot_provider() -> Option<&'static Arc<dyn SnapshotProvider + Sen
 }
 
 /// Store the header provider globally
-/// Creates functions that directly call HeaderProvider::header() and HeaderProvider::header_by_number()
+/// Creates functions that directly call HeaderProvider::header() and
+/// HeaderProvider::header_by_number()
 pub fn set_header_provider<T>(
     provider: Arc<T>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
@@ -434,11 +440,8 @@ where
     P: HeaderProvider<Header = Header>,
 {
     let Some(handle) = get_network_handle() else { return };
-    let total_difficulty = provider
-        .header_td_by_number(header.number())
-        .ok()
-        .flatten()
-        .unwrap_or_default();
+    let total_difficulty =
+        provider.header_td_by_number(header.number()).ok().flatten().unwrap_or_default();
     let head = reth_ethereum_forks::Head {
         number: header.number(),
         hash: header.hash_slow(),
@@ -463,7 +466,8 @@ pub fn get_payload_events_tx() -> Option<&'static broadcast::Sender<Events<BscPa
 
 /// Store the fork choice engine globally.
 ///
-/// This stores a `BscForkChoiceEngine` instance to provide global access for fork choice operations.
+/// This stores a `BscForkChoiceEngine` instance to provide global access for fork choice
+/// operations.
 pub fn set_fork_choice_engine<P>(
     engine: crate::node::consensus::BscForkChoiceEngine<P>,
 ) -> Result<(), Box<dyn std::error::Error>>
@@ -855,9 +859,7 @@ pub async fn ipc_send_raw_transaction(tx: TransactionSigned) -> Result<B256, eyr
 static ENGINE_API_TX: OnceLock<BscEngineApiTx> = OnceLock::new();
 
 /// Set global engine api tx if present.
-pub fn set_engine_api_tx(
-    tx: BscEngineApiTx,
-) -> Result<(), BscEngineApiTx> {
+pub fn set_engine_api_tx(tx: BscEngineApiTx) -> Result<(), BscEngineApiTx> {
     ENGINE_API_TX.set(tx)
 }
 

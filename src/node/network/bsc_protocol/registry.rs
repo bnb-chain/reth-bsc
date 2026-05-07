@@ -1,12 +1,13 @@
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use std::sync::RwLock;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, RwLock},
+};
 
 use once_cell::sync::Lazy;
-use tokio::sync::broadcast;
-use tokio::sync::mpsc::UnboundedSender;
-use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
+use tokio::{
+    sync::{broadcast, mpsc::UnboundedSender, oneshot},
+    task::JoinHandle,
+};
 
 use reth_network_api::PeerId;
 
@@ -16,8 +17,10 @@ use crate::node::network::blocks_by_range::{
 };
 use alloy_primitives::B256;
 use reth_network::Peers;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
 use tokio::time::timeout;
 
 /// Global registry of active BSC protocol senders per peer.
@@ -321,7 +324,8 @@ pub fn spawn_evn_refresh_listener() {
                         }
                         tracing::info!(target: "bsc::evn", marked = marked, nodeids = ?nodeids, "Applied on-chain EVN NodeIDs to peers");
 
-                        // Start periodic refresh every 60s to apply on-chain NodeIDs to existing peers
+                        // Start periodic refresh every 60s to apply on-chain NodeIDs to existing
+                        // peers
                         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
                         loop {
                             ticker.tick().await;
@@ -398,8 +402,7 @@ pub async fn request_blocks_by_range_with_failover(
         return Err("no BSC peers available for range request".to_string());
     }
 
-    let mut last: Result<BlocksByRangePacket, String> =
-        Err("uninitialised failover".to_string());
+    let mut last: Result<BlocksByRangePacket, String> = Err("uninitialised failover".to_string());
     for (idx, peer) in peers.iter().enumerate() {
         match request_blocks_by_range(*peer, start_height, start_hash, count, timeout_dur).await {
             Ok(resp) if !resp.blocks.is_empty() => return Ok(resp),
@@ -492,12 +495,7 @@ mod tests {
 
     #[test]
     fn allow_vote_broadcast_when_td_missing() {
-        assert!(should_allow_vote_broadcast(
-            false,
-            Some(10_000u128),
-            None,
-            1000
-        ));
+        assert!(should_allow_vote_broadcast(false, Some(10_000u128), None, 1000));
         assert!(should_allow_vote_broadcast(
             false,
             None,

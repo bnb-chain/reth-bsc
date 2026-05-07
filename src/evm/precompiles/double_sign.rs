@@ -5,14 +5,17 @@ use alloy_primitives::{keccak256, BlockNumber, Bytes, ChainId, B256, B512, U256}
 use alloy_rlp::{Decodable, RlpDecodable, RlpEncodable};
 use core::cmp::Ordering;
 use revm::precompile::{
-    secp256k1, u64_to_address, PrecompileError, PrecompileOutput, PrecompileResult,
-    Precompile, PrecompileId,
+    secp256k1, u64_to_address, Precompile, PrecompileError, PrecompileId, PrecompileOutput,
+    PrecompileResult,
 };
 use std::borrow::Cow;
 
 /// Double sign evidence validation precompile for BSC.
-pub(crate) const DOUBLE_SIGN_EVIDENCE_VALIDATION: Precompile =
-    Precompile::new(PrecompileId::Custom(Cow::Borrowed("VERIFY_DOUBLE_SIGN_EVIDENCE")), u64_to_address(104), double_sign_evidence_validation_run);
+pub(crate) const DOUBLE_SIGN_EVIDENCE_VALIDATION: Precompile = Precompile::new(
+    PrecompileId::Custom(Cow::Borrowed("VERIFY_DOUBLE_SIGN_EVIDENCE")),
+    u64_to_address(104),
+    double_sign_evidence_validation_run,
+);
 
 const EXTRA_SEAL_LENGTH: usize = 65;
 

@@ -15,18 +15,14 @@ use alloy_primitives::{B256, U128};
 use alloy_rpc_types::engine::{ForkchoiceState, PayloadStatusEnum};
 use futures::{future::Either, stream::FuturesUnordered, StreamExt};
 use parking_lot::RwLock;
-use reth::consensus::HeaderValidator;
-use reth::network::cache::LruCache;
+use reth::{consensus::HeaderValidator, network::cache::LruCache};
 use reth_engine_primitives::{ConsensusEngineHandle, EngineTypes};
 use reth_engine_tree::engine::EngineApiRequest;
 use reth_eth_wire::{BlockHashNumber, GetBlockHeaders, NewBlock};
 use reth_eth_wire_types::broadcast::NewBlockHashes;
 use reth_network::{
     import::{BlockImportError, BlockImportEvent, BlockImportOutcome, BlockValidation},
-    message::{NewBlockMessage, PeerMessage},
-};
-use reth_network::{
-    message::{BlockRequest, PeerResponse},
+    message::{BlockRequest, NewBlockMessage, PeerMessage, PeerResponse},
     FetchClient, NetworkHandle,
 };
 use reth_network_api::{PeerId, Peers, ReputationChangeKind};
@@ -117,6 +113,14 @@ where
     /// Per-outcome counters for `engine.new_payload` results. Cloned into each
     /// import future since `Counter` is a cheap handle into the global registry.
     metrics: crate::metrics::BscBlockImportMetrics,
+}
+
+fn resolve_bsc_peer_static(announcer: PeerId) -> Option<PeerId> {
+    if crate::node::network::bsc_protocol::registry::has_registered_peer(announcer) {
+        Some(announcer)
+    } else {
+        crate::node::network::bsc_protocol::registry::list_registered_peers().into_iter().next()
+    }
 }
 
 impl<Provider> ImportService<Provider>
@@ -224,7 +228,10 @@ where
                             // this push the network keeps advertising the startup forkid
                             // and remote peers reject the handshake as InvalidFork once
                             // the local tip crosses any time-based hardfork.
-                            crate::shared::push_head_to_network(&forkchoice_engine.provider, &header);
+                            crate::shared::push_head_to_network(
+                                &forkchoice_engine.provider,
+                                &header,
+                            );
                         }
                         Outcome { peer: peer_id, result: Ok(BlockValidation::ValidBlock { block }) }
                             .into()
@@ -482,7 +489,10 @@ where
                         "Failed to update fork choice for mined block"
                     );
                 } else {
-                    crate::shared::push_head_to_network(&forkchoice_engine.provider, &header_for_fcu);
+                    crate::shared::push_head_to_network(
+                        &forkchoice_engine.provider,
+                        &header_for_fcu,
+                    );
                     tracing::debug!(
                         target: "bsc::block_import",
                         block_number = %header_for_fcu.number,
@@ -742,10 +752,11 @@ where
         }
         let header_ref = &block.block.0.block.header;
         let coinbase = header_ref.beneficiary;
-        // If from proxied validators or validator address, target EVN peers with ETH NewBlockHashes.
-        if cfg.proxyed_validators.contains(&coinbase)
-            || (mining_config.enabled
-                && mining_config.validator_address.unwrap_or_default() == coinbase)
+        // If from proxied validators or validator address, target EVN peers with ETH
+        // NewBlockHashes.
+        if cfg.proxyed_validators.contains(&coinbase) ||
+            (mining_config.enabled &&
+                mining_config.validator_address.unwrap_or_default() == coinbase)
         {
             if let Some(net) = crate::shared::get_network_handle() {
                 let peers = crate::node::network::evn_peers::snapshot();
@@ -917,11 +928,11 @@ where
                     }
                 }
 
-                // TODO: add queued blocks removal later, to avoid milicious block import, and trigger next download.
-                // now, it must wait backfilling to download the correct block.
-                // the verified header can drop the peer later, it cannot transfer a bad header now.
-                // if let Some(block_hash) = outcome.block.hash {
-                //     this.queued_blocks.remove(&block_hash);
+                // TODO: add queued blocks removal later, to avoid milicious block import, and
+                // trigger next download. now, it must wait backfilling to download
+                // the correct block. the verified header can drop the peer later,
+                // it cannot transfer a bad header now. if let Some(block_hash) =
+                // outcome.block.hash {     this.queued_blocks.remove(&block_hash);
                 // }
 
                 if let Err(e) = this.to_network.send(BlockImportEvent::Outcome(outcome)) {
@@ -1581,7 +1592,8 @@ mod tests {
 
     #[test]
     fn planner_announces_when_peer_best_number_unknown() {
-        // best_number is None before any head info has been observed; announce is the right default.
+        // best_number is None before any head info has been observed; announce is the right
+        // default.
         let peers = vec![peer(1, None)];
         let result = plan_head_announcements(100, &peers);
         assert_eq!(result.len(), 1);

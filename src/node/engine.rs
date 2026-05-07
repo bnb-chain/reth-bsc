@@ -1,30 +1,26 @@
 use crate::{
+    consensus::parlia::VoteAddress,
     node::{
         engine_api::payload::BscPayloadTypes,
         miner::{BscMiner, MiningConfig},
         BscNode,
     },
-    BscPrimitives,
+    BscBlock, BscPrimitives,
 };
-use crate::BscBlock;
-use crate::consensus::parlia::VoteAddress;
-use alloy_primitives::Address;
 use alloy_eips::eip7685::Requests;
-use alloy_primitives::U256;
-use reth::transaction_pool::PoolTransaction;
+use alloy_primitives::{Address, U256};
 use reth::{
     api::FullNodeTypes,
     builder::{components::PayloadServiceBuilder, BuilderContext},
     payload::{PayloadBuilderHandle, PayloadServiceCommand},
-    transaction_pool::TransactionPool,
+    transaction_pool::{PoolTransaction, TransactionPool},
 };
 use reth_chain_state::ExecutedBlock;
 use reth_evm::ConfigureEvm;
 use reth_payload_builder_primitives::Events;
 use reth_payload_primitives::BuiltPayload;
 use reth_primitives::{SealedBlock, TransactionSigned};
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info};
 
@@ -163,7 +159,8 @@ where
         let (events_tx, _events_rx) = broadcast::channel::<Events<BscPayloadTypes>>(100);
         let _ = crate::shared::set_payload_events_tx(events_tx.clone());
 
-        // Handle payload service commands (keep minimal compatibility but with shared events channel)
+        // Handle payload service commands (keep minimal compatibility but with shared events
+        // channel)
         ctx.task_executor().spawn_critical("payload-service-handler", async move {
             while let Some(message) = rx.recv().await {
                 match message {

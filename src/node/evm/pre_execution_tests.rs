@@ -2,8 +2,10 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::consensus::parlia::vote::VoteAddress;
-    use crate::node::evm::pre_execution::{TURN_LENGTH_CACHE, VALIDATOR_CACHE};
+    use crate::{
+        consensus::parlia::vote::VoteAddress,
+        node::evm::pre_execution::{TURN_LENGTH_CACHE, VALIDATOR_CACHE},
+    };
     use alloy_primitives::{Address, B256};
 
     /// Test validator cache basic operations

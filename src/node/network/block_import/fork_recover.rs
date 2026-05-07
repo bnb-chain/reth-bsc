@@ -162,8 +162,8 @@ pub async fn discover_fork_blocks<
         // a header when its parent was already Valid via a prior new_payload.
         // Transitively, any side-block in our provider is rooted at the
         // canonical chain, so no further walking is required.
-        let cursor_is_local = provider.block_hash(cursor_num)? == Some(cursor_hash)
-            || provider.header(cursor_hash)?.is_some();
+        let cursor_is_local = provider.block_hash(cursor_num)? == Some(cursor_hash) ||
+            provider.header(cursor_hash)?.is_some();
         if cursor_is_local {
             let outcome = if fork_blocks.is_empty() {
                 DiscoveryOutcome::Shortcircuit
@@ -219,10 +219,10 @@ pub async fn discover_fork_blocks<
 /// Top-level recovery entry point.
 ///
 /// 1. Walks back via `discover_fork_blocks` to find the common ancestor.
-/// 2. Imports fork blocks oldest → newest via `engine.new_payload`, awaiting
-///    `Valid` on each before submitting the next.
-/// 3. Issues a final `fork_choice_updated` for `head_hash`, so engine-tree
-///    re-evaluates canonical selection.
+/// 2. Imports fork blocks oldest → newest via `engine.new_payload`, awaiting `Valid` on each before
+///    submitting the next.
+/// 3. Issues a final `fork_choice_updated` for `head_hash`, so engine-tree re-evaluates canonical
+///    selection.
 pub async fn recover_ancestors<P>(
     peer: PeerId,
     head_hash: B256,
@@ -369,9 +369,7 @@ where
         );
         return Ok(last.header.clone());
     }
-    provider
-        .header(head_hash)?
-        .ok_or(ForkRecoverError::HeadHeaderMissing { hash: head_hash })
+    provider.header(head_hash)?.ok_or(ForkRecoverError::HeadHeaderMissing { hash: head_hash })
 }
 
 /// Bounded LRU of recently-failed recovery heads with per-entry deadlines.
@@ -389,9 +387,7 @@ pub struct FailedHeadsCooler {
 impl FailedHeadsCooler {
     pub fn new(capacity: u32, cooldown: Duration) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(schnellru::LruMap::new(
-                schnellru::ByLength::new(capacity),
-            ))),
+            inner: Arc::new(Mutex::new(schnellru::LruMap::new(schnellru::ByLength::new(capacity)))),
             cooldown,
         }
     }

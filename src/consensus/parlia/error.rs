@@ -2,7 +2,6 @@ use alloy_primitives::{BlockHash, BlockNumber};
 
 use crate::consensus::parlia::VoteAddress;
 
-
 /// Parlia consensus error.
 #[derive(thiserror::Error, Debug, PartialEq, Eq, Clone)]
 pub enum ParliaConsensusError {
@@ -69,9 +68,7 @@ pub enum ParliaConsensusError {
 
     /// Error when header extra attestation is invalid
     #[error("fetch vote error")]
-    FetchVoteError {
-        address: VoteAddress,
-    },
+    FetchVoteError { address: VoteAddress },
 
     /// Error when aggregate signature failed
     #[error("aggregate signature failed")]
@@ -79,14 +76,9 @@ pub enum ParliaConsensusError {
 
     /// Error when invalid attestation vote count
     #[error("invalid attestation vote count")]
-    InvalidAttestationVoteCount {
-        got: u32,
-        expected: u32,
-    },
+    InvalidAttestationVoteCount { got: u32, expected: u32 },
 
     /// Error when turn length is not found
     #[error("turn length not found")]
-    TurnLengthNotFound {
-        block_hash: BlockHash,
-    },
+    TurnLengthNotFound { block_hash: BlockHash },
 }

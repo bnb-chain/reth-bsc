@@ -12,8 +12,8 @@ use reth_rpc_eth_api::helpers::config::{EthConfigApiServer, EthConfigHandler};
 /// Adjusts `systemContracts` to match geth-bsc behavior:
 /// - BSC has no Beacon Chain, so `BEACON_ROOTS_ADDRESS` is not included.
 /// - BSC only includes `HISTORY_STORAGE_ADDRESS` when Prague is active.
-/// - Other Ethereum-specific system contracts (ConsolidationRequest, Deposit,
-///   WithdrawalRequest) are not used on BSC.
+/// - Other Ethereum-specific system contracts (ConsolidationRequest, Deposit, WithdrawalRequest)
+///   are not used on BSC.
 #[derive(Debug, Clone)]
 pub struct BscEthConfigHandler<Provider, Evm> {
     inner: EthConfigHandler<Provider, Evm>,

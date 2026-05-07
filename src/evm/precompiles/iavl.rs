@@ -1,30 +1,45 @@
 use alloy_primitives::Bytes;
 use parity_bytes::BytesRef;
 use revm::precompile::{
-    u64_to_address, PrecompileError, PrecompileOutput, PrecompileResult, Precompile, PrecompileId,
+    u64_to_address, Precompile, PrecompileError, PrecompileId, PrecompileOutput, PrecompileResult,
 };
 use std::borrow::Cow;
 use tendermint::lite::iavl_proof;
 
 /// Iavl proof validation precompile for BSC.
-pub(crate) const IAVL_PROOF_VALIDATION: Precompile =
-    Precompile::new(PrecompileId::Custom(Cow::Borrowed("IAVL_MERKLE_PROOF_VALIDATE")), u64_to_address(101), iavl_proof_validation_run);
+pub(crate) const IAVL_PROOF_VALIDATION: Precompile = Precompile::new(
+    PrecompileId::Custom(Cow::Borrowed("IAVL_MERKLE_PROOF_VALIDATE")),
+    u64_to_address(101),
+    iavl_proof_validation_run,
+);
 
 /// Iavl proof validation precompile for BSC after Nano hardfork.
-pub(crate) const IAVL_PROOF_VALIDATION_NANO: Precompile =
-    Precompile::new(PrecompileId::Custom(Cow::Borrowed("IAVL_MERKLE_PROOF_VALIDATE_NANO")), u64_to_address(101), iavl_proof_validation_run_nano);
+pub(crate) const IAVL_PROOF_VALIDATION_NANO: Precompile = Precompile::new(
+    PrecompileId::Custom(Cow::Borrowed("IAVL_MERKLE_PROOF_VALIDATE_NANO")),
+    u64_to_address(101),
+    iavl_proof_validation_run_nano,
+);
 
 /// Iavl proof validation precompile for BSC after Moran hardfork.
-pub(crate) const IAVL_PROOF_VALIDATION_MORAN: Precompile =
-    Precompile::new(PrecompileId::Custom(Cow::Borrowed("IAVL_MERKLE_PROOF_VALIDATE_MORAN")), u64_to_address(101), iavl_proof_validation_run_moran);
+pub(crate) const IAVL_PROOF_VALIDATION_MORAN: Precompile = Precompile::new(
+    PrecompileId::Custom(Cow::Borrowed("IAVL_MERKLE_PROOF_VALIDATE_MORAN")),
+    u64_to_address(101),
+    iavl_proof_validation_run_moran,
+);
 
 /// Iavl proof validation precompile for BSC after Planck hardfork.
-pub(crate) const IAVL_PROOF_VALIDATION_PLANCK: Precompile =
-    Precompile::new(PrecompileId::Custom(Cow::Borrowed("IAVL_MERKLE_PROOF_VALIDATE_PLANCK")), u64_to_address(101), iavl_proof_validation_run_planck);
+pub(crate) const IAVL_PROOF_VALIDATION_PLANCK: Precompile = Precompile::new(
+    PrecompileId::Custom(Cow::Borrowed("IAVL_MERKLE_PROOF_VALIDATE_PLANCK")),
+    u64_to_address(101),
+    iavl_proof_validation_run_planck,
+);
 
 /// Iavl proof validation precompile for BSC after Plato hardfork.
-pub(crate) const IAVL_PROOF_VALIDATION_PLATO: Precompile =
-    Precompile::new(PrecompileId::Custom(Cow::Borrowed("IAVL_MERKLE_PROOF_VALIDATE_PLATO")), u64_to_address(101), iavl_proof_validation_run_plato);
+pub(crate) const IAVL_PROOF_VALIDATION_PLATO: Precompile = Precompile::new(
+    PrecompileId::Custom(Cow::Borrowed("IAVL_MERKLE_PROOF_VALIDATE_PLATO")),
+    u64_to_address(101),
+    iavl_proof_validation_run_plato,
+);
 
 /// Run Iavl proof validation.
 fn iavl_proof_validation_run(input: &[u8], gas_limit: u64) -> PrecompileResult {

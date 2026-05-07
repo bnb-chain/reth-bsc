@@ -1,32 +1,28 @@
 use std::sync::{
-    Arc,
     atomic::{AtomicBool, Ordering},
+    Arc,
 };
 
 use alloy_consensus::{BlockHeader, Transaction};
 use alloy_eips::merge::EPOCH_SLOTS;
-use reth::api::FullNodeTypes;
-use reth::api::{NodePrimitives, NodeTypes};
-use reth::builder::{
-    components::{create_blob_store_with_cache, PoolBuilder, TxPoolBuilder},
-    BuilderContext,
+use reth::{
+    api::{FullNodeTypes, NodePrimitives, NodeTypes},
+    builder::{
+        components::{create_blob_store_with_cache, PoolBuilder, TxPoolBuilder},
+        BuilderContext,
+    },
 };
 use reth_chainspec::{EthChainSpec, EthereumHardforks, ForkCondition, Hardforks};
 use reth_ethereum_primitives::TransactionSigned as EthTxSigned;
 use reth_payload_primitives::PayloadTypes;
-use reth_primitives_traits::SignedTransaction;
-use reth_primitives_traits::constants::MAX_TX_GAS_LIMIT_OSAKA;
+use reth_primitives_traits::{constants::MAX_TX_GAS_LIMIT_OSAKA, SignedTransaction};
 use reth_transaction_pool::{
-    blobstore::DiskFileBlobStore, error::InvalidPoolTransactionError, PoolTransaction,
-    TransactionOrigin, TransactionValidationOutcome, TransactionValidationTaskExecutor,
-    TransactionValidator,
-};
-use reth_transaction_pool::{
-    CoinbaseTipOrdering, EthPooledTransaction, EthTransactionValidator, Pool,
+    blobstore::DiskFileBlobStore, error::InvalidPoolTransactionError, CoinbaseTipOrdering,
+    EthPooledTransaction, EthTransactionValidator, Pool, PoolTransaction, TransactionOrigin,
+    TransactionValidationOutcome, TransactionValidationTaskExecutor, TransactionValidator,
 };
 
-use crate::evm::blacklist;
-use crate::hardforks::bsc::BscHardfork;
+use crate::{evm::blacklist, hardforks::bsc::BscHardfork};
 
 /// Transaction pool blacklist error type: marked as "bad transaction" to punish source node
 #[derive(thiserror::Error, Debug)]
@@ -84,8 +80,8 @@ where
             );
         }
 
-        if self.osaka_activated.load(Ordering::Relaxed)
-            && transaction.gas_limit() > MAX_TX_GAS_LIMIT_OSAKA
+        if self.osaka_activated.load(Ordering::Relaxed) &&
+            transaction.gas_limit() > MAX_TX_GAS_LIMIT_OSAKA
         {
             return TransactionValidationOutcome::Invalid(
                 transaction,
@@ -158,16 +154,15 @@ where
         B: reth_primitives_traits::Block,
     {
         if let Some(osaka_ts) = self.osaka_timestamp {
-            self.osaka_activated.store(
-                new_tip_block.header().timestamp() >= osaka_ts,
-                Ordering::Relaxed,
-            );
+            self.osaka_activated
+                .store(new_tip_block.header().timestamp() >= osaka_ts, Ordering::Relaxed);
         }
         self.inner.on_new_head_block(new_tip_block)
     }
 }
 
-/// BSC custom transaction pool builder: add blacklist validation to the default Ethereum pool builder.
+/// BSC custom transaction pool builder: add blacklist validation to the default Ethereum pool
+/// builder.
 #[derive(Debug, Default, Clone, Copy)]
 #[non_exhaustive]
 pub struct BscPoolBuilder;
@@ -242,8 +237,7 @@ where
             ForkCondition::Timestamp(ts) => Some(ts),
             _ => None,
         };
-        let osaka_activated = osaka_timestamp
-            .is_some_and(|ts| ctx.head().timestamp >= ts);
+        let osaka_activated = osaka_timestamp.is_some_and(|ts| ctx.head().timestamp >= ts);
 
         let validator = validator.map(|v| BscTxValidator::new(v, osaka_activated, osaka_timestamp));
 

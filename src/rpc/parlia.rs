@@ -42,7 +42,8 @@ pub struct SnapshotResult {
 
 impl From<Snapshot> for SnapshotResult {
     fn from(snapshot: Snapshot) -> Self {
-        // Convert validators to the expected format: address -> ValidatorInfo (BTreeMap for sorted output)
+        // Convert validators to the expected format: address -> ValidatorInfo (BTreeMap for sorted
+        // output)
         let validators: std::collections::BTreeMap<String, ValidatorInfo> = snapshot
             .validators
             .iter()
@@ -58,7 +59,8 @@ impl From<Snapshot> for SnapshotResult {
             })
             .collect();
 
-        // Convert recent proposers to string format: block_number -> address (BTreeMap for sorted output)
+        // Convert recent proposers to string format: block_number -> address (BTreeMap for sorted
+        // output)
         let recents: std::collections::BTreeMap<String, String> = snapshot
             .recent_proposers
             .iter()
@@ -453,9 +455,10 @@ fn parse_node_ids(input: Vec<String>) -> RpcResult<Vec<[u8; 32]>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chainspec::{bsc_testnet, BscChainSpec};
-    use crate::consensus::parlia::provider::EnhancedDbSnapshotProvider;
-    use crate::consensus::parlia::VoteData;
+    use crate::{
+        chainspec::{bsc_testnet, BscChainSpec},
+        consensus::parlia::{provider::EnhancedDbSnapshotProvider, VoteData},
+    };
     use alloy_consensus::Header;
     use alloy_primitives::b256;
     use core::ops::RangeBounds;

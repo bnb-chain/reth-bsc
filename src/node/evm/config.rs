@@ -3,13 +3,13 @@ use super::{
     factory::BscEvmFactory,
 };
 use crate::{
-    BscPrimitives,
     chainspec::BscChainSpec,
     consensus::{eip4844::next_block_excess_blob_gas_with_mendel, parlia::VoteAddress},
     evm::transaction::BscTxEnv,
     hardforks::{bsc::BscHardfork, BscHardforks},
     node::engine_api::validator::BscExecutionData,
     system_contracts::{feynman_fork::ValidatorElectionInfo, SystemContract},
+    BscPrimitives,
 };
 use alloy_consensus::{transaction::SignerRecoverable, BlockHeader, Header, TxReceipt};
 use alloy_eips::eip7840::BlobParams;
@@ -35,7 +35,13 @@ use revm::{
     primitives::hardfork::SpecId,
     Inspector,
 };
-use std::{borrow::Cow, cell::RefCell, convert::Infallible, rc::Rc, sync::{Arc, Mutex}};
+use std::{
+    borrow::Cow,
+    cell::RefCell,
+    convert::Infallible,
+    rc::Rc,
+    sync::{Arc, Mutex},
+};
 
 /// Shared sink type for transporting `(current_validators, vote_addresses)` from the builder to
 /// the payload/bid layer so that VALIDATOR_CACHE can be written after the definitive block hash
@@ -45,10 +51,10 @@ pub type ValidatorCacheSink = Arc<Mutex<Option<(Vec<Address>, Vec<VoteAddress>)>
 /// BSC wrapper around [`NextBlockEnvAttributes`].
 ///
 /// Extends the upstream attributes with TrieDB-specific context for the miner:
-/// - `parent_difflayers`: incremental trie diffs from the engine tree, used as input for
-///   the next state-root calculation via TrieDB.
-/// - `triedb_prefetcher`: a background trie-prefetch handle started before block execution
-///   so that trie nodes are warmed up by the time `finish()` computes the state root.
+/// - `parent_difflayers`: incremental trie diffs from the engine tree, used as input for the next
+///   state-root calculation via TrieDB.
+/// - `triedb_prefetcher`: a background trie-prefetch handle started before block execution so that
+///   trie nodes are warmed up by the time `finish()` computes the state root.
 ///
 /// The struct still satisfies upstream RPC trait bounds via a delegating [`BuildPendingEnv`]
 /// implementation, keeping reth's base attributes unchanged.
@@ -82,7 +88,8 @@ impl<H: BlockHeader> BuildPendingEnv<H> for BscNextBlockEnvAttributes {
 }
 
 /// Type alias for system transactions to reduce complexity
-type SystemTxs = Vec<reth_primitives_traits::Recovered<reth_primitives_traits::TxTy<crate::BscPrimitives>>>;
+type SystemTxs =
+    Vec<reth_primitives_traits::Recovered<reth_primitives_traits::TxTy<crate::BscPrimitives>>>;
 
 #[derive(Debug, Clone, Default)]
 pub struct BscExecutionSharedCtxInner {
@@ -105,9 +112,7 @@ pub struct BscExecutionSharedCtx {
 
 impl Default for BscExecutionSharedCtx {
     fn default() -> Self {
-        Self {
-            inner: Rc::new(RefCell::new(BscExecutionSharedCtxInner::default())),
-        }
+        Self { inner: Rc::new(RefCell::new(BscExecutionSharedCtxInner::default())) }
     }
 }
 
@@ -300,7 +305,11 @@ where
         if let Some(blob_params) = &blob_params {
             cfg_env.set_max_blobs_per_tx(blob_params.max_blobs_per_tx);
         }
-        if BscHardforks::is_osaka_active_at_timestamp(self.chain_spec(), header.number, header.timestamp) {
+        if BscHardforks::is_osaka_active_at_timestamp(
+            self.chain_spec(),
+            header.number,
+            header.timestamp,
+        ) {
             cfg_env.tx_gas_limit_cap = Some(MAX_TX_GAS_LIMIT_OSAKA);
         }
 
@@ -368,7 +377,11 @@ where
             BlobExcessGasAndPrice { excess_blob_gas, blob_gasprice }
         });
 
-        if BscHardforks::is_osaka_active_at_timestamp(self.chain_spec(), parent.number + 1, attributes.timestamp) {
+        if BscHardforks::is_osaka_active_at_timestamp(
+            self.chain_spec(),
+            parent.number + 1,
+            attributes.timestamp,
+        ) {
             cfg_env.tx_gas_limit_cap = Some(MAX_TX_GAS_LIMIT_OSAKA);
         }
 
@@ -441,7 +454,11 @@ where
         parent: &SealedHeader<HeaderTy<Self::Primitives>>,
         attributes: Self::NextBlockEnvCtx,
     ) -> Result<ExecutionCtxFor<'_, Self>, Self::Error> {
-        tracing::trace!("Try to create next block ctx for miner, next_block_numer={}, parent_hash={}", parent.number+1, parent.hash());
+        tracing::trace!(
+            "Try to create next block ctx for miner, next_block_numer={}, parent_hash={}",
+            parent.number + 1,
+            parent.hash()
+        );
         Ok(BscBlockExecutionCtx {
             base: EthBlockExecutionCtx {
                 tx_count_hint: None,
@@ -480,8 +497,8 @@ where
         let bsc_executor = BscBlockExecutor::new(
             evm,
             {
-                // Avoid cloning miner-only helpers into the executor context. The block builder keeps
-                // the full ctx and consumes these in `finish()`.
+                // Avoid cloning miner-only helpers into the executor context. The block builder
+                // keeps the full ctx and consumes these in `finish()`.
                 let mut exec_ctx = ctx.clone();
                 exec_ctx.parent_difflayers = None;
                 exec_ctx.triedb_prefetcher = None;
@@ -493,13 +510,7 @@ where
             SystemContract::new(self.executor_factory.spec().clone()),
         );
 
-        BscBlockBuilder::new(
-            bsc_executor,
-            ctx,
-            shared_ctx,
-            &self.block_assembler,
-            parent,
-        )
+        BscBlockBuilder::new(bsc_executor, ctx, shared_ctx, &self.block_assembler, parent)
     }
 }
 
@@ -507,7 +518,10 @@ impl ConfigureEngineEvm<BscExecutionData> for BscEvmConfig
 where
     Self: Send + Sync + Unpin + Clone + 'static,
 {
-    fn evm_env_for_payload(&self, payload: &BscExecutionData) -> Result<EvmEnv<BscHardfork>, Self::Error> {
+    fn evm_env_for_payload(
+        &self,
+        payload: &BscExecutionData,
+    ) -> Result<EvmEnv<BscHardfork>, Self::Error> {
         self.evm_env(&payload.block.header)
     }
 

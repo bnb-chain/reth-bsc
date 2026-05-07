@@ -1,6 +1,5 @@
 use alloy_primitives::Address;
-use jsonrpsee::core::RpcResult;
-use jsonrpsee::proc_macros::rpc;
+use jsonrpsee::{core::RpcResult, proc_macros::rpc};
 
 /// BSC Eth extension API - adds eth_coinbase and eth_health
 /// to match geth-bsc's EthereumAPI and BlockChainAPI.

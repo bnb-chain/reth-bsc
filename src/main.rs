@@ -5,15 +5,13 @@ use reth::{
     consensus::FullConsensus,
     version::{default_reth_version_metadata, try_init_version_metadata},
 };
-use reth_bsc::consensus::parlia::bls_signer;
-use reth_bsc::node::consensus::BscConsensus;
 use reth_bsc::{
     chainspec::{genesis_override, parser::BscChainSpecParser},
-    node::{evm::config::BscEvmConfig, BscNode},
+    consensus::parlia::bls_signer,
+    node::{consensus::BscConsensus, evm::config::BscEvmConfig, BscNode},
     BscPrimitives,
 };
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 // We use jemalloc for performance reasons
 #[cfg(all(feature = "jemalloc", unix))]
@@ -159,11 +157,11 @@ fn main() -> eyre::Result<()> {
                 return Err(e);
             }
 
-            if builder.config().rpc.ipcdisable {    
+            if builder.config().rpc.ipcdisable {
                 panic!("IPC is disabled, please enable it by setting --ipc.enable to true");
             }
             let ipc_path = builder.config().rpc.ipcpath.clone();
-            
+
             // Map CLI args into a global MiningConfig override before launching services
             {
                 use reth_bsc::node::miner::{config as mining_config, MiningConfig};
@@ -207,7 +205,7 @@ fn main() -> eyre::Result<()> {
                 } else {
                     None
                 };
-                
+
                 if let Some(gas_limit) = args.mining_gas_limit {
                     mining_config.gas_limit = Some(gas_limit);
                 }
@@ -323,13 +321,13 @@ fn main() -> eyre::Result<()> {
                     .unwrap_or_default();
                 let mut peer_ids_str = peers_from_env;
                 peer_ids_str.extend(args.proxyed_peer_ids.iter().cloned());
-                
+
                 let mut parsed_peer_ids = Vec::new();
                 for peer_id_str in peer_ids_str {
                     // Parse as 64-character hex PeerId (64 bytes total)
                     let peer_id_str = peer_id_str.trim();
                     if peer_id_str.is_empty() { continue; }
-                    
+
                     let hex = peer_id_str.strip_prefix("0x").unwrap_or(peer_id_str);
                     match alloy_primitives::hex::decode(hex) {
                         Ok(bytes) if bytes.len() == 64 => {
@@ -342,7 +340,7 @@ fn main() -> eyre::Result<()> {
                         Err(e) => tracing::warn!("Failed to parse proxyed peer ID '{}': {}", peer_id_str, e),
                     }
                 }
-                
+
                 if !parsed_peer_ids.is_empty() {
                     tracing::info!(target: "bsc::init", "Configured {} proxyed peer(s)", parsed_peer_ids.len());
                 }
@@ -362,14 +360,14 @@ fn main() -> eyre::Result<()> {
                     .extend_rpc_modules(move |ctx| {
                         tracing::info!("Start to register Parlia RPC API...");
                         use reth_bsc::rpc::parlia::{ParliaApiImpl, ParliaApiServer, DynSnapshotProvider};
-                        
+
                         let snapshot_provider = if let Some(provider) = reth_bsc::shared::get_snapshot_provider() {
                             provider.clone()
                         } else {
                             tracing::error!("Failed to register Parlia RPC due to can not get snapshot provider");
                             return Err(eyre::eyre!("Failed to get snapshot provider"));
                         };
-                        
+
                         let wrapped_provider = Arc::new(DynSnapshotProvider::new(snapshot_provider));
                         let parlia_api = ParliaApiImpl::new(wrapped_provider, ctx.provider().clone());
                         ctx.modules.merge_configured(parlia_api.into_rpc())?;
