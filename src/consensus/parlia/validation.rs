@@ -11,7 +11,7 @@ use reth_primitives_traits::GotExpected;
 use alloy_eips::eip4844::{DATA_GAS_PER_BLOB, MAX_DATA_GAS_PER_BLOCK_DENCUN};
 use crate::BscBlock;
 use reth_primitives_traits::Block;
-use std::time::SystemTime;
+use std::{sync::Arc, time::SystemTime};
 
 const MAX_RLP_BLOCK_SIZE_OSAKA: usize = 8 * 1024 * 1024;
 
@@ -51,11 +51,11 @@ pub fn validate_4844_header_of_bsc<ChainSpec: BscHardforks>(
 
     // BEP-657: After Mendel, non-eligible blocks must have blob_gas_used == 0
     if !is_blob_eligible_block(chain_spec, header.number, header.timestamp) && blob_gas_used != 0 {
-        return Err(ConsensusError::Other(format!(
+        return Err(ConsensusError::Other(Arc::new(std::io::Error::other(format!(
             "blob transactions not allowed in block {} (N % {} != 0)",
             header.number,
             crate::consensus::eip4844::BLOB_ELIGIBLE_BLOCK_INTERVAL
-        )));
+        )))));
     }
 
     if blob_gas_used > MAX_DATA_GAS_PER_BLOCK_DENCUN {
@@ -114,16 +114,16 @@ fn validate_mix_digest_for_parlia(
 ) -> Result<(), ConsensusError> {
     if !lorentz_active {
         if header.mix_hash != B256::ZERO {
-            return Err(ConsensusError::Other("non-zero mix digest".to_string()));
+            return Err(ConsensusError::Other(Arc::new(std::io::Error::other("non-zero mix digest"))));
         }
         return Ok(());
     }
 
     // In Lorentz+, mix digest carries the millisecond remainder. It must not overflow seconds.
     if calculate_millisecond_timestamp(header) / 1000 != header.timestamp {
-        return Err(ConsensusError::Other(
-            "invalid mix digest milliseconds component".to_string(),
-        ));
+        return Err(ConsensusError::Other(Arc::new(std::io::Error::other(
+            "invalid mix digest milliseconds component",
+        ))));
     }
     Ok(())
 }
@@ -172,7 +172,7 @@ impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 's
         validate_header_not_from_future(header, present_unix_seconds())?;
 
         // Check extra data
-        self.check_header_extra(header).map_err(|e| ConsensusError::Other(format!("Invalid header extra: {e}")))?;
+        self.check_header_extra(header).map_err(|e| ConsensusError::Other(Arc::new(std::io::Error::other(format!("Invalid header extra: {e}")))))?;
 
         // Ensure that the block with no uncles
         if header.ommers_hash != EMPTY_OMMER_ROOT_HASH {
@@ -268,9 +268,9 @@ impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 's
             if !is_blob_eligible_block(&*self.spec, block.number, block.timestamp)
                 && block.body().transactions().any(|tx| tx.is_eip4844())
             {
-                return Err(ConsensusError::Other(
-                    "blob transactions not allowed in this block".to_string(),
-                ));
+                return Err(ConsensusError::Other(Arc::new(std::io::Error::other(
+                    "blob transactions not allowed in this block",
+                ))));
             }
             // Check that the blob gas used in the header matches the sum of the blob gas used by
             // each blob tx

@@ -932,13 +932,13 @@ where
                 }
             }
 
-            self.gas_used += tx_gas_used;
+            self.gas_used += tx_gas_used.tx_gas_used();
             let tx_effective_gas_price = recovered_tx
                 .effective_tip_per_gas(base_fee)
                 .expect("fee is always valid; execution succeeded");
             self.gas_fee += (U256::from(tx_effective_gas_price) + U256::from(base_fee))
-                * U256::from(tx_gas_used);
-            self.system_balance += U256::from(tx_effective_gas_price) * U256::from(tx_gas_used);
+                * U256::from(tx_gas_used.tx_gas_used());
+            self.system_balance += U256::from(tx_effective_gas_price) * U256::from(tx_gas_used.tx_gas_used());
         }
 
         Ok(())
