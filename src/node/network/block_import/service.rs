@@ -221,6 +221,11 @@ where
                             tracing::warn!(target: "bsc::block_import", "Failed to update fork choice: {}", e);
                         } else {
                             tracing::debug!(target: "bsc::block_import", "Succeed to update fork choice for new payload: number = {:?}, hash = {:?}", header.number, block_hash);
+                            // Forkid is computed from the chain head's timestamp; without
+                            // this push the network keeps advertising the startup forkid
+                            // and remote peers reject the handshake as InvalidFork once
+                            // the local tip crosses any time-based hardfork.
+                            crate::shared::push_head_to_network(&forkchoice_engine.provider, &header);
                         }
                         Outcome { peer: peer_id, result: Ok(BlockValidation::ValidBlock { block }) }
                             .into()
@@ -429,6 +434,7 @@ where
                         "Failed to update fork choice for mined block"
                     );
                 } else {
+                    crate::shared::push_head_to_network(&forkchoice_engine.provider, &header_for_fcu);
                     tracing::debug!(
                         target: "bsc::block_import",
                         block_number = %header_for_fcu.number,

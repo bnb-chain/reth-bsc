@@ -421,6 +421,34 @@ pub fn get_network_handle() -> Option<NetworkHandle<BscNetworkPrimitives>> {
     NETWORK_HANDLE.get().cloned()
 }
 
+/// Push a new canonical head to the network's `ForkFilter` so the advertised
+/// forkid matches the chain's actual progression.
+///
+/// Reth's stock launcher only calls `update_status` on
+/// `CanonicalChainCommitted` engine events, which BSC's import path does not
+/// emit. Without this push the forkid stays frozen at startup, and remote
+/// peers reject our `eth/68` handshake with `InvalidFork` once the local tip
+/// crosses any time-based hardfork.
+pub fn push_head_to_network<P>(provider: &P, header: &Header)
+where
+    P: HeaderProvider<Header = Header>,
+{
+    let Some(handle) = get_network_handle() else { return };
+    let total_difficulty = provider
+        .header_td_by_number(header.number())
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let head = reth_ethereum_forks::Head {
+        number: header.number(),
+        hash: header.hash_slow(),
+        difficulty: header.difficulty(),
+        timestamp: header.timestamp(),
+        total_difficulty,
+    };
+    handle.update_status(head);
+}
+
 /// Set global payload events broadcast sender.
 pub fn set_payload_events_tx(
     tx: broadcast::Sender<Events<BscPayloadTypes>>,
