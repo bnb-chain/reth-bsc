@@ -11,7 +11,7 @@ use reth_ethereum_forks::ForkFilter;
 use std::{future::Future, pin::Pin};
 use tokio::time::{timeout, Duration};
 use tokio_stream::StreamExt;
-use tracing::debug;
+use tracing::{debug, warn};
 
 #[derive(Debug, Default)]
 /// The Binance Smart Chain (BSC) P2P handshake.
@@ -37,11 +37,34 @@ impl BscHandshake {
             tracing::debug!(target: "bsc_handshake", "Sending upgrade status message, EVN enabled: {}, disable tx broadcast forbidden: {}", evn_enabled, disable_tx_broadcast_forbidden);
             unauth.start_send_unpin(upgrade_msg.into_rlpx())?;
 
-            // Receive peer's upgrade status response
+            // Receive peer's upgrade status response.
+            //
+            // Diagnostic note: the three error branches below are the *only* ways the
+            // BSC-specific portion of the handshake can fail. The decoding-failure branch
+            // is the path that produces a `DisconnectReason::ProtocolBreach` and therefore
+            // increments the `reth_network_protocol_breach` metric — log enough context
+            // (raw bytes, msg len, eth version) to distinguish "non-BSC client" from
+            // "real wire corruption". `UnauthEth` doesn't currently expose peer_id /
+            // remote_addr at this layer (see TODO below); operators correlating with a
+            // specific peer should cross-reference `peer_dump.rs`'s
+            // `recent_disconnect reason=ProtocolBreach` line at the same timestamp.
             let their_msg = match unauth.next().await {
                 Some(Ok(msg)) => msg,
-                Some(Err(e)) => return Err(EthStreamError::from(e)),
+                Some(Err(e)) => {
+                    warn!(
+                        target: "bsc_handshake",
+                        eth_version = ?negotiated_status.version,
+                        error = %e,
+                        "BSC upgrade-status: wire error while reading peer's UpgradeStatus reply; aborting handshake (no ProtocolBreach disconnect emitted by us)"
+                    );
+                    return Err(EthStreamError::from(e));
+                }
                 None => {
+                    warn!(
+                        target: "bsc_handshake",
+                        eth_version = ?negotiated_status.version,
+                        "BSC upgrade-status: peer closed stream before sending UpgradeStatus reply; sending DisconnectRequested (NOT counted as ProtocolBreach)"
+                    );
                     unauth.disconnect(DisconnectReason::DisconnectRequested).await?;
                     return Err(EthStreamError::EthHandshakeError(EthHandshakeError::NoResponse));
                 }
@@ -49,7 +72,13 @@ impl BscHandshake {
 
             // Decode their response
             match UpgradeStatus::decode(&mut their_msg.as_ref()).map_err(|e| {
-                debug!("Decode error in BSC handshake: msg={their_msg:x}");
+                warn!(
+                    target: "bsc_handshake",
+                    eth_version = ?negotiated_status.version,
+                    msg_len = their_msg.len(),
+                    decode_error = %e,
+                    "BSC upgrade-status: failed to decode peer's UpgradeStatus reply (raw msg follows): msg={their_msg:x}"
+                );
                 EthStreamError::InvalidMessage(e.into())
             }) {
                 Ok(their_status) => {
@@ -62,7 +91,17 @@ impl BscHandshake {
                     return Ok(negotiated_status);
                 }
                 Err(e) => {
-                    tracing::trace!(target: "bsc_handshake", "bsc handshake: upgrade failed: {:?}", e);
+                    // This is the locally-emitted ProtocolBreach. If the metric jumps
+                    // and you see this line, the cause is a peer that does NOT speak the
+                    // BSC `UpgradeStatus` extension (vanilla geth / wrong fork client),
+                    // or a wire corruption that produced an undecodable message body.
+                    warn!(
+                        target: "bsc_handshake",
+                        eth_version = ?negotiated_status.version,
+                        msg_len = their_msg.len(),
+                        error = %e,
+                        "BSC upgrade-status: decode failed -> sending DisconnectReason::ProtocolBreach (origin of ProtocolBreach metric increment is HERE; common cause: peer is not a BSC client or doesn't implement UpgradeStatus)"
+                    );
                     unauth.disconnect(DisconnectReason::ProtocolBreach).await?;
                     return Err(EthStreamError::EthHandshakeError(
                         EthHandshakeError::NonStatusMessageInHandshake,
