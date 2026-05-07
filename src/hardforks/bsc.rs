@@ -380,4 +380,56 @@ mod tests {
             BscHardfork::Nano
         );
     }
+
+    /// Reth's `fork_id` (in `crates/chainspec/src/spec.rs`) deduplicates same
+    /// activation forks only against the immediately previous applied entry.
+    /// If the list isn't sorted by activation, two same-activation forks
+    /// separated by a third get counted as separate transitions and the CRC32
+    /// chain diverges from peers using the same logical chainspec — handshakes
+    /// then fail with `InvalidFork` even though both clients agree on the
+    /// chain. The chapel Tycho misordering hid here for months for exactly
+    /// this reason; keep the invariant under test.
+    #[test]
+    fn test_hardfork_activations_are_sorted() {
+        fn assert_sorted(label: &str, forks: ChainHardforks) {
+            let blocks: Vec<u64> = forks
+                .forks_iter()
+                .filter_map(|(_, cond)| match cond {
+                    ForkCondition::Block(b) => Some(b),
+                    ForkCondition::TTD { fork_block: Some(b), .. } => Some(b),
+                    _ => None,
+                })
+                .collect();
+            for w in blocks.windows(2) {
+                assert!(
+                    w[0] <= w[1],
+                    "{label}: block-based hardforks must be in non-decreasing order, \
+                     found {} appearing after {}",
+                    w[1],
+                    w[0],
+                );
+            }
+
+            let timestamps: Vec<u64> = forks
+                .forks_iter()
+                .filter_map(|(_, cond)| match cond {
+                    ForkCondition::Timestamp(t) => Some(t),
+                    _ => None,
+                })
+                .collect();
+            for w in timestamps.windows(2) {
+                assert!(
+                    w[0] <= w[1],
+                    "{label}: timestamp-based hardforks must be in non-decreasing order, \
+                     found {} appearing after {}",
+                    w[1],
+                    w[0],
+                );
+            }
+        }
+
+        assert_sorted("mainnet", BscHardfork::bsc_mainnet());
+        assert_sorted("testnet", BscHardfork::bsc_testnet());
+        assert_sorted("qanet", BscHardfork::bsc_qanet());
+    }
 }
