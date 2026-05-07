@@ -500,6 +500,32 @@ where
             tracing::trace!(target: "bsc::block_import", "Block already queued when receiving new block: number = {:?}, hash = {:?}", block.block.0.block.header.number, block.hash);
             return;
         }
+
+        let local_tip =
+            self.forkchoice_engine.provider.best_block_number().unwrap_or(0);
+        let block_number = block.block.0.block.header.number;
+        let delta = block_number.saturating_sub(local_tip);
+        if delta > PIPELINE_TRIGGER_DELTA {
+            tracing::info!(
+                target: "bsc::block_import",
+                block_hash = %block.hash,
+                block_number,
+                local_tip,
+                delta,
+                peer = %peer_id,
+                "NewBlock far ahead of local tip; routing to pipeline instead of fork_recover"
+            );
+            self.processed_blocks.insert(block.hash);
+            self.spawn_pipeline_trigger_fcu(
+                peer_id,
+                block.hash,
+                block_number,
+                local_tip,
+                delta,
+            );
+            return;
+        }
+
         self.queued_blocks.insert(block.hash);
 
         // Record chain delay metrics: time from block creation to first network reception

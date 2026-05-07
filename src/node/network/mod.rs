@@ -395,7 +395,18 @@ where
         if crate::shared::set_local_peer_id(*local_peer_id).is_err() {
             warn!(target: "reth::cli", "Failed to set global local peer ID - already set");
         } else {
-            info!(target: "reth::cli", peer_id=%local_peer_id, "Local peer ID set globally");
+            let node_id = alloy_primitives::keccak256(local_peer_id);
+            let node_id_short = format!(
+                "{:016x}",
+                u64::from_be_bytes(node_id.0[..8].try_into().expect("8 bytes"))
+            );
+            info!(
+                target: "reth::cli",
+                peer_id = %local_peer_id,
+                node_id = %node_id,
+                node_id_short = %node_id_short,
+                "Local peer ID set globally (node_id = keccak256(peer_id); use node_id or node_id_short to grep BSC geth logs)"
+            );
         }
 
         if let Err(_h) = crate::shared::set_network_handle(handle.clone()) {
