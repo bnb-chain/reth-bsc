@@ -741,8 +741,8 @@ where
             let miner_fee = tx
                 .effective_tip_per_gas(base_fee)
                 .expect("fee is always valid; execution succeeded");
-            total_fees += U256::from(miner_fee) * U256::from(gas_used);
-            cumulative_gas_used += gas_used;
+            total_fees += U256::from(miner_fee) * U256::from(gas_used.tx_gas_used());
+            cumulative_gas_used += gas_used.tx_gas_used();
 
             let tx_duration = tx_start.elapsed();
             if tx_duration.as_micros() > 3000 {

@@ -41,7 +41,7 @@ fn turn_length_matches(turn_length_from_header: Option<u8>, expected_turn_length
 impl<'a, EVM, Spec, R: ReceiptBuilder> BscBlockExecutor<'a, EVM, Spec, R>
 where
     EVM: Evm<
-        DB: alloy_evm::block::StateDB + 'a,
+        DB: alloy_evm::block::StateDB,
         Tx: FromRecoveredTx<R::Transaction>
                 + FromRecoveredTx<TransactionSigned>
                 + FromTxWithEncoded<TransactionSigned>,

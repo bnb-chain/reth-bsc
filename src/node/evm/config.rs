@@ -1,5 +1,6 @@
 use super::{
-    assembler::BscBlockAssembler, builder::BscBlockBuilder, executor::BscBlockExecutor,
+    assembler::BscBlockAssembler, builder::BscBlockBuilder,
+    executor::{BscBlockExecutor, BscTxResult},
     factory::BscEvmFactory,
 };
 use crate::{
@@ -230,23 +231,25 @@ where
     BscTxEnv: IntoTxEnv<<EvmF as EvmFactory>::Tx>,
 {
     type EvmFactory = EvmF;
+    type TxExecutionResult = BscTxResult<<EvmF as EvmFactory>::HaltReason>;
     type ExecutionCtx<'a> = BscBlockExecutionCtx<'a>;
     type Transaction = TransactionSigned;
     type Receipt = R::Receipt;
+    type Executor<'a, DB: alloy_evm::block::StateDB, I: Inspector<<Self::EvmFactory as EvmFactory>::Context<DB>>> =
+        BscBlockExecutor<'a, <EvmF as EvmFactory>::Evm<DB, I>, Spec, R>;
 
     fn evm_factory(&self) -> &Self::EvmFactory {
         &self.evm_factory
     }
 
-    #[allow(refining_impl_trait)]
     fn create_executor<'a, DB, I>(
         &'a self,
         evm: <Self::EvmFactory as EvmFactory>::Evm<DB, I>,
         ctx: Self::ExecutionCtx<'a>,
-    ) -> BscBlockExecutor<'a, <Self::EvmFactory as EvmFactory>::Evm<DB, I>, Spec, R>
+    ) -> Self::Executor<'a, DB, I>
     where
-        DB: alloy_evm::block::StateDB + 'a,
-        I: Inspector<<Self::EvmFactory as EvmFactory>::Context<DB>> + 'a,
+        DB: alloy_evm::block::StateDB,
+        I: Inspector<<Self::EvmFactory as EvmFactory>::Context<DB>>,
     {
         BscBlockExecutor::new(
             evm,
@@ -474,7 +477,7 @@ where
         ctx: <Self::BlockExecutorFactory as BlockExecutorFactory>::ExecutionCtx<'a>,
     ) -> impl BlockBuilder<
         Primitives = Self::Primitives,
-        Executor: BlockExecutorFor<'a, Self::BlockExecutorFactory, &'a mut State<DB>, I>,
+        Executor = BlockExecutorFor<'a, Self::BlockExecutorFactory, &'a mut State<DB>, I>,
     >
     where
         DB: Database,

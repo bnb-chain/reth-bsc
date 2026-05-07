@@ -10,7 +10,7 @@ use crate::{
     BscPrimitives,
 };
 use alloy_consensus::BlockHeader as _;
-use alloy_evm::block::BlockExecutor;
+use alloy_evm::block::{BlockExecutor, GasOutput};
 use alloy_evm::eth::receipt_builder::ReceiptBuilder;
 use alloy_primitives::BlockHash;
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
@@ -95,13 +95,13 @@ where
         &mut self,
         tx: impl ExecutorTx<Self::Executor>,
         f: impl FnOnce(&<Self::Executor as alloy_evm::block::BlockExecutor>::Result) -> alloy_evm::block::CommitChanges,
-    ) -> Result<Option<u64>, BlockExecutionError> {
+    ) -> Result<Option<GasOutput>, BlockExecutionError> {
         let (tx_env, recovered) = tx.into_parts();
         if let Some(gas_output) =
             self.executor.execute_transaction_with_commit_condition((tx_env, &recovered), f)?
         {
             self.transactions.push(recovered);
-            Ok(Some(gas_output.tx_gas_used()))
+            Ok(Some(gas_output))
         } else {
             Ok(None)
         }

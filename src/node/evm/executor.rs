@@ -56,7 +56,7 @@ pub struct BscTxResult<H> {
     pub is_system: bool,
 }
 
-impl<H> TxResult for BscTxResult<H> {
+impl<H: Send + 'static> TxResult for BscTxResult<H> {
     type HaltReason = H;
 
     fn result(&self) -> &ResultAndState<H> {
@@ -124,12 +124,14 @@ where
     pub(super) executor_metrics: BscExecutorMetrics,
     /// Rewards metrics for tracking reward distributions.
     pub(super) rewards_metrics: BscRewardsMetrics,
+    /// Deferred error from commit_transaction (e.g. hertz patch), returned from finish().
+    pub(super) deferred_error: Option<BlockExecutionError>,
 }
 
 impl<'a, EVM, Spec, R: ReceiptBuilder> BscBlockExecutor<'a, EVM, Spec, R>
 where
     EVM: Evm<
-        DB: alloy_evm::block::StateDB + 'a,
+        DB: alloy_evm::block::StateDB,
         Tx: FromRecoveredTx<R::Transaction>
                 + FromRecoveredTx<TransactionSigned>
                 + FromTxWithEncoded<TransactionSigned>,
@@ -199,6 +201,7 @@ where
             vote_metrics: BscVoteMetrics::default(),
             executor_metrics: BscExecutorMetrics::default(),
             rewards_metrics: BscRewardsMetrics::default(),
+            deferred_error: None,
         }
     }
 
@@ -385,7 +388,7 @@ where
 impl<'a, E, Spec, R> BlockExecutor for BscBlockExecutor<'a, E, Spec, R>
 where
     E: Evm<
-        DB: alloy_evm::block::StateDB + 'a,
+        DB: alloy_evm::block::StateDB,
         Tx: FromRecoveredTx<R::Transaction>
                 + FromRecoveredTx<TransactionSigned>
                 + FromTxWithEncoded<TransactionSigned>,
@@ -549,9 +552,9 @@ where
     fn commit_transaction(
         &mut self,
         output: BscTxResult<E::HaltReason>,
-    ) -> Result<GasOutput, BlockExecutionError> {
+    ) -> GasOutput {
         if output.is_system {
-            return Ok(GasOutput::new(0));
+            return GasOutput::new(0);
         }
 
         let ResultAndState { result, state } = output.inner;
@@ -576,16 +579,22 @@ where
         self.evm.db_mut().commit(state);
 
         // Apply hertz patch after tx (validation only, not mining).
+        // commit_transaction cannot return errors in the new API, so defer any error to finish().
         if !self.ctx.is_miner {
-            self.hertz_patch_manager.patch_after_tx(&output.tx, self.evm.db_mut())?;
+            if let Err(e) = self.hertz_patch_manager.patch_after_tx(&output.tx, self.evm.db_mut()) {
+                self.deferred_error = Some(e);
+            }
         }
 
-        Ok(GasOutput::new(gas_used))
+        GasOutput::new(gas_used)
     }
 
     fn finish(
         mut self,
     ) -> Result<(Self::Evm, BlockExecutionResult<R::Receipt>), BlockExecutionError> {
+        if let Some(err) = self.deferred_error.take() {
+            return Err(err);
+        }
         let block_env = self.evm.block().clone();
         debug!(
             target: "bsc::executor",

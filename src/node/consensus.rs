@@ -86,10 +86,10 @@ fn validate_bsc_gas_limit_against_parent<ChainSpec: BscHardforks>(
 ) -> Result<(), ConsensusError> {
     // Keep parity with go-bsc's Parlia checks.
     if header.gas_limit > GAS_LIMIT_CAPACITY {
-        return Err(ConsensusError::Other(format!(
+        return Err(ConsensusError::Other(Arc::new(std::io::Error::other(format!(
             "invalid gasLimit: have {}, max {}",
             header.gas_limit, GAS_LIMIT_CAPACITY
-        )));
+        )))));
     }
 
     if header.gas_used > header.gas_limit {
@@ -109,12 +109,12 @@ fn validate_bsc_gas_limit_against_parent<ChainSpec: BscHardforks>(
     let limit = parent.gas_limit / bound_divisor;
 
     if diff >= limit || header.gas_limit < MINIMUM_GAS_LIMIT {
-        return Err(ConsensusError::Other(format!(
+        return Err(ConsensusError::Other(Arc::new(std::io::Error::other(format!(
             "invalid gas limit: have {}, want {} += {}",
             header.gas_limit,
             parent.gas_limit,
             limit.saturating_sub(1)
-        )));
+        )))));
     }
 
     Ok(())
