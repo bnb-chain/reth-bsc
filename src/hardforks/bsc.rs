@@ -155,10 +155,16 @@ impl BscHardfork {
             (Self::FeynmanFix.boxed(), ForkCondition::Timestamp(1711342800)),
             (EthereumHardfork::Cancun.boxed(), ForkCondition::Timestamp(1713330442)),
             (Self::Cancun.boxed(), ForkCondition::Timestamp(1713330442)),
+            // Tycho on chapel shares its activation timestamp with Cancun. It must sit next to
+            // the other 1713330442 entries so reth's `fork_id` deduplication (which only checks
+            // the immediately previous timestamp) folds it into the same fork point. Placing it
+            // after Bohr made it count as an extra fork in the CRC32 chain, producing a forkid
+            // that disagreed with bsc-geth and broke handshakes with the rest of the chapel
+            // network.
+            (Self::Tycho.boxed(), ForkCondition::Timestamp(1713330442)), /* 2024-04-17 05:07:22 AM UTC - Tycho testnet */
             (Self::Haber.boxed(), ForkCondition::Timestamp(1716962820)),
             (Self::HaberFix.boxed(), ForkCondition::Timestamp(1719986788)),
             (Self::Bohr.boxed(), ForkCondition::Timestamp(1724116996)),
-            (Self::Tycho.boxed(), ForkCondition::Timestamp(1713330442)), /* 2024-04-17 05:07:22 AM UTC - Tycho testnet */
             (EthereumHardfork::Prague.boxed(), ForkCondition::Timestamp(1740452880)),
             (Self::Pascal.boxed(), ForkCondition::Timestamp(1740452880)),
             (Self::Lorentz.boxed(), ForkCondition::Timestamp(1744097580)),
