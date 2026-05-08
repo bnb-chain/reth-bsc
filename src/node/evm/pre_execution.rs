@@ -11,14 +11,14 @@ use revm::{
     primitives::{Address, Bytes, TxKind, U256},
 };
 use alloy_consensus::{TxReceipt, Header, BlockHeader};
-use alloy_primitives::{BlockHash, BlockNumber, B256};
-use crate::consensus::parlia::{VoteAddress, Snapshot, DIFF_INTURN, DIFF_NOTURN};
+use alloy_primitives::{BlockHash, BlockNumber, B256, keccak256};
+use crate::consensus::parlia::{VoteAddress, VoteAttestation, Snapshot, DIFF_INTURN, DIFF_NOTURN};
 use crate::consensus::parlia::util::{is_breathe_block, debug_header};
 use crate::consensus::parlia::vote::MAX_ATTESTATION_EXTRA_LENGTH;
 use crate::node::evm::error::{BscBlockExecutionError, BscBlockValidationError};
 use crate::node::evm::util::HEADER_CACHE_READER;
 use crate::system_contracts::feynman_fork::ValidatorElectionInfo;
-use std::{collections::HashMap, sync::{LazyLock, Mutex}};
+use std::{collections::HashMap, sync::{Arc, LazyLock, Mutex}};
 use schnellru::{ByLength, LruMap};
 use reth_primitives::GotExpected;
 use blst::{
@@ -32,6 +32,12 @@ const BLST_DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
 
 type ValidatorCache = LruMap<BlockHash, (Vec<Address>, Vec<VoteAddress>), ByLength>;
 type TurnLengthCache = LruMap<BlockHash, u8, ByLength>;
+type AttestationCache = LruMap<B256, (), ByLength>;
+type SnapshotFingerprintCache = LruMap<BlockHash, B256, ByLength>;
+type BlsPublicKeyCache = LruMap<VoteAddress, Arc<PublicKey>, ByLength>;
+
+const DEFAULT_FINGERPRINT_CACHE_SIZE: u32 = 4096;
+const DEFAULT_BLS_PUBKEY_CACHE_SIZE: u32 = 256;
 
 pub static VALIDATOR_CACHE: LazyLock<Mutex<ValidatorCache>> = LazyLock::new(|| {
     Mutex::new(LruMap::new(ByLength::new(1024)))
@@ -40,6 +46,71 @@ pub static VALIDATOR_CACHE: LazyLock<Mutex<ValidatorCache>> = LazyLock::new(|| {
 pub static TURN_LENGTH_CACHE: LazyLock<Mutex<TurnLengthCache>> = LazyLock::new(|| {
     Mutex::new(LruMap::new(ByLength::new(1024)))
 });
+
+static ATTESTATION_VERIFY_CACHE: LazyLock<Mutex<AttestationCache>> = LazyLock::new(|| {
+    Mutex::new(LruMap::new(ByLength::new(1024)))
+});
+
+static SNAPSHOT_FINGERPRINT_CACHE: LazyLock<Mutex<SnapshotFingerprintCache>> =
+    LazyLock::new(|| Mutex::new(LruMap::new(ByLength::new(DEFAULT_FINGERPRINT_CACHE_SIZE))));
+
+static BLS_PUBKEY_CACHE: LazyLock<Mutex<BlsPublicKeyCache>> =
+    LazyLock::new(|| Mutex::new(LruMap::new(ByLength::new(DEFAULT_BLS_PUBKEY_CACHE_SIZE))));
+
+#[cfg(test)]
+fn reset_attestation_caches() {
+    ATTESTATION_VERIFY_CACHE.lock().unwrap().clear();
+    SNAPSHOT_FINGERPRINT_CACHE.lock().unwrap().clear();
+    BLS_PUBKEY_CACHE.lock().unwrap().clear();
+}
+
+fn snapshot_fingerprint(snap: &Snapshot) -> B256 {
+    {
+        let mut cache = SNAPSHOT_FINGERPRINT_CACHE.lock().unwrap();
+        if let Some(fingerprint) = cache.get(&snap.block_hash) {
+            return *fingerprint;
+        }
+    }
+
+    // Each entry contributes an address (20 bytes) and vote address (48 bytes).
+    let mut buf = Vec::with_capacity(snap.validators.len() * 68);
+    for validator in &snap.validators {
+        buf.extend_from_slice(validator.as_slice());
+        let vote_addr = snap
+            .validators_map
+            .get(validator)
+            .map(|info| info.vote_addr)
+            .unwrap_or_default();
+        buf.extend_from_slice(vote_addr.as_slice());
+    }
+    let fingerprint = keccak256(&buf);
+
+    SNAPSHOT_FINGERPRINT_CACHE.lock().unwrap().insert(snap.block_hash, fingerprint);
+    fingerprint
+}
+
+fn attestation_cache_key(snapshot_fingerprint: B256, attestation: &VoteAttestation) -> B256 {
+    let mut buf = Vec::with_capacity(32 + 8 + 96 + 32);
+    buf.extend_from_slice(snapshot_fingerprint.as_slice());
+    buf.extend_from_slice(&attestation.vote_address_set.to_be_bytes());
+    buf.extend_from_slice(attestation.agg_signature.as_slice());
+    buf.extend_from_slice(attestation.data.hash().as_slice());
+    keccak256(&buf)
+}
+
+fn cached_public_key(vote_addr: &VoteAddress) -> Result<Arc<PublicKey>, BscBlockExecutionError> {
+    let mut cache = BLS_PUBKEY_CACHE.lock().unwrap();
+    if let Some(existing) = cache.get(vote_addr) {
+        return Ok(Arc::clone(existing));
+    }
+
+    let pk = PublicKey::from_bytes(vote_addr.as_slice()).map_err(|_| {
+        BscBlockExecutionError::Validation(BscBlockValidationError::InvalidAttestationSignature)
+    })?;
+    let arc = Arc::new(pk);
+    cache.insert(*vote_addr, Arc::clone(&arc));
+    Ok(arc)
+}
 
 impl<'a, DB, EVM, Spec, R: ReceiptBuilder> BscBlockExecutor<'a, EVM, Spec, R>
 where
@@ -382,7 +453,27 @@ where
                     })
                 ).into());
             }
-             
+
+            // check if voted validator count satisfied 2/3 + 1
+            let at_least_votes = (validators_count * 2).div_ceil(3); // ceil division
+            if bit_set_count < at_least_votes {
+                return Err(BscBlockExecutionError::Validation(
+                    BscBlockValidationError::InvalidAttestationVoteCount(GotExpected {
+                        got: bit_set_count as u64,
+                        expected: at_least_votes as u64,
+                    })
+                ).into());
+            }
+
+            let snapshot_fp = snapshot_fingerprint(&pre_snap);
+            let attestation_cache_key = attestation_cache_key(snapshot_fp, &attestation);
+            {
+                let mut cache = ATTESTATION_VERIFY_CACHE.lock().unwrap();
+                if cache.get(&attestation_cache_key).is_some() {
+                    return Ok(());
+                }
+            }
+
             let mut vote_addrs: Vec<VoteAddress> = Vec::with_capacity(bit_set_count);
             for (i, val) in pre_snap.validators.iter().enumerate() {
                 if !vote_bit_set.contains(i) {
@@ -396,32 +487,15 @@ where
                 vote_addrs.push(val_info.vote_addr);
             }
 
-            // check if voted validator count satisfied 2/3 + 1
-            let at_least_votes = (validators_count * 2).div_ceil(3); // ceil division
-            if vote_addrs.len() < at_least_votes {
-                return Err(BscBlockExecutionError::Validation(
-                    BscBlockValidationError::InvalidAttestationVoteCount(GotExpected {
-                        got: vote_addrs.len() as u64,
-                        expected: at_least_votes as u64,
-                    })
-                ).into());
-            }
- 
             // check bls aggregate sig
-            let mut pubkeys: Vec<PublicKey> = Vec::with_capacity(vote_addrs.len());
+            let mut pubkeys: Vec<Arc<PublicKey>> = Vec::with_capacity(vote_addrs.len());
             for addr in &vote_addrs {
-                match PublicKey::from_bytes(addr.as_slice()) {
-                    Ok(pk) => pubkeys.push(pk),
-                    Err(_) => {
-                        return Err(
-                            BscBlockExecutionError::Validation(
-                                BscBlockValidationError::InvalidAttestationSignature
-                            ).into()
-                        );
-                    }
-                }
+                pubkeys.push(
+                    cached_public_key(addr)
+                        .map_err(BlockExecutionError::from)?
+                );
             }
-            let vote_addrs_ref: Vec<&PublicKey> = pubkeys.iter().collect();
+            let vote_addrs_ref: Vec<&PublicKey> = pubkeys.iter().map(|pk| pk.as_ref()).collect();
  
             let sig = Signature::from_bytes(&attestation.agg_signature[..]).map_err(|_| {
                 BscBlockExecutionError::Validation(BscBlockValidationError::InvalidAttestationSignature)
@@ -442,7 +516,10 @@ where
             self.vote_metrics.bls_verification_duration_seconds.record(start.elapsed().as_secs_f64());
  
             return match err {
-                BLST_ERROR::BLST_SUCCESS => Ok(()),
+                BLST_ERROR::BLST_SUCCESS => {
+                    ATTESTATION_VERIFY_CACHE.lock().unwrap().insert(attestation_cache_key, ());
+                    Ok(())
+                },
                 _ => {
                     // Update BLS verification failure metric (kept here as it's a specific metric)
                     self.vote_metrics.bls_verification_failures_total.increment(1);
@@ -600,5 +677,93 @@ where
             self.inner_ctx.validators_election_info = Some(validator_election_info);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::consensus::parlia::snapshot::ValidatorInfo;
+    use crate::consensus::parlia::vote::{VoteAttestation, VoteData, VoteSignature};
+    use alloy_primitives::{Address, U256};
+    use blst::min_pk::SecretKey;
+    use bytes::Bytes;
+
+    fn b256_from_u64(value: u64) -> B256 {
+        U256::from(value).into()
+    }
+
+    fn build_snapshot(block_hash: u64, vote_addr_seed: u8) -> Snapshot {
+        let mut addr_bytes = [0u8; 20];
+        addr_bytes[12..].copy_from_slice(&0xdeadbeefu64.to_be_bytes());
+        let validator = Address::from(addr_bytes);
+        let mut snapshot = Snapshot {
+            block_hash: b256_from_u64(block_hash),
+            block_number: block_hash,
+            validators: vec![validator],
+            ..Snapshot::default()
+        };
+        snapshot.validators_map.insert(
+            validator,
+            ValidatorInfo { index: 1, vote_addr: VoteAddress::from([vote_addr_seed; 48]) },
+        );
+        snapshot
+    }
+
+    #[test]
+    fn snapshot_fingerprint_cached_per_block_hash() {
+        reset_attestation_caches();
+
+        let snap = build_snapshot(1, 1);
+        let fp1 = snapshot_fingerprint(&snap);
+        {
+            let cache = SNAPSHOT_FINGERPRINT_CACHE.lock().unwrap();
+            assert_eq!(cache.len(), 1);
+            assert_eq!(cache.peek(&snap.block_hash), Some(&fp1));
+        }
+
+        let fp2 = snapshot_fingerprint(&snap);
+        assert_eq!(fp1, fp2);
+        assert_eq!(SNAPSHOT_FINGERPRINT_CACHE.lock().unwrap().len(), 1);
+
+        let snap2 = build_snapshot(2, 2);
+        let _fp3 = snapshot_fingerprint(&snap2);
+        assert_eq!(SNAPSHOT_FINGERPRINT_CACHE.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn cached_public_key_reuses_arc() {
+        reset_attestation_caches();
+        let secret_key = SecretKey::key_gen(&[1u8; 32], &[]).expect("static seed yields key");
+        let vote_addr = VoteAddress::from(secret_key.sk_to_pk().to_bytes());
+        let pk1 = cached_public_key(&vote_addr).unwrap();
+        let pk2 = cached_public_key(&vote_addr).unwrap();
+        assert!(Arc::ptr_eq(&pk1, &pk2));
+    }
+
+    #[test]
+    fn attestation_cache_key_changes_on_input() {
+        let mut attestation = VoteAttestation {
+            vote_address_set: 0b11,
+            agg_signature: VoteSignature::from([9u8; 96]),
+            data: VoteData {
+                source_number: 1,
+                source_hash: b256_from_u64(1),
+                target_number: 2,
+                target_hash: b256_from_u64(2),
+            },
+            extra: Bytes::new(),
+        };
+
+        let fp1 = b256_from_u64(10);
+        let fp2 = b256_from_u64(11);
+
+        let key1 = attestation_cache_key(fp1, &attestation);
+        let key2 = attestation_cache_key(fp2, &attestation);
+        assert_ne!(key1, key2, "snapshot fingerprint participates in the key");
+
+        attestation.vote_address_set = 0b01;
+        let key3 = attestation_cache_key(fp1, &attestation);
+        assert_ne!(key1, key3, "vote bitset participates in the key");
     }
 }
