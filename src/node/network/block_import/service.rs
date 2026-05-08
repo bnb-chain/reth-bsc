@@ -291,6 +291,16 @@ where
                         let recovering = recovering_heads.clone();
                         let peer = resolve_bsc_peer_static(peer_id);
                         let failed_heads = failed_heads.clone();
+                        // Parent-start to dodge the broadcast-before-commit
+                        // race; see `RecoverTarget::from_parent`.
+                        let recover_target =
+                            crate::node::network::block_import::fork_recover::RecoverTarget::from_parent(
+                                header.parent_hash,
+                                block_number.saturating_sub(1),
+                                block_hash,
+                                block_number,
+                                header.clone(),
+                            );
                         tokio::spawn(async move {
                             let _guard = crate::node::network::block_import::fork_recover::RecoveringHeadGuard::new(
                                 block_hash, recovering,
@@ -303,8 +313,7 @@ where
                             if let Err(err) =
                                 crate::node::network::block_import::fork_recover::recover_ancestors(
                                     target,
-                                    block_hash,
-                                    block_number,
+                                    recover_target,
                                     provider,
                                     engine_clone,
                                     forkchoice_engine_clone,
@@ -644,11 +653,16 @@ where
                     );
                     return;
                 };
+                // Header-only path: no parent_hash, so fetch and FCU collapse
+                // to the same hash. See `RecoverTarget::single_pair`.
+                let recover_target =
+                    crate::node::network::block_import::fork_recover::RecoverTarget::single_pair(
+                        head_hash, head_num,
+                    );
                 if let Err(err) =
                     crate::node::network::block_import::fork_recover::recover_ancestors(
                         target,
-                        head_hash,
-                        head_num,
+                        recover_target,
                         provider,
                         engine,
                         forkchoice_engine,
