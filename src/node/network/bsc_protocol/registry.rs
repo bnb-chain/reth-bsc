@@ -20,8 +20,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::time::timeout;
 
-/// Global registry of active BSC protocol senders per peer.
-static REGISTRY: Lazy<RwLock<HashMap<PeerId, UnboundedSender<BscCommand>>>> =
+/// Per-peer entry in [`REGISTRY`]. Tracks the negotiated `bsc/n` version so
+/// callers can avoid sending v2-only messages (e.g. `GetBlocksByRange`) to a
+/// peer that only speaks `bsc/1`.
+struct PeerEntry {
+    tx: UnboundedSender<BscCommand>,
+    /// Negotiated bsc subprotocol version (1 or 2).
+    version: u8,
+}
+
+/// Global registry of active BSC protocol peers.
+static REGISTRY: Lazy<RwLock<HashMap<PeerId, PeerEntry>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 
 /// Optional background task handle for EVN post-sync peer refresh.
@@ -32,14 +41,16 @@ static EVN_REFRESH_TASK: Lazy<RwLock<Option<JoinHandle<()>>>> = Lazy::new(|| RwL
 static PROXYED_PEER_IDS_MAP: Lazy<RwLock<HashSet<PeerId>>> =
     Lazy::new(|| RwLock::new(HashSet::new()));
 
-/// Register a new peer's sender channel.
-pub fn register_peer(peer: PeerId, tx: UnboundedSender<BscCommand>) {
+/// Register a new peer's sender channel along with its negotiated bsc/n
+/// version (1 or 2). Re-registering the same `peer` overwrites the previous
+/// entry — used by reconnects that may negotiate a different version.
+pub fn register_peer(peer: PeerId, tx: UnboundedSender<BscCommand>, version: u8) {
     let tx_for_sync = tx.clone();
     let mut inserted = false;
     let guard = REGISTRY.write();
     match guard {
         Ok(mut g) => {
-            g.insert(peer, tx);
+            g.insert(peer, PeerEntry { tx, version });
             inserted = true;
         }
         Err(e) => {
@@ -67,7 +78,10 @@ fn sync_pending_votes_to_peer(peer: PeerId, tx: UnboundedSender<BscCommand>) {
     }
 }
 
-/// Snapshot the currently registered BSC protocol peers
+/// Snapshot the currently registered BSC protocol peers, regardless of bsc/n
+/// version. Kept for non-`GetBlocksByRange` use cases (any future caller that
+/// needs to iterate v1+v2 peers); current callers prefer [`list_v2_peers`].
+#[allow(dead_code)]
 pub fn list_registered_peers() -> Vec<PeerId> {
     match REGISTRY.read() {
         Ok(guard) => guard.keys().copied().collect(),
@@ -75,11 +89,32 @@ pub fn list_registered_peers() -> Vec<PeerId> {
     }
 }
 
-/// Returns true if the given peer is registered with the BSC subprotocol
+/// Returns true if the given peer is registered with the BSC subprotocol,
+/// regardless of bsc/n version. Use [`is_v2_peer`] to gate `GetBlocksByRange`.
+#[allow(dead_code)]
 pub fn has_registered_peer(peer: PeerId) -> bool {
     match REGISTRY.read() {
         Ok(guard) => guard.contains_key(&peer),
         Err(_) => false,
+    }
+}
+
+/// Returns true if `peer` negotiated bsc/2 — required for `GetBlocksByRange`.
+pub fn is_v2_peer(peer: PeerId) -> bool {
+    match REGISTRY.read() {
+        Ok(guard) => guard.get(&peer).is_some_and(|e| e.version >= 2),
+        Err(_) => false,
+    }
+}
+
+/// Snapshot of peers that negotiated bsc/2 (i.e. support `GetBlocksByRange`).
+pub fn list_v2_peers() -> Vec<PeerId> {
+    match REGISTRY.read() {
+        Ok(guard) => guard
+            .iter()
+            .filter_map(|(p, e)| (e.version >= 2).then_some(*p))
+            .collect(),
+        Err(_) => Vec::new(),
     }
 }
 
@@ -121,6 +156,11 @@ pub fn is_proxyed_peer(peer_id: &PeerId) -> bool {
 static REQ_COUNTER: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(1));
 
 /// Request blocks by range from a specific peer. Returns response or timeout error.
+///
+/// Defensive: rejects peers that did not negotiate bsc/2. `GetBlocksByRange`
+/// (msg 0x02) is unknown to bsc/1 peers — sending it gets us kicked with
+/// `SubprotocolSpecific`. Callers should normally pick from [`list_v2_peers`];
+/// this guard catches any bypass.
 pub async fn request_blocks_by_range(
     peer: PeerId,
     start_height: u64,
@@ -135,7 +175,11 @@ pub async fn request_blocks_by_range(
     let tx = {
         let guard = REGISTRY.read();
         match guard {
-            Ok(g) => g.get(&peer).cloned(),
+            Ok(g) => match g.get(&peer) {
+                Some(entry) if entry.version >= 2 => Some(entry.tx.clone()),
+                Some(_) => return Err("peer does not support bsc/2 GetBlocksByRange".to_string()),
+                None => None,
+            },
             Err(_) => None,
         }
     }
@@ -167,7 +211,7 @@ pub fn broadcast_votes(votes: Vec<crate::consensus::parlia::vote::VoteEnvelope>)
         let votes_arc = Arc::new(votes);
         // Snapshot registry to avoid holding lock during await
         let reg_snapshot: Vec<(PeerId, UnboundedSender<BscCommand>)> = match REGISTRY.read() {
-            Ok(guard) => guard.iter().map(|(p, tx)| (*p, tx.clone())).collect(),
+            Ok(guard) => guard.iter().map(|(p, e)| (*p, e.tx.clone())).collect(),
             Err(e) => {
                 tracing::error!(target: "bsc::registry", error=%e, "Registry lock poisoned (broadcast snapshot)");
                 return;
@@ -381,10 +425,26 @@ pub(crate) fn plan_failover_peers(
     out
 }
 
-/// Like [`request_blocks_by_range`], but rotates through other registered BSC
-/// peers on `Err` or empty response. Returns the first non-empty success,
-/// otherwise the last seen result (preserving the original error for
-/// diagnostics).
+/// Failover plan for `GetBlocksByRange`: only bsc/2 peers eligible. If
+/// `preferred` itself is bsc/2 it leads, otherwise the v2 list is tried in
+/// its natural order (preferred is excluded entirely).
+pub(crate) fn plan_v2_failover_peers(
+    preferred: PeerId,
+    v2_peers: Vec<PeerId>,
+    max_attempts: usize,
+) -> Vec<PeerId> {
+    if v2_peers.contains(&preferred) {
+        plan_failover_peers(preferred, v2_peers, max_attempts)
+    } else {
+        v2_peers.into_iter().take(max_attempts).collect()
+    }
+}
+
+/// Like [`request_blocks_by_range`], but rotates through other bsc/2 peers on
+/// `Err` or empty response. Returns the first non-empty success, otherwise
+/// the last seen result (preserving the original error for diagnostics).
+///
+/// Candidates are restricted to bsc/2 peers; see [`plan_v2_failover_peers`].
 pub async fn request_blocks_by_range_with_failover(
     preferred: PeerId,
     start_height: u64,
@@ -393,9 +453,9 @@ pub async fn request_blocks_by_range_with_failover(
     timeout_dur: Duration,
     max_attempts: usize,
 ) -> Result<BlocksByRangePacket, String> {
-    let peers = plan_failover_peers(preferred, list_registered_peers(), max_attempts);
+    let peers = plan_v2_failover_peers(preferred, list_v2_peers(), max_attempts);
     if peers.is_empty() {
-        return Err("no BSC peers available for range request".to_string());
+        return Err("no bsc/2 peers available for range request".to_string());
     }
 
     let mut last: Result<BlocksByRangePacket, String> =
@@ -434,6 +494,98 @@ pub async fn request_blocks_by_range_with_failover(
 }
 
 #[cfg(test)]
+mod version_tests {
+    //! Unit tests for the bsc/n version-aware registry. Each test uses a
+    //! locally-unique `PeerId` byte to avoid cross-test interference in the
+    //! shared global `REGISTRY`.
+
+    use super::*;
+    use alloy_primitives::B512;
+
+    fn pid(byte: u8) -> PeerId {
+        B512::repeat_byte(byte)
+    }
+
+    /// Drops the test peer from the global registry on test exit so that
+    /// subsequent tests (or repeated runs) start clean.
+    struct TestPeerGuard(PeerId);
+    impl Drop for TestPeerGuard {
+        fn drop(&mut self) {
+            if let Ok(mut g) = REGISTRY.write() {
+                g.remove(&self.0);
+            }
+        }
+    }
+
+    #[test]
+    fn v1_peer_is_not_v2() {
+        let p = pid(0xA1);
+        let _g = TestPeerGuard(p);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        register_peer(p, tx, 1);
+
+        assert!(!is_v2_peer(p));
+        assert!(!list_v2_peers().contains(&p));
+    }
+
+    #[test]
+    fn v2_peer_is_v2() {
+        let p = pid(0xA2);
+        let _g = TestPeerGuard(p);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        register_peer(p, tx, 2);
+
+        assert!(is_v2_peer(p));
+        assert!(list_v2_peers().contains(&p));
+    }
+
+    #[test]
+    fn upgrade_v1_to_v2_takes_effect() {
+        // Same peer reconnects negotiating a higher version → registry
+        // overwrites the entry, version gets upgraded.
+        let p = pid(0xA3);
+        let _g = TestPeerGuard(p);
+        let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
+        register_peer(p, tx1, 1);
+        assert!(!is_v2_peer(p));
+
+        let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel();
+        register_peer(p, tx2, 2);
+        assert!(is_v2_peer(p));
+    }
+
+    #[test]
+    fn downgrade_v2_to_v1_takes_effect() {
+        let p = pid(0xA4);
+        let _g = TestPeerGuard(p);
+        let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel();
+        register_peer(p, tx2, 2);
+        assert!(is_v2_peer(p));
+
+        let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
+        register_peer(p, tx1, 1);
+        assert!(!is_v2_peer(p));
+        assert!(!list_v2_peers().contains(&p));
+    }
+
+    #[tokio::test]
+    async fn request_blocks_by_range_rejects_v1_peer() {
+        // The defensive guard inside `request_blocks_by_range`: even if a
+        // caller bypasses `with_failover` and dials a v1 peer directly, the
+        // function returns Err instead of emitting a 0x02 frame.
+        let p = pid(0xA5);
+        let _g = TestPeerGuard(p);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        register_peer(p, tx, 1);
+
+        let err = request_blocks_by_range(p, 1, B256::ZERO, 1, Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        assert!(err.contains("bsc/2"), "expected bsc/2 rejection, got: {err}");
+    }
+}
+
+#[cfg(test)]
 mod failover_tests {
     use super::*;
     use alloy_primitives::B512;
@@ -458,6 +610,35 @@ mod failover_tests {
     fn plan_handles_zero_attempts() {
         let plan = plan_failover_peers(pid(1), vec![pid(2)], 0);
         assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn plan_v2_keeps_v2_preferred_at_head() {
+        // preferred is in the v2 list → behaves like plan_failover_peers.
+        let plan = plan_v2_failover_peers(pid(1), vec![pid(1), pid(2), pid(3)], 3);
+        assert_eq!(plan, vec![pid(1), pid(2), pid(3)]);
+    }
+
+    #[test]
+    fn plan_v2_drops_non_v2_preferred() {
+        // preferred (v1) is NOT in the v2 list → preferred must not appear
+        // in the plan; only v2 peers are tried.
+        let plan = plan_v2_failover_peers(pid(9), vec![pid(2), pid(3), pid(4)], 3);
+        assert_eq!(plan, vec![pid(2), pid(3), pid(4)]);
+        assert!(!plan.contains(&pid(9)));
+    }
+
+    #[test]
+    fn plan_v2_empty_v2_list_yields_empty_plan() {
+        // No v2 peers → empty plan (caller surfaces "no bsc/2 peers" error).
+        let plan = plan_v2_failover_peers(pid(1), vec![], 3);
+        assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn plan_v2_respects_max_attempts_on_non_v2_path() {
+        let plan = plan_v2_failover_peers(pid(9), vec![pid(2), pid(3), pid(4)], 2);
+        assert_eq!(plan, vec![pid(2), pid(3)]);
     }
 
     #[test]

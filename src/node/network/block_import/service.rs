@@ -116,11 +116,15 @@ where
     announce_interval: tokio::time::Interval,
 }
 
+/// Pick a peer to route `GetBlocksByRange` to. Only bsc/2 peers qualify —
+/// bsc/1 peers don't speak `GetBlocksByRange` and would kick us with
+/// `SubprotocolSpecific`. Prefer the announcing peer if it's bsc/2;
+/// otherwise pick any registered bsc/2 peer.
 fn resolve_bsc_peer_static(announcer: PeerId) -> Option<PeerId> {
-    if crate::node::network::bsc_protocol::registry::has_registered_peer(announcer) {
+    if crate::node::network::bsc_protocol::registry::is_v2_peer(announcer) {
         Some(announcer)
     } else {
-        crate::node::network::bsc_protocol::registry::list_registered_peers().into_iter().next()
+        crate::node::network::bsc_protocol::registry::list_v2_peers().into_iter().next()
     }
 }
 
@@ -683,8 +687,7 @@ where
         }
     }
 
-    /// Pick a peer to route `GetBlocksByRange` to. Prefer the announcing peer
-    /// if it speaks the BSC sub-protocol; otherwise any registered BSC peer.
+    /// See [`resolve_bsc_peer_static`].
     fn resolve_bsc_peer(&self, announcer: PeerId) -> Option<PeerId> {
         resolve_bsc_peer_static(announcer)
     }

@@ -50,7 +50,7 @@ impl ConnectionHandler for BscConnectionHandlerV2 {
         // Note: PeerId is not exposed directly here, so we rely on the local peer id for keying
         // when available. However, reth passes `_peer_id` which we can use.
         // Even if the connection drops, failed sends will lazily clean up entries.
-        registry::register_peer(peer_id, tx);
+        registry::register_peer(peer_id, tx, 2);
         // EVN: mark this peer if present in whitelist and mark as trusted at runtime
         crate::node::network::evn_peers::mark_evn_if_whitelisted(peer_id);
         if crate::node::network::evn_peers::is_evn_peer(peer_id) {
@@ -105,7 +105,7 @@ impl ConnectionHandler for BscConnectionHandlerV1 {
         conn: ProtocolConnection,
     ) -> Self::Connection {
         let (tx, rx) = mpsc::unbounded_channel();
-        registry::register_peer(peer_id, tx);
+        registry::register_peer(peer_id, tx, 1);
         crate::node::network::evn_peers::mark_evn_if_whitelisted(peer_id);
         if crate::node::network::evn_peers::is_evn_peer(peer_id) {
             if let Some(net) = crate::shared::get_network_handle() {
