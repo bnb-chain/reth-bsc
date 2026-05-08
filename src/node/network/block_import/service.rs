@@ -469,6 +469,10 @@ where
     fn on_new_block(&mut self, block: BlockMsg, peer_id: PeerId) {
         tracing::debug!(target: "bsc::block_import", "Receiving new block from network: number = {:?}, hash = {:?}, peer = {:?}", block.block.0.block.header.number, block.hash, peer_id);
 
+        // Record before stale-block / dedup checks: announcer remains a
+        // valid `GetBlocksByRange` target even if we skip processing here.
+        crate::node::network::bsc_protocol::registry::record_announcer(block.hash, peer_id);
+
         // Drop blocks that are far behind the canonical head early to avoid wasting
         // resources on stale blocks from misbehaving or out-of-sync peers. Without this
         // guard, proof workers open read transactions against cold historical trie pages,
@@ -582,6 +586,12 @@ where
         };
 
         for hash_number in hashes.0 {
+            // Record before dedup checks (see `on_new_block` above).
+            crate::node::network::bsc_protocol::registry::record_announcer(
+                hash_number.hash,
+                peer_id,
+            );
+
             if self.processed_blocks.contains(&hash_number.hash) {
                 continue;
             }

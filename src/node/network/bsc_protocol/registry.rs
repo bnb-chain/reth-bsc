@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::RwLock;
 
 use once_cell::sync::Lazy;
+use parking_lot::Mutex as ParkingMutex;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
@@ -116,6 +117,54 @@ pub fn list_v2_peers() -> Vec<PeerId> {
             .collect(),
         Err(_) => Vec::new(),
     }
+}
+
+/// Distinct hashes tracked for announcers. ~6 minutes of mainnet announce
+/// traffic at typical rates.
+const ANNOUNCER_LRU_CAP: u32 = 256;
+
+/// Per-hash announcer cap. Defensive ceiling; once full, further announcers
+/// are dropped FIFO (earlier announcers more likely to have already
+/// committed the block).
+const MAX_ANNOUNCERS_PER_HASH: usize = 16;
+
+/// Per-hash announcers, used by `request_blocks_by_range_with_failover` to
+/// prefer peers known to have the block. On miss/empty the caller falls
+/// through to the v2 peer list.
+static ANNOUNCERS: Lazy<ParkingMutex<schnellru::LruMap<B256, Vec<PeerId>, schnellru::ByLength>>> =
+    Lazy::new(|| {
+        ParkingMutex::new(schnellru::LruMap::new(schnellru::ByLength::new(ANNOUNCER_LRU_CAP)))
+    });
+
+/// Record `peer` as having announced `hash`. Idempotent on `peer`; bounded
+/// by [`MAX_ANNOUNCERS_PER_HASH`] (further announcers dropped FIFO).
+pub fn record_announcer(hash: B256, peer: PeerId) {
+    let mut g = ANNOUNCERS.lock();
+    let list = g.get_or_insert(hash, Vec::new).expect("ByLength limiter never rejects");
+    if list.contains(&peer) || list.len() >= MAX_ANNOUNCERS_PER_HASH {
+        return;
+    }
+    list.push(peer);
+}
+
+/// Snapshot of peers that announced `hash` and currently negotiate bsc/2.
+pub fn list_announcers_for(hash: B256) -> Vec<PeerId> {
+    let raw: Vec<PeerId> = {
+        let mut g = ANNOUNCERS.lock();
+        match g.get(&hash) {
+            Some(list) => list.clone(),
+            None => return Vec::new(),
+        }
+    };
+    let v2: Vec<PeerId> = raw.into_iter().filter(|p| is_v2_peer(*p)).collect();
+    if v2.is_empty() {
+        tracing::trace!(
+            target: "bsc::registry",
+            %hash,
+            "announcer LRU hit but all entries are non-v2 or disconnected; falling back to v2 list"
+        );
+    }
+    v2
 }
 
 /// Initialize the proxyed peer IDs map from a list of peer IDs.
@@ -401,20 +450,26 @@ pub fn spawn_evn_refresh_listener() {
     }
 }
 
-/// Compute a failover peer ordering: `preferred` first, then up to
-/// `max_attempts - 1` other peers from `registered`, preserving order and
-/// deduplicating. Returns at most `max_attempts` entries.
-pub(crate) fn plan_failover_peers(
+/// Failover plan for `GetBlocksByRange` — only bsc/2 peers eligible.
+/// Order: `preferred` (if bsc/2), `announcers`, then remaining v2 peers.
+/// Duplicates are removed and the result is truncated to `max_attempts`.
+///
+/// `announcers` should already be v2-filtered (see [`list_announcers_for`]);
+/// empty `announcers` falls back to the v2 list alone.
+pub(crate) fn plan_v2_failover_peers(
     preferred: PeerId,
-    registered: Vec<PeerId>,
+    announcers: Vec<PeerId>,
+    v2_peers: Vec<PeerId>,
     max_attempts: usize,
 ) -> Vec<PeerId> {
     if max_attempts == 0 {
         return Vec::new();
     }
     let mut out = Vec::with_capacity(max_attempts);
-    out.push(preferred);
-    for p in registered {
+    if v2_peers.contains(&preferred) {
+        out.push(preferred);
+    }
+    for p in announcers.into_iter().chain(v2_peers) {
         if out.len() >= max_attempts {
             break;
         }
@@ -423,21 +478,6 @@ pub(crate) fn plan_failover_peers(
         }
     }
     out
-}
-
-/// Failover plan for `GetBlocksByRange`: only bsc/2 peers eligible. If
-/// `preferred` itself is bsc/2 it leads, otherwise the v2 list is tried in
-/// its natural order (preferred is excluded entirely).
-pub(crate) fn plan_v2_failover_peers(
-    preferred: PeerId,
-    v2_peers: Vec<PeerId>,
-    max_attempts: usize,
-) -> Vec<PeerId> {
-    if v2_peers.contains(&preferred) {
-        plan_failover_peers(preferred, v2_peers, max_attempts)
-    } else {
-        v2_peers.into_iter().take(max_attempts).collect()
-    }
 }
 
 /// Like [`request_blocks_by_range`], but rotates through other bsc/2 peers on
@@ -453,7 +493,8 @@ pub async fn request_blocks_by_range_with_failover(
     timeout_dur: Duration,
     max_attempts: usize,
 ) -> Result<BlocksByRangePacket, String> {
-    let peers = plan_v2_failover_peers(preferred, list_v2_peers(), max_attempts);
+    let announcers = list_announcers_for(start_hash);
+    let peers = plan_v2_failover_peers(preferred, announcers, list_v2_peers(), max_attempts);
     if peers.is_empty() {
         return Err("no bsc/2 peers available for range request".to_string());
     }
@@ -583,6 +624,110 @@ mod version_tests {
             .unwrap_err();
         assert!(err.contains("bsc/2"), "expected bsc/2 rejection, got: {err}");
     }
+
+    // ---- announcer LRU tests ----
+
+    /// Drops a hash from the announcer LRU on test exit.
+    struct TestHashGuard(B256);
+    impl Drop for TestHashGuard {
+        fn drop(&mut self) {
+            ANNOUNCERS.lock().remove(&self.0);
+        }
+    }
+
+    fn hash(byte: u8) -> B256 {
+        B256::repeat_byte(byte)
+    }
+
+    #[test]
+    fn record_announcer_preserves_insertion_order() {
+        let h = hash(0xB1);
+        let _g = TestHashGuard(h);
+        let p1 = pid(0xB1);
+        let p2 = pid(0xB2);
+        let _gp1 = TestPeerGuard(p1);
+        let _gp2 = TestPeerGuard(p2);
+        let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
+        let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel();
+        register_peer(p1, tx1, 2);
+        register_peer(p2, tx2, 2);
+
+        record_announcer(h, p1);
+        record_announcer(h, p2);
+
+        // p1 announced first → must come first in the list.
+        assert_eq!(list_announcers_for(h), vec![p1, p2]);
+    }
+
+    #[test]
+    fn record_announcer_dedups_repeat_record() {
+        let h = hash(0xB3);
+        let _g = TestHashGuard(h);
+        let p = pid(0xB3);
+        let _gp = TestPeerGuard(p);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        register_peer(p, tx, 2);
+
+        record_announcer(h, p);
+        record_announcer(h, p);
+        record_announcer(h, p);
+
+        assert_eq!(list_announcers_for(h), vec![p]);
+    }
+
+    #[test]
+    fn record_announcer_drops_after_cap() {
+        let h = hash(0xB4);
+        let _g = TestHashGuard(h);
+        // Register MAX_ANNOUNCERS_PER_HASH + 2 peers (all v2).
+        let mut peers = Vec::with_capacity(MAX_ANNOUNCERS_PER_HASH + 2);
+        let mut guards: Vec<TestPeerGuard> = Vec::with_capacity(MAX_ANNOUNCERS_PER_HASH + 2);
+        for i in 0..(MAX_ANNOUNCERS_PER_HASH + 2) {
+            let p = pid(0xC0 + i as u8);
+            guards.push(TestPeerGuard(p));
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            register_peer(p, tx, 2);
+            record_announcer(h, p);
+            peers.push(p);
+        }
+
+        let listed = list_announcers_for(h);
+        assert_eq!(listed.len(), MAX_ANNOUNCERS_PER_HASH);
+        // FIFO: the first `MAX_ANNOUNCERS_PER_HASH` peers are kept; later ones dropped.
+        assert_eq!(listed, peers[..MAX_ANNOUNCERS_PER_HASH]);
+    }
+
+    #[test]
+    fn list_announcers_for_filters_v1_and_disconnected() {
+        let h = hash(0xB5);
+        let _g = TestHashGuard(h);
+        let v2_peer = pid(0xB6);
+        let v1_peer = pid(0xB7);
+        let _gp_v2 = TestPeerGuard(v2_peer);
+        let _gp_v1 = TestPeerGuard(v1_peer);
+        let (tx_v2, _rx_v2) = tokio::sync::mpsc::unbounded_channel();
+        let (tx_v1, _rx_v1) = tokio::sync::mpsc::unbounded_channel();
+        register_peer(v2_peer, tx_v2, 2);
+        register_peer(v1_peer, tx_v1, 1);
+
+        record_announcer(h, v2_peer);
+        record_announcer(h, v1_peer);
+
+        // Disconnected peer simulated by a peer that was never registered.
+        let ghost_peer = pid(0xB8);
+        record_announcer(h, ghost_peer);
+
+        // Only the v2-and-still-registered peer survives the filter.
+        assert_eq!(list_announcers_for(h), vec![v2_peer]);
+    }
+
+    #[test]
+    fn list_announcers_for_returns_empty_on_lru_miss() {
+        // A hash never recorded: list returns empty (no panic, no error).
+        let h = hash(0xB9);
+        // No record_announcer call.
+        assert!(list_announcers_for(h).is_empty());
+    }
 }
 
 #[cfg(test)]
@@ -595,57 +740,106 @@ mod failover_tests {
     }
 
     #[test]
-    fn plan_puts_preferred_first_and_dedups() {
-        let plan = plan_failover_peers(pid(1), vec![pid(2), pid(1), pid(3)], 3);
-        assert_eq!(plan, vec![pid(1), pid(2), pid(3)]);
-    }
-
-    #[test]
-    fn plan_respects_max_attempts() {
-        let plan = plan_failover_peers(pid(1), vec![pid(2), pid(3), pid(4)], 2);
-        assert_eq!(plan, vec![pid(1), pid(2)]);
-    }
-
-    #[test]
-    fn plan_handles_zero_attempts() {
-        let plan = plan_failover_peers(pid(1), vec![pid(2)], 0);
+    fn plan_v2_zero_attempts_returns_empty() {
+        let plan = plan_v2_failover_peers(pid(1), vec![], vec![pid(1), pid(2)], 0);
         assert!(plan.is_empty());
     }
 
+    // ---- plan_v2_failover_peers: legacy (no announcer) tests ----
+
     #[test]
     fn plan_v2_keeps_v2_preferred_at_head() {
-        // preferred is in the v2 list → behaves like plan_failover_peers.
-        let plan = plan_v2_failover_peers(pid(1), vec![pid(1), pid(2), pid(3)], 3);
+        let plan =
+            plan_v2_failover_peers(pid(1), vec![], vec![pid(1), pid(2), pid(3)], 3);
         assert_eq!(plan, vec![pid(1), pid(2), pid(3)]);
     }
 
     #[test]
     fn plan_v2_drops_non_v2_preferred() {
-        // preferred (v1) is NOT in the v2 list → preferred must not appear
-        // in the plan; only v2 peers are tried.
-        let plan = plan_v2_failover_peers(pid(9), vec![pid(2), pid(3), pid(4)], 3);
+        // preferred (v1) is NOT in the v2 list → must not appear in the plan.
+        let plan =
+            plan_v2_failover_peers(pid(9), vec![], vec![pid(2), pid(3), pid(4)], 3);
         assert_eq!(plan, vec![pid(2), pid(3), pid(4)]);
         assert!(!plan.contains(&pid(9)));
     }
 
     #[test]
     fn plan_v2_empty_v2_list_yields_empty_plan() {
-        // No v2 peers → empty plan (caller surfaces "no bsc/2 peers" error).
-        let plan = plan_v2_failover_peers(pid(1), vec![], 3);
+        let plan = plan_v2_failover_peers(pid(1), vec![], vec![], 3);
         assert!(plan.is_empty());
     }
 
     #[test]
     fn plan_v2_respects_max_attempts_on_non_v2_path() {
-        let plan = plan_v2_failover_peers(pid(9), vec![pid(2), pid(3), pid(4)], 2);
+        let plan =
+            plan_v2_failover_peers(pid(9), vec![], vec![pid(2), pid(3), pid(4)], 2);
         assert_eq!(plan, vec![pid(2), pid(3)]);
     }
 
+    // ---- plan_v2_failover_peers: announcer-aware tests ----
+
     #[test]
-    fn plan_handles_empty_registered() {
-        let plan = plan_failover_peers(pid(1), vec![], 5);
-        assert_eq!(plan, vec![pid(1)]);
+    fn plan_v2_announcers_come_before_other_v2_peers() {
+        // Announcers (already v2-filtered by the caller) are tried before
+        // the rest of the v2 list, regardless of their position in v2_peers.
+        let plan = plan_v2_failover_peers(
+            pid(1),
+            vec![pid(3)],                            // announcer
+            vec![pid(1), pid(2), pid(3), pid(4)],    // full v2 list
+            4,
+        );
+        // Order: preferred → announcer → remaining v2.
+        assert_eq!(plan, vec![pid(1), pid(3), pid(2), pid(4)]);
     }
+
+    #[test]
+    fn plan_v2_preferred_takes_precedence_over_announcers() {
+        // Even if `preferred` is not the first announcer, when it's in the
+        // v2 list it leads.
+        let plan = plan_v2_failover_peers(
+            pid(1),
+            vec![pid(2), pid(3)],
+            vec![pid(1), pid(2), pid(3)],
+            3,
+        );
+        assert_eq!(plan, vec![pid(1), pid(2), pid(3)]);
+    }
+
+    #[test]
+    fn plan_v2_dedups_across_preferred_announcers_and_v2() {
+        // A peer appearing in all three sources only shows up once.
+        let plan = plan_v2_failover_peers(
+            pid(1),
+            vec![pid(1), pid(2)],
+            vec![pid(1), pid(2), pid(3)],
+            3,
+        );
+        assert_eq!(plan, vec![pid(1), pid(2), pid(3)]);
+    }
+
+    #[test]
+    fn plan_v2_truncates_to_max_attempts() {
+        let plan = plan_v2_failover_peers(
+            pid(1),
+            vec![pid(2), pid(3)],
+            vec![pid(1), pid(2), pid(3), pid(4)],
+            2,
+        );
+        assert_eq!(plan, vec![pid(1), pid(2)]);
+    }
+
+    #[test]
+    fn plan_v2_announcers_only_when_preferred_not_v2() {
+        // Non-v2 preferred is dropped; announcers (v2) lead the plan.
+        let plan = plan_v2_failover_peers(
+            pid(9),
+            vec![pid(3), pid(4)],
+            vec![pid(2), pid(3), pid(4)],
+            3,
+        );
+        assert_eq!(plan, vec![pid(3), pid(4), pid(2)]);
+    }
+
 }
 
 #[cfg(test)]
