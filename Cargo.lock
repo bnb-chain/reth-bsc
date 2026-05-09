@@ -10194,6 +10194,7 @@ dependencies = [
  "reth-cli-util",
  "reth-db",
  "reth-discv4",
+ "reth-dns-discovery",
  "reth-engine-local",
  "reth-engine-primitives",
  "reth-engine-tree",

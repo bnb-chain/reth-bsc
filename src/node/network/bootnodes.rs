@@ -37,6 +37,20 @@ pub static BSC_TESTNET_BOOTNODES: &[&str] = &[
     "enode://665cf77ca26a8421cfe61a52ac312958308d4912e78ce8e0f61d6902e4494d4cc38f9b0dd1b23a427a7a5734e27e5d9729231426b06bb9c73b56a142f83f6b68@52.72.123.113:30311",
 ];
 
+/// BSC mainnet DNS-discovery enrtree URL.
+///
+/// Mirrors `bsc-geth`'s `params.KnownDNSNetwork` for BSC mainnet (genesis
+/// `0x0d2184…`): the same `enrtree://AKA3…@all.mainnet.ethdisco.net` record is
+/// used by both Ethereum and BSC mainnet, with each side filtering on genesis
+/// hash during the eth handshake.
+///
+/// Without this, discv4 has only the 6 hardcoded `BSC_MAINNET_BOOTNODES` plus
+/// any user-supplied trusted peers as seed material; bsc-geth additionally
+/// pulls hundreds of curated peers from this DNS record, so reth-bsc nodes
+/// without it run with a much smaller candidate pool and often plateau at a
+/// low outgoing-peer count regardless of `max_outbound`.
+pub static BSC_MAINNET_DNS_NETWORK: &str =
+    "enrtree://AKA3AM6LPBYEUDMVNU3BSVQJ5AD45Y7YPOHJLEF6W26QOE4VTUDPE@all.mainnet.ethdisco.net";
 
 /// Bsc qanet boot nodes.
 pub static BSC_QANET_BOOTNODES: &[&str] = &[

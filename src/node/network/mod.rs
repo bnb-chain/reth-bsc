@@ -1,20 +1,28 @@
 #![allow(clippy::owned_cow)]
 use crate::{
-    BscBlock, chainspec::BscChainSpec, node::{
-        BscNode, engine_api::payload::BscPayloadTypes, network::{
-            block_import::{BscBlockImport, handle::ImportHandle},
+    chainspec::BscChainSpec,
+    node::{
+        engine_api::payload::BscPayloadTypes,
+        miner::signer::{is_signer_initialized, sign_system_transaction},
+        network::{
+            block_import::{handle::ImportHandle, BscBlockImport},
             evn_peers::{get_onchain_nodeids_set, peer_id_to_node_id},
-        }, primitives::{BscBlobTransactionSidecar, BscPrimitives}
-    }
+        },
+        primitives::{BscBlobTransactionSidecar, BscPrimitives},
+        BscNode,
+    },
+    BscBlock,
 };
 use alloy_primitives::{Address, U256};
 use alloy_rlp::{Decodable, Encodable};
+use alloy_rpc_types::TransactionRequest as RpcTransactionRequest;
 use handshake::BscHandshake;
 use reth::{
     api::{FullNodeTypes, TxTy},
     builder::{components::NetworkBuilder, BuilderContext},
     transaction_pool::{PoolTransaction, TransactionPool},
 };
+use reth_chainspec::EthChainSpec;
 use reth_discv4::Discv4Config;
 use reth_engine_primitives::ConsensusEngineHandle;
 use reth_eth_wire::{BasicNetworkPrimitives, NewBlock, NewBlockPayload};
@@ -22,16 +30,11 @@ use reth_ethereum_primitives::PooledTransactionVariant;
 use reth_network::{NetworkConfig, NetworkHandle, NetworkManager};
 use reth_network_api::PeersInfo;
 use reth_network_peers::NodeRecord;
-use reth_provider::{BlockNumReader, HeaderProvider, StateProviderFactory};
 use reth_primitives::TransactionSigned;
+use reth_provider::{BlockNumReader, HeaderProvider, StateProviderFactory};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, info, warn};
-use alloy_rpc_types::{
-    TransactionRequest as RpcTransactionRequest,
-};
-use crate::node::miner::signer::{is_signer_initialized, sign_system_transaction};
-use reth_chainspec::EthChainSpec;
 
 pub mod block_import;
 pub(crate) mod blocks_by_range;
@@ -166,10 +169,8 @@ pub struct BscNetworkBuilder {
     engine_handle_rx: Arc<Mutex<Option<oneshot::Receiver<ConsensusEngineHandle<BscPayloadTypes>>>>>,
 }
 
-fn apply_bsc_discv4_overrides<I>(
-    discv4_config: &mut Option<Discv4Config>,
-    boot_nodes: Option<I>,
-) where
+fn apply_bsc_discv4_overrides<I>(discv4_config: &mut Option<Discv4Config>, boot_nodes: Option<I>)
+where
     I: IntoIterator<Item = NodeRecord>,
 {
     let Some(discv4_config) = discv4_config.as_mut() else {
@@ -180,6 +181,22 @@ fn apply_bsc_discv4_overrides<I>(
         discv4_config.bootstrap_nodes.extend(boot_nodes);
     }
     discv4_config.lookup_interval = Duration::from_millis(500);
+}
+
+/// Returns the DNS-discovery enrtree URL to use as a discv4 seed source for
+/// the given chain. Only BSC mainnet has a curated DNS record; chapel and
+/// rialto/qanet rely on hardcoded bootnodes plus user-supplied trusted peers.
+/// This matches `bsc-geth`'s `params.KnownDNSNetwork` behaviour.
+fn bsc_dns_network_for(chain_spec: &Arc<BscChainSpec>) -> Option<&'static str> {
+    use alloy_chains::{Chain, NamedChain};
+    use reth_chainspec::EthChainSpec;
+
+    let chain: Chain = chain_spec.chain();
+    if chain == Chain::from_named(NamedChain::BinanceSmartChain) {
+        Some(crate::node::network::bootnodes::BSC_MAINNET_DNS_NETWORK)
+    } else {
+        None
+    }
 }
 
 impl BscNetworkBuilder {
@@ -329,7 +346,8 @@ impl BscNetworkBuilder {
             .unwrap();
         });
 
-        // TODO: update network with the latest canonical head, but has a fork id issue, can fix it later.
+        // TODO: update network with the latest canonical head, but has a fork id issue, can fix it
+        // later.
         let mut network_builder = network_builder
             .boot_nodes(ctx.chain_spec().bootnodes().unwrap_or_default())
             .set_head(ctx.chain_spec().head())
@@ -343,6 +361,31 @@ impl BscNetworkBuilder {
         // Apply proxyed peer IDs if configured
         if let Some(proxyed_peer_ids) = crate::shared::get_proxyed_peer_ids() {
             network_builder = network_builder.proxied_peers(proxyed_peer_ids.clone());
+        }
+
+        // Mirror bsc-geth's `SetDNSDiscoveryDefaults`: when running on BSC
+        // mainnet, register the DNS enrtree as a discovery seed so discv4 has
+        // hundreds of curated peers to bootstrap from instead of only the 6
+        // hardcoded `BSC_MAINNET_BOOTNODES`. bsc-geth only sets a DNS record
+        // for BSC mainnet (testnet/qanet return empty), so we mirror that
+        // exactly — no DNS for chapel or rialto.
+        if let Some(url) = bsc_dns_network_for(&ctx.chain_spec()) {
+            use reth_dns_discovery::{tree::LinkEntry, DnsDiscoveryConfig};
+            use std::collections::HashSet;
+            match url.parse::<LinkEntry>() {
+                Ok(entry) => {
+                    let mut networks = HashSet::new();
+                    networks.insert(entry);
+                    network_builder = network_builder.dns_discovery(DnsDiscoveryConfig {
+                        bootstrap_dns_networks: Some(networks),
+                        ..Default::default()
+                    });
+                    info!(target: "bsc::net", url, "DNS discovery enrtree configured");
+                }
+                Err(e) => {
+                    warn!(target: "bsc::net", error = %e, url, "Failed to parse BSC DNS enrtree URL");
+                }
+            }
         }
 
         let peer_id = network_builder.get_peer_id();
@@ -510,16 +553,27 @@ async fn register_nodeids_actions<P: StateProviderFactory>(
     to_add: Vec<[u8; 32]>,
     to_remove: Vec<[u8; 32]>,
 ) -> Result<(), eyre::Error> {
-    let best_block_number = crate::shared::get_best_canonical_block_number().ok_or(eyre::eyre!("Best block number not found"))?;
-    let h = crate::shared::get_canonical_header_by_number(best_block_number).ok_or(eyre::eyre!("Header not found"))?;
+    let best_block_number = crate::shared::get_best_canonical_block_number()
+        .ok_or(eyre::eyre!("Best block number not found"))?;
+    let h = crate::shared::get_canonical_header_by_number(best_block_number)
+        .ok_or(eyre::eyre!("Header not found"))?;
     let state = provider.state_by_block_hash(h.hash_slow())?;
-    let acc = state.basic_account(&validator)?.ok_or(eyre::eyre!("Account not found for validator"))?;
+    let acc =
+        state.basic_account(&validator)?.ok_or(eyre::eyre!("Account not found for validator"))?;
     let mut next_nonce = acc.nonce;
     let chain_id = chain_spec.chain().id();
 
     let onchain_nodeids_set = get_onchain_nodeids_set();
-    let to_add: Vec<[u8; 32]>= to_add.iter().filter(|id| !onchain_nodeids_set.contains(&alloy_primitives::hex::encode(**id))).copied().collect();
-    let to_remove: Vec<[u8; 32]>= to_remove.iter().filter(|id| onchain_nodeids_set.contains(&alloy_primitives::hex::encode(**id))).copied().collect();
+    let to_add: Vec<[u8; 32]> = to_add
+        .iter()
+        .filter(|id| !onchain_nodeids_set.contains(&alloy_primitives::hex::encode(**id)))
+        .copied()
+        .collect();
+    let to_remove: Vec<[u8; 32]> = to_remove
+        .iter()
+        .filter(|id| onchain_nodeids_set.contains(&alloy_primitives::hex::encode(**id)))
+        .copied()
+        .collect();
     debug!(target: "bsc::evn", to_add = ?to_add, to_remove = ?to_remove, onchain_nodeids_set = ?onchain_nodeids_set, "refreshed to_add and to_remove");
     let mut signed_batch: Vec<TransactionSigned> = Vec::new();
     if !to_add.is_empty() {
