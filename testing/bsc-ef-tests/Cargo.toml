@@ -14,23 +14,23 @@ asm-keccak = ["alloy-primitives/asm-keccak"]
 reth_bsc = { path = "../.." }
 
 # reth dependencies aligned with root crate tag to avoid duplicate crate versions
-reth-chainspec = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.9" }
-reth-consensus = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.9" }
-reth-ethereum-forks = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.9" }
-reth-db = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.9", features = ["mdbx", "test-utils", "disable-lock"] }
-reth-db-api = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.9" }
-reth-db-common = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.9" }
-reth-ethereum-consensus = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.9" }
-reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.9" }
-reth-evm = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.9" }
-reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.9" }
-reth-primitives = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.9" }
-reth-primitives-traits = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.9" }
-reth-provider = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.9", features = ["test-utils"] }
-reth-revm = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.9", features = ["std"] }
-reth-tracing = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.9" }
-reth-trie = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.9" }
-reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", tag = "v0.0.9" }
+reth-chainspec = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/dns-enrtree-tolerate-empty-branches" }
+reth-consensus = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/dns-enrtree-tolerate-empty-branches" }
+reth-ethereum-forks = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/dns-enrtree-tolerate-empty-branches" }
+reth-db = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/dns-enrtree-tolerate-empty-branches", features = ["mdbx", "test-utils", "disable-lock"] }
+reth-db-api = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/dns-enrtree-tolerate-empty-branches" }
+reth-db-common = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/dns-enrtree-tolerate-empty-branches" }
+reth-ethereum-consensus = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/dns-enrtree-tolerate-empty-branches" }
+reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/dns-enrtree-tolerate-empty-branches" }
+reth-evm = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/dns-enrtree-tolerate-empty-branches" }
+reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/dns-enrtree-tolerate-empty-branches" }
+reth-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/dns-enrtree-tolerate-empty-branches" }
+reth-primitives-traits = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/dns-enrtree-tolerate-empty-branches" }
+reth-provider = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/dns-enrtree-tolerate-empty-branches", features = ["test-utils"] }
+reth-revm = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/dns-enrtree-tolerate-empty-branches", features = ["std"] }
+reth-tracing = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/dns-enrtree-tolerate-empty-branches" }
+reth-trie = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/dns-enrtree-tolerate-empty-branches" }
+reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/dns-enrtree-tolerate-empty-branches" }
 
 # revm
 revm = { version = "34.0.0", features = ["secp256k1", "blst", "c-kzg", "memory_limit"] }
