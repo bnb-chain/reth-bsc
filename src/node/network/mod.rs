@@ -213,6 +213,10 @@ fn apply_bsc_peer_stability_overrides(
 
     // Tentative: 30s covers cross-region bootnode handshakes that clip at the 20s default.
     sessions_config.pending_session_timeout = Duration::from_secs(30);
+
+    // Tentative: default 5 evicts peers permanently after 6 transient failures, which
+    // BSC mainnet's TooManyPeers/RST rate triggers in minutes; raise the floor.
+    peers_config.max_backoff_count = 32;
 }
 
 impl BscNetworkBuilder {
