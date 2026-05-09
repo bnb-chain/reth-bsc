@@ -39,15 +39,10 @@ impl BscHandshake {
 
             // Receive peer's upgrade status response.
             //
-            // Diagnostic note: the three error branches below are the *only* ways the
-            // BSC-specific portion of the handshake can fail. The decoding-failure branch
-            // is the path that produces a `DisconnectReason::ProtocolBreach` and therefore
-            // increments the `reth_network_protocol_breach` metric — log enough context
-            // (raw bytes, msg len, eth version) to distinguish "non-BSC client" from
-            // "real wire corruption". `UnauthEth` doesn't currently expose peer_id /
-            // remote_addr at this layer (see TODO below); operators correlating with a
-            // specific peer should cross-reference `peer_dump.rs`'s
-            // `recent_disconnect reason=ProtocolBreach` line at the same timestamp.
+            // None of the three error branches below disconnects with ProtocolBreach.
+            // A peer that doesn't speak BSC UpgradeStatus (vanilla geth, wrong-fork
+            // client) is not misbehaving; the warn! logs still capture raw bytes /
+            // msg_len / eth version for diagnosing wire corruption.
             let their_msg = match unauth.next().await {
                 Some(Ok(msg)) => msg,
                 Some(Err(e)) => {
@@ -91,20 +86,21 @@ impl BscHandshake {
                     return Ok(negotiated_status);
                 }
                 Err(e) => {
-                    // This is the locally-emitted ProtocolBreach. If the metric jumps
-                    // and you see this line, the cause is a peer that does NOT speak the
-                    // BSC `UpgradeStatus` extension (vanilla geth / wrong fork client),
-                    // or a wire corruption that produced an undecodable message body.
+                    // Most common cause: peer doesn't speak BSC UpgradeStatus
+                    // (vanilla geth / wrong-fork client) — that's not a protocol
+                    // violation. Disconnect gracefully (matches the empty-stream
+                    // path above) so the peer goes through Low backoff and stays
+                    // retry-eligible, instead of being treated as fatal.
                     warn!(
                         target: "bsc_handshake",
                         eth_version = ?negotiated_status.version,
                         msg_len = their_msg.len(),
                         error = %e,
-                        "BSC upgrade-status: decode failed -> sending DisconnectReason::ProtocolBreach (origin of ProtocolBreach metric increment is HERE; common cause: peer is not a BSC client or doesn't implement UpgradeStatus)"
+                        "BSC upgrade-status: decode failed -> sending DisconnectRequested (peer likely not a BSC client or doesn't implement UpgradeStatus; treated as graceful, no protocol_breach metric increment)"
                     );
-                    unauth.disconnect(DisconnectReason::ProtocolBreach).await?;
+                    unauth.disconnect(DisconnectReason::DisconnectRequested).await?;
                     return Err(EthStreamError::EthHandshakeError(
-                        EthHandshakeError::NonStatusMessageInHandshake,
+                        EthHandshakeError::NoResponse,
                     ));
                 }
             }
