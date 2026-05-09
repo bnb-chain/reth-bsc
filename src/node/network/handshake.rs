@@ -30,14 +30,23 @@ impl BscHandshake {
             // This mirrors the BSC EVN behavior where validator/sentry nodes
             // avoid mempool flooding between EVN peers.
             let evn_enabled = crate::node::network::evn::is_evn_ready();
-            let disable_tx_broadcast_forbidden = crate::node::network::evn::get_global_evn_config().map(|cfg| cfg.disable_tx_broadcast_forbidden).unwrap_or(false);
+            let disable_tx_broadcast_forbidden = crate::node::network::evn::get_global_evn_config()
+                .map(|cfg| cfg.disable_tx_broadcast_forbidden)
+                .unwrap_or(false);
             let upgrade_msg = UpgradeStatus {
-                extension: UpgradeStatusExtension { disable_peer_tx_broadcast: evn_enabled && !disable_tx_broadcast_forbidden },
+                extension: UpgradeStatusExtension {
+                    disable_peer_tx_broadcast: evn_enabled && !disable_tx_broadcast_forbidden,
+                },
             };
             tracing::debug!(target: "bsc_handshake", "Sending upgrade status message, EVN enabled: {}, disable tx broadcast forbidden: {}", evn_enabled, disable_tx_broadcast_forbidden);
             unauth.start_send_unpin(upgrade_msg.into_rlpx())?;
 
-            // Receive peer's upgrade status response
+            // Receive peer's upgrade status response.
+            //
+            // None of the three error branches below disconnects with ProtocolBreach.
+            // A peer that doesn't speak BSC UpgradeStatus (vanilla geth, wrong-fork
+            // client) is not misbehaving; the warn! logs still capture raw bytes /
+            // msg_len / eth version for diagnosing wire corruption.
             let their_msg = match unauth.next().await {
                 Some(Ok(msg)) => msg,
                 Some(Err(e)) => return Err(EthStreamError::from(e)),
@@ -62,11 +71,20 @@ impl BscHandshake {
                     return Ok(negotiated_status);
                 }
                 Err(e) => {
-                    tracing::trace!(target: "bsc_handshake", "bsc handshake: upgrade failed: {:?}", e);
-                    unauth.disconnect(DisconnectReason::ProtocolBreach).await?;
-                    return Err(EthStreamError::EthHandshakeError(
-                        EthHandshakeError::NonStatusMessageInHandshake,
-                    ));
+                    // Most common cause: peer doesn't speak BSC UpgradeStatus
+                    // (vanilla geth / wrong-fork client) — that's not a protocol
+                    // violation. Disconnect gracefully (matches the empty-stream
+                    // path above) so the peer goes through Low backoff and stays
+                    // retry-eligible, instead of being treated as fatal.
+                    warn!(
+                        target: "bsc_handshake",
+                        eth_version = ?negotiated_status.version,
+                        msg_len = their_msg.len(),
+                        error = %e,
+                        "BSC upgrade-status: decode failed -> sending DisconnectRequested (peer likely not a BSC client or doesn't implement UpgradeStatus; treated as graceful, no protocol_breach metric increment)"
+                    );
+                    unauth.disconnect(DisconnectReason::DisconnectRequested).await?;
+                    return Err(EthStreamError::EthHandshakeError(EthHandshakeError::NoResponse));
                 }
             }
         }
