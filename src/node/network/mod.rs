@@ -206,6 +206,13 @@ fn apply_bsc_peer_stability_overrides(
     // Soft per-request abandonment still happens at internal_request_timeout
     // (adaptive 2-20s); this is just the deadline for declaring ProtocolBreach.
     sessions_config.protocol_breach_request_timeout = Duration::from_secs(600);
+
+    // Tentative: widen outbound pipeline against BSC mainnet's ~5-10% dial success rate.
+    peers_config.connection_info.max_concurrent_outbound_dials = 64;
+    peers_config.connection_info.max_outbound = 256;
+
+    // Tentative: 30s covers cross-region bootnode handshakes that clip at the 20s default.
+    sessions_config.pending_session_timeout = Duration::from_secs(30);
 }
 
 impl BscNetworkBuilder {
