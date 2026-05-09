@@ -11,7 +11,7 @@ use reth_ethereum_forks::ForkFilter;
 use std::{future::Future, pin::Pin};
 use tokio::time::{timeout, Duration};
 use tokio_stream::StreamExt;
-use tracing::debug;
+use tracing::{debug, warn};
 
 #[derive(Debug, Default)]
 /// The Binance Smart Chain (BSC) P2P handshake.
