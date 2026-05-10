@@ -79,6 +79,51 @@ const LRU_PROCESSED_BLOCKS_SIZE: u32 = 100;
 const PIPELINE_TRIGGER_DELTA: u64 =
     crate::node::network::block_import::fork_recover::MAX_FORK_DEPTH;
 
+/// Synthesized `forkchoiceUpdated` so engine-tree optimistic sync can backfill
+/// when the announced head is farther than [`PIPELINE_TRIGGER_DELTA`] above the
+/// local tip (same condition as `fork_recover::ForkTooDeep`).
+fn spawn_pipeline_trigger_fcu_task(
+    engine: ConsensusEngineHandle<BscPayloadTypes>,
+    peer_id: PeerId,
+    head_hash: B256,
+    head_num: u64,
+    local_tip: u64,
+    delta: u64,
+) {
+    tracing::info!(
+        target: "bsc::block_import",
+        %peer_id,
+        %head_hash,
+        head_num,
+        local_tip,
+        delta,
+        "Far-behind gap detected; dispatching pipeline-trigger FCU"
+    );
+    tokio::spawn(async move {
+        let state = ForkchoiceState {
+            head_block_hash: head_hash,
+            safe_block_hash: B256::ZERO,
+            finalized_block_hash: B256::ZERO,
+        };
+        match engine.fork_choice_updated(state, None, EngineApiMessageVersion::V1).await {
+            Ok(ret) => tracing::info!(
+                target: "bsc::block_import",
+                %head_hash,
+                head_num,
+                status = ?ret.payload_status.status,
+                "Pipeline-trigger FCU dispatched"
+            ),
+            Err(err) => tracing::warn!(
+                target: "bsc::block_import",
+                %head_hash,
+                head_num,
+                error = %err,
+                "Pipeline-trigger FCU failed"
+            ),
+        }
+    });
+}
+
 /// A service that handles bidirectional block import communication with the network.
 /// It receives new blocks from the network via `from_network` channel and sends back
 /// import outcomes via `to_network` channel.
@@ -264,6 +309,38 @@ where
                             peer = %peer_id,
                             "New payload returned Syncing - spawning fork recovery"
                         );
+
+                        if let Ok(local_tip) =
+                            forkchoice_engine.provider.best_block_number()
+                        {
+                            let delta = block_number.saturating_sub(local_tip);
+                            if delta > PIPELINE_TRIGGER_DELTA {
+                                // Same bound as `fork_recover::MAX_FORK_DEPTH`: ancestor
+                                // walk cannot reach our chain, so `recover_ancestors` would
+                                // only burn cycles and log `ForkTooDeep` forever while
+                                // gossip keeps advancing the head hash (per-hash cooldown
+                                // does not help). `on_new_block_hashes` already routes this
+                                // case to the pipeline; full `NewBlock` must do the same.
+                                tracing::info!(
+                                    target: "bsc::block_import",
+                                    %block_hash,
+                                    block_number,
+                                    local_tip,
+                                    delta,
+                                    %peer_id,
+                                    "NewBlock Syncing gap exceeds fork_recover depth; pipeline-trigger FCU instead"
+                                );
+                                spawn_pipeline_trigger_fcu_task(
+                                    engine.clone(),
+                                    peer_id,
+                                    block_hash,
+                                    block_number,
+                                    local_tip,
+                                    delta,
+                                );
+                                return None;
+                            }
+                        }
 
                         if failed_heads.is_cooling(&block_hash) {
                             tracing::debug!(
@@ -642,39 +719,14 @@ where
         local_tip: u64,
         delta: u64,
     ) {
-        let engine = self.engine.clone();
-        tracing::info!(
-            target: "bsc::block_import",
-            %peer_id,
-            %head_hash,
+        spawn_pipeline_trigger_fcu_task(
+            self.engine.clone(),
+            peer_id,
+            head_hash,
             head_num,
             local_tip,
             delta,
-            "Far-behind gap detected; dispatching pipeline-trigger FCU"
         );
-        tokio::spawn(async move {
-            let state = ForkchoiceState {
-                head_block_hash: head_hash,
-                safe_block_hash: B256::ZERO,
-                finalized_block_hash: B256::ZERO,
-            };
-            match engine.fork_choice_updated(state, None, EngineApiMessageVersion::V1).await {
-                Ok(ret) => tracing::info!(
-                    target: "bsc::block_import",
-                    %head_hash,
-                    head_num,
-                    status = ?ret.payload_status.status,
-                    "Pipeline-trigger FCU dispatched"
-                ),
-                Err(err) => tracing::warn!(
-                    target: "bsc::block_import",
-                    %head_hash,
-                    head_num,
-                    error = %err,
-                    "Pipeline-trigger FCU failed"
-                ),
-            }
-        });
     }
 
     /// Transfer the block to EVN peers if from proxied validators or validator address.
