@@ -59,6 +59,9 @@ pub struct BscProtocolConnection {
     proto_version: u64,
     /// PeerId for this connection, if known
     _peer_id: Option<PeerId>,
+    /// Token returned by [`crate::node::network::bsc_protocol::registry::register_peer`];
+    /// used to remove only this session's registry entry on drop.
+    registry_conn_token: u64,
     /// Last time we pruned pending requests
     last_prune: std::time::Instant,
 }
@@ -70,6 +73,7 @@ impl BscProtocolConnection {
         is_dialer: bool,
         proto_version: u64,
         peer_id: Option<PeerId>,
+        registry_conn_token: u64,
     ) -> Self {
         let handshake_deadline = Some(Box::pin(tokio::time::sleep(HANDSHAKE_TIMEOUT)));
         // Both sides should send initial capability in BSC protocol
@@ -89,6 +93,7 @@ impl BscProtocolConnection {
             pending_range_reqs: HashMap::new(),
             proto_version,
             _peer_id: peer_id,
+            registry_conn_token,
             last_prune: std::time::Instant::now(),
         }
     }
@@ -350,6 +355,17 @@ impl BscProtocolConnection {
                 tracing::debug!(target: "bsc_protocol", msg_id = format_args!("{:#04x}", msg_id), "Unknown BSC message id");
                 None
             }
+        }
+    }
+}
+
+impl Drop for BscProtocolConnection {
+    fn drop(&mut self) {
+        if let Some(peer) = self._peer_id {
+            crate::node::network::bsc_protocol::registry::unregister_peer_if_current(
+                peer,
+                self.registry_conn_token,
+            );
         }
     }
 }
