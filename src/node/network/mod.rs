@@ -19,7 +19,7 @@ use reth_discv4::Discv4Config;
 use reth_engine_primitives::ConsensusEngineHandle;
 use reth_eth_wire::{BasicNetworkPrimitives, NewBlock, NewBlockPayload};
 use reth_ethereum_primitives::PooledTransactionVariant;
-use reth_network::{NetworkConfig, NetworkHandle, NetworkManager};
+use reth_network::{NetworkConfig, NetworkHandle, NetworkManager, PeersConfig, SessionsConfig};
 use reth_network_api::PeersInfo;
 use reth_network_peers::NodeRecord;
 use reth_provider::{BlockNumReader, HeaderProvider, StateProviderFactory};
@@ -180,6 +180,42 @@ fn apply_bsc_discv4_overrides<I>(
         discv4_config.bootstrap_nodes.extend(boot_nodes);
     }
     discv4_config.lookup_interval = Duration::from_millis(500);
+}
+
+/// Align reth-bsc's per-peer punishment profile with geth-bsc.
+///
+/// Upstream reth treats a single ProtocolBreach as fatal
+/// (`bad_protocol = i32::MIN`) and bans for 12h; BSC mainnet's load
+/// profile fires those triggers on legitimate peers. geth-bsc has no
+/// reputation memory and runs fine. See
+/// docs/superpowers/p2p-stability-phase1.md for the full rationale.
+fn apply_bsc_peer_stability_overrides(
+    peers_config: &mut PeersConfig,
+    sessions_config: &mut SessionsConfig,
+) {
+    // BANNED_REPUTATION = -51200. Weights below picked so a single event
+    // does not cross it: ~4 bad_protocol, ~13 failed_to_connect, or ~50
+    // timeout/dropped events to reach ban — vs. geth-bsc which never bans.
+    peers_config.ban_duration = Duration::from_secs(60);
+    peers_config.reputation_weights.bad_protocol = -16384;
+    peers_config.reputation_weights.failed_to_connect = -4096;
+    peers_config.reputation_weights.timeout = -1024;
+    peers_config.reputation_weights.dropped = -1024;
+
+    // Soft per-request abandonment still happens at internal_request_timeout
+    // (adaptive 2-20s); this is just the deadline for declaring ProtocolBreach.
+    sessions_config.protocol_breach_request_timeout = Duration::from_secs(600);
+
+    // Tentative: widen outbound pipeline against BSC mainnet's ~5-10% dial success rate.
+    peers_config.connection_info.max_concurrent_outbound_dials = 64;
+    peers_config.connection_info.max_outbound = 256;
+
+    // Tentative: 30s covers cross-region bootnode handshakes that clip at the 20s default.
+    sessions_config.pending_session_timeout = Duration::from_secs(30);
+
+    // Tentative: default 5 evicts peers permanently after 6 transient failures, which
+    // BSC mainnet's TooManyPeers/RST rate triggers in minutes; raise the floor.
+    peers_config.max_backoff_count = 32;
 }
 
 impl BscNetworkBuilder {
@@ -350,6 +386,10 @@ impl BscNetworkBuilder {
         apply_bsc_discv4_overrides(
             &mut network_config.discovery_v4_config,
             ctx.chain_spec().bootnodes(),
+        );
+        apply_bsc_peer_stability_overrides(
+            &mut network_config.peers_config,
+            &mut network_config.sessions_config,
         );
         network_config.status.forkid = network_config.fork_filter.current();
 

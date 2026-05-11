@@ -55,14 +55,31 @@ pub fn register_peer(peer: PeerId, tx: UnboundedSender<BscCommand>) {
     }
 }
 
+/// Defensive ceiling on votes sent in a single sync packet. At ~250 B per
+/// envelope this caps the encoded `VotesPacket` near 8 MiB, well under RLPx's
+/// 16 MiB frame limit. The pool is kept bounded by lazy prune in
+/// [`crate::consensus::parlia::vote_pool::put_vote`], so this cap should not
+/// trigger in steady state; it exists so a regression in pruning cannot again
+/// produce frames that the local p2p stack refuses to send.
+const MAX_SYNC_VOTES: usize = 32 * 1024;
+
 fn sync_pending_votes_to_peer(peer: PeerId, tx: UnboundedSender<BscCommand>) {
-    // Keep parity with go-bsc's syncVotes: send currently pending votes to a new peer.
-    let votes = crate::consensus::parlia::vote_pool::get_votes();
+    // Mirrors geth-bsc's syncVotes: dump currently pending votes to a new peer.
+    let mut votes = crate::consensus::parlia::vote_pool::get_votes();
     if votes.is_empty() {
         return;
     }
-    let votes_arc = Arc::new(votes);
-    if tx.send(BscCommand::Votes(votes_arc)).is_err() {
+    if votes.len() > MAX_SYNC_VOTES {
+        tracing::warn!(
+            target: "bsc::registry",
+            peer = %peer,
+            total = votes.len(),
+            kept = MAX_SYNC_VOTES,
+            "vote_pool oversized; truncating sync packet"
+        );
+        votes.truncate(MAX_SYNC_VOTES);
+    }
+    if tx.send(BscCommand::Votes(Arc::new(votes))).is_err() {
         tracing::trace!(
             target: "bsc::registry",
             peer = %peer,
