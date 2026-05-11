@@ -46,11 +46,7 @@ impl ConnectionHandler for BscConnectionHandlerV2 {
     ) -> Self::Connection {
         tracing::debug!(target: "bsc_protocol", "Into connection, direction: {}, peer_id: {}", direction, _peer_id);
         let (tx, rx) = mpsc::unbounded_channel();
-        // Save sender so other components can broadcast BSC messages
-        // Note: PeerId is not exposed directly here, so we rely on the local peer id for keying
-        // when available. However, reth passes `_peer_id` which we can use.
-        // Even if the connection drops, failed sends will lazily clean up entries.
-        registry::register_peer(_peer_id, tx);
+        let registry_conn_token = registry::register_peer(_peer_id, tx);
         // EVN: mark this peer if present in whitelist and mark as trusted at runtime
         crate::node::network::evn_peers::mark_evn_if_whitelisted(_peer_id);
         if crate::node::network::evn_peers::is_evn_peer(_peer_id) {
@@ -61,7 +57,14 @@ impl ConnectionHandler for BscConnectionHandlerV2 {
         // Ensure EVN refresh listener is running to handle post-sync EVN updates
         // for existing peers.
         crate::node::network::bsc_protocol::registry::spawn_evn_refresh_listener();
-        BscProtocolConnection::new(conn, rx, direction.is_outgoing(), 2, Some(_peer_id))
+        BscProtocolConnection::new(
+            conn,
+            rx,
+            direction.is_outgoing(),
+            2,
+            Some(_peer_id),
+            registry_conn_token,
+        )
     }
 }
 
@@ -104,7 +107,7 @@ impl ConnectionHandler for BscConnectionHandlerV1 {
         conn: ProtocolConnection,
     ) -> Self::Connection {
         let (tx, rx) = mpsc::unbounded_channel();
-        registry::register_peer(_peer_id, tx);
+        let registry_conn_token = registry::register_peer(_peer_id, tx);
         crate::node::network::evn_peers::mark_evn_if_whitelisted(_peer_id);
         if crate::node::network::evn_peers::is_evn_peer(_peer_id) {
             if let Some(net) = crate::shared::get_network_handle() {
@@ -112,6 +115,13 @@ impl ConnectionHandler for BscConnectionHandlerV1 {
             }
         }
         crate::node::network::bsc_protocol::registry::spawn_evn_refresh_listener();
-        BscProtocolConnection::new(conn, rx, direction.is_outgoing(), 1, Some(_peer_id))
+        BscProtocolConnection::new(
+            conn,
+            rx,
+            direction.is_outgoing(),
+            1,
+            Some(_peer_id),
+            registry_conn_token,
+        )
     }
 }
