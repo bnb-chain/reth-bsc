@@ -23,6 +23,12 @@ use crate::shared;
 use std::time::SystemTime;
 
 const LOWER_LIMIT_OF_VOTE_BLOCK_NUMBER: u64 = 256;
+/// Upper acceptance window for vote `target_number` relative to local head, in blocks.
+/// Mirrors geth-bsc's `upperLimitOfVoteBlockNumber`; votes targeting beyond
+/// `head + UPPER_LIMIT_OF_VOTE_BLOCK_NUMBER` are dropped at insert. This is what
+/// prevents the pool from growing unbounded during stage sync, when peers continue
+/// to broadcast votes for network-tip blocks far ahead of our local head.
+const UPPER_LIMIT_OF_VOTE_BLOCK_NUMBER: u64 = 11;
 /// Size of the LRU cache for tracking finality notifications (matches geth's finalizedNotified)
 const FINALIZED_NOTIFIED_CACHE_SIZE: usize = 21;
 
@@ -103,8 +109,20 @@ impl VotePool {
         }
     }
 
-    /// Insert a vote and return the new vote count for its target block (0 if duplicate).
+    /// Insert a vote and return the new vote count for its target block (0 if rejected/duplicate).
     fn insert(&mut self, vote: VoteEnvelope, pending_block_number: BlockNumber) -> usize {
+        // Match geth-bsc: only accept votes whose target_number falls in
+        // (head - LOWER_LIMIT, head + UPPER_LIMIT]. Without the upper bound,
+        // stage sync ingests votes for network-tip blocks (target_number far
+        // ahead of local head) that prune cannot evict, and the pool grows
+        // until catch-up.
+        let target_number = vote.data.target_number;
+        if target_number + LOWER_LIMIT_OF_VOTE_BLOCK_NUMBER - 1 < pending_block_number
+            || target_number > pending_block_number + UPPER_LIMIT_OF_VOTE_BLOCK_NUMBER
+        {
+            return 0;
+        }
+
         let vote_hash = vote.hash();
         if self.received_votes.insert(vote_hash) {
             // Track received votes count (geth-compatible)
@@ -411,7 +429,10 @@ mod tests {
             data: VoteData {
                 source_number,
                 source_hash: B256::from([source_number as u8; 32]),
-                target_number: 100,
+                // Stay inside the (head - 256, head + 11] acceptance window.
+                // In tests `BEST_BLOCK_NUMBER_PROVIDER` is uninitialized so
+                // pending_block_number == 0; pick a target within +11 of that.
+                target_number: 5,
                 target_hash,
             },
         }
@@ -444,5 +465,51 @@ mod tests {
         assert!(source_12.is_empty());
 
         let _ = drain();
+    }
+
+    fn vote_at_target(target_hash: B256, target_number: u64, unique: u8) -> VoteEnvelope {
+        let mut address = VoteAddress::default();
+        address[0] = unique;
+        let mut signature = VoteSignature::default();
+        signature[0] = unique;
+        VoteEnvelope {
+            vote_address: address,
+            signature,
+            data: VoteData {
+                source_number: 0,
+                source_hash: B256::from([0u8; 32]),
+                target_number,
+                target_hash,
+            },
+        }
+    }
+
+    #[test]
+    fn insert_rejects_votes_outside_acceptance_window() {
+        // In tests pending_block_number == 0 (BEST_BLOCK_NUMBER_PROVIDER unset).
+        // Acceptance window is then (0 - 256, 0 + 11] == [0, 11] in u64-saturated terms.
+        let mut pool = VotePool::new();
+
+        // Inside the window: accepted.
+        let inside = vote_at_target(B256::from([0x01; 32]), 5, 1);
+        assert_eq!(pool.insert(inside, 0), 1);
+
+        // Above upper bound: rejected.
+        let too_far = vote_at_target(B256::from([0x02; 32]), 50_000_000, 2);
+        assert_eq!(pool.insert(too_far, 0), 0);
+        assert_eq!(pool.len(), 1);
+
+        // Below lower bound (head=1000, target=100): rejected.
+        let too_old = vote_at_target(B256::from([0x03; 32]), 100, 3);
+        assert_eq!(pool.insert(too_old, 1000), 0);
+        assert_eq!(pool.len(), 1);
+
+        // Exactly at upper boundary (head + 11): accepted.
+        let at_upper = vote_at_target(B256::from([0x04; 32]), 11, 4);
+        assert_eq!(pool.insert(at_upper, 0), 1);
+
+        // Just past upper boundary (head + 12): rejected.
+        let past_upper = vote_at_target(B256::from([0x05; 32]), 12, 5);
+        assert_eq!(pool.insert(past_upper, 0), 0);
     }
 }
