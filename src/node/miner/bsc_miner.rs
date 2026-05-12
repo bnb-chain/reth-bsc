@@ -2,7 +2,7 @@ use crate::node::miner::bid_simulator::{BidRuntime, BidSimulator};
 use crate::node::miner::payload::BscBuildArguments;
 use crate::{
     chainspec::BscChainSpec,
-    consensus::parlia::{provider::SnapshotProvider, vote_pool, Parlia},
+    consensus::parlia::{provider::SnapshotProvider, Parlia},
     metrics::BscConsensusMetrics,
     node::{
         engine::BscBuiltPayload,
@@ -246,10 +246,6 @@ where
                     }
 
                     let tip_header = tip.clone_sealed_header();
-                    // Prune old votes from the vote pool based on the new block number
-                    let block_number =
-                        self.provider.last_block_number().ok().unwrap_or(tip_header.number());
-                    vote_pool::prune(block_number);
 
                     // Produce and broadcast a local vote for this new canonical head, if eligible
                     if let Some(sp) = crate::shared::get_snapshot_provider() {
