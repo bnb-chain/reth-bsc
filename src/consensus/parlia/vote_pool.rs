@@ -4,7 +4,10 @@ use std::{
     cmp::Reverse,
     collections::{BinaryHeap, HashMap, HashSet},
     num::NonZero,
-    sync::RwLock,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        RwLock,
+    },
 };
 
 use alloy_primitives::{BlockNumber, B256};
@@ -220,6 +223,10 @@ impl VotePool {
 /// Global singleton pool.
 static VOTE_POOL: Lazy<RwLock<VotePool>> = Lazy::new(|| RwLock::new(VotePool::new()));
 
+/// Highest block number against which the pool has already been pruned.
+/// Throttles [`put_vote`]'s lazy prune to once per observed head advance.
+static LAST_PRUNED_BLOCK: AtomicU64 = AtomicU64::new(0);
+
 /// Global metrics for vote operations.
 static VOTE_METRICS: Lazy<BscVoteMetrics> = Lazy::new(BscVoteMetrics::default);
 
@@ -244,8 +251,35 @@ pub fn put_vote(vote: VoteEnvelope) {
     // Get pending block number for malicious vote detection scope
     let pending_block_number = shared::get_best_canonical_block_number().unwrap_or(0);
 
+    // Lazy prune: evict votes below `head - LOWER_LIMIT_OF_VOTE_BLOCK_NUMBER`
+    // once per observed head advance. Replaces geth-bsc's chain-head event
+    // subscription by piggybacking on the vote ingest path (same cadence).
+    // `fetch_max` keeps the watermark monotonic across racing writers; the
+    // inner prune is O(0) when nothing is stale.
+    let need_prune = pending_block_number > LAST_PRUNED_BLOCK.load(Ordering::Relaxed);
+
+    let target_number = vote.data.target_number;
+
     let mut pool = VOTE_POOL.write().expect("vote pool poisoned");
     let votes_for_block = pool.insert(vote, pending_block_number);
+    if need_prune {
+        pool.prune(pending_block_number);
+        LAST_PRUNED_BLOCK.fetch_max(pending_block_number, Ordering::Relaxed);
+    }
+
+    // Force prune if pool is too large, prevents memory issues during stage sync.
+    const MAX_VOTES_IN_POOL: usize = 32 * 1024 * 2;
+    if pool.len() > MAX_VOTES_IN_POOL {
+        let force_prune = target_number.saturating_sub(LOWER_LIMIT_OF_VOTE_BLOCK_NUMBER);
+        pool.prune(force_prune);
+        tracing::debug!(
+            target: "bsc::vote_pool",
+            pool_size = pool.len(),
+            force_prune_block_number = force_prune,
+            "Vote pool oversized, force pruned"
+        );
+    }
+
     let size = pool.len();
     drop(pool);
     update_vote_pool_size_metric(size);
@@ -293,15 +327,6 @@ pub fn fetch_vote_by_block_hash_and_source_number(
         .read()
         .expect("vote pool poisoned")
         .fetch_vote_by_block_hash_and_source_number(block_hash, source_number)
-}
-
-/// Prune old votes based on the latest block number.
-pub fn prune(latest_block_number: BlockNumber) {
-    let mut pool = VOTE_POOL.write().expect("vote pool poisoned");
-    pool.prune(latest_block_number);
-    let size = pool.len();
-    drop(pool);
-    update_vote_pool_size_metric(size);
 }
 
 fn maybe_notify_finality(target_hash: B256, votes_for_block: usize) {

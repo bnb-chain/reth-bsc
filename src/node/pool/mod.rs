@@ -216,6 +216,10 @@ where
 
         let blob_store = create_blob_store_with_cache(ctx, blob_cache_size)?;
 
+        // Register blob store globally so the block-body serving path can
+        // look up blob sidecars by tx hash (for GetBlockBodies responses).
+        crate::shared::set_global_blob_store(std::sync::Arc::new(blob_store.clone()));
+
         // Build default Ethereum validator executor
         // BSC rejected EIP-7594 (PeerDAS), so we disable EIP-7594 sidecar support to always
         // use v0 (legacy) blob sidecars and reject v1 (EIP-7594) sidecars.

@@ -4,8 +4,6 @@ use jsonrpsee::proc_macros::rpc;
 
 /// BSC Eth extension API - adds eth_coinbase and eth_health
 /// to match geth-bsc's EthereumAPI and BlockChainAPI.
-///
-/// Note: eth_config (EIP-7910) is already provided by reth's EthConfigHandler.
 #[rpc(server, namespace = "eth")]
 pub trait BscEthExtApi {
     /// Returns the client coinbase address (alias for etherbase).

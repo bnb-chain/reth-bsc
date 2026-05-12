@@ -19,7 +19,7 @@ use reth_discv4::Discv4Config;
 use reth_engine_primitives::ConsensusEngineHandle;
 use reth_eth_wire::{BasicNetworkPrimitives, NewBlock, NewBlockPayload};
 use reth_ethereum_primitives::PooledTransactionVariant;
-use reth_network::{NetworkConfig, NetworkHandle, NetworkManager};
+use reth_network::{NetworkConfig, NetworkHandle, NetworkManager, PeersConfig, SessionsConfig};
 use reth_network_api::PeersInfo;
 use reth_network_peers::NodeRecord;
 use reth_provider::{BlockNumReader, HeaderProvider, StateProviderFactory};
@@ -182,6 +182,42 @@ fn apply_bsc_discv4_overrides<I>(
     discv4_config.lookup_interval = Duration::from_millis(500);
 }
 
+/// Align reth-bsc's per-peer punishment profile with geth-bsc.
+///
+/// Upstream reth treats a single ProtocolBreach as fatal
+/// (`bad_protocol = i32::MIN`) and bans for 12h; BSC mainnet's load
+/// profile fires those triggers on legitimate peers. geth-bsc has no
+/// reputation memory and runs fine. See
+/// docs/superpowers/p2p-stability-phase1.md for the full rationale.
+fn apply_bsc_peer_stability_overrides(
+    peers_config: &mut PeersConfig,
+    sessions_config: &mut SessionsConfig,
+) {
+    // BANNED_REPUTATION = -51200. Weights below picked so a single event
+    // does not cross it: ~4 bad_protocol, ~13 failed_to_connect, or ~50
+    // timeout/dropped events to reach ban — vs. geth-bsc which never bans.
+    peers_config.ban_duration = Duration::from_secs(60);
+    peers_config.reputation_weights.bad_protocol = -16384;
+    peers_config.reputation_weights.failed_to_connect = -4096;
+    peers_config.reputation_weights.timeout = -1024;
+    peers_config.reputation_weights.dropped = -1024;
+
+    // Soft per-request abandonment still happens at internal_request_timeout
+    // (adaptive 2-20s); this is just the deadline for declaring ProtocolBreach.
+    sessions_config.protocol_breach_request_timeout = Duration::from_secs(600);
+
+    // Tentative: widen outbound pipeline against BSC mainnet's ~5-10% dial success rate.
+    peers_config.connection_info.max_concurrent_outbound_dials = 64;
+    peers_config.connection_info.max_outbound = 256;
+
+    // Tentative: 30s covers cross-region bootnode handshakes that clip at the 20s default.
+    sessions_config.pending_session_timeout = Duration::from_secs(30);
+
+    // Tentative: default 5 evicts peers permanently after 6 transient failures, which
+    // BSC mainnet's TooManyPeers/RST rate triggers in minutes; raise the floor.
+    peers_config.max_backoff_count = 32;
+}
+
 impl BscNetworkBuilder {
     pub fn new(
         engine_handle_rx: Arc<
@@ -250,18 +286,17 @@ impl BscNetworkBuilder {
         let provider = ctx.provider().clone();
         let chain_spec = ctx.chain_spec().clone();
 
-        // Install a cached full block provider so that BSC BlocksByRange replies
-        // can include full bodies if they were recently imported. External callers
-        // can override by setting a richer provider before network starts.
+        // Install a cached full block provider so BSC BlocksByRange replies can include
+        // full bodies when blocks are in the provider (DB + canonical in-memory state),
+        // not just the broadcast-populated BODY_CACHE.
         {
-            use reth_provider::{BlockNumReader, HeaderProvider};
+            use reth_provider::BlockReader;
             struct CachedFullBlockProvider<P> {
                 inner: P,
             }
             impl<P> crate::shared::FullBlockProvider for CachedFullBlockProvider<P>
             where
-                P: HeaderProvider<Header = alloy_consensus::Header>
-                    + BlockNumReader
+                P: BlockReader<Block = crate::node::primitives::BscBlock>
                     + Clone
                     + Send
                     + Sync
@@ -271,33 +306,15 @@ impl BscNetworkBuilder {
                     &self,
                     hash: &alloy_primitives::B256,
                 ) -> Option<crate::node::primitives::BscBlock> {
-                    crate::shared::get_cached_block_by_hash(hash).or_else(|| {
-                        self.inner.header(*hash).ok().flatten().map(|h| {
-                            crate::node::primitives::BscBlock {
-                                header: h,
-                                body: crate::node::primitives::BscBlockBody {
-                                    inner: reth_ethereum_primitives::BlockBody::default(),
-                                    sidecars: None,
-                                },
-                            }
-                        })
-                    })
+                    crate::shared::get_cached_block_by_hash(hash)
+                        .or_else(|| self.inner.block_by_hash(*hash).ok().flatten())
                 }
                 fn block_by_number(
                     &self,
                     number: u64,
                 ) -> Option<crate::node::primitives::BscBlock> {
-                    crate::shared::get_cached_block_by_number(number).or_else(|| {
-                        self.inner.header_by_number(number).ok().flatten().map(|h| {
-                            crate::node::primitives::BscBlock {
-                                header: h,
-                                body: crate::node::primitives::BscBlockBody {
-                                    inner: reth_ethereum_primitives::BlockBody::default(),
-                                    sidecars: None,
-                                },
-                            }
-                        })
-                    })
+                    crate::shared::get_cached_block_by_number(number)
+                        .or_else(|| self.inner.block_by_number(number).ok().flatten())
                 }
             }
 
@@ -350,6 +367,10 @@ impl BscNetworkBuilder {
         apply_bsc_discv4_overrides(
             &mut network_config.discovery_v4_config,
             ctx.chain_spec().bootnodes(),
+        );
+        apply_bsc_peer_stability_overrides(
+            &mut network_config.peers_config,
+            &mut network_config.sessions_config,
         );
         network_config.status.forkid = network_config.fork_filter.current();
 
@@ -413,7 +434,18 @@ where
         if crate::shared::set_local_peer_id(*local_peer_id).is_err() {
             warn!(target: "reth::cli", "Failed to set global local peer ID - already set");
         } else {
-            info!(target: "reth::cli", peer_id=%local_peer_id, "Local peer ID set globally");
+            let node_id = alloy_primitives::keccak256(local_peer_id);
+            let node_id_short = format!(
+                "{:016x}",
+                u64::from_be_bytes(node_id.0[..8].try_into().expect("8 bytes"))
+            );
+            info!(
+                target: "reth::cli",
+                peer_id = %local_peer_id,
+                node_id = %node_id,
+                node_id_short = %node_id_short,
+                "Local peer ID set globally (node_id = keccak256(peer_id); use node_id or node_id_short to grep BSC geth logs)"
+            );
         }
 
         if let Err(_h) = crate::shared::set_network_handle(handle.clone()) {
@@ -423,6 +455,7 @@ where
         if crate::node::network::evn::is_evn_enabled() {
             spawn_evn_sync_watcher(ctx, handle.clone());
         }
+
 
         Ok(handle)
     }

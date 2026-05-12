@@ -37,11 +37,29 @@ impl BscHandshake {
             tracing::debug!(target: "bsc_handshake", "Sending upgrade status message, EVN enabled: {}, disable tx broadcast forbidden: {}", evn_enabled, disable_tx_broadcast_forbidden);
             unauth.start_send_unpin(upgrade_msg.into_rlpx())?;
 
-            // Receive peer's upgrade status response
+            // Receive peer's upgrade status response.
+            //
+            // None of the three error branches below disconnects with ProtocolBreach.
+            // A peer that doesn't speak BSC UpgradeStatus (vanilla geth, wrong-fork
+            // client) is not misbehaving; the warn! logs still capture raw bytes /
+            // msg_len / eth version for diagnosing wire corruption.
             let their_msg = match unauth.next().await {
                 Some(Ok(msg)) => msg,
-                Some(Err(e)) => return Err(EthStreamError::from(e)),
+                Some(Err(e)) => {
+                    debug!(
+                        target: "bsc_handshake",
+                        eth_version = ?negotiated_status.version,
+                        error = %e,
+                        "BSC upgrade-status: wire error while reading peer's UpgradeStatus reply; aborting handshake (no ProtocolBreach disconnect emitted by us)"
+                    );
+                    return Err(EthStreamError::from(e));
+                }
                 None => {
+                    debug!(
+                        target: "bsc_handshake",
+                        eth_version = ?negotiated_status.version,
+                        "BSC upgrade-status: peer closed stream before sending UpgradeStatus reply; sending DisconnectRequested (NOT counted as ProtocolBreach)"
+                    );
                     unauth.disconnect(DisconnectReason::DisconnectRequested).await?;
                     return Err(EthStreamError::EthHandshakeError(EthHandshakeError::NoResponse));
                 }
@@ -49,7 +67,13 @@ impl BscHandshake {
 
             // Decode their response
             match UpgradeStatus::decode(&mut their_msg.as_ref()).map_err(|e| {
-                debug!("Decode error in BSC handshake: msg={their_msg:x}");
+                debug!(
+                    target: "bsc_handshake",
+                    eth_version = ?negotiated_status.version,
+                    msg_len = their_msg.len(),
+                    decode_error = %e,
+                    "BSC upgrade-status: failed to decode peer's UpgradeStatus reply (raw msg follows): msg={their_msg:x}"
+                );
                 EthStreamError::InvalidMessage(e.into())
             }) {
                 Ok(their_status) => {
@@ -62,10 +86,21 @@ impl BscHandshake {
                     return Ok(negotiated_status);
                 }
                 Err(e) => {
-                    tracing::trace!(target: "bsc_handshake", "bsc handshake: upgrade failed: {:?}", e);
-                    unauth.disconnect(DisconnectReason::ProtocolBreach).await?;
+                    // Most common cause: peer doesn't speak BSC UpgradeStatus
+                    // (vanilla geth / wrong-fork client) — that's not a protocol
+                    // violation. Disconnect gracefully (matches the empty-stream
+                    // path above) so the peer goes through Low backoff and stays
+                    // retry-eligible, instead of being treated as fatal.
+                    debug!(
+                        target: "bsc_handshake",
+                        eth_version = ?negotiated_status.version,
+                        msg_len = their_msg.len(),
+                        error = %e,
+                        "BSC upgrade-status: decode failed -> sending DisconnectRequested (peer likely not a BSC client or doesn't implement UpgradeStatus; treated as graceful, no protocol_breach metric increment)"
+                    );
+                    unauth.disconnect(DisconnectReason::DisconnectRequested).await?;
                     return Err(EthStreamError::EthHandshakeError(
-                        EthHandshakeError::NonStatusMessageInHandshake,
+                        EthHandshakeError::NoResponse,
                     ));
                 }
             }

@@ -1,5 +1,10 @@
 use clap::{Args, Parser};
-use reth::{builder::NodeHandle, cli::Cli, consensus::FullConsensus};
+use reth::{
+    builder::NodeHandle,
+    cli::Cli,
+    consensus::FullConsensus,
+    version::{default_reth_version_metadata, try_init_version_metadata},
+};
 use reth_bsc::consensus::parlia::bls_signer;
 use reth_bsc::node::consensus::BscConsensus;
 use reth_bsc::{
@@ -109,6 +114,26 @@ pub struct BscCliArgs {
 }
 
 fn main() -> eyre::Result<()> {
+    // Override reth's global version metadata so startup/P2P logs identify
+    // this binary as Reth-BSC with its own version + commit.
+    {
+        use std::borrow::Cow;
+        let pkg_version = env!("CARGO_PKG_VERSION");
+        let git_sha_short = env!("RETH_BSC_GIT_SHA");
+        let git_sha_long = env!("RETH_BSC_GIT_SHA_LONG");
+        let mut md = default_reth_version_metadata();
+        md.name_client = Cow::Borrowed("Reth-BSC");
+        md.cargo_pkg_version = Cow::Borrowed(pkg_version);
+        md.vergen_git_sha = Cow::Borrowed(git_sha_short);
+        md.vergen_git_sha_long = Cow::Borrowed(git_sha_long);
+        md.short_version = Cow::Owned(format!("{pkg_version} ({git_sha_short})"));
+        md.p2p_client_version = Cow::Owned(format!(
+            "reth-bsc/v{pkg_version}-{git_sha_short}/{}",
+            std::env::consts::OS,
+        ));
+        let _ = try_init_version_metadata(md);
+    }
+
     reth_cli_util::sigsegv_handler::install();
 
     // Enable backtraces unless a RUST_BACKTRACE value has already been explicitly provided.
@@ -394,10 +419,23 @@ fn main() -> eyre::Result<()> {
                         // Get pool and provider from context
                         let pool = ctx.pool().clone();
                         let provider = ctx.provider().clone();
-                        
+
                         let blob_api = BlobApiImpl::new(pool, provider);
                         ctx.modules.merge_configured(blob_api.into_rpc())?;
                         tracing::info!("Succeed to register Blob RPC API");
+
+                        tracing::info!("Start to register eth_config (EIP-7910) API...");
+                        use reth::api::FullNodeComponents;
+                        use reth_bsc::rpc::BscEthConfigHandler;
+                        use reth_rpc_eth_api::helpers::config::EthConfigApiServer;
+                        use reth_rpc_server_types::RethRpcModule;
+
+                        let eth_config = BscEthConfigHandler::new(
+                            ctx.provider().clone(),
+                            ctx.node().evm_config().clone(),
+                        );
+                        ctx.modules.merge_if_module_configured(RethRpcModule::Eth, eth_config.into_rpc())?;
+                        tracing::info!("Succeed to register eth_config (EIP-7910) API");
                         Ok(())
                     })
                     .launch().await?;

@@ -305,12 +305,18 @@ where
             let parent_snap = snapshot_provider
                 .snapshot_by_hash(&header.parent_hash)
                 .ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;
+            let block_timestamp_ms = self.parlia.block_time_for_ramanujan_fork(
+                &parent_snap,
+                parent_header.header(),
+                &header,
+            );
             finalize_new_header(
-                self.parlia.clone(), 
-                &parent_snap, 
-                &parent_header, 
+                self.parlia.clone(),
+                &parent_snap,
+                &parent_header,
                 &mut header,
                 &snapshot_provider,
+                block_timestamp_ms,
             ).map_err(|e| BlockExecutionError::msg(format!("Failed to finalize header: {}", e)))?;
 
             let header_hash = keccak256(alloy_rlp::encode(&header));
