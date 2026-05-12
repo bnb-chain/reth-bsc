@@ -498,7 +498,7 @@ where
                 // Surface this at INFO under `bsc::peers` so #312-style peer-loss
                 // investigations can attribute drift to this guard without DEBUG logs.
                 if let Some(net) = crate::shared::get_network_handle() {
-                    tracing::info!(
+                    tracing::debug!(
                         target: "bsc::peers",
                         peer = %peer_id, gap, threshold = MAX_STALE_BLOCK_DISTANCE,
                         "applying BadAnnouncement: stale-block guard"
