@@ -96,26 +96,6 @@ fn sync_pending_votes_to_peer(peer: PeerId, tx: UnboundedSender<BscCommand>) {
     }
 }
 
-/// Snapshot the currently registered BSC protocol peers, regardless of bsc/n
-/// version. Kept for non-`GetBlocksByRange` use cases (any future caller that
-/// needs to iterate v1+v2 peers); current callers prefer [`list_v2_peers`].
-#[allow(dead_code)]
-pub fn list_registered_peers() -> Vec<PeerId> {
-    match REGISTRY.read() {
-        Ok(guard) => guard.keys().copied().collect(),
-        Err(_) => Vec::new(),
-    }
-}
-
-/// Returns true if the given peer is registered with the BSC subprotocol,
-/// regardless of bsc/n version. Use [`is_v2_peer`] to gate `GetBlocksByRange`.
-#[allow(dead_code)]
-pub fn has_registered_peer(peer: PeerId) -> bool {
-    match REGISTRY.read() {
-        Ok(guard) => guard.contains_key(&peer),
-        Err(_) => false,
-    }
-}
 
 /// Returns true if `peer` negotiated bsc/2 — required for `GetBlocksByRange`.
 pub fn is_v2_peer(peer: PeerId) -> bool {
