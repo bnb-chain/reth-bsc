@@ -116,11 +116,15 @@ where
     announce_interval: tokio::time::Interval,
 }
 
+/// Pick a peer to route `GetBlocksByRange` to. Only bsc/2 peers qualify —
+/// bsc/1 peers don't speak `GetBlocksByRange` and would kick us with
+/// `SubprotocolSpecific`. Prefer the announcing peer if it's bsc/2;
+/// otherwise pick any registered bsc/2 peer.
 fn resolve_bsc_peer_static(announcer: PeerId) -> Option<PeerId> {
-    if crate::node::network::bsc_protocol::registry::has_registered_peer(announcer) {
+    if crate::node::network::bsc_protocol::registry::is_v2_peer(announcer) {
         Some(announcer)
     } else {
-        crate::node::network::bsc_protocol::registry::list_registered_peers().into_iter().next()
+        crate::node::network::bsc_protocol::registry::list_v2_peers().into_iter().next()
     }
 }
 
@@ -291,6 +295,16 @@ where
                         let recovering = recovering_heads.clone();
                         let peer = resolve_bsc_peer_static(peer_id);
                         let failed_heads = failed_heads.clone();
+                        // Parent-start to dodge the broadcast-before-commit
+                        // race; see `RecoverTarget::from_parent`.
+                        let recover_target =
+                            crate::node::network::block_import::fork_recover::RecoverTarget::from_parent(
+                                header.parent_hash,
+                                block_number.saturating_sub(1),
+                                block_hash,
+                                block_number,
+                                header.clone(),
+                            );
                         tokio::spawn(async move {
                             let _guard = crate::node::network::block_import::fork_recover::RecoveringHeadGuard::new(
                                 block_hash, recovering,
@@ -303,8 +317,7 @@ where
                             if let Err(err) =
                                 crate::node::network::block_import::fork_recover::recover_ancestors(
                                     target,
-                                    block_hash,
-                                    block_number,
+                                    recover_target,
                                     provider,
                                     engine_clone,
                                     forkchoice_engine_clone,
@@ -327,12 +340,13 @@ where
                     _ => None,
                 },
                 Err(err) => {
-                    tracing::warn!(
+                    tracing::debug!(
                         target: "bsc::block_import",
-                        block_hash = %block_hash,
                         block_number = header.number,
-                        %err,
-                        "Engine unavailable or failed to process new payload"
+                        block_hash = %block_hash,
+                        peer = %peer_id,
+                        error = %err,
+                        "engine.new_payload returned error"
                     );
                     None
                 }
@@ -455,6 +469,10 @@ where
     fn on_new_block(&mut self, block: BlockMsg, peer_id: PeerId) {
         tracing::debug!(target: "bsc::block_import", "Receiving new block from network: number = {:?}, hash = {:?}, peer = {:?}", block.block.0.block.header.number, block.hash, peer_id);
 
+        // Record before stale-block / dedup checks: announcer remains a
+        // valid `GetBlocksByRange` target even if we skip processing here.
+        crate::node::network::bsc_protocol::registry::record_announcer(block.hash, peer_id);
+
         // Drop blocks that are far behind the canonical head early to avoid wasting
         // resources on stale blocks from misbehaving or out-of-sync peers. Without this
         // guard, proof workers open read transactions against cold historical trie pages,
@@ -463,19 +481,28 @@ where
         if let Ok(info) = self.forkchoice_engine.provider.chain_info() {
             let block_number = block.block.0.block.header.number;
             if block_number + MAX_STALE_BLOCK_DISTANCE < info.best_number {
+                let gap = info.best_number - block_number;
                 tracing::debug!(
                     target: "bsc::block_import",
                     block_number,
                     block_hash = %block.hash,
                     canonical_head = info.best_number,
-                    gap = info.best_number - block_number,
+                    gap,
                     peer_id = %peer_id,
                     "Dropping stale block far behind canonical head"
                 );
                 // Apply a lightweight reputation penalty so peers that repeatedly send
                 // stale blocks are gradually deprioritized (BadAnnouncement = -1024,
                 // needs ~50 hits to reach ban threshold).
+                //
+                // Surface this at INFO under `bsc::peers` so #312-style peer-loss
+                // investigations can attribute drift to this guard without DEBUG logs.
                 if let Some(net) = crate::shared::get_network_handle() {
+                    tracing::debug!(
+                        target: "bsc::peers",
+                        peer = %peer_id, gap, threshold = MAX_STALE_BLOCK_DISTANCE,
+                        "applying BadAnnouncement: stale-block guard"
+                    );
                     net.reputation_change(peer_id, ReputationChangeKind::BadAnnouncement);
                 }
                 return;
@@ -490,6 +517,25 @@ where
             tracing::trace!(target: "bsc::block_import", "Block already queued when receiving new block: number = {:?}, hash = {:?}", block.block.0.block.header.number, block.hash);
             return;
         }
+
+        let local_tip = self.forkchoice_engine.provider.best_block_number().unwrap_or(0);
+        let block_number = block.block.0.block.header.number;
+        let delta = block_number.saturating_sub(local_tip);
+        if delta > PIPELINE_TRIGGER_DELTA {
+            tracing::info!(
+                target: "bsc::block_import",
+                block_hash = %block.hash,
+                block_number,
+                local_tip,
+                delta,
+                peer = %peer_id,
+                "NewBlock far ahead of local tip; routing to pipeline instead of fork_recover"
+            );
+            self.processed_blocks.insert(block.hash);
+            self.spawn_pipeline_trigger_fcu(peer_id, block.hash, block_number, local_tip, delta);
+            return;
+        }
+
         self.queued_blocks.insert(block.hash);
 
         // Record chain delay metrics: time from block creation to first network reception
@@ -533,6 +579,12 @@ where
         };
 
         for hash_number in hashes.0 {
+            // Record before dedup checks (see `on_new_block` above).
+            crate::node::network::bsc_protocol::registry::record_announcer(
+                hash_number.hash,
+                peer_id,
+            );
+
             if self.processed_blocks.contains(&hash_number.hash) {
                 continue;
             }
@@ -608,11 +660,16 @@ where
                     );
                     return;
                 };
+                // Header-only path: no parent_hash, so fetch and FCU collapse
+                // to the same hash. See `RecoverTarget::single_pair`.
+                let recover_target =
+                    crate::node::network::block_import::fork_recover::RecoverTarget::single_pair(
+                        head_hash, head_num,
+                    );
                 if let Err(err) =
                     crate::node::network::block_import::fork_recover::recover_ancestors(
                         target,
-                        head_hash,
-                        head_num,
+                        recover_target,
                         provider,
                         engine,
                         forkchoice_engine,
@@ -633,8 +690,7 @@ where
         }
     }
 
-    /// Pick a peer to route `GetBlocksByRange` to. Prefer the announcing peer
-    /// if it speaks the BSC sub-protocol; otherwise any registered BSC peer.
+    /// See [`resolve_bsc_peer_static`].
     fn resolve_bsc_peer(&self, announcer: PeerId) -> Option<PeerId> {
         resolve_bsc_peer_static(announcer)
     }
@@ -906,8 +962,8 @@ mod tests {
     use reth_chainspec::ChainInfo;
     use reth_engine_primitives::{BeaconEngineMessage, OnForkChoiceUpdated};
     use reth_eth_wire::NewBlock;
-    use reth_node_ethereum::EthEngineTypes;
     use reth_ethereum_primitives::Block;
+    use reth_node_ethereum::EthEngineTypes;
     use reth_primitives_traits::SealedHeader;
     use reth_provider::ProviderError;
     use schnellru::{ByLength, LruMap};
@@ -1324,11 +1380,7 @@ mod tests {
                         tx.send(Ok(PayloadStatus::new(responses.new_payload.clone(), None)))
                             .unwrap();
                     }
-                    BeaconEngineMessage::ForkchoiceUpdated {
-                        state: _,
-                        payload_attrs: _,
-                        tx,
-                    } => {
+                    BeaconEngineMessage::ForkchoiceUpdated { state: _, payload_attrs: _, tx } => {
                         tx.send(Ok(OnForkChoiceUpdated::valid(PayloadStatus::new(
                             responses.fcu.clone(),
                             None,
@@ -1366,11 +1418,7 @@ mod tests {
                         let _ = np_tx.send(());
                         let _ = tx.send(Ok(PayloadStatus::new(PayloadStatusEnum::Valid, None)));
                     }
-                    BeaconEngineMessage::ForkchoiceUpdated {
-                        state,
-                        payload_attrs: _,
-                        tx,
-                    } => {
+                    BeaconEngineMessage::ForkchoiceUpdated { state, payload_attrs: _, tx } => {
                         let _ = fcu_tx.send(state);
                         let _ = tx.send(Ok(OnForkChoiceUpdated::valid(PayloadStatus::new(
                             PayloadStatusEnum::Valid,
