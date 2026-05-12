@@ -31,37 +31,37 @@ impl ConnectionHandler for BscConnectionHandlerV2 {
     fn on_unsupported_by_peer(
         self,
         _supported: &SharedCapabilities,
-        _direction: reth_network_api::Direction,
-        _peer_id: PeerId,
+        direction: reth_network_api::Direction,
+        peer_id: PeerId,
     ) -> OnNotSupported {
-        tracing::debug!(target: "bsc_protocol", "Unsupported by peer, direction: {}, peer_id: {}", _direction, _peer_id);
+        tracing::debug!(target: "bsc_protocol", "Unsupported bsc v2 by peer, direction: {}, peer_id: {}", direction, peer_id);
         OnNotSupported::KeepAlive
     }
 
     fn into_connection(
         self,
         direction: Direction,
-        _peer_id: PeerId,
+        peer_id: PeerId,
         conn: ProtocolConnection,
     ) -> Self::Connection {
-        tracing::debug!(target: "bsc_protocol", "Into connection, direction: {}, peer_id: {}", direction, _peer_id);
+        tracing::debug!(target: "bsc_protocol", "Into connection, direction: {}, peer_id: {}", direction, peer_id);
         let (tx, rx) = mpsc::unbounded_channel();
         // Save sender so other components can broadcast BSC messages
         // Note: PeerId is not exposed directly here, so we rely on the local peer id for keying
         // when available. However, reth passes `_peer_id` which we can use.
         // Even if the connection drops, failed sends will lazily clean up entries.
-        registry::register_peer(_peer_id, tx);
+        registry::register_peer(peer_id, tx, 2);
         // EVN: mark this peer if present in whitelist and mark as trusted at runtime
-        crate::node::network::evn_peers::mark_evn_if_whitelisted(_peer_id);
-        if crate::node::network::evn_peers::is_evn_peer(_peer_id) {
+        crate::node::network::evn_peers::mark_evn_if_whitelisted(peer_id);
+        if crate::node::network::evn_peers::is_evn_peer(peer_id) {
             if let Some(net) = crate::shared::get_network_handle() {
-                net.add_trusted_peer_id(_peer_id);
+                net.add_trusted_peer_id(peer_id);
             }
         }
         // Ensure EVN refresh listener is running to handle post-sync EVN updates
         // for existing peers.
         crate::node::network::bsc_protocol::registry::spawn_evn_refresh_listener();
-        BscProtocolConnection::new(conn, rx, direction.is_outgoing(), 2, Some(_peer_id))
+        BscProtocolConnection::new(conn, rx, direction.is_outgoing(), 2, Some(peer_id))
     }
 }
 
@@ -91,27 +91,28 @@ impl ConnectionHandler for BscConnectionHandlerV1 {
     fn on_unsupported_by_peer(
         self,
         _supported: &SharedCapabilities,
-        _direction: reth_network_api::Direction,
-        _peer_id: PeerId,
+        direction: reth_network_api::Direction,
+        peer_id: PeerId,
     ) -> OnNotSupported {
+        tracing::debug!(target: "bsc_protocol", "Unsupported bsc v1 by peer, direction: {}, peer_id: {}", direction, peer_id);
         OnNotSupported::KeepAlive
     }
 
     fn into_connection(
         self,
         direction: Direction,
-        _peer_id: PeerId,
+        peer_id: PeerId,
         conn: ProtocolConnection,
     ) -> Self::Connection {
         let (tx, rx) = mpsc::unbounded_channel();
-        registry::register_peer(_peer_id, tx);
-        crate::node::network::evn_peers::mark_evn_if_whitelisted(_peer_id);
-        if crate::node::network::evn_peers::is_evn_peer(_peer_id) {
+        registry::register_peer(peer_id, tx, 1);
+        crate::node::network::evn_peers::mark_evn_if_whitelisted(peer_id);
+        if crate::node::network::evn_peers::is_evn_peer(peer_id) {
             if let Some(net) = crate::shared::get_network_handle() {
-                net.add_trusted_peer_id(_peer_id);
+                net.add_trusted_peer_id(peer_id);
             }
         }
         crate::node::network::bsc_protocol::registry::spawn_evn_refresh_listener();
-        BscProtocolConnection::new(conn, rx, direction.is_outgoing(), 1, Some(_peer_id))
+        BscProtocolConnection::new(conn, rx, direction.is_outgoing(), 1, Some(peer_id))
     }
 }
