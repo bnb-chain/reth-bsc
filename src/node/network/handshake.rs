@@ -11,7 +11,7 @@ use reth_ethereum_forks::ForkFilter;
 use std::{future::Future, pin::Pin};
 use tokio::time::{timeout, Duration};
 use tokio_stream::StreamExt;
-use tracing::{debug, warn};
+use tracing::debug;
 
 #[derive(Debug, Default)]
 /// The Binance Smart Chain (BSC) P2P handshake.
@@ -46,7 +46,7 @@ impl BscHandshake {
             let their_msg = match unauth.next().await {
                 Some(Ok(msg)) => msg,
                 Some(Err(e)) => {
-                    warn!(
+                    debug!(
                         target: "bsc_handshake",
                         eth_version = ?negotiated_status.version,
                         error = %e,
@@ -55,7 +55,7 @@ impl BscHandshake {
                     return Err(EthStreamError::from(e));
                 }
                 None => {
-                    warn!(
+                    debug!(
                         target: "bsc_handshake",
                         eth_version = ?negotiated_status.version,
                         "BSC upgrade-status: peer closed stream before sending UpgradeStatus reply; sending DisconnectRequested (NOT counted as ProtocolBreach)"
@@ -67,7 +67,7 @@ impl BscHandshake {
 
             // Decode their response
             match UpgradeStatus::decode(&mut their_msg.as_ref()).map_err(|e| {
-                warn!(
+                debug!(
                     target: "bsc_handshake",
                     eth_version = ?negotiated_status.version,
                     msg_len = their_msg.len(),
@@ -91,7 +91,7 @@ impl BscHandshake {
                     // violation. Disconnect gracefully (matches the empty-stream
                     // path above) so the peer goes through Low backoff and stays
                     // retry-eligible, instead of being treated as fatal.
-                    warn!(
+                    debug!(
                         target: "bsc_handshake",
                         eth_version = ?negotiated_status.version,
                         msg_len = their_msg.len(),

@@ -258,12 +258,28 @@ pub fn put_vote(vote: VoteEnvelope) {
     // inner prune is O(0) when nothing is stale.
     let need_prune = pending_block_number > LAST_PRUNED_BLOCK.load(Ordering::Relaxed);
 
+    let target_number = vote.data.target_number;
+
     let mut pool = VOTE_POOL.write().expect("vote pool poisoned");
     let votes_for_block = pool.insert(vote, pending_block_number);
     if need_prune {
         pool.prune(pending_block_number);
         LAST_PRUNED_BLOCK.fetch_max(pending_block_number, Ordering::Relaxed);
     }
+
+    // Force prune if pool is too large, prevents memory issues during stage sync.
+    const MAX_VOTES_IN_POOL: usize = 32 * 1024 * 2;
+    if pool.len() > MAX_VOTES_IN_POOL {
+        let force_prune = target_number.saturating_sub(LOWER_LIMIT_OF_VOTE_BLOCK_NUMBER);
+        pool.prune(force_prune);
+        tracing::debug!(
+            target: "bsc::vote_pool",
+            pool_size = pool.len(),
+            force_prune_block_number = force_prune,
+            "Vote pool oversized, force pruned"
+        );
+    }
+
     let size = pool.len();
     drop(pool);
     update_vote_pool_size_metric(size);
