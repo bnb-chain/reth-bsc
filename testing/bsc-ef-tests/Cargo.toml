@@ -14,22 +14,22 @@ asm-keccak = ["alloy-primitives/asm-keccak"]
 reth_bsc = { path = "../.." }
 
 # reth dependencies aligned with root crate branch to avoid duplicate crate versions
-reth-chainspec = { git = "https://github.com/bnb-chain/reth.git", branch = "develop-v2.2-without-cross-region" }
-reth-consensus = { git = "https://github.com/bnb-chain/reth.git", branch = "develop-v2.2-without-cross-region" }
-reth-ethereum-forks = { git = "https://github.com/bnb-chain/reth.git", branch = "develop-v2.2-without-cross-region" }
-reth-db = { git = "https://github.com/bnb-chain/reth.git", branch = "develop-v2.2-without-cross-region", features = ["mdbx", "test-utils", "disable-lock"] }
-reth-db-api = { git = "https://github.com/bnb-chain/reth.git", branch = "develop-v2.2-without-cross-region" }
-reth-db-common = { git = "https://github.com/bnb-chain/reth.git", branch = "develop-v2.2-without-cross-region" }
-reth-ethereum-consensus = { git = "https://github.com/bnb-chain/reth.git", branch = "develop-v2.2-without-cross-region" }
-reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "develop-v2.2-without-cross-region" }
-reth-evm = { git = "https://github.com/bnb-chain/reth.git", branch = "develop-v2.2-without-cross-region" }
-reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "develop-v2.2-without-cross-region" }
+reth-chainspec = { git = "https://github.com/bnb-chain/reth.git", branch = "develop-v2.2-without-cross-region-double-sign-fix" }
+reth-consensus = { git = "https://github.com/bnb-chain/reth.git", branch = "develop-v2.2-without-cross-region-double-sign-fix" }
+reth-ethereum-forks = { git = "https://github.com/bnb-chain/reth.git", branch = "develop-v2.2-without-cross-region-double-sign-fix" }
+reth-db = { git = "https://github.com/bnb-chain/reth.git", branch = "develop-v2.2-without-cross-region-double-sign-fix", features = ["mdbx", "test-utils", "disable-lock"] }
+reth-db-api = { git = "https://github.com/bnb-chain/reth.git", branch = "develop-v2.2-without-cross-region-double-sign-fix" }
+reth-db-common = { git = "https://github.com/bnb-chain/reth.git", branch = "develop-v2.2-without-cross-region-double-sign-fix" }
+reth-ethereum-consensus = { git = "https://github.com/bnb-chain/reth.git", branch = "develop-v2.2-without-cross-region-double-sign-fix" }
+reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "develop-v2.2-without-cross-region-double-sign-fix" }
+reth-evm = { git = "https://github.com/bnb-chain/reth.git", branch = "develop-v2.2-without-cross-region-double-sign-fix" }
+reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "develop-v2.2-without-cross-region-double-sign-fix" }
 reth-primitives-traits = { git = "https://github.com/bnb-chain/reth-core.git", branch = "v0.3.1-v2", default-features = false }
-reth-provider = { git = "https://github.com/bnb-chain/reth.git", branch = "develop-v2.2-without-cross-region", features = ["test-utils"] }
-reth-revm = { git = "https://github.com/bnb-chain/reth.git", branch = "develop-v2.2-without-cross-region", features = ["std"] }
-reth-tracing = { git = "https://github.com/bnb-chain/reth.git", branch = "develop-v2.2-without-cross-region" }
-reth-trie = { git = "https://github.com/bnb-chain/reth.git", branch = "develop-v2.2-without-cross-region" }
-reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", branch = "develop-v2.2-without-cross-region" }
+reth-provider = { git = "https://github.com/bnb-chain/reth.git", branch = "develop-v2.2-without-cross-region-double-sign-fix", features = ["test-utils"] }
+reth-revm = { git = "https://github.com/bnb-chain/reth.git", branch = "develop-v2.2-without-cross-region-double-sign-fix", features = ["std"] }
+reth-tracing = { git = "https://github.com/bnb-chain/reth.git", branch = "develop-v2.2-without-cross-region-double-sign-fix" }
+reth-trie = { git = "https://github.com/bnb-chain/reth.git", branch = "develop-v2.2-without-cross-region-double-sign-fix" }
+reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", branch = "develop-v2.2-without-cross-region-double-sign-fix" }
 
 # revm
 revm = { version = "38.0.0", features = ["secp256k1", "blst", "c-kzg", "memory_limit"] }
