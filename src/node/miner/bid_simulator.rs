@@ -612,6 +612,7 @@ where
         };
         let mut executed_block = executed.into_executed_payload();
         executed_block.difflayer = difflayer;
+        executed_block.is_miner_block = true;
 
         // Read validator/turn-length data transported via sinks from the now-consumed builder.
         let pending_validators = bid_validator_cache_sink.lock().unwrap().take();
