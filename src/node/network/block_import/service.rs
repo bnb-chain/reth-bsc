@@ -326,7 +326,17 @@ where
                     }
                     _ => None,
                 },
-                Err(err) => None,
+                Err(err) => {
+                    tracing::warn!(
+                        target: "bsc::block_import",
+                        block_number = header.number,
+                        block_hash = %block_hash,
+                        peer = %peer_id,
+                        error = %err,
+                        "engine.new_payload returned an error"
+                    );
+                    None
+                }
             }
         })
     }
@@ -369,13 +379,13 @@ where
         //
         // Ordering guarantee: InsertExecutedBlock MUST be processed by the engine before FCU.
         // Both messages travel through separate channels (engine_api_tx vs consensus_engine_tx)
-        // that feed into the same engine service via a tokio::select! loop. Without explicit
-        // ordering, the engine may process FCU before the block is indexed, causing it to be
-        // rejected or ignored.
+        // that feed into the same non-biased tokio::select! loop. Without explicit ordering,
+        // the engine may process FCU before the block is indexed, returning Syncing — which
+        // looks like success to the caller but leaves the chain stuck.
         //
-        // Fix: run both in a single spawned task. After sending InsertExecutedBlock, call
-        // yield_now() so the engine service task can pick up and process the insert from
-        // engine_api_rx before we send FCU through the separate consensus channel.
+        // Fix: use an ack oneshot channel. The engine sends () on ack_tx after the block is
+        // inserted into blocks_by_hash. We await ack_rx before sending FCU, giving a hard
+        // ordering guarantee regardless of tokio scheduler decisions.
         {
             let engine_tx_opt = crate::shared::get_engine_api_tx();
             let executed_block = payload.executed_block.clone();
@@ -388,8 +398,9 @@ where
                         block_hash = %block_hash,
                         "Inserting mined block into engine tree"
                     );
-                    if let Err(e) =
-                        engine_tx.send(EngineApiRequest::InsertExecutedBlock(executed_block))
+                    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<()>();
+                    if let Err(e) = engine_tx
+                        .send(EngineApiRequest::InsertExecutedBlock(executed_block, Some(ack_tx)))
                     {
                         tracing::warn!(
                             target: "bsc::block_import",
@@ -400,11 +411,10 @@ where
                         );
                         return;
                     }
-                    // Yield to the tokio runtime so the engine service loop processes
-                    // InsertExecutedBlock from engine_api_rx before FCU is enqueued in
-                    // the separate consensus_engine channel. This closes the race window
-                    // where FCU could arrive at the engine tree before the block is indexed.
-                    tokio::task::yield_now().await;
+                    // Wait until the engine has indexed the block before sending FCU.
+                    // If the channel drops (engine shut down), proceed anyway — FCU will fail
+                    // gracefully.
+                    let _ = ack_rx.await;
                 } else {
                     tracing::warn!(
                         target: "bsc::block_import",
