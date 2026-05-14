@@ -138,9 +138,7 @@ pub struct Discovery {
 /// Walk backwards from `(head_num, head_hash)` via `parent_hash`-walked
 /// `GetBlocksByRange` hops until a local-chain match is found or
 /// `MAX_FORK_DEPTH` is exhausted.
-pub async fn discover_fork_blocks<
-    P: BlockHashReader + HeaderProvider<Header = alloy_consensus::Header>,
->(
+pub async fn discover_fork_blocks<P: BlockHashReader>(
     peer: PeerId,
     head_hash: B256,
     head_num: u64,
@@ -153,17 +151,18 @@ pub async fn discover_fork_blocks<
     let mut walked: u64 = 0;
 
     loop {
-        // Pre-hop local checks: if this cursor is already local, we've
+        // Pre-hop local checks: if this cursor is already canonical we've
         // reached the common ancestor (or short-circuited on an already-known
         // head).
         //
-        // The side-chain hit (`provider.header(cursor_hash).is_some()`) is
-        // safe to treat as "ancestor reached" because engine-tree only stores
-        // a header when its parent was already Valid via a prior new_payload.
-        // Transitively, any side-block in our provider is rooted at the
-        // canonical chain, so no further walking is required.
-        let cursor_is_local = provider.block_hash(cursor_num)? == Some(cursor_hash)
-            || provider.header(cursor_hash)?.is_some();
+        // We intentionally only check the canonical chain here.  A rejected
+        // block's header can still be visible via `provider.header()` (e.g.
+        // the engine tree keeps it in its buffer after adding it to
+        // `invalid_headers`), so using that check would incorrectly treat a
+        // previously-invalid block as a valid ancestor and cause Phase-2 to
+        // try importing descendants that inherit from it — failing with
+        // "links to previously rejected block".
+        let cursor_is_local = provider.block_hash(cursor_num)? == Some(cursor_hash);
         if cursor_is_local {
             let outcome = if fork_blocks.is_empty() {
                 DiscoveryOutcome::Shortcircuit
@@ -195,10 +194,11 @@ pub async fn discover_fork_blocks<
                 found_ancestor = true;
                 break;
             }
-            // Side-chain already present: skip adding to fork_blocks, but keep walking.
-            if provider.header(b.header.hash_slow())?.is_some() {
-                continue;
-            }
+            // Only skip blocks that are confirmed canonical — do NOT skip on
+            // `provider.header().is_some()` alone.  A rejected block's header
+            // can still be present via the engine tree buffer; skipping it
+            // would leave a gap in fork_blocks so Phase-2 starts with a block
+            // whose parent was never actually imported.
             fork_blocks.push(b.clone());
         }
         if found_ancestor {
