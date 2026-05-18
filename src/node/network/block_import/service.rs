@@ -326,7 +326,16 @@ where
                     }
                     _ => None,
                 },
-                Err(err) => None,
+                Err(err) => {
+                    tracing::warn!(
+                        target: "bsc::block_import",
+                        block_hash = %block_hash,
+                        block_number = header.number,
+                        %err,
+                        "Engine unavailable or failed to process new payload"
+                    );
+                    None
+                }
             }
         })
     }
