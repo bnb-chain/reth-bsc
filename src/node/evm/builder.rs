@@ -126,15 +126,19 @@ where
         state: impl StateProvider,
     ) -> Result<BlockBuilderOutcomeWithDiffLayer<BscPrimitives>, BlockExecutionError> {
         let finish_start = std::time::Instant::now();
+        let executor_finish_started = std::time::Instant::now();
         let (evm, result) = self.executor.finish()?;
         let (db, evm_env) = evm.finish();
+        let executor_finish_us = executor_finish_started.elapsed().as_micros();
 
         let assembled_system_txs = {
             let mut inner = self.shared_ctx.inner.borrow_mut();
             std::mem::take(&mut inner.assembled_system_txs)
         };
         // merge all transitions into bundle state
+        let merge_transitions_started = std::time::Instant::now();
         db.merge_transitions(BundleRetention::Reverts);
+        let merge_transitions_us = merge_transitions_started.elapsed().as_micros();
 
         let state_root_start = std::time::Instant::now();
         let hashed_state = state.hashed_post_state(&db.bundle_state);
@@ -191,8 +195,10 @@ where
         self.transactions.extend(assembled_system_txs);
         let total_tx_len = self.transactions.len();
 
+        let tx_into_parts_started = std::time::Instant::now();
         let (transactions, senders): (Vec<_>, Vec<_>) =
             self.transactions.into_iter().map(|tx| tx.into_parts()).unzip();
+        let tx_into_parts_us = tx_into_parts_started.elapsed().as_micros();
 
         // Extract sinks from ctx before it is moved into BscBlockAssemblerInput.
         let validator_cache_sink = self.ctx.validator_cache_sink.take();
@@ -243,6 +249,20 @@ where
             state_root_duration_ms = state_root_duration.as_millis(),
             assemble_duration_ms = assemble_duration.as_millis(),
             "Assembled block body (pre-finalize)"
+        );
+        tracing::debug!(
+            target: "bsc::builder::finish",
+            block_number = block.header.number,
+            user_tx_count = user_tx_len,
+            system_tx_count = system_tx_len,
+            total_tx_count = total_tx_len,
+            executor_finish_us,
+            merge_transitions_us,
+            state_root_us = state_root_duration.as_micros(),
+            tx_into_parts_us,
+            assemble_us = assemble_duration.as_micros(),
+            finish_total_us = finish_duration.as_micros(),
+            "finish breakdown"
         );
 
         let block = RecoveredBlock::new_unhashed(block, senders);
