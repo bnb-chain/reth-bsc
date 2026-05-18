@@ -91,6 +91,7 @@ where
     pub fn assemble_block_body_only(&self, input: BscBlockAssemblerInput<'_, '_, BscBlockExecutorFactory>) ->
         Result<crate::node::primitives::BscBlock, BlockExecutionError>
     {
+        let assemble_started = std::time::Instant::now();
         let BscBlockAssemblerInput {
             evm_env,
             execution_ctx: ctx,
@@ -103,15 +104,24 @@ where
 
         let eth_ctx = ctx.as_eth_context();
         let timestamp = evm_env.block_env.timestamp().saturating_to();
+
+        let tx_root_started = std::time::Instant::now();
         let transactions_root = proofs::calculate_transaction_root(&transactions);
+        let tx_root_us = tx_root_started.elapsed().as_micros();
+
         let block_number = evm_env.block_env.number().saturating_to();
 
+        let receipt_root_started = std::time::Instant::now();
         let receipts_with_bloom = receipts.iter().map(TxReceipt::with_bloom_ref).collect::<Vec<_>>();
+        let receipts_with_bloom_collect_us = receipt_root_started.elapsed().as_micros();
         let receipts_root = alloy_consensus::proofs::calculate_receipt_root(&receipts_with_bloom);
+        let receipt_root_us = receipt_root_started.elapsed().as_micros();
 
+        let bloom_started = std::time::Instant::now();
         let logs_bloom = receipts_with_bloom
             .iter()
             .fold(alloy_primitives::Bloom::ZERO, |bloom, r| bloom | r.bloom_ref());
+        let bloom_us = bloom_started.elapsed().as_micros();
 
         let mut withdrawals_root = None;
         let mut withdrawals = None;
@@ -178,9 +188,19 @@ where
             requests_hash,
         };
 
+        let assemble_total_us = assemble_started.elapsed().as_micros();
         tracing::debug!(
-            "Assembled block body only (pre-finalize), block_number={}, parent_hash=0x{:x}, txs={}",
-            header.number, header.parent_hash, transactions.len()
+            target: "bsc::builder::assemble",
+            block_number = header.number,
+            parent_hash = ?header.parent_hash,
+            tx_count = transactions.len(),
+            receipt_count = receipts_with_bloom.len(),
+            tx_root_us,
+            receipts_with_bloom_collect_us,
+            receipt_root_us,
+            bloom_us,
+            assemble_total_us,
+            "assemble breakdown"
         );
 
         Ok(BscBlock {
