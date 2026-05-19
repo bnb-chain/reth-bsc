@@ -183,26 +183,23 @@ where
                 "Calculated state root using triedb"
             );
 
-            // Snapshot the per-layer bloom filter stats accumulated during this
-            // state-root call (resets to 0 atomically for the next block).
-            // Only meaningful when the chain actually had parent diff layers
-            // — first few blocks after restart will see queries=0.
-            if let Some(difflayers) = difflayers_opt {
-                let s = difflayers.filter_stats.snapshot_and_reset();
-                tracing::debug!(
-                    target: "bsc::builder::difflayer",
-                    block_number = self.parent.number + 1,
-                    chain_depth = difflayers.diff_layers.len(),
-                    queries = s.queries,
-                    bloom_checks = s.bloom_checks,
-                    bloom_rejects = s.bloom_rejects,
-                    bloom_passes = s.bloom_passes,
-                    hashmap_hits = s.hashmap_hits,
-                    hashmap_misses = s.hashmap_misses,
-                    resolve_total_us = s.total_lookup_ns / 1_000,
-                    "difflayer filter stats"
-                );
-            }
+            // Snapshot per-block trie-lookup path counters: how many
+            // resolves landed at each tier (DiffLayer / moka cache / RocksDB).
+            // Counters are global atomics in rust_eth_triedb_common, padded
+            // to one cache line each so concurrent increments from the
+            // state-root main thread and prefetcher tasks don't contend.
+            let s = rust_eth_triedb_common::lookup_stats::snapshot_and_reset();
+            let total = s.total();
+            tracing::debug!(
+                target: "bsc::builder::triedb_path",
+                block_number = self.parent.number + 1,
+                chain_depth = difflayers_opt.map(|d| d.diff_layers.len()).unwrap_or(0),
+                diff_hits = s.diff_hits,
+                moka_hits = s.moka_hits,
+                disk_reads = s.disk_reads,
+                total = total,
+                "trie lookup path breakdown"
+            );
             (new_root, TrieUpdates::default(), Some(new_difflayer))
         } else {
             let (root, updates) =
