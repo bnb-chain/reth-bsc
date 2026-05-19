@@ -777,7 +777,16 @@ where
         let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } = out.inner;
         let difflayer = out.difflayer;
 
+        let block_clone_started = std::time::Instant::now();
         let mut sealed_block = Arc::new(block.sealed_block().clone());
+        let block_clone_us = block_clone_started.elapsed().as_micros();
+        debug!(
+            target: "bsc::builder::clone",
+            block_number = sealed_block.number(),
+            tx_count = sealed_block.body().inner.transactions.len(),
+            block_clone_us,
+            "block clone breakdown"
+        );
 
         // Update miner metrics
         let finalize_elapsed = finalize_start.elapsed();
@@ -1001,7 +1010,16 @@ where
         let difflayer = out.difflayer;
         let finalize_elapsed = finalize_start.elapsed();
 
+        let block_clone_started = std::time::Instant::now();
         let sealed_block = Arc::new(block.sealed_block().clone());
+        let block_clone_us = block_clone_started.elapsed().as_micros();
+        debug!(
+            target: "bsc::builder::clone",
+            block_number = sealed_block.number(),
+            tx_count = sealed_block.body().inner.transactions.len(),
+            block_clone_us,
+            "block clone breakdown"
+        );
 
         // Update miner metrics
         let finalize_duration = finalize_start.elapsed().as_secs_f64();
