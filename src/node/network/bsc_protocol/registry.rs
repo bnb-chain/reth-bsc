@@ -239,8 +239,45 @@ pub async fn request_blocks_by_range(
         start_block_hash: start_hash,
         count,
     };
-    tx.send(BscCommand::GetBlocksByRange(packet, resp_tx))
-        .map_err(|_| "failed to send GetBlocksByRange command".to_string())?;
+    if tx.send(BscCommand::GetBlocksByRange(packet, resp_tx)).is_err() {
+        // Send fails iff the bsc/n stream's receiver has been dropped (handshake
+        // timeout, sub-protocol stream closed, version mismatch). The eth/68
+        // session may still be alive, so the peer-manager has no reason to
+        // recycle this connection on its own — without an explicit kick the
+        // stale entry would linger and every future GetBlocksByRange to this
+        // peer would fail instantly. Evict the dead entry (guarded by
+        // `same_channel` so we don't clobber a fresh reconnect) and force an
+        // RLPx disconnect; the resulting reconnect re-runs `into_connection`
+        // and re-registers a live tx via `register_peer`.
+        let evicted = match REGISTRY.write() {
+            Ok(mut g) => match g.get(&peer) {
+                Some(entry) if entry.tx.same_channel(&tx) => {
+                    g.remove(&peer);
+                    true
+                }
+                _ => false,
+            },
+            Err(e) => {
+                tracing::error!(
+                    target: "bsc::registry",
+                    error = %e,
+                    "Registry lock poisoned (range-request cleanup)"
+                );
+                false
+            }
+        };
+        if evicted {
+            tracing::warn!(
+                target: "bsc::registry",
+                %peer,
+                "Evicted stale bsc/2 registry entry after send failure; disconnecting peer to force reconnect"
+            );
+            if let Some(net) = crate::shared::get_network_handle() {
+                net.disconnect_peer(peer);
+            }
+        }
+        return Err("failed to send GetBlocksByRange command".to_string());
+    }
 
     match timeout(timeout_dur, resp_rx).await {
         Ok(Ok(Ok(res))) => Ok(res),
