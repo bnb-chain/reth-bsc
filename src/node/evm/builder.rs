@@ -182,6 +182,27 @@ where
                 triedb_calc_us = triedb_calc_started.elapsed().as_micros(),
                 "Calculated state root using triedb"
             );
+
+            // Snapshot the per-layer bloom filter stats accumulated during this
+            // state-root call (resets to 0 atomically for the next block).
+            // Only meaningful when the chain actually had parent diff layers
+            // — first few blocks after restart will see queries=0.
+            if let Some(difflayers) = difflayers_opt {
+                let s = difflayers.filter_stats.snapshot_and_reset();
+                tracing::debug!(
+                    target: "bsc::builder::difflayer",
+                    block_number = self.parent.number + 1,
+                    chain_depth = difflayers.diff_layers.len(),
+                    queries = s.queries,
+                    bloom_checks = s.bloom_checks,
+                    bloom_rejects = s.bloom_rejects,
+                    bloom_passes = s.bloom_passes,
+                    hashmap_hits = s.hashmap_hits,
+                    hashmap_misses = s.hashmap_misses,
+                    resolve_total_us = s.total_lookup_ns / 1_000,
+                    "difflayer filter stats"
+                );
+            }
             (new_root, TrieUpdates::default(), Some(new_difflayer))
         } else {
             let (root, updates) =
