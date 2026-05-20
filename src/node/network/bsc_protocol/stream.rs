@@ -14,8 +14,18 @@ use tokio::sync::{mpsc::UnboundedReceiver, oneshot};
 use tokio::time::{Duration, Sleep};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
-/// Handshake timeout, mirroring the Go implementation.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Maximum time a freshly-opened bsc/n sub-stream waits for the peer's
+/// `Capability` packet before tearing itself down. The previous 5 s value
+/// (chosen to mirror geth-bsc) was tight enough to fire on its own during the
+/// cold-start race when multiple validators boot together: protocol
+/// negotiation contends with eth/68 handshake, RLPx hello, discovery, and
+/// snapshot/triedb init, and the peer's first bsc/n frame can land later than
+/// 5 s after our own. A timeout here drops the sub-stream without taking down
+/// the RLPx connection, leaving a stale sender in the protocol registry that
+/// downstream `GetBlocksByRange` calls fail against. 30 s gives the cold-start
+/// race plenty of slack; truly dead peers are still surfaced by RLPx-level
+/// keepalive/disconnect signaling, so the looser cap costs almost nothing.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// TTL for pending range requests before being pruned
 const PENDING_REQ_TTL: Duration = Duration::from_secs(15);
 /// Minimum interval between pending-request pruning passes
