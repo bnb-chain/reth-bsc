@@ -200,6 +200,43 @@ pub(super) struct MinerCacheBorrow {
     v_at_borrow: u64,
 }
 
+impl MinerCacheBorrow {
+    /// Look up an account by address.
+    ///
+    /// Returns:
+    /// - `None` — cache miss OR filter rejected (caller falls through to raw provider)
+    /// - `Some(None)` — cached tombstone (account was destroyed)
+    /// - `Some(Some(account))` — cached live account
+    ///
+    /// Filter (spec §9.3): entry must have the same `chain_epoch` as at borrow time
+    /// AND a `write_version` ≤ `v_at_borrow`. Either mismatch → `None`.
+    pub(super) fn lookup_account(&self, addr: &Address) -> Option<Option<Account>> {
+        let (value, write_v, ce) = self.cache.accounts.get(addr)?;
+        if ce == self.chain_epoch_at_borrow && write_v <= self.v_at_borrow {
+            Some(value)
+        } else {
+            None
+        }
+    }
+
+    /// Look up bytecode by code hash.
+    ///
+    /// Returns:
+    /// - `None` — cache miss OR filter rejected
+    /// - `Some(None)` — cached absence (should not arise for code, but consistent)
+    /// - `Some(Some(bytecode))` — cached bytecode
+    ///
+    /// Filter: identical to `lookup_account` (spec §9.3).
+    pub(super) fn lookup_code(&self, code_hash: &B256) -> Option<Option<Bytecode>> {
+        let (value, write_v, ce) = self.cache.code.get(code_hash)?;
+        if ce == self.chain_epoch_at_borrow && write_v <= self.v_at_borrow {
+            Some(value)
+        } else {
+            None
+        }
+    }
+}
+
 // ===========================================================================
 // Global handle
 // ===========================================================================
@@ -470,6 +507,86 @@ mod tests {
         // Manually mark heartbeat as ancient.
         cache.last_apply_at_ms.store(1, Ordering::Relaxed);
         assert!(cache.peek_for().is_none(), "stale heartbeat → no borrow");
+    }
+
+    // ------------------------------------------------------------------
+    // lookup_account / lookup_code tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn lookup_account_accepts_in_chain_in_version() {
+        let cache = Arc::new(MinerExecCache::new());
+        let addr = Address::from([0x77; 20]);
+        cache.apply_bundle(&mk_bundle_with_account(addr, 42));
+
+        let borrow = cache.peek_for().unwrap();
+        let result = borrow.lookup_account(&addr);
+        assert!(matches!(result, Some(Some(_))), "expected cache hit with value");
+    }
+
+    #[test]
+    fn lookup_account_rejects_chain_mismatch() {
+        let cache = Arc::new(MinerExecCache::new());
+        let addr = Address::from([0x88; 20]);
+        cache.apply_bundle(&mk_bundle_with_account(addr, 1));
+
+        let borrow = cache.peek_for().unwrap();
+        cache.on_reorg(); // bump chain_epoch
+        // Apply on the new chain.
+        cache.apply_bundle(&mk_bundle_with_account(addr, 2));
+
+        // Borrow's chain_epoch is stale → must reject the new entry.
+        let result = borrow.lookup_account(&addr);
+        assert!(result.is_none(), "chain mismatch must reject");
+    }
+
+    #[test]
+    fn lookup_account_rejects_future_version() {
+        let cache = Arc::new(MinerExecCache::new());
+        let addr = Address::from([0x99; 20]);
+        cache.apply_bundle(&mk_bundle_with_account(addr, 1));
+
+        let borrow = cache.peek_for().unwrap();
+        let v_at_borrow = borrow.v_at_borrow;
+
+        cache.apply_bundle(&mk_bundle_with_account(addr, 2)); // write_v = v_at_borrow + 1
+
+        // The newer entry overwrites the cache. Borrow sees the newer
+        // entry but rejects via the version filter.
+        let result = borrow.lookup_account(&addr);
+        assert!(result.is_none(), "future-version entry must be rejected");
+        assert!(borrow.v_at_borrow == v_at_borrow, "borrow unchanged");
+    }
+
+    #[test]
+    fn lookup_account_miss_returns_none() {
+        let cache = Arc::new(MinerExecCache::new());
+        // Force heartbeat fresh without writing anything readable.
+        cache.last_apply_at_ms.store(now_ms(), Ordering::Relaxed);
+        let borrow = cache.peek_for().unwrap();
+        assert!(borrow.lookup_account(&Address::from([0xAA; 20])).is_none());
+    }
+
+    #[test]
+    fn lookup_code_filters_consistently() {
+        use std::collections::HashMap;
+        let cache = Arc::new(MinerExecCache::new());
+        let code_hash = B256::from([0xBB; 32]);
+        let bytecode = Bytecode::new_raw(vec![0xfd].into());
+
+        let mut contracts = HashMap::default();
+        contracts.insert(code_hash, bytecode.0.clone());
+        let bundle = revm::database::BundleState {
+            state: HashMap::default(),
+            contracts,
+            reverts: Default::default(),
+            state_size: 0,
+            reverts_size: 0,
+        };
+        cache.apply_bundle(&bundle);
+
+        let borrow = cache.peek_for().unwrap();
+        assert!(matches!(borrow.lookup_code(&code_hash), Some(Some(_))));
     }
 
     #[test]
