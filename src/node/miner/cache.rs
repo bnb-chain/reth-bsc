@@ -155,6 +155,31 @@ impl MinerExecCache {
         self.version.store(new_v, Ordering::Release);
     }
 
+    /// Returns a `MinerCacheBorrow` if the cache heartbeat is fresh enough.
+    ///
+    /// Returns `None` when:
+    /// - The cache has never been written to (`last_apply_at_ms == 0`), or
+    /// - The updater task hasn't run within `STALENESS_THRESHOLD_MS` (5 s).
+    ///
+    /// On `None`, callers (miner build loop) fall back to the raw state provider
+    /// (spec §5, §9.4 S5).
+    pub(super) fn peek_for(self: &Arc<Self>) -> Option<MinerCacheBorrow> {
+        let now = now_ms();
+        let last = self.last_apply_at_ms.load(Ordering::Relaxed);
+        // Never-set: last == 0 → stale by definition (no apply has run yet).
+        // Otherwise: check now - last <= threshold.
+        if last == 0 || now.saturating_sub(last) > STALENESS_THRESHOLD_MS {
+            return None;
+        }
+        let ce = self.chain_epoch.load(Ordering::Acquire);
+        let v = self.version.load(Ordering::Acquire);
+        Some(MinerCacheBorrow {
+            cache: Arc::clone(self),
+            chain_epoch_at_borrow: ce,
+            v_at_borrow: v,
+        })
+    }
+
     /// Called when a `CanonStateNotification::Reorg` is received.
     ///
     /// Bumps `chain_epoch` (Release) so all existing cache entries become
@@ -416,6 +441,35 @@ mod tests {
         assert!(cache.last_apply_at_ms.load(Ordering::Relaxed) > heartbeat_before);
         // version unchanged
         assert_eq!(cache.version.load(Ordering::Acquire), 0);
+    }
+
+    // ------------------------------------------------------------------
+    // peek_for tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn peek_for_returns_none_when_heartbeat_never_set() {
+        let cache = Arc::new(MinerExecCache::new());
+        assert!(cache.peek_for().is_none(), "no apply yet → no borrow");
+    }
+
+    #[test]
+    fn peek_for_returns_borrow_after_apply() {
+        let cache = Arc::new(MinerExecCache::new());
+        let bundle = mk_bundle_with_account(Address::from([0x55; 20]), 1);
+        cache.apply_bundle(&bundle);
+
+        let borrow = cache.peek_for().expect("heartbeat fresh");
+        assert_eq!(borrow.chain_epoch_at_borrow, 0);
+        assert_eq!(borrow.v_at_borrow, 1);
+    }
+
+    #[test]
+    fn peek_for_returns_none_when_heartbeat_stale() {
+        let cache = Arc::new(MinerExecCache::new());
+        // Manually mark heartbeat as ancient.
+        cache.last_apply_at_ms.store(1, Ordering::Relaxed);
+        assert!(cache.peek_for().is_none(), "stale heartbeat → no borrow");
     }
 
     #[test]
