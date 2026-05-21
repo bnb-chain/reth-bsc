@@ -94,6 +94,13 @@ impl MinerExecCache {
         let chain_epoch = self.chain_epoch.load(Ordering::Acquire); // chain_epoch snapshot
         let new_v = self.version.load(Ordering::Acquire) + 1;
 
+        // Bytecode is content-addressable (code_hash → bytes); no destruction logic
+        // applies. Tag every entry with (new_v, chain_epoch) for reader-side filter
+        // consistency (spec §6.1).
+        for (code_hash, bytecode) in &bundle.contracts {
+            self.code.insert(*code_hash, (Some(Bytecode(bytecode.clone())), new_v, chain_epoch));
+        }
+
         for (addr, account) in &bundle.state {
             if account.was_destroyed() {
                 // CRITICAL: insert-replace, NOT invalidate. moka invalidate is
@@ -358,6 +365,31 @@ mod tests {
         // (Option a: just assert presence; Arc ptr-inequality test requires Task 5.)
         let _storage_arc_after =
             cache.storage.get(&addr).expect("storage entry must be inserted (not removed) on destruction");
+    }
+
+    #[test]
+    fn apply_bundle_writes_code() {
+        use std::collections::HashMap;
+        let cache = MinerExecCache::new();
+        let code_hash = B256::from([0xAA; 32]);
+        let bytecode = Bytecode::new_raw(vec![0x60, 0x00, 0x60, 0x00, 0xfd].into());
+
+        let mut contracts = HashMap::default();
+        contracts.insert(code_hash, bytecode.0.clone());
+        let bundle = revm::database::BundleState {
+            state: HashMap::default(),
+            contracts,
+            reverts: Default::default(),
+            state_size: 0,
+            reverts_size: 0,
+        };
+
+        cache.apply_bundle(&bundle);
+
+        let entry = cache.code.get(&code_hash).expect("code cached");
+        let (cached_code, write_v, _ce) = entry;
+        assert_eq!(cached_code, Some(bytecode));
+        assert_eq!(write_v, cache.version.load(Ordering::Acquire));
     }
 
     #[test]
