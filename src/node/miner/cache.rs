@@ -598,6 +598,27 @@ pub(super) async fn run_updater<N: reth_primitives_traits::NodePrimitives>(
 // Public API (§3.1)
 // ===========================================================================
 
+/// Test-only flag: when set to `true`, `wrap_state_provider` returns the raw
+/// provider unchanged, bypassing the cache entirely. This allows integration
+/// tests to build a payload with the cache disabled, compare the result
+/// against a cache-enabled build, and assert byte-identical outputs.
+///
+/// Must only be used in `#[cfg(test)]` contexts. Has **no effect** in
+/// production builds — the static is not compiled in at all.
+#[cfg(test)]
+static CACHE_DISABLED_FOR_TEST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Enable or disable the cache for the current test run.
+///
+/// Call `set_cache_disabled(true)` before building a payload without the
+/// cache, and `set_cache_disabled(false)` to restore normal behavior.
+/// Only available under `#[cfg(test)]`.
+#[cfg(test)]
+pub fn set_cache_disabled(disabled: bool) {
+    CACHE_DISABLED_FOR_TEST.store(disabled, Ordering::Release);
+}
+
 /// Initialize the global miner exec cache and spawn the updater task.
 ///
 /// Idempotent: calling twice is a no-op for the second call (logs a warning).
@@ -639,12 +660,17 @@ where
 ///
 /// Returns the `raw` provider unchanged when:
 /// - The cache has not been initialized yet (`init_and_spawn` not called), or
-/// - The cache heartbeat is stale (`peek_for` returns `None`).
+/// - The cache heartbeat is stale (`peek_for` returns `None`), or
+/// - `set_cache_disabled(true)` has been called (test-only bypass).
 ///
-/// Never panics — all three degrade paths return `raw` unmodified.
+/// Never panics — all degrade paths return `raw` unmodified.
 pub fn wrap_state_provider(
     raw: reth_provider::StateProviderBox,
 ) -> reth_provider::StateProviderBox {
+    #[cfg(test)]
+    if CACHE_DISABLED_FOR_TEST.load(Ordering::Acquire) {
+        return raw;
+    }
     let cache = match EXEC_CACHE.get() {
         Some(c) => c,
         None => return raw,
