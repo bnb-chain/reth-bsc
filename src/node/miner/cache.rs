@@ -235,6 +235,49 @@ impl MinerCacheBorrow {
             None
         }
     }
+
+    /// Look up a storage slot by address and key.
+    ///
+    /// **Accounts-first check (required for correctness, not an optimisation —
+    /// spec §6.3, §7.3):** if the accounts cache shows a tombstone (`None`) at
+    /// or before `v_at_borrow` on the same chain epoch, the account was
+    /// destroyed before this borrow was taken.  Storage is therefore empty by
+    /// definition and we return `Some(None)` immediately, regardless of any
+    /// slot entries that may linger in a leaked old `Arc<MinerStorageCache>`.
+    ///
+    /// Returns:
+    /// - `None` — cache miss OR filter rejected (caller falls through to raw
+    ///   provider)
+    /// - `Some(None)` — cached "no value at this slot" (tombstone short-circuit
+    ///   OR a cached absent slot)
+    /// - `Some(Some(v))` — cached slot value
+    pub(super) fn lookup_storage(
+        &self,
+        addr: &Address,
+        key: &B256,
+    ) -> Option<Option<StorageValue>> {
+        // Step 1: accounts-first. If the account is tombstoned at or before our
+        // borrow's version (and on the same chain), storage is empty by
+        // definition — regardless of any slot entries that may linger
+        // (spec §6.3).
+        if let Some((value, write_v, ce)) = self.cache.accounts.get(addr) {
+            if ce == self.chain_epoch_at_borrow
+                && write_v <= self.v_at_borrow
+                && value.is_none()
+            {
+                return Some(None);
+            }
+        }
+
+        // Step 2: slot lookup via per-account Arc.
+        let storage_arc = self.cache.storage.get(addr)?;
+        let (value, write_v, ce) = storage_arc.slots.get(key)?;
+        if ce == self.chain_epoch_at_borrow && write_v <= self.v_at_borrow {
+            Some(value)
+        } else {
+            None
+        }
+    }
 }
 
 // ===========================================================================
@@ -604,5 +647,65 @@ mod tests {
         let (cached_val, write_v, _ce) = entry;
         assert_eq!(cached_val, Some(value));
         assert_eq!(write_v, cache.version.load(Ordering::Acquire));
+    }
+
+    // ------------------------------------------------------------------
+    // lookup_storage tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn lookup_storage_happy_path() {
+        let cache = Arc::new(MinerExecCache::new());
+        let addr = Address::from([0x10; 20]);
+        let key = U256::from(1);
+        let value = U256::from(123);
+        cache.apply_bundle(&mk_bundle_with_slot(addr, key, value));
+
+        let borrow = cache.peek_for().unwrap();
+        let storage_key = B256::from(key.to_be_bytes::<32>());
+        let result = borrow.lookup_storage(&addr, &storage_key);
+        assert_eq!(result, Some(Some(value)));
+    }
+
+    #[test]
+    fn lookup_storage_shortcircuits_on_account_tombstone() {
+        let cache = Arc::new(MinerExecCache::new());
+        let addr = Address::from([0x20; 20]);
+        // Block 1: seed an account with a storage slot.
+        cache.apply_bundle(&mk_bundle_with_slot(addr, U256::from(7), U256::from(99)));
+        // Block 2: destroy the account.
+        cache.apply_bundle(&mk_bundle_with_destroyed(addr));
+
+        let borrow = cache.peek_for().unwrap();
+        // Even if a stale slot entry exists in some leaked Arc, accounts-first
+        // must return Some(None) because the tombstone covers our v_at_borrow.
+        let storage_key = B256::from(U256::from(7).to_be_bytes::<32>());
+        let result = borrow.lookup_storage(&addr, &storage_key);
+        assert_eq!(result, Some(None), "tombstoned account → storage is None");
+    }
+
+    #[test]
+    fn lookup_storage_borrow_before_destruction_does_not_shortcircuit() {
+        let cache = Arc::new(MinerExecCache::new());
+        let addr = Address::from([0x30; 20]);
+        cache.apply_bundle(&mk_bundle_with_slot(addr, U256::from(7), U256::from(99)));
+
+        // Borrow taken NOW, BEFORE destruction.
+        let borrow = cache.peek_for().unwrap();
+
+        // Destruction happens after.
+        cache.apply_bundle(&mk_bundle_with_destroyed(addr));
+
+        // Borrow's v_at_borrow predates destruction. The tombstone now in
+        // accounts has write_v > v_at_borrow → filter rejects → no short-circuit.
+        // The storage Arc was replaced by destruction, so storage.get(addr)
+        // returns the new (empty) Arc. Slot lookup misses → None.
+        // Caller (raw provider) handles the actual pre-destruction read.
+        let storage_key = B256::from(U256::from(7).to_be_bytes::<32>());
+        let result = borrow.lookup_storage(&addr, &storage_key);
+        assert!(
+            result.is_none(),
+            "pre-destruction borrow + post-destruction read: cache returns None (fall-through), not Some(None) shortcut"
+        );
     }
 }
