@@ -7,7 +7,7 @@
 
 #![allow(dead_code)]
 
-use std::sync::atomic::{AtomicI64, AtomicU64};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -81,6 +81,35 @@ impl MinerExecCache {
             last_apply_at_ms: AtomicI64::new(0),
         }
     }
+
+    /// Applies a post-block `BundleState` into the cache.
+    ///
+    /// # Ordering invariant (spec §6.1, §9.4 S2)
+    ///
+    /// Version is bumped **after** all moka writes (Release ordering). If we
+    /// bumped first, a concurrent reader could observe `v_at_borrow = new_v`
+    /// before the writes land, read a stale entry for a key in the bundle,
+    /// and incorrectly accept it as current.
+    pub(super) fn apply_bundle(&self, bundle: &revm::database::BundleState) {
+        let chain_epoch = self.chain_epoch.load(Ordering::Acquire); // chain_epoch snapshot
+        let new_v = self.version.load(Ordering::Acquire) + 1;
+
+        for (addr, account) in &bundle.state {
+            if account.was_destroyed() {
+                // Destruction path handled in Task 4.
+                continue;
+            }
+            // `Account` stores only (balance, nonce, bytecode_hash); inline bytecode
+            // is cached separately by Task 6 via bundle.contracts.
+            let reth_account = account.info.as_ref().map(Account::from);
+            self.accounts.insert(*addr, (reth_account, new_v, chain_epoch));
+            // Storage and code writes land in Tasks 5/6.
+        }
+
+        self.last_apply_at_ms.store(now_ms(), Ordering::Relaxed);
+        // MUST be last: bump version only after all moka writes are visible.
+        self.version.store(new_v, Ordering::Release);
+    }
 }
 
 /// Snapshot handle taken at `peek_for`. RAII: drop releases nothing
@@ -117,6 +146,49 @@ mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
 
+    use alloy_primitives::U256;
+    use revm::database::{AccountStatus, BundleAccount, BundleState, StorageWithOriginalValues};
+    use revm::state::AccountInfo;
+
+    // ------------------------------------------------------------------
+    // Test helpers
+    // ------------------------------------------------------------------
+
+    fn mk_account_info(balance: u64) -> AccountInfo {
+        AccountInfo {
+            balance: U256::from(balance),
+            nonce: 0,
+            code_hash: B256::ZERO,
+            account_id: None,
+            code: None,
+        }
+    }
+
+    fn mk_bundle_with_account(addr: Address, balance: u64) -> BundleState {
+        use std::collections::HashMap;
+        let mut state = HashMap::default();
+        state.insert(
+            addr,
+            BundleAccount {
+                info: Some(mk_account_info(balance)),
+                original_info: None,
+                storage: StorageWithOriginalValues::default(),
+                status: AccountStatus::Changed,
+            },
+        );
+        BundleState {
+            state,
+            contracts: HashMap::default(),
+            reverts: Default::default(),
+            state_size: 0,
+            reverts_size: 0,
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Basic sanity tests
+    // ------------------------------------------------------------------
+
     #[test]
     fn skeleton_compiles() {
         // Trivial test to confirm module compiles.
@@ -130,5 +202,42 @@ mod tests {
         assert_eq!(cache.chain_epoch.load(Ordering::Acquire), 0);
         assert_eq!(cache.version.load(Ordering::Acquire), 0);
         assert_eq!(cache.last_apply_at_ms.load(Ordering::Relaxed), 0);
+    }
+
+    // ------------------------------------------------------------------
+    // apply_bundle tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn apply_bundle_inserts_non_destroyed_account() {
+        let cache = MinerExecCache::new();
+        let addr = Address::from([0xAB; 20]);
+        let bundle = mk_bundle_with_account(addr, 100);
+
+        let v_before = cache.version.load(Ordering::Acquire);
+        cache.apply_bundle(&bundle);
+        let v_after = cache.version.load(Ordering::Acquire);
+
+        assert_eq!(v_after, v_before + 1, "version must be bumped exactly once");
+        let entry = cache.accounts.get(&addr).expect("account should be cached");
+        let (value, write_v, ce) = entry;
+        assert!(value.is_some(), "value should not be a tombstone");
+        assert_eq!(write_v, v_after, "entry write_version must equal new version");
+        assert_eq!(
+            ce,
+            cache.chain_epoch.load(Ordering::Acquire),
+            "entry chain_epoch must equal current chain_epoch"
+        );
+    }
+
+    #[test]
+    fn apply_bundle_bumps_version_sequentially() {
+        let cache = MinerExecCache::new();
+        let addr = Address::from([0xCD; 20]);
+
+        for i in 1u64..=3 {
+            cache.apply_bundle(&mk_bundle_with_account(addr, i * 10));
+            assert_eq!(cache.version.load(Ordering::Acquire), i, "version step {i}");
+        }
     }
 }
