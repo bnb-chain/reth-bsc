@@ -10222,6 +10222,7 @@ dependencies = [
  "libc",
  "lru 0.12.5",
  "metrics",
+ "moka",
  "once_cell",
  "parity-bytes",
  "parking_lot",
