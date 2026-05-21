@@ -96,7 +96,14 @@ impl MinerExecCache {
 
         for (addr, account) in &bundle.state {
             if account.was_destroyed() {
-                // Destruction path handled in Task 4.
+                // CRITICAL: insert-replace, NOT invalidate. moka invalidate is
+                // eventually consistent — get(K) may keep returning the old value
+                // for an unbounded period. insert is per-key linearizable, so the
+                // empty Arc is immediately visible to subsequent callers (spec §6.1).
+                // The accounts tombstone (None) lets Task 10's lookup_storage
+                // short-circuit destroyed-account storage lookups (spec §6.3).
+                self.storage.insert(*addr, Arc::new(MinerStorageCache::new()));
+                self.accounts.insert(*addr, (None, new_v, chain_epoch));
                 continue;
             }
             // `Account` stores only (balance, nonce, bytecode_hash); inline bytecode
@@ -161,6 +168,27 @@ mod tests {
             code_hash: B256::ZERO,
             account_id: None,
             code: None,
+        }
+    }
+
+    fn mk_bundle_with_destroyed(addr: Address) -> BundleState {
+        use std::collections::HashMap;
+        let mut state = HashMap::default();
+        state.insert(
+            addr,
+            BundleAccount {
+                info: None,
+                original_info: None,
+                storage: StorageWithOriginalValues::default(),
+                status: AccountStatus::Destroyed,
+            },
+        );
+        BundleState {
+            state,
+            contracts: HashMap::default(),
+            reverts: Default::default(),
+            state_size: 0,
+            reverts_size: 0,
         }
     }
 
@@ -239,5 +267,35 @@ mod tests {
             cache.apply_bundle(&mk_bundle_with_account(addr, i * 10));
             assert_eq!(cache.version.load(Ordering::Acquire), i, "version step {i}");
         }
+    }
+
+    #[test]
+    fn apply_bundle_destruction_tombstones_and_replaces_storage() {
+        let cache = MinerExecCache::new();
+        let addr = Address::from([0xEF; 20]);
+
+        // Seed: account exists. Task 3 only inserts the account entry, not the
+        // storage Arc, so storage_arc_before will be None here. The assertion
+        // below (option a) checks that a fresh Arc IS present after destruction,
+        // rather than testing Arc ptr-inequality. After Task 5 lands (which adds
+        // storage writes in the non-destruction branch), this can be strengthened.
+        cache.apply_bundle(&mk_bundle_with_account(addr, 99));
+
+        // Destroy.
+        cache.apply_bundle(&mk_bundle_with_destroyed(addr));
+
+        // Accounts: tombstone (None) at latest version.
+        let (value, write_v, _ce) = cache.accounts.get(&addr).expect("must have tombstone");
+        assert!(value.is_none(), "destruction must store None tombstone");
+        assert_eq!(
+            write_v,
+            cache.version.load(Ordering::Acquire),
+            "tombstone write_version must equal current version"
+        );
+
+        // Storage: outer cache contains a fresh empty Arc, NOT invalidated.
+        // (Option a: just assert presence; Arc ptr-inequality test requires Task 5.)
+        let _storage_arc_after =
+            cache.storage.get(&addr).expect("storage entry must be inserted (not removed) on destruction");
     }
 }
