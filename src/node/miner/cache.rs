@@ -110,7 +110,37 @@ impl MinerExecCache {
             // is cached separately by Task 6 via bundle.contracts.
             let reth_account = account.info.as_ref().map(Account::from);
             self.accounts.insert(*addr, (reth_account, new_v, chain_epoch));
-            // Storage and code writes land in Tasks 5/6.
+
+            // Storage slots — non-destruction path (spec §6.1).
+            //
+            // Reuse the existing per-account Arc when present; only create a new
+            // empty one if no entry exists yet. NEVER replace an existing populated
+            // Arc — that would silently drop unrelated cached slots written by earlier
+            // blocks.
+            //
+            // Safety: apply_bundle is only ever called by the single updater task
+            // (spec §5), so there is no concurrent writer that could race between
+            // our .get() and .insert() below.
+            if !account.storage.is_empty() {
+                let storage_arc = match self.storage.get(addr) {
+                    Some(arc) => arc,
+                    None => {
+                        let new_arc = Arc::new(MinerStorageCache::new());
+                        self.storage.insert(*addr, new_arc.clone());
+                        new_arc
+                    }
+                };
+                for (key, slot) in &account.storage {
+                    // revm StorageKey is U256; our slots cache is keyed by
+                    // alloy_primitives::StorageKey (= B256). Convert via big-endian bytes.
+                    let slot_key = B256::from(key.to_be_bytes::<32>());
+                    storage_arc.slots.insert(
+                        slot_key,
+                        (Some(slot.present_value), new_v, chain_epoch),
+                    );
+                }
+            }
+            // Code writes land in Task 6.
         }
 
         self.last_apply_at_ms.store(now_ms(), Ordering::Relaxed);
@@ -154,7 +184,9 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use alloy_primitives::U256;
-    use revm::database::{AccountStatus, BundleAccount, BundleState, StorageWithOriginalValues};
+    use revm::database::{
+        states::StorageSlot, AccountStatus, BundleAccount, BundleState, StorageWithOriginalValues,
+    };
     use revm::state::AccountInfo;
 
     // ------------------------------------------------------------------
@@ -201,6 +233,35 @@ mod tests {
                 info: Some(mk_account_info(balance)),
                 original_info: None,
                 storage: StorageWithOriginalValues::default(),
+                status: AccountStatus::Changed,
+            },
+        );
+        BundleState {
+            state,
+            contracts: HashMap::default(),
+            reverts: Default::default(),
+            state_size: 0,
+            reverts_size: 0,
+        }
+    }
+
+    fn mk_bundle_with_slot(addr: Address, slot_key: U256, slot_value: U256) -> BundleState {
+        use std::collections::HashMap;
+        let mut storage = StorageWithOriginalValues::default();
+        storage.insert(
+            slot_key,
+            StorageSlot {
+                previous_or_original_value: U256::ZERO,
+                present_value: slot_value,
+            },
+        );
+        let mut state = HashMap::default();
+        state.insert(
+            addr,
+            BundleAccount {
+                info: Some(mk_account_info(0)),
+                original_info: None,
+                storage,
                 status: AccountStatus::Changed,
             },
         );
@@ -297,5 +358,22 @@ mod tests {
         // (Option a: just assert presence; Arc ptr-inequality test requires Task 5.)
         let _storage_arc_after =
             cache.storage.get(&addr).expect("storage entry must be inserted (not removed) on destruction");
+    }
+
+    #[test]
+    fn apply_bundle_writes_storage_slots() {
+        let cache = MinerExecCache::new();
+        let addr = Address::from([0x11; 20]);
+        let key = U256::from(42);
+        let value = U256::from(777);
+
+        cache.apply_bundle(&mk_bundle_with_slot(addr, key, value));
+
+        let storage = cache.storage.get(&addr).expect("storage container exists");
+        let slot_key = B256::from(key.to_be_bytes::<32>());
+        let entry = storage.slots.get(&slot_key).expect("slot cached");
+        let (cached_val, write_v, _ce) = entry;
+        assert_eq!(cached_val, Some(value));
+        assert_eq!(write_v, cache.version.load(Ordering::Acquire));
     }
 }
