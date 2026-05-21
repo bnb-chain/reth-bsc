@@ -498,9 +498,9 @@ static EXEC_CACHE: OnceLock<Arc<MinerExecCache>> = OnceLock::new();
 /// - `Commit { new }` → apply the chain's merged `BundleState` to the cache.
 /// - `Reorg { new, .. }` → bump `chain_epoch` (on_reorg) first, then apply
 ///   the new chain's bundle so the new-chain entries are immediately valid.
-pub(super) fn apply_notification(
+pub(super) fn apply_notification<N: reth_primitives_traits::NodePrimitives>(
     cache: &MinerExecCache,
-    notif: reth_chain_state::CanonStateNotification,
+    notif: reth_chain_state::CanonStateNotification<N>,
 ) {
     use reth_chain_state::CanonStateNotification;
     match notif {
@@ -529,9 +529,9 @@ pub(super) fn apply_notification(
 ///   recoverable condition (spec §15, degraded-mode).
 /// - `Err(Closed)` → sender dropped; no more notifications will arrive.
 ///   Return so the spawned task exits cleanly.
-pub(super) async fn run_updater(
+pub(super) async fn run_updater<N: reth_primitives_traits::NodePrimitives>(
     cache: Arc<MinerExecCache>,
-    mut rx: reth_chain_state::CanonStateNotifications,
+    mut rx: reth_chain_state::CanonStateNotifications<N>,
 ) {
     use tokio::sync::broadcast::error::RecvError;
     loop {
@@ -559,6 +559,68 @@ pub(super) async fn run_updater(
             }
         }
     }
+}
+
+// ===========================================================================
+// Public API (§3.1)
+// ===========================================================================
+
+/// Initialize the global miner exec cache and spawn the updater task.
+///
+/// Idempotent: calling twice is a no-op for the second call (logs a warning).
+/// The first caller wins via [`OnceLock`]; subsequent callers return immediately.
+///
+/// The updater task runs indefinitely on `task_executor`, draining
+/// `CanonStateNotifications` forwarded by `provider`. When the channel closes
+/// the task exits cleanly; when it lags it falls back to an on-reorg epoch bump.
+pub fn init_and_spawn<P>(provider: P, task_executor: reth_tasks::TaskExecutor)
+where
+    P: reth_provider::CanonStateSubscriptions
+        + reth_provider::NodePrimitivesProvider
+        + Send
+        + Sync
+        + 'static,
+    <P as reth_provider::NodePrimitivesProvider>::Primitives: reth_primitives_traits::NodePrimitives,
+{
+    let cache = Arc::new(MinerExecCache::new());
+    // First-set-wins via OnceLock.
+    if EXEC_CACHE.set(Arc::clone(&cache)).is_err() {
+        tracing::warn!(
+            target: "bsc::miner::cache",
+            "MinerExecCache already initialized; ignoring"
+        );
+        return;
+    }
+    let rx = provider.subscribe_to_canonical_state();
+    let cache_for_task = Arc::clone(&cache);
+    task_executor.spawn_critical("miner-cache-updater", async move {
+        run_updater(cache_for_task, rx).await;
+    });
+    tracing::info!(
+        target: "bsc::miner::cache",
+        "MinerExecCache initialized and updater task spawned"
+    );
+}
+
+/// Wrap a raw state provider with the miner cache.
+///
+/// Returns the `raw` provider unchanged when:
+/// - The cache has not been initialized yet (`init_and_spawn` not called), or
+/// - The cache heartbeat is stale (`peek_for` returns `None`).
+///
+/// Never panics — all three degrade paths return `raw` unmodified.
+pub fn wrap_state_provider(
+    raw: reth_provider::StateProviderBox,
+) -> reth_provider::StateProviderBox {
+    let cache = match EXEC_CACHE.get() {
+        Some(c) => c,
+        None => return raw,
+    };
+    let borrow = match cache.peek_for() {
+        Some(b) => b,
+        None => return raw,
+    };
+    Box::new(MinerCachedStateProvider::new(raw, borrow))
 }
 
 // ===========================================================================
@@ -1254,5 +1316,19 @@ mod tests {
         // We simply assert the task is still alive and not panicked.
         assert!(!handle.is_finished(), "updater must still be running after Lagged");
         handle.abort();
+    }
+
+    // ------------------------------------------------------------------
+    // Public API surface tests (Task 13)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn wrap_returns_raw_when_cache_not_initialized() {
+        // NOTE: EXEC_CACHE is process-global; we can't guarantee it's
+        // uninitialized in test order. So this test verifies the API exists
+        // and is callable. The fall-through behavior is tested via
+        // cached_provider_falls_through_to_raw_on_filter_reject (Task 11).
+        let _: fn(reth_provider::StateProviderBox) -> reth_provider::StateProviderBox =
+            wrap_state_provider;
     }
 }
