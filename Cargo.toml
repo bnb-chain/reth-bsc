@@ -111,6 +111,7 @@ jsonrpsee-core = { version = "0.26.0", features = ["server"] }
 jsonrpsee-types = "0.26.0"
 
 # misc dependencies
+moka = { version = "0.12.15", features = ["sync"] }
 auto_impl = "1"
 async-trait = "0.1"
 bytes = "1.5"
