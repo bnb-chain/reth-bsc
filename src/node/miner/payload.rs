@@ -385,8 +385,9 @@ where
             }
         }
 
-        let state_provider = self.client.state_by_block_hash(parent_header.hash_slow())?;
-        let state = StateProviderDatabase::new(&state_provider);
+        let raw_state_provider = self.client.state_by_block_hash(parent_header.hash_slow())?;
+        let state_provider = crate::node::miner::cache::wrap_state_provider(raw_state_provider);
+        let state = StateProviderDatabase::new(&*state_provider);
         let mut db = State::builder()
             .with_database(cached_reads.as_db_mut(state))
             .with_bundle_update()
@@ -911,8 +912,9 @@ where
             }
         }
 
-        let state_provider = self.client.state_by_block_hash(parent_header.hash_slow())?;
-        let state = StateProviderDatabase::new(&state_provider);
+        let raw_state_provider = self.client.state_by_block_hash(parent_header.hash_slow())?;
+        let state_provider = crate::node::miner::cache::wrap_state_provider(raw_state_provider);
+        let state = StateProviderDatabase::new(&*state_provider);
         let mut db = State::builder()
             .with_database(cached_reads.as_db_mut(state))
             .with_bundle_update()
