@@ -110,19 +110,21 @@ where
                 MiningConfig::from_env()
             };
 
-        // Initialize miner cross-block execution cache. Single global instance;
-        // updater task subscribes to canonical state notifications and is the
-        // only writer. wrap_state_provider in miner/payload.rs reads from it.
-        crate::node::miner::cache::init_and_spawn(
-            ctx.provider().clone(),
-            ctx.task_executor().clone(),
-        );
-
         // Skip mining setup if disabled
         if !mining_config.is_mining_enabled() {
             info!("Mining is disabled in configuration");
         } else {
             info!("Mining is enabled - will start mining after consensus initialization");
+
+            // Initialize miner cross-block execution cache. Gated on mining
+            // being enabled so non-validator nodes (full / archive) don't pay
+            // the memory cost. Single global instance; updater task
+            // subscribes to canonical state notifications and is the only
+            // writer. wrap_state_provider in miner/payload.rs reads from it.
+            crate::node::miner::cache::init_and_spawn(
+                ctx.provider().clone(),
+                ctx.task_executor().clone(),
+            );
 
             let mining_config_clone = mining_config.clone();
             let pool_clone = pool.clone();
