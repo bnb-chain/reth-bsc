@@ -52,6 +52,12 @@ impl MinerStorageCache {
     fn new() -> Self {
         Self {
             slots: Cache::builder()
+                // Each slot entry: 32 (key) + 32 (StorageValue) + 16 (write_v, ce)
+                // + ~150 (moka per-entry overhead). Round to a flat 256 bytes.
+                // With `max_capacity` interpreted as a weighted total, this caps
+                // the inner cache at ~STORAGE_INNER_CAPACITY_BYTES of slots per
+                // account (~64k slots for the default 16 MB budget).
+                .weigher(|_: &StorageKey, _: &SlotEntry| -> u32 { 256 })
                 .max_capacity(STORAGE_INNER_CAPACITY_BYTES)
                 .build(),
         }
@@ -72,12 +78,34 @@ impl MinerExecCache {
     pub(super) fn new() -> Self {
         Self {
             accounts: Cache::builder()
+                // 20 (Address) + ~80 (Option<Account>) + 16 (write_v, ce)
+                // + ~140 (moka overhead). Round to 256.
+                .weigher(|_: &Address, _: &AccountEntry| -> u32 { 256 })
                 .max_capacity(ACCOUNTS_CAPACITY_BYTES)
                 .build(),
             storage: Cache::builder()
+                // Mirrors upstream cached_state.rs: per-account base cost +
+                // per-slot estimate. `entry_count()` is approximate (moka
+                // defers some bookkeeping to background threads) but good
+                // enough for size budgeting. apply_bundle re-inserts the same
+                // Arc after filling slots so moka picks up the new weight.
+                .weigher(|_: &Address, value: &Arc<MinerStorageCache>| -> u32 {
+                    const BASE: u32 = 39_000;
+                    let slots =
+                        (value.slots.entry_count()).min(u32::MAX as u64 / 256) as u32;
+                    BASE.saturating_add(slots.saturating_mul(218))
+                })
                 .max_capacity(STORAGE_OUTER_CAPACITY_BYTES)
                 .build(),
             code: Cache::builder()
+                // 32 (B256) + Bytecode actual length + 16 (write_v, ce)
+                // + ~150 (moka overhead). Average BSC bytecode is several KB.
+                .weigher(|_: &B256, value: &CodeEntry| -> u32 {
+                    let bytes = value.0.as_ref().map(|b| b.0.len()).unwrap_or(0);
+                    200u64
+                        .saturating_add(bytes as u64)
+                        .min(u32::MAX as u64) as u32
+                })
                 .max_capacity(CODE_CAPACITY_BYTES)
                 .build(),
             chain_epoch: AtomicU64::new(0),
@@ -107,6 +135,12 @@ impl MinerExecCache {
         }
 
         for (addr, account) in &bundle.state {
+            // Mirror upstream cached_state.rs: touched-but-unchanged accounts
+            // carry no new state. Skipping them keeps version tags on existing
+            // entries stable so concurrent readers can still hit them.
+            if account.status.is_not_modified() {
+                continue;
+            }
             if account.was_destroyed() {
                 // CRITICAL: insert-replace, NOT invalidate. moka invalidate is
                 // eventually consistent — get(K) may keep returning the old value
@@ -117,6 +151,18 @@ impl MinerExecCache {
                 self.storage.insert(*addr, Arc::new(MinerStorageCache::new()));
                 self.accounts.insert(*addr, (None, new_v, chain_epoch));
                 continue;
+            }
+            // Defensive: an account with status != not_modified, not destroyed,
+            // but with `info == None` is an EVM-level inconsistency (upstream
+            // returns Err in this case). We tombstone defensively so reader
+            // filtering stays safe, but log so it's visible if it ever happens.
+            if account.info.is_none() {
+                tracing::warn!(
+                    target: "bsc::miner::cache",
+                    address = %addr,
+                    status = ?account.status,
+                    "BundleAccount has None info but is not Destroyed; tombstoning"
+                );
             }
             // `Account` stores only (balance, nonce, bytecode_hash); inline bytecode
             // is cached separately by Task 6 via bundle.contracts.
@@ -151,6 +197,11 @@ impl MinerExecCache {
                         (Some(slot.present_value), new_v, chain_epoch),
                     );
                 }
+                // Re-insert the (same) Arc so moka picks up the new weighted size.
+                // The Arc identity is unchanged but the slot count grew, and the
+                // outer cache's weigher depends on `slots.entry_count()`. Mirrors
+                // upstream cached_state.rs::ExecutionCache::insert_storage_bulk.
+                self.storage.insert(*addr, storage_arc);
             }
             // Code writes land in Task 6.
         }
@@ -1101,6 +1152,89 @@ mod tests {
         let storage_key = B256::from(U256::from(7).to_be_bytes::<32>());
         let result = borrow.lookup_storage(&addr, &storage_key);
         assert_eq!(result, Some(None), "tombstoned account → storage is None");
+    }
+
+    #[test]
+    fn destruction_then_recreate_three_windows_correct() {
+        // Spec §6.3: cross-block CREATE2 redeploy. A reader borrowing in any
+        // of three time windows (pre-destruction / mid / post-recreate) must
+        // get a value consistent with the parent block its borrow corresponds
+        // to. We exercise each window by re-borrowing immediately after the
+        // relevant block — so each borrow's v_at_borrow falls in the right
+        // window. (Borrows held *past* their window degrade to filter-reject /
+        // fall-through — that's a separate documented behavior, not tested here.)
+        let cache = Arc::new(MinerExecCache::new());
+        let addr = Address::from([0x40; 20]);
+        let slot_old = U256::from(7);
+        let val_old = U256::from(99);
+        let slot_new = U256::from(8);
+        let val_new = U256::from(123);
+        let key_old = B256::from(slot_old.to_be_bytes::<32>());
+        let key_new = B256::from(slot_new.to_be_bytes::<32>());
+
+        // ── PRE-window: seed account+slot, no destruction yet. Borrow now.
+        cache.apply_bundle(&mk_bundle_with_slot(addr, slot_old, val_old));
+        {
+            let borrow_pre = cache.peek_for().unwrap();
+            assert!(
+                matches!(borrow_pre.lookup_account(&addr), Some(Some(_))),
+                "pre: account must be alive"
+            );
+            assert_eq!(
+                borrow_pre.lookup_storage(&addr, &key_old),
+                Some(Some(val_old)),
+                "pre: old slot must be a cache hit at its actual value"
+            );
+        }
+
+        // ── MID-window: destroy in block N. Borrow now, before any recreate.
+        cache.apply_bundle(&mk_bundle_with_destroyed(addr));
+        {
+            let borrow_mid = cache.peek_for().unwrap();
+            assert_eq!(
+                borrow_mid.lookup_account(&addr),
+                Some(None),
+                "mid: account must read as tombstone"
+            );
+            assert_eq!(
+                borrow_mid.lookup_storage(&addr, &key_old),
+                Some(None),
+                "mid: accounts-first shortcut returns Some(None) for old slot"
+            );
+            assert_eq!(
+                borrow_mid.lookup_storage(&addr, &key_new),
+                Some(None),
+                "mid: accounts-first shortcut returns Some(None) for any slot \
+                 when account is tombstoned at or before v_at_borrow"
+            );
+        }
+
+        // ── POST-window: recreate in block N+1 with a different slot.
+        cache.apply_bundle(&mk_bundle_with_slot(addr, slot_new, val_new));
+        {
+            let borrow_post = cache.peek_for().unwrap();
+            assert!(
+                matches!(borrow_post.lookup_account(&addr), Some(Some(_))),
+                "post: account must be alive again"
+            );
+            assert_eq!(
+                borrow_post.lookup_storage(&addr, &key_new),
+                Some(Some(val_new)),
+                "post: new slot value must be visible"
+            );
+            // Old slot was not in the N+1 bundle. Storage Arc was replaced
+            // empty at block N (destruction), then refilled in N+1 with only
+            // key_new. So storage.get(addr).slots.get(key_old) misses. The
+            // accounts cache shows the recreate at v=3 = v_at_borrow, value =
+            // Some, so the tombstone shortcut does NOT fire. Result: None
+            // (cache miss → fall-through to raw provider, which knows the
+            // post-recreate storage is empty for this key).
+            assert_eq!(
+                borrow_post.lookup_storage(&addr, &key_old),
+                None,
+                "post: untouched old slot is a cache miss (fall-through)"
+            );
+        }
     }
 
     #[test]
