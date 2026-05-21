@@ -369,10 +369,15 @@ where
         // Clone header for FCU update
         let header_for_fcu = block.header.clone();
 
-        // Register block stats for chain delay vote metrics (mined blocks also receive votes)
-        crate::consensus::parlia::block_stats::on_block_received(
+        // Register block stats so vote-delay metrics can still be computed when votes arrive for
+        // this self-mined block. We deliberately do NOT call `on_block_received` here — that
+        // records `chain.delay.block_recv`, which is meant to measure pure network propagation
+        // delay; for a block we just produced locally the sample would actually reflect local
+        // mining/finalize latency and would pollute cross-region diagnosis. Mirrors geth-bsc,
+        // which only sets `RecvNewBlockTime` inside `handleBlockBroadcast` (the network path).
+        crate::consensus::parlia::block_stats::register_self_mined_block(
             block_hash,
-            block.header.timestamp,
+            &block.header,
         );
 
         // send to EVN peers first
@@ -548,7 +553,7 @@ where
         // Record chain delay metrics: time from block creation to first network reception
         crate::consensus::parlia::block_stats::on_block_received(
             block.hash,
-            block.block.0.block.header.timestamp,
+            &block.block.0.block.header,
         );
 
         // send to EVN peers first
