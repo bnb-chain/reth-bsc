@@ -64,6 +64,25 @@ pub(super) struct MinerExecCache {
     last_apply_at_ms: AtomicI64,
 }
 
+impl MinerExecCache {
+    pub(super) fn new() -> Self {
+        Self {
+            accounts: Cache::builder()
+                .max_capacity(ACCOUNTS_CAPACITY_BYTES)
+                .build(),
+            storage: Cache::builder()
+                .max_capacity(STORAGE_OUTER_CAPACITY_BYTES)
+                .build(),
+            code: Cache::builder()
+                .max_capacity(CODE_CAPACITY_BYTES)
+                .build(),
+            chain_epoch: AtomicU64::new(0),
+            version: AtomicU64::new(0),
+            last_apply_at_ms: AtomicI64::new(0),
+        }
+    }
+}
+
 /// Snapshot handle taken at `peek_for`. RAII: drop releases nothing
 /// (we don't use SavedCache.usage_guard semantics).
 pub(super) struct MinerCacheBorrow {
@@ -96,11 +115,20 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn skeleton_compiles() {
         // Trivial test to confirm module compiles.
         let _cache_size = ACCOUNTS_CAPACITY_BYTES;
         const { assert!(STALENESS_THRESHOLD_MS > 0) };
+    }
+
+    #[test]
+    fn new_initializes_atomics_to_zero() {
+        let cache = MinerExecCache::new();
+        assert_eq!(cache.chain_epoch.load(Ordering::Acquire), 0);
+        assert_eq!(cache.version.load(Ordering::Acquire), 0);
+        assert_eq!(cache.last_apply_at_ms.load(Ordering::Relaxed), 0);
     }
 }
