@@ -208,6 +208,42 @@ pub struct BscMinerMetrics {
     pub payload_rebuild_estimated_uplift_bps: Gauge,
 }
 
+/// Metrics for the BSC block builder, specifically the trie-db prefetcher.
+///
+/// The prefetcher runs in parallel with EVM execution and reads trie nodes
+/// from RocksDB into moka before `state_root` computation reads them. Its
+/// effectiveness is measured by `coverage = prefetched / needed` — the higher,
+/// the fewer cold misses state_root will see.
+///
+/// All three gauges are set once per `finish_with_difflayer` call right after
+/// `TrieDBStatePrefetcher::finish()` returns. Compute the per-second / per-block
+/// view in PromQL.
+#[derive(Metrics, Clone)]
+#[metrics(scope = "bsc.builder.prefetcher")]
+pub struct BscBuilderPrefetcherMetrics {
+    /// Number of storage-touching accounts the upcoming `state_root` call will
+    /// need to traverse (== `hashed_state.storages.len()` at the call site).
+    pub needed_storage_accounts: Gauge,
+
+    /// Number of storage tries the prefetcher actually warmed in time
+    /// (== `prefetch_state.storage_tries.len()`). Ideally equals
+    /// `needed_storage_accounts`; gap means the prefetcher couldn't keep up
+    /// with EVM execution and `state_root` will see a cold miss on those.
+    pub prefetched_storage_tries: Gauge,
+
+    /// Number of storage roots the prefetcher resolved
+    /// (== `prefetch_state.storage_roots.len()`). Storage roots are leaf-level
+    /// metadata; high coverage here means SLOAD-heavy tx paths are warm.
+    pub prefetched_storage_roots: Gauge,
+
+    /// Number of accounts state_root will need (counted as
+    /// `hashed_state.accounts.len()`). Reference number; comparing
+    /// `prefetched_storage_tries / needed_storage_accounts` and
+    /// `needed_storage_accounts / hashed_accounts_total` together gives the
+    /// "what fraction of touched accounts also touched storage" picture.
+    pub hashed_accounts_total: Gauge,
+}
+
 /// Metrics for BSC fast finality
 ///
 /// Tracks fast finality operations and finalized blocks.

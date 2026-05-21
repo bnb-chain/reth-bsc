@@ -144,6 +144,31 @@ where
             let mut triedb = get_global_triedb();
             // Miner-side: try to use triedb prefetcher + parent difflayers from execution ctx.
             let prefetch_state = self.ctx.triedb_prefetcher.take().and_then(|p| p.finish());
+
+            // Surface prefetcher coverage metrics before `prefetch_state` is moved
+            // into `intermediate_and_commit_hashed_post_state` below. The two
+            // "prefetched_*" gauges are how many entries the prefetcher actually
+            // produced; "needed_storage_accounts" is what state_root is about to
+            // ask for. PromQL ratio = prefetcher coverage; gap means cold misses.
+            {
+                use crate::metrics::BscBuilderPrefetcherMetrics;
+                use once_cell::sync::Lazy;
+                static PREFETCH_METRICS: Lazy<BscBuilderPrefetcherMetrics> =
+                    Lazy::new(BscBuilderPrefetcherMetrics::default);
+                PREFETCH_METRICS
+                    .needed_storage_accounts
+                    .set(hashed_state.storages.len() as f64);
+                PREFETCH_METRICS
+                    .hashed_accounts_total
+                    .set(hashed_state.accounts.len() as f64);
+                let (tries, roots) = prefetch_state
+                    .as_ref()
+                    .map(|p| (p.storage_tries.len(), p.storage_roots.len()))
+                    .unwrap_or((0, 0));
+                PREFETCH_METRICS.prefetched_storage_tries.set(tries as f64);
+                PREFETCH_METRICS.prefetched_storage_roots.set(roots as f64);
+            }
+
             let parent_state_root = (**self.parent).state_root();
             let trie_hashed_state = hashed_state.to_triedb_hashed_post_state();
             let difflayers_opt = self.ctx.parent_difflayers.as_ref();
