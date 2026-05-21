@@ -154,6 +154,17 @@ impl MinerExecCache {
         // MUST be last: bump version only after all moka writes are visible.
         self.version.store(new_v, Ordering::Release);
     }
+
+    /// Called when a `CanonStateNotification::Reorg` is received.
+    ///
+    /// Bumps `chain_epoch` (Release) so all existing cache entries become
+    /// unborrowable from any future borrow's perspective. No physical cache
+    /// clearing is needed — entries are LRU-evicted naturally as new
+    /// `apply_bundle` calls accumulate on the new chain (spec §6.2, §9.4 S4).
+    pub(super) fn on_reorg(&self) {
+        self.chain_epoch.fetch_add(1, Ordering::Release);
+        self.last_apply_at_ms.store(now_ms(), Ordering::Relaxed);
+    }
 }
 
 /// Snapshot handle taken at `peek_for`. RAII: drop releases nothing
@@ -390,6 +401,21 @@ mod tests {
         let (cached_code, write_v, _ce) = entry;
         assert_eq!(cached_code, Some(bytecode));
         assert_eq!(write_v, cache.version.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn on_reorg_bumps_chain_epoch_and_heartbeat() {
+        let cache = MinerExecCache::new();
+        let ce_before = cache.chain_epoch.load(Ordering::Acquire);
+        let heartbeat_before = cache.last_apply_at_ms.load(Ordering::Relaxed);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        cache.on_reorg();
+
+        assert_eq!(cache.chain_epoch.load(Ordering::Acquire), ce_before + 1);
+        assert!(cache.last_apply_at_ms.load(Ordering::Relaxed) > heartbeat_before);
+        // version unchanged
+        assert_eq!(cache.version.load(Ordering::Acquire), 0);
     }
 
     #[test]
