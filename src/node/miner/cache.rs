@@ -281,6 +281,206 @@ impl MinerCacheBorrow {
 }
 
 // ===========================================================================
+// MinerCachedStateProvider — StateProvider wrapper
+// ===========================================================================
+
+/// Wraps a raw `StateProvider` with the miner cross-block cache.
+///
+/// - `basic_account`, `bytecode_by_hash`, and `storage` consult the
+///   `MinerCacheBorrow` first; a `None` return (cache-miss or filter-reject)
+///   falls through to the raw provider.
+/// - All other `StateProvider` parent-trait methods delegate unconditionally.
+///
+/// Visibility: `pub(super)` so Task 13 (`wrap_state_provider`) can use it.
+pub(super) struct MinerCachedStateProvider<S> {
+    raw: S,
+    borrow: MinerCacheBorrow,
+}
+
+impl<S> MinerCachedStateProvider<S> {
+    pub(super) fn new(raw: S, borrow: MinerCacheBorrow) -> Self {
+        Self { raw, borrow }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cache-backed readers
+// ---------------------------------------------------------------------------
+
+impl<S: reth_provider::AccountReader> reth_provider::AccountReader
+    for MinerCachedStateProvider<S>
+{
+    fn basic_account(
+        &self,
+        address: &Address,
+    ) -> reth_provider::ProviderResult<Option<Account>> {
+        match self.borrow.lookup_account(address) {
+            Some(value) => Ok(value),
+            None => self.raw.basic_account(address),
+        }
+    }
+}
+
+impl<S: reth_provider::BytecodeReader> reth_provider::BytecodeReader
+    for MinerCachedStateProvider<S>
+{
+    fn bytecode_by_hash(
+        &self,
+        code_hash: &B256,
+    ) -> reth_provider::ProviderResult<Option<reth_primitives_traits::Bytecode>> {
+        match self.borrow.lookup_code(code_hash) {
+            Some(value) => Ok(value),
+            None => self.raw.bytecode_by_hash(code_hash),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// StateProvider (owns the `storage` method)
+// ---------------------------------------------------------------------------
+
+impl<S: reth_provider::StateProvider> reth_provider::StateProvider
+    for MinerCachedStateProvider<S>
+{
+    fn storage(
+        &self,
+        account: Address,
+        storage_key: StorageKey,
+    ) -> reth_provider::ProviderResult<Option<StorageValue>> {
+        // StorageKey = B256 (alloy alias); no conversion needed.
+        match self.borrow.lookup_storage(&account, &storage_key) {
+            Some(value) => Ok(value),
+            None => self.raw.storage(account, storage_key),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pure-delegation impls for every other StateProvider super-trait
+// ---------------------------------------------------------------------------
+
+impl<S: reth_provider::BlockHashReader> reth_provider::BlockHashReader
+    for MinerCachedStateProvider<S>
+{
+    fn block_hash(
+        &self,
+        number: alloy_primitives::BlockNumber,
+    ) -> reth_provider::ProviderResult<Option<B256>> {
+        self.raw.block_hash(number)
+    }
+
+    fn canonical_hashes_range(
+        &self,
+        start: alloy_primitives::BlockNumber,
+        end: alloy_primitives::BlockNumber,
+    ) -> reth_provider::ProviderResult<Vec<B256>> {
+        self.raw.canonical_hashes_range(start, end)
+    }
+}
+
+impl<S: reth_provider::StateRootProvider> reth_provider::StateRootProvider
+    for MinerCachedStateProvider<S>
+{
+    fn state_root(
+        &self,
+        hashed_state: reth_trie_common::HashedPostState,
+    ) -> reth_provider::ProviderResult<B256> {
+        self.raw.state_root(hashed_state)
+    }
+
+    fn state_root_from_nodes(
+        &self,
+        input: reth_trie_common::TrieInput,
+    ) -> reth_provider::ProviderResult<B256> {
+        self.raw.state_root_from_nodes(input)
+    }
+
+    fn state_root_with_updates(
+        &self,
+        hashed_state: reth_trie_common::HashedPostState,
+    ) -> reth_provider::ProviderResult<(B256, reth_trie_common::updates::TrieUpdates)> {
+        self.raw.state_root_with_updates(hashed_state)
+    }
+
+    fn state_root_from_nodes_with_updates(
+        &self,
+        input: reth_trie_common::TrieInput,
+    ) -> reth_provider::ProviderResult<(B256, reth_trie_common::updates::TrieUpdates)> {
+        self.raw.state_root_from_nodes_with_updates(input)
+    }
+}
+
+impl<S: reth_provider::StorageRootProvider> reth_provider::StorageRootProvider
+    for MinerCachedStateProvider<S>
+{
+    fn storage_root(
+        &self,
+        address: Address,
+        hashed_storage: reth_trie_common::HashedStorage,
+    ) -> reth_provider::ProviderResult<B256> {
+        self.raw.storage_root(address, hashed_storage)
+    }
+
+    fn storage_proof(
+        &self,
+        address: Address,
+        slot: B256,
+        hashed_storage: reth_trie_common::HashedStorage,
+    ) -> reth_provider::ProviderResult<reth_trie_common::StorageProof> {
+        self.raw.storage_proof(address, slot, hashed_storage)
+    }
+
+    fn storage_multiproof(
+        &self,
+        address: Address,
+        slots: &[B256],
+        hashed_storage: reth_trie_common::HashedStorage,
+    ) -> reth_provider::ProviderResult<reth_trie_common::StorageMultiProof> {
+        self.raw.storage_multiproof(address, slots, hashed_storage)
+    }
+}
+
+impl<S: reth_provider::StateProofProvider> reth_provider::StateProofProvider
+    for MinerCachedStateProvider<S>
+{
+    fn proof(
+        &self,
+        input: reth_trie_common::TrieInput,
+        address: Address,
+        slots: &[B256],
+    ) -> reth_provider::ProviderResult<reth_trie_common::AccountProof> {
+        self.raw.proof(input, address, slots)
+    }
+
+    fn multiproof(
+        &self,
+        input: reth_trie_common::TrieInput,
+        targets: reth_trie_common::MultiProofTargets,
+    ) -> reth_provider::ProviderResult<reth_trie_common::MultiProof> {
+        self.raw.multiproof(input, targets)
+    }
+
+    fn witness(
+        &self,
+        input: reth_trie_common::TrieInput,
+        target: reth_trie_common::HashedPostState,
+    ) -> reth_provider::ProviderResult<Vec<alloy_primitives::Bytes>> {
+        self.raw.witness(input, target)
+    }
+}
+
+impl<S: reth_provider::HashedPostStateProvider> reth_provider::HashedPostStateProvider
+    for MinerCachedStateProvider<S>
+{
+    fn hashed_post_state(
+        &self,
+        bundle_state: &revm::database::BundleState,
+    ) -> reth_trie_common::HashedPostState {
+        self.raw.hashed_post_state(bundle_state)
+    }
+}
+
+// ===========================================================================
 // Global handle
 // ===========================================================================
 
@@ -311,6 +511,7 @@ mod tests {
         states::StorageSlot, AccountStatus, BundleAccount, BundleState, StorageWithOriginalValues,
     };
     use revm::state::AccountInfo;
+    use reth_provider::AccountReader;
 
     // ------------------------------------------------------------------
     // Test helpers
@@ -706,6 +907,92 @@ mod tests {
         assert!(
             result.is_none(),
             "pre-destruction borrow + post-destruction read: cache returns None (fall-through), not Some(None) shortcut"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // MinerCachedStateProvider tests
+    // ------------------------------------------------------------------
+
+    /// Stub raw provider that always returns a fixed account regardless of address.
+    struct StubRaw {
+        account: Account,
+    }
+
+    impl reth_provider::AccountReader for StubRaw {
+        fn basic_account(
+            &self,
+            _address: &Address,
+        ) -> reth_provider::ProviderResult<Option<Account>> {
+            Ok(Some(self.account))
+        }
+    }
+
+    #[test]
+    fn cached_provider_falls_through_to_raw_on_filter_reject() {
+        // Scenario: take a borrow, then a NEWER write for the same address
+        // arrives (write_v > v_at_borrow). The version filter must reject the
+        // newer entry and fall through to the raw provider.
+        let cache = Arc::new(MinerExecCache::new());
+        let addr = Address::from([0x33; 20]);
+        cache.apply_bundle(&mk_bundle_with_account(addr, 42));
+
+        // Borrow snapshot: v_at_borrow = 1.
+        let borrow = cache.peek_for().unwrap();
+        assert_eq!(borrow.v_at_borrow, 1);
+
+        // Overwrite the entry with a newer write (write_v = 2, same chain).
+        cache.apply_bundle(&mk_bundle_with_account(addr, 555));
+        // Now cache has (value=555, write_v=2, ce=0). Borrow v_at_borrow=1 < 2
+        // → version filter rejects.
+
+        // Construct the wrapper with a stub that returns a sentinel value (99999).
+        let raw = StubRaw {
+            account: Account {
+                nonce: 0,
+                balance: alloy_primitives::U256::from(99999u64),
+                bytecode_hash: None,
+            },
+        };
+        let provider = MinerCachedStateProvider::new(raw, borrow);
+
+        // lookup_account sees write_v=2 > v_at_borrow=1 → returns None
+        // → wrapper falls through to raw → 99999.
+        let result = provider
+            .basic_account(&addr)
+            .expect("basic_account must not error");
+        assert_eq!(
+            result.unwrap().balance,
+            alloy_primitives::U256::from(99999u64),
+            "filter reject (future write_v) must fall through to raw provider"
+        );
+    }
+
+    #[test]
+    fn cached_provider_returns_cached_value_on_hit() {
+        let cache = Arc::new(MinerExecCache::new());
+        let addr = Address::from([0x44; 20]);
+        cache.apply_bundle(&mk_bundle_with_account(addr, 777));
+
+        // Borrow taken immediately after — chain_epoch matches, version matches.
+        let borrow = cache.peek_for().unwrap();
+
+        let raw = StubRaw {
+            account: Account {
+                nonce: 0,
+                balance: alloy_primitives::U256::from(99999u64),
+                bytecode_hash: None,
+            },
+        };
+        let provider = MinerCachedStateProvider::new(raw, borrow);
+
+        let result = provider
+            .basic_account(&addr)
+            .expect("basic_account must not error");
+        assert_eq!(
+            result.unwrap().balance,
+            alloy_primitives::U256::from(777u64),
+            "cache hit must return the cached value, not the raw fallback"
         );
     }
 }
