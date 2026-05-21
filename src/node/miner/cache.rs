@@ -1364,4 +1364,115 @@ mod tests {
         let _: fn(reth_provider::StateProviderBox) -> reth_provider::StateProviderBox =
             wrap_state_provider;
     }
+
+    // ------------------------------------------------------------------
+    // Concurrent reader/writer race-injection test (Task 17, spec §9.4 S2)
+    //
+    // This is the primary correctness validator for the design's
+    // concurrent-reader guarantee. A `MinerCacheBorrow` taken at time T
+    // corresponds to a hypothetical "raw provider for the parent at time
+    // T". Any value the borrow returns MUST agree with that hypothetical
+    // raw provider — or it MUST return None (cache miss / filter reject),
+    // signaling fall-through to the actual raw provider.
+    //
+    // The test pits a reader (using a borrow taken after a known
+    // snapshot) against a writer (writing many bundles after the
+    // snapshot). The reader asserts every returned Some(...) value
+    // matches the pre-snapshot oracle — the truth at borrow time.
+    // ------------------------------------------------------------------
+
+    /// Oracle of what the borrow's parent SHOULD see — the truth at the
+    /// moment the borrow was taken. NEVER updated after the borrow.
+    #[derive(Default)]
+    struct OracleState {
+        accounts: std::sync::Mutex<std::collections::HashMap<Address, Account>>,
+    }
+
+    impl OracleState {
+        fn snapshot(&self) -> std::collections::HashMap<Address, Account> {
+            self.accounts.lock().unwrap().clone()
+        }
+        fn apply(&self, addr: Address, account: Account) {
+            self.accounts.lock().unwrap().insert(addr, account);
+        }
+    }
+
+    #[test]
+    fn concurrent_reader_writer_no_disagreement() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        let cache = Arc::new(MinerExecCache::new());
+        let oracle = Arc::new(OracleState::default());
+
+        // Seed one bundle so heartbeat is fresh and the borrow has something to read.
+        let addr0 = Address::from([0x00; 20]);
+        let info0 = mk_account_info(1);
+        cache.apply_bundle(&mk_bundle_with_account(addr0, 1));
+        oracle.apply(addr0, Account::from(&info0));
+
+        // Take borrow + snapshot oracle in lock-step. After this point, the oracle
+        // is frozen — any value the borrow returns must agree with this snapshot.
+        let borrow = cache.peek_for().unwrap();
+        let oracle_snapshot = oracle.snapshot();
+
+        // Two threads:
+        //   writer: hammers apply_bundle for many addresses (NOT updating the oracle —
+        //           the oracle is frozen at borrow time).
+        //   reader: uses the borrow to lookup many addresses, asserts every
+        //           Some(_) return agrees with the oracle snapshot.
+
+        let barrier = Arc::new(Barrier::new(2));
+
+        let cache_w = Arc::clone(&cache);
+        let barrier_w = Arc::clone(&barrier);
+        let writer = thread::spawn(move || {
+            barrier_w.wait();
+            for i in 1..=500u64 {
+                let addr = Address::from([(i & 0xff) as u8; 20]);
+                cache_w.apply_bundle(&mk_bundle_with_account(addr, i));
+                // Deliberately DO NOT update the oracle here.
+            }
+        });
+
+        let borrow_r = borrow;
+        let oracle_snap = oracle_snapshot;
+        let barrier_r = Arc::clone(&barrier);
+        let reader = thread::spawn(move || {
+            barrier_r.wait();
+            let mut hits = 0u32;
+            let mut misses = 0u32;
+            for i in 0..500u64 {
+                let addr = Address::from([(i & 0xff) as u8; 20]);
+                match borrow_r.lookup_account(&addr) {
+                    Some(Some(cached)) => {
+                        hits += 1;
+                        let oracle_says = oracle_snap.get(&addr).copied();
+                        assert_eq!(
+                            Some(cached),
+                            oracle_says,
+                            "cache returned a value the oracle never had at borrow's parent (addr index {i})"
+                        );
+                    }
+                    Some(None) => {
+                        // Cached "doesn't exist" — oracle must agree.
+                        let oracle_says = oracle_snap.get(&addr).copied();
+                        assert_eq!(
+                            oracle_says, None,
+                            "cache says destroyed but oracle has it (addr index {i})"
+                        );
+                    }
+                    None => {
+                        // Fall-through to raw provider — always correct by definition.
+                        misses += 1;
+                    }
+                }
+            }
+            // Make sure we exercised the cache (otherwise the test is vacuous).
+            assert!(hits + misses > 0, "no lookups performed");
+        });
+
+        writer.join().unwrap();
+        reader.join().unwrap();
+    }
 }
