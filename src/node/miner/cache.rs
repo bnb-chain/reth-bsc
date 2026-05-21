@@ -8,8 +8,12 @@
 #![allow(dead_code)]
 
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, LazyLock, OnceLock};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+/// Process-wide metrics singleton for the miner cross-block cache.
+static METRICS: LazyLock<crate::metrics::BscMinerCacheMetrics> =
+    LazyLock::new(crate::metrics::BscMinerCacheMetrics::default);
 
 use alloy_primitives::{Address, StorageKey, StorageValue, B256};
 use moka::sync::Cache;
@@ -91,6 +95,7 @@ impl MinerExecCache {
     /// before the writes land, read a stale entry for a key in the bundle,
     /// and incorrectly accept it as current.
     pub(super) fn apply_bundle(&self, bundle: &revm::database::BundleState) {
+        let _t0 = Instant::now();
         let chain_epoch = self.chain_epoch.load(Ordering::Acquire); // chain_epoch snapshot
         let new_v = self.version.load(Ordering::Acquire) + 1;
 
@@ -153,6 +158,7 @@ impl MinerExecCache {
         self.last_apply_at_ms.store(now_ms(), Ordering::Relaxed);
         // MUST be last: bump version only after all moka writes are visible.
         self.version.store(new_v, Ordering::Release);
+        METRICS.apply_bundle_seconds.record(_t0.elapsed().as_secs_f64());
     }
 
     /// Returns a `MinerCacheBorrow` if the cache heartbeat is fresh enough.
@@ -168,7 +174,10 @@ impl MinerExecCache {
         let last = self.last_apply_at_ms.load(Ordering::Relaxed);
         // Never-set: last == 0 → stale by definition (no apply has run yet).
         // Otherwise: check now - last <= threshold.
+        // Both conditions (never-set and stale) are counted as heartbeat_skip
+        // because in both cases the caller falls back to the raw provider.
         if last == 0 || now.saturating_sub(last) > STALENESS_THRESHOLD_MS {
+            METRICS.heartbeat_skip.increment(1);
             return None;
         }
         let ce = self.chain_epoch.load(Ordering::Acquire);
@@ -189,6 +198,7 @@ impl MinerExecCache {
     pub(super) fn on_reorg(&self) {
         self.chain_epoch.fetch_add(1, Ordering::Release);
         self.last_apply_at_ms.store(now_ms(), Ordering::Relaxed);
+        METRICS.reorg_total.increment(1);
     }
 }
 
@@ -211,10 +221,15 @@ impl MinerCacheBorrow {
     /// Filter (spec §9.3): entry must have the same `chain_epoch` as at borrow time
     /// AND a `write_version` ≤ `v_at_borrow`. Either mismatch → `None`.
     pub(super) fn lookup_account(&self, addr: &Address) -> Option<Option<Account>> {
-        let (value, write_v, ce) = self.cache.accounts.get(addr)?;
+        let Some((value, write_v, ce)) = self.cache.accounts.get(addr) else {
+            METRICS.misses_account.increment(1);
+            return None;
+        };
         if ce == self.chain_epoch_at_borrow && write_v <= self.v_at_borrow {
+            METRICS.hits_account.increment(1);
             Some(value)
         } else {
+            METRICS.misses_account.increment(1);
             None
         }
     }
@@ -228,10 +243,15 @@ impl MinerCacheBorrow {
     ///
     /// Filter: identical to `lookup_account` (spec §9.3).
     pub(super) fn lookup_code(&self, code_hash: &B256) -> Option<Option<Bytecode>> {
-        let (value, write_v, ce) = self.cache.code.get(code_hash)?;
+        let Some((value, write_v, ce)) = self.cache.code.get(code_hash) else {
+            METRICS.misses_code.increment(1);
+            return None;
+        };
         if ce == self.chain_epoch_at_borrow && write_v <= self.v_at_borrow {
+            METRICS.hits_code.increment(1);
             Some(value)
         } else {
+            METRICS.misses_code.increment(1);
             None
         }
     }
@@ -259,22 +279,32 @@ impl MinerCacheBorrow {
         // Step 1: accounts-first. If the account is tombstoned at or before our
         // borrow's version (and on the same chain), storage is empty by
         // definition — regardless of any slot entries that may linger
-        // (spec §6.3).
+        // (spec §6.3). The tombstone short-circuit counts as a HIT: the cache
+        // definitively answered the question.
         if let Some((value, write_v, ce)) = self.cache.accounts.get(addr) {
             if ce == self.chain_epoch_at_borrow
                 && write_v <= self.v_at_borrow
                 && value.is_none()
             {
+                METRICS.hits_storage.increment(1);
                 return Some(None);
             }
         }
 
         // Step 2: slot lookup via per-account Arc.
-        let storage_arc = self.cache.storage.get(addr)?;
-        let (value, write_v, ce) = storage_arc.slots.get(key)?;
+        let Some(storage_arc) = self.cache.storage.get(addr) else {
+            METRICS.misses_storage.increment(1);
+            return None;
+        };
+        let Some((value, write_v, ce)) = storage_arc.slots.get(key) else {
+            METRICS.misses_storage.increment(1);
+            return None;
+        };
         if ce == self.chain_epoch_at_borrow && write_v <= self.v_at_borrow {
+            METRICS.hits_storage.increment(1);
             Some(value)
         } else {
+            METRICS.misses_storage.increment(1);
             None
         }
     }
@@ -543,11 +573,14 @@ pub(super) async fn run_updater<N: reth_primitives_traits::NodePrimitives>(
                     skipped = n,
                     "CanonStateNotifications lagged — cache invalidated (on_reorg)"
                 );
+                METRICS.lagged_total.increment(1);
                 // Treat as forced invalidation: bump chain_epoch so every
                 // existing entry becomes unborrowable from any future borrow.
                 // The heartbeat is also refreshed so peek_for doesn't
                 // permanently stale-out; subsequent apply_bundle calls will
                 // re-fill the cache on the new canonical segment.
+                // Note: on_reorg also increments reorg_total, so a Lagged event
+                // contributes to both lagged_total and reorg_total.
                 cache.on_reorg();
             }
             Err(RecvError::Closed) => {

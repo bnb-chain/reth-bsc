@@ -295,6 +295,38 @@ pub struct BscParliaGethMetrics {
     pub doublesign: Counter,
 }
 
+/// Metrics for the miner cross-block execution cache.
+///
+/// All counters are cumulative since process start. The `apply_bundle_seconds`
+/// histogram measures the wall-clock time of a single `apply_bundle` call.
+///
+/// Metric names are rendered as `bsc_miner_cache_<field>` by the reth_metrics
+/// derive macro (dots → underscores, scope prefix prepended).
+#[derive(Metrics, Clone)]
+#[metrics(scope = "bsc.miner.cache")]
+pub struct BscMinerCacheMetrics {
+    /// Cache hits served for account lookups.
+    pub hits_account: Counter,
+    /// Cache hits served for storage-slot lookups (including tombstone short-circuit).
+    pub hits_storage: Counter,
+    /// Cache hits served for bytecode lookups.
+    pub hits_code: Counter,
+    /// Cache misses for account lookups (entry absent or filter rejected).
+    pub misses_account: Counter,
+    /// Cache misses for storage-slot lookups (entry absent or filter rejected).
+    pub misses_storage: Counter,
+    /// Cache misses for bytecode lookups (entry absent or filter rejected).
+    pub misses_code: Counter,
+    /// `peek_for` calls that returned `None` due to a stale or never-set heartbeat.
+    pub heartbeat_skip: Counter,
+    /// `chain_epoch` bumps from `on_reorg` (explicit reorgs and Lagged invalidations).
+    pub reorg_total: Counter,
+    /// `RecvError::Lagged` events received by the updater task.
+    pub lagged_total: Counter,
+    /// Wall-clock time to apply one `BundleState` into the cache, in seconds.
+    pub apply_bundle_seconds: Histogram,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,5 +342,6 @@ mod tests {
         let _miner_metrics = BscMinerMetrics::default();
         let _finality_metrics = BscFinalityMetrics::default();
         let _blockchain_metrics = BscBlockchainMetrics::default();
+        let _cache_metrics = BscMinerCacheMetrics::default();
     }
 }
