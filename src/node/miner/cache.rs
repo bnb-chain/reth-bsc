@@ -159,6 +159,13 @@ impl MinerExecCache {
         // MUST be last: bump version only after all moka writes are visible.
         self.version.store(new_v, Ordering::Release);
         METRICS.apply_bundle_seconds.record(_t0.elapsed().as_secs_f64());
+        // Update entry-count gauges so canary can confirm moka isn't blowing
+        // past the size cap (spec §13). entry_count() returns u64 directly in
+        // moka 0.12.x; note counts are approximate (moka defers some bookkeeping
+        // to background threads), so treat these as best-effort estimates.
+        METRICS.entries_account.set(self.accounts.entry_count() as f64);
+        METRICS.entries_storage.set(self.storage.entry_count() as f64);
+        METRICS.entries_code.set(self.code.entry_count() as f64);
     }
 
     /// Returns a `MinerCacheBorrow` if the cache heartbeat is fresh enough.
@@ -225,13 +232,18 @@ impl MinerCacheBorrow {
             METRICS.misses_account.increment(1);
             return None;
         };
-        if ce == self.chain_epoch_at_borrow && write_v <= self.v_at_borrow {
-            METRICS.hits_account.increment(1);
-            Some(value)
-        } else {
+        if ce != self.chain_epoch_at_borrow {
+            METRICS.chain_epoch_mismatch.increment(1);
             METRICS.misses_account.increment(1);
-            None
+            return None;
         }
+        if write_v > self.v_at_borrow {
+            METRICS.version_reject.increment(1);
+            METRICS.misses_account.increment(1);
+            return None;
+        }
+        METRICS.hits_account.increment(1);
+        Some(value)
     }
 
     /// Look up bytecode by code hash.
@@ -247,13 +259,18 @@ impl MinerCacheBorrow {
             METRICS.misses_code.increment(1);
             return None;
         };
-        if ce == self.chain_epoch_at_borrow && write_v <= self.v_at_borrow {
-            METRICS.hits_code.increment(1);
-            Some(value)
-        } else {
+        if ce != self.chain_epoch_at_borrow {
+            METRICS.chain_epoch_mismatch.increment(1);
             METRICS.misses_code.increment(1);
-            None
+            return None;
         }
+        if write_v > self.v_at_borrow {
+            METRICS.version_reject.increment(1);
+            METRICS.misses_code.increment(1);
+            return None;
+        }
+        METRICS.hits_code.increment(1);
+        Some(value)
     }
 
     /// Look up a storage slot by address and key.
@@ -300,13 +317,18 @@ impl MinerCacheBorrow {
             METRICS.misses_storage.increment(1);
             return None;
         };
-        if ce == self.chain_epoch_at_borrow && write_v <= self.v_at_borrow {
-            METRICS.hits_storage.increment(1);
-            Some(value)
-        } else {
+        if ce != self.chain_epoch_at_borrow {
+            METRICS.chain_epoch_mismatch.increment(1);
             METRICS.misses_storage.increment(1);
-            None
+            return None;
         }
+        if write_v > self.v_at_borrow {
+            METRICS.version_reject.increment(1);
+            METRICS.misses_storage.increment(1);
+            return None;
+        }
+        METRICS.hits_storage.increment(1);
+        Some(value)
     }
 }
 

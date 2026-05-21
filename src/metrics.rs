@@ -325,6 +325,16 @@ pub struct BscMinerCacheMetrics {
     pub lagged_total: Counter,
     /// Wall-clock time to apply one `BundleState` into the cache, in seconds.
     pub apply_bundle_seconds: Histogram,
+    /// Filter reject: borrow's chain_epoch did not match an observed entry's chain_epoch.
+    pub chain_epoch_mismatch: Counter,
+    /// Filter reject: entry's write_v > v_at_borrow.
+    pub version_reject: Counter,
+    /// Current moka entry counts (updated at end of each apply_bundle).
+    pub entries_account: Gauge,
+    /// Current moka entry count for the storage (outer) cache.
+    pub entries_storage: Gauge,
+    /// Current moka entry count for the code cache.
+    pub entries_code: Gauge,
 }
 
 #[cfg(test)]
