@@ -818,6 +818,15 @@ where
                     let is_inturn = submit_ctx.mining_ctx.is_inturn;
                     let block_number = submit_ctx.payload.block().number();
                     let block_hash = submit_ctx.payload.block().hash();
+                    let tx_count = submit_ctx.payload.block().body().transaction_count();
+                    let exec_ms = submit_ctx.payload.exec_duration.as_millis();
+                    let trie_root_ms = submit_ctx.payload.trie_root_duration.as_millis();
+                    let block_ts_ms = submit_ctx.mining_ctx.block_timestamp_ms;
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let block_age_ms = now_ms as i64 - block_ts_ms as i64;
                     match self.submit_payload(submit_ctx.payload).await {
                         Ok(()) => {
                             info!(
@@ -825,6 +834,12 @@ where
                                 block_number,
                                 block_hash = %block_hash,
                                 is_inturn,
+                                tx_count,
+                                exec_ms,
+                                trie_root_ms,
+                                block_ts_ms,
+                                now_ms,
+                                block_age_ms,
                                 "Succeed to submit block"
                             );
                         }
