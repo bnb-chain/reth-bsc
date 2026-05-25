@@ -110,17 +110,18 @@ impl<DB: Database, I> BscEvm<DB, I> {
         }
     }
 
-    /// Fund the beneficiary with `value` so a value-transferring BSC system tx
-    /// (e.g. the block-reward deposit) does not fail balance checks during trace
-    /// replay — archive state at block start has not yet received that reward.
-    /// Trace-mode only; callers must gate on `tx.is_system_transaction`.
+    /// Stand in for `post_execution::distribute_incoming`'s SYSTEM_ADDRESS →
+    /// validator credit, which trace replay skips. Use `incr_balance`, not
+    /// `set_balance`, so the archive-state balance survives the deposit's
+    /// `B + V → B` round-trip. Runs before the handler's tx checkpoint, so a
+    /// (very unlikely) system-tx revert would leave the top-up in place.
     pub(crate) fn fund_beneficiary_for_system_tx_replay(&mut self, value: revm::primitives::U256) {
-        if !self.trace {
+        if !self.trace || value.is_zero() {
             return;
         }
         let beneficiary = self.block.beneficiary;
         if let Ok(mut account) = self.journal_mut().load_account_mut(beneficiary) {
-            account.set_balance(value);
+            let _ = account.incr_balance(value);
         }
     }
 }
@@ -557,5 +558,68 @@ mod tests {
             evm.inner.ctx.tx.is_system_transaction,
             "system transaction should be marked after inspect_one_tx()"
         );
+    }
+
+    fn read_beneficiary_balance(
+        evm: &mut BscEvm<InMemoryDB, NoOpInspector>,
+        beneficiary: Address,
+    ) -> U256 {
+        use revm::context::{ContextTr, JournalTr};
+        use revm_context_interface::journaled_state::account::JournaledAccountTr;
+        *evm.journal_mut()
+            .load_account_mut(beneficiary)
+            .expect("beneficiary account should load")
+            .balance()
+    }
+
+    const TRACE_BENEFICIARY_INITIAL_BALANCE: u64 = 1_000_000_000_000u64;
+
+    #[test]
+    fn fund_uses_incr_semantics_not_set() {
+        let beneficiary = Address::from([0x10; 20]);
+        let mut evm = make_trace_replay_evm(beneficiary, VALIDATOR_SYSTEM_CONTRACT);
+
+        let initial = U256::from(TRACE_BENEFICIARY_INITIAL_BALANCE);
+        let top_up = U256::from(42_000u64);
+        evm.fund_beneficiary_for_system_tx_replay(top_up);
+
+        assert_eq!(read_beneficiary_balance(&mut evm, beneficiary), initial + top_up);
+    }
+
+    #[test]
+    fn fund_is_noop_for_zero_value() {
+        let beneficiary = Address::from([0x10; 20]);
+        let mut evm = make_trace_replay_evm(beneficiary, VALIDATOR_SYSTEM_CONTRACT);
+
+        let initial = U256::from(TRACE_BENEFICIARY_INITIAL_BALANCE);
+        evm.fund_beneficiary_for_system_tx_replay(U256::ZERO);
+
+        assert_eq!(read_beneficiary_balance(&mut evm, beneficiary), initial);
+    }
+
+    #[test]
+    fn fund_is_noop_when_trace_disabled() {
+        let beneficiary = Address::from([0x10; 20]);
+        let mut cfg_env = CfgEnv::new_with_spec(BscHardfork::Osaka).with_chain_id(56);
+        cfg_env.tx_gas_limit_cap = Some(2u64.pow(24));
+        let block_env = BlockEnv {
+            beneficiary,
+            prevrandao: Some(U256::from(1).into()),
+            ..Default::default()
+        };
+        let mut db = InMemoryDB::default();
+        db.insert_account_info(
+            beneficiary,
+            AccountInfo {
+                balance: U256::from(TRACE_BENEFICIARY_INITIAL_BALANCE),
+                ..AccountInfo::default()
+            },
+        );
+        let mut evm = BscEvm::new(EvmEnv::new(cfg_env, block_env), db, NoOpInspector, false, false);
+
+        let initial = U256::from(TRACE_BENEFICIARY_INITIAL_BALANCE);
+        evm.fund_beneficiary_for_system_tx_replay(U256::from(123u64));
+
+        assert_eq!(read_beneficiary_balance(&mut evm, beneficiary), initial);
     }
 }
