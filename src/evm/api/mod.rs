@@ -110,15 +110,12 @@ impl<DB: Database, I> BscEvm<DB, I> {
         }
     }
 
-    /// Trace-only: top up beneficiary so a value-transferring system tx (e.g. the
-    /// block-reward deposit) does not fail balance checks during replay — archive
-    /// state at block start has not yet received that reward.
-    pub(crate) fn maybe_bump_beneficiary_balance_for_trace(
-        &mut self,
-        is_system_tx: bool,
-        value: revm::primitives::U256,
-    ) {
-        if !self.trace || !is_system_tx {
+    /// Fund the beneficiary with `value` so a value-transferring BSC system tx
+    /// (e.g. the block-reward deposit) does not fail balance checks during trace
+    /// replay — archive state at block start has not yet received that reward.
+    /// Trace-mode only; callers must gate on `tx.is_system_transaction`.
+    pub(crate) fn fund_beneficiary_for_system_tx_replay(&mut self, value: revm::primitives::U256) {
+        if !self.trace {
             return;
         }
         let beneficiary = self.block.beneficiary;
@@ -419,7 +416,7 @@ mod tests {
         );
         db.insert_account_info(system_contract, AccountInfo::default());
 
-        // trace = true enables `maybe_bump_beneficiary_balance_for_trace`.
+        // trace = true enables `fund_beneficiary_for_system_tx_replay`.
         BscEvm::new(env, db, NoOpInspector, false, true)
     }
 

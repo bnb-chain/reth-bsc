@@ -69,9 +69,9 @@ where
         // BlockExecutor filters mined system txs out before reaching here; trace
         // RPCs do not — let `prepare` mark them idempotently for `BscHandler`.
         self.prepare_tx_for_execution(&mut tx);
-        self.maybe_bump_beneficiary_balance_for_trace(tx.is_system_transaction, tx.base.value);
 
         let saved_env = if tx.is_system_transaction {
+            self.fund_beneficiary_for_system_tx_replay(tx.base.value);
             Some((
                 core::mem::replace(&mut self.block.gas_limit, tx.base.gas_limit),
                 core::mem::replace(&mut self.block.basefee, 0),
@@ -81,10 +81,8 @@ where
             None
         };
 
-        // Execute transaction
         let res = if self.inspect { self.inspect_tx(tx) } else { ExecuteEvm::transact(self, tx) };
 
-        // Restore environment for system transactions
         if let Some((gas_limit, basefee, disable_nonce_check)) = saved_env {
             self.block.gas_limit = gas_limit;
             self.block.basefee = basefee;

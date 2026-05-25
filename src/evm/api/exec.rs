@@ -31,10 +31,11 @@ where
         self.inner.set_block(block);
     }
 
-    fn transact_one(&mut self, tx: Self::Tx) -> Result<Self::ExecutionResult, Self::Error> {
-        let mut tx = tx;
+    fn transact_one(&mut self, mut tx: Self::Tx) -> Result<Self::ExecutionResult, Self::Error> {
         self.prepare_tx_for_execution(&mut tx);
-        self.maybe_bump_beneficiary_balance_for_trace(tx.is_system_transaction, tx.base.value);
+        if tx.is_system_transaction {
+            self.fund_beneficiary_for_system_tx_replay(tx.base.value);
+        }
         self.inner.ctx.set_tx(tx);
         BscHandler::new().run(self)
     }
@@ -45,9 +46,10 @@ where
 
     fn replay(&mut self) -> Result<ResultAndState, Self::Error> {
         self.prepare_current_tx_for_execution();
-        let is_sys = self.inner.ctx.tx.is_system_transaction;
-        let value = self.inner.ctx.tx.base.value;
-        self.maybe_bump_beneficiary_balance_for_trace(is_sys, value);
+        if self.inner.ctx.tx.is_system_transaction {
+            let value = self.inner.ctx.tx.base.value;
+            self.fund_beneficiary_for_system_tx_replay(value);
+        }
         BscHandler::new().run(self).map(|result| {
             let state = self.finalize();
             ResultAndState::new(result, state)
@@ -75,10 +77,11 @@ where
         self.inner.set_inspector(inspector);
     }
 
-    fn inspect_one_tx(&mut self, tx: Self::Tx) -> Result<Self::ExecutionResult, Self::Error> {
-        let mut tx = tx;
+    fn inspect_one_tx(&mut self, mut tx: Self::Tx) -> Result<Self::ExecutionResult, Self::Error> {
         self.prepare_tx_for_execution(&mut tx);
-        self.maybe_bump_beneficiary_balance_for_trace(tx.is_system_transaction, tx.base.value);
+        if tx.is_system_transaction {
+            self.fund_beneficiary_for_system_tx_replay(tx.base.value);
+        }
         self.inner.ctx.set_tx(tx);
         BscHandler::new().inspect_run(self)
     }
