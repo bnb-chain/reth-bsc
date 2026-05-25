@@ -20,12 +20,10 @@ use reth_evm::{precompiles::PrecompilesMap, Database, Evm, EvmEnv};
 use revm::{
     context::{
         result::{EVMError, HaltReason, ResultAndState},
-        BlockEnv, ContextTr,
+        BlockEnv,
     },
-    context_interface::JournalTr,
     Context, ExecuteEvm, InspectEvm, Inspector, SystemCallEvm,
 };
-use revm_context_interface::journaled_state::account::JournaledAccountTr;
 
 mod assembler;
 mod builder;
@@ -68,30 +66,11 @@ where
         &mut self,
         mut tx: Self::Tx,
     ) -> Result<ResultAndState<Self::HaltReason>, Self::Error> {
-        // Detect system transactions in inspect mode (for trace APIs)
-        // Normal execution: BlockExecutor filters system txs before calling transact
-        // debug_traceTransaction/debug_traceCall: detect and handle system txs here
+        // BlockExecutor filters mined system txs out before reaching here; trace
+        // RPCs do not — let `prepare` mark them idempotently for `BscHandler`.
+        self.prepare_tx_for_execution(&mut tx);
+        self.maybe_bump_beneficiary_balance_for_trace(tx.is_system_transaction, tx.base.value);
 
-        if self.trace {
-            use crate::system_contracts::is_invoke_system_contract;
-            use revm::primitives::TxKind;
-
-            tx.is_system_transaction = matches!(tx.base.kind, TxKind::Call(to)
-                if tx.base.caller == self.block.beneficiary
-                    && is_invoke_system_contract(&to)
-                    && tx.base.gas_price == 0);
-
-            // Increase beneficiary balance for system transactions in trace context
-            // Only runs when trace=true (CacheDB detected or explicit inspector used)
-            if tx.is_system_transaction {
-                let beneficiary = self.block.beneficiary;
-                if let Ok(mut account) = self.journal_mut().load_account_mut(beneficiary) {
-                    account.set_balance(tx.base.value);
-                }
-            }
-        }
-
-        // Save original environment for system transactions
         let saved_env = if tx.is_system_transaction {
             Some((
                 core::mem::replace(&mut self.block.gas_limit, tx.base.gas_limit),

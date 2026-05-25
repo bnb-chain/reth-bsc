@@ -5,7 +5,7 @@ use crate::{evm::transaction::BscTxEnv, hardforks::bsc::BscHardfork};
 use super::precompiles::BscPrecompiles;
 use reth_evm::{precompiles::PrecompilesMap, Database, EvmEnv};
 use revm::{
-    context::{BlockEnv, CfgEnv, Evm as EvmCtx, FrameStack, JournalTr},
+    context::{BlockEnv, CfgEnv, ContextTr, Evm as EvmCtx, FrameStack, JournalTr},
     handler::{
         evm::{ContextDbError, FrameInitResult},
         instructions::EthInstructions,
@@ -16,6 +16,7 @@ use revm::{
     primitives::hardfork::SpecId,
     Context, Inspector, Journal,
 };
+use revm_context_interface::journaled_state::account::JournaledAccountTr;
 
 mod exec;
 
@@ -79,6 +80,51 @@ impl<DB: Database, I> BscEvm<DB, I> {
     /// Provides a mutable reference to the EVM context.
     pub fn ctx_mut(&mut self) -> &mut BscContext<DB> {
         &mut self.inner.ctx
+    }
+
+    /// `BscTxEnv` counterpart of `system_contracts::is_system_transaction`.
+    fn detect_system_transaction(&self, tx: &BscTxEnv) -> bool {
+        use crate::system_contracts::is_invoke_system_contract;
+        use revm::primitives::TxKind;
+
+        matches!(tx.base.kind, TxKind::Call(to)
+            if tx.base.caller == self.block.beneficiary
+                && is_invoke_system_contract(&to)
+                && tx.base.gas_price == 0)
+    }
+
+    /// Mark `tx` if it looks like a system tx. Idempotent: never downgrades an
+    /// already-true flag, because `pre/post_execution` hand-set it with
+    /// `caller = 0x00..00` which the predicate does not match.
+    pub(crate) fn prepare_tx_for_execution(&self, tx: &mut BscTxEnv) {
+        if !tx.is_system_transaction {
+            tx.is_system_transaction = self.detect_system_transaction(tx);
+        }
+    }
+
+    /// `prepare_tx_for_execution` for the `replay()` path (tx already on ctx).
+    pub(crate) fn prepare_current_tx_for_execution(&mut self) {
+        if !self.inner.ctx.tx.is_system_transaction {
+            let detected = self.detect_system_transaction(&self.inner.ctx.tx);
+            self.inner.ctx.tx.is_system_transaction = detected;
+        }
+    }
+
+    /// Trace-only: top up beneficiary so a value-transferring system tx (e.g. the
+    /// block-reward deposit) does not fail balance checks during replay — archive
+    /// state at block start has not yet received that reward.
+    pub(crate) fn maybe_bump_beneficiary_balance_for_trace(
+        &mut self,
+        is_system_tx: bool,
+        value: revm::primitives::U256,
+    ) {
+        if !self.trace || !is_system_tx {
+            return;
+        }
+        let beneficiary = self.block.beneficiary;
+        if let Ok(mut account) = self.journal_mut().load_account_mut(beneficiary) {
+            account.set_balance(value);
+        }
     }
 }
 
@@ -235,9 +281,9 @@ mod tests {
     use reth_evm::EvmEnv;
     use revm::{
         context::{BlockEnv, CfgEnv, TxEnv},
-        context_interface::result::{ExecutionResult, HaltReason},
+        context_interface::result::{EVMError, ExecutionResult, HaltReason, InvalidTransaction},
         handler::instructions::EthInstructions,
-        inspector::NoOpInspector,
+        inspector::{InspectEvm, NoOpInspector},
         primitives::{hardfork::SpecId, Address, Bytes, TxKind, U256},
         state::{AccountInfo, Bytecode},
         ExecuteEvm,
@@ -343,6 +389,176 @@ mod tests {
         assert!(
             mismatched_result.is_success(),
             "latest-spec instruction table should succeed with this gas limit"
+        );
+    }
+
+    /// `BscEvm` with Osaka + EIP-7825 cap enabled and a funded beneficiary,
+    /// shaped for trace-replay regression tests.
+    fn make_trace_replay_evm(
+        beneficiary: Address,
+        system_contract: Address,
+    ) -> BscEvm<InMemoryDB, NoOpInspector> {
+        let spec = BscHardfork::Osaka;
+        let mut cfg_env = CfgEnv::new_with_spec(spec).with_chain_id(56);
+        cfg_env.tx_gas_limit_cap = Some(2u64.pow(24));
+
+        let block_env = BlockEnv {
+            beneficiary,
+            prevrandao: Some(U256::from(1).into()),
+            ..Default::default()
+        };
+        let env = EvmEnv::new(cfg_env, block_env);
+
+        let mut db = InMemoryDB::default();
+        db.insert_account_info(
+            beneficiary,
+            AccountInfo {
+                balance: U256::from(1_000_000_000_000u64),
+                ..AccountInfo::default()
+            },
+        );
+        db.insert_account_info(system_contract, AccountInfo::default());
+
+        // trace = true enables `maybe_bump_beneficiary_balance_for_trace`.
+        BscEvm::new(env, db, NoOpInspector, false, true)
+    }
+
+    /// Mined-system-tx shape: signer = miner, to = system contract, fee = 0,
+    /// gas = `i64::MAX` (the value that trips the EIP-7825 cap).
+    fn system_tx_shape(beneficiary: Address, system_contract: Address) -> BscTxEnv {
+        BscTxEnv::new(
+            TxEnv::builder()
+                .caller(beneficiary)
+                .chain_id(Some(56))
+                .gas_limit(i64::MAX as u64)
+                .gas_price(0)
+                .kind(TxKind::Call(system_contract))
+                .build()
+                .expect("tx env should build"),
+        )
+    }
+
+    /// BSC `VALIDATOR_CONTRACT` (target of `deposit` / `distributeFinalityReward`).
+    const VALIDATOR_SYSTEM_CONTRACT: Address = Address::new([
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10, 0x00,
+    ]);
+
+    #[test]
+    fn prepare_marks_system_shape_tx() {
+        let beneficiary = Address::from([0x10; 20]);
+        let evm = make_trace_replay_evm(beneficiary, VALIDATOR_SYSTEM_CONTRACT);
+        let mut tx = system_tx_shape(beneficiary, VALIDATOR_SYSTEM_CONTRACT);
+        assert!(!tx.is_system_transaction, "precondition: unmarked");
+
+        evm.prepare_tx_for_execution(&mut tx);
+
+        assert!(
+            tx.is_system_transaction,
+            "tx matching (caller == beneficiary, to ∈ system contracts, gas_price == 0) should be marked"
+        );
+    }
+
+    #[test]
+    fn prepare_is_idempotent_and_does_not_overwrite_pre_marked() {
+        // Regression guard for `pre/post_execution` helpers that hand-set
+        // is_system_transaction = true with caller = 0x00..00 (which the
+        // predicate would reject).
+        let beneficiary = Address::from([0x10; 20]);
+        let evm = make_trace_replay_evm(beneficiary, VALIDATOR_SYSTEM_CONTRACT);
+        let mut tx = BscTxEnv {
+            base: TxEnv::builder()
+                .caller(Address::ZERO) // != beneficiary
+                .chain_id(Some(56))
+                .gas_limit(30_000_000)
+                .gas_price(0)
+                .kind(TxKind::Call(VALIDATOR_SYSTEM_CONTRACT))
+                .build()
+                .expect("tx env should build"),
+            is_system_transaction: true,
+        };
+
+        evm.prepare_tx_for_execution(&mut tx);
+
+        assert!(
+            tx.is_system_transaction,
+            "prepare must not overwrite an explicitly set is_system_transaction = true"
+        );
+    }
+
+    #[test]
+    fn prepare_leaves_normal_user_tx_unmarked() {
+        let beneficiary = Address::from([0x10; 20]);
+        let evm = make_trace_replay_evm(beneficiary, VALIDATOR_SYSTEM_CONTRACT);
+        let mut tx = BscTxEnv::new(
+            TxEnv::builder()
+                .caller(Address::from([0x11; 20])) // not beneficiary
+                .chain_id(Some(56))
+                .gas_limit(21_000)
+                .gas_price(1) // not zero
+                .kind(TxKind::Call(Address::from([0x22; 20])))
+                .build()
+                .expect("tx env should build"),
+        );
+
+        evm.prepare_tx_for_execution(&mut tx);
+
+        assert!(
+            !tx.is_system_transaction,
+            "ordinary user tx must not be misclassified as a system tx"
+        );
+    }
+
+    #[test]
+    fn replay_marks_system_tx_before_validation() {
+        let beneficiary = Address::from([0x10; 20]);
+        let mut evm = make_trace_replay_evm(beneficiary, VALIDATOR_SYSTEM_CONTRACT);
+        evm.inner.ctx.tx = system_tx_shape(beneficiary, VALIDATOR_SYSTEM_CONTRACT);
+
+        let result = evm.replay();
+        if let Err(EVMError::Transaction(InvalidTransaction::TxGasLimitGreaterThanCap { .. })) =
+            result
+        {
+            panic!("system transaction was not classified before replay validation");
+        }
+        assert!(
+            evm.inner.ctx.tx.is_system_transaction,
+            "system transaction should be marked after replay()"
+        );
+    }
+
+    #[test]
+    fn transact_one_marks_system_tx_before_validation() {
+        let beneficiary = Address::from([0x10; 20]);
+        let mut evm = make_trace_replay_evm(beneficiary, VALIDATOR_SYSTEM_CONTRACT);
+        let tx = system_tx_shape(beneficiary, VALIDATOR_SYSTEM_CONTRACT);
+
+        let result = evm.transact_one(tx);
+        if let Err(EVMError::Transaction(InvalidTransaction::TxGasLimitGreaterThanCap { .. })) =
+            result
+        {
+            panic!("system transaction was not classified before transact_one validation");
+        }
+        assert!(
+            evm.inner.ctx.tx.is_system_transaction,
+            "system transaction should be marked after transact_one()"
+        );
+    }
+
+    #[test]
+    fn inspect_one_tx_marks_system_tx_before_validation() {
+        let beneficiary = Address::from([0x10; 20]);
+        let mut evm = make_trace_replay_evm(beneficiary, VALIDATOR_SYSTEM_CONTRACT);
+        let tx = system_tx_shape(beneficiary, VALIDATOR_SYSTEM_CONTRACT);
+
+        let result = evm.inspect_one_tx(tx);
+        if let Err(EVMError::Transaction(InvalidTransaction::TxGasLimitGreaterThanCap { .. })) =
+            result
+        {
+            panic!("system transaction was not classified before inspect_one_tx validation");
+        }
+        assert!(
+            evm.inner.ctx.tx.is_system_transaction,
+            "system transaction should be marked after inspect_one_tx()"
         );
     }
 }

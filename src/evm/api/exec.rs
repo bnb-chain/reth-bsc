@@ -32,6 +32,9 @@ where
     }
 
     fn transact_one(&mut self, tx: Self::Tx) -> Result<Self::ExecutionResult, Self::Error> {
+        let mut tx = tx;
+        self.prepare_tx_for_execution(&mut tx);
+        self.maybe_bump_beneficiary_balance_for_trace(tx.is_system_transaction, tx.base.value);
         self.inner.ctx.set_tx(tx);
         BscHandler::new().run(self)
     }
@@ -41,6 +44,10 @@ where
     }
 
     fn replay(&mut self) -> Result<ResultAndState, Self::Error> {
+        self.prepare_current_tx_for_execution();
+        let is_sys = self.inner.ctx.tx.is_system_transaction;
+        let value = self.inner.ctx.tx.base.value;
+        self.maybe_bump_beneficiary_balance_for_trace(is_sys, value);
         BscHandler::new().run(self).map(|result| {
             let state = self.finalize();
             ResultAndState::new(result, state)
@@ -69,6 +76,9 @@ where
     }
 
     fn inspect_one_tx(&mut self, tx: Self::Tx) -> Result<Self::ExecutionResult, Self::Error> {
+        let mut tx = tx;
+        self.prepare_tx_for_execution(&mut tx);
+        self.maybe_bump_beneficiary_balance_for_trace(tx.is_system_transaction, tx.base.value);
         self.inner.ctx.set_tx(tx);
         BscHandler::new().inspect_run(self)
     }
