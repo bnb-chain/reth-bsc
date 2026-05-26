@@ -24,7 +24,6 @@ use revm::{
     },
     Context, ExecuteEvm, InspectEvm, Inspector, SystemCallEvm,
 };
-use revm::context_interface::journaled_state::account::JournaledAccountTr;
 
 mod assembler;
 mod builder;

@@ -16,7 +16,7 @@ use revm::{
     primitives::hardfork::SpecId,
     Context, Inspector, Journal,
 };
-use revm_context_interface::journaled_state::account::JournaledAccountTr;
+use revm::context_interface::journaled_state::account::JournaledAccountTr;
 
 mod exec;
 
@@ -565,7 +565,7 @@ mod tests {
         beneficiary: Address,
     ) -> U256 {
         use revm::context::{ContextTr, JournalTr};
-        use revm_context_interface::journaled_state::account::JournaledAccountTr;
+        use revm::context_interface::journaled_state::account::JournaledAccountTr;
         *evm.journal_mut()
             .load_account_mut(beneficiary)
             .expect("beneficiary account should load")
