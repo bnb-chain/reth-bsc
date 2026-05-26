@@ -70,6 +70,9 @@ pub enum ForkRecoverError {
 
     #[error("head header {hash} not in provider after recovery")]
     HeadHeaderMissing { hash: alloy_primitives::B256 },
+
+    #[error("fcu_target_header.hash {got} ≠ fcu_target_hash {expected}")]
+    FcuTargetHeaderMismatch { expected: alloy_primitives::B256, got: alloy_primitives::B256 },
 }
 
 /// Abstraction over `GetBlocksByRange`. Tests substitute a fake; production
@@ -135,27 +138,32 @@ pub struct Discovery {
     pub outcome: DiscoveryOutcome,
 }
 
-/// Walk backwards from `(head_num, head_hash)` via `parent_hash`-walked
+/// Walk backwards from `(start_num, start_hash)` via `parent_hash`-walked
 /// `GetBlocksByRange` hops until a local-chain match is found or
 /// `MAX_FORK_DEPTH` is exhausted.
+///
+/// The starting cursor is the *first block we want to learn about*, not
+/// necessarily the announced head: the parent-start path (`on_new_block`)
+/// passes `parent_hash` here while the legacy path (`on_new_block_hashes`)
+/// passes the announced head itself.
 pub async fn discover_fork_blocks<
     P: BlockHashReader + HeaderProvider<Header = alloy_consensus::Header>,
 >(
     peer: PeerId,
-    head_hash: B256,
-    head_num: u64,
+    start_hash: B256,
+    start_num: u64,
     provider: &P,
     fetcher: &dyn RangeFetcher,
 ) -> Result<Discovery, ForkRecoverError> {
     let mut fork_blocks: Vec<crate::BscBlock> = Vec::new();
-    let mut cursor_num = head_num;
-    let mut cursor_hash = head_hash;
+    let mut cursor_num = start_num;
+    let mut cursor_hash = start_hash;
     let mut walked: u64 = 0;
 
     loop {
         // Pre-hop local checks: if this cursor is already local, we've
-        // reached the common ancestor (or short-circuited on an already-known
-        // head).
+        // reached the common ancestor (or short-circuited because the
+        // starting cursor was itself locally known).
         //
         // The side-chain hit (`provider.header(cursor_hash).is_some()`) is
         // safe to treat as "ancestor reached" because engine-tree only stores
@@ -216,17 +224,82 @@ pub async fn discover_fork_blocks<
     }
 }
 
-/// Top-level recovery entry point.
+/// Inputs to [`recover_ancestors`]. The discovery start and FCU target are
+/// kept separate so callers with the full block payload (`on_new_block`) can
+/// start the backward walk from `parent_hash` — avoiding BSC's
+/// broadcast-before-commit race — while still flipping canonical to the
+/// announced head. Construct via [`RecoverTarget::single_pair`] or
+/// [`RecoverTarget::from_parent`].
+#[derive(Debug, Clone)]
+pub struct RecoverTarget {
+    /// Cursor for the backward walk. Parent of the announced block on the
+    /// `on_new_block` path; the head itself on header-only paths.
+    pub fetch_start_hash: B256,
+    /// Block number paired with `fetch_start_hash`.
+    pub fetch_start_num: u64,
+    /// Block we want canonical at the end of recovery.
+    pub fcu_target_hash: B256,
+    /// Block number paired with `fcu_target_hash`.
+    pub fcu_target_num: u64,
+    /// Header for the FCU target. `Some` when the caller already has it
+    /// decoded — lets Phase 3 skip a `provider.header(fcu_target_hash)` lookup
+    /// that may miss a block engine-tree just unbuffered but hasn't persisted.
+    /// `None` falls back to phase-2 tail / provider.
+    pub fcu_target_header: Option<alloy_consensus::Header>,
+}
+
+impl RecoverTarget {
+    /// Fetch from and FCU to the same `(hash, num)`. Used by header-only
+    /// paths (`on_new_block_hashes`) where we can't compute `parent_hash`;
+    /// stays exposed to a small broadcast-before-commit race window.
+    pub fn single_pair(hash: B256, num: u64) -> Self {
+        Self {
+            fetch_start_hash: hash,
+            fetch_start_num: num,
+            fcu_target_hash: hash,
+            fcu_target_num: num,
+            fcu_target_header: None,
+        }
+    }
+
+    /// Fetch from `(parent_hash, parent_num)`, FCU to `(target_hash,
+    /// target_num)`. Used by `on_new_block` to dodge the broadcast-before-
+    /// commit race: `parent_hash` is always committed on the source peer
+    /// (since `target` was built on top of it).
+    ///
+    /// Caller must already have called `engine.new_payload(target)` so the
+    /// block is buffered in engine-tree; Phase 2's parent import unbuffers
+    /// and imports it via `try_connect_buffered_blocks`.
+    pub fn from_parent(
+        parent_hash: B256,
+        parent_num: u64,
+        target_hash: B256,
+        target_num: u64,
+        target_header: alloy_consensus::Header,
+    ) -> Self {
+        Self {
+            fetch_start_hash: parent_hash,
+            fetch_start_num: parent_num,
+            fcu_target_hash: target_hash,
+            fcu_target_num: target_num,
+            fcu_target_header: Some(target_header),
+        }
+    }
+}
+
+/// Three-phase ancestor-aware recovery:
 ///
-/// 1. Walks back via `discover_fork_blocks` to find the common ancestor.
+/// 1. `discover_fork_blocks` walks back from `target.fetch_start_*` to the
+///    common ancestor.
 /// 2. Imports fork blocks oldest → newest via `engine.new_payload`, awaiting
 ///    `Valid` on each before submitting the next.
-/// 3. Issues a final `fork_choice_updated` for `head_hash`, so engine-tree
+/// 3. `fork_choice_updated` for `target.fcu_target_*` so engine-tree
 ///    re-evaluates canonical selection.
+///
+/// See [`RecoverTarget`] for the parent-start vs single-pair design.
 pub async fn recover_ancestors<P>(
     peer: PeerId,
-    head_hash: B256,
-    head_num: u64,
+    target: RecoverTarget,
     provider: P,
     engine: ConsensusEngineHandle<BscPayloadTypes>,
     forkchoice_engine: BscForkChoiceEngine<P>,
@@ -241,21 +314,34 @@ where
         + Sync
         + 'static,
 {
+    let RecoverTarget {
+        fetch_start_hash,
+        fetch_start_num,
+        fcu_target_hash,
+        fcu_target_num,
+        fcu_target_header,
+    } = target;
+
     tracing::info!(
         target: "bsc::fork_recover",
         %peer,
-        %head_hash,
-        head_num,
+        %fetch_start_hash,
+        fetch_start_num,
+        %fcu_target_hash,
+        fcu_target_num,
         "Starting fork recovery"
     );
 
     // ---- Phase 1 ----
-    let discovery = discover_fork_blocks(peer, head_hash, head_num, &provider, fetcher).await?;
+    let discovery =
+        discover_fork_blocks(peer, fetch_start_hash, fetch_start_num, &provider, fetcher).await?;
     tracing::debug!(
         target: "bsc::fork_recover",
         %peer,
-        %head_hash,
-        head_num,
+        %fetch_start_hash,
+        fetch_start_num,
+        %fcu_target_hash,
+        fcu_target_num,
         fork_blocks = discovery.fork_blocks.len(),
         outcome = ?discovery.outcome,
         "Phase 1 complete"
@@ -303,37 +389,27 @@ where
         }
     }
 
-    // ---- Phase 3: single FCU to let engine-tree re-evaluate canonical head ----
-    //
-    // `provider.header(head_hash)` is not safe on the AncestorFound path:
-    // engine-tree keeps the blocks we just imported in memory (TreeState)
-    // until persistence, so the DB-backed `provider` can return `None` for a
-    // block that `engine.new_payload` has already accepted as `Valid`. That
-    // false-negative was the qanet two-validator fork livelock: Phase 2
-    // succeeded, but Phase 3 aborted with `HeadHeaderMissing`, the head was
-    // cooled down for 30s, and the FCU that would flip canonical never fired.
-    //
-    // The Phase-2 tail is the recovery head by construction (see
-    // `discover_fork_blocks`: fork_blocks is newest→oldest with the head at
-    // index 0, so `to_import.last()` after `reverse()` is the head). Use its
-    // in-memory header directly. Only fall back to the provider on the
-    // Shortcircuit path, where `to_import` is empty and the head was already
-    // locally known (canonical or side-chain) — that lookup must succeed.
-    let head_header = resolve_fcu_head_header(&provider, head_hash, to_import.last())?;
+    // ---- Phase 3: FCU so engine-tree re-evaluates canonical head ----
+    let head_header = resolve_fcu_head_header(
+        &provider,
+        fcu_target_hash,
+        fcu_target_header.as_ref(),
+        to_import.last(),
+    )?;
     if let Err(err) = forkchoice_engine.update_forkchoice(&head_header).await {
         // FCU failure is recoverable (engine-tree may retry on next import);
         // surface at warn level to match `service.rs` convention.
         tracing::warn!(
             target: "bsc::fork_recover",
-            %head_hash,
+            %fcu_target_hash,
             error = %err,
             "fork_choice_updated returned error after recovery"
         );
     } else {
         tracing::info!(
             target: "bsc::fork_recover",
-            %head_hash,
-            head_num,
+            %fcu_target_hash,
+            fcu_target_num,
             "Fork recovery FCU succeeded"
         );
     }
@@ -341,37 +417,48 @@ where
     Ok(())
 }
 
-/// Resolve the header used as the FCU target at the end of `recover_ancestors`.
+/// Resolve the FCU target header in priority order:
 ///
-/// The AncestorFound path uses the Phase-2 tail (the peer's announced head,
-/// just imported via `engine.new_payload`) without consulting the DB provider:
-/// engine-tree holds that block in memory and the provider would return `None`
-/// until persistence lands — which is the qanet livelock we're fixing.
-///
-/// The Shortcircuit path (`phase_2_tail == None`) falls back to the provider,
-/// which is guaranteed to hold the head (canonical or side-chain) because
-/// `discover_fork_blocks` only short-circuits when the pre-hop local check
-/// succeeds. If the provider somehow disagrees, surface `HeadHeaderMissing`
-/// rather than forging an FCU target.
+/// 1. Caller override (`fcu_target_header`) — used by `on_new_block` to skip
+///    a provider lookup for a block engine-tree just unbuffered.
+/// 2. Phase-2 tail iff its hash equals `fcu_target_hash` — single-pair
+///    callers; sidesteps the qanet livelock where the DB-backed provider
+///    misses freshly-imported blocks.
+/// 3. Provider — Shortcircuit path or last resort; missing →
+///    `HeadHeaderMissing`.
 fn resolve_fcu_head_header<P>(
     provider: &P,
-    head_hash: B256,
+    fcu_target_hash: B256,
+    fcu_target_header: Option<&alloy_consensus::Header>,
     phase_2_tail: Option<&crate::BscBlock>,
 ) -> Result<alloy_consensus::Header, ForkRecoverError>
 where
     P: HeaderProvider<Header = alloy_consensus::Header>,
 {
-    if let Some(last) = phase_2_tail {
-        debug_assert_eq!(
-            last.header.hash_slow(),
-            head_hash,
-            "phase-2 tail must be the recovery head; invariant of discover_fork_blocks",
-        );
-        return Ok(last.header.clone());
+    // 1. Override. Hard-fail on hash mismatch: silently accepting a forged
+    // header would flip canonical to the wrong head.
+    if let Some(h) = fcu_target_header {
+        let got = h.hash_slow();
+        if got != fcu_target_hash {
+            return Err(ForkRecoverError::FcuTargetHeaderMismatch {
+                expected: fcu_target_hash,
+                got,
+            });
+        }
+        return Ok(h.clone());
     }
+
+    // 2. Phase-2 tail iff it equals the FCU target.
+    if let Some(last) = phase_2_tail {
+        if last.header.hash_slow() == fcu_target_hash {
+            return Ok(last.header.clone());
+        }
+    }
+
+    // 3. Provider.
     provider
-        .header(head_hash)?
-        .ok_or(ForkRecoverError::HeadHeaderMissing { hash: head_hash })
+        .header(fcu_target_hash)?
+        .ok_or(ForkRecoverError::HeadHeaderMissing { hash: fcu_target_hash })
 }
 
 /// Bounded LRU of recently-failed recovery heads with per-entry deadlines.
@@ -791,6 +878,48 @@ mod tests {
         assert_eq!(fetcher.calls().len(), 1);
     }
 
+    // ---- RecoverTarget constructor tests ----
+    //
+    // Trivial field mapping, pinned to catch future swaps of `parent_*` ↔
+    // `target_*` (would type-check but reintroduce the race).
+
+    #[test]
+    fn recover_target_single_pair_collapses_fetch_and_fcu() {
+        let h = B256::repeat_byte(0xAB);
+        let n = 42;
+        let t = super::RecoverTarget::single_pair(h, n);
+        assert_eq!(t.fetch_start_hash, h);
+        assert_eq!(t.fetch_start_num, n);
+        assert_eq!(t.fcu_target_hash, h);
+        assert_eq!(t.fcu_target_num, n);
+        assert!(t.fcu_target_header.is_none());
+    }
+
+    #[test]
+    fn recover_target_from_parent_keeps_pairs_distinct() {
+        let parent_hash = B256::repeat_byte(0x11);
+        let parent_num = 99;
+        let target_hash = B256::repeat_byte(0x22);
+        let target_num = 100;
+        let target_header = make_header(target_num, parent_hash, 0x1);
+        let target_header_hash = target_header.hash_slow();
+
+        let t = super::RecoverTarget::from_parent(
+            parent_hash,
+            parent_num,
+            target_hash,
+            target_num,
+            target_header,
+        );
+        assert_eq!(t.fetch_start_hash, parent_hash);
+        assert_eq!(t.fetch_start_num, parent_num);
+        assert_eq!(t.fcu_target_hash, target_hash);
+        assert_eq!(t.fcu_target_num, target_num);
+        let stored = t.fcu_target_header.expect("from_parent must populate the header");
+        assert_eq!(stored.hash_slow(), target_header_hash);
+        assert_eq!(stored.number, target_num);
+    }
+
     // ---- Phase-3 head-header resolver tests ----
     //
     // These pin the qanet livelock fix: Phase 2 imports the peer's head via
@@ -824,8 +953,9 @@ mod tests {
             "precondition: head not as side-chain in provider",
         );
 
+        // Legacy single-pair path: fcu_target_header = None, phase_2_tail.hash == fcu_target_hash.
         let resolved =
-            super::resolve_fcu_head_header(&provider, head_hash, Some(&tail_block)).unwrap();
+            super::resolve_fcu_head_header(&provider, head_hash, None, Some(&tail_block)).unwrap();
         assert_eq!(
             resolved.hash_slow(),
             head_hash,
@@ -847,7 +977,8 @@ mod tests {
         let side_hash = side.hash_slow();
         provider.insert_side(side);
 
-        let resolved = super::resolve_fcu_head_header(&provider, side_hash, None).unwrap();
+        let resolved =
+            super::resolve_fcu_head_header(&provider, side_hash, None, None).unwrap();
         assert_eq!(resolved.hash_slow(), side_hash);
     }
 
@@ -859,9 +990,107 @@ mod tests {
         let provider = FakeProvider::default();
         let head_hash = B256::repeat_byte(0xAB);
 
-        let err = super::resolve_fcu_head_header(&provider, head_hash, None).unwrap_err();
+        let err =
+            super::resolve_fcu_head_header(&provider, head_hash, None, None).unwrap_err();
         match err {
             ForkRecoverError::HeadHeaderMissing { hash } => assert_eq!(hash, head_hash),
+            other => panic!("expected HeadHeaderMissing, got {other:?}"),
+        }
+    }
+
+    // ---- Override / parent-start path tests ----
+
+    #[test]
+    fn resolve_fcu_head_header_explicit_override_wins_over_phase2_tail() {
+        // Override (priority 1) wins over phase-2 tail (priority 2), even
+        // when both are present.
+        let provider = FakeProvider::default();
+
+        let target = make_header(10, B256::repeat_byte(0xAA), 0x1);
+        let target_hash = target.hash_slow();
+
+        // Phase-2 tail is N-1 in the parent-start path; its hash differs.
+        let tail_header = make_header(9, B256::repeat_byte(0xBB), 0x2);
+        let tail_block = make_block(tail_header);
+
+        let resolved = super::resolve_fcu_head_header(
+            &provider,
+            target_hash,
+            Some(&target),
+            Some(&tail_block),
+        )
+        .unwrap();
+        assert_eq!(resolved.hash_slow(), target_hash);
+        assert_eq!(resolved.number, 10);
+    }
+
+    #[test]
+    fn resolve_fcu_head_header_mismatched_override_yields_error() {
+        // Hash mismatch must surface as error, not silently flip canonical
+        // to a forged head.
+        let provider = FakeProvider::default();
+        let supplied = make_header(10, B256::repeat_byte(0xAA), 0x1);
+        let supplied_hash = supplied.hash_slow();
+        let claimed_target_hash = B256::repeat_byte(0x99); // ≠ supplied_hash
+
+        let err = super::resolve_fcu_head_header(
+            &provider,
+            claimed_target_hash,
+            Some(&supplied),
+            None,
+        )
+        .unwrap_err();
+        match err {
+            ForkRecoverError::FcuTargetHeaderMismatch { expected, got } => {
+                assert_eq!(expected, claimed_target_hash);
+                assert_eq!(got, supplied_hash);
+            }
+            other => panic!("expected FcuTargetHeaderMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_fcu_head_header_parent_start_falls_back_to_provider_when_no_override() {
+        // Parent-start: tail.hash (N-1) ≠ fcu_target_hash (N). Tail is
+        // skipped, provider answers.
+        let mut provider = FakeProvider::default();
+        let parent = make_header(9, B256::repeat_byte(0xCC), 0x1);
+        let parent_hash = parent.hash_slow();
+        provider.insert_canonical(parent.clone());
+
+        let target = make_header(10, parent_hash, 0x1);
+        let target_hash = target.hash_slow();
+        // Provider DOES know N (canonical) — pretend persistence raced ahead.
+        provider.insert_canonical(target.clone());
+
+        let tail_block = make_block(parent);
+
+        let resolved =
+            super::resolve_fcu_head_header(&provider, target_hash, None, Some(&tail_block))
+                .unwrap();
+        assert_eq!(resolved.hash_slow(), target_hash);
+        assert_eq!(resolved.number, 10);
+    }
+
+    #[test]
+    fn resolve_fcu_head_header_parent_start_missing_provider_yields_error() {
+        // Parent-start with no override and provider also missing N → must
+        // surface HeadHeaderMissing rather than forge from the N-1 tail.
+        let provider = FakeProvider::default();
+        let parent_hash = B256::repeat_byte(0xCC);
+        let target_hash = B256::repeat_byte(0xDD);
+
+        let tail_block = make_block(make_header(9, parent_hash, 0x1));
+
+        let err = super::resolve_fcu_head_header(
+            &provider,
+            target_hash,
+            None,
+            Some(&tail_block),
+        )
+        .unwrap_err();
+        match err {
+            ForkRecoverError::HeadHeaderMissing { hash } => assert_eq!(hash, target_hash),
             other => panic!("expected HeadHeaderMissing, got {other:?}"),
         }
     }

@@ -49,13 +49,13 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y liburing-dev pkg-config libclang-dev
       - uses: actions-rs/toolchain@v1
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-05-11
           components: rustfmt
           override: true
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-udeps
       - name: Run cargo udeps
-        run: cargo +nightly udeps --workspace --lib --examples --tests --benches --all-features --locked
+        run: cargo +nightly-2026-05-11 udeps --workspace --lib --examples --tests --benches --all-features --locked
 
   clippy:
     name: clippy
