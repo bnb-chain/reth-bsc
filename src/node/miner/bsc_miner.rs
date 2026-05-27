@@ -730,6 +730,9 @@ where
                 .map(|v| v as u128)
                 .unwrap_or(self.desired_min_gas_tip),
             parent_difflayers: None, // populated once at job start via fetch_triedb_difflayers
+            // Filled in by BscPayloadJob::start when sparse-trie state-root is enabled
+            // and the engine has registered a spawner. Falls back to legacy path when None.
+            state_root_precomputed: std::sync::Arc::new(std::sync::Mutex::new(None)),
         };
 
         let parent_hash = mining_ctx.parent_header.hash();

@@ -287,6 +287,18 @@ pub struct BscBuildArguments<Attributes> {
     /// Fetched once at job creation and shared across all build attempts for the same parent.
     /// `None` when triedb is inactive or the fetch failed (graceful degradation to full trie).
     pub parent_difflayers: Option<DiffLayers>,
+    /// Precomputed `(state_root, trie_updates)` from a sparse-trie background task.
+    ///
+    /// Filled in by `BscPayloadJob::start` after exec completes, by calling
+    /// `StateRootHandle::state_root()` on the handle obtained from
+    /// `crate::shared::spawn_sparse_trie_state_root`. The builder consumes this in
+    /// `finish_with_difflayer` to skip the blocking `state_root_with_updates` call when
+    /// a value is present. `None` triggers the legacy synchronous path (fallback).
+    ///
+    /// `Arc<Mutex<...>>` so `#[derive(Clone)]` on `BscBuildArguments` still works; the
+    /// builder takes (`Option::take`) the value, retries see `None`.
+    pub state_root_precomputed:
+        Arc<Mutex<Option<(alloy_primitives::B256, reth_trie_common::updates::TrieUpdates)>>>,
 }
 
 /// BSC payload builder, used to build payload for bsc miner.
@@ -356,7 +368,15 @@ where
         args: BscBuildArguments<EthPayloadAttributes>,
     ) -> Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>> {
         let build_start = std::time::Instant::now();
-        let BscBuildArguments { mut cached_reads, config, cancel, trace_id, min_gas_tip, parent_difflayers } = args;
+        let BscBuildArguments {
+    mut cached_reads,
+    config,
+    cancel,
+    trace_id,
+    min_gas_tip,
+    parent_difflayers,
+    state_root_precomputed,
+} = args;
         let PayloadConfig { parent_header, attributes, payload_id: _ } = config;
 
         let parent_hash = parent_header.hash_slow();
@@ -778,6 +798,18 @@ where
 
         // add system txs to payload.
         let finalize_start = std::time::Instant::now();
+        // TODO(sparse-trie): once the StateRootHandle wiring lands, take
+        // `state_root_precomputed.lock().take()` here and route it into the builder
+        // before `finish_with_difflayer`. The blocker is that `builder` is typed as
+        // `impl BlockBuilder` from `evm_config.builder_for_next_block(...)`, so the
+        // concrete `BscBlockBuilder::with_precomputed_state_root(...)` setter is not
+        // reachable through the trait. Two ways forward:
+        //   1. Plumb precomputed root via `BscExecutionSharedCtx` (which builder.rs
+        //      already reads in `finish_with_difflayer`), or
+        //   2. Change `evm_config.builder_for_next_block` to return concrete
+        //      `BscBlockBuilder` instead of `impl BlockBuilder`.
+        // Leaving `state_root_precomputed` unused suppresses the dead-code warning.
+        let _ = &state_root_precomputed;
         let out = builder.finish_with_difflayer(&state_provider)?;
         let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } = out.inner;
         let difflayer = out.difflayer;
@@ -884,8 +916,15 @@ where
         args: BscBuildArguments<EthPayloadAttributes>,
     ) -> Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>> {
         let build_start = std::time::Instant::now();
-        let BscBuildArguments { mut cached_reads, config, cancel: _, trace_id, min_gas_tip: _, parent_difflayers } =
-            args;
+        let BscBuildArguments {
+            mut cached_reads,
+            config,
+            cancel: _,
+            trace_id,
+            min_gas_tip: _,
+            parent_difflayers,
+            state_root_precomputed,
+        } = args;
         let PayloadConfig { parent_header, attributes, payload_id: _ } = config;
 
         let parent_hash = parent_header.hash_slow();
@@ -1002,6 +1041,9 @@ where
 
         // Add system txs to payload and finalize
         let finalize_start = std::time::Instant::now();
+        // TODO(sparse-trie): same plumbing gap as in the first build path; see comment
+        // there for the two ways forward.
+        let _ = &state_root_precomputed;
         let out = builder.finish_with_difflayer(&state_provider)?;
         let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } = out.inner;
         let difflayer = out.difflayer;
@@ -1261,6 +1303,34 @@ where
             self.build_args.config.parent_header.hash_slow(),
         )
         .await;
+
+        // === TODO(sparse-trie): wire `crate::shared::spawn_sparse_trie_state_root` ===
+        //
+        // When `MiningConfig::use_sparse_trie_state_root` is enabled and triedb is NOT
+        // active, this is where we should:
+        //   1. Spawn a `StateRootHandle` via `crate::shared::spawn_sparse_trie_state_root(
+        //          self.build_args.config.parent_header.state_root(),
+        //      )`.
+        //   2. Hand it down to `build_payload` so it can:
+        //        a. Call `handle.state_hook()` and install it on `builder.executor` via
+        //           `set_state_hook(Some(...))` BEFORE the tx-execution loop.
+        //        b. After the exec loop, call `set_state_hook(None)` to signal the task to
+        //           finalize.
+        //        c. Call `handle.state_root()` to retrieve the precomputed root and stash it
+        //           in `self.build_args.state_root_precomputed` (which the builder already
+        //           consumes — see `finish_with_difflayer`).
+        //
+        // The blocker on doing this right now is that `build_payload`'s spawn closure
+        // captures `build_args` by value (cloned), and `StateRootHandle` is `!Clone` and
+        // `state_root(&mut self)` is single-use. Passing it through requires either:
+        //   * Adding `trie_handle: Arc<Mutex<Option<StateRootHandle>>>` to
+        //     `BscBuildArguments` (so first attempt takes it, retries see `None`), or
+        //   * Restructuring the build closure to own the handle outside the clone.
+        //
+        // Engine-side wiring (Task #4 in the plan) — `set_sparse_trie_spawn_fn` must be
+        // called from the engine launch path before this code is reached, otherwise
+        // `spawn_sparse_trie_state_root` returns `None` (graceful fallback to legacy
+        // `state_root_with_updates`, identical to today's behaviour).
 
         let mut start_time = std::time::Instant::now();
         let initial_wait = initial_out_of_turn_build_wait(&self.parlia, &self.mining_ctx);

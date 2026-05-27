@@ -41,6 +41,17 @@ pub struct MiningConfig {
     pub builder_fee_ceil: Option<u128>,
     /// List of allowed builder addresses (whitelist)
     pub allowed_builders: Option<Vec<Address>>,
+    /// Use the reth 2.0 sparse-trie background task for state-root computation
+    /// during MDBX-mode payload build.
+    ///
+    /// When `true` (and the node is not in `--statedb.triedb` mode), the BSC miner
+    /// spawns a `StateRootHandle` per payload job, streams per-tx state diffs into
+    /// it via `set_state_hook`, and consumes the precomputed `(state_root,
+    /// trie_updates)` at finish time — mirroring upstream
+    /// `crates/ethereum/payload`'s flow. Falls back to the legacy synchronous
+    /// `state_root_with_updates` path when the global spawner has not been
+    /// registered or returns `None`.
+    pub use_sparse_trie_state_root: bool,
 }
 
 impl std::fmt::Debug for MiningConfig {
@@ -60,6 +71,7 @@ impl std::fmt::Debug for MiningConfig {
             .field("max_bids_per_builder", &self.max_bids_per_builder)
             .field("builder_fee_ceil", &self.builder_fee_ceil)
             .field("allowed_builders", &self.allowed_builders)
+            .field("use_sparse_trie_state_root", &self.use_sparse_trie_state_root)
             .finish()
     }
 }
@@ -84,6 +96,7 @@ impl Default for MiningConfig {
             max_bids_per_builder: Some(3),
             builder_fee_ceil: Some(1_000_000_000_000_000_000), // 1 BNB
             allowed_builders: None, // No whitelist by default (allow all)
+            use_sparse_trie_state_root: false, // Opt-in for now (perf testing)
         }
     }
 }
@@ -193,6 +206,7 @@ impl MiningConfig {
                 builder_fee_ceil: Some(1_000_000_000_000_000_000),
                 allowed_builders: None,
                 greedy_merge: true,
+                use_sparse_trie_state_root: false,
             }
         } else {
             // Fallback to default if key generation fails
@@ -280,6 +294,11 @@ impl MiningConfig {
             })
             .filter(|v| !v.is_empty());
 
+        let use_sparse_trie_state_root = std::env::var("BSC_MINING_USE_SPARSE_TRIE_STATE_ROOT")
+            .ok()
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false);
+
         let mut cfg = Self {
             enabled,
             private_key_hex,
@@ -295,6 +314,7 @@ impl MiningConfig {
             max_bids_per_builder,
             builder_fee_ceil,
             allowed_builders,
+            use_sparse_trie_state_root,
             ..Default::default()
         };
 

@@ -48,6 +48,18 @@ where
     pub parent: &'a SealedHeader<HeaderTy<BscPrimitives>>,
     /// The assembler used to build the block.
     pub assembler: &'a BscBlockAssembler<crate::chainspec::BscChainSpec>,
+    /// Optional precomputed `(state_root, trie_updates)` from a sparse-trie background
+    /// task.
+    ///
+    /// When `Some`, `finish_with_difflayer`'s MDBX branch uses these values directly
+    /// and skips the blocking `state_root_with_updates` call. Set via either:
+    ///   * [`BscBlockBuilder::with_precomputed_state_root`] (fluent), or
+    ///   * the `state_root_precomputed` parameter on the [`BlockBuilder::finish`]
+    ///     trait method (which forwards into this field before delegating to
+    ///     `finish_with_difflayer`).
+    ///
+    /// `None` in the TrieDB branch and when no sparse-trie task is in flight.
+    pub precomputed_state_root: Option<(alloy_primitives::B256, TrieUpdates)>,
 }
 
 impl<'a, EVM, Spec, R> BscBlockBuilder<'a, EVM, Spec, R>
@@ -62,7 +74,34 @@ where
         assembler: &'a BscBlockAssembler<crate::chainspec::BscChainSpec>,
         parent: &'a SealedHeader<HeaderTy<BscPrimitives>>,
     ) -> Self {
-        Self { executor, transactions: Vec::new(), ctx, shared_ctx, parent, assembler }
+        Self {
+            executor,
+            transactions: Vec::new(),
+            ctx,
+            shared_ctx,
+            parent,
+            assembler,
+            precomputed_state_root: None,
+        }
+    }
+
+    /// Install a precomputed `(state_root, trie_updates)` to be consumed by
+    /// `finish_with_difflayer` (MDBX branch only). Returns `self` for fluent usage.
+    ///
+    /// Pass `None` to clear an existing value.
+    ///
+    /// Currently has no callers — `BscPayloadJob` obtains its builder via
+    /// `evm_config.builder_for_next_block(...)` which returns `impl BlockBuilder`, so
+    /// this concrete setter is unreachable through the trait. Kept as the documented
+    /// integration point for the follow-up sparse-trie wiring; see TODOs in
+    /// `payload.rs` for the two ways to bridge the gap.
+    #[allow(dead_code)]
+    pub fn with_precomputed_state_root(
+        mut self,
+        precomputed: Option<(alloy_primitives::B256, TrieUpdates)>,
+    ) -> Self {
+        self.precomputed_state_root = precomputed;
+        self
     }
 }
 
@@ -109,10 +148,15 @@ where
 
     // fetch assembled_system_txs and add into sealed block.
     fn finish(
-        self,
+        mut self,
         state: impl StateProvider,
-        _state_root_precomputed: Option<(alloy_primitives::B256, TrieUpdates)>,
+        state_root_precomputed: Option<(alloy_primitives::B256, TrieUpdates)>,
     ) -> Result<BlockBuilderOutcome<BscPrimitives>, BlockExecutionError> {
+        // Forward into the field so `finish_with_difflayer` (whose trait signature
+        // takes only `state`) can pick it up.
+        if state_root_precomputed.is_some() {
+            self.precomputed_state_root = state_root_precomputed;
+        }
         Ok(self.finish_with_difflayer(state)?.inner)
     }
 
@@ -121,6 +165,11 @@ where
     /// the precomputed diff layer that can be committed directly to the TrieDB backend;
     /// otherwise `difflayer` is `None` and the caller falls back to the standard
     /// hashed-state + trie-updates path.
+    ///
+    /// MDBX branch additionally honors `self.precomputed_state_root` (set via
+    /// [`BscBlockBuilder::with_precomputed_state_root`] or routed through `fn finish`)
+    /// to skip the blocking `state_root_with_updates` call when a sparse-trie task has
+    /// already computed the root concurrently with execution.
     fn finish_with_difflayer(
         mut self,
         state: impl StateProvider,
@@ -179,6 +228,21 @@ where
                 "Calculated state root using triedb"
             );
             (new_root, TrieUpdates::default(), Some(new_difflayer))
+        } else if let Some((root, updates)) = self.precomputed_state_root.take() {
+            // Fast path: sparse-trie background task already computed the root concurrently
+            // with execution. See `crate::shared::spawn_sparse_trie_state_root` and reth 2.0
+            // `--engine.share-sparse-trie-with-payload-builder` semantics for the upstream
+            // mechanism we mirror.
+            tracing::debug!(
+                target: "bsc::builder",
+                parent_hash = %self.parent.hash(),
+                block_number = %(self.parent.number + 1),
+                user_tx_count = self.transactions.len(),
+                hashed_accounts = hashed_state.accounts.len(),
+                hashed_storages = hashed_state.storages.len(),
+                "Using precomputed state root from sparse-trie task"
+            );
+            (root, updates, None)
         } else {
             let (root, updates) =
                 state.state_root_with_updates(hashed_state.clone()).map_err(BlockExecutionError::other)?;

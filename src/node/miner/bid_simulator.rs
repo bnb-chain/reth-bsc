@@ -563,8 +563,13 @@ where
             return;
         }
 
-        // Finish the builder (also returns triedb difflayer when enabled)
-        let out = match builder.finish_with_difflayer(&state_provider).map_err(PayloadBuilderError::other) {
+        // Finish the builder (also returns triedb difflayer when enabled).
+        // Bid simulation does not run alongside a sparse-trie task — no precomputed root,
+        // so the builder uses the legacy state_root_with_updates path inside
+        // finish_with_difflayer.
+        let out =
+            match builder.finish_with_difflayer(&state_provider).map_err(PayloadBuilderError::other)
+            {
             Ok(outcome) => outcome,
             Err(e) => {
                 debug!("Failed to finish builder: {:?}", e);

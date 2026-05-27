@@ -48,6 +48,24 @@ type HeaderByNumberFn = Arc<dyn Fn(u64) -> Option<Header> + Send + Sync>;
 /// Global shared access to the snapshot provider for RPC
 static SNAPSHOT_PROVIDER: OnceLock<Arc<dyn SnapshotProvider + Send + Sync>> = OnceLock::new();
 
+/// Function type for spawning a sparse-trie state-root background task.
+///
+/// Takes the parent block's state root, returns an opaque handle that the miner can:
+///   1. attach as a `state_hook` on the BSC executor (streams per-tx state diffs to the task)
+///   2. block on after execution to receive the precomputed `(state_root, trie_updates)`
+///
+/// Registered by the engine launch path when
+/// `--mining.use-sparse-trie-state-root` is enabled. Returns `None` if the engine
+/// has not been wired (graceful fallback to legacy `state_root_with_updates`).
+pub type SparseTrieSpawnFn = Arc<
+    dyn Fn(B256) -> Option<reth_engine_tree::tree::multiproof::StateRootHandle>
+        + Send
+        + Sync,
+>;
+
+/// Global sparse-trie state-root spawner. See [`SparseTrieSpawnFn`].
+static SPARSE_TRIE_SPAWN_FN: OnceLock<SparseTrieSpawnFn> = OnceLock::new();
+
 /// Global header provider function - HeaderProvider::header() by hash
 static HEADER_BY_HASH_PROVIDER: OnceLock<HeaderByHashFn> = OnceLock::new();
 
@@ -253,6 +271,31 @@ pub fn set_snapshot_provider(
 /// Get the global snapshot provider
 pub fn get_snapshot_provider() -> Option<&'static Arc<dyn SnapshotProvider + Send + Sync>> {
     SNAPSHOT_PROVIDER.get()
+}
+
+/// Register the sparse-trie state-root spawner.
+///
+/// Should be called once from the engine launch path. Subsequent calls return
+/// an error and are ignored (mirrors the rest of the OnceLock setters in this
+/// module). When the spawner is not registered, BSC miner falls back to the
+/// synchronous `state_root_with_updates` path.
+pub fn set_sparse_trie_spawn_fn(
+    spawner: SparseTrieSpawnFn,
+) -> Result<(), SparseTrieSpawnFn> {
+    SPARSE_TRIE_SPAWN_FN.set(spawner)
+}
+
+/// Spawn a sparse-trie state-root task for the given parent state root.
+///
+/// Returns `None` when:
+///   * the spawner has not been registered (engine wiring incomplete), or
+///   * the spawner itself decided not to spawn (e.g. resource pressure).
+///
+/// On `None`, callers must fall back to the synchronous state-root path.
+pub fn spawn_sparse_trie_state_root(
+    parent_state_root: B256,
+) -> Option<reth_engine_tree::tree::multiproof::StateRootHandle> {
+    SPARSE_TRIE_SPAWN_FN.get().and_then(|f| f(parent_state_root))
 }
 
 /// Store the header provider globally
