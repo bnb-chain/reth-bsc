@@ -14,22 +14,22 @@ asm-keccak = ["alloy-primitives/asm-keccak"]
 reth_bsc = { path = "../.." }
 
 # reth dependencies aligned with root crate branch to avoid duplicate crate versions
-reth-chainspec = { git = "https://github.com/bnb-chain/reth.git", rev = "de11c921b7f20bb15720d90cb5e4ff1939c058c0" }
-reth-consensus = { git = "https://github.com/bnb-chain/reth.git", rev = "de11c921b7f20bb15720d90cb5e4ff1939c058c0" }
-reth-ethereum-forks = { git = "https://github.com/bnb-chain/reth.git", rev = "de11c921b7f20bb15720d90cb5e4ff1939c058c0" }
-reth-db = { git = "https://github.com/bnb-chain/reth.git", rev = "de11c921b7f20bb15720d90cb5e4ff1939c058c0", features = ["mdbx", "test-utils", "disable-lock"] }
-reth-db-api = { git = "https://github.com/bnb-chain/reth.git", rev = "de11c921b7f20bb15720d90cb5e4ff1939c058c0" }
-reth-db-common = { git = "https://github.com/bnb-chain/reth.git", rev = "de11c921b7f20bb15720d90cb5e4ff1939c058c0" }
-reth-ethereum-consensus = { git = "https://github.com/bnb-chain/reth.git", rev = "de11c921b7f20bb15720d90cb5e4ff1939c058c0" }
-reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth.git", rev = "de11c921b7f20bb15720d90cb5e4ff1939c058c0" }
-reth-evm = { git = "https://github.com/bnb-chain/reth.git", rev = "de11c921b7f20bb15720d90cb5e4ff1939c058c0" }
-reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth.git", rev = "de11c921b7f20bb15720d90cb5e4ff1939c058c0" }
+reth-chainspec = { git = "https://github.com/bnb-chain/reth.git", rev = "485e37b738754f96603391f42ee529f9364b47a4" }
+reth-consensus = { git = "https://github.com/bnb-chain/reth.git", rev = "485e37b738754f96603391f42ee529f9364b47a4" }
+reth-ethereum-forks = { git = "https://github.com/bnb-chain/reth.git", rev = "485e37b738754f96603391f42ee529f9364b47a4" }
+reth-db = { git = "https://github.com/bnb-chain/reth.git", rev = "485e37b738754f96603391f42ee529f9364b47a4", features = ["mdbx", "test-utils", "disable-lock"] }
+reth-db-api = { git = "https://github.com/bnb-chain/reth.git", rev = "485e37b738754f96603391f42ee529f9364b47a4" }
+reth-db-common = { git = "https://github.com/bnb-chain/reth.git", rev = "485e37b738754f96603391f42ee529f9364b47a4" }
+reth-ethereum-consensus = { git = "https://github.com/bnb-chain/reth.git", rev = "485e37b738754f96603391f42ee529f9364b47a4" }
+reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth.git", rev = "485e37b738754f96603391f42ee529f9364b47a4" }
+reth-evm = { git = "https://github.com/bnb-chain/reth.git", rev = "485e37b738754f96603391f42ee529f9364b47a4" }
+reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth.git", rev = "485e37b738754f96603391f42ee529f9364b47a4" }
 reth-primitives-traits = { git = "https://github.com/bnb-chain/reth-core.git", branch = "v0.3.1-v2", default-features = false }
-reth-provider = { git = "https://github.com/bnb-chain/reth.git", rev = "de11c921b7f20bb15720d90cb5e4ff1939c058c0", features = ["test-utils"] }
-reth-revm = { git = "https://github.com/bnb-chain/reth.git", rev = "de11c921b7f20bb15720d90cb5e4ff1939c058c0", features = ["std"] }
-reth-tracing = { git = "https://github.com/bnb-chain/reth.git", rev = "de11c921b7f20bb15720d90cb5e4ff1939c058c0" }
-reth-trie = { git = "https://github.com/bnb-chain/reth.git", rev = "de11c921b7f20bb15720d90cb5e4ff1939c058c0" }
-reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", rev = "de11c921b7f20bb15720d90cb5e4ff1939c058c0" }
+reth-provider = { git = "https://github.com/bnb-chain/reth.git", rev = "485e37b738754f96603391f42ee529f9364b47a4", features = ["test-utils"] }
+reth-revm = { git = "https://github.com/bnb-chain/reth.git", rev = "485e37b738754f96603391f42ee529f9364b47a4", features = ["std"] }
+reth-tracing = { git = "https://github.com/bnb-chain/reth.git", rev = "485e37b738754f96603391f42ee529f9364b47a4" }
+reth-trie = { git = "https://github.com/bnb-chain/reth.git", rev = "485e37b738754f96603391f42ee529f9364b47a4" }
+reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", rev = "485e37b738754f96603391f42ee529f9364b47a4" }
 
 # revm
 revm = { version = "38.0.0", features = ["secp256k1", "blst", "c-kzg", "memory_limit"] }
