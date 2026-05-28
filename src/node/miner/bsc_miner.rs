@@ -733,6 +733,7 @@ where
             // Filled in by BscPayloadJob::start when sparse-trie state-root is enabled
             // and the engine has registered a spawner. Falls back to legacy path when None.
             state_root_precomputed: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            trie_handle: std::sync::Arc::new(std::sync::Mutex::new(None)),
         };
 
         let parent_hash = mining_ctx.parent_header.hash();

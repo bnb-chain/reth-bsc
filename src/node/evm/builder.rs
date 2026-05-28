@@ -175,8 +175,58 @@ where
         state: impl StateProvider,
     ) -> Result<BlockBuilderOutcomeWithDiffLayer<BscPrimitives>, BlockExecutionError> {
         let finish_start = std::time::Instant::now();
+        // `executor.finish()` runs BSC's post-execution system txs (slash spoiled
+        // validator, distribute fees / finality rewards, breathe-block validator-set
+        // updates). Any `state_hook` previously installed on the executor — including
+        // the sparse-trie hook — captures those state changes here. Consuming the
+        // executor on the next line drops the hook closure, which triggers
+        // `StateHookSender::drop` → `FinishedStateUpdates` → sparse-trie task can
+        // safely return from `state_root()` below.
         let (evm, result) = self.executor.finish()?;
         let (db, evm_env) = evm.finish();
+
+        // Sparse-trie state-root collection: now that the executor (and therefore the
+        // state_hook) has been dropped, the background task has all updates and is
+        // finalizing. Take the handle from ctx, block on `state_root()`, and stash the
+        // result in the sink — the MDBX branch below reads it.
+        //
+        // Failures fall through silently to the legacy `state_root_with_updates` path,
+        // logged at WARN. A failure here is non-fatal but indicates the task panicked
+        // or its channel was dropped; investigate via the trace target below.
+        if let Some(handle_slot) = self.ctx.trie_handle.take() {
+            if let Some(mut handle) = handle_slot.lock().unwrap().take() {
+                let wait_start = std::time::Instant::now();
+                match handle.state_root() {
+                    Ok(outcome) => {
+                        let updates = std::sync::Arc::try_unwrap(outcome.trie_updates)
+                            .unwrap_or_else(|arc| (*arc).clone());
+                        if let Some(sink) = self.ctx.state_root_precomputed_sink.as_ref() {
+                            *sink.lock().unwrap() = Some((outcome.state_root, updates));
+                        } else {
+                            // No sink registered — write into the field (which the
+                            // MDBX branch also reads as fallback).
+                            self.precomputed_state_root = Some((outcome.state_root, updates));
+                        }
+                        tracing::debug!(
+                            target: "bsc::builder",
+                            parent_hash = %self.parent.hash(),
+                            block_number = %(self.parent.number + 1),
+                            wait_ms = wait_start.elapsed().as_millis(),
+                            "Sparse-trie state-root delivered post-finish()"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "bsc::builder",
+                            parent_hash = %self.parent.hash(),
+                            block_number = %(self.parent.number + 1),
+                            %err,
+                            "Sparse-trie task failed post-finish(); falling back to state_root_with_updates"
+                        );
+                    }
+                }
+            }
+        }
 
         let assembled_system_txs = {
             let mut inner = self.shared_ctx.inner.borrow_mut();
@@ -228,11 +278,21 @@ where
                 "Calculated state root using triedb"
             );
             (new_root, TrieUpdates::default(), Some(new_difflayer))
-        } else if let Some((root, updates)) = self.precomputed_state_root.take() {
+        } else if let Some((root, updates)) = self
+            .ctx
+            .state_root_precomputed_sink
+            .as_ref()
+            .and_then(|sink| sink.lock().unwrap().take())
+            .or_else(|| self.precomputed_state_root.take())
+        {
             // Fast path: sparse-trie background task already computed the root concurrently
             // with execution. See `crate::shared::spawn_sparse_trie_state_root` and reth 2.0
             // `--engine.share-sparse-trie-with-payload-builder` semantics for the upstream
             // mechanism we mirror.
+            //
+            // Preferred source is the sink on `self.ctx` (filled by the payload layer
+            // post-exec); the field on `Self` is a fallback that `fn finish` populates
+            // when callers route through the trait method.
             tracing::debug!(
                 target: "bsc::builder",
                 parent_hash = %self.parent.hash(),

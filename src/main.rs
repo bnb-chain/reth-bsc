@@ -458,6 +458,13 @@ fn main() -> eyre::Result<()> {
             reth_bsc::shared::set_engine_api_tx(node.engine_api_tx.clone().unwrap()).unwrap();
             tracing::debug!("set engine api tx successfully");
 
+            // Publish CanonicalInMemoryState so the sparse-trie spawner can resolve
+            // in-memory parents back to the on-disk anchor. Concrete `BlockchainProvider`
+            // is only reachable here (post-launch); the generic builder context isn't.
+            let _ = reth_bsc::shared::set_canonical_in_memory_state(
+                node.provider.canonical_in_memory_state(),
+            );
+
             // Set the IPC client
             reth_bsc::shared::set_ipc_client(ipc_path).await.unwrap();
 

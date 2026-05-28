@@ -459,6 +459,10 @@ where
                     triedb_prefetcher,
                     validator_cache_sink: Some(bid_validator_cache_sink.clone()),
                     turn_length_sink: Some(bid_turn_length_sink.clone()),
+                    // Bid simulation does not run alongside a sparse-trie task —
+                    // builder will fall through to state_root_with_updates.
+                    state_root_precomputed_sink: None,
+                    trie_handle: None,
                 },
             )
             .map_err(PayloadBuilderError::other)

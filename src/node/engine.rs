@@ -111,6 +111,134 @@ where
                 MiningConfig::from_env()
             };
 
+        // Register the sparse-trie state-root spawner, if enabled.
+        //
+        // We construct a long-lived `PayloadProcessor` keyed to a fresh `BscEvmConfig`
+        // (built from chain_spec — same source as the rest of the BSC pipeline). For
+        // each build job, the registered closure constructs a one-shot
+        // `OverlayStateProviderFactory` anchored at the parent block hash and calls
+        // `spawn_state_root` to get a `StateRootHandle`.
+        //
+        // `TreeConfig::default()` is used here as a workaround — the engine-launch
+        // `TreeConfig` (which honors `--engine.*` CLI flags) is not reachable from
+        // `BscPayloadServiceBuilder`. Default values are reasonable for the sparse-trie
+        // background task; revisit if performance testing shows we need CLI-tunable
+        // worker counts or cache sizes.
+        if mining_config.use_sparse_trie_state_root
+            && !rust_eth_triedb::triedb_manager::is_triedb_active()
+        {
+            use alloy_consensus::BlockHeader;
+            use reth_chain_state::LazyOverlay;
+            use reth_engine_tree::tree::{
+                payload_processor::PayloadProcessor, precompile_cache::PrecompileCacheMap,
+                TreeConfig,
+            };
+            use reth_provider::providers::{OverlayBuilder, OverlayStateProviderFactory};
+            use reth_tasks::{Runtime, RuntimeBuilder, RuntimeConfig, TokioConfig};
+            use reth_trie_db::ChangesetCache;
+
+            let chain_spec = Arc::new(ctx.config().chain.clone().as_ref().clone());
+            let bsc_evm_config = crate::node::evm::config::BscEvmConfig::new(chain_spec);
+            let tree_config = Arc::new(TreeConfig::default());
+            let provider = ctx.provider().clone();
+
+            // Build a dedicated `reth_tasks::Runtime` for the sparse-trie pools,
+            // attached to the existing tokio handle so we don't spin up a second tokio
+            // executor. Rayon pools default to `available_parallelism()`, matching what
+            // the engine uses for its own PayloadProcessor.
+            //
+            // TODO: in a follow-up, share the engine's Runtime instead of constructing
+            // a parallel one — this currently means two sets of rayon pools competing
+            // for CPU. Acceptable for a first cut; revisit if perf testing shows
+            // contention.
+            let tokio_handle = ctx.task_executor().handle().clone();
+            let runtime = RuntimeBuilder::new(
+                RuntimeConfig::default().with_tokio(TokioConfig::existing_handle(tokio_handle)),
+            )
+            .build()
+            .map_err(|e| eyre::eyre!("failed to build sparse-trie Runtime: {e}"))?;
+            let _: &Runtime = &runtime; // type-check anchor
+
+            let payload_processor = std::sync::Arc::new(PayloadProcessor::new(
+                runtime,
+                bsc_evm_config,
+                tree_config.as_ref(),
+                PrecompileCacheMap::default(),
+            ));
+
+            let tree_config_for_closure = tree_config.clone();
+            let spawn_fn: crate::shared::SparseTrieSpawnFn = std::sync::Arc::new(
+                move |parent_hash: alloy_primitives::B256,
+                      parent_state_root: alloy_primitives::B256| {
+                    // Walk the in-memory canonical chain to find the on-disk anchor.
+                    // Without this, proof workers fail with `BlockHashNotFound` whenever
+                    // the parent hasn't been persisted yet (the common case during fast
+                    // block production with last_persisted_number lagging head).
+                    //
+                    // Mirrors `payload_validator::get_parent_lazy_overlay` from upstream
+                    // reth, which the engine's own PayloadProcessor uses.
+                    //
+                    // `canonical_in_memory_state` is published from main.rs after launch
+                    // (it's only reachable on the concrete BlockchainProvider). If for
+                    // some reason it's not yet set (race during early startup), fall back
+                    // to anchoring at parent_hash directly — proof workers will fail and
+                    // builder will use the synchronous state_root_with_updates path.
+                    let (anchor_hash, lazy_overlay) = if let Some(cim) =
+                        crate::shared::get_canonical_in_memory_state()
+                    {
+                        match cim.state_by_hash(parent_hash) {
+                            Some(state) => {
+                                // chain() yields newest-to-oldest including self, exactly
+                                // the order LazyOverlay::new requires.
+                                let blocks: Vec<ExecutedBlock<crate::BscPrimitives>> =
+                                    state.chain().map(|bs| bs.block()).collect();
+                                // Anchor = parent of the oldest in-memory block (= on-disk tip).
+                                let anchor = blocks
+                                    .last()
+                                    .map(|b| b.recovered_block().parent_hash())
+                                    .unwrap_or(parent_hash);
+                                (anchor, Some(LazyOverlay::new(blocks)))
+                            }
+                            None => {
+                                // Parent already persisted — anchor directly, no overlay.
+                                (parent_hash, None)
+                            }
+                        }
+                    } else {
+                        (parent_hash, None)
+                    };
+
+                    let overlay_builder = OverlayBuilder::<crate::BscPrimitives>::new(
+                        anchor_hash,
+                        ChangesetCache::default(),
+                    )
+                    .with_lazy_overlay(lazy_overlay);
+
+                    let overlay_factory = OverlayStateProviderFactory::new(
+                        provider.clone(),
+                        overlay_builder,
+                    );
+                    Some(payload_processor.spawn_state_root(
+                        overlay_factory,
+                        parent_state_root,
+                        false, // halve_workers
+                        tree_config_for_closure.as_ref(),
+                    ))
+                },
+            );
+
+            if crate::shared::set_sparse_trie_spawn_fn(spawn_fn).is_err() {
+                tracing::warn!(
+                    "Sparse-trie spawner already registered, keeping existing one"
+                );
+            } else {
+                info!(
+                    "Sparse-trie state-root spawner registered \
+                     (use_sparse_trie_state_root=true, triedb=inactive)"
+                );
+            }
+        }
+
         // Skip mining setup if disabled
         if !mining_config.is_mining_enabled() {
             info!("Mining is disabled in configuration");
