@@ -119,11 +119,10 @@ where
         // `OverlayStateProviderFactory` anchored at the parent block hash and calls
         // `spawn_state_root` to get a `StateRootHandle`.
         //
-        // `TreeConfig::default()` is used here as a workaround — the engine-launch
-        // `TreeConfig` (which honors `--engine.*` CLI flags) is not reachable from
-        // `BscPayloadServiceBuilder`. Default values are reasonable for the sparse-trie
-        // background task; revisit if performance testing shows we need CLI-tunable
-        // worker counts or cache sizes.
+        // The sparse-trie PayloadProcessor is configured from the engine-launch
+        // `TreeConfig` built from the `--engine.*` CLI flags via
+        // `ctx.config().engine.tree_config()`, so miner-side proof-worker counts /
+        // cache sizes are CLI-tunable and match the import (engine) path.
         if mining_config.use_sparse_trie_state_root
             && !rust_eth_triedb::triedb_manager::is_triedb_active()
         {
@@ -131,7 +130,6 @@ where
             use reth_chain_state::LazyOverlay;
             use reth_engine_tree::tree::{
                 payload_processor::PayloadProcessor, precompile_cache::PrecompileCacheMap,
-                TreeConfig,
             };
             use reth_provider::providers::{OverlayBuilder, OverlayStateProviderFactory};
             use reth_tasks::{Runtime, RuntimeBuilder, RuntimeConfig, TokioConfig};
@@ -139,7 +137,12 @@ where
 
             let chain_spec = Arc::new(ctx.config().chain.clone().as_ref().clone());
             let bsc_evm_config = crate::node::evm::config::BscEvmConfig::new(chain_spec);
-            let tree_config = Arc::new(TreeConfig::default());
+            let tree_config = Arc::new(ctx.config().engine.tree_config());
+            tracing::debug!(
+                target: "bsc::miner",
+                ?tree_config,
+                "Miner sparse-trie PayloadProcessor TreeConfig (from --engine.* CLI flags)"
+            );
             let provider = ctx.provider().clone();
 
             // Build a dedicated `reth_tasks::Runtime` for the sparse-trie pools,
