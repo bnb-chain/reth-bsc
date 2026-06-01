@@ -1,4 +1,4 @@
-use reth_primitives::Transaction;
+use reth_ethereum_primitives::Transaction;
 use alloy_consensus::{Header, BlockHeader};
 use alloy_primitives::{B256, BlockHash, BlockNumber};
 use schnellru::{ByLength, LruMap};

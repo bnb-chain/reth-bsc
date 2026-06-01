@@ -1,5 +1,6 @@
 use super::{
-    assembler::BscBlockAssembler, builder::BscBlockBuilder, executor::BscBlockExecutor,
+    assembler::BscBlockAssembler, builder::BscBlockBuilder,
+    executor::{BscBlockExecutor, BscTxResult},
     factory::BscEvmFactory,
 };
 use crate::{
@@ -25,7 +26,8 @@ use reth_evm::{
     NextBlockEnvAttributes,
 };
 use reth_evm_ethereum::RethReceiptBuilder;
-use reth_primitives::{BlockTy, HeaderTy, SealedBlock, SealedHeader, TransactionSigned};
+use reth_primitives_traits::{BlockTy, HeaderTy, SealedBlock, SealedHeader};
+use reth_ethereum_primitives::TransactionSigned;
 use reth_primitives_traits::constants::MAX_TX_GAS_LIMIT_OSAKA;
 use reth_revm::State;
 use reth_rpc_eth_api::helpers::pending_block::BuildPendingEnv;
@@ -229,23 +231,25 @@ where
     BscTxEnv: IntoTxEnv<<EvmF as EvmFactory>::Tx>,
 {
     type EvmFactory = EvmF;
+    type TxExecutionResult = BscTxResult<<EvmF as EvmFactory>::HaltReason>;
     type ExecutionCtx<'a> = BscBlockExecutionCtx<'a>;
     type Transaction = TransactionSigned;
     type Receipt = R::Receipt;
+    type Executor<'a, DB: alloy_evm::block::StateDB, I: Inspector<<Self::EvmFactory as EvmFactory>::Context<DB>>> =
+        BscBlockExecutor<'a, <EvmF as EvmFactory>::Evm<DB, I>, Spec, R>;
 
     fn evm_factory(&self) -> &Self::EvmFactory {
         &self.evm_factory
     }
 
-    #[allow(refining_impl_trait)]
     fn create_executor<'a, DB, I>(
         &'a self,
-        evm: <Self::EvmFactory as EvmFactory>::Evm<&'a mut State<DB>, I>,
+        evm: <Self::EvmFactory as EvmFactory>::Evm<DB, I>,
         ctx: Self::ExecutionCtx<'a>,
-    ) -> BscBlockExecutor<'a, <Self::EvmFactory as EvmFactory>::Evm<&'a mut State<DB>, I>, Spec, R>
+    ) -> Self::Executor<'a, DB, I>
     where
-        DB: alloy_evm::Database + 'a,
-        I: Inspector<<Self::EvmFactory as EvmFactory>::Context<&'a mut State<DB>>> + 'a,
+        DB: alloy_evm::block::StateDB,
+        I: Inspector<<Self::EvmFactory as EvmFactory>::Context<DB>>,
     {
         BscBlockExecutor::new(
             evm,
@@ -329,6 +333,7 @@ where
             gas_limit: header.gas_limit(),
             basefee: header.base_fee_per_gas().unwrap_or_default(),
             blob_excess_gas_and_price,
+            slot_num: 0,
         };
 
         Ok(EvmEnv { cfg_env, block_env })
@@ -408,6 +413,7 @@ where
             basefee: basefee.unwrap_or_default(),
             // calculate excess gas based on parent block's blob gas usage
             blob_excess_gas_and_price,
+            slot_num: 0,
         };
 
         Ok(EvmEnv { cfg_env, block_env })
@@ -423,8 +429,9 @@ where
                 parent_hash: block.header().parent_hash,
                 parent_beacon_block_root: block.header().parent_beacon_block_root,
                 ommers: &block.body().ommers,
-                withdrawals: block.body().withdrawals.as_ref().map(Cow::Borrowed),
+                withdrawals: block.body().withdrawals.as_ref().map(|w| Cow::Borrowed(w.as_slice())),
                 extra_data: block.header().extra_data.clone(),
+                slot_number: None,
             },
             header: Some(block.header().clone()),
             header_hash: Some(block.hash()),
@@ -448,8 +455,9 @@ where
                 parent_hash: parent.hash(),
                 parent_beacon_block_root: attributes.inner.parent_beacon_block_root,
                 ommers: &[],
-                withdrawals: attributes.inner.withdrawals.map(Cow::Owned),
+                withdrawals: attributes.inner.withdrawals.map(|w| Cow::Owned(w.into_inner())),
                 extra_data: attributes.inner.extra_data,
+                slot_number: attributes.inner.slot_number,
             },
             header: None, // No header available for next block context
             header_hash: None,
@@ -469,7 +477,7 @@ where
         ctx: <Self::BlockExecutorFactory as BlockExecutorFactory>::ExecutionCtx<'a>,
     ) -> impl BlockBuilder<
         Primitives = Self::Primitives,
-        Executor: BlockExecutorFor<'a, Self::BlockExecutorFactory, DB, I>,
+        Executor = BlockExecutorFor<'a, Self::BlockExecutorFactory, &'a mut State<DB>, I>,
     >
     where
         DB: Database,
@@ -522,8 +530,9 @@ where
                 parent_hash: block.header.parent_hash(),
                 parent_beacon_block_root: block.header.parent_beacon_block_root,
                 ommers: &block.body.inner.ommers,
-                withdrawals: block.body.inner.withdrawals.as_ref().map(Cow::Borrowed),
+                withdrawals: block.body.inner.withdrawals.as_ref().map(|w| Cow::Borrowed(w.as_slice())),
                 extra_data: block.header.extra_data.clone(),
+                slot_number: None,
             },
             header: Some(block.header.clone()),
             header_hash: Some(payload.block_hash_cached()),

@@ -9,7 +9,7 @@ use revm::{
     handler::EthPrecompiles,
     precompile::{
         bls12_381, kzg_point_evaluation, modexp, secp256r1, u64_to_address, Precompile, PrecompileError, PrecompileFn,
-        PrecompileId, PrecompileOutput, PrecompileResult, Precompiles,
+        PrecompileId, PrecompileResult, Precompiles,
     },
     primitives::{hardfork::SpecId, Address as RevmAddress},
 };
@@ -28,7 +28,7 @@ mod tm_secp256k1;
 #[derive(Clone, Debug)]
 struct PrecompileTraceEntry {
     id: PrecompileId,
-    original: PrecompileFn,
+    original: Precompile,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -200,7 +200,7 @@ fn log_precompile_call(
                 precompile_input_len = input_len,
                 precompile_gas_used = output.gas_used,
                 precompile_gas_refunded = output.gas_refunded,
-                precompile_reverted = output.reverted,
+                precompile_reverted = !output.is_success(),
                 precompile_output_len = output.bytes.len(),
                 "Precompile executed"
             );
@@ -227,7 +227,7 @@ fn log_precompile_call(
     }
 }
 
-fn traced_precompile_call(address: RevmAddress, input: &[u8], gas_limit: u64) -> PrecompileResult {
+fn traced_precompile_call(address: RevmAddress, input: &[u8], gas_limit: u64, reservoir: u64) -> PrecompileResult {
     let ctx = current_precompile_trace_context();
 
     let entry = if let Some(ctx) = &ctx {
@@ -237,10 +237,10 @@ fn traced_precompile_call(address: RevmAddress, input: &[u8], gas_limit: u64) ->
     };
 
     let Some(entry) = entry else {
-        return Err(PrecompileError::other("missing original precompile function"));
+        return Err(PrecompileError::Fatal("missing original precompile function".to_string()));
     };
 
-    let result = (entry.original)(input, gas_limit);
+    let result = entry.original.execute(input, gas_limit, reservoir);
 
     if let Some(ctx) = &ctx {
         if should_trace_precompiles(ctx) {
@@ -272,8 +272,8 @@ const PRECOMPILE_ADDR_105: RevmAddress = u64_to_address(105);
 
 macro_rules! traced_wrapper {
     ($name:ident, $addr:ident) => {
-        fn $name(input: &[u8], gas_limit: u64) -> PrecompileResult {
-            traced_precompile_call($addr, input, gas_limit)
+        fn $name(input: &[u8], gas_limit: u64, reservoir: u64) -> PrecompileResult {
+            traced_precompile_call($addr, input, gas_limit, reservoir)
         }
     };
 }
@@ -327,8 +327,9 @@ fn install_precompile_tracing(precompiles: &mut Precompiles) -> PrecompileTraceM
             continue;
         };
 
-        let (id, address, original) = precompile.into();
-        trace_map.insert(address, PrecompileTraceEntry { id: id.clone(), original });
+        let id = precompile.id().clone();
+        let address = *precompile.address();
+        trace_map.insert(address, PrecompileTraceEntry { id: id.clone(), original: precompile });
 
         if let Some(wrapper) = traced_wrapper_for_address(address) {
             precompiles.extend([Precompile::new(id, address, wrapper)]);

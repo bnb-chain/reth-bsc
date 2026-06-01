@@ -11,7 +11,7 @@ use alloy_primitives::{Bytes, B256, U256, U64};
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::proc_macros::rpc;
 use reth_chainspec::EthChainSpec;
-use reth_primitives::TransactionSigned;
+use reth_ethereum_primitives::TransactionSigned;
 use reth_primitives_traits::SignerRecoverable;
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};

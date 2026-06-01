@@ -29,7 +29,7 @@ use reth_engine_local::LocalPayloadAttributesBuilder;
 use reth_engine_primitives::ConsensusEngineHandle;
 
 use reth_payload_primitives::{PayloadAttributesBuilder, PayloadTypes};
-use reth_primitives::BlockBody;
+use reth_ethereum_primitives::BlockBody;
 use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex};
 use tracing::trace;

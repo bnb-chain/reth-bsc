@@ -4,7 +4,7 @@ use alloy_primitives::BlockHash;
 use reth_chainspec::{
     make_genesis_header, BaseFeeParams, BaseFeeParamsKind, Chain, ChainSpec, Head, NamedChain,
 };
-use reth_primitives::SealedHeader;
+use reth_primitives_traits::SealedHeader;
 use std::str::FromStr;
 
 pub fn bsc_mainnet() -> ChainSpec {

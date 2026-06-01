@@ -10,7 +10,7 @@ use crate::{
     BscPrimitives,
 };
 use alloy_consensus::BlockHeader as _;
-use alloy_evm::block::BlockExecutor;
+use alloy_evm::block::{BlockExecutor, GasOutput};
 use alloy_evm::eth::receipt_builder::ReceiptBuilder;
 use alloy_primitives::BlockHash;
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
@@ -94,15 +94,14 @@ where
     fn execute_transaction_with_commit_condition(
         &mut self,
         tx: impl ExecutorTx<Self::Executor>,
-        f: impl FnOnce(
-            &revm::context::result::ExecutionResult<<<Self::Executor as alloy_evm::block::BlockExecutor>::Evm as alloy_evm::Evm>::HaltReason>,
-        ) -> alloy_evm::block::CommitChanges,
-    ) -> Result<Option<u64>, BlockExecutionError> {
-        if let Some(gas_used) =
-            self.executor.execute_transaction_with_commit_condition(tx.as_executable(), f)?
+        f: impl FnOnce(&<Self::Executor as alloy_evm::block::BlockExecutor>::Result) -> alloy_evm::block::CommitChanges,
+    ) -> Result<Option<GasOutput>, BlockExecutionError> {
+        let (tx_env, recovered) = tx.into_parts();
+        if let Some(gas_output) =
+            self.executor.execute_transaction_with_commit_condition((tx_env, &recovered), f)?
         {
-            self.transactions.push(tx.into_recovered());
-            Ok(Some(gas_used))
+            self.transactions.push(recovered);
+            Ok(Some(gas_output))
         } else {
             Ok(None)
         }
@@ -112,6 +111,7 @@ where
     fn finish(
         self,
         state: impl StateProvider,
+        _state_root_precomputed: Option<(alloy_primitives::B256, TrieUpdates)>,
     ) -> Result<BlockBuilderOutcome<BscPrimitives>, BlockExecutionError> {
         Ok(self.finish_with_difflayer(state)?.inner)
     }

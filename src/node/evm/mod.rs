@@ -20,7 +20,7 @@ use reth_evm::{precompiles::PrecompilesMap, Database, Evm, EvmEnv};
 use revm::{
     context::{
         result::{EVMError, HaltReason, ResultAndState},
-        BlockEnv,
+        BlockEnv, CfgEnv,
     },
     Context, ExecuteEvm, InspectEvm, Inspector, SystemCallEvm,
 };
@@ -53,6 +53,10 @@ where
     type BlockEnv = BlockEnv;
     type Precompiles = PrecompilesMap;
     type Inspector = I;
+
+    fn cfg_env(&self) -> &CfgEnv<Self::Spec> {
+        &self.inner.ctx.cfg
+    }
 
     fn chain_id(&self) -> u64 {
         self.cfg.chain_id
