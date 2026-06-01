@@ -15,10 +15,12 @@ use crate::node::miner::util::finalize_new_header;
 use crate::node::pool::BlacklistedAddressError;
 use crate::node::primitives::BscBlobTransactionSidecar;
 use alloy_consensus::{BlockHeader, Transaction};
+use alloy_eips::eip4895::Withdrawals;
 use alloy_evm::block::BlockExecutor;
 use alloy_evm::Evm;
 use alloy_primitives::U256;
-use reth_node_ethereum::engine::EthPayloadAttributes;
+use either::Either;
+use once_cell::sync::Lazy;
 use reth::transaction_pool::error::Eip4844PoolTransactionError;
 use reth::transaction_pool::error::InvalidPoolTransactionError;
 use reth::transaction_pool::BestTransactionsAttributes;
@@ -26,30 +28,28 @@ use reth::transaction_pool::{PoolTransaction, TransactionPool};
 use reth_basic_payload_builder::PayloadConfig;
 use reth_chainspec::EthChainSpec;
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
+use reth_ethereum_primitives::TransactionSigned;
 use reth_evm::block::{BlockExecutionError, BlockValidationError};
 use reth_evm::execute::BlockBuilder;
 use reth_evm::execute::BlockBuilderOutcome;
 use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
 use reth_execution_types::BlockExecutionOutput;
+use reth_node_ethereum::engine::EthPayloadAttributes;
 use reth_payload_primitives::{BuiltPayload, BuiltPayloadExecutedBlock, PayloadBuilderError};
-use alloy_eips::eip4895::Withdrawals;
-use either::Either;
-use once_cell::sync::Lazy;
-use revm::context_interface::Block as EvmBlock;
-use reth_primitives_traits::{HeaderTy, SealedHeader};
 use reth_primitives_traits::transaction::error::InvalidTransactionError;
-use reth_ethereum_primitives::TransactionSigned;
 use reth_primitives_traits::{BlockBody, RecoveredBlock, SignerRecoverable};
+use reth_primitives_traits::{HeaderTy, SealedHeader};
 use reth_provider::StateProviderFactory;
 use reth_revm::cached::CachedReads;
 use reth_revm::cancelled::ManualCancel;
 use reth_revm::state::EvmState as RethEvmState;
 use reth_revm::{database::StateProviderDatabase, db::State};
+use revm::context_interface::Block as EvmBlock;
 use rust_eth_triedb::get_global_triedb;
 use rust_eth_triedb_common::DiffLayers;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, trace, warn};
 
@@ -315,9 +315,7 @@ pub struct BscBuildArguments<Attributes> {
     /// single-consumer channels) and `BscBuildArguments` derives `Clone`. First retry
     /// takes the handle; subsequent retries see `None` and fall back to the legacy
     /// synchronous state-root path (still correct, just slower for that retry).
-    pub trie_handle: Arc<
-        Mutex<Option<reth_engine_tree::tree::multiproof::StateRootHandle>>,
-    >,
+    pub trie_handle: Arc<Mutex<Option<reth_engine_tree::tree::multiproof::StateRootHandle>>>,
 }
 
 /// BSC payload builder, used to build payload for bsc miner.
@@ -388,15 +386,15 @@ where
     ) -> Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>> {
         let build_start = std::time::Instant::now();
         let BscBuildArguments {
-    mut cached_reads,
-    config,
-    cancel,
-    trace_id,
-    min_gas_tip,
-    parent_difflayers,
-    state_root_precomputed,
-    trie_handle,
-} = args;
+            mut cached_reads,
+            config,
+            cancel,
+            trace_id,
+            min_gas_tip,
+            parent_difflayers,
+            state_root_precomputed,
+            trie_handle,
+        } = args;
         let PayloadConfig { parent_header, attributes, payload_id: _ } = config;
 
         let parent_hash = parent_header.hash_slow();
@@ -407,7 +405,8 @@ where
         // parent state root matches the pathdb disk layer.  If they diverge (e.g. after a
         // restart where in-memory difflayers were lost), building on this parent would produce
         // a block with an incorrect state root.  Skip building to avoid polluting the network.
-        if rust_eth_triedb::triedb_manager::is_triedb_active() && triedb_parent_difflayers.is_none() {
+        if rust_eth_triedb::triedb_manager::is_triedb_active() && triedb_parent_difflayers.is_none()
+        {
             let triedb = get_global_triedb();
             let (persist_block, persist_root) = triedb
                 .latest_persist_state()
@@ -441,14 +440,19 @@ where
         let triedb_prefetcher = triedb_parent_difflayers.clone().and_then(|difflayers| {
             let mut triedb = get_global_triedb();
             let path_db = triedb.get_mut_path_db_ref().clone();
-            MinerTrieDbPrefetcher::new(parent_header.state_root(), path_db, Some(difflayers), self.task_executor.clone()).ok()
+            MinerTrieDbPrefetcher::new(
+                parent_header.state_root(),
+                path_db,
+                Some(difflayers),
+                self.task_executor.clone(),
+            )
+            .ok()
         });
 
         // Sinks transport current_validators / turn_length from the builder (which is consumed by
         // finish_with_difflayer) back to this layer so they can be written to cache after
         // finalize_new_header() assigns the definitive block hash.
-        let validator_cache_sink: ValidatorCacheSink =
-            Arc::new(Mutex::new(None));
+        let validator_cache_sink: ValidatorCacheSink = Arc::new(Mutex::new(None));
         let turn_length_sink: Arc<Mutex<Option<u8>>> = Arc::new(Mutex::new(None));
 
         // Sink for the sparse-trie precomputed state root. The same Arc<Mutex<>> from
@@ -505,11 +509,11 @@ where
         // access/touches performed during pre-execution are also captured by the hook.
         if let Some(prefetcher) = triedb_prefetcher.clone() {
             let pf = prefetcher.clone();
-            builder
-                .executor_mut()
-                .set_state_hook(Some(Box::new(move |_, update: &RethEvmState| {
+            builder.executor_mut().set_state_hook(Some(Box::new(
+                move |_, update: &RethEvmState| {
                     pf.on_state_update(update);
-                })));
+                },
+            )));
             debug!(
                 target: "payload_builder",
                 trace_id,
@@ -521,9 +525,7 @@ where
             // The handle itself is forwarded via `attrs.trie_handle` (Arc clone)
             // into `ctx.trie_handle` so `finish_with_difflayer` can take it after
             // executor.finish() and call `state_root()`.
-            builder
-                .executor_mut()
-                .set_state_hook(Some(Box::new(handle_guard.state_hook())));
+            builder.executor_mut().set_state_hook(Some(Box::new(handle_guard.state_hook())));
             debug!(
                 target: "payload_builder",
                 trace_id,
@@ -651,7 +653,9 @@ where
                 continue;
             }
             let tx_start = std::time::Instant::now();
-            let mut blob_tx_sidecar: Option<Arc<alloy_eips::eip7594::BlobTransactionSidecarVariant>> = None;
+            let mut blob_tx_sidecar: Option<
+                Arc<alloy_eips::eip7594::BlobTransactionSidecarVariant>,
+            > = None;
             trace!(
                 target: "payload_builder",
                 trace_id,
@@ -768,15 +772,15 @@ where
                             error = %error,
                             "Skipping nonce too low transaction"
                         );
-                        best_tx_list.mark_invalid(
-                            &pool_tx,
-                            &InvalidPoolTransactionError::Consensus(
-                                InvalidTransactionError::NonceNotConsistent {
-                                    tx: tx.nonce(),
-                                    state: 0_u64, // TODO: get the nonce from the state later.
-                                },
-                            ),
-                        );
+                        // best_tx_list.mark_invalid(
+                        //     &pool_tx,
+                        //     &InvalidPoolTransactionError::Consensus(
+                        //         InvalidTransactionError::NonceNotConsistent {
+                        //             tx: tx.nonce(),
+                        //             state: 0_u64, // TODO: get the nonce from the state later.
+                        //         },
+                        //     ),
+                        // );
                     } else {
                         // if the transaction is invalid, we can skip it and all of its
                         // descendants
@@ -941,7 +945,8 @@ where
         sealed_block = Arc::new(plain.into());
 
         let requests = execution_result.requests.clone();
-        let execution_outcome = BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
+        let execution_outcome =
+            BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
         let executed: BuiltPayloadExecutedBlock<_> = BuiltPayloadExecutedBlock {
             recovered_block: Arc::new(block),
             execution_output: Arc::new(execution_outcome),
@@ -995,7 +1000,8 @@ where
 
         // Safety guard: same as build_payload — refuse to build on a parent whose state root
         // cannot be correctly resolved by pathdb without difflayers.
-        if rust_eth_triedb::triedb_manager::is_triedb_active() && triedb_parent_difflayers.is_none() {
+        if rust_eth_triedb::triedb_manager::is_triedb_active() && triedb_parent_difflayers.is_none()
+        {
             let triedb = get_global_triedb();
             let (persist_block, persist_root) = triedb
                 .latest_persist_state()
@@ -1029,12 +1035,17 @@ where
         let triedb_prefetcher = triedb_parent_difflayers.clone().and_then(|difflayers| {
             let mut triedb = get_global_triedb();
             let path_db = triedb.get_mut_path_db_ref().clone();
-            MinerTrieDbPrefetcher::new(parent_header.state_root(), path_db, Some(difflayers), self.task_executor.clone()).ok()
+            MinerTrieDbPrefetcher::new(
+                parent_header.state_root(),
+                path_db,
+                Some(difflayers),
+                self.task_executor.clone(),
+            )
+            .ok()
         });
 
         // Sinks for empty-payload builds (same delayed-seal mechanism as normal builds).
-        let validator_cache_sink: ValidatorCacheSink =
-            Arc::new(Mutex::new(None));
+        let validator_cache_sink: ValidatorCacheSink = Arc::new(Mutex::new(None));
         let turn_length_sink: Arc<Mutex<Option<u8>>> = Arc::new(Mutex::new(None));
 
         let mut builder = self
@@ -1049,7 +1060,10 @@ where
                         prev_randao: attributes.prev_randao,
                         gas_limit: self.builder_config.gas_limit(parent_header.gas_limit),
                         parent_beacon_block_root: attributes.parent_beacon_block_root,
-                        withdrawals: attributes.withdrawals.as_ref().map(|w| Withdrawals::new(w.clone())),
+                        withdrawals: attributes
+                            .withdrawals
+                            .as_ref()
+                            .map(|w| Withdrawals::new(w.clone())),
                         extra_data: crate::shared::get_miner_extra()
                             .filter(|b| !b.is_empty())
                             .unwrap_or_else(|| self.builder_config.extra_data.clone()),
@@ -1073,11 +1087,11 @@ where
         // performed during pre-execution are also prefetched.
         if let Some(prefetcher) = triedb_prefetcher.clone() {
             let pf = prefetcher.clone();
-            builder
-                .executor_mut()
-                .set_state_hook(Some(Box::new(move |_, update: &RethEvmState| {
+            builder.executor_mut().set_state_hook(Some(Box::new(
+                move |_, update: &RethEvmState| {
                     pf.on_state_update(update);
-                })));
+                },
+            )));
             debug!(
                 target: "payload_builder",
                 trace_id,
@@ -1143,7 +1157,8 @@ where
         );
 
         let requests = execution_result.requests.clone();
-        let execution_outcome = BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
+        let execution_outcome =
+            BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
         let executed: BuiltPayloadExecutedBlock<_> = BuiltPayloadExecutedBlock {
             recovered_block: Arc::new(block),
             execution_output: Arc::new(execution_outcome),
@@ -1178,7 +1193,10 @@ where
 /// Called once per payload job at startup; the result is stored in [`BscBuildArguments`] and
 /// shared across all build attempts (normal and empty) for the same parent block.
 /// Returns `None` on any failure — callers degrade gracefully to the full-trie path.
-async fn fetch_triedb_difflayers(trace_id: u64, parent_hash: alloy_primitives::B256) -> Option<DiffLayers> {
+async fn fetch_triedb_difflayers(
+    trace_id: u64,
+    parent_hash: alloy_primitives::B256,
+) -> Option<DiffLayers> {
     if !rust_eth_triedb::triedb_manager::is_triedb_active() {
         return None;
     }
@@ -1449,8 +1467,7 @@ where
             {
                 let builder = self.builder.clone();
                 let build_args = self.build_args.clone();
-                self.join_handle
-                    .spawn(async move { builder.build_payload(build_args).await });
+                self.join_handle.spawn(async move { builder.build_payload(build_args).await });
             }
 
             tokio::select! {
@@ -2081,16 +2098,13 @@ where
 
             // Remaining time we can still spend waiting for background builds.
             let try_mine_block_number = self.build_args.config.parent_header.number() + 1;
-            let mut remaining_ms = if self
-                .mining_ctx
-                .parent_snapshot
-                .last_block_in_one_turn(try_mine_block_number)
-            {
-                self.mining_ctx.end_mining_timestamp_ms.saturating_sub(now_ms) as u64
-            } else {
-                (self.mining_ctx.end_mining_timestamp_ms.saturating_sub(now_ms) as u64)
-                    .saturating_mul(3)
-            };
+            let mut remaining_ms =
+                if self.mining_ctx.parent_snapshot.last_block_in_one_turn(try_mine_block_number) {
+                    self.mining_ctx.end_mining_timestamp_ms.saturating_sub(now_ms) as u64
+                } else {
+                    (self.mining_ctx.end_mining_timestamp_ms.saturating_sub(now_ms) as u64)
+                        .saturating_mul(3)
+                };
             if remaining_ms > 50 {
                 remaining_ms = 50;
             }
@@ -2283,7 +2297,9 @@ where
     ///
     /// Selection is by fees only; finalization (difficulty, vote attestation, ECDSA seal,
     /// cache updates) is delegated to [`finalize_payload`].
-    fn pick_best_payload_and_finalize(&mut self) -> Result<BscBuiltPayload, Box<BscPayloadJobError>> {
+    fn pick_best_payload_and_finalize(
+        &mut self,
+    ) -> Result<BscBuiltPayload, Box<BscPayloadJobError>> {
         let total_job_duration = self.job_start_time.elapsed();
         let try_mine_block_number = self.build_args.config.parent_header.number() + 1;
 
@@ -2399,12 +2415,10 @@ fn finalize_payload(
     parent_header: &SealedHeader<alloy_consensus::Header>,
     block_timestamp_ms: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let snapshot_provider = crate::shared::get_snapshot_provider()
-        .cloned()
-        .ok_or_else(|| {
-            Box::new(std::io::Error::other("Snapshot provider not available"))
-                as Box<dyn std::error::Error + Send + Sync>
-        })?;
+    let snapshot_provider = crate::shared::get_snapshot_provider().cloned().ok_or_else(|| {
+        Box::new(std::io::Error::other("Snapshot provider not available"))
+            as Box<dyn std::error::Error + Send + Sync>
+    })?;
 
     let senders = payload.executed_block.recovered_block.senders().to_vec();
     let mut existing_sidecars = payload.block.clone_block().body.sidecars;
@@ -2419,8 +2433,7 @@ fn finalize_payload(
         block_timestamp_ms,
     )
     .map_err(|e| {
-        Box::new(std::io::Error::other(e.to_string()))
-            as Box<dyn std::error::Error + Send + Sync>
+        Box::new(std::io::Error::other(e.to_string())) as Box<dyn std::error::Error + Send + Sync>
     })?;
 
     let final_hash = plain_block.header.hash_slow();
