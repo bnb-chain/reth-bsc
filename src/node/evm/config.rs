@@ -44,6 +44,12 @@ use std::{borrow::Cow, cell::RefCell, convert::Infallible, rc::Rc, sync::{Arc, M
 /// is known.
 pub type ValidatorCacheSink = Arc<Mutex<Option<(Vec<Address>, Vec<VoteAddress>)>>>;
 
+/// Sink carrying the sparse-trie background task's precomputed
+/// `(state_root, trie_updates)`, threaded from the payload layer to the builder's
+/// MDBX branch so it can skip the blocking `state_root_with_updates` call.
+pub type StateRootPrecomputedSink =
+    Arc<Mutex<Option<(alloy_primitives::B256, reth_trie_common::updates::TrieUpdates)>>>;
+
 /// BSC wrapper around [`NextBlockEnvAttributes`].
 ///
 /// Extends the upstream attributes with TrieDB-specific context for the miner:
@@ -73,9 +79,7 @@ pub struct BscNextBlockEnvAttributes {
     /// task. Filled by payload layer between exec and `finish_with_difflayer` so the
     /// builder's MDBX branch can skip the blocking `state_root_with_updates` call. See
     /// [`BscBlockExecutionCtx::state_root_precomputed_sink`] for full semantics.
-    pub state_root_precomputed_sink: Option<
-        Arc<Mutex<Option<(alloy_primitives::B256, reth_trie_common::updates::TrieUpdates)>>>,
-    >,
+    pub state_root_precomputed_sink: Option<StateRootPrecomputedSink>,
     /// Sparse-trie state-root handle, threaded through to `finish_with_difflayer`.
     ///
     /// Stored here (in `Arc<Mutex<Option<_>>>` so `Clone` works for the type-erased
@@ -166,9 +170,7 @@ pub struct BscBlockExecutionCtx<'a> {
     /// it to skip the synchronous `state_root_with_updates` call. `None` in the bid
     /// simulator path and when the `--mining.use-sparse-trie-state-root` flag is off,
     /// triggering the legacy state-root path.
-    pub state_root_precomputed_sink: Option<
-        Arc<Mutex<Option<(alloy_primitives::B256, reth_trie_common::updates::TrieUpdates)>>>,
-    >,
+    pub state_root_precomputed_sink: Option<StateRootPrecomputedSink>,
     /// Sparse-trie state-root handle. The builder consumes this **after**
     /// `executor.finish()` runs BSC's post-execution system transactions (slash,
     /// fee distribution, validator-set updates), so those state changes are
