@@ -269,6 +269,10 @@ pub enum BscPayloadJobError {
     ChannelCommunicationError(String),
 }
 
+/// R2: margin (ms) reserved before a slot's `end_mining_timestamp_ms` when bounding the
+/// sparse-trie `state_root()` wait, leaving room to finalize before the slot deadline.
+pub const STATE_ROOT_WAIT_MARGIN_MS: u64 = 30;
+
 /// Build arguments for BscPayloadBuilder.
 #[derive(Debug, Clone)]
 pub struct BscBuildArguments<Attributes> {
@@ -316,6 +320,11 @@ pub struct BscBuildArguments<Attributes> {
     /// takes the handle; subsequent retries see `None` and fall back to the legacy
     /// synchronous state-root path (still correct, just slower for that retry).
     pub trie_handle: Arc<Mutex<Option<reth_engine_tree::tree::multiproof::StateRootHandle>>>,
+    /// R2: absolute wall-clock deadline (epoch ms) for bounding the sparse-trie
+    /// `state_root()` wait in `finish_with_difflayer`; threaded into the build ctx.
+    /// Set from `MiningContext::end_mining_timestamp_ms` minus
+    /// [`STATE_ROOT_WAIT_MARGIN_MS`]. `None` = legacy unbounded blocking wait.
+    pub state_root_deadline_ms: Option<u64>,
 }
 
 /// BSC payload builder, used to build payload for bsc miner.
@@ -394,6 +403,7 @@ where
             parent_difflayers,
             state_root_precomputed,
             trie_handle,
+            state_root_deadline_ms,
         } = args;
         let PayloadConfig { parent_header, attributes, payload_id: _ } = config;
 
@@ -485,6 +495,7 @@ where
             // post-execution system txs (slash / reward / validator-set updates) with
             // the state_hook installed. See `BscBlockExecutionCtx::trie_handle` doc.
             trie_handle: Some(trie_handle.clone()),
+            state_root_deadline_ms,
         };
 
         let mut builder = self
@@ -991,6 +1002,7 @@ where
             parent_difflayers,
             state_root_precomputed,
             trie_handle,
+            state_root_deadline_ms: _,
         } = args;
         let PayloadConfig { parent_header, attributes, payload_id: _ } = config;
 
@@ -1077,6 +1089,7 @@ where
                     // Empty-payload path: don't engage sparse-trie (would still be
                     // correct but the setup overhead isn't worth it for ~0-tx blocks).
                     trie_handle: None,
+                    state_root_deadline_ms: None,
                 },
             )
             .map_err(PayloadBuilderError::other)?;

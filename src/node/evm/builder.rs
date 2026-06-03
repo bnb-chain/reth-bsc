@@ -196,34 +196,74 @@ where
         if let Some(handle_slot) = self.ctx.trie_handle.take() {
             if let Some(mut handle) = handle_slot.lock().unwrap().take() {
                 let wait_start = std::time::Instant::now();
-                match handle.state_root() {
-                    Ok(outcome) => {
-                        let updates = std::sync::Arc::try_unwrap(outcome.trie_updates)
-                            .unwrap_or_else(|arc| (*arc).clone());
-                        if let Some(sink) = self.ctx.state_root_precomputed_sink.as_ref() {
-                            *sink.lock().unwrap() = Some((outcome.state_root, updates));
-                        } else {
-                            // No sink registered — write into the field (which the
-                            // MDBX branch also reads as fallback).
-                            self.precomputed_state_root = Some((outcome.state_root, updates));
+                // R2: bound the wait by the slot deadline (if set) so an in-turn block
+                // never blocks unboundedly past its slot. On timeout/error we leave the
+                // sink empty, so the MDBX branch below falls back to the synchronous
+                // `state_root_with_updates` (bounded, correct). `None` deadline keeps the
+                // legacy blocking wait (out-of-turn / bid-sim / import paths).
+                let delivered = match self.ctx.state_root_deadline_ms {
+                    Some(deadline_ms) => {
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+                        let budget =
+                            std::time::Duration::from_millis(deadline_ms.saturating_sub(now_ms));
+                        match handle.take_state_root_rx().recv_timeout(budget) {
+                            Ok(Ok(outcome)) => Some(outcome),
+                            Ok(Err(err)) => {
+                                tracing::warn!(
+                                    target: "bsc::builder",
+                                    parent_hash = %self.parent.hash(),
+                                    block_number = %(self.parent.number + 1),
+                                    %err,
+                                    "Sparse-trie task error post-finish(); falling back to state_root_with_updates"
+                                );
+                                None
+                            }
+                            Err(_timeout) => {
+                                tracing::warn!(
+                                    target: "bsc::builder",
+                                    parent_hash = %self.parent.hash(),
+                                    block_number = %(self.parent.number + 1),
+                                    wait_ms = wait_start.elapsed().as_millis(),
+                                    "Sparse-trie state-root not ready before slot deadline; falling back to state_root_with_updates"
+                                );
+                                None
+                            }
                         }
-                        tracing::debug!(
-                            target: "bsc::builder",
-                            parent_hash = %self.parent.hash(),
-                            block_number = %(self.parent.number + 1),
-                            wait_ms = wait_start.elapsed().as_millis(),
-                            "Sparse-trie state-root delivered post-finish()"
-                        );
                     }
-                    Err(err) => {
-                        tracing::warn!(
-                            target: "bsc::builder",
-                            parent_hash = %self.parent.hash(),
-                            block_number = %(self.parent.number + 1),
-                            %err,
-                            "Sparse-trie task failed post-finish(); falling back to state_root_with_updates"
-                        );
+                    None => match handle.state_root() {
+                        Ok(outcome) => Some(outcome),
+                        Err(err) => {
+                            tracing::warn!(
+                                target: "bsc::builder",
+                                parent_hash = %self.parent.hash(),
+                                block_number = %(self.parent.number + 1),
+                                %err,
+                                "Sparse-trie task failed post-finish(); falling back to state_root_with_updates"
+                            );
+                            None
+                        }
+                    },
+                };
+                if let Some(outcome) = delivered {
+                    let updates = std::sync::Arc::try_unwrap(outcome.trie_updates)
+                        .unwrap_or_else(|arc| (*arc).clone());
+                    if let Some(sink) = self.ctx.state_root_precomputed_sink.as_ref() {
+                        *sink.lock().unwrap() = Some((outcome.state_root, updates));
+                    } else {
+                        // No sink registered — write into the field (which the
+                        // MDBX branch also reads as fallback).
+                        self.precomputed_state_root = Some((outcome.state_root, updates));
                     }
+                    tracing::debug!(
+                        target: "bsc::builder",
+                        parent_hash = %self.parent.hash(),
+                        block_number = %(self.parent.number + 1),
+                        wait_ms = wait_start.elapsed().as_millis(),
+                        "Sparse-trie state-root delivered post-finish()"
+                    );
                 }
             }
         }
