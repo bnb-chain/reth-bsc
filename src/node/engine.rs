@@ -132,7 +132,7 @@ where
                 payload_processor::PayloadProcessor, precompile_cache::PrecompileCacheMap,
             };
             use reth_provider::providers::{OverlayBuilder, OverlayStateProviderFactory};
-            use reth_tasks::{Runtime, RuntimeBuilder, RuntimeConfig, TokioConfig};
+            use reth_tasks::{RuntimeBuilder, RuntimeConfig, TokioConfig};
             use reth_trie_db::ChangesetCache;
 
             let chain_spec = Arc::new(ctx.config().chain.clone().as_ref().clone());
@@ -145,31 +145,18 @@ where
             );
             let provider = ctx.provider().clone();
 
-            // Build a dedicated `reth_tasks::Runtime` for the sparse-trie pools,
-            // attached to the existing tokio handle so we don't spin up a second tokio
-            // executor. Rayon pools default to `available_parallelism()`, matching what
-            // the engine uses for its own PayloadProcessor.
-            //
-            // TODO: in a follow-up, share the engine's Runtime instead of constructing
-            // a parallel one — this currently means two sets of rayon pools competing
-            // for CPU. Acceptable for a first cut; revisit if perf testing shows
-            // contention.
+            // R1: share the engine's `Runtime` (same rayon proof pools) instead of building a
+            // second, competing set. The engine publishes its Runtime via
+            // `reth_tasks::set_shared_engine_runtime` in `TreePayloadValidator::new`; we read it
+            // here. The `PayloadProcessor` is built lazily on first use (then cached) because the
+            // engine runtime is published during engine launch, which can run *after* this
+            // service builder. If it is still unavailable on first use we fall back to a
+            // dedicated Runtime (degraded: pools not shared) so block production never stalls.
             let tokio_handle = ctx.task_executor().handle().clone();
-            let runtime = RuntimeBuilder::new(
-                RuntimeConfig::default().with_tokio(TokioConfig::existing_handle(tokio_handle)),
-            )
-            .build()
-            .map_err(|e| eyre::eyre!("failed to build sparse-trie Runtime: {e}"))?;
-            let _: &Runtime = &runtime; // type-check anchor
-
-            let payload_processor = std::sync::Arc::new(PayloadProcessor::new(
-                runtime,
-                bsc_evm_config,
-                tree_config.as_ref(),
-                PrecompileCacheMap::default(),
-            ));
-
             let tree_config_for_closure = tree_config.clone();
+            let pp_cell: std::sync::OnceLock<
+                std::sync::Arc<PayloadProcessor<crate::node::evm::config::BscEvmConfig>>,
+            > = std::sync::OnceLock::new();
             let spawn_fn: crate::shared::SparseTrieSpawnFn = std::sync::Arc::new(
                 move |parent_hash: alloy_primitives::B256,
                       parent_state_root: alloy_primitives::B256| {
@@ -221,6 +208,28 @@ where
                         provider.clone(),
                         overlay_builder,
                     );
+                    // R1: lazily build (once) the PayloadProcessor on the engine's shared
+                    // Runtime, falling back to a dedicated one if not yet published.
+                    let payload_processor = pp_cell.get_or_init(|| {
+                        let runtime = reth_tasks::shared_engine_runtime().unwrap_or_else(|| {
+                            tracing::warn!(
+                                target: "bsc::miner",
+                                "engine Runtime not yet published; building a dedicated sparse-trie \
+                                 Runtime (proof pools NOT shared with the engine this run)"
+                            );
+                            RuntimeBuilder::new(RuntimeConfig::default().with_tokio(
+                                TokioConfig::existing_handle(tokio_handle.clone()),
+                            ))
+                            .build()
+                            .expect("failed to build fallback sparse-trie Runtime")
+                        });
+                        std::sync::Arc::new(PayloadProcessor::new(
+                            runtime,
+                            bsc_evm_config.clone(),
+                            tree_config_for_closure.as_ref(),
+                            PrecompileCacheMap::default(),
+                        ))
+                    });
                     Some(payload_processor.spawn_state_root(
                         overlay_factory,
                         parent_state_root,

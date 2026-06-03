@@ -16,60 +16,60 @@ name = "reth-bsc"
 path = "src/main.rs"
 
 [dependencies]
-reth = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-cli = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-cli-commands = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-basic-payload-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-db = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-engine-local = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-engine-tree = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-node-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-chainspec = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-cli-util = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-discv4 = { git = "https://github.com/bnb-chain/reth.git", branch = "develop", features = [
+reth = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/share-engine-payload-processor" }
+reth-cli = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/share-engine-payload-processor" }
+reth-cli-commands = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/share-engine-payload-processor" }
+reth-basic-payload-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/share-engine-payload-processor" }
+reth-db = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/share-engine-payload-processor" }
+reth-engine-local = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/share-engine-payload-processor" }
+reth-engine-tree = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/share-engine-payload-processor" }
+reth-node-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/share-engine-payload-processor" }
+reth-chainspec = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/share-engine-payload-processor" }
+reth-cli-util = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/share-engine-payload-processor" }
+reth-discv4 = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/share-engine-payload-processor", features = [
     "test-utils",
 ] }
-reth-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-ethereum-forks = { git = "https://github.com/bnb-chain/reth.git", branch = "develop", features = [
+reth-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/share-engine-payload-processor" }
+reth-ethereum-forks = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/share-engine-payload-processor", features = [
     "serde",
 ] }
-reth-ethereum-payload-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-payload-builder-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-chain-state = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-eth-wire = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-eth-wire-types = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-evm = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-execution-types = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-ipc = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-metrics = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-node-core = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-revm = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-network = { git = "https://github.com/bnb-chain/reth.git", branch = "develop", features = [
+reth-ethereum-payload-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/share-engine-payload-processor" }
+reth-payload-builder-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/share-engine-payload-processor" }
+reth-chain-state = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/share-engine-payload-processor" }
+reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/share-engine-payload-processor" }
+reth-eth-wire = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/share-engine-payload-processor" }
+reth-eth-wire-types = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/share-engine-payload-processor" }
+reth-evm = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/share-engine-payload-processor" }
+reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/share-engine-payload-processor" }
+reth-execution-types = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/share-engine-payload-processor" }
+reth-ipc = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/share-engine-payload-processor" }
+reth-metrics = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/share-engine-payload-processor" }
+reth-node-core = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/share-engine-payload-processor" }
+reth-revm = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/share-engine-payload-processor" }
+reth-network = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/share-engine-payload-processor", features = [
     "test-utils",
 ] }
-reth-network-p2p = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-network-api = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-node-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "develop", features = [
+reth-network-p2p = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/share-engine-payload-processor" }
+reth-network-api = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/share-engine-payload-processor" }
+reth-node-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/share-engine-payload-processor", features = [
     "test-utils",
 ] }
-reth-network-peers = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-payload-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-ethereum-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
+reth-network-peers = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/share-engine-payload-processor" }
+reth-payload-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/share-engine-payload-processor" }
+reth-ethereum-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/share-engine-payload-processor" }
 reth-primitives-traits = { git = "https://github.com/bnb-chain/reth-core.git", branch = "v0.3.1-v2", default-features = false }
 reth-codecs = { git = "https://github.com/bnb-chain/reth-core.git", branch = "v0.3.1-v2" }
-reth-provider = { git = "https://github.com/bnb-chain/reth.git", branch = "develop", features = [
+reth-provider = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/share-engine-payload-processor", features = [
     "test-utils",
 ] }
-reth-rpc-eth-api = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-rpc-convert = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-rpc-engine-api = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-rpc-server-types = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-trie-common = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-tasks = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
-reth-transaction-pool = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
+reth-rpc-eth-api = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/share-engine-payload-processor" }
+reth-rpc-convert = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/share-engine-payload-processor" }
+reth-rpc-engine-api = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/share-engine-payload-processor" }
+reth-rpc-server-types = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/share-engine-payload-processor" }
+reth-trie-common = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/share-engine-payload-processor" }
+reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/share-engine-payload-processor" }
+reth-tasks = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/share-engine-payload-processor" }
+reth-transaction-pool = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/share-engine-payload-processor" }
 
 # triedb dependencies
 rust-eth-triedb = { git = "https://github.com/bnb-chain/reth-bsc-triedb.git", branch = "develop" }
