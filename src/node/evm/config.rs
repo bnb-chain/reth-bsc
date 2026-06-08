@@ -94,6 +94,12 @@ pub struct BscNextBlockEnvAttributes {
     pub trie_handle: Option<
         Arc<Mutex<Option<reth_engine_tree::tree::multiproof::StateRootHandle>>>,
     >,
+    /// R2: absolute wall-clock deadline (epoch ms) for bounding the sparse-trie
+    /// `state_root()` wait in `finish_with_difflayer`. Past it the builder stops
+    /// waiting and falls back to synchronous `state_root_with_updates`, so an
+    /// in-turn block never blocks unboundedly past its slot. `None` = legacy
+    /// unbounded blocking wait (out-of-turn / bid-sim / import paths).
+    pub state_root_deadline_ms: Option<u64>,
 }
 
 impl<H: BlockHeader> BuildPendingEnv<H> for BscNextBlockEnvAttributes {
@@ -106,6 +112,7 @@ impl<H: BlockHeader> BuildPendingEnv<H> for BscNextBlockEnvAttributes {
             turn_length_sink: None,
             state_root_precomputed_sink: None,
             trie_handle: None,
+            state_root_deadline_ms: None,
         }
     }
 }
@@ -183,6 +190,9 @@ pub struct BscBlockExecutionCtx<'a> {
     pub trie_handle: Option<
         Arc<Mutex<Option<reth_engine_tree::tree::multiproof::StateRootHandle>>>,
     >,
+    /// R2: see [`BscNextBlockEnvAttributes::state_root_deadline_ms`]. Bounds the
+    /// sparse-trie `state_root()` wait in `finish_with_difflayer`.
+    pub state_root_deadline_ms: Option<u64>,
 }
 
 impl<'a> BscBlockExecutionCtx<'a> {
@@ -490,6 +500,7 @@ where
             turn_length_sink: None,
             state_root_precomputed_sink: None,
             trie_handle: None,
+            state_root_deadline_ms: None,
         })
     }
 
@@ -518,6 +529,7 @@ where
             turn_length_sink: attributes.turn_length_sink,
             state_root_precomputed_sink: attributes.state_root_precomputed_sink,
             trie_handle: attributes.trie_handle,
+            state_root_deadline_ms: attributes.state_root_deadline_ms,
         })
     }
 
@@ -595,6 +607,7 @@ where
             turn_length_sink: None,
             state_root_precomputed_sink: None,
             trie_handle: None,
+            state_root_deadline_ms: None,
         })
     }
 

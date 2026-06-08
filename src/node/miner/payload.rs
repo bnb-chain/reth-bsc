@@ -269,6 +269,10 @@ pub enum BscPayloadJobError {
     ChannelCommunicationError(String),
 }
 
+/// R2: margin (ms) reserved before a slot's `end_mining_timestamp_ms` when bounding the
+/// sparse-trie `state_root()` wait, leaving room to finalize before the slot deadline.
+pub const STATE_ROOT_WAIT_MARGIN_MS: u64 = 30;
+
 /// Build arguments for BscPayloadBuilder.
 #[derive(Debug, Clone)]
 pub struct BscBuildArguments<Attributes> {
@@ -316,6 +320,11 @@ pub struct BscBuildArguments<Attributes> {
     /// takes the handle; subsequent retries see `None` and fall back to the legacy
     /// synchronous state-root path (still correct, just slower for that retry).
     pub trie_handle: Arc<Mutex<Option<reth_engine_tree::tree::multiproof::StateRootHandle>>>,
+    /// R2: absolute wall-clock deadline (epoch ms) for bounding the sparse-trie
+    /// `state_root()` wait in `finish_with_difflayer`; threaded into the build ctx.
+    /// Set from `MiningContext::end_mining_timestamp_ms` minus
+    /// [`STATE_ROOT_WAIT_MARGIN_MS`]. `None` = legacy unbounded blocking wait.
+    pub state_root_deadline_ms: Option<u64>,
 }
 
 /// BSC payload builder, used to build payload for bsc miner.
@@ -393,13 +402,34 @@ where
             min_gas_tip,
             parent_difflayers,
             state_root_precomputed,
-            trie_handle,
+            // R3: the job-level handle is ignored here; build_payload spawns a fresh one
+            // per attempt below, so retries (value-gated rebuilds) also get the
+            // precomputed root instead of only the first attempt.
+            trie_handle: _,
+            state_root_deadline_ms,
         } = args;
         let PayloadConfig { parent_header, attributes, payload_id: _ } = config;
 
         let parent_hash = parent_header.hash_slow();
         // Parent difflayers were fetched once at job start; reuse across all retry attempts.
         let triedb_parent_difflayers = parent_difflayers;
+
+        // R3: spawn a fresh sparse-trie state-root handle for THIS build attempt. The
+        // job-level handle was single-use — the first attempt consumed it and any retry
+        // (e.g. a value-gated rebuild) fell back to the synchronous `state_root_with_updates`,
+        // so ~half of in-turn blocks paid the full sync root cost. A fresh handle per attempt
+        // is cheap now that R1 shares the engine's proof pools. `None` keeps the sync path
+        // (sparse-trie disabled, triedb mode, or no spawner registered).
+        let trie_handle: Arc<Mutex<Option<reth_engine_tree::tree::multiproof::StateRootHandle>>> = {
+            let use_sparse_trie = crate::node::miner::config::get_global_mining_config()
+                .is_some_and(|c| c.use_sparse_trie_state_root)
+                && !rust_eth_triedb::triedb_manager::is_triedb_active();
+            Arc::new(Mutex::new(if use_sparse_trie {
+                crate::shared::spawn_sparse_trie_state_root(parent_hash, parent_header.state_root())
+            } else {
+                None
+            }))
+        };
 
         // Safety guard: when triedb is active but no difflayers are available, verify that the
         // parent state root matches the pathdb disk layer.  If they diverge (e.g. after a
@@ -485,6 +515,7 @@ where
             // post-execution system txs (slash / reward / validator-set updates) with
             // the state_hook installed. See `BscBlockExecutionCtx::trie_handle` doc.
             trie_handle: Some(trie_handle.clone()),
+            state_root_deadline_ms,
         };
 
         let mut builder = self
@@ -991,6 +1022,7 @@ where
             parent_difflayers,
             state_root_precomputed,
             trie_handle,
+            state_root_deadline_ms: _,
         } = args;
         let PayloadConfig { parent_header, attributes, payload_id: _ } = config;
 
@@ -1077,6 +1109,7 @@ where
                     // Empty-payload path: don't engage sparse-trie (would still be
                     // correct but the setup overhead isn't worth it for ~0-tx blocks).
                     trie_handle: None,
+                    state_root_deadline_ms: None,
                 },
             )
             .map_err(PayloadBuilderError::other)?;
@@ -1392,56 +1425,13 @@ where
         )
         .await;
 
-        // Sparse-trie state-root: spawn the background task (if enabled and not
-        // running in triedb mode) and stash the handle in `build_args.trie_handle`.
-        //
-        // The first build attempt inside `build_payload` takes the handle:
-        //   1. installs `handle.state_hook()` on the executor before the exec loop
-        //   2. drops the hook after exec to signal the task to finalize
-        //   3. calls `handle.state_root()` to get the precomputed `(root, updates)`
-        //   4. writes the result into `build_args.state_root_precomputed`, which the
-        //      builder's `finish_with_difflayer` reads (via the sink on
-        //      `BscBlockExecutionCtx.state_root_precomputed_sink`)
-        //
-        // If the engine has not registered a spawner via
-        // `shared::set_sparse_trie_spawn_fn` (the engine-launch wiring is opt-in and
-        // gated on `--mining.use-sparse-trie-state-root`), `spawn_sparse_trie_state_root`
-        // returns `None` and the slot stays empty — the builder falls through to the
-        // legacy synchronous `state_root_with_updates` path.
-        //
-        // `state_root_with_updates` is also kept as the fallback for any retry whose
-        // build attempt happens AFTER the first one has consumed the handle (the handle
-        // is single-use because `state_root(&mut self)` consumes the receiver).
-        let use_sparse_trie = crate::node::miner::config::get_global_mining_config()
-            .is_some_and(|c| c.use_sparse_trie_state_root)
-            && !rust_eth_triedb::triedb_manager::is_triedb_active();
-
-        if use_sparse_trie {
-            let parent_header_ref = &self.build_args.config.parent_header;
-            let parent_hash = parent_header_ref.hash_slow();
-            let parent_state_root = parent_header_ref.state_root();
-            match crate::shared::spawn_sparse_trie_state_root(parent_hash, parent_state_root) {
-                Some(handle) => {
-                    *self.build_args.trie_handle.lock().unwrap() = Some(handle);
-                    debug!(
-                        target: "bsc::miner::payload",
-                        trace_id = self.trace_id,
-                        block_number = self.build_args.config.parent_header.number() + 1,
-                        %parent_state_root,
-                        "Spawned sparse-trie state-root background task"
-                    );
-                }
-                None => {
-                    // Spawner registered no-op (e.g. engine not wired up). Logging at
-                    // trace because falling back to the sync path is harmless.
-                    tracing::trace!(
-                        target: "bsc::miner::payload",
-                        trace_id = self.trace_id,
-                        "use_sparse_trie_state_root is true but no spawner registered; falling back to legacy state_root_with_updates"
-                    );
-                }
-            }
-        }
+        // Sparse-trie state-root (MDBX mode, `--mining.use-sparse-trie-state-root`):
+        // R3 spawns a fresh background task PER build attempt inside `build_payload`
+        // (not once here), so every attempt — including value-gated rebuilds — gets the
+        // precomputed root rather than only the first attempt. Each attempt installs
+        // `handle.state_hook()` before exec, drops it after to finalize, then
+        // `finish_with_difflayer` calls `state_root()` (bounded by R2's slot deadline)
+        // and falls back to synchronous `state_root_with_updates` on miss / no spawner.
 
         let mut start_time = std::time::Instant::now();
         let initial_wait = initial_out_of_turn_build_wait(&self.parlia, &self.mining_ctx);
