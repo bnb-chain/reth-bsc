@@ -48,6 +48,18 @@ where
     pub parent: &'a SealedHeader<HeaderTy<BscPrimitives>>,
     /// The assembler used to build the block.
     pub assembler: &'a BscBlockAssembler<crate::chainspec::BscChainSpec>,
+    /// Optional precomputed `(state_root, trie_updates)` from a sparse-trie background
+    /// task.
+    ///
+    /// When `Some`, `finish_with_difflayer`'s MDBX branch uses these values directly
+    /// and skips the blocking `state_root_with_updates` call. Set via either:
+    ///   * [`BscBlockBuilder::with_precomputed_state_root`] (fluent), or
+    ///   * the `state_root_precomputed` parameter on the [`BlockBuilder::finish`]
+    ///     trait method (which forwards into this field before delegating to
+    ///     `finish_with_difflayer`).
+    ///
+    /// `None` in the TrieDB branch and when no sparse-trie task is in flight.
+    pub precomputed_state_root: Option<(alloy_primitives::B256, TrieUpdates)>,
 }
 
 impl<'a, EVM, Spec, R> BscBlockBuilder<'a, EVM, Spec, R>
@@ -62,7 +74,34 @@ where
         assembler: &'a BscBlockAssembler<crate::chainspec::BscChainSpec>,
         parent: &'a SealedHeader<HeaderTy<BscPrimitives>>,
     ) -> Self {
-        Self { executor, transactions: Vec::new(), ctx, shared_ctx, parent, assembler }
+        Self {
+            executor,
+            transactions: Vec::new(),
+            ctx,
+            shared_ctx,
+            parent,
+            assembler,
+            precomputed_state_root: None,
+        }
+    }
+
+    /// Install a precomputed `(state_root, trie_updates)` to be consumed by
+    /// `finish_with_difflayer` (MDBX branch only). Returns `self` for fluent usage.
+    ///
+    /// Pass `None` to clear an existing value.
+    ///
+    /// Currently has no callers — `BscPayloadJob` obtains its builder via
+    /// `evm_config.builder_for_next_block(...)` which returns `impl BlockBuilder`, so
+    /// this concrete setter is unreachable through the trait. Kept as the documented
+    /// integration point for the follow-up sparse-trie wiring; see TODOs in
+    /// `payload.rs` for the two ways to bridge the gap.
+    #[allow(dead_code)]
+    pub fn with_precomputed_state_root(
+        mut self,
+        precomputed: Option<(alloy_primitives::B256, TrieUpdates)>,
+    ) -> Self {
+        self.precomputed_state_root = precomputed;
+        self
     }
 }
 
@@ -109,10 +148,15 @@ where
 
     // fetch assembled_system_txs and add into sealed block.
     fn finish(
-        self,
+        mut self,
         state: impl StateProvider,
-        _state_root_precomputed: Option<(alloy_primitives::B256, TrieUpdates)>,
+        state_root_precomputed: Option<(alloy_primitives::B256, TrieUpdates)>,
     ) -> Result<BlockBuilderOutcome<BscPrimitives>, BlockExecutionError> {
+        // Forward into the field so `finish_with_difflayer` (whose trait signature
+        // takes only `state`) can pick it up.
+        if state_root_precomputed.is_some() {
+            self.precomputed_state_root = state_root_precomputed;
+        }
         Ok(self.finish_with_difflayer(state)?.inner)
     }
 
@@ -121,13 +165,108 @@ where
     /// the precomputed diff layer that can be committed directly to the TrieDB backend;
     /// otherwise `difflayer` is `None` and the caller falls back to the standard
     /// hashed-state + trie-updates path.
+    ///
+    /// MDBX branch additionally honors `self.precomputed_state_root` (set via
+    /// [`BscBlockBuilder::with_precomputed_state_root`] or routed through `fn finish`)
+    /// to skip the blocking `state_root_with_updates` call when a sparse-trie task has
+    /// already computed the root concurrently with execution.
     fn finish_with_difflayer(
         mut self,
         state: impl StateProvider,
     ) -> Result<BlockBuilderOutcomeWithDiffLayer<BscPrimitives>, BlockExecutionError> {
         let finish_start = std::time::Instant::now();
+        // `executor.finish()` runs BSC's post-execution system txs (slash spoiled
+        // validator, distribute fees / finality rewards, breathe-block validator-set
+        // updates). Any `state_hook` previously installed on the executor — including
+        // the sparse-trie hook — captures those state changes here. Consuming the
+        // executor on the next line drops the hook closure, which triggers
+        // `StateHookSender::drop` → `FinishedStateUpdates` → sparse-trie task can
+        // safely return from `state_root()` below.
         let (evm, result) = self.executor.finish()?;
         let (db, evm_env) = evm.finish();
+
+        // Sparse-trie state-root collection: now that the executor (and therefore the
+        // state_hook) has been dropped, the background task has all updates and is
+        // finalizing. Take the handle from ctx, block on `state_root()`, and stash the
+        // result in the sink — the MDBX branch below reads it.
+        //
+        // Failures fall through silently to the legacy `state_root_with_updates` path,
+        // logged at WARN. A failure here is non-fatal but indicates the task panicked
+        // or its channel was dropped; investigate via the trace target below.
+        if let Some(handle_slot) = self.ctx.trie_handle.take() {
+            if let Some(mut handle) = handle_slot.lock().unwrap().take() {
+                let wait_start = std::time::Instant::now();
+                // R2: bound the wait by the slot deadline (if set) so an in-turn block
+                // never blocks unboundedly past its slot. On timeout/error we leave the
+                // sink empty, so the MDBX branch below falls back to the synchronous
+                // `state_root_with_updates` (bounded, correct). `None` deadline keeps the
+                // legacy blocking wait (out-of-turn / bid-sim / import paths).
+                let delivered = match self.ctx.state_root_deadline_ms {
+                    Some(deadline_ms) => {
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+                        let budget =
+                            std::time::Duration::from_millis(deadline_ms.saturating_sub(now_ms));
+                        match handle.take_state_root_rx().recv_timeout(budget) {
+                            Ok(Ok(outcome)) => Some(outcome),
+                            Ok(Err(err)) => {
+                                tracing::warn!(
+                                    target: "bsc::builder",
+                                    parent_hash = %self.parent.hash(),
+                                    block_number = %(self.parent.number + 1),
+                                    %err,
+                                    "Sparse-trie task error post-finish(); falling back to state_root_with_updates"
+                                );
+                                None
+                            }
+                            Err(_timeout) => {
+                                tracing::warn!(
+                                    target: "bsc::builder",
+                                    parent_hash = %self.parent.hash(),
+                                    block_number = %(self.parent.number + 1),
+                                    wait_ms = wait_start.elapsed().as_millis(),
+                                    "Sparse-trie state-root not ready before slot deadline; falling back to state_root_with_updates"
+                                );
+                                None
+                            }
+                        }
+                    }
+                    None => match handle.state_root() {
+                        Ok(outcome) => Some(outcome),
+                        Err(err) => {
+                            tracing::warn!(
+                                target: "bsc::builder",
+                                parent_hash = %self.parent.hash(),
+                                block_number = %(self.parent.number + 1),
+                                %err,
+                                "Sparse-trie task failed post-finish(); falling back to state_root_with_updates"
+                            );
+                            None
+                        }
+                    },
+                };
+                if let Some(outcome) = delivered {
+                    let updates = std::sync::Arc::try_unwrap(outcome.trie_updates)
+                        .unwrap_or_else(|arc| (*arc).clone());
+                    if let Some(sink) = self.ctx.state_root_precomputed_sink.as_ref() {
+                        *sink.lock().unwrap() = Some((outcome.state_root, updates));
+                    } else {
+                        // No sink registered — write into the field (which the
+                        // MDBX branch also reads as fallback).
+                        self.precomputed_state_root = Some((outcome.state_root, updates));
+                    }
+                    tracing::debug!(
+                        target: "bsc::builder",
+                        parent_hash = %self.parent.hash(),
+                        block_number = %(self.parent.number + 1),
+                        wait_ms = wait_start.elapsed().as_millis(),
+                        "Sparse-trie state-root delivered post-finish()"
+                    );
+                }
+            }
+        }
 
         let assembled_system_txs = {
             let mut inner = self.shared_ctx.inner.borrow_mut();
@@ -179,6 +318,31 @@ where
                 "Calculated state root using triedb"
             );
             (new_root, TrieUpdates::default(), Some(new_difflayer))
+        } else if let Some((root, updates)) = self
+            .ctx
+            .state_root_precomputed_sink
+            .as_ref()
+            .and_then(|sink| sink.lock().unwrap().take())
+            .or_else(|| self.precomputed_state_root.take())
+        {
+            // Fast path: sparse-trie background task already computed the root concurrently
+            // with execution. See `crate::shared::spawn_sparse_trie_state_root` and reth 2.0
+            // `--engine.share-sparse-trie-with-payload-builder` semantics for the upstream
+            // mechanism we mirror.
+            //
+            // Preferred source is the sink on `self.ctx` (filled by the payload layer
+            // post-exec); the field on `Self` is a fallback that `fn finish` populates
+            // when callers route through the trait method.
+            tracing::debug!(
+                target: "bsc::builder",
+                parent_hash = %self.parent.hash(),
+                block_number = %(self.parent.number + 1),
+                user_tx_count = self.transactions.len(),
+                hashed_accounts = hashed_state.accounts.len(),
+                hashed_storages = hashed_state.storages.len(),
+                "Using precomputed state root from sparse-trie task"
+            );
+            (root, updates, None)
         } else {
             let (root, updates) =
                 state.state_root_with_updates(hashed_state.clone()).map_err(BlockExecutionError::other)?;

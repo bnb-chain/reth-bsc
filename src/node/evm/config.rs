@@ -44,6 +44,12 @@ use std::{borrow::Cow, cell::RefCell, convert::Infallible, rc::Rc, sync::{Arc, M
 /// is known.
 pub type ValidatorCacheSink = Arc<Mutex<Option<(Vec<Address>, Vec<VoteAddress>)>>>;
 
+/// Sink carrying the sparse-trie background task's precomputed
+/// `(state_root, trie_updates)`, threaded from the payload layer to the builder's
+/// MDBX branch so it can skip the blocking `state_root_with_updates` call.
+pub type StateRootPrecomputedSink =
+    Arc<Mutex<Option<(alloy_primitives::B256, reth_trie_common::updates::TrieUpdates)>>>;
+
 /// BSC wrapper around [`NextBlockEnvAttributes`].
 ///
 /// Extends the upstream attributes with TrieDB-specific context for the miner:
@@ -69,6 +75,31 @@ pub struct BscNextBlockEnvAttributes {
     /// Sink for transporting `turn_length` from builder to payload layer without writing to
     /// TURN_LENGTH_CACHE prematurely.
     pub turn_length_sink: Option<Arc<Mutex<Option<u8>>>>,
+    /// Sink for precomputed `(state_root, trie_updates)` from a sparse-trie background
+    /// task. Filled by payload layer between exec and `finish_with_difflayer` so the
+    /// builder's MDBX branch can skip the blocking `state_root_with_updates` call. See
+    /// [`BscBlockExecutionCtx::state_root_precomputed_sink`] for full semantics.
+    pub state_root_precomputed_sink: Option<StateRootPrecomputedSink>,
+    /// Sparse-trie state-root handle, threaded through to `finish_with_difflayer`.
+    ///
+    /// Stored here (in `Arc<Mutex<Option<_>>>` so `Clone` works for the type-erased
+    /// builder path) so that `state_root()` can be called **after** `executor.finish()`
+    /// runs BSC's post-execution system transactions (slash, fee distribution,
+    /// validator-set updates). Those system txs change state via the same executor
+    /// that has the `state_hook` installed; the hook is dropped naturally when the
+    /// executor is consumed by `finish()`, which sends `FinishedStateUpdates` to the
+    /// background task. Only after that drop is it safe to await `state_root()`.
+    ///
+    /// `None` when sparse-trie is disabled or in TrieDB mode.
+    pub trie_handle: Option<
+        Arc<Mutex<Option<reth_engine_tree::tree::multiproof::StateRootHandle>>>,
+    >,
+    /// R2: absolute wall-clock deadline (epoch ms) for bounding the sparse-trie
+    /// `state_root()` wait in `finish_with_difflayer`. Past it the builder stops
+    /// waiting and falls back to synchronous `state_root_with_updates`, so an
+    /// in-turn block never blocks unboundedly past its slot. `None` = legacy
+    /// unbounded blocking wait (out-of-turn / bid-sim / import paths).
+    pub state_root_deadline_ms: Option<u64>,
 }
 
 impl<H: BlockHeader> BuildPendingEnv<H> for BscNextBlockEnvAttributes {
@@ -79,6 +110,9 @@ impl<H: BlockHeader> BuildPendingEnv<H> for BscNextBlockEnvAttributes {
             triedb_prefetcher: None,
             validator_cache_sink: None,
             turn_length_sink: None,
+            state_root_precomputed_sink: None,
+            trie_handle: None,
+            state_root_deadline_ms: None,
         }
     }
 }
@@ -135,6 +169,30 @@ pub struct BscBlockExecutionCtx<'a> {
     pub validator_cache_sink: Option<ValidatorCacheSink>,
     /// Sink for `turn_length` — same lifecycle as `validator_cache_sink`.
     pub turn_length_sink: Option<Arc<Mutex<Option<u8>>>>,
+    /// Sink for a precomputed `(state_root, trie_updates)` from a sparse-trie background
+    /// task (reth 2.0 mechanism).
+    ///
+    /// Write direction is **reversed** vs the other sinks: the payload layer fills this
+    /// **before** calling `finish_with_difflayer`, and the builder's MDBX branch reads
+    /// it to skip the synchronous `state_root_with_updates` call. `None` in the bid
+    /// simulator path and when the `--mining.use-sparse-trie-state-root` flag is off,
+    /// triggering the legacy state-root path.
+    pub state_root_precomputed_sink: Option<StateRootPrecomputedSink>,
+    /// Sparse-trie state-root handle. The builder consumes this **after**
+    /// `executor.finish()` runs BSC's post-execution system transactions (slash,
+    /// fee distribution, validator-set updates), so those state changes are
+    /// captured by the executor's `state_hook` before the hook is dropped (which
+    /// signals the sparse-trie task to finalize). Calling `state_root()` before
+    /// the executor is dropped would deadlock the task on `FinishedStateUpdates`.
+    ///
+    /// `Arc<Mutex<Option<_>>>` because `StateRootHandle` is `!Clone` (single-use
+    /// receiver) and `BscBlockExecutionCtx` derives `Clone`.
+    pub trie_handle: Option<
+        Arc<Mutex<Option<reth_engine_tree::tree::multiproof::StateRootHandle>>>,
+    >,
+    /// R2: see [`BscNextBlockEnvAttributes::state_root_deadline_ms`]. Bounds the
+    /// sparse-trie `state_root()` wait in `finish_with_difflayer`.
+    pub state_root_deadline_ms: Option<u64>,
 }
 
 impl<'a> BscBlockExecutionCtx<'a> {
@@ -440,6 +498,9 @@ where
             triedb_prefetcher: None,
             validator_cache_sink: None,
             turn_length_sink: None,
+            state_root_precomputed_sink: None,
+            trie_handle: None,
+            state_root_deadline_ms: None,
         })
     }
 
@@ -466,6 +527,9 @@ where
             triedb_prefetcher: attributes.triedb_prefetcher,
             validator_cache_sink: attributes.validator_cache_sink,
             turn_length_sink: attributes.turn_length_sink,
+            state_root_precomputed_sink: attributes.state_root_precomputed_sink,
+            trie_handle: attributes.trie_handle,
+            state_root_deadline_ms: attributes.state_root_deadline_ms,
         })
     }
 
@@ -541,6 +605,9 @@ where
             triedb_prefetcher: None,
             validator_cache_sink: None,
             turn_length_sink: None,
+            state_root_precomputed_sink: None,
+            trie_handle: None,
+            state_root_deadline_ms: None,
         })
     }
 

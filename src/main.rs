@@ -40,6 +40,14 @@ pub struct BscCliArgs {
     #[arg(long = "mining.min-gas-tip")]
     pub mining_min_gas_tip: Option<u128>,
 
+    /// Use reth 2.0 sparse-trie background task for state-root computation in
+    /// MDBX-mode payload build (opt-in; no effect when `--statedb.triedb` is
+    /// active).
+    ///
+    /// Env alternative: `BSC_MINING_USE_SPARSE_TRIE_STATE_ROOT=true`.
+    #[arg(long = "mining.use-sparse-trie-state-root")]
+    pub mining_use_sparse_trie_state_root: bool,
+
     /// Private key for mining (hex format, for testing only)
     /// The validator address will be automatically derived from this key
     #[arg(long = "mining.private-key")]
@@ -214,6 +222,11 @@ fn main() -> eyre::Result<()> {
 
                 if let Some(min_gas_tip) = args.mining_min_gas_tip {
                     mining_config.min_gas_tip = Some(min_gas_tip);
+                }
+
+                // CLI takes precedence over env BSC_MINING_USE_SPARSE_TRIE_STATE_ROOT.
+                if args.mining_use_sparse_trie_state_root {
+                    mining_config.use_sparse_trie_state_root = true;
                 }
 
                 // Ensure keys are available if enabled but none provided
@@ -444,6 +457,13 @@ fn main() -> eyre::Result<()> {
             engine_handle_tx.send(node.beacon_engine_handle.clone()).unwrap();
             reth_bsc::shared::set_engine_api_tx(node.engine_api_tx.clone().unwrap()).unwrap();
             tracing::debug!("set engine api tx successfully");
+
+            // Publish CanonicalInMemoryState so the sparse-trie spawner can resolve
+            // in-memory parents back to the on-disk anchor. Concrete `BlockchainProvider`
+            // is only reachable here (post-launch); the generic builder context isn't.
+            let _ = reth_bsc::shared::set_canonical_in_memory_state(
+                node.provider.canonical_in_memory_state(),
+            );
 
             // Set the IPC client
             reth_bsc::shared::set_ipc_client(ipc_path).await.unwrap();

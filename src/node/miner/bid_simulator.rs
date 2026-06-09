@@ -459,6 +459,11 @@ where
                     triedb_prefetcher,
                     validator_cache_sink: Some(bid_validator_cache_sink.clone()),
                     turn_length_sink: Some(bid_turn_length_sink.clone()),
+                    // Bid simulation does not run alongside a sparse-trie task —
+                    // builder will fall through to state_root_with_updates.
+                    state_root_precomputed_sink: None,
+                    trie_handle: None,
+                    state_root_deadline_ms: None,
                 },
             )
             .map_err(PayloadBuilderError::other)
@@ -563,8 +568,13 @@ where
             return;
         }
 
-        // Finish the builder (also returns triedb difflayer when enabled)
-        let out = match builder.finish_with_difflayer(&state_provider).map_err(PayloadBuilderError::other) {
+        // Finish the builder (also returns triedb difflayer when enabled).
+        // Bid simulation does not run alongside a sparse-trie task — no precomputed root,
+        // so the builder uses the legacy state_root_with_updates path inside
+        // finish_with_difflayer.
+        let out =
+            match builder.finish_with_difflayer(&state_provider).map_err(PayloadBuilderError::other)
+            {
             Ok(outcome) => outcome,
             Err(e) => {
                 debug!("Failed to finish builder: {:?}", e);

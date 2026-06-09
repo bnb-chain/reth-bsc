@@ -730,6 +730,16 @@ where
                 .map(|v| v as u128)
                 .unwrap_or(self.desired_min_gas_tip),
             parent_difflayers: None, // populated once at job start via fetch_triedb_difflayers
+            // Filled in by BscPayloadJob::start when sparse-trie state-root is enabled
+            // and the engine has registered a spawner. Falls back to legacy path when None.
+            state_root_precomputed: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            trie_handle: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            // R2: bound the sparse-trie state_root() wait to this slot so an in-turn
+            // block never blocks past its deadline (then falls back to sync root).
+            state_root_deadline_ms: Some(
+                (mining_ctx.end_mining_timestamp_ms as u64)
+                    .saturating_sub(crate::node::miner::payload::STATE_ROOT_WAIT_MARGIN_MS),
+            ),
         };
 
         let parent_hash = mining_ctx.parent_header.hash();
