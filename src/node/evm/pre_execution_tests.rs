@@ -6,6 +6,34 @@ mod tests {
     use crate::node::evm::pre_execution::{TURN_LENGTH_CACHE, VALIDATOR_CACHE};
     use alloy_primitives::{Address, B256};
 
+    /// Multi-block `eth_simulateV1` parent resolution (regression for bnb-chain/reth#194).
+    /// A simulated block must be resolvable by hash for the next block's parent lookup,
+    /// and hash-only seeding must not touch the canonical block-number index.
+    #[test]
+    fn test_simulated_block_parent_resolvable_by_hash_only() {
+        use crate::node::evm::util::{insert_header_to_cache_hash_only, HEADER_CACHE_READER};
+        use alloy_consensus::Header;
+
+        // High block number so it can't collide with a real cached/provider header.
+        let simulated_block_1 =
+            Header { number: 99_000_000, gas_limit: 140_000_000, ..Default::default() };
+        let block_1_hash = simulated_block_1.hash_slow();
+
+        // Unseeded: invisible to the reader (the None that aborts block 2 today).
+        assert!(HEADER_CACHE_READER.lock().unwrap().get_header_by_hash(&block_1_hash).is_none());
+
+        // Seed by hash, as BscBlockBuilder does before block 2 pre-executes.
+        insert_header_to_cache_hash_only(simulated_block_1.clone(), block_1_hash);
+
+        let resolved = HEADER_CACHE_READER.lock().unwrap().get_header_by_hash(&block_1_hash);
+        assert_eq!(resolved.map(|h| h.number), Some(simulated_block_1.number));
+
+        // Hash-only seeding must leave the canonical block-number index untouched.
+        let by_number =
+            HEADER_CACHE_READER.lock().unwrap().get_header_by_number(simulated_block_1.number);
+        assert!(by_number.is_none());
+    }
+
     /// Test validator cache basic operations
     #[test]
     fn test_validator_cache_insert_and_get() {

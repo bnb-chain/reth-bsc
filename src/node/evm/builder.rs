@@ -88,6 +88,15 @@ where
     type Executor = BscBlockExecutor<'a, EVM, Spec, R>;
 
     fn apply_pre_execution_changes(&mut self) -> Result<(), BlockExecutionError> {
+        // Parlia pre-execution and the snapshot rebuild resolve the parent by hash via
+        // the global header reader, which only holds canonical headers. During a
+        // multi-block eth_simulateV1 the parent is the previous in-memory simulated
+        // block, so seed it here — by hash only, to leave the canonical block-number
+        // index intact. Re-seeding an already-canonical parent is a no-op.
+        crate::node::evm::util::insert_header_to_cache_hash_only(
+            self.parent.header().clone(),
+            self.parent.hash(),
+        );
         self.executor.apply_pre_execution_changes()
     }
 
