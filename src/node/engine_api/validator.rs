@@ -14,7 +14,7 @@ use reth::{
 };
 use reth_engine_primitives::{ExecutionPayload, PayloadValidator};
 use reth_payload_primitives::NewPayloadError;
-use reth_primitives::{RecoveredBlock, SealedBlock};
+use reth_primitives_traits::{RecoveredBlock, SealedBlock};
 use reth_primitives_traits::Block;
 use reth_trie_common::HashedPostState;
 use serde::{Deserialize, Serialize};
@@ -139,6 +139,14 @@ impl ExecutionPayload for BscExecutionData {
 
     fn gas_used(&self) -> u64 {
         self.block.header.gas_used()
+    }
+
+    fn gas_limit(&self) -> u64 {
+        self.block.header.gas_limit()
+    }
+
+    fn slot_number(&self) -> Option<u64> {
+        None
     }
 
     fn transaction_count(&self) -> usize {

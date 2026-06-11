@@ -17,7 +17,7 @@ use crate::{
 use alloy_consensus::{Header, TxReceipt};
 use alloy_eips::Encodable2718;
 use alloy_primitives::{Bytes, B256};
-use alloy_rpc_types::engine::{ForkchoiceState, PayloadStatusEnum};
+use alloy_rpc_types_engine::{ForkchoiceState, PayloadStatusEnum};
 use reth::{
     api::FullNodeTypes,
     beacon_consensus::EthBeaconConsensus,
@@ -32,8 +32,7 @@ use reth::{
 use reth_chainspec::EthChainSpec;
 use reth_engine_primitives::ConsensusEngineHandle;
 use reth_ethereum_primitives::Receipt;
-use reth_payload_primitives::EngineApiMessageVersion;
-use reth_primitives::{gas_spent_by_transactions, GotExpected};
+use reth_primitives_traits::{receipt::gas_spent_by_transactions, GotExpected};
 use reth_primitives_traits::constants::{GAS_LIMIT_BOUND_DIVISOR, MINIMUM_GAS_LIMIT};
 use reth_provider::{BlockNumReader, HeaderProvider};
 use std::sync::Arc;
@@ -87,10 +86,10 @@ fn validate_bsc_gas_limit_against_parent<ChainSpec: BscHardforks>(
 ) -> Result<(), ConsensusError> {
     // Keep parity with go-bsc's Parlia checks.
     if header.gas_limit > GAS_LIMIT_CAPACITY {
-        return Err(ConsensusError::Other(format!(
+        return Err(ConsensusError::Other(Arc::new(std::io::Error::other(format!(
             "invalid gasLimit: have {}, max {}",
             header.gas_limit, GAS_LIMIT_CAPACITY
-        )));
+        )))));
     }
 
     if header.gas_used > header.gas_limit {
@@ -110,12 +109,12 @@ fn validate_bsc_gas_limit_against_parent<ChainSpec: BscHardforks>(
     let limit = parent.gas_limit / bound_divisor;
 
     if diff >= limit || header.gas_limit < MINIMUM_GAS_LIMIT {
-        return Err(ConsensusError::Other(format!(
+        return Err(ConsensusError::Other(Arc::new(std::io::Error::other(format!(
             "invalid gas limit: have {}, want {} += {}",
             header.gas_limit,
             parent.gas_limit,
             limit.saturating_sub(1)
-        )));
+        )))));
     }
 
     Ok(())
@@ -375,15 +374,15 @@ mod tests {
         fn sealed_header(
             &self,
             _number: u64,
-        ) -> reth_provider::ProviderResult<Option<reth_primitives::SealedHeader<Self::Header>>> {
+        ) -> reth_provider::ProviderResult<Option<reth_primitives_traits::SealedHeader<Self::Header>>> {
             Ok(None)
         }
 
         fn sealed_headers_while(
             &self,
             _range: impl core::ops::RangeBounds<u64>,
-            _predicate: impl FnMut(&reth_primitives::SealedHeader<Self::Header>) -> bool,
-        ) -> reth_provider::ProviderResult<Vec<reth_primitives::SealedHeader<Self::Header>>> {
+            _predicate: impl FnMut(&reth_primitives_traits::SealedHeader<Self::Header>) -> bool,
+        ) -> reth_provider::ProviderResult<Vec<reth_primitives_traits::SealedHeader<Self::Header>>> {
             Ok(Vec::new())
         }
     }
@@ -1256,7 +1255,7 @@ where
 
         match self
             .engine_handle
-            .fork_choice_updated(state, None, EngineApiMessageVersion::default())
+            .fork_choice_updated(state, None)
             .await
         {
             Ok(response) => match response.payload_status.status {

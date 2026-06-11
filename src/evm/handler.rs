@@ -17,13 +17,13 @@ use revm::{
         transaction::TransactionType,
         Cfg, ContextError, ContextTr, LocalContextTr, Transaction,
     },
-    context_interface::{transaction::eip7702::AuthorizationTr, Block, JournalTr},
+    context_interface::{result::ResultGas, transaction::eip7702::AuthorizationTr, Block, JournalTr},
     handler::{EthFrame, EvmTr, FrameResult, Handler, MainnetHandler},
     inspector::{Inspector, InspectorHandler},
     interpreter::{interpreter::EthInterpreter, Host, InitialAndFloorGas, SuccessOrHalt},
     primitives::hardfork::SpecId,
 };
-use revm_context_interface::journaled_state::account::JournaledAccountTr;
+use revm::context_interface::journaled_state::account::JournaledAccountTr;
 
 use crate::consensus::SYSTEM_ADDRESS;
 pub struct BscHandler<DB: revm::Database, INSP> {
@@ -79,7 +79,7 @@ impl<DB: Database, INSP> Handler for BscHandler<DB, INSP> {
     // https://github.com/bluealloy/revm/blob/df467931c4b1b8b620ff2cb9f62501c7abc3ea03/crates/handler/src/pre_execution.rs#L186
     // with slight modifications to support BSC specific validation.
     // https://github.com/bnb-chain/bsc/blob/develop/core/state_transition.go#L593
-    fn apply_eip7702_auth_list(&self, evm: &mut Self::Evm) -> Result<u64, Self::Error> {
+    fn apply_eip7702_auth_list(&self, evm: &mut Self::Evm, _init_and_floor_gas: &mut InitialAndFloorGas) -> Result<u64, Self::Error> {
         let ctx = evm.ctx_ref();
         let tx = ctx.tx();
 
@@ -204,7 +204,7 @@ impl<DB: Database, INSP> Handler for BscHandler<DB, INSP> {
         ));
 
         let res = if is_system_tx {
-            Ok(InitialAndFloorGas { initial_gas: 0, floor_gas: 0 })
+            Ok(InitialAndFloorGas::new(0, 0))
         } else {
             self.mainnet.validate_initial_tx_gas(evm)
         };
@@ -231,7 +231,7 @@ impl<DB: Database, INSP> Handler for BscHandler<DB, INSP> {
 
         let effective_gas_price = ctx.effective_gas_price();
         let gas = exec_result.gas();
-        let mut tx_fee = U256::from(gas.spent() - gas.refunded() as u64) * effective_gas_price;
+        let mut tx_fee = U256::from(gas.spent_sub_refunded()) * effective_gas_price;
 
         // EIP-4844
         let is_cancun = SpecId::from(*ctx.cfg().spec()).is_enabled_in(SpecId::CANCUN);
@@ -249,6 +249,7 @@ impl<DB: Database, INSP> Handler for BscHandler<DB, INSP> {
         &mut self,
         evm: &mut Self::Evm,
         result: FrameResult,
+        mut result_gas: ResultGas,
     ) -> Result<ExecutionResult<Self::HaltReason>, Self::Error> {
         // Ensure we always pop the trace context, even on early returns.
         struct PrecompileTracePopGuard;
@@ -265,15 +266,12 @@ impl<DB: Database, INSP> Handler for BscHandler<DB, INSP> {
             Ok(_) => (),
         }
 
-        // used gas with refund calculated.
-        let raw_gas_refunded = result.gas().refunded() as u64;
-        let raw_gas_spent = result.gas().spent();
-        let is_system_tx = {
-            let ctx = evm.ctx_ref();
-            ctx.tx().is_system_transaction
-        };
-        let gas_refunded = if is_system_tx { 0 } else { raw_gas_refunded };
-        let final_gas_used = raw_gas_spent - gas_refunded;
+        // System transactions never get a gas refund in BSC.
+        let is_system_tx = evm.ctx_ref().tx().is_system_transaction;
+        if is_system_tx {
+            result_gas.set_refunded(0);
+        }
+
         let output = result.output();
         let instruction_result = result.into_interpreter_result();
 
@@ -283,16 +281,15 @@ impl<DB: Database, INSP> Handler for BscHandler<DB, INSP> {
         let result = match SuccessOrHalt::from(instruction_result.result) {
             SuccessOrHalt::Success(reason) => ExecutionResult::Success {
                 reason,
-                gas_used: final_gas_used,
-                gas_refunded,
+                gas: result_gas,
                 logs,
                 output,
             },
             SuccessOrHalt::Revert => {
-                ExecutionResult::Revert { gas_used: final_gas_used, output: output.into_data() }
+                ExecutionResult::Revert { gas: result_gas, logs, output: output.into_data() }
             }
             SuccessOrHalt::Halt(reason) => {
-                ExecutionResult::Halt { reason, gas_used: final_gas_used }
+                ExecutionResult::Halt { reason, gas: result_gas, logs }
             }
             // Only two internal return flags.
             flag @ (SuccessOrHalt::FatalExternalError | SuccessOrHalt::Internal(_)) => {

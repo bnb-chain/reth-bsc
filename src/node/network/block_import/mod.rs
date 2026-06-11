@@ -4,7 +4,7 @@ use reth_engine_primitives::EngineTypes;
 use reth_network::import::{BlockImport, BlockImportOutcome, NewBlockEvent};
 use reth_network_peers::PeerId;
 use reth_payload_primitives::{BuiltPayload, PayloadTypes};
-use reth_primitives::NodePrimitives;
+use reth_primitives_traits::NodePrimitives;
 use service::{BlockMsg, ImportEvent, Outcome};
 use std::{
     fmt,
@@ -15,6 +15,7 @@ use crate::node::network::BscNewBlock;
 
 pub mod handle;
 pub mod service;
+pub(crate) mod fork_recover;
 
 #[derive(Debug)]
 pub struct BscBlockImport {

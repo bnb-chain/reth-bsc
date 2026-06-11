@@ -8,8 +8,6 @@ use alloy_rpc_types_engine::{ForkchoiceState, PayloadStatusEnum};
 #[cfg(feature = "bench-test")]
 use jsonrpsee_types::ErrorObjectOwned;
 #[cfg(feature = "bench-test")]
-use reth_payload_primitives::EngineApiMessageVersion;
-#[cfg(feature = "bench-test")]
 use reth_node_ethereum::engine::EthPayloadAttributes;
 
 
@@ -68,7 +66,6 @@ impl IntoEngineApiRpcModule for BscEngineApi {
                             .fork_choice_updated(
                                 forkchoice_state,
                                 payload_attrs,
-                                EngineApiMessageVersion::V1,
                             )
                             .await
                         {

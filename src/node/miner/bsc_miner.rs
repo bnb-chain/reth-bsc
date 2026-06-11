@@ -2,7 +2,7 @@ use crate::node::miner::bid_simulator::{BidRuntime, BidSimulator};
 use crate::node::miner::payload::BscBuildArguments;
 use crate::{
     chainspec::BscChainSpec,
-    consensus::parlia::{provider::SnapshotProvider, vote_pool, Parlia},
+    consensus::parlia::{provider::SnapshotProvider, Parlia},
     metrics::BscConsensusMetrics,
     node::{
         engine::BscBuiltPayload,
@@ -33,7 +33,8 @@ use reth_chainspec::EthChainSpec;
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
 use reth_network::message::NewBlockMessage;
 use reth_payload_primitives::BuiltPayload;
-use reth_primitives::{SealedHeader, TransactionSigned};
+use reth_primitives_traits::SealedHeader;
+use reth_ethereum_primitives::TransactionSigned;
 use reth_primitives_traits::BlockBody;
 use reth_provider::{
     BlockNumReader, CanonStateNotification, CanonStateSubscriptions, HeaderProvider,
@@ -41,8 +42,8 @@ use reth_provider::{
 use reth_revm::cancelled::ManualCancel;
 use reth_tasks::TaskExecutor;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_stream::StreamExt;
@@ -51,23 +52,17 @@ use tracing::{debug, error, info, trace, warn};
 /// Maximum number of recently mined blocks to track for double signing prevention
 const RECENT_MINED_BLOCKS_CACHE_SIZE: usize = 100;
 
-/// After this many seconds of `is_syncing() == true` with no canonical events, allow mining
-/// anyway. This breaks the deadlock that occurs when all validators restart simultaneously:
-/// no one produces blocks → no FCU → is_syncing never clears → no mining → deadlock.
-/// 5s ≈ 11 Fermi slots (450 ms each), enough time for a peer to send FCU if any are running.
-const SYNC_GATE_TIMEOUT_SECS: u64 = 5;
-
-/// Tracks when the miner first encountered the sync gate. Used for timeout-based deadlock
-/// recovery when all validators restart simultaneously.
-static SYNC_GATE_FIRST_HIT: OnceLock<Instant> = OnceLock::new();
-
 #[derive(Clone, Debug)]
 pub struct MiningContext {
-    pub header: Option<reth_primitives::Header>, // tmp header for payload building.
-    pub parent_header: reth_primitives::SealedHeader,
+    pub header: Option<alloy_consensus::Header>, // tmp header for payload building.
+    pub parent_header: reth_primitives_traits::SealedHeader,
     pub parent_snapshot: Arc<crate::consensus::parlia::snapshot::Snapshot>,
     pub is_inturn: bool,
     pub cached_reads: Option<reth_revm::cached::CachedReads>,
+    /// Block timestamp in milliseconds, computed via `block_time_for_ramanujan_fork`.
+    pub block_timestamp_ms: u64,
+    /// End timestamp of the mining job (UNIX epoch ms), computed via `delay_for_ramanujan_fork`.
+    pub end_mining_timestamp_ms: u128,
 }
 
 #[derive(Clone)]
@@ -88,6 +83,31 @@ pub struct NewWorkWorker<Provider> {
     /// Hash of the tip block for which mining was last triggered, used to suppress
     /// periodic-tick retries when no new canonical head has arrived.
     last_triggered_tip: Option<alloy_primitives::B256>,
+}
+
+/// Skip mining when isolated (no peers or network handle not yet installed) to avoid
+/// producing a small fork-chain that peers do not know about after reconnect.
+fn is_network_ready_to_mine(tip_number: u64) -> bool {
+    let Some(network) = crate::shared::get_network_handle() else {
+        debug!(
+            target: "bsc::miner",
+            tip_number,
+            "Skip mining due to network handle not yet available"
+        );
+        return false;
+    };
+
+    use reth_network::PeersInfo;
+    if network.num_connected_peers() == 0 {
+        debug!(
+            target: "bsc::miner",
+            tip_number,
+            "Skip mining due to no peers connected"
+        );
+        return false;
+    }
+
+    true
 }
 
 impl<Provider> NewWorkWorker<Provider>
@@ -227,10 +247,6 @@ where
                     }
 
                     let tip_header = tip.clone_sealed_header();
-                    // Prune old votes from the vote pool based on the new block number
-                    let block_number =
-                        self.provider.last_block_number().ok().unwrap_or(tip_header.number());
-                    vote_pool::prune(block_number);
 
                     // Produce and broadcast a local vote for this new canonical head, if eligible
                     if let Some(sp) = crate::shared::get_snapshot_provider() {
@@ -384,7 +400,7 @@ where
         }
     }
 
-    fn get_tip_header_at_startup(&self) -> Option<reth_primitives::SealedHeader> {
+    fn get_tip_header_at_startup(&self) -> Option<reth_primitives_traits::SealedHeader> {
         let best_number = self.provider.best_block_number().ok()?;
         let tip_header = self.provider.sealed_header(best_number).ok()??;
         Some(tip_header)
@@ -435,31 +451,8 @@ where
             return;
         }
 
-        // Gate mining on live sync: skip if the node is still backfill-syncing.
-        // Exception: if all validators restart simultaneously, is_syncing() never clears
-        // because no FCU arrives. After SYNC_GATE_TIMEOUT_SECS we allow mining to break
-        // the deadlock.
-        if let Some(network) = crate::shared::get_network_handle() {
-            use reth_network_p2p::sync::SyncStateProvider;
-            if network.is_syncing() {
-                let first_hit = SYNC_GATE_FIRST_HIT.get_or_init(Instant::now);
-                let elapsed = first_hit.elapsed();
-                if elapsed < Duration::from_secs(SYNC_GATE_TIMEOUT_SECS) {
-                    debug!(
-                        target: "bsc::miner",
-                        tip_number = tip.number(),
-                        elapsed_secs = elapsed.as_secs(),
-                        "Skip mining: node is syncing (backfill active)"
-                    );
-                    return;
-                }
-                warn!(
-                    target: "bsc::miner",
-                    tip_number = tip.number(),
-                    elapsed_secs = elapsed.as_secs(),
-                    "Sync gate timeout reached, allowing mining to break potential all-validators-restart deadlock"
-                );
-            }
+        if !is_network_ready_to_mine(tip.number()) {
+            return;
         }
 
         let parent_header = match self.provider.sealed_header_by_hash(tip.hash()) {
@@ -541,6 +534,8 @@ where
             parent_snapshot: Arc::new(parent_snapshot),
             is_inturn,
             cached_reads: self.maybe_pre_cached(parent_hash),
+            block_timestamp_ms: 0,
+            end_mining_timestamp_ms: 0,
         };
 
         debug!("Queuing mining context, next_block: {}", tip.number() + 1);
@@ -566,6 +561,7 @@ pub struct MainWorkWorker<Pool, Provider> {
     simulator: Arc<BidSimulator<Provider, Pool>>, // No outer RwLock, each map has its own lock
     desired_gas_limit: u64,
     desired_min_gas_tip: u128,
+    task_executor: reth_tasks::TaskExecutor,
 }
 
 impl<Pool, Provider> MainWorkWorker<Pool, Provider>
@@ -594,6 +590,7 @@ where
         payload_tx: mpsc::UnboundedSender<SubmitContext>,
         desired_gas_limit: u64,
         desired_min_gas_tip: u128,
+        task_executor: reth_tasks::TaskExecutor,
     ) -> Self {
         Self {
             pool,
@@ -608,6 +605,7 @@ where
             payload_job_join_set: JoinSet::new(),
             desired_gas_limit,
             desired_min_gas_tip,
+            task_executor,
         }
     }
 
@@ -721,16 +719,27 @@ where
             self.chain_spec.clone(),
             self.parlia.clone(),
             mining_ctx.clone(),
+            self.task_executor.clone(),
         );
         let build_args = BscBuildArguments {
             cached_reads: mining_ctx.cached_reads.clone().unwrap_or_default(),
-            config: PayloadConfig::new(Arc::new(mining_ctx.parent_header.clone()), attributes),
+            config: PayloadConfig::new(Arc::new(mining_ctx.parent_header.clone()), attributes, alloy_rpc_types_engine::PayloadId::new([0u8; 8])),
             cancel: ManualCancel::default(),
             trace_id: crate::node::miner::payload::generate_trace_id(),
             min_gas_tip: crate::shared::get_miner_gas_tip()
                 .map(|v| v as u128)
                 .unwrap_or(self.desired_min_gas_tip),
             parent_difflayers: None, // populated once at job start via fetch_triedb_difflayers
+            // Filled in by BscPayloadJob::start when sparse-trie state-root is enabled
+            // and the engine has registered a spawner. Falls back to legacy path when None.
+            state_root_precomputed: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            trie_handle: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            // R2: bound the sparse-trie state_root() wait to this slot so an in-turn
+            // block never blocks past its deadline (then falls back to sync root).
+            state_root_deadline_ms: Some(
+                (mining_ctx.end_mining_timestamp_ms as u64)
+                    .saturating_sub(crate::node::miner::payload::STATE_ROOT_WAIT_MARGIN_MS),
+            ),
         };
 
         let parent_hash = mining_ctx.parent_header.hash();
@@ -1277,6 +1286,7 @@ where
             snapshot_provider.clone(),
             mining_config.validator_commission.unwrap_or(100),
             mining_config.greedy_merge,
+            task_executor.clone(),
         ));
         let main_work_worker = MainWorkWorker::new(
             validator_address,
@@ -1289,6 +1299,7 @@ where
             payload_tx,
             desired_gas_limit,
             desired_min_gas_tip,
+            task_executor.clone(),
         );
 
         let result_work_worker = ResultWorkWorker::new(
@@ -1323,10 +1334,10 @@ where
     }
 
     fn spawn_workers(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.task_executor.spawn_critical("mev_work_worker", self.mev_work_worker.run());
-        self.task_executor.spawn_critical("new_work_worker", self.new_work_worker.run());
-        self.task_executor.spawn_critical("main_work_worker", self.main_work_worker.run());
-        self.task_executor.spawn_critical("result_work_worker", self.result_work_worker.run());
+        self.task_executor.spawn_critical_task("mev_work_worker", self.mev_work_worker.run());
+        self.task_executor.spawn_critical_task("new_work_worker", self.new_work_worker.run());
+        self.task_executor.spawn_critical_task("main_work_worker", self.main_work_worker.run());
+        self.task_executor.spawn_critical_task("result_work_worker", self.result_work_worker.run());
         info!("Succeed to start mining, address: {}", self.validator_address);
         Ok(())
     }

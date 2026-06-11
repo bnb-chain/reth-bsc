@@ -22,7 +22,8 @@ use reth_chain_state::ExecutedBlock;
 use reth_evm::ConfigureEvm;
 use reth_payload_builder_primitives::Events;
 use reth_payload_primitives::BuiltPayload;
-use reth_primitives::{SealedBlock, TransactionSigned};
+use reth_primitives_traits::SealedBlock;
+use reth_ethereum_primitives::TransactionSigned;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
@@ -110,6 +111,146 @@ where
                 MiningConfig::from_env()
             };
 
+        // Register the sparse-trie state-root spawner, if enabled.
+        //
+        // We construct a long-lived `PayloadProcessor` keyed to a fresh `BscEvmConfig`
+        // (built from chain_spec — same source as the rest of the BSC pipeline). For
+        // each build job, the registered closure constructs a one-shot
+        // `OverlayStateProviderFactory` anchored at the parent block hash and calls
+        // `spawn_state_root` to get a `StateRootHandle`.
+        //
+        // The sparse-trie PayloadProcessor is configured from the engine-launch
+        // `TreeConfig` built from the `--engine.*` CLI flags via
+        // `ctx.config().engine.tree_config()`, so miner-side proof-worker counts /
+        // cache sizes are CLI-tunable and match the import (engine) path.
+        if mining_config.use_sparse_trie_state_root
+            && !rust_eth_triedb::triedb_manager::is_triedb_active()
+        {
+            use alloy_consensus::BlockHeader;
+            use reth_chain_state::LazyOverlay;
+            use reth_engine_tree::tree::{
+                payload_processor::PayloadProcessor, precompile_cache::PrecompileCacheMap,
+            };
+            use reth_provider::providers::{OverlayBuilder, OverlayStateProviderFactory};
+            use reth_tasks::{RuntimeBuilder, RuntimeConfig, TokioConfig};
+            use reth_trie_db::ChangesetCache;
+
+            let chain_spec = Arc::new(ctx.config().chain.clone().as_ref().clone());
+            let bsc_evm_config = crate::node::evm::config::BscEvmConfig::new(chain_spec);
+            let tree_config = Arc::new(ctx.config().engine.tree_config());
+            tracing::debug!(
+                target: "bsc::miner",
+                ?tree_config,
+                "Miner sparse-trie PayloadProcessor TreeConfig (from --engine.* CLI flags)"
+            );
+            let provider = ctx.provider().clone();
+
+            // R1: share the engine's `Runtime` (same rayon proof pools) instead of building a
+            // second, competing set. The engine publishes its Runtime via
+            // `reth_tasks::set_shared_engine_runtime` in `TreePayloadValidator::new`; we read it
+            // here. The `PayloadProcessor` is built lazily on first use (then cached) because the
+            // engine runtime is published during engine launch, which can run *after* this
+            // service builder. If it is still unavailable on first use we fall back to a
+            // dedicated Runtime (degraded: pools not shared) so block production never stalls.
+            let tokio_handle = ctx.task_executor().handle().clone();
+            let tree_config_for_closure = tree_config.clone();
+            let pp_cell: std::sync::OnceLock<
+                std::sync::Arc<PayloadProcessor<crate::node::evm::config::BscEvmConfig>>,
+            > = std::sync::OnceLock::new();
+            let spawn_fn: crate::shared::SparseTrieSpawnFn = std::sync::Arc::new(
+                move |parent_hash: alloy_primitives::B256,
+                      parent_state_root: alloy_primitives::B256| {
+                    // Walk the in-memory canonical chain to find the on-disk anchor.
+                    // Without this, proof workers fail with `BlockHashNotFound` whenever
+                    // the parent hasn't been persisted yet (the common case during fast
+                    // block production with last_persisted_number lagging head).
+                    //
+                    // Mirrors `payload_validator::get_parent_lazy_overlay` from upstream
+                    // reth, which the engine's own PayloadProcessor uses.
+                    //
+                    // `canonical_in_memory_state` is published from main.rs after launch
+                    // (it's only reachable on the concrete BlockchainProvider). If for
+                    // some reason it's not yet set (race during early startup), fall back
+                    // to anchoring at parent_hash directly — proof workers will fail and
+                    // builder will use the synchronous state_root_with_updates path.
+                    let (anchor_hash, lazy_overlay) = if let Some(cim) =
+                        crate::shared::get_canonical_in_memory_state()
+                    {
+                        match cim.state_by_hash(parent_hash) {
+                            Some(state) => {
+                                // chain() yields newest-to-oldest including self, exactly
+                                // the order LazyOverlay::new requires.
+                                let blocks: Vec<ExecutedBlock<crate::BscPrimitives>> =
+                                    state.chain().map(|bs| bs.block()).collect();
+                                // Anchor = parent of the oldest in-memory block (= on-disk tip).
+                                let anchor = blocks
+                                    .last()
+                                    .map(|b| b.recovered_block().parent_hash())
+                                    .unwrap_or(parent_hash);
+                                (anchor, Some(LazyOverlay::new(blocks)))
+                            }
+                            None => {
+                                // Parent already persisted — anchor directly, no overlay.
+                                (parent_hash, None)
+                            }
+                        }
+                    } else {
+                        (parent_hash, None)
+                    };
+
+                    let overlay_builder = OverlayBuilder::<crate::BscPrimitives>::new(
+                        anchor_hash,
+                        ChangesetCache::default(),
+                    )
+                    .with_lazy_overlay(lazy_overlay);
+
+                    let overlay_factory = OverlayStateProviderFactory::new(
+                        provider.clone(),
+                        overlay_builder,
+                    );
+                    // R1: lazily build (once) the PayloadProcessor on the engine's shared
+                    // Runtime, falling back to a dedicated one if not yet published.
+                    let payload_processor = pp_cell.get_or_init(|| {
+                        let runtime = reth_tasks::shared_engine_runtime().unwrap_or_else(|| {
+                            tracing::warn!(
+                                target: "bsc::miner",
+                                "engine Runtime not yet published; building a dedicated sparse-trie \
+                                 Runtime (proof pools NOT shared with the engine this run)"
+                            );
+                            RuntimeBuilder::new(RuntimeConfig::default().with_tokio(
+                                TokioConfig::existing_handle(tokio_handle.clone()),
+                            ))
+                            .build()
+                            .expect("failed to build fallback sparse-trie Runtime")
+                        });
+                        std::sync::Arc::new(PayloadProcessor::new(
+                            runtime,
+                            bsc_evm_config.clone(),
+                            tree_config_for_closure.as_ref(),
+                            PrecompileCacheMap::default(),
+                        ))
+                    });
+                    Some(payload_processor.spawn_state_root(
+                        overlay_factory,
+                        parent_state_root,
+                        false, // halve_workers
+                        tree_config_for_closure.as_ref(),
+                    ))
+                },
+            );
+
+            if crate::shared::set_sparse_trie_spawn_fn(spawn_fn).is_err() {
+                tracing::warn!(
+                    "Sparse-trie spawner already registered, keeping existing one"
+                );
+            } else {
+                info!(
+                    "Sparse-trie state-root spawner registered \
+                     (use_sparse_trie_state_root=true, triedb=inactive)"
+                );
+            }
+        }
+
         // Skip mining setup if disabled
         if !mining_config.is_mining_enabled() {
             info!("Mining is disabled in configuration");
@@ -122,7 +263,7 @@ where
             let chain_spec_clone = Arc::new(ctx.config().chain.clone().as_ref().clone());
             let task_executor_clone = ctx.task_executor().clone();
 
-            ctx.task_executor().spawn_critical("bsc-miner-initializer", async move {
+            ctx.task_executor().spawn_critical_task("bsc-miner-initializer", async move {
                 info!("Waiting for consensus module to initialize snapshot provider...");
                 let mut attempts = 0;
                 let snapshot_provider = loop {
@@ -164,7 +305,7 @@ where
         let _ = crate::shared::set_payload_events_tx(events_tx.clone());
 
         // Handle payload service commands (keep minimal compatibility but with shared events channel)
-        ctx.task_executor().spawn_critical("payload-service-handler", async move {
+        ctx.task_executor().spawn_critical_task("payload-service-handler", async move {
             while let Some(message) = rx.recv().await {
                 match message {
                     PayloadServiceCommand::Subscribe(tx) => {

@@ -2,7 +2,7 @@ use alloy_eips::eip7910::{EthConfig, EthForkConfig, SystemContract};
 use jsonrpsee::core::RpcResult;
 use reth_chainspec::{ChainSpecProvider, EthereumHardforks, Hardforks};
 use reth_evm::ConfigureEvm;
-use reth_primitives::NodePrimitives;
+use reth_primitives_traits::NodePrimitives;
 use reth_primitives_traits::header::HeaderMut;
 use reth_provider::BlockReaderIdExt;
 use reth_rpc_eth_api::helpers::config::{EthConfigApiServer, EthConfigHandler};

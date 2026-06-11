@@ -70,36 +70,36 @@ impl Decodable for BlocksByRangePacket {
     }
 }
 
-/// Build a best-effort response for a GetBlocksByRange request using only headers if needed.
-///
-/// Note: This currently constructs blocks with empty bodies if full data is not available
-/// via global providers. It prioritizes `start_block_hash` if non-zero, otherwise uses
-/// `start_block_height`. The traversal follows parent hashes up to `count` blocks.
-pub fn build_blocks_by_range_response(req: &GetBlocksByRangePacket) -> BlocksByRangePacket {
-    use crate::shared::{get_cached_block_by_hash, get_cached_block_by_number};
-
+/// Pure variant of [`build_blocks_by_range_response`] parameterised by a block
+/// lookup. `lookup(hash, number_opt)` returns `Some(block)` when the block is
+/// available. The first call receives `number_opt = Some(start_block_height)`
+/// only when `start_block_hash == B256::ZERO`; subsequent hops always pass the
+/// parent hash with `number_opt = None`. Exposed `pub(crate)` for testing.
+pub(crate) fn build_blocks_by_range_response_with<F>(
+    req: &GetBlocksByRangePacket,
+    mut lookup: F,
+) -> BlocksByRangePacket
+where
+    F: FnMut(&B256, Option<u64>) -> Option<BscBlock>,
+{
     let mut blocks: Vec<BscBlock> = Vec::new();
 
-    // Resolve starting block: only include full blocks (cached or provider). If not found, return empty.
     let mut current_block: Option<BscBlock> = if req.start_block_hash != B256::ZERO {
-        get_cached_block_by_hash(&req.start_block_hash)
+        lookup(&req.start_block_hash, None)
     } else {
-        get_cached_block_by_number(req.start_block_height)
+        lookup(&B256::ZERO, Some(req.start_block_height))
     };
 
-    // Walk back by parents up to count
     let mut remaining = req.count.min(MAX_REQUEST_RANGE_BLOCKS_COUNT);
     while let (Some(block), r) = (current_block.clone(), remaining) {
         if r == 0 {
             break;
         }
-        // Push the current full block
         blocks.push(block.clone());
 
-        // Prepare next parent
         let parent_hash = block.header.parent_hash;
         current_block =
-            if parent_hash != B256::ZERO { get_cached_block_by_hash(&parent_hash) } else { None };
+            if parent_hash != B256::ZERO { lookup(&parent_hash, None) } else { None };
         remaining -= 1;
     }
 
@@ -115,6 +115,23 @@ pub fn build_blocks_by_range_response(req: &GetBlocksByRangePacket) -> BlocksByR
     }
 
     BlocksByRangePacket { request_id: req.request_id, blocks }
+}
+
+/// Build a response for a `GetBlocksByRange` request using the BODY_CACHE
+/// first, then the installed [`crate::shared::FullBlockProvider`]
+/// (DB / canonical state).
+pub fn build_blocks_by_range_response(req: &GetBlocksByRangePacket) -> BlocksByRangePacket {
+    use crate::shared::{
+        get_cached_block_by_hash, get_cached_block_by_number, get_full_block_provider,
+    };
+
+    let provider = get_full_block_provider();
+    build_blocks_by_range_response_with(req, |hash, number_opt| match number_opt {
+        Some(num) => get_cached_block_by_number(num)
+            .or_else(|| provider.as_ref().and_then(|p| p.block_by_number(num))),
+        None => get_cached_block_by_hash(hash)
+            .or_else(|| provider.as_ref().and_then(|p| p.block_by_hash(hash))),
+    })
 }
 
 // === RLP inner helpers (without message-id prefix) ===
@@ -188,8 +205,9 @@ mod tests {
     use crate::BscBlockBody;
     use alloy_consensus::Header;
     use alloy_rlp::RlpDecodable;
-    use reth_primitives::TransactionSigned;
+    use reth_ethereum_primitives::TransactionSigned;
     use bytes::BytesMut;
+    use std::collections::HashMap;
 
     #[test]
     fn test_get_blocks_by_range_codec_roundtrip() {
@@ -374,5 +392,96 @@ mod tests {
         // Parent missing => only child should be included
         assert_eq!(resp.blocks.len(), 1);
         assert_eq!(resp.blocks[0].header.hash_slow(), child_hash);
+    }
+
+    fn mk_block_t3(number: u64, parent: B256) -> BscBlock {
+        BscBlock {
+            header: Header { number, parent_hash: parent, ..Default::default() },
+            body: BscBlockBody {
+                inner: reth_ethereum_primitives::BlockBody::default(),
+                sidecars: None,
+            },
+        }
+    }
+
+    #[test]
+    fn build_response_falls_back_to_provider_lookup_on_cache_miss() {
+        // Simulate a 4-block parent chain only available via the "provider" map.
+        let b3 = mk_block_t3(3, B256::ZERO);
+        let b2 = mk_block_t3(2, b3.header.hash_slow());
+        let b1 = mk_block_t3(1, b2.header.hash_slow());
+        let b0 = mk_block_t3(0, b1.header.hash_slow());
+
+        let mut by_hash: HashMap<B256, BscBlock> = HashMap::new();
+        by_hash.insert(b0.header.hash_slow(), b0.clone());
+        by_hash.insert(b1.header.hash_slow(), b1.clone());
+        by_hash.insert(b2.header.hash_slow(), b2.clone());
+        by_hash.insert(b3.header.hash_slow(), b3.clone());
+
+        let req = GetBlocksByRangePacket {
+            request_id: 42,
+            start_block_height: 0,
+            start_block_hash: b0.header.hash_slow(),
+            count: 4,
+        };
+        let resp =
+            build_blocks_by_range_response_with(&req, |h, _| by_hash.get(h).cloned());
+
+        assert_eq!(resp.request_id, 42);
+        assert_eq!(resp.blocks.len(), 4, "should walk the full chain via provider fallback");
+        assert_eq!(resp.blocks[0].header.number, 0);
+        assert_eq!(resp.blocks[3].header.number, 3);
+    }
+
+    #[test]
+    fn build_response_returns_empty_when_start_block_unknown() {
+        let req = GetBlocksByRangePacket {
+            request_id: 7,
+            start_block_height: 0,
+            start_block_hash: B256::repeat_byte(0xaa),
+            count: 4,
+        };
+        let resp = build_blocks_by_range_response_with(&req, |_, _| None);
+        assert!(resp.blocks.is_empty());
+    }
+
+    #[test]
+    fn build_response_looks_up_by_number_when_hash_is_zero() {
+        let b0 = mk_block_t3(10, B256::ZERO);
+        let req = GetBlocksByRangePacket {
+            request_id: 9,
+            start_block_height: 10,
+            start_block_hash: B256::ZERO,
+            count: 1,
+        };
+        let b0_clone = b0.clone();
+        let resp = build_blocks_by_range_response_with(&req, move |_, n| {
+            if n == Some(10) { Some(b0_clone.clone()) } else { None }
+        });
+        assert_eq!(resp.blocks.len(), 1);
+        assert_eq!(resp.blocks[0].header.number, 10);
+    }
+
+    #[test]
+    fn build_response_returns_empty_when_cache_miss_and_no_provider_installed() {
+        // Pin the public wrapper's fallback wiring: with the broadcast cache cleared
+        // and no FullBlockProvider installed in this test process, a request for an
+        // unknown start block must return an empty response instead of walking a
+        // stale entry. Protects against future refactors dropping the
+        // get_full_block_provider() plumbing in build_blocks_by_range_response.
+        crate::shared::clear_body_cache();
+
+        let req = GetBlocksByRangePacket {
+            request_id: 99,
+            start_block_height: 0,
+            start_block_hash: B256::repeat_byte(0x55),
+            count: 4,
+        };
+        let resp = build_blocks_by_range_response(&req);
+        assert_eq!(resp.request_id, 99);
+        assert!(
+            resp.blocks.is_empty(),
+            "no cache entry + no FullBlockProvider installed must yield empty response"
+        );
     }
 }

@@ -13,6 +13,7 @@ use reth::builder::{
 };
 use reth_chainspec::{EthChainSpec, EthereumHardforks, ForkCondition, Hardforks};
 use reth_ethereum_primitives::TransactionSigned as EthTxSigned;
+use reth_evm::ConfigureEvm;
 use reth_payload_primitives::PayloadTypes;
 use reth_primitives_traits::SignedTransaction;
 use reth_primitives_traits::constants::MAX_TX_GAS_LIMIT_OSAKA;
@@ -70,6 +71,7 @@ where
     V: TransactionValidator + Send + Sync + 'static,
 {
     type Transaction = <V as TransactionValidator>::Transaction;
+    type Block = <V as TransactionValidator>::Block;
 
     async fn validate_transaction(
         &self,
@@ -109,54 +111,7 @@ where
         self.inner.validate_transaction(origin, transaction).await
     }
 
-    async fn validate_transactions(
-        &self,
-        transactions: Vec<(TransactionOrigin, Self::Transaction)>,
-    ) -> Vec<TransactionValidationOutcome<Self::Transaction>> {
-        let outcomes = self.inner.validate_transactions(transactions).await;
-        let mut mapped: Vec<TransactionValidationOutcome<Self::Transaction>> =
-            Vec::with_capacity(outcomes.len());
-        for outcome in outcomes {
-            let new_outcome: TransactionValidationOutcome<Self::Transaction> = match outcome {
-                TransactionValidationOutcome::Valid {
-                    balance,
-                    state_nonce,
-                    bytecode_hash,
-                    transaction,
-                    propagate,
-                    authorities,
-                } => {
-                    if blacklist::check_tx_basic_blacklist(
-                        transaction.transaction().sender(),
-                        transaction.transaction().to(),
-                    ) {
-                        tracing::debug!(target: "bsc::txpool", "Blacklisted transaction: {:?}", transaction.hash());
-                        TransactionValidationOutcome::Invalid(
-                            transaction.into_transaction(),
-                            InvalidPoolTransactionError::other(BlacklistedAddressError()),
-                        )
-                    } else {
-                        TransactionValidationOutcome::Valid {
-                            balance,
-                            state_nonce,
-                            bytecode_hash,
-                            transaction,
-                            propagate,
-                            authorities,
-                        }
-                    }
-                }
-                other => other,
-            };
-            mapped.push(new_outcome);
-        }
-        mapped
-    }
-
-    fn on_new_head_block<B>(&self, new_tip_block: &reth_primitives_traits::SealedBlock<B>)
-    where
-        B: reth_primitives_traits::Block,
-    {
+    fn on_new_head_block(&self, new_tip_block: &reth_primitives_traits::SealedBlock<Self::Block>) {
         if let Some(osaka_ts) = self.osaka_timestamp {
             self.osaka_activated.store(
                 new_tip_block.header().timestamp() >= osaka_ts,
@@ -172,7 +127,7 @@ where
 #[non_exhaustive]
 pub struct BscPoolBuilder;
 
-impl<Types, Node> PoolBuilder<Node> for BscPoolBuilder
+impl<Types, Node, Evm> PoolBuilder<Node, Evm> for BscPoolBuilder
 where
     Node: FullNodeTypes<Types = Types>,
     Types: NodeTypes<
@@ -183,16 +138,22 @@ where
     <Types as NodeTypes>::Payload: PayloadTypes,
     EthPooledTransaction<EthTxSigned>: reth_transaction_pool::EthPoolTransaction,
     EthPooledTransaction<EthTxSigned>: PoolTransaction,
+    Evm: ConfigureEvm<
+            Primitives: NodePrimitives<
+                BlockHeader = <<Types as NodeTypes>::Primitives as NodePrimitives>::BlockHeader,
+                Block = <<Types as NodeTypes>::Primitives as NodePrimitives>::Block,
+            >,
+        > + Clone + Send + Sync + 'static,
 {
     type Pool = Pool<
         TransactionValidationTaskExecutor<
-            BscTxValidator<EthTransactionValidator<Node::Provider, EthPooledTransaction>>,
+            BscTxValidator<EthTransactionValidator<Node::Provider, EthPooledTransaction, Evm>>,
         >,
         CoinbaseTipOrdering<EthPooledTransaction>,
         DiskFileBlobStore,
     >;
 
-    async fn build_pool(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::Pool> {
+    async fn build_pool(self, ctx: &BuilderContext<Node>, evm_config: Evm) -> eyre::Result<Self::Pool> {
         // Disable the upstream protocol base fee check (MIN_PROTOCOL_BASE_FEE = 7 wei)
         // because BSC handles min gas price dynamically via miner_setGasPrice RPC
         // and enforces it in BscTxValidator instead.
@@ -216,11 +177,14 @@ where
 
         let blob_store = create_blob_store_with_cache(ctx, blob_cache_size)?;
 
+        // Register blob store globally so the block-body serving path can
+        // look up blob sidecars by tx hash (for GetBlockBodies responses).
+        crate::shared::set_global_blob_store(std::sync::Arc::new(blob_store.clone()));
+
         // Build default Ethereum validator executor
         // BSC rejected EIP-7594 (PeerDAS), so we disable EIP-7594 sidecar support to always
         // use v0 (legacy) blob sidecars and reject v1 (EIP-7594) sidecars.
-        let validator = TransactionValidationTaskExecutor::eth_builder(ctx.provider().clone())
-            .with_head_timestamp(ctx.head().timestamp)
+        let validator = TransactionValidationTaskExecutor::eth_builder(ctx.provider().clone(), evm_config)
             .with_max_tx_input_bytes(ctx.config().txpool.max_tx_input_bytes)
             .kzg_settings(ctx.kzg_settings()?)
             .with_local_transactions_config(pool_config.local_transactions_config.clone())
