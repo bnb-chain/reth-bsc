@@ -79,6 +79,18 @@ const LRU_PROCESSED_BLOCKS_SIZE: u32 = 100;
 const PIPELINE_TRIGGER_DELTA: u64 =
     crate::node::network::block_import::fork_recover::MAX_FORK_DEPTH;
 
+/// Blocks (or hash announcements) more than this far below the canonical tip
+/// are dropped at the import-service entrance.
+///
+/// Under fast finality the finalized block trails the tip by only a few
+/// blocks, so anything this deep can never become canonical. Without this
+/// guard, fork recovery imports the stale block and engine-tree builds an
+/// overlay reverting thousands of blocks; the changeset cache cannot cover
+/// that range, so every block below its floor is recomputed from the DB while
+/// all proof-worker read transactions stay pinned until
+/// `db.read-transaction-timeout` kills them.
+const MAX_STALE_BLOCK_DISTANCE: u64 = 64;
+
 /// A service that handles bidirectional block import communication with the network.
 /// It receives new blocks from the network via `from_network` channel and sends back
 /// import outcomes via `to_network` channel.
@@ -479,10 +491,8 @@ where
         crate::node::network::bsc_protocol::registry::record_announcer(block.hash, peer_id);
 
         // Drop blocks that are far behind the canonical head early to avoid wasting
-        // resources on stale blocks from misbehaving or out-of-sync peers. Without this
-        // guard, proof workers open read transactions against cold historical trie pages,
-        // blocking until db.read-transaction-timeout (5 min default) is hit.
-        const MAX_STALE_BLOCK_DISTANCE: u64 = 64;
+        // resources on stale blocks from misbehaving or out-of-sync peers; see
+        // `MAX_STALE_BLOCK_DISTANCE`.
         if let Ok(info) = self.forkchoice_engine.provider.chain_info() {
             let block_number = block.block.0.block.header.number;
             if block_number + MAX_STALE_BLOCK_DISTANCE < info.best_number {
@@ -603,6 +613,32 @@ where
                     block_number = hash_number.number,
                     "Skipping fork recovery: head is in cooldown after recent failure"
                 );
+                continue;
+            }
+
+            // Mirror `on_new_block`'s stale guard: without it, an announcement
+            // of an ancient hash whose parent is locally known short-circuits
+            // fork recovery into a single `new_payload` for a block thousands
+            // of blocks below the tip; see `MAX_STALE_BLOCK_DISTANCE`.
+            if hash_number.number + MAX_STALE_BLOCK_DISTANCE < local_tip {
+                let gap = local_tip - hash_number.number;
+                tracing::debug!(
+                    target: "bsc::block_import",
+                    block_number = hash_number.number,
+                    block_hash = %hash_number.hash,
+                    canonical_head = local_tip,
+                    gap,
+                    peer_id = %peer_id,
+                    "Dropping stale block hash announcement far behind canonical head"
+                );
+                if let Some(net) = crate::shared::get_network_handle() {
+                    tracing::debug!(
+                        target: "bsc::peers",
+                        peer = %peer_id, gap, threshold = MAX_STALE_BLOCK_DISTANCE,
+                        "applying BadAnnouncement: stale-hash guard"
+                    );
+                    net.reputation_change(peer_id, ReputationChangeKind::BadAnnouncement);
+                }
                 continue;
             }
 
