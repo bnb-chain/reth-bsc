@@ -4,7 +4,7 @@
 use std::{sync::Arc, time::Duration};
 
 use alloy_primitives::B256;
-use alloy_rpc_types::engine::PayloadStatusEnum;
+use alloy_rpc_types_engine::PayloadStatusEnum;
 use futures::future::BoxFuture;
 use parking_lot::Mutex;
 use reth::network::cache::LruCache;
@@ -605,14 +605,14 @@ mod tests {
         fn sealed_header(
             &self,
             _number: u64,
-        ) -> Result<Option<reth_primitives::SealedHeader<Self::Header>>, ProviderError> {
+        ) -> Result<Option<reth_primitives_traits::SealedHeader<Self::Header>>, ProviderError> {
             Ok(None)
         }
         fn sealed_headers_while(
             &self,
             _range: impl core::ops::RangeBounds<u64>,
-            _predicate: impl FnMut(&reth_primitives::SealedHeader<Self::Header>) -> bool,
-        ) -> Result<Vec<reth_primitives::SealedHeader<Self::Header>>, ProviderError> {
+            _predicate: impl FnMut(&reth_primitives_traits::SealedHeader<Self::Header>) -> bool,
+        ) -> Result<Vec<reth_primitives_traits::SealedHeader<Self::Header>>, ProviderError> {
             Ok(vec![])
         }
     }

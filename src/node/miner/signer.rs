@@ -1,6 +1,6 @@
 use once_cell::sync::OnceCell;
 use std::sync::Arc;
-use reth_primitives::{Transaction, TransactionSigned};
+use reth_ethereum_primitives::{Transaction, TransactionSigned};
 // reth signing helper avoided to not materialize a B256 from secret
 use alloy_primitives::B256;
 use alloy_consensus::{SignableTransaction, Header};
@@ -128,7 +128,7 @@ mod tests {
     use alloy_consensus::Header;
     use alloy_primitives::{keccak256, Address, Bytes, TxKind, U256};
     use alloy_consensus::TxLegacy;
-    use reth_primitives::Transaction;
+    use reth_ethereum_primitives::Transaction;
     use reth_primitives_traits::SignerRecoverable;
     use secp256k1::{ecdsa::RecoverableSignature, ecdsa::RecoveryId};
 

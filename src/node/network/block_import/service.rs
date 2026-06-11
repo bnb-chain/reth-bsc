@@ -12,7 +12,7 @@ use crate::{
 use alloy_consensus::{BlockBody, Header};
 use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::{B256, U128};
-use alloy_rpc_types::engine::{ForkchoiceState, PayloadStatusEnum};
+use alloy_rpc_types_engine::{ForkchoiceState, PayloadStatusEnum};
 use futures::{future::Either, stream::FuturesUnordered, StreamExt};
 use parking_lot::RwLock;
 use reth::consensus::HeaderValidator;
@@ -32,8 +32,8 @@ use reth_network::{
 use reth_network_api::{PeerId, Peers, ReputationChangeKind};
 use reth_node_ethereum::EthEngineTypes;
 use reth_payload_builder_primitives::Events;
-use reth_payload_primitives::{BuiltPayload, EngineApiMessageVersion, PayloadTypes};
-use reth_primitives::NodePrimitives;
+use reth_payload_primitives::{BuiltPayload, PayloadTypes};
+use reth_primitives_traits::NodePrimitives;
 use reth_primitives_traits::{AlloyBlockHeader, Block};
 use reth_provider::{BlockHashReader, BlockNumReader, BlockReaderIdExt, HeaderProvider};
 use std::{
@@ -523,8 +523,7 @@ where
             return;
         }
 
-        let local_tip =
-            self.forkchoice_engine.provider.best_block_number().unwrap_or(0);
+        let local_tip = self.forkchoice_engine.provider.best_block_number().unwrap_or(0);
         let block_number = block.block.0.block.header.number;
         let delta = block_number.saturating_sub(local_tip);
         if delta > PIPELINE_TRIGGER_DELTA {
@@ -538,13 +537,7 @@ where
                 "NewBlock far ahead of local tip; routing to pipeline instead of fork_recover"
             );
             self.processed_blocks.insert(block.hash);
-            self.spawn_pipeline_trigger_fcu(
-                peer_id,
-                block.hash,
-                block_number,
-                local_tip,
-                delta,
-            );
+            self.spawn_pipeline_trigger_fcu(peer_id, block.hash, block_number, local_tip, delta);
             return;
         }
 
@@ -735,7 +728,7 @@ where
                 safe_block_hash: B256::ZERO,
                 finalized_block_hash: B256::ZERO,
             };
-            match engine.fork_choice_updated(state, None, EngineApiMessageVersion::V1).await {
+            match engine.fork_choice_updated(state, None).await {
                 Ok(ret) => tracing::info!(
                     target: "bsc::block_import",
                     %head_hash,
@@ -974,8 +967,9 @@ mod tests {
     use reth_chainspec::ChainInfo;
     use reth_engine_primitives::{BeaconEngineMessage, OnForkChoiceUpdated};
     use reth_eth_wire::NewBlock;
+    use reth_ethereum_primitives::Block;
     use reth_node_ethereum::EthEngineTypes;
-    use reth_primitives::{Block, SealedHeader};
+    use reth_primitives_traits::SealedHeader;
     use reth_provider::ProviderError;
     use schnellru::{ByLength, LruMap};
     use std::{
@@ -1391,12 +1385,7 @@ mod tests {
                         tx.send(Ok(PayloadStatus::new(responses.new_payload.clone(), None)))
                             .unwrap();
                     }
-                    BeaconEngineMessage::ForkchoiceUpdated {
-                        state: _,
-                        payload_attrs: _,
-                        version: _,
-                        tx,
-                    } => {
+                    BeaconEngineMessage::ForkchoiceUpdated { state: _, payload_attrs: _, tx } => {
                         tx.send(Ok(OnForkChoiceUpdated::valid(PayloadStatus::new(
                             responses.fcu.clone(),
                             None,
@@ -1434,12 +1423,7 @@ mod tests {
                         let _ = np_tx.send(());
                         let _ = tx.send(Ok(PayloadStatus::new(PayloadStatusEnum::Valid, None)));
                     }
-                    BeaconEngineMessage::ForkchoiceUpdated {
-                        state,
-                        payload_attrs: _,
-                        version: _,
-                        tx,
-                    } => {
+                    BeaconEngineMessage::ForkchoiceUpdated { state, payload_attrs: _, tx } => {
                         let _ = fcu_tx.send(state);
                         let _ = tx.send(Ok(OnForkChoiceUpdated::valid(PayloadStatus::new(
                             PayloadStatusEnum::Valid,

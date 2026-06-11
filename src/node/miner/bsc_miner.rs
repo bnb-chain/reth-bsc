@@ -33,7 +33,8 @@ use reth_chainspec::EthChainSpec;
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
 use reth_network::message::NewBlockMessage;
 use reth_payload_primitives::BuiltPayload;
-use reth_primitives::{SealedHeader, TransactionSigned};
+use reth_primitives_traits::SealedHeader;
+use reth_ethereum_primitives::TransactionSigned;
 use reth_primitives_traits::BlockBody;
 use reth_provider::{
     BlockNumReader, CanonStateNotification, CanonStateSubscriptions, HeaderProvider,
@@ -53,8 +54,8 @@ const RECENT_MINED_BLOCKS_CACHE_SIZE: usize = 100;
 
 #[derive(Clone, Debug)]
 pub struct MiningContext {
-    pub header: Option<reth_primitives::Header>, // tmp header for payload building.
-    pub parent_header: reth_primitives::SealedHeader,
+    pub header: Option<alloy_consensus::Header>, // tmp header for payload building.
+    pub parent_header: reth_primitives_traits::SealedHeader,
     pub parent_snapshot: Arc<crate::consensus::parlia::snapshot::Snapshot>,
     pub is_inturn: bool,
     pub cached_reads: Option<reth_revm::cached::CachedReads>,
@@ -399,7 +400,7 @@ where
         }
     }
 
-    fn get_tip_header_at_startup(&self) -> Option<reth_primitives::SealedHeader> {
+    fn get_tip_header_at_startup(&self) -> Option<reth_primitives_traits::SealedHeader> {
         let best_number = self.provider.best_block_number().ok()?;
         let tip_header = self.provider.sealed_header(best_number).ok()??;
         Some(tip_header)
@@ -560,6 +561,7 @@ pub struct MainWorkWorker<Pool, Provider> {
     simulator: Arc<BidSimulator<Provider, Pool>>, // No outer RwLock, each map has its own lock
     desired_gas_limit: u64,
     desired_min_gas_tip: u128,
+    task_executor: reth_tasks::TaskExecutor,
 }
 
 impl<Pool, Provider> MainWorkWorker<Pool, Provider>
@@ -588,6 +590,7 @@ where
         payload_tx: mpsc::UnboundedSender<SubmitContext>,
         desired_gas_limit: u64,
         desired_min_gas_tip: u128,
+        task_executor: reth_tasks::TaskExecutor,
     ) -> Self {
         Self {
             pool,
@@ -602,6 +605,7 @@ where
             payload_job_join_set: JoinSet::new(),
             desired_gas_limit,
             desired_min_gas_tip,
+            task_executor,
         }
     }
 
@@ -715,16 +719,27 @@ where
             self.chain_spec.clone(),
             self.parlia.clone(),
             mining_ctx.clone(),
+            self.task_executor.clone(),
         );
         let build_args = BscBuildArguments {
             cached_reads: mining_ctx.cached_reads.clone().unwrap_or_default(),
-            config: PayloadConfig::new(Arc::new(mining_ctx.parent_header.clone()), attributes),
+            config: PayloadConfig::new(Arc::new(mining_ctx.parent_header.clone()), attributes, alloy_rpc_types_engine::PayloadId::new([0u8; 8])),
             cancel: ManualCancel::default(),
             trace_id: crate::node::miner::payload::generate_trace_id(),
             min_gas_tip: crate::shared::get_miner_gas_tip()
                 .map(|v| v as u128)
                 .unwrap_or(self.desired_min_gas_tip),
             parent_difflayers: None, // populated once at job start via fetch_triedb_difflayers
+            // Filled in by BscPayloadJob::start when sparse-trie state-root is enabled
+            // and the engine has registered a spawner. Falls back to legacy path when None.
+            state_root_precomputed: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            trie_handle: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            // R2: bound the sparse-trie state_root() wait to this slot so an in-turn
+            // block never blocks past its deadline (then falls back to sync root).
+            state_root_deadline_ms: Some(
+                (mining_ctx.end_mining_timestamp_ms as u64)
+                    .saturating_sub(crate::node::miner::payload::STATE_ROOT_WAIT_MARGIN_MS),
+            ),
         };
 
         let parent_hash = mining_ctx.parent_header.hash();
@@ -1271,6 +1286,7 @@ where
             snapshot_provider.clone(),
             mining_config.validator_commission.unwrap_or(100),
             mining_config.greedy_merge,
+            task_executor.clone(),
         ));
         let main_work_worker = MainWorkWorker::new(
             validator_address,
@@ -1283,6 +1299,7 @@ where
             payload_tx,
             desired_gas_limit,
             desired_min_gas_tip,
+            task_executor.clone(),
         );
 
         let result_work_worker = ResultWorkWorker::new(
@@ -1317,10 +1334,10 @@ where
     }
 
     fn spawn_workers(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.task_executor.spawn_critical("mev_work_worker", self.mev_work_worker.run());
-        self.task_executor.spawn_critical("new_work_worker", self.new_work_worker.run());
-        self.task_executor.spawn_critical("main_work_worker", self.main_work_worker.run());
-        self.task_executor.spawn_critical("result_work_worker", self.result_work_worker.run());
+        self.task_executor.spawn_critical_task("mev_work_worker", self.mev_work_worker.run());
+        self.task_executor.spawn_critical_task("new_work_worker", self.new_work_worker.run());
+        self.task_executor.spawn_critical_task("main_work_worker", self.main_work_worker.run());
+        self.task_executor.spawn_critical_task("result_work_worker", self.result_work_worker.run());
         info!("Succeed to start mining, address: {}", self.validator_address);
         Ok(())
     }

@@ -176,6 +176,8 @@ where
             blob_gas_used,
             excess_blob_gas,
             requests_hash,
+            block_access_list_hash: Default::default(),
+            slot_number: None,
         };
 
         tracing::debug!(
@@ -233,10 +235,13 @@ where
         let logs_bloom = logs_bloom(receipts.iter().flat_map(|r| &r.logs));
         let block_number = evm_env.block_env.number().saturating_to();
 
-        let withdrawals = self
+        let withdrawals: Option<Withdrawals> = self
             .chain_spec
             .is_shanghai_active_at_timestamp(timestamp)
-            .then(|| eth_ctx.withdrawals.clone().map(|w| w.into_owned()).unwrap_or_default());
+            .then(|| {
+                let v = eth_ctx.withdrawals.clone().map(|w| w.into_owned()).unwrap_or_default();
+                Withdrawals::new(v)
+            });
 
         let withdrawals_root =
             withdrawals.as_deref().map(|w| proofs::calculate_withdrawals_root(w));
@@ -293,6 +298,8 @@ where
             blob_gas_used,
             excess_blob_gas,
             requests_hash,
+            block_access_list_hash: Default::default(),
+            slot_number: None,
         };
         
         {   // finalize_new_header

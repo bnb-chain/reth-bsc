@@ -3,7 +3,7 @@ use crate::hardforks::bsc::BscHardfork;
 use reth_chainspec::{
     make_genesis_header, BaseFeeParams, BaseFeeParamsKind, Chain, ChainSpec, Head, NamedChain,
 };
-use reth_primitives::SealedHeader;
+use reth_primitives_traits::SealedHeader;
 
 pub fn bsc_local() -> ChainSpec {
     let genesis = serde_json::from_str(include_str!("genesis_local.json"))

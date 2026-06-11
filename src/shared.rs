@@ -19,7 +19,7 @@ use reth_network::NetworkHandle;
 use reth_network_api::PeerId;
 use reth_provider::providers::BlockchainProvider;
 use reth_payload_builder_primitives::Events;
-use reth_primitives::TransactionSigned;
+use reth_ethereum_primitives::TransactionSigned;
 use reth_provider::{BlockNumReader, HeaderProvider};
 use schnellru::{ByLength, LruMap};
 use std::collections::VecDeque;
@@ -34,7 +34,7 @@ pub type BscEngineApiTx = UnboundedSender<
     EngineApiRequest<
         crate::node::engine_api::payload::BscPayloadTypes,
         crate::BscPrimitives,
-        BlockchainProvider<NodeTypesWithDBAdapter<crate::node::BscNode, Arc<reth_db::DatabaseEnv>>>,
+        BlockchainProvider<NodeTypesWithDBAdapter<crate::node::BscNode, reth_db::DatabaseEnv>>,
         crate::node::evm::config::BscEvmConfig,
     >,
 >;
@@ -47,6 +47,32 @@ type HeaderByNumberFn = Arc<dyn Fn(u64) -> Option<Header> + Send + Sync>;
 
 /// Global shared access to the snapshot provider for RPC
 static SNAPSHOT_PROVIDER: OnceLock<Arc<dyn SnapshotProvider + Send + Sync>> = OnceLock::new();
+
+/// Function type for spawning a sparse-trie state-root background task.
+///
+/// Takes the parent block's hash and state root, returns an opaque handle that the
+/// miner can:
+///   1. attach as a `state_hook` on the BSC executor (streams per-tx state diffs to the task)
+///   2. block on after execution to receive the precomputed `(state_root, trie_updates)`
+///
+/// Two `B256` parameters:
+///   * `parent_hash`: block hash of the parent — used as the `anchor_hash` for the
+///     `OverlayStateProviderFactory` so the sparse trie can resolve historical trie
+///     nodes via the changeset cache.
+///   * `parent_state_root`: state root of the parent — the sparse trie's starting
+///     anchor for incremental hashing.
+///
+/// Registered by the engine launch path when
+/// `--mining.use-sparse-trie-state-root` is enabled. Returns `None` if the engine
+/// has not been wired (graceful fallback to legacy `state_root_with_updates`).
+pub type SparseTrieSpawnFn = Arc<
+    dyn Fn(B256, B256) -> Option<reth_engine_tree::tree::multiproof::StateRootHandle>
+        + Send
+        + Sync,
+>;
+
+/// Global sparse-trie state-root spawner. See [`SparseTrieSpawnFn`].
+static SPARSE_TRIE_SPAWN_FN: OnceLock<SparseTrieSpawnFn> = OnceLock::new();
 
 /// Global header provider function - HeaderProvider::header() by hash
 static HEADER_BY_HASH_PROVIDER: OnceLock<HeaderByHashFn> = OnceLock::new();
@@ -253,6 +279,37 @@ pub fn set_snapshot_provider(
 /// Get the global snapshot provider
 pub fn get_snapshot_provider() -> Option<&'static Arc<dyn SnapshotProvider + Send + Sync>> {
     SNAPSHOT_PROVIDER.get()
+}
+
+/// Register the sparse-trie state-root spawner.
+///
+/// Should be called once from the engine launch path. Subsequent calls return
+/// an error and are ignored (mirrors the rest of the OnceLock setters in this
+/// module). When the spawner is not registered, BSC miner falls back to the
+/// synchronous `state_root_with_updates` path.
+pub fn set_sparse_trie_spawn_fn(
+    spawner: SparseTrieSpawnFn,
+) -> Result<(), SparseTrieSpawnFn> {
+    SPARSE_TRIE_SPAWN_FN.set(spawner)
+}
+
+/// Spawn a sparse-trie state-root task for the given parent block.
+///
+/// `parent_hash` is the parent block hash (used as the trie anchor for the overlay
+/// state provider). `parent_state_root` is the parent's state-root commitment.
+///
+/// Returns `None` when:
+///   * the spawner has not been registered (engine wiring incomplete), or
+///   * the spawner itself decided not to spawn (e.g. resource pressure).
+///
+/// On `None`, callers must fall back to the synchronous state-root path.
+pub fn spawn_sparse_trie_state_root(
+    parent_hash: B256,
+    parent_state_root: B256,
+) -> Option<reth_engine_tree::tree::multiproof::StateRootHandle> {
+    SPARSE_TRIE_SPAWN_FN
+        .get()
+        .and_then(|f| f(parent_hash, parent_state_root))
 }
 
 /// Store the header provider globally
@@ -821,6 +878,32 @@ pub async fn ipc_send_raw_transaction(tx: TransactionSigned) -> Result<B256, eyr
     >::send_raw_transaction(client.as_ref(), bytes)
     .await
     .map_err(|e| eyre::eyre!("failed to query chain id from healthy node: {e}"))
+}
+
+/// Global access to the engine's `CanonicalInMemoryState`.
+///
+/// Published from `main.rs` right after `.launch()` returns (which is where the
+/// concrete `BlockchainProvider` is available — generic builder code can't see
+/// through `Node::Provider`).
+///
+/// Used by the sparse-trie state-root spawner to walk the in-memory canonical
+/// chain back to the on-disk anchor when constructing the overlay factory,
+/// without which proof workers fail with `BlockHashNotFound` whenever the parent
+/// block hasn't been persisted to MDBX yet.
+static CANONICAL_IN_MEMORY_STATE:
+    OnceLock<reth_chain_state::CanonicalInMemoryState<crate::BscPrimitives>> = OnceLock::new();
+
+/// Set the canonical in-memory state handle. Idempotent first-write-wins.
+pub fn set_canonical_in_memory_state(
+    state: reth_chain_state::CanonicalInMemoryState<crate::BscPrimitives>,
+) -> Result<(), reth_chain_state::CanonicalInMemoryState<crate::BscPrimitives>> {
+    CANONICAL_IN_MEMORY_STATE.set(state)
+}
+
+/// Get a cloned handle to the canonical in-memory state if published.
+pub fn get_canonical_in_memory_state(
+) -> Option<reth_chain_state::CanonicalInMemoryState<crate::BscPrimitives>> {
+    CANONICAL_IN_MEMORY_STATE.get().cloned()
 }
 
 /// Global engine api tx (custom request sender)

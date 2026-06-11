@@ -1,5 +1,6 @@
 use super::{
-    assembler::BscBlockAssembler, builder::BscBlockBuilder, executor::BscBlockExecutor,
+    assembler::BscBlockAssembler, builder::BscBlockBuilder,
+    executor::{BscBlockExecutor, BscTxResult},
     factory::BscEvmFactory,
 };
 use crate::{
@@ -25,7 +26,8 @@ use reth_evm::{
     NextBlockEnvAttributes,
 };
 use reth_evm_ethereum::RethReceiptBuilder;
-use reth_primitives::{BlockTy, HeaderTy, SealedBlock, SealedHeader, TransactionSigned};
+use reth_primitives_traits::{BlockTy, HeaderTy, SealedBlock, SealedHeader};
+use reth_ethereum_primitives::TransactionSigned;
 use reth_primitives_traits::constants::MAX_TX_GAS_LIMIT_OSAKA;
 use reth_revm::State;
 use reth_rpc_eth_api::helpers::pending_block::BuildPendingEnv;
@@ -41,6 +43,12 @@ use std::{borrow::Cow, cell::RefCell, convert::Infallible, rc::Rc, sync::{Arc, M
 /// the payload/bid layer so that VALIDATOR_CACHE can be written after the definitive block hash
 /// is known.
 pub type ValidatorCacheSink = Arc<Mutex<Option<(Vec<Address>, Vec<VoteAddress>)>>>;
+
+/// Sink carrying the sparse-trie background task's precomputed
+/// `(state_root, trie_updates)`, threaded from the payload layer to the builder's
+/// MDBX branch so it can skip the blocking `state_root_with_updates` call.
+pub type StateRootPrecomputedSink =
+    Arc<Mutex<Option<(alloy_primitives::B256, reth_trie_common::updates::TrieUpdates)>>>;
 
 /// BSC wrapper around [`NextBlockEnvAttributes`].
 ///
@@ -67,6 +75,31 @@ pub struct BscNextBlockEnvAttributes {
     /// Sink for transporting `turn_length` from builder to payload layer without writing to
     /// TURN_LENGTH_CACHE prematurely.
     pub turn_length_sink: Option<Arc<Mutex<Option<u8>>>>,
+    /// Sink for precomputed `(state_root, trie_updates)` from a sparse-trie background
+    /// task. Filled by payload layer between exec and `finish_with_difflayer` so the
+    /// builder's MDBX branch can skip the blocking `state_root_with_updates` call. See
+    /// [`BscBlockExecutionCtx::state_root_precomputed_sink`] for full semantics.
+    pub state_root_precomputed_sink: Option<StateRootPrecomputedSink>,
+    /// Sparse-trie state-root handle, threaded through to `finish_with_difflayer`.
+    ///
+    /// Stored here (in `Arc<Mutex<Option<_>>>` so `Clone` works for the type-erased
+    /// builder path) so that `state_root()` can be called **after** `executor.finish()`
+    /// runs BSC's post-execution system transactions (slash, fee distribution,
+    /// validator-set updates). Those system txs change state via the same executor
+    /// that has the `state_hook` installed; the hook is dropped naturally when the
+    /// executor is consumed by `finish()`, which sends `FinishedStateUpdates` to the
+    /// background task. Only after that drop is it safe to await `state_root()`.
+    ///
+    /// `None` when sparse-trie is disabled or in TrieDB mode.
+    pub trie_handle: Option<
+        Arc<Mutex<Option<reth_engine_tree::tree::multiproof::StateRootHandle>>>,
+    >,
+    /// R2: absolute wall-clock deadline (epoch ms) for bounding the sparse-trie
+    /// `state_root()` wait in `finish_with_difflayer`. Past it the builder stops
+    /// waiting and falls back to synchronous `state_root_with_updates`, so an
+    /// in-turn block never blocks unboundedly past its slot. `None` = legacy
+    /// unbounded blocking wait (out-of-turn / bid-sim / import paths).
+    pub state_root_deadline_ms: Option<u64>,
 }
 
 impl<H: BlockHeader> BuildPendingEnv<H> for BscNextBlockEnvAttributes {
@@ -77,6 +110,9 @@ impl<H: BlockHeader> BuildPendingEnv<H> for BscNextBlockEnvAttributes {
             triedb_prefetcher: None,
             validator_cache_sink: None,
             turn_length_sink: None,
+            state_root_precomputed_sink: None,
+            trie_handle: None,
+            state_root_deadline_ms: None,
         }
     }
 }
@@ -133,6 +169,30 @@ pub struct BscBlockExecutionCtx<'a> {
     pub validator_cache_sink: Option<ValidatorCacheSink>,
     /// Sink for `turn_length` — same lifecycle as `validator_cache_sink`.
     pub turn_length_sink: Option<Arc<Mutex<Option<u8>>>>,
+    /// Sink for a precomputed `(state_root, trie_updates)` from a sparse-trie background
+    /// task (reth 2.0 mechanism).
+    ///
+    /// Write direction is **reversed** vs the other sinks: the payload layer fills this
+    /// **before** calling `finish_with_difflayer`, and the builder's MDBX branch reads
+    /// it to skip the synchronous `state_root_with_updates` call. `None` in the bid
+    /// simulator path and when the `--mining.use-sparse-trie-state-root` flag is off,
+    /// triggering the legacy state-root path.
+    pub state_root_precomputed_sink: Option<StateRootPrecomputedSink>,
+    /// Sparse-trie state-root handle. The builder consumes this **after**
+    /// `executor.finish()` runs BSC's post-execution system transactions (slash,
+    /// fee distribution, validator-set updates), so those state changes are
+    /// captured by the executor's `state_hook` before the hook is dropped (which
+    /// signals the sparse-trie task to finalize). Calling `state_root()` before
+    /// the executor is dropped would deadlock the task on `FinishedStateUpdates`.
+    ///
+    /// `Arc<Mutex<Option<_>>>` because `StateRootHandle` is `!Clone` (single-use
+    /// receiver) and `BscBlockExecutionCtx` derives `Clone`.
+    pub trie_handle: Option<
+        Arc<Mutex<Option<reth_engine_tree::tree::multiproof::StateRootHandle>>>,
+    >,
+    /// R2: see [`BscNextBlockEnvAttributes::state_root_deadline_ms`]. Bounds the
+    /// sparse-trie `state_root()` wait in `finish_with_difflayer`.
+    pub state_root_deadline_ms: Option<u64>,
 }
 
 impl<'a> BscBlockExecutionCtx<'a> {
@@ -229,23 +289,25 @@ where
     BscTxEnv: IntoTxEnv<<EvmF as EvmFactory>::Tx>,
 {
     type EvmFactory = EvmF;
+    type TxExecutionResult = BscTxResult<<EvmF as EvmFactory>::HaltReason>;
     type ExecutionCtx<'a> = BscBlockExecutionCtx<'a>;
     type Transaction = TransactionSigned;
     type Receipt = R::Receipt;
+    type Executor<'a, DB: alloy_evm::block::StateDB, I: Inspector<<Self::EvmFactory as EvmFactory>::Context<DB>>> =
+        BscBlockExecutor<'a, <EvmF as EvmFactory>::Evm<DB, I>, Spec, R>;
 
     fn evm_factory(&self) -> &Self::EvmFactory {
         &self.evm_factory
     }
 
-    #[allow(refining_impl_trait)]
     fn create_executor<'a, DB, I>(
         &'a self,
-        evm: <Self::EvmFactory as EvmFactory>::Evm<&'a mut State<DB>, I>,
+        evm: <Self::EvmFactory as EvmFactory>::Evm<DB, I>,
         ctx: Self::ExecutionCtx<'a>,
-    ) -> BscBlockExecutor<'a, <Self::EvmFactory as EvmFactory>::Evm<&'a mut State<DB>, I>, Spec, R>
+    ) -> Self::Executor<'a, DB, I>
     where
-        DB: alloy_evm::Database + 'a,
-        I: Inspector<<Self::EvmFactory as EvmFactory>::Context<&'a mut State<DB>>> + 'a,
+        DB: alloy_evm::block::StateDB,
+        I: Inspector<<Self::EvmFactory as EvmFactory>::Context<DB>>,
     {
         BscBlockExecutor::new(
             evm,
@@ -329,6 +391,7 @@ where
             gas_limit: header.gas_limit(),
             basefee: header.base_fee_per_gas().unwrap_or_default(),
             blob_excess_gas_and_price,
+            slot_num: 0,
         };
 
         Ok(EvmEnv { cfg_env, block_env })
@@ -408,6 +471,7 @@ where
             basefee: basefee.unwrap_or_default(),
             // calculate excess gas based on parent block's blob gas usage
             blob_excess_gas_and_price,
+            slot_num: 0,
         };
 
         Ok(EvmEnv { cfg_env, block_env })
@@ -423,8 +487,9 @@ where
                 parent_hash: block.header().parent_hash,
                 parent_beacon_block_root: block.header().parent_beacon_block_root,
                 ommers: &block.body().ommers,
-                withdrawals: block.body().withdrawals.as_ref().map(Cow::Borrowed),
+                withdrawals: block.body().withdrawals.as_ref().map(|w| Cow::Borrowed(w.as_slice())),
                 extra_data: block.header().extra_data.clone(),
+                slot_number: None,
             },
             header: Some(block.header().clone()),
             header_hash: Some(block.hash()),
@@ -433,6 +498,9 @@ where
             triedb_prefetcher: None,
             validator_cache_sink: None,
             turn_length_sink: None,
+            state_root_precomputed_sink: None,
+            trie_handle: None,
+            state_root_deadline_ms: None,
         })
     }
 
@@ -448,8 +516,9 @@ where
                 parent_hash: parent.hash(),
                 parent_beacon_block_root: attributes.inner.parent_beacon_block_root,
                 ommers: &[],
-                withdrawals: attributes.inner.withdrawals.map(Cow::Owned),
+                withdrawals: attributes.inner.withdrawals.map(|w| Cow::Owned(w.into_inner())),
                 extra_data: attributes.inner.extra_data,
+                slot_number: attributes.inner.slot_number,
             },
             header: None, // No header available for next block context
             header_hash: None,
@@ -458,6 +527,9 @@ where
             triedb_prefetcher: attributes.triedb_prefetcher,
             validator_cache_sink: attributes.validator_cache_sink,
             turn_length_sink: attributes.turn_length_sink,
+            state_root_precomputed_sink: attributes.state_root_precomputed_sink,
+            trie_handle: attributes.trie_handle,
+            state_root_deadline_ms: attributes.state_root_deadline_ms,
         })
     }
 
@@ -469,7 +541,7 @@ where
         ctx: <Self::BlockExecutorFactory as BlockExecutorFactory>::ExecutionCtx<'a>,
     ) -> impl BlockBuilder<
         Primitives = Self::Primitives,
-        Executor: BlockExecutorFor<'a, Self::BlockExecutorFactory, DB, I>,
+        Executor = BlockExecutorFor<'a, Self::BlockExecutorFactory, &'a mut State<DB>, I>,
     >
     where
         DB: Database,
@@ -522,8 +594,9 @@ where
                 parent_hash: block.header.parent_hash(),
                 parent_beacon_block_root: block.header.parent_beacon_block_root,
                 ommers: &block.body.inner.ommers,
-                withdrawals: block.body.inner.withdrawals.as_ref().map(Cow::Borrowed),
+                withdrawals: block.body.inner.withdrawals.as_ref().map(|w| Cow::Borrowed(w.as_slice())),
                 extra_data: block.header.extra_data.clone(),
+                slot_number: None,
             },
             header: Some(block.header.clone()),
             header_hash: Some(payload.block_hash_cached()),
@@ -532,6 +605,9 @@ where
             triedb_prefetcher: None,
             validator_cache_sink: None,
             turn_length_sink: None,
+            state_root_precomputed_sink: None,
+            trie_handle: None,
+            state_root_deadline_ms: None,
         })
     }
 

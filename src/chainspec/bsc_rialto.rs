@@ -3,7 +3,7 @@ use alloy_primitives::{BlockHash, U256, B256};
 use reth_chainspec::{
     make_genesis_header, BaseFeeParams, BaseFeeParamsKind, Chain, ChainSpec, Head,
 };
-use reth_primitives::SealedHeader;
+use reth_primitives_traits::SealedHeader;
 use std::str::FromStr;
 
 pub const RIALTO_CHAIN_ID: u64 = 714;
