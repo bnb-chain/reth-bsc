@@ -198,9 +198,23 @@ where
                         (parent_hash, None)
                     };
 
+                    // Reuse the node-wide changeset cache (published from main.rs): it is
+                    // kept warm by the engine's deferred trie tasks and evicted on
+                    // persistence. A fresh per-build cache starts empty and forces a
+                    // DB-based changeset recomputation over the whole revert range on
+                    // every payload build (observed as cluster-wide fallback storms with
+                    // 25s+ overlay builds under load).
+                    let changeset_cache =
+                        crate::shared::get_changeset_cache().unwrap_or_else(|| {
+                            tracing::warn!(
+                                target: "bsc::miner",
+                                "Shared changeset cache not yet published; falling back to an empty one"
+                            );
+                            ChangesetCache::default()
+                        });
                     let overlay_builder = OverlayBuilder::<crate::BscPrimitives>::new(
                         anchor_hash,
-                        ChangesetCache::default(),
+                        changeset_cache,
                     )
                     .with_lazy_overlay(lazy_overlay);
 

@@ -906,6 +906,27 @@ pub fn get_canonical_in_memory_state(
     CANONICAL_IN_MEMORY_STATE.get().cloned()
 }
 
+/// Node-wide changeset cache, published from `main.rs` post-launch (the concrete
+/// `BlockchainProvider` is only reachable there, same as `CANONICAL_IN_MEMORY_STATE`).
+///
+/// The miner's sparse-trie payload path must reuse this instance: it is populated by
+/// the engine's deferred trie tasks and evicted on persistence. A separate (or
+/// per-build) instance starts empty and forces an expensive DB-based changeset
+/// recomputation over the whole revert range on every payload build.
+static CHANGESET_CACHE: OnceLock<reth_trie_db::ChangesetCache> = OnceLock::new();
+
+/// Set the shared changeset cache handle. Idempotent first-write-wins.
+pub fn set_changeset_cache(
+    cache: reth_trie_db::ChangesetCache,
+) -> Result<(), reth_trie_db::ChangesetCache> {
+    CHANGESET_CACHE.set(cache)
+}
+
+/// Get a cloned handle to the shared changeset cache if published.
+pub fn get_changeset_cache() -> Option<reth_trie_db::ChangesetCache> {
+    CHANGESET_CACHE.get().cloned()
+}
+
 /// Global engine api tx (custom request sender)
 static ENGINE_API_TX: OnceLock<BscEngineApiTx> = OnceLock::new();
 

@@ -465,6 +465,11 @@ fn main() -> eyre::Result<()> {
                 node.provider.canonical_in_memory_state(),
             );
 
+            // Publish the node-wide changeset cache so the miner's sparse-trie payload
+            // path reuses the engine's instance instead of recomputing changesets from
+            // the database on every payload build.
+            let _ = reth_bsc::shared::set_changeset_cache(node.provider.changeset_cache());
+
             // Set the IPC client
             reth_bsc::shared::set_ipc_client(ipc_path).await.unwrap();
 
