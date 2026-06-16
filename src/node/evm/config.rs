@@ -52,23 +52,13 @@ pub type StateRootPrecomputedSink =
 
 /// BSC wrapper around [`NextBlockEnvAttributes`].
 ///
-/// Extends the upstream attributes with TrieDB-specific context for the miner:
-/// - `parent_difflayers`: incremental trie diffs from the engine tree, used as input for
-///   the next state-root calculation via TrieDB.
-/// - `triedb_prefetcher`: a background trie-prefetch handle started before block execution
-///   so that trie nodes are warmed up by the time `finish()` computes the state root.
-///
-/// The struct still satisfies upstream RPC trait bounds via a delegating [`BuildPendingEnv`]
-/// implementation, keeping reth's base attributes unchanged.
+/// Extends the upstream attributes with sparse-trie sinks and validator/turn-length
+/// transport sinks needed by the BSC miner. The struct still satisfies upstream RPC
+/// trait bounds via a delegating [`BuildPendingEnv`] implementation, keeping reth's
+/// base attributes unchanged.
 #[derive(Debug, Clone)]
 pub struct BscNextBlockEnvAttributes {
     pub inner: NextBlockEnvAttributes,
-    /// Parent difflayers (from engine tree), used by triedb state root calculation and miner-side
-    /// triedb prefetcher.
-    pub parent_difflayers: Option<rust_eth_triedb_common::DiffLayers>,
-    /// Miner-side triedb prefetcher handle. This is started before execution and consumed in
-    /// `finish()` to obtain `prefetch_state` for triedb root calculation.
-    pub triedb_prefetcher: Option<crate::node::evm::MinerTrieDbPrefetcher>,
     /// Sink for transporting `current_validators` from builder to payload layer without writing
     /// to VALIDATOR_CACHE prematurely (hash not yet final at build time).
     pub validator_cache_sink: Option<ValidatorCacheSink>,
@@ -76,11 +66,11 @@ pub struct BscNextBlockEnvAttributes {
     /// TURN_LENGTH_CACHE prematurely.
     pub turn_length_sink: Option<Arc<Mutex<Option<u8>>>>,
     /// Sink for precomputed `(state_root, trie_updates)` from a sparse-trie background
-    /// task. Filled by payload layer between exec and `finish_with_difflayer` so the
-    /// builder's MDBX branch can skip the blocking `state_root_with_updates` call. See
+    /// task. Filled by the payload layer between exec and `finish` so the builder can
+    /// skip the blocking `state_root_with_updates` call. See
     /// [`BscBlockExecutionCtx::state_root_precomputed_sink`] for full semantics.
     pub state_root_precomputed_sink: Option<StateRootPrecomputedSink>,
-    /// Sparse-trie state-root handle, threaded through to `finish_with_difflayer`.
+    /// Sparse-trie state-root handle, threaded through to `finish`.
     ///
     /// Stored here (in `Arc<Mutex<Option<_>>>` so `Clone` works for the type-erased
     /// builder path) so that `state_root()` can be called **after** `executor.finish()`
@@ -89,16 +79,14 @@ pub struct BscNextBlockEnvAttributes {
     /// that has the `state_hook` installed; the hook is dropped naturally when the
     /// executor is consumed by `finish()`, which sends `FinishedStateUpdates` to the
     /// background task. Only after that drop is it safe to await `state_root()`.
-    ///
-    /// `None` when sparse-trie is disabled or in TrieDB mode.
     pub trie_handle: Option<
         Arc<Mutex<Option<reth_engine_tree::tree::multiproof::StateRootHandle>>>,
     >,
-    /// R2: absolute wall-clock deadline (epoch ms) for bounding the sparse-trie
-    /// `state_root()` wait in `finish_with_difflayer`. Past it the builder stops
-    /// waiting and falls back to synchronous `state_root_with_updates`, so an
-    /// in-turn block never blocks unboundedly past its slot. `None` = legacy
-    /// unbounded blocking wait (out-of-turn / bid-sim / import paths).
+    /// Absolute wall-clock deadline (epoch ms) for bounding the sparse-trie
+    /// `state_root()` wait in `finish`. Past it the builder stops waiting and falls
+    /// back to synchronous `state_root_with_updates`, so an in-turn block never
+    /// blocks unboundedly past its slot. `None` = legacy unbounded blocking wait
+    /// (out-of-turn / bid-sim / import paths).
     pub state_root_deadline_ms: Option<u64>,
 }
 
@@ -106,8 +94,6 @@ impl<H: BlockHeader> BuildPendingEnv<H> for BscNextBlockEnvAttributes {
     fn build_pending_env(parent: &SealedHeader<H>) -> Self {
         Self {
             inner: NextBlockEnvAttributes::build_pending_env(parent),
-            parent_difflayers: None,
-            triedb_prefetcher: None,
             validator_cache_sink: None,
             turn_length_sink: None,
             state_root_precomputed_sink: None,
@@ -159,13 +145,8 @@ pub struct BscBlockExecutionCtx<'a> {
     pub header_hash: Option<BlockHash>,
     /// Whether the block is being mined.
     pub is_miner: bool,
-    /// Parent difflayers (from engine tree), used by triedb state root calculation and miner-side
-    /// triedb prefetcher.
-    pub parent_difflayers: Option<rust_eth_triedb_common::DiffLayers>,
-    /// Miner-side triedb prefetcher handle (consumed in `finish()`).
-    pub triedb_prefetcher: Option<crate::node::evm::MinerTrieDbPrefetcher>,
-    /// Sink for `current_validators` — written by builder in `finish_with_difflayer()` and
-    /// read by payload layer after the builder is consumed.  `None` for non-miner paths.
+    /// Sink for `current_validators` — written by builder in `finish()` and read by the
+    /// payload layer after the builder is consumed. `None` for non-miner paths.
     pub validator_cache_sink: Option<ValidatorCacheSink>,
     /// Sink for `turn_length` — same lifecycle as `validator_cache_sink`.
     pub turn_length_sink: Option<Arc<Mutex<Option<u8>>>>,
@@ -173,10 +154,10 @@ pub struct BscBlockExecutionCtx<'a> {
     /// task (reth 2.0 mechanism).
     ///
     /// Write direction is **reversed** vs the other sinks: the payload layer fills this
-    /// **before** calling `finish_with_difflayer`, and the builder's MDBX branch reads
-    /// it to skip the synchronous `state_root_with_updates` call. `None` in the bid
-    /// simulator path and when the `--mining.use-sparse-trie-state-root` flag is off,
-    /// triggering the legacy state-root path.
+    /// **before** calling `finish`, and the builder reads it to skip the synchronous
+    /// `state_root_with_updates` call. `None` in the bid simulator path and when the
+    /// `--mining.use-sparse-trie-state-root` flag is off, triggering the legacy
+    /// state-root path.
     pub state_root_precomputed_sink: Option<StateRootPrecomputedSink>,
     /// Sparse-trie state-root handle. The builder consumes this **after**
     /// `executor.finish()` runs BSC's post-execution system transactions (slash,
@@ -190,8 +171,8 @@ pub struct BscBlockExecutionCtx<'a> {
     pub trie_handle: Option<
         Arc<Mutex<Option<reth_engine_tree::tree::multiproof::StateRootHandle>>>,
     >,
-    /// R2: see [`BscNextBlockEnvAttributes::state_root_deadline_ms`]. Bounds the
-    /// sparse-trie `state_root()` wait in `finish_with_difflayer`.
+    /// See [`BscNextBlockEnvAttributes::state_root_deadline_ms`]. Bounds the
+    /// sparse-trie `state_root()` wait in `finish`.
     pub state_root_deadline_ms: Option<u64>,
 }
 
@@ -494,8 +475,6 @@ where
             header: Some(block.header().clone()),
             header_hash: Some(block.hash()),
             is_miner: false,
-            parent_difflayers: None,
-            triedb_prefetcher: None,
             validator_cache_sink: None,
             turn_length_sink: None,
             state_root_precomputed_sink: None,
@@ -523,8 +502,6 @@ where
             header: None, // No header available for next block context
             header_hash: None,
             is_miner: true,
-            parent_difflayers: attributes.parent_difflayers,
-            triedb_prefetcher: attributes.triedb_prefetcher,
             validator_cache_sink: attributes.validator_cache_sink,
             turn_length_sink: attributes.turn_length_sink,
             state_root_precomputed_sink: attributes.state_root_precomputed_sink,
@@ -551,14 +528,7 @@ where
         let shared_ctx = BscExecutionSharedCtx::default();
         let bsc_executor = BscBlockExecutor::new(
             evm,
-            {
-                // Avoid cloning miner-only helpers into the executor context. The block builder keeps
-                // the full ctx and consumes these in `finish()`.
-                let mut exec_ctx = ctx.clone();
-                exec_ctx.parent_difflayers = None;
-                exec_ctx.triedb_prefetcher = None;
-                exec_ctx
-            },
+            ctx.clone(),
             shared_ctx.clone(),
             self.executor_factory.spec().clone(),
             *self.executor_factory.receipt_builder(),
@@ -601,8 +571,6 @@ where
             header: Some(block.header.clone()),
             header_hash: Some(payload.block_hash_cached()),
             is_miner: false,
-            parent_difflayers: None,
-            triedb_prefetcher: None,
             validator_cache_sink: None,
             turn_length_sink: None,
             state_root_precomputed_sink: None,

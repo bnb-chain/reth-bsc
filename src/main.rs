@@ -41,8 +41,7 @@ pub struct BscCliArgs {
     pub mining_min_gas_tip: Option<u128>,
 
     /// Use reth 2.0 sparse-trie background task for state-root computation in
-    /// MDBX-mode payload build (opt-in; no effect when `--statedb.triedb` is
-    /// active).
+    /// payload build (opt-in).
     ///
     /// Env alternative: `BSC_MINING_USE_SPARSE_TRIE_STATE_ROOT=true`.
     #[arg(long = "mining.use-sparse-trie-state-root")]
