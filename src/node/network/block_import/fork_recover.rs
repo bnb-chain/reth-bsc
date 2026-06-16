@@ -12,7 +12,7 @@ use reth_engine_primitives::ConsensusEngineHandle;
 use reth_network_api::PeerId;
 use reth_payload_primitives::PayloadTypes;
 use reth_primitives_traits::{AlloyBlockHeader, Block as _};
-use reth_provider::{BlockHashReader, BlockNumReader, HeaderProvider};
+use reth_provider::{BlockHashReader, BlockIdReader, BlockNumReader, HeaderProvider};
 
 use crate::{
     node::{consensus::BscForkChoiceEngine, engine_api::payload::BscPayloadTypes},
@@ -52,6 +52,9 @@ pub enum ForkRecoverError {
 
     #[error("no common ancestor found within MAX_FORK_DEPTH={MAX_FORK_DEPTH} blocks")]
     ForkTooDeep,
+
+    #[error("fork diverges at or below the finalized block #{finalized} (reached #{cursor}); refusing to recover below finality")]
+    ForkBelowFinalized { cursor: u64, finalized: u64 },
 
     #[error("range fetch failed: {0}")]
     FetchFailed(String),
@@ -152,6 +155,11 @@ pub async fn discover_fork_blocks<
     peer: PeerId,
     start_hash: B256,
     start_num: u64,
+    // Finalized block number floor. A valid fork cannot diverge at or below a finalized
+    // (2/3-voted, settled) block, so the backward walk must stop here instead of pulling and
+    // importing hundreds of below-finalized blocks (deep, slow state reconstruction that has
+    // tripped the MDBX read-transaction timeout and crashed the engine). Pass `0` to disable.
+    finalized_num: u64,
     provider: &P,
     fetcher: &dyn RangeFetcher,
 ) -> Result<Discovery, ForkRecoverError> {
@@ -181,6 +189,16 @@ pub async fn discover_fork_blocks<
             return Ok(Discovery { fork_blocks, outcome });
         }
 
+        // Finality floor: the cursor reached the finalized height without matching our canonical
+        // chain, so the fork conflicts with a settled block and cannot be valid. Stop here rather
+        // than walking (and importing) below finality.
+        if cursor_num <= finalized_num {
+            return Err(ForkRecoverError::ForkBelowFinalized {
+                cursor: cursor_num,
+                finalized: finalized_num,
+            });
+        }
+
         if walked >= MAX_FORK_DEPTH {
             return Err(ForkRecoverError::ForkTooDeep);
         }
@@ -206,6 +224,14 @@ pub async fn discover_fork_blocks<
             // Side-chain already present: skip adding to fork_blocks, but keep walking.
             if provider.header(b.header.hash_slow())?.is_some() {
                 continue;
+            }
+            // Finality floor (mid-hop): a fork block at or below the finalized height that is not
+            // our canonical block means the fork diverges below finality — refuse to import it.
+            if b.header.number <= finalized_num {
+                return Err(ForkRecoverError::ForkBelowFinalized {
+                    cursor: b.header.number,
+                    finalized: finalized_num,
+                });
             }
             fork_blocks.push(b.clone());
         }
@@ -308,6 +334,7 @@ pub async fn recover_ancestors<P>(
 where
     P: BlockHashReader
         + BlockNumReader
+        + BlockIdReader
         + HeaderProvider<Header = alloy_consensus::Header>
         + Clone
         + Send
@@ -333,8 +360,18 @@ where
     );
 
     // ---- Phase 1 ----
-    let discovery =
-        discover_fork_blocks(peer, fetch_start_hash, fetch_start_num, &provider, fetcher).await?;
+    // Finalized floor: never walk/import below the finalized block. `unwrap_or(0)` disables the
+    // floor if finality is unknown (e.g. pre-finality genesis), preserving prior behavior.
+    let finalized_num = provider.finalized_block_number()?.unwrap_or(0);
+    let discovery = discover_fork_blocks(
+        peer,
+        fetch_start_hash,
+        fetch_start_num,
+        finalized_num,
+        &provider,
+        fetcher,
+    )
+    .await?;
     tracing::debug!(
         target: "bsc::fork_recover",
         %peer,
@@ -693,7 +730,7 @@ mod tests {
         }
 
         let fetcher = ScriptedFetcher::new(vec![]);
-        let out = discover_fork_blocks(fake_peer(), hashes[100], 100, &provider, fetcher.as_ref())
+        let out = discover_fork_blocks(fake_peer(), hashes[100], 100, 0, &provider, fetcher.as_ref())
             .await
             .unwrap();
 
@@ -717,7 +754,7 @@ mod tests {
         let fetcher = ScriptedFetcher::new(vec![Ok(hop1)]);
 
         let head_hash = peer_ext.last().unwrap().hash_slow();
-        let out = discover_fork_blocks(fake_peer(), head_hash, 104, &provider, fetcher.as_ref())
+        let out = discover_fork_blocks(fake_peer(), head_hash, 104, 0, &provider, fetcher.as_ref())
             .await
             .unwrap();
 
@@ -758,7 +795,7 @@ mod tests {
         let fetcher = ScriptedFetcher::new(vec![Ok(hop1), Ok(hop2)]);
 
         let out =
-            discover_fork_blocks(fake_peer(), peer_y_hashes[6], 102, &provider, fetcher.as_ref())
+            discover_fork_blocks(fake_peer(), peer_y_hashes[6], 102, 0, &provider, fetcher.as_ref())
                 .await
                 .unwrap();
 
@@ -813,6 +850,7 @@ mod tests {
             fake_peer(),
             peer_hashes[peer_len_usize - 1],
             peer_len,
+            0,
             &provider,
             fetcher.as_ref(),
         )
@@ -836,12 +874,46 @@ mod tests {
         provider.insert_side(side_96);
 
         let fetcher = ScriptedFetcher::new(vec![]);
-        let out = discover_fork_blocks(fake_peer(), side_hash, 96, &provider, fetcher.as_ref())
+        let out = discover_fork_blocks(fake_peer(), side_hash, 96, 0, &provider, fetcher.as_ref())
             .await
             .unwrap();
         assert!(matches!(out.outcome, DiscoveryOutcome::Shortcircuit));
         assert!(out.fork_blocks.is_empty());
         assert_eq!(fetcher.calls().len(), 0);
+    }
+
+    // ---- Spec test #7b: fork diverges at/below finalized -> ForkBelowFinalized ----
+    #[tokio::test]
+    async fn discover_fork_below_finalized_is_rejected() {
+        let mut provider = FakeProvider::default();
+        // Canonical 0..=100.
+        let (shared, shared_hashes) = linear_chain(0, 101, B256::ZERO, 0xC);
+        for h in &shared {
+            provider.insert_canonical(h.clone());
+        }
+        // Peer fork diverges at 90: blocks 91..=100 differ (marker 0xB).
+        let (peer, peer_hashes) = linear_chain(91, 10, shared_hashes[90], 0xB);
+        // Hop 1 from cursor 100: [100B, 99B, 98B, 97B].
+        let hop1: Vec<BscBlock> =
+            peer.iter().cloned().rev().take(4).map(make_block).collect();
+        let fetcher = ScriptedFetcher::new(vec![Ok(hop1)]);
+
+        // finalized = 98: the walk reaches block 98 (divergent, not canonical) and must stop
+        // instead of pulling/importing below finality.
+        let err = discover_fork_blocks(
+            fake_peer(),
+            peer_hashes[9],
+            100,
+            98,
+            &provider,
+            fetcher.as_ref(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ForkRecoverError::ForkBelowFinalized { finalized: 98, .. }
+        ));
     }
 
     // ---- Spec test #8: mid-chain side block already present, skipped ----
@@ -864,7 +936,7 @@ mod tests {
         let fetcher = ScriptedFetcher::new(vec![Ok(hop1)]);
 
         let out =
-            discover_fork_blocks(fake_peer(), peer_y_hashes[3], 99, &provider, fetcher.as_ref())
+            discover_fork_blocks(fake_peer(), peer_y_hashes[3], 99, 0, &provider, fetcher.as_ref())
                 .await
                 .unwrap();
 

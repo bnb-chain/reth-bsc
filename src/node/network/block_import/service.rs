@@ -35,7 +35,9 @@ use reth_payload_builder_primitives::Events;
 use reth_payload_primitives::{BuiltPayload, PayloadTypes};
 use reth_primitives_traits::NodePrimitives;
 use reth_primitives_traits::{AlloyBlockHeader, Block};
-use reth_provider::{BlockHashReader, BlockNumReader, BlockReaderIdExt, HeaderProvider};
+use reth_provider::{
+    BlockHashReader, BlockIdReader, BlockNumReader, BlockReaderIdExt, HeaderProvider,
+};
 use std::{
     future::Future,
     pin::Pin,
@@ -144,6 +146,7 @@ impl<Provider> ImportService<Provider>
 where
     Provider: BlockNumReader
         + BlockHashReader
+        + BlockIdReader
         + HeaderProvider<Header = Header>
         + Clone
         + Send
@@ -928,6 +931,7 @@ impl<Provider> Future for ImportService<Provider>
 where
     Provider: BlockNumReader
         + BlockHashReader
+        + BlockIdReader
         + HeaderProvider<Header = Header>
         + Clone
         + Send
@@ -1199,6 +1203,24 @@ mod tests {
 
         fn block_number(&self, hash: B256) -> Result<Option<BlockNumber>, ProviderError> {
             Ok(self.headers_by_hash.get(&hash).map(|h| h.number))
+        }
+    }
+
+    impl BlockIdReader for MockProvider {
+        fn pending_block_num_hash(
+            &self,
+        ) -> Result<Option<alloy_eips::BlockNumHash>, ProviderError> {
+            Ok(None)
+        }
+
+        fn safe_block_num_hash(&self) -> Result<Option<alloy_eips::BlockNumHash>, ProviderError> {
+            Ok(None)
+        }
+
+        fn finalized_block_num_hash(
+            &self,
+        ) -> Result<Option<alloy_eips::BlockNumHash>, ProviderError> {
+            Ok(None)
         }
     }
 
