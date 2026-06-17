@@ -358,6 +358,37 @@ where
             );
             (root, updates, None)
         } else {
+            // Fix #1: bound the synchronous state-root fallback by the slot deadline.
+            //
+            // When the sparse-trie precomputed root is unavailable (recv_timeout expired, or no
+            // handle was spawned) we land here on the synchronous full-trie walk
+            // `state_root_with_updates`. Under a deep miner overlay this walk takes ~700ms — far
+            // past the block period. Running it anyway is doubly harmful: it produces a candidate
+            // the miner has already given up waiting for, and it pins a CPU core ~700ms into the
+            // next slot, shrinking the next block's build budget and cascading further
+            // empty/low-gas blocks. If we are already at/over the state-root deadline
+            // (`end_mining_timestamp_ms - STATE_ROOT_WAIT_MARGIN_MS`), abort this candidate so the
+            // miner ships the best already-completed candidate on time instead of over-running.
+            if let Some(deadline_ms) = self.ctx.state_root_deadline_ms {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                if now_ms >= deadline_ms {
+                    metrics::counter!("bsc_builder_sync_root_deadline_abort_total").increment(1);
+                    tracing::warn!(
+                        target: "bsc::builder",
+                        parent_hash = %self.parent.hash(),
+                        block_number = %(self.parent.number + 1),
+                        now_ms,
+                        deadline_ms,
+                        "Synchronous state-root would miss the slot deadline; aborting candidate to avoid slot over-run"
+                    );
+                    return Err(BlockExecutionError::msg(format!(
+                        "synchronous state-root aborted: past slot deadline (now_ms={now_ms} >= deadline_ms={deadline_ms})"
+                    )));
+                }
+            }
             let (root, updates) =
                 state.state_root_with_updates(hashed_state.clone()).map_err(BlockExecutionError::other)?;
             (root, updates, None)
