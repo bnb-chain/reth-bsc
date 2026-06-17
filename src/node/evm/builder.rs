@@ -222,6 +222,11 @@ where
                                 None
                             }
                             Err(_timeout) => {
+                                // Build-path state-root missed the slot deadline (the ~DELAY_LEFT_OVER
+                                // budget). A high rate here is a primary cause of empty/low-gas
+                                // blocks: filling stopped but the root wasn't ready in time.
+                                metrics::counter!("bsc_builder_state_root_deadline_timeout_total")
+                                    .increment(1);
                                 tracing::warn!(
                                     target: "bsc::builder",
                                     parent_hash = %self.parent.hash(),
@@ -247,6 +252,15 @@ where
                         }
                     },
                 };
+                // Build-path state-root instrumentation: total attempts, how long we waited (vs the
+                // ~DELAY_LEFT_OVER budget), and how often we fell back to the synchronous root.
+                // fallback_total / total = the build-path root fallback ratio.
+                metrics::counter!("bsc_builder_state_root_total").increment(1);
+                metrics::histogram!("bsc_builder_state_root_wait_duration_seconds")
+                    .record(wait_start.elapsed().as_secs_f64());
+                if delivered.is_none() {
+                    metrics::counter!("bsc_builder_state_root_fallback_total").increment(1);
+                }
                 if let Some(outcome) = delivered {
                     let updates = std::sync::Arc::try_unwrap(outcome.trie_updates)
                         .unwrap_or_else(|arc| (*arc).clone());
