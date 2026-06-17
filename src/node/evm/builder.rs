@@ -275,6 +275,8 @@ where
                         target: "bsc::builder",
                         parent_hash = %self.parent.hash(),
                         block_number = %(self.parent.number + 1),
+                        user_tx_count = self.transactions.len(),
+                        state_root = %outcome.state_root,
                         wait_ms = wait_start.elapsed().as_millis(),
                         "Sparse-trie state-root delivered post-finish()"
                     );
@@ -354,6 +356,7 @@ where
                 user_tx_count = self.transactions.len(),
                 hashed_accounts = hashed_state.accounts.len(),
                 hashed_storages = hashed_state.storages.len(),
+                state_root = %root,
                 "Using precomputed state root from sparse-trie task"
             );
             (root, updates, None)
