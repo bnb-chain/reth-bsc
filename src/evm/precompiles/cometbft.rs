@@ -1,5 +1,5 @@
 //! Credits to <https://github.com/bnb-chain/revm/blob/d66170e712460ae766fc26a063f106658ce33e9d/crates/precompile/src/cometbft.rs>
-use crate::evm::precompiles::error::BscPrecompileError;
+use crate::evm::precompiles::{dedup::DuplicateTracker, error::BscPrecompileError};
 use alloy_primitives::Bytes;
 use cometbft::{block::signed_header::SignedHeader, validator::Set, vote::Power, PublicKey};
 use cometbft_light_client::{
@@ -24,6 +24,9 @@ pub(crate) const COMETBFT_LIGHT_BLOCK_VALIDATION: Precompile =
 pub(crate) const COMETBFT_LIGHT_BLOCK_VALIDATION_BEFORE_HERTZ: Precompile =
     Precompile::new(PrecompileId::Custom(Cow::Borrowed("COMET_BFT_LIGHT_BLOCK_VALIDATE")), u64_to_address(103), cometbft_light_block_validation_run_before_hertz);
 
+pub(crate) const COMETBFT_LIGHT_BLOCK_VALIDATION_PASTEUR: Precompile =
+    Precompile::new(PrecompileId::Custom(Cow::Borrowed("COMET_BFT_LIGHT_BLOCK_VALIDATE_PASTEUR")), u64_to_address(103), cometbft_light_block_validation_run_pasteur);
+
 const UINT64_TYPE_LENGTH: u64 = 8;
 const CONSENSUS_STATE_LENGTH_BYTES_LENGTH: u64 = 32;
 const VALIDATE_RESULT_METADATA_LENGTH: u64 = 32;
@@ -47,7 +50,7 @@ const MAX_CONSENSUS_STATE_LENGTH: u64 = CHAIN_ID_LENGTH +
     99 * SINGLE_VALIDATOR_BYTES_LENGTH;
 
 fn cometbft_light_block_validation_run(input: &[u8], gas_limit: u64, reservoir: u64) -> PrecompileResult {
-    cometbft_light_block_validation_run_inner(input, gas_limit, reservoir, true)
+    cometbft_light_block_validation_run_inner(input, gas_limit, reservoir, true, false)
 }
 
 fn cometbft_light_block_validation_run_before_hertz(
@@ -55,7 +58,15 @@ fn cometbft_light_block_validation_run_before_hertz(
     gas_limit: u64,
     reservoir: u64,
 ) -> PrecompileResult {
-    cometbft_light_block_validation_run_inner(input, gas_limit, reservoir, false)
+    cometbft_light_block_validation_run_inner(input, gas_limit, reservoir, false, false)
+}
+
+fn cometbft_light_block_validation_run_pasteur(
+    input: &[u8],
+    gas_limit: u64,
+    reservoir: u64,
+) -> PrecompileResult {
+    cometbft_light_block_validation_run_inner(input, gas_limit, reservoir, true, true)
 }
 
 fn cometbft_light_block_validation_run_inner(
@@ -63,6 +74,7 @@ fn cometbft_light_block_validation_run_inner(
     gas_limit: u64,
     reservoir: u64,
     is_hertz: bool,
+    require_unique_validators: bool,
 ) -> PrecompileResult {
     const COMETBFT_LIGHT_BLOCK_VALIDATION_BASE: u64 = 3_000;
 
@@ -70,15 +82,24 @@ fn cometbft_light_block_validation_run_inner(
         return Ok(PrecompileOutput::halt(PrecompileHalt::OutOfGas, reservoir));
     }
 
-    let (mut consensus_state, tm_light_block) = match decode_light_block_validation_input(input) {
-        Ok(v) => v,
-        Err(h) => return Ok(PrecompileOutput::halt(h, reservoir)),
-    };
+    let (mut consensus_state, tm_light_block) =
+        match decode_light_block_validation_input(input, require_unique_validators) {
+            Ok(v) => v,
+            Err(h) => return Ok(PrecompileOutput::halt(h, reservoir)),
+        };
 
     let light_block = match convert_light_block_from_proto(&tm_light_block) {
         Ok(v) => v,
         Err(h) => return Ok(PrecompileOutput::halt(h, reservoir)),
     };
+
+    // From Pasteur, reject duplicate identities in the incoming light block's validator set
+    // (the trusted consensus state set is checked during decoding above).
+    if require_unique_validators {
+        if let Err(h) = validate_unique_validator_set(&light_block.validators) {
+            return Ok(PrecompileOutput::halt(h, reservoir));
+        }
+    }
 
     let mut validator_set_changed = match consensus_state.apply_light_block(&light_block) {
         Ok(v) => v,
@@ -120,7 +141,10 @@ fn convert_light_block_from_proto(light_block_proto: &TmLightBlock) -> ConvertLi
 }
 
 type DecodeLightBlockResult = Result<(ConsensusState, TmLightBlock), PrecompileHalt>;
-fn decode_light_block_validation_input(input: &[u8]) -> DecodeLightBlockResult {
+fn decode_light_block_validation_input(
+    input: &[u8],
+    require_unique_validators: bool,
+) -> DecodeLightBlockResult {
     let input_length = input.len() as u64;
     if input_length < CONSENSUS_STATE_LENGTH_BYTES_LENGTH {
         return Err(BscPrecompileError::InvalidInput.into());
@@ -147,7 +171,7 @@ fn decode_light_block_validation_input(input: &[u8]) -> DecodeLightBlockResult {
             (CONSENSUS_STATE_LENGTH_BYTES_LENGTH + cs_length) as usize]
             .to_vec(),
     );
-    let consensus_state = decode_consensus_state(&decode_input)?;
+    let consensus_state = decode_consensus_state(&decode_input, require_unique_validators)?;
 
     let mut light_block_pb: TmLightBlock = TmLightBlock::default();
     match light_block_pb
@@ -309,7 +333,10 @@ type DecodeConsensusStateResult = Result<ConsensusState, PrecompileHalt>;
 /// input:
 /// | chainID   | height   | nextValidatorSetHash | [{validator pubkey, voting power, relayer address, relayer bls pubkey}] |
 /// | 32 bytes  | 8 bytes  | 32 bytes             | [{32 bytes, 8 bytes, 20 bytes, 48 bytes}]
-fn decode_consensus_state(input: &Bytes) -> DecodeConsensusStateResult {
+fn decode_consensus_state(
+    input: &Bytes,
+    require_unique_validators: bool,
+) -> DecodeConsensusStateResult {
     let minimum_length = CHAIN_ID_LENGTH + HEIGHT_LENGTH + VALIDATOR_SET_HASH_LENGTH;
     let input_length = input.len() as u64;
     if input_length <= minimum_length ||
@@ -374,12 +401,40 @@ fn decode_consensus_state(input: &Bytes) -> DecodeConsensusStateResult {
         validator_set.push(validator_info);
     }
 
-    Ok(ConsensusState::new(
+    let consensus_state = ConsensusState::new(
         chain_id,
         height,
         next_validator_set_hash,
         ValidatorSet::without_proposer(validator_set),
-    ))
+    );
+    if require_unique_validators {
+        validate_unique_validator_set(&consensus_state.validators)?;
+    }
+
+    Ok(consensus_state)
+}
+
+/// Reject validator sets that repeat any identity field, mirroring bnb-chain/bsc's Pasteur
+/// `validateUniqueValidatorSet`. Validator address and consensus pubkey must always be unique;
+/// the optional bridge fields (BLS key, relayer address) are only checked when set, since unset
+/// fields are zero-filled by the fixed-width decoding and legitimately repeat.
+fn validate_unique_validator_set(validators: &ValidatorSet) -> Result<(), PrecompileHalt> {
+    let vals = validators.validators();
+    let size = vals.len();
+
+    let mut addresses = DuplicateTracker::new("validator address", size, false);
+    let mut pubkeys = DuplicateTracker::new("validator pubkey", size, false);
+    let mut bls_keys = DuplicateTracker::new("validator bls key", size, true);
+    let mut relayer_addresses = DuplicateTracker::new("validator relayer address", size, true);
+
+    for (idx, validator) in vals.iter().enumerate() {
+        addresses.check(idx, validator.address.as_bytes())?;
+        pubkeys.check(idx, &validator.pub_key.to_bytes())?;
+        bls_keys.check(idx, validator.bls_key.as_ref())?;
+        relayer_addresses.check(idx, validator.relayer_address.as_ref())?;
+    }
+
+    Ok(())
 }
 
 /// output:
@@ -543,7 +598,7 @@ mod tests {
             let bls_pub_key = Bytes::from(hex!("a60afe627fd78b19e07e07e19d446009dd53a18c6c8744176a5d851a762bbb51198e7e006f2a6ea7225661a61ecd832d"));
             let relayer_address = Bytes::from(hex!("B32d0723583040F3A16D1380D1e6AA874cD1bdF7"));
             let cs_bytes = Bytes::from(hex!("636861696e5f393030302d31323100000000000000000000000000000000000000000000000000010ce856b1dc9cdcf3bf2478291cf02c62aeeb3679889e9866931bf1fb05a10edac3d9a1082f42ca161402f8668f8e39ec9e30092affd8d3262267ac7e248a959e0000000000002710b32d0723583040f3a16d1380d1e6aa874cd1bdf7a60afe627fd78b19e07e07e19d446009dd53a18c6c8744176a5d851a762bbb51198e7e006f2a6ea7225661a61ecd832d"));
-            let cs = match decode_consensus_state(&cs_bytes) {
+            let cs = match decode_consensus_state(&cs_bytes, false) {
                 Ok(cs) => cs,
                 Err(_) => panic!("decode consensus state failed"),
             };
@@ -601,7 +656,7 @@ mod tests {
             relayer_addresses.push(Bytes::from(hex!("97376a436bbf54e0f6949b57aa821a90a749920a")));
             let validator_set = ValidatorSet::without_proposer(validators_info);
             let cs_bytes = Bytes::from(hex!("636861696e5f393030302d3132310000000000000000000000000000000000000000000000000001a5f1af4874227f1cdbe5240259a365ad86484a4255bfd65e2a0222d733fcdbc320cc466ee9412ddd49e0fff04cdb41bade2b7622f08b6bdacac94d4de03bdb970000000000002710d5e63aeee6e6fa122a6a23a6e0fca87701ba1541aa2d28cbcd1ea3a63479f6fb260a3d755853e6a78cfa6252584fee97b2ec84a9d572ee4a5d3bc1558bb98a4b370fb8616b0b523ee91ad18a63d63f21e0c40a83ef15963f4260574ca5159fd90a1c527000000000000027106fd1ceb5a48579f322605220d4325bd9ff90d5fab31e74a881fc78681e3dfa440978d2b8be0708a1cbbca2c660866216975fdaf0e9038d9b7ccbf9731f43956dba7f2451919606ae20bf5d248ee353821754bcdb456fd3950618fda3e32d3d0fb990eeda000000000000271097376a436bbf54e0f6949b57aa821a90a749920ab32979580ea04984a2be033599c20c7a0c9a8d121b57f94ee05f5eda5b36c38f6e354c89328b92cdd1de33b64d3a0867"));
-            let cs = match decode_consensus_state(&cs_bytes) {
+            let cs = match decode_consensus_state(&cs_bytes, false) {
                 Ok(cs) => cs,
                 Err(_) => panic!("decode consensus state failed"),
             };
@@ -632,7 +687,7 @@ mod tests {
     fn test_apply_light_block() {
         {
             let cs_bytes = Bytes::from(hex!("677265656e6669656c645f393030302d3132310000000000000000000000000000000000000000013c350cd55b99dc6c2b7da9bef5410fbfb869fede858e7b95bf7ca294e228bb40e33f6e876d63791ebd05ff617a1b4f4ad1aa2ce65e3c3a9cdfb33e0ffa7e8423000000000098968015154514f68ce65a0d9eecc578c0ab12da0a2a28a0805521b5b7ae56eb3fb24555efbfe59e1622bfe9f7be8c9022e9b3f2442739c1ce870b9adee169afe60f674edd7c86451c5363d89052fde8351895eeea166ce5373c36e31b518ed191d0c599aa0f5b0000000000989680432f6c4908a9aa5f3444421f466b11645235c99b831b2a2de9e504d7ea299e52a202ce529808618eb3bfc0addf13d8c5f2df821d81e18f9bc61583510b322d067d46323b0a572635c06a049c0a2a929e3c8184a50cf6a8b95708c25834ade456f399015a0000000000989680864cb9828254d712f8e59b164fc6a9402dc4e6c59065e38cff24f5323c8c5da888a0f97e5ee4ba1e11b0674b0a0d06204c1dfa247c370cd4be3e799fc4f6f48d977ac7ca"));
-            let mut cs = match decode_consensus_state(&cs_bytes) {
+            let mut cs = match decode_consensus_state(&cs_bytes, false) {
                 Ok(cs) => cs,
                 Err(_) => panic!("decode consensus state failed"),
             };
@@ -659,7 +714,7 @@ mod tests {
         }
         {
             let cs_bytes = Bytes::from(hex!("677265656e6669656c645f393030302d313734310000000000000000000000000000000000000001af6b801dda578dddfa4da1d5d67fd1b32510db24ec271346fc573e9242b01c9a112b51dda2d336246bdc0cc51407ba0cb0e5087be0db5f1cdc3285bbaa8e647500000000000003e84202722cf6a34d727be762b46825b0d26b6263a0a9355ebf3c24bedac5a357a56feeb2cd8b6fed9f14cca15c3091f523b9fb21183b4bb31eb482a0321885e3f57072156448e2b2f7d9a3e7b668757d9cc0bbd28cd674c34ed1c2ed75c5de3b6a8f8cad4600000000000003e8668a0acd8f6db5cae959a0e02132f4d6a672c4d7a4726b542012cc8023ee07b29ab3971cc999d8751bbd16f23413968afcdb070ed66ab47e6e1842bf875bef21dfc5b8af6813bfd82860d361e339bd1ae2f801b6d6ee46b8497a3d51c80b50b6160ea1cc00000000000003e80dfa99423d3084c596c5e3bd6bcb4f654516517b8d4786703c56b300b70f085c0d0482e5d6a3c7208883f0ec8abd2de893f71d18e8f919e7ab198499201d87f92c57ebce83ed2b763bb872e9bc148fb216fd5c93b18819670d9a946ae4b3075672d726b800000000000003e824aab6f85470ff73e3048c64083a09e980d4cb7f8146d231a7b2051c5f7a9c07ab6e6bfe277bd5f4a94f901fe6ee7a6b6bd8479e9e5e448de4b1b33d5ddd74194c86b3852cc140a3f08a9c4149efd45643202f8bef2ad7eecf53e58951c6df6fd932004b00000000000003e84998f6ef8d999a0f36a851bfa29dbcf0364dd65695c286deb3f1657664859d59876bf1ec5a288f6e66e18b37b8a2a1e6ee4a3ef8fa50784d8b758d0c3e70a7cdfe65ab5d"));
-            let mut cs = match decode_consensus_state(&cs_bytes) {
+            let mut cs = match decode_consensus_state(&cs_bytes, false) {
                 Ok(cs) => cs,
                 Err(_) => panic!("decode consensus state failed"),
             };
@@ -700,5 +755,138 @@ mod tests {
         assert_eq!(output.gas_used, 3_000);
         assert_eq!(output.bytes, except_output_after_hertz);
         assert!(output.is_success());
+    }
+
+    #[test]
+    fn pasteur_rejects_duplicate_validators_in_consensus_state() {
+        // Two identical validators collide on address, pubkey, bls key and relayer address.
+        let pk = || {
+            PublicKey::from_raw_ed25519(&hex!(
+                "c3d9a1082f42ca161402f8668f8e39ec9e30092affd8d3262267ac7e248a959e"
+            ))
+            .unwrap()
+        };
+        let bls = hex!("a60afe627fd78b19e07e07e19d446009dd53a18c6c8744176a5d851a762bbb51198e7e006f2a6ea7225661a61ecd832d").to_vec();
+        let relayer = hex!("b32d0723583040f3a16d1380d1e6aa874cd1bdf7").to_vec();
+        let cs = ConsensusState::new(
+            "chain_9000-121".to_string(),
+            1,
+            Bytes::from(
+                hex!("0ce856b1dc9cdcf3bf2478291cf02c62aeeb3679889e9866931bf1fb05a10eda").to_vec(),
+            ),
+            ValidatorSet::without_proposer(vec![
+                Validator::new_with_bls_and_relayer(
+                    pk(),
+                    Power::from(10000_u32),
+                    bls.clone(),
+                    relayer.clone(),
+                ),
+                Validator::new_with_bls_and_relayer(
+                    pk(),
+                    Power::from(10000_u32),
+                    bls.clone(),
+                    relayer.clone(),
+                ),
+            ]),
+        );
+        let encoded = cs.encode().expect("encode consensus state");
+
+        // Pre-Pasteur decoding tolerates duplicates; Pasteur rejects them.
+        assert!(decode_consensus_state(&encoded, false).is_ok());
+        match decode_consensus_state(&encoded, true) {
+            Err(PrecompileHalt::Other(msg)) => assert!(msg.contains("duplicate validator")),
+            Err(other) => panic!("unexpected halt: {other:?}"),
+            Ok(_) => panic!("expected duplicate-validator rejection"),
+        }
+    }
+
+    #[test]
+    fn validate_unique_validator_set_checks_bridge_keys() {
+        let pk0 = || {
+            PublicKey::from_raw_ed25519(&hex!(
+                "20cc466ee9412ddd49e0fff04cdb41bade2b7622f08b6bdacac94d4de03bdb97"
+            ))
+            .unwrap()
+        };
+        let pk1 = || {
+            PublicKey::from_raw_ed25519(&hex!(
+                "6b0b523ee91ad18a63d63f21e0c40a83ef15963f4260574ca5159fd90a1c5270"
+            ))
+            .unwrap()
+        };
+        let bls0 = hex!("aa2d28cbcd1ea3a63479f6fb260a3d755853e6a78cfa6252584fee97b2ec84a9d572ee4a5d3bc1558bb98a4b370fb861").to_vec();
+        let bls1 = hex!("b31e74a881fc78681e3dfa440978d2b8be0708a1cbbca2c660866216975fdaf0e9038d9b7ccbf9731f43956dba7f2451").to_vec();
+        let relayer0 = hex!("d5e63aeee6e6fa122a6a23a6e0fca87701ba1541").to_vec();
+        let relayer1 = hex!("6fd1ceb5a48579f322605220d4325bd9ff90d5fa").to_vec();
+
+        // Duplicate BLS key (pubkeys and relayer addresses distinct).
+        let set = ValidatorSet::without_proposer(vec![
+            Validator::new_with_bls_and_relayer(pk0(), Power::from(1_u32), bls0.clone(), relayer0.clone()),
+            Validator::new_with_bls_and_relayer(pk1(), Power::from(1_u32), bls0.clone(), relayer1.clone()),
+        ]);
+        match validate_unique_validator_set(&set).unwrap_err() {
+            PrecompileHalt::Other(msg) => assert!(msg.contains("duplicate validator bls key")),
+            other => panic!("unexpected halt: {other:?}"),
+        }
+
+        // Duplicate relayer address.
+        let set = ValidatorSet::without_proposer(vec![
+            Validator::new_with_bls_and_relayer(pk0(), Power::from(1_u32), bls0.clone(), relayer0.clone()),
+            Validator::new_with_bls_and_relayer(pk1(), Power::from(1_u32), bls1.clone(), relayer0.clone()),
+        ]);
+        match validate_unique_validator_set(&set).unwrap_err() {
+            PrecompileHalt::Other(msg) => assert!(msg.contains("duplicate validator relayer address")),
+            other => panic!("unexpected halt: {other:?}"),
+        }
+
+        // Unset (all-zero) bridge fields may legitimately repeat across validators.
+        let set = ValidatorSet::without_proposer(vec![
+            Validator::new_with_bls_and_relayer(pk0(), Power::from(1_u32), vec![0u8; 48], vec![0u8; 20]),
+            Validator::new_with_bls_and_relayer(pk1(), Power::from(1_u32), vec![0u8; 48], vec![0u8; 20]),
+        ]);
+        assert!(validate_unique_validator_set(&set).is_ok());
+    }
+
+    #[test]
+    fn pasteur_accepts_unique_validator_set() {
+        // Three distinct validators must pass the uniqueness check (no false positives).
+        let cs = ConsensusState::new(
+            "chain_9000-121".to_string(),
+            1,
+            Bytes::from(
+                hex!("a5f1af4874227f1cdbe5240259a365ad86484a4255bfd65e2a0222d733fcdbc3").to_vec(),
+            ),
+            ValidatorSet::without_proposer(vec![
+                Validator::new_with_bls_and_relayer(
+                    PublicKey::from_raw_ed25519(&hex!(
+                        "20cc466ee9412ddd49e0fff04cdb41bade2b7622f08b6bdacac94d4de03bdb97"
+                    ))
+                    .unwrap(),
+                    Power::from(10000_u32),
+                    hex!("aa2d28cbcd1ea3a63479f6fb260a3d755853e6a78cfa6252584fee97b2ec84a9d572ee4a5d3bc1558bb98a4b370fb861").to_vec(),
+                    hex!("d5e63aeee6e6fa122a6a23a6e0fca87701ba1541").to_vec(),
+                ),
+                Validator::new_with_bls_and_relayer(
+                    PublicKey::from_raw_ed25519(&hex!(
+                        "6b0b523ee91ad18a63d63f21e0c40a83ef15963f4260574ca5159fd90a1c5270"
+                    ))
+                    .unwrap(),
+                    Power::from(10000_u32),
+                    hex!("b31e74a881fc78681e3dfa440978d2b8be0708a1cbbca2c660866216975fdaf0e9038d9b7ccbf9731f43956dba7f2451").to_vec(),
+                    hex!("6fd1ceb5a48579f322605220d4325bd9ff90d5fa").to_vec(),
+                ),
+                Validator::new_with_bls_and_relayer(
+                    PublicKey::from_raw_ed25519(&hex!(
+                        "919606ae20bf5d248ee353821754bcdb456fd3950618fda3e32d3d0fb990eeda"
+                    ))
+                    .unwrap(),
+                    Power::from(10000_u32),
+                    hex!("b32979580ea04984a2be033599c20c7a0c9a8d121b57f94ee05f5eda5b36c38f6e354c89328b92cdd1de33b64d3a0867").to_vec(),
+                    hex!("97376a436bbf54e0f6949b57aa821a90a749920a").to_vec(),
+                ),
+            ]),
+        );
+        let encoded = cs.encode().expect("encode consensus state");
+        assert!(decode_consensus_state(&encoded, true).is_ok());
     }
 }
