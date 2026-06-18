@@ -69,6 +69,8 @@ hardfork!(
         Osaka,
         /// BSC `Mendel` hardfork
         Mendel,
+        /// BSC `Pasteur` hardfork - sequenced immediately after Mendel
+        Pasteur,
     }
 );
 
@@ -119,6 +121,8 @@ impl BscHardfork {
             (Self::Fermi.boxed(), ForkCondition::Timestamp(1768357800)), /* 2026-01-14 02:30:00 AM UTC */
             (Self::Osaka.boxed(), ForkCondition::Timestamp(1777343400)),
             (Self::Mendel.boxed(), ForkCondition::Timestamp(1777343400)),
+            // TODO: real activation TBD; unscheduled (u64::MAX) until announced.
+            (Self::Pasteur.boxed(), ForkCondition::Timestamp(u64::MAX)),
         ])
     }
 
@@ -166,6 +170,8 @@ impl BscHardfork {
             (Self::Fermi.boxed(), ForkCondition::Timestamp(1762741500)),
             (Self::Osaka.boxed(), ForkCondition::Timestamp(1774319400)),
             (Self::Mendel.boxed(), ForkCondition::Timestamp(1774319400)),
+            // TODO: real activation TBD; unscheduled (u64::MAX) until announced.
+            (Self::Pasteur.boxed(), ForkCondition::Timestamp(u64::MAX)),
         ])
     }
 
@@ -210,6 +216,8 @@ impl BscHardfork {
             (Self::Lorentz.boxed(), ForkCondition::Timestamp(1754967081)),
             (Self::Maxwell.boxed(), ForkCondition::Timestamp(1754967101)),
             (Self::Fermi.boxed(), ForkCondition::Timestamp(1761030900)),
+            // TODO: real activation TBD; unscheduled (u64::MAX) until announced.
+            (Self::Pasteur.boxed(), ForkCondition::Timestamp(u64::MAX)),
         ])
     }
 
@@ -263,7 +271,7 @@ impl From<BscHardfork> for SpecId {
             | BscHardfork::Lorentz
             | BscHardfork::Maxwell
             | BscHardfork::Fermi => SpecId::PRAGUE,
-            BscHardfork::Osaka | BscHardfork::Mendel => SpecId::OSAKA,
+            BscHardfork::Osaka | BscHardfork::Mendel | BscHardfork::Pasteur => SpecId::OSAKA,
         }
     }
 }
@@ -272,6 +280,56 @@ impl From<BscHardfork> for SpecId {
 mod tests {
     use super::*;
     use crate::chainspec::{bsc::bsc_mainnet, bsc_chapel::bsc_testnet};
+
+    #[test]
+    fn test_pasteur_is_sequenced_after_mendel() {
+        // Derived ordering must place Pasteur as the highest fork so that
+        // `spec >= BscHardfork::Pasteur` is the first/highest dispatcher check.
+        assert!(BscHardfork::Pasteur > BscHardfork::Mendel);
+        assert!(BscHardfork::Pasteur > BscHardfork::Osaka);
+        // Pasteur is a BSC-only precompile/system-contract fork with no new EVM spec.
+        assert_eq!(SpecId::from(BscHardfork::Pasteur), SpecId::OSAKA);
+    }
+
+    #[test]
+    fn test_pasteur_present_but_unscheduled_in_schedules() {
+        for hardforks in [
+            BscHardfork::bsc_mainnet(),
+            BscHardfork::bsc_testnet(),
+            BscHardfork::bsc_qanet(),
+        ] {
+            let activation = hardforks.fork(BscHardfork::Pasteur);
+            assert_eq!(
+                activation,
+                ForkCondition::Timestamp(u64::MAX),
+                "Pasteur should be defined but dormant until a real activation is set"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pasteur_resolves_at_its_timestamp() {
+        use crate::node::evm::config::revm_spec_by_timestamp_and_block_number;
+
+        // Give Pasteur a concrete activation just after Mendel (1777343400 on mainnet).
+        let pasteur_time = 1_777_343_400 + 1_000;
+        let mut cs = bsc_mainnet();
+        cs.hardforks.insert(BscHardfork::Pasteur, ForkCondition::Timestamp(pasteur_time));
+        let spec = crate::chainspec::BscChainSpec::from(cs);
+
+        let block = 50_000_000; // well past London activation (31302048)
+
+        // Just before Pasteur, the latest fork is still Mendel.
+        assert_eq!(
+            revm_spec_by_timestamp_and_block_number(spec.clone(), pasteur_time - 1, block),
+            BscHardfork::Mendel
+        );
+        // At/after Pasteur's timestamp, it resolves to Pasteur.
+        assert_eq!(
+            revm_spec_by_timestamp_and_block_number(spec.clone(), pasteur_time, block),
+            BscHardfork::Pasteur
+        );
+    }
 
     #[test]
     fn test_hardfork_activation_order_differences() {

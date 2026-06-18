@@ -485,7 +485,11 @@ fn mendel_traced() -> &'static TracedPrecompiles {
 
 fn traced_precompiles_for_spec(spec: BscHardfork) -> &'static TracedPrecompiles {
     // Osaka uses updated precompiles (EIP-7823/7883 MODEXP, EIP-7951 P256VERIFY)
-    if spec >= BscHardfork::Mendel {
+    if spec >= BscHardfork::Pasteur {
+        // Pasteur currently reuses the Mendel precompile set; later PRs introduce
+        // a dedicated Pasteur set (validator-set dedup, suspended v1 precompiles, etc.).
+        mendel_traced()
+    } else if spec >= BscHardfork::Mendel {
         mendel_traced()
     } else if spec >= BscHardfork::Pascal {
         pascal_traced()
@@ -603,5 +607,19 @@ impl BscPrecompiles {
 impl Default for BscPrecompiles {
     fn default() -> Self {
         Self::new(BscHardfork::default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pasteur_reuses_mendel_precompile_set() {
+        // PR 1 introduces the fork but must not change precompile behavior: the Pasteur
+        // set is identical to Mendel until later PRs add a dedicated set.
+        let pasteur = traced_precompiles_for_spec(BscHardfork::Pasteur).precompiles();
+        let mendel = traced_precompiles_for_spec(BscHardfork::Mendel).precompiles();
+        assert_eq!(pasteur.addresses_set(), mendel.addresses_set());
     }
 }
