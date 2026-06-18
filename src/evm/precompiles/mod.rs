@@ -17,6 +17,7 @@ use std::{boxed::Box, cell::RefCell, collections::HashMap};
 
 mod bls;
 mod cometbft;
+mod dedup;
 mod double_sign;
 mod error;
 mod iavl;
@@ -421,6 +422,13 @@ fn build_mendel_precompiles() -> Precompiles {
     precompiles
 }
 
+fn build_pasteur_precompiles() -> Precompiles {
+    // PR 1/2 scaffolding: Pasteur reuses the Mendel set unchanged. Later PRs override
+    // the bridge precompiles here (validator-set dedup on 0x67, BLS pubkey dedup on 0x66,
+    // suspended v1 Tendermint precompiles on 0x64/0x65).
+    build_mendel_precompiles()
+}
+
 // --- Traced precompile singletons ---------------------------------------------------------------
 
 fn istanbul_traced() -> &'static TracedPrecompiles {
@@ -483,12 +491,18 @@ fn mendel_traced() -> &'static TracedPrecompiles {
     INSTANCE.get_or_init(|| Box::new(build_traced_precompiles(build_mendel_precompiles())))
 }
 
+fn pasteur_traced() -> &'static TracedPrecompiles {
+    static INSTANCE: OnceBox<TracedPrecompiles> = OnceBox::new();
+    INSTANCE.get_or_init(|| Box::new(build_traced_precompiles(build_pasteur_precompiles())))
+}
+
 fn traced_precompiles_for_spec(spec: BscHardfork) -> &'static TracedPrecompiles {
     // Osaka uses updated precompiles (EIP-7823/7883 MODEXP, EIP-7951 P256VERIFY)
     if spec >= BscHardfork::Pasteur {
-        // Pasteur currently reuses the Mendel precompile set; later PRs introduce
-        // a dedicated Pasteur set (validator-set dedup, suspended v1 precompiles, etc.).
-        mendel_traced()
+        // Pasteur reuses the Mendel precompile set today; later PRs add the dedicated
+        // Pasteur bridge precompiles (validator-set dedup, suspended v1 precompiles, etc.)
+        // via `build_pasteur_precompiles`.
+        pasteur_traced()
     } else if spec >= BscHardfork::Mendel {
         mendel_traced()
     } else if spec >= BscHardfork::Pascal {
@@ -581,6 +595,12 @@ pub fn pascal() -> &'static Precompiles {
 /// Includes EIP-7823/7883 (MODEXP) and EIP-7951 (P256VERIFY gas increase).
 pub fn mendel() -> &'static Precompiles {
     mendel_traced().precompiles()
+}
+
+/// Returns precompiles for Pasteur spec.
+/// Currently identical to Mendel; later PRs add the Pasteur bridge precompiles.
+pub fn pasteur() -> &'static Precompiles {
+    pasteur_traced().precompiles()
 }
 
 // BSC precompile provider
