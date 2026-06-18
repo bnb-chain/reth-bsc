@@ -428,11 +428,21 @@ where
         let validator_cache_sink: ValidatorCacheSink = Arc::new(Mutex::new(None));
         let turn_length_sink: Arc<Mutex<Option<u8>>> = Arc::new(Mutex::new(None));
 
-        // Sink for the sparse-trie precomputed state root. The same Arc<Mutex<>> from
-        // `state_root_precomputed` is threaded into ctx so builder.rs can read it during
-        // `finish`. When the sparse-trie path is not active (flag off), this Mutex stays
-        // `None` and the builder falls through to `state_root_with_updates`.
-        let state_root_precomputed_sink = state_root_precomputed.clone();
+        // Sink for the sparse-trie precomputed state root. This MUST be a fresh per-attempt
+        // Arc<Mutex<>> — NOT a clone of the job-level `state_root_precomputed`. The job-level Arc
+        // is shared by every build attempt (including the deadline-spawned empty-fallback build),
+        // and inside `finish` the write (after the sparse-trie wait) and the read-back
+        // (`sink.take()`) are separated by `merge_transitions` + `hashed_post_state` over all txs
+        // (~hundreds of ms for a full block). With a shared sink, a concurrent second finish (e.g.
+        // the empty build, which has no trie_handle so it jumps straight to the take()) steals the
+        // root this attempt deposited, forcing this attempt onto the slow synchronous
+        // `state_root_with_updates`. A per-attempt sink makes write→read strictly intra-attempt, so
+        // the full build reads back its OWN precomputed root. When the sparse-trie path is not active
+        // (flag off), this Mutex stays `None` and the builder falls through to
+        // `state_root_with_updates`.
+        let state_root_precomputed_sink: Arc<
+            Mutex<Option<(alloy_primitives::B256, reth_trie_common::updates::TrieUpdates)>>,
+        > = Arc::new(Mutex::new(None));
 
         let next_env_attributes = BscNextBlockEnvAttributes {
             inner: NextBlockEnvAttributes {
@@ -827,7 +837,10 @@ where
         // it after executor.finish() and calls `state_root()` once the hook is
         // naturally dropped (executor consumption triggers `StateHookSender::drop`
         // which sends `FinishedStateUpdates`).
-        let _ = &state_root_precomputed; // sink referenced for trace; written by builder
+        // The job-level `state_root_precomputed` Arc is vestigial: this attempt uses its own
+        // per-attempt sink (see `state_root_precomputed_sink` above). Kept bound to avoid an
+        // unused-variable warning until the field is removed from BscBuildArguments.
+        let _ = &state_root_precomputed;
         let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } =
             builder.finish(&state_provider, None)?;
 
@@ -982,7 +995,13 @@ where
                     },
                     validator_cache_sink: Some(validator_cache_sink.clone()),
                     turn_length_sink: Some(turn_length_sink.clone()),
-                    state_root_precomputed_sink: Some(state_root_precomputed.clone()),
+                    // Empty-fallback build never installs a sparse-trie hook (trie_handle: None
+                    // below), so it must NOT read from any sparse-trie sink. Passing None makes the
+                    // builder compute this empty block's own (cheap) state root via
+                    // `state_root_with_updates` instead of stealing a full build's precomputed root
+                    // out of a shared sink (which both starved the full build and risked sealing a
+                    // foreign root onto the empty block).
+                    state_root_precomputed_sink: None,
                     // Empty-payload path: don't engage sparse-trie (would still be
                     // correct but the setup overhead isn't worth it for ~0-tx blocks).
                     trie_handle: None,
