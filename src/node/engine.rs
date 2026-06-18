@@ -187,14 +187,26 @@ where
                                     .last()
                                     .map(|b| b.recovered_block().parent_hash())
                                     .unwrap_or(parent_hash);
+                                // Instrumentation: the in-memory overlay depth (= head - on-disk
+                                // tip ≈ persist lag) the proof workers must reconstruct over. We
+                                // suspect a deep overlay (and the per-spawn empty ChangesetCache
+                                // above) is what makes the occasional root slow — NOT tx count.
+                                // Correlate this with bsc_builder_state_root_wait_duration_seconds.
+                                metrics::histogram!("bsc_miner_overlay_depth")
+                                    .record(blocks.len() as f64);
+                                metrics::counter!("bsc_miner_sparse_trie_anchor_inmemory_total")
+                                    .increment(1);
                                 (anchor, Some(LazyOverlay::new(blocks)))
                             }
                             None => {
                                 // Parent already persisted — anchor directly, no overlay.
+                                metrics::counter!("bsc_miner_sparse_trie_anchor_persisted_total")
+                                    .increment(1);
                                 (parent_hash, None)
                             }
                         }
                     } else {
+                        metrics::counter!("bsc_miner_sparse_trie_anchor_nocim_total").increment(1);
                         (parent_hash, None)
                     };
 
@@ -230,12 +242,20 @@ where
                             PrecompileCacheMap::default(),
                         ))
                     });
-                    Some(payload_processor.spawn_state_root(
+                    // Instrumentation: time the spawn itself. spawn_state_root creates the proof
+                    // worker pools and kicks off overlay/proof work per block (3000+ spawns/run);
+                    // a slow spawn points at per-block worker-pool churn / overlay setup rather
+                    // than tx execution.
+                    let spawn_start = std::time::Instant::now();
+                    let handle = payload_processor.spawn_state_root(
                         overlay_factory,
                         parent_state_root,
                         false, // halve_workers
                         tree_config_for_closure.as_ref(),
-                    ))
+                    );
+                    metrics::histogram!("bsc_miner_sparse_trie_spawn_duration_seconds")
+                        .record(spawn_start.elapsed().as_secs_f64());
+                    Some(handle)
                 },
             );
 
