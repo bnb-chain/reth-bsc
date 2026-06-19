@@ -49,8 +49,15 @@ const MAX_CONSENSUS_STATE_LENGTH: u64 = CHAIN_ID_LENGTH +
     VALIDATOR_SET_HASH_LENGTH +
     99 * SINGLE_VALIDATOR_BYTES_LENGTH;
 
+/// Base gas for the cometBFT light-block validation precompile.
+const COMETBFT_LIGHT_BLOCK_VALIDATION_BASE: u64 = 3_000;
+
+/// Per-input-byte gas charged from Pasteur, so cost scales with the validator/signature
+/// count instead of being a flat fee.
+const COMETBFT_LIGHT_BLOCK_VALIDATE_PER_BYTE_GAS: u64 = 16;
+
 fn cometbft_light_block_validation_run(input: &[u8], gas_limit: u64, reservoir: u64) -> PrecompileResult {
-    cometbft_light_block_validation_run_inner(input, gas_limit, reservoir, true, false)
+    cometbft_light_block_validation_run_inner(input, gas_limit, reservoir, true, false, 0)
 }
 
 fn cometbft_light_block_validation_run_before_hertz(
@@ -58,7 +65,7 @@ fn cometbft_light_block_validation_run_before_hertz(
     gas_limit: u64,
     reservoir: u64,
 ) -> PrecompileResult {
-    cometbft_light_block_validation_run_inner(input, gas_limit, reservoir, false, false)
+    cometbft_light_block_validation_run_inner(input, gas_limit, reservoir, false, false, 0)
 }
 
 fn cometbft_light_block_validation_run_pasteur(
@@ -66,7 +73,15 @@ fn cometbft_light_block_validation_run_pasteur(
     gas_limit: u64,
     reservoir: u64,
 ) -> PrecompileResult {
-    cometbft_light_block_validation_run_inner(input, gas_limit, reservoir, true, true)
+    // From Pasteur the cost scales with input size and duplicate validators are rejected.
+    cometbft_light_block_validation_run_inner(
+        input,
+        gas_limit,
+        reservoir,
+        true,
+        true,
+        COMETBFT_LIGHT_BLOCK_VALIDATE_PER_BYTE_GAS,
+    )
 }
 
 fn cometbft_light_block_validation_run_inner(
@@ -75,10 +90,12 @@ fn cometbft_light_block_validation_run_inner(
     reservoir: u64,
     is_hertz: bool,
     require_unique_validators: bool,
+    per_byte_gas: u64,
 ) -> PrecompileResult {
-    const COMETBFT_LIGHT_BLOCK_VALIDATION_BASE: u64 = 3_000;
+    let cost = COMETBFT_LIGHT_BLOCK_VALIDATION_BASE
+        .saturating_add((input.len() as u64).saturating_mul(per_byte_gas));
 
-    if COMETBFT_LIGHT_BLOCK_VALIDATION_BASE > gas_limit {
+    if cost > gas_limit {
         return Ok(PrecompileOutput::halt(PrecompileHalt::OutOfGas, reservoir));
     }
 
@@ -115,7 +132,7 @@ fn cometbft_light_block_validation_run_inner(
     };
 
     Ok(PrecompileOutput::new(
-        COMETBFT_LIGHT_BLOCK_VALIDATION_BASE,
+        cost,
         encode_light_block_validation_result(validator_set_changed, consensus_state_bytes),
         reservoir,
     ))
@@ -888,5 +905,23 @@ mod tests {
         );
         let encoded = cs.encode().expect("encode consensus state");
         assert!(decode_consensus_state(&encoded, true).is_ok());
+    }
+
+    #[test]
+    fn pasteur_0x67_charges_per_byte_gas() {
+        // Gas is charged before decoding, so this needs no valid light block.
+        let input = vec![0u8; 1000];
+        let cost = COMETBFT_LIGHT_BLOCK_VALIDATION_BASE +
+            input.len() as u64 * COMETBFT_LIGHT_BLOCK_VALIDATE_PER_BYTE_GAS;
+
+        // Pasteur prices per input byte: a gas limit one below `cost` runs out of gas.
+        let pasteur = cometbft_light_block_validation_run_pasteur(&input, cost - 1, 0).unwrap();
+        assert_eq!(pasteur.halt_reason(), Some(&PrecompileHalt::OutOfGas));
+
+        // Hertz only ever charges the flat base, so the same limit clears the gas gate (it then
+        // halts on the undecodable input — a halt, but not OutOfGas).
+        let hertz = cometbft_light_block_validation_run(&input, cost - 1, 0).unwrap();
+        assert!(hertz.is_halt());
+        assert_ne!(hertz.halt_reason(), Some(&PrecompileHalt::OutOfGas));
     }
 }
