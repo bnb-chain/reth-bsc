@@ -41,6 +41,7 @@ fn main() {
         "pascal",
         "lorentz",
         "maxwell",
+        "pasteur",
     ];
 
     // Rerun if any of the hardfork directories change

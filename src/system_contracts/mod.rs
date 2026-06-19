@@ -672,6 +672,7 @@ fn hardforks_with_system_contracts() -> Vec<BscHardfork> {
         BscHardfork::Lorentz,
         BscHardfork::Maxwell,
         BscHardfork::Fermi,
+        BscHardfork::Pasteur,
     ]
 }
 
@@ -697,6 +698,7 @@ fn hardfork_to_dir_name(hardfork: &BscHardfork) -> Result<String, SystemContract
         BscHardfork::Lorentz => "lorentz",
         BscHardfork::Maxwell => "maxwell",
         BscHardfork::Fermi => "fermi",
+        BscHardfork::Pasteur => "pasteur",
         _ => {
             return Err(SystemContractError::InvalidHardfork);
         }
@@ -1109,7 +1111,23 @@ where
             }
         }
     }
-    
+
+    if spec.is_pasteur_transition_at_timestamp(block_number, block_time, parent_block_time) {
+        if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Pasteur.name()) {
+            for (address, v) in &contracts {
+                m.insert(*address, v.clone());
+                info!(
+                    target: "bsc::system_contracts::upgrade",
+                    block_number = block_number,
+                    block_time = block_time,
+                    parent_block_time = parent_block_time,
+                    address = ?address,
+                    "Pasteur upgrade contract"
+                );
+            }
+        }
+    }
+
     Ok(m)
 }
 
@@ -1139,6 +1157,52 @@ pub fn is_system_transaction<T: reth_primitives_traits::Transaction>(
 mod tests {
     use super::*;
     use alloy_primitives::address;
+
+    #[test]
+    fn test_pasteur_system_contract_upgrade() {
+        // The Pasteur upgrade swaps exactly StakeHub (0x2002) and Governor (0x2004) on every
+        // network, with non-empty genesis-contract v1.2.6 bytecode.
+        for spec in [bsc_mainnet(), bsc_testnet(), bsc_qanet()] {
+            let res = get_system_contract_codes(&spec, BscHardfork::Pasteur.name()).unwrap();
+            assert_eq!(res.len(), 2, "Pasteur upgrades only StakeHub and Governor");
+
+            for addr in [STAKE_HUB_CONTRACT, GOVERNOR_CONTRACT] {
+                let code = res.get(&addr).expect("contract present").as_ref().unwrap();
+                assert!(!code.original_bytes().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn test_pasteur_upgrade_applied_at_transition() {
+        use reth_chainspec::ForkCondition;
+
+        // Schedule Pasteur at a concrete timestamp just after Mendel and wrap in a BscChainSpec.
+        let pasteur_time = 1_777_343_400 + 1_000;
+        let mut cs = bsc_mainnet();
+        cs.hardforks.insert(BscHardfork::Pasteur, ForkCondition::Timestamp(pasteur_time));
+        let spec = crate::chainspec::BscChainSpec::from(cs);
+
+        let block = 50_000_000; // well past London activation
+
+        // Block whose parent is pre-Pasteur and itself is at/after Pasteur => the upgrade fires,
+        // swapping exactly StakeHub and Governor.
+        let upgraded =
+            get_upgrade_system_contracts(&spec, block, pasteur_time, pasteur_time - 1).unwrap();
+        assert!(upgraded.contains_key(&STAKE_HUB_CONTRACT));
+        assert!(upgraded.contains_key(&GOVERNOR_CONTRACT));
+        assert_eq!(upgraded.len(), 2);
+
+        // A block fully after Pasteur (parent already active) is not a transition => no upgrade.
+        let after =
+            get_upgrade_system_contracts(&spec, block, pasteur_time + 10, pasteur_time + 9).unwrap();
+        assert!(!after.contains_key(&STAKE_HUB_CONTRACT));
+
+        // A block fully before Pasteur is likewise not a Pasteur transition.
+        let before =
+            get_upgrade_system_contracts(&spec, block, pasteur_time - 10, pasteur_time - 11).unwrap();
+        assert!(!before.contains_key(&STAKE_HUB_CONTRACT));
+    }
 
     #[test]
     fn test_get_system_contract_code() {
