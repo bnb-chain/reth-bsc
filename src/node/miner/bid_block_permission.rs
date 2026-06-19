@@ -174,6 +174,11 @@ mod tests {
     };
 
     const BUILDER: Address = address!("0xb32d0723583040f3a16d1380d1e6aa874cd1bdf7");
+    const BUILDER_A: Address = address!("0x000000000000000000000000000000000000000a");
+    const BUILDER_B: Address = address!("0x000000000000000000000000000000000000000b");
+    const BUILDER_C: Address = address!("0x000000000000000000000000000000000000000c");
+    const DAY: u64 = BID_BLOCK_REVOKE_DURATION_SECS;
+    const INSERT_CHAIN_REASON: &str = "insert chain failed";
 
     /// Manager with a test-controllable clock; returns the manager and the shared "now" cell.
     fn manager_with_fake_clock() -> (BidBlockPermissionManager, Arc<AtomicU64>) {
@@ -245,5 +250,141 @@ mod tests {
 
         mgr.set_allowed(BUILDER, true);
         assert!(mgr.is_allowed(BUILDER));
+    }
+
+    #[test]
+    fn builders_are_independent() {
+        let (mgr, _now) = manager_with_fake_clock();
+        mgr.revoke(BUILDER_A, INSERT_CHAIN_REASON, B256::ZERO, 1);
+        assert!(!mgr.is_allowed(BUILDER_A), "A should be revoked");
+        assert!(mgr.is_allowed(BUILDER_B), "B should remain active");
+    }
+
+    #[test]
+    fn revoke_overwrites_previous_record() {
+        let (mgr, _now) = manager_with_fake_clock();
+        mgr.revoke(BUILDER, INSERT_CHAIN_REASON, B256::repeat_byte(0x01), 1);
+        mgr.revoke(BUILDER, REVOKE_REASON_MANUAL, B256::repeat_byte(0x02), 2);
+
+        // Most recent revoke wins.
+        let status = mgr.get_status(BUILDER);
+        assert_eq!(status.reason, REVOKE_REASON_MANUAL);
+        assert_eq!(status.block_num, 2);
+        assert_eq!(status.block_hash, B256::repeat_byte(0x02));
+    }
+
+    #[test]
+    fn revoke_expiry_tracks_elapsed_time_not_wall_day() {
+        // Only elapsed time matters — a UTC day rollover must not reset the revoke.
+        let (mgr, now) = manager_with_fake_clock();
+        let t = 1_000_000;
+        now.store(t, Ordering::Relaxed);
+        mgr.revoke(BUILDER, INSERT_CHAIN_REASON, B256::ZERO, 1);
+
+        // 2s later (even across a day boundary): still revoked.
+        now.store(t + 2, Ordering::Relaxed);
+        assert!(!mgr.is_allowed(BUILDER));
+        // 1s before the 24h boundary: still revoked.
+        now.store(t + DAY - 1, Ordering::Relaxed);
+        assert!(!mgr.is_allowed(BUILDER));
+        // exactly revoked_at + 24h: expired.
+        now.store(t + DAY, Ordering::Relaxed);
+        assert!(mgr.is_allowed(BUILDER));
+    }
+
+    #[test]
+    fn builders_expire_independently() {
+        let (mgr, now) = manager_with_fake_clock();
+        let t0 = 100_000;
+        let five_hours = 5 * 60 * 60;
+
+        now.store(t0, Ordering::Relaxed);
+        mgr.revoke(BUILDER_A, INSERT_CHAIN_REASON, B256::ZERO, 1);
+        now.store(t0 + five_hours, Ordering::Relaxed);
+        mgr.revoke(BUILDER_B, INSERT_CHAIN_REASON, B256::ZERO, 2);
+
+        // Both revoked at t0 + 6h; reset times are independent of each other.
+        now.store(t0 + 6 * 60 * 60, Ordering::Relaxed);
+        assert!(!mgr.is_allowed(BUILDER_A));
+        assert!(!mgr.is_allowed(BUILDER_B));
+        assert_eq!(mgr.get_status(BUILDER_A).reset_at, t0 + DAY);
+        assert_eq!(mgr.get_status(BUILDER_B).reset_at, t0 + five_hours + DAY);
+
+        // At A's own revoked_at + 24h, A expires but B still has time left.
+        now.store(t0 + DAY, Ordering::Relaxed);
+        assert!(mgr.is_allowed(BUILDER_A));
+        assert!(!mgr.is_allowed(BUILDER_B));
+
+        // At B's own revoked_at + 24h, B also expires.
+        now.store(t0 + five_hours + DAY, Ordering::Relaxed);
+        assert!(mgr.is_allowed(BUILDER_B));
+    }
+
+    #[test]
+    fn active_revoke_count_excludes_expired() {
+        let (mgr, now) = manager_with_fake_clock();
+        assert_eq!(mgr.active_revoke_count(), 0);
+
+        let t = 500_000;
+        now.store(t, Ordering::Relaxed);
+        mgr.revoke(BUILDER_A, INSERT_CHAIN_REASON, B256::ZERO, 1);
+        mgr.revoke(BUILDER_B, REVOKE_REASON_MANUAL, B256::ZERO, 2);
+        assert_eq!(mgr.active_revoke_count(), 2);
+
+        // After the window the entries are stale, not active.
+        now.store(t + DAY, Ordering::Relaxed);
+        assert_eq!(mgr.active_revoke_count(), 0);
+    }
+
+    #[test]
+    fn get_status_reports_full_detail() {
+        let (mgr, now) = manager_with_fake_clock();
+        let t = 700_000;
+        now.store(t, Ordering::Relaxed);
+
+        // Allowed builders carry no reset time.
+        let status = mgr.get_status(BUILDER);
+        assert!(status.allowed);
+        assert_eq!(status.reset_at, 0);
+
+        let hash = B256::repeat_byte(0xab);
+        mgr.revoke(BUILDER, INSERT_CHAIN_REASON, hash, 100);
+        let status = mgr.get_status(BUILDER);
+        assert_eq!(
+            status,
+            BidBlockPermissionStatus {
+                allowed: false,
+                reason: INSERT_CHAIN_REASON.to_string(),
+                block_hash: hash,
+                block_num: 100,
+                revoked_at: t,
+                reset_at: t + DAY,
+            }
+        );
+    }
+
+    #[test]
+    fn concurrent_access_is_safe() {
+        use std::thread;
+
+        let mgr = Arc::new(BidBlockPermissionManager::new());
+        let builders = [BUILDER_A, BUILDER_B, BUILDER_C];
+
+        let mut handles = Vec::new();
+        for i in 0..50usize {
+            let builder = builders[i % builders.len()];
+            for _ in 0..3 {
+                let mgr = mgr.clone();
+                handles.push(thread::spawn(move || {
+                    mgr.is_allowed(builder);
+                    mgr.revoke(builder, INSERT_CHAIN_REASON, B256::ZERO, 1);
+                    let _ = mgr.get_status(builder);
+                    mgr.active_revoke_count();
+                }));
+            }
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
     }
 }
