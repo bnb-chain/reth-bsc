@@ -26,6 +26,10 @@ pub(crate) const IAVL_PROOF_VALIDATION_PLANCK: Precompile =
 pub(crate) const IAVL_PROOF_VALIDATION_PLATO: Precompile =
     Precompile::new(PrecompileId::Custom(Cow::Borrowed("IAVL_MERKLE_PROOF_VALIDATE_PLATO")), u64_to_address(101), iavl_proof_validation_run_plato);
 
+/// Iavl proof validation precompile disabled from Pasteur (legacy v1 light client deprecated).
+pub(crate) const IAVL_PROOF_VALIDATION_DEPRECATED: Precompile =
+    Precompile::new(PrecompileId::Custom(Cow::Borrowed("IAVL_MERKLE_PROOF_VALIDATE_DEPRECATED")), u64_to_address(101), iavl_proof_validation_run_deprecated);
+
 /// Run Iavl proof validation.
 fn iavl_proof_validation_run(input: &[u8], gas_limit: u64, reservoir: u64) -> PrecompileResult {
     iavl_proof_validation_run_inner(input, gas_limit, reservoir, false, false, false)
@@ -34,6 +38,11 @@ fn iavl_proof_validation_run(input: &[u8], gas_limit: u64, reservoir: u64) -> Pr
 /// Run Iavl proof validation with Nano hardfork.
 fn iavl_proof_validation_run_nano(_input: &[u8], _gas_limit: u64, reservoir: u64) -> PrecompileResult {
     Ok(PrecompileOutput::halt(PrecompileHalt::other("suspended"), reservoir))
+}
+
+/// Run the deprecated (Pasteur) Iavl proof validation precompile: rejects all input.
+fn iavl_proof_validation_run_deprecated(_input: &[u8], _gas_limit: u64, reservoir: u64) -> PrecompileResult {
+    Ok(PrecompileOutput::halt(PrecompileHalt::other("deprecated"), reservoir))
 }
 
 /// Run Iavl proof validation with Moran hardfork.
@@ -177,5 +186,11 @@ mod tests {
 
         let res = hex::encode(res.bytes);
         assert_eq!(res, "0000000000000000000000000000000000000000000000000000000000000001")
+    }
+
+    #[test]
+    fn deprecated_precompile_rejects_all_input() {
+        let res = iavl_proof_validation_run_deprecated(b"anything", 3_000, 0).unwrap();
+        assert!(res.is_halt());
     }
 }
