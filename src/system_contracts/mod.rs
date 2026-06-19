@@ -1174,6 +1174,37 @@ mod tests {
     }
 
     #[test]
+    fn test_pasteur_upgrade_applied_at_transition() {
+        use reth_chainspec::ForkCondition;
+
+        // Schedule Pasteur at a concrete timestamp just after Mendel and wrap in a BscChainSpec.
+        let pasteur_time = 1_777_343_400 + 1_000;
+        let mut cs = bsc_mainnet();
+        cs.hardforks.insert(BscHardfork::Pasteur, ForkCondition::Timestamp(pasteur_time));
+        let spec = crate::chainspec::BscChainSpec::from(cs);
+
+        let block = 50_000_000; // well past London activation
+
+        // Block whose parent is pre-Pasteur and itself is at/after Pasteur => the upgrade fires,
+        // swapping exactly StakeHub and Governor.
+        let upgraded =
+            get_upgrade_system_contracts(&spec, block, pasteur_time, pasteur_time - 1).unwrap();
+        assert!(upgraded.contains_key(&STAKE_HUB_CONTRACT));
+        assert!(upgraded.contains_key(&GOVERNOR_CONTRACT));
+        assert_eq!(upgraded.len(), 2);
+
+        // A block fully after Pasteur (parent already active) is not a transition => no upgrade.
+        let after =
+            get_upgrade_system_contracts(&spec, block, pasteur_time + 10, pasteur_time + 9).unwrap();
+        assert!(!after.contains_key(&STAKE_HUB_CONTRACT));
+
+        // A block fully before Pasteur is likewise not a Pasteur transition.
+        let before =
+            get_upgrade_system_contracts(&spec, block, pasteur_time - 10, pasteur_time - 11).unwrap();
+        assert!(!before.contains_key(&STAKE_HUB_CONTRACT));
+    }
+
+    #[test]
     fn test_get_system_contract_code() {
         let res = get_system_contract_codes(&bsc_mainnet(), BscHardfork::Feynman.name()).unwrap();
         assert!(!res.is_empty());
