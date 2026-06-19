@@ -423,10 +423,11 @@ fn build_mendel_precompiles() -> Precompiles {
 }
 
 fn build_pasteur_precompiles() -> Precompiles {
-    // PR 1/2 scaffolding: Pasteur reuses the Mendel set unchanged. Later PRs override
-    // the bridge precompiles here (validator-set dedup on 0x67, BLS pubkey dedup on 0x66,
-    // suspended v1 Tendermint precompiles on 0x64/0x65).
-    build_mendel_precompiles()
+    let mut precompiles = build_mendel_precompiles();
+    // Override 0x67 with the Pasteur cometBFT light-block precompile, which rejects
+    // duplicate validator identities in the consensus state and light-block validator sets.
+    precompiles.extend([cometbft::COMETBFT_LIGHT_BLOCK_VALIDATION_PASTEUR]);
+    precompiles
 }
 
 // --- Traced precompile singletons ---------------------------------------------------------------
@@ -635,11 +636,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pasteur_reuses_mendel_precompile_set() {
-        // PR 1 introduces the fork but must not change precompile behavior: the Pasteur
-        // set is identical to Mendel until later PRs add a dedicated set.
+    fn pasteur_shares_mendel_addresses_but_overrides_cometbft() {
         let pasteur = traced_precompiles_for_spec(BscHardfork::Pasteur).precompiles();
         let mendel = traced_precompiles_for_spec(BscHardfork::Mendel).precompiles();
+
+        // Pasteur keeps the same address set as Mendel...
         assert_eq!(pasteur.addresses_set(), mendel.addresses_set());
+
+        // ...but 0x67 now resolves to the Pasteur cometBFT light-block variant.
+        let addr = u64_to_address(103);
+        let id = pasteur.get(&addr).expect("0x67 present in Pasteur set").id();
+        assert!(
+            matches!(id, PrecompileId::Custom(c) if c.as_ref() == "COMET_BFT_LIGHT_BLOCK_VALIDATE_PASTEUR"),
+            "0x67 should be the Pasteur cometBFT variant, got {id:?}"
+        );
+        // Mendel keeps the Hertz variant.
+        let mendel_id = mendel.get(&addr).expect("0x67 present in Mendel set").id();
+        assert!(
+            matches!(mendel_id, PrecompileId::Custom(c) if c.as_ref() == "COMET_BFT_LIGHT_BLOCK_VALIDATE_HERTZ"),
+            "0x67 should remain the Hertz variant pre-Pasteur, got {mendel_id:?}"
+        );
     }
 }
