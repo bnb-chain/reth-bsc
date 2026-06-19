@@ -672,6 +672,7 @@ fn hardforks_with_system_contracts() -> Vec<BscHardfork> {
         BscHardfork::Lorentz,
         BscHardfork::Maxwell,
         BscHardfork::Fermi,
+        BscHardfork::Pasteur,
     ]
 }
 
@@ -697,6 +698,7 @@ fn hardfork_to_dir_name(hardfork: &BscHardfork) -> Result<String, SystemContract
         BscHardfork::Lorentz => "lorentz",
         BscHardfork::Maxwell => "maxwell",
         BscHardfork::Fermi => "fermi",
+        BscHardfork::Pasteur => "pasteur",
         _ => {
             return Err(SystemContractError::InvalidHardfork);
         }
@@ -1109,7 +1111,23 @@ where
             }
         }
     }
-    
+
+    if spec.is_pasteur_transition_at_timestamp(block_number, block_time, parent_block_time) {
+        if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Pasteur.name()) {
+            for (address, v) in &contracts {
+                m.insert(*address, v.clone());
+                info!(
+                    target: "bsc::system_contracts::upgrade",
+                    block_number = block_number,
+                    block_time = block_time,
+                    parent_block_time = parent_block_time,
+                    address = ?address,
+                    "Pasteur upgrade contract"
+                );
+            }
+        }
+    }
+
     Ok(m)
 }
 
@@ -1139,6 +1157,21 @@ pub fn is_system_transaction<T: reth_primitives_traits::Transaction>(
 mod tests {
     use super::*;
     use alloy_primitives::address;
+
+    #[test]
+    fn test_pasteur_system_contract_upgrade() {
+        // The Pasteur upgrade swaps exactly StakeHub (0x2002) and Governor (0x2004) on every
+        // network, with non-empty genesis-contract v1.2.6 bytecode.
+        for spec in [bsc_mainnet(), bsc_testnet(), bsc_qanet()] {
+            let res = get_system_contract_codes(&spec, BscHardfork::Pasteur.name()).unwrap();
+            assert_eq!(res.len(), 2, "Pasteur upgrades only StakeHub and Governor");
+
+            for addr in [STAKE_HUB_CONTRACT, GOVERNOR_CONTRACT] {
+                let code = res.get(&addr).expect("contract present").as_ref().unwrap();
+                assert!(!code.original_bytes().is_empty());
+            }
+        }
+    }
 
     #[test]
     fn test_get_system_contract_code() {
