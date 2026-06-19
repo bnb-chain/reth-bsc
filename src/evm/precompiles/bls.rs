@@ -5,12 +5,15 @@ use bls_on_arkworks as bls;
 use revm::precompile::{
     u64_to_address, PrecompileHalt, PrecompileOutput, PrecompileResult, Precompile, PrecompileId,
 };
-use std::{borrow::Cow, vec::Vec};
+use std::{borrow::Cow, collections::HashSet, vec::Vec};
 
 use super::error::BscPrecompileError;
 
 pub(crate) const BLS_SIGNATURE_VALIDATION: Precompile =
     Precompile::new(PrecompileId::Custom(Cow::Borrowed("BLS_SIGNATURE_VERIFY")), u64_to_address(102), bls_signature_validation_run);
+
+pub(crate) const BLS_SIGNATURE_VALIDATION_PASTEUR: Precompile =
+    Precompile::new(PrecompileId::Custom(Cow::Borrowed("BLS_SIGNATURE_VERIFY_PASTEUR")), u64_to_address(102), bls_signature_validation_run_pasteur);
 
 const BLS_MSG_HASH_LENGTH: u64 = 32;
 const BLS_SIGNATURE_LENGTH: u64 = 96;
@@ -23,6 +26,24 @@ const BLS_DST: &[u8] = bls::DST_ETHEREUM.as_bytes();
 /// | msg_hash |  signature  |  [{bls pubkey}]  |
 /// |    32    |      96     |      [{48}]      |
 fn bls_signature_validation_run(input: &[u8], gas_limit: u64, reservoir: u64) -> PrecompileResult {
+    bls_signature_validation_run_inner(input, gas_limit, reservoir, false)
+}
+
+/// Pasteur variant: additionally rejects aggregated signer sets that repeat a pubkey.
+fn bls_signature_validation_run_pasteur(
+    input: &[u8],
+    gas_limit: u64,
+    reservoir: u64,
+) -> PrecompileResult {
+    bls_signature_validation_run_inner(input, gas_limit, reservoir, true)
+}
+
+fn bls_signature_validation_run_inner(
+    input: &[u8],
+    gas_limit: u64,
+    reservoir: u64,
+    require_unique_pubkeys: bool,
+) -> PrecompileResult {
     let cost = calc_gas_cost(input);
     if cost > gas_limit {
         return Ok(PrecompileOutput::halt(PrecompileHalt::OutOfGas, reservoir));
@@ -50,12 +71,17 @@ fn bls_signature_validation_run(input: &[u8], gas_limit: u64, reservoir: u64) ->
     let pub_key_count = (input_length - msg_and_sig_length) / BLS_SINGLE_PUBKEY_LENGTH;
     let mut pub_keys = Vec::with_capacity(pub_key_count as usize);
     let mut msg_hashes = Vec::with_capacity(pub_key_count as usize);
+    // From Pasteur, reject aggregated signer sets that repeat the same pubkey.
+    let mut seen_pub_keys = HashSet::with_capacity(pub_key_count as usize);
 
     // check pubkey format and push to pub_keys
     for i in 0..pub_key_count {
         let pub_key = &pub_keys_data[i as usize * BLS_SINGLE_PUBKEY_LENGTH as usize..
             (i + 1) as usize * BLS_SINGLE_PUBKEY_LENGTH as usize];
         if !bls::key_validate(&pub_key.to_vec()) {
+            return revert()
+        }
+        if require_unique_pubkeys && !seen_pub_keys.insert(pub_key.to_vec()) {
             return revert()
         }
         pub_keys.push(pub_key.to_vec());
@@ -256,5 +282,33 @@ mod tests {
             Err(e) => panic!("BLS signature validation failed, {e:?}"),
         };
         assert_eq!(result, excepted_output);
+    }
+
+    #[test]
+    fn pasteur_rejects_duplicate_pubkeys() {
+        // Same input as the legacy "duplicate pubkey" case: pub_key1 == pub_key2.
+        let msg_hash = hex!("6377c7e66081cb65e473c1b95db5195a27d04a7108b468890224bedbe1a8a6eb");
+        let signature = hex!("876ac46847e82a2f2887bbeb855916e05bd259086fda5553e4e5e5ee0dcda6869c10e2aa539e265b492015d1bd1b553815a42ea9daf6713b6a0002c6f1aacfa51e55b931745638c0552d7fab4a499bbd6ba71f9be36d35ffa527f77b2a6cebda");
+        let pub_key1 = hex!("8bec004e938668c67aa0fab6f555282efdf213817e455d9eaa6a0897211eae5f79db5cdc626d1cd5759a0c1c10cf7aa0");
+        let pub_key2 = hex!("8bec004e938668c67aa0fab6f555282efdf213817e455d9eaa6a0897211eae5f79db5cdc626d1cd5759a0c1c10cf7aa0");
+        let pub_key3 = hex!("af952757f442d7240a4cec62de638973a24fde8eb0ad5217be61eea53211c19859c03a299125ea8520f015f6f8865076");
+        let mut input = Vec::<u8>::new();
+        input.extend_from_slice(&msg_hash);
+        input.extend_from_slice(&signature);
+        input.extend_from_slice(&pub_key1);
+        input.extend_from_slice(&pub_key2);
+        input.extend_from_slice(&pub_key3);
+        let input = Bytes::from(input);
+
+        // Pasteur rejects the duplicate signer set outright (revert, cost preserved: 1000 + 3*3500).
+        let pasteur = bls_signature_validation_run_pasteur(&input, 100_000_000, 0)
+            .expect("precompile should not fatally error");
+        assert_eq!(pasteur, PrecompileOutput::revert(11500, Default::default(), 0));
+
+        // Pre-Pasteur keeps the legacy behavior: a successful run with empty (failed) output.
+        let legacy = bls_signature_validation_run(&input, 100_000_000, 0)
+            .expect("precompile should not fatally error");
+        assert!(legacy.is_success());
+        assert_eq!(legacy.bytes, Bytes::from(vec![]));
     }
 }
