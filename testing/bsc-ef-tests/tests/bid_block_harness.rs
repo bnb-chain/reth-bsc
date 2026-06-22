@@ -214,3 +214,121 @@ fn trusted_local_build_produces_block() {
     assert_eq!(block.header().number, 1);
     assert_ne!(block.header().state_root, B256::ZERO);
 }
+
+/// Round-trip: build block 1 via the builder path, finalize/seal it, then re-execute the sealed
+/// block via the executor path and assert both paths agree on the post-state root.
+///
+/// This is the core verify-mode invariant a BidBlock relies on: a builder builds (builder path) and
+/// the validator re-executes (executor path, consuming the block's system txs). Agreement on the
+/// state root means the validator faithfully reproduces the builder's block. Finalization
+/// (difficulty + ECDSA seal) is required because the executor validates a *sealed* header; the
+/// build uses `prev_randao = calculate_difficulty(...)` so it matches the finalized difficulty.
+#[test]
+fn round_trip_build_finalize_reexecute_agree() {
+    use reth_bsc::consensus::parlia::util::calculate_difficulty;
+    use reth_bsc::node::evm::config::{BscEvmConfig, BscNextBlockEnvAttributes};
+    use reth_bsc::node::miner::util::finalize_new_header;
+    use reth_evm::execute::{BlockBuilder, BlockBuilderOutcome, Executor};
+    use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
+    use reth_primitives_traits::RecoveredBlock;
+    use reth_provider::DatabaseProviderFactory;
+    use reth_revm::{database::StateProviderDatabase, db::State};
+    use reth_trie::{HashedPostState, KeccakKeyHasher, StateRoot};
+    use reth_trie_db::{
+        DatabaseHashedCursorFactory, DatabaseStateRoot, DatabaseTrieCursorFactory, LegacyKeyAdapter,
+    };
+
+    let chain_spec = signable_test_chain_spec();
+    let factory = create_test_provider_factory_with_chain_spec(Arc::new(chain_spec.inner.clone()));
+    init_genesis(&factory).expect("init genesis");
+    publish_env(chain_spec.clone());
+    let _ = reth_bsc::shared::set_header_provider(Arc::new(factory.clone()));
+
+    let parent = SealedHeader::new(chain_spec.genesis_header().clone(), chain_spec.genesis_hash());
+    let snap = genesis_snapshot(chain_spec.clone());
+    let parlia = Arc::new(Parlia::new(chain_spec.clone(), 200));
+    let difficulty = calculate_difficulty(&snap, TEST_VALIDATOR);
+    let provider = factory.database_provider_rw().expect("rw provider");
+
+    // Build block 1 via the builder path. Use a 32-byte vanity (so finalize's seal append reaches
+    // the vanity+seal minimum) and prev_randao = the finalized difficulty (BSC PREVRANDAO).
+    let block = {
+        let state_provider = provider.latest();
+        let sp_db = StateProviderDatabase::new(&state_provider);
+        let mut db = State::builder().with_database(sp_db).with_bundle_update().build();
+        let evm_config = BscEvmConfig::new(chain_spec.clone());
+        let mut builder = evm_config
+            .builder_for_next_block(
+                &mut db,
+                &parent,
+                BscNextBlockEnvAttributes {
+                    inner: NextBlockEnvAttributes {
+                        timestamp: parent.timestamp + 3,
+                        suggested_fee_recipient: TEST_VALIDATOR,
+                        prev_randao: difficulty.into(),
+                        gas_limit: parent.gas_limit,
+                        parent_beacon_block_root: None,
+                        withdrawals: None,
+                        extra_data: alloy_primitives::Bytes::from(vec![0u8; 32]),
+                        slot_number: None,
+                    },
+                    parent_difflayers: None,
+                    triedb_prefetcher: None,
+                    validator_cache_sink: None,
+                    turn_length_sink: None,
+                    state_root_precomputed_sink: None,
+                    trie_handle: None,
+                    state_root_deadline_ms: None,
+                },
+            )
+            .expect("builder for next block");
+        builder.apply_pre_execution_changes().expect("apply pre-execution changes");
+        let out = builder.finish_with_difflayer(&state_provider).expect("finish builder");
+        let BlockBuilderOutcome { block, .. } = out.inner;
+        block
+    };
+    let reference_root = block.header().state_root;
+
+    // Finalize/seal the built block (difficulty + ECDSA seal); state root is unchanged.
+    let snapshot_provider =
+        reth_bsc::shared::get_snapshot_provider().cloned().expect("snapshot provider");
+    let senders = block.senders().to_vec();
+    let mut plain = block.sealed_block().clone_block();
+    finalize_new_header(
+        parlia,
+        &snap,
+        &parent,
+        &mut plain.header,
+        &snapshot_provider,
+        (parent.timestamp + 3) * 1000,
+    )
+    .expect("finalize header");
+
+    // The executor also looks up the *current* block's snapshot (post-apply). For this non-epoch
+    // block the validator set is unchanged, so publish a block-1 snapshot keyed by the sealed hash.
+    let block1_hash = plain.header.hash_slow();
+    let mut snap1 = snap.clone();
+    snap1.block_number = 1;
+    snap1.block_hash = block1_hash;
+    snapshot_provider.insert(snap1);
+
+    let finalized = RecoveredBlock::new_unhashed(plain, senders);
+
+    // Re-execute the sealed block via the executor path and recompute the state root.
+    let state_provider2 = provider.latest();
+    let evm_config = BscEvmConfig::new(chain_spec.clone());
+    let executor = evm_config.batch_executor(StateProviderDatabase::new(&state_provider2));
+    let output = executor.execute(&finalized).expect("re-execute sealed block");
+    let hashed = HashedPostState::from_bundle_state::<KeccakKeyHasher>(output.state.state());
+    let (computed_root, _) = <StateRoot<
+        DatabaseTrieCursorFactory<_, LegacyKeyAdapter>,
+        DatabaseHashedCursorFactory<_>,
+    > as DatabaseStateRoot<_>>::overlay_root_with_updates(
+        provider.tx_ref(),
+        &hashed.clone_into_sorted(),
+    )
+    .expect("compute state root");
+
+    // Builder path and executor path must agree on the post-state root.
+    assert_eq!(computed_root, reference_root);
+}
