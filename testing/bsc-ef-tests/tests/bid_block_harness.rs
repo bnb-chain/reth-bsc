@@ -15,9 +15,12 @@
 //! `simulate_bid_block`, and the round-trip assertion (build a block → repackage as a DecodedBidBlock
 //! → simulate → assert identical hash/state root) build on this foundation.
 
-use alloy_primitives::{address, hex};
+use alloy_primitives::{address, b256, hex, B256};
 use reth_bsc::chainspec::{bsc::bsc_mainnet, BscChainSpec};
-use reth_bsc::consensus::parlia::Parlia;
+use reth_bsc::consensus::parlia::{Parlia, Snapshot, SnapshotProvider};
+use reth_bsc::node::miner::signer::init_global_signer;
+use std::collections::HashMap;
+use std::sync::RwLock;
 use reth_chainspec::{
     make_genesis_header, BaseFeeParams, BaseFeeParamsKind, Chain, ChainHardforks, ChainSpec,
     EthChainSpec, EthereumHardfork, ForkCondition, Hardfork, NamedChain,
@@ -31,6 +34,35 @@ use std::sync::Arc;
 /// can build/seal blocks. The same key the miner tests initialize the global signer with.
 const TEST_VALIDATOR: alloy_primitives::Address =
     address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
+
+/// The private key matching [`TEST_VALIDATOR`] (Anvil dev key 0), used to seal/sign as the validator.
+const TEST_VALIDATOR_KEY: B256 =
+    b256!("0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
+
+/// In-memory [`SnapshotProvider`] for the harness. The BSC executor reads the parent snapshot from
+/// the global provider during pre/post-execution, so the harness publishes this one.
+#[derive(Default)]
+struct MockSnapshotProvider {
+    snaps: RwLock<HashMap<B256, Snapshot>>,
+}
+
+impl SnapshotProvider for MockSnapshotProvider {
+    fn snapshot_by_hash(&self, hash: &B256) -> Option<Snapshot> {
+        self.snaps.read().unwrap().get(hash).cloned()
+    }
+    fn insert(&self, snapshot: Snapshot) {
+        self.snaps.write().unwrap().insert(snapshot.block_hash, snapshot);
+    }
+}
+
+/// Build the genesis snapshot (validator set) for a signable chain spec.
+fn genesis_snapshot(chain_spec: Arc<BscChainSpec>) -> Snapshot {
+    let parlia = Parlia::new(chain_spec.clone(), 200);
+    let header = chain_spec.genesis_header();
+    let info =
+        parlia.parse_validators_from_header(header, 200).expect("parse genesis validators");
+    Snapshot::new(info.consensus_addrs, 0, header.hash_slow(), 200, info.vote_addrs)
+}
 
 /// A **signable** BSC test chain spec: a genesis whose sole validator is [`TEST_VALIDATOR`], so the
 /// harness can build and seal blocks as that validator (unlike `bsc_mainnet`, whose validator keys
@@ -94,4 +126,25 @@ fn signable_genesis_snapshot_has_known_validator() {
         .parse_validators_from_header(chain_spec.genesis_header(), 200)
         .expect("parse genesis validators");
     assert_eq!(validators.consensus_addrs, vec![TEST_VALIDATOR]);
+}
+
+/// Publish the snapshot provider + validator signer the BSC executor reads from globals, and
+/// confirm the parent (genesis) snapshot is retrievable — the environment a block build needs.
+#[test]
+fn execution_environment_is_wired() {
+    let chain_spec = signable_test_chain_spec();
+    let snap = genesis_snapshot(chain_spec.clone());
+    let genesis_hash = chain_spec.genesis_hash();
+
+    let provider = Arc::new(MockSnapshotProvider::default());
+    provider.insert(snap);
+    // OnceLock setters: ignore "already initialized" so the harness is order-independent.
+    let _ = reth_bsc::shared::set_snapshot_provider(provider);
+    let _ = init_global_signer(TEST_VALIDATOR_KEY);
+
+    let published = reth_bsc::shared::get_snapshot_provider().expect("snapshot provider published");
+    assert_eq!(
+        published.snapshot_by_hash(&genesis_hash).map(|s| s.validators),
+        Some(vec![TEST_VALIDATOR])
+    );
 }
