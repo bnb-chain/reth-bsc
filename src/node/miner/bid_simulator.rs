@@ -395,7 +395,9 @@ where
             parent_header.number + 1,
             attributes.timestamp,
         );
-        if bid_runtime.bid.gas_used > gas_limit - system_txs_gas - PAY_BID_TX_GAS_LIMIT {
+        if bid_runtime.bid.gas_used
+            > gas_limit.saturating_sub(system_txs_gas).saturating_sub(PAY_BID_TX_GAS_LIMIT)
+        {
             debug!("bidSimulator: gas limit exceeded, ignore");
             return;
         }
