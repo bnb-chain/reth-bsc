@@ -5,18 +5,23 @@
 //! `consensus/parlia/bid_block.go`: which trailing txs are signable, and the exact selector/order
 //! the trailing region must have for the given header.
 //!
-//! These functions are pure (no consensus state): they classify and verify transactions and so are
-//! parameterized on `(txs, header, parent)` rather than the not-yet-ported `DecodedBidBlock`. The
-//! stateful Parlia methods (`prepare_for_bid_block`, assembly, `block_time_upper_check`, the
-//! `sign_system_tx` wrapper) are a separate slice.
+//! Most of these functions are pure (no consensus state): they classify and verify transactions and
+//! so are parameterized on `(txs, header, parent)` rather than the not-yet-ported `DecodedBidBlock`.
+//! The exception is [`Parlia::block_time_upper_check`] — a stateful timestamp bound used by BidBlock
+//! pre-seal verification. The remaining stateful methods (`prepare_for_bid_block`, assembly, the
+//! `sign_system_tx` wrapper) land with the miner build path.
 
 use crate::{
-    consensus::parlia::util::is_breathe_block,
+    consensus::parlia::{consensus::Parlia, util::is_breathe_block, util::calculate_millisecond_timestamp, Snapshot},
+    hardforks::BscHardforks,
+    node::evm::error::{BscBlockExecutionError, BscBlockValidationError},
     system_contracts::{is_invoke_system_contract, VALIDATOR_CONTRACT},
 };
 use alloy_consensus::{Header, Transaction};
 use alloy_primitives::U256;
+use reth_chainspec::EthChainSpec;
 use reth_ethereum_primitives::TransactionSigned;
+use reth_evm::execute::BlockExecutionError;
 use std::{fmt, vec::Vec};
 
 /// `deposit(...)` on the Validator contract.
@@ -189,6 +194,36 @@ pub fn verify_bid_block_system_txs(
     }
     let shape = expected_system_tx_shape(header, parent);
     verify_system_tx_shape(&txs[system_tx_start..], &shape)
+}
+
+impl<ChainSpec> Parlia<ChainSpec>
+where
+    ChainSpec: EthChainSpec + BscHardforks + 'static,
+{
+    /// Upper-bound check on a BidBlock header's timestamp (go-bsc `BlockTimeUpperCheck`).
+    ///
+    /// A builder must not post-date its block beyond the in-turn block time for `parent`. The bound
+    /// is the same [`block_time_for_ramanujan_fork`] value the validator would use when building
+    /// locally (so it also floors at the current wall clock), keeping accepted BidBlocks within the
+    /// slot the validator could itself have produced. Used during BidBlock pre-seal verification.
+    ///
+    /// [`block_time_for_ramanujan_fork`]: Parlia::block_time_for_ramanujan_fork
+    pub fn block_time_upper_check(
+        &self,
+        snap: &Snapshot,
+        header: &Header,
+        parent: &Header,
+    ) -> Result<(), BlockExecutionError> {
+        let max_allowed = self.block_time_for_ramanujan_fork(snap, parent, header);
+        if calculate_millisecond_timestamp(header) > max_allowed {
+            return Err(BscBlockExecutionError::Validation(BscBlockValidationError::FutureBlock {
+                block_number: header.number,
+                hash: header.hash_slow(),
+            })
+            .into());
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -369,5 +404,34 @@ mod tests {
             verify_bid_block_system_txs(&bad, &header, &parent, 1),
             Err(BidBlockSystemTxError::NotSignable { index: 2 })
         );
+    }
+
+    #[test]
+    fn block_time_upper_check_bounds_header_timestamp() {
+        use crate::chainspec::BscChainSpec;
+        use alloy_primitives::B256;
+        use reth_chainspec::ChainSpecBuilder;
+        use std::sync::Arc;
+
+        // Plain mainnet spec => no BSC forks active, so Ramanujan is inactive at block 1 and the
+        // bound reduces to parent_ts + block_interval (no back-off term).
+        let chain_spec = Arc::new(BscChainSpec::from(ChainSpecBuilder::mainnet().build()));
+        let parlia = Parlia::new(chain_spec, 200);
+
+        let mut snap = Snapshot::new(vec![Address::ZERO], 0, B256::ZERO, 200, None);
+        snap.block_interval = 3_000;
+
+        // Parent far in the future so parent_ts + interval exceeds wall clock: the wall-clock floor
+        // in block_time_for_ramanujan_fork does not engage and max_allowed is deterministic.
+        let parent = mk_header(0, 4_000_000_000);
+        let max_allowed_secs = 4_000_000_003; // 4_000_000_000 * 1000 + 3_000 ms == this * 1000 ms
+
+        // header at exactly the bound is accepted.
+        let at_bound = mk_header(1, max_allowed_secs);
+        assert!(parlia.block_time_upper_check(&snap, &at_bound, &parent).is_ok());
+
+        // one second past the bound is rejected.
+        let too_late = mk_header(1, max_allowed_secs + 1);
+        assert!(parlia.block_time_upper_check(&snap, &too_late, &parent).is_err());
     }
 }
