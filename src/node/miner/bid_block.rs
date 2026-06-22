@@ -338,6 +338,45 @@ pub fn pre_seal_verify_bid_block(
     etherbase: Address,
     expected_gas_limit: u64,
 ) -> Result<(usize, U256), PreSealVerifyError> {
+    verify_bid_block_header(parlia, &decoded.header, parent, snap)?;
+    verify_bid_block_payload(chain_spec, decoded, parent, etherbase, expected_gas_limit)
+}
+
+/// Header half of [`pre_seal_verify_bid_block`]: the unsealed Parlia header-field checks
+/// (`validate_header`: extra, ommers, gas, base fee, withdrawals, 4844, mix digest, beacon root,
+/// requests hash) plus the slot timestamp bound.
+///
+/// Split out because it must run on the **finalized** header (which carries the validator's extra
+/// and seal), whereas [`verify_bid_block_payload`] must run **before** finalize (its `system_tx_start`
+/// feeds bind-signing, which mutates the tx set and therefore must precede finalize).
+pub fn verify_bid_block_header(
+    parlia: &Parlia<BscChainSpec>,
+    header: &Header,
+    parent: &Header,
+    snap: &Snapshot,
+) -> Result<(), PreSealVerifyError> {
+    let sealed = SealedHeader::seal_slow(header.clone());
+    parlia
+        .validate_header(&sealed)
+        .map_err(|e| PreSealVerifyError::InvalidHeader(e.to_string()))?;
+    parlia
+        .block_time_upper_check(snap, header, parent)
+        .map_err(|e| PreSealVerifyError::InvalidHeader(e.to_string()))?;
+    Ok(())
+}
+
+/// Payload half of [`pre_seal_verify_bid_block`]: the checks that do not depend on the finalized
+/// header — coinbase is the validator, gas limit matches the in-turn target, the deposit gas-fee is
+/// non-zero, blob sidecars are well-formed, no user tx exceeds the per-tx gas cap, and the trailing
+/// system-tx region is valid. Returns the located `(system_tx_start, gas_fee)`. Needs no `Parlia`
+/// engine, so it is runnable (and testable) before finalize/seal.
+pub fn verify_bid_block_payload(
+    chain_spec: &BscChainSpec,
+    decoded: &DecodedBidBlock,
+    parent: &Header,
+    etherbase: Address,
+    expected_gas_limit: u64,
+) -> Result<(usize, U256), PreSealVerifyError> {
     let header = &decoded.header;
 
     if header.beneficiary != etherbase {
@@ -349,16 +388,6 @@ pub fn pre_seal_verify_bid_block(
             want: expected_gas_limit,
         });
     }
-
-    // VerifyUnsealedHeader: standalone Parlia header-field checks (extra, ommers, gas, base fee,
-    // withdrawals, 4844, mix digest, beacon root, requests hash).
-    let sealed = SealedHeader::seal_slow(header.clone());
-    parlia
-        .validate_header(&sealed)
-        .map_err(|e| PreSealVerifyError::InvalidHeader(e.to_string()))?;
-    parlia
-        .block_time_upper_check(snap, header, parent)
-        .map_err(|e| PreSealVerifyError::InvalidHeader(e.to_string()))?;
 
     let (system_tx_start, gas_fee) = extract_bid_block_deposit_value(&decoded.txs);
     if gas_fee.is_zero() {
@@ -931,6 +960,32 @@ mod tests {
             ),
             Err(PreSealVerifyError::EmptyGasFee)
         );
+    }
+
+    #[test]
+    fn verify_bid_block_payload_runs_without_parlia() {
+        // The payload half needs no Parlia engine / finalized header — it locates the system-tx
+        // region and validates it, returning (system_tx_start, gas_fee).
+        let spec = preseal_spec();
+        let etherbase = Address::repeat_byte(0x11);
+        let header = valid_bid_header(etherbase, 30_000_000);
+        let parent = Header { number: 0, timestamp: 1, gas_limit: 30_000_000, ..Default::default() };
+        let txs = vec![legacy_tx(0), deposit_system_tx(100)];
+        let d = decoded_block(header.clone(), txs, vec![]);
+        assert_eq!(
+            verify_bid_block_payload(&spec, &d, &parent, etherbase, header.gas_limit),
+            Ok((1, U256::from(100)))
+        );
+        // Wrong coinbase is rejected by the payload half alone.
+        let bad = decoded_block(
+            valid_bid_header(Address::repeat_byte(0x22), 30_000_000),
+            vec![legacy_tx(0), deposit_system_tx(100)],
+            vec![],
+        );
+        assert!(matches!(
+            verify_bid_block_payload(&spec, &bad, &parent, etherbase, 30_000_000),
+            Err(PreSealVerifyError::InvalidCoinbase { .. })
+        ));
     }
 
     #[test]
