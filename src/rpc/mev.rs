@@ -87,6 +87,9 @@ pub struct MevParams {
     /// Maximum builder fee allowed - decimal number
     #[serde(rename = "BuilderFeeCeil", serialize_with = "serialize_u256_as_decimal")]
     pub builder_fee_ceil: U256,
+    /// Whether the `mev_sendBidBlock` (BEP-675) path is accepted
+    #[serde(rename = "BidBlockEnabled")]
+    pub bid_block_enabled: bool,
     /// MEV service version
     #[serde(rename = "Version")]
     pub version: String,
@@ -154,6 +157,7 @@ pub struct MevApiImpl {
     gas_ceil: u64,
     min_gas_price: U256,
     builder_fee_ceil: U256,
+    bid_block_enabled: bool,
     version: String,
     /// Whitelist of allowed builders (shared with miner_ namespace via shared.rs)
     allowed_builders: Arc<RwLock<HashSet<Address>>>,
@@ -211,6 +215,7 @@ impl MevApiImpl {
         let no_interrupt_left_over = mining_config.get_no_interrupt_left_over();
         let max_bids_per_builder = mining_config.get_max_bids_per_builder();
         let builder_fee_ceil = U256::from(mining_config.get_builder_fee_ceil());
+        let bid_block_enabled = mining_config.get_bid_block_enabled();
 
         // Version string
         let version = env!("CARGO_PKG_VERSION").to_string();
@@ -256,6 +261,7 @@ impl MevApiImpl {
             gas_ceil,
             min_gas_price,
             builder_fee_ceil,
+            bid_block_enabled,
             version,
             allowed_builders,
         }
@@ -826,6 +832,7 @@ impl BscMevApiServer for MevApiImpl {
             gas_ceil: self.gas_ceil,
             gas_price: self.min_gas_price,
             builder_fee_ceil: self.builder_fee_ceil,
+            bid_block_enabled: self.bid_block_enabled,
             version: self.version.clone(),
         })
     }
@@ -865,5 +872,28 @@ impl BscMevApiServer for MevApiImpl {
             tracing::info!("Builder {} was not in whitelist", builder);
         }
         Ok(removed)
+    }
+}
+
+#[cfg(test)]
+mod bid_block_param_tests {
+    use super::*;
+
+    #[test]
+    fn mev_params_exposes_bid_block_enabled_field() {
+        let params = MevParams {
+            validator_commission: 100,
+            bid_simulation_left_over: 0,
+            no_interrupt_left_over: 0,
+            max_bids_per_builder: 3,
+            gas_ceil: 0,
+            gas_price: U256::ZERO,
+            builder_fee_ceil: U256::ZERO,
+            bid_block_enabled: true,
+            version: "test".to_string(),
+        };
+        let json = serde_json::to_value(&params).unwrap();
+        // geth parity: the field is exposed as "BidBlockEnabled".
+        assert_eq!(json.get("BidBlockEnabled"), Some(&serde_json::Value::Bool(true)));
     }
 }

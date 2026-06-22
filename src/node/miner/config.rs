@@ -41,6 +41,9 @@ pub struct MiningConfig {
     pub builder_fee_ceil: Option<u128>,
     /// List of allowed builder addresses (whitelist)
     pub allowed_builders: Option<Vec<Address>>,
+    /// Whether the `mev_sendBidBlock` RPC (BEP-675 builder-proposed blocks) is accepted.
+    /// Off by default; enable with `--mining.bid-block-enabled` or `BSC_MINING_BID_BLOCK_ENABLED`.
+    pub bid_block_enabled: bool,
     /// Use the reth 2.0 sparse-trie background task for state-root computation
     /// during MDBX-mode payload build.
     ///
@@ -71,6 +74,7 @@ impl std::fmt::Debug for MiningConfig {
             .field("max_bids_per_builder", &self.max_bids_per_builder)
             .field("builder_fee_ceil", &self.builder_fee_ceil)
             .field("allowed_builders", &self.allowed_builders)
+            .field("bid_block_enabled", &self.bid_block_enabled)
             .field("use_sparse_trie_state_root", &self.use_sparse_trie_state_root)
             .finish()
     }
@@ -96,6 +100,7 @@ impl Default for MiningConfig {
             max_bids_per_builder: Some(3),
             builder_fee_ceil: Some(1_000_000_000_000_000_000), // 1 BNB
             allowed_builders: None, // No whitelist by default (allow all)
+            bid_block_enabled: false, // BEP-675 BidBlock path off by default
             use_sparse_trie_state_root: false, // Opt-in for now (perf testing)
         }
     }
@@ -173,6 +178,11 @@ impl MiningConfig {
         self.builder_fee_ceil.unwrap_or(1_000_000_000_000_000_000) // Default: 1 BNB
     }
 
+    /// Whether the `mev_sendBidBlock` RPC (BEP-675) is accepted.
+    pub fn get_bid_block_enabled(&self) -> bool {
+        self.bid_block_enabled
+    }
+
     /// Generate a new validator configuration with random keys
     pub fn generate_for_development() -> Self {
         // use rand::Rng;
@@ -205,6 +215,7 @@ impl MiningConfig {
                 max_bids_per_builder: Some(3),
                 builder_fee_ceil: Some(1_000_000_000_000_000_000),
                 allowed_builders: None,
+                bid_block_enabled: false,
                 greedy_merge: true,
                 use_sparse_trie_state_root: false,
             }
@@ -299,6 +310,11 @@ impl MiningConfig {
             .map(|v| v.to_lowercase() == "true")
             .unwrap_or(false);
 
+        let bid_block_enabled = std::env::var("BSC_MINING_BID_BLOCK_ENABLED")
+            .ok()
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false);
+
         let mut cfg = Self {
             enabled,
             private_key_hex,
@@ -314,6 +330,7 @@ impl MiningConfig {
             max_bids_per_builder,
             builder_fee_ceil,
             allowed_builders,
+            bid_block_enabled,
             use_sparse_trie_state_root,
             ..Default::default()
         };
@@ -416,6 +433,11 @@ pub mod keystore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bid_block_disabled_by_default() {
+        assert!(!MiningConfig::default().get_bid_block_enabled());
+    }
 
     #[test]
     fn test_mining_config_validation() {
