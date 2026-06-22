@@ -105,6 +105,13 @@ static LOCAL_PEER_ID: OnceLock<PeerId> = OnceLock::new();
 static BID_PACKAGE_QUEUE: OnceLock<Arc<Mutex<VecDeque<crate::node::miner::bid_simulator::Bid>>>> =
     OnceLock::new();
 
+/// Global BidBlock builder permission manager (BEP-675). Shared between the `mev_sendBidBlock`
+/// admission path (which rejects revoked builders) and the miner, which revokes builders after a
+/// failed BidBlock verification.
+static BID_BLOCK_PERMISSION_MANAGER: OnceLock<
+    Arc<crate::node::miner::bid_block_permission::BidBlockPermissionManager>,
+> = OnceLock::new();
+
 /// Global network handle to interact with P2P (reth).
 static NETWORK_HANDLE: OnceLock<NetworkHandle<BscNetworkPrimitives>> = OnceLock::new();
 
@@ -464,6 +471,16 @@ pub fn pop_bid_package() -> Option<crate::node::miner::bid_simulator::Bid> {
 /// Get the count of pending bid packages in the queue
 pub fn bid_package_queue_len() -> usize {
     BID_PACKAGE_QUEUE.get().map(|queue| queue.lock().len()).unwrap_or(0)
+}
+
+/// Get the global BidBlock permission manager, initializing it lazily on first access.
+pub fn get_bid_block_permission_manager(
+) -> Arc<crate::node::miner::bid_block_permission::BidBlockPermissionManager> {
+    BID_BLOCK_PERMISSION_MANAGER
+        .get_or_init(|| {
+            Arc::new(crate::node::miner::bid_block_permission::BidBlockPermissionManager::new())
+        })
+        .clone()
 }
 
 /// Store the reth `NetworkHandle` globally for dynamic peer actions.
