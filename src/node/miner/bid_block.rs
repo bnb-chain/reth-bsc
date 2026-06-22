@@ -10,11 +10,17 @@
 
 use crate::chainspec::BscChainSpec;
 use crate::consensus::eip4844::is_blob_eligible_block;
+use crate::consensus::parlia::bid_block::{
+    extract_bid_block_deposit_value, verify_bid_block_system_txs, BidBlockSystemTxError,
+};
+use crate::consensus::parlia::{consensus::Parlia, Snapshot};
 use crate::node::primitives::BscBlobTransactionSidecar;
-use alloy_consensus::Header;
+use alloy_consensus::{Header, Transaction};
 use alloy_eips::eip2718::Decodable2718;
 use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
 use alloy_rlp::Encodable;
+use reth::consensus::HeaderValidator;
+use reth::primitives::SealedHeader;
 use reth_chainspec::EthChainSpec;
 use reth_ethereum_primitives::TransactionSigned;
 use std::{fmt, vec::Vec};
@@ -22,6 +28,11 @@ use std::{fmt, vec::Vec};
 /// Sidecar version carrying EIP-7594 cell proofs (PeerDAS). BSC does not support it yet, so a
 /// BidBlock declaring it is rejected; legacy EIP-4844 blob proofs are version `0`.
 const BLOB_SIDECAR_VERSION_CELL_PROOF: u8 = 1;
+
+/// Per-transaction gas cap (EIP-7825, `params.MaxTxGas` in go-bsc): `2^24` = 16,777,216. go-bsc
+/// applies it to every user tx in `preSealVerifyBidBlock`; BidBlocks only exist post-Pasteur (which
+/// is past Osaka), so the cap is always in force there.
+const MAX_TX_GAS: u64 = 1 << 24;
 
 /// The builder-proposed block carried by [`BidBlockArgs`].
 ///
@@ -303,6 +314,120 @@ impl fmt::Display for BlobSidecarError {
 }
 
 impl std::error::Error for BlobSidecarError {}
+
+/// Pre-seal verification of an admitted BidBlock (go-bsc `bidSimulator.preSealVerifyBidBlock`).
+///
+/// Runs the cheap checks a validator makes before sealing a builder block, in go-bsc's order:
+/// coinbase is the validator, gas limit matches the in-turn target, the header is a valid unsealed
+/// Parlia header, the timestamp is within the slot, the deposit (gas-fee) value is non-zero, blob
+/// sidecars are well-formed, no user tx exceeds the per-tx gas cap, and the trailing system-tx
+/// region is valid. KZG proofs and parent-relative cascading fields are re-checked at block
+/// insertion. Returns the located `(system_tx_start, gas_fee)`.
+///
+/// `expected_gas_limit` is the caller's `calculate_block_gas_limit(parent.gas_limit, ceil)` (reth's
+/// `core.CalcGasLimit`); `etherbase` is the validator address; `snap` is the parent's snapshot.
+#[allow(clippy::too_many_arguments)]
+pub fn pre_seal_verify_bid_block(
+    parlia: &Parlia<BscChainSpec>,
+    chain_spec: &BscChainSpec,
+    decoded: &DecodedBidBlock,
+    parent: &Header,
+    snap: &Snapshot,
+    etherbase: Address,
+    expected_gas_limit: u64,
+) -> Result<(usize, U256), PreSealVerifyError> {
+    let header = &decoded.header;
+
+    if header.beneficiary != etherbase {
+        return Err(PreSealVerifyError::InvalidCoinbase { got: header.beneficiary, want: etherbase });
+    }
+    if header.gas_limit != expected_gas_limit {
+        return Err(PreSealVerifyError::InvalidGasLimit {
+            got: header.gas_limit,
+            want: expected_gas_limit,
+        });
+    }
+
+    // VerifyUnsealedHeader: standalone Parlia header-field checks (extra, ommers, gas, base fee,
+    // withdrawals, 4844, mix digest, beacon root, requests hash).
+    let sealed = SealedHeader::seal_slow(header.clone());
+    parlia
+        .validate_header(&sealed)
+        .map_err(|e| PreSealVerifyError::InvalidHeader(e.to_string()))?;
+    parlia
+        .block_time_upper_check(snap, header, parent)
+        .map_err(|e| PreSealVerifyError::InvalidHeader(e.to_string()))?;
+
+    let (system_tx_start, gas_fee) = extract_bid_block_deposit_value(&decoded.txs);
+    if gas_fee.is_zero() {
+        return Err(PreSealVerifyError::EmptyGasFee);
+    }
+
+    validate_bid_block_blob_sidecars(
+        header,
+        &decoded.txs,
+        &decoded.sidecars,
+        system_tx_start,
+        chain_spec,
+    )
+    .map_err(PreSealVerifyError::Blob)?;
+
+    for (i, tx) in decoded.txs[..system_tx_start].iter().enumerate() {
+        if tx.gas_limit() > MAX_TX_GAS {
+            return Err(PreSealVerifyError::TxGasTooHigh {
+                tx_index: i,
+                gas: tx.gas_limit(),
+                cap: MAX_TX_GAS,
+            });
+        }
+    }
+
+    verify_bid_block_system_txs(&decoded.txs, header, parent, system_tx_start)
+        .map_err(PreSealVerifyError::SystemTx)?;
+
+    Ok((system_tx_start, gas_fee))
+}
+
+/// Why an admitted BidBlock failed pre-seal verification (see [`pre_seal_verify_bid_block`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreSealVerifyError {
+    /// Header coinbase is not the in-turn validator.
+    InvalidCoinbase { got: Address, want: Address },
+    /// Header gas limit does not equal the in-turn target.
+    InvalidGasLimit { got: u64, want: u64 },
+    /// The unsealed Parlia header is invalid, or the timestamp exceeds the slot bound.
+    InvalidHeader(String),
+    /// The deposit (gas-fee) value is zero.
+    EmptyGasFee,
+    /// A user tx exceeds the per-tx gas cap.
+    TxGasTooHigh { tx_index: usize, gas: u64, cap: u64 },
+    /// Blob-sidecar validation failed.
+    Blob(BlobSidecarError),
+    /// Trailing system-tx region validation failed.
+    SystemTx(BidBlockSystemTxError),
+}
+
+impl fmt::Display for PreSealVerifyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidCoinbase { got, want } => {
+                write!(f, "invalid coinbase: got {got}, want {want}")
+            }
+            Self::InvalidGasLimit { got, want } => {
+                write!(f, "invalid gasLimit: got {got}, want {want}")
+            }
+            Self::InvalidHeader(detail) => write!(f, "invalid header: {detail}"),
+            Self::EmptyGasFee => write!(f, "empty gasFee"),
+            Self::TxGasTooHigh { tx_index, gas, cap } => {
+                write!(f, "tx {tx_index} gas {gas} exceeds cap {cap}")
+            }
+            Self::Blob(e) => write!(f, "{e}"),
+            Self::SystemTx(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for PreSealVerifyError {}
 
 #[cfg(test)]
 mod tests {
@@ -590,6 +715,155 @@ mod tests {
         assert_eq!(
             validate_bid_block_blob_sidecars(&blob_header(), &[tx], &[sidecar], 1, &spec),
             Err(BlobSidecarError::TooManyBlobs { have: 7, permitted: 6 })
+        );
+    }
+
+    // ---- pre_seal_verify_bid_block ----
+
+    use crate::consensus::parlia::bid_block::DEPOSIT_SELECTOR;
+    use crate::system_contracts::VALIDATOR_CONTRACT;
+    use alloy_consensus::EMPTY_OMMER_ROOT_HASH;
+    use std::sync::Arc;
+
+    /// Plain mainnet spec: all BSC forks inactive at block 1, so the header has no base fee, blob,
+    /// beacon-root, requests-hash or millisecond-mix-digest fields to satisfy.
+    fn preseal_spec() -> BscChainSpec {
+        BscChainSpec::from(reth_chainspec::ChainSpecBuilder::mainnet().build())
+    }
+
+    fn parlia_engine(spec: BscChainSpec) -> Parlia<BscChainSpec> {
+        Parlia::new(Arc::new(spec), 200)
+    }
+
+    fn snap_with_interval(interval: u64) -> Snapshot {
+        let mut snap = Snapshot::new(vec![Address::ZERO], 0, B256::ZERO, 200, None);
+        snap.block_interval = interval;
+        snap
+    }
+
+    /// A valid unsealed Parlia header for block 1: in-turn validator coinbase, EIP-1559/Cancun/etc.
+    /// fields all absent (pre-fork), extra = 32-byte vanity + 65-byte seal slot (non-epoch).
+    fn valid_bid_header(etherbase: Address, gas_limit: u64) -> Header {
+        Header {
+            number: 1,
+            timestamp: 1,
+            beneficiary: etherbase,
+            gas_limit,
+            gas_used: 21_000,
+            ommers_hash: EMPTY_OMMER_ROOT_HASH,
+            extra_data: Bytes::from(vec![0u8; 32 + 65]),
+            ..Default::default()
+        }
+    }
+
+    /// An unsigned `deposit(...)` system tx (zero gas price, zero signature, validator contract).
+    fn deposit_system_tx(value: u64) -> TransactionSigned {
+        use alloy_consensus::TxLegacy;
+        let tx = TxLegacy {
+            chain_id: Some(1),
+            nonce: 0,
+            gas_price: 0,
+            gas_limit: 21_000,
+            to: TxKind::Call(VALIDATOR_CONTRACT),
+            value: U256::from(value),
+            input: Bytes::from(DEPOSIT_SELECTOR.to_vec()),
+        };
+        TransactionSigned::new_unhashed(tx.into(), Signature::new(U256::ZERO, U256::ZERO, false))
+    }
+
+    fn decoded_block(
+        header: Header,
+        txs: Vec<TransactionSigned>,
+        sidecars: Vec<BscBlobTransactionSidecar>,
+    ) -> DecodedBidBlock {
+        DecodedBidBlock {
+            builder: Address::ZERO,
+            header,
+            txs,
+            sidecars,
+            gas_fee: U256::ZERO,
+            system_tx_start: 0,
+            bid_hash: B256::ZERO,
+        }
+    }
+
+    #[test]
+    fn pre_seal_accepts_valid_bid_block() {
+        let spec = preseal_spec();
+        let etherbase = Address::repeat_byte(0x11);
+        let parlia = parlia_engine(spec.clone());
+        let snap = snap_with_interval(3_000);
+        let header = valid_bid_header(etherbase, 30_000_000);
+        let parent = Header { number: 0, timestamp: 1, gas_limit: 30_000_000, ..Default::default() };
+        // user tx (signed, non-system) then a trailing unsigned deposit tx carrying the gas fee.
+        let txs = vec![legacy_tx(0), deposit_system_tx(100)];
+        let d = decoded_block(header.clone(), txs, vec![]);
+        assert_eq!(
+            pre_seal_verify_bid_block(
+                &parlia,
+                &spec,
+                &d,
+                &parent,
+                &snap,
+                etherbase,
+                header.gas_limit
+            ),
+            Ok((1, U256::from(100)))
+        );
+    }
+
+    #[test]
+    fn pre_seal_rejects_wrong_coinbase() {
+        let spec = preseal_spec();
+        let parlia = parlia_engine(spec.clone());
+        let snap = snap_with_interval(3_000);
+        let etherbase = Address::repeat_byte(0x11);
+        let header = valid_bid_header(Address::repeat_byte(0x22), 30_000_000);
+        let parent = Header { number: 0, timestamp: 1, gas_limit: 30_000_000, ..Default::default() };
+        let d = decoded_block(header, vec![], vec![]);
+        assert!(matches!(
+            pre_seal_verify_bid_block(&parlia, &spec, &d, &parent, &snap, etherbase, 30_000_000),
+            Err(PreSealVerifyError::InvalidCoinbase { .. })
+        ));
+    }
+
+    #[test]
+    fn pre_seal_rejects_wrong_gas_limit() {
+        let spec = preseal_spec();
+        let parlia = parlia_engine(spec.clone());
+        let snap = snap_with_interval(3_000);
+        let etherbase = Address::repeat_byte(0x11);
+        let header = valid_bid_header(etherbase, 30_000_000);
+        let parent = Header { number: 0, timestamp: 1, gas_limit: 30_000_000, ..Default::default() };
+        let d = decoded_block(header, vec![], vec![]);
+        assert!(matches!(
+            pre_seal_verify_bid_block(&parlia, &spec, &d, &parent, &snap, etherbase, 29_000_000),
+            Err(PreSealVerifyError::InvalidGasLimit { .. })
+        ));
+    }
+
+    #[test]
+    fn pre_seal_rejects_empty_gas_fee() {
+        let spec = preseal_spec();
+        let etherbase = Address::repeat_byte(0x11);
+        let parlia = parlia_engine(spec.clone());
+        let snap = snap_with_interval(3_000);
+        let header = valid_bid_header(etherbase, 30_000_000);
+        let parent = Header { number: 0, timestamp: 1, gas_limit: 30_000_000, ..Default::default() };
+        // deposit value 0 => gas fee is zero.
+        let txs = vec![legacy_tx(0), deposit_system_tx(0)];
+        let d = decoded_block(header.clone(), txs, vec![]);
+        assert_eq!(
+            pre_seal_verify_bid_block(
+                &parlia,
+                &spec,
+                &d,
+                &parent,
+                &snap,
+                etherbase,
+                header.gas_limit
+            ),
+            Err(PreSealVerifyError::EmptyGasFee)
         );
     }
 }
