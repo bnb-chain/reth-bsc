@@ -48,6 +48,12 @@ pub struct BscCliArgs {
     #[arg(long = "mining.use-sparse-trie-state-root")]
     pub mining_use_sparse_trie_state_root: bool,
 
+    /// Accept BEP-675 builder-proposed blocks via `mev_sendBidBlock`.
+    ///
+    /// Env alternative: `BSC_MINING_BID_BLOCK_ENABLED=true`.
+    #[arg(long = "mining.bid-block-enabled")]
+    pub mining_bid_block_enabled: bool,
+
     /// Private key for mining (hex format, for testing only)
     /// The validator address will be automatically derived from this key
     #[arg(long = "mining.private-key")]
@@ -227,6 +233,11 @@ fn main() -> eyre::Result<()> {
                 // CLI takes precedence over env BSC_MINING_USE_SPARSE_TRIE_STATE_ROOT.
                 if args.mining_use_sparse_trie_state_root {
                     mining_config.use_sparse_trie_state_root = true;
+                }
+
+                // CLI takes precedence over env BSC_MINING_BID_BLOCK_ENABLED.
+                if args.mining_bid_block_enabled {
+                    mining_config.bid_block_enabled = true;
                 }
 
                 // Ensure keys are available if enabled but none provided
