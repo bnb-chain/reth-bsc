@@ -60,6 +60,38 @@ use tracing::{debug, info, trace, warn};
 /// 120ms to avoid missing the block deadline or eating into the next block's time budget.
 pub const DELAY_LEFT_OVER: u64 = 120;
 
+/// Maximum end-of-slot reserve (ms) used when the in-memory overlay is deep.
+///
+/// Empty blocks under load cluster at the *peaks* of the overlay depth (head − finalized): there
+/// the background sparse-trie root can't finalize within the default 120ms reserve, so `finish`
+/// waits past the slot deadline and the block degrades to empty-fallback. For the ~97% of blocks
+/// at normal depth the root is ready in ~20ms, so the default reserve is left untouched. When the
+/// overlay is deep we reserve more of the slot for the root (fill stops earlier → exec ends earlier
+/// → the finalize tail gets a larger window, and fewer txs are filled → the finalize tail is
+/// smaller), turning a would-be empty block into an on-time smaller block.
+/// See docs/design-adaptive-overlay-depth.md.
+const ROOT_RESERVE_MAX_MS: u64 = 280;
+/// Overlay depth (head − finalized) at/below which the default reserve is used (normal blocks).
+const ROOT_RESERVE_DEPTH_LOW: u64 = 15;
+/// Overlay depth at/above which the maximum reserve is used.
+const ROOT_RESERVE_DEPTH_HIGH: u64 = 40;
+
+/// Effective end-of-slot reserve (ms) given the current in-memory overlay depth.
+///
+/// Linearly interpolates `DELAY_LEFT_OVER..=ROOT_RESERVE_MAX_MS` between the LOW and HIGH depths.
+/// At/below LOW it returns the unchanged default, so normal blocks are unaffected.
+pub fn effective_delay_left_over(overlay_depth: u64) -> u64 {
+    if overlay_depth <= ROOT_RESERVE_DEPTH_LOW {
+        DELAY_LEFT_OVER
+    } else if overlay_depth >= ROOT_RESERVE_DEPTH_HIGH {
+        ROOT_RESERVE_MAX_MS
+    } else {
+        let span = (ROOT_RESERVE_DEPTH_HIGH - ROOT_RESERVE_DEPTH_LOW) as f64;
+        let t = (overlay_depth - ROOT_RESERVE_DEPTH_LOW) as f64 / span;
+        DELAY_LEFT_OVER + (t * (ROOT_RESERVE_MAX_MS - DELAY_LEFT_OVER) as f64) as u64
+    }
+}
+
 /// Minimum estimated fee uplift required for a normal rebuild, expressed in basis points.
 const NORMAL_REBUILD_UPLIFT_BPS: u64 = 1_500;
 
@@ -1373,10 +1405,22 @@ where
 
         let trace_id = build_args.trace_id;
 
+        // Adaptive root reserve: when the in-memory overlay (head − finalized) is deep, reserve
+        // more of the slot for the background state root so it finalizes before the deadline
+        // instead of degrading the block to empty-fallback. Normal-depth blocks keep the default
+        // reserve (overlay_depth ≤ ROOT_RESERVE_DEPTH_LOW). Falls back to depth 0 (default reserve)
+        // when finalized is not yet available. See docs/design-adaptive-overlay-depth.md.
+        let block_number = mining_ctx.parent_header.number() + 1;
+        let overlay_depth = crate::shared::get_canonical_in_memory_state()
+            .and_then(|cim| cim.get_finalized_num_hash())
+            .map(|f| block_number.saturating_sub(f.number))
+            .unwrap_or(0);
+        let effective_reserve = effective_delay_left_over(overlay_depth);
+        metrics::histogram!("bsc_miner_effective_reserve_ms").record(effective_reserve as f64);
         let mining_delay = parlia.clone().delay_for_mining(
             &mining_ctx.parent_snapshot,
             mining_ctx.header.as_ref().unwrap(),
-            DELAY_LEFT_OVER,
+            effective_reserve,
         );
         let pending_basefee = builder.pool.block_info().pending_basefee;
 
