@@ -128,6 +128,55 @@ pub fn effective_delay_left_over(overlay_depth: u64) -> u64 {
     }
 }
 
+/// Diagnostic guard for a single build attempt's lifetime.
+///
+/// A build attempt's executor (with the sparse-trie `state_hook` installed) keeps reth's
+/// sparse-trie task — and therefore its proof workers' MDBX read-only transaction — alive for as
+/// long as the attempt runs. reth releases that RO promptly only once the executor is dropped
+/// (`sparse_trie.rs` exits when the updates channel disconnects). A read txn held ~30s is what
+/// pins the MDBX freelist and stalls persistence. This guard records how long EACH attempt lives
+/// — including attempts that are aborted/superseded (the `Drop` fires when the spawned future is
+/// dropped) — so we can identify which kind of attempt (speculative/out-of-turn vs rebuild) holds
+/// the RO long enough to hit the 30s cap. Pure instrumentation; no behavior change.
+struct BuildAttemptGuard {
+    start: std::time::Instant,
+    trace_id: u64,
+    block_number: u64,
+    is_inturn: bool,
+    kind: &'static str,
+}
+
+impl BuildAttemptGuard {
+    fn new(trace_id: u64, block_number: u64, is_inturn: bool, kind: &'static str) -> Self {
+        Self { start: std::time::Instant::now(), trace_id, block_number, is_inturn, kind }
+    }
+}
+
+impl Drop for BuildAttemptGuard {
+    fn drop(&mut self) {
+        let elapsed = self.start.elapsed();
+        metrics::histogram!(
+            "bsc_miner_build_attempt_lifetime_seconds",
+            "kind" => self.kind,
+            "inturn" => if self.is_inturn { "true" } else { "false" },
+        )
+        .record(elapsed.as_secs_f64());
+        // A long-lived attempt held the proof-worker RO this long → suspected source of the 30s
+        // read-only txn that pins the MDBX freelist. Threshold 2s flags the outliers.
+        if elapsed.as_secs() >= 2 {
+            tracing::warn!(
+                target: "bsc::miner",
+                trace_id = self.trace_id,
+                block_number = self.block_number,
+                is_inturn = self.is_inturn,
+                kind = self.kind,
+                lifetime_ms = elapsed.as_millis() as u64,
+                "Long-lived build attempt (held proof-worker RO for this long)"
+            );
+        }
+    }
+}
+
 /// Minimum estimated fee uplift required for a normal rebuild, expressed in basis points.
 const NORMAL_REBUILD_UPLIFT_BPS: u64 = 1_500;
 
@@ -1555,7 +1604,16 @@ where
             {
                 let builder = self.builder.clone();
                 let build_args = self.build_args.clone();
-                self.join_handle.spawn(async move { builder.build_payload(build_args).await });
+                let guard = BuildAttemptGuard::new(
+                    self.trace_id,
+                    self.build_args.config.parent_header.number() + 1,
+                    self.mining_ctx.is_inturn,
+                    "speculative",
+                );
+                self.join_handle.spawn(async move {
+                    let _guard = guard;
+                    builder.build_payload(build_args).await
+                });
             }
 
             tokio::select! {
@@ -1626,7 +1684,14 @@ where
 
                             let builder = self.builder.clone();
                             let build_args = self.build_args.clone();
+                            let guard = BuildAttemptGuard::new(
+                                self.trace_id,
+                                self.build_args.config.parent_header.number() + 1,
+                                self.mining_ctx.is_inturn,
+                                "rebuild",
+                            );
                             self.join_handle.spawn(async move {
+                                let _guard = guard;
                                 builder.build_payload(build_args).await
                             });
                         }
