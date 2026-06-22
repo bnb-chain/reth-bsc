@@ -17,13 +17,17 @@ use reth_ethereum_primitives::TransactionSigned;
 use std::{fmt, vec::Vec};
 
 /// The builder-proposed block carried by [`BidBlockArgs`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// JSON field names mirror go-bsc's `core/types/bid.go` (`header`, `transactions`, `sidecars`) so
+/// builder payloads deserialize unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BidBlock {
     /// Proposed block header.
     pub header: Header,
     /// Raw (EIP-2718) transactions: user txs first, unsigned system txs last.
     pub transactions: Vec<Bytes>,
-    /// Blob sidecars for any blob transactions (empty when there are none).
+    /// Blob sidecars for any blob transactions (empty/omitted when there are none).
+    #[serde(default)]
     pub sidecars: Vec<BscBlobTransactionSidecar>,
 }
 
@@ -46,9 +50,12 @@ impl BidBlock {
 }
 
 /// Input to the `mev_sendBidBlock` RPC: a [`BidBlock`] plus the builder's signature over its hash.
-#[derive(Debug, Clone)]
+///
+/// JSON keys match go-bsc's `BidBlockArgs` (`BidBlock`, `signature`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BidBlockArgs {
     /// The proposed block.
+    #[serde(rename = "BidBlock")]
     pub bid_block: BidBlock,
     /// secp256k1 signature (`r || s || v`, 65 bytes) over [`BidBlock::hash`].
     pub signature: Bytes,
@@ -259,5 +266,33 @@ mod tests {
     fn ecrecover_rejects_bad_signature_length() {
         let args = BidBlockArgs { bid_block: vector_a_block(), signature: Bytes::from(vec![0u8; 64]) };
         assert_eq!(args.ecrecover_sender(), Err(BidBlockError::InvalidSignatureLength(64)));
+    }
+
+    #[test]
+    fn bid_block_args_json_roundtrip_preserves_hash() {
+        // The hash is taken over the decoded structure, so a JSON round-trip must not perturb it.
+        let args = BidBlockArgs {
+            bid_block: vector_a_block(),
+            signature: Bytes::from(vec![1u8; 65]),
+        };
+        let json = serde_json::to_value(&args).unwrap();
+        // geth wire parity: outer keys are "BidBlock" and "signature".
+        assert!(json.get("BidBlock").is_some());
+        assert!(json.get("signature").is_some());
+
+        let decoded: BidBlockArgs = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded.bid_block, args.bid_block);
+        assert_eq!(decoded.bid_block.hash(), args.bid_block.hash());
+    }
+
+    #[test]
+    fn bid_block_sidecars_default_when_omitted() {
+        // Builder payloads with no blob txs omit "sidecars"; it must default to empty.
+        let json = serde_json::json!({
+            "header": serde_json::to_value(vector_a_block().header).unwrap(),
+            "transactions": [],
+        });
+        let bb: BidBlock = serde_json::from_value(json).unwrap();
+        assert!(bb.sidecars.is_empty());
     }
 }
