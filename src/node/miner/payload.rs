@@ -60,6 +60,17 @@ use tracing::{debug, info, trace, warn};
 /// 120ms to avoid missing the block deadline or eating into the next block's time budget.
 pub const DELAY_LEFT_OVER: u64 = 120;
 
+/// Relative budget (ms) for the empty-fallback build's state root.
+///
+/// The empty-fallback build is spawned *at* the slot deadline, so the job-level
+/// `state_root_deadline_ms` (= `end_mining - 30`) is already elapsed — using it would starve the
+/// sparse-trie wait to ~0 and force the slow synchronous `state_root_with_updates`. Even for a
+/// 0-tx block that sync path pays the full ~340ms overlay trie-input rebuild over a deep overlay
+/// (and can balloon to the 30s read-txn cap under freelist contention). Giving the empty build a
+/// fresh *relative* budget keeps its root on the warm sparse-trie fast path (~tens of ms) and
+/// bounds the read transaction well below the cap.
+const EMPTY_BUILD_ROOT_BUDGET_MS: u64 = 200;
+
 /// Adaptive end-of-slot reserve, tuned at runtime via env (no recompile needed for testing).
 ///
 /// Empty blocks under load cluster at the *peaks* of the overlay depth (head − finalized): there
@@ -1209,6 +1220,35 @@ where
         let validator_cache_sink: ValidatorCacheSink = Arc::new(Mutex::new(None));
         let turn_length_sink: Arc<Mutex<Option<u8>>> = Arc::new(Mutex::new(None));
 
+        // Empty-fallback build: use the sparse-trie fast path (reuse the warm anchored trie) so the
+        // state root is ~tens of ms instead of the ~340ms synchronous full overlay trie-input
+        // rebuild that a 0-tx block otherwise pays over a deep overlay. Fresh per-attempt handle
+        // (R3) + fresh sink (no cross-build theft); a *relative* deadline (now + budget) keeps the
+        // sparse wait from being starved by the already-elapsed slot deadline and bounds the read
+        // txn below the 30s cap. On miss it falls through to the (deadline-guarded) sync path.
+        let empty_trie_handle: Arc<
+            Mutex<Option<reth_engine_tree::tree::multiproof::StateRootHandle>>,
+        > = {
+            let use_sparse_trie = crate::node::miner::config::get_global_mining_config()
+                .is_some_and(|c| c.use_sparse_trie_state_root)
+                && !rust_eth_triedb::triedb_manager::is_triedb_active();
+            Arc::new(Mutex::new(if use_sparse_trie {
+                crate::shared::spawn_sparse_trie_state_root(
+                    parent_header.hash_slow(),
+                    parent_header.state_root(),
+                )
+            } else {
+                None
+            }))
+        };
+        let empty_state_root_sink: Arc<
+            Mutex<Option<(alloy_primitives::B256, reth_trie_common::updates::TrieUpdates)>>,
+        > = Arc::new(Mutex::new(None));
+        let empty_root_deadline_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64 + EMPTY_BUILD_ROOT_BUDGET_MS)
+            .unwrap_or(0);
+
         let mut builder = self
             .evm_config
             .builder_for_next_block(
@@ -1234,17 +1274,15 @@ where
                     triedb_prefetcher: triedb_prefetcher.clone(),
                     validator_cache_sink: Some(validator_cache_sink.clone()),
                     turn_length_sink: Some(turn_length_sink.clone()),
-                    // Empty-fallback build never installs a sparse-trie hook (trie_handle: None
-                    // below), so it must NOT read from any sparse-trie sink. Passing None makes the
-                    // builder compute this empty block's own (cheap) state root via
-                    // `state_root_with_updates` instead of stealing a full build's precomputed root
-                    // out of a shared sink (which both starved the full build and risked sealing a
-                    // foreign root onto the empty block).
-                    state_root_precomputed_sink: None,
-                    // Empty-payload path: don't engage sparse-trie (would still be
-                    // correct but the setup overhead isn't worth it for ~0-tx blocks).
-                    trie_handle: None,
-                    state_root_deadline_ms: None,
+                    // Fresh per-attempt sink for this empty build's own sparse-trie root (no
+                    // cross-build sharing). Paired with `empty_trie_handle` below.
+                    state_root_precomputed_sink: Some(empty_state_root_sink.clone()),
+                    // Empty build now uses the warm sparse-trie fast path (see above) instead of
+                    // the slow synchronous overlay rebuild.
+                    trie_handle: Some(empty_trie_handle.clone()),
+                    // Relative budget so the sparse wait isn't starved by the elapsed slot
+                    // deadline; bounds the read txn below the 30s cap.
+                    state_root_deadline_ms: Some(empty_root_deadline_ms),
                 },
             )
             .map_err(PayloadBuilderError::other)?;
@@ -1265,6 +1303,18 @@ where
                 trace_id,
                 parent_hash = ?parent_hash,
                 "Started triedb prefetcher for miner empty payload build"
+            );
+        } else if let Some(handle_guard) = empty_trie_handle.lock().unwrap().as_ref() {
+            // Sparse-trie mode (non-triedb): install the state_hook so the system-tx state changes
+            // stream to the sparse-trie task. The handle is forwarded via attrs.trie_handle into
+            // ctx, and finish_with_difflayer consumes it (bounded by the relative deadline) — the
+            // warm anchored trie yields the root in ~tens of ms instead of the ~340ms sync rebuild.
+            builder.executor_mut().set_state_hook(Some(Box::new(handle_guard.state_hook())));
+            debug!(
+                target: "payload_builder",
+                trace_id,
+                parent_hash = ?parent_hash,
+                "Installed sparse-trie state_hook on executor for empty payload build"
             );
         }
 
