@@ -14,6 +14,7 @@ use crate::consensus::parlia::bid_block::{
     extract_bid_block_deposit_value, verify_bid_block_system_txs, BidBlockSystemTxError,
 };
 use crate::consensus::parlia::{consensus::Parlia, Snapshot};
+use crate::node::miner::signer::sign_system_transaction;
 use crate::node::primitives::BscBlobTransactionSidecar;
 use alloy_consensus::{Header, Transaction};
 use alloy_eips::eip2718::Decodable2718;
@@ -428,6 +429,46 @@ impl fmt::Display for PreSealVerifyError {
 }
 
 impl std::error::Error for PreSealVerifyError {}
+
+/// Blind-sign the trailing unsigned system txs of a verified BidBlock with the validator key
+/// (go-bsc `bindSignBidBlockSystemTxs` + `parlia.SignSystemTx`).
+///
+/// The leading user txs (`[..system_tx_start]`, already builder-signed) are copied through
+/// unchanged; each trailing tx — an unsigned placeholder the validator owns — is re-signed with the
+/// global validator key. Signing these is what makes the builder-assembled block sealable by the
+/// validator. Returns the full transaction list ready for execution.
+pub fn bind_sign_bid_block_system_txs(
+    txs: &[TransactionSigned],
+    system_tx_start: usize,
+) -> Result<Vec<TransactionSigned>, BindSignError> {
+    let mut out = Vec::with_capacity(txs.len());
+    out.extend_from_slice(&txs[..system_tx_start]);
+    for (offset, tx) in txs[system_tx_start..].iter().enumerate() {
+        // Recover the typed transaction, dropping the all-zero placeholder signature, then re-sign.
+        let unsigned = tx.clone().into_typed_transaction();
+        let signed = sign_system_transaction(unsigned)
+            .map_err(|e| BindSignError { index: system_tx_start + offset, detail: e.to_string() })?;
+        out.push(signed);
+    }
+    Ok(out)
+}
+
+/// A trailing system tx at `index` could not be signed with the validator key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindSignError {
+    /// Index in the BidBlock transaction list.
+    pub index: usize,
+    /// Underlying signer error.
+    pub detail: String,
+}
+
+impl fmt::Display for BindSignError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "failed to sign system tx {}: {}", self.index, self.detail)
+    }
+}
+
+impl std::error::Error for BindSignError {}
 
 #[cfg(test)]
 mod tests {
@@ -884,5 +925,39 @@ mod tests {
         assert_eq!(crate::shared::pop_bid_block_package().unwrap().block_number(), 1);
         assert_eq!(crate::shared::pop_bid_block_package().unwrap().block_number(), 2);
         assert!(crate::shared::pop_bid_block_package().is_none());
+    }
+
+    #[test]
+    fn bind_sign_signs_trailing_system_txs() {
+        use reth_primitives_traits::SignerRecoverable;
+
+        // Same dev key the other miner tests use, so the process-global signer is consistent
+        // regardless of test order (init is first-wins; we ignore AlreadyInitialized).
+        let raw = alloy_primitives::hex::decode(
+            "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+        )
+        .unwrap();
+        let _ = crate::node::miner::signer::init_global_signer(B256::from_slice(&raw));
+
+        // user tx, then two unsigned (zero-signature) system txs.
+        let txs = vec![legacy_tx(0), deposit_system_tx(100), deposit_system_tx(0)];
+        let out = bind_sign_bid_block_system_txs(&txs, 1).unwrap();
+        assert_eq!(out.len(), 3);
+
+        // Leading user tx is untouched.
+        assert_eq!(out[0], txs[0]);
+
+        // The validator address the global signer signs with.
+        let validator = sign_system_transaction(deposit_system_tx(7).into_typed_transaction())
+            .unwrap()
+            .recover_signer()
+            .unwrap();
+        assert_ne!(validator, Address::ZERO);
+
+        // Trailing system txs now carry a real signature recovering to the validator, and differ
+        // from the unsigned placeholders.
+        assert_eq!(out[1].recover_signer().unwrap(), validator);
+        assert_eq!(out[2].recover_signer().unwrap(), validator);
+        assert_ne!(out[1], txs[1]);
     }
 }
