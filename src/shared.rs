@@ -112,6 +112,13 @@ static BID_BLOCK_PERMISSION_MANAGER: OnceLock<
     Arc<crate::node::miner::bid_block_permission::BidBlockPermissionManager>,
 > = OnceLock::new();
 
+/// Global intake queue for admitted BEP-675 BidBlocks. `mev_sendBidBlock` pushes a decoded block
+/// here after admission; the miner pops it to pre-seal verify, execute, and select against the
+/// local block (mirrors the legacy [`BID_PACKAGE_QUEUE`] SendBid intake).
+static BID_BLOCK_QUEUE: OnceLock<
+    Arc<Mutex<VecDeque<crate::node::miner::bid_block::DecodedBidBlock>>>,
+> = OnceLock::new();
+
 /// Global network handle to interact with P2P (reth).
 static NETWORK_HANDLE: OnceLock<NetworkHandle<BscNetworkPrimitives>> = OnceLock::new();
 
@@ -481,6 +488,26 @@ pub fn get_bid_block_permission_manager(
             Arc::new(crate::node::miner::bid_block_permission::BidBlockPermissionManager::new())
         })
         .clone()
+}
+
+fn bid_block_queue() -> &'static Arc<Mutex<VecDeque<crate::node::miner::bid_block::DecodedBidBlock>>>
+{
+    BID_BLOCK_QUEUE.get_or_init(|| Arc::new(Mutex::new(VecDeque::new())))
+}
+
+/// Push an admitted BidBlock onto the global intake queue for the miner to process.
+pub fn push_bid_block_package(decoded: crate::node::miner::bid_block::DecodedBidBlock) {
+    bid_block_queue().lock().push_back(decoded);
+}
+
+/// Pop the next admitted BidBlock from the global intake queue (FIFO).
+pub fn pop_bid_block_package() -> Option<crate::node::miner::bid_block::DecodedBidBlock> {
+    bid_block_queue().lock().pop_front()
+}
+
+/// Number of admitted BidBlocks waiting in the global intake queue.
+pub fn bid_block_queue_len() -> usize {
+    bid_block_queue().lock().len()
 }
 
 /// Store the reth `NetworkHandle` globally for dynamic peer actions.
