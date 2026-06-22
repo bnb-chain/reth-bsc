@@ -528,7 +528,12 @@ pub fn bid_block_env_attributes(header: &Header) -> EthPayloadAttributes {
 }
 
 /// The validator-finalized, sealed block produced from an admitted BidBlock, ready to execute.
-pub struct SimulatedBidBlock {
+///
+/// Mirrors the bid-block fields of go-bsc's `task` / `bidBlockTaskInfo` (`miner/bid_block.go`):
+/// `block` + `gasFee` + `systemTxStart`. (`builder`/`bidHash` are added when the consumer loop needs
+/// them for revoke-on-mismatch; receipts/state live on the caller's payload since execution is
+/// deferred.)
+pub struct BidBlockTask {
     /// Sealed block with the validator's extra/seal and the bind-signed system txs.
     pub block: RecoveredBlock<BscBlock>,
     /// Deposit (gas-fee) value located during payload verification.
@@ -585,7 +590,7 @@ pub fn simulate_bid_block(
     expected_gas_limit: u64,
     vanity: Bytes,
     block_timestamp_ms: u64,
-) -> Result<SimulatedBidBlock, SimulateBidBlockError> {
+) -> Result<BidBlockTask, SimulateBidBlockError> {
     let (system_tx_start, gas_fee) =
         verify_bid_block_payload(chain_spec, decoded, parent.header(), validator, expected_gas_limit)
             .map_err(SimulateBidBlockError::Verify)?;
@@ -627,7 +632,7 @@ pub fn simulate_bid_block(
         BscBlockBody { inner: BlockBody { transactions: txs, ommers: Vec::new(), withdrawals }, sidecars };
     let block = RecoveredBlock::new_unhashed(BscBlock { header, body }, senders);
 
-    Ok(SimulatedBidBlock { block, gas_fee, system_tx_start })
+    Ok(BidBlockTask { block, gas_fee, system_tx_start })
 }
 
 #[cfg(test)]
