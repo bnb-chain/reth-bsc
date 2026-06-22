@@ -295,4 +295,37 @@ mod tests {
         let bb: BidBlock = serde_json::from_value(json).unwrap();
         assert!(bb.sidecars.is_empty());
     }
+
+    #[test]
+    fn hash_matches_geth_blob_sidecar_vector() {
+        use alloy_consensus::BlobTransactionSidecar;
+        use alloy_eips::eip4844::{Blob, Bytes48};
+
+        // One BlobSidecar with a single all-zero blob/commitment/proof. go-bsc tags the sidecar
+        // Version `rlp:"-"`, so it is excluded from the hash; the RLP layout is
+        // [[blobs, commitments, proofs], blockNumber, blockHash, txIndex, txHash].
+        let sidecar = BscBlobTransactionSidecar {
+            inner: BlobTransactionSidecar {
+                blobs: vec![Blob::default()],
+                commitments: vec![Bytes48::default()],
+                proofs: vec![Bytes48::default()],
+            },
+            block_number: 7,
+            block_hash: b256!(
+                "0x1111111111111111111111111111111111111111111111111111111111111111"
+            ),
+            tx_index: 3,
+            tx_hash: b256!("0x2222222222222222222222222222222222222222222222222222222222222222"),
+        };
+        let block = BidBlock {
+            header: vector_a_block().header,
+            transactions: Vec::new(),
+            sidecars: vec![sidecar],
+        };
+        // Generated from go-bsc BidBlock.Hash() over [header, [], [sidecar]].
+        assert_eq!(
+            block.hash(),
+            b256!("0x020136e0d39a0a27c9597e89c56f77170b1d43e6b391c4852a2138936184d9c5"),
+        );
+    }
 }
