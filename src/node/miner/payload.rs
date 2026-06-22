@@ -60,7 +60,7 @@ use tracing::{debug, info, trace, warn};
 /// 120ms to avoid missing the block deadline or eating into the next block's time budget.
 pub const DELAY_LEFT_OVER: u64 = 120;
 
-/// Maximum end-of-slot reserve (ms) used when the in-memory overlay is deep.
+/// Adaptive end-of-slot reserve, tuned at runtime via env (no recompile needed for testing).
 ///
 /// Empty blocks under load cluster at the *peaks* of the overlay depth (head − finalized): there
 /// the background sparse-trie root can't finalize within the default 120ms reserve, so `finish`
@@ -70,25 +70,61 @@ pub const DELAY_LEFT_OVER: u64 = 120;
 /// → the finalize tail gets a larger window, and fewer txs are filled → the finalize tail is
 /// smaller), turning a would-be empty block into an on-time smaller block.
 /// See docs/design-adaptive-overlay-depth.md.
+///
+/// Env knobs (read once at startup, cached):
+/// - `BSC_MINING_ADAPTIVE_RESERVE` = on/off (default on); off → fixed `DELAY_LEFT_OVER` (A/B base).
+/// - `BSC_MINING_ROOT_RESERVE_DEPTH_LOW`  (default 15) — at/below this, default reserve.
+/// - `BSC_MINING_ROOT_RESERVE_DEPTH_HIGH` (default 40) — at/above this, max reserve.
+/// - `BSC_MINING_ROOT_RESERVE_MAX_MS`     (default 280) — reserve used at/above DEPTH_HIGH.
+#[derive(Debug, Clone, Copy)]
+struct AdaptiveReserveConfig {
+    enabled: bool,
+    depth_low: u64,
+    depth_high: u64,
+    reserve_max_ms: u64,
+}
+
+/// Default knob values (also the fallback when the corresponding env var is unset/unparseable).
 const ROOT_RESERVE_MAX_MS: u64 = 280;
-/// Overlay depth (head − finalized) at/below which the default reserve is used (normal blocks).
 const ROOT_RESERVE_DEPTH_LOW: u64 = 15;
-/// Overlay depth at/above which the maximum reserve is used.
 const ROOT_RESERVE_DEPTH_HIGH: u64 = 40;
+
+fn adaptive_reserve_config() -> &'static AdaptiveReserveConfig {
+    static CFG: std::sync::OnceLock<AdaptiveReserveConfig> = std::sync::OnceLock::new();
+    CFG.get_or_init(|| {
+        let env_u64 = |k: &str, default: u64| {
+            std::env::var(k).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default)
+        };
+        let enabled = std::env::var("BSC_MINING_ADAPTIVE_RESERVE")
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"))
+            .unwrap_or(true);
+        let cfg = AdaptiveReserveConfig {
+            enabled,
+            depth_low: env_u64("BSC_MINING_ROOT_RESERVE_DEPTH_LOW", ROOT_RESERVE_DEPTH_LOW),
+            depth_high: env_u64("BSC_MINING_ROOT_RESERVE_DEPTH_HIGH", ROOT_RESERVE_DEPTH_HIGH),
+            reserve_max_ms: env_u64("BSC_MINING_ROOT_RESERVE_MAX_MS", ROOT_RESERVE_MAX_MS),
+        };
+        tracing::info!(target: "bsc::miner", ?cfg, "Adaptive root-reserve config");
+        cfg
+    })
+}
 
 /// Effective end-of-slot reserve (ms) given the current in-memory overlay depth.
 ///
-/// Linearly interpolates `DELAY_LEFT_OVER..=ROOT_RESERVE_MAX_MS` between the LOW and HIGH depths.
-/// At/below LOW it returns the unchanged default, so normal blocks are unaffected.
+/// Linearly interpolates `DELAY_LEFT_OVER..=reserve_max_ms` between `depth_low` and `depth_high`.
+/// At/below `depth_low` (or when disabled) returns the unchanged default, so normal blocks are
+/// unaffected. The branch ordering also makes a misconfigured `depth_high <= depth_low` behave as a
+/// step at `depth_low` (no divide-by-zero).
 pub fn effective_delay_left_over(overlay_depth: u64) -> u64 {
-    if overlay_depth <= ROOT_RESERVE_DEPTH_LOW {
+    let cfg = adaptive_reserve_config();
+    if !cfg.enabled || overlay_depth <= cfg.depth_low {
         DELAY_LEFT_OVER
-    } else if overlay_depth >= ROOT_RESERVE_DEPTH_HIGH {
-        ROOT_RESERVE_MAX_MS
+    } else if overlay_depth >= cfg.depth_high {
+        cfg.reserve_max_ms
     } else {
-        let span = (ROOT_RESERVE_DEPTH_HIGH - ROOT_RESERVE_DEPTH_LOW) as f64;
-        let t = (overlay_depth - ROOT_RESERVE_DEPTH_LOW) as f64 / span;
-        DELAY_LEFT_OVER + (t * (ROOT_RESERVE_MAX_MS - DELAY_LEFT_OVER) as f64) as u64
+        let span = (cfg.depth_high - cfg.depth_low) as f64;
+        let t = (overlay_depth - cfg.depth_low) as f64 / span;
+        DELAY_LEFT_OVER + (t * cfg.reserve_max_ms.saturating_sub(DELAY_LEFT_OVER) as f64) as u64
     }
 }
 
