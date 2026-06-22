@@ -13,9 +13,10 @@ use crate::consensus::eip4844::is_blob_eligible_block;
 use crate::consensus::parlia::bid_block::{
     extract_bid_block_deposit_value, verify_bid_block_system_txs, BidBlockSystemTxError,
 };
-use crate::consensus::parlia::{consensus::Parlia, Snapshot};
+use crate::consensus::parlia::{consensus::Parlia, Snapshot, SnapshotProvider};
 use crate::node::miner::signer::sign_system_transaction;
-use crate::node::primitives::BscBlobTransactionSidecar;
+use crate::node::miner::util::finalize_new_header;
+use crate::node::primitives::{BscBlobTransactionSidecar, BscBlock, BscBlockBody};
 use alloy_consensus::{Header, Transaction};
 use alloy_eips::eip2718::Decodable2718;
 use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
@@ -23,8 +24,10 @@ use alloy_rlp::Encodable;
 use reth::consensus::HeaderValidator;
 use reth::primitives::SealedHeader;
 use reth_chainspec::EthChainSpec;
-use reth_ethereum_primitives::TransactionSigned;
+use reth_ethereum_primitives::{BlockBody, TransactionSigned};
 use reth_node_ethereum::engine::EthPayloadAttributes;
+use reth_primitives_traits::{RecoveredBlock, SignerRecoverable};
+use std::sync::Arc;
 use std::{fmt, vec::Vec};
 
 /// Sidecar version carrying EIP-7594 cell proofs (PeerDAS). BSC does not support it yet, so a
@@ -522,6 +525,109 @@ pub fn bid_block_env_attributes(header: &Header) -> EthPayloadAttributes {
         parent_beacon_block_root: header.parent_beacon_block_root,
         slot_number: None,
     }
+}
+
+/// The validator-finalized, sealed block produced from an admitted BidBlock, ready to execute.
+pub struct SimulatedBidBlock {
+    /// Sealed block with the validator's extra/seal and the bind-signed system txs.
+    pub block: RecoveredBlock<BscBlock>,
+    /// Deposit (gas-fee) value located during payload verification.
+    pub gas_fee: U256,
+    /// Index where the trailing system-tx region begins.
+    pub system_tx_start: usize,
+}
+
+/// Why simulating an admitted BidBlock failed.
+#[derive(Debug)]
+pub enum SimulateBidBlockError {
+    /// Payload or finalized-header verification failed.
+    Verify(PreSealVerifyError),
+    /// Blind-signing a trailing system tx failed.
+    BindSign(BindSignError),
+    /// Finalizing/sealing the header failed.
+    Finalize(String),
+    /// Recovering a transaction sender failed.
+    SenderRecovery(String),
+}
+
+impl fmt::Display for SimulateBidBlockError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Verify(e) => write!(f, "verify: {e}"),
+            Self::BindSign(e) => write!(f, "bind-sign: {e}"),
+            Self::Finalize(e) => write!(f, "finalize: {e}"),
+            Self::SenderRecovery(e) => write!(f, "sender recovery: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for SimulateBidBlockError {}
+
+/// Validator-side simulation of an admitted BidBlock: payload-verify, blind-sign the trailing system
+/// txs, install the validator's own block context (its extra + the recomputed tx root), finalize and
+/// seal the header — producing the consensus-valid block the validator would propose.
+///
+/// Execution (to obtain the state root / build a payload) is left to the caller, since it differs by
+/// environment (miner trie backend vs test DB overlay). All other EVM block-context fields are kept
+/// as the builder set them so the re-executed state root matches the builder's.
+///
+/// `vanity` is the validator's extra-data vanity (finalize appends the 65-byte seal slot);
+/// `block_timestamp_ms` is the millisecond timestamp for Lorentz.
+#[allow(clippy::too_many_arguments)]
+pub fn simulate_bid_block(
+    parlia: Arc<Parlia<BscChainSpec>>,
+    chain_spec: &BscChainSpec,
+    decoded: &DecodedBidBlock,
+    parent: &SealedHeader,
+    parent_snap: &Snapshot,
+    snapshot_provider: &Arc<dyn SnapshotProvider + Send + Sync>,
+    validator: Address,
+    expected_gas_limit: u64,
+    vanity: Bytes,
+    block_timestamp_ms: u64,
+) -> Result<SimulatedBidBlock, SimulateBidBlockError> {
+    let (system_tx_start, gas_fee) =
+        verify_bid_block_payload(chain_spec, decoded, parent.header(), validator, expected_gas_limit)
+            .map_err(SimulateBidBlockError::Verify)?;
+
+    let txs = bind_sign_bid_block_system_txs(&decoded.txs, system_tx_start)
+        .map_err(SimulateBidBlockError::BindSign)?;
+
+    // Install the validator's block context: its own extra (vanity; finalize appends the seal slot)
+    // and the tx root for the now-signed tx set. Other block-context fields are left as the builder
+    // set them so the re-executed state root matches.
+    let mut header = decoded.header.clone();
+    header.extra_data = vanity;
+    header.transactions_root = alloy_consensus::proofs::calculate_transaction_root(&txs);
+
+    finalize_new_header(
+        parlia.clone(),
+        parent_snap,
+        parent,
+        &mut header,
+        snapshot_provider,
+        block_timestamp_ms,
+    )
+    .map_err(|e| SimulateBidBlockError::Finalize(e.to_string()))?;
+
+    // The finalized (sealed) header must pass the unsealed-header + slot-time checks.
+    verify_bid_block_header(&parlia, &header, parent.header(), parent_snap)
+        .map_err(SimulateBidBlockError::Verify)?;
+
+    let senders = txs
+        .iter()
+        .map(SignerRecoverable::recover_signer)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| SimulateBidBlockError::SenderRecovery(e.to_string()))?;
+
+    let sidecars =
+        (!decoded.sidecars.is_empty()).then(|| decoded.sidecars.clone());
+    let withdrawals = header.withdrawals_root.map(|_| Default::default());
+    let body =
+        BscBlockBody { inner: BlockBody { transactions: txs, ommers: Vec::new(), withdrawals }, sidecars };
+    let block = RecoveredBlock::new_unhashed(BscBlock { header, body }, senders);
+
+    Ok(SimulatedBidBlock { block, gas_fee, system_tx_start })
 }
 
 #[cfg(test)]
@@ -1058,5 +1164,65 @@ mod tests {
         // PREVRANDAO == difficulty on BSC; must be the builder's value, not snapshot-recomputed.
         assert_eq!(attrs.prev_randao, B256::from(header.difficulty));
         assert_eq!(attrs.parent_beacon_block_root, header.parent_beacon_block_root);
+    }
+
+    /// Trivial snapshot provider for finalize (vote-attestation is skipped pre-Luban, so lookups
+    /// don't actually fire — this just satisfies the parameter).
+    struct TestSnapProvider(Snapshot);
+    impl SnapshotProvider for TestSnapProvider {
+        fn snapshot_by_hash(&self, _hash: &B256) -> Option<Snapshot> {
+            Some(self.0.clone())
+        }
+        fn insert(&self, _snapshot: Snapshot) {}
+    }
+
+    #[test]
+    fn simulate_bid_block_produces_sealed_block() {
+        use reth_primitives_traits::SignerRecoverable;
+
+        // Validator = Anvil dev key 0; init the global signer so finalize can seal as it.
+        let validator = address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
+        let key = b256!("0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
+        let _ = crate::node::miner::signer::init_global_signer(key);
+
+        let chain_spec = std::sync::Arc::new(preseal_spec());
+        let parlia = std::sync::Arc::new(Parlia::new(chain_spec.clone(), 200));
+
+        let parent_header = Header { number: 0, timestamp: 1, gas_limit: 30_000_000, ..Default::default() };
+        let parent = SealedHeader::new(parent_header.clone(), parent_header.hash_slow());
+        let mut snap = Snapshot::new(vec![validator], 0, parent.hash(), 200, None);
+        snap.block_interval = 3_000;
+        let snapshot_provider: std::sync::Arc<dyn SnapshotProvider + Send + Sync> =
+            std::sync::Arc::new(TestSnapProvider(snap.clone()));
+
+        // BidBlock: a user tx then an unsigned deposit system tx (gas fee 100).
+        let decoded = decoded_block(
+            valid_bid_header(validator, 30_000_000),
+            vec![legacy_tx(0), deposit_system_tx(100)],
+            vec![],
+        );
+
+        let sim = simulate_bid_block(
+            parlia,
+            &chain_spec,
+            &decoded,
+            &parent,
+            &snap,
+            &snapshot_provider,
+            validator,
+            30_000_000,
+            Bytes::from(vec![0u8; 32]),
+            1_000,
+        )
+        .expect("simulate");
+
+        assert_eq!(sim.block.header().number, 1);
+        assert_eq!(sim.gas_fee, U256::from(100));
+        assert_eq!(sim.system_tx_start, 1);
+        // Header is sealed: 32-byte vanity + 65-byte seal.
+        assert_eq!(sim.block.header().extra_data.len(), 32 + 65);
+        // The trailing deposit tx is now validator-signed.
+        let txs: Vec<_> = sim.block.body().transactions().collect();
+        assert_eq!(txs[1].recover_signer().unwrap(), validator);
     }
 }
