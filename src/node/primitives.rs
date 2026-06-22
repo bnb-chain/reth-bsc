@@ -34,6 +34,11 @@ pub struct BscBlobTransactionSidecar {
     pub block_hash: B256,
     pub tx_index: u64,
     pub tx_hash: B256,
+    /// Sidecar proof version: `0` = legacy EIP-4844 blob proofs, `1` = EIP-7594 cell proofs.
+    /// Mirrors go-bsc `BlobTxSidecar.Version`, which is tagged `rlp:"-"` — excluded from the RLP
+    /// encoding (and therefore from the BidBlock hash) and carried only on the JSON wire.
+    #[serde(default)]
+    pub version: u8,
 }
 
 impl Encodable for BscBlobTransactionSidecar {
@@ -99,7 +104,8 @@ impl Decodable for BscBlobTransactionSidecar {
         if consumed != header.payload_length {
             return Err(alloy_rlp::Error::UnexpectedLength);
         }
-        Ok(Self { inner, block_number, block_hash, tx_index, tx_hash })
+        // `version` is rlp:"-" in go-bsc: not present in the RLP, defaults to 0 (legacy proofs).
+        Ok(Self { inner, block_number, block_hash, tx_index, tx_hash, version: 0 })
     }
 }
 
@@ -623,6 +629,7 @@ mod tests {
             block_hash: B256::repeat_byte(0xab),
             tx_index: 7,
             tx_hash: B256::repeat_byte(0xcd),
+            version: 0,
         };
 
         // Encode
