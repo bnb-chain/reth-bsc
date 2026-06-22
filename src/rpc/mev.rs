@@ -842,34 +842,31 @@ impl BscMevApiServer for MevApiImpl {
 
     /// Admit a builder-proposed block (BEP-675).
     ///
-    /// Mirrors go-bsc's `MevAPI.SendBidBlock` + `Miner.SendBidBlock` admission: enabled-gate →
-    /// head-alignment / in-turn → builder recovery, whitelist & permission → system-tx validation.
-    /// The validator-side block build/simulation is wired separately; this entry validates the
-    /// submission and acknowledges the bid hash.
+    /// Mirrors the admission boundary of go-bsc's two functions, in their order:
+    /// `MevAPI.SendBidBlock` (MEV-running + structural checks) followed by the front of
+    /// `Miner.SendBidBlock` (enabled-gate, builder recovery, whitelist and permission). The rest
+    /// of `Miner.SendBidBlock` — `recordBidBlockBuilder`, `CheckPending`, bid timing,
+    /// `ToDecodedBidBlock` + parlia extra/blind-sign, the full `preSealVerifyBidBlock` (header,
+    /// gasLimit, gasFee, blob and system-tx verification) and the bid-simulator enqueue — is the
+    /// validator-side build path and lands in 8d. Until then admission acknowledges the bid hash.
     async fn send_bid_block(&self, args: BidBlockArgs) -> RpcResult<B256> {
         let bb = &args.bid_block;
         let bid_hash = bb.hash();
 
-        // Chain-head context (parent the bid must build on).
+        // --- MevAPI.SendBidBlock: MEV-running + structural checks ---
+        if !crate::shared::is_mev_running() {
+            return Err(Self::invalid_bid("MEV is not running"));
+        }
+
+        // Chain-head context (the parent the bid must build on).
         let head_number = crate::shared::get_best_canonical_block_number()
             .ok_or_else(|| Self::builder_err("chain head unavailable"))?;
         let head_header = self
             .get_header_by_number(head_number)
             .ok_or_else(|| Self::builder_err("chain head header unavailable"))?;
 
-        // Gate (go-bsc `bidBlockEnabled`): MEV running + flag + Pasteur active at head.
-        let pasteur_active = self
-            .chain_spec
-            .is_pasteur_active_at_timestamp(head_header.number, head_header.timestamp);
-        if !bid_block_admission_enabled(
-            crate::shared::is_mev_running(),
-            self.bid_block_enabled,
-            pasteur_active,
-        ) {
-            return Err(Self::invalid_bid("BidBlock disabled, fallback to SendBid"));
-        }
-
-        // Structural validation: the bid must build exactly the next block on the current head.
+        // The bid must build exactly the next block on the current head, with the validator in
+        // turn (go-bsc checks number, then MinerInTurn, then the parent-hash alignment).
         let block_number = bb.header.number;
         if block_number < head_number + 1 {
             return Err(Self::invalid_bid(format!(
@@ -882,16 +879,13 @@ impl BscMevApiServer for MevApiImpl {
             )));
         }
         let parent_hash = head_header.hash_slow();
-        if bb.header.parent_hash != parent_hash {
-            return Err(Self::invalid_bid(format!("non-aligned parent hash: {parent_hash:?}")));
-        }
-
-        // The validator must be in turn for this slot (go-bsc `MinerInTurn`).
         match self.snapshot_provider.snapshot_by_hash(&parent_hash) {
             Some(snapshot) if snapshot.is_inturn(self.validator_address) => {}
             _ => return Err(Self::invalid_bid("validator is not in turn")),
         }
-
+        if bb.header.parent_hash != parent_hash {
+            return Err(Self::invalid_bid(format!("non-aligned parent hash: {parent_hash:?}")));
+        }
         if bb.header.gas_used == 0 {
             return Err(Self::invalid_bid("empty gasUsed in header"));
         }
@@ -899,37 +893,32 @@ impl BscMevApiServer for MevApiImpl {
             return Err(Self::invalid_bid("empty transactions"));
         }
 
-        // Builder recovery → whitelist → permission. Permission is checked before any further work
-        // so a revoked builder cannot consume quota.
+        // --- Miner.SendBidBlock (front): enabled-gate, builder recovery, whitelist, permission ---
+        // bidBlockEnabled(): MEV running AND the BidBlockEnabled flag AND Pasteur active at head.
+        let pasteur_active = self
+            .chain_spec
+            .is_pasteur_active_at_timestamp(head_header.number, head_header.timestamp);
+        if !bid_block_admission_enabled(
+            crate::shared::is_mev_running(),
+            self.bid_block_enabled,
+            pasteur_active,
+        ) {
+            return Err(Self::invalid_bid("BidBlock disabled, fallback to SendBid"));
+        }
+
         let builder = args.ecrecover_sender().map_err(|e| {
             Self::invalid_bid(format!("invalid signature: bidHash={bid_hash}, err={e}"))
         })?;
         if !self.is_builder_allowed(&builder) {
             return Err(Self::builder_err(format!("builder is not registered: {builder}")));
         }
+        // Permission is checked before any further work so a revoked builder cannot consume quota.
         if !crate::shared::get_bid_block_permission_manager().is_allowed(builder) {
             return Err(Self::builder_err(
                 "builder BidBlock permission revoked, fallback to SendBid",
             ));
         }
 
-        // Decode txs and validate the trailing unsigned system-tx region (BEP-675 parlia rules).
-        let decoded = args
-            .to_decoded_bid_block(builder)
-            .map_err(|e| Self::invalid_bid(format!("failed to decode bid block: {e}")))?;
-        let (system_tx_start, _deposit_value) =
-            crate::consensus::parlia::bid_block::extract_bid_block_deposit_value(&decoded.txs);
-        crate::consensus::parlia::bid_block::verify_bid_block_system_txs(
-            &decoded.txs,
-            &decoded.header,
-            &head_header,
-            system_tx_start,
-        )
-        .map_err(|e| Self::invalid_bid(format!("invalid system txs: {e}")))?;
-
-        // TODO(8d): hand `decoded` to the validator-side BidBlock build/simulation path (parlia
-        // prepare/finalize + bid-block enqueue). Until that lands, admission validates the
-        // submission and acknowledges the bid hash.
         tracing::info!(
             "BidBlock admitted: block={block_number}, builder={builder}, bidHash={bid_hash:?} (build integration pending)"
         );
