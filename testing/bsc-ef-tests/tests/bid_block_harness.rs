@@ -148,3 +148,69 @@ fn execution_environment_is_wired() {
         Some(vec![TEST_VALIDATOR])
     );
 }
+
+/// Publish env globals (snapshot provider + signer), idempotent across tests.
+fn publish_env(chain_spec: Arc<BscChainSpec>) {
+    let provider = Arc::new(MockSnapshotProvider::default());
+    provider.insert(genesis_snapshot(chain_spec));
+    let _ = reth_bsc::shared::set_snapshot_provider(provider);
+    let _ = init_global_signer(TEST_VALIDATOR_KEY);
+}
+
+/// Trusted local build: drive `BscEvmConfig`'s builder to produce block 1 on the signable genesis.
+/// This is the reference the round-trip will compare `simulate_bid_block` against.
+#[test]
+fn trusted_local_build_produces_block() {
+    use reth_bsc::node::evm::config::{BscEvmConfig, BscNextBlockEnvAttributes};
+    use reth_evm::execute::{BlockBuilder, BlockBuilderOutcome};
+    use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
+    use reth_provider::DatabaseProviderFactory;
+    use reth_revm::{database::StateProviderDatabase, db::State};
+
+    let chain_spec = signable_test_chain_spec();
+    let factory = create_test_provider_factory_with_chain_spec(Arc::new(chain_spec.inner.clone()));
+    init_genesis(&factory).expect("init genesis");
+    publish_env(chain_spec.clone());
+    // BSC pre/post-execution looks the parent header up via the global header reader.
+    let _ = reth_bsc::shared::set_header_provider(Arc::new(factory.clone()));
+
+    let parent = SealedHeader::new(chain_spec.genesis_header().clone(), chain_spec.genesis_hash());
+    let provider = factory.database_provider_rw().expect("rw provider");
+    let state_provider = provider.latest();
+    let sp_db = StateProviderDatabase::new(&state_provider);
+    let mut db = State::builder().with_database(sp_db).with_bundle_update().build();
+
+    let evm_config = BscEvmConfig::new(chain_spec.clone());
+    let mut builder = evm_config
+        .builder_for_next_block(
+            &mut db,
+            &parent,
+            BscNextBlockEnvAttributes {
+                inner: NextBlockEnvAttributes {
+                    timestamp: parent.timestamp + 3,
+                    suggested_fee_recipient: TEST_VALIDATOR,
+                    prev_randao: B256::ZERO,
+                    gas_limit: parent.gas_limit,
+                    parent_beacon_block_root: None,
+                    withdrawals: None,
+                    extra_data: Default::default(),
+                    slot_number: None,
+                },
+                parent_difflayers: None,
+                triedb_prefetcher: None,
+                validator_cache_sink: None,
+                turn_length_sink: None,
+                state_root_precomputed_sink: None,
+                trie_handle: None,
+                state_root_deadline_ms: None,
+            },
+        )
+        .expect("builder for next block");
+
+    builder.apply_pre_execution_changes().expect("apply pre-execution changes");
+    let out = builder.finish_with_difflayer(&state_provider).expect("finish builder");
+    let BlockBuilderOutcome { block, .. } = out.inner;
+
+    assert_eq!(block.header().number, 1);
+    assert_ne!(block.header().state_root, B256::ZERO);
+}
