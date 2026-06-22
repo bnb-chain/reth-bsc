@@ -24,6 +24,7 @@ use reth::consensus::HeaderValidator;
 use reth::primitives::SealedHeader;
 use reth_chainspec::EthChainSpec;
 use reth_ethereum_primitives::TransactionSigned;
+use reth_node_ethereum::engine::EthPayloadAttributes;
 use std::{fmt, vec::Vec};
 
 /// Sidecar version carrying EIP-7594 cell proofs (PeerDAS). BSC does not support it yet, so a
@@ -468,7 +469,31 @@ impl fmt::Display for BindSignError {
     }
 }
 
-impl std::error::Error for BindSignError {}
+/// EVM payload attributes for executing a BidBlock, preserving the builder's block context.
+///
+/// The validator must re-execute the builder's block against its **exact** EVM `BlockContext`;
+/// changing any context field would diverge the re-executed state root from what the builder
+/// produced and fail block insertion (go-bsc `prepareBidBlockTask`: "Do not touch fields that enter
+/// the EVM BlockContext — GasLimit, Coinbase, Time, Difficulty, BaseFee"). So every field is taken
+/// verbatim from the builder's header — notably `prev_randao`, which on BSC is the header
+/// difficulty (the EVM exposes it via PREVRANDAO), so it must NOT be recomputed from the snapshot as
+/// the local-build path does. The gas limit, coinbase, timestamp and base fee live on the header
+/// itself and are likewise consumed unchanged when the block builder is constructed.
+///
+/// Consequently the downstream finalize/seal step for a BidBlock must also preserve the builder's
+/// difficulty rather than recompute it — that is the integration-gated hazard tracked for the
+/// execution wiring.
+pub fn bid_block_env_attributes(header: &Header) -> EthPayloadAttributes {
+    EthPayloadAttributes {
+        timestamp: header.timestamp,
+        suggested_fee_recipient: header.beneficiary,
+        // BSC PREVRANDAO returns difficulty; preserve the builder's value verbatim.
+        prev_randao: header.difficulty.into(),
+        withdrawals: None,
+        parent_beacon_block_root: header.parent_beacon_block_root,
+        slot_number: None,
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -959,5 +984,24 @@ mod tests {
         assert_eq!(out[1].recover_signer().unwrap(), validator);
         assert_eq!(out[2].recover_signer().unwrap(), validator);
         assert_ne!(out[1], txs[1]);
+    }
+
+    #[test]
+    fn bid_block_attributes_preserve_builder_block_context() {
+        let header = Header {
+            number: 5,
+            timestamp: 1_700_000_000,
+            beneficiary: Address::repeat_byte(0x33),
+            difficulty: U256::from(2),
+            parent_beacon_block_root: Some(B256::ZERO),
+            ..Default::default()
+        };
+        let attrs = bid_block_env_attributes(&header);
+        // Every EVM block-context field is taken verbatim from the builder's header.
+        assert_eq!(attrs.timestamp, header.timestamp);
+        assert_eq!(attrs.suggested_fee_recipient, header.beneficiary);
+        // PREVRANDAO == difficulty on BSC; must be the builder's value, not snapshot-recomputed.
+        assert_eq!(attrs.prev_randao, B256::from(header.difficulty));
+        assert_eq!(attrs.parent_beacon_block_root, header.parent_beacon_block_root);
     }
 }
