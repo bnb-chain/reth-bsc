@@ -375,12 +375,17 @@ impl MevApiImpl {
             ));
         }
 
-        // TODO(8d): simulator-backed tail of Miner.SendBidBlock — recordBidBlockBuilder,
-        // CheckPending, bid timing, ToDecodedBidBlock + parlia extra/blind-sign,
-        // preSealVerifyBidBlock (header/gasLimit/gasFee/blob + system-tx verification) and the
-        // bid-simulator enqueue.
+        // Decode and hand to the miner via the global intake queue. The simulator-backed tail of
+        // Miner.SendBidBlock — pre-seal verification, execution, selection against the local block,
+        // and revoke-on-invalid — runs miner-side when the block is popped (8d-2b), matching the
+        // legacy SendBid layering where the RPC enqueues and the miner verifies/executes.
+        let decoded = args
+            .to_decoded_bid_block(builder)
+            .map_err(|e| Self::invalid_bid(format!("failed to decode bid block: {e}")))?;
+        crate::shared::push_bid_block_package(decoded);
+
         tracing::info!(
-            "BidBlock admitted: block={}, builder={builder}, bidHash={bid_hash:?} (build integration pending)",
+            "BidBlock queued: block={}, builder={builder}, bidHash={bid_hash:?}",
             args.bid_block.header.number
         );
 

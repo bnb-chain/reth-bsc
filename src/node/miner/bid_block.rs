@@ -866,4 +866,23 @@ mod tests {
             Err(PreSealVerifyError::EmptyGasFee)
         );
     }
+
+    #[test]
+    fn bid_block_intake_queue_is_fifo() {
+        // Drain any residue first (the queue is a process-global; tests run single-threaded).
+        while crate::shared::pop_bid_block_package().is_some() {}
+
+        let first = decoded_block(valid_bid_header(Address::ZERO, 30_000_000), vec![], vec![]);
+        let mut second_header = valid_bid_header(Address::ZERO, 30_000_000);
+        second_header.number = 2;
+        let second = decoded_block(second_header, vec![], vec![]);
+
+        crate::shared::push_bid_block_package(first);
+        crate::shared::push_bid_block_package(second);
+        assert_eq!(crate::shared::bid_block_queue_len(), 2);
+
+        assert_eq!(crate::shared::pop_bid_block_package().unwrap().block_number(), 1);
+        assert_eq!(crate::shared::pop_bid_block_package().unwrap().block_number(), 2);
+        assert!(crate::shared::pop_bid_block_package().is_none());
+    }
 }
