@@ -211,7 +211,14 @@ fn read_sidecars_from_blob_store(
                     "blob_store_read: sidecar has EMPTY fields!"
                 );
             }
-            Some(BscBlobTransactionSidecar { inner, block_number, block_hash, tx_index, tx_hash })
+            Some(BscBlobTransactionSidecar {
+                inner,
+                block_number,
+                block_hash,
+                tx_index,
+                tx_hash,
+                version: 0,
+            })
         })
         .collect();
 

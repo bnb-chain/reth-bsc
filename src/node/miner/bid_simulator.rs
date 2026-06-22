@@ -937,6 +937,7 @@ where
                         block_hash: B256::ZERO, // Will be set when block is sealed
                         tx_index: index as u64,
                         tx_hash,
+                        version: 0,
                     };
                     self.blob_sidecars.push(bsc_sidecar);
                 }

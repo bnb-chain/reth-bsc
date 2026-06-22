@@ -966,6 +966,7 @@ where
                     block_hash: sealed_block.hash(),
                     tx_index: u64::try_from(index).unwrap_or(u64::MAX),
                     tx_hash: *tx.hash(),
+                    version: 0,
                 };
                 blob_sidecars.push(bsc_blob_tx_sidecar);
             }
