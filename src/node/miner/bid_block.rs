@@ -531,10 +531,10 @@ pub fn bid_block_env_attributes(header: &Header) -> EthPayloadAttributes {
 
 /// The validator-finalized, sealed block produced from an admitted BidBlock, ready to execute.
 ///
-/// Mirrors the bid-block fields of go-bsc's `task` / `bidBlockTaskInfo` (`miner/bid_block.go`):
-/// `block` + `gasFee` + `systemTxStart`. (`builder`/`bidHash` are added when the consumer loop needs
-/// them for revoke-on-mismatch; receipts/state live on the caller's payload since execution is
-/// deferred.)
+/// Mirrors go-bsc's `task` / `bidBlockTaskInfo` (`miner/bid_block.go`): `block` + `gasFee` +
+/// `systemTxStart` + `builder` + `bidHash`. (Receipts/state live on the caller's payload, since
+/// execution is deferred.)
+#[derive(Clone)]
 pub struct BidBlockTask {
     /// Sealed block with the validator's extra/seal and the bind-signed system txs.
     pub block: RecoveredBlock<BscBlock>,
@@ -542,6 +542,10 @@ pub struct BidBlockTask {
     pub gas_fee: U256,
     /// Index where the trailing system-tx region begins.
     pub system_tx_start: usize,
+    /// Builder that submitted the BidBlock (for selection logging / revoke-on-mismatch).
+    pub builder: Address,
+    /// Hash of the original BidBlock payload.
+    pub bid_hash: B256,
 }
 
 /// Why simulating an admitted BidBlock failed.
@@ -649,7 +653,7 @@ pub fn simulate_bid_block(
         BscBlockBody { inner: BlockBody { transactions: txs, ommers: Vec::new(), withdrawals }, sidecars };
     let block = RecoveredBlock::new_unhashed(BscBlock { header, body }, senders);
 
-    Ok(BidBlockTask { block, gas_fee, system_tx_start })
+    Ok(BidBlockTask { block, gas_fee, system_tx_start, builder: decoded.builder, bid_hash: decoded.hash() })
 }
 
 #[cfg(test)]

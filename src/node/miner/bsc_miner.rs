@@ -1156,6 +1156,8 @@ where
                 _ = send_bid_interval.tick() => {
                     // Attempt to send bids
                     self.get_bid_and_send();
+                    // Process any admitted BEP-675 BidBlocks.
+                    self.process_bid_block();
                 }
 
                 _ = clear_bid_interval.tick() => {
@@ -1205,6 +1207,19 @@ where
                     error!("Failed to send bid simulate request due to channel closed: {}", e);
                 }
             }
+        }
+    }
+
+    /// Pop an admitted BEP-675 BidBlock (from `mev_sendBidBlock`) and verify/blind-sign/seal it into
+    /// the simulator's best-bid-block store (go-bsc `newBidBlockLoop` → `AddBidBlock`).
+    fn process_bid_block(&self) {
+        if let Some(decoded) = crate::shared::pop_bid_block_package() {
+            debug!(
+                "Popped BidBlock from queue, block: {}, builder: {}",
+                decoded.block_number(),
+                decoded.builder
+            );
+            self.simulator.commit_bid_block(decoded);
         }
     }
 }
