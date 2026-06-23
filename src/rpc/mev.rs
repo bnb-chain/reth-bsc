@@ -15,7 +15,7 @@ use jsonrpsee::proc_macros::rpc;
 use reth_chainspec::EthChainSpec;
 use reth_ethereum_primitives::TransactionSigned;
 use reth_primitives_traits::SignerRecoverable;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use tracing::debug;
 
@@ -180,6 +180,10 @@ pub struct MevApiImpl {
     version: String,
     /// Whitelist of allowed builders (shared with miner_ namespace via shared.rs)
     allowed_builders: Arc<RwLock<HashSet<Address>>>,
+    /// Mirrors go-bsc `bidSimulator.pending`: blockNumber → builder → set of bid hashes.
+    /// Used to enforce duplicate detection and the per-builder-per-block quota
+    /// (`max_bids_per_builder`) at RPC admission time, before the bid enters the miner queue.
+    pending_bid_blocks: Arc<RwLock<HashMap<u64, HashMap<Address, HashSet<B256>>>>>,
 }
 
 // NOTE: The allowed_builders is now also accessible via crate::shared::get_builder_whitelist()
@@ -283,7 +287,53 @@ impl MevApiImpl {
             bid_block_enabled,
             version,
             allowed_builders,
+            pending_bid_blocks: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Mirrors go-bsc `bidSimulator.CheckPending`: returns an error if `bid_hash` is already
+    /// registered for `(block_number, builder)` or if the builder has reached the per-block quota.
+    fn check_pending_bid_block(
+        &self,
+        block_number: u64,
+        builder: Address,
+        bid_hash: B256,
+    ) -> Result<(), String> {
+        let pending = self.pending_bid_blocks.read().unwrap();
+        if let Some(by_builder) = pending.get(&block_number) {
+            if let Some(hashes) = by_builder.get(&builder) {
+                if hashes.contains(&bid_hash) {
+                    return Err("bid already exists".to_string());
+                }
+                if hashes.len() >= self.max_bids_per_builder as usize {
+                    return Err(format!(
+                        "too many bids: exceeded limit of {} bids per builder per block",
+                        self.max_bids_per_builder
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Mirrors go-bsc `bidSimulator.AddPending`: registers `bid_hash` for `(block_number, builder)`.
+    fn add_pending_bid_block(&self, block_number: u64, builder: Address, bid_hash: B256) {
+        let mut pending = self.pending_bid_blocks.write().unwrap();
+        pending
+            .entry(block_number)
+            .or_default()
+            .entry(builder)
+            .or_default()
+            .insert(bid_hash);
+    }
+
+    /// Mirrors go-bsc `bidSimulator.bidMustBefore`: the deadline after which a bid is too late.
+    ///
+    /// `bid_must_before_ms = parent_timestamp_ms + block_interval_ms - no_interrupt_left_over_ms`
+    fn bid_must_before_ms(&self, parent_timestamp_secs: u64, block_interval_ms: u64) -> u128 {
+        (parent_timestamp_secs as u128) * 1000
+            + block_interval_ms as u128
+            - self.no_interrupt_left_over as u128
     }
 
     /// Get header by number from global header provider
@@ -368,25 +418,57 @@ impl MevApiImpl {
                 "builder is not registered: builder={builder}, bidHash={bid_hash}"
             )));
         }
-        // Checked before any quota use so a revoked builder cannot consume it.
+
+        // Mirrors go-bsc: permission check comes before CheckPending so a revoked builder cannot
+        // consume quota.
         if !crate::shared::get_bid_block_permission_manager().is_allowed(builder) {
             return Err(Self::permission_revoked(
                 "builder BidBlock permission revoked, fallback to SendBid",
             ));
         }
 
+        // Mirrors go-bsc `bidSimulator.CheckPending`: duplicate + per-builder quota guard.
+        // Must run before the timing check so rejected bids do not consume quota.
+        let block_number = args.bid_block.header.number;
+        self.check_pending_bid_block(block_number, builder, bid_hash)
+            .map_err(|e| Self::invalid_bid(e))?;
+
+        // Mirrors go-bsc `bidSimulator.bidMustBefore`: reject bids that arrive after the
+        // validator must have already started sealing (no time left to simulate).
+        let block_interval_ms = self
+            .snapshot_provider
+            .snapshot_by_hash(&head_header.hash_slow())
+            .map(|s| s.block_interval)
+            .unwrap_or(3_000); // 3 s default
+        let bid_must_before_ms = self.bid_must_before_ms(head_header.timestamp, block_interval_ms);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        if now_ms >= bid_must_before_ms {
+            return Err(Self::invalid_bid(format!(
+                "too late: bid must arrive before {}ms, arrived {}ms later, bidHash={bid_hash}",
+                bid_must_before_ms,
+                now_ms.saturating_sub(bid_must_before_ms),
+            )));
+        }
+
         // Decode and hand to the miner via the global intake queue. The simulator-backed tail of
-        // Miner.SendBidBlock — pre-seal verification, execution, selection against the local block,
-        // and revoke-on-invalid — runs miner-side when the block is popped (8d-2b), matching the
-        // legacy SendBid layering where the RPC enqueues and the miner verifies/executes.
+        // Miner.SendBidBlock — Extra overwrite, setBidMevInfo, pre-seal verification, execution,
+        // selection against the local block, and revoke-on-invalid — runs miner-side when the
+        // block is popped, matching the legacy SendBid layering where the RPC enqueues and the
+        // miner verifies/executes.
         let decoded = args
             .to_decoded_bid_block(builder)
             .map_err(|e| Self::invalid_bid(format!("failed to decode bid block: {e}")))?;
+
+        // Register after all checks pass so quota is only consumed by accepted bids.
+        self.add_pending_bid_block(block_number, builder, bid_hash);
+
         crate::shared::push_bid_block_package(decoded);
 
         tracing::info!(
-            "BidBlock queued: block={}, builder={builder}, bidHash={bid_hash:?}",
-            args.bid_block.header.number
+            "BidBlock queued: block={block_number}, builder={builder}, bidHash={bid_hash:?}",
         );
 
         Ok(bid_hash)
