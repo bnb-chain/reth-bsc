@@ -1954,6 +1954,20 @@ where
         }
     }
 
+    /// Collect the best BEP-675 BidBlock payload (if any) so it competes with the local block and
+    /// any legacy SendBid by fee in `pick_best_payload_and_finalize` (go-bsc `selectBidBlock`).
+    fn collect_best_bid_block(&mut self) {
+        if let Some(payload) = self.simulator.best_bid_block(self.mining_ctx.parent_header.hash()) {
+            info!(
+                target: "bsc::miner::payload",
+                trace_id = self.trace_id,
+                payload_fees = %payload.fees(),
+                "Found best BidBlock payload"
+            );
+            self.potential_payloads.push(payload);
+        }
+    }
+
     /// Ensure `potential_payloads` has at least one candidate, then drain background build tasks
     /// within the submission deadline to maximise the chance of a better (non-empty / higher-fee)
     /// payload.
@@ -2204,6 +2218,7 @@ where
     /// Try to return the best payload to result channel
     fn try_return_best_payload(&mut self) -> Result<(), Box<BscPayloadJobError>> {
         self.collect_best_bid();
+        self.collect_best_bid_block();
 
         self.collect_payload_candidates()?;
 
