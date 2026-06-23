@@ -14,6 +14,8 @@ use crate::consensus::parlia::bid_block::{
     extract_bid_block_deposit_value, verify_bid_block_system_txs, BidBlockSystemTxError,
 };
 use crate::consensus::parlia::{consensus::Parlia, Snapshot, SnapshotProvider};
+use crate::hardforks::BscHardforks;
+use crate::node::miner::block_mev_info::{encode_block_mev_info, BlockMevInfoVersion};
 use crate::node::miner::signer::sign_system_transaction;
 use crate::node::miner::util::finalize_new_header;
 use crate::node::primitives::{BscBlobTransactionSidecar, BscBlock, BscBlockBody};
@@ -568,6 +570,17 @@ impl fmt::Display for SimulateBidBlockError {
 
 impl std::error::Error for SimulateBidBlockError {}
 
+/// Stamp a BidBlock header with BEP-675 MEV info (go-bsc `setBidMevInfo` for the BidBlock case): the
+/// validator records `(version = BidBlock, builder)` in `requests_hash`. BidBlock is post-Prague (so
+/// `requests_hash` is present), hence this only applies when Prague is active — matching go-bsc,
+/// where BidBlock blocks are always post-Prague.
+pub fn set_bid_block_mev_info(header: &mut Header, builder: Address, prague_active: bool) {
+    if prague_active {
+        header.requests_hash =
+            Some(encode_block_mev_info(BlockMevInfoVersion::BidBlock, builder));
+    }
+}
+
 /// Validator-side simulation of an admitted BidBlock: payload-verify, blind-sign the trailing system
 /// txs, install the validator's own block context (its extra + the recomputed tx root), finalize and
 /// seal the header — producing the consensus-valid block the validator would propose.
@@ -604,6 +617,10 @@ pub fn simulate_bid_block(
     let mut header = decoded.header.clone();
     header.extra_data = vanity;
     header.transactions_root = alloy_consensus::proofs::calculate_transaction_root(&txs);
+    // Tag the header with BEP-675 BidBlock MEV info (go-bsc setBidMevInfo).
+    let prague_active =
+        chain_spec.is_prague_active_at_block_and_timestamp(header.number, header.timestamp);
+    set_bid_block_mev_info(&mut header, decoded.builder, prague_active);
 
     finalize_new_header(
         parlia.clone(),
@@ -1229,5 +1246,22 @@ mod tests {
         // The trailing deposit tx is now validator-signed.
         let txs: Vec<_> = sim.block.body().transactions().collect();
         assert_eq!(txs[1].recover_signer().unwrap(), validator);
+    }
+
+    #[test]
+    fn set_bid_block_mev_info_tags_requests_hash_only_when_prague() {
+        use crate::node::miner::block_mev_info::decode_block_mev_info;
+
+        let builder = Address::repeat_byte(0xbb);
+        let mut header = Header::default();
+
+        // Pre-Prague: the header is left untagged (requests_hash must stay None there).
+        set_bid_block_mev_info(&mut header, builder, false);
+        assert!(header.requests_hash.is_none());
+
+        // Prague active: requests_hash carries the (BidBlock, builder) tag.
+        set_bid_block_mev_info(&mut header, builder, true);
+        let tag = header.requests_hash.expect("requests_hash tagged");
+        assert_eq!(decode_block_mev_info(tag), Some((BlockMevInfoVersion::BidBlock, builder)));
     }
 }
