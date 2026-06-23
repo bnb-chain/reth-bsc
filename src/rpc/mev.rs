@@ -453,11 +453,24 @@ impl MevApiImpl {
             )));
         }
 
-        // Decode and hand to the miner via the global intake queue. The simulator-backed tail of
-        // Miner.SendBidBlock — Extra overwrite, setBidMevInfo, pre-seal verification, execution,
-        // selection against the local block, and revoke-on-invalid — runs miner-side when the
-        // block is popped, matching the legacy SendBid layering where the RPC enqueues and the
-        // miner verifies/executes.
+        // Decode and hand to the miner via the global intake queue.
+        //
+        // The remaining tail of go-bsc's Miner.SendBidBlock is intentionally deferred to the
+        // miner side (bid_block::simulate_bid_block, called from BidSimulator::commit_bid_block):
+        //
+        //   • Extra overwrite + SetExtraData  →  header.extra_data = vanity + finalize_new_header
+        //   • setBidMevInfo                   →  set_bid_block_mev_info
+        //   • preSealVerifyBidBlock           →  verify_bid_block_payload + verify_bid_block_header
+        //   • execution + state-root check    →  execute_bid_block_payload
+        //
+        // Behavioral difference vs geth: geth runs these synchronously and returns an error to the
+        // builder immediately on failure.  reth-bsc returns bidHash optimistically; if any of the
+        // above steps fail the block is silently dropped miner-side.  The checks still run — the
+        // builder just does not receive per-step error feedback.
+        //
+        // Bringing them forward to admit_bid_block would require injecting
+        // Arc<Parlia<BscChainSpec>> into MevApiImpl (needed by verify_bid_block_header) and is
+        // left as future work.
         let decoded = args
             .to_decoded_bid_block(builder)
             .map_err(|e| Self::invalid_bid(format!("failed to decode bid block: {e}")))?;
