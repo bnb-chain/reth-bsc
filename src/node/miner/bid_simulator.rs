@@ -13,7 +13,9 @@ use alloy_consensus::BlobTransactionSidecar;
 use alloy_consensus::Transaction;
 use alloy_evm::Evm;
 use alloy_primitives::U256;
-use alloy_primitives::{Address, B256};
+use alloy_primitives::{Address, Bytes, B256};
+use crate::consensus::parlia::util::calculate_millisecond_timestamp;
+use crate::node::miner::bid_block::{simulate_bid_block, BidBlockTask, DecodedBidBlock};
 use parking_lot::RwLock;
 use reth_node_ethereum::engine::EthPayloadAttributes;
 use reth::transaction_pool::BestTransactionsAttributes;
@@ -86,6 +88,8 @@ pub struct BidSimulator<Client, Pool> {
     best_bid_to_run: Arc<RwLock<HashMap<B256, Bid>>>,
     simulating_bid: Arc<RwLock<HashMap<B256, Bid>>>,
     best_bid: Arc<RwLock<HashMap<B256, BidRuntime<Pool, BscEvmConfig>>>>,
+    /// Best simulated BEP-675 BidBlock per parent hash (go-bsc `AddBidBlock`/`GetBestBidBlock`).
+    best_bid_block: Arc<RwLock<HashMap<B256, BidBlockTask>>>,
     pending_bid: Arc<RwLock<HashMap<String, u8>>>,
     bid_receiving: bool,
     chain_spec: Arc<BscChainSpec>,
@@ -131,6 +135,7 @@ where
             best_bid_to_run: Arc::new(RwLock::new(HashMap::new())),
             simulating_bid: Arc::new(RwLock::new(HashMap::new())),
             best_bid: Arc::new(RwLock::new(HashMap::new())),
+            best_bid_block: Arc::new(RwLock::new(HashMap::new())),
             pending_bid: Arc::new(RwLock::new(HashMap::new())),
             bid_receiving: true,
             min_gas_price: U256::ZERO,
@@ -701,6 +706,64 @@ where
     /// Get the best bid for a given parent hash
     pub fn get_best_bid(&self, parent_hash: B256) -> Option<BidRuntime<Pool, BscEvmConfig>> {
         self.best_bid.read().get(&parent_hash).cloned()
+    }
+
+    /// Verify, blind-sign, and seal an admitted BEP-675 BidBlock, keeping the highest-fee one per
+    /// parent hash (go-bsc `AddBidBlock`). Execution and selection against the locally-built block
+    /// happen in the build cycle (a follow-on slice); this is the intake half.
+    pub fn commit_bid_block(&self, decoded: DecodedBidBlock) {
+        let parent_hash = decoded.parent_hash();
+        let parent = match self.client.header(parent_hash) {
+            Ok(Some(h)) => SealedHeader::new(h, parent_hash),
+            _ => {
+                debug!("BidBlock: parent header not found: {parent_hash}");
+                return;
+            }
+        };
+        let Some(parent_snap) = self.snapshot_provider.snapshot_by_hash(&parent_hash) else {
+            debug!("BidBlock: no snapshot for parent {parent_hash}");
+            return;
+        };
+        let gas_ceil = crate::shared::get_miner_gas_limit().unwrap_or(parent.gas_limit);
+        let expected_gas_limit =
+            EthereumBuilderConfig::new().with_gas_limit(gas_ceil).gas_limit(parent.gas_limit);
+        // TODO: use the operator-configured extra vanity instead of zero bytes.
+        let vanity = Bytes::from(vec![0u8; 32]);
+        let block_timestamp_ms = calculate_millisecond_timestamp(&decoded.header);
+
+        match simulate_bid_block(
+            self.parlia.clone(),
+            &self.chain_spec,
+            &decoded,
+            &parent,
+            &parent_snap,
+            &self.snapshot_provider,
+            self.validator_address,
+            expected_gas_limit,
+            vanity,
+            block_timestamp_ms,
+        ) {
+            Ok(task) => {
+                debug!(
+                    "BidBlock simulated: builder={}, bidHash={}, gasFee={}",
+                    task.builder, task.bid_hash, task.gas_fee
+                );
+                let mut best = self.best_bid_block.write();
+                let replace = best.get(&parent_hash).is_none_or(|t| task.gas_fee > t.gas_fee);
+                if replace {
+                    best.insert(parent_hash, task);
+                }
+            }
+            Err(e) => {
+                debug!("BidBlock rejected in simulate: {e}");
+                // TODO(8d-2c): revoke the builder on verification failure.
+            }
+        }
+    }
+
+    /// The best stored BidBlock for a parent hash (go-bsc `GetBestBidBlock`).
+    pub fn best_bid_block(&self, parent_hash: B256) -> Option<BidBlockTask> {
+        self.best_bid_block.read().get(&parent_hash).cloned()
     }
 }
 
