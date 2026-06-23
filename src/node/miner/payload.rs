@@ -1209,35 +1209,6 @@ where
         let validator_cache_sink: ValidatorCacheSink = Arc::new(Mutex::new(None));
         let turn_length_sink: Arc<Mutex<Option<u8>>> = Arc::new(Mutex::new(None));
 
-        // Empty-fallback build: use the sparse-trie fast path (reuse the warm anchored trie) so the
-        // root is ~tens of ms instead of the ~340ms synchronous overlay trie-input rebuild a 0-tx
-        // block otherwise pays over a deep overlay. Fresh per-attempt handle (R3) + fresh sink.
-        //
-        // SAFETY: state_root_deadline_ms stays `None` in the attrs below, so finish_with_difflayer
-        // takes the *blocking* `handle.state_root()` branch (the same path import / out-of-turn
-        // builds already use) and the fix#1 sync-root abort guard is skipped entirely. The fallback
-        // build therefore NEVER aborts — it always produces a block (proof workers complete <1s; on
-        // sparse error it falls through to the sync root). This avoids the missed-slot -> slash
-        // regression that came from bounding/aborting the fallback build's root.
-        let empty_trie_handle: Arc<
-            Mutex<Option<reth_engine_tree::tree::multiproof::StateRootHandle>>,
-        > = {
-            let use_sparse_trie = crate::node::miner::config::get_global_mining_config()
-                .is_some_and(|c| c.use_sparse_trie_state_root)
-                && !rust_eth_triedb::triedb_manager::is_triedb_active();
-            Arc::new(Mutex::new(if use_sparse_trie {
-                crate::shared::spawn_sparse_trie_state_root(
-                    parent_header.hash_slow(),
-                    parent_header.state_root(),
-                )
-            } else {
-                None
-            }))
-        };
-        let empty_state_root_sink: Arc<
-            Mutex<Option<(alloy_primitives::B256, reth_trie_common::updates::TrieUpdates)>>,
-        > = Arc::new(Mutex::new(None));
-
         let mut builder = self
             .evm_config
             .builder_for_next_block(
@@ -1263,13 +1234,16 @@ where
                     triedb_prefetcher: triedb_prefetcher.clone(),
                     validator_cache_sink: Some(validator_cache_sink.clone()),
                     turn_length_sink: Some(turn_length_sink.clone()),
-                    // Fresh per-attempt sink for this empty build's own sparse-trie root.
-                    state_root_precomputed_sink: Some(empty_state_root_sink.clone()),
-                    // Empty build uses the warm sparse-trie fast path (handle installed below).
-                    trie_handle: Some(empty_trie_handle.clone()),
-                    // None => finish_with_difflayer BLOCKS on handle.state_root() (proven import /
-                    // out-of-turn path) and the fix#1 abort guard is skipped => NEVER aborts =>
-                    // the fallback build always produces a block (no missed slot / no slash).
+                    // Empty-fallback build never installs a sparse-trie hook (trie_handle: None
+                    // below), so it must NOT read from any sparse-trie sink. Passing None makes the
+                    // builder compute this empty block's own (cheap) state root via
+                    // `state_root_with_updates` instead of stealing a full build's precomputed root
+                    // out of a shared sink (which both starved the full build and risked sealing a
+                    // foreign root onto the empty block).
+                    state_root_precomputed_sink: None,
+                    // Empty-payload path: don't engage sparse-trie (would still be
+                    // correct but the setup overhead isn't worth it for ~0-tx blocks).
+                    trie_handle: None,
                     state_root_deadline_ms: None,
                 },
             )
@@ -1291,17 +1265,6 @@ where
                 trace_id,
                 parent_hash = ?parent_hash,
                 "Started triedb prefetcher for miner empty payload build"
-            );
-        } else if let Some(handle_guard) = empty_trie_handle.lock().unwrap().as_ref() {
-            // Sparse-trie mode (non-triedb): install the state_hook so the system-tx state changes
-            // stream to the sparse-trie task. Handle forwarded via attrs.trie_handle into ctx;
-            // finish_with_difflayer blocks on state_root() (deadline None => never aborts).
-            builder.executor_mut().set_state_hook(Some(Box::new(handle_guard.state_hook())));
-            debug!(
-                target: "payload_builder",
-                trace_id,
-                parent_hash = ?parent_hash,
-                "Installed sparse-trie state_hook on executor for empty payload build"
             );
         }
 
