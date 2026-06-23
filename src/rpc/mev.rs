@@ -1,7 +1,8 @@
 use crate::chainspec::BscChainSpec;
+use crate::consensus::parlia::bid_block::extract_bid_block_deposit_value;
 use crate::consensus::parlia::SnapshotProvider;
 use crate::hardforks::BscHardforks;
-use crate::node::miner::bid_block::BidBlockArgs;
+use crate::node::miner::bid_block::{validate_bid_block_blob_sidecars, BidBlockArgs};
 use crate::node::miner::bid_simulator::Bid;
 use crate::node::miner::config::keystore;
 use crate::node::miner::config::MiningConfig;
@@ -456,27 +457,40 @@ impl MevApiImpl {
             )));
         }
 
-        // Decode and hand to the miner via the global intake queue.
-        //
-        // The remaining tail of go-bsc's Miner.SendBidBlock is intentionally deferred to the
-        // miner side (bid_block::simulate_bid_block, called from BidSimulator::commit_bid_block):
-        //
-        //   • Extra overwrite + SetExtraData  →  header.extra_data = vanity + finalize_new_header
-        //   • setBidMevInfo                   →  set_bid_block_mev_info
-        //   • preSealVerifyBidBlock           →  verify_bid_block_payload + verify_bid_block_header
-        //   • execution + state-root check    →  execute_bid_block_payload
-        //
-        // Behavioral difference vs geth: geth runs these synchronously and returns an error to the
-        // builder immediately on failure.  reth-bsc returns bidHash optimistically; if any of the
-        // above steps fail the block is silently dropped miner-side.  The checks still run — the
-        // builder just does not receive per-step error feedback.
-        //
-        // Bringing them forward to admit_bid_block would require injecting
-        // Arc<Parlia<BscChainSpec>> into MevApiImpl (needed by verify_bid_block_header) and is
-        // left as future work.
+        // Mirrors go-bsc Miner.SendBidBlock: reject before decode to avoid wasted work.
+        if args.bid_block.transactions.is_empty() {
+            return Err(Self::invalid_bid("empty BidBlock txs"));
+        }
+
         let decoded = args
             .to_decoded_bid_block(builder)
             .map_err(|e| Self::invalid_bid(format!("failed to decode bid block: {e}")))?;
+
+        // Mirrors go-bsc preSealVerifyBidBlock check 3: gas-fee extraction + validation.
+        // go-bsc also checks BitLen() > uint256BitLen but U256 is bounded to 256 bits in Rust.
+        let (system_tx_start, gas_fee) =
+            extract_bid_block_deposit_value(&decoded.txs);
+        if gas_fee.is_zero() {
+            return Err(Self::invalid_bid(format!("empty gasFee: bidHash={bid_hash}")));
+        }
+
+        // Mirrors go-bsc preSealVerifyBidBlock check 4: cheap blob sidecar invariants.
+        // KZG proofs are not verified here — only at final block insertion (matching go-bsc).
+        validate_bid_block_blob_sidecars(
+            &decoded.header,
+            &decoded.txs,
+            &decoded.sidecars,
+            system_tx_start,
+            &self.chain_spec,
+        )
+        .map_err(|e| Self::invalid_bid(format!("{e}")))?;
+
+        // go-bsc preSealVerifyBidBlock checks 1–2 (VerifyUnsealedHeader, BlockTimeUpperCheck)
+        // require the Parlia engine and remain deferred to the miner side
+        // (simulate_bid_block → verify_bid_block_header).  Behavioral difference vs geth: if
+        // those checks fail the builder does not receive per-step error feedback; the block is
+        // silently dropped.  Bringing them forward requires injecting Arc<Parlia<BscChainSpec>>
+        // into MevApiImpl and is left as future work.
 
         // Register after all checks pass so quota is only consumed by accepted bids.
         self.add_pending_bid_block(block_number, builder, bid_hash);
