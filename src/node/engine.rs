@@ -111,6 +111,47 @@ where
                 MiningConfig::from_env()
             };
 
+        // Periodic overlay/persist sampler (diagnostic, opt-in via BSC_OVERLAY_SAMPLE_MS=<ms>).
+        // Emits one `bsc::diag` line per interval so a long-RO WARN (RETH_TXN_LONG_RO_MS) can be
+        // aligned — in the same log file — with the overlay depth and persist progress at that
+        // instant. `persisted` flat across consecutive lines == persistence stalled; `overlay_depth`
+        // = head - persisted tip (count of in-memory, not-yet-persisted blocks). Unset => disabled.
+        if let Some(sample_ms) = std::env::var("BSC_OVERLAY_SAMPLE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+        {
+            ctx.task_executor().handle().clone().spawn(async move {
+                use alloy_consensus::BlockHeader;
+                let mut ticker =
+                    tokio::time::interval(std::time::Duration::from_millis(sample_ms));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                let mut last_persisted: u64 = 0;
+                loop {
+                    ticker.tick().await;
+                    let Some(cim) = crate::shared::get_canonical_in_memory_state() else {
+                        continue;
+                    };
+                    let head = cim.get_canonical_head().number();
+                    let overlay_depth = cim.canonical_chain().count() as u64;
+                    let persisted = head.saturating_sub(overlay_depth);
+                    let finalized = cim.get_finalized_num_hash().map(|n| n.number).unwrap_or(0);
+                    let persist_advanced = persisted.saturating_sub(last_persisted);
+                    last_persisted = persisted;
+                    tracing::info!(
+                        target: "bsc::diag",
+                        head,
+                        persisted,
+                        persist_advanced,
+                        overlay_depth,
+                        finalized,
+                        finality_lag = head.saturating_sub(finalized),
+                        "overlay/persist sample"
+                    );
+                }
+            });
+        }
+
         // Register the sparse-trie state-root spawner, if enabled.
         //
         // We construct a long-lived `PayloadProcessor` keyed to a fresh `BscEvmConfig`
