@@ -17,6 +17,9 @@ use reth_ethereum_primitives::TransactionSigned;
 use reth_primitives_traits::SignerRecoverable;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
+
+/// Per-block pending BidBlock tracking: block_number → builder → set of bid hashes.
+type PendingBidBlocks = Arc<RwLock<HashMap<u64, HashMap<Address, HashSet<B256>>>>>;
 use tracing::debug;
 
 /// Raw bid data structure from builder
@@ -183,7 +186,7 @@ pub struct MevApiImpl {
     /// Mirrors go-bsc `bidSimulator.pending`: blockNumber → builder → set of bid hashes.
     /// Used to enforce duplicate detection and the per-builder-per-block quota
     /// (`max_bids_per_builder`) at RPC admission time, before the bid enters the miner queue.
-    pending_bid_blocks: Arc<RwLock<HashMap<u64, HashMap<Address, HashSet<B256>>>>>,
+    pending_bid_blocks: PendingBidBlocks,
 }
 
 // NOTE: The allowed_builders is now also accessible via crate::shared::get_builder_whitelist()
@@ -431,7 +434,7 @@ impl MevApiImpl {
         // Must run before the timing check so rejected bids do not consume quota.
         let block_number = args.bid_block.header.number;
         self.check_pending_bid_block(block_number, builder, bid_hash)
-            .map_err(|e| Self::invalid_bid(e))?;
+            .map_err(Self::invalid_bid)?;
 
         // Mirrors go-bsc `bidSimulator.bidMustBefore`: reject bids that arrive after the
         // validator must have already started sealing (no time left to simulate).
