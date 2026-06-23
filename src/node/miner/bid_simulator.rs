@@ -727,8 +727,13 @@ where
         let gas_ceil = crate::shared::get_miner_gas_limit().unwrap_or(parent.gas_limit);
         let expected_gas_limit =
             EthereumBuilderConfig::new().with_gas_limit(gas_ceil).gas_limit(parent.gas_limit);
-        // TODO: use the operator-configured extra vanity instead of zero bytes.
-        let vanity = Bytes::from(vec![0u8; 32]);
+        // Use the operator-configured extra (`miner_setExtra`) as the block vanity, mirroring
+        // geth's `worker.extra`; pad/truncate to the Parlia vanity length, defaulting to zeros.
+        let vanity = {
+            let mut v = crate::shared::get_miner_extra().map(|e| e.to_vec()).unwrap_or_default();
+            v.resize(crate::consensus::parlia::EXTRA_VANITY_LEN, 0u8);
+            Bytes::from(v)
+        };
         let block_timestamp_ms = calculate_millisecond_timestamp(&decoded.header);
 
         let task = match simulate_bid_block(
@@ -746,7 +751,10 @@ where
             Ok(task) => task,
             Err(e) => {
                 debug!("BidBlock rejected in simulate: {e}");
-                // TODO(8d-2c): revoke the builder on verification failure.
+                // go-bsc only revokes on blob-tx validation failure here (`errInvalidBidBlockBlobTx`
+                // in `prepareBidBlockTask`); other prepare failures are plain rejections. Our KZG
+                // blob verification isn't ported yet, so there is no revoke-worthy variant to match
+                // on — the dishonest-builder revoke lives at the state-root check below.
                 return;
             }
         };
@@ -774,6 +782,9 @@ where
         use reth_trie_common::{HashedPostState, KeccakKeyHasher};
 
         let sealed = task.block;
+        let builder = task.builder;
+        let bid_hash = task.bid_hash;
+        let block_num = sealed.header().number;
         let state_provider = match self.client.state_by_block_hash(parent_hash) {
             Ok(sp) => sp,
             Err(e) => {
@@ -806,7 +817,17 @@ where
                 "BidBlock: state root mismatch (dishonest builder): computed {root}, claimed {}",
                 sealed.header().state_root
             );
-            // TODO(8d-2c): revoke the builder.
+            // A wrong claimed root is unambiguous builder dishonesty — revoke its permission, as
+            // go-bsc does on the InsertChain mismatch in `handleBidBlockResult`.
+            crate::shared::get_bid_block_permission_manager().revoke(
+                builder,
+                format!(
+                    "BidBlock state root mismatch: computed {root}, claimed {}",
+                    sealed.header().state_root
+                ),
+                bid_hash,
+                block_num,
+            );
             return None;
         }
         let sealed_block = Arc::new(sealed.sealed_block().clone());
