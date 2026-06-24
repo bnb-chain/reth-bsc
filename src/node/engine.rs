@@ -164,6 +164,15 @@ where
             // shares the underlying Arc<RwLock<..>>; `evict` (interior-mutable) bounds growth.
             const MINER_CHANGESET_RETENTION_BLOCKS: u64 = 256;
             let miner_changeset_cache = ChangesetCache::new();
+            // Read-only canonical sparse-trie reuse: each build clones a warm trie from the snapshot
+            // ring (keyed by its parent) and never stores back to a shared slot, so repeated
+            // same-height rebuilds within a slot don't clobber each other's anchor (the dominant
+            // cold-root cause). Falls back to the normal spawn on ring miss. Default off.
+            let reuse_canonical_sparse_trie = std::env::var("BSC_MINER_SPARSE_REUSE_CANONICAL")
+                .ok()
+                .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on"))
+                .unwrap_or(false);
+            tracing::info!(target: "bsc::miner", reuse_canonical_sparse_trie, "Miner sparse-trie canonical reuse (BSC_MINER_SPARSE_REUSE_CANONICAL)");
             let spawn_fn: crate::shared::SparseTrieSpawnFn = std::sync::Arc::new(
                 move |parent_hash: alloy_primitives::B256,
                       parent_state_root: alloy_primitives::B256| {
@@ -266,12 +275,37 @@ where
                     // a slow spawn points at per-block worker-pool churn / overlay setup rather
                     // than tx execution.
                     let spawn_start = std::time::Instant::now();
-                    let handle = payload_processor.spawn_state_root(
-                        overlay_factory,
-                        parent_state_root,
-                        false, // halve_workers
-                        tree_config_for_closure.as_ref(),
-                    );
+                    // Read-only reuse: try the snapshot ring first (warm clone, no shared-slot
+                    // clobber). On ring miss, fall back to the normal spawn (take/store the slot).
+                    let handle = if reuse_canonical_sparse_trie {
+                        match payload_processor.spawn_state_root_via_ring(
+                            overlay_factory.clone(),
+                            parent_state_root,
+                            false, // halve_workers
+                            tree_config_for_closure.as_ref(),
+                        ) {
+                            Some(h) => {
+                                metrics::counter!("bsc_miner_sparse_seed_hit_total").increment(1);
+                                h
+                            }
+                            None => {
+                                metrics::counter!("bsc_miner_sparse_seed_miss_total").increment(1);
+                                payload_processor.spawn_state_root(
+                                    overlay_factory,
+                                    parent_state_root,
+                                    false,
+                                    tree_config_for_closure.as_ref(),
+                                )
+                            }
+                        }
+                    } else {
+                        payload_processor.spawn_state_root(
+                            overlay_factory,
+                            parent_state_root,
+                            false, // halve_workers
+                            tree_config_for_closure.as_ref(),
+                        )
+                    };
                     metrics::histogram!("bsc_miner_sparse_trie_spawn_duration_seconds")
                         .record(spawn_start.elapsed().as_secs_f64());
                     Some(handle)
