@@ -55,7 +55,7 @@ pub struct BscBuiltPayload {
     pub exec_duration: Duration,
     /// Time spent computing the trie root (time spent in `finish()` after execution).
     pub trie_root_duration: Duration,
-    /// The executed block (includes difflayer if triedb produced one)
+    /// The executed block.
     pub(crate) executed_block: ExecutedBlock<BscPrimitives>,
     /// Validators from execution context, to be written to VALIDATOR_CACHE after finalization.
     /// `None` for bid payloads and non-epoch blocks.
@@ -123,9 +123,7 @@ where
         // `TreeConfig` built from the `--engine.*` CLI flags via
         // `ctx.config().engine.tree_config()`, so miner-side proof-worker counts /
         // cache sizes are CLI-tunable and match the import (engine) path.
-        if mining_config.use_sparse_trie_state_root
-            && !rust_eth_triedb::triedb_manager::is_triedb_active()
-        {
+        if mining_config.use_sparse_trie_state_root {
             use alloy_consensus::BlockHeader;
             use reth_chain_state::LazyOverlay;
             use reth_engine_tree::tree::{
@@ -246,7 +244,7 @@ where
             } else {
                 info!(
                     "Sparse-trie state-root spawner registered \
-                     (use_sparse_trie_state_root=true, triedb=inactive)"
+                     (use_sparse_trie_state_root=true)"
                 );
             }
         }
