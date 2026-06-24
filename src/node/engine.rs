@@ -328,6 +328,20 @@ where
                         if let Some(engine_trie) =
                             reth_engine_tree::tree::engine_preserved_sparse_trie()
                         {
+                            // Diagnose WHY a seed hits/misses: classify the engine trie's anchor at
+                            // this instant relative to our parent. miss = None (import mid-compute /
+                            // unpublished) vs mismatch (import anchored on a different block than our
+                            // build parent — a timing/anchor-lag issue, not slot contention).
+                            match engine_trie.anchored_root() {
+                                None => metrics::counter!("bsc_miner_seed_engine_none_total")
+                                    .increment(1),
+                                Some(a) if a == parent_state_root => {
+                                    metrics::counter!("bsc_miner_seed_engine_match_total")
+                                        .increment(1)
+                                }
+                                Some(_) => metrics::counter!("bsc_miner_seed_engine_mismatch_total")
+                                    .increment(1),
+                            }
                             let seeded = payload_processor
                                 .preserved_sparse_trie()
                                 .seed_from(&engine_trie, parent_state_root);
