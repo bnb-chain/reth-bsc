@@ -56,6 +56,74 @@ use tracing::{debug, info, trace, warn};
 /// 120ms to avoid missing the block deadline or eating into the next block's time budget.
 pub const DELAY_LEFT_OVER: u64 = 120;
 
+/// Adaptive end-of-slot reserve, tuned at runtime via env (no recompile needed for testing).
+///
+/// Empty blocks under load cluster at the *peaks* of the overlay depth (head − finalized): there
+/// the background sparse-trie root can't finalize within the default 120ms reserve, so `finish`
+/// waits past the slot deadline and the block degrades to empty-fallback. For the ~97% of blocks
+/// at normal depth the root is ready in ~20ms, so the default reserve is left untouched. When the
+/// overlay is deep we reserve more of the slot for the root (fill stops earlier → exec ends earlier
+/// → the finalize tail gets a larger window, and fewer txs are filled → the finalize tail is
+/// smaller), turning a would-be empty block into an on-time smaller block.
+/// See docs/design-adaptive-overlay-depth.md.
+///
+/// Env knobs (read once at startup, cached):
+/// - `BSC_MINING_ADAPTIVE_RESERVE` = on/off (default on); off → fixed `DELAY_LEFT_OVER` (A/B base).
+/// - `BSC_MINING_ROOT_RESERVE_DEPTH_LOW`  (default 15) — at/below this, default reserve.
+/// - `BSC_MINING_ROOT_RESERVE_DEPTH_HIGH` (default 40) — at/above this, max reserve.
+/// - `BSC_MINING_ROOT_RESERVE_MAX_MS`     (default 280) — reserve used at/above DEPTH_HIGH.
+#[derive(Debug, Clone, Copy)]
+struct AdaptiveReserveConfig {
+    enabled: bool,
+    depth_low: u64,
+    depth_high: u64,
+    reserve_max_ms: u64,
+}
+
+/// Default knob values (also the fallback when the corresponding env var is unset/unparseable).
+const ROOT_RESERVE_MAX_MS: u64 = 280;
+const ROOT_RESERVE_DEPTH_LOW: u64 = 15;
+const ROOT_RESERVE_DEPTH_HIGH: u64 = 40;
+
+fn adaptive_reserve_config() -> &'static AdaptiveReserveConfig {
+    static CFG: std::sync::OnceLock<AdaptiveReserveConfig> = std::sync::OnceLock::new();
+    CFG.get_or_init(|| {
+        let env_u64 = |k: &str, default: u64| {
+            std::env::var(k).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default)
+        };
+        let enabled = std::env::var("BSC_MINING_ADAPTIVE_RESERVE")
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"))
+            .unwrap_or(true);
+        let cfg = AdaptiveReserveConfig {
+            enabled,
+            depth_low: env_u64("BSC_MINING_ROOT_RESERVE_DEPTH_LOW", ROOT_RESERVE_DEPTH_LOW),
+            depth_high: env_u64("BSC_MINING_ROOT_RESERVE_DEPTH_HIGH", ROOT_RESERVE_DEPTH_HIGH),
+            reserve_max_ms: env_u64("BSC_MINING_ROOT_RESERVE_MAX_MS", ROOT_RESERVE_MAX_MS),
+        };
+        tracing::info!(target: "bsc::miner", ?cfg, "Adaptive root-reserve config");
+        cfg
+    })
+}
+
+/// Effective end-of-slot reserve (ms) given the current in-memory overlay depth.
+///
+/// Linearly interpolates `DELAY_LEFT_OVER..=reserve_max_ms` between `depth_low` and `depth_high`.
+/// At/below `depth_low` (or when disabled) returns the unchanged default, so normal blocks are
+/// unaffected. The branch ordering also makes a misconfigured `depth_high <= depth_low` behave as a
+/// step at `depth_low` (no divide-by-zero).
+pub fn effective_delay_left_over(overlay_depth: u64) -> u64 {
+    let cfg = adaptive_reserve_config();
+    if !cfg.enabled || overlay_depth <= cfg.depth_low {
+        DELAY_LEFT_OVER
+    } else if overlay_depth >= cfg.depth_high {
+        cfg.reserve_max_ms
+    } else {
+        let span = (cfg.depth_high - cfg.depth_low) as f64;
+        let t = (overlay_depth - cfg.depth_low) as f64 / span;
+        DELAY_LEFT_OVER + (t * cfg.reserve_max_ms.saturating_sub(DELAY_LEFT_OVER) as f64) as u64
+    }
+}
+
 /// Minimum estimated fee uplift required for a normal rebuild, expressed in basis points.
 const NORMAL_REBUILD_UPLIFT_BPS: u64 = 1_500;
 
@@ -428,11 +496,21 @@ where
         let validator_cache_sink: ValidatorCacheSink = Arc::new(Mutex::new(None));
         let turn_length_sink: Arc<Mutex<Option<u8>>> = Arc::new(Mutex::new(None));
 
-        // Sink for the sparse-trie precomputed state root. The same Arc<Mutex<>> from
-        // `state_root_precomputed` is threaded into ctx so builder.rs can read it during
-        // `finish`. When the sparse-trie path is not active (flag off), this Mutex stays
-        // `None` and the builder falls through to `state_root_with_updates`.
-        let state_root_precomputed_sink = state_root_precomputed.clone();
+        // Sink for the sparse-trie precomputed state root. This MUST be a fresh per-attempt
+        // Arc<Mutex<>> — NOT a clone of the job-level `state_root_precomputed`. The job-level Arc
+        // is shared by every build attempt (including the deadline-spawned empty-fallback build),
+        // and inside `finish` the write (after the sparse-trie wait) and the read-back
+        // (`sink.take()`) are separated by `merge_transitions` + `hashed_post_state` over all txs
+        // (~hundreds of ms for a full block). With a shared sink, a concurrent second finish (e.g.
+        // the empty build, which has no trie_handle so it jumps straight to the take()) steals the
+        // root this attempt deposited, forcing this attempt onto the slow synchronous
+        // `state_root_with_updates`. A per-attempt sink makes write→read strictly intra-attempt, so
+        // the full build reads back its OWN precomputed root. When the sparse-trie path is not active
+        // (flag off), this Mutex stays `None` and the builder falls through to
+        // `state_root_with_updates`.
+        let state_root_precomputed_sink: Arc<
+            Mutex<Option<(alloy_primitives::B256, reth_trie_common::updates::TrieUpdates)>>,
+        > = Arc::new(Mutex::new(None));
 
         let next_env_attributes = BscNextBlockEnvAttributes {
             inner: NextBlockEnvAttributes {
@@ -827,7 +905,10 @@ where
         // it after executor.finish() and calls `state_root()` once the hook is
         // naturally dropped (executor consumption triggers `StateHookSender::drop`
         // which sends `FinishedStateUpdates`).
-        let _ = &state_root_precomputed; // sink referenced for trace; written by builder
+        // The job-level `state_root_precomputed` Arc is vestigial: this attempt uses its own
+        // per-attempt sink (see `state_root_precomputed_sink` above). Kept bound to avoid an
+        // unused-variable warning until the field is removed from BscBuildArguments.
+        let _ = &state_root_precomputed;
         let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } =
             builder.finish(&state_provider, None)?;
 
@@ -982,7 +1063,13 @@ where
                     },
                     validator_cache_sink: Some(validator_cache_sink.clone()),
                     turn_length_sink: Some(turn_length_sink.clone()),
-                    state_root_precomputed_sink: Some(state_root_precomputed.clone()),
+                    // Empty-fallback build never installs a sparse-trie hook (trie_handle: None
+                    // below), so it must NOT read from any sparse-trie sink. Passing None makes the
+                    // builder compute this empty block's own (cheap) state root via
+                    // `state_root_with_updates` instead of stealing a full build's precomputed root
+                    // out of a shared sink (which both starved the full build and risked sealing a
+                    // foreign root onto the empty block).
+                    state_root_precomputed_sink: None,
                     // Empty-payload path: don't engage sparse-trie (would still be
                     // correct but the setup overhead isn't worth it for ~0-tx blocks).
                     trie_handle: None,
@@ -1174,10 +1261,22 @@ where
 
         let trace_id = build_args.trace_id;
 
+        // Adaptive root reserve: when the in-memory overlay (head − finalized) is deep, reserve
+        // more of the slot for the background state root so it finalizes before the deadline
+        // instead of degrading the block to empty-fallback. Normal-depth blocks keep the default
+        // reserve (overlay_depth ≤ ROOT_RESERVE_DEPTH_LOW). Falls back to depth 0 (default reserve)
+        // when finalized is not yet available. See docs/design-adaptive-overlay-depth.md.
+        let block_number = mining_ctx.parent_header.number() + 1;
+        let overlay_depth = crate::shared::get_canonical_in_memory_state()
+            .and_then(|cim| cim.get_finalized_num_hash())
+            .map(|f| block_number.saturating_sub(f.number))
+            .unwrap_or(0);
+        let effective_reserve = effective_delay_left_over(overlay_depth);
+        metrics::histogram!("bsc_miner_effective_reserve_ms").record(effective_reserve as f64);
         let mining_delay = parlia.clone().delay_for_mining(
             &mining_ctx.parent_snapshot,
             mining_ctx.header.as_ref().unwrap(),
-            DELAY_LEFT_OVER,
+            effective_reserve,
         );
         let pending_basefee = builder.pool.block_info().pending_basefee;
 
