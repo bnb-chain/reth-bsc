@@ -325,13 +325,25 @@ where
                     // on miss (import mid-compute / anchored elsewhere) we leave the miner's slot as-is
                     // and fall back to the existing path. Clone computes byte-identical roots.
                     if reuse_canonical_sparse_trie {
+                        // Seed the miner's preserved trie from the canonical snapshot ring (the last
+                        // N canonical tries published by the import path), keyed by our parent state
+                        // root. Immune to import being mid-compute (None) or having advanced past our
+                        // parent (mismatch), as long as our parent is within the last N canonical
+                        // blocks. On miss → fall back to the existing path.
+                        let seeded = payload_processor
+                            .preserved_sparse_trie()
+                            .seed_from_canonical_snapshot(parent_state_root);
+                        if seeded {
+                            metrics::counter!("bsc_miner_sparse_seed_hit_total").increment(1);
+                        } else {
+                            metrics::counter!("bsc_miner_sparse_seed_miss_total").increment(1);
+                        }
+                        // Diagnostic: would the single *live* import trie have matched right now?
+                        // (classifies the old 26%-hit live path: none = import mid-compute,
+                        // mismatch = import anchored on a different block). Compares ring vs live.
                         if let Some(engine_trie) =
                             reth_engine_tree::tree::engine_preserved_sparse_trie()
                         {
-                            // Diagnose WHY a seed hits/misses: classify the engine trie's anchor at
-                            // this instant relative to our parent. miss = None (import mid-compute /
-                            // unpublished) vs mismatch (import anchored on a different block than our
-                            // build parent — a timing/anchor-lag issue, not slot contention).
                             match engine_trie.anchored_root() {
                                 None => metrics::counter!("bsc_miner_seed_engine_none_total")
                                     .increment(1),
@@ -341,14 +353,6 @@ where
                                 }
                                 Some(_) => metrics::counter!("bsc_miner_seed_engine_mismatch_total")
                                     .increment(1),
-                            }
-                            let seeded = payload_processor
-                                .preserved_sparse_trie()
-                                .seed_from(&engine_trie, parent_state_root);
-                            if seeded {
-                                metrics::counter!("bsc_miner_sparse_seed_hit_total").increment(1);
-                            } else {
-                                metrics::counter!("bsc_miner_sparse_seed_miss_total").increment(1);
                             }
                         }
                     }
