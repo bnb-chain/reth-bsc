@@ -265,6 +265,16 @@ where
                                     .record(blocks.len() as f64);
                                 metrics::counter!("bsc_miner_sparse_trie_anchor_inmemory_total")
                                     .increment(1);
+                                // diag: overlay reconstruction depth the proof workers must walk
+                                // over (= persist lag). Correlate with the sparse-v2 reveal/idle
+                                // breakdown and the slow-proof logs from `trie::proof_task`.
+                                tracing::debug!(
+                                    target: "bsc::miner",
+                                    parent_hash = %parent_hash,
+                                    anchor = %anchor,
+                                    overlay_depth = blocks.len(),
+                                    "sparse-trie spawn: in-memory overlay anchored"
+                                );
                                 (anchor, Some(LazyOverlay::new(blocks)))
                             }
                             None => {
@@ -349,8 +359,19 @@ where
                             tree_config_for_closure.as_ref(),
                         )
                     };
+                    let spawn_elapsed = spawn_start.elapsed();
                     metrics::histogram!("bsc_miner_sparse_trie_spawn_duration_seconds")
-                        .record(spawn_start.elapsed().as_secs_f64());
+                        .record(spawn_elapsed.as_secs_f64());
+                    // diag: cost of standing up the proof-worker pools + overlay per block. A
+                    // large value here points at per-block worker-pool churn / overlay setup
+                    // rather than the trie computation itself.
+                    tracing::debug!(
+                        target: "bsc::miner",
+                        parent_hash = %parent_hash,
+                        parent_state_root = %parent_state_root,
+                        spawn_ms = spawn_elapsed.as_secs_f64() * 1e3,
+                        "sparse-trie spawn complete"
+                    );
                     Some(handle)
                 },
             );
