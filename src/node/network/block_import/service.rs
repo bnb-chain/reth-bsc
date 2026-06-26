@@ -1200,6 +1200,64 @@ mod tests {
         }
     }
 
+    /// Build a minimal sealed BidBlock (no txs) at the given height for the BidBlock import path.
+    fn create_bid_sealed_block(number: u64) -> SealedBlock<BscBlock> {
+        use reth_primitives_traits::Block as _;
+        let block = BscBlock {
+            header: Header { number, ..Default::default() },
+            body: BscBlockBody {
+                inner: BlockBody { transactions: Vec::new(), ommers: Vec::new(), withdrawals: None },
+                sidecars: None,
+            },
+        };
+        let hash = block.header.hash_slow();
+        block.seal_unchecked(hash)
+    }
+
+    #[tokio::test]
+    async fn bid_block_broadcasts_then_revokes_on_invalid() {
+        // Zero-simulate BidBlock import: the block must be broadcast BEFORE verification, and when
+        // the engine rejects it (Invalid) the builder must be revoked — go-bsc `handleBidBlockResult`
+        // (broadcast first, InsertChain after, punish dishonesty).
+        let mut fixture = TestFixture::new(EngineResponses::invalid_new_payload()).await;
+
+        // Unique builder so this test doesn't collide with the process-global permission manager.
+        let builder = Address::repeat_byte(0x7e);
+        let bid_hash = B256::repeat_byte(0xb1);
+        let pm = crate::shared::get_bid_block_permission_manager();
+        assert!(pm.is_allowed(builder), "builder should start allowed");
+
+        fixture.bid_tx.send((create_bid_sealed_block(1), builder, bid_hash)).unwrap();
+
+        // 1. Broadcast-first: a full-block (ValidBlock) announcement is emitted.
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut saw_broadcast = false;
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
+        while !saw_broadcast && tokio::time::Instant::now() < deadline {
+            match fixture.handle.poll_outcome(&mut cx) {
+                Poll::Ready(Some(event)) => {
+                    if matches!(
+                        event,
+                        BlockImportEvent::Announcement(BlockValidation::ValidBlock { .. })
+                    ) {
+                        saw_broadcast = true;
+                    }
+                }
+                Poll::Ready(None) => break,
+                Poll::Pending => tokio::task::yield_now().await,
+            }
+        }
+        assert!(saw_broadcast, "BidBlock must be broadcast before verification");
+
+        // 2. Verify-after: the Invalid payload revokes the builder (runs in a spawned task).
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
+        while pm.is_allowed(builder) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        }
+        assert!(!pm.is_allowed(builder), "builder must be revoked after Invalid verification");
+    }
+
     #[derive(Clone)]
     struct MockProvider {
         headers_by_number: HashMap<BlockNumber, Header>,
@@ -1366,6 +1424,8 @@ mod tests {
     /// Test fixture for block import tests
     struct TestFixture {
         handle: ImportHandle,
+        /// Sender feeding the service's BEP-675 BidBlock channel (`from_bid_block`).
+        bid_tx: mpsc::UnboundedSender<IncomingBidBlock>,
     }
 
     impl TestFixture {
@@ -1384,7 +1444,7 @@ mod tests {
 
             let (to_import, from_network) = mpsc::unbounded_channel();
             let (to_import_mined, from_builder) = mpsc::unbounded_channel();
-            let (_to_import_bid, from_bid_block) = mpsc::unbounded_channel();
+            let (to_import_bid, from_bid_block) = mpsc::unbounded_channel();
             let (to_hashes, from_hashes) = mpsc::unbounded_channel();
             let (to_network, import_outcome) = mpsc::unbounded_channel();
 
@@ -1404,7 +1464,7 @@ mod tests {
                 service.await.unwrap();
             }));
 
-            Self { handle }
+            Self { handle, bid_tx: to_import_bid }
         }
 
         /// Run a block import test with the given event assertion

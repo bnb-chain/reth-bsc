@@ -1005,6 +1005,39 @@ mod tests {
         );
     }
 
+    // ---- validate_bid_block_blob_kzg (pre-broadcast proof gate) ----
+
+    #[test]
+    fn kzg_accepts_block_without_blob_txs() {
+        // No EIP-4844 txs in the user region → nothing to verify, no sidecars consumed.
+        let txs = vec![legacy_tx(0), legacy_tx(1)];
+        assert_eq!(validate_bid_block_blob_kzg(&txs, &[], 2), Ok(()));
+    }
+
+    #[test]
+    fn kzg_rejects_blob_tx_without_sidecar() {
+        // A blob tx with no matching sidecar is rejected before any crypto runs (go-bsc would have
+        // no sidecar to hand ValidateBlobTx). The error carries the offending tx index.
+        let txs = vec![blob_tx(0)];
+        assert_eq!(
+            validate_bid_block_blob_kzg(&txs, &[], 1),
+            Err(BlobKzgError::MissingSidecar { tx_index: 0 })
+        );
+    }
+
+    #[test]
+    fn kzg_rejects_invalid_proof() {
+        // A blob tx paired with an all-zero (bogus) sidecar fails KZG verification: the commitment
+        // does not hash to the tx's versioned hash / is not a valid point. Must be a typed error,
+        // never a panic.
+        let tx = blob_tx(0);
+        let sidecar = sidecar_for(&tx, 0, 0, 1); // all-zero blob/commitment/proof
+        assert!(matches!(
+            validate_bid_block_blob_kzg(&[tx], &[sidecar], 1),
+            Err(BlobKzgError::Invalid { tx_index: 0, .. })
+        ));
+    }
+
     // ---- pre_seal_verify_bid_block ----
 
     use crate::consensus::parlia::bid_block::DEPOSIT_SELECTOR;
