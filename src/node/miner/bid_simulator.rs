@@ -89,7 +89,7 @@ pub struct BidSimulator<Client, Pool> {
     simulating_bid: Arc<RwLock<HashMap<B256, Bid>>>,
     best_bid: Arc<RwLock<HashMap<B256, BidRuntime<Pool, BscEvmConfig>>>>,
     /// Best executed BEP-675 BidBlock payload per parent hash (go-bsc `AddBidBlock`/`GetBestBidBlock`).
-    best_bid_block: Arc<RwLock<HashMap<B256, BscBuiltPayload>>>,
+    best_bid_block: Arc<RwLock<HashMap<B256, BidBlockTask>>>,
     pending_bid: Arc<RwLock<HashMap<String, u8>>>,
     bid_receiving: bool,
     chain_spec: Arc<BscChainSpec>,
@@ -759,101 +759,23 @@ where
             }
         };
 
-        // Execute the sealed block to obtain its post-state + trie updates, and verify the builder's
-        // claimed state root before turning it into a selectable payload.
-        let Some(payload) = self.execute_bid_block_payload(parent_hash, task) else { return };
+        // BEP-675 zero-simulate: do NOT execute here. Keep the highest-fee sealed BidBlock per
+        // parent (go-bsc `AddBidBlock`). Execution + state-root verification are deferred until the
+        // block has been selected and broadcast — see `ImportService::on_new_bid_block` — matching
+        // go-bsc's broadcast-then-`InsertChain` flow in `handleBidBlockResult`. Selection is by the
+        // deposit-derived `gas_fee`, which needs no execution.
         let mut best = self.best_bid_block.write();
-        let replace = best.get(&parent_hash).is_none_or(|p| payload.fees > p.fees);
+        let replace = best.get(&parent_hash).is_none_or(|t| task.gas_fee > t.gas_fee);
         if replace {
-            best.insert(parent_hash, payload);
+            best.insert(parent_hash, task);
         }
     }
 
-    /// Execute a sealed BidBlock against the parent state, verify its claimed state root, and
-    /// assemble a `BscBuiltPayload` (is_bid = true) for selection. Returns `None` on any failure
-    /// (missing state, execution error, or state-root mismatch — a dishonest builder).
-    fn execute_bid_block_payload(
-        &self,
-        parent_hash: B256,
-        task: BidBlockTask,
-    ) -> Option<BscBuiltPayload> {
-        use reth_evm::execute::Executor;
-        use reth_provider::StateRootProvider;
-        use reth_trie_common::{HashedPostState, KeccakKeyHasher};
-
-        let sealed = task.block;
-        let builder = task.builder;
-        let bid_hash = task.bid_hash;
-        let block_num = sealed.header().number;
-        let state_provider = match self.client.state_by_block_hash(parent_hash) {
-            Ok(sp) => sp,
-            Err(e) => {
-                debug!("BidBlock: state provider error: {e}");
-                return None;
-            }
-        };
-        let output = {
-            let evm_config = BscEvmConfig::new(self.chain_spec.clone());
-            let executor = evm_config.batch_executor(StateProviderDatabase::new(&state_provider));
-            match executor.execute(&sealed) {
-                Ok(o) => o,
-                Err(e) => {
-                    debug!("BidBlock: execution failed: {e}");
-                    return None;
-                }
-            }
-        };
-        let requests = output.result.requests.clone();
-        let hashed_state = HashedPostState::from_bundle_state::<KeccakKeyHasher>(output.state.state());
-        let (root, trie_updates) = match state_provider.state_root_with_updates(hashed_state.clone()) {
-            Ok(r) => r,
-            Err(e) => {
-                debug!("BidBlock: state root failed: {e}");
-                return None;
-            }
-        };
-        if root != sealed.header().state_root {
-            debug!(
-                "BidBlock: state root mismatch (dishonest builder): computed {root}, claimed {}",
-                sealed.header().state_root
-            );
-            // A wrong claimed root is unambiguous builder dishonesty — revoke its permission, as
-            // go-bsc does on the InsertChain mismatch in `handleBidBlockResult`.
-            crate::shared::get_bid_block_permission_manager().revoke(
-                builder,
-                format!(
-                    "BidBlock state root mismatch: computed {root}, claimed {}",
-                    sealed.header().state_root
-                ),
-                bid_hash,
-                block_num,
-            );
-            return None;
-        }
-        let sealed_block = Arc::new(sealed.sealed_block().clone());
-        let executed = BuiltPayloadExecutedBlock {
-            recovered_block: Arc::new(sealed.clone()),
-            execution_output: Arc::new(output),
-            hashed_state: Either::Left(Arc::new(hashed_state)),
-            trie_updates: Either::Left(Arc::new(trie_updates)),
-        }
-        .into_executed_payload();
-        Some(BscBuiltPayload {
-            block: sealed_block,
-            fees: task.gas_fee,
-            requests: Some(requests),
-            build_kind: crate::node::engine::BuildKind::NormalAttempt,
-            exec_duration: std::time::Duration::ZERO,
-            trie_root_duration: std::time::Duration::ZERO,
-            executed_block: executed,
-            pending_validators: None,
-            pending_turn_length: None,
-            is_bid: true,
-        })
-    }
-
-    /// The best stored BidBlock payload for a parent hash (go-bsc `GetBestBidBlock`).
-    pub fn best_bid_block(&self, parent_hash: B256) -> Option<BscBuiltPayload> {
+    /// The best stored (sealed, unexecuted) BidBlock for a parent hash (go-bsc `GetBestBidBlock`).
+    ///
+    /// The returned [`BidBlockTask`] is fully blind-signed and sealed but **not** executed: under
+    /// BEP-675 zero-simulate the validator verifies the state root only after broadcasting.
+    pub fn best_bid_block(&self, parent_hash: B256) -> Option<BidBlockTask> {
         self.best_bid_block.read().get(&parent_hash).cloned()
     }
 }

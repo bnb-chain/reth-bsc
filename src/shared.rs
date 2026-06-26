@@ -1,6 +1,8 @@
 use crate::consensus::parlia::SnapshotProvider;
 use crate::node::engine_api::payload::BscPayloadTypes;
-use crate::node::network::block_import::service::{IncomingBlock, IncomingMinedBlock};
+use crate::node::network::block_import::service::{
+    IncomingBidBlock, IncomingBlock, IncomingMinedBlock,
+};
 use crate::node::network::BscNetworkPrimitives;
 use crate::node::primitives::BscBlock;
 use alloy_consensus::{BlockHeader, Header};
@@ -97,6 +99,10 @@ static BLOCK_IMPORT_MINED_SENDER: OnceLock<UnboundedSender<IncomingMinedBlock>> 
 
 /// Global sender for submitting built payload to the import service
 static BLOCK_IMPORT_SENDER: OnceLock<UnboundedSender<IncomingBlock>> = OnceLock::new();
+
+/// Global sender for submitting a selected (sealed, unexecuted) BEP-675 BidBlock to the import
+/// service, which broadcasts it then verifies it on import (zero-simulate).
+static BID_BLOCK_IMPORT_SENDER: OnceLock<UnboundedSender<IncomingBidBlock>> = OnceLock::new();
 
 /// Global local peer ID for network identification
 static LOCAL_PEER_ID: OnceLock<PeerId> = OnceLock::new();
@@ -441,6 +447,18 @@ pub fn set_block_import_sender(
 /// Get a reference to the global block import sender, if initialized.
 pub fn get_block_import_sender() -> Option<&'static UnboundedSender<IncomingBlock>> {
     BLOCK_IMPORT_SENDER.get()
+}
+
+/// Store the BidBlock import sender globally. Returns an error if it was set before.
+pub fn set_bid_block_import_sender(
+    sender: UnboundedSender<IncomingBidBlock>,
+) -> Result<(), UnboundedSender<IncomingBidBlock>> {
+    BID_BLOCK_IMPORT_SENDER.set(sender)
+}
+
+/// Get a reference to the global BidBlock import sender, if initialized.
+pub fn get_bid_block_import_sender() -> Option<&'static UnboundedSender<IncomingBidBlock>> {
+    BID_BLOCK_IMPORT_SENDER.get()
 }
 
 /// Store the local peer ID globally. Returns an error if it was set before.

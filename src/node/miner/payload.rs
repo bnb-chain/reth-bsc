@@ -9,6 +9,7 @@ use crate::node::engine::{BscBuiltPayload, BuildKind};
 use crate::node::evm::config::{BscEvmConfig, BscNextBlockEnvAttributes, ValidatorCacheSink};
 use crate::node::evm::pre_execution::{TURN_LENGTH_CACHE, VALIDATOR_CACHE};
 use crate::node::evm::{request_difflayer, MinerTrieDbPrefetcher};
+use crate::node::miner::bid_block::BidBlockTask;
 use crate::node::miner::bid_simulator::BidSimulator;
 use crate::node::miner::bsc_miner::{MiningContext, SubmitContext};
 use crate::node::miner::util::finalize_new_header;
@@ -1298,6 +1299,10 @@ where
     result_tx: mpsc::UnboundedSender<SubmitContext>,
     /// Potential payloads vector for selecting the best one
     potential_payloads: Vec<BscBuiltPayload>,
+    /// Best (sealed, unexecuted) BEP-675 BidBlock for this parent, collected from the simulator.
+    /// Competes against `potential_payloads` by fee; if it wins it is broadcast first and verified
+    /// on import (zero-simulate), so it is intentionally kept out of `potential_payloads`.
+    bid_block_candidate: Option<BidBlockTask>,
     /// Current build arguments
     build_args: BscBuildArguments<EthPayloadAttributes>,
     /// Retry count for payload building
@@ -1389,6 +1394,7 @@ where
             is_aborted: false,
             result_tx,
             potential_payloads: Vec::new(),
+            bid_block_candidate: None,
             build_args,
             retries: 0,
             join_handle: tokio::task::JoinSet::new(),
@@ -1954,17 +1960,24 @@ where
         }
     }
 
-    /// Collect the best BEP-675 BidBlock payload (if any) so it competes with the local block and
-    /// any legacy SendBid by fee in `pick_best_payload_and_finalize` (go-bsc `selectBidBlock`).
+    /// Collect the best (sealed, unexecuted) BEP-675 BidBlock for this parent so it can compete by
+    /// fee against the local block and any legacy SendBid in `try_return_best_payload`
+    /// (go-bsc `selectBidBlock`).
+    ///
+    /// Unlike the legacy/local payloads, the BidBlock is **not** pushed into `potential_payloads`:
+    /// under zero-simulate it is never executed before selection, so it has no `BscBuiltPayload`.
+    /// If it wins it is broadcast first and verified on import.
     fn collect_best_bid_block(&mut self) {
-        if let Some(payload) = self.simulator.best_bid_block(self.mining_ctx.parent_header.hash()) {
+        if let Some(task) = self.simulator.best_bid_block(self.mining_ctx.parent_header.hash()) {
             info!(
                 target: "bsc::miner::payload",
                 trace_id = self.trace_id,
-                payload_fees = %payload.fees(),
-                "Found best BidBlock payload"
+                bid_fees = %task.gas_fee,
+                bid_hash = %task.bid_hash,
+                builder = ?task.builder,
+                "Found best (unexecuted) BidBlock candidate"
             );
-            self.potential_payloads.push(payload);
+            self.bid_block_candidate = Some(task);
         }
     }
 
@@ -2222,11 +2235,85 @@ where
 
         self.collect_payload_candidates()?;
 
+        // BEP-675 zero-simulate selection (go-bsc `selectBidBlock`): if the unexecuted BidBlock's
+        // deposit-derived fee beats every local / legacy-SendBid candidate, commit to it. The block
+        // is broadcast immediately and only then executed + state-root-verified on import — the
+        // validator never re-executes before proposing. A losing BidBlock is simply dropped here.
+        if self.try_submit_winning_bid_block() {
+            return Ok(());
+        }
+
         let best_payload = self.pick_best_payload_and_finalize()?;
 
         self.submit_payload(best_payload)?;
 
         Ok(())
+    }
+
+    /// If a collected BidBlock candidate out-bids every local/legacy payload by fee, hand its sealed
+    /// block to the block-import service for broadcast-then-verify and return `true` (the local work
+    /// is then discarded, matching go-bsc's `commitWork` early-return after `enqueueBidBlockTask`).
+    ///
+    /// Returns `false` when there is no candidate, it does not win, or the import sender is missing —
+    /// in which case the caller falls back to submitting the best local payload.
+    fn try_submit_winning_bid_block(&mut self) -> bool {
+        let Some(bid) = self.bid_block_candidate.take() else { return false };
+
+        let best_local_fee =
+            self.potential_payloads.iter().map(|p| p.fees()).max().unwrap_or(U256::ZERO);
+        if bid.gas_fee <= best_local_fee {
+            info!(
+                target: "bsc::miner::payload",
+                trace_id = self.trace_id,
+                bid_hash = %bid.bid_hash,
+                bid_fees = %bid.gas_fee,
+                best_local_fee = %best_local_fee,
+                "BidBlock did not out-bid local candidates; discarding"
+            );
+            return false;
+        }
+
+        let Some(sender) = crate::shared::get_bid_block_import_sender() else {
+            warn!(
+                target: "bsc::miner::payload",
+                trace_id = self.trace_id,
+                bid_hash = %bid.bid_hash,
+                "BidBlock won but import sender is not initialised; falling back to local payload"
+            );
+            return false;
+        };
+
+        let sealed = bid.block.sealed_block().clone();
+        let block_number = sealed.header().number();
+        let block_hash = sealed.hash();
+        if let Err(e) = sender.send((sealed, bid.builder, bid.bid_hash)) {
+            warn!(
+                target: "bsc::miner::payload",
+                trace_id = self.trace_id,
+                bid_hash = %bid.bid_hash,
+                error = %e,
+                "Failed to hand BidBlock to import service; falling back to local payload"
+            );
+            return false;
+        }
+
+        use crate::metrics::BscMevMetrics;
+        use once_cell::sync::Lazy;
+        static MEV_METRICS: Lazy<BscMevMetrics> = Lazy::new(BscMevMetrics::default);
+        MEV_METRICS.bid_win_total.increment(1);
+
+        info!(
+            target: "bsc::miner::payload",
+            trace_id = self.trace_id,
+            block_number,
+            block_hash = %block_hash,
+            bid_hash = %bid.bid_hash,
+            builder = ?bid.builder,
+            bid_fees = %bid.gas_fee,
+            best_local_fee = %best_local_fee,
+            "[BID BLOCK selected] broadcasting before verification (zero-simulate)"
+        );
+        true
     }
 
     /// Send `payload` to the result channel, respecting the submission deadline.

@@ -11,7 +11,8 @@ use crate::{
 };
 use alloy_consensus::{BlockBody, Header};
 use alloy_eips::BlockNumberOrTag;
-use alloy_primitives::{B256, U128};
+use alloy_primitives::{Address, B256, U128};
+use reth_primitives_traits::SealedBlock;
 use alloy_rpc_types_engine::{ForkchoiceState, PayloadStatusEnum};
 use futures::{future::Either, stream::FuturesUnordered, StreamExt};
 use parking_lot::RwLock;
@@ -62,6 +63,13 @@ pub(crate) type IncomingBlock = (BlockMsg, PeerId);
 /// Channel message type for incoming mined blocks
 pub(crate) type IncomingMinedBlock = (BscBuiltPayload, BlockMsg);
 
+/// Channel message type for a selected (sealed, unexecuted) BEP-675 BidBlock.
+///
+/// Carries the sealed block plus the `(builder, bid_hash)` needed to revoke the builder if the
+/// block turns out to be invalid on import. Unlike [`IncomingMinedBlock`] there is no executed
+/// payload: under zero-simulate the validator broadcasts first and executes on import.
+pub(crate) type IncomingBidBlock = (SealedBlock<BscBlock>, Address, B256);
+
 /// Channel message type for incoming block hashes
 pub(crate) type IncomingHashes = (NewBlockHashes, PeerId);
 
@@ -94,6 +102,8 @@ where
     from_network: UnboundedReceiver<IncomingBlock>,
     /// Receive the new block from the network
     from_builder: UnboundedReceiver<IncomingMinedBlock>,
+    /// Receive selected (sealed, unexecuted) BEP-675 BidBlocks to broadcast-then-verify.
+    from_bid_block: UnboundedReceiver<IncomingBidBlock>,
     /// Receive block hashes from the network for downloading
     from_hashes: UnboundedReceiver<IncomingHashes>,
     /// Send the event of the import to the network
@@ -145,6 +155,7 @@ where
         engine: ConsensusEngineHandle<BscPayloadTypes>,
         from_network: UnboundedReceiver<IncomingBlock>,
         from_builder: UnboundedReceiver<IncomingMinedBlock>,
+        from_bid_block: UnboundedReceiver<IncomingBidBlock>,
         from_hashes: UnboundedReceiver<IncomingHashes>,
         to_network: UnboundedSender<ImportEvent>,
     ) -> Self {
@@ -159,6 +170,7 @@ where
             forkchoice_engine,
             from_network,
             from_builder,
+            from_bid_block,
             from_hashes,
             to_network,
             pending_imports: FuturesUnordered::new(),
@@ -467,6 +479,89 @@ where
             });
         }
         // Cache the block hash to avoid re-processing the same block.
+        self.processed_blocks.insert(block_hash);
+    }
+
+    /// Handle a selected BEP-675 BidBlock under zero-simulate: broadcast it to peers immediately,
+    /// then execute + state-root-verify it via the engine (the same path peer blocks take through
+    /// `new_payload`, i.e. go-bsc's `InsertChain`). On `Valid` the fork choice is advanced to make
+    /// it canonical; on `Invalid` the dishonest builder is revoked. Mirrors go-bsc
+    /// `handleBidBlockResult`: broadcast first, verify after, punish dishonesty.
+    fn on_new_bid_block(&mut self, sealed: SealedBlock<BscBlock>, builder: Address, bid_hash: B256) {
+        let block_hash = sealed.hash();
+        let header = sealed.header().clone();
+        let block_number = header.number;
+
+        // Total difficulty for the wire message: parent TD + this block's difficulty.
+        let parent_td = self
+            .forkchoice_engine
+            .provider
+            .header_td_by_number(block_number.saturating_sub(1))
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let new_td = parent_td + header.difficulty;
+
+        let new_block = BscNewBlock(NewBlock {
+            block: sealed.clone_block(),
+            td: U128::from(new_td.to::<u128>()),
+        });
+        let block_msg =
+            NewBlockMessage { hash: block_hash, block: Arc::new(new_block), td: Some(new_td) };
+
+        // Cache + register stats like a self-mined block so range responses and vote-delay metrics
+        // work for it (mirrors `on_new_mined_block`).
+        insert_header_to_cache_with_hash(header.clone(), Some(block_hash));
+        crate::shared::cache_full_block(block_msg.block.0.block.clone());
+        crate::consensus::parlia::block_stats::register_self_mined_block(block_hash, &header);
+
+        // 1. Broadcast first — before verification. go-bsc posts the sealed block, then runs
+        //    InsertChain. Announce header + full block so peers diffuse it immediately.
+        if let Err(e) = self.transfer_to_evn_peers(block_msg.clone()) {
+            tracing::warn!(target: "bsc::block_import", number = block_number, hash = %block_hash, error = %e, "BidBlock: failed to transfer to EVN peers");
+        }
+        let _ = self.to_network.send(BlockImportEvent::Announcement(
+            BlockValidation::ValidHeader { block: block_msg.clone() },
+        ));
+        let _ = self.to_network.send(BlockImportEvent::Announcement(
+            BlockValidation::ValidBlock { block: block_msg },
+        ));
+
+        // 2. Verify after: execute through the engine (state root, receipts, gas, blob proofs). On
+        //    Valid advance fork choice; on Invalid revoke the dishonest builder.
+        let engine = self.engine.clone();
+        let forkchoice_engine = self.forkchoice_engine.clone();
+        let payload = BscPayloadTypes::block_to_payload(sealed);
+        tokio::spawn(async move {
+            match engine.new_payload(payload).await {
+                Ok(status) => match status.status {
+                    PayloadStatusEnum::Valid => {
+                        tracing::info!(target: "bsc::block_import", number = block_number, hash = %block_hash, %bid_hash, "[BID BLOCK VERIFIED] advancing fork choice");
+                        if let Err(e) = forkchoice_engine.update_forkchoice(&header).await {
+                            tracing::warn!(target: "bsc::block_import", number = block_number, hash = %block_hash, error = %e, "BidBlock: failed to update fork choice");
+                        }
+                    }
+                    PayloadStatusEnum::Invalid { validation_error } => {
+                        tracing::error!(target: "bsc::block_import", number = block_number, hash = %block_hash, %bid_hash, %validation_error, "[BID BLOCK VERIFY FAILED] revoking builder");
+                        crate::shared::get_bid_block_permission_manager().revoke(
+                            builder,
+                            format!("BidBlock invalid on import: {validation_error}"),
+                            bid_hash,
+                            block_number,
+                        );
+                    }
+                    other => {
+                        // Parent is canonical (we just built on top of it), so Syncing/Accepted is
+                        // unexpected; log without revoking — not provable dishonesty.
+                        tracing::warn!(target: "bsc::block_import", number = block_number, hash = %block_hash, ?other, "BidBlock: unexpected non-terminal payload status");
+                    }
+                },
+                Err(err) => {
+                    tracing::error!(target: "bsc::block_import", number = block_number, hash = %block_hash, %bid_hash, error = %err, "BidBlock: engine.new_payload errored");
+                }
+            }
+        });
+
         self.processed_blocks.insert(block_hash);
     }
 
@@ -914,6 +1009,11 @@ where
             this.on_new_mined_block(payload, block_msg);
         }
 
+        // Receive selected BEP-675 BidBlocks: broadcast then verify-on-import.
+        while let Poll::Ready(Some((sealed, builder, bid_hash))) = this.from_bid_block.poll_recv(cx) {
+            this.on_new_bid_block(sealed, builder, bid_hash);
+        }
+
         // Receive new block hashes from network
         while let Poll::Ready(Some((hashes, peer_id))) = this.from_hashes.poll_recv(cx) {
             this.on_new_block_hashes(hashes, peer_id);
@@ -1284,6 +1384,7 @@ mod tests {
 
             let (to_import, from_network) = mpsc::unbounded_channel();
             let (to_import_mined, from_builder) = mpsc::unbounded_channel();
+            let (_to_import_bid, from_bid_block) = mpsc::unbounded_channel();
             let (to_hashes, from_hashes) = mpsc::unbounded_channel();
             let (to_network, import_outcome) = mpsc::unbounded_channel();
 
@@ -1295,6 +1396,7 @@ mod tests {
                 engine_handle,
                 from_network,
                 from_builder,
+                from_bid_block,
                 from_hashes,
                 to_network,
             );
@@ -1437,6 +1539,7 @@ mod tests {
 
         let (to_import, from_network) = mpsc::unbounded_channel();
         let (_to_import_mined, from_builder) = mpsc::unbounded_channel();
+        let (_to_import_bid, from_bid_block) = mpsc::unbounded_channel();
         let (to_hashes, from_hashes) = mpsc::unbounded_channel();
         let (to_network, import_outcome) = mpsc::unbounded_channel();
         let handle = ImportHandle::new(to_import, to_hashes, import_outcome);
@@ -1447,6 +1550,7 @@ mod tests {
             engine_handle,
             from_network,
             from_builder,
+            from_bid_block,
             from_hashes,
             to_network,
         );
