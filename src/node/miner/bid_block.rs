@@ -322,6 +322,66 @@ impl fmt::Display for BlobSidecarError {
 
 impl std::error::Error for BlobSidecarError {}
 
+/// Why a selected BidBlock's blob KZG proofs are invalid (see [`validate_bid_block_blob_kzg`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlobKzgError {
+    /// No sidecar present for the blob tx at `tx_index`.
+    MissingSidecar { tx_index: usize },
+    /// KZG proof / versioned-hash verification failed for the blob tx at `tx_index`.
+    Invalid { tx_index: usize, detail: String },
+}
+
+impl fmt::Display for BlobKzgError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingSidecar { tx_index } => {
+                write!(f, "missing sidecar for blob tx at index {tx_index}")
+            }
+            Self::Invalid { tx_index, detail } => {
+                write!(f, "blob KZG invalid for tx at index {tx_index}: {detail}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for BlobKzgError {}
+
+/// Verify EIP-4844 KZG proofs for a selected BidBlock's blob txs (go-bsc `validateBidBlockBlobTxs`
+/// → `txpool.ValidateBlobTx`).
+///
+/// This is the **expensive** proof check that the cheap admission-time
+/// [`validate_bid_block_blob_sidecars`] deliberately skips (it only checks structural sidecar
+/// invariants). go-bsc runs it in `prepareBidBlockTask` — on the *selected* block, *before* sealing
+/// and broadcast — and revokes the builder on failure. Under zero-simulate it must run before the
+/// block is broadcast, since full re-execution (which would also catch a bad blob) is deferred to
+/// after broadcast. Each blob tx in the user-tx region (`txs[..system_tx_start]`) is paired in order
+/// with the next sidecar and its commitments/proofs are verified against the tx's versioned hashes.
+pub fn validate_bid_block_blob_kzg(
+    txs: &[TransactionSigned],
+    sidecars: &[BscBlobTransactionSidecar],
+    system_tx_start: usize,
+) -> Result<(), BlobKzgError> {
+    let proof_settings = alloy_eips::eip4844::env_settings::EnvKzgSettings::Default;
+    let proof_settings = proof_settings.get();
+    let end = system_tx_start.min(txs.len());
+    let mut sidecar_index = 0usize;
+    for (tx_index, tx) in txs[..end].iter().enumerate() {
+        if !tx.is_eip4844() {
+            continue;
+        }
+        let Some(sidecar) = sidecars.get(sidecar_index) else {
+            return Err(BlobKzgError::MissingSidecar { tx_index });
+        };
+        let versioned = tx.blob_versioned_hashes().unwrap_or(&[]);
+        sidecar
+            .inner
+            .validate(versioned, proof_settings)
+            .map_err(|e| BlobKzgError::Invalid { tx_index, detail: e.to_string() })?;
+        sidecar_index += 1;
+    }
+    Ok(())
+}
+
 /// Pre-seal verification of an admitted BidBlock (go-bsc `bidSimulator.preSealVerifyBidBlock`).
 ///
 /// Runs the cheap checks a validator makes before sealing a builder block, in go-bsc's order:

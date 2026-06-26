@@ -9,7 +9,7 @@ use crate::node::engine::{BscBuiltPayload, BuildKind};
 use crate::node::evm::config::{BscEvmConfig, BscNextBlockEnvAttributes, ValidatorCacheSink};
 use crate::node::evm::pre_execution::{TURN_LENGTH_CACHE, VALIDATOR_CACHE};
 use crate::node::evm::{request_difflayer, MinerTrieDbPrefetcher};
-use crate::node::miner::bid_block::BidBlockTask;
+use crate::node::miner::bid_block::{validate_bid_block_blob_kzg, BidBlockTask};
 use crate::node::miner::bid_simulator::BidSimulator;
 use crate::node::miner::bsc_miner::{MiningContext, SubmitContext};
 use crate::node::miner::util::finalize_new_header;
@@ -2273,6 +2273,37 @@ where
             return false;
         }
 
+        let sealed = bid.block.sealed_block().clone();
+        let block_number = sealed.header().number();
+        let block_hash = sealed.hash();
+
+        // Expensive blob KZG verification on the winning block, BEFORE broadcast (go-bsc
+        // `prepareBidBlockTask` → `validateBidBlockBlobTxs`). Cheap structural sidecar checks already
+        // ran at admission; under zero-simulate full re-execution is deferred to after broadcast, so
+        // this is the last gate that can stop a bad-blob block from being proposed. On failure revoke
+        // the builder and fall back to the local payload (go-bsc `bidBlockFallback`).
+        let body = sealed.body();
+        let blob_sidecars = body.sidecars.as_deref().unwrap_or(&[]);
+        if let Err(e) =
+            validate_bid_block_blob_kzg(&body.inner.transactions, blob_sidecars, bid.system_tx_start)
+        {
+            warn!(
+                target: "bsc::miner::payload",
+                trace_id = self.trace_id,
+                bid_hash = %bid.bid_hash,
+                builder = ?bid.builder,
+                error = %e,
+                "BidBlock blob KZG validation failed; revoking builder and falling back to local payload"
+            );
+            crate::shared::get_bid_block_permission_manager().revoke(
+                bid.builder,
+                format!("BidBlock blob KZG invalid: {e}"),
+                bid.bid_hash,
+                block_number,
+            );
+            return false;
+        }
+
         let Some(sender) = crate::shared::get_bid_block_import_sender() else {
             warn!(
                 target: "bsc::miner::payload",
@@ -2282,10 +2313,6 @@ where
             );
             return false;
         };
-
-        let sealed = bid.block.sealed_block().clone();
-        let block_number = sealed.header().number();
-        let block_hash = sealed.hash();
         if let Err(e) = sender.send((sealed, bid.builder, bid.bid_hash)) {
             warn!(
                 target: "bsc::miner::payload",
