@@ -217,7 +217,9 @@ impl BscHardfork {
             (Self::Maxwell.boxed(), ForkCondition::Timestamp(1754967101)),
             (Self::Fermi.boxed(), ForkCondition::Timestamp(1761030900)),
             // TODO: real activation TBD; unscheduled (u64::MAX) until announced.
-            (Self::Pasteur.boxed(), ForkCondition::Timestamp(u64::MAX)),
+            (Self::Osaka.boxed(), ForkCondition::Timestamp(1782779200)),
+            (Self::Mendel.boxed(), ForkCondition::Timestamp(1782779300)),
+            (Self::Pasteur.boxed(), ForkCondition::Timestamp(1782779400)),
         ])
     }
 
@@ -293,11 +295,9 @@ mod tests {
 
     #[test]
     fn test_pasteur_present_but_unscheduled_in_schedules() {
-        for hardforks in [
-            BscHardfork::bsc_mainnet(),
-            BscHardfork::bsc_testnet(),
-            BscHardfork::bsc_qanet(),
-        ] {
+        for hardforks in
+            [BscHardfork::bsc_mainnet(), BscHardfork::bsc_testnet(), BscHardfork::bsc_qanet()]
+        {
             let activation = hardforks.fork(BscHardfork::Pasteur);
             assert_eq!(
                 activation,
