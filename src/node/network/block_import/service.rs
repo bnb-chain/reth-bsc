@@ -149,6 +149,7 @@ where
         + 'static,
 {
     /// Create a new block import service
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         provider: Provider,
         chain_spec: Arc<BscChainSpec>,
