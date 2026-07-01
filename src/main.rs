@@ -438,8 +438,7 @@ fn main() -> eyre::Result<()> {
 
                         tracing::info!("Start to register eth_config (EIP-7910) API...");
                         use reth::api::FullNodeComponents;
-                        use reth_bsc::rpc::BscEthConfigHandler;
-                        use reth_rpc_eth_api::helpers::config::EthConfigApiServer;
+                        use reth_bsc::rpc::{BscEthConfigApiServer, BscEthConfigHandler};
                         use reth_rpc_server_types::RethRpcModule;
 
                         let eth_config = BscEthConfigHandler::new(
