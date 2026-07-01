@@ -191,6 +191,17 @@ This client implements the BSC upgrade-status handshake extension. When EVN is e
 
 Note: This currently affects the outgoing handshake signaling. Further EVN behaviors (e.g., peer whitelists, conditional broadcast policies) can be added incrementally.
 
+## Storage migration (v1 → v2)
+
+Existing nodes on the legacy v1 storage layout can upgrade to the v2 layout
+(static files + RocksDB) with a one-time migration:
+
+```bash
+./target/release/reth-bsc db migrate-v2 --chain bsc --datadir ./data_dir
+```
+
+See [MIGRATE_V2.md](MIGRATE_V2.md) for the full guide — what it does, requirements, verification, and troubleshooting.
+
 ## Contributing
 
 We welcome community contributions! Please feel free to open issues or submit pull requests.
