@@ -217,9 +217,7 @@ impl BscHardfork {
             (Self::Maxwell.boxed(), ForkCondition::Timestamp(1754967101)),
             (Self::Fermi.boxed(), ForkCondition::Timestamp(1761030900)),
             // TODO: real activation TBD; unscheduled (u64::MAX) until announced.
-            (Self::Osaka.boxed(), ForkCondition::Timestamp(1782779200)),
-            (Self::Mendel.boxed(), ForkCondition::Timestamp(1782779300)),
-            (Self::Pasteur.boxed(), ForkCondition::Timestamp(1782779400)),
+            (Self::Pasteur.boxed(), ForkCondition::Timestamp(u64::MAX)),
         ])
     }
 
