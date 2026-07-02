@@ -1232,6 +1232,23 @@ impl BscMevApiServer for MevApiImpl {
     async fn params(&self) -> RpcResult<MevParams> {
         tracing::debug!("MEV params requested");
 
+        // Mirrors go-bsc's `Miner.bidBlockEnabled()`: MEV running AND the BidBlockEnabled flag
+        // AND Pasteur active at the chain head — dynamic, not a static echo of the config flag,
+        // so a builder never sees `BidBlockEnabled: true` right before every submission is
+        // rejected with "disabled" for not-yet-being-past Pasteur. Falls back to `false` if the
+        // chain head isn't available yet (e.g. still syncing at startup) rather than failing the
+        // whole `params()` call.
+        let pasteur_active = crate::shared::get_best_canonical_block_number()
+            .and_then(|n| self.get_header_by_number(n))
+            .is_some_and(|head| {
+                self.chain_spec.is_pasteur_active_at_timestamp(head.number, head.timestamp)
+            });
+        let bid_block_enabled = bid_block_admission_enabled(
+            crate::shared::is_mev_running(),
+            self.bid_block_enabled,
+            pasteur_active,
+        );
+
         Ok(MevParams {
             validator_commission: self.validator_commission,
             // Convert milliseconds to nanoseconds (1ms = 1,000,000 ns)
@@ -1241,7 +1258,7 @@ impl BscMevApiServer for MevApiImpl {
             gas_ceil: self.gas_ceil,
             gas_price: self.min_gas_price,
             builder_fee_ceil: self.builder_fee_ceil,
-            bid_block_enabled: self.bid_block_enabled,
+            bid_block_enabled,
             version: self.version.clone(),
         })
     }
