@@ -120,6 +120,79 @@ where
     }
 }
 
+/// JSON wire shape of go-bsc's `BidBlockPermissionResult` (`internal/ethapi/api_mev.go`): the
+/// detail fields are omitted entirely when `allowed` is true, matching Go's `omitempty` tags.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BidBlockPermissionResult {
+    pub allowed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_hash: Option<B256>,
+    /// Hex-quantity block number (e.g. `"0x64"`), matching go-bsc's `hexutil.Uint64`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_number: Option<String>,
+    /// RFC 3339 UTC timestamp, matching Go's default `time.Time` JSON marshaling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revoked_at: Option<String>,
+    /// RFC 3339 UTC timestamp, matching Go's default `time.Time` JSON marshaling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reset_at: Option<String>,
+}
+
+impl From<crate::node::miner::bid_block_permission::BidBlockPermissionStatus>
+    for BidBlockPermissionResult
+{
+    fn from(status: crate::node::miner::bid_block_permission::BidBlockPermissionStatus) -> Self {
+        if status.allowed {
+            return Self {
+                allowed: true,
+                reason: None,
+                block_hash: None,
+                block_number: None,
+                revoked_at: None,
+                reset_at: None,
+            };
+        }
+        Self {
+            allowed: false,
+            reason: Some(status.reason),
+            block_hash: Some(status.block_hash),
+            block_number: Some(format!("0x{:x}", status.block_num)),
+            revoked_at: Some(unix_secs_to_rfc3339_utc(status.revoked_at)),
+            reset_at: Some(unix_secs_to_rfc3339_utc(status.reset_at)),
+        }
+    }
+}
+
+/// Formats a Unix timestamp (UTC, whole seconds) as an RFC 3339 string (`"2024-01-15T10:30:04Z"`),
+/// matching the shape Go's `time.Time.MarshalJSON` produces for `revokedAt`/`resetAt`. Avoids a
+/// date/time dependency for what is otherwise the only place this repo needs one.
+fn unix_secs_to_rfc3339_utc(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let secs_of_day = secs % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    let (hour, min, sec) = (secs_of_day / 3600, (secs_of_day % 3600) / 60, secs_of_day % 60);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}Z")
+}
+
+/// Converts a day count since the Unix epoch (1970-01-01) into a (year, month, day) civil date.
+/// Howard Hinnant's `civil_from_days` algorithm: <http://howardhinnant.github.io/date_algorithms.html#civil_from_days>.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    let year = if month <= 2 { y + 1 } else { y };
+    (year, month, day)
+}
+
 /// Custom MEV API server trait - only includes send_bid to avoid conflicts with reth's default MEV API
 #[rpc(server, namespace = "mev")]
 pub trait BscMevApi {
@@ -150,6 +223,11 @@ pub trait BscMevApi {
     /// Remove a builder from the whitelist
     #[method(name = "removeBuilder")]
     async fn remove_builder(&self, builder: Address) -> RpcResult<bool>;
+
+    /// Query a builder's current BEP-675 `SendBidBlock` permission (go-bsc
+    /// `MevAPI.GetBidBlockPermission`): whether it's allowed, and if not, why and when it resets.
+    #[method(name = "getBidBlockPermission")]
+    async fn get_bid_block_permission(&self, builder: Address) -> RpcResult<BidBlockPermissionResult>;
 }
 
 const PAY_BID_TX_GAS_LIMIT: u64 = 25000;
@@ -1158,6 +1236,15 @@ impl BscMevApiServer for MevApiImpl {
         }
         Ok(removed)
     }
+
+    /// Query a builder's current BidBlock permission status.
+    async fn get_bid_block_permission(
+        &self,
+        builder: Address,
+    ) -> RpcResult<BidBlockPermissionResult> {
+        let status = crate::shared::get_bid_block_permission_manager().get_status(builder);
+        Ok(status.into())
+    }
 }
 
 #[cfg(test)]
@@ -1248,5 +1335,58 @@ mod bid_block_param_tests {
         // admission window instead of being already in the past.
         assert!(deadline > parent_timestamp_ms as u128);
         assert_eq!(deadline, parent_timestamp_ms as u128 + fermi_block_interval_ms as u128 - 15);
+    }
+
+    #[test]
+    fn unix_secs_to_rfc3339_matches_known_dates() {
+        // 2024-01-15T10:30:04Z
+        assert_eq!(super::unix_secs_to_rfc3339_utc(1_705_314_604), "2024-01-15T10:30:04Z");
+        // The Unix epoch itself.
+        assert_eq!(super::unix_secs_to_rfc3339_utc(0), "1970-01-01T00:00:00Z");
+        // 2000-02-29 exercises the leap-year branch of civil_from_days.
+        assert_eq!(super::unix_secs_to_rfc3339_utc(951_782_400), "2000-02-29T00:00:00Z");
+        // 2024-12-31T23:59:59Z, the last second of a leap year.
+        assert_eq!(super::unix_secs_to_rfc3339_utc(1_735_689_599), "2024-12-31T23:59:59Z");
+    }
+
+    #[test]
+    fn bid_block_permission_result_omits_details_when_allowed() {
+        use crate::node::miner::bid_block_permission::BidBlockPermissionStatus;
+
+        let result: BidBlockPermissionResult =
+            BidBlockPermissionStatus { allowed: true, ..Default::default() }.into();
+        let json = serde_json::to_value(&result).unwrap();
+
+        assert_eq!(json["allowed"], true);
+        // go-bsc's `omitempty` tags drop these entirely when allowed; a builder-facing client
+        // must not see stale/zeroed detail fields for the common "not revoked" case.
+        assert!(json.get("reason").is_none());
+        assert!(json.get("blockHash").is_none());
+        assert!(json.get("blockNumber").is_none());
+        assert!(json.get("revokedAt").is_none());
+        assert!(json.get("resetAt").is_none());
+    }
+
+    #[test]
+    fn bid_block_permission_result_matches_geth_wire_shape_when_revoked() {
+        use crate::node::miner::bid_block_permission::BidBlockPermissionStatus;
+
+        let status = BidBlockPermissionStatus {
+            allowed: false,
+            reason: "InsertChain err: state root mismatch".to_string(),
+            block_hash: B256::repeat_byte(0xab),
+            block_num: 100,
+            revoked_at: 1_705_314_604,
+            reset_at: 1_705_401_004,
+        };
+        let json = serde_json::to_value(BidBlockPermissionResult::from(status)).unwrap();
+
+        assert_eq!(json["allowed"], false);
+        assert_eq!(json["reason"], "InsertChain err: state root mismatch");
+        assert_eq!(json["blockHash"], format!("{:#x}", B256::repeat_byte(0xab)));
+        // Hex-quantity, matching go-bsc's hexutil.Uint64 — not a plain JSON number.
+        assert_eq!(json["blockNumber"], "0x64");
+        assert_eq!(json["revokedAt"], "2024-01-15T10:30:04Z");
+        assert_eq!(json["resetAt"], "2024-01-16T10:30:04Z");
     }
 }

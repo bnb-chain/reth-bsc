@@ -437,6 +437,13 @@ fn main() -> eyre::Result<()> {
                         ctx.modules.merge_configured(eth_ext_api.into_rpc())?;
                         tracing::info!("Succeed to register BSC Eth extension API");
 
+                        tracing::info!("Start to register BSC Admin RPC API (admin_setBidBlockPermission)...");
+                        use reth_bsc::rpc::admin::{BscAdminApiImpl, BscAdminApiServer};
+
+                        let admin_api = BscAdminApiImpl::new();
+                        ctx.modules.merge_configured(admin_api.into_rpc())?;
+                        tracing::info!("Succeed to register BSC Admin RPC API");
+
                         tracing::info!("Start to register Blob RPC API...");
                         use reth_bsc::rpc::blob::{BlobApiImpl, BlobApiServer};
 
