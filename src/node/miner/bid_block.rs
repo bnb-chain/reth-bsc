@@ -434,6 +434,48 @@ pub fn validate_bid_block_blob_kzg(
     Ok(())
 }
 
+/// Sum of per-tx gas used over a BidBlock's non-system-tx region `receipts[..system_tx_start]` —
+/// go-bsc's `calcNonSystemGasUsed`. Reth/alloy receipts only carry `cumulative_gas_used` (there is
+/// no stored per-tx figure), but since cumulative gas used is monotonic from the block's first tx,
+/// summing each receipt's per-tx gas over `[0, system_tx_start)` telescopes to the last
+/// non-system receipt's cumulative total — so no explicit summation loop is needed.
+pub fn non_system_gas_used<R: alloy_consensus::TxReceipt>(
+    receipts: &[R],
+    system_tx_start: usize,
+) -> u64 {
+    if system_tx_start == 0 {
+        return 0;
+    }
+    receipts.get(system_tx_start - 1).map(|r| r.cumulative_gas_used()).unwrap_or(0)
+}
+
+/// Post-import average-gas-price floor check (go-bsc `validateBidBlockAverageGasPrice`), run once
+/// `new_payload` confirms the BidBlock is valid. The deposit-derived `gas_fee` the bid was selected
+/// on is the sole source of the fee ranking; without this check a builder could pad it via the
+/// system deposit while filling the user-tx region with near-zero-gas-price transactions. This does
+/// **not** reject the (already-canonical) block — it only informs whether to revoke the builder's
+/// future `SendBidBlock` permission.
+///
+/// Returns `Ok(())` when there's no non-system gas used to check (matching go-bsc's `gasUsed == 0`
+/// early return — avoids a division by zero) or the average clears `min_gas_price`; otherwise
+/// `Err(avg_gas_price)`.
+pub fn validate_bid_block_average_gas_price<R: alloy_consensus::TxReceipt>(
+    gas_fee: U256,
+    receipts: &[R],
+    system_tx_start: usize,
+    min_gas_price: U256,
+) -> Result<(), U256> {
+    let gas_used = non_system_gas_used(receipts, system_tx_start);
+    if gas_used == 0 {
+        return Ok(());
+    }
+    let avg_gas_price = gas_fee / U256::from(gas_used);
+    if avg_gas_price < min_gas_price {
+        return Err(avg_gas_price);
+    }
+    Ok(())
+}
+
 /// Pre-seal verification of an admitted BidBlock (go-bsc `bidSimulator.preSealVerifyBidBlock`).
 ///
 /// Runs the cheap checks a validator makes before sealing a builder block, in go-bsc's order:
@@ -1088,6 +1130,83 @@ mod tests {
             validate_bid_block_blob_kzg(&[tx], &[sidecar], 1),
             Err(BlobKzgError::Invalid { tx_index: 0, .. })
         ));
+    }
+
+    // ---- validate_bid_block_average_gas_price / non_system_gas_used (post-import floor check) ----
+
+    fn receipt_with_cumulative_gas(cumulative_gas_used: u64) -> alloy_consensus::Receipt {
+        alloy_consensus::Receipt {
+            status: alloy_consensus::Eip658Value::Eip658(true),
+            cumulative_gas_used,
+            logs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn non_system_gas_used_reads_last_non_system_receipt() {
+        // Sum of per-tx gas over receipts[..system_tx_start] telescopes to the cumulative total at
+        // system_tx_start - 1, regardless of what the trailing (system) receipts' totals are.
+        let receipts = vec![
+            receipt_with_cumulative_gas(21_000),
+            receipt_with_cumulative_gas(50_000),
+            receipt_with_cumulative_gas(9_999_999), // trailing system tx: must not count
+        ];
+        assert_eq!(non_system_gas_used(&receipts, 2), 50_000);
+    }
+
+    #[test]
+    fn non_system_gas_used_is_zero_when_system_tx_start_is_zero() {
+        // Matches go-bsc: systemTxStart == 0 means no user txs at all.
+        let receipts = vec![receipt_with_cumulative_gas(21_000)];
+        assert_eq!(non_system_gas_used(&receipts, 0), 0);
+    }
+
+    #[test]
+    fn validate_average_gas_price_accepts_at_or_above_floor() {
+        // gas_fee=1_050_000 over 50_000 gas => avg=21 (integer division), clears a floor of 21.
+        let receipts = vec![receipt_with_cumulative_gas(21_000), receipt_with_cumulative_gas(50_000)];
+        assert_eq!(
+            validate_bid_block_average_gas_price(U256::from(1_050_000), &receipts, 2, U256::from(21)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn validate_average_gas_price_rejects_below_floor() {
+        // gas_fee=1_000 over 50_000 gas => avg=0, below any positive floor.
+        let receipts = vec![receipt_with_cumulative_gas(21_000), receipt_with_cumulative_gas(50_000)];
+        assert_eq!(
+            validate_bid_block_average_gas_price(U256::from(1_000), &receipts, 2, U256::from(1)),
+            Err(U256::ZERO)
+        );
+    }
+
+    #[test]
+    fn validate_average_gas_price_skips_check_when_no_non_system_gas_used() {
+        // Matches go-bsc's `gasUsed == 0` early return: avoids a division by zero and simply
+        // passes when there is nothing to check (e.g. a BidBlock with only system txs).
+        let receipts = vec![receipt_with_cumulative_gas(9_999_999)];
+        assert_eq!(
+            validate_bid_block_average_gas_price(U256::ZERO, &receipts, 0, U256::from(1_000_000)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn validate_average_gas_price_ignores_trailing_system_tx_gas() {
+        // A huge trailing system-tx gas total must not dilute the average — go-bsc excludes it via
+        // `receipts[:systemTxStart]`, and a builder must not be able to hide an underpriced
+        // user-tx region behind expensive system txs.
+        let receipts = vec![
+            receipt_with_cumulative_gas(21_000),
+            receipt_with_cumulative_gas(9_021_000), // system tx: consumes ~9M gas on its own
+        ];
+        // If the system-tx gas were (wrongly) included, avg = fee / 9_021_000 would clear any
+        // reasonable floor; excluding it correctly, avg = fee / 21_000 must still fail low floors.
+        assert_eq!(
+            validate_bid_block_average_gas_price(U256::from(1_000), &receipts, 1, U256::from(1)),
+            Err(U256::ZERO)
+        );
     }
 
     // ---- pre_seal_verify_bid_block ----

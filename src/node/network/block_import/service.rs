@@ -11,7 +11,7 @@ use crate::{
 };
 use alloy_consensus::{BlockBody, Header};
 use alloy_eips::BlockNumberOrTag;
-use alloy_primitives::{Address, B256, U128};
+use alloy_primitives::{Address, B256, U128, U256};
 use reth_primitives_traits::SealedBlock;
 use alloy_rpc_types_engine::{ForkchoiceState, PayloadStatusEnum};
 use futures::{future::Either, stream::FuturesUnordered, StreamExt};
@@ -36,7 +36,9 @@ use reth_payload_builder_primitives::Events;
 use reth_payload_primitives::{BuiltPayload, PayloadTypes};
 use reth_primitives_traits::NodePrimitives;
 use reth_primitives_traits::{AlloyBlockHeader, Block};
-use reth_provider::{BlockHashReader, BlockNumReader, BlockReaderIdExt, HeaderProvider};
+use reth_provider::{
+    BlockHashReader, BlockNumReader, BlockReaderIdExt, HeaderProvider, ReceiptProvider,
+};
 use std::{
     future::Future,
     pin::Pin,
@@ -66,9 +68,13 @@ pub(crate) type IncomingMinedBlock = (BscBuiltPayload, BlockMsg);
 /// Channel message type for a selected (sealed, unexecuted) BEP-675 BidBlock.
 ///
 /// Carries the sealed block plus the `(builder, bid_hash)` needed to revoke the builder if the
-/// block turns out to be invalid on import. Unlike [`IncomingMinedBlock`] there is no executed
-/// payload: under zero-simulate the validator broadcasts first and executes on import.
-pub(crate) type IncomingBidBlock = (SealedBlock<BscBlock>, Address, B256);
+/// block turns out to be invalid on import, and `(gas_fee, system_tx_start)` needed for the
+/// post-import average-gas-price floor check (go-bsc `validateBidBlockAverageGasPrice`) — the
+/// deposit-derived fee the bid was selected on, and the index where the trailing (unsigned,
+/// bind-signed) system-tx region begins, so the check can exclude system-tx gas from the average.
+/// Unlike [`IncomingMinedBlock`] there is no executed payload: under zero-simulate the validator
+/// broadcasts first and executes on import.
+pub(crate) type IncomingBidBlock = (SealedBlock<BscBlock>, Address, B256, U256, usize);
 
 /// Channel message type for incoming block hashes
 pub(crate) type IncomingHashes = (NewBlockHashes, PeerId);
@@ -143,6 +149,7 @@ where
     Provider: BlockNumReader
         + BlockHashReader
         + HeaderProvider<Header = Header>
+        + ReceiptProvider
         + Clone
         + Send
         + Sync
@@ -488,7 +495,14 @@ where
     /// `new_payload`, i.e. go-bsc's `InsertChain`). On `Valid` the fork choice is advanced to make
     /// it canonical; on `Invalid` the dishonest builder is revoked. Mirrors go-bsc
     /// `handleBidBlockResult`: broadcast first, verify after, punish dishonesty.
-    fn on_new_bid_block(&mut self, sealed: SealedBlock<BscBlock>, builder: Address, bid_hash: B256) {
+    fn on_new_bid_block(
+        &mut self,
+        sealed: SealedBlock<BscBlock>,
+        builder: Address,
+        bid_hash: B256,
+        gas_fee: U256,
+        system_tx_start: usize,
+    ) {
         let block_hash = sealed.hash();
         let header = sealed.header().clone();
         let block_number = header.number;
@@ -538,6 +552,56 @@ where
                 Ok(status) => match status.status {
                     PayloadStatusEnum::Valid => {
                         tracing::info!(target: "bsc::block_import", number = block_number, hash = %block_hash, %bid_hash, "[BID BLOCK VERIFIED] advancing fork choice");
+
+                        // Post-import average-gas-price floor check (go-bsc
+                        // `validateBidBlockAverageGasPrice`), run now that the block is confirmed
+                        // valid. This does not reject the (already-canonical) block — it only
+                        // affects the builder's future SendBidBlock permission, since the
+                        // deposit-derived `gas_fee` is the sole source of the fee ranking and a
+                        // builder could otherwise pad it while underpaying for user-tx gas.
+                        match forkchoice_engine.provider.receipts_by_block(block_hash.into()) {
+                            Ok(Some(receipts)) => {
+                                // Mirrors the fallback `MevApiImpl::new` uses when the CLI/env
+                                // hasn't published a global config yet: fall through to env vars
+                                // (and ultimately `DEFAULT_MIN_GAS_TIP`) rather than treating
+                                // "unset" as "no floor at all".
+                                let min_gas_price = U256::from(
+                                    crate::node::miner::config::get_global_mining_config()
+                                        .map(|cfg| cfg.get_min_gas_tip())
+                                        .unwrap_or_else(|| {
+                                            crate::node::miner::config::MiningConfig::from_env()
+                                                .get_min_gas_tip()
+                                        }),
+                                );
+                                if let Err(avg_gas_price) =
+                                    crate::node::miner::bid_block::validate_bid_block_average_gas_price(
+                                        gas_fee,
+                                        &receipts,
+                                        system_tx_start,
+                                        min_gas_price,
+                                    )
+                                {
+                                    let revoke_duration_secs = crate::node::miner::bid_block_permission::BID_BLOCK_GAS_PRICE_LOW_REVOKE_DURATION_SECS;
+                                    tracing::error!(target: "bsc::block_import", number = block_number, hash = %block_hash, %bid_hash, %avg_gas_price, %min_gas_price, revoke_duration_secs, "[BID BLOCK GASPRICE LOW] revoking builder");
+                                    crate::shared::get_bid_block_permission_manager().revoke_for(
+                                        builder,
+                                        format!(
+                                            "BidBlock average gas price too low: avg={avg_gas_price}, min={min_gas_price}"
+                                        ),
+                                        block_hash,
+                                        block_number,
+                                        revoke_duration_secs,
+                                    );
+                                }
+                            }
+                            Ok(None) => {
+                                tracing::warn!(target: "bsc::block_import", number = block_number, hash = %block_hash, "BidBlock: receipts not found post-import; skipping gas-price check");
+                            }
+                            Err(e) => {
+                                tracing::warn!(target: "bsc::block_import", number = block_number, hash = %block_hash, error = %e, "BidBlock: failed to fetch receipts for gas-price check");
+                            }
+                        }
+
                         if let Err(e) = forkchoice_engine.update_forkchoice(&header).await {
                             tracing::warn!(target: "bsc::block_import", number = block_number, hash = %block_hash, error = %e, "BidBlock: failed to update fork choice");
                         }
@@ -989,6 +1053,7 @@ where
     Provider: BlockNumReader
         + BlockHashReader
         + HeaderProvider<Header = Header>
+        + ReceiptProvider
         + Clone
         + Send
         + Sync
@@ -1011,8 +1076,10 @@ where
         }
 
         // Receive selected BEP-675 BidBlocks: broadcast then verify-on-import.
-        while let Poll::Ready(Some((sealed, builder, bid_hash))) = this.from_bid_block.poll_recv(cx) {
-            this.on_new_bid_block(sealed, builder, bid_hash);
+        while let Poll::Ready(Some((sealed, builder, bid_hash, gas_fee, system_tx_start))) =
+            this.from_bid_block.poll_recv(cx)
+        {
+            this.on_new_bid_block(sealed, builder, bid_hash, gas_fee, system_tx_start);
         }
 
         // Receive new block hashes from network
@@ -1068,7 +1135,7 @@ mod tests {
     use reth_chainspec::ChainInfo;
     use reth_engine_primitives::{BeaconEngineMessage, OnForkChoiceUpdated};
     use reth_eth_wire::NewBlock;
-    use reth_ethereum_primitives::Block;
+    use reth_ethereum_primitives::{Block, Receipt};
     use reth_node_ethereum::EthEngineTypes;
     use reth_primitives_traits::SealedHeader;
     use reth_provider::ProviderError;
@@ -1228,7 +1295,10 @@ mod tests {
         let pm = crate::shared::get_bid_block_permission_manager();
         assert!(pm.is_allowed(builder), "builder should start allowed");
 
-        fixture.bid_tx.send((create_bid_sealed_block(1), builder, bid_hash)).unwrap();
+        fixture
+            .bid_tx
+            .send((create_bid_sealed_block(1), builder, bid_hash, U256::ZERO, 0))
+            .unwrap();
 
         // 1. Broadcast-first: a full-block (ValidBlock) announcement is emitted.
         let waker = futures::task::noop_waker();
@@ -1259,6 +1329,92 @@ mod tests {
         assert!(!pm.is_allowed(builder), "builder must be revoked after Invalid verification");
     }
 
+    #[tokio::test]
+    async fn bid_block_low_average_gas_price_revokes() {
+        // Post-import average-gas-price floor check (go-bsc `validateBidBlockAverageGasPrice`):
+        // a Valid BidBlock whose deposit-derived gas_fee implies an average price below the
+        // validator's floor must still get canonicalized (it already passed InsertChain-equivalent
+        // verification) but must revoke the builder's *future* SendBidBlock permission.
+        let sealed = create_bid_sealed_block(1);
+        let block_hash = sealed.hash();
+
+        let mut provider = MockProvider::new();
+        // gas_fee = 0 over 21_000 non-system gas => avg = 0, below any positive floor (including
+        // the compiled-in DEFAULT_MIN_GAS_TIP the test process falls back to).
+        provider.insert_receipts(
+            block_hash,
+            vec![Receipt {
+                tx_type: alloy_consensus::TxType::Legacy,
+                success: true,
+                cumulative_gas_used: 21_000,
+                logs: Vec::new(),
+            }],
+        );
+
+        let mut fixture =
+            TestFixture::new_with_provider(EngineResponses::both_valid(), provider).await;
+
+        let builder = Address::repeat_byte(0x7f);
+        let bid_hash = B256::repeat_byte(0xb2);
+        let pm = crate::shared::get_bid_block_permission_manager();
+        assert!(pm.is_allowed(builder), "builder should start allowed");
+
+        // system_tx_start = 1: the single receipt above is the entire non-system-tx region.
+        fixture.bid_tx.send((sealed, builder, bid_hash, U256::ZERO, 1)).unwrap();
+
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
+        while pm.is_allowed(builder) && tokio::time::Instant::now() < deadline {
+            let _ = fixture.handle.poll_outcome(&mut cx);
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        }
+        assert!(!pm.is_allowed(builder), "builder must be revoked for a too-low average gas price");
+    }
+
+    #[tokio::test]
+    async fn bid_block_sufficient_average_gas_price_does_not_revoke() {
+        // Regression guard for the check above: a BidBlock whose average gas price clears the
+        // floor must not be revoked, even though it goes through the exact same code path.
+        let sealed = create_bid_sealed_block(1);
+        let block_hash = sealed.hash();
+
+        let mut provider = MockProvider::new();
+        provider.insert_receipts(
+            block_hash,
+            vec![Receipt {
+                tx_type: alloy_consensus::TxType::Legacy,
+                success: true,
+                cumulative_gas_used: 21_000,
+                logs: Vec::new(),
+            }],
+        );
+
+        let mut fixture =
+            TestFixture::new_with_provider(EngineResponses::both_valid(), provider).await;
+
+        let builder = Address::repeat_byte(0x80);
+        let bid_hash = B256::repeat_byte(0xb3);
+        let pm = crate::shared::get_bid_block_permission_manager();
+        assert!(pm.is_allowed(builder), "builder should start allowed");
+
+        // gas_fee well above 21_000 * DEFAULT_MIN_GAS_TIP (21_000 * 50_000_000) clears the floor
+        // with room to spare regardless of whatever the test process's ambient config resolves to.
+        let gas_fee = U256::from(21_000u64) * U256::from(1_000_000_000_000u64);
+        fixture.bid_tx.send((sealed, builder, bid_hash, gas_fee, 1)).unwrap();
+
+        // There's no state change to poll for in the non-revoked case; give the spawned
+        // verify-then-check task ample time to run, then assert nothing happened.
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(500);
+        while tokio::time::Instant::now() < deadline {
+            let _ = fixture.handle.poll_outcome(&mut cx);
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        }
+        assert!(pm.is_allowed(builder), "builder must not be revoked for a sufficient average gas price");
+    }
+
     #[derive(Clone)]
     struct MockProvider {
         headers_by_number: HashMap<BlockNumber, Header>,
@@ -1266,6 +1422,10 @@ mod tests {
         td_by_hash: HashMap<BlockHash, U256>,
         head_number: BlockNumber,
         head_hash: BlockHash,
+        /// Configurable receipts for the post-import average-gas-price check
+        /// (`validate_bid_block_average_gas_price`); empty unless a test opts in via
+        /// [`MockProvider::insert_receipts`].
+        receipts_by_hash: HashMap<BlockHash, Vec<Receipt>>,
     }
 
     impl MockProvider {
@@ -1279,6 +1439,7 @@ mod tests {
                 td_by_hash,
                 head_number: 0,
                 head_hash: BlockHash::ZERO,
+                receipts_by_hash: HashMap::new(),
             }
         }
 
@@ -1290,6 +1451,52 @@ mod tests {
                 self.head_number = header.number;
                 self.head_hash = header.hash_slow();
             }
+        }
+
+        fn insert_receipts(&mut self, block_hash: BlockHash, receipts: Vec<Receipt>) {
+            self.receipts_by_hash.insert(block_hash, receipts);
+        }
+    }
+
+    impl ReceiptProvider for MockProvider {
+        type Receipt = Receipt;
+
+        fn receipt(&self, _id: u64) -> Result<Option<Self::Receipt>, ProviderError> {
+            Ok(None)
+        }
+
+        fn receipt_by_hash(&self, _hash: B256) -> Result<Option<Self::Receipt>, ProviderError> {
+            Ok(None)
+        }
+
+        fn receipts_by_block(
+            &self,
+            block: alloy_eips::BlockHashOrNumber,
+        ) -> Result<Option<Vec<Self::Receipt>>, ProviderError> {
+            let hash = match block {
+                alloy_eips::BlockHashOrNumber::Hash(hash) => hash,
+                alloy_eips::BlockHashOrNumber::Number(number) => {
+                    match self.headers_by_number.get(&number) {
+                        Some(header) => header.hash_slow(),
+                        None => return Ok(None),
+                    }
+                }
+            };
+            Ok(self.receipts_by_hash.get(&hash).cloned())
+        }
+
+        fn receipts_by_tx_range(
+            &self,
+            _range: impl core::ops::RangeBounds<u64>,
+        ) -> Result<Vec<Self::Receipt>, ProviderError> {
+            Ok(vec![])
+        }
+
+        fn receipts_by_block_range(
+            &self,
+            _block_range: core::ops::RangeInclusive<BlockNumber>,
+        ) -> Result<Vec<Vec<Self::Receipt>>, ProviderError> {
+            Ok(vec![])
         }
     }
 
@@ -1432,8 +1639,14 @@ mod tests {
     impl TestFixture {
         /// Create a new test fixture with the given engine responses
         async fn new(responses: EngineResponses) -> Self {
+            Self::new_with_provider(responses, MockProvider::new()).await
+        }
+
+        /// Create a new test fixture with the given engine responses and a pre-configured
+        /// provider (e.g. with receipts installed via [`MockProvider::insert_receipts`] for the
+        /// post-import average-gas-price check).
+        async fn new_with_provider(responses: EngineResponses, provider: MockProvider) -> Self {
             // Use mainnet chain spec for tests; it influences only fast-finality parsing.
-            let provider = MockProvider::new();
             let chain_spec = Arc::new(crate::chainspec::BscChainSpec::from(
                 crate::chainspec::bsc::bsc_mainnet(),
             ));

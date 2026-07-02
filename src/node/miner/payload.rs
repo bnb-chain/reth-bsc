@@ -2383,7 +2383,9 @@ where
             return false;
         }
 
-        if let Err(e) = sender.send((sealed, bid.builder, bid.bid_hash)) {
+        if let Err(e) =
+            sender.send((sealed, bid.builder, bid.bid_hash, bid.gas_fee, bid.system_tx_start))
+        {
             // The slot was never actually broadcast — release it so the local-payload fallback
             // below is not wrongly rejected as a double sign for a block that never went out.
             crate::shared::forget_recorded_mined_block(block_number, parent_hash);
