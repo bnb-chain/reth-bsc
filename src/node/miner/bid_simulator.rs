@@ -713,6 +713,25 @@ where
     /// happen in the build cycle (a follow-on slice); this is the intake half.
     pub fn commit_bid_block(&self, decoded: DecodedBidBlock) {
         let parent_hash = decoded.parent_hash();
+        // go-bsc's `newBidBlockLoop` also re-checks `isRunning` / `receivingBid` here. We don't:
+        // `is_mev_running()` is already enforced at admission in `MevApiImpl::admit_bid_block`, and
+        // `bid_receiving` has no toggle in this codebase (no setter, no RPC) so the gate would be
+        // dead code. A bid that races past `is_mev_running` between admit and pop is harmless —
+        // the resulting payload sits in `best_bid_block` until evicted.
+        //
+        // Mirrors go-bsc `bidSimulator.newBidBlockLoop`: discard BidBlocks for a block number we
+        // have already passed. Admission only checks head-relative timing, not block number, so a
+        // bid admitted just before the head advanced can still reach here for a stale block.
+        let head_number = self.client.last_block_number().unwrap_or(0);
+        if decoded.block_number() <= head_number {
+            debug!(
+                "BidBlock: discard stale block, blockNumber={}, latestBlock={}, builder={}",
+                decoded.block_number(),
+                head_number,
+                decoded.builder,
+            );
+            return;
+        }
         let parent = match self.client.header(parent_hash) {
             Ok(Some(h)) => SealedHeader::new(h, parent_hash),
             _ => {
