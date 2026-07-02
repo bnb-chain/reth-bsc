@@ -27,7 +27,13 @@ impl NodePrimitives for BscPrimitives {
 ///   `[[blobs, commitments, proofs], block_number, block_hash, tx_index, tx_hash]`
 /// The inner `BlobTxSidecar` is encoded as a sub-list, matching the Go struct
 /// `BlobSidecar { BlobTxSidecar, BlockNumber, BlockHash, TxIndex, TxHash }`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// JSON encoding is hand-written (see the `Serialize`/`Deserialize` impls below) rather than
+/// derived: go-bsc's `BlobSidecar` has custom `MarshalJSON`/`UnmarshalJSON` that nests the inner
+/// sidecar (including `version`, which the Go struct carries on `BlobTxSidecar`, not `BlobSidecar`
+/// itself) under a `blobSidecar` key, alongside hex-quantity `blockNumber`/`txIndex` — a shape a
+/// plain `#[derive(Serialize, Deserialize)]` with field renaming cannot produce.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BscBlobTransactionSidecar {
     pub inner: BlobTransactionSidecar,
     pub block_number: u64,
@@ -36,9 +42,97 @@ pub struct BscBlobTransactionSidecar {
     pub tx_hash: B256,
     /// Sidecar proof version: `0` = legacy EIP-4844 blob proofs, `1` = EIP-7594 cell proofs.
     /// Mirrors go-bsc `BlobTxSidecar.Version`, which is tagged `rlp:"-"` — excluded from the RLP
-    /// encoding (and therefore from the BidBlock hash) and carried only on the JSON wire.
-    #[serde(default)]
+    /// encoding (and therefore from the BidBlock hash) and carried only on the JSON wire, nested
+    /// under `blobSidecar` alongside `blobs`/`commitments`/`proofs`.
     pub version: u8,
+}
+
+/// Hex-quantity string encoding for `u64`, matching go-ethereum's `hexutil.EncodeUint64` /
+/// `hexutil.Big` — used for `BlobSidecar`'s `blockNumber` and `txIndex` on the JSON wire, which
+/// are quantities (`"0x64"`), not plain JSON numbers.
+mod hex_quantity {
+    use serde::{de::Error as _, Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(value: &u64, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&format!("0x{value:x}"))
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        let digits = s
+            .strip_prefix("0x")
+            .ok_or_else(|| D::Error::custom("hex string without 0x prefix"))?;
+        u64::from_str_radix(digits, 16).map_err(D::Error::custom)
+    }
+}
+
+/// JSON wire shape of the inner `BlobTxSidecar`: `blobs`/`commitments`/`proofs` plus `version`,
+/// nested under the outer struct's `blobSidecar` key. Kept separate from
+/// [`alloy_consensus::BlobTransactionSidecar`], which has no `version` field.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BlobTxSidecarWire<Blobs, Commitments, Proofs> {
+    #[serde(default)]
+    version: u8,
+    blobs: Blobs,
+    commitments: Commitments,
+    proofs: Proofs,
+}
+
+/// JSON wire shape of [`BscBlobTransactionSidecar`], matching go-bsc's `BlobSidecar.MarshalJSON` /
+/// `UnmarshalJSON`.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BlobSidecarWire<Sidecar> {
+    blob_sidecar: Sidecar,
+    #[serde(with = "hex_quantity")]
+    block_number: u64,
+    block_hash: B256,
+    #[serde(with = "hex_quantity")]
+    tx_index: u64,
+    tx_hash: B256,
+}
+
+impl Serialize for BscBlobTransactionSidecar {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        BlobSidecarWire {
+            blob_sidecar: BlobTxSidecarWire {
+                version: self.version,
+                blobs: &self.inner.blobs,
+                commitments: &self.inner.commitments,
+                proofs: &self.inner.proofs,
+            },
+            block_number: self.block_number,
+            block_hash: self.block_hash,
+            tx_index: self.tx_index,
+            tx_hash: self.tx_hash,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for BscBlobTransactionSidecar {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = BlobSidecarWire::<
+            BlobTxSidecarWire<
+                Vec<alloy_eips::eip4844::Blob>,
+                Vec<alloy_eips::eip4844::Bytes48>,
+                Vec<alloy_eips::eip4844::Bytes48>,
+            >,
+        >::deserialize(deserializer)?;
+        Ok(Self {
+            inner: BlobTransactionSidecar {
+                blobs: wire.blob_sidecar.blobs,
+                commitments: wire.blob_sidecar.commitments,
+                proofs: wire.blob_sidecar.proofs,
+            },
+            block_number: wire.block_number,
+            block_hash: wire.block_hash,
+            tx_index: wire.tx_index,
+            tx_hash: wire.tx_hash,
+            version: wire.blob_sidecar.version,
+        })
+    }
 }
 
 impl Encodable for BscBlobTransactionSidecar {
@@ -666,5 +760,122 @@ mod tests {
             buf.len(),
             "length() must match actual encoded size"
         );
+    }
+
+    fn sample_sidecar() -> BscBlobTransactionSidecar {
+        BscBlobTransactionSidecar {
+            inner: BlobTransactionSidecar {
+                blobs: vec![alloy_eips::eip4844::Blob::default()],
+                commitments: vec![alloy_eips::eip4844::Bytes48::default()],
+                proofs: vec![alloy_eips::eip4844::Bytes48::default()],
+            },
+            block_number: 0x64,
+            block_hash: B256::repeat_byte(0xab),
+            tx_index: 0x7,
+            tx_hash: B256::repeat_byte(0xcd),
+            version: 0,
+        }
+    }
+
+    #[test]
+    fn blob_sidecar_json_matches_geth_wire_shape() {
+        // Regression test for the JSON/RPC-layer break: go-bsc's `BlobSidecar` has custom
+        // MarshalJSON that nests the inner sidecar (blobs/commitments/proofs + version) under a
+        // "blobSidecar" key, with "blockNumber"/"txIndex" as hex-quantity strings — not the
+        // previous derive-based shape ({"inner": {...}, "block_number": 100, ...}), which any
+        // geth-conformant builder's BidBlock submission would fail to deserialize against.
+        let json = serde_json::to_value(sample_sidecar()).unwrap();
+
+        assert!(json.get("blobSidecar").is_some(), "must nest under 'blobSidecar', not 'inner'");
+        assert!(json.get("inner").is_none());
+        assert_eq!(json["blobSidecar"]["version"], 0);
+        assert!(json["blobSidecar"]["blobs"].is_array());
+        assert!(json["blobSidecar"]["commitments"].is_array());
+        assert!(json["blobSidecar"]["proofs"].is_array());
+
+        // blockNumber/txIndex are hex-quantity strings, matching hexutil.EncodeUint64, not plain
+        // JSON numbers.
+        assert_eq!(json["blockNumber"], "0x64");
+        assert_eq!(json["txIndex"], "0x7");
+        assert!(json.get("block_number").is_none());
+        assert!(json.get("tx_index").is_none());
+
+        assert_eq!(json["blockHash"], format!("{:#x}", B256::repeat_byte(0xab)));
+        assert_eq!(json["txHash"], format!("{:#x}", B256::repeat_byte(0xcd)));
+    }
+
+    #[test]
+    fn blob_sidecar_json_roundtrips() {
+        let sidecar = sample_sidecar();
+        let json = serde_json::to_value(&sidecar).unwrap();
+        let decoded: BscBlobTransactionSidecar = serde_json::from_value(json).unwrap();
+        assert_eq!(sidecar, decoded);
+    }
+
+    #[test]
+    fn blob_sidecar_json_accepts_geth_style_payload() {
+        // A payload shaped exactly like go-bsc's wire format (as a real builder would send it),
+        // decoded without ever having gone through our own Serialize impl. Commitments/proofs use
+        // real (small, 48-byte) values; blobs are omitted (128KB each) since only the envelope
+        // shape — not blob content — is under test here (covered with real blob data via
+        // `sample_sidecar()` in the roundtrip tests above).
+        let json = serde_json::json!({
+            "blobSidecar": {
+                "version": 1,
+                "blobs": [],
+                "commitments": [format!("{:#x}", alloy_eips::eip4844::Bytes48::default())],
+                "proofs": [format!("{:#x}", alloy_eips::eip4844::Bytes48::default())],
+            },
+            "blockNumber": "0x64",
+            "blockHash": format!("{:#x}", B256::repeat_byte(0xab)),
+            "txIndex": "0x7",
+            "txHash": format!("{:#x}", B256::repeat_byte(0xcd)),
+        });
+
+        let decoded: BscBlobTransactionSidecar = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded.version, 1);
+        assert_eq!(decoded.block_number, 0x64);
+        assert_eq!(decoded.tx_index, 0x7);
+        assert_eq!(decoded.block_hash, B256::repeat_byte(0xab));
+        assert_eq!(decoded.tx_hash, B256::repeat_byte(0xcd));
+    }
+
+    #[test]
+    fn blob_sidecar_json_defaults_version_when_absent() {
+        // go-bsc's BlobTxSidecar.Version defaults to 0 (legacy EIP-4844 proofs) when absent, same
+        // as the RLP side (`version` is `rlp:"-"`).
+        let json = serde_json::json!({
+            "blobSidecar": {
+                "blobs": [],
+                "commitments": [],
+                "proofs": [],
+            },
+            "blockNumber": "0x1",
+            "blockHash": format!("{:#x}", B256::ZERO),
+            "txIndex": "0x0",
+            "txHash": format!("{:#x}", B256::ZERO),
+        });
+
+        let decoded: BscBlobTransactionSidecar = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded.version, 0);
+    }
+
+    #[test]
+    fn blob_sidecar_json_rejects_quantity_without_0x_prefix() {
+        // Matches go-ethereum's hexutil.Big, which requires the "0x" prefix.
+        let json = serde_json::json!({
+            "blobSidecar": {
+                "version": 0,
+                "blobs": [],
+                "commitments": [],
+                "proofs": [],
+            },
+            "blockNumber": "64",
+            "blockHash": format!("{:#x}", B256::ZERO),
+            "txIndex": "0x0",
+            "txHash": format!("{:#x}", B256::ZERO),
+        });
+
+        assert!(serde_json::from_value::<BscBlobTransactionSidecar>(json).is_err());
     }
 }
