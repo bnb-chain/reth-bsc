@@ -13,6 +13,7 @@ use alloy_primitives::{Bytes, B256, U256, U64};
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::proc_macros::rpc;
 use reth_chainspec::EthChainSpec;
+use reth_ethereum_payload_builder::EthereumBuilderConfig;
 use reth_ethereum_primitives::TransactionSigned;
 use reth_primitives_traits::SignerRecoverable;
 use std::collections::{HashMap, HashSet};
@@ -238,6 +239,8 @@ const INVALID_BID_PARAM_ERROR: i32 = -38001;
 const MEV_NOT_RUNNING_ERROR: i32 = -38003;
 const MEV_NOT_IN_TURN_ERROR: i32 = -38005;
 const BID_BLOCK_PERMISSION_REVOKED_ERROR: i32 = -38006;
+const BID_BLOCK_PRE_SEAL_VERIFY_ERROR: i32 = -38007;
+const BID_BLOCK_TOO_LATE_ERROR: i32 = -38008;
 
 /// Reproduces go-bsc `Miner.bidBlockEnabled()`: a BidBlock is only accepted when MEV is running,
 /// the `BidBlockEnabled` flag is set, and the Pasteur fork is active at the chain head.
@@ -483,6 +486,17 @@ impl MevApiImpl {
         )
     }
 
+    /// `NewBidBlockPreSealVerifyError` (code `-38007`): the synchronous checks
+    /// `preSealVerifyBidBlock` runs at admission failed.
+    fn pre_seal_verify_failed(msg: impl Into<String>) -> jsonrpsee::types::ErrorObjectOwned {
+        jsonrpsee::types::ErrorObject::owned(BID_BLOCK_PRE_SEAL_VERIFY_ERROR, msg.into(), None::<()>)
+    }
+
+    /// `NewBidBlockTooLateError` (code `-38008`): the bid arrived after `bidMustBefore`.
+    fn too_late(msg: impl Into<String>) -> jsonrpsee::types::ErrorObjectOwned {
+        jsonrpsee::types::ErrorObject::owned(BID_BLOCK_TOO_LATE_ERROR, msg.into(), None::<()>)
+    }
+
     /// Internal error (`-32603`) for conditions go-bsc never hits (e.g. the chain head missing).
     fn internal_err(msg: impl Into<String>) -> jsonrpsee::types::ErrorObjectOwned {
         jsonrpsee::types::ErrorObject::owned(-32603, msg.into(), None::<()>)
@@ -551,11 +565,49 @@ impl MevApiImpl {
             .unwrap_or_default()
             .as_millis();
         if now_ms >= bid_must_before_ms {
-            return Err(Self::invalid_bid(format!(
+            return Err(Self::too_late(format!(
                 "too late: bid must arrive before {}ms, arrived {}ms later, bidHash={bid_hash}",
                 bid_must_before_ms,
                 now_ms.saturating_sub(bid_must_before_ms),
             )));
+        }
+
+        let mut decoded = args
+            .to_decoded_bid_block(builder)
+            .map_err(|e| Self::invalid_bid(format!("failed to decode bid block: {e}")))?;
+
+        // Mirrors go-bsc `preSealVerifyBidBlock`'s payload-only checks (coinbase, gas limit, the
+        // deposit-derived gas fee, blob sidecar structure, per-tx gas cap, trailing system-tx
+        // shape) synchronously, returning `-38007` immediately on failure like geth does — rather
+        // than admitting optimistically and dropping the bid silently later.
+        //
+        // NOT run here: `verify_bid_block_header`'s structural + cascading checks (extra-data
+        // length/validator-list layout, authorized-validator/sign-recently/difficulty against the
+        // snapshot). go-bsc only makes those checks meaningful by first overwriting the builder's
+        // `Extra` with the validator's own reconstructed vanity/forkhash/validator-list/turnLength
+        // (`SetExtraData`, run before `preSealVerifyBidBlock`) — replicating that rewrite here
+        // would risk rejecting legitimate submissions whose raw `Extra` doesn't yet match that
+        // final structure. Those checks remain deferred to the miner side
+        // (`simulate_bid_block`), which does perform the rewrite first.
+        let gas_ceil = crate::shared::get_miner_gas_limit().unwrap_or(head_header.gas_limit);
+        let expected_gas_limit =
+            EthereumBuilderConfig::new().with_gas_limit(gas_ceil).gas_limit(head_header.gas_limit);
+        match crate::node::miner::bid_block::verify_bid_block_payload(
+            &self.chain_spec,
+            &decoded,
+            head_header,
+            self.validator_address,
+            expected_gas_limit,
+        ) {
+            Ok((system_tx_start, gas_fee)) => {
+                decoded.system_tx_start = system_tx_start;
+                decoded.gas_fee = gas_fee;
+            }
+            Err(e) => {
+                return Err(Self::pre_seal_verify_failed(format!(
+                    "pre-seal verify failed: bidHash={bid_hash}, err={e}"
+                )));
+            }
         }
 
         // Decode and hand to the miner via the global intake queue.
@@ -565,21 +617,15 @@ impl MevApiImpl {
         //
         //   • Extra overwrite + SetExtraData  →  header.extra_data = vanity + finalize_new_header
         //   • setBidMevInfo                   →  set_bid_block_mev_info
-        //   • preSealVerifyBidBlock           →  verify_bid_block_payload + verify_bid_block_header
+        //   • verify_bid_block_header         →  structural + cascading header checks (see above)
         //   • execution + state-root check    →  execute_bid_block_payload
         //
-        // Behavioral difference vs geth: geth runs these synchronously and returns an error to the
-        // builder immediately on failure.  reth-bsc returns bidHash optimistically; if any of the
-        // above steps fail the block is silently dropped miner-side.  The checks still run — the
-        // builder just does not receive per-step error feedback.
+        // Behavioral difference vs geth: geth runs the queue handoff itself
+        // (`sendBidBlock`/`newBidBlockLoop`) with a bounded channel and returns `ErrMevBusy`
+        // (`-38004`) on a 1s enqueue timeout; reth-bsc's intake queue is unbounded, so admission
+        // can never report busy. Left as a known gap — implementing genuine backpressure here is
+        // a distinct change from surfacing the correct error codes for checks that already run.
         //
-        // Bringing them forward to admit_bid_block would require injecting
-        // Arc<Parlia<BscChainSpec>> into MevApiImpl (needed by verify_bid_block_header) and is
-        // left as future work.
-        let decoded = args
-            .to_decoded_bid_block(builder)
-            .map_err(|e| Self::invalid_bid(format!("failed to decode bid block: {e}")))?;
-
         // Register after all checks pass so quota is only consumed by accepted bids.
         self.add_pending_bid_block(block_number, builder, bid_hash);
 
@@ -1285,6 +1331,10 @@ mod bid_block_param_tests {
         assert_eq!(MevApiImpl::mev_not_in_turn().code(), -38005);
         assert_eq!(MevApiImpl::invalid_bid("x").code(), -38001);
         assert_eq!(MevApiImpl::permission_revoked("x").code(), -38006);
+        // Regression guard: these two used to collapse into -38001 (generic invalid-bid), so a
+        // builder keying retry/backoff behavior on the specific geth code would misbehave.
+        assert_eq!(MevApiImpl::pre_seal_verify_failed("x").code(), -38007);
+        assert_eq!(MevApiImpl::too_late("x").code(), -38008);
         assert_eq!(
             MevApiImpl::mev_not_running().message(),
             "the validator stop accepting bids for now, try again later"
