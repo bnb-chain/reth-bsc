@@ -14,7 +14,7 @@ use crate::node::miner::bid_simulator::BidSimulator;
 use crate::node::miner::bsc_miner::{MiningContext, SubmitContext};
 use crate::node::miner::util::finalize_new_header;
 use crate::node::pool::BlacklistedAddressError;
-use crate::node::primitives::BscBlobTransactionSidecar;
+use crate::node::primitives::{BscBlobTransactionSidecar, BscBlock};
 use alloy_consensus::{BlockHeader, Transaction};
 use alloy_eips::eip4895::Withdrawals;
 use alloy_evm::block::BlockExecutor;
@@ -40,7 +40,7 @@ use once_cell::sync::Lazy;
 use revm::context_interface::Block as EvmBlock;
 use reth_primitives_traits::{HeaderTy, SealedHeader};
 use reth_primitives_traits::transaction::error::InvalidTransactionError;
-use reth_primitives_traits::{BlockBody, RecoveredBlock, SignerRecoverable};
+use reth_primitives_traits::{Block, BlockBody, RecoveredBlock, SealedBlock, SignerRecoverable};
 use reth_provider::StateProviderFactory;
 use reth_revm::cached::CachedReads;
 use reth_revm::cancelled::ManualCancel;
@@ -2250,6 +2250,33 @@ where
         Ok(())
     }
 
+    /// Re-assemble the vote attestation and re-seal a winning BidBlock's header at selection time
+    /// (see the call site in [`Self::try_submit_winning_bid_block`] for why). Falls back to the
+    /// block's admission-time seal — never fails the submission — if the snapshot provider is
+    /// unavailable.
+    fn refresh_bid_block_vote_attestation(
+        &self,
+        block: &RecoveredBlock<BscBlock>,
+    ) -> SealedBlock<BscBlock> {
+        let Some(snapshot_provider) = crate::shared::get_snapshot_provider().cloned() else {
+            warn!(
+                target: "bsc::miner::payload",
+                trace_id = self.trace_id,
+                "Snapshot provider unavailable; submitting BidBlock with admission-time vote attestation"
+            );
+            return block.sealed_block().clone();
+        };
+
+        refresh_and_reseal_bid_block(
+            self.parlia.clone(),
+            &self.mining_ctx.parent_snapshot,
+            self.mining_ctx.parent_header.header(),
+            &snapshot_provider,
+            block,
+            self.trace_id,
+        )
+    }
+
     /// If a collected BidBlock candidate out-bids every local/legacy payload by fee, hand its sealed
     /// block to the block-import service for broadcast-then-verify and return `true` (the local work
     /// is then discarded, matching go-bsc's `commitWork` early-return after `enqueueBidBlockTask`).
@@ -2273,7 +2300,14 @@ where
             return false;
         }
 
-        let sealed = bid.block.sealed_block().clone();
+        // Refresh the vote attestation with the freshest votes available now that this BidBlock
+        // has won selection, and re-seal — go-bsc defers `assembleVoteAttestation` + the ECDSA
+        // seal to `engine.Seal()`, called only after `selectBidBlock` picks the winner, to
+        // maximize the window for BFT votes to arrive. This BidBlock's own attestation was
+        // assembled at admission time (`simulate_bid_block`, potentially a full slot earlier);
+        // without this refresh it would carry stale votes while the local-block path (via
+        // `finalize_payload`, called at this same selection point) does not.
+        let sealed = self.refresh_bid_block_vote_attestation(&bid.block);
         let block_number = sealed.header().number();
         let block_hash = sealed.hash();
         let parent_hash = sealed.header().parent_hash;
@@ -2589,6 +2623,51 @@ where
     }
 }
 
+/// Core of [`BscPayloadJob::refresh_bid_block_vote_attestation`], split out as a free function so
+/// it's testable without constructing a full payload job.
+///
+/// Refreshes `block`'s vote attestation and re-seals via
+/// [`crate::node::miner::util::refresh_vote_attestation_and_seal`]; on any internal failure that
+/// function restores the original attestation/seal and returns `Ok(())`, so the only externally
+/// observable outcomes are "refreshed" or "unchanged" — never a broken block. When the header
+/// hash changes (any successful re-seal changes it, since the seal is part of `extra_data`, which
+/// is part of the header hash), patches the blob sidecars' cached `block_hash` (set at admission
+/// time) before the block goes out over P2P, mirroring `finalize_payload`'s equivalent patch for
+/// the local-block path.
+fn refresh_and_reseal_bid_block(
+    parlia: Arc<Parlia<BscChainSpec>>,
+    parent_snapshot: &Snapshot,
+    parent_header: &alloy_consensus::Header,
+    snapshot_provider: &Arc<dyn crate::consensus::parlia::SnapshotProvider + Send + Sync>,
+    block: &RecoveredBlock<BscBlock>,
+    trace_id: u64,
+) -> SealedBlock<BscBlock> {
+    let mut plain_block = block.clone_block();
+    if let Err(e) = crate::node::miner::util::refresh_vote_attestation_and_seal(
+        parlia,
+        parent_snapshot,
+        parent_header,
+        &mut plain_block.header,
+        snapshot_provider,
+    ) {
+        warn!(
+            target: "bsc::miner::payload",
+            trace_id,
+            error = %e,
+            "Failed to refresh BidBlock vote attestation; submitting with admission-time attestation"
+        );
+        return block.sealed_block().clone();
+    }
+
+    let final_hash = plain_block.header.hash_slow();
+    if let Some(ref mut sidecars) = plain_block.body.sidecars {
+        for sidecar in sidecars.iter_mut() {
+            sidecar.block_hash = final_hash;
+        }
+    }
+    plain_block.seal_unchecked(final_hash)
+}
+
 /// Finalize a built payload in-place.
 ///
 /// Runs `finalize_new_header()` on the payload's header (sets difficulty, prepares validators
@@ -2671,13 +2750,14 @@ fn finalize_payload(
 #[cfg(test)]
 mod tests {
     use super::{
-        initial_out_of_turn_build_wait, local_rebuild_action, validate_bsc_sidecar,
-        LocalRebuildAction, LocalRebuildPolicyInput,
+        initial_out_of_turn_build_wait, local_rebuild_action, refresh_and_reseal_bid_block,
+        validate_bsc_sidecar, LocalRebuildAction, LocalRebuildPolicyInput,
     };
     use crate::chainspec::BscChainSpec;
     use crate::consensus::parlia::Parlia;
     use crate::consensus::parlia::Snapshot;
     use crate::node::miner::bsc_miner::MiningContext;
+    use crate::node::primitives::BscBlock;
     use alloy_consensus::BlobTransactionSidecar;
     use alloy_consensus::Header;
     use alloy_eips::eip4844::{Blob, Bytes48};
@@ -2686,7 +2766,7 @@ mod tests {
     };
     use alloy_primitives::{Address, B256, U256};
     use reth::transaction_pool::error::Eip4844PoolTransactionError;
-    use reth_primitives_traits::SealedHeader;
+    use reth_primitives_traits::{RecoveredBlock, SealedHeader};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -2999,5 +3079,145 @@ mod tests {
         );
 
         assert_eq!(rebuilds, 0);
+    }
+
+    // ---- refresh_and_reseal_bid_block (BEP-675 vote-attestation-at-selection fix) ----
+
+    struct MockBidBlockSnapshotProvider {
+        snapshot: Snapshot,
+    }
+
+    impl crate::consensus::parlia::provider::SnapshotProvider for MockBidBlockSnapshotProvider {
+        fn snapshot_by_hash(&self, _block_hash: &B256) -> Option<Snapshot> {
+            Some(self.snapshot.clone())
+        }
+        fn insert(&self, _snapshot: Snapshot) {}
+    }
+
+    fn ensure_bid_block_test_signer() {
+        let raw = alloy_primitives::hex::decode(
+            "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+        )
+        .unwrap();
+        let _ = crate::node::miner::signer::init_global_signer(B256::from_slice(&raw));
+    }
+
+    fn luban_chain_spec() -> Arc<BscChainSpec> {
+        Arc::new(BscChainSpec::from(
+            reth_chainspec::ChainSpecBuilder::mainnet()
+                .with_fork(crate::hardforks::bsc::BscHardfork::Luban, reth_chainspec::ForkCondition::Block(0))
+                .build(),
+        ))
+    }
+
+    /// A non-epoch header (block 1, so `assemble_vote_attestation` skips — it only assembles from
+    /// block 3 onward) carrying a fake attestation in `extra_data`: Vanity (32) + Attestation (RLP)
+    /// + Seal (65). This exercises the pure strip-and-reseal path without needing a vote pool.
+    fn header_with_fake_attestation() -> Header {
+        use crate::consensus::parlia::vote::{VoteAttestation, VoteData};
+        let att = VoteAttestation {
+            vote_address_set: 0xFF,
+            agg_signature: Default::default(),
+            data: VoteData { source_number: 1, source_hash: B256::ZERO, target_number: 0, target_hash: B256::ZERO },
+            extra: bytes::Bytes::new(),
+        };
+        let mut extra = vec![0u8; crate::consensus::parlia::EXTRA_VANITY_LEN];
+        extra.extend_from_slice(alloy_rlp::encode(&att).as_ref());
+        extra.extend_from_slice(&[0u8; crate::consensus::parlia::EXTRA_SEAL_LEN]);
+        Header { number: 1, extra_data: alloy_primitives::Bytes::from(extra), ..Default::default() }
+    }
+
+    fn bid_block_with_sidecar(header: Header, sidecar_block_hash: B256) -> RecoveredBlock<BscBlock> {
+        let body = crate::node::primitives::BscBlockBody {
+            inner: reth_ethereum_primitives::BlockBody {
+                transactions: Vec::new(),
+                ommers: Vec::new(),
+                withdrawals: None,
+            },
+            sidecars: Some(vec![crate::node::primitives::BscBlobTransactionSidecar {
+                inner: BlobTransactionSidecar {
+                    blobs: Vec::new(),
+                    commitments: Vec::new(),
+                    proofs: Vec::new(),
+                },
+                block_number: header.number,
+                block_hash: sidecar_block_hash,
+                tx_index: 0,
+                tx_hash: B256::ZERO,
+                version: 0,
+            }]),
+        };
+        RecoveredBlock::new_unhashed(BscBlock { header, body }, Vec::new())
+    }
+
+    #[test]
+    fn refresh_and_reseal_strips_stale_attestation_and_patches_sidecar_hash() {
+        ensure_bid_block_test_signer();
+        let chain_spec = luban_chain_spec();
+        let parlia = Arc::new(Parlia::new(chain_spec, 200));
+        let parent_snap = Snapshot::new(vec![Address::with_last_byte(1)], 0, B256::random(), 200, None);
+        let parent_header = Header { number: 0, parent_hash: B256::random(), ..Default::default() };
+
+        let header = header_with_fake_attestation();
+        let original_hash = header.hash_slow();
+        let block = bid_block_with_sidecar(header, original_hash);
+
+        let snapshot_provider: Arc<dyn crate::consensus::parlia::SnapshotProvider + Send + Sync> =
+            Arc::new(MockBidBlockSnapshotProvider { snapshot: parent_snap.clone() });
+
+        let refreshed = refresh_and_reseal_bid_block(
+            parlia,
+            &parent_snap,
+            &parent_header,
+            &snapshot_provider,
+            &block,
+            0,
+        );
+
+        // The stale attestation was stripped (block 1 is below the vote-assembly floor of 3, so
+        // no new attestation replaces it) and the header re-sealed — vanity + seal only, and a
+        // different hash than the admission-time seal.
+        assert_eq!(
+            refreshed.header().extra_data.len(),
+            crate::consensus::parlia::EXTRA_VANITY_LEN + crate::consensus::parlia::EXTRA_SEAL_LEN
+        );
+        assert_ne!(refreshed.hash(), original_hash);
+
+        // The sidecar's cached block_hash (set at admission time, before this refresh) must be
+        // patched to the new post-reseal hash before the block goes out over P2P.
+        let sidecar = refreshed.body().sidecars.as_ref().unwrap().first().unwrap();
+        assert_eq!(sidecar.block_hash, refreshed.hash());
+    }
+
+    #[test]
+    fn refresh_and_reseal_is_a_noop_pre_luban() {
+        ensure_bid_block_test_signer();
+        // Mainnet spec without the Luban fork override: inactive at block 1.
+        let chain_spec = Arc::new(BscChainSpec::from(reth_chainspec::ChainSpecBuilder::mainnet().build()));
+        let parlia = Arc::new(Parlia::new(chain_spec, 200));
+        let parent_snap = Snapshot::new(vec![Address::with_last_byte(1)], 0, B256::random(), 200, None);
+        let parent_header = Header { number: 0, parent_hash: B256::random(), ..Default::default() };
+
+        let header = header_with_fake_attestation();
+        let original_hash = header.hash_slow();
+        let block = bid_block_with_sidecar(header, original_hash);
+
+        let snapshot_provider: Arc<dyn crate::consensus::parlia::SnapshotProvider + Send + Sync> =
+            Arc::new(MockBidBlockSnapshotProvider { snapshot: parent_snap.clone() });
+
+        let refreshed = refresh_and_reseal_bid_block(
+            parlia,
+            &parent_snap,
+            &parent_header,
+            &snapshot_provider,
+            &block,
+            0,
+        );
+
+        // Pre-Luban, refresh_vote_attestation_and_seal returns early without touching the header
+        // at all — the block (and its sidecar's block_hash) must come back byte-for-byte unchanged.
+        assert_eq!(refreshed.hash(), original_hash);
+        let sidecar = refreshed.body().sidecars.as_ref().unwrap().first().unwrap();
+        assert_eq!(sidecar.block_hash, original_hash);
     }
 }
