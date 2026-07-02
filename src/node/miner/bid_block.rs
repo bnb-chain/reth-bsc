@@ -13,7 +13,11 @@ use crate::consensus::eip4844::is_blob_eligible_block;
 use crate::consensus::parlia::bid_block::{
     extract_bid_block_deposit_value, verify_bid_block_system_txs, BidBlockSystemTxError,
 };
-use crate::consensus::parlia::{consensus::Parlia, Snapshot, SnapshotProvider};
+use crate::consensus::parlia::{
+    consensus::Parlia,
+    constants::{DIFF_INTURN, DIFF_NOTURN},
+    Snapshot, SnapshotProvider,
+};
 use crate::hardforks::BscHardforks;
 use crate::node::miner::block_mev_info::{encode_block_mev_info, BlockMevInfoVersion};
 use crate::node::miner::signer::sign_system_transaction;
@@ -497,17 +501,33 @@ pub fn pre_seal_verify_bid_block(
     etherbase: Address,
     expected_gas_limit: u64,
 ) -> Result<(usize, U256), PreSealVerifyError> {
+    // go-bsc checks coinbase/gasLimit before VerifyUnsealedHeader (see preSealVerifyBidBlock) —
+    // matters now that verify_bid_block_header's cascading checks depend on the header's coinbase
+    // too, so a header with a *wrong* coinbase must surface `InvalidCoinbase`, not
+    // `UnauthorizedValidator`, matching which error go-bsc would return first.
+    verify_bid_block_coinbase_and_gas_limit(&decoded.header, etherbase, expected_gas_limit)?;
     verify_bid_block_header(parlia, &decoded.header, parent, snap)?;
     verify_bid_block_payload(chain_spec, decoded, parent, etherbase, expected_gas_limit)
 }
 
 /// Header half of [`pre_seal_verify_bid_block`]: the unsealed Parlia header-field checks
 /// (`validate_header`: extra, ommers, gas, base fee, withdrawals, 4844, mix digest, beacon root,
-/// requests hash) plus the slot timestamp bound.
+/// requests hash), the cascading fields go-bsc's `VerifyUnsealedHeader` checks against the parent
+/// snapshot (coinbase is an authorized, not-recently-signed validator; difficulty matches its
+/// in-turn/no-turn status), and the slot timestamp bound (both directions: the existing upper
+/// bound plus go-bsc's `blockTimeVerifyForRamanujanFork` lower bound).
 ///
-/// Split out because it must run on the **finalized** header (which carries the validator's extra
-/// and seal), whereas [`verify_bid_block_payload`] must run **before** finalize (its `system_tx_start`
-/// feeds bind-signing, which mutates the tx set and therefore must precede finalize).
+/// The cascading checks use `header.beneficiary` directly rather than recovering a seal signer:
+/// go-bsc's function is explicitly named "Unsealed" because it runs on headers that may not carry
+/// a valid seal yet (this function's first, admission-time call site — [`pre_seal_verify_bid_block`]
+/// — runs on the builder's raw, unfinalized header). Signature-based verification of the seal
+/// itself happens later, when the finalized block is executed on import.
+///
+/// Split out because it must also run on the **finalized** header (which carries the validator's
+/// extra and seal) after `finalize_new_header`, to confirm that step didn't itself produce an
+/// invalid header, whereas [`verify_bid_block_payload`] must run **before** finalize (its
+/// `system_tx_start` feeds bind-signing, which mutates the tx set and therefore must precede
+/// finalize).
 pub fn verify_bid_block_header(
     parlia: &Parlia<BscChainSpec>,
     header: &Header,
@@ -518,9 +538,49 @@ pub fn verify_bid_block_header(
     parlia
         .validate_header(&sealed)
         .map_err(|e| PreSealVerifyError::InvalidHeader(e.to_string()))?;
+
+    if !snap.validators.contains(&header.beneficiary) {
+        return Err(PreSealVerifyError::UnauthorizedValidator { validator: header.beneficiary });
+    }
+    if snap.sign_recently(header.beneficiary) {
+        return Err(PreSealVerifyError::SignedTooRecently { validator: header.beneficiary });
+    }
+    let want_difficulty =
+        if snap.is_inturn(header.beneficiary) { DIFF_INTURN } else { DIFF_NOTURN };
+    if header.difficulty != want_difficulty {
+        return Err(PreSealVerifyError::WrongDifficulty {
+            got: header.difficulty,
+            want: want_difficulty,
+        });
+    }
+
+    parlia
+        .block_time_verify_for_ramanujan_fork(snap, header, parent)
+        .map_err(|e| PreSealVerifyError::InvalidHeader(e.to_string()))?;
     parlia
         .block_time_upper_check(snap, header, parent)
         .map_err(|e| PreSealVerifyError::InvalidHeader(e.to_string()))?;
+    Ok(())
+}
+
+/// Coinbase-is-the-validator and gas-limit-matches-target checks — go-bsc's `preSealVerifyBidBlock`
+/// runs these *before* `VerifyUnsealedHeader`'s cascading fields, which matters once a wrong
+/// coinbase could otherwise surface as [`PreSealVerifyError::UnauthorizedValidator`] instead of the
+/// more specific [`PreSealVerifyError::InvalidCoinbase`].
+fn verify_bid_block_coinbase_and_gas_limit(
+    header: &Header,
+    etherbase: Address,
+    expected_gas_limit: u64,
+) -> Result<(), PreSealVerifyError> {
+    if header.beneficiary != etherbase {
+        return Err(PreSealVerifyError::InvalidCoinbase { got: header.beneficiary, want: etherbase });
+    }
+    if header.gas_limit != expected_gas_limit {
+        return Err(PreSealVerifyError::InvalidGasLimit {
+            got: header.gas_limit,
+            want: expected_gas_limit,
+        });
+    }
     Ok(())
 }
 
@@ -537,16 +597,7 @@ pub fn verify_bid_block_payload(
     expected_gas_limit: u64,
 ) -> Result<(usize, U256), PreSealVerifyError> {
     let header = &decoded.header;
-
-    if header.beneficiary != etherbase {
-        return Err(PreSealVerifyError::InvalidCoinbase { got: header.beneficiary, want: etherbase });
-    }
-    if header.gas_limit != expected_gas_limit {
-        return Err(PreSealVerifyError::InvalidGasLimit {
-            got: header.gas_limit,
-            want: expected_gas_limit,
-        });
-    }
+    verify_bid_block_coinbase_and_gas_limit(header, etherbase, expected_gas_limit)?;
 
     let (system_tx_start, gas_fee) = extract_bid_block_deposit_value(&decoded.txs);
     if gas_fee.is_zero() {
@@ -587,6 +638,14 @@ pub enum PreSealVerifyError {
     InvalidGasLimit { got: u64, want: u64 },
     /// The unsealed Parlia header is invalid, or the timestamp exceeds the slot bound.
     InvalidHeader(String),
+    /// Coinbase is not an authorized validator in the parent snapshot (go-bsc
+    /// `errUnauthorizedValidator`).
+    UnauthorizedValidator { validator: Address },
+    /// Coinbase signed too recently to sign again (go-bsc `errRecentlySigned`).
+    SignedTooRecently { validator: Address },
+    /// Difficulty does not match the coinbase's in-turn/no-turn status (go-bsc
+    /// `errWrongDifficulty`).
+    WrongDifficulty { got: U256, want: U256 },
     /// The deposit (gas-fee) value is zero.
     EmptyGasFee,
     /// A user tx exceeds the per-tx gas cap.
@@ -607,6 +666,15 @@ impl fmt::Display for PreSealVerifyError {
                 write!(f, "invalid gasLimit: got {got}, want {want}")
             }
             Self::InvalidHeader(detail) => write!(f, "invalid header: {detail}"),
+            Self::UnauthorizedValidator { validator } => {
+                write!(f, "unauthorized validator: {validator}")
+            }
+            Self::SignedTooRecently { validator } => {
+                write!(f, "validator {validator} signed recently")
+            }
+            Self::WrongDifficulty { got, want } => {
+                write!(f, "wrong difficulty: got {got}, want {want}")
+            }
             Self::EmptyGasFee => write!(f, "empty gasFee"),
             Self::TxGasTooHigh { tx_index, gas, cap } => {
                 write!(f, "tx {tx_index} gas {gas} exceeds cap {cap}")
@@ -1226,8 +1294,12 @@ mod tests {
         Parlia::new(Arc::new(spec), 200)
     }
 
+    /// Single-validator snapshot authorizing `Address::repeat_byte(0x11)` — the etherbase every
+    /// `pre_seal_*` test below uses — so it passes the authorized-validator/in-turn cascading
+    /// checks `verify_bid_block_header` now runs.
     fn snap_with_interval(interval: u64) -> Snapshot {
-        let mut snap = Snapshot::new(vec![Address::ZERO], 0, B256::ZERO, 200, None);
+        let mut snap =
+            Snapshot::new(vec![Address::repeat_byte(0x11)], 0, B256::ZERO, 200, None);
         snap.block_interval = interval;
         snap
     }
@@ -1243,6 +1315,9 @@ mod tests {
             gas_used: 21_000,
             ommers_hash: EMPTY_OMMER_ROOT_HASH,
             extra_data: Bytes::from(vec![0u8; 32 + 65]),
+            // `snap_with_interval`'s lone validator is always in-turn (a single-member set has
+            // nothing to rotate with), so a genuinely valid header must claim DIFF_INTURN.
+            difficulty: DIFF_INTURN,
             ..Default::default()
         }
     }
@@ -1331,6 +1406,66 @@ mod tests {
             pre_seal_verify_bid_block(&parlia, &spec, &d, &parent, &snap, etherbase, 29_000_000),
             Err(PreSealVerifyError::InvalidGasLimit { .. })
         ));
+    }
+
+    // ---- verify_bid_block_header cascading checks (go-bsc VerifyUnsealedHeader) ----
+
+    #[test]
+    fn pre_seal_rejects_unauthorized_validator() {
+        // Coinbase matches the caller's etherbase (passes the earlier InvalidCoinbase check) but
+        // is not a member of the parent snapshot's validator set at all.
+        let spec = preseal_spec();
+        let parlia = parlia_engine(spec.clone());
+        let etherbase = Address::repeat_byte(0x11);
+        // A snapshot that only authorizes a *different* validator.
+        let snap = {
+            let mut s = Snapshot::new(vec![Address::repeat_byte(0x99)], 0, B256::ZERO, 200, None);
+            s.block_interval = 3_000;
+            s
+        };
+        let header = valid_bid_header(etherbase, 30_000_000);
+        let parent = Header { number: 0, timestamp: 1, gas_limit: 30_000_000, ..Default::default() };
+        let d = decoded_block(header, vec![], vec![]);
+        assert_eq!(
+            pre_seal_verify_bid_block(&parlia, &spec, &d, &parent, &snap, etherbase, 30_000_000),
+            Err(PreSealVerifyError::UnauthorizedValidator { validator: etherbase })
+        );
+    }
+
+    #[test]
+    fn pre_seal_rejects_signed_too_recently() {
+        // An authorized, correctly-in-turn validator that already signed within the lookback
+        // window must still be rejected (go-bsc errRecentlySigned).
+        let spec = preseal_spec();
+        let parlia = parlia_engine(spec.clone());
+        let etherbase = Address::repeat_byte(0x11);
+        let mut snap = snap_with_interval(3_000);
+        // count_recent_proposers only counts entries strictly after `block_number - lookback`
+        // (0 here, since the snapshot's block_number is 0); block 0 itself would be skipped.
+        snap.recent_proposers.insert(1, etherbase);
+        let header = valid_bid_header(etherbase, 30_000_000);
+        let parent = Header { number: 0, timestamp: 1, gas_limit: 30_000_000, ..Default::default() };
+        let d = decoded_block(header, vec![], vec![]);
+        assert_eq!(
+            pre_seal_verify_bid_block(&parlia, &spec, &d, &parent, &snap, etherbase, 30_000_000),
+            Err(PreSealVerifyError::SignedTooRecently { validator: etherbase })
+        );
+    }
+
+    #[test]
+    fn pre_seal_rejects_wrong_difficulty() {
+        // snap_with_interval's lone validator is always in-turn, so DIFF_NOTURN is wrong here.
+        let spec = preseal_spec();
+        let parlia = parlia_engine(spec.clone());
+        let etherbase = Address::repeat_byte(0x11);
+        let snap = snap_with_interval(3_000);
+        let header = Header { difficulty: DIFF_NOTURN, ..valid_bid_header(etherbase, 30_000_000) };
+        let parent = Header { number: 0, timestamp: 1, gas_limit: 30_000_000, ..Default::default() };
+        let d = decoded_block(header, vec![], vec![]);
+        assert_eq!(
+            pre_seal_verify_bid_block(&parlia, &spec, &d, &parent, &snap, etherbase, 30_000_000),
+            Err(PreSealVerifyError::WrongDifficulty { got: DIFF_NOTURN, want: DIFF_INTURN })
+        );
     }
 
     #[test]
