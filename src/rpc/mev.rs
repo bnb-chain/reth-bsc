@@ -167,6 +167,23 @@ fn bid_block_admission_enabled(mev_running: bool, flag_enabled: bool, pasteur_ac
     mev_running && flag_enabled && pasteur_active
 }
 
+/// Mirrors go-bsc `bidutil.BidMustBefore`: the deadline after which a `mev_sendBidBlock`
+/// submission is rejected as too late.
+///
+/// `bid_must_before_ms = parent.MilliTimestamp() + block_interval_ms - delay_left_over_ms`
+///
+/// `parent_timestamp_ms` must be the parent header's *full* millisecond timestamp (seconds plus
+/// the sub-second component carried in `mixHash` post-Lorentz — see
+/// [`crate::consensus::parlia::util::calculate_millisecond_timestamp`]), not just
+/// `header.timestamp * 1000`: on sub-second block intervals (Fermi/Maxwell), truncating the
+/// parent's millisecond part shifts the deadline by up to a full block interval. The subtracted
+/// knob is `delay_left_over_ms` (go-bsc's `Config.DelayLeftOver`, default 15ms) —
+/// `no_interrupt_left_over` bounds bid *simulation* time and is a different, much larger, knob.
+fn bid_must_before_ms(parent_timestamp_ms: u64, block_interval_ms: u64, delay_left_over_ms: u64) -> u128 {
+    (parent_timestamp_ms as u128 + block_interval_ms as u128)
+        .saturating_sub(delay_left_over_ms as u128)
+}
+
 /// Implementation of the MEV Builder RPC API
 pub struct MevApiImpl {
     snapshot_provider: Arc<dyn SnapshotProvider + Send + Sync>,
@@ -175,6 +192,10 @@ pub struct MevApiImpl {
     validator_commission: u64,
     bid_simulation_left_over: u64, // milliseconds
     no_interrupt_left_over: u64,   // milliseconds
+    /// go-bsc's `Config.DelayLeftOver`: time reserved to finalize a block, subtracted from the
+    /// `mev_sendBidBlock` admission deadline (`bidMustBefore`). Distinct from
+    /// `no_interrupt_left_over`, which only bounds bid *simulation*.
+    delay_left_over: u64, // milliseconds
     max_bids_per_builder: u32,
     gas_ceil: u64,
     min_gas_price: U256,
@@ -239,6 +260,7 @@ impl MevApiImpl {
         let validator_commission = mining_config.get_validator_commission();
         let bid_simulation_left_over = mining_config.get_bid_simulation_left_over();
         let no_interrupt_left_over = mining_config.get_no_interrupt_left_over();
+        let delay_left_over = mining_config.get_delay_left_over();
         let max_bids_per_builder = mining_config.get_max_bids_per_builder();
         let builder_fee_ceil = U256::from(mining_config.get_builder_fee_ceil());
         let bid_block_enabled = mining_config.get_bid_block_enabled();
@@ -283,6 +305,7 @@ impl MevApiImpl {
             validator_commission,
             bid_simulation_left_over,
             no_interrupt_left_over,
+            delay_left_over,
             max_bids_per_builder,
             gas_ceil,
             min_gas_price,
@@ -330,13 +353,12 @@ impl MevApiImpl {
             .insert(bid_hash);
     }
 
-    /// Mirrors go-bsc `bidSimulator.bidMustBefore`: the deadline after which a bid is too late.
+    /// Mirrors go-bsc `bidutil.BidMustBefore`: the deadline after which a bid is too late.
     ///
-    /// `bid_must_before_ms = parent_timestamp_ms + block_interval_ms - no_interrupt_left_over_ms`
-    fn bid_must_before_ms(&self, parent_timestamp_secs: u64, block_interval_ms: u64) -> u128 {
-        (parent_timestamp_secs as u128) * 1000
-            + block_interval_ms as u128
-            - self.no_interrupt_left_over as u128
+    /// See [`bid_must_before_ms`] for the formula and why `parent_timestamp_ms` must be the
+    /// parent's full millisecond timestamp.
+    fn bid_must_before_ms(&self, parent_timestamp_ms: u64, block_interval_ms: u64) -> u128 {
+        bid_must_before_ms(parent_timestamp_ms, block_interval_ms, self.delay_left_over)
     }
 
     /// Get header by number from global header provider
@@ -443,7 +465,9 @@ impl MevApiImpl {
             .snapshot_by_hash(&head_header.hash_slow())
             .map(|s| s.block_interval)
             .unwrap_or(3_000); // 3 s default
-        let bid_must_before_ms = self.bid_must_before_ms(head_header.timestamp, block_interval_ms);
+        let parent_timestamp_ms =
+            crate::consensus::parlia::util::calculate_millisecond_timestamp(head_header);
+        let bid_must_before_ms = self.bid_must_before_ms(parent_timestamp_ms, block_interval_ms);
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1178,5 +1202,51 @@ mod bid_block_param_tests {
             MevApiImpl::mev_not_running().message(),
             "the validator stop accepting bids for now, try again later"
         );
+    }
+
+    #[test]
+    fn bid_must_before_matches_geth_formula() {
+        // parent at second 1_000, no sub-second component, 3s block interval, 15ms delay left
+        // over: bidutil.BidMustBefore = 1_000_000 + 3_000 - 15 = 1_002_985.
+        assert_eq!(super::bid_must_before_ms(1_000_000, 3_000, 15), 1_002_985);
+    }
+
+    #[test]
+    fn bid_must_before_uses_full_millisecond_parent_timestamp() {
+        // A parent with a nonzero sub-second component (carried in mixHash post-Lorentz) must
+        // shift the deadline forward by that amount, not be truncated away.
+        let parent_ms_no_subsecond = 1_000_000u64;
+        let parent_ms_with_subsecond = 1_000_400u64; // .400s into the block
+
+        let deadline_a = super::bid_must_before_ms(parent_ms_no_subsecond, 450, 15);
+        let deadline_b = super::bid_must_before_ms(parent_ms_with_subsecond, 450, 15);
+
+        assert_eq!(deadline_b - deadline_a, 400);
+    }
+
+    #[test]
+    fn bid_must_before_does_not_reject_everything_on_sub_second_intervals() {
+        // Regression guard for the original bug: dropping the parent's millisecond component and
+        // subtracting `no_interrupt_left_over` (500ms) instead of `delay_left_over` (15ms) made
+        // the deadline land at-or-before the parent's own timestamp on Fermi's 450ms interval,
+        // rejecting every bid as "too late" the instant the parent block appeared.
+        let parent_timestamp_ms =
+            crate::consensus::parlia::util::calculate_millisecond_timestamp(&alloy_consensus::Header {
+                timestamp: 1_700_000_000,
+                ..Default::default()
+            });
+        let fermi_block_interval_ms = 450;
+        let delay_left_over_ms = 15;
+
+        let deadline = super::bid_must_before_ms(
+            parent_timestamp_ms,
+            fermi_block_interval_ms,
+            delay_left_over_ms,
+        );
+
+        // The deadline must fall strictly after the parent's own timestamp, leaving a real
+        // admission window instead of being already in the past.
+        assert!(deadline > parent_timestamp_ms as u128);
+        assert_eq!(deadline, parent_timestamp_ms as u128 + fermi_block_interval_ms as u128 - 15);
     }
 }
