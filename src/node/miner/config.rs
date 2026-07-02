@@ -45,15 +45,14 @@ pub struct MiningConfig {
     /// Off by default; enable with `--mining.bid-block-enabled` or `BSC_MINING_BID_BLOCK_ENABLED`.
     pub bid_block_enabled: bool,
     /// Use the reth 2.0 sparse-trie background task for state-root computation
-    /// during MDBX-mode payload build.
+    /// during payload build.
     ///
-    /// When `true` (and the node is not in `--statedb.triedb` mode), the BSC miner
-    /// spawns a `StateRootHandle` per payload job, streams per-tx state diffs into
-    /// it via `set_state_hook`, and consumes the precomputed `(state_root,
-    /// trie_updates)` at finish time — mirroring upstream
-    /// `crates/ethereum/payload`'s flow. Falls back to the legacy synchronous
-    /// `state_root_with_updates` path when the global spawner has not been
-    /// registered or returns `None`.
+    /// When `true`, the BSC miner spawns a `StateRootHandle` per payload job,
+    /// streams per-tx state diffs into it via `set_state_hook`, and consumes the
+    /// precomputed `(state_root, trie_updates)` at finish time — mirroring
+    /// upstream `crates/ethereum/payload`'s flow. Falls back to the legacy
+    /// synchronous `state_root_with_updates` path when the global spawner has
+    /// not been registered or returns `None`.
     pub use_sparse_trie_state_root: bool,
 }
 

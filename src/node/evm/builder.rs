@@ -6,28 +6,19 @@ use crate::{
         executor::BscBlockExecutor,
         factory::BscEvmFactory,
     },
-    shared::BscEngineApiTx,
     BscPrimitives,
 };
-use alloy_consensus::BlockHeader as _;
 use alloy_evm::block::{BlockExecutor, GasOutput};
 use alloy_evm::eth::receipt_builder::ReceiptBuilder;
-use alloy_primitives::BlockHash;
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
-use reth_engine_primitives::BSCEngineMessageError;
-use reth_engine_tree::engine::EngineApiRequest;
-use reth_engine_tree::tree::CustomRequestMessage;
-use reth_evm::execute::{BlockBuilder, BlockBuilderOutcome, BlockBuilderOutcomeWithDiffLayer, BlockExecutionError, ExecutorTx};
+use reth_evm::execute::{BlockBuilder, BlockBuilderOutcome, BlockExecutionError, ExecutorTx};
 use reth_primitives_traits::{
     HeaderTy, NodePrimitives, Recovered, RecoveredBlock, SealedHeader, SignerRecoverable, TxTy,
 };
 use reth_provider::StateProvider;
 use reth_trie_common::updates::TrieUpdates;
-use rust_eth_triedb::get_global_triedb;
-use rust_eth_triedb_common::DiffLayers;
 use revm::context::BlockEnv;
 use revm::database::{states::bundle_state::BundleRetention, State};
-use tokio::sync::oneshot;
 
 /// rewrite BasicBlockBuilder, mainly about the finish() trait.
 /// add system txs to sealed block.
@@ -51,14 +42,10 @@ where
     /// Optional precomputed `(state_root, trie_updates)` from a sparse-trie background
     /// task.
     ///
-    /// When `Some`, `finish_with_difflayer`'s MDBX branch uses these values directly
-    /// and skips the blocking `state_root_with_updates` call. Set via either:
+    /// When `Some`, `finish` uses these values directly and skips the blocking
+    /// `state_root_with_updates` call. Set via either:
     ///   * [`BscBlockBuilder::with_precomputed_state_root`] (fluent), or
-    ///   * the `state_root_precomputed` parameter on the [`BlockBuilder::finish`]
-    ///     trait method (which forwards into this field before delegating to
-    ///     `finish_with_difflayer`).
-    ///
-    /// `None` in the TrieDB branch and when no sparse-trie task is in flight.
+    ///   * the `state_root_precomputed` parameter on [`BlockBuilder::finish`].
     pub precomputed_state_root: Option<(alloy_primitives::B256, TrieUpdates)>,
 }
 
@@ -86,15 +73,9 @@ where
     }
 
     /// Install a precomputed `(state_root, trie_updates)` to be consumed by
-    /// `finish_with_difflayer` (MDBX branch only). Returns `self` for fluent usage.
+    /// `finish`. Returns `self` for fluent usage.
     ///
     /// Pass `None` to clear an existing value.
-    ///
-    /// Currently has no callers — `BscPayloadJob` obtains its builder via
-    /// `evm_config.builder_for_next_block(...)` which returns `impl BlockBuilder`, so
-    /// this concrete setter is unreachable through the trait. Kept as the documented
-    /// integration point for the follow-up sparse-trie wiring; see TODOs in
-    /// `payload.rs` for the two ways to bridge the gap.
     #[allow(dead_code)]
     pub fn with_precomputed_state_root(
         mut self,
@@ -146,34 +127,21 @@ where
         }
     }
 
-    // fetch assembled_system_txs and add into sealed block.
+    /// Finalize the block and compute the state root.
+    ///
+    /// Honors `self.precomputed_state_root` (set via
+    /// [`BscBlockBuilder::with_precomputed_state_root`] or the
+    /// `state_root_precomputed` parameter) to skip the blocking
+    /// `state_root_with_updates` call when a sparse-trie task has already computed
+    /// the root concurrently with execution.
     fn finish(
         mut self,
         state: impl StateProvider,
         state_root_precomputed: Option<(alloy_primitives::B256, TrieUpdates)>,
     ) -> Result<BlockBuilderOutcome<BscPrimitives>, BlockExecutionError> {
-        // Forward into the field so `finish_with_difflayer` (whose trait signature
-        // takes only `state`) can pick it up.
         if state_root_precomputed.is_some() {
             self.precomputed_state_root = state_root_precomputed;
         }
-        Ok(self.finish_with_difflayer(state)?.inner)
-    }
-
-    /// Finalize the block and compute the state root, supporting both MDBX-only and
-    /// TrieDB modes. When TrieDB is active the returned `difflayer` is `Some`, carrying
-    /// the precomputed diff layer that can be committed directly to the TrieDB backend;
-    /// otherwise `difflayer` is `None` and the caller falls back to the standard
-    /// hashed-state + trie-updates path.
-    ///
-    /// MDBX branch additionally honors `self.precomputed_state_root` (set via
-    /// [`BscBlockBuilder::with_precomputed_state_root`] or routed through `fn finish`)
-    /// to skip the blocking `state_root_with_updates` call when a sparse-trie task has
-    /// already computed the root concurrently with execution.
-    fn finish_with_difflayer(
-        mut self,
-        state: impl StateProvider,
-    ) -> Result<BlockBuilderOutcomeWithDiffLayer<BscPrimitives>, BlockExecutionError> {
         let finish_start = std::time::Instant::now();
         // `executor.finish()` runs BSC's post-execution system txs (slash spoiled
         // validator, distribute fees / finality rewards, breathe-block validator-set
@@ -261,6 +229,8 @@ where
                         target: "bsc::builder",
                         parent_hash = %self.parent.hash(),
                         block_number = %(self.parent.number + 1),
+                        user_tx_count = self.transactions.len(),
+                        state_root = %outcome.state_root,
                         wait_ms = wait_start.elapsed().as_millis(),
                         "Sparse-trie state-root delivered post-finish()"
                     );
@@ -278,47 +248,7 @@ where
         let state_root_start = std::time::Instant::now();
         let hashed_state = state.hashed_post_state(&db.bundle_state);
 
-        // Use triedb to calculate state root
-        let (state_root, trie_updates, produced_difflayer) = if rust_eth_triedb::triedb_manager::is_triedb_active() {
-            let mut triedb = get_global_triedb();
-            // Miner-side: try to use triedb prefetcher + parent difflayers from execution ctx.
-            let prefetch_state = self.ctx.triedb_prefetcher.take().and_then(|p| p.finish());
-            let parent_state_root = (**self.parent).state_root();
-            let trie_hashed_state = hashed_state.to_triedb_hashed_post_state();
-            let difflayers_opt = self.ctx.parent_difflayers.as_ref();
-
-            let triedb_calc_started = std::time::Instant::now();
-            let (new_root, new_difflayer) = triedb
-                .intermediate_and_commit_hashed_post_state(
-                    parent_state_root,
-                    difflayers_opt,
-                    &trie_hashed_state,
-                    prefetch_state,
-                )
-                .map_err(BlockExecutionError::other)?;
-            let triedb_calc_with_prefetch_ms = triedb_calc_started.elapsed().as_millis();
-
-            tracing::debug!(
-                target: "bsc::builder",
-                parent_hash = %self.parent.hash(),
-                block_number = %(self.parent.number + 1),
-                parent_state_root = %parent_state_root,
-                new_state_root = %new_root,
-                has_parent_difflayers = difflayers_opt.is_some(),
-                user_tx_count = self.transactions.len(),
-                hashed_accounts = hashed_state.accounts.len(),
-                hashed_storages = hashed_state.storages.len(),
-                hashed_storage_slots = hashed_state
-                    .storages
-                    .values()
-                    .map(|s| s.storage.len())
-                    .sum::<usize>(),
-                triedb_calc_ms = triedb_calc_with_prefetch_ms,
-                triedb_calc_us = triedb_calc_started.elapsed().as_micros(),
-                "Calculated state root using triedb"
-            );
-            (new_root, TrieUpdates::default(), Some(new_difflayer))
-        } else if let Some((root, updates)) = self
+        let (state_root, trie_updates) = if let Some((root, updates)) = self
             .ctx
             .state_root_precomputed_sink
             .as_ref()
@@ -332,7 +262,7 @@ where
             //
             // Preferred source is the sink on `self.ctx` (filled by the payload layer
             // post-exec); the field on `Self` is a fallback that `fn finish` populates
-            // when callers route through the trait method.
+            // when called with `state_root_precomputed`.
             tracing::debug!(
                 target: "bsc::builder",
                 parent_hash = %self.parent.hash(),
@@ -340,13 +270,43 @@ where
                 user_tx_count = self.transactions.len(),
                 hashed_accounts = hashed_state.accounts.len(),
                 hashed_storages = hashed_state.storages.len(),
+                state_root = %root,
                 "Using precomputed state root from sparse-trie task"
             );
-            (root, updates, None)
+            (root, updates)
         } else {
-            let (root, updates) =
-                state.state_root_with_updates(hashed_state.clone()).map_err(BlockExecutionError::other)?;
-            (root, updates, None)
+            // Fix #1: bound the synchronous state-root fallback by the slot deadline.
+            //
+            // When the sparse-trie precomputed root is unavailable (recv_timeout expired, or no
+            // handle was spawned) we land here on the synchronous full-trie walk
+            // `state_root_with_updates`. Under a deep miner overlay this walk takes ~700ms — far
+            // past the block period. Running it anyway is doubly harmful: it produces a candidate
+            // the miner has already given up waiting for, and it pins a CPU core ~700ms into the
+            // next slot, shrinking the next block's build budget and cascading further
+            // empty/low-gas blocks. If we are already at/over the state-root deadline
+            // (`end_mining_timestamp_ms - STATE_ROOT_WAIT_MARGIN_MS`), abort this candidate so the
+            // miner ships the best already-completed candidate on time instead of over-running.
+            if let Some(deadline_ms) = self.ctx.state_root_deadline_ms {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                if now_ms >= deadline_ms {
+                    metrics::counter!("bsc_builder_sync_root_deadline_abort_total").increment(1);
+                    tracing::warn!(
+                        target: "bsc::builder",
+                        parent_hash = %self.parent.hash(),
+                        block_number = %(self.parent.number + 1),
+                        now_ms,
+                        deadline_ms,
+                        "Synchronous state-root would miss the slot deadline; aborting candidate to avoid slot over-run"
+                    );
+                    return Err(BlockExecutionError::msg(format!(
+                        "synchronous state-root aborted: past slot deadline (now_ms={now_ms} >= deadline_ms={deadline_ms})"
+                    )));
+                }
+            }
+            state.state_root_with_updates(hashed_state.clone()).map_err(BlockExecutionError::other)?
         };
         let state_root_duration = state_root_start.elapsed();
 
@@ -410,10 +370,7 @@ where
         );
 
         let block = RecoveredBlock::new_unhashed(block, senders);
-        Ok(BlockBuilderOutcomeWithDiffLayer {
-            inner: BlockBuilderOutcome { execution_result: result, hashed_state, trie_updates, block },
-            difflayer: produced_difflayer,
-        })
+        Ok(BlockBuilderOutcome { execution_result: result, hashed_state, trie_updates, block })
     }
 
     fn executor_mut(&mut self) -> &mut Self::Executor {
@@ -427,22 +384,4 @@ where
     fn into_executor(self) -> Self::Executor {
         self.executor
     }
-}
-
-/// Request the parent block's diff layers from the engine (TrieDB mode only).
-///
-/// Diff layers capture the trie-node changes produced by prior blocks and serve as
-/// incremental input for computing the next state root via TrieDB, avoiding a full
-/// trie traversal from disk.
-pub async fn request_difflayer(
-    engine_api_tx: &BscEngineApiTx,
-    parent_hash: BlockHash,
-) -> Result<DiffLayers, BSCEngineMessageError> {
-    let (tx, rx) = oneshot::channel();
-    let _ = engine_api_tx.send(EngineApiRequest::Custom(CustomRequestMessage::RequestDiffLayer {
-        parent_hash,
-        tx,
-        _phantom: std::marker::PhantomData,
-    }));
-    rx.await.map_err(BSCEngineMessageError::internal)?.map_err(BSCEngineMessageError::internal)
 }

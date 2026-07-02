@@ -293,11 +293,9 @@ mod tests {
 
     #[test]
     fn test_pasteur_present_but_unscheduled_in_schedules() {
-        for hardforks in [
-            BscHardfork::bsc_mainnet(),
-            BscHardfork::bsc_testnet(),
-            BscHardfork::bsc_qanet(),
-        ] {
+        // Mainnet and testnet have no announced Pasteur activation yet, so it must
+        // stay dormant (u64::MAX) until a real timestamp is set.
+        for hardforks in [BscHardfork::bsc_mainnet(), BscHardfork::bsc_testnet()] {
             let activation = hardforks.fork(BscHardfork::Pasteur);
             assert_eq!(
                 activation,
@@ -305,6 +303,14 @@ mod tests {
                 "Pasteur should be defined but dormant until a real activation is set"
             );
         }
+
+        // qanet schedules Pasteur for testing, so it must have a concrete activation.
+        let qanet_activation = BscHardfork::bsc_qanet().fork(BscHardfork::Pasteur);
+        assert_eq!(
+            qanet_activation,
+            ForkCondition::Timestamp(1782779400),
+            "qanet should have Pasteur scheduled at its configured timestamp"
+        );
     }
 
     #[test]
