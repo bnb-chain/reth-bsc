@@ -52,7 +52,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 /// Milliseconds reserved at the end of each block period for state-root computation.
 ///
@@ -2276,6 +2276,56 @@ where
         let sealed = bid.block.sealed_block().clone();
         let block_number = sealed.header().number();
         let block_hash = sealed.hash();
+        let parent_hash = sealed.header().parent_hash;
+
+        // Late canonical-state re-check, mirroring the guards `ResultWorkWorker::submit_payload`
+        // applies to the local/legacy path: a reorg during the build window can leave this
+        // BidBlock's parent no longer canonical, or a competing block already at/above this
+        // height. Catching that here — before broadcast — is strictly better than only finding
+        // out via a failed `engine.new_payload` after the block has already been announced to
+        // peers and the builder punished for a staleness issue that wasn't its fault.
+        if let Some(best_block_number) = crate::shared::get_best_canonical_block_number() {
+            if block_number <= best_block_number {
+                debug!(
+                    target: "bsc::miner::payload",
+                    trace_id = self.trace_id,
+                    bid_hash = %bid.bid_hash,
+                    block_number,
+                    best_block_number,
+                    "BidBlock stale: block number not greater than best block number; discarding"
+                );
+                return false;
+            }
+        }
+
+        let parent_number = block_number.saturating_sub(1);
+        match crate::shared::get_canonical_header_by_number_from_provider(parent_number) {
+            Some(canonical_parent) if canonical_parent.hash_slow() == parent_hash => {}
+            Some(canonical_parent) => {
+                debug!(
+                    target: "bsc::miner::payload",
+                    trace_id = self.trace_id,
+                    bid_hash = %bid.bid_hash,
+                    block_number,
+                    parent_number,
+                    expected_parent_hash = %parent_hash,
+                    canonical_parent_hash = %canonical_parent.hash_slow(),
+                    "BidBlock's parent no longer canonical (reorg occurred); discarding"
+                );
+                return false;
+            }
+            None => {
+                debug!(
+                    target: "bsc::miner::payload",
+                    trace_id = self.trace_id,
+                    bid_hash = %bid.bid_hash,
+                    block_number,
+                    parent_number,
+                    "BidBlock's parent not found in canonical chain; discarding"
+                );
+                return false;
+            }
+        }
 
         // Expensive blob KZG verification on the winning block, BEFORE broadcast (go-bsc
         // `prepareBidBlockTask` → `validateBidBlockBlobTxs`). Cheap structural sidecar checks already
@@ -2313,7 +2363,30 @@ where
             );
             return false;
         };
+
+        // Double-sign guard shared with the local/legacy path (`ResultWorkWorker::submit_payload`
+        // in bsc_miner.rs, via `crate::shared::check_and_record_mined_block`): the validator must
+        // not sign a BidBlock at the same height on the same parent as a block it already sealed,
+        // whether that prior block came from the local path or another BidBlock. This must be the
+        // last check before the point of no return (the send below) — every earlier `return false`
+        // in this function falls back to submitting the local payload for this same
+        // (block_number, parent_hash), which must remain free to record and claim it.
+        if !crate::shared::check_and_record_mined_block(block_number, parent_hash) {
+            error!(
+                target: "bsc::miner::payload",
+                trace_id = self.trace_id,
+                bid_hash = %bid.bid_hash,
+                block_number,
+                parent_hash = %parent_hash,
+                "Reject Double Sign!! BidBlock at height already sealed on this parent; discarding"
+            );
+            return false;
+        }
+
         if let Err(e) = sender.send((sealed, bid.builder, bid.bid_hash)) {
+            // The slot was never actually broadcast — release it so the local-payload fallback
+            // below is not wrongly rejected as a double sign for a block that never went out.
+            crate::shared::forget_recorded_mined_block(block_number, parent_hash);
             warn!(
                 target: "bsc::miner::payload",
                 trace_id = self.trace_id,
