@@ -70,6 +70,13 @@ impl Bid {
     }
 }
 
+/// Evicts entries older than `min_block_number` from the `best_bid_block` map, keyed by parent
+/// hash. Split out as a free function (from [`BidSimulator::clear`]) so it's directly testable
+/// without constructing a full `BidSimulator`.
+fn retain_recent_bid_blocks(map: &mut HashMap<B256, BidBlockTask>, min_block_number: u64) {
+    map.retain(|_, task| task.block.sealed_block().header().number() >= min_block_number);
+}
+
 // bid loop receive bid from client and commit bid to simulator
 // 1. last block number check
 // 2. pack bid runtime and calculate bid value
@@ -300,6 +307,11 @@ where
         self.best_bid_to_run.write().retain(|_, bid| bid.block_number >= min_block_number);
         self.simulating_bid.write().retain(|_, bid| bid.block_number >= min_block_number);
         self.best_bid.write().retain(|_, bid| bid.bid.block_number >= min_block_number);
+
+        // Clear old BEP-675 BidBlocks (go-bsc `clearLoop` prunes `bestBidBlock[parentHash]` the
+        // same way). Without this, every parent hash that ever received an admitted BidBlock keeps
+        // its full sealed block — including blob data — in memory forever.
+        retain_recent_bid_blocks(&mut self.best_bid_block.write(), min_block_number);
 
         // Clear old pending bids by parsing block_number from key prefix
         // Key format: "{block_number}-{builder}-{bid_hash}"
@@ -1143,5 +1155,65 @@ where
             return Err(e);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::node::primitives::{BscBlock, BscBlockBody};
+    use reth_primitives_traits::RecoveredBlock;
+
+    fn bid_block_task_at(number: u64, parent_hash: B256) -> BidBlockTask {
+        let header = alloy_consensus::Header { number, parent_hash, ..Default::default() };
+        let body = BscBlockBody {
+            inner: reth_ethereum_primitives::BlockBody {
+                transactions: Vec::new(),
+                ommers: Vec::new(),
+                withdrawals: None,
+            },
+            sidecars: None,
+        };
+        BidBlockTask {
+            block: RecoveredBlock::new_unhashed(BscBlock { header, body }, Vec::new()),
+            gas_fee: U256::from(1),
+            system_tx_start: 0,
+            builder: Address::ZERO,
+            bid_hash: B256::random(),
+        }
+    }
+
+    #[test]
+    fn retain_recent_bid_blocks_evicts_stale_entries_by_block_number() {
+        let mut map = HashMap::new();
+        let old_parent = B256::repeat_byte(0x11);
+        let recent_parent = B256::repeat_byte(0x22);
+        map.insert(old_parent, bid_block_task_at(100, B256::random()));
+        map.insert(recent_parent, bid_block_task_at(110, B256::random()));
+
+        // min_block_number = 105: the block-100 entry is stale and must be evicted; the
+        // block-110 entry is recent and must survive.
+        retain_recent_bid_blocks(&mut map, 105);
+
+        assert!(!map.contains_key(&old_parent), "stale BidBlock must be evicted");
+        assert!(map.contains_key(&recent_parent), "recent BidBlock must be retained");
+    }
+
+    #[test]
+    fn retain_recent_bid_blocks_keeps_entry_at_exact_threshold() {
+        let mut map = HashMap::new();
+        let parent = B256::repeat_byte(0x33);
+        map.insert(parent, bid_block_task_at(105, B256::random()));
+
+        retain_recent_bid_blocks(&mut map, 105);
+
+        assert!(map.contains_key(&parent), "entry exactly at the threshold must be retained");
+    }
+
+    #[test]
+    fn retain_recent_bid_blocks_is_a_noop_on_empty_map() {
+        let mut map: HashMap<B256, BidBlockTask> = HashMap::new();
+        retain_recent_bid_blocks(&mut map, 1_000);
+        assert!(map.is_empty());
     }
 }
