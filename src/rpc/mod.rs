@@ -1,5 +1,6 @@
 pub mod admin;
 pub mod blob;
+pub mod debug_builder;
 pub mod eth_config;
 pub mod eth_ext;
 pub mod mev;

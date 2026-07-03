@@ -111,20 +111,43 @@ impl Serialize for BscBlobTransactionSidecar {
     }
 }
 
+/// Hex-decode a list of hex strings into `FixedBytes<N>`, one at a time via a heap buffer.
+///
+/// Deliberately does NOT deserialize the blob fields as `Vec<FixedBytes<131072>>` directly: a
+/// `Blob` is 128 KiB *by value*, and serde_json's deeply-nested generic `deserialize` frames move
+/// those values up the call stack. In an unoptimized (debug) build those moves are not elided, so
+/// several 128 KiB copies are live at once and a single blob overflows a tokio worker's 2 MiB
+/// stack — a remotely-triggerable validator crash via `mev_sendBidBlock`. Decoding from hex
+/// strings (which live on the heap) in this flat loop keeps peak stack to one blob-sized temporary
+/// regardless of build profile. (Release elides the moves and fits in 2 MiB even at 6 blobs, but
+/// relying on the optimizer for memory safety is exactly the fragility this avoids.)
+fn hex_decode_fixed<const N: usize, E: serde::de::Error>(
+    hexes: Vec<String>,
+) -> Result<Vec<alloy_primitives::FixedBytes<N>>, E> {
+    let mut out = Vec::with_capacity(hexes.len());
+    for h in hexes {
+        let s = h.strip_prefix("0x").unwrap_or(&h);
+        let bytes = alloy_primitives::hex::decode(s)
+            .map_err(|e| E::custom(format!("invalid hex: {e}")))?;
+        if bytes.len() != N {
+            return Err(E::custom(format!("expected {N} bytes, got {}", bytes.len())));
+        }
+        out.push(alloy_primitives::FixedBytes::<N>::from_slice(&bytes));
+    }
+    Ok(out)
+}
+
 impl<'de> Deserialize<'de> for BscBlobTransactionSidecar {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let wire = BlobSidecarWire::<
-            BlobTxSidecarWire<
-                Vec<alloy_eips::eip4844::Blob>,
-                Vec<alloy_eips::eip4844::Bytes48>,
-                Vec<alloy_eips::eip4844::Bytes48>,
-            >,
-        >::deserialize(deserializer)?;
+        let wire =
+            BlobSidecarWire::<BlobTxSidecarWire<Vec<String>, Vec<String>, Vec<String>>>::deserialize(
+                deserializer,
+            )?;
         Ok(Self {
             inner: BlobTransactionSidecar {
-                blobs: wire.blob_sidecar.blobs,
-                commitments: wire.blob_sidecar.commitments,
-                proofs: wire.blob_sidecar.proofs,
+                blobs: hex_decode_fixed(wire.blob_sidecar.blobs)?,
+                commitments: hex_decode_fixed(wire.blob_sidecar.commitments)?,
+                proofs: hex_decode_fixed(wire.blob_sidecar.proofs)?,
             },
             block_number: wire.block_number,
             block_hash: wire.block_hash,

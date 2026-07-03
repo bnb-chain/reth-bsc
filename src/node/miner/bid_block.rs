@@ -28,7 +28,6 @@ use alloy_consensus::{Header, Transaction, TxLegacy};
 use alloy_eips::eip2718::Decodable2718;
 use alloy_primitives::{keccak256, Address, Bytes, Signature, B256, U256};
 use alloy_rlp::{Decodable, Encodable};
-use reth::consensus::HeaderValidator;
 use reth::primitives::SealedHeader;
 use reth_chainspec::EthChainSpec;
 use reth_ethereum_primitives::{BlockBody, TransactionSigned};
@@ -535,8 +534,12 @@ pub fn verify_bid_block_header(
     snap: &Snapshot,
 ) -> Result<(), PreSealVerifyError> {
     let sealed = SealedHeader::seal_slow(header.clone());
+    // go-bsc's `VerifyUnsealedHeader` scope: the standalone field checks WITHOUT the
+    // wall-clock future bound — a bid's next-slot timestamp is legitimately in the future
+    // (by up to one block interval) when it arrives, and geth only applies the future check
+    // on the sync path (`verifyHeader`).
     parlia
-        .validate_header(&sealed)
+        .validate_unsealed_header_fields(&sealed)
         .map_err(|e| PreSealVerifyError::InvalidHeader(e.to_string()))?;
 
     if !snap.validators.contains(&header.beneficiary) {
@@ -697,12 +700,21 @@ impl std::error::Error for PreSealVerifyError {}
 pub fn bind_sign_bid_block_system_txs(
     txs: &[TransactionSigned],
     system_tx_start: usize,
+    chain_id: u64,
 ) -> Result<Vec<TransactionSigned>, BindSignError> {
     let mut out = Vec::with_capacity(txs.len());
     out.extend_from_slice(&txs[..system_tx_start]);
     for (offset, tx) in txs[system_tx_start..].iter().enumerate() {
         // Recover the typed transaction, dropping the all-zero placeholder signature, then re-sign.
-        let unsigned = tx.clone().into_typed_transaction();
+        let mut unsigned = tx.clone().into_typed_transaction();
+        // geth's wire format for unsigned system txs carries no chain id (it only exists in `v`
+        // after signing), so the decoded placeholder has `chain_id: None`. go-bsc bind-signs with
+        // the EIP-155 signer (`signTxFn(..., chainID)`); mirror that here — otherwise the signed
+        // tx's signature_hash disagrees with the executor's regenerated template (which carries
+        // the chain id) and every geth-built BidBlock fails import with `UnexpectedSystemTx`.
+        if let alloy_consensus::EthereumTypedTransaction::Legacy(ref mut legacy) = unsigned {
+            legacy.chain_id = Some(chain_id);
+        }
         let signed = sign_system_transaction(unsigned)
             .map_err(|e| BindSignError { index: system_tx_start + offset, detail: e.to_string() })?;
         out.push(signed);
@@ -834,8 +846,9 @@ pub fn simulate_bid_block(
         verify_bid_block_payload(chain_spec, decoded, parent.header(), validator, expected_gas_limit)
             .map_err(SimulateBidBlockError::Verify)?;
 
-    let txs = bind_sign_bid_block_system_txs(&decoded.txs, system_tx_start)
-        .map_err(SimulateBidBlockError::BindSign)?;
+    let txs =
+        bind_sign_bid_block_system_txs(&decoded.txs, system_tx_start, chain_spec.chain().id())
+            .map_err(SimulateBidBlockError::BindSign)?;
 
     // Install the validator's block context: its own extra (vanity; finalize appends the seal slot)
     // and the tx root for the now-signed tx set. Other block-context fields are left as the builder
@@ -882,6 +895,78 @@ pub fn simulate_bid_block(
 mod tests {
     use super::*;
     use alloy_primitives::{address, b256, bytes, hex};
+
+    /// Repro for the blob-BidBlock admission stack overflow: run the decode+hash path a tokio
+    /// worker takes (2 MiB stack) on a BidBlockArgs carrying real 128 KiB blobs.
+    fn run_blob_admission_on_stack(stack_bytes: usize, num_blobs: usize) -> std::thread::Result<()> {
+        use alloy_consensus::{BlobTransactionSidecar, TxEip4844};
+        use alloy_eips::eip4844::{Blob, Bytes48};
+        use alloy_eips::eip2718::Encodable2718;
+
+        // Build a blob tx + matching sidecar exactly like a real submission (non-empty blobs).
+        let tx = TxEip4844 {
+            chain_id: 714,
+            nonce: 0,
+            gas_limit: 21_000,
+            max_fee_per_gas: 1,
+            max_priority_fee_per_gas: 1,
+            to: Address::ZERO,
+            value: U256::ZERO,
+            access_list: Default::default(),
+            blob_versioned_hashes: vec![B256::ZERO],
+            max_fee_per_blob_gas: 1,
+            input: Bytes::new(),
+        };
+        let signed = TransactionSigned::new_unhashed(tx.into(), dummy_sig());
+        let raw = Bytes::from(signed.encoded_2718());
+        let sidecar = BscBlobTransactionSidecar {
+            inner: BlobTransactionSidecar {
+                blobs: vec![Blob::default(); num_blobs],
+                commitments: vec![Bytes48::default(); num_blobs],
+                proofs: vec![Bytes48::default(); num_blobs],
+            },
+            block_number: 1,
+            block_hash: B256::ZERO,
+            tx_index: 0,
+            tx_hash: *signed.hash(),
+            version: 0,
+        };
+        let args = BidBlockArgs {
+            bid_block: BidBlock {
+                header: vector_a_block().header,
+                transactions: vec![raw],
+                sidecars: vec![sidecar],
+            },
+            signature: Bytes::from(vec![0u8; 65]),
+        };
+        // Round-trip through JSON like the RPC layer does, then run the admission decode/hash.
+        let json = serde_json::to_string(&args).unwrap();
+
+        let handle = std::thread::Builder::new()
+            .stack_size(stack_bytes)
+            .spawn(move || {
+                // The full pre-KZG admission decode path the RPC layer runs per submission.
+                let parsed: BidBlockArgs = serde_json::from_str(&json).unwrap();
+                let _hash = parsed.bid_block.hash();
+                let _decoded = parsed.to_decoded_bid_block(Address::ZERO).unwrap();
+                std::hint::black_box(&_decoded);
+            })
+            .unwrap();
+        handle.join()
+    }
+
+    #[test]
+    fn blob_admission_does_not_overflow_tokio_stack() {
+        // Regression guard for the blob-BidBlock stack overflow: a tokio worker has a 2 MiB stack
+        // by default, and admission (JSON decode + hash) runs on it. A max-blob (6) BidBlock must
+        // fit — otherwise any whitelisted builder crashes the validator via mev_sendBidBlock. The
+        // fix keeps blob decoding on the heap (see `hex_decode_fixed` in node::primitives); before
+        // it, even a single blob overflowed in a debug build.
+        assert!(
+            run_blob_admission_on_stack(2 * 1024 * 1024, 6).is_ok(),
+            "blob BidBlock admission overflowed a 2 MiB stack (tokio worker default)"
+        );
+    }
 
     /// A header matching go-ethereum's literal `&Header{...}` defaults: the three roots and
     /// ommers hash are ZERO (alloy's `Header::default()` would set them to the empty-trie hashes).
@@ -1552,8 +1637,13 @@ mod tests {
 
         // user tx, then two unsigned (zero-signature) system txs.
         let txs = vec![legacy_tx(0), deposit_system_tx(100), deposit_system_tx(0)];
-        let out = bind_sign_bid_block_system_txs(&txs, 1).unwrap();
+        let out = bind_sign_bid_block_system_txs(&txs, 1, 714).unwrap();
         assert_eq!(out.len(), 3);
+
+        // The bind-signed legacy system txs must carry the chain id (EIP-155), matching the
+        // executor's regenerated template — geth signs system txs with the chain-id signer.
+        assert_eq!(out[1].chain_id(), Some(714));
+        assert_eq!(out[2].chain_id(), Some(714));
 
         // Leading user tx is untouched.
         assert_eq!(out[0], txs[0]);

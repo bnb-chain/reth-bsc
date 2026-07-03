@@ -2417,38 +2417,58 @@ where
             return false;
         }
 
-        if let Err(e) =
-            sender.send((sealed, bid.builder, bid.bid_hash, bid.gas_fee, bid.system_tx_start))
-        {
-            // The slot was never actually broadcast — release it so the local-payload fallback
-            // below is not wrongly rejected as a double sign for a block that never went out.
-            crate::shared::forget_recorded_mined_block(block_number, parent_hash);
-            warn!(
+        // go-bsc's `Parlia.Seal` waits until the header's timestamp (`delayForRamanujanFork`)
+        // before releasing the sealed block, so a bid-won block is never announced before its
+        // own time — otherwise the wall-clock future bound peers (and our own import) enforce
+        // on the sync path would reject it. Mirror that timing with a delayed background send,
+        // the same pattern `submit_payload` uses for the local path.
+        let target_ms =
+            crate::consensus::parlia::util::calculate_millisecond_timestamp(sealed.header());
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let delay = std::time::Duration::from_millis(target_ms.saturating_sub(now_ms));
+
+        let trace_id = self.trace_id;
+        let (builder_addr, bid_hash, gas_fee, system_tx_start) =
+            (bid.builder, bid.bid_hash, bid.gas_fee, bid.system_tx_start);
+        tokio::spawn(async move {
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            if let Err(e) = sender.send((sealed, builder_addr, bid_hash, gas_fee, system_tx_start))
+            {
+                // The slot was never actually broadcast — release it so a later legitimate
+                // block at this height is not wrongly rejected as a double sign.
+                crate::shared::forget_recorded_mined_block(block_number, parent_hash);
+                warn!(
+                    target: "bsc::miner::payload",
+                    trace_id,
+                    bid_hash = %bid_hash,
+                    error = %e,
+                    "Failed to hand BidBlock to import service"
+                );
+                return;
+            }
+
+            use crate::metrics::BscMevMetrics;
+            use once_cell::sync::Lazy;
+            static MEV_METRICS: Lazy<BscMevMetrics> = Lazy::new(BscMevMetrics::default);
+            MEV_METRICS.bid_win_total.increment(1);
+
+            info!(
                 target: "bsc::miner::payload",
-                trace_id = self.trace_id,
-                bid_hash = %bid.bid_hash,
-                error = %e,
-                "Failed to hand BidBlock to import service; falling back to local payload"
+                trace_id,
+                block_number,
+                block_hash = %block_hash,
+                bid_hash = %bid_hash,
+                builder = ?builder_addr,
+                bid_fees = %gas_fee,
+                best_local_fee = %best_local_fee,
+                "[BID BLOCK selected] broadcasting before verification (zero-simulate)"
             );
-            return false;
-        }
-
-        use crate::metrics::BscMevMetrics;
-        use once_cell::sync::Lazy;
-        static MEV_METRICS: Lazy<BscMevMetrics> = Lazy::new(BscMevMetrics::default);
-        MEV_METRICS.bid_win_total.increment(1);
-
-        info!(
-            target: "bsc::miner::payload",
-            trace_id = self.trace_id,
-            block_number,
-            block_hash = %block_hash,
-            bid_hash = %bid.bid_hash,
-            builder = ?bid.builder,
-            bid_fees = %bid.gas_fee,
-            best_local_fee = %best_local_fee,
-            "[BID BLOCK selected] broadcasting before verification (zero-simulate)"
-        );
+        });
         true
     }
 

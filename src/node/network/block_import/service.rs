@@ -553,13 +553,32 @@ where
                     PayloadStatusEnum::Valid => {
                         tracing::info!(target: "bsc::block_import", number = block_number, hash = %block_hash, %bid_hash, "[BID BLOCK VERIFIED] advancing fork choice");
 
+                        if let Err(e) = forkchoice_engine.update_forkchoice(&header).await {
+                            tracing::warn!(target: "bsc::block_import", number = block_number, hash = %block_hash, error = %e, "BidBlock: failed to update fork choice");
+                        }
+
                         // Post-import average-gas-price floor check (go-bsc
                         // `validateBidBlockAverageGasPrice`), run now that the block is confirmed
                         // valid. This does not reject the (already-canonical) block — it only
                         // affects the builder's future SendBidBlock permission, since the
                         // deposit-derived `gas_fee` is the sole source of the fee ranking and a
                         // builder could otherwise pad it while underpaying for user-tx gas.
-                        match forkchoice_engine.provider.receipts_by_block(block_hash.into()) {
+                        //
+                        // Must run AFTER the fork-choice update (go-bsc runs it after
+                        // `InsertChain`): the receipts of a just-inserted payload only become
+                        // visible through the provider once the block is canonical in the
+                        // in-memory tree. Retry briefly to absorb canonicalization lag.
+                        let mut receipts_lookup =
+                            forkchoice_engine.provider.receipts_by_block(block_hash.into());
+                        for _ in 0..10 {
+                            if matches!(receipts_lookup, Ok(Some(_))) {
+                                break;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            receipts_lookup =
+                                forkchoice_engine.provider.receipts_by_block(block_hash.into());
+                        }
+                        match receipts_lookup {
                             Ok(Some(receipts)) => {
                                 // Mirrors the fallback `MevApiImpl::new` uses when the CLI/env
                                 // hasn't published a global config yet: fall through to env vars
@@ -600,10 +619,6 @@ where
                             Err(e) => {
                                 tracing::warn!(target: "bsc::block_import", number = block_number, hash = %block_hash, error = %e, "BidBlock: failed to fetch receipts for gas-price check");
                             }
-                        }
-
-                        if let Err(e) = forkchoice_engine.update_forkchoice(&header).await {
-                            tracing::warn!(target: "bsc::block_import", number = block_number, hash = %block_hash, error = %e, "BidBlock: failed to update fork choice");
                         }
                     }
                     PayloadStatusEnum::Invalid { validation_error } => {

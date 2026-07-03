@@ -66,6 +66,18 @@ where
     }
 }
 
+/// Whether a block's header `requests_hash` is acceptable post-execution.
+///
+/// BEP-675 block-source tagging: validators overwrite `requests_hash` with a `BlockMEVInfo` tag
+/// (version + builder address) on MEV-won blocks. go-bsc does not validate this field
+/// post-execution at all (BSC produces no EIP-7685 requests), so the strict computed==header check
+/// is kept only for untagged blocks; any well-formed MEV tag is accepted even when it differs from
+/// the computed requests hash.
+fn requests_hash_ok(computed: B256, header_requests_hash: B256) -> bool {
+    computed == header_requests_hash
+        || crate::node::miner::block_mev_info::decode_block_mev_info(header_requests_hash).is_some()
+}
+
 /// BSC consensus implementation.
 ///
 /// Provides basic checks as outlined in the execution specs.
@@ -291,7 +303,7 @@ impl<ChainSpec: EthChainSpec<Header = Header> + BscHardforks + 'static> FullCons
                 return Err(ConsensusError::RequestsHashMissing);
             };
             let requests_hash = requests.requests_hash();
-            if requests_hash != header_requests_hash {
+            if !requests_hash_ok(requests_hash, header_requests_hash) {
                 return Err(ConsensusError::BodyRequestsHashDiff(
                     GotExpected::new(requests_hash, header_requests_hash).into(),
                 ));
@@ -317,6 +329,28 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::{Arc, RwLock};
     use tokio::sync::mpsc;
+
+    /// Regression guard for the BEP-675 post-execution requests-hash fix: an MEV-won block carries
+    /// a BlockMEVInfo tag in `requests_hash` that differs from the computed (empty) requests hash,
+    /// and post-execution validation must accept it; a genuinely-wrong requests hash must still be
+    /// rejected.
+    #[test]
+    fn requests_hash_ok_accepts_mev_tag_but_rejects_garbage() {
+        use crate::node::miner::block_mev_info::{encode_block_mev_info, BlockMevInfoVersion};
+        let computed = crate::consensus::parlia::EMPTY_WITHDRAWALS_HASH; // any "real" computed hash
+        let builder = Address::repeat_byte(0xab);
+
+        // Exact match → ok (untagged / local block path).
+        assert!(super::requests_hash_ok(computed, computed));
+
+        // A well-formed BidBlock MEV tag that differs from computed → accepted.
+        let tag = encode_block_mev_info(BlockMevInfoVersion::BidBlock, builder);
+        assert_ne!(tag, computed);
+        assert!(super::requests_hash_ok(computed, tag));
+
+        // A non-tag hash that differs from computed → rejected (real mismatch).
+        assert!(!super::requests_hash_ok(computed, B256::repeat_byte(0x11)));
+    }
 
     #[derive(Clone, Default)]
     struct TestProvider;
