@@ -1042,9 +1042,6 @@ pub fn get_engine_api_tx() -> Option<BscEngineApiTx> {
     ENGINE_API_TX.get().cloned()
 }
 
-// Note: difflayers are now returned directly from the BSC block builder (`finish_bsc`) and carried
-// through `BscBuiltPayload` / `ExecutedBlockWithTrieUpdates`. We no longer use a global cache.
-
 #[cfg(test)]
 mod tests {
     use super::*;

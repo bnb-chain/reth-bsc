@@ -270,8 +270,6 @@ fn trusted_local_build_produces_block() {
                     extra_data: Default::default(),
                     slot_number: None,
                 },
-                parent_difflayers: None,
-                triedb_prefetcher: None,
                 validator_cache_sink: None,
                 turn_length_sink: None,
                 state_root_precomputed_sink: None,
@@ -282,8 +280,8 @@ fn trusted_local_build_produces_block() {
         .expect("builder for next block");
 
     builder.apply_pre_execution_changes().expect("apply pre-execution changes");
-    let out = builder.finish_with_difflayer(&state_provider).expect("finish builder");
-    let BlockBuilderOutcome { block, .. } = out.inner;
+    let out = builder.finish(&state_provider, None).expect("finish builder");
+    let BlockBuilderOutcome { block, .. } = out;
 
     assert_eq!(block.header().number, 1);
     assert_ne!(block.header().state_root, B256::ZERO);
@@ -345,8 +343,6 @@ fn round_trip_build_finalize_reexecute_agree() {
                         extra_data: alloy_primitives::Bytes::from(vec![0u8; 32]),
                         slot_number: None,
                     },
-                    parent_difflayers: None,
-                    triedb_prefetcher: None,
                     validator_cache_sink: None,
                     turn_length_sink: None,
                     state_root_precomputed_sink: None,
@@ -356,8 +352,8 @@ fn round_trip_build_finalize_reexecute_agree() {
             )
             .expect("builder for next block");
         builder.apply_pre_execution_changes().expect("apply pre-execution changes");
-        let out = builder.finish_with_difflayer(&state_provider).expect("finish builder");
-        let BlockBuilderOutcome { block, .. } = out.inner;
+        let out = builder.finish(&state_provider, None).expect("finish builder");
+        let BlockBuilderOutcome { block, .. } = out;
         block
     };
     let reference_root = block.header().state_root;
@@ -458,8 +454,6 @@ fn execution_gate_round_trip() {
             extra_data: alloy_primitives::Bytes::from(vec![0u8; 32]),
             slot_number: None,
         },
-        parent_difflayers: None,
-        triedb_prefetcher: None,
         validator_cache_sink: None,
         turn_length_sink: None,
         state_root_precomputed_sink: None,
@@ -479,8 +473,8 @@ fn execution_gate_round_trip() {
             .builder_for_next_block(&mut db, &genesis, attrs(genesis.timestamp + 3, diff, genesis.gas_limit))
             .expect("builder b1");
         builder.apply_pre_execution_changes().expect("pre-exec b1");
-        let out = builder.finish_with_difflayer(&state_provider).expect("finish b1");
-        let BlockBuilderOutcome { execution_result, block, .. } = out.inner;
+        let out = builder.finish(&state_provider, None).expect("finish b1");
+        let BlockBuilderOutcome { execution_result, block, .. } = out;
         let senders = block.senders().to_vec();
         let mut plain = block.sealed_block().clone_block();
         finalize_new_header(parlia.clone(), &genesis_snap, &genesis, &mut plain.header, &snapshot_provider, (genesis.timestamp + 3) * 1000)
@@ -527,8 +521,8 @@ fn execution_gate_round_trip() {
             .expect("builder b2");
         builder.apply_pre_execution_changes().expect("pre-exec b2");
         builder.execute_transaction(user.clone().try_into_recovered().expect("recover user")).expect("exec user");
-        let out = builder.finish_with_difflayer(&state_provider).expect("finish b2");
-        let BlockBuilderOutcome { execution_result, block, .. } = out.inner;
+        let out = builder.finish(&state_provider, None).expect("finish b2");
+        let BlockBuilderOutcome { execution_result, block, .. } = out;
         let output = BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
         (block, output)
     };

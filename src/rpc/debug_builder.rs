@@ -201,8 +201,6 @@ where
                     extra_data: Default::default(),
                     slot_number: None,
                 },
-                parent_difflayers: None,
-                triedb_prefetcher: None,
                 validator_cache_sink: None,
                 turn_length_sink: None,
                 state_root_precomputed_sink: None,
@@ -228,9 +226,9 @@ where
     // finish() executes the trailing system txs (deposit with value = accrued
     // SYSTEM_ADDRESS fees) and computes state root / receipts root / bloom / gasUsed.
     let out = builder
-        .finish_with_difflayer(&state_provider)
+        .finish(&state_provider, None)
         .map_err(|e| internal_err(format!("finish: {e}")))?;
-    let BlockBuilderOutcome { block, .. } = out.inner;
+    let BlockBuilderOutcome { block, .. } = out;
 
     let mut header = block.clone_header();
     // The assembler leaves prev_randao in mix_hash and env difficulty in the header; a real
