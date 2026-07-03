@@ -232,7 +232,7 @@ fn run_case(
         let exec_witness = ExecutionWitness::default();
         program_inputs.push((block.clone(), exec_witness));
 
-        // Trie removal (see TRIEDB_REMOVAL_PLAN.md): the per-block state-root
+        // Trie removal: the per-block state-root
         // recomputation oracle is gone — this client maintains no Merkle trie. The
         // correctness oracle is the fixture's `postState` account-level assertion
         // below. Hashed post-state (plain keccak hashing, no trie walk) is still

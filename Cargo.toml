@@ -67,8 +67,7 @@ reth-rpc-convert = { git = "https://github.com/bnb-chain/reth.git", rev = "da4cb
 reth-rpc-engine-api = { git = "https://github.com/bnb-chain/reth.git", rev = "da4cb22adf904ae22c33ca8851ea8e4b39710784" }
 reth-rpc-server-types = { git = "https://github.com/bnb-chain/reth.git", rev = "da4cb22adf904ae22c33ca8851ea8e4b39710784" }
 # reth-trie-common stays: upstream trait signatures (BlockBuilder::finish,
-# PayloadValidator) name its types. reth-trie-db is fully removed (trie removal,
-# see TRIEDB_REMOVAL_PLAN.md).
+# PayloadValidator) name its types. reth-trie-db is fully removed (trie removal).
 reth-trie-common = { git = "https://github.com/bnb-chain/reth.git", rev = "da4cb22adf904ae22c33ca8851ea8e4b39710784" }
 reth-tasks = { git = "https://github.com/bnb-chain/reth.git", rev = "da4cb22adf904ae22c33ca8851ea8e4b39710784" }
 reth-transaction-pool = { git = "https://github.com/bnb-chain/reth.git", rev = "da4cb22adf904ae22c33ca8851ea8e4b39710784" }

@@ -148,7 +148,7 @@ fn main() -> eyre::Result<()> {
     // Initialize bid package queue at startup
     reth_bsc::shared::init_bid_package_queue();
 
-    // Trie removal (see TRIEDB_REMOVAL_PLAN.md): this binary maintains no Merkle
+    // Trie removal: this binary maintains no Merkle
     // trie. Force fastnode mode (`--engine.skip-state-root-validation`) for the
     // `node` command so state-root computation/validation is skipped in the engine
     // tree and the pipeline hashing/Merkle stages are disabled — an operator
@@ -165,7 +165,7 @@ fn main() -> eyre::Result<()> {
         argv.iter().any(|a| a.to_string_lossy().starts_with("--engine.skip-state-root-validation"));
     if is_node_cmd && !has_fastnode_flag {
         eprintln!(
-            "reth-bsc-zerosim: forcing --engine.skip-state-root-validation (fastnode); \
+            "reth-bsc: trie removal — forcing --engine.skip-state-root-validation (fastnode); \
              this node maintains no trie and does not verify state roots"
         );
         argv.push("--engine.skip-state-root-validation".into());

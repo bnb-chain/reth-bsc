@@ -106,10 +106,10 @@ where
 
     /// Finalize the block.
     ///
-    /// Trie removal (see `TRIEDB_REMOVAL_PLAN.md`): this node maintains no Merkle
+    /// Trie removal: this node maintains no Merkle
     /// trie, so no state root is computed. Locally-built blocks carry
     /// `B256::ZERO` in the `state_root` header field — valid only under the
-    /// zerosim protocol assumption that peers do not verify state roots
+    /// trie-less protocol assumption that peers do not verify state roots
     /// (fastnode mode). BEP-675 BidBlocks are sealed with the builder-supplied
     /// header and never pass through here.
     ///

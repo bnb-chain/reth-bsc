@@ -107,7 +107,7 @@ where
                 MiningConfig::from_env()
             };
 
-        // Trie removal (see TRIEDB_REMOVAL_PLAN.md): the sparse-trie state-root
+        // Trie removal: the sparse-trie state-root
         // spawner that used to be registered here is gone — this node maintains no
         // Merkle trie and locally-built blocks carry a zero state root.
 

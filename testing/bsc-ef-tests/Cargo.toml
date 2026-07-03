@@ -36,7 +36,7 @@ reth-revm = { git = "https://github.com/bnb-chain/reth.git", rev = "da4cb22adf90
     "std",
 ] }
 reth-tracing = { git = "https://github.com/bnb-chain/reth.git", rev = "da4cb22adf904ae22c33ca8851ea8e4b39710784" }
-# Trie removal (TRIEDB_REMOVAL_PLAN.md): reth-trie / reth-trie-db are gone; only
+# Trie removal: reth-trie / reth-trie-db are gone; only
 # reth-trie-common remains for HashedPostState/KeccakKeyHasher (hashed state, no trie).
 reth-trie-common = { git = "https://github.com/bnb-chain/reth.git", rev = "da4cb22adf904ae22c33ca8851ea8e4b39710784" }
 
