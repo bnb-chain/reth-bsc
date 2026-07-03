@@ -148,30 +148,7 @@ fn main() -> eyre::Result<()> {
     // Initialize bid package queue at startup
     reth_bsc::shared::init_bid_package_queue();
 
-    // Trie removal: this binary maintains no Merkle
-    // trie. Force fastnode mode (`--engine.skip-state-root-validation`) for the
-    // `node` command so state-root computation/validation is skipped in the engine
-    // tree and the pipeline hashing/Merkle stages are disabled — an operator
-    // forgetting the flag must not silently fall back to full trie mode. This node
-    // therefore trusts header state roots and disables `eth_getProof` /
-    // `eth_getAccount`; locally-built blocks carry a zero state root.
-    let mut argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
-    let is_node_cmd = argv
-        .iter()
-        .skip(1)
-        .find(|a| !a.to_string_lossy().starts_with('-'))
-        .is_some_and(|a| a == "node");
-    let has_fastnode_flag =
-        argv.iter().any(|a| a.to_string_lossy().starts_with("--engine.skip-state-root-validation"));
-    if is_node_cmd && !has_fastnode_flag {
-        eprintln!(
-            "reth-bsc: trie removal — forcing --engine.skip-state-root-validation (fastnode); \
-             this node maintains no trie and does not verify state roots"
-        );
-        argv.push("--engine.skip-state-root-validation".into());
-    }
-
-    Cli::<BscChainSpecParser, BscCliArgs>::parse_from(argv).run_with_components::<BscNode>(
+    Cli::<BscChainSpecParser, BscCliArgs>::parse().run_with_components::<BscNode>(
         |spec| {
             (
                 BscEvmConfig::new(spec.clone()),

@@ -106,15 +106,17 @@ where
 
     /// Finalize the block.
     ///
-    /// Trie removal: this node maintains no Merkle
-    /// trie, so no state root is computed. Locally-built blocks carry
-    /// `B256::ZERO` in the `state_root` header field — valid only under the
-    /// trie-less protocol assumption that peers do not verify state roots
-    /// (fastnode mode). BEP-675 BidBlocks are sealed with the builder-supplied
-    /// header and never pass through here.
+    /// State root: computed synchronously via `state_root_with_updates` by
+    /// default. Under fastnode mode (`--engine.skip-state-root-validation`) the
+    /// trie tables are not maintained, so no root can be computed — the header
+    /// carries `B256::ZERO`, which is only valid because fastnode peers do not
+    /// verify state roots; such blocks are network-invalid outside fastnode.
+    /// BEP-675 BidBlocks are sealed with the builder-supplied header and never
+    /// pass through here.
     ///
     /// The `state_root_precomputed` parameter is part of the upstream
-    /// `BlockBuilder` trait signature and is ignored.
+    /// `BlockBuilder` trait signature and is ignored (the sparse-trie
+    /// background-root machinery was removed).
     fn finish(
         mut self,
         state: impl StateProvider,
@@ -134,11 +136,12 @@ where
         // merge all transitions into bundle state
         db.merge_transitions(BundleRetention::Reverts);
 
-        // Hashed post-state is still produced (keccak over changed accounts, no trie
-        // walk) — under storage v2 the hashed tables are the canonical state
-        // representation, and downstream payload consumers expect it.
         let hashed_state = state.hashed_post_state(&db.bundle_state);
-        let (state_root, trie_updates) = (alloy_primitives::B256::ZERO, TrieUpdates::default());
+        let (state_root, trie_updates) = if reth_engine_primitives::is_fastnode_active() {
+            (alloy_primitives::B256::ZERO, TrieUpdates::default())
+        } else {
+            state.state_root_with_updates(hashed_state.clone()).map_err(BlockExecutionError::other)?
+        };
 
         let user_tx_len = self.transactions.len();
         let system_tx_len = assembled_system_txs.len();

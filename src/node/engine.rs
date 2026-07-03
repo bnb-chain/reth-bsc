@@ -107,9 +107,11 @@ where
                 MiningConfig::from_env()
             };
 
-        // Trie removal: the sparse-trie state-root
-        // spawner that used to be registered here is gone — this node maintains no
-        // Merkle trie and locally-built blocks carry a zero state root.
+        // The sparse-trie state-root spawner that used to be registered here is
+        // gone. The builder computes roots synchronously (`state_root_with_updates`)
+        // in default mode, and seals a zero root under fastnode
+        // (`--engine.skip-state-root-validation`), where trie tables are not
+        // maintained.
 
         // Skip mining setup if disabled
         if !mining_config.is_mining_enabled() {

@@ -287,21 +287,20 @@ fn trusted_local_build_produces_block() {
     let BlockBuilderOutcome { block, .. } = out;
 
     assert_eq!(block.header().number, 1);
-    // Trie removal: locally-built blocks carry the zero placeholder state root
-    // (no trie is maintained; roots are not computed or verified).
-    assert_eq!(block.header().state_root, B256::ZERO);
+    // Default (non-fastnode) mode: the builder computes a real state root.
+    // Under fastnode it would be B256::ZERO; tests run without fastnode.
+    assert_ne!(block.header().state_root, B256::ZERO);
 }
 
 /// Round-trip: build block 1 via the builder path, finalize/seal it, then re-execute the sealed
 /// block via the executor path and assert both paths agree on the post-state.
 ///
 /// This is the core verify-mode invariant a BidBlock relies on: a builder builds (builder path) and
-/// the validator re-executes (executor path, consuming the block's system txs). With the trie
-/// removed there is no state root to compare; the invariant is preserved at the hashed-post-state
-/// level (keccak-hashed accounts + storage from the bundle state), which is strictly finer-grained
-/// than root equality. Finalization (difficulty + ECDSA seal) is required because the executor
-/// validates a *sealed* header; the build uses `prev_randao = calculate_difficulty(...)` so it
-/// matches the finalized difficulty.
+/// the validator re-executes (executor path, consuming the block's system txs). Checked at two
+/// levels: the recomputed state root must equal the builder header's root, and the full hashed
+/// post-state (every account and storage slot) must match. Finalization (difficulty + ECDSA seal)
+/// is required because the executor validates a *sealed* header; the build uses
+/// `prev_randao = calculate_difficulty(...)` so it matches the finalized difficulty.
 #[test]
 fn round_trip_build_finalize_reexecute_agree() {
     use reth_bsc::{
@@ -318,7 +317,10 @@ fn round_trip_build_finalize_reexecute_agree() {
     use reth_primitives_traits::RecoveredBlock;
     use reth_provider::DatabaseProviderFactory;
     use reth_revm::{database::StateProviderDatabase, db::State};
-    use reth_trie_common::{HashedPostState, KeccakKeyHasher};
+    use reth_trie::{HashedPostState, KeccakKeyHasher, StateRoot};
+    use reth_trie_db::{
+        DatabaseHashedCursorFactory, DatabaseStateRoot, DatabaseTrieCursorFactory, LegacyKeyAdapter,
+    };
 
     let chain_spec = signable_test_chain_spec();
     let factory = create_test_provider_factory_with_chain_spec(Arc::new(chain_spec.inner.clone()));
@@ -363,6 +365,7 @@ fn round_trip_build_finalize_reexecute_agree() {
         let BlockBuilderOutcome { block, hashed_state, .. } = out;
         (block, hashed_state)
     };
+    let reference_root = block.header().state_root;
 
     // Finalize/seal the built block (difficulty + ECDSA seal); state root is unchanged.
     let snapshot_provider =
@@ -400,6 +403,17 @@ fn round_trip_build_finalize_reexecute_agree() {
     // Builder path and executor path must agree on the full hashed post-state
     // (every account: nonce/balance/code-hash, and every storage slot).
     assert_eq!(reexecuted_hashed_state, reference_hashed_state);
+
+    // ... and the recomputed state root must match the builder header's root.
+    let (computed_root, _) = <StateRoot<
+        DatabaseTrieCursorFactory<_, LegacyKeyAdapter>,
+        DatabaseHashedCursorFactory<_>,
+    > as DatabaseStateRoot<_>>::overlay_root_with_updates(
+        provider.tx_ref(),
+        &reexecuted_hashed_state.clone_into_sorted(),
+    )
+    .expect("compute state root");
+    assert_eq!(computed_root, reference_root);
 }
 
 /// Full execution gate: with a real block-1→block-2 chain (Kepler active), build block 2 with a
@@ -435,7 +449,10 @@ fn execution_gate_round_trip() {
         StateWriter, StaticFileProviderFactory, StaticFileWriter,
     };
     use reth_revm::{database::StateProviderDatabase, db::State};
-    use reth_trie_common::{HashedPostState, KeccakKeyHasher};
+    use reth_trie::{HashedPostState, KeccakKeyHasher, StateRoot};
+    use reth_trie_db::{
+        DatabaseHashedCursorFactory, DatabaseStateRoot, DatabaseTrieCursorFactory, LegacyKeyAdapter,
+    };
 
     let chain_spec = kepler_signable_chain_spec();
     let factory = create_test_provider_factory_with_node_types::<BscNode>(chain_spec.clone());
@@ -559,8 +576,7 @@ fn execution_gate_round_trip() {
         let output = BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
         (block, output)
     };
-    // Trie removal: the byte-exact verify-mode proof is now at the hashed-post-state
-    // level (see `round_trip_build_finalize_reexecute_agree`) instead of root equality.
+    let reference_root = block2_ref.header().state_root;
     let reference_hashed_state =
         HashedPostState::from_bundle_state::<KeccakKeyHasher>(out2.state.state());
 
@@ -617,4 +633,15 @@ fn execution_gate_round_trip() {
         HashedPostState::from_bundle_state::<KeccakKeyHasher>(output.state.state());
 
     assert_eq!(simulated_hashed_state, reference_hashed_state);
+
+    // Byte-exact verify-mode proof: recomputed root equals the reference build's root.
+    let (computed_root, _) = <StateRoot<
+        DatabaseTrieCursorFactory<_, LegacyKeyAdapter>,
+        DatabaseHashedCursorFactory<_>,
+    > as DatabaseStateRoot<_>>::overlay_root_with_updates(
+        provider.tx_ref(),
+        &simulated_hashed_state.clone_into_sorted(),
+    )
+    .expect("state root");
+    assert_eq!(computed_root, reference_root);
 }

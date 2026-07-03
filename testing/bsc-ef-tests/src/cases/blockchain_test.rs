@@ -28,7 +28,10 @@ use reth_provider::{
     StaticFileProviderFactory, StaticFileSegment, StaticFileWriter,
 };
 use reth_revm::{database::StateProviderDatabase, State};
-use reth_trie_common::{HashedPostState, KeccakKeyHasher};
+use reth_trie::{HashedPostState, KeccakKeyHasher, StateRoot};
+use reth_trie_db::{
+    DatabaseHashedCursorFactory, DatabaseStateRoot, DatabaseTrieCursorFactory, LegacyKeyAdapter,
+};
 use std::{
     collections::BTreeMap,
     fs,
@@ -232,13 +235,28 @@ fn run_case(
         let exec_witness = ExecutionWitness::default();
         program_inputs.push((block.clone(), exec_witness));
 
-        // Trie removal: the per-block state-root
-        // recomputation oracle is gone — this client maintains no Merkle trie. The
-        // correctness oracle is the fixture's `postState` account-level assertion
-        // below. Hashed post-state (plain keccak hashing, no trie walk) is still
-        // produced because the hashed tables are written as canonical state.
+        // Compute and check the post state root
         let hashed_state =
             HashedPostState::from_bundle_state::<KeccakKeyHasher>(output.state.state());
+        let (computed_state_root, _) = <StateRoot<
+            DatabaseTrieCursorFactory<_, LegacyKeyAdapter>,
+            DatabaseHashedCursorFactory<_>,
+        > as DatabaseStateRoot<_>>::overlay_root_with_updates(
+            provider.tx_ref(),
+            &hashed_state.clone_into_sorted(),
+        )
+        .map_err(|err| Error::block_failed(block_number, program_inputs.clone(), err))?;
+
+        if computed_state_root != block.state_root {
+            return Err(Error::block_failed(
+                block_number,
+                program_inputs.clone(),
+                Error::Assertion(format!(
+                    "state root mismatch: computed {computed_state_root:?}, expected {:?}",
+                    block.state_root
+                )),
+            ));
+        }
 
         // Commit the post state to the database
         provider
@@ -259,19 +277,11 @@ fn run_case(
         _parent = block.clone();
     }
 
-    // Validate the post-state. With the state-root oracle removed (trie removal),
-    // this account-level assertion is the only state-correctness check. Fixtures
-    // that carry no `postState` (root-hash-only fixtures) get NO state verification
-    // — surface that instead of passing silently.
+    // Validate the post-state
     if let Some(expected_post_state) = &case.post_state {
         for (address, account) in expected_post_state {
             account.assert_db(*address, provider.tx_ref())?;
         }
-    } else {
-        eprintln!(
-            "warning: fixture provides no postState; state correctness NOT verified \
-             (state-root oracle removed with the trie)"
-        );
     }
 
     Ok(program_inputs)
