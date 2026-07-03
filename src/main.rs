@@ -5,15 +5,13 @@ use reth::{
     consensus::FullConsensus,
     version::{default_reth_version_metadata, try_init_version_metadata},
 };
-use reth_bsc::consensus::parlia::bls_signer;
-use reth_bsc::node::consensus::BscConsensus;
 use reth_bsc::{
     chainspec::{genesis_override, parser::BscChainSpecParser},
-    node::{evm::config::BscEvmConfig, BscNode},
+    consensus::parlia::bls_signer,
+    node::{consensus::BscConsensus, evm::config::BscEvmConfig, BscNode},
     BscPrimitives,
 };
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 // We use jemalloc for performance reasons
 #[cfg(all(feature = "jemalloc", unix))]
@@ -39,13 +37,6 @@ pub struct BscCliArgs {
     /// Minimum gas tip for mined blocks (e.g., 1000000000 for 1G, 1000000000000 for 1T)
     #[arg(long = "mining.min-gas-tip")]
     pub mining_min_gas_tip: Option<u128>,
-
-    /// Use reth 2.0 sparse-trie background task for state-root computation in
-    /// payload build (opt-in).
-    ///
-    /// Env alternative: `BSC_MINING_USE_SPARSE_TRIE_STATE_ROOT=true`.
-    #[arg(long = "mining.use-sparse-trie-state-root")]
-    pub mining_use_sparse_trie_state_root: bool,
 
     /// Accept BEP-675 builder-proposed blocks via `mev_sendBidBlock`.
     ///
@@ -157,7 +148,30 @@ fn main() -> eyre::Result<()> {
     // Initialize bid package queue at startup
     reth_bsc::shared::init_bid_package_queue();
 
-    Cli::<BscChainSpecParser, BscCliArgs>::parse().run_with_components::<BscNode>(
+    // Trie removal (see TRIEDB_REMOVAL_PLAN.md): this binary maintains no Merkle
+    // trie. Force fastnode mode (`--engine.skip-state-root-validation`) for the
+    // `node` command so state-root computation/validation is skipped in the engine
+    // tree and the pipeline hashing/Merkle stages are disabled — an operator
+    // forgetting the flag must not silently fall back to full trie mode. This node
+    // therefore trusts header state roots and disables `eth_getProof` /
+    // `eth_getAccount`; locally-built blocks carry a zero state root.
+    let mut argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let is_node_cmd = argv
+        .iter()
+        .skip(1)
+        .find(|a| !a.to_string_lossy().starts_with('-'))
+        .is_some_and(|a| a == "node");
+    let has_fastnode_flag =
+        argv.iter().any(|a| a.to_string_lossy().starts_with("--engine.skip-state-root-validation"));
+    if is_node_cmd && !has_fastnode_flag {
+        eprintln!(
+            "reth-bsc-zerosim: forcing --engine.skip-state-root-validation (fastnode); \
+             this node maintains no trie and does not verify state roots"
+        );
+        argv.push("--engine.skip-state-root-validation".into());
+    }
+
+    Cli::<BscChainSpecParser, BscCliArgs>::parse_from(argv).run_with_components::<BscNode>(
         |spec| {
             (
                 BscEvmConfig::new(spec.clone()),
@@ -227,11 +241,6 @@ fn main() -> eyre::Result<()> {
 
                 if let Some(min_gas_tip) = args.mining_min_gas_tip {
                     mining_config.min_gas_tip = Some(min_gas_tip);
-                }
-
-                // CLI takes precedence over env BSC_MINING_USE_SPARSE_TRIE_STATE_ROOT.
-                if args.mining_use_sparse_trie_state_root {
-                    mining_config.use_sparse_trie_state_root = true;
                 }
 
                 // CLI takes precedence over env BSC_MINING_BID_BLOCK_ENABLED.

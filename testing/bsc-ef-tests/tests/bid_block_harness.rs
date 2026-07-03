@@ -7,20 +7,20 @@
 //! environment.
 //!
 //! This harness builds that environment on top of the same primitives the EF blockchain-test runner
-//! uses (`create_test_provider_factory_with_chain_spec` + genesis init + a state provider), but with
-//! the BSC chain spec / genesis so the system-contract execution path is exercised.
+//! uses (`create_test_provider_factory_with_chain_spec` + genesis init + a state provider), but
+//! with the BSC chain spec / genesis so the system-contract execution path is exercised.
 //!
 //! Step 1 (this file) is the scaffold: stand up the provider, initialize the BSC genesis, and
 //! confirm a state provider opens at the expected genesis. The trusted local build,
-//! `simulate_bid_block`, and the round-trip assertion (build a block → repackage as a DecodedBidBlock
-//! → simulate → assert identical hash/state root) build on this foundation.
+//! `simulate_bid_block`, and the round-trip assertion (build a block → repackage as a
+//! DecodedBidBlock → simulate → assert identical hash/state root) build on this foundation.
 
 use alloy_primitives::{address, b256, hex, B256};
-use reth_bsc::chainspec::{bsc::bsc_mainnet, BscChainSpec};
-use reth_bsc::consensus::parlia::{Parlia, Snapshot, SnapshotProvider};
-use reth_bsc::node::miner::signer::init_global_signer;
-use std::collections::HashMap;
-use std::sync::RwLock;
+use reth_bsc::{
+    chainspec::{bsc::bsc_mainnet, BscChainSpec},
+    consensus::parlia::{Parlia, Snapshot, SnapshotProvider},
+    node::miner::signer::init_global_signer,
+};
 use reth_chainspec::{
     make_genesis_header, BaseFeeParams, BaseFeeParamsKind, Chain, ChainHardforks, ChainSpec,
     EthChainSpec, EthereumHardfork, ForkCondition, Hardfork, NamedChain,
@@ -28,14 +28,18 @@ use reth_chainspec::{
 use reth_db_common::init::init_genesis;
 use reth_primitives_traits::SealedHeader;
 use reth_provider::test_utils::create_test_provider_factory_with_chain_spec;
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
 
 /// Address of Anvil dev key 0 (`ac0974…ff80`) — the validator whose key the harness controls, so it
 /// can build/seal blocks. The same key the miner tests initialize the global signer with.
 const TEST_VALIDATOR: alloy_primitives::Address =
     address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
 
-/// The private key matching [`TEST_VALIDATOR`] (Anvil dev key 0), used to seal/sign as the validator.
+/// The private key matching [`TEST_VALIDATOR`] (Anvil dev key 0), used to seal/sign as the
+/// validator.
 const TEST_VALIDATOR_KEY: B256 =
     b256!("0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
 
@@ -59,8 +63,7 @@ impl SnapshotProvider for MockSnapshotProvider {
 fn genesis_snapshot(chain_spec: Arc<BscChainSpec>) -> Snapshot {
     let parlia = Parlia::new(chain_spec.clone(), 200);
     let header = chain_spec.genesis_header();
-    let info =
-        parlia.parse_validators_from_header(header, 200).expect("parse genesis validators");
+    let info = parlia.parse_validators_from_header(header, 200).expect("parse genesis validators");
     Snapshot::new(info.consensus_addrs, 0, header.hash_slow(), 200, info.vote_addrs)
 }
 
@@ -72,15 +75,16 @@ fn signable_test_chain_spec() -> Arc<BscChainSpec> {
     build_signable_chain_spec(vec![])
 }
 
-/// Signable test spec with Kepler active (timestamp 0). Post-Kepler skips the `distribute_to_system`
-/// system-reward tx, so a normal block's trailing system-tx region is exactly `[deposit]` — what the
-/// BidBlock validation expects. Kepler activates independently; Luban/Lorentz/London stay off, so
-/// the validator encoding and header format stay simple.
+/// Signable test spec with Kepler active (timestamp 0). Post-Kepler skips the
+/// `distribute_to_system` system-reward tx, so a normal block's trailing system-tx region is
+/// exactly `[deposit]` — what the BidBlock validation expects. Kepler activates independently;
+/// Luban/Lorentz/London stay off, so the validator encoding and header format stay simple.
 fn kepler_signable_chain_spec() -> Arc<BscChainSpec> {
     use reth_bsc::hardforks::bsc::BscHardfork;
-    // Kepler requires London active (is_kepler_active_at_timestamp gates on is_london_active_at_block).
-    // genesis baseFeePerGas=0 keeps the base fee 0 for all blocks (0 * adjustment = 0), so a
-    // gas_price=1 user tx still pays a fee — which is what funds the validator deposit.
+    // Kepler requires London active (is_kepler_active_at_timestamp gates on
+    // is_london_active_at_block). genesis baseFeePerGas=0 keeps the base fee 0 for all blocks
+    // (0 * adjustment = 0), so a gas_price=1 user tx still pays a fee — which is what funds the
+    // validator deposit.
     let validator = hex::encode(TEST_VALIDATOR);
     let extra_data = format!("0x{}{}{}", "00".repeat(32), validator, "00".repeat(65));
     let genesis_json = format!(
@@ -237,8 +241,10 @@ fn publish_env(chain_spec: Arc<BscChainSpec>) {
 #[test]
 fn trusted_local_build_produces_block() {
     use reth_bsc::node::evm::config::{BscEvmConfig, BscNextBlockEnvAttributes};
-    use reth_evm::execute::{BlockBuilder, BlockBuilderOutcome};
-    use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
+    use reth_evm::{
+        execute::{BlockBuilder, BlockBuilderOutcome},
+        ConfigureEvm, NextBlockEnvAttributes,
+    };
     use reth_provider::DatabaseProviderFactory;
     use reth_revm::{database::StateProviderDatabase, db::State};
 
@@ -272,9 +278,6 @@ fn trusted_local_build_produces_block() {
                 },
                 validator_cache_sink: None,
                 turn_length_sink: None,
-                state_root_precomputed_sink: None,
-                trie_handle: None,
-                state_root_deadline_ms: None,
             },
         )
         .expect("builder for next block");
@@ -284,31 +287,38 @@ fn trusted_local_build_produces_block() {
     let BlockBuilderOutcome { block, .. } = out;
 
     assert_eq!(block.header().number, 1);
-    assert_ne!(block.header().state_root, B256::ZERO);
+    // Trie removal: locally-built blocks carry the zero placeholder state root
+    // (no trie is maintained; roots are not computed or verified).
+    assert_eq!(block.header().state_root, B256::ZERO);
 }
 
 /// Round-trip: build block 1 via the builder path, finalize/seal it, then re-execute the sealed
-/// block via the executor path and assert both paths agree on the post-state root.
+/// block via the executor path and assert both paths agree on the post-state.
 ///
 /// This is the core verify-mode invariant a BidBlock relies on: a builder builds (builder path) and
-/// the validator re-executes (executor path, consuming the block's system txs). Agreement on the
-/// state root means the validator faithfully reproduces the builder's block. Finalization
-/// (difficulty + ECDSA seal) is required because the executor validates a *sealed* header; the
-/// build uses `prev_randao = calculate_difficulty(...)` so it matches the finalized difficulty.
+/// the validator re-executes (executor path, consuming the block's system txs). With the trie
+/// removed there is no state root to compare; the invariant is preserved at the hashed-post-state
+/// level (keccak-hashed accounts + storage from the bundle state), which is strictly finer-grained
+/// than root equality. Finalization (difficulty + ECDSA seal) is required because the executor
+/// validates a *sealed* header; the build uses `prev_randao = calculate_difficulty(...)` so it
+/// matches the finalized difficulty.
 #[test]
 fn round_trip_build_finalize_reexecute_agree() {
-    use reth_bsc::consensus::parlia::util::calculate_difficulty;
-    use reth_bsc::node::evm::config::{BscEvmConfig, BscNextBlockEnvAttributes};
-    use reth_bsc::node::miner::util::finalize_new_header;
-    use reth_evm::execute::{BlockBuilder, BlockBuilderOutcome, Executor};
-    use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
+    use reth_bsc::{
+        consensus::parlia::util::calculate_difficulty,
+        node::{
+            evm::config::{BscEvmConfig, BscNextBlockEnvAttributes},
+            miner::util::finalize_new_header,
+        },
+    };
+    use reth_evm::{
+        execute::{BlockBuilder, BlockBuilderOutcome, Executor},
+        ConfigureEvm, NextBlockEnvAttributes,
+    };
     use reth_primitives_traits::RecoveredBlock;
     use reth_provider::DatabaseProviderFactory;
     use reth_revm::{database::StateProviderDatabase, db::State};
-    use reth_trie::{HashedPostState, KeccakKeyHasher, StateRoot};
-    use reth_trie_db::{
-        DatabaseHashedCursorFactory, DatabaseStateRoot, DatabaseTrieCursorFactory, LegacyKeyAdapter,
-    };
+    use reth_trie_common::{HashedPostState, KeccakKeyHasher};
 
     let chain_spec = signable_test_chain_spec();
     let factory = create_test_provider_factory_with_chain_spec(Arc::new(chain_spec.inner.clone()));
@@ -323,7 +333,7 @@ fn round_trip_build_finalize_reexecute_agree() {
 
     // Build block 1 via the builder path. Use a 32-byte vanity (so finalize's seal append reaches
     // the vanity+seal minimum) and prev_randao = the finalized difficulty (BSC PREVRANDAO).
-    let block = {
+    let (block, reference_hashed_state) = {
         let state_provider = provider.latest();
         let sp_db = StateProviderDatabase::new(&state_provider);
         let mut db = State::builder().with_database(sp_db).with_bundle_update().build();
@@ -345,18 +355,14 @@ fn round_trip_build_finalize_reexecute_agree() {
                     },
                     validator_cache_sink: None,
                     turn_length_sink: None,
-                    state_root_precomputed_sink: None,
-                    trie_handle: None,
-                    state_root_deadline_ms: None,
                 },
             )
             .expect("builder for next block");
         builder.apply_pre_execution_changes().expect("apply pre-execution changes");
         let out = builder.finish(&state_provider, None).expect("finish builder");
-        let BlockBuilderOutcome { block, .. } = out;
-        block
+        let BlockBuilderOutcome { block, hashed_state, .. } = out;
+        (block, hashed_state)
     };
-    let reference_root = block.header().state_root;
 
     // Finalize/seal the built block (difficulty + ECDSA seal); state root is unchanged.
     let snapshot_provider =
@@ -383,23 +389,17 @@ fn round_trip_build_finalize_reexecute_agree() {
 
     let finalized = RecoveredBlock::new_unhashed(plain, senders);
 
-    // Re-execute the sealed block via the executor path and recompute the state root.
+    // Re-execute the sealed block via the executor path and compare post-states.
     let state_provider2 = provider.latest();
     let evm_config = BscEvmConfig::new(chain_spec.clone());
     let executor = evm_config.batch_executor(StateProviderDatabase::new(&state_provider2));
     let output = executor.execute(&finalized).expect("re-execute sealed block");
-    let hashed = HashedPostState::from_bundle_state::<KeccakKeyHasher>(output.state.state());
-    let (computed_root, _) = <StateRoot<
-        DatabaseTrieCursorFactory<_, LegacyKeyAdapter>,
-        DatabaseHashedCursorFactory<_>,
-    > as DatabaseStateRoot<_>>::overlay_root_with_updates(
-        provider.tx_ref(),
-        &hashed.clone_into_sorted(),
-    )
-    .expect("compute state root");
+    let reexecuted_hashed_state =
+        HashedPostState::from_bundle_state::<KeccakKeyHasher>(output.state.state());
 
-    // Builder path and executor path must agree on the post-state root.
-    assert_eq!(computed_root, reference_root);
+    // Builder path and executor path must agree on the full hashed post-state
+    // (every account: nonce/balance/code-hash, and every storage slot).
+    assert_eq!(reexecuted_hashed_state, reference_hashed_state);
 }
 
 /// Full execution gate: with a real block-1→block-2 chain (Kepler active), build block 2 with a
@@ -411,26 +411,31 @@ fn execution_gate_round_trip() {
     use alloy_consensus::TxLegacy;
     use alloy_eips::eip2718::Encodable2718;
     use alloy_primitives::{Signature, TxKind};
-    use reth_bsc::consensus::parlia::util::calculate_difficulty;
-    use reth_bsc::node::evm::config::{BscEvmConfig, BscNextBlockEnvAttributes};
-    use reth_bsc::node::miner::bid_block::{simulate_bid_block, BidBlock, BidBlockArgs};
-    use reth_bsc::node::miner::signer::sign_system_transaction;
-    use reth_bsc::node::miner::util::finalize_new_header;
-    use reth_bsc::node::BscNode;
+    use reth_bsc::{
+        consensus::parlia::util::calculate_difficulty,
+        node::{
+            evm::config::{BscEvmConfig, BscNextBlockEnvAttributes},
+            miner::{
+                bid_block::{simulate_bid_block, BidBlock, BidBlockArgs},
+                signer::sign_system_transaction,
+                util::finalize_new_header,
+            },
+            BscNode,
+        },
+    };
     use reth_ethereum_primitives::TransactionSigned;
-    use reth_evm::execute::{BlockBuilder, BlockBuilderOutcome, BlockExecutionOutput, Executor};
-    use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
+    use reth_evm::{
+        execute::{BlockBuilder, BlockBuilderOutcome, BlockExecutionOutput, Executor},
+        ConfigureEvm, NextBlockEnvAttributes,
+    };
     use reth_primitives_traits::{RecoveredBlock, SignerRecoverable};
-    use reth_provider::test_utils::create_test_provider_factory_with_node_types;
     use reth_provider::{
-        BlockWriter, DBProvider, DatabaseProviderFactory, ExecutionOutcome, OriginalValuesKnown,
-        StateWriteConfig, StateWriter, StaticFileProviderFactory, StaticFileWriter,
+        test_utils::create_test_provider_factory_with_node_types, BlockWriter, DBProvider,
+        DatabaseProviderFactory, ExecutionOutcome, OriginalValuesKnown, StateWriteConfig,
+        StateWriter, StaticFileProviderFactory, StaticFileWriter,
     };
     use reth_revm::{database::StateProviderDatabase, db::State};
-    use reth_trie::{HashedPostState, KeccakKeyHasher, StateRoot};
-    use reth_trie_db::{
-        DatabaseHashedCursorFactory, DatabaseStateRoot, DatabaseTrieCursorFactory, LegacyKeyAdapter,
-    };
+    use reth_trie_common::{HashedPostState, KeccakKeyHasher};
 
     let chain_spec = kepler_signable_chain_spec();
     let factory = create_test_provider_factory_with_node_types::<BscNode>(chain_spec.clone());
@@ -456,9 +461,6 @@ fn execution_gate_round_trip() {
         },
         validator_cache_sink: None,
         turn_length_sink: None,
-        state_root_precomputed_sink: None,
-        trie_handle: None,
-        state_root_deadline_ms: None,
     };
 
     // --- Build + finalize + insert block 1 (absorbs the one-time system-contract init txs). ---
@@ -470,15 +472,26 @@ fn execution_gate_round_trip() {
         let evm_config = BscEvmConfig::new(chain_spec.clone());
         let diff = calculate_difficulty(&genesis_snap, TEST_VALIDATOR);
         let mut builder = evm_config
-            .builder_for_next_block(&mut db, &genesis, attrs(genesis.timestamp + 3, diff, genesis.gas_limit))
+            .builder_for_next_block(
+                &mut db,
+                &genesis,
+                attrs(genesis.timestamp + 3, diff, genesis.gas_limit),
+            )
             .expect("builder b1");
         builder.apply_pre_execution_changes().expect("pre-exec b1");
         let out = builder.finish(&state_provider, None).expect("finish b1");
         let BlockBuilderOutcome { execution_result, block, .. } = out;
         let senders = block.senders().to_vec();
         let mut plain = block.sealed_block().clone_block();
-        finalize_new_header(parlia.clone(), &genesis_snap, &genesis, &mut plain.header, &snapshot_provider, (genesis.timestamp + 3) * 1000)
-            .expect("finalize b1");
+        finalize_new_header(
+            parlia.clone(),
+            &genesis_snap,
+            &genesis,
+            &mut plain.header,
+            &snapshot_provider,
+            (genesis.timestamp + 3) * 1000,
+        )
+        .expect("finalize b1");
         let output = BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
         (RecoveredBlock::new_unhashed(plain, senders), output)
     };
@@ -492,7 +505,12 @@ fn execution_gate_round_trip() {
         snapshot_provider.insert(snap1);
         let provider = factory.database_provider_rw().unwrap();
         provider.insert_block(&block1).expect("insert b1");
-        provider.write_state(&ExecutionOutcome::single(1, out1), OriginalValuesKnown::Yes, StateWriteConfig::default())
+        provider
+            .write_state(
+                &ExecutionOutcome::single(1, out1),
+                OriginalValuesKnown::Yes,
+                StateWriteConfig::default(),
+            )
             .expect("write b1 state");
         provider.static_file_provider().commit().expect("sf commit");
         provider.commit().expect("commit b1");
@@ -506,10 +524,19 @@ fn execution_gate_round_trip() {
 
     // --- Build block 2 (reference) with a fee-paying user tx -> [user, deposit]. ---
     let user = sign_system_transaction(
-        TxLegacy { chain_id: None, nonce: 0, gas_price: 1, gas_limit: 21_000, to: TxKind::Call(alloy_primitives::Address::ZERO), value: alloy_primitives::U256::from(1u64), input: Default::default() }.into(),
+        TxLegacy {
+            chain_id: None,
+            nonce: 0,
+            gas_price: 1,
+            gas_limit: 21_000,
+            to: TxKind::Call(alloy_primitives::Address::ZERO),
+            value: alloy_primitives::U256::from(1u64),
+            input: Default::default(),
+        }
+        .into(),
     )
     .expect("sign user");
-    let (block2_ref, _out2): (RecoveredBlock<reth_bsc::BscBlock>, BlockExecutionOutput<_>) = {
+    let (block2_ref, out2): (RecoveredBlock<reth_bsc::BscBlock>, BlockExecutionOutput<_>) = {
         let provider = factory.database_provider_rw().unwrap();
         let state_provider = provider.latest();
         let sp_db = StateProviderDatabase::new(&state_provider);
@@ -517,16 +544,25 @@ fn execution_gate_round_trip() {
         let evm_config = BscEvmConfig::new(chain_spec.clone());
         let diff = calculate_difficulty(&block1_snap, TEST_VALIDATOR);
         let mut builder = evm_config
-            .builder_for_next_block(&mut db, &block1_sealed, attrs(block1_sealed.timestamp + 3, diff, block1_sealed.gas_limit))
+            .builder_for_next_block(
+                &mut db,
+                &block1_sealed,
+                attrs(block1_sealed.timestamp + 3, diff, block1_sealed.gas_limit),
+            )
             .expect("builder b2");
         builder.apply_pre_execution_changes().expect("pre-exec b2");
-        builder.execute_transaction(user.clone().try_into_recovered().expect("recover user")).expect("exec user");
+        builder
+            .execute_transaction(user.clone().try_into_recovered().expect("recover user"))
+            .expect("exec user");
         let out = builder.finish(&state_provider, None).expect("finish b2");
         let BlockBuilderOutcome { execution_result, block, .. } = out;
         let output = BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
         (block, output)
     };
-    let reference_root = block2_ref.header().state_root;
+    // Trie removal: the byte-exact verify-mode proof is now at the hashed-post-state
+    // level (see `round_trip_build_finalize_reexecute_agree`) instead of root equality.
+    let reference_hashed_state =
+        HashedPostState::from_bundle_state::<KeccakKeyHasher>(out2.state.state());
 
     // --- Repackage block 2 as a BidBlock: [user (signed), deposit (UNSIGNED placeholder)]. ---
     let ref_txs: Vec<TransactionSigned> = block2_ref.body().transactions().cloned().collect();
@@ -544,8 +580,11 @@ fn execution_gate_round_trip() {
         ],
         sidecars: vec![],
     };
-    let args = BidBlockArgs { bid_block: bid, signature: alloy_primitives::Bytes::from(vec![0u8; 65]) };
-    let decoded = args.to_decoded_bid_block(alloy_primitives::Address::repeat_byte(0xbb)).expect("decode bid");
+    let args =
+        BidBlockArgs { bid_block: bid, signature: alloy_primitives::Bytes::from(vec![0u8; 65]) };
+    let decoded = args
+        .to_decoded_bid_block(alloy_primitives::Address::repeat_byte(0xbb))
+        .expect("decode bid");
 
     // --- Simulate (re-signs the deposit, finalizes) and execute the sealed block. ---
     let sim = simulate_bid_block(
@@ -574,12 +613,8 @@ fn execution_gate_round_trip() {
     let evm_config = BscEvmConfig::new(chain_spec.clone());
     let executor = evm_config.batch_executor(StateProviderDatabase::new(&state_provider));
     let output = executor.execute(&sim.block).expect("execute simulated block 2");
-    let hashed = HashedPostState::from_bundle_state::<KeccakKeyHasher>(output.state.state());
-    let (computed_root, _) = <StateRoot<
-        DatabaseTrieCursorFactory<_, LegacyKeyAdapter>,
-        DatabaseHashedCursorFactory<_>,
-    > as DatabaseStateRoot<_>>::overlay_root_with_updates(provider.tx_ref(), &hashed.clone_into_sorted())
-        .expect("state root");
+    let simulated_hashed_state =
+        HashedPostState::from_bundle_state::<KeccakKeyHasher>(output.state.state());
 
-    assert_eq!(computed_root, reference_root);
+    assert_eq!(simulated_hashed_state, reference_hashed_state);
 }

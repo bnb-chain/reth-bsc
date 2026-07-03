@@ -12,25 +12,32 @@
 //! from this node's key and are stripped before returning; they never affect the state root
 //! because system txs execute with `caller = coinbase` regardless of signature.
 
-use crate::chainspec::BscChainSpec;
-use crate::consensus::parlia::bid_block::DEPOSIT_SELECTOR;
-use crate::consensus::parlia::util::{
-    calculate_difficulty, calculate_millisecond_timestamp, set_millisecond_part_of_timestamp,
+use crate::{
+    chainspec::BscChainSpec,
+    consensus::parlia::{
+        bid_block::DEPOSIT_SELECTOR,
+        util::{
+            calculate_difficulty, calculate_millisecond_timestamp,
+            set_millisecond_part_of_timestamp,
+        },
+    },
+    hardforks::BscHardforks,
+    node::{
+        evm::config::{BscEvmConfig, BscNextBlockEnvAttributes},
+        miner::bid_block::BidBlock,
+    },
 };
-use crate::hardforks::BscHardforks;
-use crate::node::evm::config::{BscEvmConfig, BscNextBlockEnvAttributes};
-use crate::node::miner::bid_block::BidBlock;
-use alloy_consensus::transaction::SignerRecoverable;
-use alloy_consensus::Transaction;
+use alloy_consensus::{transaction::SignerRecoverable, Transaction};
 use alloy_eips::eip2718::{Decodable2718, Encodable2718};
 use alloy_primitives::{Address, Bytes, B256, U256};
 use alloy_rlp::Encodable;
-use jsonrpsee::core::RpcResult;
-use jsonrpsee::proc_macros::rpc;
+use jsonrpsee::{core::RpcResult, proc_macros::rpc};
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
 use reth_ethereum_primitives::TransactionSigned;
-use reth_evm::execute::{BlockBuilder, BlockBuilderOutcome};
-use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
+use reth_evm::{
+    execute::{BlockBuilder, BlockBuilderOutcome},
+    ConfigureEvm, NextBlockEnvAttributes,
+};
 use reth_primitives_traits::SealedHeader;
 use reth_provider::StateProviderFactory;
 use reth_revm::{database::StateProviderDatabase, db::State};
@@ -120,11 +127,9 @@ where
         let chain_spec = self.chain_spec.clone();
 
         // Block building + state root are CPU-bound; keep them off the async executor.
-        tokio::task::spawn_blocking(move || {
-            build_candidate(client, chain_spec, coinbase, raw_txs)
-        })
-        .await
-        .map_err(|e| internal_err(format!("build task panicked: {e}")))?
+        tokio::task::spawn_blocking(move || build_candidate(client, chain_spec, coinbase, raw_txs))
+            .await
+            .map_err(|e| internal_err(format!("build task panicked: {e}")))?
     }
 }
 
@@ -203,9 +208,6 @@ where
                 },
                 validator_cache_sink: None,
                 turn_length_sink: None,
-                state_root_precomputed_sink: None,
-                trie_handle: None,
-                state_root_deadline_ms: None,
             },
         )
         .map_err(|e| internal_err(format!("builder_for_next_block: {e}")))?;
@@ -225,9 +227,8 @@ where
 
     // finish() executes the trailing system txs (deposit with value = accrued
     // SYSTEM_ADDRESS fees) and computes state root / receipts root / bloom / gasUsed.
-    let out = builder
-        .finish(&state_provider, None)
-        .map_err(|e| internal_err(format!("finish: {e}")))?;
+    let out =
+        builder.finish(&state_provider, None).map_err(|e| internal_err(format!("finish: {e}")))?;
     let BlockBuilderOutcome { block, .. } = out;
 
     let mut header = block.clone_header();

@@ -1,7 +1,6 @@
 use alloy_primitives::Address;
 use k256::ecdsa::SigningKey;
-use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::{path::PathBuf, sync::OnceLock};
 
 use crate::consensus::parlia::DEFAULT_MIN_GAS_TIP;
 
@@ -49,16 +48,6 @@ pub struct MiningConfig {
     /// Whether the `mev_sendBidBlock` RPC (BEP-675 builder-proposed blocks) is accepted.
     /// Off by default; enable with `--mining.bid-block-enabled` or `BSC_MINING_BID_BLOCK_ENABLED`.
     pub bid_block_enabled: bool,
-    /// Use the reth 2.0 sparse-trie background task for state-root computation
-    /// during payload build.
-    ///
-    /// When `true`, the BSC miner spawns a `StateRootHandle` per payload job,
-    /// streams per-tx state diffs into it via `set_state_hook`, and consumes the
-    /// precomputed `(state_root, trie_updates)` at finish time — mirroring
-    /// upstream `crates/ethereum/payload`'s flow. Falls back to the legacy
-    /// synchronous `state_root_with_updates` path when the global spawner has
-    /// not been registered or returns `None`.
-    pub use_sparse_trie_state_root: bool,
 }
 
 impl std::fmt::Debug for MiningConfig {
@@ -80,7 +69,6 @@ impl std::fmt::Debug for MiningConfig {
             .field("builder_fee_ceil", &self.builder_fee_ceil)
             .field("allowed_builders", &self.allowed_builders)
             .field("bid_block_enabled", &self.bid_block_enabled)
-            .field("use_sparse_trie_state_root", &self.use_sparse_trie_state_root)
             .finish()
     }
 }
@@ -99,17 +87,17 @@ impl Default for MiningConfig {
             submit_built_payload: false,
             greedy_merge: true,
             // MEV defaults
-            validator_commission: Some(100),     // 1%
-            bid_simulation_left_over: Some(20),  // 20ms (go-bsc's defaultBidSimulationLeftOver)
-            no_interrupt_left_over: Some(135),   // 135ms (go-bsc's getDefaultNoInterruptLeftOver
-                                                  // at its default GasCeil: 110ms bidProcessing +
-                                                  // 10ms buffer + 15ms delayLeftOver)
-            delay_left_over: Some(15),           // 15ms (go-bsc's defaultDelayLeftOver)
+            validator_commission: Some(100),    // 1%
+            bid_simulation_left_over: Some(20), // 20ms (go-bsc's defaultBidSimulationLeftOver)
+            no_interrupt_left_over: Some(135),  // 135ms (go-bsc's getDefaultNoInterruptLeftOver
+            // at its default GasCeil: 110ms bidProcessing +
+            // 10ms buffer + 15ms delayLeftOver)
+            delay_left_over: Some(15), // 15ms (go-bsc's defaultDelayLeftOver)
             max_bids_per_builder: Some(3),
             builder_fee_ceil: Some(1_000_000_000_000_000_000), // 1 BNB
-            allowed_builders: None, // No whitelist by default (allow all)
+            allowed_builders: None,                            /* No whitelist by default (allow
+                                                                * all) */
             bid_block_enabled: false, // BEP-675 BidBlock path off by default
-            use_sparse_trie_state_root: false, // Opt-in for now (perf testing)
         }
     }
 }
@@ -143,7 +131,7 @@ impl MiningConfig {
     /// Get the desired gas limit for the specified chain ID.
     /// Returns the configured gas_limit if set, otherwise returns chain-specific defaults:
     /// - BSC Mainnet (56): 140M
-    /// - BSC Testnet (97): 100M  
+    /// - BSC Testnet (97): 100M
     /// - Local/Other: 40M
     pub fn get_gas_limit(&self, chain_id: u64) -> u64 {
         self.gas_limit.unwrap_or({
@@ -231,7 +219,6 @@ impl MiningConfig {
                 allowed_builders: None,
                 bid_block_enabled: false,
                 greedy_merge: true,
-                use_sparse_trie_state_root: false,
             }
         } else {
             // Fallback to default if key generation fails
@@ -322,11 +309,6 @@ impl MiningConfig {
             })
             .filter(|v| !v.is_empty());
 
-        let use_sparse_trie_state_root = std::env::var("BSC_MINING_USE_SPARSE_TRIE_STATE_ROOT")
-            .ok()
-            .map(|v| v.to_lowercase() == "true")
-            .unwrap_or(false);
-
         let bid_block_enabled = std::env::var("BSC_MINING_BID_BLOCK_ENABLED")
             .ok()
             .map(|v| v.to_lowercase() == "true")
@@ -349,7 +331,6 @@ impl MiningConfig {
             builder_fee_ceil,
             allowed_builders,
             bid_block_enabled,
-            use_sparse_trie_state_root,
             ..Default::default()
         };
 
@@ -387,8 +368,7 @@ pub fn get_global_mining_config() -> Option<&'static MiningConfig> {
 
 /// Key management for validators
 pub mod keystore {
-    use alloy_primitives::keccak256;
-    use alloy_primitives::Address;
+    use alloy_primitives::{keccak256, Address};
     use k256::ecdsa::{signature::Signer, Signature, SigningKey};
     use std::path::Path;
 
@@ -506,9 +486,7 @@ mod tests {
 
     #[test]
     fn test_load_private_key_from_keystore_file() {
-        use std::fs;
-        use std::io::Write;
-        use std::path::PathBuf;
+        use std::{fs, io::Write, path::PathBuf};
         use uuid::Uuid;
 
         // This is a real V3 keystore JSON (address bcdd0d2c...) with password "0123456789"

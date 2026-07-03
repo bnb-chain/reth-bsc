@@ -66,8 +66,10 @@ reth-rpc-eth-api = { git = "https://github.com/bnb-chain/reth.git", rev = "0dea1
 reth-rpc-convert = { git = "https://github.com/bnb-chain/reth.git", rev = "0dea17d20f358768ac2d458bef170d8f0ab1df59" }
 reth-rpc-engine-api = { git = "https://github.com/bnb-chain/reth.git", rev = "0dea17d20f358768ac2d458bef170d8f0ab1df59" }
 reth-rpc-server-types = { git = "https://github.com/bnb-chain/reth.git", rev = "0dea17d20f358768ac2d458bef170d8f0ab1df59" }
+# reth-trie-common stays: upstream trait signatures (BlockBuilder::finish,
+# PayloadValidator) name its types. reth-trie-db is fully removed (trie removal,
+# see TRIEDB_REMOVAL_PLAN.md).
 reth-trie-common = { git = "https://github.com/bnb-chain/reth.git", rev = "0dea17d20f358768ac2d458bef170d8f0ab1df59" }
-reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", rev = "0dea17d20f358768ac2d458bef170d8f0ab1df59" }
 reth-tasks = { git = "https://github.com/bnb-chain/reth.git", rev = "0dea17d20f358768ac2d458bef170d8f0ab1df59" }
 reth-transaction-pool = { git = "https://github.com/bnb-chain/reth.git", rev = "0dea17d20f358768ac2d458bef170d8f0ab1df59" }
 
@@ -202,7 +204,6 @@ serde = [
     "reth-primitives-traits/serde",
     "reth-revm/serde",
     "reth-trie-common/serde",
-    "reth-trie-db/serde",
     "revm/serde",
     "secp256k1/serde",
 ]
