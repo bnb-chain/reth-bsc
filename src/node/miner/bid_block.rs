@@ -19,10 +19,11 @@ use crate::node::miner::block_mev_info::{encode_block_mev_info, BlockMevInfoVers
 use crate::node::miner::signer::sign_system_transaction;
 use crate::node::miner::util::finalize_new_header;
 use crate::node::primitives::{BscBlobTransactionSidecar, BscBlock, BscBlockBody};
-use alloy_consensus::{Header, Transaction};
+use alloy_consensus::transaction::RlpEcdsaDecodableTx;
+use alloy_consensus::{Header, Transaction, TxLegacy};
 use alloy_eips::eip2718::Decodable2718;
-use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
-use alloy_rlp::Encodable;
+use alloy_primitives::{keccak256, Address, Bytes, Signature, B256, U256};
+use alloy_rlp::{Decodable, Encodable};
 use reth::consensus::HeaderValidator;
 use reth::primitives::SealedHeader;
 use reth_chainspec::EthChainSpec;
@@ -86,6 +87,57 @@ pub struct BidBlockArgs {
     pub signature: Bytes,
 }
 
+/// Decode one raw EIP-2718 transaction, falling back to [`decode_unsigned_legacy_tx`] for
+/// go-bsc's unsigned trailing system txs.
+///
+/// go-bsc builds these as untagged legacy transactions with `V = R = S = 0`
+/// (`types.NewTransaction` leaves the signature fields nil, which RLP-encodes as zero) — see
+/// `consensus/parlia/bid_block.go`'s `isUnsignedSystemTxCandidate`. alloy's legacy-tx decoder
+/// rejects that `v` value outright (`from_eip155_value` only accepts `27`, `28`, or `>= 35`), so a
+/// real BidBlock's trailing system txs fail `TransactionSigned::decode_2718` before any BidBlock
+/// validation logic runs. The placeholder signature is discarded once the validator bind-signs
+/// these txs (see [`crate::consensus::parlia::bid_block::is_unsigned_system_tx_candidate`] and
+/// [`bind_sign_bid_block_system_txs`]), so byte-exact re-encoding of the placeholder isn't needed —
+/// only the transaction body fields (nonce, gas price, gas limit, to, value, input) matter.
+fn decode_bid_block_tx(bytes: &[u8]) -> Result<TransactionSigned, String> {
+    match TransactionSigned::decode_2718(&mut &*bytes) {
+        Ok(tx) => Ok(tx),
+        // Report the standard decoder's error, not the fallback's: it's the more informative one
+        // for every shape other than the unsigned-system-tx case the fallback exists for.
+        Err(primary_err) => decode_unsigned_legacy_tx(bytes).map_err(|_| primary_err.to_string()),
+    }
+}
+
+/// Decode an untagged legacy transaction whose trailing `V, R, S` are all zero — go-bsc's
+/// unsigned-system-tx convention (see [`decode_bid_block_tx`]). Anything else is rejected, so this
+/// stays as strict as the standard decoder for every other transaction shape.
+fn decode_unsigned_legacy_tx(bytes: &[u8]) -> Result<TransactionSigned, alloy_rlp::Error> {
+    let buf = &mut &*bytes;
+    let header = alloy_rlp::Header::decode(buf)?;
+    if !header.list {
+        return Err(alloy_rlp::Error::UnexpectedString);
+    }
+    let remaining = buf.len();
+
+    let tx = TxLegacy::rlp_decode_fields(buf)?;
+    let v = U256::decode(buf)?;
+    let r = U256::decode(buf)?;
+    let s = U256::decode(buf)?;
+
+    if remaining.saturating_sub(buf.len()) != header.payload_length {
+        return Err(alloy_rlp::Error::ListLengthMismatch {
+            expected: header.payload_length,
+            got: remaining - buf.len(),
+        });
+    }
+    if v != U256::ZERO || r != U256::ZERO || s != U256::ZERO {
+        return Err(alloy_rlp::Error::Custom("invalid parity value"));
+    }
+
+    let signature = Signature::new(U256::ZERO, U256::ZERO, false);
+    Ok(TransactionSigned::new_unhashed(tx.into(), signature))
+}
+
 impl BidBlockArgs {
     /// Recover the builder address from the signature over [`BidBlock::hash`].
     pub fn ecrecover_sender(&self) -> Result<Address, BidBlockError> {
@@ -99,8 +151,8 @@ impl BidBlockArgs {
             .iter()
             .enumerate()
             .map(|(i, bytes)| {
-                TransactionSigned::decode_2718(&mut bytes.as_ref())
-                    .map_err(|e| BidBlockError::TxDecode { index: i, detail: e.to_string() })
+                decode_bid_block_tx(bytes.as_ref())
+                    .map_err(|detail| BidBlockError::TxDecode { index: i, detail })
             })
             .collect()
     }
@@ -1267,5 +1319,134 @@ mod tests {
         set_bid_block_mev_info(&mut header, builder, true);
         let tag = header.requests_hash.expect("requests_hash tagged");
         assert_eq!(decode_block_mev_info(tag), Some((BlockMevInfoVersion::BidBlock, builder)));
+    }
+
+    /// RLP-encodes a legacy tx exactly the way go-bsc's `types.NewTransaction` does for BidBlock's
+    /// unsigned trailing system txs: literal `V = R = S = 0` (alloy's own encoder would instead
+    /// write `V = 27` for a zero-parity signature, which is not the wire format geth produces).
+    fn encode_geth_style_unsigned_legacy_tx(tx: &TxLegacy) -> Bytes {
+        let mut payload = Vec::new();
+        tx.nonce.encode(&mut payload);
+        tx.gas_price.encode(&mut payload);
+        tx.gas_limit.encode(&mut payload);
+        tx.to.encode(&mut payload);
+        tx.value.encode(&mut payload);
+        tx.input.encode(&mut payload);
+        0u8.encode(&mut payload); // v
+        0u8.encode(&mut payload); // r
+        0u8.encode(&mut payload); // s
+
+        let mut out = Vec::new();
+        alloy_rlp::Header { list: true, payload_length: payload.len() }.encode(&mut out);
+        out.extend_from_slice(&payload);
+        Bytes::from(out)
+    }
+
+    #[test]
+    fn decode_txs_accepts_geths_unsigned_system_tx_wire_format() {
+        use crate::system_contracts::VALIDATOR_CONTRACT;
+
+        let tx = TxLegacy {
+            chain_id: None,
+            nonce: 5,
+            gas_price: 0,
+            gas_limit: 100_000,
+            to: alloy_primitives::TxKind::Call(VALIDATOR_CONTRACT),
+            value: U256::ZERO,
+            input: Bytes::from(hex!("f340fa01")), // deposit selector
+        };
+        let raw = encode_geth_style_unsigned_legacy_tx(&tx);
+
+        // The standard EIP-2718 decoder must reject this on its own: v=0 is not in {27,28,35+}.
+        assert!(TransactionSigned::decode_2718(&mut raw.as_ref()).is_err());
+
+        let args = BidBlockArgs {
+            bid_block: BidBlock {
+                header: vector_a_block().header,
+                transactions: vec![raw],
+                sidecars: Vec::new(),
+            },
+            signature: Bytes::from(vec![0u8; 65]),
+        };
+
+        let decoded = args.decode_txs().expect("geth-style unsigned system tx must decode");
+        assert_eq!(decoded.len(), 1);
+        let decoded_tx = &decoded[0];
+        assert_eq!(decoded_tx.nonce(), 5);
+        assert_eq!(decoded_tx.to(), Some(VALIDATOR_CONTRACT));
+        assert_eq!(decoded_tx.input().as_ref(), &hex!("f340fa01"));
+        assert!(decoded_tx.signature().r().is_zero());
+        assert!(decoded_tx.signature().s().is_zero());
+        assert!(!decoded_tx.signature().v());
+    }
+
+    #[test]
+    fn decode_txs_rejects_non_zero_rs_with_zero_v() {
+        // Only the exact all-zero placeholder is accepted; a nonzero r/s with v=0 is not a valid
+        // signature under any scheme and must still be rejected, not silently coerced.
+        let tx = TxLegacy {
+            chain_id: None,
+            nonce: 0,
+            gas_price: 0,
+            gas_limit: 21_000,
+            to: alloy_primitives::TxKind::Call(Address::ZERO),
+            value: U256::ZERO,
+            input: Bytes::new(),
+        };
+        let mut payload = Vec::new();
+        tx.nonce.encode(&mut payload);
+        tx.gas_price.encode(&mut payload);
+        tx.gas_limit.encode(&mut payload);
+        tx.to.encode(&mut payload);
+        tx.value.encode(&mut payload);
+        tx.input.encode(&mut payload);
+        0u8.encode(&mut payload); // v = 0
+        1u8.encode(&mut payload); // r = 1 (not the placeholder)
+        0u8.encode(&mut payload); // s = 0
+        let mut out = Vec::new();
+        alloy_rlp::Header { list: true, payload_length: payload.len() }.encode(&mut out);
+        out.extend_from_slice(&payload);
+
+        let args = BidBlockArgs {
+            bid_block: BidBlock {
+                header: vector_a_block().header,
+                transactions: vec![Bytes::from(out)],
+                sidecars: Vec::new(),
+            },
+            signature: Bytes::from(vec![0u8; 65]),
+        };
+        assert!(args.decode_txs().is_err());
+    }
+
+    #[test]
+    fn decode_txs_still_accepts_normal_signed_legacy_tx() {
+        // Regression guard: the geth-unsigned-tx fallback must not interfere with ordinary
+        // properly-signed transactions, which take the standard `decode_2718` path.
+        use alloy_eips::eip2718::Encodable2718;
+        let tx = TxLegacy {
+            chain_id: Some(56),
+            nonce: 1,
+            gas_price: 1_000_000_000,
+            gas_limit: 21_000,
+            to: alloy_primitives::TxKind::Call(Address::repeat_byte(0x11)),
+            value: U256::from(1),
+            input: Bytes::new(),
+        };
+        let signature = Signature::new(U256::from(1), U256::from(2), true);
+        let signed = TransactionSigned::new_unhashed(tx.into(), signature);
+        let raw = Bytes::from(signed.encoded_2718());
+
+        let args = BidBlockArgs {
+            bid_block: BidBlock {
+                header: vector_a_block().header,
+                transactions: vec![raw],
+                sidecars: Vec::new(),
+            },
+            signature: Bytes::from(vec![0u8; 65]),
+        };
+        let decoded = args.decode_txs().expect("normal signed tx must still decode");
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].signature().r(), U256::from(1));
+        assert_eq!(decoded[0].signature().s(), U256::from(2));
     }
 }
