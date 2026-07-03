@@ -13,6 +13,7 @@ use alloy_primitives::{Bytes, B256, U256, U64};
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::proc_macros::rpc;
 use reth_chainspec::EthChainSpec;
+use reth_ethereum_payload_builder::EthereumBuilderConfig;
 use reth_ethereum_primitives::TransactionSigned;
 use reth_primitives_traits::SignerRecoverable;
 use std::collections::{HashMap, HashSet};
@@ -120,6 +121,79 @@ where
     }
 }
 
+/// JSON wire shape of go-bsc's `BidBlockPermissionResult` (`internal/ethapi/api_mev.go`): the
+/// detail fields are omitted entirely when `allowed` is true, matching Go's `omitempty` tags.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BidBlockPermissionResult {
+    pub allowed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_hash: Option<B256>,
+    /// Hex-quantity block number (e.g. `"0x64"`), matching go-bsc's `hexutil.Uint64`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_number: Option<String>,
+    /// RFC 3339 UTC timestamp, matching Go's default `time.Time` JSON marshaling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revoked_at: Option<String>,
+    /// RFC 3339 UTC timestamp, matching Go's default `time.Time` JSON marshaling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reset_at: Option<String>,
+}
+
+impl From<crate::node::miner::bid_block_permission::BidBlockPermissionStatus>
+    for BidBlockPermissionResult
+{
+    fn from(status: crate::node::miner::bid_block_permission::BidBlockPermissionStatus) -> Self {
+        if status.allowed {
+            return Self {
+                allowed: true,
+                reason: None,
+                block_hash: None,
+                block_number: None,
+                revoked_at: None,
+                reset_at: None,
+            };
+        }
+        Self {
+            allowed: false,
+            reason: Some(status.reason),
+            block_hash: Some(status.block_hash),
+            block_number: Some(format!("0x{:x}", status.block_num)),
+            revoked_at: Some(unix_secs_to_rfc3339_utc(status.revoked_at)),
+            reset_at: Some(unix_secs_to_rfc3339_utc(status.reset_at)),
+        }
+    }
+}
+
+/// Formats a Unix timestamp (UTC, whole seconds) as an RFC 3339 string (`"2024-01-15T10:30:04Z"`),
+/// matching the shape Go's `time.Time.MarshalJSON` produces for `revokedAt`/`resetAt`. Avoids a
+/// date/time dependency for what is otherwise the only place this repo needs one.
+fn unix_secs_to_rfc3339_utc(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let secs_of_day = secs % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    let (hour, min, sec) = (secs_of_day / 3600, (secs_of_day % 3600) / 60, secs_of_day % 60);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}Z")
+}
+
+/// Converts a day count since the Unix epoch (1970-01-01) into a (year, month, day) civil date.
+/// Howard Hinnant's `civil_from_days` algorithm: <http://howardhinnant.github.io/date_algorithms.html#civil_from_days>.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    let year = if month <= 2 { y + 1 } else { y };
+    (year, month, day)
+}
+
 /// Custom MEV API server trait - only includes send_bid to avoid conflicts with reth's default MEV API
 #[rpc(server, namespace = "mev")]
 pub trait BscMevApi {
@@ -150,6 +224,11 @@ pub trait BscMevApi {
     /// Remove a builder from the whitelist
     #[method(name = "removeBuilder")]
     async fn remove_builder(&self, builder: Address) -> RpcResult<bool>;
+
+    /// Query a builder's current BEP-675 `SendBidBlock` permission (go-bsc
+    /// `MevAPI.GetBidBlockPermission`): whether it's allowed, and if not, why and when it resets.
+    #[method(name = "getBidBlockPermission")]
+    async fn get_bid_block_permission(&self, builder: Address) -> RpcResult<BidBlockPermissionResult>;
 }
 
 const PAY_BID_TX_GAS_LIMIT: u64 = 25000;
@@ -160,11 +239,30 @@ const INVALID_BID_PARAM_ERROR: i32 = -38001;
 const MEV_NOT_RUNNING_ERROR: i32 = -38003;
 const MEV_NOT_IN_TURN_ERROR: i32 = -38005;
 const BID_BLOCK_PERMISSION_REVOKED_ERROR: i32 = -38006;
+const BID_BLOCK_PRE_SEAL_VERIFY_ERROR: i32 = -38007;
+const BID_BLOCK_TOO_LATE_ERROR: i32 = -38008;
 
 /// Reproduces go-bsc `Miner.bidBlockEnabled()`: a BidBlock is only accepted when MEV is running,
 /// the `BidBlockEnabled` flag is set, and the Pasteur fork is active at the chain head.
 fn bid_block_admission_enabled(mev_running: bool, flag_enabled: bool, pasteur_active: bool) -> bool {
     mev_running && flag_enabled && pasteur_active
+}
+
+/// Mirrors go-bsc `bidutil.BidMustBefore`: the deadline after which a `mev_sendBidBlock`
+/// submission is rejected as too late.
+///
+/// `bid_must_before_ms = parent.MilliTimestamp() + block_interval_ms - delay_left_over_ms`
+///
+/// `parent_timestamp_ms` must be the parent header's *full* millisecond timestamp (seconds plus
+/// the sub-second component carried in `mixHash` post-Lorentz — see
+/// [`crate::consensus::parlia::util::calculate_millisecond_timestamp`]), not just
+/// `header.timestamp * 1000`: on sub-second block intervals (Fermi/Maxwell), truncating the
+/// parent's millisecond part shifts the deadline by up to a full block interval. The subtracted
+/// knob is `delay_left_over_ms` (go-bsc's `Config.DelayLeftOver`, default 15ms) —
+/// `no_interrupt_left_over` bounds bid *simulation* time and is a different, much larger, knob.
+fn bid_must_before_ms(parent_timestamp_ms: u64, block_interval_ms: u64, delay_left_over_ms: u64) -> u128 {
+    (parent_timestamp_ms as u128 + block_interval_ms as u128)
+        .saturating_sub(delay_left_over_ms as u128)
 }
 
 /// Implementation of the MEV Builder RPC API
@@ -175,6 +273,10 @@ pub struct MevApiImpl {
     validator_commission: u64,
     bid_simulation_left_over: u64, // milliseconds
     no_interrupt_left_over: u64,   // milliseconds
+    /// go-bsc's `Config.DelayLeftOver`: time reserved to finalize a block, subtracted from the
+    /// `mev_sendBidBlock` admission deadline (`bidMustBefore`). Distinct from
+    /// `no_interrupt_left_over`, which only bounds bid *simulation*.
+    delay_left_over: u64, // milliseconds
     max_bids_per_builder: u32,
     gas_ceil: u64,
     min_gas_price: U256,
@@ -239,6 +341,7 @@ impl MevApiImpl {
         let validator_commission = mining_config.get_validator_commission();
         let bid_simulation_left_over = mining_config.get_bid_simulation_left_over();
         let no_interrupt_left_over = mining_config.get_no_interrupt_left_over();
+        let delay_left_over = mining_config.get_delay_left_over();
         let max_bids_per_builder = mining_config.get_max_bids_per_builder();
         let builder_fee_ceil = U256::from(mining_config.get_builder_fee_ceil());
         let bid_block_enabled = mining_config.get_bid_block_enabled();
@@ -283,6 +386,7 @@ impl MevApiImpl {
             validator_commission,
             bid_simulation_left_over,
             no_interrupt_left_over,
+            delay_left_over,
             max_bids_per_builder,
             gas_ceil,
             min_gas_price,
@@ -330,13 +434,12 @@ impl MevApiImpl {
             .insert(bid_hash);
     }
 
-    /// Mirrors go-bsc `bidSimulator.bidMustBefore`: the deadline after which a bid is too late.
+    /// Mirrors go-bsc `bidutil.BidMustBefore`: the deadline after which a bid is too late.
     ///
-    /// `bid_must_before_ms = parent_timestamp_ms + block_interval_ms - no_interrupt_left_over_ms`
-    fn bid_must_before_ms(&self, parent_timestamp_secs: u64, block_interval_ms: u64) -> u128 {
-        (parent_timestamp_secs as u128) * 1000
-            + block_interval_ms as u128
-            - self.no_interrupt_left_over as u128
+    /// See [`bid_must_before_ms`] for the formula and why `parent_timestamp_ms` must be the
+    /// parent's full millisecond timestamp.
+    fn bid_must_before_ms(&self, parent_timestamp_ms: u64, block_interval_ms: u64) -> u128 {
+        bid_must_before_ms(parent_timestamp_ms, block_interval_ms, self.delay_left_over)
     }
 
     /// Get header by number from global header provider
@@ -381,6 +484,17 @@ impl MevApiImpl {
             msg.into(),
             None::<()>,
         )
+    }
+
+    /// `NewBidBlockPreSealVerifyError` (code `-38007`): the synchronous checks
+    /// `preSealVerifyBidBlock` runs at admission failed.
+    fn pre_seal_verify_failed(msg: impl Into<String>) -> jsonrpsee::types::ErrorObjectOwned {
+        jsonrpsee::types::ErrorObject::owned(BID_BLOCK_PRE_SEAL_VERIFY_ERROR, msg.into(), None::<()>)
+    }
+
+    /// `NewBidBlockTooLateError` (code `-38008`): the bid arrived after `bidMustBefore`.
+    fn too_late(msg: impl Into<String>) -> jsonrpsee::types::ErrorObjectOwned {
+        jsonrpsee::types::ErrorObject::owned(BID_BLOCK_TOO_LATE_ERROR, msg.into(), None::<()>)
     }
 
     /// Internal error (`-32603`) for conditions go-bsc never hits (e.g. the chain head missing).
@@ -443,17 +557,57 @@ impl MevApiImpl {
             .snapshot_by_hash(&head_header.hash_slow())
             .map(|s| s.block_interval)
             .unwrap_or(3_000); // 3 s default
-        let bid_must_before_ms = self.bid_must_before_ms(head_header.timestamp, block_interval_ms);
+        let parent_timestamp_ms =
+            crate::consensus::parlia::util::calculate_millisecond_timestamp(head_header);
+        let bid_must_before_ms = self.bid_must_before_ms(parent_timestamp_ms, block_interval_ms);
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis();
         if now_ms >= bid_must_before_ms {
-            return Err(Self::invalid_bid(format!(
+            return Err(Self::too_late(format!(
                 "too late: bid must arrive before {}ms, arrived {}ms later, bidHash={bid_hash}",
                 bid_must_before_ms,
                 now_ms.saturating_sub(bid_must_before_ms),
             )));
+        }
+
+        let mut decoded = args
+            .to_decoded_bid_block(builder)
+            .map_err(|e| Self::invalid_bid(format!("failed to decode bid block: {e}")))?;
+
+        // Mirrors go-bsc `preSealVerifyBidBlock`'s payload-only checks (coinbase, gas limit, the
+        // deposit-derived gas fee, blob sidecar structure, per-tx gas cap, trailing system-tx
+        // shape) synchronously, returning `-38007` immediately on failure like geth does — rather
+        // than admitting optimistically and dropping the bid silently later.
+        //
+        // NOT run here: `verify_bid_block_header`'s structural + cascading checks (extra-data
+        // length/validator-list layout, authorized-validator/sign-recently/difficulty against the
+        // snapshot). go-bsc only makes those checks meaningful by first overwriting the builder's
+        // `Extra` with the validator's own reconstructed vanity/forkhash/validator-list/turnLength
+        // (`SetExtraData`, run before `preSealVerifyBidBlock`) — replicating that rewrite here
+        // would risk rejecting legitimate submissions whose raw `Extra` doesn't yet match that
+        // final structure. Those checks remain deferred to the miner side
+        // (`simulate_bid_block`), which does perform the rewrite first.
+        let gas_ceil = crate::shared::get_miner_gas_limit().unwrap_or(head_header.gas_limit);
+        let expected_gas_limit =
+            EthereumBuilderConfig::new().with_gas_limit(gas_ceil).gas_limit(head_header.gas_limit);
+        match crate::node::miner::bid_block::verify_bid_block_payload(
+            &self.chain_spec,
+            &decoded,
+            head_header,
+            self.validator_address,
+            expected_gas_limit,
+        ) {
+            Ok((system_tx_start, gas_fee)) => {
+                decoded.system_tx_start = system_tx_start;
+                decoded.gas_fee = gas_fee;
+            }
+            Err(e) => {
+                return Err(Self::pre_seal_verify_failed(format!(
+                    "pre-seal verify failed: bidHash={bid_hash}, err={e}"
+                )));
+            }
         }
 
         // Decode and hand to the miner via the global intake queue.
@@ -463,21 +617,15 @@ impl MevApiImpl {
         //
         //   • Extra overwrite + SetExtraData  →  header.extra_data = vanity + finalize_new_header
         //   • setBidMevInfo                   →  set_bid_block_mev_info
-        //   • preSealVerifyBidBlock           →  verify_bid_block_payload + verify_bid_block_header
+        //   • verify_bid_block_header         →  structural + cascading header checks (see above)
         //   • execution + state-root check    →  execute_bid_block_payload
         //
-        // Behavioral difference vs geth: geth runs these synchronously and returns an error to the
-        // builder immediately on failure.  reth-bsc returns bidHash optimistically; if any of the
-        // above steps fail the block is silently dropped miner-side.  The checks still run — the
-        // builder just does not receive per-step error feedback.
+        // Behavioral difference vs geth: geth runs the queue handoff itself
+        // (`sendBidBlock`/`newBidBlockLoop`) with a bounded channel and returns `ErrMevBusy`
+        // (`-38004`) on a 1s enqueue timeout; reth-bsc's intake queue is unbounded, so admission
+        // can never report busy. Left as a known gap — implementing genuine backpressure here is
+        // a distinct change from surfacing the correct error codes for checks that already run.
         //
-        // Bringing them forward to admit_bid_block would require injecting
-        // Arc<Parlia<BscChainSpec>> into MevApiImpl (needed by verify_bid_block_header) and is
-        // left as future work.
-        let decoded = args
-            .to_decoded_bid_block(builder)
-            .map_err(|e| Self::invalid_bid(format!("failed to decode bid block: {e}")))?;
-
         // Register after all checks pass so quota is only consumed by accepted bids.
         self.add_pending_bid_block(block_number, builder, bid_hash);
 
@@ -1084,6 +1232,23 @@ impl BscMevApiServer for MevApiImpl {
     async fn params(&self) -> RpcResult<MevParams> {
         tracing::debug!("MEV params requested");
 
+        // Mirrors go-bsc's `Miner.bidBlockEnabled()`: MEV running AND the BidBlockEnabled flag
+        // AND Pasteur active at the chain head — dynamic, not a static echo of the config flag,
+        // so a builder never sees `BidBlockEnabled: true` right before every submission is
+        // rejected with "disabled" for not-yet-being-past Pasteur. Falls back to `false` if the
+        // chain head isn't available yet (e.g. still syncing at startup) rather than failing the
+        // whole `params()` call.
+        let pasteur_active = crate::shared::get_best_canonical_block_number()
+            .and_then(|n| self.get_header_by_number(n))
+            .is_some_and(|head| {
+                self.chain_spec.is_pasteur_active_at_timestamp(head.number, head.timestamp)
+            });
+        let bid_block_enabled = bid_block_admission_enabled(
+            crate::shared::is_mev_running(),
+            self.bid_block_enabled,
+            pasteur_active,
+        );
+
         Ok(MevParams {
             validator_commission: self.validator_commission,
             // Convert milliseconds to nanoseconds (1ms = 1,000,000 ns)
@@ -1093,7 +1258,7 @@ impl BscMevApiServer for MevApiImpl {
             gas_ceil: self.gas_ceil,
             gas_price: self.min_gas_price,
             builder_fee_ceil: self.builder_fee_ceil,
-            bid_block_enabled: self.bid_block_enabled,
+            bid_block_enabled,
             version: self.version.clone(),
         })
     }
@@ -1133,6 +1298,15 @@ impl BscMevApiServer for MevApiImpl {
             tracing::info!("Builder {} was not in whitelist", builder);
         }
         Ok(removed)
+    }
+
+    /// Query a builder's current BidBlock permission status.
+    async fn get_bid_block_permission(
+        &self,
+        builder: Address,
+    ) -> RpcResult<BidBlockPermissionResult> {
+        let status = crate::shared::get_bid_block_permission_manager().get_status(builder);
+        Ok(status.into())
     }
 }
 
@@ -1174,9 +1348,112 @@ mod bid_block_param_tests {
         assert_eq!(MevApiImpl::mev_not_in_turn().code(), -38005);
         assert_eq!(MevApiImpl::invalid_bid("x").code(), -38001);
         assert_eq!(MevApiImpl::permission_revoked("x").code(), -38006);
+        // Regression guard: these two used to collapse into -38001 (generic invalid-bid), so a
+        // builder keying retry/backoff behavior on the specific geth code would misbehave.
+        assert_eq!(MevApiImpl::pre_seal_verify_failed("x").code(), -38007);
+        assert_eq!(MevApiImpl::too_late("x").code(), -38008);
         assert_eq!(
             MevApiImpl::mev_not_running().message(),
             "the validator stop accepting bids for now, try again later"
         );
+    }
+
+    #[test]
+    fn bid_must_before_matches_geth_formula() {
+        // parent at second 1_000, no sub-second component, 3s block interval, 15ms delay left
+        // over: bidutil.BidMustBefore = 1_000_000 + 3_000 - 15 = 1_002_985.
+        assert_eq!(super::bid_must_before_ms(1_000_000, 3_000, 15), 1_002_985);
+    }
+
+    #[test]
+    fn bid_must_before_uses_full_millisecond_parent_timestamp() {
+        // A parent with a nonzero sub-second component (carried in mixHash post-Lorentz) must
+        // shift the deadline forward by that amount, not be truncated away.
+        let parent_ms_no_subsecond = 1_000_000u64;
+        let parent_ms_with_subsecond = 1_000_400u64; // .400s into the block
+
+        let deadline_a = super::bid_must_before_ms(parent_ms_no_subsecond, 450, 15);
+        let deadline_b = super::bid_must_before_ms(parent_ms_with_subsecond, 450, 15);
+
+        assert_eq!(deadline_b - deadline_a, 400);
+    }
+
+    #[test]
+    fn bid_must_before_does_not_reject_everything_on_sub_second_intervals() {
+        // Regression guard for the original bug: dropping the parent's millisecond component and
+        // subtracting `no_interrupt_left_over` (500ms) instead of `delay_left_over` (15ms) made
+        // the deadline land at-or-before the parent's own timestamp on Fermi's 450ms interval,
+        // rejecting every bid as "too late" the instant the parent block appeared.
+        let parent_timestamp_ms =
+            crate::consensus::parlia::util::calculate_millisecond_timestamp(&alloy_consensus::Header {
+                timestamp: 1_700_000_000,
+                ..Default::default()
+            });
+        let fermi_block_interval_ms = 450;
+        let delay_left_over_ms = 15;
+
+        let deadline = super::bid_must_before_ms(
+            parent_timestamp_ms,
+            fermi_block_interval_ms,
+            delay_left_over_ms,
+        );
+
+        // The deadline must fall strictly after the parent's own timestamp, leaving a real
+        // admission window instead of being already in the past.
+        assert!(deadline > parent_timestamp_ms as u128);
+        assert_eq!(deadline, parent_timestamp_ms as u128 + fermi_block_interval_ms as u128 - 15);
+    }
+
+    #[test]
+    fn unix_secs_to_rfc3339_matches_known_dates() {
+        // 2024-01-15T10:30:04Z
+        assert_eq!(super::unix_secs_to_rfc3339_utc(1_705_314_604), "2024-01-15T10:30:04Z");
+        // The Unix epoch itself.
+        assert_eq!(super::unix_secs_to_rfc3339_utc(0), "1970-01-01T00:00:00Z");
+        // 2000-02-29 exercises the leap-year branch of civil_from_days.
+        assert_eq!(super::unix_secs_to_rfc3339_utc(951_782_400), "2000-02-29T00:00:00Z");
+        // 2024-12-31T23:59:59Z, the last second of a leap year.
+        assert_eq!(super::unix_secs_to_rfc3339_utc(1_735_689_599), "2024-12-31T23:59:59Z");
+    }
+
+    #[test]
+    fn bid_block_permission_result_omits_details_when_allowed() {
+        use crate::node::miner::bid_block_permission::BidBlockPermissionStatus;
+
+        let result: BidBlockPermissionResult =
+            BidBlockPermissionStatus { allowed: true, ..Default::default() }.into();
+        let json = serde_json::to_value(&result).unwrap();
+
+        assert_eq!(json["allowed"], true);
+        // go-bsc's `omitempty` tags drop these entirely when allowed; a builder-facing client
+        // must not see stale/zeroed detail fields for the common "not revoked" case.
+        assert!(json.get("reason").is_none());
+        assert!(json.get("blockHash").is_none());
+        assert!(json.get("blockNumber").is_none());
+        assert!(json.get("revokedAt").is_none());
+        assert!(json.get("resetAt").is_none());
+    }
+
+    #[test]
+    fn bid_block_permission_result_matches_geth_wire_shape_when_revoked() {
+        use crate::node::miner::bid_block_permission::BidBlockPermissionStatus;
+
+        let status = BidBlockPermissionStatus {
+            allowed: false,
+            reason: "InsertChain err: state root mismatch".to_string(),
+            block_hash: B256::repeat_byte(0xab),
+            block_num: 100,
+            revoked_at: 1_705_314_604,
+            reset_at: 1_705_401_004,
+        };
+        let json = serde_json::to_value(BidBlockPermissionResult::from(status)).unwrap();
+
+        assert_eq!(json["allowed"], false);
+        assert_eq!(json["reason"], "InsertChain err: state root mismatch");
+        assert_eq!(json["blockHash"], format!("{:#x}", B256::repeat_byte(0xab)));
+        // Hex-quantity, matching go-bsc's hexutil.Uint64 — not a plain JSON number.
+        assert_eq!(json["blockNumber"], "0x64");
+        assert_eq!(json["revokedAt"], "2024-01-15T10:30:04Z");
+        assert_eq!(json["resetAt"], "2024-01-16T10:30:04Z");
     }
 }

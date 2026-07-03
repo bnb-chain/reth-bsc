@@ -436,6 +436,13 @@ fn main() -> eyre::Result<()> {
                         ctx.modules.merge_configured(eth_ext_api.into_rpc())?;
                         tracing::info!("Succeed to register BSC Eth extension API");
 
+                        tracing::info!("Start to register BSC Admin RPC API (admin_setBidBlockPermission)...");
+                        use reth_bsc::rpc::admin::{BscAdminApiImpl, BscAdminApiServer};
+
+                        let admin_api = BscAdminApiImpl::new();
+                        ctx.modules.merge_configured(admin_api.into_rpc())?;
+                        tracing::info!("Succeed to register BSC Admin RPC API");
+
                         tracing::info!("Start to register Blob RPC API...");
                         use reth_bsc::rpc::blob::{BlobApiImpl, BlobApiServer};
 
@@ -446,6 +453,17 @@ fn main() -> eyre::Result<()> {
                         let blob_api = BlobApiImpl::new(pool, provider);
                         ctx.modules.merge_configured(blob_api.into_rpc())?;
                         tracing::info!("Succeed to register Blob RPC API");
+
+                        // Debug-only builder extraction seam for BEP-675 e2e testing
+                        // (bep675 testing plan, Tier 2). Off unless explicitly enabled.
+                        if std::env::var("BSC_DEBUG_BUILDER").map(|v| v == "true").unwrap_or(false) {
+                            tracing::info!("Start to register Debug Builder RPC API (debug_buildCandidateBlock)...");
+                            use reth_bsc::rpc::debug_builder::{BscDebugBuilderApiServer, DebugBuilderApiImpl};
+                            let chain_spec = std::sync::Arc::new(ctx.config().chain.clone().as_ref().clone());
+                            let debug_builder_api = DebugBuilderApiImpl::new(ctx.provider().clone(), chain_spec);
+                            ctx.modules.merge_configured(debug_builder_api.into_rpc())?;
+                            tracing::info!("Succeed to register Debug Builder RPC API");
+                        }
 
                         tracing::info!("Start to register eth_config (EIP-7910) API...");
                         use reth::api::FullNodeComponents;

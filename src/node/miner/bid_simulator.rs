@@ -10,6 +10,7 @@ use crate::node::miner::payload::DELAY_LEFT_OVER;
 use crate::node::miner::util::prepare_new_attributes;
 use crate::node::primitives::BscBlobTransactionSidecar;
 use alloy_consensus::BlobTransactionSidecar;
+use alloy_consensus::BlockHeader as _;
 use alloy_consensus::Transaction;
 use alloy_evm::Evm;
 use alloy_primitives::U256;
@@ -66,6 +67,13 @@ impl Bid {
     }
 }
 
+/// Evicts entries older than `min_block_number` from the `best_bid_block` map, keyed by parent
+/// hash. Split out as a free function (from [`BidSimulator::clear`]) so it's directly testable
+/// without constructing a full `BidSimulator`.
+fn retain_recent_bid_blocks(map: &mut HashMap<B256, BidBlockTask>, min_block_number: u64) {
+    map.retain(|_, task| task.block.sealed_block().header().number() >= min_block_number);
+}
+
 // bid loop receive bid from client and commit bid to simulator
 // 1. last block number check
 // 2. pack bid runtime and calculate bid value
@@ -84,7 +92,7 @@ pub struct BidSimulator<Client, Pool> {
     simulating_bid: Arc<RwLock<HashMap<B256, Bid>>>,
     best_bid: Arc<RwLock<HashMap<B256, BidRuntime<Pool, BscEvmConfig>>>>,
     /// Best executed BEP-675 BidBlock payload per parent hash (go-bsc `AddBidBlock`/`GetBestBidBlock`).
-    best_bid_block: Arc<RwLock<HashMap<B256, BscBuiltPayload>>>,
+    best_bid_block: Arc<RwLock<HashMap<B256, BidBlockTask>>>,
     pending_bid: Arc<RwLock<HashMap<String, u8>>>,
     bid_receiving: bool,
     chain_spec: Arc<BscChainSpec>,
@@ -293,6 +301,11 @@ where
         self.best_bid_to_run.write().retain(|_, bid| bid.block_number >= min_block_number);
         self.simulating_bid.write().retain(|_, bid| bid.block_number >= min_block_number);
         self.best_bid.write().retain(|_, bid| bid.bid.block_number >= min_block_number);
+
+        // Clear old BEP-675 BidBlocks (go-bsc `clearLoop` prunes `bestBidBlock[parentHash]` the
+        // same way). Without this, every parent hash that ever received an admitted BidBlock keeps
+        // its full sealed block — including blob data — in memory forever.
+        retain_recent_bid_blocks(&mut self.best_bid_block.write(), min_block_number);
 
         // Clear old pending bids by parsing block_number from key prefix
         // Key format: "{block_number}-{builder}-{bid_hash}"
@@ -729,101 +742,23 @@ where
             }
         };
 
-        // Execute the sealed block to obtain its post-state + trie updates, and verify the builder's
-        // claimed state root before turning it into a selectable payload.
-        let Some(payload) = self.execute_bid_block_payload(parent_hash, task) else { return };
+        // BEP-675 zero-simulate: do NOT execute here. Keep the highest-fee sealed BidBlock per
+        // parent (go-bsc `AddBidBlock`). Execution + state-root verification are deferred until the
+        // block has been selected and broadcast — see `ImportService::on_new_bid_block` — matching
+        // go-bsc's broadcast-then-`InsertChain` flow in `handleBidBlockResult`. Selection is by the
+        // deposit-derived `gas_fee`, which needs no execution.
         let mut best = self.best_bid_block.write();
-        let replace = best.get(&parent_hash).is_none_or(|p| payload.fees > p.fees);
+        let replace = best.get(&parent_hash).is_none_or(|t| task.gas_fee > t.gas_fee);
         if replace {
-            best.insert(parent_hash, payload);
+            best.insert(parent_hash, task);
         }
     }
 
-    /// Execute a sealed BidBlock against the parent state, verify its claimed state root, and
-    /// assemble a `BscBuiltPayload` (is_bid = true) for selection. Returns `None` on any failure
-    /// (missing state, execution error, or state-root mismatch — a dishonest builder).
-    fn execute_bid_block_payload(
-        &self,
-        parent_hash: B256,
-        task: BidBlockTask,
-    ) -> Option<BscBuiltPayload> {
-        use reth_evm::execute::Executor;
-        use reth_provider::StateRootProvider;
-        use reth_trie_common::{HashedPostState, KeccakKeyHasher};
-
-        let sealed = task.block;
-        let builder = task.builder;
-        let bid_hash = task.bid_hash;
-        let block_num = sealed.header().number;
-        let state_provider = match self.client.state_by_block_hash(parent_hash) {
-            Ok(sp) => sp,
-            Err(e) => {
-                debug!("BidBlock: state provider error: {e}");
-                return None;
-            }
-        };
-        let output = {
-            let evm_config = BscEvmConfig::new(self.chain_spec.clone());
-            let executor = evm_config.batch_executor(StateProviderDatabase::new(&state_provider));
-            match executor.execute(&sealed) {
-                Ok(o) => o,
-                Err(e) => {
-                    debug!("BidBlock: execution failed: {e}");
-                    return None;
-                }
-            }
-        };
-        let requests = output.result.requests.clone();
-        let hashed_state = HashedPostState::from_bundle_state::<KeccakKeyHasher>(output.state.state());
-        let (root, trie_updates) = match state_provider.state_root_with_updates(hashed_state.clone()) {
-            Ok(r) => r,
-            Err(e) => {
-                debug!("BidBlock: state root failed: {e}");
-                return None;
-            }
-        };
-        if root != sealed.header().state_root {
-            debug!(
-                "BidBlock: state root mismatch (dishonest builder): computed {root}, claimed {}",
-                sealed.header().state_root
-            );
-            // A wrong claimed root is unambiguous builder dishonesty — revoke its permission, as
-            // go-bsc does on the InsertChain mismatch in `handleBidBlockResult`.
-            crate::shared::get_bid_block_permission_manager().revoke(
-                builder,
-                format!(
-                    "BidBlock state root mismatch: computed {root}, claimed {}",
-                    sealed.header().state_root
-                ),
-                bid_hash,
-                block_num,
-            );
-            return None;
-        }
-        let sealed_block = Arc::new(sealed.sealed_block().clone());
-        let executed = BuiltPayloadExecutedBlock {
-            recovered_block: Arc::new(sealed.clone()),
-            execution_output: Arc::new(output),
-            hashed_state: Either::Left(Arc::new(hashed_state)),
-            trie_updates: Either::Left(Arc::new(trie_updates)),
-        }
-        .into_executed_payload();
-        Some(BscBuiltPayload {
-            block: sealed_block,
-            fees: task.gas_fee,
-            requests: Some(requests),
-            build_kind: crate::node::engine::BuildKind::NormalAttempt,
-            exec_duration: std::time::Duration::ZERO,
-            trie_root_duration: std::time::Duration::ZERO,
-            executed_block: executed,
-            pending_validators: None,
-            pending_turn_length: None,
-            is_bid: true,
-        })
-    }
-
-    /// The best stored BidBlock payload for a parent hash (go-bsc `GetBestBidBlock`).
-    pub fn best_bid_block(&self, parent_hash: B256) -> Option<BscBuiltPayload> {
+    /// The best stored (sealed, unexecuted) BidBlock for a parent hash (go-bsc `GetBestBidBlock`).
+    ///
+    /// The returned [`BidBlockTask`] is fully blind-signed and sealed but **not** executed: under
+    /// BEP-675 zero-simulate the validator verifies the state root only after broadcasting.
+    pub fn best_bid_block(&self, parent_hash: B256) -> Option<BidBlockTask> {
         self.best_bid_block.read().get(&parent_hash).cloned()
     }
 }
@@ -1172,5 +1107,65 @@ where
             return Err(e);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::node::primitives::{BscBlock, BscBlockBody};
+    use reth_primitives_traits::RecoveredBlock;
+
+    fn bid_block_task_at(number: u64, parent_hash: B256) -> BidBlockTask {
+        let header = alloy_consensus::Header { number, parent_hash, ..Default::default() };
+        let body = BscBlockBody {
+            inner: reth_ethereum_primitives::BlockBody {
+                transactions: Vec::new(),
+                ommers: Vec::new(),
+                withdrawals: None,
+            },
+            sidecars: None,
+        };
+        BidBlockTask {
+            block: RecoveredBlock::new_unhashed(BscBlock { header, body }, Vec::new()),
+            gas_fee: U256::from(1),
+            system_tx_start: 0,
+            builder: Address::ZERO,
+            bid_hash: B256::random(),
+        }
+    }
+
+    #[test]
+    fn retain_recent_bid_blocks_evicts_stale_entries_by_block_number() {
+        let mut map = HashMap::new();
+        let old_parent = B256::repeat_byte(0x11);
+        let recent_parent = B256::repeat_byte(0x22);
+        map.insert(old_parent, bid_block_task_at(100, B256::random()));
+        map.insert(recent_parent, bid_block_task_at(110, B256::random()));
+
+        // min_block_number = 105: the block-100 entry is stale and must be evicted; the
+        // block-110 entry is recent and must survive.
+        retain_recent_bid_blocks(&mut map, 105);
+
+        assert!(!map.contains_key(&old_parent), "stale BidBlock must be evicted");
+        assert!(map.contains_key(&recent_parent), "recent BidBlock must be retained");
+    }
+
+    #[test]
+    fn retain_recent_bid_blocks_keeps_entry_at_exact_threshold() {
+        let mut map = HashMap::new();
+        let parent = B256::repeat_byte(0x33);
+        map.insert(parent, bid_block_task_at(105, B256::random()));
+
+        retain_recent_bid_blocks(&mut map, 105);
+
+        assert!(map.contains_key(&parent), "entry exactly at the threshold must be retained");
+    }
+
+    #[test]
+    fn retain_recent_bid_blocks_is_a_noop_on_empty_map() {
+        let mut map: HashMap<B256, BidBlockTask> = HashMap::new();
+        retain_recent_bid_blocks(&mut map, 1_000);
+        assert!(map.is_empty());
     }
 }

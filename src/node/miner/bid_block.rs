@@ -13,7 +13,11 @@ use crate::consensus::eip4844::is_blob_eligible_block;
 use crate::consensus::parlia::bid_block::{
     extract_bid_block_deposit_value, verify_bid_block_system_txs, BidBlockSystemTxError,
 };
-use crate::consensus::parlia::{consensus::Parlia, Snapshot, SnapshotProvider};
+use crate::consensus::parlia::{
+    consensus::Parlia,
+    constants::{DIFF_INTURN, DIFF_NOTURN},
+    Snapshot, SnapshotProvider,
+};
 use crate::hardforks::BscHardforks;
 use crate::node::miner::block_mev_info::{encode_block_mev_info, BlockMevInfoVersion};
 use crate::node::miner::signer::sign_system_transaction;
@@ -24,7 +28,6 @@ use alloy_consensus::{Header, Transaction, TxLegacy};
 use alloy_eips::eip2718::Decodable2718;
 use alloy_primitives::{keccak256, Address, Bytes, Signature, B256, U256};
 use alloy_rlp::{Decodable, Encodable};
-use reth::consensus::HeaderValidator;
 use reth::primitives::SealedHeader;
 use reth_chainspec::EthChainSpec;
 use reth_ethereum_primitives::{BlockBody, TransactionSigned};
@@ -374,6 +377,108 @@ impl fmt::Display for BlobSidecarError {
 
 impl std::error::Error for BlobSidecarError {}
 
+/// Why a selected BidBlock's blob KZG proofs are invalid (see [`validate_bid_block_blob_kzg`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlobKzgError {
+    /// No sidecar present for the blob tx at `tx_index`.
+    MissingSidecar { tx_index: usize },
+    /// KZG proof / versioned-hash verification failed for the blob tx at `tx_index`.
+    Invalid { tx_index: usize, detail: String },
+}
+
+impl fmt::Display for BlobKzgError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingSidecar { tx_index } => {
+                write!(f, "missing sidecar for blob tx at index {tx_index}")
+            }
+            Self::Invalid { tx_index, detail } => {
+                write!(f, "blob KZG invalid for tx at index {tx_index}: {detail}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for BlobKzgError {}
+
+/// Verify EIP-4844 KZG proofs for a selected BidBlock's blob txs (go-bsc `validateBidBlockBlobTxs`
+/// → `txpool.ValidateBlobTx`).
+///
+/// This is the **expensive** proof check that the cheap admission-time
+/// [`validate_bid_block_blob_sidecars`] deliberately skips (it only checks structural sidecar
+/// invariants). go-bsc runs it in `prepareBidBlockTask` — on the *selected* block, *before* sealing
+/// and broadcast — and revokes the builder on failure. Under zero-simulate it must run before the
+/// block is broadcast, since full re-execution (which would also catch a bad blob) is deferred to
+/// after broadcast. Each blob tx in the user-tx region (`txs[..system_tx_start]`) is paired in order
+/// with the next sidecar and its commitments/proofs are verified against the tx's versioned hashes.
+pub fn validate_bid_block_blob_kzg(
+    txs: &[TransactionSigned],
+    sidecars: &[BscBlobTransactionSidecar],
+    system_tx_start: usize,
+) -> Result<(), BlobKzgError> {
+    let proof_settings = alloy_eips::eip4844::env_settings::EnvKzgSettings::Default;
+    let proof_settings = proof_settings.get();
+    let end = system_tx_start.min(txs.len());
+    let mut sidecar_index = 0usize;
+    for (tx_index, tx) in txs[..end].iter().enumerate() {
+        if !tx.is_eip4844() {
+            continue;
+        }
+        let Some(sidecar) = sidecars.get(sidecar_index) else {
+            return Err(BlobKzgError::MissingSidecar { tx_index });
+        };
+        let versioned = tx.blob_versioned_hashes().unwrap_or(&[]);
+        sidecar
+            .inner
+            .validate(versioned, proof_settings)
+            .map_err(|e| BlobKzgError::Invalid { tx_index, detail: e.to_string() })?;
+        sidecar_index += 1;
+    }
+    Ok(())
+}
+
+/// Sum of per-tx gas used over a BidBlock's non-system-tx region `receipts[..system_tx_start]` —
+/// go-bsc's `calcNonSystemGasUsed`. Reth/alloy receipts only carry `cumulative_gas_used` (there is
+/// no stored per-tx figure), but since cumulative gas used is monotonic from the block's first tx,
+/// summing each receipt's per-tx gas over `[0, system_tx_start)` telescopes to the last
+/// non-system receipt's cumulative total — so no explicit summation loop is needed.
+pub fn non_system_gas_used<R: alloy_consensus::TxReceipt>(
+    receipts: &[R],
+    system_tx_start: usize,
+) -> u64 {
+    if system_tx_start == 0 {
+        return 0;
+    }
+    receipts.get(system_tx_start - 1).map(|r| r.cumulative_gas_used()).unwrap_or(0)
+}
+
+/// Post-import average-gas-price floor check (go-bsc `validateBidBlockAverageGasPrice`), run once
+/// `new_payload` confirms the BidBlock is valid. The deposit-derived `gas_fee` the bid was selected
+/// on is the sole source of the fee ranking; without this check a builder could pad it via the
+/// system deposit while filling the user-tx region with near-zero-gas-price transactions. This does
+/// **not** reject the (already-canonical) block — it only informs whether to revoke the builder's
+/// future `SendBidBlock` permission.
+///
+/// Returns `Ok(())` when there's no non-system gas used to check (matching go-bsc's `gasUsed == 0`
+/// early return — avoids a division by zero) or the average clears `min_gas_price`; otherwise
+/// `Err(avg_gas_price)`.
+pub fn validate_bid_block_average_gas_price<R: alloy_consensus::TxReceipt>(
+    gas_fee: U256,
+    receipts: &[R],
+    system_tx_start: usize,
+    min_gas_price: U256,
+) -> Result<(), U256> {
+    let gas_used = non_system_gas_used(receipts, system_tx_start);
+    if gas_used == 0 {
+        return Ok(());
+    }
+    let avg_gas_price = gas_fee / U256::from(gas_used);
+    if avg_gas_price < min_gas_price {
+        return Err(avg_gas_price);
+    }
+    Ok(())
+}
+
 /// Pre-seal verification of an admitted BidBlock (go-bsc `bidSimulator.preSealVerifyBidBlock`).
 ///
 /// Runs the cheap checks a validator makes before sealing a builder block, in go-bsc's order:
@@ -395,17 +500,33 @@ pub fn pre_seal_verify_bid_block(
     etherbase: Address,
     expected_gas_limit: u64,
 ) -> Result<(usize, U256), PreSealVerifyError> {
+    // go-bsc checks coinbase/gasLimit before VerifyUnsealedHeader (see preSealVerifyBidBlock) —
+    // matters now that verify_bid_block_header's cascading checks depend on the header's coinbase
+    // too, so a header with a *wrong* coinbase must surface `InvalidCoinbase`, not
+    // `UnauthorizedValidator`, matching which error go-bsc would return first.
+    verify_bid_block_coinbase_and_gas_limit(&decoded.header, etherbase, expected_gas_limit)?;
     verify_bid_block_header(parlia, &decoded.header, parent, snap)?;
     verify_bid_block_payload(chain_spec, decoded, parent, etherbase, expected_gas_limit)
 }
 
 /// Header half of [`pre_seal_verify_bid_block`]: the unsealed Parlia header-field checks
 /// (`validate_header`: extra, ommers, gas, base fee, withdrawals, 4844, mix digest, beacon root,
-/// requests hash) plus the slot timestamp bound.
+/// requests hash), the cascading fields go-bsc's `VerifyUnsealedHeader` checks against the parent
+/// snapshot (coinbase is an authorized, not-recently-signed validator; difficulty matches its
+/// in-turn/no-turn status), and the slot timestamp bound (both directions: the existing upper
+/// bound plus go-bsc's `blockTimeVerifyForRamanujanFork` lower bound).
 ///
-/// Split out because it must run on the **finalized** header (which carries the validator's extra
-/// and seal), whereas [`verify_bid_block_payload`] must run **before** finalize (its `system_tx_start`
-/// feeds bind-signing, which mutates the tx set and therefore must precede finalize).
+/// The cascading checks use `header.beneficiary` directly rather than recovering a seal signer:
+/// go-bsc's function is explicitly named "Unsealed" because it runs on headers that may not carry
+/// a valid seal yet (this function's first, admission-time call site — [`pre_seal_verify_bid_block`]
+/// — runs on the builder's raw, unfinalized header). Signature-based verification of the seal
+/// itself happens later, when the finalized block is executed on import.
+///
+/// Split out because it must also run on the **finalized** header (which carries the validator's
+/// extra and seal) after `finalize_new_header`, to confirm that step didn't itself produce an
+/// invalid header, whereas [`verify_bid_block_payload`] must run **before** finalize (its
+/// `system_tx_start` feeds bind-signing, which mutates the tx set and therefore must precede
+/// finalize).
 pub fn verify_bid_block_header(
     parlia: &Parlia<BscChainSpec>,
     header: &Header,
@@ -413,12 +534,56 @@ pub fn verify_bid_block_header(
     snap: &Snapshot,
 ) -> Result<(), PreSealVerifyError> {
     let sealed = SealedHeader::seal_slow(header.clone());
+    // go-bsc's `VerifyUnsealedHeader` scope: the standalone field checks WITHOUT the
+    // wall-clock future bound — a bid's next-slot timestamp is legitimately in the future
+    // (by up to one block interval) when it arrives, and geth only applies the future check
+    // on the sync path (`verifyHeader`).
     parlia
-        .validate_header(&sealed)
+        .validate_unsealed_header_fields(&sealed)
+        .map_err(|e| PreSealVerifyError::InvalidHeader(e.to_string()))?;
+
+    if !snap.validators.contains(&header.beneficiary) {
+        return Err(PreSealVerifyError::UnauthorizedValidator { validator: header.beneficiary });
+    }
+    if snap.sign_recently(header.beneficiary) {
+        return Err(PreSealVerifyError::SignedTooRecently { validator: header.beneficiary });
+    }
+    let want_difficulty =
+        if snap.is_inturn(header.beneficiary) { DIFF_INTURN } else { DIFF_NOTURN };
+    if header.difficulty != want_difficulty {
+        return Err(PreSealVerifyError::WrongDifficulty {
+            got: header.difficulty,
+            want: want_difficulty,
+        });
+    }
+
+    parlia
+        .block_time_verify_for_ramanujan_fork(snap, header, parent)
         .map_err(|e| PreSealVerifyError::InvalidHeader(e.to_string()))?;
     parlia
         .block_time_upper_check(snap, header, parent)
         .map_err(|e| PreSealVerifyError::InvalidHeader(e.to_string()))?;
+    Ok(())
+}
+
+/// Coinbase-is-the-validator and gas-limit-matches-target checks — go-bsc's `preSealVerifyBidBlock`
+/// runs these *before* `VerifyUnsealedHeader`'s cascading fields, which matters once a wrong
+/// coinbase could otherwise surface as [`PreSealVerifyError::UnauthorizedValidator`] instead of the
+/// more specific [`PreSealVerifyError::InvalidCoinbase`].
+fn verify_bid_block_coinbase_and_gas_limit(
+    header: &Header,
+    etherbase: Address,
+    expected_gas_limit: u64,
+) -> Result<(), PreSealVerifyError> {
+    if header.beneficiary != etherbase {
+        return Err(PreSealVerifyError::InvalidCoinbase { got: header.beneficiary, want: etherbase });
+    }
+    if header.gas_limit != expected_gas_limit {
+        return Err(PreSealVerifyError::InvalidGasLimit {
+            got: header.gas_limit,
+            want: expected_gas_limit,
+        });
+    }
     Ok(())
 }
 
@@ -435,16 +600,7 @@ pub fn verify_bid_block_payload(
     expected_gas_limit: u64,
 ) -> Result<(usize, U256), PreSealVerifyError> {
     let header = &decoded.header;
-
-    if header.beneficiary != etherbase {
-        return Err(PreSealVerifyError::InvalidCoinbase { got: header.beneficiary, want: etherbase });
-    }
-    if header.gas_limit != expected_gas_limit {
-        return Err(PreSealVerifyError::InvalidGasLimit {
-            got: header.gas_limit,
-            want: expected_gas_limit,
-        });
-    }
+    verify_bid_block_coinbase_and_gas_limit(header, etherbase, expected_gas_limit)?;
 
     let (system_tx_start, gas_fee) = extract_bid_block_deposit_value(&decoded.txs);
     if gas_fee.is_zero() {
@@ -485,6 +641,14 @@ pub enum PreSealVerifyError {
     InvalidGasLimit { got: u64, want: u64 },
     /// The unsealed Parlia header is invalid, or the timestamp exceeds the slot bound.
     InvalidHeader(String),
+    /// Coinbase is not an authorized validator in the parent snapshot (go-bsc
+    /// `errUnauthorizedValidator`).
+    UnauthorizedValidator { validator: Address },
+    /// Coinbase signed too recently to sign again (go-bsc `errRecentlySigned`).
+    SignedTooRecently { validator: Address },
+    /// Difficulty does not match the coinbase's in-turn/no-turn status (go-bsc
+    /// `errWrongDifficulty`).
+    WrongDifficulty { got: U256, want: U256 },
     /// The deposit (gas-fee) value is zero.
     EmptyGasFee,
     /// A user tx exceeds the per-tx gas cap.
@@ -505,6 +669,15 @@ impl fmt::Display for PreSealVerifyError {
                 write!(f, "invalid gasLimit: got {got}, want {want}")
             }
             Self::InvalidHeader(detail) => write!(f, "invalid header: {detail}"),
+            Self::UnauthorizedValidator { validator } => {
+                write!(f, "unauthorized validator: {validator}")
+            }
+            Self::SignedTooRecently { validator } => {
+                write!(f, "validator {validator} signed recently")
+            }
+            Self::WrongDifficulty { got, want } => {
+                write!(f, "wrong difficulty: got {got}, want {want}")
+            }
             Self::EmptyGasFee => write!(f, "empty gasFee"),
             Self::TxGasTooHigh { tx_index, gas, cap } => {
                 write!(f, "tx {tx_index} gas {gas} exceeds cap {cap}")
@@ -527,12 +700,21 @@ impl std::error::Error for PreSealVerifyError {}
 pub fn bind_sign_bid_block_system_txs(
     txs: &[TransactionSigned],
     system_tx_start: usize,
+    chain_id: u64,
 ) -> Result<Vec<TransactionSigned>, BindSignError> {
     let mut out = Vec::with_capacity(txs.len());
     out.extend_from_slice(&txs[..system_tx_start]);
     for (offset, tx) in txs[system_tx_start..].iter().enumerate() {
         // Recover the typed transaction, dropping the all-zero placeholder signature, then re-sign.
-        let unsigned = tx.clone().into_typed_transaction();
+        let mut unsigned = tx.clone().into_typed_transaction();
+        // geth's wire format for unsigned system txs carries no chain id (it only exists in `v`
+        // after signing), so the decoded placeholder has `chain_id: None`. go-bsc bind-signs with
+        // the EIP-155 signer (`signTxFn(..., chainID)`); mirror that here — otherwise the signed
+        // tx's signature_hash disagrees with the executor's regenerated template (which carries
+        // the chain id) and every geth-built BidBlock fails import with `UnexpectedSystemTx`.
+        if let alloy_consensus::EthereumTypedTransaction::Legacy(ref mut legacy) = unsigned {
+            legacy.chain_id = Some(chain_id);
+        }
         let signed = sign_system_transaction(unsigned)
             .map_err(|e| BindSignError { index: system_tx_start + offset, detail: e.to_string() })?;
         out.push(signed);
@@ -664,8 +846,9 @@ pub fn simulate_bid_block(
         verify_bid_block_payload(chain_spec, decoded, parent.header(), validator, expected_gas_limit)
             .map_err(SimulateBidBlockError::Verify)?;
 
-    let txs = bind_sign_bid_block_system_txs(&decoded.txs, system_tx_start)
-        .map_err(SimulateBidBlockError::BindSign)?;
+    let txs =
+        bind_sign_bid_block_system_txs(&decoded.txs, system_tx_start, chain_spec.chain().id())
+            .map_err(SimulateBidBlockError::BindSign)?;
 
     // Install the validator's block context: its own extra (vanity; finalize appends the seal slot)
     // and the tx root for the now-signed tx set. Other block-context fields are left as the builder
@@ -712,6 +895,78 @@ pub fn simulate_bid_block(
 mod tests {
     use super::*;
     use alloy_primitives::{address, b256, bytes, hex};
+
+    /// Repro for the blob-BidBlock admission stack overflow: run the decode+hash path a tokio
+    /// worker takes (2 MiB stack) on a BidBlockArgs carrying real 128 KiB blobs.
+    fn run_blob_admission_on_stack(stack_bytes: usize, num_blobs: usize) -> std::thread::Result<()> {
+        use alloy_consensus::{BlobTransactionSidecar, TxEip4844};
+        use alloy_eips::eip4844::{Blob, Bytes48};
+        use alloy_eips::eip2718::Encodable2718;
+
+        // Build a blob tx + matching sidecar exactly like a real submission (non-empty blobs).
+        let tx = TxEip4844 {
+            chain_id: 714,
+            nonce: 0,
+            gas_limit: 21_000,
+            max_fee_per_gas: 1,
+            max_priority_fee_per_gas: 1,
+            to: Address::ZERO,
+            value: U256::ZERO,
+            access_list: Default::default(),
+            blob_versioned_hashes: vec![B256::ZERO],
+            max_fee_per_blob_gas: 1,
+            input: Bytes::new(),
+        };
+        let signed = TransactionSigned::new_unhashed(tx.into(), dummy_sig());
+        let raw = Bytes::from(signed.encoded_2718());
+        let sidecar = BscBlobTransactionSidecar {
+            inner: BlobTransactionSidecar {
+                blobs: vec![Blob::default(); num_blobs],
+                commitments: vec![Bytes48::default(); num_blobs],
+                proofs: vec![Bytes48::default(); num_blobs],
+            },
+            block_number: 1,
+            block_hash: B256::ZERO,
+            tx_index: 0,
+            tx_hash: *signed.hash(),
+            version: 0,
+        };
+        let args = BidBlockArgs {
+            bid_block: BidBlock {
+                header: vector_a_block().header,
+                transactions: vec![raw],
+                sidecars: vec![sidecar],
+            },
+            signature: Bytes::from(vec![0u8; 65]),
+        };
+        // Round-trip through JSON like the RPC layer does, then run the admission decode/hash.
+        let json = serde_json::to_string(&args).unwrap();
+
+        let handle = std::thread::Builder::new()
+            .stack_size(stack_bytes)
+            .spawn(move || {
+                // The full pre-KZG admission decode path the RPC layer runs per submission.
+                let parsed: BidBlockArgs = serde_json::from_str(&json).unwrap();
+                let _hash = parsed.bid_block.hash();
+                let _decoded = parsed.to_decoded_bid_block(Address::ZERO).unwrap();
+                std::hint::black_box(&_decoded);
+            })
+            .unwrap();
+        handle.join()
+    }
+
+    #[test]
+    fn blob_admission_does_not_overflow_tokio_stack() {
+        // Regression guard for the blob-BidBlock stack overflow: a tokio worker has a 2 MiB stack
+        // by default, and admission (JSON decode + hash) runs on it. A max-blob (6) BidBlock must
+        // fit — otherwise any whitelisted builder crashes the validator via mev_sendBidBlock. The
+        // fix keeps blob decoding on the heap (see `hex_decode_fixed` in node::primitives); before
+        // it, even a single blob overflowed in a debug build.
+        assert!(
+            run_blob_admission_on_stack(2 * 1024 * 1024, 6).is_ok(),
+            "blob BidBlock admission overflowed a 2 MiB stack (tokio worker default)"
+        );
+    }
 
     /// A header matching go-ethereum's literal `&Header{...}` defaults: the three roots and
     /// ommers hash are ZERO (alloy's `Header::default()` would set them to the empty-trie hashes).
@@ -997,6 +1252,116 @@ mod tests {
         );
     }
 
+    // ---- validate_bid_block_blob_kzg (pre-broadcast proof gate) ----
+
+    #[test]
+    fn kzg_accepts_block_without_blob_txs() {
+        // No EIP-4844 txs in the user region → nothing to verify, no sidecars consumed.
+        let txs = vec![legacy_tx(0), legacy_tx(1)];
+        assert_eq!(validate_bid_block_blob_kzg(&txs, &[], 2), Ok(()));
+    }
+
+    #[test]
+    fn kzg_rejects_blob_tx_without_sidecar() {
+        // A blob tx with no matching sidecar is rejected before any crypto runs (go-bsc would have
+        // no sidecar to hand ValidateBlobTx). The error carries the offending tx index.
+        let txs = vec![blob_tx(0)];
+        assert_eq!(
+            validate_bid_block_blob_kzg(&txs, &[], 1),
+            Err(BlobKzgError::MissingSidecar { tx_index: 0 })
+        );
+    }
+
+    #[test]
+    fn kzg_rejects_invalid_proof() {
+        // A blob tx paired with an all-zero (bogus) sidecar fails KZG verification: the commitment
+        // does not hash to the tx's versioned hash / is not a valid point. Must be a typed error,
+        // never a panic.
+        let tx = blob_tx(0);
+        let sidecar = sidecar_for(&tx, 0, 0, 1); // all-zero blob/commitment/proof
+        assert!(matches!(
+            validate_bid_block_blob_kzg(&[tx], &[sidecar], 1),
+            Err(BlobKzgError::Invalid { tx_index: 0, .. })
+        ));
+    }
+
+    // ---- validate_bid_block_average_gas_price / non_system_gas_used (post-import floor check) ----
+
+    fn receipt_with_cumulative_gas(cumulative_gas_used: u64) -> alloy_consensus::Receipt {
+        alloy_consensus::Receipt {
+            status: alloy_consensus::Eip658Value::Eip658(true),
+            cumulative_gas_used,
+            logs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn non_system_gas_used_reads_last_non_system_receipt() {
+        // Sum of per-tx gas over receipts[..system_tx_start] telescopes to the cumulative total at
+        // system_tx_start - 1, regardless of what the trailing (system) receipts' totals are.
+        let receipts = vec![
+            receipt_with_cumulative_gas(21_000),
+            receipt_with_cumulative_gas(50_000),
+            receipt_with_cumulative_gas(9_999_999), // trailing system tx: must not count
+        ];
+        assert_eq!(non_system_gas_used(&receipts, 2), 50_000);
+    }
+
+    #[test]
+    fn non_system_gas_used_is_zero_when_system_tx_start_is_zero() {
+        // Matches go-bsc: systemTxStart == 0 means no user txs at all.
+        let receipts = vec![receipt_with_cumulative_gas(21_000)];
+        assert_eq!(non_system_gas_used(&receipts, 0), 0);
+    }
+
+    #[test]
+    fn validate_average_gas_price_accepts_at_or_above_floor() {
+        // gas_fee=1_050_000 over 50_000 gas => avg=21 (integer division), clears a floor of 21.
+        let receipts = vec![receipt_with_cumulative_gas(21_000), receipt_with_cumulative_gas(50_000)];
+        assert_eq!(
+            validate_bid_block_average_gas_price(U256::from(1_050_000), &receipts, 2, U256::from(21)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn validate_average_gas_price_rejects_below_floor() {
+        // gas_fee=1_000 over 50_000 gas => avg=0, below any positive floor.
+        let receipts = vec![receipt_with_cumulative_gas(21_000), receipt_with_cumulative_gas(50_000)];
+        assert_eq!(
+            validate_bid_block_average_gas_price(U256::from(1_000), &receipts, 2, U256::from(1)),
+            Err(U256::ZERO)
+        );
+    }
+
+    #[test]
+    fn validate_average_gas_price_skips_check_when_no_non_system_gas_used() {
+        // Matches go-bsc's `gasUsed == 0` early return: avoids a division by zero and simply
+        // passes when there is nothing to check (e.g. a BidBlock with only system txs).
+        let receipts = vec![receipt_with_cumulative_gas(9_999_999)];
+        assert_eq!(
+            validate_bid_block_average_gas_price(U256::ZERO, &receipts, 0, U256::from(1_000_000)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn validate_average_gas_price_ignores_trailing_system_tx_gas() {
+        // A huge trailing system-tx gas total must not dilute the average — go-bsc excludes it via
+        // `receipts[:systemTxStart]`, and a builder must not be able to hide an underpriced
+        // user-tx region behind expensive system txs.
+        let receipts = vec![
+            receipt_with_cumulative_gas(21_000),
+            receipt_with_cumulative_gas(9_021_000), // system tx: consumes ~9M gas on its own
+        ];
+        // If the system-tx gas were (wrongly) included, avg = fee / 9_021_000 would clear any
+        // reasonable floor; excluding it correctly, avg = fee / 21_000 must still fail low floors.
+        assert_eq!(
+            validate_bid_block_average_gas_price(U256::from(1_000), &receipts, 1, U256::from(1)),
+            Err(U256::ZERO)
+        );
+    }
+
     // ---- pre_seal_verify_bid_block ----
 
     use crate::consensus::parlia::bid_block::DEPOSIT_SELECTOR;
@@ -1014,8 +1379,12 @@ mod tests {
         Parlia::new(Arc::new(spec), 200)
     }
 
+    /// Single-validator snapshot authorizing `Address::repeat_byte(0x11)` — the etherbase every
+    /// `pre_seal_*` test below uses — so it passes the authorized-validator/in-turn cascading
+    /// checks `verify_bid_block_header` now runs.
     fn snap_with_interval(interval: u64) -> Snapshot {
-        let mut snap = Snapshot::new(vec![Address::ZERO], 0, B256::ZERO, 200, None);
+        let mut snap =
+            Snapshot::new(vec![Address::repeat_byte(0x11)], 0, B256::ZERO, 200, None);
         snap.block_interval = interval;
         snap
     }
@@ -1031,6 +1400,9 @@ mod tests {
             gas_used: 21_000,
             ommers_hash: EMPTY_OMMER_ROOT_HASH,
             extra_data: Bytes::from(vec![0u8; 32 + 65]),
+            // `snap_with_interval`'s lone validator is always in-turn (a single-member set has
+            // nothing to rotate with), so a genuinely valid header must claim DIFF_INTURN.
+            difficulty: DIFF_INTURN,
             ..Default::default()
         }
     }
@@ -1121,6 +1493,66 @@ mod tests {
         ));
     }
 
+    // ---- verify_bid_block_header cascading checks (go-bsc VerifyUnsealedHeader) ----
+
+    #[test]
+    fn pre_seal_rejects_unauthorized_validator() {
+        // Coinbase matches the caller's etherbase (passes the earlier InvalidCoinbase check) but
+        // is not a member of the parent snapshot's validator set at all.
+        let spec = preseal_spec();
+        let parlia = parlia_engine(spec.clone());
+        let etherbase = Address::repeat_byte(0x11);
+        // A snapshot that only authorizes a *different* validator.
+        let snap = {
+            let mut s = Snapshot::new(vec![Address::repeat_byte(0x99)], 0, B256::ZERO, 200, None);
+            s.block_interval = 3_000;
+            s
+        };
+        let header = valid_bid_header(etherbase, 30_000_000);
+        let parent = Header { number: 0, timestamp: 1, gas_limit: 30_000_000, ..Default::default() };
+        let d = decoded_block(header, vec![], vec![]);
+        assert_eq!(
+            pre_seal_verify_bid_block(&parlia, &spec, &d, &parent, &snap, etherbase, 30_000_000),
+            Err(PreSealVerifyError::UnauthorizedValidator { validator: etherbase })
+        );
+    }
+
+    #[test]
+    fn pre_seal_rejects_signed_too_recently() {
+        // An authorized, correctly-in-turn validator that already signed within the lookback
+        // window must still be rejected (go-bsc errRecentlySigned).
+        let spec = preseal_spec();
+        let parlia = parlia_engine(spec.clone());
+        let etherbase = Address::repeat_byte(0x11);
+        let mut snap = snap_with_interval(3_000);
+        // count_recent_proposers only counts entries strictly after `block_number - lookback`
+        // (0 here, since the snapshot's block_number is 0); block 0 itself would be skipped.
+        snap.recent_proposers.insert(1, etherbase);
+        let header = valid_bid_header(etherbase, 30_000_000);
+        let parent = Header { number: 0, timestamp: 1, gas_limit: 30_000_000, ..Default::default() };
+        let d = decoded_block(header, vec![], vec![]);
+        assert_eq!(
+            pre_seal_verify_bid_block(&parlia, &spec, &d, &parent, &snap, etherbase, 30_000_000),
+            Err(PreSealVerifyError::SignedTooRecently { validator: etherbase })
+        );
+    }
+
+    #[test]
+    fn pre_seal_rejects_wrong_difficulty() {
+        // snap_with_interval's lone validator is always in-turn, so DIFF_NOTURN is wrong here.
+        let spec = preseal_spec();
+        let parlia = parlia_engine(spec.clone());
+        let etherbase = Address::repeat_byte(0x11);
+        let snap = snap_with_interval(3_000);
+        let header = Header { difficulty: DIFF_NOTURN, ..valid_bid_header(etherbase, 30_000_000) };
+        let parent = Header { number: 0, timestamp: 1, gas_limit: 30_000_000, ..Default::default() };
+        let d = decoded_block(header, vec![], vec![]);
+        assert_eq!(
+            pre_seal_verify_bid_block(&parlia, &spec, &d, &parent, &snap, etherbase, 30_000_000),
+            Err(PreSealVerifyError::WrongDifficulty { got: DIFF_NOTURN, want: DIFF_INTURN })
+        );
+    }
+
     #[test]
     fn pre_seal_rejects_empty_gas_fee() {
         let spec = preseal_spec();
@@ -1205,8 +1637,13 @@ mod tests {
 
         // user tx, then two unsigned (zero-signature) system txs.
         let txs = vec![legacy_tx(0), deposit_system_tx(100), deposit_system_tx(0)];
-        let out = bind_sign_bid_block_system_txs(&txs, 1).unwrap();
+        let out = bind_sign_bid_block_system_txs(&txs, 1, 714).unwrap();
         assert_eq!(out.len(), 3);
+
+        // The bind-signed legacy system txs must carry the chain id (EIP-155), matching the
+        // executor's regenerated template — geth signs system txs with the chain-id signer.
+        assert_eq!(out[1].chain_id(), Some(714));
+        assert_eq!(out[2].chain_id(), Some(714));
 
         // Leading user tx is untouched.
         assert_eq!(out[0], txs[0]);

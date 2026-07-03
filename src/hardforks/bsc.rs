@@ -304,12 +304,13 @@ mod tests {
             );
         }
 
-        // qanet schedules Pasteur for testing, so it must have a concrete activation.
+        // qanet's Pasteur activation is TBD (see bsc_qanet's TODO comment), so it must also
+        // stay dormant until announced.
         let qanet_activation = BscHardfork::bsc_qanet().fork(BscHardfork::Pasteur);
         assert_eq!(
             qanet_activation,
-            ForkCondition::Timestamp(1782779400),
-            "qanet should have Pasteur scheduled at its configured timestamp"
+            ForkCondition::Timestamp(u64::MAX),
+            "qanet's Pasteur activation is unscheduled until announced"
         );
     }
 
