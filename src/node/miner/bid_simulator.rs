@@ -272,7 +272,7 @@ where
 
             if let Some(simulating_bid) = self.simulating_bid.read().get(&bid.parent_hash).cloned()
             {
-                let delay_ms = self.parlia.delay_for_mining(
+                let delay_ms = self.parlia.delay_for_bid_simulation(
                     &parent_snapshot,
                     mining_ctx.header.as_ref().unwrap(),
                     DELAY_LEFT_OVER,
@@ -493,7 +493,7 @@ where
         if self.greedy_merge {
             let ending_bids_extra = 20;
             let min_time_left_for_ending_bids = DELAY_LEFT_OVER + ending_bids_extra;
-            let delay_ms = self.parlia.delay_for_mining(
+            let delay_ms = self.parlia.delay_for_bid_simulation(
                 &bid_runtime.mining_ctx.parent_snapshot,
                 bid_runtime.mining_ctx.header.as_ref().unwrap(),
                 min_time_left_for_ending_bids,
