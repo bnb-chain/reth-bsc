@@ -85,6 +85,22 @@ impl std::fmt::Debug for MiningConfig {
     }
 }
 
+/// Default for `no_interrupt_left_over`: the minimum wall-clock time that must remain before the
+/// block's target timestamp for a newly arrived bid to preempt an in-flight simulation — enough
+/// to run one worst-case simulation to completion and still finalize the block.
+///
+/// Mirrors go-bsc's `getDefaultNoInterruptLeftOver` formula but substitutes reth-bsc's own
+/// finalize reserve: worst-case bid execution (55M gas ceil at an assumed 500 Mgas/s = 110ms) plus
+/// a 10ms buffer plus [`DELAY_LEFT_OVER`](super::payload::DELAY_LEFT_OVER) (120ms vs go-bsc's
+/// 15ms, as reth-bsc's state-root computation is slower), giving 240ms vs go-bsc's 135ms.
+pub fn default_no_interrupt_left_over() -> u64 {
+    const DEFAULT_GAS_CEIL: u64 = 55_000_000;
+    const EXPECTED_PROCESSING_SPEED_GAS_PER_MS: u64 = 500_000; // 500 Mgas/s
+    let bid_processing_ms = DEFAULT_GAS_CEIL / EXPECTED_PROCESSING_SPEED_GAS_PER_MS;
+    let buffer_ms = 10;
+    bid_processing_ms + buffer_ms + super::payload::DELAY_LEFT_OVER
+}
+
 impl Default for MiningConfig {
     fn default() -> Self {
         Self {
@@ -101,9 +117,7 @@ impl Default for MiningConfig {
             // MEV defaults
             validator_commission: Some(100),     // 1%
             bid_simulation_left_over: Some(20),  // 20ms (go-bsc's defaultBidSimulationLeftOver)
-            no_interrupt_left_over: Some(135),   // 135ms (go-bsc's getDefaultNoInterruptLeftOver
-                                                  // at its default GasCeil: 110ms bidProcessing +
-                                                  // 10ms buffer + 15ms delayLeftOver)
+            no_interrupt_left_over: Some(default_no_interrupt_left_over()),
             delay_left_over: Some(15),           // 15ms (go-bsc's defaultDelayLeftOver)
             max_bids_per_builder: Some(3),
             builder_fee_ceil: Some(1_000_000_000_000_000_000), // 1 BNB
@@ -173,7 +187,7 @@ impl MiningConfig {
 
     /// Get no interrupt left over time in milliseconds
     pub fn get_no_interrupt_left_over(&self) -> u64 {
-        self.no_interrupt_left_over.unwrap_or(135) // Default: 135ms (go-bsc default)
+        self.no_interrupt_left_over.unwrap_or_else(default_no_interrupt_left_over)
     }
 
     /// Get the block-finalization time reserve in milliseconds (go-bsc's `DelayLeftOver`).
@@ -224,7 +238,7 @@ impl MiningConfig {
                 // Use default MEV parameters
                 validator_commission: Some(100),
                 bid_simulation_left_over: Some(20),
-                no_interrupt_left_over: Some(135),
+                no_interrupt_left_over: Some(default_no_interrupt_left_over()),
                 delay_left_over: Some(15),
                 max_bids_per_builder: Some(3),
                 builder_fee_ceil: Some(1_000_000_000_000_000_000),
@@ -464,16 +478,20 @@ mod tests {
     }
 
     #[test]
-    fn no_interrupt_left_over_matches_go_bsc_default() {
-        // go-bsc's `getDefaultNoInterruptLeftOver()` at its default GasCeil (55M gas @ an assumed
-        // 500 Mgas/s): 110ms bidProcessing + 10ms buffer + 15ms delayLeftOver = 135ms.
-        assert_eq!(MiningConfig::default().get_no_interrupt_left_over(), 135);
+    fn no_interrupt_left_over_follows_go_bsc_formula_with_reth_reserve() {
+        // go-bsc's `getDefaultNoInterruptLeftOver()` formula (55M gas ceil @ an assumed
+        // 500 Mgas/s = 110ms bidProcessing + 10ms buffer + delayLeftOver), with reth-bsc's
+        // 120ms finalize reserve (`DELAY_LEFT_OVER`) instead of go-bsc's 15ms: 240ms vs 135ms.
+        assert_eq!(
+            MiningConfig::default().get_no_interrupt_left_over(),
+            110 + 10 + crate::node::miner::payload::DELAY_LEFT_OVER
+        );
     }
 
     #[test]
     fn delay_left_over_defaults_to_go_bsc_value() {
         // go-bsc's `defaultDelayLeftOver = 15 * time.Millisecond`; distinct from and smaller than
-        // `no_interrupt_left_over` (135ms default), which bounds bid simulation, not block sealing.
+        // `no_interrupt_left_over` (240ms default), which bounds bid simulation, not block sealing.
         assert_eq!(MiningConfig::default().get_delay_left_over(), 15);
     }
 

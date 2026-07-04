@@ -41,7 +41,6 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{debug, trace};
-const NO_INTERRUPT_LEFT_OVER: u64 = 500;
 const PAY_BID_TX_GAS_LIMIT: u64 = 25000;
 const TX_GAS: u64 = 21000;
 
@@ -65,6 +64,18 @@ impl Bid {
     fn is_committed(&self) -> bool {
         self.committed
     }
+}
+
+/// go-bsc `canBeInterrupted`: a newly arrived bid may preempt the in-flight simulation only if
+/// the raw wall-clock time left until the block's target timestamp still fits one worst-case
+/// simulation plus the finalize reserve (`no_interrupt_left_over_ms`). Compares against the raw
+/// block target — not a mining-delay value, which is leftover-subtracted and interval-clamped and
+/// would distort the comparison. A zero `block_time_ms` (unknown target) disables the check.
+fn can_be_interrupted(block_time_ms: u64, now_ms: u64, no_interrupt_left_over_ms: u64) -> bool {
+    if block_time_ms == 0 {
+        return true;
+    }
+    block_time_ms.saturating_sub(now_ms) >= no_interrupt_left_over_ms
 }
 
 /// Evicts entries older than `min_block_number` from the `best_bid_block` map, keyed by parent
@@ -99,6 +110,9 @@ pub struct BidSimulator<Client, Pool> {
     min_gas_price: U256,
     validator_commission: u64,
     greedy_merge: bool,
+    /// go-bsc `Mev.NoInterruptLeftOver`: minimum raw time-to-block-target required for a new bid
+    /// to preempt an in-flight simulation. See [`can_be_interrupted`].
+    no_interrupt_left_over: u64,
 
     // MEV metrics
     mev_metrics: crate::metrics::BscMevMetrics,
@@ -125,6 +139,7 @@ where
         snapshot_provider: Arc<dyn SnapshotProvider + Send + Sync>,
         validator_commission: u64,
         greedy_merge: bool,
+        no_interrupt_left_over: u64,
     ) -> Self {
         Self {
             client,
@@ -143,6 +158,7 @@ where
             mev_metrics: crate::metrics::BscMevMetrics::default(),
             validator_commission,
             greedy_merge,
+            no_interrupt_left_over,
         }
     }
 
@@ -208,7 +224,6 @@ where
             block_timestamp_ms: 0,
             end_mining_timestamp_ms: 0,
         };
-        let parent_snapshot = mining_ctx.parent_snapshot.clone();
         let attributes = prepare_new_attributes(
             &mut mining_ctx,
             self.parlia.clone(),
@@ -272,17 +287,25 @@ where
 
             if let Some(simulating_bid) = self.simulating_bid.read().get(&bid.parent_hash).cloned()
             {
-                let delay_ms = self.parlia.delay_for_bid_simulation(
-                    &parent_snapshot,
-                    mining_ctx.header.as_ref().unwrap(),
-                    DELAY_LEFT_OVER,
-                );
-                if delay_ms >= NO_INTERRUPT_LEFT_OVER || delay_ms == 0 {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                if can_be_interrupted(
+                    mining_ctx.block_timestamp_ms,
+                    now_ms,
+                    self.no_interrupt_left_over,
+                ) {
                     simulating_bid.interrupt_flag.store(true, Ordering::Relaxed);
                     let bid_simulate_req = self.commit_bid(5, _bid_runtime);
                     return Some(bid_simulate_req);
                 } else {
-                    debug!("simulate in progress, no interrupt after delay_ms:{}, NO_INTERRUPT_LEFT_OVER:{},bid hash:{}", delay_ms, NO_INTERRUPT_LEFT_OVER, _bid_runtime.bid.bid_hash);
+                    debug!(
+                        "simulate in progress, no interrupt, left:{}, no_interrupt_left_over:{}, bid hash:{}",
+                        mining_ctx.block_timestamp_ms.saturating_sub(now_ms),
+                        self.no_interrupt_left_over,
+                        _bid_runtime.bid.bid_hash
+                    );
                 }
             } else {
                 let bid_simulate_req = self.commit_bid(5, _bid_runtime);
@@ -1115,6 +1138,18 @@ mod tests {
     use super::*;
     use crate::node::primitives::{BscBlock, BscBlockBody};
     use reth_primitives_traits::RecoveredBlock;
+
+    #[test]
+    fn can_be_interrupted_requires_full_simulation_window() {
+        // 240ms threshold (default): exactly at the boundary → interruptible.
+        assert!(can_be_interrupted(10_000, 9_760, 240));
+        // 1ms short of the window → the in-flight simulation keeps running.
+        assert!(!can_be_interrupted(10_000, 9_761, 240));
+        // Block target already passed → saturates to 0 left, never interrupt.
+        assert!(!can_be_interrupted(10_000, 10_100, 240));
+        // Unknown block target disables the check (go-bsc `targetTime == 0`).
+        assert!(can_be_interrupted(0, 10_000, 240));
+    }
 
     fn bid_block_task_at(number: u64, parent_hash: B256) -> BidBlockTask {
         let header = alloy_consensus::Header { number, parent_hash, ..Default::default() };

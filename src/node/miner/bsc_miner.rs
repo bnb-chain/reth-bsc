@@ -1247,6 +1247,7 @@ where
             snapshot_provider.clone(),
             mining_config.validator_commission.unwrap_or(100),
             mining_config.greedy_merge,
+            mining_config.get_no_interrupt_left_over(),
         ));
         let main_work_worker = MainWorkWorker::new(
             validator_address,
