@@ -185,6 +185,13 @@ where
             return None;
         }
         self.add_pending_bid(bid.block_number, bid.builder, bid.bid_hash);
+        self.commit_bid_inner(bid)
+    }
+
+    // Admission shared by new bids and the post-simulation recommit probe (go-bsc
+    // newBidLoop). The probe re-enters with a bid that is already in pending_bid, so
+    // it must skip commit_new_bid's dedup — go-bsc has no dedup on the newBidCh path.
+    fn commit_bid_inner(&self, bid: Bid) -> Option<BidRuntime<Pool, BscEvmConfig>> {
         let final_block_number = match self.client.finalized_block_number() {
             Ok(Some(final_block_number)) => final_block_number,
             Ok(None) => return None,
@@ -382,25 +389,120 @@ where
     ) -> BidRuntime<Pool, BscEvmConfig> {
         debug!("bid committed reason:{}, bid hash:{}", reason, bid_runtime.bid.bid_hash);
         bid_runtime.bid.committed = true;
+        // go-bsc shares one *types.Bid between bestBidToRun and the dispatched runtime,
+        // so Commit() marks both. Our map holds a clone inserted before this call —
+        // mark it too, or best_bid_to_run never reads as committed and admission would
+        // re-simulate an already-dispatched bid instead of discarding the newcomer.
+        if let Some(existing) =
+            self.best_bid_to_run.write().get_mut(&bid_runtime.bid.parent_hash)
+        {
+            if existing.bid_hash == bid_runtime.bid.bid_hash {
+                existing.committed = true;
+            }
+        }
 
         bid_runtime
     }
 
-    // sim_bid commit tx and set best bid
+    // sim_bid commit tx and set best bid (go-bsc simBid). On a clean simulation this
+    // returns the follow-up request produced by the recommit probe (go-bsc's simBid
+    // defer re-sends the best bid through newBidCh) — the caller must feed it back
+    // into the simulate loop.
     pub fn bid_simulate(
         &self,
         mut bid_runtime: BidRuntime<Pool, BscEvmConfig>,
-    ) {
+    ) -> Option<BidRuntime<Pool, BscEvmConfig>> {
         if !self.bid_receiving {
-            return;
+            return None;
         }
 
         // Track simulation start time
         let sim_start = std::time::Instant::now();
         let is_first_bid = self.best_bid.read().is_empty();
-
-        let mut success = false;
         let parent_hash = bid_runtime.bid.parent_hash;
+
+        self.simulating_bid.write().insert(parent_hash, bid_runtime.bid.clone());
+        let outcome = self.simulate_bid_inner(&mut bid_runtime);
+
+        // go-bsc simBid runs all of this in a defer so it covers every exit path.
+        // Previously the early error returns skipped it, leaving a phantom in-flight
+        // simulation that parked incoming bids until clear() pruned it blocks later.
+        self.simulating_bid.write().remove(&parent_hash);
+        bid_runtime.finished.store(true, Ordering::Relaxed);
+        let success = matches!(outcome, Ok(true));
+        if !success {
+            // go-bsc DelBestBidToRun: hash-matched, so aborting this bid can't evict a
+            // newer bid parked in best_bid_to_run while this one was simulating.
+            let mut to_run = self.best_bid_to_run.write();
+            if to_run.get(&parent_hash).is_some_and(|b| b.bid_hash == bid_runtime.bid.bid_hash)
+            {
+                to_run.remove(&parent_hash);
+            }
+        }
+
+        // Aborted simulations keep their site-specific debug logs; metrics and the
+        // recommit probe only apply to simulations that ran to completion.
+        if outcome.is_err() {
+            return None;
+        }
+
+        // Update metrics after simulation
+        let sim_duration = sim_start.elapsed().as_secs_f64();
+        self.mev_metrics.bid_simulation_duration_seconds.record(sim_duration);
+
+        if is_first_bid {
+            self.mev_metrics.first_bid_simulation_seconds.record(sim_duration);
+        }
+
+        if success {
+            self.mev_metrics.valid_bids_total.increment(1);
+
+            // Update best bid gas used (in MGas)
+            let gas_used_mgas = bid_runtime.gas_used as f64 / 1_000_000.0;
+            self.mev_metrics.best_bid_gas_used_mgas.set(gas_used_mgas);
+
+            // Calculate simulation speed (MGas/s)
+            if sim_duration > 0.0 {
+                let mgasps = gas_used_mgas / sim_duration;
+                self.mev_metrics.bid_simulation_speed_mgasps.set(mgasps);
+            }
+        } else {
+            self.mev_metrics.invalid_bids_total.increment(1);
+        }
+
+        debug!("bidSimulator: sim_bid finished, block number:{}, parent hash:{}, builder:{}, bid hash:{}, gas used:{}, gas fee:{}, success:{}",
+         bid_runtime.bid.block_number,
+         bid_runtime.bid.parent_hash,
+         bid_runtime.bid.builder,
+         bid_runtime.bid.bid_hash,
+         bid_runtime.gas_used,
+         bid_runtime.gas_fee,
+         success,
+        );
+
+        // go-bsc simBid defer: after a clean simulation, re-commit the best simulated
+        // bid ("recommit probe") when no new bids are queued. The probe re-runs
+        // admission, which does one of two things: if a better bid was parked
+        // non-committed in best_bid_to_run while this one simulated (no-interrupt
+        // window), the probe loses the expected-reward comparison and the parked bid
+        // finally gets simulated; otherwise (is_expected_better_than is >=, matching
+        // go-bsc) the probe wins against itself and the best bid is re-simulated,
+        // deliberately re-running greedy merge over the current mempool. The
+        // no-time-left guard in simulate_bid_inner is what terminates this loop at
+        // DELAY_LEFT_OVER before the seal deadline.
+        if crate::shared::bid_package_queue_len() > 0 {
+            return None;
+        }
+        let recommit = self.best_bid.read().get(&parent_hash).map(|rt| rt.bid.clone())?;
+        self.commit_bid_inner(recommit)
+    }
+
+    fn simulate_bid_inner(
+        &self,
+        bid_runtime: &mut BidRuntime<Pool, BscEvmConfig>,
+    ) -> Result<bool, ()> {
+        let parent_hash = bid_runtime.bid.parent_hash;
+        let mut success = false;
 
         // go-bsc simBid aborts with errNoTimeLeft when engine.Delay(header, delayLeftOver)
         // has run out. Without this, a bid dispatched near the seal deadline (or one that
@@ -420,23 +522,9 @@ where
                     "bidSimulator: abort simulation, no time left, block number:{}, bid hash:{}",
                     bid_runtime.bid.block_number, bid_runtime.bid.bid_hash,
                 );
-                // go-bsc DelBestBidToRun: drop this bid (hash-matched) from best_bid_to_run
-                // so a committed-but-never-simulated bid can't block later admissions.
-                {
-                    let mut to_run = self.best_bid_to_run.write();
-                    if to_run
-                        .get(&parent_hash)
-                        .is_some_and(|b| b.bid_hash == bid_runtime.bid.bid_hash)
-                    {
-                        to_run.remove(&parent_hash);
-                    }
-                }
-                bid_runtime.finished.store(true, Ordering::Relaxed);
-                return;
+                return Err(());
             }
         }
-
-        self.simulating_bid.write().insert(parent_hash, bid_runtime.bid.clone());
 
         let mut txs_except_last = bid_runtime.bid.txs.clone();
         let pay_bid_tx = txs_except_last.pop();
@@ -446,7 +534,7 @@ where
                 Ok(provider) => provider,
                 Err(e) => {
                     debug!("Failed to get state provider by block hash: {:?}", e);
-                    return;
+                    return Err(());
                 }
             };
         let sp_db = StateProviderDatabase::new(&state_provider);
@@ -465,7 +553,7 @@ where
         );
         if bid_runtime.bid.gas_used > gas_limit - system_txs_gas - PAY_BID_TX_GAS_LIMIT {
             debug!("bidSimulator: gas limit exceeded, ignore");
-            return;
+            return Err(());
         }
 
         // Sinks transport current_validators / turn_length from the builder so that
@@ -504,7 +592,7 @@ where
             Ok(builder) => builder,
             Err(e) => {
                 debug!("Failed to create builder for next block: {:?}", e);
-                return;
+                return Err(());
             }
         };
         let mut block_gas_limit: u64 =
@@ -514,7 +602,7 @@ where
         // todo: prefetch transactions
         if let Err(e) = builder.apply_pre_execution_changes().map_err(PayloadBuilderError::other) {
             debug!("Failed to apply pre-execution changes: {:?}", e);
-            return;
+            return Err(());
         }
 
         // First commit: bid transactions
@@ -522,18 +610,35 @@ where
             bid_runtime.commit_transaction(txs_except_last.clone(), &mut builder, block_gas_limit)
         {
             debug!("Failed to commit bid transactions: {:?}", e);
-            return;
+            return Err(());
+        }
+
+        // go-bsc simBid re-checks engine.Delay after committing the bid txs
+        // (errNoTimeLeft): executing them may have consumed the remaining window.
+        if let Some(header) = bid_runtime.mining_ctx.header.as_ref() {
+            if self.parlia.delay_for_bid_simulation(
+                &bid_runtime.mining_ctx.parent_snapshot,
+                header,
+                DELAY_LEFT_OVER,
+            ) == 0
+            {
+                debug!(
+                    "bidSimulator: no time left after committing bid txs, bid hash:{}",
+                    bid_runtime.bid.bid_hash,
+                );
+                return Err(());
+            }
         }
 
         if let Err(e) =
             bid_runtime.pack_reward(self.validator_commission, bid_runtime.system_balance)
         {
             debug!("Failed to pack reward: {:?}", e);
-            return;
+            return Err(());
         }
         if !bid_runtime.valid_reward() {
             debug!("bidSimulator: invalid bid, ignore");
-            return;
+            return Err(());
         }
 
         if bid_runtime.gas_used != 0 {
@@ -543,7 +648,7 @@ where
                     "bid gas price is lower than min gas price, bid:{}, min:{}",
                     bid_gas_price, self.min_gas_price
                 );
-                return;
+                return Err(());
             }
         }
 
@@ -567,13 +672,13 @@ where
                     delay_ms,
                 ) {
                     debug!("Failed to commit tx pool transactions: {:?}", e);
-                    return;
+                    return Err(());
                 }
                 if let Err(e) =
                     bid_runtime.pack_reward(self.validator_commission, bid_runtime.system_balance)
                 {
                     debug!("Failed to pack reward: {:?}", e);
-                    return;
+                    return Err(());
                 }
 
                 // Record greedy merge duration
@@ -594,11 +699,11 @@ where
                 bid_runtime.commit_transaction(pay_bid_txs, &mut builder, block_gas_limit)
             {
                 debug!("Failed to commit pay bid transaction: {:?}", e);
-                return;
+                return Err(());
             }
         } else {
             debug!("No pay bid transaction found, skipping bid");
-            return;
+            return Err(());
         }
 
         // Finish the builder. Bid simulation does not run alongside a sparse-trie task —
@@ -607,7 +712,7 @@ where
             Ok(outcome) => outcome,
             Err(e) => {
                 debug!("Failed to finish builder: {:?}", e);
-                return;
+                return Err(());
             }
         };
         let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } = out;
@@ -626,7 +731,7 @@ where
                     bid_runtime.bid.bid_hash,
                     bid_runtime.bid.block_number
                 );
-                return;
+                return Err(());
             }
         }
 
@@ -684,45 +789,7 @@ where
             }
         }
 
-        // Update metrics after simulation
-        let sim_duration = sim_start.elapsed().as_secs_f64();
-        self.mev_metrics.bid_simulation_duration_seconds.record(sim_duration);
-
-        if is_first_bid {
-            self.mev_metrics.first_bid_simulation_seconds.record(sim_duration);
-        }
-
-        if success {
-            self.mev_metrics.valid_bids_total.increment(1);
-
-            // Update best bid gas used (in MGas)
-            let gas_used_mgas = bid_runtime.gas_used as f64 / 1_000_000.0;
-            self.mev_metrics.best_bid_gas_used_mgas.set(gas_used_mgas);
-
-            // Calculate simulation speed (MGas/s)
-            if sim_duration > 0.0 {
-                let mgasps = gas_used_mgas / sim_duration;
-                self.mev_metrics.bid_simulation_speed_mgasps.set(mgasps);
-            }
-        } else {
-            self.mev_metrics.invalid_bids_total.increment(1);
-        }
-
-        debug!("bidSimulator: sim_bid finished, block number:{}, parent hash:{}, builder:{}, bid hash:{}, gas used:{}, gas fee:{}, success:{}",
-         bid_runtime.bid.block_number,
-         bid_runtime.bid.parent_hash,
-         bid_runtime.bid.builder,
-         bid_runtime.bid.bid_hash,
-         bid_runtime.gas_used,
-         bid_runtime.gas_fee,
-         success,
-        );
-
-        self.simulating_bid.write().remove(&parent_hash);
-        bid_runtime.finished.store(true, Ordering::Relaxed);
-        if !success {
-            self.best_bid_to_run.write().remove(&parent_hash);
-        }
+        Ok(success)
     }
 
     /// Get the best bid for a given parent hash

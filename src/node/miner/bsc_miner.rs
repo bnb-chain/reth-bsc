@@ -1115,7 +1115,14 @@ where
                 bid_runtime = self.bid_simulate_req_rx.recv() => {
                     match bid_runtime {
                         Some(bid_runtime) => {
-                            self.simulator.bid_simulate(bid_runtime);
+                            // A finished simulation may produce a recommit request
+                            // (go-bsc simBid defer): the follow-up simulation of a
+                            // better bid that was parked during this run.
+                            if let Some(req) = self.simulator.bid_simulate(bid_runtime) {
+                                if let Err(e) = self.bid_simulate_req_tx.send(req) {
+                                    error!("Failed to send recommit bid simulate request due to channel closed: {}", e);
+                                }
+                            }
                         }
                         None => {
                             warn!("Bid simulate request channel closed");
