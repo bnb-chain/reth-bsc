@@ -401,6 +401,41 @@ where
 
         let mut success = false;
         let parent_hash = bid_runtime.bid.parent_hash;
+
+        // go-bsc simBid aborts with errNoTimeLeft when engine.Delay(header, delayLeftOver)
+        // has run out. Without this, a bid dispatched near the seal deadline (or one that
+        // sat queued behind another simulation — the simulate loop is sequential) starts a
+        // simulation that can't finish before sealing, and delays viable bids for the next
+        // block queued behind it. We reserve DELAY_LEFT_OVER (120ms) rather than go-bsc's
+        // delayLeftOver (15ms) because that is this codebase's finalize reserve: with less
+        // than that remaining, sealing is already under way and no result can land in time.
+        if let Some(header) = bid_runtime.mining_ctx.header.as_ref() {
+            let delay_ms = self.parlia.delay_for_bid_simulation(
+                &bid_runtime.mining_ctx.parent_snapshot,
+                header,
+                DELAY_LEFT_OVER,
+            );
+            if delay_ms == 0 {
+                debug!(
+                    "bidSimulator: abort simulation, no time left, block number:{}, bid hash:{}",
+                    bid_runtime.bid.block_number, bid_runtime.bid.bid_hash,
+                );
+                // go-bsc DelBestBidToRun: drop this bid (hash-matched) from best_bid_to_run
+                // so a committed-but-never-simulated bid can't block later admissions.
+                {
+                    let mut to_run = self.best_bid_to_run.write();
+                    if to_run
+                        .get(&parent_hash)
+                        .is_some_and(|b| b.bid_hash == bid_runtime.bid.bid_hash)
+                    {
+                        to_run.remove(&parent_hash);
+                    }
+                }
+                bid_runtime.finished.store(true, Ordering::Relaxed);
+                return;
+            }
+        }
+
         self.simulating_bid.write().insert(parent_hash, bid_runtime.bid.clone());
 
         let mut txs_except_last = bid_runtime.bid.txs.clone();
