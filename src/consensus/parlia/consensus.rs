@@ -617,6 +617,23 @@ where
         )
     }
 
+    /// Like `delay_for_mining`, but without the last-block-in-turn cap or the
+    /// first-block-in-turn floor: bid simulation always gets the full block
+    /// interval. The cap exists so *local* block building seals early and the
+    /// next validator gets network lead time; simulating an already-built bid
+    /// has a small fixed cost, so shortening its window only discards better
+    /// late-arriving bids (go-bsc PR #3669).
+    pub fn delay_for_bid_simulation(
+        &self,
+        snap: &Snapshot,
+        header: &Header,
+        left_over_ms: u64,
+    ) -> u64 {
+        let period_ms = snap.block_interval;
+        let delay_ms = self.delay_for_ramanujan_fork(snap, header);
+        apply_mining_delay_with_leftover(delay_ms, period_ms, false, false, left_over_ms)
+    }
+
     /// Set `new_header.timestamp` (seconds) and `mix_hash` (Lorentz-era ms) based on
     /// `parent + block_interval + back_off_time` (with a wall-clock ceiling fallback).
     /// Returns the computed millisecond timestamp so callers can cache it and feed the
@@ -1014,5 +1031,16 @@ mod tests {
         // first_block_in_turn: left_over (600) >= delay (500), so delay = 0,
         // then first_block_in_turn minimum kicks in: result is 50.
         assert_eq!(apply_mining_delay_with_leftover(500, 3000, false, true, 600), 50);
+    }
+
+    #[test]
+    fn bid_simulation_delay_ignores_turn_position() {
+        // Bid simulation passes last/first_block_in_turn as false regardless of
+        // the actual turn position (go-bsc PR #3669): a last-in-turn block gets
+        // the full period cap (2500 - 100 = 2400, under the 3000 cap) instead of
+        // being squeezed to period/5 = 600 like local mining.
+        assert_eq!(apply_mining_delay_with_leftover(2500, 3000, false, false, 100), 2400);
+        // And no 50ms floor: fully consumed delay stays 0.
+        assert_eq!(apply_mining_delay_with_leftover(500, 3000, false, false, 600), 0);
     }
 }
