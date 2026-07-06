@@ -17,8 +17,8 @@ use crate::node::miner::bsc_miner::MiningContext;
 use crate::node::miner::signer::{seal_header_with_global_signer, SignerError};
 use alloy_consensus::{BlockHeader, Header};
 use alloy_primitives::{Address, Bytes, B256};
+use reth_chainspec::{EthChainSpec, Hardforks, Head};
 use reth_node_ethereum::engine::EthPayloadAttributes;
-use reth_chainspec::EthChainSpec;
 use reth_primitives_traits::SealedHeader;
 use std::sync::Arc;
 
@@ -169,7 +169,7 @@ pub fn finalize_new_header<ChainSpec>(
     block_timestamp_ms: u64,
 ) -> Result<(), crate::node::miner::signer::SignerError>
 where
-    ChainSpec: EthChainSpec + crate::hardforks::BscHardforks + 'static,
+    ChainSpec: EthChainSpec + crate::hardforks::BscHardforks + Hardforks + 'static,
 {
     new_header.difficulty = calculate_difficulty(parent_snap, new_header.beneficiary);
     if parlia.spec.is_lorentz_active_at_timestamp(new_header.number, new_header.timestamp) {
@@ -178,19 +178,21 @@ where
         new_header.mix_hash = B256::ZERO;
     }
 
-    if new_header.extra_data.len() < EXTRA_VANITY_LEN {
-        let mut padded = new_header.extra_data.to_vec();
-        padded.resize(EXTRA_VANITY_LEN, 0u8);
-        new_header.extra_data = Bytes::from(padded);
+    // go-bsc compat: write fork_id hash into vanity[28..32] for snapshot.recent_fork_hashes
+    {
+        let mut extra_data = new_header.extra_data.to_vec();
+        if extra_data.len() < EXTRA_VANITY_LEN {
+            extra_data.resize(EXTRA_VANITY_LEN, 0u8);
+        }
+        let head = Head {
+            number: new_header.number,
+            timestamp: new_header.timestamp,
+            ..Default::default()
+        };
+        let fork_hash = parlia.spec.fork_id(&head).hash;
+        extra_data[EXTRA_VANITY_LEN - 4..EXTRA_VANITY_LEN].copy_from_slice(&fork_hash.0);
+        new_header.extra_data = Bytes::from(extra_data);
     }
-    // TODO: add vanity data, and fork hash.
-    // set default header extra with Reth version.
-    // extra, _ = rlp.EncodeToBytes([]interface{}{
-    // 	uint(gethversion.Major<<16 | gethversion.Minor<<8 | gethversion.Patch),
-    // 	"geth",
-    // 	runtime.Version(),
-    // 	runtime.GOOS,
-    // })
 
     {
         // prepare validators
@@ -909,5 +911,59 @@ mod tests {
              the wall-clock ceiling path that caused the 2026-04-20 qanet stall must not apply"
         );
         assert_eq!(header.timestamp, planned_ms / 1000);
+    }
+
+    #[test]
+    fn finalize_new_header_writes_fork_hash_to_vanity_bytes_28_32() {
+        ensure_test_signer();
+        let parlia = Arc::new(Parlia::new(lorentz_chain_spec(), 200));
+
+        let mut parent_hdr = Header { number: 1, timestamp: 1_000_000, ..Default::default() };
+        set_millisecond_part_of_timestamp(1_000_000_500, &mut parent_hdr);
+        let parent_sealed = SealedHeader::seal_slow(parent_hdr);
+
+        let validator = Address::with_last_byte(1);
+        let mut parent_snap = Snapshot::new(vec![validator], 1, parent_sealed.hash(), 500, None);
+        parent_snap.block_interval = 450;
+
+        let planned_ms: u64 = 1_000_000_500 + 450;
+        let mut header = Header {
+            number: 2,
+            parent_hash: parent_sealed.hash(),
+            beneficiary: validator,
+            timestamp: planned_ms / 1000,
+            extra_data: Bytes::new(),
+            ..Default::default()
+        };
+
+        let sp: Arc<dyn SnapshotProvider + Send + Sync> =
+            Arc::new(MockSnapshotProvider { snapshot: parent_snap.clone() });
+
+        let expected_fork_hash = {
+            let head =
+                Head { number: header.number, timestamp: header.timestamp, ..Default::default() };
+            parlia.spec.fork_id(&head).hash
+        };
+
+        finalize_new_header(
+            parlia.clone(),
+            &parent_snap,
+            &parent_sealed,
+            &mut header,
+            &sp,
+            planned_ms,
+        )
+        .expect("finalize_new_header should succeed");
+
+        assert!(
+            header.extra_data.len() >= EXTRA_VANITY_LEN,
+            "extra_data must be at least {} bytes after finalize",
+            EXTRA_VANITY_LEN
+        );
+        assert_eq!(
+            &header.extra_data[EXTRA_VANITY_LEN - 4..EXTRA_VANITY_LEN],
+            &expected_fork_hash.0,
+            "fork hash must be written into vanity bytes [28..32]"
+        );
     }
 }
