@@ -17,6 +17,7 @@ use std::{boxed::Box, cell::RefCell, collections::HashMap};
 
 mod bls;
 mod cometbft;
+mod dedup;
 mod double_sign;
 mod error;
 mod iavl;
@@ -421,6 +422,21 @@ fn build_mendel_precompiles() -> Precompiles {
     precompiles
 }
 
+fn build_pasteur_precompiles() -> Precompiles {
+    let mut precompiles = build_mendel_precompiles();
+    // Pasteur bridge-precompile changes:
+    // - 0x64/0x65: legacy v1 Tendermint header / IAVL proof precompiles are deprecated
+    //   (return an error for any input).
+    // - 0x67: cometBFT light-block validation rejects duplicate validator identities and is
+    //   repriced with per-input-byte gas.
+    precompiles.extend([
+        tendermint::TENDERMINT_HEADER_VALIDATION_DEPRECATED,
+        iavl::IAVL_PROOF_VALIDATION_DEPRECATED,
+        cometbft::COMETBFT_LIGHT_BLOCK_VALIDATION_PASTEUR,
+    ]);
+    precompiles
+}
+
 // --- Traced precompile singletons ---------------------------------------------------------------
 
 fn istanbul_traced() -> &'static TracedPrecompiles {
@@ -483,9 +499,19 @@ fn mendel_traced() -> &'static TracedPrecompiles {
     INSTANCE.get_or_init(|| Box::new(build_traced_precompiles(build_mendel_precompiles())))
 }
 
+fn pasteur_traced() -> &'static TracedPrecompiles {
+    static INSTANCE: OnceBox<TracedPrecompiles> = OnceBox::new();
+    INSTANCE.get_or_init(|| Box::new(build_traced_precompiles(build_pasteur_precompiles())))
+}
+
 fn traced_precompiles_for_spec(spec: BscHardfork) -> &'static TracedPrecompiles {
     // Osaka uses updated precompiles (EIP-7823/7883 MODEXP, EIP-7951 P256VERIFY)
-    if spec >= BscHardfork::Mendel {
+    if spec >= BscHardfork::Pasteur {
+        // Pasteur reuses the Mendel precompile set today; later PRs add the dedicated
+        // Pasteur bridge precompiles (validator-set dedup, suspended v1 precompiles, etc.)
+        // via `build_pasteur_precompiles`.
+        pasteur_traced()
+    } else if spec >= BscHardfork::Mendel {
         mendel_traced()
     } else if spec >= BscHardfork::Pascal {
         pascal_traced()
@@ -579,6 +605,12 @@ pub fn mendel() -> &'static Precompiles {
     mendel_traced().precompiles()
 }
 
+/// Returns precompiles for Pasteur spec.
+/// Currently identical to Mendel; later PRs add the Pasteur bridge precompiles.
+pub fn pasteur() -> &'static Precompiles {
+    pasteur_traced().precompiles()
+}
+
 // BSC precompile provider
 #[derive(Debug, Clone)]
 pub struct BscPrecompiles {
@@ -603,5 +635,43 @@ impl BscPrecompiles {
 impl Default for BscPrecompiles {
     fn default() -> Self {
         Self::new(BscHardfork::default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pasteur_shares_mendel_addresses_but_overrides_bridge_precompiles() {
+        let pasteur = traced_precompiles_for_spec(BscHardfork::Pasteur).precompiles();
+        let mendel = traced_precompiles_for_spec(BscHardfork::Mendel).precompiles();
+
+        // Pasteur keeps the same address set as Mendel...
+        assert_eq!(pasteur.addresses_set(), mendel.addresses_set());
+
+        let id_of = |p: &Precompiles, addr| {
+            p.get(&addr).unwrap_or_else(|| panic!("{addr:?} present")).id().clone()
+        };
+        let is_custom = |id: &PrecompileId, name: &str| {
+            matches!(id, PrecompileId::Custom(c) if c.as_ref() == name)
+        };
+
+        // ...but the bridge precompiles resolve to their Pasteur variants, while Mendel keeps
+        // the prior (live) implementations.
+        let tendermint = u64_to_address(100);
+        let iavl = u64_to_address(101);
+        let cometbft = u64_to_address(103);
+
+        assert!(is_custom(&id_of(pasteur, tendermint), "HEADER_VALIDATE_DEPRECATED"));
+        assert!(is_custom(&id_of(mendel, tendermint), "HEADER_VALIDATE"));
+        assert!(is_custom(&id_of(pasteur, iavl), "IAVL_MERKLE_PROOF_VALIDATE_DEPRECATED"));
+        assert!(is_custom(&id_of(mendel, iavl), "IAVL_MERKLE_PROOF_VALIDATE_PLATO"));
+        assert!(is_custom(&id_of(pasteur, cometbft), "COMET_BFT_LIGHT_BLOCK_VALIDATE_PASTEUR"));
+        assert!(is_custom(&id_of(mendel, cometbft), "COMET_BFT_LIGHT_BLOCK_VALIDATE_HERTZ"));
+
+        // 0x66 (BLS) is unchanged at Pasteur — it stays the generic verify (matches geth).
+        let bls = u64_to_address(102);
+        assert!(is_custom(&id_of(pasteur, bls), "BLS_SIGNATURE_VERIFY"));
     }
 }

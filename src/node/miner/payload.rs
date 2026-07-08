@@ -8,7 +8,6 @@ use crate::metrics::{BscConsensusMetrics, BscMinerMetrics};
 use crate::node::engine::{BscBuiltPayload, BuildKind};
 use crate::node::evm::config::{BscEvmConfig, BscNextBlockEnvAttributes, ValidatorCacheSink};
 use crate::node::evm::pre_execution::{TURN_LENGTH_CACHE, VALIDATOR_CACHE};
-use crate::node::evm::{request_difflayer, MinerTrieDbPrefetcher};
 use crate::node::miner::bid_simulator::BidSimulator;
 use crate::node::miner::bsc_miner::{MiningContext, SubmitContext};
 use crate::node::miner::util::finalize_new_header;
@@ -43,10 +42,7 @@ use reth_primitives_traits::{BlockBody, RecoveredBlock, SignerRecoverable};
 use reth_provider::StateProviderFactory;
 use reth_revm::cached::CachedReads;
 use reth_revm::cancelled::ManualCancel;
-use reth_revm::state::EvmState as RethEvmState;
 use reth_revm::{database::StateProviderDatabase, db::State};
-use rust_eth_triedb::get_global_triedb;
-use rust_eth_triedb_common::DiffLayers;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -56,9 +52,77 @@ use tracing::{debug, info, trace, warn};
 /// Milliseconds reserved at the end of each block period for state-root computation.
 ///
 /// Geth-BSC uses 50ms because its native hashdb-based trie is faster and more predictable.
-/// reth-bsc's TrieDB root calculation has higher and less stable latency, so we reserve
+/// reth-bsc's MDBX-based root calculation has higher and less stable latency, so we reserve
 /// 120ms to avoid missing the block deadline or eating into the next block's time budget.
 pub const DELAY_LEFT_OVER: u64 = 120;
+
+/// Adaptive end-of-slot reserve, tuned at runtime via env (no recompile needed for testing).
+///
+/// Empty blocks under load cluster at the *peaks* of the overlay depth (head − finalized): there
+/// the background sparse-trie root can't finalize within the default 120ms reserve, so `finish`
+/// waits past the slot deadline and the block degrades to empty-fallback. For the ~97% of blocks
+/// at normal depth the root is ready in ~20ms, so the default reserve is left untouched. When the
+/// overlay is deep we reserve more of the slot for the root (fill stops earlier → exec ends earlier
+/// → the finalize tail gets a larger window, and fewer txs are filled → the finalize tail is
+/// smaller), turning a would-be empty block into an on-time smaller block.
+/// See docs/design-adaptive-overlay-depth.md.
+///
+/// Env knobs (read once at startup, cached):
+/// - `BSC_MINING_ADAPTIVE_RESERVE` = on/off (default on); off → fixed `DELAY_LEFT_OVER` (A/B base).
+/// - `BSC_MINING_ROOT_RESERVE_DEPTH_LOW`  (default 15) — at/below this, default reserve.
+/// - `BSC_MINING_ROOT_RESERVE_DEPTH_HIGH` (default 40) — at/above this, max reserve.
+/// - `BSC_MINING_ROOT_RESERVE_MAX_MS`     (default 280) — reserve used at/above DEPTH_HIGH.
+#[derive(Debug, Clone, Copy)]
+struct AdaptiveReserveConfig {
+    enabled: bool,
+    depth_low: u64,
+    depth_high: u64,
+    reserve_max_ms: u64,
+}
+
+/// Default knob values (also the fallback when the corresponding env var is unset/unparseable).
+const ROOT_RESERVE_MAX_MS: u64 = 280;
+const ROOT_RESERVE_DEPTH_LOW: u64 = 15;
+const ROOT_RESERVE_DEPTH_HIGH: u64 = 40;
+
+fn adaptive_reserve_config() -> &'static AdaptiveReserveConfig {
+    static CFG: std::sync::OnceLock<AdaptiveReserveConfig> = std::sync::OnceLock::new();
+    CFG.get_or_init(|| {
+        let env_u64 = |k: &str, default: u64| {
+            std::env::var(k).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default)
+        };
+        let enabled = std::env::var("BSC_MINING_ADAPTIVE_RESERVE")
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"))
+            .unwrap_or(true);
+        let cfg = AdaptiveReserveConfig {
+            enabled,
+            depth_low: env_u64("BSC_MINING_ROOT_RESERVE_DEPTH_LOW", ROOT_RESERVE_DEPTH_LOW),
+            depth_high: env_u64("BSC_MINING_ROOT_RESERVE_DEPTH_HIGH", ROOT_RESERVE_DEPTH_HIGH),
+            reserve_max_ms: env_u64("BSC_MINING_ROOT_RESERVE_MAX_MS", ROOT_RESERVE_MAX_MS),
+        };
+        tracing::info!(target: "bsc::miner", ?cfg, "Adaptive root-reserve config");
+        cfg
+    })
+}
+
+/// Effective end-of-slot reserve (ms) given the current in-memory overlay depth.
+///
+/// Linearly interpolates `DELAY_LEFT_OVER..=reserve_max_ms` between `depth_low` and `depth_high`.
+/// At/below `depth_low` (or when disabled) returns the unchanged default, so normal blocks are
+/// unaffected. The branch ordering also makes a misconfigured `depth_high <= depth_low` behave as a
+/// step at `depth_low` (no divide-by-zero).
+pub fn effective_delay_left_over(overlay_depth: u64) -> u64 {
+    let cfg = adaptive_reserve_config();
+    if !cfg.enabled || overlay_depth <= cfg.depth_low {
+        DELAY_LEFT_OVER
+    } else if overlay_depth >= cfg.depth_high {
+        cfg.reserve_max_ms
+    } else {
+        let span = (cfg.depth_high - cfg.depth_low) as f64;
+        let t = (overlay_depth - cfg.depth_low) as f64 / span;
+        DELAY_LEFT_OVER + (t * cfg.reserve_max_ms.saturating_sub(DELAY_LEFT_OVER) as f64) as u64
+    }
+}
 
 /// Minimum estimated fee uplift required for a normal rebuild, expressed in basis points.
 const NORMAL_REBUILD_UPLIFT_BPS: u64 = 1_500;
@@ -286,18 +350,13 @@ pub struct BscBuildArguments<Attributes> {
     pub trace_id: u64,
     /// Minimum gas tip
     pub min_gas_tip: u128,
-    /// Parent block diff layers for triedb state root computation.
-    ///
-    /// Fetched once at job creation and shared across all build attempts for the same parent.
-    /// `None` when triedb is inactive or the fetch failed (graceful degradation to full trie).
-    pub parent_difflayers: Option<DiffLayers>,
     /// Precomputed `(state_root, trie_updates)` from a sparse-trie background task.
     ///
     /// Filled in by `BscPayloadJob::start` after exec completes, by calling
     /// `StateRootHandle::state_root()` on the handle obtained from
     /// `crate::shared::spawn_sparse_trie_state_root`. The builder consumes this in
-    /// `finish_with_difflayer` to skip the blocking `state_root_with_updates` call when
-    /// a value is present. `None` triggers the legacy synchronous path (fallback).
+    /// `finish` to skip the blocking `state_root_with_updates` call when a value is
+    /// present. `None` triggers the legacy synchronous path (fallback).
     ///
     /// `Arc<Mutex<...>>` so `#[derive(Clone)]` on `BscBuildArguments` still works; the
     /// builder takes (`Option::take`) the value, retries see `None`.
@@ -306,24 +365,24 @@ pub struct BscBuildArguments<Attributes> {
     /// Sparse-trie state-root handle for this job.
     ///
     /// Spawned once in `BscPayloadJob::start` (gated by
-    /// `MiningConfig::use_sparse_trie_state_root` + non-triedb mode) and consumed by the
-    /// first build attempt inside `build_payload`:
+    /// `MiningConfig::use_sparse_trie_state_root`) and consumed by the first build attempt
+    /// inside `build_payload`:
     ///   1. take handle from this slot
     ///   2. `handle.state_hook()` → install via `executor.set_state_hook(Some(_))`
     ///   3. run tx exec (state diffs flow to the background task)
     ///   4. drop hook (`set_state_hook(None)`) to signal task to finalize
     ///   5. `handle.state_root()` → write the `(state_root, trie_updates)` into
-    ///      [`Self::state_root_precomputed`], which finish_with_difflayer then consumes
+    ///      [`Self::state_root_precomputed`], which `finish` then consumes
     ///
     /// `Arc<Mutex<Option<_>>>` because `StateRootHandle` is `!Clone` (it owns
     /// single-consumer channels) and `BscBuildArguments` derives `Clone`. First retry
     /// takes the handle; subsequent retries see `None` and fall back to the legacy
     /// synchronous state-root path (still correct, just slower for that retry).
     pub trie_handle: Arc<Mutex<Option<reth_engine_tree::tree::multiproof::StateRootHandle>>>,
-    /// R2: absolute wall-clock deadline (epoch ms) for bounding the sparse-trie
-    /// `state_root()` wait in `finish_with_difflayer`; threaded into the build ctx.
-    /// Set from `MiningContext::end_mining_timestamp_ms` minus
-    /// [`STATE_ROOT_WAIT_MARGIN_MS`]. `None` = legacy unbounded blocking wait.
+    /// Absolute wall-clock deadline (epoch ms) for bounding the sparse-trie
+    /// `state_root()` wait in `finish`; threaded into the build ctx. Set from
+    /// `MiningContext::end_mining_timestamp_ms` minus [`STATE_ROOT_WAIT_MARGIN_MS`].
+    /// `None` = legacy unbounded blocking wait.
     pub state_root_deadline_ms: Option<u64>,
 }
 
@@ -344,8 +403,6 @@ pub struct BscPayloadBuilder<Pool, Client, EvmConfig = BscEvmConfig> {
     parlia: Arc<Parlia<BscChainSpec>>,
     // Mining context containing header information for blob fee calculation
     ctx: MiningContext,
-    /// Task executor for spawning blocking tasks (e.g., trie prefetcher).
-    task_executor: reth_tasks::TaskExecutor,
 }
 
 impl<Pool, Client, EvmConfig> BscPayloadBuilder<Pool, Client, EvmConfig>
@@ -369,9 +426,8 @@ where
         chain_spec: Arc<BscChainSpec>,
         parlia: Arc<Parlia<BscChainSpec>>,
         ctx: MiningContext,
-        task_executor: reth_tasks::TaskExecutor,
     ) -> Self {
-        Self { client, pool, evm_config, builder_config, chain_spec, parlia, ctx, task_executor }
+        Self { client, pool, evm_config, builder_config, chain_spec, parlia, ctx }
     }
 
     /// Builds a payload with the given arguments.
@@ -400,7 +456,6 @@ where
             cancel,
             trace_id,
             min_gas_tip,
-            parent_difflayers,
             state_root_precomputed,
             // R3: the job-level handle is ignored here; build_payload spawns a fresh one
             // per attempt below, so retries (value-gated rebuilds) also get the
@@ -411,52 +466,22 @@ where
         let PayloadConfig { parent_header, attributes, payload_id: _ } = config;
 
         let parent_hash = parent_header.hash_slow();
-        // Parent difflayers were fetched once at job start; reuse across all retry attempts.
-        let triedb_parent_difflayers = parent_difflayers;
 
         // R3: spawn a fresh sparse-trie state-root handle for THIS build attempt. The
         // job-level handle was single-use — the first attempt consumed it and any retry
         // (e.g. a value-gated rebuild) fell back to the synchronous `state_root_with_updates`,
         // so ~half of in-turn blocks paid the full sync root cost. A fresh handle per attempt
         // is cheap now that R1 shares the engine's proof pools. `None` keeps the sync path
-        // (sparse-trie disabled, triedb mode, or no spawner registered).
+        // (sparse-trie disabled or no spawner registered).
         let trie_handle: Arc<Mutex<Option<reth_engine_tree::tree::multiproof::StateRootHandle>>> = {
             let use_sparse_trie = crate::node::miner::config::get_global_mining_config()
-                .is_some_and(|c| c.use_sparse_trie_state_root)
-                && !rust_eth_triedb::triedb_manager::is_triedb_active();
+                .is_some_and(|c| c.use_sparse_trie_state_root);
             Arc::new(Mutex::new(if use_sparse_trie {
                 crate::shared::spawn_sparse_trie_state_root(parent_hash, parent_header.state_root())
             } else {
                 None
             }))
         };
-
-        // Safety guard: when triedb is active but no difflayers are available, verify that the
-        // parent state root matches the pathdb disk layer.  If they diverge (e.g. after a
-        // restart where in-memory difflayers were lost), building on this parent would produce
-        // a block with an incorrect state root.  Skip building to avoid polluting the network.
-        if rust_eth_triedb::triedb_manager::is_triedb_active() && triedb_parent_difflayers.is_none()
-        {
-            let triedb = get_global_triedb();
-            let (persist_block, persist_root) = triedb
-                .latest_persist_state()
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-            if parent_header.state_root() != persist_root {
-                warn!(
-                    target: "payload_builder",
-                    trace_id,
-                    parent_hash = %parent_hash,
-                    parent_number = parent_header.number(),
-                    parent_state_root = %parent_header.state_root(),
-                    pathdb_block = persist_block,
-                    pathdb_root = %persist_root,
-                    "Skipping build_payload: no difflayers and parent state root diverges from pathdb disk layer"
-                );
-                return Err(Box::from(
-                    "triedb pathdb gap: no difflayers and parent state root != pathdb disk layer root",
-                ));
-            }
-        }
 
         let state_provider = self.client.state_by_block_hash(parent_header.hash_slow())?;
         let state = StateProviderDatabase::new(&state_provider);
@@ -465,32 +490,27 @@ where
             .with_bundle_update()
             .build();
 
-        // Build triedb prefetcher before creating the block builder so it can be carried via the
-        // custom next-block env ctx into the execution ctx and consumed in `finish()`.
-        let triedb_prefetcher = triedb_parent_difflayers.clone().and_then(|difflayers| {
-            let mut triedb = get_global_triedb();
-            let path_db = triedb.get_mut_path_db_ref().clone();
-            MinerTrieDbPrefetcher::new(
-                parent_header.state_root(),
-                path_db,
-                Some(difflayers),
-                self.task_executor.clone(),
-            )
-            .ok()
-        });
-
         // Sinks transport current_validators / turn_length from the builder (which is consumed by
-        // finish_with_difflayer) back to this layer so they can be written to cache after
+        // `finish`) back to this layer so they can be written to cache after
         // finalize_new_header() assigns the definitive block hash.
         let validator_cache_sink: ValidatorCacheSink = Arc::new(Mutex::new(None));
         let turn_length_sink: Arc<Mutex<Option<u8>>> = Arc::new(Mutex::new(None));
 
-        // Sink for the sparse-trie precomputed state root. The same Arc<Mutex<>> from
-        // `state_root_precomputed` is threaded into ctx so builder.rs's MDBX branch can
-        // read it during finish_with_difflayer. When the sparse-trie path is not
-        // active (flag off or triedb mode), this Mutex stays `None` and the builder
-        // falls through to `state_root_with_updates`.
-        let state_root_precomputed_sink = state_root_precomputed.clone();
+        // Sink for the sparse-trie precomputed state root. This MUST be a fresh per-attempt
+        // Arc<Mutex<>> — NOT a clone of the job-level `state_root_precomputed`. The job-level Arc
+        // is shared by every build attempt (including the deadline-spawned empty-fallback build),
+        // and inside `finish` the write (after the sparse-trie wait) and the read-back
+        // (`sink.take()`) are separated by `merge_transitions` + `hashed_post_state` over all txs
+        // (~hundreds of ms for a full block). With a shared sink, a concurrent second finish (e.g.
+        // the empty build, which has no trie_handle so it jumps straight to the take()) steals the
+        // root this attempt deposited, forcing this attempt onto the slow synchronous
+        // `state_root_with_updates`. A per-attempt sink makes write→read strictly intra-attempt, so
+        // the full build reads back its OWN precomputed root. When the sparse-trie path is not active
+        // (flag off), this Mutex stays `None` and the builder falls through to
+        // `state_root_with_updates`.
+        let state_root_precomputed_sink: Arc<
+            Mutex<Option<(alloy_primitives::B256, reth_trie_common::updates::TrieUpdates)>>,
+        > = Arc::new(Mutex::new(None));
 
         let next_env_attributes = BscNextBlockEnvAttributes {
             inner: NextBlockEnvAttributes {
@@ -505,15 +525,13 @@ where
                     .unwrap_or_else(|| self.builder_config.extra_data.clone()),
                 slot_number: None,
             },
-            parent_difflayers: triedb_parent_difflayers.clone(),
-            triedb_prefetcher: triedb_prefetcher.clone(),
             validator_cache_sink: Some(validator_cache_sink.clone()),
             turn_length_sink: Some(turn_length_sink.clone()),
             state_root_precomputed_sink: Some(state_root_precomputed_sink),
-            // Forward the Arc<Mutex<>> holding the StateRootHandle into ctx so
-            // `finish_with_difflayer` can take it after executor.finish() runs the BSC
-            // post-execution system txs (slash / reward / validator-set updates) with
-            // the state_hook installed. See `BscBlockExecutionCtx::trie_handle` doc.
+            // Forward the Arc<Mutex<>> holding the StateRootHandle into ctx so `finish`
+            // can take it after executor.finish() runs the BSC post-execution system txs
+            // (slash / reward / validator-set updates) with the state_hook installed.
+            // See `BscBlockExecutionCtx::trie_handle` doc.
             trie_handle: Some(trie_handle.clone()),
             state_root_deadline_ms,
         };
@@ -523,39 +541,22 @@ where
             .builder_for_next_block(&mut db, &parent_header, next_env_attributes)
             .map_err(PayloadBuilderError::other)?;
 
-        // Wire either the miner triedb prefetcher OR the sparse-trie state-root task as
-        // the executor's state hook. The two paths are mutually exclusive at runtime:
-        // the prefetcher exists only in triedb mode, the sparse-trie handle exists only
-        // in MDBX mode (gated by `--mining.use-sparse-trie-state-root`).
+        // Wire the sparse-trie state-root task's state hook onto the executor.
         //
-        // For the sparse-trie path: the `state_hook` is installed here on the executor;
-        // it stays installed through `executor.finish()` (BSC post-execution system txs
-        // — slash / reward / validator-set updates) inside `finish_with_difflayer`.
-        // When `finish_with_difflayer` consumes the executor, the hook is dropped,
-        // which sends `FinishedStateUpdates` to the sparse-trie task. `state_root()`
-        // is then called on the handle from inside `finish_with_difflayer` (via
-        // `ctx.trie_handle`) — calling it any earlier would deadlock the task.
+        // The `state_hook` is installed here; it stays installed through `executor.finish()`
+        // (BSC post-execution system txs — slash / reward / validator-set updates) inside
+        // `finish`. When `finish` consumes the executor, the hook is dropped, which sends
+        // `FinishedStateUpdates` to the sparse-trie task. `state_root()` is then called on
+        // the handle from inside `finish` (via `ctx.trie_handle`) — calling it any earlier
+        // would deadlock the task.
         //
         // NOTE: This must be set before `apply_pre_execution_changes()` so any state
         // access/touches performed during pre-execution are also captured by the hook.
-        if let Some(prefetcher) = triedb_prefetcher.clone() {
-            let pf = prefetcher.clone();
-            builder.executor_mut().set_state_hook(Some(Box::new(
-                move |_, update: &RethEvmState| {
-                    pf.on_state_update(update);
-                },
-            )));
-            debug!(
-                target: "payload_builder",
-                trace_id,
-                parent_hash = ?parent_hash,
-                "Started triedb prefetcher for miner payload build"
-            );
-        } else if let Some(handle_guard) = trie_handle.lock().unwrap().as_ref() {
+        if let Some(handle_guard) = trie_handle.lock().unwrap().as_ref() {
             // Install hook from the handle while it's still in the Arc<Mutex<>>.
-            // The handle itself is forwarded via `attrs.trie_handle` (Arc clone)
-            // into `ctx.trie_handle` so `finish_with_difflayer` can take it after
-            // executor.finish() and call `state_root()`.
+            // The handle itself is forwarded via `attrs.trie_handle` (Arc clone) into
+            // `ctx.trie_handle` so `finish` can take it after executor.finish() and
+            // call `state_root()`.
             builder.executor_mut().set_state_hook(Some(Box::new(handle_guard.state_hook())));
             debug!(
                 target: "payload_builder",
@@ -892,23 +893,24 @@ where
         // add system txs to payload.
         let finalize_start = std::time::Instant::now();
 
-        // Sparse-trie state-root collection happens INSIDE `finish_with_difflayer`, NOT
-        // here. The reason: BSC's post-execution (slash, fee distribution, validator-set
-        // updates) runs as system txs via `executor.finish()` inside
-        // `finish_with_difflayer`. Those system txs change state and must be captured by
-        // the `state_hook` we installed before exec. If we dropped the hook here
-        // (before finish_with_difflayer), the sparse-trie task would compute a state
-        // root missing those changes — diverging from the canonical state-root and
-        // causing consensus split / slashing.
+        // Sparse-trie state-root collection happens INSIDE `finish`, NOT here. The reason:
+        // BSC's post-execution (slash, fee distribution, validator-set updates) runs as
+        // system txs via `executor.finish()` inside `finish`. Those system txs change state
+        // and must be captured by the `state_hook` we installed before exec. If we dropped
+        // the hook here (before `finish`), the sparse-trie task would compute a state root
+        // missing those changes — diverging from the canonical state-root and causing
+        // consensus split / slashing.
         //
         // The handle was forwarded into `ctx.trie_handle` via attrs; builder.rs takes
         // it after executor.finish() and calls `state_root()` once the hook is
         // naturally dropped (executor consumption triggers `StateHookSender::drop`
         // which sends `FinishedStateUpdates`).
-        let _ = &state_root_precomputed; // sink referenced for trace; written by builder
-        let out = builder.finish_with_difflayer(&state_provider)?;
-        let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } = out.inner;
-        let difflayer = out.difflayer;
+        // The job-level `state_root_precomputed` Arc is vestigial: this attempt uses its own
+        // per-attempt sink (see `state_root_precomputed_sink` above). Kept bound to avoid an
+        // unused-variable warning until the field is removed from BscBuildArguments.
+        let _ = &state_root_precomputed;
+        let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } =
+            builder.finish(&state_provider, None)?;
 
         let mut sealed_block = Arc::new(block.sealed_block().clone());
 
@@ -984,8 +986,7 @@ where
             hashed_state: Either::Left(Arc::new(hashed_state)),
             trie_updates: Either::Left(Arc::new(trie_updates)),
         };
-        let mut executed_block = executed.into_executed_payload();
-        executed_block.difflayer = difflayer;
+        let executed_block = executed.into_executed_payload();
 
         // Read validator/turn-length data transported via sinks from the now-consumed builder.
         let pending_validators = validator_cache_sink.lock().unwrap().take();
@@ -1019,7 +1020,6 @@ where
             cancel: _,
             trace_id,
             min_gas_tip: _,
-            parent_difflayers,
             state_root_precomputed,
             trie_handle,
             state_root_deadline_ms: _,
@@ -1027,33 +1027,7 @@ where
         let PayloadConfig { parent_header, attributes, payload_id: _ } = config;
 
         let parent_hash = parent_header.hash_slow();
-        // Parent difflayers were fetched once at job start; reuse across all retry attempts.
-        let triedb_parent_difflayers = parent_difflayers;
-
-        // Safety guard: same as build_payload — refuse to build on a parent whose state root
-        // cannot be correctly resolved by pathdb without difflayers.
-        if rust_eth_triedb::triedb_manager::is_triedb_active() && triedb_parent_difflayers.is_none()
-        {
-            let triedb = get_global_triedb();
-            let (persist_block, persist_root) = triedb
-                .latest_persist_state()
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-            if parent_header.state_root() != persist_root {
-                warn!(
-                    target: "payload_builder",
-                    trace_id,
-                    parent_hash = %parent_hash,
-                    parent_number = parent_header.number(),
-                    parent_state_root = %parent_header.state_root(),
-                    pathdb_block = persist_block,
-                    pathdb_root = %persist_root,
-                    "Skipping build_empty_payload: no difflayers and parent state root diverges from pathdb disk layer"
-                );
-                return Err(Box::from(
-                    "triedb pathdb gap: no difflayers and parent state root != pathdb disk layer root",
-                ));
-            }
-        }
+        let _ = parent_hash;
 
         let state_provider = self.client.state_by_block_hash(parent_header.hash_slow())?;
         let state = StateProviderDatabase::new(&state_provider);
@@ -1061,20 +1035,6 @@ where
             .with_database(cached_reads.as_db_mut(state))
             .with_bundle_update()
             .build();
-
-        // Build triedb prefetcher before creating the block builder so it can be carried via the
-        // custom next-block env ctx into the execution ctx and consumed in `finish()`.
-        let triedb_prefetcher = triedb_parent_difflayers.clone().and_then(|difflayers| {
-            let mut triedb = get_global_triedb();
-            let path_db = triedb.get_mut_path_db_ref().clone();
-            MinerTrieDbPrefetcher::new(
-                parent_header.state_root(),
-                path_db,
-                Some(difflayers),
-                self.task_executor.clone(),
-            )
-            .ok()
-        });
 
         // Sinks for empty-payload builds (same delayed-seal mechanism as normal builds).
         let validator_cache_sink: ValidatorCacheSink = Arc::new(Mutex::new(None));
@@ -1101,11 +1061,15 @@ where
                             .unwrap_or_else(|| self.builder_config.extra_data.clone()),
                         slot_number: None,
                     },
-                    parent_difflayers: triedb_parent_difflayers.clone(),
-                    triedb_prefetcher: triedb_prefetcher.clone(),
                     validator_cache_sink: Some(validator_cache_sink.clone()),
                     turn_length_sink: Some(turn_length_sink.clone()),
-                    state_root_precomputed_sink: Some(state_root_precomputed.clone()),
+                    // Empty-fallback build never installs a sparse-trie hook (trie_handle: None
+                    // below), so it must NOT read from any sparse-trie sink. Passing None makes the
+                    // builder compute this empty block's own (cheap) state root via
+                    // `state_root_with_updates` instead of stealing a full build's precomputed root
+                    // out of a shared sink (which both starved the full build and risked sealing a
+                    // foreign root onto the empty block).
+                    state_root_precomputed_sink: None,
                     // Empty-payload path: don't engage sparse-trie (would still be
                     // correct but the setup overhead isn't worth it for ~0-tx blocks).
                     trie_handle: None,
@@ -1113,25 +1077,6 @@ where
                 },
             )
             .map_err(PayloadBuilderError::other)?;
-
-        // Wire miner triedb prefetcher via state hook (if enabled).
-        //
-        // NOTE: This must be set before `apply_pre_execution_changes()` so any state access/touches
-        // performed during pre-execution are also prefetched.
-        if let Some(prefetcher) = triedb_prefetcher.clone() {
-            let pf = prefetcher.clone();
-            builder.executor_mut().set_state_hook(Some(Box::new(
-                move |_, update: &RethEvmState| {
-                    pf.on_state_update(update);
-                },
-            )));
-            debug!(
-                target: "payload_builder",
-                trace_id,
-                parent_hash = ?parent_hash,
-                "Started triedb prefetcher for miner empty payload build"
-            );
-        }
 
         // Total time spent executing pre-execution changes (no user txs for empty payloads).
         let exec_start = std::time::Instant::now();
@@ -1161,9 +1106,8 @@ where
         // legacy `state_root_with_updates` cost is acceptable. The handle (if any)
         // stays in `trie_handle` and is dropped when the spawned task ends.
         let _ = (&state_root_precomputed, &trie_handle);
-        let out = builder.finish_with_difflayer(&state_provider)?;
-        let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } = out.inner;
-        let difflayer = out.difflayer;
+        let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } =
+            builder.finish(&state_provider, None)?;
         let finalize_elapsed = finalize_start.elapsed();
 
         let sealed_block = Arc::new(block.sealed_block().clone());
@@ -1198,8 +1142,7 @@ where
             hashed_state: Either::Left(Arc::new(hashed_state)),
             trie_updates: Either::Left(Arc::new(trie_updates)),
         };
-        let mut executed_block = executed.into_executed_payload();
-        executed_block.difflayer = difflayer;
+        let executed_block = executed.into_executed_payload();
 
         // Read validator/turn-length data transported via sinks from the now-consumed builder.
         let pending_validators = validator_cache_sink.lock().unwrap().take();
@@ -1218,43 +1161,6 @@ where
             is_bid: false,
         };
         Ok(payload)
-    }
-}
-
-/// Fetch the parent block's diff layers for triedb state-root computation.
-///
-/// Called once per payload job at startup; the result is stored in [`BscBuildArguments`] and
-/// shared across all build attempts (normal and empty) for the same parent block.
-/// Returns `None` on any failure — callers degrade gracefully to the full-trie path.
-async fn fetch_triedb_difflayers(
-    trace_id: u64,
-    parent_hash: alloy_primitives::B256,
-) -> Option<DiffLayers> {
-    if !rust_eth_triedb::triedb_manager::is_triedb_active() {
-        return None;
-    }
-    let Some(engine_api_tx) = crate::shared::get_engine_api_tx() else {
-        warn!(
-            target: "payload_builder",
-            trace_id,
-            %parent_hash,
-            "engine_api_tx not available; proceeding without triedb difflayers"
-        );
-        return None;
-    };
-    match request_difflayer(&engine_api_tx, parent_hash).await {
-        Ok(difflayers) => Some(difflayers),
-        Err(e) => {
-            warn!(
-                target: "payload_builder",
-                trace_id,
-                %parent_hash,
-                error = %e,
-                "Failed to fetch parent difflayers; triedb state root falls back to full trie traversal \
-                 (typically only seen shortly after node startup, before difflayers for recent blocks have been cached)"
-            );
-            None
-        }
     }
 }
 
@@ -1355,10 +1261,22 @@ where
 
         let trace_id = build_args.trace_id;
 
+        // Adaptive root reserve: when the in-memory overlay (head − finalized) is deep, reserve
+        // more of the slot for the background state root so it finalizes before the deadline
+        // instead of degrading the block to empty-fallback. Normal-depth blocks keep the default
+        // reserve (overlay_depth ≤ ROOT_RESERVE_DEPTH_LOW). Falls back to depth 0 (default reserve)
+        // when finalized is not yet available. See docs/design-adaptive-overlay-depth.md.
+        let block_number = mining_ctx.parent_header.number() + 1;
+        let overlay_depth = crate::shared::get_canonical_in_memory_state()
+            .and_then(|cim| cim.get_finalized_num_hash())
+            .map(|f| block_number.saturating_sub(f.number))
+            .unwrap_or(0);
+        let effective_reserve = effective_delay_left_over(overlay_depth);
+        metrics::histogram!("bsc_miner_effective_reserve_ms").record(effective_reserve as f64);
         let mining_delay = parlia.clone().delay_for_mining(
             &mining_ctx.parent_snapshot,
             mining_ctx.header.as_ref().unwrap(),
-            DELAY_LEFT_OVER,
+            effective_reserve,
         );
         let pending_basefee = builder.pool.block_info().pending_basefee;
 
@@ -1417,21 +1335,13 @@ where
 
     /// Runs the payload job asynchronously with timeout support
     pub async fn start(mut self) -> Result<(), Box<BscPayloadJobError>> {
-        // Fetch parent difflayers once for all build attempts in this job.
-        // Stored in build_args so retries and empty-payload fallback share the same value.
-        self.build_args.parent_difflayers = fetch_triedb_difflayers(
-            self.trace_id,
-            self.build_args.config.parent_header.hash_slow(),
-        )
-        .await;
-
-        // Sparse-trie state-root (MDBX mode, `--mining.use-sparse-trie-state-root`):
+        // Sparse-trie state-root (`--mining.use-sparse-trie-state-root`):
         // R3 spawns a fresh background task PER build attempt inside `build_payload`
         // (not once here), so every attempt — including value-gated rebuilds — gets the
         // precomputed root rather than only the first attempt. Each attempt installs
-        // `handle.state_hook()` before exec, drops it after to finalize, then
-        // `finish_with_difflayer` calls `state_root()` (bounded by R2's slot deadline)
-        // and falls back to synchronous `state_root_with_updates` on miss / no spawner.
+        // `handle.state_hook()` before exec, drops it after to finalize, then `finish`
+        // calls `state_root()` (bounded by R2's slot deadline) and falls back to
+        // synchronous `state_root_with_updates` on miss / no spawner.
 
         let mut start_time = std::time::Instant::now();
         let initial_wait = initial_out_of_turn_build_wait(&self.parlia, &self.mining_ctx);
@@ -1441,17 +1351,17 @@ where
                 trace_id = self.trace_id,
                 block_number = self.build_args.config.parent_header.number() + 1,
                 wait_ms = initial_wait.as_millis(),
-                "Applying out-of-turn backoff; starting speculative build to warm TrieDB prefetcher"
+                "Applying out-of-turn backoff; starting speculative build"
             );
 
-            // Kick off a speculative build before sleeping so the TrieDB prefetcher
-            // can warm the storage slots state-root will need. Without this the
-            // prefetcher only starts after the backoff ends, leaving ~one slot for
-            // both cache warm-up and state-root computation over thousands of txs —
-            // which repeatedly times out and degrades the block to EmptyFallback.
-            // The spawned build's result is picked up by the outer loop's
-            // join_next() branch, so the try_build_tx kickoff below is skipped when
-            // a speculative build is already in flight.
+            // Kick off a speculative build before sleeping so the sparse-trie
+            // background task can warm the storage slots state-root will need.
+            // Without this the speculative work only starts after the backoff ends,
+            // leaving ~one slot for both cache warm-up and state-root computation
+            // over thousands of txs — which repeatedly times out and degrades the
+            // block to EmptyFallback. The spawned build's result is picked up by
+            // the outer loop's join_next() branch, so the try_build_tx kickoff
+            // below is skipped when a speculative build is already in flight.
             self.retries += 1;
             start_time = std::time::Instant::now();
             {

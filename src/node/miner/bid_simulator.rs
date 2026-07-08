@@ -34,14 +34,10 @@ use reth_primitives_traits::SignerRecoverable;
 use reth_provider::StateProviderFactory;
 use reth_provider::{BlockHashReader, HeaderProvider};
 use reth_revm::{database::StateProviderDatabase, db::State};
-use rust_eth_triedb::get_global_triedb;
-use rust_eth_triedb_common::DiffLayers;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{debug, trace};
-use alloy_consensus::BlockHeader as _;
-use crate::node::evm::MinerTrieDbPrefetcher;
 const NO_INTERRUPT_LEFT_OVER: u64 = 500;
 const PAY_BID_TX_GAS_LIMIT: u64 = 25000;
 const TX_GAS: u64 = 21000;
@@ -79,7 +75,6 @@ pub struct BidSimulator<Client, Pool> {
     parlia: Arc<crate::consensus::parlia::Parlia<crate::chainspec::BscChainSpec>>,
     pool: Pool,
     validator_address: Address,
-    task_executor: reth_tasks::TaskExecutor,
 
     // Each map has its own lock for fine-grained concurrency control
     // This avoids writer starvation when one operation needs write access
@@ -118,14 +113,12 @@ where
         snapshot_provider: Arc<dyn SnapshotProvider + Send + Sync>,
         validator_commission: u64,
         greedy_merge: bool,
-        task_executor: reth_tasks::TaskExecutor,
     ) -> Self {
         Self {
             client,
             parlia,
             pool,
             validator_address,
-            task_executor,
             chain_spec,
             snapshot_provider,
             best_bid_to_run: Arc::new(RwLock::new(HashMap::new())),
@@ -356,7 +349,6 @@ where
     pub fn bid_simulate(
         &self,
         mut bid_runtime: BidRuntime<Pool, BscEvmConfig>,
-        parent_difflayers: Option<DiffLayers>,
     ) {
         if !self.bid_receiving {
             return;
@@ -400,39 +392,6 @@ where
             return;
         }
 
-        // Two execution paths for state-root computation:
-        //
-        // TrieDB mode (is_triedb_active):
-        //   - `parent_difflayers` feeds `finish_with_difflayer` so triedb can compute the
-        //     state root incrementally without a full disk trie traversal.
-        //   - A `MinerTrieDbPrefetcher` is also spun up to pre-load trie nodes in the
-        //     background using the difflayer warm-cache, reducing `finish()` latency.
-        //     (Per-tx state hook is not wired here; bid txs are externally pre-built so
-        //     incremental prefetching is less valuable than for miner-built payloads.)
-        //
-        // Non-TrieDB mode (original path):
-        //   - Both fields stay `None`; `finish_with_difflayer` falls through to the standard
-        //     `state_root_with_updates` calculation, identical to the pre-triedb behavior.
-        let (triedb_env_difflayers, triedb_prefetcher) =
-            if rust_eth_triedb::triedb_manager::is_triedb_active() {
-                let prefetcher = parent_difflayers.clone().and_then(|difflayers| {
-                    let mut triedb = get_global_triedb();
-                    let path_db = triedb.get_mut_path_db_ref().clone();
-                    MinerTrieDbPrefetcher::new(
-                        parent_header.state_root(),
-                        path_db,
-                        Some(difflayers),
-                        self.task_executor.clone(),
-                    )
-                    .ok()
-                });
-                (parent_difflayers, prefetcher)
-            } else {
-                // Non-triedb: discard any difflayers passed in and use the original
-                // state_root_with_updates path inside finish_with_difflayer.
-                (None, None)
-            };
-
         // Sinks transport current_validators / turn_length from the builder so that
         // pick_best_payload() can write to VALIDATOR_CACHE / TURN_LENGTH_CACHE with the
         // definitive block hash after finalize_new_header() runs.
@@ -455,8 +414,6 @@ where
                         extra_data: builder_config.extra_data.clone(),
                         slot_number: None,
                     },
-                    parent_difflayers: triedb_env_difflayers,
-                    triedb_prefetcher,
                     validator_cache_sink: Some(bid_validator_cache_sink.clone()),
                     turn_length_sink: Some(bid_turn_length_sink.clone()),
                     // Bid simulation does not run alongside a sparse-trie task —
@@ -568,21 +525,16 @@ where
             return;
         }
 
-        // Finish the builder (also returns triedb difflayer when enabled).
-        // Bid simulation does not run alongside a sparse-trie task — no precomputed root,
-        // so the builder uses the legacy state_root_with_updates path inside
-        // finish_with_difflayer.
-        let out =
-            match builder.finish_with_difflayer(&state_provider).map_err(PayloadBuilderError::other)
-            {
+        // Finish the builder. Bid simulation does not run alongside a sparse-trie task —
+        // no precomputed root, so the builder falls through to state_root_with_updates.
+        let out = match builder.finish(&state_provider, None).map_err(PayloadBuilderError::other) {
             Ok(outcome) => outcome,
             Err(e) => {
                 debug!("Failed to finish builder: {:?}", e);
                 return;
             }
         };
-        let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } = out.inner;
-        let difflayer = out.difflayer;
+        let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } = out;
         let mut sealed_block = Arc::new(block.sealed_block().clone());
 
         // Check if any un_revertible transaction failed
@@ -620,8 +572,7 @@ where
             hashed_state: Either::Left(Arc::new(hashed_state)),
             trie_updates: Either::Left(Arc::new(trie_updates)),
         };
-        let mut executed_block = executed.into_executed_payload();
-        executed_block.difflayer = difflayer;
+        let executed_block = executed.into_executed_payload();
 
         // Read validator/turn-length data transported via sinks from the now-consumed builder.
         let pending_validators = bid_validator_cache_sink.lock().unwrap().take();

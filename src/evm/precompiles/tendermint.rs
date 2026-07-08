@@ -16,9 +16,18 @@ pub(crate) const TENDERMINT_HEADER_VALIDATION: Precompile =
 pub(crate) const TENDERMINT_HEADER_VALIDATION_NANO: Precompile =
     Precompile::new(PrecompileId::Custom(Cow::Borrowed("HEADER_VALIDATE_NANO")), u64_to_address(100), tendermint_header_validation_run_nano);
 
+/// Tendermint precompile disabled from Pasteur (legacy v1 light client deprecated).
+pub(crate) const TENDERMINT_HEADER_VALIDATION_DEPRECATED: Precompile =
+    Precompile::new(PrecompileId::Custom(Cow::Borrowed("HEADER_VALIDATE_DEPRECATED")), u64_to_address(100), tendermint_header_validation_run_deprecated);
+
 /// Run the Tendermint header validation precompile after Nano hardfork.
 fn tendermint_header_validation_run_nano(_input: &[u8], _gas_limit: u64, reservoir: u64) -> PrecompileResult {
     Ok(PrecompileOutput::halt(PrecompileHalt::other("suspended"), reservoir))
+}
+
+/// Run the deprecated (Pasteur) Tendermint header validation precompile: rejects all input.
+fn tendermint_header_validation_run_deprecated(_input: &[u8], _gas_limit: u64, reservoir: u64) -> PrecompileResult {
+    Ok(PrecompileOutput::halt(PrecompileHalt::other("deprecated"), reservoir))
 }
 
 /// Run the Tendermint header validation precompile.
@@ -53,5 +62,11 @@ mod tests {
 
         let output = hex::encode(res.bytes);
         assert_eq!(output, "000000000000000000000000000000000000000000000000000000000000022042696e616e63652d436861696e2d4e696c6500000000000000000000000000000000000003fc05e3a3e248bc209955054d880e4d89ff3c0419c0cd77681f4b4c6649ead5545054b980d9ab0fc10d18ca0e0832d5f4c063c5489ec1443dfb738252d038a82131b27ae17cbe9c20cdcfdf876b3b12978d3264a007fcaaa71c4cdb701d9ebc0323f44f000000174876e800184e7b103d34c41003f9b864d5f8c1adda9bd0436b253bb3c844bc739c1e77c9000000174876e8004d420aea843e92a0cfe69d89696dff6827769f9cb52a249af537ce89bf2a4b74000000174876e800bd03de9f8ab29e2800094e153fac6f696cfa512536c9c2f804dcb2c2c4e4aed6000000174876e8008f4a74a07351895ddf373057b98fae6dfaf2cd21f37a063e19601078fe470d53000000174876e8004a5d4753eb79f92e80efe22df7aca4f666a4f44bf81c536c4a09d4b9c5b654b5000000174876e800c80e9abef7ff439c10c68fe8f1303deddfc527718c3b37d8ba6807446e3c827a000000174876e8009142afcc691b7cc05d26c7b0be0c8b46418294171730e079f384fde2fa50bafc000000174876e80049b288e4ebbb3a281c2d546fc30253d5baf08993b6e5d295fb787a5b314a298e000000174876e80004224339688f012e649de48e241880092eaa8f6aa0f4f14bfcf9e0c76917c0b6000000174876e8004034b37ceda8a0bf13b1abaeee7a8f9383542099a554d219b93d0ce69e3970e8000000174876e800");
+    }
+
+    #[test]
+    fn deprecated_precompile_rejects_all_input() {
+        let res = tendermint_header_validation_run_deprecated(b"anything", 3_000, 0).unwrap();
+        assert!(res.is_halt());
     }
 }
