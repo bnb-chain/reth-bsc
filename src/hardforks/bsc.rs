@@ -121,7 +121,8 @@ impl BscHardfork {
             (Self::Fermi.boxed(), ForkCondition::Timestamp(1768357800)), /* 2026-01-14 02:30:00 AM UTC */
             (Self::Osaka.boxed(), ForkCondition::Timestamp(1777343400)),
             (Self::Mendel.boxed(), ForkCondition::Timestamp(1777343400)),
-            (Self::Pasteur.boxed(), ForkCondition::Timestamp(1784601000)), /* 2026-07-21 02:30:00 AM UTC */
+            // TODO: real activation TBD; unscheduled (u64::MAX) until announced.
+            (Self::Pasteur.boxed(), ForkCondition::Timestamp(u64::MAX)),
         ])
     }
 
@@ -169,8 +170,7 @@ impl BscHardfork {
             (Self::Fermi.boxed(), ForkCondition::Timestamp(1762741500)),
             (Self::Osaka.boxed(), ForkCondition::Timestamp(1774319400)),
             (Self::Mendel.boxed(), ForkCondition::Timestamp(1774319400)),
-            // TODO: real activation TBD; unscheduled (u64::MAX) until announced.
-            (Self::Pasteur.boxed(), ForkCondition::Timestamp(u64::MAX)),
+            (Self::Pasteur.boxed(), ForkCondition::Timestamp(1784601000)), /* 2026-07-21 02:30:00 AM UTC */
         ])
     }
 
@@ -291,20 +291,20 @@ mod tests {
     }
 
     #[test]
-    fn test_pasteur_scheduled_on_mainnet() {
-        // Mainnet has an announced Pasteur activation: 2026-07-21 02:30:00 AM UTC.
+    fn test_pasteur_scheduled_on_testnet() {
+        // Testnet has an announced Pasteur activation: 2026-07-21 02:30:00 AM UTC.
         assert_eq!(
-            BscHardfork::bsc_mainnet().fork(BscHardfork::Pasteur),
+            BscHardfork::bsc_testnet().fork(BscHardfork::Pasteur),
             ForkCondition::Timestamp(1784601000),
-            "Pasteur should activate on mainnet at its announced timestamp"
+            "Pasteur should activate on testnet at its announced timestamp"
         );
     }
 
     #[test]
-    fn test_pasteur_present_but_unscheduled_in_testnet_and_qanet() {
-        // Testnet and qanet have no announced Pasteur activation yet, so they
+    fn test_pasteur_present_but_unscheduled_in_mainnet_and_qanet() {
+        // Mainnet and qanet have no announced Pasteur activation yet, so they
         // must stay dormant (u64::MAX) until a real timestamp is set.
-        for hardforks in [BscHardfork::bsc_testnet(), BscHardfork::bsc_qanet()] {
+        for hardforks in [BscHardfork::bsc_mainnet(), BscHardfork::bsc_qanet()] {
             let activation = hardforks.fork(BscHardfork::Pasteur);
             assert_eq!(
                 activation,
