@@ -561,7 +561,6 @@ pub struct MainWorkWorker<Pool, Provider> {
     simulator: Arc<BidSimulator<Provider, Pool>>, // No outer RwLock, each map has its own lock
     desired_gas_limit: u64,
     desired_min_gas_tip: u128,
-    task_executor: reth_tasks::TaskExecutor,
 }
 
 impl<Pool, Provider> MainWorkWorker<Pool, Provider>
@@ -590,7 +589,6 @@ where
         payload_tx: mpsc::UnboundedSender<SubmitContext>,
         desired_gas_limit: u64,
         desired_min_gas_tip: u128,
-        task_executor: reth_tasks::TaskExecutor,
     ) -> Self {
         Self {
             pool,
@@ -605,7 +603,6 @@ where
             payload_job_join_set: JoinSet::new(),
             desired_gas_limit,
             desired_min_gas_tip,
-            task_executor,
         }
     }
 
@@ -719,7 +716,6 @@ where
             self.chain_spec.clone(),
             self.parlia.clone(),
             mining_ctx.clone(),
-            self.task_executor.clone(),
         );
         let build_args = BscBuildArguments {
             cached_reads: mining_ctx.cached_reads.clone().unwrap_or_default(),
@@ -729,7 +725,6 @@ where
             min_gas_tip: crate::shared::get_miner_gas_tip()
                 .map(|v| v as u128)
                 .unwrap_or(self.desired_min_gas_tip),
-            parent_difflayers: None, // populated once at job start via fetch_triedb_difflayers
             // Filled in by BscPayloadJob::start when sparse-trie state-root is enabled
             // and the engine has registered a spawner. Falls back to legacy path when None.
             state_root_precomputed: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -1140,10 +1135,7 @@ where
                 bid_runtime = self.bid_simulate_req_rx.recv() => {
                     match bid_runtime {
                         Some(bid_runtime) => {
-                            let parent_difflayers =
-                                Self::fetch_parent_difflayers_for_bid(&bid_runtime.bid.parent_hash)
-                                    .await;
-                            self.simulator.bid_simulate(bid_runtime, parent_difflayers);
+                            self.simulator.bid_simulate(bid_runtime);
                         }
                         None => {
                             warn!("Bid simulate request channel closed");
@@ -1162,32 +1154,6 @@ where
                     let last_block_number = self.provider.last_block_number().unwrap_or(0);
                     self.simulator.clear(last_block_number);
                 }
-            }
-        }
-    }
-
-    /// Fetch parent difflayers for a bid simulation (TrieDB mode only).
-    ///
-    /// Returns `None` when TrieDB is inactive, engine_api_tx is unavailable, or the
-    /// request fails. In all fallback cases `bid_simulate` degrades gracefully (slower
-    /// state root via full trie traversal, no triedb prefetching).
-    async fn fetch_parent_difflayers_for_bid(
-        parent_hash: &alloy_primitives::B256,
-    ) -> Option<rust_eth_triedb_common::DiffLayers> {
-        if !rust_eth_triedb::triedb_manager::is_triedb_active() {
-            return None;
-        }
-        let engine_api_tx = crate::shared::get_engine_api_tx()?;
-        match crate::node::evm::request_difflayer(&engine_api_tx, *parent_hash).await {
-            Ok(difflayers) => Some(difflayers),
-            Err(e) => {
-                warn!(
-                    target: "bsc::mev",
-                    %parent_hash,
-                    error = %e,
-                    "Failed to fetch parent difflayers for bid simulation; triedb state root will fall back to full trie traversal"
-                );
-                None
             }
         }
     }
@@ -1286,7 +1252,6 @@ where
             snapshot_provider.clone(),
             mining_config.validator_commission.unwrap_or(100),
             mining_config.greedy_merge,
-            task_executor.clone(),
         ));
         let main_work_worker = MainWorkWorker::new(
             validator_address,
@@ -1299,7 +1264,6 @@ where
             payload_tx,
             desired_gas_limit,
             desired_min_gas_tip,
-            task_executor.clone(),
         );
 
         let result_work_worker = ResultWorkWorker::new(

@@ -8,7 +8,6 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - Workspace members: the root crate (binary `reth-bsc`, library `reth_bsc`) and `testing/bsc-ef-tests` (execution-spec tests harness).
 - All `reth-*` deps are pinned to one commit in `Cargo.toml` (currently `bnb-chain/reth` rev `ef46a48…`). If you change the Reth rev, update **every** `reth-*` line — a mismatched rev produces duplicate-crate build failures. The `testing/bsc-ef-tests/Cargo.toml` uses `branch = "develop"` of the same fork; that's intentional but keep it aligned when bumping.
-- Triedb backend (`--statedb.triedb`) pulls `rust-eth-triedb*` from `bnb-chain/reth-bsc-triedb` on the `develop` branch.
 - `build.rs` scans `src/system_contracts/<hardfork>/{mainnet,chapel,rialto}/*` at build time and emits `src/system_contracts/embedded_contracts.rs` (a `phf_map` keyed as `"<hardfork>_<network>_<contract>"`). It also records the git SHA into `RETH_BSC_GIT_SHA` / `RETH_BSC_GIT_SHA_LONG` used at startup and in the P2P client string. If you add a new hardfork directory with system contracts, add it to the `hardforks` list in `build.rs` so cargo rebuilds when those files change.
 
 ## Common commands
@@ -46,11 +45,10 @@ make ef-tests-nextest   # same, via cargo-nextest
 make clean-eest
 ```
 
-Run (binary is `reth-bsc`, chain ids `bsc`, `bsc-testnet`; optional `--statedb.triedb`):
+Run (binary is `reth-bsc`, chain ids `bsc`, `bsc-testnet`):
 ```bash
 ./target/release/reth-bsc node --chain bsc --datadir ./data_dir
 ./target/release/reth-bsc node --full --chain bsc --datadir ./data_dir            # full node
-./target/release/reth-bsc node --chain bsc --datadir ./data_dir --statedb.triedb  # triedb backend
 ```
 
 ## Where the wiring lives

@@ -55,7 +55,7 @@ pub struct BscBuiltPayload {
     pub exec_duration: Duration,
     /// Time spent computing the trie root (time spent in `finish()` after execution).
     pub trie_root_duration: Duration,
-    /// The executed block (includes difflayer if triedb produced one)
+    /// The executed block.
     pub(crate) executed_block: ExecutedBlock<BscPrimitives>,
     /// Validators from execution context, to be written to VALIDATOR_CACHE after finalization.
     /// `None` for bid payloads and non-epoch blocks.
@@ -123,9 +123,7 @@ where
         // `TreeConfig` built from the `--engine.*` CLI flags via
         // `ctx.config().engine.tree_config()`, so miner-side proof-worker counts /
         // cache sizes are CLI-tunable and match the import (engine) path.
-        if mining_config.use_sparse_trie_state_root
-            && !rust_eth_triedb::triedb_manager::is_triedb_active()
-        {
+        if mining_config.use_sparse_trie_state_root {
             use alloy_consensus::BlockHeader;
             use reth_chain_state::LazyOverlay;
             use reth_engine_tree::tree::{
@@ -157,6 +155,15 @@ where
             let pp_cell: std::sync::OnceLock<
                 std::sync::Arc<PayloadProcessor<crate::node::evm::config::BscEvmConfig>>,
             > = std::sync::OnceLock::new();
+            // Long-lived changeset cache SHARED across all miner sparse-trie spawns. Previously
+            // each spawn built `ChangesetCache::default()` (a fresh, empty cache), so any overlay
+            // that needed trie reverts (anchor below db_tip) missed and recomputed changesets from
+            // the DB on every block — the dominant cause of the occasional 100-280ms "slow root".
+            // A single cache reused across the miner's consecutive blocks warms up: the first block
+            // computes the reverts (from DB) and caches them; later blocks reuse them. Cloning
+            // shares the underlying Arc<RwLock<..>>; `evict` (interior-mutable) bounds growth.
+            const MINER_CHANGESET_RETENTION_BLOCKS: u64 = 256;
+            let miner_changeset_cache = ChangesetCache::new();
             let spawn_fn: crate::shared::SparseTrieSpawnFn = std::sync::Arc::new(
                 move |parent_hash: alloy_primitives::B256,
                       parent_state_root: alloy_primitives::B256| {
@@ -176,6 +183,16 @@ where
                     let (anchor_hash, lazy_overlay) = if let Some(cim) =
                         crate::shared::get_canonical_in_memory_state()
                     {
+                        // Bound the long-lived cache: drop entries well below finalized. The
+                        // overlay only ever needs reverts within [finalized-RETENTION .. head], so
+                        // this keeps the working set hot while preventing unbounded growth over a
+                        // long run. evict() takes &self (RwLock), so it composes with the shared
+                        // clone handed to the OverlayBuilder below.
+                        if let Some(finalized) = cim.get_finalized_num_hash() {
+                            miner_changeset_cache.evict(
+                                finalized.number.saturating_sub(MINER_CHANGESET_RETENTION_BLOCKS),
+                            );
+                        }
                         match cim.state_by_hash(parent_hash) {
                             Some(state) => {
                                 // chain() yields newest-to-oldest including self, exactly
@@ -187,20 +204,34 @@ where
                                     .last()
                                     .map(|b| b.recovered_block().parent_hash())
                                     .unwrap_or(parent_hash);
+                                // Instrumentation: the in-memory overlay depth (= head - on-disk
+                                // tip ≈ persist lag) the proof workers must reconstruct over. We
+                                // suspect a deep overlay (and the per-spawn empty ChangesetCache
+                                // above) is what makes the occasional root slow — NOT tx count.
+                                // Correlate this with bsc_builder_state_root_wait_duration_seconds.
+                                metrics::histogram!("bsc_miner_overlay_depth")
+                                    .record(blocks.len() as f64);
+                                metrics::counter!("bsc_miner_sparse_trie_anchor_inmemory_total")
+                                    .increment(1);
                                 (anchor, Some(LazyOverlay::new(blocks)))
                             }
                             None => {
                                 // Parent already persisted — anchor directly, no overlay.
+                                metrics::counter!("bsc_miner_sparse_trie_anchor_persisted_total")
+                                    .increment(1);
                                 (parent_hash, None)
                             }
                         }
                     } else {
+                        metrics::counter!("bsc_miner_sparse_trie_anchor_nocim_total").increment(1);
                         (parent_hash, None)
                     };
 
                     let overlay_builder = OverlayBuilder::<crate::BscPrimitives>::new(
                         anchor_hash,
-                        ChangesetCache::default(),
+                        // Shared, warm cache (see MINER_CHANGESET_RETENTION_BLOCKS above) instead of
+                        // a fresh empty one per spawn — clone shares the underlying store.
+                        miner_changeset_cache.clone(),
                     )
                     .with_lazy_overlay(lazy_overlay);
 
@@ -230,12 +261,20 @@ where
                             PrecompileCacheMap::default(),
                         ))
                     });
-                    Some(payload_processor.spawn_state_root(
+                    // Instrumentation: time the spawn itself. spawn_state_root creates the proof
+                    // worker pools and kicks off overlay/proof work per block (3000+ spawns/run);
+                    // a slow spawn points at per-block worker-pool churn / overlay setup rather
+                    // than tx execution.
+                    let spawn_start = std::time::Instant::now();
+                    let handle = payload_processor.spawn_state_root(
                         overlay_factory,
                         parent_state_root,
                         false, // halve_workers
                         tree_config_for_closure.as_ref(),
-                    ))
+                    );
+                    metrics::histogram!("bsc_miner_sparse_trie_spawn_duration_seconds")
+                        .record(spawn_start.elapsed().as_secs_f64());
+                    Some(handle)
                 },
             );
 
@@ -246,7 +285,7 @@ where
             } else {
                 info!(
                     "Sparse-trie state-root spawner registered \
-                     (use_sparse_trie_state_root=true, triedb=inactive)"
+                     (use_sparse_trie_state_root=true)"
                 );
             }
         }

@@ -222,6 +222,10 @@ fn add_hardforks_to_chainspec(
     if let Some(mendel_time) = config.get("mendelTime").and_then(|v| v.as_u64()) {
         chain_spec = chain_spec.with_fork(BscHardfork::Mendel, ForkCondition::Timestamp(mendel_time));
     }
-    
+
+    if let Some(pasteur_time) = config.get("pasteurTime").and_then(|v| v.as_u64()) {
+        chain_spec = chain_spec.with_fork(BscHardfork::Pasteur, ForkCondition::Timestamp(pasteur_time));
+    }
+
     Ok(chain_spec)
 }
