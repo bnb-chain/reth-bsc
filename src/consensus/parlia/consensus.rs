@@ -859,7 +859,7 @@ where
         }
         // Build a stable sequence based on the index of validators in parent snapshot (although BLS aggregation order is irrelevant, it is convenient for debugging and consistency)
         let mut ordered_unique: Vec<(u64, VoteAddress, VoteSignature)> = Vec::new();
-        for (_, info) in target_header_parent_snap.validators_map.iter() {
+        for info in target_header_parent_snap.validators_map.values() {
             let vote_addr = info.vote_addr;
             if let Some(sig) = unique_by_addr.get(&vote_addr) {
                 ordered_unique.push((info.index, vote_addr, *sig));
