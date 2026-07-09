@@ -6093,7 +6093,7 @@ mod tests {
             .unwrap();
 
         let input_str = hex::encode(&input);
-        println!("encoded data: {:?}", &input_str);
+        println!("encoded data: {input_str:?}");
         assert_eq!(input_str, expected);
     }
 

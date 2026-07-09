@@ -972,7 +972,7 @@ where
             sender_txs_map.entry(pool_tx.sender()).or_insert_with(Vec::new).push(pool_tx);
         }
 
-        for (_sender, txs) in sender_txs_map.iter_mut() {
+        for txs in sender_txs_map.values_mut() {
             for i in (0..txs.len()).rev() {
                 let tx_hash = txs[i].hash();
                 if bid_tx_hashes.contains(tx_hash) {
