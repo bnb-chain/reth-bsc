@@ -9,6 +9,47 @@ on:
       - "**"
 
 jobs:
+  fmt:
+    name: Rustfmt (非阻断，仅提示)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: nightly-2026-05-11
+          components: rustfmt
+          override: true
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo +nightly-2026-05-11 fmt --all -- --check
+
+  audit:
+    name: cargo-audit (非阻断，仅提示)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-audit
+      - name: Run cargo audit
+        run: cargo audit
+
+  deny:
+    name: cargo-deny (非阻断，仅提示)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features
+
   check:
     name: Cargo Check
     runs-on: ubuntu-latest
@@ -58,8 +99,14 @@ jobs:
         run: cargo +nightly-2026-05-11 udeps --workspace --lib --examples --tests --benches --all-features --locked
 
   clippy:
-    name: clippy
+    # ⚠️ 临时冒烟测试版本：验证 sksat/action-clippy 本身能否正常安装运行
+    # 正式版本应为：if: github.event_name == 'pull_request' + reporter: github-pr-review
+    # + filter_mode: added + fail_on_error: true（见方案讨论，push 事件无 PR 上下文无法测试这部分）
+    name: clippy (临时冒烟测试，非最终配置)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@v4
       - name: Install system dependencies
@@ -70,7 +117,11 @@ jobs:
           components: clippy
           override: true
       - uses: Swatinem/rust-cache@v2
-      - name: clippy
-        run: cargo clippy --workspace --tests --all-features
-        env:
-          RUSTFLAGS: "-D warnings"
+      - name: clippy (冒烟测试：github-check 报告，不做 diff 过滤，不阻断)
+        uses: sksat/action-clippy@v0.7.0
+        with:
+          reporter: github-check
+          level: warning
+          filter_mode: nofilter
+          fail_on_error: false
+          clippy_flags: --workspace --tests --all-features
