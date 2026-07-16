@@ -99,14 +99,12 @@ jobs:
         run: cargo +nightly-2026-05-11 udeps --workspace --lib --examples --tests --benches --all-features --locked
 
   clippy:
-    # ⚠️ 临时冒烟测试版本：验证 sksat/action-clippy 本身能否正常安装运行
-    # 正式版本应为：if: github.event_name == 'pull_request' + reporter: github-pr-review
-    # + filter_mode: added + fail_on_error: true（见方案讨论，push 事件无 PR 上下文无法测试这部分）
-    name: clippy (临时冒烟测试，非最终配置)
+    name: clippy (增量门禁，仅 PR 时运行)
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      checks: write
+      pull-requests: write
     steps:
       - uses: actions/checkout@v4
       - name: Install system dependencies
@@ -117,11 +115,11 @@ jobs:
           components: clippy
           override: true
       - uses: Swatinem/rust-cache@v2
-      - name: clippy (冒烟测试：github-check 报告，不做 diff 过滤，不阻断)
+      - name: clippy (增量门禁：只对本次 PR 新增/修改的行报错)
         uses: sksat/action-clippy@v0.7.0
         with:
-          reporter: github-check
+          reporter: github-pr-review
           level: warning
-          filter_mode: nofilter
-          fail_on_error: false
+          filter_mode: added
+          fail_on_error: true
           clippy_flags: --workspace --tests --all-features
