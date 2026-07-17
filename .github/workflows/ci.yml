@@ -116,7 +116,9 @@ jobs:
           override: true
       - uses: Swatinem/rust-cache@v2
       - name: clippy (增量门禁：只对本次 PR 新增/修改的行报错)
-        uses: sksat/action-clippy@v0.7.0
+        # 原用 sksat/action-clippy@v0.7.0，在本仓库当前 Rust/cargo 工具链下解析
+        # clippy JSON 输出时崩溃（"missing field version"），换用维护更新的 giraffate/clippy-action
+        uses: giraffate/clippy-action@v1
         with:
           reporter: github-pr-review
           level: warning
