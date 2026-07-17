@@ -1,3 +1,5 @@
+#![warn(clippy::unwrap_used, clippy::expect_used)]
+
 use std::collections::HashSet;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},

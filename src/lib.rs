@@ -4,7 +4,6 @@ pub mod evm;
 pub mod hardforks;
 pub mod metrics;
 pub mod node;
-pub mod reviewdog_smoketest;
 pub mod rpc;
 pub mod shared;
 pub use node::primitives::BscPrimitives;
