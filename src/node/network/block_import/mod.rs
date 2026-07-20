@@ -18,13 +18,6 @@ pub mod handle;
 pub mod service;
 pub(crate) mod fork_recover;
 
-/// Throwaway function used only to verify the semgrep unwrap-gate rule
-/// (.semgrep/unwrap-gate.yml) on this module. Safe to delete once validated.
-pub fn semgrep_unwrap_gate_smoketest() {
-    let x: Option<u8> = Some(1);
-    let _ = x.unwrap();
-}
-
 #[derive(Debug)]
 pub struct BscBlockImport {
     handle: ImportHandle,
