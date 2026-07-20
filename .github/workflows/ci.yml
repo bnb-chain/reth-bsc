@@ -127,7 +127,7 @@ jobs:
           clippy_flags: --workspace --tests --all-features
 
   unwrap-gate:
-    name: semgrep unwrap-gate (非阻断，仅提示，需人工在PR描述中说明理由)
+    name: semgrep unwrap-gate (非阻断，仅提示，需在评论中说明理由)
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     continue-on-error: true

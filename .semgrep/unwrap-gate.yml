@@ -3,7 +3,8 @@ rules:
     languages: [rust]
     message: >
       高风险模块中新增了 unwrap() 或 expect() 调用，
-      请在 PR 描述中说明"为什么此处 unwrap 不可能 panic"
+      请直接回复本条评论说明"为什么此处 unwrap 不可能 panic"，
+      code owner 确认后可 Resolve conversation
     severity: WARNING
     patterns:
       - pattern-either:
