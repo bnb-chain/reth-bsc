@@ -120,6 +120,19 @@ pub struct BscCliArgs {
     pub evn_disable_tx_broadcast_forbidden: bool,
 }
 
+/// BSC default for `--gpo.ignoreprice` (wei), matching geth and pre-v2.2 reth-bsc.
+///
+/// BSC blocks carry many legitimate zero-gas-price transactions, most of them not sent
+/// by the block's coinbase, so with upstream's default threshold of 0 they dominate the
+/// gas-price-oracle sample and `eth_gasPrice` / `eth_maxPriorityFeePerGas` return 0.
+const BSC_DEFAULT_GPO_IGNORE_PRICE: u64 = 2;
+
+/// Returns true if `--gpo.ignoreprice` was passed explicitly, either as
+/// `--gpo.ignoreprice <value>` or `--gpo.ignoreprice=<value>`.
+fn user_set_gpo_ignore_price(mut args: impl Iterator<Item = String>) -> bool {
+    args.any(|arg| arg == "--gpo.ignoreprice" || arg.starts_with("--gpo.ignoreprice="))
+}
+
 fn main() -> eyre::Result<()> {
     // Override reth's global version metadata so startup/P2P logs identify
     // this binary as Reth-BSC with its own version + commit.
@@ -159,7 +172,7 @@ fn main() -> eyre::Result<()> {
                     as Arc<dyn FullConsensus<BscPrimitives>>,
             )
         },
-        async move |builder, args| {
+        async move |mut builder, args| {
             // Set genesis hash override if provided
             if let Err(e) = genesis_override::set_genesis_hash_override(args.genesis_hash) {
                 tracing::error!("Failed to set genesis hash override: {}", e);
@@ -170,7 +183,13 @@ fn main() -> eyre::Result<()> {
                 panic!("IPC is disabled, please enable it by setting --ipc.enable to true");
             }
             let ipc_path = builder.config().rpc.ipcpath.clone();
-            
+
+            // Apply the BSC gas-price-oracle default unless the user set the flag.
+            if !user_set_gpo_ignore_price(std::env::args()) {
+                builder.config_mut().rpc.gas_price_oracle.ignore_price =
+                    BSC_DEFAULT_GPO_IGNORE_PRICE;
+            }
+
             // Map CLI args into a global MiningConfig override before launching services
             {
                 use reth_bsc::node::miner::{config as mining_config, MiningConfig};
@@ -470,4 +489,21 @@ fn main() -> eyre::Result<()> {
         },
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::user_set_gpo_ignore_price;
+
+    fn args(v: &[&str]) -> std::vec::IntoIter<String> {
+        v.iter().map(|s| s.to_string()).collect::<Vec<_>>().into_iter()
+    }
+
+    #[test]
+    fn detects_explicit_gpo_ignore_price() {
+        assert!(user_set_gpo_ignore_price(args(&["reth-bsc", "node", "--gpo.ignoreprice", "0"])));
+        assert!(user_set_gpo_ignore_price(args(&["reth-bsc", "node", "--gpo.ignoreprice=7"])));
+        assert!(!user_set_gpo_ignore_price(args(&["reth-bsc", "node", "--chain", "bsc"])));
+        assert!(!user_set_gpo_ignore_price(args(&["reth-bsc", "node", "--gpo.blocks", "20"])));
+    }
 }
