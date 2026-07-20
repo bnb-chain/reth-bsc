@@ -325,7 +325,9 @@ impl BscProtocolConnection {
             }
             x if x == BscProtoMessageId::BlocksByRange as u8 => {
                 tracing::debug!(target: "bsc_protocol", "Processing BlocksByRange response");
-                match BlocksByRangePacket::decode(&mut &slice[..]) {
+                match crate::node::network::blocks_by_range::decode_blocks_by_range(
+                    &mut &slice[..],
+                ) {
                     Ok(res) => {
                         tracing::debug!(
                             target: "bsc_protocol",
@@ -340,8 +342,28 @@ impl BscProtocolConnection {
                         }
                         None
                     }
-                    Err(e) => {
-                        tracing::warn!(target: "bsc_protocol", error = %e, "Failed to decode BlocksByRangePacket");
+                    Err(err) => {
+                        // The decode error carries the request id when it was
+                        // readable, so the pending waiter fails now instead of
+                        // burning the full fetch timeout; the extra fields make
+                        // the sender diagnosable in the field (issue #374).
+                        tracing::warn!(
+                            target: "bsc_protocol",
+                            error = %err.error,
+                            peer = ?self._peer_id,
+                            proto_version = self.proto_version,
+                            frame_len = slice.len(),
+                            request_id = ?err.request_id,
+                            "Failed to decode BlocksByRangePacket"
+                        );
+                        if let Some(req_id) = err.request_id {
+                            if let Some((waiter, _)) = self.pending_range_reqs.remove(&req_id) {
+                                let _ = waiter.send(Err(format!(
+                                    "failed to decode BlocksByRangePacket: {}",
+                                    err.error
+                                )));
+                            }
+                        }
                         None
                     }
                 }
