@@ -1,0 +1,17 @@
+rules:
+  - id: high-risk-unwrap
+    languages: [rust]
+    message: >
+      高风险模块中新增了 unwrap() 或 expect() 调用，
+      请在 PR 描述中说明"为什么此处 unwrap 不可能 panic"
+    severity: WARNING
+    patterns:
+      - pattern-either:
+          - pattern: $X.unwrap()
+          - pattern: $X.expect(...)
+    paths:
+      include:
+        - "src/consensus/parlia/**"
+        - "src/evm/**"
+        - "src/node/network/block_import/**"
+        - "src/node/vote_*.rs"
