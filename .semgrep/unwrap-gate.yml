@@ -11,7 +11,7 @@ rules:
           - pattern: $X.expect(...)
     paths:
       include:
-        - "src/consensus/parlia/**"
-        - "src/evm/**"
-        - "src/node/network/block_import/**"
-        - "src/node/vote_*.rs"
+        - "/src/consensus/parlia/**"
+        - "/src/evm/**"
+        - "/src/node/network/block_import/**"
+        - "/src/node/vote_*.rs"

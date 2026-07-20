@@ -144,8 +144,10 @@ jobs:
       - name: Install semgrep
         run: python3 -m pip install semgrep
       - name: Run semgrep unwrap-gate via reviewdog
+        # reviewdog 没有原生 semgrep 格式解析器（早前假设错了），
+        # semgrep 能直接输出 SARIF，reviewdog 原生支持 -f=sarif，改走这条路
         env:
           REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          semgrep --config .semgrep/unwrap-gate.yml --json src/ | \
-            reviewdog -f=semgrep -reporter=github-pr-review -filter-mode=added -fail-level=none
+          semgrep --config .semgrep/unwrap-gate.yml --sarif src/ | \
+            reviewdog -f=sarif -reporter=github-pr-review -filter-mode=added -fail-level=none
