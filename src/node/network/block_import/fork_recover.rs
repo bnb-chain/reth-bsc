@@ -530,6 +530,8 @@ pub fn new_recovering_heads(cap: u32) -> RecoveringHeads {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)] // tests assert by panicking
+
     use super::*;
     use alloy_consensus::Header;
     use alloy_primitives::B256;

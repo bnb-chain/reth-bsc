@@ -186,6 +186,9 @@ static GLOBAL_JOURNAL: LazyLock<Mutex<VoteJournal>> = LazyLock::new(|| {
 
 /// Get a guard to the global vote journal.
 pub fn global() -> std::sync::MutexGuard<'static, VoteJournal> {
+    // A poisoned lock means a writer panicked mid-update; continuing with possibly
+    // inconsistent vote records risks double-signing, so crashing is the safe choice.
+    #[allow(clippy::expect_used)]
     GLOBAL_JOURNAL.lock().expect("vote journal poisoned")
 }
 
@@ -201,6 +204,8 @@ pub fn persist_vote(env: &VoteEnvelope) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)] // tests assert by panicking
+
     use super::*;
     use alloy_primitives::B256;
 

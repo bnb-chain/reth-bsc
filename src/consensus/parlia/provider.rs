@@ -260,16 +260,15 @@ impl<DB: Database + 'static> EnhancedDbSnapshotProvider<DB> {
             let mut parent_block_hash = target_header.parent_hash;
             rebuild_block_hashes.push(target_header.hash_slow());
             loop {
-                let parent_header = self.get_header_by_hash(&parent_block_hash);
-                if parent_header.is_none() {
+                let Some(parent_header) = self.get_header_by_hash(&parent_block_hash) else {
                     tracing::warn!(
                         "Failed to query snapshot by hash due to not found header, block_hash: {}",
                         parent_block_hash
                     );
                     break None;
-                }
-                if parent_header.clone().unwrap().number == 0 {
-                    self.init_genesis_snapshot(parent_header.as_ref().unwrap());
+                };
+                if parent_header.number == 0 {
+                    self.init_genesis_snapshot(&parent_header);
                 }
                 if let Some(snap) = self.base.snapshot_by_hash(&parent_block_hash) {
                     break Some(snap);
@@ -277,24 +276,24 @@ impl<DB: Database + 'static> EnhancedDbSnapshotProvider<DB> {
                 rebuild_block_hashes.push(parent_block_hash);
                 tracing::trace!(
                     "Succeed to walk to parent block, parent_block_number: {}",
-                    parent_header.clone().unwrap().number
+                    parent_header.number
                 );
-                parent_block_hash = parent_header.clone().unwrap().parent_hash;
+                parent_block_hash = parent_header.parent_hash;
             }
         };
-        if base_snapshot.is_none() {
+        let Some(base_snapshot) = base_snapshot else {
             tracing::warn!("Failed to rebuild snapshot due to not found base snapshot");
             return None;
-        }
+        };
         tracing::debug!(
             "try rebuild snapshot, from_block: {}, to_block: {}, rebuild_block_len: {:?}",
-            base_snapshot.clone().unwrap().block_number,
+            base_snapshot.block_number,
             target_header.number,
             rebuild_block_hashes.len()
         );
 
         rebuild_block_hashes.reverse();
-        let mut working_snapshot = base_snapshot.clone().unwrap();
+        let mut working_snapshot = base_snapshot;
         for block_hash in rebuild_block_hashes {
             let apply_header = self.get_header_by_hash(&block_hash);
             if apply_header.is_none() {

@@ -269,6 +269,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)] // tests assert by panicking
+
     use super::BscEvm;
     use crate::{evm::transaction::BscTxEnv, hardforks::bsc::BscHardfork};
     use reth_evm::EvmEnv;

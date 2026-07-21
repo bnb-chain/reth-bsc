@@ -212,9 +212,7 @@ impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 's
         validate_mix_digest_for_parlia(header, lorentz_active)?;
 
         if self.spec.is_bohr_active_at_timestamp(header.number, header.timestamp) {
-            if header.parent_beacon_block_root.is_none() ||
-                header.parent_beacon_block_root.unwrap() != B256::default()
-            {
+            if header.parent_beacon_block_root != Some(B256::default()) {
                 return Err(ConsensusError::ParentBeaconBlockRootUnexpected)
             }
         } else if header.parent_beacon_block_root.is_some() {
