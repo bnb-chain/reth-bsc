@@ -1,0 +1,43 @@
+# Configuration for the cargo-audit CI job (.github/workflows/ci.yml, `audit`).
+#
+# Every advisory listed here is UNFIXABLE from this repo today: the vulnerable
+# version is pinned by a git dependency (bnb-chain/tendermint-rs-parlia,
+# bnb-chain/greenfield-cometbft-rs, or the pinned bnb-chain/reth rev) and the fix
+# requires a semver-major upgrade in that upstream. Re-check this list whenever one
+# of those deps is bumped; remove entries as they become fixable.
+
+[advisories]
+ignore = [
+    # -- pinned by tendermint v0.17.0 (bnb-chain/tendermint-rs-parlia) ---------------
+    # curve25519-dalek 3.2.0: timing variability in Scalar sub. Fix is 4.1.3
+    # (already present elsewhere in the graph); tendermint-rs-parlia pins 3.x.
+    "RUSTSEC-2024-0344",
+    # ed25519-dalek 1.0.1: double public-key signing oracle. Fix is 2.x
+    # (already present elsewhere in the graph); tendermint-rs-parlia pins 1.x.
+    "RUSTSEC-2022-0093",
+    # prost-types 0.6.1: Timestamp -> SystemTime conversion overflow panic.
+    # Fix is 0.8+; tendermint-rs-parlia pins 0.6.
+    "RUSTSEC-2021-0073",
+
+    # -- pinned by cometbft-rpc (bnb-chain/greenfield-cometbft-rs) via reqwest 0.11 --
+    # rustls-webpki 0.101.7 (x3): wildcard/URI name-constraint bypasses and a
+    # reachable panic in CRL parsing. Fix is 0.103.x, which requires rustls 0.23 /
+    # reqwest 0.12 in cometbft-rpc. CRL parsing is not exercised by our usage.
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0099",
+    "RUSTSEC-2026-0104",
+
+    # -- pinned by the reth git rev (reth-dns-discovery -> hickory-resolver 0.25) ----
+    # hickory-proto 0.25.2: O(n^2) name-compression CPU exhaustion — upstream has
+    # published no fixed release for this advisory yet.
+    "RUSTSEC-2026-0118",
+    # hickory-proto 0.25.2: NSEC3 closest-encloser proof unbounded loop. Fix is
+    # 0.26.1; needs a hickory bump in upstream reth. Only used for DNS discovery.
+    "RUSTSEC-2026-0119",
+
+    # -- lockfile-only entry ----------------------------------------------------------
+    # tracing-subscriber 0.2.25: ANSI-escape log injection. Locked via an optional
+    # feature of ark-relations that is never enabled — `cargo tree -i` shows the
+    # crate is unreachable, so it is not compiled into the binary. Fix is 0.3.20+.
+    "RUSTSEC-2025-0055",
+]
