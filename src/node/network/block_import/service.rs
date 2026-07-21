@@ -15,26 +15,21 @@ use alloy_primitives::{B256, U128};
 use alloy_rpc_types_engine::{ForkchoiceState, PayloadStatusEnum};
 use futures::{future::Either, stream::FuturesUnordered, StreamExt};
 use parking_lot::RwLock;
-use reth::consensus::HeaderValidator;
-use reth::network::cache::LruCache;
+use reth::{consensus::HeaderValidator, network::cache::LruCache};
 use reth_engine_primitives::{ConsensusEngineHandle, EngineTypes};
 use reth_engine_tree::engine::EngineApiRequest;
 use reth_eth_wire::{BlockHashNumber, GetBlockHeaders, NewBlock};
 use reth_eth_wire_types::broadcast::NewBlockHashes;
 use reth_network::{
     import::{BlockImportError, BlockImportEvent, BlockImportOutcome, BlockValidation},
-    message::{NewBlockMessage, PeerMessage},
-};
-use reth_network::{
-    message::{BlockRequest, PeerResponse},
+    message::{BlockRequest, NewBlockMessage, PeerMessage, PeerResponse},
     FetchClient, NetworkHandle,
 };
 use reth_network_api::{PeerId, Peers, ReputationChangeKind};
 use reth_node_ethereum::EthEngineTypes;
 use reth_payload_builder_primitives::Events;
 use reth_payload_primitives::{BuiltPayload, PayloadTypes};
-use reth_primitives_traits::NodePrimitives;
-use reth_primitives_traits::{AlloyBlockHeader, Block};
+use reth_primitives_traits::{AlloyBlockHeader, Block, NodePrimitives};
 use reth_provider::{BlockHashReader, BlockNumReader, BlockReaderIdExt, HeaderProvider};
 use std::{
     future::Future,
@@ -375,10 +370,7 @@ where
         // delay; for a block we just produced locally the sample would actually reflect local
         // mining/finalize latency and would pollute cross-region diagnosis. Mirrors geth-bsc,
         // which only sets `RecvNewBlockTime` inside `handleBlockBroadcast` (the network path).
-        crate::consensus::parlia::block_stats::register_self_mined_block(
-            block_hash,
-            &block.header,
-        );
+        crate::consensus::parlia::block_stats::register_self_mined_block(block_hash, &block.header);
 
         // send to EVN peers first
         if let Err(e) = self.transfer_to_evn_peers(block_msg.clone()) {
@@ -758,10 +750,11 @@ where
         }
         let header_ref = &block.block.0.block.header;
         let coinbase = header_ref.beneficiary;
-        // If from proxied validators or validator address, target EVN peers with ETH NewBlockHashes.
-        if cfg.proxyed_validators.contains(&coinbase)
-            || (mining_config.enabled
-                && mining_config.validator_address.unwrap_or_default() == coinbase)
+        // If from proxied validators or validator address, target EVN peers with ETH
+        // NewBlockHashes.
+        if cfg.proxyed_validators.contains(&coinbase) ||
+            (mining_config.enabled &&
+                mining_config.validator_address.unwrap_or_default() == coinbase)
         {
             if let Some(net) = crate::shared::get_network_handle() {
                 let peers = crate::node::network::evn_peers::snapshot();
@@ -933,11 +926,11 @@ where
                     }
                 }
 
-                // TODO: add queued blocks removal later, to avoid milicious block import, and trigger next download.
-                // now, it must wait backfilling to download the correct block.
-                // the verified header can drop the peer later, it cannot transfer a bad header now.
-                // if let Some(block_hash) = outcome.block.hash {
-                //     this.queued_blocks.remove(&block_hash);
+                // TODO: add queued blocks removal later, to avoid milicious block import, and
+                // trigger next download. now, it must wait backfilling to download
+                // the correct block. the verified header can drop the peer later,
+                // it cannot transfer a bad header now. if let Some(block_hash) =
+                // outcome.block.hash {     this.queued_blocks.remove(&block_hash);
                 // }
 
                 if let Err(e) = this.to_network.send(BlockImportEvent::Outcome(outcome)) {
@@ -1565,7 +1558,8 @@ mod tests {
 
     #[test]
     fn planner_announces_when_peer_best_number_unknown() {
-        // best_number is None before any head info has been observed; announce is the right default.
+        // best_number is None before any head info has been observed; announce is the right
+        // default.
         let peers = vec![peer(1, None)];
         let result = plan_head_announcements(100, &peers);
         assert_eq!(result.len(), 1);

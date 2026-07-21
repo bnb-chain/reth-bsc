@@ -1,6 +1,5 @@
 use alloy_primitives::Address;
-use jsonrpsee::core::RpcResult;
-use jsonrpsee::proc_macros::rpc;
+use jsonrpsee::{core::RpcResult, proc_macros::rpc};
 
 /// BSC Miner RPC API - matches geth-bsc's MinerAPI
 /// Provides control over mining operations, gas settings, and MEV configuration.

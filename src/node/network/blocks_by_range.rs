@@ -3,8 +3,9 @@ use alloy_rlp::{Decodable, Encodable, RlpDecodable, RlpEncodable};
 use alloy_rpc_types::Withdrawals;
 use bytes::BufMut;
 
-use crate::node::network::bsc_protocol::protocol::proto::BscProtoMessageId;
-use crate::node::primitives::BscBlock;
+use crate::node::{
+    network::bsc_protocol::protocol::proto::BscProtoMessageId, primitives::BscBlock,
+};
 
 /// Max range allowed in a single request, mirroring geth's constant.
 pub const MAX_REQUEST_RANGE_BLOCKS_COUNT: u64 = 64;
@@ -98,8 +99,7 @@ where
         blocks.push(block.clone());
 
         let parent_hash = block.header.parent_hash;
-        current_block =
-            if parent_hash != B256::ZERO { lookup(&parent_hash, None) } else { None };
+        current_block = if parent_hash != B256::ZERO { lookup(&parent_hash, None) } else { None };
         remaining -= 1;
     }
 
@@ -175,8 +175,9 @@ struct BlocksByRangePacketInner {
 impl From<&BlocksByRangePacket> for BlocksByRangePacketInner {
     fn from(v: &BlocksByRangePacket) -> Self {
         // Geth decodes sidecar-carrying `BlocksByRangePacket.Blocks[i].Withdrawals` as a list type.
-        // Ensure absent withdrawals are encoded as an empty list (`[]`) instead of RLP null (`0x80`)
-        // only when sidecars are present, to preserve pre-Cancun semantics for historical blocks.
+        // Ensure absent withdrawals are encoded as an empty list (`[]`) instead of RLP null
+        // (`0x80`) only when sidecars are present, to preserve pre-Cancun semantics for
+        // historical blocks.
         let blocks = v
             .blocks
             .iter()
@@ -201,12 +202,11 @@ impl From<BlocksByRangePacketInner> for BlocksByRangePacket {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::node::primitives::BscBlobTransactionSidecar;
-    use crate::BscBlockBody;
+    use crate::{node::primitives::BscBlobTransactionSidecar, BscBlockBody};
     use alloy_consensus::Header;
     use alloy_rlp::RlpDecodable;
-    use reth_ethereum_primitives::TransactionSigned;
     use bytes::BytesMut;
+    use reth_ethereum_primitives::TransactionSigned;
     use std::collections::HashMap;
 
     #[test]
@@ -272,7 +272,8 @@ mod tests {
         let mut bytes = BytesMut::new();
         resp.encode(&mut bytes);
 
-        // Strip message id (0x03), then decode payload as a type that requires withdrawals to be a list.
+        // Strip message id (0x03), then decode payload as a type that requires withdrawals to be a
+        // list.
         let mut payload = &bytes[1..];
         let decoded = BlocksByRangeInnerWithListWithdrawals::decode(&mut payload).unwrap();
 
@@ -424,8 +425,7 @@ mod tests {
             start_block_hash: b0.header.hash_slow(),
             count: 4,
         };
-        let resp =
-            build_blocks_by_range_response_with(&req, |h, _| by_hash.get(h).cloned());
+        let resp = build_blocks_by_range_response_with(&req, |h, _| by_hash.get(h).cloned());
 
         assert_eq!(resp.request_id, 42);
         assert_eq!(resp.blocks.len(), 4, "should walk the full chain via provider fallback");
@@ -456,7 +456,11 @@ mod tests {
         };
         let b0_clone = b0.clone();
         let resp = build_blocks_by_range_response_with(&req, move |_, n| {
-            if n == Some(10) { Some(b0_clone.clone()) } else { None }
+            if n == Some(10) {
+                Some(b0_clone.clone())
+            } else {
+                None
+            }
         });
         assert_eq!(resp.blocks.len(), 1);
         assert_eq!(resp.blocks[0].header.number, 10);

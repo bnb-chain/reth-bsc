@@ -1,51 +1,65 @@
-use crate::chainspec::BscChainSpec;
-use crate::consensus::eip4844::{calc_blob_fee, is_blob_eligible_block, BLOB_TX_BLOB_GAS_PER_BLOB};
-use crate::consensus::parlia::util::calculate_millisecond_timestamp;
-use crate::consensus::parlia::{Parlia, Snapshot};
-use crate::evm::blacklist;
-use crate::hardforks::BscHardforks;
-use crate::metrics::{BscConsensusMetrics, BscMinerMetrics};
-use crate::node::engine::{BscBuiltPayload, BuildKind};
-use crate::node::evm::config::{BscEvmConfig, BscNextBlockEnvAttributes, ValidatorCacheSink};
-use crate::node::evm::pre_execution::{TURN_LENGTH_CACHE, VALIDATOR_CACHE};
-use crate::node::miner::bid_simulator::BidSimulator;
-use crate::node::miner::bsc_miner::{MiningContext, SubmitContext};
-use crate::node::miner::util::finalize_new_header;
-use crate::node::pool::BlacklistedAddressError;
-use crate::node::primitives::BscBlobTransactionSidecar;
+use crate::{
+    chainspec::BscChainSpec,
+    consensus::{
+        eip4844::{calc_blob_fee, is_blob_eligible_block, BLOB_TX_BLOB_GAS_PER_BLOB},
+        parlia::{util::calculate_millisecond_timestamp, Parlia, Snapshot},
+    },
+    evm::blacklist,
+    hardforks::BscHardforks,
+    metrics::{BscConsensusMetrics, BscMinerMetrics},
+    node::{
+        engine::{BscBuiltPayload, BuildKind},
+        evm::{
+            config::{BscEvmConfig, BscNextBlockEnvAttributes, ValidatorCacheSink},
+            pre_execution::{TURN_LENGTH_CACHE, VALIDATOR_CACHE},
+        },
+        miner::{
+            bid_simulator::BidSimulator,
+            bsc_miner::{MiningContext, SubmitContext},
+            util::finalize_new_header,
+        },
+        pool::BlacklistedAddressError,
+        primitives::BscBlobTransactionSidecar,
+    },
+};
 use alloy_consensus::{BlockHeader, Transaction};
 use alloy_eips::eip4895::Withdrawals;
-use alloy_evm::block::BlockExecutor;
-use alloy_evm::Evm;
+use alloy_evm::{block::BlockExecutor, Evm};
 use alloy_primitives::U256;
-use reth_node_ethereum::engine::EthPayloadAttributes;
-use reth::transaction_pool::error::Eip4844PoolTransactionError;
-use reth::transaction_pool::error::InvalidPoolTransactionError;
-use reth::transaction_pool::BestTransactionsAttributes;
-use reth::transaction_pool::{PoolTransaction, TransactionPool};
+use either::Either;
+use once_cell::sync::Lazy;
+use reth::transaction_pool::{
+    error::{Eip4844PoolTransactionError, InvalidPoolTransactionError},
+    BestTransactionsAttributes, PoolTransaction, TransactionPool,
+};
 use reth_basic_payload_builder::PayloadConfig;
 use reth_chainspec::EthChainSpec;
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
 use reth_ethereum_primitives::TransactionSigned;
-use reth_evm::block::{BlockExecutionError, BlockValidationError};
-use reth_evm::execute::BlockBuilder;
-use reth_evm::execute::BlockBuilderOutcome;
-use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
+use reth_evm::{
+    block::{BlockExecutionError, BlockValidationError},
+    execute::{BlockBuilder, BlockBuilderOutcome},
+    ConfigureEvm, NextBlockEnvAttributes,
+};
 use reth_execution_types::BlockExecutionOutput;
+use reth_node_ethereum::engine::EthPayloadAttributes;
 use reth_payload_primitives::{BuiltPayload, BuiltPayloadExecutedBlock, PayloadBuilderError};
-use either::Either;
-use once_cell::sync::Lazy;
-use revm::context_interface::Block as EvmBlock;
-use reth_primitives_traits::{HeaderTy, SealedHeader};
-use reth_primitives_traits::transaction::error::InvalidTransactionError;
-use reth_primitives_traits::{BlockBody, RecoveredBlock, SignerRecoverable};
+use reth_primitives_traits::{
+    transaction::error::InvalidTransactionError, BlockBody, HeaderTy, RecoveredBlock, SealedHeader,
+    SignerRecoverable,
+};
 use reth_provider::StateProviderFactory;
-use reth_revm::cached::CachedReads;
-use reth_revm::cancelled::ManualCancel;
-use reth_revm::{database::StateProviderDatabase, db::State};
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use reth_revm::{
+    cached::CachedReads, cancelled::ManualCancel, database::StateProviderDatabase, db::State,
+};
+use revm::context_interface::Block as EvmBlock;
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
+};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, trace, warn};
 
@@ -228,8 +242,8 @@ fn estimated_uplift_meets_threshold(
     comparison_base: U256,
     threshold_bps: u64,
 ) -> bool {
-    estimated_new_fees.saturating_mul(U256::from(10_000_u64))
-        >= comparison_base.saturating_mul(U256::from(threshold_bps))
+    estimated_new_fees.saturating_mul(U256::from(10_000_u64)) >=
+        comparison_base.saturating_mul(U256::from(threshold_bps))
 }
 
 fn estimated_uplift_bps(current_payload_fees: U256, estimated_new_fees: U256) -> u64 {
@@ -262,10 +276,10 @@ fn local_rebuild_action(input: LocalRebuildPolicyInput) -> LocalRebuildAction {
     let final_shot_max_remaining =
         duration_mul_ratio(input.last_build_duration, FINAL_SHOT_WINDOW_NUM, FINAL_SHOT_WINDOW_DEN);
 
-    if !input.final_shot_used
-        && input.remaining_duration >= final_shot_min_remaining
-        && input.remaining_duration <= final_shot_max_remaining
-        && estimated_uplift_meets_threshold(
+    if !input.final_shot_used &&
+        input.remaining_duration >= final_shot_min_remaining &&
+        input.remaining_duration <= final_shot_max_remaining &&
+        estimated_uplift_meets_threshold(
             input.estimated_new_fees,
             comparison_base,
             FINAL_SHOT_UPLIFT_BPS,
@@ -505,8 +519,8 @@ where
         // the empty build, which has no trie_handle so it jumps straight to the take()) steals the
         // root this attempt deposited, forcing this attempt onto the slow synchronous
         // `state_root_with_updates`. A per-attempt sink makes write→read strictly intra-attempt, so
-        // the full build reads back its OWN precomputed root. When the sparse-trie path is not active
-        // (flag off), this Mutex stays `None` and the builder falls through to
+        // the full build reads back its OWN precomputed root. When the sparse-trie path is not
+        // active (flag off), this Mutex stays `None` and the builder falls through to
         // `state_root_with_updates`.
         let state_root_precomputed_sink: Arc<
             Mutex<Option<(alloy_primitives::B256, reth_trie_common::updates::TrieUpdates)>>,
@@ -635,8 +649,8 @@ where
             }
 
             // filter out blacklisted transactions before executing.
-            if self.chain_spec.is_nano_active_at_block(parent_header.number + 1)
-                && blacklist::check_tx_basic_blacklist(pool_tx.sender(), pool_tx.to())
+            if self.chain_spec.is_nano_active_at_block(parent_header.number + 1) &&
+                blacklist::check_tx_basic_blacklist(pool_tx.sender(), pool_tx.to())
             {
                 debug!(
                     target: "payload_builder",
@@ -1080,7 +1094,8 @@ where
 
         // Total time spent executing pre-execution changes (no user txs for empty payloads).
         let exec_start = std::time::Instant::now();
-        // Everything before `exec_start` is treated as "prepare" time for this empty payload attempt.
+        // Everything before `exec_start` is treated as "prepare" time for this empty payload
+        // attempt.
         let prepare_duration = exec_start.duration_since(build_start);
         builder.apply_pre_execution_changes().map_err(|err| {
             warn!(
@@ -2042,8 +2057,8 @@ where
                         end_mining_timestamp_ms = self.mining_ctx.end_mining_timestamp_ms,
                         "No background payload candidate finished within wait slice"
                     );
-                    // Keep waiting in further slices until we hit the expected end timestamp (+grace)
-                    // or until all background tasks have completed.
+                    // Keep waiting in further slices until we hit the expected end timestamp
+                    // (+grace) or until all background tasks have completed.
                     continue;
                 }
                 WaitMore::Aborted => {
@@ -2299,15 +2314,15 @@ where
 /// Runs `finalize_new_header()` on the payload's header (sets difficulty, prepares validators
 /// for epoch blocks, assembles vote attestation, and ECDSA-seals the header), then:
 ///
-/// 1. Writes `pending_validators` / `pending_turn_length` to the global caches keyed by
-///    the now-deterministic final block hash.
-/// 2. Rebuilds `executed_block.recovered_block` with the finalized header so the engine
-///    tree can identify the block by its correct hash.
+/// 1. Writes `pending_validators` / `pending_turn_length` to the global caches keyed by the
+///    now-deterministic final block hash.
+/// 2. Rebuilds `executed_block.recovered_block` with the finalized header so the engine tree can
+///    identify the block by its correct hash.
 /// 3. Rebuilds `block` (sealed block with sidecars) with the finalized header.
 ///
 /// This function is intentionally separate from the builder path so that finalization is
-/// deferred until `pick_best_payload_and_finalize()` chooses the winning payload — giving more time for
-/// FF votes to arrive.
+/// deferred until `pick_best_payload_and_finalize()` chooses the winning payload — giving more time
+/// for FF votes to arrive.
 fn finalize_payload(
     payload: &mut BscBuiltPayload,
     parlia: Arc<Parlia<BscChainSpec>>,
@@ -2379,21 +2394,22 @@ mod tests {
         initial_out_of_turn_build_wait, local_rebuild_action, validate_bsc_sidecar,
         LocalRebuildAction, LocalRebuildPolicyInput,
     };
-    use crate::chainspec::BscChainSpec;
-    use crate::consensus::parlia::Parlia;
-    use crate::consensus::parlia::Snapshot;
-    use crate::node::miner::bsc_miner::MiningContext;
-    use alloy_consensus::BlobTransactionSidecar;
-    use alloy_consensus::Header;
-    use alloy_eips::eip4844::{Blob, Bytes48};
-    use alloy_eips::eip7594::{
-        BlobTransactionSidecarEip7594, BlobTransactionSidecarVariant, CELLS_PER_EXT_BLOB,
+    use crate::{
+        chainspec::BscChainSpec,
+        consensus::parlia::{Parlia, Snapshot},
+        node::miner::bsc_miner::MiningContext,
+    };
+    use alloy_consensus::{BlobTransactionSidecar, Header};
+    use alloy_eips::{
+        eip4844::{Blob, Bytes48},
+        eip7594::{
+            BlobTransactionSidecarEip7594, BlobTransactionSidecarVariant, CELLS_PER_EXT_BLOB,
+        },
     };
     use alloy_primitives::{Address, B256, U256};
     use reth::transaction_pool::error::Eip4844PoolTransactionError;
     use reth_primitives_traits::SealedHeader;
-    use std::sync::Arc;
-    use std::time::Duration;
+    use std::{sync::Arc, time::Duration};
 
     fn test_parlia() -> Parlia<BscChainSpec> {
         let chain_spec = Arc::new(BscChainSpec { inner: crate::chainspec::bsc::bsc_mainnet() });
@@ -2475,8 +2491,8 @@ mod tests {
                         rebuilds += 1;
                         return rebuilds;
                     }
-                    LocalRebuildAction::ReturnBestPayload
-                    | LocalRebuildAction::WaitForMoreValue => {
+                    LocalRebuildAction::ReturnBestPayload |
+                    LocalRebuildAction::WaitForMoreValue => {
                         break;
                     }
                     LocalRebuildAction::WaitForCooldown(wait_duration) => {

@@ -1,10 +1,12 @@
 #![warn(clippy::unwrap_used, clippy::expect_used)]
 
-use std::collections::{HashMap, VecDeque};
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
+use std::{
+    collections::{HashMap, VecDeque},
+    fs::{self, File, OpenOptions},
+    io::{BufRead, BufReader, Write},
+    path::{Path, PathBuf},
+    sync::{LazyLock, Mutex},
+};
 
 // no top-level B256 import; tests import it under cfg(test)
 
@@ -26,7 +28,9 @@ struct VoteDataLru {
 }
 
 impl VoteDataLru {
-    fn new(capacity: usize) -> Self { Self { capacity, order: VecDeque::new(), map: HashMap::new() } }
+    fn new(capacity: usize) -> Self {
+        Self { capacity, order: VecDeque::new(), map: HashMap::new() }
+    }
 
     fn add(&mut self, key: u64, value: VoteData) {
         if !self.map.contains_key(&key) {
@@ -40,9 +44,13 @@ impl VoteDataLru {
         self.map.insert(key, value);
     }
 
-    fn contains(&self, key: u64) -> bool { self.map.contains_key(&key) }
+    fn contains(&self, key: u64) -> bool {
+        self.map.contains_key(&key)
+    }
 
-    fn get(&self, key: u64) -> Option<VoteData> { self.map.get(&key).cloned() }
+    fn get(&self, key: u64) -> Option<VoteData> {
+        self.map.get(&key).cloned()
+    }
 
     // no additional methods
 }
@@ -56,13 +64,19 @@ pub struct VoteJournal {
 impl VoteJournal {
     fn resolve_default_path() -> PathBuf {
         // Priority: BSC_VOTE_JOURNAL_DIR -> RETH_DATADIR -> ./voteJournal
-        if let Ok(dir) = std::env::var("BSC_VOTE_JOURNAL_DIR") { return PathBuf::from(dir).join("votes.jsonl"); }
-        if let Ok(reth_dir) = std::env::var("RETH_DATADIR") { return PathBuf::from(reth_dir).join("voteJournal").join("votes.jsonl"); }
+        if let Ok(dir) = std::env::var("BSC_VOTE_JOURNAL_DIR") {
+            return PathBuf::from(dir).join("votes.jsonl");
+        }
+        if let Ok(reth_dir) = std::env::var("RETH_DATADIR") {
+            return PathBuf::from(reth_dir).join("voteJournal").join("votes.jsonl");
+        }
         PathBuf::from("voteJournal").join("votes.jsonl")
     }
 
     fn ensure_parent_dir(path: &Path) {
-        if let Some(parent) = path.parent() { let _ = fs::create_dir_all(parent); }
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
     }
 
     fn open_file_append(path: &Path) -> std::io::Result<File> {
@@ -70,7 +84,9 @@ impl VoteJournal {
         OpenOptions::new().create(true).append(true).open(path)
     }
 
-    fn open_file_read(path: &Path) -> std::io::Result<File> { OpenOptions::new().read(true).open(path) }
+    fn open_file_read(path: &Path) -> std::io::Result<File> {
+        OpenOptions::new().read(true).open(path)
+    }
 
     fn load_from_disk(path: &Path) -> VoteDataLru {
         let mut lru = VoteDataLru::new(MAX_RECENT_ENTRIES);
@@ -80,13 +96,19 @@ impl VoteJournal {
             // Each line is expected to be a JSON-serialized VoteEnvelope
             let mut buf: Vec<VoteData> = Vec::with_capacity(MAX_RECENT_ENTRIES);
             for line in reader.lines().map_while(Result::ok) {
-                if line.is_empty() { continue; }
+                if line.is_empty() {
+                    continue;
+                }
                 if let Ok(env) = serde_json::from_str::<VoteEnvelope>(&line) {
                     buf.push(env.data);
-                    if buf.len() > MAX_RECENT_ENTRIES { buf.remove(0); }
+                    if buf.len() > MAX_RECENT_ENTRIES {
+                        buf.remove(0);
+                    }
                 }
             }
-            for vd in buf { lru.add(vd.target_number, vd); }
+            for vd in buf {
+                lru.add(vd.target_number, vd);
+            }
         }
         lru
     }
@@ -97,12 +119,13 @@ impl VoteJournal {
     }
 
     /// Check vote rules against the in-memory buffer.
-    /// Returns true if the vote is allowed under rules, along with the provided source/target context.
+    /// Returns true if the vote is allowed under rules, along with the provided source/target
+    /// context.
     pub fn under_rules(&self, source_number: u64, target_number: u64) -> bool {
         // Rule 1: must not publish two distinct votes for the same height
-        if self.lru.contains(target_number) { 
+        if self.lru.contains(target_number) {
             tracing::trace!(target: "bsc::vote", reason = "duplicate-height", target_number=target_number, "skip vote production");
-            return false; 
+            return false;
         }
 
         // Rule 2: must not vote within the span of its other votes
@@ -113,9 +136,9 @@ impl VoteJournal {
         }
         while block_number < target_number {
             if let Some(vd) = self.lru.get(block_number) {
-                if vd.source_number > source_number { 
+                if vd.source_number > source_number {
                     tracing::trace!(target: "bsc::vote", reason = "backward-window", block_number=block_number, source_number=source_number, vd.source_number=vd.source_number, "skip vote production");
-                    return false; 
+                    return false;
                 }
             }
             block_number += 1;
@@ -125,9 +148,9 @@ impl VoteJournal {
         let upper = target_number + UPPER_LIMIT_OF_VOTE_BLOCK_NUMBER;
         while bn <= upper {
             if let Some(vd) = self.lru.get(bn) {
-                if vd.source_number < source_number { 
+                if vd.source_number < source_number {
                     tracing::trace!(target: "bsc::vote", reason = "forward-window", block_number=bn, source_number=source_number, vd.source_number=vd.source_number, "skip vote production");
-                    return false; 
+                    return false;
                 }
             }
             bn += 1;
@@ -162,10 +185,14 @@ static GLOBAL_JOURNAL: LazyLock<Mutex<VoteJournal>> = LazyLock::new(|| {
 });
 
 /// Get a guard to the global vote journal.
-pub fn global() -> std::sync::MutexGuard<'static, VoteJournal> { GLOBAL_JOURNAL.lock().expect("vote journal poisoned") }
+pub fn global() -> std::sync::MutexGuard<'static, VoteJournal> {
+    GLOBAL_JOURNAL.lock().expect("vote journal poisoned")
+}
 
 /// Helper for external modules to check the rules via global journal.
-pub fn under_rules(source_number: u64, target_number: u64) -> bool { global().under_rules(source_number, target_number) }
+pub fn under_rules(source_number: u64, target_number: u64) -> bool {
+    global().under_rules(source_number, target_number)
+}
 
 /// Helper for external modules to persist a signed vote via global journal.
 pub fn persist_vote(env: &VoteEnvelope) -> Result<(), String> {
@@ -178,10 +205,8 @@ mod tests {
     use alloy_primitives::B256;
 
     fn tmp_path(name: &str) -> PathBuf {
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let ts =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         std::env::temp_dir().join(format!("{}_{}.jsonl", name, ts))
     }
 
@@ -189,7 +214,12 @@ mod tests {
         VoteEnvelope {
             vote_address: Default::default(),
             signature: Default::default(),
-            data: VoteData { source_number: src_n, source_hash: src_h, target_number: tgt_n, target_hash: tgt_h },
+            data: VoteData {
+                source_number: src_n,
+                source_hash: src_h,
+                target_number: tgt_n,
+                target_hash: tgt_h,
+            },
         }
     }
 
@@ -209,7 +239,8 @@ mod tests {
         // Previous vote with target 125 and source 120
         let env = mk_env(120, B256::from([3u8; 32]), 125, B256::from([4u8; 32]));
         j.write_vote(&env).unwrap();
-        // New vote spans across: source 110, target 130 should be invalid (sees prior at 125 with higher source)
+        // New vote spans across: source 110, target 130 should be invalid (sees prior at 125 with
+        // higher source)
         assert!(!j.under_rules(110, 130));
     }
 
@@ -220,7 +251,8 @@ mod tests {
         // Previous vote with target 110 and lower source 90
         let env = mk_env(90, B256::from([5u8; 32]), 110, B256::from([6u8; 32]));
         j.write_vote(&env).unwrap();
-        // New vote source 100, target 105: forward window includes 106..116; contains 110 with vd.source=90 < 100 => invalid
+        // New vote source 100, target 105: forward window includes 106..116; contains 110 with
+        // vd.source=90 < 100 => invalid
         assert!(!j.under_rules(100, 105));
     }
 
@@ -248,7 +280,8 @@ mod tests {
         let j2 = VoteJournal::new(path);
         // Rule1: contains 40
         assert!(!j2.under_rules(35, 40));
-        // Rule2 forward: with source 35 target 33, forward window includes 34..44; 40 present with vd.source=30 < 35 => invalid
+        // Rule2 forward: with source 35 target 33, forward window includes 34..44; 40 present with
+        // vd.source=30 < 35 => invalid
         assert!(!j2.under_rules(35, 33));
     }
 }

@@ -1,5 +1,3 @@
-use crate::node::miner::bid_simulator::{BidRuntime, BidSimulator};
-use crate::node::miner::payload::BscBuildArguments;
 use crate::{
     chainspec::BscChainSpec,
     consensus::parlia::{provider::SnapshotProvider, Parlia},
@@ -8,8 +6,9 @@ use crate::{
         engine::BscBuiltPayload,
         evm::config::BscEvmConfig,
         miner::{
+            bid_simulator::{BidRuntime, BidSimulator},
             config::MiningConfig,
-            payload::{BscPayloadBuilder, BscPayloadJob, BscPayloadJobHandle},
+            payload::{BscBuildArguments, BscPayloadBuilder, BscPayloadJob, BscPayloadJobHandle},
             signer::init_global_signer_from_k256,
             util::prepare_new_attributes,
         },
@@ -26,26 +25,27 @@ use alloy_consensus::BlockHeader;
 use alloy_primitives::{Address, Sealable, U128};
 use k256::ecdsa::SigningKey;
 use lru::LruCache;
-use reth::transaction_pool::PoolTransaction;
-use reth::transaction_pool::TransactionPool;
+use reth::transaction_pool::{PoolTransaction, TransactionPool};
 use reth_basic_payload_builder::{PayloadConfig, PrecachedState};
 use reth_chainspec::EthChainSpec;
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
+use reth_ethereum_primitives::TransactionSigned;
 use reth_network::message::NewBlockMessage;
 use reth_payload_primitives::BuiltPayload;
-use reth_primitives_traits::SealedHeader;
-use reth_ethereum_primitives::TransactionSigned;
-use reth_primitives_traits::BlockBody;
+use reth_primitives_traits::{BlockBody, SealedHeader};
 use reth_provider::{
     BlockNumReader, CanonStateNotification, CanonStateSubscriptions, HeaderProvider,
 };
 use reth_revm::cancelled::ManualCancel;
 use reth_tasks::TaskExecutor;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-use tokio::sync::mpsc;
-use tokio::task::JoinSet;
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    time::Duration,
+};
+use tokio::{sync::mpsc, task::JoinSet};
 use tokio_stream::StreamExt;
 use tracing::{debug, error, info, trace, warn};
 
@@ -174,8 +174,7 @@ where
         // This is essential for deadlock recovery when all validators restart simultaneously
         // and the sync gate times out — without this ticker, try_new_work would never be
         // re-invoked after the startup attempt.
-        let mut periodic_tick =
-            tokio::time::interval(Duration::from_secs(3));
+        let mut periodic_tick = tokio::time::interval(Duration::from_secs(3));
         periodic_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // Burn the first immediate tick so we don't double-fire with the startup spawn above.
         periodic_tick.tick().await;
@@ -331,7 +330,8 @@ where
     /// Returns a `Result<bool, Box<dyn Error>>`:
     /// - `Ok(true)` - Reorg is valid and justified, should proceed with mining
     /// - `Ok(false)` - Reorg is invalid according to fork choice rules, should skip mining
-    /// - `Err(error)` - Validation failed (engine not initialized or headers unavailable), error contains reason
+    /// - `Err(error)` - Validation failed (engine not initialized or headers unavailable), error
+    ///   contains reason
     async fn validate_reorg<N>(
         &self,
         old: &Arc<reth::providers::Chain<N>>,
@@ -433,7 +433,8 @@ where
         self.pre_cached = Some(PrecachedState { block: committed.tip().hash(), cached });
     }
 
-    /// Returns the pre-cached reads for the given parent header if it matches the cached state's block.
+    /// Returns the pre-cached reads for the given parent header if it matches the cached state's
+    /// block.
     fn maybe_pre_cached(
         &self,
         parent: alloy_primitives::B256,
@@ -556,8 +557,7 @@ pub struct MainWorkWorker<Pool, Provider> {
     mining_queue_rx: mpsc::UnboundedReceiver<MiningContext>,
     payload_tx: mpsc::UnboundedSender<SubmitContext>,
     running_job_handle: Option<BscPayloadJobHandle>,
-    payload_job_join_set:
-        JoinSet<Result<(), Box<crate::node::miner::payload::BscPayloadJobError>>>,
+    payload_job_join_set: JoinSet<Result<(), Box<crate::node::miner::payload::BscPayloadJobError>>>,
     simulator: Arc<BidSimulator<Provider, Pool>>, // No outer RwLock, each map has its own lock
     desired_gas_limit: u64,
     desired_min_gas_tip: u128,
@@ -719,7 +719,11 @@ where
         );
         let build_args = BscBuildArguments {
             cached_reads: mining_ctx.cached_reads.clone().unwrap_or_default(),
-            config: PayloadConfig::new(Arc::new(mining_ctx.parent_header.clone()), attributes, alloy_rpc_types_engine::PayloadId::new([0u8; 8])),
+            config: PayloadConfig::new(
+                Arc::new(mining_ctx.parent_header.clone()),
+                attributes,
+                alloy_rpc_types_engine::PayloadId::new([0u8; 8]),
+            ),
             cancel: ManualCancel::default(),
             trace_id: crate::node::miner::payload::generate_trace_id(),
             min_gas_tip: crate::shared::get_miner_gas_tip()
@@ -993,9 +997,7 @@ where
         }
 
         // Record payload build timings.
-        MINER_METRICS
-            .block_exec_duration_seconds
-            .record(payload.exec_duration.as_secs_f64());
+        MINER_METRICS.block_exec_duration_seconds.record(payload.exec_duration.as_secs_f64());
         MINER_METRICS
             .block_trie_root_duration_seconds
             .record(payload.trie_root_duration.as_secs_f64());
@@ -1062,9 +1064,7 @@ where
                 }
             } else {
                 warn!("Failed to send mined block due to import sender not initialised");
-                return Err(
-                    "Failed to send mined block due to import sender not initialised".into()
-                );
+                return Err("Failed to send mined block due to import sender not initialised".into());
             }
         } else if let Some(sender) = get_block_import_sender() {
             let peer_id = get_local_peer_id_or_default();

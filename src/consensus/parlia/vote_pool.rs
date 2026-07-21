@@ -17,9 +17,11 @@ use super::{
     malicious_vote_monitor::MaliciousVoteMonitor,
     vote::{VoteData, VoteEnvelope},
 };
-use crate::consensus::parlia::util::calculate_millisecond_timestamp;
-use crate::metrics::{BscFinalityMetrics, BscVoteMetrics};
-use crate::shared;
+use crate::{
+    consensus::parlia::util::calculate_millisecond_timestamp,
+    metrics::{BscFinalityMetrics, BscVoteMetrics},
+    shared,
+};
 use std::time::SystemTime;
 
 const LOWER_LIMIT_OF_VOTE_BLOCK_NUMBER: u64 = 256;
@@ -156,7 +158,8 @@ impl VotePool {
     fn get_votes(&self) -> Vec<VoteEnvelope> {
         let mut all_votes = Vec::new();
         for vote_messages in self.cur_votes.values() {
-            all_votes.extend(vote_messages.vote_messages.iter().map(|entry| entry.envelope.clone()));
+            all_votes
+                .extend(vote_messages.vote_messages.iter().map(|entry| entry.envelope.clone()));
         }
         all_votes
     }
@@ -171,11 +174,7 @@ impl VotePool {
 
     fn fetch_vote_by_block_hash(&self, block_hash: B256) -> Vec<VoteEnvelope> {
         if let Some(vote_messages) = self.cur_votes.get(&block_hash) {
-            vote_messages
-                .vote_messages
-                .iter()
-                .map(|entry| entry.envelope.clone())
-                .collect()
+            vote_messages.vote_messages.iter().map(|entry| entry.envelope.clone()).collect()
         } else {
             Vec::new()
         }
@@ -205,7 +204,8 @@ impl VotePool {
 
                 // Remove from votes map and received_votes set
                 if let Some(vote_box) = self.cur_votes.remove(&block_hash) {
-                    self.total_votes = self.total_votes.saturating_sub(vote_box.vote_messages.len());
+                    self.total_votes =
+                        self.total_votes.saturating_sub(vote_box.vote_messages.len());
                     for vote in vote_box.vote_messages {
                         self.received_votes.remove(&vote.hash);
                     }
@@ -234,7 +234,8 @@ static VOTE_METRICS: Lazy<BscVoteMetrics> = Lazy::new(BscVoteMetrics::default);
 static FINALITY_METRICS: Lazy<BscFinalityMetrics> = Lazy::new(BscFinalityMetrics::default);
 
 /// LRU cache to track which blocks have already been notified for finality.
-/// This prevents repeated update_forkchoice calls for the same block (matches geth's finalizedNotified).
+/// This prevents repeated update_forkchoice calls for the same block (matches geth's
+/// finalizedNotified).
 static FINALIZED_NOTIFIED: Lazy<RwLock<LruCache<B256, ()>>> =
     Lazy::new(|| RwLock::new(LruCache::new(NonZero::new(FINALIZED_NOTIFIED_CACHE_SIZE).unwrap())));
 
@@ -375,8 +376,8 @@ fn maybe_notify_finality(target_hash: B256, votes_for_block: usize) {
     let eligible_votes = fetch_vote_by_block_hash(target_hash)
         .into_iter()
         .filter(|vote| {
-            vote.data.source_number == current_justified_number
-                && vote.data.target_number == head.number
+            vote.data.source_number == current_justified_number &&
+                vote.data.target_number == head.number
         })
         .count();
 
@@ -393,7 +394,8 @@ fn maybe_notify_finality(target_hash: B256, votes_for_block: usize) {
     // Record early finalization latency: time from the finalized block's millisecond
     // timestamp to now, equivalent to chain/finalized/latency/early in geth.
     // The finalized block is current_justified (head - 1), identified by current_justified_number.
-    if let Some(justified_header) = shared::get_canonical_header_by_number(current_justified_number) {
+    if let Some(justified_header) = shared::get_canonical_header_by_number(current_justified_number)
+    {
         let now_ms = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()

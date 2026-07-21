@@ -1,20 +1,23 @@
-use crate::chainspec::BscChainSpec;
-use crate::consensus::parlia::SnapshotProvider;
-use crate::node::miner::bid_simulator::Bid;
-use crate::node::miner::config::keystore;
-use crate::node::miner::config::MiningConfig;
-use alloy_consensus::BlobTransactionSidecar;
-use alloy_consensus::Transaction;
-use alloy_consensus::{transaction::RlpEcdsaDecodableTx, TxEip4844WithSidecar};
-use alloy_primitives::Address;
-use alloy_primitives::{Bytes, B256, U256, U64};
-use jsonrpsee::core::RpcResult;
-use jsonrpsee::proc_macros::rpc;
+use crate::{
+    chainspec::BscChainSpec,
+    consensus::parlia::SnapshotProvider,
+    node::miner::{
+        bid_simulator::Bid,
+        config::{keystore, MiningConfig},
+    },
+};
+use alloy_consensus::{
+    transaction::RlpEcdsaDecodableTx, BlobTransactionSidecar, Transaction, TxEip4844WithSidecar,
+};
+use alloy_primitives::{Address, Bytes, B256, U256, U64};
+use jsonrpsee::{core::RpcResult, proc_macros::rpc};
 use reth_chainspec::EthChainSpec;
 use reth_ethereum_primitives::TransactionSigned;
 use reth_primitives_traits::SignerRecoverable;
-use std::collections::HashSet;
-use std::sync::{Arc, RwLock};
+use std::{
+    collections::HashSet,
+    sync::{Arc, RwLock},
+};
 use tracing::debug;
 
 /// Raw bid data structure from builder
@@ -112,7 +115,8 @@ where
     }
 }
 
-/// Custom MEV API server trait - only includes send_bid to avoid conflicts with reth's default MEV API
+/// Custom MEV API server trait - only includes send_bid to avoid conflicts with reth's default MEV
+/// API
 #[rpc(server, namespace = "mev")]
 pub trait BscMevApi {
     /// Send a bid to the builder
@@ -531,20 +535,21 @@ impl MevApiImpl {
         use alloy_rlp::Encodable;
 
         // RLP encode the RawBid structure
-        // The structure is: [blockNumber, parentHash, txs, unRevertible, gasUsed, gasFee, builderFee]
+        // The structure is: [blockNumber, parentHash, txs, unRevertible, gasUsed, gasFee,
+        // builderFee]
         let mut rlp_buffer = Vec::new();
 
         // Get builder_fee value (use 0 if None)
         let builder_fee = raw_bid.builder_fee.unwrap_or(U256::ZERO);
 
         // First calculate the length of all encoded items
-        let payload_length = raw_bid.block_number.length()
-            + raw_bid.parent_hash.length()
-            + raw_bid.txs.length()
-            + raw_bid.un_revertible.length()
-            + raw_bid.gas_used.length()
-            + raw_bid.gas_fee.length()
-            + builder_fee.length();
+        let payload_length = raw_bid.block_number.length() +
+            raw_bid.parent_hash.length() +
+            raw_bid.txs.length() +
+            raw_bid.un_revertible.length() +
+            raw_bid.gas_used.length() +
+            raw_bid.gas_fee.length() +
+            builder_fee.length();
 
         // Encode the list header
         alloy_rlp::Header { list: true, payload_length }.encode(&mut rlp_buffer);

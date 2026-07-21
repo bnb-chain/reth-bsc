@@ -1,31 +1,27 @@
 use crate::{
+    consensus::parlia::VoteAddress,
     node::{
         engine_api::payload::BscPayloadTypes,
         miner::{BscMiner, MiningConfig},
         BscNode,
     },
-    BscPrimitives,
+    BscBlock, BscPrimitives,
 };
-use crate::BscBlock;
-use crate::consensus::parlia::VoteAddress;
-use alloy_primitives::Address;
 use alloy_eips::eip7685::Requests;
-use alloy_primitives::U256;
-use reth::transaction_pool::PoolTransaction;
+use alloy_primitives::{Address, U256};
 use reth::{
     api::FullNodeTypes,
     builder::{components::PayloadServiceBuilder, BuilderContext},
     payload::{PayloadBuilderHandle, PayloadServiceCommand},
-    transaction_pool::TransactionPool,
+    transaction_pool::{PoolTransaction, TransactionPool},
 };
 use reth_chain_state::ExecutedBlock;
+use reth_ethereum_primitives::TransactionSigned;
 use reth_evm::ConfigureEvm;
 use reth_payload_builder_primitives::Events;
 use reth_payload_primitives::BuiltPayload;
 use reth_primitives_traits::SealedBlock;
-use reth_ethereum_primitives::TransactionSigned;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info};
 
@@ -229,16 +225,15 @@ where
 
                     let overlay_builder = OverlayBuilder::<crate::BscPrimitives>::new(
                         anchor_hash,
-                        // Shared, warm cache (see MINER_CHANGESET_RETENTION_BLOCKS above) instead of
-                        // a fresh empty one per spawn — clone shares the underlying store.
+                        // Shared, warm cache (see MINER_CHANGESET_RETENTION_BLOCKS above) instead
+                        // of a fresh empty one per spawn — clone shares
+                        // the underlying store.
                         miner_changeset_cache.clone(),
                     )
                     .with_lazy_overlay(lazy_overlay);
 
-                    let overlay_factory = OverlayStateProviderFactory::new(
-                        provider.clone(),
-                        overlay_builder,
-                    );
+                    let overlay_factory =
+                        OverlayStateProviderFactory::new(provider.clone(), overlay_builder);
                     // R1: lazily build (once) the PayloadProcessor on the engine's shared
                     // Runtime, falling back to a dedicated one if not yet published.
                     let payload_processor = pp_cell.get_or_init(|| {
@@ -279,9 +274,7 @@ where
             );
 
             if crate::shared::set_sparse_trie_spawn_fn(spawn_fn).is_err() {
-                tracing::warn!(
-                    "Sparse-trie spawner already registered, keeping existing one"
-                );
+                tracing::warn!("Sparse-trie spawner already registered, keeping existing one");
             } else {
                 info!(
                     "Sparse-trie state-root spawner registered \
@@ -343,7 +336,8 @@ where
         let (events_tx, _events_rx) = broadcast::channel::<Events<BscPayloadTypes>>(100);
         let _ = crate::shared::set_payload_events_tx(events_tx.clone());
 
-        // Handle payload service commands (keep minimal compatibility but with shared events channel)
+        // Handle payload service commands (keep minimal compatibility but with shared events
+        // channel)
         ctx.task_executor().spawn_critical_task("payload-service-handler", async move {
             while let Some(message) = rx.recv().await {
                 match message {

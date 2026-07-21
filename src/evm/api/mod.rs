@@ -6,6 +6,7 @@ use super::precompiles::BscPrecompiles;
 use reth_evm::{precompiles::PrecompilesMap, Database, EvmEnv};
 use revm::{
     context::{BlockEnv, CfgEnv, ContextTr, Evm as EvmCtx, FrameStack, JournalTr},
+    context_interface::journaled_state::account::JournaledAccountTr,
     handler::{
         evm::{ContextDbError, FrameInitResult},
         instructions::EthInstructions,
@@ -16,7 +17,6 @@ use revm::{
     primitives::hardfork::SpecId,
     Context, Inspector, Journal,
 };
-use revm::context_interface::journaled_state::account::JournaledAccountTr;
 
 mod exec;
 
@@ -153,12 +153,7 @@ where
 
     fn all(
         &self,
-    ) -> (
-        &Self::Context,
-        &Self::Instructions,
-        &Self::Precompiles,
-        &FrameStack<Self::Frame>,
-    ) {
+    ) -> (&Self::Context, &Self::Instructions, &Self::Precompiles, &FrameStack<Self::Frame>) {
         self.inner.all()
     }
 
@@ -372,18 +367,11 @@ mod tests {
 
         // Mismatched instruction table (defaults to the latest spec): should undercharge and
         // succeed with the same gas limit.
-        let mut mismatched = BscEvm::new(
-            env,
-            make_db(caller, contract, repetitions),
-            NoOpInspector,
-            false,
-            false,
-        );
+        let mut mismatched =
+            BscEvm::new(env, make_db(caller, contract, repetitions), NoOpInspector, false, false);
         mismatched.inner.instruction = EthInstructions::new_mainnet_with_spec(SpecId::default());
 
-        let mismatched_result = mismatched
-            .transact_one(tx)
-            .expect("execution should not error");
+        let mismatched_result = mismatched.transact_one(tx).expect("execution should not error");
         assert!(
             mismatched_result.is_success(),
             "latest-spec instruction table should succeed with this gas limit"
@@ -400,20 +388,14 @@ mod tests {
         let mut cfg_env = CfgEnv::new_with_spec(spec).with_chain_id(56);
         cfg_env.tx_gas_limit_cap = Some(2u64.pow(24));
 
-        let block_env = BlockEnv {
-            beneficiary,
-            prevrandao: Some(U256::from(1).into()),
-            ..Default::default()
-        };
+        let block_env =
+            BlockEnv { beneficiary, prevrandao: Some(U256::from(1).into()), ..Default::default() };
         let env = EvmEnv::new(cfg_env, block_env);
 
         let mut db = InMemoryDB::default();
         db.insert_account_info(
             beneficiary,
-            AccountInfo {
-                balance: U256::from(1_000_000_000_000u64),
-                ..AccountInfo::default()
-            },
+            AccountInfo { balance: U256::from(1_000_000_000_000u64), ..AccountInfo::default() },
         );
         db.insert_account_info(system_contract, AccountInfo::default());
 
@@ -437,9 +419,8 @@ mod tests {
     }
 
     /// BSC `VALIDATOR_CONTRACT` (target of `deposit` / `distributeFinalityReward`).
-    const VALIDATOR_SYSTEM_CONTRACT: Address = Address::new([
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10, 0x00,
-    ]);
+    const VALIDATOR_SYSTEM_CONTRACT: Address =
+        Address::new([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10, 0x00]);
 
     #[test]
     fn prepare_marks_system_shape_tx() {
@@ -564,8 +545,10 @@ mod tests {
         evm: &mut BscEvm<InMemoryDB, NoOpInspector>,
         beneficiary: Address,
     ) -> U256 {
-        use revm::context::{ContextTr, JournalTr};
-        use revm::context_interface::journaled_state::account::JournaledAccountTr;
+        use revm::{
+            context::{ContextTr, JournalTr},
+            context_interface::journaled_state::account::JournaledAccountTr,
+        };
         *evm.journal_mut()
             .load_account_mut(beneficiary)
             .expect("beneficiary account should load")
@@ -602,11 +585,8 @@ mod tests {
         let beneficiary = Address::from([0x10; 20]);
         let mut cfg_env = CfgEnv::new_with_spec(BscHardfork::Osaka).with_chain_id(56);
         cfg_env.tx_gas_limit_cap = Some(2u64.pow(24));
-        let block_env = BlockEnv {
-            beneficiary,
-            prevrandao: Some(U256::from(1).into()),
-            ..Default::default()
-        };
+        let block_env =
+            BlockEnv { beneficiary, prevrandao: Some(U256::from(1).into()), ..Default::default() };
         let mut db = InMemoryDB::default();
         db.insert_account_info(
             beneficiary,

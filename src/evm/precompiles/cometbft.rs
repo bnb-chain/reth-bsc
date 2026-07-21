@@ -14,18 +14,31 @@ use cometbft_light_client_verifier::{
 use cometbft_proto::types::v1::LightBlock as TmLightBlock;
 use prost::Message;
 use revm::precompile::{
-    u64_to_address, PrecompileHalt, PrecompileOutput, PrecompileResult, Precompile, PrecompileId,
+    u64_to_address, Precompile, PrecompileHalt, PrecompileId, PrecompileOutput, PrecompileResult,
 };
-use std::{borrow::{Cow, ToOwned}, string::String, vec::Vec};
+use std::{
+    borrow::{Cow, ToOwned},
+    string::String,
+    vec::Vec,
+};
 
-pub(crate) const COMETBFT_LIGHT_BLOCK_VALIDATION: Precompile =
-    Precompile::new(PrecompileId::Custom(Cow::Borrowed("COMET_BFT_LIGHT_BLOCK_VALIDATE_HERTZ")), u64_to_address(103), cometbft_light_block_validation_run);
+pub(crate) const COMETBFT_LIGHT_BLOCK_VALIDATION: Precompile = Precompile::new(
+    PrecompileId::Custom(Cow::Borrowed("COMET_BFT_LIGHT_BLOCK_VALIDATE_HERTZ")),
+    u64_to_address(103),
+    cometbft_light_block_validation_run,
+);
 
-pub(crate) const COMETBFT_LIGHT_BLOCK_VALIDATION_BEFORE_HERTZ: Precompile =
-    Precompile::new(PrecompileId::Custom(Cow::Borrowed("COMET_BFT_LIGHT_BLOCK_VALIDATE")), u64_to_address(103), cometbft_light_block_validation_run_before_hertz);
+pub(crate) const COMETBFT_LIGHT_BLOCK_VALIDATION_BEFORE_HERTZ: Precompile = Precompile::new(
+    PrecompileId::Custom(Cow::Borrowed("COMET_BFT_LIGHT_BLOCK_VALIDATE")),
+    u64_to_address(103),
+    cometbft_light_block_validation_run_before_hertz,
+);
 
-pub(crate) const COMETBFT_LIGHT_BLOCK_VALIDATION_PASTEUR: Precompile =
-    Precompile::new(PrecompileId::Custom(Cow::Borrowed("COMET_BFT_LIGHT_BLOCK_VALIDATE_PASTEUR")), u64_to_address(103), cometbft_light_block_validation_run_pasteur);
+pub(crate) const COMETBFT_LIGHT_BLOCK_VALIDATION_PASTEUR: Precompile = Precompile::new(
+    PrecompileId::Custom(Cow::Borrowed("COMET_BFT_LIGHT_BLOCK_VALIDATE_PASTEUR")),
+    u64_to_address(103),
+    cometbft_light_block_validation_run_pasteur,
+);
 
 const UINT64_TYPE_LENGTH: u64 = 8;
 const CONSENSUS_STATE_LENGTH_BYTES_LENGTH: u64 = 32;
@@ -56,7 +69,11 @@ const COMETBFT_LIGHT_BLOCK_VALIDATION_BASE: u64 = 3_000;
 /// count instead of being a flat fee.
 const COMETBFT_LIGHT_BLOCK_VALIDATE_PER_BYTE_GAS: u64 = 16;
 
-fn cometbft_light_block_validation_run(input: &[u8], gas_limit: u64, reservoir: u64) -> PrecompileResult {
+fn cometbft_light_block_validation_run(
+    input: &[u8],
+    gas_limit: u64,
+    reservoir: u64,
+) -> PrecompileResult {
     cometbft_light_block_validation_run_inner(input, gas_limit, reservoir, true, false, 0)
 }
 
@@ -838,8 +855,18 @@ mod tests {
 
         // Duplicate BLS key (pubkeys and relayer addresses distinct).
         let set = ValidatorSet::without_proposer(vec![
-            Validator::new_with_bls_and_relayer(pk0(), Power::from(1_u32), bls0.clone(), relayer0.clone()),
-            Validator::new_with_bls_and_relayer(pk1(), Power::from(1_u32), bls0.clone(), relayer1.clone()),
+            Validator::new_with_bls_and_relayer(
+                pk0(),
+                Power::from(1_u32),
+                bls0.clone(),
+                relayer0.clone(),
+            ),
+            Validator::new_with_bls_and_relayer(
+                pk1(),
+                Power::from(1_u32),
+                bls0.clone(),
+                relayer1.clone(),
+            ),
         ]);
         match validate_unique_validator_set(&set).unwrap_err() {
             PrecompileHalt::Other(msg) => assert!(msg.contains("duplicate validator bls key")),
@@ -848,18 +875,40 @@ mod tests {
 
         // Duplicate relayer address.
         let set = ValidatorSet::without_proposer(vec![
-            Validator::new_with_bls_and_relayer(pk0(), Power::from(1_u32), bls0.clone(), relayer0.clone()),
-            Validator::new_with_bls_and_relayer(pk1(), Power::from(1_u32), bls1.clone(), relayer0.clone()),
+            Validator::new_with_bls_and_relayer(
+                pk0(),
+                Power::from(1_u32),
+                bls0.clone(),
+                relayer0.clone(),
+            ),
+            Validator::new_with_bls_and_relayer(
+                pk1(),
+                Power::from(1_u32),
+                bls1.clone(),
+                relayer0.clone(),
+            ),
         ]);
         match validate_unique_validator_set(&set).unwrap_err() {
-            PrecompileHalt::Other(msg) => assert!(msg.contains("duplicate validator relayer address")),
+            PrecompileHalt::Other(msg) => {
+                assert!(msg.contains("duplicate validator relayer address"))
+            }
             other => panic!("unexpected halt: {other:?}"),
         }
 
         // Unset (all-zero) bridge fields may legitimately repeat across validators.
         let set = ValidatorSet::without_proposer(vec![
-            Validator::new_with_bls_and_relayer(pk0(), Power::from(1_u32), vec![0u8; 48], vec![0u8; 20]),
-            Validator::new_with_bls_and_relayer(pk1(), Power::from(1_u32), vec![0u8; 48], vec![0u8; 20]),
+            Validator::new_with_bls_and_relayer(
+                pk0(),
+                Power::from(1_u32),
+                vec![0u8; 48],
+                vec![0u8; 20],
+            ),
+            Validator::new_with_bls_and_relayer(
+                pk1(),
+                Power::from(1_u32),
+                vec![0u8; 48],
+                vec![0u8; 20],
+            ),
         ]);
         assert!(validate_unique_validator_set(&set).is_ok());
     }
