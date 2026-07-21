@@ -10,7 +10,7 @@ on:
 
 jobs:
   fmt:
-    name: Rustfmt (非阻断，仅提示)
+    name: Rustfmt (non-blocking, informational only)
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
@@ -25,7 +25,7 @@ jobs:
         run: cargo +nightly-2026-05-11 fmt --all -- --check
 
   audit:
-    name: cargo-audit (非阻断，仅提示)
+    name: cargo-audit (non-blocking, informational only)
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
@@ -40,7 +40,7 @@ jobs:
         run: cargo audit
 
   deny:
-    name: cargo-deny (非阻断，仅提示)
+    name: cargo-deny (non-blocking, informational only)
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
@@ -99,7 +99,7 @@ jobs:
         run: cargo +nightly-2026-05-11 udeps --workspace --lib --examples --tests --benches --all-features --locked
 
   clippy:
-    name: clippy (增量门禁，仅 PR 时运行)
+    name: clippy (incremental gate, PR-only)
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     permissions:
@@ -115,9 +115,10 @@ jobs:
           components: clippy
           override: true
       - uses: Swatinem/rust-cache@v2
-      - name: clippy (增量门禁：只对本次 PR 新增/修改的行报错)
-        # 原用 sksat/action-clippy@v0.7.0，在本仓库当前 Rust/cargo 工具链下解析
-        # clippy JSON 输出时崩溃（"missing field version"），换用维护更新的 giraffate/clippy-action
+      - name: "clippy (incremental gate: only errors on lines added/modified in this PR)"
+        # Originally used sksat/action-clippy@v0.7.0, but it crashed while parsing
+        # clippy's JSON output under this repo's current Rust/cargo toolchain ("missing field version"),
+        # so switched to the actively maintained giraffate/clippy-action
         uses: giraffate/clippy-action@v1
         with:
           reporter: github-pr-review
@@ -127,7 +128,7 @@ jobs:
           clippy_flags: --workspace --tests --all-features
 
   unwrap-gate:
-    name: semgrep unwrap-gate (非阻断，仅提示，需在评论中说明理由)
+    name: semgrep unwrap-gate (non-blocking, informational only, justify in comments)
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     continue-on-error: true
@@ -144,8 +145,8 @@ jobs:
       - name: Install semgrep
         run: python3 -m pip install semgrep
       - name: Run semgrep unwrap-gate via reviewdog
-        # reviewdog 没有原生 semgrep 格式解析器（早前假设错了），
-        # semgrep 能直接输出 SARIF，reviewdog 原生支持 -f=sarif，改走这条路
+        # reviewdog has no native semgrep format parser (an earlier assumption was wrong);
+        # semgrep can output SARIF directly and reviewdog natively supports -f=sarif, so use that path instead
         env:
           REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
