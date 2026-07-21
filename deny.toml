@@ -6,11 +6,36 @@ no-default-features = false
 feature-depth = 1
 
 [advisories]
-ignore = []
+# Everything listed here is unfixable from this repo today: the flagged version is
+# pinned by a git dependency (bnb-chain/tendermint-rs-parlia, bnb-chain/greenfield-cometbft-rs,
+# or the pinned bnb-chain/reth rev) and the fix needs a semver-major bump in that upstream.
+# Keep the vulnerability entries in sync with .cargo/audit.toml (cargo-audit CI job);
+# re-check the whole list whenever one of those git deps is bumped.
+ignore = [
+    # --- vulnerabilities (mirrors .cargo/audit.toml) -------------------------------
+    "RUSTSEC-2024-0344", # curve25519-dalek 3.2.0 timing variability; fix 4.1.3, pinned by tendermint-rs-parlia
+    "RUSTSEC-2022-0093", # ed25519-dalek 1.0.1 signing oracle; fix 2.x, pinned by tendermint-rs-parlia
+    "RUSTSEC-2021-0073", # prost-types 0.6.1 Timestamp overflow panic; fix 0.8+, pinned by tendermint-rs-parlia
+    "RUSTSEC-2026-0098", # rustls-webpki 0.101.7 wildcard name-constraint bypass; fix needs reqwest 0.12 in cometbft-rpc
+    "RUSTSEC-2026-0099", # rustls-webpki 0.101.7 URI name-constraint bypass; same chain as above
+    "RUSTSEC-2026-0104", # rustls-webpki 0.101.7 CRL-parsing panic (CRLs unused); same chain as above
+    "RUSTSEC-2026-0118", # hickory-proto 0.25.2 O(n^2) name compression; upstream has no fixed release yet
+    "RUSTSEC-2026-0119", # hickory-proto 0.25.2 NSEC3 unbounded loop; fix 0.26.1, pinned by the reth rev
+    # --- unmaintained (transitive; no drop-in replacement from this repo) ----------
+    "RUSTSEC-2021-0127", # serde_cbor; direct dep + via cometbft-light-client
+    "RUSTSEC-2025-0141", # bincode 1.x; via reth-nippy-jar (reth rev)
+    "RUSTSEC-2024-0388", # derivative; via arkworks (ark-ec)
+    "RUSTSEC-2020-0036", # failure; via ics23 <- tendermint-rs-parlia
+    "RUSTSEC-2024-0436", # paste; via alloy-primitives
+    "RUSTSEC-2026-0173", # proc-macro-error2; via alloy-sol-macro
+    "RUSTSEC-2025-0134", # rustls-pemfile 1.x; via reqwest 0.11 <- cometbft-rpc
+]
 
 [licenses]
-# Permissive licenses are allowed outright; MPL-2.0/MPL-2.0+ is not in the list, so it
-# gets flagged for manual review (affects 5 crates: bitmaps, contracts, fastrlp, imbl, imbl-sized-chunks)
+# Permissive licenses plus MPL-2.0. MPL-2.0 is file-level (weak) copyleft: fine for
+# linking unmodified crates into this binary (affects bitmaps, contracts, imbl,
+# imbl-sized-chunks). If we ever fork/patch one of those crates, the modified files
+# must stay MPL-licensed.
 allow = [
     "MIT",
     "Apache-2.0",
@@ -23,6 +48,7 @@ allow = [
     "Unicode-3.0",
     "0BSD",
     "CDLA-Permissive-2.0",
+    "MPL-2.0",
 ]
 confidence-threshold = 0.8
 
