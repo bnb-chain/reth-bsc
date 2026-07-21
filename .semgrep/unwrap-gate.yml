@@ -2,9 +2,9 @@ rules:
   - id: high-risk-unwrap
     languages: [rust]
     message: >
-      高风险模块中新增了 unwrap() 或 expect() 调用，
-      请直接回复本条评论说明"为什么此处 unwrap 不可能 panic"，
-      code owner 确认后可 Resolve conversation
+      A new unwrap() or expect() call was added in a high-risk module.
+      Please reply directly to this comment explaining "why unwrap cannot panic here";
+      once the code owner confirms, the conversation can be resolved
     severity: WARNING
     patterns:
       - pattern-either:

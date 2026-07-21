@@ -9,8 +9,8 @@ feature-depth = 1
 ignore = []
 
 [licenses]
-# 宽松许可证，直接放行；MPL-2.0/MPL-2.0+ 不在列表里，会被标记出来提醒人工评估
-# （bitmaps、contracts、fastrlp、imbl、imbl-sized-chunks 这 5 个包）
+# Permissive licenses are allowed outright; MPL-2.0/MPL-2.0+ is not in the list, so it
+# gets flagged for manual review (affects 5 crates: bitmaps, contracts, fastrlp, imbl, imbl-sized-chunks)
 allow = [
     "MIT",
     "Apache-2.0",
@@ -27,7 +27,8 @@ allow = [
 confidence-threshold = 0.8
 
 [licenses.private]
-# 忽略仓库自己的包（reth_bsc、bsc-ef-tests），它们没有 license 字段是正常的，不是外部依赖问题
+# Ignore this repo's own crates (reth_bsc, bsc-ef-tests); it's normal for them to lack a license field,
+# not an external-dependency issue
 ignore = true
 
 [bans]
