@@ -1,17 +1,19 @@
 use alloy_primitives::bytes::BytesMut;
 use alloy_rlp::{Decodable, Encodable};
 use bytes::Bytes;
-use futures::Future;
-use futures::{Stream, StreamExt};
+use futures::{Future, Stream, StreamExt};
 use reth_eth_wire::multiplex::ProtocolConnection;
 use reth_network_api::PeerId;
-use std::{collections::HashMap, sync::Arc};
 use std::{
+    collections::HashMap,
     pin::Pin,
+    sync::Arc,
     task::{ready, Context, Poll},
 };
-use tokio::sync::{mpsc::UnboundedReceiver, oneshot};
-use tokio::time::{Duration, Sleep};
+use tokio::{
+    sync::{mpsc::UnboundedReceiver, oneshot},
+    time::{Duration, Sleep},
+};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 /// Handshake timeout, mirroring the Go implementation.
@@ -22,11 +24,13 @@ const PENDING_REQ_TTL: Duration = Duration::from_secs(15);
 const PRUNE_INTERVAL: Duration = Duration::from_secs(5);
 
 use super::protocol::proto::BscProtoMessageId;
-use crate::node::network::blocks_by_range::{
-    build_blocks_by_range_response, BlocksByRangePacket, GetBlocksByRangePacket,
-    MAX_REQUEST_RANGE_BLOCKS_COUNT,
+use crate::node::network::{
+    blocks_by_range::{
+        build_blocks_by_range_response, BlocksByRangePacket, GetBlocksByRangePacket,
+        MAX_REQUEST_RANGE_BLOCKS_COUNT,
+    },
+    votes::{handle_votes_broadcast, BscCapPacket, VotesPacket},
 };
-use crate::node::network::votes::{handle_votes_broadcast, BscCapPacket, VotesPacket};
 
 /// Commands that can be sent to the BSC connection.
 #[allow(dead_code)]

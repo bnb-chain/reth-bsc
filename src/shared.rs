@@ -1,8 +1,14 @@
-use crate::consensus::parlia::SnapshotProvider;
-use crate::node::engine_api::payload::BscPayloadTypes;
-use crate::node::network::block_import::service::{IncomingBlock, IncomingMinedBlock};
-use crate::node::network::BscNetworkPrimitives;
-use crate::node::primitives::BscBlock;
+use crate::{
+    consensus::parlia::SnapshotProvider,
+    node::{
+        engine_api::payload::BscPayloadTypes,
+        network::{
+            block_import::service::{IncomingBlock, IncomingMinedBlock},
+            BscNetworkPrimitives,
+        },
+        primitives::BscBlock,
+    },
+};
 use alloy_consensus::{BlockHeader, Header};
 use alloy_eips::BlockId;
 use alloy_primitives::{Bytes, B256, U256};
@@ -15,19 +21,20 @@ use alloy_rpc_types::{
 use parking_lot::Mutex;
 use reth::api::NodeTypesWithDBAdapter;
 use reth_engine_tree::engine::EngineApiRequest;
+use reth_ethereum_primitives::TransactionSigned;
 use reth_network::NetworkHandle;
 use reth_network_api::PeerId;
-use reth_provider::providers::BlockchainProvider;
 use reth_payload_builder_primitives::Events;
-use reth_ethereum_primitives::TransactionSigned;
-use reth_provider::{BlockNumReader, HeaderProvider};
+use reth_provider::{providers::BlockchainProvider, BlockNumReader, HeaderProvider};
 use schnellru::{ByLength, LruMap};
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::RwLock;
-use std::sync::{Arc, OnceLock};
-use tokio::sync::broadcast;
-use tokio::sync::mpsc::UnboundedSender;
+use std::{
+    collections::VecDeque,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, OnceLock, RwLock,
+    },
+};
+use tokio::sync::{broadcast, mpsc::UnboundedSender};
 
 /// Public type alias for the BSC engine API sender (replaces private reth EngineApiTx).
 pub type BscEngineApiTx = UnboundedSender<
@@ -57,18 +64,16 @@ static SNAPSHOT_PROVIDER: OnceLock<Arc<dyn SnapshotProvider + Send + Sync>> = On
 ///
 /// Two `B256` parameters:
 ///   * `parent_hash`: block hash of the parent — used as the `anchor_hash` for the
-///     `OverlayStateProviderFactory` so the sparse trie can resolve historical trie
-///     nodes via the changeset cache.
-///   * `parent_state_root`: state root of the parent — the sparse trie's starting
-///     anchor for incremental hashing.
+///     `OverlayStateProviderFactory` so the sparse trie can resolve historical trie nodes via the
+///     changeset cache.
+///   * `parent_state_root`: state root of the parent — the sparse trie's starting anchor for
+///     incremental hashing.
 ///
 /// Registered by the engine launch path when
 /// `--mining.use-sparse-trie-state-root` is enabled. Returns `None` if the engine
 /// has not been wired (graceful fallback to legacy `state_root_with_updates`).
 pub type SparseTrieSpawnFn = Arc<
-    dyn Fn(B256, B256) -> Option<reth_engine_tree::tree::multiproof::StateRootHandle>
-        + Send
-        + Sync,
+    dyn Fn(B256, B256) -> Option<reth_engine_tree::tree::multiproof::StateRootHandle> + Send + Sync,
 >;
 
 /// Global sparse-trie state-root spawner. See [`SparseTrieSpawnFn`].
@@ -236,9 +241,7 @@ static GLOBAL_BLOB_STORE: OnceLock<Arc<dyn reth_transaction_pool::blobstore::Blo
     OnceLock::new();
 
 /// Register the node-wide blob store so that block-body serving can read blob sidecars.
-pub fn set_global_blob_store(
-    store: Arc<dyn reth_transaction_pool::blobstore::BlobStore>,
-) {
+pub fn set_global_blob_store(store: Arc<dyn reth_transaction_pool::blobstore::BlobStore>) {
     let _ = GLOBAL_BLOB_STORE.set(store);
 }
 
@@ -287,9 +290,7 @@ pub fn get_snapshot_provider() -> Option<&'static Arc<dyn SnapshotProvider + Sen
 /// an error and are ignored (mirrors the rest of the OnceLock setters in this
 /// module). When the spawner is not registered, BSC miner falls back to the
 /// synchronous `state_root_with_updates` path.
-pub fn set_sparse_trie_spawn_fn(
-    spawner: SparseTrieSpawnFn,
-) -> Result<(), SparseTrieSpawnFn> {
+pub fn set_sparse_trie_spawn_fn(spawner: SparseTrieSpawnFn) -> Result<(), SparseTrieSpawnFn> {
     SPARSE_TRIE_SPAWN_FN.set(spawner)
 }
 
@@ -307,13 +308,12 @@ pub fn spawn_sparse_trie_state_root(
     parent_hash: B256,
     parent_state_root: B256,
 ) -> Option<reth_engine_tree::tree::multiproof::StateRootHandle> {
-    SPARSE_TRIE_SPAWN_FN
-        .get()
-        .and_then(|f| f(parent_hash, parent_state_root))
+    SPARSE_TRIE_SPAWN_FN.get().and_then(|f| f(parent_hash, parent_state_root))
 }
 
 /// Store the header provider globally
-/// Creates functions that directly call HeaderProvider::header() and HeaderProvider::header_by_number()
+/// Creates functions that directly call HeaderProvider::header() and
+/// HeaderProvider::header_by_number()
 pub fn set_header_provider<T>(
     provider: Arc<T>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
@@ -492,7 +492,8 @@ pub fn get_payload_events_tx() -> Option<&'static broadcast::Sender<Events<BscPa
 
 /// Store the fork choice engine globally.
 ///
-/// This stores a `BscForkChoiceEngine` instance to provide global access for fork choice operations.
+/// This stores a `BscForkChoiceEngine` instance to provide global access for fork choice
+/// operations.
 pub fn set_fork_choice_engine<P>(
     engine: crate::node::consensus::BscForkChoiceEngine<P>,
 ) -> Result<(), Box<dyn std::error::Error>>
@@ -890,8 +891,9 @@ pub async fn ipc_send_raw_transaction(tx: TransactionSigned) -> Result<B256, eyr
 /// chain back to the on-disk anchor when constructing the overlay factory,
 /// without which proof workers fail with `BlockHashNotFound` whenever the parent
 /// block hasn't been persisted to MDBX yet.
-static CANONICAL_IN_MEMORY_STATE:
-    OnceLock<reth_chain_state::CanonicalInMemoryState<crate::BscPrimitives>> = OnceLock::new();
+static CANONICAL_IN_MEMORY_STATE: OnceLock<
+    reth_chain_state::CanonicalInMemoryState<crate::BscPrimitives>,
+> = OnceLock::new();
 
 /// Set the canonical in-memory state handle. Idempotent first-write-wins.
 pub fn set_canonical_in_memory_state(
@@ -910,9 +912,7 @@ pub fn get_canonical_in_memory_state(
 static ENGINE_API_TX: OnceLock<BscEngineApiTx> = OnceLock::new();
 
 /// Set global engine api tx if present.
-pub fn set_engine_api_tx(
-    tx: BscEngineApiTx,
-) -> Result<(), BscEngineApiTx> {
+pub fn set_engine_api_tx(tx: BscEngineApiTx) -> Result<(), BscEngineApiTx> {
     ENGINE_API_TX.set(tx)
 }
 

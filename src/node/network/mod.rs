@@ -1,37 +1,39 @@
 #![allow(clippy::owned_cow)]
 use crate::{
-    BscBlock, chainspec::BscChainSpec, node::{
-        BscNode, engine_api::payload::BscPayloadTypes, network::{
-            block_import::{BscBlockImport, handle::ImportHandle},
+    chainspec::BscChainSpec,
+    node::{
+        engine_api::payload::BscPayloadTypes,
+        miner::signer::{is_signer_initialized, sign_system_transaction},
+        network::{
+            block_import::{handle::ImportHandle, BscBlockImport},
             evn_peers::{get_onchain_nodeids_set, peer_id_to_node_id},
-        }, primitives::{BscBlobTransactionSidecar, BscPrimitives}
-    }
+        },
+        primitives::{BscBlobTransactionSidecar, BscPrimitives},
+        BscNode,
+    },
+    BscBlock,
 };
 use alloy_primitives::{Address, U256};
 use alloy_rlp::{Decodable, Encodable};
+use alloy_rpc_types::TransactionRequest as RpcTransactionRequest;
 use handshake::BscHandshake;
 use reth::{
     api::{FullNodeTypes, TxTy},
     builder::{components::NetworkBuilder, BuilderContext},
     transaction_pool::{PoolTransaction, TransactionPool},
 };
+use reth_chainspec::EthChainSpec;
 use reth_discv4::Discv4Config;
 use reth_engine_primitives::ConsensusEngineHandle;
 use reth_eth_wire::{BasicNetworkPrimitives, NewBlock, NewBlockPayload};
-use reth_ethereum_primitives::PooledTransactionVariant;
+use reth_ethereum_primitives::{PooledTransactionVariant, TransactionSigned};
 use reth_network::{NetworkConfig, NetworkHandle, NetworkManager, PeersConfig, SessionsConfig};
 use reth_network_api::PeersInfo;
 use reth_network_peers::NodeRecord;
 use reth_provider::{BlockNumReader, HeaderProvider, StateProviderFactory};
-use reth_ethereum_primitives::TransactionSigned;
 use std::{sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, info, warn};
-use alloy_rpc_types::{
-    TransactionRequest as RpcTransactionRequest,
-};
-use crate::node::miner::signer::{is_signer_initialized, sign_system_transaction};
-use reth_chainspec::EthChainSpec;
 
 pub mod block_import;
 pub(crate) mod blocks_by_range;
@@ -166,10 +168,8 @@ pub struct BscNetworkBuilder {
     engine_handle_rx: Arc<Mutex<Option<oneshot::Receiver<ConsensusEngineHandle<BscPayloadTypes>>>>>,
 }
 
-fn apply_bsc_discv4_overrides<I>(
-    discv4_config: &mut Option<Discv4Config>,
-    boot_nodes: Option<I>,
-) where
+fn apply_bsc_discv4_overrides<I>(discv4_config: &mut Option<Discv4Config>, boot_nodes: Option<I>)
+where
     I: IntoIterator<Item = NodeRecord>,
 {
     let Some(discv4_config) = discv4_config.as_mut() else {
@@ -346,7 +346,8 @@ impl BscNetworkBuilder {
             .unwrap();
         });
 
-        // TODO: update network with the latest canonical head, but has a fork id issue, can fix it later.
+        // TODO: update network with the latest canonical head, but has a fork id issue, can fix it
+        // later.
         let mut network_builder = network_builder
             .boot_nodes(ctx.chain_spec().bootnodes().unwrap_or_default())
             .set_head(ctx.chain_spec().head())
@@ -435,10 +436,8 @@ where
             warn!(target: "reth::cli", "Failed to set global local peer ID - already set");
         } else {
             let node_id = alloy_primitives::keccak256(local_peer_id);
-            let node_id_short = format!(
-                "{:016x}",
-                u64::from_be_bytes(node_id.0[..8].try_into().expect("8 bytes"))
-            );
+            let node_id_short =
+                format!("{:016x}", u64::from_be_bytes(node_id.0[..8].try_into().expect("8 bytes")));
             info!(
                 target: "reth::cli",
                 peer_id = %local_peer_id,
@@ -455,7 +454,6 @@ where
         if crate::node::network::evn::is_evn_enabled() {
             spawn_evn_sync_watcher(ctx, handle.clone());
         }
-
 
         Ok(handle)
     }
@@ -543,16 +541,27 @@ async fn register_nodeids_actions<P: StateProviderFactory>(
     to_add: Vec<[u8; 32]>,
     to_remove: Vec<[u8; 32]>,
 ) -> Result<(), eyre::Error> {
-    let best_block_number = crate::shared::get_best_canonical_block_number().ok_or(eyre::eyre!("Best block number not found"))?;
-    let h = crate::shared::get_canonical_header_by_number(best_block_number).ok_or(eyre::eyre!("Header not found"))?;
+    let best_block_number = crate::shared::get_best_canonical_block_number()
+        .ok_or(eyre::eyre!("Best block number not found"))?;
+    let h = crate::shared::get_canonical_header_by_number(best_block_number)
+        .ok_or(eyre::eyre!("Header not found"))?;
     let state = provider.state_by_block_hash(h.hash_slow())?;
-    let acc = state.basic_account(&validator)?.ok_or(eyre::eyre!("Account not found for validator"))?;
+    let acc =
+        state.basic_account(&validator)?.ok_or(eyre::eyre!("Account not found for validator"))?;
     let mut next_nonce = acc.nonce;
     let chain_id = chain_spec.chain().id();
 
     let onchain_nodeids_set = get_onchain_nodeids_set();
-    let to_add: Vec<[u8; 32]>= to_add.iter().filter(|id| !onchain_nodeids_set.contains(&alloy_primitives::hex::encode(**id))).copied().collect();
-    let to_remove: Vec<[u8; 32]>= to_remove.iter().filter(|id| onchain_nodeids_set.contains(&alloy_primitives::hex::encode(**id))).copied().collect();
+    let to_add: Vec<[u8; 32]> = to_add
+        .iter()
+        .filter(|id| !onchain_nodeids_set.contains(&alloy_primitives::hex::encode(**id)))
+        .copied()
+        .collect();
+    let to_remove: Vec<[u8; 32]> = to_remove
+        .iter()
+        .filter(|id| onchain_nodeids_set.contains(&alloy_primitives::hex::encode(**id)))
+        .copied()
+        .collect();
     debug!(target: "bsc::evn", to_add = ?to_add, to_remove = ?to_remove, onchain_nodeids_set = ?onchain_nodeids_set, "refreshed to_add and to_remove");
     let mut signed_batch: Vec<TransactionSigned> = Vec::new();
     if !to_add.is_empty() {

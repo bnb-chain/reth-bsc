@@ -10,7 +10,6 @@ use jsonrpsee_types::ErrorObjectOwned;
 #[cfg(feature = "bench-test")]
 use reth_node_ethereum::engine::EthPayloadAttributes;
 
-
 pub mod builder;
 pub mod payload;
 pub mod validator;
@@ -22,8 +21,7 @@ mod validator_tests;
 pub struct BscEngineApi {
     /// Handle to the beacon consensus engine
     #[allow(dead_code)]
-    engine_handle:
-        Arc<ConsensusEngineHandle<crate::node::engine_api::payload::BscPayloadTypes>>,
+    engine_handle: Arc<ConsensusEngineHandle<crate::node::engine_api::payload::BscPayloadTypes>>,
 }
 
 impl BscEngineApi {
@@ -57,18 +55,16 @@ impl IntoEngineApiRpcModule for BscEngineApi {
                             ForkchoiceState,
                             Option<EthPayloadAttributes>,
                         ) = params.parse().map_err(|e| {
-                            ErrorObjectOwned::owned(-32602, format!("Parse error: {}", e), None::<()>)
+                            ErrorObjectOwned::owned(
+                                -32602,
+                                format!("Parse error: {}", e),
+                                None::<()>,
+                            )
                         })?;
 
                         let engine = engine_handle.clone();
                         // Call the engine service
-                        match engine
-                            .fork_choice_updated(
-                                forkchoice_state,
-                                payload_attrs,
-                            )
-                            .await
-                        {
+                        match engine.fork_choice_updated(forkchoice_state, payload_attrs).await {
                             Ok(response) => match response.payload_status.status {
                                 PayloadStatusEnum::Valid => Ok(response),
                                 PayloadStatusEnum::Invalid { validation_error } => {
@@ -80,7 +76,10 @@ impl IntoEngineApiRpcModule for BscEngineApi {
                                 }
                                 _ => Err(ErrorObjectOwned::owned(
                                     -32603,
-                                    format!("Engine status error: {}", response.payload_status.status),
+                                    format!(
+                                        "Engine status error: {}",
+                                        response.payload_status.status
+                                    ),
                                     None::<()>,
                                 )),
                             },

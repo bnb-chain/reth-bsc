@@ -1,9 +1,10 @@
-use super::config::{revm_spec_by_timestamp_and_block_number, BscBlockExecutionCtx};
-use super::patch::HertzPatchManager;
-use crate::consensus::parlia::SnapshotProvider;
+use super::{
+    config::{revm_spec_by_timestamp_and_block_number, BscBlockExecutionCtx},
+    patch::HertzPatchManager,
+};
 use crate::{
     consensus::{
-        parlia::{Parlia, Snapshot, VoteAddress},
+        parlia::{Parlia, Snapshot, SnapshotProvider, VoteAddress},
         SYSTEM_ADDRESS,
     },
     evm::{precompiles, transaction::BscTxEnv},
@@ -19,14 +20,16 @@ use crate::{
     },
 };
 use alloy_consensus::{Header, TxReceipt, TxType};
-use alloy_eips::eip2935::{HISTORY_STORAGE_ADDRESS, HISTORY_STORAGE_CODE};
-use alloy_eips::{eip7685::Requests, Encodable2718};
+use alloy_eips::{
+    eip2935::{HISTORY_STORAGE_ADDRESS, HISTORY_STORAGE_CODE},
+    eip7685::Requests,
+    Encodable2718,
+};
 use alloy_evm::{
     block::{ExecutableTx, GasOutput, StateChangeSource, TxResult},
     eth::receipt_builder::ReceiptBuilderCtx,
 };
-use alloy_primitives::keccak256;
-use alloy_primitives::{hex, uint, Address, BlockNumber, Bytes, U256};
+use alloy_primitives::{hex, keccak256, uint, Address, BlockNumber, Bytes, U256};
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
 use reth_ethereum_primitives::TransactionSigned;
 use reth_evm::{
@@ -37,12 +40,11 @@ use reth_evm::{
     Evm, FromRecoveredTx, FromTxWithEncoded, IntoTxEnv, OnStateHook,
 };
 use reth_provider::BlockExecutionResult;
-use revm::Database as _;
 use revm::{
     context::result::{ExecutionResult, Output, ResultAndState, ResultGas, SuccessReason},
     context_interface::block::Block,
     state::{Account as RevmAccount, Bytecode, EvmState},
-    DatabaseCommit,
+    Database as _, DatabaseCommit,
 };
 use std::{collections::HashMap, sync::Arc};
 use tracing::{debug, error, info, trace, warn};
@@ -419,7 +421,8 @@ where
         let block_number = block_env.number().to::<u64>();
         self.consensus_metrics.current_block_height.set(block_number as f64);
 
-        // pre check and prepare some intermediate data for commit parlia snapshot in finish function.
+        // pre check and prepare some intermediate data for commit parlia snapshot in finish
+        // function.
         if self.ctx.is_miner {
             self.prepare_new_block(&block_env)?;
         } else {
@@ -549,10 +552,7 @@ where
         Ok(BscTxResult { inner, blob_gas_used, tx_type, tx: tx_signed, is_system: false })
     }
 
-    fn commit_transaction(
-        &mut self,
-        output: BscTxResult<E::HaltReason>,
-    ) -> GasOutput {
+    fn commit_transaction(&mut self, output: BscTxResult<E::HaltReason>) -> GasOutput {
         if output.is_system {
             return GasOutput::new(0);
         }

@@ -1,34 +1,52 @@
 use alloy_primitives::Bytes;
 use parity_bytes::BytesRef;
 use revm::precompile::{
-    u64_to_address, PrecompileHalt, PrecompileOutput, PrecompileResult, Precompile, PrecompileId,
+    u64_to_address, Precompile, PrecompileHalt, PrecompileId, PrecompileOutput, PrecompileResult,
 };
 use std::borrow::Cow;
 use tendermint::lite::iavl_proof;
 
 /// Iavl proof validation precompile for BSC.
-pub(crate) const IAVL_PROOF_VALIDATION: Precompile =
-    Precompile::new(PrecompileId::Custom(Cow::Borrowed("IAVL_MERKLE_PROOF_VALIDATE")), u64_to_address(101), iavl_proof_validation_run);
+pub(crate) const IAVL_PROOF_VALIDATION: Precompile = Precompile::new(
+    PrecompileId::Custom(Cow::Borrowed("IAVL_MERKLE_PROOF_VALIDATE")),
+    u64_to_address(101),
+    iavl_proof_validation_run,
+);
 
 /// Iavl proof validation precompile for BSC after Nano hardfork.
-pub(crate) const IAVL_PROOF_VALIDATION_NANO: Precompile =
-    Precompile::new(PrecompileId::Custom(Cow::Borrowed("IAVL_MERKLE_PROOF_VALIDATE_NANO")), u64_to_address(101), iavl_proof_validation_run_nano);
+pub(crate) const IAVL_PROOF_VALIDATION_NANO: Precompile = Precompile::new(
+    PrecompileId::Custom(Cow::Borrowed("IAVL_MERKLE_PROOF_VALIDATE_NANO")),
+    u64_to_address(101),
+    iavl_proof_validation_run_nano,
+);
 
 /// Iavl proof validation precompile for BSC after Moran hardfork.
-pub(crate) const IAVL_PROOF_VALIDATION_MORAN: Precompile =
-    Precompile::new(PrecompileId::Custom(Cow::Borrowed("IAVL_MERKLE_PROOF_VALIDATE_MORAN")), u64_to_address(101), iavl_proof_validation_run_moran);
+pub(crate) const IAVL_PROOF_VALIDATION_MORAN: Precompile = Precompile::new(
+    PrecompileId::Custom(Cow::Borrowed("IAVL_MERKLE_PROOF_VALIDATE_MORAN")),
+    u64_to_address(101),
+    iavl_proof_validation_run_moran,
+);
 
 /// Iavl proof validation precompile for BSC after Planck hardfork.
-pub(crate) const IAVL_PROOF_VALIDATION_PLANCK: Precompile =
-    Precompile::new(PrecompileId::Custom(Cow::Borrowed("IAVL_MERKLE_PROOF_VALIDATE_PLANCK")), u64_to_address(101), iavl_proof_validation_run_planck);
+pub(crate) const IAVL_PROOF_VALIDATION_PLANCK: Precompile = Precompile::new(
+    PrecompileId::Custom(Cow::Borrowed("IAVL_MERKLE_PROOF_VALIDATE_PLANCK")),
+    u64_to_address(101),
+    iavl_proof_validation_run_planck,
+);
 
 /// Iavl proof validation precompile for BSC after Plato hardfork.
-pub(crate) const IAVL_PROOF_VALIDATION_PLATO: Precompile =
-    Precompile::new(PrecompileId::Custom(Cow::Borrowed("IAVL_MERKLE_PROOF_VALIDATE_PLATO")), u64_to_address(101), iavl_proof_validation_run_plato);
+pub(crate) const IAVL_PROOF_VALIDATION_PLATO: Precompile = Precompile::new(
+    PrecompileId::Custom(Cow::Borrowed("IAVL_MERKLE_PROOF_VALIDATE_PLATO")),
+    u64_to_address(101),
+    iavl_proof_validation_run_plato,
+);
 
 /// Iavl proof validation precompile disabled from Pasteur (legacy v1 light client deprecated).
-pub(crate) const IAVL_PROOF_VALIDATION_DEPRECATED: Precompile =
-    Precompile::new(PrecompileId::Custom(Cow::Borrowed("IAVL_MERKLE_PROOF_VALIDATE_DEPRECATED")), u64_to_address(101), iavl_proof_validation_run_deprecated);
+pub(crate) const IAVL_PROOF_VALIDATION_DEPRECATED: Precompile = Precompile::new(
+    PrecompileId::Custom(Cow::Borrowed("IAVL_MERKLE_PROOF_VALIDATE_DEPRECATED")),
+    u64_to_address(101),
+    iavl_proof_validation_run_deprecated,
+);
 
 /// Run Iavl proof validation.
 fn iavl_proof_validation_run(input: &[u8], gas_limit: u64, reservoir: u64) -> PrecompileResult {
@@ -36,27 +54,47 @@ fn iavl_proof_validation_run(input: &[u8], gas_limit: u64, reservoir: u64) -> Pr
 }
 
 /// Run Iavl proof validation with Nano hardfork.
-fn iavl_proof_validation_run_nano(_input: &[u8], _gas_limit: u64, reservoir: u64) -> PrecompileResult {
+fn iavl_proof_validation_run_nano(
+    _input: &[u8],
+    _gas_limit: u64,
+    reservoir: u64,
+) -> PrecompileResult {
     Ok(PrecompileOutput::halt(PrecompileHalt::other("suspended"), reservoir))
 }
 
 /// Run the deprecated (Pasteur) Iavl proof validation precompile: rejects all input.
-fn iavl_proof_validation_run_deprecated(_input: &[u8], _gas_limit: u64, reservoir: u64) -> PrecompileResult {
+fn iavl_proof_validation_run_deprecated(
+    _input: &[u8],
+    _gas_limit: u64,
+    reservoir: u64,
+) -> PrecompileResult {
     Ok(PrecompileOutput::halt(PrecompileHalt::other("deprecated"), reservoir))
 }
 
 /// Run Iavl proof validation with Moran hardfork.
-fn iavl_proof_validation_run_moran(input: &[u8], gas_limit: u64, reservoir: u64) -> PrecompileResult {
+fn iavl_proof_validation_run_moran(
+    input: &[u8],
+    gas_limit: u64,
+    reservoir: u64,
+) -> PrecompileResult {
     iavl_proof_validation_run_inner(input, gas_limit, reservoir, true, false, false)
 }
 
 /// Run Iavl proof validation with Planck hardfork.
-fn iavl_proof_validation_run_planck(input: &[u8], gas_limit: u64, reservoir: u64) -> PrecompileResult {
+fn iavl_proof_validation_run_planck(
+    input: &[u8],
+    gas_limit: u64,
+    reservoir: u64,
+) -> PrecompileResult {
     iavl_proof_validation_run_inner(input, gas_limit, reservoir, false, true, false)
 }
 
 /// Run Iavl proof validation with Plato hardfork.
-fn iavl_proof_validation_run_plato(input: &[u8], gas_limit: u64, reservoir: u64) -> PrecompileResult {
+fn iavl_proof_validation_run_plato(
+    input: &[u8],
+    gas_limit: u64,
+    reservoir: u64,
+) -> PrecompileResult {
     iavl_proof_validation_run_inner(input, gas_limit, reservoir, false, false, true)
 }
 

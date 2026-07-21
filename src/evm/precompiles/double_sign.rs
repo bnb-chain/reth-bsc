@@ -5,14 +5,17 @@ use alloy_primitives::{keccak256, BlockNumber, Bytes, ChainId, B256, B512, U256}
 use alloy_rlp::{Decodable, RlpDecodable, RlpEncodable};
 use core::cmp::Ordering;
 use revm::precompile::{
-    secp256k1, u64_to_address, PrecompileHalt, PrecompileOutput, PrecompileResult,
-    Precompile, PrecompileId,
+    secp256k1, u64_to_address, Precompile, PrecompileHalt, PrecompileId, PrecompileOutput,
+    PrecompileResult,
 };
 use std::borrow::Cow;
 
 /// Double sign evidence validation precompile for BSC.
-pub(crate) const DOUBLE_SIGN_EVIDENCE_VALIDATION: Precompile =
-    Precompile::new(PrecompileId::Custom(Cow::Borrowed("VERIFY_DOUBLE_SIGN_EVIDENCE")), u64_to_address(104), double_sign_evidence_validation_run);
+pub(crate) const DOUBLE_SIGN_EVIDENCE_VALIDATION: Precompile = Precompile::new(
+    PrecompileId::Custom(Cow::Borrowed("VERIFY_DOUBLE_SIGN_EVIDENCE")),
+    u64_to_address(104),
+    double_sign_evidence_validation_run,
+);
 
 const EXTRA_SEAL_LENGTH: usize = 65;
 
@@ -74,7 +77,11 @@ pub(crate) struct SealContent {
 /// signer address| evidence height|
 ///
 /// 20 bytes      | 32 bytes       |
-fn double_sign_evidence_validation_run(input: &[u8], gas_limit: u64, reservoir: u64) -> PrecompileResult {
+fn double_sign_evidence_validation_run(
+    input: &[u8],
+    gas_limit: u64,
+    reservoir: u64,
+) -> PrecompileResult {
     const DOUBLE_SIGN_EVIDENCE_VALIDATION_BASE: u64 = 10_000;
 
     if DOUBLE_SIGN_EVIDENCE_VALIDATION_BASE > gas_limit {
@@ -82,7 +89,11 @@ fn double_sign_evidence_validation_run(input: &[u8], gas_limit: u64, reservoir: 
     }
 
     let revert = || {
-        Ok(PrecompileOutput::revert(DOUBLE_SIGN_EVIDENCE_VALIDATION_BASE, Default::default(), reservoir))
+        Ok(PrecompileOutput::revert(
+            DOUBLE_SIGN_EVIDENCE_VALIDATION_BASE,
+            Default::default(),
+            reservoir,
+        ))
     };
 
     let Ok(evidence) = DoubleSignEvidence::decode(&mut input.iter().as_ref()) else {
@@ -95,23 +106,38 @@ fn double_sign_evidence_validation_run(input: &[u8], gas_limit: u64, reservoir: 
 
     // basic check
     if header1.number.to_be_bytes().len() > 32 || header2.number.to_be_bytes().len() > 32 {
-        return Ok(PrecompileOutput::halt(BscPrecompileError::DoubleSignInvalidEvidence.into(), reservoir));
+        return Ok(PrecompileOutput::halt(
+            BscPrecompileError::DoubleSignInvalidEvidence.into(),
+            reservoir,
+        ));
     }
     if header1.number != header2.number {
-        return Ok(PrecompileOutput::halt(BscPrecompileError::DoubleSignInvalidEvidence.into(), reservoir));
+        return Ok(PrecompileOutput::halt(
+            BscPrecompileError::DoubleSignInvalidEvidence.into(),
+            reservoir,
+        ));
     }
     if header1.parent_hash.cmp(&header2.parent_hash) != Ordering::Equal {
-        return Ok(PrecompileOutput::halt(BscPrecompileError::DoubleSignInvalidEvidence.into(), reservoir));
+        return Ok(PrecompileOutput::halt(
+            BscPrecompileError::DoubleSignInvalidEvidence.into(),
+            reservoir,
+        ));
     }
 
     if header1.extra.len() < EXTRA_SEAL_LENGTH || header2.extra.len() < EXTRA_SEAL_LENGTH {
-        return Ok(PrecompileOutput::halt(BscPrecompileError::DoubleSignInvalidEvidence.into(), reservoir));
+        return Ok(PrecompileOutput::halt(
+            BscPrecompileError::DoubleSignInvalidEvidence.into(),
+            reservoir,
+        ));
     }
 
     let sig1 = &header1.extra[header1.extra.len() - EXTRA_SEAL_LENGTH..];
     let sig2 = &header2.extra[header2.extra.len() - EXTRA_SEAL_LENGTH..];
     if sig1.eq(sig2) {
-        return Ok(PrecompileOutput::halt(BscPrecompileError::DoubleSignInvalidEvidence.into(), reservoir));
+        return Ok(PrecompileOutput::halt(
+            BscPrecompileError::DoubleSignInvalidEvidence.into(),
+            reservoir,
+        ));
     }
 
     // check signature
@@ -119,7 +145,10 @@ fn double_sign_evidence_validation_run(input: &[u8], gas_limit: u64, reservoir: 
     let msg_hash2 = seal_hash(&header2, evidence.chain_id);
 
     if msg_hash1.eq(&msg_hash2) {
-        return Ok(PrecompileOutput::halt(BscPrecompileError::DoubleSignInvalidEvidence.into(), reservoir));
+        return Ok(PrecompileOutput::halt(
+            BscPrecompileError::DoubleSignInvalidEvidence.into(),
+            reservoir,
+        ));
     }
 
     let recid1 = sig1[64];
@@ -131,7 +160,10 @@ fn double_sign_evidence_validation_run(input: &[u8], gas_limit: u64, reservoir: 
     let Ok(addr2) = secp256k1::ecrecover(sig2, recid2, &msg_hash2) else { return revert() };
 
     if !addr1.eq(&addr2) {
-        return Ok(PrecompileOutput::halt(BscPrecompileError::DoubleSignInvalidEvidence.into(), reservoir));
+        return Ok(PrecompileOutput::halt(
+            BscPrecompileError::DoubleSignInvalidEvidence.into(),
+            reservoir,
+        ));
     }
 
     let mut res = [0; 52];
@@ -139,7 +171,11 @@ fn double_sign_evidence_validation_run(input: &[u8], gas_limit: u64, reservoir: 
     res[..20].clone_from_slice(signer);
     res[52 - header1.number.to_be_bytes().len()..].clone_from_slice(&header1.number.to_be_bytes());
 
-    Ok(PrecompileOutput::new(DOUBLE_SIGN_EVIDENCE_VALIDATION_BASE, Bytes::copy_from_slice(&res), reservoir))
+    Ok(PrecompileOutput::new(
+        DOUBLE_SIGN_EVIDENCE_VALIDATION_BASE,
+        Bytes::copy_from_slice(&res),
+        reservoir,
+    ))
 }
 
 fn seal_hash(header: &Header, chain_id: ChainId) -> B256 {
@@ -227,7 +263,9 @@ mod tests {
         // Should return DoubleSignInvalidEvidence halt
         let output = result.expect("should not return fatal error");
         assert!(output.is_halt());
-        assert!(matches!(output.halt_reason(), Some(PrecompileHalt::Other(s)) if s == "double sign invalid evidence"));
+        assert!(
+            matches!(output.halt_reason(), Some(PrecompileHalt::Other(s)) if s == "double sign invalid evidence")
+        );
     }
 
     #[test]

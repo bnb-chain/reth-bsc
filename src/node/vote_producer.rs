@@ -1,24 +1,26 @@
 #![warn(clippy::unwrap_used, clippy::expect_used)]
 
-use std::collections::HashSet;
-use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
-    Arc, LazyLock, Mutex,
+use std::{
+    collections::HashSet,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, LazyLock, Mutex,
+    },
 };
 
 use alloy_consensus::{BlockHeader, Header};
 use alloy_primitives::B256;
 
-use crate::chainspec::BscChainSpec;
-use crate::consensus::parlia::constants::K_ANCESTOR_GENERATION_DEPTH;
-use crate::consensus::parlia::util::calculate_millisecond_timestamp;
-use crate::consensus::parlia::{
-    bls_signer, provider::SnapshotProvider, vote::VoteData, votes, VoteAddress,
+use crate::{
+    chainspec::BscChainSpec,
+    consensus::parlia::{
+        bls_signer, constants::K_ANCESTOR_GENERATION_DEPTH, provider::SnapshotProvider,
+        util::calculate_millisecond_timestamp, vote::VoteData, votes, VoteAddress,
+    },
+    hardforks::BscHardforks,
+    metrics::BscVoteMetrics,
+    node::{evm::util::get_cannonical_header_from_cache, vote_journal},
 };
-use crate::hardforks::BscHardforks;
-use crate::metrics::BscVoteMetrics;
-use crate::node::evm::util::get_cannonical_header_from_cache;
-use crate::node::vote_journal;
 
 /// Number of blocks to wait after mining becomes enabled before producing votes.
 /// This mirrors geth's VoteManager warm-up (blocksNumberSinceMining = 40) to avoid

@@ -8,8 +8,10 @@ use crate::{
     },
     BscPrimitives,
 };
-use alloy_evm::block::{BlockExecutor, GasOutput};
-use alloy_evm::eth::receipt_builder::ReceiptBuilder;
+use alloy_evm::{
+    block::{BlockExecutor, GasOutput},
+    eth::receipt_builder::ReceiptBuilder,
+};
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
 use reth_evm::execute::{BlockBuilder, BlockBuilderOutcome, BlockExecutionError, ExecutorTx};
 use reth_primitives_traits::{
@@ -17,8 +19,10 @@ use reth_primitives_traits::{
 };
 use reth_provider::StateProvider;
 use reth_trie_common::updates::TrieUpdates;
-use revm::context::BlockEnv;
-use revm::database::{states::bundle_state::BundleRetention, State};
+use revm::{
+    context::BlockEnv,
+    database::{states::bundle_state::BundleRetention, State},
+};
 
 /// rewrite BasicBlockBuilder, mainly about the finish() trait.
 /// add system txs to sealed block.
@@ -114,7 +118,9 @@ where
     fn execute_transaction_with_commit_condition(
         &mut self,
         tx: impl ExecutorTx<Self::Executor>,
-        f: impl FnOnce(&<Self::Executor as alloy_evm::block::BlockExecutor>::Result) -> alloy_evm::block::CommitChanges,
+        f: impl FnOnce(
+            &<Self::Executor as alloy_evm::block::BlockExecutor>::Result,
+        ) -> alloy_evm::block::CommitChanges,
     ) -> Result<Option<GasOutput>, BlockExecutionError> {
         let (tx_env, recovered) = tx.into_parts();
         if let Some(gas_output) =
@@ -306,7 +312,9 @@ where
                     )));
                 }
             }
-            state.state_root_with_updates(hashed_state.clone()).map_err(BlockExecutionError::other)?
+            state
+                .state_root_with_updates(hashed_state.clone())
+                .map_err(BlockExecutionError::other)?
         };
         let state_root_duration = state_root_start.elapsed();
 

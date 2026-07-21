@@ -15,7 +15,10 @@ use std::num::NonZero;
 use super::vote::{VoteAddress, VoteEnvelope};
 
 /// Maximum number of recent votes to track per validator.
-const MAX_SIZE_OF_RECENT_ENTRY: usize = 512;
+const MAX_SIZE_OF_RECENT_ENTRY: NonZero<usize> = match NonZero::new(512) {
+    Some(v) => v,
+    None => unreachable!(),
+};
 
 /// Scope in blocks for malicious vote slashing eligibility.
 const MALICIOUS_VOTE_SLASH_SCOPE: u64 = 256;
@@ -46,9 +49,10 @@ impl MaliciousVoteMonitor {
         let vote_address = new_vote.vote_address;
 
         // Ensure LRU cache exists for this validator
-        let vote_buffer = self.cur_votes.entry(vote_address).or_insert_with(|| {
-            LruCache::new(NonZero::new(MAX_SIZE_OF_RECENT_ENTRY).unwrap())
-        });
+        let vote_buffer = self
+            .cur_votes
+            .entry(vote_address)
+            .or_insert_with(|| LruCache::new(MAX_SIZE_OF_RECENT_ENTRY));
 
         let source_number = new_vote.data.source_number;
         let target_number = new_vote.data.target_number;
@@ -76,10 +80,10 @@ impl MaliciousVoteMonitor {
                     malicious = true;
                 }
                 // Rule 2: overlapping vote spans
-                else if (block_number < target_number
-                    && existing_vote.data.source_number > source_number)
-                    || (block_number > target_number
-                        && existing_vote.data.source_number < source_number)
+                else if (block_number < target_number &&
+                    existing_vote.data.source_number > source_number) ||
+                    (block_number > target_number &&
+                        existing_vote.data.source_number < source_number)
                 {
                     metrics::counter!("monitor.maliciousVote.violateRule2").increment(1);
                     malicious = true;

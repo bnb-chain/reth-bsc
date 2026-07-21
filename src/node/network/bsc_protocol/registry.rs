@@ -1,13 +1,14 @@
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use std::sync::RwLock;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, RwLock},
+};
 
 use once_cell::sync::Lazy;
 use parking_lot::Mutex as ParkingMutex;
-use tokio::sync::broadcast;
-use tokio::sync::mpsc::UnboundedSender;
-use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
+use tokio::{
+    sync::{broadcast, mpsc::UnboundedSender, oneshot},
+    task::JoinHandle,
+};
 
 use reth_network_api::PeerId;
 
@@ -17,8 +18,10 @@ use crate::node::network::blocks_by_range::{
 };
 use alloy_primitives::B256;
 use reth_network::Peers;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
 use tokio::time::timeout;
 
 /// Per-peer entry in [`REGISTRY`]. Tracks the negotiated `bsc/n` version so
@@ -96,7 +99,6 @@ fn sync_pending_votes_to_peer(peer: PeerId, tx: UnboundedSender<BscCommand>) {
     }
 }
 
-
 /// Returns true if `peer` negotiated bsc/2 — required for `GetBlocksByRange`.
 pub fn is_v2_peer(peer: PeerId) -> bool {
     match REGISTRY.read() {
@@ -108,10 +110,7 @@ pub fn is_v2_peer(peer: PeerId) -> bool {
 /// Snapshot of peers that negotiated bsc/2 (i.e. support `GetBlocksByRange`).
 pub fn list_v2_peers() -> Vec<PeerId> {
     match REGISTRY.read() {
-        Ok(guard) => guard
-            .iter()
-            .filter_map(|(p, e)| (e.version >= 2).then_some(*p))
-            .collect(),
+        Ok(guard) => guard.iter().filter_map(|(p, e)| (e.version >= 2).then_some(*p)).collect(),
         Err(_) => Vec::new(),
     }
 }
@@ -448,7 +447,8 @@ pub fn spawn_evn_refresh_listener() {
                         }
                         tracing::info!(target: "bsc::evn", marked = marked, nodeids = ?nodeids, "Applied on-chain EVN NodeIDs to peers");
 
-                        // Start periodic refresh every 60s to apply on-chain NodeIDs to existing peers
+                        // Start periodic refresh every 60s to apply on-chain NodeIDs to existing
+                        // peers
                         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
                         loop {
                             ticker.tick().await;
@@ -533,8 +533,7 @@ pub async fn request_blocks_by_range_with_failover(
         return Err("no bsc/2 peers available for range request".to_string());
     }
 
-    let mut last: Result<BlocksByRangePacket, String> =
-        Err("uninitialised failover".to_string());
+    let mut last: Result<BlocksByRangePacket, String> = Err("uninitialised failover".to_string());
     for (idx, peer) in peers.iter().enumerate() {
         match request_blocks_by_range(*peer, start_height, start_hash, count, timeout_dur).await {
             Ok(resp) if !resp.blocks.is_empty() => return Ok(resp),
@@ -783,16 +782,14 @@ mod failover_tests {
 
     #[test]
     fn plan_v2_keeps_v2_preferred_at_head() {
-        let plan =
-            plan_v2_failover_peers(pid(1), vec![], vec![pid(1), pid(2), pid(3)], 3);
+        let plan = plan_v2_failover_peers(pid(1), vec![], vec![pid(1), pid(2), pid(3)], 3);
         assert_eq!(plan, vec![pid(1), pid(2), pid(3)]);
     }
 
     #[test]
     fn plan_v2_drops_non_v2_preferred() {
         // preferred (v1) is NOT in the v2 list → must not appear in the plan.
-        let plan =
-            plan_v2_failover_peers(pid(9), vec![], vec![pid(2), pid(3), pid(4)], 3);
+        let plan = plan_v2_failover_peers(pid(9), vec![], vec![pid(2), pid(3), pid(4)], 3);
         assert_eq!(plan, vec![pid(2), pid(3), pid(4)]);
         assert!(!plan.contains(&pid(9)));
     }
@@ -805,8 +802,7 @@ mod failover_tests {
 
     #[test]
     fn plan_v2_respects_max_attempts_on_non_v2_path() {
-        let plan =
-            plan_v2_failover_peers(pid(9), vec![], vec![pid(2), pid(3), pid(4)], 2);
+        let plan = plan_v2_failover_peers(pid(9), vec![], vec![pid(2), pid(3), pid(4)], 2);
         assert_eq!(plan, vec![pid(2), pid(3)]);
     }
 
@@ -818,8 +814,8 @@ mod failover_tests {
         // the rest of the v2 list, regardless of their position in v2_peers.
         let plan = plan_v2_failover_peers(
             pid(1),
-            vec![pid(3)],                            // announcer
-            vec![pid(1), pid(2), pid(3), pid(4)],    // full v2 list
+            vec![pid(3)],                         // announcer
+            vec![pid(1), pid(2), pid(3), pid(4)], // full v2 list
             4,
         );
         // Order: preferred → announcer → remaining v2.
@@ -830,24 +826,16 @@ mod failover_tests {
     fn plan_v2_preferred_takes_precedence_over_announcers() {
         // Even if `preferred` is not the first announcer, when it's in the
         // v2 list it leads.
-        let plan = plan_v2_failover_peers(
-            pid(1),
-            vec![pid(2), pid(3)],
-            vec![pid(1), pid(2), pid(3)],
-            3,
-        );
+        let plan =
+            plan_v2_failover_peers(pid(1), vec![pid(2), pid(3)], vec![pid(1), pid(2), pid(3)], 3);
         assert_eq!(plan, vec![pid(1), pid(2), pid(3)]);
     }
 
     #[test]
     fn plan_v2_dedups_across_preferred_announcers_and_v2() {
         // A peer appearing in all three sources only shows up once.
-        let plan = plan_v2_failover_peers(
-            pid(1),
-            vec![pid(1), pid(2)],
-            vec![pid(1), pid(2), pid(3)],
-            3,
-        );
+        let plan =
+            plan_v2_failover_peers(pid(1), vec![pid(1), pid(2)], vec![pid(1), pid(2), pid(3)], 3);
         assert_eq!(plan, vec![pid(1), pid(2), pid(3)]);
     }
 
@@ -865,15 +853,10 @@ mod failover_tests {
     #[test]
     fn plan_v2_announcers_only_when_preferred_not_v2() {
         // Non-v2 preferred is dropped; announcers (v2) lead the plan.
-        let plan = plan_v2_failover_peers(
-            pid(9),
-            vec![pid(3), pid(4)],
-            vec![pid(2), pid(3), pid(4)],
-            3,
-        );
+        let plan =
+            plan_v2_failover_peers(pid(9), vec![pid(3), pid(4)], vec![pid(2), pid(3), pid(4)], 3);
         assert_eq!(plan, vec![pid(3), pid(4), pid(2)]);
     }
-
 }
 
 #[cfg(test)]
@@ -901,12 +884,7 @@ mod tests {
 
     #[test]
     fn allow_vote_broadcast_when_td_missing() {
-        assert!(should_allow_vote_broadcast(
-            false,
-            Some(10_000u128),
-            None,
-            1000
-        ));
+        assert!(should_allow_vote_broadcast(false, Some(10_000u128), None, 1000));
         assert!(should_allow_vote_broadcast(
             false,
             None,

@@ -2,8 +2,7 @@
 
 use crate::evm::{
     api::{BscContext, BscEvm},
-    blacklist,
-    precompiles,
+    blacklist, precompiles,
 };
 
 use alloy_primitives::{hex, TxKind, U256};
@@ -17,13 +16,15 @@ use revm::{
         transaction::TransactionType,
         Cfg, ContextError, ContextTr, LocalContextTr, Transaction,
     },
-    context_interface::{result::ResultGas, transaction::eip7702::AuthorizationTr, Block, JournalTr},
+    context_interface::{
+        journaled_state::account::JournaledAccountTr, result::ResultGas,
+        transaction::eip7702::AuthorizationTr, Block, JournalTr,
+    },
     handler::{EthFrame, EvmTr, FrameResult, Handler, MainnetHandler},
     inspector::{Inspector, InspectorHandler},
     interpreter::{interpreter::EthInterpreter, Host, InitialAndFloorGas, SuccessOrHalt},
     primitives::hardfork::SpecId,
 };
-use revm::context_interface::journaled_state::account::JournaledAccountTr;
 
 use crate::consensus::SYSTEM_ADDRESS;
 pub struct BscHandler<DB: revm::Database, INSP> {
@@ -65,8 +66,12 @@ impl<DB: Database, INSP> Handler for BscHandler<DB, INSP> {
                 return Err(revm::context_interface::result::InvalidHeader::PrevrandaoNotSet.into());
             }
             // `excess_blob_gas` is required for Cancun
-            if spec.is_enabled_in(SpecId::CANCUN) && ctx.block().blob_excess_gas_and_price().is_none() {
-                return Err(revm::context_interface::result::InvalidHeader::ExcessBlobGasNotSet.into());
+            if spec.is_enabled_in(SpecId::CANCUN) &&
+                ctx.block().blob_excess_gas_and_price().is_none()
+            {
+                return Err(
+                    revm::context_interface::result::InvalidHeader::ExcessBlobGasNotSet.into()
+                );
             }
             Ok(())
         } else {
@@ -79,7 +84,11 @@ impl<DB: Database, INSP> Handler for BscHandler<DB, INSP> {
     // https://github.com/bluealloy/revm/blob/df467931c4b1b8b620ff2cb9f62501c7abc3ea03/crates/handler/src/pre_execution.rs#L186
     // with slight modifications to support BSC specific validation.
     // https://github.com/bnb-chain/bsc/blob/develop/core/state_transition.go#L593
-    fn apply_eip7702_auth_list(&self, evm: &mut Self::Evm, _init_and_floor_gas: &mut InitialAndFloorGas) -> Result<u64, Self::Error> {
+    fn apply_eip7702_auth_list(
+        &self,
+        evm: &mut Self::Evm,
+        _init_and_floor_gas: &mut InitialAndFloorGas,
+    ) -> Result<u64, Self::Error> {
         let ctx = evm.ctx_ref();
         let tx = ctx.tx();
 
@@ -178,11 +187,7 @@ impl<DB: Database, INSP> Handler for BscHandler<DB, INSP> {
                 _ => None,
             };
             let input = tx.base.data.as_ref();
-            let selector = if input.len() >= 4 {
-                Some(hex::encode(&input[..4]))
-            } else {
-                None
-            };
+            let selector = if input.len() >= 4 { Some(hex::encode(&input[..4])) } else { None };
             (
                 ctx.block().number.to::<u64>(),
                 *ctx.cfg().spec(),
@@ -193,15 +198,17 @@ impl<DB: Database, INSP> Handler for BscHandler<DB, INSP> {
             )
         };
 
-        precompiles::push_precompile_trace_context(precompiles::PrecompileTraceContext::from_parts(
-            block_number,
-            spec,
-            is_system_tx,
-            None,
-            to,
-            selector,
-            input_len,
-        ));
+        precompiles::push_precompile_trace_context(
+            precompiles::PrecompileTraceContext::from_parts(
+                block_number,
+                spec,
+                is_system_tx,
+                None,
+                to,
+                selector,
+                input_len,
+            ),
+        );
 
         let res = if is_system_tx {
             Ok(InitialAndFloorGas::new(0, 0))
@@ -279,18 +286,13 @@ impl<DB: Database, INSP> Handler for BscHandler<DB, INSP> {
         let logs = evm.ctx().journal_mut().take_logs();
 
         let result = match SuccessOrHalt::from(instruction_result.result) {
-            SuccessOrHalt::Success(reason) => ExecutionResult::Success {
-                reason,
-                gas: result_gas,
-                logs,
-                output,
-            },
+            SuccessOrHalt::Success(reason) => {
+                ExecutionResult::Success { reason, gas: result_gas, logs, output }
+            }
             SuccessOrHalt::Revert => {
                 ExecutionResult::Revert { gas: result_gas, logs, output: output.into_data() }
             }
-            SuccessOrHalt::Halt(reason) => {
-                ExecutionResult::Halt { reason, gas: result_gas, logs }
-            }
+            SuccessOrHalt::Halt(reason) => ExecutionResult::Halt { reason, gas: result_gas, logs },
             // Only two internal return flags.
             flag @ (SuccessOrHalt::FatalExternalError | SuccessOrHalt::Internal(_)) => {
                 panic!(
@@ -378,13 +380,8 @@ mod tests {
         // Mark as system transaction
         tx.is_system_transaction = true;
 
-        let mut evm = BscEvm::new(
-            env,
-            make_db_with_funded_caller(caller),
-            NoOpInspector,
-            false,
-            false,
-        );
+        let mut evm =
+            BscEvm::new(env, make_db_with_funded_caller(caller), NoOpInspector, false, false);
 
         // Set the transaction directly on the inner context
         evm.inner.ctx.tx = tx;
@@ -433,13 +430,8 @@ mod tests {
         );
         // is_system_transaction defaults to false
 
-        let mut evm = BscEvm::new(
-            env,
-            make_db_with_funded_caller(caller),
-            NoOpInspector,
-            false,
-            false,
-        );
+        let mut evm =
+            BscEvm::new(env, make_db_with_funded_caller(caller), NoOpInspector, false, false);
 
         // Set the transaction directly on the inner context
         evm.inner.ctx.tx = tx;
@@ -457,7 +449,9 @@ mod tests {
         // Verify it's the correct error type
         if let Err(e) = result {
             match e {
-                revm::context::result::EVMError::Transaction(InvalidTransaction::TxGasLimitGreaterThanCap { gas_limit, cap }) => {
+                revm::context::result::EVMError::Transaction(
+                    InvalidTransaction::TxGasLimitGreaterThanCap { gas_limit, cap },
+                ) => {
                     assert_eq!(gas_limit, excessive_gas_limit);
                     assert_eq!(cap, MAX_TX_GAS_LIMIT_OSAKA);
                 }
@@ -497,13 +491,8 @@ mod tests {
                 .expect("tx env should build"),
         );
 
-        let mut evm = BscEvm::new(
-            env,
-            make_db_with_funded_caller(caller),
-            NoOpInspector,
-            false,
-            false,
-        );
+        let mut evm =
+            BscEvm::new(env, make_db_with_funded_caller(caller), NoOpInspector, false, false);
 
         // Set the transaction directly on the inner context
         evm.inner.ctx.tx = tx;
