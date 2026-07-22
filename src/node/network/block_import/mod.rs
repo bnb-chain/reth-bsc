@@ -1,5 +1,4 @@
 #![allow(unused)]
-#![warn(clippy::unwrap_used, clippy::expect_used)]
 use handle::ImportHandle;
 use reth_engine_primitives::EngineTypes;
 use reth_network::import::{BlockImport, BlockImportOutcome, NewBlockEvent};
