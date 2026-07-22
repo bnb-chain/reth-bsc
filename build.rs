@@ -16,10 +16,27 @@ fn main() {
         .and_then(|o| if o.status.success() { String::from_utf8(o.stdout).ok() } else { None })
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| "unknown".to_string());
+    // Emit the BSC release identifier (e.g. `0.1.0-fix`) from the nearest git tag.
+    //
+    // `git describe --tags` resolves the closest ancestor tag, so a binary built
+    // from the `v0.1.0-fix` tag reports `0.1.0-fix` (distinguishing it from
+    // `v0.1.0`), while dev builds report `<tag>-<n>-g<sha>[-dirty]`. Falls back to
+    // the Cargo package version when git metadata is unavailable.
+    let bsc_version = Command::new("git")
+        .args(["describe", "--tags", "--always", "--dirty"])
+        .output()
+        .ok()
+        .and_then(|o| if o.status.success() { String::from_utf8(o.stdout).ok() } else { None })
+        .map(|s| s.trim().trim_start_matches('v').to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+
+    println!("cargo:rustc-env=RETH_BSC_VERSION={bsc_version}");
     println!("cargo:rustc-env=RETH_BSC_GIT_SHA={git_sha_short}");
     println!("cargo:rustc-env=RETH_BSC_GIT_SHA_LONG={git_sha_long}");
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/refs/heads");
+    println!("cargo:rerun-if-changed=.git/refs/tags");
 
     // Define hardforks that contain system contracts (matching hardfork_to_dir_name function)
     let hardforks = vec![
