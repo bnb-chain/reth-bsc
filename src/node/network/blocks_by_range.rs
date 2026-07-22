@@ -4,7 +4,9 @@ use alloy_rpc_types::Withdrawals;
 use bytes::BufMut;
 
 use crate::node::network::bsc_protocol::protocol::proto::BscProtoMessageId;
-use crate::node::primitives::BscBlock;
+use crate::node::primitives::{BscBlock, BscBlobTransactionSidecar};
+use crate::BscBlockBody;
+use reth_ethereum_primitives::{BlockBody, TransactionSigned};
 
 /// Max range allowed in a single request, mirroring geth's constant.
 pub const MAX_REQUEST_RANGE_BLOCKS_COUNT: u64 = 64;
@@ -57,17 +59,142 @@ impl Encodable for BlocksByRangePacket {
 
 impl Decodable for BlocksByRangePacket {
     fn decode(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
-        if buf.is_empty() {
-            return Err(alloy_rlp::Error::InputTooShort);
-        }
-        let msg = buf[0];
-        *buf = &buf[1..];
-        if msg != (BscProtoMessageId::BlocksByRange as u8) {
-            return Err(alloy_rlp::Error::Custom("Invalid message ID for BlocksByRangePacket"));
-        }
-        let inner = BlocksByRangePacketInner::decode(buf)?;
-        Ok(inner.into())
+        decode_blocks_by_range(buf).map_err(|e| e.error)
     }
+}
+
+/// Failure from [`decode_blocks_by_range`], carrying the `request_id` when it
+/// was readable before the failure point. The id is the first field of the
+/// packet, so it survives almost any malformation of the block payload —
+/// letting the stream fail the matching pending request immediately instead
+/// of letting it burn the full fetch timeout.
+#[derive(Debug)]
+pub struct BlocksByRangeDecodeError {
+    pub request_id: Option<u64>,
+    pub error: alloy_rlp::Error,
+}
+
+/// Decode a BlocksByRange frame (msg-id byte + packet). Same semantics as
+/// [`BlocksByRangePacket`]'s [`Decodable`] impl, but errors keep the
+/// already-decoded `request_id` (see [`BlocksByRangeDecodeError`]).
+pub fn decode_blocks_by_range(
+    buf: &mut &[u8],
+) -> Result<BlocksByRangePacket, BlocksByRangeDecodeError> {
+    let no_id = |error| BlocksByRangeDecodeError { request_id: None, error };
+
+    if buf.is_empty() {
+        return Err(no_id(alloy_rlp::Error::InputTooShort));
+    }
+    let msg = buf[0];
+    *buf = &buf[1..];
+    if msg != (BscProtoMessageId::BlocksByRange as u8) {
+        return Err(no_id(alloy_rlp::Error::Custom("Invalid message ID for BlocksByRangePacket")));
+    }
+    let head = alloy_rlp::Header::decode(buf).map_err(no_id)?;
+    if !head.list {
+        return Err(no_id(alloy_rlp::Error::UnexpectedString));
+    }
+    if buf.len() < head.payload_length {
+        return Err(no_id(alloy_rlp::Error::InputTooShort));
+    }
+    let started = buf.len();
+
+    let request_id = u64::decode(buf).map_err(no_id)?;
+    let with_id = |error| BlocksByRangeDecodeError { request_id: Some(request_id), error };
+
+    let blocks_head = alloy_rlp::Header::decode(buf).map_err(with_id)?;
+    if !blocks_head.list {
+        return Err(with_id(alloy_rlp::Error::UnexpectedString));
+    }
+    let blocks_started = buf.len();
+    let mut blocks = Vec::new();
+    while blocks_started - buf.len() < blocks_head.payload_length {
+        blocks.push(decode_wire_block_data(buf).map_err(with_id)?);
+    }
+    if blocks_started - buf.len() != blocks_head.payload_length {
+        return Err(with_id(alloy_rlp::Error::ListLengthMismatch {
+            expected: blocks_head.payload_length,
+            got: blocks_started - buf.len(),
+        }));
+    }
+
+    // Packet-level tolerance is pure future-proofing: BAL-era geth only
+    // extended the per-block encoding (see `decode_wire_block_data`), not the
+    // packet itself, so this skip is a no-op against every known sender.
+    skip_unknown_trailing(buf, head.payload_length, started, "BlocksByRangePacket")
+        .map_err(with_id)?;
+    Ok(BlocksByRangePacket { request_id, blocks })
+}
+
+/// Decode one wire `BlockData`
+/// (`[header, txs, ommers, withdrawals?, sidecars?, <unknown trailing>*]`).
+///
+/// Known fields are decoded strictly; unknown trailing list elements are
+/// skipped instead of failing the whole packet. geth-bsc releases between
+/// bnb-chain/bsc#3374 (2025-09-30) and #3690 (2026-05-19) append a BEP-592
+/// block access list here, which a strict 5-field decode rejects with
+/// `unexpected list length` — starving fork recovery on any node whose only
+/// live bsc/2 peers run those releases (issue #374). Tolerating trailing
+/// data is confined to this wire path; `BscBlock`'s own RLP stays strict.
+fn decode_wire_block_data(buf: &mut &[u8]) -> alloy_rlp::Result<BscBlock> {
+    let head = alloy_rlp::Header::decode(buf)?;
+    if !head.list {
+        return Err(alloy_rlp::Error::UnexpectedString);
+    }
+    if buf.len() < head.payload_length {
+        return Err(alloy_rlp::Error::InputTooShort);
+    }
+    let started = buf.len();
+
+    let header = alloy_consensus::Header::decode(buf)?;
+    let transactions = Vec::<TransactionSigned>::decode(buf)?;
+    let ommers = Vec::<alloy_consensus::Header>::decode(buf)?;
+    let mut withdrawals = None;
+    let mut sidecars = None;
+    if started - buf.len() < head.payload_length {
+        withdrawals = Some(Withdrawals::decode(buf)?);
+    }
+    if started - buf.len() < head.payload_length {
+        sidecars = Some(Vec::<BscBlobTransactionSidecar>::decode(buf)?);
+    }
+
+    // BAL-era BlockData (geth v1.6.2–v1.7.5) is handled HERE: those releases
+    // append a 6th element — the BEP-592 block access list — after
+    // `sidecars`. It reaches this point as unconsumed trailing bytes of the
+    // block's list and is skipped, so the five known fields above decode the
+    // block exactly as if the BAL were absent. Any future trailing extension
+    // takes the same path.
+    skip_unknown_trailing(buf, head.payload_length, started, "BlockData")?;
+    Ok(BscBlock {
+        header,
+        body: BscBlockBody { inner: BlockBody { transactions, ommers, withdrawals }, sidecars },
+    })
+}
+
+/// Advance `buf` past any bytes left in the enclosing list after the known
+/// fields were decoded. Errors only if the fields overran the declared
+/// payload (a genuinely malformed message).
+fn skip_unknown_trailing(
+    buf: &mut &[u8],
+    payload_length: usize,
+    started: usize,
+    what: &'static str,
+) -> alloy_rlp::Result<()> {
+    let consumed = started - buf.len();
+    if consumed > payload_length {
+        return Err(alloy_rlp::Error::ListLengthMismatch { expected: payload_length, got: consumed });
+    }
+    let extra = payload_length - consumed;
+    if extra > 0 {
+        tracing::trace!(
+            target: "bsc_protocol",
+            what,
+            extra_bytes = extra,
+            "ignoring unknown trailing wire fields"
+        );
+        *buf = &buf[extra..];
+    }
+    Ok(())
 }
 
 /// Pure variant of [`build_blocks_by_range_response`] parameterised by a block
@@ -166,7 +293,12 @@ impl From<GetBlocksByRangePacketInner> for GetBlocksByRangePacket {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, RlpEncodable, RlpDecodable)]
+/// Encode-only shape of the response packet. Decoding deliberately does NOT
+/// go through a derived `RlpDecodable` here — the derive's strict
+/// consumed-equals-declared check is exactly what rejected BAL-era peers
+/// (issue #374); the tolerant [`decode_blocks_by_range`] is the only decode
+/// path.
+#[derive(Debug, Clone, PartialEq, Eq, RlpEncodable)]
 struct BlocksByRangePacketInner {
     request_id: u64,
     blocks: Vec<BscBlock>,
@@ -189,12 +321,6 @@ impl From<&BlocksByRangePacket> for BlocksByRangePacketInner {
             })
             .collect();
         Self { request_id: v.request_id, blocks }
-    }
-}
-
-impl From<BlocksByRangePacketInner> for BlocksByRangePacket {
-    fn from(v: BlocksByRangePacketInner) -> Self {
-        Self { request_id: v.request_id, blocks: v.blocks }
     }
 }
 
@@ -483,5 +609,232 @@ mod tests {
             resp.blocks.is_empty(),
             "no cache entry + no FullBlockProvider installed must yield empty response"
         );
+    }
+
+    // ---- BEP-592 BAL-era interop (issue #374) ----
+    //
+    // geth-bsc between bnb-chain/bsc#3374 (2025-09-30) and #3690 (2026-05-19)
+    // encoded `BlockData` with a 6th trailing element:
+    //   [header, txs, uncles, withdrawals, sidecars, BAL]
+    // where BAL is `BlockAccessListEncode { version, number, hash, sign_data,
+    // accounts }`. `NewBlockData` attached it unconditionally (no bsc/3
+    // gating), so bsc/2 peers receive it too whenever the serving geth holds
+    // a BAL for the block.
+
+    #[derive(Debug, RlpEncodable)]
+    struct BalStorageItem {
+        tx_index: u32,
+        dirty: bool,
+        key: B256,
+    }
+
+    #[derive(Debug, RlpEncodable)]
+    struct BalAccount {
+        tx_index: u32,
+        address: alloy_primitives::Address,
+        storage_items: Vec<BalStorageItem>,
+    }
+
+    /// Mirrors go-bsc `types.BlockAccessListEncode` (BEP-592 era).
+    #[derive(Debug, RlpEncodable)]
+    struct BalEncode {
+        version: u32,
+        number: u64,
+        hash: B256,
+        sign_data: alloy_primitives::Bytes,
+        accounts: Vec<BalAccount>,
+    }
+
+    /// Mirrors go-bsc BAL-era `bsc.BlockData` (6 elements). Go's
+    /// `rlp:"optional"` semantics force the earlier optionals (withdrawals,
+    /// sidecars) to be present (as empty lists) whenever BAL is attached.
+    #[derive(Debug, RlpEncodable)]
+    struct BalEraBlockData {
+        header: Header,
+        transactions: Vec<TransactionSigned>,
+        ommers: Vec<Header>,
+        withdrawals: Withdrawals,
+        sidecars: Vec<BscBlobTransactionSidecar>,
+        bal: BalEncode,
+    }
+
+    #[derive(Debug, RlpEncodable)]
+    struct BalEraPacketInner {
+        request_id: u64,
+        blocks: Vec<BalEraBlockData>,
+    }
+
+    fn dummy_bal(number: u64) -> BalEncode {
+        BalEncode {
+            version: 1,
+            number,
+            hash: B256::repeat_byte(0xbb),
+            sign_data: alloy_primitives::Bytes::from(vec![0u8; 65]),
+            accounts: vec![BalAccount {
+                tx_index: 0,
+                address: alloy_primitives::Address::repeat_byte(0xaa),
+                storage_items: vec![
+                    BalStorageItem { tx_index: 0, dirty: true, key: B256::repeat_byte(0x01) },
+                    BalStorageItem { tx_index: 0, dirty: false, key: B256::repeat_byte(0x02) },
+                ],
+            }],
+        }
+    }
+
+    #[test]
+    fn blocks_by_range_ignores_bal_era_blockdata_trailing_field() {
+        // Regression for issue #374: before the tolerant wire decode this
+        // exact packet failed with `unexpected list length (got …, expected …)`
+        // and starved fork recovery. It must now decode, with the BAL ignored.
+        let packet = BalEraPacketInner {
+            request_id: 374,
+            blocks: vec![BalEraBlockData {
+                header: Header::default(),
+                transactions: Vec::new(),
+                ommers: Vec::new(),
+                withdrawals: Withdrawals::default(),
+                sidecars: Vec::new(),
+                bal: dummy_bal(1),
+            }],
+        };
+        let mut bytes = BytesMut::new();
+        bytes.put_u8(BscProtoMessageId::BlocksByRange as u8);
+        packet.encode(&mut bytes);
+
+        let mut slice = bytes.as_ref();
+        let decoded = BlocksByRangePacket::decode(&mut slice)
+            .expect("BAL-era 6-element BlockData must decode with the BAL ignored");
+        assert_eq!(decoded.request_id, 374);
+        assert_eq!(decoded.blocks.len(), 1);
+        assert_eq!(
+            decoded.blocks[0].header.hash_slow(),
+            Header::default().hash_slow(),
+            "header must survive the tolerant decode intact"
+        );
+        assert_eq!(decoded.blocks[0].body.inner.withdrawals, Some(Withdrawals::default()));
+        assert_eq!(decoded.blocks[0].body.sidecars, Some(Vec::new()));
+    }
+
+    #[test]
+    fn blocks_by_range_ignores_packet_level_trailing_fields() {
+        // Same tolerance one level up: unknown elements after `blocks` in the
+        // packet list must not fail the decode either.
+        #[derive(Debug, RlpEncodable)]
+        struct PacketWithTrailing {
+            request_id: u64,
+            blocks: Vec<BalEraBlockData>,
+            future_field: alloy_primitives::Bytes,
+        }
+        let packet = PacketWithTrailing {
+            request_id: 99,
+            blocks: vec![BalEraBlockData {
+                header: Header::default(),
+                transactions: Vec::new(),
+                ommers: Vec::new(),
+                withdrawals: Withdrawals::default(),
+                sidecars: Vec::new(),
+                bal: dummy_bal(2),
+            }],
+            future_field: alloy_primitives::Bytes::from(vec![0x42u8; 33]),
+        };
+        let mut bytes = BytesMut::new();
+        bytes.put_u8(BscProtoMessageId::BlocksByRange as u8);
+        packet.encode(&mut bytes);
+
+        let mut slice = bytes.as_ref();
+        let decoded = BlocksByRangePacket::decode(&mut slice)
+            .expect("packet-level trailing fields must be ignored");
+        assert_eq!(decoded.request_id, 99);
+        assert_eq!(decoded.blocks.len(), 1);
+    }
+
+    #[test]
+    fn blocks_by_range_still_rejects_truncated_packet() {
+        // Tolerance must not become acceptance of garbage: a packet whose
+        // fields overrun the declared list payload still fails.
+        let packet = BalEraPacketInner {
+            request_id: 7,
+            blocks: vec![BalEraBlockData {
+                header: Header::default(),
+                transactions: Vec::new(),
+                ommers: Vec::new(),
+                withdrawals: Withdrawals::default(),
+                sidecars: Vec::new(),
+                bal: dummy_bal(3),
+            }],
+        };
+        let mut bytes = BytesMut::new();
+        bytes.put_u8(BscProtoMessageId::BlocksByRange as u8);
+        packet.encode(&mut bytes);
+        let truncated = &bytes[..bytes.len() - 10];
+        let mut slice = truncated;
+        BlocksByRangePacket::decode(&mut slice)
+            .expect_err("truncated packet must still fail to decode");
+    }
+
+    #[test]
+    fn decode_error_carries_request_id_for_fail_fast() {
+        // A frame whose body is garbage after the request id fails to decode,
+        // but the error still yields the id — so the stream can fail the
+        // pending waiter immediately instead of waiting out the fetch timeout.
+        #[derive(Debug, RlpEncodable)]
+        struct GarbagePacket {
+            request_id: u64,
+            junk: alloy_primitives::Bytes,
+        }
+        let mut bytes = BytesMut::new();
+        bytes.put_u8(BscProtoMessageId::BlocksByRange as u8);
+        GarbagePacket { request_id: 4242, junk: alloy_primitives::Bytes::from(vec![7u8; 16]) }
+            .encode(&mut bytes);
+        let err = decode_blocks_by_range(&mut bytes.as_ref())
+            .expect_err("garbage block payload must fail to decode");
+        assert_eq!(err.request_id, Some(4242));
+
+        // Failures before the request id is reachable carry no id.
+        let err = decode_blocks_by_range(&mut &[0xffu8, 0xc0][..])
+            .expect_err("wrong message id must fail");
+        assert_eq!(err.request_id, None);
+        let err = decode_blocks_by_range(&mut &[][..]).expect_err("empty frame must fail");
+        assert_eq!(err.request_id, None);
+    }
+
+    #[test]
+    fn blocks_by_range_accepts_five_element_blockdata_control() {
+        // Control: identical shape minus the BAL element (what post-#3690 geth
+        // sends, withdrawals/sidecars present-but-empty) decodes fine, proving
+        // the rejection above is caused by the trailing BAL specifically.
+        #[derive(Debug, RlpEncodable)]
+        struct FiveElementBlockData {
+            header: Header,
+            transactions: Vec<TransactionSigned>,
+            ommers: Vec<Header>,
+            withdrawals: Withdrawals,
+            sidecars: Vec<BscBlobTransactionSidecar>,
+        }
+        #[derive(Debug, RlpEncodable)]
+        struct FiveElementPacketInner {
+            request_id: u64,
+            blocks: Vec<FiveElementBlockData>,
+        }
+
+        let packet = FiveElementPacketInner {
+            request_id: 375,
+            blocks: vec![FiveElementBlockData {
+                header: Header::default(),
+                transactions: Vec::new(),
+                ommers: Vec::new(),
+                withdrawals: Withdrawals::default(),
+                sidecars: Vec::new(),
+            }],
+        };
+        let mut bytes = BytesMut::new();
+        bytes.put_u8(BscProtoMessageId::BlocksByRange as u8);
+        packet.encode(&mut bytes);
+
+        let mut slice = bytes.as_ref();
+        let decoded = BlocksByRangePacket::decode(&mut slice)
+            .expect("5-element BlockData must decode");
+        assert_eq!(decoded.request_id, 375);
+        assert_eq!(decoded.blocks.len(), 1);
     }
 }
