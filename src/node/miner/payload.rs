@@ -378,7 +378,7 @@ pub struct BscBuildArguments<Attributes> {
     /// single-consumer channels) and `BscBuildArguments` derives `Clone`. First retry
     /// takes the handle; subsequent retries see `None` and fall back to the legacy
     /// synchronous state-root path (still correct, just slower for that retry).
-    pub trie_handle: Arc<Mutex<Option<reth_engine_tree::tree::multiproof::StateRootHandle>>>,
+    pub trie_handle: Arc<Mutex<Option<reth_engine_tree::tree::StateRootHandle>>>,
     /// Absolute wall-clock deadline (epoch ms) for bounding the sparse-trie
     /// `state_root()` wait in `finish`; threaded into the build ctx. Set from
     /// `MiningContext::end_mining_timestamp_ms` minus [`STATE_ROOT_WAIT_MARGIN_MS`].
@@ -473,7 +473,7 @@ where
         // so ~half of in-turn blocks paid the full sync root cost. A fresh handle per attempt
         // is cheap now that R1 shares the engine's proof pools. `None` keeps the sync path
         // (sparse-trie disabled or no spawner registered).
-        let trie_handle: Arc<Mutex<Option<reth_engine_tree::tree::multiproof::StateRootHandle>>> = {
+        let trie_handle: Arc<Mutex<Option<reth_engine_tree::tree::StateRootHandle>>> = {
             let use_sparse_trie = crate::node::miner::config::get_global_mining_config()
                 .is_some_and(|c| c.use_sparse_trie_state_root);
             Arc::new(Mutex::new(if use_sparse_trie {

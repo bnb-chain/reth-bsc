@@ -66,7 +66,7 @@ static SNAPSHOT_PROVIDER: OnceLock<Arc<dyn SnapshotProvider + Send + Sync>> = On
 /// `--mining.use-sparse-trie-state-root` is enabled. Returns `None` if the engine
 /// has not been wired (graceful fallback to legacy `state_root_with_updates`).
 pub type SparseTrieSpawnFn = Arc<
-    dyn Fn(B256, B256) -> Option<reth_engine_tree::tree::multiproof::StateRootHandle>
+    dyn Fn(B256, B256) -> Option<reth_engine_tree::tree::StateRootHandle>
         + Send
         + Sync,
 >;
@@ -306,7 +306,7 @@ pub fn set_sparse_trie_spawn_fn(
 pub fn spawn_sparse_trie_state_root(
     parent_hash: B256,
     parent_state_root: B256,
-) -> Option<reth_engine_tree::tree::multiproof::StateRootHandle> {
+) -> Option<reth_engine_tree::tree::StateRootHandle> {
     SPARSE_TRIE_SPAWN_FN
         .get()
         .and_then(|f| f(parent_hash, parent_state_root))

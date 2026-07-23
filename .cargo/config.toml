@@ -1,0 +1,3 @@
+# Local-only: build against the working reth checkout instead of fetching the
+# pushed git branch. Not committed (see .git/info/exclude).
+paths = ["/Users/chee/Documents/repo/reth"]
