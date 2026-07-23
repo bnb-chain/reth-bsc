@@ -32,7 +32,6 @@ use reth_payload_primitives::{PayloadAttributesBuilder, PayloadTypes};
 use reth_ethereum_primitives::BlockBody;
 use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex};
-use tracing::trace;
 
 pub mod consensus;
 pub mod engine;

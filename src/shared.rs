@@ -13,11 +13,9 @@ use alloy_rpc_types::{
     TransactionRequest as RpcTransactionRequest,
 };
 use parking_lot::Mutex;
-use reth::api::NodeTypesWithDBAdapter;
 use reth_engine_tree::engine::EngineApiRequest;
 use reth_network::NetworkHandle;
 use reth_network_api::PeerId;
-use reth_provider::providers::BlockchainProvider;
 use reth_payload_builder_primitives::Events;
 use reth_ethereum_primitives::TransactionSigned;
 use reth_provider::{BlockNumReader, HeaderProvider};

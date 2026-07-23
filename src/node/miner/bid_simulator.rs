@@ -870,7 +870,6 @@ where
                 if let Some(sidecar) = self.bid.blob_sidecars.get(&tx_hash) {
                     // Insert blob sidecar into pool's blob store
                     use alloy_eips::eip7594::BlobTransactionSidecarVariant;
-                    use reth::transaction_pool::{BlobStore, TransactionPool};
                     if let Err(e) = self.pool.blob_store().insert(
                         tx_hash,
                         BlobTransactionSidecarVariant::Eip4844(sidecar.clone()),
