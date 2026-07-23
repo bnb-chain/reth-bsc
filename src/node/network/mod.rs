@@ -192,6 +192,7 @@ fn apply_bsc_discv4_overrides<I>(
 fn apply_bsc_peer_stability_overrides(
     peers_config: &mut PeersConfig,
     sessions_config: &mut SessionsConfig,
+    user_max_outbound: Option<usize>,
 ) {
     // BANNED_REPUTATION = -51200. Weights below picked so a single event
     // does not cross it: ~4 bad_protocol, ~13 failed_to_connect, or ~50
@@ -207,8 +208,12 @@ fn apply_bsc_peer_stability_overrides(
     sessions_config.protocol_breach_request_timeout = Duration::from_secs(600);
 
     // Tentative: widen outbound pipeline against BSC mainnet's ~5-10% dial success rate.
+    // The raised outbound cap is a default only; an explicit --max-outbound-peers or
+    // --max-peers (already baked into peers_config by the CLI) wins.
     peers_config.connection_info.max_concurrent_outbound_dials = 64;
-    peers_config.connection_info.max_outbound = 256;
+    if user_max_outbound.is_none() {
+        peers_config.connection_info.max_outbound = 256;
+    }
 
     // Tentative: 30s covers cross-region bootnode handshakes that clip at the 20s default.
     sessions_config.pending_session_timeout = Duration::from_secs(30);
@@ -378,6 +383,7 @@ impl BscNetworkBuilder {
         apply_bsc_peer_stability_overrides(
             &mut network_config.peers_config,
             &mut network_config.sessions_config,
+            ctx.config().network.resolved_max_outbound_peers(),
         );
         network_config.status.forkid = network_config.fork_filter.current();
 
@@ -634,8 +640,9 @@ async fn register_nodeids_actions<P: StateProviderFactory>(
 
 #[cfg(test)]
 mod tests {
-    use super::apply_bsc_discv4_overrides;
+    use super::{apply_bsc_discv4_overrides, apply_bsc_peer_stability_overrides};
     use reth_discv4::{Discv4Config, NatResolver};
+    use reth_network::{PeersConfig, SessionsConfig};
     use reth_network_peers::NodeRecord;
     use std::{
         net::{IpAddr, Ipv4Addr},
@@ -655,5 +662,29 @@ mod tests {
         let discv4 = discv4.expect("discv4 config should remain enabled");
         assert_eq!(discv4.external_ip_resolver, Some(NatResolver::ExternalIp(external_ip)));
         assert_eq!(discv4.lookup_interval, Duration::from_millis(500));
+    }
+
+    #[test]
+    fn peer_stability_overrides_raise_outbound_by_default() {
+        let mut peers = PeersConfig::default();
+        let mut sessions = SessionsConfig::default();
+
+        apply_bsc_peer_stability_overrides(&mut peers, &mut sessions, None);
+
+        assert_eq!(peers.connection_info.max_outbound, 256);
+        assert_eq!(peers.connection_info.max_concurrent_outbound_dials, 64);
+    }
+
+    #[test]
+    fn peer_stability_overrides_respect_user_max_outbound() {
+        // Mirror the CLI flow: the user's --max-outbound-peers is already applied
+        // to the config before the BSC overrides run.
+        let mut peers = PeersConfig::default().with_max_outbound(50);
+        let mut sessions = SessionsConfig::default();
+
+        apply_bsc_peer_stability_overrides(&mut peers, &mut sessions, Some(50));
+
+        assert_eq!(peers.connection_info.max_outbound, 50);
+        assert_eq!(peers.connection_info.max_concurrent_outbound_dials, 64);
     }
 }
