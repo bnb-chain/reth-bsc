@@ -1055,18 +1055,18 @@ mod tests {
         // EIP-7685 commitment, so it must be accepted without content validation.
         let tagged = b256!("0000000000000000000000016c98eb21139f6e12db5b78a4aed4d8eba147fb7b");
         assert!(consensus
-            .validate_block_post_execution(&block_with(Some(tagged)), &result, None)
+            .validate_block_post_execution(&block_with(Some(tagged)), &result, None, None)
             .is_ok());
 
         // Locally built blocks keep the empty requests hash, sha256("").
         let empty = b256!("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
         assert!(consensus
-            .validate_block_post_execution(&block_with(Some(empty)), &result, None)
+            .validate_block_post_execution(&block_with(Some(empty)), &result, None, None)
             .is_ok());
 
         // The field itself is still mandatory after Prague.
         assert!(matches!(
-            consensus.validate_block_post_execution(&block_with(None), &result, None),
+            consensus.validate_block_post_execution(&block_with(None), &result, None, None),
             Err(ConsensusError::RequestsHashMissing)
         ));
     }
@@ -1473,23 +1473,22 @@ where
 
     /// Gets the total difficulty for a specific header.
     ///
-    /// Queries the TD from the provider (the `header_td_by_number` reth hook, which is
-    /// in-memory/overlay aware) and caches it for future use.
+    /// Queries the TD from the provider via the hash-keyed `header_td` reth hook and caches it
+    /// for future use.
     ///
     /// NOTE: v2.4.1 migration — the previous `engine.query_td(number, hash)` engine round-trip
-    /// was replaced by a provider lookup keyed on block number. For competing non-canonical
-    /// blocks at the same height this resolves the canonical TD; reorg fork-choice behavior must
-    /// be validated on testnet.
+    /// was replaced by the hash-keyed provider lookup `HeaderProvider::header_td`, preserving the
+    /// hash-aware semantics needed for reorg fork-choice.
     async fn header_td(
         &self,
         _engine: &ConsensusEngineHandle<BscPayloadTypes>,
-        number: u64,
+        _number: u64,
         hash: B256,
     ) -> Result<Option<alloy_primitives::U256>, ParliaConsensusErr> {
         if let Some(td) = self.header_td_cache.write().get(&hash) {
             return Ok(*td);
         }
-        let td = self.provider.header_td_by_number(number).map_err(ParliaConsensusErr::internal)?;
+        let td = self.provider.header_td(&hash).map_err(ParliaConsensusErr::internal)?;
         self.header_td_cache.write().insert(hash, td);
         Ok(td)
     }

@@ -89,7 +89,7 @@ mod tests {
         let block = create_test_block(1, B256::random());
         let expected_hash = block.header.hash_slow();
         let sealed_block = block.seal_unchecked(expected_hash);
-        let execution_data = BscPayloadTypes::block_to_payload(sealed_block);
+        let execution_data = BscPayloadTypes::block_to_payload(sealed_block, None);
 
         assert_eq!(execution_data.block_hash(), expected_hash);
     }
