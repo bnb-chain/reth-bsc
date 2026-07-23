@@ -2,10 +2,7 @@ use super::config::{revm_spec_by_timestamp_and_block_number, BscBlockExecutionCt
 use super::patch::HertzPatchManager;
 use crate::consensus::parlia::SnapshotProvider;
 use crate::{
-    consensus::{
-        parlia::{Parlia, Snapshot, VoteAddress},
-        SYSTEM_ADDRESS,
-    },
+    consensus::parlia::{Parlia, Snapshot, VoteAddress},
     evm::{precompiles, transaction::BscTxEnv},
     hardforks::BscHardforks,
     metrics::{
@@ -34,7 +31,7 @@ use reth_evm::{
     eth::receipt_builder::ReceiptBuilder,
     execute::{BlockExecutionError, BlockExecutor},
     system_calls::SystemCaller,
-    Evm, FromRecoveredTx, FromTxWithEncoded, IntoTxEnv, OnStateHook,
+    Evm, FromRecoveredTx, FromTxWithEncoded, IntoTxEnv,
 };
 use reth_provider::BlockExecutionResult;
 use revm::Database as _;

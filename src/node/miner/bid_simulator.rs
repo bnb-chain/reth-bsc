@@ -24,9 +24,11 @@ use reth_evm::execute::BlockBuilderOutcome;
 use reth_evm::execute::{BlockExecutionError, BlockValidationError};
 use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
 use reth_execution_types::BlockExecutionOutput;
-use reth_payload_primitives::{BuiltPayloadExecutedBlock, PayloadBuilderError};
+use reth_payload_primitives::PayloadBuilderError;
+use reth_chain_state::ExecutedBlock;
+use reth_trie_common::{ComputedTrieData, LazyTrieData};
+use crate::node::primitives::BscPrimitives;
 use alloy_eips::eip4895::Withdrawals;
-use either::Either;
 use revm::context_interface::Block as EvmBlock;
 use reth_primitives_traits::SealedHeader;
 use reth_ethereum_primitives::TransactionSigned;
@@ -534,7 +536,7 @@ where
                 return;
             }
         };
-        let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } = out;
+        let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block, block_access_list: _ } = out;
         let mut sealed_block = Arc::new(block.sealed_block().clone());
 
         // Check if any un_revertible transaction failed
@@ -566,13 +568,14 @@ where
 
         let requests = execution_result.requests.clone();
         let execution_outcome = BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
-        let executed: BuiltPayloadExecutedBlock<_> = BuiltPayloadExecutedBlock {
+        let executed_block = ExecutedBlock::<BscPrimitives> {
             recovered_block: Arc::new(block.clone()),
             execution_output: Arc::new(execution_outcome),
-            hashed_state: Either::Left(Arc::new(hashed_state)),
-            trie_updates: Either::Left(Arc::new(trie_updates)),
+            trie_data: LazyTrieData::ready(ComputedTrieData::new(
+                Arc::new(hashed_state.into_sorted()),
+                Arc::new(trie_updates.into_sorted()),
+            )),
         };
-        let executed_block = executed.into_executed_payload();
 
         // Read validator/turn-length data transported via sinks from the now-consumed builder.
         let pending_validators = bid_validator_cache_sink.lock().unwrap().take();

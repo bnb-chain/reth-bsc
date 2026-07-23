@@ -32,8 +32,10 @@ use reth_evm::execute::BlockBuilder;
 use reth_evm::execute::BlockBuilderOutcome;
 use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
 use reth_execution_types::BlockExecutionOutput;
-use reth_payload_primitives::{BuiltPayload, BuiltPayloadExecutedBlock, PayloadBuilderError};
-use either::Either;
+use reth_payload_primitives::{BuiltPayload, PayloadBuilderError};
+use reth_chain_state::ExecutedBlock;
+use reth_trie_common::{ComputedTrieData, LazyTrieData};
+use crate::node::primitives::BscPrimitives;
 use once_cell::sync::Lazy;
 use revm::context_interface::Block as EvmBlock;
 use reth_primitives_traits::{HeaderTy, SealedHeader};
@@ -463,7 +465,7 @@ where
             trie_handle: _,
             state_root_deadline_ms,
         } = args;
-        let PayloadConfig { parent_header, attributes, payload_id: _ } = config;
+        let PayloadConfig { parent_header, attributes, payload_id: _, parent_block_info: _ } = config;
 
         let parent_hash = parent_header.hash_slow();
 
@@ -541,30 +543,11 @@ where
             .builder_for_next_block(&mut db, &parent_header, next_env_attributes)
             .map_err(PayloadBuilderError::other)?;
 
-        // Wire the sparse-trie state-root task's state hook onto the executor.
-        //
-        // The `state_hook` is installed here; it stays installed through `executor.finish()`
-        // (BSC post-execution system txs — slash / reward / validator-set updates) inside
-        // `finish`. When `finish` consumes the executor, the hook is dropped, which sends
-        // `FinishedStateUpdates` to the sparse-trie task. `state_root()` is then called on
-        // the handle from inside `finish` (via `ctx.trie_handle`) — calling it any earlier
-        // would deadlock the task.
-        //
-        // NOTE: This must be set before `apply_pre_execution_changes()` so any state
-        // access/touches performed during pre-execution are also captured by the hook.
-        if let Some(handle_guard) = trie_handle.lock().unwrap().as_ref() {
-            // Install hook from the handle while it's still in the Arc<Mutex<>>.
-            // The handle itself is forwarded via `attrs.trie_handle` (Arc clone) into
-            // `ctx.trie_handle` so `finish` can take it after executor.finish() and
-            // call `state_root()`.
-            builder.executor_mut().set_state_hook(Some(Box::new(handle_guard.state_hook())));
-            debug!(
-                target: "payload_builder",
-                trace_id,
-                parent_hash = ?parent_hash,
-                "Installed sparse-trie state_hook on executor (handle in ctx for post-exec collection)"
-            );
-        }
+        // NOTE: v2.4.1 migration — the sparse-trie state-root task's executor-level
+        // `state_hook` wiring was removed. State-root computation now runs synchronously
+        // via `builder.finish()` over the full committed state (see `spawn_state_root`
+        // fallback in engine.rs). `trie_handle` is retained for signature compatibility
+        // but no hook is installed on the executor.
 
         builder.apply_pre_execution_changes().map_err(|err| {
             warn!(
@@ -646,7 +629,7 @@ where
                 );
                 best_tx_list.mark_invalid(
                     &pool_tx,
-                    &InvalidPoolTransactionError::other(BlacklistedAddressError()),
+                    InvalidPoolTransactionError::other(BlacklistedAddressError()),
                 );
                 continue;
             }
@@ -671,7 +654,7 @@ where
                 // continue
                 best_tx_list.mark_invalid(
                     &pool_tx,
-                    &InvalidPoolTransactionError::ExceedsGasLimit(
+                    InvalidPoolTransactionError::ExceedsGasLimit(
                         pool_tx.gas_limit(),
                         block_gas_limit,
                     ),
@@ -715,7 +698,7 @@ where
                     );
                     best_tx_list.mark_invalid(
                         &pool_tx,
-                        &InvalidPoolTransactionError::Eip4844(
+                        InvalidPoolTransactionError::Eip4844(
                             Eip4844PoolTransactionError::TooManyEip4844Blobs {
                                 have: block_blob_count + tx_blob_count,
                                 permitted: max_blob_count,
@@ -735,7 +718,7 @@ where
                     {
                         best_tx_list.mark_invalid(
                             &pool_tx,
-                            &InvalidPoolTransactionError::Eip4844(
+                            InvalidPoolTransactionError::Eip4844(
                                 Eip4844PoolTransactionError::TooManyEip4844Blobs {
                                     have: block_blob_count + tx_blob_count,
                                     permitted: max_blob_count,
@@ -773,7 +756,7 @@ where
                             "Skipping blob transaction due to invalid sidecar"
                         );
                         best_tx_list
-                            .mark_invalid(&pool_tx, &InvalidPoolTransactionError::Eip4844(error));
+                            .mark_invalid(&pool_tx, InvalidPoolTransactionError::Eip4844(error));
                         continue;
                     }
                 };
@@ -806,7 +789,7 @@ where
                         );
                         // best_tx_list.mark_invalid(
                         //     &pool_tx,
-                        //     &InvalidPoolTransactionError::Consensus(
+                        //     InvalidPoolTransactionError::Consensus(
                         //         InvalidTransactionError::NonceNotConsistent {
                         //             tx: tx.nonce(),
                         //             state: 0_u64, // TODO: get the nonce from the state later.
@@ -829,7 +812,7 @@ where
                         );
                         best_tx_list.mark_invalid(
                             &pool_tx,
-                            &InvalidPoolTransactionError::Consensus(
+                            InvalidPoolTransactionError::Consensus(
                                 InvalidTransactionError::TxTypeNotSupported,
                             ),
                         );
@@ -909,7 +892,7 @@ where
         // per-attempt sink (see `state_root_precomputed_sink` above). Kept bound to avoid an
         // unused-variable warning until the field is removed from BscBuildArguments.
         let _ = &state_root_precomputed;
-        let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } =
+        let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block, block_access_list: _ } =
             builder.finish(&state_provider, None)?;
 
         let mut sealed_block = Arc::new(block.sealed_block().clone());
@@ -980,13 +963,14 @@ where
         let requests = execution_result.requests.clone();
         let execution_outcome =
             BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
-        let executed: BuiltPayloadExecutedBlock<_> = BuiltPayloadExecutedBlock {
+        let executed_block = ExecutedBlock::<BscPrimitives> {
             recovered_block: Arc::new(block),
             execution_output: Arc::new(execution_outcome),
-            hashed_state: Either::Left(Arc::new(hashed_state)),
-            trie_updates: Either::Left(Arc::new(trie_updates)),
+            trie_data: LazyTrieData::ready(ComputedTrieData::new(
+                Arc::new(hashed_state.into_sorted()),
+                Arc::new(trie_updates.into_sorted()),
+            )),
         };
-        let executed_block = executed.into_executed_payload();
 
         // Read validator/turn-length data transported via sinks from the now-consumed builder.
         let pending_validators = validator_cache_sink.lock().unwrap().take();
@@ -1024,7 +1008,7 @@ where
             trie_handle,
             state_root_deadline_ms: _,
         } = args;
-        let PayloadConfig { parent_header, attributes, payload_id: _ } = config;
+        let PayloadConfig { parent_header, attributes, payload_id: _, parent_block_info: _ } = config;
 
         let parent_hash = parent_header.hash_slow();
         let _ = parent_hash;
@@ -1106,7 +1090,7 @@ where
         // legacy `state_root_with_updates` cost is acceptable. The handle (if any)
         // stays in `trie_handle` and is dropped when the spawned task ends.
         let _ = (&state_root_precomputed, &trie_handle);
-        let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } =
+        let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block, block_access_list: _ } =
             builder.finish(&state_provider, None)?;
         let finalize_elapsed = finalize_start.elapsed();
 
@@ -1136,13 +1120,14 @@ where
         let requests = execution_result.requests.clone();
         let execution_outcome =
             BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
-        let executed: BuiltPayloadExecutedBlock<_> = BuiltPayloadExecutedBlock {
+        let executed_block = ExecutedBlock::<BscPrimitives> {
             recovered_block: Arc::new(block),
             execution_output: Arc::new(execution_outcome),
-            hashed_state: Either::Left(Arc::new(hashed_state)),
-            trie_updates: Either::Left(Arc::new(trie_updates)),
+            trie_data: LazyTrieData::ready(ComputedTrieData::new(
+                Arc::new(hashed_state.into_sorted()),
+                Arc::new(trie_updates.into_sorted()),
+            )),
         };
-        let executed_block = executed.into_executed_payload();
 
         // Read validator/turn-length data transported via sinks from the now-consumed builder.
         let pending_validators = validator_cache_sink.lock().unwrap().take();
