@@ -22,7 +22,7 @@ use alloy_consensus::{Header, TxReceipt, TxType};
 use alloy_eips::eip2935::{HISTORY_STORAGE_ADDRESS, HISTORY_STORAGE_CODE};
 use alloy_eips::{eip7685::Requests, Encodable2718};
 use alloy_evm::{
-    block::{ExecutableTx, GasOutput, StateChangeSource, TxResult},
+    block::{ExecutableTx, GasOutput, TxResult},
     eth::receipt_builder::ReceiptBuilderCtx,
 };
 use alloy_primitives::keccak256;
@@ -559,10 +559,11 @@ where
 
         let ResultAndState { result, state } = output.inner;
 
-        let mut temp_state = state.clone();
-        temp_state.remove(&SYSTEM_ADDRESS);
-        self.system_caller
-            .on_state(StateChangeSource::Transaction(self.receipts.len()), &temp_state);
+        // NOTE(reth-v2.4.1): previously streamed post-tx state (excluding SYSTEM_ADDRESS) to the
+        // state-root task via `system_caller.on_state(..)`. v2.4.1 installs the state hook at the
+        // DB level and streams automatically on `commit`, so the manual call is removed; the final
+        // state root is computed over the full committed state regardless. Re-introduce the
+        // SYSTEM_ADDRESS exclusion via the DB hook if it turns out to be required for BSC.
 
         let gas_used = result.tx_gas_used();
         self.gas_used += gas_used;
@@ -687,9 +688,6 @@ where
         ))
     }
 
-    fn set_state_hook(&mut self, hook: Option<Box<dyn OnStateHook>>) {
-        self.system_caller.with_state_hook(hook);
-    }
 
     fn evm_mut(&mut self) -> &mut Self::Evm {
         &mut self.evm

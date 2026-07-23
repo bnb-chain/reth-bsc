@@ -12,7 +12,7 @@ use crate::evm::precompiles;
 use crate::evm::transaction::BscTxEnv;
 use crate::system_contracts::{SLASH_CONTRACT, SYSTEM_REWARD_CONTRACT, STAKE_HUB_CONTRACT, feynman_fork::{ValidatorElectionInfo, get_top_validators_by_voting_power, ElectedValidators}};
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
-use reth_evm::{eth::receipt_builder::{ReceiptBuilder, ReceiptBuilderCtx}, execute::BlockExecutionError, Evm, FromRecoveredTx, FromTxWithEncoded, IntoTxEnv, block::StateChangeSource};
+use reth_evm::{eth::receipt_builder::{ReceiptBuilder, ReceiptBuilderCtx}, execute::BlockExecutionError, Evm, FromRecoveredTx, FromTxWithEncoded, IntoTxEnv};
 use reth_ethereum_primitives::{TransactionSigned, Transaction};
 use crate::node::evm::ResultAndState;
 use revm::{
@@ -414,9 +414,7 @@ where
 
         let result_and_state = self.evm.transact(tx_env.into_tx_env()).map_err(BlockExecutionError::other)?;
         let ResultAndState { result, state } = result_and_state;
-        let mut temp_state = state.clone();
-        temp_state.remove(&SYSTEM_ADDRESS);
-        self.system_caller.on_state(StateChangeSource::Transaction(self.receipts.len()), &temp_state);
+        // NOTE(reth-v2.4.1): manual state-hook streaming removed; state hook is DB-level now.
 
         let gas_used = result.tx_gas_used();
         self.gas_used += gas_used;
