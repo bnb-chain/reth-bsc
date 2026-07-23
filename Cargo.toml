@@ -61,39 +61,39 @@ reth-trie-db = { path = "/Users/chee/Documents/repo/reth/crates/trie/db" }
 reth-tasks = { path = "/Users/chee/Documents/repo/reth/crates/tasks" }
 reth-transaction-pool = { path = "/Users/chee/Documents/repo/reth/crates/transaction-pool" }
 
-revm = "38.0.0"
-revm-database = "13.0.0"
-revm-bytecode = "10.0.0"
-revm-state = "11.0.0"
-revm-primitives = { version = "23.0.0", default-features = false }
-revm-interpreter = "35.0.0"
-revm-database-interface = "11.0.0"
+revm = "41.0.0"
+revm-database = "41.0.0"
+revm-bytecode = "41.0.0"
+revm-state = "41.0.0"
+revm-primitives = { version = "41.0.0", default-features = false }
+revm-interpreter = "41.0.0"
+revm-database-interface = "41.0.0"
 
 # alloy dependencies
-alloy-evm = { version = "0.34.0", features = ["rpc"] }
+alloy-evm = { version = "0.37.1", features = ["rpc"] }
 
-alloy-genesis = "2.0.4"
-alloy-consensus = "2.0.4"
-alloy-eips = "2.0.4"
-alloy-network = "2.0.4"
-alloy-rpc-types = { version = "2.0.4", features = ["eth"] }
-alloy-rpc-types-eth = "2.0.4"
-alloy-rpc-types-engine = "2.0.4"
-alloy-rpc-types-mev = "2.0.4"
-alloy-signer = "2.0.4"
+alloy-genesis = "2.1.1"
+alloy-consensus = "2.1.1"
+alloy-eips = "2.1.1"
+alloy-network = "2.1.1"
+alloy-rpc-types = { version = "2.1.1", features = ["eth"] }
+alloy-rpc-types-eth = "2.1.1"
+alloy-rpc-types-engine = "2.1.1"
+alloy-rpc-types-mev = "2.1.1"
+alloy-signer = "2.1.1"
 
-alloy-chains = "0.2.33"
-alloy-rlp = { version = "0.3.13", default-features = false, features = [
+alloy-chains = "0.2.34"
+alloy-rlp = { version = "0.3.16", default-features = false, features = [
     "core-net",
 ] }
 
-alloy-dyn-abi = "1.5.6"
-alloy-json-abi = { version = "1.5.6", default-features = false }
-alloy-primitives = { version = "1.5.6", default-features = false, features = [
+alloy-dyn-abi = "1.6.1"
+alloy-json-abi = { version = "1.6.1", default-features = false }
+alloy-primitives = { version = "1.6.1", default-features = false, features = [
     "map-foldhash",
 ] }
-alloy-sol-macro = "1.5.6"
-alloy-sol-types = { version = "1.5.6", default-features = false }
+alloy-sol-macro = "1.6.1"
+alloy-sol-types = { version = "1.6.1", default-features = false }
 
 jsonrpsee = { version = "0.26.0", features = ["server", "client", "macros"] }
 jsonrpsee-core = { version = "0.26.0", features = ["server"] }
