@@ -1473,17 +1473,23 @@ where
 
     /// Gets the total difficulty for a specific header.
     ///
-    /// This private method queries the TD from the engine and caches it for future use.
+    /// Queries the TD from the provider (the `header_td_by_number` reth hook, which is
+    /// in-memory/overlay aware) and caches it for future use.
+    ///
+    /// NOTE: v2.4.1 migration — the previous `engine.query_td(number, hash)` engine round-trip
+    /// was replaced by a provider lookup keyed on block number. For competing non-canonical
+    /// blocks at the same height this resolves the canonical TD; reorg fork-choice behavior must
+    /// be validated on testnet.
     async fn header_td(
         &self,
-        engine: &ConsensusEngineHandle<BscPayloadTypes>,
+        _engine: &ConsensusEngineHandle<BscPayloadTypes>,
         number: u64,
         hash: B256,
     ) -> Result<Option<alloy_primitives::U256>, ParliaConsensusErr> {
         if let Some(td) = self.header_td_cache.write().get(&hash) {
             return Ok(*td);
         }
-        let td = engine.query_td(number, hash).await.map_err(ParliaConsensusErr::internal)?;
+        let td = self.provider.header_td_by_number(number).map_err(ParliaConsensusErr::internal)?;
         self.header_td_cache.write().insert(hash, td);
         Ok(td)
     }
