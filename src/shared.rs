@@ -34,8 +34,6 @@ pub type BscEngineApiTx = UnboundedSender<
     EngineApiRequest<
         crate::node::engine_api::payload::BscPayloadTypes,
         crate::BscPrimitives,
-        BlockchainProvider<NodeTypesWithDBAdapter<crate::node::BscNode, reth_db::DatabaseEnv>>,
-        crate::node::evm::config::BscEvmConfig,
     >,
 >;
 
@@ -843,7 +841,7 @@ pub async fn ipc_estimate_gas(
         RpcReceipt,
         RpcHeader,
         TransactionSigned,
-    >::estimate_gas(client.as_ref(), req, block_id, state_overrides)
+    >::estimate_gas(client.as_ref(), req, block_id, state_overrides, None)
     .await
     .map_err(|e| eyre::eyre!("failed to query chain id from healthy node: {e}"))
 }

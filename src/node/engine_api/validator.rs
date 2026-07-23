@@ -92,6 +92,13 @@ impl From<BscBlock> for BscExecutionData {
     }
 }
 
+impl From<crate::node::engine::BscBuiltPayload> for BscExecutionData {
+    fn from(payload: crate::node::engine::BscBuiltPayload) -> Self {
+        let hash = payload.block.hash();
+        Self::new_with_hash(payload.block.clone_block(), hash)
+    }
+}
+
 impl Default for BscExecutionData {
     fn default() -> Self {
         Self::new(BscBlock::default())
@@ -172,13 +179,6 @@ impl PayloadValidator<BscPayloadTypes> for BscEngineValidator {
         sealed_block.try_recover().map_err(|e| NewPayloadError::Other(e.into()))
     }
 
-    fn validate_block_post_execution_with_hashed_state(
-        &self,
-        _state_updates: &HashedPostState,
-        _block: &RecoveredBlock<Self::Block>,
-    ) -> Result<(), ConsensusError> {
-        Ok(())
-    }
 }
 
 /// Execution payload validator.

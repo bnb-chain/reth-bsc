@@ -24,10 +24,7 @@ use reth_evm::execute::BlockBuilderOutcome;
 use reth_evm::execute::{BlockExecutionError, BlockValidationError};
 use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
 use reth_execution_types::BlockExecutionOutput;
-use reth_payload_primitives::PayloadBuilderError;
-use reth_chain_state::ExecutedBlock;
-use reth_trie_common::{ComputedTrieData, LazyTrieData};
-use crate::node::primitives::BscPrimitives;
+use reth_payload_primitives::{BuiltPayloadExecutedBlock, PayloadBuilderError};
 use alloy_eips::eip4895::Withdrawals;
 use revm::context_interface::Block as EvmBlock;
 use reth_primitives_traits::SealedHeader;
@@ -568,13 +565,12 @@ where
 
         let requests = execution_result.requests.clone();
         let execution_outcome = BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
-        let executed_block = ExecutedBlock::<BscPrimitives> {
+        let executed_block = BuiltPayloadExecutedBlock {
             recovered_block: Arc::new(block.clone()),
             execution_output: Arc::new(execution_outcome),
-            trie_data: LazyTrieData::ready(ComputedTrieData::new(
-                Arc::new(hashed_state.into_sorted()),
-                Arc::new(trie_updates.into_sorted()),
-            )),
+            hashed_state: Arc::new(hashed_state),
+            trie_updates: Arc::new(trie_updates),
+            changed_paths: None,
         };
 
         // Read validator/turn-length data transported via sinks from the now-consumed builder.

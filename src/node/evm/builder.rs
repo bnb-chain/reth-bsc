@@ -370,7 +370,13 @@ where
         );
 
         let block = RecoveredBlock::new_unhashed(block, senders);
-        Ok(BlockBuilderOutcome { execution_result: result, hashed_state, trie_updates, block })
+        Ok(BlockBuilderOutcome {
+            execution_result: result,
+            hashed_state,
+            trie_updates,
+            block,
+            block_access_list: None,
+        })
     }
 
     fn executor_mut(&mut self) -> &mut Self::Executor {

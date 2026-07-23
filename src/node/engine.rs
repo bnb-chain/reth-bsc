@@ -18,7 +18,7 @@ use reth::{
     payload::{PayloadBuilderHandle, PayloadServiceCommand},
     transaction_pool::TransactionPool,
 };
-use reth_chain_state::ExecutedBlock;
+use reth_payload_primitives::BuiltPayloadExecutedBlock;
 use reth_evm::ConfigureEvm;
 use reth_payload_builder_primitives::Events;
 use reth_payload_primitives::BuiltPayload;
@@ -56,7 +56,7 @@ pub struct BscBuiltPayload {
     /// Time spent computing the trie root (time spent in `finish()` after execution).
     pub trie_root_duration: Duration,
     /// The executed block.
-    pub(crate) executed_block: ExecutedBlock<BscPrimitives>,
+    pub(crate) executed_block: BuiltPayloadExecutedBlock<BscPrimitives>,
     /// Validators from execution context, to be written to VALIDATOR_CACHE after finalization.
     /// `None` for bid payloads and non-epoch blocks.
     pub(crate) pending_validators: Option<(Vec<Address>, Vec<VoteAddress>)>,

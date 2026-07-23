@@ -250,6 +250,7 @@ impl<ChainSpec: EthChainSpec<Header = Header> + BscHardforks + 'static> FullCons
         block: &RecoveredBlock<BscBlock>,
         result: &BlockExecutionResult<Receipt>,
         _receipt_root_bloom: Option<ReceiptRootBloom>,
+        _block_access_list_hash: Option<alloy_primitives::B256>,
     ) -> Result<(), ConsensusError> {
         let receipts = &result.receipts;
         let chain_spec = &self.chain_spec;

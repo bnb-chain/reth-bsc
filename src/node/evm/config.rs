@@ -91,9 +91,12 @@ pub struct BscNextBlockEnvAttributes {
 }
 
 impl<H: BlockHeader> BuildPendingEnv<H> for BscNextBlockEnvAttributes {
-    fn build_pending_env(parent: &SealedHeader<H>) -> Self {
+    fn build_pending_env(
+        parent: &SealedHeader<H>,
+        block_overrides: Option<&alloy_rpc_types_eth::BlockOverrides>,
+    ) -> Self {
         Self {
-            inner: NextBlockEnvAttributes::build_pending_env(parent),
+            inner: NextBlockEnvAttributes::build_pending_env(parent, block_overrides),
             validator_cache_sink: None,
             turn_length_sink: None,
             state_root_precomputed_sink: None,
