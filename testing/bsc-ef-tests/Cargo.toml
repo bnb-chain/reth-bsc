@@ -40,12 +40,6 @@ reth-trie = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-ups
 reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1" }
 
 # revm
-revm = { version = "38.0.0", features = [
-    "secp256k1",
-    "blst",
-    "c-kzg",
-    "memory_limit",
-] }
 
 # alloy
 alloy-consensus = "2.0.0"
