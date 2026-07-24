@@ -1,0 +1,66 @@
+# Benchmark matrix configuration.
+#
+# Copy to config.toml and edit paths. Semantics:
+#   - The blocks measured for a group are `from..=to` inclusive.
+#   - Each (config, group) snapshot must be a datadir synced to exactly `from - 1`
+#     under the matching binary/backend.
+#   - The first [[configs]] entry is the baseline all deltas are computed against.
+
+[global]
+chain         = "bsc"
+jwt_secret    = "/path/to/jwt.hex"
+output_dir    = "benchmark/results"
+bench_bin     = "bin/reth-bench/target/maxperf/reth-bench-bsc"
+authrpc_port  = 8551
+http_port     = 8545
+ipc_path      = "/tmp/reth-bench.ipc"
+# Blocks dropped from the start of every run's latency stats (SYNCING-retry
+# inflation right after node start).
+warmup_blocks = 2
+node_ready_timeout_secs    = 300
+node_shutdown_timeout_secs = 120
+# A run is marked invalid if any node.log line matches one of these regexes.
+error_log_patterns = ["state root", "ERROR"]
+# Passed to every node so it cannot sync past the snapshot head on its own.
+isolation_args = ["--disable-discovery", "--max-outbound-peers", "0", "--max-inbound-peers", "0"]
+
+[[configs]]                     # baseline
+name    = "legacy-mdbx"
+binary  = "/path/to/legacy/target/maxperf/reth-bsc"
+datadir = "/data/bench-datadir"
+extra_node_args = []
+[configs.snapshots]             # one per group, keyed by group name
+big    = "/snapshots/legacy-mdbx-big"
+normal = "/snapshots/legacy-mdbx-normal"
+
+[[configs]]
+name    = "legacy-triedb"
+binary  = "/path/to/legacy/target/maxperf/reth-bsc"
+datadir = "/data/bench-datadir"
+extra_node_args = ["--statedb.triedb"]
+[configs.snapshots]
+big    = "/snapshots/legacy-triedb-big"
+normal = "/snapshots/legacy-triedb-normal"
+
+[[configs]]
+name    = "storage-v2"
+binary  = "target/maxperf/reth-bsc"
+datadir = "/data/bench-datadir"
+extra_node_args = []
+[configs.snapshots]
+big    = "/snapshots/storage-v2-big"
+normal = "/snapshots/storage-v2-normal"
+
+[[groups]]
+name    = "big"
+label   = "Big Blocks: 48 blocks ~1 Ggas"
+rpc_url = "http://source-node:8545"
+from    = 48000100
+to      = 48000147
+
+[[groups]]
+name    = "normal"
+label   = "Normal Blocks: 500 blocks"
+rpc_url = "http://source-node:8545"
+from    = 47000001
+to      = 47000500

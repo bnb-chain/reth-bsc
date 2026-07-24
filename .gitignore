@@ -3,3 +3,6 @@ target/
 .vscode/
 genesis_local.json
 test-datadir/
+benchmark/config.toml
+benchmark/results/
+__pycache__/

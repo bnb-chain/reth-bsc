@@ -28,6 +28,10 @@ reth-bench: ## Build the reth-bench binary into the `target` directory.
 	@echo "Location: bin/reth-bench/target/$(PROFILE)/reth-bench-bsc"
 	@echo ""
 
+.PHONY: bench-matrix
+bench-matrix: ## Run the storage benchmark matrix (see benchmark/README.md).
+	python3 benchmark/bench.py run --config benchmark/config.toml
+
 check-features:
 	cargo hack check \
 		--package reth-codecs \
