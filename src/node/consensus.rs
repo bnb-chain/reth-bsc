@@ -1478,21 +1478,10 @@ where
 
     /// Gets the total difficulty for a specific header, keyed by hash.
     ///
-    /// v2.4.1 migration: reth no longer tracks total difficulty in the DB (the
-    /// `HeaderTerminalDifficulties` table is unpopulated post-merge) and the old
-    /// `engine.query_td` round-trip is gone. BSC parlia TD is a pure function of the header
-    /// chain, so we compute it directly:
-    ///
-    ///   TD(genesis) = genesis.difficulty
-    ///   TD(n)       = TD(n-1) + header(n).difficulty
-    ///
-    /// We walk parent hashes back until a cached ancestor (or genesis), then fold the collected
-    /// difficulties forward, caching each level. The per-hash cache keeps this O(1) amortized for
-    /// the sequential queries fork choice makes. Returns `None` only if an ancestor header is
-    /// missing from the provider (e.g. not yet imported).
-    ///
-    /// NOTE: a cold query deep in the chain (e.g. right after restart, before the cache is warm)
-    /// walks back to genesis once; TD is not persisted across restarts.
+    /// Reads the TD from the provider's `header_td` hook, which serves the persisted per-block TD
+    /// from the `HeaderTerminalDifficulties` table (written in `save_blocks`) and extends it over
+    /// any not-yet-persisted in-memory tail. Results are cached here for the sequential queries
+    /// fork choice makes.
     async fn header_td(
         &self,
         _engine: &ConsensusEngineHandle<BscPayloadTypes>,
@@ -1502,41 +1491,9 @@ where
         if let Some(td) = self.header_td_cache.write().get(&hash) {
             return Ok(*td);
         }
-
-        // Collect (hash, difficulty) child-first for blocks whose TD we don't yet know,
-        // stopping at a cached ancestor or genesis.
-        let mut chain: Vec<(B256, alloy_primitives::U256)> = Vec::new();
-        let mut cursor = hash;
-        let base_td: Option<alloy_primitives::U256> = loop {
-            if let Some(td) = self.header_td_cache.write().get(&cursor) {
-                break *td;
-            }
-            let Some(header) =
-                self.provider.header(cursor).map_err(ParliaConsensusErr::internal)?
-            else {
-                break None;
-            };
-            if header.number == 0 {
-                // Genesis: TD is its own difficulty (no parent).
-                self.header_td_cache.write().insert(cursor, Some(header.difficulty));
-                break Some(header.difficulty);
-            }
-            chain.push((cursor, header.difficulty));
-            cursor = header.parent_hash;
-        };
-
-        // Fold difficulties forward from the base (parent-first). Only cache resolved TDs so a
-        // transiently-missing ancestor can be recomputed once it arrives.
-        let mut td = base_td;
-        for (h, diff) in chain.into_iter().rev() {
-            match td {
-                Some(acc) => {
-                    let next = acc + diff;
-                    self.header_td_cache.write().insert(h, Some(next));
-                    td = Some(next);
-                }
-                None => break,
-            }
+        let td = self.provider.header_td(&hash).map_err(ParliaConsensusErr::internal)?;
+        if td.is_some() {
+            self.header_td_cache.write().insert(hash, td);
         }
         Ok(td)
     }
