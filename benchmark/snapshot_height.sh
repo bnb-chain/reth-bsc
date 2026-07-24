@@ -51,24 +51,43 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "starting $BINARY on $DATADIR (p2p disabled) ..." >&2
+NODE_LOG=$(mktemp "${TMPDIR:-/tmp}/snapshot_height_node.XXXXXX")
+echo "starting $BINARY on $DATADIR (p2p disabled); node log -> $NODE_LOG" >&2
+# The `+` guard keeps an empty EXTRA_ARGS from tripping `set -u` on bash < 4.4
+# (e.g. macOS system bash 3.2); it expands to zero words when unset.
 "$BINARY" node --chain bsc --datadir "$DATADIR" \
     --http --http.port "$HTTP_PORT" \
     --disable-discovery --max-outbound-peers 0 --max-inbound-peers 0 \
-    "${EXTRA_ARGS[@]}" >/tmp/snapshot_height_node.log 2>&1 &
+    ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} >"$NODE_LOG" 2>&1 &
 NODE_PID=$!
 
+MAX_TRIES=150
 HEX=""
-for _ in $(seq 1 150); do
-    kill -0 "$NODE_PID" 2>/dev/null || { echo "error: node exited early; see /tmp/snapshot_height_node.log" >&2; exit 1; }
+for i in $(seq 1 $MAX_TRIES); do
+    if ! kill -0 "$NODE_PID" 2>/dev/null; then
+        echo "error: node exited early. Last log lines:" >&2
+        tail -n 20 "$NODE_LOG" >&2
+        exit 1
+    fi
+    # `|| true`: while the node is still opening its RPC port, curl exits
+    # non-zero (connection refused). Without this the failed command
+    # substitution would trip `set -e` and kill the script on the first try
+    # instead of retrying.
     HEX=$(curl -s "localhost:$HTTP_PORT" -X POST -H 'Content-Type: application/json' \
         -d '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' \
-        | sed -n 's/.*"result":"\(0x[0-9a-fA-F]*\)".*/\1/p')
+        | sed -n 's/.*"result":"\(0x[0-9a-fA-F]\{1,\}\)".*/\1/p') || true
     [[ -n "$HEX" ]] && break
+    # periodic heartbeat so a slow-starting node isn't mistaken for a hang
+    (( i % 5 == 0 )) && echo "  ... still waiting for RPC on port $HTTP_PORT (${i}/${MAX_TRIES})" >&2
     sleep 2
 done
 
-[[ -n "$HEX" ]] || { echo "error: RPC did not return a block number in time" >&2; exit 1; }
+if [[ -z "$HEX" ]]; then
+    echo "error: RPC on port $HTTP_PORT did not return a block number after ~$((MAX_TRIES * 2))s." >&2
+    echo "Last log lines:" >&2
+    tail -n 20 "$NODE_LOG" >&2
+    exit 1
+fi
 
 DEC=$((HEX))
 echo "head block: $DEC ($HEX)"
