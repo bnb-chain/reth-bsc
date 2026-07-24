@@ -148,7 +148,7 @@ where
         // updates). The sparse-trie `state_hook` is installed on the DB (v2.4.1), so it
         // captures those commits here too.
         let (evm, result) = self.executor.finish()?;
-        let (mut db, evm_env) = evm.finish();
+        let (db, evm_env) = evm.finish();
 
         // Finish the sparse-trie update stream. The hook lives on the DB (which outlives the
         // executor), so it is NOT dropped by `executor.finish()`; we must clear it explicitly.
