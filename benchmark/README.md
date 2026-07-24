@@ -124,6 +124,19 @@ Invalid runs (failed checks) are recorded but excluded from the chart.
    persisted into the datadir's config, which wins over the CLI flag) nor
    across binary revisions (storage schema drift between pinned reth revs).
 
+   Confirm every snapshot in a group sits at the **same** height (each config's
+   node must start at exactly `from - 1`) with the helper:
+
+   ```bash
+   benchmark/snapshot_height.sh <binary> <snapshot-datadir>
+   benchmark/snapshot_height.sh <triedb-binary> <snapshot-datadir> -- --statedb.triedb
+   ```
+
+   It starts the node with p2p disabled (so it can't advance), prints the head
+   block number, and stops it. If the three differ, advance the lower ones to
+   the highest common height with the recipe above, then set `from` to that
+   height + 1.
+
 4. A JWT secret file (hex) shared by the node and the driver.
 
 ## Interpreting the numbers
