@@ -308,6 +308,15 @@ pub fn spawn_sparse_trie_state_root(
         .and_then(|f| f(parent_hash, parent_state_root))
 }
 
+/// Whether the sparse-trie state-root fast path is wired up.
+///
+/// When `false` (spawner not registered — e.g. the v2.4.1 migration disabled it), the miner
+/// runs the synchronous state-root walk unconditionally and the slot-deadline abort — which only
+/// exists to protect the fast path from a slow fallback overrunning the slot — must not fire.
+pub fn is_sparse_trie_state_root_enabled() -> bool {
+    SPARSE_TRIE_SPAWN_FN.get().is_some()
+}
+
 /// Store the header provider globally
 /// Creates functions that directly call HeaderProvider::header() and HeaderProvider::header_by_number()
 pub fn set_header_provider<T>(

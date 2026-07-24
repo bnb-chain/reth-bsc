@@ -286,7 +286,14 @@ where
             // empty/low-gas blocks. If we are already at/over the state-root deadline
             // (`end_mining_timestamp_ms - STATE_ROOT_WAIT_MARGIN_MS`), abort this candidate so the
             // miner ships the best already-completed candidate on time instead of over-running.
-            if let Some(deadline_ms) = self.ctx.state_root_deadline_ms {
+            // The abort only makes sense as a guard for the sparse-trie fast path: it prevents a
+            // slow synchronous fallback from overrunning the slot after the fast path timed out.
+            // When the sparse-trie spawner is disabled (v2.4.1 migration), synchronous is the
+            // only path — aborting would stop all block production — so we skip the abort and
+            // always complete the walk.
+            if let Some(deadline_ms) =
+                self.ctx.state_root_deadline_ms.filter(|_| crate::shared::is_sparse_trie_state_root_enabled())
+            {
                 let now_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)
