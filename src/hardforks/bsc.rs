@@ -121,8 +121,7 @@ impl BscHardfork {
             (Self::Fermi.boxed(), ForkCondition::Timestamp(1768357800)), /* 2026-01-14 02:30:00 AM UTC */
             (Self::Osaka.boxed(), ForkCondition::Timestamp(1777343400)),
             (Self::Mendel.boxed(), ForkCondition::Timestamp(1777343400)),
-            // TODO: real activation TBD; unscheduled (u64::MAX) until announced.
-            (Self::Pasteur.boxed(), ForkCondition::Timestamp(u64::MAX)),
+            (Self::Pasteur.boxed(), ForkCondition::Timestamp(1787625000)), /* 2026-08-25 02:30:00 AM UTC */
         ])
     }
 
@@ -301,17 +300,24 @@ mod tests {
     }
 
     #[test]
-    fn test_pasteur_present_but_unscheduled_in_mainnet_and_qanet() {
-        // Mainnet and qanet have no announced Pasteur activation yet, so they
-        // must stay dormant (u64::MAX) until a real timestamp is set.
-        for hardforks in [BscHardfork::bsc_mainnet(), BscHardfork::bsc_qanet()] {
-            let activation = hardforks.fork(BscHardfork::Pasteur);
-            assert_eq!(
-                activation,
-                ForkCondition::Timestamp(u64::MAX),
-                "Pasteur should be defined but dormant until a real activation is set"
-            );
-        }
+    fn test_pasteur_scheduled_on_mainnet() {
+        // Mainnet has an announced Pasteur activation: 2026-08-25 02:30:00 AM UTC.
+        assert_eq!(
+            BscHardfork::bsc_mainnet().fork(BscHardfork::Pasteur),
+            ForkCondition::Timestamp(1787625000),
+            "Pasteur should activate on mainnet at its announced timestamp"
+        );
+    }
+
+    #[test]
+    fn test_pasteur_present_but_unscheduled_in_qanet() {
+        // Qanet has no announced Pasteur activation yet, so it must stay
+        // dormant (u64::MAX) until a real timestamp is set.
+        assert_eq!(
+            BscHardfork::bsc_qanet().fork(BscHardfork::Pasteur),
+            ForkCondition::Timestamp(u64::MAX),
+            "Pasteur should be defined but dormant until a real activation is set"
+        );
     }
 
     #[test]

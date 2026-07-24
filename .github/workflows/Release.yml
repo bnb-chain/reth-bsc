@@ -23,6 +23,10 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
+        with:
+          # Full history + tags so `git describe --tags` in build.rs can resolve
+          # the release tag into RETH_BSC_VERSION (e.g. 0.1.0-fix).
+          fetch-depth: 0
 
       - name: Install Rust toolchain
         uses: actions-rs/toolchain@v1
