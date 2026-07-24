@@ -539,11 +539,27 @@ where
             .builder_for_next_block(&mut db, &parent_header, next_env_attributes)
             .map_err(PayloadBuilderError::other)?;
 
-        // NOTE: v2.4.1 migration — the sparse-trie state-root task's executor-level
-        // `state_hook` wiring was removed. State-root computation now runs synchronously
-        // via `builder.finish()` over the full committed state (see `spawn_state_root`
-        // fallback in engine.rs). `trie_handle` is retained for signature compatibility
-        // but no hook is installed on the executor.
+        // Wire the sparse-trie state-root task's update hook onto the building EVM's DB.
+        //
+        // v2.4.1 installs the hook at the DB level (it fires on every state commit) rather than
+        // on the executor. It must be set before `apply_pre_execution_changes()` so pre-execution
+        // state touches are also streamed to the task. The hook is dropped when the executor is
+        // consumed in `finish`, which signals end-of-updates; `finish` then reads the precomputed
+        // root from the same handle (forwarded via `ctx.trie_handle`) with a slot-deadline-bounded
+        // wait. When no spawner is registered, `trie_handle` is empty and this is a no-op
+        // (synchronous fallback).
+        if let Some(handle) = trie_handle.lock().unwrap().as_mut() {
+            builder
+                .evm_mut()
+                .db_mut()
+                .set_state_hook(Some(Box::new(handle.take_execution_hook())));
+            debug!(
+                target: "payload_builder",
+                trace_id,
+                parent_hash = ?parent_hash,
+                "Installed sparse-trie state-root hook on building EVM DB"
+            );
+        }
 
         builder.apply_pre_execution_changes().map_err(|err| {
             warn!(

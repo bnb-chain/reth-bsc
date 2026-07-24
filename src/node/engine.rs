@@ -113,28 +113,125 @@ where
 
         // Register the sparse-trie state-root spawner, if enabled.
         //
-        // We construct a long-lived `PayloadProcessor` keyed to a fresh `BscEvmConfig`
-        // (built from chain_spec — same source as the rest of the BSC pipeline). For
-        // each build job, the registered closure constructs a one-shot
-        // `OverlayStateProviderFactory` anchored at the parent block hash and calls
-        // `spawn_state_root` to get a `StateRootHandle`.
+        // For each build job the registered closure builds a one-shot
+        // `OverlayStateProviderFactory` anchored at the parent block hash and calls the
+        // v2.4.1 `spawn_payload_builder_state_root` hook to get a `StateRootHandle`. The
+        // miner installs the handle's state hook on the building EVM's DB (streaming per-tx
+        // state diffs to the sparse-trie task) and reads the precomputed root back in
+        // `BscBlockBuilder::finish`.
         //
-        // The sparse-trie PayloadProcessor is configured from the engine-launch
-        // `TreeConfig` built from the `--engine.*` CLI flags via
-        // `ctx.config().engine.tree_config()`, so miner-side proof-worker counts /
-        // cache sizes are CLI-tunable and match the import (engine) path.
+        // v2.4.1 port: `LazyOverlay` / `OverlayBuilder::with_lazy_overlay` were replaced by
+        // `StateTrieOverlayManager` + `OverlayBuilder::with_state_trie_overlay_manager`, and the
+        // old `PayloadProcessor::spawn_state_root` by the standalone
+        // `state_root_strategy::spawn_payload_builder_state_root`. We mirror the engine's own
+        // `overlay_builder_for_parent`: anchor at `parent_hash` and feed the in-memory canonical
+        // chain to a per-spawn `StateTrieOverlayManager` so proof workers can resolve a
+        // not-yet-persisted parent.
         if mining_config.use_sparse_trie_state_root {
-            // TODO(reth-v2.4.1): the sparse-trie miner state-root optimization is temporarily
-            // disabled pending a port to v2.4.1's PayloadProcessor API (spawn_state_root /
-            // LazyOverlay / OverlayBuilder::with_lazy_overlay were restructured upstream).
-            // With no spawner registered, spawn_sparse_trie_state_root() returns None and block
-            // production falls back to the synchronous state_root_with_updates path (correct,
-            // just without the mining-latency optimization).
-            tracing::warn!(
+            use reth_chain_state::{ExecutedBlock, StateTrieOverlayManager};
+            use reth_engine_tree::tree::state_root_strategy::spawn_payload_builder_state_root;
+            use reth_provider::providers::{OverlayBuilder, OverlayStateProviderFactory};
+            use reth_tasks::{RuntimeBuilder, RuntimeConfig, TokioConfig};
+            use reth_trie_db::ChangesetCache;
+
+            let tree_config = Arc::new(ctx.config().engine.tree_config());
+            tracing::debug!(
                 target: "bsc::miner",
-                "--mining.use-sparse-trie-state-root set, but the sparse-trie spawner is not yet \
-                 ported to reth v2.4.1; falling back to synchronous state root"
+                ?tree_config,
+                "Miner sparse-trie TreeConfig (from --engine.* CLI flags)"
             );
+            let provider = ctx.provider().clone();
+            let worker_pool = ctx.task_executor().state_trie_overlay_worker_pool();
+            let tokio_handle = ctx.task_executor().handle().clone();
+
+            // Long-lived changeset cache shared across all miner spawns: the first block computes
+            // trie reverts (from DB) and caches them; consecutive blocks reuse them, avoiding the
+            // dominant "slow root" cost of recomputing reverts per block. Cloning shares the Arc.
+            let miner_changeset_cache = ChangesetCache::new();
+            let tree_config_for_closure = tree_config.clone();
+            // Cache the task Runtime so it is built at most once. Rebuilding (and dropping) a
+            // worker-pool Runtime per spawn panics the storage workers with a join deadlock, so
+            // we resolve it once: the engine's shared Runtime if published, else a single
+            // dedicated fallback reused for the rest of the run.
+            let runtime_cell: std::sync::OnceLock<reth_tasks::Runtime> = std::sync::OnceLock::new();
+
+            let spawn_fn: crate::shared::SparseTrieSpawnFn = std::sync::Arc::new(
+                move |parent_hash: alloy_primitives::B256,
+                      parent_state_root: alloy_primitives::B256| {
+                    // Per-spawn overlay manager fed with the in-memory canonical chain, so the
+                    // proof workers can resolve a parent that hasn't been persisted yet (the
+                    // common case during fast block production).
+                    let overlay_manager =
+                        StateTrieOverlayManager::<crate::BscPrimitives>::new(worker_pool.clone());
+                    if let Some(cim) = crate::shared::get_canonical_in_memory_state() {
+                        if let Some(state) = cim.state_by_hash(parent_hash) {
+                            // chain() yields newest-to-oldest including the parent itself.
+                            let blocks: Vec<ExecutedBlock<crate::BscPrimitives>> =
+                                state.chain().map(|bs| bs.block()).collect();
+                            metrics::histogram!("bsc_miner_overlay_depth")
+                                .record(blocks.len() as f64);
+                            for b in &blocks {
+                                overlay_manager.insert_block(b.clone());
+                            }
+                            metrics::counter!("bsc_miner_sparse_trie_anchor_inmemory_total")
+                                .increment(1);
+                        } else {
+                            metrics::counter!("bsc_miner_sparse_trie_anchor_persisted_total")
+                                .increment(1);
+                        }
+                    } else {
+                        metrics::counter!("bsc_miner_sparse_trie_anchor_nocim_total").increment(1);
+                    }
+
+                    // Anchor directly at the parent hash; the overlay manager resolves the
+                    // in-memory parent trie (mirrors engine `overlay_builder_for_parent`).
+                    let overlay_builder = OverlayBuilder::<crate::BscPrimitives>::new(
+                        parent_hash,
+                        miner_changeset_cache.clone(),
+                    )
+                    .with_state_trie_overlay_manager(overlay_manager.clone());
+                    let overlay_factory =
+                        OverlayStateProviderFactory::new(provider.clone(), overlay_builder);
+
+                    // Resolve the Runtime once (see `runtime_cell` above): prefer the engine's
+                    // shared Runtime (same rayon proof pools); if not yet published on first use,
+                    // build a single dedicated fallback and reuse it (pools not shared this run).
+                    let runtime = runtime_cell.get_or_init(|| {
+                        reth_tasks::shared_engine_runtime().unwrap_or_else(|| {
+                            tracing::warn!(
+                                target: "bsc::miner",
+                                "engine Runtime not yet published on first sparse-trie spawn; \
+                                 building a dedicated Runtime (proof pools NOT shared this run)"
+                            );
+                            RuntimeBuilder::new(RuntimeConfig::default().with_tokio(
+                                TokioConfig::existing_handle(tokio_handle.clone()),
+                            ))
+                            .build()
+                            .expect("failed to build fallback sparse-trie Runtime")
+                        })
+                    });
+
+                    let spawn_start = std::time::Instant::now();
+                    let handle = spawn_payload_builder_state_root(
+                        runtime,
+                        &overlay_manager,
+                        overlay_factory,
+                        parent_state_root,
+                        None, // tx count unknown at spawn time → full proof-worker pool
+                        tree_config_for_closure.as_ref(),
+                        None, // fresh manager per spawn: no preserved trie to prune
+                    );
+                    metrics::histogram!("bsc_miner_sparse_trie_spawn_duration_seconds")
+                        .record(spawn_start.elapsed().as_secs_f64());
+                    Some(handle)
+                },
+            );
+
+            if crate::shared::set_sparse_trie_spawn_fn(spawn_fn).is_err() {
+                tracing::warn!("Sparse-trie spawner already registered, keeping existing one");
+            } else {
+                info!("Sparse-trie state-root spawner registered (use_sparse_trie_state_root=true)");
+            }
         }
 
         // Skip mining setup if disabled
