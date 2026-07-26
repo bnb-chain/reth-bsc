@@ -45,6 +45,21 @@ class TestPreflight(unittest.TestCase):
         self.assertEqual(problems, [])
         self.assertEqual(versions["config 'a'"], "fake-reth 1.2.3")
 
+    def test_binary_without_version_flag_is_not_a_problem(self):
+        # reth-bench-bsc has no --version; clap exits non-zero with a usage
+        # error. That must not fail preflight, and must not land in meta.json
+        # dressed up as a version string.
+        with tempfile.NamedTemporaryFile("w", delete=False, suffix=".sh") as f:
+            f.write("#!/bin/sh\necho \"error: unexpected argument '--version'\" >&2\nexit 2\n")
+            path = f.name
+        os.chmod(path, 0o755)
+        try:
+            problems, versions = preflight_binaries([("bench_bin", path)])
+        finally:
+            Path(path).unlink()
+        self.assertEqual(problems, [])
+        self.assertEqual(versions["bench_bin"], "unknown (--version exited 2)")
+
 
 class TestNoRestore(unittest.TestCase):
     def make_cfg(self, with_snapshot: bool) -> MatrixConfig:

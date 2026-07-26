@@ -53,8 +53,16 @@ def preflight_binaries(
                 out = subprocess.run(
                     [str(p), "--version"], capture_output=True, text=True, timeout=15
                 )
-                first = (out.stdout or out.stderr).strip().splitlines()
-                versions[label] = first[0] if first else f"exit code {out.returncode}"
+                if out.returncode != 0:
+                    # Not every binary implements --version: reth-bench-bsc
+                    # doesn't, and clap answers with a usage error. Record that
+                    # plainly rather than storing the error text in meta.json
+                    # where a version string is expected. Not a hard failure -
+                    # the binary exists and runs, which is what preflight is for.
+                    versions[label] = f"unknown (--version exited {out.returncode})"
+                else:
+                    first = (out.stdout or out.stderr).strip().splitlines()
+                    versions[label] = first[0] if first else "unknown (no output)"
             except (subprocess.TimeoutExpired, OSError) as e:
                 problems.append(f"{label}: {path} failed to run --version: {e}")
     return problems, versions
