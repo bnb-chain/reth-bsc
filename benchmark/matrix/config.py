@@ -16,6 +16,11 @@ class GlobalConfig:
     jwt_secret: str
     output_dir: str
     bench_bin: str
+    # Driver subcommand. "forkchoice-only" makes the node fetch each block over
+    # p2p, so it requires a peered node. "new-payload-fcu" pushes the block in
+    # over the engine API, needing no peers - but the node must be built from a
+    # branch that registers engine_newPayloadBscV1 under `bench-test`.
+    bench_mode: str = "forkchoice-only"
     chain: str = "bsc"
     authrpc_port: int = 8551
     http_port: int = 8545
@@ -82,6 +87,10 @@ class MatrixConfig:
         raise ConfigError(f"unknown group {name!r}")
 
 
+#: Driver subcommands the runner knows how to invoke.
+BENCH_MODES = frozenset({"forkchoice-only", "new-payload-fcu"})
+
+
 def _require(table: dict, key: str, where: str):
     if key not in table:
         raise ConfigError(f"missing required key {key!r} in {where}")
@@ -106,6 +115,7 @@ def load_config(path: str | Path) -> MatrixConfig:
         **{
             k: g[k]
             for k in (
+                "bench_mode",
                 "chain",
                 "authrpc_port",
                 "http_port",
@@ -134,6 +144,11 @@ def load_config(path: str | Path) -> MatrixConfig:
         )
     if not configs:
         raise ConfigError("at least one [[configs]] entry is required")
+    if global_.bench_mode not in BENCH_MODES:
+        raise ConfigError(
+            f"[global] bench_mode {global_.bench_mode!r} is not one of {sorted(BENCH_MODES)}"
+        )
+
     names = [c.name for c in configs]
     if len(set(names)) != len(names):
         raise ConfigError(f"duplicate config names: {names}")

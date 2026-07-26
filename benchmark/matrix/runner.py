@@ -165,9 +165,12 @@ class Runner:
         ]
 
     def bench_argv(self, group: Group, run_dir: Path) -> list[str]:
+        # Both driver modes take the same arguments; they differ only in whether
+        # the node fetches each block itself (forkchoice-only, needs peers) or
+        # the driver pushes it in (new-payload-fcu, needs none).
         return [
             self.g.bench_bin,
-            "forkchoice-only",
+            self.g.bench_mode,
             "--rpc-url",
             group.rpc_url,
             # reth-bench replays --from+1 ..= --to; measured blocks are from..=to.

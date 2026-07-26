@@ -99,6 +99,19 @@ class TestConfig(unittest.TestCase):
         cfg = load_str(VALID)
         self.assertEqual(cfg.configs[0].snapshots["g1"], "/snap/base-g1")
 
+    def test_unknown_bench_mode_rejected(self):
+        with self.assertRaises(ConfigError):
+            load_str(VALID.replace('bench_bin  = "reth-bench-bsc"',
+                                   'bench_bin  = "reth-bench-bsc"\nbench_mode = "nonsense"'))
+
+    def test_new_payload_mode_accepted(self):
+        cfg = load_str(VALID.replace('bench_bin  = "reth-bench-bsc"',
+                                     'bench_bin  = "reth-bench-bsc"\nbench_mode = "new-payload-fcu"'))
+        self.assertEqual(cfg.global_.bench_mode, "new-payload-fcu")
+
+    def test_default_bench_mode(self):
+        self.assertEqual(load_str(VALID).global_.bench_mode, "forkchoice-only")
+
     def test_example_config_parses(self):
         example = Path(__file__).resolve().parents[1] / "config.example.toml"
         cfg = load_config(example)

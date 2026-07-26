@@ -123,6 +123,18 @@ class TestArgv(unittest.TestCase):
         argv = runner.node_argv(cfg.configs[0], cfg.groups[0])
         self.assertEqual(argv[-1], "--statedb.triedb")
 
+    def test_bench_argv_uses_configured_mode(self):
+        runner, cfg = self.make_runner()
+        argv = runner.bench_argv(cfg.groups[0], Path("/tmp/run"))
+        self.assertEqual(argv[1], "forkchoice-only")  # default
+
+        cfg.global_.bench_mode = "new-payload-fcu"
+        runner2 = Runner(cfg, Path("/tmp"), dry_run=True)
+        argv2 = runner2.bench_argv(cfg.groups[0], Path("/tmp/run"))
+        self.assertEqual(argv2[1], "new-payload-fcu")
+        # everything else must be identical - the modes take the same arguments
+        self.assertEqual(argv[2:], argv2[2:])
+
     def test_bench_argv_replays_from_minus_one(self):
         # reth-bench replays --from+1 ..= --to, so --from must be from_block-1
         # or the first measured block is silently skipped.

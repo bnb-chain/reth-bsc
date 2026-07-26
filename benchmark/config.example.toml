@@ -23,7 +23,21 @@ node_ready_timeout_secs    = 300
 node_shutdown_timeout_secs = 120
 # A run is marked invalid if any node.log line matches one of these regexes.
 error_log_patterns = ["state root", "ERROR"]
+# Driver subcommand:
+#   "forkchoice-only"  - sends only the forkchoice update, so the NODE must
+#                        fetch each block over p2p. Requires a peered node that
+#                        can reach a source of blocks from..to, and the fetch
+#                        happens inside the measured window.
+#   "new-payload-fcu"  - the driver pushes the block in over the engine API.
+#                        Needs no peers at all, and block fetching happens in
+#                        the driver's prefetch task, outside the measurement.
+#                        Requires a node built from a branch registering
+#                        engine_newPayloadBscV1 under the `bench-test` feature.
+bench_mode = "forkchoice-only"
 # Passed to every node so it cannot sync past the snapshot head on its own.
+# NOTE: zero peers only works with bench_mode = "new-payload-fcu". Under
+# "forkchoice-only" the node needs a peer to fetch block bodies from, or every
+# cell hangs in SYNCING.
 isolation_args = ["--disable-discovery", "--max-outbound-peers", "0", "--max-inbound-peers", "0"]
 
 [[configs]]                     # baseline
