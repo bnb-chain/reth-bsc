@@ -181,19 +181,38 @@ if head is None:
     head = max(stages.values())
     print("warning: no Finish checkpoint; using max stage checkpoint", file=sys.stderr)
 
-# A checkpoint of exactly 0 means the stage never advanced - the pipeline never
-# ran it. That is a config/sync-path difference (fastnode disables the hashing
-# stages, and a node that synced live via the engine never runs some of these),
-# not a partial unwind. A stage stopped PART WAY - nonzero but below head - is
-# the one that means the datadir is inconsistent.
+# Three distinct situations, which need distinct wording - reporting them all as
+# "below head" once nearly caused a completed sync to be redone from scratch.
+#
+#   0            - the stage never advanced. A config/sync-path difference
+#                  (fastnode drops the hashing stages; a live-synced datadir
+#                  never runs some of these), not damage.
+#   below head   - stopped part way. This is the one that means inconsistent.
+#   above head   - the pipeline got that far but did not reach `Finish`, which
+#                  is what `head` reports. An interrupted run, and re-running it
+#                  usually just completes the trailing stages.
 never_ran = sorted(k for k, v in stages.items() if v == 0 and head != 0)
-partial = sorted(((k, v) for k, v in stages.items() if v != head and v != 0),
-                 key=lambda kv: kv[1])
+behind = sorted(((k, v) for k, v in stages.items() if v != 0 and v < head),
+                key=lambda kv: kv[1])
+ahead = sorted(((k, v) for k, v in stages.items() if v > head), key=lambda kv: kv[1])
 
-if partial:
-    print(f"WARNING: {len(partial)} stage(s) stopped below {head} - snapshot may be mid-unwind:",
+if behind:
+    print(f"WARNING: {len(behind)} stage(s) stopped below {head} - snapshot may be mid-unwind:",
           file=sys.stderr)
-    for k, v in partial:
+    for k, v in behind:
+        print(f"    {k:<24} {v}", file=sys.stderr)
+
+if ahead:
+    top = max(v for _, v in ahead)
+    print(f"note: {len(ahead)} stage(s) are AHEAD of the reported head, up to {top}.",
+          file=sys.stderr)
+    print(f"      The pipeline reached {top} but did not complete `Finish`, so the head",
+          file=sys.stderr)
+    print("      still reads lower. Re-running the same sync normally finishes in moments -",
+          file=sys.stderr)
+    print("      the expensive stages are already committed. Do not start over.",
+          file=sys.stderr)
+    for k, v in ahead:
         print(f"    {k:<24} {v}", file=sys.stderr)
 
 if never_ran:
