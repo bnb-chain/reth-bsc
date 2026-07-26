@@ -1,3 +1,9 @@
+# Independent workspace, deliberately not a member of the root one: this crate
+# pins a different `bnb-chain/reth` rev than the node (see below) and keeps its
+# own Cargo.lock. Without this empty table cargo tries to attach it to the root
+# workspace and refuses to build.
+[workspace]
+
 [package]
 name = "reth-bench-bsc"
 version = "1.0.0"
