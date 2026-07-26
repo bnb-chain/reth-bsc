@@ -18,13 +18,17 @@
 # minutes on a mainnet-sized datadir, with no progress output. Extra node args
 # (e.g. --statedb.triedb) go after `--` and only apply in this mode.
 #
+# --stages dumps every stage checkpoint. Worth doing once per snapshot group:
+# two datadirs at the same height but with different stage profiles (e.g. one
+# fastnode, one not) are not a like-for-like benchmark.
+#
 # Usage:
-#   benchmark/snapshot_height.sh <binary> <datadir> [--chain NAME] [--via-rpc]
-#       [--http-port N] [--wait-secs N] [-- <extra node args>]
+#   benchmark/snapshot_height.sh <binary> <datadir> [--chain NAME] [--stages]
+#       [--via-rpc] [--http-port N] [--wait-secs N] [-- <extra node args>]
 #
 # Examples:
 #   benchmark/snapshot_height.sh ./reth-bsc /snapshots/legacy-mdbx
-#   benchmark/snapshot_height.sh ./reth-bsc /snapshots/legacy-triedb
+#   benchmark/snapshot_height.sh ./reth-bsc /snapshots/legacy-triedb --stages
 #   benchmark/snapshot_height.sh ./reth-bsc /snapshots/legacy-triedb \
 #       --via-rpc --wait-secs 1800 -- --statedb.triedb
 
@@ -41,12 +45,14 @@ shift 2
 
 CHAIN=bsc
 VIA_RPC=0
+SHOW_STAGES=0
 HTTP_PORT=8545
 WAIT_SECS=300
 EXTRA_ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --chain) CHAIN=$2; shift 2 ;;
+        --stages) SHOW_STAGES=1; shift ;;
         --via-rpc) VIA_RPC=1; shift ;;
         --http-port) HTTP_PORT=$2; shift 2 ;;
         --wait-secs) WAIT_SECS=$2; shift 2 ;;
@@ -122,8 +128,10 @@ read_offline() {
 
     # Reports the Finish checkpoint, and flags any stage that lags behind it -
     # a snapshot whose stages disagree cannot be compared against another.
-    python3 - "$json_file" <<'PY'
-import json, sys
+    SHOW_STAGES=$SHOW_STAGES python3 - "$json_file" <<'PY'
+import json, os, sys
+
+SHOW_STAGES = os.environ.get("SHOW_STAGES") == "1"
 
 with open(sys.argv[1], errors="replace") as fh:
     raw = fh.read()
@@ -173,11 +181,32 @@ if head is None:
     head = max(stages.values())
     print("warning: no Finish checkpoint; using max stage checkpoint", file=sys.stderr)
 
-behind = {k: v for k, v in stages.items() if v != head}
-if behind:
-    print(f"warning: {len(behind)} stage(s) not at {head} - snapshot may be mid-unwind:",
+# A checkpoint of exactly 0 means the stage never advanced - the pipeline never
+# ran it. That is a config/sync-path difference (fastnode disables the hashing
+# stages, and a node that synced live via the engine never runs some of these),
+# not a partial unwind. A stage stopped PART WAY - nonzero but below head - is
+# the one that means the datadir is inconsistent.
+never_ran = sorted(k for k, v in stages.items() if v == 0 and head != 0)
+partial = sorted(((k, v) for k, v in stages.items() if v != head and v != 0),
+                 key=lambda kv: kv[1])
+
+if partial:
+    print(f"WARNING: {len(partial)} stage(s) stopped below {head} - snapshot may be mid-unwind:",
           file=sys.stderr)
-    for k, v in sorted(behind.items(), key=lambda kv: kv[1]):
+    for k, v in partial:
+        print(f"    {k:<24} {v}", file=sys.stderr)
+
+if never_ran:
+    print(f"note: {len(never_ran)} stage(s) never ran (checkpoint 0): {', '.join(never_ran)}",
+          file=sys.stderr)
+    print("      Expected for fastnode/live-synced datadirs; compare across snapshots",
+          file=sys.stderr)
+    print("      with --stages, since a differing stage profile is not a like-for-like benchmark.",
+          file=sys.stderr)
+
+if SHOW_STAGES:
+    print(f"stage checkpoints ({len(stages)}):", file=sys.stderr)
+    for k, v in sorted(stages.items()):
         print(f"    {k:<24} {v}", file=sys.stderr)
 
 print(f"head block: {head} ({hex(head)})")
