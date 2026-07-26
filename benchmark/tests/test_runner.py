@@ -72,6 +72,51 @@ class TestNoRestore(unittest.TestCase):
         self.assertIn("dry_run", result.checks)
 
 
+class TestArgv(unittest.TestCase):
+    """Guards the exact spelling of node/driver flags.
+
+    These are passed straight to binaries we don't build here, so a wrong
+    spelling only surfaces as a failed run on the benchmark machine. The IPC
+    flag already cost one: `--ipc.path` is rejected by every reth revision,
+    which derives it from the field name as `--ipcpath`.
+    """
+
+    def make_runner(self):
+        cfg = MatrixConfig(
+            global_=GlobalConfig(
+                jwt_secret="/jwt.hex",
+                output_dir="o",
+                bench_bin="/bin/bench",
+                ipc_path="/tmp/reth-bench.ipc",
+                http_port=8545,
+                authrpc_port=8551,
+            ),
+            configs=[NodeConfig("a", "/bin/a", "/data", extra_node_args=["--statedb.triedb"])],
+            groups=[Group("g1", "Group One", "http://x", 100, 110)],
+        )
+        return Runner(cfg, Path("/tmp"), dry_run=True), cfg
+
+    def test_node_argv_ipc_flag_spelling(self):
+        runner, cfg = self.make_runner()
+        argv = runner.node_argv(cfg.configs[0], cfg.groups[0])
+        self.assertIn("--ipcpath", argv)
+        self.assertNotIn("--ipc.path", argv)
+        self.assertEqual(argv[argv.index("--ipcpath") + 1], "/tmp/reth-bench.ipc")
+
+    def test_node_argv_carries_extra_args_last(self):
+        runner, cfg = self.make_runner()
+        argv = runner.node_argv(cfg.configs[0], cfg.groups[0])
+        self.assertEqual(argv[-1], "--statedb.triedb")
+
+    def test_bench_argv_replays_from_minus_one(self):
+        # reth-bench replays --from+1 ..= --to, so --from must be from_block-1
+        # or the first measured block is silently skipped.
+        runner, cfg = self.make_runner()
+        argv = runner.bench_argv(cfg.groups[0], Path("/tmp/run"))
+        self.assertEqual(argv[argv.index("--from") + 1], "99")
+        self.assertEqual(argv[argv.index("--to") + 1], "110")
+
+
 class TestMetaMerge(unittest.TestCase):
     def make_cfg(self) -> MatrixConfig:
         return MatrixConfig(

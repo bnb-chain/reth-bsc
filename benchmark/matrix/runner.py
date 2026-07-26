@@ -146,7 +146,11 @@ class Runner:
             str(self.g.authrpc_port),
             "--authrpc.jwtsecret",
             self.g.jwt_secret,
-            "--ipc.path",
+            # Note: `--ipcpath`, not `--ipc.path`. reth derives this flag from
+            # the struct field name (RpcServerArgs::ipcpath) with no `long =`
+            # override, so the dotted form is rejected outright by every
+            # revision, old and new.
+            "--ipcpath",
             self.g.ipc_path,
             *self.g.isolation_args,
             *config.extra_node_args,
