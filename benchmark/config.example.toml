@@ -10,7 +10,9 @@
 chain         = "bsc"
 jwt_secret    = "/path/to/jwt.hex"
 output_dir    = "benchmark/results"
-bench_bin     = "bin/reth-bench/target/maxperf/reth-bench-bsc"
+# `make reth-bench` builds this. Its crate is a separate workspace and defines
+# no maxperf profile, so it lands under target/release/, not target/maxperf/.
+bench_bin     = "bin/reth-bench/target/release/reth-bench-bsc"
 authrpc_port  = 8551
 http_port     = 8545
 ipc_path      = "/tmp/reth-bench.ipc"
