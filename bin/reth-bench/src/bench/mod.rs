@@ -7,6 +7,7 @@ use reth_tracing::FileWorkerGuard;
 
 mod context;
 mod forkchoice_only;
+mod new_payload_fcu;
 mod output;
 
 /// `reth bench` command
@@ -23,7 +24,16 @@ pub struct BenchmarkCommand {
 #[derive(Subcommand, Debug)]
 pub enum Subcommands {
     /// Benchmark which only calls subsequent `forkchoiceUpdated` calls.
+    ///
+    /// The node must obtain each block itself over p2p, so this requires a
+    /// peered node. Use `new-payload-fcu` if the node cannot peer.
     ForkchoiceOnly(forkchoice_only::Command),
+    /// Benchmark which pushes each block with `newPayload`, then calls
+    /// `forkchoiceUpdated`.
+    ///
+    /// Requires a node built with the `bench-test` feature. Needs no peers:
+    /// blocks are fetched from `--rpc-url` and handed to the node directly.
+    NewPayloadFcu(new_payload_fcu::Command),
 }
 
 impl BenchmarkCommand {
@@ -34,6 +44,7 @@ impl BenchmarkCommand {
 
         match self.command {
             Subcommands::ForkchoiceOnly(command) => command.execute(ctx).await,
+            Subcommands::NewPayloadFcu(command) => command.execute(ctx).await,
         }
     }
 

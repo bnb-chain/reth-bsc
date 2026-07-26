@@ -24,6 +24,8 @@ reth-primitives-traits = { git = "https://github.com/bnb-chain/reth", rev = "b11
 reth-tracing = { git = "https://github.com/bnb-chain/reth", rev = "b11687867" }
 
 # alloy
+alloy-consensus = "1.0"
+alloy-rlp = "0.3"
 alloy-eips = "1.0"
 alloy-json-rpc = "1.0" 
 alloy-primitives = "1.3"

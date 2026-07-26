@@ -4758,11 +4758,13 @@ dependencies = [
 name = "reth-bench-bsc"
 version = "1.0.0"
 dependencies = [
+ "alloy-consensus",
  "alloy-eips",
  "alloy-json-rpc",
  "alloy-primitives",
  "alloy-provider",
  "alloy-pubsub",
+ "alloy-rlp",
  "alloy-rpc-client",
  "alloy-rpc-types-engine",
  "alloy-transport",
