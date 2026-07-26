@@ -129,13 +129,22 @@ Invalid runs (failed checks) are recorded but excluded from the chart.
 
    ```bash
    benchmark/snapshot_height.sh <binary> <snapshot-datadir>
-   benchmark/snapshot_height.sh <triedb-binary> <snapshot-datadir> -- --statedb.triedb
    ```
 
-   It starts the node with p2p disabled (so it can't advance), prints the head
-   block number, and stops it. If the three differ, advance the lower ones to
-   the highest common height with the recipe above, then set `from` to that
-   height + 1.
+   It reads the stage checkpoints out of mdbx read-only (`db list
+   StageCheckpoints`), prints the head block number, and warns if any stage
+   lags behind `Finish` — which means the snapshot is mid-unwind and cannot be
+   compared against another. Same command for both backends: it never opens the
+   state backend, so the triedb snapshots need no `--statedb.triedb`.
+
+   If the three heights differ, advance the lower ones to the highest common
+   height with the recipe above, then set `from` to that height + 1.
+
+   To cross-check a number against a live `eth_blockNumber`, add `--via-rpc`
+   (plus `-- --statedb.triedb` for a triedb snapshot). Be aware that path takes
+   the mdbx read-write lock and, on triedb, spends several silent minutes in
+   the RocksDB open before the RPC port comes up — raise `--wait-secs` (default
+   300) accordingly, and make sure no other reth process is on the datadir.
 
 4. A JWT secret file (hex) shared by the node and the driver.
 

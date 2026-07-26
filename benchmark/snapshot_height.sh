@@ -1,21 +1,32 @@
 #!/usr/bin/env bash
-# Report the head block number of a snapshot datadir, by briefly starting the
-# node on it (p2p disabled so it cannot advance) and querying eth_blockNumber.
+# Report the head block number of a snapshot datadir.
 #
 # Use this to confirm all of a group's snapshots sit at the SAME height before
 # benchmarking: the range is from..to and every config's node must start at
-# exactly from-1. Run it once per (binary, snapshot); extra node args (e.g.
-# --statedb.triedb) go after `--`.
+# exactly from-1.
+#
+# Default (offline) mode reads the stage checkpoints out of mdbx with
+# `<binary> db list StageCheckpoints`. That path opens mdbx read-only, so it
+# takes no storage lock, and it never touches the triedb/pathdb state backend -
+# it returns in seconds regardless of backend, and it also reports when a
+# snapshot's stages disagree (a half-unwound datadir).
+#
+# --via-rpc boots the node with p2p disabled and calls eth_blockNumber instead.
+# That is far slower and more invasive: it takes the mdbx read-WRITE lock, and
+# on a triedb snapshot the RocksDB open runs with max_open_files=-1, so it
+# builds table readers for every SST before emitting a single log line - many
+# minutes on a mainnet-sized datadir, with no progress output. Extra node args
+# (e.g. --statedb.triedb) go after `--` and only apply in this mode.
 #
 # Usage:
-#   benchmark/snapshot_height.sh <binary> <datadir> [--http-port N] [--wait-secs N] [-- <extra node args>]
-#
-# --wait-secs defaults to 300. TrieDB opens slower than MDBX (it initializes
-# the pathdb + difflayers), so bump this if a triedb snapshot times out.
+#   benchmark/snapshot_height.sh <binary> <datadir> [--chain NAME] [--via-rpc]
+#       [--http-port N] [--wait-secs N] [-- <extra node args>]
 #
 # Examples:
 #   benchmark/snapshot_height.sh ./reth-bsc /snapshots/legacy-mdbx
-#   benchmark/snapshot_height.sh ./reth-bsc /snapshots/legacy-triedb --wait-secs 600 -- --statedb.triedb
+#   benchmark/snapshot_height.sh ./reth-bsc /snapshots/legacy-triedb
+#   benchmark/snapshot_height.sh ./reth-bsc /snapshots/legacy-triedb \
+#       --via-rpc --wait-secs 1800 -- --statedb.triedb
 
 set -euo pipefail
 
@@ -28,11 +39,15 @@ BINARY=$1
 DATADIR=$2
 shift 2
 
+CHAIN=bsc
+VIA_RPC=0
 HTTP_PORT=8545
 WAIT_SECS=300
 EXTRA_ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --chain) CHAIN=$2; shift 2 ;;
+        --via-rpc) VIA_RPC=1; shift ;;
         --http-port) HTTP_PORT=$2; shift 2 ;;
         --wait-secs) WAIT_SECS=$2; shift 2 ;;
         --) shift; EXTRA_ARGS=("$@"); break ;;
@@ -43,6 +58,100 @@ done
 [[ -x "$BINARY" ]] || { echo "error: binary not executable: $BINARY" >&2; exit 1; }
 [[ -d "$DATADIR" ]] || { echo "error: datadir not found: $DATADIR" >&2; exit 1; }
 
+# ---------------------------------------------------------------------------
+# Who else is on this datadir?
+#
+# reth writes "<pid>\n<start_time>" to <datadir>/db/lock when it opens mdbx
+# read-write, and refuses to start while a process with that exact pid AND
+# start time is alive (crates/storage/db/src/lockfile.rs). A killed node leaves
+# the file behind, which reth correctly ignores - so only report a holder whose
+# pid still resolves to a live reth-ish process, otherwise a recycled pid would
+# produce a bogus warning.
+# ---------------------------------------------------------------------------
+lock_holder_pid() {
+    local lock_file="$DATADIR/db/lock" pid cmd
+    [[ -f "$lock_file" ]] || return 0
+    pid=$(head -n 1 "$lock_file" 2>/dev/null | tr -d '[:space:]')
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+    kill -0 "$pid" 2>/dev/null || return 0
+    cmd=$(ps -o comm= -p "$pid" 2>/dev/null || true)
+    [[ "$cmd" == *reth* ]] || return 0
+    printf '%s' "$pid"
+}
+
+# ---------------------------------------------------------------------------
+# Offline: read the stage checkpoints from mdbx.
+#
+# `db list ... --json` prints a JSON array of [stage_id, {block_number, ...}]
+# pairs on stdout and its own logs on stderr. --len must exceed the number of
+# stages (default is 5) or the JSON is truncated to the first few.
+# ---------------------------------------------------------------------------
+read_offline() {
+    local json_file err_file rc=0
+    json_file=$(mktemp "${TMPDIR:-/tmp}/snapshot_height_json.XXXXXX")
+    err_file=$(mktemp "${TMPDIR:-/tmp}/snapshot_height_err.XXXXXX")
+    # shellcheck disable=SC2064
+    trap "rm -f '$json_file' '$err_file'" RETURN
+
+    echo "reading stage checkpoints from $DATADIR (mdbx, read-only)" >&2
+    "$BINARY" db --chain "$CHAIN" --datadir "$DATADIR" \
+        list StageCheckpoints --json --len 64 >"$json_file" 2>"$err_file" || rc=$?
+
+    if (( rc != 0 )); then
+        echo "error: '$BINARY db list StageCheckpoints' failed (exit $rc)." >&2
+        local holder
+        holder=$(lock_holder_pid)
+        if [[ -n "$holder" ]]; then
+            echo "A reth process (PID $holder) is live on this datadir; stop it first (kill $holder)." >&2
+        fi
+        echo "Last output lines:" >&2
+        tail -n 20 "$err_file" >&2
+        return 1
+    fi
+
+    if [[ ! -s "$json_file" ]]; then
+        echo "error: no JSON on stdout - StageCheckpoints looks empty for this datadir." >&2
+        tail -n 20 "$err_file" >&2
+        return 1
+    fi
+
+    # Reports the Finish checkpoint, and flags any stage that lags behind it -
+    # a snapshot whose stages disagree cannot be compared against another.
+    python3 - "$json_file" <<'PY'
+import json, sys
+
+with open(sys.argv[1]) as fh:
+    rows = json.load(fh)
+
+# Tolerate both the [[k, v], ...] list-of-pairs shape and a plain object.
+pairs = rows.items() if isinstance(rows, dict) else (tuple(r) for r in rows)
+stages = {}
+for key, value in pairs:
+    if isinstance(value, dict) and "block_number" in value:
+        stages[key] = value["block_number"]
+
+if not stages:
+    sys.exit("error: no stage checkpoints parsed from db output")
+
+head = stages.get("Finish")
+if head is None:
+    head = max(stages.values())
+    print("warning: no Finish checkpoint; using max stage checkpoint", file=sys.stderr)
+
+behind = {k: v for k, v in stages.items() if v != head}
+if behind:
+    print(f"warning: {len(behind)} stage(s) not at {head} - snapshot may be mid-unwind:",
+          file=sys.stderr)
+    for k, v in sorted(behind.items(), key=lambda kv: kv[1]):
+        print(f"    {k:<24} {v}", file=sys.stderr)
+
+print(f"head block: {head} ({hex(head)})")
+PY
+}
+
+# ---------------------------------------------------------------------------
+# Via RPC: boot the node with p2p disabled and ask eth_blockNumber.
+# ---------------------------------------------------------------------------
 NODE_PID=""
 cleanup() {
     if [[ -n "$NODE_PID" ]] && kill -0 "$NODE_PID" 2>/dev/null; then
@@ -51,65 +160,97 @@ cleanup() {
             kill -0 "$NODE_PID" 2>/dev/null || break
             sleep 1
         done
-        kill -0 "$NODE_PID" 2>/dev/null && kill -KILL "$NODE_PID" 2>/dev/null || true
-    fi
-}
-trap cleanup EXIT
-
-NODE_LOG=$(mktemp "${TMPDIR:-/tmp}/snapshot_height_node.XXXXXX")
-echo "starting $BINARY on $DATADIR (p2p disabled); node log -> $NODE_LOG" >&2
-# The `+` guard keeps an empty EXTRA_ARGS from tripping `set -u` on bash < 4.4
-# (e.g. macOS system bash 3.2); it expands to zero words when unset.
-"$BINARY" node --chain bsc --datadir "$DATADIR" \
-    --http --http.port "$HTTP_PORT" \
-    --disable-discovery --max-outbound-peers 0 --max-inbound-peers 0 \
-    ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} >"$NODE_LOG" 2>&1 &
-NODE_PID=$!
-
-# poll every 2s for up to WAIT_SECS
-MAX_TRIES=$(( WAIT_SECS / 2 ))
-(( MAX_TRIES < 1 )) && MAX_TRIES=1
-HEX=""
-RESP=""
-RC=0
-for i in $(seq 1 $MAX_TRIES); do
-    if ! kill -0 "$NODE_PID" 2>/dev/null; then
-        echo "error: node exited early. Last log lines:" >&2
-        tail -n 20 "$NODE_LOG" >&2
-        exit 1
-    fi
-    # `|| true`: while the node is still opening its RPC port, curl exits
-    # non-zero (connection refused). Without this the failed command
-    # substitution would trip `set -e` and kill the script on the first try
-    # instead of retrying.
-    RESP=$(curl -s "localhost:$HTTP_PORT" -X POST -H 'Content-Type: application/json' \
-        -d '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}') && RC=0 || RC=$?
-    HEX=$(printf '%s' "$RESP" | sed -n 's/.*"result":"\(0x[0-9a-fA-F]\{1,\}\)".*/\1/p')
-    [[ -n "$HEX" ]] && break
-    # Heartbeat that distinguishes the two failure shapes: curl couldn't
-    # connect (RPC port not open yet) vs. it connected but the JSON had no
-    # result (node up, eth_blockNumber still erroring during init).
-    if (( i % 5 == 0 )); then
-        if (( RC != 0 )); then
-            echo "  ... waiting for RPC port $HTTP_PORT to open (curl rc=$RC, ${i}/${MAX_TRIES})" >&2
-        else
-            echo "  ... RPC is up but no block number yet (${i}/${MAX_TRIES}); last response: ${RESP:0:200}" >&2
+        if kill -0 "$NODE_PID" 2>/dev/null; then
+            kill -KILL "$NODE_PID" 2>/dev/null || true
+            sleep 2
+            # A node stuck in uninterruptible I/O outlives SIGKILL until the
+            # syscall returns, and keeps holding the mdbx lock - which makes the
+            # NEXT run fail with "storage directory is currently in use". Say so
+            # here rather than letting that be a surprise later.
+            if kill -0 "$NODE_PID" 2>/dev/null; then
+                echo "WARNING: node PID $NODE_PID survived SIGKILL and still holds" >&2
+                echo "  $DATADIR/db/lock - later runs on this datadir will fail until it exits." >&2
+                echo "  Inspect with: ps -o pid,stat,wchan:24,etime,cmd -p $NODE_PID" >&2
+            fi
         fi
     fi
-    sleep 2
-done
+}
 
-if [[ -z "$HEX" ]]; then
-    echo "error: RPC on port $HTTP_PORT did not return a block number after ~$((MAX_TRIES * 2))s." >&2
-    if (( RC != 0 )); then
-        echo "The RPC port never opened (curl rc=$RC) - the node was still initializing." >&2
-    else
-        echo "The RPC answered but without a result. Last response: $RESP" >&2
+read_via_rpc() {
+    trap cleanup EXIT
+
+    local holder
+    holder=$(lock_holder_pid)
+    if [[ -n "$holder" ]]; then
+        echo "error: a reth process (PID $holder) already holds $DATADIR/db/lock." >&2
+        echo "Stop it first (kill $holder), or use the default offline mode which needs no lock." >&2
+        return 1
     fi
-    echo "Last node log lines:" >&2
-    tail -n 20 "$NODE_LOG" >&2
-    exit 1
-fi
 
-DEC=$((HEX))
-echo "head block: $DEC ($HEX)"
+    local node_log
+    node_log=$(mktemp "${TMPDIR:-/tmp}/snapshot_height_node.XXXXXX")
+    echo "starting $BINARY on $DATADIR (p2p disabled); node log -> $node_log" >&2
+    # The `+` guard keeps an empty EXTRA_ARGS from tripping `set -u` on bash < 4.4
+    # (e.g. macOS system bash 3.2); it expands to zero words when unset.
+    "$BINARY" node --chain "$CHAIN" --datadir "$DATADIR" \
+        --http --http.port "$HTTP_PORT" \
+        --disable-discovery --max-outbound-peers 0 --max-inbound-peers 0 \
+        ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} >"$node_log" 2>&1 &
+    NODE_PID=$!
+
+    # poll every 2s for up to WAIT_SECS
+    local max_tries=$(( WAIT_SECS / 2 ))
+    (( max_tries < 1 )) && max_tries=1
+    local hex="" resp="" rc=0 i
+    for i in $(seq 1 "$max_tries"); do
+        if ! kill -0 "$NODE_PID" 2>/dev/null; then
+            echo "error: node exited early. Last log lines:" >&2
+            tail -n 20 "$node_log" >&2
+            return 1
+        fi
+        # `|| true`: while the node is still opening its RPC port, curl exits
+        # non-zero (connection refused). Without this the failed command
+        # substitution would trip `set -e` and kill the script on the first try
+        # instead of retrying.
+        resp=$(curl -s "localhost:$HTTP_PORT" -X POST -H 'Content-Type: application/json' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}') && rc=0 || rc=$?
+        hex=$(printf '%s' "$resp" | sed -n 's/.*"result":"\(0x[0-9a-fA-F]\{1,\}\)".*/\1/p')
+        [[ -n "$hex" ]] && break
+        # Heartbeat that distinguishes the two failure shapes: curl couldn't
+        # connect (RPC port not open yet) vs. it connected but the JSON had no
+        # result (node up, eth_blockNumber still erroring during init).
+        if (( i % 5 == 0 )); then
+            if (( rc != 0 )); then
+                echo "  ... waiting for RPC port $HTTP_PORT to open (curl rc=$rc, ${i}/${max_tries})" >&2
+            else
+                echo "  ... RPC is up but no block number yet (${i}/${max_tries}); last response: ${resp:0:200}" >&2
+            fi
+        fi
+        sleep 2
+    done
+
+    if [[ -z "$hex" ]]; then
+        echo "error: RPC on port $HTTP_PORT did not return a block number after ~$((max_tries * 2))s." >&2
+        if (( rc != 0 )); then
+            echo "The RPC port never opened (curl rc=$rc) - the node was still initializing." >&2
+            echo "On a triedb snapshot this is usually the RocksDB open; raise --wait-secs, or" >&2
+            echo "drop --via-rpc to read the height offline instead." >&2
+        else
+            echo "The RPC answered but without a result. Last response: $resp" >&2
+        fi
+        echo "Last node log lines:" >&2
+        tail -n 20 "$node_log" >&2
+        return 1
+    fi
+
+    echo "head block: $((hex)) ($hex)"
+}
+
+if (( VIA_RPC )); then
+    read_via_rpc
+else
+    if (( ${#EXTRA_ARGS[@]} )); then
+        echo "note: extra node args are ignored in offline mode (they only apply to --via-rpc)" >&2
+    fi
+    read_offline
+fi
