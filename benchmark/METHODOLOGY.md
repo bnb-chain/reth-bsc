@@ -288,7 +288,7 @@ bench_mode    = "new-payload-fcu"   # not the default forkchoice-only
 warmup_blocks = 200
 authrpc_port  = 8601
 http_port     = 8600
-node_ready_timeout_secs = 7200      # triedb's RocksDB open is hours
+node_ready_timeout_secs = 7200      # triedb's RocksDB open measured at 41m30s
 isolation_args = ["--disable-discovery", "--max-outbound-peers", "0",
                   "--max-inbound-peers", "0"]
 ```
@@ -379,15 +379,23 @@ over months of syncing. A freshly built trie is likely better laid out on disk.
 This favours mdbx v2 for reasons unrelated to the storage format. **Not
 quantified.**
 
-**triedb pays a multi-hour RocksDB open on every node start.** Measured: 128
-MB/s sustained reads, 155 GB read in the first 20 minutes, no completion within
-that window, against a 1013 GB store of 14,568 SSTs. `PathDB::new` opens the
+**triedb pays a ~40-minute RocksDB open on every node start.** Measured on a
+cold page cache against a 1013 GB store of 14,568 SSTs: **41m30s** from
+`Opening database` (17:11:46) to `RPC HTTP server started` (17:53:16), reading
+at a sustained 128 MB/s for a cumulative **~330 GB**. `PathDB::new` opens the
 database twice (once to enumerate column families, once with descriptors), and
 `max_open_files = -1` loads table readers for every SST up front. mdbx opens in
-constant time by comparison. This is a real operational property of triedb worth
-reporting, but it also means each triedb cell carries hours of setup.
-**Unverified:** total open time, and whether a warm-page-cache restart is
-materially faster.
+constant time by comparison — seconds, regardless of its 5.4 TB size.
+
+This is a real operational property of triedb, not a benchmark artifact, and
+worth reporting as a result in its own right: restarting a 1 TB triedb node
+costs 40 minutes. It also means every triedb cell carries that setup before its
+first block executes, which is why `node_ready_timeout_secs` is 7200.
+
+**Unverified:** whether a warm-page-cache restart is materially faster. The
+measurement above was cold and with an unrelated trie rebuild running
+concurrently (that job was doing only ~2 MB/s, so contention was probably
+minor). A back-to-back restart would answer it.
 
 **The three datadirs have different provenance.** mdbx v1 came from a full
 staged-sync pipeline (all 15 stage checkpoints at head); mdbx v2 came from
