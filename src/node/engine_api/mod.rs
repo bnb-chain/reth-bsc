@@ -11,6 +11,18 @@ use jsonrpsee_types::ErrorObjectOwned;
 use reth_payload_primitives::EngineApiMessageVersion;
 #[cfg(feature = "bench-test")]
 use reth_node_ethereum::engine::EthPayloadAttributes;
+#[cfg(feature = "bench-test")]
+use alloy_primitives::hex;
+#[cfg(feature = "bench-test")]
+use alloy_rlp::Decodable;
+#[cfg(feature = "bench-test")]
+use reth_ethereum_primitives::Block as EthBlock;
+
+#[cfg(feature = "bench-test")]
+use crate::node::{
+    engine_api::validator::BscExecutionData,
+    primitives::{BscBlock, BscBlockBody},
+};
 
 
 pub mod builder;
@@ -46,12 +58,17 @@ impl IntoEngineApiRpcModule for BscEngineApi {
         #[cfg(not(feature = "bench-test"))]
         let module = RpcModule::new(());
 
-        // Register the fork choice update v1 method only when bench-test feature is enabled
+        // BSC has no production engine API, so this module is empty in normal
+        // builds. These two methods exist only so `reth-bench-bsc` can drive the
+        // node, and only under bench-test.
         #[cfg(feature = "bench-test")]
         {
+            let fcu_handle = self.engine_handle.clone();
+            let payload_handle = self.engine_handle.clone();
+
             module
                 .register_async_method("engine_forkchoiceUpdatedV1", move |params, _, _| {
-                    let engine_handle = self.engine_handle.clone();
+                    let engine_handle = fcu_handle.clone();
 
                     async move {
                         // Parse the parameters - ForkchoiceState and optional PayloadAttributes
@@ -96,6 +113,71 @@ impl IntoEngineApiRpcModule for BscEngineApi {
                     }
                 })
                 .expect("Failed to register engine_forkchoiceUpdatedV1");
+
+            // Accepts a whole block as 0x-prefixed RLP so the driver can push
+            // blocks in, instead of the node having to fetch them over p2p.
+            //
+            // Deliberately NOT named `engine_newPayloadV1`: the parameter is a
+            // consensus block, not a spec `ExecutionPayloadV1`, and it should not
+            // be mistaken for the real thing. `bin/reth-bench` is a separate
+            // workspace on a different reth rev and cannot depend on reth-bsc
+            // types, so it sends an Ethereum-shaped block and the BSC wrapper is
+            // attached on this side.
+            //
+            // Returns the `PayloadStatus` verbatim for every status, including
+            // SYNCING and INVALID - the caller decides what counts as failure.
+            // Only parse and engine-transport failures surface as RPC errors.
+            module
+                .register_async_method("engine_newPayloadBscV1", move |params, _, _| {
+                    let engine_handle = payload_handle.clone();
+
+                    async move {
+                        let (block_rlp,): (String,) = params.parse().map_err(|e| {
+                            ErrorObjectOwned::owned(
+                                -32602,
+                                format!("Parse error: {}", e),
+                                None::<()>,
+                            )
+                        })?;
+
+                        let raw = hex::decode(block_rlp.strip_prefix("0x").unwrap_or(&block_rlp))
+                            .map_err(|e| {
+                                ErrorObjectOwned::owned(
+                                    -32602,
+                                    format!("Invalid block hex: {}", e),
+                                    None::<()>,
+                                )
+                            })?;
+
+                        let eth_block = EthBlock::decode(&mut raw.as_slice()).map_err(|e| {
+                            ErrorObjectOwned::owned(
+                                -32602,
+                                format!("Invalid block RLP: {}", e),
+                                None::<()>,
+                            )
+                        })?;
+
+                        // Sidecars are a data-availability concern and expire from
+                        // the network - the p2p path already executes these blocks
+                        // without them. Execution needs only the versioned hashes,
+                        // which the blob transactions themselves carry.
+                        let block = BscBlock {
+                            header: eth_block.header,
+                            body: BscBlockBody { inner: eth_block.body, sidecars: None },
+                        };
+
+                        engine_handle.new_payload(BscExecutionData::new(block)).await.map_err(
+                            |err| {
+                                ErrorObjectOwned::owned(
+                                    -32603,
+                                    format!("Engine new_payload error: {}", err),
+                                    None::<()>,
+                                )
+                            },
+                        )
+                    }
+                })
+                .expect("Failed to register engine_newPayloadBscV1");
         }
 
         module
