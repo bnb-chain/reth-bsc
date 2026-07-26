@@ -88,6 +88,11 @@ def _require(table: dict, key: str, where: str):
     return table[key]
 
 
+def _contains(parent: Path, child: Path) -> bool:
+    """True if `child` lies inside `parent`. Both must already be resolved."""
+    return parent in child.parents
+
+
 def load_config(path: str | Path) -> MatrixConfig:
     path = Path(path)
     with open(path, "rb") as f:
@@ -132,6 +137,30 @@ def load_config(path: str | Path) -> MatrixConfig:
     names = [c.name for c in configs]
     if len(set(names)) != len(names):
         raise ConfigError(f"duplicate config names: {names}")
+
+    # A snapshot must never be the working datadir, or live inside one.
+    #
+    # Restoring is `rsync -a --delete <snapshot>/ <datadir>/`, and a run leaves
+    # the datadir advanced to the group's `to`. So pointing both at one path
+    # silently consumes the snapshot on the first run - and once a second cell
+    # restores over that path, --delete removes what's left. Preparing a
+    # snapshot costs hours of resync, so refuse the config instead of
+    # discovering it afterwards.
+    for c in configs:
+        datadir = Path(c.datadir).expanduser().resolve()
+        for group_name, snapshot in c.snapshots.items():
+            snap = Path(snapshot).expanduser().resolve()
+            where = f"config '{c.name}' group '{group_name}'"
+            if snap == datadir:
+                raise ConfigError(
+                    f"{where}: snapshot and datadir are the same path ({snap}). "
+                    "A run advances the datadir, which would destroy the snapshot."
+                )
+            if _contains(snap, datadir) or _contains(datadir, snap):
+                raise ConfigError(
+                    f"{where}: snapshot ({snap}) and datadir ({datadir}) are nested. "
+                    "The restore would delete one while reading the other."
+                )
 
     groups = []
     for i, grp in enumerate(raw.get("groups", [])):

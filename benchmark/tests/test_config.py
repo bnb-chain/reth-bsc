@@ -76,6 +76,29 @@ class TestConfig(unittest.TestCase):
         with self.assertRaises(ConfigError):
             load_str(VALID.split("[[groups]]")[0])
 
+    def test_snapshot_equal_to_datadir_rejected(self):
+        # A run advances the datadir to the group's `to`. If the snapshot is
+        # the same path, the first run consumes it and a second cell's
+        # `rsync --delete` finishes it off - hours of resync lost silently.
+        with self.assertRaises(ConfigError):
+            load_str(VALID.replace('g1 = "/snap/base-g1"', 'g1 = "/data/d"'))
+
+    def test_snapshot_equal_to_datadir_after_normalisation_rejected(self):
+        with self.assertRaises(ConfigError):
+            load_str(VALID.replace('g1 = "/snap/base-g1"', 'g1 = "/data/./d"'))
+
+    def test_snapshot_nested_in_datadir_rejected(self):
+        with self.assertRaises(ConfigError):
+            load_str(VALID.replace('g1 = "/snap/base-g1"', 'g1 = "/data/d/snap"'))
+
+    def test_datadir_nested_in_snapshot_rejected(self):
+        with self.assertRaises(ConfigError):
+            load_str(VALID.replace('datadir = "/data/d"', 'datadir = "/snap/base-g1/work"'))
+
+    def test_distinct_paths_accepted(self):
+        cfg = load_str(VALID)
+        self.assertEqual(cfg.configs[0].snapshots["g1"], "/snap/base-g1")
+
     def test_example_config_parses(self):
         example = Path(__file__).resolve().parents[1] / "config.example.toml"
         cfg = load_config(example)
