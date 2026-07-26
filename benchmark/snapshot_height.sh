@@ -8,11 +8,14 @@
 # --statedb.triedb) go after `--`.
 #
 # Usage:
-#   benchmark/snapshot_height.sh <binary> <datadir> [--http-port N] [-- <extra node args>]
+#   benchmark/snapshot_height.sh <binary> <datadir> [--http-port N] [--wait-secs N] [-- <extra node args>]
+#
+# --wait-secs defaults to 300. TrieDB opens slower than MDBX (it initializes
+# the pathdb + difflayers), so bump this if a triedb snapshot times out.
 #
 # Examples:
 #   benchmark/snapshot_height.sh ./reth-bsc /snapshots/legacy-mdbx
-#   benchmark/snapshot_height.sh ./reth-bsc /snapshots/legacy-triedb -- --statedb.triedb
+#   benchmark/snapshot_height.sh ./reth-bsc /snapshots/legacy-triedb --wait-secs 600 -- --statedb.triedb
 
 set -euo pipefail
 
@@ -26,10 +29,12 @@ DATADIR=$2
 shift 2
 
 HTTP_PORT=8545
+WAIT_SECS=300
 EXTRA_ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --http-port) HTTP_PORT=$2; shift 2 ;;
+        --wait-secs) WAIT_SECS=$2; shift 2 ;;
         --) shift; EXTRA_ARGS=("$@"); break ;;
         *) echo "unknown argument: $1" >&2; exit 1 ;;
     esac
@@ -61,8 +66,12 @@ echo "starting $BINARY on $DATADIR (p2p disabled); node log -> $NODE_LOG" >&2
     ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} >"$NODE_LOG" 2>&1 &
 NODE_PID=$!
 
-MAX_TRIES=150
+# poll every 2s for up to WAIT_SECS
+MAX_TRIES=$(( WAIT_SECS / 2 ))
+(( MAX_TRIES < 1 )) && MAX_TRIES=1
 HEX=""
+RESP=""
+RC=0
 for i in $(seq 1 $MAX_TRIES); do
     if ! kill -0 "$NODE_PID" 2>/dev/null; then
         echo "error: node exited early. Last log lines:" >&2
@@ -73,18 +82,31 @@ for i in $(seq 1 $MAX_TRIES); do
     # non-zero (connection refused). Without this the failed command
     # substitution would trip `set -e` and kill the script on the first try
     # instead of retrying.
-    HEX=$(curl -s "localhost:$HTTP_PORT" -X POST -H 'Content-Type: application/json' \
-        -d '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' \
-        | sed -n 's/.*"result":"\(0x[0-9a-fA-F]\{1,\}\)".*/\1/p') || true
+    RESP=$(curl -s "localhost:$HTTP_PORT" -X POST -H 'Content-Type: application/json' \
+        -d '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}') && RC=0 || RC=$?
+    HEX=$(printf '%s' "$RESP" | sed -n 's/.*"result":"\(0x[0-9a-fA-F]\{1,\}\)".*/\1/p')
     [[ -n "$HEX" ]] && break
-    # periodic heartbeat so a slow-starting node isn't mistaken for a hang
-    (( i % 5 == 0 )) && echo "  ... still waiting for RPC on port $HTTP_PORT (${i}/${MAX_TRIES})" >&2
+    # Heartbeat that distinguishes the two failure shapes: curl couldn't
+    # connect (RPC port not open yet) vs. it connected but the JSON had no
+    # result (node up, eth_blockNumber still erroring during init).
+    if (( i % 5 == 0 )); then
+        if (( RC != 0 )); then
+            echo "  ... waiting for RPC port $HTTP_PORT to open (curl rc=$RC, ${i}/${MAX_TRIES})" >&2
+        else
+            echo "  ... RPC is up but no block number yet (${i}/${MAX_TRIES}); last response: ${RESP:0:200}" >&2
+        fi
+    fi
     sleep 2
 done
 
 if [[ -z "$HEX" ]]; then
     echo "error: RPC on port $HTTP_PORT did not return a block number after ~$((MAX_TRIES * 2))s." >&2
-    echo "Last log lines:" >&2
+    if (( RC != 0 )); then
+        echo "The RPC port never opened (curl rc=$RC) - the node was still initializing." >&2
+    else
+        echo "The RPC answered but without a result. Last response: $RESP" >&2
+    fi
+    echo "Last node log lines:" >&2
     tail -n 20 "$NODE_LOG" >&2
     exit 1
 fi
