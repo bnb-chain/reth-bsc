@@ -83,8 +83,13 @@ lock_holder_pid() {
 # Offline: read the stage checkpoints from mdbx.
 #
 # `db list ... --json` prints a JSON array of [stage_id, {block_number, ...}]
-# pairs on stdout and its own logs on stderr. --len must exceed the number of
-# stages (default is 5) or the JSON is truncated to the first few.
+# pairs. --len must exceed the number of stages (default is 5) or the JSON is
+# truncated to the first few.
+#
+# reth's tracing writes to STDOUT, not stderr, so its startup lines land in the
+# middle of the JSON stream. --quiet turns the log layer off (LevelFilter::OFF,
+# see Verbosity::directive); the parser below still scans past any leading
+# noise in case a build ignores it.
 # ---------------------------------------------------------------------------
 read_offline() {
     local json_file err_file rc=0
@@ -94,7 +99,7 @@ read_offline() {
     trap "rm -f '$json_file' '$err_file'" RETURN
 
     echo "reading stage checkpoints from $DATADIR (mdbx, read-only)" >&2
-    "$BINARY" db --chain "$CHAIN" --datadir "$DATADIR" \
+    "$BINARY" db --quiet --chain "$CHAIN" --datadir "$DATADIR" \
         list StageCheckpoints --json --len 64 >"$json_file" 2>"$err_file" || rc=$?
 
     if (( rc != 0 )); then
@@ -120,18 +125,48 @@ read_offline() {
     python3 - "$json_file" <<'PY'
 import json, sys
 
-with open(sys.argv[1]) as fh:
-    rows = json.load(fh)
+with open(sys.argv[1], errors="replace") as fh:
+    raw = fh.read()
 
-# Tolerate both the [[k, v], ...] list-of-pairs shape and a plain object.
-pairs = rows.items() if isinstance(rows, dict) else (tuple(r) for r in rows)
+def to_stages(doc):
+    """Pull {stage_id: block_number} out of a decoded db-list document.
+
+    Tolerates both the [[key, value], ...] list-of-pairs shape and a plain
+    object, and returns {} for anything that isn't stage checkpoints."""
+    try:
+        pairs = doc.items() if isinstance(doc, dict) else [tuple(r) for r in doc]
+    except TypeError:
+        return {}
+    stages = {}
+    for pair in pairs:
+        if len(pair) != 2:
+            continue
+        key, value = pair
+        if isinstance(value, dict) and isinstance(value.get("block_number"), int):
+            stages[key] = value["block_number"]
+    return stages
+
+
+# reth logs to stdout, not stderr, so the payload can be surrounded by log
+# lines. Scan for the first offset that both decodes as JSON and actually looks
+# like stage checkpoints - a bare "[]" inside a log line must not win.
 stages = {}
-for key, value in pairs:
-    if isinstance(value, dict) and "block_number" in value:
-        stages[key] = value["block_number"]
+decoder = json.JSONDecoder()
+for start in (i for i, ch in enumerate(raw) if ch in "[{"):
+    try:
+        doc, _ = decoder.raw_decode(raw, start)
+    except ValueError:
+        continue
+    stages = to_stages(doc)
+    if stages:
+        break
 
 if not stages:
-    sys.exit("error: no stage checkpoints parsed from db output")
+    print("error: no stage checkpoints found in db output. First lines were:",
+          file=sys.stderr)
+    for line in raw.splitlines()[:15]:
+        print(f"    {line}", file=sys.stderr)
+    sys.exit(1)
 
 head = stages.get("Finish")
 if head is None:
