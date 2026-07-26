@@ -2,9 +2,21 @@
 
 from __future__ import annotations
 
-import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
+
+try:
+    import tomllib  # Python >= 3.11
+except ModuleNotFoundError:  # pragma: no cover - depends on interpreter version
+    try:
+        import tomli as tomllib  # type: ignore[no-redef]
+    except ModuleNotFoundError:
+        raise SystemExit(
+            "This tool needs a TOML parser: either run it with Python 3.11+ "
+            "(which has tomllib in the stdlib) or `pip install tomli`.\n"
+            "Benchmark machines often ship an older system Python - check for "
+            "python3.11/3.12 before installing anything."
+        ) from None
 
 
 class ConfigError(Exception):

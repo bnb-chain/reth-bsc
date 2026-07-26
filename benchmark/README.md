@@ -8,7 +8,12 @@ throughput (Ggas/s) per block group, with % deltas vs a baseline.
 It orchestrates the existing harness — a node built with `make bench-test`
 (exposes `engine_forkchoiceUpdatedV1`) replayed by `bin/reth-bench`
 (`reth-bench-bsc forkchoice-only`) — and adds run isolation, statistics,
-summaries, and the chart. Stdlib-only Python >= 3.11.
+summaries, and the chart.
+
+Python >= 3.11 and no dependencies. On an older interpreter everything works
+except TOML parsing, so `pip install tomli` is enough — benchmark boxes often
+ship an older system Python (RHEL 9 is on 3.9), and installing an interpreter
+there is a bigger intervention than one pure-Python package.
 
 ## How it works
 
