@@ -218,6 +218,22 @@ fn main() -> eyre::Result<()> {
                     BSC_DEFAULT_GPO_IGNORE_PRICE;
             }
 
+            // BSC fix: force the serial import state-root, disabling the engine's parallel
+            // sparse-trie state-root task on block import.
+            //
+            // The sparse-trie task corrupts shared state when it validates a *reorg* block
+            // whose parent is a historical (below-tip) in-memory block: `PreservedSparseTrie`
+            // reuse on an anchor mismatch (see reth `preserved_sparse_trie.rs`) produces a wrong
+            // reconstructed parent state root, so the block's computed root mismatches its header
+            // and the (valid) block is rejected — permanently stalling sync. BSC parlia produces
+            // out-of-turn "slash" blocks on nearly every timing fork, so this reorg path is hit
+            // constantly; the serial state root reconstructs the parent correctly.
+            //
+            // Only the *import* path is affected: the miner keeps its own sparse-trie state root
+            // (it always builds on the canonical tip, never a reorg) via
+            // `--mining.use-sparse-trie-state-root`.
+            builder.config_mut().engine.state_root_fallback = true;
+
             // Map CLI args into a global MiningConfig override before launching services
             {
                 use reth_bsc::node::miner::{config as mining_config, MiningConfig};
