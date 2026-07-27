@@ -235,10 +235,61 @@ impl BscHardfork {
         ])
     }
 
+    /// Mirrors the mainnet schedule with everything that is live on mainnet active from
+    /// genesis, so the local single-validator dev chain behaves like current production
+    /// BSC (header shape, EVM spec, Parlia epoch/breathe logic, system-txs gas reserve).
+    ///
+    /// The genesis system contracts in `genesis_local.json` are generated at the same
+    /// level from `bnb-chain/bsc-genesis-contract` (`npm run generate:dev`, validator =
+    /// dev account #0), so no upgrade of a live fork fires on this chain: those forks are
+    /// already active at genesis and the baked bytecode is current.
+    ///
+    /// Forks not yet live on mainnet keep its timestamp, so the node runs their transition.
     pub fn bsc_local() -> ChainHardforks {
         ChainHardforks::new(vec![
             (EthereumHardfork::Frontier.boxed(), ForkCondition::Block(0)),
-            (Self::Bohr.boxed(), ForkCondition::Block(0)),
+            (EthereumHardfork::Homestead.boxed(), ForkCondition::Block(0)),
+            (EthereumHardfork::Tangerine.boxed(), ForkCondition::Block(0)),
+            (EthereumHardfork::SpuriousDragon.boxed(), ForkCondition::Block(0)),
+            (EthereumHardfork::Byzantium.boxed(), ForkCondition::Block(0)),
+            (EthereumHardfork::Constantinople.boxed(), ForkCondition::Block(0)),
+            (EthereumHardfork::Petersburg.boxed(), ForkCondition::Block(0)),
+            (EthereumHardfork::Istanbul.boxed(), ForkCondition::Block(0)),
+            (EthereumHardfork::MuirGlacier.boxed(), ForkCondition::Block(0)),
+            (Self::Ramanujan.boxed(), ForkCondition::Block(0)),
+            (Self::Niels.boxed(), ForkCondition::Block(0)),
+            (Self::MirrorSync.boxed(), ForkCondition::Block(0)),
+            (Self::Bruno.boxed(), ForkCondition::Block(0)),
+            (Self::Euler.boxed(), ForkCondition::Block(0)),
+            (Self::Nano.boxed(), ForkCondition::Block(0)),
+            (Self::Moran.boxed(), ForkCondition::Block(0)),
+            (Self::Gibbs.boxed(), ForkCondition::Block(0)),
+            (Self::Planck.boxed(), ForkCondition::Block(0)),
+            (Self::Luban.boxed(), ForkCondition::Block(0)),
+            (Self::Plato.boxed(), ForkCondition::Block(0)),
+            (EthereumHardfork::Berlin.boxed(), ForkCondition::Block(0)),
+            (EthereumHardfork::London.boxed(), ForkCondition::Block(0)),
+            (Self::Hertz.boxed(), ForkCondition::Block(0)),
+            (Self::HertzFix.boxed(), ForkCondition::Block(0)),
+            (EthereumHardfork::Shanghai.boxed(), ForkCondition::Timestamp(0)),
+            (Self::Kepler.boxed(), ForkCondition::Timestamp(0)),
+            (Self::Feynman.boxed(), ForkCondition::Timestamp(0)),
+            (Self::FeynmanFix.boxed(), ForkCondition::Timestamp(0)),
+            (EthereumHardfork::Cancun.boxed(), ForkCondition::Timestamp(0)),
+            (Self::Cancun.boxed(), ForkCondition::Timestamp(0)),
+            (Self::Haber.boxed(), ForkCondition::Timestamp(0)),
+            (Self::Tycho.boxed(), ForkCondition::Timestamp(0)),
+            (Self::HaberFix.boxed(), ForkCondition::Timestamp(0)),
+            (Self::Bohr.boxed(), ForkCondition::Timestamp(0)),
+            (EthereumHardfork::Prague.boxed(), ForkCondition::Timestamp(0)),
+            (Self::Pascal.boxed(), ForkCondition::Timestamp(0)),
+            (Self::Lorentz.boxed(), ForkCondition::Timestamp(0)),
+            (Self::Maxwell.boxed(), ForkCondition::Timestamp(0)),
+            (Self::Fermi.boxed(), ForkCondition::Timestamp(0)),
+            (Self::Osaka.boxed(), ForkCondition::Timestamp(0)),
+            (Self::Mendel.boxed(), ForkCondition::Timestamp(0)),
+            (Self::Pasteur.boxed(), ForkCondition::Timestamp(0)),
+            (Self::Jenner.boxed(), Self::bsc_mainnet().fork(Self::Jenner)),
         ])
     }
 }
@@ -433,8 +484,11 @@ mod tests {
     }
 
     #[test]
-    fn test_jenner_not_scheduled_on_local() {
-        assert_eq!(BscHardfork::bsc_local().fork(BscHardfork::Jenner), ForkCondition::Never);
+    fn test_jenner_follows_mainnet_on_local() {
+        assert_eq!(
+            BscHardfork::bsc_local().fork(BscHardfork::Jenner),
+            BscHardfork::bsc_mainnet().fork(BscHardfork::Jenner)
+        );
     }
 
     #[test]
