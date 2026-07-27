@@ -630,6 +630,19 @@ where
         let ElectedValidators { validators, voting_powers, vote_addrs } =
             get_top_validators_by_voting_power(validators_election_info, max_elected_validators);
 
+        // No validators registered in StakeHub yet — possible on fresh dev chains where
+        // every fork is active from genesis and nobody has staked. Calling
+        // updateValidatorSetV2 with empty arrays makes the ValidatorSet contract abort
+        // on an INVALID opcode, consuming the entire system-tx gas limit and poisoning
+        // the block's gasUsed. An empty election means "keep the current set", so skip
+        // the call. Real networks always have registered validators past Feynman.
+        if validators.is_empty() {
+            tracing::debug!(
+                "Skip updateValidatorSetV2: no validators registered in StakeHub"
+            );
+            return Ok(());
+        }
+
         self.transact_system_tx(
             self.system_contracts.update_validator_set_v2(validators, voting_powers, vote_addrs),
             validator,
