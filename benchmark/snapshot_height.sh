@@ -196,15 +196,16 @@ behind = sorted(((k, v) for k, v in stages.items() if v != 0 and v < head),
                 key=lambda kv: kv[1])
 ahead = sorted(((k, v) for k, v in stages.items() if v > head), key=lambda kv: kv[1])
 
-# Stages that legitimately sit below head because they are no-ops unless
-# explicitly configured. Era only advances when [stages.era] names a path or
-# url to import ERA1 archives from; on a normal datadir it never moves, and
-# flagging it as a possible unwind is a false alarm.
-INERT_WHEN_BEHIND = {"Era"}
+# Stages that are no-ops unless explicitly configured, so their checkpoint
+# drifts from head in either direction and means nothing either way. Era only
+# advances when [stages.era] names a path or url to import ERA1 archives from.
+# On a normal datadir it never moves: it reads as "behind" after a sync and as
+# "ahead" after an unwind, and both readings are false alarms.
+INERT = {"Era"}
 
 if behind:
-    real = [(k, v) for k, v in behind if k not in INERT_WHEN_BEHIND]
-    inert = [(k, v) for k, v in behind if k in INERT_WHEN_BEHIND]
+    real = [(k, v) for k, v in behind if k not in INERT]
+    inert = [(k, v) for k, v in behind if k in INERT]
     if real:
         print(f"WARNING: {len(real)} stage(s) stopped below {head} - snapshot may be mid-unwind:",
               file=sys.stderr)
@@ -214,9 +215,15 @@ if behind:
         print(f"note: {k} is at {v}, below the head - expected, it is a no-op "
               "unless configured.", file=sys.stderr)
 
-if ahead:
-    top = max(v for _, v in ahead)
-    print(f"note: {len(ahead)} stage(s) are AHEAD of the reported head, up to {top}.",
+real_ahead = [(k, v) for k, v in ahead if k not in INERT]
+for k, v in ahead:
+    if k in INERT:
+        print(f"note: {k} is at {v}, above the head - expected, it is a no-op "
+              "unless configured.", file=sys.stderr)
+
+if real_ahead:
+    top = max(v for _, v in real_ahead)
+    print(f"note: {len(real_ahead)} stage(s) are AHEAD of the reported head, up to {top}.",
           file=sys.stderr)
     print(f"      The pipeline reached {top} but did not complete `Finish`, so the head",
           file=sys.stderr)
@@ -224,7 +231,7 @@ if ahead:
           file=sys.stderr)
     print("      the expensive stages are already committed. Do not start over.",
           file=sys.stderr)
-    for k, v in ahead:
+    for k, v in real_ahead:
         print(f"    {k:<24} {v}", file=sys.stderr)
 
 if never_ran:
