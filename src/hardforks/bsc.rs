@@ -255,7 +255,7 @@ impl From<BscHardfork> for SpecId {
             | BscHardfork::Moran
             | BscHardfork::Planck
             | BscHardfork::Luban
-            | BscHardfork::Plato => SpecId::MUIR_GLACIER,
+            | BscHardfork::Plato => SpecId::ISTANBUL,
             BscHardfork::Hertz | BscHardfork::HertzFix => SpecId::LONDON,
             BscHardfork::Kepler | BscHardfork::Feynman | BscHardfork::FeynmanFix => {
                 SpecId::SHANGHAI

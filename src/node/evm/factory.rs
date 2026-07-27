@@ -6,7 +6,7 @@ use crate::{
     hardforks::bsc::BscHardfork,
 };
 use reth_evm::{precompiles::PrecompilesMap, Database, EvmEnv, EvmFactory};
-use revm::context::{BlockEnv, result::{EVMError, HaltReason}};
+use revm::context::{BlockEnv, DBErrorMarker, result::{EVMError, HaltReason}};
 use revm::inspector::NoOpInspector;
 use reth_revm::Inspector;
 
@@ -19,7 +19,8 @@ impl EvmFactory for BscEvmFactory {
     type Evm<DB: Database, I: Inspector<BscContext<DB>>> = BscEvm<DB, I>;
     type Context<DB: Database> = BscContext<DB>;
     type Tx = BscTxEnv;
-    type Error<DBError: core::error::Error + Send + Sync + 'static> = EVMError<DBError>;
+    type Error<DBError: core::error::Error + Send + Sync + 'static + DBErrorMarker> =
+        EVMError<DBError>;
     type HaltReason = HaltReason;
     type Spec = BscHardfork;
     type BlockEnv = BlockEnv;

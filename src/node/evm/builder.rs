@@ -145,18 +145,21 @@ where
         let finish_start = std::time::Instant::now();
         // `executor.finish()` runs BSC's post-execution system txs (slash spoiled
         // validator, distribute fees / finality rewards, breathe-block validator-set
-        // updates). Any `state_hook` previously installed on the executor — including
-        // the sparse-trie hook — captures those state changes here. Consuming the
-        // executor on the next line drops the hook closure, which triggers
-        // `StateHookSender::drop` → `FinishedStateUpdates` → sparse-trie task can
-        // safely return from `state_root()` below.
+        // updates). The sparse-trie `state_hook` is installed on the DB (v2.4.1), so it
+        // captures those commits here too.
         let (evm, result) = self.executor.finish()?;
         let (db, evm_env) = evm.finish();
 
-        // Sparse-trie state-root collection: now that the executor (and therefore the
-        // state_hook) has been dropped, the background task has all updates and is
-        // finalizing. Take the handle from ctx, block on `state_root()`, and stash the
-        // result in the sink — the MDBX branch below reads it.
+        // Finish the sparse-trie update stream. The hook lives on the DB (which outlives the
+        // executor), so it is NOT dropped by `executor.finish()`; we must clear it explicitly.
+        // Clearing drops the `StateRootUpdateHook`, which signals end-of-updates so the
+        // background task can finalize and `state_root()` below returns. Without this the task
+        // waits forever for more updates and the miner falls back after the slot deadline.
+        db.set_state_hook(None);
+
+        // Sparse-trie state-root collection: now that the update stream is finished, the
+        // background task has all updates and is finalizing. Take the handle from ctx, block on
+        // `state_root()`, and stash the result in the sink — the MDBX branch below reads it.
         //
         // Failures fall through silently to the legacy `state_root_with_updates` path,
         // logged at WARN. A failure here is non-fatal but indicates the task panicked
@@ -286,7 +289,14 @@ where
             // empty/low-gas blocks. If we are already at/over the state-root deadline
             // (`end_mining_timestamp_ms - STATE_ROOT_WAIT_MARGIN_MS`), abort this candidate so the
             // miner ships the best already-completed candidate on time instead of over-running.
-            if let Some(deadline_ms) = self.ctx.state_root_deadline_ms {
+            // The abort only makes sense as a guard for the sparse-trie fast path: it prevents a
+            // slow synchronous fallback from overrunning the slot after the fast path timed out.
+            // When the sparse-trie spawner is disabled (v2.4.1 migration), synchronous is the
+            // only path — aborting would stop all block production — so we skip the abort and
+            // always complete the walk.
+            if let Some(deadline_ms) =
+                self.ctx.state_root_deadline_ms.filter(|_| crate::shared::is_sparse_trie_state_root_enabled())
+            {
                 let now_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)
@@ -370,7 +380,13 @@ where
         );
 
         let block = RecoveredBlock::new_unhashed(block, senders);
-        Ok(BlockBuilderOutcome { execution_result: result, hashed_state, trie_updates, block })
+        Ok(BlockBuilderOutcome {
+            execution_result: result,
+            hashed_state,
+            trie_updates,
+            block,
+            block_access_list: None,
+        })
     }
 
     fn executor_mut(&mut self) -> &mut Self::Executor {

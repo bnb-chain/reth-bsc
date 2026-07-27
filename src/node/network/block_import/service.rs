@@ -215,7 +215,7 @@ where
 
             let sealed_block = block.block.0.block.clone().seal_unchecked(block_hash);
             let header = sealed_block.header().clone();
-            let payload = BscPayloadTypes::block_to_payload(sealed_block);
+            let payload = BscPayloadTypes::block_to_payload(sealed_block, None);
             match engine.new_payload(payload).await {
                 Ok(payload_status) => match payload_status.status {
                     PayloadStatusEnum::Valid => {
@@ -1370,7 +1370,7 @@ mod tests {
         };
         let new_block = BscNewBlock(NewBlock { block, td: U128::from(1) });
         let hash = new_block.0.block.header.hash_slow();
-        NewBlockMessage { hash, block: Arc::new(new_block), td: Some(U256::from(1)) }
+        NewBlockMessage { hash, block: Arc::new(new_block) }
     }
 
     /// Helper function to handle engine messages with specified payload statuses

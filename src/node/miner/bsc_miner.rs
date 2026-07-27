@@ -1046,8 +1046,7 @@ where
         let td = U128::from(new_td.to::<u128>());
         let new_block =
             BscNewBlock(reth_eth_wire::NewBlock { block: sealed_block.clone_block(), td });
-        let msg =
-            NewBlockMessage { hash: block_hash, block: Arc::new(new_block), td: Some(new_td) };
+        let msg = NewBlockMessage { hash: block_hash, block: Arc::new(new_block) };
 
         if self.submit_built_payload {
             if let Some(sender) = get_block_import_mined_sender() {

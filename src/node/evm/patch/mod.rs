@@ -1,7 +1,7 @@
 use alloy_primitives::{address, b256, Address, B256, U256};
 use reth_evm::block::BlockExecutionError;
 use reth_primitives_traits::SignedTransaction;
-use revm::{state::{Account, EvmState, EvmStorageSlot}, Database, DatabaseCommit};
+use revm::{state::{Account, EvmState, EvmStorageSlot, TransactionId}, Database, DatabaseCommit};
 use std::{collections::HashMap, str::FromStr, sync::LazyLock};
 use tracing::trace;
 
@@ -757,7 +757,7 @@ where
         let original = if value == U256::ZERO { U256::from(1) } else { U256::ZERO };
         account.storage.insert(
             key,
-            EvmStorageSlot { original_value: original, present_value: value, transaction_id: 0, is_cold: false },
+            EvmStorageSlot { original_value: original, present_value: value, transaction_id: TransactionId::ZERO, is_cold: false },
         );
     }
     let mut changes: EvmState = Default::default();

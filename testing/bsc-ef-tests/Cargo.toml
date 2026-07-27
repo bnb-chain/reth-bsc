@@ -14,38 +14,32 @@ asm-keccak = ["alloy-primitives/asm-keccak"]
 reth_bsc = { path = "../.." }
 
 # reth dependencies aligned with root crate branch to avoid duplicate crate versions
-reth-chainspec = { git = "https://github.com/bnb-chain/reth.git", rev = "c13b098660e0a65bd9aac8171eb917c04ed2297f" }
-reth-consensus = { git = "https://github.com/bnb-chain/reth.git", rev = "c13b098660e0a65bd9aac8171eb917c04ed2297f" }
-reth-ethereum-forks = { git = "https://github.com/bnb-chain/reth.git", rev = "c13b098660e0a65bd9aac8171eb917c04ed2297f" }
-reth-db = { git = "https://github.com/bnb-chain/reth.git", rev = "c13b098660e0a65bd9aac8171eb917c04ed2297f", features = [
+reth-chainspec = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1" }
+reth-consensus = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1" }
+reth-ethereum-forks = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1" }
+reth-db = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1", features = [
     "mdbx",
     "test-utils",
     "disable-lock",
 ] }
-reth-db-api = { git = "https://github.com/bnb-chain/reth.git", rev = "c13b098660e0a65bd9aac8171eb917c04ed2297f" }
-reth-db-common = { git = "https://github.com/bnb-chain/reth.git", rev = "c13b098660e0a65bd9aac8171eb917c04ed2297f" }
-reth-ethereum-consensus = { git = "https://github.com/bnb-chain/reth.git", rev = "c13b098660e0a65bd9aac8171eb917c04ed2297f" }
-reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth.git", rev = "c13b098660e0a65bd9aac8171eb917c04ed2297f" }
-reth-evm = { git = "https://github.com/bnb-chain/reth.git", rev = "c13b098660e0a65bd9aac8171eb917c04ed2297f" }
-reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth.git", rev = "c13b098660e0a65bd9aac8171eb917c04ed2297f" }
-reth-primitives-traits = { git = "https://github.com/bnb-chain/reth-core.git", branch = "v0.3.1-v2", default-features = false }
-reth-provider = { git = "https://github.com/bnb-chain/reth.git", rev = "c13b098660e0a65bd9aac8171eb917c04ed2297f", features = [
+reth-db-api = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1" }
+reth-db-common = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1" }
+reth-ethereum-consensus = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1" }
+reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1" }
+reth-evm = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1" }
+reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1" }
+reth-primitives-traits = { version = "0.5.0", default-features = false }
+reth-provider = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1", features = [
     "test-utils",
 ] }
-reth-revm = { git = "https://github.com/bnb-chain/reth.git", rev = "c13b098660e0a65bd9aac8171eb917c04ed2297f", features = [
+reth-revm = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1", features = [
     "std",
 ] }
-reth-tracing = { git = "https://github.com/bnb-chain/reth.git", rev = "c13b098660e0a65bd9aac8171eb917c04ed2297f" }
-reth-trie = { git = "https://github.com/bnb-chain/reth.git", rev = "c13b098660e0a65bd9aac8171eb917c04ed2297f" }
-reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", rev = "c13b098660e0a65bd9aac8171eb917c04ed2297f" }
+reth-tracing = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1" }
+reth-trie = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1" }
+reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1" }
 
 # revm
-revm = { version = "38.0.0", features = [
-    "secp256k1",
-    "blst",
-    "c-kzg",
-    "memory_limit",
-] }
 
 # alloy
 alloy-consensus = "2.0.0"

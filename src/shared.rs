@@ -13,11 +13,9 @@ use alloy_rpc_types::{
     TransactionRequest as RpcTransactionRequest,
 };
 use parking_lot::Mutex;
-use reth::api::NodeTypesWithDBAdapter;
 use reth_engine_tree::engine::EngineApiRequest;
 use reth_network::NetworkHandle;
 use reth_network_api::PeerId;
-use reth_provider::providers::BlockchainProvider;
 use reth_payload_builder_primitives::Events;
 use reth_ethereum_primitives::TransactionSigned;
 use reth_provider::{BlockNumReader, HeaderProvider};
@@ -34,8 +32,6 @@ pub type BscEngineApiTx = UnboundedSender<
     EngineApiRequest<
         crate::node::engine_api::payload::BscPayloadTypes,
         crate::BscPrimitives,
-        BlockchainProvider<NodeTypesWithDBAdapter<crate::node::BscNode, reth_db::DatabaseEnv>>,
-        crate::node::evm::config::BscEvmConfig,
     >,
 >;
 
@@ -66,7 +62,7 @@ static SNAPSHOT_PROVIDER: OnceLock<Arc<dyn SnapshotProvider + Send + Sync>> = On
 /// `--mining.use-sparse-trie-state-root` is enabled. Returns `None` if the engine
 /// has not been wired (graceful fallback to legacy `state_root_with_updates`).
 pub type SparseTrieSpawnFn = Arc<
-    dyn Fn(B256, B256) -> Option<reth_engine_tree::tree::multiproof::StateRootHandle>
+    dyn Fn(B256, B256) -> Option<reth_engine_tree::tree::StateRootHandle>
         + Send
         + Sync,
 >;
@@ -306,10 +302,19 @@ pub fn set_sparse_trie_spawn_fn(
 pub fn spawn_sparse_trie_state_root(
     parent_hash: B256,
     parent_state_root: B256,
-) -> Option<reth_engine_tree::tree::multiproof::StateRootHandle> {
+) -> Option<reth_engine_tree::tree::StateRootHandle> {
     SPARSE_TRIE_SPAWN_FN
         .get()
         .and_then(|f| f(parent_hash, parent_state_root))
+}
+
+/// Whether the sparse-trie state-root fast path is wired up.
+///
+/// When `false` (spawner not registered — e.g. the v2.4.1 migration disabled it), the miner
+/// runs the synchronous state-root walk unconditionally and the slot-deadline abort — which only
+/// exists to protect the fast path from a slow fallback overrunning the slot — must not fire.
+pub fn is_sparse_trie_state_root_enabled() -> bool {
+    SPARSE_TRIE_SPAWN_FN.get().is_some()
 }
 
 /// Store the header provider globally
@@ -843,7 +848,7 @@ pub async fn ipc_estimate_gas(
         RpcReceipt,
         RpcHeader,
         TransactionSigned,
-    >::estimate_gas(client.as_ref(), req, block_id, state_overrides)
+    >::estimate_gas(client.as_ref(), req, block_id, state_overrides, None)
     .await
     .map_err(|e| eyre::eyre!("failed to query chain id from healthy node: {e}"))
 }

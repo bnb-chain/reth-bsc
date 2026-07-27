@@ -80,7 +80,7 @@ pub struct BscNextBlockEnvAttributes {
     /// executor is consumed by `finish()`, which sends `FinishedStateUpdates` to the
     /// background task. Only after that drop is it safe to await `state_root()`.
     pub trie_handle: Option<
-        Arc<Mutex<Option<reth_engine_tree::tree::multiproof::StateRootHandle>>>,
+        Arc<Mutex<Option<reth_engine_tree::tree::StateRootHandle>>>,
     >,
     /// Absolute wall-clock deadline (epoch ms) for bounding the sparse-trie
     /// `state_root()` wait in `finish`. Past it the builder stops waiting and falls
@@ -91,9 +91,12 @@ pub struct BscNextBlockEnvAttributes {
 }
 
 impl<H: BlockHeader> BuildPendingEnv<H> for BscNextBlockEnvAttributes {
-    fn build_pending_env(parent: &SealedHeader<H>) -> Self {
+    fn build_pending_env(
+        parent: &SealedHeader<H>,
+        block_overrides: Option<&alloy_rpc_types_eth::BlockOverrides>,
+    ) -> Self {
         Self {
-            inner: NextBlockEnvAttributes::build_pending_env(parent),
+            inner: NextBlockEnvAttributes::build_pending_env(parent, block_overrides),
             validator_cache_sink: None,
             turn_length_sink: None,
             state_root_precomputed_sink: None,
@@ -169,7 +172,7 @@ pub struct BscBlockExecutionCtx<'a> {
     /// `Arc<Mutex<Option<_>>>` because `StateRootHandle` is `!Clone` (single-use
     /// receiver) and `BscBlockExecutionCtx` derives `Clone`.
     pub trie_handle: Option<
-        Arc<Mutex<Option<reth_engine_tree::tree::multiproof::StateRootHandle>>>,
+        Arc<Mutex<Option<reth_engine_tree::tree::StateRootHandle>>>,
     >,
     /// See [`BscNextBlockEnvAttributes::state_root_deadline_ms`]. Bounds the
     /// sparse-trie `state_root()` wait in `finish`.

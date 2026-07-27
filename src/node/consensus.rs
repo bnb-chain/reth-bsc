@@ -250,6 +250,7 @@ impl<ChainSpec: EthChainSpec<Header = Header> + BscHardforks + 'static> FullCons
         block: &RecoveredBlock<BscBlock>,
         result: &BlockExecutionResult<Receipt>,
         _receipt_root_bloom: Option<ReceiptRootBloom>,
+        _block_access_list_hash: Option<alloy_primitives::B256>,
     ) -> Result<(), ConsensusError> {
         let receipts = &result.receipts;
         let chain_spec = &self.chain_spec;
@@ -1054,18 +1055,18 @@ mod tests {
         // EIP-7685 commitment, so it must be accepted without content validation.
         let tagged = b256!("0000000000000000000000016c98eb21139f6e12db5b78a4aed4d8eba147fb7b");
         assert!(consensus
-            .validate_block_post_execution(&block_with(Some(tagged)), &result, None)
+            .validate_block_post_execution(&block_with(Some(tagged)), &result, None, None)
             .is_ok());
 
         // Locally built blocks keep the empty requests hash, sha256("").
         let empty = b256!("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
         assert!(consensus
-            .validate_block_post_execution(&block_with(Some(empty)), &result, None)
+            .validate_block_post_execution(&block_with(Some(empty)), &result, None, None)
             .is_ok());
 
         // The field itself is still mandatory after Prague.
         assert!(matches!(
-            consensus.validate_block_post_execution(&block_with(None), &result, None),
+            consensus.validate_block_post_execution(&block_with(None), &result, None, None),
             Err(ConsensusError::RequestsHashMissing)
         ));
     }
@@ -1453,37 +1454,47 @@ where
     ) -> Result<(Option<alloy_primitives::U256>, Option<alloy_primitives::U256>), ParliaConsensusErr>
     {
         let current_td = self.header_td(engine, current.number, current.hash_slow()).await?;
-        let incoming_td = match self.header_td(engine, incoming.number, incoming.hash_slow()).await
+
+        // The incoming block is typically not imported yet, so its own hash won't resolve a TD
+        // (`header_td` would return `Ok(None)`). Derive it from the parent's TD plus the incoming
+        // block's own difficulty — the parent is the current head or an already-imported ancestor,
+        // so its TD is computable. Fall back to a direct lookup only if the parent is unknown.
+        let incoming_td = match self
+            .header_td(engine, incoming.number.saturating_sub(1), incoming.parent_hash)
+            .await?
         {
-            Ok(td) => td,
-            Err(e) => {
-                tracing::debug!(target: "bsc::forkchoice", "Failed to get incoming header TD: {:?}, try to query parent block TD", e);
-                match self.header_td(engine, incoming.number - 1, incoming.parent_hash).await? {
-                    Some(td) => Some(td + incoming.difficulty),
-                    None => {
-                        tracing::debug!(target: "bsc::forkchoice", "Failed to get parent header TD, return None");
-                        None
-                    }
-                }
+            Some(parent_td) => Some(parent_td + incoming.difficulty),
+            None => {
+                tracing::debug!(
+                    target: "bsc::forkchoice",
+                    incoming_number = incoming.number,
+                    "parent TD unknown; trying incoming block's own TD"
+                );
+                self.header_td(engine, incoming.number, incoming.hash_slow()).await?
             }
         };
         Ok((incoming_td, current_td))
     }
 
-    /// Gets the total difficulty for a specific header.
+    /// Gets the total difficulty for a specific header, keyed by hash.
     ///
-    /// This private method queries the TD from the engine and caches it for future use.
+    /// Reads the TD from the provider's `header_td` hook, which serves the persisted per-block TD
+    /// from the `HeaderTerminalDifficulties` table (written in `save_blocks`) and extends it over
+    /// any not-yet-persisted in-memory tail. Results are cached here for the sequential queries
+    /// fork choice makes.
     async fn header_td(
         &self,
-        engine: &ConsensusEngineHandle<BscPayloadTypes>,
-        number: u64,
+        _engine: &ConsensusEngineHandle<BscPayloadTypes>,
+        _number: u64,
         hash: B256,
     ) -> Result<Option<alloy_primitives::U256>, ParliaConsensusErr> {
         if let Some(td) = self.header_td_cache.write().get(&hash) {
             return Ok(*td);
         }
-        let td = engine.query_td(number, hash).await.map_err(ParliaConsensusErr::internal)?;
-        self.header_td_cache.write().insert(hash, td);
+        let td = self.provider.header_td(&hash).map_err(ParliaConsensusErr::internal)?;
+        if td.is_some() {
+            self.header_td_cache.write().insert(hash, td);
+        }
         Ok(td)
     }
 }

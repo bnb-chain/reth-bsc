@@ -354,7 +354,7 @@ where
         let block_hash = block.header.hash_slow();
         let block_num = block.header.number;
         let sealed = block.clone().seal_unchecked(block_hash);
-        let payload = BscPayloadTypes::block_to_payload(sealed);
+        let payload = BscPayloadTypes::block_to_payload(sealed, None);
 
         match engine.new_payload(payload).await {
             Ok(status) => match status.status {
