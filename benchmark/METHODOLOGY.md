@@ -379,6 +379,39 @@ over months of syncing. A freshly built trie is likely better laid out on disk.
 This favours mdbx v2 for reasons unrelated to the storage format. **Not
 quantified.**
 
+**The triedb datadir could not be brought to the benchmark height.** Two
+independent blockers, both reproducible:
+
+1. **State-root divergence at block 84295819.** With `--statedb.triedb` the node
+   computes `0x56d3e258…` where the canonical root is `0x16c9545b…`. Parent
+   84295818 validates and the 254 preceding blocks executed correctly, so the
+   pre-state was canonically correct going in. The same binary on an mdbx
+   datadir executes the same block correctly via the same driver, which rules
+   out the EVM, consensus, and the push mechanism. Deterministic across two
+   runs. Ruled out as triggers: blob transactions (none in the block), contract
+   creation, withdrawals, and EIP-7702 (7 of 22 sampled earlier blocks contain
+   type-0x4 transactions and all executed correctly). **Cause not localised** -
+   that needs the `--debug.invalid-block-hook witness` diff, which was not
+   captured.
+
+2. **The trie unwind exceeds available memory.** `stage unwind to-block` reports
+   success but leaves `MerkleExecute` and `MerkleUnwind` at the pre-unwind
+   height; the node then attempts that reconciliation itself at startup, and the
+   storage-trie unwind builds an uncommitted mdbx write transaction that grew
+   past 45 GB on a 61 GB machine and was OOM-killed. Nothing is written until it
+   commits, so an OOM discards the entire attempt. `v0.0.9-beta` pins triedb
+   `v0.0.2`, which has no `RETHBSC_ROCKSDB_*` overrides, so the 16 GB block
+   cache cannot be reduced without rebuilding.
+
+Consequence: the comparison lost its only single-variable pair. triedb vs
+mdbx-v1 shares a binary and a reth revision, so it isolates the backend;
+mdbx-v1 vs mdbx-v2 does not.
+
+**Preliminary triedb figures, not results.** Over the 254 blocks it did execute:
+~59 ms/block at ~71 MGas/s, against mdbx v1's steady-state ~480 ms at ~16
+MGas/s. Recorded only because the run ended in a state-root divergence and the
+sample is far too small - it is not a performance finding.
+
 **triedb pays a ~40-minute RocksDB open on every node start.** Measured on a
 cold page cache against a 1013 GB store of 14,568 SSTs: **41m30s** from
 `Opening database` (17:11:46) to `RPC HTTP server started` (17:53:16), reading
