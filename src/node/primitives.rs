@@ -835,6 +835,77 @@ mod tests {
         assert_eq!(sidecar, decoded);
     }
 
+    /// Deterministic pseudo-random filler (xorshift64). Blob content under test must not be
+    /// all-zero: a decode that truncated, zero-filled or reordered bytes would round-trip a
+    /// `Blob::default()` unnoticed.
+    fn fill_pattern(bytes: &mut [u8], seed: u64) {
+        let mut state = seed | 1;
+        for b in bytes.iter_mut() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *b = (state >> 24) as u8;
+        }
+    }
+
+    #[test]
+    fn blob_sidecar_deserialize_six_blobs_no_stack_overflow() {
+        // A max-blob (6 × 128 KiB) sidecar must deserialize on a tokio worker's 2 MiB stack in an
+        // *unoptimized* build. Deserializing the blob fields as `Vec<Blob>` directly puts several
+        // 128 KiB by-value moves live at once across serde_json's nested generic frames — release
+        // elides them, debug does not, and the stack blows. That is a remotely-triggerable
+        // validator crash via `mev_sendBidBlock`, so the guard runs at a pinned 2 MiB regardless of
+        // profile. See `hex_decode_fixed` above for the fix, and
+        // `node::miner::bid_block::tests::blob_admission_does_not_overflow_tokio_stack` for the
+        // same guard over the full admission path (decode + hash + block build).
+        const MAX_BLOBS: usize = 6;
+
+        let mut blobs = vec![alloy_eips::eip4844::Blob::default(); MAX_BLOBS];
+        let mut commitments = vec![alloy_eips::eip4844::Bytes48::default(); MAX_BLOBS];
+        let mut proofs = vec![alloy_eips::eip4844::Bytes48::default(); MAX_BLOBS];
+        for i in 0..MAX_BLOBS {
+            fill_pattern(blobs[i].as_mut_slice(), 0x1000 + i as u64);
+            fill_pattern(commitments[i].as_mut_slice(), 0x2000 + i as u64);
+            fill_pattern(proofs[i].as_mut_slice(), 0x3000 + i as u64);
+        }
+
+        let sidecar = BscBlobTransactionSidecar {
+            inner: BlobTransactionSidecar { blobs, commitments, proofs },
+            block_number: 0x64,
+            block_hash: B256::repeat_byte(0xab),
+            tx_index: 0x7,
+            tx_hash: B256::repeat_byte(0xcd),
+            version: 1,
+        };
+
+        let json = serde_json::to_string(&sidecar).unwrap();
+        // Two hex chars per byte: the payload really is carrying full-size blobs, not empties.
+        assert!(
+            json.len() > MAX_BLOBS * 2 * alloy_eips::eip4844::BYTES_PER_BLOB,
+            "test payload must contain {MAX_BLOBS} full-size blobs, got {} bytes of JSON",
+            json.len()
+        );
+
+        let handle = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || {
+                // Repeat so a pass reflects the decode path's actual stack usage rather than one
+                // lucky run. A real overflow aborts the process (SIGSEGV / "stack overflow"), which
+                // is itself the failure signal — it is not a catchable `Err`.
+                for _ in 0..20 {
+                    let decoded: BscBlobTransactionSidecar = serde_json::from_str(&json).unwrap();
+                    assert_eq!(decoded.inner.blobs.len(), MAX_BLOBS);
+                    assert_eq!(decoded.version, 1);
+                    assert_eq!(decoded, sidecar, "6-blob sidecar must round-trip byte-exactly");
+                }
+            })
+            .unwrap();
+
+        if let Err(panic) = handle.join() {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
     #[test]
     fn blob_sidecar_json_accepts_geth_style_payload() {
         // A payload shaped exactly like go-bsc's wire format (as a real builder would send it),
