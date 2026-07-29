@@ -1175,6 +1175,8 @@ pub struct BscForkChoiceEngine<P> {
     finality_metrics: BscFinalityMetrics,
     /// Blockchain metrics (including reorg metrics)
     blockchain_metrics: BscBlockchainMetrics,
+    /// Consensus metrics (forkchoice failures)
+    consensus_metrics: crate::metrics::BscConsensusMetrics,
 }
 
 impl<P> BscForkChoiceEngine<P>
@@ -1197,6 +1199,7 @@ where
             ))),
             finality_metrics: BscFinalityMetrics::default(),
             blockchain_metrics: BscBlockchainMetrics::default(),
+            consensus_metrics: crate::metrics::BscConsensusMetrics::default(),
         }
     }
 
@@ -1237,7 +1240,15 @@ where
             .ok_or(ParliaConsensusErr::HeadHashNotFound)?;
 
         // Determine if we need to reorg using fork choice rules
-        let need_reorg = self.is_need_reorg(incoming_header, &current_head).await?;
+        let need_reorg = match self.is_need_reorg(incoming_header, &current_head).await {
+            Ok(need_reorg) => need_reorg,
+            Err(e) => {
+                // Bailing here means no forkchoice update is sent and the canonical head stays
+                // put, so this must be visible in metrics — callers only log it at warn.
+                self.consensus_metrics.forkchoice_update_errors_total.increment(1);
+                return Err(e);
+            }
+        };
 
         // Only count as reorg if:
         // 1. Fork choice says we need to reorg AND
@@ -1492,6 +1503,9 @@ where
             return Ok(*td);
         }
         let td = self.provider.header_td(&hash).map_err(ParliaConsensusErr::internal)?;
+        // Only memoize resolved values. Caching a `None` makes a transient failure permanent for
+        // that hash: TD becomes resolvable once the block is persisted or a common ancestor
+        // appears, but a cached `None` means we would never ask again.
         if td.is_some() {
             self.header_td_cache.write().insert(hash, td);
         }

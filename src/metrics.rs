@@ -59,6 +59,21 @@ pub struct BscConsensusMetrics {
 
     /// Total number of bad blocks detected (equivalent to chain/insert/badBlock)
     pub bad_blocks_total: Counter,
+
+    /// Total number of fork-choice decisions made by height because total difficulty could not
+    /// be resolved.
+    ///
+    /// A sustained nonzero rate means this node's persisted tip sits on a branch below the fork
+    /// point, so the engine cannot derive TD for incoming blocks. Worth alerting on: before the
+    /// height fallback existed, this condition froze the canonical head permanently while the
+    /// node kept reporting itself healthy.
+    pub td_unknown_fallbacks_total: Counter,
+
+    /// Total number of failed forkchoice updates, any cause.
+    ///
+    /// Repeated failures mean the canonical head is not advancing even though blocks are still
+    /// being validated — a state no other metric distinguishes from normal operation.
+    pub forkchoice_update_errors_total: Counter,
 }
 
 /// Metrics for BSC reward distribution
