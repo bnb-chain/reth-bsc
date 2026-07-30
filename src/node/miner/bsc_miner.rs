@@ -42,8 +42,8 @@ use reth_provider::{
 use reth_revm::cancelled::ManualCancel;
 use reth_tasks::TaskExecutor;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_stream::StreamExt;
@@ -108,6 +108,99 @@ fn is_network_ready_to_mine(tip_number: u64) -> bool {
     }
 
     true
+}
+
+/// Maximum blocks the local tip is allowed to lag behind the highest known peer
+/// before mining is suppressed. Catches the case where the node has fallen behind
+/// (sync recovery failed / bsc/2 disrupted / etc.) and would otherwise extend a
+/// stale tip onto a divergent fork that peers do not accept. The threshold is
+/// loose enough to tolerate the inevitable one-block staleness between an
+/// in-flight `NewBlock` and our canonical-head update.
+const MINING_LAG_THRESHOLD: u64 = 5;
+
+/// Maximum time the gate waits for any peer to publish a head before falling
+/// through. Bounds the "all validators restarted simultaneously" deadlock where
+/// every peer reports `best_number = None` until somebody produces a block.
+const PEER_HEAD_WAIT_TIMEOUT_SECS: u64 = 5;
+
+/// Records the first instant the gate observed "no peer head yet". Used to
+/// time-bound the deadlock-break window above.
+static NO_PEER_HEAD_FIRST_HIT: OnceLock<Instant> = OnceLock::new();
+
+/// Verify the local tip is within `MINING_LAG_THRESHOLD` of the highest head
+/// reported by any connected peer. Returning `false` suppresses mining and
+/// prevents the validator from extending a stale tip into a divergent fork
+/// while other recovery paths (`fork_recover`, staged-sync pipeline) catch up.
+///
+/// The deadlock-break window kicks in only when **no** peer has published a
+/// head at all — the typical all-validators-restart cold-start. As soon as one
+/// peer publishes a head, the lag check is authoritative and the timer is
+/// irrelevant; reaching the fallthrough later requires the network to genuinely
+/// produce zero head announcements for `PEER_HEAD_WAIT_TIMEOUT_SECS`.
+async fn is_caught_up_to_peers(local_tip: u64) -> bool {
+    use reth_network::Peers;
+
+    let Some(network) = crate::shared::get_network_handle() else {
+        debug!(
+            target: "bsc::miner",
+            local_tip,
+            "Skip mining: network handle not yet available (post peer-ready gate)"
+        );
+        return false;
+    };
+
+    let peers = match network.get_all_peers().await {
+        Ok(p) => p,
+        Err(e) => {
+            debug!(
+                target: "bsc::miner",
+                local_tip,
+                error = %e,
+                "Skip mining: get_all_peers failed"
+            );
+            return false;
+        }
+    };
+
+    let max_peer_best: Option<u64> = peers.iter().filter_map(|p| p.best_number).max();
+
+    match max_peer_best {
+        Some(peer_best) => {
+            let lag = peer_best.saturating_sub(local_tip);
+            if lag > MINING_LAG_THRESHOLD {
+                debug!(
+                    target: "bsc::miner",
+                    local_tip,
+                    peer_best,
+                    lag,
+                    threshold = MINING_LAG_THRESHOLD,
+                    "Skip mining: local tip lags peers' best head beyond threshold"
+                );
+                return false;
+            }
+            true
+        }
+        None => {
+            let first_hit = NO_PEER_HEAD_FIRST_HIT.get_or_init(Instant::now);
+            let elapsed = first_hit.elapsed();
+            if elapsed < Duration::from_secs(PEER_HEAD_WAIT_TIMEOUT_SECS) {
+                debug!(
+                    target: "bsc::miner",
+                    local_tip,
+                    elapsed_secs = elapsed.as_secs(),
+                    "Skip mining: no peer head observed yet (cold-start grace window)"
+                );
+                return false;
+            }
+            warn!(
+                target: "bsc::miner",
+                local_tip,
+                elapsed_secs = elapsed.as_secs(),
+                "Mining gate fallthrough: no peer head after grace window; permitting mining to break the all-validators-restart deadlock"
+            );
+            true
+        }
+    }
 }
 
 impl<Provider> NewWorkWorker<Provider>
@@ -452,6 +545,10 @@ where
         }
 
         if !is_network_ready_to_mine(tip.number()) {
+            return;
+        }
+
+        if !is_caught_up_to_peers(tip.number()).await {
             return;
         }
 
