@@ -78,6 +78,37 @@ fn can_be_interrupted(block_time_ms: u64, now_ms: u64, no_interrupt_left_over_ms
     block_time_ms.saturating_sub(now_ms) >= no_interrupt_left_over_ms
 }
 
+/// Per-block tally of simulations preempted by a higher-value bid, keyed by parent hash. Carries
+/// the block number so [`BidSimulator::clear`] can prune it alongside the bid maps.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct InterruptTally {
+    block_number: u64,
+    count: u64,
+}
+
+/// Bumps the preempted-simulation tally for `parent_hash`. Split out as a free function (as with
+/// [`retain_recent_interrupt_tallies`]) so the bookkeeping is testable without a full
+/// `BidSimulator`.
+fn record_interrupt_tally(
+    map: &mut HashMap<B256, InterruptTally>,
+    parent_hash: B256,
+    block_number: u64,
+) {
+    let tally = map.entry(parent_hash).or_insert(InterruptTally { block_number, count: 0 });
+    // A parent hash is unique to a height, but keep the number fresh so pruning stays correct even
+    // if a caller ever tallies against a re-observed parent.
+    tally.block_number = block_number;
+    tally.count += 1;
+}
+
+/// Evicts tallies older than `min_block_number`, mirroring [`retain_recent_bid_blocks`].
+fn retain_recent_interrupt_tallies(
+    map: &mut HashMap<B256, InterruptTally>,
+    min_block_number: u64,
+) {
+    map.retain(|_, tally| tally.block_number >= min_block_number);
+}
+
 /// Evicts entries older than `min_block_number` from the `best_bid_block` map, keyed by parent
 /// hash. Split out as a free function (from [`BidSimulator::clear`]) so it's directly testable
 /// without constructing a full `BidSimulator`.
@@ -113,6 +144,9 @@ pub struct BidSimulator<Client, Pool> {
     /// go-bsc `Mev.NoInterruptLeftOver`: minimum raw time-to-block-target required for a new bid
     /// to preempt an in-flight simulation. See [`can_be_interrupted`].
     no_interrupt_left_over: u64,
+    /// Simulations preempted per parent hash, so the seal path can tell whether an interrupt
+    /// actually bought a better block. See [`Self::take_interrupt_count`].
+    interrupt_counts: Arc<RwLock<HashMap<B256, InterruptTally>>>,
 
     // MEV metrics
     mev_metrics: crate::metrics::BscMevMetrics,
@@ -159,6 +193,7 @@ where
             validator_commission,
             greedy_merge,
             no_interrupt_left_over,
+            interrupt_counts: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -304,6 +339,7 @@ where
                     self.no_interrupt_left_over,
                 ) {
                     simulating_bid.interrupt_flag.store(true, Ordering::Relaxed);
+                    self.record_interrupt(bid.parent_hash, bid.block_number);
                     let bid_simulate_req = self.commit_bid(5, _bid_runtime);
                     return Some(bid_simulate_req);
                 } else {
@@ -323,6 +359,34 @@ where
         None
     }
 
+    /// Records that an in-flight simulation building on `parent_hash` was preempted by a
+    /// higher-value bid. Bumps the process-wide counter (the thrash-ratio denominator) and the
+    /// per-block tally that [`Self::take_interrupt_count`] reports at seal time.
+    fn record_interrupt(&self, parent_hash: B256, block_number: u64) {
+        self.mev_metrics.bid_interrupt_total.increment(1);
+        record_interrupt_tally(&mut self.interrupt_counts.write(), parent_hash, block_number);
+    }
+
+    /// Number of simulations preempted while building on `parent_hash`, **consuming** the tally.
+    /// The seal path adds this to `bid_interrupt_wasted_total` when the sealed block turned out not
+    /// to come from a bid, so the count is a weight and not just a yes/no. Taking the tally means a
+    /// second build attempt at the same height cannot double-count. Sole reader — a future second
+    /// caller would observe 0, so peek separately rather than calling this twice.
+    pub fn take_interrupt_count(&self, parent_hash: B256) -> u64 {
+        self.interrupt_counts.write().remove(&parent_hash).map_or(0, |tally| tally.count)
+    }
+
+    /// Whether a simulation for `parent_hash` is still running right now. Sampled by the payload job
+    /// at bid-collection time to tell a wasted interrupt whose replacement was simply *too late*
+    /// from one whose replacement did finish but lost on merit — only the former indicts
+    /// `no_interrupt_left_over`.
+    ///
+    /// Relies on `simulating_bid` being a true in-flight registry: inserted before
+    /// `simulate_bid_inner` and removed on every exit path, aborts included.
+    pub fn is_simulating(&self, parent_hash: B256) -> bool {
+        self.simulating_bid.read().contains_key(&parent_hash)
+    }
+
     pub fn clear(&self, block_number: u64) {
         let clear_threshold = 5; //todo: config
         let min_block_number = block_number.saturating_sub(clear_threshold);
@@ -336,6 +400,10 @@ where
         // same way). Without this, every parent hash that ever received an admitted BidBlock keeps
         // its full sealed block — including blob data — in memory forever.
         retain_recent_bid_blocks(&mut self.best_bid_block.write(), min_block_number);
+
+        // Same for the preempted-simulation tallies: without pruning, every parent hash that ever
+        // saw an interrupt is retained for the process's lifetime.
+        retain_recent_interrupt_tallies(&mut self.interrupt_counts.write(), min_block_number);
 
         // Clear old pending bids by parsing block_number from key prefix
         // Key format: "{block_number}-{builder}-{bid_hash}"
@@ -422,6 +490,10 @@ where
         let parent_hash = bid_runtime.bid.parent_hash;
 
         self.simulating_bid.write().insert(parent_hash, bid_runtime.bid.clone());
+        // Counted here, alongside the in-flight insert, so it covers every simulation regardless of
+        // how it exits — the denominator for the interrupt-thrash ratio must include aborted runs,
+        // which `bid_simulation_duration_seconds` below deliberately excludes.
+        self.mev_metrics.bid_simulation_started_total.increment(1);
         let outcome = self.simulate_bid_inner(&mut bid_runtime);
 
         // go-bsc simBid runs all of this in a defer so it covers every exit path.
@@ -1304,5 +1376,68 @@ mod tests {
         let mut map: HashMap<B256, BidBlockTask> = HashMap::new();
         retain_recent_bid_blocks(&mut map, 1_000);
         assert!(map.is_empty());
+    }
+
+    #[test]
+    fn interrupt_tally_accumulates_per_parent() {
+        // The thrash ratio needs a per-block count, not a boolean: a block can have several bids
+        // preempt each other in turn, and the seal path must still see a non-zero count.
+        let mut map = HashMap::new();
+        let parent_a = B256::repeat_byte(0x44);
+        let parent_b = B256::repeat_byte(0x55);
+
+        record_interrupt_tally(&mut map, parent_a, 200);
+        record_interrupt_tally(&mut map, parent_a, 200);
+        record_interrupt_tally(&mut map, parent_b, 201);
+
+        assert_eq!(map[&parent_a], InterruptTally { block_number: 200, count: 2 });
+        assert_eq!(
+            map[&parent_b],
+            InterruptTally { block_number: 201, count: 1 },
+            "tallies must not bleed across parents"
+        );
+    }
+
+    #[test]
+    fn retain_recent_interrupt_tallies_evicts_stale_entries_by_block_number() {
+        // Without pruning, every parent hash that ever saw an interrupt is kept for the process's
+        // lifetime. Mirrors `retain_recent_bid_blocks`, including the inclusive threshold.
+        let mut map = HashMap::new();
+        let old_parent = B256::repeat_byte(0x66);
+        let threshold_parent = B256::repeat_byte(0x77);
+        let recent_parent = B256::repeat_byte(0x88);
+        record_interrupt_tally(&mut map, old_parent, 100);
+        record_interrupt_tally(&mut map, threshold_parent, 105);
+        record_interrupt_tally(&mut map, recent_parent, 110);
+
+        retain_recent_interrupt_tallies(&mut map, 105);
+
+        assert!(!map.contains_key(&old_parent), "stale tally must be evicted");
+        assert!(
+            map.contains_key(&threshold_parent),
+            "tally exactly at the threshold must be retained"
+        );
+        assert!(map.contains_key(&recent_parent), "recent tally must be retained");
+    }
+
+    #[test]
+    fn interrupt_tally_lookup_of_unseen_parent_is_zero() {
+        // The seal path reads this for every block, including the overwhelming majority that saw no
+        // interrupt at all; an absent entry must read as 0, not as evidence of thrash.
+        let map: HashMap<B256, InterruptTally> = HashMap::new();
+        assert_eq!(map.get(&B256::repeat_byte(0x99)).map_or(0, |t| t.count), 0);
+    }
+
+    #[test]
+    fn taking_an_interrupt_tally_is_exactly_once_per_parent() {
+        // `take_interrupt_count` removes the entry so a retried build at the same height cannot
+        // increment `bid_interrupt_wasted_total` twice for one block.
+        let mut map = HashMap::new();
+        let parent = B256::repeat_byte(0xaa);
+        record_interrupt_tally(&mut map, parent, 300);
+        record_interrupt_tally(&mut map, parent, 300);
+
+        assert_eq!(map.remove(&parent).map_or(0, |t| t.count), 2, "first read sees the tally");
+        assert_eq!(map.remove(&parent).map_or(0, |t| t.count), 0, "second read must see nothing");
     }
 }

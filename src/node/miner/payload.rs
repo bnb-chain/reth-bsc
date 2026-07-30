@@ -2143,6 +2143,17 @@ where
         self.collect_best_bid();
         self.collect_best_bid_block();
 
+        // Sample "is a replacement simulation still in flight" here, right after the last moment a
+        // finished bid could still have been collected — not down at the metric site. A simulation
+        // that completes after this point is already too late to be used, yet its `simulating_bid`
+        // entry is removed the instant it completes, so a later check would report it as on-time.
+        // On the common path the gap is a few ms and either point would do; the reason to sample
+        // early is `collect_payload_candidates`, which blocks on `join_next` when no candidate has
+        // landed yet — precisely the fat-block-under-load case this metric exists to detect, where
+        // a late check would be biased toward reporting "on time".
+        let replacement_in_flight =
+            self.simulator.is_simulating(self.mining_ctx.parent_header.hash());
+
         self.collect_payload_candidates()?;
 
         // BEP-675 zero-simulate selection (go-bsc `selectBidBlock`): if the unexecuted BidBlock's
@@ -2153,7 +2164,7 @@ where
             return Ok(());
         }
 
-        let best_payload = self.pick_best_payload_and_finalize()?;
+        let best_payload = self.pick_best_payload_and_finalize(replacement_in_flight)?;
 
         self.submit_payload(best_payload)?;
 
@@ -2456,8 +2467,11 @@ where
     ///
     /// Selection is by fees only; finalization (difficulty, vote attestation, ECDSA seal,
     /// cache updates) is delegated to [`finalize_payload`].
+    /// `replacement_in_flight` is sampled by the caller at bid-collection time — see the comment at
+    /// that sample point for why it cannot be read here instead.
     fn pick_best_payload_and_finalize(
         &mut self,
+        replacement_in_flight: bool,
     ) -> Result<BscBuiltPayload, Box<BscPayloadJobError>> {
         let total_job_duration = self.job_start_time.elapsed();
         let try_mine_block_number = self.build_args.config.parent_header.number() + 1;
@@ -2522,11 +2536,41 @@ where
             Box::new(BscPayloadJobError::PayloadBuildingError(e.to_string()))
         })?;
 
-        if best_payload.is_bid {
+        {
             use crate::metrics::BscMevMetrics;
             use once_cell::sync::Lazy;
             static MEV_METRICS: Lazy<BscMevMetrics> = Lazy::new(BscMevMetrics::default);
-            MEV_METRICS.bid_win_total.increment(1);
+            if best_payload.is_bid {
+                MEV_METRICS.bid_win_total.increment(1);
+            } else {
+                // Simulations were preempted for bids that then failed to win the block: the
+                // interrupts killed work and bought nothing, and we sealed a local payload instead.
+                // Against `bid_interrupt_total` this is the thrash ratio that a tightened
+                // `no_interrupt_left_over` window has to be judged on — a preempted simulation
+                // records no metric of its own (aborted runs return before
+                // `bid_simulation_duration_seconds` is recorded), so this is the only place the
+                // cost surfaces.
+                //
+                // Weighted by how many simulations were preempted, not one per block: the failure
+                // mode under test is a cascade (bid → interrupt → bid → interrupt → nothing
+                // finishes), and counting that once would flatten a six-deep cascade to look like a
+                // single unlucky coin-flip. Keeping the same unit as `bid_interrupt_total` also
+                // makes the ratio a true proportion rather than blocks-per-interrupt.
+                let parent_hash = self.mining_ctx.parent_header.hash();
+                let wasted = self.simulator.take_interrupt_count(parent_hash);
+                if wasted > 0 {
+                    MEV_METRICS.bid_interrupt_wasted_total.increment(wasted);
+
+                    // Split out the cause. A replacement still in flight when the bid was needed is
+                    // the one outcome that actually indicts the window: it was preempted with
+                    // "enough" time left by `can_be_interrupted`'s arithmetic, and that arithmetic
+                    // was wrong. Waste where the replacement *did* finish but lost on merit or was
+                    // rejected would have happened under the old 500ms window too.
+                    if replacement_in_flight {
+                        MEV_METRICS.bid_interrupt_late_total.increment(wasted);
+                    }
+                }
+            }
         }
 
         info!(
