@@ -248,6 +248,62 @@ fn bid_block_admission_enabled(mev_running: bool, flag_enabled: bool, pasteur_ac
     mev_running && flag_enabled && pasteur_active
 }
 
+/// Why `mev_sendBidBlock`'s structural validation rejected a submission. Ordered as the checks run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BidBlockStructuralRejection {
+    /// Bid targets a height at or below the head — it can never become the next block.
+    StaleNumber,
+    /// Bid targets a height beyond `head + 1`.
+    FutureNumber,
+    /// This validator does not propose the block after the head.
+    NotInTurn,
+    /// Bid's `parent_hash` is not the current head's hash.
+    NonAlignedParent,
+    /// Header claims no gas was used.
+    EmptyGasUsed,
+    /// Bid carries no transactions.
+    EmptyTransactions,
+}
+
+/// Structural validation for `mev_sendBidBlock`, mirroring go-bsc `MevAPI.SendBidBlock`.
+///
+/// Split out as a free function so the checks — and critically their **order** — are testable
+/// without standing up a full `MevApiImpl` with a snapshot provider and chain head. The order is
+/// load-bearing and matches go-bsc: number, then in-turn, then parent alignment. `node-deploy-bsc`'s
+/// `probeInTurn` depends on it, submitting a parent-hash-mismatched bid to learn whether the
+/// validator is in turn — the number check must pass and in-turn must run *before* parent alignment
+/// fails, or the probe reads the wrong answer.
+fn validate_bid_block_structure(
+    block_number: u64,
+    head_number: u64,
+    is_inturn: bool,
+    bid_parent_hash: B256,
+    head_hash: B256,
+    gas_used: u64,
+    transaction_count: usize,
+) -> Result<(), BidBlockStructuralRejection> {
+    use BidBlockStructuralRejection::*;
+    if block_number < head_number + 1 {
+        return Err(StaleNumber);
+    }
+    if block_number > head_number + 1 {
+        return Err(FutureNumber);
+    }
+    if !is_inturn {
+        return Err(NotInTurn);
+    }
+    if bid_parent_hash != head_hash {
+        return Err(NonAlignedParent);
+    }
+    if gas_used == 0 {
+        return Err(EmptyGasUsed);
+    }
+    if transaction_count == 0 {
+        return Err(EmptyTransactions);
+    }
+    Ok(())
+}
+
 /// Mirrors go-bsc `bidutil.BidMustBefore`: the deadline after which a `mev_sendBidBlock`
 /// submission is rejected as too late.
 ///
@@ -1197,33 +1253,43 @@ impl BscMevApiServer for MevApiImpl {
             .get_header_by_number(head_number)
             .ok_or_else(|| Self::internal_err("chain head header unavailable"))?;
 
-        // Number, then in-turn, then parent-hash alignment — go-bsc's order.
+        // Number, then in-turn, then parent-hash alignment — go-bsc's order, enforced in
+        // `validate_bid_block_structure` so the ordering itself is unit-tested.
         let block_number = bb.header.number;
-        if block_number < head_number + 1 {
-            return Err(Self::invalid_bid(format!(
-                "stale block number: {block_number}, latest block: {head_number}"
-            )));
-        }
-        if block_number > head_number + 1 {
-            return Err(Self::invalid_bid(format!(
-                "block in future: {block_number}, latest block: {head_number}"
-            )));
-        }
         let parent_hash = head_header.hash_slow();
-        match self.snapshot_provider.snapshot_by_hash(&parent_hash) {
-            Some(snapshot) if snapshot.is_inturn(self.validator_address) => {}
-            _ => return Err(Self::mev_not_in_turn()),
-        }
-        if bb.header.parent_hash != parent_hash {
-            return Err(Self::invalid_bid(format!("non-aligned parent hash: {parent_hash:?}")));
-        }
-        if bb.header.gas_used == 0 {
-            return Err(Self::invalid_bid("empty gasUsed in header"));
-        }
-        if bb.transactions.is_empty() {
-            return Err(Self::invalid_bid("empty transactions"));
+        let is_inturn = self
+            .snapshot_provider
+            .snapshot_by_hash(&parent_hash)
+            .is_some_and(|snapshot| snapshot.is_inturn(self.validator_address));
+
+        if let Err(rejection) = validate_bid_block_structure(
+            block_number,
+            head_number,
+            is_inturn,
+            bb.header.parent_hash,
+            parent_hash,
+            bb.header.gas_used,
+            bb.transactions.len(),
+        ) {
+            use BidBlockStructuralRejection as R;
+            return Err(match rejection {
+                R::StaleNumber => Self::invalid_bid(format!(
+                    "stale block number: {block_number}, latest block: {head_number}"
+                )),
+                R::FutureNumber => Self::invalid_bid(format!(
+                    "block in future: {block_number}, latest block: {head_number}"
+                )),
+                R::NotInTurn => Self::mev_not_in_turn(),
+                R::NonAlignedParent => {
+                    Self::invalid_bid(format!("non-aligned parent hash: {parent_hash:?}"))
+                }
+                R::EmptyGasUsed => Self::invalid_bid("empty gasUsed in header"),
+                R::EmptyTransactions => Self::invalid_bid("empty transactions"),
+            });
         }
 
+        // Every rejection above returns before this point, so nothing structurally invalid can reach
+        // the miner queue (TC-009's `bid_block_queue_len()` invariant).
         self.admit_bid_block(&args, &head_header)
     }
 
@@ -1339,6 +1405,147 @@ mod bid_block_param_tests {
         assert!(!super::bid_block_admission_enabled(false, true, true));
         assert!(!super::bid_block_admission_enabled(true, false, true));
         assert!(!super::bid_block_admission_enabled(true, true, false));
+    }
+
+    /// A submission that passes every structural check, as the baseline the rejection tests mutate.
+    fn valid_structure() -> (u64, u64, bool, B256, B256, u64, usize) {
+        let head_hash = B256::repeat_byte(0xaa);
+        (101, 100, true, head_hash, head_hash, 121_000, 1)
+    }
+
+    #[test]
+    fn bid_block_structure_accepts_a_well_formed_submission() {
+        let (n, head, inturn, bid_parent, head_hash, gas, txs) = valid_structure();
+        assert_eq!(
+            super::validate_bid_block_structure(n, head, inturn, bid_parent, head_hash, gas, txs),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn bid_block_structure_rejects_stale_block_number() {
+        // TC-009 sub-case 1: number == head, so it can never be the next block. Rejected before the
+        // in-turn check, which is why `probeInTurn` can run against any head.
+        let (_, head, inturn, bid_parent, head_hash, gas, txs) = valid_structure();
+        assert_eq!(
+            super::validate_bid_block_structure(head, head, inturn, bid_parent, head_hash, gas, txs),
+            Err(super::BidBlockStructuralRejection::StaleNumber)
+        );
+        // Well below the head too, not just exactly at it.
+        assert_eq!(
+            super::validate_bid_block_structure(1, head, inturn, bid_parent, head_hash, gas, txs),
+            Err(super::BidBlockStructuralRejection::StaleNumber)
+        );
+    }
+
+    #[test]
+    fn bid_block_structure_rejects_future_block_number() {
+        // TC-009 sub-case 2: head + 2. Distinct from stale so builders can tell "you are behind"
+        // from "you are ahead" — the messages differ and both map to -38001.
+        let (_, head, inturn, bid_parent, head_hash, gas, txs) = valid_structure();
+        assert_eq!(
+            super::validate_bid_block_structure(
+                head + 2,
+                head,
+                inturn,
+                bid_parent,
+                head_hash,
+                gas,
+                txs
+            ),
+            Err(super::BidBlockStructuralRejection::FutureNumber)
+        );
+    }
+
+    #[test]
+    fn bid_block_structure_rejects_when_not_in_turn() {
+        // TC-009 sub-case 3: correct height, aligned parent, valid body — only the turn is wrong,
+        // and it must surface as -38005 rather than collapsing into a generic -38001.
+        let (n, head, _, bid_parent, head_hash, gas, txs) = valid_structure();
+        assert_eq!(
+            super::validate_bid_block_structure(n, head, false, bid_parent, head_hash, gas, txs),
+            Err(super::BidBlockStructuralRejection::NotInTurn)
+        );
+    }
+
+    #[test]
+    fn bid_block_structure_rejects_non_aligned_parent_hash() {
+        // TC-009 sub-case 4: builds on something that is not the current head.
+        let (n, head, inturn, _, head_hash, gas, txs) = valid_structure();
+        assert_eq!(
+            super::validate_bid_block_structure(
+                n,
+                head,
+                inturn,
+                B256::repeat_byte(0xde),
+                head_hash,
+                gas,
+                txs
+            ),
+            Err(super::BidBlockStructuralRejection::NonAlignedParent)
+        );
+    }
+
+    #[test]
+    fn bid_block_structure_rejects_empty_transactions() {
+        // TC-009 sub-case 5.
+        let (n, head, inturn, bid_parent, head_hash, gas, _) = valid_structure();
+        assert_eq!(
+            super::validate_bid_block_structure(n, head, inturn, bid_parent, head_hash, gas, 0),
+            Err(super::BidBlockStructuralRejection::EmptyTransactions)
+        );
+    }
+
+    #[test]
+    fn bid_block_structure_rejects_empty_gas_used() {
+        // Not in TC-009's list but validated by go-bsc and by node-deploy-bsc's `zero-gas-used`
+        // case, and it runs before the empty-transactions check.
+        let (n, head, inturn, bid_parent, head_hash, _, txs) = valid_structure();
+        assert_eq!(
+            super::validate_bid_block_structure(n, head, inturn, bid_parent, head_hash, 0, txs),
+            Err(super::BidBlockStructuralRejection::EmptyGasUsed)
+        );
+    }
+
+    #[test]
+    fn bid_block_structure_check_order_matches_geth() {
+        use super::BidBlockStructuralRejection as R;
+        let head_hash = B256::repeat_byte(0xaa);
+        let bad_parent = B256::repeat_byte(0xde);
+
+        // Order is load-bearing, not cosmetic. `node-deploy-bsc`'s `probeInTurn` submits a
+        // parent-mismatched bid precisely to read the in-turn answer out of the response: a bid at
+        // the right height that is *not* in turn must report -38005, while the same bid *in* turn
+        // must report the parent mismatch. Swap those two checks and the probe silently inverts.
+        assert_eq!(
+            super::validate_bid_block_structure(101, 100, false, bad_parent, head_hash, 121_000, 1),
+            Err(R::NotInTurn),
+            "in-turn must be checked before parent alignment"
+        );
+        assert_eq!(
+            super::validate_bid_block_structure(101, 100, true, bad_parent, head_hash, 121_000, 1),
+            Err(R::NonAlignedParent)
+        );
+
+        // Number precedes in-turn, so a stale/future bid is rejected the same way regardless of
+        // whose turn it is — that is what lets the probe run against any head without waiting.
+        for inturn in [true, false] {
+            assert_eq!(
+                super::validate_bid_block_structure(
+                    100, 100, inturn, bad_parent, head_hash, 0, 0
+                ),
+                Err(R::StaleNumber),
+                "number must be checked before everything else"
+            );
+        }
+
+        // Parent alignment precedes the body checks, so a misaligned bid with an empty body still
+        // reports the parent mismatch.
+        assert_eq!(
+            super::validate_bid_block_structure(101, 100, true, bad_parent, head_hash, 0, 0),
+            Err(R::NonAlignedParent),
+            "parent alignment must be checked before gasUsed/transactions"
+        );
     }
 
     #[test]
