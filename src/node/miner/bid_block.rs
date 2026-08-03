@@ -27,7 +27,7 @@ use alloy_consensus::transaction::RlpEcdsaDecodableTx;
 use alloy_consensus::{Header, Transaction, TxLegacy};
 use alloy_eips::eip2718::Decodable2718;
 use alloy_primitives::{keccak256, Address, Bytes, Signature, B256, U256};
-use alloy_rlp::{Decodable, Encodable};
+use alloy_rlp::Decodable;
 use reth::primitives::SealedHeader;
 use reth_chainspec::EthChainSpec;
 use reth_ethereum_primitives::{BlockBody, TransactionSigned};
@@ -61,20 +61,21 @@ pub struct BidBlock {
 }
 
 impl BidBlock {
-    /// `rlpHash([header, transactions, sidecars])` — the digest the builder signs.
+    /// The header hash — the digest the builder signs.
     ///
-    /// Matches geth's `BidBlock.Hash()`; see the module note on blob-sidecar parity.
+    /// Matches geth's `BidBlock.Hash()` as of bsc #3742 ("miner: optimize BidBlock signing hash",
+    /// shipped in v1.7.6), which replaced `rlpHash([header, transactions, sidecars])` with
+    /// `b.Header.Hash()`. Re-hashing the body on every call meant re-hashing up to 6 × 128 KiB of
+    /// blob data on the admission hot path; the header is ~600 bytes.
+    ///
+    /// The body is still bound to the signature, indirectly: `header.transactions_root` commits to
+    /// the transactions and is verified in [`verify_bid_block_payload`], and blob sidecars are
+    /// bound through the blob versioned hashes carried inside those transactions. **That tx-root
+    /// check is what makes this digest safe — do not narrow the digest without it.** Recovering a
+    /// signature over the wrong digest does not fail; it silently yields a different address, so a
+    /// mismatch here surfaces as a bogus "builder is not registered" rather than a signature error.
     pub fn hash(&self) -> B256 {
-        let payload_length =
-            self.header.length() + self.transactions.length() + self.sidecars.length();
-
-        let mut out = Vec::with_capacity(payload_length + 8);
-        alloy_rlp::Header { list: true, payload_length }.encode(&mut out);
-        self.header.encode(&mut out);
-        self.transactions.encode(&mut out);
-        self.sidecars.encode(&mut out);
-
-        keccak256(&out)
+        self.header.hash_slow()
     }
 }
 
@@ -166,12 +167,23 @@ impl BidBlockArgs {
             builder,
             header: self.bid_block.header.clone(),
             txs: self.decode_txs()?,
+            submitted_tx_root: submitted_tx_root(&self.bid_block.transactions),
             sidecars: self.bid_block.sidecars.clone(),
             gas_fee: U256::ZERO,
             system_tx_start: 0,
             bid_hash: self.bid_block.hash(),
         })
     }
+}
+
+/// Transactions trie root over raw (EIP-2718) tx bytes — go-bsc `DeriveSha(txs, StackTrie)`.
+///
+/// Hashes the submitted bytes verbatim rather than re-encoding decoded transactions, which would
+/// not round-trip the unsigned system txs (`V=R=S=0`).
+pub fn submitted_tx_root(raw_txs: &[Bytes]) -> B256 {
+    alloy_consensus::proofs::ordered_trie_root_with_encoder(raw_txs, |tx: &Bytes, buf| {
+        buf.extend_from_slice(tx.as_ref())
+    })
 }
 
 /// Validator-side decoded representation of a [`BidBlock`].
@@ -183,6 +195,13 @@ pub struct DecodedBidBlock {
     pub header: Header,
     /// Decoded transactions.
     pub txs: Vec<TransactionSigned>,
+    /// Transactions trie root over the **raw submitted** tx bytes, computed at decode time.
+    ///
+    /// Must be taken from the raw bytes, not by re-encoding [`Self::txs`]: the trailing system txs
+    /// arrive unsigned with `V=R=S=0`, and reth's `Signature` stores only a parity bit, so
+    /// re-encoding a legacy tx emits `v=27` and yields a different root than go-bsc's `DeriveSha`
+    /// over the same input. The raw bytes are also precisely what the builder committed to.
+    pub submitted_tx_root: B256,
     /// Blob sidecars.
     pub sidecars: Vec<BscBlobTransactionSidecar>,
     /// Fees collected from user txs (set during admission).
@@ -602,6 +621,25 @@ pub fn verify_bid_block_payload(
     let header = &decoded.header;
     verify_bid_block_coinbase_and_gas_limit(header, etherbase, expected_gas_limit)?;
 
+    // go-bsc `preSealVerifyBidBlock`: `DeriveSha(decoded.Txs) == header.TxHash`.
+    //
+    // Load-bearing, not a formality. Since bsc #3742 the builder's signature covers only the
+    // header, so `transactions_root` is the *sole* commitment binding the submitted body to that
+    // signature. Without this check anyone could take an honest builder's (header, signature) off
+    // the wire, resubmit it with a substituted transaction list, and have it proposed under that
+    // builder's identity — the validator later overwrites `transactions_root` with the root of
+    // whatever body it was handed (see `simulate_bid_block`), so the forgery would leave no trace.
+    //
+    // Compares the txs exactly as submitted, before `bind_sign_bid_block_system_txs` re-signs the
+    // trailing system txs — that as-submitted set (unsigned system txs, V=R=S=0) is what the
+    // builder committed to. go-bsc likewise checks before blind-signing.
+    if decoded.submitted_tx_root != header.transactions_root {
+        return Err(PreSealVerifyError::TxRootMismatch {
+            got: header.transactions_root,
+            want: decoded.submitted_tx_root,
+        });
+    }
+
     let (system_tx_start, gas_fee) = extract_bid_block_deposit_value(&decoded.txs);
     if gas_fee.is_zero() {
         return Err(PreSealVerifyError::EmptyGasFee);
@@ -651,6 +689,9 @@ pub enum PreSealVerifyError {
     WrongDifficulty { got: U256, want: U256 },
     /// The deposit (gas-fee) value is zero.
     EmptyGasFee,
+    /// Header `transactions_root` does not commit to the submitted transactions. Since bsc #3742
+    /// the signature covers only the header, so this root is what binds the body to it.
+    TxRootMismatch { got: B256, want: B256 },
     /// A user tx exceeds the per-tx gas cap.
     TxGasTooHigh { tx_index: usize, gas: u64, cap: u64 },
     /// Blob-sidecar validation failed.
@@ -679,6 +720,9 @@ impl fmt::Display for PreSealVerifyError {
                 write!(f, "wrong difficulty: got {got}, want {want}")
             }
             Self::EmptyGasFee => write!(f, "empty gasFee"),
+            Self::TxRootMismatch { got, want } => {
+                write!(f, "invalid tx root: got {got}, want {want}")
+            }
             Self::TxGasTooHigh { tx_index, gas, cap } => {
                 write!(f, "tx {tx_index} gas {gas} exceeds cap {cap}")
             }
@@ -894,6 +938,8 @@ pub fn simulate_bid_block(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Needed by the hand-rolled RLP fixtures below; the production path no longer RLP-encodes.
+    use alloy_rlp::Encodable;
     use alloy_primitives::{address, b256, bytes, hex};
 
     /// Repro for the blob-BidBlock admission stack overflow: run the decode+hash path a tokio
@@ -997,7 +1043,7 @@ mod tests {
         // Generated from go-ethereum BidBlock.Hash() (nil sidecars).
         assert_eq!(
             vector_a_block().hash(),
-            b256!("0xdc44b22e7cc5c067a0cc494d39871fa87de72bfd54db5711ccc3cdc31e948491"),
+            b256!("0x45908d0719d520fb290125d2df35591b639a6667a8ca453b807f0577ab3a8eba"),
         );
     }
 
@@ -1021,13 +1067,19 @@ mod tests {
         };
         assert_eq!(
             block.hash(),
-            b256!("0x789bf84e2c1f41f6fe8d05cfc0f4b9ee72380c16f506e0640fcfb4c12d0ea6a5"),
+            b256!("0xad40d96e6b75df67950f6a63e6659936814b5e11407c6cdcf3b5c63675aa59f8"),
         );
+        // Post-#3742 the digest is exactly the header hash; the two transactions above do not
+        // enter it (they are bound via `transactions_root` instead — see `verify_bid_block_payload`).
+        assert_eq!(block.hash(), block.header.hash_slow());
     }
 
     #[test]
     fn ecrecover_matches_geth_vector_c() {
-        // Builder signed vector A's hash with a known key; geth recovered this address.
+        // The same fixed signature reth-bsc has always pinned, recovered over the post-#3742
+        // digest. Regenerated with go-bsc `BidBlockArgs.EcrecoverSender()`: narrowing the digest
+        // changes which address a given signature recovers to, which is exactly why the old
+        // mismatch surfaced as a bogus "builder is not registered".
         let args = BidBlockArgs {
             bid_block: vector_a_block(),
             signature: Bytes::from(hex!(
@@ -1036,7 +1088,7 @@ mod tests {
         };
         assert_eq!(
             args.ecrecover_sender().unwrap(),
-            address!("0x9d8A62f656a8d1615C1294fd71e9CFb3E4855A4F"),
+            address!("0xd6df9A7DF6A570f65d7BC2B1e1001e0dD8500040"),
         );
     }
 
@@ -1101,11 +1153,16 @@ mod tests {
             transactions: Vec::new(),
             sidecars: vec![sidecar],
         };
-        // Generated from go-bsc BidBlock.Hash() over [header, [], [sidecar]].
+        // Post-#3742 sidecars are NOT part of the signing digest, so attaching one to vector A's
+        // header must leave the hash unchanged. Verified against go-bsc `BidBlock.Hash()` over
+        // [header, [], [sidecar]], which returns vector A's hash. Sidecars are instead bound
+        // through the blob versioned hashes carried inside the (root-committed) transactions.
         assert_eq!(
             block.hash(),
-            b256!("0x020136e0d39a0a27c9597e89c56f77170b1d43e6b391c4852a2138936184d9c5"),
+            b256!("0x45908d0719d520fb290125d2df35591b639a6667a8ca453b807f0577ab3a8eba"),
+            "sidecars must not affect the signing digest"
         );
+        assert_eq!(block.hash(), vector_a_block().hash());
     }
 
     // ---- blob sidecar validation ----
@@ -1422,20 +1479,110 @@ mod tests {
         TransactionSigned::new_unhashed(tx.into(), Signature::new(U256::ZERO, U256::ZERO, false))
     }
 
+    /// Builds a well-formed `DecodedBidBlock`, deriving `transactions_root` from `txs` the way a
+    /// real builder must: since bsc #3742 the signature covers only the header, so that root is the
+    /// commitment binding the body, and `verify_bid_block_payload` rejects a mismatch. Tests that
+    /// want a mismatch should overwrite the root explicitly (see
+    /// `pre_seal_rejects_tx_root_mismatch`).
     fn decoded_block(
         header: Header,
         txs: Vec<TransactionSigned>,
         sidecars: Vec<BscBlobTransactionSidecar>,
     ) -> DecodedBidBlock {
+        let mut header = header;
+        let root = alloy_consensus::proofs::calculate_transaction_root(&txs);
+        header.transactions_root = root;
         DecodedBidBlock {
             builder: Address::ZERO,
             header,
             txs,
+            submitted_tx_root: root,
             sidecars,
             gas_fee: U256::ZERO,
             system_tx_start: 0,
             bid_hash: B256::ZERO,
         }
+    }
+
+    #[test]
+    fn submitted_tx_root_matches_geth_for_unsigned_system_tx() {
+        // Cross-client vector generated with go-bsc `DeriveSha(txs, NewStackTrie(nil))` over one
+        // unsigned parlia system tx (`types.NewTransaction` leaves V=R=S nil, wire-encoded as 0).
+        //
+        // This is the case that forces the root to be taken from the RAW submitted bytes: reth's
+        // `Signature` carries only a parity bit, so decoding this tx and re-encoding it emits
+        // `v=27` instead of `v=0` and produces a different root. Computing the root by
+        // re-encoding would therefore reject every legitimate BidBlock.
+        let raw = bytes!(
+            "0xf8498080887fffffffffffffff94000000000000000000000000000000000000100064a4f340fa01000000000000000000000000bcdd0d2cda5f6423e57b6a4dcd75decbe31aecf0808080"
+        );
+        let geth_root =
+            b256!("0x4527823c77294bc45e8d370fc7c3e95cf779bdbf98f4adacdb57e361050a1ddf");
+
+        assert_eq!(submitted_tx_root(std::slice::from_ref(&raw)), geth_root, "must match go-bsc DeriveSha");
+
+        // And demonstrate why the raw form is required: the re-encoded root differs.
+        // `decode_bid_block_tx` is the production decoder — plain `decode_2718` rejects this
+        // shape outright (`UnexpectedType(0)`), which is itself why reth-bsc needs a bespoke one.
+        let decoded = decode_bid_block_tx(raw.as_ref()).expect("decode system tx");
+        assert_ne!(
+            alloy_consensus::proofs::calculate_transaction_root(&[decoded]),
+            geth_root,
+            "re-encoding a decoded unsigned system tx must NOT reproduce the root — if this ever \
+             starts matching, the raw-bytes path can be simplified"
+        );
+    }
+
+    #[test]
+    fn pre_seal_rejects_tx_root_mismatch() {
+        // The security-critical half of bsc #3742. The signature covers only the header, so
+        // `transactions_root` is the sole binding between the signed header and the submitted body.
+        // Without this rejection, anyone could replay an honest builder's (header, signature) with a
+        // substituted transaction list: recovery would still yield the whitelisted builder, and
+        // `simulate_bid_block` would overwrite the root to match the forged body, leaving no trace.
+        let spec = preseal_spec();
+        let etherbase = Address::repeat_byte(0x11);
+        let parent = Header { number: 0, timestamp: 1, gas_limit: 30_000_000, ..Default::default() };
+        let txs = vec![legacy_tx(0), deposit_system_tx(100)];
+        let mut d = decoded_block(valid_bid_header(etherbase, 30_000_000), txs, vec![]);
+
+        // Sanity: the well-formed fixture passes, so the failure below is attributable to the root.
+        assert!(verify_bid_block_payload(
+            &spec,
+            &d,
+            &parent,
+            etherbase,
+            d.header.gas_limit
+        )
+        .is_ok());
+
+        // Now claim a different body than the one supplied — the replay/substitution shape.
+        let honest_root = d.header.transactions_root;
+        d.header.transactions_root = B256::repeat_byte(0xab);
+        assert_eq!(
+            verify_bid_block_payload(&spec, &d, &parent, etherbase, d.header.gas_limit),
+            Err(PreSealVerifyError::TxRootMismatch {
+                got: B256::repeat_byte(0xab),
+                want: honest_root,
+            }),
+        );
+    }
+
+    #[test]
+    fn signing_digest_ignores_body_and_is_the_header_hash() {
+        // Post-#3742 property, verified against go-bsc: the digest is a pure function of the
+        // header, so neither transactions nor sidecars perturb it. This is the inverse of what the
+        // pre-#3742 vectors asserted, and it is only safe because `verify_bid_block_payload` checks
+        // `transactions_root` — these two tests must be read together.
+        let bare = vector_a_block();
+        let with_txs = BidBlock {
+            header: bare.header.clone(),
+            transactions: vec![bytes!("0x010203"), bytes!("0xdeadbeef")],
+            sidecars: Vec::new(),
+        };
+
+        assert_eq!(bare.hash(), bare.header.hash_slow(), "digest must be the header hash");
+        assert_eq!(with_txs.hash(), bare.hash(), "transactions must not enter the digest");
     }
 
     #[test]
