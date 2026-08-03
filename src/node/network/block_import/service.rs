@@ -1345,6 +1345,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bid_block_engine_err_leaves_double_sign_slot_claimed() {
+        // Characterization test for the `Err(err)` arm of `on_new_bid_block` — the case where
+        // `engine.new_payload()` fails at the transport level instead of returning a verdict.
+        //
+        // This pins CORRECT behavior, not a gap. The BidBlock is broadcast to peers *before*
+        // verification (zero-simulate), so by the time the engine errors the block is already out
+        // on the wire and this validator has signed at this height. The double-sign slot must
+        // therefore STAY claimed: releasing it would let a fallback block be produced for the same
+        // height and turn a missed slot into a slashable double sign. (The slot-rollback helper in
+        // `shared` is scoped to blocks that were "never actually broadcast" — the miner's
+        // channel-send failure — which is not this case.) go-bsc agrees: `handleBidBlockResult`
+        // leaves `recentMinedBlocks` untouched on a verification failure, and has no rollback at
+        // all. The builder is likewise not revoked here — an `Err` is our failure, not provable
+        // dishonesty (a deliberate divergence: go-bsc revokes on any `InsertChain` error, because
+        // its single error return cannot separate "block is invalid" from "our node failed").
+        //
+        // If someone intends to change this, they must first move the broadcast to after
+        // verification; until then, a failing assertion here means a double-sign risk was
+        // introduced.
+        let (responses, mut new_payload_observed) = EngineResponses::unavailable_new_payload();
+        let mut fixture = TestFixture::new(responses).await;
+
+        // High, test-local block number: `RECENT_MINED_BLOCKS` is process-global.
+        let block_number = 900_101_u64;
+        let sealed = create_bid_sealed_block(block_number);
+        let parent_hash = sealed.header().parent_hash;
+
+        let builder = Address::repeat_byte(0x7f);
+        let bid_hash = B256::repeat_byte(0xb2);
+        let pm = crate::shared::get_bid_block_permission_manager();
+        assert!(pm.is_allowed(builder), "builder should start allowed");
+
+        // Stand in for the miner, which claims the slot before handing the block to this service
+        // (`pick_best_payload_and_finalize` → `check_and_record_mined_block`).
+        assert!(
+            crate::shared::check_and_record_mined_block(block_number, parent_hash),
+            "slot must start unclaimed"
+        );
+
+        fixture.bid_tx.send((sealed, builder, bid_hash, U256::ZERO, 0)).unwrap();
+
+        // 1. Broadcast still happens, before (and despite) the failed verification.
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut saw_broadcast = false;
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
+        while !saw_broadcast && tokio::time::Instant::now() < deadline {
+            match fixture.handle.poll_outcome(&mut cx) {
+                Poll::Ready(Some(event)) => {
+                    if matches!(
+                        event,
+                        BlockImportEvent::Announcement(BlockValidation::ValidBlock { .. })
+                    ) {
+                        saw_broadcast = true;
+                    }
+                }
+                Poll::Ready(None) => break,
+                Poll::Pending => tokio::task::yield_now().await,
+            }
+        }
+        assert!(saw_broadcast, "BidBlock must be broadcast before verification");
+
+        // 2. Wait for positive proof the engine call was made and failed, rather than assuming it
+        //    from a bare timeout — otherwise the negative assertions below could pass vacuously.
+        tokio::time::timeout(tokio::time::Duration::from_secs(2), new_payload_observed.recv())
+            .await
+            .expect("engine.new_payload was never called")
+            .expect("engine mock closed without observing new_payload");
+        // The responder was already dropped when the observation fired, so the handle's `Err` is
+        // determined; yield briefly to let the spawned verify task reach its `Err` arm.
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // 3. The slot is still claimed: a second call for the same pair is refused.
+        assert!(
+            !crate::shared::check_and_record_mined_block(block_number, parent_hash),
+            "double-sign slot must remain claimed after an engine error — the block was already \
+             broadcast, so releasing it would permit a second signature at this height"
+        );
+
+        // 4. The builder keeps its permission: `Err` is not provable dishonesty.
+        assert!(
+            pm.is_allowed(builder),
+            "builder must NOT be revoked for an engine-side error (only Invalid revokes)"
+        );
+    }
+
+    #[tokio::test]
     async fn bid_block_low_average_gas_price_revokes() {
         // Post-import average-gas-price floor check (go-bsc `validateBidBlockAverageGasPrice`):
         // a Valid BidBlock whose deposit-derived gas_fee implies an average price below the
@@ -1622,17 +1709,32 @@ mod tests {
     struct EngineResponses {
         new_payload: PayloadStatusEnum,
         fcu: PayloadStatusEnum,
+        /// Make `new_payload` fail at the transport level rather than return a status: the mock
+        /// drops the responder, which `ConsensusEngineHandle::new_payload` maps to
+        /// `Err(BeaconOnNewPayloadError::EngineUnavailable)`. Distinct from
+        /// `PayloadStatusEnum::Invalid` — an `Err` is *our* failure, not a verdict on the block.
+        new_payload_unavailable: bool,
+        /// Fires once per observed `NewPayload`, so a test can await proof that the engine call
+        /// actually happened rather than inferring it from a timeout.
+        new_payload_observed: Option<mpsc::UnboundedSender<()>>,
     }
 
     impl EngineResponses {
         fn both_valid() -> Self {
-            Self { new_payload: PayloadStatusEnum::Valid, fcu: PayloadStatusEnum::Valid }
+            Self {
+                new_payload: PayloadStatusEnum::Valid,
+                fcu: PayloadStatusEnum::Valid,
+                new_payload_unavailable: false,
+                new_payload_observed: None,
+            }
         }
 
         fn invalid_new_payload() -> Self {
             Self {
                 new_payload: PayloadStatusEnum::Invalid { validation_error: "test error".into() },
                 fcu: PayloadStatusEnum::Valid,
+                new_payload_unavailable: false,
+                new_payload_observed: None,
             }
         }
 
@@ -1640,7 +1742,24 @@ mod tests {
             Self {
                 new_payload: PayloadStatusEnum::Valid,
                 fcu: PayloadStatusEnum::Invalid { validation_error: "fcu error".into() },
+                new_payload_unavailable: false,
+                new_payload_observed: None,
             }
+        }
+
+        /// `engine.new_payload()` returns `Err`, exercising the arm that is neither Valid nor
+        /// Invalid. Returns a receiver that fires once the engine call has been made and failed.
+        fn unavailable_new_payload() -> (Self, mpsc::UnboundedReceiver<()>) {
+            let (observed_tx, observed_rx) = mpsc::unbounded_channel();
+            (
+                Self {
+                    new_payload: PayloadStatusEnum::Valid,
+                    fcu: PayloadStatusEnum::Valid,
+                    new_payload_unavailable: true,
+                    new_payload_observed: Some(observed_tx),
+                },
+                observed_rx,
+            )
         }
     }
 
@@ -1773,8 +1892,19 @@ mod tests {
             while let Some(message) = from_engine.recv().await {
                 match message {
                     BeaconEngineMessage::NewPayload { payload: _, tx } => {
-                        tx.send(Ok(PayloadStatus::new(responses.new_payload.clone(), None)))
-                            .unwrap();
+                        if responses.new_payload_unavailable {
+                            // Drop the responder without replying: the handle maps a closed oneshot
+                            // to `Err(BeaconOnNewPayloadError::EngineUnavailable)`, which is the
+                            // real shape of this failure (engine task gone) rather than a synthetic
+                            // error value.
+                            drop(tx);
+                        } else {
+                            tx.send(Ok(PayloadStatus::new(responses.new_payload.clone(), None)))
+                                .unwrap();
+                        }
+                        if let Some(observed) = &responses.new_payload_observed {
+                            let _ = observed.send(());
+                        }
                     }
                     BeaconEngineMessage::ForkchoiceUpdated { state: _, payload_attrs: _, tx } => {
                         tx.send(Ok(OnForkChoiceUpdated::valid(PayloadStatus::new(

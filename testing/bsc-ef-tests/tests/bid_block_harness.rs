@@ -413,7 +413,9 @@ fn execution_gate_round_trip() {
     use alloy_primitives::{Signature, TxKind};
     use reth_bsc::consensus::parlia::util::calculate_difficulty;
     use reth_bsc::node::evm::config::{BscEvmConfig, BscNextBlockEnvAttributes};
-    use reth_bsc::node::miner::bid_block::{simulate_bid_block, BidBlock, BidBlockArgs};
+    use reth_bsc::node::miner::bid_block::{
+        simulate_bid_block, submitted_tx_root, BidBlock, BidBlockArgs,
+    };
     use reth_bsc::node::miner::signer::sign_system_transaction;
     use reth_bsc::node::miner::util::finalize_new_header;
     use reth_bsc::node::BscNode;
@@ -536,14 +538,20 @@ fn execution_gate_round_trip() {
         ref_txs[1].clone().into_typed_transaction(),
         Signature::new(alloy_primitives::U256::ZERO, alloy_primitives::U256::ZERO, false),
     );
-    let bid = BidBlock {
-        header: block2_ref.header().clone(),
-        transactions: vec![
-            alloy_primitives::Bytes::from(ref_txs[0].encoded_2718()),
-            alloy_primitives::Bytes::from(unsigned_deposit.encoded_2718()),
-        ],
-        sidecars: vec![],
-    };
+    let submitted_txs = vec![
+        alloy_primitives::Bytes::from(ref_txs[0].encoded_2718()),
+        alloy_primitives::Bytes::from(unsigned_deposit.encoded_2718()),
+    ];
+    // The reference header's `transactions_root` commits to the *signed* deposit, but the body
+    // submitted below carries the unsigned placeholder — so the root has to be recomputed over what
+    // is actually sent. That is what a real builder does: since bsc #3742 the signature covers only
+    // the header, so this root is the commitment binding the body, and `verify_bid_block_payload`
+    // rejects a mismatch. Reusing the reference root here built a BidBlock no builder could produce.
+    // `simulate_bid_block` still overwrites the root with the re-signed set, so the sealed header —
+    // and the state root this test compares — is unaffected.
+    let mut bid_header = block2_ref.header().clone();
+    bid_header.transactions_root = submitted_tx_root(&submitted_txs);
+    let bid = BidBlock { header: bid_header, transactions: submitted_txs, sidecars: vec![] };
     let args = BidBlockArgs { bid_block: bid, signature: alloy_primitives::Bytes::from(vec![0u8; 65]) };
     let decoded = args.to_decoded_bid_block(alloy_primitives::Address::repeat_byte(0xbb)).expect("decode bid");
 

@@ -251,6 +251,18 @@ where
         transactions.push(encode_unsigned_legacy(tx).map_err(internal_err)?);
     }
 
+    // Re-root the header over the transactions actually being returned. The built block's root
+    // commits to the *signed* system txs, but the body above re-emits them unsigned, so shipping
+    // the sealed root would produce a candidate whose header does not commit to its own body — a
+    // BidBlock no real builder can produce, and one `verify_bid_block_payload` rejects outright
+    // (`invalid tx root`) now that the signature covers only the header (bsc #3742).
+    //
+    // Safe for the state root this seam exists to exercise: the validator recomputes
+    // `transactions_root` in `simulate_bid_block` after bind-signing, so the sealed header it
+    // proposes is unaffected by what we put here.
+    header.transactions_root =
+        crate::node::miner::bid_block::submitted_tx_root(&transactions);
+
     // The first generated system tx must be the deposit carrying the claimed gas fee.
     let gas_fee = match body_txs.get(user_tx_count) {
         Some(tx) if tx.input().starts_with(&DEPOSIT_SELECTOR) => tx.value(),
