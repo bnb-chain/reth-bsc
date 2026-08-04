@@ -214,8 +214,11 @@ impl BscHardfork {
             (Self::Lorentz.boxed(), ForkCondition::Timestamp(1754967081)),
             (Self::Maxwell.boxed(), ForkCondition::Timestamp(1754967101)),
             (Self::Fermi.boxed(), ForkCondition::Timestamp(1761030900)),
-            // TODO: real activation TBD; unscheduled (u64::MAX) until announced.
-            (Self::Pasteur.boxed(), ForkCondition::Timestamp(u64::MAX)),
+            // Osaka, Mendel and Pasteur activate together on qanet so the QA cluster jumps
+            // straight to the newest fork. 2026-08-05 02:30:00 AM UTC.
+            (Self::Osaka.boxed(), ForkCondition::Timestamp(1785897000)),
+            (Self::Mendel.boxed(), ForkCondition::Timestamp(1785897000)),
+            (Self::Pasteur.boxed(), ForkCondition::Timestamp(1785897000)),
         ])
     }
 
@@ -310,13 +313,22 @@ mod tests {
     }
 
     #[test]
-    fn test_pasteur_present_but_unscheduled_in_qanet() {
-        // Qanet has no announced Pasteur activation yet, so it must stay
-        // dormant (u64::MAX) until a real timestamp is set.
-        assert_eq!(
-            BscHardfork::bsc_qanet().fork(BscHardfork::Pasteur),
-            ForkCondition::Timestamp(u64::MAX),
-            "Pasteur should be defined but dormant until a real activation is set"
+    fn test_osaka_mendel_pasteur_scheduled_together_on_qanet() {
+        // Qanet activates Osaka, Mendel and Pasteur at one timestamp
+        // (2026-08-05 02:30:00 AM UTC) so the QA cluster runs the newest fork.
+        let qanet = BscHardfork::bsc_qanet();
+        let expected = ForkCondition::Timestamp(1785897000);
+        for fork in [BscHardfork::Osaka, BscHardfork::Mendel, BscHardfork::Pasteur] {
+            assert_eq!(
+                qanet.fork(fork),
+                expected,
+                "{fork:?} should activate on qanet at the shared timestamp"
+            );
+        }
+        // Pasteur must not precede the fork it is sequenced after.
+        assert!(
+            qanet.fork(BscHardfork::Fermi).active_at_timestamp(1785897000),
+            "Fermi must already be active when Osaka/Mendel/Pasteur activate"
         );
     }
 
