@@ -12,6 +12,7 @@ use crate::evm::precompiles;
 use crate::evm::transaction::BscTxEnv;
 use crate::system_contracts::{SLASH_CONTRACT, SYSTEM_REWARD_CONTRACT, STAKE_HUB_CONTRACT, feynman_fork::{ValidatorElectionInfo, get_top_validators_by_voting_power, ElectedValidators}};
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
+use alloy_evm::block::StateChangePostBlockSource;
 use reth_evm::{eth::receipt_builder::{ReceiptBuilder, ReceiptBuilderCtx}, execute::BlockExecutionError, Evm, FromRecoveredTx, FromTxWithEncoded, IntoTxEnv, block::StateChangeSource};
 use reth_ethereum_primitives::{TransactionSigned, Transaction};
 use crate::node::evm::ResultAndState;
@@ -457,14 +458,23 @@ where
             return Ok(());
         }
 
-        // Zero out SYSTEM_ADDRESS balance
+        // Zero out SYSTEM_ADDRESS balance.
+        //
+        // These balance writes bypass the EVM, so - like the system-contract upgrades in
+        // `executor.rs` - they must be announced to the state hook. The incremental state-root
+        // computation (sparse trie / `StateRootTask`) only observes reported changes, and a bare
+        // `db.commit` would leave the block committing a root without them.
         {
             let mut system_account = RevmAccount::from(system_info);
             system_account.mark_touch();
             system_account.info.balance = U256::ZERO;
             let mut changes: EvmState = Default::default();
             changes.insert(SYSTEM_ADDRESS, system_account);
-            self.evm.db_mut().commit(changes);
+            self.evm.db_mut().commit(changes.clone());
+            self.system_caller.on_state(
+                StateChangeSource::PostBlock(StateChangePostBlockSource::BalanceIncrements),
+                &changes,
+            );
         }
 
         // Credit validator with the block reward
@@ -477,7 +487,11 @@ where
             validator_account.info.balance = validator_account.info.balance.saturating_add(U256::from(block_reward));
             let mut changes: EvmState = Default::default();
             changes.insert(validator, validator_account);
-            self.evm.db_mut().commit(changes);
+            self.evm.db_mut().commit(changes.clone());
+            self.system_caller.on_state(
+                StateChangeSource::PostBlock(StateChangePostBlockSource::BalanceIncrements),
+                &changes,
+            );
         }
 
         let system_reward_balance = self
