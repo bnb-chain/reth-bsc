@@ -341,10 +341,8 @@ mod tests {
             ForkCondition::Timestamp(PASTEUR),
             "Pasteur should activate on qanet at its re-armed timestamp"
         );
-        assert!(
-            PASTEUR > OSAKA_MENDEL,
-            "Pasteur must not precede Osaka/Mendel on qanet"
-        );
+        // Ordering is compile-time enforced: Pasteur must never precede Osaka/Mendel.
+        const _: () = assert!(PASTEUR > OSAKA_MENDEL);
         assert!(
             qanet.fork(BscHardfork::Mendel).active_at_timestamp(PASTEUR),
             "Mendel must already be active when Pasteur activates"
