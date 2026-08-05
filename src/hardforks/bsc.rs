@@ -214,11 +214,16 @@ impl BscHardfork {
             (Self::Lorentz.boxed(), ForkCondition::Timestamp(1754967081)),
             (Self::Maxwell.boxed(), ForkCondition::Timestamp(1754967101)),
             (Self::Fermi.boxed(), ForkCondition::Timestamp(1761030900)),
-            // Osaka, Mendel and Pasteur activate together on qanet so the QA cluster jumps
-            // straight to the newest fork. 2026-08-05 02:30:00 AM UTC.
+            // Osaka and Mendel activated on qanet at 2026-08-05 02:30:00 AM UTC. Both are
+            // geth-compatible: geth accepted blocks 21323714..21327713 with only Pasteur deferred.
             (Self::Osaka.boxed(), ForkCondition::Timestamp(1785897000)),
             (Self::Mendel.boxed(), ForkCondition::Timestamp(1785897000)),
-            (Self::Pasteur.boxed(), ForkCondition::Timestamp(1785897000)),
+            // Pasteur is deferred to 2026-09-21 14:13:20 UTC pending the state-root fix. Its
+            // system-contract upgrade writes the new StakeHub/Governor code to plain state without
+            // committing the changed codeHash to the trie, so the block's state root describes the
+            // un-upgraded state and geth rejects it (`invalid merkle root`, qanet block 21323714).
+            // Must stay equal to geth's `--override.pasteur` on this cluster.
+            (Self::Pasteur.boxed(), ForkCondition::Timestamp(1790000000)),
         ])
     }
 
@@ -313,22 +318,34 @@ mod tests {
     }
 
     #[test]
-    fn test_osaka_mendel_pasteur_scheduled_together_on_qanet() {
-        // Qanet activates Osaka, Mendel and Pasteur at one timestamp
-        // (2026-08-05 02:30:00 AM UTC) so the QA cluster runs the newest fork.
+    fn test_osaka_mendel_active_pasteur_deferred_on_qanet() {
         let qanet = BscHardfork::bsc_qanet();
-        let expected = ForkCondition::Timestamp(1785897000);
-        for fork in [BscHardfork::Osaka, BscHardfork::Mendel, BscHardfork::Pasteur] {
+
+        // Osaka and Mendel activated together at 2026-08-05 02:30:00 AM UTC.
+        for fork in [BscHardfork::Osaka, BscHardfork::Mendel] {
             assert_eq!(
                 qanet.fork(fork),
-                expected,
-                "{fork:?} should activate on qanet at the shared timestamp"
+                ForkCondition::Timestamp(1785897000),
+                "{fork:?} should be active on qanet from the 2026-08-05 02:30 UTC activation"
             );
         }
-        // Pasteur must not precede the fork it is sequenced after.
+
+        // Pasteur is deferred pending the state-root fix; it must stay in sync with geth's
+        // `--override.pasteur` on the QA cluster, and must not precede Osaka/Mendel.
+        assert_eq!(
+            qanet.fork(BscHardfork::Pasteur),
+            ForkCondition::Timestamp(1790000000),
+            "Pasteur should be deferred on qanet until the trie-commit bug is fixed"
+        );
+        assert!(
+            qanet.fork(BscHardfork::Mendel).active_at_timestamp(1790000000),
+            "Mendel must already be active when Pasteur eventually activates"
+        );
+
+        // Fermi precedes the whole group.
         assert!(
             qanet.fork(BscHardfork::Fermi).active_at_timestamp(1785897000),
-            "Fermi must already be active when Osaka/Mendel/Pasteur activate"
+            "Fermi must already be active when Osaka/Mendel activate"
         );
     }
 
