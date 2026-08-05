@@ -88,6 +88,15 @@ pub struct NewWorkWorker<Provider> {
 /// Skip mining when isolated (no peers or network handle not yet installed) to avoid
 /// producing a small fork-chain that peers do not know about after reconnect.
 fn is_network_ready_to_mine(tip_number: u64) -> bool {
+    // Single-validator dev/CI chains (e.g. `--chain local` with `--mining.dev`) have no
+    // peers by design; without this escape hatch the isolation gate would permanently
+    // stall them at genesis.
+    if crate::node::miner::config::get_global_mining_config()
+        .is_some_and(|cfg| cfg.allow_isolated)
+    {
+        return true;
+    }
+
     let Some(network) = crate::shared::get_network_handle() else {
         debug!(
             target: "bsc::miner",
