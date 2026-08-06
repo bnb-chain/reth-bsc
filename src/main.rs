@@ -120,22 +120,63 @@ pub struct BscCliArgs {
     pub evn_disable_tx_broadcast_forbidden: bool,
 }
 
+/// BSC default for `--gpo.ignoreprice` (wei), matching geth and pre-v2.2 reth-bsc.
+///
+/// BSC blocks carry many legitimate zero-gas-price transactions, most of them not sent
+/// by the block's coinbase, so with upstream's default threshold of 0 they dominate the
+/// gas-price-oracle sample and `eth_gasPrice` / `eth_maxPriorityFeePerGas` return 0.
+const BSC_DEFAULT_GPO_IGNORE_PRICE: u64 = 2;
+
+/// Returns true if `--gpo.ignoreprice` was passed explicitly, either as
+/// `--gpo.ignoreprice <value>` or `--gpo.ignoreprice=<value>`.
+fn user_set_gpo_ignore_price(mut args: impl Iterator<Item = String>) -> bool {
+    args.any(|arg| arg == "--gpo.ignoreprice" || arg.starts_with("--gpo.ignoreprice="))
+}
+
 fn main() -> eyre::Result<()> {
     // Override reth's global version metadata so startup/P2P logs identify
     // this binary as Reth-BSC with its own version + commit.
     {
         use std::borrow::Cow;
-        let pkg_version = env!("CARGO_PKG_VERSION");
+        // The BSC release identifier (e.g. `0.1.0-fix`), derived from the nearest
+        // git tag in build.rs. This is what distinguishes patch/fix releases that
+        // share a Cargo package version.
+        let bsc_version = env!("RETH_BSC_VERSION");
         let git_sha_short = env!("RETH_BSC_GIT_SHA");
         let git_sha_long = env!("RETH_BSC_GIT_SHA_LONG");
+
         let mut md = default_reth_version_metadata();
+        // Capture the upstream Reth identity before we overwrite these fields, so
+        // both the BSC and upstream builds can be reported in `reth --version`.
+        let upstream_reth_version = md.cargo_pkg_version.clone();
+        let upstream_reth_sha = md.vergen_git_sha_long.clone();
+        let build_timestamp = md.vergen_build_timestamp.clone();
+        let cargo_features = md.vergen_cargo_features.clone();
+        let build_profile = md.build_profile_name.clone();
+
         md.name_client = Cow::Borrowed("Reth-BSC");
-        md.cargo_pkg_version = Cow::Borrowed(pkg_version);
+        // Expose the BSC release id as the primary version. This flows into the
+        // `reth_info{version=...}` metric and the DB client version, so `0.1.0-fix`
+        // is distinguishable from `0.1.0` without a commit-to-tag lookup.
+        md.cargo_pkg_version = Cow::Borrowed(bsc_version);
         md.vergen_git_sha = Cow::Borrowed(git_sha_short);
         md.vergen_git_sha_long = Cow::Borrowed(git_sha_long);
-        md.short_version = Cow::Owned(format!("{pkg_version} ({git_sha_short})"));
+        md.short_version = Cow::Owned(format!("{bsc_version} ({git_sha_short})"));
+        // Report both the BSC release/commit and the upstream Reth version/commit
+        // that this binary was built against.
+        // Note: the CLI prepends the client name ("Reth-BSC") to the first line,
+        // so line 0 is just "Version: ..." to render as "Reth-BSC Version: ...".
+        md.long_version = Cow::Owned(format!(
+            "Version: {bsc_version}\n\
+             Commit SHA: {git_sha_long}\n\
+             Upstream Reth Version: {upstream_reth_version}\n\
+             Upstream Reth Commit SHA: {upstream_reth_sha}\n\
+             Build Timestamp: {build_timestamp}\n\
+             Build Features: {cargo_features}\n\
+             Build Profile: {build_profile}",
+        ));
         md.p2p_client_version = Cow::Owned(format!(
-            "reth-bsc/v{pkg_version}-{git_sha_short}/{}",
+            "reth-bsc/v{bsc_version}-{git_sha_short}/{}",
             std::env::consts::OS,
         ));
         let _ = try_init_version_metadata(md);
@@ -159,7 +200,7 @@ fn main() -> eyre::Result<()> {
                     as Arc<dyn FullConsensus<BscPrimitives>>,
             )
         },
-        async move |builder, args| {
+        async move |mut builder, args| {
             // Set genesis hash override if provided
             if let Err(e) = genesis_override::set_genesis_hash_override(args.genesis_hash) {
                 tracing::error!("Failed to set genesis hash override: {}", e);
@@ -170,7 +211,13 @@ fn main() -> eyre::Result<()> {
                 panic!("IPC is disabled, please enable it by setting --ipc.enable to true");
             }
             let ipc_path = builder.config().rpc.ipcpath.clone();
-            
+
+            // Apply the BSC gas-price-oracle default unless the user set the flag.
+            if !user_set_gpo_ignore_price(std::env::args()) {
+                builder.config_mut().rpc.gas_price_oracle.ignore_price =
+                    BSC_DEFAULT_GPO_IGNORE_PRICE;
+            }
+
             // Map CLI args into a global MiningConfig override before launching services
             {
                 use reth_bsc::node::miner::{config as mining_config, MiningConfig};
@@ -470,4 +517,21 @@ fn main() -> eyre::Result<()> {
         },
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::user_set_gpo_ignore_price;
+
+    fn args(v: &[&str]) -> std::vec::IntoIter<String> {
+        v.iter().map(|s| s.to_string()).collect::<Vec<_>>().into_iter()
+    }
+
+    #[test]
+    fn detects_explicit_gpo_ignore_price() {
+        assert!(user_set_gpo_ignore_price(args(&["reth-bsc", "node", "--gpo.ignoreprice", "0"])));
+        assert!(user_set_gpo_ignore_price(args(&["reth-bsc", "node", "--gpo.ignoreprice=7"])));
+        assert!(!user_set_gpo_ignore_price(args(&["reth-bsc", "node", "--chain", "bsc"])));
+        assert!(!user_set_gpo_ignore_price(args(&["reth-bsc", "node", "--gpo.blocks", "20"])));
+    }
 }
