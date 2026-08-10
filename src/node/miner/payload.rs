@@ -1878,16 +1878,30 @@ where
     /// under zero-simulate it is never executed before selection, so it has no `BscBuiltPayload`.
     /// If it wins it is broadcast first and verified on import.
     fn collect_best_bid_block(&mut self) {
-        if let Some(task) = self.simulator.best_bid_block(self.mining_ctx.parent_header.hash()) {
-            info!(
+        let parent_hash = self.mining_ctx.parent_header.hash();
+        match self.simulator.best_bid_block(parent_hash) {
+            Some(task) => {
+                info!(
+                    target: "bsc::miner::payload",
+                    trace_id = self.trace_id,
+                    bid_fees = %task.gas_fee,
+                    bid_hash = %task.bid_hash,
+                    builder = ?task.builder,
+                    "Found best (unexecuted) BidBlock candidate"
+                );
+                self.bid_block_candidate = Some(task);
+            }
+            // Log the miss with the key we looked up. A silent miss is indistinguishable from
+            // "no builder bid at all", which is what made the sample-before-wait bug above cost a
+            // day to find: the builder saw `send success`, the validator logged `BidBlock queued`,
+            // and nothing anywhere reported that the bid was never used.
+            None => debug!(
                 target: "bsc::miner::payload",
                 trace_id = self.trace_id,
-                bid_fees = %task.gas_fee,
-                bid_hash = %task.bid_hash,
-                builder = ?task.builder,
-                "Found best (unexecuted) BidBlock candidate"
-            );
-            self.bid_block_candidate = Some(task);
+                %parent_hash,
+                parent_number = self.mining_ctx.parent_header.number,
+                "No BidBlock candidate stored for this parent"
+            ),
         }
     }
 
@@ -2138,10 +2152,59 @@ where
         Ok(())
     }
 
+    /// Sleep until this slot's submission deadline so that BidBlocks arriving later in the slot
+    /// are still visible when selection runs — go-bsc defers `selectBidBlock` to the end of the
+    /// build window for exactly this reason.
+    ///
+    /// The local path already spends this time: [`Self::submit_payload`] sleeps the same remainder
+    /// before sending. Waiting *before* selection instead of after therefore costs the no-bid case
+    /// nothing — the local payload still goes out at the same instant, because `submit_payload`
+    /// then computes `delay_ms == 0` — while giving a builder the whole slot to bid rather than
+    /// only the instant before this job first sampled the store.
+    ///
+    /// Without it, `collect_best_bid_block` runs at t≈0 of the slot and every bid that arrives
+    /// afterwards is silently ignored despite being admitted by `mev_sendBidBlock` (whose
+    /// `bidMustBefore` deadline is far later). Measured on a local 10-node cluster: the store was
+    /// read 68 ms before the bid for that very block was written, and the validator sealed an
+    /// empty block with the bid sitting unused under the correct key.
+    fn wait_for_submission_deadline(&mut self) -> Result<(), Box<BscPayloadJobError>> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let delay_ms = self.mining_ctx.end_mining_timestamp_ms.saturating_sub(now_ms) as u64;
+        if delay_ms == 0 {
+            return Ok(());
+        }
+
+        let abort_rx = &mut self.abort_rx;
+        let aborted = tokio::task::block_in_place(move || {
+            tokio::runtime::Handle::current().block_on(async move {
+                tokio::select! {
+                    _ = abort_rx => true,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(delay_ms)) => false,
+                }
+            })
+        });
+
+        if aborted {
+            info!(
+                target: "bsc::miner::payload",
+                trace_id = self.trace_id,
+                block_number = self.build_args.config.parent_header.number() + 1,
+                delay_ms,
+                "Abort while waiting for the submission deadline"
+            );
+            self.build_args.cancel.clone().cancel();
+            self.is_aborted = true;
+            return Err(Box::new(BscPayloadJobError::JobAborted));
+        }
+        Ok(())
+    }
+
     /// Try to return the best payload to result channel
     fn try_return_best_payload(&mut self) -> Result<(), Box<BscPayloadJobError>> {
         self.collect_best_bid();
-        self.collect_best_bid_block();
 
         // Sample "is a replacement simulation still in flight" here, right after the last moment a
         // finished bid could still have been collected — not down at the metric site. A simulation
@@ -2155,6 +2218,13 @@ where
             self.simulator.is_simulating(self.mining_ctx.parent_header.hash());
 
         self.collect_payload_candidates()?;
+
+        // Hold the slot open before deciding, then sample the BidBlock store. Both must happen
+        // after candidate collection: `collect_payload_candidates` returns immediately when the
+        // local build finished and no background tasks remain (the empty-mempool case), so without
+        // the wait this decision is made at t≈0 and no bid can ever be seen.
+        self.wait_for_submission_deadline()?;
+        self.collect_best_bid_block();
 
         // BEP-675 zero-simulate selection (go-bsc `selectBidBlock`): if the unexecuted BidBlock's
         // deposit-derived fee beats every local / legacy-SendBid candidate, commit to it. The block

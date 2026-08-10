@@ -946,6 +946,15 @@ where
         // deposit-derived `gas_fee`, which needs no execution.
         let mut best = self.best_bid_block.write();
         let replace = best.get(&parent_hash).is_none_or(|t| task.gas_fee > t.gas_fee);
+        // Log the key we store under. `collect_best_bid_block` logs the key it looks up, so a
+        // stored/looked-up pair that never matches is visible by diffing the two lines for one
+        // block height — the failure mode where a BidBlock is admitted, queued and stored, and
+        // then never selected, with nothing reporting why.
+        debug!(
+            "BidBlock stored: parentHash={parent_hash}, blockNumber={}, gasFee={}, replace={replace}",
+            task.block.header().number(),
+            task.gas_fee,
+        );
         if replace {
             best.insert(parent_hash, task);
         }
