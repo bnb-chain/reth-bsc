@@ -44,6 +44,35 @@ pub const MAX_PEER_ATTEMPTS: usize = 3;
 /// doomed recovery every loop.
 pub const FAILED_HEAD_COOLDOWN: Duration = Duration::from_secs(30);
 
+/// Safety valve for [`RecoveryGate`]: a recovery that reports no progress for
+/// this long is presumed wedged and stops blocking new attempts.
+///
+/// This measures **silence, not duration**. A full-depth walk (512 hops) over
+/// slow peers is legitimately slow but never quiet — `recover_ancestors`
+/// reports progress after every network hop and every imported block. Timing
+/// out on total elapsed time instead would reclaim slots from healthy deep
+/// recoveries exactly when gaps are largest, quietly restoring the unbounded
+/// concurrency this gate exists to prevent.
+///
+/// Derived rather than guessed: the longest legitimate silence is one stalled
+/// hop, `MAX_PEER_ATTEMPTS * FETCH_TIMEOUT` = 15s, plus the execution of a
+/// single heavy block. 60s leaves ~4x margin over that.
+pub const RECOVERY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How many ancestor recoveries may run at once.
+///
+/// Concurrent recoveries duplicate each other's work (they converge on the same
+/// common ancestor), so this is the constant factor of wasted imports: with a
+/// cap of N, the worst case is N× rather than the unbounded ~2 recoveries/s ×
+/// walk-duration that produced 15-17× on a healthy LAN and far worse on the
+/// testnet node in bnb-chain/reth-bsc#456.
+///
+/// Not 1: a single slot means one unresponsive peer stalls all catch-up until
+/// [`RECOVERY_IDLE_TIMEOUT`] elapses, and `resolve_bsc_peer_static` currently
+/// routes every recovery to the same peer. Three keeps the duplication small
+/// while preserving a spare walk that can make progress meanwhile.
+pub const MAX_CONCURRENT_RECOVERIES: usize = 3;
+
 /// Error kinds produced by `recover_ancestors` / `discover_fork_blocks`.
 #[derive(Debug, thiserror::Error)]
 pub enum ForkRecoverError {
@@ -62,8 +91,18 @@ pub enum ForkRecoverError {
     #[error("engine new_payload returned Invalid for block {num}: {reason}")]
     ImportInvalid { num: u64, reason: String },
 
-    #[error("engine new_payload returned Syncing mid-chain for block {num} (parent should have been Valid)")]
-    ImportSyncingMidChain { num: u64 },
+    /// The engine asked for more ancestors part-way through Phase 2.
+    ///
+    /// Despite the historic name this is *not* evidence that a parent we
+    /// imported went missing: the engine also answers `Syncing` when backfill
+    /// is active, when tree state was reset under us, or (with triedb) when the
+    /// parent has no difflayer chain back to the disk layer. In every case the
+    /// engine's contract is "walk further back", not "give up".
+    ///
+    /// `committed` is the highest block this attempt did make canonical before
+    /// halting; the next attempt starts from there rather than from scratch.
+    #[error("engine new_payload returned Syncing for block {num}; committed up to {committed:?}")]
+    ImportHalted { num: u64, committed: Option<u64> },
 
     #[error("engine call failed: {0}")]
     EngineCall(String),
@@ -154,6 +193,7 @@ pub async fn discover_fork_blocks<
     start_num: u64,
     provider: &P,
     fetcher: &dyn RangeFetcher,
+    progress: &dyn ProgressSink,
 ) -> Result<Discovery, ForkRecoverError> {
     let mut fork_blocks: Vec<crate::BscBlock> = Vec::new();
     let mut cursor_num = start_num;
@@ -195,6 +235,8 @@ pub async fn discover_fork_blocks<
         if resp.is_empty() {
             return Err(ForkRecoverError::EmptyResponse { num: cursor_num, hash: cursor_hash });
         }
+        // A hop came back: this walk is alive, however deep it still has to go.
+        progress.record_progress();
 
         // Iterate newest -> oldest (the order we got them in).
         let mut found_ancestor = false;
@@ -304,6 +346,7 @@ pub async fn recover_ancestors<P>(
     engine: ConsensusEngineHandle<BscPayloadTypes>,
     forkchoice_engine: BscForkChoiceEngine<P>,
     fetcher: &dyn RangeFetcher,
+    progress: &dyn ProgressSink,
 ) -> Result<(), ForkRecoverError>
 where
     P: BlockHashReader
@@ -334,7 +377,8 @@ where
 
     // ---- Phase 1 ----
     let discovery =
-        discover_fork_blocks(peer, fetch_start_hash, fetch_start_num, &provider, fetcher).await?;
+        discover_fork_blocks(peer, fetch_start_hash, fetch_start_num, &provider, fetcher, progress)
+            .await?;
     tracing::debug!(
         target: "bsc::fork_recover",
         %peer,
@@ -350,6 +394,12 @@ where
     // ---- Phase 2: import oldest → newest via new_payload ----
     let mut to_import = discovery.fork_blocks;
     to_import.reverse();
+    // Highest block the engine accepted this attempt. On a halt it becomes the
+    // FCU target so the work already done is committed rather than discarded —
+    // without this every attempt re-imports the same prefix and the canonical
+    // tip never moves (bnb-chain/reth-bsc#456).
+    let mut last_valid: Option<alloy_consensus::Header> = None;
+    let mut halted_at: Option<u64> = None;
     for block in &to_import {
         let block_hash = block.header.hash_slow();
         let block_num = block.header.number;
@@ -365,6 +415,9 @@ where
                         block_num,
                         "Fork block imported Valid"
                     );
+                    last_valid = Some(block.header.clone());
+                    // An accepted block is unambiguous progress.
+                    progress.record_progress();
                 }
                 PayloadStatusEnum::Invalid { validation_error } => {
                     return Err(ForkRecoverError::ImportInvalid {
@@ -373,9 +426,17 @@ where
                     });
                 }
                 PayloadStatusEnum::Syncing => {
-                    // Sequencing guarantees parents were already Valid, so
-                    // Syncing here means a parent failed silently.
-                    return Err(ForkRecoverError::ImportSyncingMidChain { num: block_num });
+                    // The engine wants ancestors we did not reach. Stop here and
+                    // commit what was accepted; see `ImportHalted`.
+                    tracing::info!(
+                        target: "bsc::fork_recover",
+                        %block_hash,
+                        block_num,
+                        committed = ?last_valid.as_ref().map(|h| h.number),
+                        "Fork recovery halted; committing partial progress"
+                    );
+                    halted_at = Some(block_num);
+                    break;
                 }
                 other => {
                     return Err(ForkRecoverError::EngineCall(format!(
@@ -390,6 +451,28 @@ where
     }
 
     // ---- Phase 3: FCU so engine-tree re-evaluates canonical head ----
+    //
+    // On a halt the target is the highest block the engine accepted, not the
+    // announced head we never reached. That FCU is exactly as safe as the
+    // success-path one: the engine returned Valid for this block moments ago.
+    if let Some(num) = halted_at {
+        let Some(head_header) = last_valid else {
+            // Nothing was accepted, so there is no progress to commit — the
+            // walk needs to start deeper. Report and let the caller back off.
+            return Err(ForkRecoverError::ImportHalted { num, committed: None });
+        };
+        let committed = head_header.number;
+        if let Err(err) = forkchoice_engine.update_forkchoice(&head_header).await {
+            tracing::warn!(
+                target: "bsc::fork_recover",
+                committed,
+                error = %err,
+                "fork_choice_updated returned error after partial recovery"
+            );
+        }
+        return Err(ForkRecoverError::ImportHalted { num, committed: Some(committed) });
+    }
+
     let head_header = resolve_fcu_head_header(
         &provider,
         fcu_target_hash,
@@ -504,6 +587,145 @@ impl FailedHeadsCooler {
 /// Factory matching the shape of `new_recovering_heads`.
 pub fn new_failed_heads_cooler(capacity: u32) -> FailedHeadsCooler {
     FailedHeadsCooler::new(capacity, FAILED_HEAD_COOLDOWN)
+}
+
+/// Admission gate bounding how many ancestor recoveries run concurrently.
+///
+/// Every recovery walks back to the common ancestor, which while we are behind
+/// is the local canonical tip. Two recoveries spawned seconds apart therefore
+/// cover near-identical ranges — they differ only in the handful of blocks at
+/// their heads. Without this gate one recovery is spawned per announced head
+/// (~2/s on BSC), each replaying the whole range: `O(in_flight × depth)`
+/// payload submissions for `O(depth)` of useful work, with `in_flight` growing
+/// as the node falls further behind. See bnb-chain/reth-bsc#456.
+///
+/// The cap is [`MAX_CONCURRENT_RECOVERIES`] rather than 1 deliberately.
+/// Strict single-flight bounds duplicated work perfectly, but it also removes
+/// the redundancy the old storm provided by accident: with one slot and
+/// `resolve_bsc_peer_static` always choosing the same peer, a single
+/// unresponsive peer stalls all catch-up until the staleness valve fires. A
+/// small cap keeps duplicated work at a constant factor while leaving spare
+/// capacity for a walk that makes progress when another is stuck.
+#[derive(Clone, Debug)]
+pub struct RecoveryGate {
+    inner: Arc<Mutex<GateState>>,
+    idle_timeout: Duration,
+    capacity: usize,
+    /// Shared time origin for the millisecond stamps in [`InFlight`], so every
+    /// clone and every permit measures progress against the same clock.
+    epoch: std::time::Instant,
+}
+
+#[derive(Debug, Default)]
+struct GateState {
+    /// Monotonic permit id, so a permit dropped after its slot was reclaimed
+    /// cannot evict a live holder.
+    next_generation: u64,
+    in_flight: Vec<InFlight>,
+}
+
+#[derive(Debug)]
+struct InFlight {
+    generation: u64,
+    head_num: u64,
+    /// Milliseconds since the gate epoch at the recovery's last reported
+    /// progress. Shared with the permit, which stamps it as work completes.
+    last_progress: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl RecoveryGate {
+    pub fn new(capacity: usize, idle_timeout: Duration) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(GateState::default())),
+            idle_timeout,
+            capacity,
+            epoch: std::time::Instant::now(),
+        }
+    }
+
+    /// A handle onto the same slots with a different idle threshold.
+    /// Test-only: production always uses [`RECOVERY_IDLE_TIMEOUT`].
+    #[cfg(test)]
+    fn with_idle_timeout(&self, idle_timeout: Duration) -> Self {
+        Self { inner: self.inner.clone(), idle_timeout, capacity: self.capacity, epoch: self.epoch }
+    }
+
+    fn now_millis(&self) -> u64 {
+        self.epoch.elapsed().as_millis() as u64
+    }
+
+    /// Claim a recovery slot for `head_num`. `Err` means every slot is taken by
+    /// a live recovery — the head number of the oldest is returned for logging,
+    /// and this announcement should be dropped, since the in-flight walks
+    /// already cover its range.
+    pub fn try_acquire(&self, head_num: u64) -> Result<RecoveryPermit, u64> {
+        let now = self.now_millis();
+        let idle_ms = self.idle_timeout.as_millis() as u64;
+        let mut state = self.inner.lock();
+
+        // Reclaim slots from recoveries that have gone silent. Silence, not
+        // age: a deep walk over slow peers is slow but keeps reporting, and
+        // reclaiming its slot would let concurrency grow past `capacity`
+        // precisely when the gap is largest.
+        state.in_flight.retain(|f| {
+            let last = f.last_progress.load(std::sync::atomic::Ordering::Relaxed);
+            now.saturating_sub(last) < idle_ms
+        });
+
+        if state.in_flight.len() >= self.capacity {
+            let oldest = state.in_flight.iter().map(|f| f.head_num).min().unwrap_or(head_num);
+            return Err(oldest);
+        }
+
+        state.next_generation += 1;
+        let generation = state.next_generation;
+        let last_progress = Arc::new(std::sync::atomic::AtomicU64::new(now));
+        state.in_flight.push(InFlight {
+            generation,
+            head_num,
+            last_progress: last_progress.clone(),
+        });
+        Ok(RecoveryPermit { gate: self.clone(), generation, last_progress })
+    }
+}
+
+/// Reports that a recovery is still making progress, so its slot is not
+/// reclaimed as wedged. Implemented by [`RecoveryPermit`]; `()` is the no-op
+/// used by callers that hold no slot.
+pub trait ProgressSink: Send + Sync {
+    fn record_progress(&self);
+}
+
+impl ProgressSink for () {
+    fn record_progress(&self) {}
+}
+
+/// RAII slot holder. Releasing on drop covers early return and task panic.
+#[derive(Debug)]
+pub struct RecoveryPermit {
+    gate: RecoveryGate,
+    generation: u64,
+    last_progress: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl ProgressSink for RecoveryPermit {
+    fn record_progress(&self) {
+        self.last_progress.store(self.gate.now_millis(), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl Drop for RecoveryPermit {
+    fn drop(&mut self) {
+        // Match on generation, not position: a permit whose slot was already
+        // reclaimed as idle must not evict whoever took the slot after it.
+        let mut state = self.gate.inner.lock();
+        state.in_flight.retain(|f| f.generation != self.generation);
+    }
+}
+
+/// Factory matching the shape of `new_recovering_heads`.
+pub fn new_recovery_gate() -> RecoveryGate {
+    RecoveryGate::new(MAX_CONCURRENT_RECOVERIES, RECOVERY_IDLE_TIMEOUT)
 }
 
 /// RAII guard that removes a head hash from the dedup cache on drop, even on
@@ -693,7 +915,7 @@ mod tests {
         }
 
         let fetcher = ScriptedFetcher::new(vec![]);
-        let out = discover_fork_blocks(fake_peer(), hashes[100], 100, &provider, fetcher.as_ref())
+        let out = discover_fork_blocks(fake_peer(), hashes[100], 100, &provider, fetcher.as_ref(), &())
             .await
             .unwrap();
 
@@ -717,7 +939,7 @@ mod tests {
         let fetcher = ScriptedFetcher::new(vec![Ok(hop1)]);
 
         let head_hash = peer_ext.last().unwrap().hash_slow();
-        let out = discover_fork_blocks(fake_peer(), head_hash, 104, &provider, fetcher.as_ref())
+        let out = discover_fork_blocks(fake_peer(), head_hash, 104, &provider, fetcher.as_ref(), &())
             .await
             .unwrap();
 
@@ -758,7 +980,7 @@ mod tests {
         let fetcher = ScriptedFetcher::new(vec![Ok(hop1), Ok(hop2)]);
 
         let out =
-            discover_fork_blocks(fake_peer(), peer_y_hashes[6], 102, &provider, fetcher.as_ref())
+            discover_fork_blocks(fake_peer(), peer_y_hashes[6], 102, &provider, fetcher.as_ref(), &())
                 .await
                 .unwrap();
 
@@ -815,6 +1037,7 @@ mod tests {
             peer_len,
             &provider,
             fetcher.as_ref(),
+            &(),
         )
         .await
         .unwrap_err();
@@ -836,7 +1059,7 @@ mod tests {
         provider.insert_side(side_96);
 
         let fetcher = ScriptedFetcher::new(vec![]);
-        let out = discover_fork_blocks(fake_peer(), side_hash, 96, &provider, fetcher.as_ref())
+        let out = discover_fork_blocks(fake_peer(), side_hash, 96, &provider, fetcher.as_ref(), &())
             .await
             .unwrap();
         assert!(matches!(out.outcome, DiscoveryOutcome::Shortcircuit));
@@ -864,7 +1087,7 @@ mod tests {
         let fetcher = ScriptedFetcher::new(vec![Ok(hop1)]);
 
         let out =
-            discover_fork_blocks(fake_peer(), peer_y_hashes[3], 99, &provider, fetcher.as_ref())
+            discover_fork_blocks(fake_peer(), peer_y_hashes[3], 99, &provider, fetcher.as_ref(), &())
                 .await
                 .unwrap();
 
@@ -1093,6 +1316,471 @@ mod tests {
             ForkRecoverError::HeadHeaderMissing { hash } => assert_eq!(hash, target_hash),
             other => panic!("expected HeadHeaderMissing, got {other:?}"),
         }
+    }
+
+    /// Recovery behaviour while the node is behind the tip, where heads are
+    /// announced faster than a single ancestor walk can complete. Two
+    /// properties must hold, both regressions from bnb-chain/reth-bsc#456:
+    ///
+    /// 1. Work is not duplicated across concurrently announced heads. They all walk back to the
+    ///    same common ancestor, so anything past the first recovery is a replay — the node
+    ///    re-imported the same blocks ~2000 times each and fell further behind for it.
+    /// 2. A recovery that cannot reach the announced head still commits what it did import.
+    ///    Discarding it left the canonical tip parked, so every later attempt replayed the
+    ///    identical prefix and never converged.
+    ///
+    /// Modelled invariant of the real system: `recover_ancestors` imports fork
+    /// blocks via `engine.new_payload`, which places them in engine-tree's
+    /// **non-canonical in-memory state**. The DB-backed provider that Phase 1
+    /// walks does not observe them until an FCU makes them canonical (see
+    /// `resolve_fcu_head_header`'s doc comment). The `FakeProvider` here is
+    /// therefore never updated by the engine except where a test explicitly
+    /// models an FCU landing, matching production.
+    mod catching_up {
+        use super::*;
+        use alloy_rpc_types_engine::PayloadStatus;
+        use reth_chainspec::ChainInfo;
+        use reth_engine_primitives::{
+            BeaconEngineMessage, ConsensusEngineHandle, OnForkChoiceUpdated,
+        };
+        use reth_payload_primitives::ExecutionPayload;
+        use reth_provider::{BlockNumReader, ProviderError};
+        use std::sync::Arc;
+
+        use crate::node::{consensus::BscForkChoiceEngine, engine_api::payload::BscPayloadTypes};
+
+        impl BlockNumReader for FakeProvider {
+            fn chain_info(&self) -> Result<ChainInfo, ProviderError> {
+                let best_number = self.canonical_by_num.keys().copied().max().unwrap_or(0);
+                let best_hash =
+                    self.canonical_by_num.get(&best_number).copied().unwrap_or_default();
+                Ok(ChainInfo { best_hash, best_number })
+            }
+            fn best_block_number(&self) -> Result<u64, ProviderError> {
+                Ok(self.canonical_by_num.keys().copied().max().unwrap_or(0))
+            }
+            fn last_block_number(&self) -> Result<u64, ProviderError> {
+                self.best_block_number()
+            }
+            fn block_number(&self, hash: B256) -> Result<Option<u64>, ProviderError> {
+                Ok(self.headers_by_hash.get(&hash).map(|h| h.number))
+            }
+        }
+
+        /// Serves `GetBlocksByRange` from a full in-memory chain, walking
+        /// `parent_hash` newest -> oldest exactly like the real peer. Records
+        /// how many hops and how many block bodies were served so the network
+        /// side of the amplification is measurable too.
+        #[derive(Default)]
+        struct ChainFetcher {
+            blocks: HashMap<B256, BscBlock>,
+            hops: Mutex<usize>,
+            served_blocks: Mutex<usize>,
+        }
+
+        impl ChainFetcher {
+            fn hops(&self) -> usize {
+                *self.hops.lock().unwrap()
+            }
+            fn served_blocks(&self) -> usize {
+                *self.served_blocks.lock().unwrap()
+            }
+        }
+
+        impl RangeFetcher for ChainFetcher {
+            fn fetch<'a>(
+                &'a self,
+                _peer: PeerId,
+                _start_num: u64,
+                start_hash: B256,
+                count: u64,
+            ) -> BoxFuture<'a, Result<Vec<BscBlock>, String>> {
+                let mut out = Vec::new();
+                let mut cursor = start_hash;
+                for _ in 0..count {
+                    let Some(block) = self.blocks.get(&cursor) else { break };
+                    out.push(block.clone());
+                    cursor = block.header.parent_hash;
+                }
+                *self.hops.lock().unwrap() += 1;
+                *self.served_blocks.lock().unwrap() += out.len();
+                Box::pin(async move { Ok(out) })
+            }
+        }
+
+        /// Every `(number, hash)` the engine was asked to import, in order.
+        type Submissions = Arc<Mutex<Vec<(u64, B256)>>>;
+        /// Every `head_block_hash` the engine was asked to make canonical.
+        type Fcus = Arc<Mutex<Vec<B256>>>;
+
+        /// Mock engine. Answers `Valid` to every payload except heights in
+        /// `syncing_at`, which get `Syncing` — the shape reported in issue #456
+        /// §6 (2046 of 2047 recovery failures).
+        ///
+        /// `QueryTd` answers with the block number so the BSC fork-choice rule
+        /// sees a higher-height head as the better chain and actually emits the
+        /// FCU, rather than erroring out on an unanswered TD query.
+        fn recording_engine(
+            syncing_at: Vec<u64>,
+        ) -> (ConsensusEngineHandle<BscPayloadTypes>, Submissions, Fcus) {
+            let (to_engine, mut from_engine) =
+                tokio::sync::mpsc::unbounded_channel::<BeaconEngineMessage<BscPayloadTypes>>();
+            let handle = ConsensusEngineHandle::new(to_engine);
+            let submissions: Submissions = Arc::new(Mutex::new(Vec::new()));
+            let fcus: Fcus = Arc::new(Mutex::new(Vec::new()));
+            let (recorder, fcu_recorder) = (submissions.clone(), fcus.clone());
+
+            tokio::spawn(async move {
+                while let Some(msg) = from_engine.recv().await {
+                    match msg {
+                        BeaconEngineMessage::NewPayload { payload, tx } => {
+                            let (num, hash) = (payload.block_number(), payload.block_hash());
+                            recorder.lock().unwrap().push((num, hash));
+                            let status = if syncing_at.contains(&num) {
+                                PayloadStatusEnum::Syncing
+                            } else {
+                                PayloadStatusEnum::Valid
+                            };
+                            let _ = tx.send(Ok(PayloadStatus::new(status, None)));
+                        }
+                        BeaconEngineMessage::ForkchoiceUpdated { state, tx, .. } => {
+                            fcu_recorder.lock().unwrap().push(state.head_block_hash);
+                            let _ = tx.send(Ok(OnForkChoiceUpdated::valid(PayloadStatus::new(
+                                PayloadStatusEnum::Valid,
+                                None,
+                            ))));
+                        }
+                        BeaconEngineMessage::QueryTd { number, tx, .. } => {
+                            let _ = tx.send(Ok(Some(alloy_primitives::U256::from(number))));
+                        }
+                        // Dropping any other message drops its responder, which the
+                        // handle maps to an error rather than hanging.
+                        _ => {}
+                    }
+                }
+            });
+
+            (handle, submissions, fcus)
+        }
+
+        /// Local canonical chain `0..=local_tip`, plus a peer-only extension of
+        /// `ext_len` blocks on top of it. Returns the provider, a fetcher that
+        /// can serve the whole peer chain, and the `(hash, number)` of every
+        /// extension block (i.e. every head the peer could announce).
+        fn scenario(
+            local_tip: u64,
+            ext_len: u64,
+        ) -> (FakeProvider, Arc<ChainFetcher>, Vec<(B256, u64)>) {
+            let mut provider = FakeProvider::default();
+            let (local, local_hashes) = linear_chain(0, local_tip + 1, B256::ZERO, 0xC);
+            for h in local {
+                provider.insert_canonical(h);
+            }
+
+            let (ext, ext_hashes) =
+                linear_chain(local_tip + 1, ext_len, local_hashes[local_tip as usize], 0xC);
+
+            let mut blocks = HashMap::new();
+            for h in &ext {
+                blocks.insert(h.hash_slow(), make_block(h.clone()));
+            }
+            let fetcher = Arc::new(ChainFetcher { blocks, ..Default::default() });
+
+            let heads =
+                ext_hashes.iter().copied().zip(ext.iter().map(|h| h.number)).collect::<Vec<_>>();
+
+            (provider, fetcher, heads)
+        }
+
+        fn chain_spec() -> Arc<crate::chainspec::BscChainSpec> {
+            Arc::new(crate::chainspec::BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet()))
+        }
+
+        /// Admission is what the service does synchronously at announcement
+        /// time: acquire the gate, then spawn. Returns one entry per admitted
+        /// head, holding its permit for the lifetime of the recovery.
+        fn admit(gate: &RecoveryGate, heads: &[(B256, u64)]) -> Vec<((B256, u64), RecoveryPermit)> {
+            heads
+                .iter()
+                .filter_map(|&(hash, num)| {
+                    gate.try_acquire(num).ok().map(|permit| ((hash, num), permit))
+                })
+                .collect()
+        }
+
+        /// Unbounded announcements each replayed the whole ancestor range,
+        /// because Phase 1's local-known check cannot see what a concurrent
+        /// Phase 2 has already imported. Admission now caps that replay at
+        /// [`MAX_CONCURRENT_RECOVERIES`], independent of how many heads arrive.
+        #[tokio::test]
+        async fn overlapping_announcements_are_capped_at_capacity() {
+            let (provider, fetcher, heads) = scenario(100, 12);
+            let (engine, submissions, _fcus) = recording_engine(vec![]);
+            let fce = BscForkChoiceEngine::new(provider.clone(), engine.clone(), chain_spec());
+            let gate = new_recovery_gate();
+
+            // Ten heads announced while the node is behind — at ~2 blocks/s this
+            // is five seconds of announcements.
+            let announced: Vec<_> = heads[2..12].to_vec();
+            let admitted = admit(&gate, &announced);
+            assert_eq!(
+                admitted.len(),
+                MAX_CONCURRENT_RECOVERIES,
+                "admission is capped regardless of announcement count",
+            );
+
+            let recoveries = admitted.iter().map(|&((hash, num), _)| {
+                recover_ancestors(
+                    fake_peer(),
+                    RecoverTarget::single_pair(hash, num),
+                    provider.clone(),
+                    engine.clone(),
+                    fce.clone(),
+                    fetcher.as_ref(),
+                    &(),
+                )
+            });
+            for result in futures::future::join_all(recoveries).await {
+                result.expect("the admitted recovery reaches the common ancestor");
+            }
+
+            let submitted = submissions.lock().unwrap().clone();
+            let distinct: std::collections::HashSet<B256> =
+                submitted.iter().map(|(_, h)| *h).collect();
+
+            // Ten announcements previously meant ten full replays. Now at most
+            // MAX_CONCURRENT_RECOVERIES walks run, so every block is imported at
+            // most that many times.
+            let worst = submitted.iter().filter(|(num, _)| *num == 101).count();
+            assert!(
+                worst <= MAX_CONCURRENT_RECOVERIES,
+                "block 101 imported {worst}x, above the {MAX_CONCURRENT_RECOVERIES} cap",
+            );
+            assert!(
+                submitted.len() <= distinct.len() * MAX_CONCURRENT_RECOVERIES,
+                "{} submissions for {} distinct blocks exceeds the cap",
+                submitted.len(),
+                distinct.len(),
+            );
+
+            // Skipping is a deferral, not a drop: once an in-flight recovery
+            // ends, the next announcement is admitted.
+            drop(admitted);
+            assert!(gate.try_acquire(113).is_ok(), "gate releases on permit drop");
+        }
+
+        /// The amplification was `O(in_flight * depth)` — what turned a
+        /// 1000-block lag into ~1755 payload imports/s against a chain
+        /// producing 2.22 blocks/s (issue #456 §1), and measured 15-17x on a
+        /// healthy LAN devnet. It must now be bounded by capacity rather than
+        /// growing with the number of announced heads.
+        #[tokio::test]
+        async fn amplification_is_bounded_by_capacity() {
+            const DEPTH: u64 = 200;
+            const HEADS: usize = 10;
+
+            let (provider, fetcher, heads) = scenario(1_000, DEPTH);
+            let (engine, submissions, _fcus) = recording_engine(vec![]);
+            let fce = BscForkChoiceEngine::new(provider.clone(), engine.clone(), chain_spec());
+            let gate = new_recovery_gate();
+
+            // The last HEADS blocks of the extension, announced together.
+            let admitted = admit(&gate, &heads[heads.len() - HEADS..]);
+            let recoveries = admitted.iter().map(|&((hash, num), _)| {
+                recover_ancestors(
+                    fake_peer(),
+                    RecoverTarget::single_pair(hash, num),
+                    provider.clone(),
+                    engine.clone(),
+                    fce.clone(),
+                    fetcher.as_ref(),
+                    &(),
+                )
+            });
+            for result in futures::future::join_all(recoveries).await {
+                result.expect("recovery succeeds");
+            }
+
+            let submitted = submissions.lock().unwrap().len();
+            let distinct: std::collections::HashSet<B256> =
+                submissions.lock().unwrap().iter().map(|(_, h)| *h).collect();
+            let amplification = submitted as f64 / distinct.len() as f64;
+
+            eprintln!(
+                "issue #456: {HEADS} heads over depth {DEPTH} -> {submitted} payload submissions \
+                 for {} distinct blocks ({amplification:.1}x, was 9.8x uncapped), {} peer hops, \
+                 {} bodies served",
+                distinct.len(),
+                fetcher.hops(),
+                fetcher.served_blocks(),
+            );
+
+            assert!(
+                amplification <= MAX_CONCURRENT_RECOVERIES as f64,
+                "amplification {amplification:.1}x exceeds the {MAX_CONCURRENT_RECOVERIES}x cap",
+            );
+        }
+
+        /// A `Syncing` part-way through Phase 2 used to abort the recovery and
+        /// discard every block already imported, so the canonical tip never
+        /// moved and the next attempt replayed the identical prefix (issue #456
+        /// §6). Now the attempt commits what the engine accepted and the retry
+        /// resumes from there.
+        #[tokio::test]
+        async fn halted_recovery_commits_partial_progress() {
+            let (mut provider, fetcher, heads) = scenario(100, 10);
+            // Block 105 comes back Syncing; 101-104 are imported Valid first.
+            let (engine, submissions, fcus) = recording_engine(vec![105]);
+            let (head_hash, head_num) = heads[9];
+
+            let fce = BscForkChoiceEngine::new(provider.clone(), engine.clone(), chain_spec());
+            let err = recover_ancestors(
+                fake_peer(),
+                RecoverTarget::single_pair(head_hash, head_num),
+                provider.clone(),
+                engine.clone(),
+                fce,
+                fetcher.as_ref(),
+                &(),
+            )
+            .await
+            .unwrap_err();
+
+            assert!(
+                matches!(err, ForkRecoverError::ImportHalted { num: 105, committed: Some(104) }),
+                "expected a halt at 105 with progress committed to 104, got {err:?}",
+            );
+            let after_first: Vec<u64> =
+                submissions.lock().unwrap().iter().map(|(n, _)| *n).collect();
+            assert_eq!(after_first, vec![101, 102, 103, 104, 105], "halts at the first Syncing");
+
+            // Progress is committed by an FCU targeting the highest block the
+            // engine accepted — not the announced head we never reached.
+            let block_104_hash = heads[3].0;
+            assert_eq!(
+                fcus.lock().unwrap().as_slice(),
+                &[block_104_hash],
+                "one FCU, targeting block 104",
+            );
+
+            // That FCU is what advances the canonical tip; model its effect.
+            for (hash, num) in heads.iter().take(4) {
+                let header = fetcher.blocks[hash].header.clone();
+                assert_eq!(header.number, *num);
+                provider.insert_canonical(header);
+            }
+
+            // Retry from the new tip: the committed prefix is not replayed.
+            let fce = BscForkChoiceEngine::new(provider.clone(), engine.clone(), chain_spec());
+            let err = recover_ancestors(
+                fake_peer(),
+                RecoverTarget::single_pair(head_hash, head_num),
+                provider.clone(),
+                engine.clone(),
+                fce,
+                fetcher.as_ref(),
+                &(),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(err, ForkRecoverError::ImportHalted { num: 105, committed: None }),
+                "still halted at 105, but with nothing new to commit, got {err:?}",
+            );
+
+            let after_second: Vec<u64> =
+                submissions.lock().unwrap().iter().map(|(n, _)| *n).collect();
+            assert_eq!(
+                after_second,
+                vec![101, 102, 103, 104, 105, 105],
+                "the retry resumes at 105 instead of replaying 101-104",
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod recovery_gate_tests {
+    use super::{new_recovery_gate, ProgressSink, RecoveryGate, MAX_CONCURRENT_RECOVERIES};
+    use std::time::Duration;
+
+    #[test]
+    fn admits_up_to_capacity_then_refuses() {
+        let gate = new_recovery_gate();
+        let mut permits: Vec<_> = (0..MAX_CONCURRENT_RECOVERIES)
+            .map(|i| gate.try_acquire(100 + i as u64).expect("within capacity"))
+            .collect();
+
+        assert_eq!(
+            gate.try_acquire(200).unwrap_err(),
+            100,
+            "refuses beyond capacity, reporting the oldest in-flight head",
+        );
+
+        // Releasing one slot admits exactly one more, not an unbounded burst.
+        // `remove(0)` rather than `into_iter().next()`: the latter drops the
+        // whole vector, freeing every slot.
+        drop(permits.remove(0));
+        let _admitted = gate.try_acquire(200).expect("freed slot is reusable");
+        assert!(gate.try_acquire(201).is_err(), "still capped");
+    }
+
+    #[test]
+    fn silent_holders_are_reclaimed() {
+        // Recoveries wedged behind an unresponsive peer must not disable
+        // recovery for the rest of the process's life — this is the failure
+        // mode that makes a capacity of 1 risky in the first place.
+        let gate = RecoveryGate::new(MAX_CONCURRENT_RECOVERIES, Duration::ZERO);
+        let _wedged: Vec<_> = (0..MAX_CONCURRENT_RECOVERIES)
+            .map(|i| gate.try_acquire(100 + i as u64).unwrap())
+            .collect();
+        assert!(gate.try_acquire(200).is_ok(), "silent holders are reclaimed");
+    }
+
+    #[test]
+    fn slow_but_progressing_holders_keep_their_slots() {
+        // The point of heartbeating: a full-depth walk over slow peers takes a
+        // long time but is never quiet. Reclaiming on elapsed time instead of
+        // silence would push concurrency past `capacity` exactly when gaps are
+        // largest — restoring the amplification this gate exists to bound.
+        let gate = RecoveryGate::new(1, Duration::from_millis(30));
+        let working = gate.try_acquire(100).unwrap();
+
+        // Outlive the idle timeout several times over, reporting throughout.
+        for _ in 0..6 {
+            std::thread::sleep(Duration::from_millis(10));
+            working.record_progress();
+            assert_eq!(
+                gate.try_acquire(101).unwrap_err(),
+                100,
+                "a reporting recovery must keep its slot however long it runs",
+            );
+        }
+
+        // Stop reporting and the slot is reclaimed.
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(gate.try_acquire(101).is_ok(), "slot freed once progress stops");
+    }
+
+    #[test]
+    fn superseded_permit_does_not_release_a_live_slot() {
+        // After the idle valve reclaims a slot and hands it to a new recovery,
+        // the old permit dropping must not free the new holder's slot.
+        let lenient = RecoveryGate::new(1, Duration::ZERO);
+        let stale = lenient.try_acquire(100).unwrap();
+        let live = lenient.try_acquire(101).unwrap();
+        drop(stale);
+
+        // Same slots, viewed through a gate that hands out no idle reclaims, so
+        // the assertion is about ownership rather than timing.
+        let strict = lenient.with_idle_timeout(Duration::from_secs(3600));
+        assert_eq!(
+            strict.try_acquire(102).unwrap_err(),
+            101,
+            "the live holder still owns its slot"
+        );
+        drop(live);
+        assert!(strict.try_acquire(102).is_ok());
     }
 }
 
