@@ -50,6 +50,44 @@ pub type ValidatorCacheSink = Arc<Mutex<Option<(Vec<Address>, Vec<VoteAddress>)>
 pub type StateRootPrecomputedSink =
     Arc<Mutex<Option<(alloy_primitives::B256, reth_trie_common::updates::TrieUpdates)>>>;
 
+/// What the executor is doing with the block it is running.
+///
+/// Replaces the former `is_miner: bool`, which fused two independent questions: whether a
+/// header already exists, and whether Parlia finalization should run. Those two always
+/// moved together for the import and mining paths, so a bool sufficed — until
+/// `eth_simulateV1` needed the third combination (author a block, but do *not* finalize
+/// it) and was silently rounded to [`Self::Mining`], making a read-only RPC try to sign
+/// Parlia system transactions. See <https://github.com/bnb-chain/reth-bsc/issues/451>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BscExecutionMode {
+    /// Verifying a block received from the network or the engine API. The header already
+    /// exists and system transactions are consumed from the block rather than generated.
+    Import,
+    /// Producing a block this validator will sign and broadcast. System transactions are
+    /// generated and signed with the validator key.
+    Mining,
+    /// Answering a hypothetical — `eth_simulateV1` or the local pending block. Authors a
+    /// header like [`Self::Mining`], but runs no Parlia finalization and signs nothing,
+    /// matching BSC geth's simulation path.
+    Simulation,
+}
+
+impl BscExecutionMode {
+    /// Whether no header exists yet and one is being authored.
+    ///
+    /// True for both [`Self::Mining`] and [`Self::Simulation`]; the block-verification
+    /// checks that dereference `ctx.header` must be skipped in both.
+    pub const fn authors_block(self) -> bool {
+        matches!(self, Self::Mining | Self::Simulation)
+    }
+
+    /// Whether Parlia post-block finalization (reward distribution, slashing, validator-set
+    /// updates) must run — which implies signing system transactions.
+    pub const fn finalizes(self) -> bool {
+        matches!(self, Self::Mining)
+    }
+}
+
 /// BSC wrapper around [`NextBlockEnvAttributes`].
 ///
 /// Extends the upstream attributes with sparse-trie sinks and validator/turn-length
@@ -59,6 +97,13 @@ pub type StateRootPrecomputedSink =
 #[derive(Debug, Clone)]
 pub struct BscNextBlockEnvAttributes {
     pub inner: NextBlockEnvAttributes,
+    /// Execution mode for the block built from these attributes.
+    ///
+    /// Defaults to [`BscExecutionMode::Simulation`] via [`BuildPendingEnv`], which is the
+    /// entry point reth uses for `eth_simulateV1` and the local pending block. The miner and
+    /// bid simulator construct this struct literally and must set
+    /// [`BscExecutionMode::Mining`] explicitly.
+    pub mode: BscExecutionMode,
     /// Sink for transporting `current_validators` from builder to payload layer without writing
     /// to VALIDATOR_CACHE prematurely (hash not yet final at build time).
     pub validator_cache_sink: Option<ValidatorCacheSink>,
@@ -94,6 +139,9 @@ impl<H: BlockHeader> BuildPendingEnv<H> for BscNextBlockEnvAttributes {
     fn build_pending_env(parent: &SealedHeader<H>) -> Self {
         Self {
             inner: NextBlockEnvAttributes::build_pending_env(parent),
+            // This is the RPC-side entry point (`eth_simulateV1`, local pending block), not
+            // the miner. Simulation must not run Parlia finalization or sign system txs.
+            mode: BscExecutionMode::Simulation,
             validator_cache_sink: None,
             turn_length_sink: None,
             state_root_precomputed_sink: None,
@@ -143,8 +191,8 @@ pub struct BscBlockExecutionCtx<'a> {
     pub header: Option<Header>,
     /// Block hash when known (sealed block), to avoid re-hashing.
     pub header_hash: Option<BlockHash>,
-    /// Whether the block is being mined.
-    pub is_miner: bool,
+    /// What this execution is for: verifying, mining, or simulating.
+    pub mode: BscExecutionMode,
     /// Sink for `current_validators` — written by builder in `finish()` and read by the
     /// payload layer after the builder is consumed. `None` for non-miner paths.
     pub validator_cache_sink: Option<ValidatorCacheSink>,
@@ -469,7 +517,7 @@ where
             },
             header: Some(block.header().clone()),
             header_hash: Some(block.hash()),
-            is_miner: false,
+            mode: BscExecutionMode::Import,
             validator_cache_sink: None,
             turn_length_sink: None,
             state_root_precomputed_sink: None,
@@ -483,7 +531,12 @@ where
         parent: &SealedHeader<HeaderTy<Self::Primitives>>,
         attributes: Self::NextBlockEnvCtx,
     ) -> Result<ExecutionCtxFor<'_, Self>, Self::Error> {
-        tracing::trace!("Try to create next block ctx for miner, next_block_numer={}, parent_hash={}", parent.number+1, parent.hash());
+        tracing::trace!(
+            "Try to create next block ctx, next_block_numer={}, parent_hash={}, mode={:?}",
+            parent.number + 1,
+            parent.hash(),
+            attributes.mode
+        );
         Ok(BscBlockExecutionCtx {
             base: EthBlockExecutionCtx {
                 tx_count_hint: None,
@@ -496,7 +549,9 @@ where
             },
             header: None, // No header available for next block context
             header_hash: None,
-            is_miner: true,
+            // Carried from the attributes rather than hard-coded: this hook is shared by
+            // the miner, `eth_simulateV1` and the local pending-block path.
+            mode: attributes.mode,
             validator_cache_sink: attributes.validator_cache_sink,
             turn_length_sink: attributes.turn_length_sink,
             state_root_precomputed_sink: attributes.state_root_precomputed_sink,
@@ -565,7 +620,7 @@ where
             },
             header: Some(block.header.clone()),
             header_hash: Some(payload.block_hash_cached()),
-            is_miner: false,
+            mode: BscExecutionMode::Import,
             validator_cache_sink: None,
             turn_length_sink: None,
             state_root_precomputed_sink: None,
@@ -664,5 +719,42 @@ pub fn revm_spec_by_timestamp_and_block_number(
         } else {
             BscHardfork::Frontier
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_consensus::Header;
+    use reth_primitives_traits::SealedHeader;
+
+    /// Regression guard for <https://github.com/bnb-chain/reth-bsc/issues/451>.
+    ///
+    /// `build_pending_env` is the entry point reth uses for `eth_simulateV1` and the local
+    /// pending block. It must not select a mode that runs Parlia finalization, or those
+    /// read-only RPCs try to sign system transactions and fail on any node without a
+    /// validator key (and silently inject a signed reward tx on nodes that have one).
+    #[test]
+    fn rpc_pending_env_does_not_select_a_finalizing_mode() {
+        let parent = SealedHeader::seal_slow(Header::default());
+        let attrs = <BscNextBlockEnvAttributes as BuildPendingEnv<Header>>::build_pending_env(
+            &parent,
+        );
+
+        assert_eq!(attrs.mode, BscExecutionMode::Simulation);
+        assert!(!attrs.mode.finalizes(), "simulation must not run Parlia finalization");
+    }
+
+    /// The two predicates encode the axes the old `is_miner: bool` fused together.
+    /// Mining and simulation both author a header; only mining finalizes.
+    #[test]
+    fn execution_mode_predicates_split_authoring_from_finalizing() {
+        assert!(!BscExecutionMode::Import.authors_block());
+        assert!(BscExecutionMode::Mining.authors_block());
+        assert!(BscExecutionMode::Simulation.authors_block());
+
+        assert!(!BscExecutionMode::Import.finalizes());
+        assert!(BscExecutionMode::Mining.finalizes());
+        assert!(!BscExecutionMode::Simulation.finalizes());
     }
 }

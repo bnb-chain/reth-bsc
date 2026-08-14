@@ -258,7 +258,9 @@ fn publish_env(chain_spec: Arc<BscChainSpec>) {
 /// This is the reference the round-trip will compare `simulate_bid_block` against.
 #[test]
 fn trusted_local_build_produces_block() {
-    use reth_bsc::node::evm::config::{BscEvmConfig, BscNextBlockEnvAttributes};
+    use reth_bsc::node::evm::config::{
+        BscEvmConfig, BscExecutionMode, BscNextBlockEnvAttributes,
+    };
     use reth_evm::execute::{BlockBuilder, BlockBuilderOutcome};
     use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
     use reth_provider::DatabaseProviderFactory;
@@ -292,6 +294,7 @@ fn trusted_local_build_produces_block() {
                     extra_data: Default::default(),
                     slot_number: None,
                 },
+                mode: BscExecutionMode::Mining,
                 validator_cache_sink: None,
                 turn_length_sink: None,
                 state_root_precomputed_sink: None,
@@ -320,7 +323,9 @@ fn trusted_local_build_produces_block() {
 #[test]
 fn round_trip_build_finalize_reexecute_agree() {
     use reth_bsc::consensus::parlia::util::calculate_difficulty;
-    use reth_bsc::node::evm::config::{BscEvmConfig, BscNextBlockEnvAttributes};
+    use reth_bsc::node::evm::config::{
+        BscEvmConfig, BscExecutionMode, BscNextBlockEnvAttributes,
+    };
     use reth_bsc::node::miner::util::finalize_new_header;
     use reth_evm::execute::{BlockBuilder, BlockBuilderOutcome, Executor};
     use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
@@ -365,6 +370,7 @@ fn round_trip_build_finalize_reexecute_agree() {
                         extra_data: alloy_primitives::Bytes::from(vec![0u8; 32]),
                         slot_number: None,
                     },
+                    mode: BscExecutionMode::Mining,
                     validator_cache_sink: None,
                     turn_length_sink: None,
                     state_root_precomputed_sink: None,
@@ -435,7 +441,9 @@ fn execution_gate_round_trip() {
     use alloy_eips::eip2718::Encodable2718;
     use alloy_primitives::{Signature, TxKind};
     use reth_bsc::consensus::parlia::util::calculate_difficulty;
-    use reth_bsc::node::evm::config::{BscEvmConfig, BscNextBlockEnvAttributes};
+    use reth_bsc::node::evm::config::{
+        BscEvmConfig, BscExecutionMode, BscNextBlockEnvAttributes,
+    };
     use reth_bsc::node::miner::bid_block::{
         simulate_bid_block, submitted_tx_root, BidBlock, BidBlockArgs,
     };
@@ -479,6 +487,7 @@ fn execution_gate_round_trip() {
             extra_data: alloy_primitives::Bytes::from(vec![0u8; 32]),
             slot_number: None,
         },
+        mode: BscExecutionMode::Mining,
         validator_cache_sink: None,
         turn_length_sink: None,
         state_root_precomputed_sink: None,

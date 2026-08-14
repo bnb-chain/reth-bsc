@@ -1,7 +1,7 @@
 use super::executor::BscBlockExecutor;
 use super::error::{BscBlockExecutionError, BscBlockValidationError};
 use super::util::set_nonce;
-use super::config::revm_spec_by_timestamp_and_block_number;
+use super::config::{revm_spec_by_timestamp_and_block_number, BscExecutionMode};
 use crate::consensus::parlia::{FF_REWARD_DISTRIBUTION_INTERVAL};
 use crate::node::evm::pre_execution::{CallBlockEnv, TURN_LENGTH_CACHE};
 use crate::node::evm::util::get_header_by_hash_from_cache;
@@ -61,7 +61,7 @@ where
         &mut self, 
         block: &BlockEnv
     ) -> Result<(), BlockExecutionError> {
-        tracing::debug!("Start to post check new block, block_number: {}, is_miner: {}", block.number(), self.ctx.is_miner); 
+        tracing::debug!("Start to post check new block, block_number: {}, mode: {:?}", block.number(), self.ctx.mode);
         self.verify_validators(self.inner_ctx.current_validators.clone(), self.inner_ctx.header.clone())?;
         self.verify_turn_length(self.inner_ctx.header.clone())?;
 
@@ -303,7 +303,20 @@ where
 
         let transaction = set_nonce(transaction, account.nonce);
 
-        let signed_tx = if !self.ctx.is_miner {
+        // Simulation never generates system transactions: `finish` skips finalization and
+        // the contract-init steps that would reach here. Guard defensively so a future
+        // caller cannot reintroduce issue #451 by routing a simulation into signing.
+        if self.ctx.mode == BscExecutionMode::Simulation {
+            debug_assert!(false, "system tx attempted during simulation: {transaction:?}");
+            tracing::warn!(
+                target: "bsc::evm",
+                "Skipping system transaction in simulation mode: {:?}",
+                transaction.to()
+            );
+            return Ok(());
+        }
+
+        let signed_tx = if !self.ctx.mode.finalizes() {
             let hash = transaction.signature_hash();
             if self.system_txs.is_empty() || hash != self.system_txs[0].signature_hash() {
                 // slash tx could fail and not in the block
@@ -342,7 +355,7 @@ where
             return Err(BscBlockExecutionError::GlobalSignerNotInitializedForMiningMode.into());
         };
 
-        if self.ctx.is_miner {
+        if self.ctx.mode.finalizes() {
             if let Some(signed) = signed_tx.clone() {
                 let recovered = signed.clone().try_into_recovered_unchecked().unwrap_or_else(|_| {
                     panic!("Failed to recover system transaction signature")
@@ -661,7 +674,7 @@ where
         &mut self, 
         block: &BlockEnv
     ) -> Result<(), BlockExecutionError> {
-        tracing::debug!("Start to finalize new block, block_number: {}, is_miner: {}", block.number(), self.ctx.is_miner);
+        tracing::debug!("Start to finalize new block, block_number: {}, mode: {:?}", block.number(), self.ctx.mode);
         let snap = self.inner_ctx.snap.as_ref().unwrap();
         let epoch_length = snap.epoch_num;
         let expected_validator = snap.inturn_validator();

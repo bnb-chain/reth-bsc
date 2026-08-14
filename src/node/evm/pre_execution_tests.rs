@@ -428,7 +428,7 @@ mod parent_block_env {
     use crate::consensus::parlia::snapshot::MAXWELL_EPOCH_LENGTH;
     use crate::evm::api::BscEvm;
     use crate::node::evm::config::{
-        evm_env_for_header, BscBlockExecutionCtx, BscExecutionSharedCtx,
+        evm_env_for_header, BscBlockExecutionCtx, BscExecutionMode, BscExecutionSharedCtx,
     };
     use crate::node::evm::executor::BscBlockExecutor;
     use crate::node::evm::pre_execution::{CallBlockEnv, VALIDATOR_CACHE};
@@ -608,7 +608,7 @@ mod parent_block_env {
             },
             header: Some(header),
             header_hash: None,
-            is_miner: false,
+            mode: BscExecutionMode::Import,
             validator_cache_sink: None,
             turn_length_sink: None,
             state_root_precomputed_sink: None,
