@@ -550,17 +550,27 @@ where
             .get_header_by_hash(&self.ctx.base.parent_hash)
             .ok_or(BlockExecutionError::msg("Failed to get parent header from global header reader"))?;
         self.inner_ctx.parent_header = Some(parent_header.clone());
-        let snap = self
-            .snapshot_provider
-            .as_ref()
-            .unwrap()
-            .snapshot_by_hash(&self.ctx.base.parent_hash)
-            .ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;
-        self.inner_ctx.snap = Some(snap.clone());
+
+        // Only the Parlia finalization in `finish` reads the snapshot, and simulation skips
+        // that entirely. Requiring one here would make `eth_simulateV1` fail — or panic on
+        // the `unwrap` below — whenever the snapshot provider is unavailable, e.g. during
+        // early startup before consensus has published it.
+        if self.ctx.mode.finalizes() {
+            let snap = self
+                .snapshot_provider
+                .as_ref()
+                .ok_or(BlockExecutionError::msg("Snapshot provider is not available"))?
+                .snapshot_by_hash(&self.ctx.base.parent_hash)
+                .ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;
+            self.inner_ctx.snap = Some(snap.clone());
+        }
 
         let header_number = block.number().to::<u64>();
         let header_timestamp = block.timestamp().to::<u64>();
-        if self.spec.is_feynman_active_at_timestamp(header_number, header_timestamp) &&
+        // The election data below feeds `update_validator_set_v2`, which only runs during
+        // finalization; skip the system-contract calls in simulation.
+        if self.ctx.mode.finalizes() &&
+            self.spec.is_feynman_active_at_timestamp(header_number, header_timestamp) &&
             !self.spec.is_feynman_transition_at_timestamp(header_number, header_timestamp, parent_header.timestamp) &&
             is_breathe_block(parent_header.timestamp, header_timestamp)
         {

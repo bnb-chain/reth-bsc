@@ -4,7 +4,9 @@ use crate::consensus::parlia::provider::SnapshotProvider;
 use crate::consensus::parlia::Snapshot;
 use crate::hardforks::BscHardforks;
 use crate::node::engine::BscBuiltPayload;
-use crate::node::evm::config::{BscEvmConfig, BscNextBlockEnvAttributes, ValidatorCacheSink};
+use crate::node::evm::config::{
+    BscEvmConfig, BscExecutionMode, BscNextBlockEnvAttributes, ValidatorCacheSink,
+};
 use crate::node::miner::bsc_miner::MiningContext;
 use crate::node::miner::payload::DELAY_LEFT_OVER;
 use crate::node::miner::util::prepare_new_attributes;
@@ -414,6 +416,10 @@ where
                         extra_data: builder_config.extra_data.clone(),
                         slot_number: None,
                     },
+                    // MEV bid simulation reproduces the block this validator would seal, so
+                    // it must run the full Parlia finalization the miner runs — unlike
+                    // `eth_simulateV1`, which is a caller-facing hypothetical.
+                    mode: BscExecutionMode::Mining,
                     validator_cache_sink: Some(bid_validator_cache_sink.clone()),
                     turn_length_sink: Some(bid_turn_length_sink.clone()),
                     // Bid simulation does not run alongside a sparse-trie task —

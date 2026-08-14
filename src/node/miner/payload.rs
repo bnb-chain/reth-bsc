@@ -6,7 +6,9 @@ use crate::evm::blacklist;
 use crate::hardforks::BscHardforks;
 use crate::metrics::{BscConsensusMetrics, BscMinerMetrics};
 use crate::node::engine::{BscBuiltPayload, BuildKind};
-use crate::node::evm::config::{BscEvmConfig, BscNextBlockEnvAttributes, ValidatorCacheSink};
+use crate::node::evm::config::{
+    BscEvmConfig, BscExecutionMode, BscNextBlockEnvAttributes, ValidatorCacheSink,
+};
 use crate::node::evm::pre_execution::{TURN_LENGTH_CACHE, VALIDATOR_CACHE};
 use crate::node::miner::bid_simulator::BidSimulator;
 use crate::node::miner::bsc_miner::{MiningContext, SubmitContext};
@@ -525,6 +527,7 @@ where
                     .unwrap_or_else(|| self.builder_config.extra_data.clone()),
                 slot_number: None,
             },
+            mode: BscExecutionMode::Mining,
             validator_cache_sink: Some(validator_cache_sink.clone()),
             turn_length_sink: Some(turn_length_sink.clone()),
             state_root_precomputed_sink: Some(state_root_precomputed_sink),
@@ -1061,6 +1064,7 @@ where
                             .unwrap_or_else(|| self.builder_config.extra_data.clone()),
                         slot_number: None,
                     },
+                    mode: BscExecutionMode::Mining,
                     validator_cache_sink: Some(validator_cache_sink.clone()),
                     turn_length_sink: Some(turn_length_sink.clone()),
                     // Empty-fallback build never installs a sparse-trie hook (trie_handle: None
