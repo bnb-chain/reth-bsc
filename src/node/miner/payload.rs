@@ -10,6 +10,7 @@ use crate::node::evm::config::{BscEvmConfig, BscNextBlockEnvAttributes, Validato
 use crate::node::evm::pre_execution::{TURN_LENGTH_CACHE, VALIDATOR_CACHE};
 use crate::node::miner::bid_block::{validate_bid_block_blob_kzg, BidBlockTask};
 use crate::node::miner::bid_simulator::BidSimulator;
+use crate::node::miner::block_mev_info::{set_block_mev_info, BlockMevInfoVersion};
 use crate::node::miner::bsc_miner::{MiningContext, SubmitContext};
 use crate::node::miner::util::finalize_new_header;
 use crate::node::pool::BlacklistedAddressError;
@@ -1004,7 +1005,7 @@ where
             executed_block,
             pending_validators,
             pending_turn_length,
-            is_bid: false,
+            bid_builder: None,
         };
         Ok(payload)
     }
@@ -1160,7 +1161,7 @@ where
             executed_block,
             pending_validators,
             pending_turn_length,
-            is_bid: false,
+            bid_builder: None,
         };
         Ok(payload)
     }
@@ -2610,7 +2611,7 @@ where
             use crate::metrics::BscMevMetrics;
             use once_cell::sync::Lazy;
             static MEV_METRICS: Lazy<BscMevMetrics> = Lazy::new(BscMevMetrics::default);
-            if best_payload.is_bid {
+            if best_payload.bid_builder.is_some() {
                 MEV_METRICS.bid_win_total.increment(1);
             } else {
                 // Simulations were preempted for bids that then failed to win the block: the
@@ -2649,7 +2650,7 @@ where
             block_number = best_payload.block().header().number(),
             block_hash = %best_payload.block().hash(),
             is_inturn = self.mining_ctx.is_inturn,
-            is_bid = best_payload.is_bid,
+            is_bid = best_payload.bid_builder.is_some(),
             tx_count = best_payload.block().body().transaction_count(),
             fees = %best_payload.fees(),
             exec_duration_ms = best_payload.exec_duration.as_millis(),
@@ -2741,6 +2742,26 @@ fn finalize_payload(
     let senders = payload.executed_block.recovered_block.senders().to_vec();
     let mut existing_sidecars = payload.block.clone_block().body.sidecars;
     let mut plain_block = payload.executed_block.recovered_block.sealed_block().clone_block();
+
+    // Tag legacy `SendBid` winners with their builder (go-bsc `setBidMevInfo`, the Bid case).
+    // Must run before `finalize_new_header()`, which ECDSA-seals the header: a tag written after
+    // the seal would not be covered by it. Local builds leave `requests_hash` empty, which is what
+    // lets consumers read "untagged" as "locally built" — see `block_mev_info`.
+    //
+    // The BEP-675 BidBlock path tags its own header in `simulate_bid_block()` instead, because
+    // those blocks never become a `BscBuiltPayload` and so never reach this function.
+    if let Some(builder) = payload.bid_builder {
+        let prague_active = parlia.chain_spec().is_prague_active_at_block_and_timestamp(
+            plain_block.header.number,
+            plain_block.header.timestamp,
+        );
+        set_block_mev_info(
+            &mut plain_block.header,
+            BlockMevInfoVersion::Bid,
+            builder,
+            prague_active,
+        );
+    }
 
     finalize_new_header(
         parlia,

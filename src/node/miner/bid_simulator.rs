@@ -841,7 +841,7 @@ where
             executed_block,
             pending_validators,
             pending_turn_length,
-            is_bid: true,
+            bid_builder: Some(bid_runtime.bid.builder),
         });
 
         // Acquire write lock to update best_bid

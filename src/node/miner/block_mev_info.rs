@@ -33,6 +33,25 @@ pub fn encode_block_mev_info(version: BlockMevInfoVersion, builder: Address) -> 
     h
 }
 
+/// Stamp a header with `(version, builder)` in `requests_hash` (go-bsc `setBidMevInfo`).
+///
+/// `requests_hash` only exists post-Prague, so callers pass whether Prague is active at this block;
+/// before Prague the header carries no tag and the block is indistinguishable from a local build.
+/// Both MEV paths (legacy `SendBid` and BEP-675 `SendBidBlock`) funnel through here so the tag can
+/// never drift between them.
+///
+/// Must run **before** the header is ECDSA-sealed, or the seal will not cover the tag.
+pub fn set_block_mev_info(
+    header: &mut alloy_consensus::Header,
+    version: BlockMevInfoVersion,
+    builder: Address,
+    prague_active: bool,
+) {
+    if prague_active {
+        header.requests_hash = Some(encode_block_mev_info(version, builder));
+    }
+}
+
 /// Recover the MEV source and builder from a tag.
 ///
 /// Returns `None` when the block should be treated as local: a nonzero leading sentinel, an
@@ -105,5 +124,40 @@ mod tests {
     fn rejects_zero_builder() {
         let tag = encode_block_mev_info(BlockMevInfoVersion::Bid, Address::ZERO);
         assert_eq!(decode_block_mev_info(tag), None);
+    }
+
+    #[test]
+    fn set_block_mev_info_tags_both_paths_only_when_prague() {
+        for version in [BlockMevInfoVersion::Bid, BlockMevInfoVersion::BidBlock] {
+            // Pre-Prague there is no `requests_hash` field to carry the tag, so the block stays
+            // untagged and reads as local.
+            let mut header = alloy_consensus::Header::default();
+            set_block_mev_info(&mut header, version, BUILDER, false);
+            assert_eq!(header.requests_hash, None, "{version:?} must not tag pre-Prague");
+
+            set_block_mev_info(&mut header, version, BUILDER, true);
+            let tag = header.requests_hash.expect("post-Prague header must be tagged");
+            assert_eq!(decode_block_mev_info(tag), Some((version, BUILDER)));
+        }
+    }
+
+    #[test]
+    fn legacy_bid_and_bid_block_tags_are_distinguishable() {
+        // The whole point of the version byte: a `SendBid` winner must not be mistaken for a
+        // BEP-675 `SendBidBlock` winner, nor either for a local build.
+        let mut bid_header = alloy_consensus::Header::default();
+        set_block_mev_info(&mut bid_header, BlockMevInfoVersion::Bid, BUILDER, true);
+        let mut bid_block_header = alloy_consensus::Header::default();
+        set_block_mev_info(&mut bid_block_header, BlockMevInfoVersion::BidBlock, BUILDER, true);
+
+        assert_ne!(bid_header.requests_hash, bid_block_header.requests_hash);
+        assert_eq!(
+            decode_block_mev_info(bid_header.requests_hash.unwrap()).map(|(v, _)| v),
+            Some(BlockMevInfoVersion::Bid)
+        );
+        assert_eq!(
+            decode_block_mev_info(bid_block_header.requests_hash.unwrap()).map(|(v, _)| v),
+            Some(BlockMevInfoVersion::BidBlock)
+        );
     }
 }

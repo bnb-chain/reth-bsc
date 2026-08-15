@@ -19,7 +19,7 @@ use crate::consensus::parlia::{
     Snapshot, SnapshotProvider,
 };
 use crate::hardforks::BscHardforks;
-use crate::node::miner::block_mev_info::{encode_block_mev_info, BlockMevInfoVersion};
+use crate::node::miner::block_mev_info::{set_block_mev_info, BlockMevInfoVersion};
 use crate::node::miner::signer::sign_system_transaction;
 use crate::node::miner::util::finalize_new_header;
 use crate::node::primitives::{BscBlobTransactionSidecar, BscBlock, BscBlockBody};
@@ -857,10 +857,7 @@ impl std::error::Error for SimulateBidBlockError {}
 /// `requests_hash` is present), hence this only applies when Prague is active — matching go-bsc,
 /// where BidBlock blocks are always post-Prague.
 pub fn set_bid_block_mev_info(header: &mut Header, builder: Address, prague_active: bool) {
-    if prague_active {
-        header.requests_hash =
-            Some(encode_block_mev_info(BlockMevInfoVersion::BidBlock, builder));
-    }
+    set_block_mev_info(header, BlockMevInfoVersion::BidBlock, builder, prague_active);
 }
 
 /// Validator-side simulation of an admitted BidBlock: payload-verify, blind-sign the trailing system
