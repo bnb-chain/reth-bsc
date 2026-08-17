@@ -78,6 +78,18 @@ where
         origin: TransactionOrigin,
         transaction: Self::Transaction,
     ) -> TransactionValidationOutcome<Self::Transaction> {
+        // TEMP INSTRUMENTATION (BEP-675 leak attribution): log every pool ingress with its origin.
+        // `origin` distinguishes External (p2p gossip from a peer) from Local (eth_sendRawTransaction)
+        // and any internal insert. Grep target `bsc::txingress` for a specific tx hash to learn how
+        // it entered the pool. Remove after the investigation.
+        tracing::info!(
+            target: "bsc::txingress",
+            tx = %transaction.hash(),
+            ?origin,
+            sender = %transaction.sender(),
+            "txpool ingress",
+        );
+
         if blacklist::check_tx_basic_blacklist(transaction.sender(), transaction.to()) {
             tracing::debug!(target: "bsc::txpool", "Blacklisted transaction: {:?}", transaction.hash());
             return TransactionValidationOutcome::Invalid(
