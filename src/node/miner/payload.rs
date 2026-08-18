@@ -2414,22 +2414,18 @@ where
         // own time — otherwise the wall-clock future bound peers (and our own import) enforce
         // on the sync path would reject it. Mirror that timing with a delayed background send,
         // the same pattern `submit_payload` uses for the local path.
-        let target_ms =
-            crate::consensus::parlia::util::calculate_millisecond_timestamp(sealed.header());
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        let delay = std::time::Duration::from_millis(target_ms.saturating_sub(now_ms));
+        let delay = bid_block_broadcast_delay(sealed.header(), now_unix_ms());
 
         let trace_id = self.trace_id;
         let (builder_addr, bid_hash, gas_fee, system_tx_start) =
             (bid.builder, bid.bid_hash, bid.gas_fee, bid.system_tx_start);
         tokio::spawn(async move {
-            if !delay.is_zero() {
-                tokio::time::sleep(delay).await;
-            }
-            if let Err(e) = sender.send((sealed, builder_addr, bid_hash, gas_fee, system_tx_start))
+            if let Err(e) = send_bid_block_after_delay(
+                sender,
+                (sealed, builder_addr, bid_hash, gas_fee, system_tx_start),
+                delay,
+            )
+            .await
             {
                 // The slot was never actually broadcast — release it so a later legitimate
                 // block at this height is not wrongly rejected as a double sign.
@@ -2679,6 +2675,43 @@ where
 /// is part of the header hash), patches the blob sidecars' cached `block_hash` (set at admission
 /// time) before the block goes out over P2P, mirroring `finalize_payload`'s equivalent patch for
 /// the local-block path.
+/// Milliseconds since the unix epoch, for comparison against a header's millisecond timestamp.
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// How long to hold a won BidBlock before releasing it, so it is never announced before its own
+/// header timestamp.
+///
+/// go-bsc's `Parlia.Seal` waits out `delayForRamanujanFork` for exactly this reason: a block
+/// announced early trips the wall-clock future bound that peers — and our own import path —
+/// enforce, so an early broadcast gets the block rejected rather than propagated. Zero once the
+/// timestamp has passed, which is the common case for a block sealed at the end of its slot.
+fn bid_block_broadcast_delay(header: &alloy_consensus::Header, now_ms: u64) -> std::time::Duration {
+    let target_ms = crate::consensus::parlia::util::calculate_millisecond_timestamp(header);
+    std::time::Duration::from_millis(target_ms.saturating_sub(now_ms))
+}
+
+/// Waits out `delay`, then hands the BidBlock to the import service, which is where broadcast
+/// actually begins.
+///
+/// Split out from `try_submit_winning_bid_block` so the "not before its timestamp" invariant can be
+/// tested against a channel instead of a P2P capture: the `send` below *is* the start of broadcast,
+/// so a test that observes when the receiver sees the block observes the real timing.
+async fn send_bid_block_after_delay<T>(
+    sender: &tokio::sync::mpsc::UnboundedSender<T>,
+    block: T,
+    delay: std::time::Duration,
+) -> Result<(), tokio::sync::mpsc::error::SendError<T>> {
+    if !delay.is_zero() {
+        tokio::time::sleep(delay).await;
+    }
+    sender.send(block)
+}
+
 fn refresh_and_reseal_bid_block(
     parlia: Arc<Parlia<BscChainSpec>>,
     parent_snapshot: &Snapshot,
@@ -2815,8 +2848,9 @@ fn finalize_payload(
 #[cfg(test)]
 mod tests {
     use super::{
-        initial_out_of_turn_build_wait, local_rebuild_action, refresh_and_reseal_bid_block,
-        validate_bsc_sidecar, LocalRebuildAction, LocalRebuildPolicyInput,
+        bid_block_broadcast_delay, initial_out_of_turn_build_wait, local_rebuild_action,
+        refresh_and_reseal_bid_block, send_bid_block_after_delay, validate_bsc_sidecar,
+        LocalRebuildAction, LocalRebuildPolicyInput,
     };
     use crate::chainspec::BscChainSpec;
     use crate::consensus::parlia::Parlia;
@@ -2834,6 +2868,94 @@ mod tests {
     use reth_primitives_traits::{RecoveredBlock, SealedHeader};
     use std::sync::Arc;
     use std::time::Duration;
+
+    /// A won BidBlock must not be released before its own header timestamp.
+    ///
+    /// The delay is derived from the header, so this pins the arithmetic against a real header
+    /// rather than re-deriving it. `calculate_millisecond_timestamp` is `timestamp * 1000` plus the
+    /// millisecond part packed into the last 8 bytes of `mix_hash`, and that sub-second part
+    /// matters: BSC slots are shorter than a second, so truncating it would under-delay by up to
+    /// 999ms.
+    #[test]
+    fn bid_block_broadcast_delay_waits_out_the_header_timestamp() {
+        let header_at = |secs: u64, millis: u64| {
+            let mut h = Header { timestamp: secs, ..Default::default() };
+            crate::consensus::parlia::util::set_millisecond_part_of_timestamp(millis, &mut h);
+            h
+        };
+
+        // Header 750ms in the future -> wait exactly that long.
+        let h = header_at(1_000, 250);
+        assert_eq!(
+            bid_block_broadcast_delay(&h, 1_000_000 - 750 + 250),
+            Duration::from_millis(750)
+        );
+
+        // The millisecond part is honoured, not truncated to the second.
+        assert_eq!(bid_block_broadcast_delay(&h, 1_000_000), Duration::from_millis(250));
+
+        // Already due, and already past: no delay, and no panic on the underflow.
+        assert!(bid_block_broadcast_delay(&h, 1_000_250).is_zero());
+        assert!(bid_block_broadcast_delay(&h, 1_000_251).is_zero());
+        assert!(bid_block_broadcast_delay(&h, u64::MAX).is_zero());
+    }
+
+    /// The delay must actually withhold the block, not merely be computed.
+    ///
+    /// `send_bid_block_after_delay`'s send is where broadcast begins — the import service takes it
+    /// from there — so observing when the receiver sees the block observes the real broadcast
+    /// timing, without a P2P capture. Time is paused, so this asserts ordering deterministically
+    /// instead of racing a wall clock.
+    #[tokio::test(start_paused = true)]
+    async fn bid_block_send_is_withheld_until_the_delay_elapses() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+        let delay = Duration::from_millis(600);
+
+        let task = tokio::spawn(async move { send_bid_block_after_delay(&tx, 7u64, delay).await });
+
+        // One millisecond short of due: still withheld.
+        tokio::time::advance(Duration::from_millis(599)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "BidBlock was released before its timestamp; peers would reject it as future-dated"
+        );
+
+        // Past due: released.
+        tokio::time::advance(Duration::from_millis(2)).await;
+        task.await.expect("send task panicked").expect("receiver is still alive");
+        assert_eq!(rx.try_recv().expect("BidBlock must be released once due"), 7);
+    }
+
+    /// A block already past its timestamp — the common case, sealed at the end of its slot — must go
+    /// out without waiting.
+    #[tokio::test(start_paused = true)]
+    async fn bid_block_send_is_immediate_when_already_due() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+
+        send_bid_block_after_delay(&tx, 9u64, Duration::ZERO)
+            .await
+            .expect("receiver is still alive");
+
+        assert_eq!(
+            rx.try_recv().expect("a due BidBlock must not be delayed"),
+            9,
+            "zero delay must not defer the send"
+        );
+    }
+
+    /// A closed receiver must surface as an error, because the caller uses it to release the
+    /// double-sign slot: the block was never broadcast, so a later block at this height must remain
+    /// free to claim it.
+    #[tokio::test(start_paused = true)]
+    async fn bid_block_send_reports_a_closed_receiver() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+        drop(rx);
+
+        let err = send_bid_block_after_delay(&tx, 1u64, Duration::from_millis(50))
+            .await
+            .expect_err("a closed receiver must be reported so the slot can be released");
+        assert_eq!(err.0, 1, "the undelivered block is returned to the caller");
+    }
 
     fn test_parlia() -> Parlia<BscChainSpec> {
         let chain_spec = Arc::new(BscChainSpec { inner: crate::chainspec::bsc::bsc_mainnet() });

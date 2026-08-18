@@ -250,3 +250,6 @@ strip = false
 
 [dev-dependencies]
 uuid = { version = "1", features = ["v4"] }
+# `test-util` gives tests a paused clock (`start_paused`, `time::advance`), so timing invariants
+# can be asserted by ordering instead of racing a wall clock.
+tokio = { version = "1.44", features = ["full", "test-util"] }

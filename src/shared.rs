@@ -1075,6 +1075,161 @@ mod tests {
     // `RECENT_MINED_BLOCKS` is a process-wide global shared across every test in this binary, so
     // each test below uses a block number reserved just for it to avoid cross-test interference.
 
+    /// Two block-production paths racing for the same slot: exactly one may proceed to broadcast.
+    ///
+    /// The other guard tests call [`check_and_record_mined_block`] twice in sequence, which proves
+    /// the bookkeeping but not the property that matters: the local path
+    /// (`ResultWorkWorker::submit_payload`) and the BidBlock path (`try_submit_winning_bid_block`)
+    /// are independent tasks that can reach the guard at the same instant. If both were admitted
+    /// the validator would have signed two different blocks at one height on one parent —
+    /// equivocation, which is slashable.
+    ///
+    /// Both production paths have the same shape around the guard: consult it, and only if it
+    /// returns `true` hand the block to an import channel, which is the point of no return. Each
+    /// side below runs that sequence on its **own OS thread**, released together by a blocking
+    /// barrier — async tasks on a shared runtime do not reliably enter a synchronous critical
+    /// section at the same time, so they cannot exercise this at all.
+    ///
+    /// Detection is probabilistic: a mutex-protected read-modify-write is atomic by construction,
+    /// so this cannot *prove* atomicity, only catch an implementation that reopens the window.
+    /// Measured to do so — splitting the guard into a check under one lock and a record under
+    /// another fails this on round 1, while the two sequential tests below still pass.
+    #[test]
+    fn double_sign_guard_admits_exactly_one_of_two_racing_paths() {
+        use std::sync::{Arc, Barrier, Mutex};
+
+        for round in 0..256_u64 {
+            // Reserved, unique height per round; the cache is process-global.
+            let block_number = 910_000 + round;
+            let parent = B256::repeat_byte(0xc3);
+
+            let barrier = Arc::new(Barrier::new(2));
+            // Stands in for the import channels: only an admitted path may append.
+            let broadcast = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+
+            let handles: Vec<_> = ["local", "bid_block"]
+                .into_iter()
+                .map(|label| {
+                    let barrier = barrier.clone();
+                    let broadcast = broadcast.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        if check_and_record_mined_block(block_number, parent) {
+                            broadcast.lock().unwrap().push(label);
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                })
+                .collect();
+
+            let winners = handles
+                .into_iter()
+                .filter(|_| true)
+                .filter_map(|h| h.join().ok())
+                .filter(|w| *w)
+                .count();
+
+            assert_eq!(
+                winners, 1,
+                "round {round}: exactly one path may be admitted, got {winners}"
+            );
+            let broadcast = broadcast.lock().unwrap();
+            assert_eq!(
+                broadcast.len(),
+                1,
+                "round {round}: exactly one path may broadcast, got {broadcast:?}"
+            );
+        }
+    }
+
+    /// The same property under heavier contention than two threads can produce.
+    ///
+    /// More racers per height, and many heights, widens the window a non-atomic guard would expose.
+    #[test]
+    fn double_sign_guard_admits_exactly_one_under_heavy_contention() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Barrier,
+        };
+
+        const RACERS: usize = 16;
+
+        for round in 0..64_u64 {
+            let block_number = 911_000 + round;
+            let parent = B256::repeat_byte(0xd4);
+
+            let barrier = Arc::new(Barrier::new(RACERS));
+            let admitted = Arc::new(AtomicUsize::new(0));
+
+            let handles: Vec<_> = (0..RACERS)
+                .map(|_| {
+                    let barrier = barrier.clone();
+                    let admitted = admitted.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        if check_and_record_mined_block(block_number, parent) {
+                            admitted.fetch_add(1, Ordering::SeqCst);
+                        }
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().expect("racer thread panicked");
+            }
+
+            assert_eq!(
+                admitted.load(Ordering::SeqCst),
+                1,
+                "round {round}: {RACERS} racers at one height/parent, exactly one may be admitted"
+            );
+        }
+    }
+
+    /// Racing at the *same height on different parents* is a fork choice, not equivocation, so
+    /// every parent must be admitted exactly once.
+    ///
+    /// Negative control for the two tests above: a guard that simply admitted the first caller per
+    /// height would satisfy them while silently suppressing legitimate blocks after a reorg.
+    #[test]
+    fn double_sign_guard_admits_each_distinct_parent_once_under_contention() {
+        use std::sync::{Arc, Barrier, Mutex};
+
+        const PARENTS: u8 = 8;
+        const RACERS_PER_PARENT: usize = 4;
+
+        let block_number = 911_500_u64;
+        let barrier = Arc::new(Barrier::new(PARENTS as usize * RACERS_PER_PARENT));
+        let admitted = Arc::new(Mutex::new(Vec::<u8>::new()));
+
+        let mut handles = Vec::new();
+        for p in 0..PARENTS {
+            for _ in 0..RACERS_PER_PARENT {
+                let barrier = barrier.clone();
+                let admitted = admitted.clone();
+                handles.push(std::thread::spawn(move || {
+                    let parent = B256::repeat_byte(p);
+                    barrier.wait();
+                    if check_and_record_mined_block(block_number, parent) {
+                        admitted.lock().unwrap().push(p);
+                    }
+                }));
+            }
+        }
+        for h in handles {
+            h.join().expect("racer thread panicked");
+        }
+
+        let mut admitted = admitted.lock().unwrap().clone();
+        admitted.sort_unstable();
+        assert_eq!(
+            admitted,
+            (0..PARENTS).collect::<Vec<_>>(),
+            "each distinct parent must be admitted exactly once at the same height"
+        );
+    }
+
     #[test]
     fn double_sign_guard_rejects_exact_repeat() {
         let block_number = 900_001;
