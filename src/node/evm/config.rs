@@ -757,4 +757,37 @@ mod tests {
         assert!(BscExecutionMode::Mining.finalizes());
         assert!(!BscExecutionMode::Simulation.finalizes());
     }
+
+    /// Regression guard for <https://github.com/bnb-chain/reth-bsc/issues/464>.
+    ///
+    /// `context_for_next_block` used to hard-code `is_miner: true`, so the execution context
+    /// reth builds for the local pending block demanded Parlia finalization regardless of the
+    /// attributes it was handed. On a node without a validator key that made
+    /// `eth_getBlockByNumber("pending")` fail to build and return `null`. The mode must be
+    /// carried from the attributes, not re-decided here.
+    #[test]
+    fn next_block_ctx_carries_the_mode_from_the_attributes() {
+        let chain_spec = Arc::new(BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet()));
+        let evm_config = BscEvmConfig::new(chain_spec);
+        let parent = SealedHeader::seal_slow(Header::default());
+
+        // The RPC pending-block / `eth_simulateV1` entry point.
+        let pending_attrs =
+            <BscNextBlockEnvAttributes as BuildPendingEnv<Header>>::build_pending_env(&parent);
+        let ctx = evm_config.context_for_next_block(&parent, pending_attrs).unwrap();
+        assert_eq!(ctx.mode, BscExecutionMode::Simulation);
+        assert!(
+            !ctx.mode.finalizes(),
+            "pending-block ctx must not require a validator key to finalize"
+        );
+        assert!(ctx.mode.authors_block(), "pending block still authors a header");
+
+        // The miner passes its attributes through the same hook and must keep finalizing.
+        let mut mining_attrs =
+            <BscNextBlockEnvAttributes as BuildPendingEnv<Header>>::build_pending_env(&parent);
+        mining_attrs.mode = BscExecutionMode::Mining;
+        let ctx = evm_config.context_for_next_block(&parent, mining_attrs).unwrap();
+        assert_eq!(ctx.mode, BscExecutionMode::Mining);
+        assert!(ctx.mode.finalizes(), "mining must still run Parlia finalization");
+    }
 }
