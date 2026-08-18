@@ -35,7 +35,16 @@ use std::sync::Arc;
 const TEST_VALIDATOR: alloy_primitives::Address =
     address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
 
-/// The private key matching [`TEST_VALIDATOR`] (Anvil dev key 0), used to seal/sign as the validator.
+/// The private key matching [`TEST_VALIDATOR`], used to seal/sign as the validator.
+///
+/// Anvil development account #0. Not a secret: `anvil` prints it on every start and Foundry
+/// publishes it, so it controls nothing on any real network. Fixed rather than random because this
+/// harness pins expected block hashes and signatures that are only reproducible from a known key —
+/// randomising it would delete those checks rather than strengthen them.
+///
+/// `reth_bsc` keeps the same constant for its unit tests
+/// (`node::miner::signer::ANVIL_DEV_PRIVATE_KEY`); it cannot be shared across crates without
+/// exposing a key literal outside test code, which is what this duplication buys.
 const TEST_VALIDATOR_KEY: B256 =
     b256!("0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
 

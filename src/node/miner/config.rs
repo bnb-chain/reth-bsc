@@ -210,19 +210,30 @@ impl MiningConfig {
         self.bid_block_enabled
     }
 
-    /// Generate a new validator configuration with random keys
+    /// Generate a new validator configuration with a freshly generated random key.
+    ///
+    /// The key is random per call and per process. It previously hard-coded Anvil development
+    /// account #0, which meant any node that reached here — see [`Self::ensure_keys_available`],
+    /// which `main.rs` calls when mining is enabled with no key supplied — would sign blocks with a
+    /// key published in Foundry's documentation, and so impersonatable by anyone. A random key is
+    /// still not fit for production, but it is not *pre-compromised*, and it matches what this
+    /// function has always claimed to do.
     pub fn generate_for_development() -> Self {
-        // use rand::Rng;
+        use rand::Rng;
 
-        // Generate random 32-byte private key
-        // let mut rng = rand::rng();
-        // let private_key: [u8; 32] = rng.random();
-        // let private_key_hex = format!("0x{}", alloy_primitives::hex::encode(private_key));
-        let private_key_hex = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
-        // Validator Address: 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266
+        // Rejection-sample so the result is always a valid secp256k1 scalar; raw random bytes can
+        // fall outside the curve order (astronomically unlikely, but a silent fallback to
+        // `Self::default()` on a bad draw would disable mining for no visible reason).
+        let private_key_hex = loop {
+            let candidate: [u8; 32] = rand::rng().random();
+            let hex = format!("0x{}", alloy_primitives::hex::encode(candidate));
+            if keystore::load_private_key_from_hex(&hex).is_ok() {
+                break hex;
+            }
+        };
 
         // Derive validator address from private key
-        if let Ok(signing_key) = keystore::load_private_key_from_hex(private_key_hex) {
+        if let Ok(signing_key) = keystore::load_private_key_from_hex(&private_key_hex) {
             let validator_address = keystore::get_validator_address(&signing_key);
 
             Self {

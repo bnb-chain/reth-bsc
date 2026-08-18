@@ -9,6 +9,36 @@ use secp256k1::{SECP256K1, Message, SecretKey};
 use zeroize::Zeroizing;
 use k256::ecdsa::SigningKey as K256SigningKey;
 
+/// Anvil development account #0's private key, and the address it derives.
+///
+/// This is not a secret: `anvil` prints it on every start and Foundry publishes it, so it controls
+/// nothing on any real network. It is kept fixed rather than randomised for two reasons.
+///
+/// 1. [`init_global_signer`] is first-wins (`OnceCell::set`), and unit tests share one process. If
+///    each test seeded its own random key, whichever test ran first would decide the validator for
+///    all of them, and any test asserting a derived address would fail depending on test order.
+/// 2. Cross-client conformance vectors regenerated from go-bsc are pinned to this key; randomising
+///    them would delete the check, not improve it.
+///
+/// Only ever compiled into test builds.
+#[cfg(test)]
+pub(crate) const ANVIL_DEV_PRIVATE_KEY: B256 =
+    alloy_primitives::b256!("0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
+
+/// The validator address [`ANVIL_DEV_PRIVATE_KEY`] derives.
+#[cfg(test)]
+pub(crate) const ANVIL_DEV_ADDRESS: alloy_primitives::Address =
+    alloy_primitives::address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
+
+/// Seeds the process-global signer with [`ANVIL_DEV_PRIVATE_KEY`], ignoring `AlreadyInitialized`.
+///
+/// Every test that needs the global signer must go through this, so all of them agree on the
+/// validator regardless of which test runs first.
+#[cfg(test)]
+pub(crate) fn init_test_signer() {
+    let _ = init_global_signer(ANVIL_DEV_PRIVATE_KEY);
+}
+
 pub struct MinerSigner {
     // Wrap raw key bytes to ensure zeroize-on-drop; reconstruct SecretKey as needed
     secret_bytes: Zeroizing<[u8; 32]>,
@@ -132,15 +162,22 @@ mod tests {
     use reth_primitives_traits::SignerRecoverable;
     use secp256k1::{ecdsa::RecoverableSignature, ecdsa::RecoveryId};
 
+    /// A fresh random key for tests that only need *some* valid signer.
+    ///
+    /// These tests derive the expected address from the key itself and never touch the global
+    /// signer, so nothing here depends on a particular value. Generated via `SigningKey::random`
+    /// rather than raw bytes so the result is always a valid secp256k1 scalar.
     fn dev_sk_bytes() -> [u8; 32] {
-        // Same as MiningConfig::generate_for_development()
-        let v = alloy_primitives::hex::decode(
-            "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
-        )
-        .unwrap();
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&v);
-        out
+        use rand::Rng;
+        // Rejection-sample so the result is always a valid secp256k1 scalar. `k256`'s own
+        // `SigningKey::random` wants a rand_core 0.6 RNG while this crate is on rand 0.9, so
+        // going through raw bytes avoids pulling in a second rand_core.
+        loop {
+            let candidate: [u8; 32] = rand::rng().random();
+            if SecretKey::from_slice(&candidate).is_ok() {
+                return candidate;
+            }
+        }
     }
 
     #[test]

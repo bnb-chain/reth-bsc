@@ -1771,13 +1771,9 @@ mod tests {
     fn bind_sign_signs_trailing_system_txs() {
         use reth_primitives_traits::SignerRecoverable;
 
-        // Same dev key the other miner tests use, so the process-global signer is consistent
-        // regardless of test order (init is first-wins; we ignore AlreadyInitialized).
-        let raw = alloy_primitives::hex::decode(
-            "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
-        )
-        .unwrap();
-        let _ = crate::node::miner::signer::init_global_signer(B256::from_slice(&raw));
+        // Shared with every other miner test, so the process-global signer is consistent
+        // regardless of test order (init is first-wins).
+        crate::node::miner::signer::init_test_signer();
 
         // user tx, then two unsigned (zero-signature) system txs.
         let txs = vec![legacy_tx(0), deposit_system_tx(100), deposit_system_tx(0)];
@@ -1839,10 +1835,9 @@ mod tests {
     fn simulate_bid_block_produces_sealed_block() {
         use reth_primitives_traits::SignerRecoverable;
 
-        // Validator = Anvil dev key 0; init the global signer so finalize can seal as it.
-        let validator = address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
-        let key = b256!("0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
-        let _ = crate::node::miner::signer::init_global_signer(key);
+        // Seal as the shared test validator, so this matches whatever the global signer holds.
+        let validator = crate::node::miner::signer::ANVIL_DEV_ADDRESS;
+        crate::node::miner::signer::init_test_signer();
 
         let chain_spec = std::sync::Arc::new(preseal_spec());
         let parlia = std::sync::Arc::new(Parlia::new(chain_spec.clone(), 200));
