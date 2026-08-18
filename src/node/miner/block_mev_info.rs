@@ -78,9 +78,10 @@ pub fn decode_block_mev_info(h: B256) -> Option<(BlockMevInfoVersion, Address)> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::address;
 
-    const BUILDER: Address = address!("0xb32d0723583040f3a16d1380d1e6aa874cd1bdf7");
+    /// Synthetic builder address. The value is arbitrary — these tests only round-trip it —
+    /// so it is deliberately not a realistic-looking address.
+    const BUILDER: Address = Address::repeat_byte(0xb1);
 
     #[test]
     fn round_trips_both_versions() {

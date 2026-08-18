@@ -173,7 +173,9 @@ mod tests {
         Arc,
     };
 
-    const BUILDER: Address = address!("0xb32d0723583040f3a16d1380d1e6aa874cd1bdf7");
+    /// Synthetic builder address. The value is arbitrary — these tests only round-trip it —
+    /// so it is deliberately not a realistic-looking address.
+    const BUILDER: Address = Address::repeat_byte(0xb1);
     const BUILDER_A: Address = address!("0x000000000000000000000000000000000000000a");
     const BUILDER_B: Address = address!("0x000000000000000000000000000000000000000b");
     const BUILDER_C: Address = address!("0x000000000000000000000000000000000000000c");
