@@ -2033,6 +2033,7 @@ dependencies = [
  "alloy-genesis",
  "alloy-primitives",
  "alloy-rlp",
+ "rand 0.9.4",
  "rayon",
  "reth-chainspec",
  "reth-consensus",

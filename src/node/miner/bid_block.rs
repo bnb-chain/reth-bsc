@@ -1836,7 +1836,7 @@ mod tests {
         use reth_primitives_traits::SignerRecoverable;
 
         // Seal as the shared test validator, so this matches whatever the global signer holds.
-        let validator = crate::node::miner::signer::ANVIL_DEV_ADDRESS;
+        let validator = crate::node::miner::signer::test_validator_address();
         crate::node::miner::signer::init_test_signer();
 
         let chain_spec = std::sync::Arc::new(preseal_spec());

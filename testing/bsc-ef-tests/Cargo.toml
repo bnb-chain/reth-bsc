@@ -12,6 +12,8 @@ asm-keccak = ["alloy-primitives/asm-keccak"]
 [dependencies]
 # BSC crate
 reth_bsc = { path = "../.." }
+# Used only by the test harness, to generate its validator key instead of embedding one.
+rand = "0.9"
 
 # reth dependencies aligned with root crate branch to avoid duplicate crate versions
 reth-chainspec = { git = "https://github.com/bnb-chain/reth.git", rev = "0241164c682780a1cb6841dc9cbe4e56e8886951" }

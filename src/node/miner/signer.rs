@@ -9,34 +9,45 @@ use secp256k1::{SECP256K1, Message, SecretKey};
 use zeroize::Zeroizing;
 use k256::ecdsa::SigningKey as K256SigningKey;
 
-/// Anvil development account #0's private key, and the address it derives.
+/// A random signing key, generated once per test process.
 ///
-/// This is not a secret: `anvil` prints it on every start and Foundry publishes it, so it controls
-/// nothing on any real network. It is kept fixed rather than randomised for two reasons.
+/// Random rather than a hard-coded development key, so no key literal exists in the tree — but
+/// generated *once* and shared, which is the part that matters: [`init_global_signer`] is
+/// first-wins (`OnceCell::set`) and unit tests share one process, so a per-test key would let
+/// whichever test ran first decide the validator for all of them, and any test asserting a derived
+/// address would pass or fail depending on test order.
 ///
-/// 1. [`init_global_signer`] is first-wins (`OnceCell::set`), and unit tests share one process. If
-///    each test seeded its own random key, whichever test ran first would decide the validator for
-///    all of them, and any test asserting a derived address would fail depending on test order.
-/// 2. Cross-client conformance vectors regenerated from go-bsc are pinned to this key; randomising
-///    them would delete the check, not improve it.
-///
-/// Only ever compiled into test builds.
+/// Tests that need the matching address call [`test_validator_address`] rather than hard-coding one.
+/// Nothing here is pinned to a particular key: the go-bsc conformance vectors in `bid_block` pin a
+/// fixed *signature* and the address it recovers to, which is independent of this.
 #[cfg(test)]
-pub(crate) const ANVIL_DEV_PRIVATE_KEY: B256 =
-    alloy_primitives::b256!("0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
+static TEST_SIGNER_KEY: once_cell::sync::Lazy<B256> = once_cell::sync::Lazy::new(|| {
+    use rand::Rng;
+    // Rejection-sample so the result is always a valid secp256k1 scalar.
+    loop {
+        let candidate: [u8; 32] = rand::rng().random();
+        if SecretKey::from_slice(&candidate).is_ok() {
+            return B256::from(candidate);
+        }
+    }
+});
 
-/// The validator address [`ANVIL_DEV_PRIVATE_KEY`] derives.
-#[cfg(test)]
-pub(crate) const ANVIL_DEV_ADDRESS: alloy_primitives::Address =
-    alloy_primitives::address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
-
-/// Seeds the process-global signer with [`ANVIL_DEV_PRIVATE_KEY`], ignoring `AlreadyInitialized`.
+/// Seeds the process-global signer with [`TEST_SIGNER_KEY`], ignoring `AlreadyInitialized`.
 ///
 /// Every test that needs the global signer must go through this, so all of them agree on the
 /// validator regardless of which test runs first.
 #[cfg(test)]
 pub(crate) fn init_test_signer() {
-    let _ = init_global_signer(ANVIL_DEV_PRIVATE_KEY);
+    let _ = init_global_signer(*TEST_SIGNER_KEY);
+}
+
+/// The validator address [`TEST_SIGNER_KEY`] derives, for tests that must agree with what the
+/// global signer will seal as.
+#[cfg(test)]
+pub(crate) fn test_validator_address() -> alloy_primitives::Address {
+    let sk = K256SigningKey::from_slice(TEST_SIGNER_KEY.as_slice())
+        .expect("TEST_SIGNER_KEY is a valid scalar by construction");
+    crate::node::miner::config::keystore::get_validator_address(&sk)
 }
 
 pub struct MinerSigner {
