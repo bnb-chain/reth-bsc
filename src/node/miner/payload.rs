@@ -8,11 +8,13 @@ use crate::metrics::{BscConsensusMetrics, BscMinerMetrics};
 use crate::node::engine::{BscBuiltPayload, BuildKind};
 use crate::node::evm::config::{BscEvmConfig, BscNextBlockEnvAttributes, ValidatorCacheSink};
 use crate::node::evm::pre_execution::{TURN_LENGTH_CACHE, VALIDATOR_CACHE};
+use crate::node::miner::bid_block::{validate_bid_block_blob_kzg, BidBlockTask};
 use crate::node::miner::bid_simulator::BidSimulator;
+use crate::node::miner::block_mev_info::{set_block_mev_info, BlockMevInfoVersion};
 use crate::node::miner::bsc_miner::{MiningContext, SubmitContext};
 use crate::node::miner::util::finalize_new_header;
 use crate::node::pool::BlacklistedAddressError;
-use crate::node::primitives::BscBlobTransactionSidecar;
+use crate::node::primitives::{BscBlobTransactionSidecar, BscBlock};
 use alloy_consensus::{BlockHeader, Transaction};
 use alloy_eips::eip4895::Withdrawals;
 use alloy_evm::block::BlockExecutor;
@@ -38,7 +40,7 @@ use once_cell::sync::Lazy;
 use revm::context_interface::Block as EvmBlock;
 use reth_primitives_traits::{HeaderTy, SealedHeader};
 use reth_primitives_traits::transaction::error::InvalidTransactionError;
-use reth_primitives_traits::{BlockBody, RecoveredBlock, SignerRecoverable};
+use reth_primitives_traits::{Block, BlockBody, RecoveredBlock, SealedBlock, SignerRecoverable};
 use reth_provider::StateProviderFactory;
 use reth_revm::cached::CachedReads;
 use reth_revm::cancelled::ManualCancel;
@@ -47,7 +49,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 /// Milliseconds reserved at the end of each block period for state-root computation.
 ///
@@ -968,6 +970,7 @@ where
                     block_hash: sealed_block.hash(),
                     tx_index: u64::try_from(index).unwrap_or(u64::MAX),
                     tx_hash: *tx.hash(),
+                    version: 0,
                 };
                 blob_sidecars.push(bsc_blob_tx_sidecar);
             }
@@ -1002,7 +1005,7 @@ where
             executed_block,
             pending_validators,
             pending_turn_length,
-            is_bid: false,
+            bid_builder: None,
         };
         Ok(payload)
     }
@@ -1158,7 +1161,7 @@ where
             executed_block,
             pending_validators,
             pending_turn_length,
-            is_bid: false,
+            bid_builder: None,
         };
         Ok(payload)
     }
@@ -1203,6 +1206,10 @@ where
     result_tx: mpsc::UnboundedSender<SubmitContext>,
     /// Potential payloads vector for selecting the best one
     potential_payloads: Vec<BscBuiltPayload>,
+    /// Best (sealed, unexecuted) BEP-675 BidBlock for this parent, collected from the simulator.
+    /// Competes against `potential_payloads` by fee; if it wins it is broadcast first and verified
+    /// on import (zero-simulate), so it is intentionally kept out of `potential_payloads`.
+    bid_block_candidate: Option<BidBlockTask>,
     /// Current build arguments
     build_args: BscBuildArguments<EthPayloadAttributes>,
     /// Retry count for payload building
@@ -1306,6 +1313,7 @@ where
             is_aborted: false,
             result_tx,
             potential_payloads: Vec::new(),
+            bid_block_candidate: None,
             build_args,
             retries: 0,
             join_handle: tokio::task::JoinSet::new(),
@@ -1863,6 +1871,41 @@ where
         }
     }
 
+    /// Collect the best (sealed, unexecuted) BEP-675 BidBlock for this parent so it can compete by
+    /// fee against the local block and any legacy SendBid in `try_return_best_payload`
+    /// (go-bsc `selectBidBlock`).
+    ///
+    /// Unlike the legacy/local payloads, the BidBlock is **not** pushed into `potential_payloads`:
+    /// under zero-simulate it is never executed before selection, so it has no `BscBuiltPayload`.
+    /// If it wins it is broadcast first and verified on import.
+    fn collect_best_bid_block(&mut self) {
+        let parent_hash = self.mining_ctx.parent_header.hash();
+        match self.simulator.best_bid_block(parent_hash) {
+            Some(task) => {
+                info!(
+                    target: "bsc::miner::payload",
+                    trace_id = self.trace_id,
+                    bid_fees = %task.gas_fee,
+                    bid_hash = %task.bid_hash,
+                    builder = ?task.builder,
+                    "Found best (unexecuted) BidBlock candidate"
+                );
+                self.bid_block_candidate = Some(task);
+            }
+            // Log the miss with the key we looked up. A silent miss is indistinguishable from
+            // "no builder bid at all", which is what made the sample-before-wait bug above cost a
+            // day to find: the builder saw `send success`, the validator logged `BidBlock queued`,
+            // and nothing anywhere reported that the bid was never used.
+            None => debug!(
+                target: "bsc::miner::payload",
+                trace_id = self.trace_id,
+                %parent_hash,
+                parent_number = self.mining_ctx.parent_header.number,
+                "No BidBlock candidate stored for this parent"
+            ),
+        }
+    }
+
     /// Ensure `potential_payloads` has at least one candidate, then drain background build tasks
     /// within the submission deadline to maximise the chance of a better (non-empty / higher-fee)
     /// payload.
@@ -2110,17 +2153,311 @@ where
         Ok(())
     }
 
+    /// Sleep until this slot's submission deadline so that BidBlocks arriving later in the slot
+    /// are still visible when selection runs — go-bsc defers `selectBidBlock` to the end of the
+    /// build window for exactly this reason.
+    ///
+    /// The local path already spends this time: [`Self::submit_payload`] sleeps the same remainder
+    /// before sending. Waiting *before* selection instead of after therefore costs the no-bid case
+    /// nothing — the local payload still goes out at the same instant, because `submit_payload`
+    /// then computes `delay_ms == 0` — while giving a builder the whole slot to bid rather than
+    /// only the instant before this job first sampled the store.
+    ///
+    /// Without it, `collect_best_bid_block` runs at t≈0 of the slot and every bid that arrives
+    /// afterwards is silently ignored despite being admitted by `mev_sendBidBlock` (whose
+    /// `bidMustBefore` deadline is far later). Measured on a local 10-node cluster: the store was
+    /// read 68 ms before the bid for that very block was written, and the validator sealed an
+    /// empty block with the bid sitting unused under the correct key.
+    fn wait_for_submission_deadline(&mut self) -> Result<(), Box<BscPayloadJobError>> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let delay_ms = self.mining_ctx.end_mining_timestamp_ms.saturating_sub(now_ms) as u64;
+        if delay_ms == 0 {
+            return Ok(());
+        }
+
+        let abort_rx = &mut self.abort_rx;
+        let aborted = tokio::task::block_in_place(move || {
+            tokio::runtime::Handle::current().block_on(async move {
+                tokio::select! {
+                    _ = abort_rx => true,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(delay_ms)) => false,
+                }
+            })
+        });
+
+        if aborted {
+            info!(
+                target: "bsc::miner::payload",
+                trace_id = self.trace_id,
+                block_number = self.build_args.config.parent_header.number() + 1,
+                delay_ms,
+                "Abort while waiting for the submission deadline"
+            );
+            self.build_args.cancel.clone().cancel();
+            self.is_aborted = true;
+            return Err(Box::new(BscPayloadJobError::JobAborted));
+        }
+        Ok(())
+    }
+
     /// Try to return the best payload to result channel
     fn try_return_best_payload(&mut self) -> Result<(), Box<BscPayloadJobError>> {
         self.collect_best_bid();
 
+        // Sample "is a replacement simulation still in flight" here, right after the last moment a
+        // finished bid could still have been collected — not down at the metric site. A simulation
+        // that completes after this point is already too late to be used, yet its `simulating_bid`
+        // entry is removed the instant it completes, so a later check would report it as on-time.
+        // On the common path the gap is a few ms and either point would do; the reason to sample
+        // early is `collect_payload_candidates`, which blocks on `join_next` when no candidate has
+        // landed yet — precisely the fat-block-under-load case this metric exists to detect, where
+        // a late check would be biased toward reporting "on time".
+        let replacement_in_flight =
+            self.simulator.is_simulating(self.mining_ctx.parent_header.hash());
+
         self.collect_payload_candidates()?;
 
-        let best_payload = self.pick_best_payload_and_finalize()?;
+        // Hold the slot open before deciding, then sample the BidBlock store. Both must happen
+        // after candidate collection: `collect_payload_candidates` returns immediately when the
+        // local build finished and no background tasks remain (the empty-mempool case), so without
+        // the wait this decision is made at t≈0 and no bid can ever be seen.
+        self.wait_for_submission_deadline()?;
+        self.collect_best_bid_block();
+
+        // BEP-675 zero-simulate selection (go-bsc `selectBidBlock`): if the unexecuted BidBlock's
+        // deposit-derived fee beats every local / legacy-SendBid candidate, commit to it. The block
+        // is broadcast immediately and only then executed + state-root-verified on import — the
+        // validator never re-executes before proposing. A losing BidBlock is simply dropped here.
+        if self.try_submit_winning_bid_block() {
+            return Ok(());
+        }
+
+        let best_payload = self.pick_best_payload_and_finalize(replacement_in_flight)?;
 
         self.submit_payload(best_payload)?;
 
         Ok(())
+    }
+
+    /// Re-assemble the vote attestation and re-seal a winning BidBlock's header at selection time
+    /// (see the call site in [`Self::try_submit_winning_bid_block`] for why). Falls back to the
+    /// block's admission-time seal — never fails the submission — if the snapshot provider is
+    /// unavailable.
+    fn refresh_bid_block_vote_attestation(
+        &self,
+        block: &RecoveredBlock<BscBlock>,
+    ) -> SealedBlock<BscBlock> {
+        let Some(snapshot_provider) = crate::shared::get_snapshot_provider().cloned() else {
+            warn!(
+                target: "bsc::miner::payload",
+                trace_id = self.trace_id,
+                "Snapshot provider unavailable; submitting BidBlock with admission-time vote attestation"
+            );
+            return block.sealed_block().clone();
+        };
+
+        refresh_and_reseal_bid_block(
+            self.parlia.clone(),
+            &self.mining_ctx.parent_snapshot,
+            self.mining_ctx.parent_header.header(),
+            &snapshot_provider,
+            block,
+            self.trace_id,
+        )
+    }
+
+    /// If a collected BidBlock candidate out-bids every local/legacy payload by fee, hand its sealed
+    /// block to the block-import service for broadcast-then-verify and return `true` (the local work
+    /// is then discarded, matching go-bsc's `commitWork` early-return after `enqueueBidBlockTask`).
+    ///
+    /// Returns `false` when there is no candidate, it does not win, or the import sender is missing —
+    /// in which case the caller falls back to submitting the best local payload.
+    fn try_submit_winning_bid_block(&mut self) -> bool {
+        let Some(bid) = self.bid_block_candidate.take() else { return false };
+
+        let best_local_fee =
+            self.potential_payloads.iter().map(|p| p.fees()).max().unwrap_or(U256::ZERO);
+        if bid.gas_fee <= best_local_fee {
+            info!(
+                target: "bsc::miner::payload",
+                trace_id = self.trace_id,
+                bid_hash = %bid.bid_hash,
+                bid_fees = %bid.gas_fee,
+                best_local_fee = %best_local_fee,
+                "BidBlock did not out-bid local candidates; discarding"
+            );
+            return false;
+        }
+
+        // Refresh the vote attestation with the freshest votes available now that this BidBlock
+        // has won selection, and re-seal — go-bsc defers `assembleVoteAttestation` + the ECDSA
+        // seal to `engine.Seal()`, called only after `selectBidBlock` picks the winner, to
+        // maximize the window for BFT votes to arrive. This BidBlock's own attestation was
+        // assembled at admission time (`simulate_bid_block`, potentially a full slot earlier);
+        // without this refresh it would carry stale votes while the local-block path (via
+        // `finalize_payload`, called at this same selection point) does not.
+        let sealed = self.refresh_bid_block_vote_attestation(&bid.block);
+        let block_number = sealed.header().number();
+        let block_hash = sealed.hash();
+        let parent_hash = sealed.header().parent_hash;
+
+        // Late canonical-state re-check, mirroring the guards `ResultWorkWorker::submit_payload`
+        // applies to the local/legacy path: a reorg during the build window can leave this
+        // BidBlock's parent no longer canonical, or a competing block already at/above this
+        // height. Catching that here — before broadcast — is strictly better than only finding
+        // out via a failed `engine.new_payload` after the block has already been announced to
+        // peers and the builder punished for a staleness issue that wasn't its fault.
+        if let Some(best_block_number) = crate::shared::get_best_canonical_block_number() {
+            if block_number <= best_block_number {
+                debug!(
+                    target: "bsc::miner::payload",
+                    trace_id = self.trace_id,
+                    bid_hash = %bid.bid_hash,
+                    block_number,
+                    best_block_number,
+                    "BidBlock stale: block number not greater than best block number; discarding"
+                );
+                return false;
+            }
+        }
+
+        let parent_number = block_number.saturating_sub(1);
+        match crate::shared::get_canonical_header_by_number_from_provider(parent_number) {
+            Some(canonical_parent) if canonical_parent.hash_slow() == parent_hash => {}
+            Some(canonical_parent) => {
+                debug!(
+                    target: "bsc::miner::payload",
+                    trace_id = self.trace_id,
+                    bid_hash = %bid.bid_hash,
+                    block_number,
+                    parent_number,
+                    expected_parent_hash = %parent_hash,
+                    canonical_parent_hash = %canonical_parent.hash_slow(),
+                    "BidBlock's parent no longer canonical (reorg occurred); discarding"
+                );
+                return false;
+            }
+            None => {
+                debug!(
+                    target: "bsc::miner::payload",
+                    trace_id = self.trace_id,
+                    bid_hash = %bid.bid_hash,
+                    block_number,
+                    parent_number,
+                    "BidBlock's parent not found in canonical chain; discarding"
+                );
+                return false;
+            }
+        }
+
+        // Expensive blob KZG verification on the winning block, BEFORE broadcast (go-bsc
+        // `prepareBidBlockTask` → `validateBidBlockBlobTxs`). Cheap structural sidecar checks already
+        // ran at admission; under zero-simulate full re-execution is deferred to after broadcast, so
+        // this is the last gate that can stop a bad-blob block from being proposed. On failure revoke
+        // the builder and fall back to the local payload (go-bsc `bidBlockFallback`).
+        let body = sealed.body();
+        let blob_sidecars = body.sidecars.as_deref().unwrap_or(&[]);
+        if let Err(e) =
+            validate_bid_block_blob_kzg(&body.inner.transactions, blob_sidecars, bid.system_tx_start)
+        {
+            warn!(
+                target: "bsc::miner::payload",
+                trace_id = self.trace_id,
+                bid_hash = %bid.bid_hash,
+                builder = ?bid.builder,
+                error = %e,
+                "BidBlock blob KZG validation failed; revoking builder and falling back to local payload"
+            );
+            crate::shared::get_bid_block_permission_manager().revoke(
+                bid.builder,
+                format!("BidBlock blob KZG invalid: {e}"),
+                bid.bid_hash,
+                block_number,
+            );
+            return false;
+        }
+
+        let Some(sender) = crate::shared::get_bid_block_import_sender() else {
+            warn!(
+                target: "bsc::miner::payload",
+                trace_id = self.trace_id,
+                bid_hash = %bid.bid_hash,
+                "BidBlock won but import sender is not initialised; falling back to local payload"
+            );
+            return false;
+        };
+
+        // Double-sign guard shared with the local/legacy path (`ResultWorkWorker::submit_payload`
+        // in bsc_miner.rs, via `crate::shared::check_and_record_mined_block`): the validator must
+        // not sign a BidBlock at the same height on the same parent as a block it already sealed,
+        // whether that prior block came from the local path or another BidBlock. This must be the
+        // last check before the point of no return (the send below) — every earlier `return false`
+        // in this function falls back to submitting the local payload for this same
+        // (block_number, parent_hash), which must remain free to record and claim it.
+        if !crate::shared::check_and_record_mined_block(block_number, parent_hash) {
+            error!(
+                target: "bsc::miner::payload",
+                trace_id = self.trace_id,
+                bid_hash = %bid.bid_hash,
+                block_number,
+                parent_hash = %parent_hash,
+                "Reject Double Sign!! BidBlock at height already sealed on this parent; discarding"
+            );
+            return false;
+        }
+
+        // go-bsc's `Parlia.Seal` waits until the header's timestamp (`delayForRamanujanFork`)
+        // before releasing the sealed block, so a bid-won block is never announced before its
+        // own time — otherwise the wall-clock future bound peers (and our own import) enforce
+        // on the sync path would reject it. Mirror that timing with a delayed background send,
+        // the same pattern `submit_payload` uses for the local path.
+        let delay = bid_block_broadcast_delay(sealed.header(), now_unix_ms());
+
+        let trace_id = self.trace_id;
+        let (builder_addr, bid_hash, gas_fee, system_tx_start) =
+            (bid.builder, bid.bid_hash, bid.gas_fee, bid.system_tx_start);
+        tokio::spawn(async move {
+            if let Err(e) = send_bid_block_after_delay(
+                sender,
+                (sealed, builder_addr, bid_hash, gas_fee, system_tx_start),
+                delay,
+            )
+            .await
+            {
+                // The slot was never actually broadcast — release it so a later legitimate
+                // block at this height is not wrongly rejected as a double sign.
+                crate::shared::forget_recorded_mined_block(block_number, parent_hash);
+                warn!(
+                    target: "bsc::miner::payload",
+                    trace_id,
+                    bid_hash = %bid_hash,
+                    error = %e,
+                    "Failed to hand BidBlock to import service"
+                );
+                return;
+            }
+
+            use crate::metrics::BscMevMetrics;
+            use once_cell::sync::Lazy;
+            static MEV_METRICS: Lazy<BscMevMetrics> = Lazy::new(BscMevMetrics::default);
+            MEV_METRICS.bid_win_total.increment(1);
+
+            info!(
+                target: "bsc::miner::payload",
+                trace_id,
+                block_number,
+                block_hash = %block_hash,
+                bid_hash = %bid_hash,
+                builder = ?builder_addr,
+                bid_fees = %gas_fee,
+                best_local_fee = %best_local_fee,
+                "[BID BLOCK selected] broadcasting before verification (zero-simulate)"
+            );
+        });
+        true
     }
 
     /// Send `payload` to the result channel, respecting the submission deadline.
@@ -2197,8 +2534,11 @@ where
     ///
     /// Selection is by fees only; finalization (difficulty, vote attestation, ECDSA seal,
     /// cache updates) is delegated to [`finalize_payload`].
+    /// `replacement_in_flight` is sampled by the caller at bid-collection time — see the comment at
+    /// that sample point for why it cannot be read here instead.
     fn pick_best_payload_and_finalize(
         &mut self,
+        replacement_in_flight: bool,
     ) -> Result<BscBuiltPayload, Box<BscPayloadJobError>> {
         let total_job_duration = self.job_start_time.elapsed();
         let try_mine_block_number = self.build_args.config.parent_header.number() + 1;
@@ -2263,11 +2603,41 @@ where
             Box::new(BscPayloadJobError::PayloadBuildingError(e.to_string()))
         })?;
 
-        if best_payload.is_bid {
+        {
             use crate::metrics::BscMevMetrics;
             use once_cell::sync::Lazy;
             static MEV_METRICS: Lazy<BscMevMetrics> = Lazy::new(BscMevMetrics::default);
-            MEV_METRICS.bid_win_total.increment(1);
+            if best_payload.bid_builder.is_some() {
+                MEV_METRICS.bid_win_total.increment(1);
+            } else {
+                // Simulations were preempted for bids that then failed to win the block: the
+                // interrupts killed work and bought nothing, and we sealed a local payload instead.
+                // Against `bid_interrupt_total` this is the thrash ratio that a tightened
+                // `no_interrupt_left_over` window has to be judged on — a preempted simulation
+                // records no metric of its own (aborted runs return before
+                // `bid_simulation_duration_seconds` is recorded), so this is the only place the
+                // cost surfaces.
+                //
+                // Weighted by how many simulations were preempted, not one per block: the failure
+                // mode under test is a cascade (bid → interrupt → bid → interrupt → nothing
+                // finishes), and counting that once would flatten a six-deep cascade to look like a
+                // single unlucky coin-flip. Keeping the same unit as `bid_interrupt_total` also
+                // makes the ratio a true proportion rather than blocks-per-interrupt.
+                let parent_hash = self.mining_ctx.parent_header.hash();
+                let wasted = self.simulator.take_interrupt_count(parent_hash);
+                if wasted > 0 {
+                    MEV_METRICS.bid_interrupt_wasted_total.increment(wasted);
+
+                    // Split out the cause. A replacement still in flight when the bid was needed is
+                    // the one outcome that actually indicts the window: it was preempted with
+                    // "enough" time left by `can_be_interrupted`'s arithmetic, and that arithmetic
+                    // was wrong. Waste where the replacement *did* finish but lost on merit or was
+                    // rejected would have happened under the old 500ms window too.
+                    if replacement_in_flight {
+                        MEV_METRICS.bid_interrupt_late_total.increment(wasted);
+                    }
+                }
+            }
         }
 
         info!(
@@ -2276,7 +2646,7 @@ where
             block_number = best_payload.block().header().number(),
             block_hash = %best_payload.block().hash(),
             is_inturn = self.mining_ctx.is_inturn,
-            is_bid = best_payload.is_bid,
+            is_bid = best_payload.bid_builder.is_some(),
             tx_count = best_payload.block().body().transaction_count(),
             fees = %best_payload.fees(),
             exec_duration_ms = best_payload.exec_duration.as_millis(),
@@ -2292,6 +2662,88 @@ where
 
         Ok(best_payload)
     }
+}
+
+/// Core of [`BscPayloadJob::refresh_bid_block_vote_attestation`], split out as a free function so
+/// it's testable without constructing a full payload job.
+///
+/// Refreshes `block`'s vote attestation and re-seals via
+/// [`crate::node::miner::util::refresh_vote_attestation_and_seal`]; on any internal failure that
+/// function restores the original attestation/seal and returns `Ok(())`, so the only externally
+/// observable outcomes are "refreshed" or "unchanged" — never a broken block. When the header
+/// hash changes (any successful re-seal changes it, since the seal is part of `extra_data`, which
+/// is part of the header hash), patches the blob sidecars' cached `block_hash` (set at admission
+/// time) before the block goes out over P2P, mirroring `finalize_payload`'s equivalent patch for
+/// the local-block path.
+/// Milliseconds since the unix epoch, for comparison against a header's millisecond timestamp.
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// How long to hold a won BidBlock before releasing it, so it is never announced before its own
+/// header timestamp.
+///
+/// go-bsc's `Parlia.Seal` waits out `delayForRamanujanFork` for exactly this reason: a block
+/// announced early trips the wall-clock future bound that peers — and our own import path —
+/// enforce, so an early broadcast gets the block rejected rather than propagated. Zero once the
+/// timestamp has passed, which is the common case for a block sealed at the end of its slot.
+fn bid_block_broadcast_delay(header: &alloy_consensus::Header, now_ms: u64) -> std::time::Duration {
+    let target_ms = crate::consensus::parlia::util::calculate_millisecond_timestamp(header);
+    std::time::Duration::from_millis(target_ms.saturating_sub(now_ms))
+}
+
+/// Waits out `delay`, then hands the BidBlock to the import service, which is where broadcast
+/// actually begins.
+///
+/// Split out from `try_submit_winning_bid_block` so the "not before its timestamp" invariant can be
+/// tested against a channel instead of a P2P capture: the `send` below *is* the start of broadcast,
+/// so a test that observes when the receiver sees the block observes the real timing.
+async fn send_bid_block_after_delay<T>(
+    sender: &tokio::sync::mpsc::UnboundedSender<T>,
+    block: T,
+    delay: std::time::Duration,
+) -> Result<(), tokio::sync::mpsc::error::SendError<T>> {
+    if !delay.is_zero() {
+        tokio::time::sleep(delay).await;
+    }
+    sender.send(block)
+}
+
+fn refresh_and_reseal_bid_block(
+    parlia: Arc<Parlia<BscChainSpec>>,
+    parent_snapshot: &Snapshot,
+    parent_header: &alloy_consensus::Header,
+    snapshot_provider: &Arc<dyn crate::consensus::parlia::SnapshotProvider + Send + Sync>,
+    block: &RecoveredBlock<BscBlock>,
+    trace_id: u64,
+) -> SealedBlock<BscBlock> {
+    let mut plain_block = block.clone_block();
+    if let Err(e) = crate::node::miner::util::refresh_vote_attestation_and_seal(
+        parlia,
+        parent_snapshot,
+        parent_header,
+        &mut plain_block.header,
+        snapshot_provider,
+    ) {
+        warn!(
+            target: "bsc::miner::payload",
+            trace_id,
+            error = %e,
+            "Failed to refresh BidBlock vote attestation; submitting with admission-time attestation"
+        );
+        return block.sealed_block().clone();
+    }
+
+    let final_hash = plain_block.header.hash_slow();
+    if let Some(ref mut sidecars) = plain_block.body.sidecars {
+        for sidecar in sidecars.iter_mut() {
+            sidecar.block_hash = final_hash;
+        }
+    }
+    plain_block.seal_unchecked(final_hash)
 }
 
 /// Finalize a built payload in-place.
@@ -2323,6 +2775,26 @@ fn finalize_payload(
     let senders = payload.executed_block.recovered_block.senders().to_vec();
     let mut existing_sidecars = payload.block.clone_block().body.sidecars;
     let mut plain_block = payload.executed_block.recovered_block.sealed_block().clone_block();
+
+    // Tag legacy `SendBid` winners with their builder (go-bsc `setBidMevInfo`, the Bid case).
+    // Must run before `finalize_new_header()`, which ECDSA-seals the header: a tag written after
+    // the seal would not be covered by it. Local builds leave `requests_hash` empty, which is what
+    // lets consumers read "untagged" as "locally built" — see `block_mev_info`.
+    //
+    // The BEP-675 BidBlock path tags its own header in `simulate_bid_block()` instead, because
+    // those blocks never become a `BscBuiltPayload` and so never reach this function.
+    if let Some(builder) = payload.bid_builder {
+        let prague_active = parlia.chain_spec().is_prague_active_at_block_and_timestamp(
+            plain_block.header.number,
+            plain_block.header.timestamp,
+        );
+        set_block_mev_info(
+            &mut plain_block.header,
+            BlockMevInfoVersion::Bid,
+            builder,
+            prague_active,
+        );
+    }
 
     finalize_new_header(
         parlia,
@@ -2376,13 +2848,15 @@ fn finalize_payload(
 #[cfg(test)]
 mod tests {
     use super::{
-        initial_out_of_turn_build_wait, local_rebuild_action, validate_bsc_sidecar,
+        bid_block_broadcast_delay, initial_out_of_turn_build_wait, local_rebuild_action,
+        refresh_and_reseal_bid_block, send_bid_block_after_delay, validate_bsc_sidecar,
         LocalRebuildAction, LocalRebuildPolicyInput,
     };
     use crate::chainspec::BscChainSpec;
     use crate::consensus::parlia::Parlia;
     use crate::consensus::parlia::Snapshot;
     use crate::node::miner::bsc_miner::MiningContext;
+    use crate::node::primitives::BscBlock;
     use alloy_consensus::BlobTransactionSidecar;
     use alloy_consensus::Header;
     use alloy_eips::eip4844::{Blob, Bytes48};
@@ -2391,9 +2865,97 @@ mod tests {
     };
     use alloy_primitives::{Address, B256, U256};
     use reth::transaction_pool::error::Eip4844PoolTransactionError;
-    use reth_primitives_traits::SealedHeader;
+    use reth_primitives_traits::{RecoveredBlock, SealedHeader};
     use std::sync::Arc;
     use std::time::Duration;
+
+    /// A won BidBlock must not be released before its own header timestamp.
+    ///
+    /// The delay is derived from the header, so this pins the arithmetic against a real header
+    /// rather than re-deriving it. `calculate_millisecond_timestamp` is `timestamp * 1000` plus the
+    /// millisecond part packed into the last 8 bytes of `mix_hash`, and that sub-second part
+    /// matters: BSC slots are shorter than a second, so truncating it would under-delay by up to
+    /// 999ms.
+    #[test]
+    fn bid_block_broadcast_delay_waits_out_the_header_timestamp() {
+        let header_at = |secs: u64, millis: u64| {
+            let mut h = Header { timestamp: secs, ..Default::default() };
+            crate::consensus::parlia::util::set_millisecond_part_of_timestamp(millis, &mut h);
+            h
+        };
+
+        // Header 750ms in the future -> wait exactly that long.
+        let h = header_at(1_000, 250);
+        assert_eq!(
+            bid_block_broadcast_delay(&h, 1_000_000 - 750 + 250),
+            Duration::from_millis(750)
+        );
+
+        // The millisecond part is honoured, not truncated to the second.
+        assert_eq!(bid_block_broadcast_delay(&h, 1_000_000), Duration::from_millis(250));
+
+        // Already due, and already past: no delay, and no panic on the underflow.
+        assert!(bid_block_broadcast_delay(&h, 1_000_250).is_zero());
+        assert!(bid_block_broadcast_delay(&h, 1_000_251).is_zero());
+        assert!(bid_block_broadcast_delay(&h, u64::MAX).is_zero());
+    }
+
+    /// The delay must actually withhold the block, not merely be computed.
+    ///
+    /// `send_bid_block_after_delay`'s send is where broadcast begins — the import service takes it
+    /// from there — so observing when the receiver sees the block observes the real broadcast
+    /// timing, without a P2P capture. Time is paused, so this asserts ordering deterministically
+    /// instead of racing a wall clock.
+    #[tokio::test(start_paused = true)]
+    async fn bid_block_send_is_withheld_until_the_delay_elapses() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+        let delay = Duration::from_millis(600);
+
+        let task = tokio::spawn(async move { send_bid_block_after_delay(&tx, 7u64, delay).await });
+
+        // One millisecond short of due: still withheld.
+        tokio::time::advance(Duration::from_millis(599)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "BidBlock was released before its timestamp; peers would reject it as future-dated"
+        );
+
+        // Past due: released.
+        tokio::time::advance(Duration::from_millis(2)).await;
+        task.await.expect("send task panicked").expect("receiver is still alive");
+        assert_eq!(rx.try_recv().expect("BidBlock must be released once due"), 7);
+    }
+
+    /// A block already past its timestamp — the common case, sealed at the end of its slot — must go
+    /// out without waiting.
+    #[tokio::test(start_paused = true)]
+    async fn bid_block_send_is_immediate_when_already_due() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+
+        send_bid_block_after_delay(&tx, 9u64, Duration::ZERO)
+            .await
+            .expect("receiver is still alive");
+
+        assert_eq!(
+            rx.try_recv().expect("a due BidBlock must not be delayed"),
+            9,
+            "zero delay must not defer the send"
+        );
+    }
+
+    /// A closed receiver must surface as an error, because the caller uses it to release the
+    /// double-sign slot: the block was never broadcast, so a later block at this height must remain
+    /// free to claim it.
+    #[tokio::test(start_paused = true)]
+    async fn bid_block_send_reports_a_closed_receiver() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+        drop(rx);
+
+        let err = send_bid_block_after_delay(&tx, 1u64, Duration::from_millis(50))
+            .await
+            .expect_err("a closed receiver must be reported so the slot can be released");
+        assert_eq!(err.0, 1, "the undelivered block is returned to the caller");
+    }
 
     fn test_parlia() -> Parlia<BscChainSpec> {
         let chain_spec = Arc::new(BscChainSpec { inner: crate::chainspec::bsc::bsc_mainnet() });
@@ -2704,5 +3266,141 @@ mod tests {
         );
 
         assert_eq!(rebuilds, 0);
+    }
+
+    // ---- refresh_and_reseal_bid_block (BEP-675 vote-attestation-at-selection fix) ----
+
+    struct MockBidBlockSnapshotProvider {
+        snapshot: Snapshot,
+    }
+
+    impl crate::consensus::parlia::provider::SnapshotProvider for MockBidBlockSnapshotProvider {
+        fn snapshot_by_hash(&self, _block_hash: &B256) -> Option<Snapshot> {
+            Some(self.snapshot.clone())
+        }
+        fn insert(&self, _snapshot: Snapshot) {}
+    }
+
+    fn ensure_bid_block_test_signer() {
+        crate::node::miner::signer::init_test_signer();
+    }
+
+    fn luban_chain_spec() -> Arc<BscChainSpec> {
+        Arc::new(BscChainSpec::from(
+            reth_chainspec::ChainSpecBuilder::mainnet()
+                .with_fork(crate::hardforks::bsc::BscHardfork::Luban, reth_chainspec::ForkCondition::Block(0))
+                .build(),
+        ))
+    }
+
+    /// A non-epoch header (block 1, so `assemble_vote_attestation` skips — it only assembles from
+    /// block 3 onward) carrying a fake attestation in `extra_data`: Vanity (32) + Attestation (RLP)
+    /// + Seal (65). This exercises the pure strip-and-reseal path without needing a vote pool.
+    fn header_with_fake_attestation() -> Header {
+        use crate::consensus::parlia::vote::{VoteAttestation, VoteData};
+        let att = VoteAttestation {
+            vote_address_set: 0xFF,
+            agg_signature: Default::default(),
+            data: VoteData { source_number: 1, source_hash: B256::ZERO, target_number: 0, target_hash: B256::ZERO },
+            extra: bytes::Bytes::new(),
+        };
+        let mut extra = vec![0u8; crate::consensus::parlia::EXTRA_VANITY_LEN];
+        extra.extend_from_slice(alloy_rlp::encode(&att).as_ref());
+        extra.extend_from_slice(&[0u8; crate::consensus::parlia::EXTRA_SEAL_LEN]);
+        Header { number: 1, extra_data: alloy_primitives::Bytes::from(extra), ..Default::default() }
+    }
+
+    fn bid_block_with_sidecar(header: Header, sidecar_block_hash: B256) -> RecoveredBlock<BscBlock> {
+        let body = crate::node::primitives::BscBlockBody {
+            inner: reth_ethereum_primitives::BlockBody {
+                transactions: Vec::new(),
+                ommers: Vec::new(),
+                withdrawals: None,
+            },
+            sidecars: Some(vec![crate::node::primitives::BscBlobTransactionSidecar {
+                inner: BlobTransactionSidecar {
+                    blobs: Vec::new(),
+                    commitments: Vec::new(),
+                    proofs: Vec::new(),
+                },
+                block_number: header.number,
+                block_hash: sidecar_block_hash,
+                tx_index: 0,
+                tx_hash: B256::ZERO,
+                version: 0,
+            }]),
+        };
+        RecoveredBlock::new_unhashed(BscBlock { header, body }, Vec::new())
+    }
+
+    #[test]
+    fn refresh_and_reseal_strips_stale_attestation_and_patches_sidecar_hash() {
+        ensure_bid_block_test_signer();
+        let chain_spec = luban_chain_spec();
+        let parlia = Arc::new(Parlia::new(chain_spec, 200));
+        let parent_snap = Snapshot::new(vec![Address::with_last_byte(1)], 0, B256::random(), 200, None);
+        let parent_header = Header { number: 0, parent_hash: B256::random(), ..Default::default() };
+
+        let header = header_with_fake_attestation();
+        let original_hash = header.hash_slow();
+        let block = bid_block_with_sidecar(header, original_hash);
+
+        let snapshot_provider: Arc<dyn crate::consensus::parlia::SnapshotProvider + Send + Sync> =
+            Arc::new(MockBidBlockSnapshotProvider { snapshot: parent_snap.clone() });
+
+        let refreshed = refresh_and_reseal_bid_block(
+            parlia,
+            &parent_snap,
+            &parent_header,
+            &snapshot_provider,
+            &block,
+            0,
+        );
+
+        // The stale attestation was stripped (block 1 is below the vote-assembly floor of 3, so
+        // no new attestation replaces it) and the header re-sealed — vanity + seal only, and a
+        // different hash than the admission-time seal.
+        assert_eq!(
+            refreshed.header().extra_data.len(),
+            crate::consensus::parlia::EXTRA_VANITY_LEN + crate::consensus::parlia::EXTRA_SEAL_LEN
+        );
+        assert_ne!(refreshed.hash(), original_hash);
+
+        // The sidecar's cached block_hash (set at admission time, before this refresh) must be
+        // patched to the new post-reseal hash before the block goes out over P2P.
+        let sidecar = refreshed.body().sidecars.as_ref().unwrap().first().unwrap();
+        assert_eq!(sidecar.block_hash, refreshed.hash());
+    }
+
+    #[test]
+    fn refresh_and_reseal_is_a_noop_pre_luban() {
+        ensure_bid_block_test_signer();
+        // Mainnet spec without the Luban fork override: inactive at block 1.
+        let chain_spec = Arc::new(BscChainSpec::from(reth_chainspec::ChainSpecBuilder::mainnet().build()));
+        let parlia = Arc::new(Parlia::new(chain_spec, 200));
+        let parent_snap = Snapshot::new(vec![Address::with_last_byte(1)], 0, B256::random(), 200, None);
+        let parent_header = Header { number: 0, parent_hash: B256::random(), ..Default::default() };
+
+        let header = header_with_fake_attestation();
+        let original_hash = header.hash_slow();
+        let block = bid_block_with_sidecar(header, original_hash);
+
+        let snapshot_provider: Arc<dyn crate::consensus::parlia::SnapshotProvider + Send + Sync> =
+            Arc::new(MockBidBlockSnapshotProvider { snapshot: parent_snap.clone() });
+
+        let refreshed = refresh_and_reseal_bid_block(
+            parlia,
+            &parent_snap,
+            &parent_header,
+            &snapshot_provider,
+            &block,
+            0,
+        );
+
+        // Pre-Luban, refresh_vote_attestation_and_seal returns early without touching the header
+        // at all — the block (and its sidecar's block_hash) must come back byte-for-byte unchanged.
+        assert_eq!(refreshed.hash(), original_hash);
+        let sidecar = refreshed.body().sidecars.as_ref().unwrap().first().unwrap();
+        assert_eq!(sidecar.block_hash, original_hash);
     }
 }

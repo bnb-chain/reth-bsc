@@ -12,32 +12,34 @@ asm-keccak = ["alloy-primitives/asm-keccak"]
 [dependencies]
 # BSC crate
 reth_bsc = { path = "../.." }
+# Used only by the test harness, to generate its validator key instead of embedding one.
+rand = "0.9"
 
 # reth dependencies aligned with root crate branch to avoid duplicate crate versions
-reth-chainspec = { git = "https://github.com/bnb-chain/reth.git", rev = "c13b098660e0a65bd9aac8171eb917c04ed2297f" }
-reth-consensus = { git = "https://github.com/bnb-chain/reth.git", rev = "c13b098660e0a65bd9aac8171eb917c04ed2297f" }
-reth-ethereum-forks = { git = "https://github.com/bnb-chain/reth.git", rev = "c13b098660e0a65bd9aac8171eb917c04ed2297f" }
-reth-db = { git = "https://github.com/bnb-chain/reth.git", rev = "c13b098660e0a65bd9aac8171eb917c04ed2297f", features = [
+reth-chainspec = { git = "https://github.com/bnb-chain/reth.git", rev = "0241164c682780a1cb6841dc9cbe4e56e8886951" }
+reth-consensus = { git = "https://github.com/bnb-chain/reth.git", rev = "0241164c682780a1cb6841dc9cbe4e56e8886951" }
+reth-ethereum-forks = { git = "https://github.com/bnb-chain/reth.git", rev = "0241164c682780a1cb6841dc9cbe4e56e8886951" }
+reth-db = { git = "https://github.com/bnb-chain/reth.git", rev = "0241164c682780a1cb6841dc9cbe4e56e8886951", features = [
     "mdbx",
     "test-utils",
     "disable-lock",
 ] }
-reth-db-api = { git = "https://github.com/bnb-chain/reth.git", rev = "c13b098660e0a65bd9aac8171eb917c04ed2297f" }
-reth-db-common = { git = "https://github.com/bnb-chain/reth.git", rev = "c13b098660e0a65bd9aac8171eb917c04ed2297f" }
-reth-ethereum-consensus = { git = "https://github.com/bnb-chain/reth.git", rev = "c13b098660e0a65bd9aac8171eb917c04ed2297f" }
-reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth.git", rev = "c13b098660e0a65bd9aac8171eb917c04ed2297f" }
-reth-evm = { git = "https://github.com/bnb-chain/reth.git", rev = "c13b098660e0a65bd9aac8171eb917c04ed2297f" }
-reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth.git", rev = "c13b098660e0a65bd9aac8171eb917c04ed2297f" }
+reth-db-api = { git = "https://github.com/bnb-chain/reth.git", rev = "0241164c682780a1cb6841dc9cbe4e56e8886951" }
+reth-db-common = { git = "https://github.com/bnb-chain/reth.git", rev = "0241164c682780a1cb6841dc9cbe4e56e8886951" }
+reth-ethereum-consensus = { git = "https://github.com/bnb-chain/reth.git", rev = "0241164c682780a1cb6841dc9cbe4e56e8886951" }
+reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth.git", rev = "0241164c682780a1cb6841dc9cbe4e56e8886951" }
+reth-evm = { git = "https://github.com/bnb-chain/reth.git", rev = "0241164c682780a1cb6841dc9cbe4e56e8886951" }
+reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth.git", rev = "0241164c682780a1cb6841dc9cbe4e56e8886951" }
 reth-primitives-traits = { git = "https://github.com/bnb-chain/reth-core.git", branch = "v0.3.1-v2", default-features = false }
-reth-provider = { git = "https://github.com/bnb-chain/reth.git", rev = "c13b098660e0a65bd9aac8171eb917c04ed2297f", features = [
+reth-provider = { git = "https://github.com/bnb-chain/reth.git", rev = "0241164c682780a1cb6841dc9cbe4e56e8886951", features = [
     "test-utils",
 ] }
-reth-revm = { git = "https://github.com/bnb-chain/reth.git", rev = "c13b098660e0a65bd9aac8171eb917c04ed2297f", features = [
+reth-revm = { git = "https://github.com/bnb-chain/reth.git", rev = "0241164c682780a1cb6841dc9cbe4e56e8886951", features = [
     "std",
 ] }
-reth-tracing = { git = "https://github.com/bnb-chain/reth.git", rev = "c13b098660e0a65bd9aac8171eb917c04ed2297f" }
-reth-trie = { git = "https://github.com/bnb-chain/reth.git", rev = "c13b098660e0a65bd9aac8171eb917c04ed2297f" }
-reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", rev = "c13b098660e0a65bd9aac8171eb917c04ed2297f" }
+reth-tracing = { git = "https://github.com/bnb-chain/reth.git", rev = "0241164c682780a1cb6841dc9cbe4e56e8886951" }
+reth-trie = { git = "https://github.com/bnb-chain/reth.git", rev = "0241164c682780a1cb6841dc9cbe4e56e8886951" }
+reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", rev = "0241164c682780a1cb6841dc9cbe4e56e8886951" }
 
 # revm
 revm = { version = "38.0.0", features = [

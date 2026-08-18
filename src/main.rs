@@ -47,6 +47,12 @@ pub struct BscCliArgs {
     #[arg(long = "mining.use-sparse-trie-state-root")]
     pub mining_use_sparse_trie_state_root: bool,
 
+    /// Accept BEP-675 builder-proposed blocks via `mev_sendBidBlock`.
+    ///
+    /// Env alternative: `BSC_MINING_BID_BLOCK_ENABLED=true`.
+    #[arg(long = "mining.bid-block-enabled")]
+    pub mining_bid_block_enabled: bool,
+
     /// Private key for mining (hex format, for testing only)
     /// The validator address will be automatically derived from this key
     #[arg(long = "mining.private-key")]
@@ -275,6 +281,11 @@ fn main() -> eyre::Result<()> {
                     mining_config.use_sparse_trie_state_root = true;
                 }
 
+                // CLI takes precedence over env BSC_MINING_BID_BLOCK_ENABLED.
+                if args.mining_bid_block_enabled {
+                    mining_config.bid_block_enabled = true;
+                }
+
                 // Ensure keys are available if enabled but none provided
                 mining_config = mining_config.ensure_keys_available();
 
@@ -419,6 +430,17 @@ fn main() -> eyre::Result<()> {
             let NodeHandle { node, node_exit_future: exit_future } =
                 builder.node(node)
                     .extend_rpc_modules(move |ctx| {
+                        // Every BSC namespace below is registered with `merge_if_module_configured`
+                        // rather than `merge_configured`: the latter merges into every configured
+                        // transport regardless of `--http.api`/`--ws.api`, so operator namespace
+                        // selection was silently ignored for the BSC-specific APIs. That left
+                        // `admin_setBidBlockPermission`, `miner_stop`, `miner_setGasLimit`,
+                        // `miner_setEtherbase` and `mev_addBuilder`/`removeBuilder` callable
+                        // unauthenticated on any node with HTTP enabled, even when the operator had
+                        // excluded those namespaces — geth honours the equivalent `HTTPModules`
+                        // setting, so this was also a parity gap.
+                        use reth_rpc_server_types::RethRpcModule;
+
                         tracing::info!("Start to register Parlia RPC API...");
                         use reth_bsc::rpc::parlia::{ParliaApiImpl, ParliaApiServer, DynSnapshotProvider};
                         
@@ -431,6 +453,14 @@ fn main() -> eyre::Result<()> {
                         
                         let wrapped_provider = Arc::new(DynSnapshotProvider::new(snapshot_provider));
                         let parlia_api = ParliaApiImpl::new(wrapped_provider, ctx.provider().clone());
+                        // `parlia` stays unconditional: reth's CLI rejects module names outside its
+                        // known set ("Invalid RPC module 'parlia' in http.api"), so gating it on
+                        // `RethRpcModule::Other("parlia")` would make the namespace unreachable —
+                        // an operator has no way to ask for it back. That is acceptable here and
+                        // only here, because every `parlia_*` method is read-only (snapshot,
+                        // validator and justified/finalized queries, plus two calldata encoders);
+                        // none mutates node state. The namespaces that do — admin, miner, mev —
+                        // are gated below.
                         ctx.modules.merge_configured(parlia_api.into_rpc())?;
                         tracing::info!("Succeed to register Parlia RPC API");
 
@@ -448,7 +478,7 @@ fn main() -> eyre::Result<()> {
                         // Get chain spec from context
                         let chain_spec = std::sync::Arc::new(ctx.config().chain.clone().as_ref().clone());
                         let mev_api = MevApiImpl::new(snapshot_provider, chain_spec);
-                        ctx.modules.merge_configured(mev_api.into_rpc())?;
+                        ctx.modules.merge_if_module_configured(RethRpcModule::Mev, mev_api.into_rpc())?;
                         tracing::info!("Succeed to register MEV RPC API");
 
                         tracing::info!("Start to register Miner RPC API...");
@@ -460,7 +490,7 @@ fn main() -> eyre::Result<()> {
                         ctx.modules.remove_method_from_configured("miner_setGasPrice");
                         ctx.modules.remove_method_from_configured("miner_setGasLimit");
                         let miner_api = BscMinerApiImpl::new();
-                        ctx.modules.merge_configured(miner_api.into_rpc())?;
+                        ctx.modules.merge_if_module_configured(RethRpcModule::Miner, miner_api.into_rpc())?;
                         tracing::info!("Succeed to register Miner RPC API");
 
                         tracing::info!("Start to register BSC Eth extension API (eth_coinbase, eth_health)...");
@@ -469,8 +499,15 @@ fn main() -> eyre::Result<()> {
                         // Remove the default unimplemented eth_coinbase before registering our version
                         ctx.modules.remove_method_from_configured("eth_coinbase");
                         let eth_ext_api = BscEthExtApiImpl::new();
-                        ctx.modules.merge_configured(eth_ext_api.into_rpc())?;
+                        ctx.modules.merge_if_module_configured(RethRpcModule::Eth, eth_ext_api.into_rpc())?;
                         tracing::info!("Succeed to register BSC Eth extension API");
+
+                        tracing::info!("Start to register BSC Admin RPC API (admin_setBidBlockPermission)...");
+                        use reth_bsc::rpc::admin::{BscAdminApiImpl, BscAdminApiServer};
+
+                        let admin_api = BscAdminApiImpl::new();
+                        ctx.modules.merge_if_module_configured(RethRpcModule::Admin, admin_api.into_rpc())?;
+                        tracing::info!("Succeed to register BSC Admin RPC API");
 
                         tracing::info!("Start to register Blob RPC API...");
                         use reth_bsc::rpc::blob::{BlobApiImpl, BlobApiServer};
@@ -480,13 +517,23 @@ fn main() -> eyre::Result<()> {
                         let provider = ctx.provider().clone();
 
                         let blob_api = BlobApiImpl::new(pool, provider);
-                        ctx.modules.merge_configured(blob_api.into_rpc())?;
+                        ctx.modules.merge_if_module_configured(RethRpcModule::Eth, blob_api.into_rpc())?;
                         tracing::info!("Succeed to register Blob RPC API");
+
+                        // Debug-only builder extraction seam for BEP-675 e2e testing
+                        // (bep675 testing plan, Tier 2). Off unless explicitly enabled.
+                        if std::env::var("BSC_DEBUG_BUILDER").map(|v| v == "true").unwrap_or(false) {
+                            tracing::info!("Start to register Debug Builder RPC API (debug_buildCandidateBlock)...");
+                            use reth_bsc::rpc::debug_builder::{BscDebugBuilderApiServer, DebugBuilderApiImpl};
+                            let chain_spec = std::sync::Arc::new(ctx.config().chain.clone().as_ref().clone());
+                            let debug_builder_api = DebugBuilderApiImpl::new(ctx.provider().clone(), chain_spec);
+                            ctx.modules.merge_if_module_configured(RethRpcModule::Debug, debug_builder_api.into_rpc())?;
+                            tracing::info!("Succeed to register Debug Builder RPC API");
+                        }
 
                         tracing::info!("Start to register eth_config (EIP-7910) API...");
                         use reth::api::FullNodeComponents;
                         use reth_bsc::rpc::{BscEthConfigApiServer, BscEthConfigHandler};
-                        use reth_rpc_server_types::RethRpcModule;
 
                         let eth_config = BscEthConfigHandler::new(
                             ctx.provider().clone(),

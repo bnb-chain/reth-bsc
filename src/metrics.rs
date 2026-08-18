@@ -141,8 +141,19 @@ pub struct BscMevMetrics {
     /// Bid simulation speed in MGas/s (equivalent to bid/sim/simulateSpeed)
     pub bid_simulation_speed_mgasps: Gauge,
 
-    /// Bid simulation duration in seconds (equivalent to bid/sim/duration)
+    /// Bid simulation duration in seconds (equivalent to bid/sim/duration). Only records
+    /// simulations that ran to **completion** — aborted ones (preempted, or rejected for blob/gas
+    /// limits) return before this is observed, so its `_count` series is not the total number of
+    /// simulations. Use [`Self::bid_simulation_started_total`] for that.
     pub bid_simulation_duration_seconds: Histogram,
+
+    /// Total bid simulations **started**, counted at the single point every simulation passes
+    /// through, before it can succeed or abort. This is the denominator the interrupt-thrash ratio
+    /// is defined against ("占总模拟次数比例"): unlike
+    /// `bid_simulation_duration_seconds_count` it includes aborted runs, and unlike that histogram
+    /// series it carries no unit ambiguity — `_sum` on a `_seconds` histogram is seconds, whereas
+    /// this is a plain count.
+    pub bid_simulation_started_total: Counter,
 
     /// First bid simulation time in seconds (equivalent to bid/sim/sim1stBid)
     pub first_bid_simulation_seconds: Histogram,
@@ -152,6 +163,32 @@ pub struct BscMevMetrics {
 
     /// Total number of bid wins (when the final payload is from a bid)
     pub bid_win_total: Counter,
+
+    /// Total in-flight bid simulations preempted by a higher-value bid, i.e. every time
+    /// `canBeInterrupted` allowed a new bid through. Counted in **simulations**. Denominator for
+    /// the interrupt-thrash ratio that `no_interrupt_left_over` tuning is judged against.
+    pub bid_interrupt_total: Counter,
+
+    /// Of those preempted simulations, how many belonged to a block that then went on to seal
+    /// without any bid — the interrupts bought nothing and the node fell back to a local payload.
+    /// Counted in **simulations** too (a block that thrashed six times contributes 6, not 1), so
+    /// dividing by [`Self::bid_interrupt_total`] yields a true proportion: the share of gambles
+    /// that were wasted. A tightened `no_interrupt_left_over` window that kills good simulations it
+    /// cannot replace in time shows up here and nowhere else.
+    pub bid_interrupt_wasted_total: Counter,
+
+    /// The subset of [`Self::bid_interrupt_wasted_total`] attributable specifically to the
+    /// replacement simulation being **too late**: at seal time a simulation for this block was
+    /// still in flight. Counted in **simulations**, on the same basis as the other two, so
+    /// `late / wasted` is the share of wasted interrupts caused by the window being too tight
+    /// (versus the replacement finishing but scoring worse or being rejected — real waste, but not
+    /// evidence against `no_interrupt_left_over`).
+    ///
+    /// Attribution caveat: at most one simulation per parent runs at a time, so "still in flight"
+    /// is a single observation about the block. Crediting the block's whole tally to lateness
+    /// mirrors how `bid_interrupt_wasted_total` is weighted; in a multi-interrupt cascade the
+    /// earlier replacements did finish (only to be preempted in turn).
+    pub bid_interrupt_late_total: Counter,
 }
 
 /// Metrics for BSC miner/worker operations
