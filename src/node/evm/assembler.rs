@@ -207,8 +207,7 @@ where
 {
     type Block = crate::node::primitives::BscBlock;
 
-    // Unused in-tree: `BscEvmConfig::create_block_builder` returns `BscBlockBuilder`, whose
-    // `finish` calls `assemble_block_body_only`. Kept only to satisfy the `BlockAssembler` trait.
+    // note that assemble_block is unused, BscBlockBuiler use assemble_block_bsc instead.
     fn assemble_block(
         &self,
         input: BlockAssemblerInput<'_, '_, F>,
@@ -325,7 +324,7 @@ where
                 &mut header,
                 &snapshot_provider,
                 block_timestamp_ms,
-                None, // no epoch validators here; this fn is dead (see the note on it)
+                None,
             ).map_err(|e| BlockExecutionError::msg(format!("Failed to finalize header: {}", e)))?;
 
             let header_hash = keccak256(alloy_rlp::encode(&header));

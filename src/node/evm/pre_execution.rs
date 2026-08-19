@@ -33,21 +33,11 @@ use crate::consensus::parlia::constants::K_ANCESTOR_GENERATION_DEPTH;
 
 const BLST_DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
 
-/// A validator set paired with each member's BLS vote address, as `getMiningValidators()` returns
-/// them post-Luban (empty vote addresses before it).
 pub type EpochValidators = (Vec<Address>, Vec<VoteAddress>);
 
 type ValidatorCache = LruMap<BlockHash, EpochValidators, ByLength>;
 type TurnLengthCache = LruMap<BlockHash, u8, ByLength>;
 
-/// `getMiningValidators()` memoized by the block it was evaluated at.
-///
-/// INVARIANT: the entry under `hash(B)` is the result evaluated in block `B`'s env on `B`'s
-/// post-state. Block validation reads this map, so an entry derived any other way forks the node
-/// (bnb-chain/reth-bsc#465).
-///
-/// Writers use two env constructors (`evm_env_for_header`, `next_evm_env`) that agree only on
-/// `block.number` — so only a value depending on nothing else may be cached here.
 pub static VALIDATOR_CACHE: LazyLock<Mutex<ValidatorCache>> = LazyLock::new(|| {
     Mutex::new(LruMap::new(ByLength::new(1024)))
 });
@@ -219,8 +209,6 @@ where
 
         let epoch_length = snap.epoch_num;
         if header.number.is_multiple_of(epoch_length) {
-            // go-bsc `verifyValidators` reads this at `(header.ParentHash, header.Number-1)` —
-            // the parent's env, see [`CallBlockEnv`].
             let (validator_set, vote_addresses) = self.get_current_validators_with_cache(
                 header.number - 1,
                 header.parent_hash,
@@ -302,11 +290,6 @@ where
         Ok(())
     }
 
-    /// [`VALIDATOR_CACHE`] lookup for block `block_number`, computing it on a miss.
-    ///
-    /// `block_hash` must be the hash of `block_number`. Either `at` value lands on that block's own
-    /// env — `Current` when it is the block being executed, `Parent` when it is that block's parent
-    /// — so the stored entry honors the cache's invariant either way.
     pub(crate) fn get_current_validators_with_cache(
         &mut self, 
         block_number: BlockNumber,
