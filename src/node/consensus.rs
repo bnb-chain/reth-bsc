@@ -1174,6 +1174,8 @@ pub struct BscForkChoiceEngine<P> {
     finality_metrics: BscFinalityMetrics,
     /// Blockchain metrics (including reorg metrics)
     blockchain_metrics: BscBlockchainMetrics,
+    /// Consensus metrics (forkchoice failures)
+    consensus_metrics: crate::metrics::BscConsensusMetrics,
 }
 
 impl<P> BscForkChoiceEngine<P>
@@ -1196,6 +1198,7 @@ where
             ))),
             finality_metrics: BscFinalityMetrics::default(),
             blockchain_metrics: BscBlockchainMetrics::default(),
+            consensus_metrics: crate::metrics::BscConsensusMetrics::default(),
         }
     }
 
@@ -1236,7 +1239,15 @@ where
             .ok_or(ParliaConsensusErr::HeadHashNotFound)?;
 
         // Determine if we need to reorg using fork choice rules
-        let need_reorg = self.is_need_reorg(incoming_header, &current_head).await?;
+        let need_reorg = match self.is_need_reorg(incoming_header, &current_head).await {
+            Ok(need_reorg) => need_reorg,
+            Err(e) => {
+                // Bailing here means no forkchoice update is sent and the canonical head stays
+                // put, so this must be visible in metrics — callers only log it at warn.
+                self.consensus_metrics.forkchoice_update_errors_total.increment(1);
+                return Err(e);
+            }
+        };
 
         // Only count as reorg if:
         // 1. Fork choice says we need to reorg AND
@@ -1453,21 +1464,49 @@ where
     ) -> Result<(Option<alloy_primitives::U256>, Option<alloy_primitives::U256>), ParliaConsensusErr>
     {
         let current_td = self.header_td(engine, current.number, current.hash_slow()).await?;
+
+        // The engine reports "TD unknown" as `Ok(None)`, not `Err` — its walk deliberately
+        // avoids failing the query (see `query_header_with_td`). Falling back only on `Err`
+        // therefore skipped the parent-derived path in exactly the case that needs it: a fork
+        // whose divergence point lies below the persisted tip, where the walk gives up.
         let incoming_td = match self.header_td(engine, incoming.number, incoming.hash_slow()).await
         {
-            Ok(td) => td,
+            Ok(Some(td)) => Some(td),
+            Ok(None) => {
+                tracing::debug!(target: "bsc::forkchoice", "Incoming header TD unknown, try to query parent block TD");
+                self.parent_derived_td(engine, incoming).await?
+            }
             Err(e) => {
                 tracing::debug!(target: "bsc::forkchoice", "Failed to get incoming header TD: {:?}, try to query parent block TD", e);
-                match self.header_td(engine, incoming.number - 1, incoming.parent_hash).await? {
-                    Some(td) => Some(td + incoming.difficulty),
-                    None => {
-                        tracing::debug!(target: "bsc::forkchoice", "Failed to get parent header TD, return None");
-                        None
-                    }
-                }
+                self.parent_derived_td(engine, incoming).await?
             }
         };
         Ok((incoming_td, current_td))
+    }
+
+    /// Derives a header's TD from its parent's, when the header's own TD cannot be resolved.
+    ///
+    /// Returns `None` when the parent's TD is unknown too; callers must treat that as "unknown"
+    /// and degrade, never as a failure.
+    async fn parent_derived_td(
+        &self,
+        engine: &ConsensusEngineHandle<BscPayloadTypes>,
+        incoming: &Header,
+    ) -> Result<Option<alloy_primitives::U256>, ParliaConsensusErr> {
+        if incoming.number == 0 {
+            return Ok(None);
+        }
+        match self.header_td(engine, incoming.number - 1, incoming.parent_hash).await {
+            Ok(Some(td)) => Ok(Some(td + incoming.difficulty)),
+            Ok(None) => {
+                tracing::debug!(target: "bsc::forkchoice", "Failed to get parent header TD, return None");
+                Ok(None)
+            }
+            Err(e) => {
+                tracing::debug!(target: "bsc::forkchoice", "Failed to get parent header TD: {:?}, return None", e);
+                Ok(None)
+            }
+        }
     }
 
     /// Gets the total difficulty for a specific header.
@@ -1483,7 +1522,12 @@ where
             return Ok(*td);
         }
         let td = engine.query_td(number, hash).await.map_err(ParliaConsensusErr::internal)?;
-        self.header_td_cache.write().insert(hash, td);
+        // Only memoize resolved values. Caching a `None` makes a transient failure permanent for
+        // that hash: TD becomes resolvable once the block is persisted or a common ancestor
+        // appears, but a cached `None` means we would never ask again.
+        if td.is_some() {
+            self.header_td_cache.write().insert(hash, td);
+        }
         Ok(td)
     }
 }
