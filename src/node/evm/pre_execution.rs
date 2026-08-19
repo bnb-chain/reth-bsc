@@ -1,11 +1,13 @@
+use super::config::evm_env_for_header;
 use super::executor::BscBlockExecutor;
+use super::factory::BscEvmFactory;
 use crate::evm::transaction::BscTxEnv;
 
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
-use reth_evm::{eth::receipt_builder::ReceiptBuilder, execute::BlockExecutionError, Evm, FromRecoveredTx, FromTxWithEncoded, IntoTxEnv};
+use reth_evm::{eth::receipt_builder::ReceiptBuilder, execute::BlockExecutionError, Evm, EvmFactory, FromRecoveredTx, FromTxWithEncoded, IntoTxEnv};
 use reth_ethereum_primitives::TransactionSigned;
 use revm::{
-    context::{BlockEnv, TxEnv},
+    context::{result::ExecutionResult, BlockEnv, TxEnv},
     context_interface::block::Block,
     primitives::{Address, Bytes, TxKind, U256},
 };
@@ -39,6 +41,59 @@ pub static VALIDATOR_CACHE: LazyLock<Mutex<ValidatorCache>> = LazyLock::new(|| {
 pub static TURN_LENGTH_CACHE: LazyLock<Mutex<TurnLengthCache>> = LazyLock::new(|| {
     Mutex::new(LruMap::new(ByLength::new(1024)))
 });
+
+/// Which block's [`BlockEnv`] a Parlia system-contract read is evaluated in.
+///
+/// State is the parent's on both paths, so only reads whose *value* depends on the block env need
+/// [`Self::Parent`]. Today that is only `getMiningValidators()`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum CallBlockEnv {
+    /// The env of the block being executed.
+    Current,
+    /// The env of its parent. Required for env-dependent reads that validate this block.
+    Parent,
+}
+
+/// The transaction shape used for read-only system-contract calls.
+///
+/// `gas_limit` is the gas limit of the block whose env the call runs in, so GASLIMIT reports it.
+/// `is_system_transaction` bypasses the EIP-7825 tx gas cap (16M), which BSC block gas limits
+/// exceed; it also zeroes BASEFEE and disables nonce checks. BSC's system-contract view functions
+/// read none of those, but a future contract reading BASEFEE would need this revisited.
+fn view_call_tx_env(to: Address, data: Bytes, gas_limit: u64, chain_id: u64) -> BscTxEnv {
+    BscTxEnv {
+        base: TxEnv {
+            caller: Address::default(),
+            kind: TxKind::Call(to),
+            nonce: 0,
+            gas_limit,
+            value: U256::ZERO,
+            data,
+            gas_price: 0,
+            chain_id: Some(chain_id),
+            gas_priority_fee: None,
+            access_list: Default::default(),
+            blob_hashes: Vec::new(),
+            max_fee_per_blob_gas: 0,
+            tx_type: 0,
+            authorization_list: Default::default(),
+        },
+        is_system_transaction: true,
+    }
+}
+
+/// Extracts the return data of a read-only system-contract call.
+fn view_call_output<H>(
+    to: Address,
+    data: &Bytes,
+    result: ExecutionResult<H>,
+) -> Result<Bytes, BlockExecutionError> {
+    if !result.is_success() {
+        tracing::error!("Failed to eth call, to: {:?}, data: {:?}", to, data);
+        return Err(BlockExecutionError::msg("ETH call failed"));
+    }
+    result.into_output().ok_or_else(|| BlockExecutionError::msg("ETH call output is None"))
+}
 
 impl<'a, EVM, Spec, R: ReceiptBuilder> BscBlockExecutor<'a, EVM, Spec, R>
 where
@@ -88,8 +143,21 @@ where
 
         let epoch_length = snap.epoch_num;
         if header.number.is_multiple_of(epoch_length) {
-            // TODO: need fix it later, it may got error when restart the node?
-            let (validator_set, vote_addresses) = self.get_current_validators_with_cache(header.number-1, header.parent_hash)?;
+            // Evaluate in the PARENT block's env, matching go-bsc `verifyValidators` ->
+            // `getCurrentValidators(header.ParentHash, N-1)`. Not cosmetic: `getMiningValidators()`
+            // draws its 21-of-45 result with seed `block.number / 200`, so an epoch block that is
+            // itself a multiple of 200 draws from a different window than its parent and returns a
+            // different set (bnb-chain/reth-bsc#465). That is every epoch block at epoch lengths
+            // 200 and 1000 (mainnet is 1000 post-Maxwell), and every second one at Lorentz's 500.
+            let (validator_set, vote_addresses) =
+                self.get_current_validators(header.number - 1, CallBlockEnv::Parent)?;
+            // Write-only, and must NOT become a read-through: `miner::util::resolve_epoch_validators`
+            // writes this same key from a snapshot, and block validation must not depend on a global
+            // with writers outside consensus. Overwriting repairs a non-conforming entry it left.
+            VALIDATOR_CACHE
+                .lock()
+                .unwrap()
+                .insert(header.parent_hash, (validator_set.clone(), vote_addresses.clone()));
             tracing::debug!("validator_set: {:?}, vote_addresses: {:?}", validator_set, vote_addresses);
             
             let vote_addrs_map = if vote_addresses.is_empty() {
@@ -105,7 +173,9 @@ where
             self.inner_ctx.current_validators = Some((validator_set, vote_addrs_map));
 
             if self.spec.is_bohr_active_at_timestamp(header.number, header.timestamp) {
-                // Keep parity with go-bsc: turn length is read from parent state.
+                // Parity with go-bsc `bohrFork.go` getTurnLength: parent state, and the Bohr gate
+                // uses the parent's number/timestamp. Evaluated in this block's env, which is sound
+                // because `getTurnLength()` is a plain storage read.
                 let expected_turn_length =
                     self.get_turn_length(parent_header.number, parent_header.timestamp)?;
                 self.inner_ctx.expected_turn_length = Some(expected_turn_length);
@@ -129,6 +199,9 @@ where
             !self.spec.is_feynman_transition_at_timestamp(header.number, header.timestamp, parent_header.timestamp) &&
             is_breathe_block(parent_header.timestamp, header.timestamp)
         {
+            // go-bsc reads both at the parent (`feynmanfork.go`), but both are plain storage reads;
+            // their results feed `updateValidatorSetV2` calldata, so moving them is state-root
+            // affecting and out of scope for #465.
             let (to, data) = self.system_contracts.get_max_elected_validators();
             let bz = self.eth_call(to, data)?;
             let max_elected_validators = self.system_contracts.unpack_data_into_max_elected_validators(bz.as_ref());
@@ -180,7 +253,7 @@ where
             }
         }
 
-        let result = self.get_current_validators(block_number)?;
+        let result = self.get_current_validators(block_number, CallBlockEnv::Current)?;
 
         {
             let mut cache = VALIDATOR_CACHE.lock().unwrap();
@@ -193,71 +266,78 @@ where
     }
 
 
+    /// Runs a read-only system-contract call in the env of the block being executed.
     pub(crate) fn eth_call(
         &mut self,
         to: Address,
         data: Bytes
     ) -> Result<Bytes, BlockExecutionError> {
-        // Use block gas limit (~36M on BSC) to match GASLIMIT opcode semantics.
-        // Mark as system transaction to bypass EIP-7825 gas limit cap (16M),
-        // since block gas limit exceeds the cap and these are internal queries.
-        //
-        // Trade-off accepted: is_system_transaction causes transact_raw to:
-        // - Set basefee to 0 (BASEFEE opcode returns 0 instead of actual basefee)
-        // - Disable nonce checks
-        // - Replace block.gas_limit with tx.gas_limit
-        //
-        // For BSC system contract reads (get_current_validators, get_validator_election_info, etc.),
-        // these side effects are acceptable because the contracts don't use BASEFEE in view functions.
-        // If future contracts depend on BASEFEE, this approach would need revisiting.
-        let tx_env = BscTxEnv {
-            base: TxEnv {
-                caller: Address::default(),
-                kind: TxKind::Call(to),
-                nonce: 0,
-                gas_limit: self.evm.block().gas_limit(),
-                value: U256::ZERO,
-                data: data.clone(),
-                gas_price: 0,
-                chain_id: Some(self.spec.chain().id()),
-                gas_priority_fee: None,
-                access_list: Default::default(),
-                blob_hashes: Vec::new(),
-                max_fee_per_blob_gas: 0,
-                tx_type: 0,
-                authorization_list: Default::default(),
-            },
-            is_system_transaction: true,
-        };
-
+        let tx_env =
+            view_call_tx_env(to, data.clone(), self.evm.block().gas_limit(), self.spec.chain().id());
         let result_and_state = self.evm.transact(tx_env.into_tx_env()).map_err(BlockExecutionError::other)?;
-        if !result_and_state.result.is_success() {
-            tracing::error!("Failed to eth call, to: {:?}, data: {:?}", to, data);
-            return Err(BlockExecutionError::msg("ETH call failed"));
-        }
-        let output = result_and_state.result.output().ok_or(BlockExecutionError::msg("ETH call output is None"))?;
-        Ok(output.clone())
+        view_call_output(to, &data, result_and_state.result)
     }
 
-    pub(crate) fn get_current_validators(
-        &mut self, 
-        block_number: BlockNumber
-    ) -> Result<(Vec<Address>, Vec<VoteAddress>), BlockExecutionError> {
+    /// Runs a read-only system-contract call in the **parent** block's env.
+    ///
+    /// go-bsc's `ethAPI.Call(args, BlockNumberOrHashWithHash(header.ParentHash, false))`. The state
+    /// is already the parent's, so only the [`BlockEnv`] has to be substituted — and since [`Evm`]
+    /// exposes no mutable block accessor, that means a throwaway EVM over the same DB. Nothing is
+    /// committed.
+    ///
+    /// PRECONDITION: only valid before any of this block's state changes are applied, i.e. from
+    /// `check_new_block` / `prepare_new_block`.
+    fn eth_call_at_parent(
+        &mut self,
+        to: Address,
+        data: Bytes,
+    ) -> Result<Bytes, BlockExecutionError> {
+        let parent = self.inner_ctx.parent_header.clone().ok_or_else(|| {
+            BlockExecutionError::msg("Missing parent header for parent-env eth call")
+        })?;
+        debug_assert_eq!(
+            parent.number + 1,
+            self.evm.block().number().to::<u64>(),
+            "parent-env call must run while executing the parent's direct child"
+        );
 
-        let result = if self.spec.is_luban_active_at_block(block_number) {
-            let (to, data) = self.system_contracts.get_current_validators();
-            let output = self.eth_call(to, data)?;
+        // Both must be built before `db_mut()` borrows `self.evm`.
+        let env = evm_env_for_header(&self.spec, &parent);
+        let tx_env = view_call_tx_env(to, data.clone(), parent.gas_limit, self.spec.chain().id());
+
+        let mut evm = BscEvmFactory::default().create_evm(self.evm.db_mut(), env);
+        // UFCS on purpose: `BscEvm` also implements `revm::ExecuteEvm::transact`, which skips the
+        // system-transaction env overrides that `Evm::transact` applies.
+        let result_and_state = Evm::transact(&mut evm, tx_env).map_err(BlockExecutionError::other)?;
+        view_call_output(to, &data, result_and_state.result)
+    }
+
+    /// Reads the active validator set from the ValidatorSet system contract.
+    ///
+    /// `block_number` selects the ABI (pre/post Luban, Euler) and must be the number of the block
+    /// whose state is being read. `at` selects the block env — see [`CallBlockEnv`].
+    pub(crate) fn get_current_validators(
+        &mut self,
+        block_number: BlockNumber,
+        at: CallBlockEnv,
+    ) -> Result<(Vec<Address>, Vec<VoteAddress>), BlockExecutionError> {
+        let is_luban = self.spec.is_luban_active_at_block(block_number);
+        let (to, data) = if is_luban {
+            self.system_contracts.get_current_validators()
+        } else {
+            self.system_contracts.get_current_validators_before_luban(block_number)
+        };
+        let output = match at {
+            CallBlockEnv::Current => self.eth_call(to, data)?,
+            CallBlockEnv::Parent => self.eth_call_at_parent(to, data)?,
+        };
+        Ok(if is_luban {
             self.system_contracts.unpack_data_into_validator_set(&output)
         } else {
-            let (to, data) = self.system_contracts.get_current_validators_before_luban(block_number);
-            let output = self.eth_call(to, data)?;
-            let validator_set = self.system_contracts.unpack_data_into_validator_set_before_luban(&output);
-            (validator_set, Vec::new())
-        };
-
-        Ok(result)
+            (self.system_contracts.unpack_data_into_validator_set_before_luban(&output), Vec::new())
+        })
     }
-    
+
     fn verify_cascading_fields(
         &self,
         header: &Header,

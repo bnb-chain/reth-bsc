@@ -3,7 +3,7 @@ use super::error::{BscBlockExecutionError, BscBlockValidationError};
 use super::util::set_nonce;
 use super::config::revm_spec_by_timestamp_and_block_number;
 use crate::consensus::parlia::{FF_REWARD_DISTRIBUTION_INTERVAL};
-use crate::node::evm::pre_execution::TURN_LENGTH_CACHE;
+use crate::node::evm::pre_execution::{CallBlockEnv, TURN_LENGTH_CACHE};
 use crate::node::evm::util::get_header_by_hash_from_cache;
 use crate::node::miner::signer::{sign_system_transaction, is_signer_initialized};
 use crate::consensus::parlia::{DIFF_INTURN, VoteAddress, VoteAttestation, snapshot::DEFAULT_TURN_LENGTH, constants::COLLECT_ADDITIONAL_VOTES_REWARD_RATIO, util::is_breathe_block};
@@ -722,7 +722,8 @@ where
                 "Check validator cache update: block_number={}, epoch_length={}, is_next_epoch={}",
                 header_number, epoch_length, is_next_epoch
             );
-            let (validators, vote_addresses) = self.get_current_validators(header_number)?;
+            let (validators, vote_addresses) =
+                self.get_current_validators(header_number, CallBlockEnv::Current)?;
             self.shared_ctx.inner.borrow_mut().current_validators = Some((validators, vote_addresses));
         }
 

@@ -303,6 +303,56 @@ where
 
 const EIP1559_INITIAL_BASE_FEE: u64 = 0;
 
+/// The [`EvmEnv`] that `header` itself presents to the EVM — go-bsc's
+/// `core.NewEVMBlockContext(header, ..)`.
+///
+/// Consensus reads pass the *parent* header here; see [`super::pre_execution::CallBlockEnv`].
+pub(crate) fn evm_env_for_header<Spec>(spec: &Spec, header: &Header) -> EvmEnv<BscHardfork>
+where
+    Spec: BscHardforks + EthChainSpec + Clone,
+{
+    // `BscHardforks::` disambiguates from the same-named `EthereumHardforks` supertrait methods.
+    let blob_params =
+        BscHardforks::is_cancun_active_at_timestamp(spec, header.number, header.timestamp)
+            .then(|| spec.blob_params_at_timestamp(header.timestamp))
+            .flatten();
+    let hardfork =
+        revm_spec_by_timestamp_and_block_number(spec.clone(), header.timestamp(), header.number());
+    let spec_id = SpecId::from(hardfork);
+
+    let mut cfg_env = CfgEnv::new_with_spec(hardfork).with_chain_id(spec.chain().id());
+
+    if let Some(blob_params) = &blob_params {
+        cfg_env.set_max_blobs_per_tx(blob_params.max_blobs_per_tx);
+    }
+    if BscHardforks::is_osaka_active_at_timestamp(spec, header.number, header.timestamp) {
+        cfg_env.tx_gas_limit_cap = Some(MAX_TX_GAS_LIMIT_OSAKA);
+    }
+
+    // derive the EIP-4844 blob fees from the header's `excess_blob_gas` and the current blobparams
+    let blob_excess_gas_and_price =
+        header.excess_blob_gas.zip(blob_params).map(|(excess_blob_gas, params)| {
+            let blob_gasprice = params.calc_blob_fee(excess_blob_gas);
+            BlobExcessGasAndPrice { excess_blob_gas, blob_gasprice }
+        });
+
+    let block_env = BlockEnv {
+        number: U256::from(header.number()),
+        beneficiary: header.beneficiary(),
+        timestamp: U256::from(header.timestamp()),
+        difficulty: if spec_id >= SpecId::MERGE { U256::ZERO } else { header.difficulty() },
+        // BSC does not replace the DIFFICULTY output with prevrandao so here we are setting
+        // this to the difficulty values to ensure correct opcode outputs
+        prevrandao: if spec_id >= SpecId::MERGE { Some(header.difficulty().into()) } else { None },
+        gas_limit: header.gas_limit(),
+        basefee: header.base_fee_per_gas().unwrap_or_default(),
+        blob_excess_gas_and_price,
+        slot_num: 0,
+    };
+
+    EvmEnv { cfg_env, block_env }
+}
+
 impl ConfigureEvm for BscEvmConfig
 where
     Self: Send + Sync + Unpin + Clone + 'static,
@@ -322,60 +372,7 @@ where
     }
 
     fn evm_env(&self, header: &Header) -> Result<EvmEnv<BscHardfork>, Self::Error> {
-        let mut blob_params = None;
-        if BscHardforks::is_cancun_active_at_timestamp(
-            self.chain_spec(),
-            header.number,
-            header.timestamp,
-        ) {
-            blob_params = self.chain_spec().blob_params_at_timestamp(header.timestamp);
-        }
-        let spec = revm_spec_by_timestamp_and_block_number(
-            self.chain_spec().clone(),
-            header.timestamp(),
-            header.number(),
-        );
-        let spec_id = SpecId::from(spec);
-
-        // configure evm env based on parent block
-        let mut cfg_env = CfgEnv::new_with_spec(spec).with_chain_id(self.chain_spec().chain().id());
-
-        if let Some(blob_params) = &blob_params {
-            cfg_env.set_max_blobs_per_tx(blob_params.max_blobs_per_tx);
-        }
-        if BscHardforks::is_osaka_active_at_timestamp(self.chain_spec(), header.number, header.timestamp) {
-            cfg_env.tx_gas_limit_cap = Some(MAX_TX_GAS_LIMIT_OSAKA);
-        }
-
-        // derive the EIP-4844 blob fees from the header's `excess_blob_gas` and the current
-        // blobparams
-        let blob_excess_gas_and_price =
-            header.excess_blob_gas.zip(blob_params).map(|(excess_blob_gas, params)| {
-                let blob_gasprice = params.calc_blob_fee(excess_blob_gas);
-                BlobExcessGasAndPrice { excess_blob_gas, blob_gasprice }
-            });
-
-        let eth_spec = spec_id;
-
-        let block_env = BlockEnv {
-            number: U256::from(header.number()),
-            beneficiary: header.beneficiary(),
-            timestamp: U256::from(header.timestamp()),
-            difficulty: if eth_spec >= SpecId::MERGE { U256::ZERO } else { header.difficulty() },
-            // BSC does not replace the DIFFICULTY output with prevrandao so here we are setting
-            // this to the difficulty values to ensure correct opcode outputs
-            prevrandao: if eth_spec >= SpecId::MERGE {
-                Some(header.difficulty().into())
-            } else {
-                None
-            },
-            gas_limit: header.gas_limit(),
-            basefee: header.base_fee_per_gas().unwrap_or_default(),
-            blob_excess_gas_and_price,
-            slot_num: 0,
-        };
-
-        Ok(EvmEnv { cfg_env, block_env })
+        Ok(evm_env_for_header(self.chain_spec(), header))
     }
 
     fn next_evm_env(

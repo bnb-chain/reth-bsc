@@ -420,3 +420,186 @@ mod tests {
         }
     }
 }
+
+/// Regression tests for bnb-chain/reth-bsc#465.
+///
+/// NOT covered: that `check_new_block` actually passes [`CallBlockEnv::Parent`]. Driving it would
+/// need a `SnapshotProvider` global plus a real secp256k1 Parlia seal and BLS attestation for
+/// `verify_seal`.
+#[cfg(test)]
+mod parent_block_env {
+    use crate::chainspec::{bsc::bsc_mainnet, BscChainSpec};
+    use crate::consensus::parlia::snapshot::{
+        DEFAULT_EPOCH_LENGTH, LORENTZ_EPOCH_LENGTH, MAXWELL_EPOCH_LENGTH,
+    };
+    use crate::evm::api::BscEvm;
+    use crate::node::evm::config::{
+        evm_env_for_header, BscBlockExecutionCtx, BscExecutionSharedCtx,
+    };
+    use crate::node::evm::executor::BscBlockExecutor;
+    use crate::node::evm::pre_execution::CallBlockEnv;
+    use crate::system_contracts::{SystemContract, VALIDATOR_CONTRACT};
+    use alloy_consensus::Header;
+    use alloy_evm::eth::EthBlockExecutionCtx;
+    use alloy_primitives::{hex, Address, Bytes, U160};
+    use reth_evm_ethereum::RethReceiptBuilder;
+    use revm::bytecode::Bytecode;
+    use revm::database::InMemoryDB;
+    use revm::inspector::NoOpInspector;
+    use revm::state::AccountInfo;
+    use std::sync::Arc;
+
+    /// `_shuffleInterval` in BSCValidatorSet.sol — hard-coded there, and unrelated to the Parlia
+    /// epoch length.
+    const SHUFFLE_INTERVAL: u64 = 200;
+
+    /// The mainnet epoch block from #465.
+    const EPOCH_BLOCK: u64 = 115_596_000;
+
+    /// Stand-in for `ValidatorSet`, returning `getMiningValidators()`-shaped output whose single
+    /// validator address is literally `block.number / 200` — so the decoded set names the shuffle
+    /// window the callee observed.
+    ///
+    /// ```text
+    /// PUSH1 0x40   PUSH1 0x00 MSTORE   head[0] = 0x40   -> address[] at 0x40
+    /// PUSH1 0x80   PUSH1 0x20 MSTORE   head[1] = 0x80   -> bytes[]   at 0x80
+    /// PUSH1 0x01   PUSH1 0x40 MSTORE   address[].len = 1
+    /// PUSH1 0xc8   NUMBER DIV
+    ///              PUSH1 0x60 MSTORE   address[0] = NUMBER / 200
+    /// PUSH1 0x01   PUSH1 0x80 MSTORE   bytes[].len = 1
+    /// PUSH1 0x20   PUSH1 0xa0 MSTORE   bytes[0] data offset = 0x20, relative to 0xa0
+    /// PUSH1 0x30   PUSH1 0xc0 MSTORE   bytes[0].len = 48; its 0xe0..0x120 payload stays zero
+    /// PUSH2 0x0120 PUSH1 0x00 RETURN
+    /// ```
+    const WINDOW_REPORTING_VALIDATOR_SET: &[u8] = &hex!(
+        "6040600052" // head[0]
+        "6080602052" // head[1]
+        "6001604052" // address[].len
+        "60c84304606052" // address[0] = NUMBER / 200
+        "6001608052" // bytes[].len
+        "602060a052" // bytes[0] data offset
+        "603060c052" // bytes[0].len
+        "6101206000f3" // return mem[0x00..0x120]
+    );
+
+    /// The address the mock reports for a callee that observed `block_number`.
+    fn window_address(block_number: u64) -> Address {
+        Address::from(U160::from(block_number / SHUFFLE_INTERVAL))
+    }
+
+    fn header_at(number: u64) -> Header {
+        Header {
+            number,
+            timestamp: 1_786_578_821, // real timestamp of EPOCH_BLOCK
+            gas_limit: 140_000_000,
+            // Cancun is long active at this timestamp, and a Cancun block env without it is
+            // rejected outright.
+            excess_blob_gas: Some(0),
+            blob_gas_used: Some(0),
+            ..Default::default()
+        }
+    }
+
+    type TestExecutor = BscBlockExecutor<
+        'static,
+        BscEvm<InMemoryDB, NoOpInspector>,
+        Arc<BscChainSpec>,
+        RethReceiptBuilder,
+    >;
+
+    /// An executor positioned on `EPOCH_BLOCK`, with the mock installed at `ValidatorSet` and
+    /// `parent_header` set as `check_new_block` sets it.
+    fn executor() -> TestExecutor {
+        let spec = Arc::new(BscChainSpec::from(bsc_mainnet()));
+        let header = header_at(EPOCH_BLOCK);
+
+        let mut db = InMemoryDB::default();
+        db.insert_account_info(
+            VALIDATOR_CONTRACT,
+            AccountInfo::default()
+                .with_code(Bytecode::new_raw(Bytes::from_static(WINDOW_REPORTING_VALIDATOR_SET))),
+        );
+
+        let evm =
+            BscEvm::new(evm_env_for_header(&spec, &header), db, NoOpInspector {}, false, false);
+
+        let ctx = BscBlockExecutionCtx {
+            base: EthBlockExecutionCtx {
+                parent_hash: header.parent_hash,
+                parent_beacon_block_root: None,
+                ommers: &[],
+                withdrawals: None,
+                extra_data: Bytes::new(),
+                tx_count_hint: None,
+                slot_number: None,
+            },
+            header: Some(header),
+            header_hash: None,
+            is_miner: false,
+            validator_cache_sink: None,
+            turn_length_sink: None,
+            state_root_precomputed_sink: None,
+            trie_handle: None,
+            state_root_deadline_ms: None,
+        };
+
+        let mut executor = BscBlockExecutor::new(
+            evm,
+            ctx,
+            BscExecutionSharedCtx::default(),
+            spec.clone(),
+            RethReceiptBuilder::default(),
+            SystemContract::new(spec),
+        );
+        executor.inner_ctx.parent_header = Some(header_at(EPOCH_BLOCK - 1));
+        executor
+    }
+
+    /// The fix: `Parent` reads the window of `N-1` (what the epoch header encodes and what go-bsc
+    /// computes), `Current` reads the window of `N` — the #465 divergence.
+    #[test]
+    fn parent_env_call_observes_the_parent_shuffle_window() {
+        assert_ne!(
+            window_address(EPOCH_BLOCK - 1),
+            window_address(EPOCH_BLOCK),
+            "fixture is useless unless the two windows differ"
+        );
+
+        let mut executor = executor();
+
+        let (validators, _) = executor
+            .get_current_validators(EPOCH_BLOCK - 1, CallBlockEnv::Parent)
+            .expect("parent-env call");
+        assert_eq!(validators, vec![window_address(EPOCH_BLOCK - 1)], "must observe the parent");
+
+        let (validators, _) = executor
+            .get_current_validators(EPOCH_BLOCK - 1, CallBlockEnv::Current)
+            .expect("current-env call");
+        assert_eq!(validators, vec![window_address(EPOCH_BLOCK)], "bug #465");
+    }
+
+    /// An epoch block `N` observes a different shuffle window than `N - 1` iff `SHUFFLE_INTERVAL`
+    /// divides `N`. At 200 and at Maxwell's 1000 — mainnet today — that is every epoch block; at
+    /// Lorentz's 500 only every second one. So the parent env is mandatory, not cosmetic.
+    #[test]
+    fn epoch_blocks_cross_a_shuffle_window_boundary() {
+        let diverging = |epoch_length: u64| {
+            (1..=10).filter(|k| (k * epoch_length).is_multiple_of(SHUFFLE_INTERVAL)).count()
+        };
+
+        assert_eq!(diverging(DEFAULT_EPOCH_LENGTH), 10, "epoch 200: every epoch block");
+        assert_eq!(diverging(MAXWELL_EPOCH_LENGTH), 10, "epoch 1000: every epoch block");
+        assert_eq!(diverging(LORENTZ_EPOCH_LENGTH), 5, "epoch 500: every second one");
+        assert!(EPOCH_BLOCK.is_multiple_of(MAXWELL_EPOCH_LENGTH), "#465 block is a Maxwell epoch");
+    }
+
+    #[test]
+    fn parent_env_call_requires_a_parent_header() {
+        let mut executor = executor();
+        executor.inner_ctx.parent_header = None;
+        let err = executor
+            .get_current_validators(EPOCH_BLOCK - 1, CallBlockEnv::Parent)
+            .expect_err("must not silently fall back to the current env");
+        assert!(err.to_string().contains("parent header"), "unexpected error: {err}");
+    }
+}
