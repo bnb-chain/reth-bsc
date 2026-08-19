@@ -40,8 +40,7 @@ where
         return Ok(None);
     }
     let parent_hash = parent_header.hash();
-    // Bind the lookup so the guard drops here: under edition 2021 an `if let` on the guard itself
-    // would hold the lock across its whole body.
+    // Bind the lookup so the lock guard drops before the branch body.
     let cached = VALIDATOR_CACHE.lock().unwrap().get(&parent_hash).cloned();
     if let Some(validators) = cached {
         tracing::debug!(
@@ -63,8 +62,7 @@ where
     let state = client.state_by_block_hash(parent_hash).map_err(|e| failed(&e))?;
     let validators = validators_at_parent(&state, chain_spec.clone(), parent_header)
         .map_err(|e| failed(&e))?;
-    // Worth a `warn!`: the parent should have filled the cache, so a miss here means this process
-    // did not execute it — the restart window #465 stalls in.
+    // A cache miss means this process did not execute the parent block.
     tracing::warn!(
         target: "bsc::miner",
         block_number = parent_header.number() + 1,
@@ -76,14 +74,7 @@ where
     Ok(Some(validators))
 }
 
-/// Prepare a new block's header and derive the payload builder attributes.
-///
-/// Populates on `ctx`:
-/// - `header`: the freshly constructed unsealed header for this block.
-/// - `block_timestamp_ms`: block timestamp in ms fixed by `prepare_timestamp`, reused
-///   verbatim by `finalize_new_header` to avoid seconds/ms drift at sealing time.
-/// - `end_mining_timestamp_ms`: wall-clock deadline for this mining job, computed as
-///   `now_ms + parlia.delay_for_ramanujan_fork(...)`.
+/// Prepare a new block header and payload attributes.
 pub fn prepare_new_attributes(
     ctx: &mut MiningContext,
     parlia: Arc<Parlia<BscChainSpec>>,
@@ -91,7 +82,7 @@ pub fn prepare_new_attributes(
     signer: Address,
 ) -> EthPayloadAttributes {
     let mut new_header = prepare_new_header(parlia.clone(), parent_header, signer);
-    // Cache the planned millisecond timestamp so finalize_new_header can reuse it verbatim.
+    // Reuse the planned millisecond timestamp during finalization.
     ctx.block_timestamp_ms =
         parlia.prepare_timestamp(&ctx.parent_snapshot, parent_header.header(), &mut new_header);
 
@@ -103,9 +94,7 @@ pub fn prepare_new_attributes(
         parlia.delay_for_ramanujan_fork(&ctx.parent_snapshot, &new_header);
     ctx.end_mining_timestamp_ms = now_ms + end_mining_delay_ms as u128;
 
-    // BSC uses the PREVRANDAO opcode to return difficulty (not a random value like
-    // Ethereum PoS). The validation path in BscEvmConfig::evm_env sets
-    // `prevrandao = header.difficulty()`, so the building path must match.
+    // In BSC, PREVRANDAO returns difficulty, so the build path must match validation.
     let difficulty = calculate_difficulty(&ctx.parent_snapshot, signer);
     let mut attributes = EthPayloadAttributes {
         timestamp: new_header.timestamp,
@@ -126,7 +115,7 @@ pub fn prepare_new_attributes(
     attributes
 }
 
-/// prepare a tmp new header for preparing attributes.
+/// Prepare a temporary header for attribute derivation.
 pub fn prepare_new_header<ChainSpec>(
     parlia: Arc<Parlia<ChainSpec>>,
     parent_header: &SealedHeader,
@@ -143,8 +132,7 @@ where
         number: parent_header.number() + 1,
         parent_hash: parent_header.hash(),
         beneficiary: signer,
-        // Set timestamp to present time (or parent + 1 if present time is not greater)
-        // This avoids header.timestamp = 0 when back_off_time is called inside prepare_timestamp
+        // Initialize timestamp before `prepare_timestamp` adjusts it.
         timestamp,
         ..Default::default()
     };
@@ -203,8 +191,7 @@ where
     // })
 
     {
-        // prepare validators
-        // Use epoch_num from parent snapshot for epoch boundary check
+        // Prepare validators on epoch boundaries.
         let epoch_length = parent_snap.epoch_num;
         if (new_header.number).is_multiple_of(epoch_length) {
             let validators = epoch_validators.ok_or_else(|| {
@@ -233,7 +220,7 @@ where
     }
 
     {
-        // seal header
+        // Seal the header.
         let mut extra_data = new_header.extra_data.to_vec();
         extra_data.extend_from_slice(&[0u8; EXTRA_SEAL_LEN]);
         new_header.extra_data = Bytes::from(extra_data);

@@ -900,10 +900,7 @@ where
                 return;
             }
         };
-        // A consensus precondition no other check here covers. Without it a builder can name an
-        // arbitrary ancestor and make this "zero-simulate" intake path read historical state, and
-        // the epoch test below (`parent.number + 1`) can disagree with the one in
-        // `finalize_new_header` (`header.number`).
+        // BidBlocks must build directly on the selected parent.
         if decoded.block_number() != parent.number() + 1 {
             debug!(
                 "BidBlock: block {} is not a child of parent {} ({parent_hash})",
@@ -936,8 +933,7 @@ where
         ) {
             Ok(v) => v,
             Err(e) => {
-                // Unlike the bid-specific rejections around it, this is an infrastructure failure
-                // that drops every BidBlock for this epoch block.
+                // This is an infrastructure failure, not a bid-specific rejection.
                 warn!(
                     "BidBlock: failed to resolve epoch validators for block {}, builder={}: {e}",
                     decoded.block_number(),
@@ -971,11 +967,7 @@ where
             }
         };
 
-        // BEP-675 zero-simulate: do NOT execute here. Keep the highest-fee sealed BidBlock per
-        // parent (go-bsc `AddBidBlock`). Execution + state-root verification are deferred until the
-        // block has been selected and broadcast — see `ImportService::on_new_bid_block` — matching
-        // go-bsc's broadcast-then-`InsertChain` flow in `handleBidBlockResult`. Selection is by the
-        // deposit-derived `gas_fee`, which needs no execution.
+        // Keep the highest-fee sealed BidBlock per parent. Execution is deferred.
         let mut best = self.best_bid_block.write();
         let replace = best.get(&parent_hash).is_none_or(|t| task.gas_fee > t.gas_fee);
         // Log the key we store under. `collect_best_bid_block` logs the key it looks up, so a

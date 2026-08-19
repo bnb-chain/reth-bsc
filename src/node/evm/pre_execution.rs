@@ -60,8 +60,7 @@ where
 {
     let tx_env = view_call_tx_env(to, data.clone(), header.gas_limit, spec.chain().id());
     let mut evm = BscEvmFactory::default().create_evm(db, evm_env_for_header(spec, header));
-    // UFCS on purpose: `BscEvm` also implements `revm::ExecuteEvm::transact`, which skips the
-    // system-transaction env overrides that `Evm::transact` applies.
+    // Use `Evm::transact` so system-transaction overrides still apply.
     let result = Evm::transact(&mut evm, tx_env).map_err(BlockExecutionError::other)?.result;
     view_call_output(to, &data, result)
 }
@@ -139,8 +138,7 @@ fn view_call_output<H>(
     let output = result
         .into_output()
         .ok_or_else(|| BlockExecutionError::msg("ETH call output is None"))?;
-    // A call to a codeless address succeeds with empty returndata, which every `unpack_*` below
-    // would then `unwrap()`-panic on. Report it as a failed read instead.
+    // Treat empty returndata as an invalid read instead of letting ABI unpack panic.
     if output.is_empty() {
         tracing::error!("Empty eth call output, to: {:?}, data: {:?}", to, data);
         return Err(BlockExecutionError::msg("ETH call returned no data"));
@@ -164,8 +162,7 @@ where
     BscTxEnv: IntoTxEnv<<EVM as alloy_evm::Evm>::Tx>,
     R::Transaction: Into<TransactionSigned>,
 {
-    /// check the new block, pre check and prepare some intermediate data for finish function.
-    /// depends on parlia, header and snapshot.
+    /// Validate block fields that depend on Parlia, the header, and the parent snapshot.
     pub(crate) fn check_new_block(
         &mut self, 
         block: &BlockEnv
@@ -216,14 +213,13 @@ where
             self.inner_ctx.current_validators = Some((validator_set, vote_addrs_map));
 
             if self.spec.is_bohr_active_at_timestamp(header.number, header.timestamp) {
-                // Keep parity with go-bsc: turn length is read from parent state.
+                // Turn length is read from the parent state.
                 let expected_turn_length =
                     self.get_turn_length(parent_header.number, parent_header.timestamp)?;
                 self.inner_ctx.expected_turn_length = Some(expected_turn_length);
             }
 
-            // Also fetch on-chain NodeIDs for validators (EVN identification) and update cache.
-            // Only available after Maxwell hardfork when StakeHub contract's getNodeIDs is deployed
+            // Also fetch validator NodeIDs after Maxwell.
             if self.spec.is_maxwell_active_at_timestamp(header.number, header.timestamp) {
                 let (to2, data2) = self.system_contracts.get_node_ids(self.inner_ctx.current_validators.as_ref().unwrap().0.clone());
                 if let Ok(output2) = self.eth_call(to2, data2) {
@@ -337,10 +333,9 @@ where
         view_call_at_header(self.evm.db_mut(), &self.spec, &parent, to, data)
     }
 
-    /// Reads the active validator set from the ValidatorSet system contract.
+    /// Reads the active validator set.
     ///
-    /// `block_number` selects the ABI (pre/post Luban, Euler) and must be the number of the block
-    /// whose state is being read. `at` selects the block env — see [`CallBlockEnv`].
+    /// `block_number` selects the ABI; `at` selects the block env.
     pub(crate) fn get_current_validators(
         &mut self,
         block_number: BlockNumber,

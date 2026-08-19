@@ -2757,18 +2757,8 @@ fn refresh_and_reseal_bid_block(
 
 /// Finalize a built payload in-place.
 ///
-/// Runs `finalize_new_header()` on the payload's header (sets difficulty, prepares validators
-/// for epoch blocks, assembles vote attestation, and ECDSA-seals the header), then:
-///
-/// 1. Writes `pending_validators` / `pending_turn_length` to the global caches keyed by
-///    the now-deterministic final block hash.
-/// 2. Rebuilds `executed_block.recovered_block` with the finalized header so the engine
-///    tree can identify the block by its correct hash.
-/// 3. Rebuilds `block` (sealed block with sidecars) with the finalized header.
-///
-/// This function is intentionally separate from the builder path so that finalization is
-/// deferred until `pick_best_payload_and_finalize()` chooses the winning payload — giving more time for
-/// FF votes to arrive.
+/// This seals the header, writes pending cache entries under the final hash, and rebuilds the
+/// payload objects with the finalized header.
 fn finalize_payload(
     payload: &mut BscBuiltPayload,
     parlia: Arc<Parlia<BscChainSpec>>,

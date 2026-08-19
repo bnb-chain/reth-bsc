@@ -421,7 +421,7 @@ mod tests {
     }
 }
 
-/// Helper-level regression tests for bnb-chain/reth-bsc#465.
+/// Helper-level regression tests for parent-vs-current validator reads.
 #[cfg(test)]
 mod parent_block_env {
     use crate::chainspec::{bsc::bsc_mainnet, BscChainSpec};
@@ -443,16 +443,14 @@ mod parent_block_env {
     use revm::state::AccountInfo;
     use std::sync::Arc;
 
-    /// `_shuffleInterval` in BSCValidatorSet.sol — hard-coded there, and unrelated to the Parlia
-    /// epoch length.
+    /// Hard-coded interval used by the mock validator contract below.
     const SHUFFLE_INTERVAL: u64 = 200;
 
-    /// The mainnet epoch block from #465.
+    /// Epoch block used by the fixture.
     const EPOCH_BLOCK: u64 = 115_596_000;
 
-    /// Stand-in for the `ValidatorSet` contract, returning `getMiningValidators()`-shaped output whose single
-    /// validator address is literally `block.number / 200` — so the decoded set names the shuffle
-    /// window the callee observed.
+    /// Stand-in for the `ValidatorSet` contract. The returned validator address is
+    /// `block.number / 200`, so the decoded set reflects the observed block env.
     ///
     /// ```text
     /// PUSH1 0x40   PUSH1 0x00 MSTORE   head[0] = 0x40   -> address[] at 0x40
@@ -494,9 +492,7 @@ mod parent_block_env {
         }
     }
 
-    /// The standalone, provider-backed twin of the executor path. Nothing re-checks its result
-    /// before the header is sealed, so a drift between the two would only surface as a
-    /// network-wide rejection (bnb-chain/reth-bsc#465).
+    /// Provider-backed twin of the executor path.
     mod standalone {
         use super::*;
         use crate::node::evm::pre_execution::validators_at_parent;
@@ -559,7 +555,7 @@ mod parent_block_env {
             assert_eq!(
                 set,
                 vec![window_address(EPOCH_BLOCK - 1)],
-                "must draw from the parent's window, not the epoch block's"
+                "must draw from the parent env"
             );
         }
 
@@ -632,8 +628,7 @@ mod parent_block_env {
         executor
     }
 
-    /// The fix: `Parent` reads the window of `N-1` (what the epoch header encodes and what go-bsc
-    /// computes), `Current` reads the window of `N` — the #465 divergence.
+    /// `Parent` reads the parent env; `Current` reads the current env.
     #[test]
     fn parent_env_call_observes_the_parent_shuffle_window() {
         assert_ne!(
@@ -652,11 +647,10 @@ mod parent_block_env {
         let (validators, _) = executor
             .get_current_validators(EPOCH_BLOCK - 1, CallBlockEnv::Current)
             .expect("current-env call");
-        assert_eq!(validators, vec![window_address(EPOCH_BLOCK)], "bug #465");
+        assert_eq!(validators, vec![window_address(EPOCH_BLOCK)], "must observe the current env");
     }
 
-    /// The miner resolves from state only on a cache miss — the post-restart window the fix exists
-    /// to close. Reintroducing #465 on this path produces a block the network rejects, silently.
+    /// On a cache miss, the miner resolves validators from parent state and env.
     #[test]
     fn the_miner_reads_the_parents_window_on_a_cache_miss() {
         use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
