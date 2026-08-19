@@ -452,11 +452,7 @@ mod tests {
 
     /// Initialize the global signer for tests (ignores AlreadyInitialized errors).
     fn ensure_test_signer() {
-        let raw = alloy_primitives::hex::decode(
-            "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
-        )
-        .unwrap();
-        let _ = crate::node::miner::signer::init_global_signer(B256::from_slice(&raw));
+        crate::node::miner::signer::init_test_signer();
     }
 
     /// Build a post-Luban chain spec with Luban active at block 0.

@@ -12,8 +12,11 @@ use revm::{
         EthFrame, EvmTr, FrameInitOrResult, FrameResult,
     },
     inspector::InspectorEvmTr,
-    interpreter::{interpreter::EthInterpreter, interpreter_action::FrameInit},
-    primitives::hardfork::SpecId,
+    interpreter::{
+        interpreter::EthInterpreter, interpreter_action::FrameInit, InstructionResult,
+        InterpreterAction, InterpreterResult,
+    },
+    primitives::{hardfork::SpecId, Bytes},
     Context, Inspector, Journal,
 };
 use revm::context_interface::journaled_state::account::JournaledAccountTr;
@@ -85,12 +88,15 @@ impl<DB: Database, I> BscEvm<DB, I> {
     /// `BscTxEnv` counterpart of `system_contracts::is_system_transaction`.
     fn detect_system_transaction(&self, tx: &BscTxEnv) -> bool {
         use crate::system_contracts::is_invoke_system_contract;
-        use revm::primitives::TxKind;
+        use revm::{context_interface::Transaction as _, primitives::TxKind};
 
+        // BSC never enforces a base fee, so pass 0. `tx.base.gas_price` alone is
+        // `max_fee_per_gas` for EIP-1559 transactions, which wrongly excludes a
+        // zero-priority-fee tx with a non-zero fee cap from being detected as system.
         matches!(tx.base.kind, TxKind::Call(to)
             if tx.base.caller == self.block.beneficiary
                 && is_invoke_system_contract(&to)
-                && tx.base.gas_price == 0)
+                && tx.base.effective_gas_price(0) == 0)
     }
 
     /// Mark `tx` if it looks like a system tx. Idempotent: never downgrades an
@@ -206,6 +212,38 @@ where
     fn frame_run(
         &mut self,
     ) -> Result<FrameInitOrResult<Self::Frame>, ContextDbError<Self::Context>> {
+        let coinbase = self.block.beneficiary;
+        let hits_coinbase = {
+            let frame = self.frame_stack().get();
+            frame.interpreter.input.target_address == coinbase
+        };
+
+        if hits_coinbase {
+            // Ported from go-bsc (core/vm: "coinbase address cannot be used as contract
+            // address"): refuse to execute any bytecode whose storage/self context is the
+            // block's coinbase, whether reached via CALL/DELEGATECALL to pre-existing code
+            // or freshly deployed via CREATE/CREATE2. Without this, a contract could run
+            // "as" the coinbase and be mistaken for the validator itself by callers that
+            // gate on `caller == coinbase` (e.g. system transaction detection), or otherwise
+            // interfere with fee-distribution invariants that assume the coinbase never
+            // carries code. This mirrors go-ethereum's error-code semantics: burn the
+            // frame's remaining gas and revert its state changes, same as any other halt.
+            let (ctx, _, _, frame_stack) = self.all_mut();
+            let frame = frame_stack.get();
+            let mut gas = frame.interpreter.gas;
+            gas.spend_all();
+            let action = InterpreterAction::Return(InterpreterResult {
+                result: InstructionResult::PrecompileError,
+                output: Bytes::new(),
+                gas,
+            });
+            return frame.process_next_action(ctx, action).inspect(|i| {
+                if i.is_result() {
+                    frame.set_finished(true);
+                }
+            });
+        }
+
         self.inner.frame_run()
     }
 
@@ -621,5 +659,204 @@ mod tests {
         evm.fund_beneficiary_for_system_tx_replay(U256::from(123u64));
 
         assert_eq!(read_beneficiary_balance(&mut evm, beneficiary), initial);
+    }
+
+    #[test]
+    fn prepare_marks_eip1559_tx_with_zero_effective_price() {
+        // BSC never enforces a base fee, so a non-zero fee cap with a zero priority fee
+        // still has an effective price of 0 and must be classified as a system tx.
+        let beneficiary = Address::from([0x10; 20]);
+        let evm = make_trace_replay_evm(beneficiary, VALIDATOR_SYSTEM_CONTRACT);
+        let mut tx = BscTxEnv::new(
+            TxEnv::builder()
+                .tx_type(Some(revm::context_interface::TransactionType::Eip1559 as u8))
+                .caller(beneficiary)
+                .chain_id(Some(56))
+                .gas_limit(21_000)
+                .gas_price(1_000_000_000) // non-zero fee cap
+                .gas_priority_fee(Some(0)) // zero priority fee => zero effective price
+                .kind(TxKind::Call(VALIDATOR_SYSTEM_CONTRACT))
+                .build()
+                .expect("tx env should build"),
+        );
+
+        evm.prepare_tx_for_execution(&mut tx);
+
+        assert!(
+            tx.is_system_transaction,
+            "EIP-1559 tx with zero effective gas price should be marked as system, \
+             even though its fee cap is non-zero"
+        );
+    }
+
+    #[test]
+    fn prepare_leaves_eip1559_tx_with_nonzero_effective_price_unmarked() {
+        let beneficiary = Address::from([0x10; 20]);
+        let evm = make_trace_replay_evm(beneficiary, VALIDATOR_SYSTEM_CONTRACT);
+        let mut tx = BscTxEnv::new(
+            TxEnv::builder()
+                .tx_type(Some(revm::context_interface::TransactionType::Eip1559 as u8))
+                .caller(beneficiary)
+                .chain_id(Some(56))
+                .gas_limit(21_000)
+                .gas_price(1_000_000_000)
+                .gas_priority_fee(Some(1)) // non-zero priority fee => non-zero effective price
+                .kind(TxKind::Call(VALIDATOR_SYSTEM_CONTRACT))
+                .build()
+                .expect("tx env should build"),
+        );
+
+        evm.prepare_tx_for_execution(&mut tx);
+
+        assert!(
+            !tx.is_system_transaction,
+            "EIP-1559 tx that actually pays a priority fee must not be classified as system"
+        );
+    }
+
+    /// Ported guard (go-bsc: "coinbase address cannot be used as contract address"): a call
+    /// into pre-existing bytecode deployed at the block's coinbase must fail before any of
+    /// that bytecode runs.
+    #[test]
+    fn call_into_code_deployed_at_coinbase_is_rejected() {
+        let coinbase = Address::from([0xC0; 20]);
+        let caller = Address::from([0x11; 20]);
+
+        let cfg_env = CfgEnv::new_with_spec(BscHardfork::Osaka).with_chain_id(56);
+        let block_env = BlockEnv {
+            beneficiary: coinbase,
+            prevrandao: Some(U256::from(1).into()),
+            ..Default::default()
+        };
+        let env = EvmEnv::new(cfg_env, block_env);
+
+        let mut db = InMemoryDB::default();
+        db.insert_account_info(
+            caller,
+            AccountInfo { balance: U256::from(1_000_000u64), ..AccountInfo::default() },
+        );
+        // PUSH1 0x01; PUSH1 0x00; SSTORE; STOP -- would leave storage slot 0 set to 1 if it
+        // ever ran.
+        let code = Bytecode::new_raw(Bytes::from(vec![0x60, 0x01, 0x60, 0x00, 0x55, 0x00]));
+        db.insert_account_info(coinbase, AccountInfo::default().with_code(code));
+
+        let mut evm = BscEvm::new(env, db, NoOpInspector, false, false);
+        let tx = BscTxEnv::new(
+            TxEnv::builder()
+                .caller(caller)
+                .chain_id(Some(56))
+                .gas_limit(100_000)
+                .gas_price(1)
+                .kind(TxKind::Call(coinbase))
+                .build()
+                .expect("tx env should build"),
+        );
+
+        let result = evm.transact_one(tx).expect("execution should not error");
+        match result {
+            ExecutionResult::Halt { reason, .. } => {
+                assert!(
+                    matches!(reason, HaltReason::PrecompileError),
+                    "expected the coinbase-as-contract guard to halt execution, got {reason:?}"
+                );
+            }
+            other => panic!(
+                "expected a halt when calling code deployed at the coinbase address, got {other:?}"
+            ),
+        }
+
+        // The guard must fire before any bytecode runs.
+        use revm::context::{ContextTr, JournalTr};
+        let slot =
+            evm.journal_mut().sload(coinbase, U256::ZERO).expect("sload should succeed").data;
+        assert_eq!(slot, U256::ZERO, "SSTORE must not have executed");
+    }
+
+    /// Same guard, but for a `CREATE` whose computed address happens to land on the coinbase.
+    #[test]
+    fn create_landing_on_coinbase_is_rejected() {
+        let caller = Address::from([0x11; 20]);
+        // The address a `CREATE` from `caller` at nonce 0 would produce, computed up front so
+        // it can be used as the block's coinbase.
+        let created_address = caller.create(0);
+
+        let cfg_env = CfgEnv::new_with_spec(BscHardfork::Osaka).with_chain_id(56);
+        let block_env = BlockEnv {
+            beneficiary: created_address,
+            prevrandao: Some(U256::from(1).into()),
+            ..Default::default()
+        };
+        let env = EvmEnv::new(cfg_env, block_env);
+
+        let mut db = InMemoryDB::default();
+        db.insert_account_info(
+            caller,
+            AccountInfo { balance: U256::from(1_000_000u64), ..AccountInfo::default() },
+        );
+
+        let mut evm = BscEvm::new(env, db, NoOpInspector, false, false);
+        // Init code that deploys a single non-empty runtime byte if it ever runs:
+        // MSTORE8(0, 0x00); RETURN(0, 1).
+        let init_code = vec![0x60, 0x00, 0x60, 0x00, 0x53, 0x60, 0x01, 0x60, 0x00, 0xF3];
+        let tx = BscTxEnv::new(
+            TxEnv::builder()
+                .caller(caller)
+                .chain_id(Some(56))
+                .gas_limit(200_000)
+                .gas_price(1)
+                .kind(TxKind::Create)
+                .data(Bytes::from(init_code))
+                .build()
+                .expect("tx env should build"),
+        );
+
+        let result = evm.transact_one(tx).expect("execution should not error");
+        assert!(
+            !result.is_success(),
+            "CREATE landing on the coinbase address must fail, got {result:?}"
+        );
+    }
+
+    /// Regression guard: only bytecode execution at the coinbase is blocked. A plain value
+    /// transfer to a coinbase with no code (tips, MEV payments, etc. — the common case on
+    /// every block) never reaches the interpreter and must be unaffected.
+    #[test]
+    fn call_to_coinbase_without_code_still_succeeds() {
+        let coinbase = Address::from([0xC0; 20]);
+        let caller = Address::from([0x11; 20]);
+
+        let cfg_env = CfgEnv::new_with_spec(BscHardfork::Osaka).with_chain_id(56);
+        let block_env = BlockEnv {
+            beneficiary: coinbase,
+            prevrandao: Some(U256::from(1).into()),
+            ..Default::default()
+        };
+        let env = EvmEnv::new(cfg_env, block_env);
+
+        let mut db = InMemoryDB::default();
+        db.insert_account_info(
+            caller,
+            AccountInfo { balance: U256::from(1_000_000u64), ..AccountInfo::default() },
+        );
+        // No account installed at `coinbase`: empty, no code.
+
+        let mut evm = BscEvm::new(env, db, NoOpInspector, false, false);
+        let tx = BscTxEnv::new(
+            TxEnv::builder()
+                .caller(caller)
+                .chain_id(Some(56))
+                .gas_limit(50_000)
+                .gas_price(1)
+                .value(U256::from(100u64))
+                .kind(TxKind::Call(coinbase))
+                .build()
+                .expect("tx env should build"),
+        );
+
+        let result = evm.transact_one(tx).expect("execution should not error");
+        assert!(
+            result.is_success(),
+            "a plain transfer to an empty coinbase account must succeed, got {result:?}"
+        );
     }
 }
