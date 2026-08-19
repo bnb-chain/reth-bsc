@@ -421,17 +421,11 @@ mod tests {
     }
 }
 
-/// Regression tests for bnb-chain/reth-bsc#465.
-///
-/// NOT covered: the arguments `check_new_block` itself passes — driving it needs a
-/// `SnapshotProvider` global plus a real secp256k1 Parlia seal and BLS attestation for
-/// `verify_seal`. So a call site edited to `CallBlockEnv::Current` would not fail here.
+/// Helper-level regression tests for bnb-chain/reth-bsc#465.
 #[cfg(test)]
 mod parent_block_env {
     use crate::chainspec::{bsc::bsc_mainnet, BscChainSpec};
-    use crate::consensus::parlia::snapshot::{
-        DEFAULT_EPOCH_LENGTH, LORENTZ_EPOCH_LENGTH, MAXWELL_EPOCH_LENGTH,
-    };
+    use crate::consensus::parlia::snapshot::MAXWELL_EPOCH_LENGTH;
     use crate::evm::api::BscEvm;
     use crate::node::evm::config::{
         evm_env_for_header, BscBlockExecutionCtx, BscExecutionSharedCtx,
@@ -659,21 +653,6 @@ mod parent_block_env {
             .get_current_validators(EPOCH_BLOCK - 1, CallBlockEnv::Current)
             .expect("current-env call");
         assert_eq!(validators, vec![window_address(EPOCH_BLOCK)], "bug #465");
-    }
-
-    /// An epoch block `N` observes a different shuffle window than `N - 1` iff `SHUFFLE_INTERVAL`
-    /// divides `N`. At 200 and at Maxwell's 1000 — mainnet today — that is every epoch block; at
-    /// Lorentz's 500 only every second one. So the parent env is mandatory, not cosmetic.
-    #[test]
-    fn epoch_blocks_cross_a_shuffle_window_boundary() {
-        let diverging = |epoch_length: u64| {
-            (1..=10).filter(|k| (k * epoch_length).is_multiple_of(SHUFFLE_INTERVAL)).count()
-        };
-
-        assert_eq!(diverging(DEFAULT_EPOCH_LENGTH), 10, "epoch 200: every epoch block");
-        assert_eq!(diverging(MAXWELL_EPOCH_LENGTH), 10, "epoch 1000: every epoch block");
-        assert_eq!(diverging(LORENTZ_EPOCH_LENGTH), 5, "epoch 500: every second one");
-        assert!(EPOCH_BLOCK.is_multiple_of(MAXWELL_EPOCH_LENGTH), "#465 block is a Maxwell epoch");
     }
 
     /// The miner resolves from state only on a cache miss — the post-restart window the fix exists

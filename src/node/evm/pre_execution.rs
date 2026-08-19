@@ -46,9 +46,7 @@ pub static TURN_LENGTH_CACHE: LazyLock<Mutex<TurnLengthCache>> = LazyLock::new(|
     Mutex::new(LruMap::new(ByLength::new(1024)))
 });
 
-/// Runs a read-only system-contract call in `header`'s env, over a DB already holding `header`'s
-/// post-state — go-bsc's `ethAPI.Call(args, BlockNumberOrHashWithHash(hash, false))`. Commits
-/// nothing.
+/// Runs a read-only system-contract call in `header`'s env over `header`'s post-state.
 fn view_call_at_header<DB, Spec>(
     db: DB,
     spec: &Spec,
@@ -68,10 +66,7 @@ where
     view_call_output(to, &data, result)
 }
 
-/// `getMiningValidators()` on `parent`'s post-state, in `parent`'s [`BlockEnv`].
-///
-/// The twin of [`BscBlockExecutor::get_current_validators`] with [`CallBlockEnv::Parent`], for
-/// callers that hold a state handle rather than an executor.
+/// `getMiningValidators()` on `parent`'s post-state in `parent`'s env.
 pub(crate) fn validators_at_parent<S, Spec>(
     state: S,
     spec: Spec,
@@ -97,12 +92,9 @@ where
     })
 }
 
-/// Which block's [`BlockEnv`] a Parlia system-contract read is evaluated in.
+/// Which block env a Parlia system-contract read uses.
 ///
-/// State is the parent's on both paths, so only reads whose *value* depends on the block env need
-/// [`Self::Parent`]. Today that is only `getMiningValidators()`: it seeds its 21-of-45 shuffle on
-/// `block.number / 200`, so blocks N and N-1 draw from different windows whenever N is a multiple
-/// of 200, and go-bsc evaluates it at the parent (bnb-chain/reth-bsc#465).
+/// Only `getMiningValidators()` needs `Parent`: the state is already the parent's on both paths.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum CallBlockEnv {
     /// The env of the block being executed.
@@ -112,11 +104,6 @@ pub(crate) enum CallBlockEnv {
 }
 
 /// The transaction shape used for read-only system-contract calls.
-///
-/// `gas_limit` is the gas limit of the block whose env the call runs in, so GASLIMIT reports it.
-/// `is_system_transaction` bypasses the EIP-7825 tx gas cap (16M), which BSC block gas limits
-/// exceed; it also zeroes BASEFEE and disables nonce checks. BSC's system-contract view functions
-/// read none of those, but a future contract reading BASEFEE would need this revisited.
 fn view_call_tx_env(to: Address, data: Bytes, gas_limit: u64, chain_id: u64) -> BscTxEnv {
     BscTxEnv {
         base: TxEnv {
@@ -330,15 +317,9 @@ where
         view_call_output(to, &data, result_and_state.result)
     }
 
-    /// Runs a read-only system-contract call in the **parent** block's env.
+    /// Runs the same read-only system call against the current DB, but under `parent`'s env.
     ///
-    /// go-bsc's `ethAPI.Call(args, BlockNumberOrHashWithHash(header.ParentHash, false))`. The state
-    /// is already the parent's, so only the [`BlockEnv`] has to be substituted — and since [`Evm`]
-    /// exposes no mutable block accessor, that means a throwaway EVM over the same DB. Nothing is
-    /// committed.
-    ///
-    /// PRECONDITION: only valid before any of this block's state changes are applied, i.e. from
-    /// `check_new_block` / `prepare_new_block`.
+    /// PRECONDITION: only valid before this block mutates state.
     fn eth_call_at_parent(
         &mut self,
         to: Address,

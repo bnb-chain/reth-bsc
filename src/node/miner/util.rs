@@ -24,12 +24,9 @@ use reth_primitives_traits::SealedHeader;
 use reth_provider::StateProviderFactory;
 use std::sync::Arc;
 
-/// The epoch validator set that block `parent_header.number + 1` must carry, or `None` when that
-/// block is not an epoch block.
+/// Returns the validator set for `parent_header.number + 1`, or `None` off the epoch boundary.
 ///
-/// Read on the parent's state and in the parent's env — see `CallBlockEnv`. Resolved here rather
-/// than in [`finalize_new_header`] so `simulate_bid_block` needs no state handle, and memoized under
-/// the parent hash, so sealing after the parent has executed reads no state.
+/// Reads under the parent's state/env and caches by `parent.hash()`.
 pub(crate) fn epoch_validators_for_next_block<C>(
     client: &C,
     chain_spec: &Arc<BscChainSpec>,
@@ -169,14 +166,9 @@ where
     new_header
 }
 
-/// finalize a new header and seal it.
+/// Finalize a new header and seal it.
 ///
-/// `block_timestamp_ms` is the millisecond timestamp decided by `prepare_timestamp` and
-/// cached on `MiningContext`.
-///
-/// `epoch_validators` is the set the block must carry when it is an epoch block, and `None`
-/// otherwise; an epoch block with `None` is rejected rather than sealed with a guess. Produced by
-/// `epoch_validators_for_next_block`.
+/// Epoch blocks require an explicit validator set from the caller.
 pub fn finalize_new_header<ChainSpec>(
     parlia: Arc<Parlia<ChainSpec>>,
     parent_snap: &Snapshot,
