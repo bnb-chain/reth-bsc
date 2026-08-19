@@ -392,6 +392,7 @@ fn round_trip_build_finalize_reexecute_agree() {
         &mut plain.header,
         &snapshot_provider,
         (parent.timestamp + 3) * 1000,
+        None, // not an epoch block
     )
     .expect("finalize header");
 
@@ -501,7 +502,7 @@ fn execution_gate_round_trip() {
         let BlockBuilderOutcome { execution_result, block, .. } = out;
         let senders = block.senders().to_vec();
         let mut plain = block.sealed_block().clone_block();
-        finalize_new_header(parlia.clone(), &genesis_snap, &genesis, &mut plain.header, &snapshot_provider, (genesis.timestamp + 3) * 1000)
+        finalize_new_header(parlia.clone(), &genesis_snap, &genesis, &mut plain.header, &snapshot_provider, (genesis.timestamp + 3) * 1000, None) // not an epoch block
             .expect("finalize b1");
         let output = BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
         (RecoveredBlock::new_unhashed(plain, senders), output)
@@ -589,6 +590,7 @@ fn execution_gate_round_trip() {
         block1_sealed.gas_limit,
         alloy_primitives::Bytes::from(vec![0u8; 32]),
         (block1_sealed.timestamp + 3) * 1000,
+        None, // not an epoch block
     )
     .expect("simulate bid block");
 

@@ -146,7 +146,11 @@ where
         if is_next_epoch {  // cache validators
             // cache it on pre block.
             // for verify validators in post-check of fullnode mode and prepare new header in miner mode.
-            self.get_current_validators_with_cache(header.number, header.hash_slow())?;
+            self.get_current_validators_with_cache(
+                header.number,
+                header.hash_slow(),
+                CallBlockEnv::Current, // unchanged: this block's own env
+            )?;
         }
 
         { // cache turnlength

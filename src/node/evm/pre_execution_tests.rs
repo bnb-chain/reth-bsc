@@ -437,11 +437,11 @@ mod parent_block_env {
         evm_env_for_header, BscBlockExecutionCtx, BscExecutionSharedCtx,
     };
     use crate::node::evm::executor::BscBlockExecutor;
-    use crate::node::evm::pre_execution::CallBlockEnv;
+    use crate::node::evm::pre_execution::{CallBlockEnv, VALIDATOR_CACHE};
     use crate::system_contracts::{SystemContract, VALIDATOR_CONTRACT};
     use alloy_consensus::Header;
     use alloy_evm::eth::EthBlockExecutionCtx;
-    use alloy_primitives::{hex, Address, Bytes, U160};
+    use alloy_primitives::{hex, Address, Bytes, B256, U160};
     use reth_evm_ethereum::RethReceiptBuilder;
     use revm::bytecode::Bytecode;
     use revm::database::InMemoryDB;
@@ -456,7 +456,7 @@ mod parent_block_env {
     /// The mainnet epoch block from #465.
     const EPOCH_BLOCK: u64 = 115_596_000;
 
-    /// Stand-in for `ValidatorSet`, returning `getMiningValidators()`-shaped output whose single
+    /// Stand-in for the `ValidatorSet` contract, returning `getMiningValidators()`-shaped output whose single
     /// validator address is literally `block.number / 200` — so the decoded set names the shuffle
     /// window the callee observed.
     ///
@@ -498,6 +498,89 @@ mod parent_block_env {
             blob_gas_used: Some(0),
             ..Default::default()
         }
+    }
+
+    /// The standalone, provider-backed twin of the executor path. Nothing re-checks its result
+    /// before the header is sealed, so a drift between the two would only surface as a
+    /// network-wide rejection (bnb-chain/reth-bsc#465).
+    mod standalone {
+        use super::*;
+        use crate::node::evm::pre_execution::validators_at_parent;
+        use alloy_primitives::{B256, U256};
+        use reth_primitives_traits::{Account, Bytecode as PrimitivesBytecode, SealedHeader};
+        use reth_provider::ProviderResult;
+        use reth_revm::database::EvmStateProvider;
+
+        /// Serves [`WINDOW_REPORTING_VALIDATOR_SET`] as the code of `VALIDATOR_CONTRACT`, or an
+        /// empty state when `code` is `None` — i.e. the contract not deployed.
+        struct ParentState {
+            code: Option<PrimitivesBytecode>,
+        }
+
+        impl ParentState {
+            fn code_hash(&self) -> B256 {
+                self.code.as_ref().map(|c| c.hash_slow()).unwrap_or_default()
+            }
+        }
+
+        impl EvmStateProvider for ParentState {
+            fn basic_account(&self, address: &Address) -> ProviderResult<Option<Account>> {
+                Ok((self.code.is_some() && *address == VALIDATOR_CONTRACT).then_some(Account {
+                    nonce: 0,
+                    balance: U256::ZERO,
+                    bytecode_hash: Some(self.code_hash()),
+                }))
+            }
+
+            fn block_hash(&self, _: u64) -> ProviderResult<Option<B256>> {
+                Ok(None)
+            }
+
+            fn bytecode_by_hash(
+                &self,
+                code_hash: &B256,
+            ) -> ProviderResult<Option<PrimitivesBytecode>> {
+                Ok((code_hash == &self.code_hash()).then(|| self.code.clone()).flatten())
+            }
+
+            fn storage(&self, _: Address, _: B256) -> ProviderResult<Option<U256>> {
+                Ok(None)
+            }
+        }
+
+        fn parent_state() -> ParentState {
+            let code = PrimitivesBytecode(Bytecode::new_raw(Bytes::from_static(
+                WINDOW_REPORTING_VALIDATOR_SET,
+            )));
+            ParentState { code: Some(code) }
+        }
+
+        #[test]
+        fn observes_the_parent_shuffle_window() {
+            let spec = Arc::new(BscChainSpec::from(bsc_mainnet()));
+            let parent = SealedHeader::seal_slow(header_at(EPOCH_BLOCK - 1));
+
+            let (set, _) = validators_at_parent(parent_state(), spec, &parent).unwrap();
+
+            assert_eq!(
+                set,
+                vec![window_address(EPOCH_BLOCK - 1)],
+                "must draw from the parent's window, not the epoch block's"
+            );
+        }
+
+        /// A call to an address with no code succeeds with empty returndata, which the ABI unpack
+        /// would `unwrap()`-panic on — inside a payload job or the bid loop, where a panic is
+        /// permanent. It must surface as an error instead.
+        #[test]
+        fn missing_validator_set_contract_errors_rather_than_panicking() {
+            let spec = Arc::new(BscChainSpec::from(bsc_mainnet()));
+            let parent = SealedHeader::seal_slow(header_at(EPOCH_BLOCK - 1));
+
+            let err = validators_at_parent(ParentState { code: None }, spec, &parent).unwrap_err();
+            assert!(err.to_string().contains("no data"), "unexpected error: {err}");
+        }
+
     }
 
     type TestExecutor = BscBlockExecutor<
@@ -591,6 +674,71 @@ mod parent_block_env {
         assert_eq!(diverging(MAXWELL_EPOCH_LENGTH), 10, "epoch 1000: every epoch block");
         assert_eq!(diverging(LORENTZ_EPOCH_LENGTH), 5, "epoch 500: every second one");
         assert!(EPOCH_BLOCK.is_multiple_of(MAXWELL_EPOCH_LENGTH), "#465 block is a Maxwell epoch");
+    }
+
+    /// Guards the call site, not just the mechanism. `get_current_validators` is *told* which env
+    /// to use, so the test above passes even with the fix reverted — this one asks the validation
+    /// path what it actually requests for an epoch block (bnb-chain/reth-bsc#465).
+    #[test]
+    fn the_epoch_call_site_asks_for_the_parents_window() {
+        let mut executor = executor();
+        // A fresh parent hash keeps this off any other test's cache entry.
+        let header = Header { parent_hash: B256::random(), ..header_at(EPOCH_BLOCK) };
+
+        let (validators, _) =
+            executor.declared_epoch_validators(&header).expect("epoch validators");
+
+        assert_eq!(
+            validators,
+            vec![window_address(EPOCH_BLOCK - 1)],
+            "the epoch call site must ask for N-1's window, not N's"
+        );
+        // And it must file that answer under N-1, per VALIDATOR_CACHE's invariant: keying it under
+        // N would hand N-1's window to whoever validates or seals N+1.
+        assert_eq!(
+            VALIDATOR_CACHE.lock().unwrap().get(&header.parent_hash).unwrap().0,
+            vec![window_address(EPOCH_BLOCK - 1)],
+        );
+    }
+
+    /// The miner resolves from state only on a cache miss — the post-restart window the fix exists
+    /// to close. Reintroducing #465 on this path produces a block the network rejects, silently.
+    #[test]
+    fn the_miner_reads_the_parents_window_on_a_cache_miss() {
+        use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
+
+        let client = MockEthProvider::default();
+        client.add_account(
+            VALIDATOR_CONTRACT,
+            ExtendedAccount::new(0, alloy_primitives::U256::ZERO)
+                .with_bytecode(Bytes::from_static(WINDOW_REPORTING_VALIDATOR_SET)),
+        );
+        // A fresh hash forces the miss; `epoch_num` makes EPOCH_BLOCK the next epoch block.
+        let parent = reth_primitives_traits::SealedHeader::new(
+            header_at(EPOCH_BLOCK - 1),
+            alloy_primitives::B256::random(),
+        );
+        let snap = crate::consensus::parlia::Snapshot::new(
+            vec![Address::with_last_byte(1)],
+            EPOCH_BLOCK - 1,
+            parent.hash(),
+            MAXWELL_EPOCH_LENGTH,
+            None,
+        );
+
+        let resolved = crate::node::miner::util::epoch_validators_for_next_block(
+            &client,
+            &Arc::new(BscChainSpec::from(bsc_mainnet())),
+            &snap,
+            &parent,
+        )
+        .expect("state read on cache miss");
+
+        assert_eq!(
+            resolved.map(|(validators, _)| validators),
+            Some(vec![window_address(EPOCH_BLOCK - 1)]),
+            "the miner must evaluate at the parent, not at the epoch block"
+        );
     }
 
     #[test]

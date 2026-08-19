@@ -9,10 +9,11 @@ use crate::consensus::parlia::util::{
     calculate_difficulty, debug_header, set_millisecond_part_of_timestamp,
 };
 use crate::consensus::parlia::Snapshot;
-use crate::consensus::parlia::VoteAddress;
 use crate::consensus::parlia::{EXTRA_SEAL_LEN, EXTRA_VANITY_LEN};
 use crate::hardforks::BscHardforks;
-use crate::node::evm::pre_execution::VALIDATOR_CACHE;
+use crate::node::evm::pre_execution::{
+    validators_at_parent, EpochValidators, VALIDATOR_CACHE,
+};
 use crate::node::miner::bsc_miner::MiningContext;
 use crate::node::miner::signer::{seal_header_with_global_signer, SignerError};
 use alloy_consensus::{BlockHeader, Header};
@@ -20,50 +21,62 @@ use alloy_primitives::{Address, Bytes, B256};
 use reth_node_ethereum::engine::EthPayloadAttributes;
 use reth_chainspec::EthChainSpec;
 use reth_primitives_traits::SealedHeader;
+use reth_provider::StateProviderFactory;
 use std::sync::Arc;
 
-fn resolve_epoch_validators(
+/// The epoch validator set that block `parent_header.number + 1` must carry, or `None` when that
+/// block is not an epoch block.
+///
+/// Read on the parent's state and in the parent's env — see `CallBlockEnv`. Resolved here rather
+/// than in [`finalize_new_header`] so `simulate_bid_block` needs no state handle, and memoized under
+/// the parent hash, so sealing after the parent has executed reads no state.
+pub(crate) fn epoch_validators_for_next_block<C>(
+    client: &C,
+    chain_spec: &Arc<BscChainSpec>,
     parent_snap: &Snapshot,
     parent_header: &SealedHeader,
-) -> Result<(Vec<Address>, Vec<VoteAddress>), SignerError> {
+) -> Result<Option<EpochValidators>, SignerError>
+where
+    C: StateProviderFactory,
+{
+    if !(parent_header.number() + 1).is_multiple_of(parent_snap.epoch_num) {
+        return Ok(None);
+    }
     let parent_hash = parent_header.hash();
-    let mut cache = VALIDATOR_CACHE.lock().unwrap();
-    if let Some(cached_result) = cache.get(&parent_hash) {
+    // Bind the lookup so the guard drops here: under edition 2021 an `if let` on the guard itself
+    // would hold the lock across its whole body.
+    let cached = VALIDATOR_CACHE.lock().unwrap().get(&parent_hash).cloned();
+    if let Some(validators) = cached {
         tracing::debug!(
-            "Succeed to query cached validator result, block_number: {}, block_hash: {}",
-            parent_header.number(),
-            parent_hash
+            target: "bsc::miner",
+            block_number = parent_header.number() + 1,
+            validators = ?validators.0,
+            "Epoch validators from cache"
         );
-        return Ok(cached_result.clone());
+        return Ok(Some(validators));
     }
 
-    if parent_snap.validators.is_empty() {
-        return Err(SignerError::SigningFailed(format!(
-            "Missing epoch validators for parent block {} ({})",
-            parent_header.number(), parent_hash
-        )));
-    }
-
-    let validators = parent_snap.validators.clone();
-    let vote_addresses = validators
-        .iter()
-        .map(|validator| {
-            parent_snap
-                .validators_map
-                .get(validator)
-                .map(|info| info.vote_addr)
-                .unwrap_or(VoteAddress::ZERO)
-        })
-        .collect::<Vec<_>>();
-
+    let failed = |e: &dyn std::fmt::Display| {
+        SignerError::SigningFailed(format!(
+            "Failed to read epoch validators from parent block {} ({}): {e}",
+            parent_header.number(),
+            parent_hash,
+        ))
+    };
+    let state = client.state_by_block_hash(parent_hash).map_err(|e| failed(&e))?;
+    let validators = validators_at_parent(&state, chain_spec.clone(), parent_header)
+        .map_err(|e| failed(&e))?;
+    // Worth a `warn!`: the parent should have filled the cache, so a miss here means this process
+    // did not execute it — the restart window #465 stalls in.
     tracing::warn!(
         target: "bsc::miner",
-        block_number = parent_header.number(),
-        block_hash = %parent_hash,
-        "Validator cache miss on epoch boundary, falling back to parent snapshot validators"
+        block_number = parent_header.number() + 1,
+        %parent_hash,
+        validators = ?validators.0,
+        "Epoch validators read from parent state after a cache miss"
     );
-    cache.insert(parent_hash, (validators.clone(), vote_addresses.clone()));
-    Ok((validators, vote_addresses))
+    VALIDATOR_CACHE.lock().unwrap().insert(parent_hash, validators.clone());
+    Ok(Some(validators))
 }
 
 /// Prepare a new block's header and derive the payload builder attributes.
@@ -160,6 +173,10 @@ where
 ///
 /// `block_timestamp_ms` is the millisecond timestamp decided by `prepare_timestamp` and
 /// cached on `MiningContext`.
+///
+/// `epoch_validators` is the set the block must carry when it is an epoch block, and `None`
+/// otherwise; an epoch block with `None` is rejected rather than sealed with a guess. Produced by
+/// `epoch_validators_for_next_block`.
 pub fn finalize_new_header<ChainSpec>(
     parlia: Arc<Parlia<ChainSpec>>,
     parent_snap: &Snapshot,
@@ -167,6 +184,7 @@ pub fn finalize_new_header<ChainSpec>(
     new_header: &mut Header,
     snapshot_provider: &Arc<dyn SnapshotProvider + Send + Sync>,
     block_timestamp_ms: u64,
+    epoch_validators: Option<EpochValidators>,
 ) -> Result<(), crate::node::miner::signer::SignerError>
 where
     ChainSpec: EthChainSpec + crate::hardforks::BscHardforks + 'static,
@@ -197,7 +215,13 @@ where
         // Use epoch_num from parent snapshot for epoch boundary check
         let epoch_length = parent_snap.epoch_num;
         if (new_header.number).is_multiple_of(epoch_length) {
-            let validators = resolve_epoch_validators(parent_snap, parent_header)?;
+            let validators = epoch_validators.ok_or_else(|| {
+                SignerError::SigningFailed(format!(
+                    "Epoch block {} needs epoch validators, but none were supplied (parent {})",
+                    new_header.number,
+                    parent_header.hash(),
+                ))
+            })?;
             parlia.prepare_validators(parent_snap, Some(validators), new_header);
         }
     }
@@ -353,80 +377,142 @@ mod tests {
         VALIDATOR_BYTES_LEN_AFTER_LUBAN, VALIDATOR_NUMBER_SIZE,
     };
     use crate::consensus::parlia::vote::{VoteAttestation, VoteData};
+    use crate::chainspec::bsc::bsc_mainnet;
+    use crate::consensus::parlia::VoteAddress;
+    use reth_provider::test_utils::MockEthProvider;
     use alloy_primitives::B256;
 
     fn unique_parent_header(number: u64) -> Header {
         Header { number, parent_hash: B256::random(), ..Default::default() }
     }
 
+    /// The gate: a non-epoch child needs no set, and deciding that must not touch state.
     #[test]
-    fn resolve_epoch_validators_falls_back_to_snapshot_on_cache_miss() {
-        let parent_header = unique_parent_header(499);
-        let parent_hash = parent_header.hash_slow();
+    fn epoch_validators_are_only_resolved_for_epoch_blocks() {
+        let parent = SealedHeader::seal_slow(Header { number: 5, ..Default::default() });
+        // `epoch_num = 2` makes 6 an epoch block and 7 not one.
+        let at_boundary = Snapshot::new(vec![Address::with_last_byte(1)], 5, parent.hash(), 2, None);
+        let off_boundary =
+            Snapshot::new(vec![Address::with_last_byte(1)], 5, parent.hash(), 4, None);
+        let spec = Arc::new(BscChainSpec::from(bsc_mainnet()));
+        // A provider that knows nothing: reaching it at all is a failure, not a `None`.
+        let client = MockEthProvider::default();
 
-        let validators = vec![
-            Address::with_last_byte(2),
-            Address::with_last_byte(1),
-            Address::with_last_byte(3),
-        ];
-        let vote_addresses = vec![
-            VoteAddress::with_last_byte(22),
-            VoteAddress::with_last_byte(11),
-            VoteAddress::with_last_byte(33),
-        ];
-        let parent_snap =
-            Snapshot::new(validators, 499, B256::random(), 500, Some(vote_addresses.clone()));
-
-        let resolved =
-            resolve_epoch_validators(&parent_snap, &SealedHeader::seal_slow(parent_header)).unwrap();
-
-        assert_eq!(resolved.0, parent_snap.validators);
-        assert_eq!(resolved.1.len(), parent_snap.validators.len());
-        for (i, validator) in parent_snap.validators.iter().enumerate() {
-            assert_eq!(resolved.1[i], parent_snap.validators_map.get(validator).unwrap().vote_addr);
-        }
-
-        let mut cache = VALIDATOR_CACHE.lock().unwrap();
-        let cached = cache.get(&parent_hash).unwrap();
-        assert_eq!(cached.0, resolved.0);
-        assert_eq!(cached.1, resolved.1);
+        assert_eq!(
+            epoch_validators_for_next_block(&client, &spec, &off_boundary, &parent).unwrap(),
+            None,
+            "block 6 is not a multiple of 4, so no state should be read"
+        );
+        epoch_validators_for_next_block(&client, &spec, &at_boundary, &parent)
+            .expect_err("block 6 is a multiple of 2, so the empty provider must surface an error");
     }
 
+    /// The memo: an entry the parent's own execution already left is used as-is, so sealing an
+    /// epoch block reads no state. Its key and value are [`VALIDATOR_CACHE`]'s (see its invariant).
     #[test]
-    fn resolve_epoch_validators_prefers_cache() {
-        let parent_header = unique_parent_header(799);
-        let parent_hash = parent_header.hash_slow();
+    fn epoch_validators_come_from_the_cache_when_the_parent_filled_it() {
+        let parent = SealedHeader::seal_slow(Header {
+            number: 5,
+            parent_hash: B256::random(), // unique, so this test owns its cache entry
+            ..Default::default()
+        });
+        let snap = Snapshot::new(vec![Address::with_last_byte(1)], 5, parent.hash(), 2, None);
+        let expected = (vec![Address::with_last_byte(9)], vec![VoteAddress::with_last_byte(99)]);
+        VALIDATOR_CACHE.lock().unwrap().insert(parent.hash(), expected.clone());
 
-        let cached_validators = vec![Address::with_last_byte(9), Address::with_last_byte(7)];
-        let cached_vote_addresses =
-            vec![VoteAddress::with_last_byte(99), VoteAddress::with_last_byte(77)];
-        {
-            let mut cache = VALIDATOR_CACHE.lock().unwrap();
-            cache.insert(parent_hash, (cached_validators.clone(), cached_vote_addresses.clone()));
-        }
+        let resolved = epoch_validators_for_next_block(
+            &MockEthProvider::default(),
+            &Arc::new(BscChainSpec::from(bsc_mainnet())),
+            &snap,
+            &parent,
+        )
+        .expect("cache hit must not need the provider");
 
-        let parent_snap =
-            Snapshot::new(vec![Address::with_last_byte(1)], 799, B256::random(), 500, None);
-        let resolved =
-            resolve_epoch_validators(&parent_snap, &SealedHeader::seal_slow(parent_header)).unwrap();
-
-        assert_eq!(resolved.0, cached_validators);
-        assert_eq!(resolved.1, cached_vote_addresses);
+        assert_eq!(resolved, Some(expected));
     }
 
-    #[test]
-    fn resolve_epoch_validators_errors_when_no_cache_or_snapshot_validators() {
-        let parent_header = unique_parent_header(999);
-        let parent_snap = Snapshot::default();
+    /// A single-validator epoch block at height 2: `epoch_num = 2` makes it an epoch boundary
+    /// while staying under the height-3 short-circuit in `assemble_vote_attestation`. Bohr is not
+    /// enabled by `lorentz_chain_spec`, so no turn-length byte follows the validator records.
+    fn epoch_block_fixture() -> (Arc<Parlia<BscChainSpec>>, Snapshot, SealedHeader, Header) {
+        let parlia = Arc::new(Parlia::new(lorentz_chain_spec(), 200));
+        let parent = SealedHeader::seal_slow(Header {
+            number: 1,
+            timestamp: 1_776_727_552,
+            ..Default::default()
+        });
+        let validator = Address::with_last_byte(1);
+        let parent_snap = Snapshot::new(vec![validator], 1, parent.hash(), 2, None);
+        let header = Header {
+            number: 2,
+            parent_hash: parent.hash(),
+            beneficiary: validator,
+            timestamp: parent.timestamp() + 1,
+            extra_data: Bytes::from(vec![0u8; EXTRA_VANITY_LEN]),
+            ..Default::default()
+        };
+        (parlia, parent_snap, parent, header)
+    }
 
-        let err =
-            resolve_epoch_validators(&parent_snap, &SealedHeader::seal_slow(parent_header))
-                .unwrap_err();
+    /// Fail-closed at an epoch block: there is no fallback, because the only set reachable without
+    /// the parent's state (the snapshot's) is the *outgoing* one — sealing that would produce a
+    /// block the rest of the network rejects (bnb-chain/reth-bsc#465).
+    #[test]
+    fn finalize_new_header_rejects_an_epoch_block_without_validators() {
+        let (parlia, parent_snap, parent, mut header) = epoch_block_fixture();
+        let sp: Arc<dyn SnapshotProvider + Send + Sync> =
+            Arc::new(MockSnapshotProvider { snapshot: parent_snap.clone() });
+        let planned_ms = header.timestamp * 1000;
+
+        let err = finalize_new_header(
+            parlia,
+            &parent_snap,
+            &parent,
+            &mut header,
+            &sp,
+            planned_ms,
+            None,
+        )
+        .unwrap_err();
+
         match err {
             SignerError::SigningFailed(msg) => {
-                assert!(msg.contains("Missing epoch validators"), "unexpected message: {}", msg);
+                assert!(msg.contains("needs epoch validators"), "unexpected message: {msg}");
             }
-            other => panic!("unexpected error: {:?}", other),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    /// Whatever set the caller supplies is what the epoch block's extra data carries —
+    /// `finalize_new_header` no longer sources it itself.
+    #[test]
+    fn finalize_new_header_writes_the_supplied_epoch_validators() {
+        ensure_test_signer();
+        let (parlia, parent_snap, parent, mut header) = epoch_block_fixture();
+        let sp: Arc<dyn SnapshotProvider + Send + Sync> =
+            Arc::new(MockSnapshotProvider { snapshot: parent_snap.clone() });
+        let planned_ms = header.timestamp * 1000;
+        let mut validators = vec![Address::with_last_byte(9), Address::with_last_byte(7)];
+
+        finalize_new_header(
+            parlia,
+            &parent_snap,
+            &parent,
+            &mut header,
+            &sp,
+            planned_ms,
+            Some((validators.clone(), vec![VoteAddress::ZERO; validators.len()])),
+        )
+        .expect("finalize_new_header should succeed");
+
+        // Assert the layout, not mere presence: these addresses are 19 zero bytes plus one
+        // significant byte and sit among long zero runs, so a substring search matches by chance.
+        let payload = &header.extra_data[EXTRA_VANITY_LEN..];
+        assert_eq!(payload[0] as usize, validators.len(), "validator count");
+        validators.sort(); // prepare_validators sorts before writing
+        for (i, validator) in validators.iter().enumerate() {
+            let at = VALIDATOR_NUMBER_SIZE + i * VALIDATOR_BYTES_LEN_AFTER_LUBAN;
+            assert_eq!(&payload[at..at + 20], validator.as_slice(), "validator {i}");
         }
     }
 
@@ -895,6 +981,7 @@ mod tests {
             &mut header,
             &sp,
             planned_ms,
+            None, // block 2 is not an epoch block at epoch_num 500
         )
         .expect("finalize_new_header should succeed");
 

@@ -4,7 +4,7 @@ use super::factory::BscEvmFactory;
 use crate::evm::transaction::BscTxEnv;
 
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
-use reth_evm::{eth::receipt_builder::ReceiptBuilder, execute::BlockExecutionError, Evm, EvmFactory, FromRecoveredTx, FromTxWithEncoded, IntoTxEnv};
+use reth_evm::{eth::receipt_builder::ReceiptBuilder, execute::BlockExecutionError, Database, Evm, EvmFactory, FromRecoveredTx, FromTxWithEncoded, IntoTxEnv};
 use reth_ethereum_primitives::TransactionSigned;
 use revm::{
     context::{result::ExecutionResult, BlockEnv, TxEnv},
@@ -18,10 +18,12 @@ use crate::consensus::parlia::util::{is_breathe_block, debug_header};
 use crate::consensus::parlia::vote::MAX_ATTESTATION_EXTRA_LENGTH;
 use crate::node::evm::error::{BscBlockExecutionError, BscBlockValidationError};
 use crate::node::evm::util::HEADER_CACHE_READER;
+use crate::system_contracts::SystemContract;
+use reth_revm::{database::{EvmStateProvider, StateProviderDatabase}, db::State};
 use crate::system_contracts::feynman_fork::ValidatorElectionInfo;
 use std::{collections::HashMap, sync::{LazyLock, Mutex}};
 use schnellru::{ByLength, LruMap};
-use reth_primitives_traits::GotExpected;
+use reth_primitives_traits::{GotExpected, SealedHeader};
 use blst::{
     min_pk::{PublicKey, Signature},
     BLST_ERROR,
@@ -31,9 +33,21 @@ use crate::consensus::parlia::constants::K_ANCESTOR_GENERATION_DEPTH;
 
 const BLST_DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
 
-type ValidatorCache = LruMap<BlockHash, (Vec<Address>, Vec<VoteAddress>), ByLength>;
+/// A validator set paired with each member's BLS vote address, as `getMiningValidators()` returns
+/// them post-Luban (empty vote addresses before it).
+pub type EpochValidators = (Vec<Address>, Vec<VoteAddress>);
+
+type ValidatorCache = LruMap<BlockHash, EpochValidators, ByLength>;
 type TurnLengthCache = LruMap<BlockHash, u8, ByLength>;
 
+/// `getMiningValidators()` memoized by the block it was evaluated at.
+///
+/// INVARIANT: the entry under `hash(B)` is the result evaluated in block `B`'s env on `B`'s
+/// post-state. Block validation reads this map, so an entry derived any other way forks the node
+/// (bnb-chain/reth-bsc#465).
+///
+/// Writers use two env constructors (`evm_env_for_header`, `next_evm_env`) that agree only on
+/// `block.number` — so only a value depending on nothing else may be cached here.
 pub static VALIDATOR_CACHE: LazyLock<Mutex<ValidatorCache>> = LazyLock::new(|| {
     Mutex::new(LruMap::new(ByLength::new(1024)))
 });
@@ -42,10 +56,63 @@ pub static TURN_LENGTH_CACHE: LazyLock<Mutex<TurnLengthCache>> = LazyLock::new(|
     Mutex::new(LruMap::new(ByLength::new(1024)))
 });
 
+/// Runs a read-only system-contract call in `header`'s env, over a DB already holding `header`'s
+/// post-state — go-bsc's `ethAPI.Call(args, BlockNumberOrHashWithHash(hash, false))`. Commits
+/// nothing.
+fn view_call_at_header<DB, Spec>(
+    db: DB,
+    spec: &Spec,
+    header: &Header,
+    to: Address,
+    data: Bytes,
+) -> Result<Bytes, BlockExecutionError>
+where
+    DB: Database,
+    Spec: EthChainSpec + crate::hardforks::BscHardforks + Clone,
+{
+    let tx_env = view_call_tx_env(to, data.clone(), header.gas_limit, spec.chain().id());
+    let mut evm = BscEvmFactory::default().create_evm(db, evm_env_for_header(spec, header));
+    // UFCS on purpose: `BscEvm` also implements `revm::ExecuteEvm::transact`, which skips the
+    // system-transaction env overrides that `Evm::transact` applies.
+    let result = Evm::transact(&mut evm, tx_env).map_err(BlockExecutionError::other)?.result;
+    view_call_output(to, &data, result)
+}
+
+/// `getMiningValidators()` on `parent`'s post-state, in `parent`'s [`BlockEnv`].
+///
+/// The twin of [`BscBlockExecutor::get_current_validators`] with [`CallBlockEnv::Parent`], for
+/// callers that hold a state handle rather than an executor.
+pub(crate) fn validators_at_parent<S, Spec>(
+    state: S,
+    spec: Spec,
+    parent: &SealedHeader,
+) -> Result<EpochValidators, BlockExecutionError>
+where
+    S: EvmStateProvider,
+    Spec: EthChainSpec + crate::hardforks::BscHardforks + Clone,
+{
+    let mut db = State::builder().with_database(StateProviderDatabase::new(state)).build();
+    let system_contracts = SystemContract::new(spec.clone());
+    let is_luban = spec.is_luban_active_at_block(parent.number());
+    let (to, data) = if is_luban {
+        system_contracts.get_current_validators()
+    } else {
+        system_contracts.get_current_validators_before_luban(parent.number())
+    };
+    let output = view_call_at_header(&mut db, &spec, parent.header(), to, data)?;
+    Ok(if is_luban {
+        system_contracts.unpack_data_into_validator_set(&output)
+    } else {
+        (system_contracts.unpack_data_into_validator_set_before_luban(&output), Vec::new())
+    })
+}
+
 /// Which block's [`BlockEnv`] a Parlia system-contract read is evaluated in.
 ///
 /// State is the parent's on both paths, so only reads whose *value* depends on the block env need
-/// [`Self::Parent`]. Today that is only `getMiningValidators()`.
+/// [`Self::Parent`]. Today that is only `getMiningValidators()`: it seeds its 21-of-45 shuffle on
+/// `block.number / 200`, so blocks N and N-1 draw from different windows whenever N is a multiple
+/// of 200, and go-bsc evaluates it at the parent (bnb-chain/reth-bsc#465).
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum CallBlockEnv {
     /// The env of the block being executed.
@@ -92,7 +159,16 @@ fn view_call_output<H>(
         tracing::error!("Failed to eth call, to: {:?}, data: {:?}", to, data);
         return Err(BlockExecutionError::msg("ETH call failed"));
     }
-    result.into_output().ok_or_else(|| BlockExecutionError::msg("ETH call output is None"))
+    let output = result
+        .into_output()
+        .ok_or_else(|| BlockExecutionError::msg("ETH call output is None"))?;
+    // A call to a codeless address succeeds with empty returndata, which every `unpack_*` below
+    // would then `unwrap()`-panic on. Report it as a failed read instead.
+    if output.is_empty() {
+        tracing::error!("Empty eth call output, to: {:?}, data: {:?}", to, data);
+        return Err(BlockExecutionError::msg("ETH call returned no data"));
+    }
+    Ok(output)
 }
 
 impl<'a, EVM, Spec, R: ReceiptBuilder> BscBlockExecutor<'a, EVM, Spec, R>
@@ -143,21 +219,7 @@ where
 
         let epoch_length = snap.epoch_num;
         if header.number.is_multiple_of(epoch_length) {
-            // Evaluate in the PARENT block's env, matching go-bsc `verifyValidators` ->
-            // `getCurrentValidators(header.ParentHash, N-1)`. Not cosmetic: `getMiningValidators()`
-            // draws its 21-of-45 result with seed `block.number / 200`, so an epoch block that is
-            // itself a multiple of 200 draws from a different window than its parent and returns a
-            // different set (bnb-chain/reth-bsc#465). That is every epoch block at epoch lengths
-            // 200 and 1000 (mainnet is 1000 post-Maxwell), and every second one at Lorentz's 500.
-            let (validator_set, vote_addresses) =
-                self.get_current_validators(header.number - 1, CallBlockEnv::Parent)?;
-            // Write-only, and must NOT become a read-through: `miner::util::resolve_epoch_validators`
-            // writes this same key from a snapshot, and block validation must not depend on a global
-            // with writers outside consensus. Overwriting repairs a non-conforming entry it left.
-            VALIDATOR_CACHE
-                .lock()
-                .unwrap()
-                .insert(header.parent_hash, (validator_set.clone(), vote_addresses.clone()));
+            let (validator_set, vote_addresses) = self.declared_epoch_validators(&header)?;
             tracing::debug!("validator_set: {:?}, vote_addresses: {:?}", validator_set, vote_addresses);
             
             let vote_addrs_map = if vote_addresses.is_empty() {
@@ -173,9 +235,7 @@ where
             self.inner_ctx.current_validators = Some((validator_set, vote_addrs_map));
 
             if self.spec.is_bohr_active_at_timestamp(header.number, header.timestamp) {
-                // Parity with go-bsc `bohrFork.go` getTurnLength: parent state, and the Bohr gate
-                // uses the parent's number/timestamp. Evaluated in this block's env, which is sound
-                // because `getTurnLength()` is a plain storage read.
+                // Keep parity with go-bsc: turn length is read from parent state.
                 let expected_turn_length =
                     self.get_turn_length(parent_header.number, parent_header.timestamp)?;
                 self.inner_ctx.expected_turn_length = Some(expected_turn_length);
@@ -199,9 +259,6 @@ where
             !self.spec.is_feynman_transition_at_timestamp(header.number, header.timestamp, parent_header.timestamp) &&
             is_breathe_block(parent_header.timestamp, header.timestamp)
         {
-            // go-bsc reads both at the parent (`feynmanfork.go`), but both are plain storage reads;
-            // their results feed `updateValidatorSetV2` calldata, so moving them is state-root
-            // affecting and out of scope for #465.
             let (to, data) = self.system_contracts.get_max_elected_validators();
             let bz = self.eth_call(to, data)?;
             let max_elected_validators = self.system_contracts.unpack_data_into_max_elected_validators(bz.as_ref());
@@ -239,11 +296,33 @@ where
         Ok(())
     }
 
+    /// [`VALIDATOR_CACHE`] lookup for block `block_number`, computing it on a miss.
+    ///
+    /// The validator set epoch block `header` must declare in its extra data.
+    ///
+    /// go-bsc `verifyValidators` reads it at `(header.ParentHash, header.Number-1)` — the parent's
+    /// env, see [`CallBlockEnv`]. Reading through [`VALIDATOR_CACHE`] is safe because every writer
+    /// evaluates in the keyed block's own env.
+    pub(crate) fn declared_epoch_validators(
+        &mut self,
+        header: &Header,
+    ) -> Result<EpochValidators, BlockExecutionError> {
+        self.get_current_validators_with_cache(
+            header.number - 1,
+            header.parent_hash,
+            CallBlockEnv::Parent,
+        )
+    }
+
+    /// `block_hash` must be the hash of `block_number`. Either `at` value lands on that block's own
+    /// env — `Current` when it is the block being executed, `Parent` when it is that block's parent
+    /// — so the stored entry honors the cache's invariant either way.
     pub(crate) fn get_current_validators_with_cache(
         &mut self, 
         block_number: BlockNumber,
-        block_hash: BlockHash
-    ) -> Result<(Vec<Address>, Vec<VoteAddress>), BlockExecutionError> {
+        block_hash: BlockHash,
+        at: CallBlockEnv,
+    ) -> Result<EpochValidators, BlockExecutionError> {
         {
             let mut cache = VALIDATOR_CACHE.lock().unwrap();
             if let Some(cached_result) = cache.get(&block_hash) {
@@ -253,7 +332,7 @@ where
             }
         }
 
-        let result = self.get_current_validators(block_number, CallBlockEnv::Current)?;
+        let result = self.get_current_validators(block_number, at)?;
 
         {
             let mut cache = VALIDATOR_CACHE.lock().unwrap();
@@ -301,15 +380,7 @@ where
             "parent-env call must run while executing the parent's direct child"
         );
 
-        // Both must be built before `db_mut()` borrows `self.evm`.
-        let env = evm_env_for_header(&self.spec, &parent);
-        let tx_env = view_call_tx_env(to, data.clone(), parent.gas_limit, self.spec.chain().id());
-
-        let mut evm = BscEvmFactory::default().create_evm(self.evm.db_mut(), env);
-        // UFCS on purpose: `BscEvm` also implements `revm::ExecuteEvm::transact`, which skips the
-        // system-transaction env overrides that `Evm::transact` applies.
-        let result_and_state = Evm::transact(&mut evm, tx_env).map_err(BlockExecutionError::other)?;
-        view_call_output(to, &data, result_and_state.result)
+        view_call_at_header(self.evm.db_mut(), &self.spec, &parent, to, data)
     }
 
     /// Reads the active validator set from the ValidatorSet system contract.
@@ -320,7 +391,7 @@ where
         &mut self,
         block_number: BlockNumber,
         at: CallBlockEnv,
-    ) -> Result<(Vec<Address>, Vec<VoteAddress>), BlockExecutionError> {
+    ) -> Result<EpochValidators, BlockExecutionError> {
         let is_luban = self.spec.is_luban_active_at_block(block_number);
         let (to, data) = if is_luban {
             self.system_contracts.get_current_validators()

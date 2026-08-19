@@ -7,12 +7,12 @@ use crate::hardforks::BscHardforks;
 use crate::metrics::{BscConsensusMetrics, BscMinerMetrics};
 use crate::node::engine::{BscBuiltPayload, BuildKind};
 use crate::node::evm::config::{BscEvmConfig, BscNextBlockEnvAttributes, ValidatorCacheSink};
-use crate::node::evm::pre_execution::{TURN_LENGTH_CACHE, VALIDATOR_CACHE};
+use crate::node::evm::pre_execution::{EpochValidators, TURN_LENGTH_CACHE, VALIDATOR_CACHE};
 use crate::node::miner::bid_block::{validate_bid_block_blob_kzg, BidBlockTask};
 use crate::node::miner::bid_simulator::BidSimulator;
 use crate::node::miner::block_mev_info::{set_block_mev_info, BlockMevInfoVersion};
 use crate::node::miner::bsc_miner::{MiningContext, SubmitContext};
-use crate::node::miner::util::finalize_new_header;
+use crate::node::miner::util::{epoch_validators_for_next_block, finalize_new_header};
 use crate::node::pool::BlacklistedAddressError;
 use crate::node::primitives::{BscBlobTransactionSidecar, BscBlock};
 use alloy_consensus::{BlockHeader, Transaction};
@@ -2584,12 +2584,21 @@ where
         let gas_usage_percent =
             if gas_limit > 0 { (gas_used as f64 / gas_limit as f64 * 100.0) as u64 } else { 0 };
 
+        let epoch_validators = epoch_validators_for_next_block(
+            &self.builder.client,
+            &self.builder.chain_spec,
+            &self.mining_ctx.parent_snapshot,
+            &self.mining_ctx.parent_header,
+        )
+        .map_err(|e| Box::new(BscPayloadJobError::PayloadBuildingError(e.to_string())))?;
+
         finalize_payload(
             &mut best_payload,
             self.parlia.clone(),
             &self.mining_ctx.parent_snapshot,
             &self.mining_ctx.parent_header,
             self.mining_ctx.block_timestamp_ms,
+            epoch_validators,
         )
         .map_err(|e| {
             warn!(
@@ -2766,6 +2775,7 @@ fn finalize_payload(
     parent_snapshot: &Snapshot,
     parent_header: &SealedHeader<alloy_consensus::Header>,
     block_timestamp_ms: u64,
+    epoch_validators: Option<EpochValidators>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let snapshot_provider = crate::shared::get_snapshot_provider().cloned().ok_or_else(|| {
         Box::new(std::io::Error::other("Snapshot provider not available"))
@@ -2803,6 +2813,7 @@ fn finalize_payload(
         &mut plain_block.header,
         &snapshot_provider,
         block_timestamp_ms,
+        epoch_validators,
     )
     .map_err(|e| {
         Box::new(std::io::Error::other(e.to_string())) as Box<dyn std::error::Error + Send + Sync>
