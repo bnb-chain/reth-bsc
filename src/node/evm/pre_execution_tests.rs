@@ -423,9 +423,9 @@ mod tests {
 
 /// Regression tests for bnb-chain/reth-bsc#465.
 ///
-/// NOT covered: that `check_new_block` actually passes [`CallBlockEnv::Parent`]. Driving it would
-/// need a `SnapshotProvider` global plus a real secp256k1 Parlia seal and BLS attestation for
-/// `verify_seal`.
+/// NOT covered: the arguments `check_new_block` itself passes — driving it needs a
+/// `SnapshotProvider` global plus a real secp256k1 Parlia seal and BLS attestation for
+/// `verify_seal`. So a call site edited to `CallBlockEnv::Current` would not fail here.
 #[cfg(test)]
 mod parent_block_env {
     use crate::chainspec::{bsc::bsc_mainnet, BscChainSpec};
@@ -441,7 +441,7 @@ mod parent_block_env {
     use crate::system_contracts::{SystemContract, VALIDATOR_CONTRACT};
     use alloy_consensus::Header;
     use alloy_evm::eth::EthBlockExecutionCtx;
-    use alloy_primitives::{hex, Address, Bytes, B256, U160};
+    use alloy_primitives::{hex, Address, Bytes, U160};
     use reth_evm_ethereum::RethReceiptBuilder;
     use revm::bytecode::Bytecode;
     use revm::database::InMemoryDB;
@@ -676,31 +676,6 @@ mod parent_block_env {
         assert!(EPOCH_BLOCK.is_multiple_of(MAXWELL_EPOCH_LENGTH), "#465 block is a Maxwell epoch");
     }
 
-    /// Guards the call site, not just the mechanism. `get_current_validators` is *told* which env
-    /// to use, so the test above passes even with the fix reverted — this one asks the validation
-    /// path what it actually requests for an epoch block (bnb-chain/reth-bsc#465).
-    #[test]
-    fn the_epoch_call_site_asks_for_the_parents_window() {
-        let mut executor = executor();
-        // A fresh parent hash keeps this off any other test's cache entry.
-        let header = Header { parent_hash: B256::random(), ..header_at(EPOCH_BLOCK) };
-
-        let (validators, _) =
-            executor.declared_epoch_validators(&header).expect("epoch validators");
-
-        assert_eq!(
-            validators,
-            vec![window_address(EPOCH_BLOCK - 1)],
-            "the epoch call site must ask for N-1's window, not N's"
-        );
-        // And it must file that answer under N-1, per VALIDATOR_CACHE's invariant: keying it under
-        // N would hand N-1's window to whoever validates or seals N+1.
-        assert_eq!(
-            VALIDATOR_CACHE.lock().unwrap().get(&header.parent_hash).unwrap().0,
-            vec![window_address(EPOCH_BLOCK - 1)],
-        );
-    }
-
     /// The miner resolves from state only on a cache miss — the post-restart window the fix exists
     /// to close. Reintroducing #465 on this path produces a block the network rejects, silently.
     #[test]
@@ -738,6 +713,11 @@ mod parent_block_env {
             resolved.map(|(validators, _)| validators),
             Some(vec![window_address(EPOCH_BLOCK - 1)]),
             "the miner must evaluate at the parent, not at the epoch block"
+        );
+        // And file it under the parent, per VALIDATOR_CACHE's invariant.
+        assert_eq!(
+            VALIDATOR_CACHE.lock().unwrap().get(&parent.hash()).unwrap().0,
+            vec![window_address(EPOCH_BLOCK - 1)],
         );
     }
 

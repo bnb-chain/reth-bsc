@@ -219,7 +219,13 @@ where
 
         let epoch_length = snap.epoch_num;
         if header.number.is_multiple_of(epoch_length) {
-            let (validator_set, vote_addresses) = self.declared_epoch_validators(&header)?;
+            // go-bsc `verifyValidators` reads this at `(header.ParentHash, header.Number-1)` —
+            // the parent's env, see [`CallBlockEnv`].
+            let (validator_set, vote_addresses) = self.get_current_validators_with_cache(
+                header.number - 1,
+                header.parent_hash,
+                CallBlockEnv::Parent,
+            )?;
             tracing::debug!("validator_set: {:?}, vote_addresses: {:?}", validator_set, vote_addresses);
             
             let vote_addrs_map = if vote_addresses.is_empty() {
@@ -298,22 +304,6 @@ where
 
     /// [`VALIDATOR_CACHE`] lookup for block `block_number`, computing it on a miss.
     ///
-    /// The validator set epoch block `header` must declare in its extra data.
-    ///
-    /// go-bsc `verifyValidators` reads it at `(header.ParentHash, header.Number-1)` — the parent's
-    /// env, see [`CallBlockEnv`]. Reading through [`VALIDATOR_CACHE`] is safe because every writer
-    /// evaluates in the keyed block's own env.
-    pub(crate) fn declared_epoch_validators(
-        &mut self,
-        header: &Header,
-    ) -> Result<EpochValidators, BlockExecutionError> {
-        self.get_current_validators_with_cache(
-            header.number - 1,
-            header.parent_hash,
-            CallBlockEnv::Parent,
-        )
-    }
-
     /// `block_hash` must be the hash of `block_number`. Either `at` value lands on that block's own
     /// env — `Current` when it is the block being executed, `Parent` when it is that block's parent
     /// — so the stored entry honors the cache's invariant either way.
