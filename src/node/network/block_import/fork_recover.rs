@@ -389,6 +389,22 @@ where
         }
     }
 
+    // Precompute TDs for the just-imported fork chain so Phase-3's FCU can
+    // resolve them. Fork blocks live in the engine tree, not on the canonical
+    // chain, so the provider-backed `header_td` can't see them — without this,
+    // fork choice fails with `Unknown total difficulty` (v2.5 dropped the
+    // block-carried TD). Best-effort: on failure we fall through to the existing
+    // `header_td` behavior.
+    if let Err(err) =
+        forkchoice_engine.prime_fork_chain_tds(to_import.iter().map(|b| &b.header))
+    {
+        tracing::debug!(
+            target: "bsc::fork_recover",
+            error = %err,
+            "priming fork-chain TDs failed; relying on header_td fallback"
+        );
+    }
+
     // ---- Phase 3: FCU so engine-tree re-evaluates canonical head ----
     let head_header = resolve_fcu_head_header(
         &provider,

@@ -1497,4 +1497,38 @@ where
         }
         Ok(td)
     }
+
+    /// Precomputes and caches total difficulties for a freshly fork-recovered
+    /// chain so fork choice can resolve them.
+    ///
+    /// Fork blocks live in the engine tree, not on the canonical chain, so the
+    /// provider-backed [`Self::header_td`] (which only sees canonical + DB
+    /// blocks) returns `None` for them — the cause of `Unknown total difficulty`
+    /// FCU failures after v2.5 dropped the block-carried TD (`NewBlockMessage.td`).
+    /// Given the imported fork headers oldest→newest, the base TD is taken from
+    /// the fork point (the parent of the oldest block, which is canonical and
+    /// therefore resolvable) and each block's TD is `parent_td + difficulty`,
+    /// inserted by hash into the shared cache that `header_td` consults first.
+    ///
+    /// Best-effort: a no-op if `headers` is empty or the fork point's TD is not
+    /// resolvable, in which case the existing `header_td` fallback still applies.
+    pub(crate) fn prime_fork_chain_tds<'a, I>(&self, headers: I) -> Result<(), ParliaConsensusErr>
+    where
+        I: IntoIterator<Item = &'a Header>,
+    {
+        let mut iter = headers.into_iter().peekable();
+        let Some(first) = iter.peek() else { return Ok(()) };
+        let Some(mut running) =
+            self.provider.header_td(&first.parent_hash).map_err(ParliaConsensusErr::internal)?
+        else {
+            // Fork point TD unknown; leave resolution to the header_td fallback.
+            return Ok(());
+        };
+        let mut cache = self.header_td_cache.write();
+        for h in iter {
+            running += h.difficulty;
+            cache.insert(h.hash_slow(), Some(running));
+        }
+        Ok(())
+    }
 }
