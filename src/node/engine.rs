@@ -63,9 +63,13 @@ pub struct BscBuiltPayload {
     /// Turn length from execution context, to be written to TURN_LENGTH_CACHE after finalization.
     /// `None` for bid payloads and blocks without turn-length changes.
     pub(crate) pending_turn_length: Option<u8>,
-    /// Whether this payload originated from an external bid (MEV bundle) rather than a local
-    /// transaction pool build.  Used to track bid-win metrics in `try_return_best_payload()`.
-    pub(crate) is_bid: bool,
+    /// The builder this payload came from, when it originated from an external legacy `SendBid`
+    /// rather than a local transaction-pool build. `None` for local builds.
+    ///
+    /// Carries the address (not just a flag) because finalization needs it to stamp the block's
+    /// MEV info tag — see `set_block_mev_info`. Also drives the bid-win metrics in
+    /// `pick_best_payload_and_finalize()`.
+    pub(crate) bid_builder: Option<Address>,
 }
 
 impl BuiltPayload for BscBuiltPayload {

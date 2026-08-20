@@ -25,7 +25,6 @@ use crate::{
 use alloy_consensus::BlockHeader;
 use alloy_primitives::{Address, Sealable, U128};
 use k256::ecdsa::SigningKey;
-use lru::LruCache;
 use reth::transaction_pool::PoolTransaction;
 use reth::transaction_pool::TransactionPool;
 use reth_basic_payload_builder::{PayloadConfig, PrecachedState};
@@ -42,15 +41,12 @@ use reth_provider::{
 use reth_revm::cancelled::ManualCancel;
 use reth_tasks::TaskExecutor;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_stream::StreamExt;
 use tracing::{debug, error, info, trace, warn};
-
-/// Maximum number of recently mined blocks to track for double signing prevention
-const RECENT_MINED_BLOCKS_CACHE_SIZE: usize = 100;
 
 #[derive(Clone, Debug)]
 pub struct MiningContext {
@@ -785,8 +781,6 @@ pub struct ResultWorkWorker<Provider> {
     provider: Provider,
     /// Receiver for payloads that are ready to submit (delay already applied by payload job)
     payload_rx: mpsc::UnboundedReceiver<SubmitContext>,
-    /// LRU cache to track recently mined blocks to prevent double signing
-    recent_mined_blocks: Arc<Mutex<LruCache<u64, Vec<alloy_primitives::B256>>>>,
     /// Consensus metrics for tracking double signs and block turn stats
     consensus_metrics: BscConsensusMetrics,
     /// Flag for submitting built payload
@@ -804,15 +798,11 @@ where
         payload_rx: mpsc::UnboundedReceiver<SubmitContext>,
         submit_built_payload: bool,
     ) -> Self {
-        let recent_mined_blocks = Arc::new(Mutex::new(LruCache::new(
-            std::num::NonZeroUsize::new(RECENT_MINED_BLOCKS_CACHE_SIZE).unwrap(),
-        )));
         tracing::info!("ResultWorkWorker created, submit_built_payload: {}", submit_built_payload);
         Self {
             validator_address,
             provider,
             payload_rx,
-            recent_mined_blocks,
             consensus_metrics: BscConsensusMetrics::default(),
             submit_built_payload,
         }
@@ -923,31 +913,21 @@ where
             }
         }
 
-        {
-            // check double sign
-            let mut cache = self.recent_mined_blocks.lock().unwrap();
-            if let Some(prev_parents) = cache.get(&block_number) {
-                let mut double_sign = false;
-                for prev_parent in prev_parents {
-                    if *prev_parent == parent_hash {
-                        error!("Reject Double Sign!! block: {}, hash: 0x{:x}, root: 0x{:x}, ParentHash: 0x{:x}", 
-                            block_number, block_hash, sealed_block.header().state_root, parent_hash);
-                        // Update double sign metrics (both reth-bsc native and geth-compatible)
-                        self.consensus_metrics.double_signs_detected_total.increment(1);
-                        metrics::counter!("parlia.doublesign").increment(1);
-                        double_sign = true;
-                        break;
-                    }
-                }
-                if double_sign {
-                    return Ok(());
-                }
-                let mut updated_parents = prev_parents.clone();
-                updated_parents.push(parent_hash);
-                cache.put(block_number, updated_parents);
-            } else {
-                cache.put(block_number, vec![parent_hash]);
-            }
+        // Check double sign via the cache shared with the BidBlock path (`try_submit_winning_bid_block`
+        // in payload.rs) — a validator must not sign two different blocks at the same height on the
+        // same parent, regardless of which path produced either one.
+        if !crate::shared::check_and_record_mined_block(block_number, parent_hash) {
+            error!(
+                "Reject Double Sign!! block: {}, hash: 0x{:x}, root: 0x{:x}, ParentHash: 0x{:x}",
+                block_number,
+                block_hash,
+                sealed_block.header().state_root,
+                parent_hash
+            );
+            // Update double sign metrics (both reth-bsc native and geth-compatible)
+            self.consensus_metrics.double_signs_detected_total.increment(1);
+            metrics::counter!("parlia.doublesign").increment(1);
+            return Ok(());
         }
 
         let block_hash = sealed_block.hash();
@@ -1134,7 +1114,14 @@ where
                 bid_runtime = self.bid_simulate_req_rx.recv() => {
                     match bid_runtime {
                         Some(bid_runtime) => {
-                            self.simulator.bid_simulate(bid_runtime);
+                            // A finished simulation may produce a recommit request
+                            // (go-bsc simBid defer): the follow-up simulation of a
+                            // better bid that was parked during this run.
+                            if let Some(req) = self.simulator.bid_simulate(bid_runtime) {
+                                if let Err(e) = self.bid_simulate_req_tx.send(req) {
+                                    error!("Failed to send recommit bid simulate request due to channel closed: {}", e);
+                                }
+                            }
                         }
                         None => {
                             warn!("Bid simulate request channel closed");
@@ -1147,6 +1134,8 @@ where
                 _ = send_bid_interval.tick() => {
                     // Attempt to send bids
                     self.get_bid_and_send();
+                    // Process any admitted BEP-675 BidBlocks.
+                    self.process_bid_block();
                 }
 
                 _ = clear_bid_interval.tick() => {
@@ -1170,6 +1159,19 @@ where
                     error!("Failed to send bid simulate request due to channel closed: {}", e);
                 }
             }
+        }
+    }
+
+    /// Pop an admitted BEP-675 BidBlock (from `mev_sendBidBlock`) and verify/blind-sign/seal it into
+    /// the simulator's best-bid-block store (go-bsc `newBidBlockLoop` → `AddBidBlock`).
+    fn process_bid_block(&self) {
+        if let Some(decoded) = crate::shared::pop_bid_block_package() {
+            debug!(
+                "Popped BidBlock from queue, block: {}, builder: {}",
+                decoded.block_number(),
+                decoded.builder
+            );
+            self.simulator.commit_bid_block(decoded);
         }
     }
 }
@@ -1251,6 +1253,7 @@ where
             snapshot_provider.clone(),
             mining_config.validator_commission.unwrap_or(100),
             mining_config.greedy_merge,
+            mining_config.get_no_interrupt_left_over(),
         ));
         let main_work_worker = MainWorkWorker::new(
             validator_address,

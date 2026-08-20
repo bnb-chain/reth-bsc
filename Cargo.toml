@@ -16,51 +16,50 @@ name = "reth-bsc"
 path = "src/main.rs"
 
 [dependencies]
-reth = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1" }
-reth-cli = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1" }
-reth-cli-commands = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1" }
-reth-basic-payload-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1" }
-reth-db = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1" }
-reth-engine-local = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1" }
-reth-engine-tree = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1" }
-reth-node-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1" }
-reth-chainspec = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1" }
-reth-cli-util = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1" }
-reth-discv4 = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1", features = ["test-utils"] }
-reth-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1" }
-reth-ethereum-forks = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1", features = ["serde"] }
-reth-ethereum-payload-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1" }
-reth-payload-builder-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1" }
-reth-chain-state = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1" }
-reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1" }
-reth-eth-wire = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1" }
-reth-eth-wire-types = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1" }
-reth-evm = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1" }
-reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1" }
-reth-execution-types = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1" }
-reth-ipc = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1" }
-reth-metrics = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1" }
-reth-node-core = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1" }
-reth-revm = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1" }
-reth-network = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1", features = ["test-utils"] }
-reth-network-p2p = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1" }
-reth-network-api = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1" }
-reth-node-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1", features = ["test-utils"] }
-reth-network-peers = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1" }
-reth-payload-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1" }
-reth-ethereum-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1" }
+reth = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5" }
+reth-cli = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5" }
+reth-cli-commands = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5" }
+reth-basic-payload-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5" }
+reth-db = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5" }
+reth-engine-local = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5" }
+reth-engine-tree = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5" }
+reth-node-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5" }
+reth-chainspec = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5" }
+reth-cli-util = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5" }
+reth-discv4 = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5", features = ["test-utils"] }
+reth-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5" }
+reth-ethereum-forks = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5", features = ["serde"] }
+reth-ethereum-payload-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5" }
+reth-payload-builder-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5" }
+reth-chain-state = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5" }
+reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5" }
+reth-eth-wire = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5" }
+reth-eth-wire-types = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5" }
+reth-evm = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5" }
+reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5" }
+reth-execution-types = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5" }
+reth-ipc = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5" }
+reth-metrics = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5" }
+reth-node-core = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5" }
+reth-revm = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5" }
+reth-network = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5", features = ["test-utils"] }
+reth-network-p2p = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5" }
+reth-network-api = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5" }
+reth-node-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5", features = ["test-utils"] }
+reth-network-peers = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5" }
+reth-payload-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5" }
+reth-ethereum-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5" }
 reth-primitives-traits = { version = "0.5.0", default-features = false }
 reth-codecs = { version = "0.5.0" }
-reth-provider = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1", features = ["test-utils"] }
-reth-rpc-eth-api = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1" }
-reth-rpc-convert = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1" }
-reth-rpc-engine-api = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1" }
-reth-rpc-server-types = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1" }
-reth-trie-common = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1" }
-reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1" }
-reth-tasks = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1" }
-reth-transaction-pool = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.4.1" }
-
+reth-provider = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5", features = ["test-utils"] }
+reth-rpc-eth-api = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5" }
+reth-rpc-convert = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5" }
+reth-rpc-engine-api = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5" }
+reth-rpc-server-types = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5" }
+reth-trie-common = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5" }
+reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5" }
+reth-tasks = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5" }
+reth-transaction-pool = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5" }
 revm = "41.0.0"
 revm-database = "41.0.0"
 revm-bytecode = "41.0.0"
@@ -240,3 +239,6 @@ strip = false
 
 [dev-dependencies]
 uuid = { version = "1", features = ["v4"] }
+# `test-util` gives tests a paused clock (`start_paused`, `time::advance`), so timing invariants
+# can be asserted by ordering instead of racing a wall clock.
+tokio = { version = "1.44", features = ["full", "test-util"] }

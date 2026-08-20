@@ -1143,9 +1143,14 @@ pub fn is_system_transaction<T: reth_primitives_traits::Transaction>(
     coinbase: Address,
 ) -> bool {
     let to = tx.to();
-    let max_fee_per_gas = tx.max_fee_per_gas();
+    // BSC never enforces a base fee, so pass `Some(0)` (equivalent to
+    // `EffectiveGasPriceForBSC` in go-bsc). Passing `None` here would be wrong too: alloy
+    // treats "no base fee" as "no cap", short-circuiting to `max_fee_per_gas` (the fee
+    // cap) instead of `min(max_fee_per_gas, max_priority_fee_per_gas)` — the same bug
+    // this fix removes.
+    let effective_gas_price = tx.effective_gas_price(Some(0));
     if let Some(to) = to {
-        if signer == coinbase && is_invoke_system_contract(&to) && max_fee_per_gas == 0 {
+        if signer == coinbase && is_invoke_system_contract(&to) && effective_gas_price == 0 {
             return true;
         }
     }
@@ -1156,7 +1161,61 @@ pub fn is_system_transaction<T: reth_primitives_traits::Transaction>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::address;
+    use alloy_consensus::TxEip1559;
+    use alloy_primitives::{address, Signature, U256};
+
+    fn dummy_sig() -> Signature {
+        Signature::new(U256::ZERO, U256::ZERO, false)
+    }
+
+    #[test]
+    fn test_is_system_transaction_uses_effective_gas_price() {
+        // BSC never enforces a base fee, so the "effective gas price" of an EIP-1559
+        // transaction is `min(max_fee_per_gas, max_priority_fee_per_gas)`. Before this
+        // fix, `is_system_transaction` checked `max_fee_per_gas` alone (the fee cap),
+        // which is wrong whenever the cap and the priority fee disagree on being zero.
+        let coinbase = address!("0x1111111111111111111111111111111111111111");
+
+        // Legacy zero-gas-price system tx: unchanged behavior, still detected.
+        let legacy = TransactionSigned::new_unhashed(
+            Transaction::Legacy(TxLegacy {
+                to: TxKind::Call(STAKE_HUB_CONTRACT),
+                gas_price: 0,
+                ..Default::default()
+            }),
+            dummy_sig(),
+        );
+        assert!(is_system_transaction(&legacy, coinbase, coinbase));
+
+        // Non-zero fee cap but zero priority fee: effective price is 0 (baseFee = 0),
+        // so this must still be detected as a system transaction.
+        let eip1559_zero_effective = TransactionSigned::new_unhashed(
+            Transaction::Eip1559(TxEip1559 {
+                to: TxKind::Call(STAKE_HUB_CONTRACT),
+                max_fee_per_gas: 1_000_000_000,
+                max_priority_fee_per_gas: 0,
+                ..Default::default()
+            }),
+            dummy_sig(),
+        );
+        assert!(is_system_transaction(&eip1559_zero_effective, coinbase, coinbase));
+
+        // Genuine non-zero priority fee: not a system transaction.
+        let eip1559_paid = TransactionSigned::new_unhashed(
+            Transaction::Eip1559(TxEip1559 {
+                to: TxKind::Call(STAKE_HUB_CONTRACT),
+                max_fee_per_gas: 1_000_000_000,
+                max_priority_fee_per_gas: 1,
+                ..Default::default()
+            }),
+            dummy_sig(),
+        );
+        assert!(!is_system_transaction(&eip1559_paid, coinbase, coinbase));
+
+        // Sender other than coinbase is never a system transaction, regardless of price.
+        let not_coinbase = address!("0x2222222222222222222222222222222222222222");
+        assert!(!is_system_transaction(&legacy, not_coinbase, coinbase));
+    }
 
     #[test]
     fn test_pasteur_system_contract_upgrade() {

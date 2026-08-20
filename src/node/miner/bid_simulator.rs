@@ -10,10 +10,13 @@ use crate::node::miner::payload::DELAY_LEFT_OVER;
 use crate::node::miner::util::prepare_new_attributes;
 use crate::node::primitives::BscBlobTransactionSidecar;
 use alloy_consensus::BlobTransactionSidecar;
+use alloy_consensus::BlockHeader as _;
 use alloy_consensus::Transaction;
 use alloy_evm::Evm;
 use alloy_primitives::U256;
-use alloy_primitives::{Address, B256};
+use alloy_primitives::{Address, Bytes, B256};
+use crate::consensus::parlia::util::calculate_millisecond_timestamp;
+use crate::node::miner::bid_block::{simulate_bid_block, BidBlockTask, DecodedBidBlock};
 use parking_lot::RwLock;
 use reth_node_ethereum::engine::EthPayloadAttributes;
 use reth::transaction_pool::BestTransactionsAttributes;
@@ -37,7 +40,6 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{debug, trace};
-const NO_INTERRUPT_LEFT_OVER: u64 = 500;
 const PAY_BID_TX_GAS_LIMIT: u64 = 25000;
 const TX_GAS: u64 = 21000;
 
@@ -63,6 +65,56 @@ impl Bid {
     }
 }
 
+/// go-bsc `canBeInterrupted`: a newly arrived bid may preempt the in-flight simulation only if
+/// the raw wall-clock time left until the block's target timestamp still fits one worst-case
+/// simulation plus the finalize reserve (`no_interrupt_left_over_ms`). Compares against the raw
+/// block target — not a mining-delay value, which is leftover-subtracted and interval-clamped and
+/// would distort the comparison. A zero `block_time_ms` (unknown target) disables the check.
+fn can_be_interrupted(block_time_ms: u64, now_ms: u64, no_interrupt_left_over_ms: u64) -> bool {
+    if block_time_ms == 0 {
+        return true;
+    }
+    block_time_ms.saturating_sub(now_ms) >= no_interrupt_left_over_ms
+}
+
+/// Per-block tally of simulations preempted by a higher-value bid, keyed by parent hash. Carries
+/// the block number so [`BidSimulator::clear`] can prune it alongside the bid maps.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct InterruptTally {
+    block_number: u64,
+    count: u64,
+}
+
+/// Bumps the preempted-simulation tally for `parent_hash`. Split out as a free function (as with
+/// [`retain_recent_interrupt_tallies`]) so the bookkeeping is testable without a full
+/// `BidSimulator`.
+fn record_interrupt_tally(
+    map: &mut HashMap<B256, InterruptTally>,
+    parent_hash: B256,
+    block_number: u64,
+) {
+    let tally = map.entry(parent_hash).or_insert(InterruptTally { block_number, count: 0 });
+    // A parent hash is unique to a height, but keep the number fresh so pruning stays correct even
+    // if a caller ever tallies against a re-observed parent.
+    tally.block_number = block_number;
+    tally.count += 1;
+}
+
+/// Evicts tallies older than `min_block_number`, mirroring [`retain_recent_bid_blocks`].
+fn retain_recent_interrupt_tallies(
+    map: &mut HashMap<B256, InterruptTally>,
+    min_block_number: u64,
+) {
+    map.retain(|_, tally| tally.block_number >= min_block_number);
+}
+
+/// Evicts entries older than `min_block_number` from the `best_bid_block` map, keyed by parent
+/// hash. Split out as a free function (from [`BidSimulator::clear`]) so it's directly testable
+/// without constructing a full `BidSimulator`.
+fn retain_recent_bid_blocks(map: &mut HashMap<B256, BidBlockTask>, min_block_number: u64) {
+    map.retain(|_, task| task.block.sealed_block().header().number() >= min_block_number);
+}
+
 // bid loop receive bid from client and commit bid to simulator
 // 1. last block number check
 // 2. pack bid runtime and calculate bid value
@@ -80,12 +132,20 @@ pub struct BidSimulator<Client, Pool> {
     best_bid_to_run: Arc<RwLock<HashMap<B256, Bid>>>,
     simulating_bid: Arc<RwLock<HashMap<B256, Bid>>>,
     best_bid: Arc<RwLock<HashMap<B256, BidRuntime<Pool, BscEvmConfig>>>>,
+    /// Best executed BEP-675 BidBlock payload per parent hash (go-bsc `AddBidBlock`/`GetBestBidBlock`).
+    best_bid_block: Arc<RwLock<HashMap<B256, BidBlockTask>>>,
     pending_bid: Arc<RwLock<HashMap<String, u8>>>,
     bid_receiving: bool,
     chain_spec: Arc<BscChainSpec>,
     min_gas_price: U256,
     validator_commission: u64,
     greedy_merge: bool,
+    /// go-bsc `Mev.NoInterruptLeftOver`: minimum raw time-to-block-target required for a new bid
+    /// to preempt an in-flight simulation. See [`can_be_interrupted`].
+    no_interrupt_left_over: u64,
+    /// Simulations preempted per parent hash, so the seal path can tell whether an interrupt
+    /// actually bought a better block. See [`Self::take_interrupt_count`].
+    interrupt_counts: Arc<RwLock<HashMap<B256, InterruptTally>>>,
 
     // MEV metrics
     mev_metrics: crate::metrics::BscMevMetrics,
@@ -112,6 +172,7 @@ where
         snapshot_provider: Arc<dyn SnapshotProvider + Send + Sync>,
         validator_commission: u64,
         greedy_merge: bool,
+        no_interrupt_left_over: u64,
     ) -> Self {
         Self {
             client,
@@ -123,12 +184,15 @@ where
             best_bid_to_run: Arc::new(RwLock::new(HashMap::new())),
             simulating_bid: Arc::new(RwLock::new(HashMap::new())),
             best_bid: Arc::new(RwLock::new(HashMap::new())),
+            best_bid_block: Arc::new(RwLock::new(HashMap::new())),
             pending_bid: Arc::new(RwLock::new(HashMap::new())),
             bid_receiving: true,
             min_gas_price: U256::ZERO,
             mev_metrics: crate::metrics::BscMevMetrics::default(),
             validator_commission,
             greedy_merge,
+            no_interrupt_left_over,
+            interrupt_counts: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -155,6 +219,13 @@ where
             return None;
         }
         self.add_pending_bid(bid.block_number, bid.builder, bid.bid_hash);
+        self.commit_bid_inner(bid)
+    }
+
+    // Admission shared by new bids and the post-simulation recommit probe (go-bsc
+    // newBidLoop). The probe re-enters with a bid that is already in pending_bid, so
+    // it must skip commit_new_bid's dedup — go-bsc has no dedup on the newBidCh path.
+    fn commit_bid_inner(&self, bid: Bid) -> Option<BidRuntime<Pool, BscEvmConfig>> {
         let final_block_number = match self.client.finalized_block_number() {
             Ok(Some(final_block_number)) => final_block_number,
             Ok(None) => return None,
@@ -194,7 +265,6 @@ where
             block_timestamp_ms: 0,
             end_mining_timestamp_ms: 0,
         };
-        let parent_snapshot = mining_ctx.parent_snapshot.clone();
         let attributes = prepare_new_attributes(
             &mut mining_ctx,
             self.parlia.clone(),
@@ -258,17 +328,26 @@ where
 
             if let Some(simulating_bid) = self.simulating_bid.read().get(&bid.parent_hash).cloned()
             {
-                let delay_ms = self.parlia.delay_for_mining(
-                    &parent_snapshot,
-                    mining_ctx.header.as_ref().unwrap(),
-                    DELAY_LEFT_OVER,
-                );
-                if delay_ms >= NO_INTERRUPT_LEFT_OVER || delay_ms == 0 {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                if can_be_interrupted(
+                    mining_ctx.block_timestamp_ms,
+                    now_ms,
+                    self.no_interrupt_left_over,
+                ) {
                     simulating_bid.interrupt_flag.store(true, Ordering::Relaxed);
+                    self.record_interrupt(bid.parent_hash, bid.block_number);
                     let bid_simulate_req = self.commit_bid(5, _bid_runtime);
                     return Some(bid_simulate_req);
                 } else {
-                    debug!("simulate in progress, no interrupt after delay_ms:{}, NO_INTERRUPT_LEFT_OVER:{},bid hash:{}", delay_ms, NO_INTERRUPT_LEFT_OVER, _bid_runtime.bid.bid_hash);
+                    debug!(
+                        "simulate in progress, no interrupt, left:{}, no_interrupt_left_over:{}, bid hash:{}",
+                        mining_ctx.block_timestamp_ms.saturating_sub(now_ms),
+                        self.no_interrupt_left_over,
+                        _bid_runtime.bid.bid_hash
+                    );
                 }
             } else {
                 let bid_simulate_req = self.commit_bid(5, _bid_runtime);
@@ -279,6 +358,34 @@ where
         None
     }
 
+    /// Records that an in-flight simulation building on `parent_hash` was preempted by a
+    /// higher-value bid. Bumps the process-wide counter (the thrash-ratio denominator) and the
+    /// per-block tally that [`Self::take_interrupt_count`] reports at seal time.
+    fn record_interrupt(&self, parent_hash: B256, block_number: u64) {
+        self.mev_metrics.bid_interrupt_total.increment(1);
+        record_interrupt_tally(&mut self.interrupt_counts.write(), parent_hash, block_number);
+    }
+
+    /// Number of simulations preempted while building on `parent_hash`, **consuming** the tally.
+    /// The seal path adds this to `bid_interrupt_wasted_total` when the sealed block turned out not
+    /// to come from a bid, so the count is a weight and not just a yes/no. Taking the tally means a
+    /// second build attempt at the same height cannot double-count. Sole reader — a future second
+    /// caller would observe 0, so peek separately rather than calling this twice.
+    pub fn take_interrupt_count(&self, parent_hash: B256) -> u64 {
+        self.interrupt_counts.write().remove(&parent_hash).map_or(0, |tally| tally.count)
+    }
+
+    /// Whether a simulation for `parent_hash` is still running right now. Sampled by the payload job
+    /// at bid-collection time to tell a wasted interrupt whose replacement was simply *too late*
+    /// from one whose replacement did finish but lost on merit — only the former indicts
+    /// `no_interrupt_left_over`.
+    ///
+    /// Relies on `simulating_bid` being a true in-flight registry: inserted before
+    /// `simulate_bid_inner` and removed on every exit path, aborts included.
+    pub fn is_simulating(&self, parent_hash: B256) -> bool {
+        self.simulating_bid.read().contains_key(&parent_hash)
+    }
+
     pub fn clear(&self, block_number: u64) {
         let clear_threshold = 5; //todo: config
         let min_block_number = block_number.saturating_sub(clear_threshold);
@@ -287,6 +394,15 @@ where
         self.best_bid_to_run.write().retain(|_, bid| bid.block_number >= min_block_number);
         self.simulating_bid.write().retain(|_, bid| bid.block_number >= min_block_number);
         self.best_bid.write().retain(|_, bid| bid.bid.block_number >= min_block_number);
+
+        // Clear old BEP-675 BidBlocks (go-bsc `clearLoop` prunes `bestBidBlock[parentHash]` the
+        // same way). Without this, every parent hash that ever received an admitted BidBlock keeps
+        // its full sealed block — including blob data — in memory forever.
+        retain_recent_bid_blocks(&mut self.best_bid_block.write(), min_block_number);
+
+        // Same for the preempted-simulation tallies: without pruning, every parent hash that ever
+        // saw an interrupt is retained for the process's lifetime.
+        retain_recent_interrupt_tallies(&mut self.interrupt_counts.write(), min_block_number);
 
         // Clear old pending bids by parsing block_number from key prefix
         // Key format: "{block_number}-{builder}-{bid_hash}"
@@ -340,26 +456,146 @@ where
     ) -> BidRuntime<Pool, BscEvmConfig> {
         debug!("bid committed reason:{}, bid hash:{}", reason, bid_runtime.bid.bid_hash);
         bid_runtime.bid.committed = true;
+        // go-bsc shares one *types.Bid between bestBidToRun and the dispatched runtime,
+        // so Commit() marks both. Our map holds a clone inserted before this call —
+        // mark it too, or best_bid_to_run never reads as committed and admission would
+        // re-simulate an already-dispatched bid instead of discarding the newcomer.
+        if let Some(existing) =
+            self.best_bid_to_run.write().get_mut(&bid_runtime.bid.parent_hash)
+        {
+            if existing.bid_hash == bid_runtime.bid.bid_hash {
+                existing.committed = true;
+            }
+        }
 
         bid_runtime
     }
 
-    // sim_bid commit tx and set best bid
+    // sim_bid commit tx and set best bid (go-bsc simBid). On a clean simulation this
+    // returns the follow-up request produced by the recommit probe (go-bsc's simBid
+    // defer re-sends the best bid through newBidCh) — the caller must feed it back
+    // into the simulate loop.
     pub fn bid_simulate(
         &self,
         mut bid_runtime: BidRuntime<Pool, BscEvmConfig>,
-    ) {
+    ) -> Option<BidRuntime<Pool, BscEvmConfig>> {
         if !self.bid_receiving {
-            return;
+            return None;
         }
 
         // Track simulation start time
         let sim_start = std::time::Instant::now();
         let is_first_bid = self.best_bid.read().is_empty();
-
-        let mut success = false;
         let parent_hash = bid_runtime.bid.parent_hash;
+
         self.simulating_bid.write().insert(parent_hash, bid_runtime.bid.clone());
+        // Counted here, alongside the in-flight insert, so it covers every simulation regardless of
+        // how it exits — the denominator for the interrupt-thrash ratio must include aborted runs,
+        // which `bid_simulation_duration_seconds` below deliberately excludes.
+        self.mev_metrics.bid_simulation_started_total.increment(1);
+        let outcome = self.simulate_bid_inner(&mut bid_runtime);
+
+        // go-bsc simBid runs all of this in a defer so it covers every exit path.
+        // Previously the early error returns skipped it, leaving a phantom in-flight
+        // simulation that parked incoming bids until clear() pruned it blocks later.
+        self.simulating_bid.write().remove(&parent_hash);
+        bid_runtime.finished.store(true, Ordering::Relaxed);
+        let success = matches!(outcome, Ok(true));
+        if !success {
+            // go-bsc DelBestBidToRun: hash-matched, so aborting this bid can't evict a
+            // newer bid parked in best_bid_to_run while this one was simulating.
+            let mut to_run = self.best_bid_to_run.write();
+            if to_run.get(&parent_hash).is_some_and(|b| b.bid_hash == bid_runtime.bid.bid_hash)
+            {
+                to_run.remove(&parent_hash);
+            }
+        }
+
+        // Aborted simulations keep their site-specific debug logs; metrics and the
+        // recommit probe only apply to simulations that ran to completion.
+        if outcome.is_err() {
+            return None;
+        }
+
+        // Update metrics after simulation
+        let sim_duration = sim_start.elapsed().as_secs_f64();
+        self.mev_metrics.bid_simulation_duration_seconds.record(sim_duration);
+
+        if is_first_bid {
+            self.mev_metrics.first_bid_simulation_seconds.record(sim_duration);
+        }
+
+        if success {
+            self.mev_metrics.valid_bids_total.increment(1);
+
+            // Update best bid gas used (in MGas)
+            let gas_used_mgas = bid_runtime.gas_used as f64 / 1_000_000.0;
+            self.mev_metrics.best_bid_gas_used_mgas.set(gas_used_mgas);
+
+            // Calculate simulation speed (MGas/s)
+            if sim_duration > 0.0 {
+                let mgasps = gas_used_mgas / sim_duration;
+                self.mev_metrics.bid_simulation_speed_mgasps.set(mgasps);
+            }
+        } else {
+            self.mev_metrics.invalid_bids_total.increment(1);
+        }
+
+        debug!("bidSimulator: sim_bid finished, block number:{}, parent hash:{}, builder:{}, bid hash:{}, gas used:{}, gas fee:{}, success:{}",
+         bid_runtime.bid.block_number,
+         bid_runtime.bid.parent_hash,
+         bid_runtime.bid.builder,
+         bid_runtime.bid.bid_hash,
+         bid_runtime.gas_used,
+         bid_runtime.gas_fee,
+         success,
+        );
+
+        // go-bsc simBid defer: after a clean simulation, re-commit the best simulated
+        // bid ("recommit probe") when no new bids are queued. The probe re-runs
+        // admission, which does one of two things: if a better bid was parked
+        // non-committed in best_bid_to_run while this one simulated (no-interrupt
+        // window), the probe loses the expected-reward comparison and the parked bid
+        // finally gets simulated; otherwise (is_expected_better_than is >=, matching
+        // go-bsc) the probe wins against itself and the best bid is re-simulated,
+        // deliberately re-running greedy merge over the current mempool. The
+        // no-time-left guard in simulate_bid_inner is what terminates this loop at
+        // DELAY_LEFT_OVER before the seal deadline.
+        if crate::shared::bid_package_queue_len() > 0 {
+            return None;
+        }
+        let recommit = self.best_bid.read().get(&parent_hash).map(|rt| rt.bid.clone())?;
+        self.commit_bid_inner(recommit)
+    }
+
+    fn simulate_bid_inner(
+        &self,
+        bid_runtime: &mut BidRuntime<Pool, BscEvmConfig>,
+    ) -> Result<bool, ()> {
+        let parent_hash = bid_runtime.bid.parent_hash;
+        let mut success = false;
+
+        // go-bsc simBid aborts with errNoTimeLeft when engine.Delay(header, delayLeftOver)
+        // has run out. Without this, a bid dispatched near the seal deadline (or one that
+        // sat queued behind another simulation — the simulate loop is sequential) starts a
+        // simulation that can't finish before sealing, and delays viable bids for the next
+        // block queued behind it. We reserve DELAY_LEFT_OVER (120ms) rather than go-bsc's
+        // delayLeftOver (15ms) because that is this codebase's finalize reserve: with less
+        // than that remaining, sealing is already under way and no result can land in time.
+        if let Some(header) = bid_runtime.mining_ctx.header.as_ref() {
+            let delay_ms = self.parlia.delay_for_bid_simulation(
+                &bid_runtime.mining_ctx.parent_snapshot,
+                header,
+                DELAY_LEFT_OVER,
+            );
+            if delay_ms == 0 {
+                debug!(
+                    "bidSimulator: abort simulation, no time left, block number:{}, bid hash:{}",
+                    bid_runtime.bid.block_number, bid_runtime.bid.bid_hash,
+                );
+                return Err(());
+            }
+        }
 
         let mut txs_except_last = bid_runtime.bid.txs.clone();
         let pay_bid_tx = txs_except_last.pop();
@@ -369,7 +605,7 @@ where
                 Ok(provider) => provider,
                 Err(e) => {
                     debug!("Failed to get state provider by block hash: {:?}", e);
-                    return;
+                    return Err(());
                 }
             };
         let sp_db = StateProviderDatabase::new(&state_provider);
@@ -388,7 +624,7 @@ where
         );
         if bid_runtime.bid.gas_used > gas_limit - system_txs_gas - PAY_BID_TX_GAS_LIMIT {
             debug!("bidSimulator: gas limit exceeded, ignore");
-            return;
+            return Err(());
         }
 
         // Sinks transport current_validators / turn_length from the builder so that
@@ -427,7 +663,7 @@ where
             Ok(builder) => builder,
             Err(e) => {
                 debug!("Failed to create builder for next block: {:?}", e);
-                return;
+                return Err(());
             }
         };
         let mut block_gas_limit: u64 =
@@ -437,7 +673,7 @@ where
         // todo: prefetch transactions
         if let Err(e) = builder.apply_pre_execution_changes().map_err(PayloadBuilderError::other) {
             debug!("Failed to apply pre-execution changes: {:?}", e);
-            return;
+            return Err(());
         }
 
         // First commit: bid transactions
@@ -445,18 +681,35 @@ where
             bid_runtime.commit_transaction(txs_except_last.clone(), &mut builder, block_gas_limit)
         {
             debug!("Failed to commit bid transactions: {:?}", e);
-            return;
+            return Err(());
+        }
+
+        // go-bsc simBid re-checks engine.Delay after committing the bid txs
+        // (errNoTimeLeft): executing them may have consumed the remaining window.
+        if let Some(header) = bid_runtime.mining_ctx.header.as_ref() {
+            if self.parlia.delay_for_bid_simulation(
+                &bid_runtime.mining_ctx.parent_snapshot,
+                header,
+                DELAY_LEFT_OVER,
+            ) == 0
+            {
+                debug!(
+                    "bidSimulator: no time left after committing bid txs, bid hash:{}",
+                    bid_runtime.bid.bid_hash,
+                );
+                return Err(());
+            }
         }
 
         if let Err(e) =
             bid_runtime.pack_reward(self.validator_commission, bid_runtime.system_balance)
         {
             debug!("Failed to pack reward: {:?}", e);
-            return;
+            return Err(());
         }
         if !bid_runtime.valid_reward() {
             debug!("bidSimulator: invalid bid, ignore");
-            return;
+            return Err(());
         }
 
         if bid_runtime.gas_used != 0 {
@@ -466,7 +719,7 @@ where
                     "bid gas price is lower than min gas price, bid:{}, min:{}",
                     bid_gas_price, self.min_gas_price
                 );
-                return;
+                return Err(());
             }
         }
 
@@ -474,7 +727,7 @@ where
         if self.greedy_merge {
             let ending_bids_extra = 20;
             let min_time_left_for_ending_bids = DELAY_LEFT_OVER + ending_bids_extra;
-            let delay_ms = self.parlia.delay_for_mining(
+            let delay_ms = self.parlia.delay_for_bid_simulation(
                 &bid_runtime.mining_ctx.parent_snapshot,
                 bid_runtime.mining_ctx.header.as_ref().unwrap(),
                 min_time_left_for_ending_bids,
@@ -490,13 +743,13 @@ where
                     delay_ms,
                 ) {
                     debug!("Failed to commit tx pool transactions: {:?}", e);
-                    return;
+                    return Err(());
                 }
                 if let Err(e) =
                     bid_runtime.pack_reward(self.validator_commission, bid_runtime.system_balance)
                 {
                     debug!("Failed to pack reward: {:?}", e);
-                    return;
+                    return Err(());
                 }
 
                 // Record greedy merge duration
@@ -517,11 +770,11 @@ where
                 bid_runtime.commit_transaction(pay_bid_txs, &mut builder, block_gas_limit)
             {
                 debug!("Failed to commit pay bid transaction: {:?}", e);
-                return;
+                return Err(());
             }
         } else {
             debug!("No pay bid transaction found, skipping bid");
-            return;
+            return Err(());
         }
 
         // Finish the builder. Bid simulation does not run alongside a sparse-trie task —
@@ -530,7 +783,7 @@ where
             Ok(outcome) => outcome,
             Err(e) => {
                 debug!("Failed to finish builder: {:?}", e);
-                return;
+                return Err(());
             }
         };
         let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block, block_access_list: _ } = out;
@@ -549,7 +802,7 @@ where
                     bid_runtime.bid.bid_hash,
                     bid_runtime.bid.block_number
                 );
-                return;
+                return Err(());
             }
         }
 
@@ -587,7 +840,7 @@ where
             executed_block,
             pending_validators,
             pending_turn_length,
-            is_bid: true,
+            bid_builder: Some(bid_runtime.bid.builder),
         });
 
         // Acquire write lock to update best_bid
@@ -607,50 +860,111 @@ where
             }
         }
 
-        // Update metrics after simulation
-        let sim_duration = sim_start.elapsed().as_secs_f64();
-        self.mev_metrics.bid_simulation_duration_seconds.record(sim_duration);
-
-        if is_first_bid {
-            self.mev_metrics.first_bid_simulation_seconds.record(sim_duration);
-        }
-
-        if success {
-            self.mev_metrics.valid_bids_total.increment(1);
-
-            // Update best bid gas used (in MGas)
-            let gas_used_mgas = bid_runtime.gas_used as f64 / 1_000_000.0;
-            self.mev_metrics.best_bid_gas_used_mgas.set(gas_used_mgas);
-
-            // Calculate simulation speed (MGas/s)
-            if sim_duration > 0.0 {
-                let mgasps = gas_used_mgas / sim_duration;
-                self.mev_metrics.bid_simulation_speed_mgasps.set(mgasps);
-            }
-        } else {
-            self.mev_metrics.invalid_bids_total.increment(1);
-        }
-
-        debug!("bidSimulator: sim_bid finished, block number:{}, parent hash:{}, builder:{}, bid hash:{}, gas used:{}, gas fee:{}, success:{}",
-         bid_runtime.bid.block_number,
-         bid_runtime.bid.parent_hash,
-         bid_runtime.bid.builder,
-         bid_runtime.bid.bid_hash,
-         bid_runtime.gas_used,
-         bid_runtime.gas_fee,
-         success,
-        );
-
-        self.simulating_bid.write().remove(&parent_hash);
-        bid_runtime.finished.store(true, Ordering::Relaxed);
-        if !success {
-            self.best_bid_to_run.write().remove(&parent_hash);
-        }
+        Ok(success)
     }
 
     /// Get the best bid for a given parent hash
     pub fn get_best_bid(&self, parent_hash: B256) -> Option<BidRuntime<Pool, BscEvmConfig>> {
         self.best_bid.read().get(&parent_hash).cloned()
+    }
+
+    /// Verify, blind-sign, and seal an admitted BEP-675 BidBlock, keeping the highest-fee one per
+    /// parent hash (go-bsc `AddBidBlock`). Execution and selection against the locally-built block
+    /// happen in the build cycle (a follow-on slice); this is the intake half.
+    pub fn commit_bid_block(&self, decoded: DecodedBidBlock) {
+        let parent_hash = decoded.parent_hash();
+        // go-bsc's `newBidBlockLoop` also re-checks `isRunning` / `receivingBid` here. We don't:
+        // `is_mev_running()` is already enforced at admission in `MevApiImpl::admit_bid_block`, and
+        // `bid_receiving` has no toggle in this codebase (no setter, no RPC) so the gate would be
+        // dead code. A bid that races past `is_mev_running` between admit and pop is harmless —
+        // the resulting payload sits in `best_bid_block` until evicted.
+        //
+        // Mirrors go-bsc `bidSimulator.newBidBlockLoop`: discard BidBlocks for a block number we
+        // have already passed. Admission only checks head-relative timing, not block number, so a
+        // bid admitted just before the head advanced can still reach here for a stale block.
+        let head_number = self.client.last_block_number().unwrap_or(0);
+        if decoded.block_number() <= head_number {
+            debug!(
+                "BidBlock: discard stale block, blockNumber={}, latestBlock={}, builder={}",
+                decoded.block_number(),
+                head_number,
+                decoded.builder,
+            );
+            return;
+        }
+        let parent = match self.client.header(parent_hash) {
+            Ok(Some(h)) => SealedHeader::new(h, parent_hash),
+            _ => {
+                debug!("BidBlock: parent header not found: {parent_hash}");
+                return;
+            }
+        };
+        let Some(parent_snap) = self.snapshot_provider.snapshot_by_hash(&parent_hash) else {
+            debug!("BidBlock: no snapshot for parent {parent_hash}");
+            return;
+        };
+        let gas_ceil = crate::shared::get_miner_gas_limit().unwrap_or(parent.gas_limit);
+        let expected_gas_limit =
+            EthereumBuilderConfig::new().with_gas_limit(gas_ceil).gas_limit(parent.gas_limit);
+        // Use the operator-configured extra (`miner_setExtra`) as the block vanity, mirroring
+        // geth's `worker.extra`; pad/truncate to the Parlia vanity length, defaulting to zeros.
+        let vanity = {
+            let mut v = crate::shared::get_miner_extra().map(|e| e.to_vec()).unwrap_or_default();
+            v.resize(crate::consensus::parlia::EXTRA_VANITY_LEN, 0u8);
+            Bytes::from(v)
+        };
+        let block_timestamp_ms = calculate_millisecond_timestamp(&decoded.header);
+
+        let task = match simulate_bid_block(
+            self.parlia.clone(),
+            &self.chain_spec,
+            &decoded,
+            &parent,
+            &parent_snap,
+            &self.snapshot_provider,
+            self.validator_address,
+            expected_gas_limit,
+            vanity,
+            block_timestamp_ms,
+        ) {
+            Ok(task) => task,
+            Err(e) => {
+                debug!("BidBlock rejected in simulate: {e}");
+                // go-bsc only revokes on blob-tx validation failure here (`errInvalidBidBlockBlobTx`
+                // in `prepareBidBlockTask`); other prepare failures are plain rejections. Our KZG
+                // blob verification isn't ported yet, so there is no revoke-worthy variant to match
+                // on — the dishonest-builder revoke lives at the state-root check below.
+                return;
+            }
+        };
+
+        // BEP-675 zero-simulate: do NOT execute here. Keep the highest-fee sealed BidBlock per
+        // parent (go-bsc `AddBidBlock`). Execution + state-root verification are deferred until the
+        // block has been selected and broadcast — see `ImportService::on_new_bid_block` — matching
+        // go-bsc's broadcast-then-`InsertChain` flow in `handleBidBlockResult`. Selection is by the
+        // deposit-derived `gas_fee`, which needs no execution.
+        let mut best = self.best_bid_block.write();
+        let replace = best.get(&parent_hash).is_none_or(|t| task.gas_fee > t.gas_fee);
+        // Log the key we store under. `collect_best_bid_block` logs the key it looks up, so a
+        // stored/looked-up pair that never matches is visible by diffing the two lines for one
+        // block height — the failure mode where a BidBlock is admitted, queued and stored, and
+        // then never selected, with nothing reporting why.
+        debug!(
+            "BidBlock stored: parentHash={parent_hash}, blockNumber={}, gasFee={}, replace={replace}",
+            task.block.header().number(),
+            task.gas_fee,
+        );
+        if replace {
+            best.insert(parent_hash, task);
+        }
+    }
+
+    /// The best stored (sealed, unexecuted) BidBlock for a parent hash (go-bsc `GetBestBidBlock`).
+    ///
+    /// The returned [`BidBlockTask`] is fully blind-signed and sealed but **not** executed: under
+    /// BEP-675 zero-simulate the validator verifies the state root only after broadcasting.
+    pub fn best_bid_block(&self, parent_hash: B256) -> Option<BidBlockTask> {
+        self.best_bid_block.read().get(&parent_hash).cloned()
     }
 }
 
@@ -887,6 +1201,7 @@ where
                         block_hash: B256::ZERO, // Will be set when block is sealed
                         tx_index: index as u64,
                         tx_hash,
+                        version: 0,
                     };
                     self.blob_sidecars.push(bsc_sidecar);
                 }
@@ -997,5 +1312,140 @@ where
             return Err(e);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::node::primitives::{BscBlock, BscBlockBody};
+    use reth_primitives_traits::RecoveredBlock;
+
+    #[test]
+    fn can_be_interrupted_requires_full_simulation_window() {
+        // 240ms threshold (default): exactly at the boundary → interruptible.
+        assert!(can_be_interrupted(10_000, 9_760, 240));
+        // 1ms short of the window → the in-flight simulation keeps running.
+        assert!(!can_be_interrupted(10_000, 9_761, 240));
+        // Block target already passed → saturates to 0 left, never interrupt.
+        assert!(!can_be_interrupted(10_000, 10_100, 240));
+        // Unknown block target disables the check (go-bsc `targetTime == 0`).
+        assert!(can_be_interrupted(0, 10_000, 240));
+    }
+
+    fn bid_block_task_at(number: u64, parent_hash: B256) -> BidBlockTask {
+        let header = alloy_consensus::Header { number, parent_hash, ..Default::default() };
+        let body = BscBlockBody {
+            inner: reth_ethereum_primitives::BlockBody {
+                transactions: Vec::new(),
+                ommers: Vec::new(),
+                withdrawals: None,
+            },
+            sidecars: None,
+        };
+        BidBlockTask {
+            block: RecoveredBlock::new_unhashed(BscBlock { header, body }, Vec::new()),
+            gas_fee: U256::from(1),
+            system_tx_start: 0,
+            builder: Address::ZERO,
+            bid_hash: B256::random(),
+        }
+    }
+
+    #[test]
+    fn retain_recent_bid_blocks_evicts_stale_entries_by_block_number() {
+        let mut map = HashMap::new();
+        let old_parent = B256::repeat_byte(0x11);
+        let recent_parent = B256::repeat_byte(0x22);
+        map.insert(old_parent, bid_block_task_at(100, B256::random()));
+        map.insert(recent_parent, bid_block_task_at(110, B256::random()));
+
+        // min_block_number = 105: the block-100 entry is stale and must be evicted; the
+        // block-110 entry is recent and must survive.
+        retain_recent_bid_blocks(&mut map, 105);
+
+        assert!(!map.contains_key(&old_parent), "stale BidBlock must be evicted");
+        assert!(map.contains_key(&recent_parent), "recent BidBlock must be retained");
+    }
+
+    #[test]
+    fn retain_recent_bid_blocks_keeps_entry_at_exact_threshold() {
+        let mut map = HashMap::new();
+        let parent = B256::repeat_byte(0x33);
+        map.insert(parent, bid_block_task_at(105, B256::random()));
+
+        retain_recent_bid_blocks(&mut map, 105);
+
+        assert!(map.contains_key(&parent), "entry exactly at the threshold must be retained");
+    }
+
+    #[test]
+    fn retain_recent_bid_blocks_is_a_noop_on_empty_map() {
+        let mut map: HashMap<B256, BidBlockTask> = HashMap::new();
+        retain_recent_bid_blocks(&mut map, 1_000);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn interrupt_tally_accumulates_per_parent() {
+        // The thrash ratio needs a per-block count, not a boolean: a block can have several bids
+        // preempt each other in turn, and the seal path must still see a non-zero count.
+        let mut map = HashMap::new();
+        let parent_a = B256::repeat_byte(0x44);
+        let parent_b = B256::repeat_byte(0x55);
+
+        record_interrupt_tally(&mut map, parent_a, 200);
+        record_interrupt_tally(&mut map, parent_a, 200);
+        record_interrupt_tally(&mut map, parent_b, 201);
+
+        assert_eq!(map[&parent_a], InterruptTally { block_number: 200, count: 2 });
+        assert_eq!(
+            map[&parent_b],
+            InterruptTally { block_number: 201, count: 1 },
+            "tallies must not bleed across parents"
+        );
+    }
+
+    #[test]
+    fn retain_recent_interrupt_tallies_evicts_stale_entries_by_block_number() {
+        // Without pruning, every parent hash that ever saw an interrupt is kept for the process's
+        // lifetime. Mirrors `retain_recent_bid_blocks`, including the inclusive threshold.
+        let mut map = HashMap::new();
+        let old_parent = B256::repeat_byte(0x66);
+        let threshold_parent = B256::repeat_byte(0x77);
+        let recent_parent = B256::repeat_byte(0x88);
+        record_interrupt_tally(&mut map, old_parent, 100);
+        record_interrupt_tally(&mut map, threshold_parent, 105);
+        record_interrupt_tally(&mut map, recent_parent, 110);
+
+        retain_recent_interrupt_tallies(&mut map, 105);
+
+        assert!(!map.contains_key(&old_parent), "stale tally must be evicted");
+        assert!(
+            map.contains_key(&threshold_parent),
+            "tally exactly at the threshold must be retained"
+        );
+        assert!(map.contains_key(&recent_parent), "recent tally must be retained");
+    }
+
+    #[test]
+    fn interrupt_tally_lookup_of_unseen_parent_is_zero() {
+        // The seal path reads this for every block, including the overwhelming majority that saw no
+        // interrupt at all; an absent entry must read as 0, not as evidence of thrash.
+        let map: HashMap<B256, InterruptTally> = HashMap::new();
+        assert_eq!(map.get(&B256::repeat_byte(0x99)).map_or(0, |t| t.count), 0);
+    }
+
+    #[test]
+    fn taking_an_interrupt_tally_is_exactly_once_per_parent() {
+        // `take_interrupt_count` removes the entry so a retried build at the same height cannot
+        // increment `bid_interrupt_wasted_total` twice for one block.
+        let mut map = HashMap::new();
+        let parent = B256::repeat_byte(0xaa);
+        record_interrupt_tally(&mut map, parent, 300);
+        record_interrupt_tally(&mut map, parent, 300);
+
+        assert_eq!(map.remove(&parent).map_or(0, |t| t.count), 2, "first read sees the tally");
+        assert_eq!(map.remove(&parent).map_or(0, |t| t.count), 0, "second read must see nothing");
     }
 }
