@@ -80,3 +80,54 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chainspec::BscChainSpec;
+    use alloy_primitives::Address;
+    use std::sync::Arc;
+
+    // Ramanujan activated very early in BSC's real history; any block well past genesis has it
+    // active, regardless of how (in)consistent the rest of the header is with that height — this
+    // function only reads header.number, the two timestamps, and the snapshot.
+    fn parlia() -> Parlia<BscChainSpec> {
+        Parlia::new(Arc::new(BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet())), 200)
+    }
+
+    fn single_validator_snap(block_interval: u64) -> Snapshot {
+        let mut snap = Snapshot::new(vec![Address::ZERO], 0, alloy_primitives::B256::ZERO, 200, None);
+        snap.block_interval = block_interval;
+        snap
+    }
+
+    #[test]
+    fn rejects_header_before_parent_plus_interval() {
+        // go-bsc's lower bound: current_ts must be >= parent_ts + block_interval + back_off_time.
+        // A single-validator snapshot's lone member is always in-turn, so back_off_time is 0.
+        let parlia = parlia();
+        let snap = single_validator_snap(3_000);
+        let parent = Header { number: 10_000_000, timestamp: 1_700_000_000, ..Default::default() };
+        let header = Header {
+            number: 10_000_001,
+            timestamp: 1_700_000_002, // 2s later; the 3s interval hasn't elapsed yet
+            beneficiary: Address::ZERO,
+            ..Default::default()
+        };
+        assert!(parlia.block_time_verify_for_ramanujan_fork(&snap, &header, &parent).is_err());
+    }
+
+    #[test]
+    fn accepts_header_at_parent_plus_interval() {
+        let parlia = parlia();
+        let snap = single_validator_snap(3_000);
+        let parent = Header { number: 10_000_000, timestamp: 1_700_000_000, ..Default::default() };
+        let header = Header {
+            number: 10_000_001,
+            timestamp: 1_700_000_003, // exactly parent + interval
+            beneficiary: Address::ZERO,
+            ..Default::default()
+        };
+        assert!(parlia.block_time_verify_for_ramanujan_fork(&snap, &header, &parent).is_ok());
+    }
+}

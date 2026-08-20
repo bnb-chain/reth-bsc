@@ -166,11 +166,16 @@ fn validate_requests_hash_for_bsc(
     Ok(())
 }
 
-impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 'static> HeaderValidator for Parlia<ChainSpec> {
-    fn validate_header(&self, header: &SealedHeader) -> Result<(), ConsensusError> {
-        // Don't waste time checking blocks from the future.
-        validate_header_not_from_future(header, present_unix_seconds())?;
-
+impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 'static> Parlia<ChainSpec> {
+    /// The standalone header-field checks shared by the sync path and the BidBlock path —
+    /// go-bsc's `VerifyUnsealedHeader` scope. Deliberately EXCLUDES the wall-clock future
+    /// bound: go-bsc applies that only in `verifyHeader` (the sync path), never to
+    /// builder-submitted BidBlock headers, whose next-slot timestamp is legitimately a few
+    /// hundred milliseconds ahead of the validator's clock at admission time.
+    pub fn validate_unsealed_header_fields(
+        &self,
+        header: &SealedHeader,
+    ) -> Result<(), ConsensusError> {
         // Check extra data
         self.check_header_extra(header).map_err(|e| ConsensusError::Other(Arc::new(std::io::Error::other(format!("Invalid header extra: {e}")))))?;
 
@@ -216,6 +221,16 @@ impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 's
         validate_requests_hash_for_bsc(header, prague_active)?;
 
        Ok(())
+    }
+}
+
+impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 'static> HeaderValidator for Parlia<ChainSpec> {
+    fn validate_header(&self, header: &SealedHeader) -> Result<(), ConsensusError> {
+        // Don't waste time checking blocks from the future (sync path only — go-bsc's
+        // `verifyHeader`; the BidBlock path uses `validate_unsealed_header_fields` directly).
+        validate_header_not_from_future(header, present_unix_seconds())?;
+
+        self.validate_unsealed_header_fields(header)
     }
 
     fn validate_header_against_parent(
@@ -385,5 +400,35 @@ mod tests {
             validate_requests_hash_for_bsc(&header, false),
             Err(ConsensusError::RequestsHashUnexpected)
         ));
+    }
+
+    /// Regression guard for the BidBlock future-timestamp fix: the sync path (`validate_header`)
+    /// applies the wall-clock future bound (go-bsc `verifyHeader`), but the BidBlock admission path
+    /// (`validate_unsealed_header_fields`, go-bsc `VerifyUnsealedHeader`) must NOT — a bid's
+    /// next-slot timestamp is legitimately in the future when it arrives. If someone re-adds the
+    /// future check to the unsealed path, this fails.
+    #[test]
+    fn unsealed_header_fields_skips_wall_clock_future_check() {
+        use crate::chainspec::BscChainSpec;
+        use reth_chainspec::ChainSpecBuilder;
+        let parlia = Parlia::new(Arc::new(BscChainSpec::from(ChainSpecBuilder::mainnet().build())), 200);
+
+        // Far-future timestamp AND empty extra (so check_header_extra would also reject). The
+        // discriminating signal is *which* error each path returns first.
+        let header = sealed(Header { number: 1, timestamp: u64::MAX / 2, ..Default::default() });
+
+        // Sync path: the future bound is checked first → TimestampIsInFuture.
+        assert!(
+            matches!(parlia.validate_header(&header), Err(ConsensusError::TimestampIsInFuture { .. })),
+            "sync validate_header must reject a future timestamp"
+        );
+
+        // Unsealed/BidBlock path: no future bound → it must NOT be TimestampIsInFuture
+        // (it fails later on the empty extra instead).
+        if let Err(ConsensusError::TimestampIsInFuture { .. }) =
+            parlia.validate_unsealed_header_fields(&header)
+        {
+            panic!("validate_unsealed_header_fields must NOT apply the wall-clock future bound")
+        }
     }
 }

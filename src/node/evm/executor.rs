@@ -22,7 +22,10 @@ use alloy_consensus::{Header, TxReceipt, TxType};
 use alloy_eips::eip2935::{HISTORY_STORAGE_ADDRESS, HISTORY_STORAGE_CODE};
 use alloy_eips::{eip7685::Requests, Encodable2718};
 use alloy_evm::{
-    block::{ExecutableTx, GasOutput, StateChangeSource, TxResult},
+    block::{
+        ExecutableTx, GasOutput, StateChangePostBlockSource, StateChangePreBlockSource,
+        StateChangeSource, TxResult,
+    },
     eth::receipt_builder::ReceiptBuilderCtx,
 };
 use alloy_primitives::keccak256;
@@ -206,11 +209,15 @@ where
     }
 
     /// Applies system contract upgrades if the Feynman fork is not yet active.
+    ///
+    /// `source` identifies the upgrade to the state hook and therefore to the incremental
+    /// state-root computation; pre-Feynman upgrades run at block begin, later ones at block end.
     fn upgrade_contracts(
         &mut self,
         block_number: BlockNumber,
         block_timestamp: u64,
         parent_timestamp: u64,
+        source: StateChangeSource,
     ) -> Result<(), BlockExecutionError> {
         trace!(
             target: "bsc::executor::upgrade",
@@ -237,7 +244,7 @@ where
                     code_len = code.len(),
                     "Upgrading system contract"
                 );
-                self.upgrade_system_contract(address, code)?;
+                self.upgrade_system_contract(address, code, source)?;
             }
         }
 
@@ -261,7 +268,14 @@ where
                     parent_timestamp,
                     "Upgrading system contracts at block begin (before Feynman)"
                 );
-                self.upgrade_contracts(block_number, block_timestamp, parent_timestamp)?;
+                self.upgrade_contracts(
+                    block_number,
+                    block_timestamp,
+                    parent_timestamp,
+                    StateChangeSource::PreBlock(StateChangePreBlockSource::Other(
+                        "bsc_system_contract_upgrade",
+                    )),
+                )?;
             }
 
             // HistoryStorageAddress is a special system contract in BSC, which can't be upgraded
@@ -288,7 +302,14 @@ where
                     parent_timestamp,
                     "Upgrading system contracts at block end (Feynman active)"
                 );
-                self.upgrade_contracts(block_number, block_timestamp, parent_timestamp)?;
+                self.upgrade_contracts(
+                    block_number,
+                    block_timestamp,
+                    parent_timestamp,
+                    StateChangeSource::PostBlock(StateChangePostBlockSource::Other(
+                        "bsc_system_contract_upgrade",
+                    )),
+                )?;
             }
         }
         Ok(())
@@ -323,16 +344,29 @@ where
         &mut self,
         address: Address,
         code: Bytecode,
+        source: StateChangeSource,
     ) -> Result<(), BlockExecutionError> {
-        let db = self.evm.db_mut();
-        let mut info = db.basic(address).map_err(BlockExecutionError::other)?.unwrap_or_default();
-        info.code_hash = code.hash_slow();
-        info.code = Some(code);
-        let mut account = RevmAccount::from(info);
-        account.mark_touch();
-        let mut changes: EvmState = Default::default();
-        changes.insert(address, account);
-        db.commit(changes);
+        let changes = {
+            let db = self.evm.db_mut();
+            let mut info =
+                db.basic(address).map_err(BlockExecutionError::other)?.unwrap_or_default();
+            info.code_hash = code.hash_slow();
+            info.code = Some(code);
+            let mut account = RevmAccount::from(info);
+            account.mark_touch();
+            let mut changes: EvmState = Default::default();
+            changes.insert(address, account);
+            db.commit(changes.clone());
+            changes
+        };
+
+        // The state root is computed incrementally from the state hook (sparse trie /
+        // `StateRootTask`), so a bare `db.commit` is invisible to it: the account's new
+        // `code_hash` never reaches the trie and the block commits a root describing the
+        // un-upgraded contract. That is what split bsc-qanet at the Pasteur transition
+        // (block 21323714) - geth computed the true root and rejected the block while every
+        // reth node agreed on the stale one. Report the change like `commit_transaction` does.
+        self.system_caller.on_state(source, &changes);
         Ok(())
     }
 
@@ -374,7 +408,17 @@ where
         account.mark_touch();
         let mut changes: EvmState = Default::default();
         changes.insert(HISTORY_STORAGE_ADDRESS, account);
-        db.commit(changes);
+        db.commit(changes.clone());
+
+        // Same reasoning as `upgrade_system_contract`: the incremental state-root pipeline only
+        // sees changes reported through the hook, so this deployment must be announced or the
+        // Prague transition block commits a root without it.
+        self.system_caller.on_state(
+            StateChangeSource::PreBlock(StateChangePreBlockSource::Other(
+                "bsc_history_storage_account",
+            )),
+            &changes,
+        );
 
         info!(
             target: "bsc::executor::prague",

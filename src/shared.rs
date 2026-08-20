@@ -1,6 +1,8 @@
 use crate::consensus::parlia::SnapshotProvider;
 use crate::node::engine_api::payload::BscPayloadTypes;
-use crate::node::network::block_import::service::{IncomingBlock, IncomingMinedBlock};
+use crate::node::network::block_import::service::{
+    IncomingBidBlock, IncomingBlock, IncomingMinedBlock,
+};
 use crate::node::network::BscNetworkPrimitives;
 use crate::node::primitives::BscBlock;
 use alloy_consensus::{BlockHeader, Header};
@@ -98,12 +100,43 @@ static BLOCK_IMPORT_MINED_SENDER: OnceLock<UnboundedSender<IncomingMinedBlock>> 
 /// Global sender for submitting built payload to the import service
 static BLOCK_IMPORT_SENDER: OnceLock<UnboundedSender<IncomingBlock>> = OnceLock::new();
 
+/// Global sender for submitting a selected (sealed, unexecuted) BEP-675 BidBlock to the import
+/// service, which broadcasts it then verifies it on import (zero-simulate).
+static BID_BLOCK_IMPORT_SENDER: OnceLock<UnboundedSender<IncomingBidBlock>> = OnceLock::new();
+
 /// Global local peer ID for network identification
 static LOCAL_PEER_ID: OnceLock<PeerId> = OnceLock::new();
 
 /// Global queue for bid packages (thread-safe)
 static BID_PACKAGE_QUEUE: OnceLock<Arc<Mutex<VecDeque<crate::node::miner::bid_simulator::Bid>>>> =
     OnceLock::new();
+
+/// Global BidBlock builder permission manager (BEP-675). Shared between the `mev_sendBidBlock`
+/// admission path (which rejects revoked builders) and the miner, which revokes builders after a
+/// failed BidBlock verification.
+static BID_BLOCK_PERMISSION_MANAGER: OnceLock<
+    Arc<crate::node::miner::bid_block_permission::BidBlockPermissionManager>,
+> = OnceLock::new();
+
+/// Global intake queue for admitted BEP-675 BidBlocks. `mev_sendBidBlock` pushes a decoded block
+/// here after admission; the miner pops it to pre-seal verify, execute, and select against the
+/// local block (mirrors the legacy [`BID_PACKAGE_QUEUE`] SendBid intake).
+static BID_BLOCK_QUEUE: OnceLock<
+    Arc<Mutex<VecDeque<crate::node::miner::bid_block::DecodedBidBlock>>>,
+> = OnceLock::new();
+
+/// Function type for the [`RECENT_MINED_BLOCKS`] cache: `block_number -> parent_hashes already
+/// sealed for it`.
+type RecentMinedBlocksCache = Arc<Mutex<lru::LruCache<u64, Vec<B256>>>>;
+
+/// LRU cache backing [`check_and_record_mined_block`]. Shared by every block-submission path —
+/// local/legacy payload (via `ResultWorkWorker::submit_payload`) and BEP-675 BidBlock (via
+/// `BscPayloadJob::try_submit_winning_bid_block`) — so the validator's double-sign guard covers
+/// both, not just whichever path happens to hold its own private cache.
+static RECENT_MINED_BLOCKS: OnceLock<RecentMinedBlocksCache> = OnceLock::new();
+
+/// Matches go-bsc's mined-block history depth used for the same purpose.
+const RECENT_MINED_BLOCKS_CACHE_SIZE: usize = 100;
 
 /// Global network handle to interact with P2P (reth).
 static NETWORK_HANDLE: OnceLock<NetworkHandle<BscNetworkPrimitives>> = OnceLock::new();
@@ -429,6 +462,18 @@ pub fn get_block_import_sender() -> Option<&'static UnboundedSender<IncomingBloc
     BLOCK_IMPORT_SENDER.get()
 }
 
+/// Store the BidBlock import sender globally. Returns an error if it was set before.
+pub fn set_bid_block_import_sender(
+    sender: UnboundedSender<IncomingBidBlock>,
+) -> Result<(), UnboundedSender<IncomingBidBlock>> {
+    BID_BLOCK_IMPORT_SENDER.set(sender)
+}
+
+/// Get a reference to the global BidBlock import sender, if initialized.
+pub fn get_bid_block_import_sender() -> Option<&'static UnboundedSender<IncomingBidBlock>> {
+    BID_BLOCK_IMPORT_SENDER.get()
+}
+
 /// Store the local peer ID globally. Returns an error if it was set before.
 pub fn set_local_peer_id(peer_id: PeerId) -> Result<(), PeerId> {
     LOCAL_PEER_ID.set(peer_id)
@@ -464,6 +509,82 @@ pub fn pop_bid_package() -> Option<crate::node::miner::bid_simulator::Bid> {
 /// Get the count of pending bid packages in the queue
 pub fn bid_package_queue_len() -> usize {
     BID_PACKAGE_QUEUE.get().map(|queue| queue.lock().len()).unwrap_or(0)
+}
+
+/// Get the global BidBlock permission manager, initializing it lazily on first access.
+pub fn get_bid_block_permission_manager(
+) -> Arc<crate::node::miner::bid_block_permission::BidBlockPermissionManager> {
+    BID_BLOCK_PERMISSION_MANAGER
+        .get_or_init(|| {
+            Arc::new(crate::node::miner::bid_block_permission::BidBlockPermissionManager::new())
+        })
+        .clone()
+}
+
+fn bid_block_queue() -> &'static Arc<Mutex<VecDeque<crate::node::miner::bid_block::DecodedBidBlock>>>
+{
+    BID_BLOCK_QUEUE.get_or_init(|| Arc::new(Mutex::new(VecDeque::new())))
+}
+
+fn recent_mined_blocks() -> &'static RecentMinedBlocksCache {
+    RECENT_MINED_BLOCKS.get_or_init(|| {
+        Arc::new(Mutex::new(lru::LruCache::new(
+            std::num::NonZeroUsize::new(RECENT_MINED_BLOCKS_CACHE_SIZE).unwrap(),
+        )))
+    })
+}
+
+/// Double-sign guard shared by every block-submission path. Records `(block_number,
+/// parent_hash)` and returns `false` if this exact pair was already recorded — i.e. the validator
+/// already sealed a block for `block_number` on top of `parent_hash`, from either the
+/// local/legacy path or a BEP-675 BidBlock, and must not sign a second one for the same height.
+///
+/// Mirrors go-bsc's `resultLoop`, which runs its double-sign check (`recordMinedBlock`) on every
+/// sealed block *before* branching on whether it came from the BidBlock path — a validator that
+/// signs a local block and a competing BidBlock at the same height on the same parent has
+/// equivocated, regardless of which path produced either one.
+pub fn check_and_record_mined_block(block_number: u64, parent_hash: B256) -> bool {
+    let mut cache = recent_mined_blocks().lock();
+    if let Some(prev_parents) = cache.get(&block_number) {
+        if prev_parents.contains(&parent_hash) {
+            return false;
+        }
+        let mut updated_parents = prev_parents.clone();
+        updated_parents.push(parent_hash);
+        cache.put(block_number, updated_parents);
+    } else {
+        cache.put(block_number, vec![parent_hash]);
+    }
+    true
+}
+
+/// Best-effort rollback for [`check_and_record_mined_block`]: removes `(block_number,
+/// parent_hash)` if it was recorded. Only for use when the caller recorded a slot but then failed
+/// to actually submit the block (e.g. the import channel was closed) — without this, a genuine
+/// fallback submission for the same slot would be wrongly rejected as a double sign for a block
+/// that was never actually broadcast.
+pub fn forget_recorded_mined_block(block_number: u64, parent_hash: B256) {
+    let mut cache = recent_mined_blocks().lock();
+    if let Some(prev_parents) = cache.get(&block_number) {
+        let retained: Vec<B256> =
+            prev_parents.iter().copied().filter(|&h| h != parent_hash).collect();
+        cache.put(block_number, retained);
+    }
+}
+
+/// Push an admitted BidBlock onto the global intake queue for the miner to process.
+pub fn push_bid_block_package(decoded: crate::node::miner::bid_block::DecodedBidBlock) {
+    bid_block_queue().lock().push_back(decoded);
+}
+
+/// Pop the next admitted BidBlock from the global intake queue (FIFO).
+pub fn pop_bid_block_package() -> Option<crate::node::miner::bid_block::DecodedBidBlock> {
+    bid_block_queue().lock().pop_front()
+}
+
+/// Number of admitted BidBlocks waiting in the global intake queue.
+pub fn bid_block_queue_len() -> usize {
+    bid_block_queue().lock().len()
 }
 
 /// Store the reth `NetworkHandle` globally for dynamic peer actions.
@@ -950,4 +1071,209 @@ mod tests {
     // Note: eviction behavior depends on access patterns; an exhaustive eviction
     // test would be flaky here without introspecting the LRU. The cache is covered
     // by basic put/get tests above.
+
+    // `RECENT_MINED_BLOCKS` is a process-wide global shared across every test in this binary, so
+    // each test below uses a block number reserved just for it to avoid cross-test interference.
+
+    /// Two block-production paths racing for the same slot: exactly one may proceed to broadcast.
+    ///
+    /// The other guard tests call [`check_and_record_mined_block`] twice in sequence, which proves
+    /// the bookkeeping but not the property that matters: the local path
+    /// (`ResultWorkWorker::submit_payload`) and the BidBlock path (`try_submit_winning_bid_block`)
+    /// are independent tasks that can reach the guard at the same instant. If both were admitted
+    /// the validator would have signed two different blocks at one height on one parent —
+    /// equivocation, which is slashable.
+    ///
+    /// Both production paths have the same shape around the guard: consult it, and only if it
+    /// returns `true` hand the block to an import channel, which is the point of no return. Each
+    /// side below runs that sequence on its **own OS thread**, released together by a blocking
+    /// barrier — async tasks on a shared runtime do not reliably enter a synchronous critical
+    /// section at the same time, so they cannot exercise this at all.
+    ///
+    /// Detection is probabilistic: a mutex-protected read-modify-write is atomic by construction,
+    /// so this cannot *prove* atomicity, only catch an implementation that reopens the window.
+    /// Measured to do so — splitting the guard into a check under one lock and a record under
+    /// another fails this on round 1, while the two sequential tests below still pass.
+    #[test]
+    fn double_sign_guard_admits_exactly_one_of_two_racing_paths() {
+        use std::sync::{Arc, Barrier, Mutex};
+
+        for round in 0..256_u64 {
+            // Reserved, unique height per round; the cache is process-global.
+            let block_number = 910_000 + round;
+            let parent = B256::repeat_byte(0xc3);
+
+            let barrier = Arc::new(Barrier::new(2));
+            // Stands in for the import channels: only an admitted path may append.
+            let broadcast = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+
+            let handles: Vec<_> = ["local", "bid_block"]
+                .into_iter()
+                .map(|label| {
+                    let barrier = barrier.clone();
+                    let broadcast = broadcast.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        if check_and_record_mined_block(block_number, parent) {
+                            broadcast.lock().unwrap().push(label);
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                })
+                .collect();
+
+            let winners = handles
+                .into_iter()
+                .filter(|_| true)
+                .filter_map(|h| h.join().ok())
+                .filter(|w| *w)
+                .count();
+
+            assert_eq!(
+                winners, 1,
+                "round {round}: exactly one path may be admitted, got {winners}"
+            );
+            let broadcast = broadcast.lock().unwrap();
+            assert_eq!(
+                broadcast.len(),
+                1,
+                "round {round}: exactly one path may broadcast, got {broadcast:?}"
+            );
+        }
+    }
+
+    /// The same property under heavier contention than two threads can produce.
+    ///
+    /// More racers per height, and many heights, widens the window a non-atomic guard would expose.
+    #[test]
+    fn double_sign_guard_admits_exactly_one_under_heavy_contention() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Barrier,
+        };
+
+        const RACERS: usize = 16;
+
+        for round in 0..64_u64 {
+            let block_number = 911_000 + round;
+            let parent = B256::repeat_byte(0xd4);
+
+            let barrier = Arc::new(Barrier::new(RACERS));
+            let admitted = Arc::new(AtomicUsize::new(0));
+
+            let handles: Vec<_> = (0..RACERS)
+                .map(|_| {
+                    let barrier = barrier.clone();
+                    let admitted = admitted.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        if check_and_record_mined_block(block_number, parent) {
+                            admitted.fetch_add(1, Ordering::SeqCst);
+                        }
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().expect("racer thread panicked");
+            }
+
+            assert_eq!(
+                admitted.load(Ordering::SeqCst),
+                1,
+                "round {round}: {RACERS} racers at one height/parent, exactly one may be admitted"
+            );
+        }
+    }
+
+    /// Racing at the *same height on different parents* is a fork choice, not equivocation, so
+    /// every parent must be admitted exactly once.
+    ///
+    /// Negative control for the two tests above: a guard that simply admitted the first caller per
+    /// height would satisfy them while silently suppressing legitimate blocks after a reorg.
+    #[test]
+    fn double_sign_guard_admits_each_distinct_parent_once_under_contention() {
+        use std::sync::{Arc, Barrier, Mutex};
+
+        const PARENTS: u8 = 8;
+        const RACERS_PER_PARENT: usize = 4;
+
+        let block_number = 911_500_u64;
+        let barrier = Arc::new(Barrier::new(PARENTS as usize * RACERS_PER_PARENT));
+        let admitted = Arc::new(Mutex::new(Vec::<u8>::new()));
+
+        let mut handles = Vec::new();
+        for p in 0..PARENTS {
+            for _ in 0..RACERS_PER_PARENT {
+                let barrier = barrier.clone();
+                let admitted = admitted.clone();
+                handles.push(std::thread::spawn(move || {
+                    let parent = B256::repeat_byte(p);
+                    barrier.wait();
+                    if check_and_record_mined_block(block_number, parent) {
+                        admitted.lock().unwrap().push(p);
+                    }
+                }));
+            }
+        }
+        for h in handles {
+            h.join().expect("racer thread panicked");
+        }
+
+        let mut admitted = admitted.lock().unwrap().clone();
+        admitted.sort_unstable();
+        assert_eq!(
+            admitted,
+            (0..PARENTS).collect::<Vec<_>>(),
+            "each distinct parent must be admitted exactly once at the same height"
+        );
+    }
+
+    #[test]
+    fn double_sign_guard_rejects_exact_repeat() {
+        let block_number = 900_001;
+        let parent = B256::repeat_byte(0xaa);
+
+        // First claim of (block_number, parent) succeeds...
+        assert!(check_and_record_mined_block(block_number, parent));
+        // ...a second claim of the exact same pair is a double sign and is rejected. This is the
+        // scenario fix #3 closes: previously only the local/legacy path recorded into this cache,
+        // so a local block and a competing BidBlock at the same height/parent could both be signed.
+        assert!(!check_and_record_mined_block(block_number, parent));
+    }
+
+    #[test]
+    fn double_sign_guard_allows_different_parent_at_same_height() {
+        let block_number = 900_002;
+        let parent_a = B256::repeat_byte(0xbb);
+        let parent_b = B256::repeat_byte(0xcc);
+
+        // A reorg changing the parent at the same height is not equivocation — go-bsc's
+        // `recordMinedBlock` tracks parent hashes per height for exactly this reason.
+        assert!(check_and_record_mined_block(block_number, parent_a));
+        assert!(check_and_record_mined_block(block_number, parent_b));
+        // Both are now claimed; repeating either is rejected.
+        assert!(!check_and_record_mined_block(block_number, parent_a));
+        assert!(!check_and_record_mined_block(block_number, parent_b));
+    }
+
+    #[test]
+    fn forget_recorded_mined_block_releases_the_slot() {
+        let block_number = 900_003;
+        let parent = B256::repeat_byte(0xdd);
+
+        assert!(check_and_record_mined_block(block_number, parent));
+        // Simulates a BidBlock that claimed the slot but then failed to actually send (e.g. the
+        // import channel was closed) — the rollback must let the local-payload fallback claim it.
+        forget_recorded_mined_block(block_number, parent);
+        assert!(check_and_record_mined_block(block_number, parent));
+    }
+
+    #[test]
+    fn forget_recorded_mined_block_is_a_noop_for_unknown_height() {
+        // Rolling back a height that was never recorded must not panic or corrupt the cache.
+        forget_recorded_mined_block(900_004, B256::repeat_byte(0xee));
+        assert!(check_and_record_mined_block(900_004, B256::repeat_byte(0xee)));
+    }
 }
