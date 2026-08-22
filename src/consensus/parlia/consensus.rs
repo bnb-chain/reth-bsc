@@ -890,10 +890,14 @@ where
             return Ok(()); // If not enough unique votes, do not append attestation
         }
         // Aggregate signatures
+        // Vote signatures come from the peer-fed vote pool and are not BLS-verified at ingest, so
+        // a spoofed/malformed signature must not panic block production here. Surface it as a
+        // consensus error; the caller logs and continues without the attestation.
         let sigs: Vec<blst::min_pk::Signature> = ordered_unique
             .iter()
-            .map(|(_, _, sig)| blst::min_pk::Signature::from_bytes(sig.as_slice()).unwrap())
-            .collect();
+            .map(|(_, _, sig)| blst::min_pk::Signature::from_bytes(sig.as_slice()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| ParliaConsensusError::AggregateSignatureError)?;
         let sigs_ref: Vec<&blst::min_pk::Signature> = sigs.iter().collect();
         let aggregate = blst::min_pk::AggregateSignature::aggregate(&sigs_ref, false)
             .map_err(|_| ParliaConsensusError::AggregateSignatureError)?;
