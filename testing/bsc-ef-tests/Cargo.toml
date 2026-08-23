@@ -16,29 +16,29 @@ reth_bsc = { path = "../.." }
 rand = "0.9"
 
 # reth dependencies aligned with root crate branch to avoid duplicate crate versions
-reth-chainspec = { path = "/Users/chee/Documents/repo/reth/crates/chainspec" }
-reth-consensus = { path = "/Users/chee/Documents/repo/reth/crates/consensus/consensus" }
-reth-ethereum-forks = { path = "/Users/chee/Documents/repo/reth/crates/ethereum/hardforks" }
-reth-db = { path = "/Users/chee/Documents/repo/reth/crates/storage/db", features = [    "mdbx",
+reth-chainspec = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
+reth-consensus = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
+reth-ethereum-forks = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
+reth-db = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5", features = [    "mdbx",
     "test-utils",
     "disable-lock",
 ] }
-reth-db-api = { path = "/Users/chee/Documents/repo/reth/crates/storage/db-api" }
-reth-db-common = { path = "/Users/chee/Documents/repo/reth/crates/storage/db-common" }
-reth-ethereum-consensus = { path = "/Users/chee/Documents/repo/reth/crates/ethereum/consensus" }
-reth-ethereum-primitives = { path = "/Users/chee/Documents/repo/reth/crates/ethereum/primitives" }
-reth-evm = { path = "/Users/chee/Documents/repo/reth/crates/evm/evm" }
-reth-evm-ethereum = { path = "/Users/chee/Documents/repo/reth/crates/ethereum/evm" }
+reth-db-api = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
+reth-db-common = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
+reth-ethereum-consensus = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
+reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
+reth-evm = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
+reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
 reth-primitives-traits = { version = "0.6.0", default-features = false }
-reth-provider = { path = "/Users/chee/Documents/repo/reth/crates/storage/provider", features = [
+reth-provider = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5", features = [
     "test-utils",
 ] }
-reth-revm = { path = "/Users/chee/Documents/repo/reth/crates/revm", features = [
+reth-revm = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5", features = [
     "std",
 ] }
-reth-tracing = { path = "/Users/chee/Documents/repo/reth/crates/tracing" }
-reth-trie = { path = "/Users/chee/Documents/repo/reth/crates/trie/trie" }
-reth-trie-db = { path = "/Users/chee/Documents/repo/reth/crates/trie/db" }
+reth-tracing = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
+reth-trie = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
+reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
 # revm
 
 # alloy
