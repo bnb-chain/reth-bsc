@@ -29,7 +29,6 @@ use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
 use reth_execution_types::BlockExecutionOutput;
 use reth_payload_primitives::{BuiltPayloadExecutedBlock, PayloadBuilderError};
 use alloy_eips::eip4895::Withdrawals;
-use either::Either;
 use revm::context_interface::Block as EvmBlock;
 use reth_primitives_traits::SealedHeader;
 use reth_ethereum_primitives::TransactionSigned;
@@ -787,7 +786,7 @@ where
                 return Err(());
             }
         };
-        let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } = out;
+        let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block, block_access_list: _ } = out;
         let mut sealed_block = Arc::new(block.sealed_block().clone());
 
         // Check if any un_revertible transaction failed
@@ -819,13 +818,12 @@ where
 
         let requests = execution_result.requests.clone();
         let execution_outcome = BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
-        let executed: BuiltPayloadExecutedBlock<_> = BuiltPayloadExecutedBlock {
+        let executed_block = BuiltPayloadExecutedBlock {
             recovered_block: Arc::new(block.clone()),
             execution_output: Arc::new(execution_outcome),
-            hashed_state: Either::Left(Arc::new(hashed_state)),
-            trie_updates: Either::Left(Arc::new(trie_updates)),
+            hashed_state: Arc::new(hashed_state),
+            trie_updates: Arc::new(trie_updates),
         };
-        let executed_block = executed.into_executed_payload();
 
         // Read validator/turn-length data transported via sinks from the now-consumed builder.
         let pending_validators = bid_validator_cache_sink.lock().unwrap().take();
@@ -1185,9 +1183,9 @@ where
                 if let Some(sidecar) = self.bid.blob_sidecars.get(&tx_hash) {
                     // Insert blob sidecar into pool's blob store
                     use alloy_eips::eip7594::BlobTransactionSidecarVariant;
-                    if let Err(e) = self.pool.insert_blob(
+                    if let Err(e) = self.pool.blob_store().insert(
                         tx_hash,
-                        BlobTransactionSidecarVariant::Eip4844(sidecar.clone()),
+                        BlobTransactionSidecarVariant::Eip4844(sidecar.clone()).into(),
                     ) {
                         debug!("Failed to insert blob sidecar for tx {:?}: {:?}", tx_hash, e);
                         if from_pool {

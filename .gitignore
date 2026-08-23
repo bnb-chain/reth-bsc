@@ -3,3 +3,4 @@ target/
 .vscode/
 genesis_local.json
 test-datadir/
+.cargo/config.toml

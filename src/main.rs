@@ -224,6 +224,31 @@ fn main() -> eyre::Result<()> {
                     BSC_DEFAULT_GPO_IGNORE_PRICE;
             }
 
+            // v2.5 VALIDATION: parallel import sparse-trie state-root re-enabled.
+            //
+            // On reth v2.4.1 this was forced to `true` (serial import) because the sparse-trie
+            // task corrupted shared state on a *reorg* block whose parent is a historical
+            // (below-tip) in-memory block: `PreservedSparseTrie` reuse on an anchor mismatch
+            // produced a wrong reconstructed parent state root, the block's computed root
+            // mismatched its header, and the valid block was rejected — permanently stalling sync.
+            // BSC parlia hits that reorg path constantly via out-of-turn "slash" blocks.
+            //
+            // reth v2.5 reworked that subsystem (overlay-manager anchoring, `anchor_hash`,
+            // `into_trie_for -> Result<Option<..>>`). We set `false` here to exercise the parallel
+            // import path and confirm on the devnet that v2.5 no longer diverges on the reorg path.
+            // If a validator stalls with `mismatched block state root`, flip back to `true`.
+            // 2026-08-20: fallback=false wedges PRODUCING validators — reth mis-roots an incoming
+            // fork block during reorg (anchored to wrong parent state). Testing fallback=true.
+            // TEST-ONLY (uncommitted): allow overriding via env so one binary can exercise both
+            // the parallel sparse path (default false) and the serial path (true) — the latter is
+            // needed to test the v2.5.1 storage-wipe batched-persistence fix (#26750).
+            let state_root_fallback = std::env::var("STATE_ROOT_FALLBACK")
+                .ok()
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            builder.config_mut().engine.state_root_fallback = state_root_fallback;
+            tracing::info!(target: "reth_bsc", state_root_fallback, "engine.state_root_fallback");
+
             // Map CLI args into a global MiningConfig override before launching services
             {
                 use reth_bsc::node::miner::{config as mining_config, MiningConfig};

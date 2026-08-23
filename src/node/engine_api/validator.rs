@@ -10,13 +10,11 @@ use reth::{
         rpc::{BasicEngineValidatorBuilder, PayloadValidatorBuilder},
         AddOnsContext,
     },
-    consensus::ConsensusError,
 };
 use reth_engine_primitives::{ExecutionPayload, PayloadValidator};
 use reth_payload_primitives::NewPayloadError;
 use reth_primitives_traits::{RecoveredBlock, SealedBlock};
 use reth_primitives_traits::Block;
-use reth_trie_common::HashedPostState;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, OnceLock};
 
@@ -89,6 +87,13 @@ impl BscExecutionData {
 impl From<BscBlock> for BscExecutionData {
     fn from(block: BscBlock) -> Self {
         Self::new(block)
+    }
+}
+
+impl From<crate::node::engine::BscBuiltPayload> for BscExecutionData {
+    fn from(payload: crate::node::engine::BscBuiltPayload) -> Self {
+        let hash = payload.block.hash();
+        Self::new_with_hash(payload.block.clone_block(), hash)
     }
 }
 
@@ -172,13 +177,6 @@ impl PayloadValidator<BscPayloadTypes> for BscEngineValidator {
         sealed_block.try_recover().map_err(|e| NewPayloadError::Other(e.into()))
     }
 
-    fn validate_block_post_execution_with_hashed_state(
-        &self,
-        _state_updates: &HashedPostState,
-        _block: &RecoveredBlock<Self::Block>,
-    ) -> Result<(), ConsensusError> {
-        Ok(())
-    }
 }
 
 /// Execution payload validator.

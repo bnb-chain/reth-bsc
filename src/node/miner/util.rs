@@ -104,6 +104,7 @@ pub fn prepare_new_attributes(
         withdrawals: None,
         parent_beacon_block_root: None,
         slot_number: None,
+        target_gas_limit: None,
     };
     if BscHardforks::is_bohr_active_at_timestamp(
         &parlia.spec,

@@ -804,6 +804,7 @@ pub fn bid_block_env_attributes(header: &Header) -> EthPayloadAttributes {
         withdrawals: None,
         parent_beacon_block_root: header.parent_beacon_block_root,
         slot_number: None,
+        target_gas_limit: None,
     }
 }
 

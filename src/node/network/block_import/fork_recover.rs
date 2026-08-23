@@ -354,7 +354,7 @@ where
         let block_hash = block.header.hash_slow();
         let block_num = block.header.number;
         let sealed = block.clone().seal_unchecked(block_hash);
-        let payload = BscPayloadTypes::block_to_payload(sealed);
+        let payload = BscPayloadTypes::block_to_payload(sealed, None);
 
         match engine.new_payload(payload).await {
             Ok(status) => match status.status {
@@ -387,6 +387,22 @@ where
                 return Err(ForkRecoverError::EngineCall(err.to_string()));
             }
         }
+    }
+
+    // Precompute TDs for the just-imported fork chain so Phase-3's FCU can
+    // resolve them. Fork blocks live in the engine tree, not on the canonical
+    // chain, so the provider-backed `header_td` can't see them — without this,
+    // fork choice fails with `Unknown total difficulty` (v2.5 dropped the
+    // block-carried TD). Best-effort: on failure we fall through to the existing
+    // `header_td` behavior.
+    if let Err(err) =
+        forkchoice_engine.prime_fork_chain_tds(to_import.iter().map(|b| &b.header))
+    {
+        tracing::debug!(
+            target: "bsc::fork_recover",
+            error = %err,
+            "priming fork-chain TDs failed; relying on header_td fallback"
+        );
     }
 
     // ---- Phase 3: FCU so engine-tree re-evaluates canonical head ----
