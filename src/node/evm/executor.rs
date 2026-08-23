@@ -20,9 +20,9 @@ use alloy_eips::eip2935::{HISTORY_STORAGE_ADDRESS, HISTORY_STORAGE_CODE};
 use alloy_eips::{eip7685::Requests, Encodable2718};
 use alloy_evm::{
     block::{
-        ExecutableTx, GasOutput, StateChangePostBlockSource, StateChangePreBlockSource,
-        StateChangeSource, TxResult,
-    },    eth::receipt_builder::ReceiptBuilderCtx,
+        ExecutableTx, GasOutput, TxResult,
+    },
+    eth::receipt_builder::ReceiptBuilderCtx,
 };
 use alloy_primitives::keccak256;
 use alloy_primitives::{hex, uint, Address, BlockNumber, Bytes, U256};
@@ -206,14 +206,14 @@ where
 
     /// Applies system contract upgrades if the Feynman fork is not yet active.
     ///
-    /// `source` identifies the upgrade to the state hook and therefore to the incremental
-    /// state-root computation; pre-Feynman upgrades run at block begin, later ones at block end.
+    /// Pre-Feynman upgrades run at block begin, later ones at block end. The upgraded state reaches
+    /// the incremental state-root computation automatically: the DB-level state hook streams on
+    /// every `commit` (see the note in `commit_transaction`).
     fn upgrade_contracts(
         &mut self,
         block_number: BlockNumber,
         block_timestamp: u64,
         parent_timestamp: u64,
-        source: StateChangeSource,
     ) -> Result<(), BlockExecutionError> {
         trace!(
             target: "bsc::executor::upgrade",
@@ -240,7 +240,7 @@ where
                     code_len = code.len(),
                     "Upgrading system contract"
                 );
-                self.upgrade_system_contract(address, code, source)?;
+                self.upgrade_system_contract(address, code)?;
             }
         }
 
@@ -264,14 +264,7 @@ where
                     parent_timestamp,
                     "Upgrading system contracts at block begin (before Feynman)"
                 );
-                self.upgrade_contracts(
-                    block_number,
-                    block_timestamp,
-                    parent_timestamp,
-                    StateChangeSource::PreBlock(StateChangePreBlockSource::Other(
-                        "bsc_system_contract_upgrade",
-                    )),
-                )?;
+                self.upgrade_contracts(block_number, block_timestamp, parent_timestamp)?;
             }
 
             // HistoryStorageAddress is a special system contract in BSC, which can't be upgraded
@@ -298,14 +291,7 @@ where
                     parent_timestamp,
                     "Upgrading system contracts at block end (Feynman active)"
                 );
-                self.upgrade_contracts(
-                    block_number,
-                    block_timestamp,
-                    parent_timestamp,
-                    StateChangeSource::PostBlock(StateChangePostBlockSource::Other(
-                        "bsc_system_contract_upgrade",
-                    )),
-                )?;
+                self.upgrade_contracts(block_number, block_timestamp, parent_timestamp)?;
             }
         }
         Ok(())
@@ -340,29 +326,22 @@ where
         &mut self,
         address: Address,
         code: Bytecode,
-        source: StateChangeSource,
     ) -> Result<(), BlockExecutionError> {
-        let changes = {
-            let db = self.evm.db_mut();
-            let mut info =
-                db.basic(address).map_err(BlockExecutionError::other)?.unwrap_or_default();
-            info.code_hash = code.hash_slow();
-            info.code = Some(code);
-            let mut account = RevmAccount::from(info);
-            account.mark_touch();
-            let mut changes: EvmState = Default::default();
-            changes.insert(address, account);
-            db.commit(changes.clone());
-            changes
-        };
+        let db = self.evm.db_mut();
+        let mut info = db.basic(address).map_err(BlockExecutionError::other)?.unwrap_or_default();
+        info.code_hash = code.hash_slow();
+        info.code = Some(code);
+        let mut account = RevmAccount::from(info);
+        account.mark_touch();
+        let mut changes: EvmState = Default::default();
+        changes.insert(address, account);
 
-        // The state root is computed incrementally from the state hook (sparse trie /
-        // `StateRootTask`), so a bare `db.commit` is invisible to it: the account's new
-        // `code_hash` never reaches the trie and the block commits a root describing the
-        // un-upgraded contract. That is what split bsc-qanet at the Pasteur transition
-        // (block 21323714) - geth computed the true root and rejected the block while every
-        // reth node agreed on the stale one. Report the change like `commit_transaction` does.
-        self.system_caller.on_state(source, &changes);
+        // The upgraded account's new `code_hash` must reach the incremental state-root
+        // computation, or the block commits a root describing the un-upgraded contract (this
+        // split bsc-qanet at the Pasteur transition, block 21323714: geth computed the true root
+        // and rejected the block while every reth node agreed on the stale one). The DB-level
+        // state hook streams every `commit` to the state-root task, so `db.commit` alone suffices.
+        db.commit(changes);
         Ok(())
     }
 
@@ -404,17 +383,10 @@ where
         account.mark_touch();
         let mut changes: EvmState = Default::default();
         changes.insert(HISTORY_STORAGE_ADDRESS, account);
-        db.commit(changes.clone());
-
-        // Same reasoning as `upgrade_system_contract`: the incremental state-root pipeline only
-        // sees changes reported through the hook, so this deployment must be announced or the
-        // Prague transition block commits a root without it.
-        self.system_caller.on_state(
-            StateChangeSource::PreBlock(StateChangePreBlockSource::Other(
-                "bsc_history_storage_account",
-            )),
-            &changes,
-        );
+        // Same reasoning as `upgrade_system_contract`: the DB-level state hook streams this
+        // deployment to the incremental state-root pipeline on `commit`, so the Prague transition
+        // block commits a root that includes it.
+        db.commit(changes);
 
         info!(
             target: "bsc::executor::prague",

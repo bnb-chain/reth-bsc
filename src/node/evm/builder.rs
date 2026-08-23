@@ -249,7 +249,8 @@ where
         db.merge_transitions(BundleRetention::Reverts);
 
         let state_root_start = std::time::Instant::now();
-        let hashed_state = state.hashed_post_state(&db.bundle_state);
+        let hashed_state =
+            state.hashed_post_state(&db.bundle_state).map_err(BlockExecutionError::other)?;
 
         let (state_root, trie_updates) = if let Some((root, updates)) = self
             .ctx

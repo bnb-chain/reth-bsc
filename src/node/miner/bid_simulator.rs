@@ -823,7 +823,6 @@ where
             execution_output: Arc::new(execution_outcome),
             hashed_state: Arc::new(hashed_state),
             trie_updates: Arc::new(trie_updates),
-            changed_paths: None,
         };
 
         // Read validator/turn-length data transported via sinks from the now-consumed builder.
@@ -1186,7 +1185,7 @@ where
                     use alloy_eips::eip7594::BlobTransactionSidecarVariant;
                     if let Err(e) = self.pool.blob_store().insert(
                         tx_hash,
-                        BlobTransactionSidecarVariant::Eip4844(sidecar.clone()),
+                        BlobTransactionSidecarVariant::Eip4844(sidecar.clone()).into(),
                     ) {
                         debug!("Failed to insert blob sidecar for tx {:?}: {:?}", tx_hash, e);
                         if from_pool {

@@ -53,7 +53,9 @@ where
             }
             if !to_insert.is_empty() {
                 let tx_hashes: Vec<_> = to_insert.iter().map(|(h, _)| *h).collect();
-                match blob_store.insert_all(to_insert) {
+                match blob_store.insert_all(
+                    to_insert.into_iter().map(|(h, s)| (h, s.into())).collect(),
+                ) {
                     Ok(()) => {
                         tracing::debug!(
                             target: "bsc::storage",

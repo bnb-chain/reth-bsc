@@ -18,6 +18,7 @@ use parking_lot::Mutex;
 use reth_engine_tree::engine::EngineApiRequest;
 use reth_network::NetworkHandle;
 use reth_network_api::PeerId;
+use reth_primitives_traits::SealedHeader;
 use reth_payload_builder_primitives::Events;
 use reth_ethereum_primitives::TransactionSigned;
 use reth_provider::{BlockNumReader, HeaderProvider};
@@ -48,23 +49,20 @@ static SNAPSHOT_PROVIDER: OnceLock<Arc<dyn SnapshotProvider + Send + Sync>> = On
 
 /// Function type for spawning a sparse-trie state-root background task.
 ///
-/// Takes the parent block's hash and state root, returns an opaque handle that the
+/// Takes the parent block's sealed header, returns an opaque handle that the
 /// miner can:
 ///   1. attach as a `state_hook` on the BSC executor (streams per-tx state diffs to the task)
 ///   2. block on after execution to receive the precomputed `(state_root, trie_updates)`
 ///
-/// Two `B256` parameters:
-///   * `parent_hash`: block hash of the parent — used as the `anchor_hash` for the
-///     `OverlayStateProviderFactory` so the sparse trie can resolve historical trie
-///     nodes via the changeset cache.
-///   * `parent_state_root`: state root of the parent — the sparse trie's starting
-///     anchor for incremental hashing.
+/// The parent [`SealedHeader`] carries everything the task needs: its hash is the `anchor_hash`
+/// for the `OverlayStateProviderFactory` (so the sparse trie resolves historical nodes via the
+/// overlay), its state root anchors incremental hashing, and its number seeds the trie-node epoch.
 ///
 /// Registered by the engine launch path when
 /// `--mining.use-sparse-trie-state-root` is enabled. Returns `None` if the engine
 /// has not been wired (graceful fallback to legacy `state_root_with_updates`).
 pub type SparseTrieSpawnFn = Arc<
-    dyn Fn(B256, B256) -> Option<reth_engine_tree::tree::StateRootHandle>
+    dyn Fn(SealedHeader<Header>) -> Option<reth_engine_tree::tree::StateRootHandle>
         + Send
         + Sync,
 >;
@@ -333,12 +331,9 @@ pub fn set_sparse_trie_spawn_fn(
 ///
 /// On `None`, callers must fall back to the synchronous state-root path.
 pub fn spawn_sparse_trie_state_root(
-    parent_hash: B256,
-    parent_state_root: B256,
+    parent_header: SealedHeader<Header>,
 ) -> Option<reth_engine_tree::tree::StateRootHandle> {
-    SPARSE_TRIE_SPAWN_FN
-        .get()
-        .and_then(|f| f(parent_hash, parent_state_root))
+    SPARSE_TRIE_SPAWN_FN.get().and_then(|f| f(parent_header))
 }
 
 /// Whether the sparse-trie state-root fast path is wired up.

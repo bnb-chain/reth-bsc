@@ -132,11 +132,12 @@ where
         // chain to a per-spawn `StateTrieOverlayManager` so proof workers can resolve a
         // not-yet-persisted parent.
         if mining_config.use_sparse_trie_state_root {
-            use reth_chain_state::{ExecutedBlock, StateTrieOverlayManager};
+            use alloy_consensus::Header;
+            use reth_chain_state::ExecutedBlock;
             use reth_engine_tree::tree::state_root_strategy::spawn_payload_builder_state_root;
-            use reth_provider::providers::{OverlayBuilder, OverlayStateProviderFactory};
+            use reth_primitives_traits::SealedHeader;
+            use reth_storage_overlay::{OverlayManager, OverlayStateProviderFactory};
             use reth_tasks::{RuntimeBuilder, RuntimeConfig, TokioConfig};
-            use reth_trie_db::ChangesetCache;
 
             let tree_config = Arc::new(ctx.config().engine.tree_config());
             tracing::debug!(
@@ -148,10 +149,6 @@ where
             let worker_pool = ctx.task_executor().state_trie_overlay_worker_pool();
             let tokio_handle = ctx.task_executor().handle().clone();
 
-            // Long-lived changeset cache shared across all miner spawns: the first block computes
-            // trie reverts (from DB) and caches them; consecutive blocks reuse them, avoiding the
-            // dominant "slow root" cost of recomputing reverts per block. Cloning shares the Arc.
-            let miner_changeset_cache = ChangesetCache::new();
             let tree_config_for_closure = tree_config.clone();
             // Cache the task Runtime so it is built at most once. Rebuilding (and dropping) a
             // worker-pool Runtime per spawn panics the storage workers with a join deadlock, so
@@ -160,13 +157,14 @@ where
             let runtime_cell: std::sync::OnceLock<reth_tasks::Runtime> = std::sync::OnceLock::new();
 
             let spawn_fn: crate::shared::SparseTrieSpawnFn = std::sync::Arc::new(
-                move |parent_hash: alloy_primitives::B256,
-                      parent_state_root: alloy_primitives::B256| {
+                move |parent: SealedHeader<Header>| {
+                    let parent_hash = parent.hash();
                     // Per-spawn overlay manager fed with the in-memory canonical chain, so the
                     // proof workers can resolve a parent that hasn't been persisted yet (the
-                    // common case during fast block production).
+                    // common case during fast block production). The manager owns its own changeset
+                    // cache internally (reth v2.5), so there is no shared cache to thread in.
                     let overlay_manager =
-                        StateTrieOverlayManager::<crate::BscPrimitives>::new(worker_pool.clone());
+                        OverlayManager::<crate::BscPrimitives>::new(worker_pool.clone());
                     if let Some(cim) = crate::shared::get_canonical_in_memory_state() {
                         if let Some(state) = cim.state_by_hash(parent_hash) {
                             // chain() yields newest-to-oldest including the parent itself.
@@ -188,12 +186,9 @@ where
                     }
 
                     // Anchor directly at the parent hash; the overlay manager resolves the
-                    // in-memory parent trie (mirrors engine `overlay_builder_for_parent`).
-                    let overlay_builder = OverlayBuilder::<crate::BscPrimitives>::new(
-                        parent_hash,
-                        miner_changeset_cache.clone(),
-                    )
-                    .with_state_trie_overlay_manager(overlay_manager.clone());
+                    // in-memory parent trie (mirrors the engine's own payload-builder path in
+                    // `payload_state_root_handle_for`).
+                    let overlay_builder = overlay_manager.overlay_builder(parent_hash);
                     let overlay_factory =
                         OverlayStateProviderFactory::new(provider.clone(), overlay_builder);
 
@@ -220,7 +215,7 @@ where
                         runtime,
                         &overlay_manager,
                         overlay_factory,
-                        parent_state_root,
+                        parent,
                         None, // tx count unknown at spawn time → full proof-worker pool
                         tree_config_for_closure.as_ref(),
                         None, // fresh manager per spawn: no preserved trie to prune

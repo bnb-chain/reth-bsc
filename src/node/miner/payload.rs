@@ -477,7 +477,7 @@ where
             let use_sparse_trie = crate::node::miner::config::get_global_mining_config()
                 .is_some_and(|c| c.use_sparse_trie_state_root);
             Arc::new(Mutex::new(if use_sparse_trie {
-                crate::shared::spawn_sparse_trie_state_root(parent_hash, parent_header.state_root())
+                crate::shared::spawn_sparse_trie_state_root(parent_header.as_ref().clone())
             } else {
                 None
             }))
@@ -983,7 +983,6 @@ where
             execution_output: Arc::new(execution_outcome),
             hashed_state: Arc::new(hashed_state),
             trie_updates: Arc::new(trie_updates),
-            changed_paths: None,
         };
 
         // Read validator/turn-length data transported via sinks from the now-consumed builder.
@@ -1139,7 +1138,6 @@ where
             execution_output: Arc::new(execution_outcome),
             hashed_state: Arc::new(hashed_state),
             trie_updates: Arc::new(trie_updates),
-            changed_paths: None,
         };
 
         // Read validator/turn-length data transported via sinks from the now-consumed builder.

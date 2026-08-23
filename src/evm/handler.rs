@@ -20,7 +20,9 @@ use revm::{
     context_interface::{result::ResultGas, transaction::eip7702::AuthorizationTr, Block, JournalTr},
     handler::{EthFrame, EvmTr, FrameResult, Handler, MainnetHandler},
     inspector::{Inspector, InspectorHandler},
-    interpreter::{interpreter::EthInterpreter, Host, InitialAndFloorGas, SuccessOrHalt},
+    interpreter::{
+        interpreter::EthInterpreter, GasTracker, Host, InitialAndFloorGas, SuccessOrHalt,
+    },
     primitives::hardfork::SpecId,
 };
 use revm::context_interface::journaled_state::account::JournaledAccountTr;
@@ -79,12 +81,16 @@ impl<DB: Database, INSP> Handler for BscHandler<DB, INSP> {
     // https://github.com/bluealloy/revm/blob/df467931c4b1b8b620ff2cb9f62501c7abc3ea03/crates/handler/src/pre_execution.rs#L186
     // with slight modifications to support BSC specific validation.
     // https://github.com/bnb-chain/bsc/blob/develop/core/state_transition.go#L593
-    fn apply_eip7702_auth_list(&self, evm: &mut Self::Evm, _init_and_floor_gas: &mut InitialAndFloorGas) -> Result<u64, Self::Error> {
+    fn apply_eip7702_auth_list(
+        &self,
+        evm: &mut Self::Evm,
+        _gas: &mut GasTracker,
+    ) -> Result<Option<u64>, Self::Error> {
         let ctx = evm.ctx_ref();
         let tx = ctx.tx();
 
         if tx.tx_type() != TransactionType::Eip7702 {
-            return Ok(0);
+            return Ok(Some(0));
         }
 
         let chain_id = evm.ctx().cfg().chain_id();
@@ -162,7 +168,7 @@ impl<DB: Database, INSP> Handler for BscHandler<DB, INSP> {
         let refunded_gas =
             refunded_accounts * (eip7702::PER_EMPTY_ACCOUNT_COST - eip7702::PER_AUTH_BASE_COST);
 
-        Ok(refunded_gas)
+        Ok(Some(refunded_gas))
     }
 
     fn validate_initial_tx_gas(

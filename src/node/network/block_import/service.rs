@@ -522,7 +522,7 @@ where
             td: U128::from(new_td.to::<u128>()),
         });
         let block_msg =
-            NewBlockMessage { hash: block_hash, block: Arc::new(new_block), td: Some(new_td) };
+            NewBlockMessage { hash: block_hash, block: Arc::new(new_block) };
 
         // Cache + register stats like a self-mined block so range responses and vote-delay metrics
         // work for it (mirrors `on_new_mined_block`).
@@ -546,7 +546,7 @@ where
         //    Valid advance fork choice; on Invalid revoke the dishonest builder.
         let engine = self.engine.clone();
         let forkchoice_engine = self.forkchoice_engine.clone();
-        let payload = BscPayloadTypes::block_to_payload(sealed);
+        let payload = BscPayloadTypes::block_to_payload(sealed, None);
         tokio::spawn(async move {
             match engine.new_payload(payload).await {
                 Ok(status) => match status.status {
