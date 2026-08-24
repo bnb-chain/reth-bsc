@@ -136,6 +136,13 @@ pub struct BscNextBlockEnvAttributes {
     /// blocks unboundedly past its slot. `None` = legacy unbounded blocking wait
     /// (out-of-turn / bid-sim / import paths).
     pub state_root_deadline_ms: Option<u64>,
+    /// Sub-second millisecond remainder (BEP-520) of the block being built, consumed by
+    /// [`BscBlockEnv`] and the BEP-706 precompile. The miner and bid simulator fill it
+    /// with `block_timestamp_ms % 1000` (the planned millisecond timestamp that is
+    /// later sealed into the header's `mix_hash`); the RPC pending/simulate paths leave
+    /// it `0`, matching go-bsc's synthetic headers whose zero `MixDigest` yields
+    /// `Time*1000`.
+    pub milli_remainder: u64,
 }
 
 impl<H: BlockHeader> BuildPendingEnv<H> for BscNextBlockEnvAttributes {
@@ -150,6 +157,9 @@ impl<H: BlockHeader> BuildPendingEnv<H> for BscNextBlockEnvAttributes {
             state_root_precomputed_sink: None,
             trie_handle: None,
             state_root_deadline_ms: None,
+            // RPC pending/simulate blocks have no millisecond source — second precision
+            // (`Time*1000`), like go-bsc's zero-MixDigest synthetic headers.
+            milli_remainder: 0,
         }
     }
 }
@@ -436,6 +446,7 @@ where
         parent: &Header,
         attributes: &Self::NextBlockEnvCtx,
     ) -> Result<EvmEnv<BscHardfork, BscBlockEnv>, Self::Error> {
+        let milli_remainder = attributes.milli_remainder;
         let attributes = &attributes.inner;
         // ensure we're not missing any timestamp based hardforks
         let spec_id = revm_spec_by_timestamp_and_block_number(
@@ -507,10 +518,10 @@ where
             blob_excess_gas_and_price,
             slot_num: 0,
         };
-        // Millisecond remainder for the next block: `0` until the miner threads its
-        // planned millisecond timestamp through the attributes (mirrors go-bsc's
-        // synthetic headers, whose zero MixDigest yields `Time*1000`).
-        let block_env = BscBlockEnv::new(block_env, 0);
+        // Millisecond remainder for the next block, threaded through the attributes:
+        // the miner/bid-simulator's planned `block_timestamp_ms % 1000`, or `0` on the
+        // RPC pending/simulate paths (go-bsc synthetic-header semantics).
+        let block_env = BscBlockEnv::new(block_env, milli_remainder);
 
         Ok(EvmEnv { cfg_env, block_env })
     }
@@ -818,6 +829,46 @@ mod tests {
         assert_eq!(
             env.block_env.milli_timestamp(),
             env.block_env.timestamp.saturating_to::<u64>() * 1000
+        );
+    }
+
+    /// The miner threads `block_timestamp_ms % 1000` through the attributes; the env's
+    /// live millisecond value must equal both the planned value and what the sealed
+    /// header will report via `calculate_millisecond_timestamp` once the same remainder
+    /// is written into its `mix_hash` (the two millisecond sources must agree).
+    #[test]
+    fn next_evm_env_carries_the_miner_millisecond_remainder() {
+        let chain_spec =
+            crate::chainspec::BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet());
+        let evm_config = BscEvmConfig::bsc(std::sync::Arc::new(chain_spec));
+
+        let parent = SealedHeader::seal_slow(Header {
+            number: 50_000_000,
+            timestamp: 1_780_000_000,
+            gas_limit: 30_000_000,
+            ..Default::default()
+        });
+        // The planned millisecond timestamp a miner would compute for the next slot.
+        let block_timestamp_ms: u64 = 1_780_000_000_750;
+        let mut attrs =
+            <BscNextBlockEnvAttributes as BuildPendingEnv<Header>>::build_pending_env(&parent);
+        attrs.inner.timestamp = block_timestamp_ms / 1000;
+        attrs.milli_remainder = block_timestamp_ms % 1000;
+
+        let env = evm_config.next_evm_env(&parent, &attrs).unwrap();
+        assert_eq!(env.block_env.milli_remainder, 750);
+        assert_eq!(env.block_env.milli_timestamp(), block_timestamp_ms);
+
+        // Sealing the same value into a header (what finalize does via
+        // `set_millisecond_part_of_timestamp`) reports the identical milliseconds.
+        let mut sealed = Header { timestamp: block_timestamp_ms / 1000, ..Default::default() };
+        crate::consensus::parlia::util::set_millisecond_part_of_timestamp(
+            block_timestamp_ms,
+            &mut sealed,
+        );
+        assert_eq!(
+            env.block_env.milli_timestamp(),
+            crate::consensus::parlia::util::calculate_millisecond_timestamp(&sealed),
         );
     }
 
