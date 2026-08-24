@@ -7,7 +7,7 @@ use crate::node::engine::BscBuiltPayload;
 use crate::node::evm::config::{BscEvmConfig, BscNextBlockEnvAttributes, ValidatorCacheSink};
 use crate::node::miner::bsc_miner::MiningContext;
 use crate::node::miner::payload::DELAY_LEFT_OVER;
-use crate::node::miner::util::prepare_new_attributes;
+use crate::node::miner::util::{epoch_validators_for_next_block, prepare_new_attributes};
 use crate::node::primitives::BscBlobTransactionSidecar;
 use alloy_consensus::BlobTransactionSidecar;
 use alloy_consensus::BlockHeader as _;
@@ -40,7 +40,7 @@ use reth_revm::{database::StateProviderDatabase, db::State};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 const PAY_BID_TX_GAS_LIMIT: u64 = 25000;
 const TX_GAS: u64 = 21000;
 
@@ -900,6 +900,15 @@ where
                 return;
             }
         };
+        // BidBlocks must build directly on the selected parent.
+        if decoded.block_number() != parent.number() + 1 {
+            debug!(
+                "BidBlock: block {} is not a child of parent {} ({parent_hash})",
+                decoded.block_number(),
+                parent.number(),
+            );
+            return;
+        }
         let Some(parent_snap) = self.snapshot_provider.snapshot_by_hash(&parent_hash) else {
             debug!("BidBlock: no snapshot for parent {parent_hash}");
             return;
@@ -916,6 +925,24 @@ where
         };
         let block_timestamp_ms = calculate_millisecond_timestamp(&decoded.header);
 
+        let epoch_validators = match epoch_validators_for_next_block(
+            &self.client,
+            &self.chain_spec,
+            &parent_snap,
+            &parent,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                // This is an infrastructure failure, not a bid-specific rejection.
+                warn!(
+                    "BidBlock: failed to resolve epoch validators for block {}, builder={}: {e}",
+                    decoded.block_number(),
+                    decoded.builder,
+                );
+                return;
+            }
+        };
+
         let task = match simulate_bid_block(
             self.parlia.clone(),
             &self.chain_spec,
@@ -927,6 +954,7 @@ where
             expected_gas_limit,
             vanity,
             block_timestamp_ms,
+            epoch_validators,
         ) {
             Ok(task) => task,
             Err(e) => {
@@ -939,11 +967,7 @@ where
             }
         };
 
-        // BEP-675 zero-simulate: do NOT execute here. Keep the highest-fee sealed BidBlock per
-        // parent (go-bsc `AddBidBlock`). Execution + state-root verification are deferred until the
-        // block has been selected and broadcast — see `ImportService::on_new_bid_block` — matching
-        // go-bsc's broadcast-then-`InsertChain` flow in `handleBidBlockResult`. Selection is by the
-        // deposit-derived `gas_fee`, which needs no execution.
+        // Keep the highest-fee sealed BidBlock per parent. Execution is deferred.
         let mut best = self.best_bid_block.write();
         let replace = best.get(&parent_hash).is_none_or(|t| task.gas_fee > t.gas_fee);
         // Log the key we store under. `collect_best_bid_block` logs the key it looks up, so a

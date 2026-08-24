@@ -324,6 +324,7 @@ where
                 &mut header,
                 &snapshot_provider,
                 block_timestamp_ms,
+                None,
             ).map_err(|e| BlockExecutionError::msg(format!("Failed to finalize header: {}", e)))?;
 
             let header_hash = keccak256(alloy_rlp::encode(&header));

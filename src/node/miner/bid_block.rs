@@ -21,6 +21,7 @@ use crate::consensus::parlia::{
 use crate::hardforks::BscHardforks;
 use crate::node::miner::block_mev_info::{set_block_mev_info, BlockMevInfoVersion};
 use crate::node::miner::signer::sign_system_transaction;
+use crate::node::evm::pre_execution::EpochValidators;
 use crate::node::miner::util::finalize_new_header;
 use crate::node::primitives::{BscBlobTransactionSidecar, BscBlock, BscBlockBody};
 use alloy_consensus::transaction::RlpEcdsaDecodableTx;
@@ -869,7 +870,8 @@ pub fn set_bid_block_mev_info(header: &mut Header, builder: Address, prague_acti
 /// as the builder set them so the re-executed state root matches the builder's.
 ///
 /// `vanity` is the validator's extra-data vanity (finalize appends the 65-byte seal slot);
-/// `block_timestamp_ms` is the millisecond timestamp for Lorentz.
+/// `block_timestamp_ms` is the millisecond timestamp for Lorentz; `epoch_validators` is the set an
+/// epoch block must carry, forwarded to `finalize_new_header` (see it for the `None` contract).
 #[allow(clippy::too_many_arguments)]
 pub fn simulate_bid_block(
     parlia: Arc<Parlia<BscChainSpec>>,
@@ -882,6 +884,7 @@ pub fn simulate_bid_block(
     expected_gas_limit: u64,
     vanity: Bytes,
     block_timestamp_ms: u64,
+    epoch_validators: Option<EpochValidators>,
 ) -> Result<BidBlockTask, SimulateBidBlockError> {
     let (system_tx_start, gas_fee) =
         verify_bid_block_payload(chain_spec, decoded, parent.header(), validator, expected_gas_limit)
@@ -909,6 +912,7 @@ pub fn simulate_bid_block(
         &mut header,
         snapshot_provider,
         block_timestamp_ms,
+        epoch_validators,
     )
     .map_err(|e| SimulateBidBlockError::Finalize(e.to_string()))?;
 
@@ -1867,6 +1871,7 @@ mod tests {
             30_000_000,
             Bytes::from(vec![0u8; 32]),
             1_000,
+            None, // not an epoch block
         )
         .expect("simulate");
 
