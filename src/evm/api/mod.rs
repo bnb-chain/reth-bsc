@@ -52,8 +52,19 @@ impl<DB: Database, I> BscEvm<DB, I> {
         inspect: bool,
         trace: bool,
     ) -> Self {
-        let precompiles =
+        let mut precompiles =
             PrecompilesMap::from_static(BscPrecompiles::new(env.cfg_env.spec).precompiles());
+        // BEP-706 (Jenner): the 0x70 millisecond-timestamp precompile depends on the
+        // block being executed, so it is registered dynamically here — never in the
+        // static fork-cumulative tables. The factory captures this block's sub-second
+        // remainder; the seconds are read live from the block env at call time.
+        if env.cfg_env.spec >= BscHardfork::Jenner {
+            precompiles.extend_precompiles([
+                crate::evm::precompiles::milli_timestamp::milli_timestamp_precompile(
+                    env.block_env.milli_remainder,
+                ),
+            ]);
+        }
         // Ensure the instruction table matches the configured spec. `new_mainnet()` defaults to
         // the latest spec (Prague), which undercharges pre-Berlin SLOAD in early blocks.
         let spec_id = SpecId::from(env.cfg_env.spec);
@@ -864,5 +875,196 @@ mod tests {
             result.is_success(),
             "a plain transfer to an empty coinbase account must succeed, got {result:?}"
         );
+    }
+
+    // ---- BEP-706 milliTimestamp precompile (0x70, Jenner) ----
+
+    const MILLI_TS_ADDRESS: Address = revm::precompile::u64_to_address(0x70);
+    const JENNER_TEST_SECS: u64 = 1_790_000_000;
+    const JENNER_TEST_REMAINDER: u64 = 750;
+    const JENNER_TEST_MS: u64 = JENNER_TEST_SECS * 1000 + JENNER_TEST_REMAINDER;
+
+    fn make_jenner_evm(
+        spec: BscHardfork,
+        caller: Address,
+        contract_code: Option<(Address, Vec<u8>)>,
+    ) -> BscEvm<InMemoryDB, NoOpInspector> {
+        let cfg_env = CfgEnv::new_with_spec(spec).with_chain_id(56);
+        let block_env = BlockEnv {
+            beneficiary: Address::from([0xC0; 20]),
+            timestamp: U256::from(JENNER_TEST_SECS),
+            prevrandao: Some(U256::from(1).into()),
+            ..Default::default()
+        };
+        let env = EvmEnv::new(
+            cfg_env,
+            crate::evm::block_env::BscBlockEnv::new(block_env, JENNER_TEST_REMAINDER),
+        );
+
+        let mut db = InMemoryDB::default();
+        db.insert_account_info(
+            caller,
+            AccountInfo { balance: U256::from(1_000_000u64), ..AccountInfo::default() },
+        );
+        if let Some((address, code)) = contract_code {
+            db.insert_account_info(
+                address,
+                AccountInfo::default().with_code(Bytecode::new_raw(Bytes::from(code))),
+            );
+        }
+        BscEvm::new(env, db, NoOpInspector, false, false)
+    }
+
+    fn call_output(result: ExecutionResult) -> Bytes {
+        match result {
+            ExecutionResult::Success { output, .. } => output.into_data(),
+            other => panic!("expected success, got {other:?}"),
+        }
+    }
+
+    /// Mirrors go-bsc `TestMilliTimestamp_PreActivation`: before Jenner, `0x70` is a
+    /// plain empty account — the call succeeds with empty return data, no revert, no
+    /// "invalid precompile" error.
+    #[test]
+    fn milli_timestamp_pre_activation_behaves_as_empty_account() {
+        let caller = Address::from([0x11; 20]);
+        let mut evm = make_jenner_evm(BscHardfork::Pasteur, caller, None);
+        let tx = BscTxEnv::new(
+            TxEnv::builder()
+                .caller(caller)
+                .chain_id(Some(56))
+                .gas_limit(60_000)
+                .gas_price(1)
+                .data(Bytes::from(vec![0xde, 0xad]))
+                .kind(TxKind::Call(MILLI_TS_ADDRESS))
+                .build()
+                .expect("tx env should build"),
+        );
+
+        let result = evm.transact_one(tx).expect("execution should not error");
+        assert!(result.is_success(), "pre-Jenner call to 0x70 must succeed, got {result:?}");
+        assert!(call_output(result).is_empty(), "empty account returns no data");
+    }
+
+    /// Mirrors go-bsc `TestMilliTimestamp_PostActivation` + `_GasCost` + `_IgnoresInput`
+    /// end-to-end: from Jenner, `0x70` returns the block's millisecond timestamp for a
+    /// flat 20 gas (21000 intrinsic + 20 for an empty-calldata direct call — the same
+    /// observable go's devnet run showed), and calldata does not affect the output.
+    #[test]
+    fn milli_timestamp_post_activation_returns_value_for_twenty_gas() {
+        let caller = Address::from([0x11; 20]);
+        let mut evm = make_jenner_evm(BscHardfork::Jenner, caller, None);
+        let tx = BscTxEnv::new(
+            TxEnv::builder()
+                .caller(caller)
+                .chain_id(Some(56))
+                .gas_limit(60_000)
+                .gas_price(1)
+                .kind(TxKind::Call(MILLI_TS_ADDRESS))
+                .build()
+                .expect("tx env should build"),
+        );
+        let result = evm.transact_one(tx).expect("execution should not error");
+        let gas_used = result.tx_gas_used();
+        let output = call_output(result);
+        assert_eq!(U256::from_be_slice(&output), U256::from(JENNER_TEST_MS));
+        assert_eq!(output.len(), 32);
+        assert_eq!(gas_used, 21_000 + 20, "flat 20 gas on top of the intrinsic cost");
+
+        // Garbage calldata changes only the intrinsic gas, never the output.
+        let tx = BscTxEnv::new(
+            TxEnv::builder()
+                .caller(caller)
+                .chain_id(Some(56))
+                .nonce(1)
+                .gas_limit(60_000)
+                .gas_price(1)
+                .data(Bytes::from(vec![0xde, 0xad, 0xbe, 0xef]))
+                .kind(TxKind::Call(MILLI_TS_ADDRESS))
+                .build()
+                .expect("tx env should build"),
+        );
+        let result = evm.transact_one(tx).expect("execution should not error");
+        assert_eq!(U256::from_be_slice(&call_output(result)), U256::from(JENNER_TEST_MS));
+    }
+
+    /// Mirrors go-bsc `TestMilliTimestamp_AllCallKindsUseBlockContext` (and
+    /// `_StaticCall`): CALL, CALLCODE, DELEGATECALL and STATICCALL all reach the
+    /// dynamically registered precompile and return the real millisecond timestamp.
+    #[test]
+    fn milli_timestamp_serves_all_call_kinds() {
+        let caller = Address::from([0x11; 20]);
+        let contract = Address::from([0x22; 20]);
+
+        // (opcode, has value argument): bytecode calls 0x70 with the given kind and
+        // returns the first 32 bytes of the returned data.
+        for (name, opcode, pushes_value) in [
+            ("CALL", 0xF1u8, true),
+            ("CALLCODE", 0xF2, true),
+            ("DELEGATECALL", 0xF4, false),
+            ("STATICCALL", 0xFA, false),
+        ] {
+            // PUSH1 0x20 (retSize) PUSH1 0x00 (retOffset) PUSH1 0x00 (argsSize)
+            // PUSH1 0x00 (argsOffset) [PUSH1 0x00 (value)] PUSH1 0x70 (addr) GAS <op>
+            // POP PUSH1 0x20 PUSH1 0x00 RETURN
+            let mut code =
+                vec![0x60, 0x20, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00];
+            if pushes_value {
+                code.extend([0x60, 0x00]);
+            }
+            code.extend([0x60, 0x70, 0x5A, opcode, 0x50, 0x60, 0x20, 0x60, 0x00, 0xF3]);
+
+            let mut evm =
+                make_jenner_evm(BscHardfork::Jenner, caller, Some((contract, code)));
+            let tx = BscTxEnv::new(
+                TxEnv::builder()
+                    .caller(caller)
+                    .chain_id(Some(56))
+                    .gas_limit(200_000)
+                    .gas_price(1)
+                    .kind(TxKind::Call(contract))
+                    .build()
+                    .expect("tx env should build"),
+            );
+            let result = evm.transact_one(tx).expect("execution should not error");
+            let output = call_output(result);
+            assert_eq!(
+                U256::from_be_slice(&output),
+                U256::from(JENNER_TEST_MS),
+                "{name} must reach the millisecond-timestamp precompile"
+            );
+        }
+    }
+
+    /// The go-side `TestPrecompiles_FreshMap` equivalent, asserted on the live EVM's
+    /// `PrecompilesMap` (0x70 is registered dynamically, never in the static tables):
+    /// the Jenner set is exactly the Pasteur set plus `0x70`, and no earlier spec
+    /// contains `0x70` — i.e. the precompile cannot activate early.
+    #[test]
+    fn jenner_precompile_set_is_pasteur_set_plus_milli_timestamp() {
+        use std::collections::BTreeSet;
+
+        let caller = Address::from([0x11; 20]);
+        let addresses = |spec: BscHardfork| -> BTreeSet<Address> {
+            let evm = make_jenner_evm(spec, caller, None);
+            evm.inner.precompiles.addresses().copied().collect()
+        };
+
+        let pasteur = addresses(BscHardfork::Pasteur);
+        let jenner = addresses(BscHardfork::Jenner);
+
+        assert!(!pasteur.contains(&MILLI_TS_ADDRESS), "0x70 must not exist before Jenner");
+        assert!(jenner.contains(&MILLI_TS_ADDRESS));
+        let mut expected = pasteur.clone();
+        expected.insert(MILLI_TS_ADDRESS);
+        assert_eq!(jenner, expected, "Jenner set == Pasteur set + 0x70, nothing else");
+
+        // Every pre-Jenner spec stays 0x70-free (spot-check the fork ladder).
+        for spec in [BscHardfork::Mendel, BscHardfork::Haber, BscHardfork::Hertz] {
+            assert!(
+                !addresses(spec).contains(&MILLI_TS_ADDRESS),
+                "{spec:?} must not contain 0x70"
+            );
+        }
     }
 }
