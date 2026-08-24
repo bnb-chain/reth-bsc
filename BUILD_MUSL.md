@@ -83,11 +83,10 @@ The added packages cover reth's C stack: `clang`/`libclang-dev` (bindgen for
 rocksdb and mdbx — these run on the glibc host so `dlopen` works), `m4` (GMP's
 autotools configure), `cmake` (rocksdb, aws-lc), `perl`+`golang` (aws-lc-sys).
 
-`PERL_USE_UNSAFE_INC=1` is needed by `sha3-asm` (the `asm-keccak` feature): its
-cryptogams Perl script does `require "x86_64-xlate.pl"`, and modern Perl dropped
-`.` from `@INC`, so without this env var the script can't find its sibling and
-the build fails. (Alternatively, drop `asm-keccak` from `--features` to skip
-`sha3-asm` entirely, at a small hashing-throughput cost.)
+`PERL_USE_UNSAFE_INC=1` is a harmless safety net for the cryptogams Perl scripts
+that `sha3-asm` (the `asm-keccak` feature) runs. If `asm-keccak` ever proves
+troublesome, dropping it from `--features` skips `sha3-asm` entirely, at a small
+hashing-throughput cost.
 
 **Do not override `CARGO_HOME`.** The image ships `/root/.cargo/config.toml`
 that configures the musl cross compiler as the linker for the target. If you
@@ -132,6 +131,12 @@ Normal and CI (glibc) builds don't match that target, so they're unaffected.
 
 - **First build is slow** (compiles GMP, rocksdb, aws-lc, blst, mdbx from source
   under musl). The `.cargo-musl/` cache makes later builds fast.
+
+- **If you move the crate cache** (change `CARGO_HOME`/registry path) with an
+  existing `target/`, `sha3-asm` can fail with `can't locate x86_64-xlate.pl`.
+  Its OUT_DIR holds a symlink into the old registry path that's now dangling.
+  Delete the stale dir and rebuild:
+  `rm -rf target/*/maxperf/build/sha3-asm-*`
 
 ## Disk / Docker setup on Amazon Linux 2
 
