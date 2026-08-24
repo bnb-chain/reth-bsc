@@ -143,6 +143,43 @@ mod tests {
         assert_eq!(U256::from_be_slice(&output_bytes(&res)), U256::from(1_780_000_000_000u64));
     }
 
+    /// Fixed-seed randomized coverage — the go-bsc `FuzzMilliTimestamp` equivalent
+    /// (dedicated fuzz infra is deliberately not added; a deterministic seeded loop
+    /// gives the same coverage in CI).
+    ///
+    /// Inputs stay inside the header-legal domain (`time <= u64::MAX / 1000`,
+    /// `remainder < 1000` — `calculate_millisecond_timestamp` is `secs * 1000 + part`
+    /// and consensus bounds the remainder, so out-of-domain values cannot appear on a
+    /// real header and are not part of the tested behavior).
+    #[test]
+    fn randomized_output_depends_only_on_the_block_env() {
+        use rand::{rngs::StdRng, Rng, SeedableRng};
+
+        let mut rng = StdRng::seed_from_u64(0xB5C_706);
+        let mut scratch = vec![0u8; 512];
+
+        for i in 0..100_000u64 {
+            let secs: u64 = rng.random_range(0..=u64::MAX / 1000);
+            let remainder: u64 = rng.random_range(0..1000);
+            let ms = secs * 1000 + remainder;
+
+            // Random calldata (length and content).
+            let len = rng.random_range(0..scratch.len());
+            rng.fill(&mut scratch[..len]);
+
+            let with_input =
+                run_milli_timestamp(ms, secs, &scratch[..len], 1_000_000, 0).unwrap();
+            let without_input = run_milli_timestamp(ms, secs, &[], 1_000_000, 0).unwrap();
+
+            // Output is 32 bytes, only a function of the env, gas is flat 20.
+            assert_eq!(with_input, without_input, "iteration {i}: input must be ignored");
+            assert_eq!(with_input.bytes.len(), 32);
+            assert_eq!(with_input.gas_used, MILLI_TIMESTAMP_GAS);
+            let expected = if ms == 0 { secs.saturating_mul(1000) } else { ms };
+            assert_eq!(U256::from_be_slice(&with_input.bytes), U256::from(expected));
+        }
+    }
+
     /// The factory must produce a *stateful* precompile — `supports_caching() ==
     /// false` — or the engine's `CachedPrecompile` wrapping would serve a stale
     /// cross-block value for `0x70`.
