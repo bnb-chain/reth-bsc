@@ -21,6 +21,7 @@ mod dedup;
 mod double_sign;
 mod error;
 mod iavl;
+pub(crate) mod milli_timestamp;
 mod tendermint;
 mod tm_secp256k1;
 
