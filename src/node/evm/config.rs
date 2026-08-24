@@ -644,7 +644,9 @@ pub fn revm_spec_by_timestamp_and_block_number(
     timestamp: u64,
     block_number: u64,
 ) -> BscHardfork {
-    if chain_spec.is_pasteur_active_at_timestamp(block_number, timestamp) {
+    if chain_spec.is_jenner_active_at_timestamp(block_number, timestamp) {
+        BscHardfork::Jenner
+    } else if chain_spec.is_pasteur_active_at_timestamp(block_number, timestamp) {
         BscHardfork::Pasteur
     } else if chain_spec.is_mendel_active_at_timestamp(block_number, timestamp) {
         BscHardfork::Mendel
