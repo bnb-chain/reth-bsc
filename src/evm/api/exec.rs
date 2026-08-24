@@ -6,7 +6,7 @@ use crate::evm::{
 
 use reth_evm::Database;
 use revm::{
-    context::{BlockEnv, ContextSetters},
+    context::ContextSetters,
     context_interface::{
         result::{EVMError, ExecutionResult, ResultAndState},
         ContextTr,
@@ -25,7 +25,7 @@ where
     type State = EvmState;
     type Error = EVMError<DB::Error>;
     type Tx = BscTxEnv;
-    type Block = BlockEnv;
+    type Block = crate::evm::block_env::BscBlockEnv;
 
     fn set_block(&mut self, block: Self::Block) {
         self.inner.set_block(block);

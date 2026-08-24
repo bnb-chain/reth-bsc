@@ -1,11 +1,11 @@
 use std::ops::{Deref, DerefMut};
 
-use crate::{evm::transaction::BscTxEnv, hardforks::bsc::BscHardfork};
+use crate::{evm::block_env::BscBlockEnv, evm::transaction::BscTxEnv, hardforks::bsc::BscHardfork};
 
 use super::precompiles::BscPrecompiles;
 use reth_evm::{precompiles::PrecompilesMap, Database, EvmEnv};
 use revm::{
-    context::{BlockEnv, CfgEnv, ContextTr, Evm as EvmCtx, FrameStack, JournalTr},
+    context::{CfgEnv, ContextTr, Evm as EvmCtx, FrameStack, JournalTr},
     handler::{
         evm::{ContextDbError, FrameInitResult},
         instructions::EthInstructions,
@@ -24,7 +24,7 @@ use revm::context_interface::journaled_state::account::JournaledAccountTr;
 mod exec;
 
 /// Type alias for the default context type of the BscEvm.
-pub type BscContext<DB> = Context<BlockEnv, BscTxEnv, CfgEnv<BscHardfork>, DB>;
+pub type BscContext<DB> = Context<BscBlockEnv, BscTxEnv, CfgEnv<BscHardfork>, DB>;
 
 /// BSC EVM implementation.
 ///
@@ -45,7 +45,13 @@ pub struct BscEvm<DB: revm::Database, I> {
 
 impl<DB: Database, I> BscEvm<DB, I> {
     /// Creates a new [`BscEvm`].
-    pub fn new(env: EvmEnv<BscHardfork>, db: DB, inspector: I, inspect: bool, trace: bool) -> Self {
+    pub fn new(
+        env: EvmEnv<BscHardfork, BscBlockEnv>,
+        db: DB,
+        inspector: I,
+        inspect: bool,
+        trace: bool,
+    ) -> Self {
         let precompiles =
             PrecompilesMap::from_static(BscPrecompiles::new(env.cfg_env.spec).precompiles());
         // Ensure the instruction table matches the configured spec. `new_mainnet()` defaults to
@@ -365,7 +371,7 @@ mod tests {
         // Use a pre-Berlin BSC hardfork which maps to Muir Glacier rules.
         let spec = BscHardfork::Bruno;
         let cfg_env = CfgEnv::new_with_spec(spec).with_chain_id(56);
-        let env = EvmEnv::new(cfg_env, BlockEnv::default());
+        let env = EvmEnv::new(cfg_env, BlockEnv::default().into());
 
         let caller = Address::from([0x11; 20]);
         let contract = Address::from([0x22; 20]);
@@ -443,7 +449,7 @@ mod tests {
             prevrandao: Some(U256::from(1).into()),
             ..Default::default()
         };
-        let env = EvmEnv::new(cfg_env, block_env);
+        let env = EvmEnv::new(cfg_env, block_env.into());
 
         let mut db = InMemoryDB::default();
         db.insert_account_info(
@@ -653,7 +659,7 @@ mod tests {
                 ..AccountInfo::default()
             },
         );
-        let mut evm = BscEvm::new(EvmEnv::new(cfg_env, block_env), db, NoOpInspector, false, false);
+        let mut evm = BscEvm::new(EvmEnv::new(cfg_env, block_env.into()), db, NoOpInspector, false, false);
 
         let initial = U256::from(TRACE_BENEFICIARY_INITIAL_BALANCE);
         evm.fund_beneficiary_for_system_tx_replay(U256::from(123u64));
@@ -728,7 +734,7 @@ mod tests {
             prevrandao: Some(U256::from(1).into()),
             ..Default::default()
         };
-        let env = EvmEnv::new(cfg_env, block_env);
+        let env = EvmEnv::new(cfg_env, block_env.into());
 
         let mut db = InMemoryDB::default();
         db.insert_account_info(
@@ -786,7 +792,7 @@ mod tests {
             prevrandao: Some(U256::from(1).into()),
             ..Default::default()
         };
-        let env = EvmEnv::new(cfg_env, block_env);
+        let env = EvmEnv::new(cfg_env, block_env.into());
 
         let mut db = InMemoryDB::default();
         db.insert_account_info(
@@ -831,7 +837,7 @@ mod tests {
             prevrandao: Some(U256::from(1).into()),
             ..Default::default()
         };
-        let env = EvmEnv::new(cfg_env, block_env);
+        let env = EvmEnv::new(cfg_env, block_env.into());
 
         let mut db = InMemoryDB::default();
         db.insert_account_info(

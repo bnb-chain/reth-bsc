@@ -6,8 +6,11 @@ use super::{
 use crate::{
     BscPrimitives,
     chainspec::BscChainSpec,
-    consensus::{eip4844::next_block_excess_blob_gas_with_mendel, parlia::VoteAddress},
-    evm::transaction::BscTxEnv,
+    consensus::{
+        eip4844::next_block_excess_blob_gas_with_mendel,
+        parlia::{util::millisecond_remainder, VoteAddress},
+    },
+    evm::{block_env::BscBlockEnv, transaction::BscTxEnv},
     hardforks::{bsc::BscHardfork, BscHardforks},
     node::engine_api::validator::BscExecutionData,
     system_contracts::{feynman_fork::ValidatorElectionInfo, SystemContract},
@@ -311,7 +314,7 @@ where
     Spec: EthereumHardforks + BscHardforks + EthChainSpec + Hardforks + Clone,
     EvmF: EvmFactory<
         Tx: FromRecoveredTx<TransactionSigned> + FromTxWithEncoded<TransactionSigned>,
-        BlockEnv = BlockEnv,
+        BlockEnv = BscBlockEnv,
     >,
     R::Transaction: From<TransactionSigned> + Clone,
     Self: 'static,
@@ -353,7 +356,10 @@ const EIP1559_INITIAL_BASE_FEE: u64 = 0;
 
 /// The [`EvmEnv`] that `header` itself presents to the EVM — go-bsc's
 /// `core.NewEVMBlockContext(header, ..)`.
-pub(crate) fn evm_env_for_header<Spec>(spec: &Spec, header: &Header) -> EvmEnv<BscHardfork>
+pub(crate) fn evm_env_for_header<Spec>(
+    spec: &Spec,
+    header: &Header,
+) -> EvmEnv<BscHardfork, BscBlockEnv>
 where
     Spec: BscHardforks + EthChainSpec + Clone,
 {
@@ -395,6 +401,10 @@ where
         blob_excess_gas_and_price,
         slot_num: 0,
     };
+    // The millisecond remainder lives in the header's `mix_hash` tail (BEP-520) — the
+    // BscBlockEnv counterpart of go-bsc filling `BlockContext.MilliTimestamp` from
+    // `header.MilliTimestamp()` in `NewEVMBlockContext`.
+    let block_env = BscBlockEnv::new(block_env, millisecond_remainder(header));
 
     EvmEnv { cfg_env, block_env }
 }
@@ -417,7 +427,7 @@ where
         &self.block_assembler
     }
 
-    fn evm_env(&self, header: &Header) -> Result<EvmEnv<BscHardfork>, Self::Error> {
+    fn evm_env(&self, header: &Header) -> Result<EvmEnv<BscHardfork, BscBlockEnv>, Self::Error> {
         Ok(evm_env_for_header(self.chain_spec(), header))
     }
 
@@ -425,7 +435,7 @@ where
         &self,
         parent: &Header,
         attributes: &Self::NextBlockEnvCtx,
-    ) -> Result<EvmEnv<BscHardfork>, Self::Error> {
+    ) -> Result<EvmEnv<BscHardfork, BscBlockEnv>, Self::Error> {
         let attributes = &attributes.inner;
         // ensure we're not missing any timestamp based hardforks
         let spec_id = revm_spec_by_timestamp_and_block_number(
@@ -497,6 +507,10 @@ where
             blob_excess_gas_and_price,
             slot_num: 0,
         };
+        // Millisecond remainder for the next block: `0` until the miner threads its
+        // planned millisecond timestamp through the attributes (mirrors go-bsc's
+        // synthetic headers, whose zero MixDigest yields `Time*1000`).
+        let block_env = BscBlockEnv::new(block_env, 0);
 
         Ok(EvmEnv { cfg_env, block_env })
     }
@@ -599,7 +613,10 @@ impl ConfigureEngineEvm<BscExecutionData> for BscEvmConfig
 where
     Self: Send + Sync + Unpin + Clone + 'static,
 {
-    fn evm_env_for_payload(&self, payload: &BscExecutionData) -> Result<EvmEnv<BscHardfork>, Self::Error> {
+    fn evm_env_for_payload(
+        &self,
+        payload: &BscExecutionData,
+    ) -> Result<EvmEnv<BscHardfork, BscBlockEnv>, Self::Error> {
         self.evm_env(&payload.block.header)
     }
 
@@ -728,7 +745,81 @@ pub fn revm_spec_by_timestamp_and_block_number(
 mod tests {
     use super::*;
     use alloy_consensus::Header;
+    use alloy_primitives::B256;
     use reth_primitives_traits::SealedHeader;
+
+    /// `evm_env(header)` must decode the BEP-520 millisecond remainder out of the
+    /// header's `mix_hash` tail into [`BscBlockEnv`] — the counterpart of go-bsc
+    /// filling `BlockContext.MilliTimestamp` from `header.MilliTimestamp()` in
+    /// `NewEVMBlockContext` (the only fill point on the header-derived paths).
+    #[test]
+    fn evm_env_fills_millisecond_remainder_from_header() {
+        let chain_spec =
+            crate::chainspec::BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet());
+        let evm_config = BscEvmConfig::bsc(std::sync::Arc::new(chain_spec));
+
+        // Post-Lorentz header: seconds in `timestamp`, remainder in the mix_hash tail.
+        let mut header = Header {
+            number: 50_000_000,
+            timestamp: 1_780_000_000,
+            gas_limit: 30_000_000,
+            ..Default::default()
+        };
+        crate::consensus::parlia::util::set_millisecond_part_of_timestamp(
+            1_780_000_000_750,
+            &mut header,
+        );
+        let env = evm_config.evm_env(&header).unwrap();
+        assert_eq!(env.block_env.milli_remainder, 750);
+        assert_eq!(env.block_env.milli_timestamp(), 1_780_000_000_750);
+        assert_eq!(
+            env.block_env.milli_timestamp(),
+            crate::consensus::parlia::util::calculate_millisecond_timestamp(&header),
+            "env and header millisecond sources must agree"
+        );
+
+        // Pre-Lorentz-shaped header (zero mix_hash): remainder 0, value Time*1000.
+        header.mix_hash = B256::ZERO;
+        let env = evm_config.evm_env(&header).unwrap();
+        assert_eq!(env.block_env.milli_remainder, 0);
+        assert_eq!(env.block_env.milli_timestamp(), 1_780_000_000_000);
+
+        // Stale-immunity across the generic `inner_mut()` mutation path (block
+        // overrides, traceCallMany's bump, callBundle): the live value follows the
+        // mutated seconds and keeps the original remainder.
+        crate::consensus::parlia::util::set_millisecond_part_of_timestamp(
+            1_780_000_000_750,
+            &mut header,
+        );
+        let mut env = evm_config.evm_env(&header).unwrap();
+        use alloy_evm::env::BlockEnvironment;
+        env.block_env.inner_mut().timestamp = U256::from(1_790_000_000u64);
+        assert_eq!(env.block_env.milli_timestamp(), 1_790_000_000_750);
+    }
+
+    /// `next_evm_env` (miner / pending / simulate paths) carries a zero remainder until
+    /// the miner threads its planned millisecond timestamp through the attributes (R4).
+    #[test]
+    fn next_evm_env_defaults_to_zero_remainder() {
+        let chain_spec =
+            crate::chainspec::BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet());
+        let evm_config = BscEvmConfig::bsc(std::sync::Arc::new(chain_spec));
+
+        let parent = SealedHeader::seal_slow(Header {
+            number: 50_000_000,
+            timestamp: 1_780_000_000,
+            gas_limit: 30_000_000,
+            ..Default::default()
+        });
+        let attrs =
+            <BscNextBlockEnvAttributes as BuildPendingEnv<Header>>::build_pending_env(&parent);
+        let env = evm_config.next_evm_env(&parent, &attrs).unwrap();
+        assert_eq!(env.block_env.milli_remainder, 0);
+        assert_eq!(
+            env.block_env.milli_timestamp(),
+            env.block_env.timestamp.saturating_to::<u64>() * 1000
+        );
+    }
 
     /// Regression guard for <https://github.com/bnb-chain/reth-bsc/issues/451>.
     ///

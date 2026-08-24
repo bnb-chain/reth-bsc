@@ -6,6 +6,7 @@ mod pre_execution_tests;
 use crate::{
     evm::{
         api::{BscContext, BscEvm},
+        block_env::BscBlockEnv,
         transaction::BscTxEnv,
     },
     hardforks::bsc::BscHardfork,
@@ -19,8 +20,7 @@ use reth::{
 use reth_evm::{precompiles::PrecompilesMap, Database, Evm, EvmEnv};
 use revm::{
     context::{
-        result::{EVMError, HaltReason, ResultAndState},
-        BlockEnv, CfgEnv,
+        result::{EVMError, HaltReason, ResultAndState}, CfgEnv,
     },
     Context, ExecuteEvm, InspectEvm, Inspector, SystemCallEvm,
 };
@@ -47,7 +47,7 @@ where
     type Error = EVMError<DB::Error>;
     type HaltReason = HaltReason;
     type Spec = BscHardfork;
-    type BlockEnv = BlockEnv;
+    type BlockEnv = BscBlockEnv;
     type Precompiles = PrecompilesMap;
     type Inspector = I;
 
@@ -59,8 +59,8 @@ where
         self.cfg.chain_id
     }
 
-    fn block(&self) -> &BlockEnv {
-        &self.block
+    fn block(&self) -> &BscBlockEnv {
+        &self.inner.ctx.block
     }
 
     fn transact_raw(
