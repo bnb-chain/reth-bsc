@@ -18,14 +18,13 @@ maxperf: ## Builds `reth-bsc` with the most aggressive optimisations.
 	RUSTFLAGS="-C target-cpu=native" cargo build --bin reth-bsc --profile maxperf --features jemalloc,asm-keccak
 
 .PHONY: maxperf-musl
-maxperf-musl: ## Static musl build via Alpine/Docker (runs on old glibc, e.g. Amazon Linux 2). See BUILD_MUSL.md.
+maxperf-musl: ## Static musl build via glibc->musl cross (runs on old glibc, e.g. Amazon Linux 2). See BUILD_MUSL.md.
 	docker run --rm \
 		-v "$(CURDIR)":/src -w /src \
 		-v "$(CURDIR)/.cargo-musl":/cargo -e CARGO_HOME=/cargo \
-		rust:alpine sh -euxc '\
-			apk add --no-cache build-base musl-dev linux-headers clang clang-dev llvm-dev cmake make m4 perl go gmp-dev mpfr-dev git bash pkgconf && \
-			export LIBCLANG_PATH=/usr/lib && \
-			RUSTFLAGS="-C target-cpu=native" cargo build --bin reth-bsc --profile maxperf --features jemalloc,asm-keccak'
+		messense/rust-musl-cross:x86_64-musl bash -euxc '\
+			apt-get update && apt-get install -y --no-install-recommends clang libclang-dev m4 cmake perl golang pkg-config && \
+			RUSTFLAGS="-C target-cpu=native" cargo build --bin reth-bsc --profile maxperf --features jemalloc,asm-keccak --target x86_64-unknown-linux-musl'
 
 .PHONY: bench-test
 bench-test: ## Builds `reth-bsc` with the bench-test feature.

@@ -17,17 +17,27 @@ The fix is a **fully static musl build**: musl bundles its own libc (which has
 `gettid`), so the binary has no glibc dependency and runs on any Linux,
 including glibc 2.26.
 
-## Why Alpine, not a gnu→musl cross build
+## Why a glibc host cross-compiling to musl (and not native Alpine)
 
-Cross-compiling from a glibc host to `x86_64-unknown-linux-musl` (via
-`cargo-zigbuild`, `cross`, or a musl cross toolchain) trips on reth's C/C++
-dependencies — `gmp-mpfr-sys` (pulled by `revm-precompile`) outright refuses to
-cross-compile, and rocksdb / aws-lc / mdbx-bindgen are fragile under cross
-toolchains.
+Two things pull in opposite directions:
 
-Building **inside Alpine** sidesteps all of it: Alpine's host triple *is*
-`x86_64-unknown-linux-musl`, so every C dependency sees a **native** build (not
-a cross build) and compiles normally. No `force-cross`, no zig.
+- reth's C/C++ deps (rocksdb, blst, `gmp-mpfr-sys`, mdbx) build most reliably
+  with a real toolchain, which pushed toward building natively inside Alpine.
+- **But** several `-sys` crates (mdbx, rocksdb) run `bindgen`, which `dlopen`s
+  `libclang` at build time. In a native-musl (Alpine) build the *build scripts
+  themselves* are static musl binaries, and **musl static binaries cannot
+  `dlopen`** — bindgen dies with "Dynamic loading not supported".
+
+The way out is to build on a **glibc host, cross-compiling to musl**:
+
+- Build scripts / proc-macros compile for the glibc host, so bindgen's `dlopen`
+  works.
+- Only the final `reth-bsc` binary is linked static-musl, so it runs on old
+  glibc.
+
+The `messense/rust-musl-cross:x86_64-musl` image is purpose-built for this: a
+Debian (glibc) host with a musl cross toolchain (musl-gcc/g++), cmake, etc.
+already wired up, defaulting to the `x86_64-unknown-linux-musl` target.
 
 ## Quick start
 
@@ -38,11 +48,12 @@ the build happens inside the container):
 make maxperf-musl
 ```
 
-Output: `target/maxperf/reth-bsc`, a static musl binary. Verify:
+Output: `target/x86_64-unknown-linux-musl/maxperf/reth-bsc`, a static musl
+binary. Verify:
 
 ```bash
-file target/maxperf/reth-bsc          # ... statically linked
-ldd  target/maxperf/reth-bsc          # "not a dynamic executable"
+file target/x86_64-unknown-linux-musl/maxperf/reth-bsc   # ... statically linked
+ldd  target/x86_64-unknown-linux-musl/maxperf/reth-bsc   # "not a dynamic executable"
 ```
 
 Copy that binary to the target host (e.g. Amazon Linux 2) and run it directly —
@@ -50,47 +61,60 @@ no runtime dependencies to install.
 
 ## What `make maxperf-musl` runs
 
-It mirrors `make maxperf` (same profile and features) but inside `rust:alpine`,
-installing the C toolchain reth needs and pointing `CARGO_HOME` at a repo-local
+It mirrors `make maxperf` (same profile and features) but inside the musl-cross
+image, adds a few build-time packages, and pins `CARGO_HOME` to a repo-local
 `.cargo-musl/` cache so subsequent builds are incremental:
 
 ```bash
 docker run --rm \
   -v "$PWD":/src -w /src \
   -v "$PWD/.cargo-musl":/cargo -e CARGO_HOME=/cargo \
-  rust:alpine sh -euxc '
-    apk add --no-cache build-base musl-dev linux-headers \
-      clang clang-dev llvm-dev cmake make m4 perl go gmp-dev mpfr-dev \
-      git bash pkgconf &&
-    export LIBCLANG_PATH=/usr/lib &&
+  messense/rust-musl-cross:x86_64-musl bash -euxc '
+    apt-get update && apt-get install -y --no-install-recommends \
+      clang libclang-dev m4 cmake perl golang pkg-config &&
     RUSTFLAGS="-C target-cpu=native" \
-      cargo build --bin reth-bsc --profile maxperf --features jemalloc,asm-keccak'
+      cargo build --bin reth-bsc --profile maxperf \
+        --features jemalloc,asm-keccak --target x86_64-unknown-linux-musl'
 ```
 
-The apk packages cover reth's C stack: `clang`/`llvm` (bindgen for rocksdb and
-mdbx), `cmake` (rocksdb, aws-lc), `perl`+`go` (aws-lc-sys), `m4` +
-`gmp-dev`/`mpfr-dev` (`gmp-mpfr-sys` builds GMP from source via autotools),
-`build-base` (g++ for rocksdb/blst).
+The added packages cover reth's C stack: `clang`/`libclang-dev` (bindgen for
+rocksdb and mdbx — these run on the glibc host so `dlopen` works), `m4` (GMP's
+autotools configure), `cmake` (rocksdb, aws-lc), `perl`+`golang` (aws-lc-sys).
+
+## The `gmp-mpfr-sys` force-cross dependency
+
+`gmp-mpfr-sys` (pulled by `revm-precompile`) refuses to build when the host and
+target triples differ, which is exactly what a glibc→musl cross is. Its
+`force-cross` feature allows it. `Cargo.toml` enables that feature **only** for
+the musl target:
+
+```toml
+[target.x86_64-unknown-linux-musl.dependencies]
+gmp-mpfr-sys = { version = "1.7", features = ["force-cross"] }
+```
+
+Normal and CI (glibc) builds don't match that target, so they're unaffected.
 
 ## Caveats
 
-- **Fully static is required to run on old glibc.** Do *not* pass
-  `-C target-feature=-crt-static` — that yields a *dynamic* musl binary needing
-  musl's loader (`/lib/ld-musl-x86_64.so.1`), which glibc hosts don't have. The
-  musl target defaults to static; leave it that way.
+- **Fully static is required to run on old glibc.** The musl target defaults to
+  static; do not pass `-C target-feature=-crt-static` (that yields a *dynamic*
+  musl binary needing musl's loader, which glibc hosts don't have).
 
 - **`target-cpu=native`** tunes for the build host's CPU. If you build and run
-  on different CPU classes, replace it with e.g. `-C target-cpu=x86-64-v3` to
-  avoid illegal-instruction crashes (`FEATURES`/`RUSTFLAGS` are baked into the
-  target, so edit the Makefile target or run the docker command by hand).
+  on different CPU classes, edit the Makefile target (or the raw command) to use
+  e.g. `-C target-cpu=x86-64-v3` to avoid illegal-instruction crashes.
 
-- **jemalloc**: if it fails to build under fully-static musl, drop it from the
-  feature list (`--features asm-keccak`). musl's own allocator works; you lose a
-  little throughput.
+- **jemalloc**: if it fails under static musl, drop it from the feature list
+  (`--features asm-keccak`). musl's own allocator works; you lose a little
+  throughput.
 
-- **First build is slow** (15–40 min): it compiles GMP, rocksdb, aws-lc, blst,
-  and mdbx from source under musl. The `.cargo-musl/` cache makes later builds
-  fast.
+- **Rust version**: the deps require a recent stable. If the image's toolchain
+  is too old ("package X requires rustc 1.NN"), add `rustup update` before the
+  `cargo build` in the recipe.
+
+- **First build is slow** (compiles GMP, rocksdb, aws-lc, blst, mdbx from source
+  under musl). The `.cargo-musl/` cache makes later builds fast.
 
 ## Disk / Docker setup on Amazon Linux 2
 

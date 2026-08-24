@@ -164,6 +164,13 @@ tikv-jemalloc-ctl = "0.6"
 tikv-jemallocator = { version = "0.6", optional = true }
 libc = "0.2"
 
+# gmp-mpfr-sys (pulled by revm-precompile) refuses to build when the host and
+# target triples differ, which is the case for the static musl cross-build used
+# to run on old-glibc hosts (see BUILD_MUSL.md). `force-cross` allows it. This
+# is scoped to the musl target so normal/CI (glibc) builds are unaffected.
+[target.x86_64-unknown-linux-musl.dependencies]
+gmp-mpfr-sys = { version = "1.7", features = ["force-cross"] }
+
 [features]
 default = ["jemalloc"]
 jemalloc = ["dep:tikv-jemallocator", "reth/jemalloc"]
