@@ -4,3 +4,6 @@ target/
 genesis_local.json
 test-datadir/
 .cargo/config.toml
+
+# static musl build cargo cache (see BUILD_MUSL.md)
+.cargo-musl/
