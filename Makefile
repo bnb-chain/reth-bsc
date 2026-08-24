@@ -21,7 +21,8 @@ maxperf: ## Builds `reth-bsc` with the most aggressive optimisations.
 maxperf-musl: ## Static musl build via glibc->musl cross (runs on old glibc, e.g. Amazon Linux 2). See BUILD_MUSL.md.
 	docker run --rm \
 		-v "$(CURDIR)":/src -w /src \
-		-v "$(CURDIR)/.cargo-musl":/cargo -e CARGO_HOME=/cargo \
+		-v "$(CURDIR)/.cargo-musl/registry":/root/.cargo/registry \
+		-v "$(CURDIR)/.cargo-musl/git":/root/.cargo/git \
 		messense/rust-musl-cross:x86_64-musl bash -euxc '\
 			apt-get update && apt-get install -y --no-install-recommends clang libclang-dev m4 cmake perl golang pkg-config && \
 			RUSTFLAGS="-C target-cpu=native" cargo build --bin reth-bsc --profile maxperf --features jemalloc,asm-keccak --target x86_64-unknown-linux-musl'

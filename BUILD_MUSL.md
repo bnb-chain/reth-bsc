@@ -62,13 +62,14 @@ no runtime dependencies to install.
 ## What `make maxperf-musl` runs
 
 It mirrors `make maxperf` (same profile and features) but inside the musl-cross
-image, adds a few build-time packages, and pins `CARGO_HOME` to a repo-local
-`.cargo-musl/` cache so subsequent builds are incremental:
+image, adds a few build-time packages, and persists the crate/git cache under a
+repo-local `.cargo-musl/` so subsequent builds are incremental:
 
 ```bash
 docker run --rm \
   -v "$PWD":/src -w /src \
-  -v "$PWD/.cargo-musl":/cargo -e CARGO_HOME=/cargo \
+  -v "$PWD/.cargo-musl/registry":/root/.cargo/registry \
+  -v "$PWD/.cargo-musl/git":/root/.cargo/git \
   messense/rust-musl-cross:x86_64-musl bash -euxc '
     apt-get update && apt-get install -y --no-install-recommends \
       clang libclang-dev m4 cmake perl golang pkg-config &&
@@ -80,6 +81,15 @@ docker run --rm \
 The added packages cover reth's C stack: `clang`/`libclang-dev` (bindgen for
 rocksdb and mdbx — these run on the glibc host so `dlopen` works), `m4` (GMP's
 autotools configure), `cmake` (rocksdb, aws-lc), `perl`+`golang` (aws-lc-sys).
+
+**Do not override `CARGO_HOME`.** The image ships `/root/.cargo/config.toml`
+that configures the musl cross compiler as the linker for the target. If you
+point `CARGO_HOME` elsewhere, that config is lost, rustc links with the host
+`cc` (glibc gcc), and the final link fails with a flood of undefined glibc
+symbols (`__libc_single_threaded`, `fopen64`, `__wmemcpy_chk`, …) from the
+host's `libstdc++.a` being pulled into a musl binary. That's why the cache is
+mounted at `/root/.cargo/{registry,git}` (subdirs) rather than replacing the
+whole `CARGO_HOME`.
 
 ## The `gmp-mpfr-sys` force-cross dependency
 
