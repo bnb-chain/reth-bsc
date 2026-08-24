@@ -128,8 +128,53 @@ where
     /// behaviour when the 3s head-announce tick re-announces the same
     /// unreachable head.
     failed_heads: crate::node::network::block_import::fork_recover::FailedHeadsCooler,
+    /// Admits one ancestor recovery at a time. Concurrent recoveries walk
+    /// near-identical ranges, so the extra ones are pure duplicated work — see
+    /// [`fork_recover::RecoveryGate`] and bnb-chain/reth-bsc#456.
+    ///
+    /// [`fork_recover::RecoveryGate`]: crate::node::network::block_import::fork_recover::RecoveryGate
+    recovery_gate: crate::node::network::block_import::fork_recover::RecoveryGate,
     /// Periodic timer for head announcement.
     announce_interval: tokio::time::Interval,
+}
+
+/// Log a `recover_ancestors` error at a level matching its severity.
+///
+/// `ImportHalted` with committed progress is the expected outcome whenever the
+/// engine wants ancestors deeper than this walk reached: the attempt still
+/// advanced the canonical tip, so the next one starts closer. Logging it at
+/// `warn` alongside genuine failures is what made bnb-chain/reth-bsc#456 look
+/// like thousands of failed recoveries rather than incremental progress.
+fn log_recovery_error(
+    err: &crate::node::network::block_import::fork_recover::ForkRecoverError,
+    head_hash: B256,
+    head_num: u64,
+    source: &'static str,
+) {
+    use crate::node::network::block_import::fork_recover::ForkRecoverError;
+    match err {
+        ForkRecoverError::ImportHalted { num, committed: Some(committed) } => {
+            tracing::info!(
+                target: "bsc::block_import",
+                %head_hash,
+                head_num,
+                halted_at = num,
+                committed,
+                source,
+                "Fork recovery committed partial progress"
+            );
+        }
+        _ => {
+            tracing::warn!(
+                target: "bsc::block_import",
+                %head_hash,
+                head_num,
+                error = %err,
+                source,
+                "Fork recovery failed"
+            );
+        }
+    }
 }
 
 /// Pick a peer to route `GetBlocksByRange` to. Only bsc/2 peers qualify —
@@ -191,6 +236,7 @@ where
             failed_heads: crate::node::network::block_import::fork_recover::new_failed_heads_cooler(
                 LRU_PROCESSED_BLOCKS_SIZE,
             ),
+            recovery_gate: crate::node::network::block_import::fork_recover::new_recovery_gate(),
             announce_interval: {
                 // 3s ≈ 6-7 BSC slots (450ms each). Fast enough to break fork
                 // livelocks, slow enough to be negligible overhead.
@@ -207,6 +253,7 @@ where
         let forkchoice_engine = self.forkchoice_engine.clone();
         let recovering_heads = self.recovering_heads.clone();
         let failed_heads = self.failed_heads.clone();
+        let recovery_gate = self.recovery_gate.clone();
 
         let announced_hash = block.hash;
         let block_hash = block.block.0.block.header.hash_slow();
@@ -299,6 +346,23 @@ where
                             return None;
                         }
 
+                        // Single-flight: an in-flight recovery already walks back
+                        // to the same common ancestor, so a second one for a head
+                        // a few blocks higher is duplicated work, not progress.
+                        let permit = match recovery_gate.try_acquire(block_number) {
+                            Ok(permit) => permit,
+                            Err(in_flight_head) => {
+                                tracing::debug!(
+                                    target: "bsc::block_import",
+                                    %block_hash,
+                                    block_number,
+                                    in_flight_head,
+                                    "Skipping fork recovery: all recovery slots in flight"
+                                );
+                                return None;
+                            }
+                        };
+
                         // Fire-and-forget spawn; `recover_ancestors` runs its
                         // own Phase-1 local checks so it's correct even if the
                         // head is already on chain by the time the task starts.
@@ -326,6 +390,11 @@ where
                                 header.clone(),
                             );
                         tokio::spawn(async move {
+                            // Held for the whole recovery; released on drop even
+                            // if the task panics or returns early. Also the
+                            // progress sink: recovery stamps it as it works, so
+                            // the gate can tell "slow" from "wedged".
+                            let permit = permit;
                             let _guard = crate::node::network::block_import::fork_recover::RecoveringHeadGuard::new(
                                 block_hash, recovering,
                             );
@@ -342,16 +411,11 @@ where
                                     engine_clone,
                                     forkchoice_engine_clone,
                                     &fetcher,
+                                    &permit,
                                 )
                                 .await
                             {
-                                tracing::warn!(
-                                    target: "bsc::block_import",
-                                    %block_hash,
-                                    block_number,
-                                    error = %err,
-                                    "Fork recovery failed (Syncing path)"
-                                );
+                                log_recovery_error(&err, block_hash, block_number, "Syncing path");
                                 failed_heads.mark_failed(block_hash);
                             }
                         });
@@ -800,6 +864,24 @@ where
                 continue;
             }
 
+            // Single-flight across all heads: see the `Syncing` path in
+            // `new_payload`. Skipped heads are deliberately not marked
+            // processed/queued, so the next announcement retries them once the
+            // in-flight recovery — which has meanwhile advanced the tip — ends.
+            let permit = match self.recovery_gate.try_acquire(hash_number.number) {
+                Ok(permit) => permit,
+                Err(in_flight_head) => {
+                    tracing::trace!(
+                        target: "bsc::block_import",
+                        block_hash = %hash_number.hash,
+                        block_number = hash_number.number,
+                        in_flight_head,
+                        "Skipping fork recovery: all recovery slots in flight"
+                    );
+                    continue;
+                }
+            };
+
             // Concurrent-dedup: one recovery per head at a time.
             {
                 let mut guard = self.recovering_heads.lock();
@@ -827,6 +909,8 @@ where
             let head_num = hash_number.number;
 
             tokio::spawn(async move {
+                // Slot holder and progress sink; see the `Syncing` path above.
+                let permit = permit;
                 let _guard =
                     crate::node::network::block_import::fork_recover::RecoveringHeadGuard::new(
                         head_hash, recovering,
@@ -854,16 +938,11 @@ where
                         engine,
                         forkchoice_engine,
                         &fetcher,
+                        &permit,
                     )
                     .await
                 {
-                    tracing::warn!(
-                        target: "bsc::block_import",
-                        %head_hash,
-                        head_num,
-                        error = %err,
-                        "Fork recovery failed"
-                    );
+                    log_recovery_error(&err, head_hash, head_num, "announced head");
                     failed_heads.mark_failed(head_hash);
                 }
             });
