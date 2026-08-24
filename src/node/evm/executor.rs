@@ -1,4 +1,6 @@
-use super::config::{revm_spec_by_timestamp_and_block_number, BscBlockExecutionCtx};
+use super::config::{
+    revm_spec_by_timestamp_and_block_number, BscBlockExecutionCtx, BscExecutionMode,
+};
 use super::patch::HertzPatchManager;
 use crate::consensus::parlia::SnapshotProvider;
 use crate::{
@@ -165,8 +167,8 @@ where
                 .lock()
                 .unwrap()
                 .insert_header_to_cache_with_hash(header.clone(), ctx.header_hash);
-        } else if !ctx.is_miner {
-            // miner has no current header.
+        } else if !ctx.mode.authors_block() {
+            // Block-authoring modes (mining, simulation) have no current header.
             warn!(
                 "No header found in the context, block_number: {:?}",
                 evm.block().number().to::<u64>()
@@ -455,7 +457,7 @@ where
         trace!(
             target: "bsc::executor",
             block_id = %block_env.number(),
-            is_miner = self.ctx.is_miner,
+            mode = ?self.ctx.mode,
             "Start to apply_pre_execution_changes"
         );
 
@@ -464,7 +466,8 @@ where
         self.consensus_metrics.current_block_height.set(block_number as f64);
 
         // pre check and prepare some intermediate data for commit parlia snapshot in finish function.
-        if self.ctx.is_miner {
+        // `check_new_block` dereferences `ctx.header`, which only exists when importing.
+        if self.ctx.mode.authors_block() {
             self.prepare_new_block(&block_env)?;
         } else {
             self.check_new_block(&block_env)?;
@@ -529,8 +532,9 @@ where
             });
         }
 
-        // Apply hertz patch before tx (validation only, not mining).
-        if !self.ctx.is_miner {
+        // Apply hertz patch before tx (import only — it replays a historical state fix and
+        // is meaningless for a block being authored).
+        if !self.ctx.mode.authors_block() {
             self.hertz_patch_manager.patch_before_tx(&tx_signed, self.evm.db_mut())?;
         }
 
@@ -622,9 +626,9 @@ where
 
         self.evm.db_mut().commit(state);
 
-        // Apply hertz patch after tx (validation only, not mining).
+        // Apply hertz patch after tx (import only — see `patch_before_tx` above).
         // commit_transaction cannot return errors in the new API, so defer any error to finish().
-        if !self.ctx.is_miner {
+        if !self.ctx.mode.authors_block() {
             if let Err(e) = self.hertz_patch_manager.patch_after_tx(&output.tx, self.evm.db_mut()) {
                 self.deferred_error = Some(e);
             }
@@ -643,7 +647,7 @@ where
         debug!(
             target: "bsc::executor",
             block_id = %block_env.number(),
-            is_miner = self.ctx.is_miner,
+            mode = ?self.ctx.mode,
             "Start to finish"
         );
 
@@ -655,33 +659,49 @@ where
             false,
         )?;
 
-        // Initialize Feynman contracts on transition block
-        if self.spec.is_feynman_transition_at_timestamp(
-            self.evm.block().number().to::<u64>(),
-            self.evm.block().timestamp().to::<u64>(),
-            parent_timestamp,
-        ) {
-            info!(
-                target: "bsc::executor::feynman",
-                block_number = self.evm.block().number().to::<u64>(),
-                "Initializing Feynman contracts"
-            );
-            self.initialize_feynman_contracts(self.evm.block().beneficiary())?;
+        // Both contract-initialization steps below issue Parlia system transactions via
+        // `transact_system_tx`, so they require either a block to consume them from (import)
+        // or a validator key to sign them with (mining). A simulation has neither, and its
+        // caller asked a hypothetical rather than for a sealed block — so skip them, along
+        // with the finalization below.
+        if self.ctx.mode != BscExecutionMode::Simulation {
+            // Initialize Feynman contracts on transition block
+            if self.spec.is_feynman_transition_at_timestamp(
+                self.evm.block().number().to::<u64>(),
+                self.evm.block().timestamp().to::<u64>(),
+                parent_timestamp,
+            ) {
+                info!(
+                    target: "bsc::executor::feynman",
+                    block_number = self.evm.block().number().to::<u64>(),
+                    "Initializing Feynman contracts"
+                );
+                self.initialize_feynman_contracts(self.evm.block().beneficiary())?;
+            }
+
+            // Deploy genesis contracts on Block 1
+            if self.evm.block().number() == uint!(1U256) {
+                info!(
+                    target: "bsc::executor::genesis",
+                    "Deploying genesis contracts on Block 1"
+                );
+                self.deploy_genesis_contracts(self.evm.block().beneficiary())?;
+            }
         }
 
-        // Deploy genesis contracts on Block 1
-        if self.evm.block().number() == uint!(1U256) {
-            info!(
-                target: "bsc::executor::genesis",
-                "Deploying genesis contracts on Block 1"
-            );
-            self.deploy_genesis_contracts(self.evm.block().beneficiary())?;
-        }
-
-        if self.ctx.is_miner {
-            self.finalize_new_block(&self.evm.block().clone())?;
-        } else {
-            self.post_check_new_block(&self.evm.block().clone())?;
+        match self.ctx.mode {
+            // Generates and signs system txs (rewards, slashing, validator-set updates).
+            BscExecutionMode::Mining => self.finalize_new_block(&self.evm.block().clone())?,
+            // Verifies the system txs already present in the received block.
+            BscExecutionMode::Import => self.post_check_new_block(&self.evm.block().clone())?,
+            // Neither: return the executed block as-is, matching BSC geth's simulation path.
+            BscExecutionMode::Simulation => {
+                trace!(
+                    target: "bsc::executor",
+                    block_id = %block_env.number(),
+                    "Skipping Parlia finalization for simulated block"
+                );
+            }
         }
 
         // Update receipt height metric
