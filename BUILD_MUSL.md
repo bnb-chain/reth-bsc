@@ -73,6 +73,7 @@ docker run --rm \
   messense/rust-musl-cross:x86_64-musl bash -euxc '
     apt-get update && apt-get install -y --no-install-recommends \
       clang libclang-dev m4 cmake perl golang pkg-config &&
+    export PERL_USE_UNSAFE_INC=1 &&
     RUSTFLAGS="-C target-cpu=native" \
       cargo build --bin reth-bsc --profile maxperf \
         --features jemalloc,asm-keccak --target x86_64-unknown-linux-musl'
@@ -81,6 +82,12 @@ docker run --rm \
 The added packages cover reth's C stack: `clang`/`libclang-dev` (bindgen for
 rocksdb and mdbx — these run on the glibc host so `dlopen` works), `m4` (GMP's
 autotools configure), `cmake` (rocksdb, aws-lc), `perl`+`golang` (aws-lc-sys).
+
+`PERL_USE_UNSAFE_INC=1` is needed by `sha3-asm` (the `asm-keccak` feature): its
+cryptogams Perl script does `require "x86_64-xlate.pl"`, and modern Perl dropped
+`.` from `@INC`, so without this env var the script can't find its sibling and
+the build fails. (Alternatively, drop `asm-keccak` from `--features` to skip
+`sha3-asm` entirely, at a small hashing-throughput cost.)
 
 **Do not override `CARGO_HOME`.** The image ships `/root/.cargo/config.toml`
 that configures the musl cross compiler as the linker for the target. If you
