@@ -1036,6 +1036,49 @@ mod tests {
         }
     }
 
+    /// Regression guard for EVM reuse via `ExecuteEvm::set_block`: replacing the block
+    /// env must re-register the 0x70 precompile with the new block's millisecond
+    /// remainder — the closure captures the remainder at registration time, so without
+    /// the refresh a reused EVM would return the previous block's sub-second value.
+    #[test]
+    fn milli_timestamp_follows_set_block_replacement() {
+        use revm::ExecuteEvm as _;
+
+        let caller = Address::from([0x11; 20]);
+        let mut evm = make_jenner_evm(BscHardfork::Jenner, caller, None);
+
+        // Replace the block env with a later block carrying a different remainder.
+        let new_secs = JENNER_TEST_SECS + 100;
+        let new_remainder = 123u64;
+        let new_block = crate::evm::block_env::BscBlockEnv::new(
+            BlockEnv {
+                beneficiary: Address::from([0xC0; 20]),
+                timestamp: U256::from(new_secs),
+                prevrandao: Some(U256::from(1).into()),
+                ..Default::default()
+            },
+            new_remainder,
+        );
+        evm.set_block(new_block);
+
+        let tx = BscTxEnv::new(
+            TxEnv::builder()
+                .caller(caller)
+                .chain_id(Some(56))
+                .gas_limit(60_000)
+                .gas_price(1)
+                .kind(TxKind::Call(MILLI_TS_ADDRESS))
+                .build()
+                .expect("tx env should build"),
+        );
+        let result = evm.transact_one(tx).expect("execution should not error");
+        assert_eq!(
+            U256::from_be_slice(&call_output(result)),
+            U256::from(new_secs * 1000 + new_remainder),
+            "0x70 must serve the replacement block's full millisecond timestamp"
+        );
+    }
+
     /// The go-side `TestPrecompiles_FreshMap` equivalent, asserted on the live EVM's
     /// `PrecompilesMap` (0x70 is registered dynamically, never in the static tables):
     /// the Jenner set is exactly the Pasteur set plus `0x70`, and no earlier spec
