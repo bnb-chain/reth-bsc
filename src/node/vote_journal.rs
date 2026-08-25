@@ -243,8 +243,10 @@ mod tests {
     fn rule2_backward_across_span_disallowed() {
         let path = tmp_path("journal_rule2_back");
         let mut j = VoteJournal::new(path);
+        // Previous vote with target 125 and source 120
         let env = mk_env(120, B256::from([3u8; 32]), 125, B256::from([4u8; 32]));
         j.write_vote(&env).unwrap();
+        // New vote spans across: source 110, target 130 should be invalid (sees prior at 125 with higher source)
         assert!(!j.under_rules(110, 130));
     }
 
@@ -252,8 +254,10 @@ mod tests {
     fn rule2_forward_within_span_disallowed() {
         let path = tmp_path("journal_rule2_forward");
         let mut j = VoteJournal::new(path);
+        // Previous vote with target 110 and lower source 90
         let env = mk_env(90, B256::from([5u8; 32]), 110, B256::from([6u8; 32]));
         j.write_vote(&env).unwrap();
+        // New vote source 100, target 105: forward window includes 106..116; contains 110 with vd.source=90 < 100 => invalid
         assert!(!j.under_rules(100, 105));
     }
 
@@ -261,6 +265,7 @@ mod tests {
     fn allowed_vote_when_no_conflict() {
         let path = tmp_path("journal_ok");
         let mut j = VoteJournal::new(path);
+        // Old vote far behind
         let env = mk_env(80, B256::from([7u8; 32]), 90, B256::from([8u8; 32]));
         j.write_vote(&env).unwrap();
         assert!(j.under_rules(100, 110));
@@ -276,8 +281,11 @@ mod tests {
             j.write_vote(&env1).unwrap();
             j.write_vote(&env2).unwrap();
         }
+        // Reopen
         let j2 = VoteJournal::new(path);
+        // Rule1: contains 40
         assert!(!j2.under_rules(35, 40));
+        // Rule2 forward: with source 35 target 33, forward window includes 34..44; 40 present with vd.source=30 < 35 => invalid
         assert!(!j2.under_rules(35, 33));
     }
 }
