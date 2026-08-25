@@ -1,6 +1,5 @@
-//! Regression: the epoch checkpoint must be reached by `parent_hash`, not by block number
-//! (geth `consensus/parlia/snapshot.go:384` `FindAncientHeader`). The by-number header cache
-//! can hold a rejected sibling, which on a fork loads the other branch's validators.
+//! Regression: the epoch checkpoint must be reached by parent_hash, not by number - the
+//! by-number header cache can hold a rejected sibling (geth parlia `FindAncientHeader`).
 
 use super::super::{
     provider::{EnhancedDbSnapshotProvider, SnapshotProvider},
@@ -13,7 +12,10 @@ use crate::hardforks::BscHardforks;
 use crate::node::evm::util::insert_header_to_cache_with_hash;
 use alloy_consensus::Header;
 use alloy_primitives::{Address, B256};
-use reth_db::{init_db, mdbx::DatabaseArguments};
+use reth_db::{
+    init_db, mdbx::DatabaseArguments, tables::{HeaderNumbers, Headers}, transaction::{DbTx, DbTxMut},
+    Database,
+};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -80,5 +82,45 @@ fn epoch_checkpoint_is_read_from_the_branch_being_rebuilt() -> eyre::Result<()> 
         let snap = provider.snapshot_by_hash(tip).expect("branch snapshot should rebuild");
         assert_eq!(snap.validators, expected, "branch must load its own checkpoint ancestor");
     }
+    Ok(())
+}
+
+/// The DB fallback resolves `HeaderNumbers[hash] -> Headers[number]`, i.e. a by-number read,
+/// so mid-reorg it can hand back the sibling that now owns that height. Nothing is seeded into
+/// the header cache here on purpose: the lookup has to miss it and go through MDBX.
+#[test]
+fn db_fallback_rejects_a_header_that_is_not_the_requested_hash() -> eyre::Result<()> {
+    let db_path = std::env::temp_dir().join(format!("bsc_fork_db_fallback_{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&db_path)?;
+    let _cleanup = TestCleanup { path: db_path.clone() };
+    let db = Arc::new(init_db(&db_path, DatabaseArguments::new(Default::default()))?);
+    let provider =
+        EnhancedDbSnapshotProvider::new(db.clone(), 256, Arc::new(BscChainSpec::from(bsc_testnet())));
+
+    // Seeds distinct from the test above: the header cache is process-global with no reset, so
+    // every hash built here must be one no other test inserted.
+    let grandparent = B256::repeat_byte(0xbb);
+    let cp = header(CHECKPOINT, grandparent, &addrs(0x40));
+    let mid = header(CHECKPOINT + 1, cp.hash_slow(), &[]);
+    let mid_hash = mid.hash_slow();
+    let tip = header(TRANSITION, mid_hash, &[]);
+    let tip_hash = tip.hash_slow();
+    provider.insert(Snapshot::new(addrs(0x10), CHECKPOINT + 1, mid_hash, EPOCH, None));
+
+    let tx = db.tx_mut()?;
+    for h in [&cp, &mid, &tip] {
+        tx.put::<HeaderNumbers>(h.hash_slow(), h.number)?;
+    }
+    tx.put::<Headers<Header>>(TRANSITION, tip)?;
+    tx.put::<Headers<Header>>(CHECKPOINT + 1, mid)?;
+    // The reorg: HeaderNumbers still maps the checkpoint hash to CHECKPOINT, but that height is
+    // now owned by a sibling carrying a different validator set.
+    tx.put::<Headers<Header>>(CHECKPOINT, header(CHECKPOINT, grandparent, &addrs(0x50)))?;
+    tx.commit()?;
+
+    assert!(
+        provider.snapshot_by_hash(&tip_hash).is_none(),
+        "checkpoint resolved to another branch's header, the rebuild must fail",
+    );
     Ok(())
 }

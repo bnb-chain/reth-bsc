@@ -160,7 +160,7 @@ impl VoteJournal {
             // erasing a vote we already broadcast. Hence the rollback on error.
             let len_before = file.metadata()?.len();
             // `File::flush` is a no-op for `std::fs::File`; only fsync survives power loss,
-            // and the vote is broadcast right after this returns. geth: tidwall/wal, NoSync=false.
+            // and the vote is broadcast right after this returns.
             written = file.write_all(line.as_bytes()).and_then(|()| file.sync_all());
             if written.is_err() {
                 let _ = file.set_len(len_before);
@@ -236,8 +236,10 @@ mod tests {
     }
 
     #[test]
-    fn failed_write_is_reported_and_not_recorded() {
-        // Parent is a regular file, so create_dir_all + open cannot succeed.
+    fn open_failure_is_reported_and_not_recorded() {
+        // Parent is a regular file, so create_dir_all + open cannot succeed. Only failures
+        // *before* any byte is written leave the journal untouched; a write or fsync that
+        // fails afterwards still claims the height (see `lru.add` in `write_vote`).
         let blocker = tmp_path("journal_blocker");
         std::fs::write(&blocker, b"x").unwrap();
         let mut j = VoteJournal::new(blocker.join("votes.jsonl"));

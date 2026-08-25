@@ -197,16 +197,15 @@ impl<DB: Database + 'static> EnhancedDbSnapshotProvider<DB> {
         })
     }
 
-    /// Port of geth `consensus/parlia/snapshot.go:582-607` `FindAncientHeader`.
-    /// Never look up by number here: it resolves to whoever occupies that height, which on
+    /// Port of geth parlia's `FindAncientHeader`: walk ancestors by parent hash.
+    /// Never look up by number here - it resolves to whoever occupies that height, which on
     /// a fork binds the snapshot to the *other* branch's epoch validators.
-    /// `get_header_by_hash` covers `candidateParents` (`:588-597`); `None` == `:599-601`.
     fn find_ancient_header(&self, header: &Header, ite: u64) -> Option<Header> {
         (0..ite).try_fold(header.clone(), |h, _| {
-            // Re-check the hash: every by-hash fallback resolves
-            // `HeaderNumbers[hash] -> Headers[number]`, a by-number read that can hand back
-            // another branch's header mid-reorg. The checkpoint is only parsed, never
-            // applied, so `Snapshot::apply`'s parent-hash gate would not catch that.
+            // Re-check the hash: the by-hash fallback resolves HeaderNumbers[hash] ->
+            // Headers[number], a by-number read that can hand back another branch's header
+            // mid-reorg. The checkpoint is only parsed, never applied, so Snapshot::apply's
+            // parent-hash gate would not catch it.
             self.get_header_by_hash(&h.parent_hash).filter(|p| p.hash_slow() == h.parent_hash)
         })
     }
@@ -281,7 +280,6 @@ impl<DB: Database + 'static> EnhancedDbSnapshotProvider<DB> {
             let mut turn_length = None;
 
             let validators_info = if is_epoch_boundary {
-                // geth snapshot.go:384-387
                 let Some(checkpoint_header) = self.find_ancient_header(&header, miner_check_len)
                 else {
                     tracing::error!(target: "parlia::snapshot",
