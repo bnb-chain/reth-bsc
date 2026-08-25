@@ -7,7 +7,7 @@ use crate::chainspec::BscChainSpec;
 
 use crate::consensus::parlia::{CHECKPOINT_INTERVAL, Parlia, VoteAddress};
 use crate::node::evm::error::{BscBlockExecutionError, BscBlockValidationError};
-use crate::node::evm::util::{get_cannonical_header_from_cache, get_header_by_hash_from_cache};
+use crate::node::evm::util::get_header_by_hash_from_cache;
 use alloy_primitives::{Address};
 use alloy_primitives::{BlockHash};
 
@@ -128,13 +128,6 @@ impl<DB: Database> DbSnapshotProvider<DB> {
         let block_number = tx.get::<HeaderNumbers>(*block_hash).ok()??;
         tx.get::<Headers<alloy_consensus::Header>>(block_number).ok()?
     }
-
-    /// Fetch a canonical header by block number directly from the DB.
-    /// Used as fallback when the in-memory header cache is empty (e.g. at startup).
-    fn get_canonical_header_by_number_from_db(&self, block_number: u64) -> Option<Header> {
-        let tx = self.db.tx().ok()?;
-        tx.get::<Headers<alloy_consensus::Header>>(block_number).ok()?
-    }
 }
 
 impl<DB: Database + 'static> SnapshotProvider for DbSnapshotProvider<DB> {
@@ -204,14 +197,17 @@ impl<DB: Database + 'static> EnhancedDbSnapshotProvider<DB> {
         })
     }
 
-    /// Get canonical header by number: in-memory cache first, DB as fallback.
-    fn get_canonical_header_by_number(&self, number: u64) -> Option<Header> {
-        get_cannonical_header_from_cache(number).or_else(|| {
-            let h = self.base.get_canonical_header_by_number_from_db(number);
-            if h.is_some() {
-                tracing::debug!(target: "parlia::snapshot", "Canonical header cache miss, loaded from DB for number {}", number);
-            }
-            h
+    /// Port of geth `consensus/parlia/snapshot.go:582-607` `FindAncientHeader`.
+    /// Never look up by number here: it resolves to whoever occupies that height, which on
+    /// a fork binds the snapshot to the *other* branch's epoch validators.
+    /// `get_header_by_hash` covers `candidateParents` (`:588-597`); `None` == `:599-601`.
+    fn find_ancient_header(&self, header: &Header, ite: u64) -> Option<Header> {
+        (0..ite).try_fold(header.clone(), |h, _| {
+            // Re-check the hash: every by-hash fallback resolves
+            // `HeaderNumbers[hash] -> Headers[number]`, a by-number read that can hand back
+            // another branch's header mid-reorg. The checkpoint is only parsed, never
+            // applied, so `Snapshot::apply`'s parent-hash gate would not catch that.
+            self.get_header_by_hash(&h.parent_hash).filter(|p| p.hash_slow() == h.parent_hash)
         })
     }
 
@@ -285,31 +281,33 @@ impl<DB: Database + 'static> EnhancedDbSnapshotProvider<DB> {
             let mut turn_length = None;
 
             let validators_info = if is_epoch_boundary {
-                let checkpoint_block_number = header.number - miner_check_len;
+                // geth snapshot.go:384-387
+                let Some(checkpoint_header) = self.find_ancient_header(&header, miner_check_len)
+                else {
+                    tracing::error!(target: "parlia::snapshot",
+                        "Unknown ancestor walking back to epoch checkpoint, block: {}, ite: {}",
+                        header.number, miner_check_len);
+                    return None; // geth: consensus.ErrUnknownAncestor
+                };
                 tracing::debug!("Updating validator set at epoch boundary, checkpoint_block: {}, current_block: {}",
-                    checkpoint_block_number, header.number);
+                    checkpoint_header.number, header.number);
 
-                if let Some(checkpoint_header) = self.get_canonical_header_by_number(checkpoint_block_number) {
-                    let parsed = 
-                        self.parlia.parse_validators_from_header(&checkpoint_header, working_snapshot.epoch_num)
-                            .map_err(|err| {
-                                tracing::error!("Failed to parse validators from checkpoint header: {:?}", err);
-                                err
-                            });
-                    
-                    turn_length = 
-                        self.parlia.get_turn_length_from_header(
-                            &checkpoint_header, 
-                            working_snapshot.epoch_num).map_err(|err| {
-                        tracing::error!("Failed to get turn length from checkpoint header, block_number: {}, checkpoint_block_number: {}, epoch_num: {}, error: {:?}", 
-                            header.number, checkpoint_block_number, working_snapshot.epoch_num, err);
-                        err
-                    }).ok()?;
-                    parsed
-                } else {
-                    tracing::error!("Failed to find checkpoint header for block {}", checkpoint_block_number);
-                    return None;
-                }
+                let parsed =
+                    self.parlia.parse_validators_from_header(&checkpoint_header, working_snapshot.epoch_num)
+                        .map_err(|err| {
+                            tracing::error!("Failed to parse validators from checkpoint header: {:?}", err);
+                            err
+                        });
+
+                turn_length =
+                    self.parlia.get_turn_length_from_header(
+                        &checkpoint_header,
+                        working_snapshot.epoch_num).map_err(|err| {
+                    tracing::error!("Failed to get turn length from checkpoint header, block_number: {}, checkpoint_block_number: {}, epoch_num: {}, error: {:?}",
+                        header.number, checkpoint_header.number, working_snapshot.epoch_num, err);
+                    err
+                }).ok()?;
+                parsed
             } else {
                 Ok(ValidatorsInfo {
                     consensus_addrs: Vec::new(),

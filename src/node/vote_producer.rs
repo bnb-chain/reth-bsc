@@ -202,7 +202,7 @@ pub fn maybe_produce_and_broadcast_for_head(
         }
     }
 
-    // Check vote rules against local journal to prevent slashing and double votes.
+    // Cheap pre-filter only; `write_vote` re-runs the rules atomically under its own lock.
     if !vote_journal::under_rules(source_number, target_number) {
         tracing::debug!(target: "bsc::vote", reason = "under-rules-failed", source_number=source_number, target_number=target_number, "skip vote production");
         return;
@@ -213,11 +213,17 @@ pub fn maybe_produce_and_broadcast_for_head(
     // Sign and insert/broadcast
     match bls_signer::sign_vote_with_global(data) {
         Ok(envelope) => {
-            // Persist in journal first to avoid vote loss due to failures.
+            // An unjournalled vote must not leave this node (geth vote_manager.go: a
+            // WriteVote error skips PutVote + broadcast). Lost vote = rewards; double = stake.
             if let Err(e) = vote_journal::persist_vote(&envelope) {
-                tracing::error!(target: "bsc::vote", error=%e, "Failed to write vote into journal");
-                VOTE_METRICS.vote_journal_errors_total.increment(1);
-                // Continue despite journal error; do not halt voting pipeline.
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    // Journal refused it (duplicate height or span), not a storage fault.
+                    tracing::debug!(target: "bsc::vote", reason = "journal-rules-failed", target_number=target_number, "skip vote production");
+                } else {
+                    tracing::error!(target: "bsc::vote", error=%e, "Failed to write vote into journal, skipping vote");
+                    VOTE_METRICS.vote_journal_errors_total.increment(1);
+                }
+                return;
             }
             // insert into local pool
             tracing::trace!(target: "bsc::vote", "insert self vote into local pool, target_number: {}, target_hash: {}", data.target_number, data.target_hash);
