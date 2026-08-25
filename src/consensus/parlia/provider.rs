@@ -197,11 +197,8 @@ impl<DB: Database + 'static> EnhancedDbSnapshotProvider<DB> {
         })
     }
 
-    /// Walk ancestors by parent hash.
-    /// Epoch checkpoints must stay on the branch being rebuilt.
-    fn find_ancient_header(&self, header: &Header, ite: u64) -> Option<Header> {
-        (0..ite).try_fold(header.clone(), |h, _| {
-            // Re-check the returned hash because DB fallback resolves by hash -> number -> header.
+    fn find_ancient_header(&self, header: &Header, steps: u64) -> Option<Header> {
+        (0..steps).try_fold(header.clone(), |h, _| {
             self.get_header_by_hash(&h.parent_hash).filter(|p| p.hash_slow() == h.parent_hash)
         })
     }
@@ -279,9 +276,9 @@ impl<DB: Database + 'static> EnhancedDbSnapshotProvider<DB> {
                 let Some(checkpoint_header) = self.find_ancient_header(&header, miner_check_len)
                 else {
                     tracing::error!(target: "parlia::snapshot",
-                        "Unknown ancestor walking back to epoch checkpoint, block: {}, ite: {}",
+                        "Unknown ancestor walking back to epoch checkpoint, block: {}, steps: {}",
                         header.number, miner_check_len);
-                    return None; // geth: consensus.ErrUnknownAncestor
+                    return None;
                 };
                 tracing::debug!("Updating validator set at epoch boundary, checkpoint_block: {}, current_block: {}",
                     checkpoint_header.number, header.number);
@@ -318,7 +315,6 @@ impl<DB: Database + 'static> EnhancedDbSnapshotProvider<DB> {
                 err
             }).ok()?;
 
-            // Apply header to snapshot
             working_snapshot = match working_snapshot.apply(
                 header.beneficiary,
                 &header,

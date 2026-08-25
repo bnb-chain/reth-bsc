@@ -82,7 +82,6 @@ impl VoteJournal {
                         buf.push(env.data);
                         if buf.len() > MAX_RECENT_ENTRIES { buf.remove(0); }
                     }
-                    // Log unreadable lines instead of silently forgetting them.
                     Err(e) => tracing::error!(target: "bsc::vote", error=%e, "Unparsable line in vote journal, skipping"),
                 }
             }
@@ -96,8 +95,6 @@ impl VoteJournal {
         Self { path, lru }
     }
 
-    /// Check vote rules against the in-memory buffer.
-    /// Returns true if the vote is allowed under rules, along with the provided source/target context.
     pub fn under_rules(&self, source_number: u64, target_number: u64) -> bool {
         // Rule 1: must not publish two distinct votes for the same height
         if self.lru.contains(target_number) { 
@@ -137,14 +134,12 @@ impl VoteJournal {
 
     /// Append a vote to the journal and update the in-memory cache.
     pub fn write_vote(&mut self, env: &VoteEnvelope) -> std::io::Result<()> {
-        // Recheck under the journal lock so the rule check and LRU update stay atomic.
         if !self.under_rules(env.data.source_number, env.data.target_number) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
                 "vote violates journal rules",
             ));
         }
-        // Allow memory-only mode via env toggle.
         let mem_only = std::env::var("BSC_VOTE_JOURNAL_MEMORY_ONLY")
             .is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"));
         let mut written = Ok(());
@@ -153,41 +148,31 @@ impl VoteJournal {
             let mut line = serde_json::to_string(env).map_err(std::io::Error::other)?;
             line.push('\n');
             let mut file = Self::open_file_append(&self.path)?;
-            // Write the full line and roll back partial appends on error.
             let len_before = file.metadata()?.len();
-            // Persist the vote before it can leave the node.
             written = file.write_all(line.as_bytes()).and_then(|()| file.sync_all());
             if written.is_err() {
                 let _ = file.set_len(len_before);
             }
             if is_new_file {
-                // Best-effort directory sync for the first journal file.
                 if let Some(dir) = self.path.parent() {
                     let _ = File::open(dir).and_then(|d| d.sync_all());
                 }
             }
         }
-        // Claim the height in memory once a write was attempted.
         self.lru.add(env.data.target_number, env.data);
         written
     }
 }
 
-/// Global vote journal instance, initialized lazily on first use.
 static GLOBAL_JOURNAL: LazyLock<Mutex<VoteJournal>> = LazyLock::new(|| {
     let path = VoteJournal::resolve_default_path();
     Mutex::new(VoteJournal::new(path))
 });
 
-/// Get a guard to the global vote journal.
 pub fn global() -> std::sync::MutexGuard<'static, VoteJournal> { GLOBAL_JOURNAL.lock().expect("vote journal poisoned") }
 
-/// Helper for external modules to check the rules via global journal.
 pub fn under_rules(source_number: u64, target_number: u64) -> bool { global().under_rules(source_number, target_number) }
 
-/// Helper for external modules to persist a signed vote via global journal.
-///
-/// Keep `AlreadyExists` distinct from storage errors.
 pub fn persist_vote(env: &VoteEnvelope) -> std::io::Result<()> {
     global().write_vote(env)
 }
@@ -220,14 +205,12 @@ mod tests {
         let dup = mk_env(90, B256::from([1u8; 32]), 100, B256::from([3u8; 32]));
         j.write_vote(&env).unwrap();
         assert!(!j.under_rules(95, 100));
-        // `write_vote` must reject duplicates even if the caller's pre-check races.
         let err = j.write_vote(&dup).expect_err("equivocating vote must be refused");
         assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
     }
 
     #[test]
     fn open_failure_is_reported_and_not_recorded() {
-        // Opening under a regular file fails before any byte is written.
         let blocker = tmp_path("journal_blocker");
         std::fs::write(&blocker, b"x").unwrap();
         let mut j = VoteJournal::new(blocker.join("votes.jsonl"));
@@ -240,10 +223,8 @@ mod tests {
     fn rule2_backward_across_span_disallowed() {
         let path = tmp_path("journal_rule2_back");
         let mut j = VoteJournal::new(path);
-        // Previous vote with target 125 and source 120
         let env = mk_env(120, B256::from([3u8; 32]), 125, B256::from([4u8; 32]));
         j.write_vote(&env).unwrap();
-        // New vote spans across: source 110, target 130 should be invalid (sees prior at 125 with higher source)
         assert!(!j.under_rules(110, 130));
     }
 
@@ -251,10 +232,8 @@ mod tests {
     fn rule2_forward_within_span_disallowed() {
         let path = tmp_path("journal_rule2_forward");
         let mut j = VoteJournal::new(path);
-        // Previous vote with target 110 and lower source 90
         let env = mk_env(90, B256::from([5u8; 32]), 110, B256::from([6u8; 32]));
         j.write_vote(&env).unwrap();
-        // New vote source 100, target 105: forward window includes 106..116; contains 110 with vd.source=90 < 100 => invalid
         assert!(!j.under_rules(100, 105));
     }
 
@@ -262,7 +241,6 @@ mod tests {
     fn allowed_vote_when_no_conflict() {
         let path = tmp_path("journal_ok");
         let mut j = VoteJournal::new(path);
-        // Old vote far behind
         let env = mk_env(80, B256::from([7u8; 32]), 90, B256::from([8u8; 32]));
         j.write_vote(&env).unwrap();
         assert!(j.under_rules(100, 110));
@@ -278,11 +256,8 @@ mod tests {
             j.write_vote(&env1).unwrap();
             j.write_vote(&env2).unwrap();
         }
-        // Reopen
         let j2 = VoteJournal::new(path);
-        // Rule1: contains 40
         assert!(!j2.under_rules(35, 40));
-        // Rule2 forward: with source 35 target 33, forward window includes 34..44; 40 present with vd.source=30 < 35 => invalid
         assert!(!j2.under_rules(35, 33));
     }
 }

@@ -155,24 +155,20 @@ impl Snapshot {
         ChainSpec: crate::hardforks::BscHardforks,
     {
         let block_number = next_header.number();
-        // Require both number and parent-hash continuity.
         if self.block_number + 1 != block_number || self.block_hash != next_header.parent_hash() {
             return None;
         }
 
-        // Clone base.
         let original_snap = self.clone();
         let mut snap = self.clone();
         snap.block_hash = next_header.hash_slow();
         snap.block_number = block_number;
 
-        // Maintain recent proposer window.
         let limit = self.miner_history_check_len() + 1;
         if block_number >= limit {
             snap.recent_proposers.remove(&(block_number - limit));
         }
 
-        // Maintain recent fork hash window.
         let version_limit = self.version_history_check_len();
         if block_number >= version_limit {
             snap.recent_fork_hashes.remove(&(block_number - version_limit));

@@ -202,7 +202,6 @@ pub fn maybe_produce_and_broadcast_for_head(
         }
     }
 
-    // Cheap pre-filter only; `write_vote` re-runs the rules atomically under its own lock.
     if !vote_journal::under_rules(source_number, target_number) {
         tracing::debug!(target: "bsc::vote", reason = "under-rules-failed", source_number=source_number, target_number=target_number, "skip vote production");
         return;
@@ -210,10 +209,8 @@ pub fn maybe_produce_and_broadcast_for_head(
 
     let data = VoteData { source_number, source_hash, target_number, target_hash };
 
-    // Sign and insert/broadcast
     match bls_signer::sign_vote_with_global(data) {
         Ok(envelope) => {
-            // Do not broadcast votes that failed to persist in the journal.
             if let Err(e) = vote_journal::persist_vote(&envelope) {
                 if e.kind() == std::io::ErrorKind::AlreadyExists {
                     tracing::debug!(target: "bsc::vote", reason = "journal-rules-failed", target_number=target_number, "skip vote production");
@@ -223,10 +220,8 @@ pub fn maybe_produce_and_broadcast_for_head(
                 }
                 return;
             }
-            // insert into local pool
             tracing::trace!(target: "bsc::vote", "insert self vote into local pool, target_number: {}, target_hash: {}", data.target_number, data.target_hash);
             votes::put_vote(envelope.clone());
-            // broadcast to peers
             crate::node::network::bsc_protocol::registry::broadcast_votes(vec![envelope]);
         }
         Err(e) => {
@@ -258,7 +253,6 @@ mod tests {
         Header { number, timestamp: now, ..Default::default() }
     }
 
-    /// Journal failure must stop the vote before it reaches the pool or the wire.
     #[tokio::test(flavor = "current_thread")]
     async fn journal_error_blocks_pool_and_broadcast() {
         let dir = std::env::temp_dir().join(format!("vote_producer_{}", uuid::Uuid::new_v4()));
@@ -294,15 +288,12 @@ mod tests {
         };
         let sp = FixedSnap(snap);
 
-        // Burn the warm-up block.
         maybe_produce_and_broadcast_for_head(spec.clone(), &sp, &head_at(40_000_001));
 
-        // Journal writable: the vote reaches the pool.
         let ok = head_at(40_000_002);
         maybe_produce_and_broadcast_for_head(spec.clone(), &sp, &ok);
         assert_eq!(votes::fetch_vote_by_block_hash(ok.hash_slow()).len(), 1);
 
-        // Journal directory replaced by a regular file: persist_vote fails.
         std::fs::remove_dir_all(&dir).unwrap();
         std::fs::write(&dir, b"x").unwrap();
         let bad = head_at(40_000_003);
