@@ -197,8 +197,15 @@ impl<DB: Database + 'static> EnhancedDbSnapshotProvider<DB> {
         })
     }
 
+    /// Port of geth parlia's `FindAncientHeader`: walk ancestors by parent hash.
+    /// Never look up by number here - it resolves to whoever occupies that height, which on
+    /// a fork binds the snapshot to the *other* branch's epoch validators.
     fn find_ancient_header(&self, header: &Header, steps: u64) -> Option<Header> {
         (0..steps).try_fold(header.clone(), |h, _| {
+            // Re-check the hash: the by-hash fallback resolves HeaderNumbers[hash] ->
+            // Headers[number], a by-number read that can hand back another branch's header
+            // mid-reorg. The checkpoint is only parsed, never applied, so Snapshot::apply's
+            // parent-hash gate would not catch it.
             self.get_header_by_hash(&h.parent_hash).filter(|p| p.hash_slow() == h.parent_hash)
         })
     }
@@ -278,7 +285,7 @@ impl<DB: Database + 'static> EnhancedDbSnapshotProvider<DB> {
                     tracing::error!(target: "parlia::snapshot",
                         "Unknown ancestor walking back to epoch checkpoint, block: {}, steps: {}",
                         header.number, miner_check_len);
-                    return None;
+                    return None; // geth: consensus.ErrUnknownAncestor
                 };
                 tracing::debug!("Updating validator set at epoch boundary, checkpoint_block: {}, current_block: {}",
                     checkpoint_header.number, header.number);
@@ -315,6 +322,7 @@ impl<DB: Database + 'static> EnhancedDbSnapshotProvider<DB> {
                 err
             }).ok()?;
 
+            // Apply header to snapshot
             working_snapshot = match working_snapshot.apply(
                 header.beneficiary,
                 &header,

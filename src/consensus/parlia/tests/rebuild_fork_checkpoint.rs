@@ -1,4 +1,5 @@
-//! Regression: epoch checkpoints must be resolved from the branch being rebuilt.
+//! Regression: the epoch checkpoint must be reached by parent_hash, not by number - the
+//! by-number header cache can hold a rejected sibling (geth parlia `FindAncientHeader`).
 
 use super::super::{
     provider::{EnhancedDbSnapshotProvider, SnapshotProvider},
@@ -20,13 +21,15 @@ use uuid::Uuid;
 
 const EPOCH: u64 = 200;
 const CHECKPOINT: u64 = 200;
-/// Two hops catch an off-by-one in the ancestor walk.
+/// +2 because 5 validators, turn_length 1 => miner_history_check_len == 2. Two hops, so an
+/// off-by-one in the walk is caught.
 const TRANSITION: u64 = CHECKPOINT + 2;
 
 fn addrs(seed: u8) -> Vec<Address> {
     (0..5u8).map(|i| Address::repeat_byte(seed + i)).collect()
 }
 
+/// Empty `validators` -> plain header; otherwise a pre-Luban epoch checkpoint.
 fn header(number: u64, parent: B256, validators: &[Address]) -> Header {
     let mut extra = vec![0u8; EXTRA_VANITY_LEN];
     validators.iter().for_each(|v| extra.extend_from_slice(v.as_slice()));
@@ -47,6 +50,8 @@ fn epoch_checkpoint_is_read_from_the_branch_being_rebuilt() -> eyre::Result<()> 
     let _cleanup = TestCleanup { path: db_path.clone() };
     let db = init_db(&db_path, DatabaseArguments::new(Default::default()))?;
     let chain_spec = Arc::new(BscChainSpec::from(bsc_testnet()));
+    // Both matter: Luban changes the validator layout, Bohr makes `extra[32]` a validator
+    // count and the hand-built extra_data would parse as garbage.
     assert!(!chain_spec.is_luban_active_at_block(TRANSITION), "extra_data above is pre-Luban");
     assert!(!chain_spec.is_bohr_active_at_timestamp(TRANSITION, 0), "no turn_length byte");
     let provider = EnhancedDbSnapshotProvider::new(db, 256, chain_spec);
@@ -65,6 +70,7 @@ fn epoch_checkpoint_is_read_from_the_branch_being_rebuilt() -> eyre::Result<()> 
         let mid_hash = mid.hash_slow();
         let next = header(TRANSITION, mid_hash, &[]);
         tips.push(next.hash_slow());
+        // Seed at the intermediate block so the rebuild replays exactly one header.
         provider.insert(Snapshot::new(base.clone(), CHECKPOINT + 1, mid_hash, EPOCH, None));
         for h in [cp, mid, next] {
             insert_header_to_cache_with_hash(h, None);
@@ -79,7 +85,9 @@ fn epoch_checkpoint_is_read_from_the_branch_being_rebuilt() -> eyre::Result<()> 
     Ok(())
 }
 
-/// Exercise the DB fallback path without seeding the header cache.
+/// The DB fallback resolves `HeaderNumbers[hash] -> Headers[number]`, i.e. a by-number read,
+/// so mid-reorg it can hand back the sibling that now owns that height. Nothing is seeded into
+/// the header cache here on purpose: the lookup has to miss it and go through MDBX.
 #[test]
 fn db_fallback_rejects_a_header_that_is_not_the_requested_hash() -> eyre::Result<()> {
     let db_path = std::env::temp_dir().join(format!("bsc_fork_db_fallback_{}", Uuid::new_v4()));
@@ -89,7 +97,8 @@ fn db_fallback_rejects_a_header_that_is_not_the_requested_hash() -> eyre::Result
     let provider =
         EnhancedDbSnapshotProvider::new(db.clone(), 256, Arc::new(BscChainSpec::from(bsc_testnet())));
 
-    // The header cache is process-global, so use distinct hashes here.
+    // Seeds distinct from the test above: the header cache is process-global with no reset, so
+    // every hash built here must be one no other test inserted.
     let grandparent = B256::repeat_byte(0xbb);
     let cp = header(CHECKPOINT, grandparent, &addrs(0x40));
     let mid = header(CHECKPOINT + 1, cp.hash_slow(), &[]);
@@ -104,7 +113,8 @@ fn db_fallback_rejects_a_header_that_is_not_the_requested_hash() -> eyre::Result
     }
     tx.put::<Headers<Header>>(TRANSITION, tip)?;
     tx.put::<Headers<Header>>(CHECKPOINT + 1, mid)?;
-    // Simulate a reorg where the checkpoint height is now owned by a sibling header.
+    // The reorg: HeaderNumbers still maps the checkpoint hash to CHECKPOINT, but that height is
+    // now owned by a sibling carrying a different validator set.
     tx.put::<Headers<Header>>(CHECKPOINT, header(CHECKPOINT, grandparent, &addrs(0x50)))?;
     tx.commit()?;
 
