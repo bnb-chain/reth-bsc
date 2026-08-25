@@ -76,9 +76,8 @@ impl HeaderCacheReader {
         let block_number = header.number();
         let block_hash = block_hash.unwrap_or_else(|| header.hash_slow());
         let header_clone_for_log = header.clone();
-        // NOT fork-safe: last writer wins, and BscBlockExecutor::new writes here *before*
-        // Parlia validation, so a rejected sibling can own this slot. Remaining readers only
-        // ask for block 0. Never add a by-number lookup on a consensus path (see provider.rs).
+        // Not fork-safe: the last writer wins for a block number.
+        // Do not use by-number lookups on consensus paths.
         self.blocknumber_to_header.insert(block_number, header.clone());
         self.blockhash_to_header.insert(block_hash, header);
         tracing::trace!("Insert header to cache, block_number: {:?}, block_hash: {:?}, header: {:?}", block_number, block_hash, header_clone_for_log);

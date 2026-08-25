@@ -155,8 +155,7 @@ impl Snapshot {
         ChainSpec: crate::hardforks::BscHardforks,
     {
         let block_number = next_header.number();
-        // Gate on number *and* parent hash (geth parlia snapshot.go apply): number alone
-        // lets a competing branch's sibling apply onto this snapshot.
+        // Require both number and parent-hash continuity.
         if self.block_number + 1 != block_number || self.block_hash != next_header.parent_hash() {
             return None;
         }

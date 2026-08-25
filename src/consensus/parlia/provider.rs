@@ -197,15 +197,11 @@ impl<DB: Database + 'static> EnhancedDbSnapshotProvider<DB> {
         })
     }
 
-    /// Port of geth parlia's `FindAncientHeader`: walk ancestors by parent hash.
-    /// Never look up by number here - it resolves to whoever occupies that height, which on
-    /// a fork binds the snapshot to the *other* branch's epoch validators.
+    /// Walk ancestors by parent hash.
+    /// Epoch checkpoints must stay on the branch being rebuilt.
     fn find_ancient_header(&self, header: &Header, ite: u64) -> Option<Header> {
         (0..ite).try_fold(header.clone(), |h, _| {
-            // Re-check the hash: the by-hash fallback resolves HeaderNumbers[hash] ->
-            // Headers[number], a by-number read that can hand back another branch's header
-            // mid-reorg. The checkpoint is only parsed, never applied, so Snapshot::apply's
-            // parent-hash gate would not catch it.
+            // Re-check the returned hash because DB fallback resolves by hash -> number -> header.
             self.get_header_by_hash(&h.parent_hash).filter(|p| p.hash_slow() == h.parent_hash)
         })
     }

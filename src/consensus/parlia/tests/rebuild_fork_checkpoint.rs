@@ -1,5 +1,4 @@
-//! Regression: the epoch checkpoint must be reached by parent_hash, not by number - the
-//! by-number header cache can hold a rejected sibling (geth parlia `FindAncientHeader`).
+//! Regression: epoch checkpoints must be resolved from the branch being rebuilt.
 
 use super::super::{
     provider::{EnhancedDbSnapshotProvider, SnapshotProvider},
@@ -85,9 +84,7 @@ fn epoch_checkpoint_is_read_from_the_branch_being_rebuilt() -> eyre::Result<()> 
     Ok(())
 }
 
-/// The DB fallback resolves `HeaderNumbers[hash] -> Headers[number]`, i.e. a by-number read,
-/// so mid-reorg it can hand back the sibling that now owns that height. Nothing is seeded into
-/// the header cache here on purpose: the lookup has to miss it and go through MDBX.
+/// Exercise the DB fallback path without seeding the header cache.
 #[test]
 fn db_fallback_rejects_a_header_that_is_not_the_requested_hash() -> eyre::Result<()> {
     let db_path = std::env::temp_dir().join(format!("bsc_fork_db_fallback_{}", Uuid::new_v4()));
@@ -97,8 +94,7 @@ fn db_fallback_rejects_a_header_that_is_not_the_requested_hash() -> eyre::Result
     let provider =
         EnhancedDbSnapshotProvider::new(db.clone(), 256, Arc::new(BscChainSpec::from(bsc_testnet())));
 
-    // Seeds distinct from the test above: the header cache is process-global with no reset, so
-    // every hash built here must be one no other test inserted.
+    // The header cache is process-global, so use distinct hashes here.
     let grandparent = B256::repeat_byte(0xbb);
     let cp = header(CHECKPOINT, grandparent, &addrs(0x40));
     let mid = header(CHECKPOINT + 1, cp.hash_slow(), &[]);
@@ -113,8 +109,7 @@ fn db_fallback_rejects_a_header_that_is_not_the_requested_hash() -> eyre::Result
     }
     tx.put::<Headers<Header>>(TRANSITION, tip)?;
     tx.put::<Headers<Header>>(CHECKPOINT + 1, mid)?;
-    // The reorg: HeaderNumbers still maps the checkpoint hash to CHECKPOINT, but that height is
-    // now owned by a sibling carrying a different validator set.
+    // Simulate a reorg where the checkpoint height is now owned by a sibling header.
     tx.put::<Headers<Header>>(CHECKPOINT, header(CHECKPOINT, grandparent, &addrs(0x50)))?;
     tx.commit()?;
 

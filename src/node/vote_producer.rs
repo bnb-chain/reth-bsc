@@ -213,11 +213,9 @@ pub fn maybe_produce_and_broadcast_for_head(
     // Sign and insert/broadcast
     match bls_signer::sign_vote_with_global(data) {
         Ok(envelope) => {
-            // An unjournalled vote must not leave this node (geth vote_manager.go: a
-            // WriteVote error skips PutVote + broadcast). Lost vote = rewards; double = stake.
+            // Do not broadcast votes that failed to persist in the journal.
             if let Err(e) = vote_journal::persist_vote(&envelope) {
                 if e.kind() == std::io::ErrorKind::AlreadyExists {
-                    // Journal refused it (duplicate height or span), not a storage fault.
                     tracing::debug!(target: "bsc::vote", reason = "journal-rules-failed", target_number=target_number, "skip vote production");
                 } else {
                     tracing::error!(target: "bsc::vote", error=%e, "Failed to write vote into journal, skipping vote");
@@ -260,10 +258,7 @@ mod tests {
         Header { number, timestamp: now, ..Default::default() }
     }
 
-    /// A journal write failure has to stop the vote before it reaches the pool or the wire:
-    /// a vote that left without being journalled can be signed again at the same height after
-    /// a restart, which is slashable. Positive and negative case share one test because the
-    /// journal path is resolved once per process.
+    /// Journal failure must stop the vote before it reaches the pool or the wire.
     #[tokio::test(flavor = "current_thread")]
     async fn journal_error_blocks_pool_and_broadcast() {
         let dir = std::env::temp_dir().join(format!("vote_producer_{}", uuid::Uuid::new_v4()));
