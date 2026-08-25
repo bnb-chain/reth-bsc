@@ -155,10 +155,8 @@ impl Snapshot {
         ChainSpec: crate::hardforks::BscHardforks,
     {
         let block_number = next_header.number();
-        // Gate on number *and* parent hash (geth parlia snapshot.go apply): number alone
-        // lets a competing branch's sibling apply onto this snapshot.
         if self.block_number + 1 != block_number || self.block_hash != next_header.parent_hash() {
-            return None;
+            return None; // non-continuous block
         }
 
         // Clone base.
@@ -670,7 +668,7 @@ mod tests {
 
         let header = MockHeader {
             number: 1,
-            parent_hash: block_hash, // apply() gates on parent hash
+            parent_hash: block_hash,
             beneficiary: validators[0],
             extra_data: alloy_primitives::Bytes::new(),
         };

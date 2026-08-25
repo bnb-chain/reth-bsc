@@ -136,9 +136,7 @@ impl VoteJournal {
 
     /// Append a vote to the journal and update the in-memory cache.
     pub fn write_vote(&mut self, env: &VoteEnvelope) -> std::io::Result<()> {
-        // Authoritative check. The caller's `under_rules` runs under a *separate* lock
-        // acquisition with BLS signing in between, so two head events at one height can both
-        // pass it. Here check and LRU update share one lock, so they are atomic.
+        // Re-check under the journal lock.
         if !self.under_rules(env.data.source_number, env.data.target_number) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
@@ -154,27 +152,21 @@ impl VoteJournal {
             let mut line = serde_json::to_string(env).map_err(std::io::Error::other)?;
             line.push('\n');
             let mut file = Self::open_file_append(&self.path)?;
-            // One write_all: a failure between payload and newline leaves an unterminated
-            // line the next append glues onto, and `load_from_disk` drops it - silently
-            // erasing a vote we already broadcast. Hence the rollback on error.
+            // Roll back partial appends on error.
             let len_before = file.metadata()?.len();
-            // `File::flush` is a no-op for `std::fs::File`; only fsync survives power loss,
-            // and the vote is broadcast right after this returns.
+            // Persist before the vote can leave the node.
             written = file.write_all(line.as_bytes()).and_then(|()| file.sync_all());
             if written.is_err() {
                 let _ = file.set_len(len_before);
             }
             if is_new_file {
-                // The directory entry must be durable too, or a crash after the first vote
-                // loses the journal and the guard resets to "never voted". Best effort:
-                // platforms that will not fsync a dir handle must not cost us the vote.
+                // Best-effort directory sync for the first journal file.
                 if let Some(dir) = self.path.parent() {
                     let _ = File::open(dir).and_then(|d| d.sync_all());
                 }
             }
         }
-        // Claim the height once we tried to write: even on failure we return Err (caller must
-        // not broadcast), but the bytes may be there - re-voting the height would equivocate.
+        // Claim the height once a write was attempted.
         self.lru.add(env.data.target_number, env.data);
         written
     }
