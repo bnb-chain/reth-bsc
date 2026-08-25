@@ -179,14 +179,17 @@ fn log_recovery_error(
 
 /// Pick a peer to route `GetBlocksByRange` to. Only bsc/2 peers qualify —
 /// bsc/1 peers don't speak `GetBlocksByRange` and would kick us with
-/// `SubprotocolSpecific`. Prefer the announcing peer if it's bsc/2;
-/// otherwise pick any registered bsc/2 peer.
+/// `SubprotocolSpecific`.
+///
+/// Only the announcing peer is eligible: it is the one peer known to have
+/// the block. Routing the request to an arbitrary bsc/2 peer asks a node
+/// that may have never seen the hash; geth answers `GetBlocksByRange` for
+/// an unknown start block with an error and disconnects the requester
+/// (`DiscSubprotocolError`), so every misrouted request costs us a peer.
+/// If the announcer doesn't speak bsc/2, give up — the caller's cooldown
+/// and the far-behind pipeline trigger handle the gap instead.
 fn resolve_bsc_peer_static(announcer: PeerId) -> Option<PeerId> {
-    if crate::node::network::bsc_protocol::registry::is_v2_peer(announcer) {
-        Some(announcer)
-    } else {
-        crate::node::network::bsc_protocol::registry::list_v2_peers().into_iter().next()
-    }
+    crate::node::network::bsc_protocol::registry::is_v2_peer(announcer).then_some(announcer)
 }
 
 impl<Provider> ImportService<Provider>

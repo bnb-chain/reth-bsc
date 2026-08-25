@@ -710,12 +710,12 @@ fn hardfork_to_dir_name(hardfork: &BscHardfork) -> Result<String, SystemContract
 fn read_all_system_contracts(
     spec: &ChainSpec,
 ) -> HashMap<String, HashMap<Address, Option<Bytecode>>> {
-    let dir = if spec.chain.eq(&Chain::bsc_mainnet()) {
-        "mainnet"
+    let dir: String = if spec.chain.eq(&Chain::bsc_mainnet()) {
+        "mainnet".to_string()
     } else if spec.chain.eq(&Chain::bsc_testnet()) {
-        "chapel"
+        "chapel".to_string()
     } else if spec.chain.eq(&Chain::from_id(714)) {
-        "rialto"
+        "rialto".to_string()
     } else {
         panic!("invalid spec");
     };

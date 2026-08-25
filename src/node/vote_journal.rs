@@ -74,14 +74,15 @@ impl VoteJournal {
         let mut lru = VoteDataLru::new(MAX_RECENT_ENTRIES);
         if let Ok(file) = Self::open_file_read(path) {
             let reader = BufReader::new(file);
-            // Read all lines and keep the last MAX_RECENT_ENTRIES
-            // Each line is expected to be a JSON-serialized VoteEnvelope
             let mut buf: Vec<VoteData> = Vec::with_capacity(MAX_RECENT_ENTRIES);
             for line in reader.lines().map_while(Result::ok) {
                 if line.is_empty() { continue; }
-                if let Ok(env) = serde_json::from_str::<VoteEnvelope>(&line) {
-                    buf.push(env.data);
-                    if buf.len() > MAX_RECENT_ENTRIES { buf.remove(0); }
+                match serde_json::from_str::<VoteEnvelope>(&line) {
+                    Ok(env) => {
+                        buf.push(env.data);
+                        if buf.len() > MAX_RECENT_ENTRIES { buf.remove(0); }
+                    }
+                    Err(e) => tracing::error!(target: "bsc::vote", error=%e, "Unparsable line in vote journal, skipping"),
                 }
             }
             for vd in buf { lru.add(vd.target_number, vd); }
@@ -135,21 +136,39 @@ impl VoteJournal {
 
     /// Append a vote to the journal and update the in-memory cache.
     pub fn write_vote(&mut self, env: &VoteEnvelope) -> std::io::Result<()> {
+        // Re-check under the journal lock.
+        if !self.under_rules(env.data.source_number, env.data.target_number) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "vote violates journal rules",
+            ));
+        }
         // Allow memory-only mode via env toggle.
         let mem_only = std::env::var("BSC_VOTE_JOURNAL_MEMORY_ONLY")
-            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
-            .unwrap_or(false);
+            .is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"));
+        let mut written = Ok(());
         if !mem_only {
+            let is_new_file = !self.path.exists();
+            let mut line = serde_json::to_string(env).map_err(std::io::Error::other)?;
+            line.push('\n');
             let mut file = Self::open_file_append(&self.path)?;
-            let line = serde_json::to_string(env).unwrap_or_else(|_| String::new());
-            if !line.is_empty() {
-                file.write_all(line.as_bytes())?;
-                file.write_all(b"\n")?;
-                file.flush()?;
+            // Roll back partial appends on error.
+            let len_before = file.metadata()?.len();
+            // Persist before the vote can leave the node.
+            written = file.write_all(line.as_bytes()).and_then(|()| file.sync_all());
+            if written.is_err() {
+                let _ = file.set_len(len_before);
+            }
+            if is_new_file {
+                // Best-effort directory sync for the first journal file.
+                if let Some(dir) = self.path.parent() {
+                    let _ = File::open(dir).and_then(|d| d.sync_all());
+                }
             }
         }
+        // Claim the height once a write was attempted.
         self.lru.add(env.data.target_number, env.data);
-        Ok(())
+        written
     }
 }
 
@@ -166,8 +185,11 @@ pub fn global() -> std::sync::MutexGuard<'static, VoteJournal> { GLOBAL_JOURNAL.
 pub fn under_rules(source_number: u64, target_number: u64) -> bool { global().under_rules(source_number, target_number) }
 
 /// Helper for external modules to persist a signed vote via global journal.
-pub fn persist_vote(env: &VoteEnvelope) -> Result<(), String> {
-    global().write_vote(env).map_err(|e| format!("Failed to write vote journal: {e}"))
+///
+/// `io::Error` as-is: `AlreadyExists` = violates the journal rules (benign during a reorg),
+/// anything else = storage fault. A `String` would make those indistinguishable.
+pub fn persist_vote(env: &VoteEnvelope) -> std::io::Result<()> {
+    global().write_vote(env)
 }
 
 #[cfg(test)]
@@ -193,11 +215,28 @@ mod tests {
 
     #[test]
     fn rule1_duplicate_height_disallowed() {
-        let path = tmp_path("journal_rule1");
-        let mut j = VoteJournal::new(path);
+        let mut j = VoteJournal::new(tmp_path("journal_rule1"));
         let env = mk_env(90, B256::from([1u8; 32]), 100, B256::from([2u8; 32]));
+        let dup = mk_env(90, B256::from([1u8; 32]), 100, B256::from([3u8; 32]));
         j.write_vote(&env).unwrap();
         assert!(!j.under_rules(95, 100));
+        // write_vote itself must refuse, not just the pre-filter: the caller's check runs
+        // under a separate lock acquisition, so two tasks can both get past it.
+        let err = j.write_vote(&dup).expect_err("equivocating vote must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn open_failure_is_reported_and_not_recorded() {
+        // Parent is a regular file, so create_dir_all + open cannot succeed. Only failures
+        // *before* any byte is written leave the journal untouched; a write or fsync that
+        // fails afterwards still claims the height (see `lru.add` in `write_vote`).
+        let blocker = tmp_path("journal_blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        let mut j = VoteJournal::new(blocker.join("votes.jsonl"));
+        assert!(j.write_vote(&mk_env(90, B256::ZERO, 100, B256::ZERO)).is_err());
+        assert!(j.under_rules(95, 100), "failed write must leave the journal untouched");
+        let _ = std::fs::remove_file(&blocker);
     }
 
     #[test]
