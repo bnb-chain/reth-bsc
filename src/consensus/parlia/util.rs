@@ -139,7 +139,11 @@ fn rlp_header(header: &Header, chain_id: u64) -> alloy_rlp::Header {
 }
 
 pub fn calculate_millisecond_timestamp(header: &Header) -> u64 {
-    header.timestamp * 1000 + millisecond_remainder(header)
+    // Plain uint64 wrap-around like go-bsc's `Header.MilliTimestamp()`
+    // (`h.Time*1000 + milliseconds`): consensus-valid headers never overflow,
+    // but this helper also runs on unvalidated inputs (RPC-supplied headers,
+    // fuzzing), where Rust's debug overflow panic would diverge from geth.
+    header.timestamp.wrapping_mul(1000).wrapping_add(millisecond_remainder(header))
 }
 
 /// The sub-second millisecond remainder encoded in the header's `mix_hash` tail (BEP-520).
@@ -189,6 +193,22 @@ mod tests {
 
         let result = calculate_millisecond_timestamp(&header);
         assert_eq!(result, timestamp * 1000);
+    }
+
+    #[test]
+    fn test_calculate_millisecond_timestamp_wraps_like_geth() {
+        // go-bsc's Header.MilliTimestamp() is plain uint64 arithmetic: an
+        // out-of-domain timestamp (unvalidated header) wraps instead of
+        // panicking in debug builds. (u64::MAX * 1000) mod 2^64 = 2^64 - 1000.
+        let mut mix = [0u8; 32];
+        mix[24..32].copy_from_slice(&123u64.to_be_bytes());
+        let header =
+            Header { timestamp: u64::MAX, mix_hash: B256::new(mix), ..Default::default() };
+        assert_eq!(
+            calculate_millisecond_timestamp(&header),
+            u64::MAX.wrapping_mul(1000).wrapping_add(123)
+        );
+        assert_eq!(calculate_millisecond_timestamp(&header), 18_446_744_073_709_550_739);
     }
 
     #[test]
