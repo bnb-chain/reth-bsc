@@ -1929,6 +1929,9 @@ mod tests {
         let mut provider = MockProvider::new();
         let header = Header { number: local_tip, ..Default::default() };
         provider.insert(header, U256::from(1));
+        // "TD unknown" is produced by the provider, not the engine: since v2.5 fork choice resolves
+        // TD through `header_td`, and this mock holds only `local_tip`, both the incoming fork
+        // block's hash and its parent's answer `Ok(None)` — the case that used to wedge the head.
         let chain_spec =
             Arc::new(crate::chainspec::BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet()));
 
@@ -1988,9 +1991,9 @@ mod tests {
         tokio::time::timeout(timeout, fcu_rx.recv()).await.ok().flatten()
     }
 
-    /// Like [`spawn_service_with_tip`], but the engine answers `QueryTd` with `Ok(None)` —
-    /// "TD unknown" — which is what the real engine-tree returns for a fork whose divergence
-    /// point lies below the persisted tip (its parent walk stops at `last_block_number`).
+    /// Like [`spawn_service_with_tip`], but the provider cannot resolve the incoming block's TD.
+    /// Since v2.5 fork choice reads TD via `header_td` rather than asking the engine, "TD unknown"
+    /// is what a real node sees for a fork whose divergence point lies below the persisted tip.
     async fn spawn_service_with_td_unknown(
         local_tip: u64,
     ) -> (ImportHandle, mpsc::UnboundedReceiver<ForkchoiceState>, mpsc::UnboundedReceiver<()>) {
@@ -2018,10 +2021,6 @@ mod tests {
                             PayloadStatusEnum::Valid,
                             None,
                         ))));
-                    }
-                    BeaconEngineMessage::QueryTd { number: _, hash: _, tx } => {
-                        // The distinguishing behavior: query succeeds, answer is "unknown".
-                        let _ = tx.send(Ok(None));
                     }
                     _ => {}
                 }
@@ -2067,7 +2066,7 @@ mod tests {
         };
         let new_block = BscNewBlock(NewBlock { block, td: U128::from(1) });
         let hash = new_block.0.block.header.hash_slow();
-        NewBlockMessage { hash, block: Arc::new(new_block), td: Some(U256::from(1)) }
+        NewBlockMessage { hash, block: Arc::new(new_block) }
     }
 
     /// Regression test for the unrecoverable-fork wedge (QA net, 2026-07-28).
