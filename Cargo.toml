@@ -251,6 +251,7 @@ strip = false
 
 [dev-dependencies]
 uuid = { version = "1", features = ["v4"] }
+reth-transaction-pool = { git = "https://github.com/bnb-chain/reth.git", branch = "jenner-bep706", features = ["test-utils"] }
 # `test-util` gives tests a paused clock (`start_paused`, `time::advance`), so timing invariants
 # can be asserted by ordering instead of racing a wall clock.
 tokio = { version = "1.44", features = ["full", "test-util"] }
