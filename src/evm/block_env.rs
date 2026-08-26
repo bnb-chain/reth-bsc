@@ -34,14 +34,19 @@ impl BscBlockEnv {
     /// The block's millisecond timestamp (BEP-520): computed live from the
     /// *current* seconds value so direct `timestamp` mutations are reflected.
     ///
-    /// Saturates instead of overflowing for out-of-domain timestamps
-    /// (`timestamp > u64::MAX / 1000` cannot appear on a real header).
+    /// The multiply/add **wraps** on overflow, matching go-bsc's plain `uint64`
+    /// arithmetic (`Header.MilliTimestamp()` / `BlockOverrides.Apply`): an
+    /// out-of-domain seconds value (e.g. `blockOverrides.time = u64::MAX`, an
+    /// RPC-reachable input on both clients) must produce the same wrapped value
+    /// as geth. Only the `U256 -> u64` narrowing saturates — go's `Time` *is* a
+    /// `u64`, so a wider value is unrepresentable there and has no parity
+    /// baseline.
     pub fn milli_timestamp(&self) -> u64 {
         self.inner
             .timestamp
             .saturating_to::<u64>()
-            .saturating_mul(1000)
-            .saturating_add(self.milli_remainder)
+            .wrapping_mul(1000)
+            .wrapping_add(self.milli_remainder)
     }
 }
 
@@ -326,6 +331,25 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("must be less than 1000"), "unexpected message: {err}");
         assert!(err.contains("18446744073709551739"), "must report the full value: {err}");
+    }
+
+    #[test]
+    fn test_wrapping_matches_geth_u64_arithmetic() {
+        // go-bsc computes `Time*1000 + remainder` with plain `uint64` maths, so
+        // an extreme-but-RPC-reachable `blockOverrides.time = u64::MAX` wraps.
+        // (u64::MAX * 1000) mod 2^64 == 2^64 - 1000; + 123 remainder.
+        let mut e = env(SECS, REMAINDER);
+        apply(
+            &mut e,
+            BlockOverrides {
+                time: Some(u64::MAX),
+                random: Some(randao(123)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(e.milli_timestamp(), u64::MAX.wrapping_mul(1000).wrapping_add(123));
+        assert_eq!(e.milli_timestamp(), 18_446_744_073_709_550_739);
     }
 
     #[test]

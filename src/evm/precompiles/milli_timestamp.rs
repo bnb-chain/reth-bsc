@@ -42,7 +42,8 @@ fn run_milli_timestamp(
         return Ok(PrecompileOutput::halt(PrecompileHalt::OutOfGas, reservoir));
     }
 
-    let ts = if milli_timestamp == 0 { timestamp_secs.saturating_mul(1000) } else { milli_timestamp };
+    // Wrapping like go-bsc's plain `uint64` `Time*1000` fallback.
+    let ts = if milli_timestamp == 0 { timestamp_secs.wrapping_mul(1000) } else { milli_timestamp };
     let output = U256::from(ts).to_be_bytes::<32>();
     Ok(PrecompileOutput::new(MILLI_TIMESTAMP_GAS, output.to_vec().into(), reservoir))
 }
@@ -59,7 +60,12 @@ pub(crate) fn milli_timestamp_precompile(milli_remainder: u64) -> (Address, DynP
     let address = u64_to_address(0x70);
     let precompile = DynPrecompile::new_stateful(MILLI_TIMESTAMP_ID, move |input: PrecompileInput<'_>| {
         let timestamp_secs = input.internals.block_env().timestamp().saturating_to::<u64>();
-        let milli_timestamp = timestamp_secs.saturating_mul(1000).saturating_add(milli_remainder);
+        // Wrapping multiply/add: go-bsc computes the millisecond timestamp with
+        // plain `uint64` arithmetic, so RPC-reachable extreme inputs (e.g.
+        // `blockOverrides.time = u64::MAX`) must wrap identically on both
+        // clients. The `U256 -> u64` narrowing above saturates because go's
+        // seconds field is a `u64` — wider values have no parity baseline.
+        let milli_timestamp = timestamp_secs.wrapping_mul(1000).wrapping_add(milli_remainder);
         let result =
             run_milli_timestamp(milli_timestamp, timestamp_secs, input.data, input.gas, input.reservoir);
 
@@ -143,6 +149,18 @@ mod tests {
         assert_eq!(U256::from_be_slice(&output_bytes(&res)), U256::from(1_780_000_000_000u64));
     }
 
+    /// The zero-value fallback wraps like go-bsc's plain `uint64` `Time*1000`
+    /// (u64::MAX * 1000 wraps to 2^64 - 1000), never saturates.
+    #[test]
+    fn fallback_wraps_like_geth() {
+        let res = run_milli_timestamp(0, u64::MAX, &[], MILLI_TIMESTAMP_GAS, 0);
+        assert_eq!(
+            U256::from_be_slice(&output_bytes(&res)),
+            U256::from(u64::MAX.wrapping_mul(1000))
+        );
+        assert_eq!(U256::from_be_slice(&output_bytes(&res)), U256::from(18_446_744_073_709_550_616u64));
+    }
+
     /// Fixed-seed randomized coverage — the go-bsc `FuzzMilliTimestamp` equivalent
     /// (dedicated fuzz infra is deliberately not added; a deterministic seeded loop
     /// gives the same coverage in CI).
@@ -175,7 +193,7 @@ mod tests {
             assert_eq!(with_input, without_input, "iteration {i}: input must be ignored");
             assert_eq!(with_input.bytes.len(), 32);
             assert_eq!(with_input.gas_used, MILLI_TIMESTAMP_GAS);
-            let expected = if ms == 0 { secs.saturating_mul(1000) } else { ms };
+            let expected = if ms == 0 { secs.wrapping_mul(1000) } else { ms };
             assert_eq!(U256::from_be_slice(&with_input.bytes), U256::from(expected));
         }
     }
