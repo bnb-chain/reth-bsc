@@ -63,6 +63,7 @@ reth-provider = { git = "https://github.com/bnb-chain/reth.git", branch = "jenne
     "test-utils",
 ] }
 reth-rpc-eth-api = { git = "https://github.com/bnb-chain/reth.git", branch = "jenner-bep706" }
+reth-rpc-eth-types = { git = "https://github.com/bnb-chain/reth.git", branch = "jenner-bep706" }
 reth-rpc-convert = { git = "https://github.com/bnb-chain/reth.git", branch = "jenner-bep706" }
 reth-rpc-engine-api = { git = "https://github.com/bnb-chain/reth.git", branch = "jenner-bep706" }
 reth-rpc-server-types = { git = "https://github.com/bnb-chain/reth.git", branch = "jenner-bep706" }
@@ -80,7 +81,7 @@ revm-interpreter = "35.0.0"
 revm-database-interface = "11.0.0"
 
 # alloy dependencies
-alloy-evm = { version = "0.34.0", features = ["rpc"] }
+alloy-evm = { version = "0.34.0", features = ["rpc", "overrides"] }
 
 alloy-genesis = "2.0.4"
 alloy-consensus = "2.0.4"
