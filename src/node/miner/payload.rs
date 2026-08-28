@@ -72,12 +72,20 @@ pub const DELAY_LEFT_OVER: u64 = 120;
 /// - `BSC_MINING_ROOT_RESERVE_DEPTH_LOW`  (default 15) — at/below this, default reserve.
 /// - `BSC_MINING_ROOT_RESERVE_DEPTH_HIGH` (default 40) — at/above this, max reserve.
 /// - `BSC_MINING_ROOT_RESERVE_MAX_MS`     (default 280) — reserve used at/above DEPTH_HIGH.
+/// - `BSC_MINING_ROOT_RESERVE_MIN_MS`     (default [`DELAY_LEFT_OVER`]) — reserve at/below
+///   DEPTH_LOW, i.e. the floor for normal-depth blocks. Lower it to hand the extra milliseconds
+///   back to transaction filling: measured `trie_root_duration_ms` on the 3-validator benchmark
+///   cluster was p50 8ms / p99 28ms / max 46ms, so the 120ms default is ~2.6x the worst observed
+///   case there and 80% of blocks under load ended pinned at the build deadline. Clamped to
+///   `[10, reserve_max_ms]`. Raising throughput this way trades against empty-block rate — A/B it
+///   and watch `bsc_miner_effective_reserve_ms` alongside the empty/diff-1 rates.
 #[derive(Debug, Clone, Copy)]
 struct AdaptiveReserveConfig {
     enabled: bool,
     depth_low: u64,
     depth_high: u64,
     reserve_max_ms: u64,
+    reserve_min_ms: u64,
 }
 
 /// Default knob values (also the fallback when the corresponding env var is unset/unparseable).
@@ -94,11 +102,16 @@ fn adaptive_reserve_config() -> &'static AdaptiveReserveConfig {
         let enabled = std::env::var("BSC_MINING_ADAPTIVE_RESERVE")
             .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"))
             .unwrap_or(true);
+        let reserve_max_ms = env_u64("BSC_MINING_ROOT_RESERVE_MAX_MS", ROOT_RESERVE_MAX_MS);
         let cfg = AdaptiveReserveConfig {
             enabled,
             depth_low: env_u64("BSC_MINING_ROOT_RESERVE_DEPTH_LOW", ROOT_RESERVE_DEPTH_LOW),
             depth_high: env_u64("BSC_MINING_ROOT_RESERVE_DEPTH_HIGH", ROOT_RESERVE_DEPTH_HIGH),
-            reserve_max_ms: env_u64("BSC_MINING_ROOT_RESERVE_MAX_MS", ROOT_RESERVE_MAX_MS),
+            reserve_max_ms,
+            // Clamped so a typo cannot leave no room for the state root, nor invert the
+            // interpolation range.
+            reserve_min_ms: env_u64("BSC_MINING_ROOT_RESERVE_MIN_MS", DELAY_LEFT_OVER)
+                .clamp(10, reserve_max_ms),
         };
         tracing::info!(target: "bsc::miner", ?cfg, "Adaptive root-reserve config");
         cfg
@@ -112,15 +125,21 @@ fn adaptive_reserve_config() -> &'static AdaptiveReserveConfig {
 /// unaffected. The branch ordering also makes a misconfigured `depth_high <= depth_low` behave as a
 /// step at `depth_low` (no divide-by-zero).
 pub fn effective_delay_left_over(overlay_depth: u64) -> u64 {
-    let cfg = adaptive_reserve_config();
+    reserve_for_depth(adaptive_reserve_config(), overlay_depth)
+}
+
+/// Pure interpolation, split out from [`effective_delay_left_over`] so it is testable without
+/// the process-wide env cache.
+fn reserve_for_depth(cfg: &AdaptiveReserveConfig, overlay_depth: u64) -> u64 {
     if !cfg.enabled || overlay_depth <= cfg.depth_low {
-        DELAY_LEFT_OVER
+        cfg.reserve_min_ms
     } else if overlay_depth >= cfg.depth_high {
         cfg.reserve_max_ms
     } else {
         let span = (cfg.depth_high - cfg.depth_low) as f64;
         let t = (overlay_depth - cfg.depth_low) as f64 / span;
-        DELAY_LEFT_OVER + (t * cfg.reserve_max_ms.saturating_sub(DELAY_LEFT_OVER) as f64) as u64
+        cfg.reserve_min_ms
+            + (t * cfg.reserve_max_ms.saturating_sub(cfg.reserve_min_ms) as f64) as u64
     }
 }
 
@@ -2840,6 +2859,60 @@ fn finalize_payload(
 
 #[cfg(test)]
 mod tests {
+
+    use super::{reserve_for_depth, AdaptiveReserveConfig, DELAY_LEFT_OVER};
+
+    fn cfg(min_ms: u64, max_ms: u64) -> AdaptiveReserveConfig {
+        AdaptiveReserveConfig {
+            enabled: true,
+            depth_low: 15,
+            depth_high: 40,
+            reserve_max_ms: max_ms,
+            reserve_min_ms: min_ms,
+        }
+    }
+
+    #[test]
+    fn reserve_floor_defaults_to_delay_left_over() {
+        let c = cfg(DELAY_LEFT_OVER, 280);
+        assert_eq!(reserve_for_depth(&c, 0), DELAY_LEFT_OVER);
+        assert_eq!(reserve_for_depth(&c, 15), DELAY_LEFT_OVER);
+        assert_eq!(reserve_for_depth(&c, 40), 280);
+    }
+
+    #[test]
+    fn lowering_the_floor_hands_the_slot_back_to_filling() {
+        // 80% of blocks under load on the benchmark cluster ended pinned at the build deadline
+        // with trie-root p99 at 28ms, so the floor is what caps transaction filling.
+        let c = cfg(60, 280);
+        assert_eq!(reserve_for_depth(&c, 0), 60);
+        assert_eq!(reserve_for_depth(&c, 15), 60);
+        // deep overlay still gets the full reserve — the safety behaviour is unchanged
+        assert_eq!(reserve_for_depth(&c, 40), 280);
+        assert_eq!(reserve_for_depth(&c, 100), 280);
+    }
+
+    #[test]
+    fn interpolation_spans_floor_to_max_and_stays_monotonic() {
+        let c = cfg(60, 280);
+        let mid = reserve_for_depth(&c, 27);
+        assert!(mid > 60 && mid < 280, "midpoint {mid} should sit between floor and max");
+        let mut prev = 0;
+        for d in 0..=45 {
+            let r = reserve_for_depth(&c, d);
+            assert!(r >= prev, "reserve must not decrease as overlay depth grows");
+            prev = r;
+        }
+    }
+
+    #[test]
+    fn disabled_adaptive_reserve_still_honours_the_floor() {
+        let mut c = cfg(60, 280);
+        c.enabled = false;
+        assert_eq!(reserve_for_depth(&c, 0), 60);
+        assert_eq!(reserve_for_depth(&c, 100), 60, "disabled must be a fixed reserve");
+    }
+
     use super::{
         bid_block_broadcast_delay, initial_out_of_turn_build_wait, local_rebuild_action,
         refresh_and_reseal_bid_block, send_bid_block_after_delay, validate_bsc_sidecar,
