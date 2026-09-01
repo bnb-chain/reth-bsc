@@ -387,10 +387,11 @@ impl Stream for BscProtocolConnection {
 mod tests {
     use super::*;
     use crate::consensus::parlia::{
+        bls_signer::BlsVoteSigner,
         vote::{VoteData, VoteEnvelope},
         votes,
     };
-    use alloy_primitives::{FixedBytes, B256};
+    use alloy_primitives::B256;
 
     /// `ProtocolConnection` has no public constructor, so these tests drive
     /// [`BscProtocolConnection::dispatch`] directly. That is the function the
@@ -410,19 +411,22 @@ mod tests {
         frame_of(BscCapPacket { protocol_version, extra: Bytes::from_static(&[0x00u8]) })
     }
 
-    /// A synthetic vote. Signature/address are never verified on this path, and
-    /// `target_number` is kept high so vote-pool pruning cannot evict it.
+    /// A genuinely signed vote: the pool authenticates the BLS signature before
+    /// admitting anything, so a synthetic one would be dropped and this test
+    /// would no longer prove the frame was dispatched. `target_number` is kept
+    /// high so vote-pool pruning cannot evict it.
     fn vote(target_number: u64, target_hash: B256) -> VoteEnvelope {
-        VoteEnvelope {
-            vote_address: FixedBytes::<48>::repeat_byte(0xab),
-            signature: FixedBytes::<96>::repeat_byte(0xcd),
-            data: VoteData {
+        let mut raw = [0u8; 32];
+        raw[31] = 1;
+        let signer = BlsVoteSigner::new_from_bytes(raw).expect("create bls signer");
+        signer
+            .sign_vote(VoteData {
                 source_number: target_number - 1,
                 source_hash: B256::repeat_byte(0x11),
                 target_number,
                 target_hash,
-            },
-        }
+            })
+            .expect("sign vote")
     }
 
     // === The bsc#3737 peer generation ===

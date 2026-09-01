@@ -245,7 +245,40 @@ fn update_vote_pool_size_metric(size: usize) {
 }
 
 /// Insert a single vote into the pool (deduplicated by hash).
+///
+/// The vote's BLS signature is authenticated first: pool contents drive both
+/// finality notification and vote-attestation assembly, and votes reach here
+/// straight off the wire with nothing else checking them. Mirrors go-bsc's
+/// `basicVerify` -> `VoteEnvelope.Verify` (`core/vote/vote_pool.go`).
 pub fn put_vote(vote: VoteEnvelope) {
+    VOTE_METRICS.bls_verifications_total.increment(1);
+    let started = std::time::Instant::now();
+    let verified = crate::consensus::parlia::bls_signer::verify_vote_envelope(&vote);
+    VOTE_METRICS.bls_verification_duration_seconds.record(started.elapsed().as_secs_f64());
+
+    if let Err(e) = verified {
+        VOTE_METRICS.bls_verification_failures_total.increment(1);
+        tracing::debug!(
+            target: "bsc::vote_pool",
+            vote_address = %vote.vote_address,
+            target_number = vote.data.target_number,
+            error = %e,
+            "rejecting vote with invalid BLS signature",
+        );
+        return;
+    }
+
+    put_vote_inner(vote);
+}
+
+/// Test-only ingress that skips signature verification, for tests exercising
+/// pool/finality bookkeeping with synthetic vote addresses.
+#[cfg(test)]
+pub fn put_vote_unchecked(vote: VoteEnvelope) {
+    put_vote_inner(vote);
+}
+
+fn put_vote_inner(vote: VoteEnvelope) {
     let target_hash = vote.data.target_hash;
 
     // Get pending block number for malicious vote detection scope
@@ -413,6 +446,7 @@ fn maybe_notify_finality(target_hash: B256, votes_for_block: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::consensus::parlia::bls_signer::BlsVoteSigner;
     use crate::consensus::parlia::vote::{VoteAddress, VoteData, VoteEnvelope, VoteSignature};
     use alloy_primitives::B256;
 
@@ -441,9 +475,11 @@ mod tests {
         let target_hash = B256::from([0x11; 32]);
         let other_target_hash = B256::from([0x22; 32]);
 
-        put_vote(vote_with_source(target_hash, 10, 1));
-        put_vote(vote_with_source(target_hash, 11, 2));
-        put_vote(vote_with_source(other_target_hash, 10, 3));
+        // Synthetic vote addresses/signatures: bypass BLS verification, which is
+        // covered separately by `put_vote_rejects_invalid_signature`.
+        put_vote_unchecked(vote_with_source(target_hash, 10, 1));
+        put_vote_unchecked(vote_with_source(target_hash, 11, 2));
+        put_vote_unchecked(vote_with_source(other_target_hash, 10, 3));
 
         let all_for_target = fetch_vote_by_block_hash(target_hash);
         assert_eq!(all_for_target.len(), 2);
@@ -461,4 +497,66 @@ mod tests {
 
         let _ = drain();
     }
+
+    /// A vote reaching the pool is authenticated: pool contents drive finality
+    /// notification and attestation assembly, and nothing between the wire and
+    /// here checks them. See go-bsc `basicVerify` -> `VoteEnvelope.Verify`.
+    #[test]
+    fn put_vote_rejects_unauthenticated_votes() {
+        let _ = drain();
+
+        let mut raw = [0u8; 32];
+        raw[31] = 1;
+        let signer = BlsVoteSigner::new_from_bytes(raw).expect("create bls signer");
+
+        let data = VoteData {
+            source_number: 10,
+            source_hash: B256::from([0xaa; 32]),
+            target_number: 100,
+            target_hash: B256::from([0xbb; 32]),
+        };
+        let genuine = signer.sign_vote(data).expect("sign vote");
+
+        // Baseline: a correctly signed vote is admitted.
+        put_vote(genuine.clone());
+        assert_eq!(fetch_vote_by_block_hash(data.target_hash).len(), 1, "genuine vote rejected");
+
+        // Undecodable signature under a real validator's address. Before
+        // verification existed this reached attestation assembly and panicked
+        // in `Signature::from_bytes(..).unwrap()`.
+        put_vote(VoteEnvelope {
+            signature: VoteSignature::from([0x42u8; 96]),
+            ..genuine.clone()
+        });
+        assert_eq!(
+            fetch_vote_by_block_hash(data.target_hash).len(),
+            1,
+            "vote with undecodable signature was admitted",
+        );
+
+        // Well-formed signature by the same key, but over different vote data:
+        // decodes cleanly, so only real verification catches it.
+        let other = VoteData { target_number: 101, ..data };
+        let mismatched = signer.sign_vote(other).expect("sign vote").signature;
+        put_vote(VoteEnvelope { signature: mismatched, ..genuine.clone() });
+        assert_eq!(
+            fetch_vote_by_block_hash(data.target_hash).len(),
+            1,
+            "vote signed over different data was admitted",
+        );
+
+        // Signature valid in isolation, but attributed to another validator.
+        put_vote(VoteEnvelope {
+            vote_address: VoteAddress::from([0x07u8; 48]),
+            ..genuine
+        });
+        assert_eq!(
+            fetch_vote_by_block_hash(data.target_hash).len(),
+            1,
+            "vote under a mismatched vote address was admitted",
+        );
+
+        let _ = drain();
+    }
+
 }
