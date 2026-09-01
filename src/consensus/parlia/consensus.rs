@@ -46,7 +46,7 @@ fn apply_mining_delay_with_leftover(
     mut delay_ms: u64,
     period_ms: u64,
     last_block_in_turn: bool,
-    first_block_in_turn: bool,
+    enforce_min_delay: bool,
     left_over_ms: u64,
 ) -> u64 {
     if left_over_ms >= period_ms {
@@ -68,10 +68,15 @@ fn apply_mining_delay_with_leftover(
         delay_ms = time_for_mining_ms;
     }
 
-    // For the first block in a turn, a minimum 50ms delay is enforced so the block
-    // is not empty — validator switches require re-execution and root recomputation,
-    // leaving very little time for transaction inclusion.
-    if delay_ms == 0 && first_block_in_turn {
+    // A zero window makes the payload job return immediately with an empty candidate, and on
+    // BSC an empty block carries no system transaction, so peers reject it
+    // (`BscBlockValidationError::UnexpectedSystemTx`). This is not limited to validator
+    // switches: after any stall the parent timestamp is old enough that `delay_ms` collapses
+    // to 0 for ORDINARY in-turn blocks too, and the validator then seals invalid empty blocks
+    // that the network refuses — with `turn_length = 16` that is 15 blocks in 16, and the chain
+    // cannot restart on its own. Every locally built block therefore gets a floor; bid
+    // simulation passes `false` because it only re-executes an already-built bid.
+    if delay_ms == 0 && enforce_min_delay {
         delay_ms = 50;
     }
 
@@ -602,17 +607,18 @@ where
     /// - Applies `left_over_ms` reservation for finalization work.
     /// - Caps blocking time to `period / 5` when last block in turn to reserve
     ///   time for trie root computation; otherwise a full period.
-    /// - Ensures first block in turn gets at least 50ms for transaction inclusion.
+    /// - Ensures every locally built block gets at least 50ms for transaction inclusion, so a
+    ///   stale parent can never produce an empty (and therefore invalid) block.
     pub fn delay_for_mining(&self, snap: &Snapshot, header: &Header, left_over_ms: u64) -> u64 {
         let period_ms = snap.block_interval;
         let last_block_in_turn = snap.last_block_in_one_turn(header.number);
-        let first_block_in_turn = snap.first_block_in_one_turn(header.number);
         let delay_ms = self.delay_for_ramanujan_fork(snap, header);
         apply_mining_delay_with_leftover(
             delay_ms,
             period_ms,
             last_block_in_turn,
-            first_block_in_turn,
+            // Locally built blocks always need a non-zero window, not just the first of a turn.
+            true,
             left_over_ms,
         )
     }
@@ -1027,20 +1033,33 @@ mod tests {
     }
 
     #[test]
-    fn mining_delay_first_block_in_turn_gets_minimum_50ms() {
-        // first_block_in_turn: left_over (600) >= delay (500), so delay = 0,
-        // then first_block_in_turn minimum kicks in: result is 50.
+    fn mining_delay_floor_applies_when_the_window_is_fully_consumed() {
+        // left_over (600) >= delay (500), so delay = 0, then the floor kicks in: result is 50.
         assert_eq!(apply_mining_delay_with_leftover(500, 3000, false, true, 600), 50);
     }
 
     #[test]
+    fn mining_delay_floor_covers_ordinary_in_turn_blocks_not_just_the_first() {
+        // Regression, observed 2026-08-26 on a 3-validator net with turn_length=16: after a
+        // stall the parent timestamp is old, so the raw delay is already 0. The floor used to
+        // be gated on `first_block_in_turn`, leaving 15 blocks in 16 with a ZERO build window;
+        // the payload job then returned an empty candidate, and an empty BSC block carries no
+        // system transaction, so peers rejected it with `UnexpectedSystemTx`. The validator
+        // re-entered the same path every ~3s, signing a different block for the same height.
+        assert_eq!(apply_mining_delay_with_leftover(0, 450, false, true, 0), 50);
+        // Same for the last block of a turn, where the period/5 cap also applies.
+        assert_eq!(apply_mining_delay_with_leftover(0, 450, true, true, 0), 50);
+    }
+
+    #[test]
     fn bid_simulation_delay_ignores_turn_position() {
-        // Bid simulation passes last/first_block_in_turn as false regardless of
+        // Bid simulation passes last_block_in_turn/enforce_min_delay as false regardless of
         // the actual turn position (go-bsc PR #3669): a last-in-turn block gets
         // the full period cap (2500 - 100 = 2400, under the 3000 cap) instead of
         // being squeezed to period/5 = 600 like local mining.
         assert_eq!(apply_mining_delay_with_leftover(2500, 3000, false, false, 100), 2400);
-        // And no 50ms floor: fully consumed delay stays 0.
+        // And no floor: bid simulation only re-executes an already-built bid, so a fully
+        // consumed delay legitimately stays 0.
         assert_eq!(apply_mining_delay_with_leftover(500, 3000, false, false, 600), 0);
     }
 }

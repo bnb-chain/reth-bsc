@@ -1929,6 +1929,9 @@ mod tests {
         let mut provider = MockProvider::new();
         let header = Header { number: local_tip, ..Default::default() };
         provider.insert(header, U256::from(1));
+        // "TD unknown" is produced by the provider, not the engine: since v2.5 fork choice resolves
+        // TD through `header_td`, and this mock holds only `local_tip`, both the incoming fork
+        // block's hash and its parent's answer `Ok(None)` — the case that used to wedge the head.
         let chain_spec =
             Arc::new(crate::chainspec::BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet()));
 
@@ -1986,6 +1989,116 @@ mod tests {
         timeout: tokio::time::Duration,
     ) -> Option<ForkchoiceState> {
         tokio::time::timeout(timeout, fcu_rx.recv()).await.ok().flatten()
+    }
+
+    /// Like [`spawn_service_with_tip`], but the provider cannot resolve the incoming block's TD.
+    /// Since v2.5 fork choice reads TD via `header_td` rather than asking the engine, "TD unknown"
+    /// is what a real node sees for a fork whose divergence point lies below the persisted tip.
+    async fn spawn_service_with_td_unknown(
+        local_tip: u64,
+    ) -> (ImportHandle, mpsc::UnboundedReceiver<ForkchoiceState>, mpsc::UnboundedReceiver<()>) {
+        let mut provider = MockProvider::new();
+        let header = Header { number: local_tip, ..Default::default() };
+        provider.insert(header, U256::from(1));
+        let chain_spec =
+            Arc::new(crate::chainspec::BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet()));
+
+        let (to_engine, mut from_engine) = mpsc::unbounded_channel();
+        let engine_handle = ConsensusEngineHandle::new(to_engine);
+
+        let (fcu_tx, fcu_rx) = mpsc::unbounded_channel();
+        let (np_tx, np_rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(message) = from_engine.recv().await {
+                match message {
+                    BeaconEngineMessage::NewPayload { payload: _, tx } => {
+                        let _ = np_tx.send(());
+                        let _ = tx.send(Ok(PayloadStatus::new(PayloadStatusEnum::Valid, None)));
+                    }
+                    BeaconEngineMessage::ForkchoiceUpdated { state, payload_attrs: _, tx } => {
+                        let _ = fcu_tx.send(state);
+                        let _ = tx.send(Ok(OnForkChoiceUpdated::valid(PayloadStatus::new(
+                            PayloadStatusEnum::Valid,
+                            None,
+                        ))));
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let (to_import, from_network) = mpsc::unbounded_channel();
+        let (_to_import_mined, from_builder) = mpsc::unbounded_channel();
+        let (_to_import_bid, from_bid_block) = mpsc::unbounded_channel();
+        let (to_hashes, from_hashes) = mpsc::unbounded_channel();
+        let (to_network, import_outcome) = mpsc::unbounded_channel();
+        let handle = ImportHandle::new(to_import, to_hashes, import_outcome);
+
+        let service = ImportService::new(
+            provider,
+            chain_spec,
+            engine_handle,
+            from_network,
+            from_builder,
+            from_bid_block,
+            from_hashes,
+            to_network,
+        );
+        tokio::spawn(Box::pin(async move {
+            service.await.unwrap();
+        }));
+
+        (handle, fcu_rx, np_rx)
+    }
+
+    /// Builds a test block message at `number`.
+    fn create_test_block_at(number: u64) -> NewBlockMessage<BscNewBlock> {
+        let block = BscBlock {
+            header: Header { number, ..Default::default() },
+            body: BscBlockBody {
+                inner: BlockBody {
+                    transactions: Vec::new(),
+                    ommers: Vec::new(),
+                    withdrawals: None,
+                },
+                sidecars: None,
+            },
+        };
+        let new_block = BscNewBlock(NewBlock { block, td: U128::from(1) });
+        let hash = new_block.0.block.header.hash_slow();
+        NewBlockMessage { hash, block: Arc::new(new_block) }
+    }
+
+    /// Regression test for the unrecoverable-fork wedge (QA net, 2026-07-28).
+    ///
+    /// A node whose persisted tip sits on a branch below the fork point cannot resolve the TD of
+    /// any incoming majority-chain block. Before the fix, `head_choice_with_td` turned that into
+    /// `UnknownTotalDifficulty`, `update_forkchoice` returned `Err`, and **no forkchoice update
+    /// was ever sent** — freezing the canonical head, which kept the DB on the losing branch,
+    /// which kept the TD unresolvable. Four validators stayed dead for an entire run while
+    /// reporting themselves healthy.
+    ///
+    /// This asserts the loop-level property the unit tests cannot: an FCU is actually emitted,
+    /// and it targets the incoming block rather than the stale local tip.
+    #[tokio::test]
+    async fn unresolvable_td_still_emits_forkchoice_update() {
+        // Local tip 63 and incoming 653 mirror the production incident.
+        let (handle, mut fcu_rx, _np_rx) = spawn_service_with_td_unknown(63).await;
+
+        let block = create_test_block_at(653);
+        let expected_head = block.hash;
+        handle.send_block(block, PeerId::random()).unwrap();
+
+        let state = recv_fcu_within(&mut fcu_rx, tokio::time::Duration::from_secs(5))
+            .await
+            .expect(
+                "a forkchoice update must be emitted even when the incoming TD is unresolvable; \
+                 without one the canonical head can never advance and the node is wedged",
+            );
+        assert_eq!(
+            state.head_block_hash, expected_head,
+            "the forkchoice update must target the incoming block, not the stale local tip"
+        );
     }
 
     #[tokio::test]

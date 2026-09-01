@@ -1,7 +1,11 @@
-use crate::{chainspec::BscChainSpec, hardforks::BscHardforks};
+use crate::{chainspec::BscChainSpec, hardforks::BscHardforks, metrics::BscConsensusMetrics};
 use alloy_consensus::Header;
 use alloy_primitives::U256;
+use once_cell::sync::Lazy;
 use std::{sync::Arc, cmp::Ordering};
+
+/// Metrics for fork-choice decisions taken without a resolvable total difficulty.
+static FORKCHOICE_METRICS: Lazy<BscConsensusMetrics> = Lazy::new(BscConsensusMetrics::default);
 
 /// Header with additional fork choice metadata.
 ///
@@ -145,12 +149,35 @@ impl BscForkChoiceRule {
         incoming: &HeaderForForkchoice,
         current: &HeaderForForkchoice,
     ) -> Result<bool, crate::consensus::ParliaConsensusErr> {
-        let current_td = current.td.ok_or(
-            crate::consensus::ParliaConsensusErr::UnknownTotalDifficulty(current.header.hash_slow(), current.header.number)
-        )?;
-        let incoming_td = incoming.td.ok_or(
-            crate::consensus::ParliaConsensusErr::UnknownTotalDifficulty(incoming.header.hash_slow(), incoming.header.number)
-        )?;
+        // An unresolvable TD must never abort the decision. Erroring here returns `Err` all the
+        // way out of `update_forkchoice`, so no forkchoice update is ever sent; the canonical
+        // head then stays pinned to `current`, which is precisely what makes the TD
+        // unresolvable in the first place (the persisted chain keeps the losing branch). That
+        // feedback loop is unrecoverable — see `td_unknown_prefers_higher_descendant` and the
+        // upstream `query_header_with_td` deep-fork gap.
+        //
+        // Fall back to height instead: only a STRICTLY higher block may win. That is
+        // conservative in the direction that matters — we never reorg to a sibling or to a
+        // lower block on the strength of missing information, and every candidate reaching
+        // here has already passed full payload validation (the block-import path only calls
+        // fork choice after `PayloadStatusEnum::Valid`), so it is a real, executed chain.
+        let (Some(current_td), Some(incoming_td)) = (current.td, incoming.td) else {
+            let reorg = incoming.header.number > current.header.number;
+            FORKCHOICE_METRICS.td_unknown_fallbacks_total.increment(1);
+            tracing::warn!(
+                target: "bsc::forkchoice",
+                incoming_number = incoming.header.number,
+                incoming_hash = ?incoming.header.hash_slow(),
+                incoming_td = ?incoming.td,
+                current_number = current.header.number,
+                current_hash = ?current.header.hash_slow(),
+                current_td = ?current.td,
+                reorg,
+                "Total difficulty unresolvable; deciding fork choice by height. Persistent \
+                 occurrences mean this node's persisted tip is on a branch below the fork point"
+            );
+            return Ok(reorg);
+        };
 
         tracing::debug!(
             target: "bsc::forkchoice",
@@ -347,5 +374,113 @@ mod tests {
                 curr_num, curr_tgt, inc_num, inc_tgt, should_reorg, result
             );
         }
+    }
+
+    /// Control case: when the incoming TD is known, fork choice decides normally.
+    ///
+    /// Numbers mirror the 2026-07-28 QA-net incident so this sits directly alongside
+    /// `unknown_incoming_td_must_not_wedge_forkchoice` below: stale local head 63 at
+    /// TD 106, incoming majority-chain block 653. This passes on current code.
+    #[test]
+    fn known_incoming_td_decides_normally() {
+        let chain_spec = Arc::new(crate::chainspec::BscChainSpec::from(bsc_qanet()));
+        let rule = BscForkChoiceRule::new(chain_spec);
+
+        let current_header = Header { number: 63, ..Default::default() };
+        let incoming_header = Header { number: 653, ..Default::default() };
+
+        let current = HeaderForForkchoice::new(&current_header, Some(U256::from(106)), 0);
+        let incoming = HeaderForForkchoice::new(&incoming_header, Some(U256::from(1200)), 0);
+
+        assert!(
+            rule.is_need_reorg(&incoming, &current).unwrap(),
+            "higher known TD must win"
+        );
+    }
+
+    /// Reproduces the 2026-07-28 QA-net validator wedge.
+    ///
+    /// Background: four reth-bsc validators lost an equal-TD tie at block 61 and
+    /// persisted their own branch to block 63. Because the fork point (61) sits more
+    /// than one block below the persisted tip (63), upstream `query_header_with_td`
+    /// walks the in-memory fork, fails to reach a canonical ancestor, and returns
+    /// `Ok((header, None))` — "TD unknown" — for every incoming majority-chain block.
+    ///
+    /// `head_choice_with_td` then hard-errors `UnknownTotalDifficulty`, so
+    /// `update_forkchoice` returns `Err` and never issues a forkchoice update. The
+    /// provider's canonical head stays at 63 forever, which means the DB can never
+    /// reorg off the losing branch, which means the TD stays unresolvable. The node
+    /// keeps validating the majority chain in memory and reports itself healthy while
+    /// being permanently unable to rejoin — and its miner idles, because it evaluates
+    /// `sign_recently` against the frozen tip where it had already signed.
+    ///
+    /// The primary assertion is that fork choice must not *abort* on an unresolvable
+    /// TD. The second assertion encodes the proposed policy (a strictly
+    /// higher-numbered block wins when its TD cannot be resolved); reviewers may want
+    /// to debate that policy without weakening the first assertion.
+    ///
+    #[test]
+    fn unknown_incoming_td_must_not_wedge_forkchoice() {
+        let chain_spec = Arc::new(crate::chainspec::BscChainSpec::from(bsc_qanet()));
+        let rule = BscForkChoiceRule::new(chain_spec);
+
+        // Local head: the losing branch's persisted tip, TD as observed in the incident.
+        let current_header = Header { number: 63, ..Default::default() };
+        // Incoming: a majority-chain block whose TD the engine could not resolve.
+        let incoming_header = Header { number: 653, ..Default::default() };
+
+        let current = HeaderForForkchoice::new(&current_header, Some(U256::from(106)), 0);
+        let incoming = HeaderForForkchoice::new(&incoming_header, None, 0);
+
+        let decision = rule.is_need_reorg(&incoming, &current);
+
+        assert!(
+            decision.is_ok(),
+            "unresolvable incoming TD must not abort fork choice — aborting pins the \
+             canonical head to the stale tip and the node can never rejoin; got {:?}",
+            decision.err()
+        );
+        assert!(
+            decision.unwrap(),
+            "a strictly higher-numbered block must win when its TD cannot be resolved"
+        );
+    }
+
+    /// The height fallback must stay conservative: unresolvable TD is not a licence to reorg
+    /// onto a sibling or a shorter branch.
+    #[test]
+    fn td_unknown_never_reorgs_to_equal_or_lower_height() {
+        let chain_spec = Arc::new(crate::chainspec::BscChainSpec::from(bsc_qanet()));
+        let rule = BscForkChoiceRule::new(chain_spec);
+
+        let current_header = Header { number: 100, ..Default::default() };
+        let current = HeaderForForkchoice::new(&current_header, Some(U256::from(200)), 0);
+
+        for incoming_number in [99u64, 100] {
+            let incoming_header = Header { number: incoming_number, ..Default::default() };
+            let incoming = HeaderForForkchoice::new(&incoming_header, None, 0);
+            assert!(
+                !rule.is_need_reorg(&incoming, &current).unwrap(),
+                "must not reorg to height {incoming_number} against current height 100 with TD unknown"
+            );
+        }
+    }
+
+    /// The fallback applies whichever side is unresolvable — a stale local head whose own TD
+    /// cannot be read must not abort the decision either.
+    #[test]
+    fn td_unknown_on_current_side_also_falls_back() {
+        let chain_spec = Arc::new(crate::chainspec::BscChainSpec::from(bsc_qanet()));
+        let rule = BscForkChoiceRule::new(chain_spec);
+
+        let current_header = Header { number: 63, ..Default::default() };
+        let incoming_header = Header { number: 653, ..Default::default() };
+
+        let current = HeaderForForkchoice::new(&current_header, None, 0);
+        let incoming = HeaderForForkchoice::new(&incoming_header, Some(U256::from(1200)), 0);
+
+        let decision = rule.is_need_reorg(&incoming, &current);
+        assert!(decision.is_ok(), "unresolvable current TD must not abort; got {:?}", decision.err());
+        assert!(decision.unwrap(), "higher incoming block must win");
     }
 }
