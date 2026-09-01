@@ -18,6 +18,59 @@ const PENDING_REQ_TTL: Duration = Duration::from_secs(15);
 /// Minimum interval between pending-request pruning passes
 const PRUNE_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Inbound votes a single peer may send us per second, mirroring go-bsc's
+/// `receiveRateLimitPerSecond` (`eth/protocols/bsc/peer.go`). 21 validators each
+/// produce one vote per block interval, so ~47/s is the natural ceiling; go-bsc
+/// sets 68 to leave headroom.
+const VOTE_RECEIVE_RATE_LIMIT_PER_SECOND: u32 = 68;
+/// Length of one vote-accounting period (go-bsc's `secondsPerPeriod`).
+const VOTE_RATE_LIMIT_PERIOD: Duration = Duration::from_secs(30);
+/// Total inbound votes a peer may send us within one period.
+const VOTE_RATE_LIMIT_PER_PERIOD: u32 =
+    VOTE_RECEIVE_RATE_LIMIT_PER_SECOND * VOTE_RATE_LIMIT_PERIOD.as_secs() as u32;
+
+/// Per-peer inbound vote budget over a tumbling window.
+///
+/// Ports go-bsc's `Peer.IsOverLimitAfterReceivingVotes`, including its two
+/// quirks: the window is tumbling rather than sliding, and the packet that rolls
+/// the window is not charged against the new period.
+#[derive(Debug)]
+struct VoteRateLimiter {
+    period_begin: std::time::Instant,
+    period_counter: u32,
+}
+
+impl VoteRateLimiter {
+    fn new() -> Self {
+        Self { period_begin: std::time::Instant::now(), period_counter: 0 }
+    }
+
+    /// Charges `n` received votes against this peer's budget and reports whether
+    /// the peer has exceeded it.
+    ///
+    /// `n` is the number of votes the peer *sent*, not the number we admit. That
+    /// matches go-bsc's `handleVotes`, which charges `len(ann.Votes)` so the
+    /// limit bounds what a peer can push at us rather than what we happen to
+    /// consume.
+    fn is_over_limit_after_receiving(&mut self, n: u32) -> bool {
+        if self.period_begin.elapsed() >= VOTE_RATE_LIMIT_PERIOD {
+            self.period_begin = std::time::Instant::now();
+            self.period_counter = 0;
+            return false;
+        }
+        self.period_counter = self.period_counter.saturating_add(n);
+        self.period_counter > VOTE_RATE_LIMIT_PER_PERIOD
+    }
+
+    /// Backdates the period so the next charge rolls the window.
+    #[cfg(test)]
+    fn force_period_expiry(&mut self) {
+        self.period_begin = std::time::Instant::now()
+            .checked_sub(VOTE_RATE_LIMIT_PERIOD)
+            .expect("machine uptime exceeds one accounting period");
+    }
+}
+
 use super::protocol::proto::BscProtoMessageId;
 use crate::node::network::blocks_by_range::{
     build_blocks_by_range_response, BlocksByRangePacket, GetBlocksByRangePacket,
@@ -60,6 +113,8 @@ pub struct BscProtocolConnection {
     _peer_id: Option<PeerId>,
     /// Last time we pruned pending requests
     last_prune: std::time::Instant,
+    /// Inbound vote budget for this peer
+    vote_rate_limiter: VoteRateLimiter,
 }
 
 impl BscProtocolConnection {
@@ -89,6 +144,7 @@ impl BscProtocolConnection {
             proto_version,
             _peer_id: peer_id,
             last_prune: std::time::Instant::now(),
+            vote_rate_limiter: VoteRateLimiter::new(),
         }
     }
 
@@ -222,7 +278,13 @@ impl BscProtocolConnection {
     /// exercised without a [`ProtocolConnection`], which has no public
     /// constructor.
     fn handle_protocol_message(&mut self, frame: &BytesMut) -> Option<BytesMut> {
-        Self::dispatch(frame, &mut self.pending_range_reqs, self._peer_id, self.proto_version)
+        Self::dispatch(
+            frame,
+            &mut self.pending_range_reqs,
+            self._peer_id,
+            self.proto_version,
+            &mut self.vote_rate_limiter,
+        )
     }
 
     /// Route one inbound frame by message id, returning a frame to send back if
@@ -240,6 +302,7 @@ impl BscProtocolConnection {
         pending_range_reqs: &mut PendingRangeReqs,
         peer_id: Option<PeerId>,
         proto_version: u64,
+        vote_rate_limiter: &mut VoteRateLimiter,
     ) -> Option<BytesMut> {
         let slice = frame.as_ref();
         let msg_id = slice[0];
@@ -258,6 +321,17 @@ impl BscProtocolConnection {
                 match VotesPacket::decode(&mut &slice[..]) {
                     Ok(packet) => {
                         let count = packet.0.len();
+                        let charged = u32::try_from(count).unwrap_or(u32::MAX);
+                        if vote_rate_limiter.is_over_limit_after_receiving(charged) {
+                            tracing::debug!(
+                                target: "bsc_protocol",
+                                peer = ?peer_id,
+                                count,
+                                period_total = vote_rate_limiter.period_counter,
+                                "peer exceeded its inbound vote budget, dropping packet",
+                            );
+                            return None;
+                        }
                         handle_votes_broadcast(packet);
                         tracing::trace!(target: "bsc_protocol", count, "Processed votes packet");
                         None
@@ -397,8 +471,12 @@ mod tests {
     /// [`BscProtocolConnection::dispatch`] directly. That is the function the
     /// deleted handshake gate used to sit in front of.
     fn dispatch(frame: &BytesMut) -> Option<BytesMut> {
+        dispatch_with_limiter(frame, &mut VoteRateLimiter::new())
+    }
+
+    fn dispatch_with_limiter(frame: &BytesMut, limiter: &mut VoteRateLimiter) -> Option<BytesMut> {
         let mut pending = HashMap::new();
-        BscProtocolConnection::dispatch(frame, &mut pending, None, 2)
+        BscProtocolConnection::dispatch(frame, &mut pending, None, 2, limiter)
     }
 
     fn frame_of(msg: impl Encodable) -> BytesMut {
@@ -505,7 +583,8 @@ mod tests {
         pending.insert(7u64, (tx, std::time::Instant::now()));
 
         let frame = frame_of(BlocksByRangePacket { request_id: 7, blocks: Vec::new() });
-        let reply = BscProtocolConnection::dispatch(&frame, &mut pending, None, 2);
+        let reply =
+            BscProtocolConnection::dispatch(&frame, &mut pending, None, 2, &mut VoteRateLimiter::new());
 
         assert!(reply.is_none(), "a range response needs no reply");
         assert!(pending.is_empty(), "the waiter must be consumed");
@@ -531,4 +610,66 @@ mod tests {
         let decoded = BscCapPacket::decode(&mut &encoded[..]).expect("must round-trip");
         assert_eq!(decoded.protocol_version, 2);
     }
+
+    // === G1: per-peer inbound vote budget (go-bsc receiveRateLimitPerSecond) ===
+
+    #[test]
+    fn vote_budget_matches_go_bsc() {
+        // 68 votes/s over a 30s period => 2040, the value go-bsc compares against.
+        assert_eq!(VOTE_RATE_LIMIT_PER_PERIOD, 2040);
+    }
+
+    #[test]
+    fn vote_rate_limiter_admits_exactly_the_budget() {
+        let mut l = VoteRateLimiter::new();
+        assert!(!l.is_over_limit_after_receiving(VOTE_RATE_LIMIT_PER_PERIOD), "budget itself must pass");
+        assert!(l.is_over_limit_after_receiving(1), "one vote past the budget must trip");
+    }
+
+    #[test]
+    fn vote_rate_limiter_accumulates_across_packets() {
+        let mut l = VoteRateLimiter::new();
+        for _ in 0..(VOTE_RATE_LIMIT_PER_PERIOD / 68) {
+            assert!(!l.is_over_limit_after_receiving(68));
+        }
+        assert!(l.is_over_limit_after_receiving(1), "budget is per period, not per packet");
+    }
+
+    /// go-bsc resets the counter and returns false when the period has elapsed,
+    /// without charging the packet that rolled the window. Ported deliberately.
+    #[test]
+    fn vote_rate_limiter_rolls_the_window_uncharged() {
+        let mut l = VoteRateLimiter::new();
+        assert!(l.is_over_limit_after_receiving(VOTE_RATE_LIMIT_PER_PERIOD + 1));
+
+        l.force_period_expiry();
+        assert!(!l.is_over_limit_after_receiving(VOTE_RATE_LIMIT_PER_PERIOD + 1), "window roll allows");
+        assert_eq!(l.period_counter, 0, "the rolling packet is not charged");
+        assert!(!l.is_over_limit_after_receiving(VOTE_RATE_LIMIT_PER_PERIOD), "fresh budget");
+    }
+
+    /// A peer over budget has its packet dropped before the vote reaches the pool.
+    #[test]
+    fn over_budget_votes_packet_never_reaches_the_pool() {
+        let target_hash = B256::repeat_byte(0x7c);
+        let mut limiter = VoteRateLimiter::new();
+        assert!(limiter.is_over_limit_after_receiving(VOTE_RATE_LIMIT_PER_PERIOD + 1));
+
+        let before = votes::len();
+        let reply = dispatch_with_limiter(
+            &frame_of(VotesPacket(vec![vote(30_000_100, target_hash)])),
+            &mut limiter,
+        );
+        assert!(reply.is_none(), "a votes frame needs no reply");
+        assert_eq!(votes::len(), before, "over-budget packet must not be ingested");
+
+        // Once the window rolls, the same peer is served again.
+        limiter.force_period_expiry();
+        let _ = dispatch_with_limiter(
+            &frame_of(VotesPacket(vec![vote(30_000_100, target_hash)])),
+            &mut limiter,
+        );
+        assert_eq!(votes::len(), before + 1, "peer must be served after the window rolls");
+    }
+
 }
