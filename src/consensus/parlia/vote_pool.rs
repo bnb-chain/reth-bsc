@@ -23,6 +23,9 @@ use crate::shared;
 use std::time::SystemTime;
 
 const LOWER_LIMIT_OF_VOTE_BLOCK_NUMBER: u64 = 256;
+/// How far above our head a vote may target, mirroring go-bsc's
+/// `upperLimitOfVoteBlockNumber` (itself derived from `fetcher.maxUncleDist`).
+pub(crate) const UPPER_LIMIT_OF_VOTE_BLOCK_NUMBER: u64 = 11;
 /// Envelope hashes to remember as rejected. ~32 B each, so a few hundred KB.
 const REJECTED_VOTE_CACHE_SIZE: usize = 8192;
 /// Size of the LRU cache for tracking finality notifications (matches geth's finalizedNotified)
@@ -260,6 +263,28 @@ fn update_vote_pool_size_metric(size: usize) {
     VOTE_METRICS.current_votes_count.set(size as f64);
 }
 
+/// Whether a vote targeting `target_number` falls inside the admission window
+/// `(head - 256, head + 11]`, matching go-bsc's `putIntoVotePool`.
+///
+/// Without an upper bound a peer can park votes for arbitrarily distant future
+/// heights in the pool, where nothing prunes them: `prune` only evicts by the
+/// lower bound, so far-future entries are unreachable by it.
+///
+/// `head` is `None` before the canonical-head accessor is registered during
+/// startup. Votes are admitted in that case rather than rejected: treating an
+/// unknown head as height 0 would discard every vote whose target exceeds 11.
+fn is_within_admission_window(target_number: BlockNumber, head: Option<BlockNumber>) -> bool {
+    let Some(head) = head else {
+        return true;
+    };
+    // Saturating throughout: `target_number` is attacker-supplied, and a plain
+    // add would overflow-panic in debug builds on a crafted value.
+    if target_number.saturating_add(LOWER_LIMIT_OF_VOTE_BLOCK_NUMBER - 1) < head {
+        return false;
+    }
+    target_number <= head.saturating_add(UPPER_LIMIT_OF_VOTE_BLOCK_NUMBER)
+}
+
 /// Insert a single vote into the pool (deduplicated by hash).
 ///
 /// The vote's BLS signature is authenticated first: pool contents drive both
@@ -267,6 +292,21 @@ fn update_vote_pool_size_metric(size: usize) {
 /// straight off the wire with nothing else checking them. Mirrors go-bsc's
 /// `basicVerify` -> `VoteEnvelope.Verify` (`core/vote/vote_pool.go`).
 pub fn put_vote(vote: VoteEnvelope) {
+    // Height window first of all: it costs nothing, while everything below costs
+    // at least a hash. go-bsc orders it ahead of verification the same way in
+    // `putIntoVotePool`.
+    if !is_within_admission_window(vote.data.target_number, shared::get_best_canonical_block_number())
+    {
+        metrics::counter!("votes.rejected.out_of_range").increment(1);
+        tracing::debug!(
+            target: "bsc::vote_pool",
+            target_number = vote.data.target_number,
+            head = ?shared::get_best_canonical_block_number(),
+            "rejecting vote outside the (head-256, head+11] admission window",
+        );
+        return;
+    }
+
     // Verification is a pairing, and votes arrive unsolicited from any peer, so
     // do the cheap exclusions first. Votes are gossiped, meaning the same
     // envelope reaches us from every peer that has it: verifying before
@@ -644,6 +684,73 @@ mod tests {
             fetch_vote_by_block_hash(data.target_hash).len(),
             1,
             "replayed forgeries never enter the pool",
+        );
+
+        let _ = drain();
+    }
+
+
+    // === D2: (head-256, head+11] admission window ===
+
+    #[test]
+    fn admission_window_matches_go_bsc_bounds() {
+        let head = Some(10_000u64);
+        // go-bsc: reject when target+256-1 < head, i.e. target < head-255.
+        assert!(!is_within_admission_window(9_744, head), "head-256 is outside");
+        assert!(is_within_admission_window(9_745, head), "head-255 is the oldest admitted");
+        assert!(is_within_admission_window(10_000, head), "head itself");
+        assert!(is_within_admission_window(10_011, head), "head+11 is the newest admitted");
+        assert!(!is_within_admission_window(10_012, head), "head+12 is outside");
+    }
+
+    /// Before the head accessor is registered we cannot place a vote, and
+    /// treating an unknown head as 0 would discard everything above height 11.
+    #[test]
+    fn admission_window_admits_when_head_unknown() {
+        assert!(is_within_admission_window(0, None));
+        assert!(is_within_admission_window(40_000_000, None));
+        assert!(is_within_admission_window(u64::MAX, None));
+    }
+
+    /// `target_number` is attacker-supplied. A plain `target + 256` or
+    /// `head + 11` would overflow-panic in debug builds.
+    #[test]
+    fn admission_window_is_overflow_safe() {
+        assert!(!is_within_admission_window(u64::MAX, Some(10_000)), "far future rejected");
+        assert!(!is_within_admission_window(0, Some(u64::MAX)), "far past rejected");
+        assert!(is_within_admission_window(u64::MAX, Some(u64::MAX)));
+        // Would panic rather than return if the arithmetic were unchecked.
+        assert!(!is_within_admission_window(u64::MAX - 1, Some(1)));
+    }
+
+    /// The window is wired into the ingest path, and its unknown-head guard is
+    /// fail-open. No unit test can register the head provider, so `head` is
+    /// always `None` here — the startup state worth pinning, since a fail-closed
+    /// guard would silently discard every vote above height 11 until the
+    /// provider appears.
+    #[test]
+    fn put_vote_admits_any_height_while_head_is_unknown() {
+        let _ = drain();
+        assert!(
+            shared::get_best_canonical_block_number().is_none(),
+            "precondition: no head provider is registered in unit tests",
+        );
+
+        let mut raw = [0u8; 32];
+        raw[31] = 1;
+        let signer = BlsVoteSigner::new_from_bytes(raw).expect("create bls signer");
+        let data = VoteData {
+            source_number: 39_999_999,
+            source_hash: B256::from([0xcd; 32]),
+            target_number: 40_000_000,
+            target_hash: B256::from([0xce; 32]),
+        };
+        put_vote(signer.sign_vote(data).expect("sign vote"));
+
+        assert_eq!(
+            fetch_vote_by_block_hash(data.target_hash).len(),
+            1,
+            "an unknown head must not cause votes to be discarded",
         );
 
         let _ = drain();

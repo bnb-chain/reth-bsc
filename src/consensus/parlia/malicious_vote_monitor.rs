@@ -10,6 +10,8 @@ use std::collections::HashMap;
 
 use alloy_primitives::BlockNumber;
 use lru::LruCache;
+
+use super::vote_pool::UPPER_LIMIT_OF_VOTE_BLOCK_NUMBER;
 use std::num::NonZero;
 
 use super::vote::{VoteAddress, VoteEnvelope};
@@ -20,8 +22,6 @@ const MAX_SIZE_OF_RECENT_ENTRY: usize = 512;
 /// Scope in blocks for malicious vote slashing eligibility.
 const MALICIOUS_VOTE_SLASH_SCOPE: u64 = 256;
 
-/// Upper limit of vote block number offset (matches geth's `upperLimitOfVoteBlockNumber`).
-const UPPER_LIMIT_OF_VOTE_BLOCK_NUMBER: u64 = 11;
 
 /// Monitors incoming votes for rule violations and increments geth-compatible metrics
 /// (`monitor/maliciousVote/violateRule1`, `monitor/maliciousVote/violateRule2`).
