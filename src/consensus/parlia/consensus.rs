@@ -40,11 +40,48 @@ use tracing::{debug, trace, warn};
 const RECOVERED_PROPOSER_CACHE_NUM: usize = 4096;
 const ADDRESS_LENGTH: usize = 20; // Ethereum address length in bytes
 
+/// Divisor applied to the block period to cap the last-block-in-turn build window.
+///
+/// go-bsc uses `period / 2`. reth-bsc has used `period / 5` because trie root computation was
+/// significantly slower, so the last block of a turn seals earlier and the next validator gets
+/// more network lead time. At a 450ms period that is a 90ms build window against go-bsc's 225ms.
+///
+/// The cost is measurable: the last block of every turn fills to ~20% of the gas limit where its
+/// neighbours reach 95-99%, worth roughly 5% of chain throughput at `turn_length = 16`. Whether 5
+/// is still right depends on how long the state root actually takes, and that has changed — hence
+/// the dial.
+const LAST_BLOCK_PERIOD_DIVISOR: u64 = 5;
+
+/// Effective last-block-in-turn period divisor, overridable with
+/// `BSC_MINING_LAST_BLOCK_PERIOD_DIVISOR`.
+///
+/// Clamped to `1..=20`: 1 disables the cap (the last block gets a full period, like any other
+/// block), 20 leaves a 22ms window at a 450ms period. Read once and cached, so it must be set
+/// before the first block is built.
+fn last_block_period_divisor() -> u64 {
+    static DIVISOR: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *DIVISOR.get_or_init(|| {
+        let value = std::env::var("BSC_MINING_LAST_BLOCK_PERIOD_DIVISOR")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(LAST_BLOCK_PERIOD_DIVISOR)
+            .clamp(1, 20);
+        tracing::info!(
+            target: "bsc::miner",
+            divisor = value,
+            default = LAST_BLOCK_PERIOD_DIVISOR,
+            "Last-block-in-turn period divisor"
+        );
+        value
+    })
+}
+
 /// Applies left-over reservation and mining-time cap to raw delay.
 #[inline]
 fn apply_mining_delay_with_leftover(
     mut delay_ms: u64,
     period_ms: u64,
+    period_divisor: u64,
     last_block_in_turn: bool,
     enforce_min_delay: bool,
     left_over_ms: u64,
@@ -57,10 +94,11 @@ fn apply_mining_delay_with_leftover(
         delay_ms -= left_over_ms;
     }
 
-    // Unlike go-bsc (which uses `period / 2`), reth-bsc uses `period / 5` for the
-    // last-block-in-turn cap because trie root computation is significantly slower
-    // and needs more reserved time to avoid spilling into the next validator's slot.
-    let mut time_for_mining_ms = period_ms / 5;
+    // Unlike go-bsc (which uses `period / 2`), reth-bsc defaults to `period / 5` for the
+    // last-block-in-turn cap because trie root computation is significantly slower and needs
+    // more reserved time to avoid spilling into the next validator's slot. Tunable via
+    // `BSC_MINING_LAST_BLOCK_PERIOD_DIVISOR`; see [`LAST_BLOCK_PERIOD_DIVISOR`].
+    let mut time_for_mining_ms = period_ms / period_divisor.max(1);
     if !last_block_in_turn {
         time_for_mining_ms = period_ms;
     }
@@ -605,8 +643,9 @@ where
 
     /// - `snap.block_interval` is used as the period (milliseconds).
     /// - Applies `left_over_ms` reservation for finalization work.
-    /// - Caps blocking time to `period / 5` when last block in turn to reserve
-    ///   time for trie root computation; otherwise a full period.
+    /// - Caps blocking time to `period / LAST_BLOCK_PERIOD_DIVISOR` (default 5, overridable with
+    ///   `BSC_MINING_LAST_BLOCK_PERIOD_DIVISOR`) when last block in turn to reserve time for trie
+    ///   root computation; otherwise a full period.
     /// - Ensures every locally built block gets at least 50ms for transaction inclusion, so a
     ///   stale parent can never produce an empty (and therefore invalid) block.
     pub fn delay_for_mining(&self, snap: &Snapshot, header: &Header, left_over_ms: u64) -> u64 {
@@ -616,6 +655,7 @@ where
         apply_mining_delay_with_leftover(
             delay_ms,
             period_ms,
+            last_block_period_divisor(),
             last_block_in_turn,
             // Locally built blocks always need a non-zero window, not just the first of a turn.
             true,
@@ -637,7 +677,16 @@ where
     ) -> u64 {
         let period_ms = snap.block_interval;
         let delay_ms = self.delay_for_ramanujan_fork(snap, header);
-        apply_mining_delay_with_leftover(delay_ms, period_ms, false, false, left_over_ms)
+        // The divisor is inert here (`last_block_in_turn = false`), so pass the default rather
+        // than reading the dial.
+        apply_mining_delay_with_leftover(
+            delay_ms,
+            period_ms,
+            LAST_BLOCK_PERIOD_DIVISOR,
+            false,
+            false,
+            left_over_ms,
+        )
     }
 
     /// Set `new_header.timestamp` (seconds) and `mix_hash` (Lorentz-era ms) based on
@@ -1015,27 +1064,27 @@ mod tests {
     fn mining_delay_last_block_in_turn_caps_to_period_div_5() {
         // last_block_in_turn: left_over applied first (2500 - 2000 = 500),
         // then cap to period/5 = 600; 500 <= 600 so result is 500.
-        assert_eq!(apply_mining_delay_with_leftover(2500, 3000, true, false, 2000), 500);
+        assert_eq!(apply_mining_delay_with_leftover(2500, 3000, 5, true, false, 2000), 500);
     }
 
     #[test]
     fn mining_delay_last_block_in_turn_capped() {
         // last_block_in_turn: left_over applied first (2500 - 100 = 2400),
         // then cap to period/5 = 600; 2400 > 600 so result is 600.
-        assert_eq!(apply_mining_delay_with_leftover(2500, 3000, true, false, 100), 600);
+        assert_eq!(apply_mining_delay_with_leftover(2500, 3000, 5, true, false, 100), 600);
     }
 
     #[test]
     fn mining_delay_not_last_block_uses_full_period_cap() {
         // not last_block_in_turn: left_over applied first (3500 - 200 = 3300),
         // then cap to full period = 3000; result is 3000.
-        assert_eq!(apply_mining_delay_with_leftover(3500, 3000, false, false, 200), 3000);
+        assert_eq!(apply_mining_delay_with_leftover(3500, 3000, 5, false, false, 200), 3000);
     }
 
     #[test]
     fn mining_delay_floor_applies_when_the_window_is_fully_consumed() {
         // left_over (600) >= delay (500), so delay = 0, then the floor kicks in: result is 50.
-        assert_eq!(apply_mining_delay_with_leftover(500, 3000, false, true, 600), 50);
+        assert_eq!(apply_mining_delay_with_leftover(500, 3000, 5, false, true, 600), 50);
     }
 
     #[test]
@@ -1046,9 +1095,9 @@ mod tests {
         // the payload job then returned an empty candidate, and an empty BSC block carries no
         // system transaction, so peers rejected it with `UnexpectedSystemTx`. The validator
         // re-entered the same path every ~3s, signing a different block for the same height.
-        assert_eq!(apply_mining_delay_with_leftover(0, 450, false, true, 0), 50);
+        assert_eq!(apply_mining_delay_with_leftover(0, 450, 5, false, true, 0), 50);
         // Same for the last block of a turn, where the period/5 cap also applies.
-        assert_eq!(apply_mining_delay_with_leftover(0, 450, true, true, 0), 50);
+        assert_eq!(apply_mining_delay_with_leftover(0, 450, 5, true, true, 0), 50);
     }
 
     #[test]
@@ -1057,9 +1106,55 @@ mod tests {
         // the actual turn position (go-bsc PR #3669): a last-in-turn block gets
         // the full period cap (2500 - 100 = 2400, under the 3000 cap) instead of
         // being squeezed to period/5 = 600 like local mining.
-        assert_eq!(apply_mining_delay_with_leftover(2500, 3000, false, false, 100), 2400);
+        assert_eq!(apply_mining_delay_with_leftover(2500, 3000, 5, false, false, 100), 2400);
         // And no floor: bid simulation only re-executes an already-built bid, so a fully
         // consumed delay legitimately stays 0.
-        assert_eq!(apply_mining_delay_with_leftover(500, 3000, false, false, 600), 0);
+        assert_eq!(apply_mining_delay_with_leftover(500, 3000, 5, false, false, 600), 0);
+    }
+
+    #[test]
+    fn last_block_period_divisor_widens_the_build_window() {
+        // At a 450ms period the default divisor of 5 leaves a 90ms build window for the last
+        // block of a turn; go-bsc's 2 would leave 225ms. The raw delay (330 = 450 - a 120ms
+        // reserve) exceeds every cap below, so the cap is what binds.
+        assert_eq!(apply_mining_delay_with_leftover(330, 450, 5, true, false, 0), 90);
+        assert_eq!(apply_mining_delay_with_leftover(330, 450, 4, true, false, 0), 112);
+        assert_eq!(apply_mining_delay_with_leftover(330, 450, 3, true, false, 0), 150);
+        // go-bsc's value.
+        assert_eq!(apply_mining_delay_with_leftover(330, 450, 2, true, false, 0), 225);
+    }
+
+    #[test]
+    fn last_block_period_divisor_of_one_disables_the_cap() {
+        // Divisor 1 means the last block gets a full period, i.e. the same treatment as any
+        // other block: the delay passes through uncapped.
+        assert_eq!(apply_mining_delay_with_leftover(330, 450, 1, true, false, 0), 330);
+        assert_eq!(
+            apply_mining_delay_with_leftover(330, 450, 1, true, false, 0),
+            apply_mining_delay_with_leftover(330, 450, 5, false, false, 0)
+        );
+    }
+
+    #[test]
+    fn last_block_period_divisor_is_inert_for_non_last_blocks() {
+        // Only the last block of a turn is capped, so the divisor must not affect the others.
+        for divisor in [1u64, 2, 5, 20] {
+            assert_eq!(apply_mining_delay_with_leftover(330, 450, divisor, false, false, 0), 330);
+        }
+    }
+
+    #[test]
+    fn last_block_period_divisor_zero_cannot_divide_by_zero() {
+        // `last_block_period_divisor()` clamps to 1..=20, but the pure function is called
+        // directly by tests and could be called with 0 in future; `.max(1)` keeps it total.
+        assert_eq!(apply_mining_delay_with_leftover(330, 450, 0, true, false, 0), 330);
+    }
+
+    #[test]
+    fn last_block_period_divisor_still_respects_the_floor() {
+        // Widening the cap must not remove the non-zero build window guarantee.
+        for divisor in [1u64, 2, 5, 20] {
+            assert_eq!(apply_mining_delay_with_leftover(0, 450, divisor, true, true, 0), 50);
+        }
     }
 }
