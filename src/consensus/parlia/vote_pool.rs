@@ -398,7 +398,12 @@ impl VotePool {
     fn prune(&mut self, latest_block_number: BlockNumber) {
         // Remove votes in the range [, latestBlockNumber - LOWER_LIMIT_OF_VOTE_BLOCK_NUMBER]
         while let Some(vote_data) = self.cur_votes_pq.peek() {
-            if vote_data.target_number + LOWER_LIMIT_OF_VOTE_BLOCK_NUMBER - 1 < latest_block_number
+            // Saturating: the admission window bounds `target_number` to
+            // `head + 11`, but it fails open while the head is unknown at
+            // startup, so an extreme value can still reach the pool. A plain add
+            // would then wrap in release and trap in debug.
+            if vote_data.target_number.saturating_add(LOWER_LIMIT_OF_VOTE_BLOCK_NUMBER)
+                <= latest_block_number
             {
                 // Remove from priority queue
                 let vote_data = self.cur_votes_pq.pop().unwrap();
@@ -1304,6 +1309,78 @@ mod tests {
             MAX_CUR_VOTE_AMOUNT_PER_BLOCK,
             "votes for one target must stop at the cap",
         );
+
+        let _ = drain();
+    }
+
+
+    /// An extreme `target_number` must not be able to empty the pool.
+    ///
+    /// The oversize path used to derive its prune height from the *incoming*
+    /// vote's target: `prune(target_number - 256)`. `target_number` is supplied
+    /// by whoever sent the vote, and before the admission window existed it was
+    /// unbounded — so one vote claiming a target near `u64::MAX` produced an
+    /// astronomically large prune height, and `prune` then evicted every vote
+    /// below it, which is all of them. Votes are never re-sent, so the node lost
+    /// local quorum until fresh ones accumulated.
+    ///
+    /// No panic accompanied it: `[profile.release]` sets no `overflow-checks`,
+    /// so `target_number + 255` inside `prune` wraps rather than trapping.
+    ///
+    /// The height now comes from our own head, so the sender cannot steer it.
+    /// Uses `put_vote_unchecked` to reach the oversize path without paying a
+    /// pairing per vote.
+    #[test]
+    fn extreme_target_number_cannot_wipe_the_pool() {
+        let _ = drain();
+
+        let survivor_target = B256::from([0xd1; 32]);
+        let vote = |target: B256, number: u64, i: usize| {
+            let mut address = VoteAddress::default();
+            address[0] = (i & 0xff) as u8;
+            address[1] = ((i >> 8) & 0xff) as u8;
+            address[2] = ((i >> 16) & 0xff) as u8;
+            VoteEnvelope {
+                vote_address: address,
+                signature: VoteSignature::default(),
+                data: VoteData {
+                    source_number: number.saturating_sub(1),
+                    source_hash: B256::from([0xd0; 32]),
+                    target_number: number,
+                    target_hash: target,
+                },
+            }
+        };
+
+        // One vote we will look for afterwards, at an ordinary height.
+        put_vote_unchecked(vote(survivor_target, 5_000, 0));
+        assert_eq!(fetch_vote_by_block_hash(survivor_target).len(), 1);
+
+        // Push past MAX_VOTES_IN_POOL so the oversize path engages. Spread over
+        // many targets because the per-target cap bounds each one.
+        let mut i = 1usize;
+        let mut target_seed = 0u64;
+        while len() <= MAX_VOTES_IN_POOL {
+            target_seed += 1;
+            let mut bytes = [0u8; 32];
+            bytes[..8].copy_from_slice(&target_seed.to_le_bytes());
+            let filler = B256::from(bytes);
+            for _ in 0..MAX_CUR_VOTE_AMOUNT_PER_BLOCK {
+                put_vote_unchecked(vote(filler, 5_000, i));
+                i += 1;
+            }
+        }
+        assert!(len() > MAX_VOTES_IN_POOL, "precondition: pool is oversized");
+
+        // The payload: a target claiming to be near the end of the number space.
+        put_vote_unchecked(vote(B256::from([0xff; 32]), u64::MAX - 300, i));
+
+        assert_eq!(
+            fetch_vote_by_block_hash(survivor_target).len(),
+            1,
+            "a vote at an ordinary height must survive an extreme target_number",
+        );
+        assert!(len() > MAX_CUR_VOTE_AMOUNT_PER_BLOCK, "the pool must not have been emptied");
 
         let _ = drain();
     }
