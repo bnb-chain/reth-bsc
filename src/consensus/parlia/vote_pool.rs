@@ -28,6 +28,14 @@ const LOWER_LIMIT_OF_VOTE_BLOCK_NUMBER: u64 = 256;
 pub(crate) const UPPER_LIMIT_OF_VOTE_BLOCK_NUMBER: u64 = 11;
 /// Envelope hashes to remember as rejected. ~32 B each, so a few hundred KB.
 const REJECTED_VOTE_CACHE_SIZE: usize = 8192;
+/// Votes retained per target hash once we hold the target block, matching
+/// go-bsc's `maxCurVoteAmountPerBlock`. One per validator suffices.
+const MAX_CUR_VOTE_AMOUNT_PER_BLOCK: usize = 21;
+/// Votes retained per target hash while the target block is still unknown
+/// (`maxFutureVoteAmountPerBlock`). Higher than the current-vote cap because we
+/// cannot yet resolve the target's validator set, so non-validator votes cannot
+/// be filtered out until promotion.
+const MAX_FUTURE_VOTE_AMOUNT_PER_BLOCK: usize = 50;
 /// Size of the LRU cache for tracking finality notifications (matches geth's finalizedNotified)
 const FINALIZED_NOTIFIED_CACHE_SIZE: usize = 21;
 
@@ -91,6 +99,10 @@ struct VotePool {
     cur_votes: HashMap<B256, VoteMessages>,
     /// Priority queue for efficiently finding votes to prune.
     cur_votes_pq: VotesPriorityQueue,
+    /// Votes whose target block we do not hold yet, keyed by target hash.
+    future_votes: HashMap<B256, VoteMessages>,
+    /// Priority queue over `future_votes`, ordered by target number.
+    future_votes_pq: VotesPriorityQueue,
     /// Total number of votes stored in the pool.
     total_votes: usize,
     /// Malicious vote monitor for detecting rule violations.
@@ -103,50 +115,84 @@ impl VotePool {
             received_votes: HashSet::new(),
             cur_votes: HashMap::new(),
             cur_votes_pq: VotesPriorityQueue::new(),
+            future_votes: HashMap::new(),
+            future_votes_pq: VotesPriorityQueue::new(),
             total_votes: 0,
             malicious_vote_monitor: MaliciousVoteMonitor::new(),
         }
     }
 
-    /// Insert a vote and return the new vote count for its target block (0 if duplicate).
-    fn insert(&mut self, vote: VoteEnvelope, pending_block_number: BlockNumber) -> usize {
+    /// Whether this target hash already holds its per-pool maximum.
+    ///
+    /// go-bsc applies the same cap in `basicVerify`, bounding how much one block
+    /// hash can cost us regardless of how many peers relay votes for it.
+    fn is_at_capacity(&self, block_hash: &B256, is_future: bool) -> bool {
+        let (votes, cap) = if is_future {
+            (&self.future_votes, MAX_FUTURE_VOTE_AMOUNT_PER_BLOCK)
+        } else {
+            (&self.cur_votes, MAX_CUR_VOTE_AMOUNT_PER_BLOCK)
+        };
+        votes.get(block_hash).is_some_and(|vm| vm.vote_messages.len() >= cap)
+    }
+
+    /// Insert a vote and return the new *current* vote count for its target
+    /// block. Returns 0 for duplicates and for future votes, which must not
+    /// drive finality notification until they are promoted.
+    fn insert(
+        &mut self,
+        vote: VoteEnvelope,
+        pending_block_number: BlockNumber,
+        is_future: bool,
+    ) -> usize {
         let vote_hash = vote.hash();
-        if self.received_votes.insert(vote_hash) {
-            // Track received votes count (geth-compatible)
-            VOTE_METRICS.received_votes_total.increment(1);
-            metrics::counter!("curVotes.local").increment(1);
+        if !self.received_votes.insert(vote_hash) {
+            return 0; // duplicate vote
+        }
 
-            // Check for malicious votes
-            self.malicious_vote_monitor.conflict_detect(&vote, pending_block_number);
+        VOTE_METRICS.received_votes_total.increment(1);
+        metrics::counter!(if is_future { "futureVotes.local" } else { "curVotes.local" })
+            .increment(1);
 
-            // Use target_hash as the key for organizing votes
-            let block_hash = vote.data.target_hash;
+        // Check for malicious votes
+        self.malicious_vote_monitor.conflict_detect(&vote, pending_block_number);
 
-            // Add to priority queue if this is a new block
-            if !self.cur_votes.contains_key(&block_hash) {
-                self.cur_votes_pq.push(vote.data);
+        let block_hash = vote.data.target_hash;
+        let vote_data = vote.data;
+        {
+            let (votes, pq) = if is_future {
+                (&mut self.future_votes, &mut self.future_votes_pq)
+            } else {
+                (&mut self.cur_votes, &mut self.cur_votes_pq)
+            };
+            // Only push to the queue for a hash we are not already tracking, so
+            // the queue holds one entry per target rather than one per vote.
+            if !votes.contains_key(&block_hash) {
+                pq.push(vote_data);
             }
-            self.cur_votes
+            votes
                 .entry(block_hash)
                 .or_default()
                 .vote_messages
                 .push(VoteEntry { hash: vote_hash, envelope: vote });
-            self.total_votes += 1;
+        }
+        self.total_votes += 1;
 
-            // Update geth-compatible gauges
-            metrics::gauge!("curVotesPq.local").set(self.cur_votes_pq.heap.len() as f64);
-            metrics::gauge!("receivedVotes.local").set(self.received_votes.len() as f64);
+        metrics::gauge!("curVotesPq.local").set(self.cur_votes_pq.heap.len() as f64);
+        metrics::gauge!("futureVotesPq.local").set(self.future_votes_pq.heap.len() as f64);
+        metrics::gauge!("receivedVotes.local").set(self.received_votes.len() as f64);
 
-            // Return the new vote count for this block
-            self.len_for_block(&block_hash)
+        if is_future {
+            0
         } else {
-            0 // duplicate vote
+            self.len_for_block(&block_hash)
         }
     }
 
     fn drain(&mut self) -> Vec<VoteEnvelope> {
         self.received_votes.clear();
         self.cur_votes_pq = VotesPriorityQueue::new();
+        self.future_votes_pq = VotesPriorityQueue::new();
+        self.future_votes.clear();
         self.total_votes = 0;
         let mut all_votes = Vec::new();
         for (_, vote_messages) in self.cur_votes.drain() {
@@ -202,6 +248,89 @@ impl VotePool {
             .collect()
     }
 
+    /// Promotes future votes whose target we now hold, mirroring go-bsc's
+    /// `transferVotesFromFutureToCur`.
+    ///
+    /// Two phases, as upstream: entries older than `latest - 11` are promoted
+    /// unconditionally (they can no longer be "future"), then entries at or
+    /// below `latest` are promoted only once their target block is actually
+    /// known, with the rest pushed back for a later pass.
+    ///
+    /// Returns the target hashes that gained current votes, so the caller can
+    /// run finality notification after releasing the pool lock.
+    fn transfer_future_votes(&mut self, latest: BlockNumber) -> Vec<B256> {
+        let mut promoted = Vec::new();
+
+        // Phase 1: too old to still be considered future.
+        while let Some(vd) = self.future_votes_pq.peek() {
+            if vd.target_number.saturating_add(UPPER_LIMIT_OF_VOTE_BLOCK_NUMBER) >= latest {
+                break;
+            }
+            let hash = vd.target_hash;
+            self.future_votes_pq.pop();
+            if self.promote(hash) {
+                promoted.push(hash);
+            }
+        }
+
+        // Phase 2: promote only what we can now resolve; retain the rest.
+        let mut deferred = Vec::new();
+        while let Some(vd) = self.future_votes_pq.peek() {
+            if vd.target_number > latest {
+                break;
+            }
+            let vd = *vd;
+            self.future_votes_pq.pop();
+            if shared::get_canonical_header_by_hash_from_provider(&vd.target_hash).is_none() {
+                deferred.push(vd);
+                continue;
+            }
+            if self.promote(vd.target_hash) {
+                promoted.push(vd.target_hash);
+            }
+        }
+        for vd in deferred {
+            self.future_votes_pq.push(vd);
+        }
+
+        metrics::gauge!("futureVotesPq.local").set(self.future_votes_pq.heap.len() as f64);
+        promoted
+    }
+
+    /// Moves one target's future votes into the current pool, dropping any that
+    /// fail the origin check. Returns whether any vote survived.
+    ///
+    /// The caller has already popped this hash from the future queue.
+    fn promote(&mut self, block_hash: B256) -> bool {
+        let Some(box_) = self.future_votes.remove(&block_hash) else {
+            return false;
+        };
+
+        let mut valid = Vec::with_capacity(box_.vote_messages.len());
+        for entry in box_.vote_messages {
+            if verify_vote_origin(&entry.envelope) {
+                valid.push(entry);
+            } else {
+                // Drop from the dedup set too, so a later legitimate copy is not
+                // mistaken for a duplicate.
+                self.received_votes.remove(&entry.hash);
+                self.total_votes = self.total_votes.saturating_sub(1);
+                metrics::counter!("votes.rejected.origin_on_promote").increment(1);
+            }
+        }
+        if valid.is_empty() {
+            return false;
+        }
+
+        let data = valid[0].envelope.data;
+        if !self.cur_votes.contains_key(&block_hash) {
+            self.cur_votes_pq.push(data);
+        }
+        self.cur_votes.entry(block_hash).or_default().vote_messages.extend(valid);
+        metrics::gauge!("curVotesPq.local").set(self.cur_votes_pq.heap.len() as f64);
+        true
+    }
+
     /// Prune old votes based on the latest block number.
     /// Removes votes where targetNumber + LOWER_LIMIT_OF_VOTE_BLOCK_NUMBER - 1 < latestBlockNumber
     fn prune(&mut self, latest_block_number: BlockNumber) {
@@ -224,6 +353,24 @@ impl VotePool {
                 break;
             }
         }
+        // Future entries below the lower bound can never be promoted usefully.
+        while let Some(vd) = self.future_votes_pq.peek() {
+            if vd.target_number.saturating_add(LOWER_LIMIT_OF_VOTE_BLOCK_NUMBER)
+                > latest_block_number
+            {
+                break;
+            }
+            let hash = vd.target_hash;
+            self.future_votes_pq.pop();
+            if let Some(box_) = self.future_votes.remove(&hash) {
+                self.total_votes = self.total_votes.saturating_sub(box_.vote_messages.len());
+                for entry in box_.vote_messages {
+                    self.received_votes.remove(&entry.hash);
+                }
+            }
+        }
+        metrics::gauge!("futureVotesPq.local").set(self.future_votes_pq.heap.len() as f64);
+
         // Update geth-compatible gauges after pruning
         metrics::gauge!("curVotesPq.local").set(self.cur_votes_pq.heap.len() as f64);
         metrics::gauge!("receivedVotes.local").set(self.received_votes.len() as f64);
@@ -261,6 +408,78 @@ static FINALIZED_NOTIFIED: Lazy<RwLock<LruCache<B256, ()>>> =
 fn update_vote_pool_size_metric(size: usize) {
     VOTE_METRICS.vote_pool_size.set(size as f64);
     VOTE_METRICS.current_votes_count.set(size as f64);
+}
+
+/// Justified (source) pair recorded in a header's snapshot.
+///
+/// Shared so the vote pool and `BscForkChoiceEngine` derive it one way. The
+/// Luban gate stays with the caller, which is where the chain spec lives.
+pub fn justified_pair_for_hash(header_hash: &B256) -> Option<(BlockNumber, B256)> {
+    let sp = shared::get_snapshot_provider()?;
+    let snap = sp.snapshot_by_hash(header_hash)?;
+    Some((snap.vote_data.target_number, snap.vote_data.target_hash))
+}
+
+/// Whether a vote plausibly originates from a validator of its target block and
+/// cites the correct source, mirroring go-bsc's `Parlia.VerifyVote`.
+///
+/// Only meaningful once the target block is known; callers apply it to current
+/// votes at admission and to future votes at promotion, exactly as upstream
+/// does. Returns false when the target header or either snapshot is missing —
+/// the same outcome go-bsc reaches by returning an error — but logs the two
+/// cases separately, because "snapshot not available yet" and "vote is not from
+/// a validator" have very different operational meanings.
+fn verify_vote_origin(vote: &VoteEnvelope) -> bool {
+    let Some(header) = shared::get_canonical_header_by_hash_from_provider(&vote.data.target_hash)
+    else {
+        tracing::debug!(
+            target: "bsc::vote_pool",
+            target_number = vote.data.target_number,
+            "vote origin unverifiable: target header not found",
+        );
+        return false;
+    };
+    if header.number != vote.data.target_number {
+        return false;
+    }
+
+    match justified_pair_for_hash(&vote.data.target_hash) {
+        Some((justified_number, justified_hash)) => {
+            if vote.data.source_number != justified_number
+                || vote.data.source_hash != justified_hash
+            {
+                metrics::counter!("votes.rejected.source_mismatch").increment(1);
+                return false;
+            }
+        }
+        None => {
+            tracing::debug!(
+                target: "bsc::vote_pool",
+                target_number = vote.data.target_number,
+                "vote origin unverifiable: no snapshot for target",
+            );
+            return false;
+        }
+    }
+
+    let Some(sp) = shared::get_snapshot_provider() else {
+        return false;
+    };
+    let Some(parent_snap) = sp.snapshot_by_hash(&header.parent_hash) else {
+        tracing::debug!(
+            target: "bsc::vote_pool",
+            target_number = vote.data.target_number,
+            "vote origin unverifiable: no snapshot for target's parent",
+        );
+        return false;
+    };
+
+    let is_validator =
+        parent_snap.validators_map.values().any(|v| v.vote_addr == vote.vote_address);
+    if !is_validator {
+        metrics::counter!("votes.rejected.not_a_validator").increment(1);
+    }
+    is_validator
 }
 
 /// Whether a vote targeting `target_number` falls inside the admission window
@@ -355,22 +574,62 @@ pub fn put_vote_unchecked(vote: VoteEnvelope) {
 
 fn put_vote_inner(vote: VoteEnvelope) {
     let target_hash = vote.data.target_hash;
-
-    // Get pending block number for malicious vote detection scope
+    let target_number = vote.data.target_number;
     let pending_block_number = shared::get_best_canonical_block_number().unwrap_or(0);
 
-    // Lazy prune: evict votes below `head - LOWER_LIMIT_OF_VOTE_BLOCK_NUMBER`
-    // once per observed head advance. Replaces geth-bsc's chain-head event
-    // subscription by piggybacking on the vote ingest path (same cadence).
-    // `fetch_max` keeps the watermark monotonic across racing writers; the
-    // inner prune is O(0) when nothing is stale.
-    let need_prune = pending_block_number > LAST_PRUNED_BLOCK.load(Ordering::Relaxed);
+    // Classify: a vote for a block we do not hold cannot have its origin checked
+    // yet, because membership is resolved against the target's parent snapshot.
+    // go-bsc splits `curVotes`/`futureVotes` on exactly this condition.
+    //
+    // We test canonical presence where go-bsc tests *verified* presence, which is
+    // the stricter reading: a valid but not-yet-canonical target is treated as
+    // future here. That defers its origin check to promotion rather than skipping
+    // it, so the effect is conservative.
+    //
+    // Before the header provider is registered every lookup misses, which would
+    // classify *everything* as future — and promotion needs the same provider,
+    // so those votes could never be promoted and finality would stall. Treat an
+    // unregistered provider as "cannot classify" and admit as current without an
+    // origin check, matching the fail-open stance the height window takes.
+    let can_classify = shared::has_header_by_hash_provider();
+    let is_future = can_classify
+        && shared::get_canonical_header_by_hash_from_provider(&target_hash).is_none();
 
-    let target_number = vote.data.target_number;
+    // Current votes are origin-checked at admission; future votes at promotion.
+    if can_classify && !is_future && !verify_vote_origin(&vote) {
+        tracing::debug!(
+            target: "bsc::vote_pool",
+            vote_address = %vote.vote_address,
+            target_number,
+            "rejecting vote that failed the origin check",
+        );
+        return;
+    }
+
+    // Lazy prune and promotion: run once per observed head advance. Replaces
+    // geth-bsc's chain-head subscription by piggybacking on the vote ingest
+    // path, which is the same cadence in practice since votes arrive per block.
+    let need_head_work = pending_block_number > LAST_PRUNED_BLOCK.load(Ordering::Relaxed);
 
     let mut pool = VOTE_POOL.write().expect("vote pool poisoned");
-    let votes_for_block = pool.insert(vote, pending_block_number);
-    if need_prune {
+
+    if pool.is_at_capacity(&target_hash, is_future) {
+        drop(pool);
+        metrics::counter!("votes.rejected.block_at_capacity").increment(1);
+        tracing::debug!(
+            target: "bsc::vote_pool",
+            target_number,
+            is_future,
+            "rejecting vote: target already at its per-block vote cap",
+        );
+        return;
+    }
+
+    let votes_for_block = pool.insert(vote, pending_block_number, is_future);
+
+    let mut promoted = Vec::new();
+    if need_head_work {
+        promoted = pool.transfer_future_votes(pending_block_number);
         pool.prune(pending_block_number);
         LAST_PRUNED_BLOCK.fetch_max(pending_block_number, Ordering::Relaxed);
     }
@@ -389,6 +648,8 @@ fn put_vote_inner(vote: VoteEnvelope) {
     }
 
     let size = pool.len();
+    let promoted_counts: Vec<(B256, usize)> =
+        promoted.iter().map(|h| (*h, pool.len_for_block(h))).collect();
     drop(pool);
     update_vote_pool_size_metric(size);
 
@@ -396,6 +657,12 @@ fn put_vote_inner(vote: VoteEnvelope) {
     if votes_for_block > 0 {
         block_stats::on_vote_received(target_hash, votes_for_block);
         maybe_notify_finality(target_hash, votes_for_block);
+    }
+    // Promoted targets may have crossed quorum while sitting in the future pool.
+    for (hash, count) in promoted_counts {
+        if count > 0 {
+            maybe_notify_finality(hash, count);
+        }
     }
 }
 
@@ -745,6 +1012,39 @@ mod tests {
             fetch_vote_by_block_hash(data.target_hash).len(),
             1,
             "an unknown head must not cause votes to be discarded",
+        );
+
+        let _ = drain();
+    }
+
+
+    /// One target hash cannot be made to hold unbounded votes, however many
+    /// distinct validators sign for it. Mirrors go-bsc's cap in `basicVerify`.
+    #[test]
+    fn put_vote_caps_votes_per_target() {
+        let _ = drain();
+
+        let data = VoteData {
+            source_number: 900,
+            source_hash: B256::from([0x91; 32]),
+            target_number: 901,
+            target_hash: B256::from([0x92; 32]),
+        };
+
+        // Distinct signers so nothing is rejected as a duplicate.
+        let over = MAX_CUR_VOTE_AMOUNT_PER_BLOCK + 8;
+        for i in 1..=over {
+            let mut raw = [0u8; 32];
+            raw[30] = (i >> 8) as u8;
+            raw[31] = (i & 0xff) as u8;
+            let signer = BlsVoteSigner::new_from_bytes(raw).expect("create bls signer");
+            put_vote(signer.sign_vote(data).expect("sign vote"));
+        }
+
+        assert_eq!(
+            fetch_vote_by_block_hash(data.target_hash).len(),
+            MAX_CUR_VOTE_AMOUNT_PER_BLOCK,
+            "votes for one target must stop at the cap",
         );
 
         let _ = drain();
