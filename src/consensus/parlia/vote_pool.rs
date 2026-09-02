@@ -31,33 +31,27 @@ const REJECTED_VOTE_CACHE_SIZE: usize = 8192;
 /// Votes retained per target hash once we hold the target block, matching
 /// go-bsc's `maxCurVoteAmountPerBlock`. One per validator suffices.
 const MAX_CUR_VOTE_AMOUNT_PER_BLOCK: usize = 21;
-// Deliberately no per-target cap on future votes.
-//
-// go-bsc has one (`maxFutureVoteAmountPerBlock = 50`), but capping a bucket
-// whose contents cannot be authenticated turns the cap into a censorship tool.
-// A future vote is only signature-checked, and a signature proves the signer
-// holds the key in the envelope — not that the key belongs to a validator. So
-// any peer can mint keys, self-sign 50 envelopes for a target hash it has seen
-// and we have not, and fill the bucket. Genuine validator votes for that target
-// are then refused, and nothing re-sends them: votes are broadcast once. When
-// the block finally arrives the junk is discarded at promotion, but the real
-// votes are already lost, so that target can never reach local quorum.
-//
-// Leaving the future bucket uncapped trades that for bounded waste. Memory is
-// still held by three other limits: the `(head-256, head+11]` admission window
-// bounds how many distinct targets can be addressed, `MAX_VOTES_IN_POOL` bounds
-// the pool overall, and the per-peer receive budget bounds the rate. Junk is
-// reclaimed by promotion and by pruning. Losing good votes is not recoverable;
-// holding useless ones briefly is.
-//
-// NOTE: go-bsc appears to share this weakness. `basicVerify` applies the 50-cap
-// to future votes with only `vote.Verify()` behind it, `VerifyVote` runs solely
-// for current votes, and there is no per-peer accounting for future votes
-// anywhere in `core/vote/vote_pool.go`. Worth reporting upstream rather than
-// assuming reth-bsc is the only client affected.
-//
-// The real fix, ahead of both clients, is per-peer fairness for unauthenticated
-// votes, which needs peer identity plumbed into the ingest path.
+/// Votes retained per target hash for future targets whose sender we managed to
+/// authenticate, matching go-bsc's `maxFutureVoteAmountPerBlock`.
+///
+/// Applied *only* when `future_vote_sender_is_validator` returned `Some(true)`.
+/// A cap over unauthenticatable contents is a censorship tool, not a safety
+/// limit: a future vote is signature-checked and nothing more, and a signature
+/// proves the signer holds the key in the envelope, not that the key belongs to
+/// a validator. Capping such a bucket lets any peer mint keys, self-sign enough
+/// envelopes to fill it, and have genuine validator votes refused —
+/// permanently, since votes are broadcast once and never re-sent. Reported by
+/// Hashdit Bot on #491.
+///
+/// NOTE: go-bsc applies its cap unconditionally. `basicVerify` uses
+/// `maxFutureVoteAmountPerBlock` with only `vote.Verify()` behind it,
+/// `VerifyVote` runs solely for current votes, and there is no per-peer
+/// accounting for future votes in `core/vote/vote_pool.go`. Worth raising
+/// upstream rather than assuming reth-bsc is the only client affected.
+const MAX_FUTURE_VOTE_AMOUNT_PER_BLOCK: usize = 50;
+/// Hard ceiling on pooled votes. Exceeding it triggers a prune and, failing
+/// that, shedding of future votes.
+const MAX_VOTES_IN_POOL: usize = 32 * 1024 * 2;
 /// Size of the LRU cache for tracking finality notifications (matches geth's finalizedNotified)
 const FINALIZED_NOTIFIED_CACHE_SIZE: usize = 21;
 
@@ -151,9 +145,15 @@ impl VotePool {
     /// vote per target is all that counts, and the cap sits at the validator
     /// count. Future votes are intentionally uncapped; see the note above the
     /// absent `MAX_FUTURE_VOTE_AMOUNT_PER_BLOCK`.
-    fn is_at_capacity(&self, block_hash: &B256, is_future: bool) -> bool {
+    fn is_at_capacity(&self, block_hash: &B256, is_future: bool, authenticated: bool) -> bool {
         if is_future {
-            return false;
+            // Only cap a future bucket whose sender we authenticated; see the
+            // note on MAX_FUTURE_VOTE_AMOUNT_PER_BLOCK.
+            return authenticated
+                && self
+                    .future_votes
+                    .get(block_hash)
+                    .is_some_and(|vm| vm.vote_messages.len() >= MAX_FUTURE_VOTE_AMOUNT_PER_BLOCK);
         }
         self.cur_votes
             .get(block_hash)
@@ -356,6 +356,43 @@ impl VotePool {
         true
     }
 
+    /// Drops future votes, furthest-ahead target first, until at least `target`
+    /// entries have been released. Returns how many votes were dropped.
+    ///
+    /// The escape hatch for a flood that pruning cannot reach because every
+    /// entry is still inside the admission window. Furthest-ahead first because
+    /// those are the least likely to be promoted soon.
+    fn shed_future_votes(&mut self, target: usize) -> usize {
+        let mut order: Vec<VoteData> = self.future_votes_pq.heap.iter().map(|r| r.0).collect();
+        order.sort_by_key(|vd| std::cmp::Reverse(vd.target_number));
+
+        let mut shed = 0usize;
+        for vd in order {
+            if shed >= target {
+                break;
+            }
+            if let Some(box_) = self.future_votes.remove(&vd.target_hash) {
+                shed += box_.vote_messages.len();
+                self.total_votes = self.total_votes.saturating_sub(box_.vote_messages.len());
+                for entry in box_.vote_messages {
+                    self.received_votes.remove(&entry.hash);
+                }
+            }
+        }
+        // Rebuild the queue over what survived.
+        self.future_votes_pq = VotesPriorityQueue::new();
+        let surviving: Vec<VoteData> = self
+            .future_votes
+            .values()
+            .filter_map(|vm| vm.vote_messages.first().map(|e| e.envelope.data))
+            .collect();
+        for vd in surviving {
+            self.future_votes_pq.push(vd);
+        }
+        metrics::gauge!("futureVotesPq.local").set(self.future_votes_pq.heap.len() as f64);
+        shed
+    }
+
     /// Prune old votes based on the latest block number.
     /// Removes votes where targetNumber + LOWER_LIMIT_OF_VOTE_BLOCK_NUMBER - 1 < latestBlockNumber
     fn prune(&mut self, latest_block_number: BlockNumber) {
@@ -443,6 +480,39 @@ pub fn justified_pair_for_hash(header_hash: &B256) -> Option<(BlockNumber, B256)
     let sp = shared::get_snapshot_provider()?;
     let snap = sp.snapshot_by_hash(header_hash)?;
     Some((snap.vote_data.target_number, snap.vote_data.target_hash))
+}
+
+/// Whether a *future* vote's sender is a validator, judged against the snapshot
+/// at our own head.
+///
+/// `verify_vote_origin` cannot run on a future vote: it resolves membership from
+/// the target's parent snapshot, and we do not hold the target. But the
+/// validator set only changes on epoch boundaries, and the admission window caps
+/// a future target at `head + 11`, so the set at our head is the set that will
+/// govern the target — unless an epoch boundary falls in between.
+///
+/// Returns:
+/// - `Some(true)`  sender is a validator in the current set
+/// - `Some(false)` sender is not, and cannot become one inside the window
+/// - `None` undecidable: no snapshot, or an epoch boundary lies in
+///   `(head, target]` so the governing set may differ. Callers admit these
+///   uncapped rather than guess.
+fn future_vote_sender_is_validator(vote: &VoteEnvelope) -> Option<bool> {
+    let head_number = shared::get_best_canonical_block_number()?;
+    let head = shared::get_canonical_header_by_number(head_number)?;
+    let snap = shared::get_snapshot_provider()?.snapshot_by_hash(&head.hash_slow())?;
+    if snap.validators_map.is_empty() {
+        return None;
+    }
+
+    // An epoch boundary between head and target can swap the set out from under
+    // us; decline to judge rather than risk rejecting an incoming validator.
+    let epoch = snap.epoch_num.max(1);
+    if vote.data.target_number / epoch > head_number / epoch {
+        return None;
+    }
+
+    Some(snap.validators_map.values().any(|v| v.vote_addr == vote.vote_address))
 }
 
 /// Whether a vote plausibly originates from a validator of its target block and
@@ -620,6 +690,30 @@ fn put_vote_inner(vote: VoteEnvelope) {
     let is_future = can_classify
         && shared::get_canonical_header_by_hash_from_provider(&target_hash).is_none();
 
+    // Future votes cannot be origin-checked (membership lives in the target's
+    // parent snapshot, which we do not hold), but we can still ask whether the
+    // sender is a validator *at all*, against our own head. An attacker's minted
+    // key is in no validator set, so this refuses the junk before a bucket is
+    // ever created. `None` means undecidable — admitted, but left uncapped.
+    let future_sender_authenticated = if is_future {
+        match future_vote_sender_is_validator(&vote) {
+            Some(false) => {
+                metrics::counter!("votes.rejected.future_not_a_validator").increment(1);
+                tracing::debug!(
+                    target: "bsc::vote_pool",
+                    vote_address = %vote.vote_address,
+                    target_number,
+                    "rejecting future vote from a non-validator",
+                );
+                return;
+            }
+            Some(true) => true,
+            None => false,
+        }
+    } else {
+        false
+    };
+
     // Current votes are origin-checked at admission; future votes at promotion.
     if can_classify && !is_future && !verify_vote_origin(&vote) {
         tracing::debug!(
@@ -638,7 +732,7 @@ fn put_vote_inner(vote: VoteEnvelope) {
 
     let mut pool = VOTE_POOL.write().expect("vote pool poisoned");
 
-    if pool.is_at_capacity(&target_hash, is_future) {
+    if pool.is_at_capacity(&target_hash, is_future, future_sender_authenticated) {
         drop(pool);
         metrics::counter!("votes.rejected.block_at_capacity").increment(1);
         tracing::debug!(
@@ -659,17 +753,38 @@ fn put_vote_inner(vote: VoteEnvelope) {
         LAST_PRUNED_BLOCK.fetch_max(pending_block_number, Ordering::Relaxed);
     }
 
-    // Force prune if pool is too large, prevents memory issues during stage sync.
-    const MAX_VOTES_IN_POOL: usize = 32 * 1024 * 2;
+    // Force prune if the pool is oversized.
+    //
+    // This used to prune relative to the *incoming* vote's target, which frees
+    // nothing when the flood targets recent heights: pruning below
+    // `target - 256` only evicts votes already far behind the window. Prune
+    // relative to our head instead, and if that reclaims too little, shed
+    // future votes.
+    //
+    // Shedding future votes is the right response because current votes cannot
+    // be the cause: they are origin-checked and capped per target, so with the
+    // 267-block admission window they are bounded at roughly
+    // `267 * MAX_CUR_VOTE_AMOUNT_PER_BLOCK` entries. Any overflow is future
+    // votes, which are the less trustworthy half by construction.
     if pool.len() > MAX_VOTES_IN_POOL {
-        let force_prune = target_number.saturating_sub(LOWER_LIMIT_OF_VOTE_BLOCK_NUMBER);
-        pool.prune(force_prune);
-        tracing::debug!(
-            target: "bsc::vote_pool",
-            pool_size = pool.len(),
-            force_prune_block_number = force_prune,
-            "Vote pool oversized, force pruned"
-        );
+        pool.prune(pending_block_number);
+        let after_prune = pool.len();
+        if after_prune > MAX_VOTES_IN_POOL {
+            let shed = pool.shed_future_votes(after_prune - MAX_VOTES_IN_POOL);
+            metrics::counter!("votes.shed.future_oversized").increment(shed as u64);
+            tracing::warn!(
+                target: "bsc::vote_pool",
+                pool_size = pool.len(),
+                shed,
+                "vote pool oversized after pruning; shed future votes",
+            );
+        } else {
+            tracing::debug!(
+                target: "bsc::vote_pool",
+                pool_size = after_prune,
+                "vote pool oversized, pruned to head",
+            );
+        }
     }
 
     let size = pool.len();
@@ -1047,14 +1162,15 @@ mod tests {
 
     // === D1: per-target vote caps ===
 
-    /// Future votes carry no per-target cap; current votes do.
+    /// The future-vote cap applies only once the sender is authenticated.
     ///
-    /// A future vote is only signature-checked, and a signature does not show
-    /// the signer is a validator — so a cap there refuses genuine votes as
-    /// readily as forged ones, and whichever arrives second loses. Current votes
-    /// have passed the origin check, so their cap only ever refuses surplus.
+    /// Unauthenticated future votes are uncapped, because a cap over contents we
+    /// cannot vouch for refuses genuine votes as readily as forged ones and
+    /// whichever arrives second loses. Authenticated ones are capped, because
+    /// then it can only ever refuse surplus from real validators. Current votes
+    /// are always capped, having passed the origin check.
     #[test]
-    fn future_votes_are_uncapped_and_current_votes_are_capped() {
+    fn future_cap_applies_only_to_authenticated_senders() {
         let mut pool = VotePool::new();
 
         let envelope = |target: B256, i: usize| {
@@ -1073,31 +1189,91 @@ mod tests {
             }
         };
 
-        // Well past go-bsc's former future cap of 50.
-        let future_target = B256::from([0x77; 32]);
-        for i in 0..200 {
+        // Unauthenticated future sender: well past the cap, never refused.
+        let unauth = B256::from([0x77; 32]);
+        for i in 0..(MAX_FUTURE_VOTE_AMOUNT_PER_BLOCK * 4) {
             assert!(
-                !pool.is_at_capacity(&future_target, true),
-                "a future target must never refuse a vote for capacity (i={i})",
+                !pool.is_at_capacity(&unauth, true, false),
+                "an unauthenticated future bucket must never refuse (i={i})",
             );
-            pool.insert(envelope(future_target, i), 0, true);
+            pool.insert(envelope(unauth, i), 0, true);
         }
         assert_eq!(
-            pool.future_votes.get(&future_target).map(|vm| vm.vote_messages.len()),
-            Some(200),
-            "every future vote is retained",
+            pool.future_votes.get(&unauth).map(|vm| vm.vote_messages.len()),
+            Some(MAX_FUTURE_VOTE_AMOUNT_PER_BLOCK * 4),
+            "every unauthenticated future vote is retained",
         );
 
-        // Current votes still stop at the validator-count cap.
+        // Authenticated future sender: capped.
+        let auth = B256::from([0x79; 32]);
+        for i in 0..MAX_FUTURE_VOTE_AMOUNT_PER_BLOCK {
+            assert!(!pool.is_at_capacity(&auth, true, true), "below the future cap (i={i})");
+            pool.insert(envelope(auth, 5_000 + i), 0, true);
+        }
+        assert!(
+            pool.is_at_capacity(&auth, true, true),
+            "an authenticated future bucket stops at MAX_FUTURE_VOTE_AMOUNT_PER_BLOCK",
+        );
+
+        // Current votes stop at the validator-count cap.
         let cur_target = B256::from([0x78; 32]);
         for i in 0..MAX_CUR_VOTE_AMOUNT_PER_BLOCK {
-            assert!(!pool.is_at_capacity(&cur_target, false), "below the cap (i={i})");
+            assert!(!pool.is_at_capacity(&cur_target, false, false), "below the cap (i={i})");
             pool.insert(envelope(cur_target, 1_000 + i), 0, false);
         }
         assert!(
-            pool.is_at_capacity(&cur_target, false),
+            pool.is_at_capacity(&cur_target, false, false),
             "current votes must stop at MAX_CUR_VOTE_AMOUNT_PER_BLOCK",
         );
+    }
+
+    /// Shedding releases future votes when pruning cannot, furthest-ahead first.
+    ///
+    /// Answers the "what if there are too many bad votes" case: a flood that
+    /// targets recent heights sits entirely inside the admission window, so
+    /// pruning by head frees nothing and the pool needs another way down.
+    #[test]
+    fn shedding_releases_future_votes_furthest_ahead_first() {
+        let mut pool = VotePool::new();
+
+        // Three future targets at increasing heights, two votes each.
+        for (n, byte) in [(100u64, 0xb1u8), (200, 0xb2), (300, 0xb3)] {
+            let target = B256::from([byte; 32]);
+            for i in 0..2usize {
+                let mut address = VoteAddress::default();
+                address[0] = byte;
+                address[1] = i as u8;
+                pool.insert(
+                    VoteEnvelope {
+                        vote_address: address,
+                        signature: VoteSignature::default(),
+                        data: VoteData {
+                            source_number: n - 1,
+                            source_hash: B256::from([0x01; 32]),
+                            target_number: n,
+                            target_hash: target,
+                        },
+                    },
+                    0,
+                    true,
+                );
+            }
+        }
+        assert_eq!(pool.len(), 6);
+
+        // Ask for 1; the furthest-ahead bucket (300) goes, releasing both of its
+        // votes. Buckets are released whole, so shedding can overshoot.
+        let shed = pool.shed_future_votes(1);
+        assert_eq!(shed, 2, "the whole furthest-ahead bucket is released");
+        assert!(
+            !pool.future_votes.contains_key(&B256::from([0xb3; 32])),
+            "height 300 shed first",
+        );
+        assert!(
+            pool.future_votes.contains_key(&B256::from([0xb1; 32])),
+            "height 100 retained: nearest to promotion",
+        );
+        assert_eq!(pool.len(), 4, "accounting follows the shed votes");
     }
 
     /// One target hash cannot be made to hold unbounded votes, however many
