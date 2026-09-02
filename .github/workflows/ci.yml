@@ -26,7 +26,10 @@ jobs:
 
   test:
     name: Cargo Test
-    runs-on: ubuntu-latest
+    # org larger runner (16 vCPU / 64 GB). Tests run with --test-threads=1, so
+    # the cores go to building the workspace and to the tokio runtimes the node
+    # tests spin up internally, not to test-level parallelism.
+    runs-on: runner-linux-x64-16core
     steps:
       - uses: actions/checkout@v4
       - name: Install system dependencies
