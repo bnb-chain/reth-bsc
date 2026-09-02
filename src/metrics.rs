@@ -191,6 +191,32 @@ pub struct BscMevMetrics {
     pub bid_interrupt_late_total: Counter,
 }
 
+/// Metrics for the BEP-675 gRPC ingress.
+#[derive(Metrics, Clone)]
+#[metrics(scope = "bsc.mev.grpc")]
+pub struct BscMevGrpcMetrics {
+    /// Total `SendBidBlock` requests that reached the gRPC handler.
+    pub requests_total: Counter,
+
+    /// Total gRPC BidBlock requests rejected by decoding or MEV admission.
+    pub errors_total: Counter,
+
+    /// Total requests rejected because the process-wide concurrency budget was exhausted.
+    pub rejected_total: Counter,
+
+    /// Current number of gRPC BidBlock requests holding an admission permit.
+    pub active_requests: Gauge,
+
+    /// RLP BidBlock decode duration in seconds.
+    pub decode_duration_seconds: Histogram,
+
+    /// End-to-end handler duration in seconds.
+    pub handler_duration_seconds: Histogram,
+
+    /// Submitted RLP payload size in bytes.
+    pub payload_size_bytes: Histogram,
+}
+
 /// Metrics for BSC miner/worker operations
 ///
 /// Tracks block production and finalization metrics.

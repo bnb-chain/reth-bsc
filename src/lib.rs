@@ -1,6 +1,7 @@
 pub mod chainspec;
 pub mod consensus;
 pub mod evm;
+pub mod grpc;
 pub mod hardforks;
 pub mod metrics;
 pub mod node;

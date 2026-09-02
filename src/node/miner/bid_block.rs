@@ -28,7 +28,7 @@ use alloy_consensus::transaction::RlpEcdsaDecodableTx;
 use alloy_consensus::{Header, Transaction, TxLegacy};
 use alloy_eips::eip2718::Decodable2718;
 use alloy_primitives::{keccak256, Address, Bytes, Signature, B256, U256};
-use alloy_rlp::Decodable;
+use alloy_rlp::{Decodable, Encodable};
 use reth::primitives::SealedHeader;
 use reth_chainspec::EthChainSpec;
 use reth_ethereum_primitives::{BlockBody, TransactionSigned};
@@ -59,6 +59,46 @@ pub struct BidBlock {
     /// Blob sidecars for any blob transactions (empty/omitted when there are none).
     #[serde(default)]
     pub sidecars: Vec<BscBlobTransactionSidecar>,
+}
+
+// go-bsc transports BidBlock over gRPC as the ordinary RLP encoding of its three exported fields:
+// [header, transactions, sidecars]. Keep this implementation on the domain type so the gRPC path
+// and any future binary ingress cannot drift from the structure builders encode with geth/rlp.
+impl Encodable for BidBlock {
+    fn encode(&self, out: &mut dyn bytes::BufMut) {
+        let payload_length =
+            self.header.length() + self.transactions.length() + self.sidecars.length();
+        alloy_rlp::Header { list: true, payload_length }.encode(out);
+        self.header.encode(out);
+        self.transactions.encode(out);
+        self.sidecars.encode(out);
+    }
+
+    fn length(&self) -> usize {
+        let payload_length =
+            self.header.length() + self.transactions.length() + self.sidecars.length();
+        alloy_rlp::Header { list: true, payload_length }.length() + payload_length
+    }
+}
+
+impl Decodable for BidBlock {
+    fn decode(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
+        let header = alloy_rlp::Header::decode(buf)?;
+        if !header.list {
+            return Err(alloy_rlp::Error::UnexpectedString);
+        }
+        let remaining = buf.len();
+
+        let block = Self {
+            header: Header::decode(buf)?,
+            transactions: Vec::<Bytes>::decode(buf)?,
+            sidecars: Vec::<BscBlobTransactionSidecar>::decode(buf)?,
+        };
+        if remaining.saturating_sub(buf.len()) != header.payload_length {
+            return Err(alloy_rlp::Error::UnexpectedLength);
+        }
+        Ok(block)
+    }
 }
 
 impl BidBlock {
@@ -939,8 +979,6 @@ pub fn simulate_bid_block(
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Needed by the hand-rolled RLP fixtures below; the production path no longer RLP-encodes.
-    use alloy_rlp::Encodable;
     use alloy_primitives::{address, b256, bytes, hex};
 
     /// Repro for the blob-BidBlock admission stack overflow: run the decode+hash path a tokio
@@ -1037,6 +1075,21 @@ mod tests {
             h.extra_data = Bytes::from(vec![0u8; 32]);
         });
         BidBlock { header, transactions: Vec::new(), sidecars: Vec::new() }
+    }
+
+    #[test]
+    fn bid_block_rlp_roundtrip_matches_grpc_wire_shape() {
+        let block = BidBlock {
+            header: vector_a_block().header,
+            transactions: vec![bytes!("0x010203"), bytes!("0xdeadbeef")],
+            sidecars: Vec::new(),
+        };
+        let encoded = alloy_rlp::encode(&block);
+        let mut input = encoded.as_slice();
+        let decoded = BidBlock::decode(&mut input).unwrap();
+
+        assert!(input.is_empty(), "BidBlock decoder must consume one complete RLP value");
+        assert_eq!(decoded, block);
     }
 
     #[test]

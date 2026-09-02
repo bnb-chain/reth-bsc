@@ -12,7 +12,7 @@ use cometbft_light_client_verifier::{
     types::{Validator, ValidatorSet},
 };
 use cometbft_proto::types::v1::LightBlock as TmLightBlock;
-use prost::Message;
+use prost12::Message;
 use revm::precompile::{
     u64_to_address, PrecompileHalt, PrecompileOutput, PrecompileResult, Precompile, PrecompileId,
 };

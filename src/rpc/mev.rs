@@ -321,7 +321,11 @@ fn bid_must_before_ms(parent_timestamp_ms: u64, block_interval_ms: u64, delay_le
         .saturating_sub(delay_left_over_ms as u128)
 }
 
-/// Implementation of the MEV Builder RPC API
+/// Implementation of the MEV Builder RPC API.
+///
+/// Clones share the whitelist and pending-BidBlock accounting. This lets JSON-RPC and gRPC expose
+/// the same admission object without creating separate duplicate/quota state.
+#[derive(Clone)]
 pub struct MevApiImpl {
     snapshot_provider: Arc<dyn SnapshotProvider + Send + Sync>,
     chain_spec: Arc<BscChainSpec>,
@@ -556,6 +560,65 @@ impl MevApiImpl {
     /// Internal error (`-32603`) for conditions go-bsc never hits (e.g. the chain head missing).
     fn internal_err(msg: impl Into<String>) -> jsonrpsee::types::ErrorObjectOwned {
         jsonrpsee::types::ErrorObject::owned(-32603, msg.into(), None::<()>)
+    }
+
+    /// Submit a builder-proposed BEP-675 block through the common validator admission path.
+    ///
+    /// Both `mev_sendBidBlock` and `mev.v1.BidBlockService/SendBidBlock` call this method so the
+    /// fork gate, signature/permission checks, duplicate quota and miner queue cannot diverge by
+    /// transport.
+    pub async fn submit_bid_block(&self, args: BidBlockArgs) -> RpcResult<B256> {
+        let bb = &args.bid_block;
+
+        if !crate::shared::is_mev_running() {
+            return Err(Self::mev_not_running());
+        }
+
+        // Chain-head context (the parent the bid must build on); go-bsc reads `CurrentBlock()`.
+        let head_number = crate::shared::get_best_canonical_block_number()
+            .ok_or_else(|| Self::internal_err("chain head unavailable"))?;
+        let head_header = self
+            .get_header_by_number(head_number)
+            .ok_or_else(|| Self::internal_err("chain head header unavailable"))?;
+
+        // Number, then in-turn, then parent-hash alignment — go-bsc's order, enforced in
+        // `validate_bid_block_structure` so the ordering itself is unit-tested.
+        let block_number = bb.header.number;
+        let parent_hash = head_header.hash_slow();
+        let is_inturn = self
+            .snapshot_provider
+            .snapshot_by_hash(&parent_hash)
+            .is_some_and(|snapshot| snapshot.is_inturn(self.validator_address));
+
+        if let Err(rejection) = validate_bid_block_structure(
+            block_number,
+            head_number,
+            is_inturn,
+            bb.header.parent_hash,
+            parent_hash,
+            bb.header.gas_used,
+            bb.transactions.len(),
+        ) {
+            use BidBlockStructuralRejection as R;
+            return Err(match rejection {
+                R::StaleNumber => Self::invalid_bid(format!(
+                    "stale block number: {block_number}, latest block: {head_number}"
+                )),
+                R::FutureNumber => Self::invalid_bid(format!(
+                    "block in future: {block_number}, latest block: {head_number}"
+                )),
+                R::NotInTurn => Self::mev_not_in_turn(),
+                R::NonAlignedParent => {
+                    Self::invalid_bid(format!("non-aligned parent hash: {parent_hash:?}"))
+                }
+                R::EmptyGasUsed => Self::invalid_bid("empty gasUsed in header"),
+                R::EmptyTransactions => Self::invalid_bid("empty transactions"),
+            });
+        }
+
+        // Every rejection above returns before this point, so nothing structurally invalid can
+        // reach the miner queue (TC-009's `bid_block_queue_len()` invariant).
+        self.admit_bid_block(&args, &head_header)
     }
 
     /// Miner-side BidBlock admission — mirrors the front of go-bsc `Miner.SendBidBlock`:
@@ -1240,57 +1303,7 @@ impl BscMevApiServer for MevApiImpl {
     /// non-empty gasUsed/txs). It then delegates to [`MevApiImpl::admit_bid_block`], which mirrors
     /// `Miner.SendBidBlock`.
     async fn send_bid_block(&self, args: BidBlockArgs) -> RpcResult<B256> {
-        let bb = &args.bid_block;
-
-        if !crate::shared::is_mev_running() {
-            return Err(Self::mev_not_running());
-        }
-
-        // Chain-head context (the parent the bid must build on); go-bsc reads `CurrentBlock()`.
-        let head_number = crate::shared::get_best_canonical_block_number()
-            .ok_or_else(|| Self::internal_err("chain head unavailable"))?;
-        let head_header = self
-            .get_header_by_number(head_number)
-            .ok_or_else(|| Self::internal_err("chain head header unavailable"))?;
-
-        // Number, then in-turn, then parent-hash alignment — go-bsc's order, enforced in
-        // `validate_bid_block_structure` so the ordering itself is unit-tested.
-        let block_number = bb.header.number;
-        let parent_hash = head_header.hash_slow();
-        let is_inturn = self
-            .snapshot_provider
-            .snapshot_by_hash(&parent_hash)
-            .is_some_and(|snapshot| snapshot.is_inturn(self.validator_address));
-
-        if let Err(rejection) = validate_bid_block_structure(
-            block_number,
-            head_number,
-            is_inturn,
-            bb.header.parent_hash,
-            parent_hash,
-            bb.header.gas_used,
-            bb.transactions.len(),
-        ) {
-            use BidBlockStructuralRejection as R;
-            return Err(match rejection {
-                R::StaleNumber => Self::invalid_bid(format!(
-                    "stale block number: {block_number}, latest block: {head_number}"
-                )),
-                R::FutureNumber => Self::invalid_bid(format!(
-                    "block in future: {block_number}, latest block: {head_number}"
-                )),
-                R::NotInTurn => Self::mev_not_in_turn(),
-                R::NonAlignedParent => {
-                    Self::invalid_bid(format!("non-aligned parent hash: {parent_hash:?}"))
-                }
-                R::EmptyGasUsed => Self::invalid_bid("empty gasUsed in header"),
-                R::EmptyTransactions => Self::invalid_bid("empty transactions"),
-            });
-        }
-
-        // Every rejection above returns before this point, so nothing structurally invalid can reach
-        // the miner queue (TC-009's `bid_block_queue_len()` invariant).
-        self.admit_bid_block(&args, &head_header)
+        self.submit_bid_block(args).await
     }
 
     /// Get MEV parameters
