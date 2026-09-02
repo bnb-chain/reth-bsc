@@ -670,4 +670,61 @@ mod tests {
         assert_eq!(votes::len(), before + 1, "peer must be served after the window rolls");
     }
 
+
+    /// Only the first vote of a packet is admitted, and that is correct.
+    ///
+    /// This pins a behaviour that looks like a bug and is not. go-bsc does the
+    /// same in `eth/handler_bsc.go`:
+    ///
+    /// ```text
+    ///   // Here we only put the first vote, to avoid ddos attack by sending a
+    ///   // large batch of votes. This won't abandon any valid vote, because one
+    ///   // vote is sent every time referring to func voteBroadcastLoop
+    ///   if len(votes) > 0 { h.votepool.PutVote(votes[0]) }
+    /// ```
+    ///
+    /// It arrived in `3fd5b0c149` ("defend ddos voting attack ... according to
+    /// audit", bnb-chain/bsc#1741, 2023-07-11), which *replaced* a
+    /// `for _, vote := range votes { PutVote(vote) }` loop and, in the same
+    /// commit, introduced the per-peer receive rate limit ported above. The two
+    /// are halves of one fix: bound what a packet can admit, and bound what a
+    /// peer may send.
+    ///
+    /// Nothing is lost, because geth's `voteBroadcastLoop` sends one vote per
+    /// message by design (`eth/handler.go`: "one vote will be sent instantly
+    /// without waiting for other votes for batch sending"). Multi-vote packets
+    /// only arise from the best-effort sync-on-connect dump.
+    ///
+    /// A reviewer working from a stale reading of upstream may try to "fix" this
+    /// into whole-packet ingestion. That would need the per-peer budget to
+    /// already be in place, and it would diverge from current go-bsc. This test
+    /// is here to force that conversation rather than let it happen silently.
+    #[test]
+    fn only_the_first_vote_of_a_packet_is_admitted() {
+        let first = B256::repeat_byte(0xa1);
+        let second = B256::repeat_byte(0xa2);
+        let third = B256::repeat_byte(0xa3);
+
+        let before = votes::len();
+        let reply = dispatch(&frame_of(VotesPacket(vec![
+            vote(30_001_000, first),
+            vote(30_001_001, second),
+            vote(30_001_002, third),
+        ])));
+
+        assert!(reply.is_none(), "a votes frame needs no reply");
+        assert_eq!(votes::len(), before + 1, "exactly one vote from the packet is admitted");
+        assert_eq!(
+            votes::fetch_any_vote_by_block_hash(first).len(),
+            1,
+            "the first vote is the one admitted",
+        );
+        for (label, hash) in [("second", second), ("third", third)] {
+            assert!(
+                votes::fetch_any_vote_by_block_hash(hash).is_empty(),
+                "the {label} vote must be discarded",
+            );
+        }
+    }
+
 }
