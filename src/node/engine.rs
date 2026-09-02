@@ -106,6 +106,32 @@ where
         pool: Pool,
         _evm_config: Evm,
     ) -> eyre::Result<PayloadBuilderHandle<BscPayloadTypes>> {
+        // BidBlock revoke lockouts (validator-local MEV policy) journal to a single file under
+        // the datadir rather than chaindata — go-bsc parity (`BidBlockRevokesJournal`, default
+        // `bidblockrevokes.json`). Like go's config field, `BSC_BID_BLOCK_REVOKES_JOURNAL`
+        // overrides the location (a relative path is resolved under the datadir) and an empty
+        // value disables persistence entirely. Registered here, during component build, so it is
+        // in place before any consumer lazily initializes the global manager.
+        use reth_chainspec::EthChainSpec as _;
+        let datadir =
+            ctx.config().datadir.clone().resolve_datadir(ctx.chain_spec().chain());
+        let revokes_journal = match std::env::var("BSC_BID_BLOCK_REVOKES_JOURNAL") {
+            Ok(path) if path.is_empty() => None, // explicit opt-out: purely in-memory
+            Ok(path) => {
+                let path = std::path::PathBuf::from(path);
+                Some(if path.is_absolute() { path } else { datadir.data_dir().join(path) })
+            }
+            Err(_) => Some(datadir.data_dir().join("bidblockrevokes.json")),
+        };
+        if let Some(path) = revokes_journal {
+            if crate::shared::set_bid_block_revokes_journal(path).is_err() {
+                tracing::warn!(
+                    target: "payload_builder",
+                    "BidBlock revoke journal path already registered; keeping the existing one"
+                );
+            }
+        }
+
         let (tx, mut rx) = mpsc::unbounded_channel();
         // Load mining configuration from environment, allow override via CLI if set globally
         let mining_config =
