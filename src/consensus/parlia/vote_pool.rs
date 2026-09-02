@@ -31,11 +31,33 @@ const REJECTED_VOTE_CACHE_SIZE: usize = 8192;
 /// Votes retained per target hash once we hold the target block, matching
 /// go-bsc's `maxCurVoteAmountPerBlock`. One per validator suffices.
 const MAX_CUR_VOTE_AMOUNT_PER_BLOCK: usize = 21;
-/// Votes retained per target hash while the target block is still unknown
-/// (`maxFutureVoteAmountPerBlock`). Higher than the current-vote cap because we
-/// cannot yet resolve the target's validator set, so non-validator votes cannot
-/// be filtered out until promotion.
-const MAX_FUTURE_VOTE_AMOUNT_PER_BLOCK: usize = 50;
+// Deliberately no per-target cap on future votes.
+//
+// go-bsc has one (`maxFutureVoteAmountPerBlock = 50`), but capping a bucket
+// whose contents cannot be authenticated turns the cap into a censorship tool.
+// A future vote is only signature-checked, and a signature proves the signer
+// holds the key in the envelope — not that the key belongs to a validator. So
+// any peer can mint keys, self-sign 50 envelopes for a target hash it has seen
+// and we have not, and fill the bucket. Genuine validator votes for that target
+// are then refused, and nothing re-sends them: votes are broadcast once. When
+// the block finally arrives the junk is discarded at promotion, but the real
+// votes are already lost, so that target can never reach local quorum.
+//
+// Leaving the future bucket uncapped trades that for bounded waste. Memory is
+// still held by three other limits: the `(head-256, head+11]` admission window
+// bounds how many distinct targets can be addressed, `MAX_VOTES_IN_POOL` bounds
+// the pool overall, and the per-peer receive budget bounds the rate. Junk is
+// reclaimed by promotion and by pruning. Losing good votes is not recoverable;
+// holding useless ones briefly is.
+//
+// NOTE: go-bsc appears to share this weakness. `basicVerify` applies the 50-cap
+// to future votes with only `vote.Verify()` behind it, `VerifyVote` runs solely
+// for current votes, and there is no per-peer accounting for future votes
+// anywhere in `core/vote/vote_pool.go`. Worth reporting upstream rather than
+// assuming reth-bsc is the only client affected.
+//
+// The real fix, ahead of both clients, is per-peer fairness for unauthenticated
+// votes, which needs peer identity plumbed into the ingest path.
 /// Size of the LRU cache for tracking finality notifications (matches geth's finalizedNotified)
 const FINALIZED_NOTIFIED_CACHE_SIZE: usize = 21;
 
@@ -122,17 +144,20 @@ impl VotePool {
         }
     }
 
-    /// Whether this target hash already holds its per-pool maximum.
+    /// Whether this target hash already holds its maximum current votes.
     ///
-    /// go-bsc applies the same cap in `basicVerify`, bounding how much one block
-    /// hash can cost us regardless of how many peers relay votes for it.
+    /// Applies to current votes only. Those have passed the origin check, so the
+    /// cap can only ever refuse a vote we know to be surplus — one validator's
+    /// vote per target is all that counts, and the cap sits at the validator
+    /// count. Future votes are intentionally uncapped; see the note above the
+    /// absent `MAX_FUTURE_VOTE_AMOUNT_PER_BLOCK`.
     fn is_at_capacity(&self, block_hash: &B256, is_future: bool) -> bool {
-        let (votes, cap) = if is_future {
-            (&self.future_votes, MAX_FUTURE_VOTE_AMOUNT_PER_BLOCK)
-        } else {
-            (&self.cur_votes, MAX_CUR_VOTE_AMOUNT_PER_BLOCK)
-        };
-        votes.get(block_hash).is_some_and(|vm| vm.vote_messages.len() >= cap)
+        if is_future {
+            return false;
+        }
+        self.cur_votes
+            .get(block_hash)
+            .is_some_and(|vm| vm.vote_messages.len() >= MAX_CUR_VOTE_AMOUNT_PER_BLOCK)
     }
 
     /// Insert a vote and return the new *current* vote count for its target
@@ -1017,6 +1042,63 @@ mod tests {
         let _ = drain();
     }
 
+
+
+
+    // === D1: per-target vote caps ===
+
+    /// Future votes carry no per-target cap; current votes do.
+    ///
+    /// A future vote is only signature-checked, and a signature does not show
+    /// the signer is a validator — so a cap there refuses genuine votes as
+    /// readily as forged ones, and whichever arrives second loses. Current votes
+    /// have passed the origin check, so their cap only ever refuses surplus.
+    #[test]
+    fn future_votes_are_uncapped_and_current_votes_are_capped() {
+        let mut pool = VotePool::new();
+
+        let envelope = |target: B256, i: usize| {
+            let mut address = VoteAddress::default();
+            address[0] = (i & 0xff) as u8;
+            address[1] = ((i >> 8) & 0xff) as u8;
+            VoteEnvelope {
+                vote_address: address,
+                signature: VoteSignature::default(),
+                data: VoteData {
+                    source_number: 10,
+                    source_hash: B256::from([0x71; 32]),
+                    target_number: 11,
+                    target_hash: target,
+                },
+            }
+        };
+
+        // Well past go-bsc's former future cap of 50.
+        let future_target = B256::from([0x77; 32]);
+        for i in 0..200 {
+            assert!(
+                !pool.is_at_capacity(&future_target, true),
+                "a future target must never refuse a vote for capacity (i={i})",
+            );
+            pool.insert(envelope(future_target, i), 0, true);
+        }
+        assert_eq!(
+            pool.future_votes.get(&future_target).map(|vm| vm.vote_messages.len()),
+            Some(200),
+            "every future vote is retained",
+        );
+
+        // Current votes still stop at the validator-count cap.
+        let cur_target = B256::from([0x78; 32]);
+        for i in 0..MAX_CUR_VOTE_AMOUNT_PER_BLOCK {
+            assert!(!pool.is_at_capacity(&cur_target, false), "below the cap (i={i})");
+            pool.insert(envelope(cur_target, 1_000 + i), 0, false);
+        }
+        assert!(
+            pool.is_at_capacity(&cur_target, false),
+            "current votes must stop at MAX_CUR_VOTE_AMOUNT_PER_BLOCK",
+        );
+    }
 
     /// One target hash cannot be made to hold unbounded votes, however many
     /// distinct validators sign for it. Mirrors go-bsc's cap in `basicVerify`.
