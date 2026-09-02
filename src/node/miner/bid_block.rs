@@ -542,11 +542,11 @@ pub fn validate_bid_block_average_gas_price<R: alloy_consensus::TxReceipt>(
 /// Pre-seal verification of an admitted BidBlock (go-bsc `bidSimulator.preSealVerifyBidBlock`).
 ///
 /// Runs the cheap checks a validator makes before sealing a builder block, in go-bsc's order:
-/// coinbase is the validator, gas limit matches the in-turn target, the header is a valid unsealed
-/// Parlia header, the timestamp is within the slot, the deposit (gas-fee) value is non-zero, blob
-/// sidecars are well-formed, no user tx exceeds the per-tx gas cap, and the trailing system-tx
-/// region is valid. KZG proofs and parent-relative cascading fields are re-checked at block
-/// insertion. Returns the located `(system_tx_start, gas_fee)`.
+/// state root is non-zero, coinbase is the validator, gas limit matches the in-turn target, the
+/// header is a valid unsealed Parlia header, the timestamp is within the slot, the deposit
+/// (gas-fee) value is non-zero, blob sidecars are well-formed, no user tx exceeds the per-tx gas
+/// cap, and the trailing system-tx region is valid. KZG proofs and parent-relative cascading fields
+/// are re-checked at block insertion. Returns the located `(system_tx_start, gas_fee)`.
 ///
 /// `expected_gas_limit` is the caller's `calculate_block_gas_limit(parent.gas_limit, ceil)` (reth's
 /// `core.CalcGasLimit`); `etherbase` is the validator address; `snap` is the parent's snapshot.
@@ -560,6 +560,10 @@ pub fn pre_seal_verify_bid_block(
     etherbase: Address,
     expected_gas_limit: u64,
 ) -> Result<(usize, U256), PreSealVerifyError> {
+    // bsc #3798: reject the sentinel root before doing any Parlia or payload work. Builders must
+    // commit to their expected post-state even though zero-simulate verifies it after broadcast.
+    verify_bid_block_state_root(&decoded.header)?;
+
     // go-bsc checks coinbase/gasLimit before VerifyUnsealedHeader (see preSealVerifyBidBlock) —
     // matters now that verify_bid_block_header's cascading checks depend on the header's coinbase
     // too, so a header with a *wrong* coinbase must surface `InvalidCoinbase`, not
@@ -660,6 +664,9 @@ pub fn verify_bid_block_payload(
     expected_gas_limit: u64,
 ) -> Result<(usize, U256), PreSealVerifyError> {
     let header = &decoded.header;
+    // This is the production admission/simulation seam in reth-bsc. Keep the same cheap guard here
+    // as in `pre_seal_verify_bid_block` so both the synchronous RPC path and miner path benefit.
+    verify_bid_block_state_root(header)?;
     verify_bid_block_coinbase_and_gas_limit(header, etherbase, expected_gas_limit)?;
 
     // go-bsc `preSealVerifyBidBlock`: `DeriveSha(decoded.Txs) == header.TxHash`.
@@ -711,9 +718,18 @@ pub fn verify_bid_block_payload(
     Ok((system_tx_start, gas_fee))
 }
 
+fn verify_bid_block_state_root(header: &Header) -> Result<(), PreSealVerifyError> {
+    if header.state_root == B256::ZERO {
+        return Err(PreSealVerifyError::ZeroStateRoot);
+    }
+    Ok(())
+}
+
 /// Why an admitted BidBlock failed pre-seal verification (see [`pre_seal_verify_bid_block`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PreSealVerifyError {
+    /// Builder supplied the zero state-root sentinel (bsc #3798).
+    ZeroStateRoot,
     /// Header coinbase is not the in-turn validator.
     InvalidCoinbase { got: Address, want: Address },
     /// Header gas limit does not equal the in-turn target.
@@ -744,6 +760,9 @@ pub enum PreSealVerifyError {
 impl fmt::Display for PreSealVerifyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ZeroStateRoot => {
+                write!(f, "bid block rejected due to zero state root")
+            }
             Self::InvalidCoinbase { got, want } => {
                 write!(f, "invalid coinbase: got {got}, want {want}")
             }
@@ -1509,6 +1528,7 @@ mod tests {
             beneficiary: etherbase,
             gas_limit,
             gas_used: 21_000,
+            state_root: B256::repeat_byte(0x44),
             ommers_hash: EMPTY_OMMER_ROOT_HASH,
             extra_data: Bytes::from(vec![0u8; 32 + 65]),
             // `snap_with_interval`'s lone validator is always in-turn (a single-member set has
@@ -1661,6 +1681,33 @@ mod tests {
                 header.gas_limit
             ),
             Ok((1, U256::from(100)))
+        );
+    }
+
+    #[test]
+    fn pre_seal_rejects_zero_state_root_before_other_checks() {
+        let spec = preseal_spec();
+        let parlia = parlia_engine(spec.clone());
+        let snap = snap_with_interval(3_000);
+        let etherbase = Address::repeat_byte(0x11);
+        // Deliberately also use the wrong coinbase: bsc #3798 requires the zero-root rejection to
+        // win because it is the first pre-seal check.
+        let mut header = valid_bid_header(Address::repeat_byte(0x22), 30_000_000);
+        header.state_root = B256::ZERO;
+        let parent = Header { number: 0, timestamp: 1, gas_limit: 30_000_000, ..Default::default() };
+        let d = decoded_block(header, vec![], vec![]);
+
+        assert_eq!(
+            pre_seal_verify_bid_block(&parlia, &spec, &d, &parent, &snap, etherbase, 30_000_000),
+            Err(PreSealVerifyError::ZeroStateRoot)
+        );
+        assert_eq!(
+            verify_bid_block_payload(&spec, &d, &parent, etherbase, 30_000_000),
+            Err(PreSealVerifyError::ZeroStateRoot)
+        );
+        assert_eq!(
+            PreSealVerifyError::ZeroStateRoot.to_string(),
+            "bid block rejected due to zero state root"
         );
     }
 
