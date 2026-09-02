@@ -1,4 +1,6 @@
 pub mod admin;
+#[cfg(test)]
+mod block_overrides_tests;
 pub mod blob;
 pub mod debug_builder;
 pub mod eth_config;

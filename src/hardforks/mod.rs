@@ -365,4 +365,19 @@ pub trait BscHardforks: EthereumHardforks {
         self.is_london_active_at_block(block_number) &&
         self.bsc_fork_activation(BscHardfork::Pasteur).active_at_timestamp(timestamp)
     }
+
+    /// Convenience method to check if [`BscHardfork::Jenner`] is firstly active at a given
+    /// timestamp and parent timestamp.
+    fn is_jenner_transition_at_timestamp(&self, block_number: u64, timestamp: u64, parent_timestamp: u64) -> bool {
+        let parent_number = block_number.saturating_sub(1);
+        !self.is_jenner_active_at_timestamp(parent_number, parent_timestamp)
+            && self.is_jenner_active_at_timestamp(block_number, timestamp)
+    }
+
+    /// Convenience method to check if [`BscHardfork::Jenner`] (BEP-706) is active at a given
+    /// timestamp.
+    fn is_jenner_active_at_timestamp(&self, block_number: u64, timestamp: u64) -> bool {
+        self.is_london_active_at_block(block_number) &&
+        self.bsc_fork_activation(BscHardfork::Jenner).active_at_timestamp(timestamp)
+    }
 }

@@ -6,7 +6,7 @@ use crate::evm::{
 
 use reth_evm::Database;
 use revm::{
-    context::{BlockEnv, ContextSetters},
+    context::ContextSetters,
     context_interface::{
         result::{EVMError, ExecutionResult, ResultAndState},
         ContextTr,
@@ -25,10 +25,22 @@ where
     type State = EvmState;
     type Error = EVMError<DB::Error>;
     type Tx = BscTxEnv;
-    type Block = BlockEnv;
+    type Block = crate::evm::block_env::BscBlockEnv;
 
     fn set_block(&mut self, block: Self::Block) {
+        let milli_remainder = block.milli_remainder;
         self.inner.set_block(block);
+        // The 0x70 precompile closure captures the millisecond remainder at
+        // registration time; replacing the block env must re-register it with the
+        // new block's remainder or a reused EVM would serve the previous block's
+        // sub-second value (the seconds are read live, the remainder is not).
+        if self.inner.ctx.cfg.spec >= crate::hardforks::bsc::BscHardfork::Jenner {
+            self.inner.precompiles.extend_precompiles([
+                crate::evm::precompiles::milli_timestamp::milli_timestamp_precompile(
+                    milli_remainder,
+                ),
+            ]);
+        }
     }
 
     fn transact_one(&mut self, mut tx: Self::Tx) -> Result<Self::ExecutionResult, Self::Error> {
