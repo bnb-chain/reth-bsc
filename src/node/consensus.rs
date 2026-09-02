@@ -1371,19 +1371,16 @@ where
             return None;
         }
 
-        let sp = shared::get_snapshot_provider()?;
-
-        match sp.snapshot_by_hash(&header.hash_slow()) {
-            Some(snap) => Some((snap.vote_data.target_number, snap.vote_data.target_hash)),
-            None => {
-                tracing::warn!(
-                    target: "bsc::forkchoice",
-                    header_hash = ?header.hash_slow(),
-                    "Missing snapshot for header when get justified number and hash"
-                );
-                None
-            }
+        let hash = header.hash_slow();
+        let pair = crate::consensus::parlia::vote_pool::justified_pair_for_hash(&hash);
+        if pair.is_none() {
+            tracing::warn!(
+                target: "bsc::forkchoice",
+                header_hash = ?hash,
+                "Missing snapshot for header when get justified number and hash"
+            );
         }
+        pair
     }
 
     /// Gets the finalized number and hash from the header's snapshot.
