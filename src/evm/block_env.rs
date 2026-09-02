@@ -354,7 +354,9 @@ mod tests {
 
     #[test]
     fn test_no_overrides_keep_the_block_values() {
-        // "没传就用原值": untouched env keeps the real header's remainder.
+        // Nothing passed, nothing overridden: an untouched env keeps the real
+        // header's remainder (go semantics: absent fields fall back to the
+        // block's own values).
         let mut e = env(SECS, REMAINDER);
         apply(&mut e, BlockOverrides::default()).unwrap();
         assert_eq!(e.milli_timestamp(), SECS * 1000 + REMAINDER);
