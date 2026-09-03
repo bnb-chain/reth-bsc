@@ -30,6 +30,11 @@ use alloy_evm::{
     },
     eth::receipt_builder::ReceiptBuilderCtx,
 };
+use crate::node::evm::error::BscBlockExecutionError;
+use crate::consensus::payment_lane::{
+    meta::LaneMeta, rules::classify, Budget, Commitment, Lane, LaneError,
+};
+use alloy_consensus::constants::KECCAK_EMPTY;
 use alloy_primitives::keccak256;
 use alloy_primitives::{hex, uint, Address, BlockNumber, Bytes, U256};
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
@@ -59,6 +64,9 @@ pub struct BscTxResult<H> {
     pub tx_type: TxType,
     pub tx: TransactionSigned,
     pub is_system: bool,
+    /// On the result rather than on `self`, so a transaction that errors between classification
+    /// and commit cannot leave a stale lane behind.
+    pub lane: Lane,
 }
 
 impl<H: Send + 'static> TxResult for BscTxResult<H> {
@@ -72,6 +80,14 @@ impl<H: Send + 'static> TxResult for BscTxResult<H> {
         self.inner
     }
 }
+/// BEP-703 lane state for one block: the governance snapshot read from `0x2007` before
+/// execution, and the payment gas booked so far.
+#[derive(Debug, Clone)]
+pub(crate) struct LaneState {
+    pub(crate) meta: LaneMeta,
+    pub(crate) budget: Budget,
+}
+
 /// Helper type for the input of post execution.
 #[allow(clippy::type_complexity)]
 #[derive(Debug, Clone)]
@@ -83,6 +99,8 @@ pub(crate) struct InnerExecutionContext {
     pub(crate) snap: Option<Snapshot>,
     pub(crate) header: Option<Header>,
     pub(crate) parent_header: Option<Header>,
+    /// `None` until Jenner, and on the activation block itself.
+    pub(crate) payment_lane: Option<LaneState>,
 }
 
 pub struct BscBlockExecutor<'a, EVM, Spec, R: ReceiptBuilder>
@@ -95,6 +113,9 @@ where
     pub(super) evm: EVM,
     /// Gas used in the block.
     pub(super) gas_used: u64,
+    /// Whether the DB still holds the parent's post-state, i.e. nothing in this block has been
+    /// committed yet. `load_lane_meta` refuses to read `0x2007` once this is false.
+    pub(super) db_at_parent_state: bool,
     /// Total blob gas used in the block.
     pub(super) blob_gas_used: u64,
     /// Receipts of executed transactions.
@@ -181,6 +202,7 @@ where
             spec,
             evm,
             gas_used: 0,
+            db_at_parent_state: true,
             blob_gas_used: 0,
             receipts: vec![],
             system_txs: vec![],
@@ -193,6 +215,7 @@ where
             snapshot_provider: crate::shared::get_snapshot_provider().cloned(),
             parlia,
             inner_ctx: InnerExecutionContext {
+                payment_lane: None,
                 current_validators: None,
                 expected_turn_length: None,
                 max_elected_validators: None,
@@ -358,6 +381,7 @@ where
             account.mark_touch();
             let mut changes: EvmState = Default::default();
             changes.insert(address, account);
+            self.db_at_parent_state = false;
             db.commit(changes.clone());
             changes
         };
@@ -411,6 +435,7 @@ where
         let mut changes: EvmState = Default::default();
         changes.insert(HISTORY_STORAGE_ADDRESS, account);
         db.commit(changes.clone());
+        self.db_at_parent_state = false;
 
         // Same reasoning as `upgrade_system_contract`: the incremental state-root pipeline only
         // sees changes reported through the hook, so this deployment must be announced or the
@@ -429,6 +454,41 @@ where
         );
         Ok(true)
     }
+    /// The lane budget as it stands, or `None` before Jenner.
+    ///
+    /// Read fresh per admission decision; `used` grows as payment transactions land, and a
+    /// snapshot pinned at zero evicts general transactions go-bsc would have packed.
+    pub(crate) fn payment_lane_budget(&self) -> Option<&Budget> {
+        self.inner_ctx.payment_lane.as_ref().map(|l| &l.budget)
+    }
+
+    /// Which lane this transaction's gas is booked against. `General` until Jenner.
+    ///
+    /// The code probe reads live state on every call. A deploy and a later transfer to the same
+    /// address must classify differently within one block, so memoizing by address is a fork.
+    pub(crate) fn classify_lane(
+        &mut self,
+        to: Option<Address>,
+        tx_type: u8,
+        value: U256,
+    ) -> Result<Lane, BlockExecutionError> {
+        // Cheap `Arc` clone: the probe below needs `&mut self`.
+        let Some(listed) = self.inner_ctx.payment_lane.as_ref().map(|l| l.meta.listed.clone())
+        else {
+            return Ok(Lane::General);
+        };
+
+        let db = self.evm.db_mut();
+        classify(to, tx_type, value, &listed, |to| match db.basic(to) {
+            Ok(None) => Ok(true),
+            Ok(Some(acc)) => Ok(acc.code_hash.is_zero() || acc.code_hash == KECCAK_EMPTY),
+            // Never `unwrap_or_default()`: that reports "no code", biasing the classification
+            // toward Payment and making an honest block look untruthful.
+            Err(err) => Err(LaneError::StateUnavailable(err.to_string())),
+        })
+        .map_err(|e| BscBlockExecutionError::from(e).into())
+    }
+
 }
 
 impl<'a, E, Spec, R> BlockExecutor for BscBlockExecutor<'a, E, Spec, R>
@@ -529,6 +589,7 @@ where
                 tx_type,
                 tx: tx_signed,
                 is_system: true,
+                lane: Lane::General,
             });
         }
 
@@ -537,6 +598,11 @@ where
         if !self.ctx.mode.authors_block() {
             self.hertz_patch_manager.patch_before_tx(&tx_signed, self.evm.db_mut())?;
         }
+
+        let lane = {
+            use alloy_consensus::{Transaction as _, Typed2718 as _};
+            self.classify_lane(tx_signed.to(), tx_signed.ty(), tx_signed.value())?
+        };
 
         let block_available_gas = self.evm.block().gas_limit() - self.gas_used;
         let tx_gas_limit = {
@@ -563,6 +629,42 @@ where
             let selector = if input.len() >= 4 { Some(hex::encode(&input[..4])) } else { None };
             (to, selector, input.len())
         };
+
+        // go-bsc gates exactly one loop this way (`worker.go`'s pool loop), never the import
+        // path and never an MEV bid. `shared` subtracts the miner's system-transaction reserve,
+        // the same quantity go-bsc's gas pool holds. `InvalidTx` is the sentinel because both
+        // producing loops already answer it with go-bsc's `txs.Pop()` — dropping this
+        // transaction and the sender's later nonces — whereas a capacity error aborts the build.
+        if self.ctx.mode == BscExecutionMode::Mining {
+            if let Some(budget) = self.payment_lane_budget().cloned() {
+                let reserved = self.parlia.estimate_gas_reserved_for_system_txs(
+                    self.inner_ctx.parent_header.as_ref().map(|p| p.timestamp),
+                    block_number,
+                    timestamp,
+                );
+                let shared = self
+                    .evm
+                    .block()
+                    .gas_limit()
+                    .saturating_sub(reserved)
+                    .saturating_sub(self.gas_used);
+                if !budget.admits(shared, lane, tx_gas_limit) {
+                    crate::metrics::LANE_METRICS.general_lane_yielded.increment(1);
+                    trace!(
+                        target: "bsc::payment_lane",
+                        ?lane, tx_gas_limit, shared, idle = budget.idle(),
+                        "dropping a transaction that would eat into the reserved quota"
+                    );
+                    return Err(BlockValidationError::InvalidTx {
+                        hash: tx_hash,
+                        error: Box::new(
+                            revm::context_interface::result::InvalidTransaction::CallerGasLimitMoreThanBlock,
+                        ),
+                    }
+                    .into());
+                }
+            }
+        }
 
         precompiles::push_precompile_trace_context(
             precompiles::PrecompileTraceContext::from_parts(
@@ -594,7 +696,7 @@ where
         let inner =
             self.evm.transact(tx_env).map_err(|err| BlockExecutionError::evm(err, tx_hash))?;
 
-        Ok(BscTxResult { inner, blob_gas_used, tx_type, tx: tx_signed, is_system: false })
+        Ok(BscTxResult { inner, blob_gas_used, tx_type, tx: tx_signed, is_system: false, lane })
     }
 
     fn commit_transaction(
@@ -614,6 +716,10 @@ where
 
         let gas_used = result.tx_gas_used();
         self.gas_used += gas_used;
+        // Same value as `self.gas_used`, so `Budget::used <= gas_used` holds by construction.
+        if let Some(lane_state) = self.inner_ctx.payment_lane.as_mut() {
+            lane_state.budget.record_used(output.lane, gas_used);
+        }
         self.blob_gas_used = self.blob_gas_used.saturating_add(output.blob_gas_used);
 
         self.receipts.push(self.receipt_builder.build_receipt(ReceiptBuilderCtx {
@@ -624,6 +730,7 @@ where
             cumulative_gas_used: self.gas_used,
         }));
 
+        self.db_at_parent_state = false;
         self.evm.db_mut().commit(state);
 
         // Apply hertz patch after tx (import only — see `patch_before_tx` above).
@@ -691,7 +798,9 @@ where
 
         match self.ctx.mode {
             // Generates and signs system txs (rewards, slashing, validator-set updates).
-            BscExecutionMode::Mining => self.finalize_new_block(&self.evm.block().clone())?,
+            BscExecutionMode::Mining | BscExecutionMode::BidSimulation => {
+                self.finalize_new_block(&self.evm.block().clone())?
+            }
             // Verifies the system txs already present in the received block.
             BscExecutionMode::Import => self.post_check_new_block(&self.evm.block().clone())?,
             // Neither: return the executed block as-is, matching BSC geth's simulation path.
@@ -701,6 +810,28 @@ where
                     block_id = %block_env.number(),
                     "Skipping Parlia finalization for simulated block"
                 );
+            }
+        }
+
+        // After the mode match, so the Parlia system transactions above are already in
+        // `self.gas_used` — the same point the importer checks at. Failure declines the block;
+        // there is no fallback that produces with the lane switched off.
+        if let Some(lane) = self.inner_ctx.payment_lane.as_ref() {
+            if self.ctx.mode.finalizes() {
+                let gas_limit = self.evm.block().gas_limit();
+                lane.budget.verify(gas_limit, self.gas_used).map_err(|e| {
+                    crate::metrics::LANE_METRICS.produce_declined.increment(1);
+                    BscBlockExecutionError::from(e)
+                })?;
+                debug_assert!(
+                    self.ctx.base.ommers.is_empty(),
+                    "a produced block must carry no ommers"
+                );
+                *self.ctx.payment_lane_sink.lock().unwrap() = Some(Commitment {
+                    quota: lane.budget.quota,
+                    payment_gas_used: lane.budget.used,
+                });
+                crate::metrics::LANE_METRICS.idle.set(lane.budget.idle() as f64);
             }
         }
 

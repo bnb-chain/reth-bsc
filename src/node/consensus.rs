@@ -14,13 +14,15 @@ use crate::{
     node::{engine_api::payload::BscPayloadTypes, BscNode},
     shared, BscBlock, BscBlockBody, BscPrimitives,
 };
-use alloy_consensus::{Header, TxReceipt};
+use crate::consensus::payment_lane::{
+    rules::check_ommers_hash_against_parent, OmmersHashError,
+};
+use alloy_consensus::{Header, TxReceipt, EMPTY_OMMER_ROOT_HASH};
 use alloy_eips::Encodable2718;
 use alloy_primitives::{Bytes, B256};
 use alloy_rpc_types_engine::{ForkchoiceState, PayloadStatusEnum};
 use reth::{
     api::FullNodeTypes,
-    beacon_consensus::EthBeaconConsensus,
     builder::{components::ConsensusBuilder, BuilderContext},
     consensus::{Consensus, ConsensusError, FullConsensus, HeaderValidator, ReceiptRootBloom},
     consensus_common::validation::{
@@ -71,7 +73,6 @@ where
 /// Provides basic checks as outlined in the execution specs.
 #[derive(Debug, Clone)]
 pub struct BscConsensus<ChainSpec> {
-    base: EthBeaconConsensus<ChainSpec>,
     parlia: Arc<Parlia<ChainSpec>>,
     chain_spec: Arc<ChainSpec>,
 }
@@ -123,7 +124,6 @@ fn validate_bsc_gas_limit_against_parent<ChainSpec: BscHardforks>(
 impl<ChainSpec: EthChainSpec + BscHardforks + 'static> BscConsensus<ChainSpec> {
     pub fn new(chain_spec: Arc<ChainSpec>) -> Self {
         Self {
-            base: EthBeaconConsensus::new(chain_spec.clone()),
             parlia: Arc::new(Parlia::new(chain_spec.clone(), 200)),
             chain_spec,
         }
@@ -160,6 +160,21 @@ impl<ChainSpec: EthChainSpec + BscHardforks + 'static> HeaderValidator<Header>
                 err
             );
             return Err(err);
+        }
+
+        // A pre-fork commitment must surface as an ommers-hash error, not a lane error.
+        if let Err(e) = check_ommers_hash_against_parent(
+            self.chain_spec.commits_payment_lane(parent.number, parent.timestamp),
+            header,
+        ) {
+            return Err(match e {
+                OmmersHashError::CommitmentBeforeFork(got) => ConsensusError::BodyOmmersHashDiff(
+                    GotExpected { got, expected: EMPTY_OMMER_ROOT_HASH }.into(),
+                ),
+                OmmersHashError::Lane(e) => {
+                    ConsensusError::Other(Arc::new(std::io::Error::other(e.to_string())))
+                }
+            });
         }
 
         let header_ts = calculate_millisecond_timestamp(header.header());
@@ -226,8 +241,34 @@ impl<ChainSpec: EthChainSpec<Header = Header> + BscHardforks + 'static> Consensu
         body: &BscBlockBody,
         header: &SealedHeader,
     ) -> Result<(), ConsensusError> {
-        // tracing::debug!("Validating body against header, block_number: {:?}", header.number);
-        Consensus::<BscBlock>::validate_body_against_header(&self.base, body, header)
+        // Not delegated upstream: since Jenner `header.ommers_hash` is a commitment, so ommers
+        // emptiness must be enforced on the body itself. The tx-root and withdrawals checks stay
+        // the same as upstream.
+        use reth_primitives_traits::BlockBody as _;
+        if let Some(ommers) = body.ommers().filter(|o| !o.is_empty()) {
+            return Err(ConsensusError::BodyOmmersHashDiff(
+                GotExpected {
+                    got: alloy_consensus::proofs::calculate_ommers_root(ommers),
+                    expected: EMPTY_OMMER_ROOT_HASH,
+                }
+                .into(),
+            ));
+        }
+
+        let tx_root = body.calculate_tx_root();
+        if header.transactions_root != tx_root {
+            return Err(ConsensusError::BodyTransactionRootDiff(
+                GotExpected { got: tx_root, expected: header.transactions_root }.into(),
+            ));
+        }
+
+        match (header.withdrawals_root, body.calculate_withdrawals_root()) {
+            (Some(want), Some(got)) if got != want => Err(ConsensusError::BodyWithdrawalsRootDiff(
+                GotExpected { got, expected: want }.into(),
+            )),
+            (Some(_), Some(_)) | (None, None) => Ok(()),
+            _ => Err(ConsensusError::WithdrawalsRootUnexpected),
+        }
     }
 
     /// body stage validation.
@@ -501,6 +542,192 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_bsc_gas_limit_against_parent(&valid, &parent, &chain_spec).is_ok());
+    }
+
+    /// Since Jenner, body validation must enforce empty ommers.
+    #[test]
+    fn body_against_header_requires_empty_ommers_not_a_matching_root() {
+        use crate::consensus::payment_lane::Commitment;
+        use crate::node::primitives::BscBlockBody;
+        use reth_primitives_traits::BlockBody as _;
+
+        let consensus =
+            BscConsensus::new(Arc::new(BscChainSpec::from(ChainSpecBuilder::mainnet().build())));
+        let empty = BscBlockBody::default();
+        let header = |ommers_hash| {
+            SealedHeader::seal_slow(Header {
+                number: 1,
+                ommers_hash,
+                transactions_root: empty.calculate_tx_root(),
+                ..Default::default()
+            })
+        };
+
+        // A commitment in `ommers_hash` with an empty body is valid.
+        let commitment = Commitment { quota: 2_000_000, payment_gas_used: 7 }.encode();
+        assert!(Consensus::<BscBlock>::validate_body_against_header(
+            &consensus,
+            &empty,
+            &header(commitment)
+        )
+        .is_ok());
+
+        // The upstream tx-root and withdrawals clauses now live here.
+        let wrong_tx_root = SealedHeader::seal_slow(Header {
+            number: 1,
+            ommers_hash: commitment,
+            transactions_root: B256::repeat_byte(9),
+            ..Default::default()
+        });
+        assert!(matches!(
+            Consensus::<BscBlock>::validate_body_against_header(&consensus, &empty, &wrong_tx_root),
+            Err(ConsensusError::BodyTransactionRootDiff(_))
+        ));
+
+        {
+            use alloy_eips::eip4895::Withdrawal;
+            let body = BscBlockBody {
+                inner: alloy_consensus::BlockBody {
+                    withdrawals: Some(vec![Withdrawal::default()].into()),
+                    ..Default::default()
+                },
+                sidecars: None,
+            };
+            let root = body.calculate_withdrawals_root().expect("withdrawals root");
+            let with_root = |withdrawals_root| {
+                SealedHeader::seal_slow(Header {
+                    number: 1,
+                    ommers_hash: commitment,
+                    transactions_root: empty.calculate_tx_root(),
+                    withdrawals_root,
+                    ..Default::default()
+                })
+            };
+            // Matching pair accepted; mismatching pair rejected.
+            assert!(Consensus::<BscBlock>::validate_body_against_header(
+                &consensus,
+                &body,
+                &with_root(Some(root))
+            )
+            .is_ok());
+            assert!(matches!(
+                Consensus::<BscBlock>::validate_body_against_header(
+                    &consensus,
+                    &body,
+                    &with_root(Some(B256::repeat_byte(7)))
+                ),
+                Err(ConsensusError::BodyWithdrawalsRootDiff(_))
+            ));
+            // Header/body presence must match in both directions.
+            assert!(matches!(
+                Consensus::<BscBlock>::validate_body_against_header(&consensus, &body, &with_root(None)),
+                Err(ConsensusError::WithdrawalsRootUnexpected)
+            ));
+            assert!(matches!(
+                Consensus::<BscBlock>::validate_body_against_header(
+                    &consensus,
+                    &empty,
+                    &with_root(Some(root))
+                ),
+                Err(ConsensusError::WithdrawalsRootUnexpected)
+            ));
+        }
+
+        // A real uncle in the body is always rejected, even if the header carries its root.
+        let uncle = Header { number: 1, ..Default::default() };
+        let ommers = vec![uncle.clone()];
+        let with_uncle = BscBlockBody {
+            inner: alloy_consensus::BlockBody { ommers: ommers.clone(), ..Default::default() },
+            sidecars: None,
+        };
+        let matching_root = alloy_consensus::proofs::calculate_ommers_root(&ommers);
+        for h in [header(commitment), header(matching_root)] {
+            assert!(matches!(
+                Consensus::<BscBlock>::validate_body_against_header(&consensus, &with_uncle, &h),
+                Err(ConsensusError::BodyOmmersHashDiff(_))
+            ));
+        }
+    }
+
+    /// Parent-gated checks still force EMPTY on the activation block.
+    #[test]
+    fn jenner_commitment_checks_gate_on_the_parents_timestamp() {
+        use crate::consensus::payment_lane::Commitment;
+        use alloy_consensus::EMPTY_OMMER_ROOT_HASH;
+
+        const JENNER: u64 = 1_800_000_000;
+        const BLOCK: u64 = LONDON_ACTIVE_BLOCK + 1;
+        let consensus = BscConsensus::new(Arc::new(BscChainSpec::from(
+            ChainSpecBuilder::mainnet()
+                .with_fork(BscHardfork::Jenner, ForkCondition::Timestamp(JENNER))
+                .build(),
+        )));
+
+        let parent_at = |timestamp| {
+            SealedHeader::seal_slow(Header {
+                number: BLOCK - 1,
+                timestamp,
+                gas_limit: 55_000_000,
+                ..Default::default()
+            })
+        };
+        let child = |parent: &SealedHeader, ommers_hash, gas_used| {
+            SealedHeader::seal_slow(Header {
+                number: BLOCK,
+                parent_hash: parent.hash(),
+                timestamp: parent.timestamp + 3,
+                gas_limit: 55_000_000,
+                gas_used,
+                ommers_hash,
+                ..Default::default()
+            })
+        };
+        // Match the message too: gas-limit validation also uses `ConsensusError::Other`.
+        let lane_verdict = |parent: &SealedHeader, ommers_hash, gas_used| {
+            match consensus
+                .validate_header_against_parent(&child(parent, ommers_hash, gas_used), parent)
+            {
+                Err(ConsensusError::Other(e)) => e.to_string(),
+                Err(e @ ConsensusError::BodyOmmersHashDiff(_)) => e.to_string(),
+                _ => String::new(),
+            }
+        };
+        let lane_rejected = |parent: &SealedHeader, ommers_hash, gas_used| {
+            let msg = lane_verdict(parent, ommers_hash, gas_used);
+            assert!(
+                msg.is_empty() || msg.contains("payment lane") || msg.contains("ommer hash"),
+                "rejected for something other than the lane: {msg}"
+            );
+            !msg.is_empty()
+        };
+
+        // The activation block still requires EMPTY because the parent is pre-Jenner.
+        let activation_parent = parent_at(JENNER - 3);
+        let commitment = Commitment { quota: 2_000_000, payment_gas_used: 0 }.encode();
+        assert!(!lane_rejected(&activation_parent, EMPTY_OMMER_ROOT_HASH, 0));
+        assert!(
+            lane_verdict(&activation_parent, commitment, 0).contains("ommer hash"),
+            "a commitment on the activation block must be rejected as a bad uncle hash, \
+             not as a payment lane error"
+        );
+
+        // Full commitment checks apply from the block after activation.
+        let parent = parent_at(JENNER);
+        assert!(!lane_rejected(&parent, commitment, 3_000_000));
+        // #1 reserved bytes must be zero — and EMPTY is now a malformed commitment, not a
+        // pass, which is the only thing separating the two eras.
+        assert!(lane_rejected(&parent, EMPTY_OMMER_ROOT_HASH, 0));
+        // #2 payment_gas_used <= gas_used
+        let overstated = Commitment { quota: 2_000_000, payment_gas_used: 3_000_001 }.encode();
+        assert!(lane_rejected(&parent, overstated, 3_000_000));
+        // #3 quota <= gas_limit
+        let huge = Commitment { quota: 55_000_001, payment_gas_used: 0 }.encode();
+        assert!(lane_rejected(&parent, huge, 0));
+        // #4 the accounting inequality, one gas over
+        let tight = Commitment { quota: 52_000_001, payment_gas_used: 0 }.encode();
+        assert!(lane_rejected(&parent, tight, 3_000_000));
+        let exact = Commitment { quota: 52_000_000, payment_gas_used: 0 }.encode();
+        assert!(!lane_rejected(&parent, exact, 3_000_000));
     }
 
     #[test]

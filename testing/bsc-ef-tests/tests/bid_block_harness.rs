@@ -624,3 +624,249 @@ fn execution_gate_round_trip() {
 
     assert_eq!(computed_root, reference_root);
 }
+
+/// A Jenner test chain with 55M gas, activation at timestamp 6, Prague enabled, `0x2007`
+/// installed by the activation block, and `_paymentLaneMin = 1000`.
+fn jenner_lane_chain_spec() -> Arc<BscChainSpec> {
+    use reth_bsc::hardforks::bsc::BscHardfork;
+
+    let validator = hex::encode(*TEST_VALIDATOR);
+    let extra_data = format!("0x{}{}{}", "00".repeat(32), validator, "00".repeat(65));
+    let genesis_json = format!(
+        r#"{{
+            "config": {{ "chainId": 714 }},
+            "gasLimit": "0x3473bc0",
+            "timestamp": "0x0",
+            "baseFeePerGas": "0x0",
+            "excessBlobGas": "0x0",
+            "blobGasUsed": "0x0",
+            "extraData": "{extra_data}",
+            "alloc": {{
+                "0x{validator}": {{ "balance": "0x21e19e0c9bab2400000" }},
+                "0x0000000000000000000000000000000000002007": {{
+                    "balance": "0x0",
+                    "storage": {{ "0x06": "0x00000000000000000000000000000000000000000000000000000000000003e8" }}
+                }}
+            }}
+        }}"#
+    );
+    let genesis: alloy_genesis::Genesis =
+        serde_json::from_str(&genesis_json).expect("deserialize jenner genesis");
+    let hardforks = ChainHardforks::new(vec![
+        (EthereumHardfork::Frontier.boxed(), ForkCondition::Block(0)),
+        (EthereumHardfork::London.boxed(), ForkCondition::Block(0)),
+        (EthereumHardfork::Paris.boxed(), ForkCondition::Block(0)),
+        (EthereumHardfork::Shanghai.boxed(), ForkCondition::Timestamp(0)),
+        (EthereumHardfork::Cancun.boxed(), ForkCondition::Timestamp(0)),
+        (EthereumHardfork::Prague.boxed(), ForkCondition::Timestamp(0)),
+        (BscHardfork::Kepler.boxed(), ForkCondition::Timestamp(0)),
+        (BscHardfork::Cancun.boxed(), ForkCondition::Timestamp(0)),
+        (BscHardfork::Jenner.boxed(), ForkCondition::Timestamp(6)),
+    ]);
+    let genesis_header = {
+        let header = make_genesis_header(&genesis, &hardforks);
+        let hash = header.hash_slow();
+        SealedHeader::new(header, hash)
+    };
+    let spec = ChainSpec {
+        chain: Chain::from_named(NamedChain::BinanceSmartChain),
+        genesis,
+        hardforks,
+        base_fee_params: BaseFeeParamsKind::Constant(BaseFeeParams::new(1, 1)),
+        genesis_header,
+        ..Default::default()
+    };
+    Arc::new(BscChainSpec::from(spec))
+}
+
+/// Builds and re-imports a four-block chain across Jenner to prove producer and importer agree
+/// on the stamped commitment.
+#[test]
+fn jenner_payment_lane_chain_round_trips() {
+    use alloy_consensus::{TxLegacy, EMPTY_OMMER_ROOT_HASH};
+    use alloy_primitives::{TxKind, U256};
+    use reth_bsc::consensus::parlia::util::calculate_difficulty;
+    use reth_bsc::consensus::payment_lane::Commitment;
+    use reth_bsc::node::evm::config::{
+        BscEvmConfig, BscExecutionMode, BscNextBlockEnvAttributes,
+    };
+    use reth_bsc::node::miner::signer::sign_system_transaction;
+    use reth_bsc::node::miner::util::finalize_new_header;
+    use reth_bsc::node::BscNode;
+    use reth_evm::execute::{BlockBuilder, BlockBuilderOutcome, BlockExecutionOutput, Executor};
+    use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
+    use reth_primitives_traits::RecoveredBlock;
+    use reth_provider::test_utils::create_test_provider_factory_with_node_types;
+    use reth_provider::{
+        BlockWriter, DatabaseProviderFactory, ExecutionOutcome, OriginalValuesKnown,
+        DBProvider, HistoryWriter, StateWriteConfig, StateWriter,
+        StaticFileProviderFactory, StaticFileWriter,
+    };
+    use reth_primitives_traits::SignerRecoverable;
+    use reth_revm::{database::StateProviderDatabase, db::State};
+
+    let chain_spec = jenner_lane_chain_spec();
+    let factory = create_test_provider_factory_with_node_types::<BscNode>(chain_spec.clone());
+    init_genesis(&factory).expect("init genesis");
+    publish_env(chain_spec.clone());
+
+    let parlia = Arc::new(Parlia::new(chain_spec.clone(), 200));
+    let snapshot_provider =
+        reth_bsc::shared::get_snapshot_provider().cloned().expect("snapshot provider");
+    let evm_config = BscEvmConfig::new(chain_spec.clone());
+
+    let mut parent =
+        SealedHeader::new(chain_spec.genesis_header().clone(), chain_spec.genesis_hash());
+    let mut parent_snap = genesis_snapshot(chain_spec.clone());
+
+    // A minimal payment-lane transaction.
+    let payment_tx = |nonce: u64| {
+        sign_system_transaction(
+            TxLegacy {
+                chain_id: None,
+                nonce,
+                gas_price: 1,
+                gas_limit: 21_000,
+                to: TxKind::Call(alloy_primitives::Address::random()),
+                value: U256::from(1u64),
+                input: Default::default(),
+            }
+            .into(),
+        )
+        .expect("sign payment tx")
+    };
+
+    // Block 1 is pre-fork; blocks 3 and 4 each carry one payment transaction.
+    let payments_per_block = [0usize, 0, 1, 1];
+
+    for (i, &payments) in payments_per_block.iter().enumerate() {
+        let number = i as u64 + 1;
+        let timestamp = parent.timestamp + 3;
+
+        let (block, output, hashed_state) = {
+            let provider = factory.database_provider_rw().unwrap();
+            let state_provider = provider.latest();
+            let mut db = State::builder()
+                .with_database(StateProviderDatabase::new(&state_provider))
+                .with_bundle_update()
+                .build();
+            let diff = calculate_difficulty(&parent_snap, *TEST_VALIDATOR);
+            let attrs = BscNextBlockEnvAttributes {
+                inner: NextBlockEnvAttributes {
+                    timestamp,
+                    suggested_fee_recipient: *TEST_VALIDATOR,
+                    prev_randao: diff.into(),
+                    gas_limit: parent.gas_limit,
+                    parent_beacon_block_root: None,
+                    withdrawals: None,
+                    extra_data: alloy_primitives::Bytes::from(vec![0u8; 32]),
+                    slot_number: None,
+                },
+                mode: BscExecutionMode::Mining,
+                validator_cache_sink: None,
+                turn_length_sink: None,
+                state_root_precomputed_sink: None,
+                trie_handle: None,
+                state_root_deadline_ms: None,
+            };
+            let mut builder = evm_config
+                .builder_for_next_block(&mut db, &parent, attrs)
+                .unwrap_or_else(|e| panic!("builder for block {number}: {e:?}"));
+            builder.apply_pre_execution_changes().expect("pre-exec");
+            let mut nonce = reth_provider::AccountReader::basic_account(
+                &state_provider,
+                &TEST_VALIDATOR,
+            )
+            .expect("read validator account")
+            .map(|a| a.nonce)
+            .unwrap_or(0);
+            for _ in 0..payments {
+                let tx = payment_tx(nonce);
+                nonce += 1;
+                builder
+                    .execute_transaction(tx.try_into_recovered().expect("recover"))
+                    .unwrap_or_else(|e| panic!("execute payment in block {number}: {e:?}"));
+            }
+            let BlockBuilderOutcome { execution_result, block, hashed_state, .. } =
+                builder.finish(&state_provider, None).expect("finish");
+            let senders = block.senders().to_vec();
+            let mut plain = block.sealed_block().clone_block();
+            finalize_new_header(
+                parlia.clone(),
+                &parent_snap,
+                &parent,
+                &mut plain.header,
+                &snapshot_provider,
+                timestamp * 1000,
+                None,
+            )
+            .expect("finalize");
+            let out = BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
+            (RecoveredBlock::new_unhashed(plain, senders), out, hashed_state)
+        };
+
+        let header = block.header().clone();
+        assert_eq!(header.number, number);
+        assert!(block.body().inner.ommers.is_empty(), "block {number} must carry no ommers");
+
+        // What the producer committed.
+        match number {
+            1 | 2 => assert_eq!(
+                header.ommers_hash, EMPTY_OMMER_ROOT_HASH,
+                "block {number} is outside the lane and must keep the empty ommers root"
+            ),
+            // Bootstrap from an empty parent commitment, using the full 55M block gas limit.
+            3 => assert_eq!(
+                Commitment::decode(header.ommers_hash).expect("block 3 commitment"),
+                Commitment { quota: 1_100_000, payment_gas_used: 21_000 },
+            ),
+            // The second post-fork block keeps the same floor commitment.
+            4 => assert_eq!(
+                Commitment::decode(header.ommers_hash).expect("block 4 commitment"),
+                Commitment { quota: 1_100_000, payment_gas_used: 21_000 },
+            ),
+            _ => unreachable!(),
+        }
+        // In this fixture Parlia system transactions consume zero gas.
+        let expected_gas_used = if payments == 0 { 0 } else { 21_000 };
+        assert_eq!(header.gas_used, expected_gas_used, "block {number} gas_used");
+
+        // Advance every piece of state the next block needs, then re-import this one.
+        let sealed = SealedHeader::new(header.clone(), header.hash_slow());
+        shared_header_provider().add_header(sealed.hash(), header.clone());
+        let mut snap = parent_snap.clone();
+        snap.block_number = number;
+        snap.block_hash = sealed.hash();
+        snapshot_provider.insert(snap.clone());
+
+        // Re-import before persisting, so the importer still sees the parent post-state.
+        {
+            let provider = factory.database_provider_rw().unwrap();
+            let state_provider = provider.latest();
+            let executor =
+                evm_config.batch_executor(StateProviderDatabase::new(&state_provider));
+            executor
+                .execute(&block)
+                .unwrap_or_else(|e| panic!("re-import of block {number} rejected: {e:?}"));
+        }
+
+        {
+            let provider = factory.database_provider_rw().unwrap();
+            provider.insert_block(&block).expect("insert block");
+            provider
+                .write_state(
+                    &ExecutionOutcome::single(number, output),
+                    OriginalValuesKnown::Yes,
+                    StateWriteConfig::default(),
+                )
+                .expect("write state");
+            provider.write_hashed_state(&hashed_state.into_sorted()).expect("write hashed state");
+            provider.update_history_indices(number..=number).expect("history indices");
+            provider.static_file_provider().commit().expect("static file commit");
+            provider.commit().expect("commit");
+        }
+
+        parent = sealed;
+        parent_snap = snap;
+    }
+}

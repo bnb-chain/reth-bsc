@@ -1,3 +1,4 @@
+use crate::consensus::payment_lane::{Commitment, Signal};
 use crate::chainspec::BscChainSpec;
 use crate::consensus::eip4844::{calc_blob_fee, is_blob_eligible_block, BLOB_TX_BLOB_GAS_PER_BLOB};
 use crate::consensus::parlia::util::calculate_millisecond_timestamp;
@@ -2329,8 +2330,11 @@ where
         }
 
         let parent_number = block_number.saturating_sub(1);
-        match crate::shared::get_canonical_header_by_number_from_provider(parent_number) {
-            Some(canonical_parent) if canonical_parent.hash_slow() == parent_hash => {}
+        // Bound out of the match: the payment lane check below needs this same header.
+        let canonical_parent = match crate::shared::get_canonical_header_by_number_from_provider(
+            parent_number,
+        ) {
+            Some(canonical_parent) if canonical_parent.hash_slow() == parent_hash => canonical_parent,
             Some(canonical_parent) => {
                 debug!(
                     target: "bsc::miner::payload",
@@ -2352,6 +2356,49 @@ where
                     block_number,
                     parent_number,
                     "BidBlock's parent not found in canonical chain; discarding"
+                );
+                return false;
+            }
+        };
+
+        // Check #5 on a header this validator is about to sign; checks #1-#4 already ran at
+        // admission. Deliberately does NOT examine `paymentGasUsed` — go-bsc does not either,
+        // and adding it would discard bids a go-bsc validator would sign; a lie there is caught
+        // on import, which revokes the builder. Parameters come from the cache the local build
+        // for this height filled; on a miss the node declines rather than sign a bid it could
+        // not check.
+        if self.builder
+            .chain_spec
+            .commits_payment_lane(canonical_parent.number, canonical_parent.timestamp)
+        {
+            let Some(params) = crate::node::evm::pre_execution::cached_lane_params(parent_hash)
+            else {
+                crate::metrics::LANE_METRICS.bid_block_declined.increment(1);
+                warn!(
+                    target: "bsc::miner::payload",
+                    trace_id = self.trace_id,
+                    bid_hash = %bid.bid_hash,
+                    "payment lane parameters unknown for this parent; cannot verify the BidBlock quota, falling back to local payload"
+                );
+                return false;
+            };
+            let header = sealed.header();
+            let verdict = Commitment::decode(header.ommers_hash).and_then(|c| {
+                Signal::from_parent(&canonical_parent)?.check_next_lane_quota(
+                    c.quota,
+                    &params,
+                    header.gas_limit,
+                )
+            });
+            if let Err(e) = verdict {
+                crate::metrics::LANE_METRICS.bid_block_declined.increment(1);
+                warn!(
+                    target: "bsc::miner::payload",
+                    trace_id = self.trace_id,
+                    bid_hash = %bid.bid_hash,
+                    builder = ?bid.builder,
+                    error = %e,
+                    "BidBlock payment lane quota is wrong; discarding and falling back to local payload"
                 );
                 return false;
             }

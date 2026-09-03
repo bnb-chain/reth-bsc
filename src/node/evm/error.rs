@@ -1,7 +1,7 @@
 //! Error types for the Bsc EVM module.
 
 use alloy_primitives::{Address, BlockHash, BlockNumber, B256, U256};
-use crate::consensus::parlia::error::ParliaConsensusError;
+use crate::consensus::{parlia::error::ParliaConsensusError, payment_lane::LaneError};
 use reth_evm::execute::{BlockExecutionError, BlockValidationError};
 use reth_provider::ProviderError;
 use reth_primitives_traits::{GotExpected, GotExpectedBoxed};
@@ -18,6 +18,10 @@ pub enum BscBlockValidationError {
         hash: B256,
     },
     
+    /// A payment lane rule the block breaks.
+    #[error("{0}")]
+    PaymentLane(String),
+
     /// Error when the system txs are more than expected
     #[error("unexpected system tx")]
     UnexpectedSystemTx,
@@ -123,6 +127,10 @@ pub enum BscBlockExecutionError {
     #[error(transparent)]
     Validation(#[from] BscBlockValidationError),
 
+    /// A local payment lane state read failed on this node.
+    #[error("payment lane state unavailable: {0}")]
+    PaymentLaneStateUnavailable(String),
+
     /// Error when there is no snapshot found
     #[error("no snapshot found")]
     SnapshotNotFound,
@@ -188,6 +196,37 @@ pub enum BscBlockExecutionError {
     GlobalSignerNotInitializedForMiningMode,
 }
 
+/// Routes payment lane failures to the local-fault or block-verdict side.
+pub fn lane_reject(err: LaneError) -> BscBlockExecutionError {
+    use crate::metrics::LANE_METRICS as METRICS;
+
+    let local_fault = matches!(err, LaneError::StateUnavailable(_));
+    if local_fault {
+        METRICS.state_unavailable.increment(1);
+    } else {
+        METRICS.rejected.increment(1);
+    }
+    let category = if local_fault { "stateUnavailable" } else { "verdict" };
+    tracing::error!(target: "bsc::payment_lane", category, error = %err, "payment lane check failed");
+    BscBlockExecutionError::from(err)
+}
+
+impl From<LaneError> for BscBlockExecutionError {
+    fn from(err: LaneError) -> Self {
+        match err {
+            LaneError::StateUnavailable(reason) => Self::PaymentLaneStateUnavailable(reason),
+            verdict => BscBlockValidationError::PaymentLane(verdict.to_string()).into(),
+        }
+    }
+}
+
+/// Lets `?` lift `LaneError` into `BlockExecutionError` directly.
+impl From<LaneError> for BlockExecutionError {
+    fn from(err: LaneError) -> Self {
+        BscBlockExecutionError::from(err).into()
+    }
+}
+
 impl From<BscBlockExecutionError> for BlockExecutionError {
     fn from(err: BscBlockExecutionError) -> Self {
         // Update execution errors metric for all types of errors
@@ -218,6 +257,7 @@ impl From<BscBlockExecutionError> for BlockExecutionError {
                 ))
             }
 
+            BscBlockExecutionError::PaymentLaneStateUnavailable(_) |
             BscBlockExecutionError::SnapshotNotFound |
             BscBlockExecutionError::EthCallFailed |
             BscBlockExecutionError::GetTopValidatorsFailed |
@@ -233,6 +273,39 @@ impl From<BscBlockExecutionError> for BlockExecutionError {
                 // Internal errors: mapped to BlockExecutionError::Internal, which
                 // engine-tree handles without caching in invalid_headers.
                 Self::other(err)
+            }
+        }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::consensus::payment_lane::LaneError;
+
+    #[test]
+    fn payment_lane_errors_split_local_faults_from_verdicts() {
+        let local: BlockExecutionError =
+            LaneError::StateUnavailable("missing trie node".into()).into();
+        assert!(
+            matches!(local, BlockExecutionError::Internal(_)),
+            "a failed state read must not be a validation error: {local:?}"
+        );
+
+        for verdict in [
+            LaneError::CorruptConfig("total changed mid-walk".into()),
+            LaneError::QuotaMismatch { committed: 1, derived: 2 },
+            LaneError::Untruthy { committed: 1, actual: 2 },
+            LaneError::BadCommitment(B256::ZERO),
+            LaneError::Violated { gas_limit: 1, gas_used: 2, quota: 3, payment_gas_used: 4 },
+        ] {
+            let message = verdict.to_string();
+            let mapped: BlockExecutionError = verdict.into();
+            match mapped {
+                BlockExecutionError::Validation(ref inner) => assert!(
+                    inner.to_string().contains(&message),
+                    "the LaneError message must survive: {inner}"
+                ),
+                other => panic!("expected a validation error, got {other:?}"),
             }
         }
     }

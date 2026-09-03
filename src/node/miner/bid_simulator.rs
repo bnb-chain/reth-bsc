@@ -655,7 +655,7 @@ where
                     // MEV bid simulation reproduces the block this validator would seal, so
                     // it must run the full Parlia finalization the miner runs — unlike
                     // `eth_simulateV1`, which is a caller-facing hypothetical.
-                    mode: BscExecutionMode::Mining,
+                    mode: BscExecutionMode::BidSimulation,
                     validator_cache_sink: Some(bid_validator_cache_sink.clone()),
                     turn_length_sink: Some(bid_turn_length_sink.clone()),
                     // Bid simulation does not run alongside a sparse-trie task —

@@ -1,16 +1,8 @@
-//! Debug-only builder extraction RPC for BEP-675 end-to-end testing.
+//! Debug-only BEP-675 builder seam.
 //!
-//! `debug_buildCandidateBlock` runs the normal block-building pipeline against the current
-//! head on behalf of an **arbitrary coinbase** (a validator this node does not hold the key
-//! for), with a caller-supplied user-tx list, and returns a state-valid [`BidBlock`]
-//! candidate: header with correct state/receipts roots, user txs first, and the trailing
-//! system txs re-emitted **unsigned** in go-bsc's wire shape (`v = r = s = 0`) so the target
-//! validator can bind-sign them — exactly what a geth builder ships over `mev_sendBidBlock`.
-//!
-//! Registered only when `BSC_DEBUG_BUILDER=true`; this is a test seam, not a production API.
-//! The throwaway signatures the miner-mode executor puts on the generated system txs come
-//! from this node's key and are stripped before returning; they never affect the state root
-//! because system txs execute with `caller = coinbase` regardless of signature.
+//! Runs the normal block-building pipeline for an arbitrary coinbase and returns a state-valid
+//! [`BidBlock`] with trailing system transactions re-encoded in go-bsc's unsigned wire shape.
+//! Registered only when `BSC_DEBUG_BUILDER=true`.
 
 use crate::chainspec::BscChainSpec;
 use crate::consensus::parlia::bid_block::DEPOSIT_SELECTOR;
@@ -82,9 +74,7 @@ fn invalid_params(msg: impl Into<String>) -> jsonrpsee::types::ErrorObjectOwned 
     jsonrpsee::types::ErrorObject::owned(-32602, msg.into(), None::<()>)
 }
 
-/// Re-encode a generated (node-key-signed) legacy system tx in go-bsc's unsigned wire shape:
-/// the tx body fields followed by literal `V = R = S = 0`. Mirrors go-bsc's
-/// `types.NewTransaction` encoding for BidBlock trailing system txs.
+/// Re-encodes a generated legacy system tx in go-bsc's unsigned wire shape.
 fn encode_unsigned_legacy(tx: &TransactionSigned) -> Result<Bytes, String> {
     let legacy = match tx.clone().into_typed_transaction() {
         alloy_consensus::EthereumTypedTransaction::Legacy(legacy) => legacy,
@@ -201,9 +191,9 @@ where
                     extra_data: Default::default(),
                     slot_number: None,
                 },
-                // `debug_buildCandidateBlock` runs the real block-building pipeline and
-                // signs Parlia system txs, so it is Mining despite passing no sinks.
-                mode: BscExecutionMode::Mining,
+                // Runs the real pipeline and signs Parlia system txs, so it finalizes;
+                // `BidSimulation` because the transaction set is fixed by the caller.
+                mode: BscExecutionMode::BidSimulation,
                 validator_cache_sink: None,
                 turn_length_sink: None,
                 state_root_precomputed_sink: None,

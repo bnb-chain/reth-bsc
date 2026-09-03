@@ -29,7 +29,6 @@ use revm::context_interface::block::Block;
 use revm::database::BundleState;
 use std::sync::Arc;
 
-
 /// BSC block assembler input that mirrors BlockAssemblerInput but is not #[non_exhaustive]
 /// 
 /// This allows us to construct the input in external crates without being limited by
@@ -54,6 +53,15 @@ pub struct BscBlockAssemblerInput<'a, 'b, F: BlockExecutorFactory, H = Header> {
     pub state_provider: &'b dyn StateProvider,
     /// State root for this block.
     pub state_root: alloy_primitives::B256,
+}
+
+/// The value to stamp into `ommers_hash`: an encoded commitment once the executor produced one,
+/// and `EMPTY_OMMER_ROOT_HASH` otherwise. Reads the sink the executor filled.
+///
+/// Nothing here decides anything — an absent commitment means the executor found no lane state
+/// for this block, which is the right answer before the fork and on the activation block.
+fn payment_lane_commitment(ctx: &crate::node::evm::config::BscBlockExecutionCtx<'_>) -> B256 {
+    ctx.payment_lane_sink.lock().unwrap().map(|c| c.encode()).unwrap_or(EMPTY_OMMER_ROOT_HASH)
 }
 
 /// Block assembler for BSC, mainly for support BscBlockExecutionCtx.
@@ -154,9 +162,13 @@ where
             if ctx_extra.is_empty() { self.extra_data.clone() } else { ctx_extra }
         };
 
+        // Pure stamp; the executor already self-checked the budget this comes from. Every
+        // producing path reaches here — local mining and BEP-322 SendBid share `builder.finish()`.
+        let ommers_hash = payment_lane_commitment(&ctx);
+
         let header = Header {
             parent_hash: eth_ctx.parent_hash,
-            ommers_hash: EMPTY_OMMER_ROOT_HASH,
+            ommers_hash,
             beneficiary: evm_env.block_env.beneficiary(),
             state_root,
             transactions_root,
@@ -276,9 +288,11 @@ where
             if ctx_extra.is_empty() { self.extra_data.clone() } else { ctx_extra }
         };
 
+        let ommers_hash = payment_lane_commitment(&ctx);
+
         let mut header = Header {
             parent_hash: eth_ctx.parent_hash,
-            ommers_hash: EMPTY_OMMER_ROOT_HASH,
+            ommers_hash,
             beneficiary: evm_env.block_env.beneficiary(),
             state_root,
             transactions_root,

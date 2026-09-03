@@ -9,6 +9,7 @@
 //! vector before the blob path is relied upon.
 
 use crate::chainspec::BscChainSpec;
+use crate::consensus::payment_lane::rules::check_ommers_hash_against_parent;
 use crate::consensus::eip4844::is_blob_eligible_block;
 use crate::consensus::parlia::bid_block::{
     extract_bid_block_deposit_value, verify_bid_block_system_txs, BidBlockSystemTxError,
@@ -576,6 +577,14 @@ pub fn verify_bid_block_header(
             want: want_difficulty,
         });
     }
+
+    // The same rule the import path applies, and the only ruling on a lying builder that the
+    // builder sees an error for: a bid rejected here never gets signed.
+    check_ommers_hash_against_parent(
+        parlia.chain_spec().commits_payment_lane(parent.number, parent.timestamp),
+        header,
+    )
+    .map_err(|e| PreSealVerifyError::InvalidHeader(e.to_string()))?;
 
     parlia
         .block_time_verify_for_ramanujan_fork(snap, header, parent)
@@ -1642,6 +1651,64 @@ mod tests {
     }
 
     // ---- verify_bid_block_header cascading checks (go-bsc VerifyUnsealedHeader) ----
+
+    /// The `else` arm of the BEP-703 gate in `verify_bid_block_header`. Without it a reth
+    /// validator admits an activation-block bid carrying a commitment that go-bsc rejects
+    /// (`parlia.go`'s `!IsJenner(parent)` branch).
+    /// The `consensus.rs` twin of this gate has its own test; this pins the copy on the bid path.
+    #[test]
+    fn pre_seal_rejects_a_commitment_when_the_parent_is_pre_jenner() {
+        use crate::consensus::payment_lane::Commitment;
+        use crate::hardforks::bsc::BscHardfork;
+        use reth_chainspec::ForkCondition;
+
+        // Past London, because the Jenner predicate keeps go-bsc's `IsLondon(num) &&` term, and
+        // before Ethereum's Shanghai so the header needs no withdrawals or blob fields.
+        const JENNER: u64 = 1_650_000_000;
+        const BLOCK: u64 = 12_965_001;
+
+        let spec = {
+            let mut cs = reth_chainspec::ChainSpecBuilder::mainnet().build();
+            cs.hardforks.insert(BscHardfork::Jenner, ForkCondition::Timestamp(JENNER));
+            BscChainSpec::from(cs)
+        };
+        let parlia = parlia_engine(spec.clone());
+        let etherbase = Address::repeat_byte(0x11);
+        let snap = snap_with_interval(3_000);
+        let parent = Header {
+            number: BLOCK - 1,
+            timestamp: JENNER - 3,
+            gas_limit: 30_000_000,
+            ..Default::default()
+        };
+        let header = |ommers_hash| Header {
+            number: BLOCK,
+            timestamp: JENNER,
+            base_fee_per_gas: Some(0),
+            ommers_hash,
+            ..valid_bid_header(etherbase, 30_000_000)
+        };
+
+        // The parent is pre-Jenner, so this block is the activation block and may carry no
+        // commitment — even a well-formed one whose bounds all hold.
+        let commitment = Commitment { quota: 1_000_000, payment_gas_used: 0 }.encode();
+        let d = decoded_block(header(commitment), vec![], vec![]);
+        assert!(
+            matches!(
+                pre_seal_verify_bid_block(&parlia, &spec, &d, &parent, &snap, etherbase, 30_000_000),
+                Err(PreSealVerifyError::InvalidHeader(msg)) if msg.contains("is not empty before the payment lane activates")
+            ),
+            "an activation-block bid carrying a commitment must be refused"
+        );
+
+        // The same bid with an empty ommers root gets past the lane gate.
+        let d = decoded_block(header(EMPTY_OMMER_ROOT_HASH), vec![], vec![]);
+        let verdict = pre_seal_verify_bid_block(&parlia, &spec, &d, &parent, &snap, etherbase, 30_000_000);
+        assert!(
+            !format!("{verdict:?}").contains("Jenner"),
+            "an empty ommers root must clear the lane gate, got {verdict:?}"
+        );
+    }
 
     #[test]
     fn pre_seal_rejects_unauthorized_validator() {

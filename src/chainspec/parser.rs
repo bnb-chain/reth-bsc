@@ -227,5 +227,9 @@ fn add_hardforks_to_chainspec(
         chain_spec = chain_spec.with_fork(BscHardfork::Pasteur, ForkCondition::Timestamp(pasteur_time));
     }
 
+    if let Some(jenner_time) = config.get("jennerTime").and_then(|v| v.as_u64()) {
+        chain_spec = chain_spec.with_fork(BscHardfork::Jenner, ForkCondition::Timestamp(jenner_time));
+    }
+
     Ok(chain_spec)
 }
