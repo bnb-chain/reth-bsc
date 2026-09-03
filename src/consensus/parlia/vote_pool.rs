@@ -665,11 +665,24 @@ pub fn put_vote(vote: VoteEnvelope) {
     put_vote_inner(vote);
 }
 
-/// Test-only ingress that skips signature verification, for tests exercising
-/// pool/finality bookkeeping with synthetic vote addresses.
+/// Test-only ingress that skips signature verification and places the vote
+/// directly into the current pool, for tests exercising pool and finality
+/// bookkeeping with synthetic vote addresses.
+///
+/// Bypasses classification deliberately: no unit test can register the header
+/// provider, so the real path would route everything to the future pool.
 #[cfg(test)]
 pub fn put_vote_unchecked(vote: VoteEnvelope) {
-    put_vote_inner(vote);
+    let target_hash = vote.data.target_hash;
+    let mut pool = VOTE_POOL.write().expect("vote pool poisoned");
+    if pool.is_at_capacity(&target_hash, false, false) {
+        return;
+    }
+    let votes_for_block = pool.insert(vote, 0, false);
+    drop(pool);
+    if votes_for_block > 0 {
+        maybe_notify_finality(target_hash, votes_for_block);
+    }
 }
 
 fn put_vote_inner(vote: VoteEnvelope) {
@@ -686,14 +699,17 @@ fn put_vote_inner(vote: VoteEnvelope) {
     // future here. That defers its origin check to promotion rather than skipping
     // it, so the effect is conservative.
     //
-    // Before the header provider is registered every lookup misses, which would
-    // classify *everything* as future — and promotion needs the same provider,
-    // so those votes could never be promoted and finality would stall. Treat an
-    // unregistered provider as "cannot classify" and admit as current without an
-    // origin check, matching the fail-open stance the height window takes.
+    // Until the header provider is registered we cannot classify at all. The
+    // network starts accepting peers in `build_network` while the provider is
+    // registered later, in `build_consensus`, so that window is reachable by a
+    // connected peer. Treat unclassifiable votes as future: they are then
+    // uncapped (so they cannot crowd out validator votes), they do not reach
+    // `maybe_notify_finality` (so they cannot manufacture quorum), and they are
+    // fully origin-checked at promotion once the provider appears. Reported by
+    // Hashdit Bot on #491.
     let can_classify = shared::has_header_by_hash_provider();
-    let is_future = can_classify
-        && shared::get_canonical_header_by_hash_from_provider(&target_hash).is_none();
+    let is_future = !can_classify
+        || shared::get_canonical_header_by_hash_from_provider(&target_hash).is_none();
 
     // Future votes cannot be origin-checked (membership lives in the target's
     // parent snapshot, which we do not hold), but we can still ask whether the
@@ -720,7 +736,7 @@ fn put_vote_inner(vote: VoteEnvelope) {
     };
 
     // Current votes are origin-checked at admission; future votes at promotion.
-    if can_classify && !is_future && !verify_vote_origin(&vote) {
+    if !is_future && !verify_vote_origin(&vote) {
         tracing::debug!(
             target: "bsc::vote_pool",
             vote_address = %vote.vote_address,
@@ -836,6 +852,22 @@ pub fn is_empty() -> bool {
 /// Fetch votes by block hash.
 pub fn fetch_vote_by_block_hash(block_hash: B256) -> Vec<VoteEnvelope> {
     VOTE_POOL.read().expect("vote pool poisoned").fetch_vote_by_block_hash(block_hash)
+}
+
+/// Test-only: votes for a target in either pool.
+///
+/// No unit test can register the header provider, so the real ingest path
+/// classifies everything as future. Tests whose subject is admission — dedup,
+/// signature rejection, the height window — need to see both pools; production
+/// callers deliberately see only current votes, which are origin-checked.
+#[cfg(test)]
+pub fn fetch_any_vote_by_block_hash(block_hash: B256) -> Vec<VoteEnvelope> {
+    let pool = VOTE_POOL.read().expect("vote pool poisoned");
+    let mut out = pool.fetch_vote_by_block_hash(block_hash);
+    if let Some(vm) = pool.future_votes.get(&block_hash) {
+        out.extend(vm.vote_messages.iter().map(|e| e.envelope.clone()));
+    }
+    out
 }
 
 /// Fetch votes by block hash and source block number.
@@ -1004,7 +1036,7 @@ mod tests {
 
         // Baseline: a correctly signed vote is admitted.
         put_vote(genuine.clone());
-        assert_eq!(fetch_vote_by_block_hash(data.target_hash).len(), 1, "genuine vote rejected");
+        assert_eq!(fetch_any_vote_by_block_hash(data.target_hash).len(), 1, "genuine vote rejected");
 
         // Undecodable signature under a real validator's address. Before
         // verification existed this reached attestation assembly and panicked
@@ -1014,7 +1046,7 @@ mod tests {
             ..genuine.clone()
         });
         assert_eq!(
-            fetch_vote_by_block_hash(data.target_hash).len(),
+            fetch_any_vote_by_block_hash(data.target_hash).len(),
             1,
             "vote with undecodable signature was admitted",
         );
@@ -1025,7 +1057,7 @@ mod tests {
         let mismatched = signer.sign_vote(other).expect("sign vote").signature;
         put_vote(VoteEnvelope { signature: mismatched, ..genuine.clone() });
         assert_eq!(
-            fetch_vote_by_block_hash(data.target_hash).len(),
+            fetch_any_vote_by_block_hash(data.target_hash).len(),
             1,
             "vote signed over different data was admitted",
         );
@@ -1036,7 +1068,7 @@ mod tests {
             ..genuine
         });
         assert_eq!(
-            fetch_vote_by_block_hash(data.target_hash).len(),
+            fetch_any_vote_by_block_hash(data.target_hash).len(),
             1,
             "vote under a mismatched vote address was admitted",
         );
@@ -1066,12 +1098,12 @@ mod tests {
 
         // A valid vote, then replays of it: deduplicated by the pool.
         put_vote(genuine.clone());
-        assert_eq!(fetch_vote_by_block_hash(data.target_hash).len(), 1);
+        assert_eq!(fetch_any_vote_by_block_hash(data.target_hash).len(), 1);
         for _ in 0..10 {
             put_vote(genuine.clone());
         }
         assert_eq!(
-            fetch_vote_by_block_hash(data.target_hash).len(),
+            fetch_any_vote_by_block_hash(data.target_hash).len(),
             1,
             "re-relayed copies must not accumulate",
         );
@@ -1089,7 +1121,7 @@ mod tests {
             put_vote(forged.clone());
         }
         assert_eq!(
-            fetch_vote_by_block_hash(data.target_hash).len(),
+            fetch_any_vote_by_block_hash(data.target_hash).len(),
             1,
             "replayed forgeries never enter the pool",
         );
@@ -1154,7 +1186,7 @@ mod tests {
         put_vote(signer.sign_vote(data).expect("sign vote"));
 
         assert_eq!(
-            fetch_vote_by_block_hash(data.target_hash).len(),
+            fetch_any_vote_by_block_hash(data.target_hash).len(),
             1,
             "an unknown head must not cause votes to be discarded",
         );
@@ -1301,7 +1333,7 @@ mod tests {
             raw[30] = (i >> 8) as u8;
             raw[31] = (i & 0xff) as u8;
             let signer = BlsVoteSigner::new_from_bytes(raw).expect("create bls signer");
-            put_vote(signer.sign_vote(data).expect("sign vote"));
+            put_vote_unchecked(signer.sign_vote(data).expect("sign vote"));
         }
 
         assert_eq!(
@@ -1381,6 +1413,60 @@ mod tests {
             "a vote at an ordinary height must survive an extreme target_number",
         );
         assert!(len() > MAX_CUR_VOTE_AMOUNT_PER_BLOCK, "the pool must not have been emptied");
+
+        let _ = drain();
+    }
+
+
+    /// A vote that cannot be classified must not be treated as current.
+    ///
+    /// The network begins accepting peers in `build_network`, while the header
+    /// provider is registered later in `build_consensus`, so votes can arrive
+    /// while classification is impossible. Treating them as current would put
+    /// un-origin-checked votes where attestation assembly and finality
+    /// notification read from, let them consume the 21-per-target cap and so
+    /// crowd out real validator votes, and never revalidate them afterwards.
+    ///
+    /// Routing them to the future pool instead means they are uncapped, invisible
+    /// to finality counting, and fully origin-checked at promotion once the
+    /// provider appears. Reported by Hashdit Bot on #491.
+    ///
+    /// Unit tests cannot register the provider, so this is the state under test.
+    #[test]
+    fn unclassifiable_votes_are_held_as_future_not_current() {
+        let _ = drain();
+        assert!(
+            !shared::has_header_by_hash_provider(),
+            "precondition: unit tests have no header provider",
+        );
+
+        let mut raw = [0u8; 32];
+        raw[31] = 1;
+        let signer = BlsVoteSigner::new_from_bytes(raw).expect("create bls signer");
+        let data = VoteData {
+            source_number: 7_000,
+            source_hash: B256::from([0xe1; 32]),
+            target_number: 7_001,
+            target_hash: B256::from([0xe2; 32]),
+        };
+        put_vote(signer.sign_vote(data).expect("sign vote"));
+
+        assert!(
+            fetch_vote_by_block_hash(data.target_hash).is_empty(),
+            "an unclassifiable vote must not enter the current pool, which feeds \
+             attestation assembly and finality counting",
+        );
+        assert_eq!(
+            fetch_any_vote_by_block_hash(data.target_hash).len(),
+            1,
+            "it is retained as a future vote, to be origin-checked at promotion",
+        );
+
+        // Uncapped, so it cannot be used to crowd out validator votes.
+        {
+            let pool = VOTE_POOL.read().expect("vote pool poisoned");
+            assert!(!pool.is_at_capacity(&data.target_hash, true, false));
+        }
 
         let _ = drain();
     }
