@@ -389,6 +389,12 @@ pub struct BscBuildArguments<Attributes> {
     /// `MiningContext::end_mining_timestamp_ms` minus [`STATE_ROOT_WAIT_MARGIN_MS`].
     /// `None` = legacy unbounded blocking wait.
     pub state_root_deadline_ms: Option<u64>,
+    /// Sub-second millisecond remainder (BEP-520) of the block being built:
+    /// `MiningContext::block_timestamp_ms % 1000`. Threaded into
+    /// [`BscNextBlockEnvAttributes`] so [`crate::evm::block_env::BscBlockEnv`] (and the
+    /// BEP-706 precompile) sees the same millisecond timestamp that is later sealed
+    /// into the header's `mix_hash`.
+    pub milli_remainder: u64,
 }
 
 /// BSC payload builder, used to build payload for bsc miner.
@@ -467,6 +473,7 @@ where
             // precomputed root instead of only the first attempt.
             trie_handle: _,
             state_root_deadline_ms,
+            milli_remainder,
         } = args;
         let PayloadConfig { parent_header, attributes, payload_id: _ } = config;
 
@@ -531,6 +538,7 @@ where
                 slot_number: None,
             },
             mode: BscExecutionMode::Mining,
+            milli_remainder,
             validator_cache_sink: Some(validator_cache_sink.clone()),
             turn_length_sink: Some(turn_length_sink.clone()),
             state_root_precomputed_sink: Some(state_root_precomputed_sink),
@@ -1030,6 +1038,7 @@ where
             state_root_precomputed,
             trie_handle,
             state_root_deadline_ms: _,
+            milli_remainder,
         } = args;
         let PayloadConfig { parent_header, attributes, payload_id: _ } = config;
 
@@ -1069,6 +1078,7 @@ where
                         slot_number: None,
                     },
                     mode: BscExecutionMode::Mining,
+                    milli_remainder,
                     validator_cache_sink: Some(validator_cache_sink.clone()),
                     turn_length_sink: Some(turn_length_sink.clone()),
                     // Empty-fallback build never installs a sparse-trie hook (trie_handle: None

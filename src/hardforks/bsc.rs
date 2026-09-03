@@ -71,7 +71,7 @@ hardfork!(
         Mendel,
         /// BSC `Pasteur` hardfork - sequenced immediately after Mendel
         Pasteur,
-        /// BSC `Jenner` hardfork. Carries BEP-703 and must stay last.
+        /// BSC `Jenner` hardfork (BEP-706 and BEP-703) - sequenced immediately after Pasteur
         Jenner,
     }
 );
@@ -307,75 +307,10 @@ mod tests {
         assert_eq!(SpecId::from(BscHardfork::Pasteur), SpecId::OSAKA);
     }
 
-    #[test]
-    fn jenner_is_sequenced_after_pasteur() {
-        // Declaration order defines `Ord`.
-        assert!(BscHardfork::Jenner > BscHardfork::Pasteur);
-        assert!(BscHardfork::Jenner > BscHardfork::Mendel);
-        // Jenner reuses Pasteur's EVM spec.
-        assert_eq!(SpecId::from(BscHardfork::Jenner), SpecId::OSAKA);
-    }
 
-    /// Jenner must stay unscheduled until activation is intentional.
-    #[test]
-    fn jenner_is_unscheduled_on_every_network() {
-        for (name, forks) in [
-            ("mainnet", BscHardfork::bsc_mainnet()),
-            ("testnet", BscHardfork::bsc_testnet()),
-            ("qanet", BscHardfork::bsc_qanet()),
-            ("local", BscHardfork::bsc_local()),
-        ] {
-            assert_eq!(
-                forks.fork(BscHardfork::Jenner),
-                ForkCondition::Never,
-                "Jenner must not be scheduled on {name} yet"
-            );
-        }
-    }
 
-    /// Schedule Jenner on top of a mainnet-derived spec.
-    fn spec_with_jenner(jenner_time: u64) -> crate::chainspec::BscChainSpec {
-        let mut cs = bsc_mainnet();
-        cs.hardforks.insert(BscHardfork::Jenner, ForkCondition::Timestamp(jenner_time));
-        crate::chainspec::BscChainSpec::from(cs)
-    }
 
-    /// go-bsc's Jenner gate also requires London.
-    #[test]
-    fn jenner_gate_requires_london() {
-        const JENNER: u64 = 1_800_000_000;
-        let spec = spec_with_jenner(JENNER);
 
-        assert!(
-            !spec.is_jenner_active_at_timestamp(0, JENNER),
-            "block 0 is pre-London, so the lane must stay off however late the timestamp is"
-        );
-        assert!(spec.is_jenner_active_at_timestamp(60_000_000, JENNER));
-    }
-
-    /// Jenner must dispatch only when scheduled.
-    #[test]
-    fn jenner_dispatches_ahead_of_pasteur_only_once_scheduled() {
-        use crate::node::evm::config::revm_spec_by_timestamp_and_block_number;
-
-        const JENNER: u64 = 1_800_000_000;
-        let block = 50_000_000; // well past London
-        let scheduled = spec_with_jenner(JENNER);
-        let unscheduled = crate::chainspec::BscChainSpec::from(bsc_mainnet());
-
-        assert_eq!(
-            revm_spec_by_timestamp_and_block_number(scheduled.clone(), JENNER, block),
-            BscHardfork::Jenner
-        );
-        assert_eq!(
-            revm_spec_by_timestamp_and_block_number(scheduled, JENNER - 1, block),
-            BscHardfork::Pasteur
-        );
-        assert_eq!(
-            revm_spec_by_timestamp_and_block_number(unscheduled, u64::MAX, block),
-            BscHardfork::Pasteur
-        );
-    }
 
     #[test]
     fn test_pasteur_scheduled_on_testnet() {
@@ -453,6 +388,97 @@ mod tests {
         // At/after Pasteur's timestamp, it resolves to Pasteur.
         assert_eq!(
             revm_spec_by_timestamp_and_block_number(spec.clone(), pasteur_time, block),
+            BscHardfork::Pasteur
+        );
+    }
+
+    #[test]
+    fn test_jenner_is_sequenced_after_pasteur() {
+        // Derived ordering must place Jenner (BEP-706) right after Pasteur so that
+        // `spec >= BscHardfork::Jenner` is the highest dispatcher check
+        // (mirrors go-bsc: Jenner sits between Pasteur and the far-future upstream forks).
+        assert!(BscHardfork::Jenner > BscHardfork::Pasteur);
+        assert!(BscHardfork::Jenner > BscHardfork::Mendel);
+        assert!(BscHardfork::Jenner > BscHardfork::Osaka);
+        // Jenner adds a BSC-only precompile; it introduces no new EVM rule set.
+        assert_eq!(SpecId::from(BscHardfork::Jenner), SpecId::OSAKA);
+    }
+
+    #[test]
+    fn test_jenner_not_scheduled_on_builtin_chains() {
+        // Mirrors go-bsc `JennerTime: nil` on BSCChainConfig/ChapelChainConfig: until the
+        // activation is announced, Jenner must not be present in the built-in fork schedules.
+        for (name, forks) in [
+            ("mainnet", BscHardfork::bsc_mainnet()),
+            ("testnet", BscHardfork::bsc_testnet()),
+            ("qanet", BscHardfork::bsc_qanet()),
+            ("local", BscHardfork::bsc_local()),
+        ] {
+            assert_eq!(
+                forks.fork(BscHardfork::Jenner),
+                ForkCondition::Never,
+                "Jenner must stay unscheduled on {name} until its activation is announced"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_jenner_activation_boundary() {
+        use crate::hardforks::BscHardforks;
+
+        // Mirrors go-bsc TestIsJenner: exactly at JennerTime -> active; one second
+        // before -> inactive; one second after -> active.
+        let jenner_time = 1_790_000_000u64;
+        let mut cs = bsc_mainnet();
+        cs.hardforks.insert(BscHardfork::Jenner, ForkCondition::Timestamp(jenner_time));
+        let spec = crate::chainspec::BscChainSpec::from(cs);
+
+        let block = 50_000_000; // well past London activation (31302048)
+        assert!(!spec.is_jenner_active_at_timestamp(block, jenner_time - 1));
+        assert!(spec.is_jenner_active_at_timestamp(block, jenner_time));
+        assert!(spec.is_jenner_active_at_timestamp(block, jenner_time + 1));
+
+        // The convention shared by every timestamp fork helper: inert before London.
+        let pre_london_block = 1_000;
+        assert!(!spec.is_jenner_active_at_timestamp(pre_london_block, jenner_time));
+
+        // Transition helper: first block whose timestamp crosses the boundary.
+        assert!(spec.is_jenner_transition_at_timestamp(block, jenner_time, jenner_time - 1));
+        assert!(!spec.is_jenner_transition_at_timestamp(block, jenner_time + 1, jenner_time));
+        assert!(!spec.is_jenner_transition_at_timestamp(block, jenner_time - 1, jenner_time - 2));
+    }
+
+    #[test]
+    fn test_jenner_resolves_at_its_timestamp() {
+        use crate::node::evm::config::revm_spec_by_timestamp_and_block_number;
+
+        // Give Jenner a concrete activation just after Pasteur (1787625000 on mainnet).
+        let jenner_time = 1_787_625_000 + 1_000;
+        let mut cs = bsc_mainnet();
+        cs.hardforks.insert(BscHardfork::Jenner, ForkCondition::Timestamp(jenner_time));
+        let spec = crate::chainspec::BscChainSpec::from(cs);
+
+        let block = 50_000_000; // well past London activation (31302048)
+
+        // Just before Jenner, the latest fork is still Pasteur.
+        assert_eq!(
+            revm_spec_by_timestamp_and_block_number(spec.clone(), jenner_time - 1, block),
+            BscHardfork::Pasteur
+        );
+        // At/after Jenner's timestamp, it resolves to Jenner.
+        assert_eq!(
+            revm_spec_by_timestamp_and_block_number(spec.clone(), jenner_time, block),
+            BscHardfork::Jenner
+        );
+        // Cross-fork regression (mirrors go-bsc TestRulesJennerRegression): with Jenner
+        // unscheduled, resolution at the same instants is unchanged.
+        let plain = crate::chainspec::BscChainSpec::from(bsc_mainnet());
+        assert_eq!(
+            revm_spec_by_timestamp_and_block_number(plain.clone(), jenner_time, block),
+            BscHardfork::Pasteur
+        );
+        assert_eq!(
+            revm_spec_by_timestamp_and_block_number(plain, jenner_time - 1, block),
             BscHardfork::Pasteur
         );
     }

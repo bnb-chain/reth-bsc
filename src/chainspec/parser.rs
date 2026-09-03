@@ -233,3 +233,62 @@ fn add_hardforks_to_chainspec(
 
     Ok(chain_spec)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hardforks::BscHardforks;
+
+    fn genesis_json(config_extra: &str) -> String {
+        format!(
+            r#"{{
+                "config": {{
+                    "chainId": 714,
+                    "ramanujanBlock": 0,
+                    "nielsBlock": 0,
+                    "berlinBlock": 0,
+                    "londonBlock": 0,
+                    "shanghaiTime": 0,
+                    "keplerTime": 0,
+                    "cancunTime": 0,
+                    "pasteurTime": 1785920400{config_extra}
+                }},
+                "difficulty": "0x1",
+                "gasLimit": "0x2625a00",
+                "alloc": {{}}
+            }}"#
+        )
+    }
+
+    #[test]
+    fn test_parse_jenner_time_from_genesis() {
+        // `jennerTime` in the genesis config activates Jenner at that timestamp
+        // (the geth genesis key introduced by BEP-706, mirroring go-bsc's
+        // `JennerTime *uint64` json tag `jennerTime,omitempty`).
+        let jenner_time = 1_790_000_000u64;
+        let spec =
+            parse_genesis_json(&genesis_json(&format!(r#", "jennerTime": {jenner_time}"#)))
+                .expect("genesis with jennerTime should parse");
+
+        assert_eq!(
+            spec.inner.hardforks.fork(BscHardfork::Jenner),
+            ForkCondition::Timestamp(jenner_time)
+        );
+        assert!(!spec.is_jenner_active_at_timestamp(1, jenner_time - 1));
+        assert!(spec.is_jenner_active_at_timestamp(1, jenner_time));
+        // Coexists with the adjacent fork key: Pasteur keeps its own activation.
+        assert_eq!(
+            spec.inner.hardforks.fork(BscHardfork::Pasteur),
+            ForkCondition::Timestamp(1_785_920_400)
+        );
+    }
+
+    #[test]
+    fn test_jenner_absent_from_genesis_stays_unscheduled() {
+        // Without the key, Jenner must not activate — matching every other
+        // unscheduled fork and go-bsc's `nil` semantics.
+        let spec = parse_genesis_json(&genesis_json("")).expect("genesis should parse");
+        assert_eq!(spec.inner.hardforks.fork(BscHardfork::Jenner), ForkCondition::Never);
+        assert!(!spec.is_jenner_active_at_timestamp(1, u64::MAX));
+    }
+}

@@ -194,6 +194,9 @@ where
                 // Runs the real pipeline and signs Parlia system txs, so it finalizes;
                 // `BidSimulation` because the transaction set is fixed by the caller.
                 mode: BscExecutionMode::BidSimulation,
+                // The candidate block is built from a second-granularity `timestamp`
+                // parameter with no millisecond source — second precision (`Time*1000`).
+                milli_remainder: 0,
                 validator_cache_sink: None,
                 turn_length_sink: None,
                 state_root_precomputed_sink: None,

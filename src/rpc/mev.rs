@@ -81,6 +81,11 @@ pub struct MevParams {
     /// Time left when bid cannot be interrupted in nanoseconds
     #[serde(rename = "NoInterruptLeftOver")]
     pub no_interrupt_left_over: u64,
+    /// Time reserved to finalize a block, in nanoseconds; the BidBlock receive deadline is
+    /// `BidMustBefore = header.Time - DelayLeftOver`. Exposed so builders can compute
+    /// `BidMustBefore` per validator instead of hardcoding the 15ms default.
+    #[serde(rename = "DelayLeftOver")]
+    pub delay_left_over: u64,
     /// Maximum number of bids allowed per builder per block
     #[serde(rename = "MaxBidsPerBuilder")]
     pub max_bids_per_builder: u32,
@@ -1337,6 +1342,7 @@ impl BscMevApiServer for MevApiImpl {
             // Convert milliseconds to nanoseconds (1ms = 1,000,000 ns)
             bid_simulation_left_over: self.bid_simulation_left_over * 1_000_000,
             no_interrupt_left_over: self.no_interrupt_left_over * 1_000_000,
+            delay_left_over: self.delay_left_over * 1_000_000,
             max_bids_per_builder: self.max_bids_per_builder,
             gas_ceil: self.gas_ceil,
             gas_price: self.min_gas_price,
@@ -1403,6 +1409,7 @@ mod bid_block_param_tests {
             validator_commission: 100,
             bid_simulation_left_over: 0,
             no_interrupt_left_over: 0,
+            delay_left_over: 0,
             max_bids_per_builder: 3,
             gas_ceil: 0,
             gas_price: U256::ZERO,
@@ -1413,6 +1420,31 @@ mod bid_block_param_tests {
         let json = serde_json::to_value(&params).unwrap();
         // geth parity: the field is exposed as "BidBlockEnabled".
         assert_eq!(json.get("BidBlockEnabled"), Some(&serde_json::Value::Bool(true)));
+    }
+
+    #[test]
+    fn mev_params_exposes_delay_left_over_field() {
+        // geth parity (bnb-chain/bsc#3807): `Miner.Config.DelayLeftOver` is exposed as
+        // "DelayLeftOver" (a Go `time.Duration`, i.e. nanoseconds in JSON) so builders can
+        // compute `BidMustBefore` per validator instead of hardcoding the 15ms default.
+        let params = MevParams {
+            validator_commission: 100,
+            bid_simulation_left_over: 0,
+            no_interrupt_left_over: 0,
+            delay_left_over: 15 * 1_000_000, // 15ms in nanoseconds
+            max_bids_per_builder: 3,
+            gas_ceil: 0,
+            gas_price: U256::ZERO,
+            builder_fee_ceil: U256::ZERO,
+            bid_block_enabled: true,
+            version: "test".to_string(),
+        };
+        let json = serde_json::to_value(&params).unwrap();
+        assert_eq!(
+            json.get("DelayLeftOver"),
+            Some(&serde_json::Value::from(15_000_000u64)),
+            "DelayLeftOver must serialize under go-bsc's key, in nanoseconds"
+        );
     }
 
     #[test]

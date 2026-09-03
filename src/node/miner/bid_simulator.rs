@@ -656,6 +656,8 @@ where
                     // it must run the full Parlia finalization the miner runs — unlike
                     // `eth_simulateV1`, which is a caller-facing hypothetical.
                     mode: BscExecutionMode::BidSimulation,
+                    // Same remainder the miner would seal into mix_hash for this slot.
+                    milli_remainder: bid_runtime.mining_ctx.block_timestamp_ms % 1000,
                     validator_cache_sink: Some(bid_validator_cache_sink.clone()),
                     turn_length_sink: Some(bid_turn_length_sink.clone()),
                     // Bid simulation does not run alongside a sparse-trie task —
