@@ -166,6 +166,35 @@ fn validate_requests_hash_for_bsc(
     Ok(())
 }
 
+/// go-bsc `parlia.VerifyUnsealedHeader`: reject the two trailing `rlp:"optional"` header fields
+/// `BlockAccessListHash` (EIP-7928) and `SlotNumber` (EIP-7843).
+///
+/// Both are covered by the block hash but NOT by the Parlia seal preimage —
+/// [`super::util::encode_header_with_chain_id`] stops after `requests_hash`, mirroring go-bsc's
+/// `EncodeSigHeader`. Honest blocks never set them, so without this check an unprivileged peer
+/// could append a crafted value to a validator-signed header, changing its block hash while
+/// leaving the seal (and therefore the recovered signer) valid.
+///
+/// go-bsc gates the rule on Amsterdam — absent before, required from — but BSC has not
+/// scheduled Amsterdam and reth-bsc has no such fork, so only the "must be absent" half is
+/// expressible here. The presence half lands with Amsterdam itself, at which point the fields'
+/// *content* is bound by state validation (`BlockAccessListHash` is recomputed from execution)
+/// and the slot rules rather than by the seal.
+#[inline]
+fn validate_optional_trailing_fields_for_bsc(header: &SealedHeader) -> Result<(), ConsensusError> {
+    if let Some(block_access_list_hash) = header.block_access_list_hash {
+        return Err(ConsensusError::msg(format!(
+            "invalid BlockAccessListHash, have {block_access_list_hash:#x}, expected nil"
+        )));
+    }
+    if let Some(slot_number) = header.slot_number {
+        return Err(ConsensusError::msg(format!(
+            "invalid SlotNumber, have {slot_number}, expected nil"
+        )));
+    }
+    Ok(())
+}
+
 impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 'static> Parlia<ChainSpec> {
     /// The standalone header-field checks shared by the sync path and the BidBlock path —
     /// go-bsc's `VerifyUnsealedHeader` scope. Deliberately EXCLUDES the wall-clock future
@@ -219,6 +248,8 @@ impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 's
         let prague_active =
             self.spec.is_prague_active_at_block_and_timestamp(header.number, header.timestamp);
         validate_requests_hash_for_bsc(header, prague_active)?;
+
+        validate_optional_trailing_fields_for_bsc(header)?;
 
        Ok(())
     }
@@ -400,6 +431,89 @@ mod tests {
             validate_requests_hash_for_bsc(&header, false),
             Err(ConsensusError::RequestsHashUnexpected)
         ));
+    }
+
+    #[test]
+    fn rejects_block_access_list_hash_and_slot_number() {
+        // Both absent: the only shape honest BSC blocks have today.
+        assert!(validate_optional_trailing_fields_for_bsc(&sealed(Header::default())).is_ok());
+
+        let header = sealed(Header {
+            block_access_list_hash: Some(B256::from([3u8; 32])),
+            ..Default::default()
+        });
+        let err = validate_optional_trailing_fields_for_bsc(&header).unwrap_err().to_string();
+        assert!(err.contains("invalid BlockAccessListHash"), "unexpected error: {err}");
+
+        let header = sealed(Header { slot_number: Some(7), ..Default::default() });
+        let err = validate_optional_trailing_fields_for_bsc(&header).unwrap_err().to_string();
+        assert!(err.contains("invalid SlotNumber"), "unexpected error: {err}");
+    }
+
+    /// Why the check has to exist: appending either field leaves the Parlia seal preimage — and
+    /// so the recovered signer — untouched, while changing the block hash. That is exactly the
+    /// malleability go-bsc closes; without the check, a peer can mint a second valid-looking
+    /// hash for a block it did not sign.
+    #[test]
+    fn trailing_fields_change_the_block_hash_but_not_the_seal_hash() {
+        use crate::consensus::parlia::util::hash_with_chain_id;
+
+        let base = Header { number: 1, extra_data: vec![0u8; 97].into(), ..Default::default() };
+
+        let mut malleated = base.clone();
+        malleated.block_access_list_hash = Some(B256::from([9u8; 32]));
+
+        // The seal covers neither field, so the signature over the original header still
+        // verifies against the malleated one.
+        assert_eq!(hash_with_chain_id(&base, 56), hash_with_chain_id(&malleated, 56));
+        // But the block hash — what peers index and fork-choice keys on — differs.
+        assert_ne!(base.hash_slow(), malleated.hash_slow());
+
+        let mut malleated = base.clone();
+        malleated.slot_number = Some(1);
+        assert_eq!(hash_with_chain_id(&base, 56), hash_with_chain_id(&malleated, 56));
+        assert_ne!(base.hash_slow(), malleated.hash_slow());
+    }
+
+    /// The check is reached from `validate_unsealed_header_fields` (go-bsc's
+    /// `VerifyUnsealedHeader` scope), not just callable in isolation: an otherwise-valid
+    /// pre-Cancun header passes, and the same header with a `BlockAccessListHash` does not.
+    #[test]
+    fn unsealed_header_fields_rejects_trailing_optional_fields() {
+        use crate::chainspec::BscChainSpec;
+        use reth_chainspec::ChainSpecBuilder;
+        let parlia = Parlia::new(Arc::new(BscChainSpec::from(ChainSpecBuilder::mainnet().build())), 200);
+
+        // Non-epoch height, vanity+seal extra data, pre-Cancun timestamp: every other optional
+        // field is legitimately absent, so this header's only variable is the one under test.
+        let valid = Header {
+            number: 1,
+            timestamp: 1_600_000_000,
+            extra_data: vec![0u8; 97].into(),
+            ommers_hash: EMPTY_OMMER_ROOT_HASH,
+            base_fee_per_gas: Some(0),
+            ..Default::default()
+        };
+        parlia
+            .validate_unsealed_header_fields(&sealed(valid.clone()))
+            .expect("baseline header must pass");
+
+        let with_bal = Header {
+            block_access_list_hash: Some(B256::from([4u8; 32])),
+            ..valid.clone()
+        };
+        let err = parlia
+            .validate_unsealed_header_fields(&sealed(with_bal))
+            .expect_err("BlockAccessListHash must be rejected")
+            .to_string();
+        assert!(err.contains("invalid BlockAccessListHash"), "unexpected error: {err}");
+
+        let with_slot = Header { slot_number: Some(1), ..valid };
+        let err = parlia
+            .validate_unsealed_header_fields(&sealed(with_slot))
+            .expect_err("SlotNumber must be rejected")
+            .to_string();
+        assert!(err.contains("invalid SlotNumber"), "unexpected error: {err}");
     }
 
     /// Regression guard for the BidBlock future-timestamp fix: the sync path (`validate_header`)
