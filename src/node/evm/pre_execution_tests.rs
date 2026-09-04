@@ -612,6 +612,7 @@ mod parent_block_env {
             validator_cache_sink: None,
             turn_length_sink: None,
             state_root_precomputed_sink: None,
+            payment_lane_sink: Arc::new(std::sync::Mutex::new(None)),
             trie_handle: None,
             state_root_deadline_ms: None,
         };
@@ -626,6 +627,22 @@ mod parent_block_env {
         );
         executor.inner_ctx.parent_header = Some(header_at(EPOCH_BLOCK - 1));
         executor
+    }
+
+    /// The payment lane may only read `0x2007` while the DB still holds the parent's
+    /// post-state. Enforced rather than documented: a late read would take the list from a
+    /// state this block has already changed, and then cache that answer under the parent hash,
+    /// so every later block with the same parent inherits it.
+    #[test]
+    fn lane_meta_refuses_to_read_a_mutated_state() {
+        let mut executor = executor();
+        executor.db_at_parent_state = false;
+
+        let err = executor.load_lane_meta().expect_err("must refuse");
+        assert!(
+            err.to_string().contains("after this block mutated state"),
+            "unexpected error: {err}"
+        );
     }
 
     /// `Parent` reads the parent env; `Current` reads the current env.

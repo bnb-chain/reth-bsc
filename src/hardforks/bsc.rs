@@ -71,7 +71,7 @@ hardfork!(
         Mendel,
         /// BSC `Pasteur` hardfork - sequenced immediately after Mendel
         Pasteur,
-        /// BSC `Jenner` hardfork (BEP-706) - sequenced immediately after Pasteur
+        /// BSC `Jenner` hardfork (BEP-706 and BEP-703) - sequenced immediately after Pasteur
         Jenner,
     }
 );
@@ -292,7 +292,10 @@ impl From<BscHardfork> for SpecId {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chainspec::{bsc::bsc_mainnet, bsc_chapel::bsc_testnet};
+    use crate::{
+        chainspec::{bsc::bsc_mainnet, bsc_chapel::bsc_testnet},
+        hardforks::BscHardforks,
+    };
 
     #[test]
     fn test_pasteur_is_sequenced_after_mendel() {
@@ -303,6 +306,11 @@ mod tests {
         // Pasteur is a BSC-only precompile/system-contract fork with no new EVM spec.
         assert_eq!(SpecId::from(BscHardfork::Pasteur), SpecId::OSAKA);
     }
+
+
+
+
+
 
     #[test]
     fn test_pasteur_scheduled_on_testnet() {

@@ -332,6 +332,46 @@ pub struct BscParliaGethMetrics {
     pub doublesign: Counter,
 }
 
+/// Metrics for the BEP-703 payment lane.
+///
+/// Field docs keep the go-bsc metric names for easier cross-client comparison.
+#[derive(Metrics, Clone)]
+#[metrics(scope = "bsc.payment_lane")]
+pub struct BscPaymentLaneMetrics {
+    /// paymentlane/imported/paymentLaneQuota
+    pub imported_quota: Gauge,
+    /// paymentlane/imported/paymentGasUsed
+    pub imported_payment_gas_used: Gauge,
+    /// paymentlane/imported/paymentLaneIdle
+    pub imported_idle: Gauge,
+
+    /// paymentlane/paymentLaneQuota
+    pub quota: Gauge,
+    /// paymentlane/paymentLaneIdle
+    pub idle: Gauge,
+    /// paymentlane/paymentLaneFloor
+    pub floor: Gauge,
+    /// paymentlane/paymentLaneCeiling
+    pub ceiling: Gauge,
+    /// paymentlane/paymentLaneCap
+    pub cap: Gauge,
+
+    /// paymentlane/rejected
+    pub rejected: Counter,
+    /// paymentlane/stateUnavailable
+    pub state_unavailable: Counter,
+    /// paymentlane/generalLaneYielded
+    pub general_lane_yielded: Counter,
+    /// paymentlane/produceDeclined
+    pub produce_declined: Counter,
+    /// paymentlane/bidBlockDeclined
+    pub bid_block_declined: Counter,
+}
+
+/// Process-wide payment lane metrics shared by execution, validation, and mining.
+pub static LANE_METRICS: once_cell::sync::Lazy<BscPaymentLaneMetrics> =
+    once_cell::sync::Lazy::new(BscPaymentLaneMetrics::default);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,5 +387,6 @@ mod tests {
         let _miner_metrics = BscMinerMetrics::default();
         let _finality_metrics = BscFinalityMetrics::default();
         let _blockchain_metrics = BscBlockchainMetrics::default();
+        let _payment_lane_metrics = BscPaymentLaneMetrics::default();
     }
 }

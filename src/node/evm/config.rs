@@ -42,99 +42,58 @@ use revm::{
 };
 use std::{borrow::Cow, cell::RefCell, convert::Infallible, rc::Rc, sync::{Arc, Mutex}};
 
-/// Shared sink type for transporting `(current_validators, vote_addresses)` from the builder to
-/// the payload/bid layer so that VALIDATOR_CACHE can be written after the definitive block hash
-/// is known.
+/// Carries `(current_validators, vote_addresses)` until the final block hash is known.
 pub type ValidatorCacheSink = Arc<Mutex<Option<(Vec<Address>, Vec<VoteAddress>)>>>;
 
-/// Sink carrying the sparse-trie background task's precomputed
-/// `(state_root, trie_updates)`, threaded from the payload layer to the builder's
-/// MDBX branch so it can skip the blocking `state_root_with_updates` call.
+/// Carries the BEP-703 commitment from `finish` to the assembler.
+pub type PaymentLaneSink = Arc<Mutex<Option<crate::consensus::payment_lane::Commitment>>>;
+
+/// Carries precomputed `(state_root, trie_updates)` into the MDBX builder path.
 pub type StateRootPrecomputedSink =
     Arc<Mutex<Option<(alloy_primitives::B256, reth_trie_common::updates::TrieUpdates)>>>;
 
-/// What the executor is doing with the block it is running.
-///
-/// Replaces the former `is_miner: bool`, which fused two independent questions: whether a
-/// header already exists, and whether Parlia finalization should run. Those two always
-/// moved together for the import and mining paths, so a bool sufficed — until
-/// `eth_simulateV1` needed the third combination (author a block, but do *not* finalize
-/// it) and was silently rounded to [`Self::Mining`], making a read-only RPC try to sign
-/// Parlia system transactions. See <https://github.com/bnb-chain/reth-bsc/issues/451>.
+/// How the executor should treat the block it is running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BscExecutionMode {
-    /// Verifying a block received from the network or the engine API. The header already
-    /// exists and system transactions are consumed from the block rather than generated.
+    /// Verifying an existing block.
     Import,
-    /// Producing a block this validator will sign and broadcast. System transactions are
-    /// generated and signed with the validator key.
+    /// Producing a validator-owned block from the tx pool.
     Mining,
-    /// Answering a hypothetical — `eth_simulateV1` or the local pending block. Authors a
-    /// header like [`Self::Mining`], but runs no Parlia finalization and signs nothing,
-    /// matching BSC geth's simulation path.
+    /// Producing a block from a fixed transaction set.
+    BidSimulation,
+    /// Building a hypothetical block without finalization.
     Simulation,
 }
 
 impl BscExecutionMode {
-    /// Whether no header exists yet and one is being authored.
-    ///
-    /// True for both [`Self::Mining`] and [`Self::Simulation`]; the block-verification
-    /// checks that dereference `ctx.header` must be skipped in both.
+    /// Whether this path authors a fresh header.
     pub const fn authors_block(self) -> bool {
-        matches!(self, Self::Mining | Self::Simulation)
+        matches!(self, Self::Mining | Self::BidSimulation | Self::Simulation)
     }
 
-    /// Whether Parlia post-block finalization (reward distribution, slashing, validator-set
-    /// updates) must run — which implies signing system transactions.
+    /// Whether this path runs Parlia finalization and signs system transactions.
     pub const fn finalizes(self) -> bool {
-        matches!(self, Self::Mining)
+        matches!(self, Self::Mining | Self::BidSimulation)
     }
 }
 
 /// BSC wrapper around [`NextBlockEnvAttributes`].
-///
-/// Extends the upstream attributes with sparse-trie sinks and validator/turn-length
-/// transport sinks needed by the BSC miner. The struct still satisfies upstream RPC
-/// trait bounds via a delegating [`BuildPendingEnv`] implementation, keeping reth's
-/// base attributes unchanged.
 #[derive(Debug, Clone)]
 pub struct BscNextBlockEnvAttributes {
     pub inner: NextBlockEnvAttributes,
     /// Execution mode for the block built from these attributes.
-    ///
-    /// Defaults to [`BscExecutionMode::Simulation`] via [`BuildPendingEnv`], which is the
-    /// entry point reth uses for `eth_simulateV1` and the local pending block. The miner and
-    /// bid simulator construct this struct literally and must set
-    /// [`BscExecutionMode::Mining`] explicitly.
     pub mode: BscExecutionMode,
-    /// Sink for transporting `current_validators` from builder to payload layer without writing
-    /// to VALIDATOR_CACHE prematurely (hash not yet final at build time).
+    /// Defers validator-cache writes until the final block hash is known.
     pub validator_cache_sink: Option<ValidatorCacheSink>,
-    /// Sink for transporting `turn_length` from builder to payload layer without writing to
-    /// TURN_LENGTH_CACHE prematurely.
+    /// Defers turn-length cache writes until the final block hash is known.
     pub turn_length_sink: Option<Arc<Mutex<Option<u8>>>>,
-    /// Sink for precomputed `(state_root, trie_updates)` from a sparse-trie background
-    /// task. Filled by the payload layer between exec and `finish` so the builder can
-    /// skip the blocking `state_root_with_updates` call. See
-    /// [`BscBlockExecutionCtx::state_root_precomputed_sink`] for full semantics.
+    /// Carries precomputed `(state_root, trie_updates)` into `finish`.
     pub state_root_precomputed_sink: Option<StateRootPrecomputedSink>,
-    /// Sparse-trie state-root handle, threaded through to `finish`.
-    ///
-    /// Stored here (in `Arc<Mutex<Option<_>>>` so `Clone` works for the type-erased
-    /// builder path) so that `state_root()` can be called **after** `executor.finish()`
-    /// runs BSC's post-execution system transactions (slash, fee distribution,
-    /// validator-set updates). Those system txs change state via the same executor
-    /// that has the `state_hook` installed; the hook is dropped naturally when the
-    /// executor is consumed by `finish()`, which sends `FinishedStateUpdates` to the
-    /// background task. Only after that drop is it safe to await `state_root()`.
+    /// Sparse-trie state-root handle, kept until `finish` can await it safely.
     pub trie_handle: Option<
         Arc<Mutex<Option<reth_engine_tree::tree::multiproof::StateRootHandle>>>,
     >,
-    /// Absolute wall-clock deadline (epoch ms) for bounding the sparse-trie
-    /// `state_root()` wait in `finish`. Past it the builder stops waiting and falls
-    /// back to synchronous `state_root_with_updates`, so an in-turn block never
-    /// blocks unboundedly past its slot. `None` = legacy unbounded blocking wait
-    /// (out-of-turn / bid-sim / import paths).
+    /// Absolute deadline for waiting on sparse-trie state-root completion in `finish`.
     pub state_root_deadline_ms: Option<u64>,
     /// Sub-second millisecond remainder (BEP-520) of the block being built, consumed by
     /// [`BscBlockEnv`] and the BEP-706 precompile. The miner and bid simulator fill it
@@ -149,8 +108,7 @@ impl<H: BlockHeader> BuildPendingEnv<H> for BscNextBlockEnvAttributes {
     fn build_pending_env(parent: &SealedHeader<H>) -> Self {
         Self {
             inner: NextBlockEnvAttributes::build_pending_env(parent),
-            // This is the RPC-side entry point (`eth_simulateV1`, local pending block), not
-            // the miner. Simulation must not run Parlia finalization or sign system txs.
+            // RPC pending/simulate path: build a header, but do not finalize or sign.
             mode: BscExecutionMode::Simulation,
             validator_cache_sink: None,
             turn_length_sink: None,
@@ -220,6 +178,9 @@ pub struct BscBlockExecutionCtx<'a> {
     /// `--mining.use-sparse-trie-state-root` flag is off, triggering the legacy
     /// state-root path.
     pub state_root_precomputed_sink: Option<StateRootPrecomputedSink>,
+    /// Carries the BEP-703 commitment from the executor to the assembler. Stays empty on
+    /// import paths, where the assembler never runs.
+    pub payment_lane_sink: PaymentLaneSink,
     /// Sparse-trie state-root handle. The builder consumes this **after**
     /// `executor.finish()` runs BSC's post-execution system transactions (slash,
     /// fee distribution, validator-set updates), so those state changes are
@@ -546,6 +507,7 @@ where
             validator_cache_sink: None,
             turn_length_sink: None,
             state_root_precomputed_sink: None,
+            payment_lane_sink: Arc::new(Mutex::new(None)),
             trie_handle: None,
             state_root_deadline_ms: None,
         })
@@ -580,6 +542,7 @@ where
             validator_cache_sink: attributes.validator_cache_sink,
             turn_length_sink: attributes.turn_length_sink,
             state_root_precomputed_sink: attributes.state_root_precomputed_sink,
+            payment_lane_sink: Arc::new(Mutex::new(None)),
             trie_handle: attributes.trie_handle,
             state_root_deadline_ms: attributes.state_root_deadline_ms,
         })
@@ -652,6 +615,7 @@ where
             validator_cache_sink: None,
             turn_length_sink: None,
             state_root_precomputed_sink: None,
+            payment_lane_sink: Arc::new(Mutex::new(None)),
             trie_handle: None,
             state_root_deadline_ms: None,
         })
@@ -895,10 +859,12 @@ mod tests {
     fn execution_mode_predicates_split_authoring_from_finalizing() {
         assert!(!BscExecutionMode::Import.authors_block());
         assert!(BscExecutionMode::Mining.authors_block());
+        assert!(BscExecutionMode::BidSimulation.authors_block());
         assert!(BscExecutionMode::Simulation.authors_block());
 
         assert!(!BscExecutionMode::Import.finalizes());
         assert!(BscExecutionMode::Mining.finalizes());
+        assert!(BscExecutionMode::BidSimulation.finalizes());
         assert!(!BscExecutionMode::Simulation.finalizes());
     }
 

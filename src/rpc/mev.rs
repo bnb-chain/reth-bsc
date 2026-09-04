@@ -588,6 +588,23 @@ impl MevApiImpl {
             return Err(Self::invalid_bid("BidBlock disabled, fallback to SendBid"));
         }
 
+        // BEP-703: the activation block is outside the lane mechanism, so its `ommers_hash`
+        // must stay EMPTY — but a BidBlock's header is adopted almost verbatim from the builder,
+        // which cannot be relied on to know that. Decline and let the builder fall back.
+        //
+        // The message text is part of the interface: builders match on it to decide to retry via
+        // SendBid, so it must read exactly as go-bsc's does.
+        let next_number = head_header.number + 1;
+        if self.chain_spec.is_jenner_transition_at_timestamp(
+            next_number,
+            args.bid_block.header.timestamp,
+            head_header.timestamp,
+        ) {
+            return Err(Self::invalid_bid(format!(
+                "BidBlock disabled at block {next_number} (hard-fork activation block), fallback to SendBid"
+            )));
+        }
+
         let builder = args.ecrecover_sender().map_err(|e| {
             Self::invalid_bid(format!("invalid signature: bidHash={bid_hash}, err={e}"))
         })?;

@@ -2,6 +2,7 @@ use reth::consensus::{Consensus, ConsensusError, HeaderValidator};
 use reth::primitives::SealedHeader;
 use reth_chainspec::{EthChainSpec, EthereumHardforks, EthereumHardfork};
 use crate::consensus::parlia::util::calculate_millisecond_timestamp;
+use crate::consensus::payment_lane::Commitment;
 use crate::hardforks::BscHardforks;
 use crate::consensus::eip4844::is_blob_eligible_block;
 use super::{Parlia, EMPTY_WITHDRAWALS_HASH};
@@ -179,8 +180,19 @@ impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 's
         // Check extra data
         self.check_header_extra(header).map_err(|e| ConsensusError::Other(Arc::new(std::io::Error::other(format!("Invalid header extra: {e}")))))?;
 
-        // Ensure that the block with no uncles
-        if header.ommers_hash != EMPTY_OMMER_ROOT_HASH {
+        // No uncles, ever. Before Jenner this must be the empty ommers root; from Jenner on this
+        // path only shape-checks the commitment. The activation block still relies on the
+        // pre-Jenner `else` arm because this path has no parent.
+        let ommers_hash_ok = if BscHardforks::is_jenner_active_at_timestamp(
+            &*self.spec,
+            header.number,
+            header.timestamp,
+        ) {
+            Commitment::commits_no_uncles(header.ommers_hash)
+        } else {
+            header.ommers_hash == EMPTY_OMMER_ROOT_HASH
+        };
+        if !ommers_hash_ok {
             return Err(ConsensusError::BodyOmmersHashDiff(
                 GotExpected { got: header.ommers_hash, expected: EMPTY_OMMER_ROOT_HASH }.into(),
             ));
@@ -258,6 +270,20 @@ impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 's
         &self,
         block: &reth_primitives_traits::SealedBlock<BscBlock>,
     ) -> Result<(), ConsensusError> {
+        // The body must still carry no ommers. Since Jenner `ommers_hash` is a commitment, so
+        // the backfill path has to enforce emptiness here.
+        if let Some(ommers) =
+            reth_primitives_traits::BlockBody::ommers(block.body()).filter(|o| !o.is_empty())
+        {
+            return Err(ConsensusError::BodyOmmersHashDiff(
+                GotExpected {
+                    got: alloy_consensus::proofs::calculate_ommers_root(ommers),
+                    expected: EMPTY_OMMER_ROOT_HASH,
+                }
+                .into(),
+            ));
+        }
+
         // Check transaction root
         if let Err(error) = block.ensure_transaction_root_valid() {
             return Err(ConsensusError::BodyTransactionRootDiff(error.into()));
@@ -402,11 +428,105 @@ mod tests {
         ));
     }
 
-    /// Regression guard for the BidBlock future-timestamp fix: the sync path (`validate_header`)
-    /// applies the wall-clock future bound (go-bsc `verifyHeader`), but the BidBlock admission path
-    /// (`validate_unsealed_header_fields`, go-bsc `VerifyUnsealedHeader`) must NOT — a bid's
-    /// next-slot timestamp is legitimately in the future when it arrives. If someone re-adds the
-    /// future check to the unsealed path, this fails.
+    /// The backfill path reaches ommers validation only here, so the body must still reject
+    /// real ommers after Jenner.
+    #[test]
+    fn block_pre_execution_requires_an_empty_ommers_list() {
+        use crate::chainspec::BscChainSpec;
+        use crate::consensus::payment_lane::Commitment;
+        use crate::node::primitives::BscBlockBody;
+        use reth_chainspec::ChainSpecBuilder;
+        use reth_primitives_traits::SealedBlock;
+
+        let parlia = Parlia::new(
+            Arc::new(BscChainSpec::from(ChainSpecBuilder::mainnet().build())),
+            200,
+        );
+        let block = |ommers: Vec<Header>| {
+            let body = BscBlockBody {
+                inner: alloy_consensus::BlockBody { ommers, ..Default::default() },
+                sidecars: None,
+            };
+            let header = Header {
+                number: 1,
+                // Use a commitment so the test proves this path inspects the body, not the field.
+                ommers_hash: Commitment { quota: 1, payment_gas_used: 0 }.encode(),
+                transactions_root: alloy_consensus::proofs::calculate_transaction_root::<
+                    reth_ethereum_primitives::TransactionSigned,
+                >(&[]),
+                ..Default::default()
+            };
+            SealedBlock::<BscBlock>::seal_slow(crate::BscBlock { header, body })
+        };
+
+        assert!(parlia.validate_block_pre_execution(&block(vec![])).is_ok());
+        assert!(matches!(
+            parlia.validate_block_pre_execution(&block(vec![Header {
+                number: 1,
+                ..Default::default()
+            }])),
+            Err(ConsensusError::BodyOmmersHashDiff(_))
+        ));
+    }
+
+    /// Since Jenner, this path shape-checks the commitment in `ommers_hash`.
+    /// It has no parent, so it gates on the header timestamp.
+    #[test]
+    fn jenner_ommers_hash_is_shape_checked_not_compared_to_the_empty_root() {
+        use crate::chainspec::BscChainSpec;
+        use crate::consensus::payment_lane::Commitment;
+        use crate::hardforks::bsc::BscHardfork;
+        use reth_chainspec::{ChainSpecBuilder, ForkCondition};
+
+        const JENNER: u64 = 1_800_000_000;
+        let parlia = Parlia::new(
+            Arc::new(BscChainSpec::from(
+                ChainSpecBuilder::mainnet()
+                    .with_fork(BscHardfork::Jenner, ForkCondition::Timestamp(JENNER))
+                    .build(),
+            )),
+            200,
+        );
+        // Past London and off-epoch, with just enough extra data to clear `check_header_extra`.
+        use crate::consensus::parlia::constants::{EXTRA_SEAL_LEN, EXTRA_VANITY_LEN};
+        const BLOCK: u64 = 12_965_001;
+        let extra = alloy_primitives::Bytes::from(vec![0u8; EXTRA_VANITY_LEN + EXTRA_SEAL_LEN]);
+        let header = |timestamp, ommers_hash| {
+            sealed(Header {
+                number: BLOCK,
+                timestamp,
+                ommers_hash,
+                extra_data: extra.clone(),
+                mix_hash: B256::ZERO,
+                ..Default::default()
+            })
+        };
+        let ommers_rejected = |h: &SealedHeader| {
+            matches!(
+                parlia.validate_unsealed_header_fields(h),
+                Err(ConsensusError::BodyOmmersHashDiff(_))
+            )
+        };
+
+        let commitment = Commitment { quota: 3_000_000, payment_gas_used: 1_000 }.encode();
+        let reserved_set = {
+            let mut b = commitment.0;
+            b[31] = 1;
+            B256::from(b)
+        };
+
+        // Before Jenner only the empty root passes, commitment shape included.
+        assert!(!ommers_rejected(&header(JENNER - 1, EMPTY_OMMER_ROOT_HASH)));
+        assert!(ommers_rejected(&header(JENNER - 1, commitment)));
+
+        // From Jenner on, both a well-shaped commitment and EMPTY pass on this path.
+        assert!(!ommers_rejected(&header(JENNER, commitment)));
+        assert!(!ommers_rejected(&header(JENNER, EMPTY_OMMER_ROOT_HASH)));
+        // Reserved bytes set still fails shape validation.
+        assert!(ommers_rejected(&header(JENNER, reserved_set)));
+    }
+
+    /// Regression guard: sync checks the wall clock, unsealed-header validation does not.
     #[test]
     fn unsealed_header_fields_skips_wall_clock_future_check() {
         use crate::chainspec::BscChainSpec;

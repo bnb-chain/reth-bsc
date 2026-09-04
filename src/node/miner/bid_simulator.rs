@@ -655,7 +655,7 @@ where
                     // MEV bid simulation reproduces the block this validator would seal, so
                     // it must run the full Parlia finalization the miner runs — unlike
                     // `eth_simulateV1`, which is a caller-facing hypothetical.
-                    mode: BscExecutionMode::Mining,
+                    mode: BscExecutionMode::BidSimulation,
                     // Same remainder the miner would seal into mix_hash for this slot.
                     milli_remainder: bid_runtime.mining_ctx.block_timestamp_ms % 1000,
                     validator_cache_sink: Some(bid_validator_cache_sink.clone()),

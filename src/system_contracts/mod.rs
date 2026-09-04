@@ -558,6 +558,10 @@ pub const STAKE_CREDIT_CONTRACT: Address = address!("0x0000000000000000000000000
 pub const GOVERNOR_CONTRACT: Address = address!("0x0000000000000000000000000000000000002004");
 pub const GOV_TOKEN_CONTRACT: Address = address!("0x0000000000000000000000000000000000002005");
 pub const TIMELOCK_CONTRACT: Address = address!("0x0000000000000000000000000000000000002006");
+/// BEP-703 PaymentLane, installed by the Jenner fork.
+///
+/// Deliberately absent from `SYSTEM_CONTRACTS_SET`, matching go-bsc.
+pub const PAYMENT_LANE_CONTRACT: Address = address!("0x0000000000000000000000000000000000002007");
 pub const TOKEN_RECOVER_PORTAL_CONTRACT: Address =
     address!("0x0000000000000000000000000000000000003000");
 
@@ -589,7 +593,6 @@ lazy_static! {
         read_all_system_contracts(&bsc_testnet());
     pub(crate) static ref BSC_QANET_CONTRACTS: HashMap<String, HashMap<Address, Option<Bytecode>>> =
         read_all_system_contracts(&bsc_qanet());
-
 
 }
 
@@ -633,6 +636,7 @@ fn get_all_system_contracts() -> Vec<SystemContractName> {
             "TokenRecoverPortalContract".to_string(),
             TOKEN_RECOVER_PORTAL_CONTRACT,
         ),
+        SystemContractName::new("PaymentLaneContract".to_string(), PAYMENT_LANE_CONTRACT),
     ];
 
     res
@@ -673,6 +677,7 @@ fn hardforks_with_system_contracts() -> Vec<BscHardfork> {
         BscHardfork::Maxwell,
         BscHardfork::Fermi,
         BscHardfork::Pasteur,
+        BscHardfork::Jenner,
     ]
 }
 
@@ -699,6 +704,7 @@ fn hardfork_to_dir_name(hardfork: &BscHardfork) -> Result<String, SystemContract
         BscHardfork::Maxwell => "maxwell",
         BscHardfork::Fermi => "fermi",
         BscHardfork::Pasteur => "pasteur",
+        BscHardfork::Jenner => "jenner",
         _ => {
             return Err(SystemContractError::InvalidHardfork);
         }
@@ -1127,6 +1133,23 @@ where
         }
     }
 
+    // Jenner only installs PaymentLane code; no initializer is needed.
+    if spec.is_jenner_transition_at_timestamp(block_number, block_time, parent_block_time) {
+        if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Jenner.name()) {
+            for (address, v) in &contracts {
+                m.insert(*address, v.clone());
+                info!(
+                    target: "bsc::system_contracts::upgrade",
+                    block_number = block_number,
+                    block_time = block_time,
+                    parent_block_time = parent_block_time,
+                    address = ?address,
+                    "Jenner upgrade contract"
+                );
+            }
+        }
+    }
+
     Ok(m)
 }
 
@@ -1220,6 +1243,7 @@ mod tests {
     fn test_pasteur_system_contract_upgrade() {
         // The Pasteur upgrade swaps exactly StakeHub (0x2002) and Governor (0x2004) on every
         // network, with non-empty genesis-contract v1.2.6 bytecode.
+
         for spec in [bsc_mainnet(), bsc_testnet(), bsc_qanet()] {
             let res = get_system_contract_codes(&spec, BscHardfork::Pasteur.name()).unwrap();
             assert_eq!(res.len(), 2, "Pasteur upgrades only StakeHub and Governor");
@@ -1260,6 +1284,58 @@ mod tests {
         let before =
             get_upgrade_system_contracts(&spec, block, pasteur_time - 10, pasteur_time - 11).unwrap();
         assert!(!before.contains_key(&STAKE_HUB_CONTRACT));
+    }
+
+    #[test]
+    fn jenner_payment_lane_code_matches_genesis_contract() {
+        // Guard the hardcoded address directly.
+        assert_eq!(PAYMENT_LANE_CONTRACT, address!("0x0000000000000000000000000000000000002007"));
+
+        use sha2::{Digest, Sha256};
+
+        // bsc-genesis-contract@aaa092b, solc 0.8.17.
+        const WANT_SHA256: &str =
+            "2e0fa3189b43957fcf25c9bec3e83f52a5bd5115f1e5f1cb3f6782c5ea1c1fcc";
+
+        for spec in [bsc_mainnet(), bsc_testnet(), bsc_qanet()] {
+            let res = get_system_contract_codes(&spec, BscHardfork::Jenner.name()).unwrap();
+            assert_eq!(res.len(), 1, "Jenner installs only PaymentLane");
+
+            let code = res.get(&PAYMENT_LANE_CONTRACT).expect("PaymentLane present");
+            let bytes = code.as_ref().unwrap().original_bytes();
+            assert_eq!(bytes.len(), 5248);
+            assert_eq!(hex::encode(Sha256::digest(bytes)), WANT_SHA256);
+        }
+    }
+
+    /// PaymentLane is a system contract, but not a system-transaction target.
+    #[test]
+    fn jenner_payment_lane_is_not_a_system_tx_target() {
+        assert!(!SYSTEM_CONTRACTS_SET.contains(&PAYMENT_LANE_CONTRACT));
+        assert!(!is_invoke_system_contract(&PAYMENT_LANE_CONTRACT));
+    }
+
+    #[test]
+    fn jenner_upgrade_applies_only_at_the_transition_block() {
+        use reth_chainspec::ForkCondition;
+
+        let jenner_time = 1_800_000_000u64;
+        let mut cs = bsc_mainnet();
+        cs.hardforks.insert(BscHardfork::Jenner, ForkCondition::Timestamp(jenner_time));
+        let spec = crate::chainspec::BscChainSpec::from(cs);
+        let block = 50_000_000; // past London
+
+        let at_transition =
+            get_upgrade_system_contracts(&spec, block, jenner_time, jenner_time - 3).unwrap();
+        assert!(at_transition.contains_key(&PAYMENT_LANE_CONTRACT));
+
+        let after =
+            get_upgrade_system_contracts(&spec, block, jenner_time + 3, jenner_time).unwrap();
+        assert!(!after.contains_key(&PAYMENT_LANE_CONTRACT));
+
+        let before =
+            get_upgrade_system_contracts(&spec, block, jenner_time - 3, jenner_time - 6).unwrap();
+        assert!(!before.contains_key(&PAYMENT_LANE_CONTRACT));
     }
 
     #[test]
