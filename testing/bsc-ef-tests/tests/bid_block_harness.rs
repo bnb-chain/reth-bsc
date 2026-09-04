@@ -778,18 +778,16 @@ fn jenner_payment_lane_chain_round_trips() {
                 .builder_for_next_block(&mut db, &parent, attrs)
                 .unwrap_or_else(|e| panic!("builder for block {number}: {e:?}"));
             builder.apply_pre_execution_changes().expect("pre-exec");
-            let mut nonce = reth_provider::AccountReader::basic_account(
+            let start_nonce = reth_provider::AccountReader::basic_account(
                 &state_provider,
                 &TEST_VALIDATOR,
             )
             .expect("read validator account")
             .map(|a| a.nonce)
             .unwrap_or(0);
-            for _ in 0..payments {
-                let tx = payment_tx(nonce);
-                nonce += 1;
+            for nonce in start_nonce..start_nonce + payments as u64 {
                 builder
-                    .execute_transaction(tx.try_into_recovered().expect("recover"))
+                    .execute_transaction(payment_tx(nonce).try_into_recovered().expect("recover"))
                     .unwrap_or_else(|e| panic!("execute payment in block {number}: {e:?}"));
             }
             let BlockBuilderOutcome { execution_result, block, hashed_state, .. } =
