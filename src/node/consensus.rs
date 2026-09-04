@@ -601,8 +601,8 @@ mod tests {
             data: vote_data,
         };
 
-        vote_pool::put_vote(vote1);
-        vote_pool::put_vote(vote2);
+        vote_pool::put_vote_unchecked(vote1);
+        vote_pool::put_vote_unchecked(vote2);
 
         let finalized = engine.get_finalized_number_and_hash(&head).unwrap();
         assert_eq!(finalized, (9, parent_hash));
@@ -680,7 +680,7 @@ mod tests {
             signature: VoteSignature::default(),
             data: vote_data,
         };
-        vote_pool::put_vote(vote1);
+        vote_pool::put_vote_unchecked(vote1);
 
         // Finality should NOT advance - still returns fallback
         let finalized = engine.get_finalized_number_and_hash(&head).unwrap();
@@ -762,8 +762,8 @@ mod tests {
             signature: VoteSignature::default(),
             data: wrong_vote_data,
         };
-        vote_pool::put_vote(vote1);
-        vote_pool::put_vote(vote2);
+        vote_pool::put_vote_unchecked(vote1);
+        vote_pool::put_vote_unchecked(vote2);
 
         // Finality should NOT advance - votes have wrong source
         let finalized = engine.get_finalized_number_and_hash(&head).unwrap();
@@ -845,8 +845,8 @@ mod tests {
             signature: VoteSignature::default(),
             data: wrong_vote_data,
         };
-        vote_pool::put_vote(vote1);
-        vote_pool::put_vote(vote2);
+        vote_pool::put_vote_unchecked(vote1);
+        vote_pool::put_vote_unchecked(vote2);
 
         // Finality should NOT advance - votes have wrong target
         let finalized = engine.get_finalized_number_and_hash(&head).unwrap();
@@ -920,8 +920,8 @@ mod tests {
             signature: VoteSignature::default(),
             data: vote_data,
         };
-        vote_pool::put_vote(vote1);
-        vote_pool::put_vote(vote2);
+        vote_pool::put_vote_unchecked(vote1);
+        vote_pool::put_vote_unchecked(vote2);
 
         // Finality should NOT advance because head.number - 1 (11) != current_justified_number (9)
         let finalized = engine.get_finalized_number_and_hash(&head).unwrap();
@@ -1003,7 +1003,7 @@ mod tests {
                 signature: VoteSignature::default(),
                 data: vote_data,
             };
-            vote_pool::put_vote(vote);
+            vote_pool::put_vote_unchecked(vote);
         }
 
         let finalized = engine.get_finalized_number_and_hash(&head).unwrap();
@@ -1015,7 +1015,7 @@ mod tests {
             signature: VoteSignature::default(),
             data: vote_data,
         };
-        vote_pool::put_vote(vote14);
+        vote_pool::put_vote_unchecked(vote14);
 
         let finalized = engine.get_finalized_number_and_hash(&head).unwrap();
         assert_eq!(finalized, (99, parent_hash), "14 votes should reach quorum");
