@@ -410,6 +410,16 @@ where
     Ok(())
 }
 
+/// Whether the global header provider has been registered yet.
+///
+/// Distinguishes "no provider" from "provider has no such header". Callers that
+/// classify by block presence need that distinction: before the provider is
+/// registered every lookup misses, which is not the same as the block being
+/// absent from the chain.
+pub fn has_header_by_hash_provider() -> bool {
+    HEADER_BY_HASH_PROVIDER.get().is_some()
+}
+
 /// Get header by hash from the global header provider
 /// Directly calls the stored HeaderProvider::header() function
 pub fn get_canonical_header_by_hash_from_provider(block_hash: &B256) -> Option<Header> {

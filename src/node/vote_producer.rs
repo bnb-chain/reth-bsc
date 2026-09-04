@@ -298,7 +298,7 @@ mod tests {
         // Journal writable: the vote reaches the pool.
         let ok = head_at(40_000_002);
         maybe_produce_and_broadcast_for_head(spec.clone(), &sp, &ok);
-        assert_eq!(votes::fetch_vote_by_block_hash(ok.hash_slow()).len(), 1);
+        assert_eq!(votes::fetch_any_vote_by_block_hash(ok.hash_slow()).len(), 1);
 
         // Journal directory replaced by a regular file: persist_vote fails.
         std::fs::remove_dir_all(&dir).unwrap();
@@ -306,7 +306,7 @@ mod tests {
         let bad = head_at(40_000_003);
         maybe_produce_and_broadcast_for_head(spec.clone(), &sp, &bad);
         assert!(
-            votes::fetch_vote_by_block_hash(bad.hash_slow()).is_empty(),
+            votes::fetch_any_vote_by_block_hash(bad.hash_slow()).is_empty(),
             "unjournalled vote must not reach put_vote or broadcast_votes",
         );
 
