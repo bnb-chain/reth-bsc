@@ -53,6 +53,24 @@ pub struct BscCliArgs {
     #[arg(long = "mining.bid-block-enabled")]
     pub mining_bid_block_enabled: bool,
 
+    /// Port for the optional BEP-675 `BidBlockService` gRPC listener. Zero disables it.
+    ///
+    /// Env alternative: `BSC_MEV_GRPC_PORT`.
+    #[arg(long = "mining.mev-grpc-port")]
+    pub mining_mev_grpc_port: Option<u16>,
+
+    /// Maximum process-wide in-flight gRPC `SendBidBlock` requests.
+    ///
+    /// Env alternative: `BSC_MEV_GRPC_CONCURRENCY`.
+    #[arg(long = "mining.mev-grpc-concurrency")]
+    pub mining_mev_grpc_concurrency: Option<u32>,
+
+    /// Total gRPC `SendBidBlock` timeout in milliseconds.
+    ///
+    /// Env alternative: `BSC_MEV_GRPC_REQUEST_TIMEOUT_MS`.
+    #[arg(long = "mining.mev-grpc-request-timeout-ms")]
+    pub mining_mev_grpc_request_timeout_ms: Option<u64>,
+
     /// Private key for mining (hex format, for testing only)
     /// The validator address will be automatically derived from this key
     #[arg(long = "mining.private-key")]
@@ -286,6 +304,16 @@ fn main() -> eyre::Result<()> {
                     mining_config.bid_block_enabled = true;
                 }
 
+                if let Some(port) = args.mining_mev_grpc_port {
+                    mining_config.mev_grpc_port = port;
+                }
+                if let Some(concurrency) = args.mining_mev_grpc_concurrency {
+                    mining_config.mev_grpc_concurrency = concurrency;
+                }
+                if let Some(timeout_ms) = args.mining_mev_grpc_request_timeout_ms {
+                    mining_config.mev_grpc_request_timeout_ms = timeout_ms;
+                }
+
                 // Ensure keys are available if enabled but none provided
                 mining_config = mining_config.ensure_keys_available();
 
@@ -426,6 +454,28 @@ fn main() -> eyre::Result<()> {
                 }
             }
 
+            let mev_grpc_config =
+                reth_bsc::node::miner::config::get_global_mining_config().and_then(|config| {
+                    let port = config.get_mev_grpc_port();
+                    (port != 0).then(|| {
+                        (
+                            port,
+                            reth_bsc::grpc::mev::MevGrpcConfig::new(
+                                config.get_mev_grpc_concurrency(),
+                                std::time::Duration::from_millis(
+                                    config.get_mev_grpc_request_timeout_ms(),
+                                ),
+                            ),
+                        )
+                    })
+                });
+            // Match go-bsc: the gRPC listener uses the configured HTTP bind host and an independent
+            // port. The handle crosses the synchronous RPC-extension hook so it can be shut down
+            // after the node exit future resolves.
+            let mev_grpc_host = builder.config().rpc.http_addr;
+            let mev_grpc_handle = Arc::new(std::sync::Mutex::new(None));
+            let mev_grpc_handle_for_rpc = Arc::clone(&mev_grpc_handle);
+
             let (node, engine_handle_tx) = BscNode::new();
             let NodeHandle { node, node_exit_future: exit_future } =
                 builder.node(node)
@@ -477,8 +527,8 @@ fn main() -> eyre::Result<()> {
 
                         // Get chain spec from context
                         let chain_spec = std::sync::Arc::new(ctx.config().chain.clone().as_ref().clone());
-                        let mev_api = MevApiImpl::new(snapshot_provider, chain_spec);
-                        ctx.modules.merge_if_module_configured(RethRpcModule::Mev, mev_api.into_rpc())?;
+                        let mev_api = Arc::new(MevApiImpl::new(snapshot_provider, chain_spec));
+                        ctx.modules.merge_if_module_configured(RethRpcModule::Mev, mev_api.as_ref().clone().into_rpc())?;
                         tracing::info!("Succeed to register MEV RPC API");
 
                         tracing::info!("Start to register Miner RPC API...");
@@ -541,6 +591,18 @@ fn main() -> eyre::Result<()> {
                         );
                         ctx.modules.merge_if_module_configured(RethRpcModule::Eth, eth_config.into_rpc())?;
                         tracing::info!("Succeed to register eth_config (EIP-7910) API");
+
+                        // Bind only after all RPC module registration succeeded, so a later merge
+                        // error cannot leave a detached gRPC listener behind during failed startup.
+                        if let Some((port, grpc_config)) = mev_grpc_config {
+                            let listen_addr = std::net::SocketAddr::new(mev_grpc_host, port);
+                            let handle = reth_bsc::grpc::mev::start_mev_grpc_server(
+                                listen_addr,
+                                grpc_config,
+                                mev_api,
+                            )?;
+                            *mev_grpc_handle_for_rpc.lock().unwrap() = Some(handle);
+                        }
                         Ok(())
                     })
                     .launch().await?;
@@ -560,7 +622,12 @@ fn main() -> eyre::Result<()> {
             // Set the IPC client
             reth_bsc::shared::set_ipc_client(ipc_path).await.unwrap();
 
-            exit_future.await
+            let grpc_handle = mev_grpc_handle.lock().unwrap().take();
+            let exit_result = exit_future.await;
+            if let Some(handle) = grpc_handle {
+                handle.shutdown().await;
+            }
+            exit_result
         },
     )?;
     Ok(())

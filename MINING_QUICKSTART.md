@@ -165,6 +165,37 @@ BSC_MINING_ENABLED=true BSC_GAS_LIMIT=25000000 cargo run
 BSC_MINING_ENABLED=true BSC_MINING_INTERVAL_MS=200 cargo run
 ```
 
+### BEP-675 BidBlock over gRPC
+
+The optional gRPC listener exposes the same BidBlock admission path as
+`mev_sendBidBlock`. Enable both BidBlock admission and the listener:
+
+```bash
+./target/release/reth-bsc node \
+  --chain bsc \
+  --mining.enabled \
+  --mining.bid-block-enabled \
+  --mining.mev-grpc-port 8553
+```
+
+Equivalent environment settings:
+
+```bash
+export BSC_MINING_BID_BLOCK_ENABLED=true
+export BSC_MEV_GRPC_PORT=8553
+export BSC_MEV_GRPC_CONCURRENCY=32
+export BSC_MEV_GRPC_REQUEST_TIMEOUT_MS=10000
+```
+
+The protobuf service is `mev.v1.BidBlockService`, with unary method
+`SendBidBlock`. `bid_block_rlp` is the geth RLP encoding of
+`[header, transactions, sidecars]`; `signature` is the builder's 65-byte ECDSA
+signature. See [`proto/mev.proto`](proto/mev.proto) for the complete schema.
+
+The listener binds to the configured HTTP host and is plaintext, matching the
+go-bsc endpoint. Keep it on a private validator/sentry network or protect it
+with a trusted proxy, network ACL, or mTLS termination.
+
 ### Programmatic Configuration
 ```rust
 use reth_bsc::node::mining_config::MiningConfig;
