@@ -1328,12 +1328,9 @@ mod tests {
 
         // Distinct signers so nothing is rejected as a duplicate.
         let over = MAX_CUR_VOTE_AMOUNT_PER_BLOCK + 8;
-        for i in 1..=over {
-            let mut raw = [0u8; 32];
-            raw[30] = (i >> 8) as u8;
-            raw[31] = (i & 0xff) as u8;
-            let signer = BlsVoteSigner::new_from_bytes(raw).expect("create bls signer");
-            put_vote_unchecked(signer.sign_vote(data).expect("sign vote"));
+        for _ in 1..=over {
+            // A fresh signer each time, so nothing is rejected as a duplicate.
+            put_vote_unchecked(random_test_signer().sign_vote(data).expect("sign vote"));
         }
 
         assert_eq!(
@@ -1440,9 +1437,7 @@ mod tests {
             "precondition: unit tests have no header provider",
         );
 
-        let mut raw = [0u8; 32];
-        raw[31] = 1;
-        let signer = BlsVoteSigner::new_from_bytes(raw).expect("create bls signer");
+        let signer = random_test_signer();
         let data = VoteData {
             source_number: 7_000,
             source_hash: B256::from([0xe1; 32]),
