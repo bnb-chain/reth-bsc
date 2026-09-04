@@ -521,7 +521,7 @@ fn maybe_notify_finality(target_hash: B256, votes_for_block: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consensus::parlia::bls_signer::BlsVoteSigner;
+    use crate::consensus::parlia::bls_signer::random_test_signer;
     use crate::consensus::parlia::vote::{VoteAddress, VoteData, VoteEnvelope, VoteSignature};
     use alloy_primitives::B256;
 
@@ -580,9 +580,7 @@ mod tests {
     fn put_vote_rejects_unauthenticated_votes() {
         let _ = drain();
 
-        let mut raw = [0u8; 32];
-        raw[31] = 1;
-        let signer = BlsVoteSigner::new_from_bytes(raw).expect("create bls signer");
+        let signer = random_test_signer();
 
         let data = VoteData {
             source_number: 10,
@@ -645,9 +643,7 @@ mod tests {
     fn repeated_envelopes_are_verified_at_most_once() {
         let _ = drain();
 
-        let mut raw = [0u8; 32];
-        raw[31] = 1;
-        let signer = BlsVoteSigner::new_from_bytes(raw).expect("create bls signer");
+        let signer = random_test_signer();
         let data = VoteData {
             source_number: 800,
             source_hash: B256::from([0x81; 32]),
@@ -736,9 +732,7 @@ mod tests {
             "precondition: no head provider is registered in unit tests",
         );
 
-        let mut raw = [0u8; 32];
-        raw[31] = 1;
-        let signer = BlsVoteSigner::new_from_bytes(raw).expect("create bls signer");
+        let signer = random_test_signer();
         let data = VoteData {
             source_number: 39_999_999,
             source_hash: B256::from([0xcd; 32]),
