@@ -419,17 +419,20 @@ where
                     // An accepted block is unambiguous progress.
                     progress.record_progress();
 
-                    if let Err(err) = forkchoice_engine.update_forkchoice(&header).await {
-                        tracing::warn!(
-                            target: "bsc::fork_recover",
-                            %block_hash,
-                            block_num,
-                            error = %err,
-                            "fork_choice_updated returned error mid-recovery"
-                        );
+                    match forkchoice_engine.update_forkchoice(&header).await {
+                        Ok(()) => {
+                            progress.record_progress();
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                target: "bsc::fork_recover",
+                                %block_hash,
+                                block_num,
+                                error = %err,
+                                "fork_choice_updated returned error mid-recovery"
+                            );
+                        }
                     }
-                    // The FCU alone can outlast the idle valve.
-                    progress.record_progress();
 
                     last_valid = Some(header);
                 }
@@ -493,6 +496,17 @@ where
         fcu_target_header.as_ref(),
         last_valid.as_ref(),
     )?;
+
+    if last_valid.as_ref().map(|h| h.hash_slow()) == Some(head_header.hash_slow()) {
+        tracing::debug!(
+            target: "bsc::fork_recover",
+            %fcu_target_hash,
+            fcu_target_num,
+            "Terminal FCU skipped; head already committed per-block during import"
+        );
+        return Ok(());
+    }
+
     if let Err(err) = forkchoice_engine.update_forkchoice(&head_header).await {
         // FCU failure is recoverable (engine-tree may retry on next import);
         // surface at warn level to match `service.rs` convention.
@@ -1659,14 +1673,11 @@ mod tests {
                 submissions.lock().unwrap().iter().map(|(n, _)| *n).collect();
             assert_eq!(imported, vec![101, 102, 103, 104, 105], "the whole extension imports");
 
-            // The tail repeats: on `single_pair` Phase 3 re-FCUs the block the
-            // last per-block FCU already targeted.
-            let mut expected: Vec<B256> = heads.iter().map(|(h, _)| *h).collect();
-            expected.push(head_hash);
+            let expected: Vec<B256> = heads.iter().map(|(h, _)| *h).collect();
             assert_eq!(
                 fcus.lock().unwrap().as_slice(),
                 expected.as_slice(),
-                "an FCU per imported block, then the terminal FCU at the target",
+                "an FCU per imported block, with the redundant terminal FCU skipped",
             );
         }
 
