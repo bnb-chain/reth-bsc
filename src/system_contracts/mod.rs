@@ -123,6 +123,62 @@ impl<Spec: EthChainSpec + crate::hardforks::BscHardforks> SystemContract<Spec> {
         (consensus_addresses, vote_address)
     }
 
+    /// Return the full cabinet-first validator set, including candidates.
+    pub(crate) fn get_all_validators(&self) -> (Address, Bytes) {
+        let function = self.validator_abi.function("getValidators").unwrap().first().unwrap();
+        (VALIDATOR_CONTRACT, Bytes::from(function.abi_encode_input(&[]).unwrap()))
+    }
+
+    /// Decode the validator addresses returned by `getValidators()` without panicking on
+    /// malformed returndata.
+    pub(crate) fn unpack_all_validators(
+        &self,
+        data: &[u8],
+    ) -> Result<Vec<Address>, String> {
+        let function = self.validator_abi.function("getValidators").unwrap().first().unwrap();
+        let output = function
+            .abi_decode_output(data)
+            .map_err(|err| format!("decode getValidators output: {err}"))?;
+        let validators = output
+            .first()
+            .and_then(DynSolValue::as_array)
+            .ok_or_else(|| "getValidators returned a non-address-array value".to_string())?;
+
+        validators
+            .iter()
+            .map(|value| {
+                value
+                    .as_address()
+                    .ok_or_else(|| "getValidators returned a non-address element".to_string())
+            })
+            .collect()
+    }
+
+    /// Return the validator contract and calldata for `numOfCabinets()`.
+    pub(crate) fn get_num_of_cabinets(&self) -> (Address, Bytes) {
+        let function = self.validator_abi.function("numOfCabinets").unwrap().first().unwrap();
+        (VALIDATOR_CONTRACT, Bytes::from(function.abi_encode_input(&[]).unwrap()))
+    }
+
+    /// Decode the single `uint256` returned by `numOfCabinets()` without panicking on malformed
+    /// returndata.
+    pub(crate) fn unpack_num_of_cabinets(&self, data: &[u8]) -> Result<U256, String> {
+        self.unpack_validator_uint("numOfCabinets", data)
+    }
+
+    fn unpack_validator_uint(&self, method: &str, data: &[u8]) -> Result<U256, String> {
+        let function = self.validator_abi.function(method).unwrap().first().unwrap();
+        let output = function
+            .abi_decode_output(data)
+            .map_err(|err| format!("decode {method} output: {err}"))?;
+
+        output
+            .first()
+            .and_then(DynSolValue::as_uint)
+            .map(|value| value.0)
+            .ok_or_else(|| format!("{method} returned a non-uint value"))
+    }
+
     /// Return system address and input which is used to query max elected validators.
     pub fn get_max_elected_validators(&self) -> (Address, Bytes) {
         let function =
@@ -1165,6 +1221,44 @@ mod tests {
 
     fn dummy_sig() -> Signature {
         Signature::new(U256::ZERO, U256::ZERO, false)
+    }
+
+    #[test]
+    fn bid_block_evidence_validator_set_outputs_round_trip() {
+        let contracts = SystemContract::new(crate::chainspec::BscChainSpec::from(bsc_mainnet()));
+        let validators = vec![
+            address!("1111111111111111111111111111111111111111"),
+            address!("2222222222222222222222222222222222222222"),
+        ];
+        let validator_values = validators.iter().copied().map(DynSolValue::from).collect();
+        let validators_output = contracts
+            .validator_abi
+            .function("getValidators")
+            .unwrap()
+            .first()
+            .unwrap()
+            .abi_encode_output(&[
+                DynSolValue::Array(validator_values),
+            ])
+            .unwrap();
+        assert_eq!(
+            contracts.unpack_all_validators(&validators_output).unwrap(),
+            validators
+        );
+
+        let cabinets = U256::from(21);
+        let cabinets_output = contracts
+            .validator_abi
+            .function("numOfCabinets")
+            .unwrap()
+            .first()
+            .unwrap()
+            .abi_encode_output(&[DynSolValue::from(cabinets)])
+            .unwrap();
+        assert_eq!(contracts.unpack_num_of_cabinets(&cabinets_output).unwrap(), cabinets);
+
+        assert!(contracts.unpack_all_validators(&[]).is_err());
+        assert!(contracts.unpack_num_of_cabinets(&[]).is_err());
     }
 
     #[test]

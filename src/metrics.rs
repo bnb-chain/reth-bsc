@@ -217,6 +217,16 @@ pub struct BscMevGrpcMetrics {
     pub payload_size_bytes: Histogram,
 }
 
+/// Metrics for BEP-675 cross-validator bad-BidBlock evidence.
+#[derive(Metrics, Clone)]
+#[metrics(scope = "bsc.mev.bid_block_evidence")]
+pub struct BscBidBlockEvidenceMetrics {
+    /// Evidence events dropped because the bounded queue was full.
+    pub dropped_total: Counter,
+    /// Builder revocations triggered after cross-validator evidence reached its threshold.
+    pub revokes_total: Counter,
+}
+
 /// Metrics for BSC miner/worker operations
 ///
 /// Tracks block production and finalization metrics.
@@ -370,6 +380,7 @@ mod tests {
         let _rewards_metrics = BscRewardsMetrics::default();
         let _vote_metrics = BscVoteMetrics::default();
         let _mev_metrics = BscMevMetrics::default();
+        let _bid_block_evidence_metrics = BscBidBlockEvidenceMetrics::default();
         let _miner_metrics = BscMinerMetrics::default();
         let _finality_metrics = BscFinalityMetrics::default();
         let _blockchain_metrics = BscBlockchainMetrics::default();

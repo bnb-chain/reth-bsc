@@ -5,17 +5,30 @@ use alloy_eips::eip4895::Withdrawal;
 use alloy_primitives::{Bytes, B256};
 use alloy_rpc_types_engine::PayloadError;
 use reth::{
-    api::{FullNodeComponents, NodeTypes},
+    api::{FullNodeComponents, NodeTypes, TreeConfig},
     builder::{
-        rpc::{BasicEngineValidatorBuilder, PayloadValidatorBuilder},
+        invalid_block_hook::InvalidBlockHookExt,
+        rpc::{
+            BasicEngineValidator, ChangesetCache, EngineValidator, EngineValidatorBuilder,
+            PayloadValidatorBuilder,
+        },
         AddOnsContext,
     },
     consensus::ConsensusError,
 };
-use reth_engine_primitives::{ExecutionPayload, PayloadValidator};
-use reth_payload_primitives::NewPayloadError;
-use reth_primitives_traits::{RecoveredBlock, SealedBlock};
-use reth_primitives_traits::Block;
+use reth_chain_state::ExecutedBlock;
+use reth_chainspec::EthChainSpec;
+use reth_engine_primitives::{ExecutionPayload, InvalidBlockHooks, PayloadValidator};
+use reth_engine_tree::tree::{
+    error::{InsertBlockErrorKind, InsertPayloadError},
+    payload_processor::multiproof::StateRootHandle,
+    payload_validator::{TreeCtx, ValidationOutcome},
+    CacheWaitDurations, EngineApiTreeState, SavedCache, WaitForCaches,
+};
+use reth_evm::{ConfigureEngineEvm, ConfigureEvm};
+use reth_payload_primitives::{InvalidPayloadAttributesError, NewPayloadError, PayloadTypes};
+use reth_primitives_traits::{Block, RecoveredBlock, SealedBlock};
+use reth_provider::HeaderProvider;
 use reth_trie_common::HashedPostState;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, OnceLock};
@@ -37,8 +50,172 @@ where
     }
 }
 
-/// BSC engine validator builder that wraps the payload validator
-pub type BscEngineValidatorBuilder = BasicEngineValidatorBuilder<BscPayloadValidatorBuilder>;
+/// BSC engine validator builder that combines reth's configured invalid-block diagnostics with
+/// the BEP-675 cross-validator bad-BidBlock evidence hook.
+#[derive(Debug, Default, Clone)]
+pub struct BscEngineValidatorBuilder;
+
+impl<Node, Types> EngineValidatorBuilder<Node> for BscEngineValidatorBuilder
+where
+    Types:
+        NodeTypes<ChainSpec = BscChainSpec, Payload = BscPayloadTypes, Primitives = BscPrimitives>,
+    Node: FullNodeComponents<Types = Types, Evm: ConfigureEngineEvm<BscExecutionData>>,
+{
+    type EngineValidator = BscEngineValidatorWithEvidence<Node::Provider, Node::Evm>;
+
+    async fn build_tree_validator(
+        self,
+        ctx: &AddOnsContext<'_, Node>,
+        tree_config: TreeConfig,
+        changeset_cache: ChangesetCache,
+    ) -> eyre::Result<Self::EngineValidator> {
+        let validator = BscPayloadValidatorBuilder.build(ctx).await?;
+        let data_dir = ctx.config.datadir.clone().resolve_datadir(ctx.config.chain.chain());
+        let configured_hook = ctx.create_invalid_block_hook(&data_dir).await?;
+        let evidence_reporter =
+            crate::node::miner::bid_block_evidence::BadBidBlockEvidenceReporter::spawn(
+                ctx.node.provider().clone(),
+                ctx.config.chain.clone(),
+                ctx.node.task_executor(),
+            );
+        // Enqueue evidence first; the configured witness hook may synchronously re-execute the
+        // invalid block and should not delay cross-validator propagation.
+        let invalid_block_hook =
+            InvalidBlockHooks(vec![Box::new(evidence_reporter.clone()), configured_hook]);
+
+        let inner = BasicEngineValidator::new(
+            ctx.node.provider().clone(),
+            Arc::new(ctx.node.consensus().clone()),
+            ctx.node.evm_config().clone(),
+            validator,
+            tree_config,
+            Box::new(invalid_block_hook),
+            changeset_cache,
+            ctx.node.task_executor().clone(),
+        );
+
+        Ok(BscEngineValidatorWithEvidence {
+            inner,
+            provider: ctx.node.provider().clone(),
+            evidence_reporter,
+        })
+    }
+}
+
+/// Adds evidence reporting for execution errors that occur before an execution output exists.
+///
+/// Reth's invalid-block hook covers state-root and post-execution failures. Transaction execution
+/// errors return before that hook can run, so this wrapper observes the final validation outcome.
+/// The inner validator checks the header and body; typed Parlia pre-execution errors are excluded
+/// because they do not establish that the claimed sealer authenticated the block.
+pub struct BscEngineValidatorWithEvidence<P, Evm: ConfigureEvm> {
+    inner: BasicEngineValidator<P, Evm, BscEngineValidator>,
+    provider: P,
+    evidence_reporter: crate::node::miner::bid_block_evidence::BadBidBlockEvidenceReporter,
+}
+
+impl<P, Evm> BscEngineValidatorWithEvidence<P, Evm>
+where
+    P: HeaderProvider<Header = alloy_consensus::Header>,
+    Evm: ConfigureEvm,
+{
+    fn report_execution_error(&self, outcome: &ValidationOutcome<BscPrimitives>) {
+        let Err(InsertPayloadError::Block(error)) = outcome else { return };
+        let InsertBlockErrorKind::Execution(execution_error) = error.kind() else { return };
+        if !crate::node::evm::error::is_execution_evidence(execution_error) {
+            return;
+        }
+
+        let block = error.block();
+        match self.provider.sealed_header_by_hash(block.parent_hash()) {
+            Ok(Some(parent)) => self.evidence_reporter.report(&parent, block),
+            Ok(None) => tracing::debug!(
+                target: "bsc::bid_block_evidence",
+                parent_hash = %block.parent_hash(),
+                block_hash = %block.hash(),
+                "Parent header unavailable for bad BidBlock evidence"
+            ),
+            Err(err) => tracing::warn!(
+                target: "bsc::bid_block_evidence",
+                parent_hash = %block.parent_hash(),
+                block_hash = %block.hash(),
+                %err,
+                "Failed to load parent header for bad BidBlock evidence"
+            ),
+        }
+    }
+}
+
+impl<P, Evm> EngineValidator<BscPayloadTypes, BscPrimitives>
+    for BscEngineValidatorWithEvidence<P, Evm>
+where
+    BasicEngineValidator<P, Evm, BscEngineValidator>:
+        EngineValidator<BscPayloadTypes, BscPrimitives>,
+    P: HeaderProvider<Header = alloy_consensus::Header> + Send + Sync + 'static,
+    Evm: ConfigureEvm + Send + Sync + 'static,
+{
+    fn validate_payload_attributes_against_header(
+        &self,
+        attr: &<BscPayloadTypes as PayloadTypes>::PayloadAttributes,
+        header: &alloy_consensus::Header,
+    ) -> Result<(), InvalidPayloadAttributesError> {
+        self.inner.validate_payload_attributes_against_header(attr, header)
+    }
+
+    fn convert_payload_to_block(
+        &self,
+        payload: BscExecutionData,
+    ) -> Result<SealedBlock<BscBlock>, NewPayloadError> {
+        self.inner.convert_payload_to_block(payload)
+    }
+
+    fn validate_payload(
+        &mut self,
+        payload: BscExecutionData,
+        ctx: TreeCtx<'_, BscPrimitives>,
+    ) -> ValidationOutcome<BscPrimitives> {
+        let outcome = self.inner.validate_payload(payload, ctx);
+        self.report_execution_error(&outcome);
+        outcome
+    }
+
+    fn validate_block(
+        &mut self,
+        block: SealedBlock<BscBlock>,
+        ctx: TreeCtx<'_, BscPrimitives>,
+    ) -> ValidationOutcome<BscPrimitives> {
+        let outcome = self.inner.validate_block(block, ctx);
+        self.report_execution_error(&outcome);
+        outcome
+    }
+
+    fn on_inserted_executed_block(&self, block: ExecutedBlock<BscPrimitives>) {
+        self.inner.on_inserted_executed_block(block)
+    }
+
+    fn cache_for(&self, block_hash: B256) -> Option<SavedCache> {
+        self.inner.cache_for(block_hash)
+    }
+
+    fn sparse_trie_handle_for(
+        &self,
+        parent_hash: B256,
+        parent_state_root: B256,
+        state: &EngineApiTreeState<BscPrimitives>,
+    ) -> Option<StateRootHandle> {
+        self.inner.sparse_trie_handle_for(parent_hash, parent_state_root, state)
+    }
+}
+
+impl<P, Evm> WaitForCaches for BscEngineValidatorWithEvidence<P, Evm>
+where
+    BasicEngineValidator<P, Evm, BscEngineValidator>: WaitForCaches,
+    Evm: ConfigureEvm,
+{
+    fn wait_for_caches(&self) -> CacheWaitDurations {
+        self.inner.wait_for_caches()
+    }
+}
 
 /// Validator for Optimism engine API.
 #[derive(Debug, Clone)]
