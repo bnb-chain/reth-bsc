@@ -461,7 +461,7 @@ impl Stream for BscProtocolConnection {
 mod tests {
     use super::*;
     use crate::consensus::parlia::{
-        bls_signer::BlsVoteSigner,
+        bls_signer::random_test_signer,
         vote::{VoteData, VoteEnvelope},
         votes,
     };
@@ -494,9 +494,7 @@ mod tests {
     /// would no longer prove the frame was dispatched. `target_number` is kept
     /// high so vote-pool pruning cannot evict it.
     fn vote(target_number: u64, target_hash: B256) -> VoteEnvelope {
-        let mut raw = [0u8; 32];
-        raw[31] = 1;
-        let signer = BlsVoteSigner::new_from_bytes(raw).expect("create bls signer");
+        let signer = random_test_signer();
         signer
             .sign_vote(VoteData {
                 source_number: target_number - 1,

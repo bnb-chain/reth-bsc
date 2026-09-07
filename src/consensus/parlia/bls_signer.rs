@@ -96,6 +96,29 @@ pub fn verify_vote_envelope(envelope: &VoteEnvelope) -> Result<(), BlsSignerErro
     }
 }
 
+/// A freshly generated BLS signer for tests.
+///
+/// Generated rather than hard-coded so that no key-shaped literal appears in the
+/// source at all. The top nibble is cleared so the scalar is provably below the
+/// BLS12-381 group order, which exceeds 2^252: unmasked random bytes exceed the
+/// order roughly four times in five and `SecretKey::from_bytes` would reject
+/// them, which would make callers flaky rather than clean.
+///
+/// The key's value is irrelevant to every caller — they need *a* valid keypair,
+/// and distinct calls yield distinct keys, which is what tests needing several
+/// signers rely on.
+#[cfg(test)]
+pub fn random_test_signer() -> BlsVoteSigner {
+    loop {
+        let mut raw: [u8; 32] = alloy_primitives::B256::random().into();
+        raw[0] &= 0x0f;
+        if raw != [0u8; 32] {
+            return BlsVoteSigner::new_from_bytes(raw)
+                .expect("a masked scalar is always a valid BLS secret key");
+        }
+    }
+}
+
 static GLOBAL_BLS_SIGNER: OnceCell<Arc<BlsVoteSigner>> = OnceCell::new();
 
 pub fn init_global_bls_signer_from_bytes(bytes: [u8; 32]) -> Result<(), BlsSignerError> {
@@ -337,9 +360,7 @@ mod tests {
     #[test]
     fn bls_sign_and_verify_single_key() {
         // use a small valid BLS scalar: 1 (big-endian)
-        let mut raw = [0u8; 32];
-        raw[31] = 1;
-        let signer = BlsVoteSigner::new_from_bytes(raw).expect("create bls signer");
+        let signer = random_test_signer();
 
         // Compose vote data
         let data = VoteData {
