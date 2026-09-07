@@ -399,7 +399,6 @@ where
     // without this every attempt re-imports the same prefix and the canonical
     // tip never moves (bnb-chain/reth-bsc#456).
     let mut last_valid: Option<alloy_consensus::Header> = None;
-    let mut last_fcu_ok = false;
     let mut halted_at: Option<u64> = None;
     for block in to_import {
         let header = block.header.clone();
@@ -422,11 +421,9 @@ where
 
                     match forkchoice_engine.update_forkchoice(&header).await {
                         Ok(()) => {
-                            last_fcu_ok = true;
                             progress.record_progress();
                         }
                         Err(err) => {
-                            last_fcu_ok = false;
                             tracing::warn!(
                                 target: "bsc::fork_recover",
                                 %block_hash,
@@ -499,16 +496,6 @@ where
         fcu_target_header.as_ref(),
         last_valid.as_ref(),
     )?;
-
-    if last_fcu_ok && last_valid.as_ref().map(|h| h.hash_slow()) == Some(head_header.hash_slow()) {
-        tracing::debug!(
-            target: "bsc::fork_recover",
-            %fcu_target_hash,
-            fcu_target_num,
-            "Terminal FCU skipped; head already committed per-block during import"
-        );
-        return Ok(());
-    }
 
     if let Err(err) = forkchoice_engine.update_forkchoice(&head_header).await {
         // FCU failure is recoverable (engine-tree may retry on next import);
@@ -1455,15 +1442,6 @@ mod tests {
         fn recording_engine(
             syncing_at: Vec<u64>,
         ) -> (ConsensusEngineHandle<BscPayloadTypes>, Submissions, Fcus) {
-            recording_engine_with(syncing_at, Vec::new())
-        }
-
-        /// Like [`recording_engine`], but returns `Invalid` for any FCU whose
-        /// head is in `fcu_invalid_at`.
-        fn recording_engine_with(
-            syncing_at: Vec<u64>,
-            fcu_invalid_at: Vec<B256>,
-        ) -> (ConsensusEngineHandle<BscPayloadTypes>, Submissions, Fcus) {
             let (to_engine, mut from_engine) =
                 tokio::sync::mpsc::unbounded_channel::<BeaconEngineMessage<BscPayloadTypes>>();
             let handle = ConsensusEngineHandle::new(to_engine);
@@ -1486,15 +1464,9 @@ mod tests {
                         }
                         BeaconEngineMessage::ForkchoiceUpdated { state, tx, .. } => {
                             fcu_recorder.lock().unwrap().push(state.head_block_hash);
-                            let status = if fcu_invalid_at.contains(&state.head_block_hash) {
-                                PayloadStatusEnum::Invalid {
-                                    validation_error: "test fcu rejection".into(),
-                                }
-                            } else {
-                                PayloadStatusEnum::Valid
-                            };
                             let _ = tx.send(Ok(OnForkChoiceUpdated::valid(PayloadStatus::new(
-                                status, None,
+                                PayloadStatusEnum::Valid,
+                                None,
                             ))));
                         }
                         BeaconEngineMessage::QueryTd { number, tx, .. } => {
@@ -1691,39 +1663,14 @@ mod tests {
                 submissions.lock().unwrap().iter().map(|(n, _)| *n).collect();
             assert_eq!(imported, vec![101, 102, 103, 104, 105], "the whole extension imports");
 
-            let expected: Vec<B256> = heads.iter().map(|(h, _)| *h).collect();
-            assert_eq!(
-                fcus.lock().unwrap().as_slice(),
-                expected.as_slice(),
-                "an FCU per imported block, with the redundant terminal FCU skipped",
-            );
-        }
-
-        #[tokio::test]
-        async fn failed_per_block_fcu_still_gets_the_terminal_fcu() {
-            let (provider, fetcher, heads) = scenario(100, 5);
-            let (head_hash, head_num) = heads[4];
-            let (engine, _submissions, fcus) = recording_engine_with(vec![], vec![head_hash]);
-
-            let fce = BscForkChoiceEngine::new(provider.clone(), engine.clone(), chain_spec());
-            recover_ancestors(
-                fake_peer(),
-                RecoverTarget::single_pair(head_hash, head_num),
-                provider.clone(),
-                engine.clone(),
-                fce,
-                fetcher.as_ref(),
-                &(),
-            )
-            .await
-            .unwrap();
-
             let mut expected: Vec<B256> = heads.iter().map(|(h, _)| *h).collect();
+            // Phase 3 always commits the resolved head; for a single-pair target
+            // that repeats the tail's FCU, which is an idempotent no-op.
             expected.push(head_hash);
             assert_eq!(
                 fcus.lock().unwrap().as_slice(),
                 expected.as_slice(),
-                "the rejected head is retried by the terminal FCU, not skipped",
+                "an FCU per imported block, plus the terminal commit",
             );
         }
 
