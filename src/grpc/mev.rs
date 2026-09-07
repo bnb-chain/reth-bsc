@@ -568,7 +568,7 @@ mod tests {
         let service = MevGrpcApi::new(submitter.clone(), 1);
 
         for payload in [Vec::new(), vec![0xff], {
-            let mut encoded = alloy_rlp::encode(&request_block());
+            let mut encoded = alloy_rlp::encode(request_block());
             encoded.push(0x80);
             encoded
         }] {
@@ -680,7 +680,7 @@ mod tests {
 
         let error = client
             .send_bid_block(BidBlockRequest {
-                bid_block_rlp: alloy_rlp::encode(&request_block()),
+                bid_block_rlp: alloy_rlp::encode(request_block()),
                 ..Default::default()
             })
             .await
@@ -707,7 +707,7 @@ mod tests {
         let channel =
             tonic::transport::Endpoint::from_shared(endpoint).unwrap().connect().await.unwrap();
         let request = BidBlockRequest {
-            bid_block_rlp: alloy_rlp::encode(&request_block()),
+            bid_block_rlp: alloy_rlp::encode(request_block()),
             ..Default::default()
         };
         let mut client =
