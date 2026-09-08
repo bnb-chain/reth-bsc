@@ -342,9 +342,11 @@ impl BscNetworkBuilder {
                 .take()
                 .expect("node should only be launched once")
                 .await
-                .unwrap();
+                .expect("engine handle sender dropped before the beacon engine was built");
 
-            ImportService::new(
+            // This task is critical: returning quietly would leave the node without block
+            // import, so surface the error and let the node go down with it.
+            if let Err(err) = ImportService::new(
                 provider,
                 chain_spec,
                 handle,
@@ -355,7 +357,10 @@ impl BscNetworkBuilder {
                 to_network,
             )
             .await
-            .unwrap();
+            {
+                tracing::error!(target: "bsc::network", ?err, "Block import service exited");
+                panic!("block import service exited: {err:?}");
+            }
         });
 
         // TODO: update network with the latest canonical head, but has a fork id issue, can fix it later.
