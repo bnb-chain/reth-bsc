@@ -1,24 +1,23 @@
 //! BEP-703 payment lane.
 //!
-//! A block reserves `paymentLaneQuota` gas that only payment transactions may consume.
-//! The reservation is a gas accounting rule, not a region of the block: ordering and pricing
-//! are untouched, and **nothing reaches the header** — the quota is a pure function of the
-//! ratio in the parent's post-state and this block's gas limit, so every node derives it
-//! independently.
+//! A block reserves `paymentLaneQuota` gas that only payment transactions may consume. It is a
+//! gas accounting rule, not a region of the block: ordering and pricing are untouched, and
+//! nothing reaches the header — the quota is a pure function of the ratio in the parent's
+//! post-state and this block's gas limit, so every node derives it independently.
 //!
-//! The rule layer: arithmetic, classification and the accounting inequality. No provider, no
-//! state, no EVM — the reading and caching live in `src/node/evm/pre_execution.rs`.
+//! Pure rules only; reading `0x2007` and caching the result live in
+//! `src/node/evm/pre_execution.rs`.
 
 pub mod meta;
 pub mod rules;
 
 pub use crate::system_contracts::PAYMENT_LANE_CONTRACT;
 
-/// Denominator of the ratio read from the PaymentLane contract: a stored `N` means
+/// Denominator of the ratio stored in the PaymentLane contract: a stored `N` reserves
 /// `N / RATIO_DENOM` of the gas limit. BEP-703 §3.6.1.
 pub(crate) const RATIO_DENOM: u64 = 10_000;
 
-/// BEP-703 §3.6.1's upper bound on the ratio — the lane may never exceed 10% of the gas limit.
+/// BEP-703 §3.6.1's upper bound on the ratio — at most 10% of the gas limit.
 ///
 /// A protocol constant, not a governable one: a ceiling governance can raise is not a ceiling.
 pub(crate) const MAX_LANE_RATIO: u64 = 1_000;
@@ -30,15 +29,15 @@ pub(crate) const PAGE_SIZE: u64 = 128;
 
 /// Contract-enforced ceiling on the payment contract list (BEP-703 §3.6.1).
 ///
-/// The contract enforces it on governance writes; no node checks the count against it, so it is
-/// not a block validity condition. It is checked here only to bound the walk below.
+/// The contract enforces it on governance writes, so no node treats the count as a block
+/// validity condition; it is checked here only to bound the walk.
 pub(crate) const MAX_LISTED_CONTRACTS: u64 = 100_000;
 
 /// Gas budget for one read-only call into the PaymentLane contract.
 ///
-/// Fixed, never the block's gas limit: a page walk that runs out of gas is a consensus
-/// verdict, so both clients must run out at the same point.
-pub const GETTER_GAS_LIMIT: u64 = 50_000_000;
+/// Fixed, never the block's gas limit: a page walk that runs out of gas is a consensus verdict,
+/// so both clients must run out at the same point.
+pub(crate) const GETTER_GAS_LIMIT: u64 = 50_000_000;
 
 /// Which lane a transaction's gas is booked against.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

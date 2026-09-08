@@ -628,16 +628,16 @@ fn execution_gate_round_trip() {
     assert_eq!(computed_root, reference_root);
 }
 
-/// A Jenner test chain with 30M gas, activation at timestamp 6, Prague enabled, and `0x2007`
+/// A Jenner test chain: 30M gas, activation at timestamp 6, Prague enabled, and `0x2007`
 /// installed by the activation block with `_paymentLaneRatio = 1000` (10%, the maximum).
 ///
-/// 30M rather than mainnet's 55M so the lane's admission boundary lands below EIP-7825's
-/// 2^24 per-transaction gas cap — at 55M the general lane still tops out above the cap and no
-/// single transaction can probe it. See the probe in the round-trip test below.
+/// 30M rather than mainnet's 55M so the lane's admission boundary lands below EIP-7825's 2^24
+/// per-transaction gas cap — at 55M the general lane tops out above the cap and no single
+/// transaction can probe it. See the probe in the round-trip test below.
 ///
-/// The ratio is written into genesis storage rather than left unset so the test exercises a
-/// governed value; slot 0 is `PaymentLane._paymentLaneRatio`. An unset slot would read as
-/// BEP-703 §3.6.1's 500 through the getter's own fallback.
+/// The ratio is written into genesis storage (slot 0 is `PaymentLane._paymentLaneRatio`) so the
+/// test exercises a governed value; an unset slot would read as §3.6.1's 500 default through the
+/// getter's own fallback.
 fn jenner_lane_chain_spec() -> Arc<BscChainSpec> {
     use reth_bsc::hardforks::bsc::BscHardfork;
 
@@ -694,8 +694,8 @@ fn jenner_lane_chain_spec() -> Arc<BscChainSpec> {
 /// the same lane independently — BEP-703 puts nothing in the header, so agreement rests entirely
 /// on both sides reading `0x2007` at the same point and running the same arithmetic.
 ///
-/// Also pins that the header is untouched (the empty ommers root survives the fork) and that the
-/// producer's admission gate really is live on a post-fork block.
+/// Also pins that the header is untouched and that the producer's admission gate is live on a
+/// post-fork block.
 #[test]
 fn jenner_payment_lane_chain_round_trips() {
     use alloy_consensus::{TxLegacy, EMPTY_OMMER_ROOT_HASH};
@@ -750,8 +750,7 @@ fn jenner_payment_lane_chain_round_trips() {
         .expect("sign payment tx")
     };
 
-    // A general transaction with a caller-chosen gas limit: zero value, so it can never be
-    // classified as a bare transfer however empty the destination is.
+    // A general transaction: zero value, so no destination can make it a bare transfer.
     let general_tx = |nonce: u64, gas_limit: u64| {
         sign_system_transaction(
             TxLegacy {
@@ -821,17 +820,16 @@ fn jenner_payment_lane_chain_round_trips() {
                     )
                     .unwrap_or_else(|e| panic!("execute payment in block {number}: {e:?}"));
             }
-            // The producer-side admission gate, probed at the one gas limit that separates
-            // the two lanes. BEP-703 §3.1's asymmetry is the whole rule: general traffic may
-            // never take the idle reservation, payment traffic may take the whole block.
+            // The producer-side admission gate, probed at the one gas limit that separates the
+            // two lanes — BEP-703 §3.1's asymmetry is the whole rule: general traffic may never
+            // take the idle reservation, payment traffic may take the whole block.
             //
-            // Sized so the probe cannot pass for an unrelated reason. Here `shared` is
-            // 30M − 20M reserved for Parlia's system txs − 21k already burned = 9,979,000,
-            // and the idle lane is 3M − 21k = 2,979,000, so general tops out at exactly 7M.
-            // A declared 8M sits above that, below `shared`, and below EIP-7825's 2^24 cap:
-            // it is refused only because of the reservation, and the identical declaration on
-            // the payment side must still be admitted. Comparing the two lanes at the SAME
-            // gas limit is what makes this independent of the system-tx reserve.
+            // `shared` here is 30M − 20M reserved for Parlia's system txs − 21k already burned
+            // = 9,979,000, and the idle lane is 3M − 21k = 2,979,000, so general tops out at
+            // exactly 7M. A declared 8M sits above that, below `shared`, and below EIP-7825's
+            // 2^24 cap: it is refused only because of the reservation, while the identical
+            // declaration on the payment side must still be admitted. Comparing the two lanes
+            // at the SAME gas limit is what keeps the probe independent of that reserve.
             if number > 2 {
                 const BAND: u64 = 8_000_000;
                 let nonce = start_nonce + payments as u64;
@@ -841,8 +839,8 @@ fn jenner_payment_lane_chain_round_trips() {
                     )
                     .expect_err("a general tx that would eat the idle lane must be refused");
                 // The exact sentinel, not just any InvalidTx: EIP-7825's per-transaction cap
-                // also surfaces as InvalidTx, and a probe that accepted either would pass
-                // without the lane doing anything.
+                // surfaces as InvalidTx too, so a probe that accepted either would pass with
+                // the lane doing nothing.
                 assert!(
                     format!("{refused:?}").contains("CallerGasLimitMoreThanBlock"),
                     "expected the lane's own drop, got {refused:?}"
@@ -875,15 +873,14 @@ fn jenner_payment_lane_chain_round_trips() {
         assert_eq!(header.number, number);
         assert!(block.body().inner.ommers.is_empty(), "block {number} must carry no ommers");
 
-        // BEP-703 changes no header field, in layout or in meaning. If the lane ever starts
-        // stamping something here again, this is what catches it.
+        // BEP-703 changes no header field, in layout or in meaning.
         assert_eq!(
             header.ommers_hash, EMPTY_OMMER_ROOT_HASH,
             "block {number}: the payment lane must leave ommers_hash alone"
         );
-        // In this fixture Parlia system transactions consume zero gas. Post-fork blocks also
-        // carry the payment transaction the admission probe above got through; it declares 30M
-        // but burns only the 21k intrinsic cost of a bare transfer.
+        // Parlia system transactions consume zero gas in this fixture. Post-fork blocks also
+        // carry the payment transaction the probe above got through: it declares 8M but burns
+        // only the 21k intrinsic cost of a bare transfer.
         let probe = if number > 2 { 21_000 } else { 0 };
         let expected_gas_used = payments as u64 * 21_000 + probe;
         assert_eq!(header.gas_used, expected_gas_used, "block {number} gas_used");

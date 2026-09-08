@@ -1,21 +1,20 @@
 //! Decoding the governable lane ratio and the payment contract list.
 //!
-//! Two getters, both `view`: the single ratio of BEP-703 §3.6.1, and the payment contract list
-//! walked one page at a time. Every value the lane rules consume comes from here — §3.6.1's
-//! default for a ratio governance never wrote lives in the contract's own getter, not in this
-//! client, so there is one source of truth.
+//! Two `view` getters: the ratio of BEP-703 §3.6.1, and the payment contract list walked one
+//! page at a time. §3.6.1's default for a ratio governance never wrote lives in the contract's
+//! own getter, not in this client, so there is one source of truth.
 //!
 //! This module decodes and validates; it does not call. The caller supplies each page's raw
 //! return data, which keeps every reject condition below testable without an EVM.
 
-use super::{rules::check_ratio, LaneError, MAX_LISTED_CONTRACTS, PAGE_SIZE};
+use super::{LaneError, MAX_LANE_RATIO, MAX_LISTED_CONTRACTS, PAGE_SIZE};
 use alloy_primitives::{map::HashSet, Address, Bytes, U256};
 use alloy_sol_types::{sol, SolCall};
 use std::sync::Arc;
 
 sol! {
-    /// BEP-703 §3.6.4's consensus getter for the reservation. Returns a `uint256`, and the
-    /// guard is applied at that full width — see [`check_ratio`].
+    /// BEP-703 §3.6.4's consensus getter for the reservation. Returns a `uint256`, and
+    /// [`decode_ratio`] guards it at that full width.
     #[derive(Debug)]
     function getPaymentLaneRatio() external view returns (uint256);
 
@@ -32,7 +31,7 @@ fn corrupt(msg: String) -> LaneError {
     LaneError::CorruptConfig(msg)
 }
 
-/// Everything the lane rules need from `0x2007`, read as of one block's parent post-state.
+/// Everything the lane rules need from `0x2007`, as of one block's parent post-state.
 #[derive(Clone, Debug)]
 pub struct LaneMeta {
     /// The governable reservation, as a fraction of the gas limit against `RATIO_DENOM`.
@@ -66,21 +65,24 @@ pub fn contracts_calldata(offset: u64) -> Bytes {
 
 /// Decodes the ratio getter's return data and applies BEP-703 §3.6.1's guard.
 ///
-/// The guard runs on the returned `uint256`, never on a value narrowed to 64 bits first: a
-/// truncated value can land inside the guard when the value returned did not.
+/// The guard runs on the returned `uint256`, never on a value narrowed to 64 bits first:
+/// `2^64 + 500` truncates to a legal `500` when the value returned was not.
 pub fn decode_ratio(ret: &[u8]) -> Result<u64, LaneError> {
     let value = getPaymentLaneRatioCall::abi_decode_returns(ret)
         .map_err(|e| corrupt(format!("getPaymentLaneRatio decode: {e}")))?;
-    check_ratio(value)
+    match u64::try_from(value) {
+        Ok(ratio) if ratio > 0 && ratio <= MAX_LANE_RATIO => Ok(ratio),
+        _ => Err(corrupt(format!(
+            "payment lane ratio {value} outside 0 < ratio <= {MAX_LANE_RATIO}"
+        ))),
+    }
 }
 
 /// Folds the paged `getPaymentContracts` walk into one set, rejecting every inconsistency.
 ///
-/// The walk is driven by the page lengths the contract returns, and [`Self::accept`] only ever
-/// reports an offset strictly greater than the one it was given, so it terminates.
-///
-/// Single-shot: [`Self::accept`] inserts as it goes, so an error leaves the set half-filled.
-/// Drop the walk and start over rather than retrying a page.
+/// [`Self::accept`] only ever reports an offset strictly greater than the one it was given, so
+/// the walk terminates. It also inserts as it goes, so an error leaves the set half-filled:
+/// drop the walk and start over rather than retrying a page.
 #[derive(Debug, Default)]
 pub struct PageWalk {
     /// `totalLength` as reported by the first page; every later page must agree.
@@ -95,8 +97,9 @@ impl PageWalk {
     pub fn accept(&mut self, offset: u64, ret: &[u8]) -> Result<Option<u64>, LaneError> {
         let r = getPaymentContractsCall::abi_decode_returns(ret)
             .map_err(|e| corrupt(format!("getPaymentContracts decode: {e}")))?;
-        let total = u64::try_from(r.totalLength)
-            .map_err(|_| corrupt(format!("payment contract count exceeds u64: {}", r.totalLength)))?;
+        let total = u64::try_from(r.totalLength).map_err(|_| {
+            corrupt(format!("payment contract count exceeds u64: {}", r.totalLength))
+        })?;
 
         match self.total {
             // The ceiling is checked before anything else is trusted.
@@ -121,7 +124,9 @@ impl PageWalk {
         let page = &r.paymentContracts;
         let n = page.len() as u64;
         if n == 0 {
-            return Err(corrupt(format!("empty payment contract page at offset {offset} of {total}")));
+            return Err(corrupt(format!(
+                "empty payment contract page at offset {offset} of {total}"
+            )));
         }
         if n > PAGE_SIZE {
             return Err(corrupt(format!(
@@ -235,6 +240,8 @@ mod tests {
         // 2^64 + 500 narrows to a legal 500; the guard runs before any narrowing.
         let wraps = ((U256::from(1u64) << 64u32) + U256::from(500u64)).to_be_bytes::<32>();
         assert!(matches!(decode_ratio(&wraps), Err(LaneError::CorruptConfig(_))));
+        let max = U256::MAX.to_be_bytes::<32>();
+        assert!(matches!(decode_ratio(&max), Err(LaneError::CorruptConfig(_))));
 
         // Short or absent return data is the decoder's own error, and stays an error.
         assert!(matches!(decode_ratio(&[]), Err(LaneError::CorruptConfig(_))));
@@ -260,10 +267,7 @@ mod tests {
         let mut ret = word(0x40);
         ret.extend_from_slice(&(U256::from(1u64) << 64u32).to_be_bytes::<32>());
         ret.extend_from_slice(&word(0));
-        assert!(matches!(
-            PageWalk::default().accept(0, &ret),
-            Err(LaneError::CorruptConfig(_))
-        ));
+        assert!(matches!(PageWalk::default().accept(0, &ret), Err(LaneError::CorruptConfig(_))));
     }
 
     #[test]
@@ -313,7 +317,7 @@ mod tests {
         // total changes mid-walk
         let mut w = PageWalk::default();
         assert_eq!(w.accept(0, &page(200, &a[..PAGE_SIZE as usize])).unwrap(), Some(PAGE_SIZE));
-        because(w.accept(PAGE_SIZE, &page(201, &a[PAGE_SIZE as usize..])), "count changed mid-walk");
+        because(w.accept(PAGE_SIZE, &page(201, &a[PAGE_SIZE as usize..])), "count changed");
 
         // a page that is empty while entries remain
         let mut w = PageWalk::default();

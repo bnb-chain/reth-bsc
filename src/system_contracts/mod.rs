@@ -1132,7 +1132,6 @@ where
         }
     }
 
-    // Jenner only installs PaymentLane code; no initializer is needed.
     if spec.is_jenner_transition_at_timestamp(block_number, block_time, parent_block_time) {
         if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Jenner.name()) {
             for (address, v) in &contracts {
@@ -1284,19 +1283,16 @@ mod tests {
         assert!(!before.contains_key(&STAKE_HUB_CONTRACT));
     }
 
+    /// The exact bytecode go-bsc embeds, from the commit its `jennerUpgrade` cites:
+    /// bsc-genesis-contract@45912f550f2027c4af141f94ccb9733177d5603d, solc 0.8.17. A one-byte
+    /// difference here is a different state root on the activation block.
     #[test]
     fn jenner_payment_lane_code_matches_genesis_contract() {
-        // Guard the hardcoded address directly.
-        assert_eq!(PAYMENT_LANE_CONTRACT, address!("0x0000000000000000000000000000000000002007"));
-
         use sha2::{Digest, Sha256};
-
-        // The exact bytecode go-bsc embeds, from the commit its `jennerUpgrade` cites:
-        // bsc-genesis-contract@45912f550f2027c4af141f94ccb9733177d5603d, solc 0.8.17. A
-        // one-byte difference here is a different state root on the activation block.
         const WANT_SHA256: &str =
             "8fd1686e0e53d7d6840d05ac4a3a1da1d322c3a742012428eaa63b6931add259";
 
+        assert_eq!(PAYMENT_LANE_CONTRACT, address!("0x0000000000000000000000000000000000002007"));
         for spec in [bsc_mainnet(), bsc_testnet(), bsc_qanet()] {
             let res = get_system_contract_codes(&spec, BscHardfork::Jenner.name()).unwrap();
             assert_eq!(res.len(), 1, "Jenner installs only PaymentLane");

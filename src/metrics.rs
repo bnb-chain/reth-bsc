@@ -332,9 +332,8 @@ pub struct BscParliaGethMetrics {
     pub doublesign: Counter,
 }
 
-/// Metrics for the BEP-703 payment lane.
-///
-/// Field docs keep the go-bsc metric names for easier cross-client comparison.
+/// Metrics for the BEP-703 payment lane. Field docs give the go-bsc name of each metric, so the
+/// two clients can be compared directly.
 #[derive(Metrics, Clone)]
 #[metrics(scope = "bsc.payment_lane")]
 pub struct BscPaymentLaneMetrics {
@@ -360,9 +359,9 @@ pub struct BscPaymentLaneMetrics {
     pub produce_declined: Counter,
 }
 
-/// Process-wide payment lane metrics shared by execution, validation, and mining.
-pub static LANE_METRICS: once_cell::sync::Lazy<BscPaymentLaneMetrics> =
-    once_cell::sync::Lazy::new(BscPaymentLaneMetrics::default);
+/// Process-wide payment lane metrics, shared by import, production and the admission gate.
+pub static LANE_METRICS: std::sync::LazyLock<BscPaymentLaneMetrics> =
+    std::sync::LazyLock::new(BscPaymentLaneMetrics::default);
 
 #[cfg(test)]
 mod tests {

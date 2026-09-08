@@ -196,35 +196,27 @@ pub enum BscBlockExecutionError {
     GlobalSignerNotInitializedForMiningMode,
 }
 
-/// Routes payment lane failures to the local-fault or block-verdict side.
-pub fn lane_reject(err: LaneError) -> BscBlockExecutionError {
-    use crate::metrics::LANE_METRICS as METRICS;
-
-    let local_fault = matches!(err, LaneError::StateUnavailable(_));
-    if local_fault {
-        METRICS.state_unavailable.increment(1);
-    } else {
-        METRICS.rejected.increment(1);
-    }
-    let category = if local_fault { "stateUnavailable" } else { "verdict" };
+/// Routes a payment lane failure to the local-fault side or the block-verdict side, counting
+/// and logging it on the way.
+///
+/// The only conversion for [`LaneError`]: deliberately not a `From` impl, so no call site can
+/// convert silently and skip the split.
+pub fn lane_reject(err: LaneError) -> BlockExecutionError {
+    let metrics = &crate::metrics::LANE_METRICS;
+    let (counter, category) = match err {
+        LaneError::StateUnavailable(_) => (&metrics.state_unavailable, "stateUnavailable"),
+        _ => (&metrics.rejected, "verdict"),
+    };
+    counter.increment(1);
     tracing::error!(target: "bsc::payment_lane", category, error = %err, "payment lane check failed");
-    BscBlockExecutionError::from(err)
-}
 
-impl From<LaneError> for BscBlockExecutionError {
-    fn from(err: LaneError) -> Self {
-        match err {
-            LaneError::StateUnavailable(reason) => Self::PaymentLaneStateUnavailable(reason),
-            verdict => BscBlockValidationError::PaymentLane(verdict.to_string()).into(),
+    match err {
+        LaneError::StateUnavailable(reason) => {
+            BscBlockExecutionError::PaymentLaneStateUnavailable(reason)
         }
+        verdict => BscBlockValidationError::PaymentLane(verdict.to_string()).into(),
     }
-}
-
-/// Lets `?` lift `LaneError` into `BlockExecutionError` directly.
-impl From<LaneError> for BlockExecutionError {
-    fn from(err: LaneError) -> Self {
-        BscBlockExecutionError::from(err).into()
-    }
+    .into()
 }
 
 impl From<BscBlockExecutionError> for BlockExecutionError {
@@ -277,15 +269,14 @@ impl From<BscBlockExecutionError> for BlockExecutionError {
         }
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consensus::payment_lane::LaneError;
 
     #[test]
     fn payment_lane_errors_split_local_faults_from_verdicts() {
-        let local: BlockExecutionError =
-            LaneError::StateUnavailable("missing trie node".into()).into();
+        let local = lane_reject(LaneError::StateUnavailable("missing trie node".into()));
         assert!(
             matches!(local, BlockExecutionError::Internal(_)),
             "a failed state read must not be a validation error: {local:?}"
@@ -296,8 +287,7 @@ mod tests {
             LaneError::Violated { gas_limit: 1, gas_used: 2, quota: 3, payment_gas_used: 4 },
         ] {
             let message = verdict.to_string();
-            let mapped: BlockExecutionError = verdict.into();
-            match mapped {
+            match lane_reject(verdict) {
                 BlockExecutionError::Validation(ref inner) => assert!(
                     inner.to_string().contains(&message),
                     "the LaneError message must survive: {inner}"

@@ -69,12 +69,12 @@ pub enum BscExecutionMode {
     /// Producing a block this validator will sign and broadcast, packed from the transaction
     /// pool. System transactions are generated and signed with the validator key.
     ///
-    /// The only mode that gates transactions on the BEP-703 payment lane, matching go-bsc,
-    /// where the `Admits` call sits in `worker.go`'s pool loop and nowhere else.
+    /// The only mode that gates transactions on the BEP-703 payment lane, as in go-bsc, where
+    /// the `Admits` call sits in `worker.go`'s pool loop and nowhere else.
     Mining,
-    /// Simulating a BEP-322 MEV bid: finalizes and signs like [`Self::Mining`], but the
-    /// transaction set is fixed by the builder, so there is nothing to drop for the lane —
-    /// go-bsc's `bid_simulator.go` likewise only accounts, then rules on the packed result.
+    /// Simulating a BEP-322 MEV bid: finalizes and signs like [`Self::Mining`], but the builder
+    /// fixed the transaction set, so there is nothing for the lane to drop — go-bsc's
+    /// `bid_simulator.go` likewise only accounts, then rules on the packed result.
     BidSimulation,
     /// Answering a hypothetical — `eth_simulateV1` or the local pending block. Authors a
     /// header like [`Self::Mining`], but runs no Parlia finalization and signs nothing,

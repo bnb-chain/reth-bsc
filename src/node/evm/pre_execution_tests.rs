@@ -628,10 +628,9 @@ mod parent_block_env {
         executor
     }
 
-    /// The payment lane may only read `0x2007` while the DB still holds the parent's
-    /// post-state. Enforced rather than documented: a late read would take the ratio and the
-    /// list from a state this block has already changed, and would then cache that answer
-    /// under the parent hash, so every later block with the same parent inherits it.
+    /// The payment lane may only read `0x2007` while the DB still holds the parent's post-state.
+    /// A late read would take the ratio and the list from a state this block already changed,
+    /// then cache that answer under the parent hash for every sibling block to inherit.
     #[test]
     fn lane_meta_refuses_to_read_a_mutated_state() {
         let mut executor = executor();

@@ -588,11 +588,10 @@ impl MevApiImpl {
             return Err(Self::invalid_bid("BidBlock disabled, fallback to SendBid"));
         }
 
-        // Security: validators must self-produce hard-fork activation blocks. Jenner installs
-        // the BEP-703 PaymentLane contract while its activation block executes, and that block
-        // is outside the lane mechanism — go-bsc refuses a BidBlock there
-        // (`miner_mev.go`'s `IsOnJenner` arm), so this client must refuse it too or the two
-        // would disagree on which builder blocks are admissible.
+        // A validator must self-produce a hard-fork activation block: Jenner installs `0x2007`
+        // while that block executes, and go-bsc refuses a BidBlock there (`miner_mev.go`'s
+        // `IsOnJenner` arm). Refusing it here too is what keeps the two clients agreeing on
+        // which builder blocks are admissible.
         let next_number = head_header.number + 1;
         if self.chain_spec.is_jenner_transition_at_timestamp(
             next_number,

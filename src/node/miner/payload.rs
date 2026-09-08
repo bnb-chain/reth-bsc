@@ -2365,7 +2365,7 @@ where
                 );
                 return false;
             }
-        };
+        }
 
         // Expensive blob KZG verification on the winning block, BEFORE broadcast (go-bsc
         // `prepareBidBlockTask` → `validateBidBlockBlobTxs`). Cheap structural sidecar checks already

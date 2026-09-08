@@ -1,6 +1,5 @@
 use super::executor::BscBlockExecutor;
-use crate::metrics::LANE_METRICS;
-use super::error::{BscBlockExecutionError, BscBlockValidationError};
+use super::error::{lane_reject, BscBlockExecutionError, BscBlockValidationError};
 use super::util::set_nonce;
 use super::config::{revm_spec_by_timestamp_and_block_number, BscExecutionMode};
 use crate::consensus::parlia::{FF_REWARD_DISTRIBUTION_INTERVAL};
@@ -171,17 +170,16 @@ where
         }
         // BEP-703's block rule, and it must be LAST. This function issues and executes system
         // transactions of its own, each adding to `self.gas_used`, so only here does
-        // `self.gas_used` equal `header.gas_used`. Run it at the top and 1-12M of system gas
-        // goes unaccounted — Parlia's system gas is general gas under BEP-703 §3.3.
+        // `self.gas_used` equal `header.gas_used`. Run it at the top and 1-12M of system gas goes
+        // unaccounted — Parlia's system gas is general gas under BEP-703 §3.3.
         if let Some(lane) = self.inner_ctx.payment_lane.as_ref() {
-            lane.budget
-                .verify(header.gas_limit, self.gas_used)
-                .map_err(crate::node::evm::error::lane_reject)?;
-            // Only after the block is accepted: publishing these for a rejected block would
-            // report numbers no peer agrees with.
-            LANE_METRICS.imported_quota.set(lane.budget.quota as f64);
-            LANE_METRICS.imported_payment_gas_used.set(lane.budget.used as f64);
-            LANE_METRICS.imported_idle.set(lane.budget.idle() as f64);
+            lane.budget.verify(header.gas_limit, self.gas_used).map_err(lane_reject)?;
+            // Only once the block is accepted: numbers from a rejected block are numbers no
+            // peer agrees with.
+            let metrics = &crate::metrics::LANE_METRICS;
+            metrics.imported_quota.set(lane.budget.quota as f64);
+            metrics.imported_payment_gas_used.set(lane.budget.used as f64);
+            metrics.imported_idle.set(lane.budget.idle() as f64);
         }
 
         tracing::trace!("Succeed to finalize new block, block_number: {}", block.number());
