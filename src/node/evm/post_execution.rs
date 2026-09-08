@@ -458,7 +458,7 @@ where
             state: &state,
             cumulative_gas_used: self.gas_used,
         }));
-        self.evm.db_mut().commit(state);
+        self.commit_state(state);
 
         // Record system contract execution duration
         let duration = start_time.elapsed();

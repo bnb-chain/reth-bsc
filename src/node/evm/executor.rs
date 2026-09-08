@@ -114,6 +114,10 @@ where
     /// Whether the DB still holds the parent's post-state, i.e. nothing in this block has been
     /// committed yet. `load_lane_meta` refuses to read `0x2007` once it is false.
     pub(super) db_at_parent_state: bool,
+    /// Whether this block has changed `0x2007` — its code as much as its storage, since a
+    /// replaced contract can change what the getters mean. Invalidates the lane config the
+    /// block's children would otherwise inherit. Maintained by [`Self::commit_state`].
+    pub(super) lane_contract_changed: bool,
     /// Total blob gas used in the block.
     pub(super) blob_gas_used: u64,
     /// Receipts of executed transactions.
@@ -201,6 +205,7 @@ where
             evm,
             gas_used: 0,
             db_at_parent_state: true,
+            lane_contract_changed: false,
             blob_gas_used: 0,
             receipts: vec![],
             system_txs: vec![],
@@ -370,17 +375,19 @@ where
         source: StateChangeSource,
     ) -> Result<(), BlockExecutionError> {
         let changes = {
-            let db = self.evm.db_mut();
-            let mut info =
-                db.basic(address).map_err(BlockExecutionError::other)?.unwrap_or_default();
+            let mut info = self
+                .evm
+                .db_mut()
+                .basic(address)
+                .map_err(BlockExecutionError::other)?
+                .unwrap_or_default();
             info.code_hash = code.hash_slow();
             info.code = Some(code);
             let mut account = RevmAccount::from(info);
             account.mark_touch();
             let mut changes: EvmState = Default::default();
             changes.insert(address, account);
-            self.db_at_parent_state = false;
-            db.commit(changes.clone());
+            self.commit_state(changes.clone());
             changes
         };
 
@@ -432,8 +439,7 @@ where
         account.mark_touch();
         let mut changes: EvmState = Default::default();
         changes.insert(HISTORY_STORAGE_ADDRESS, account);
-        db.commit(changes.clone());
-        self.db_at_parent_state = false;
+        self.commit_state(changes.clone());
 
         // Same reasoning as `upgrade_system_contract`: the incremental state-root pipeline only
         // sees changes reported through the hook, so this deployment must be announced or the
@@ -452,6 +458,20 @@ where
         );
         Ok(true)
     }
+    /// Commits state changes, and with them the two facts the payment lane rests on: the DB no
+    /// longer holds the parent's post-state, and whether this block has changed `0x2007`.
+    ///
+    /// `is_touched` is the whole test: revm skips anything else ("not touched account are never
+    /// changed"), so every change that reaches the DB — new code, storage, creation, destruction
+    /// — arrives touched.
+    pub(super) fn commit_state(&mut self, changes: EvmState) {
+        self.db_at_parent_state = false;
+        self.lane_contract_changed |= changes
+            .get(&crate::consensus::payment_lane::PAYMENT_LANE_CONTRACT)
+            .is_some_and(|account| account.is_touched());
+        self.evm.db_mut().commit(changes);
+    }
+
     /// Which lane this transaction's gas is booked against. `General` until Jenner.
     ///
     /// The only place this executor decides a lane: [`classify`] owns every gate, so nothing is
@@ -529,6 +549,7 @@ where
         metrics.quota.set(lane.budget.quota as f64);
         metrics.payment_gas_used.set(lane.budget.used as f64);
         metrics.idle.set(lane.budget.idle() as f64);
+        self.propagate_lane_meta();
         Ok(())
     }
 }
@@ -776,8 +797,7 @@ where
             cumulative_gas_used: self.gas_used,
         }));
 
-        self.db_at_parent_state = false;
-        self.evm.db_mut().commit(state);
+        self.commit_state(state);
 
         // Apply hertz patch after tx (import only — see `patch_before_tx` above).
         // commit_transaction cannot return errors in the new API, so defer any error to finish().

@@ -628,6 +628,41 @@ mod parent_block_env {
         executor
     }
 
+    /// One touched account, the shape a commit takes.
+    fn touched(address: Address) -> revm::state::EvmState {
+        let mut account = revm::state::Account::from(revm::state::AccountInfo::default());
+        account.mark_touch();
+        let mut state = revm::state::EvmState::default();
+        state.insert(address, account);
+        state
+    }
+
+    /// A block that leaves `0x2007` alone hands its config to its children, so the walk happens
+    /// once per governance change; a block that writes to it hands on nothing.
+    #[test]
+    fn lane_config_is_inherited_until_the_contract_changes() {
+        use crate::consensus::payment_lane::{meta::LaneMeta, Budget, PAYMENT_LANE_CONTRACT};
+        use crate::node::evm::executor::LaneState;
+        use crate::node::evm::pre_execution::LANE_META_CACHE;
+        use alloy_primitives::B256;
+
+        let mut executor = executor();
+        let meta = LaneMeta { ratio: 500, listed: Default::default() };
+        executor.inner_ctx.payment_lane = Some(LaneState { meta, budget: Budget::default() });
+
+        let inherited = B256::repeat_byte(0x11);
+        executor.ctx.header_hash = Some(inherited);
+        executor.commit_state(touched(Address::repeat_byte(0xaa)));
+        executor.propagate_lane_meta();
+        assert_eq!(LANE_META_CACHE.lock().unwrap().get(&inherited).map(|m| m.ratio), Some(500));
+
+        let changed = B256::repeat_byte(0x22);
+        executor.ctx.header_hash = Some(changed);
+        executor.commit_state(touched(PAYMENT_LANE_CONTRACT));
+        executor.propagate_lane_meta();
+        assert!(LANE_META_CACHE.lock().unwrap().get(&changed).is_none());
+    }
+
     /// A late read would take the ratio and the list from a state this block already changed,
     /// then cache that answer under the parent hash for every sibling block to inherit.
     #[test]

@@ -18,7 +18,7 @@ use crate::consensus::parlia::util::{is_breathe_block, debug_header};
 use crate::consensus::parlia::vote::MAX_ATTESTATION_EXTRA_LENGTH;
 use crate::consensus::payment_lane::{
     meta::{contracts_calldata, decode_ratio, ratio_calldata, LaneMeta, PageWalk},
-    Budget, LaneError, GETTER_GAS_LIMIT, PAYMENT_LANE_CONTRACT,
+    Budget, LaneError, GETTER_GAS_LIMIT, PAYMENT_LANE_CONTRACT, RATIO_DENOM,
 };
 use crate::node::evm::executor::LaneState;
 use crate::node::evm::error::{lane_reject, BscBlockExecutionError, BscBlockValidationError};
@@ -53,9 +53,15 @@ pub static TURN_LENGTH_CACHE: LazyLock<Mutex<TurnLengthCache>> = LazyLock::new(|
 
 type LaneMetaCache = LruMap<BlockHash, LaneMeta, ByLength>;
 
-/// Keyed on the parent hash rather than on `0x2007`'s own storage root, which reth's `Account`
-/// does not carry. Strictly more conservative: it can miss a hit, never conflate two states.
-static LANE_META_CACHE: LazyLock<Mutex<LaneMetaCache>> = LazyLock::new(|| {
+/// The lane config as of the post-state of one block, keyed by that block's hash: a block whose
+/// parent is `P` reads the entry for `P`.
+///
+/// Two writers, both meaning the same thing. [`BscBlockExecutor::load_lane_meta`] inserts what it
+/// walked at `P`, and a block that finished without writing to `0x2007` carries `P`'s entry
+/// forward to its own hash ([`BscBlockExecutor::propagate_lane_meta`]) — so the walk costs one
+/// read per change to the contract rather than one per block. Keying by block hash and only ever
+/// moving an entry along a real parent-child edge is what keeps a sibling branch's config out.
+pub(crate) static LANE_META_CACHE: LazyLock<Mutex<LaneMetaCache>> = LazyLock::new(|| {
     Mutex::new(LruMap::new(ByLength::new(1024)))
 });
 
@@ -373,13 +379,16 @@ where
             return Ok(hit.clone());
         }
 
+        let started = std::time::Instant::now();
         let ratio = decode_ratio(&self.lane_eth_call(PAYMENT_LANE_CONTRACT, ratio_calldata())?)
             .map_err(lane_reject)?;
 
         let mut walk = PageWalk::default();
         let mut offset = 0u64;
+        let mut pages = 0u64;
         loop {
             let ret = self.lane_eth_call(PAYMENT_LANE_CONTRACT, contracts_calldata(offset))?;
+            pages += 1;
             match walk.accept(offset, &ret).map_err(lane_reject)? {
                 Some(next) => offset = next,
                 None => break,
@@ -387,9 +396,42 @@ where
         }
         let listed = walk.finish().map_err(lane_reject)?;
 
+        // Sorted so two nodes' logs can be diffed directly, and capped so the contract's own
+        // 100k ceiling cannot produce an unreadable line.
+        let mut contracts: Vec<_> = listed.iter().copied().collect();
+        contracts.sort_unstable();
+        tracing::info!(
+            target: "bsc::payment_lane",
+            contract = %PAYMENT_LANE_CONTRACT,
+            parent = %parent_hash,
+            ratio,
+            denom = RATIO_DENOM,
+            listed = contracts.len(),
+            pages,
+            elapsed_ms = started.elapsed().as_millis(),
+            contracts = ?&contracts[..contracts.len().min(32)],
+            "payment lane config loaded"
+        );
+
         let meta = LaneMeta { ratio, listed: std::sync::Arc::new(listed) };
         LANE_META_CACHE.lock().unwrap().insert(parent_hash, meta.clone());
         Ok(meta)
+    }
+
+    /// Hands this block's lane config to its children: unless the block changed `0x2007`, the
+    /// config read at its parent is still the truth after it.
+    ///
+    /// No-op while producing, where the block has no hash yet — the block is cached when this
+    /// node later imports it.
+    pub(crate) fn propagate_lane_meta(&self) {
+        let (Some(hash), Some(lane)) = (self.ctx.header_hash, self.inner_ctx.payment_lane.as_ref())
+        else {
+            return;
+        };
+        if self.lane_contract_changed {
+            return;
+        }
+        LANE_META_CACHE.lock().unwrap().insert(hash, lane.meta.clone());
     }
 
     /// Derives this block's lane from the parent's ratio and this block's `gas_limit`.
