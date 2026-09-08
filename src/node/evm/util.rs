@@ -101,6 +101,9 @@ pub fn get_cannonical_header_from_cache(number: BlockNumber) -> Option<Header> {
         return Some(header);
     }
     let header = crate::shared::get_canonical_header_by_number_from_provider(number);
+    if header.is_none() {
+        tracing::warn!("Failed to get header from cache and provider, block_number: {:?}", number);
+    }
     tracing::debug!("Succeed to fetch canonical header by number, is_none: {} for number {}", header.is_none(), number);
     header
 }
