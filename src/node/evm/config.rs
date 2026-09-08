@@ -66,10 +66,8 @@ pub enum BscExecutionMode {
     /// Verifying a block received from the network or the engine API. The header already
     /// exists and system transactions are consumed from the block rather than generated.
     Import,
-    /// Producing a block this validator will sign and broadcast, packed from the transaction
-    /// pool. System transactions are generated and signed with the validator key.
-    ///
-    /// The only mode that gates transactions on the BEP-703 payment lane.
+    /// Producing a block this validator will sign and broadcast. System transactions are
+    /// generated and signed with the validator key.
     Mining,
     /// Simulating a BEP-322 MEV bid: finalizes and signs like [`Self::Mining`], but the builder
     /// fixed the transaction set, so the lane only accounts and then rules on the result.

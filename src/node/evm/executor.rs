@@ -469,15 +469,67 @@ where
             return Ok(Lane::General);
         };
 
+        let block = self.evm.block().number().to::<u64>();
         let db = self.evm.db_mut();
         classify(is_system, to, tx_type, value, &listed, |to| match db.basic(to) {
             Ok(None) => Ok(true),
             Ok(Some(acc)) => Ok(acc.code_hash.is_zero() || acc.code_hash == KECCAK_EMPTY),
-            // Never `unwrap_or_default()`: that reports "no code", biasing the classification
-            // toward Payment and making an honest block look untruthful.
-            Err(err) => Err(LaneError::StateUnavailable(err.to_string())),
+            Err(err) => {
+                error!(
+                    target: "bsc::payment_lane",
+                    block,
+                    address = %to,
+                    error = %err,
+                    "cannot read code for lane classification"
+                );
+                Err(LaneError::StateUnavailable(err.to_string()))
+            }
         })
         .map_err(lane_reject)
+    }
+
+    /// The lane verdict for a finished block. `gas_used` is the header's total, so this may only
+    /// run once the last system transaction has been executed.
+    ///
+    /// Logs everything the verdict was derived from: nothing about the reservation reaches the
+    /// header, so a disagreement between two nodes can only be diagnosed from what each side
+    /// read out of `0x2007` and how it booked the block's gas.
+    pub(crate) fn verify_payment_lane(
+        &self,
+        gas_limit: u64,
+        gas_used: u64,
+    ) -> Result<(), BlockExecutionError> {
+        let Some(lane) = self.inner_ctx.payment_lane.as_ref() else { return Ok(()) };
+        let metrics = &crate::metrics::LANE_METRICS;
+
+        if let Err(err) = lane.budget.verify(gas_limit, gas_used) {
+            if self.ctx.mode.finalizes() {
+                metrics.produce_declined.increment(1);
+            }
+            error!(
+                target: "bsc::payment_lane",
+                mode = ?self.ctx.mode,
+                block = self.evm.block().number().to::<u64>(),
+                timestamp = self.evm.block().timestamp().to::<u64>(),
+                parent = %self.ctx.base.parent_hash,
+                gas_limit,
+                gas_used,
+                quota = lane.budget.quota,
+                payment_gas_used = lane.budget.used,
+                idle = lane.budget.idle(),
+                ratio = lane.meta.ratio,
+                listed = lane.meta.listed.len(),
+                receipts = self.receipts.len(),
+                system_txs = self.system_txs.len(),
+                "payment lane violated"
+            );
+            return Err(lane_reject(err));
+        }
+
+        metrics.quota.set(lane.budget.quota as f64);
+        metrics.payment_gas_used.set(lane.budget.used as f64);
+        metrics.idle.set(lane.budget.idle() as f64);
+        Ok(())
     }
 }
 
@@ -640,10 +692,16 @@ where
                 let shared = block_gas_limit.saturating_sub(reserved).saturating_sub(self.gas_used);
                 if !lane_state.budget.admits(shared, lane, tx_gas_limit) {
                     crate::metrics::LANE_METRICS.general_lane_yielded.increment(1);
-                    trace!(
+                    debug!(
                         target: "bsc::payment_lane",
-                        ?lane, tx_gas_limit, shared, idle = lane_state.budget.idle(),
-                        "dropping a transaction that would eat into the reserved quota"
+                        block = block_number,
+                        tx = %tx_hash,
+                        ?lane,
+                        tx_gas_limit,
+                        shared,
+                        quota = lane_state.budget.quota,
+                        idle = lane_state.budget.idle(),
+                        "dropping a transaction that would eat into the reservation"
                     );
                     return Err(BlockValidationError::InvalidTx {
                         hash: tx_hash,
@@ -805,12 +863,7 @@ where
         // match, so the system transactions issued above are already in `self.gas_used`. Failure
         // declines the block; there is no fallback that produces with the lane switched off.
         if self.ctx.mode.finalizes() {
-            if let Some(lane) = self.inner_ctx.payment_lane.as_ref() {
-                lane.budget.verify(self.evm.block().gas_limit(), self.gas_used).map_err(|e| {
-                    crate::metrics::LANE_METRICS.produce_declined.increment(1);
-                    lane_reject(e)
-                })?;
-            }
+            self.verify_payment_lane(self.evm.block().gas_limit(), self.gas_used)?;
         }
 
         // Update receipt height metric

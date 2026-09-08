@@ -1,5 +1,5 @@
 use super::executor::BscBlockExecutor;
-use super::error::{lane_reject, BscBlockExecutionError, BscBlockValidationError};
+use super::error::{BscBlockExecutionError, BscBlockValidationError};
 use super::util::set_nonce;
 use super::config::{revm_spec_by_timestamp_and_block_number, BscExecutionMode};
 use crate::consensus::parlia::{FF_REWARD_DISTRIBUTION_INTERVAL};
@@ -171,14 +171,7 @@ where
         // The lane verdict, and it must be LAST: this function issues system transactions of
         // its own, so only here does `self.gas_used` equal `header.gas_used`. Run it earlier and
         // 1-12M of system gas goes unaccounted, though the lane counts it as general.
-        if let Some(lane) = self.inner_ctx.payment_lane.as_ref() {
-            lane.budget.verify(header.gas_limit, self.gas_used).map_err(lane_reject)?;
-            // Only once accepted: numbers from a rejected block are numbers no peer agrees with.
-            let metrics = &crate::metrics::LANE_METRICS;
-            metrics.quota.set(lane.budget.quota as f64);
-            metrics.payment_gas_used.set(lane.budget.used as f64);
-            metrics.idle.set(lane.budget.idle() as f64);
-        }
+        self.verify_payment_lane(header.gas_limit, self.gas_used)?;
 
         tracing::trace!("Succeed to finalize new block, block_number: {}", block.number());
         Ok(())

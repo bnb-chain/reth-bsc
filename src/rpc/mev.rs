@@ -597,6 +597,12 @@ impl MevApiImpl {
             args.bid_block.header.timestamp,
             head_header.timestamp,
         ) {
+            tracing::warn!(
+                "BidBlock refused on hard-fork activation block: block={next_number}, \
+                 bidHash={bid_hash:?}, headTime={}, bidTime={}",
+                head_header.timestamp,
+                args.bid_block.header.timestamp,
+            );
             return Err(Self::invalid_bid(format!(
                 "BidBlock disabled on hard-fork activation block {next_number}, fallback to SendBid"
             )));

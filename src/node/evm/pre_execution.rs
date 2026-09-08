@@ -392,22 +392,37 @@ where
         Ok(meta)
     }
 
-    /// Derives this block's lane from the parent's ratio and this block's `gas_limit`, or leaves
-    /// it unset until [`BscHardforks::payment_lane_applies`](crate::hardforks::BscHardforks)
-    /// says the fork binds. Must run before this block mutates state.
+    /// Derives this block's lane from the parent's ratio and this block's `gas_limit`.
+    ///
+    /// Gated on the PARENT: the ratio comes from its post-state, and Jenner installs `0x2007`
+    /// while its activation block executes, so `activation + 1` is the first block that reserves.
+    ///
+    /// Must run before this block mutates state.
     fn init_payment_lane(
         &mut self,
         parent: &Header,
         gas_limit: u64,
     ) -> Result<(), BlockExecutionError> {
-        if !self.spec.payment_lane_applies(parent.number, parent.timestamp) {
+        if !self.spec.is_jenner_active_at_timestamp(parent.number, parent.timestamp) {
             return Ok(());
         }
-        let meta = self.load_lane_meta()?;
+        // Read before the call so the failure log can name the block; `load_lane_meta` holds a
+        // mutable borrow of the executor.
+        let (block, parent_hash) = (parent.number + 1, self.ctx.base.parent_hash);
+        let meta = self.load_lane_meta().inspect_err(|err| {
+            tracing::error!(
+                target: "bsc::payment_lane",
+                block,
+                parent = %parent_hash,
+                gas_limit,
+                error = %err,
+                "cannot derive the payment lane"
+            );
+        })?;
         let quota = meta.quota(gas_limit);
         tracing::debug!(
             target: "bsc::payment_lane",
-            parent = parent.number,
+            block,
             ratio = meta.ratio,
             quota,
             listed = meta.listed.len(),
