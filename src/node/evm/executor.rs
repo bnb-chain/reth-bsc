@@ -462,10 +462,15 @@ where
 
     /// Which lane this transaction's gas is booked against. `General` until Jenner.
     ///
+    /// The only place this executor decides a lane, for system transactions as much as user
+    /// ones: [`classify`] owns every gate, so this function adds none of its own beyond the
+    /// pre-Jenner short circuit.
+    ///
     /// The code probe reads live state on every call. A deploy and a later transfer to the same
     /// address must classify differently within one block, so memoizing by address is a fork.
     pub(crate) fn classify_lane(
         &mut self,
+        is_system: bool,
         to: Option<Address>,
         tx_type: u8,
         value: U256,
@@ -477,7 +482,7 @@ where
         };
 
         let db = self.evm.db_mut();
-        classify(to, tx_type, value, &listed, |to| match db.basic(to) {
+        classify(is_system, to, tx_type, value, &listed, |to| match db.basic(to) {
             Ok(None) => Ok(true),
             Ok(Some(acc)) => Ok(acc.code_hash.is_zero() || acc.code_hash == KECCAK_EMPTY),
             // Never `unwrap_or_default()`: that reports "no code", biasing the classification
@@ -570,6 +575,16 @@ where
 
         // Detect system transactions: skip EVM execution, accumulate for later.
         let is_system = is_system_transaction(&tx_signed, signer, self.evm.block().beneficiary());
+
+        // Ahead of the branch below, so both arms take their lane from the same call and the
+        // system-transaction gate cannot be forgotten on one of them. `classify` answers
+        // `General` on `is_system` before touching the code probe, so this costs a system
+        // transaction nothing.
+        let lane = {
+            use alloy_consensus::{Transaction as _, Typed2718 as _};
+            self.classify_lane(is_system, tx_signed.to(), tx_signed.ty(), tx_signed.value())?
+        };
+
         if is_system {
             self.system_txs.push(tx_signed.clone());
             let dummy = ResultAndState {
@@ -587,7 +602,7 @@ where
                 tx_type,
                 tx: tx_signed,
                 is_system: true,
-                lane: Lane::General,
+                lane,
             });
         }
 
@@ -596,11 +611,6 @@ where
         if !self.ctx.mode.authors_block() {
             self.hertz_patch_manager.patch_before_tx(&tx_signed, self.evm.db_mut())?;
         }
-
-        let lane = {
-            use alloy_consensus::{Transaction as _, Typed2718 as _};
-            self.classify_lane(tx_signed.to(), tx_signed.ty(), tx_signed.value())?
-        };
 
         let block_available_gas = self.evm.block().gas_limit() - self.gas_used;
         let tx_gas_limit = {

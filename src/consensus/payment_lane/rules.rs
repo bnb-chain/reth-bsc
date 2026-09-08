@@ -57,10 +57,13 @@ pub fn check_inequality(
     }
 }
 
-/// Classify one user transaction against BEP-703 §3.2's gates, in order.
+/// Classify one transaction against BEP-703 §3.2's gates, in order.
 ///
-/// Parlia's system transactions never reach here — the caller books them as general, which is
-/// go-bsc's `isSystemTransaction` gate.
+/// Every gate lives here, `is_system` included, so the classification rule has exactly one
+/// home and no call site can implement half of it. `is_system` is go-bsc's `SystemTxOracle`
+/// gate, passed as a value rather than a closure because reth's executor has already computed
+/// it — system transactions skip EVM execution, so `is_system_transaction` runs either way.
+/// Making it a required argument is what forces a caller to answer it.
 ///
 /// `code_at_to_is_empty` must read the **live** state and be built fresh at each call site: the
 /// code gate's answer changes within a block, so an address that gains code earlier in the same
@@ -71,12 +74,19 @@ pub fn check_inequality(
 /// *not* `EmptyCodeHash`) and `code_hash == KECCAK_EMPTY`. Testing only `!= KECCAK_EMPTY` drops
 /// every transfer to a fresh account out of the lane.
 pub fn classify(
+    is_system: bool,
     to: Option<Address>,
     tx_type: u8,
     value: U256,
     listed: &HashSet<Address>,
     code_at_to_is_empty: impl FnOnce(Address) -> Result<bool, LaneError>,
 ) -> Result<Lane, LaneError> {
+    // The transactions Parlia appends to a block are consensus mechanics, not user traffic, so
+    // their gas falls on the general side (§3.3). First gate: a system transaction is general
+    // whatever its destination, and a listed destination must not rescue it.
+    if is_system {
+        return Ok(Lane::General);
+    }
     let Some(to) = to else { return Ok(Lane::General) };
     // Blob and set-code transactions are excluded: the code test cannot reach the execution
     // an authorisation carried by the transaction itself installs.
@@ -332,13 +342,13 @@ mod tests {
         };
 
         // A contract creation has no destination to test.
-        assert_eq!(classify(None, 0, U256::from(1), &listed, never), Ok(Lane::General));
+        assert_eq!(classify(false, None, 0, U256::from(1), &listed, never), Ok(Lane::General));
 
         // The type allowlist runs before the list, so even a listed destination is general on
         // an excluded type — 0x03 carries blobs, 0x04 installs code before execution begins.
         for ty in [0x03u8, 0x04, 0x05, 0x7e] {
             assert_eq!(
-                classify(Some(listed_addr), ty, U256::from(1), &listed, never),
+                classify(false, Some(listed_addr), ty, U256::from(1), &listed, never),
                 Ok(Lane::General),
                 "type {ty:#x}"
             );
@@ -349,7 +359,7 @@ mod tests {
         for ty in [0x00u8, 0x01, 0x02] {
             for value in [U256::ZERO, U256::from(1)] {
                 assert_eq!(
-                    classify(Some(listed_addr), ty, value, &listed, never),
+                    classify(false, Some(listed_addr), ty, value, &listed, never),
                     Ok(Lane::Payment),
                     "type {ty:#x} value {value}"
                 );
@@ -357,17 +367,51 @@ mod tests {
         }
 
         // A bare transfer needs non-zero value and no code at the destination.
-        assert_eq!(classify(Some(plain), 0, U256::from(1), &listed, empty), Ok(Lane::Payment));
-        assert_eq!(classify(Some(plain), 0, U256::ZERO, &listed, never), Ok(Lane::General));
-        assert_eq!(classify(Some(plain), 0, U256::from(1), &listed, has_code), Ok(Lane::General));
+        assert_eq!(classify(false, Some(plain), 0, U256::from(1), &listed, empty), Ok(Lane::Payment));
+        assert_eq!(classify(false, Some(plain), 0, U256::ZERO, &listed, never), Ok(Lane::General));
+        assert_eq!(classify(false, Some(plain), 0, U256::from(1), &listed, has_code), Ok(Lane::General));
 
         // A failed state read is surfaced, never rounded to "no code": biasing toward Payment
         // would let an honest block look like it overran the lane.
         assert_eq!(
-            classify(Some(plain), 0, U256::from(1), &listed, |_| Err(
+            classify(false, Some(plain), 0, U256::from(1), &listed, |_| Err(
                 LaneError::StateUnavailable("missing trie node".into())
             )),
             Err(LaneError::StateUnavailable("missing trie node".into()))
+        );
+    }
+
+    /// BEP-703 §3.2's first gate. Parlia's system transactions are consensus mechanics, not
+    /// user traffic, so their gas must land on the general side of §3.3 — and the gate has to
+    /// come first, because a system transaction otherwise satisfies the payment rules: it is
+    /// sent to a contract governance could list, and `deposit` carries non-zero value.
+    #[test]
+    fn payment_lane_system_transactions_are_always_general() {
+        let listed_addr = Address::repeat_byte(0xaa);
+        let listed = listed_set(&[listed_addr]);
+        let never = |_: Address| -> Result<bool, LaneError> {
+            panic!("the code gate must not be reached")
+        };
+
+        // Every shape that would otherwise be Payment, and one that would not: the gate wins
+        // in all of them, and it short-circuits before the code probe.
+        for (to, value) in [
+            (Some(listed_addr), U256::from(1)),
+            (Some(listed_addr), U256::ZERO),
+            (Some(Address::repeat_byte(0xbb)), U256::from(1)),
+        ] {
+            assert_eq!(
+                classify(true, to, 0x00, value, &listed, never),
+                Ok(Lane::General),
+                "system tx to {to:?} with value {value}"
+            );
+        }
+
+        // The same transaction without the system flag is Payment, so the test is not passing
+        // for an unrelated reason.
+        assert_eq!(
+            classify(false, Some(listed_addr), 0x00, U256::from(1), &listed, never),
+            Ok(Lane::Payment)
         );
     }
 
@@ -381,7 +425,7 @@ mod tests {
             let is_empty = code_hash.is_zero() || code_hash == KECCAK_EMPTY;
             assert!(is_empty);
             assert_eq!(
-                classify(Some(to), 0, U256::from(1), &listed, |_| Ok(is_empty)),
+                classify(false, Some(to), 0, U256::from(1), &listed, |_| Ok(is_empty)),
                 Ok(Lane::Payment),
                 "code hash {code_hash}"
             );
