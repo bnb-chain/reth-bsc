@@ -119,8 +119,9 @@ where
     P: HeaderProvider<Header = alloy_consensus::Header>,
     Evm: ConfigureEvm,
 {
-    fn report_execution_error(&self, outcome: &ValidationOutcome<BscPrimitives>) {
+    fn report_invalid_block(&self, outcome: &ValidationOutcome<BscPrimitives>) {
         let Err(InsertPayloadError::Block(error)) = outcome else { return };
+        super::bad_block::report(error);
         let InsertBlockErrorKind::Execution(execution_error) = error.kind() else { return };
         if !crate::node::evm::error::is_execution_evidence(execution_error) {
             return;
@@ -175,7 +176,7 @@ where
         ctx: TreeCtx<'_, BscPrimitives>,
     ) -> ValidationOutcome<BscPrimitives> {
         let outcome = self.inner.validate_payload(payload, ctx);
-        self.report_execution_error(&outcome);
+        self.report_invalid_block(&outcome);
         outcome
     }
 
@@ -185,7 +186,7 @@ where
         ctx: TreeCtx<'_, BscPrimitives>,
     ) -> ValidationOutcome<BscPrimitives> {
         let outcome = self.inner.validate_block(block, ctx);
-        self.report_execution_error(&outcome);
+        self.report_invalid_block(&outcome);
         outcome
     }
 

@@ -217,6 +217,14 @@ pub struct BscMevGrpcMetrics {
     pub payload_size_bytes: Histogram,
 }
 
+/// Live-sync bad-block diagnostics, independent of builder revocation evidence.
+#[derive(Metrics, Clone)]
+#[metrics(scope = "bsc.blockchain")]
+pub struct BscBadBlockMetrics {
+    /// Invalid blocks tagged as BEP-675 BidBlocks, deduplicated by a bounded hash cache.
+    pub bad_bid_blocks_total: Counter,
+}
+
 /// Metrics for BEP-675 cross-validator bad-BidBlock evidence.
 #[derive(Metrics, Clone)]
 #[metrics(scope = "bsc.mev.bid_block_evidence")]

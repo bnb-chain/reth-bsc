@@ -12,6 +12,7 @@ use reth_node_ethereum::engine::EthPayloadAttributes;
 
 
 pub mod builder;
+mod bad_block;
 pub mod payload;
 pub mod validator;
 
