@@ -42,58 +42,106 @@ use revm::{
 };
 use std::{borrow::Cow, cell::RefCell, convert::Infallible, rc::Rc, sync::{Arc, Mutex}};
 
-/// Carries `(current_validators, vote_addresses)` until the final block hash is known.
+/// Shared sink type for transporting `(current_validators, vote_addresses)` from the builder to
+/// the payload/bid layer so that VALIDATOR_CACHE can be written after the definitive block hash
+/// is known.
 pub type ValidatorCacheSink = Arc<Mutex<Option<(Vec<Address>, Vec<VoteAddress>)>>>;
 
-/// Carries the BEP-703 commitment from `finish` to the assembler.
-pub type PaymentLaneSink = Arc<Mutex<Option<crate::consensus::payment_lane::Commitment>>>;
-
-/// Carries precomputed `(state_root, trie_updates)` into the MDBX builder path.
+/// Sink carrying the sparse-trie background task's precomputed
+/// `(state_root, trie_updates)`, threaded from the payload layer to the builder's
+/// MDBX branch so it can skip the blocking `state_root_with_updates` call.
 pub type StateRootPrecomputedSink =
     Arc<Mutex<Option<(alloy_primitives::B256, reth_trie_common::updates::TrieUpdates)>>>;
 
-/// How the executor should treat the block it is running.
+/// What the executor is doing with the block it is running.
+///
+/// Replaces the former `is_miner: bool`, which fused two independent questions: whether a
+/// header already exists, and whether Parlia finalization should run. Those two always
+/// moved together for the import and mining paths, so a bool sufficed — until
+/// `eth_simulateV1` needed the third combination (author a block, but do *not* finalize
+/// it) and was silently rounded to [`Self::Mining`], making a read-only RPC try to sign
+/// Parlia system transactions. See <https://github.com/bnb-chain/reth-bsc/issues/451>.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BscExecutionMode {
-    /// Verifying an existing block.
+    /// Verifying a block received from the network or the engine API. The header already
+    /// exists and system transactions are consumed from the block rather than generated.
     Import,
-    /// Producing a validator-owned block from the tx pool.
+    /// Producing a block this validator will sign and broadcast, packed from the transaction
+    /// pool. System transactions are generated and signed with the validator key.
+    ///
+    /// The only mode that gates transactions on the BEP-703 payment lane, matching go-bsc,
+    /// where the `Admits` call sits in `worker.go`'s pool loop and nowhere else.
     Mining,
-    /// Producing a block from a fixed transaction set.
+    /// Simulating a BEP-322 MEV bid: finalizes and signs like [`Self::Mining`], but the
+    /// transaction set is fixed by the builder, so there is nothing to drop for the lane —
+    /// go-bsc's `bid_simulator.go` likewise only accounts, then rules on the packed result.
     BidSimulation,
-    /// Building a hypothetical block without finalization.
+    /// Answering a hypothetical — `eth_simulateV1` or the local pending block. Authors a
+    /// header like [`Self::Mining`], but runs no Parlia finalization and signs nothing,
+    /// matching BSC geth's simulation path.
     Simulation,
 }
 
 impl BscExecutionMode {
-    /// Whether this path authors a fresh header.
+    /// Whether no header exists yet and one is being authored.
+    ///
+    /// True for every producing mode; the block-verification checks that dereference
+    /// `ctx.header` must be skipped in all of them.
     pub const fn authors_block(self) -> bool {
         matches!(self, Self::Mining | Self::BidSimulation | Self::Simulation)
     }
 
-    /// Whether this path runs Parlia finalization and signs system transactions.
+    /// Whether Parlia post-block finalization (reward distribution, slashing, validator-set
+    /// updates) must run — which implies signing system transactions.
     pub const fn finalizes(self) -> bool {
         matches!(self, Self::Mining | Self::BidSimulation)
     }
 }
 
 /// BSC wrapper around [`NextBlockEnvAttributes`].
+///
+/// Extends the upstream attributes with sparse-trie sinks and validator/turn-length
+/// transport sinks needed by the BSC miner. The struct still satisfies upstream RPC
+/// trait bounds via a delegating [`BuildPendingEnv`] implementation, keeping reth's
+/// base attributes unchanged.
 #[derive(Debug, Clone)]
 pub struct BscNextBlockEnvAttributes {
     pub inner: NextBlockEnvAttributes,
     /// Execution mode for the block built from these attributes.
+    ///
+    /// Defaults to [`BscExecutionMode::Simulation`] via [`BuildPendingEnv`], which is the
+    /// entry point reth uses for `eth_simulateV1` and the local pending block. The miner and
+    /// bid simulator construct this struct literally and must set
+    /// [`BscExecutionMode::Mining`] explicitly.
     pub mode: BscExecutionMode,
-    /// Defers validator-cache writes until the final block hash is known.
+    /// Sink for transporting `current_validators` from builder to payload layer without writing
+    /// to VALIDATOR_CACHE prematurely (hash not yet final at build time).
     pub validator_cache_sink: Option<ValidatorCacheSink>,
-    /// Defers turn-length cache writes until the final block hash is known.
+    /// Sink for transporting `turn_length` from builder to payload layer without writing to
+    /// TURN_LENGTH_CACHE prematurely.
     pub turn_length_sink: Option<Arc<Mutex<Option<u8>>>>,
-    /// Carries precomputed `(state_root, trie_updates)` into `finish`.
+    /// Sink for precomputed `(state_root, trie_updates)` from a sparse-trie background
+    /// task. Filled by the payload layer between exec and `finish` so the builder can
+    /// skip the blocking `state_root_with_updates` call. See
+    /// [`BscBlockExecutionCtx::state_root_precomputed_sink`] for full semantics.
     pub state_root_precomputed_sink: Option<StateRootPrecomputedSink>,
-    /// Sparse-trie state-root handle, kept until `finish` can await it safely.
+    /// Sparse-trie state-root handle, threaded through to `finish`.
+    ///
+    /// Stored here (in `Arc<Mutex<Option<_>>>` so `Clone` works for the type-erased
+    /// builder path) so that `state_root()` can be called **after** `executor.finish()`
+    /// runs BSC's post-execution system transactions (slash, fee distribution,
+    /// validator-set updates). Those system txs change state via the same executor
+    /// that has the `state_hook` installed; the hook is dropped naturally when the
+    /// executor is consumed by `finish()`, which sends `FinishedStateUpdates` to the
+    /// background task. Only after that drop is it safe to await `state_root()`.
     pub trie_handle: Option<
         Arc<Mutex<Option<reth_engine_tree::tree::multiproof::StateRootHandle>>>,
     >,
-    /// Absolute deadline for waiting on sparse-trie state-root completion in `finish`.
+    /// Absolute wall-clock deadline (epoch ms) for bounding the sparse-trie
+    /// `state_root()` wait in `finish`. Past it the builder stops waiting and falls
+    /// back to synchronous `state_root_with_updates`, so an in-turn block never
+    /// blocks unboundedly past its slot. `None` = legacy unbounded blocking wait
+    /// (out-of-turn / bid-sim / import paths).
     pub state_root_deadline_ms: Option<u64>,
     /// Sub-second millisecond remainder (BEP-520) of the block being built, consumed by
     /// [`BscBlockEnv`] and the BEP-706 precompile. The miner and bid simulator fill it
@@ -108,7 +156,8 @@ impl<H: BlockHeader> BuildPendingEnv<H> for BscNextBlockEnvAttributes {
     fn build_pending_env(parent: &SealedHeader<H>) -> Self {
         Self {
             inner: NextBlockEnvAttributes::build_pending_env(parent),
-            // RPC pending/simulate path: build a header, but do not finalize or sign.
+            // This is the RPC-side entry point (`eth_simulateV1`, local pending block), not
+            // the miner. Simulation must not run Parlia finalization or sign system txs.
             mode: BscExecutionMode::Simulation,
             validator_cache_sink: None,
             turn_length_sink: None,
@@ -178,9 +227,6 @@ pub struct BscBlockExecutionCtx<'a> {
     /// `--mining.use-sparse-trie-state-root` flag is off, triggering the legacy
     /// state-root path.
     pub state_root_precomputed_sink: Option<StateRootPrecomputedSink>,
-    /// Carries the BEP-703 commitment from the executor to the assembler. Stays empty on
-    /// import paths, where the assembler never runs.
-    pub payment_lane_sink: PaymentLaneSink,
     /// Sparse-trie state-root handle. The builder consumes this **after**
     /// `executor.finish()` runs BSC's post-execution system transactions (slash,
     /// fee distribution, validator-set updates), so those state changes are
@@ -507,7 +553,6 @@ where
             validator_cache_sink: None,
             turn_length_sink: None,
             state_root_precomputed_sink: None,
-            payment_lane_sink: Arc::new(Mutex::new(None)),
             trie_handle: None,
             state_root_deadline_ms: None,
         })
@@ -542,7 +587,6 @@ where
             validator_cache_sink: attributes.validator_cache_sink,
             turn_length_sink: attributes.turn_length_sink,
             state_root_precomputed_sink: attributes.state_root_precomputed_sink,
-            payment_lane_sink: Arc::new(Mutex::new(None)),
             trie_handle: attributes.trie_handle,
             state_root_deadline_ms: attributes.state_root_deadline_ms,
         })
@@ -615,7 +659,6 @@ where
             validator_cache_sink: None,
             turn_length_sink: None,
             state_root_precomputed_sink: None,
-            payment_lane_sink: Arc::new(Mutex::new(None)),
             trie_handle: None,
             state_root_deadline_ms: None,
         })

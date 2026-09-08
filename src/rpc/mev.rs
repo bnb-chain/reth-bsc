@@ -588,12 +588,11 @@ impl MevApiImpl {
             return Err(Self::invalid_bid("BidBlock disabled, fallback to SendBid"));
         }
 
-        // BEP-703: the activation block is outside the lane mechanism, so its `ommers_hash`
-        // must stay EMPTY — but a BidBlock's header is adopted almost verbatim from the builder,
-        // which cannot be relied on to know that. Decline and let the builder fall back.
-        //
-        // The message text is part of the interface: builders match on it to decide to retry via
-        // SendBid, so it must read exactly as go-bsc's does.
+        // Security: validators must self-produce hard-fork activation blocks. Jenner installs
+        // the BEP-703 PaymentLane contract while its activation block executes, and that block
+        // is outside the lane mechanism — go-bsc refuses a BidBlock there
+        // (`miner_mev.go`'s `IsOnJenner` arm), so this client must refuse it too or the two
+        // would disagree on which builder blocks are admissible.
         let next_number = head_header.number + 1;
         if self.chain_spec.is_jenner_transition_at_timestamp(
             next_number,
@@ -601,7 +600,7 @@ impl MevApiImpl {
             head_header.timestamp,
         ) {
             return Err(Self::invalid_bid(format!(
-                "BidBlock disabled at block {next_number} (hard-fork activation block), fallback to SendBid"
+                "BidBlock disabled on hard-fork activation block {next_number}, fallback to SendBid"
             )));
         }
 

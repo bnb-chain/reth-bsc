@@ -1,35 +1,23 @@
-//! Decoding the governable lane parameters and the payment contract list.
+//! Decoding the governable lane ratio and the payment contract list.
 //!
-//! Two getters, both `view`: the eight parameters, and the payment contract list walked one
-//! page at a time. Every value the lane rules consume comes from here — the defaults of
-//! BEP-703 §3.6.1 live in the contract, not in this client, so there is one source of truth.
+//! Two getters, both `view`: the single ratio of BEP-703 §3.6.1, and the payment contract list
+//! walked one page at a time. Every value the lane rules consume comes from here — §3.6.1's
+//! default for a ratio governance never wrote lives in the contract's own getter, not in this
+//! client, so there is one source of truth.
 //!
 //! This module decodes and validates; it does not call. The caller supplies each page's raw
 //! return data, which keeps every reject condition below testable without an EVM.
 
-use super::{GovernanceParams, LaneError, MAX_LISTED_CONTRACTS, PAGE_SIZE};
+use super::{rules::check_ratio, LaneError, MAX_LISTED_CONTRACTS, PAGE_SIZE};
 use alloy_primitives::{map::HashSet, Address, Bytes, U256};
 use alloy_sol_types::{sol, SolCall};
 use std::sync::Arc;
 
 sol! {
-    /// Field order is the contract's slot order and `abi_decode_returns` is positional, so
-    /// all eight must be spelled out here in that order. Abbreviating hands the wire format
-    /// to luck.
+    /// BEP-703 §3.6.4's consensus getter for the reservation. Returns a `uint256`, and the
+    /// guard is applied at that full width — see [`check_ratio`].
     #[derive(Debug)]
-    struct PaymentLaneParams {
-        uint256 paymentLaneMinRatio;
-        uint256 paymentLaneMaxRatio;
-        uint256 expandTriggerRatio;
-        uint256 shrinkTriggerRatio;
-        uint256 expandStepRatio;
-        uint256 shrinkStepRatio;
-        uint256 paymentLaneMin;
-        uint256 paymentLaneMax;
-    }
-
-    #[derive(Debug)]
-    function getPaymentLaneParams() external view returns (PaymentLaneParams);
+    function getPaymentLaneRatio() external view returns (uint256);
 
     /// The returns must stay named: unnamed ones generate fields `_0`/`_1` instead.
     #[derive(Debug)]
@@ -47,15 +35,23 @@ fn corrupt(msg: String) -> LaneError {
 /// Everything the lane rules need from `0x2007`, read as of one block's parent post-state.
 #[derive(Clone, Debug)]
 pub struct LaneMeta {
-    pub params: GovernanceParams,
+    /// The governable reservation, as a fraction of the gas limit against `RATIO_DENOM`.
+    pub ratio: u64,
     /// Shared: the cache hands out a clone per block, and the per-transaction classifier holds
     /// it while the executor reads state.
     pub listed: Arc<HashSet<Address>>,
 }
 
-/// Calldata for `getPaymentLaneParams()`.
-pub fn params_calldata() -> Bytes {
-    getPaymentLaneParamsCall {}.abi_encode().into()
+impl LaneMeta {
+    /// This block's reservation. BEP-703 §3.4.1.
+    pub fn quota(&self, gas_limit: u64) -> u64 {
+        super::rules::quota(self.ratio, gas_limit)
+    }
+}
+
+/// Calldata for `getPaymentLaneRatio()`.
+pub fn ratio_calldata() -> Bytes {
+    getPaymentLaneRatioCall {}.abi_encode().into()
 }
 
 /// Calldata for one page of `getPaymentContracts(offset, limit)`.
@@ -68,34 +64,14 @@ pub fn contracts_calldata(offset: u64) -> Bytes {
         .into()
 }
 
-/// Decodes the parameter getter's return data.
+/// Decodes the ratio getter's return data and applies BEP-703 §3.6.1's guard.
 ///
-/// The only client-side validation BEP-703 permits is "does it fit in a `u64`". The six
-/// invariants of BEP-703 §3.6.2 are the contract's to enforce on write; re-checking them here would
-/// stall this client on a configuration go-bsc happily accepts.
-pub fn decode_params(ret: &[u8]) -> Result<GovernanceParams, LaneError> {
-    // Deliberately no length check. The struct return is encoded inline — eight words, no
-    // outer offset — and the decoder rejects anything short. It ignores trailing words, and so
-    // does go-bsc, which has no length check either: were a later contract upgrade to append a
-    // ninth field, geth would keep importing while a stricter reth-bsc rejected every block
-    // from that point on. Matching go-bsc's tolerance is the safe direction.
-    let p = getPaymentLaneParamsCall::abi_decode_returns(ret)
-        .map_err(|e| corrupt(format!("getPaymentLaneParams decode: {e}")))?;
-
-    let fit = |name: &str, v: U256| {
-        u64::try_from(v)
-            .map_err(|_| corrupt(format!("payment lane param {name} does not fit u64: {v}")))
-    };
-    Ok(GovernanceParams {
-        min_ratio: fit("paymentLaneMinRatio", p.paymentLaneMinRatio)?,
-        max_ratio: fit("paymentLaneMaxRatio", p.paymentLaneMaxRatio)?,
-        expand_trigger: fit("expandTriggerRatio", p.expandTriggerRatio)?,
-        shrink_trigger: fit("shrinkTriggerRatio", p.shrinkTriggerRatio)?,
-        expand_step: fit("expandStepRatio", p.expandStepRatio)?,
-        shrink_step: fit("shrinkStepRatio", p.shrinkStepRatio)?,
-        min_gas: fit("paymentLaneMin", p.paymentLaneMin)?,
-        max_gas: fit("paymentLaneMax", p.paymentLaneMax)?,
-    })
+/// The guard runs on the returned `uint256`, never on a value narrowed to 64 bits first: a
+/// truncated value can land inside the guard when the value returned did not.
+pub fn decode_ratio(ret: &[u8]) -> Result<u64, LaneError> {
+    let value = getPaymentLaneRatioCall::abi_decode_returns(ret)
+        .map_err(|e| corrupt(format!("getPaymentLaneRatio decode: {e}")))?;
+    check_ratio(value)
 }
 
 /// Folds the paged `getPaymentContracts` walk into one set, rejecting every inconsistency.
@@ -227,9 +203,11 @@ mod tests {
         w.finish()
     }
 
+    /// Pinned against the deployed dispatcher of `bsc-genesis-contract` PaymentLane: a wrong
+    /// selector reads a different function and the whole lane silently changes meaning.
     #[test]
     fn payment_lane_getter_selectors_match_the_contract() {
-        assert_eq!(getPaymentLaneParamsCall::SELECTOR, hex!("ff620147"));
+        assert_eq!(getPaymentLaneRatioCall::SELECTOR, hex!("c988aaf7"));
         assert_eq!(getPaymentContractsCall::SELECTOR, hex!("08fcc45a"));
     }
 
@@ -242,69 +220,35 @@ mod tests {
         assert_eq!(call.limit, U256::from(PAGE_SIZE));
     }
 
-    /// Eight distinct sentinels, deliberately not `DEFAULT_PARAMS`: the defaults repeat 200 for
-    /// both `min_ratio` and `expand_step`, so transposing those two fields would pass unnoticed.
     #[test]
-    fn payment_lane_params_decode_in_contract_order() {
-        let mut ret = Vec::new();
-        for v in 1..=8u64 {
-            ret.extend_from_slice(&word(v));
-        }
-        assert_eq!(
-            decode_params(&ret).unwrap(),
-            GovernanceParams {
-                min_ratio: 1,
-                max_ratio: 2,
-                expand_trigger: 3,
-                shrink_trigger: 4,
-                expand_step: 5,
-                shrink_step: 6,
-                min_gas: 7,
-                max_gas: 8,
-            }
-        );
+    fn payment_lane_ratio_decodes_and_is_guarded() {
+        // The contract applies §3.6.1's default itself, so 500 is what an untouched slot
+        // returns over the wire — this client never substitutes a default of its own.
+        assert_eq!(decode_ratio(&word(500)), Ok(500));
+        assert_eq!(decode_ratio(&word(1_000)), Ok(1_000));
+
+        // Zero never reaches a node: the getter maps it to the default. If one ever did, it
+        // must be rejected rather than turned into a lane of nothing.
+        assert!(matches!(decode_ratio(&word(0)), Err(LaneError::CorruptConfig(_))));
+        assert!(matches!(decode_ratio(&word(1_001)), Err(LaneError::CorruptConfig(_))));
+
+        // 2^64 + 500 narrows to a legal 500; the guard runs before any narrowing.
+        let wraps = ((U256::from(1u64) << 64u32) + U256::from(500u64)).to_be_bytes::<32>();
+        assert!(matches!(decode_ratio(&wraps), Err(LaneError::CorruptConfig(_))));
+
+        // Short or absent return data is the decoder's own error, and stays an error.
+        assert!(matches!(decode_ratio(&[]), Err(LaneError::CorruptConfig(_))));
+        assert!(matches!(decode_ratio(&word(500)[..31]), Err(LaneError::CorruptConfig(_))));
     }
 
+    /// The quota is the only thing the ratio is used for, and it must scale with *this*
+    /// block's gas limit — not the parent's.
     #[test]
-    fn payment_lane_params_tolerate_trailing_words_but_not_short_data() {
-        let eight = [0u8; 32 * 8];
-        assert!(decode_params(&eight).is_ok());
-        // A ninth word is ignored, matching go-bsc. Rejecting it would halt this client on a
-        // contract upgrade geth keeps importing through.
-        let mut nine = eight.to_vec();
-        nine.extend_from_slice(&word(1));
-        assert!(decode_params(&nine).is_ok());
-        // Short data is the decoder's own error, and stays an error.
-        assert!(matches!(decode_params(&eight[..32 * 7]), Err(LaneError::CorruptConfig(_))));
-        assert!(matches!(decode_params(&[]), Err(LaneError::CorruptConfig(_))));
-    }
-
-    #[test]
-    fn payment_lane_params_reject_values_over_u64() {
-        // Every field, not just the first: a truncated `max_gas` yields a different quota
-        // ceiling and every block then fails on the derived-vs-committed comparison.
-        for i in 0..8 {
-            let mut ret = [0u8; 32 * 8];
-            ret[i * 32..(i + 1) * 32].copy_from_slice(&U256::MAX.to_be_bytes::<32>());
-            assert!(
-                matches!(decode_params(&ret), Err(LaneError::CorruptConfig(_))),
-                "field {i} accepted a value over u64"
-            );
-        }
-    }
-
-    #[test]
-    fn payment_lane_params_are_not_checked_against_bep_invariants() {
-        // BEP-703 §3.6.2's invariants are the contract's to enforce on write. Checking them here
-        // would stall this client on a configuration go-bsc accepts.
-        let bad = [9_000u64, 9_000, 9_000, 1, 10_000, 10_000, u64::MAX, 0];
-        let mut ret = Vec::new();
-        for v in bad {
-            ret.extend_from_slice(&word(v));
-        }
-        let p = decode_params(&ret).unwrap();
-        assert_eq!(p.max_ratio + p.expand_trigger, 18_000); // way over RATIO_DENOM
-        assert!(p.min_gas > p.max_gas);
+    fn payment_lane_meta_quota_scales_with_the_block_gas_limit() {
+        let meta = LaneMeta { ratio: 500, listed: Arc::new(HashSet::default()) };
+        assert_eq!(meta.quota(55_000_000), 2_750_000);
+        assert_eq!(meta.quota(70_000_000), 3_500_000);
+        assert_eq!(meta.quota(0), 0);
     }
 
     #[test]

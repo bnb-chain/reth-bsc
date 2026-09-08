@@ -1,5 +1,4 @@
 use super::config::evm_env_for_header;
-use crate::metrics::LANE_METRICS;
 use super::executor::BscBlockExecutor;
 use super::factory::BscEvmFactory;
 use crate::evm::transaction::BscTxEnv;
@@ -18,9 +17,8 @@ use crate::consensus::parlia::{VoteAddress, Snapshot, DIFF_INTURN, DIFF_NOTURN};
 use crate::consensus::parlia::util::{is_breathe_block, debug_header};
 use crate::consensus::parlia::vote::MAX_ATTESTATION_EXTRA_LENGTH;
 use crate::consensus::payment_lane::{
-    meta::{contracts_calldata, decode_params, params_calldata, LaneMeta, PageWalk},
-    Budget, Commitment, GovernanceParams, Signal, GETTER_GAS_LIMIT, LaneError,
-    PAYMENT_LANE_CONTRACT,
+    meta::{contracts_calldata, decode_ratio, ratio_calldata, LaneMeta, PageWalk},
+    Budget, LaneError, GETTER_GAS_LIMIT, PAYMENT_LANE_CONTRACT,
 };
 use crate::node::evm::executor::LaneState;
 use crate::node::evm::error::{lane_reject, BscBlockExecutionError, BscBlockValidationError};
@@ -61,14 +59,6 @@ type LaneMetaCache = LruMap<BlockHash, LaneMeta, ByLength>;
 static LANE_META_CACHE: LazyLock<Mutex<LaneMetaCache>> = LazyLock::new(|| {
     Mutex::new(LruMap::new(ByLength::new(1024)))
 });
-
-/// The governance parameters cached for `parent_hash`.
-///
-/// A peek, never a load: callers outside the executor have no EVM open on the parent state, so
-/// a miss means "unknown", not "no lane".
-pub(crate) fn cached_lane_params(parent_hash: BlockHash) -> Option<GovernanceParams> {
-    LANE_META_CACHE.lock().unwrap().get(&parent_hash).map(|m| m.params)
-}
 
 /// Runs a read-only system-contract call in `header`'s env over `header`'s post-state.
 fn view_call_at_header<DB, Spec>(
@@ -215,19 +205,17 @@ where
 
         self.verify_cascading_fields(&header, &parent_header, &snap)?;
 
-        // BEP-703 check #5. The activation block loads no lane state.
-        if self.spec.commits_payment_lane(parent_header.number, parent_header.timestamp) {
+        // BEP-703: derive this block's reservation from the ratio in the parent's post-state
+        // and this block's gas limit. Nothing in the header says what it is, so there is
+        // nothing to adjudicate here — the verdict is the accounting rule, checked in
+        // `post_check_new_block` once every transaction has run.
+        //
+        // The lane applies iff the PARENT is at or after Jenner, so the activation block itself
+        // loads no lane state.
+        if self.spec.payment_lane_applies(parent_header.number, parent_header.timestamp) {
             let meta = self.load_lane_meta()?;
-            let committed = Commitment::decode(header.ommers_hash).map_err(lane_reject)?;
-            Signal::from_parent(&parent_header)
-                .and_then(|s| {
-                    s.check_next_lane_quota(committed.quota, &meta.params, header.gas_limit)
-                })
-                .map_err(lane_reject)?;
-            self.inner_ctx.payment_lane = Some(LaneState {
-                meta,
-                budget: Budget { quota: committed.quota, used: 0 },
-            });
+            let quota = meta.quota(header.gas_limit);
+            self.inner_ctx.payment_lane = Some(LaneState { meta, budget: Budget { quota, used: 0 } });
         }
 
         let epoch_length = snap.epoch_num;
@@ -364,41 +352,43 @@ where
         let tx_env =
             view_call_tx_env(to, data.clone(), GETTER_GAS_LIMIT, self.spec.chain().id());
 
+        // Every exit routes through `lane_reject`, so the local-fault / consensus-verdict split
+        // is counted and logged in one place rather than at each call site.
         let result = match self.evm.transact(tx_env.into_tx_env()) {
             Ok(result_and_state) => result_and_state.result,
-            Err(err) => {
-                return Err(BscBlockExecutionError::PaymentLaneStateUnavailable(err.to_string())
-                    .into())
-            }
+            Err(err) => return Err(lane_reject(LaneError::StateUnavailable(err.to_string())).into()),
         };
 
         if !result.is_success() {
             // The reason only: this string reaches the consensus layer, and return data can run
             // to megabytes.
-            return Err(LaneError::CorruptConfig(match result {
+            return Err(lane_reject(LaneError::CorruptConfig(match result {
                 ExecutionResult::Revert { .. } => format!("getter at {to} reverted"),
                 ExecutionResult::Halt { reason, .. } => {
                     format!("getter at {to} halted: {reason:?}")
                 }
                 ExecutionResult::Success { .. } => unreachable!("checked above"),
-            })
+            }))
             .into());
         }
         match result.into_output() {
             Some(output) if !output.is_empty() => Ok(output),
-            _ => Err(LaneError::CorruptConfig(format!("getter at {to} returned no data")).into()),
+            _ => Err(lane_reject(LaneError::CorruptConfig(format!(
+                "getter at {to} returned no data"
+            )))
+            .into()),
         }
     }
 
-    /// Reads lane parameters and the payment contract list from `0x2007`.
+    /// Reads the lane ratio and the payment contract list from `0x2007` (BEP-703 §3.6.4).
     ///
     /// Must run on the parent state before this block mutates state. Results are cached by
     /// `parent_hash`, and the guard below rejects late reads.
     pub(crate) fn load_lane_meta(&mut self) -> Result<LaneMeta, BlockExecutionError> {
         if !self.db_at_parent_state {
-            return Err(BscBlockExecutionError::PaymentLaneStateUnavailable(
+            return Err(lane_reject(LaneError::StateUnavailable(
                 "payment lane read after this block mutated state".into(),
-            )
+            ))
             .into());
         }
         let parent_hash = self.ctx.base.parent_hash;
@@ -406,9 +396,8 @@ where
             return Ok(hit.clone());
         }
 
-        let params =
-            decode_params(&self.lane_eth_call(PAYMENT_LANE_CONTRACT, params_calldata())?)
-                .map_err(lane_reject)?;
+        let ratio = decode_ratio(&self.lane_eth_call(PAYMENT_LANE_CONTRACT, ratio_calldata())?)
+            .map_err(lane_reject)?;
 
         let mut walk = PageWalk::default();
         let mut offset = 0u64;
@@ -421,7 +410,7 @@ where
         }
         let listed = walk.finish().map_err(lane_reject)?;
 
-        let meta = LaneMeta { params, listed: std::sync::Arc::new(listed) };
+        let meta = LaneMeta { ratio, listed: std::sync::Arc::new(listed) };
         LANE_META_CACHE.lock().unwrap().insert(parent_hash, meta.clone());
         Ok(meta)
     }
@@ -778,35 +767,21 @@ where
             self.inner_ctx.snap = Some(snap.clone());
         }
 
-        // Producer-side lane bootstrap. Use the sealed block gas limit, not the reserved miner
-        // gas limit, so producer and importer derive the same quota.
+        // Producer-side lane bootstrap. Use the sealed block gas limit, not the miner's
+        // system-tx-reserved gas limit, so producer and importer derive the same quota.
         if self.ctx.mode.finalizes()
-            && self.spec.commits_payment_lane(parent_header.number, parent_header.timestamp)
+            && self.spec.payment_lane_applies(parent_header.number, parent_header.timestamp)
         {
             let meta = self.load_lane_meta()?;
-            let quota = Signal::from_parent(&parent_header)
-                .map_err(lane_reject)?
-                .next_lane_quota(&meta.params, block.gas_limit());
-
-            let b = crate::consensus::payment_lane::rules::bounds(&meta.params, block.gas_limit());
-            LANE_METRICS.quota.set(quota as f64);
-            LANE_METRICS.floor.set(b.floor as f64);
-            LANE_METRICS.ceiling.set(b.ceiling as f64);
-            LANE_METRICS.cap.set(b.reserve_cap as f64);
-            // Log the bootstrap read once.
-            if parent_header.ommers_hash == alloy_consensus::EMPTY_OMMER_ROOT_HASH {
-                tracing::info!(
-                    target: "bsc::payment_lane",
-                    block = block.number().to::<u64>(),
-                    params = ?meta.params,
-                    floor = b.floor,
-                    ceiling = b.ceiling,
-                    cap = b.reserve_cap,
-                    listed = meta.listed.len(),
-                    "payment lane active"
-                );
-            }
-
+            let quota = meta.quota(block.gas_limit());
+            tracing::debug!(
+                target: "bsc::payment_lane",
+                block = block.number().to::<u64>(),
+                ratio = meta.ratio,
+                quota,
+                listed = meta.listed.len(),
+                "payment lane active"
+            );
             self.inner_ctx.payment_lane =
                 Some(LaneState { meta, budget: Budget { quota, used: 0 } });
         }

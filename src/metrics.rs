@@ -349,12 +349,6 @@ pub struct BscPaymentLaneMetrics {
     pub quota: Gauge,
     /// paymentlane/paymentLaneIdle
     pub idle: Gauge,
-    /// paymentlane/paymentLaneFloor
-    pub floor: Gauge,
-    /// paymentlane/paymentLaneCeiling
-    pub ceiling: Gauge,
-    /// paymentlane/paymentLaneCap
-    pub cap: Gauge,
 
     /// paymentlane/rejected
     pub rejected: Counter,
@@ -364,8 +358,6 @@ pub struct BscPaymentLaneMetrics {
     pub general_lane_yielded: Counter,
     /// paymentlane/produceDeclined
     pub produce_declined: Counter,
-    /// paymentlane/bidBlockDeclined
-    pub bid_block_declined: Counter,
 }
 
 /// Process-wide payment lane metrics shared by execution, validation, and mining.

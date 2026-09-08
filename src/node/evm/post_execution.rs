@@ -1,6 +1,5 @@
 use super::executor::BscBlockExecutor;
 use crate::metrics::LANE_METRICS;
-use crate::consensus::payment_lane::Commitment;
 use super::error::{BscBlockExecutionError, BscBlockValidationError};
 use super::util::set_nonce;
 use super::config::{revm_spec_by_timestamp_and_block_number, BscExecutionMode};
@@ -170,20 +169,18 @@ where
                     header.number, header.hash_slow(), epoch_length, turn_length);
             }
         }
-        // BEP-703 check #6, and it must be LAST. This function issues and executes system
+        // BEP-703's block rule, and it must be LAST. This function issues and executes system
         // transactions of its own, each adding to `self.gas_used`, so only here does
         // `self.gas_used` equal `header.gas_used`. Run it at the top and 1-12M of system gas
-        // goes unaccounted.
+        // goes unaccounted — Parlia's system gas is general gas under BEP-703 §3.3.
         if let Some(lane) = self.inner_ctx.payment_lane.as_ref() {
-            let committed =
-                Commitment::decode(header.ommers_hash).map_err(crate::node::evm::error::lane_reject)?;
             lane.budget
-                .verify_commitment(header.gas_limit, self.gas_used, &committed)
+                .verify(header.gas_limit, self.gas_used)
                 .map_err(crate::node::evm::error::lane_reject)?;
             // Only after the block is accepted: publishing these for a rejected block would
             // report numbers no peer agrees with.
-            LANE_METRICS.imported_quota.set(committed.quota as f64);
-            LANE_METRICS.imported_payment_gas_used.set(committed.payment_gas_used as f64);
+            LANE_METRICS.imported_quota.set(lane.budget.quota as f64);
+            LANE_METRICS.imported_payment_gas_used.set(lane.budget.used as f64);
             LANE_METRICS.imported_idle.set(lane.budget.idle() as f64);
         }
 

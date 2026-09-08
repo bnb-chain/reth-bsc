@@ -593,7 +593,6 @@ lazy_static! {
         read_all_system_contracts(&bsc_testnet());
     pub(crate) static ref BSC_QANET_CONTRACTS: HashMap<String, HashMap<Address, Option<Bytecode>>> =
         read_all_system_contracts(&bsc_qanet());
-
 }
 
 /// System contracts with their names as keys and addresses as values.
@@ -1243,7 +1242,6 @@ mod tests {
     fn test_pasteur_system_contract_upgrade() {
         // The Pasteur upgrade swaps exactly StakeHub (0x2002) and Governor (0x2004) on every
         // network, with non-empty genesis-contract v1.2.6 bytecode.
-
         for spec in [bsc_mainnet(), bsc_testnet(), bsc_qanet()] {
             let res = get_system_contract_codes(&spec, BscHardfork::Pasteur.name()).unwrap();
             assert_eq!(res.len(), 2, "Pasteur upgrades only StakeHub and Governor");
@@ -1293,9 +1291,11 @@ mod tests {
 
         use sha2::{Digest, Sha256};
 
-        // bsc-genesis-contract@aaa092b, solc 0.8.17.
+        // The exact bytecode go-bsc embeds, from the commit its `jennerUpgrade` cites:
+        // bsc-genesis-contract@45912f550f2027c4af141f94ccb9733177d5603d, solc 0.8.17. A
+        // one-byte difference here is a different state root on the activation block.
         const WANT_SHA256: &str =
-            "2e0fa3189b43957fcf25c9bec3e83f52a5bd5115f1e5f1cb3f6782c5ea1c1fcc";
+            "8fd1686e0e53d7d6840d05ac4a3a1da1d322c3a742012428eaa63b6931add259";
 
         for spec in [bsc_mainnet(), bsc_testnet(), bsc_qanet()] {
             let res = get_system_contract_codes(&spec, BscHardfork::Jenner.name()).unwrap();
@@ -1303,7 +1303,7 @@ mod tests {
 
             let code = res.get(&PAYMENT_LANE_CONTRACT).expect("PaymentLane present");
             let bytes = code.as_ref().unwrap().original_bytes();
-            assert_eq!(bytes.len(), 5248);
+            assert_eq!(bytes.len(), 3249);
             assert_eq!(hex::encode(Sha256::digest(bytes)), WANT_SHA256);
         }
     }

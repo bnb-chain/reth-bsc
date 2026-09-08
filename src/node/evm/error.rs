@@ -293,9 +293,6 @@ mod tests {
 
         for verdict in [
             LaneError::CorruptConfig("total changed mid-walk".into()),
-            LaneError::QuotaMismatch { committed: 1, derived: 2 },
-            LaneError::Untruthy { committed: 1, actual: 2 },
-            LaneError::BadCommitment(B256::ZERO),
             LaneError::Violated { gas_limit: 1, gas_used: 2, quota: 3, payment_gas_used: 4 },
         ] {
             let message = verdict.to_string();

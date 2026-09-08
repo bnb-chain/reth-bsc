@@ -1,74 +1,50 @@
-//! Payment lane arithmetic, classification and the commitment codec.
+//! Payment lane arithmetic, classification and the block accounting rule.
 //!
-//! The quota is an accumulator: a single disagreement with go-bsc never reconverges, so the
-//! comments below mark the places where the obvious simplification is the divergence.
+//! Mirrors go-bsc's `core/paymentlane` term for term. Every function here is a pure function of
+//! its arguments; a single disagreement with go-bsc splits the chain, so the comments mark the
+//! places where the obvious simplification is the divergence.
 
-use super::{
-    Bounds, Budget, Commitment, GovernanceParams, Lane, LaneError, OmmersHashError, ParentSignal,
-    RATIO_DENOM, SYSTEM_TXS_GAS_HARD_LIMIT, Signal,
-};
-use alloy_consensus::{Header, constants::EMPTY_OMMER_ROOT_HASH};
-use alloy_primitives::{Address, B256, U256, map::HashSet};
+use super::{Budget, Lane, LaneError, MAX_LANE_RATIO, RATIO_DENOM};
+use alloy_primitives::{map::HashSet, Address, U256};
 
-/// `floor(a * b / d)` over 128 bits, saturating.
+/// BEP-703 §3.6.1's guard, applied at the getter's full `uint256` width.
 ///
-/// `d == 0` returns `u64::MAX` to match go-bsc's `hi >= d` guard; Rust would panic.
-fn mul_div_floor(a: u64, b: u64, d: u64) -> u64 {
-    if d == 0 {
-        return u64::MAX;
-    }
-    u64::try_from(a as u128 * b as u128 / d as u128).unwrap_or(u64::MAX)
-}
-
-/// `a * b >= c * d`, exactly, without dividing.
-///
-/// 128-bit because both products wrap at a consensus-legal gas limit: `8000 * 2^62` is zero
-/// in 64 bits, which turns every contraction into an expansion.
-fn gte(a: u64, b: u64, c: u64, d: u64) -> bool {
-    a as u128 * b as u128 >= c as u128 * d as u128
-}
-
-/// Upper clamp: the tighter of the ratio bound and the absolute bound.
-fn lane_ceiling(p: &GovernanceParams, gas_limit: u64) -> u64 {
-    mul_div_floor(p.max_ratio, gas_limit, RATIO_DENOM).min(p.max_gas)
-}
-
-/// Lower clamp, itself clamped to the ceiling.
-///
-/// `min_gas` can exceed `max_ratio * gas_limit`, so without the inner `min` the floor would
-/// exceed the ceiling and the `min(max(..))` chains below would panic. `payment_lane_clamp_grid`.
-fn lane_floor(p: &GovernanceParams, gas_limit: u64) -> u64 {
-    mul_div_floor(p.min_ratio, gas_limit, RATIO_DENOM)
-        .max(p.min_gas)
-        .min(lane_ceiling(p, gas_limit))
-}
-
-/// The gas the quota must leave for Parlia's system transactions.
-///
-/// Applied last, and allowed below the floor: at a low gas limit a breathe block would not
-/// otherwise fit, and that halt does not clear on its own.
-fn reserve_cap(gas_limit: u64) -> u64 {
-    gas_limit.saturating_sub(SYSTEM_TXS_GAS_HARD_LIMIT)
-}
-
-/// The three clamps `next_lane_quota` applies.
-pub fn bounds(p: &GovernanceParams, gas_limit: u64) -> Bounds {
-    Bounds {
-        floor: lane_floor(p, gas_limit),
-        ceiling: lane_ceiling(p, gas_limit),
-        reserve_cap: reserve_cap(gas_limit),
+/// Narrowing first is the bug the spec calls out: `2^64 + 500` truncates to `500`, which is
+/// inside the guard when the value returned was not.
+pub fn check_ratio(ratio: U256) -> Result<u64, LaneError> {
+    match u64::try_from(ratio) {
+        Ok(r) if r > 0 && r <= MAX_LANE_RATIO => Ok(r),
+        _ => Err(LaneError::CorruptConfig(format!(
+            "payment lane ratio {ratio} outside 0 < ratio <= {MAX_LANE_RATIO}"
+        ))),
     }
 }
 
-/// The block validity rule: `general_gas_used + max(payment_gas_used, quota) <= gas_limit`,
-/// rewritten with `general_gas_used` as the header residual.
+/// `paymentLaneQuota(h) = PAYMENT_LANE_RATIO(h−1) × GasLimit(h) / RATIO_DENOM`.
 ///
-/// Not self-sufficient. The equivalence holds only while `payment_gas_used <= gas_used`, so
-/// callers must run that bound first — see [`Commitment::check_header_bounds`].
+/// 128-bit intermediate, as BEP-703 §3.4.2 requires: consensus bounds `gas_limit` only by
+/// `2^63 − 1`, so at the maximum ratio the product needs 73 bits and a 64-bit multiply wraps
+/// into a quota nobody else derives.
+///
+/// Saturating rather than panicking: `check_ratio` already caps the ratio far below
+/// `RATIO_DENOM`, so the clamp is unreachable — it exists so a future caller that skips the
+/// guard degrades the way go-bsc's `hi >= RatioDenom` branch does instead of aborting the node.
+pub fn quota(ratio: u64, gas_limit: u64) -> u64 {
+    u64::try_from(ratio as u128 * gas_limit as u128 / RATIO_DENOM as u128).unwrap_or(u64::MAX)
+}
+
+/// The block validity rule of BEP-703 §3.3, with `general_gas_used` as the header residual:
+///
+/// ```text
+/// gas_used + max(0, quota - payment_gas_used) <= gas_limit
+/// ```
+///
+/// Parlia's system transactions are general, so their gas sits in `gas_used` and falls on the
+/// general side by construction.
 ///
 /// `checked_add`, not `saturating_add`: at `gas_limit == u64::MAX` a saturating sum compares
 /// equal and would accept a block go-bsc rejects on carry.
-fn check_inequality(
+pub fn check_inequality(
     gas_limit: u64,
     gas_used: u64,
     payment_gas_used: u64,
@@ -81,156 +57,14 @@ fn check_inequality(
     }
 }
 
-impl Commitment {
-    /// `[0..8]` quota, `[8..16]` payment gas used, `[16..32]` zero.
-    pub fn encode(&self) -> B256 {
-        let mut out = [0u8; 32];
-        out[0..8].copy_from_slice(&self.quota.to_be_bytes());
-        out[8..16].copy_from_slice(&self.payment_gas_used.to_be_bytes());
-        B256::from(out)
-    }
-
-    /// Inverse of [`Self::encode`]. Rejects a non-zero reserved tail, which is what keeps a
-    /// commitment from ever equalling `EMPTY_OMMER_ROOT_HASH`.
-    pub fn decode(h: B256) -> Result<Self, LaneError> {
-        if h[16..32].iter().any(|b| *b != 0) {
-            return Err(LaneError::BadCommitment(h));
-        }
-        Ok(Self {
-            quota: u64::from_be_bytes(h[0..8].try_into().expect("8 bytes")),
-            payment_gas_used: u64::from_be_bytes(h[8..16].try_into().expect("8 bytes")),
-        })
-    }
-
-    /// Whether this header claims an empty ommers list. Looser than [`Self::decode`]: it also
-    /// accepts `EMPTY_OMMER_ROOT_HASH`, so a caller with no parent header can check the shape
-    /// without rejecting the activation block, which is post-Jenner yet still carries that hash.
-    pub fn commits_no_uncles(h: B256) -> bool {
-        h == EMPTY_OMMER_ROOT_HASH || h[16..32].iter().all(|b| *b == 0)
-    }
-
-    /// The order is load-bearing — [`check_inequality`] is only equivalent to the spec's rule
-    /// once `payment_gas_used <= gas_used` has been established.
-    pub fn check_header_bounds(&self, gas_used: u64, gas_limit: u64) -> Result<(), LaneError> {
-        if self.payment_gas_used > gas_used {
-            return Err(LaneError::Untruthy { committed: self.payment_gas_used, actual: gas_used });
-        }
-        if self.quota > gas_limit {
-            return Err(LaneError::Violated {
-                gas_limit,
-                gas_used,
-                quota: self.quota,
-                payment_gas_used: self.payment_gas_used,
-            });
-        }
-        check_inequality(gas_limit, gas_used, self.payment_gas_used, self.quota)
-    }
-}
-
-impl ParentSignal {
-    /// Whether the parent's congestion reached `trigger` basis points of its own gas limit.
-    fn reached(&self, trigger: u64) -> bool {
-        gte(self.signal_gas_used, RATIO_DENOM, trigger, self.gas_limit)
-    }
-
-    /// The parent's quota after one expand / shrink / hold step.
-    ///
-    /// `else if`, not two `if`s: BEP-703 §3.6 accepts parameters that violate its own
-    /// invariants, and with `shrink_trigger > expand_trigger` both predicates hold at once.
-    /// A zero gas limit is the bootstrap seed rather than a quiet parent — no signal, so no
-    /// step, but the quota carries over.
-    fn stepped(&self, p: &GovernanceParams, gas_limit: u64) -> u64 {
-        if self.gas_limit == 0 {
-            return self.lane_quota;
-        }
-        if self.reached(p.expand_trigger) {
-            self.lane_quota.saturating_add(mul_div_floor(p.expand_step, gas_limit, RATIO_DENOM))
-        } else if !self.reached(p.shrink_trigger) {
-            self.lane_quota.saturating_sub(mul_div_floor(p.shrink_step, gas_limit, RATIO_DENOM))
-        } else {
-            self.lane_quota
-        }
-    }
-}
-
-impl Signal {
-    /// Read the parent's congestion off its own header.
-    ///
-    /// Bootstrap is decided by the positive test `ommers_hash == EMPTY_OMMER_ROOT_HASH`, never
-    /// by a failed decode: reading a decode failure as bootstrap silently resets the
-    /// accumulator to the floor.
-    pub fn from_parent(parent: &Header) -> Result<Self, LaneError> {
-        if parent.ommers_hash == EMPTY_OMMER_ROOT_HASH {
-            return Ok(Self(None));
-        }
-        let c = Commitment::decode(parent.ommers_hash)?;
-        // Gas the parent spent outside the reservation. Plain `+`: the two terms sum to at
-        // most `max(parent.gas_used, c.payment_gas_used)`, so they cannot carry.
-        let signal_gas_used = parent.gas_used.saturating_sub(c.payment_gas_used)
-            + c.payment_gas_used.saturating_sub(c.quota);
-        Ok(Self(Some(ParentSignal {
-            lane_quota: c.quota,
-            signal_gas_used,
-            gas_limit: parent.gas_limit,
-        })))
-    }
-
-    /// The quota for the block after the one this signal describes.
-    ///
-    /// `gas_limit` is *that* block's: the thresholds divide by the parent's gas limit because
-    /// that is the block whose congestion is measured, while the step and all three clamps
-    /// scale by this block's because that is the block whose space is reserved.
-    pub fn next_lane_quota(&self, p: &GovernanceParams, gas_limit: u64) -> u64 {
-        let stepped = self.0.map_or(0, |parent| parent.stepped(p, gas_limit));
-        let b = bounds(p, gas_limit);
-        // Clamped every block, not only when a step fires, because the bounds track this
-        // block's gas limit. `reserve_cap` comes last and may land below the floor.
-        stepped.max(b.floor).min(b.ceiling).min(b.reserve_cap)
-    }
-
-    /// Adjudicate a committed quota. Decidable before any transaction runs, which is what
-    /// lets a validator check it before blind-signing a builder's block.
-    pub fn check_next_lane_quota(
-        &self,
-        committed: u64,
-        p: &GovernanceParams,
-        gas_limit: u64,
-    ) -> Result<(), LaneError> {
-        let derived = self.next_lane_quota(p, gas_limit);
-        if committed != derived {
-            return Err(LaneError::QuotaMismatch { committed, derived });
-        }
-        Ok(())
-    }
-}
-
-/// The whole `header.ommers_hash` rule for a caller that has the parent — checks #1-#4 once the
-/// parent is under the lane, and the empty ommers root before it.
+/// Classify one user transaction against BEP-703 §3.2's gates, in order.
 ///
-/// Both arms are one decision, which is why they live in one function: a caller that keeps only
-/// the first accepts a commitment on the activation block, and go-bsc rejects that. The import
-/// path and the BidBlock admission path both call this and map the failure to their own error
-/// type.
-pub fn check_ommers_hash_against_parent(
-    parent_commits_lane: bool,
-    header: &Header,
-) -> Result<(), OmmersHashError> {
-    if parent_commits_lane {
-        Commitment::decode(header.ommers_hash)
-            .and_then(|c| c.check_header_bounds(header.gas_used, header.gas_limit))?;
-        Ok(())
-    } else if header.ommers_hash == EMPTY_OMMER_ROOT_HASH {
-        Ok(())
-    } else {
-        Err(OmmersHashError::CommitmentBeforeFork(header.ommers_hash))
-    }
-}
-
-/// Classify one user transaction. Parlia's system transactions never reach here.
+/// Parlia's system transactions never reach here — the caller books them as general, which is
+/// go-bsc's `isSystemTransaction` gate.
 ///
-/// Gates run before any state read, and `code_at_to_is_empty` must be built fresh
-/// at each call site: the code gate's answer changes within a block — an address that gains
-/// code earlier in the same block is general by the time a transfer to it is classified.
+/// `code_at_to_is_empty` must read the **live** state and be built fresh at each call site: the
+/// code gate's answer changes within a block, so an address that gains code earlier in the same
+/// block is general by the time a transfer to it is classified. Memoizing by address is a fork.
 ///
 /// The closure returns **empty**, not "has code", and two encodings both mean empty: an absent
 /// account (reth's `basic()` gives `None`; go-bsc's `GetCodeHash` gives the zero hash, which is
@@ -257,7 +91,11 @@ pub fn classify(
     if value.is_zero() {
         return Ok(Lane::General);
     }
-    if code_at_to_is_empty(to)? { Ok(Lane::Payment) } else { Ok(Lane::General) }
+    if code_at_to_is_empty(to)? {
+        Ok(Lane::Payment)
+    } else {
+        Ok(Lane::General)
+    }
 }
 
 impl Budget {
@@ -274,667 +112,279 @@ impl Budget {
         }
     }
 
-    /// Whether this transaction may be included. Producer side only — the importer's only
-    /// lane gate is [`Self::verify_commitment`].
+    /// Whether this transaction may be included. Producer side only — the importer never
+    /// gates a transaction, it only checks the finished block with [`Self::verify`].
+    ///
+    /// `shared` is the gas still available to any lane, i.e. go-bsc's `gasPool.Gas()`.
     pub fn admits(&self, shared: u64, lane: Lane, tx_gas_limit: u64) -> bool {
         tx_gas_limit <= self.max_available_gas(shared, lane)
     }
 
-    /// Book a transaction's actual gas. Plain `+=`: overflow is unreachable, and a debug panic
-    /// beats go-bsc's silent wrap.
+    /// Book a transaction's actual gas. Plain `+=`: overflow is unreachable because `used`
+    /// tracks a subset of `gas_used`, and a debug panic beats go-bsc's silent wrap.
     pub fn record_used(&mut self, lane: Lane, delta: u64) {
         if lane == Lane::Payment {
             self.used += delta;
         }
     }
 
-    /// Check a finished block. `gas_used` is the header's total, system gas included.
+    /// Check a finished block. `gas_used` is the header's total, Parlia's system gas included.
     ///
-    /// The first branch catches swapped arguments; it is unreachable while `used` only
-    /// accumulates from user transactions.
+    /// The one verdict on this rule, and the same one on both sides: the importer's ruling on a
+    /// received block, and the producer's self-check before it seals.
     pub fn verify(&self, gas_limit: u64, gas_used: u64) -> Result<(), LaneError> {
-        if self.used > gas_used {
-            return Err(LaneError::Untruthy { committed: self.used, actual: gas_used });
-        }
         check_inequality(gas_limit, gas_used, self.used, self.quota)
     }
-
-    /// The authoritative check on a committed figure: compare it against local replay, so
-    /// `used` must come from replaying this block, never from the commitment.
-    ///
-    /// The quota comparison has no go-bsc counterpart — it leaves quota to
-    /// `check_next_lane_quota`. It only ever rejects more, and catches a commitment that was
-    /// not derived from this budget.
-    pub fn verify_commitment(
-        &self,
-        gas_limit: u64,
-        gas_used: u64,
-        c: &Commitment,
-    ) -> Result<(), LaneError> {
-        if c.quota != self.quota {
-            return Err(LaneError::QuotaMismatch { committed: c.quota, derived: self.quota });
-        }
-        if c.payment_gas_used != self.used {
-            return Err(LaneError::Untruthy {
-                committed: c.payment_gas_used,
-                actual: self.used,
-            });
-        }
-        self.verify(gas_limit, gas_used)
-    }
-
 }
 
 #[cfg(test)]
-#[allow(clippy::absurd_extreme_comparisons, clippy::if_same_then_else, clippy::manual_div_ceil)]
 mod tests {
     use super::*;
-    use crate::consensus::payment_lane::DEFAULT_PARAMS;
     use alloy_consensus::constants::KECCAK_EMPTY;
-    use alloy_primitives::b256;
 
-    fn parent_with(quota: u64, payment: u64, gas_limit: u64, gas_used: u64) -> Header {
-        Header {
-            ommers_hash: Commitment { quota, payment_gas_used: payment }.encode(),
-            gas_limit,
-            gas_used,
-            ..Default::default()
-        }
-    }
-
-    /// Build a Signal with an exact `signal_gas_used` by choosing parent gas_used.
-    /// signal = satSub(gasUsed, payment) + satSub(payment, quota); with payment=0 it is gasUsed.
-    fn signal_of(quota: u64, signal_gas_used: u64, parent_gas_limit: u64) -> Signal {
-        Signal::from_parent(&parent_with(quota, 0, parent_gas_limit, signal_gas_used)).unwrap()
-    }
-
+    /// BEP-703 §3.4's arithmetic, straight from go-bsc's `TestQuotaIsTheRatioOfTheGasLimit`.
     #[test]
-    fn payment_lane_trigger_thresholds() {
-        let gl = 55_000_000u64;
-        assert_eq!(mul_div_floor(DEFAULT_PARAMS.expand_step, gl, RATIO_DENOM), 1_100_000);
-        assert_eq!(mul_div_floor(DEFAULT_PARAMS.shrink_step, gl, RATIO_DENOM), 275_000);
-        let cases: &[(u64, u64)] = &[
-            (8000, 4_100_000),
-            (7999, 3_000_000),
-            (7000, 3_000_000),
-            (6999, 2_725_000),
-            (0, 2_725_000),
+    fn payment_lane_quota_is_the_ratio_of_the_gas_limit() {
+        let cases: &[(u64, u64, u64, &str)] = &[
+            (500, 55_000_000, 2_750_000, "§3.4.4's worked example: the default 5% of mainnet"),
+            (1_000, 55_000_000, 5_500_000, "the maximum ratio is 10%"),
+            (1, 55_000_000, 5_500, "the smallest settable ratio"),
+            (500, 0, 0, "no gas limit, no reservation"),
+            (500, 30_000_001, 1_500_000, "truncates toward zero rather than rounding"),
+            (
+                1_000,
+                i64::MAX as u64,
+                922_337_203_685_477_580,
+                "the product needs 73 bits and must not wrap",
+            ),
         ];
-        for &(bps, want) in cases {
-            // parametrisation A: parentGasLimit = 10_000 so signal == bps numerically
-            let a = signal_of(3_000_000, bps, 10_000).next_lane_quota(&DEFAULT_PARAMS, gl);
-            // parametrisation B: parentGasLimit = 55_000_000, signal scaled
-            let sig = mul_div_floor(bps, 55_000_000, RATIO_DENOM);
-            let b = signal_of(3_000_000, sig, 55_000_000).next_lane_quota(&DEFAULT_PARAMS, gl);
-            assert_eq!(a, want, "parametrisation A, bps {bps}");
-            assert_eq!(b, want, "parametrisation B, bps {bps}");
+        for &(ratio, gas_limit, want, why) in cases {
+            assert_eq!(quota(ratio, gas_limit), want, "quota({ratio}, {gas_limit}): {why}");
+            // The same value an arbitrary-precision reference computes.
+            let reference =
+                U256::from(ratio) * U256::from(gas_limit) / U256::from(RATIO_DENOM);
+            assert_eq!(U256::from(quota(ratio, gas_limit)), reference, "{why}");
         }
-        // the doc's warning: the A==B equivalence needs 10000 | gasLimit. Show it breaking.
-        let odd = 55_009_999u64;
-        let a = signal_of(3_000_000, 8000, 10_000).next_lane_quota(&DEFAULT_PARAMS, odd);
-        let sig = mul_div_floor(8000, odd, RATIO_DENOM);
-        let b = signal_of(3_000_000, sig, odd).next_lane_quota(&DEFAULT_PARAMS, odd);
-        assert_eq!(a, 4_100_199, "hand-computed: 3_000_000 + mul_div_floor(200, 55_009_999, 10000)");
-        assert_ne!(a, b, "the doc says this equivalence fails when 10000 does not divide gasLimit");
-        assert_eq!(b, 3_000_000, "signal lands one wei below the expand threshold => hysteresis");
     }
 
+    /// §3.6.1's guard, evaluated on the `uint256` the getter returned.
     #[test]
-    fn payment_lane_mul_div_floor() {
-        assert_eq!(mul_div_floor(200, 55_009_999, 10000), 1_100_199);
-        assert_eq!(mul_div_floor(800, 55_009_999, 10000), 4_400_799);
-        assert_eq!(mul_div_floor(2000, 55_009_999, 10000), 11_001_999);
-        assert_eq!(mul_div_floor(800, 54_999_999, 10000), 4_399_999);
-        assert_eq!(mul_div_floor(u64::MAX, u64::MAX, 10000), u64::MAX);
-        assert_eq!(mul_div_floor(1, 1, 0), u64::MAX);
+    fn payment_lane_ratio_guard_is_checked_at_full_width() {
+        for ok in [1u64, 500, MAX_LANE_RATIO] {
+            assert_eq!(check_ratio(U256::from(ok)), Ok(ok));
+        }
+        // 2^64 + 500 narrows to 500, which is inside the guard; at full width it is not.
+        let wraps = (U256::from(1u64) << 64) + U256::from(500u64);
+        for bad in [U256::ZERO, U256::from(MAX_LANE_RATIO + 1), wraps, U256::MAX] {
+            assert!(
+                matches!(check_ratio(bad), Err(LaneError::CorruptConfig(_))),
+                "ratio {bad} must fail the guard"
+            );
+        }
     }
 
+    /// go-bsc's `TestLaneIsFloorNotCeiling`: the rule's boundary cases, all six of them.
     #[test]
-    fn payment_lane_bootstrap_and_cap() {
-        assert_eq!(Signal(None).next_lane_quota(&DEFAULT_PARAMS, 55_000_000), 2_000_000);
-        assert_eq!(Signal(None).next_lane_quota(&DEFAULT_PARAMS, SYSTEM_TXS_GAS_HARD_LIMIT), 0);
-        assert_eq!(bounds(&DEFAULT_PARAMS, 70_000_000).ceiling, 5_600_000);
-        assert_eq!(
-            Signal(None).check_next_lane_quota(0, &DEFAULT_PARAMS, SYSTEM_TXS_GAS_HARD_LIMIT),
-            Ok(())
-        );
-        // boundary 7: parent HAS a commitment but gas_limit == 0
-        let s = Signal::from_parent(&parent_with(3_000_000, 0, 0, 12_345_678)).unwrap();
-        let got = s.next_lane_quota(&DEFAULT_PARAMS, 55_000_000);
-        let b = bounds(&DEFAULT_PARAMS, 55_000_000);
-        assert_eq!(got, 3_000_000u64.max(b.floor).min(b.ceiling));
-        assert_ne!(got, b.floor.min(b.reserve_cap), "must NOT restart from next = 0");
+    fn payment_lane_is_a_floor_not_a_ceiling() {
+        const LIMIT: u64 = 100;
+        const LANE: u64 = 20;
+        let cases: &[(u64, u64, bool, &str)] = &[
+            (80, 20, false, "payment exactly fills the quota, the terms sum to exactly GasLimit"),
+            (79, 21, false, "payment one gas over, general one gas under"),
+            (81, 19, true, "payment one gas short does not hand the freed quota to general"),
+            (80, 0, false, "with no payment demand the quota idles"),
+            (81, 0, true, "general does not get the idling quota"),
+            (0, 100, false, "the quota is a floor, not a ceiling: payment may take the block"),
+        ];
+        for &(general, payment, want_err, why) in cases {
+            let got = check_inequality(LIMIT, general + payment, payment, LANE);
+            assert_eq!(got.is_err(), want_err, "{why}: {got:?}");
+        }
     }
 
-    /// A parent with a commitment but `gas_limit == 0` keeps its quota; it is not a bootstrap.
-    ///
-    /// A parent that carries a commitment but has `gas_limit == 0` keeps its quota: only the
-    /// step is skipped. Collapsing that into bootstrap would start from zero and derive the
-    /// floor instead, which is a permanent split.
+    /// go-bsc's `TestOverflowIsNotAWayIn`: the carry must reject, never wrap into acceptance.
     #[test]
-    fn payment_lane_zero_parent_gas_limit_keeps_quota() {
-        let parent = parent_with(3_000_000, 0, 0, 0);
-        let signal = Signal::from_parent(&parent).unwrap();
-
-        let gl = 55_000_000u64;
-        let b = bounds(&DEFAULT_PARAMS, gl);
-        assert_eq!(signal.next_lane_quota(&DEFAULT_PARAMS, gl), 3_000_000);
-        assert_ne!(
-            signal.next_lane_quota(&DEFAULT_PARAMS, gl),
-            b.floor.min(b.reserve_cap),
-            "must not collapse to min(floor, cap) = 2_000_000"
-        );
-
-        // The same parent with a real gas limit sees a zero signal, so it shrinks.
-        let parent = parent_with(3_000_000, 0, 55_000_000, 0);
-        assert_eq!(
-            Signal::from_parent(&parent).unwrap().next_lane_quota(&DEFAULT_PARAMS, gl),
-            2_725_000
-        );
+    fn payment_lane_overflow_is_not_a_way_in() {
+        const GAS_LIMIT: u64 = 70_000_000;
+        let max = u64::MAX;
+        for &(gas_used, payment, lane) in &[
+            (max, 0u64, 0u64),
+            (GAS_LIMIT, 0, max),
+            (max / 2 + 1, 0, max / 2 + 1),
+            (GAS_LIMIT + 1, 0, 0),
+        ] {
+            assert!(
+                check_inequality(GAS_LIMIT, gas_used, payment, lane).is_err(),
+                "gas_used={gas_used} payment={payment} quota={lane} must be a violation"
+            );
+        }
+        // A quota fully consumed by payment gas leaves nothing idle, whatever its size.
+        assert!(check_inequality(GAS_LIMIT, 1000, max, max).is_ok());
     }
 
-    /// The reserve cap is the only clamp allowed to push the quota below its own floor, and
-    /// at a low enough gas limit it does.
+    /// go-bsc's `TestVerifyFailureTriggers`.
     #[test]
-    fn payment_lane_reserve_cap_pushes_below_floor() {
-        let gl = 21_000_000u64;
-        let b = bounds(&DEFAULT_PARAMS, gl);
-        assert_eq!((b.floor, b.ceiling, b.reserve_cap), (1_680_000, 1_680_000, 1_000_000));
-
-        let signal = Signal::from_parent(&parent_with(3_000_000, 0, 0, 0)).unwrap();
-        let quota = signal.next_lane_quota(&DEFAULT_PARAMS, gl);
-        assert_eq!(quota, 1_000_000);
-        assert!(quota < b.floor, "the outer min must push below the floor");
+    fn payment_lane_verify_failure_triggers() {
+        let cases: &[(Budget, u64, bool, &str)] = &[
+            (Budget { quota: 20, used: 20 }, 80, false, "consistent and valid"),
+            (Budget { quota: 200, used: 0 }, 0, true, "the quota does not fit this block"),
+            (
+                Budget { quota: 20, used: 20 },
+                101,
+                true,
+                "system gas overran the reservation and burst the block",
+            ),
+        ];
+        for (budget, gas_used, want_err, why) in cases {
+            assert_eq!(budget.verify(100, *gas_used).is_err(), *want_err, "{why}");
+        }
     }
 
-    /// The signal's second term: gas the parent spent *beyond* its quota.
-    ///
-    /// The lane is a floor, not a ceiling — a block may spend its whole gas limit on payments —
-    /// so that overspill is congestion and has to reach the trigger comparison. No other vector
-    /// has `payment_gas_used > quota`, which means deleting the term outright goes unnoticed
-    /// everywhere else, including against go-bsc's own generated chain.
+    /// go-bsc's `TestAdmissionIsExactlyTight`, shrunk: admission must agree exactly with
+    /// post-transaction validity, so a producer never drops a transaction go-bsc would pack and
+    /// never packs one go-bsc's own self-check would refuse.
     #[test]
-    fn payment_lane_signal_counts_gas_spent_beyond_the_quota() {
-        // parent gas limit 55M: expand at signal >= 44_000_000, shrink below 38_500_000.
-        let parent = parent_with(3_000_000, 20_000_000, 55_000_000, 47_000_000);
-        let signal = Signal::from_parent(&parent).unwrap();
-
-        // 27_000_000 general + 17_000_000 over the 3M quota, landing exactly on the trigger.
-        assert_eq!(signal.0.unwrap().signal_gas_used, 44_000_000);
-
-        // Both branches land strictly inside [floor, ceiling], so the clamp cannot hide the
-        // difference: with the overspill counted the quota expands, without it it shrinks.
-        let with_overspill = signal.next_lane_quota(&DEFAULT_PARAMS, 55_000_000);
-        assert_eq!(with_overspill, 4_100_000, "expand: 3M + 200 * 55M / 10000");
-
-        let general_only = signal_of(3_000_000, 27_000_000, 55_000_000);
-        assert_eq!(
-            general_only.next_lane_quota(&DEFAULT_PARAMS, 55_000_000),
-            2_725_000,
-            "shrink: 3M - 50 * 55M / 10000 — what dropping the overspill term would give"
-        );
+    fn payment_lane_admission_is_exactly_tight() {
+        const CAPACITY: u64 = 40;
+        for lane_quota in (0..=CAPACITY).step_by(7) {
+            for payment_used in (0..=CAPACITY).step_by(3) {
+                for general_used in (0..=CAPACITY - payment_used).step_by(3) {
+                    let budget = Budget { quota: lane_quota, used: payment_used };
+                    // Skip states no packing loop can reach.
+                    if check_inequality(
+                        CAPACITY,
+                        general_used + payment_used,
+                        payment_used,
+                        lane_quota,
+                    )
+                    .is_err()
+                    {
+                        continue;
+                    }
+                    let shared = CAPACITY - payment_used - general_used;
+                    for lane in [Lane::General, Lane::Payment] {
+                        for gas in 0..=CAPACITY {
+                            let mut after = budget.clone();
+                            after.record_used(lane, gas);
+                            let after_general =
+                                general_used + if lane == Lane::General { gas } else { 0 };
+                            let legal = check_inequality(
+                                CAPACITY,
+                                after_general + after.used,
+                                after.used,
+                                lane_quota,
+                            )
+                            .is_ok();
+                            assert_eq!(
+                                budget.admits(shared, lane, gas), legal,
+                                "quota={lane_quota} payment={payment_used} general={general_used} \
+                                 lane={lane:?} gas={gas}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
+    /// Admission must never widen as a block fills, or go-bsc's `txs.Pop()` — which never
+    /// revisits a dropped transaction — would skip one that later became admissible.
     #[test]
-    fn payment_lane_signal_derivation() {
-        // gas_used 30_001_000 less the 1_000 of payment gas, plus nothing above the quota.
-        let parent = parent_with(2_400_000, 1_000, 40_000_000, 30_001_000);
-        let signal = Signal::from_parent(&parent).unwrap();
-        let parent_signal = signal.0.expect("parent carries a commitment");
-
-        assert_eq!(parent_signal.signal_gas_used, 30_000_000);
-        assert_eq!(parent_signal.lane_quota, 2_400_000);
-        assert_eq!(parent_signal.gas_limit, 40_000_000);
-        // 30e6 sits inside [70%, 80%) of 40e6, so the quota holds.
-        assert_eq!(signal.next_lane_quota(&DEFAULT_PARAMS, 55_000_000), 2_400_000);
+    fn payment_lane_max_available_gas_never_rises() {
+        let mut budget = Budget { quota: 300, used: 0 };
+        let capacity = 1000u64;
+        let mut pool_used = 0u64;
+        let mut previous = [u64::MAX; 2];
+        for (lane, gas) in [
+            (Lane::General, 100u64),
+            (Lane::Payment, 50),
+            (Lane::General, 200),
+            (Lane::Payment, 400),
+            (Lane::General, 50),
+        ] {
+            pool_used += gas;
+            budget.record_used(lane, gas);
+            let shared = capacity - pool_used;
+            for (i, l) in [Lane::General, Lane::Payment].into_iter().enumerate() {
+                let now = budget.max_available_gas(shared, l);
+                assert!(now <= previous[i], "{l:?} rose {} -> {now}", previous[i]);
+                previous[i] = now;
+            }
+            // General traffic must never eat into the idle lane.
+            assert!(shared >= budget.idle());
+        }
     }
 
+    fn listed_set(addrs: &[Address]) -> HashSet<Address> {
+        addrs.iter().copied().collect()
+    }
+
+    /// BEP-703 §3.2's gates, in the order the spec states them.
     #[test]
-    fn payment_lane_commitment() {
-        let c = Commitment { quota: 0x0102030405060708, payment_gas_used: 0x1112131415161718 };
-        assert_eq!(
-            c.encode(),
-            b256!("01020304050607081112131415161718" "0000000000000000" "0000000000000000")
-        );
-        assert_eq!(Commitment::default().encode(), B256::ZERO);
-        assert_eq!(Commitment::decode(B256::ZERO).unwrap(), Commitment::default());
-        assert!(matches!(
-            Commitment::decode(EMPTY_OMMER_ROOT_HASH),
-            Err(LaneError::BadCommitment(_))
-        ));
-        assert!(Commitment::commits_no_uncles(EMPTY_OMMER_ROOT_HASH));
-        assert!(Commitment::commits_no_uncles(B256::ZERO), "all-zero is a legal commitment");
-        assert!(
-            !Commitment::commits_no_uncles(b256!(
-                "0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49348"
-            )),
-            "a real uncle hash must not pass the shape check"
-        );
-        assert!(Commitment::commits_no_uncles(c.encode()));
-        // all 128 reserved bits, one at a time
-        for byte in 16..32usize {
-            for bit in 0..8u32 {
-                let mut h = c.encode().0;
-                h[byte] |= 1 << bit;
-                assert!(
-                    Commitment::decode(B256::from(h)).is_err(),
-                    "reserved byte {byte} bit {bit} must be rejected"
+    fn payment_lane_classification_follows_the_spec_gates() {
+        let listed_addr = Address::repeat_byte(0xaa);
+        let plain = Address::repeat_byte(0xbb);
+        let listed = listed_set(&[listed_addr]);
+        let empty = |_: Address| Ok(true);
+        let has_code = |_: Address| Ok(false);
+        let never = |_: Address| -> Result<bool, LaneError> {
+            panic!("the code gate must not be reached")
+        };
+
+        // A contract creation has no destination to test.
+        assert_eq!(classify(None, 0, U256::from(1), &listed, never), Ok(Lane::General));
+
+        // The type allowlist runs before the list, so even a listed destination is general on
+        // an excluded type — 0x03 carries blobs, 0x04 installs code before execution begins.
+        for ty in [0x03u8, 0x04, 0x05, 0x7e] {
+            assert_eq!(
+                classify(Some(listed_addr), ty, U256::from(1), &listed, never),
+                Ok(Lane::General),
+                "type {ty:#x}"
+            );
+        }
+
+        // A listed destination is payment on every admitted type, whatever the value, and the
+        // code gate is never consulted — so a listed contract stays in the lane.
+        for ty in [0x00u8, 0x01, 0x02] {
+            for value in [U256::ZERO, U256::from(1)] {
+                assert_eq!(
+                    classify(Some(listed_addr), ty, value, &listed, never),
+                    Ok(Lane::Payment),
+                    "type {ty:#x} value {value}"
                 );
             }
         }
-    }
 
-    #[test]
-    fn payment_lane_header_bounds() {
-        // Both bounds fail here, so only the branch order decides which error surfaces.
-        assert!(matches!(
-            Commitment { quota: 200, payment_gas_used: 150 }.check_header_bounds(100, 100),
-            Err(LaneError::Untruthy { .. })
-        ));
+        // A bare transfer needs non-zero value and no code at the destination.
+        assert_eq!(classify(Some(plain), 0, U256::from(1), &listed, empty), Ok(Lane::Payment));
+        assert_eq!(classify(Some(plain), 0, U256::ZERO, &listed, never), Ok(Lane::General));
+        assert_eq!(classify(Some(plain), 0, U256::from(1), &listed, has_code), Ok(Lane::General));
 
-        let (gu, gl) = (3_000_000u64, 55_000_000u64);
-        let ok = |q, p| Commitment { quota: q, payment_gas_used: p }.check_header_bounds(gu, gl);
-        assert_eq!(ok(0, 0), Ok(()));
-        assert_eq!(ok(2_000_000, 900_000), Ok(()));
-        assert_eq!(ok(2_000_000, 3_000_000), Ok(()));
-        assert_eq!(ok(52_000_000, 0), Ok(()));
-        assert!(matches!(ok(0, 3_000_001), Err(LaneError::Untruthy { .. })));
-        assert!(matches!(ok(55_000_001, 0), Err(LaneError::Violated { .. })));
-        assert!(matches!(ok(52_000_001, 0), Err(LaneError::Violated { .. })));
-    }
-
-    #[test]
-    fn payment_lane_is_a_floor_not_a_ceiling() {
-        let gl = 100u64;
-        let q = 20u64;
-        let case = |general: u64, payment: u64| check_inequality(gl, general + payment, payment, q);
-        assert_eq!(case(80, 20), Ok(()));
-        assert_eq!(case(79, 21), Ok(()));
-        assert!(case(81, 19).is_err());
-        assert_eq!(case(80, 0), Ok(()));
-        assert!(case(81, 0).is_err());
-        assert_eq!(case(0, 100), Ok(()));
-    }
-
-    #[test]
-    fn payment_lane_inequality_overflow() {
-        let half = u64::MAX / 2 + 1;
-        assert!(
-            check_inequality(u64::MAX, half, 0, half).is_err(),
-            "checked_add must reject; saturating_add would accept (MAX <= MAX)"
-        );
-        // demonstrate the saturating variant would pass
-        let sat = half.saturating_add(half) <= u64::MAX;
-        assert!(sat);
-        assert!(check_inequality(70_000_000, u64::MAX, 0, 0).is_err());
-        assert!(check_inequality(70_000_000, 70_000_000, 0, u64::MAX).is_err());
-        assert!(check_inequality(70_000_000, 70_000_001, 0, 0).is_err());
-        assert_eq!(check_inequality(70_000_000, 1000, u64::MAX, u64::MAX), Ok(()));
-    }
-
-    struct FakeDb {
-        code_hash: B256,
-        exists: bool,
-        reads: std::cell::Cell<u32>,
-    }
-    impl FakeDb {
-        fn code_is_empty(&self) -> Result<bool, LaneError> {
-            self.reads.set(self.reads.get() + 1);
-            Ok(!self.exists || self.code_hash == KECCAK_EMPTY || self.code_hash.is_zero())
-        }
-    }
-
-    #[test]
-    fn payment_lane_classify_gate_order_and_state_reads() {
-        let target = Address::repeat_byte(0x11);
-        let empty_list: HashSet<Address> = HashSet::default();
-        let listed: HashSet<Address> = [target].into_iter().collect();
-
-        // four code-hash encodings
-        let encodings: &[(&str, B256, bool, Lane)] = &[
-            ("zero hash / account absent", B256::ZERO, false, Lane::Payment),
-            ("KECCAK_EMPTY (EOA)", KECCAK_EMPTY, true, Lane::Payment),
-            ("0x..0beef (has code)", b256!("000000000000000000000000000000000000000000000000000000000000beef"), true, Lane::General),
-            ("EIP-7702 delegation marker", b256!("eadcdba66a79ab5dce91622d1d75c8cff5cff0b96944c3bf1072cd08ce018329"), true, Lane::General),
-        ];
-        for &(name, ch, exists, want) in encodings {
-            let db = FakeDb { code_hash: ch, exists, reads: 0.into() };
-            let got = classify(Some(target), 2, U256::from(1), &empty_list, |_| db.code_is_empty()).unwrap();
-            assert_eq!(got, want, "{name}");
-            assert_eq!(db.reads.get(), 1);
-        }
-
-        // gate exhaustion: 5 tx types x 4 targets x {listed, value}
-        let mut table = Vec::new();
-        for ty in [0u8, 1, 2, 3, 4] {
-            for to in [None, Some(target)] {
-                for is_listed in [false, true] {
-                    for value in [U256::ZERO, U256::from(1)] {
-                        let l = if is_listed { &listed } else { &empty_list };
-                        let db = FakeDb { code_hash: KECCAK_EMPTY, exists: true, reads: 0.into() };
-                        let got = classify(to, ty, value, l, |_| db.code_is_empty()).unwrap();
-                        let reads = db.reads.get();
-                        // expected, from the gate order in `classify`
-                        let (want, want_reads) = if to.is_none() {
-                            (Lane::General, 0)
-                        } else if !matches!(ty, 0..=2) {
-                            (Lane::General, 0)
-                        } else if is_listed {
-                            (Lane::Payment, 0)
-                        } else if value.is_zero() {
-                            (Lane::General, 0)
-                        } else {
-                            (Lane::Payment, 1)
-                        };
-                        assert_eq!((got, reads), (want, want_reads), "ty={ty} to={to:?} listed={is_listed} value={value}");
-                        table.push((ty, to.is_some(), is_listed, !value.is_zero(), got, reads));
-                    }
-                }
-            }
-        }
-
-        // listed hit must NOT read state — pinned with a panicking closure
-        let got = classify(Some(target), 0, U256::ZERO, &listed, |_| panic!("must not read state")).unwrap();
-        assert_eq!(got, Lane::Payment);
-    }
-
-    #[test]
-    fn payment_lane_classify_rereads_code_when_it_changes() {
-        let target = Address::repeat_byte(0x22);
-        let empty: HashSet<Address> = HashSet::default();
-        let reads = std::cell::Cell::new(0u32);
-        let code_hash = std::cell::Cell::new(B256::ZERO); // no code yet
-        let call = || {
-            classify(Some(target), 2, U256::from(1), &empty, |_| {
-                reads.set(reads.get() + 1);
-                let ch = code_hash.get();
-                Ok(ch.is_zero() || ch == KECCAK_EMPTY)
-            })
-        };
-        assert_eq!(call().unwrap(), Lane::Payment);
-        code_hash.set(b256!("eadcdba66a79ab5dce91622d1d75c8cff5cff0b96944c3bf1072cd08ce018329"));
-        assert_eq!(call().unwrap(), Lane::General);
-        assert_eq!(reads.get(), 2, "exactly two state reads; a cached answer would give one");
-    }
-
-    #[test]
-    fn payment_lane_admits_implies_legal() {
-        // Only "admitted => still legal" holds. The converse fails by exactly the miner's
-        // system-tx reserve, because the packing budget subtracts that reserve while the quota
-        // is capped by the 20M protocol constant. go-bsc is conservative in the same way, so
-        // this is the shape of the rule, not a divergence.
-        let mut one_way = 0u32;
-        let mut rejected_but_legal = 0u32;
-        for reserved in [0u64, 1, 5] {
-            for quota in [0u64, 5, 20, 40, 100] {
-                for used in [0u64, 3, 20, 50] {
-                    for gas_used in [0u64, 10, 50, 99, 100] {
-                        let gl = 100u64;
-                        let b = Budget { quota, used };
-                        // Only meaningful over legal pre-states: the block so far is valid.
-                        if b.verify(gl, gas_used).is_err() {
-                            continue;
-                        }
-                        let shared = gl.saturating_sub(gas_used).saturating_sub(reserved);
-                        for lane in [Lane::General, Lane::Payment] {
-                            for g in 0..=shared {
-                                let admits = b.admits(shared, lane, g);
-                                let mut after = b.clone();
-                                after.record_used(lane, g);
-                                let legal = after.verify(gl, gas_used + g).is_ok();
-
-                                assert!(
-                                    !admits || legal,
-                                    "admitted an illegal block: reserved={reserved} quota={quota} \
-                                     used={used} gas_used={gas_used} lane={lane:?} g={g}"
-                                );
-                                if reserved == 0 {
-                                    // With no miner reserve the two coincide, which is the
-                                    // form go-bsc pins.
-                                    assert_eq!(admits, legal, "reserved=0 quota={quota} used={used} gas_used={gas_used} lane={lane:?} g={g}");
-                                }
-                                one_way += 1;
-                                if !admits && legal {
-                                    rejected_but_legal += 1;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        assert!(one_way > 0);
-        assert!(
-            rejected_but_legal > 0,
-            "with a non-zero reserve the converse must fail somewhere, or this test is vacuous"
+        // A failed state read is surfaced, never rounded to "no code": biasing toward Payment
+        // would let an honest block look like it overran the lane.
+        assert_eq!(
+            classify(Some(plain), 0, U256::from(1), &listed, |_| Err(
+                LaneError::StateUnavailable("missing trie node".into())
+            )),
+            Err(LaneError::StateUnavailable("missing trie node".into()))
         );
     }
 
+    /// The zero-code-hash trap: an account that does not exist yet must still be payment.
     #[test]
-    fn payment_lane_max_available_gas_is_monotone() {
-        let gl = 1_000_000u64;
-        let mut b = Budget { quota: 300_000, used: 0 };
-        let mut gas_used = 0u64;
-        let mut prev = (b.max_available_gas(gl, Lane::General), b.max_available_gas(gl, Lane::Payment));
-        let mut steps = 0;
-        for (i, g) in (0..40).map(|i| (i, 7_000u64 + (i as u64 * 1_301) % 9_000)) {
-            let lane = if i % 3 == 0 { Lane::Payment } else { Lane::General };
-            if !b.admits(gl - gas_used, lane, g) {
-                continue;
-            }
-            gas_used += g;
-            b.record_used(lane, g);
-            let now = (
-                b.max_available_gas(gl - gas_used, Lane::General),
-                b.max_available_gas(gl - gas_used, Lane::Payment),
+    fn payment_lane_absent_account_is_empty_code() {
+        let listed = HashSet::default();
+        let to = Address::repeat_byte(0xcc);
+        // Both encodings of "empty" that reach this closure in the executor.
+        for code_hash in [alloy_primitives::B256::ZERO, KECCAK_EMPTY] {
+            let is_empty = code_hash.is_zero() || code_hash == KECCAK_EMPTY;
+            assert!(is_empty);
+            assert_eq!(
+                classify(Some(to), 0, U256::from(1), &listed, |_| Ok(is_empty)),
+                Ok(Lane::Payment),
+                "code hash {code_hash}"
             );
-            assert!(now.0 <= prev.0 && now.1 <= prev.1, "step {i}: {prev:?} -> {now:?}");
-            prev = now;
-            steps += 1;
         }
-        assert!(steps > 5, "the loop must actually admit transactions, not skip them all");
-    }
-
-    /// `verify` runs `used > gas_used` before the accounting rule. Two separately-failing
-    /// examples cannot test an order, so this input fails both and only the order decides
-    /// which error surfaces.
-    #[test]
-    fn payment_lane_verify_error_order() {
-        let b = Budget { quota: 200, used: 1 };
-        assert!(matches!(b.verify(100, 0), Err(LaneError::Untruthy { .. })));
-        assert!(matches!(
-            check_inequality(100, 0, 1, 200),
-            Err(LaneError::Violated { .. })
-        ));
-    }
-
-    fn legal_param_grid() -> Vec<GovernanceParams> {
-        let mut v = Vec::new();
-        for min_ratio in [0u64, 200, 1000] {
-            for max_ratio in [200u64, 800, 2000] {
-                if min_ratio > max_ratio {
-                    continue;
-                }
-                for (shrink_trigger, expand_trigger) in
-                    [(0u64, 1u64), (3000, 5000), (7000, 8000), (7000, 9999)]
-                {
-                    for expand_step in [1u64, 50, 200, 1000] {
-                        for shrink_step in [1u64, 50, 200] {
-                            for (min_gas, max_gas) in
-                                [(0u64, 1u64), (0, 8_000_000), (2_000_000, 8_000_000), (2_000_000, 2_000_000)]
-                            {
-                                v.push(GovernanceParams {
-                                    min_ratio,
-                                    max_ratio,
-                                    expand_trigger,
-                                    shrink_trigger,
-                                    expand_step,
-                                    shrink_step,
-                                    min_gas,
-                                    max_gas,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        v
-    }
-
-    #[test]
-    fn payment_lane_clamp_grid() {
-        let gas_limits = [
-            0u64, 1, 21_000, 1_000_000, SYSTEM_TXS_GAS_HARD_LIMIT, 20_000_001, 21_700_000,
-            40_000_000, 55_000_000, 55_009_999, 70_000_000, 140_000_000, u64::MAX,
-        ];
-        let grid = legal_param_grid();
-        for p in &grid {
-            for &gl in &gas_limits {
-                let b = bounds(p, gl);
-                assert!(b.floor <= b.ceiling, "floor {} > ceiling {} at gl {gl} p {p:?}", b.floor, b.ceiling);
-                for sig in [Signal(None), signal_of(3_000_000, 0, 10_000), signal_of(3_000_000, u64::MAX, 10_000)] {
-                    let q = sig.next_lane_quota(p, gl);
-                    assert!(q <= b.reserve_cap, "quota {q} > reserveCap {}", b.reserve_cap);
-                    assert!(q <= mul_div_floor(2000, gl, RATIO_DENOM), "quota {q} exceeds 2000bps of gl {gl}");
-                    if b.reserve_cap >= b.ceiling {
-                        assert!(q >= b.floor && q <= b.ceiling, "quota {q} outside [{}, {}]", b.floor, b.ceiling);
-                    }
-                }
-                // in-window and not stepping => unchanged
-                let mid = (b.floor + b.ceiling) / 2;
-                if b.reserve_cap >= b.ceiling && p.shrink_trigger < p.expand_trigger {
-                    let s = signal_of(mid, mul_div_floor(p.shrink_trigger, 10_000, RATIO_DENOM), 10_000);
-                    let q = s.next_lane_quota(p, gl);
-                    assert_eq!(q, mid.max(b.floor).min(b.ceiling), "hysteresis must not move quota");
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn payment_lane_reserve_cap_crossover() {
-        // reserve_cap strictly decides the quota while gas_limit - 20M < 0.08 * gas_limit,
-        // i.e. 0.92 * gas_limit < 20M. Integer truncation puts the last such gas limit at
-        // 21_739_129, one below the real-valued 21_739_130.4.
-        assert!(reserve_cap(21_739_129) < lane_floor(&DEFAULT_PARAMS, 21_739_129));
-        assert!(reserve_cap(21_739_130) >= lane_floor(&DEFAULT_PARAMS, 21_739_130));
-
-        // A falling gas limit must stay clamped every block, and cross into the cap-decided
-        // region without the quota ever exceeding it.
-        let mut gas_limit = 70_000_000u64;
-        let mut quota = Signal(None).next_lane_quota(&DEFAULT_PARAMS, gas_limit);
-        let mut reached_cap_region = false;
-        for _ in 0..1500 {
-            gas_limit -= gas_limit / 1024;
-            let parent = parent_with(quota, 0, gas_limit, gas_limit);
-            let b = bounds(&DEFAULT_PARAMS, gas_limit);
-            quota = Signal::from_parent(&parent).unwrap().next_lane_quota(&DEFAULT_PARAMS, gas_limit);
-
-            assert!(quota <= b.reserve_cap);
-            if b.reserve_cap < b.floor {
-                reached_cap_region = true;
-                assert!(quota < b.floor, "past the crossover the cap must push below the floor");
-            }
-        }
-        assert!(reached_cap_region, "1500 blocks from 70M must cross the ~21.7M threshold");
-    }
-
-    #[test]
-    fn payment_lane_saturation_and_no_carry() {
-        // satAdd wrap guard: next near MAX + step must clamp to ceiling, not wrap
-        let p = GovernanceParams { max_ratio: 2000, max_gas: u64::MAX, ..DEFAULT_PARAMS };
-        let s = signal_of(u64::MAX - 1, u64::MAX, 10_000);
-        let gl = 55_000_000u64;
-        let got = s.next_lane_quota(&p, gl);
-        let b = bounds(&p, gl);
-        assert_eq!(got, b.ceiling.min(b.reserve_cap));
-        assert_ne!(got, (u64::MAX - 1).wrapping_add(mul_div_floor(200, gl, RATIO_DENOM)));
-
-        // signal's two terms never carry
-        let vals = [0u64, 1, 21_000, 55_000_000, u64::MAX / 2, u64::MAX - 1, u64::MAX];
-        for &gas_used in &vals {
-            for &payment in &vals {
-                for &quota in &vals {
-                    let a = gas_used.saturating_sub(payment);
-                    let bb = payment.saturating_sub(quota);
-                    assert!(a.checked_add(bb).is_some(), "carry at ({gas_used},{payment},{quota})");
-                    assert!(a + bb <= gas_used.max(payment), "bound violated");
-                }
-            }
-        }
-
-        // gasLimit exactly 2^62: 8000 * gl == 0 in u64 but gte must still be right
-        let gl = 1u64 << 62;
-        assert_eq!(8000u64.wrapping_mul(gl), 0, "naive u64 product is zero");
-        assert!(!gte(1, RATIO_DENOM, 8000, gl), "tiny signal must NOT expand");
-        assert!(gte(u64::MAX, RATIO_DENOM, 8000, gl), "huge signal must expand");
-    }
-
-    #[test]
-    fn payment_lane_accepts_invariant_violating_params() {
-        // maxRatio + expandTrigger > 10000, min_ratio > max_ratio, triggers inverted,
-        // min_gas > max_gas — all accepted, quota still derived.
-        let bad = GovernanceParams {
-            min_ratio: 9000,
-            max_ratio: 8000,
-            expand_trigger: 3000,
-            shrink_trigger: 9000,
-            expand_step: 5000,
-            shrink_step: 5000,
-            min_gas: 9_000_000,
-            max_gas: 1_000_000,
-        };
-        assert!(bad.max_ratio + bad.expand_trigger > 10_000);
-        let gl = 55_000_000u64;
-        let b = bounds(&bad, gl);
-        assert!(b.floor <= b.ceiling, "the inner min still keeps floor <= ceiling: {b:?}");
-        let q = Signal(None).next_lane_quota(&bad, gl);
-        assert_eq!(q, b.floor.min(b.reserve_cap));
-    }
-
-    // invariant-violating params (shrinkTrigger > expandTrigger), which BEP-703 §3.6 accepts.
-    #[test]
-    fn payment_lane_step_branches_are_exclusive() {
-        // An `else if` and two
-        // independent `if`s differ whenever both predicates hold at once.
-        let p = GovernanceParams { expand_trigger: 3000, shrink_trigger: 9000, ..DEFAULT_PARAMS };
-        let (gl, pgl, quota, bps) = (55_000_000u64, 10_000u64, 3_000_000u64, 5000u64);
-        assert!(gte(bps, RATIO_DENOM, p.expand_trigger, pgl), "expand predicate holds");
-        assert!(!gte(bps, RATIO_DENOM, p.shrink_trigger, pgl), "shrink predicate ALSO holds");
-
-        let as_else_if = signal_of(quota, bps, pgl).next_lane_quota(&p, gl);
-
-        // the same thing with two independent ifs, spelled out
-        let mut next = quota;
-        if gte(bps, RATIO_DENOM, p.expand_trigger, pgl) {
-            next = next.saturating_add(mul_div_floor(p.expand_step, gl, RATIO_DENOM));
-        }
-        if !gte(bps, RATIO_DENOM, p.shrink_trigger, pgl) {
-            next = next.saturating_sub(mul_div_floor(p.shrink_step, gl, RATIO_DENOM));
-        }
-        let b = bounds(&p, gl);
-        let as_two_ifs = next.max(b.floor).min(b.ceiling).min(b.reserve_cap);
-
-        // `as_else_if` came out of production `next_lane_quota`, so a difference here is
-        // proof that production takes the `else if` form — matching go-bsc's `switch`.
-        assert_ne!(
-            as_else_if, as_two_ifs,
-            "production must not apply both steps: else-if gives {as_else_if}, two ifs give {as_two_ifs}"
-        );
-    }
-
-    /// `quota <= 2000 * gas_limit / 10000` holds only while the parameters are contract-legal
-    /// (`max_ratio <= 2000`), and BEP-703 §3.6 forbids the client from enforcing that. So the
-    /// bound must never be asserted over arbitrary getter output — here it is broken on purpose.
-    #[test]
-    fn payment_lane_ratio_bound_breaks_outside_the_legal_grid() {
-        let p = GovernanceParams { max_ratio: 5000, max_gas: u64::MAX, ..DEFAULT_PARAMS };
-        let gl = 55_000_000u64;
-        let mut q = 3_000_000u64;
-        for _ in 0..40 {
-            q = signal_of(q, u64::MAX, 10_000).next_lane_quota(&p, gl); // always expanding
-        }
-        assert!(q > mul_div_floor(2000, gl, RATIO_DENOM));
     }
 }

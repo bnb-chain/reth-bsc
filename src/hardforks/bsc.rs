@@ -292,10 +292,7 @@ impl From<BscHardfork> for SpecId {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        chainspec::{bsc::bsc_mainnet, bsc_chapel::bsc_testnet},
-        hardforks::BscHardforks,
-    };
+    use crate::chainspec::{bsc::bsc_mainnet, bsc_chapel::bsc_testnet};
 
     #[test]
     fn test_pasteur_is_sequenced_after_mendel() {
@@ -306,11 +303,6 @@ mod tests {
         // Pasteur is a BSC-only precompile/system-contract fork with no new EVM spec.
         assert_eq!(SpecId::from(BscHardfork::Pasteur), SpecId::OSAKA);
     }
-
-
-
-
-
 
     #[test]
     fn test_pasteur_scheduled_on_testnet() {

@@ -366,13 +366,15 @@ pub trait BscHardforks: EthereumHardforks {
         self.bsc_fork_activation(BscHardfork::Pasteur).active_at_timestamp(timestamp)
     }
 
-    /// Whether a block whose parent is `(parent_number, parent_timestamp)` carries a BEP-703
-    /// payment-lane commitment.
+    /// Whether the BEP-703 payment lane binds in a block whose parent is
+    /// `(parent_number, parent_timestamp)`.
     ///
-    /// Never gate a lane check on the block's OWN timestamp: the activation block is
-    /// post-Jenner by that measure and must still carry the empty ommers root, which is what
-    /// go-bsc's `!IsJenner(parent)` branch enforces.
-    fn commits_payment_lane(&self, parent_number: u64, parent_timestamp: u64) -> bool {
+    /// Gated on the PARENT, never on the block's own timestamp: BEP-703 §3.4.3 reads the ratio
+    /// from the parent's post-state, and the fork installs `0x2007` *while* the activation
+    /// block executes — so the activation block is outside the mechanism and `activation + 1`
+    /// is the first block the reservation binds in. This is go-bsc's
+    /// `config.IsJenner(parent.Number, parent.Time)` guard in `ResolveLaneState`.
+    fn payment_lane_applies(&self, parent_number: u64, parent_timestamp: u64) -> bool {
         self.is_jenner_active_at_timestamp(parent_number, parent_timestamp)
     }
 

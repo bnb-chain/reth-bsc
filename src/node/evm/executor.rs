@@ -31,9 +31,7 @@ use alloy_evm::{
     eth::receipt_builder::ReceiptBuilderCtx,
 };
 use crate::node::evm::error::BscBlockExecutionError;
-use crate::consensus::payment_lane::{
-    meta::LaneMeta, rules::classify, Budget, Commitment, Lane, LaneError,
-};
+use crate::consensus::payment_lane::{meta::LaneMeta, rules::classify, Budget, Lane, LaneError};
 use alloy_consensus::constants::KECCAK_EMPTY;
 use alloy_primitives::keccak256;
 use alloy_primitives::{hex, uint, Address, BlockNumber, Bytes, U256};
@@ -813,9 +811,11 @@ where
             }
         }
 
-        // After the mode match, so the Parlia system transactions above are already in
-        // `self.gas_used` — the same point the importer checks at. Failure declines the block;
-        // there is no fallback that produces with the lane switched off.
+        // BEP-703's block rule, as the producer's self-check. After the mode match, so the
+        // Parlia system transactions above are already in `self.gas_used` — the same point the
+        // importer checks at. Failure declines the block; there is no fallback that produces
+        // with the lane switched off. Nothing is stamped into the header: the quota is derived
+        // independently by every node, so there is nothing to commit.
         if let Some(lane) = self.inner_ctx.payment_lane.as_ref() {
             if self.ctx.mode.finalizes() {
                 let gas_limit = self.evm.block().gas_limit();
@@ -823,14 +823,7 @@ where
                     crate::metrics::LANE_METRICS.produce_declined.increment(1);
                     BscBlockExecutionError::from(e)
                 })?;
-                debug_assert!(
-                    self.ctx.base.ommers.is_empty(),
-                    "a produced block must carry no ommers"
-                );
-                *self.ctx.payment_lane_sink.lock().unwrap() = Some(Commitment {
-                    quota: lane.budget.quota,
-                    payment_gas_used: lane.budget.used,
-                });
+                crate::metrics::LANE_METRICS.quota.set(lane.budget.quota as f64);
                 crate::metrics::LANE_METRICS.idle.set(lane.budget.idle() as f64);
             }
         }
