@@ -1,3 +1,5 @@
+#![warn(clippy::unwrap_used, clippy::expect_used)]
+
 use clap::{Args, Parser};
 use reth::{
     builder::NodeHandle,
