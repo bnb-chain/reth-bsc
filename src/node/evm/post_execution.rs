@@ -168,18 +168,16 @@ where
                     header.number, header.hash_slow(), epoch_length, turn_length);
             }
         }
-        // BEP-703's block rule, and it must be LAST. This function issues and executes system
-        // transactions of its own, each adding to `self.gas_used`, so only here does
-        // `self.gas_used` equal `header.gas_used`. Run it at the top and 1-12M of system gas goes
-        // unaccounted — Parlia's system gas is general gas under BEP-703 §3.3.
+        // The lane verdict, and it must be LAST: this function issues system transactions of
+        // its own, so only here does `self.gas_used` equal `header.gas_used`. Run it earlier and
+        // 1-12M of system gas goes unaccounted, though the lane counts it as general.
         if let Some(lane) = self.inner_ctx.payment_lane.as_ref() {
             lane.budget.verify(header.gas_limit, self.gas_used).map_err(lane_reject)?;
-            // Only once the block is accepted: numbers from a rejected block are numbers no
-            // peer agrees with.
+            // Only once accepted: numbers from a rejected block are numbers no peer agrees with.
             let metrics = &crate::metrics::LANE_METRICS;
-            metrics.imported_quota.set(lane.budget.quota as f64);
-            metrics.imported_payment_gas_used.set(lane.budget.used as f64);
-            metrics.imported_idle.set(lane.budget.idle() as f64);
+            metrics.quota.set(lane.budget.quota as f64);
+            metrics.payment_gas_used.set(lane.budget.used as f64);
+            metrics.idle.set(lane.budget.idle() as f64);
         }
 
         tracing::trace!("Succeed to finalize new block, block_number: {}", block.number());

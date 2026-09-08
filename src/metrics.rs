@@ -332,30 +332,23 @@ pub struct BscParliaGethMetrics {
     pub doublesign: Counter,
 }
 
-/// Metrics for the BEP-703 payment lane. Field docs give the go-bsc name of each metric, so the
-/// two clients can be compared directly.
+/// Metrics for the BEP-703 payment lane.
 #[derive(Metrics, Clone)]
 #[metrics(scope = "bsc.payment_lane")]
 pub struct BscPaymentLaneMetrics {
-    /// paymentlane/imported/paymentLaneQuota
-    pub imported_quota: Gauge,
-    /// paymentlane/imported/paymentGasUsed
-    pub imported_payment_gas_used: Gauge,
-    /// paymentlane/imported/paymentLaneIdle
-    pub imported_idle: Gauge,
-
-    /// paymentlane/paymentLaneQuota
+    /// Gas reserved for payment transactions in the last imported block
     pub quota: Gauge,
-    /// paymentlane/paymentLaneIdle
+    /// Payment gas the last imported block used
+    pub payment_gas_used: Gauge,
+    /// Reserved gas the last imported block left unclaimed
     pub idle: Gauge,
-
-    /// paymentlane/rejected
+    /// Blocks rejected by the lane rule
     pub rejected: Counter,
-    /// paymentlane/stateUnavailable
+    /// Lane state reads that failed on this node
     pub state_unavailable: Counter,
-    /// paymentlane/generalLaneYielded
+    /// Transactions dropped to keep the reservation intact
     pub general_lane_yielded: Counter,
-    /// paymentlane/produceDeclined
+    /// Blocks this validator declined to seal
     pub produce_declined: Counter,
 }
 

@@ -628,16 +628,12 @@ fn execution_gate_round_trip() {
     assert_eq!(computed_root, reference_root);
 }
 
-/// A Jenner test chain: 30M gas, activation at timestamp 6, Prague enabled, and `0x2007`
-/// installed by the activation block with `_paymentLaneRatio = 1000` (10%, the maximum).
+/// A Jenner test chain: Jenner at timestamp 6, and `0x2007` carrying a governed
+/// `_paymentLaneRatio` of 1000 (10%, the maximum) in slot 0 — an unset slot would instead read as
+/// the getter's own 500 default.
 ///
-/// 30M rather than mainnet's 55M so the lane's admission boundary lands below EIP-7825's 2^24
-/// per-transaction gas cap — at 55M the general lane tops out above the cap and no single
-/// transaction can probe it. See the probe in the round-trip test below.
-///
-/// The ratio is written into genesis storage (slot 0 is `PaymentLane._paymentLaneRatio`) so the
-/// test exercises a governed value; an unset slot would read as §3.6.1's 500 default through the
-/// getter's own fallback.
+/// 30M gas, not mainnet's 55M, so the general lane's admission boundary lands below EIP-7825's
+/// 2^24 per-transaction cap; at 55M no single transaction could probe it.
 fn jenner_lane_chain_spec() -> Arc<BscChainSpec> {
     use reth_bsc::hardforks::bsc::BscHardfork;
 
@@ -690,12 +686,9 @@ fn jenner_lane_chain_spec() -> Arc<BscChainSpec> {
     Arc::new(BscChainSpec::from(spec))
 }
 
-/// Builds and re-imports a four-block chain across Jenner to prove producer and importer derive
-/// the same lane independently — BEP-703 puts nothing in the header, so agreement rests entirely
-/// on both sides reading `0x2007` at the same point and running the same arithmetic.
-///
-/// Also pins that the header is untouched and that the producer's admission gate is live on a
-/// post-fork block.
+/// Builds and re-imports a four-block chain across Jenner: nothing about the lane is in the
+/// header, so producer and importer agree only if both read `0x2007` at the same point and run
+/// the same arithmetic. Also pins that the admission gate is live on a post-fork block.
 #[test]
 fn jenner_payment_lane_chain_round_trips() {
     use alloy_consensus::{TxLegacy, EMPTY_OMMER_ROOT_HASH};
@@ -733,8 +726,9 @@ fn jenner_payment_lane_chain_round_trips() {
         SealedHeader::new(chain_spec.genesis_header().clone(), chain_spec.genesis_hash());
     let mut parent_snap = genesis_snapshot(chain_spec.clone());
 
-    // A payment-lane transaction: non-zero value to an address that holds no code.
-    let payment_tx = |nonce: u64, gas_limit: u64| {
+    // A transfer to a fresh address with no code, so `value` alone decides the lane: non-zero is
+    // a payment, zero can never be a bare transfer.
+    let tx = |nonce: u64, gas_limit: u64, value: u64| {
         sign_system_transaction(
             TxLegacy {
                 chain_id: None,
@@ -742,30 +736,16 @@ fn jenner_payment_lane_chain_round_trips() {
                 gas_price: 1,
                 gas_limit,
                 to: TxKind::Call(alloy_primitives::Address::random()),
-                value: U256::from(1u64),
+                value: U256::from(value),
                 input: Default::default(),
             }
             .into(),
         )
-        .expect("sign payment tx")
+        .expect("sign tx")
+        .try_into_recovered()
+        .expect("recover")
     };
-
-    // A general transaction: zero value, so no destination can make it a bare transfer.
-    let general_tx = |nonce: u64, gas_limit: u64| {
-        sign_system_transaction(
-            TxLegacy {
-                chain_id: None,
-                nonce,
-                gas_price: 1,
-                gas_limit,
-                to: TxKind::Call(alloy_primitives::Address::random()),
-                value: U256::ZERO,
-                input: Default::default(),
-            }
-            .into(),
-        )
-        .expect("sign general tx")
-    };
+    let (payment, general) = (1u64, 0u64);
 
     // Block 1 is pre-fork; blocks 3 and 4 each carry one payment transaction.
     let payments_per_block = [0usize, 0, 1, 1];
@@ -815,40 +795,30 @@ fn jenner_payment_lane_chain_round_trips() {
             .unwrap_or(0);
             for nonce in start_nonce..start_nonce + payments as u64 {
                 builder
-                    .execute_transaction(
-                        payment_tx(nonce, 21_000).try_into_recovered().expect("recover"),
-                    )
+                    .execute_transaction(tx(nonce, 21_000, payment))
                     .unwrap_or_else(|e| panic!("execute payment in block {number}: {e:?}"));
             }
-            // The producer-side admission gate, probed at the one gas limit that separates the
-            // two lanes — BEP-703 §3.1's asymmetry is the whole rule: general traffic may never
-            // take the idle reservation, payment traffic may take the whole block.
-            //
-            // `shared` here is 30M − 20M reserved for Parlia's system txs − 21k already burned
-            // = 9,979,000, and the idle lane is 3M − 21k = 2,979,000, so general tops out at
-            // exactly 7M. A declared 8M sits above that, below `shared`, and below EIP-7825's
-            // 2^24 cap: it is refused only because of the reservation, while the identical
-            // declaration on the payment side must still be admitted. Comparing the two lanes
-            // at the SAME gas limit is what keeps the probe independent of that reserve.
+            // The admission gate, probed at the one gas limit that separates the two lanes.
+            // Here `shared` is 30M − 20M reserved for system txs − 21k already burned =
+            // 9,979,000 and the idle reservation is 3M − 21k = 2,979,000, so general tops out at
+            // exactly 7M. A declared 8M sits above that but below both `shared` and EIP-7825's
+            // cap, so only the reservation can refuse it — and the same declaration on the
+            // payment side must still be admitted. Probing both lanes at one gas limit is what
+            // keeps this independent of the system-tx reserve.
             if number > 2 {
                 const BAND: u64 = 8_000_000;
                 let nonce = start_nonce + payments as u64;
                 let refused = builder
-                    .execute_transaction(
-                        general_tx(nonce, BAND).try_into_recovered().expect("recover"),
-                    )
-                    .expect_err("a general tx that would eat the idle lane must be refused");
-                // The exact sentinel, not just any InvalidTx: EIP-7825's per-transaction cap
-                // surfaces as InvalidTx too, so a probe that accepted either would pass with
-                // the lane doing nothing.
+                    .execute_transaction(tx(nonce, BAND, general))
+                    .expect_err("a general tx that would eat the reservation must be refused");
+                // The exact sentinel: EIP-7825's per-transaction cap is also an InvalidTx, so a
+                // probe that accepted either would pass with the lane doing nothing.
                 assert!(
                     format!("{refused:?}").contains("CallerGasLimitMoreThanBlock"),
                     "expected the lane's own drop, got {refused:?}"
                 );
                 builder
-                    .execute_transaction(
-                        payment_tx(nonce, BAND).try_into_recovered().expect("recover"),
-                    )
+                    .execute_transaction(tx(nonce, BAND, payment))
                     .expect("the same gas limit on the payment side must still be admitted");
             }
             let BlockBuilderOutcome { execution_result, block, hashed_state, .. } =
@@ -871,19 +841,17 @@ fn jenner_payment_lane_chain_round_trips() {
 
         let header = block.header().clone();
         assert_eq!(header.number, number);
-        assert!(block.body().inner.ommers.is_empty(), "block {number} must carry no ommers");
+        // The lane changes no header field, in layout or in meaning.
+        assert_eq!(header.ommers_hash, EMPTY_OMMER_ROOT_HASH, "block {number} ommers_hash");
 
-        // BEP-703 changes no header field, in layout or in meaning.
+        // System transactions consume no gas in this fixture, so the only gas is 21k per
+        // transfer — the probe that got through declares 8M but burns the intrinsic cost.
+        let probe = if number > 2 { 1 } else { 0 };
         assert_eq!(
-            header.ommers_hash, EMPTY_OMMER_ROOT_HASH,
-            "block {number}: the payment lane must leave ommers_hash alone"
+            header.gas_used,
+            (payments as u64 + probe) * 21_000,
+            "block {number} gas_used"
         );
-        // Parlia system transactions consume zero gas in this fixture. Post-fork blocks also
-        // carry the payment transaction the probe above got through: it declares 8M but burns
-        // only the 21k intrinsic cost of a bare transfer.
-        let probe = if number > 2 { 21_000 } else { 0 };
-        let expected_gas_used = payments as u64 * 21_000 + probe;
-        assert_eq!(header.gas_used, expected_gas_used, "block {number} gas_used");
 
         // Advance every piece of state the next block needs, then re-import this one.
         let sealed = SealedHeader::new(header.clone(), header.hash_slow());

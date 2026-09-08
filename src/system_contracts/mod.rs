@@ -1315,23 +1315,19 @@ mod tests {
     fn jenner_upgrade_applies_only_at_the_transition_block() {
         use reth_chainspec::ForkCondition;
 
-        let jenner_time = 1_800_000_000u64;
+        let jenner = 1_800_000_000u64;
         let mut cs = bsc_mainnet();
-        cs.hardforks.insert(BscHardfork::Jenner, ForkCondition::Timestamp(jenner_time));
+        cs.hardforks.insert(BscHardfork::Jenner, ForkCondition::Timestamp(jenner));
         let spec = crate::chainspec::BscChainSpec::from(cs);
-        let block = 50_000_000; // past London
+        let installs = |time, parent_time| {
+            get_upgrade_system_contracts(&spec, 50_000_000, time, parent_time)
+                .unwrap()
+                .contains_key(&PAYMENT_LANE_CONTRACT)
+        };
 
-        let at_transition =
-            get_upgrade_system_contracts(&spec, block, jenner_time, jenner_time - 3).unwrap();
-        assert!(at_transition.contains_key(&PAYMENT_LANE_CONTRACT));
-
-        let after =
-            get_upgrade_system_contracts(&spec, block, jenner_time + 3, jenner_time).unwrap();
-        assert!(!after.contains_key(&PAYMENT_LANE_CONTRACT));
-
-        let before =
-            get_upgrade_system_contracts(&spec, block, jenner_time - 3, jenner_time - 6).unwrap();
-        assert!(!before.contains_key(&PAYMENT_LANE_CONTRACT));
+        assert!(installs(jenner, jenner - 3));
+        assert!(!installs(jenner + 3, jenner));
+        assert!(!installs(jenner - 3, jenner - 6));
     }
 
     #[test]

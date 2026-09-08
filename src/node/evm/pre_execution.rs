@@ -53,9 +53,8 @@ pub static TURN_LENGTH_CACHE: LazyLock<Mutex<TurnLengthCache>> = LazyLock::new(|
 
 type LaneMetaCache = LruMap<BlockHash, LaneMeta, ByLength>;
 
-/// Keyed on the parent block hash, not go-bsc's `(codeHash, storageRoot)` of `0x2007`: reth's
-/// `Account` carries no storage root. Strictly more conservative — it cannot conflate two
-/// `0x2007` states, only miss a hit when reorging to a sibling whose state matches.
+/// Keyed on the parent hash rather than on `0x2007`'s own storage root, which reth's `Account`
+/// does not carry. Strictly more conservative: it can miss a hit, never conflate two states.
 static LANE_META_CACHE: LazyLock<Mutex<LaneMetaCache>> = LazyLock::new(|| {
     Mutex::new(LruMap::new(ByLength::new(1024)))
 });
@@ -205,9 +204,8 @@ where
 
         self.verify_cascading_fields(&header, &parent_header, &snap)?;
 
-        // BEP-703 puts nothing in the header, so there is no reservation to adjudicate here:
-        // the verdict is the accounting rule, checked in `post_check_new_block` once every
-        // transaction has run.
+        // Nothing about the lane is in the header to check; the verdict is the accounting rule,
+        // reached in `post_check_new_block` once every transaction has run.
         self.init_payment_lane(&parent_header, header.gas_limit)?;
 
         let epoch_length = snap.epoch_num;
@@ -334,8 +332,6 @@ where
 
     /// Runs a PaymentLane getter in this block's env.
     ///
-    /// Uses [`GETTER_GAS_LIMIT`], not the block gas limit.
-    ///
     /// A revert or a halt is a verdict on the block, so it comes back as `CorruptConfig`; only
     /// a `transact` error is a local fault, and there the executor must not be reused.
     fn lane_eth_call(&mut self, to: Address, data: Bytes) -> Result<Bytes, BlockExecutionError> {
@@ -362,11 +358,10 @@ where
         Err(lane_reject(LaneError::CorruptConfig(format!("getter at {to} {reason}"))))
     }
 
-    /// Reads the lane ratio and the payment contract list from `0x2007` (BEP-703 §3.6.4), as of
-    /// the parent's post-state.
+    /// Reads the ratio and the contract list from `0x2007`, as of the parent's post-state.
     ///
-    /// Cached by `parent_hash`, so a late read would poison every sibling block with that
-    /// parent too; the `db_at_parent_state` guard is what prevents it.
+    /// Cached by `parent_hash`, so a late read would poison every sibling block with that parent
+    /// too; the `db_at_parent_state` guard is what prevents it.
     pub(crate) fn load_lane_meta(&mut self) -> Result<LaneMeta, BlockExecutionError> {
         if !self.db_at_parent_state {
             return Err(lane_reject(LaneError::StateUnavailable(
@@ -397,11 +392,9 @@ where
         Ok(meta)
     }
 
-    /// Derives this block's payment lane from the parent's ratio and this block's `gas_limit`,
-    /// or leaves it unset until the fork binds — see
-    /// [`payment_lane_applies`](crate::hardforks::BscHardforks::payment_lane_applies).
-    ///
-    /// Must run before this block mutates state; [`Self::load_lane_meta`] enforces it.
+    /// Derives this block's lane from the parent's ratio and this block's `gas_limit`, or leaves
+    /// it unset until [`BscHardforks::payment_lane_applies`](crate::hardforks::BscHardforks)
+    /// says the fork binds. Must run before this block mutates state.
     fn init_payment_lane(
         &mut self,
         parent: &Header,
@@ -776,8 +769,8 @@ where
             self.inner_ctx.snap = Some(snap.clone());
         }
 
-        // Producer side. `block.gas_limit()` is the sealed limit, not the miner's
-        // system-tx-reserved one, so producer and importer derive the same quota.
+        // `block.gas_limit()` is the sealed limit, not the miner's system-tx-reserved one, so
+        // producer and importer derive the same quota.
         if self.ctx.mode.finalizes() {
             self.init_payment_lane(&parent_header, block.gas_limit())?;
         }

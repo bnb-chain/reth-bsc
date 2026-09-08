@@ -62,8 +62,8 @@ pub struct BscTxResult<H> {
     pub tx_type: TxType,
     pub tx: TransactionSigned,
     pub is_system: bool,
-    /// On the result, not on `self`: a transaction that errors between classification and
-    /// commit must not leave a stale lane behind.
+    /// On the result, not on `self`: a transaction that errors between classification and commit
+    /// must not leave a stale lane behind.
     pub lane: Lane,
 }
 
@@ -79,8 +79,7 @@ impl<H: Send + 'static> TxResult for BscTxResult<H> {
     }
 }
 
-/// BEP-703 lane state for one block: the `0x2007` snapshot read before execution, and the
-/// payment gas booked so far.
+/// One block's lane: the `0x2007` snapshot read before execution, plus the gas booked since.
 #[derive(Debug, Clone)]
 pub(crate) struct LaneState {
     pub(crate) meta: LaneMeta,
@@ -455,9 +454,8 @@ where
     }
     /// Which lane this transaction's gas is booked against. `General` until Jenner.
     ///
-    /// The only place this executor decides a lane, for system transactions as much as user
-    /// ones: [`classify`] owns every gate, so nothing is added here beyond the pre-Jenner
-    /// short circuit.
+    /// The only place this executor decides a lane: [`classify`] owns every gate, so nothing is
+    /// added here beyond the pre-Jenner short circuit.
     pub(crate) fn classify_lane(
         &mut self,
         is_system: bool,
@@ -565,9 +563,8 @@ where
         // Detect system transactions: skip EVM execution, accumulate for later.
         let is_system = is_system_transaction(&tx_signed, signer, self.evm.block().beneficiary());
 
-        // Ahead of the branch below, so both arms take their lane from the same call. `classify`
-        // answers `General` on `is_system` before it reaches the code probe, so this costs a
-        // system transaction nothing.
+        // Before the branch below, so both arms take their lane from the same call. `classify`
+        // answers `General` for a system transaction without reaching the code probe.
         let lane = {
             use alloy_consensus::{Transaction as _, Typed2718 as _};
             self.classify_lane(is_system, tx_signed.to(), tx_signed.ty(), tx_signed.value())?
@@ -626,13 +623,12 @@ where
             (to, selector, input.len())
         };
 
-        // The BEP-703 admission gate. go-bsc gates exactly one loop this way (`worker.go`'s pool
-        // loop), never the import path and never an MEV bid — see [`BscExecutionMode`].
+        // The admission gate, in the one mode that packs from the pool: the importer must
+        // account for what it is given, and a bid arrives with its transaction set fixed.
+        // `shared` subtracts the gas the miner reserves for its own system transactions.
         //
-        // `shared` subtracts the miner's system-transaction reserve, the same quantity go-bsc's
-        // gas pool holds. `InvalidTx` is the sentinel because both producing loops already answer
-        // it with go-bsc's `txs.Pop()` — dropping this transaction and the sender's later nonces
-        // — whereas a capacity error aborts the build.
+        // `InvalidTx` is the sentinel both producing loops already answer by dropping this
+        // transaction and the sender's later nonces; a capacity error would abort the build.
         if self.ctx.mode == BscExecutionMode::Mining {
             if let Some(lane_state) = self.inner_ctx.payment_lane.as_ref() {
                 let reserved = self.parlia.estimate_gas_reserved_for_system_txs(
@@ -805,18 +801,15 @@ where
             }
         }
 
-        // BEP-703's block rule as the producer's self-check, the same verdict the importer
-        // reaches in `post_check_new_block`. After the mode match, so the Parlia system
-        // transactions issued above are already in `self.gas_used`. Failure declines the block;
-        // there is no fallback that produces with the lane switched off.
+        // The same verdict the importer reaches, as the producer's self-check. After the mode
+        // match, so the system transactions issued above are already in `self.gas_used`. Failure
+        // declines the block; there is no fallback that produces with the lane switched off.
         if self.ctx.mode.finalizes() {
             if let Some(lane) = self.inner_ctx.payment_lane.as_ref() {
                 lane.budget.verify(self.evm.block().gas_limit(), self.gas_used).map_err(|e| {
                     crate::metrics::LANE_METRICS.produce_declined.increment(1);
                     lane_reject(e)
                 })?;
-                crate::metrics::LANE_METRICS.quota.set(lane.budget.quota as f64);
-                crate::metrics::LANE_METRICS.idle.set(lane.budget.idle() as f64);
             }
         }
 

@@ -369,10 +369,9 @@ pub trait BscHardforks: EthereumHardforks {
     /// Whether the BEP-703 payment lane binds in a block whose parent is
     /// `(parent_number, parent_timestamp)`.
     ///
-    /// Takes the PARENT, never the block's own header: §3.4.3 reads the ratio from the parent's
+    /// Takes the PARENT, never the block's own header: the ratio is read from the parent's
     /// post-state, and Jenner installs `0x2007` *while* its activation block executes — so that
-    /// block has no lane and `activation + 1` is the first block the reservation binds in.
-    /// go-bsc's `config.IsJenner(parent.Number, parent.Time)` guard in `ResolveLaneState`.
+    /// block has no lane, and `activation + 1` is the first block that reserves.
     fn payment_lane_applies(&self, parent_number: u64, parent_timestamp: u64) -> bool {
         self.is_jenner_active_at_timestamp(parent_number, parent_timestamp)
     }

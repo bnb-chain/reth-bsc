@@ -589,9 +589,8 @@ impl MevApiImpl {
         }
 
         // A validator must self-produce a hard-fork activation block: Jenner installs `0x2007`
-        // while that block executes, and go-bsc refuses a BidBlock there (`miner_mev.go`'s
-        // `IsOnJenner` arm). Refusing it here too is what keeps the two clients agreeing on
-        // which builder blocks are admissible.
+        // while that block executes, and the lane does not bind there. go-bsc refuses a BidBlock
+        // on such a block, so this client has to refuse it too.
         let next_number = head_header.number + 1;
         if self.chain_spec.is_jenner_transition_at_timestamp(
             next_number,

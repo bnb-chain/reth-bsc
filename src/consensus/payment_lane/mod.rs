@@ -1,45 +1,35 @@
 //! BEP-703 payment lane.
 //!
-//! A block reserves `paymentLaneQuota` gas that only payment transactions may consume. It is a
-//! gas accounting rule, not a region of the block: ordering and pricing are untouched, and
-//! nothing reaches the header — the quota is a pure function of the ratio in the parent's
-//! post-state and this block's gas limit, so every node derives it independently.
+//! A block reserves gas that only payment transactions may consume. It is an accounting rule,
+//! not a region of the block: ordering and pricing are untouched, and nothing reaches the header
+//! — the quota is a function of the parent's ratio and this block's gas limit, so every node
+//! derives it independently.
 //!
-//! Pure rules only; reading `0x2007` and caching the result live in
-//! `src/node/evm/pre_execution.rs`.
+//! Rules only; reading `0x2007` and caching the result live in `node/evm/pre_execution.rs`.
 
 pub mod meta;
 pub mod rules;
 
 pub use crate::system_contracts::PAYMENT_LANE_CONTRACT;
 
-/// Denominator of the ratio stored in the PaymentLane contract: a stored `N` reserves
-/// `N / RATIO_DENOM` of the gas limit. BEP-703 §3.6.1.
+/// A stored ratio of `N` reserves `N / RATIO_DENOM` of the gas limit.
 pub(crate) const RATIO_DENOM: u64 = 10_000;
 
-/// BEP-703 §3.6.1's upper bound on the ratio — at most 10% of the gas limit.
-///
-/// A protocol constant, not a governable one: a ceiling governance can raise is not a ceiling.
+/// The lane may never reserve more than 10% of the gas limit, and that bound is not governable.
 pub(crate) const MAX_LANE_RATIO: u64 = 1_000;
 
-/// Entries requested per `getPaymentContracts` page.
-///
-/// Matches go-bsc so both clients spend the same gas walking the list.
+/// Entries per contract-list page. Matches go-bsc, so both clients spend the same gas walking
+/// the list.
 pub(crate) const PAGE_SIZE: u64 = 128;
 
-/// Contract-enforced ceiling on the payment contract list (BEP-703 §3.6.1).
-///
-/// The contract enforces it on governance writes, so no node treats the count as a block
-/// validity condition; it is checked here only to bound the walk.
+/// The contract's own ceiling on the list. It enforces this on governance writes, so no node
+/// treats the count as a validity condition; checked here only to bound the walk.
 pub(crate) const MAX_LISTED_CONTRACTS: u64 = 100_000;
 
-/// Gas budget for one read-only call into the PaymentLane contract.
-///
-/// Fixed, never the block's gas limit: a page walk that runs out of gas is a consensus verdict,
-/// so both clients must run out at the same point.
+/// Gas for one read-only PaymentLane call. Fixed, never the block's gas limit: running out
+/// mid-walk is a consensus verdict, so both clients must run out at the same point.
 pub(crate) const GETTER_GAS_LIMIT: u64 = 50_000_000;
 
-/// Which lane a transaction's gas is booked against.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lane {
     General,
@@ -47,9 +37,7 @@ pub enum Lane {
 }
 
 /// One block's lane: the quota derived before execution, plus the payment gas booked as the
-/// block runs.
-///
-/// Deliberately not `Copy`: a budget passed by value would discard the accumulation.
+/// block runs. Deliberately not `Copy` — a budget passed by value would drop the accumulation.
 #[derive(Clone, Debug, Default)]
 pub struct Budget {
     pub quota: u64,
@@ -57,8 +45,7 @@ pub struct Budget {
 }
 
 /// `StateUnavailable` is a local fault and must never reject a block; every other variant is a
-/// consensus verdict. Collapsing the two makes a pruned node reject the whole network — the same
-/// split go-bsc draws with `ErrStateUnavailable` and its `reportBadBlock` bypass.
+/// verdict on the block. Collapsing the two would make a pruned node reject the whole network.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum LaneError {
     #[error(
