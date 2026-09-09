@@ -492,14 +492,14 @@ pub fn justified_pair_for_hash(header_hash: &B256) -> Option<(BlockNumber, B256)
 ///
 /// `verify_vote_origin` cannot run on a future vote: it resolves membership from
 /// the target's parent snapshot, and we do not hold the target. But the
-/// validator set only changes on epoch boundaries, and the admission window caps
-/// a future target at `head + 11`, so the set at our head is the set that will
-/// govern the target — unless an epoch boundary falls in between.
+/// validator set only changes at one block per epoch, and the admission window
+/// caps a future target at `head + 11`, so the set at our head is the set that
+/// will govern the target — unless that block falls in between.
 ///
 /// Returns:
 /// - `Some(true)`  sender is a validator in the current set
 /// - `Some(false)` sender is not, and cannot become one inside the window
-/// - `None` undecidable: no snapshot, or an epoch boundary lies in
+/// - `None` undecidable: no snapshot, or a validator-set swap lies in
 ///   `(head, target]` so the governing set may differ. Callers admit these
 ///   uncapped rather than guess.
 fn future_vote_sender_is_validator(vote: &VoteEnvelope) -> Option<bool> {
@@ -510,14 +510,42 @@ fn future_vote_sender_is_validator(vote: &VoteEnvelope) -> Option<bool> {
         return None;
     }
 
-    // An epoch boundary between head and target can swap the set out from under
-    // us; decline to judge rather than risk rejecting an incoming validator.
-    let epoch = snap.epoch_num.max(1);
-    if vote.data.target_number / epoch > head_number / epoch {
+    // A validator-set swap between head and target changes the set out from
+    // under us; decline to judge rather than risk rejecting an incoming
+    // validator.
+    if validator_set_swaps_within(
+        head_number,
+        vote.data.target_number,
+        snap.epoch_num,
+        snap.miner_history_check_len(),
+    ) {
         return None;
     }
 
     Some(snap.validators_map.values().any(|v| v.vote_addr == vote.vote_address))
+}
+
+/// Whether a validator-set swap falls in `(head, target]`.
+///
+/// The set does **not** change at the epoch multiple: it changes `offset`
+/// blocks later, where `offset` is `Snapshot::miner_history_check_len()`. That
+/// is the `header.number % epoch_num == miner_check_len` test in
+/// `SnapshotProvider::try_rebuild`, and it is the only place the set is
+/// swapped. With 21 validators at `turn_length` 4 the offset is 43, so on a
+/// 1000-block epoch the set turns over at `…043`, not `…000`.
+///
+/// Counting the swap points at or below each height and comparing the counts
+/// catches a boundary wherever it sits in the window, and needs no special case
+/// for a window that spans an epoch multiple.
+fn validator_set_swaps_within(head: u64, target: u64, epoch: u64, offset: u64) -> bool {
+    let epoch = epoch.max(1);
+    // `n % epoch == offset` is unsatisfiable here, so the provider never treats
+    // any block as a boundary. Mirror it rather than invent one.
+    if offset >= epoch {
+        return false;
+    }
+    let swaps_upto = |n: u64| if n >= offset { (n - offset) / epoch + 1 } else { 0 };
+    swaps_upto(target) > swaps_upto(head)
 }
 
 /// Whether a vote plausibly originates from a validator of its target block and
@@ -1466,4 +1494,69 @@ mod tests {
         let _ = drain();
     }
 
+    /// The validator set swaps `miner_history_check_len()` blocks *after* the
+    /// epoch multiple, not at it. Judging a future vote against our own head is
+    /// only sound when no swap sits in `(head, target]`, and watching the
+    /// multiple instead misses the real boundary by that offset — which rejects
+    /// a joining validator's votes outright, since `Some(false)` drops them and
+    /// votes are never re-sent. Raised by will-2012 on #491.
+    #[test]
+    fn validator_set_swap_window_tracks_the_real_boundary() {
+        // Mainnet post-Maxwell: 1000-block epoch, 21 validators, turn_length 4.
+        const EPOCH: u64 = 1000;
+        const OFFSET: u64 = 43; // (21 / 2 + 1) * 4 - 1
+
+        // The swap at 43_043 lies in the window, so membership is undecidable...
+        assert!(validator_set_swaps_within(43_035, 43_043, EPOCH, OFFSET));
+        // ...and both heights share an epoch multiple, so the multiple-based
+        // test saw no boundary at all and judged against the outgoing set.
+        assert_eq!(43_035 / EPOCH, 43_043 / EPOCH);
+
+        // Crossing the multiple without reaching the swap: the set is unchanged...
+        assert!(!validator_set_swaps_within(42_995, 43_000, EPOCH, OFFSET));
+        // ...where the multiple-based test declined to judge. Harmless, but it
+        // gave up the per-block cap for no reason.
+        assert_ne!(42_995 / EPOCH, 43_000 / EPOCH);
+
+        // Half-open window: a swap at `head` is behind us, one at `target` is not.
+        assert!(!validator_set_swaps_within(43_043, 43_050, EPOCH, OFFSET));
+        assert!(validator_set_swaps_within(43_042, 43_043, EPOCH, OFFSET));
+        // Mid-epoch window, nothing near a boundary.
+        assert!(!validator_set_swaps_within(43_100, 43_111, EPOCH, OFFSET));
+    }
+
+    /// Differential check against the predicate that actually swaps the set in
+    /// `SnapshotProvider::try_rebuild`, over every window the admission bound
+    /// permits.
+    #[test]
+    fn validator_set_swap_window_matches_the_provider_predicate() {
+        const EPOCH: u64 = 200;
+        const OFFSET: u64 = 10;
+
+        for head in 0..(EPOCH * 3) {
+            for target in head..=(head + UPPER_LIMIT_OF_VOTE_BLOCK_NUMBER) {
+                // `is_epoch_boundary` in provider.rs, applied block by block.
+                let expected = ((head + 1)..=target).any(|n| n > 0 && n % EPOCH == OFFSET);
+                assert_eq!(
+                    validator_set_swaps_within(head, target, EPOCH, OFFSET),
+                    expected,
+                    "head {head}, target {target}",
+                );
+            }
+        }
+    }
+
+    /// Degenerate configurations must not invent a boundary the provider can
+    /// never reach, and must not divide by zero.
+    #[test]
+    fn validator_set_swap_window_handles_degenerate_epochs() {
+        // offset >= epoch: `n % epoch == offset` never holds, so the provider
+        // never swaps the set and neither may we.
+        assert!(!validator_set_swaps_within(0, 10_000, 200, 200));
+        // A zero epoch is coerced to 1 rather than panicking.
+        assert!(validator_set_swaps_within(5, 6, 0, 0));
+        // Single-validator devnet: offset 0, so the swap sits on the multiple.
+        assert!(validator_set_swaps_within(199, 200, 200, 0));
+        assert!(!validator_set_swaps_within(200, 205, 200, 0));
+    }
 }
