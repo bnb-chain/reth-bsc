@@ -1267,6 +1267,13 @@ where
 
         let new_canonical_head = if need_reorg { incoming_header } else { &current_head };
 
+        // Promote future votes now that a block is in hand. This is the import
+        // event go-bsc gets from `highestVerifiedBlock`: vote arrival cannot
+        // stand in for it, because the vote that would trigger promotion may
+        // already have been received and deduped. It must run before the reads
+        // below, which both source their votes from `cur_votes`.
+        crate::consensus::parlia::vote_pool::promote_future_votes(new_canonical_head.number);
+
         // Get safe block and finalized block with new canonical head
         // ref: https://github.com/bnb-chain/bsc/blob/f70aaa8399ccee429804eecf3fc4c6fd8d9e6cab/eth/api_backend.go#L72
         let (safe_block_number, safe_block_hash) =

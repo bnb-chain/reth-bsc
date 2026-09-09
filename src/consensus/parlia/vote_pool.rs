@@ -61,6 +61,23 @@ struct VoteEntry {
     envelope: VoteEnvelope,
 }
 
+/// One future target considered for promotion, captured under the read lock.
+struct PromotionCandidate {
+    data: VoteData,
+    votes: Vec<VoteEntry>,
+    /// Past the `head + 11` window, so it can never become promotable later:
+    /// judge it now and drop what fails rather than holding it forever.
+    expired: bool,
+}
+
+/// Result of moving one target out of the future pool.
+struct PromotionOutcome {
+    /// At least one vote survived the origin check and reached the current pool.
+    promoted: bool,
+    /// Votes without a verdict remain, so the target must stay queued.
+    requeue: bool,
+}
+
 /// Container for votes associated with a specific block hash.
 #[derive(Default)]
 struct VoteMessages {
@@ -283,68 +300,107 @@ impl VotePool {
     ///
     /// Returns the target hashes that gained current votes, so the caller can
     /// run finality notification after releasing the pool lock.
-    fn transfer_future_votes(&mut self, latest: BlockNumber) -> Vec<B256> {
+    /// Future entries whose target height we have reached, with their votes
+    /// cloned out so the origin checks can run *without* the pool lock held.
+    ///
+    /// Read-only: nothing moves until `apply_promotion` runs with the verdicts.
+    fn promotion_candidates(&self, latest: BlockNumber) -> Vec<PromotionCandidate> {
+        self.future_votes_pq
+            .heap
+            .iter()
+            .map(|Reverse(vd)| *vd)
+            .filter(|vd| vd.target_number <= latest)
+            .map(|vd| PromotionCandidate {
+                expired: vd.target_number.saturating_add(UPPER_LIMIT_OF_VOTE_BLOCK_NUMBER) < latest,
+                votes: self
+                    .future_votes
+                    .get(&vd.target_hash)
+                    .map(|vm| vm.vote_messages.clone())
+                    .unwrap_or_default(),
+                data: vd,
+            })
+            .collect()
+    }
+
+    /// Moves the targets in `resolved` into the current pool, using verdicts
+    /// computed outside the lock. Targets absent from `resolved` are ones whose
+    /// block we still do not hold; they stay future.
+    fn apply_promotion(
+        &mut self,
+        latest: BlockNumber,
+        resolved: &HashMap<B256, HashMap<B256, bool>>,
+    ) -> Vec<B256> {
         let mut promoted = Vec::new();
-
-        // Phase 1: too old to still be considered future.
-        while let Some(vd) = self.future_votes_pq.peek() {
-            if vd.target_number.saturating_add(UPPER_LIMIT_OF_VOTE_BLOCK_NUMBER) >= latest {
-                break;
-            }
-            let hash = vd.target_hash;
-            self.future_votes_pq.pop();
-            if self.promote(hash) {
-                promoted.push(hash);
-            }
-        }
-
-        // Phase 2: promote only what we can now resolve; retain the rest.
         let mut deferred = Vec::new();
+
         while let Some(vd) = self.future_votes_pq.peek() {
             if vd.target_number > latest {
                 break;
             }
             let vd = *vd;
             self.future_votes_pq.pop();
-            if shared::get_canonical_header_by_hash_from_provider(&vd.target_hash).is_none() {
-                deferred.push(vd);
-                continue;
-            }
-            if self.promote(vd.target_hash) {
-                promoted.push(vd.target_hash);
+            match resolved.get(&vd.target_hash) {
+                Some(verdicts) => {
+                    let outcome = self.promote_judged(vd.target_hash, verdicts);
+                    if outcome.promoted {
+                        promoted.push(vd.target_hash);
+                    }
+                    // Re-queue outside the loop: pushing here would let the same
+                    // entry be popped again on this pass, forever.
+                    if outcome.requeue {
+                        deferred.push(vd);
+                    }
+                }
+                None => deferred.push(vd),
             }
         }
+
         for vd in deferred {
             self.future_votes_pq.push(vd);
         }
-
         metrics::gauge!("futureVotesPq.local").set(self.future_votes_pq.heap.len() as f64);
         promoted
     }
 
-    /// Moves one target's future votes into the current pool, dropping any that
-    /// fail the origin check. Returns whether any vote survived.
+    /// Moves one target's future votes into the current pool, dropping those the
+    /// origin check rejected. Returns whether anything survived, and whether the
+    /// target must stay queued.
     ///
-    /// The caller has already popped this hash from the future queue.
-    fn promote(&mut self, block_hash: B256) -> bool {
+    /// Votes that arrived between the verdicts being taken and this write have no
+    /// verdict of their own. They are left in the future pool and the target is
+    /// re-queued, so the next pass judges them rather than this one guessing.
+    fn promote_judged(
+        &mut self,
+        block_hash: B256,
+        verdicts: &HashMap<B256, bool>,
+    ) -> PromotionOutcome {
         let Some(box_) = self.future_votes.remove(&block_hash) else {
-            return false;
+            return PromotionOutcome { promoted: false, requeue: false };
         };
 
         let mut valid = Vec::with_capacity(box_.vote_messages.len());
+        let mut unjudged = Vec::new();
         for entry in box_.vote_messages {
-            if verify_vote_origin(&entry.envelope) {
-                valid.push(entry);
-            } else {
-                // Drop from the dedup set too, so a later legitimate copy is not
-                // mistaken for a duplicate.
-                self.received_votes.remove(&entry.hash);
-                self.total_votes = self.total_votes.saturating_sub(1);
-                metrics::counter!("votes.rejected.origin_on_promote").increment(1);
+            match verdicts.get(&entry.hash) {
+                Some(true) => valid.push(entry),
+                Some(false) => {
+                    // Drop from the dedup set too, so a later legitimate copy is
+                    // not mistaken for a duplicate.
+                    self.received_votes.remove(&entry.hash);
+                    self.total_votes = self.total_votes.saturating_sub(1);
+                    metrics::counter!("votes.rejected.origin_on_promote").increment(1);
+                }
+                None => unjudged.push(entry),
             }
         }
+
+        let requeue = !unjudged.is_empty();
+        if requeue {
+            self.future_votes.entry(block_hash).or_default().vote_messages.extend(unjudged);
+        }
+
         if valid.is_empty() {
-            return false;
+            return PromotionOutcome { promoted: false, requeue };
         }
 
         let data = valid[0].envelope.data;
@@ -353,7 +409,7 @@ impl VotePool {
         }
         self.cur_votes.entry(block_hash).or_default().vote_messages.extend(valid);
         metrics::gauge!("curVotesPq.local").set(self.cur_votes_pq.heap.len() as f64);
-        true
+        PromotionOutcome { promoted: true, requeue }
     }
 
     /// Drops future votes, furthest-ahead target first, until at least `target`
@@ -808,10 +864,14 @@ fn put_vote_inner(vote: VoteEnvelope) {
         return;
     }
 
-    // Lazy prune and promotion: run once per observed head advance. Replaces
-    // geth-bsc's chain-head subscription by piggybacking on the vote ingest
-    // path, which is the same cadence in practice since votes arrive per block.
+    // Lazy prune, once per observed head advance. Promotion is driven by block
+    // import (`promote_future_votes`); the ingest path keeps calling it as a
+    // backstop for the case where the fork-choice engine is not yet wired, but
+    // *before* taking the write lock, since it does provider and snapshot reads.
     let need_head_work = pending_block_number > LAST_PRUNED_BLOCK.load(Ordering::Relaxed);
+    if need_head_work {
+        promote_future_votes(pending_block_number);
+    }
 
     let mut pool = VOTE_POOL.write().expect("vote pool poisoned");
 
@@ -829,9 +889,7 @@ fn put_vote_inner(vote: VoteEnvelope) {
 
     let votes_for_block = pool.insert(vote, pending_block_number, is_future);
 
-    let mut promoted = Vec::new();
     if need_head_work {
-        promoted = pool.transfer_future_votes(pending_block_number);
         pool.prune(pending_block_number);
         LAST_PRUNED_BLOCK.fetch_max(pending_block_number, Ordering::Relaxed);
     }
@@ -871,8 +929,6 @@ fn put_vote_inner(vote: VoteEnvelope) {
     }
 
     let size = pool.len();
-    let promoted_counts: Vec<(B256, usize)> =
-        promoted.iter().map(|h| (*h, pool.len_for_block(h))).collect();
     drop(pool);
     update_vote_pool_size_metric(size);
 
@@ -881,7 +937,67 @@ fn put_vote_inner(vote: VoteEnvelope) {
         block_stats::on_vote_received(target_hash, votes_for_block);
         maybe_notify_finality(target_hash, votes_for_block);
     }
-    // Promoted targets may have crossed quorum while sitting in the future pool.
+}
+
+/// Promote future votes whose target block we now hold, and judge those that
+/// have aged past the admission window.
+///
+/// Driven by **block import**, not by vote arrival. Promotion needs a *block*,
+/// and the vote that would trigger it may never come: `put_vote` returns at its
+/// dedup check, so a re-relayed copy is not an event, and a node that already
+/// received every vote for `N` before importing `N` has nothing left to arrive
+/// until a vote for `N+1` — which does not exist yet if we are the next
+/// proposer. The votes then sit unpromoted through exactly the window where the
+/// split was supposed to help: attestation assembly reads `cur_votes`, and so
+/// does `get_finalized_number_and_hash`, so a full node loses its one-block
+/// finalized lead the same way a validator loses the attestation.
+///
+/// go-bsc drives this off its `highestVerifiedBlock` event. The equivalent choke
+/// point here is `BscForkChoiceEngine::update_forkchoice`, which every node
+/// reaches on every import path. Raised by will-2012 on #491.
+///
+/// The provider and snapshot lookups run between the two locks, never under the
+/// write lock that every incoming vote contends for.
+pub fn promote_future_votes(head_number: BlockNumber) {
+    // Phase 1 — read lock: what is eligible, and the envelopes to judge.
+    let candidates = {
+        let pool = VOTE_POOL.read().expect("vote pool poisoned");
+        pool.promotion_candidates(head_number)
+    };
+    if candidates.is_empty() {
+        return;
+    }
+
+    // Phase 2 — no lock held: the provider and snapshot reads.
+    let mut resolved: HashMap<B256, HashMap<B256, bool>> = HashMap::new();
+    for candidate in candidates {
+        let target_hash = candidate.data.target_hash;
+        if !candidate.expired
+            && shared::get_canonical_header_by_hash_from_provider(&target_hash).is_none()
+        {
+            continue; // still future
+        }
+        resolved.insert(
+            target_hash,
+            candidate
+                .votes
+                .iter()
+                .map(|entry| (entry.hash, verify_vote_origin(&entry.envelope)))
+                .collect(),
+        );
+    }
+    if resolved.is_empty() {
+        return;
+    }
+
+    // Phase 3 — write lock: apply the verdicts.
+    let promoted_counts: Vec<(B256, usize)> = {
+        let mut pool = VOTE_POOL.write().expect("vote pool poisoned");
+        let promoted = pool.apply_promotion(head_number, &resolved);
+        promoted.into_iter().map(|hash| (hash, pool.len_for_block(&hash))).collect()
+    };
+
+    // A target may have crossed quorum while it sat in the future pool.
     for (hash, count) in promoted_counts {
         if count > 0 {
             maybe_notify_finality(hash, count);
@@ -1558,6 +1674,112 @@ mod tests {
         };
         let pair = justified_pair_of(&vote_data, || Some((0, genesis_hash)));
         assert_eq!(pair, Some((0, genesis_hash)));
+    }
+
+    /// A future vote for `target_number`, distinguished by `unique`.
+    fn future_vote(target_hash: B256, target_number: u64, unique: u8) -> VoteEnvelope {
+        let mut address = VoteAddress::default();
+        address[0] = unique;
+        let mut signature = VoteSignature::default();
+        signature[0] = unique;
+        VoteEnvelope {
+            vote_address: address,
+            signature,
+            data: VoteData {
+                source_number: target_number - 1,
+                source_hash: B256::from([0x01; 32]),
+                target_number,
+                target_hash,
+            },
+        }
+    }
+
+    fn verdicts(target: B256, entries: &[(B256, bool)]) -> HashMap<B256, HashMap<B256, bool>> {
+        let inner: HashMap<B256, bool> = entries.iter().copied().collect();
+        [(target, inner)].into_iter().collect()
+    }
+
+    /// Promotion applies verdicts computed outside the lock: accepted votes reach
+    /// the current pool, rejected ones are dropped along with their dedup entry.
+    #[test]
+    fn apply_promotion_moves_accepted_votes_and_drops_rejected() {
+        let target = B256::from([0x77; 32]);
+        let mut pool = VotePool::new();
+        let accepted = future_vote(target, 100, 1);
+        let rejected = future_vote(target, 100, 2);
+        pool.insert(accepted.clone(), 0, true);
+        pool.insert(rejected.clone(), 0, true);
+
+        let promoted = pool.apply_promotion(
+            100,
+            &verdicts(target, &[(accepted.hash(), true), (rejected.hash(), false)]),
+        );
+
+        assert_eq!(promoted, vec![target]);
+        assert_eq!(pool.fetch_vote_by_block_hash(target).len(), 1, "accepted vote is current");
+        assert!(!pool.future_votes.contains_key(&target), "nothing left in the future pool");
+        assert!(
+            !pool.received_votes.contains(&rejected.hash()),
+            "a rejected vote leaves the dedup set, so a legitimate copy can still arrive",
+        );
+    }
+
+    /// A vote that lands between the verdicts being taken and the write has no
+    /// verdict of its own. It must stay future and keep its target queued, rather
+    /// than being guessed either way — and re-queueing must not let the same
+    /// entry be popped again on this pass, which would never terminate.
+    #[test]
+    fn apply_promotion_requeues_votes_that_arrived_after_the_verdicts() {
+        let target = B256::from([0x88; 32]);
+        let mut pool = VotePool::new();
+        let judged = future_vote(target, 100, 3);
+        let latecomer = future_vote(target, 100, 4);
+        pool.insert(judged.clone(), 0, true);
+        pool.insert(latecomer.clone(), 0, true);
+
+        // Verdicts were taken before `latecomer` arrived.
+        let promoted = pool.apply_promotion(100, &verdicts(target, &[(judged.hash(), true)]));
+
+        assert_eq!(promoted, vec![target]);
+        assert_eq!(pool.fetch_vote_by_block_hash(target).len(), 1, "judged vote promoted");
+        assert_eq!(
+            pool.future_votes.get(&target).map(|vm| vm.vote_messages.len()),
+            Some(1),
+            "the unjudged vote stays future",
+        );
+        assert_eq!(
+            pool.future_votes_pq.heap.len(),
+            1,
+            "and its target stays queued so the next pass judges it",
+        );
+    }
+
+    /// Candidate selection is the read-lock half: everything at or below the head
+    /// is a candidate, anything past `head + 11` is flagged so promotion judges it
+    /// now instead of holding it forever, and targets above the head are left
+    /// alone.
+    #[test]
+    fn promotion_candidates_selects_reached_targets_and_flags_expired() {
+        let stale = B256::from([0xa1; 32]);
+        let current = B256::from([0xa2; 32]);
+        let ahead = B256::from([0xa3; 32]);
+        let mut pool = VotePool::new();
+        pool.insert(future_vote(stale, 50, 5), 0, true);
+        pool.insert(future_vote(current, 100, 6), 0, true);
+        pool.insert(future_vote(ahead, 105, 7), 0, true);
+
+        let mut got: Vec<(u64, bool, usize)> = pool
+            .promotion_candidates(100)
+            .into_iter()
+            .map(|c| (c.data.target_number, c.expired, c.votes.len()))
+            .collect();
+        got.sort();
+
+        assert_eq!(
+            got,
+            vec![(50, true, 1), (100, false, 1)],
+            "target 105 is still ahead of the head; 50 is past head-11 so it expires",
+        );
     }
 
     /// Registers a snapshot provider for tests, reusing whichever one another
