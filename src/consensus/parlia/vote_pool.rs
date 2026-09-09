@@ -481,10 +481,44 @@ fn update_vote_pool_size_metric(size: usize) {
 ///
 /// Shared so the vote pool and `BscForkChoiceEngine` derive it one way. The
 /// Luban gate stays with the caller, which is where the chain spec lives.
+///
+/// Before the chain justifies anything the recorded pair is all zeroes, which
+/// resolves to genesis — see `justified_pair_of`.
 pub fn justified_pair_for_hash(header_hash: &B256) -> Option<(BlockNumber, B256)> {
     let sp = shared::get_snapshot_provider()?;
     let snap = sp.snapshot_by_hash(header_hash)?;
-    Some((snap.vote_data.target_number, snap.vote_data.target_hash))
+    justified_pair_of(&snap.vote_data, || {
+        let genesis = shared::get_canonical_header_by_number(0)?;
+        Some((genesis.number, genesis.hash_slow()))
+    })
+}
+
+/// Which block a vote must cite as its source, given the attestation recorded in
+/// a header's snapshot.
+///
+/// A zero target hash is the *absence* of an attestation, not a justified block
+/// living at the zero hash. Nothing can ever cite that hash: our own producers
+/// substitute genesis in this state (`vote_producer.rs`, and `Parlia::assemble_
+/// vote_attestation`), and go-bsc's `GetJustifiedNumberAndHash` returns
+/// `chain.GetHeaderByNumber(0).Hash()` whenever `snap.Attestation == nil`.
+///
+/// Reporting the zero hash here rejects every vote for source mismatch, and the
+/// rejection is self-locking: leaving the state needs an attestation, and an
+/// attestation can only be assembled from the votes being rejected. A fresh
+/// all-reth network therefore never reaches finality at all. Raised by
+/// will-2012 on #491.
+///
+/// `genesis` is lazy so a chain that has justified something never pays for the
+/// lookup, and so the branch is unit-testable without a registered header
+/// provider.
+fn justified_pair_of(
+    vote_data: &VoteData,
+    genesis: impl FnOnce() -> Option<(BlockNumber, B256)>,
+) -> Option<(BlockNumber, B256)> {
+    if vote_data.target_hash == B256::ZERO {
+        return genesis();
+    }
+    Some((vote_data.target_number, vote_data.target_hash))
 }
 
 /// Whether a *future* vote's sender is a validator, judged against the snapshot
@@ -1492,6 +1526,109 @@ mod tests {
         }
 
         let _ = drain();
+    }
+
+    /// A recorded attestation is reported as-is, and the genesis lookup is never
+    /// performed — a chain that has justified something must not pay for it.
+    #[test]
+    fn justified_pair_uses_the_recorded_attestation() {
+        let vote_data = VoteData {
+            source_number: 8,
+            source_hash: B256::from([0x08; 32]),
+            target_number: 9,
+            target_hash: B256::from([0x09; 32]),
+        };
+        let pair = justified_pair_of(&vote_data, || panic!("genesis must not be consulted"));
+        assert_eq!(pair, Some((9, B256::from([0x09; 32]))));
+    }
+
+    /// No attestation resolves to genesis, matching go-bsc's
+    /// `GetJustifiedNumberAndHash` and the substitution our own vote producers
+    /// already make. Reported by will-2012 on #491; verified on a fresh 10-node
+    /// all-reth devnet, where every vote was rejected for source mismatch and
+    /// `finalized` never left genesis.
+    #[test]
+    fn justified_pair_without_an_attestation_resolves_to_genesis() {
+        let genesis_hash = B256::from([0x9e; 32]);
+        let vote_data = VoteData {
+            source_number: 0,
+            source_hash: B256::ZERO,
+            target_number: 0,
+            target_hash: B256::ZERO,
+        };
+        let pair = justified_pair_of(&vote_data, || Some((0, genesis_hash)));
+        assert_eq!(pair, Some((0, genesis_hash)));
+    }
+
+    /// Registers a snapshot provider for tests, reusing whichever one another
+    /// test already installed — `SNAPSHOT_PROVIDER` is a `OnceLock`.
+    fn test_snapshot_provider() -> &'static std::sync::Arc<
+        dyn crate::consensus::parlia::provider::SnapshotProvider + Send + Sync,
+    > {
+        #[derive(Default)]
+        struct MapProvider {
+            snaps: std::sync::RwLock<
+                std::collections::HashMap<B256, crate::consensus::parlia::snapshot::Snapshot>,
+            >,
+        }
+        impl crate::consensus::parlia::provider::SnapshotProvider for MapProvider {
+            fn snapshot_by_hash(
+                &self,
+                block_hash: &B256,
+            ) -> Option<crate::consensus::parlia::snapshot::Snapshot> {
+                self.snaps.read().ok().and_then(|m| m.get(block_hash).cloned())
+            }
+            fn insert(&self, snapshot: crate::consensus::parlia::snapshot::Snapshot) {
+                if let Ok(mut m) = self.snaps.write() {
+                    m.insert(snapshot.block_hash, snapshot);
+                }
+            }
+        }
+
+        if shared::get_snapshot_provider().is_none() {
+            let p: std::sync::Arc<
+                dyn crate::consensus::parlia::provider::SnapshotProvider + Send + Sync,
+            > = std::sync::Arc::new(MapProvider::default());
+            let _ = shared::set_snapshot_provider(p);
+        }
+        shared::get_snapshot_provider().expect("snapshot provider registered")
+    }
+
+    /// Before the chain has justified anything, `vote_data` is all zeroes — the
+    /// *absence* of a justified block, not a justified block whose hash is zero.
+    /// Vote producers know this and substitute genesis (`vote_producer.rs:192`,
+    /// `consensus.rs:785`), and go-bsc's `GetJustifiedNumberAndHash` returns
+    /// `chain.GetHeaderByNumber(0).Hash()` when `snap.Attestation == nil`.
+    ///
+    /// Reporting the zero hash here makes `verify_vote_origin` reject every vote
+    /// on such a chain for source mismatch, and the rejection is self-locking:
+    /// leaving the state needs an attestation, which can only be assembled from
+    /// the votes being rejected. Raised by will-2012 on #491.
+    #[test]
+    fn justified_pair_never_reports_the_zero_hash() {
+        use crate::consensus::parlia::snapshot::{Snapshot, DEFAULT_EPOCH_LENGTH};
+
+        let head_hash = B256::from([0x5a; 32]);
+        let snap = Snapshot::new(
+            vec![alloy_primitives::Address::ZERO],
+            10,
+            head_hash,
+            DEFAULT_EPOCH_LENGTH,
+            None,
+        );
+        assert_eq!(
+            snap.vote_data.target_hash,
+            B256::ZERO,
+            "a snapshot with no attestation records the zero hash",
+        );
+        test_snapshot_provider().insert(snap);
+
+        let pair = justified_pair_for_hash(&head_hash);
+        assert!(
+            !matches!(pair, Some((_, B256::ZERO))),
+            "no attestation must not be reported as a justified block at the zero hash, \
+             which no vote can ever cite; got {pair:?}",
+        );
     }
 
     /// The validator set swaps `miner_history_check_len()` blocks *after* the
