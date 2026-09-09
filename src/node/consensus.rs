@@ -1267,13 +1267,6 @@ where
 
         let new_canonical_head = if need_reorg { incoming_header } else { &current_head };
 
-        // Promote future votes now that a block is in hand. This is the import
-        // event go-bsc gets from `highestVerifiedBlock`: vote arrival cannot
-        // stand in for it, because the vote that would trigger promotion may
-        // already have been received and deduped. It must run before the reads
-        // below, which both source their votes from `cur_votes`.
-        crate::consensus::parlia::vote_pool::promote_future_votes(new_canonical_head.number);
-
         // Get safe block and finalized block with new canonical head
         // ref: https://github.com/bnb-chain/bsc/blob/f70aaa8399ccee429804eecf3fc4c6fd8d9e6cab/eth/api_backend.go#L72
         let (safe_block_number, safe_block_hash) =
@@ -1304,7 +1297,7 @@ where
             "Fork choice updated"
         );
 
-        match self
+        let outcome = match self
             .engine_handle
             .fork_choice_updated(state, None)
             .await
@@ -1316,7 +1309,28 @@ where
                 _ => Ok(()),
             },
             Err(err) => Err(ParliaConsensusErr::ForkChoiceUpdateError(err.to_string())),
+        };
+
+        // Promote future votes now that the block is canonical. This is the
+        // import event go-bsc gets from `highestVerifiedBlock`, and vote arrival
+        // cannot stand in for it: the vote that would trigger promotion may
+        // already have been received and deduped.
+        //
+        // It has to run *after* the forkchoice update, not before. reth
+        // canonicalizes in `on_forkchoice_updated`, never in `on_new_payload`,
+        // and `ConsistentProvider::header` resolves a hash only against the
+        // canonical in-memory chain or the database. Before the update the block
+        // we just imported is in neither, so every vote for it would be judged
+        // "still future" and skipped — leaving the next proposer reading an empty
+        // `cur_votes`, which is the lag this is meant to remove.
+        //
+        // A failed update means the block did not become canonical, so there is
+        // nothing to promote against.
+        if outcome.is_ok() {
+            crate::consensus::parlia::vote_pool::promote_future_votes(new_canonical_head.number);
         }
+
+        outcome
     }
 
     /// Determines if a chain reorganization is needed based on fork choice rules.
