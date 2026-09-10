@@ -104,6 +104,9 @@ where
 
 /// Classify `address` against the full cabinet-first validator set at `parent`, returning
 /// the cabinet and total counts for this event's majority thresholds.
+///
+/// The counts are returned even when `address` is absent ([`ValidatorRole::None`]) so callers
+/// can fall back to another membership source without losing the thresholds in force.
 pub(crate) fn validator_role_at_parent<S, Spec>(
     state: S,
     spec: Spec,
@@ -122,10 +125,6 @@ where
     let validators = system_contracts
         .unpack_all_validators(&output)
         .map_err(BlockExecutionError::msg)?;
-    let Some(index) = validators.iter().position(|validator| *validator == address) else {
-        return Ok((ValidatorRole::None, 0, 0));
-    };
-
     let (to, data) = system_contracts.get_num_of_cabinets();
     let output = view_call_at_header(&mut db, &spec, parent.header(), to, data)?;
     let configured_cabinets =
@@ -138,7 +137,11 @@ where
         };
 
     let cabinets = configured_cabinets.min(validators.len());
-    Ok((classify_working_validator(index, validators.len(), cabinets), cabinets, validators.len()))
+    let role = match validators.iter().position(|validator| *validator == address) {
+        Some(index) => classify_working_validator(index, validators.len(), cabinets),
+        None => ValidatorRole::None,
+    };
+    Ok((role, cabinets, validators.len()))
 }
 
 #[cfg(test)]

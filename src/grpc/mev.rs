@@ -235,35 +235,60 @@ impl BidBlockService for MevGrpcApi {
             None => self.acquire()?,
         };
         self.metrics.requests_total.increment(1);
-        let _timer = HandlerTimer { started: Instant::now(), metrics: self.metrics.clone() };
+        let started = Instant::now();
+        let _timer = HandlerTimer { started, metrics: self.metrics.clone() };
 
         let request = request.into_inner();
+        let payload_bytes = request.bid_block_rlp.len();
         tracing::info!(
             transport = "grpc",
-            payload_bytes = request.bid_block_rlp.len(),
+            payload_bytes,
             signature_bytes = request.signature.len(),
-            validator_host_name = %request.validator_host_name,
+            // Untrusted wire input: `?` escapes control characters so a peer cannot forge log lines.
+            validator_host_name = ?request.validator_host_name,
             "[BID BLOCK GRPC RECEIVED]"
         );
-        self.metrics.payload_size_bytes.record(request.bid_block_rlp.len() as f64);
+        self.metrics.payload_size_bytes.record(payload_bytes as f64);
+
+        match self.handle_send_bid_block(request).await {
+            Ok(bid_hash) => {
+                Ok(Response::new(BidBlockResponse { bid_hash: bid_hash.as_slice().to_vec() }))
+            }
+            Err(status) => {
+                // go-bsc logs `[BID BLOCK GRPC FAILED]` for every rejected request; keep the same
+                // fields (payload size, gRPC code, elapsed, error) so operators can correlate.
+                self.metrics.errors_total.increment(1);
+                tracing::warn!(
+                    transport = "grpc",
+                    payload_bytes,
+                    code = ?status.code(),
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    err = %status.message(),
+                    "[BID BLOCK GRPC FAILED]"
+                );
+                Err(status)
+            }
+        }
+    }
+}
+
+impl MevGrpcApi {
+    /// Decode and admit one BidBlock. Every rejection returns through the caller, which owns the
+    /// single failure log and error metric.
+    async fn handle_send_bid_block(&self, request: BidBlockRequest) -> Result<B256, Status> {
         if request.encoded_len() > MAX_MEV_GRPC_MESSAGE_SIZE {
-            self.metrics.errors_total.increment(1);
             return Err(Status::resource_exhausted("message exceeds maximum size"));
         }
         if request.bid_block_rlp.is_empty() {
-            self.metrics.errors_total.increment(1);
             return Err(mev_status(-38001, "empty BidBlock RLP"));
         }
 
         let decode_started = Instant::now();
         let mut encoded = request.bid_block_rlp.as_slice();
-        let bid_block = BidBlock::decode(&mut encoded).map_err(|_| {
-            self.metrics.errors_total.increment(1);
-            mev_status(-38001, "invalid BidBlock RLP")
-        })?;
+        let bid_block =
+            BidBlock::decode(&mut encoded).map_err(|_| mev_status(-38001, "invalid BidBlock RLP"))?;
         self.metrics.decode_duration_seconds.record(decode_started.elapsed().as_secs_f64());
         if !encoded.is_empty() {
-            self.metrics.errors_total.increment(1);
             return Err(mev_status(-38001, "invalid BidBlock RLP"));
         }
 
@@ -279,10 +304,8 @@ impl BidBlockService for MevGrpcApi {
 
         // validator_host_name is a sentry routing hint. Like go-bsc, a validator ignores it.
         let args = BidBlockArgs { bid_block, signature: AlloyBytes::from(request.signature) };
-        let bid_hash = self.submitter.submit_bid_block(args).await.map_err(|err| {
-            self.metrics.errors_total.increment(1);
-            rpc_error_to_status(&err)
-        })?;
+        let bid_hash =
+            self.submitter.submit_bid_block(args).await.map_err(|err| rpc_error_to_status(&err))?;
 
         tracing::info!(
             transport = "grpc",
@@ -291,7 +314,7 @@ impl BidBlockService for MevGrpcApi {
             "[BID BLOCK GRPC ACCEPTED]"
         );
 
-        Ok(Response::new(BidBlockResponse { bid_hash: bid_hash.as_slice().to_vec() }))
+        Ok(bid_hash)
     }
 }
 

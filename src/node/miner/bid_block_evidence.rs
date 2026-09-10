@@ -202,6 +202,28 @@ impl BadBidBlockTracker {
     }
 }
 
+/// Whether the parent Parlia snapshot authorized `sealer` to seal the evidenced block.
+fn sealer_in_parent_snapshot(evidence: &BadBidBlockEvidence) -> bool {
+    shared::get_snapshot_provider()
+        .and_then(|provider| provider.snapshot_by_hash(&evidence.parent.hash()))
+        .is_some_and(|snapshot| snapshot.validators.contains(&evidence.sealer))
+}
+
+/// Combine the contract-derived role with snapshot membership.
+///
+/// Parlia applies a new validator set only `len/2` blocks after the epoch block, so for that
+/// window the contract state at `parent` already holds the next set while the sealer was still
+/// authorized by the previous one. The snapshot is authoritative for who may seal: a sealer found
+/// there but absent from the contract set is counted as a candidate, since it holds no cabinet
+/// seat in the set now in force. A sealer in neither is not evidence.
+fn resolve_sealer_role(contract_role: ValidatorRole, in_snapshot: bool) -> Option<ValidatorRole> {
+    match contract_role {
+        ValidatorRole::None if in_snapshot => Some(ValidatorRole::Candidate),
+        ValidatorRole::None => None,
+        role => Some(role),
+    }
+}
+
 async fn run_evidence_service<P>(
     mut receiver: mpsc::Receiver<BadBidBlockEvidence>,
     provider: P,
@@ -254,7 +276,7 @@ async fn run_evidence_service<P>(
                 continue;
             }
         };
-        if role == ValidatorRole::None {
+        let Some(role) = resolve_sealer_role(role, sealer_in_parent_snapshot(&evidence)) else {
             tracing::debug!(
                 target: "bsc::bid_block_evidence",
                 builder = %evidence.builder,
@@ -263,7 +285,7 @@ async fn run_evidence_service<P>(
                 "Bad BidBlock sealer is not in the parent validator set"
             );
             continue;
-        }
+        };
 
         let (cabinet_votes, total_votes) = tracker.add(
             evidence.builder,
@@ -385,6 +407,26 @@ mod tests {
         let builder = address(0xb0);
         tracker.add(builder, address(1), true, now);
         assert_eq!(tracker.add(builder, address(1), false, now), (1, 1));
+    }
+
+    #[test]
+    fn snapshot_membership_covers_epoch_transition_lag() {
+        // Contract already holds the next set, snapshot still authorizes the sealer.
+        assert_eq!(
+            resolve_sealer_role(ValidatorRole::None, true),
+            Some(ValidatorRole::Candidate)
+        );
+        // In neither source: not evidence.
+        assert_eq!(resolve_sealer_role(ValidatorRole::None, false), None);
+        // Contract classification wins whenever it exists.
+        assert_eq!(
+            resolve_sealer_role(ValidatorRole::Cabinet, false),
+            Some(ValidatorRole::Cabinet)
+        );
+        assert_eq!(
+            resolve_sealer_role(ValidatorRole::Candidate, true),
+            Some(ValidatorRole::Candidate)
+        );
     }
 
     #[test]
