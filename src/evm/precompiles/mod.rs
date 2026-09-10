@@ -438,6 +438,15 @@ fn build_pasteur_precompiles() -> Precompiles {
     precompiles
 }
 
+fn build_jenner_precompiles() -> Precompiles {
+    let mut precompiles = build_pasteur_precompiles();
+    // Jenner reprices 0x68 (double-sign evidence) per input byte; the verification logic is
+    // unchanged. BEP-706's 0x70 milli-timestamp precompile is *not* here: it reads block
+    // context and is registered dynamically by `BscEvm::new` (see `milli_timestamp`).
+    precompiles.extend([double_sign::DOUBLE_SIGN_EVIDENCE_VALIDATION_JENNER]);
+    precompiles
+}
+
 // --- Traced precompile singletons ---------------------------------------------------------------
 
 fn istanbul_traced() -> &'static TracedPrecompiles {
@@ -505,12 +514,19 @@ fn pasteur_traced() -> &'static TracedPrecompiles {
     INSTANCE.get_or_init(|| Box::new(build_traced_precompiles(build_pasteur_precompiles())))
 }
 
+fn jenner_traced() -> &'static TracedPrecompiles {
+    static INSTANCE: OnceBox<TracedPrecompiles> = OnceBox::new();
+    INSTANCE.get_or_init(|| Box::new(build_traced_precompiles(build_jenner_precompiles())))
+}
+
 fn traced_precompiles_for_spec(spec: BscHardfork) -> &'static TracedPrecompiles {
     // Osaka uses updated precompiles (EIP-7823/7883 MODEXP, EIP-7951 P256VERIFY)
-    if spec >= BscHardfork::Pasteur {
-        // Pasteur reuses the Mendel precompile set today; later PRs add the dedicated
-        // Pasteur bridge precompiles (validator-set dedup, suspended v1 precompiles, etc.)
-        // via `build_pasteur_precompiles`.
+    if spec >= BscHardfork::Jenner {
+        // Jenner: 0x68 (double-sign evidence) is repriced per input byte.
+        jenner_traced()
+    } else if spec >= BscHardfork::Pasteur {
+        // Pasteur bridge precompiles: validator-set dedup, suspended v1 precompiles, and
+        // per-input-byte pricing for 0x67.
         pasteur_traced()
     } else if spec >= BscHardfork::Mendel {
         mendel_traced()
@@ -607,9 +623,15 @@ pub fn mendel() -> &'static Precompiles {
 }
 
 /// Returns precompiles for Pasteur spec.
-/// Currently identical to Mendel; later PRs add the Pasteur bridge precompiles.
+/// Same addresses as Mendel, with the Pasteur bridge-precompile variants at 0x64/0x65/0x67.
 pub fn pasteur() -> &'static Precompiles {
     pasteur_traced().precompiles()
+}
+
+/// Returns precompiles for Jenner spec.
+/// Same as Pasteur, with 0x68 (double-sign evidence) repriced per input byte.
+pub fn jenner() -> &'static Precompiles {
+    jenner_traced().precompiles()
 }
 
 // BSC precompile provider
@@ -674,5 +696,45 @@ mod tests {
         // 0x66 (BLS) is unchanged at Pasteur — it stays the generic verify (matches geth).
         let bls = u64_to_address(102);
         assert!(is_custom(&id_of(pasteur, bls), "BLS_SIGNATURE_VERIFY"));
+    }
+
+    /// Jenner keeps Pasteur's address set but reprices 0x68 per input byte. The tables are
+    /// built untraced on purpose: the traced wrappers dispatch through the thread-local trace
+    /// context, which is unset here and would resolve to the default spec.
+    #[test]
+    fn jenner_reprices_double_sign_but_keeps_the_pasteur_address_set() {
+        let jenner = build_jenner_precompiles();
+        let pasteur = build_pasteur_precompiles();
+
+        assert_eq!(jenner.addresses_set(), pasteur.addresses_set());
+
+        let double_sign = u64_to_address(104);
+        // Non-evidence input: both variants revert, which is enough to observe the gas charged.
+        let input = [0u8; 128];
+        let gas_limit = 1_000_000;
+
+        let jenner_gas = jenner
+            .get(&double_sign)
+            .expect("0x68 present at Jenner")
+            .execute(&input, gas_limit, 0)
+            .expect("no fatal error")
+            .gas_used;
+        let pasteur_gas = pasteur
+            .get(&double_sign)
+            .expect("0x68 present at Pasteur")
+            .execute(&input, gas_limit, 0)
+            .expect("no fatal error")
+            .gas_used;
+
+        assert_eq!(pasteur_gas, 10_000);
+        assert_eq!(jenner_gas, 10_000 + input.len() as u64 * 16);
+    }
+
+    /// A Jenner-spec EVM must resolve to the Jenner table, not fall through to Pasteur's.
+    #[test]
+    fn jenner_spec_resolves_to_the_jenner_table() {
+        let jenner = traced_precompiles_for_spec(BscHardfork::Jenner);
+        assert!(std::ptr::eq(jenner, jenner_traced()));
+        assert!(!std::ptr::eq(jenner, pasteur_traced()));
     }
 }
