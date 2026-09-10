@@ -202,7 +202,7 @@ pub fn maybe_produce_and_broadcast_for_head(
         }
     }
 
-    // Check vote rules against local journal to prevent slashing and double votes.
+    // Cheap pre-filter only; `write_vote` re-runs the rules atomically under its own lock.
     if !vote_journal::under_rules(source_number, target_number) {
         tracing::debug!(target: "bsc::vote", reason = "under-rules-failed", source_number=source_number, target_number=target_number, "skip vote production");
         return;
@@ -213,11 +213,14 @@ pub fn maybe_produce_and_broadcast_for_head(
     // Sign and insert/broadcast
     match bls_signer::sign_vote_with_global(data) {
         Ok(envelope) => {
-            // Persist in journal first to avoid vote loss due to failures.
             if let Err(e) = vote_journal::persist_vote(&envelope) {
-                tracing::error!(target: "bsc::vote", error=%e, "Failed to write vote into journal");
-                VOTE_METRICS.vote_journal_errors_total.increment(1);
-                // Continue despite journal error; do not halt voting pipeline.
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    tracing::debug!(target: "bsc::vote", reason = "journal-rules-failed", target_number=target_number, "skip vote production");
+                } else {
+                    tracing::error!(target: "bsc::vote", error=%e, "Failed to write vote into journal, skipping vote");
+                    VOTE_METRICS.vote_journal_errors_total.increment(1);
+                }
+                return;
             }
             // insert into local pool
             tracing::trace!(target: "bsc::vote", "insert self vote into local pool, target_number: {}, target_hash: {}", data.target_number, data.target_hash);
@@ -229,5 +232,85 @@ pub fn maybe_produce_and_broadcast_for_head(
             tracing::warn!(target: "bsc::vote", error=%e, "Failed to sign vote");
             VOTE_METRICS.vote_signing_errors_total.increment(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::consensus::parlia::snapshot::Snapshot;
+    use alloy_primitives::Address;
+
+    struct FixedSnap(Snapshot);
+    impl SnapshotProvider for FixedSnap {
+        fn snapshot_by_hash(&self, _hash: &B256) -> Option<Snapshot> {
+            Some(self.0.clone())
+        }
+        fn insert(&self, _snapshot: Snapshot) {}
+    }
+
+    fn head_at(number: u64) -> Header {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        Header { number, timestamp: now, ..Default::default() }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn journal_error_blocks_pool_and_broadcast() {
+        let dir = std::env::temp_dir().join(format!("vote_producer_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("BSC_VOTE_JOURNAL_DIR", &dir);
+        std::env::set_var("BSC_VOTE_WARMUP_BLOCKS", "1");
+
+        let mut sk = [0u8; 32];
+        sk[31] = 1;
+        bls_signer::init_global_bls_signer_from_bytes(sk).unwrap();
+        let me = bls_signer::global_bls_public_key().unwrap();
+        let _ = crate::node::miner::config::set_global_mining_config(
+            crate::node::miner::config::MiningConfig {
+                enabled: true,
+                private_key_hex: Some("11".repeat(32)),
+                ..Default::default()
+            },
+        );
+
+        let spec = Arc::new(BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet()));
+        let mut snap = Snapshot::new(
+            vec![Address::repeat_byte(7)],
+            40_000_000,
+            B256::repeat_byte(9),
+            200,
+            Some(vec![me]),
+        );
+        snap.vote_data = VoteData {
+            source_number: 39_999_990,
+            source_hash: B256::repeat_byte(3),
+            target_number: 39_999_990,
+            target_hash: B256::repeat_byte(3),
+        };
+        let sp = FixedSnap(snap);
+
+        // Burn the warm-up block.
+        maybe_produce_and_broadcast_for_head(spec.clone(), &sp, &head_at(40_000_001));
+
+        // Journal writable: the vote reaches the pool.
+        let ok = head_at(40_000_002);
+        maybe_produce_and_broadcast_for_head(spec.clone(), &sp, &ok);
+        assert_eq!(votes::fetch_vote_by_block_hash(ok.hash_slow()).len(), 1);
+
+        // Journal directory replaced by a regular file: persist_vote fails.
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::write(&dir, b"x").unwrap();
+        let bad = head_at(40_000_003);
+        maybe_produce_and_broadcast_for_head(spec.clone(), &sp, &bad);
+        assert!(
+            votes::fetch_vote_by_block_hash(bad.hash_slow()).is_empty(),
+            "unjournalled vote must not reach put_vote or broadcast_votes",
+        );
+
+        let _ = votes::drain();
+        let _ = std::fs::remove_file(&dir);
     }
 }

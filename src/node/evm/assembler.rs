@@ -303,11 +303,10 @@ where
         };
         
         {   // finalize_new_header
-            let parent_header = crate::node::evm::util::HEADER_CACHE_READER
-                .lock()
-                .unwrap()
-                .get_header_by_hash(&header.parent_hash)
-                .ok_or(BlockExecutionError::msg("Failed to get header from global header reader"))?;
+            let parent_header =
+                crate::node::evm::util::get_header_by_hash_from_cache(&header.parent_hash).ok_or(
+                    BlockExecutionError::msg("Failed to get header from global header reader"),
+                )?;
             let parent_header = SealedHeader::new(parent_header, header.parent_hash);
             let parent_snap = snapshot_provider
                 .snapshot_by_hash(&header.parent_hash)
@@ -324,6 +323,7 @@ where
                 &mut header,
                 &snapshot_provider,
                 block_timestamp_ms,
+                None,
             ).map_err(|e| BlockExecutionError::msg(format!("Failed to finalize header: {}", e)))?;
 
             let header_hash = keccak256(alloy_rlp::encode(&header));

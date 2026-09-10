@@ -155,7 +155,7 @@ impl Snapshot {
         ChainSpec: crate::hardforks::BscHardforks,
     {
         let block_number = next_header.number();
-        if self.block_number + 1 != block_number {
+        if self.block_number + 1 != block_number || self.block_hash != next_header.parent_hash() {
             return None; // non-continuous block
         }
 
@@ -583,6 +583,7 @@ mod tests {
         // Create a mock header for apply operation
         struct MockHeader {
             number: u64,
+            parent_hash: alloy_primitives::B256,
             beneficiary: Address,
             extra_data: alloy_primitives::Bytes,
         }
@@ -625,7 +626,7 @@ mod tests {
                 alloy_primitives::Bloom::ZERO
             }
             fn parent_hash(&self) -> alloy_primitives::B256 {
-                alloy_primitives::B256::ZERO
+                self.parent_hash
             }
             fn ommers_hash(&self) -> alloy_primitives::B256 {
                 alloy_primitives::B256::ZERO
@@ -667,6 +668,7 @@ mod tests {
 
         let header = MockHeader {
             number: 1,
+            parent_hash: block_hash,
             beneficiary: validators[0],
             extra_data: alloy_primitives::Bytes::new(),
         };

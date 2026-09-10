@@ -1,7 +1,6 @@
 use alloy_primitives::bytes::BytesMut;
 use alloy_rlp::{Decodable, Encodable};
 use bytes::Bytes;
-use futures::Future;
 use futures::{Stream, StreamExt};
 use reth_eth_wire::multiplex::ProtocolConnection;
 use reth_network_api::PeerId;
@@ -11,15 +10,66 @@ use std::{
     task::{ready, Context, Poll},
 };
 use tokio::sync::{mpsc::UnboundedReceiver, oneshot};
-use tokio::time::{Duration, Sleep};
+use tokio::time::Duration;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
-/// Handshake timeout, mirroring the Go implementation.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// TTL for pending range requests before being pruned
 const PENDING_REQ_TTL: Duration = Duration::from_secs(15);
 /// Minimum interval between pending-request pruning passes
 const PRUNE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Inbound votes a single peer may send us per second, mirroring go-bsc's
+/// `receiveRateLimitPerSecond` (`eth/protocols/bsc/peer.go`). 21 validators each
+/// produce one vote per block interval, so ~47/s is the natural ceiling; go-bsc
+/// sets 68 to leave headroom.
+const VOTE_RECEIVE_RATE_LIMIT_PER_SECOND: u32 = 68;
+/// Length of one vote-accounting period (go-bsc's `secondsPerPeriod`).
+const VOTE_RATE_LIMIT_PERIOD: Duration = Duration::from_secs(30);
+/// Total inbound votes a peer may send us within one period.
+const VOTE_RATE_LIMIT_PER_PERIOD: u32 =
+    VOTE_RECEIVE_RATE_LIMIT_PER_SECOND * VOTE_RATE_LIMIT_PERIOD.as_secs() as u32;
+
+/// Per-peer inbound vote budget over a tumbling window.
+///
+/// Ports go-bsc's `Peer.IsOverLimitAfterReceivingVotes`, including its two
+/// quirks: the window is tumbling rather than sliding, and the packet that rolls
+/// the window is not charged against the new period.
+#[derive(Debug)]
+struct VoteRateLimiter {
+    period_begin: std::time::Instant,
+    period_counter: u32,
+}
+
+impl VoteRateLimiter {
+    fn new() -> Self {
+        Self { period_begin: std::time::Instant::now(), period_counter: 0 }
+    }
+
+    /// Charges `n` received votes against this peer's budget and reports whether
+    /// the peer has exceeded it.
+    ///
+    /// `n` is the number of votes the peer *sent*, not the number we admit. That
+    /// matches go-bsc's `handleVotes`, which charges `len(ann.Votes)` so the
+    /// limit bounds what a peer can push at us rather than what we happen to
+    /// consume.
+    fn is_over_limit_after_receiving(&mut self, n: u32) -> bool {
+        if self.period_begin.elapsed() >= VOTE_RATE_LIMIT_PERIOD {
+            self.period_begin = std::time::Instant::now();
+            self.period_counter = 0;
+            return false;
+        }
+        self.period_counter = self.period_counter.saturating_add(n);
+        self.period_counter > VOTE_RATE_LIMIT_PER_PERIOD
+    }
+
+    /// Backdates the period so the next charge rolls the window.
+    #[cfg(test)]
+    fn force_period_expiry(&mut self) {
+        self.period_begin = std::time::Instant::now()
+            .checked_sub(VOTE_RATE_LIMIT_PERIOD)
+            .expect("machine uptime exceeds one accounting period");
+    }
+}
 
 use super::protocol::proto::BscProtoMessageId;
 use crate::node::network::blocks_by_range::{
@@ -44,23 +94,27 @@ pub enum BscCommand {
     BlocksByRange(BlocksByRangePacket),
 }
 
+/// In-flight `GetBlocksByRange` requests, keyed by request id, each with the
+/// waiter to resolve and the instant it was issued (for TTL pruning).
+type PendingRangeReqs =
+    HashMap<u64, (oneshot::Sender<Result<BlocksByRangePacket, String>>, std::time::Instant)>;
+
 /// Stream that handles incoming BSC protocol messages and returns outgoing messages to send.
 pub struct BscProtocolConnection {
     conn: ProtocolConnection,
     commands: UnboundedReceiverStream<BscCommand>,
-    handshake_deadline: Option<std::pin::Pin<Box<Sleep>>>,
-    handshake_completed: bool,
     is_dialer: bool,
     initial_capability: Option<BscCommand>,
     /// Pending in-flight GetBlocksByRange requests mapped by request_id
-    pending_range_reqs:
-        HashMap<u64, (oneshot::Sender<Result<BlocksByRangePacket, String>>, std::time::Instant)>,
+    pending_range_reqs: PendingRangeReqs,
     /// Protocol version negotiated for this connection (1 or 2)
     proto_version: u64,
     /// PeerId for this connection, if known
     _peer_id: Option<PeerId>,
     /// Last time we pruned pending requests
     last_prune: std::time::Instant,
+    /// Inbound vote budget for this peer
+    vote_rate_limiter: VoteRateLimiter,
 }
 
 impl BscProtocolConnection {
@@ -71,8 +125,10 @@ impl BscProtocolConnection {
         proto_version: u64,
         peer_id: Option<PeerId>,
     ) -> Self {
-        let handshake_deadline = Some(Box::pin(tokio::time::sleep(HANDSHAKE_TIMEOUT)));
-        // Both sides should send initial capability in BSC protocol
+        // We still send the capability packet as our first frame: nodes older than
+        // bsc#3483 block on reading it before they will talk to us. Peers on
+        // bsc#3737 and later no longer send one, and drop ours in their no-op
+        // `handleBscCap`, so sending it stays safe across every peer generation.
         // BSC sends []byte{00} which in RLP is encoded as a single byte 0x00
         let initial_capability = Some(BscCommand::Capability {
             protocol_version: proto_version,
@@ -82,14 +138,13 @@ impl BscProtocolConnection {
         Self {
             conn,
             commands: UnboundedReceiverStream::new(commands),
-            handshake_deadline,
-            handshake_completed: false,
             is_dialer,
             initial_capability,
             pending_range_reqs: HashMap::new(),
             proto_version,
             _peer_id: peer_id,
             last_prune: std::time::Instant::now(),
+            vote_rate_limiter: VoteRateLimiter::new(),
         }
     }
 
@@ -217,78 +272,66 @@ impl BscProtocolConnection {
         Poll::Ready(Some(Some(raw)))
     }
 
-    /// Handle handshake-related frames
-    fn handle_handshake_frame(
-        &mut self,
-        frame: &BytesMut,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Option<BytesMut>>> {
-        tracing::debug!(target: "bsc_protocol", "Handshake not completed, processing handshake frame");
-        // Check for handshake timeout
-        if let Some(deadline) = self.handshake_deadline.as_mut() {
-            if Future::poll(deadline.as_mut(), cx).is_ready() {
-                tracing::warn!(target: "bsc_protocol", "BSC handshake timed out");
-                return Poll::Ready(None);
-            }
-        }
-
-        let slice = frame.as_ref();
-        let msg_id = slice[0];
-
-        tracing::debug!(target: "bsc_protocol", "Handshake not completed, processing handshake frame, msg_id: {:?}", msg_id);
-        if msg_id != BscProtoMessageId::Capability as u8 {
-            tracing::warn!(target: "bsc_protocol", got = format_args!("{:#04x}", msg_id), "Expected capability during handshake");
-            return Poll::Ready(None);
-        }
-
-        // Debug: Show what we received
-        tracing::trace!(
-            target: "bsc_protocol",
-            frame_len = slice.len(),
-            frame_bytes = format!("{:02x?}", &slice[..slice.len().min(16)]),
-            "Raw received frame in handshake"
-        );
-
-        match BscCapPacket::decode(&mut &slice[..]) {
-            Ok(pkt) => {
-                if pkt.protocol_version != self.proto_version {
-                    tracing::warn!(target: "bsc_protocol", "Protocol version mismatch: {} != {}", pkt.protocol_version, self.proto_version);
-                    return Poll::Ready(None);
-                }
-
-                tracing::trace!(target: "bsc_protocol", version = pkt.protocol_version, "Received peer capability");
-
-                tracing::trace!(
-                    target: "bsc_protocol",
-                    is_dialer = self.is_dialer,
-                    "BSC handshake completed successfully"
-                );
-
-                self.handshake_completed = true;
-                self.handshake_deadline = None;
-                tracing::trace!(target: "bsc_protocol", "BSC handshake completed");
-                Poll::Ready(Some(None))
-            }
-            Err(e) => {
-                tracing::warn!(target: "bsc_protocol", error = %e, "Failed to decode BSC capability during handshake");
-                Poll::Ready(None)
-            }
-        }
+    /// Handle an inbound protocol message.
+    ///
+    /// Thin wrapper over [`Self::dispatch`] so the dispatch path can be
+    /// exercised without a [`ProtocolConnection`], which has no public
+    /// constructor.
+    fn handle_protocol_message(&mut self, frame: &BytesMut) -> Option<BytesMut> {
+        Self::dispatch(
+            frame,
+            &mut self.pending_range_reqs,
+            self._peer_id,
+            self.proto_version,
+            &mut self.vote_rate_limiter,
+        )
     }
 
-    /// Handle normal protocol messages after handshake
-    fn handle_protocol_message(&mut self, frame: &BytesMut) -> Option<BytesMut> {
-        tracing::trace!(target: "bsc_protocol", "Handshake completed, processing normal message");
+    /// Route one inbound frame by message id, returning a frame to send back if
+    /// the message requires a reply.
+    ///
+    /// There is deliberately no handshake gate here. The `bsc` subprotocol used
+    /// to require `Capability` (0x00) as the first inbound frame, but bsc#3483
+    /// removed the blocking read and bsc#3737 stops sending the packet
+    /// altogether, so a peer's first frame is normally `Votes`. Rejecting that
+    /// tore down the whole RLPx session — a satellite stream ending drops the
+    /// `eth` primary with it — so 0x00 is now ignored exactly like geth's
+    /// no-op `handleBscCap`.
+    fn dispatch(
+        frame: &BytesMut,
+        pending_range_reqs: &mut PendingRangeReqs,
+        peer_id: Option<PeerId>,
+        proto_version: u64,
+        vote_rate_limiter: &mut VoteRateLimiter,
+    ) -> Option<BytesMut> {
         let slice = frame.as_ref();
         let msg_id = slice[0];
 
-        tracing::trace!(target: "bsc_protocol", "Handshake completed, processing normal message, msg_id: {:?}", msg_id);
+        tracing::trace!(target: "bsc_protocol", msg_id = format_args!("{msg_id:#04x}"), "Processing message");
         match msg_id {
+            x if x == BscProtoMessageId::Capability as u8 => {
+                // Legacy handshake packet. Peers older than bsc#3737 still send
+                // it; the version it carries was only ever a restatement of the
+                // devp2p-negotiated version we already hold, so drop it.
+                tracing::trace!(target: "bsc_protocol", peer = ?peer_id, "Ignoring legacy BSC capability message");
+                None
+            }
             x if x == BscProtoMessageId::Votes as u8 => {
                 tracing::trace!(target: "bsc_protocol", "Processing votes message");
                 match VotesPacket::decode(&mut &slice[..]) {
                     Ok(packet) => {
                         let count = packet.0.len();
+                        let charged = u32::try_from(count).unwrap_or(u32::MAX);
+                        if vote_rate_limiter.is_over_limit_after_receiving(charged) {
+                            tracing::debug!(
+                                target: "bsc_protocol",
+                                peer = ?peer_id,
+                                count,
+                                period_total = vote_rate_limiter.period_counter,
+                                "peer exceeded its inbound vote budget, dropping packet",
+                            );
+                            return None;
+                        }
                         handle_votes_broadcast(packet);
                         tracing::trace!(target: "bsc_protocol", count, "Processed votes packet");
                         None
@@ -335,7 +378,7 @@ impl BscProtocolConnection {
                             blocks = res.blocks.len(),
                             "Received BlocksByRange"
                         );
-                        if let Some((waiter, _)) = self.pending_range_reqs.remove(&res.request_id) {
+                        if let Some((waiter, _)) = pending_range_reqs.remove(&res.request_id) {
                             let _ = waiter.send(Ok(res));
                         } else {
                             tracing::trace!(target: "bsc_protocol", "No waiter for request_id; dropping BlocksByRange");
@@ -350,14 +393,14 @@ impl BscProtocolConnection {
                         tracing::warn!(
                             target: "bsc_protocol",
                             error = %err.error,
-                            peer = ?self._peer_id,
-                            proto_version = self.proto_version,
+                            peer = ?peer_id,
+                            proto_version,
                             frame_len = slice.len(),
                             request_id = ?err.request_id,
                             "Failed to decode BlocksByRangePacket"
                         );
                         if let Some(req_id) = err.request_id {
-                            if let Some((waiter, _)) = self.pending_range_reqs.remove(&req_id) {
+                            if let Some((waiter, _)) = pending_range_reqs.remove(&req_id) {
                                 let _ = waiter.send(Err(format!(
                                     "failed to decode BlocksByRangePacket: {}",
                                     err.error
@@ -406,21 +449,225 @@ impl Stream for BscProtocolConnection {
                 Poll::Pending => return Poll::Pending,
             };
 
-            // Process the frame based on handshake state
-            if !this.handshake_completed {
-                match this.handle_handshake_frame(&raw_frame, cx) {
-                    Poll::Ready(Some(Some(response))) => return Poll::Ready(Some(response)),
-                    Poll::Ready(Some(None)) => continue, // Handshake complete, no response needed
-                    Poll::Ready(None) => return Poll::Ready(None), // Handshake failed
-                    Poll::Pending => return Poll::Pending,
-                }
-            } else if let Some(response) = this.handle_protocol_message(&raw_frame) {
+            if let Some(response) = this.handle_protocol_message(&raw_frame) {
                 return Poll::Ready(Some(response));
-            } else {
-                // After handshake, check if there are more messages to process
-                // If not, we'll loop back and check for commands/incoming frames
-                continue;
             }
+            // No reply needed; loop back for more commands/incoming frames.
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::consensus::parlia::{
+        bls_signer::random_test_signer,
+        vote::{VoteData, VoteEnvelope},
+        votes,
+    };
+    use alloy_primitives::B256;
+
+    /// `ProtocolConnection` has no public constructor, so these tests drive
+    /// [`BscProtocolConnection::dispatch`] directly. That is the function the
+    /// deleted handshake gate used to sit in front of.
+    fn dispatch(frame: &BytesMut) -> Option<BytesMut> {
+        dispatch_with_limiter(frame, &mut VoteRateLimiter::new())
+    }
+
+    fn dispatch_with_limiter(frame: &BytesMut, limiter: &mut VoteRateLimiter) -> Option<BytesMut> {
+        let mut pending = HashMap::new();
+        BscProtocolConnection::dispatch(frame, &mut pending, None, 2, limiter)
+    }
+
+    fn frame_of(msg: impl Encodable) -> BytesMut {
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf);
+        buf
+    }
+
+    fn cap_frame(protocol_version: u64) -> BytesMut {
+        frame_of(BscCapPacket { protocol_version, extra: Bytes::from_static(&[0x00u8]) })
+    }
+
+    /// A genuinely signed vote: the pool authenticates the BLS signature before
+    /// admitting anything, so a synthetic one would be dropped and this test
+    /// would no longer prove the frame was dispatched. `target_number` is kept
+    /// high so vote-pool pruning cannot evict it.
+    fn vote(target_number: u64, target_hash: B256) -> VoteEnvelope {
+        let signer = random_test_signer();
+        signer
+            .sign_vote(VoteData {
+                source_number: target_number - 1,
+                source_hash: B256::repeat_byte(0x11),
+                target_number,
+                target_hash,
+            })
+            .expect("sign vote")
+    }
+
+    // === The bsc#3737 peer generation ===
+
+    /// A peer on bsc#3737 sends no capability packet at all, so its first frame
+    /// is a vote. The old handshake gate answered that with `Poll::Ready(None)`,
+    /// which ended the satellite stream and took the whole RLPx session (`eth`
+    /// included) down with it. It must now be processed normally.
+    #[test]
+    fn votes_as_very_first_frame_are_processed() {
+        let target_hash = B256::repeat_byte(0x5a);
+        let before = votes::len();
+
+        let reply = dispatch(&frame_of(VotesPacket(vec![vote(30_000_000, target_hash)])));
+
+        assert!(reply.is_none(), "a votes frame needs no reply");
+        assert_eq!(votes::len(), before + 1, "the vote must reach the pool");
+    }
+
+    /// Same peer generation, but the first frame is a range request. The old
+    /// gate dropped the session here too, which is what broke fork recovery.
+    #[test]
+    fn get_blocks_by_range_as_very_first_frame_is_answered() {
+        let req = GetBlocksByRangePacket {
+            request_id: 0xfeed,
+            start_block_height: 1,
+            start_block_hash: B256::repeat_byte(0x22),
+            count: 1,
+        };
+
+        let reply = dispatch(&frame_of(req)).expect("a range request must be answered");
+
+        assert_eq!(reply[0], BscProtoMessageId::BlocksByRange as u8);
+        let decoded =
+            crate::node::network::blocks_by_range::decode_blocks_by_range(&mut &reply[..])
+                .expect("reply must decode");
+        assert_eq!(decoded.request_id, 0xfeed, "reply must echo the request id");
+    }
+
+    // === Legacy capability packet: tolerated, never fatal ===
+
+    /// Peers older than bsc#3737 still send the packet. Ignore it, as geth's
+    /// no-op `handleBscCap` does.
+    #[test]
+    fn legacy_capability_frame_is_ignored() {
+        assert!(dispatch(&cap_frame(2)).is_none());
+    }
+
+    /// The old gate tore the session down on a version mismatch. The devp2p
+    /// `Hello` exchange already fixed the version, so this packet's copy of it
+    /// carries no authority and a disagreement must not be fatal.
+    #[test]
+    fn capability_frame_with_mismatched_version_is_ignored() {
+        assert!(dispatch(&cap_frame(1)).is_none(), "version 1 cap on a v2 conn");
+        assert!(dispatch(&cap_frame(99)).is_none(), "nonsense version");
+    }
+
+    /// The old gate also tore the session down when the packet failed to decode.
+    /// We no longer decode it at all, so a truncated or garbage body is inert.
+    #[test]
+    fn malformed_capability_frame_is_ignored() {
+        let mut truncated = cap_frame(2);
+        truncated.truncate(2);
+        assert!(dispatch(&truncated).is_none(), "truncated cap payload");
+
+        let bare_id = BytesMut::from(&[BscProtoMessageId::Capability as u8][..]);
+        assert!(dispatch(&bare_id).is_none(), "message id with no payload");
+    }
+
+    // === Unchanged behaviour, guarded against the refactor ===
+
+    #[test]
+    fn blocks_by_range_resolves_the_pending_waiter() {
+        let (tx, rx) = oneshot::channel();
+        let mut pending = HashMap::new();
+        pending.insert(7u64, (tx, std::time::Instant::now()));
+
+        let frame = frame_of(BlocksByRangePacket { request_id: 7, blocks: Vec::new() });
+        let reply =
+            BscProtocolConnection::dispatch(&frame, &mut pending, None, 2, &mut VoteRateLimiter::new());
+
+        assert!(reply.is_none(), "a range response needs no reply");
+        assert!(pending.is_empty(), "the waiter must be consumed");
+        let resolved = rx.blocking_recv().expect("waiter must be resolved");
+        assert_eq!(resolved.expect("response must be Ok").request_id, 7);
+    }
+
+    #[test]
+    fn unknown_message_id_is_ignored() {
+        assert!(dispatch(&BytesMut::from(&[0x7fu8, 0xc0][..])).is_none());
+    }
+
+    /// We must keep *sending* the capability packet: nodes older than bsc#3483
+    /// block on reading it. Guards the frame we put on the wire first.
+    #[test]
+    fn outbound_capability_frame_is_still_well_formed() {
+        let encoded = BscProtocolConnection::encode_command(BscCommand::Capability {
+            protocol_version: 2,
+            extra: Bytes::from_static(&[0x00u8]),
+        });
+
+        assert_eq!(encoded[0], BscProtoMessageId::Capability as u8);
+        let decoded = BscCapPacket::decode(&mut &encoded[..]).expect("must round-trip");
+        assert_eq!(decoded.protocol_version, 2);
+    }
+
+    // === G1: per-peer inbound vote budget (go-bsc receiveRateLimitPerSecond) ===
+
+    #[test]
+    fn vote_budget_matches_go_bsc() {
+        // 68 votes/s over a 30s period => 2040, the value go-bsc compares against.
+        assert_eq!(VOTE_RATE_LIMIT_PER_PERIOD, 2040);
+    }
+
+    #[test]
+    fn vote_rate_limiter_admits_exactly_the_budget() {
+        let mut l = VoteRateLimiter::new();
+        assert!(!l.is_over_limit_after_receiving(VOTE_RATE_LIMIT_PER_PERIOD), "budget itself must pass");
+        assert!(l.is_over_limit_after_receiving(1), "one vote past the budget must trip");
+    }
+
+    #[test]
+    fn vote_rate_limiter_accumulates_across_packets() {
+        let mut l = VoteRateLimiter::new();
+        for _ in 0..(VOTE_RATE_LIMIT_PER_PERIOD / 68) {
+            assert!(!l.is_over_limit_after_receiving(68));
+        }
+        assert!(l.is_over_limit_after_receiving(1), "budget is per period, not per packet");
+    }
+
+    /// go-bsc resets the counter and returns false when the period has elapsed,
+    /// without charging the packet that rolled the window. Ported deliberately.
+    #[test]
+    fn vote_rate_limiter_rolls_the_window_uncharged() {
+        let mut l = VoteRateLimiter::new();
+        assert!(l.is_over_limit_after_receiving(VOTE_RATE_LIMIT_PER_PERIOD + 1));
+
+        l.force_period_expiry();
+        assert!(!l.is_over_limit_after_receiving(VOTE_RATE_LIMIT_PER_PERIOD + 1), "window roll allows");
+        assert_eq!(l.period_counter, 0, "the rolling packet is not charged");
+        assert!(!l.is_over_limit_after_receiving(VOTE_RATE_LIMIT_PER_PERIOD), "fresh budget");
+    }
+
+    /// A peer over budget has its packet dropped before the vote reaches the pool.
+    #[test]
+    fn over_budget_votes_packet_never_reaches_the_pool() {
+        let target_hash = B256::repeat_byte(0x7c);
+        let mut limiter = VoteRateLimiter::new();
+        assert!(limiter.is_over_limit_after_receiving(VOTE_RATE_LIMIT_PER_PERIOD + 1));
+
+        let before = votes::len();
+        let reply = dispatch_with_limiter(
+            &frame_of(VotesPacket(vec![vote(30_000_100, target_hash)])),
+            &mut limiter,
+        );
+        assert!(reply.is_none(), "a votes frame needs no reply");
+        assert_eq!(votes::len(), before, "over-budget packet must not be ingested");
+
+        // Once the window rolls, the same peer is served again.
+        limiter.force_period_expiry();
+        let _ = dispatch_with_limiter(
+            &frame_of(VotesPacket(vec![vote(30_000_100, target_hash)])),
+            &mut limiter,
+        );
+        assert_eq!(votes::len(), before + 1, "peer must be served after the window rolls");
+    }
+
 }

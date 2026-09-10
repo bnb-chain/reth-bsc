@@ -71,6 +71,8 @@ hardfork!(
         Mendel,
         /// BSC `Pasteur` hardfork - sequenced immediately after Mendel
         Pasteur,
+        /// BSC `Jenner` hardfork (BEP-706) - sequenced immediately after Pasteur
+        Jenner,
     }
 );
 
@@ -214,8 +216,18 @@ impl BscHardfork {
             (Self::Lorentz.boxed(), ForkCondition::Timestamp(1754967081)),
             (Self::Maxwell.boxed(), ForkCondition::Timestamp(1754967101)),
             (Self::Fermi.boxed(), ForkCondition::Timestamp(1761030900)),
-            // TODO: real activation TBD; unscheduled (u64::MAX) until announced.
-            (Self::Pasteur.boxed(), ForkCondition::Timestamp(u64::MAX)),
+            // Osaka and Mendel activated on qanet at 2026-08-05 02:30:00 AM UTC. Both are
+            // geth-compatible: geth accepted blocks 21323714..21327713 with only Pasteur deferred.
+            (Self::Osaka.boxed(), ForkCondition::Timestamp(1785897000)),
+            (Self::Mendel.boxed(), ForkCondition::Timestamp(1785897000)),
+            // Pasteur: 2026-08-05 09:00:00 AM UTC. The first attempt (at 1785897000, block
+            // 21323714) split the cluster because the system-contract upgrade wrote the new
+            // StakeHub/Governor code to plain state without committing the changed codeHash to the
+            // trie, so the block's state root described the un-upgraded state and geth rejected it
+            // (`invalid merkle root`). Fixed by reporting those writes to the state hook; this
+            // re-arms the transition to verify the fix on qanet.
+            // Must stay equal to geth's `--override.pasteur` on this cluster.
+            (Self::Pasteur.boxed(), ForkCondition::Timestamp(1785920400)),
         ])
     }
 
@@ -269,7 +281,10 @@ impl From<BscHardfork> for SpecId {
             | BscHardfork::Lorentz
             | BscHardfork::Maxwell
             | BscHardfork::Fermi => SpecId::PRAGUE,
-            BscHardfork::Osaka | BscHardfork::Mendel | BscHardfork::Pasteur => SpecId::OSAKA,
+            BscHardfork::Osaka |
+            BscHardfork::Mendel |
+            BscHardfork::Pasteur |
+            BscHardfork::Jenner => SpecId::OSAKA,
         }
     }
 }
@@ -310,13 +325,38 @@ mod tests {
     }
 
     #[test]
-    fn test_pasteur_present_but_unscheduled_in_qanet() {
-        // Qanet has no announced Pasteur activation yet, so it must stay
-        // dormant (u64::MAX) until a real timestamp is set.
+    fn test_qanet_fork_schedule_is_ordered() {
+        let qanet = BscHardfork::bsc_qanet();
+        const OSAKA_MENDEL: u64 = 1785897000; // 2026-08-05 02:30:00 UTC
+        const PASTEUR: u64 = 1785920400; // 2026-08-05 09:00:00 UTC
+
+        // Osaka and Mendel activated together at 2026-08-05 02:30:00 AM UTC.
+        for fork in [BscHardfork::Osaka, BscHardfork::Mendel] {
+            assert_eq!(
+                qanet.fork(fork),
+                ForkCondition::Timestamp(OSAKA_MENDEL),
+                "{fork:?} should be active on qanet from the 2026-08-05 02:30 UTC activation"
+            );
+        }
+
+        // Pasteur re-armed after the state-hook fix. It must stay in sync with geth's
+        // `--override.pasteur` on the QA cluster, and must not precede Osaka/Mendel.
         assert_eq!(
-            BscHardfork::bsc_qanet().fork(BscHardfork::Pasteur),
-            ForkCondition::Timestamp(u64::MAX),
-            "Pasteur should be defined but dormant until a real activation is set"
+            qanet.fork(BscHardfork::Pasteur),
+            ForkCondition::Timestamp(PASTEUR),
+            "Pasteur should activate on qanet at its re-armed timestamp"
+        );
+        // Ordering is compile-time enforced: Pasteur must never precede Osaka/Mendel.
+        const _: () = assert!(PASTEUR > OSAKA_MENDEL);
+        assert!(
+            qanet.fork(BscHardfork::Mendel).active_at_timestamp(PASTEUR),
+            "Mendel must already be active when Pasteur activates"
+        );
+
+        // Fermi precedes the whole group.
+        assert!(
+            qanet.fork(BscHardfork::Fermi).active_at_timestamp(1785897000),
+            "Fermi must already be active when Osaka/Mendel activate"
         );
     }
 
@@ -340,6 +380,97 @@ mod tests {
         // At/after Pasteur's timestamp, it resolves to Pasteur.
         assert_eq!(
             revm_spec_by_timestamp_and_block_number(spec.clone(), pasteur_time, block),
+            BscHardfork::Pasteur
+        );
+    }
+
+    #[test]
+    fn test_jenner_is_sequenced_after_pasteur() {
+        // Derived ordering must place Jenner (BEP-706) right after Pasteur so that
+        // `spec >= BscHardfork::Jenner` is the highest dispatcher check
+        // (mirrors go-bsc: Jenner sits between Pasteur and the far-future upstream forks).
+        assert!(BscHardfork::Jenner > BscHardfork::Pasteur);
+        assert!(BscHardfork::Jenner > BscHardfork::Mendel);
+        assert!(BscHardfork::Jenner > BscHardfork::Osaka);
+        // Jenner adds a BSC-only precompile; it introduces no new EVM rule set.
+        assert_eq!(SpecId::from(BscHardfork::Jenner), SpecId::OSAKA);
+    }
+
+    #[test]
+    fn test_jenner_not_scheduled_on_builtin_chains() {
+        // Mirrors go-bsc `JennerTime: nil` on BSCChainConfig/ChapelChainConfig: until the
+        // activation is announced, Jenner must not be present in the built-in fork schedules.
+        for (name, forks) in [
+            ("mainnet", BscHardfork::bsc_mainnet()),
+            ("testnet", BscHardfork::bsc_testnet()),
+            ("qanet", BscHardfork::bsc_qanet()),
+            ("local", BscHardfork::bsc_local()),
+        ] {
+            assert_eq!(
+                forks.fork(BscHardfork::Jenner),
+                ForkCondition::Never,
+                "Jenner must stay unscheduled on {name} until its activation is announced"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_jenner_activation_boundary() {
+        use crate::hardforks::BscHardforks;
+
+        // Mirrors go-bsc TestIsJenner: exactly at JennerTime -> active; one second
+        // before -> inactive; one second after -> active.
+        let jenner_time = 1_790_000_000u64;
+        let mut cs = bsc_mainnet();
+        cs.hardforks.insert(BscHardfork::Jenner, ForkCondition::Timestamp(jenner_time));
+        let spec = crate::chainspec::BscChainSpec::from(cs);
+
+        let block = 50_000_000; // well past London activation (31302048)
+        assert!(!spec.is_jenner_active_at_timestamp(block, jenner_time - 1));
+        assert!(spec.is_jenner_active_at_timestamp(block, jenner_time));
+        assert!(spec.is_jenner_active_at_timestamp(block, jenner_time + 1));
+
+        // The convention shared by every timestamp fork helper: inert before London.
+        let pre_london_block = 1_000;
+        assert!(!spec.is_jenner_active_at_timestamp(pre_london_block, jenner_time));
+
+        // Transition helper: first block whose timestamp crosses the boundary.
+        assert!(spec.is_jenner_transition_at_timestamp(block, jenner_time, jenner_time - 1));
+        assert!(!spec.is_jenner_transition_at_timestamp(block, jenner_time + 1, jenner_time));
+        assert!(!spec.is_jenner_transition_at_timestamp(block, jenner_time - 1, jenner_time - 2));
+    }
+
+    #[test]
+    fn test_jenner_resolves_at_its_timestamp() {
+        use crate::node::evm::config::revm_spec_by_timestamp_and_block_number;
+
+        // Give Jenner a concrete activation just after Pasteur (1787625000 on mainnet).
+        let jenner_time = 1_787_625_000 + 1_000;
+        let mut cs = bsc_mainnet();
+        cs.hardforks.insert(BscHardfork::Jenner, ForkCondition::Timestamp(jenner_time));
+        let spec = crate::chainspec::BscChainSpec::from(cs);
+
+        let block = 50_000_000; // well past London activation (31302048)
+
+        // Just before Jenner, the latest fork is still Pasteur.
+        assert_eq!(
+            revm_spec_by_timestamp_and_block_number(spec.clone(), jenner_time - 1, block),
+            BscHardfork::Pasteur
+        );
+        // At/after Jenner's timestamp, it resolves to Jenner.
+        assert_eq!(
+            revm_spec_by_timestamp_and_block_number(spec.clone(), jenner_time, block),
+            BscHardfork::Jenner
+        );
+        // Cross-fork regression (mirrors go-bsc TestRulesJennerRegression): with Jenner
+        // unscheduled, resolution at the same instants is unchanged.
+        let plain = crate::chainspec::BscChainSpec::from(bsc_mainnet());
+        assert_eq!(
+            revm_spec_by_timestamp_and_block_number(plain.clone(), jenner_time, block),
+            BscHardfork::Pasteur
+        );
+        assert_eq!(
+            revm_spec_by_timestamp_and_block_number(plain, jenner_time - 1, block),
             BscHardfork::Pasteur
         );
     }

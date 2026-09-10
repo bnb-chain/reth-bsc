@@ -210,8 +210,8 @@ fn test_snapshot_cache_behavior() -> eyre::Result<()> {
 }
 
 /// RAII guard to cleanup test database directory
-struct TestCleanup {
-    path: std::path::PathBuf,
+pub(super) struct TestCleanup {
+    pub(super) path: std::path::PathBuf,
 }
 
 impl Drop for TestCleanup {

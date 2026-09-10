@@ -1,11 +1,13 @@
+use super::config::evm_env_for_header;
 use super::executor::BscBlockExecutor;
+use super::factory::BscEvmFactory;
 use crate::evm::transaction::BscTxEnv;
 
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
-use reth_evm::{eth::receipt_builder::ReceiptBuilder, execute::BlockExecutionError, Evm, FromRecoveredTx, FromTxWithEncoded, IntoTxEnv};
+use reth_evm::{eth::receipt_builder::ReceiptBuilder, execute::BlockExecutionError, Database, Evm, EvmFactory, FromRecoveredTx, FromTxWithEncoded, IntoTxEnv};
 use reth_ethereum_primitives::TransactionSigned;
 use revm::{
-    context::{BlockEnv, TxEnv},
+    context::{result::ExecutionResult, BlockEnv, TxEnv},
     context_interface::block::Block,
     primitives::{Address, Bytes, TxKind, U256},
 };
@@ -15,11 +17,12 @@ use crate::consensus::parlia::{VoteAddress, Snapshot, DIFF_INTURN, DIFF_NOTURN};
 use crate::consensus::parlia::util::{is_breathe_block, debug_header};
 use crate::consensus::parlia::vote::MAX_ATTESTATION_EXTRA_LENGTH;
 use crate::node::evm::error::{BscBlockExecutionError, BscBlockValidationError};
-use crate::node::evm::util::HEADER_CACHE_READER;
+use crate::system_contracts::SystemContract;
+use reth_revm::{database::{EvmStateProvider, StateProviderDatabase}, db::State};
 use crate::system_contracts::feynman_fork::ValidatorElectionInfo;
 use std::{collections::HashMap, sync::{LazyLock, Mutex}};
 use schnellru::{ByLength, LruMap};
-use reth_primitives_traits::GotExpected;
+use reth_primitives_traits::{GotExpected, SealedHeader};
 use blst::{
     min_pk::{PublicKey, Signature},
     BLST_ERROR,
@@ -29,7 +32,9 @@ use crate::consensus::parlia::constants::K_ANCESTOR_GENERATION_DEPTH;
 
 const BLST_DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
 
-type ValidatorCache = LruMap<BlockHash, (Vec<Address>, Vec<VoteAddress>), ByLength>;
+pub type EpochValidators = (Vec<Address>, Vec<VoteAddress>);
+
+type ValidatorCache = LruMap<BlockHash, EpochValidators, ByLength>;
 type TurnLengthCache = LruMap<BlockHash, u8, ByLength>;
 
 pub static VALIDATOR_CACHE: LazyLock<Mutex<ValidatorCache>> = LazyLock::new(|| {
@@ -40,6 +45,111 @@ pub static TURN_LENGTH_CACHE: LazyLock<Mutex<TurnLengthCache>> = LazyLock::new(|
     Mutex::new(LruMap::new(ByLength::new(1024)))
 });
 
+/// Runs a read-only system-contract call in `header`'s env over `header`'s post-state.
+fn view_call_at_header<DB, Spec>(
+    db: DB,
+    spec: &Spec,
+    header: &Header,
+    to: Address,
+    data: Bytes,
+) -> Result<Bytes, BlockExecutionError>
+where
+    DB: Database,
+    Spec: EthChainSpec + crate::hardforks::BscHardforks + Clone,
+{
+    let tx_env = view_call_tx_env(to, data.clone(), header.gas_limit, spec.chain().id());
+    let mut evm = BscEvmFactory::default().create_evm(db, evm_env_for_header(spec, header));
+    // Use `Evm::transact` so system-transaction overrides still apply.
+    let result = Evm::transact(&mut evm, tx_env).map_err(BlockExecutionError::other)?.result;
+    view_call_output(to, &data, result)
+}
+
+/// `getMiningValidators()` on `parent`'s post-state in `parent`'s env.
+pub(crate) fn validators_at_parent<S, Spec>(
+    state: S,
+    spec: Spec,
+    parent: &SealedHeader,
+) -> Result<EpochValidators, BlockExecutionError>
+where
+    S: EvmStateProvider,
+    Spec: EthChainSpec + crate::hardforks::BscHardforks + Clone,
+{
+    let mut db = State::builder().with_database(StateProviderDatabase::new(state)).build();
+    let system_contracts = SystemContract::new(spec.clone());
+    let is_luban = spec.is_luban_active_at_block(parent.number());
+    let (to, data) = if is_luban {
+        system_contracts.get_current_validators()
+    } else {
+        system_contracts.get_current_validators_before_luban(parent.number())
+    };
+    let output = view_call_at_header(&mut db, &spec, parent.header(), to, data)?;
+    if is_luban {
+        system_contracts
+            .unpack_data_into_validator_set(&output)
+            .ok_or_else(|| BlockExecutionError::msg("Failed to decode system contract output"))
+    } else {
+        let validators = system_contracts
+            .unpack_data_into_validator_set_before_luban(&output)
+            .ok_or_else(|| BlockExecutionError::msg("Failed to decode system contract output"))?;
+        Ok((validators, Vec::new()))
+    }
+}
+
+/// Which block env a Parlia system-contract read uses.
+///
+/// Only `getMiningValidators()` needs `Parent`: the state is already the parent's on both paths.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum CallBlockEnv {
+    /// The env of the block being executed.
+    Current,
+    /// The env of its parent. Required for env-dependent reads that validate this block.
+    Parent,
+}
+
+/// The transaction shape used for read-only system-contract calls.
+fn view_call_tx_env(to: Address, data: Bytes, gas_limit: u64, chain_id: u64) -> BscTxEnv {
+    BscTxEnv {
+        base: TxEnv {
+            caller: Address::default(),
+            kind: TxKind::Call(to),
+            nonce: 0,
+            gas_limit,
+            value: U256::ZERO,
+            data,
+            gas_price: 0,
+            chain_id: Some(chain_id),
+            gas_priority_fee: None,
+            access_list: Default::default(),
+            blob_hashes: Vec::new(),
+            max_fee_per_blob_gas: 0,
+            tx_type: 0,
+            authorization_list: Default::default(),
+        },
+        is_system_transaction: true,
+    }
+}
+
+/// Extracts the return data of a read-only system-contract call.
+fn view_call_output<H>(
+    to: Address,
+    data: &Bytes,
+    result: ExecutionResult<H>,
+) -> Result<Bytes, BlockExecutionError> {
+    if !result.is_success() {
+        tracing::error!("Failed to eth call, to: {:?}, data: {:?}", to, data);
+        return Err(BlockExecutionError::msg("ETH call failed"));
+    }
+    let output = result
+        .into_output()
+        .ok_or_else(|| BlockExecutionError::msg("ETH call output is None"))?;
+    // Treat empty returndata as an invalid read instead of letting ABI unpack panic.
+    if output.is_empty() {
+        tracing::error!("Empty eth call output, to: {:?}, data: {:?}", to, data);
+        return Err(BlockExecutionError::msg("ETH call returned no data"));
+    }
+    Ok(output)
+}
+
 impl<'a, EVM, Spec, R: ReceiptBuilder> BscBlockExecutor<'a, EVM, Spec, R>
 where
     EVM: Evm<
@@ -47,7 +157,7 @@ where
         Tx: FromRecoveredTx<R::Transaction>
                 + FromRecoveredTx<TransactionSigned>
                 + FromTxWithEncoded<TransactionSigned>,
-        BlockEnv = BlockEnv,
+        BlockEnv = crate::evm::block_env::BscBlockEnv,
     >,
     Spec: EthereumHardforks + crate::hardforks::BscHardforks + EthChainSpec + Hardforks + Clone + 'static,
     R: ReceiptBuilder<Transaction = TransactionSigned, Receipt: TxReceipt>,
@@ -56,8 +166,7 @@ where
     BscTxEnv: IntoTxEnv<<EVM as alloy_evm::Evm>::Tx>,
     R::Transaction: Into<TransactionSigned>,
 {
-    /// check the new block, pre check and prepare some intermediate data for finish function.
-    /// depends on parlia, header and snapshot.
+    /// Validate block fields that depend on Parlia, the header, and the parent snapshot.
     pub(crate) fn check_new_block(
         &mut self, 
         block: &BlockEnv
@@ -66,19 +175,22 @@ where
         tracing::trace!("Check new block, block_number: {}", block_number);
 
         self.inner_ctx.header = self.ctx.header.clone();
-        let header = self.inner_ctx.header.clone().unwrap();
+        let header = self
+            .inner_ctx
+            .header
+            .clone()
+            .ok_or_else(|| BlockExecutionError::msg("Missing header in execution context"))?;
 
-        let parent_header = crate::node::evm::util::HEADER_CACHE_READER
-            .lock()
-            .unwrap()
-            .get_header_by_hash(&header.parent_hash)
-            .ok_or(BlockExecutionError::msg("Failed to get parent header from global header reader"))?;
+        let parent_header =
+            crate::node::evm::util::get_header_by_hash_from_cache(&header.parent_hash).ok_or(
+                BlockExecutionError::msg("Failed to get parent header from global header reader"),
+            )?;
         self.inner_ctx.parent_header = Some(parent_header.clone());
 
         let snap = self
             .snapshot_provider
             .as_ref()
-            .unwrap()
+            .ok_or_else(|| BlockExecutionError::msg("Snapshot provider is not available"))?
             .snapshot_by_hash(&header.parent_hash)
             .ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;
         self.inner_ctx.snap = Some(snap.clone());
@@ -88,8 +200,11 @@ where
 
         let epoch_length = snap.epoch_num;
         if header.number.is_multiple_of(epoch_length) {
-            // TODO: need fix it later, it may got error when restart the node?
-            let (validator_set, vote_addresses) = self.get_current_validators_with_cache(header.number-1, header.parent_hash)?;
+            let (validator_set, vote_addresses) = self.get_current_validators_with_cache(
+                header.number - 1,
+                header.parent_hash,
+                CallBlockEnv::Parent,
+            )?;
             tracing::debug!("validator_set: {:?}, vote_addresses: {:?}", validator_set, vote_addresses);
             
             let vote_addrs_map = if vote_addresses.is_empty() {
@@ -105,22 +220,34 @@ where
             self.inner_ctx.current_validators = Some((validator_set, vote_addrs_map));
 
             if self.spec.is_bohr_active_at_timestamp(header.number, header.timestamp) {
-                // Keep parity with go-bsc: turn length is read from parent state.
+                // Turn length is read from the parent state.
                 let expected_turn_length =
                     self.get_turn_length(parent_header.number, parent_header.timestamp)?;
                 self.inner_ctx.expected_turn_length = Some(expected_turn_length);
             }
 
-            // Also fetch on-chain NodeIDs for validators (EVN identification) and update cache.
-            // Only available after Maxwell hardfork when StakeHub contract's getNodeIDs is deployed
+            // Also fetch validator NodeIDs after Maxwell.
             if self.spec.is_maxwell_active_at_timestamp(header.number, header.timestamp) {
-                let (to2, data2) = self.system_contracts.get_node_ids(self.inner_ctx.current_validators.as_ref().unwrap().0.clone());
+                let current_validators = self
+                    .inner_ctx
+                    .current_validators
+                    .as_ref()
+                    .ok_or_else(|| BlockExecutionError::msg("Invalid current validators data"))?
+                    .0
+                    .clone();
+                let (to2, data2) = self.system_contracts.get_node_ids(current_validators);
                 if let Ok(output2) = self.eth_call(to2, data2) {
-                    let (_consensus_addrs, node_ids_list) = self.system_contracts.unpack_data_into_node_ids(&output2);
-                    tracing::debug!("node_ids_list: {:?}", node_ids_list);
-                    let mut flat: Vec<[u8; 32]> = Vec::new();
-                    for ids in node_ids_list { for id in ids { flat.push(id); } }
-                    crate::node::network::evn_peers::update_onchain_nodeids(flat);
+                    match self.system_contracts.unpack_data_into_node_ids(&output2) {
+                        Some((_consensus_addrs, node_ids_list)) => {
+                            tracing::debug!("node_ids_list: {:?}", node_ids_list);
+                            let mut flat: Vec<[u8; 32]> = Vec::new();
+                            for ids in node_ids_list { for id in ids { flat.push(id); } }
+                            crate::node::network::evn_peers::update_onchain_nodeids(flat);
+                        }
+                        // Advisory data for EVN peering only, so a decode failure must not
+                        // fail the block.
+                        None => tracing::warn!("Failed to decode getNodeIDs output"),
+                    }
                 }
             }
         }
@@ -131,15 +258,24 @@ where
         {
             let (to, data) = self.system_contracts.get_max_elected_validators();
             let bz = self.eth_call(to, data)?;
-            let max_elected_validators = self.system_contracts.unpack_data_into_max_elected_validators(bz.as_ref());
+            let max_elected_validators = self
+                .system_contracts
+                .unpack_data_into_max_elected_validators(bz.as_ref())
+                .ok_or_else(|| {
+                    BlockExecutionError::msg("Failed to decode system contract output")
+                })?;
             tracing::debug!("max_elected_validators: {:?}", max_elected_validators);
             self.inner_ctx.max_elected_validators = Some(max_elected_validators);
 
             let (to, data) = self.system_contracts.get_validator_election_info();
             let bz = self.eth_call(to, data)?;
 
-            let (validators, voting_powers, vote_addrs, total_length) =
-                self.system_contracts.unpack_data_into_validator_election_info(bz.as_ref());
+            let (validators, voting_powers, vote_addrs, total_length) = self
+                .system_contracts
+                .unpack_data_into_validator_election_info(bz.as_ref())
+                .ok_or_else(|| {
+                    BlockExecutionError::msg("Failed to decode system contract output")
+                })?;
 
             let total_length = total_length.to::<u64>() as usize;
             if validators.len() != total_length ||
@@ -169,8 +305,9 @@ where
     pub(crate) fn get_current_validators_with_cache(
         &mut self, 
         block_number: BlockNumber,
-        block_hash: BlockHash
-    ) -> Result<(Vec<Address>, Vec<VoteAddress>), BlockExecutionError> {
+        block_hash: BlockHash,
+        at: CallBlockEnv,
+    ) -> Result<EpochValidators, BlockExecutionError> {
         {
             let mut cache = VALIDATOR_CACHE.lock().unwrap();
             if let Some(cached_result) = cache.get(&block_hash) {
@@ -180,7 +317,7 @@ where
             }
         }
 
-        let result = self.get_current_validators(block_number)?;
+        let result = self.get_current_validators(block_number, at)?;
 
         {
             let mut cache = VALIDATOR_CACHE.lock().unwrap();
@@ -193,71 +330,71 @@ where
     }
 
 
+    /// Runs a read-only system-contract call in the env of the block being executed.
     pub(crate) fn eth_call(
         &mut self,
         to: Address,
         data: Bytes
     ) -> Result<Bytes, BlockExecutionError> {
-        // Use block gas limit (~36M on BSC) to match GASLIMIT opcode semantics.
-        // Mark as system transaction to bypass EIP-7825 gas limit cap (16M),
-        // since block gas limit exceeds the cap and these are internal queries.
-        //
-        // Trade-off accepted: is_system_transaction causes transact_raw to:
-        // - Set basefee to 0 (BASEFEE opcode returns 0 instead of actual basefee)
-        // - Disable nonce checks
-        // - Replace block.gas_limit with tx.gas_limit
-        //
-        // For BSC system contract reads (get_current_validators, get_validator_election_info, etc.),
-        // these side effects are acceptable because the contracts don't use BASEFEE in view functions.
-        // If future contracts depend on BASEFEE, this approach would need revisiting.
-        let tx_env = BscTxEnv {
-            base: TxEnv {
-                caller: Address::default(),
-                kind: TxKind::Call(to),
-                nonce: 0,
-                gas_limit: self.evm.block().gas_limit(),
-                value: U256::ZERO,
-                data: data.clone(),
-                gas_price: 0,
-                chain_id: Some(self.spec.chain().id()),
-                gas_priority_fee: None,
-                access_list: Default::default(),
-                blob_hashes: Vec::new(),
-                max_fee_per_blob_gas: 0,
-                tx_type: 0,
-                authorization_list: Default::default(),
-            },
-            is_system_transaction: true,
-        };
-
+        let tx_env =
+            view_call_tx_env(to, data.clone(), self.evm.block().gas_limit(), self.spec.chain().id());
         let result_and_state = self.evm.transact(tx_env.into_tx_env()).map_err(BlockExecutionError::other)?;
-        if !result_and_state.result.is_success() {
-            tracing::error!("Failed to eth call, to: {:?}, data: {:?}", to, data);
-            return Err(BlockExecutionError::msg("ETH call failed"));
-        }
-        let output = result_and_state.result.output().ok_or(BlockExecutionError::msg("ETH call output is None"))?;
-        Ok(output.clone())
+        view_call_output(to, &data, result_and_state.result)
     }
 
+    /// Runs the same read-only system call against the current DB, but under `parent`'s env.
+    ///
+    /// PRECONDITION: only valid before this block mutates state.
+    fn eth_call_at_parent(
+        &mut self,
+        to: Address,
+        data: Bytes,
+    ) -> Result<Bytes, BlockExecutionError> {
+        let parent = self.inner_ctx.parent_header.clone().ok_or_else(|| {
+            BlockExecutionError::msg("Missing parent header for parent-env eth call")
+        })?;
+        debug_assert_eq!(
+            parent.number + 1,
+            self.evm.block().number().to::<u64>(),
+            "parent-env call must run while executing the parent's direct child"
+        );
+
+        view_call_at_header(self.evm.db_mut(), &self.spec, &parent, to, data)
+    }
+
+    /// Reads the active validator set.
+    ///
+    /// `block_number` selects the ABI; `at` selects the block env.
     pub(crate) fn get_current_validators(
-        &mut self, 
-        block_number: BlockNumber
-    ) -> Result<(Vec<Address>, Vec<VoteAddress>), BlockExecutionError> {
-
-        let result = if self.spec.is_luban_active_at_block(block_number) {
-            let (to, data) = self.system_contracts.get_current_validators();
-            let output = self.eth_call(to, data)?;
-            self.system_contracts.unpack_data_into_validator_set(&output)
+        &mut self,
+        block_number: BlockNumber,
+        at: CallBlockEnv,
+    ) -> Result<EpochValidators, BlockExecutionError> {
+        let is_luban = self.spec.is_luban_active_at_block(block_number);
+        let (to, data) = if is_luban {
+            self.system_contracts.get_current_validators()
         } else {
-            let (to, data) = self.system_contracts.get_current_validators_before_luban(block_number);
-            let output = self.eth_call(to, data)?;
-            let validator_set = self.system_contracts.unpack_data_into_validator_set_before_luban(&output);
-            (validator_set, Vec::new())
+            self.system_contracts.get_current_validators_before_luban(block_number)
         };
-
-        Ok(result)
+        let output = match at {
+            CallBlockEnv::Current => self.eth_call(to, data)?,
+            CallBlockEnv::Parent => self.eth_call_at_parent(to, data)?,
+        };
+        if is_luban {
+            self.system_contracts
+                .unpack_data_into_validator_set(&output)
+                .ok_or_else(|| BlockExecutionError::msg("Failed to decode system contract output"))
+        } else {
+            let validators = self
+                .system_contracts
+                .unpack_data_into_validator_set_before_luban(&output)
+                .ok_or_else(|| {
+                    BlockExecutionError::msg("Failed to decode system contract output")
+                })?;
+            Ok((validators, Vec::new()))
+        }
     }
-    
+
     fn verify_cascading_fields(
         &self,
         header: &Header,
@@ -326,10 +463,9 @@ where
                     is_match = true;
                     break;
                 }
-                ancestor = crate::node::evm::util::HEADER_CACHE_READER
-                    .lock()
-                    .unwrap()
-                    .get_header_by_hash(&ancestor.parent_hash())
+                ancestor = crate::node::evm::util::get_header_by_hash_from_cache(
+                    &ancestor.parent_hash(),
+                )
                     .ok_or_else(|| BscBlockExecutionError::UnknownHeader { block_hash: ancestor.parent_hash() })?;
                 tracing::debug!("ancestor: {:?}", ancestor);
             }
@@ -362,7 +498,7 @@ where
             let pre_snap = self
                 .snapshot_provider
                 .as_ref()
-                .unwrap()
+                .ok_or_else(|| BlockExecutionError::msg("Snapshot provider is not available"))?
                 .snapshot_by_hash(&ancestor.parent_hash)
                 .ok_or(BlockExecutionError::msg("Failed to get pre snapshot from snapshot provider"))?;
 
@@ -521,19 +657,13 @@ where
         snap: &Snapshot,
     ) -> Result<Header, BlockExecutionError> {
         if snap.vote_data.source_hash == B256::ZERO && snap.vote_data.target_hash == B256::ZERO {
-            return HEADER_CACHE_READER
-                .lock()
-                .unwrap()
-                .get_header_by_number(0)
+            return crate::node::evm::util::get_cannonical_header_from_cache(0)
                 .ok_or_else(|| {
                     BscBlockExecutionError::UnknownHeader { block_hash: B256::ZERO }.into()
                 });
         }
 
-        HEADER_CACHE_READER
-            .lock()
-            .unwrap()
-            .get_header_by_hash(&snap.vote_data.target_hash)
+        crate::node::evm::util::get_header_by_hash_from_cache(&snap.vote_data.target_hash)
             .ok_or_else(|| {
                 BscBlockExecutionError::UnknownHeader { block_hash: snap.vote_data.target_hash }.into()
             })
@@ -544,37 +674,56 @@ where
         &mut self, 
         block: &BlockEnv
     ) -> Result<(), BlockExecutionError> {
-        let parent_header = crate::node::evm::util::HEADER_CACHE_READER
-            .lock()
-            .unwrap()
-            .get_header_by_hash(&self.ctx.base.parent_hash)
-            .ok_or(BlockExecutionError::msg("Failed to get parent header from global header reader"))?;
+        let parent_header =
+            crate::node::evm::util::get_header_by_hash_from_cache(&self.ctx.base.parent_hash)
+                .ok_or(BlockExecutionError::msg(
+                    "Failed to get parent header from global header reader",
+                ))?;
         self.inner_ctx.parent_header = Some(parent_header.clone());
-        let snap = self
-            .snapshot_provider
-            .as_ref()
-            .unwrap()
-            .snapshot_by_hash(&self.ctx.base.parent_hash)
-            .ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;
-        self.inner_ctx.snap = Some(snap.clone());
+
+        // Only the Parlia finalization in `finish` reads the snapshot, and simulation skips
+        // that entirely. Requiring one here would make `eth_simulateV1` fail — or panic on
+        // the `unwrap` below — whenever the snapshot provider is unavailable, e.g. during
+        // early startup before consensus has published it.
+        if self.ctx.mode.finalizes() {
+            let snap = self
+                .snapshot_provider
+                .as_ref()
+                .ok_or(BlockExecutionError::msg("Snapshot provider is not available"))?
+                .snapshot_by_hash(&self.ctx.base.parent_hash)
+                .ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;
+            self.inner_ctx.snap = Some(snap.clone());
+        }
 
         let header_number = block.number().to::<u64>();
         let header_timestamp = block.timestamp().to::<u64>();
-        if self.spec.is_feynman_active_at_timestamp(header_number, header_timestamp) &&
+        // The election data below feeds `update_validator_set_v2`, which only runs during
+        // finalization; skip the system-contract calls in simulation.
+        if self.ctx.mode.finalizes() &&
+            self.spec.is_feynman_active_at_timestamp(header_number, header_timestamp) &&
             !self.spec.is_feynman_transition_at_timestamp(header_number, header_timestamp, parent_header.timestamp) &&
             is_breathe_block(parent_header.timestamp, header_timestamp)
         {
             let (to, data) = self.system_contracts.get_max_elected_validators();
             let bz = self.eth_call(to, data)?;
-            let max_elected_validators = self.system_contracts.unpack_data_into_max_elected_validators(bz.as_ref());
+            let max_elected_validators = self
+                .system_contracts
+                .unpack_data_into_max_elected_validators(bz.as_ref())
+                .ok_or_else(|| {
+                    BlockExecutionError::msg("Failed to decode system contract output")
+                })?;
             tracing::debug!("max_elected_validators: {:?}", max_elected_validators);
             self.inner_ctx.max_elected_validators = Some(max_elected_validators);
 
             let (to, data) = self.system_contracts.get_validator_election_info();
             let bz = self.eth_call(to, data)?;
 
-            let (validators, voting_powers, vote_addrs, total_length) =
-                self.system_contracts.unpack_data_into_validator_election_info(bz.as_ref());
+            let (validators, voting_powers, vote_addrs, total_length) = self
+                .system_contracts
+                .unpack_data_into_validator_election_info(bz.as_ref())
+                .ok_or_else(|| {
+                    BlockExecutionError::msg("Failed to decode system contract output")
+                })?;
 
             let total_length = total_length.to::<u64>() as usize;
             if validators.len() != total_length ||

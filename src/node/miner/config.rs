@@ -35,12 +35,20 @@ pub struct MiningConfig {
     pub bid_simulation_left_over: Option<u64>,
     /// No interrupt left over time in milliseconds
     pub no_interrupt_left_over: Option<u64>,
+    /// Time reserved to finalize a block (compute state root, distribute income, seal) before the
+    /// next header's timestamp — go-bsc's `Config.DelayLeftOver`. This is the knob
+    /// `mev_sendBidBlock`'s admission deadline (`bidMustBefore`) subtracts, distinct from
+    /// [`Self::no_interrupt_left_over`] which only bounds bid *simulation*.
+    pub delay_left_over: Option<u64>,
     /// Maximum bids per builder per block
     pub max_bids_per_builder: Option<u32>,
     /// Builder fee ceiling in wei (as hex string for large numbers)
     pub builder_fee_ceil: Option<u128>,
     /// List of allowed builder addresses (whitelist)
     pub allowed_builders: Option<Vec<Address>>,
+    /// Whether the `mev_sendBidBlock` RPC (BEP-675 builder-proposed blocks) is accepted.
+    /// Off by default; enable with `--mining.bid-block-enabled` or `BSC_MINING_BID_BLOCK_ENABLED`.
+    pub bid_block_enabled: bool,
     /// Use the reth 2.0 sparse-trie background task for state-root computation
     /// during payload build.
     ///
@@ -67,12 +75,30 @@ impl std::fmt::Debug for MiningConfig {
             .field("validator_commission", &self.validator_commission)
             .field("bid_simulation_left_over", &self.bid_simulation_left_over)
             .field("no_interrupt_left_over", &self.no_interrupt_left_over)
+            .field("delay_left_over", &self.delay_left_over)
             .field("max_bids_per_builder", &self.max_bids_per_builder)
             .field("builder_fee_ceil", &self.builder_fee_ceil)
             .field("allowed_builders", &self.allowed_builders)
+            .field("bid_block_enabled", &self.bid_block_enabled)
             .field("use_sparse_trie_state_root", &self.use_sparse_trie_state_root)
             .finish()
     }
+}
+
+/// Default for `no_interrupt_left_over`: the minimum wall-clock time that must remain before the
+/// block's target timestamp for a newly arrived bid to preempt an in-flight simulation — enough
+/// to run one worst-case simulation to completion and still finalize the block.
+///
+/// Mirrors go-bsc's `getDefaultNoInterruptLeftOver` formula but substitutes reth-bsc's own
+/// finalize reserve: worst-case bid execution (55M gas ceil at an assumed 500 Mgas/s = 110ms) plus
+/// a 10ms buffer plus [`DELAY_LEFT_OVER`](super::payload::DELAY_LEFT_OVER) (120ms vs go-bsc's
+/// 15ms, as reth-bsc's state-root computation is slower), giving 240ms vs go-bsc's 135ms.
+pub fn default_no_interrupt_left_over() -> u64 {
+    const DEFAULT_GAS_CEIL: u64 = 55_000_000;
+    const EXPECTED_PROCESSING_SPEED_GAS_PER_MS: u64 = 500_000; // 500 Mgas/s
+    let bid_processing_ms = DEFAULT_GAS_CEIL / EXPECTED_PROCESSING_SPEED_GAS_PER_MS;
+    let buffer_ms = 10;
+    bid_processing_ms + buffer_ms + super::payload::DELAY_LEFT_OVER
 }
 
 impl Default for MiningConfig {
@@ -89,12 +115,14 @@ impl Default for MiningConfig {
             submit_built_payload: false,
             greedy_merge: true,
             // MEV defaults
-            validator_commission: Some(100),    // 1%
-            bid_simulation_left_over: Some(50), // 50ms
-            no_interrupt_left_over: Some(500),  // 500ms
+            validator_commission: Some(100),     // 1%
+            bid_simulation_left_over: Some(20),  // 20ms (go-bsc's defaultBidSimulationLeftOver)
+            no_interrupt_left_over: Some(default_no_interrupt_left_over()),
+            delay_left_over: Some(15),           // 15ms (go-bsc's defaultDelayLeftOver)
             max_bids_per_builder: Some(3),
             builder_fee_ceil: Some(1_000_000_000_000_000_000), // 1 BNB
             allowed_builders: None, // No whitelist by default (allow all)
+            bid_block_enabled: false, // BEP-675 BidBlock path off by default
             use_sparse_trie_state_root: false, // Opt-in for now (perf testing)
         }
     }
@@ -154,12 +182,17 @@ impl MiningConfig {
 
     /// Get bid simulation left over time in milliseconds
     pub fn get_bid_simulation_left_over(&self) -> u64 {
-        self.bid_simulation_left_over.unwrap_or(50) // Default: 50ms
+        self.bid_simulation_left_over.unwrap_or(20) // Default: 20ms (go-bsc default)
     }
 
     /// Get no interrupt left over time in milliseconds
     pub fn get_no_interrupt_left_over(&self) -> u64 {
-        self.no_interrupt_left_over.unwrap_or(500) // Default: 500ms
+        self.no_interrupt_left_over.unwrap_or_else(default_no_interrupt_left_over)
+    }
+
+    /// Get the block-finalization time reserve in milliseconds (go-bsc's `DelayLeftOver`).
+    pub fn get_delay_left_over(&self) -> u64 {
+        self.delay_left_over.unwrap_or(15) // Default: 15ms
     }
 
     /// Get maximum bids per builder per block
@@ -172,19 +205,35 @@ impl MiningConfig {
         self.builder_fee_ceil.unwrap_or(1_000_000_000_000_000_000) // Default: 1 BNB
     }
 
-    /// Generate a new validator configuration with random keys
-    pub fn generate_for_development() -> Self {
-        // use rand::Rng;
+    /// Whether the `mev_sendBidBlock` RPC (BEP-675) is accepted.
+    pub fn get_bid_block_enabled(&self) -> bool {
+        self.bid_block_enabled
+    }
 
-        // Generate random 32-byte private key
-        // let mut rng = rand::rng();
-        // let private_key: [u8; 32] = rng.random();
-        // let private_key_hex = format!("0x{}", alloy_primitives::hex::encode(private_key));
-        let private_key_hex = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
-        // Validator Address: 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266
+    /// Generate a new validator configuration with a freshly generated random key.
+    ///
+    /// The key is random per call and per process. It previously hard-coded Anvil development
+    /// account #0, which meant any node that reached here — see [`Self::ensure_keys_available`],
+    /// which `main.rs` calls when mining is enabled with no key supplied — would sign blocks with a
+    /// key published in Foundry's documentation, and so impersonatable by anyone. A random key is
+    /// still not fit for production, but it is not *pre-compromised*, and it matches what this
+    /// function has always claimed to do.
+    pub fn generate_for_development() -> Self {
+        use rand::Rng;
+
+        // Rejection-sample so the result is always a valid secp256k1 scalar; raw random bytes can
+        // fall outside the curve order (astronomically unlikely, but a silent fallback to
+        // `Self::default()` on a bad draw would disable mining for no visible reason).
+        let private_key_hex = loop {
+            let candidate: [u8; 32] = rand::rng().random();
+            let hex = format!("0x{}", alloy_primitives::hex::encode(candidate));
+            if keystore::load_private_key_from_hex(&hex).is_ok() {
+                break hex;
+            }
+        };
 
         // Derive validator address from private key
-        if let Ok(signing_key) = keystore::load_private_key_from_hex(private_key_hex) {
+        if let Ok(signing_key) = keystore::load_private_key_from_hex(&private_key_hex) {
             let validator_address = keystore::get_validator_address(&signing_key);
 
             Self {
@@ -199,11 +248,13 @@ impl MiningConfig {
                 submit_built_payload: false,
                 // Use default MEV parameters
                 validator_commission: Some(100),
-                bid_simulation_left_over: Some(50),
-                no_interrupt_left_over: Some(500),
+                bid_simulation_left_over: Some(20),
+                no_interrupt_left_over: Some(default_no_interrupt_left_over()),
+                delay_left_over: Some(15),
                 max_bids_per_builder: Some(3),
                 builder_fee_ceil: Some(1_000_000_000_000_000_000),
                 allowed_builders: None,
+                bid_block_enabled: false,
                 greedy_merge: true,
                 use_sparse_trie_state_root: false,
             }
@@ -277,6 +328,9 @@ impl MiningConfig {
         let no_interrupt_left_over =
             std::env::var("BSC_NO_INTERRUPT_LEFT_OVER").ok().and_then(|v| v.parse().ok());
 
+        let delay_left_over =
+            std::env::var("BSC_DELAY_LEFT_OVER").ok().and_then(|v| v.parse().ok());
+
         let max_bids_per_builder =
             std::env::var("BSC_MAX_BIDS_PER_BUILDER").ok().and_then(|v| v.parse().ok());
 
@@ -298,6 +352,11 @@ impl MiningConfig {
             .map(|v| v.to_lowercase() == "true")
             .unwrap_or(false);
 
+        let bid_block_enabled = std::env::var("BSC_MINING_BID_BLOCK_ENABLED")
+            .ok()
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false);
+
         let mut cfg = Self {
             enabled,
             private_key_hex,
@@ -310,9 +369,11 @@ impl MiningConfig {
             validator_commission,
             bid_simulation_left_over,
             no_interrupt_left_over,
+            delay_left_over,
             max_bids_per_builder,
             builder_fee_ceil,
             allowed_builders,
+            bid_block_enabled,
             use_sparse_trie_state_root,
             ..Default::default()
         };
@@ -415,6 +476,35 @@ pub mod keystore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bid_block_disabled_by_default() {
+        assert!(!MiningConfig::default().get_bid_block_enabled());
+    }
+
+    #[test]
+    fn bid_simulation_left_over_matches_go_bsc_default() {
+        // go-bsc's `defaultBidSimulationLeftOver = 20 * time.Millisecond`.
+        assert_eq!(MiningConfig::default().get_bid_simulation_left_over(), 20);
+    }
+
+    #[test]
+    fn no_interrupt_left_over_follows_go_bsc_formula_with_reth_reserve() {
+        // go-bsc's `getDefaultNoInterruptLeftOver()` formula (55M gas ceil @ an assumed
+        // 500 Mgas/s = 110ms bidProcessing + 10ms buffer + delayLeftOver), with reth-bsc's
+        // 120ms finalize reserve (`DELAY_LEFT_OVER`) instead of go-bsc's 15ms: 240ms vs 135ms.
+        assert_eq!(
+            MiningConfig::default().get_no_interrupt_left_over(),
+            110 + 10 + crate::node::miner::payload::DELAY_LEFT_OVER
+        );
+    }
+
+    #[test]
+    fn delay_left_over_defaults_to_go_bsc_value() {
+        // go-bsc's `defaultDelayLeftOver = 15 * time.Millisecond`; distinct from and smaller than
+        // `no_interrupt_left_over` (240ms default), which bounds bid simulation, not block sealing.
+        assert_eq!(MiningConfig::default().get_delay_left_over(), 15);
+    }
 
     #[test]
     fn test_mining_config_validation() {

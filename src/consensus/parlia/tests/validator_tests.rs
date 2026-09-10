@@ -4,8 +4,25 @@ use super::super::{
     snapshot::{Snapshot, ValidatorInfo},
     vote::{VoteAddress, VoteAttestation, VoteData},
 };
+use crate::chainspec::{bsc_testnet, BscChainSpec};
+use alloy_consensus::Header;
 use alloy_primitives::{Address, B256};
 use alloy_rlp::Bytes;
+
+/// geth `snapshot.go:299-302` gates on number *and* parent hash.
+#[test]
+fn apply_rejects_a_header_from_another_branch() {
+    let validators = vec![Address::repeat_byte(1)];
+    let snap_hash = B256::repeat_byte(0xaa);
+    let snapshot = Snapshot::new(validators.clone(), 100, snap_hash, 200, None);
+    let chain_spec = BscChainSpec::from(bsc_testnet());
+    let apply = |parent_hash| {
+        let h = Header { number: 101, parent_hash, beneficiary: validators[0], ..Default::default() };
+        snapshot.apply(validators[0], &h, vec![], None, None, None, &chain_spec)
+    };
+    assert!(apply(snap_hash).is_some(), "a genuine child must still apply");
+    assert!(apply(B256::repeat_byte(0xbb)).is_none(), "a same-height sibling must be rejected");
+}
 
 /// Test validator info creation and index assignment
 #[test]

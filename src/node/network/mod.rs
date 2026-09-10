@@ -271,6 +271,7 @@ impl BscNetworkBuilder {
 
         let (to_import_net, from_network) = mpsc::unbounded_channel();
         let (to_import_mined, from_builder) = mpsc::unbounded_channel();
+        let (to_import_bid, from_bid_block) = mpsc::unbounded_channel();
         let (to_network, import_outcome) = mpsc::unbounded_channel();
 
         let (to_hashes, from_hashes) = mpsc::unbounded_channel();
@@ -282,6 +283,11 @@ impl BscNetworkBuilder {
         }
         if crate::shared::set_block_import_sender(to_import_net.clone()).is_err() {
             warn!(target: "bsc", "Block import network sender already initialised; overriding skipped");
+        }
+        // Expose the BEP-675 BidBlock sender so the miner can submit a selected (sealed, unexecuted)
+        // BidBlock for broadcast-then-verify (zero-simulate).
+        if crate::shared::set_bid_block_import_sender(to_import_bid.clone()).is_err() {
+            warn!(target: "bsc", "BidBlock import sender already initialised; overriding skipped");
         }
 
         // Import the necessary types for block import service
@@ -336,19 +342,25 @@ impl BscNetworkBuilder {
                 .take()
                 .expect("node should only be launched once")
                 .await
-                .unwrap();
+                .expect("engine handle sender dropped before the beacon engine was built");
 
-            ImportService::new(
+            // This task is critical: returning quietly would leave the node without block
+            // import, so surface the error and let the node go down with it.
+            if let Err(err) = ImportService::new(
                 provider,
                 chain_spec,
                 handle,
                 from_network,
                 from_builder,
+                from_bid_block,
                 from_hashes,
                 to_network,
             )
             .await
-            .unwrap();
+            {
+                tracing::error!(target: "bsc::network", ?err, "Block import service exited");
+                panic!("block import service exited: {err:?}");
+            }
         });
 
         // TODO: update network with the latest canonical head, but has a fork id issue, can fix it later.

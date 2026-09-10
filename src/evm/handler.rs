@@ -356,7 +356,7 @@ mod tests {
             prevrandao: Some(U256::from(1).into()), // Required for post-merge
             ..Default::default()
         };
-        let env = EvmEnv::new(cfg_env, block_env);
+        let env = EvmEnv::new(cfg_env, block_env.into());
 
         let caller = Address::from([0x11; 20]);
         let contract = Address::from([0x22; 20]);
@@ -413,7 +413,7 @@ mod tests {
             prevrandao: Some(U256::from(1).into()), // Required for post-merge
             ..Default::default()
         };
-        let env = EvmEnv::new(cfg_env, block_env);
+        let env = EvmEnv::new(cfg_env, block_env.into());
 
         let caller = Address::from([0x11; 20]);
         let contract = Address::from([0x22; 20]);
@@ -478,7 +478,7 @@ mod tests {
             prevrandao: Some(U256::from(1).into()), // Required for post-merge
             ..Default::default()
         };
-        let env = EvmEnv::new(cfg_env, block_env);
+        let env = EvmEnv::new(cfg_env, block_env.into());
 
         let caller = Address::from([0x11; 20]);
         let contract = Address::from([0x22; 20]);

@@ -6,8 +6,11 @@ use super::{
 use crate::{
     BscPrimitives,
     chainspec::BscChainSpec,
-    consensus::{eip4844::next_block_excess_blob_gas_with_mendel, parlia::VoteAddress},
-    evm::transaction::BscTxEnv,
+    consensus::{
+        eip4844::next_block_excess_blob_gas_with_mendel,
+        parlia::{util::millisecond_remainder, VoteAddress},
+    },
+    evm::{block_env::BscBlockEnv, transaction::BscTxEnv},
     hardforks::{bsc::BscHardfork, BscHardforks},
     node::engine_api::validator::BscExecutionData,
     system_contracts::{feynman_fork::ValidatorElectionInfo, SystemContract},
@@ -50,6 +53,44 @@ pub type ValidatorCacheSink = Arc<Mutex<Option<(Vec<Address>, Vec<VoteAddress>)>
 pub type StateRootPrecomputedSink =
     Arc<Mutex<Option<(alloy_primitives::B256, reth_trie_common::updates::TrieUpdates)>>>;
 
+/// What the executor is doing with the block it is running.
+///
+/// Replaces the former `is_miner: bool`, which fused two independent questions: whether a
+/// header already exists, and whether Parlia finalization should run. Those two always
+/// moved together for the import and mining paths, so a bool sufficed — until
+/// `eth_simulateV1` needed the third combination (author a block, but do *not* finalize
+/// it) and was silently rounded to [`Self::Mining`], making a read-only RPC try to sign
+/// Parlia system transactions. See <https://github.com/bnb-chain/reth-bsc/issues/451>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BscExecutionMode {
+    /// Verifying a block received from the network or the engine API. The header already
+    /// exists and system transactions are consumed from the block rather than generated.
+    Import,
+    /// Producing a block this validator will sign and broadcast. System transactions are
+    /// generated and signed with the validator key.
+    Mining,
+    /// Answering a hypothetical — `eth_simulateV1` or the local pending block. Authors a
+    /// header like [`Self::Mining`], but runs no Parlia finalization and signs nothing,
+    /// matching BSC geth's simulation path.
+    Simulation,
+}
+
+impl BscExecutionMode {
+    /// Whether no header exists yet and one is being authored.
+    ///
+    /// True for both [`Self::Mining`] and [`Self::Simulation`]; the block-verification
+    /// checks that dereference `ctx.header` must be skipped in both.
+    pub const fn authors_block(self) -> bool {
+        matches!(self, Self::Mining | Self::Simulation)
+    }
+
+    /// Whether Parlia post-block finalization (reward distribution, slashing, validator-set
+    /// updates) must run — which implies signing system transactions.
+    pub const fn finalizes(self) -> bool {
+        matches!(self, Self::Mining)
+    }
+}
+
 /// BSC wrapper around [`NextBlockEnvAttributes`].
 ///
 /// Extends the upstream attributes with sparse-trie sinks and validator/turn-length
@@ -59,6 +100,13 @@ pub type StateRootPrecomputedSink =
 #[derive(Debug, Clone)]
 pub struct BscNextBlockEnvAttributes {
     pub inner: NextBlockEnvAttributes,
+    /// Execution mode for the block built from these attributes.
+    ///
+    /// Defaults to [`BscExecutionMode::Simulation`] via [`BuildPendingEnv`], which is the
+    /// entry point reth uses for `eth_simulateV1` and the local pending block. The miner and
+    /// bid simulator construct this struct literally and must set
+    /// [`BscExecutionMode::Mining`] explicitly.
+    pub mode: BscExecutionMode,
     /// Sink for transporting `current_validators` from builder to payload layer without writing
     /// to VALIDATOR_CACHE prematurely (hash not yet final at build time).
     pub validator_cache_sink: Option<ValidatorCacheSink>,
@@ -88,17 +136,30 @@ pub struct BscNextBlockEnvAttributes {
     /// blocks unboundedly past its slot. `None` = legacy unbounded blocking wait
     /// (out-of-turn / bid-sim / import paths).
     pub state_root_deadline_ms: Option<u64>,
+    /// Sub-second millisecond remainder (BEP-520) of the block being built, consumed by
+    /// [`BscBlockEnv`] and the BEP-706 precompile. The miner and bid simulator fill it
+    /// with `block_timestamp_ms % 1000` (the planned millisecond timestamp that is
+    /// later sealed into the header's `mix_hash`); the RPC pending/simulate paths leave
+    /// it `0`, matching go-bsc's synthetic headers whose zero `MixDigest` yields
+    /// `Time*1000`.
+    pub milli_remainder: u64,
 }
 
 impl<H: BlockHeader> BuildPendingEnv<H> for BscNextBlockEnvAttributes {
     fn build_pending_env(parent: &SealedHeader<H>) -> Self {
         Self {
             inner: NextBlockEnvAttributes::build_pending_env(parent),
+            // This is the RPC-side entry point (`eth_simulateV1`, local pending block), not
+            // the miner. Simulation must not run Parlia finalization or sign system txs.
+            mode: BscExecutionMode::Simulation,
             validator_cache_sink: None,
             turn_length_sink: None,
             state_root_precomputed_sink: None,
             trie_handle: None,
             state_root_deadline_ms: None,
+            // RPC pending/simulate blocks have no millisecond source — second precision
+            // (`Time*1000`), like go-bsc's zero-MixDigest synthetic headers.
+            milli_remainder: 0,
         }
     }
 }
@@ -143,8 +204,8 @@ pub struct BscBlockExecutionCtx<'a> {
     pub header: Option<Header>,
     /// Block hash when known (sealed block), to avoid re-hashing.
     pub header_hash: Option<BlockHash>,
-    /// Whether the block is being mined.
-    pub is_miner: bool,
+    /// What this execution is for: verifying, mining, or simulating.
+    pub mode: BscExecutionMode,
     /// Sink for `current_validators` — written by builder in `finish()` and read by the
     /// payload layer after the builder is consumed. `None` for non-miner paths.
     pub validator_cache_sink: Option<ValidatorCacheSink>,
@@ -263,7 +324,7 @@ where
     Spec: EthereumHardforks + BscHardforks + EthChainSpec + Hardforks + Clone,
     EvmF: EvmFactory<
         Tx: FromRecoveredTx<TransactionSigned> + FromTxWithEncoded<TransactionSigned>,
-        BlockEnv = BlockEnv,
+        BlockEnv = BscBlockEnv,
     >,
     R::Transaction: From<TransactionSigned> + Clone,
     Self: 'static,
@@ -303,6 +364,61 @@ where
 
 const EIP1559_INITIAL_BASE_FEE: u64 = 0;
 
+/// The [`EvmEnv`] that `header` itself presents to the EVM — go-bsc's
+/// `core.NewEVMBlockContext(header, ..)`.
+pub(crate) fn evm_env_for_header<Spec>(
+    spec: &Spec,
+    header: &Header,
+) -> EvmEnv<BscHardfork, BscBlockEnv>
+where
+    Spec: BscHardforks + EthChainSpec + Clone,
+{
+    // `BscHardforks::` disambiguates from the same-named `EthereumHardforks` supertrait methods.
+    let blob_params =
+        BscHardforks::is_cancun_active_at_timestamp(spec, header.number, header.timestamp)
+            .then(|| spec.blob_params_at_timestamp(header.timestamp))
+            .flatten();
+    let hardfork =
+        revm_spec_by_timestamp_and_block_number(spec.clone(), header.timestamp(), header.number());
+    let spec_id = SpecId::from(hardfork);
+
+    let mut cfg_env = CfgEnv::new_with_spec(hardfork).with_chain_id(spec.chain().id());
+
+    if let Some(blob_params) = &blob_params {
+        cfg_env.set_max_blobs_per_tx(blob_params.max_blobs_per_tx);
+    }
+    if BscHardforks::is_osaka_active_at_timestamp(spec, header.number, header.timestamp) {
+        cfg_env.tx_gas_limit_cap = Some(MAX_TX_GAS_LIMIT_OSAKA);
+    }
+
+    // derive the EIP-4844 blob fees from the header's `excess_blob_gas` and the current blobparams
+    let blob_excess_gas_and_price =
+        header.excess_blob_gas.zip(blob_params).map(|(excess_blob_gas, params)| {
+            let blob_gasprice = params.calc_blob_fee(excess_blob_gas);
+            BlobExcessGasAndPrice { excess_blob_gas, blob_gasprice }
+        });
+
+    let block_env = BlockEnv {
+        number: U256::from(header.number()),
+        beneficiary: header.beneficiary(),
+        timestamp: U256::from(header.timestamp()),
+        difficulty: if spec_id >= SpecId::MERGE { U256::ZERO } else { header.difficulty() },
+        // BSC does not replace the DIFFICULTY output with prevrandao so here we are setting
+        // this to the difficulty values to ensure correct opcode outputs
+        prevrandao: if spec_id >= SpecId::MERGE { Some(header.difficulty().into()) } else { None },
+        gas_limit: header.gas_limit(),
+        basefee: header.base_fee_per_gas().unwrap_or_default(),
+        blob_excess_gas_and_price,
+        slot_num: 0,
+    };
+    // The millisecond remainder lives in the header's `mix_hash` tail (BEP-520) — the
+    // BscBlockEnv counterpart of go-bsc filling `BlockContext.MilliTimestamp` from
+    // `header.MilliTimestamp()` in `NewEVMBlockContext`.
+    let block_env = BscBlockEnv::new(block_env, millisecond_remainder(header));
+
+    EvmEnv { cfg_env, block_env }
+}
+
 impl ConfigureEvm for BscEvmConfig
 where
     Self: Send + Sync + Unpin + Clone + 'static,
@@ -321,68 +437,16 @@ where
         &self.block_assembler
     }
 
-    fn evm_env(&self, header: &Header) -> Result<EvmEnv<BscHardfork>, Self::Error> {
-        let mut blob_params = None;
-        if BscHardforks::is_cancun_active_at_timestamp(
-            self.chain_spec(),
-            header.number,
-            header.timestamp,
-        ) {
-            blob_params = self.chain_spec().blob_params_at_timestamp(header.timestamp);
-        }
-        let spec = revm_spec_by_timestamp_and_block_number(
-            self.chain_spec().clone(),
-            header.timestamp(),
-            header.number(),
-        );
-        let spec_id = SpecId::from(spec);
-
-        // configure evm env based on parent block
-        let mut cfg_env = CfgEnv::new_with_spec(spec).with_chain_id(self.chain_spec().chain().id());
-
-        if let Some(blob_params) = &blob_params {
-            cfg_env.set_max_blobs_per_tx(blob_params.max_blobs_per_tx);
-        }
-        if BscHardforks::is_osaka_active_at_timestamp(self.chain_spec(), header.number, header.timestamp) {
-            cfg_env.tx_gas_limit_cap = Some(MAX_TX_GAS_LIMIT_OSAKA);
-        }
-
-        // derive the EIP-4844 blob fees from the header's `excess_blob_gas` and the current
-        // blobparams
-        let blob_excess_gas_and_price =
-            header.excess_blob_gas.zip(blob_params).map(|(excess_blob_gas, params)| {
-                let blob_gasprice = params.calc_blob_fee(excess_blob_gas);
-                BlobExcessGasAndPrice { excess_blob_gas, blob_gasprice }
-            });
-
-        let eth_spec = spec_id;
-
-        let block_env = BlockEnv {
-            number: U256::from(header.number()),
-            beneficiary: header.beneficiary(),
-            timestamp: U256::from(header.timestamp()),
-            difficulty: if eth_spec >= SpecId::MERGE { U256::ZERO } else { header.difficulty() },
-            // BSC does not replace the DIFFICULTY output with prevrandao so here we are setting
-            // this to the difficulty values to ensure correct opcode outputs
-            prevrandao: if eth_spec >= SpecId::MERGE {
-                Some(header.difficulty().into())
-            } else {
-                None
-            },
-            gas_limit: header.gas_limit(),
-            basefee: header.base_fee_per_gas().unwrap_or_default(),
-            blob_excess_gas_and_price,
-            slot_num: 0,
-        };
-
-        Ok(EvmEnv { cfg_env, block_env })
+    fn evm_env(&self, header: &Header) -> Result<EvmEnv<BscHardfork, BscBlockEnv>, Self::Error> {
+        Ok(evm_env_for_header(self.chain_spec(), header))
     }
 
     fn next_evm_env(
         &self,
         parent: &Header,
         attributes: &Self::NextBlockEnvCtx,
-    ) -> Result<EvmEnv<BscHardfork>, Self::Error> {
+    ) -> Result<EvmEnv<BscHardfork, BscBlockEnv>, Self::Error> {
+        let milli_remainder = attributes.milli_remainder;
         let attributes = &attributes.inner;
         // ensure we're not missing any timestamp based hardforks
         let spec_id = revm_spec_by_timestamp_and_block_number(
@@ -454,6 +518,10 @@ where
             blob_excess_gas_and_price,
             slot_num: 0,
         };
+        // Millisecond remainder for the next block, threaded through the attributes:
+        // the miner/bid-simulator's planned `block_timestamp_ms % 1000`, or `0` on the
+        // RPC pending/simulate paths (go-bsc synthetic-header semantics).
+        let block_env = BscBlockEnv::new(block_env, milli_remainder);
 
         Ok(EvmEnv { cfg_env, block_env })
     }
@@ -474,7 +542,7 @@ where
             },
             header: Some(block.header().clone()),
             header_hash: Some(block.hash()),
-            is_miner: false,
+            mode: BscExecutionMode::Import,
             validator_cache_sink: None,
             turn_length_sink: None,
             state_root_precomputed_sink: None,
@@ -488,7 +556,12 @@ where
         parent: &SealedHeader<HeaderTy<Self::Primitives>>,
         attributes: Self::NextBlockEnvCtx,
     ) -> Result<ExecutionCtxFor<'_, Self>, Self::Error> {
-        tracing::trace!("Try to create next block ctx for miner, next_block_numer={}, parent_hash={}", parent.number+1, parent.hash());
+        tracing::trace!(
+            "Try to create next block ctx, next_block_numer={}, parent_hash={}, mode={:?}",
+            parent.number + 1,
+            parent.hash(),
+            attributes.mode
+        );
         Ok(BscBlockExecutionCtx {
             base: EthBlockExecutionCtx {
                 tx_count_hint: None,
@@ -501,7 +574,9 @@ where
             },
             header: None, // No header available for next block context
             header_hash: None,
-            is_miner: true,
+            // Carried from the attributes rather than hard-coded: this hook is shared by
+            // the miner, `eth_simulateV1` and the local pending-block path.
+            mode: attributes.mode,
             validator_cache_sink: attributes.validator_cache_sink,
             turn_length_sink: attributes.turn_length_sink,
             state_root_precomputed_sink: attributes.state_root_precomputed_sink,
@@ -549,7 +624,10 @@ impl ConfigureEngineEvm<BscExecutionData> for BscEvmConfig
 where
     Self: Send + Sync + Unpin + Clone + 'static,
 {
-    fn evm_env_for_payload(&self, payload: &BscExecutionData) -> Result<EvmEnv<BscHardfork>, Self::Error> {
+    fn evm_env_for_payload(
+        &self,
+        payload: &BscExecutionData,
+    ) -> Result<EvmEnv<BscHardfork, BscBlockEnv>, Self::Error> {
         self.evm_env(&payload.block.header)
     }
 
@@ -570,7 +648,7 @@ where
             },
             header: Some(block.header.clone()),
             header_hash: Some(payload.block_hash_cached()),
-            is_miner: false,
+            mode: BscExecutionMode::Import,
             validator_cache_sink: None,
             turn_length_sink: None,
             state_root_precomputed_sink: None,
@@ -594,7 +672,9 @@ pub fn revm_spec_by_timestamp_and_block_number(
     timestamp: u64,
     block_number: u64,
 ) -> BscHardfork {
-    if chain_spec.is_pasteur_active_at_timestamp(block_number, timestamp) {
+    if chain_spec.is_jenner_active_at_timestamp(block_number, timestamp) {
+        BscHardfork::Jenner
+    } else if chain_spec.is_pasteur_active_at_timestamp(block_number, timestamp) {
         BscHardfork::Pasteur
     } else if chain_spec.is_mendel_active_at_timestamp(block_number, timestamp) {
         BscHardfork::Mendel
@@ -669,5 +749,189 @@ pub fn revm_spec_by_timestamp_and_block_number(
         } else {
             BscHardfork::Frontier
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_consensus::Header;
+    use alloy_primitives::B256;
+    use reth_primitives_traits::SealedHeader;
+
+    /// `evm_env(header)` must decode the BEP-520 millisecond remainder out of the
+    /// header's `mix_hash` tail into [`BscBlockEnv`] — the counterpart of go-bsc
+    /// filling `BlockContext.MilliTimestamp` from `header.MilliTimestamp()` in
+    /// `NewEVMBlockContext` (the only fill point on the header-derived paths).
+    #[test]
+    fn evm_env_fills_millisecond_remainder_from_header() {
+        let chain_spec =
+            crate::chainspec::BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet());
+        let evm_config = BscEvmConfig::bsc(std::sync::Arc::new(chain_spec));
+
+        // Post-Lorentz header: seconds in `timestamp`, remainder in the mix_hash tail.
+        let mut header = Header {
+            number: 50_000_000,
+            timestamp: 1_780_000_000,
+            gas_limit: 30_000_000,
+            ..Default::default()
+        };
+        crate::consensus::parlia::util::set_millisecond_part_of_timestamp(
+            1_780_000_000_750,
+            &mut header,
+        );
+        let env = evm_config.evm_env(&header).unwrap();
+        assert_eq!(env.block_env.milli_remainder, 750);
+        assert_eq!(env.block_env.milli_timestamp(), 1_780_000_000_750);
+        assert_eq!(
+            env.block_env.milli_timestamp(),
+            crate::consensus::parlia::util::calculate_millisecond_timestamp(&header),
+            "env and header millisecond sources must agree"
+        );
+
+        // Pre-Lorentz-shaped header (zero mix_hash): remainder 0, value Time*1000.
+        header.mix_hash = B256::ZERO;
+        let env = evm_config.evm_env(&header).unwrap();
+        assert_eq!(env.block_env.milli_remainder, 0);
+        assert_eq!(env.block_env.milli_timestamp(), 1_780_000_000_000);
+
+        // Stale-immunity across the generic `inner_mut()` mutation path (block
+        // overrides, traceCallMany's bump, callBundle): the live value follows the
+        // mutated seconds and keeps the original remainder.
+        crate::consensus::parlia::util::set_millisecond_part_of_timestamp(
+            1_780_000_000_750,
+            &mut header,
+        );
+        let mut env = evm_config.evm_env(&header).unwrap();
+        use alloy_evm::env::BlockEnvironment;
+        env.block_env.inner_mut().timestamp = U256::from(1_790_000_000u64);
+        assert_eq!(env.block_env.milli_timestamp(), 1_790_000_000_750);
+    }
+
+    /// `next_evm_env` (miner / pending / simulate paths) carries a zero remainder until
+    /// the miner threads its planned millisecond timestamp through the attributes (R4).
+    #[test]
+    fn next_evm_env_defaults_to_zero_remainder() {
+        let chain_spec =
+            crate::chainspec::BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet());
+        let evm_config = BscEvmConfig::bsc(std::sync::Arc::new(chain_spec));
+
+        let parent = SealedHeader::seal_slow(Header {
+            number: 50_000_000,
+            timestamp: 1_780_000_000,
+            gas_limit: 30_000_000,
+            ..Default::default()
+        });
+        let attrs =
+            <BscNextBlockEnvAttributes as BuildPendingEnv<Header>>::build_pending_env(&parent);
+        let env = evm_config.next_evm_env(&parent, &attrs).unwrap();
+        assert_eq!(env.block_env.milli_remainder, 0);
+        assert_eq!(
+            env.block_env.milli_timestamp(),
+            env.block_env.timestamp.saturating_to::<u64>() * 1000
+        );
+    }
+
+    /// The miner threads `block_timestamp_ms % 1000` through the attributes; the env's
+    /// live millisecond value must equal both the planned value and what the sealed
+    /// header will report via `calculate_millisecond_timestamp` once the same remainder
+    /// is written into its `mix_hash` (the two millisecond sources must agree).
+    #[test]
+    fn next_evm_env_carries_the_miner_millisecond_remainder() {
+        let chain_spec =
+            crate::chainspec::BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet());
+        let evm_config = BscEvmConfig::bsc(std::sync::Arc::new(chain_spec));
+
+        let parent = SealedHeader::seal_slow(Header {
+            number: 50_000_000,
+            timestamp: 1_780_000_000,
+            gas_limit: 30_000_000,
+            ..Default::default()
+        });
+        // The planned millisecond timestamp a miner would compute for the next slot.
+        let block_timestamp_ms: u64 = 1_780_000_000_750;
+        let mut attrs =
+            <BscNextBlockEnvAttributes as BuildPendingEnv<Header>>::build_pending_env(&parent);
+        attrs.inner.timestamp = block_timestamp_ms / 1000;
+        attrs.milli_remainder = block_timestamp_ms % 1000;
+
+        let env = evm_config.next_evm_env(&parent, &attrs).unwrap();
+        assert_eq!(env.block_env.milli_remainder, 750);
+        assert_eq!(env.block_env.milli_timestamp(), block_timestamp_ms);
+
+        // Sealing the same value into a header (what finalize does via
+        // `set_millisecond_part_of_timestamp`) reports the identical milliseconds.
+        let mut sealed = Header { timestamp: block_timestamp_ms / 1000, ..Default::default() };
+        crate::consensus::parlia::util::set_millisecond_part_of_timestamp(
+            block_timestamp_ms,
+            &mut sealed,
+        );
+        assert_eq!(
+            env.block_env.milli_timestamp(),
+            crate::consensus::parlia::util::calculate_millisecond_timestamp(&sealed),
+        );
+    }
+
+    /// Regression guard for <https://github.com/bnb-chain/reth-bsc/issues/451>.
+    ///
+    /// `build_pending_env` is the entry point reth uses for `eth_simulateV1` and the local
+    /// pending block. It must not select a mode that runs Parlia finalization, or those
+    /// read-only RPCs try to sign system transactions and fail on any node without a
+    /// validator key (and silently inject a signed reward tx on nodes that have one).
+    #[test]
+    fn rpc_pending_env_does_not_select_a_finalizing_mode() {
+        let parent = SealedHeader::seal_slow(Header::default());
+        let attrs = <BscNextBlockEnvAttributes as BuildPendingEnv<Header>>::build_pending_env(
+            &parent,
+        );
+
+        assert_eq!(attrs.mode, BscExecutionMode::Simulation);
+        assert!(!attrs.mode.finalizes(), "simulation must not run Parlia finalization");
+    }
+
+    /// The two predicates encode the axes the old `is_miner: bool` fused together.
+    /// Mining and simulation both author a header; only mining finalizes.
+    #[test]
+    fn execution_mode_predicates_split_authoring_from_finalizing() {
+        assert!(!BscExecutionMode::Import.authors_block());
+        assert!(BscExecutionMode::Mining.authors_block());
+        assert!(BscExecutionMode::Simulation.authors_block());
+
+        assert!(!BscExecutionMode::Import.finalizes());
+        assert!(BscExecutionMode::Mining.finalizes());
+        assert!(!BscExecutionMode::Simulation.finalizes());
+    }
+
+    /// Regression guard for <https://github.com/bnb-chain/reth-bsc/issues/464>.
+    ///
+    /// `context_for_next_block` used to hard-code `is_miner: true`, so the execution context
+    /// reth builds for the local pending block demanded Parlia finalization regardless of the
+    /// attributes it was handed. On a node without a validator key that made
+    /// `eth_getBlockByNumber("pending")` fail to build and return `null`. The mode must be
+    /// carried from the attributes, not re-decided here.
+    #[test]
+    fn next_block_ctx_carries_the_mode_from_the_attributes() {
+        let chain_spec = Arc::new(BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet()));
+        let evm_config = BscEvmConfig::new(chain_spec);
+        let parent = SealedHeader::seal_slow(Header::default());
+
+        // The RPC pending-block / `eth_simulateV1` entry point.
+        let pending_attrs =
+            <BscNextBlockEnvAttributes as BuildPendingEnv<Header>>::build_pending_env(&parent);
+        let ctx = evm_config.context_for_next_block(&parent, pending_attrs).unwrap();
+        assert_eq!(ctx.mode, BscExecutionMode::Simulation);
+        assert!(
+            !ctx.mode.finalizes(),
+            "pending-block ctx must not require a validator key to finalize"
+        );
+        assert!(ctx.mode.authors_block(), "pending block still authors a header");
+
+        // The miner passes its attributes through the same hook and must keep finalizing.
+        let mut mining_attrs =
+            <BscNextBlockEnvAttributes as BuildPendingEnv<Header>>::build_pending_env(&parent);
+        mining_attrs.mode = BscExecutionMode::Mining;
+        let ctx = evm_config.context_for_next_block(&parent, mining_attrs).unwrap();
+        assert_eq!(ctx.mode, BscExecutionMode::Mining);
+        assert!(ctx.mode.finalizes(), "mining must still run Parlia finalization");
     }
 }

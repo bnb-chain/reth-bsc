@@ -1,4 +1,6 @@
-use super::config::{revm_spec_by_timestamp_and_block_number, BscBlockExecutionCtx};
+use super::config::{
+    revm_spec_by_timestamp_and_block_number, BscBlockExecutionCtx, BscExecutionMode,
+};
 use super::patch::HertzPatchManager;
 use crate::consensus::parlia::SnapshotProvider;
 use crate::{
@@ -22,7 +24,10 @@ use alloy_consensus::{Header, TxReceipt, TxType};
 use alloy_eips::eip2935::{HISTORY_STORAGE_ADDRESS, HISTORY_STORAGE_CODE};
 use alloy_eips::{eip7685::Requests, Encodable2718};
 use alloy_evm::{
-    block::{ExecutableTx, GasOutput, StateChangeSource, TxResult},
+    block::{
+        ExecutableTx, GasOutput, StateChangePostBlockSource, StateChangePreBlockSource,
+        StateChangeSource, TxResult,
+    },
     eth::receipt_builder::ReceiptBuilderCtx,
 };
 use alloy_primitives::keccak256;
@@ -135,7 +140,7 @@ where
         Tx: FromRecoveredTx<R::Transaction>
                 + FromRecoveredTx<TransactionSigned>
                 + FromTxWithEncoded<TransactionSigned>,
-        BlockEnv = revm::context::BlockEnv,
+        BlockEnv = crate::evm::block_env::BscBlockEnv,
     >,
     Spec: EthereumHardforks + BscHardforks + EthChainSpec + Hardforks + Clone + 'static,
     R: ReceiptBuilder<Transaction = TransactionSigned, Receipt: TxReceipt>,
@@ -158,12 +163,12 @@ where
 
         trace!("Succeed to new block executor, header: {:?}", ctx.header);
         if let Some(ref header) = ctx.header {
-            crate::node::evm::util::HEADER_CACHE_READER
-                .lock()
-                .unwrap()
-                .insert_header_to_cache_with_hash(header.clone(), ctx.header_hash);
-        } else if !ctx.is_miner {
-            // miner has no current header.
+            crate::node::evm::util::insert_header_to_cache_with_hash(
+                header.clone(),
+                ctx.header_hash,
+            );
+        } else if !ctx.mode.authors_block() {
+            // Block-authoring modes (mining, simulation) have no current header.
             warn!(
                 "No header found in the context, block_number: {:?}",
                 evm.block().number().to::<u64>()
@@ -206,11 +211,15 @@ where
     }
 
     /// Applies system contract upgrades if the Feynman fork is not yet active.
+    ///
+    /// `source` identifies the upgrade to the state hook and therefore to the incremental
+    /// state-root computation; pre-Feynman upgrades run at block begin, later ones at block end.
     fn upgrade_contracts(
         &mut self,
         block_number: BlockNumber,
         block_timestamp: u64,
         parent_timestamp: u64,
+        source: StateChangeSource,
     ) -> Result<(), BlockExecutionError> {
         trace!(
             target: "bsc::executor::upgrade",
@@ -237,7 +246,7 @@ where
                     code_len = code.len(),
                     "Upgrading system contract"
                 );
-                self.upgrade_system_contract(address, code)?;
+                self.upgrade_system_contract(address, code, source)?;
             }
         }
 
@@ -261,7 +270,14 @@ where
                     parent_timestamp,
                     "Upgrading system contracts at block begin (before Feynman)"
                 );
-                self.upgrade_contracts(block_number, block_timestamp, parent_timestamp)?;
+                self.upgrade_contracts(
+                    block_number,
+                    block_timestamp,
+                    parent_timestamp,
+                    StateChangeSource::PreBlock(StateChangePreBlockSource::Other(
+                        "bsc_system_contract_upgrade",
+                    )),
+                )?;
             }
 
             // HistoryStorageAddress is a special system contract in BSC, which can't be upgraded
@@ -288,7 +304,14 @@ where
                     parent_timestamp,
                     "Upgrading system contracts at block end (Feynman active)"
                 );
-                self.upgrade_contracts(block_number, block_timestamp, parent_timestamp)?;
+                self.upgrade_contracts(
+                    block_number,
+                    block_timestamp,
+                    parent_timestamp,
+                    StateChangeSource::PostBlock(StateChangePostBlockSource::Other(
+                        "bsc_system_contract_upgrade",
+                    )),
+                )?;
             }
         }
         Ok(())
@@ -323,16 +346,29 @@ where
         &mut self,
         address: Address,
         code: Bytecode,
+        source: StateChangeSource,
     ) -> Result<(), BlockExecutionError> {
-        let db = self.evm.db_mut();
-        let mut info = db.basic(address).map_err(BlockExecutionError::other)?.unwrap_or_default();
-        info.code_hash = code.hash_slow();
-        info.code = Some(code);
-        let mut account = RevmAccount::from(info);
-        account.mark_touch();
-        let mut changes: EvmState = Default::default();
-        changes.insert(address, account);
-        db.commit(changes);
+        let changes = {
+            let db = self.evm.db_mut();
+            let mut info =
+                db.basic(address).map_err(BlockExecutionError::other)?.unwrap_or_default();
+            info.code_hash = code.hash_slow();
+            info.code = Some(code);
+            let mut account = RevmAccount::from(info);
+            account.mark_touch();
+            let mut changes: EvmState = Default::default();
+            changes.insert(address, account);
+            db.commit(changes.clone());
+            changes
+        };
+
+        // The state root is computed incrementally from the state hook (sparse trie /
+        // `StateRootTask`), so a bare `db.commit` is invisible to it: the account's new
+        // `code_hash` never reaches the trie and the block commits a root describing the
+        // un-upgraded contract. That is what split bsc-qanet at the Pasteur transition
+        // (block 21323714) - geth computed the true root and rejected the block while every
+        // reth node agreed on the stale one. Report the change like `commit_transaction` does.
+        self.system_caller.on_state(source, &changes);
         Ok(())
     }
 
@@ -374,7 +410,17 @@ where
         account.mark_touch();
         let mut changes: EvmState = Default::default();
         changes.insert(HISTORY_STORAGE_ADDRESS, account);
-        db.commit(changes);
+        db.commit(changes.clone());
+
+        // Same reasoning as `upgrade_system_contract`: the incremental state-root pipeline only
+        // sees changes reported through the hook, so this deployment must be announced or the
+        // Prague transition block commits a root without it.
+        self.system_caller.on_state(
+            StateChangeSource::PreBlock(StateChangePreBlockSource::Other(
+                "bsc_history_storage_account",
+            )),
+            &changes,
+        );
 
         info!(
             target: "bsc::executor::prague",
@@ -392,7 +438,7 @@ where
         Tx: FromRecoveredTx<R::Transaction>
                 + FromRecoveredTx<TransactionSigned>
                 + FromTxWithEncoded<TransactionSigned>,
-        BlockEnv = revm::context::BlockEnv,
+        BlockEnv = crate::evm::block_env::BscBlockEnv,
     >,
     Spec: EthereumHardforks + BscHardforks + EthChainSpec + Hardforks + 'static,
     R: ReceiptBuilder<Transaction = TransactionSigned, Receipt: TxReceipt>,
@@ -411,7 +457,7 @@ where
         trace!(
             target: "bsc::executor",
             block_id = %block_env.number(),
-            is_miner = self.ctx.is_miner,
+            mode = ?self.ctx.mode,
             "Start to apply_pre_execution_changes"
         );
 
@@ -420,13 +466,19 @@ where
         self.consensus_metrics.current_block_height.set(block_number as f64);
 
         // pre check and prepare some intermediate data for commit parlia snapshot in finish function.
-        if self.ctx.is_miner {
+        // `check_new_block` dereferences `ctx.header`, which only exists when importing.
+        if self.ctx.mode.authors_block() {
             self.prepare_new_block(&block_env)?;
         } else {
             self.check_new_block(&block_env)?;
         }
 
-        let parent_timestamp = self.inner_ctx.parent_header.as_ref().unwrap().timestamp;
+        let parent_timestamp = self
+            .inner_ctx
+            .parent_header
+            .as_ref()
+            .ok_or_else(|| BlockExecutionError::msg("Missing parent header in execution context"))?
+            .timestamp;
         self.try_update_build_in_system_contract(
             self.evm.block().number().to::<u64>(),
             self.evm.block().timestamp().to::<u64>(),
@@ -485,8 +537,9 @@ where
             });
         }
 
-        // Apply hertz patch before tx (validation only, not mining).
-        if !self.ctx.is_miner {
+        // Apply hertz patch before tx (import only — it replays a historical state fix and
+        // is meaningless for a block being authored).
+        if !self.ctx.mode.authors_block() {
             self.hertz_patch_manager.patch_before_tx(&tx_signed, self.evm.db_mut())?;
         }
 
@@ -578,9 +631,9 @@ where
 
         self.evm.db_mut().commit(state);
 
-        // Apply hertz patch after tx (validation only, not mining).
+        // Apply hertz patch after tx (import only — see `patch_before_tx` above).
         // commit_transaction cannot return errors in the new API, so defer any error to finish().
-        if !self.ctx.is_miner {
+        if !self.ctx.mode.authors_block() {
             if let Err(e) = self.hertz_patch_manager.patch_after_tx(&output.tx, self.evm.db_mut()) {
                 self.deferred_error = Some(e);
             }
@@ -599,11 +652,16 @@ where
         debug!(
             target: "bsc::executor",
             block_id = %block_env.number(),
-            is_miner = self.ctx.is_miner,
+            mode = ?self.ctx.mode,
             "Start to finish"
         );
 
-        let parent_timestamp = self.inner_ctx.parent_header.as_ref().unwrap().timestamp;
+        let parent_timestamp = self
+            .inner_ctx
+            .parent_header
+            .as_ref()
+            .ok_or_else(|| BlockExecutionError::msg("Missing parent header in execution context"))?
+            .timestamp;
         self.try_update_build_in_system_contract(
             self.evm.block().number().to::<u64>(),
             self.evm.block().timestamp().to::<u64>(),
@@ -611,33 +669,49 @@ where
             false,
         )?;
 
-        // Initialize Feynman contracts on transition block
-        if self.spec.is_feynman_transition_at_timestamp(
-            self.evm.block().number().to::<u64>(),
-            self.evm.block().timestamp().to::<u64>(),
-            parent_timestamp,
-        ) {
-            info!(
-                target: "bsc::executor::feynman",
-                block_number = self.evm.block().number().to::<u64>(),
-                "Initializing Feynman contracts"
-            );
-            self.initialize_feynman_contracts(self.evm.block().beneficiary())?;
+        // Both contract-initialization steps below issue Parlia system transactions via
+        // `transact_system_tx`, so they require either a block to consume them from (import)
+        // or a validator key to sign them with (mining). A simulation has neither, and its
+        // caller asked a hypothetical rather than for a sealed block — so skip them, along
+        // with the finalization below.
+        if self.ctx.mode != BscExecutionMode::Simulation {
+            // Initialize Feynman contracts on transition block
+            if self.spec.is_feynman_transition_at_timestamp(
+                self.evm.block().number().to::<u64>(),
+                self.evm.block().timestamp().to::<u64>(),
+                parent_timestamp,
+            ) {
+                info!(
+                    target: "bsc::executor::feynman",
+                    block_number = self.evm.block().number().to::<u64>(),
+                    "Initializing Feynman contracts"
+                );
+                self.initialize_feynman_contracts(self.evm.block().beneficiary())?;
+            }
+
+            // Deploy genesis contracts on Block 1
+            if self.evm.block().number() == uint!(1U256) {
+                info!(
+                    target: "bsc::executor::genesis",
+                    "Deploying genesis contracts on Block 1"
+                );
+                self.deploy_genesis_contracts(self.evm.block().beneficiary())?;
+            }
         }
 
-        // Deploy genesis contracts on Block 1
-        if self.evm.block().number() == uint!(1U256) {
-            info!(
-                target: "bsc::executor::genesis",
-                "Deploying genesis contracts on Block 1"
-            );
-            self.deploy_genesis_contracts(self.evm.block().beneficiary())?;
-        }
-
-        if self.ctx.is_miner {
-            self.finalize_new_block(&self.evm.block().clone())?;
-        } else {
-            self.post_check_new_block(&self.evm.block().clone())?;
+        match self.ctx.mode {
+            // Generates and signs system txs (rewards, slashing, validator-set updates).
+            BscExecutionMode::Mining => self.finalize_new_block(&self.evm.block().clone())?,
+            // Verifies the system txs already present in the received block.
+            BscExecutionMode::Import => self.post_check_new_block(&self.evm.block().clone())?,
+            // Neither: return the executed block as-is, matching BSC geth's simulation path.
+            BscExecutionMode::Simulation => {
+                trace!(
+                    target: "bsc::executor",
+                    block_id = %block_env.number(),
+                    "Skipping Parlia finalization for simulated block"
+                );
+            }
         }
 
         // Update receipt height metric
