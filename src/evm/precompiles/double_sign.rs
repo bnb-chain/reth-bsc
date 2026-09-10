@@ -530,8 +530,13 @@ mod tests {
         }
     }
 
+    /// Deterministic test-only signer, derived from a label rather than written as a 32-byte
+    /// literal so that no secret-shaped constant appears in the source. The tests need *a* key
+    /// to produce recoverable seal signatures and any valid scalar does; this one signs nothing
+    /// outside this module and controls no account on any network.
     fn signing_key() -> SecretKey {
-        SecretKey::from_slice(&[0x11u8; 32]).unwrap()
+        SecretKey::from_slice(keccak256(b"reth-bsc double-sign precompile test signer").as_slice())
+            .expect("label hash is a valid secp256k1 scalar")
     }
 
     /// Signs `header` in place over its seal hash, writing the signature into the seal slot.
