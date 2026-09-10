@@ -83,8 +83,16 @@ struct VoteEntry {
 struct PromotionCandidate {
     data: VoteData,
     votes: Vec<VoteEntry>,
-    /// Past the `head + 11` window, so it can never become promotable later:
+    /// Below the `head - 256` retention bound, where `prune` would drop it anyway:
     /// judge it now and drop what fails rather than holding it forever.
+    ///
+    /// The bound is the *lower* admission limit, not `head + 11`. A target we do
+    /// not hold is not necessarily invalid — it can be a valid block on a branch
+    /// we have not seen — and go-bsc keeps such votes for the full 256-block
+    /// window rather than discarding them 11 blocks after the head passes them.
+    /// Discarding early loses the evidence if the node later reorgs onto that
+    /// branch. This stays a live check rather than being left to `prune`, since
+    /// `prune` runs on the vote path and promotion now runs on every import.
     expired: bool,
 }
 
@@ -340,7 +348,7 @@ impl VotePool {
                 .unwrap_or_default();
             vote_budget -= votes.len();
             candidates.push(PromotionCandidate {
-                expired: vd.target_number.saturating_add(UPPER_LIMIT_OF_VOTE_BLOCK_NUMBER) < latest,
+                expired: vd.target_number.saturating_add(LOWER_LIMIT_OF_VOTE_BLOCK_NUMBER) < latest,
                 votes,
                 data: *vd,
             });
@@ -1065,9 +1073,14 @@ pub fn promote_future_votes(head_number: BlockNumber) {
         promoted.into_iter().map(|hash| (hash, pool.len_for_block(&hash))).collect()
     };
 
-    // A target may have crossed quorum while it sat in the future pool.
+    // A target may have crossed quorum while it sat in the future pool. Report the
+    // delay stats too: `on_vote_received` is keyed on the current total for a
+    // block, and promotion is the only path by which a future vote reaches that
+    // total, so skipping it under-reports first- and majority-vote delay on
+    // exactly the nodes that classify the most votes as future.
     for (hash, count) in promoted_counts {
         if count > 0 {
+            block_stats::on_vote_received(hash, count);
             maybe_notify_finality(hash, count);
         }
     }
@@ -1823,21 +1836,24 @@ mod tests {
     }
 
     /// Candidate selection is the read-lock half: everything at or below the head
-    /// is a candidate, anything past `head + 11` is flagged so promotion judges it
-    /// now instead of holding it forever, and targets above the head are left
-    /// alone.
+    /// is a candidate, anything below the `head - 256` retention bound is flagged
+    /// so promotion judges it instead of holding it forever, and targets above the
+    /// head are left alone.
     #[test]
     fn promotion_candidates_selects_reached_targets_and_flags_expired() {
+        const HEAD: u64 = 400;
         let stale = B256::from([0xa1; 32]);
-        let current = B256::from([0xa2; 32]);
-        let ahead = B256::from([0xa3; 32]);
+        let recent = B256::from([0xa2; 32]);
+        let current = B256::from([0xa3; 32]);
+        let ahead = B256::from([0xa4; 32]);
         let mut pool = VotePool::new();
-        pool.insert(future_vote(stale, 50, 5), 0, true);
-        pool.insert(future_vote(current, 100, 6), 0, true);
-        pool.insert(future_vote(ahead, 105, 7), 0, true);
+        pool.insert(future_vote(stale, 100, 5), 0, true);
+        pool.insert(future_vote(recent, 380, 6), 0, true);
+        pool.insert(future_vote(current, HEAD, 7), 0, true);
+        pool.insert(future_vote(ahead, HEAD + 5, 8), 0, true);
 
         let mut got: Vec<(u64, bool, usize)> = pool
-            .promotion_candidates(100)
+            .promotion_candidates(HEAD)
             .into_iter()
             .map(|c| (c.data.target_number, c.expired, c.votes.len()))
             .collect();
@@ -1845,8 +1861,9 @@ mod tests {
 
         assert_eq!(
             got,
-            vec![(50, true, 1), (100, false, 1)],
-            "target 105 is still ahead of the head; 50 is past head-11 so it expires",
+            vec![(100, true, 1), (380, false, 1), (400, false, 1)],
+            "405 is still ahead of the head; only 100 is past head-256, and 380 is \
+             held rather than discarded, matching go-bsc's retention",
         );
     }
 
