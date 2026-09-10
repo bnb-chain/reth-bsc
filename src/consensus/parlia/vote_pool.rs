@@ -49,6 +49,21 @@ const MAX_CUR_VOTE_AMOUNT_PER_BLOCK: usize = 21;
 /// accounting for future votes in `core/vote/vote_pool.go`. Worth raising
 /// upstream rather than assuming reth-bsc is the only client affected.
 const MAX_FUTURE_VOTE_AMOUNT_PER_BLOCK: usize = 50;
+/// Targets examined by one promotion pass.
+///
+/// Promotion runs on every import, so a bounded slice per pass still drains a
+/// backlog quickly, while a flood cannot put unbounded work on the critical path
+/// between importing a block and the next one. Whatever is left over is picked up
+/// by the next pass.
+const MAX_PROMOTION_TARGETS_PER_PASS: usize = 64;
+/// Votes origin-checked by one promotion pass.
+///
+/// The per-target budget matters more than the per-pass one: future buckets whose
+/// sender could not be authenticated are deliberately uncapped, so a single target
+/// can hold tens of thousands of votes, each costing a provider read and two
+/// snapshot reads to judge. `promote_judged` leaves the unjudged remainder future
+/// and re-queues the target, so a large bucket drains across passes.
+const MAX_PROMOTION_VOTES_PER_PASS: usize = 512;
 /// Hard ceiling on pooled votes. Exceeding it triggers a prune and, failing
 /// that, shedding of future votes.
 const MAX_VOTES_IN_POOL: usize = 32 * 1024 * 2;
@@ -62,6 +77,9 @@ struct VoteEntry {
 }
 
 /// One future target considered for promotion, captured under the read lock.
+///
+/// `votes` may be a prefix of the target's bucket when the pass runs out of
+/// budget; the remainder stays future and is judged by a later pass.
 struct PromotionCandidate {
     data: VoteData,
     votes: Vec<VoteEntry>,
@@ -305,21 +323,30 @@ impl VotePool {
     ///
     /// Read-only: nothing moves until `apply_promotion` runs with the verdicts.
     fn promotion_candidates(&self, latest: BlockNumber) -> Vec<PromotionCandidate> {
-        self.future_votes_pq
-            .heap
-            .iter()
-            .map(|Reverse(vd)| *vd)
-            .filter(|vd| vd.target_number <= latest)
-            .map(|vd| PromotionCandidate {
+        let mut candidates = Vec::new();
+        let mut vote_budget = MAX_PROMOTION_VOTES_PER_PASS;
+
+        for Reverse(vd) in self.future_votes_pq.heap.iter() {
+            if candidates.len() >= MAX_PROMOTION_TARGETS_PER_PASS || vote_budget == 0 {
+                break;
+            }
+            if vd.target_number > latest {
+                continue;
+            }
+            let votes: Vec<VoteEntry> = self
+                .future_votes
+                .get(&vd.target_hash)
+                .map(|vm| vm.vote_messages.iter().take(vote_budget).cloned().collect())
+                .unwrap_or_default();
+            vote_budget -= votes.len();
+            candidates.push(PromotionCandidate {
                 expired: vd.target_number.saturating_add(UPPER_LIMIT_OF_VOTE_BLOCK_NUMBER) < latest,
-                votes: self
-                    .future_votes
-                    .get(&vd.target_hash)
-                    .map(|vm| vm.vote_messages.clone())
-                    .unwrap_or_default(),
-                data: vd,
-            })
-            .collect()
+                votes,
+                data: *vd,
+            });
+        }
+
+        candidates
     }
 
     /// Moves the targets in `resolved` into the current pool, using verdicts
@@ -647,7 +674,7 @@ fn validator_set_swaps_within(head: u64, target: u64, epoch: u64, offset: u64) -
 /// the same outcome go-bsc reaches by returning an error — but logs the two
 /// cases separately, because "snapshot not available yet" and "vote is not from
 /// a validator" have very different operational meanings.
-fn verify_vote_origin(vote: &VoteEnvelope) -> bool {
+fn verify_vote_origin(vote: &VoteEnvelope) -> OriginVerdict {
     let Some(header) = shared::get_canonical_header_by_hash_from_provider(&vote.data.target_hash)
     else {
         tracing::debug!(
@@ -655,10 +682,10 @@ fn verify_vote_origin(vote: &VoteEnvelope) -> bool {
             target_number = vote.data.target_number,
             "vote origin unverifiable: target header not found",
         );
-        return false;
+        return OriginVerdict::Unverifiable;
     };
     if header.number != vote.data.target_number {
-        return false;
+        return OriginVerdict::Rejected;
     }
 
     match justified_pair_for_hash(&vote.data.target_hash) {
@@ -667,7 +694,7 @@ fn verify_vote_origin(vote: &VoteEnvelope) -> bool {
                 || vote.data.source_hash != justified_hash
             {
                 metrics::counter!("votes.rejected.source_mismatch").increment(1);
-                return false;
+                return OriginVerdict::Rejected;
             }
         }
         None => {
@@ -676,12 +703,12 @@ fn verify_vote_origin(vote: &VoteEnvelope) -> bool {
                 target_number = vote.data.target_number,
                 "vote origin unverifiable: no snapshot for target",
             );
-            return false;
+            return OriginVerdict::Unverifiable;
         }
     }
 
     let Some(sp) = shared::get_snapshot_provider() else {
-        return false;
+        return OriginVerdict::Unverifiable;
     };
     let Some(parent_snap) = sp.snapshot_by_hash(&header.parent_hash) else {
         tracing::debug!(
@@ -689,15 +716,41 @@ fn verify_vote_origin(vote: &VoteEnvelope) -> bool {
             target_number = vote.data.target_number,
             "vote origin unverifiable: no snapshot for target's parent",
         );
-        return false;
+        return OriginVerdict::Unverifiable;
     };
 
-    let is_validator =
-        parent_snap.validators_map.values().any(|v| v.vote_addr == vote.vote_address);
-    if !is_validator {
+    if parent_snap.validators_map.values().any(|v| v.vote_addr == vote.vote_address) {
+        OriginVerdict::Ok
+    } else {
         metrics::counter!("votes.rejected.not_a_validator").increment(1);
+        OriginVerdict::Rejected
     }
-    is_validator
+}
+
+/// Remember an envelope that can never become valid, so a replay is dropped at
+/// `put_vote`'s cache check instead of paying for another BLS verification.
+///
+/// Only for verdicts that are properties of the envelope itself. Anything we
+/// merely could not judge yet must stay out of here.
+fn remember_rejected(vote_hash: B256) {
+    REJECTED_VOTES.write().expect("rejected vote cache poisoned").put(vote_hash, ());
+}
+
+/// Outcome of an origin check.
+///
+/// `Rejected` and `Unverifiable` both keep a vote out, but they must not be
+/// treated alike at admission: a rejection is a property of the envelope and
+/// cannot change, while "unverifiable" means only that we lack the snapshot to
+/// judge it yet. Caching the latter as rejected would blacklist a vote that a
+/// later copy could have proven valid.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OriginVerdict {
+    Ok,
+    /// The envelope contradicts the chain: wrong target height, wrong source
+    /// pair, or a sender absent from the set that governs its target.
+    Rejected,
+    /// We cannot tell yet — the target's snapshot or the provider is missing.
+    Unverifiable,
 }
 
 /// Whether a vote targeting `target_number` falls inside the admission window
@@ -780,7 +833,7 @@ pub fn put_vote(vote: VoteEnvelope) {
         return;
     }
 
-    put_vote_inner(vote);
+    put_vote_inner(vote, vote_hash);
 }
 
 /// Test-only ingress that skips signature verification and places the vote
@@ -803,7 +856,7 @@ pub fn put_vote_unchecked(vote: VoteEnvelope) {
     }
 }
 
-fn put_vote_inner(vote: VoteEnvelope) {
+fn put_vote_inner(vote: VoteEnvelope, vote_hash: B256) {
     let target_hash = vote.data.target_hash;
     let target_number = vote.data.target_number;
     let pending_block_number = shared::get_best_canonical_block_number().unwrap_or(0);
@@ -844,6 +897,11 @@ fn put_vote_inner(vote: VoteEnvelope) {
                     target_number,
                     "rejecting future vote from a non-validator",
                 );
+                // The sender is in no validator set, and `future_vote_sender_is_
+                // validator` only answers `Some` when no set change lies between
+                // our head and the target — so this envelope cannot start
+                // passing, and a replay must not cost another BLS verification.
+                remember_rejected(vote_hash);
                 return;
             }
             Some(true) => true,
@@ -854,14 +912,24 @@ fn put_vote_inner(vote: VoteEnvelope) {
     };
 
     // Current votes are origin-checked at admission; future votes at promotion.
-    if !is_future && !verify_vote_origin(&vote) {
-        tracing::debug!(
-            target: "bsc::vote_pool",
-            vote_address = %vote.vote_address,
-            target_number,
-            "rejecting vote that failed the origin check",
-        );
-        return;
+    if !is_future {
+        match verify_vote_origin(&vote) {
+            OriginVerdict::Ok => {}
+            verdict => {
+                tracing::debug!(
+                    target: "bsc::vote_pool",
+                    vote_address = %vote.vote_address,
+                    target_number,
+                    "rejecting vote that failed the origin check",
+                );
+                // Only a verdict about the envelope is cacheable. "Unverifiable"
+                // means a snapshot was missing, which a later copy may not hit.
+                if verdict == OriginVerdict::Rejected {
+                    remember_rejected(vote_hash);
+                }
+                return;
+            }
+        }
     }
 
     // Lazy prune, once per observed head advance. Promotion is driven by block
@@ -982,7 +1050,7 @@ pub fn promote_future_votes(head_number: BlockNumber) {
             candidate
                 .votes
                 .iter()
-                .map(|entry| (entry.hash, verify_vote_origin(&entry.envelope)))
+                .map(|entry| (entry.hash, verify_vote_origin(&entry.envelope) == OriginVerdict::Ok))
                 .collect(),
         );
     }
@@ -1780,6 +1848,53 @@ mod tests {
             vec![(50, true, 1), (100, false, 1)],
             "target 105 is still ahead of the head; 50 is past head-11 so it expires",
         );
+    }
+
+    /// One pass judges at most `MAX_PROMOTION_VOTES_PER_PASS` votes, so an
+    /// uncapped future bucket cannot put unbounded provider and snapshot reads on
+    /// the import path. The remainder is not lost: it stays future, its target
+    /// stays queued, and the next pass continues.
+    #[test]
+    fn promotion_candidates_bounds_the_votes_judged_per_pass() {
+        let target = B256::from([0xb1; 32]);
+        let mut pool = VotePool::new();
+        let oversized = MAX_PROMOTION_VOTES_PER_PASS + 40;
+        for i in 0..oversized {
+            let mut vote = future_vote(target, 100, 0);
+            // Distinct envelopes: `insert` dedups by hash.
+            vote.vote_address[1..3].copy_from_slice(&(i as u16).to_be_bytes());
+            pool.insert(vote, 0, true);
+        }
+
+        let candidates = pool.promotion_candidates(100);
+        let judged: usize = candidates.iter().map(|c| c.votes.len()).sum();
+        assert_eq!(judged, MAX_PROMOTION_VOTES_PER_PASS, "pass budget is enforced");
+
+        // Judge exactly what the pass captured; the rest must survive as future.
+        let verdicts: HashMap<B256, bool> =
+            candidates[0].votes.iter().map(|e| (e.hash, true)).collect();
+        let promoted = pool.apply_promotion(100, &[(target, verdicts)].into_iter().collect());
+
+        assert_eq!(promoted, vec![target]);
+        assert_eq!(
+            pool.future_votes.get(&target).map(|vm| vm.vote_messages.len()),
+            Some(oversized - MAX_PROMOTION_VOTES_PER_PASS),
+            "the unjudged remainder stays future",
+        );
+        assert_eq!(pool.future_votes_pq.heap.len(), 1, "and its target stays queued");
+    }
+
+    /// At most `MAX_PROMOTION_TARGETS_PER_PASS` targets are examined per pass.
+    #[test]
+    fn promotion_candidates_bounds_the_targets_per_pass() {
+        let mut pool = VotePool::new();
+        for i in 0..(MAX_PROMOTION_TARGETS_PER_PASS + 10) {
+            let mut hash = [0xc0u8; 32];
+            hash[0..2].copy_from_slice(&(i as u16).to_be_bytes());
+            pool.insert(future_vote(B256::from(hash), 100, 9), 0, true);
+        }
+
+        assert_eq!(pool.promotion_candidates(100).len(), MAX_PROMOTION_TARGETS_PER_PASS);
     }
 
     /// Registers a snapshot provider for tests, reusing whichever one another
