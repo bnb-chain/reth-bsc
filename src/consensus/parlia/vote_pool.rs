@@ -83,16 +83,15 @@ struct VoteEntry {
 struct PromotionCandidate {
     data: VoteData,
     votes: Vec<VoteEntry>,
-    /// Below the `head - 256` retention bound, where `prune` would drop it anyway:
-    /// judge it now and drop what fails rather than holding it forever.
+    /// More than `head - 11` behind, so judge it now and drop what fails rather
+    /// than holding it forever.
     ///
-    /// The bound is the *lower* admission limit, not `head + 11`. A target we do
-    /// not hold is not necessarily invalid — it can be a valid block on a branch
-    /// we have not seen — and go-bsc keeps such votes for the full 256-block
-    /// window rather than discarding them 11 blocks after the head passes them.
-    /// Discarding early loses the evidence if the node later reorgs onto that
-    /// branch. This stays a live check rather than being left to `prune`, since
-    /// `prune` runs on the vote path and promotion now runs on every import.
+    /// The bound is the *upper* admission limit, matching go-bsc's
+    /// `transferVotesFromFutureToCur`, which sweeps
+    /// `TargetNumber + upperLimitOfVoteBlockNumber < latestBlockNumber`
+    /// unconditionally and lets `VerifyVote` drop what cannot be verified.
+    /// Upstream never prunes `futureVotes` by the 256-block bound — this sweep is
+    /// what clears them.
     expired: bool,
 }
 
@@ -348,7 +347,7 @@ impl VotePool {
                 .unwrap_or_default();
             vote_budget -= votes.len();
             candidates.push(PromotionCandidate {
-                expired: vd.target_number.saturating_add(LOWER_LIMIT_OF_VOTE_BLOCK_NUMBER) < latest,
+                expired: vd.target_number.saturating_add(UPPER_LIMIT_OF_VOTE_BLOCK_NUMBER) < latest,
                 votes,
                 data: *vd,
             });
@@ -1836,24 +1835,22 @@ mod tests {
     }
 
     /// Candidate selection is the read-lock half: everything at or below the head
-    /// is a candidate, anything below the `head - 256` retention bound is flagged
-    /// so promotion judges it instead of holding it forever, and targets above the
-    /// head are left alone.
+    /// is a candidate, anything more than `head - 11` behind is flagged so
+    /// promotion judges it instead of holding it forever — the same sweep go-bsc
+    /// runs in `transferVotesFromFutureToCur` — and targets above the head are
+    /// left alone.
     #[test]
     fn promotion_candidates_selects_reached_targets_and_flags_expired() {
-        const HEAD: u64 = 400;
         let stale = B256::from([0xa1; 32]);
-        let recent = B256::from([0xa2; 32]);
-        let current = B256::from([0xa3; 32]);
-        let ahead = B256::from([0xa4; 32]);
+        let current = B256::from([0xa2; 32]);
+        let ahead = B256::from([0xa3; 32]);
         let mut pool = VotePool::new();
-        pool.insert(future_vote(stale, 100, 5), 0, true);
-        pool.insert(future_vote(recent, 380, 6), 0, true);
-        pool.insert(future_vote(current, HEAD, 7), 0, true);
-        pool.insert(future_vote(ahead, HEAD + 5, 8), 0, true);
+        pool.insert(future_vote(stale, 50, 5), 0, true);
+        pool.insert(future_vote(current, 100, 6), 0, true);
+        pool.insert(future_vote(ahead, 105, 7), 0, true);
 
         let mut got: Vec<(u64, bool, usize)> = pool
-            .promotion_candidates(HEAD)
+            .promotion_candidates(100)
             .into_iter()
             .map(|c| (c.data.target_number, c.expired, c.votes.len()))
             .collect();
@@ -1861,9 +1858,8 @@ mod tests {
 
         assert_eq!(
             got,
-            vec![(100, true, 1), (380, false, 1), (400, false, 1)],
-            "405 is still ahead of the head; only 100 is past head-256, and 380 is \
-             held rather than discarded, matching go-bsc's retention",
+            vec![(50, true, 1), (100, false, 1)],
+            "target 105 is still ahead of the head; 50 is past head-11 so it expires",
         );
     }
 
