@@ -1,10 +1,4 @@
 //! Decoding the governable lane ratio and the payment contract list.
-//!
-//! The default for a ratio governance never wrote lives in the contract's own getter, not here,
-//! so there is one source of truth.
-//!
-//! Decodes and validates; it does not call. The caller supplies each page's raw return data,
-//! which keeps every reject condition below testable without an EVM.
 
 use super::{LaneError, MAX_LANE_RATIO, MAX_LISTED_CONTRACTS, PAGE_SIZE};
 use alloy_primitives::{map::HashSet, Address, Bytes, U256};
@@ -12,7 +6,7 @@ use alloy_sol_types::{sol, SolCall};
 use std::sync::Arc;
 
 sol! {
-    /// The consensus getters on `0x2007`.
+    /// The getters on payment lane contract `0x2007`.
     #[derive(Debug)]
     function getPaymentLaneRatio() external view returns (uint256);
 
@@ -52,8 +46,7 @@ pub fn contracts_calldata(offset: u64) -> Bytes {
         .into()
 }
 
-/// Applies the ratio guard at the full `uint256` width: narrowed to 64 bits first, `2^64 + 500`
-/// would pass it as a legal `500`.
+/// Applies the ratio guard at the full `uint256` width.
 pub fn decode_ratio(ret: &[u8]) -> Result<u64, LaneError> {
     let value = getPaymentLaneRatioCall::abi_decode_returns(ret)
         .map_err(|e| corrupt(format!("getPaymentLaneRatio decode: {e}")))?;
