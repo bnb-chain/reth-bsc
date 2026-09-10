@@ -64,6 +64,14 @@ const MAX_PROMOTION_TARGETS_PER_PASS: usize = 64;
 /// snapshot reads to judge. `promote_judged` leaves the unjudged remainder future
 /// and re-queues the target, so a large bucket drains across passes.
 const MAX_PROMOTION_VOTES_PER_PASS: usize = 512;
+/// Votes of headroom to reclaim when the pool overflows.
+///
+/// Shedding walks and rebuilds the whole future queue, so releasing exactly the
+/// overflow makes the *next* admitted vote overflow again — turning an O(n log n)
+/// pass under the write lock into a per-vote cost. Reclaiming a block of headroom
+/// instead amortises it to roughly one pass per `SHED_HEADROOM` admissions.
+/// Reported by Hashdit Bot on #491.
+const SHED_HEADROOM: usize = 4096;
 /// Hard ceiling on pooled votes. Exceeding it triggers a prune and, failing
 /// that, shedding of future votes.
 const MAX_VOTES_IN_POOL: usize = 32 * 1024 * 2;
@@ -94,6 +102,16 @@ struct PromotionCandidate {
     /// Upstream never prunes `futureVotes` by the 256-block bound — this sweep is
     /// what clears them.
     expired: bool,
+}
+
+/// How many votes to release when the pool is over its ceiling, or `None` when it
+/// is not. Sheds down to `MAX_VOTES_IN_POOL - SHED_HEADROOM` so the cost is paid
+/// once per block of admissions rather than on every vote.
+fn overflow_shed_target(pool_len: usize) -> Option<usize> {
+    if pool_len <= MAX_VOTES_IN_POOL {
+        return None;
+    }
+    Some(pool_len - MAX_VOTES_IN_POOL.saturating_sub(SHED_HEADROOM))
 }
 
 /// What one promotion pass did, so the per-pass bound is observable in tests.
@@ -424,6 +442,9 @@ impl VotePool {
                         deferred.push(vd);
                     }
                 }
+                // A target whose bucket is gone — shed, or pruned — leaves a
+                // stale queue entry. Drop it rather than deferring it forever.
+                None if !self.future_votes.contains_key(&vd.target_hash) => {}
                 None => deferred.push(vd),
             }
         }
@@ -1024,8 +1045,8 @@ fn put_vote_inner(vote: VoteEnvelope, vote_hash: B256) {
     if pool.len() > MAX_VOTES_IN_POOL {
         pool.prune(pending_block_number);
         let after_prune = pool.len();
-        if after_prune > MAX_VOTES_IN_POOL {
-            let shed = pool.shed_future_votes(after_prune - MAX_VOTES_IN_POOL);
+        if let Some(to_shed) = overflow_shed_target(after_prune) {
+            let shed = pool.shed_future_votes(to_shed);
             metrics::counter!("votes.shed.future_oversized").increment(shed as u64);
             tracing::warn!(
                 target: "bsc::vote_pool",
@@ -2013,6 +2034,43 @@ mod tests {
             .collect();
         let applied = pool.apply_promotion(1000, &resolved);
         assert_eq!(applied.promoted.len(), MAX_PROMOTION_TARGETS_PER_PASS, "all judged promoted");
+    }
+
+    /// Overflow must reclaim a block of headroom, not just the excess. Shedding
+    /// walks and rebuilds the whole future queue, so releasing exactly the
+    /// overflow would make the next admitted vote overflow again and pay that
+    /// cost per vote, under the write lock. Reported by Hashdit Bot on #491.
+    #[test]
+    fn overflow_sheds_a_block_of_headroom() {
+        assert_eq!(overflow_shed_target(MAX_VOTES_IN_POOL), None, "at the ceiling, nothing to do");
+        assert_eq!(overflow_shed_target(MAX_VOTES_IN_POOL - 1), None);
+
+        // One vote over: still reclaim headroom, so the next admissions are free.
+        let one_over = overflow_shed_target(MAX_VOTES_IN_POOL + 1).expect("over the ceiling");
+        assert_eq!(one_over, SHED_HEADROOM + 1);
+
+        // After shedding, the pool sits a full block below the ceiling.
+        let remaining = (MAX_VOTES_IN_POOL + 1) - one_over;
+        assert_eq!(remaining, MAX_VOTES_IN_POOL - SHED_HEADROOM);
+        assert_eq!(overflow_shed_target(remaining), None, "and does not re-trigger");
+    }
+
+    /// A queue entry whose bucket was shed or pruned must be discarded, not
+    /// deferred: deferring re-queues it every pass, forever.
+    #[test]
+    fn apply_promotion_drops_queue_entries_whose_bucket_is_gone() {
+        let target = B256::from([0xd1; 32]);
+        let mut pool = VotePool::new();
+        pool.insert(future_vote(target, 100, 1), 0, true);
+        assert_eq!(pool.future_votes_pq.heap.len(), 1);
+
+        // Simulate shedding having removed the bucket while its queue entry stays.
+        pool.future_votes.remove(&target);
+
+        let applied = pool.apply_promotion(100, &HashMap::new());
+        assert!(applied.promoted.is_empty());
+        assert_eq!(applied.examined, 1);
+        assert_eq!(pool.future_votes_pq.heap.len(), 0, "the stale entry is discarded");
     }
 
     /// Registers a snapshot provider for tests, reusing whichever one another
