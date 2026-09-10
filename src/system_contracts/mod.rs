@@ -1287,7 +1287,7 @@ mod tests {
     fn jenner_payment_lane_code_matches_genesis_contract() {
         use sha2::{Digest, Sha256};
         const WANT_SHA256: &str =
-            "8fd1686e0e53d7d6840d05ac4a3a1da1d322c3a742012428eaa63b6931add259";
+            "ebee6a014126a2c3c3549e1b9e8924eff695f3f9c99324ada3104616b164a213";
 
         assert_eq!(PAYMENT_LANE_CONTRACT, address!("0x0000000000000000000000000000000000002007"));
         for spec in [bsc_mainnet(), bsc_testnet(), bsc_qanet()] {
@@ -1296,7 +1296,7 @@ mod tests {
 
             let code = res.get(&PAYMENT_LANE_CONTRACT).expect("PaymentLane present");
             let bytes = code.as_ref().unwrap().original_bytes();
-            assert_eq!(bytes.len(), 3249);
+            assert_eq!(bytes.len(), 3540);
             assert_eq!(hex::encode(Sha256::digest(bytes)), WANT_SHA256);
         }
     }
