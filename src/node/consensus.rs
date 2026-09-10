@@ -1297,7 +1297,7 @@ where
             "Fork choice updated"
         );
 
-        match self
+        let outcome = match self
             .engine_handle
             .fork_choice_updated(state, None)
             .await
@@ -1309,7 +1309,28 @@ where
                 _ => Ok(()),
             },
             Err(err) => Err(ParliaConsensusErr::ForkChoiceUpdateError(err.to_string())),
+        };
+
+        // Promote future votes now that the block is canonical. This is the
+        // import event go-bsc gets from `highestVerifiedBlock`, and vote arrival
+        // cannot stand in for it: the vote that would trigger promotion may
+        // already have been received and deduped.
+        //
+        // It has to run *after* the forkchoice update, not before. reth
+        // canonicalizes in `on_forkchoice_updated`, never in `on_new_payload`,
+        // and `ConsistentProvider::header` resolves a hash only against the
+        // canonical in-memory chain or the database. Before the update the block
+        // we just imported is in neither, so every vote for it would be judged
+        // "still future" and skipped — leaving the next proposer reading an empty
+        // `cur_votes`, which is the lag this is meant to remove.
+        //
+        // A failed update means the block did not become canonical, so there is
+        // nothing to promote against.
+        if outcome.is_ok() {
+            crate::consensus::parlia::vote_pool::promote_future_votes(new_canonical_head.number);
         }
+
+        outcome
     }
 
     /// Determines if a chain reorganization is needed based on fork choice rules.
@@ -1371,19 +1392,16 @@ where
             return None;
         }
 
-        let sp = shared::get_snapshot_provider()?;
-
-        match sp.snapshot_by_hash(&header.hash_slow()) {
-            Some(snap) => Some((snap.vote_data.target_number, snap.vote_data.target_hash)),
-            None => {
-                tracing::warn!(
-                    target: "bsc::forkchoice",
-                    header_hash = ?header.hash_slow(),
-                    "Missing snapshot for header when get justified number and hash"
-                );
-                None
-            }
+        let hash = header.hash_slow();
+        let pair = crate::consensus::parlia::vote_pool::justified_pair_for_hash(&hash);
+        if pair.is_none() {
+            tracing::warn!(
+                target: "bsc::forkchoice",
+                header_hash = ?hash,
+                "Missing snapshot for header when get justified number and hash"
+            );
         }
+        pair
     }
 
     /// Gets the finalized number and hash from the header's snapshot.
