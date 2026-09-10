@@ -81,7 +81,8 @@ struct VoteEntry {
 /// `votes` may be a prefix of the target's bucket when the pass runs out of
 /// budget; the remainder stays future and is judged by a later pass.
 struct PromotionCandidate {
-    data: VoteData,
+    target_number: BlockNumber,
+    target_hash: B256,
     votes: Vec<VoteEntry>,
     /// More than `head - 11` behind, so judge it now and drop what fails rather
     /// than holding it forever.
@@ -93,6 +94,14 @@ struct PromotionCandidate {
     /// Upstream never prunes `futureVotes` by the 256-block bound — this sweep is
     /// what clears them.
     expired: bool,
+}
+
+/// What one promotion pass did, so the per-pass bound is observable in tests.
+struct PromotionApplied {
+    promoted: Vec<B256>,
+    /// Targets popped from the future queue. Never above
+    /// `MAX_PROMOTION_TARGETS_PER_PASS`.
+    examined: usize,
 }
 
 /// Result of moving one target out of the future pool.
@@ -330,26 +339,45 @@ impl VotePool {
     ///
     /// Read-only: nothing moves until `apply_promotion` runs with the verdicts.
     fn promotion_candidates(&self, latest: BlockNumber) -> Vec<PromotionCandidate> {
-        let mut candidates = Vec::new();
-        let mut vote_budget = MAX_PROMOTION_VOTES_PER_PASS;
-
+        // Select the *smallest* eligible targets, because that is the order
+        // `apply_promotion` pops in. An arbitrary subset would leave the write
+        // phase draining the whole queue to reach them, which is the cost the
+        // budget exists to prevent. A bounded max-heap keeps this O(n log k) with
+        // no allocation beyond k, under the read lock and without mutating.
+        let mut smallest: BinaryHeap<(BlockNumber, B256)> = BinaryHeap::new();
         for Reverse(vd) in self.future_votes_pq.heap.iter() {
-            if candidates.len() >= MAX_PROMOTION_TARGETS_PER_PASS || vote_budget == 0 {
-                break;
-            }
             if vd.target_number > latest {
                 continue;
             }
+            let key = (vd.target_number, vd.target_hash);
+            if smallest.len() < MAX_PROMOTION_TARGETS_PER_PASS {
+                smallest.push(key);
+            } else if smallest.peek().is_some_and(|&worst| key < worst) {
+                smallest.pop();
+                smallest.push(key);
+            }
+        }
+
+        let mut keys = smallest.into_sorted_vec();
+        keys.truncate(MAX_PROMOTION_TARGETS_PER_PASS);
+
+        let mut vote_budget = MAX_PROMOTION_VOTES_PER_PASS;
+        let mut candidates = Vec::with_capacity(keys.len());
+        for (target_number, target_hash) in keys {
+            if vote_budget == 0 {
+                break;
+            }
             let votes: Vec<VoteEntry> = self
                 .future_votes
-                .get(&vd.target_hash)
+                .get(&target_hash)
                 .map(|vm| vm.vote_messages.iter().take(vote_budget).cloned().collect())
                 .unwrap_or_default();
             vote_budget -= votes.len();
             candidates.push(PromotionCandidate {
-                expired: vd.target_number.saturating_add(UPPER_LIMIT_OF_VOTE_BLOCK_NUMBER) < latest,
+                expired: target_number.saturating_add(UPPER_LIMIT_OF_VOTE_BLOCK_NUMBER) < latest,
                 votes,
-                data: *vd,
+                target_number,
+                target_hash,
             });
         }
 
@@ -363,16 +391,27 @@ impl VotePool {
         &mut self,
         latest: BlockNumber,
         resolved: &HashMap<B256, HashMap<B256, bool>>,
-    ) -> Vec<B256> {
+    ) -> PromotionApplied {
         let mut promoted = Vec::new();
         let mut deferred = Vec::new();
+        let mut examined = 0;
 
-        while let Some(vd) = self.future_votes_pq.peek() {
+        // Bounded by the same budget the candidates were selected under. Without
+        // this the loop drains every entry at or below `latest` and pushes back
+        // whatever it could not resolve — tens of thousands of heap operations
+        // per import, under the write lock every incoming vote contends for, no
+        // matter how few targets were actually judged. Reported by Hashdit Bot
+        // on #491.
+        while examined < MAX_PROMOTION_TARGETS_PER_PASS {
+            let Some(vd) = self.future_votes_pq.peek() else {
+                break;
+            };
             if vd.target_number > latest {
                 break;
             }
             let vd = *vd;
             self.future_votes_pq.pop();
+            examined += 1;
             match resolved.get(&vd.target_hash) {
                 Some(verdicts) => {
                     let outcome = self.promote_judged(vd.target_hash, verdicts);
@@ -393,7 +432,7 @@ impl VotePool {
             self.future_votes_pq.push(vd);
         }
         metrics::gauge!("futureVotesPq.local").set(self.future_votes_pq.heap.len() as f64);
-        promoted
+        PromotionApplied { promoted, examined }
     }
 
     /// Moves one target's future votes into the current pool, dropping those the
@@ -1046,7 +1085,7 @@ pub fn promote_future_votes(head_number: BlockNumber) {
     // Phase 2 — no lock held: the provider and snapshot reads.
     let mut resolved: HashMap<B256, HashMap<B256, bool>> = HashMap::new();
     for candidate in candidates {
-        let target_hash = candidate.data.target_hash;
+        let target_hash = candidate.target_hash;
         if !candidate.expired
             && shared::get_canonical_header_by_hash_from_provider(&target_hash).is_none()
         {
@@ -1068,8 +1107,8 @@ pub fn promote_future_votes(head_number: BlockNumber) {
     // Phase 3 — write lock: apply the verdicts.
     let promoted_counts: Vec<(B256, usize)> = {
         let mut pool = VOTE_POOL.write().expect("vote pool poisoned");
-        let promoted = pool.apply_promotion(head_number, &resolved);
-        promoted.into_iter().map(|hash| (hash, pool.len_for_block(&hash))).collect()
+        let applied = pool.apply_promotion(head_number, &resolved);
+        applied.promoted.into_iter().map(|hash| (hash, pool.len_for_block(&hash))).collect()
     };
 
     // A target may have crossed quorum while it sat in the future pool. Report the
@@ -1790,12 +1829,12 @@ mod tests {
         pool.insert(accepted.clone(), 0, true);
         pool.insert(rejected.clone(), 0, true);
 
-        let promoted = pool.apply_promotion(
+        let applied = pool.apply_promotion(
             100,
             &verdicts(target, &[(accepted.hash(), true), (rejected.hash(), false)]),
         );
 
-        assert_eq!(promoted, vec![target]);
+        assert_eq!(applied.promoted, vec![target]);
         assert_eq!(pool.fetch_vote_by_block_hash(target).len(), 1, "accepted vote is current");
         assert!(!pool.future_votes.contains_key(&target), "nothing left in the future pool");
         assert!(
@@ -1818,9 +1857,9 @@ mod tests {
         pool.insert(latecomer.clone(), 0, true);
 
         // Verdicts were taken before `latecomer` arrived.
-        let promoted = pool.apply_promotion(100, &verdicts(target, &[(judged.hash(), true)]));
+        let applied = pool.apply_promotion(100, &verdicts(target, &[(judged.hash(), true)]));
 
-        assert_eq!(promoted, vec![target]);
+        assert_eq!(applied.promoted, vec![target]);
         assert_eq!(pool.fetch_vote_by_block_hash(target).len(), 1, "judged vote promoted");
         assert_eq!(
             pool.future_votes.get(&target).map(|vm| vm.vote_messages.len()),
@@ -1852,7 +1891,7 @@ mod tests {
         let mut got: Vec<(u64, bool, usize)> = pool
             .promotion_candidates(100)
             .into_iter()
-            .map(|c| (c.data.target_number, c.expired, c.votes.len()))
+            .map(|c| (c.target_number, c.expired, c.votes.len()))
             .collect();
         got.sort();
 
@@ -1886,9 +1925,9 @@ mod tests {
         // Judge exactly what the pass captured; the rest must survive as future.
         let verdicts: HashMap<B256, bool> =
             candidates[0].votes.iter().map(|e| (e.hash, true)).collect();
-        let promoted = pool.apply_promotion(100, &[(target, verdicts)].into_iter().collect());
+        let applied = pool.apply_promotion(100, &[(target, verdicts)].into_iter().collect());
 
-        assert_eq!(promoted, vec![target]);
+        assert_eq!(applied.promoted, vec![target]);
         assert_eq!(
             pool.future_votes.get(&target).map(|vm| vm.vote_messages.len()),
             Some(oversized - MAX_PROMOTION_VOTES_PER_PASS),
@@ -1908,6 +1947,62 @@ mod tests {
         }
 
         assert_eq!(pool.promotion_candidates(100).len(), MAX_PROMOTION_TARGETS_PER_PASS);
+    }
+
+    /// Both halves of a promotion pass must respect the per-pass target bound.
+    /// Selection was already bounded, but application drained every eligible
+    /// entry and pushed back what it could not resolve, so an attacker who filled
+    /// the future pool with distinct target hashes could force tens of thousands
+    /// of heap operations per import under the pool write lock. Reported by
+    /// Hashdit Bot on #491.
+    #[test]
+    fn a_promotion_pass_touches_no_more_than_its_target_budget() {
+        let eligible = MAX_PROMOTION_TARGETS_PER_PASS * 20;
+        let mut pool = VotePool::new();
+        for i in 0..eligible {
+            let mut hash = [0u8; 32];
+            hash[0..4].copy_from_slice(&(i as u32).to_be_bytes());
+            pool.insert(future_vote(B256::from(hash), 100, 1), 0, true);
+        }
+
+        let candidates = pool.promotion_candidates(100);
+        assert_eq!(candidates.len(), MAX_PROMOTION_TARGETS_PER_PASS, "selection is bounded");
+
+        // Nothing resolves — the worst case, where every popped entry has to be
+        // put back. The pass must still stop at the bound.
+        let applied = pool.apply_promotion(100, &HashMap::new());
+        assert_eq!(applied.examined, MAX_PROMOTION_TARGETS_PER_PASS, "application is bounded");
+        assert!(applied.promoted.is_empty());
+        assert_eq!(pool.future_votes_pq.heap.len(), eligible, "deferred entries are kept");
+    }
+
+    /// Selection must pick the *smallest* eligible targets, because that is the
+    /// order application pops in. An arbitrary subset would leave the bounded
+    /// write phase unable to reach what was judged, and nothing would promote.
+    #[test]
+    fn promotion_selects_the_targets_the_write_phase_will_reach() {
+        let mut pool = VotePool::new();
+        for i in 0..(MAX_PROMOTION_TARGETS_PER_PASS * 3) {
+            let mut hash = [0u8; 32];
+            hash[0..4].copy_from_slice(&(i as u32).to_be_bytes());
+            // Spread across heights so ordering is meaningful.
+            pool.insert(future_vote(B256::from(hash), 50 + i as u64, 1), 0, true);
+        }
+
+        let selected: Vec<u64> =
+            pool.promotion_candidates(1000).into_iter().map(|c| c.target_number).collect();
+        let mut expected: Vec<u64> = (50..(50 + MAX_PROMOTION_TARGETS_PER_PASS as u64)).collect();
+        expected.sort();
+        assert_eq!(selected, expected, "the k smallest eligible targets, in pop order");
+
+        // And the write phase reaches exactly those.
+        let resolved: HashMap<B256, HashMap<B256, bool>> = pool
+            .promotion_candidates(1000)
+            .into_iter()
+            .map(|c| (c.target_hash, c.votes.iter().map(|e| (e.hash, true)).collect()))
+            .collect();
+        let applied = pool.apply_promotion(1000, &resolved);
+        assert_eq!(applied.promoted.len(), MAX_PROMOTION_TARGETS_PER_PASS, "all judged promoted");
     }
 
     /// Registers a snapshot provider for tests, reusing whichever one another
