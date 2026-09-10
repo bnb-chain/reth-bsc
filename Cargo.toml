@@ -139,7 +139,10 @@ serde_cbor = "0.11"
 schnellru = "0.2"
 thiserror = "2.0"
 tokio = { version = "1.44", features = ["full"] }
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = { version = "0.14.6", features = ["transport"] }
+tonic-health = "0.14.6"
+tonic-prost = "0.14.6"
 tracing = "0.1"
 bit-set = "0.5.3"
 rand = "0.9"
@@ -161,7 +164,10 @@ cometbft-light-client-verifier = { git = "https://github.com/bnb-chain/greenfiel
 cometbft-proto = { git = "https://github.com/bnb-chain/greenfield-cometbft-rs.git", rev = "1282547" }
 cometbft-light-client = { git = "https://github.com/bnb-chain/greenfield-cometbft-rs.git", rev = "1282547" }
 
-prost = { version = "0.12.6" }
+# cometbft-proto is still generated with prost 0.12; the MEV gRPC API uses the
+# prost version paired with tonic 0.14.
+prost12 = { package = "prost", version = "0.12.6" }
+prost = { version = "0.14.3" }
 
 tendermint = { git = "https://github.com/bnb-chain/tendermint-rs-parlia", rev = "8c21ccbd58a174e07eed2c9343e63ccd00f0fbd5", features = [
     "secp256k1",
@@ -169,6 +175,10 @@ tendermint = { git = "https://github.com/bnb-chain/tendermint-rs-parlia", rev = 
 signature = "2.2.0"
 k256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
 eth-keystore = "0.5"
+
+[build-dependencies]
+protoc-bin-vendored = "3"
+tonic-prost-build = "0.14.6"
 
 [target.'cfg(unix)'.dependencies]
 tikv-jemalloc-ctl = "0.6"

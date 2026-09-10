@@ -191,6 +191,50 @@ pub struct BscMevMetrics {
     pub bid_interrupt_late_total: Counter,
 }
 
+/// Metrics for the BEP-675 gRPC ingress.
+#[derive(Metrics, Clone)]
+#[metrics(scope = "bsc.mev.grpc")]
+pub struct BscMevGrpcMetrics {
+    /// Total `SendBidBlock` requests that reached the gRPC handler.
+    pub requests_total: Counter,
+
+    /// Total gRPC BidBlock requests rejected by decoding or MEV admission.
+    pub errors_total: Counter,
+
+    /// Total requests rejected because the process-wide concurrency budget was exhausted.
+    pub rejected_total: Counter,
+
+    /// Current number of gRPC BidBlock requests holding an admission permit.
+    pub active_requests: Gauge,
+
+    /// RLP BidBlock decode duration in seconds.
+    pub decode_duration_seconds: Histogram,
+
+    /// End-to-end handler duration in seconds.
+    pub handler_duration_seconds: Histogram,
+
+    /// Submitted RLP payload size in bytes.
+    pub payload_size_bytes: Histogram,
+}
+
+/// Live-sync bad-block diagnostics, independent of builder revocation evidence.
+#[derive(Metrics, Clone)]
+#[metrics(scope = "bsc.blockchain")]
+pub struct BscBadBlockMetrics {
+    /// Invalid blocks tagged as BEP-675 BidBlocks, deduplicated by a bounded hash cache.
+    pub bad_bid_blocks_total: Counter,
+}
+
+/// Metrics for BEP-675 cross-validator bad-BidBlock evidence.
+#[derive(Metrics, Clone)]
+#[metrics(scope = "bsc.mev.bid_block_evidence")]
+pub struct BscBidBlockEvidenceMetrics {
+    /// Evidence events dropped because the bounded queue was full.
+    pub dropped_total: Counter,
+    /// Builder revocations triggered after cross-validator evidence reached its threshold.
+    pub revokes_total: Counter,
+}
+
 /// Metrics for BSC miner/worker operations
 ///
 /// Tracks block production and finalization metrics.
@@ -344,6 +388,7 @@ mod tests {
         let _rewards_metrics = BscRewardsMetrics::default();
         let _vote_metrics = BscVoteMetrics::default();
         let _mev_metrics = BscMevMetrics::default();
+        let _bid_block_evidence_metrics = BscBidBlockEvidenceMetrics::default();
         let _miner_metrics = BscMinerMetrics::default();
         let _finality_metrics = BscFinalityMetrics::default();
         let _blockchain_metrics = BscBlockchainMetrics::default();

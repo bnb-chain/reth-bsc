@@ -34,6 +34,43 @@ const BLST_DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
 
 pub type EpochValidators = (Vec<Address>, Vec<VoteAddress>);
 
+/// An address's role in the validator set used for BEP-675 bad-block evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ValidatorRole {
+    /// The address is not in the validator set.
+    None,
+    /// The address is in the cabinet prefix of the validator set.
+    Cabinet,
+    /// The address is a candidate validator outside the cabinet prefix.
+    Candidate,
+}
+
+impl std::fmt::Display for ValidatorRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::None => "none",
+            Self::Cabinet => "cabinet",
+            Self::Candidate => "candidate",
+        })
+    }
+}
+
+/// Fallback used by `BSCValidatorSet` while `numOfCabinets` is unset.
+const INIT_NUM_OF_CABINETS: usize = 21;
+
+fn classify_working_validator(
+    index: usize,
+    validator_count: usize,
+    cabinet_count: usize,
+) -> ValidatorRole {
+    let guaranteed_cabinets = cabinet_count.min(validator_count);
+    if index < guaranteed_cabinets {
+        ValidatorRole::Cabinet
+    } else {
+        ValidatorRole::Candidate
+    }
+}
+
 type ValidatorCache = LruMap<BlockHash, EpochValidators, ByLength>;
 type TurnLengthCache = LruMap<BlockHash, u8, ByLength>;
 
@@ -46,7 +83,7 @@ pub static TURN_LENGTH_CACHE: LazyLock<Mutex<TurnLengthCache>> = LazyLock::new(|
 });
 
 /// Runs a read-only system-contract call in `header`'s env over `header`'s post-state.
-fn view_call_at_header<DB, Spec>(
+pub(crate) fn view_call_at_header<DB, Spec>(
     db: DB,
     spec: &Spec,
     header: &Header,
@@ -62,6 +99,65 @@ where
     // Use `Evm::transact` so system-transaction overrides still apply.
     let result = Evm::transact(&mut evm, tx_env).map_err(BlockExecutionError::other)?.result;
     view_call_output(to, &data, result)
+}
+
+/// Classify `address` against the full cabinet-first validator set at `parent`, returning
+/// the cabinet and total counts for this event's majority thresholds.
+///
+/// The counts are returned even when `address` is absent ([`ValidatorRole::None`]) so callers
+/// can fall back to another membership source without losing the thresholds in force.
+pub(crate) fn validator_role_at_parent<S, Spec>(
+    state: S,
+    spec: Spec,
+    parent: &SealedHeader,
+    address: Address,
+) -> Result<(ValidatorRole, usize, usize), BlockExecutionError>
+where
+    S: EvmStateProvider,
+    Spec: EthChainSpec + crate::hardforks::BscHardforks + Clone,
+{
+    let mut db = State::builder().with_database(StateProviderDatabase::new(state)).build();
+    let system_contracts = SystemContract::new(spec.clone());
+
+    let (to, data) = system_contracts.get_all_validators();
+    let output = view_call_at_header(&mut db, &spec, parent.header(), to, data)?;
+    let validators = system_contracts
+        .unpack_all_validators(&output)
+        .map_err(BlockExecutionError::msg)?;
+    let (to, data) = system_contracts.get_num_of_cabinets();
+    let output = view_call_at_header(&mut db, &spec, parent.header(), to, data)?;
+    let configured_cabinets =
+        system_contracts.unpack_num_of_cabinets(&output).map_err(BlockExecutionError::msg)?;
+    let configured_cabinets =
+        if configured_cabinets.is_zero() || configured_cabinets > U256::from(i64::MAX as u64) {
+            INIT_NUM_OF_CABINETS
+        } else {
+            usize::try_from(configured_cabinets).unwrap_or(INIT_NUM_OF_CABINETS)
+        };
+
+    let cabinets = configured_cabinets.min(validators.len());
+    let role = match validators.iter().position(|validator| *validator == address) {
+        Some(index) => classify_working_validator(index, validators.len(), cabinets),
+        None => ValidatorRole::None,
+    };
+    Ok((role, cabinets, validators.len()))
+}
+
+#[cfg(test)]
+mod bid_block_evidence_tests {
+    use super::*;
+
+    #[test]
+    fn full_set_uses_cabinet_prefix() {
+        assert_eq!(classify_working_validator(20, 45, 21), ValidatorRole::Cabinet);
+        assert_eq!(classify_working_validator(21, 45, 21), ValidatorRole::Candidate);
+        assert_eq!(classify_working_validator(44, 45, 21), ValidatorRole::Candidate);
+    }
+
+    #[test]
+    fn cabinet_prefix_is_capped_by_set_size() {
+        assert_eq!(classify_working_validator(4, 5, 21), ValidatorRole::Cabinet);
+    }
 }
 
 /// `getMiningValidators()` on `parent`'s post-state in `parent`'s env.
