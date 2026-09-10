@@ -1089,7 +1089,13 @@ pub fn promote_future_votes(head_number: BlockNumber) {
         if !candidate.expired
             && shared::get_canonical_header_by_hash_from_provider(&target_hash).is_none()
         {
-            continue; // still future
+            // Still future: we do not hold the target yet.
+            tracing::trace!(
+                target: "bsc::vote_pool",
+                target_number = candidate.target_number,
+                "promotion deferred: target block not held",
+            );
+            continue;
         }
         resolved.insert(
             target_hash,
@@ -1108,6 +1114,10 @@ pub fn promote_future_votes(head_number: BlockNumber) {
     let promoted_counts: Vec<(B256, usize)> = {
         let mut pool = VOTE_POOL.write().expect("vote pool poisoned");
         let applied = pool.apply_promotion(head_number, &resolved);
+        // How much of the per-pass budget a pass consumed. Sitting at the cap
+        // means a backlog is draining across passes — or that someone is filling
+        // the future pool faster than promotion can retire it.
+        metrics::histogram!("votes.promotion.targets_examined").record(applied.examined as f64);
         applied.promoted.into_iter().map(|hash| (hash, pool.len_for_block(&hash))).collect()
     };
 
