@@ -20,7 +20,7 @@ use crate::{
         SystemContract,
     },
 };
-use alloy_consensus::{Header, TxReceipt, TxType};
+use alloy_consensus::{Header, Transaction as _, TxReceipt, TxType, Typed2718 as _};
 use alloy_eips::eip2935::{HISTORY_STORAGE_ADDRESS, HISTORY_STORAGE_CODE};
 use alloy_eips::{eip7685::Requests, Encodable2718};
 use alloy_evm::{
@@ -62,8 +62,6 @@ pub struct BscTxResult<H> {
     pub tx_type: TxType,
     pub tx: TransactionSigned,
     pub is_system: bool,
-    /// On the result, not on `self`: a transaction that errors between classification and commit
-    /// must not leave a stale lane behind.
     pub lane: Lane,
 }
 
@@ -483,9 +481,9 @@ where
         tx_type: u8,
         value: U256,
     ) -> Result<Lane, BlockExecutionError> {
-        // Cheap `Arc` clone: the probe below needs `&mut self`.
         let Some(listed) = self.inner_ctx.payment_lane.as_ref().map(|l| l.meta.listed.clone())
         else {
+            // before Jenner, the lane is General
             return Ok(Lane::General);
         };
 
@@ -636,12 +634,8 @@ where
         // Detect system transactions: skip EVM execution, accumulate for later.
         let is_system = is_system_transaction(&tx_signed, signer, self.evm.block().beneficiary());
 
-        // Before the branch below, so both arms take their lane from the same call. `classify`
-        // answers `General` for a system transaction without reaching the code probe.
-        let lane = {
-            use alloy_consensus::{Transaction as _, Typed2718 as _};
-            self.classify_lane(is_system, tx_signed.to(), tx_signed.ty(), tx_signed.value())?
-        };
+        let lane =
+            self.classify_lane(is_system, tx_signed.to(), tx_signed.ty(), tx_signed.value())?;
 
         if is_system {
             self.system_txs.push(tx_signed.clone());
@@ -671,10 +665,7 @@ where
         }
 
         let block_available_gas = self.evm.block().gas_limit() - self.gas_used;
-        let tx_gas_limit = {
-            use alloy_consensus::Transaction as _;
-            tx_signed.gas_limit()
-        };
+        let tx_gas_limit = tx_signed.gas_limit();
         if tx_gas_limit > block_available_gas {
             return Err(BlockValidationError::TransactionGasLimitMoreThanAvailableBlockGas {
                 transaction_gas_limit: tx_gas_limit,
@@ -689,7 +680,6 @@ where
         let spec =
             revm_spec_by_timestamp_and_block_number(self.spec.clone(), timestamp, block_number);
         let (to, selector, input_len) = {
-            use alloy_consensus::Transaction as _;
             let to = tx_signed.to();
             let input = tx_signed.input();
             let selector = if input.len() >= 4 { Some(hex::encode(&input[..4])) } else { None };
@@ -754,7 +744,6 @@ where
 
         let blob_gas_used =
             if BscHardforks::is_cancun_active_at_timestamp(&self.spec, block_number, timestamp) {
-                use alloy_consensus::Transaction as _;
                 tx_signed.blob_gas_used().unwrap_or_default()
             } else {
                 0

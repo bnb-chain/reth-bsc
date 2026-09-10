@@ -198,9 +198,6 @@ pub enum BscBlockExecutionError {
 
 /// Routes a payment lane failure to the local-fault side or the block-verdict side, counting
 /// and logging it on the way.
-///
-/// The only conversion for [`LaneError`]: deliberately not a `From` impl, so no call site can
-/// convert silently and skip the split.
 pub fn lane_reject(err: LaneError) -> BlockExecutionError {
     let metrics = &crate::metrics::LANE_METRICS;
     let (counter, category) = match err {

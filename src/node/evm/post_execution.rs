@@ -168,9 +168,7 @@ where
                     header.number, header.hash_slow(), epoch_length, turn_length);
             }
         }
-        // The lane verdict, and it must be LAST: this function issues system transactions of
-        // its own, so only here does `self.gas_used` equal `header.gas_used`. Run it earlier and
-        // 1-12M of system gas goes unaccounted, though the lane counts it as general.
+        
         self.verify_payment_lane(header.gas_limit, self.gas_used)?;
 
         tracing::trace!("Succeed to finalize new block, block_number: {}", block.number());

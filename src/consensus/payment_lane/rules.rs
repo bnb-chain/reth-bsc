@@ -1,18 +1,14 @@
 //! Lane arithmetic, transaction classification and the block accounting rule.
-//!
-//! Pure functions of their arguments. A single disagreement with go-bsc splits the chain, so the
-//! comments mark where the obvious simplification is the divergence.
 
 use super::{Budget, Lane, LaneError, RATIO_DENOM};
 use alloy_primitives::{map::HashSet, Address, U256};
 
 /// `quota = ratio * gas_limit / RATIO_DENOM`, in 128 bits: `gas_limit` reaches `2^63 - 1`, so at
 /// the maximum ratio the product needs 73 bits and a 64-bit multiply would wrap.
-///
-/// The clamp is unreachable behind `decode_ratio`'s guard; it is here so a caller that skips the
-/// guard degrades instead of aborting the node.
 pub fn quota(ratio: u64, gas_limit: u64) -> u64 {
-    u64::try_from(ratio as u128 * gas_limit as u128 / RATIO_DENOM as u128).unwrap_or(u64::MAX)
+    u64::try_from(ratio as u128 * gas_limit as u128 / RATIO_DENOM as u128).unwrap_or_else(|_| {
+        panic!("quota overflowed u64: ratio {ratio} gas_limit {gas_limit} denom {RATIO_DENOM}")
+    })
 }
 
 /// Classify one transaction. The gates run in the order written, and all of them live here so no
@@ -81,8 +77,7 @@ impl Budget {
         }
     }
 
-    /// The block rule — `gas_used + idle <= gas_limit`, with `gas_used` the header's total, so
-    /// Parlia's system gas counts as general. The one verdict, for importer and producer alike.
+    /// `gas_used` must be the header's total, so Parlia's system gas counts as general.
     ///
     /// `checked_add`, not saturating: at `gas_limit == u64::MAX` a saturating sum compares equal
     /// and would accept a block that overflowed.

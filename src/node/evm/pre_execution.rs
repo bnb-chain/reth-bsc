@@ -395,21 +395,15 @@ where
             }
         }
         let listed = walk.finish().map_err(lane_reject)?;
-
-        // Sorted so two nodes' logs can be diffed directly, and capped so the contract's own
-        // 100k ceiling cannot produce an unreadable line.
-        let mut contracts: Vec<_> = listed.iter().copied().collect();
-        contracts.sort_unstable();
         tracing::info!(
             target: "bsc::payment_lane",
             contract = %PAYMENT_LANE_CONTRACT,
             parent = %parent_hash,
             ratio,
             denom = RATIO_DENOM,
-            listed = contracts.len(),
+            listed = listed.len(),
             pages,
             elapsed_ms = started.elapsed().as_millis(),
-            contracts = ?&contracts[..contracts.len().min(32)],
             "payment lane config loaded"
         );
 
