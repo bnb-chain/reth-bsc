@@ -890,10 +890,23 @@ where
             return Ok(()); // If not enough unique votes, do not append attestation
         }
         // Aggregate signatures
+        // A malformed signature must not panic the block-production path: votes
+        // are attacker-controlled up to this point, and only validator-set
+        // membership has been checked above.
         let sigs: Vec<blst::min_pk::Signature> = ordered_unique
             .iter()
-            .map(|(_, _, sig)| blst::min_pk::Signature::from_bytes(sig.as_slice()).unwrap())
-            .collect();
+            .map(|(_, addr, sig)| {
+                blst::min_pk::Signature::from_bytes(sig.as_slice()).map_err(|e| {
+                    tracing::warn!(
+                        target: "parlia::consensus",
+                        vote_address = %addr,
+                        error = ?e,
+                        "undecodable vote signature, skipping attestation",
+                    );
+                    ParliaConsensusError::AggregateSignatureError
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let sigs_ref: Vec<&blst::min_pk::Signature> = sigs.iter().collect();
         let aggregate = blst::min_pk::AggregateSignature::aggregate(&sigs_ref, false)
             .map_err(|_| ParliaConsensusError::AggregateSignatureError)?;

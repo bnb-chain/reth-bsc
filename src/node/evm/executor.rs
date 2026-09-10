@@ -184,10 +184,10 @@ where
 
         trace!("Succeed to new block executor, header: {:?}", ctx.header);
         if let Some(ref header) = ctx.header {
-            crate::node::evm::util::HEADER_CACHE_READER
-                .lock()
-                .unwrap()
-                .insert_header_to_cache_with_hash(header.clone(), ctx.header_hash);
+            crate::node::evm::util::insert_header_to_cache_with_hash(
+                header.clone(),
+                ctx.header_hash,
+            );
         } else if !ctx.mode.authors_block() {
             // Block-authoring modes (mining, simulation) have no current header.
             warn!(
@@ -594,7 +594,12 @@ where
             self.check_new_block(&block_env)?;
         }
 
-        let parent_timestamp = self.inner_ctx.parent_header.as_ref().unwrap().timestamp;
+        let parent_timestamp = self
+            .inner_ctx
+            .parent_header
+            .as_ref()
+            .ok_or_else(|| BlockExecutionError::msg("Missing parent header in execution context"))?
+            .timestamp;
         self.try_update_build_in_system_contract(
             self.evm.block().number().to::<u64>(),
             self.evm.block().timestamp().to::<u64>(),
@@ -813,7 +818,12 @@ where
             "Start to finish"
         );
 
-        let parent_timestamp = self.inner_ctx.parent_header.as_ref().unwrap().timestamp;
+        let parent_timestamp = self
+            .inner_ctx
+            .parent_header
+            .as_ref()
+            .ok_or_else(|| BlockExecutionError::msg("Missing parent header in execution context"))?
+            .timestamp;
         self.try_update_build_in_system_contract(
             self.evm.block().number().to::<u64>(),
             self.evm.block().timestamp().to::<u64>(),

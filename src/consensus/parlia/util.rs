@@ -27,7 +27,8 @@ pub fn is_breathe_block(last_block_time: u64, block_time: u64) -> bool {
 /// Print all header fields that participate for debug.
 pub fn debug_header(header: &Header, chain_id: u64, context: &str) {
     let block_id = format!("#{}-0x{:x}", header.number, alloy_primitives::keccak256(header.parent_hash.as_slice()));
-    let signed_extra_data = &header.extra_data[..header.extra_data.len().saturating_sub(EXTRA_SEAL_LEN)];
+    let signed_extra_data =
+        &header.extra_data[..header.extra_data.len().saturating_sub(EXTRA_SEAL_LEN)];
     
     tracing::trace!(
         target: "bsc::parlia::util",
@@ -81,16 +82,24 @@ pub fn encode_header_with_chain_id(header: &Header, out: &mut dyn BufMut, chain_
     Encodable::encode(&header.gas_limit, out);
     Encodable::encode(&header.gas_used, out);
     Encodable::encode(&header.timestamp, out);
-    Encodable::encode(&header.extra_data[..header.extra_data.len() - EXTRA_SEAL_LEN], out); // will panic if extra_data is less than EXTRA_SEAL_LEN
+    // `saturating_sub` so a short `extra_data` yields an empty slice instead of panicking;
+    // callers reject such headers, this only keeps the hasher itself total.
+    let signed_extra_data =
+        &header.extra_data[..header.extra_data.len().saturating_sub(EXTRA_SEAL_LEN)];
+    Encodable::encode(&signed_extra_data, out);
     Encodable::encode(&header.mix_hash, out);
     Encodable::encode(&header.nonce, out);
 
     if let Some(parent_beacon_block_root) = header.parent_beacon_block_root {
         if parent_beacon_block_root == B256::default() {
-            Encodable::encode(&U256::from(header.base_fee_per_gas.unwrap()), out);
-            Encodable::encode(&header.withdrawals_root.unwrap(), out);
-            Encodable::encode(&header.blob_gas_used.unwrap(), out);
-            Encodable::encode(&header.excess_blob_gas.unwrap(), out);
+            // A header decoded from the wire cannot reach here with these fields unset (they
+            // precede `parent_beacon_block_root` positionally in the RLP list), but a
+            // hand-constructed one can. Encode the default so the hash simply fails to match
+            // instead of panicking; `rlp_header` below must use the same defaults.
+            Encodable::encode(&U256::from(header.base_fee_per_gas.unwrap_or_default()), out);
+            Encodable::encode(&header.withdrawals_root.unwrap_or_default(), out);
+            Encodable::encode(&header.blob_gas_used.unwrap_or_default(), out);
+            Encodable::encode(&header.excess_blob_gas.unwrap_or_default(), out);
             Encodable::encode(&parent_beacon_block_root, out);
             // https://github.com/bnb-chain/BEPs/blob/master/BEPs/BEP-466.md
             if let Some(requests_hash) = header.requests_hash {
@@ -117,17 +126,21 @@ fn rlp_header(header: &Header, chain_id: u64) -> alloy_rlp::Header {
     rlp_head.payload_length += header.gas_limit.length(); // gas_limit
     rlp_head.payload_length += header.gas_used.length(); // gas_used
     rlp_head.payload_length += header.timestamp.length(); // timestamp
-    rlp_head.payload_length +=
-        &header.extra_data[..header.extra_data.len() - EXTRA_SEAL_LEN].length(); // extra_data
+    let signed_extra_data =
+        &header.extra_data[..header.extra_data.len().saturating_sub(EXTRA_SEAL_LEN)];
+    rlp_head.payload_length += signed_extra_data.length(); // extra_data
     rlp_head.payload_length += header.mix_hash.length(); // mix_hash
     rlp_head.payload_length += header.nonce.length(); // nonce
 
     if let Some(parent_beacon_block_root) = header.parent_beacon_block_root {
         if parent_beacon_block_root == B256::default() {
-            rlp_head.payload_length += U256::from(header.base_fee_per_gas.unwrap()).length();
-            rlp_head.payload_length += header.withdrawals_root.unwrap().length();
-            rlp_head.payload_length += header.blob_gas_used.unwrap().length();
-            rlp_head.payload_length += header.excess_blob_gas.unwrap().length();
+            // Same defaults as `encode_header_with_chain_id`, or the declared payload length
+            // would not match the bytes actually written.
+            rlp_head.payload_length +=
+                U256::from(header.base_fee_per_gas.unwrap_or_default()).length();
+            rlp_head.payload_length += header.withdrawals_root.unwrap_or_default().length();
+            rlp_head.payload_length += header.blob_gas_used.unwrap_or_default().length();
+            rlp_head.payload_length += header.excess_blob_gas.unwrap_or_default().length();
             rlp_head.payload_length += parent_beacon_block_root.length();
             // https://github.com/bnb-chain/BEPs/blob/master/BEPs/BEP-466.md
             if let Some(requests_hash) = header.requests_hash {
@@ -182,6 +195,39 @@ mod tests {
     use super::*;
     use alloy_consensus::Header;
     use alloy_primitives::B256;
+
+    /// `parent_beacon_block_root` is set but the optional fields that precede it in the RLP
+    /// list are not — impossible for a header decoded from the wire, but reachable for a
+    /// hand-built one, and it used to unwrap straight into a panic.
+    #[test]
+    fn hash_with_chain_id_tolerates_missing_optional_fields() {
+        let header = Header {
+            extra_data: vec![0u8; EXTRA_SEAL_LEN + 32].into(),
+            parent_beacon_block_root: Some(B256::ZERO),
+            base_fee_per_gas: None,
+            withdrawals_root: None,
+            blob_gas_used: None,
+            excess_blob_gas: None,
+            ..Default::default()
+        };
+
+        // No panic, and the declared RLP payload length matches what was written: the
+        // encoder and the length calculation have to agree on the substituted defaults.
+        let mut out = BytesMut::new();
+        encode_header_with_chain_id(&header, &mut out, 56);
+        let mut slice: &[u8] = out.as_ref();
+        let rlp_head = alloy_rlp::Header::decode(&mut slice).expect("valid RLP list");
+        assert!(rlp_head.list);
+        assert_eq!(rlp_head.payload_length, slice.len());
+    }
+
+    /// `extra_data` shorter than the seal is rejected by callers, but the hasher itself must
+    /// not underflow on it.
+    #[test]
+    fn hash_with_chain_id_tolerates_short_extra_data() {
+        let header = Header { extra_data: vec![0u8; 3].into(), ..Default::default() };
+        let _ = hash_with_chain_id(&header, 56);
+    }
 
     #[test]
     fn test_calculate_millisecond_timestamp_without_mix_hash() {

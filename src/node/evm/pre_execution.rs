@@ -22,7 +22,6 @@ use crate::consensus::payment_lane::{
 };
 use crate::node::evm::executor::LaneState;
 use crate::node::evm::error::{lane_reject, BscBlockExecutionError, BscBlockValidationError};
-use crate::node::evm::util::HEADER_CACHE_READER;
 use crate::system_contracts::SystemContract;
 use reth_revm::{database::{EvmStateProvider, StateProviderDatabase}, db::State};
 use crate::system_contracts::feynman_fork::ValidatorElectionInfo;
@@ -103,11 +102,16 @@ where
         system_contracts.get_current_validators_before_luban(parent.number())
     };
     let output = view_call_at_header(&mut db, &spec, parent.header(), to, data)?;
-    Ok(if is_luban {
-        system_contracts.unpack_data_into_validator_set(&output)
+    if is_luban {
+        system_contracts
+            .unpack_data_into_validator_set(&output)
+            .ok_or_else(|| BlockExecutionError::msg("Failed to decode system contract output"))
     } else {
-        (system_contracts.unpack_data_into_validator_set_before_luban(&output), Vec::new())
-    })
+        let validators = system_contracts
+            .unpack_data_into_validator_set_before_luban(&output)
+            .ok_or_else(|| BlockExecutionError::msg("Failed to decode system contract output"))?;
+        Ok((validators, Vec::new()))
+    }
 }
 
 /// Which block env a Parlia system-contract read uses.
@@ -190,19 +194,22 @@ where
         tracing::trace!("Check new block, block_number: {}", block_number);
 
         self.inner_ctx.header = self.ctx.header.clone();
-        let header = self.inner_ctx.header.clone().unwrap();
+        let header = self
+            .inner_ctx
+            .header
+            .clone()
+            .ok_or_else(|| BlockExecutionError::msg("Missing header in execution context"))?;
 
-        let parent_header = crate::node::evm::util::HEADER_CACHE_READER
-            .lock()
-            .unwrap()
-            .get_header_by_hash(&header.parent_hash)
-            .ok_or(BlockExecutionError::msg("Failed to get parent header from global header reader"))?;
+        let parent_header =
+            crate::node::evm::util::get_header_by_hash_from_cache(&header.parent_hash).ok_or(
+                BlockExecutionError::msg("Failed to get parent header from global header reader"),
+            )?;
         self.inner_ctx.parent_header = Some(parent_header.clone());
 
         let snap = self
             .snapshot_provider
             .as_ref()
-            .unwrap()
+            .ok_or_else(|| BlockExecutionError::msg("Snapshot provider is not available"))?
             .snapshot_by_hash(&header.parent_hash)
             .ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;
         self.inner_ctx.snap = Some(snap.clone());
@@ -244,13 +251,26 @@ where
 
             // Also fetch validator NodeIDs after Maxwell.
             if self.spec.is_maxwell_active_at_timestamp(header.number, header.timestamp) {
-                let (to2, data2) = self.system_contracts.get_node_ids(self.inner_ctx.current_validators.as_ref().unwrap().0.clone());
+                let current_validators = self
+                    .inner_ctx
+                    .current_validators
+                    .as_ref()
+                    .ok_or_else(|| BlockExecutionError::msg("Invalid current validators data"))?
+                    .0
+                    .clone();
+                let (to2, data2) = self.system_contracts.get_node_ids(current_validators);
                 if let Ok(output2) = self.eth_call(to2, data2) {
-                    let (_consensus_addrs, node_ids_list) = self.system_contracts.unpack_data_into_node_ids(&output2);
-                    tracing::debug!("node_ids_list: {:?}", node_ids_list);
-                    let mut flat: Vec<[u8; 32]> = Vec::new();
-                    for ids in node_ids_list { for id in ids { flat.push(id); } }
-                    crate::node::network::evn_peers::update_onchain_nodeids(flat);
+                    match self.system_contracts.unpack_data_into_node_ids(&output2) {
+                        Some((_consensus_addrs, node_ids_list)) => {
+                            tracing::debug!("node_ids_list: {:?}", node_ids_list);
+                            let mut flat: Vec<[u8; 32]> = Vec::new();
+                            for ids in node_ids_list { for id in ids { flat.push(id); } }
+                            crate::node::network::evn_peers::update_onchain_nodeids(flat);
+                        }
+                        // Advisory data for EVN peering only, so a decode failure must not
+                        // fail the block.
+                        None => tracing::warn!("Failed to decode getNodeIDs output"),
+                    }
                 }
             }
         }
@@ -261,15 +281,24 @@ where
         {
             let (to, data) = self.system_contracts.get_max_elected_validators();
             let bz = self.eth_call(to, data)?;
-            let max_elected_validators = self.system_contracts.unpack_data_into_max_elected_validators(bz.as_ref());
+            let max_elected_validators = self
+                .system_contracts
+                .unpack_data_into_max_elected_validators(bz.as_ref())
+                .ok_or_else(|| {
+                    BlockExecutionError::msg("Failed to decode system contract output")
+                })?;
             tracing::debug!("max_elected_validators: {:?}", max_elected_validators);
             self.inner_ctx.max_elected_validators = Some(max_elected_validators);
 
             let (to, data) = self.system_contracts.get_validator_election_info();
             let bz = self.eth_call(to, data)?;
 
-            let (validators, voting_powers, vote_addrs, total_length) =
-                self.system_contracts.unpack_data_into_validator_election_info(bz.as_ref());
+            let (validators, voting_powers, vote_addrs, total_length) = self
+                .system_contracts
+                .unpack_data_into_validator_election_info(bz.as_ref())
+                .ok_or_else(|| {
+                    BlockExecutionError::msg("Failed to decode system contract output")
+                })?;
 
             let total_length = total_length.to::<u64>() as usize;
             if validators.len() != total_length ||
@@ -506,11 +535,19 @@ where
             CallBlockEnv::Current => self.eth_call(to, data)?,
             CallBlockEnv::Parent => self.eth_call_at_parent(to, data)?,
         };
-        Ok(if is_luban {
-            self.system_contracts.unpack_data_into_validator_set(&output)
+        if is_luban {
+            self.system_contracts
+                .unpack_data_into_validator_set(&output)
+                .ok_or_else(|| BlockExecutionError::msg("Failed to decode system contract output"))
         } else {
-            (self.system_contracts.unpack_data_into_validator_set_before_luban(&output), Vec::new())
-        })
+            let validators = self
+                .system_contracts
+                .unpack_data_into_validator_set_before_luban(&output)
+                .ok_or_else(|| {
+                    BlockExecutionError::msg("Failed to decode system contract output")
+                })?;
+            Ok((validators, Vec::new()))
+        }
     }
 
     fn verify_cascading_fields(
@@ -581,10 +618,9 @@ where
                     is_match = true;
                     break;
                 }
-                ancestor = crate::node::evm::util::HEADER_CACHE_READER
-                    .lock()
-                    .unwrap()
-                    .get_header_by_hash(&ancestor.parent_hash())
+                ancestor = crate::node::evm::util::get_header_by_hash_from_cache(
+                    &ancestor.parent_hash(),
+                )
                     .ok_or_else(|| BscBlockExecutionError::UnknownHeader { block_hash: ancestor.parent_hash() })?;
                 tracing::debug!("ancestor: {:?}", ancestor);
             }
@@ -617,7 +653,7 @@ where
             let pre_snap = self
                 .snapshot_provider
                 .as_ref()
-                .unwrap()
+                .ok_or_else(|| BlockExecutionError::msg("Snapshot provider is not available"))?
                 .snapshot_by_hash(&ancestor.parent_hash)
                 .ok_or(BlockExecutionError::msg("Failed to get pre snapshot from snapshot provider"))?;
 
@@ -776,19 +812,13 @@ where
         snap: &Snapshot,
     ) -> Result<Header, BlockExecutionError> {
         if snap.vote_data.source_hash == B256::ZERO && snap.vote_data.target_hash == B256::ZERO {
-            return HEADER_CACHE_READER
-                .lock()
-                .unwrap()
-                .get_header_by_number(0)
+            return crate::node::evm::util::get_cannonical_header_from_cache(0)
                 .ok_or_else(|| {
                     BscBlockExecutionError::UnknownHeader { block_hash: B256::ZERO }.into()
                 });
         }
 
-        HEADER_CACHE_READER
-            .lock()
-            .unwrap()
-            .get_header_by_hash(&snap.vote_data.target_hash)
+        crate::node::evm::util::get_header_by_hash_from_cache(&snap.vote_data.target_hash)
             .ok_or_else(|| {
                 BscBlockExecutionError::UnknownHeader { block_hash: snap.vote_data.target_hash }.into()
             })
@@ -799,11 +829,11 @@ where
         &mut self, 
         block: &BlockEnv
     ) -> Result<(), BlockExecutionError> {
-        let parent_header = crate::node::evm::util::HEADER_CACHE_READER
-            .lock()
-            .unwrap()
-            .get_header_by_hash(&self.ctx.base.parent_hash)
-            .ok_or(BlockExecutionError::msg("Failed to get parent header from global header reader"))?;
+        let parent_header =
+            crate::node::evm::util::get_header_by_hash_from_cache(&self.ctx.base.parent_hash)
+                .ok_or(BlockExecutionError::msg(
+                    "Failed to get parent header from global header reader",
+                ))?;
         self.inner_ctx.parent_header = Some(parent_header.clone());
 
         // Only the Parlia finalization in `finish` reads the snapshot, and simulation skips
@@ -837,15 +867,24 @@ where
         {
             let (to, data) = self.system_contracts.get_max_elected_validators();
             let bz = self.eth_call(to, data)?;
-            let max_elected_validators = self.system_contracts.unpack_data_into_max_elected_validators(bz.as_ref());
+            let max_elected_validators = self
+                .system_contracts
+                .unpack_data_into_max_elected_validators(bz.as_ref())
+                .ok_or_else(|| {
+                    BlockExecutionError::msg("Failed to decode system contract output")
+                })?;
             tracing::debug!("max_elected_validators: {:?}", max_elected_validators);
             self.inner_ctx.max_elected_validators = Some(max_elected_validators);
 
             let (to, data) = self.system_contracts.get_validator_election_info();
             let bz = self.eth_call(to, data)?;
 
-            let (validators, voting_powers, vote_addrs, total_length) =
-                self.system_contracts.unpack_data_into_validator_election_info(bz.as_ref());
+            let (validators, voting_powers, vote_addrs, total_length) = self
+                .system_contracts
+                .unpack_data_into_validator_election_info(bz.as_ref())
+                .ok_or_else(|| {
+                    BlockExecutionError::msg("Failed to decode system contract output")
+                })?;
 
             let total_length = total_length.to::<u64>() as usize;
             if validators.len() != total_length ||

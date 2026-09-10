@@ -55,6 +55,13 @@ lazy_static! {
     );
 }
 
+/// `(consensusAddresses, votingPowers, voteAddresses, totalLength)` from
+/// `StakeHub.getValidatorElectionInfo`.
+type ValidatorElectionInfo = (Vec<Address>, Vec<U256>, Vec<Vec<u8>>, U256);
+
+/// `(consensusAddresses, nodeIDsList)` from `StakeHub.getNodeIDs`.
+type NodeIds = (Vec<Address>, Vec<Vec<[u8; 32]>>);
+
 impl<Spec: EthChainSpec + crate::hardforks::BscHardforks> SystemContract<Spec> {
     pub(crate) fn new(chain_spec: Spec) -> Self {
         let validator_abi_before_luban = Arc::clone(&VALIDATOR_SET_ABI_BEFORE_LUBAN_JSON);
@@ -79,18 +86,19 @@ impl<Spec: EthChainSpec + crate::hardforks::BscHardforks> SystemContract<Spec> {
     }
 
     /// Unpack the data into validator set before luban.
-    pub fn unpack_data_into_validator_set_before_luban(&self, data: &[u8]) -> Vec<Address> {
+    ///
+    /// `data` is whatever the system contract returned, so its shape is only guaranteed while
+    /// the deployed contract matches the ABI compiled in here; `None` means it did not.
+    pub fn unpack_data_into_validator_set_before_luban(&self, data: &[u8]) -> Option<Vec<Address>> {
         let function =
             self.validator_abi_before_luban.function("getValidators").unwrap().first().unwrap();
-        let output = function.abi_decode_output(data).unwrap();
+        let output = function.abi_decode_output(data).ok()?;
 
         output
-            .first()
-            .unwrap()
-            .as_array()
-            .unwrap()
+            .first()?
+            .as_array()?
             .iter()
-            .map(|val| val.as_address().unwrap())
+            .map(|val| val.as_address())
             .collect()
     }
 
@@ -101,26 +109,32 @@ impl<Spec: EthChainSpec + crate::hardforks::BscHardforks> SystemContract<Spec> {
     }
 
     /// Unpack the data into validator set.
-    pub fn unpack_data_into_validator_set(&self, data: &[u8]) -> (Vec<Address>, Vec<VoteAddress>) {
+    ///
+    /// `None` if the returned data does not match the ABI compiled in here.
+    pub fn unpack_data_into_validator_set(
+        &self,
+        data: &[u8],
+    ) -> Option<(Vec<Address>, Vec<VoteAddress>)> {
         let function = self.validator_abi.function("getMiningValidators").unwrap().first().unwrap();
-        let output = function.abi_decode_output(data).unwrap();
+        let output = function.abi_decode_output(data).ok()?;
 
-        let consensus_addresses =
-            output[0].as_array().unwrap().iter().map(|val| val.as_address().unwrap()).collect();
-        let vote_address = output[1]
-            .as_array()
-            .unwrap()
+        let consensus_addresses: Vec<Address> =
+            output.first()?.as_array()?.iter().map(|val| val.as_address()).collect::<Option<_>>()?;
+        let vote_address = output
+            .get(1)?
+            .as_array()?
             .iter()
             .map(|val| {
-                if val.as_bytes().unwrap().is_empty() {
+                let bytes = val.as_bytes()?;
+                Some(if bytes.is_empty() {
                     VoteAddress::default()
                 } else {
-                    VoteAddress::from_slice(val.as_bytes().unwrap())
-                }
+                    VoteAddress::from_slice(bytes)
+                })
             })
-            .collect();
+            .collect::<Option<_>>()?;
 
-        (consensus_addresses, vote_address)
+        Some((consensus_addresses, vote_address))
     }
 
     /// Return system address and input which is used to query max elected validators.
@@ -132,12 +146,14 @@ impl<Spec: EthChainSpec + crate::hardforks::BscHardforks> SystemContract<Spec> {
     }
 
     /// Unpack the data into max elected validators.
-    pub fn unpack_data_into_max_elected_validators(&self, data: &[u8]) -> U256 {
+    ///
+    /// `None` if the returned data does not match the ABI compiled in here.
+    pub fn unpack_data_into_max_elected_validators(&self, data: &[u8]) -> Option<U256> {
         let function =
             self.stake_hub_abi.function("maxElectedValidators").unwrap().first().unwrap();
-        let output = function.abi_decode_output(data).unwrap();
+        let output = function.abi_decode_output(data).ok()?;
 
-        output[0].as_uint().unwrap().0
+        Some(output.first()?.as_uint()?.0)
     }
 
     /// Return system address and input which is used to query validator election info.
@@ -164,27 +180,33 @@ impl<Spec: EthChainSpec + crate::hardforks::BscHardforks> SystemContract<Spec> {
     }
 
     /// Unpack the data into validator election info.
+    ///
+    /// `None` if the returned data does not match the ABI compiled in here.
     pub fn unpack_data_into_validator_election_info(
         &self,
         data: &[u8],
-    ) -> (Vec<Address>, Vec<U256>, Vec<Vec<u8>>, U256) {
+    ) -> Option<ValidatorElectionInfo> {
         let function =
             self.stake_hub_abi.function("getValidatorElectionInfo").unwrap().first().unwrap();
-        let output = function.abi_decode_output(data).unwrap();
+        let output = function.abi_decode_output(data).ok()?;
 
-        let consensus_address =
-            output[0].as_array().unwrap().iter().map(|val| val.as_address().unwrap()).collect();
-        let voting_powers =
-            output[1].as_array().unwrap().iter().map(|val| val.as_uint().unwrap().0).collect();
-        let vote_addresses = output[2]
-            .as_array()
-            .unwrap()
+        let consensus_address: Vec<Address> =
+            output.first()?.as_array()?.iter().map(|val| val.as_address()).collect::<Option<_>>()?;
+        let voting_powers: Vec<U256> = output
+            .get(1)?
+            .as_array()?
             .iter()
-            .map(|val| val.as_bytes().unwrap().to_vec())
-            .collect();
-        let total_length = output[3].as_uint().unwrap().0;
+            .map(|val| Some(val.as_uint()?.0))
+            .collect::<Option<_>>()?;
+        let vote_addresses: Vec<Vec<u8>> = output
+            .get(2)?
+            .as_array()?
+            .iter()
+            .map(|val| Some(val.as_bytes()?.to_vec()))
+            .collect::<Option<_>>()?;
+        let total_length = output.get(3)?.as_uint()?.0;
 
-        (consensus_address, voting_powers, vote_addresses, total_length)
+        Some((consensus_address, voting_powers, vote_addresses, total_length))
     }
 
     /// Return system address and input which is used to query turn length.
@@ -195,11 +217,13 @@ impl<Spec: EthChainSpec + crate::hardforks::BscHardforks> SystemContract<Spec> {
     }
 
     /// Unpack the data into turn length.
-    pub fn unpack_data_into_turn_length(&self, data: &[u8]) -> U256 {
+    ///
+    /// `None` if the returned data does not match the ABI compiled in here.
+    pub fn unpack_data_into_turn_length(&self, data: &[u8]) -> Option<U256> {
         let function = self.validator_abi.function("getTurnLength").unwrap().first().unwrap();
-        let output = function.abi_decode_output(data).unwrap();
+        let output = function.abi_decode_output(data).ok()?;
 
-        output[0].as_uint().unwrap().0
+        Some(output.first()?.as_uint()?.0)
     }
 
     /// Return system address and input to query validator NodeIDs from StakeHub.
@@ -213,36 +237,36 @@ impl<Spec: EthChainSpec + crate::hardforks::BscHardforks> SystemContract<Spec> {
 
     /// Unpack the data into (consensusAddresses, nodeIDsList)
     /// Note: This function should only be called after Maxwell hardfork when StakeHub.getNodeIDs is available.
-    pub fn unpack_data_into_node_ids(&self, data: &[u8]) -> (Vec<Address>, Vec<Vec<[u8; 32]>>) {
+    ///
+    /// `None` if the returned data does not match the ABI compiled in here.
+    pub fn unpack_data_into_node_ids(
+        &self,
+        data: &[u8],
+    ) -> Option<NodeIds> {
         let function = self.stake_hub_abi.function("getNodeIDs").unwrap().first().unwrap();
-        let output = function.abi_decode_output(data).unwrap();
+        let output = function.abi_decode_output(data).ok()?;
 
-        let consensus_addresses = output[0]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|val| val.as_address().unwrap())
-            .collect::<Vec<_>>();
+        let consensus_addresses: Vec<Address> =
+            output.first()?.as_array()?.iter().map(|val| val.as_address()).collect::<Option<_>>()?;
 
-        let node_ids_list = output[1]
-            .as_array()
-            .unwrap()
+        let node_ids_list: Vec<Vec<[u8; 32]>> = output
+            .get(1)?
+            .as_array()?
             .iter()
             .map(|arr| {
-                arr.as_array()
-                    .unwrap()
+                arr.as_array()?
                     .iter()
                     .map(|v| {
-                        let (b, _size) = v.as_fixed_bytes().unwrap();
-                        let mut out = [0u8; 32];
-                        out.copy_from_slice(b);
-                        out
+                        let (b, _size) = v.as_fixed_bytes()?;
+                        // A node ID is a bytes32; anything else means the ABI moved on.
+                        let out: [u8; 32] = b.try_into().ok()?;
+                        Some(out)
                     })
-                    .collect::<Vec<[u8; 32]>>()
+                    .collect::<Option<Vec<[u8; 32]>>>()
             })
-            .collect::<Vec<_>>();
+            .collect::<Option<_>>()?;
 
-        (consensus_addresses, node_ids_list)
+        Some((consensus_addresses, node_ids_list))
     }
 
     /// Return a transaction to slash a validator.
@@ -1180,6 +1204,30 @@ mod tests {
     use super::*;
     use alloy_consensus::TxEip1559;
     use alloy_primitives::{address, Signature, U256};
+
+    /// The unpackers decode whatever the system contract returned. That shape is only
+    /// guaranteed while the deployed contract matches the ABI compiled in here, so a
+    /// mismatch has to surface as `None` instead of unwinding the block execution.
+    #[test]
+    fn unpacking_unexpected_system_contract_output_returns_none() {
+        let contracts = SystemContract::new(crate::chainspec::BscChainSpec::from(
+            crate::chainspec::bsc::bsc_mainnet(),
+        ));
+        // Empty output: what a call to a contract that no longer has the function returns.
+        assert!(contracts.unpack_data_into_validator_set(&[]).is_none());
+        assert!(contracts.unpack_data_into_validator_set_before_luban(&[]).is_none());
+        assert!(contracts.unpack_data_into_max_elected_validators(&[]).is_none());
+        assert!(contracts.unpack_data_into_validator_election_info(&[]).is_none());
+        assert!(contracts.unpack_data_into_turn_length(&[]).is_none());
+        assert!(contracts.unpack_data_into_node_ids(&[]).is_none());
+
+        // Well-sized but structurally wrong output (the dynamic offsets are nonsense).
+        let garbage = [0xffu8; 64];
+        assert!(contracts.unpack_data_into_validator_set(&garbage).is_none());
+        assert!(contracts.unpack_data_into_validator_set_before_luban(&garbage).is_none());
+        assert!(contracts.unpack_data_into_validator_election_info(&garbage).is_none());
+        assert!(contracts.unpack_data_into_node_ids(&garbage).is_none());
+    }
 
     fn dummy_sig() -> Signature {
         Signature::new(U256::ZERO, U256::ZERO, false)
