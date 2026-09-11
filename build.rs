@@ -59,6 +59,7 @@ fn main() {
         "lorentz",
         "maxwell",
         "pasteur",
+        "jenner",
     ];
 
     // Rerun if any of the hardfork directories change

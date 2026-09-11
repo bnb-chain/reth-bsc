@@ -20,7 +20,7 @@ use crate::{
         SystemContract,
     },
 };
-use alloy_consensus::{Header, TxReceipt, TxType};
+use alloy_consensus::{Header, Transaction as _, TxReceipt, TxType, Typed2718 as _};
 use alloy_eips::eip2935::{HISTORY_STORAGE_ADDRESS, HISTORY_STORAGE_CODE};
 use alloy_eips::{eip7685::Requests, Encodable2718};
 use alloy_evm::{
@@ -30,6 +30,9 @@ use alloy_evm::{
     },
     eth::receipt_builder::ReceiptBuilderCtx,
 };
+use crate::node::evm::error::lane_reject;
+use crate::consensus::payment_lane::{state::LaneState, Lane, LaneError, LaneLiveState};
+use alloy_consensus::constants::KECCAK_EMPTY;
 use alloy_primitives::keccak256;
 use alloy_primitives::{hex, uint, Address, BlockNumber, Bytes, U256};
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
@@ -45,7 +48,7 @@ use reth_provider::BlockExecutionResult;
 use revm::Database as _;
 use revm::{
     context::result::{ExecutionResult, Output, ResultAndState, ResultGas, SuccessReason},
-    context_interface::block::Block,
+    context_interface::{block::Block, result::InvalidTransaction},
     state::{Account as RevmAccount, Bytecode, EvmState},
     DatabaseCommit,
 };
@@ -59,6 +62,7 @@ pub struct BscTxResult<H> {
     pub tx_type: TxType,
     pub tx: TransactionSigned,
     pub is_system: bool,
+    pub lane: Lane,
 }
 
 impl<H: Send + 'static> TxResult for BscTxResult<H> {
@@ -72,6 +76,7 @@ impl<H: Send + 'static> TxResult for BscTxResult<H> {
         self.inner
     }
 }
+
 /// Helper type for the input of post execution.
 #[allow(clippy::type_complexity)]
 #[derive(Debug, Clone)]
@@ -95,6 +100,15 @@ where
     pub(super) evm: EVM,
     /// Gas used in the block.
     pub(super) gas_used: u64,
+    /// Whether the DB still holds the parent's post-state, i.e. nothing in this block has been
+    /// committed yet. The `LaneParentState` impl refuses to read `0x2007` once it is false.
+    pub(super) db_at_parent_state: bool,
+    /// Whether this block has changed `0x2007` — its code as much as its storage, since a
+    /// replaced contract can change what the getters mean. Invalidates the lane config the
+    /// block's children would otherwise inherit. Maintained by [`Self::commit_state`].
+    pub(super) lane_contract_changed: bool,
+    /// This block's BEP-703 lane. Switched off until the parent is Jenner-active.
+    pub(super) lane: LaneState,
     /// Total blob gas used in the block.
     pub(super) blob_gas_used: u64,
     /// Receipts of executed transactions.
@@ -181,6 +195,9 @@ where
             spec,
             evm,
             gas_used: 0,
+            db_at_parent_state: true,
+            lane_contract_changed: false,
+            lane: LaneState::off(),
             blob_gas_used: 0,
             receipts: vec![],
             system_txs: vec![],
@@ -349,16 +366,19 @@ where
         source: StateChangeSource,
     ) -> Result<(), BlockExecutionError> {
         let changes = {
-            let db = self.evm.db_mut();
-            let mut info =
-                db.basic(address).map_err(BlockExecutionError::other)?.unwrap_or_default();
+            let mut info = self
+                .evm
+                .db_mut()
+                .basic(address)
+                .map_err(BlockExecutionError::other)?
+                .unwrap_or_default();
             info.code_hash = code.hash_slow();
             info.code = Some(code);
             let mut account = RevmAccount::from(info);
             account.mark_touch();
             let mut changes: EvmState = Default::default();
             changes.insert(address, account);
-            db.commit(changes.clone());
+            self.commit_state(changes.clone());
             changes
         };
 
@@ -410,7 +430,7 @@ where
         account.mark_touch();
         let mut changes: EvmState = Default::default();
         changes.insert(HISTORY_STORAGE_ADDRESS, account);
-        db.commit(changes.clone());
+        self.commit_state(changes.clone());
 
         // Same reasoning as `upgrade_system_contract`: the incremental state-root pipeline only
         // sees changes reported through the hook, so this deployment must be announced or the
@@ -428,6 +448,136 @@ where
             "Successfully deployed HistoryStorageAddress contract"
         );
         Ok(true)
+    }
+    /// Commits state changes, and with them the two facts the payment lane rests on: the DB no
+    /// longer holds the parent's post-state, and whether this block has changed `0x2007`.
+    ///
+    /// `is_touched` is the whole test: revm skips anything else ("not touched account are never
+    /// changed"), so every change that reaches the DB — new code, storage, creation, destruction
+    /// — arrives touched.
+    pub(super) fn commit_state(&mut self, changes: EvmState) {
+        self.db_at_parent_state = false;
+        self.lane_contract_changed |= changes
+            .get(&crate::consensus::payment_lane::PAYMENT_LANE_CONTRACT)
+            .is_some_and(|account| account.is_touched());
+        self.evm.db_mut().commit(changes);
+    }
+
+    /// Gas still available to user transactions under Parlia's reservation policy — the unit
+    /// **every** producer-side lane decision is expressed in, and the one place it is computed.
+    ///
+    /// go-bsc gets this for free: `makeEnv` initialises `environment.gasPool` to
+    /// `GasLimit - EstimateGasReservedForSystemTxs` and every call site just asks the pool.
+    /// reth has no such object, so this is it — the block rule is *not* a substitute, because
+    /// it counts the system transactions' actual gas and would hand the difference to user
+    /// traffic that the reservation has already been withheld from.
+    fn producer_shared_gas(&self) -> u64 {
+        let reserved = self.parlia.estimate_gas_reserved_for_system_txs(
+            self.inner_ctx.parent_header.as_ref().map(|p| p.timestamp),
+            self.evm.block().number().to::<u64>(),
+            self.evm.block().timestamp().to::<u64>(),
+        );
+        self.evm
+            .block()
+            .gas_limit()
+            .saturating_sub(reserved)
+            .saturating_sub(self.gas_used)
+    }
+
+    /// Which lane this transaction's gas is booked against.
+    ///
+    /// Thin on purpose: [`LaneState::classify`] owns the pre-Jenner short circuit and
+    /// [`rules::classify`](crate::consensus::payment_lane::rules::classify) owns every gate, so
+    /// nothing about the rule can be re-decided here.
+    pub(crate) fn classify_lane(
+        &mut self,
+        is_system: bool,
+        to: Option<Address>,
+        tx_type: u8,
+        value: U256,
+    ) -> Result<Lane, BlockExecutionError> {
+        // The lane holds an `Arc` to the listed set, so this clone is two words and a refcount;
+        // it is what lets the classifier borrow the executor as the live state.
+        let lane = self.lane.clone();
+        lane.classify(self, is_system, to, tx_type, value).map_err(lane_reject)
+    }
+
+    /// The lane verdict for a finished block. `gas_used` is the header's total, so this may only
+    /// run once the last system transaction has been executed.
+    ///
+    /// Logs everything the verdict was derived from: nothing about the reservation reaches the
+    /// header, so a disagreement between two nodes can only be diagnosed from what each side
+    /// read out of `0x2007` and how it booked the block's gas.
+    pub(crate) fn verify_payment_lane(&self, gas_used: u64) -> Result<(), BlockExecutionError> {
+        if !self.lane.on() {
+            return Ok(());
+        }
+        let metrics = &crate::metrics::LANE_METRICS;
+
+        if let Err(err) = self.lane.verify(gas_used) {
+            if self.ctx.mode.finalizes() {
+                metrics.produce_declined.increment(1);
+            }
+            error!(
+                target: "bsc::payment_lane",
+                mode = ?self.ctx.mode,
+                block = self.evm.block().number().to::<u64>(),
+                timestamp = self.evm.block().timestamp().to::<u64>(),
+                parent = %self.ctx.base.parent_hash,
+                gas_limit = self.evm.block().gas_limit(),
+                gas_used,
+                quota = self.lane.quota(),
+                payment_gas_used = self.lane.used(),
+                idle = self.lane.idle(),
+                ratio = self.lane.ratio(),
+                listed = self.lane.listed_len(),
+                receipts = self.receipts.len(),
+                system_txs = self.system_txs.len(),
+                "payment lane violated"
+            );
+            return Err(lane_reject(err));
+        }
+
+        metrics.quota.set(self.lane.quota() as f64);
+        metrics.payment_gas_used.set(self.lane.used() as f64);
+        metrics.idle.set(self.lane.idle() as f64);
+
+        // Hand the config to this block's children, unless this block is what changed it. No-op
+        // while producing, where the block has no hash yet — it is cached when this node later
+        // imports it.
+        if !self.lane_contract_changed {
+            if let Some(hash) = self.ctx.header_hash {
+                self.lane.inherit_to(hash);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The live state, for [`LaneState::classify`] — the block as execution has reached it, which is
+/// a different view from [`LaneParentState`] and must stay one.
+impl<E, Spec, R> LaneLiveState for BscBlockExecutor<'_, E, Spec, R>
+where
+    E: Evm<DB: alloy_evm::block::StateDB>,
+    Spec: EthChainSpec,
+    R: ReceiptBuilder,
+{
+    fn lane_code_is_empty(&mut self, addr: Address) -> Result<bool, LaneError> {
+        let block = self.evm.block().number().to::<u64>();
+        match self.evm.db_mut().basic(addr) {
+            Ok(None) => Ok(true),
+            Ok(Some(acc)) => Ok(acc.code_hash.is_zero() || acc.code_hash == KECCAK_EMPTY),
+            Err(err) => {
+                error!(
+                    target: "bsc::payment_lane",
+                    block,
+                    address = %addr,
+                    error = %err,
+                    "cannot read code for lane classification"
+                );
+                Err(LaneError::StateUnavailable(err.to_string()))
+            }
+        }
     }
 }
 
@@ -517,6 +667,10 @@ where
 
         // Detect system transactions: skip EVM execution, accumulate for later.
         let is_system = is_system_transaction(&tx_signed, signer, self.evm.block().beneficiary());
+
+        let lane =
+            self.classify_lane(is_system, tx_signed.to(), tx_signed.ty(), tx_signed.value())?;
+
         if is_system {
             self.system_txs.push(tx_signed.clone());
             let dummy = ResultAndState {
@@ -534,6 +688,7 @@ where
                 tx_type,
                 tx: tx_signed,
                 is_system: true,
+                lane,
             });
         }
 
@@ -544,10 +699,7 @@ where
         }
 
         let block_available_gas = self.evm.block().gas_limit() - self.gas_used;
-        let tx_gas_limit = {
-            use alloy_consensus::Transaction as _;
-            tx_signed.gas_limit()
-        };
+        let tx_gas_limit = tx_signed.gas_limit();
         if tx_gas_limit > block_available_gas {
             return Err(BlockValidationError::TransactionGasLimitMoreThanAvailableBlockGas {
                 transaction_gas_limit: tx_gas_limit,
@@ -562,12 +714,39 @@ where
         let spec =
             revm_spec_by_timestamp_and_block_number(self.spec.clone(), timestamp, block_number);
         let (to, selector, input_len) = {
-            use alloy_consensus::Transaction as _;
             let to = tx_signed.to();
             let input = tx_signed.input();
             let selector = if input.len() >= 4 { Some(hex::encode(&input[..4])) } else { None };
             (to, selector, input.len())
         };
+
+        // BEP-703's admission gate. Only where this node picks the transactions itself: a bid
+        // arrives with its set fixed and is ruled on whole, before finalization, instead.
+        //
+        // `InvalidTx` is the sentinel the producing loop already answers by dropping this
+        // transaction and the sender's later nonces; a capacity error would abort the build.
+        if self.ctx.mode.packs_from_pool() && self.lane.on() {
+            let shared = self.producer_shared_gas();
+            if !self.lane.admits(shared, lane, tx_gas_limit) {
+                crate::metrics::LANE_METRICS.general_lane_yielded.increment(1);
+                debug!(
+                    target: "bsc::payment_lane",
+                    block = block_number,
+                    tx = %tx_hash,
+                    ?lane,
+                    tx_gas_limit,
+                    shared,
+                    quota = self.lane.quota(),
+                    idle = self.lane.idle(),
+                    "dropping a transaction that would eat into the reservation"
+                );
+                return Err(BlockValidationError::InvalidTx {
+                    hash: tx_hash,
+                    error: Box::new(InvalidTransaction::CallerGasLimitMoreThanBlock),
+                }
+                .into());
+            }
+        }
 
         precompiles::push_precompile_trace_context(
             precompiles::PrecompileTraceContext::from_parts(
@@ -590,7 +769,6 @@ where
 
         let blob_gas_used =
             if BscHardforks::is_cancun_active_at_timestamp(&self.spec, block_number, timestamp) {
-                use alloy_consensus::Transaction as _;
                 tx_signed.blob_gas_used().unwrap_or_default()
             } else {
                 0
@@ -599,7 +777,7 @@ where
         let inner =
             self.evm.transact(tx_env).map_err(|err| BlockExecutionError::evm(err, tx_hash))?;
 
-        Ok(BscTxResult { inner, blob_gas_used, tx_type, tx: tx_signed, is_system: false })
+        Ok(BscTxResult { inner, blob_gas_used, tx_type, tx: tx_signed, is_system: false, lane })
     }
 
     fn commit_transaction(
@@ -619,6 +797,9 @@ where
 
         let gas_used = result.tx_gas_used();
         self.gas_used += gas_used;
+        // The same value added to `self.gas_used`, so the booked payment gas is a subset of the
+        // block's by construction.
+        self.lane.record_used(output.lane, gas_used);
         self.blob_gas_used = self.blob_gas_used.saturating_add(output.blob_gas_used);
 
         self.receipts.push(self.receipt_builder.build_receipt(ReceiptBuilderCtx {
@@ -629,7 +810,7 @@ where
             cumulative_gas_used: self.gas_used,
         }));
 
-        self.evm.db_mut().commit(state);
+        self.commit_state(state);
 
         // Apply hertz patch after tx (import only — see `patch_before_tx` above).
         // commit_transaction cannot return errors in the new API, so defer any error to finish().
@@ -699,9 +880,21 @@ where
             }
         }
 
+        // A bid fixes its own transaction set, so the gate above never ran on it: hold the
+        // finished set to the same inequality once instead — go-bsc `bidSimulator.simBid` ->
+        // `LaneState.VerifyPackedBid`. Before finalization, so `producer_shared_gas` still
+        // means what it means on the packing side.
+        if self.ctx.mode == BscExecutionMode::BidSimulation {
+            self.lane
+                .verify_bid_leaves_reservation(self.producer_shared_gas())
+                .map_err(lane_reject)?;
+        }
+
         match self.ctx.mode {
             // Generates and signs system txs (rewards, slashing, validator-set updates).
-            BscExecutionMode::Mining => self.finalize_new_block(&self.evm.block().clone())?,
+            BscExecutionMode::Mining | BscExecutionMode::BidSimulation => {
+                self.finalize_new_block(&self.evm.block().clone())?
+            }
             // Verifies the system txs already present in the received block.
             BscExecutionMode::Import => self.post_check_new_block(&self.evm.block().clone())?,
             // Neither: return the executed block as-is, matching BSC geth's simulation path.
@@ -712,6 +905,13 @@ where
                     "Skipping Parlia finalization for simulated block"
                 );
             }
+        }
+
+        // The same verdict the importer reaches, as the producer's self-check. After the mode
+        // match, so the system transactions issued above are already in `self.gas_used`. Failure
+        // declines the block; there is no fallback that produces with the lane switched off.
+        if self.ctx.mode.finalizes() {
+            self.verify_payment_lane(self.gas_used)?;
         }
 
         // Update receipt height metric

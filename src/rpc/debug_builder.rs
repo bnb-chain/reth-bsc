@@ -201,9 +201,11 @@ where
                     extra_data: Default::default(),
                     slot_number: None,
                 },
-                // `debug_buildCandidateBlock` runs the real block-building pipeline and
-                // signs Parlia system txs, so it is Mining despite passing no sinks.
-                mode: BscExecutionMode::Mining,
+                // `debug_buildCandidateBlock` runs the real block-building pipeline and signs
+                // Parlia system txs, so it finalizes despite passing no sinks. `BidSimulation`,
+                // not `Mining`: the caller fixes the transaction set, so the lane's admission
+                // gate must not run.
+                mode: BscExecutionMode::BidSimulation,
                 // The candidate block is built from a second-granularity `timestamp`
                 // parameter with no millisecond source — second precision (`Time*1000`).
                 milli_remainder: 0,

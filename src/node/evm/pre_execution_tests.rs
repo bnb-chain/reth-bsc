@@ -628,6 +628,62 @@ mod parent_block_env {
         executor
     }
 
+    /// One touched account, the shape a commit takes.
+    fn touched(address: Address) -> revm::state::EvmState {
+        let mut account = revm::state::Account::from(revm::state::AccountInfo::default());
+        account.mark_touch();
+        let mut state = revm::state::EvmState::default();
+        state.insert(address, account);
+        state
+    }
+
+    /// A block that leaves `0x2007` alone hands its config to its children, so the walk happens
+    /// once per governance change; a block that writes to it hands on nothing.
+    #[test]
+    fn lane_config_is_inherited_until_the_contract_changes() {
+        use crate::consensus::payment_lane::{
+            meta::{cache_peek, LaneMeta},
+            state::LaneState,
+            Budget, PAYMENT_LANE_CONTRACT,
+        };
+        use alloy_primitives::B256;
+
+        let mut executor = executor();
+        let meta = LaneMeta { ratio: 500, listed: Default::default() };
+        executor.lane = LaneState::for_test(meta, Budget::default(), 30_000_000);
+
+        let inherited = B256::repeat_byte(0x11);
+        executor.ctx.header_hash = Some(inherited);
+        executor.commit_state(touched(Address::repeat_byte(0xaa)));
+        executor.verify_payment_lane(0).expect("an empty block cannot violate");
+        assert_eq!(cache_peek(inherited).map(|m| m.ratio), Some(500));
+
+        let changed = B256::repeat_byte(0x22);
+        executor.ctx.header_hash = Some(changed);
+        executor.commit_state(touched(PAYMENT_LANE_CONTRACT));
+        executor.verify_payment_lane(0).expect("an empty block cannot violate");
+        assert!(cache_peek(changed).is_none());
+    }
+
+    /// A late read would take the ratio and the list from a state this block already changed,
+    /// then cache that answer under the parent hash for every sibling block to inherit. The
+    /// refusal belongs to the parent-state accessor, so `resolve` inherits it for free.
+    #[test]
+    fn lane_meta_refuses_to_read_a_mutated_state() {
+        use crate::consensus::payment_lane::state::LaneState;
+        use alloy_primitives::B256;
+
+        let mut executor = executor();
+        executor.db_at_parent_state = false;
+
+        let err = LaneState::resolve(&mut executor, B256::repeat_byte(0x33), 30_000_000)
+            .expect_err("must refuse");
+        assert!(
+            err.to_string().contains("after this block mutated state"),
+            "unexpected error: {err}"
+        );
+    }
+
     /// `Parent` reads the parent env; `Current` reads the current env.
     #[test]
     fn parent_env_call_observes_the_parent_shuffle_window() {

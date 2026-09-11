@@ -332,6 +332,30 @@ pub struct BscParliaGethMetrics {
     pub doublesign: Counter,
 }
 
+/// Metrics for the BEP-703 payment lane.
+#[derive(Metrics, Clone)]
+#[metrics(scope = "bsc.payment_lane")]
+pub struct BscPaymentLaneMetrics {
+    /// Gas reserved for payment transactions in the last imported block
+    pub quota: Gauge,
+    /// Payment gas the last imported block used
+    pub payment_gas_used: Gauge,
+    /// Reserved gas the last imported block left unclaimed
+    pub idle: Gauge,
+    /// Blocks rejected by the lane rule
+    pub rejected: Counter,
+    /// Lane state reads that failed on this node
+    pub state_unavailable: Counter,
+    /// Transactions dropped to keep the reservation intact
+    pub general_lane_yielded: Counter,
+    /// Blocks this validator declined to seal
+    pub produce_declined: Counter,
+}
+
+/// Process-wide payment lane metrics, shared by import, production and the admission gate.
+pub static LANE_METRICS: std::sync::LazyLock<BscPaymentLaneMetrics> =
+    std::sync::LazyLock::new(BscPaymentLaneMetrics::default);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,5 +371,6 @@ mod tests {
         let _miner_metrics = BscMinerMetrics::default();
         let _finality_metrics = BscFinalityMetrics::default();
         let _blockchain_metrics = BscBlockchainMetrics::default();
+        let _payment_lane_metrics = BscPaymentLaneMetrics::default();
     }
 }

@@ -588,6 +588,26 @@ impl MevApiImpl {
             return Err(Self::invalid_bid("BidBlock disabled, fallback to SendBid"));
         }
 
+        // A validator must self-produce a hard-fork activation block: Jenner installs `0x2007`
+        // while that block executes, and the lane does not bind there. go-bsc refuses a BidBlock
+        // on such a block, so this client has to refuse it too.
+        let next_number = head_header.number + 1;
+        if self.chain_spec.is_jenner_transition_at_timestamp(
+            next_number,
+            args.bid_block.header.timestamp,
+            head_header.timestamp,
+        ) {
+            tracing::warn!(
+                "BidBlock refused on hard-fork activation block: block={next_number}, \
+                 bidHash={bid_hash:?}, headTime={}, bidTime={}",
+                head_header.timestamp,
+                args.bid_block.header.timestamp,
+            );
+            return Err(Self::invalid_bid(format!(
+                "BidBlock disabled on hard-fork activation block {next_number}, fallback to SendBid"
+            )));
+        }
+
         let builder = args.ecrecover_sender().map_err(|e| {
             Self::invalid_bid(format!("invalid signature: bidHash={bid_hash}, err={e}"))
         })?;
