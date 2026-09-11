@@ -3,7 +3,7 @@
 //! go-bsc's `core/payment_lane.go`: the same six verbs, in the same order of use —
 //! [`LaneState::resolve`] once per block, then [`LaneState::classify`] /
 //! [`LaneState::record_used`] per transaction, [`LaneState::admits`] or
-//! [`LaneState::verify_reservation_intact`] wherever a producer decides what goes in, and
+//! [`LaneState::verify_bid_leaves_reservation`] wherever a producer decides what goes in, and
 //! [`LaneState::verify`] on the finished block.
 
 use super::{
@@ -89,23 +89,26 @@ impl LaneState {
         self.0.as_ref().is_none_or(|a| a.budget.admits(shared, lane, tx_gas_limit))
     }
 
-    /// Whether the reservation survived a transaction set this node did not pick itself — the
-    /// whole-set form of [`Self::admits`], and the only lane check a producer can make when it
-    /// cannot drop anything. go-bsc calls it `LaneState.VerifyPackedBid`, and the error reads
-    /// word for word the same.
+    /// Verifies that a bid leaves the lane's reservation alone.
     ///
-    /// Used on the BEP-322 bid path (and by `debug_buildCandidateBlock`, which reproduces it):
-    /// the builder fixes the transactions, so they are accounted one by one and then judged
-    /// once, here, before finalization.
+    /// The BEP-322 path is the one place a producer cannot filter: the builder fixes the
+    /// transaction set, so they are accounted one by one and then judged once, here, before
+    /// finalization. What it asserts is the invariant [`Self::admits`] maintains transaction by
+    /// transaction — `idle <= shared` — over a set that was never filtered. go-bsc calls this
+    /// `LaneState.VerifyPackedBid`, and the error reads word for word the same.
     ///
     /// `shared` is the producer's remaining pool (`GasLimit - reserved - used`), the same unit
     /// [`Self::admits`] takes. Not the block rule: that is the importer's verdict, and counting
-    /// the system transactions' actual gas there would hand the set the unused part of the
+    /// the system transactions' actual gas there would hand the bid the unused part of the
     /// system reservation.
-    pub fn verify_reservation_intact(&self, shared: u64) -> Result<(), LaneError> {
+    ///
+    /// Written out rather than as `admits(shared, General, 0)`, which would be vacuous: the
+    /// saturating subtraction in `admits` turns an over-committed pool into a zero allowance,
+    /// and a zero-gas transaction still fits into that.
+    pub fn verify_bid_leaves_reservation(&self, shared: u64) -> Result<(), LaneError> {
         match self.0.as_ref() {
-            Some(a) if !a.budget.reservation_intact(shared) => {
-                Err(LaneError::ReservationOverrun { idle: a.budget.idle(), shared })
+            Some(a) if a.budget.idle() > shared => {
+                Err(LaneError::BidEatsReservation { idle: a.budget.idle(), shared })
             }
             _ => Ok(()),
         }
@@ -203,27 +206,41 @@ mod tests {
         off.record_used(Lane::Payment, 21_000);
         assert_eq!(off.used(), 0);
         assert!(off.admits(0, Lane::General, u64::MAX));
-        assert_eq!(off.verify_reservation_intact(0), Ok(()));
+        assert_eq!(off.verify_bid_leaves_reservation(0), Ok(()));
         assert_eq!(off.verify(u64::MAX), Ok(()));
         off.inherit_to(BlockHash::ZERO);
         assert_eq!((off.quota(), off.idle(), off.ratio(), off.listed_len()), (0, 0, 0, 0));
         let _ = NoParentReads; // `resolve` is the one verb an off lane cannot answer.
     }
 
-    /// The whole-set verdict and the per-transaction gate are one inequality; the error carries
-    /// the two numbers a builder needs to resize.
+    /// The bid verdict and the per-transaction gate are one inequality, and the error carries
+    /// the two numbers a builder needs in order to resize.
     #[test]
-    fn reservation_verdict_matches_the_gate() {
+    fn a_bid_is_held_to_the_per_transaction_invariant() {
         let lane = active(1_500_000, 21_000, 30_000_000);
         assert_eq!(lane.idle(), 1_479_000);
-        assert_eq!(lane.verify_reservation_intact(1_479_000), Ok(()));
+
+        // Exactly the reservation left is still leaving it alone; one gas less is not.
+        assert_eq!(lane.verify_bid_leaves_reservation(1_479_000), Ok(()));
         assert_eq!(
-            lane.verify_reservation_intact(979_000),
-            Err(LaneError::ReservationOverrun { idle: 1_479_000, shared: 979_000 })
+            lane.verify_bid_leaves_reservation(1_478_999),
+            Err(LaneError::BidEatsReservation { idle: 1_479_000, shared: 1_478_999 })
         );
+
+        // It agrees with the gate wherever the gate is not vacuous, which is what makes a bid
+        // and a locally packed block face the same ceiling.
+        for shared in [0u64, 1, 21_000, 1_478_999, 1_479_000, 1_500_000, u64::MAX] {
+            if lane.admits(shared, Lane::General, 1) {
+                assert!(lane.verify_bid_leaves_reservation(shared).is_ok(), "shared={shared}");
+            }
+            assert_eq!(lane.verify_bid_leaves_reservation(shared).is_ok(), lane.idle() <= shared);
+            // And why the zero-gas spelling of the same question would not do.
+            assert!(lane.admits(shared, Lane::General, 0));
+        }
+
         // The wording go-bsc's `VerifyPackedBid` logs, so one grep covers both clients.
         assert_eq!(
-            lane.verify_reservation_intact(979_000).unwrap_err().to_string(),
+            lane.verify_bid_leaves_reservation(979_000).unwrap_err().to_string(),
             "payment lane inequality violated: idle lane 1479000 exceeds the 979000 gas left in the pool"
         );
     }

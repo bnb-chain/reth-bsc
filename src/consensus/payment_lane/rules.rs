@@ -70,22 +70,6 @@ impl Budget {
             }
     }
 
-    /// Whether `shared` gas still covers the reservation — the invariant [`Self::admits`]
-    /// maintains one transaction at a time, stated directly so it can also be checked in one
-    /// go over a transaction set that was never filtered.
-    ///
-    /// `shared` is the producer's remaining pool (`GasLimit - reserved - used`), never the
-    /// block's raw headroom: the block rule is the importer's verdict and counts the system
-    /// transactions' *actual* gas, which would hand user traffic the unused part of the
-    /// reservation.
-    ///
-    /// Spelled out rather than written as `admits(shared, General, 0)`: that would be vacuous,
-    /// because the saturating subtraction inside `admits` turns an over-committed pool into a
-    /// zero allowance, which a zero-gas transaction still fits into.
-    pub fn reservation_intact(&self, shared: u64) -> bool {
-        self.idle() <= shared
-    }
-
     /// Plain `+=`: `used` tracks a subset of the block's gas, so it cannot overflow.
     pub fn record_used(&mut self, lane: Lane, delta: u64) {
         if lane == Lane::Payment {
@@ -197,31 +181,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    /// The whole-set check is the packing loop's invariant, and it must agree with the
-    /// per-transaction gate everywhere that gate is not vacuous.
-    #[test]
-    fn reservation_check_is_the_packing_loop_invariant() {
-        for quota in [0u64, 1, 7, 1_500_000, u64::MAX] {
-            for used in [0u64, 1, 21_000, 1_500_000] {
-                let b = budget(quota, used);
-                for shared in [0u64, 1, 21_000, 1_479_000, 1_500_000, u64::MAX] {
-                    assert_eq!(b.reservation_intact(shared), b.idle() <= shared);
-                    // A pool that admits any real general transaction has an intact
-                    // reservation; the converse needs `shared > idle`, which is where the two
-                    // differ by exactly one gas.
-                    if b.admits(shared, Lane::General, 1) {
-                        assert!(b.reservation_intact(shared), "quota={quota} used={used} shared={shared}");
-                    }
-                }
-            }
-        }
-        // The boundary: the reservation is intact when nothing but it is left.
-        assert!(budget(20, 0).reservation_intact(20));
-        assert!(!budget(20, 0).reservation_intact(19));
-        // And why the zero-gas spelling would not do.
-        assert!(budget(20, 0).admits(19, Lane::General, 0));
     }
 
     #[test]

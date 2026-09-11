@@ -98,12 +98,6 @@ impl BscExecutionMode {
     pub const fn packs_from_pool(self) -> bool {
         matches!(self, Self::Mining)
     }
-
-    /// Whether the caller supplied the transactions, so this node cannot drop any of them and
-    /// has to judge the finished set instead — go-bsc `bidSimulator.simBid`'s `VerifyPackedBid`.
-    pub const fn packs_a_caller_supplied_set(self) -> bool {
-        matches!(self, Self::BidSimulation)
-    }
 }
 
 /// BSC wrapper around [`NextBlockEnvAttributes`].

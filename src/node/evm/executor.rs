@@ -880,13 +880,13 @@ where
             }
         }
 
-        // The whole-set form of the gate above, for transactions the caller supplied: nothing
-        // can be dropped, so the finished set is held to the same inequality once — go-bsc
-        // `bidSimulator.simBid` -> `LaneState.VerifyPackedBid`. Before finalization, so
-        // `producer_shared_gas` still means what it means on the packing side.
-        if self.ctx.mode.packs_a_caller_supplied_set() {
+        // A bid fixes its own transaction set, so the gate above never ran on it: hold the
+        // finished set to the same inequality once instead — go-bsc `bidSimulator.simBid` ->
+        // `LaneState.VerifyPackedBid`. Before finalization, so `producer_shared_gas` still
+        // means what it means on the packing side.
+        if self.ctx.mode == BscExecutionMode::BidSimulation {
             self.lane
-                .verify_reservation_intact(self.producer_shared_gas())
+                .verify_bid_leaves_reservation(self.producer_shared_gas())
                 .map_err(lane_reject)?;
         }
 
