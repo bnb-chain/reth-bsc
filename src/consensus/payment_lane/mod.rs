@@ -74,17 +74,23 @@ pub struct Budget {
 
 /// `StateUnavailable` is a local fault and must never reject a block; every other variant is a
 /// verdict on the block. Collapsing the two would make a pruned node reject the whole network.
+/// Both verdicts are worded exactly as go-bsc words them, down to the shared
+/// `payment lane inequality violated` prefix it gets from wrapping one `ErrViolated`. The rule
+/// is one two clients have to agree on, and the only way anyone notices they did not is by
+/// comparing the two sides' rejections — so the text is an interop surface, not a place to be
+/// original. Structured detail belongs in the tracing fields, which carry more than these
+/// strings ever could.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum LaneError {
+    /// The block rule — go-bsc `paymentlane.CheckInequality`.
     #[error(
-        "payment lane accounting violated: gas_limit={gas_limit} gas_used={gas_used} \
-         quota={quota} payment_gas_used={payment_gas_used}"
+        "payment lane inequality violated: gas used {gas_used} payment {payment_gas_used} \
+         quota {quota} limit {gas_limit}"
     )]
     Violated { gas_limit: u64, gas_used: u64, quota: u64, payment_gas_used: u64 },
 
     /// A bid left less gas than the reservation needs — the producer-side form of
-    /// [`Self::Violated`]. Worded exactly as go-bsc's `LaneState.VerifyPackedBid` so one grep
-    /// covers both clients' logs.
+    /// [`Self::Violated`], go-bsc `LaneState.VerifyPackedBid`.
     #[error(
         "payment lane inequality violated: idle lane {idle} exceeds the {shared} gas left in \
          the pool"
@@ -96,4 +102,33 @@ pub enum LaneError {
 
     #[error("payment lane state unavailable: {0}")]
     StateUnavailable(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The two verdicts are an interop surface: when reth and go-bsc disagree about the same
+    /// block or the same bid, identical text is what tells an operator it is the same rule and
+    /// only the answer differs. Pinned against go-bsc `core/paymentlane/paymentlane.go`
+    /// (`CheckInequality`) and `core/payment_lane.go` (`VerifyPackedBid`).
+    #[test]
+    fn verdicts_are_worded_as_go_bsc_words_them() {
+        assert_eq!(
+            LaneError::Violated {
+                gas_limit: 30_000_000,
+                gas_used: 29_000_000,
+                quota: 1_500_000,
+                payment_gas_used: 21_000,
+            }
+            .to_string(),
+            "payment lane inequality violated: gas used 29000000 payment 21000 \
+             quota 1500000 limit 30000000"
+        );
+        assert_eq!(
+            LaneError::BidEatsReservation { idle: 1_479_000, shared: 979_000 }.to_string(),
+            "payment lane inequality violated: idle lane 1479000 exceeds the 979000 \
+             gas left in the pool"
+        );
+    }
 }

@@ -95,7 +95,7 @@ impl LaneState {
     /// transaction set, so they are accounted one by one and then judged once, here, before
     /// finalization. What it asserts is the invariant [`Self::admits`] maintains transaction by
     /// transaction — `idle <= shared` — over a set that was never filtered. go-bsc calls this
-    /// `LaneState.VerifyPackedBid`, and the error reads word for word the same.
+    /// `LaneState.VerifyPackedBid`.
     ///
     /// `shared` is the producer's remaining pool (`GasLimit - reserved - used`), the same unit
     /// [`Self::admits`] takes. Not the block rule: that is the importer's verdict, and counting
@@ -237,12 +237,6 @@ mod tests {
             // And why the zero-gas spelling of the same question would not do.
             assert!(lane.admits(shared, Lane::General, 0));
         }
-
-        // The wording go-bsc's `VerifyPackedBid` logs, so one grep covers both clients.
-        assert_eq!(
-            lane.verify_bid_leaves_reservation(979_000).unwrap_err().to_string(),
-            "payment lane inequality violated: idle lane 1479000 exceeds the 979000 gas left in the pool"
-        );
     }
 
     /// The verdict is against the gas limit the quota was derived from, not one passed in later.
