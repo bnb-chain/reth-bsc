@@ -92,6 +92,18 @@ impl BscExecutionMode {
     pub const fn finalizes(self) -> bool {
         matches!(self, Self::Mining | Self::BidSimulation)
     }
+
+    /// Whether this mode chooses the transactions itself, one at a time, and can therefore hold
+    /// each one to BEP-703's admission gate — go-bsc `worker.commitTransactions`.
+    pub const fn packs_from_pool(self) -> bool {
+        matches!(self, Self::Mining)
+    }
+
+    /// Whether the transaction set arrives fixed, so the lane cannot drop anything and has to
+    /// rule on the finished set instead — go-bsc `bidSimulator.simBid`'s `VerifyPackedBid`.
+    pub const fn packs_a_foreign_set(self) -> bool {
+        matches!(self, Self::BidSimulation)
+    }
 }
 
 /// BSC wrapper around [`NextBlockEnvAttributes`].

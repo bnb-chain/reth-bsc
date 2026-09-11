@@ -1,9 +1,14 @@
-//! Decoding the governable lane ratio and the payment contract list.
+//! Reading the governable lane ratio and the payment contract list out of `0x2007`, and caching
+//! the result. go-bsc's `core/paymentlanemeta`.
 
-use super::{LaneError, MAX_LANE_RATIO, MAX_LISTED_CONTRACTS, PAGE_SIZE};
-use alloy_primitives::{map::HashSet, Address, Bytes, U256};
+use super::{
+    LaneError, LaneParentState, MAX_LANE_RATIO, MAX_LISTED_CONTRACTS, PAGE_SIZE,
+    PAYMENT_LANE_CONTRACT, RATIO_DENOM,
+};
+use alloy_primitives::{map::HashSet, Address, BlockHash, Bytes, U256};
 use alloy_sol_types::{sol, SolCall};
-use std::sync::Arc;
+use schnellru::{ByLength, LruMap};
+use std::sync::{Arc, LazyLock, Mutex};
 
 sol! {
     /// The getters on payment lane contract `0x2007`.
@@ -147,6 +152,78 @@ impl PageWalk {
     }
 }
 
+/// The lane config as of the post-state of one block, keyed by that block's hash: a block whose
+/// parent is `P` reads the entry for `P`.
+///
+/// go-bsc keys the same cache by `0x2007`'s `(codeHash, storageRoot)`, which is content-addressed
+/// and needs no propagation. revm's account carries no storage root, and computing one means
+/// walking the contract's storage trie every block, so this keys by hash instead and moves an
+/// entry along a real parent-child edge ([`cache_inherit`]) whenever the block left `0x2007`
+/// alone. Same guarantee, reth's primitives: a sibling branch's config can never be read here,
+/// because an entry only ever reaches a hash whose parent it was read at.
+static CACHE: LazyLock<Mutex<LruMap<BlockHash, LaneMeta, ByLength>>> =
+    LazyLock::new(|| Mutex::new(LruMap::new(ByLength::new(1024))));
+
+/// Reads the ratio and the contract list as of `parent_hash`'s post-state, memoized by that hash.
+///
+/// `access` must still be looking at that post-state; it is the implementor's job to refuse once
+/// it is not (see [`LaneParentState`]). A late read would be cached under `parent_hash` and
+/// poison every sibling block with that parent.
+pub fn load(
+    access: &mut impl LaneParentState,
+    parent_hash: BlockHash,
+) -> Result<LaneMeta, LaneError> {
+    if let Some(hit) = CACHE.lock().unwrap().get(&parent_hash) {
+        return Ok(hit.clone());
+    }
+
+    let started = std::time::Instant::now();
+    let ratio = decode_ratio(&access.call_lane_getter(PAYMENT_LANE_CONTRACT, ratio_calldata())?)?;
+
+    let mut walk = PageWalk::default();
+    let mut offset = 0u64;
+    let mut pages = 0u64;
+    loop {
+        let ret = access.call_lane_getter(PAYMENT_LANE_CONTRACT, contracts_calldata(offset))?;
+        pages += 1;
+        match walk.accept(offset, &ret)? {
+            Some(next) => offset = next,
+            None => break,
+        }
+    }
+    let listed = walk.finish()?;
+    tracing::info!(
+        target: "bsc::payment_lane",
+        contract = %PAYMENT_LANE_CONTRACT,
+        parent = %parent_hash,
+        ratio,
+        denom = RATIO_DENOM,
+        listed = listed.len(),
+        pages,
+        elapsed_ms = started.elapsed().as_millis(),
+        "payment lane config loaded"
+    );
+
+    let meta = LaneMeta { ratio, listed: Arc::new(listed) };
+    CACHE.lock().unwrap().insert(parent_hash, meta.clone());
+    Ok(meta)
+}
+
+/// Carries a block's config forward to its own hash, so the walk costs one read per governance
+/// change rather than one per block.
+///
+/// The caller must not call this for a block that wrote to `0x2007`: the config it ran under is
+/// no longer the one its children will see.
+pub fn cache_inherit(block_hash: BlockHash, meta: &LaneMeta) {
+    CACHE.lock().unwrap().insert(block_hash, meta.clone());
+}
+
+/// Test-only: what the cache holds for `block_hash`.
+#[cfg(test)]
+pub fn cache_peek(block_hash: BlockHash) -> Option<LaneMeta> {
+    CACHE.lock().unwrap().get(&block_hash).cloned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,7 +248,7 @@ mod tests {
         range.map(|i| Address::from_word(U256::from(i + 1).into())).collect()
     }
 
-    /// Walks a whole list `PAGE_SIZE` at a time, the way `load_lane_meta` does.
+    /// Walks a whole list `PAGE_SIZE` at a time, the way [`load`] does.
     fn walk(total: u64, all: &[Address]) -> Result<HashSet<Address>, LaneError> {
         let mut w = PageWalk::default();
         let mut offset = 0u64;

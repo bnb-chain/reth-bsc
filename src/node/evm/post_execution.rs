@@ -189,7 +189,7 @@ where
             }
         }
         
-        self.verify_payment_lane(header.gas_limit, self.gas_used)?;
+        self.verify_payment_lane(self.gas_used)?;
 
         tracing::trace!("Succeed to finalize new block, block_number: {}", block.number());
         Ok(())

@@ -641,36 +641,43 @@ mod parent_block_env {
     /// once per governance change; a block that writes to it hands on nothing.
     #[test]
     fn lane_config_is_inherited_until_the_contract_changes() {
-        use crate::consensus::payment_lane::{meta::LaneMeta, Budget, PAYMENT_LANE_CONTRACT};
-        use crate::node::evm::executor::LaneState;
-        use crate::node::evm::pre_execution::LANE_META_CACHE;
+        use crate::consensus::payment_lane::{
+            meta::{cache_peek, LaneMeta},
+            state::LaneState,
+            Budget, PAYMENT_LANE_CONTRACT,
+        };
         use alloy_primitives::B256;
 
         let mut executor = executor();
         let meta = LaneMeta { ratio: 500, listed: Default::default() };
-        executor.inner_ctx.payment_lane = Some(LaneState { meta, budget: Budget::default() });
+        executor.lane = LaneState::for_test(meta, Budget::default(), 30_000_000);
 
         let inherited = B256::repeat_byte(0x11);
         executor.ctx.header_hash = Some(inherited);
         executor.commit_state(touched(Address::repeat_byte(0xaa)));
-        executor.propagate_lane_meta();
-        assert_eq!(LANE_META_CACHE.lock().unwrap().get(&inherited).map(|m| m.ratio), Some(500));
+        executor.verify_payment_lane(0).expect("an empty block cannot violate");
+        assert_eq!(cache_peek(inherited).map(|m| m.ratio), Some(500));
 
         let changed = B256::repeat_byte(0x22);
         executor.ctx.header_hash = Some(changed);
         executor.commit_state(touched(PAYMENT_LANE_CONTRACT));
-        executor.propagate_lane_meta();
-        assert!(LANE_META_CACHE.lock().unwrap().get(&changed).is_none());
+        executor.verify_payment_lane(0).expect("an empty block cannot violate");
+        assert!(cache_peek(changed).is_none());
     }
 
     /// A late read would take the ratio and the list from a state this block already changed,
-    /// then cache that answer under the parent hash for every sibling block to inherit.
+    /// then cache that answer under the parent hash for every sibling block to inherit. The
+    /// refusal belongs to the parent-state accessor, so `resolve` inherits it for free.
     #[test]
     fn lane_meta_refuses_to_read_a_mutated_state() {
+        use crate::consensus::payment_lane::state::LaneState;
+        use alloy_primitives::B256;
+
         let mut executor = executor();
         executor.db_at_parent_state = false;
 
-        let err = executor.load_lane_meta().expect_err("must refuse");
+        let err = LaneState::resolve(&mut executor, B256::repeat_byte(0x33), 30_000_000)
+            .expect_err("must refuse");
         assert!(
             err.to_string().contains("after this block mutated state"),
             "unexpected error: {err}"

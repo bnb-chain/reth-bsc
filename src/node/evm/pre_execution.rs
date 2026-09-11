@@ -17,10 +17,8 @@ use crate::consensus::parlia::{VoteAddress, Snapshot, DIFF_INTURN, DIFF_NOTURN};
 use crate::consensus::parlia::util::{is_breathe_block, debug_header};
 use crate::consensus::parlia::vote::MAX_ATTESTATION_EXTRA_LENGTH;
 use crate::consensus::payment_lane::{
-    meta::{contracts_calldata, decode_ratio, ratio_calldata, LaneMeta, PageWalk},
-    Budget, LaneError, GETTER_GAS_LIMIT, PAYMENT_LANE_CONTRACT, RATIO_DENOM,
+    state::LaneState, LaneError, LaneParentState, GETTER_GAS_LIMIT,
 };
-use crate::node::evm::executor::LaneState;
 use crate::node::evm::error::{lane_reject, BscBlockExecutionError, BscBlockValidationError};
 use crate::system_contracts::SystemContract;
 use reth_revm::{database::{EvmStateProvider, StateProviderDatabase}, db::State};
@@ -47,20 +45,6 @@ pub static VALIDATOR_CACHE: LazyLock<Mutex<ValidatorCache>> = LazyLock::new(|| {
 });
 
 pub static TURN_LENGTH_CACHE: LazyLock<Mutex<TurnLengthCache>> = LazyLock::new(|| {
-    Mutex::new(LruMap::new(ByLength::new(1024)))
-});
-
-type LaneMetaCache = LruMap<BlockHash, LaneMeta, ByLength>;
-
-/// The lane config as of the post-state of one block, keyed by that block's hash: a block whose
-/// parent is `P` reads the entry for `P`.
-///
-/// Two writers, both meaning the same thing. [`BscBlockExecutor::load_lane_meta`] inserts what it
-/// walked at `P`, and a block that finished without writing to `0x2007` carries `P`'s entry
-/// forward to its own hash ([`BscBlockExecutor::propagate_lane_meta`]) — so the walk costs one
-/// read per change to the contract rather than one per block. Keying by block hash and only ever
-/// moving an entry along a real parent-child edge is what keeps a sibling branch's config out.
-pub(crate) static LANE_META_CACHE: LazyLock<Mutex<LaneMetaCache>> = LazyLock::new(|| {
     Mutex::new(LruMap::new(ByLength::new(1024)))
 });
 
@@ -365,104 +349,13 @@ where
         view_call_output(to, &data, result_and_state.result)
     }
 
-    /// Runs a PaymentLane getter in this block's env.
-    ///
-    /// A revert or a halt is a verdict on the block, so it comes back as `CorruptConfig`; only
-    /// a `transact` error is a local fault, and there the executor must not be reused.
-    fn lane_eth_call(&mut self, to: Address, data: Bytes) -> Result<Bytes, BlockExecutionError> {
-        let tx_env = view_call_tx_env(to, data, GETTER_GAS_LIMIT, self.spec.chain().id());
-        let result = self
-            .evm
-            .transact(tx_env.into_tx_env())
-            .map_err(|err| lane_reject(LaneError::StateUnavailable(err.to_string())))?
-            .result;
-
-        // The reason only: this string reaches the consensus layer, and return data can run to
-        // megabytes.
-        let reason = match result {
-            ExecutionResult::Success { output, .. } => {
-                let data = output.into_data();
-                if !data.is_empty() {
-                    return Ok(data);
-                }
-                "returned no data".to_string()
-            }
-            ExecutionResult::Revert { .. } => "reverted".to_string(),
-            ExecutionResult::Halt { reason, .. } => format!("halted: {reason:?}"),
-        };
-        Err(lane_reject(LaneError::CorruptConfig(format!("getter at {to} {reason}"))))
-    }
-
-    /// Reads the ratio and the contract list from `0x2007`, as of the parent's post-state.
-    ///
-    /// Cached by `parent_hash`, so a late read would poison every sibling block with that parent
-    /// too; the `db_at_parent_state` guard is what prevents it.
-    pub(crate) fn load_lane_meta(&mut self) -> Result<LaneMeta, BlockExecutionError> {
-        if !self.db_at_parent_state {
-            return Err(lane_reject(LaneError::StateUnavailable(
-                "payment lane read after this block mutated state".into(),
-            )));
-        }
-        let parent_hash = self.ctx.base.parent_hash;
-        if let Some(hit) = LANE_META_CACHE.lock().unwrap().get(&parent_hash) {
-            return Ok(hit.clone());
-        }
-
-        let started = std::time::Instant::now();
-        let ratio = decode_ratio(&self.lane_eth_call(PAYMENT_LANE_CONTRACT, ratio_calldata())?)
-            .map_err(lane_reject)?;
-
-        let mut walk = PageWalk::default();
-        let mut offset = 0u64;
-        let mut pages = 0u64;
-        loop {
-            let ret = self.lane_eth_call(PAYMENT_LANE_CONTRACT, contracts_calldata(offset))?;
-            pages += 1;
-            match walk.accept(offset, &ret).map_err(lane_reject)? {
-                Some(next) => offset = next,
-                None => break,
-            }
-        }
-        let listed = walk.finish().map_err(lane_reject)?;
-        tracing::info!(
-            target: "bsc::payment_lane",
-            contract = %PAYMENT_LANE_CONTRACT,
-            parent = %parent_hash,
-            ratio,
-            denom = RATIO_DENOM,
-            listed = listed.len(),
-            pages,
-            elapsed_ms = started.elapsed().as_millis(),
-            "payment lane config loaded"
-        );
-
-        let meta = LaneMeta { ratio, listed: std::sync::Arc::new(listed) };
-        LANE_META_CACHE.lock().unwrap().insert(parent_hash, meta.clone());
-        Ok(meta)
-    }
-
-    /// Hands this block's lane config to its children: unless the block changed `0x2007`, the
-    /// config read at its parent is still the truth after it.
-    ///
-    /// No-op while producing, where the block has no hash yet — the block is cached when this
-    /// node later imports it.
-    pub(crate) fn propagate_lane_meta(&self) {
-        let (Some(hash), Some(lane)) = (self.ctx.header_hash, self.inner_ctx.payment_lane.as_ref())
-        else {
-            return;
-        };
-        if self.lane_contract_changed {
-            return;
-        }
-        LANE_META_CACHE.lock().unwrap().insert(hash, lane.meta.clone());
-    }
-
     /// Derives this block's lane from the parent's ratio and this block's `gas_limit`.
     ///
     /// Gated on the PARENT: the ratio comes from its post-state, and Jenner installs `0x2007`
     /// while its activation block executes, so `activation + 1` is the first block that reserves.
     ///
-    /// Must run before this block mutates state.
+    /// Must run before this block mutates state — see [`LaneParentState`], which is what refuses
+    /// a late read.
     fn init_payment_lane(
         &mut self,
         parent: &Header,
@@ -471,29 +364,28 @@ where
         if !self.spec.is_jenner_active_at_timestamp(parent.number, parent.timestamp) {
             return Ok(());
         }
-        // Read before the call so the failure log can name the block; `load_lane_meta` holds a
-        // mutable borrow of the executor.
+        // Read before the call: `resolve` borrows the executor as the parent state.
         let (block, parent_hash) = (parent.number + 1, self.ctx.base.parent_hash);
-        let meta = self.load_lane_meta().inspect_err(|err| {
-            tracing::error!(
-                target: "bsc::payment_lane",
-                block,
-                parent = %parent_hash,
-                gas_limit,
-                error = %err,
-                "cannot derive the payment lane"
-            );
-        })?;
-        let quota = meta.quota(gas_limit);
+        self.lane = LaneState::resolve(self, parent_hash, gas_limit)
+            .inspect_err(|err| {
+                tracing::error!(
+                    target: "bsc::payment_lane",
+                    block,
+                    parent = %parent_hash,
+                    gas_limit,
+                    error = %err,
+                    "cannot derive the payment lane"
+                );
+            })
+            .map_err(lane_reject)?;
         tracing::debug!(
             target: "bsc::payment_lane",
             block,
-            ratio = meta.ratio,
-            quota,
-            listed = meta.listed.len(),
+            ratio = self.lane.ratio(),
+            quota = self.lane.quota(),
+            listed = self.lane.listed_len(),
             "payment lane active"
         );
-        self.inner_ctx.payment_lane = Some(LaneState { meta, budget: Budget { quota, used: 0 } });
         Ok(())
     }
 
@@ -908,5 +800,60 @@ where
             self.inner_ctx.validators_election_info = Some(validator_election_info);
         }
         Ok(())
+    }
+}
+
+/// The parent post-state, the view [`LaneState::resolve`] reads `0x2007` through.
+///
+/// The "must run before this block mutates state" rule lives here and nowhere else: it is this
+/// implementation's promise to keep, not something the lane could check for itself. A late read
+/// would take the ratio and the list from a state this block already changed, and then be cached
+/// under the parent hash for every sibling block to inherit.
+impl<'a, EVM, Spec, R: ReceiptBuilder> LaneParentState for BscBlockExecutor<'a, EVM, Spec, R>
+where
+    EVM: Evm<
+        DB: alloy_evm::block::StateDB,
+        Tx: FromRecoveredTx<R::Transaction>
+                + FromRecoveredTx<TransactionSigned>
+                + FromTxWithEncoded<TransactionSigned>,
+        BlockEnv = crate::evm::block_env::BscBlockEnv,
+    >,
+    Spec: EthereumHardforks + crate::hardforks::BscHardforks + EthChainSpec + Hardforks + Clone + 'static,
+    R: ReceiptBuilder<Transaction = TransactionSigned, Receipt: TxReceipt>,
+    <R as ReceiptBuilder>::Transaction: Unpin + From<TransactionSigned>,
+    <EVM as alloy_evm::Evm>::Tx: FromTxWithEncoded<<R as ReceiptBuilder>::Transaction>,
+    BscTxEnv: IntoTxEnv<<EVM as alloy_evm::Evm>::Tx>,
+    R::Transaction: Into<TransactionSigned>,
+{
+    fn call_lane_getter(&mut self, to: Address, data: Bytes) -> Result<Bytes, LaneError> {
+        if !self.db_at_parent_state {
+            return Err(LaneError::StateUnavailable(
+                "payment lane read after this block mutated state".into(),
+            ));
+        }
+
+        let tx_env = view_call_tx_env(to, data, GETTER_GAS_LIMIT, self.spec.chain().id());
+        // A revert or a halt is a verdict on the block, so it comes back as `CorruptConfig`; only
+        // a `transact` error is a local fault, and there the executor must not be reused.
+        let result = self
+            .evm
+            .transact(tx_env.into_tx_env())
+            .map_err(|err| LaneError::StateUnavailable(err.to_string()))?
+            .result;
+
+        // The reason only: this string reaches the consensus layer, and return data can run to
+        // megabytes.
+        let reason = match result {
+            ExecutionResult::Success { output, .. } => {
+                let data = output.into_data();
+                if !data.is_empty() {
+                    return Ok(data);
+                }
+                "returned no data".to_string()
+            }
+            ExecutionResult::Revert { .. } => "reverted".to_string(),
+            ExecutionResult::Halt { reason, .. } => format!("halted: {reason:?}"),
+        };
+        Err(LaneError::CorruptConfig(format!("getter at {to} {reason}")))
     }
 }
