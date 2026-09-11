@@ -3,7 +3,7 @@
 //! go-bsc's `core/payment_lane.go`: the same six verbs, in the same order of use —
 //! [`LaneState::resolve`] once per block, then [`LaneState::classify`] /
 //! [`LaneState::record_used`] per transaction, [`LaneState::admits`] or
-//! [`LaneState::verify_packed_bid`] wherever a producer decides what goes in, and
+//! [`LaneState::verify_reservation_intact`] wherever a producer decides what goes in, and
 //! [`LaneState::verify`] on the finished block.
 
 use super::{
@@ -89,17 +89,23 @@ impl LaneState {
         self.0.as_ref().is_none_or(|a| a.budget.admits(shared, lane, tx_gas_limit))
     }
 
-    /// The aggregate form of [`Self::admits`], for a transaction set this node did not pack
-    /// itself — go-bsc `LaneState.VerifyPackedBid`.
+    /// Whether the reservation survived a transaction set this node did not pick itself — the
+    /// whole-set form of [`Self::admits`], and the only lane check a producer can make when it
+    /// cannot drop anything. go-bsc calls it `LaneState.VerifyPackedBid`, and the error reads
+    /// word for word the same.
+    ///
+    /// Used on the BEP-322 bid path (and by `debug_buildCandidateBlock`, which reproduces it):
+    /// the builder fixes the transactions, so they are accounted one by one and then judged
+    /// once, here, before finalization.
     ///
     /// `shared` is the producer's remaining pool (`GasLimit - reserved - used`), the same unit
     /// [`Self::admits`] takes. Not the block rule: that is the importer's verdict, and counting
-    /// the system transactions' actual gas there would hand the bundle the unused part of the
+    /// the system transactions' actual gas there would hand the set the unused part of the
     /// system reservation.
-    pub fn verify_packed_bid(&self, shared: u64) -> Result<(), LaneError> {
+    pub fn verify_reservation_intact(&self, shared: u64) -> Result<(), LaneError> {
         match self.0.as_ref() {
-            Some(a) if !a.budget.fits_packed(shared) => {
-                Err(LaneError::PackedBidOverrun { idle: a.budget.idle(), shared })
+            Some(a) if !a.budget.reservation_intact(shared) => {
+                Err(LaneError::ReservationOverrun { idle: a.budget.idle(), shared })
             }
             _ => Ok(()),
         }
@@ -197,27 +203,27 @@ mod tests {
         off.record_used(Lane::Payment, 21_000);
         assert_eq!(off.used(), 0);
         assert!(off.admits(0, Lane::General, u64::MAX));
-        assert_eq!(off.verify_packed_bid(0), Ok(()));
+        assert_eq!(off.verify_reservation_intact(0), Ok(()));
         assert_eq!(off.verify(u64::MAX), Ok(()));
         off.inherit_to(BlockHash::ZERO);
         assert_eq!((off.quota(), off.idle(), off.ratio(), off.listed_len()), (0, 0, 0, 0));
         let _ = NoParentReads; // `resolve` is the one verb an off lane cannot answer.
     }
 
-    /// The bundle verdict and the per-transaction gate are one inequality; the error carries the
-    /// two numbers a builder needs to resize.
+    /// The whole-set verdict and the per-transaction gate are one inequality; the error carries
+    /// the two numbers a builder needs to resize.
     #[test]
-    fn packed_bid_verdict_matches_the_gate() {
+    fn reservation_verdict_matches_the_gate() {
         let lane = active(1_500_000, 21_000, 30_000_000);
         assert_eq!(lane.idle(), 1_479_000);
-        assert_eq!(lane.verify_packed_bid(1_479_000), Ok(()));
+        assert_eq!(lane.verify_reservation_intact(1_479_000), Ok(()));
         assert_eq!(
-            lane.verify_packed_bid(979_000),
-            Err(LaneError::PackedBidOverrun { idle: 1_479_000, shared: 979_000 })
+            lane.verify_reservation_intact(979_000),
+            Err(LaneError::ReservationOverrun { idle: 1_479_000, shared: 979_000 })
         );
         // The wording go-bsc's `VerifyPackedBid` logs, so one grep covers both clients.
         assert_eq!(
-            lane.verify_packed_bid(979_000).unwrap_err().to_string(),
+            lane.verify_reservation_intact(979_000).unwrap_err().to_string(),
             "payment lane inequality violated: idle lane 1479000 exceeds the 979000 gas left in the pool"
         );
     }

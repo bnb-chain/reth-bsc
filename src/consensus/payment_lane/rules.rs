@@ -70,22 +70,19 @@ impl Budget {
             }
     }
 
-    /// The aggregate form of [`Self::admits`], for a transaction set the producer did not pack
-    /// itself — go-bsc `LaneState.VerifyPackedBid`.
+    /// Whether `shared` gas still covers the reservation — the invariant [`Self::admits`]
+    /// maintains one transaction at a time, stated directly so it can also be checked in one
+    /// go over a transaction set that was never filtered.
     ///
-    /// The invariant [`Self::admits`] maintains one transaction at a time: general traffic has
-    /// not eaten into the reservation. A bundle cannot be filtered transaction by transaction,
-    /// so it is held to that invariant once, whole.
+    /// `shared` is the producer's remaining pool (`GasLimit - reserved - used`), never the
+    /// block's raw headroom: the block rule is the importer's verdict and counts the system
+    /// transactions' *actual* gas, which would hand user traffic the unused part of the
+    /// reservation.
     ///
     /// Spelled out rather than written as `admits(shared, General, 0)`: that would be vacuous,
     /// because the saturating subtraction inside `admits` turns an over-committed pool into a
     /// zero allowance, which a zero-gas transaction still fits into.
-    ///
-    /// `shared` is the producer's remaining pool (`GasLimit - reserved - used`), never the
-    /// block's raw headroom: the block rule is the importer's verdict and counts the system
-    /// transactions' *actual* gas, which would hand the bundle the unused part of the
-    /// reservation.
-    pub fn fits_packed(&self, shared: u64) -> bool {
+    pub fn reservation_intact(&self, shared: u64) -> bool {
         self.idle() <= shared
     }
 
@@ -202,27 +199,27 @@ mod tests {
         }
     }
 
-    /// The bundle gate is the packing loop's invariant, and it must agree with the per-
-    /// transaction gate everywhere that gate is not vacuous.
+    /// The whole-set check is the packing loop's invariant, and it must agree with the
+    /// per-transaction gate everywhere that gate is not vacuous.
     #[test]
-    fn packed_gate_is_the_packing_loop_invariant() {
+    fn reservation_check_is_the_packing_loop_invariant() {
         for quota in [0u64, 1, 7, 1_500_000, u64::MAX] {
             for used in [0u64, 1, 21_000, 1_500_000] {
                 let b = budget(quota, used);
                 for shared in [0u64, 1, 21_000, 1_479_000, 1_500_000, u64::MAX] {
-                    assert_eq!(b.fits_packed(shared), b.idle() <= shared);
+                    assert_eq!(b.reservation_intact(shared), b.idle() <= shared);
                     // A pool that admits any real general transaction has an intact
                     // reservation; the converse needs `shared > idle`, which is where the two
                     // differ by exactly one gas.
                     if b.admits(shared, Lane::General, 1) {
-                        assert!(b.fits_packed(shared), "quota={quota} used={used} shared={shared}");
+                        assert!(b.reservation_intact(shared), "quota={quota} used={used} shared={shared}");
                     }
                 }
             }
         }
         // The boundary: the reservation is intact when nothing but it is left.
-        assert!(budget(20, 0).fits_packed(20));
-        assert!(!budget(20, 0).fits_packed(19));
+        assert!(budget(20, 0).reservation_intact(20));
+        assert!(!budget(20, 0).reservation_intact(19));
         // And why the zero-gas spelling would not do.
         assert!(budget(20, 0).admits(19, Lane::General, 0));
     }

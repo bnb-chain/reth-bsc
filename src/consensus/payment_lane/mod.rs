@@ -82,14 +82,14 @@ pub enum LaneError {
     )]
     Violated { gas_limit: u64, gas_used: u64, quota: u64, payment_gas_used: u64 },
 
-    /// The producer-side form of [`Self::Violated`], for a transaction set this node did not pack
-    /// itself. Worded exactly as go-bsc's `LaneState.VerifyPackedBid` so one grep covers both
-    /// clients' logs.
+    /// The producer-side form of [`Self::Violated`]: what was packed leaves less gas than the
+    /// reservation needs. Worded exactly as go-bsc's `LaneState.VerifyPackedBid` so one grep
+    /// covers both clients' logs.
     #[error(
         "payment lane inequality violated: idle lane {idle} exceeds the {shared} gas left in \
          the pool"
     )]
-    PackedBidOverrun { idle: u64, shared: u64 },
+    ReservationOverrun { idle: u64, shared: u64 },
 
     #[error("corrupt payment lane config: {0}")]
     CorruptConfig(String),
