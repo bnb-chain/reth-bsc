@@ -16,51 +16,51 @@ name = "reth-bsc"
 path = "src/main.rs"
 
 [dependencies]
-reth = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
-reth-cli = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
-reth-cli-commands = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
-reth-basic-payload-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
-reth-db = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
-reth-engine-local = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
-reth-engine-tree = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
-reth-node-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
-reth-chainspec = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
-reth-cli-util = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
-reth-discv4 = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5", features = ["test-utils"] }
-reth-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
-reth-ethereum-forks = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5", features = ["serde"] }
-reth-ethereum-payload-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
-reth-payload-builder-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
-reth-chain-state = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
-reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
-reth-eth-wire = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
-reth-eth-wire-types = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
-reth-evm = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
-reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
-reth-execution-types = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
-reth-ipc = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
-reth-metrics = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
-reth-node-core = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
-reth-revm = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
-reth-network = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5", features = ["test-utils"] }
-reth-network-p2p = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
-reth-network-api = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
-reth-node-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5", features = ["test-utils"] }
-reth-network-peers = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
-reth-payload-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
-reth-ethereum-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
+reth = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
+reth-cli = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
+reth-cli-commands = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
+reth-basic-payload-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
+reth-db = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
+reth-engine-local = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
+reth-engine-tree = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
+reth-node-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
+reth-chainspec = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
+reth-cli-util = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
+reth-discv4 = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td", features = ["test-utils"] }
+reth-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
+reth-ethereum-forks = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td", features = ["serde"] }
+reth-ethereum-payload-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
+reth-payload-builder-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
+reth-chain-state = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
+reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
+reth-eth-wire = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
+reth-eth-wire-types = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
+reth-evm = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
+reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
+reth-execution-types = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
+reth-ipc = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
+reth-metrics = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
+reth-node-core = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
+reth-revm = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
+reth-network = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td", features = ["test-utils"] }
+reth-network-p2p = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
+reth-network-api = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
+reth-node-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td", features = ["test-utils"] }
+reth-network-peers = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
+reth-payload-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
+reth-ethereum-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
 reth-primitives-traits = { version = "0.6.0", default-features = false }
 reth-codecs = { version = "0.6.0" }
-reth-provider = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5", features = ["test-utils"] }
-reth-storage-overlay = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
-reth-rpc-eth-api = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
-reth-rpc-convert = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
-reth-rpc-engine-api = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
-reth-rpc-server-types = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
-reth-trie-common = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
-reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
-reth-tasks = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
-reth-transaction-pool = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
+reth-provider = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td", features = ["test-utils"] }
+reth-storage-overlay = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
+reth-rpc-eth-api = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
+reth-rpc-convert = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
+reth-rpc-engine-api = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
+reth-rpc-server-types = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
+reth-trie-common = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
+reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
+reth-tasks = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
+reth-transaction-pool = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
 revm = "42.0.1"
 revm-database = "42.0.0"
 revm-bytecode = "42.0.0"
