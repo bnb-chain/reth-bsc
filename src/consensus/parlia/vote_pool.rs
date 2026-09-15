@@ -40,8 +40,7 @@ const MAX_CUR_VOTE_AMOUNT_PER_BLOCK: usize = 21;
 /// proves the signer holds the key in the envelope, not that the key belongs to
 /// a validator. Capping such a bucket lets any peer mint keys, self-sign enough
 /// envelopes to fill it, and have genuine validator votes refused —
-/// permanently, since votes are broadcast once and never re-sent. Reported by
-/// Hashdit Bot on #491.
+/// permanently, since votes are broadcast once and never re-sent.
 ///
 /// NOTE: go-bsc applies its cap unconditionally. `basicVerify` uses
 /// `maxFutureVoteAmountPerBlock` with only `vote.Verify()` behind it,
@@ -70,7 +69,6 @@ const MAX_PROMOTION_VOTES_PER_PASS: usize = 512;
 /// overflow makes the *next* admitted vote overflow again — turning an O(n log n)
 /// pass under the write lock into a per-vote cost. Reclaiming a block of headroom
 /// instead amortises it to roughly one pass per `SHED_HEADROOM` admissions.
-/// Reported by Hashdit Bot on #491.
 const SHED_HEADROOM: usize = 4096;
 /// Hard ceiling on pooled votes. Exceeding it triggers a prune and, failing
 /// that, shedding of future votes.
@@ -232,7 +230,7 @@ impl VotePool {
             // which is every vote during startup, and around each validator-set
             // swap — push the bucket past the cap, so the first genuine validator
             // vote for that target is refused. That is the censorship this
-            // conditional cap exists to prevent. Reported by Hashdit Bot on #491.
+            // conditional cap exists to prevent.
             return authenticated
                 && self
                     .future_votes
@@ -438,8 +436,7 @@ impl VotePool {
         // this the loop drains every entry at or below `latest` and pushes back
         // whatever it could not resolve — tens of thousands of heap operations
         // per import, under the write lock every incoming vote contends for, no
-        // matter how few targets were actually judged. Reported by Hashdit Bot
-        // on #491.
+        // matter how few targets were actually judged.
         while examined < MAX_PROMOTION_TARGETS_PER_PASS {
             let Some(vd) = self.future_votes_pq.peek() else {
                 break;
@@ -681,8 +678,7 @@ pub fn justified_pair_for_hash(header_hash: &B256) -> Option<(BlockNumber, B256)
 /// Reporting the zero hash here rejects every vote for source mismatch, and the
 /// rejection is self-locking: leaving the state needs an attestation, and an
 /// attestation can only be assembled from the votes being rejected. A fresh
-/// all-reth network therefore never reaches finality at all. Raised by
-/// will-2012 on #491.
+/// all-reth network therefore never reaches finality at all.
 ///
 /// `genesis` is lazy so a chain that has justified something never pays for the
 /// lookup, and so the branch is unit-testable without a registered header
@@ -747,7 +743,7 @@ fn future_vote_sender_is_validator(vote: &VoteEnvelope) -> Option<bool> {
 /// the head" answers false for every such vote and judges it against the wrong
 /// set — rejecting a validator that legitimately governs that target, and, since
 /// those rejections are cached, keeping the vote out for good if the branch later
-/// becomes canonical. Reported by Hashdit Bot on #491.
+/// becomes canonical.
 ///
 /// The set does **not** change at the epoch multiple: it changes `offset` blocks
 /// later, where `offset` is `Snapshot::miner_history_check_len()`. That is the
@@ -980,8 +976,7 @@ fn put_vote_inner(vote: VoteEnvelope, vote_hash: B256) {
     // connected peer. Treat unclassifiable votes as future: they are then
     // uncapped (so they cannot crowd out validator votes), they do not reach
     // `maybe_notify_finality` (so they cannot manufacture quorum), and they are
-    // fully origin-checked at promotion once the provider appears. Reported by
-    // Hashdit Bot on #491.
+    // fully origin-checked at promotion once the provider appears.
     let can_classify = shared::has_header_by_hash_provider();
     let is_future = !can_classify
         || shared::get_canonical_header_by_hash_from_provider(&target_hash).is_none();
@@ -1127,7 +1122,7 @@ fn put_vote_inner(vote: VoteEnvelope, vote_hash: B256) {
 ///
 /// go-bsc drives this off its `highestVerifiedBlock` event. The equivalent choke
 /// point here is `BscForkChoiceEngine::update_forkchoice`, which every node
-/// reaches on every import path. Raised by will-2012 on #491.
+/// reaches on every import path.
 ///
 /// The provider and snapshot lookups run between the two locks, never under the
 /// write lock that every incoming vote contends for.
@@ -1637,8 +1632,7 @@ mod tests {
     /// undecidable — every vote during startup, and around each validator-set
     /// swap — counted toward it. An attacker could fill a target past the cap
     /// with minted keys and have the first genuine validator vote for that target
-    /// refused; votes are broadcast once, so it is gone. Reported by Hashdit Bot
-    /// on #491.
+    /// refused; votes are broadcast once, so it is gone.
     #[test]
     fn unauthenticated_future_votes_do_not_consume_the_authenticated_cap() {
         let target = B256::from([0x7a; 32]);
@@ -1849,7 +1843,7 @@ mod tests {
     ///
     /// Routing them to the future pool instead means they are uncapped, invisible
     /// to finality counting, and fully origin-checked at promotion once the
-    /// provider appears. Reported by Hashdit Bot on #491.
+    /// provider appears.
     ///
     /// Unit tests cannot register the provider, so this is the state under test.
     #[test]
@@ -1905,9 +1899,8 @@ mod tests {
 
     /// No attestation resolves to genesis, matching go-bsc's
     /// `GetJustifiedNumberAndHash` and the substitution our own vote producers
-    /// already make. Reported by will-2012 on #491; verified on a fresh 10-node
-    /// all-reth devnet, where every vote was rejected for source mismatch and
-    /// `finalized` never left genesis.
+    /// already make. Verified on a fresh 10-node all-reth devnet, where every
+    /// vote was rejected for source mismatch and `finalized` never left genesis.
     #[test]
     fn justified_pair_without_an_attestation_resolves_to_genesis() {
         let genesis_hash = B256::from([0x9e; 32]);
@@ -2079,8 +2072,7 @@ mod tests {
     /// Selection was already bounded, but application drained every eligible
     /// entry and pushed back what it could not resolve, so an attacker who filled
     /// the future pool with distinct target hashes could force tens of thousands
-    /// of heap operations per import under the pool write lock. Reported by
-    /// Hashdit Bot on #491.
+    /// of heap operations per import under the pool write lock.
     #[test]
     fn a_promotion_pass_touches_no_more_than_its_target_budget() {
         let eligible = MAX_PROMOTION_TARGETS_PER_PASS * 20;
@@ -2134,7 +2126,7 @@ mod tests {
     /// Overflow must reclaim a block of headroom, not just the excess. Shedding
     /// walks and rebuilds the whole future queue, so releasing exactly the
     /// overflow would make the next admitted vote overflow again and pay that
-    /// cost per vote, under the write lock. Reported by Hashdit Bot on #491.
+    /// cost per vote, under the write lock.
     #[test]
     fn overflow_sheds_a_block_of_headroom() {
         assert_eq!(overflow_shed_target(MAX_VOTES_IN_POOL), None, "at the ceiling, nothing to do");
@@ -2211,7 +2203,7 @@ mod tests {
     /// Reporting the zero hash here makes `verify_vote_origin` reject every vote
     /// on such a chain for source mismatch, and the rejection is self-locking:
     /// leaving the state needs an attestation, which can only be assembled from
-    /// the votes being rejected. Raised by will-2012 on #491.
+    /// the votes being rejected.
     #[test]
     fn justified_pair_never_reports_the_zero_hash() {
         use crate::consensus::parlia::snapshot::{Snapshot, DEFAULT_EPOCH_LENGTH};
@@ -2243,8 +2235,7 @@ mod tests {
     /// epoch multiple, not at it, and membership for a target comes from the
     /// target's *parent*. Watching the multiple instead misses the real boundary
     /// by that offset — which rejects a joining validator's votes outright, since
-    /// `Some(false)` drops them and votes are never re-sent. Raised by will-2012
-    /// on #491.
+    /// `Some(false)` drops them and votes are never re-sent.
     #[test]
     fn governing_sets_differ_tracks_the_real_boundary() {
         // Mainnet post-Maxwell: 1000-block epoch, 21 validators, turn_length 4.
@@ -2277,7 +2268,7 @@ mod tests {
     /// unseen branch is routinely behind the head with a swap in between. Judging
     /// it against our head's set rejects a validator that legitimately governs
     /// that target, and the rejection is cached, so the vote stays out even if the
-    /// branch later becomes canonical. Reported by Hashdit Bot on #491.
+    /// branch later becomes canonical.
     #[test]
     fn governing_sets_differ_detects_a_swap_behind_the_head() {
         const EPOCH: u64 = 1000;
