@@ -736,9 +736,13 @@ where
         if self.greedy_merge {
             let ending_bids_extra = 20;
             let min_time_left_for_ending_bids = DELAY_LEFT_OVER + ending_bids_extra;
+            let Some(header) = bid_runtime.mining_ctx.header.as_ref() else {
+                debug!("bidSimulator: no header in the mining context, skipping bid");
+                return Err(());
+            };
             let delay_ms = self.parlia.delay_for_bid_simulation(
                 &bid_runtime.mining_ctx.parent_snapshot,
-                bid_runtime.mining_ctx.header.as_ref().unwrap(),
+                header,
                 min_time_left_for_ending_bids,
             );
             if delay_ms > 0 {
@@ -1120,7 +1124,11 @@ where
     {
         let base_fee: u64 = builder.evm().block().basefee();
         let blob_params = self.chain_spec.blob_params_at_timestamp(self.attributes.timestamp);
-        let header = self.mining_ctx.header.as_ref().unwrap();
+        let header = self
+            .mining_ctx
+            .header
+            .as_ref()
+            .ok_or("no header in the mining context")?;
         let blob_eligible = is_blob_eligible_block(&self.chain_spec, header.number, header.timestamp);
         let mut max_blob_count =
             blob_params.as_ref().map(|params| params.max_blob_count).unwrap_or_default();
@@ -1288,12 +1296,14 @@ where
             self.parent_header.number,
             self.parent_header.timestamp,
         ) {
-            if let Some(excess) = self.mining_ctx.header.as_ref().unwrap().excess_blob_gas {
+            let header = self
+                .mining_ctx
+                .header
+                .as_ref()
+                .ok_or("no header in the mining context")?;
+            if let Some(excess) = header.excess_blob_gas {
                 if excess != 0 {
-                    blob_fee = Some(calc_blob_fee(
-                        &self.chain_spec,
-                        self.mining_ctx.header.as_ref().unwrap(),
-                    ));
+                    blob_fee = Some(calc_blob_fee(&self.chain_spec, header));
                 }
             }
         }

@@ -334,7 +334,7 @@ impl RecoverTarget {
 /// 1. `discover_fork_blocks` walks back from `target.fetch_start_*` to the
 ///    common ancestor.
 /// 2. Imports fork blocks oldest → newest via `engine.new_payload`, awaiting
-///    `Valid` on each before submitting the next.
+///    `Valid` then `fork_choice_updated` on each before submitting the next.
 /// 3. `fork_choice_updated` for `target.fcu_target_*` so engine-tree
 ///    re-evaluates canonical selection.
 ///
@@ -400,10 +400,11 @@ where
     // tip never moves (bnb-chain/reth-bsc#456).
     let mut last_valid: Option<alloy_consensus::Header> = None;
     let mut halted_at: Option<u64> = None;
-    for block in &to_import {
-        let block_hash = block.header.hash_slow();
-        let block_num = block.header.number;
-        let sealed = block.clone().seal_unchecked(block_hash);
+    for block in to_import {
+        let header = block.header.clone();
+        let block_hash = header.hash_slow();
+        let block_num = header.number;
+        let sealed = block.seal_unchecked(block_hash);
         let payload = BscPayloadTypes::block_to_payload(sealed);
 
         match engine.new_payload(payload).await {
@@ -415,9 +416,25 @@ where
                         block_num,
                         "Fork block imported Valid"
                     );
-                    last_valid = Some(block.header.clone());
                     // An accepted block is unambiguous progress.
                     progress.record_progress();
+
+                    match forkchoice_engine.update_forkchoice(&header).await {
+                        Ok(()) => {
+                            progress.record_progress();
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                target: "bsc::fork_recover",
+                                %block_hash,
+                                block_num,
+                                error = %err,
+                                "fork_choice_updated returned error mid-recovery"
+                            );
+                        }
+                    }
+
+                    last_valid = Some(header);
                 }
                 PayloadStatusEnum::Invalid { validation_error } => {
                     return Err(ForkRecoverError::ImportInvalid {
@@ -477,8 +494,9 @@ where
         &provider,
         fcu_target_hash,
         fcu_target_header.as_ref(),
-        to_import.last(),
+        last_valid.as_ref(),
     )?;
+
     if let Err(err) = forkchoice_engine.update_forkchoice(&head_header).await {
         // FCU failure is recoverable (engine-tree may retry on next import);
         // surface at warn level to match `service.rs` convention.
@@ -513,7 +531,7 @@ fn resolve_fcu_head_header<P>(
     provider: &P,
     fcu_target_hash: B256,
     fcu_target_header: Option<&alloy_consensus::Header>,
-    phase_2_tail: Option<&crate::BscBlock>,
+    phase_2_tail: Option<&alloy_consensus::Header>,
 ) -> Result<alloy_consensus::Header, ForkRecoverError>
 where
     P: HeaderProvider<Header = alloy_consensus::Header>,
@@ -533,8 +551,8 @@ where
 
     // 2. Phase-2 tail iff it equals the FCU target.
     if let Some(last) = phase_2_tail {
-        if last.header.hash_slow() == fcu_target_hash {
-            return Ok(last.header.clone());
+        if last.hash_slow() == fcu_target_hash {
+            return Ok(last.clone());
         }
     }
 
@@ -1178,7 +1196,8 @@ mod tests {
 
         // Legacy single-pair path: fcu_target_header = None, phase_2_tail.hash == fcu_target_hash.
         let resolved =
-            super::resolve_fcu_head_header(&provider, head_hash, None, Some(&tail_block)).unwrap();
+            super::resolve_fcu_head_header(&provider, head_hash, None, Some(&tail_block.header))
+                .unwrap();
         assert_eq!(
             resolved.hash_slow(),
             head_hash,
@@ -1240,7 +1259,7 @@ mod tests {
             &provider,
             target_hash,
             Some(&target),
-            Some(&tail_block),
+            Some(&tail_block.header),
         )
         .unwrap();
         assert_eq!(resolved.hash_slow(), target_hash);
@@ -1289,7 +1308,7 @@ mod tests {
         let tail_block = make_block(parent);
 
         let resolved =
-            super::resolve_fcu_head_header(&provider, target_hash, None, Some(&tail_block))
+            super::resolve_fcu_head_header(&provider, target_hash, None, Some(&tail_block.header))
                 .unwrap();
         assert_eq!(resolved.hash_slow(), target_hash);
         assert_eq!(resolved.number, 10);
@@ -1309,7 +1328,7 @@ mod tests {
             &provider,
             target_hash,
             None,
-            Some(&tail_block),
+            Some(&tail_block.header),
         )
         .unwrap_err();
         match err {
@@ -1621,6 +1640,40 @@ mod tests {
             );
         }
 
+        #[tokio::test]
+        async fn every_imported_block_gets_its_own_fcu() {
+            let (provider, fetcher, heads) = scenario(100, 5);
+            let (engine, submissions, fcus) = recording_engine(vec![]);
+            let (head_hash, head_num) = heads[4];
+
+            let fce = BscForkChoiceEngine::new(provider.clone(), engine.clone(), chain_spec());
+            recover_ancestors(
+                fake_peer(),
+                RecoverTarget::single_pair(head_hash, head_num),
+                provider.clone(),
+                engine.clone(),
+                fce,
+                fetcher.as_ref(),
+                &(),
+            )
+            .await
+            .unwrap();
+
+            let imported: Vec<u64> =
+                submissions.lock().unwrap().iter().map(|(n, _)| *n).collect();
+            assert_eq!(imported, vec![101, 102, 103, 104, 105], "the whole extension imports");
+
+            let mut expected: Vec<B256> = heads.iter().map(|(h, _)| *h).collect();
+            // Phase 3 always commits the resolved head; for a single-pair target
+            // that repeats the tail's FCU, which is an idempotent no-op.
+            expected.push(head_hash);
+            assert_eq!(
+                fcus.lock().unwrap().as_slice(),
+                expected.as_slice(),
+                "an FCU per imported block, plus the terminal commit",
+            );
+        }
+
         /// A `Syncing` part-way through Phase 2 used to abort the recovery and
         /// discard every block already imported, so the canonical tip never
         /// moved and the next attempt replayed the identical prefix (issue #456
@@ -1654,13 +1707,14 @@ mod tests {
                 submissions.lock().unwrap().iter().map(|(n, _)| *n).collect();
             assert_eq!(after_first, vec![101, 102, 103, 104, 105], "halts at the first Syncing");
 
-            // Progress is committed by an FCU targeting the highest block the
-            // engine accepted — not the announced head we never reached.
+            // One FCU per accepted block, then the halt path re-commits 104.
             let block_104_hash = heads[3].0;
+            let mut expected_fcus: Vec<B256> = heads[..4].iter().map(|(h, _)| *h).collect();
+            expected_fcus.push(block_104_hash);
             assert_eq!(
                 fcus.lock().unwrap().as_slice(),
-                &[block_104_hash],
-                "one FCU, targeting block 104",
+                expected_fcus.as_slice(),
+                "an FCU per imported block 101-104, plus the halt-path commit to 104",
             );
 
             // That FCU is what advances the canonical tip; model its effect.

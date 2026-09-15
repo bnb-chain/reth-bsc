@@ -44,28 +44,15 @@ impl HeaderCacheReader {
         }
     }
 
-    pub fn get_header_by_number(&mut self, block_number: u64) -> Option<Header> {
-        if let Some(header) = self.blocknumber_to_header.get(&block_number) {
-            tracing::trace!("Get header from cache, block_number: {:?}", header.number());
-            return Some(header.clone());
-        }
-        if let Some(header) = crate::shared::get_canonical_header_by_number_from_provider(block_number) {
-            tracing::trace!("Get header from provider, block_number: {:?}", header.number());
-            return Some(header);
-        }
-
-        tracing::warn!("Failed to get header from cache and provider, block_number: {:?}", block_number);
-        None
+    /// Cache-only lookup. The provider fallback lives in the free functions below, so the
+    /// mutex is released before any database read.
+    pub fn cached_header_by_number(&mut self, block_number: u64) -> Option<Header> {
+        self.blocknumber_to_header.get(&block_number).cloned()
     }
 
-    pub fn get_header_by_hash(&mut self, block_hash: &B256) -> Option<Header> {
-        if let Some(header) = self.blockhash_to_header.get(block_hash) {
-            return Some(header.clone());
-        }
-        if let Some(header) = crate::shared::get_canonical_header_by_hash_from_provider(block_hash) {
-            return Some(header);
-        }
-        None
+    /// Cache-only lookup; see [`Self::cached_header_by_number`].
+    pub fn cached_header_by_hash(&mut self, block_hash: &B256) -> Option<Header> {
+        self.blockhash_to_header.get(block_hash).cloned()
     }
 
     pub fn insert_header_to_cache(&mut self, header: Header) {
@@ -86,27 +73,47 @@ pub static HEADER_CACHE_READER: LazyLock<Mutex<HeaderCacheReader>> = LazyLock::n
     Mutex::new(HeaderCacheReader::new(100000))
 });
 
+/// Lock the header cache, recovering from a poisoned mutex.
+///
+/// The cache is a plain LRU: a panic while it was held leaves it structurally intact, and
+/// killing every later header lookup because some unrelated task panicked is worse than
+/// reusing it.
+fn lock_header_cache() -> std::sync::MutexGuard<'static, HeaderCacheReader> {
+    HEADER_CACHE_READER.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Get header by hash from the global header provider
 pub fn get_header_by_hash_from_cache(block_hash: &BlockHash) -> Option<Header> {
-    let header = HEADER_CACHE_READER.lock().unwrap().get_header_by_hash(block_hash);
+    // Cache first, and drop the guard before falling back to the provider: the fallback is a
+    // real database read, and holding the global header lock across it stalls every other
+    // header lookup in the node.
+    if let Some(header) = lock_header_cache().cached_header_by_hash(block_hash) {
+        return Some(header);
+    }
+    let header = crate::shared::get_canonical_header_by_hash_from_provider(block_hash);
     tracing::trace!("Succeed to fetch header by hash, is_none: {} for hash {}", header.is_none(), block_hash);
     header
 }
 
 /// Get canonical header by number from the global header provider
 pub fn get_cannonical_header_from_cache(number: BlockNumber) -> Option<Header> {
-    let header = HEADER_CACHE_READER.lock().unwrap().get_header_by_number(number);
+    if let Some(header) = lock_header_cache().cached_header_by_number(number) {
+        return Some(header);
+    }
+    let header = crate::shared::get_canonical_header_by_number_from_provider(number);
+    if header.is_none() {
+        tracing::warn!("Failed to get header from cache and provider, block_number: {:?}", number);
+    }
     tracing::debug!("Succeed to fetch canonical header by number, is_none: {} for number {}", header.is_none(), number);
     header
 }
 
 /// Insert header to cache
 pub fn insert_header_to_cache(header: Header) {
-    HEADER_CACHE_READER.lock().unwrap().insert_header_to_cache(header);
+    lock_header_cache().insert_header_to_cache(header);
 }
 
 /// Insert header with a known hash to avoid re-hashing.
 pub fn insert_header_to_cache_with_hash(header: Header, block_hash: Option<BlockHash>) {
-    HEADER_CACHE_READER.lock().unwrap().insert_header_to_cache_with_hash(header, block_hash);
+    lock_header_cache().insert_header_to_cache_with_hash(header, block_hash);
 }

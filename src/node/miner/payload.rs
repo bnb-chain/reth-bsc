@@ -974,9 +974,21 @@ where
                 "Transaction included in block"
             );
             if tx.is_eip4844() {
-                let sidecar = sidecars_map.get(tx.hash()).unwrap();
+                // The sidecar map is built from the same pool transactions, so a miss here
+                // means the block still seals — only its blob record is missing.
+                let Some(inner) =
+                    sidecars_map.get(tx.hash()).and_then(|sidecar| sidecar.as_eip4844())
+                else {
+                    warn!(
+                        target: "payload_builder",
+                        trace_id,
+                        tx_hash = ?tx.hash(),
+                        "No EIP-4844 sidecar for a blob transaction, skipping its blob record"
+                    );
+                    continue;
+                };
                 let bsc_blob_tx_sidecar = BscBlobTransactionSidecar {
-                    inner: sidecar.as_eip4844().unwrap().clone(),
+                    inner: inner.clone(),
                     block_number: sealed_block.header().number(),
                     block_hash: sealed_block.hash(),
                     tx_index: u64::try_from(index).unwrap_or(u64::MAX),
@@ -1296,7 +1308,9 @@ where
         metrics::histogram!("bsc_miner_effective_reserve_ms").record(effective_reserve as f64);
         let mining_delay = parlia.clone().delay_for_mining(
             &mining_ctx.parent_snapshot,
-            mining_ctx.header.as_ref().unwrap(),
+            // Set by `BscMiner` before the job is created; a payload job without it is a
+            // construction bug, not a runtime condition.
+            mining_ctx.header.as_ref().expect("mining context has a header for the block"),
             effective_reserve,
         );
         let pending_basefee = builder.pool.block_info().pending_basefee;

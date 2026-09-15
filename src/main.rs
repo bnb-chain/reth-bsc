@@ -557,8 +557,9 @@ fn main() -> eyre::Result<()> {
                 node.provider.canonical_in_memory_state(),
             );
 
-            // Set the IPC client
-            reth_bsc::shared::set_ipc_client(ipc_path).await.unwrap();
+            // Set the IPC client. IPC is required (see the `--ipc.disable` check above), so a
+            // failure here is a startup error rather than something to panic on.
+            reth_bsc::shared::set_ipc_client(ipc_path).await?;
 
             exit_future.await
         },

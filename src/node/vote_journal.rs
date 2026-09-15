@@ -179,6 +179,15 @@ static GLOBAL_JOURNAL: LazyLock<Mutex<VoteJournal>> = LazyLock::new(|| {
 });
 
 /// Get a guard to the global vote journal.
+///
+/// The guard is deliberately held across the journal's file I/O in [`persist_vote`]: the
+/// rules check and the append have to be one atomic step, or two votes for the same height
+/// could both pass the check and be signed. The write is a single small append plus
+/// `sync_all`, and vote signing is once per block, so the contention is bounded.
+///
+/// Poisoning panics rather than recovering: a panic mid-`write_vote` can leave the in-memory
+/// height claim and the on-disk journal disagreeing, and silently continuing with that is how
+/// a double sign gets through.
 pub fn global() -> std::sync::MutexGuard<'static, VoteJournal> { GLOBAL_JOURNAL.lock().expect("vote journal poisoned") }
 
 /// Helper for external modules to check the rules via global journal.
