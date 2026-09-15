@@ -697,17 +697,27 @@ fn justified_pair_of(
 /// at our own head.
 ///
 /// `verify_vote_origin` cannot run on a future vote: it resolves membership from
-/// the target's parent snapshot, and we do not hold the target. But the
-/// validator set only changes at one block per epoch, and the admission window
-/// caps a future target at `head + 11`, so the set at our head is the set that
-/// will govern the target — unless that block falls in between.
+/// the target's parent snapshot, and we do not hold the target. The validator set
+/// changes at one block per epoch, so when no change lies between our head and
+/// the target, our head's set is the one that governs it.
+///
+/// **This is a heuristic, and it is blind to which branch the target sits on.**
+/// `governing_sets_differ` is arithmetic over block heights. A target on a fork
+/// that diverged before the last epoch checkpoint has its own elected set, and
+/// its `miner_history_check_len` puts the swaps at different heights again, so
+/// equal boundary counts do not prove equal sets. A validator legitimate on that
+/// branch can be answered `Some(false)` here. go-bsc forms no such verdict at
+/// all: it authenticates only current votes, and leaves future ones to the
+/// authoritative check at promotion.
 ///
 /// Returns:
-/// - `Some(true)`  sender is a validator in the current set
-/// - `Some(false)` sender is not, and cannot become one inside the window
-/// - `None` undecidable: no snapshot, or a validator-set swap lies in
-///   `(head, target]` so the governing set may differ. Callers admit these
-///   uncapped rather than guess.
+/// - `Some(true)`  sender is a validator in our head's set, which we believe
+///   governs the target
+/// - `Some(false)` sender is not — refused early to keep minted keys from
+///   creating a bucket, accepting that a cross-branch sender may be refused with
+///   them. Never cached, so the refusal costs one copy rather than the envelope.
+/// - `None` undecidable: no snapshot, or the governing sets differ. Callers admit
+///   these uncapped rather than guess.
 fn future_vote_sender_is_validator(vote: &VoteEnvelope) -> Option<bool> {
     let head_number = shared::get_best_canonical_block_number()?;
     let head = shared::get_canonical_header_by_number(head_number)?;
@@ -996,11 +1006,13 @@ fn put_vote_inner(vote: VoteEnvelope, vote_hash: B256) {
                     target_number,
                     "rejecting future vote from a non-validator",
                 );
-                // The sender is in no validator set, and `future_vote_sender_is_
-                // validator` only answers `Some` when no set change lies between
-                // our head and the target — so this envelope cannot start
-                // passing, and a replay must not cost another BLS verification.
-                remember_rejected(vote_hash);
+                // Deliberately not cached. This verdict rests on
+                // `governing_sets_differ`, which cannot see which branch the
+                // target sits on, so a validator legitimate on a divergent branch
+                // can be refused here. Remembering that would keep the envelope
+                // out even after the branch became canonical, and votes are never
+                // re-sent. go-bsc goes further and evicts from its dedup set what
+                // fails verification, so a later copy is judged afresh.
                 return;
             }
             Some(true) => true,
