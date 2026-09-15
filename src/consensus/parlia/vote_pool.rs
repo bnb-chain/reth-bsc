@@ -82,6 +82,10 @@ const FINALIZED_NOTIFIED_CACHE_SIZE: usize = 21;
 struct VoteEntry {
     hash: B256,
     envelope: VoteEnvelope,
+    /// Whether the sender was confirmed to be a validator when this vote was
+    /// admitted. Always false for a vote admitted while membership was
+    /// undecidable, which is why the future cap must not count it.
+    authenticated: bool,
 }
 
 /// One future target considered for promotion, captured under the read lock.
@@ -134,6 +138,10 @@ struct PromotionOutcome {
 #[derive(Default)]
 struct VoteMessages {
     vote_messages: Vec<VoteEntry>,
+    /// How many of `vote_messages` were authenticated. Kept as a counter rather
+    /// than recomputed, because an unauthenticated bucket is deliberately
+    /// unbounded and scanning it on every admission would be its own DoS.
+    authenticated: usize,
 }
 
 /// Priority queue wrapper for vote data, ordered by target_number (ascending).
@@ -218,11 +226,18 @@ impl VotePool {
         if is_future {
             // Only cap a future bucket whose sender we authenticated; see the
             // note on MAX_FUTURE_VOTE_AMOUNT_PER_BLOCK.
+            //
+            // And count only the authenticated entries. Measuring the whole
+            // bucket lets anything admitted while membership was undecidable —
+            // which is every vote during startup, and around each validator-set
+            // swap — push the bucket past the cap, so the first genuine validator
+            // vote for that target is refused. That is the censorship this
+            // conditional cap exists to prevent. Reported by Hashdit Bot on #491.
             return authenticated
                 && self
                     .future_votes
                     .get(block_hash)
-                    .is_some_and(|vm| vm.vote_messages.len() >= MAX_FUTURE_VOTE_AMOUNT_PER_BLOCK);
+                    .is_some_and(|vm| vm.authenticated >= MAX_FUTURE_VOTE_AMOUNT_PER_BLOCK);
         }
         self.cur_votes
             .get(block_hash)
@@ -237,6 +252,7 @@ impl VotePool {
         vote: VoteEnvelope,
         pending_block_number: BlockNumber,
         is_future: bool,
+        authenticated: bool,
     ) -> usize {
         let vote_hash = vote.hash();
         if !self.received_votes.insert(vote_hash) {
@@ -263,11 +279,15 @@ impl VotePool {
             if !votes.contains_key(&block_hash) {
                 pq.push(vote_data);
             }
-            votes
-                .entry(block_hash)
-                .or_default()
-                .vote_messages
-                .push(VoteEntry { hash: vote_hash, envelope: vote });
+            let bucket = votes.entry(block_hash).or_default();
+            bucket.vote_messages.push(VoteEntry {
+                hash: vote_hash,
+                envelope: vote,
+                authenticated,
+            });
+            if authenticated {
+                bucket.authenticated += 1;
+            }
         }
         self.total_votes += 1;
 
@@ -490,7 +510,10 @@ impl VotePool {
 
         let requeue = !unjudged.is_empty();
         if requeue {
-            self.future_votes.entry(block_hash).or_default().vote_messages.extend(unjudged);
+            let still_authenticated = unjudged.iter().filter(|e| e.authenticated).count();
+            let bucket = self.future_votes.entry(block_hash).or_default();
+            bucket.vote_messages.extend(unjudged);
+            bucket.authenticated += still_authenticated;
         }
 
         if valid.is_empty() {
@@ -501,7 +524,10 @@ impl VotePool {
         if !self.cur_votes.contains_key(&block_hash) {
             self.cur_votes_pq.push(data);
         }
-        self.cur_votes.entry(block_hash).or_default().vote_messages.extend(valid);
+        let promoted_authenticated = valid.iter().filter(|e| e.authenticated).count();
+        let bucket = self.cur_votes.entry(block_hash).or_default();
+        bucket.vote_messages.extend(valid);
+        bucket.authenticated += promoted_authenticated;
         metrics::gauge!("curVotesPq.local").set(self.cur_votes_pq.heap.len() as f64);
         PromotionOutcome { promoted: true, requeue }
     }
@@ -927,7 +953,7 @@ pub fn put_vote_unchecked(vote: VoteEnvelope) {
     if pool.is_at_capacity(&target_hash, false, false) {
         return;
     }
-    let votes_for_block = pool.insert(vote, 0, false);
+    let votes_for_block = pool.insert(vote, 0, false, false);
     drop(pool);
     if votes_for_block > 0 {
         maybe_notify_finality(target_hash, votes_for_block);
@@ -1033,7 +1059,8 @@ fn put_vote_inner(vote: VoteEnvelope, vote_hash: B256) {
         return;
     }
 
-    let votes_for_block = pool.insert(vote, pending_block_number, is_future);
+    let votes_for_block =
+        pool.insert(vote, pending_block_number, is_future, future_sender_authenticated);
 
     if need_head_work {
         pool.prune(pending_block_number);
@@ -1572,7 +1599,7 @@ mod tests {
                 !pool.is_at_capacity(&unauth, true, false),
                 "an unauthenticated future bucket must never refuse (i={i})",
             );
-            pool.insert(envelope(unauth, i), 0, true);
+            pool.insert(envelope(unauth, i), 0, true, false);
         }
         assert_eq!(
             pool.future_votes.get(&unauth).map(|vm| vm.vote_messages.len()),
@@ -1584,7 +1611,7 @@ mod tests {
         let auth = B256::from([0x79; 32]);
         for i in 0..MAX_FUTURE_VOTE_AMOUNT_PER_BLOCK {
             assert!(!pool.is_at_capacity(&auth, true, true), "below the future cap (i={i})");
-            pool.insert(envelope(auth, 5_000 + i), 0, true);
+            pool.insert(envelope(auth, 5_000 + i), 0, true, true);
         }
         assert!(
             pool.is_at_capacity(&auth, true, true),
@@ -1595,11 +1622,67 @@ mod tests {
         let cur_target = B256::from([0x78; 32]);
         for i in 0..MAX_CUR_VOTE_AMOUNT_PER_BLOCK {
             assert!(!pool.is_at_capacity(&cur_target, false, false), "below the cap (i={i})");
-            pool.insert(envelope(cur_target, 1_000 + i), 0, false);
+            pool.insert(envelope(cur_target, 1_000 + i), 0, false, false);
         }
         assert!(
             pool.is_at_capacity(&cur_target, false, false),
             "current votes must stop at MAX_CUR_VOTE_AMOUNT_PER_BLOCK",
+        );
+    }
+
+    /// Unauthenticated votes must not consume the authenticated cap.
+    ///
+    /// The cap is selected by the incoming vote's authentication but was measured
+    /// against the whole bucket, so anything admitted while membership was
+    /// undecidable — every vote during startup, and around each validator-set
+    /// swap — counted toward it. An attacker could fill a target past the cap
+    /// with minted keys and have the first genuine validator vote for that target
+    /// refused; votes are broadcast once, so it is gone. Reported by Hashdit Bot
+    /// on #491.
+    #[test]
+    fn unauthenticated_future_votes_do_not_consume_the_authenticated_cap() {
+        let target = B256::from([0x7a; 32]);
+        let mut pool = VotePool::new();
+        let envelope = |unique: usize| {
+            let mut address = VoteAddress::default();
+            address[0] = (unique & 0xff) as u8;
+            address[1] = ((unique >> 8) & 0xff) as u8;
+            VoteEnvelope {
+                vote_address: address,
+                signature: VoteSignature::default(),
+                data: VoteData {
+                    source_number: 10,
+                    source_hash: B256::from([0x71; 32]),
+                    target_number: 11,
+                    target_hash: target,
+                },
+            }
+        };
+
+        // A flood admitted while the sender could not be authenticated: far past
+        // the cap, and correctly never refused.
+        for i in 0..(MAX_FUTURE_VOTE_AMOUNT_PER_BLOCK * 4) {
+            pool.insert(envelope(i), 0, true, false);
+        }
+        assert_eq!(
+            pool.future_votes.get(&target).map(|vm| vm.vote_messages.len()),
+            Some(MAX_FUTURE_VOTE_AMOUNT_PER_BLOCK * 4),
+        );
+
+        // A validator's vote for the same target must still be admitted.
+        assert!(
+            !pool.is_at_capacity(&target, true, true),
+            "an unauthenticated flood must not exhaust the authenticated cap",
+        );
+
+        // And the cap still applies to authenticated votes themselves.
+        for i in 0..MAX_FUTURE_VOTE_AMOUNT_PER_BLOCK {
+            assert!(!pool.is_at_capacity(&target, true, true), "below the cap (i={i})");
+            pool.insert(envelope(10_000 + i), 0, true, true);
+        }
+        assert!(
+            pool.is_at_capacity(&target, true, true),
+            "MAX_FUTURE_VOTE_AMOUNT_PER_BLOCK authenticated votes still close the bucket",
         );
     }
 
@@ -1632,6 +1715,7 @@ mod tests {
                     },
                     0,
                     true,
+                    false,
                 );
             }
         }
@@ -1868,8 +1952,8 @@ mod tests {
         let mut pool = VotePool::new();
         let accepted = future_vote(target, 100, 1);
         let rejected = future_vote(target, 100, 2);
-        pool.insert(accepted.clone(), 0, true);
-        pool.insert(rejected.clone(), 0, true);
+        pool.insert(accepted.clone(), 0, true, false);
+        pool.insert(rejected.clone(), 0, true, false);
 
         let applied = pool.apply_promotion(
             100,
@@ -1895,8 +1979,8 @@ mod tests {
         let mut pool = VotePool::new();
         let judged = future_vote(target, 100, 3);
         let latecomer = future_vote(target, 100, 4);
-        pool.insert(judged.clone(), 0, true);
-        pool.insert(latecomer.clone(), 0, true);
+        pool.insert(judged.clone(), 0, true, false);
+        pool.insert(latecomer.clone(), 0, true, false);
 
         // Verdicts were taken before `latecomer` arrived.
         let applied = pool.apply_promotion(100, &verdicts(target, &[(judged.hash(), true)]));
@@ -1926,9 +2010,9 @@ mod tests {
         let current = B256::from([0xa2; 32]);
         let ahead = B256::from([0xa3; 32]);
         let mut pool = VotePool::new();
-        pool.insert(future_vote(stale, 50, 5), 0, true);
-        pool.insert(future_vote(current, 100, 6), 0, true);
-        pool.insert(future_vote(ahead, 105, 7), 0, true);
+        pool.insert(future_vote(stale, 50, 5), 0, true, false);
+        pool.insert(future_vote(current, 100, 6), 0, true, false);
+        pool.insert(future_vote(ahead, 105, 7), 0, true, false);
 
         let mut got: Vec<(u64, bool, usize)> = pool
             .promotion_candidates(100)
@@ -1957,7 +2041,7 @@ mod tests {
             let mut vote = future_vote(target, 100, 0);
             // Distinct envelopes: `insert` dedups by hash.
             vote.vote_address[1..3].copy_from_slice(&(i as u16).to_be_bytes());
-            pool.insert(vote, 0, true);
+            pool.insert(vote, 0, true, false);
         }
 
         let candidates = pool.promotion_candidates(100);
@@ -1985,7 +2069,7 @@ mod tests {
         for i in 0..(MAX_PROMOTION_TARGETS_PER_PASS + 10) {
             let mut hash = [0xc0u8; 32];
             hash[0..2].copy_from_slice(&(i as u16).to_be_bytes());
-            pool.insert(future_vote(B256::from(hash), 100, 9), 0, true);
+            pool.insert(future_vote(B256::from(hash), 100, 9), 0, true, false);
         }
 
         assert_eq!(pool.promotion_candidates(100).len(), MAX_PROMOTION_TARGETS_PER_PASS);
@@ -2004,7 +2088,7 @@ mod tests {
         for i in 0..eligible {
             let mut hash = [0u8; 32];
             hash[0..4].copy_from_slice(&(i as u32).to_be_bytes());
-            pool.insert(future_vote(B256::from(hash), 100, 1), 0, true);
+            pool.insert(future_vote(B256::from(hash), 100, 1), 0, true, false);
         }
 
         let candidates = pool.promotion_candidates(100);
@@ -2028,7 +2112,7 @@ mod tests {
             let mut hash = [0u8; 32];
             hash[0..4].copy_from_slice(&(i as u32).to_be_bytes());
             // Spread across heights so ordering is meaningful.
-            pool.insert(future_vote(B256::from(hash), 50 + i as u64, 1), 0, true);
+            pool.insert(future_vote(B256::from(hash), 50 + i as u64, 1), 0, true, false);
         }
 
         let selected: Vec<u64> =
@@ -2072,7 +2156,7 @@ mod tests {
     fn apply_promotion_drops_queue_entries_whose_bucket_is_gone() {
         let target = B256::from([0xd1; 32]);
         let mut pool = VotePool::new();
-        pool.insert(future_vote(target, 100, 1), 0, true);
+        pool.insert(future_vote(target, 100, 1), 0, true, false);
         assert_eq!(pool.future_votes_pq.heap.len(), 1);
 
         // Simulate shedding having removed the bucket while its queue entry stays.
