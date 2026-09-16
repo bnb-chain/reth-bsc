@@ -53,7 +53,7 @@ pub struct BscCliArgs {
     #[arg(long = "mining.bid-block-enabled")]
     pub mining_bid_block_enabled: bool,
 
-    /// Port for the BEP-675 `BidBlockService` gRPC listener (default 8552).
+    /// Port for the BEP-675 `BidBlockService` gRPC listener (default 8552; zero uses default).
     ///
     /// Env alternative: `BSC_MEV_GRPC_PORT`.
     #[arg(long = "mining.mev-grpc-port")]
@@ -480,11 +480,6 @@ fn main() -> eyre::Result<()> {
             // port. The handle crosses the synchronous RPC-extension hook so it can be shut down
             // after the node exit future resolves.
             let mev_grpc_host = builder.config().rpc.http_addr;
-            if matches!(mev_grpc_config, Some((0, _))) {
-                return Err(eyre::eyre!(
-                    "MEV gRPC port must be nonzero; use --mev.grpc.disable to disable it"
-                ));
-            }
             let mev_grpc_handle = Arc::new(std::sync::Mutex::new(None));
             let mev_grpc_handle_for_rpc = Arc::clone(&mev_grpc_handle);
 

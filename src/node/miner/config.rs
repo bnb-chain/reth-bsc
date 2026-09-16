@@ -49,7 +49,7 @@ pub struct MiningConfig {
     /// Whether the `mev_sendBidBlock` RPC (BEP-675 builder-proposed blocks) is accepted.
     /// Off by default; enable with `--mining.bid-block-enabled` or `BSC_MINING_BID_BLOCK_ENABLED`.
     pub bid_block_enabled: bool,
-    /// BEP-675 gRPC listener port (default 8552).
+    /// BEP-675 gRPC listener port (default 8552); zero uses the default.
     pub mev_grpc_port: u16,
     /// Explicitly disable the BEP-675 gRPC transport.
     pub mev_grpc_disabled: bool,
@@ -147,9 +147,6 @@ impl Default for MiningConfig {
 impl MiningConfig {
     /// Validate the mining configuration
     pub fn validate(&self) -> Result<(), String> {
-        if self.is_mev_grpc_enabled() && self.mev_grpc_port == 0 {
-            return Err("MEV gRPC port must be nonzero; use --mev.grpc.disable to disable it".into());
-        }
         if !self.enabled {
             return Ok(());
         }
@@ -229,9 +226,13 @@ impl MiningConfig {
         self.bid_block_enabled
     }
 
-    /// Configured BEP-675 gRPC port; zero means disabled.
+    /// Effective BEP-675 gRPC port; zero uses the default, not an ephemeral port.
     pub fn get_mev_grpc_port(&self) -> u16 {
-        self.mev_grpc_port
+        if self.mev_grpc_port == 0 {
+            8552
+        } else {
+            self.mev_grpc_port
+        }
     }
 
     /// Transport configuration, independent of runtime pause and hardfork activation.
@@ -580,7 +581,7 @@ mod tests {
     }
 
     #[test]
-    fn mev_grpc_zero_port_rejected_only_when_enabled() {
+    fn mev_grpc_zero_port_uses_default_and_explicit_disable() {
         let mut config = MiningConfig {
             enabled: true,
             bid_block_enabled: true,
@@ -588,12 +589,21 @@ mod tests {
             private_key_hex: Some("01".repeat(32)),
             ..Default::default()
         };
-        assert!(config.validate().unwrap_err().contains("MEV gRPC port"));
+        assert!(config.validate().is_ok());
+        assert_eq!(config.get_mev_grpc_port(), 8552);
+        assert!(config.is_mev_grpc_enabled());
         config.mev_grpc_disabled = true;
         assert!(config.validate().is_ok());
-        config.mev_grpc_disabled = false;
-        config.enabled = false;
-        assert!(config.validate().is_ok());
+        assert!(!config.is_mev_grpc_enabled());
+        assert_eq!(config.get_mev_grpc_port(), 8552);
+    }
+
+    #[test]
+    fn mev_grpc_explicit_port_is_preserved() {
+        for port in [1, 8552, 9999, u16::MAX] {
+            let config = MiningConfig { mev_grpc_port: port, ..Default::default() };
+            assert_eq!(config.get_mev_grpc_port(), port);
+        }
     }
 
     #[test]
