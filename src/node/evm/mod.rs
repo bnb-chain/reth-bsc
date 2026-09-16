@@ -2,6 +2,8 @@ pub mod error;
 pub mod util;
 
 #[cfg(test)]
+mod cas20_seed_tests;
+#[cfg(test)]
 mod jenner_transition_tests;
 #[cfg(test)]
 mod pre_execution_tests;
