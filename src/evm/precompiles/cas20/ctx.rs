@@ -36,7 +36,7 @@ pub(crate) const CALLDATA_WORD_GAS: u64 = COPY_GAS + MEMORY_GAS;
 
 /// What a CAS20 call needs from the state: the journal, so every read warms and
 /// every write is checkpointed with the frame, plus the block fields it consults.
-pub(crate) trait Cas20State {
+pub trait Cas20State {
     fn sload(&mut self, address: Address, key: U256) -> Result<StateLoad<U256>, String>;
     fn sstore(
         &mut self,

@@ -12,6 +12,7 @@ pub(crate) mod asset;
 pub(crate) mod ctx;
 pub(crate) mod errors;
 pub(crate) mod factory;
+pub mod info;
 pub(crate) mod memo;
 pub(crate) mod metadata;
 pub mod observer;

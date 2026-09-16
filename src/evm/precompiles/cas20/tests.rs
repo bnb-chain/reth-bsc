@@ -1507,3 +1507,163 @@ mod golden {
         );
     }
 }
+
+// --- the token-info view ------------------------------------------------------------------
+
+/// The facade must answer exactly what the selectors answer at the same block
+/// (go-bsc's TestCAS20TokenInfoMatchesTheSelectors), and read the same through a
+/// state provider as through the frame host.
+mod info {
+    use super::super::{
+        info::{token_info_at, InfoError, ProviderHost, RPC_MAX_STRING_LEN},
+        sigs::*,
+        storage::{slot_at, SLOT_CONTRACT_URI},
+        *,
+    };
+    use super::{a, call_data, w, Harness, ADMIN, ALICE, BOB, NOW};
+    use alloy_primitives::{Address, Bytes, B256, U256, U64};
+    use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
+
+    #[test]
+    fn token_info_matches_the_selectors() {
+        let mut h = Harness::new();
+        let future = NOW + 3600;
+        let block_id = h
+            .call(ADMIN, POLICY_REGISTRY_ADDRESS, &call_data(SEL_CREATE_POLICY, &[a(ALICE), w(0)]))
+            .u256()
+            .to::<u64>();
+        let token = h.create(
+            ALICE,
+            VARIANT_ASSET,
+            100,
+            ALICE,
+            &[
+                call_data(SEL_GRANT_ROLE, &[ROLE_MINT, a(ALICE)]),
+                call_data(SEL_GRANT_ROLE, &[ROLE_OPERATOR, a(ALICE)]),
+                call_data(SEL_GRANT_ROLE, &[ROLE_PAUSE, a(ALICE)]),
+                call_data(SEL_MINT, &[a(ALICE), w(1000)]),
+                super::u8_array_call(SEL_PAUSE, &[super::super::token::PAUSE_BURN]),
+                call_data(
+                    SEL_UPDATE_UI_MULTIPLIER,
+                    &[B256::from(U256::from(2_000_000_000_000_000_000u64)), w(future)],
+                ),
+                call_data(SEL_UPDATE_POLICY, &[SCOPE_TRANSFER_RECEIVER, w(block_id)]),
+            ],
+        );
+
+        let info = token_info_at(&mut h.st, 714, token, NOW).expect("a token");
+        assert_eq!((info.variant, info.address), ("asset", token));
+        assert_eq!(info.name, "Test Token");
+        assert_eq!(info.symbol, "TT");
+        assert_eq!(info.contract_uri, "");
+        let sel = |h: &mut Harness, s: Selector| h.call(BOB, token, &call_data(s, &[])).u256();
+        assert_eq!(U256::from(info.decimals), sel(&mut h, SEL_DECIMALS));
+        assert_eq!(info.total_supply, sel(&mut h, SEL_TOTAL_SUPPLY));
+        assert_eq!(info.supply_cap, sel(&mut h, SEL_SUPPLY_CAP));
+        assert_eq!(info.multiplier, Some(sel(&mut h, SEL_MULTIPLIER)));
+        assert_eq!(info.total_supply_ui, Some(sel(&mut h, SEL_TOTAL_SUPPLY_UI)));
+        let pending = info.pending_multiplier.clone().expect("a live schedule");
+        assert_eq!(pending.value, sel(&mut h, SEL_NEW_UI_MULTIPLIER));
+        assert_eq!(U256::from(pending.effective_at), sel(&mut h, SEL_EFFECTIVE_AT));
+        assert_eq!(info.paused_features, vec![U64::from(2)]);
+        assert_eq!(
+            U256::from(info.policies.transfer_receiver),
+            h.call(BOB, token, &call_data(SEL_POLICY_ID, &[SCOPE_TRANSFER_RECEIVER])).u256()
+        );
+        assert_eq!(info.policies.transfer_receiver, U64::from(block_id));
+        assert_eq!(info.policies.transfer_sender, U64::ZERO);
+        assert_eq!(
+            info.domain_separator,
+            h.call(BOB, token, &call_data(SEL_DOMAIN_SEPARATOR, &[])).word()
+        );
+        assert!(info.currency.is_none());
+
+        // Past the schedule, with no transaction in between.
+        h.st.time = future;
+        let matured = token_info_at(&mut h.st, 714, token, future).unwrap();
+        assert_eq!(matured.multiplier, Some(U256::from(2_000_000_000_000_000_000u64)));
+        assert_eq!(matured.multiplier, Some(sel(&mut h, SEL_MULTIPLIER)));
+        assert!(matured.pending_multiplier.is_none());
+        assert_eq!(matured.total_supply_ui, Some(U256::from(2000)));
+
+        // Stablecoin: fixed decimals, a currency, no multiplier surface.
+        let stable = h.create(ALICE, VARIANT_STABLECOIN, 101, ALICE, &[]);
+        let s = token_info_at(&mut h.st, 714, stable, future).unwrap();
+        assert_eq!(
+            (s.variant, s.decimals, s.currency.as_deref()),
+            ("stablecoin", U64::from(6), Some("USD"))
+        );
+        assert!(
+            s.multiplier.is_none() && s.pending_multiplier.is_none() && s.total_supply_ui.is_none()
+        );
+
+        // The JSON shape: hex quantities, an empty list rather than null, the other
+        // variant's fields absent.
+        let json = serde_json::to_string(&info).unwrap();
+        for want in [
+            r#""decimals":"0x12""#,
+            r#""totalSupply":"0x3e8""#,
+            r#""pausedFeatures":["0x2"]"#,
+            r#""pendingMultiplier":{"value":"0x1bc16d674ec80000""#,
+            r#""contractURI":"""#,
+        ] {
+            assert!(json.contains(want), "asset JSON lacks {want}: {json}");
+        }
+        assert!(!json.contains("currency"));
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains(r#""currency":"USD""#) && json.contains(r#""pausedFeatures":[]"#));
+        for absent in ["multiplier", "totalSupplyUI", "pendingMultiplier"] {
+            assert!(!json.contains(absent), "stablecoin JSON carries {absent}");
+        }
+
+        // Not tokens: outside the space, the factory, an address never created.
+        for addr in [ALICE, FACTORY_ADDRESS, factory::derive_address(VARIANT_ASSET, BOB, w(0xee))] {
+            assert_eq!(
+                token_info_at(&mut h.st, 714, addr, NOW),
+                Err(InfoError::NotToken),
+                "{addr:?}"
+            );
+        }
+        // A length word no transaction could have paid for is refused, not walked.
+        h.st.set(token, slot_at(SLOT_CONTRACT_URI), U256::from(2 * (RPC_MAX_STRING_LEN + 32) + 1));
+        assert_eq!(token_info_at(&mut h.st, 714, token, NOW), Err(InfoError::StringTooLong));
+    }
+
+    /// The same answer through a state provider as through the frame host.
+    #[test]
+    fn a_provider_host_reads_what_the_frame_wrote() {
+        let mut h = Harness::new();
+        let token = h.create(
+            ALICE,
+            VARIANT_ASSET,
+            102,
+            ALICE,
+            &[
+                call_data(SEL_GRANT_ROLE, &[ROLE_MINT, a(ALICE)]),
+                call_data(SEL_MINT, &[a(BOB), w(77)]),
+            ],
+        );
+        let want = token_info_at(&mut h.st, 714, token, NOW).unwrap();
+
+        let provider = MockEthProvider::default();
+        for addr in h.st.coded_accounts().collect::<Vec<_>>() {
+            let storage: Vec<(B256, U256)> =
+                h.st.storage()
+                    .filter(|(at, _, _)| *at == addr)
+                    .map(|(_, k, v)| (B256::from(k), v))
+                    .collect();
+            provider.add_account(
+                addr,
+                ExtendedAccount::new(0, U256::ZERO)
+                    .with_bytecode(Bytes::from_static(&MARKER_CODE))
+                    .extend_storage(storage),
+            );
+        }
+        let mut host = ProviderHost { state: &provider, time: NOW, chain_id: 714 };
+        assert_eq!(token_info_at(&mut host, 714, token, NOW).unwrap(), want);
+        assert_eq!(
+            token_info_at(&mut host, 714, Address::repeat_byte(0x42), NOW),
+            Err(InfoError::NotToken)
+        );
+    }
+}
