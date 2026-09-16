@@ -44,6 +44,7 @@ use reth_evm::{
     system_calls::SystemCaller,
     Evm, FromRecoveredTx, FromTxWithEncoded, IntoTxEnv, OnStateHook,
 };
+use reth_primitives_traits::Recovered;
 use reth_provider::BlockExecutionResult;
 use revm::Database as _;
 use revm::{
@@ -576,6 +577,61 @@ where
     }
 }
 
+/// Payment-lane admission for producer-selected transactions.
+pub trait LaneAdmission {
+    /// `shared` is remaining gas, excluding system gas and any reserved pay-bid gas.
+    /// State-read errors must abort the build, not skip the transaction.
+    fn lane_admits_pool_tx(
+        &mut self,
+        tx: &Recovered<TransactionSigned>,
+        shared: u64,
+    ) -> Result<bool, BlockExecutionError>;
+}
+
+impl<E, Spec, R> BscBlockExecutor<'_, E, Spec, R>
+where
+    E: Evm<DB: alloy_evm::block::StateDB>,
+    Spec: EthChainSpec,
+    R: ReceiptBuilder,
+{
+    fn lane_admits(&self, tx: &TransactionSigned, lane_type: LaneType, shared: u64) -> bool {
+        if self.lane.admits(shared, lane_type, tx.gas_limit()) {
+            return true;
+        }
+        crate::metrics::LANE_METRICS.general_lane_yielded.increment(1);
+        debug!(
+            target: "bsc::payment_lane",
+            block = self.evm.block().number().to::<u64>(),
+            tx = %tx.hash(),
+            ?lane_type,
+            tx_gas_limit = tx.gas_limit(),
+            shared,
+            quota = self.lane.quota(),
+            idle = self.lane.idle_lane(),
+            "yielding the idle payment lane"
+        );
+        false
+    }
+}
+
+impl<E, Spec, R> LaneAdmission for BscBlockExecutor<'_, E, Spec, R>
+where
+    E: Evm<DB: alloy_evm::block::StateDB>,
+    Spec: EthChainSpec,
+    R: ReceiptBuilder,
+{
+    fn lane_admits_pool_tx(
+        &mut self,
+        tx: &Recovered<TransactionSigned>,
+        shared: u64,
+    ) -> Result<bool, BlockExecutionError> {
+        let signed = tx.inner();
+        let is_system = is_system_transaction(signed, tx.signer(), self.evm.block().beneficiary());
+        let lane_type = self.lane.clone().classify(self, is_system, signed).map_err(lane_reject)?;
+        Ok(self.lane_admits(signed, lane_type, shared))
+    }
+}
+
 impl<'a, E, Spec, R> BlockExecutor for BscBlockExecutor<'a, E, Spec, R>
 where
     E: Evm<
@@ -715,32 +771,17 @@ where
             (to, selector, input.len())
         };
 
-        // BEP-703's admission gate. Only where this node picks the transactions itself: a bid
-        // arrives with its set fixed and is ruled on whole, before finalization, instead.
-        //
-        // `InvalidTx` is the sentinel the producing loop already answers by dropping this
-        // transaction and the sender's later nonces; a capacity error would abort the build.
-        if self.ctx.mode == BscExecutionMode::Mining && self.lane.on() {
-            let shared = self.producer_shared_gas();
-            if !self.lane.admits(shared, lane_type, tx_gas_limit) {
-                crate::metrics::LANE_METRICS.general_lane_yielded.increment(1);
-                debug!(
-                    target: "bsc::payment_lane",
-                    block = block_number,
-                    tx = %tx_hash,
-                    ?lane_type,
-                    tx_gas_limit,
-                    shared,
-                    quota = self.lane.quota(),
-                    idle = self.lane.idle_lane(),
-                    "dropping a transaction that would eat into the reservation"
-                );
-                return Err(BlockValidationError::InvalidTx {
-                    hash: tx_hash,
-                    error: Box::new(InvalidTransaction::CallerGasLimitMoreThanBlock),
-                }
-                .into());
+        // Greedy merge checks admission before execution. Mining checks it here and returns
+        // InvalidTx so the pool loop skips this sender instead of aborting the build.
+        if self.ctx.mode == BscExecutionMode::Mining
+            && self.lane.on()
+            && !self.lane_admits(&tx_signed, lane_type, self.producer_shared_gas())
+        {
+            return Err(BlockValidationError::InvalidTx {
+                hash: tx_hash,
+                error: Box::new(InvalidTransaction::CallerGasLimitMoreThanBlock),
             }
+            .into());
         }
 
         precompiles::push_precompile_trace_context(
@@ -881,9 +922,7 @@ where
             }
         }
 
-        // A bid fixes its own transaction set, so the gate above never ran on it: hold the
-        // finished set to the same inequality once instead. Before finalization, so
-        // `producer_shared_gas` still means what it means on the packing side.
+        // Validate the complete bid before finalization consumes the system gas reservation.
         if self.ctx.mode == BscExecutionMode::BidSimulation {
             self.lane.verify_packed_bid(self.producer_shared_gas()).map_err(lane_reject)?;
         }

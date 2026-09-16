@@ -32,7 +32,7 @@ mod builder;
 pub mod config;
 pub use config::BscEvmConfig;
 mod executor;
-pub use executor::BscBlockExecutor;
+pub use executor::{BscBlockExecutor, LaneAdmission};
 mod factory;
 pub use factory::BscEvmFactory;
 mod patch;
