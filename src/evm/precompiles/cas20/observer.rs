@@ -4,8 +4,13 @@
 //! metrics observer exports the calls to Prometheus under `bsc.cas20`.
 
 use super::{Kind, VARIANT_ASSET};
-use metrics::{counter, histogram};
-use std::time::Duration;
+use metrics::{counter, histogram, Counter, Histogram};
+use std::{
+    collections::HashMap,
+    hash::Hash,
+    sync::{LazyLock, RwLock},
+    time::Duration,
+};
 
 /// How a call ended, as the EVM sees it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,34 +78,86 @@ impl Cas20Observer for NoopObserver {
     const ENABLED: bool = false;
 }
 
-/// Exports every call to Prometheus.
+/// Exports every call to Prometheus. The label space is bounded (five kinds, the
+/// selector table, four statuses), so every handle is registered once and kept:
+/// the recorder's per-call registry lookup and label allocation are paid only
+/// the first time a combination is seen.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MetricsObserver;
+
+type Labels = (&'static str, &'static str, &'static str);
+type GasHandles = (Histogram, Histogram);
+
+struct Handles {
+    calls: RwLock<HashMap<Labels, Counter>>,
+    gas: RwLock<HashMap<(&'static str, &'static str), GasHandles>>,
+    internal_calls: RwLock<HashMap<&'static str, (Counter, Counter)>>,
+    sloads: Counter,
+    sstores: Counter,
+    keccaks: Counter,
+    created_asset: Counter,
+    created_stablecoin: Counter,
+}
+
+static HANDLES: LazyLock<Handles> = LazyLock::new(|| Handles {
+    calls: RwLock::default(),
+    gas: RwLock::default(),
+    internal_calls: RwLock::default(),
+    sloads: counter!("bsc.cas20.storage_ops_total", "op" => "sload"),
+    sstores: counter!("bsc.cas20.storage_ops_total", "op" => "sstore"),
+    keccaks: counter!("bsc.cas20.storage_ops_total", "op" => "keccak"),
+    created_asset: counter!("bsc.cas20.tokens_created_total", "variant" => "asset"),
+    created_stablecoin: counter!("bsc.cas20.tokens_created_total", "variant" => "stablecoin"),
+});
+
+/// Looks a handle up under the read lock, registering it under the write lock the
+/// first time only.
+fn cached<K: Copy + Eq + Hash, V: Clone>(
+    map: &RwLock<HashMap<K, V>>,
+    key: K,
+    make: impl FnOnce() -> V,
+) -> V {
+    if let Some(v) = map.read().unwrap().get(&key) {
+        return v.clone();
+    }
+    map.write().unwrap().entry(key).or_insert_with(make).clone()
+}
 
 impl Cas20Observer for MetricsObserver {
     fn record_call(&self, call: &CallRecord) {
         let (kind, selector) = (call.kind.name(), call.selector);
-        counter!("bsc.cas20.calls_total", "kind" => kind, "selector" => selector, "status" => call.status.label())
-            .increment(1);
-        histogram!("bsc.cas20.call_gas_used", "kind" => kind, "selector" => selector)
-            .record(call.gas_used as f64);
+        let h = &*HANDLES;
+        cached(&h.calls, (kind, selector, call.status.label()), || {
+            counter!("bsc.cas20.calls_total", "kind" => kind, "selector" => selector, "status" => call.status.label())
+        })
+        .increment(1);
+        let (gas, duration) = cached(&h.gas, (kind, selector), || {
+            (
+                histogram!("bsc.cas20.call_gas_used", "kind" => kind, "selector" => selector),
+                histogram!("bsc.cas20.call_duration_seconds", "kind" => kind, "selector" => selector),
+            )
+        });
+        gas.record(call.gas_used as f64);
         if let Some(elapsed) = call.elapsed {
-            histogram!("bsc.cas20.call_duration_seconds", "kind" => kind, "selector" => selector)
-                .record(elapsed.as_secs_f64());
+            duration.record(elapsed.as_secs_f64());
         }
         let s = call.stats;
-        counter!("bsc.cas20.storage_ops_total", "op" => "sload").increment(s.sloads as u64);
-        counter!("bsc.cas20.storage_ops_total", "op" => "sstore").increment(s.sstores as u64);
-        counter!("bsc.cas20.storage_ops_total", "op" => "keccak").increment(s.keccaks as u64);
+        h.sloads.increment(s.sloads as u64);
+        h.sstores.increment(s.sstores as u64);
+        h.keccaks.increment(s.keccaks as u64);
         if s.internal_calls > 0 {
-            counter!("bsc.cas20.internal_calls_total", "kind" => kind)
-                .increment(s.internal_calls as u64);
-            counter!("bsc.cas20.internal_call_bytes_total", "kind" => kind)
-                .increment(s.internal_call_bytes);
+            let (calls, bytes) = cached(&h.internal_calls, kind, || {
+                (
+                    counter!("bsc.cas20.internal_calls_total", "kind" => kind),
+                    counter!("bsc.cas20.internal_call_bytes_total", "kind" => kind),
+                )
+            });
+            calls.increment(s.internal_calls as u64);
+            bytes.increment(s.internal_call_bytes);
         }
         if let Some(variant) = s.created {
-            let variant = if variant == VARIANT_ASSET { "asset" } else { "stablecoin" };
-            counter!("bsc.cas20.tokens_created_total", "variant" => variant).increment(1);
+            if variant == VARIANT_ASSET { &h.created_asset } else { &h.created_stablecoin }
+                .increment(1);
         }
     }
 }
