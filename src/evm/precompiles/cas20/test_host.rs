@@ -118,7 +118,10 @@ impl MockHost {
 }
 
 impl Cas20State for MockHost {
+    // Touching a slot warms its account too, as the journal and go-bsc's access
+    // list both do.
     fn sload(&mut self, address: Address, key: U256) -> Result<StateLoad<U256>, String> {
+        self.now.warm_addrs.insert(address);
         let is_cold = self.now.warm_slots.insert((address, key));
         Ok(StateLoad::new(self.get(address, key), is_cold))
     }
@@ -129,6 +132,7 @@ impl Cas20State for MockHost {
         key: U256,
         value: U256,
     ) -> Result<StateLoad<SStoreResult>, String> {
+        self.now.warm_addrs.insert(address);
         let is_cold = self.now.warm_slots.insert((address, key));
         let original_value = self.original.get(&(address, key)).copied().unwrap_or_default();
         let present_value = self.get(address, key);
@@ -145,6 +149,7 @@ impl Cas20State for MockHost {
     }
 
     fn set_code(&mut self, address: Address, code: Bytecode) -> Result<(), String> {
+        self.now.warm_addrs.insert(address);
         self.now.code_hash.insert(address, code.hash_slow());
         Ok(())
     }
@@ -184,7 +189,10 @@ pub(crate) struct CallResult {
 }
 
 /// Runs one call against the host, as a frame would: a failed call leaves no
-/// trace, a successful one keeps its writes, logs and warmth.
+/// trace, a successful one keeps its writes, logs and warmth. The callee is not
+/// warmed on entry — that is the CALL opcode's or the transaction's doing, and
+/// go-bsc's `evm.Call` harness, which the golden trace was recorded with, does
+/// not do it either.
 pub(crate) fn run_call(host: &mut MockHost, spec: CallSpec, input: &[u8]) -> CallResult {
     let kind = resolve(spec.to).expect("a routed address");
     host.checkpoint();
