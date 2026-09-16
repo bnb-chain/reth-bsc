@@ -1,7 +1,4 @@
-//! One block's lane, and the only surface the rest of the node talks to — go-bsc's
-//! `core/payment_lane.go`. [`LaneState::resolve`] once per block, [`LaneState::classify`] and
-//! [`LaneState::record_used`] per transaction, [`LaneState::verify`] on the finished block; a
-//! producer also gates on [`LaneState::admits`] or [`LaneState::verify_packed_bid`].
+//! Per-block metadata, transaction admission/accounting and final validation.
 
 use super::{
     meta::{self, LaneMeta},
@@ -10,9 +7,7 @@ use super::{
 use alloy_consensus::Transaction;
 use alloy_primitives::BlockHash;
 
-/// `None` is "the lane does not bind here" — before Jenner, and on the activation block, whose
-/// parent is still pre-fork. Every verb then answers as if switched off, so no call site branches
-/// on it; go-bsc gets the same from a nil-safe `*LaneState` plus `On()`.
+/// An inactive lane imposes no restrictions, including on the Jenner activation block.
 #[derive(Clone, Debug, Default)]
 pub struct LaneState(Option<Active>);
 
@@ -20,22 +15,16 @@ pub struct LaneState(Option<Active>);
 struct Active {
     meta: LaneMeta,
     budget: Budget,
-    /// The quota came from it, and the verdict is against it.
     gas_limit: u64,
 }
 
 impl LaneState {
-    /// The lane switched off.
     pub const fn off() -> Self {
         Self(None)
     }
 
-    /// Reads `0x2007` as of the parent's post-state and derives this block's quota.
-    ///
-    /// Gate on the **parent** being Jenner-active: the fork installs `0x2007` while the activation
-    /// block executes, so `activation + 1` is the first block that reserves. `gas_limit` is
-    /// **this** block's, and the sealed one rather than the miner's reservation-adjusted one —
-    /// producer and importer must derive the same number.
+    /// Loads parent metadata and derives quota from this block's full gas limit, before reserves.
+    /// The caller must gate on the parent being Jenner-active.
     pub fn resolve(
         access: &mut impl LaneParentState,
         parent_hash: BlockHash,
@@ -52,10 +41,7 @@ impl LaneState {
         self.0.is_some()
     }
 
-    /// Which lane this transaction's gas is booked against; `GeneralLane` while the lane is off.
-    ///
-    /// `live` must be the state as execution has reached this transaction, never the parent
-    /// post-state the config came from — see [`LaneLiveState`].
+    /// Classifies using parent membership and live code; returns general while inactive.
     pub fn classify(
         &self,
         live: &mut impl LaneLiveState,
@@ -68,30 +54,21 @@ impl LaneState {
         })
     }
 
-    /// Books `delta` gas against `lane`.
-    ///
-    /// go-bsc's `RecordUsedFrom(lane, gasPool, usedBefore)` subtracts a running total because
-    /// geth's `GasPool` is what its executor mutates; here `delta` is the transaction's own gas.
+    /// Books this transaction's gas, not a cumulative total.
     pub fn record_used(&mut self, lane: LaneType, delta: u64) {
         if let Some(active) = self.0.as_mut() {
             active.budget.record_used(lane, delta);
         }
     }
 
-    /// Whether one more transaction fits, with `shared` the producer's remaining pool. Always
-    /// true while the lane is off.
+    /// Checks a transaction's declared gas against the remaining producer pool; true if inactive.
     pub fn admits(&self, shared: u64, lane: LaneType, tx_gas_limit: u64) -> bool {
         self.0.as_ref().is_none_or(|a| a.budget.admits(shared, lane, tx_gas_limit))
     }
 
-    /// `idle <= shared` — the invariant [`Self::admits`] maintains transaction by transaction,
-    /// asserted once over a set the BEP-322 builder fixed and the producer never got to filter.
-    /// Runs before finalization.
-    ///
-    /// `shared` is the producer's remaining pool (`GasLimit - reserved - used`), as in
-    /// [`Self::admits`] — not the header's gas used, which would hand the bid whatever the system
-    /// reservation left unspent. Spelled out rather than `admits(shared, GeneralLane, 0)`, which
-    /// is vacuous: a zero-gas transaction fits the zero allowance `admits` saturates to.
+    /// Checks the complete bid, including pool additions, before finalization.
+    /// `shared` excludes system reserves. Unlike `admits(shared, GeneralLane, 0)`,
+    /// this rejects an idle reservation larger than the remaining pool.
     pub fn verify_packed_bid(&self, shared: u64) -> Result<(), LaneError> {
         match self.0.as_ref() {
             Some(a) if a.budget.idle_lane() > shared => {
@@ -101,8 +78,7 @@ impl LaneState {
         }
     }
 
-    /// The verdict on a finished block. `gas_used` must be the header's total, so Parlia's
-    /// system gas counts as general. Always `Ok` while the lane is off.
+    /// Checks total block gas, including system gas as general; succeeds if inactive.
     pub fn verify(&self, gas_used: u64) -> Result<(), LaneError> {
         match self.0.as_ref() {
             Some(a) => a.budget.verify(a.gas_limit, gas_used),
@@ -118,14 +94,12 @@ impl LaneState {
         }
     }
 
-    /// Test-only: an active lane without reading `0x2007`.
     #[cfg(test)]
-    pub fn for_test(meta: LaneMeta, budget: Budget, gas_limit: u64) -> Self {
+    pub(crate) fn for_test(meta: LaneMeta, budget: Budget, gas_limit: u64) -> Self {
         Self(Some(Active { meta, budget, gas_limit }))
     }
 
-    /// This and the four accessors below are the diagnostics: nothing about the reservation
-    /// reaches the header, so two nodes disagreeing can only be compared on these.
+    /// Gas reserved for payment transactions.
     pub fn quota(&self) -> u64 {
         self.0.as_ref().map_or(0, |a| a.budget.payment_lane_quota)
     }
@@ -155,19 +129,12 @@ impl LaneState {
 mod tests {
     use super::*;
     use alloy_consensus::TxLegacy;
-    use alloy_primitives::{Address, Bytes};
+    use alloy_primitives::Address;
 
     struct NoLiveReads;
     impl LaneLiveState for NoLiveReads {
         fn lane_code_is_empty(&mut self, _: Address) -> Result<bool, LaneError> {
             panic!("the code gate must not run")
-        }
-    }
-
-    struct NoParentReads;
-    impl LaneParentState for NoParentReads {
-        fn call_lane_getter(&mut self, _: Address, _: Bytes) -> Result<Bytes, LaneError> {
-            panic!("the getter must not run")
         }
     }
 
@@ -179,8 +146,6 @@ mod tests {
         }))
     }
 
-    /// Every verb has to answer for a lane that does not bind, or each call site grows its own
-    /// pre-Jenner branch and they drift.
     #[test]
     fn an_off_lane_answers_every_verb() {
         let mut off = LaneState::off();
@@ -196,30 +161,25 @@ mod tests {
         assert_eq!(off.verify(u64::MAX), Ok(()));
         off.inherit_to(BlockHash::ZERO);
         assert_eq!((off.quota(), off.idle_lane(), off.ratio(), off.listed_len()), (0, 0, 0, 0));
-        let _ = NoParentReads; // `resolve` is the one verb an off lane cannot answer.
     }
 
-    /// The bid verdict and the per-transaction gate are one inequality.
     #[test]
     fn a_bid_is_held_to_the_per_transaction_invariant() {
         let lane = active(1_500_000, 21_000, 30_000_000);
         assert_eq!(lane.idle_lane(), 1_479_000);
 
-        // Exactly the reservation left is still leaving it alone; one gas less is not.
         assert_eq!(lane.verify_packed_bid(1_479_000), Ok(()));
         assert_eq!(
             lane.verify_packed_bid(1_478_999),
             Err(LaneError::BidEatsReservation { idle: 1_479_000, shared: 1_478_999 })
         );
 
-        // Agrees with the gate wherever the gate is not vacuous, so a bid and a locally packed
-        // block face the same ceiling.
+        // Admission implies the bid invariant, except for a zero-gas transaction.
         for shared in [0u64, 1, 21_000, 1_478_999, 1_479_000, 1_500_000, u64::MAX] {
             if lane.admits(shared, LaneType::GeneralLane, 1) {
                 assert!(lane.verify_packed_bid(shared).is_ok(), "shared={shared}");
             }
             assert_eq!(lane.verify_packed_bid(shared).is_ok(), lane.idle_lane() <= shared);
-            // And why the zero-gas spelling of the same question would not do.
             assert!(lane.admits(shared, LaneType::GeneralLane, 0));
         }
     }

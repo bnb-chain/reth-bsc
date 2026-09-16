@@ -297,8 +297,7 @@ where
 
         self.verify_cascading_fields(&header, &parent_header, &snap)?;
 
-        // Nothing about the lane is in the header to check; the verdict is the accounting rule,
-        // reached in `post_check_new_block` once every transaction has run.
+        // Initialize before execution; validate total gas in `post_check_new_block`.
         self.init_payment_lane(&parent_header, header.gas_limit)?;
 
         let epoch_length = snap.epoch_num;
@@ -445,13 +444,8 @@ where
         view_call_output(to, &data, result_and_state.result)
     }
 
-    /// Derives this block's lane from the parent's ratio and this block's `gas_limit`.
-    ///
-    /// Gated on the PARENT: the ratio comes from its post-state, and Jenner installs `0x2007`
-    /// while its activation block executes, so `activation + 1` is the first block that reserves.
-    ///
-    /// Must run before this block mutates state — see [`LaneParentState`], which is what refuses
-    /// a late read.
+    /// Initialize before state changes. Jenner installs `0x2007` on activation, so the lane
+    /// starts in its child; gate on the parent and use this block's full gas limit.
     fn init_payment_lane(
         &mut self,
         parent: &Header,
@@ -460,7 +454,6 @@ where
         if !self.spec.is_jenner_active_at_timestamp(parent.number, parent.timestamp) {
             return Ok(());
         }
-        // Read before the call: `resolve` borrows the executor as the parent state.
         let (block, parent_hash) = (parent.number + 1, self.ctx.base.parent_hash);
         let producing =
             matches!(self.ctx.mode, BscExecutionMode::Mining | BscExecutionMode::BidSimulation);
@@ -818,9 +811,6 @@ where
     }
 
     /// prepare some intermediate data for produce new block.
-    ///
-    /// Only reached when this node authors the header, so the guards below need only exclude
-    /// [`BscExecutionMode::Simulation`].
     pub(crate) fn prepare_new_block(
         &mut self, 
         block: &BlockEnv
@@ -846,8 +836,7 @@ where
             self.inner_ctx.snap = Some(snap.clone());
         }
 
-        // `block.gas_limit()` is the sealed limit, not the miner's system-tx-reserved one, so
-        // producer and importer derive the same quota.
+        // Use the full block limit, before subtracting producer reserves.
         if self.ctx.mode != BscExecutionMode::Simulation {
             self.init_payment_lane(&parent_header, block.gas_limit())?;
         }
@@ -907,12 +896,7 @@ where
     }
 }
 
-/// The parent post-state, the view [`LaneState::resolve`] reads `0x2007` through.
-///
-/// The "must run before this block mutates state" rule lives here and nowhere else: it is this
-/// implementation's promise to keep, not something the lane could check for itself. A late read
-/// would take the ratio and the list from a state this block already changed, and then be cached
-/// under the parent hash for every sibling block to inherit.
+/// Reject late reads to avoid caching this block's mutations under its parent's hash.
 impl<'a, EVM, Spec, R: ReceiptBuilder> LaneParentState for BscBlockExecutor<'a, EVM, Spec, R>
 where
     EVM: Evm<
@@ -937,16 +921,14 @@ where
         }
 
         let tx_env = view_call_tx_env(to, data, GETTER_GAS_LIMIT, self.spec.chain().id());
-        // A revert or a halt is a verdict on the block, so it comes back as `CorruptConfig`; only
-        // a `transact` error is a local fault, and there the executor must not be reused.
+        // Execution errors abort validation locally; getter reverts/halts indicate bad config.
         let result = self
             .evm
             .transact(tx_env.into_tx_env())
             .map_err(|err| LaneError::StateUnavailable(err.to_string()))?
             .result;
 
-        // The reason only: this string reaches the consensus layer, and return data can run to
-        // megabytes.
+        // Report the reason without retaining potentially large return data.
         let reason = match result {
             ExecutionResult::Success { output, .. } => {
                 let data = output.into_data();

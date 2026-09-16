@@ -188,7 +188,6 @@ where
                     header.number, header.hash_slow(), epoch_length, turn_length);
             }
         }
-        
         self.verify_payment_lane(self.gas_used)?;
 
         tracing::trace!("Succeed to finalize new block, block_number: {}", block.number());

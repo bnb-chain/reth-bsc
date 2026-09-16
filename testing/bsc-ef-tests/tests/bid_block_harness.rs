@@ -628,12 +628,8 @@ fn execution_gate_round_trip() {
     assert_eq!(computed_root, reference_root);
 }
 
-/// A Jenner test chain: Jenner at timestamp 6, and `0x2007` carrying a governed
-/// `_paymentLaneRatio` of 1000 (10%, the maximum) in slot 0 — an unset slot would instead read as
-/// the getter's own 500 default.
-///
-/// 30M gas, not mainnet's 55M, so the general lane's admission boundary lands below EIP-7825's
-/// 2^24 per-transaction cap; at 55M no single transaction could probe it.
+/// Jenner at timestamp 6, with a governed 10% ratio in slot 0.
+/// The 30M gas limit puts the admission boundary below EIP-7825's per-transaction cap.
 fn jenner_lane_chain_spec() -> Arc<BscChainSpec> {
     use reth_bsc::hardforks::bsc::BscHardfork;
 
@@ -670,11 +666,7 @@ fn jenner_lane_chain_spec() -> Arc<BscChainSpec> {
         (BscHardfork::Cancun.boxed(), ForkCondition::Timestamp(0)),
         (BscHardfork::Jenner.boxed(), ForkCondition::Timestamp(6)),
     ]);
-    let genesis_header = {
-        let header = make_genesis_header(&genesis, &hardforks);
-        let hash = header.hash_slow();
-        SealedHeader::new(header, hash)
-    };
+    let genesis_header = SealedHeader::seal_slow(make_genesis_header(&genesis, &hardforks));
     let spec = ChainSpec {
         chain: Chain::from_named(NamedChain::BinanceSmartChain),
         genesis,
@@ -686,9 +678,7 @@ fn jenner_lane_chain_spec() -> Arc<BscChainSpec> {
     Arc::new(BscChainSpec::from(spec))
 }
 
-/// Builds and re-imports a four-block chain across Jenner: nothing about the lane is in the
-/// header, so producer and importer agree only if both read `0x2007` at the same point and run
-/// the same arithmetic. Also pins that the admission gate is live on a post-fork block.
+/// Build/import across activation, with post-fork general/payment admission probes.
 #[test]
 fn jenner_payment_lane_chain_round_trips() {
     use alloy_consensus::{TxLegacy, EMPTY_OMMER_ROOT_HASH};
@@ -726,8 +716,7 @@ fn jenner_payment_lane_chain_round_trips() {
         SealedHeader::new(chain_spec.genesis_header().clone(), chain_spec.genesis_hash());
     let mut parent_snap = genesis_snapshot(chain_spec.clone());
 
-    // A transfer to a fresh address with no code, so `value` alone decides the lane: non-zero is
-    // a payment, zero can never be a bare transfer.
+    // Fresh destinations: non-zero value is payment, zero is general.
     let tx = |nonce: u64, gas_limit: u64, value: u64| {
         sign_system_transaction(
             TxLegacy {
@@ -747,7 +736,7 @@ fn jenner_payment_lane_chain_round_trips() {
     };
     let (payment, general) = (1u64, 0u64);
 
-    // Block 1 is pre-fork; blocks 3 and 4 each carry one payment transaction.
+    // Two pre-lane blocks, then payment traffic and admission probes.
     let payments_per_block = [0usize, 0, 1, 1];
 
     for (i, &payments) in payments_per_block.iter().enumerate() {
@@ -774,7 +763,6 @@ fn jenner_payment_lane_chain_round_trips() {
                     slot_number: None,
                 },
                 mode: BscExecutionMode::Mining,
-                // Second-granularity fixture timestamps, matching the other harness sites.
                 milli_remainder: 0,
                 validator_cache_sink: None,
                 turn_length_sink: None,
@@ -791,28 +779,21 @@ fn jenner_payment_lane_chain_round_trips() {
                 &TEST_VALIDATOR,
             )
             .expect("read validator account")
-            .map(|a| a.nonce)
-            .unwrap_or(0);
+            .map_or(0, |a| a.nonce);
             for nonce in start_nonce..start_nonce + payments as u64 {
                 builder
                     .execute_transaction(tx(nonce, 21_000, payment))
                     .unwrap_or_else(|e| panic!("execute payment in block {number}: {e:?}"));
             }
-            // The admission gate, probed at the one gas limit that separates the two lanes.
-            // Here `shared` is 30M − 20M reserved for system txs − 21k already burned =
-            // 9,979,000 and the idle reservation is 3M − 21k = 2,979,000, so general tops out at
-            // exactly 7M. A declared 8M sits above that but below both `shared` and EIP-7825's
-            // cap, so only the reservation can refuse it — and the same declaration on the
-            // payment side must still be admitted. Probing both lanes at one gas limit is what
-            // keeps this independent of the system-tx reserve.
+            // Shared = 30M - 20M system reserve - 21k; idle = 3M - 21k. General gets 7M.
+            // An 8M declaration exceeds general's allowance, but fits payment and EIP-7825.
             if number > 2 {
                 const BAND: u64 = 8_000_000;
                 let nonce = start_nonce + payments as u64;
                 let refused = builder
                     .execute_transaction(tx(nonce, BAND, general))
                     .expect_err("a general tx that would eat the reservation must be refused");
-                // The exact sentinel: EIP-7825's per-transaction cap is also an InvalidTx, so a
-                // probe that accepted either would pass with the lane doing nothing.
+                // Distinguish lane rejection from EIP-7825, which also returns InvalidTx.
                 assert!(
                     format!("{refused:?}").contains("CallerGasLimitMoreThanBlock"),
                     "expected the lane's own drop, got {refused:?}"
@@ -841,11 +822,9 @@ fn jenner_payment_lane_chain_round_trips() {
 
         let header = block.header().clone();
         assert_eq!(header.number, number);
-        // The lane changes no header field, in layout or in meaning.
         assert_eq!(header.ommers_hash, EMPTY_OMMER_ROOT_HASH, "block {number} ommers_hash");
 
-        // System transactions consume no gas in this fixture, so the only gas is 21k per
-        // transfer — the probe that got through declares 8M but burns the intrinsic cost.
+        // System gas is zero in this fixture; even the 8M probe burns only 21k.
         let probe = if number > 2 { 1 } else { 0 };
         assert_eq!(
             header.gas_used,
@@ -853,7 +832,6 @@ fn jenner_payment_lane_chain_round_trips() {
             "block {number} gas_used"
         );
 
-        // Advance every piece of state the next block needs, then re-import this one.
         let sealed = SealedHeader::new(header.clone(), header.hash_slow());
         shared_header_provider().add_header(sealed.hash(), header.clone());
         let mut snap = parent_snap.clone();

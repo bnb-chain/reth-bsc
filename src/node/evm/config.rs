@@ -61,8 +61,8 @@ pub enum BscExecutionMode {
     Import,
     /// Producing a block this validator picks the transactions for, then signs and broadcasts.
     Mining,
-    /// Simulating a BEP-322 MEV bid: signs and finalizes like [`Self::Mining`], but the builder
-    /// fixed the transaction set.
+    /// Runs a fixed bid with Parlia finalization. Optional pool additions require explicit
+    /// admission, separate from the builder's fixed transactions.
     BidSimulation,
     /// Answering a hypothetical (`eth_simulateV1`, local pending block): authors a header, but
     /// runs no Parlia finalization and signs nothing.
@@ -78,12 +78,8 @@ pub enum BscExecutionMode {
 #[derive(Debug, Clone)]
 pub struct BscNextBlockEnvAttributes {
     pub inner: NextBlockEnvAttributes,
-    /// Execution mode for the block built from these attributes.
-    ///
-    /// Defaults to [`BscExecutionMode::Simulation`] via [`BuildPendingEnv`], which is the
-    /// entry point reth uses for `eth_simulateV1` and the local pending block. The miner and
-    /// bid simulator construct this struct literally and must set
-    /// [`BscExecutionMode::Mining`] explicitly.
+    /// [`BuildPendingEnv`] defaults to simulation. Producers must explicitly select
+    /// [`BscExecutionMode::Mining`] or [`BscExecutionMode::BidSimulation`].
     pub mode: BscExecutionMode,
     /// Sink for transporting `current_validators` from builder to payload layer without writing
     /// to VALIDATOR_CACHE prematurely (hash not yet final at build time).

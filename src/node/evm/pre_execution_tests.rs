@@ -628,13 +628,10 @@ mod parent_block_env {
         executor
     }
 
-    /// One touched account, the shape a commit takes.
     fn touched(address: Address) -> revm::state::EvmState {
         let mut account = revm::state::Account::from(revm::state::AccountInfo::default());
         account.mark_touch();
-        let mut state = revm::state::EvmState::default();
-        state.insert(address, account);
-        state
+        revm::state::EvmState::from_iter([(address, account)])
     }
 
     #[test]
@@ -701,9 +698,6 @@ mod parent_block_env {
         );
     }
 
-    /// A late read would take the ratio and the list from a state this block already changed,
-    /// then cache that answer under the parent hash for every sibling block to inherit. The
-    /// refusal belongs to the parent-state accessor, so `resolve` inherits it for free.
     #[test]
     fn lane_meta_refuses_to_read_a_mutated_state() {
         use crate::consensus::payment_lane::state::LaneState;

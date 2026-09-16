@@ -1,10 +1,9 @@
-//! The lane arithmetic and the gates — go-bsc `core/paymentlane`.
+//! Payment-lane classification, admission and gas accounting.
 
 use super::{Budget, LaneError, LaneType, MAX_LANE_RATIO, RATIO_DENOM};
 use alloy_primitives::{map::HashSet, Address, U256};
 
-/// Guards at the getter's full `uint256` width: a value narrowed to 64 bits first can land inside
-/// the bound when the value returned did not.
+/// Validates the ratio without truncating the getter's `uint256` value.
 pub fn check_ratio(ratio: U256) -> Result<u64, LaneError> {
     match u64::try_from(ratio) {
         Ok(narrowed) if narrowed > 0 && narrowed <= MAX_LANE_RATIO => Ok(narrowed),
@@ -14,19 +13,14 @@ pub fn check_ratio(ratio: U256) -> Result<u64, LaneError> {
     }
 }
 
-/// In 128 bits: at the maximum ratio a `2^63` gas limit makes a 73-bit product, which a 64-bit
-/// multiply would wrap.
+/// Uses a 128-bit product to avoid overflow before division.
 pub fn quota(ratio: u64, gas_limit: u64) -> u64 {
     u64::try_from(ratio as u128 * gas_limit as u128 / RATIO_DENOM as u128).unwrap_or_else(|_| {
         panic!("quota overflowed u64: ratio {ratio} gas_limit {gas_limit} denom {RATIO_DENOM}")
     })
 }
 
-/// The block validity rule. `gas_used` must be the header's total, so Parlia's system gas counts
-/// as general.
-///
-/// Checked, not saturating: at `gas_limit == u64::MAX` a saturating sum compares equal and would
-/// admit a block that overflowed.
+/// Checks total block gas plus idle quota. System gas is general; overflow is a violation.
 pub fn check_inequality(
     gas_limit: u64,
     gas_used: u64,
@@ -45,10 +39,7 @@ pub fn check_inequality(
     }
 }
 
-/// Every gate, in consensus order, so no call site can implement half the rule.
-///
-/// `code_at_to_is_empty` must read live state and count an absent account as empty — see
-/// [`super::LaneLiveState`].
+/// Applies the classification gates in order. Absent accounts count as having empty code.
 pub fn classify(
     is_system: bool,
     to: Option<Address>,
@@ -57,17 +48,16 @@ pub fn classify(
     listed: &HashSet<Address>,
     code_at_to_is_empty: impl FnOnce(Address) -> Result<bool, LaneError>,
 ) -> Result<LaneType, LaneError> {
-    // Consensus mechanics, not user traffic. First, because a `deposit` passes the payment gates.
+    // System deposits may otherwise pass the payment gates.
     if is_system {
         return Ok(LaneType::GeneralLane);
     }
     let Some(to) = to else { return Ok(LaneType::GeneralLane) };
-    // The code gate cannot see code that the transaction's own set-code authorisation installs.
+    // Exclude blob and set-code transactions before checking membership or code.
     if !matches!(tx_type, 0x00..=0x02) {
         return Ok(LaneType::GeneralLane);
     }
-    // From the parent post-state, so it answers before the live-state gates below: one
-    // transaction's lane must not depend on two views.
+    // Membership uses parent post-state; the code probe below uses live state.
     if listed.contains(&to) {
         return Ok(LaneType::PaymentLane);
     }
@@ -87,9 +77,7 @@ impl Budget {
         self.payment_lane_quota.saturating_sub(self.payment_lane_used)
     }
 
-    /// The largest gas limit a *single* transaction of this lane may declare, with `shared` the
-    /// gas still available to any lane. Payment may take the whole remainder; general must leave
-    /// the idle reservation untouched.
+    /// Maximum declared gas: payment may use all remaining gas; general must leave idle quota.
     pub fn max_available_gas(&self, shared: u64, lane: LaneType) -> u64 {
         match lane {
             LaneType::PaymentLane => shared,
@@ -109,7 +97,7 @@ impl Budget {
         }
     }
 
-    /// This budget held to [`check_inequality`].
+    /// Checks the accumulated budget against the block rule.
     pub fn verify(&self, gas_limit: u64, gas_used: u64) -> Result<(), LaneError> {
         check_inequality(gas_limit, gas_used, self.payment_lane_used, self.payment_lane_quota)
     }
@@ -149,7 +137,6 @@ mod tests {
             let got = budget(20, payment).verify(100, general + payment);
             assert_eq!(got.is_err(), want_err, "general={general} payment={payment}: {got:?}");
         }
-        // A quota larger than the block it reserves from can never be satisfied.
         assert!(budget(200, 0).verify(100, 0).is_err());
     }
 
@@ -166,8 +153,6 @@ mod tests {
         assert!(budget(u64::MAX, u64::MAX).verify(LIMIT, 1000).is_ok());
     }
 
-    /// Must agree exactly with post-transaction validity, or a producer drops a transaction its
-    /// own final check would have accepted.
     #[test]
     fn admission_is_exactly_tight() {
         const CAPACITY: u64 = 40;
@@ -215,7 +200,6 @@ mod tests {
         assert_eq!(listed_tx(true), Ok(LaneType::GeneralLane));
         assert_eq!(listed_tx(false), Ok(LaneType::PaymentLane));
 
-        // A creation has no destination to test.
         assert_eq!(classify(false, None, 0, one, &listed, never), Ok(LaneType::GeneralLane));
 
         // Excluded types are general even when listed: 0x03 carries blobs, 0x04 installs code.
@@ -238,7 +222,7 @@ mod tests {
         assert_eq!(classify(false, to, 0, U256::ZERO, &listed, never), Ok(LaneType::GeneralLane));
         assert_eq!(classify(false, to, 0, one, &listed, has_code), Ok(LaneType::GeneralLane));
 
-        // Never rounded to "no code": that would make an honest block look like it overran.
+        // A failed read must propagate, not become an empty-code result.
         let unavailable = |_: Address| Err(LaneError::StateUnavailable("missing node".into()));
         assert!(matches!(
             classify(false, Some(plain), 0, one, &listed, unavailable),

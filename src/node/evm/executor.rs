@@ -471,14 +471,8 @@ where
         self.evm.db_mut().commit(changes);
     }
 
-    /// Gas still available to user transactions under Parlia's reservation policy — the unit
-    /// **every** producer-side lane decision is expressed in, and the one place it is computed.
-    ///
-    /// go-bsc gets this for free: `makeEnv` initialises `environment.gasPool` to
-    /// `GasLimit - EstimateGasReservedForSystemTxs` and every call site just asks the pool.
-    /// reth has no such object, so this is it — the block rule is *not* a substitute, because
-    /// it counts the system transactions' actual gas and would hand the difference to user
-    /// traffic that the reservation has already been withheld from.
+    /// Remaining producer gas after Parlia's system reserve and executed transactions.
+    /// Unlike final block validation, this withholds the full reserve, not actual system gas.
     fn producer_shared_gas(&self) -> u64 {
         let reserved = self.parlia.estimate_gas_reserved_for_system_txs(
             self.inner_ctx.parent_header.as_ref().map(|p| p.timestamp),
@@ -492,12 +486,7 @@ where
             .saturating_sub(self.gas_used)
     }
 
-    /// The lane verdict for a finished block. `gas_used` is the header's total, so this may only
-    /// run once the last system transaction has been executed.
-    ///
-    /// Logs everything the verdict was derived from: nothing about the reservation reaches the
-    /// header, so a disagreement between two nodes can only be diagnosed from what each side
-    /// read out of `0x2007` and how it booked the block's gas.
+    /// Validates total block gas after all system transactions have executed.
     pub(crate) fn verify_payment_lane(&self, gas_used: u64) -> Result<(), BlockExecutionError> {
         if !self.lane.on() {
             return Ok(());
@@ -532,12 +521,7 @@ where
         Ok(())
     }
 
-    /// Reports what the block that just passed reserved and spent.
-    ///
-    /// Import only: it is the one path every node type runs, so the gauges stay comparable
-    /// between a validator and a full node. A producer reaches the same verdict once per bid
-    /// simulation, and reporting those would leave the gauges tracking the last simulated bid
-    /// instead of the chain.
+    /// Report imported blocks only, so bid simulations cannot overwrite chain gauges.
     fn record_imported(&self) {
         if self.ctx.mode != BscExecutionMode::Import {
             return;
@@ -558,8 +542,6 @@ where
     }
 }
 
-/// The live state, for [`LaneState::classify`] — the block as execution has reached it, which is
-/// a different view from [`LaneParentState`] and must stay one.
 impl<E, Spec, R> LaneLiveState for BscBlockExecutor<'_, E, Spec, R>
 where
     E: Evm<DB: alloy_evm::block::StateDB>,
@@ -587,7 +569,7 @@ where
 
 /// Payment-lane admission for producer-selected transactions.
 pub trait LaneAdmission {
-    /// `shared` is remaining gas, excluding system gas and any reserved pay-bid gas.
+    /// `shared` is remaining gas, excluding system and pay-bid gas reservations.
     /// State-read errors must abort the build, not skip the transaction.
     fn lane_admits_pool_tx(
         &mut self,
@@ -848,8 +830,7 @@ where
 
         let gas_used = result.tx_gas_used();
         self.gas_used += gas_used;
-        // The same value added to `self.gas_used`, so the booked payment gas is a subset of the
-        // block's by construction.
+        // Payment gas uses the same accounting as total gas.
         self.lane.record_used(output.lane_type, gas_used);
         self.blob_gas_used = self.blob_gas_used.saturating_add(output.blob_gas_used);
 
@@ -936,15 +917,12 @@ where
         }
 
         match self.ctx.mode {
-            // Generates and signs system txs (rewards, slashing, validator-set updates), then
-            // reaches the importer's own lane verdict as a self-check. Failure declines the
-            // block; there is no fallback that produces with the lane switched off.
+            // Finalize system transactions, then apply the importer's lane rule.
             BscExecutionMode::Mining | BscExecutionMode::BidSimulation => {
                 self.finalize_new_block(&self.evm.block().clone())?;
                 self.verify_payment_lane(self.gas_used)?;
             }
-            // Verifies the system txs already present in the received block, and the lane
-            // inequality along with them.
+            // Validate the received system transactions and total lane budget.
             BscExecutionMode::Import => self.post_check_new_block(&self.evm.block().clone())?,
             // Neither: return the executed block as-is, matching BSC geth's simulation path.
             BscExecutionMode::Simulation => {
