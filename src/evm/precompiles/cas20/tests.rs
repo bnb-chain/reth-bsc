@@ -4,93 +4,20 @@
 
 use super::{
     abi::*,
-    activation::{act_slot, SLOT_ADMIN, SLOT_FEATURES},
-    ctx::{Cas20State, Ctx, Frame},
-    errors::{complete, Exit, Outcome},
-    execute,
+    errors::{Exit, Outcome},
     factory::derive_address,
     permit::{domain_separator, ecrecover_address},
     policy::{ALWAYS_ALLOW, ALWAYS_BLOCK, TYPE_ALLOWLIST, TYPE_BLOCKLIST, TYPE_UNION},
     resolve,
     sigs::*,
     storage::{addr_key, erc7201_root, mapping_slot, slot_at, SLOT_BALANCES},
+    test_host::{run_call, CallSpec, MockHost},
     token::PAUSE_TRANSFER,
     *,
 };
 use alloy_evm::precompiles::PrecompileLookup;
 use alloy_primitives::{keccak256, Address, Log, B256, U256};
-use revm::interpreter::{SStoreResult, StateLoad};
-use std::collections::{HashMap, HashSet};
-
-// --- a mock host --------------------------------------------------------------
-
-/// A host state with the access-list semantics of one transaction: a slot or
-/// account is cold until its first touch, original values are those at the start.
-#[derive(Clone, Default)]
-struct MockState {
-    storage: HashMap<(Address, U256), U256>,
-    original: HashMap<(Address, U256), U256>,
-    warm_slots: HashSet<(Address, U256)>,
-    warm_addrs: HashSet<Address>,
-    code_hash: HashMap<Address, B256>,
-    logs: Vec<Log>,
-    time: u64,
-    chain_id: u64,
-}
-
-impl MockState {
-    fn get(&self, at: Address, slot: U256) -> U256 {
-        self.storage.get(&(at, slot)).copied().unwrap_or_default()
-    }
-}
-
-impl Cas20State for MockState {
-    fn sload(&mut self, address: Address, key: U256) -> Result<StateLoad<U256>, String> {
-        let is_cold = self.warm_slots.insert((address, key));
-        Ok(StateLoad::new(self.get(address, key), is_cold))
-    }
-
-    fn sstore(
-        &mut self,
-        address: Address,
-        key: U256,
-        value: U256,
-    ) -> Result<StateLoad<SStoreResult>, String> {
-        let is_cold = self.warm_slots.insert((address, key));
-        let original_value = self.original.get(&(address, key)).copied().unwrap_or_default();
-        let present_value = self.get(address, key);
-        self.storage.insert((address, key), value);
-        Ok(StateLoad::new(
-            SStoreResult { original_value, present_value, new_value: value },
-            is_cold,
-        ))
-    }
-
-    fn code_hash(&mut self, address: Address) -> Result<StateLoad<B256>, String> {
-        let is_cold = self.warm_addrs.insert(address);
-        Ok(StateLoad::new(
-            self.code_hash.get(&address).copied().unwrap_or(alloy_primitives::KECCAK256_EMPTY),
-            is_cold,
-        ))
-    }
-
-    fn set_code(&mut self, address: Address, code: revm::bytecode::Bytecode) -> Result<(), String> {
-        self.code_hash.insert(address, code.hash_slow());
-        Ok(())
-    }
-
-    fn log(&mut self, log: Log) {
-        self.logs.push(log);
-    }
-
-    fn block_timestamp(&self) -> u64 {
-        self.time
-    }
-
-    fn chain_id(&self) -> u64 {
-        self.chain_id
-    }
-}
+use std::collections::HashMap;
 
 const ADMIN: Address =
     Address::new([0x60, 0xfe, 0xed, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
@@ -133,26 +60,17 @@ impl Out {
 }
 
 struct Harness {
-    st: MockState,
+    st: MockHost,
 }
 
 impl Harness {
     /// The fork plants the sentinels; opening the features and appointing the admin
-    /// stay local, since the fork opens nothing (BEP-702 3.15).
+    /// stay local, since the fork opens nothing (BEP-702 3.15). The seed counts as
+    /// committed state here.
     fn new() -> Self {
-        let mut st = MockState { time: NOW, chain_id: 714, ..Default::default() };
-        for a in [ACTIVATION_REGISTRY_ADDRESS, POLICY_REGISTRY_ADDRESS] {
-            st.code_hash.insert(a, MARKER_CODE_HASH);
-        }
-        st.storage
-            .insert((ACTIVATION_REGISTRY_ADDRESS, act_slot(SLOT_ADMIN)), u256_of(addr_key(ADMIN)));
-        for f in [FEATURE_ASSET, FEATURE_STABLECOIN, FEATURE_POLICY_REGISTRY] {
-            st.storage.insert(
-                (ACTIVATION_REGISTRY_ADDRESS, mapping_slot(act_slot(SLOT_FEATURES), f)),
-                U256::from(1),
-            );
-        }
-        st.original = st.storage.clone();
+        let mut st = MockHost::new(714, NOW);
+        st.seed_activation(ADMIN);
+        st.finalize();
         Self { st }
     }
 
@@ -167,43 +85,20 @@ impl Harness {
         direct: bool,
         value: U256,
     ) -> Out {
-        let kind = resolve(to).expect("a routed address");
-        let snapshot = self.st.clone();
-        let log_start = self.st.logs.len();
-        let (outcome, used, refund) = {
-            let mut frame = Frame::new(&mut self.st, gas, Cas20Version::V1);
-            let mut ctx = Ctx {
-                frame: &mut frame,
-                self_addr: to,
-                caller,
-                read_only: is_static,
-                direct_call: direct,
-                value,
-                admin_renounced: false,
-            };
-            let exit = execute(kind, &mut ctx, input);
-            complete(&mut frame, exit)
-        };
-        let exit = match outcome {
+        let r =
+            run_call(&mut self.st, CallSpec { caller, to, gas, is_static, direct, value }, input);
+        let exit = match r.outcome {
             Outcome::Return(b) => Exit::Return(b),
             Outcome::Revert(b) => Exit::Revert(b),
             Outcome::OutOfGas => Exit::OutOfGas,
             Outcome::Fatal(msg) => panic!("fatal: {msg}"),
         };
-        let mut logs = self.st.logs[log_start..].to_vec();
-        if !matches!(exit, Exit::Return(_)) {
-            // The frame reverts everything it did, warmth and logs included.
-            self.st = snapshot;
-            logs.clear();
-        }
-        Out { exit, used, refund, logs }
+        Out { exit, used: r.used, refund: r.refund, logs: r.logs }
     }
 
     /// A transaction boundary: what was written is now committed, and nothing is warm.
     fn finalize(&mut self) {
-        self.st.original = self.st.storage.clone();
-        self.st.warm_slots.clear();
-        self.st.warm_addrs.clear();
+        self.st.finalize();
     }
 
     fn call(&mut self, caller: Address, to: Address, input: &[u8]) -> Out {
@@ -439,7 +334,7 @@ fn factory_creates_a_token_that_transfers() {
         ],
     );
     assert_eq!(token, derive_address(VARIANT_ASSET, ALICE, w(1)));
-    assert_eq!(h.st.code_hash[&token], MARKER_CODE_HASH);
+    assert_eq!(h.st.code_hash_of(token), Some(MARKER_CODE_HASH));
 
     assert_eq!(h.call(BOB, token, &call_data(SEL_NAME, &[])).ret(), enc_string(b"Test Token"));
     assert_eq!(h.call(BOB, token, &call_data(SEL_SYMBOL, &[])).ret(), enc_string(b"TT"));
@@ -677,7 +572,7 @@ fn init_calls_are_dispatched_by_the_variant_and_failures_are_indexed() {
         ),
     );
     assert_rev(out.revert(), ERR_INIT_CALL_FAILED, &[w(1)]);
-    assert!(!h.st.code_hash.contains_key(&derive_address(VARIANT_ASSET, ALICE, w(21))));
+    assert!(h.st.code_hash_of(derive_address(VARIANT_ASSET, ALICE, w(21))).is_none());
     // A too-short entry is malformed.
     let out = h.call(
         ALICE,
@@ -1415,21 +1310,32 @@ mod evm {
 // --- the golden trace -------------------------------------------------------------------
 
 /// testdata/cas20_golden.json is a scripted scenario recorded from go-bsc's
-/// `core/vm` test harness: 145 calls across every entry point, each with its
-/// returndata, status, gas, refund and logs, and the state root the harness ended
-/// on. Replaying it here holds this port to the reference client call by call.
+/// `core/vm` test harness (`TestRecordCAS20Golden`): 145 calls across every entry
+/// point, each with its returndata, status, gas, refund and logs, and the state
+/// root the harness ended on. Replaying it here holds this port to the reference
+/// client call by call.
+///
+/// testdata/cas20_golden_footprint.json pins, per step, what this port did to get
+/// there — gas, and the SLOAD, SSTORE and paid-keccak counts — so a drift in the
+/// metering points at one operation. It is this port's own artifact, regenerated
+/// with `BLESS_GOLDEN=1 cargo test --lib cas20::tests::golden`.
 mod golden {
-    use super::super::{sigs::MARKER_CODE_HASH, storage::mapping_slot, *};
-    use super::{
-        activation::{act_slot, SLOT_ADMIN, SLOT_FEATURES},
-        Harness, MockState, Out,
+    use super::super::{
+        errors::Outcome,
+        test_host::{run_call, CallSpec, MockHost},
+        *,
     };
-    use alloy_primitives::{hex, Address, B256, U256};
+    use alloy_primitives::{hex, Address, B256, KECCAK256_EMPTY, U256};
     use reth_trie_common::{
         root::{state_root_unhashed, storage_root_unhashed},
         TrieAccount,
     };
     use std::collections::BTreeMap;
+
+    const FOOTPRINT: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/evm/precompiles/cas20/testdata/cas20_golden_footprint.json"
+    );
 
     fn addr(v: &serde_json::Value) -> Address {
         v.as_str().unwrap().parse().unwrap()
@@ -1439,11 +1345,12 @@ mod golden {
         hex::decode(v.as_str().unwrap()).unwrap()
     }
 
-    fn status(exit: &Exit) -> &'static str {
-        match exit {
-            Exit::Return(_) => "ok",
-            Exit::Revert(_) => "revert",
-            Exit::OutOfGas => "oog",
+    fn status(outcome: &Outcome) -> &'static str {
+        match outcome {
+            Outcome::Return(_) => "ok",
+            Outcome::Revert(_) => "revert",
+            Outcome::OutOfGas => "oog",
+            Outcome::Fatal(_) => "fatal",
         }
     }
 
@@ -1451,56 +1358,42 @@ mod golden {
     fn the_go_trace_replays_identically() {
         let trace: serde_json::Value =
             serde_json::from_str(include_str!("testdata/cas20_golden.json")).expect("valid trace");
-        let admin = addr(&trace["admin"]);
 
         // go-bsc's harness: the fork's sentinels, the admin and the open features are
         // written into an uncommitted state, so every original value is zero.
-        let mut st =
-            MockState { chain_id: trace["chainId"].as_u64().unwrap(), ..Default::default() };
-        for reg in [ACTIVATION_REGISTRY_ADDRESS, POLICY_REGISTRY_ADDRESS] {
-            st.code_hash.insert(reg, MARKER_CODE_HASH);
-        }
-        st.storage.insert(
-            (ACTIVATION_REGISTRY_ADDRESS, act_slot(SLOT_ADMIN)),
-            U256::from_be_bytes(admin.into_word().0),
-        );
-        for f in [sigs::FEATURE_ASSET, sigs::FEATURE_STABLECOIN, sigs::FEATURE_POLICY_REGISTRY] {
-            st.storage.insert(
-                (ACTIVATION_REGISTRY_ADDRESS, mapping_slot(act_slot(SLOT_FEATURES), f)),
-                U256::from(1),
-            );
-        }
-        let mut h = Harness { st };
+        let mut host = MockHost::new(trace["chainId"].as_u64().unwrap(), 0);
+        host.seed_activation(addr(&trace["admin"]));
 
         let mut failures = Vec::new();
+        let mut footprint: Vec<serde_json::Value> = Vec::new();
         for (i, step) in trace["steps"].as_array().unwrap().iter().enumerate() {
-            let name = format!("#{i} {}", step["name"].as_str().unwrap());
-            h.st.time = step["time"].as_u64().unwrap();
+            let name = step["name"].as_str().unwrap();
+            let label = format!("#{i} {name}");
+            host.time = step["time"].as_u64().unwrap();
             let kind = step["kind"].as_str().unwrap();
-            let value: U256 = step["value"].as_str().unwrap().parse().unwrap();
-            let out: Out = h.call_opts(
-                addr(&step["caller"]),
-                addr(&step["to"]),
-                &bytes(&step["input"]),
-                step["gas"].as_u64().unwrap(),
-                kind == "static",
-                kind != "delegate",
-                value,
-            );
+            let spec = CallSpec {
+                caller: addr(&step["caller"]),
+                to: addr(&step["to"]),
+                gas: step["gas"].as_u64().unwrap(),
+                is_static: kind == "static",
+                direct: kind != "delegate",
+                value: step["value"].as_str().unwrap().parse().unwrap(),
+            };
+            let r = run_call(&mut host, spec, &bytes(&step["input"]));
             let mut check = |what: &str, ok: bool, detail: String| {
                 if !ok {
-                    failures.push(format!("{name}: {what}: {detail}"));
+                    failures.push(format!("{label}: {what}: {detail}"));
                 }
             };
             let want_status = step["status"].as_str().unwrap();
             check(
                 "status",
-                status(&out.exit) == want_status,
-                format!("got {:?}, want {want_status}", out.exit),
+                status(&r.outcome) == want_status,
+                format!("got {:?}, want {want_status}", r.outcome),
             );
-            let ret = match &out.exit {
-                Exit::Return(b) | Exit::Revert(b) => b.clone(),
-                Exit::OutOfGas => Vec::new(),
+            let ret = match &r.outcome {
+                Outcome::Return(b) | Outcome::Revert(b) => b.clone(),
+                _ => Vec::new(),
             };
             let want_ret = bytes(&step["ret"]);
             check(
@@ -1509,18 +1402,21 @@ mod golden {
                 format!("got 0x{}, want 0x{}", hex::encode(&ret), hex::encode(&want_ret)),
             );
             let want_gas = step["gasUsed"].as_u64().unwrap();
-            check("gas", out.used == want_gas, format!("got {}, want {want_gas}", out.used));
-            let refund = if matches!(out.exit, Exit::Return(_)) { out.refund } else { 0 };
+            check("gas", r.used == want_gas, format!("got {}, want {want_gas}", r.used));
             let want_refund = step["refund"].as_i64().unwrap();
-            check("refund", refund == want_refund, format!("got {refund}, want {want_refund}"));
+            check(
+                "refund",
+                r.refund == want_refund,
+                format!("got {}, want {want_refund}", r.refund),
+            );
             let want_logs = step["logs"].as_array().map(|l| l.len()).unwrap_or(0);
             check(
                 "log count",
-                out.logs.len() == want_logs,
-                format!("got {}, want {want_logs}", out.logs.len()),
+                r.logs.len() == want_logs,
+                format!("got {}, want {want_logs}", r.logs.len()),
             );
             for (j, (got, want)) in
-                out.logs.iter().zip(step["logs"].as_array().into_iter().flatten()).enumerate()
+                r.logs.iter().zip(step["logs"].as_array().into_iter().flatten()).enumerate()
             {
                 let topics: Vec<B256> = want["topics"]
                     .as_array()
@@ -1544,19 +1440,23 @@ mod golden {
                     hex::encode(&got.data.data),
                 );
             }
+            footprint.push(serde_json::json!({
+                "name": name,
+                "gas": r.used,
+                "sload": r.stats.sloads,
+                "sstore": r.stats.sstores,
+                "keccak": r.stats.keccaks,
+            }));
         }
 
         // The state the harness ended on, as a root over every account the family touched.
-        let mut accounts: BTreeMap<Address, TrieAccount> = BTreeMap::new();
         let mut storage: BTreeMap<Address, Vec<(B256, U256)>> = BTreeMap::new();
-        for (&(at, slot), &v) in &h.st.storage {
-            if !v.is_zero() {
-                storage.entry(at).or_default().push((B256::from(slot), v));
-            }
+        for (at, slot, v) in host.storage() {
+            storage.entry(at).or_default().push((B256::from(slot), v));
         }
-        for a in h.st.code_hash.keys().copied().chain(storage.keys().copied()) {
-            let code_hash =
-                h.st.code_hash.get(&a).copied().unwrap_or(alloy_primitives::KECCAK256_EMPTY);
+        let mut accounts: BTreeMap<Address, TrieAccount> = BTreeMap::new();
+        for a in host.coded_accounts().chain(storage.keys().copied()) {
+            let code_hash = host.code_hash_of(a).unwrap_or(KECCAK256_EMPTY);
             let storage_root = storage_root_unhashed(storage.get(&a).cloned().unwrap_or_default());
             accounts
                 .insert(a, TrieAccount { nonce: 0, balance: U256::ZERO, storage_root, code_hash });
@@ -1574,12 +1474,36 @@ mod golden {
         if root != want_root {
             failures.push(format!("state root: got {root:?}, want {want_root:?}"));
         }
-
         assert!(
             failures.is_empty(),
             "{} divergences from go-bsc:\n{}",
             failures.len(),
             failures.join("\n")
+        );
+
+        // This port's own footprint, step by step.
+        let footprint = serde_json::Value::Array(footprint);
+        if std::env::var("BLESS_GOLDEN").as_deref() == Ok("1") {
+            std::fs::write(FOOTPRINT, serde_json::to_string_pretty(&footprint).unwrap()).unwrap();
+            return;
+        }
+        let pinned: serde_json::Value =
+            serde_json::from_str(include_str!("testdata/cas20_golden_footprint.json"))
+                .expect("pinned footprint");
+        let drift: Vec<String> = pinned
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(footprint.as_array().unwrap())
+            .enumerate()
+            .filter(|(_, (want, got))| want != got)
+            .map(|(i, (want, got))| format!("#{i}: pinned {want}, got {got}"))
+            .collect();
+        assert!(
+            drift.is_empty()
+                && pinned.as_array().unwrap().len() == footprint.as_array().unwrap().len(),
+            "storage-access footprint drifted (regenerate with BLESS_GOLDEN=1 if intended):\n{}",
+            drift.join("\n")
         );
     }
 }

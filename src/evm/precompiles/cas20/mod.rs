@@ -23,6 +23,8 @@ pub(crate) mod storage;
 pub(crate) mod token;
 
 #[cfg(test)]
+mod test_host;
+#[cfg(test)]
 mod tests;
 
 pub use self::observer::{
