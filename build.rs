@@ -1,6 +1,17 @@
 use std::{collections::BTreeMap, fs, process::Command};
 
 fn main() {
+    println!("cargo:rerun-if-changed=proto/mev.proto");
+    let mut prost_config = tonic_prost_build::Config::new();
+    prost_config.protoc_executable(
+        protoc_bin_vendored::protoc_bin_path().expect("failed to locate vendored protoc binary"),
+    );
+    tonic_prost_build::configure()
+        .build_client(true)
+        .build_server(true)
+        .compile_with_config(prost_config, &["proto/mev.proto"], &["proto"])
+        .expect("failed to compile MEV gRPC protobuf definitions");
+
     // Emit reth-bsc git SHA for startup version logging.
     let git_sha_short = Command::new("git")
         .args(["rev-parse", "--short=7", "HEAD"])
