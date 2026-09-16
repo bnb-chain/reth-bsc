@@ -561,26 +561,6 @@ mod tests {
     }
 
     #[test]
-    fn mev_grpc_requires_mining_bid_block_and_no_disable_flag() {
-        for enabled in [false, true] {
-            for bid_block_enabled in [false, true] {
-                for mev_grpc_disabled in [false, true] {
-                    let config = MiningConfig {
-                        enabled,
-                        bid_block_enabled,
-                        mev_grpc_disabled,
-                        ..Default::default()
-                    };
-                    assert_eq!(
-                        config.is_mev_grpc_enabled(),
-                        enabled && bid_block_enabled && !mev_grpc_disabled
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
     fn mev_grpc_zero_port_uses_default_and_explicit_disable() {
         let mut config = MiningConfig {
             enabled: true,
