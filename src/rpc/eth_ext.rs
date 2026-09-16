@@ -3,7 +3,7 @@ use crate::{
     hardforks::BscHardforks,
 };
 use alloy_consensus::BlockHeader;
-use alloy_eips::BlockId;
+use alloy_eips::{BlockId, BlockNumberOrTag};
 use alloy_primitives::Address;
 use jsonrpsee::{core::RpcResult, proc_macros::rpc, types::ErrorObject};
 use reth_chainspec::EthChainSpec;
@@ -84,10 +84,16 @@ where
         addresses: &[Address],
         block: Option<BlockId>,
     ) -> RpcResult<Vec<Option<TokenInfo>>> {
-        let id = block.unwrap_or_else(BlockId::latest);
+        // `pending` is the canonical head, as go-bsc's Pending() answers it. The
+        // header is resolved once and the state taken by its hash, so a head update
+        // between the two reads cannot pair one block's time with another's state.
+        let id = match block.unwrap_or_else(BlockId::latest) {
+            BlockId::Number(BlockNumberOrTag::Pending) => BlockId::latest(),
+            id => id,
+        };
         let header = self
             .provider
-            .header_by_id(id)
+            .sealed_header_by_id(id)
             .map_err(|e| internal(format!("failed to load header: {e}")))?
             .ok_or_else(|| invalid_params("block not found"))?;
         let spec = self.provider.chain_spec();
@@ -96,7 +102,7 @@ where
         }
         let state = self
             .provider
-            .state_by_block_id(id)
+            .state_by_block_hash(header.hash())
             .map_err(|e| internal(format!("failed to load state: {e}")))?;
         let time = header.timestamp();
         let mut host = ProviderHost { state: &*state, time, chain_id: spec.chain().id() };
@@ -105,7 +111,8 @@ where
             .map(|&addr| match token_info_at(&mut host, spec.chain().id(), addr, time) {
                 Ok(info) => Ok(Some(info)),
                 Err(InfoError::NotToken) => Ok(None),
-                Err(e) => Err(internal(e.to_string())),
+                Err(e @ InfoError::StringTooLong) => Err(invalid_params(e.to_string())),
+                Err(e @ InfoError::State(_)) => Err(internal(e.to_string())),
             })
             .collect()
     }

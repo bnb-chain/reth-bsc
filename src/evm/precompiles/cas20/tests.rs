@@ -1629,6 +1629,37 @@ mod info {
         assert_eq!(token_info_at(&mut h.st, 714, token, NOW), Err(InfoError::StringTooLong));
     }
 
+    #[test]
+    fn strings_render_as_go_encodes_them() {
+        let mut h = Harness::new();
+        let token = h.create(
+            ALICE,
+            VARIANT_ASSET,
+            103,
+            ALICE,
+            &[call_data(SEL_GRANT_ROLE, &[ROLE_METADATA, a(ALICE)])],
+        );
+        // A truncated three-byte sequence and two stray bytes: go-bsc's encoder emits
+        // one replacement character per byte, four in all.
+        let mut update = SEL_UPDATE_SYMBOL.to_vec();
+        update.extend(super::super::abi::encode_tuple(&[super::super::abi::abi_string(
+            b"ok\xe2\x82\xff\xfe",
+        )]));
+        h.call(ALICE, token, &update).ret();
+        let info = token_info_at(&mut h.st, 714, token, NOW).unwrap();
+        assert_eq!(info.symbol, "ok\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}");
+        // An empty currency is omitted, as go-bsc's omitempty leaves it out.
+        let stable = h.create(ALICE, VARIANT_STABLECOIN, 104, ALICE, &[]);
+        h.st.set(
+            stable,
+            super::super::stablecoin::stablecoin_slot(super::super::stablecoin::SLOT_CURRENCY),
+            U256::ZERO,
+        );
+        let s = token_info_at(&mut h.st, 714, stable, NOW).unwrap();
+        assert!(s.currency.is_none());
+        assert!(!serde_json::to_string(&s).unwrap().contains("currency"));
+    }
+
     /// The same answer through a state provider as through the frame host.
     #[test]
     fn a_provider_host_reads_what_the_frame_wrote() {

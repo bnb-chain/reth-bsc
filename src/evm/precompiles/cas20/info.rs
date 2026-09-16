@@ -144,7 +144,7 @@ fn read(
             return Err(InfoError::StringTooLong);
         }
     }
-    let text = |b: Option<Vec<u8>>| String::from_utf8_lossy(&b.unwrap_or_default()).into_owned();
+    let text = |b: Option<Vec<u8>>| go_string(&b.unwrap_or_default());
     let name = tok.s().name().unwrap_or_default();
     let paused = tok.s().paused();
     let (sender, receiver, executor) = tok.s().transfer_policies();
@@ -154,7 +154,7 @@ fn read(
     let mut info = TokenInfo {
         address: addr,
         variant,
-        name: String::from_utf8_lossy(&name).into_owned(),
+        name: go_string(&name),
         symbol: text(tok.s().symbol()),
         decimals: U64::ZERO,
         contract_uri: text(tok.s().contract_uri()),
@@ -191,9 +191,23 @@ fn read(
         info.total_supply_ui = Some(apply_multiplier(total_supply, mul).unwrap_or_default());
     } else {
         info.decimals = U64::from(6);
-        info.currency = Some(text(tok.currency()));
+        // Omitted when empty, as go-bsc's `omitempty` leaves it out.
+        info.currency = Some(text(tok.currency())).filter(|c| !c.is_empty());
     }
     Ok(info)
+}
+
+/// A stored string as go-bsc's JSON encoder renders it: every byte of an invalid
+/// UTF-8 sequence becomes one U+FFFD, not one per maximal invalid subpart.
+fn go_string(b: &[u8]) -> String {
+    let mut out = String::with_capacity(b.len());
+    for chunk in b.utf8_chunks() {
+        out.push_str(chunk.valid());
+        for _ in chunk.invalid() {
+            out.push('\u{FFFD}');
+        }
+    }
+    out
 }
 
 /// A read-only host over a state provider, for reads outside any frame.
