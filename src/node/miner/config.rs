@@ -49,8 +49,10 @@ pub struct MiningConfig {
     /// Whether the `mev_sendBidBlock` RPC (BEP-675 builder-proposed blocks) is accepted.
     /// Off by default; enable with `--mining.bid-block-enabled` or `BSC_MINING_BID_BLOCK_ENABLED`.
     pub bid_block_enabled: bool,
-    /// Optional BEP-675 gRPC listener port. Zero disables the service.
+    /// BEP-675 gRPC listener port (default 8552).
     pub mev_grpc_port: u16,
+    /// Explicitly disable the BEP-675 gRPC transport.
+    pub mev_grpc_disabled: bool,
     /// Maximum process-wide in-flight gRPC `SendBidBlock` calls.
     pub mev_grpc_concurrency: u32,
     /// Total gRPC request timeout in milliseconds.
@@ -87,6 +89,7 @@ impl std::fmt::Debug for MiningConfig {
             .field("allowed_builders", &self.allowed_builders)
             .field("bid_block_enabled", &self.bid_block_enabled)
             .field("mev_grpc_port", &self.mev_grpc_port)
+            .field("mev_grpc_disabled", &self.mev_grpc_disabled)
             .field("mev_grpc_concurrency", &self.mev_grpc_concurrency)
             .field("mev_grpc_request_timeout_ms", &self.mev_grpc_request_timeout_ms)
             .field("use_sparse_trie_state_root", &self.use_sparse_trie_state_root)
@@ -132,7 +135,8 @@ impl Default for MiningConfig {
             builder_fee_ceil: Some(1_000_000_000_000_000_000), // 1 BNB
             allowed_builders: None, // No whitelist by default (allow all)
             bid_block_enabled: false, // BEP-675 BidBlock path off by default
-            mev_grpc_port: 0,
+            mev_grpc_port: 8552,
+            mev_grpc_disabled: false,
             mev_grpc_concurrency: 32,
             mev_grpc_request_timeout_ms: 10_000,
             use_sparse_trie_state_root: false, // Opt-in for now (perf testing)
@@ -143,6 +147,9 @@ impl Default for MiningConfig {
 impl MiningConfig {
     /// Validate the mining configuration
     pub fn validate(&self) -> Result<(), String> {
+        if self.is_mev_grpc_enabled() && self.mev_grpc_port == 0 {
+            return Err("MEV gRPC port must be nonzero; use --mev.grpc.disable to disable it".into());
+        }
         if !self.enabled {
             return Ok(());
         }
@@ -227,6 +234,11 @@ impl MiningConfig {
         self.mev_grpc_port
     }
 
+    /// Transport configuration, independent of runtime pause and hardfork activation.
+    pub fn is_mev_grpc_enabled(&self) -> bool {
+        self.enabled && self.bid_block_enabled && !self.mev_grpc_disabled
+    }
+
     /// Maximum in-flight gRPC submissions, applying the go-bsc default when set to zero.
     pub fn get_mev_grpc_concurrency(&self) -> u32 {
         if self.mev_grpc_concurrency == 0 {
@@ -290,7 +302,8 @@ impl MiningConfig {
                 builder_fee_ceil: Some(1_000_000_000_000_000_000),
                 allowed_builders: None,
                 bid_block_enabled: false,
-                mev_grpc_port: 0,
+                mev_grpc_port: 8552,
+                mev_grpc_disabled: false,
                 mev_grpc_concurrency: 32,
                 mev_grpc_request_timeout_ms: 10_000,
                 greedy_merge: true,
@@ -396,7 +409,10 @@ impl MiningConfig {
             .unwrap_or(false);
 
         let mev_grpc_port =
-            std::env::var("BSC_MEV_GRPC_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+            std::env::var("BSC_MEV_GRPC_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(8552);
+        let mev_grpc_disabled = std::env::var("BSC_MEV_GRPC_DISABLED")
+            .ok()
+            .is_some_and(|v| v.eq_ignore_ascii_case("true"));
         let mev_grpc_concurrency = std::env::var("BSC_MEV_GRPC_CONCURRENCY")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -424,6 +440,7 @@ impl MiningConfig {
             allowed_builders,
             bid_block_enabled,
             mev_grpc_port,
+            mev_grpc_disabled,
             mev_grpc_concurrency,
             mev_grpc_request_timeout_ms,
             use_sparse_trie_state_root,
@@ -537,9 +554,46 @@ mod tests {
     #[test]
     fn mev_grpc_defaults_match_go_bsc() {
         let config = MiningConfig::default();
-        assert_eq!(config.get_mev_grpc_port(), 0);
+        assert_eq!(config.get_mev_grpc_port(), 8552);
         assert_eq!(config.get_mev_grpc_concurrency(), 32);
         assert_eq!(config.get_mev_grpc_request_timeout_ms(), 10_000);
+    }
+
+    #[test]
+    fn mev_grpc_requires_mining_bid_block_and_no_disable_flag() {
+        for enabled in [false, true] {
+            for bid_block_enabled in [false, true] {
+                for mev_grpc_disabled in [false, true] {
+                    let config = MiningConfig {
+                        enabled,
+                        bid_block_enabled,
+                        mev_grpc_disabled,
+                        ..Default::default()
+                    };
+                    assert_eq!(
+                        config.is_mev_grpc_enabled(),
+                        enabled && bid_block_enabled && !mev_grpc_disabled
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mev_grpc_zero_port_rejected_only_when_enabled() {
+        let mut config = MiningConfig {
+            enabled: true,
+            bid_block_enabled: true,
+            mev_grpc_port: 0,
+            private_key_hex: Some("01".repeat(32)),
+            ..Default::default()
+        };
+        assert!(config.validate().unwrap_err().contains("MEV gRPC port"));
+        config.mev_grpc_disabled = true;
+        assert!(config.validate().is_ok());
+        config.mev_grpc_disabled = false;
+        config.enabled = false;
+        assert!(config.validate().is_ok());
     }
 
     #[test]
