@@ -101,6 +101,9 @@ pub struct MevParams {
     /// Whether the `mev_sendBidBlock` (BEP-675) path is accepted
     #[serde(rename = "BidBlockEnabled")]
     pub bid_block_enabled: bool,
+    /// Whether the MEV gRPC transport is configured to run.
+    #[serde(rename = "GRPCEnabled")]
+    pub grpc_enabled: bool,
     /// MEV service version
     #[serde(rename = "Version")]
     pub version: String,
@@ -347,6 +350,7 @@ pub struct MevApiImpl {
     min_gas_price: U256,
     builder_fee_ceil: U256,
     bid_block_enabled: bool,
+    grpc_enabled: bool,
     version: String,
     /// Whitelist of allowed builders (shared with miner_ namespace via shared.rs)
     allowed_builders: Arc<RwLock<HashSet<Address>>>,
@@ -410,6 +414,7 @@ impl MevApiImpl {
         let max_bids_per_builder = mining_config.get_max_bids_per_builder();
         let builder_fee_ceil = U256::from(mining_config.get_builder_fee_ceil());
         let bid_block_enabled = mining_config.get_bid_block_enabled();
+        let grpc_enabled = mining_config.is_mev_grpc_enabled();
 
         // Version string
         let version = env!("CARGO_PKG_VERSION").to_string();
@@ -457,6 +462,7 @@ impl MevApiImpl {
             min_gas_price,
             builder_fee_ceil,
             bid_block_enabled,
+            grpc_enabled,
             version,
             allowed_builders,
             pending_bid_blocks: Arc::new(RwLock::new(HashMap::new())),
@@ -1344,6 +1350,7 @@ impl BscMevApiServer for MevApiImpl {
             gas_price: self.min_gas_price,
             builder_fee_ceil: self.builder_fee_ceil,
             bid_block_enabled,
+            grpc_enabled: self.grpc_enabled,
             version: self.version.clone(),
         })
     }
@@ -1411,11 +1418,13 @@ mod bid_block_param_tests {
             gas_price: U256::ZERO,
             builder_fee_ceil: U256::ZERO,
             bid_block_enabled: true,
+            grpc_enabled: true,
             version: "test".to_string(),
         };
         let json = serde_json::to_value(&params).unwrap();
         // geth parity: the field is exposed as "BidBlockEnabled".
         assert_eq!(json.get("BidBlockEnabled"), Some(&serde_json::Value::Bool(true)));
+        assert_eq!(json.get("GRPCEnabled"), Some(&serde_json::Value::Bool(true)));
     }
 
     #[test]
@@ -1433,6 +1442,7 @@ mod bid_block_param_tests {
             gas_price: U256::ZERO,
             builder_fee_ceil: U256::ZERO,
             bid_block_enabled: true,
+            grpc_enabled: false,
             version: "test".to_string(),
         };
         let json = serde_json::to_value(&params).unwrap();
