@@ -54,41 +54,19 @@ pub type StateRootPrecomputedSink =
     Arc<Mutex<Option<(alloy_primitives::B256, reth_trie_common::updates::TrieUpdates)>>>;
 
 /// What the executor is doing with the block it is running.
-///
-/// Replaces the former `is_miner: bool`, which fused two independent questions: whether a
-/// header already exists, and whether Parlia finalization should run. Those two always
-/// moved together for the import and mining paths, so a bool sufficed — until
-/// `eth_simulateV1` needed the third combination (author a block, but do *not* finalize
-/// it) and was silently rounded to [`Self::Mining`], making a read-only RPC try to sign
-/// Parlia system transactions. See <https://github.com/bnb-chain/reth-bsc/issues/451>.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BscExecutionMode {
-    /// Verifying a block received from the network or the engine API. The header already
-    /// exists and system transactions are consumed from the block rather than generated.
+    /// Verifying a block that already exists: the header is given, and system transactions are
+    /// consumed from the block rather than generated.
     Import,
-    /// Producing a block this validator will sign and broadcast. System transactions are
-    /// generated and signed with the validator key.
+    /// Producing a block this validator picks the transactions for, then signs and broadcasts.
     Mining,
-    /// Answering a hypothetical — `eth_simulateV1` or the local pending block. Authors a
-    /// header like [`Self::Mining`], but runs no Parlia finalization and signs nothing,
-    /// matching BSC geth's simulation path.
+    /// Runs a fixed bid with Parlia finalization. Optional pool additions require explicit
+    /// admission, separate from the builder's fixed transactions.
+    BidSimulation,
+    /// Answering a hypothetical (`eth_simulateV1`, local pending block): authors a header, but
+    /// runs no Parlia finalization and signs nothing.
     Simulation,
-}
-
-impl BscExecutionMode {
-    /// Whether no header exists yet and one is being authored.
-    ///
-    /// True for both [`Self::Mining`] and [`Self::Simulation`]; the block-verification
-    /// checks that dereference `ctx.header` must be skipped in both.
-    pub const fn authors_block(self) -> bool {
-        matches!(self, Self::Mining | Self::Simulation)
-    }
-
-    /// Whether Parlia post-block finalization (reward distribution, slashing, validator-set
-    /// updates) must run — which implies signing system transactions.
-    pub const fn finalizes(self) -> bool {
-        matches!(self, Self::Mining)
-    }
 }
 
 /// BSC wrapper around [`NextBlockEnvAttributes`].
@@ -100,12 +78,8 @@ impl BscExecutionMode {
 #[derive(Debug, Clone)]
 pub struct BscNextBlockEnvAttributes {
     pub inner: NextBlockEnvAttributes,
-    /// Execution mode for the block built from these attributes.
-    ///
-    /// Defaults to [`BscExecutionMode::Simulation`] via [`BuildPendingEnv`], which is the
-    /// entry point reth uses for `eth_simulateV1` and the local pending block. The miner and
-    /// bid simulator construct this struct literally and must set
-    /// [`BscExecutionMode::Mining`] explicitly.
+    /// [`BuildPendingEnv`] defaults to simulation. Producers must explicitly select
+    /// [`BscExecutionMode::Mining`] or [`BscExecutionMode::BidSimulation`].
     pub mode: BscExecutionMode,
     /// Sink for transporting `current_validators` from builder to payload layer without writing
     /// to VALIDATOR_CACHE prematurely (hash not yet final at build time).
@@ -874,10 +848,9 @@ mod tests {
 
     /// Regression guard for <https://github.com/bnb-chain/reth-bsc/issues/451>.
     ///
-    /// `build_pending_env` is the entry point reth uses for `eth_simulateV1` and the local
-    /// pending block. It must not select a mode that runs Parlia finalization, or those
-    /// read-only RPCs try to sign system transactions and fail on any node without a
-    /// validator key (and silently inject a signed reward tx on nodes that have one).
+    /// `build_pending_env` feeds `eth_simulateV1` and the local pending block, so it must not
+    /// select a finalizing mode: that makes a read-only RPC try to sign system transactions —
+    /// failing without a validator key, and silently injecting a reward tx with one.
     #[test]
     fn rpc_pending_env_does_not_select_a_finalizing_mode() {
         let parent = SealedHeader::seal_slow(Header::default());
@@ -885,30 +858,18 @@ mod tests {
             &parent,
         );
 
-        assert_eq!(attrs.mode, BscExecutionMode::Simulation);
-        assert!(!attrs.mode.finalizes(), "simulation must not run Parlia finalization");
-    }
-
-    /// The two predicates encode the axes the old `is_miner: bool` fused together.
-    /// Mining and simulation both author a header; only mining finalizes.
-    #[test]
-    fn execution_mode_predicates_split_authoring_from_finalizing() {
-        assert!(!BscExecutionMode::Import.authors_block());
-        assert!(BscExecutionMode::Mining.authors_block());
-        assert!(BscExecutionMode::Simulation.authors_block());
-
-        assert!(!BscExecutionMode::Import.finalizes());
-        assert!(BscExecutionMode::Mining.finalizes());
-        assert!(!BscExecutionMode::Simulation.finalizes());
+        assert_eq!(
+            attrs.mode,
+            BscExecutionMode::Simulation,
+            "a read-only pending env must not select a mode that signs system transactions"
+        );
     }
 
     /// Regression guard for <https://github.com/bnb-chain/reth-bsc/issues/464>.
     ///
-    /// `context_for_next_block` used to hard-code `is_miner: true`, so the execution context
-    /// reth builds for the local pending block demanded Parlia finalization regardless of the
-    /// attributes it was handed. On a node without a validator key that made
-    /// `eth_getBlockByNumber("pending")` fail to build and return `null`. The mode must be
-    /// carried from the attributes, not re-decided here.
+    /// `context_for_next_block` must carry the mode from the attributes, never re-decide it:
+    /// forcing finalization made `eth_getBlockByNumber("pending")` return `null` on any node
+    /// without a validator key.
     #[test]
     fn next_block_ctx_carries_the_mode_from_the_attributes() {
         let chain_spec = Arc::new(BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet()));
@@ -919,19 +880,21 @@ mod tests {
         let pending_attrs =
             <BscNextBlockEnvAttributes as BuildPendingEnv<Header>>::build_pending_env(&parent);
         let ctx = evm_config.context_for_next_block(&parent, pending_attrs).unwrap();
-        assert_eq!(ctx.mode, BscExecutionMode::Simulation);
-        assert!(
-            !ctx.mode.finalizes(),
+        assert_eq!(
+            ctx.mode,
+            BscExecutionMode::Simulation,
             "pending-block ctx must not require a validator key to finalize"
         );
-        assert!(ctx.mode.authors_block(), "pending block still authors a header");
 
         // The miner passes its attributes through the same hook and must keep finalizing.
         let mut mining_attrs =
             <BscNextBlockEnvAttributes as BuildPendingEnv<Header>>::build_pending_env(&parent);
         mining_attrs.mode = BscExecutionMode::Mining;
         let ctx = evm_config.context_for_next_block(&parent, mining_attrs).unwrap();
-        assert_eq!(ctx.mode, BscExecutionMode::Mining);
-        assert!(ctx.mode.finalizes(), "mining must still run Parlia finalization");
+        assert_eq!(
+            ctx.mode,
+            BscExecutionMode::Mining,
+            "mining must still run Parlia finalization"
+        );
     }
 }
