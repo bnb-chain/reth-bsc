@@ -470,7 +470,8 @@ where
         if self.ctx.mode.authors_block() {
             self.prepare_new_block(&block_env)?;
         } else {
-            self.check_new_block(&block_env)?;
+            self.check_new_block(&block_env)
+                .map_err(crate::node::evm::error::mark_pre_execution_error)?;
         }
 
         let parent_timestamp = self

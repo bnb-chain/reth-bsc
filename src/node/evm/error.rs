@@ -6,6 +6,76 @@ use reth_evm::execute::{BlockExecutionError, BlockValidationError};
 use reth_provider::ProviderError;
 use reth_primitives_traits::{GotExpected, GotExpectedBoxed};
 
+/// A validation failure before Parlia has authenticated the imported block.
+/// Keep this typed across the engine boundary: it invalidates the block, but cannot be used
+/// as evidence against the builder named in its untrusted header.
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+pub(crate) struct PreExecutionValidationError(BlockValidationError);
+
+pub(crate) fn mark_pre_execution_error(error: BlockExecutionError) -> BlockExecutionError {
+    match error {
+        BlockExecutionError::Validation(error) => BlockExecutionError::Validation(
+            BlockValidationError::Other(Box::new(PreExecutionValidationError(error))),
+        ),
+        internal => internal,
+    }
+}
+
+pub(crate) fn is_execution_evidence(error: &BlockExecutionError) -> bool {
+    match error {
+        BlockExecutionError::Validation(BlockValidationError::Other(error)) => {
+            !error.is::<PreExecutionValidationError>()
+        }
+        BlockExecutionError::Validation(_) => true,
+        BlockExecutionError::Internal(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod bid_block_evidence_tests {
+    use super::*;
+
+    #[test]
+    fn unauthenticated_seal_errors_cannot_be_evidence() {
+        let failures = [
+            BscBlockValidationError::WrongHeaderSigner {
+                block_number: 1,
+                signer: GotExpected {
+                    got: Address::with_last_byte(1),
+                    expected: Address::with_last_byte(2),
+                }
+                .into(),
+            },
+            BscBlockValidationError::SignerUnauthorized {
+                block_number: 1,
+                proposer: Address::with_last_byte(1),
+            },
+            BscBlockValidationError::InvalidAttestationSignature,
+        ];
+        for failure in failures {
+            let error: BlockExecutionError = BscBlockExecutionError::Validation(failure).into();
+            let marked = mark_pre_execution_error(error);
+            assert!(marked.as_validation().is_some(), "must still invalidate the block");
+            assert!(!is_execution_evidence(&marked), "must never count unauthenticated evidence");
+        }
+    }
+
+    #[test]
+    fn execution_failures_are_evidence_but_internal_errors_are_not() {
+        let error = BlockExecutionError::Validation(
+            BlockValidationError::TransactionGasLimitMoreThanAvailableBlockGas {
+                transaction_gas_limit: 100,
+                block_available_gas: 10,
+            },
+        );
+        assert!(is_execution_evidence(&error));
+        let error = mark_pre_execution_error(BlockExecutionError::msg("parent state unavailable"));
+        assert!(error.as_internal().is_some());
+        assert!(!is_execution_evidence(&error));
+    }
+}
+
 /// BSC specific block validation error
 #[derive(thiserror::Error, Debug, Clone)]
 pub enum BscBlockValidationError {
