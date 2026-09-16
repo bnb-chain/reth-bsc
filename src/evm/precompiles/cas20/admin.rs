@@ -258,6 +258,8 @@ impl Token<'_, '_> {
         if !self.privileged {
             let admin = self.s().role_admin(role);
             if !self.s().has_role(admin, caller) {
+                // Read again, as the reference does: the second derivation is metered.
+                let admin = self.s().role_admin(role);
                 return Err(rev(ERR_AC_UNAUTHORIZED, &[addr_key(caller), admin]));
             }
         }

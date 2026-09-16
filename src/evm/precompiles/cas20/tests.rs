@@ -184,11 +184,14 @@ impl Harness {
             (exit, frame.gas.used(), frame.gas.refund, frame.fatal.take())
         };
         assert!(fatal.is_none(), "fatal: {fatal:?}");
-        let logs = self.st.logs[log_start..].to_vec();
+        let mut logs = self.st.logs[log_start..].to_vec();
         if !matches!(exit, Exit::Return(_)) {
-            // The frame reverts everything it did, warmth included.
+            // The frame reverts everything it did, warmth and logs included.
             self.st = snapshot;
+            logs.clear();
         }
+        // A halt hands the EVM nothing back; the frame's whole budget is consumed.
+        let used = if matches!(exit, Exit::OutOfGas) { gas } else { used };
         Out { exit, used, refund, logs }
     }
 
@@ -1334,5 +1337,177 @@ mod evm {
         // A read through STATICCALL succeeds.
         let res = tx(&mut evm, ALICE, via_static, call_data(SEL_BALANCE_OF, &[a(ALICE)]), 300_000);
         assert_eq!(U256::from_be_slice(&output(&res)), U256::from(100));
+    }
+}
+
+// --- the golden trace -------------------------------------------------------------------
+
+/// testdata/cas20_golden.json is a scripted scenario recorded from go-bsc's
+/// `core/vm` test harness: 145 calls across every entry point, each with its
+/// returndata, status, gas, refund and logs, and the state root the harness ended
+/// on. Replaying it here holds this port to the reference client call by call.
+mod golden {
+    use super::super::{sigs::MARKER_CODE_HASH, storage::mapping_slot, *};
+    use super::{
+        activation::{act_slot, SLOT_ADMIN, SLOT_FEATURES},
+        Harness, MockState, Out,
+    };
+    use alloy_primitives::{hex, Address, B256, U256};
+    use reth_trie_common::{
+        root::{state_root_unhashed, storage_root_unhashed},
+        TrieAccount,
+    };
+    use std::collections::BTreeMap;
+
+    fn addr(v: &serde_json::Value) -> Address {
+        v.as_str().unwrap().parse().unwrap()
+    }
+
+    fn bytes(v: &serde_json::Value) -> Vec<u8> {
+        hex::decode(v.as_str().unwrap()).unwrap()
+    }
+
+    fn status(exit: &Exit) -> &'static str {
+        match exit {
+            Exit::Return(_) => "ok",
+            Exit::Revert(_) => "revert",
+            Exit::OutOfGas => "oog",
+        }
+    }
+
+    #[test]
+    fn the_go_trace_replays_identically() {
+        let trace: serde_json::Value =
+            serde_json::from_str(include_str!("testdata/cas20_golden.json")).expect("valid trace");
+        let admin = addr(&trace["admin"]);
+
+        // go-bsc's harness: the fork's sentinels, the admin and the open features are
+        // written into an uncommitted state, so every original value is zero.
+        let mut st =
+            MockState { chain_id: trace["chainId"].as_u64().unwrap(), ..Default::default() };
+        for reg in [ACTIVATION_REGISTRY_ADDRESS, POLICY_REGISTRY_ADDRESS] {
+            st.code_hash.insert(reg, MARKER_CODE_HASH);
+        }
+        st.storage.insert(
+            (ACTIVATION_REGISTRY_ADDRESS, act_slot(SLOT_ADMIN)),
+            U256::from_be_bytes(admin.into_word().0),
+        );
+        for f in [sigs::FEATURE_ASSET, sigs::FEATURE_STABLECOIN, sigs::FEATURE_POLICY_REGISTRY] {
+            st.storage.insert(
+                (ACTIVATION_REGISTRY_ADDRESS, mapping_slot(act_slot(SLOT_FEATURES), f)),
+                U256::from(1),
+            );
+        }
+        let mut h = Harness { st };
+
+        let mut failures = Vec::new();
+        for (i, step) in trace["steps"].as_array().unwrap().iter().enumerate() {
+            let name = format!("#{i} {}", step["name"].as_str().unwrap());
+            h.st.time = step["time"].as_u64().unwrap();
+            let kind = step["kind"].as_str().unwrap();
+            let value: U256 = step["value"].as_str().unwrap().parse().unwrap();
+            let out: Out = h.call_opts(
+                addr(&step["caller"]),
+                addr(&step["to"]),
+                &bytes(&step["input"]),
+                step["gas"].as_u64().unwrap(),
+                kind == "static",
+                kind != "delegate",
+                value,
+            );
+            let mut check = |what: &str, ok: bool, detail: String| {
+                if !ok {
+                    failures.push(format!("{name}: {what}: {detail}"));
+                }
+            };
+            let want_status = step["status"].as_str().unwrap();
+            check(
+                "status",
+                status(&out.exit) == want_status,
+                format!("got {:?}, want {want_status}", out.exit),
+            );
+            let ret = match &out.exit {
+                Exit::Return(b) | Exit::Revert(b) => b.clone(),
+                Exit::OutOfGas => Vec::new(),
+            };
+            let want_ret = bytes(&step["ret"]);
+            check(
+                "returndata",
+                ret == want_ret,
+                format!("got 0x{}, want 0x{}", hex::encode(&ret), hex::encode(&want_ret)),
+            );
+            let want_gas = step["gasUsed"].as_u64().unwrap();
+            check("gas", out.used == want_gas, format!("got {}, want {want_gas}", out.used));
+            let refund = if matches!(out.exit, Exit::Return(_)) { out.refund } else { 0 };
+            let want_refund = step["refund"].as_i64().unwrap();
+            check("refund", refund == want_refund, format!("got {refund}, want {want_refund}"));
+            let want_logs = step["logs"].as_array().map(|l| l.len()).unwrap_or(0);
+            check(
+                "log count",
+                out.logs.len() == want_logs,
+                format!("got {}, want {want_logs}", out.logs.len()),
+            );
+            for (j, (got, want)) in
+                out.logs.iter().zip(step["logs"].as_array().into_iter().flatten()).enumerate()
+            {
+                let topics: Vec<B256> = want["topics"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|t| t.as_str().unwrap().parse().unwrap())
+                    .collect();
+                check(
+                    &format!("log {j} address"),
+                    got.address == addr(&want["address"]),
+                    format!("{:?}", got.address),
+                );
+                check(
+                    &format!("log {j} topics"),
+                    got.topics() == topics.as_slice(),
+                    format!("{:?}", got.topics()),
+                );
+                check(
+                    &format!("log {j} data"),
+                    got.data.data.as_ref() == bytes(&want["data"]).as_slice(),
+                    hex::encode(&got.data.data),
+                );
+            }
+        }
+
+        // The state the harness ended on, as a root over every account the family touched.
+        let mut accounts: BTreeMap<Address, TrieAccount> = BTreeMap::new();
+        let mut storage: BTreeMap<Address, Vec<(B256, U256)>> = BTreeMap::new();
+        for (&(at, slot), &v) in &h.st.storage {
+            if !v.is_zero() {
+                storage.entry(at).or_default().push((B256::from(slot), v));
+            }
+        }
+        for a in h.st.code_hash.keys().copied().chain(storage.keys().copied()) {
+            let code_hash =
+                h.st.code_hash.get(&a).copied().unwrap_or(alloy_primitives::KECCAK256_EMPTY);
+            let storage_root = storage_root_unhashed(storage.get(&a).cloned().unwrap_or_default());
+            accounts
+                .insert(a, TrieAccount { nonce: 0, balance: U256::ZERO, storage_root, code_hash });
+        }
+        for (a, want) in trace["codeHashes"].as_object().unwrap() {
+            let a: Address = a.parse().unwrap();
+            let want: B256 = want.as_str().unwrap().parse().unwrap();
+            let got = accounts.get(&a).map(|acc| acc.code_hash);
+            if got != Some(want) {
+                failures.push(format!("code hash of {a:?}: got {got:?}, want {want:?}"));
+            }
+        }
+        let root = state_root_unhashed(accounts);
+        let want_root: B256 = trace["stateRoot"].as_str().unwrap().parse().unwrap();
+        if root != want_root {
+            failures.push(format!("state root: got {root:?}, want {want_root:?}"));
+        }
+
+        assert!(
+            failures.is_empty(),
+            "{} divergences from go-bsc:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
     }
 }
