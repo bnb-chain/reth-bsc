@@ -42,7 +42,10 @@ use reth_provider::{
 use std::{
     future::Future,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     task::{Context, Poll},
 };
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -557,11 +560,8 @@ where
         self.processed_blocks.insert(block_hash);
     }
 
-    /// Handle a selected BEP-675 BidBlock under zero-simulate: broadcast it to peers immediately,
-    /// then execute + state-root-verify it via the engine (the same path peer blocks take through
-    /// `new_payload`, i.e. go-bsc's `InsertChain`). On `Valid` the fork choice is advanced to make
-    /// it canonical; on `Invalid` the dishonest builder is revoked. Mirrors go-bsc
-    /// `handleBidBlockResult`: broadcast first, verify after, punish dishonesty.
+    /// Broadcast a selected BEP-675 BidBlock, then validate it through `new_payload`.
+    /// `Valid` advances fork choice; `Invalid` revokes the builder unless validation failed locally.
     fn on_new_bid_block(
         &mut self,
         sealed: SealedBlock<BscBlock>,
@@ -609,11 +609,12 @@ where
             BlockValidation::ValidBlock { block: block_msg },
         ));
 
-        // 2. Verify after: execute through the engine (state root, receipts, gas, blob proofs). On
-        //    Valid advance fork choice; on Invalid revoke the dishonest builder.
+        // 2. Verify after broadcast.
         let engine = self.engine.clone();
         let forkchoice_engine = self.forkchoice_engine.clone();
-        let payload = BscPayloadTypes::block_to_payload(sealed);
+        let mut payload = BscPayloadTypes::block_to_payload(sealed);
+        let local_fault = Arc::new(AtomicBool::new(false));
+        payload.local_fault = Some(local_fault.clone());
         tokio::spawn(async move {
             match engine.new_payload(payload).await {
                 Ok(status) => match status.status {
@@ -687,6 +688,12 @@ where
                                 tracing::warn!(target: "bsc::block_import", number = block_number, hash = %block_hash, error = %e, "BidBlock: failed to fetch receipts for gas-price check");
                             }
                         }
+                    }
+                    // The engine also returns Invalid when local validation could not complete.
+                    PayloadStatusEnum::Invalid { validation_error }
+                        if local_fault.load(Ordering::Acquire) =>
+                    {
+                        tracing::error!(target: "bsc::block_import", number = block_number, hash = %block_hash, %bid_hash, %validation_error, "[BID BLOCK VERIFY FAILED] local fault, not revoking builder");
                     }
                     PayloadStatusEnum::Invalid { validation_error } => {
                         tracing::error!(target: "bsc::block_import", number = block_number, hash = %block_hash, %bid_hash, %validation_error, "[BID BLOCK VERIFY FAILED] revoking builder");
@@ -1379,73 +1386,70 @@ mod tests {
         block.seal_unchecked(hash)
     }
 
-    #[tokio::test]
-    async fn bid_block_broadcasts_then_revokes_on_invalid() {
-        // Zero-simulate BidBlock import: the block must be broadcast BEFORE verification, and when
-        // the engine rejects it (Invalid) the builder must be revoked — go-bsc `handleBidBlockResult`
-        // (broadcast first, InsertChain after, punish dishonesty).
-        let mut fixture = TestFixture::new(EngineResponses::invalid_new_payload()).await;
+    #[tokio::test(start_paused = true)]
+    async fn bid_block_verdict_controls_revoke_and_forkchoice() {
+        for (valid, local_fault, builder, block_number) in [
+            (false, false, 0x7e, 900_102),
+            (false, true, 0x7d, 900_103),
+            (true, false, 0x7b, 900_104),
+        ] {
+            let sealed = create_bid_sealed_block(block_number);
+            let parent_hash = sealed.header().parent_hash;
+            let mut provider = MockProvider::new();
+            provider.insert(sealed.header().clone(), U256::from(1));
+            provider.insert_receipts(sealed.hash(), Vec::new());
+            let (observed_tx, mut new_payload_observed) = mpsc::unbounded_channel();
+            let mut responses = if valid {
+                EngineResponses::both_valid()
+            } else {
+                EngineResponses::invalid_new_payload()
+            };
+            responses.new_payload_local_fault = local_fault;
+            responses.new_payload_observed = Some(observed_tx);
+            let mut fixture = TestFixture::new_with_provider(responses, provider).await;
+            let builder = Address::repeat_byte(builder);
+            let pm = crate::shared::get_bid_block_permission_manager();
+            assert!(pm.is_allowed(builder), "builder should start allowed");
 
-        // Unique builder so this test doesn't collide with the process-global permission manager.
-        let builder = Address::repeat_byte(0x7e);
-        let bid_hash = B256::repeat_byte(0xb1);
-        let pm = crate::shared::get_bid_block_permission_manager();
-        assert!(pm.is_allowed(builder), "builder should start allowed");
+            // The miner claims the slot before handing the signed block to this service.
+            assert!(crate::shared::check_and_record_mined_block(block_number, parent_hash));
+            fixture.bid_tx.send((sealed, builder, B256::ZERO, U256::ZERO, 0)).unwrap();
 
-        fixture
-            .bid_tx
-            .send((create_bid_sealed_block(1), builder, bid_hash, U256::ZERO, 0))
-            .unwrap();
-
-        // 1. Broadcast-first: a full-block (ValidBlock) announcement is emitted.
-        let waker = futures::task::noop_waker();
-        let mut cx = Context::from_waker(&waker);
-        let mut saw_broadcast = false;
-        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
-        while !saw_broadcast && tokio::time::Instant::now() < deadline {
-            match fixture.handle.poll_outcome(&mut cx) {
-                Poll::Ready(Some(event)) => {
+            tokio::time::timeout(tokio::time::Duration::from_secs(2), async {
+                loop {
+                    let event = futures::future::poll_fn(|cx| fixture.handle.poll_outcome(cx))
+                        .await
+                        .expect("import service closed before broadcast");
                     if matches!(
                         event,
                         BlockImportEvent::Announcement(BlockValidation::ValidBlock { .. })
                     ) {
-                        saw_broadcast = true;
+                        break;
                     }
                 }
-                Poll::Ready(None) => break,
-                Poll::Pending => tokio::task::yield_now().await,
-            }
-        }
-        assert!(saw_broadcast, "BidBlock must be broadcast before verification");
+            })
+            .await
+            .expect("BidBlock was not broadcast");
+            tokio::time::timeout(tokio::time::Duration::from_secs(2), new_payload_observed.recv())
+                .await
+                .expect("engine.new_payload was never called")
+                .expect("engine mock closed without observing new_payload");
+            // The paused clock advances after ready verification work has run.
+            tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
 
-        // 2. Verify-after: the Invalid payload revokes the builder (runs in a spawned task).
-        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
-        while pm.is_allowed(builder) && tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            assert_eq!(pm.is_allowed(builder), valid || local_fault);
+            assert_eq!(fixture.forkchoice_updates.try_recv().is_ok(), valid);
+            assert!(
+                !crate::shared::check_and_record_mined_block(block_number, parent_hash),
+                "a broadcast block must retain its double-sign reservation"
+            );
         }
-        assert!(!pm.is_allowed(builder), "builder must be revoked after Invalid verification");
     }
 
     #[tokio::test]
     async fn bid_block_engine_err_leaves_double_sign_slot_claimed() {
-        // Characterization test for the `Err(err)` arm of `on_new_bid_block` — the case where
-        // `engine.new_payload()` fails at the transport level instead of returning a verdict.
-        //
-        // This pins CORRECT behavior, not a gap. The BidBlock is broadcast to peers *before*
-        // verification (zero-simulate), so by the time the engine errors the block is already out
-        // on the wire and this validator has signed at this height. The double-sign slot must
-        // therefore STAY claimed: releasing it would let a fallback block be produced for the same
-        // height and turn a missed slot into a slashable double sign. (The slot-rollback helper in
-        // `shared` is scoped to blocks that were "never actually broadcast" — the miner's
-        // channel-send failure — which is not this case.) go-bsc agrees: `handleBidBlockResult`
-        // leaves `recentMinedBlocks` untouched on a verification failure, and has no rollback at
-        // all. The builder is likewise not revoked here — an `Err` is our failure, not provable
-        // dishonesty (a deliberate divergence: go-bsc revokes on any `InsertChain` error, because
-        // its single error return cannot separate "block is invalid" from "our node failed").
-        //
-        // If someone intends to change this, they must first move the broadcast to after
-        // verification; until then, a failing assertion here means a double-sign risk was
-        // introduced.
+        // An engine failure proves no builder fault, but cannot undo an already-broadcast
+        // signature.
         let (responses, mut new_payload_observed) = EngineResponses::unavailable_new_payload();
         let mut fixture = TestFixture::new(responses).await;
 
@@ -1454,7 +1458,7 @@ mod tests {
         let sealed = create_bid_sealed_block(block_number);
         let parent_hash = sealed.header().parent_hash;
 
-        let builder = Address::repeat_byte(0x7f);
+        let builder = Address::repeat_byte(0x7c);
         let bid_hash = B256::repeat_byte(0xb2);
         let pm = crate::shared::get_bid_block_permission_manager();
         assert!(pm.is_allowed(builder), "builder should start allowed");
@@ -1507,10 +1511,7 @@ mod tests {
         );
 
         // 4. The builder keeps its permission: `Err` is not provable dishonesty.
-        assert!(
-            pm.is_allowed(builder),
-            "builder must NOT be revoked for an engine-side error (only Invalid revokes)"
-        );
+        assert!(pm.is_allowed(builder), "an engine-side error must not revoke the builder");
     }
 
     #[tokio::test]
@@ -1790,14 +1791,11 @@ mod tests {
     /// Response configuration for engine messages
     struct EngineResponses {
         new_payload: PayloadStatusEnum,
+        new_payload_local_fault: bool,
         fcu: PayloadStatusEnum,
-        /// Make `new_payload` fail at the transport level rather than return a status: the mock
-        /// drops the responder, which `ConsensusEngineHandle::new_payload` maps to
-        /// `Err(BeaconOnNewPayloadError::EngineUnavailable)`. Distinct from
-        /// `PayloadStatusEnum::Invalid` — an `Err` is *our* failure, not a verdict on the block.
+        /// Drop the responder so `new_payload` returns `EngineUnavailable`.
         new_payload_unavailable: bool,
-        /// Fires once per observed `NewPayload`, so a test can await proof that the engine call
-        /// actually happened rather than inferring it from a timeout.
+        /// Signals that the mock has replied to or dropped a `NewPayload` request.
         new_payload_observed: Option<mpsc::UnboundedSender<()>>,
     }
 
@@ -1805,6 +1803,7 @@ mod tests {
         fn both_valid() -> Self {
             Self {
                 new_payload: PayloadStatusEnum::Valid,
+                new_payload_local_fault: false,
                 fcu: PayloadStatusEnum::Valid,
                 new_payload_unavailable: false,
                 new_payload_observed: None,
@@ -1814,31 +1813,24 @@ mod tests {
         fn invalid_new_payload() -> Self {
             Self {
                 new_payload: PayloadStatusEnum::Invalid { validation_error: "test error".into() },
-                fcu: PayloadStatusEnum::Valid,
-                new_payload_unavailable: false,
-                new_payload_observed: None,
+                ..Self::both_valid()
             }
         }
 
         fn invalid_fcu() -> Self {
             Self {
-                new_payload: PayloadStatusEnum::Valid,
                 fcu: PayloadStatusEnum::Invalid { validation_error: "fcu error".into() },
-                new_payload_unavailable: false,
-                new_payload_observed: None,
+                ..Self::both_valid()
             }
         }
 
-        /// `engine.new_payload()` returns `Err`, exercising the arm that is neither Valid nor
-        /// Invalid. Returns a receiver that fires once the engine call has been made and failed.
         fn unavailable_new_payload() -> (Self, mpsc::UnboundedReceiver<()>) {
             let (observed_tx, observed_rx) = mpsc::unbounded_channel();
             (
                 Self {
-                    new_payload: PayloadStatusEnum::Valid,
-                    fcu: PayloadStatusEnum::Valid,
                     new_payload_unavailable: true,
                     new_payload_observed: Some(observed_tx),
+                    ..Self::both_valid()
                 },
                 observed_rx,
             )
@@ -1848,6 +1840,7 @@ mod tests {
     /// Test fixture for block import tests
     struct TestFixture {
         handle: ImportHandle,
+        forkchoice_updates: mpsc::UnboundedReceiver<ForkchoiceState>,
         /// Sender feeding the service's BEP-675 BidBlock channel (`from_bid_block`).
         bid_tx: mpsc::UnboundedSender<IncomingBidBlock>,
     }
@@ -1870,7 +1863,8 @@ mod tests {
             let (to_engine, from_engine) = mpsc::unbounded_channel();
             let engine_handle = ConsensusEngineHandle::new(to_engine);
 
-            handle_engine_msg(from_engine, responses).await;
+            let forkchoice_updates =
+                handle_engine_msg(from_engine, responses, provider.clone()).await;
 
             let (to_import, from_network) = mpsc::unbounded_channel();
             let (to_import_mined, from_builder) = mpsc::unbounded_channel();
@@ -1894,7 +1888,7 @@ mod tests {
                 service.await.unwrap();
             }));
 
-            Self { handle, bid_tx: to_import_bid }
+            Self { handle, bid_tx: to_import_bid, forkchoice_updates }
         }
 
         /// Run a block import test with the given event assertion
@@ -1969,16 +1963,19 @@ mod tests {
     async fn handle_engine_msg(
         mut from_engine: mpsc::UnboundedReceiver<BeaconEngineMessage<BscPayloadTypes>>,
         responses: EngineResponses,
-    ) {
+        provider: MockProvider,
+    ) -> mpsc::UnboundedReceiver<ForkchoiceState> {
+        let (fcu_tx, fcu_rx) = mpsc::unbounded_channel();
         tokio::spawn(Box::pin(async move {
             while let Some(message) = from_engine.recv().await {
                 match message {
-                    BeaconEngineMessage::NewPayload { payload: _, tx } => {
+                    BeaconEngineMessage::NewPayload { payload, tx } => {
+                        if responses.new_payload_local_fault {
+                            let local_fault = payload.local_fault.as_ref().expect("request marker");
+                            assert!(!local_fault.load(Ordering::Acquire));
+                            local_fault.store(true, Ordering::Release);
+                        }
                         if responses.new_payload_unavailable {
-                            // Drop the responder without replying: the handle maps a closed oneshot
-                            // to `Err(BeaconOnNewPayloadError::EngineUnavailable)`, which is the
-                            // real shape of this failure (engine task gone) rather than a synthetic
-                            // error value.
                             drop(tx);
                         } else {
                             tx.send(Ok(PayloadStatus::new(responses.new_payload.clone(), None)))
@@ -1988,17 +1985,22 @@ mod tests {
                             let _ = observed.send(());
                         }
                     }
-                    BeaconEngineMessage::ForkchoiceUpdated { state: _, payload_attrs: _, tx } => {
+                    BeaconEngineMessage::ForkchoiceUpdated { state, payload_attrs: _, tx } => {
+                        let _ = fcu_tx.send(state);
                         tx.send(Ok(OnForkChoiceUpdated::valid(PayloadStatus::new(
                             responses.fcu.clone(),
                             None,
                         ))))
                         .unwrap();
                     }
+                    BeaconEngineMessage::QueryTd { hash, tx, .. } => {
+                        tx.send(Ok(provider.td_by_hash.get(&hash).copied())).unwrap();
+                    }
                     _ => {}
                 }
             }
         }));
+        fcu_rx
     }
 
     /// Spawn an `ImportService` with `MockProvider::best_block_number = local_tip`
