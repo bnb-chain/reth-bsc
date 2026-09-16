@@ -462,8 +462,13 @@ where
         }
         // Read before the call: `resolve` borrows the executor as the parent state.
         let (block, parent_hash) = (parent.number + 1, self.ctx.base.parent_hash);
+        let producing =
+            matches!(self.ctx.mode, BscExecutionMode::Mining | BscExecutionMode::BidSimulation);
         self.lane = LaneState::resolve(self, parent_hash, gas_limit)
             .inspect_err(|err| {
+                if producing {
+                    crate::metrics::LANE_METRICS.produce_declined.increment(1);
+                }
                 tracing::error!(
                     target: "bsc::payment_lane",
                     block,
