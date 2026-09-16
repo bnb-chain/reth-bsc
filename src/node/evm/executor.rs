@@ -31,7 +31,7 @@ use alloy_evm::{
     eth::receipt_builder::ReceiptBuilderCtx,
 };
 use crate::node::evm::error::lane_reject;
-use crate::consensus::payment_lane::{state::LaneState, Lane, LaneError, LaneLiveState};
+use crate::consensus::payment_lane::{state::LaneState, LaneError, LaneLiveState, LaneType};
 use alloy_consensus::constants::KECCAK_EMPTY;
 use alloy_primitives::keccak256;
 use alloy_primitives::{hex, uint, Address, BlockNumber, Bytes, U256};
@@ -62,7 +62,7 @@ pub struct BscTxResult<H> {
     pub tx_type: TxType,
     pub tx: TransactionSigned,
     pub is_system: bool,
-    pub lane: Lane,
+    pub lane: LaneType,
 }
 
 impl<H: Send + 'static> TxResult for BscTxResult<H> {
@@ -495,7 +495,7 @@ where
         to: Option<Address>,
         tx_type: u8,
         value: U256,
-    ) -> Result<Lane, BlockExecutionError> {
+    ) -> Result<LaneType, BlockExecutionError> {
         // The lane holds an `Arc` to the listed set, so this clone is two words and a refcount;
         // it is what lets the classifier borrow the executor as the live state.
         let lane = self.lane.clone();
@@ -512,11 +512,10 @@ where
         if !self.lane.on() {
             return Ok(());
         }
-        let metrics = &crate::metrics::LANE_METRICS;
 
         if let Err(err) = self.lane.verify(gas_used) {
             if self.ctx.mode.finalizes() {
-                metrics.produce_declined.increment(1);
+                crate::metrics::LANE_METRICS.produce_declined.increment(1);
             }
             error!(
                 target: "bsc::payment_lane",
@@ -528,7 +527,7 @@ where
                 gas_used,
                 quota = self.lane.quota(),
                 payment_gas_used = self.lane.used(),
-                idle = self.lane.idle(),
+                idle = self.lane.idle_lane(),
                 ratio = self.lane.ratio(),
                 listed = self.lane.listed_len(),
                 receipts = self.receipts.len(),
@@ -538,19 +537,34 @@ where
             return Err(lane_reject(err));
         }
 
+        self.record_imported();
+        self.try_inherit_lane_meta();
+        Ok(())
+    }
+
+    /// Reports what the block that just passed reserved and spent.
+    ///
+    /// Import only: it is the one path every node type runs, so the gauges stay comparable
+    /// between a validator and a full node. A producer reaches the same verdict once per bid
+    /// simulation, and reporting those would leave the gauges tracking the last simulated bid
+    /// instead of the chain.
+    fn record_imported(&self) {
+        if self.ctx.mode != BscExecutionMode::Import {
+            return;
+        }
+        let metrics = &crate::metrics::LANE_METRICS;
         metrics.quota.set(self.lane.quota() as f64);
         metrics.payment_gas_used.set(self.lane.used() as f64);
-        metrics.idle.set(self.lane.idle() as f64);
+        metrics.idle.set(self.lane.idle_lane() as f64);
+    }
 
-        // Hand the config to this block's children, unless this block is what changed it. No-op
-        // while producing, where the block has no hash yet — it is cached when this node later
-        // imports it.
-        if !self.lane_contract_changed {
-            if let Some(hash) = self.ctx.header_hash {
-                self.lane.inherit_to(hash);
-            }
+    fn try_inherit_lane_meta(&self) {
+        if self.lane_contract_changed {
+            return;
         }
-        Ok(())
+        if let Some(hash) = self.ctx.header_hash {
+            self.lane.inherit_to(hash);
+        }
     }
 }
 
@@ -738,7 +752,7 @@ where
                     tx_gas_limit,
                     shared,
                     quota = self.lane.quota(),
-                    idle = self.lane.idle(),
+                    idle = self.lane.idle_lane(),
                     "dropping a transaction that would eat into the reservation"
                 );
                 return Err(BlockValidationError::InvalidTx {
@@ -882,13 +896,10 @@ where
         }
 
         // A bid fixes its own transaction set, so the gate above never ran on it: hold the
-        // finished set to the same inequality once instead — go-bsc `bidSimulator.simBid` ->
-        // `LaneState.VerifyPackedBid`. Before finalization, so `producer_shared_gas` still
-        // means what it means on the packing side.
+        // finished set to the same inequality once instead. Before finalization, so
+        // `producer_shared_gas` still means what it means on the packing side.
         if self.ctx.mode == BscExecutionMode::BidSimulation {
-            self.lane
-                .verify_bid_leaves_reservation(self.producer_shared_gas())
-                .map_err(lane_reject)?;
+            self.lane.verify_packed_bid(self.producer_shared_gas()).map_err(lane_reject)?;
         }
 
         match self.ctx.mode {

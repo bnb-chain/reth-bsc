@@ -642,7 +642,7 @@ mod parent_block_env {
     #[test]
     fn lane_config_is_inherited_until_the_contract_changes() {
         use crate::consensus::payment_lane::{
-            meta::{cache_peek, LaneMeta},
+            meta::{cache_get, LaneMeta},
             state::LaneState,
             Budget, PAYMENT_LANE_CONTRACT,
         };
@@ -656,13 +656,13 @@ mod parent_block_env {
         executor.ctx.header_hash = Some(inherited);
         executor.commit_state(touched(Address::repeat_byte(0xaa)));
         executor.verify_payment_lane(0).expect("an empty block cannot violate");
-        assert_eq!(cache_peek(inherited).map(|m| m.ratio), Some(500));
+        assert_eq!(cache_get(inherited).map(|m| m.ratio), Some(500));
 
         let changed = B256::repeat_byte(0x22);
         executor.ctx.header_hash = Some(changed);
         executor.commit_state(touched(PAYMENT_LANE_CONTRACT));
         executor.verify_payment_lane(0).expect("an empty block cannot violate");
-        assert!(cache_peek(changed).is_none());
+        assert!(cache_get(changed).is_none());
     }
 
     /// A late read would take the ratio and the list from a state this block already changed,

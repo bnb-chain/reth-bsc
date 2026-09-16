@@ -1,23 +1,54 @@
-//! Lane arithmetic, transaction classification and the block accounting rule.
+//! The lane arithmetic and the gates — go-bsc `core/paymentlane`.
 
-use super::{Budget, Lane, LaneError, RATIO_DENOM};
+use super::{Budget, LaneError, LaneType, MAX_LANE_RATIO, RATIO_DENOM};
 use alloy_primitives::{map::HashSet, Address, U256};
 
-/// `quota = ratio * gas_limit / RATIO_DENOM`, in 128 bits: `gas_limit` reaches `2^63 - 1`, so at
-/// the maximum ratio the product needs 73 bits and a 64-bit multiply would wrap.
+/// Guards at the getter's full `uint256` width: a value narrowed to 64 bits first can land inside
+/// the bound when the value returned did not.
+pub fn check_ratio(ratio: U256) -> Result<u64, LaneError> {
+    match u64::try_from(ratio) {
+        Ok(narrowed) if narrowed > 0 && narrowed <= MAX_LANE_RATIO => Ok(narrowed),
+        _ => Err(LaneError::CorruptConfig(format!(
+            "payment lane ratio {ratio} outside 0 < ratio <= {MAX_LANE_RATIO}"
+        ))),
+    }
+}
+
+/// In 128 bits: at the maximum ratio a `2^63` gas limit makes a 73-bit product, which a 64-bit
+/// multiply would wrap.
 pub fn quota(ratio: u64, gas_limit: u64) -> u64 {
     u64::try_from(ratio as u128 * gas_limit as u128 / RATIO_DENOM as u128).unwrap_or_else(|_| {
         panic!("quota overflowed u64: ratio {ratio} gas_limit {gas_limit} denom {RATIO_DENOM}")
     })
 }
 
-/// Classify one transaction. The gates run in the order written, and all of them live here so no
-/// call site can implement half the rule.
+/// The block validity rule. `gas_used` must be the header's total, so Parlia's system gas counts
+/// as general.
 ///
-/// `code_at_to_is_empty` must read **live** state: an address that gains code earlier in the same
-/// block is general by the time a transfer to it is classified, so memoizing by address is a
-/// fork. Both an absent account and `KECCAK_EMPTY` count as empty — testing `!= KECCAK_EMPTY`
-/// alone would drop every transfer to a fresh account out of the lane.
+/// Checked, not saturating: at `gas_limit == u64::MAX` a saturating sum compares equal and would
+/// admit a block that overflowed.
+pub fn check_inequality(
+    gas_limit: u64,
+    gas_used: u64,
+    payment_gas_used: u64,
+    payment_lane_quota: u64,
+) -> Result<(), LaneError> {
+    let idle = payment_lane_quota.saturating_sub(payment_gas_used);
+    match gas_used.checked_add(idle) {
+        Some(total) if total <= gas_limit => Ok(()),
+        _ => Err(LaneError::Violated {
+            gas_limit,
+            gas_used,
+            quota: payment_lane_quota,
+            payment_gas_used,
+        }),
+    }
+}
+
+/// Every gate, in consensus order, so no call site can implement half the rule.
+///
+/// `code_at_to_is_empty` must read live state and count an absent account as empty — see
+/// [`super::LaneLiveState`].
 pub fn classify(
     is_system: bool,
     to: Option<Address>,
@@ -25,72 +56,62 @@ pub fn classify(
     value: U256,
     listed: &HashSet<Address>,
     code_at_to_is_empty: impl FnOnce(Address) -> Result<bool, LaneError>,
-) -> Result<Lane, LaneError> {
-    // Consensus mechanics, not user traffic: general whatever the destination, and a listed
-    // destination must not rescue them. First, because a `deposit` passes the payment gates.
+) -> Result<LaneType, LaneError> {
+    // Consensus mechanics, not user traffic. First, because a `deposit` passes the payment gates.
     if is_system {
-        return Ok(Lane::General);
+        return Ok(LaneType::GeneralLane);
     }
-    let Some(to) = to else { return Ok(Lane::General) };
-    // Blob and set-code transactions are excluded: the code gate cannot see code that an
-    // authorisation carried by the transaction itself installs.
+    let Some(to) = to else { return Ok(LaneType::GeneralLane) };
+    // The code gate cannot see code that the transaction's own set-code authorisation installs.
     if !matches!(tx_type, 0x00..=0x02) {
-        return Ok(Lane::General);
+        return Ok(LaneType::GeneralLane);
     }
-    // Settled by the parent post-state; stopping here keeps one transaction's lane from
-    // depending on two different state views.
+    // From the parent post-state, so it answers before the live-state gates below: one
+    // transaction's lane must not depend on two views.
     if listed.contains(&to) {
-        return Ok(Lane::Payment);
+        return Ok(LaneType::PaymentLane);
     }
     if value.is_zero() {
-        return Ok(Lane::General);
+        return Ok(LaneType::GeneralLane);
     }
     if code_at_to_is_empty(to)? {
-        Ok(Lane::Payment)
+        Ok(LaneType::PaymentLane)
     } else {
-        Ok(Lane::General)
+        Ok(LaneType::GeneralLane)
     }
 }
 
 impl Budget {
     /// Reserved gas no payment transaction has claimed.
-    pub fn idle(&self) -> u64 {
-        self.quota.saturating_sub(self.used)
+    pub fn idle_lane(&self) -> u64 {
+        self.payment_lane_quota.saturating_sub(self.payment_lane_used)
     }
 
-    /// Whether this transaction fits, with `shared` the gas still available to any lane. Payment
-    /// may take the whole remainder; general must leave the idle reservation untouched.
-    ///
+    /// The largest gas limit a *single* transaction of this lane may declare, with `shared` the
+    /// gas still available to any lane. Payment may take the whole remainder; general must leave
+    /// the idle reservation untouched.
+    pub fn max_available_gas(&self, shared: u64, lane: LaneType) -> u64 {
+        match lane {
+            LaneType::PaymentLane => shared,
+            LaneType::GeneralLane => shared.saturating_sub(self.idle_lane()),
+        }
+    }
+
     /// Producer side only: the importer gates nothing, it rules on the finished block.
-    pub fn admits(&self, shared: u64, lane: Lane, tx_gas_limit: u64) -> bool {
-        tx_gas_limit <=
-            match lane {
-                Lane::Payment => shared,
-                Lane::General => shared.saturating_sub(self.idle()),
-            }
+    pub fn admits(&self, shared: u64, lane: LaneType, tx_gas_limit: u64) -> bool {
+        tx_gas_limit <= self.max_available_gas(shared, lane)
     }
 
-    /// Plain `+=`: `used` tracks a subset of the block's gas, so it cannot overflow.
-    pub fn record_used(&mut self, lane: Lane, delta: u64) {
-        if lane == Lane::Payment {
-            self.used += delta;
+    /// Plain `+=`: the payment total tracks a subset of the block's gas, so it cannot overflow.
+    pub fn record_used(&mut self, lane: LaneType, delta: u64) {
+        if lane == LaneType::PaymentLane {
+            self.payment_lane_used += delta;
         }
     }
 
-    /// `gas_used` must be the header's total, so Parlia's system gas counts as general.
-    ///
-    /// `checked_add`, not saturating: at `gas_limit == u64::MAX` a saturating sum compares equal
-    /// and would accept a block that overflowed.
+    /// This budget held to [`check_inequality`].
     pub fn verify(&self, gas_limit: u64, gas_used: u64) -> Result<(), LaneError> {
-        match gas_used.checked_add(self.idle()) {
-            Some(total) if total <= gas_limit => Ok(()),
-            _ => Err(LaneError::Violated {
-                gas_limit,
-                gas_used,
-                quota: self.quota,
-                payment_gas_used: self.used,
-            }),
-        }
+        check_inequality(gas_limit, gas_used, self.payment_lane_used, self.payment_lane_quota)
     }
 }
 
@@ -99,7 +120,7 @@ mod tests {
     use super::*;
 
     fn budget(quota: u64, used: u64) -> Budget {
-        Budget { quota, used }
+        Budget { payment_lane_quota: quota, payment_lane_used: used }
     }
 
     #[test]
@@ -113,8 +134,6 @@ mod tests {
         assert_eq!(quota(1_000, i64::MAX as u64), 922_337_203_685_477_580);
     }
 
-    /// The reservation is a floor, not a ceiling: unclaimed quota stays out of general's reach,
-    /// while payment traffic may take the whole block.
     #[test]
     fn lane_is_a_floor_not_a_ceiling() {
         // (general gas, payment gas, must reject) against gas_limit 100 and quota 20.
@@ -134,13 +153,11 @@ mod tests {
         assert!(budget(200, 0).verify(100, 0).is_err());
     }
 
-    /// The carry must reject, never wrap into acceptance.
     #[test]
     fn overflow_is_not_a_way_in() {
         const LIMIT: u64 = 70_000_000;
         let half = u64::MAX / 2 + 1;
-        for &(gas_used, quota) in
-            &[(u64::MAX, 0), (LIMIT, u64::MAX), (half, half), (LIMIT + 1, 0)]
+        for &(gas_used, quota) in &[(u64::MAX, 0), (LIMIT, u64::MAX), (half, half), (LIMIT + 1, 0)]
         {
             let got = budget(quota, 0).verify(LIMIT, gas_used);
             assert!(got.is_err(), "gas_used={gas_used} quota={quota} must be a violation");
@@ -149,8 +166,8 @@ mod tests {
         assert!(budget(u64::MAX, u64::MAX).verify(LIMIT, 1000).is_ok());
     }
 
-    /// Admission must agree exactly with post-transaction validity, or a producer drops a
-    /// transaction that its own final check would have accepted.
+    /// Must agree exactly with post-transaction validity, or a producer drops a transaction its
+    /// own final check would have accepted.
     #[test]
     fn admission_is_exactly_tight() {
         const CAPACITY: u64 = 40;
@@ -163,14 +180,14 @@ mod tests {
                         continue;
                     }
                     let shared = CAPACITY - used - general;
-                    for lane in [Lane::General, Lane::Payment] {
+                    for lane in [LaneType::GeneralLane, LaneType::PaymentLane] {
                         for gas in 0..=CAPACITY {
                             let mut after = before.clone();
                             after.record_used(lane, gas);
                             let general_after =
-                                general + if lane == Lane::General { gas } else { 0 };
-                            let legal =
-                                after.verify(CAPACITY, general_after + after.used).is_ok();
+                                general + if lane == LaneType::GeneralLane { gas } else { 0 };
+                            let total = general_after + after.payment_lane_used;
+                            let legal = after.verify(CAPACITY, total).is_ok();
                             assert_eq!(
                                 before.admits(shared, lane, gas),
                                 legal,
@@ -193,36 +210,35 @@ mod tests {
         let has_code = |_: Address| Ok(false);
         let never = |_: Address| -> Result<bool, LaneError> { panic!("code gate must not run") };
 
-        // A system transaction is general where every payment gate would otherwise pass — and
-        // the same transaction without the flag is payment, so this is not passing by accident.
-        assert_eq!(classify(true, Some(listed_addr), 0, one, &listed, never), Ok(Lane::General));
-        assert_eq!(classify(false, Some(listed_addr), 0, one, &listed, never), Ok(Lane::Payment));
+        // The same transaction with and without the flag, so system is not general by accident.
+        let listed_tx = |is_system| classify(is_system, Some(listed_addr), 0, one, &listed, never);
+        assert_eq!(listed_tx(true), Ok(LaneType::GeneralLane));
+        assert_eq!(listed_tx(false), Ok(LaneType::PaymentLane));
 
         // A creation has no destination to test.
-        assert_eq!(classify(false, None, 0, one, &listed, never), Ok(Lane::General));
+        assert_eq!(classify(false, None, 0, one, &listed, never), Ok(LaneType::GeneralLane));
 
         // Excluded types are general even when listed: 0x03 carries blobs, 0x04 installs code.
         for ty in [0x03u8, 0x04, 0x05, 0x7e] {
             let lane = classify(false, Some(listed_addr), ty, one, &listed, never);
-            assert_eq!(lane, Ok(Lane::General), "type {ty:#x}");
+            assert_eq!(lane, Ok(LaneType::GeneralLane), "type {ty:#x}");
         }
 
-        // A listed destination is payment at any admitted type and any value, and without the
-        // probe — so a listed contract stays in the lane.
+        // Listed: payment at any admitted type and any value, without ever reaching the probe.
         for ty in [0x00u8, 0x01, 0x02] {
             for value in [U256::ZERO, one] {
                 let lane = classify(false, Some(listed_addr), ty, value, &listed, never);
-                assert_eq!(lane, Ok(Lane::Payment), "type {ty:#x} value {value}");
+                assert_eq!(lane, Ok(LaneType::PaymentLane), "type {ty:#x} value {value}");
             }
         }
 
         // An unlisted destination needs a bare transfer: non-zero value, no code.
-        assert_eq!(classify(false, Some(plain), 0, one, &listed, empty), Ok(Lane::Payment));
-        assert_eq!(classify(false, Some(plain), 0, U256::ZERO, &listed, never), Ok(Lane::General));
-        assert_eq!(classify(false, Some(plain), 0, one, &listed, has_code), Ok(Lane::General));
+        let to = Some(plain);
+        assert_eq!(classify(false, to, 0, one, &listed, empty), Ok(LaneType::PaymentLane));
+        assert_eq!(classify(false, to, 0, U256::ZERO, &listed, never), Ok(LaneType::GeneralLane));
+        assert_eq!(classify(false, to, 0, one, &listed, has_code), Ok(LaneType::GeneralLane));
 
-        // A failed read is surfaced, never rounded to "no code" — that would make an honest
-        // block look like it overran the lane.
+        // Never rounded to "no code": that would make an honest block look like it overran.
         let unavailable = |_: Address| Err(LaneError::StateUnavailable("missing node".into()));
         assert!(matches!(
             classify(false, Some(plain), 0, one, &listed, unavailable),

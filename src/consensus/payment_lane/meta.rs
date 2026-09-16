@@ -2,8 +2,8 @@
 //! the result. go-bsc's `core/paymentlanemeta`.
 
 use super::{
-    LaneError, LaneParentState, MAX_LANE_RATIO, MAX_LISTED_CONTRACTS, PAGE_SIZE,
-    PAYMENT_LANE_CONTRACT, RATIO_DENOM,
+    rules, LaneError, LaneParentState, MAX_LISTED_CONTRACTS, PAGE_SIZE, PAYMENT_LANE_CONTRACT,
+    RATIO_DENOM,
 };
 use alloy_primitives::{map::HashSet, Address, BlockHash, Bytes, U256};
 use alloy_sol_types::{sol, SolCall};
@@ -37,7 +37,7 @@ pub struct LaneMeta {
 
 impl LaneMeta {
     pub fn quota(&self, gas_limit: u64) -> u64 {
-        super::rules::quota(self.ratio, gas_limit)
+        rules::quota(self.ratio, gas_limit)
     }
 }
 
@@ -51,16 +51,12 @@ pub fn contracts_calldata(offset: u64) -> Bytes {
         .into()
 }
 
-/// Applies the ratio guard at the full `uint256` width.
+/// Decodes the getter's return value and hands it to [`rules::check_ratio`], which guards it at
+/// the full `uint256` width.
 pub fn decode_ratio(ret: &[u8]) -> Result<u64, LaneError> {
     let value = getPaymentLaneRatioCall::abi_decode_returns(ret)
         .map_err(|e| corrupt(format!("getPaymentLaneRatio decode: {e}")))?;
-    match u64::try_from(value) {
-        Ok(ratio) if ratio > 0 && ratio <= MAX_LANE_RATIO => Ok(ratio),
-        _ => Err(corrupt(format!(
-            "payment lane ratio {value} outside 0 < ratio <= {MAX_LANE_RATIO}"
-        ))),
-    }
+    rules::check_ratio(value)
 }
 
 /// Folds the paged contract list into one set, rejecting every inconsistency.
@@ -158,9 +154,9 @@ impl PageWalk {
 /// go-bsc keys the same cache by `0x2007`'s `(codeHash, storageRoot)`, which is content-addressed
 /// and needs no propagation. revm's account carries no storage root, and computing one means
 /// walking the contract's storage trie every block, so this keys by hash instead and moves an
-/// entry along a real parent-child edge ([`cache_inherit`]) whenever the block left `0x2007`
-/// alone. Same guarantee, reth's primitives: a sibling branch's config can never be read here,
-/// because an entry only ever reaches a hash whose parent it was read at.
+/// entry along a real parent-child edge whenever the block left `0x2007` alone
+/// (`LaneState::inherit_to`). Same guarantee, reth's primitives: a sibling branch's config can
+/// never be read here, because an entry only ever reaches a hash whose parent it was read at.
 static CACHE: LazyLock<Mutex<LruMap<BlockHash, LaneMeta, ByLength>>> =
     LazyLock::new(|| Mutex::new(LruMap::new(ByLength::new(1024))));
 
@@ -173,8 +169,8 @@ pub fn load(
     access: &mut impl LaneParentState,
     parent_hash: BlockHash,
 ) -> Result<LaneMeta, LaneError> {
-    if let Some(hit) = CACHE.lock().unwrap().get(&parent_hash) {
-        return Ok(hit.clone());
+    if let Some(hit) = cache_get(parent_hash) {
+        return Ok(hit);
     }
 
     let started = std::time::Instant::now();
@@ -205,23 +201,18 @@ pub fn load(
     );
 
     let meta = LaneMeta { ratio, listed: Arc::new(listed) };
-    CACHE.lock().unwrap().insert(parent_hash, meta.clone());
+    cache_store(parent_hash, &meta);
     Ok(meta)
 }
 
-/// Carries a block's config forward to its own hash, so the walk costs one read per governance
-/// change rather than one per block.
-///
-/// The caller must not call this for a block that wrote to `0x2007`: the config it ran under is
-/// no longer the one its children will see.
-pub fn cache_inherit(block_hash: BlockHash, meta: &LaneMeta) {
-    CACHE.lock().unwrap().insert(block_hash, meta.clone());
+/// Files `meta` as the config every block whose parent is `hash` must read.
+pub fn cache_store(hash: BlockHash, meta: &LaneMeta) {
+    CACHE.lock().unwrap().insert(hash, meta.clone());
 }
 
-/// Test-only: what the cache holds for `block_hash`.
-#[cfg(test)]
-pub fn cache_peek(block_hash: BlockHash) -> Option<LaneMeta> {
-    CACHE.lock().unwrap().get(&block_hash).cloned()
+/// What the cache holds for `hash`.
+pub fn cache_get(hash: BlockHash) -> Option<LaneMeta> {
+    CACHE.lock().unwrap().get(&hash).cloned()
 }
 
 #[cfg(test)]
@@ -334,10 +325,7 @@ mod tests {
 
         // the ceiling, checked before anything else is trusted: this page is also empty while
         // entries remain, so only the order of the checks decides which one surfaces
-        because(
-            PageWalk::default().accept(0, &page(MAX_LISTED_CONTRACTS + 1, &[])),
-            "ceiling",
-        );
+        because(PageWalk::default().accept(0, &page(MAX_LISTED_CONTRACTS + 1, &[])), "ceiling");
 
         // total changes mid-walk
         let mut w = PageWalk::default();
