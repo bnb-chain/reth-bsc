@@ -1423,7 +1423,7 @@ mod tests {
     }
 
     /// The exact bytecode go-bsc embeds, from the commit its `jennerUpgrade` cites:
-    /// bsc-genesis-contract@45912f550f2027c4af141f94ccb9733177d5603d, solc 0.8.17. A one-byte
+    /// bsc-genesis-contract@2620fb411b0c950dd0abfc4e75fe13393a82c632, solc 0.8.17. A one-byte
     /// difference here is a different state root on the activation block.
     #[test]
     fn jenner_payment_lane_code_matches_genesis_contract() {
