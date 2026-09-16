@@ -374,8 +374,7 @@ pub trait BscHardforks: EthereumHardforks {
             && self.is_jenner_active_at_timestamp(block_number, timestamp)
     }
 
-    /// Convenience method to check if [`BscHardfork::Jenner`] (BEP-706) is active at a given
-    /// timestamp.
+    /// Convenience method to check if [`BscHardfork::Jenner`] is active at a given timestamp.
     fn is_jenner_active_at_timestamp(&self, block_number: u64, timestamp: u64) -> bool {
         self.is_london_active_at_block(block_number) &&
         self.bsc_fork_activation(BscHardfork::Jenner).active_at_timestamp(timestamp)

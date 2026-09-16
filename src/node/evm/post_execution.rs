@@ -188,6 +188,9 @@ where
                     header.number, header.hash_slow(), epoch_length, turn_length);
             }
         }
+        
+        self.verify_payment_lane(self.gas_used)?;
+
         tracing::trace!("Succeed to finalize new block, block_number: {}", block.number());
         Ok(())
     }
@@ -498,7 +501,7 @@ where
             state: &state,
             cumulative_gas_used: self.gas_used,
         }));
-        self.evm.db_mut().commit(state);
+        self.commit_state(state);
 
         // Record system contract execution duration
         let duration = start_time.elapsed();

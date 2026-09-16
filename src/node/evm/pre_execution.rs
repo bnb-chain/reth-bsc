@@ -16,7 +16,10 @@ use alloy_primitives::{BlockHash, BlockNumber, B256};
 use crate::consensus::parlia::{VoteAddress, Snapshot, DIFF_INTURN, DIFF_NOTURN};
 use crate::consensus::parlia::util::{is_breathe_block, debug_header};
 use crate::consensus::parlia::vote::MAX_ATTESTATION_EXTRA_LENGTH;
-use crate::node::evm::error::{BscBlockExecutionError, BscBlockValidationError};
+use crate::consensus::payment_lane::{
+    state::LaneState, LaneError, LaneParentState, GETTER_GAS_LIMIT,
+};
+use crate::node::evm::error::{lane_reject, BscBlockExecutionError, BscBlockValidationError};
 use crate::system_contracts::SystemContract;
 use reth_revm::{database::{EvmStateProvider, StateProviderDatabase}, db::State};
 use crate::system_contracts::feynman_fork::ValidatorElectionInfo;
@@ -198,6 +201,10 @@ where
 
         self.verify_cascading_fields(&header, &parent_header, &snap)?;
 
+        // Nothing about the lane is in the header to check; the verdict is the accounting rule,
+        // reached in `post_check_new_block` once every transaction has run.
+        self.init_payment_lane(&parent_header, header.gas_limit)?;
+
         let epoch_length = snap.epoch_num;
         if header.number.is_multiple_of(epoch_length) {
             let (validator_set, vote_addresses) = self.get_current_validators_with_cache(
@@ -340,6 +347,46 @@ where
             view_call_tx_env(to, data.clone(), self.evm.block().gas_limit(), self.spec.chain().id());
         let result_and_state = self.evm.transact(tx_env.into_tx_env()).map_err(BlockExecutionError::other)?;
         view_call_output(to, &data, result_and_state.result)
+    }
+
+    /// Derives this block's lane from the parent's ratio and this block's `gas_limit`.
+    ///
+    /// Gated on the PARENT: the ratio comes from its post-state, and Jenner installs `0x2007`
+    /// while its activation block executes, so `activation + 1` is the first block that reserves.
+    ///
+    /// Must run before this block mutates state — see [`LaneParentState`], which is what refuses
+    /// a late read.
+    fn init_payment_lane(
+        &mut self,
+        parent: &Header,
+        gas_limit: u64,
+    ) -> Result<(), BlockExecutionError> {
+        if !self.spec.is_jenner_active_at_timestamp(parent.number, parent.timestamp) {
+            return Ok(());
+        }
+        // Read before the call: `resolve` borrows the executor as the parent state.
+        let (block, parent_hash) = (parent.number + 1, self.ctx.base.parent_hash);
+        self.lane = LaneState::resolve(self, parent_hash, gas_limit)
+            .inspect_err(|err| {
+                tracing::error!(
+                    target: "bsc::payment_lane",
+                    block,
+                    parent = %parent_hash,
+                    gas_limit,
+                    error = %err,
+                    "cannot derive the payment lane"
+                );
+            })
+            .map_err(lane_reject)?;
+        tracing::debug!(
+            target: "bsc::payment_lane",
+            block,
+            ratio = self.lane.ratio(),
+            quota = self.lane.quota(),
+            listed = self.lane.listed_len(),
+            "payment lane active"
+        );
+        Ok(())
     }
 
     /// Runs the same read-only system call against the current DB, but under `parent`'s env.
@@ -695,6 +742,12 @@ where
             self.inner_ctx.snap = Some(snap.clone());
         }
 
+        // `block.gas_limit()` is the sealed limit, not the miner's system-tx-reserved one, so
+        // producer and importer derive the same quota.
+        if self.ctx.mode.finalizes() {
+            self.init_payment_lane(&parent_header, block.gas_limit())?;
+        }
+
         let header_number = block.number().to::<u64>();
         let header_timestamp = block.timestamp().to::<u64>();
         // The election data below feeds `update_validator_set_v2`, which only runs during
@@ -747,5 +800,60 @@ where
             self.inner_ctx.validators_election_info = Some(validator_election_info);
         }
         Ok(())
+    }
+}
+
+/// The parent post-state, the view [`LaneState::resolve`] reads `0x2007` through.
+///
+/// The "must run before this block mutates state" rule lives here and nowhere else: it is this
+/// implementation's promise to keep, not something the lane could check for itself. A late read
+/// would take the ratio and the list from a state this block already changed, and then be cached
+/// under the parent hash for every sibling block to inherit.
+impl<'a, EVM, Spec, R: ReceiptBuilder> LaneParentState for BscBlockExecutor<'a, EVM, Spec, R>
+where
+    EVM: Evm<
+        DB: alloy_evm::block::StateDB,
+        Tx: FromRecoveredTx<R::Transaction>
+                + FromRecoveredTx<TransactionSigned>
+                + FromTxWithEncoded<TransactionSigned>,
+        BlockEnv = crate::evm::block_env::BscBlockEnv,
+    >,
+    Spec: EthereumHardforks + crate::hardforks::BscHardforks + EthChainSpec + Hardforks + Clone + 'static,
+    R: ReceiptBuilder<Transaction = TransactionSigned, Receipt: TxReceipt>,
+    <R as ReceiptBuilder>::Transaction: Unpin + From<TransactionSigned>,
+    <EVM as alloy_evm::Evm>::Tx: FromTxWithEncoded<<R as ReceiptBuilder>::Transaction>,
+    BscTxEnv: IntoTxEnv<<EVM as alloy_evm::Evm>::Tx>,
+    R::Transaction: Into<TransactionSigned>,
+{
+    fn call_lane_getter(&mut self, to: Address, data: Bytes) -> Result<Bytes, LaneError> {
+        if !self.db_at_parent_state {
+            return Err(LaneError::StateUnavailable(
+                "payment lane read after this block mutated state".into(),
+            ));
+        }
+
+        let tx_env = view_call_tx_env(to, data, GETTER_GAS_LIMIT, self.spec.chain().id());
+        // A revert or a halt is a verdict on the block, so it comes back as `CorruptConfig`; only
+        // a `transact` error is a local fault, and there the executor must not be reused.
+        let result = self
+            .evm
+            .transact(tx_env.into_tx_env())
+            .map_err(|err| LaneError::StateUnavailable(err.to_string()))?
+            .result;
+
+        // The reason only: this string reaches the consensus layer, and return data can run to
+        // megabytes.
+        let reason = match result {
+            ExecutionResult::Success { output, .. } => {
+                let data = output.into_data();
+                if !data.is_empty() {
+                    return Ok(data);
+                }
+                "returned no data".to_string()
+            }
+            ExecutionResult::Revert { .. } => "reverted".to_string(),
+            ExecutionResult::Halt { reason, .. } => format!("halted: {reason:?}"),
+        };
+        Err(LaneError::CorruptConfig(format!("getter at {to} {reason}")))
     }
 }

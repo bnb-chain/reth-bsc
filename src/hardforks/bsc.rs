@@ -71,7 +71,7 @@ hardfork!(
         Mendel,
         /// BSC `Pasteur` hardfork - sequenced immediately after Mendel
         Pasteur,
-        /// BSC `Jenner` hardfork (BEP-706) - sequenced immediately after Pasteur
+        /// BSC `Jenner` hardfork - sequenced immediately after Pasteur
         Jenner,
     }
 );

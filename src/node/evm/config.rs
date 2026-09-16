@@ -69,6 +69,9 @@ pub enum BscExecutionMode {
     /// Producing a block this validator will sign and broadcast. System transactions are
     /// generated and signed with the validator key.
     Mining,
+    /// Simulating a BEP-322 MEV bid: finalizes and signs like [`Self::Mining`], but the builder
+    /// fixed the transaction set, so the lane only accounts and then rules on the result.
+    BidSimulation,
     /// Answering a hypothetical — `eth_simulateV1` or the local pending block. Authors a
     /// header like [`Self::Mining`], but runs no Parlia finalization and signs nothing,
     /// matching BSC geth's simulation path.
@@ -78,15 +81,21 @@ pub enum BscExecutionMode {
 impl BscExecutionMode {
     /// Whether no header exists yet and one is being authored.
     ///
-    /// True for both [`Self::Mining`] and [`Self::Simulation`]; the block-verification
-    /// checks that dereference `ctx.header` must be skipped in both.
+    /// True for every producing mode; the block-verification checks that dereference
+    /// `ctx.header` must be skipped in all of them.
     pub const fn authors_block(self) -> bool {
-        matches!(self, Self::Mining | Self::Simulation)
+        matches!(self, Self::Mining | Self::BidSimulation | Self::Simulation)
     }
 
     /// Whether Parlia post-block finalization (reward distribution, slashing, validator-set
     /// updates) must run — which implies signing system transactions.
     pub const fn finalizes(self) -> bool {
+        matches!(self, Self::Mining | Self::BidSimulation)
+    }
+
+    /// Whether this mode chooses the transactions itself, one at a time, and can therefore hold
+    /// each one to BEP-703's admission gate — go-bsc `worker.commitTransactions`.
+    pub const fn packs_from_pool(self) -> bool {
         matches!(self, Self::Mining)
     }
 }
@@ -895,10 +904,12 @@ mod tests {
     fn execution_mode_predicates_split_authoring_from_finalizing() {
         assert!(!BscExecutionMode::Import.authors_block());
         assert!(BscExecutionMode::Mining.authors_block());
+        assert!(BscExecutionMode::BidSimulation.authors_block());
         assert!(BscExecutionMode::Simulation.authors_block());
 
         assert!(!BscExecutionMode::Import.finalizes());
         assert!(BscExecutionMode::Mining.finalizes());
+        assert!(BscExecutionMode::BidSimulation.finalizes());
         assert!(!BscExecutionMode::Simulation.finalizes());
     }
 
