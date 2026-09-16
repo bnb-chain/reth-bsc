@@ -3,6 +3,7 @@
 //! the call exits. Mirrors go-bsc's `PrecompileContext` (core/vm/contracts_stateful.go)
 //! and its charge functions (core/vm/cas20_gas.go).
 
+use super::{observer::CallStats, Cas20Version};
 use alloy_evm::EvmInternals;
 use alloy_primitives::{Address, Bytes, Log, B256, U256};
 use revm::{
@@ -111,6 +112,11 @@ impl Meter {
         self.limit - self.used
     }
 
+    /// What an exhausted frame hands back: nothing.
+    pub(crate) fn exhaust(&mut self) {
+        self.used = self.limit;
+    }
+
     /// Exhausts the budget when the charge cannot be covered, as the EVM does.
     fn charge(&mut self, cost: u64) -> bool {
         if self.left() < cost {
@@ -127,6 +133,11 @@ impl Meter {
 pub(crate) struct Frame<'a> {
     pub(crate) state: &'a mut dyn Cas20State,
     pub(crate) gas: Meter,
+    /// The behaviour in force, fixed by the fork the EVM runs under. Internal
+    /// dispatch inherits it, so a bundle cannot reach a version its caller cannot.
+    pub(crate) version: Cas20Version,
+    /// What the call has done so far, for the observer; never consulted by the logic.
+    pub(crate) stats: CallStats,
     out_of_gas: bool,
     /// Outranks out_of_gas at the exit: the frame had no business writing at all,
     /// whatever it could afford.
@@ -138,14 +149,28 @@ pub(crate) struct Frame<'a> {
 }
 
 impl<'a> Frame<'a> {
-    pub(crate) fn new(state: &'a mut dyn Cas20State, gas_limit: u64) -> Self {
+    pub(crate) fn new(
+        state: &'a mut dyn Cas20State,
+        gas_limit: u64,
+        version: Cas20Version,
+    ) -> Self {
         Self {
             state,
             gas: Meter::new(gas_limit),
+            version,
+            stats: CallStats::default(),
             out_of_gas: false,
             write_protected: false,
             fatal: None,
         }
+    }
+
+    pub(crate) fn is_out_of_gas(&self) -> bool {
+        self.out_of_gas
+    }
+
+    pub(crate) fn is_write_protected(&self) -> bool {
+        self.write_protected
     }
 
     fn fail(&mut self, err: String) {
@@ -154,6 +179,7 @@ impl<'a> Frame<'a> {
     }
 
     pub(crate) fn sload(&mut self, address: Address, key: U256) -> Option<StateLoad<U256>> {
+        self.stats.sloads += 1;
         match self.state.sload(address, key) {
             Ok(v) => Some(v),
             Err(e) => {
@@ -169,6 +195,7 @@ impl<'a> Frame<'a> {
         key: U256,
         value: U256,
     ) -> Option<StateLoad<SStoreResult>> {
+        self.stats.sstores += 1;
         match self.state.sstore(address, key, value) {
             Ok(v) => Some(v),
             Err(e) => {
@@ -242,8 +269,11 @@ impl<'f, 'a> Ctx<'f, 'a> {
         }
     }
 
+    /// An exhausted frame hands nothing back, whatever it had left when the
+    /// charge it could not cover arrived; the meter says so from here on.
     pub(crate) fn mark_out_of_gas(&mut self) {
         self.frame.out_of_gas = true;
+        self.frame.gas.exhaust();
     }
 
     pub(crate) fn out_of_gas(&self) -> bool {
@@ -304,6 +334,8 @@ impl<'f, 'a> Ctx<'f, 'a> {
     /// input. Without it a shared tail could be dispatched N×M times for the price
     /// of one.
     pub(crate) fn charge_internal_dispatch(&mut self, call: &[u8]) -> bool {
+        self.frame.stats.internal_calls += 1;
+        self.frame.stats.internal_call_bytes += call.len() as u64;
         let words = (call.len() as u64).div_ceil(32);
         self.charge_gas(WARM_STORAGE_READ_COST + words * CALLDATA_WORD_GAS)
     }
@@ -318,7 +350,11 @@ impl<'f, 'a> Ctx<'f, 'a> {
 
     pub(crate) fn charge_keccak(&mut self, size: usize) -> bool {
         let words = (size as u64).div_ceil(32);
-        self.charge_gas(KECCAK256_GAS + KECCAK256_WORD_GAS * words)
+        let paid = self.charge_gas(KECCAK256_GAS + KECCAK256_WORD_GAS * words);
+        if paid {
+            self.frame.stats.keccaks += 1;
+        }
+        paid
     }
 
     pub(crate) fn charge_log(&mut self, topics: usize, data_len: usize) -> bool {

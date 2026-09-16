@@ -172,6 +172,7 @@ fn create_cas20(ctx: &mut Ctx<'_, '_>, args: &[u8]) -> R<Vec<u8>> {
     if ctx.out_of_gas() {
         return Err(Cas20Err::OutOfGas);
     }
+    ctx.frame.stats.created = Some(variant);
     if !ctx.add_log(
         vec![TOPIC_CAS20_CREATED, addr_key(addr), w_u8(variant)],
         encode_created_data(&create),

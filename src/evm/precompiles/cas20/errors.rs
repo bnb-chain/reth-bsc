@@ -3,7 +3,8 @@
 
 use super::{
     abi::{abi_bytes, abi_string, encode_tuple},
-    ctx::Ctx,
+    ctx::{Ctx, Frame},
+    observer::CallStatus,
     sigs::*,
 };
 use alloy_primitives::{B256, U256};
@@ -95,6 +96,54 @@ pub(crate) fn finish_metered(ctx: &Ctx<'_, '_>, res: R<Vec<u8>>) -> Exit {
         return Exit::OutOfGas;
     }
     finish(res)
+}
+
+/// The terminal shape of a call, with the precedence every consumer must apply: a
+/// database failure outranks everything, then write protection, then an exhausted
+/// budget, then whatever the handler returned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Outcome {
+    Return(Vec<u8>),
+    Revert(Vec<u8>),
+    OutOfGas,
+    Fatal(String),
+}
+
+impl Outcome {
+    pub(crate) fn status(&self) -> CallStatus {
+        match self {
+            Self::Return(_) => CallStatus::Return,
+            Self::Revert(_) => CallStatus::Revert,
+            Self::OutOfGas => CallStatus::OutOfGas,
+            Self::Fatal(_) => CallStatus::Fatal,
+        }
+    }
+}
+
+/// Closes a call: the outcome under the precedence above, the gas it consumed and
+/// the refund it earned. An exhausted or failed frame consumed its whole budget.
+pub(crate) fn complete(frame: &mut Frame<'_>, exit: Exit) -> (Outcome, u64, i64) {
+    if let Some(msg) = frame.fatal.take() {
+        frame.gas.exhaust();
+        return (Outcome::Fatal(msg), frame.gas.used(), 0);
+    }
+    let exit = if frame.is_write_protected() {
+        finish(Err(Cas20Err::WriteProtection))
+    } else if frame.is_out_of_gas() {
+        Exit::OutOfGas
+    } else {
+        exit
+    };
+    let outcome = match exit {
+        Exit::Return(b) => Outcome::Return(b),
+        Exit::Revert(b) => Outcome::Revert(b),
+        Exit::OutOfGas => {
+            frame.gas.exhaust();
+            Outcome::OutOfGas
+        }
+    };
+    let refund = if matches!(outcome, Outcome::Return(_)) { frame.gas.refund } else { 0 };
+    (outcome, frame.gas.used(), refund)
 }
 
 fn rev_data(sel: Selector) -> Vec<u8> {

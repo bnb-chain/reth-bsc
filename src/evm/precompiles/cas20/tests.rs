@@ -6,7 +6,7 @@ use super::{
     abi::*,
     activation::{act_slot, SLOT_ADMIN, SLOT_FEATURES},
     ctx::{Cas20State, Ctx, Frame},
-    errors::Exit,
+    errors::{complete, Exit, Outcome},
     execute,
     factory::derive_address,
     permit::{domain_separator, ecrecover_address},
@@ -17,6 +17,7 @@ use super::{
     token::PAUSE_TRANSFER,
     *,
 };
+use alloy_evm::precompiles::PrecompileLookup;
 use alloy_primitives::{keccak256, Address, Log, B256, U256};
 use revm::interpreter::{SStoreResult, StateLoad};
 use std::collections::{HashMap, HashSet};
@@ -169,8 +170,8 @@ impl Harness {
         let kind = resolve(to).expect("a routed address");
         let snapshot = self.st.clone();
         let log_start = self.st.logs.len();
-        let (exit, used, refund, fatal) = {
-            let mut frame = Frame::new(&mut self.st, gas);
+        let (outcome, used, refund) = {
+            let mut frame = Frame::new(&mut self.st, gas, Cas20Version::V1);
             let mut ctx = Ctx {
                 frame: &mut frame,
                 self_addr: to,
@@ -181,17 +182,20 @@ impl Harness {
                 admin_renounced: false,
             };
             let exit = execute(kind, &mut ctx, input);
-            (exit, frame.gas.used(), frame.gas.refund, frame.fatal.take())
+            complete(&mut frame, exit)
         };
-        assert!(fatal.is_none(), "fatal: {fatal:?}");
+        let exit = match outcome {
+            Outcome::Return(b) => Exit::Return(b),
+            Outcome::Revert(b) => Exit::Revert(b),
+            Outcome::OutOfGas => Exit::OutOfGas,
+            Outcome::Fatal(msg) => panic!("fatal: {msg}"),
+        };
         let mut logs = self.st.logs[log_start..].to_vec();
         if !matches!(exit, Exit::Return(_)) {
             // The frame reverts everything it did, warmth and logs included.
             self.st = snapshot;
             logs.clear();
         }
-        // A halt hands the EVM nothing back; the frame's whole budget is consumed.
-        let used = if matches!(exit, Exit::OutOfGas) { gas } else { used };
         Out { exit, used, refund, logs }
     }
 
@@ -345,7 +349,10 @@ fn addresses_route_by_prefix_and_singleton() {
     assert!(!is_cas20_address(outside) && resolve(outside).is_none());
     assert!(!is_cas20_routed(ALICE));
     assert!(is_cas20_routed(FACTORY_ADDRESS) && is_cas20_routed(asset));
-    assert!(lookup(&asset).is_some() && lookup(&ALICE).is_none());
+    let jenner = Cas20Lookup::new(crate::hardforks::bsc::BscHardfork::Jenner);
+    assert!(jenner.lookup(&asset).is_some() && jenner.lookup(&ALICE).is_none());
+    assert!(jenner.lookup(&unknown).is_none() && !is_cas20_routed(unknown));
+    assert!(!Cas20Lookup::new(crate::hardforks::bsc::BscHardfork::Pasteur).is_active());
 }
 
 // --- the layout fixture ---------------------------------------------------------
@@ -1147,6 +1154,7 @@ mod evm {
         },
         hardforks::bsc::BscHardfork,
     };
+    use alloy_evm::precompiles::PrecompileLookup as _;
     use alloy_primitives::{Address, Bytes, B256, U256};
     use reth_evm::EvmEnv;
     use revm::{
@@ -1240,6 +1248,70 @@ mod evm {
         c.extend([0x3D, 0x60, 0x00, 0xFD]); // REVERT(0, RETURNDATASIZE)
         c.extend([0x5B, 0x3D, 0x60, 0x00, 0xF3]); // JUMPDEST RETURN(0, RETURNDATASIZE)
         Bytecode::new_raw(Bytes::from(c))
+    }
+
+    /// An observer sees each finished call once, with the settled outcome and the
+    /// work it did; it is told nothing for a spec without the family.
+    #[test]
+    fn an_observer_is_told_about_finished_calls() {
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone, Default)]
+        struct Recording(Arc<Mutex<Vec<CallRecord>>>);
+        impl Cas20Observer for Recording {
+            fn record_call(&self, call: &CallRecord) {
+                self.0.lock().unwrap().push(*call);
+            }
+        }
+        let observer = Recording::default();
+        let mut evm = evm_at(BscHardfork::Jenner);
+        evm.inner.precompiles.set_precompile_lookup(Cas20Lookup::with_observer(
+            BscHardfork::Jenner,
+            observer.clone(),
+        ));
+
+        let create = encode_create(
+            VARIANT_ASSET,
+            w(9),
+            ALICE,
+            &[
+                call_data(SEL_GRANT_ROLE, &[ROLE_MINT, a(ALICE)]),
+                call_data(SEL_MINT, &[a(ALICE), w(5)]),
+            ],
+        );
+        let token = Address::from_word(B256::from_slice(&output(&tx(
+            &mut evm,
+            ALICE,
+            FACTORY_ADDRESS,
+            create,
+            2_000_000,
+        ))));
+        tx(&mut evm, ALICE, token, call_data(SEL_TRANSFER, &[a(BOB), w(6)]), 200_000);
+        tx(&mut evm, ALICE, token, call_data(SEL_NAME, &[]), 22_000);
+        tx(&mut evm, ALICE, token, vec![1, 2], 100_000);
+
+        let calls = observer.0.lock().unwrap().clone();
+        let summary: Vec<(Kind, &str, CallStatus)> =
+            calls.iter().map(|c| (c.kind, c.selector, c.status)).collect();
+        assert_eq!(
+            summary,
+            vec![
+                (Kind::Factory, "createCAS20", CallStatus::Return),
+                (Kind::Asset, "transfer", CallStatus::Revert),
+                (Kind::Asset, "name", CallStatus::OutOfGas),
+                (Kind::Asset, "short", CallStatus::Revert),
+            ]
+        );
+        let created = &calls[0];
+        assert_eq!(created.stats.created, Some(VARIANT_ASSET));
+        assert_eq!(created.stats.internal_calls, 2);
+        assert!(created.stats.sstores > 0 && created.stats.sloads > 0 && created.stats.keccaks > 0);
+        assert!(created.gas_used > 0 && created.elapsed.is_some());
+        assert_eq!(
+            calls[2].gas_used,
+            22_000 - 21_000 - 4 * 16,
+            "an exhausted frame reports its whole budget"
+        );
+        assert_eq!(sigs::selector_name([0xde, 0xad, 0xbe, 0xef]), "unknown");
     }
 
     #[test]

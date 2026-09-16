@@ -14,6 +14,7 @@ pub(crate) mod errors;
 pub(crate) mod factory;
 pub(crate) mod memo;
 pub(crate) mod metadata;
+pub mod observer;
 pub(crate) mod permit;
 pub(crate) mod policy;
 pub(crate) mod sigs;
@@ -24,13 +25,17 @@ pub(crate) mod token;
 #[cfg(test)]
 mod tests;
 
+pub use self::observer::{
+    CallRecord, CallStats, CallStatus, Cas20Observer, MetricsObserver, NoopObserver,
+};
 use self::{
     ctx::{had_no_code, Ctx, Frame},
-    errors::{finish, finish_metered, rev, Cas20Err, Exit, R},
+    errors::{complete, finish, finish_metered, rev, Cas20Err, Exit, Outcome, R},
     sigs::{ERR_NON_PAYABLE, FEATURE_ASSET, FEATURE_STABLECOIN, MARKER_CODE_HASH},
     token::Token,
 };
-use alloy_evm::precompiles::{DynPrecompile, PrecompileInput};
+use crate::hardforks::bsc::BscHardfork;
+use alloy_evm::precompiles::{DynPrecompile, PrecompileInput, PrecompileLookup};
 use alloy_primitives::{address, Address, Bytes, B256, U256};
 use revm::{
     bytecode::Bytecode,
@@ -38,7 +43,11 @@ use revm::{
         PrecompileError, PrecompileHalt, PrecompileId, PrecompileOutput, PrecompileResult,
     },
 };
-use std::{borrow::Cow, sync::LazyLock};
+use std::{
+    borrow::Cow,
+    sync::{Arc, LazyLock},
+    time::Instant,
+};
 
 /// Opens every CAS20 token address.
 pub(crate) const MARKER_PREFIX: [u8; 2] = [0xca, 0x52];
@@ -76,12 +85,10 @@ pub fn is_cas20_address(addr: Address) -> bool {
 }
 
 /// Whether dispatch resolves `addr` to native CAS20 code once Jenner is active:
-/// the token space and the three singletons.
+/// the three singletons and the token space, minus variant ordinals no version
+/// defines, which the EVM treats as ordinary accounts.
 pub fn is_cas20_routed(addr: Address) -> bool {
-    is_cas20_address(addr)
-        || addr == FACTORY_ADDRESS
-        || addr == POLICY_REGISTRY_ADDRESS
-        || addr == ACTIVATION_REGISTRY_ADDRESS
+    resolve(addr).is_some()
 }
 
 pub(crate) fn variant_recognized(variant: u8) -> bool {
@@ -98,7 +105,7 @@ pub(crate) fn variant_feature(variant: u8) -> Option<B256> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Kind {
+pub enum Kind {
     Factory,
     Policy,
     Activation,
@@ -107,14 +114,38 @@ enum Kind {
 }
 
 impl Kind {
-    fn id(self) -> PrecompileId {
-        PrecompileId::Custom(Cow::Borrowed(match self {
+    const ALL: [Kind; 5] =
+        [Kind::Factory, Kind::Policy, Kind::Activation, Kind::Asset, Kind::Stablecoin];
+
+    /// The name go-bsc reports for the precompile.
+    pub const fn name(self) -> &'static str {
+        match self {
             Kind::Factory => "CAS20Factory",
             Kind::Policy => "CAS20PolicyRegistry",
             Kind::Activation => "CAS20ActivationRegistry",
             Kind::Asset => "CAS20Asset",
             Kind::Stablecoin => "CAS20Stablecoin",
-        }))
+        }
+    }
+
+    fn id(self) -> PrecompileId {
+        PrecompileId::Custom(Cow::Borrowed(self.name()))
+    }
+}
+
+/// The behaviour of the family under a fork. A later fork that changes an entry
+/// point adds a variant here and branches on `frame.version`, leaving the earlier
+/// behaviour frozen for the blocks that ran under it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Cas20Version {
+    /// Jenner: the family as BEP-702 first shipped it.
+    V1,
+}
+
+impl Cas20Version {
+    /// The version in force under `spec`, none before the family exists.
+    pub fn from_spec(spec: BscHardfork) -> Option<Self> {
+        (spec >= BscHardfork::Jenner).then_some(Self::V1)
     }
 }
 
@@ -138,22 +169,66 @@ fn resolve(addr: Address) -> Option<Kind> {
 
 /// The dynamic lookup a Jenner EVM installs in its precompile map: CAS20 tokens
 /// have no fixed address, so they cannot live in the static tables and are
-/// resolved from the address prefix instead. Stateful, so the engine never caches
-/// a result.
-pub fn lookup(address: &Address) -> Option<DynPrecompile> {
-    static PRECOMPILES: LazyLock<[DynPrecompile; 5]> = LazyLock::new(|| {
-        [Kind::Factory, Kind::Policy, Kind::Activation, Kind::Asset, Kind::Stablecoin]
-            .map(|kind| DynPrecompile::new_stateful(kind.id(), move |input| run(kind, input)))
-    });
-    let kind = resolve(*address)?;
-    Some(PRECOMPILES[kind as usize].clone())
+/// resolved from the address prefix instead. The version is settled once, when the
+/// lookup is built for a spec; the five precompiles are shared, stateful (so the
+/// engine never caches a result) and side-effect free to look up, since the map
+/// also consults the lookup for `contains`.
+#[derive(Clone, Debug)]
+pub struct Cas20Lookup {
+    active: Option<Arc<[DynPrecompile; 5]>>,
 }
 
-fn run(kind: Kind, input: PrecompileInput<'_>) -> PrecompileResult {
+impl Cas20Lookup {
+    /// The production lookup for `spec`: metrics on, precompiles shared process-wide.
+    pub fn new(spec: BscHardfork) -> Self {
+        static V1: LazyLock<Arc<[DynPrecompile; 5]>> =
+            LazyLock::new(|| Arc::new(precompiles(Cas20Version::V1, MetricsObserver)));
+        Self {
+            active: Cas20Version::from_spec(spec).map(|version| match version {
+                Cas20Version::V1 => V1.clone(),
+            }),
+        }
+    }
+
+    /// A lookup for `spec` reporting to `observer`.
+    pub fn with_observer<O: Cas20Observer>(spec: BscHardfork, observer: O) -> Self {
+        Self {
+            active: Cas20Version::from_spec(spec)
+                .map(|version| Arc::new(precompiles(version, observer))),
+        }
+    }
+
+    /// Whether the family is routed at all under this lookup's spec.
+    pub fn is_active(&self) -> bool {
+        self.active.is_some()
+    }
+}
+
+impl PrecompileLookup for Cas20Lookup {
+    fn lookup(&self, address: &Address) -> Option<DynPrecompile> {
+        let entries = self.active.as_ref()?;
+        Some(entries[resolve(*address)? as usize].clone())
+    }
+}
+
+fn precompiles<O: Cas20Observer>(version: Cas20Version, observer: O) -> [DynPrecompile; 5] {
+    Kind::ALL.map(|kind| {
+        let observer = observer.clone();
+        DynPrecompile::new_stateful(kind.id(), move |input| run(version, kind, &observer, input))
+    })
+}
+
+fn run<O: Cas20Observer>(
+    version: Cas20Version,
+    kind: Kind,
+    observer: &O,
+    input: PrecompileInput<'_>,
+) -> PrecompileResult {
+    let started = O::ENABLED.then(Instant::now);
     let direct_call = input.is_direct_call();
     let (data, gas_limit, reservoir) = (input.data, input.gas, input.reservoir);
     let mut internals = input.internals;
-    let mut frame = Frame::new(&mut internals, gas_limit);
+    let mut frame = Frame::new(&mut internals, gas_limit, version);
     let mut ctx = Ctx {
         frame: &mut frame,
         self_addr: input.bytecode_address,
@@ -164,19 +239,32 @@ fn run(kind: Kind, input: PrecompileInput<'_>) -> PrecompileResult {
         admin_renounced: false,
     };
     let exit = execute(kind, &mut ctx, data);
-    let (used, refund) = (frame.gas.used(), frame.gas.refund);
-    if let Some(msg) = frame.fatal.take() {
-        return Err(PrecompileError::Fatal(msg));
+    let (outcome, used, refund) = complete(&mut frame, exit);
+    if O::ENABLED {
+        // Told after the fact, from data already settled: nothing here can reach
+        // gas, state or the result.
+        observer.record_call(&CallRecord {
+            kind,
+            selector: match data.get(..4) {
+                Some(sel) => sigs::selector_name(sel.try_into().unwrap()),
+                None => "short",
+            },
+            status: outcome.status(),
+            gas_used: used,
+            elapsed: started.map(|t| t.elapsed()),
+            stats: frame.stats,
+        });
     }
-    Ok(match exit {
-        Exit::Return(bytes) => {
+    match outcome {
+        Outcome::Return(bytes) => {
             let mut out = PrecompileOutput::new(used, bytes.into(), reservoir);
             out.gas_refunded = refund;
-            out
+            Ok(out)
         }
-        Exit::Revert(bytes) => PrecompileOutput::revert(used, bytes.into(), reservoir),
-        Exit::OutOfGas => PrecompileOutput::halt(PrecompileHalt::OutOfGas, reservoir),
-    })
+        Outcome::Revert(bytes) => Ok(PrecompileOutput::revert(used, bytes.into(), reservoir)),
+        Outcome::OutOfGas => Ok(PrecompileOutput::halt(PrecompileHalt::OutOfGas, reservoir)),
+        Outcome::Fatal(msg) => Err(PrecompileError::Fatal(msg)),
+    }
 }
 
 /// One CAS20 call, from the entry prologue to the exit shape, over any host state.
