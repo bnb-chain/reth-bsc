@@ -31,7 +31,9 @@ use alloy_evm::{
     eth::receipt_builder::ReceiptBuilderCtx,
 };
 use crate::node::evm::error::lane_reject;
-use crate::consensus::payment_lane::{state::LaneState, LaneError, LaneLiveState, LaneType};
+use crate::consensus::payment_lane::{
+    state::LaneState, LaneError, LaneLiveState, LaneType, PAYMENT_LANE_CONTRACT,
+};
 use alloy_consensus::constants::KECCAK_EMPTY;
 use alloy_primitives::keccak256;
 use alloy_primitives::{hex, uint, Address, BlockNumber, Bytes, U256};
@@ -449,17 +451,23 @@ where
         );
         Ok(true)
     }
-    /// Commits state changes, and with them the two facts the payment lane rests on: the DB no
-    /// longer holds the parent's post-state, and whether this block has changed `0x2007`.
-    ///
-    /// `is_touched` is the whole test: revm skips anything else ("not touched account are never
-    /// changed"), so every change that reaches the DB — new code, storage, creation, destruction
-    /// — arrives touched.
+    /// Commits state, preserving lane metadata across read-only calls.
     pub(super) fn commit_state(&mut self, changes: EvmState) {
         self.db_at_parent_state = false;
-        self.lane_contract_changed |= changes
-            .get(&crate::consensus::payment_lane::PAYMENT_LANE_CONTRACT)
-            .is_some_and(|account| account.is_touched());
+        if let Some(account) = changes
+            .get(&PAYMENT_LANE_CONTRACT)
+            .filter(|account| !self.lane_contract_changed && account.is_touched())
+        {
+            self.lane_contract_changed = account.is_created() ||
+                account.is_selfdestructed() ||
+                account.changed_storage_slots().next().is_some() ||
+                // Upgrades can populate `original_info` with the new code.
+                match self.evm.db_mut().basic(PAYMENT_LANE_CONTRACT) {
+                    Ok(before) => before.map(|b| b.code_hash) != Some(account.info.code_hash),
+                    // An unreadable old account must disable reuse.
+                    Err(_) => true,
+                };
+        }
         self.evm.db_mut().commit(changes);
     }
 

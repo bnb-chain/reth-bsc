@@ -637,8 +637,6 @@ mod parent_block_env {
         state
     }
 
-    /// A block that leaves `0x2007` alone hands its config to its children, so the walk happens
-    /// once per governance change; a block that writes to it hands on nothing.
     #[test]
     fn lane_config_is_inherited_until_the_contract_changes() {
         use crate::consensus::payment_lane::{
@@ -646,23 +644,61 @@ mod parent_block_env {
             state::LaneState,
             Budget, PAYMENT_LANE_CONTRACT,
         };
-        use alloy_primitives::B256;
+        use alloy_primitives::{B256, U256};
+        use alloy_evm::Evm as _;
+        use revm::state::{Account, EvmState, EvmStorageSlot};
 
+        let code = Bytecode::new_raw(Bytes::from_static(&[0x00]));
+        let deployed = AccountInfo::default().with_code(code);
         let mut executor = executor();
-        let meta = LaneMeta { ratio: 500, listed: Default::default() };
-        executor.lane = LaneState::for_test(meta, Budget::default(), 30_000_000);
+        executor.evm.db_mut().insert_account_info(PAYMENT_LANE_CONTRACT, deployed.clone());
+        executor.lane = LaneState::for_test(
+            LaneMeta { ratio: 500, listed: Default::default() },
+            Budget::default(),
+            30_000_000,
+        );
 
-        let inherited = B256::repeat_byte(0x11);
-        executor.ctx.header_hash = Some(inherited);
-        executor.commit_state(touched(Address::repeat_byte(0xaa)));
-        executor.verify_payment_lane(0).expect("an empty block cannot violate");
-        assert_eq!(cache_get(inherited).map(|m| m.ratio), Some(500));
+        let shape = |info: AccountInfo, slot: Option<EvmStorageSlot>| {
+            let mut account = Account::from(info);
+            account.mark_touch();
+            account.storage.extend(slot.map(|slot| (U256::ZERO, slot)));
+            EvmState::from_iter([(PAYMENT_LANE_CONTRACT, account)])
+        };
+        let mut inherits = |tag: u8, states: Vec<EvmState>| {
+            executor.lane_contract_changed = false;
+            executor.ctx.header_hash = Some(B256::repeat_byte(tag));
+            for state in states {
+                executor.commit_state(state);
+            }
+            executor.verify_payment_lane(0).expect("an empty block cannot violate");
+            cache_get(B256::repeat_byte(tag)).is_some()
+        };
 
-        let changed = B256::repeat_byte(0x22);
-        executor.ctx.header_hash = Some(changed);
-        executor.commit_state(touched(PAYMENT_LANE_CONTRACT));
-        executor.verify_payment_lane(0).expect("an empty block cannot violate");
-        assert!(cache_get(changed).is_none());
+        assert!(inherits(0x11, vec![touched(Address::repeat_byte(0xaa))]), "an unrelated account");
+        assert!(
+            inherits(0x22, vec![shape(deployed.clone(), Some(EvmStorageSlot::new(U256::ZERO, 0)))]),
+            "a getter transaction: touched, slots read but unchanged"
+        );
+        assert!(
+            !inherits(
+                0x33,
+                vec![
+                    shape(
+                        deployed.clone(),
+                        Some(EvmStorageSlot::new_changed(U256::ZERO, U256::from(1), 0)),
+                    ),
+                    shape(deployed, Some(EvmStorageSlot::new(U256::from(1), 0))),
+                ]
+            ),
+            "a getter after a governance write must not restore inheritance"
+        );
+        assert!(
+            !inherits(
+                0x44,
+                vec![shape(AccountInfo::default().with_code_hash(B256::repeat_byte(0xcd)), None)]
+            ),
+            "a code replacement, which changes what the getters mean"
+        );
     }
 
     /// A late read would take the ratio and the list from a state this block already changed,
