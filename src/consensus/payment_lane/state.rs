@@ -7,7 +7,8 @@ use super::{
     meta::{self, LaneMeta},
     rules, Budget, LaneError, LaneLiveState, LaneParentState, LaneType,
 };
-use alloy_primitives::{Address, BlockHash, U256};
+use alloy_consensus::Transaction;
+use alloy_primitives::BlockHash;
 
 /// `None` is "the lane does not bind here" — before Jenner, and on the activation block, whose
 /// parent is still pre-fork. Every verb then answers as if switched off, so no call site branches
@@ -59,12 +60,10 @@ impl LaneState {
         &self,
         live: &mut impl LaneLiveState,
         is_system: bool,
-        to: Option<Address>,
-        tx_type: u8,
-        value: U256,
+        tx: &impl Transaction,
     ) -> Result<LaneType, LaneError> {
         let Some(active) = self.0.as_ref() else { return Ok(LaneType::GeneralLane) };
-        rules::classify(is_system, to, tx_type, value, &active.meta.listed, |addr| {
+        rules::classify(is_system, tx.to(), tx.ty(), tx.value(), &active.meta.listed, |addr| {
             live.lane_code_is_empty(addr)
         })
     }
@@ -155,7 +154,8 @@ impl LaneState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::Bytes;
+    use alloy_consensus::TxLegacy;
+    use alloy_primitives::{Address, Bytes};
 
     struct NoLiveReads;
     impl LaneLiveState for NoLiveReads {
@@ -186,7 +186,7 @@ mod tests {
         let mut off = LaneState::off();
         assert!(!off.on());
         assert_eq!(
-            off.classify(&mut NoLiveReads, false, Some(Address::ZERO), 0, U256::from(1)),
+            off.classify(&mut NoLiveReads, false, &TxLegacy::default()),
             Ok(LaneType::GeneralLane)
         );
         off.record_used(LaneType::PaymentLane, 21_000);

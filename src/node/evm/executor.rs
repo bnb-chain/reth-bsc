@@ -20,7 +20,7 @@ use crate::{
         SystemContract,
     },
 };
-use alloy_consensus::{Header, Transaction as _, TxReceipt, TxType, Typed2718 as _};
+use alloy_consensus::{Header, Transaction as _, TxReceipt, TxType};
 use alloy_eips::eip2935::{HISTORY_STORAGE_ADDRESS, HISTORY_STORAGE_CODE};
 use alloy_eips::{eip7685::Requests, Encodable2718};
 use alloy_evm::{
@@ -62,7 +62,7 @@ pub struct BscTxResult<H> {
     pub tx_type: TxType,
     pub tx: TransactionSigned,
     pub is_system: bool,
-    pub lane: LaneType,
+    pub lane_type: LaneType,
 }
 
 impl<H: Send + 'static> TxResult for BscTxResult<H> {
@@ -483,24 +483,6 @@ where
             .saturating_sub(self.gas_used)
     }
 
-    /// Which lane this transaction's gas is booked against.
-    ///
-    /// Thin on purpose: [`LaneState::classify`] owns the pre-Jenner short circuit and
-    /// [`rules::classify`](crate::consensus::payment_lane::rules::classify) owns every gate, so
-    /// nothing about the rule can be re-decided here.
-    pub(crate) fn classify_lane(
-        &mut self,
-        is_system: bool,
-        to: Option<Address>,
-        tx_type: u8,
-        value: U256,
-    ) -> Result<LaneType, BlockExecutionError> {
-        // The lane holds an `Arc` to the listed set, so this clone is two words and a refcount;
-        // it is what lets the classifier borrow the executor as the live state.
-        let lane = self.lane.clone();
-        lane.classify(self, is_system, to, tx_type, value).map_err(lane_reject)
-    }
-
     /// The lane verdict for a finished block. `gas_used` is the header's total, so this may only
     /// run once the last system transaction has been executed.
     ///
@@ -681,8 +663,8 @@ where
         // Detect system transactions: skip EVM execution, accumulate for later.
         let is_system = is_system_transaction(&tx_signed, signer, self.evm.block().beneficiary());
 
-        let lane =
-            self.classify_lane(is_system, tx_signed.to(), tx_signed.ty(), tx_signed.value())?;
+        let lane_type =
+            self.lane.clone().classify(self, is_system, &tx_signed).map_err(lane_reject)?;
 
         if is_system {
             self.system_txs.push(tx_signed.clone());
@@ -701,7 +683,7 @@ where
                 tx_type,
                 tx: tx_signed,
                 is_system: true,
-                lane,
+                lane_type,
             });
         }
 
@@ -740,13 +722,13 @@ where
         // transaction and the sender's later nonces; a capacity error would abort the build.
         if self.ctx.mode == BscExecutionMode::Mining && self.lane.on() {
             let shared = self.producer_shared_gas();
-            if !self.lane.admits(shared, lane, tx_gas_limit) {
+            if !self.lane.admits(shared, lane_type, tx_gas_limit) {
                 crate::metrics::LANE_METRICS.general_lane_yielded.increment(1);
                 debug!(
                     target: "bsc::payment_lane",
                     block = block_number,
                     tx = %tx_hash,
-                    ?lane,
+                    ?lane_type,
                     tx_gas_limit,
                     shared,
                     quota = self.lane.quota(),
@@ -790,7 +772,14 @@ where
         let inner =
             self.evm.transact(tx_env).map_err(|err| BlockExecutionError::evm(err, tx_hash))?;
 
-        Ok(BscTxResult { inner, blob_gas_used, tx_type, tx: tx_signed, is_system: false, lane })
+        Ok(BscTxResult {
+            inner,
+            blob_gas_used,
+            tx_type,
+            tx: tx_signed,
+            is_system: false,
+            lane_type,
+        })
     }
 
     fn commit_transaction(
@@ -812,7 +801,7 @@ where
         self.gas_used += gas_used;
         // The same value added to `self.gas_used`, so the booked payment gas is a subset of the
         // block's by construction.
-        self.lane.record_used(output.lane, gas_used);
+        self.lane.record_used(output.lane_type, gas_used);
         self.blob_gas_used = self.blob_gas_used.saturating_add(output.blob_gas_used);
 
         self.receipts.push(self.receipt_builder.build_receipt(ReceiptBuilderCtx {
