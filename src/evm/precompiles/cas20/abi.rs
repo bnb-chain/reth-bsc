@@ -131,17 +131,17 @@ pub(crate) fn abi_encode_struct(members: &[AbiPart]) -> Vec<u8> {
     encode_tuple(&[AbiPart::Dynamic(encode_tuple(members))])
 }
 
-pub(crate) fn read_bytes_arg<'a>(args: &'a [u8], arg_index: usize) -> R<&'a [u8]> {
+pub(crate) fn read_bytes_arg(args: &[u8], arg_index: usize) -> R<&[u8]> {
     read_string_bytes(args, arg_index)
 }
 
 /// A string argument is bytes on the wire; the reference client never validates
 /// UTF-8, so strings stay byte slices throughout.
-pub(crate) fn read_string_arg<'a>(args: &'a [u8], arg_index: usize) -> R<&'a [u8]> {
+pub(crate) fn read_string_arg(args: &[u8], arg_index: usize) -> R<&[u8]> {
     read_string_bytes(args, arg_index)
 }
 
-fn read_string_bytes<'a>(args: &'a [u8], arg_index: usize) -> R<&'a [u8]> {
+fn read_string_bytes(args: &[u8], arg_index: usize) -> R<&[u8]> {
     let len = args.len() as u64;
     let off = word_u64(args, arg_index as u64 * 32).ok_or_else(revert)?;
     if off > len || len - off < 32 {
@@ -155,7 +155,7 @@ fn read_string_bytes<'a>(args: &'a [u8], arg_index: usize) -> R<&'a [u8]> {
     Ok(&args[data_pos as usize..(data_pos + n) as usize])
 }
 
-pub(crate) fn read_bytes_array<'a>(args: &'a [u8], arg_index: usize) -> R<Vec<&'a [u8]>> {
+pub(crate) fn read_bytes_array(args: &[u8], arg_index: usize) -> R<Vec<&[u8]>> {
     let len = args.len() as u64;
     let base = word_u64(args, arg_index as u64 * 32).ok_or_else(revert)?;
     if base > len || len - base < 32 {
