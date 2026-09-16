@@ -1,4 +1,4 @@
-use super::config::evm_env_for_header;
+use super::config::{evm_env_for_header, BscExecutionMode};
 use super::executor::BscBlockExecutor;
 use super::factory::BscEvmFactory;
 use crate::evm::transaction::BscTxEnv;
@@ -813,6 +813,9 @@ where
     }
 
     /// prepare some intermediate data for produce new block.
+    ///
+    /// Only reached when this node authors the header, so the guards below need only exclude
+    /// [`BscExecutionMode::Simulation`].
     pub(crate) fn prepare_new_block(
         &mut self, 
         block: &BlockEnv
@@ -828,7 +831,7 @@ where
         // that entirely. Requiring one here would make `eth_simulateV1` fail — or panic on
         // the `unwrap` below — whenever the snapshot provider is unavailable, e.g. during
         // early startup before consensus has published it.
-        if self.ctx.mode.finalizes() {
+        if self.ctx.mode != BscExecutionMode::Simulation {
             let snap = self
                 .snapshot_provider
                 .as_ref()
@@ -840,15 +843,15 @@ where
 
         // `block.gas_limit()` is the sealed limit, not the miner's system-tx-reserved one, so
         // producer and importer derive the same quota.
-        if self.ctx.mode.finalizes() {
+        if self.ctx.mode != BscExecutionMode::Simulation {
             self.init_payment_lane(&parent_header, block.gas_limit())?;
         }
 
         let header_number = block.number().to::<u64>();
         let header_timestamp = block.timestamp().to::<u64>();
         // The election data below feeds `update_validator_set_v2`, which only runs during
-        // finalization; skip the system-contract calls in simulation.
-        if self.ctx.mode.finalizes() &&
+        // finalization.
+        if self.ctx.mode != BscExecutionMode::Simulation &&
             self.spec.is_feynman_active_at_timestamp(header_number, header_timestamp) &&
             !self.spec.is_feynman_transition_at_timestamp(header_number, header_timestamp, parent_header.timestamp) &&
             is_breathe_block(parent_header.timestamp, header_timestamp)

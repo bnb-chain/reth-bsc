@@ -349,9 +349,8 @@ where
 
         let transaction = set_nonce(transaction, account.nonce);
 
-        // Simulation never generates system transactions: `finish` skips finalization and
-        // the contract-init steps that would reach here. Guard defensively so a future
-        // caller cannot reintroduce issue #451 by routing a simulation into signing.
+        // Unreachable today — `finish` skips the finalization and contract-init steps that lead
+        // here — but simulation must never sign, so guard rather than trust the callers.
         if self.ctx.mode == BscExecutionMode::Simulation {
             debug_assert!(false, "system tx attempted during simulation: {transaction:?}");
             tracing::warn!(
@@ -362,7 +361,7 @@ where
             return Ok(());
         }
 
-        let signed_tx = if !self.ctx.mode.finalizes() {
+        let signed_tx = if self.ctx.mode == BscExecutionMode::Import {
             let hash = transaction.signature_hash();
             if self.system_txs.is_empty() || hash != self.system_txs[0].signature_hash() {
                 // slash tx could fail and not in the block
@@ -401,7 +400,9 @@ where
             return Err(BscBlockExecutionError::GlobalSignerNotInitializedForMiningMode.into());
         };
 
-        if self.ctx.mode.finalizes() {
+        // The complement of the branch above: this node signed the transaction rather than
+        // taking it from the block, so it has to be recorded into the block being assembled.
+        if self.ctx.mode != BscExecutionMode::Import {
             if let Some(signed) = signed_tx.clone() {
                 let recovered = signed.clone().try_into_recovered_unchecked().unwrap_or_else(|_| {
                     panic!("Failed to recover system transaction signature")

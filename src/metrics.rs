@@ -392,7 +392,7 @@ pub struct BscPaymentLaneMetrics {
     pub state_unavailable: Counter,
     /// Transactions dropped to keep the reservation intact
     pub general_lane_yielded: Counter,
-    /// Blocks this validator declined to seal
+    /// Blocks this validator declined to produce
     pub produce_declined: Counter,
 }
 

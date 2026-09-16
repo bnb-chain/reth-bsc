@@ -181,8 +181,7 @@ where
                 header.clone(),
                 ctx.header_hash,
             );
-        } else if !ctx.mode.authors_block() {
-            // Block-authoring modes (mining, simulation) have no current header.
+        } else if ctx.mode == BscExecutionMode::Import {
             warn!(
                 "No header found in the context, block_number: {:?}",
                 evm.block().number().to::<u64>()
@@ -514,7 +513,7 @@ where
         }
 
         if let Err(err) = self.lane.verify(gas_used) {
-            if self.ctx.mode.finalizes() {
+            if matches!(self.ctx.mode, BscExecutionMode::Mining | BscExecutionMode::BidSimulation) {
                 crate::metrics::LANE_METRICS.produce_declined.increment(1);
             }
             error!(
@@ -630,12 +629,11 @@ where
         self.consensus_metrics.current_block_height.set(block_number as f64);
 
         // pre check and prepare some intermediate data for commit parlia snapshot in finish function.
-        // `check_new_block` dereferences `ctx.header`, which only exists when importing.
-        if self.ctx.mode.authors_block() {
-            self.prepare_new_block(&block_env)?;
-        } else {
+        if self.ctx.mode == BscExecutionMode::Import {
             self.check_new_block(&block_env)
                 .map_err(crate::node::evm::error::mark_pre_execution_error)?;
+        } else {
+            self.prepare_new_block(&block_env)?;
         }
 
         let parent_timestamp = self
@@ -707,9 +705,9 @@ where
             });
         }
 
-        // Apply hertz patch before tx (import only — it replays a historical state fix and
-        // is meaningless for a block being authored).
-        if !self.ctx.mode.authors_block() {
+        // The Hertz patches replay historical state fixes, so they only apply to a block that
+        // already exists.
+        if self.ctx.mode == BscExecutionMode::Import {
             self.hertz_patch_manager.patch_before_tx(&tx_signed, self.evm.db_mut())?;
         }
 
@@ -740,7 +738,7 @@ where
         //
         // `InvalidTx` is the sentinel the producing loop already answers by dropping this
         // transaction and the sender's later nonces; a capacity error would abort the build.
-        if self.ctx.mode.packs_from_pool() && self.lane.on() {
+        if self.ctx.mode == BscExecutionMode::Mining && self.lane.on() {
             let shared = self.producer_shared_gas();
             if !self.lane.admits(shared, lane, tx_gas_limit) {
                 crate::metrics::LANE_METRICS.general_lane_yielded.increment(1);
@@ -827,9 +825,8 @@ where
 
         self.commit_state(state);
 
-        // Apply hertz patch after tx (import only — see `patch_before_tx` above).
         // commit_transaction cannot return errors in the new API, so defer any error to finish().
-        if !self.ctx.mode.authors_block() {
+        if self.ctx.mode == BscExecutionMode::Import {
             if let Err(e) = self.hertz_patch_manager.patch_after_tx(&output.tx, self.evm.db_mut()) {
                 self.deferred_error = Some(e);
             }
@@ -903,11 +900,15 @@ where
         }
 
         match self.ctx.mode {
-            // Generates and signs system txs (rewards, slashing, validator-set updates).
+            // Generates and signs system txs (rewards, slashing, validator-set updates), then
+            // reaches the importer's own lane verdict as a self-check. Failure declines the
+            // block; there is no fallback that produces with the lane switched off.
             BscExecutionMode::Mining | BscExecutionMode::BidSimulation => {
-                self.finalize_new_block(&self.evm.block().clone())?
+                self.finalize_new_block(&self.evm.block().clone())?;
+                self.verify_payment_lane(self.gas_used)?;
             }
-            // Verifies the system txs already present in the received block.
+            // Verifies the system txs already present in the received block, and the lane
+            // inequality along with them.
             BscExecutionMode::Import => self.post_check_new_block(&self.evm.block().clone())?,
             // Neither: return the executed block as-is, matching BSC geth's simulation path.
             BscExecutionMode::Simulation => {
@@ -917,13 +918,6 @@ where
                     "Skipping Parlia finalization for simulated block"
                 );
             }
-        }
-
-        // The same verdict the importer reaches, as the producer's self-check. After the mode
-        // match, so the system transactions issued above are already in `self.gas_used`. Failure
-        // declines the block; there is no fallback that produces with the lane switched off.
-        if self.ctx.mode.finalizes() {
-            self.verify_payment_lane(self.gas_used)?;
         }
 
         // Update receipt height metric
