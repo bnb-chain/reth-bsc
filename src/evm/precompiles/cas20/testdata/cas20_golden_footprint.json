@@ -1,0 +1,1017 @@
+[
+  {
+    "name": "factory.isCAS20(factory)",
+    "gas": 12,
+    "sload": 0,
+    "sstore": 0,
+    "keccak": 0
+  },
+  {
+    "name": "factory.getCAS20Address",
+    "gas": 66,
+    "sload": 0,
+    "sstore": 0,
+    "keccak": 1
+  },
+  {
+    "name": "create.asset",
+    "gas": 418068,
+    "sload": 15,
+    "sstore": 16,
+    "keccak": 34
+  },
+  {
+    "name": "name",
+    "gas": 206,
+    "sload": 1,
+    "sstore": 0,
+    "keccak": 0
+  },
+  {
+    "name": "symbol",
+    "gas": 206,
+    "sload": 1,
+    "sstore": 0,
+    "keccak": 0
+  },
+  {
+    "name": "decimals",
+    "gas": 206,
+    "sload": 1,
+    "sstore": 0,
+    "keccak": 0
+  },
+  {
+    "name": "totalSupply",
+    "gas": 206,
+    "sload": 1,
+    "sstore": 0,
+    "keccak": 0
+  },
+  {
+    "name": "balanceOf(alice)",
+    "gas": 254,
+    "sload": 1,
+    "sstore": 0,
+    "keccak": 1
+  },
+  {
+    "name": "transfer alice->bob 400",
+    "gas": 26458,
+    "sload": 4,
+    "sstore": 2,
+    "keccak": 2
+  },
+  {
+    "name": "transfer bob->alice 401 (insufficient)",
+    "gas": 460,
+    "sload": 3,
+    "sstore": 0,
+    "keccak": 1
+  },
+  {
+    "name": "approve alice->bob 30",
+    "gas": 24058,
+    "sload": 0,
+    "sstore": 1,
+    "keccak": 2
+  },
+  {
+    "name": "transferFrom bob 10",
+    "gas": 2948,
+    "sload": 6,
+    "sstore": 3,
+    "keccak": 4
+  },
+  {
+    "name": "transferFrom bob 31 (allowance)",
+    "gas": 408,
+    "sload": 2,
+    "sstore": 0,
+    "keccak": 2
+  },
+  {
+    "name": "allowance",
+    "gas": 302,
+    "sload": 1,
+    "sstore": 0,
+    "keccak": 2
+  },
+  {
+    "name": "approve alice->bob 0 (clear)",
+    "gas": 2058,
+    "sload": 0,
+    "sstore": 1,
+    "keccak": 2
+  },
+  {
+    "name": "mint alice->bob 5",
+    "gas": 2800,
+    "sload": 6,
+    "sstore": 2,
+    "keccak": 3
+  },
+  {
+    "name": "mint by bob (no role)",
+    "gas": 2402,
+    "sload": 2,
+    "sstore": 0,
+    "keccak": 2
+  },
+  {
+    "name": "burn alice 100",
+    "gas": 2594,
+    "sload": 4,
+    "sstore": 2,
+    "keccak": 3
+  },
+  {
+    "name": "burnWithMemo alice 1",
+    "gas": 4100,
+    "sload": 4,
+    "sstore": 2,
+    "keccak": 3
+  },
+  {
+    "name": "mintWithMemo alice->carol 7",
+    "gas": 26206,
+    "sload": 6,
+    "sstore": 2,
+    "keccak": 3
+  },
+  {
+    "name": "pause [transfer]",
+    "gas": 22301,
+    "sload": 2,
+    "sstore": 1,
+    "keccak": 2
+  },
+  {
+    "name": "transfer while paused",
+    "gas": 218,
+    "sload": 1,
+    "sstore": 0,
+    "keccak": 0
+  },
+  {
+    "name": "pausedFeatures",
+    "gas": 206,
+    "sload": 1,
+    "sstore": 0,
+    "keccak": 0
+  },
+  {
+    "name": "isPaused(0)",
+    "gas": 212,
+    "sload": 1,
+    "sstore": 0,
+    "keccak": 0
+  },
+  {
+    "name": "unpause [transfer]",
+    "gas": 2401,
+    "sload": 2,
+    "sstore": 1,
+    "keccak": 2
+  },
+  {
+    "name": "pause by bob (no role)",
+    "gas": 2308,
+    "sload": 1,
+    "sstore": 0,
+    "keccak": 2
+  },
+  {
+    "name": "updateName long",
+    "gas": 70011,
+    "sload": 2,
+    "sstore": 4,
+    "keccak": 3
+  },
+  {
+    "name": "name after rename",
+    "gas": 542,
+    "sload": 4,
+    "sstore": 0,
+    "keccak": 1
+  },
+  {
+    "name": "updateSymbol",
+    "gas": 2401,
+    "sload": 2,
+    "sstore": 1,
+    "keccak": 2
+  },
+  {
+    "name": "updateContractURI",
+    "gas": 89506,
+    "sload": 2,
+    "sstore": 4,
+    "keccak": 3
+  },
+  {
+    "name": "contractURI",
+    "gas": 542,
+    "sload": 4,
+    "sstore": 0,
+    "keccak": 1
+  },
+  {
+    "name": "updateName short",
+    "gas": 3487,
+    "sload": 2,
+    "sstore": 4,
+    "keccak": 3
+  },
+  {
+    "name": "eip712Domain",
+    "gas": 206,
+    "sload": 1,
+    "sstore": 0,
+    "keccak": 0
+  },
+  {
+    "name": "DOMAIN_SEPARATOR",
+    "gas": 338,
+    "sload": 1,
+    "sstore": 0,
+    "keccak": 3
+  },
+  {
+    "name": "updateExtraMetadata",
+    "gas": 91614,
+    "sload": 2,
+    "sstore": 4,
+    "keccak": 4
+  },
+  {
+    "name": "extraMetadata(k)",
+    "gas": 602,
+    "sload": 4,
+    "sstore": 0,
+    "keccak": 2
+  },
+  {
+    "name": "updateExtraMetadata empty key",
+    "gas": 320,
+    "sload": 1,
+    "sstore": 0,
+    "keccak": 2
+  },
+  {
+    "name": "multiplier",
+    "gas": 2306,
+    "sload": 2,
+    "sstore": 0,
+    "keccak": 0
+  },
+  {
+    "name": "updateUIMultiplier 2x at +3600",
+    "gas": 22120,
+    "sload": 4,
+    "sstore": 1,
+    "keccak": 2
+  },
+  {
+    "name": "updateUIMultiplier again (exists)",
+    "gas": 402,
+    "sload": 2,
+    "sstore": 0,
+    "keccak": 2
+  },
+  {
+    "name": "newUIMultiplier",
+    "gas": 206,
+    "sload": 1,
+    "sstore": 0,
+    "keccak": 0
+  },
+  {
+    "name": "effectiveAt",
+    "gas": 206,
+    "sload": 1,
+    "sstore": 0,
+    "keccak": 0
+  },
+  {
+    "name": "balanceOfUI(bob)",
+    "gas": 454,
+    "sload": 3,
+    "sstore": 0,
+    "keccak": 1
+  },
+  {
+    "name": "uiMultiplier matured",
+    "gas": 206,
+    "sload": 1,
+    "sstore": 0,
+    "keccak": 0
+  },
+  {
+    "name": "totalSupplyUI matured",
+    "gas": 306,
+    "sload": 2,
+    "sstore": 0,
+    "keccak": 0
+  },
+  {
+    "name": "newUIMultiplier matured",
+    "gas": 306,
+    "sload": 2,
+    "sstore": 0,
+    "keccak": 0
+  },
+  {
+    "name": "cancelUIMultiplierUpdate (matured)",
+    "gas": 390,
+    "sload": 2,
+    "sstore": 0,
+    "keccak": 2
+  },
+  {
+    "name": "updateMultiplier 1.5x",
+    "gas": 3220,
+    "sload": 3,
+    "sstore": 2,
+    "keccak": 2
+  },
+  {
+    "name": "updateUIMultiplier 4x at +9000",
+    "gas": 22120,
+    "sload": 4,
+    "sstore": 1,
+    "keccak": 2
+  },
+  {
+    "name": "cancelUIMultiplierUpdate (live)",
+    "gas": 1752,
+    "sload": 2,
+    "sstore": 1,
+    "keccak": 2
+  },
+  {
+    "name": "supportsInterface(IERC165)",
+    "gas": 112,
+    "sload": 0,
+    "sstore": 0,
+    "keccak": 0
+  },
+  {
+    "name": "supportsInterface(dirty)",
+    "gas": 112,
+    "sload": 0,
+    "sstore": 0,
+    "keccak": 0
+  },
+  {
+    "name": "toUIAmount(100)",
+    "gas": 312,
+    "sload": 2,
+    "sstore": 0,
+    "keccak": 0
+  },
+  {
+    "name": "fromUIAmount(150)",
+    "gas": 312,
+    "sload": 2,
+    "sstore": 0,
+    "keccak": 0
+  },
+  {
+    "name": "batchMint",
+    "gas": 5234,
+    "sload": 10,
+    "sstore": 4,
+    "keccak": 4
+  },
+  {
+    "name": "batchMint mismatch",
+    "gas": 432,
+    "sload": 2,
+    "sstore": 0,
+    "keccak": 2
+  },
+  {
+    "name": "announce",
+    "gas": 30441,
+    "sload": 8,
+    "sstore": 3,
+    "keccak": 7
+  },
+  {
+    "name": "isAnnouncementIdUsed(A1)",
+    "gas": 266,
+    "sload": 1,
+    "sstore": 0,
+    "keccak": 1
+  },
+  {
+    "name": "announce reused id",
+    "gas": 486,
+    "sload": 2,
+    "sstore": 0,
+    "keccak": 3
+  },
+  {
+    "name": "announce with failing call",
+    "gas": 25877,
+    "sload": 4,
+    "sstore": 1,
+    "keccak": 6
+  },
+  {
+    "name": "permit",
+    "gas": 49618,
+    "sload": 2,
+    "sstore": 2,
+    "keccak": 9
+  },
+  {
+    "name": "nonces(owner)",
+    "gas": 254,
+    "sload": 1,
+    "sstore": 0,
+    "keccak": 1
+  },
+  {
+    "name": "allowance(owner,bob)",
+    "gas": 302,
+    "sload": 1,
+    "sstore": 0,
+    "keccak": 2
+  },
+  {
+    "name": "permit replay",
+    "gas": 3636,
+    "sload": 2,
+    "sstore": 0,
+    "keccak": 6
+  },
+  {
+    "name": "transferWithMemoFormat",
+    "gas": 5945,
+    "sload": 4,
+    "sstore": 2,
+    "keccak": 2
+  },
+  {
+    "name": "transferWithMemoFormat zero format",
+    "gas": 130,
+    "sload": 0,
+    "sstore": 0,
+    "keccak": 0
+  },
+  {
+    "name": "approve alice->bob 3",
+    "gas": 21958,
+    "sload": 0,
+    "sstore": 1,
+    "keccak": 2
+  },
+  {
+    "name": "transferFromWithMemoFormat",
+    "gas": 6335,
+    "sload": 6,
+    "sstore": 3,
+    "keccak": 4
+  },
+  {
+    "name": "transferWithMemo",
+    "gas": 4064,
+    "sload": 4,
+    "sstore": 2,
+    "keccak": 2
+  },
+  {
+    "name": "createPolicy blocklist",
+    "gas": 94417,
+    "sload": 2,
+    "sstore": 5,
+    "keccak": 4
+  },
+  {
+    "name": "updateBlocklist add bob",
+    "gas": 25312,
+    "sload": 4,
+    "sstore": 1,
+    "keccak": 6
+  },
+  {
+    "name": "isAuthorized(id1,bob)",
+    "gas": 202,
+    "sload": 1,
+    "sstore": 0,
+    "keccak": 2
+  },
+  {
+    "name": "isAuthorized(id1,alice)",
+    "gas": 2202,
+    "sload": 1,
+    "sstore": 0,
+    "keccak": 2
+  },
+  {
+    "name": "createPolicyWithAccounts allowlist",
+    "gas": 50859,
+    "sload": 2,
+    "sstore": 3,
+    "keccak": 4
+  },
+  {
+    "name": "createCompositePolicy union",
+    "gas": 73243,
+    "sload": 4,
+    "sstore": 4,
+    "keccak": 6
+  },
+  {
+    "name": "compositePolicyChildIds",
+    "gas": 390,
+    "sload": 3,
+    "sstore": 0,
+    "keccak": 2
+  },
+  {
+    "name": "isAuthorized(id3,alice)",
+    "gas": 580,
+    "sload": 4,
+    "sstore": 0,
+    "keccak": 4
+  },
+  {
+    "name": "updateComposite shrink",
+    "gas": 3548,
+    "sload": 5,
+    "sstore": 2,
+    "keccak": 7
+  },
+  {
+    "name": "createComposite with composite child",
+    "gas": 468,
+    "sload": 3,
+    "sstore": 0,
+    "keccak": 3
+  },
+  {
+    "name": "stageUpdateAdmin id1->carol",
+    "gas": 24461,
+    "sload": 3,
+    "sstore": 1,
+    "keccak": 4
+  },
+  {
+    "name": "pendingPolicyAdmin(id1)",
+    "gas": 154,
+    "sload": 1,
+    "sstore": 0,
+    "keccak": 1
+  },
+  {
+    "name": "finalizeUpdateAdmin by bob",
+    "gas": 438,
+    "sload": 3,
+    "sstore": 0,
+    "keccak": 3
+  },
+  {
+    "name": "finalizeUpdateAdmin by carol",
+    "gas": 2739,
+    "sload": 4,
+    "sstore": 2,
+    "keccak": 6
+  },
+  {
+    "name": "policyAdmin(id1)",
+    "gas": 154,
+    "sload": 1,
+    "sstore": 0,
+    "keccak": 1
+  },
+  {
+    "name": "updateBlocklist by old admin",
+    "gas": 604,
+    "sload": 4,
+    "sstore": 0,
+    "keccak": 4
+  },
+  {
+    "name": "updateAllowlist wrong type",
+    "gas": 320,
+    "sload": 2,
+    "sstore": 0,
+    "keccak": 2
+  },
+  {
+    "name": "policyExists(99)",
+    "gas": 2154,
+    "sload": 1,
+    "sstore": 0,
+    "keccak": 1
+  },
+  {
+    "name": "policyExists(sentinel block)",
+    "gas": 12,
+    "sload": 0,
+    "sstore": 0,
+    "keccak": 0
+  },
+  {
+    "name": "updatePolicy TRANSFER_SENDER=id1",
+    "gas": 22281,
+    "sload": 4,
+    "sstore": 1,
+    "keccak": 3
+  },
+  {
+    "name": "transfer bob->alice (forbidden)",
+    "gas": 502,
+    "sload": 3,
+    "sstore": 0,
+    "keccak": 2
+  },
+  {
+    "name": "policyId(TRANSFER_SENDER)",
+    "gas": 212,
+    "sload": 1,
+    "sstore": 0,
+    "keccak": 0
+  },
+  {
+    "name": "updatePolicy unknown id",
+    "gas": 2444,
+    "sload": 2,
+    "sstore": 0,
+    "keccak": 3
+  },
+  {
+    "name": "updatePolicy SEIZE_HOLDER=id1",
+    "gas": 24281,
+    "sload": 4,
+    "sstore": 1,
+    "keccak": 3
+  },
+  {
+    "name": "seizeWithMemo bob->alice 3",
+    "gas": 6569,
+    "sload": 6,
+    "sstore": 2,
+    "keccak": 6
+  },
+  {
+    "name": "seizeWithMemo alice (not seizable)",
+    "gas": 698,
+    "sload": 4,
+    "sstore": 0,
+    "keccak": 4
+  },
+  {
+    "name": "setRoleAdmin MINT->PAUSE",
+    "gas": 24603,
+    "sload": 4,
+    "sstore": 1,
+    "keccak": 5
+  },
+  {
+    "name": "getRoleAdmin(MINT)",
+    "gas": 254,
+    "sload": 1,
+    "sstore": 0,
+    "keccak": 1
+  },
+  {
+    "name": "grantRole by bob",
+    "gas": 2686,
+    "sload": 4,
+    "sstore": 0,
+    "keccak": 4
+  },
+  {
+    "name": "revokeRole MINT alice",
+    "gas": 2787,
+    "sload": 4,
+    "sstore": 1,
+    "keccak": 7
+  },
+  {
+    "name": "renounceRole SEIZE",
+    "gas": 2361,
+    "sload": 1,
+    "sstore": 1,
+    "keccak": 4
+  },
+  {
+    "name": "renounceRole bad confirmation",
+    "gas": 118,
+    "sload": 0,
+    "sstore": 0,
+    "keccak": 0
+  },
+  {
+    "name": "hasRole(MINT,alice)",
+    "gas": 302,
+    "sload": 1,
+    "sstore": 0,
+    "keccak": 2
+  },
+  {
+    "name": "revokeRole DEFAULT_ADMIN (last)",
+    "gas": 2828,
+    "sload": 5,
+    "sstore": 0,
+    "keccak": 5
+  },
+  {
+    "name": "updateSupplyCap 500 (below supply)",
+    "gas": 396,
+    "sload": 2,
+    "sstore": 0,
+    "keccak": 2
+  },
+  {
+    "name": "updateSupplyCap 10^6",
+    "gas": 2233,
+    "sload": 3,
+    "sstore": 1,
+    "keccak": 2
+  },
+  {
+    "name": "supplyCap",
+    "gas": 206,
+    "sload": 1,
+    "sstore": 0,
+    "keccak": 0
+  },
+  {
+    "name": "grantRole MINT bob via PAUSE admin",
+    "gas": 24687,
+    "sload": 4,
+    "sstore": 1,
+    "keccak": 7
+  },
+  {
+    "name": "mint over cap",
+    "gas": 702,
+    "sload": 5,
+    "sstore": 0,
+    "keccak": 2
+  },
+  {
+    "name": "create.stablecoin",
+    "gas": 201068,
+    "sload": 5,
+    "sstore": 7,
+    "keccak": 9
+  },
+  {
+    "name": "stable.currency",
+    "gas": 206,
+    "sload": 1,
+    "sstore": 0,
+    "keccak": 0
+  },
+  {
+    "name": "stable.decimals",
+    "gas": 106,
+    "sload": 0,
+    "sstore": 0,
+    "keccak": 0
+  },
+  {
+    "name": "stable.multiplier (absent)",
+    "gas": 106,
+    "sload": 0,
+    "sstore": 0,
+    "keccak": 0
+  },
+  {
+    "name": "stable.mint",
+    "gas": 50600,
+    "sload": 6,
+    "sstore": 2,
+    "keccak": 3
+  },
+  {
+    "name": "stable.transfer",
+    "gas": 26458,
+    "sload": 4,
+    "sstore": 2,
+    "keccak": 2
+  },
+  {
+    "name": "create.stablecoin bad currency",
+    "gas": 256,
+    "sload": 1,
+    "sstore": 0,
+    "keccak": 1
+  },
+  {
+    "name": "create.asset bad decimals",
+    "gas": 244,
+    "sload": 1,
+    "sstore": 0,
+    "keccak": 1
+  },
+  {
+    "name": "create.asset again same salt",
+    "gas": 386,
+    "sload": 1,
+    "sstore": 0,
+    "keccak": 2
+  },
+  {
+    "name": "isActivated(asset)",
+    "gas": 154,
+    "sload": 1,
+    "sstore": 0,
+    "keccak": 1
+  },
+  {
+    "name": "deactivate asset",
+    "gas": 3896,
+    "sload": 2,
+    "sstore": 1,
+    "keccak": 2
+  },
+  {
+    "name": "create.asset while closed",
+    "gas": 244,
+    "sload": 1,
+    "sstore": 0,
+    "keccak": 1
+  },
+  {
+    "name": "activate asset",
+    "gas": 21796,
+    "sload": 2,
+    "sstore": 1,
+    "keccak": 2
+  },
+  {
+    "name": "activate asset again",
+    "gas": 254,
+    "sload": 2,
+    "sstore": 0,
+    "keccak": 1
+  },
+  {
+    "name": "updateParam admin by gov",
+    "gas": 4403,
+    "sload": 1,
+    "sstore": 1,
+    "keccak": 0
+  },
+  {
+    "name": "admin()",
+    "gas": 106,
+    "sload": 1,
+    "sstore": 0,
+    "keccak": 0
+  },
+  {
+    "name": "updateParam by non-gov",
+    "gas": 42,
+    "sload": 0,
+    "sstore": 0,
+    "keccak": 0
+  },
+  {
+    "name": "updateParam unknown key",
+    "gas": 42,
+    "sload": 0,
+    "sstore": 0,
+    "keccak": 0
+  },
+  {
+    "name": "checkActivated(stablecoin)",
+    "gas": 154,
+    "sload": 1,
+    "sstore": 0,
+    "keccak": 1
+  },
+  {
+    "name": "deactivate by old admin",
+    "gas": 112,
+    "sload": 1,
+    "sstore": 0,
+    "keccak": 0
+  },
+  {
+    "name": "deactivate policy_registry by carol",
+    "gas": 1896,
+    "sload": 2,
+    "sstore": 1,
+    "keccak": 2
+  },
+  {
+    "name": "createPolicy while closed",
+    "gas": 160,
+    "sload": 1,
+    "sstore": 0,
+    "keccak": 1
+  },
+  {
+    "name": "static transfer",
+    "gas": 118,
+    "sload": 0,
+    "sstore": 0,
+    "keccak": 0
+  },
+  {
+    "name": "delegatecall transfer",
+    "gas": 0,
+    "sload": 0,
+    "sstore": 0,
+    "keccak": 0
+  },
+  {
+    "name": "call with value",
+    "gas": 0,
+    "sload": 0,
+    "sstore": 0,
+    "keccak": 0
+  },
+  {
+    "name": "oog name",
+    "gas": 200,
+    "sload": 1,
+    "sstore": 0,
+    "keccak": 0
+  },
+  {
+    "name": "oog transfer at sentry",
+    "gas": 2400,
+    "sload": 4,
+    "sstore": 0,
+    "keccak": 3
+  },
+  {
+    "name": "short calldata",
+    "gas": 106,
+    "sload": 0,
+    "sstore": 0,
+    "keccak": 0
+  },
+  {
+    "name": "unknown selector",
+    "gas": 106,
+    "sload": 0,
+    "sstore": 0,
+    "keccak": 0
+  },
+  {
+    "name": "missing argument",
+    "gas": 112,
+    "sload": 0,
+    "sstore": 0,
+    "keccak": 0
+  },
+  {
+    "name": "uninitialized token",
+    "gas": 2606,
+    "sload": 0,
+    "sstore": 0,
+    "keccak": 0
+  },
+  {
+    "name": "factory.isCAS20Initialized(ghost)",
+    "gas": 2612,
+    "sload": 0,
+    "sstore": 0,
+    "keccak": 0
+  },
+  {
+    "name": "factory.variantOf(token)",
+    "gas": 12,
+    "sload": 0,
+    "sstore": 0,
+    "keccak": 0
+  },
+  {
+    "name": "factory.variantOf(alice)",
+    "gas": 12,
+    "sload": 0,
+    "sstore": 0,
+    "keccak": 0
+  },
+  {
+    "name": "renounceLastAdmin by bob (not admin)",
+    "gas": 2290,
+    "sload": 1,
+    "sstore": 0,
+    "keccak": 2
+  },
+  {
+    "name": "renounceLastAdmin",
+    "gas": 3674,
+    "sload": 2,
+    "sstore": 2,
+    "keccak": 4
+  },
+  {
+    "name": "grantRole after renounce",
+    "gas": 2360,
+    "sload": 2,
+    "sstore": 0,
+    "keccak": 1
+  }
+]

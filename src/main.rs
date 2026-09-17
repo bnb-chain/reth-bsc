@@ -543,12 +543,12 @@ fn main() -> eyre::Result<()> {
                         ctx.modules.merge_if_module_configured(RethRpcModule::Miner, miner_api.into_rpc())?;
                         tracing::info!("Succeed to register Miner RPC API");
 
-                        tracing::info!("Start to register BSC Eth extension API (eth_coinbase, eth_health)...");
+                        tracing::info!("Start to register BSC Eth extension API (eth_coinbase, eth_health, eth_getCAS20TokenInfo)...");
                         use reth_bsc::rpc::eth_ext::{BscEthExtApiImpl, BscEthExtApiServer};
 
                         // Remove the default unimplemented eth_coinbase before registering our version
                         ctx.modules.remove_method_from_configured("eth_coinbase");
-                        let eth_ext_api = BscEthExtApiImpl::new();
+                        let eth_ext_api = BscEthExtApiImpl::new(ctx.provider().clone());
                         ctx.modules.merge_if_module_configured(RethRpcModule::Eth, eth_ext_api.into_rpc())?;
                         tracing::info!("Succeed to register BSC Eth extension API");
 

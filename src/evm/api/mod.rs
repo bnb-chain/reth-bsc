@@ -64,6 +64,11 @@ impl<DB: Database, I> BscEvm<DB, I> {
                     env.block_env.milli_remainder,
                 ),
             ]);
+            // BEP-702 (Jenner): CAS20 tokens have no fixed address, so the family is
+            // resolved by prefix through the map's dynamic lookup rather than listed.
+            precompiles.set_precompile_lookup(
+                crate::evm::precompiles::cas20::Cas20Lookup::new(env.cfg_env.spec),
+            );
         }
         // Ensure the instruction table matches the configured spec. `new_mainnet()` defaults to
         // the latest spec (Prague), which undercharges pre-Berlin SLOAD in early blocks.
