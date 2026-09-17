@@ -473,19 +473,17 @@ where
             return 0;
         }
 
-        let mut delay = BACKOFF_TIME_OF_INITIAL;
         let is_parent_lorentz =
             self.spec.is_lorentz_active_at_timestamp(parent.number, parent.timestamp);
-        if is_parent_lorentz {
-            // If the in-turn validator has not signed recently, the expected backoff times are
-            // [2, 3, 4, ...] from Lorentz and [1, 2, 3, ...] again from Jenner.
-            delay = LORENTZ_BACKOFF_TIME_OF_INITIAL;
-        }
-        if self.spec.is_jenner_active_at_timestamp(parent.number, parent.timestamp) {
-            // BEP-714: restore the one-second initial backoff
-            delay = BACKOFF_TIME_OF_INITIAL;
-        }
-        let initial_back_off_time = delay;
+        let is_parent_jenner =
+            self.spec.is_jenner_active_at_timestamp(parent.number, parent.timestamp);
+        // If the in-turn validator has not signed recently, the expected backoff times are
+        // [2, 3, 4, ...] from Lorentz and [1, 2, 3, ...] again from Jenner (BEP-714).
+        let initial_back_off_time = match (is_parent_lorentz, is_parent_jenner) {
+            (true, false) => LORENTZ_BACKOFF_TIME_OF_INITIAL,
+            _ => BACKOFF_TIME_OF_INITIAL,
+        };
+        let mut delay = initial_back_off_time;
         let mut validators = snap.validators.clone();
 
         if self.spec.is_planck_active_at_block(header.number) {
