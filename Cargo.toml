@@ -16,51 +16,51 @@ name = "reth-bsc"
 path = "src/main.rs"
 
 [dependencies]
-reth = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
-reth-cli = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
-reth-cli-commands = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
-reth-basic-payload-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
-reth-db = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
-reth-engine-local = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
-reth-engine-tree = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
-reth-node-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
-reth-chainspec = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
-reth-cli-util = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
-reth-discv4 = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td", features = ["test-utils"] }
-reth-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
-reth-ethereum-forks = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td", features = ["serde"] }
-reth-ethereum-payload-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
-reth-payload-builder-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
-reth-chain-state = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
-reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
-reth-eth-wire = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
-reth-eth-wire-types = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
-reth-evm = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
-reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
-reth-execution-types = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
-reth-ipc = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
-reth-metrics = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
-reth-node-core = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
-reth-revm = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
-reth-network = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td", features = ["test-utils"] }
-reth-network-p2p = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
-reth-network-api = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
-reth-node-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td", features = ["test-utils"] }
-reth-network-peers = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
-reth-payload-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
-reth-ethereum-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
+reth = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
+reth-cli = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
+reth-cli-commands = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
+reth-basic-payload-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
+reth-db = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
+reth-engine-local = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
+reth-engine-tree = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
+reth-node-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
+reth-chainspec = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
+reth-cli-util = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
+reth-discv4 = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics", features = ["test-utils"] }
+reth-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
+reth-ethereum-forks = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics", features = ["serde"] }
+reth-ethereum-payload-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
+reth-payload-builder-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
+reth-chain-state = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
+reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
+reth-eth-wire = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
+reth-eth-wire-types = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
+reth-evm = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
+reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
+reth-execution-types = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
+reth-ipc = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
+reth-metrics = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
+reth-node-core = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
+reth-revm = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
+reth-network = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics", features = ["test-utils"] }
+reth-network-p2p = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
+reth-network-api = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
+reth-node-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics", features = ["test-utils"] }
+reth-network-peers = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
+reth-payload-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
+reth-ethereum-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
 reth-primitives-traits = { version = "0.6.0", default-features = false }
 reth-codecs = { version = "0.6.0" }
-reth-provider = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td", features = ["test-utils"] }
-reth-storage-overlay = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
-reth-rpc-eth-api = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
-reth-rpc-convert = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
-reth-rpc-engine-api = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
-reth-rpc-server-types = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
-reth-trie-common = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
-reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
-reth-tasks = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
-reth-transaction-pool = { git = "https://github.com/bnb-chain/reth.git", branch = "fix/bsc-advertise-real-td" }
+reth-provider = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics", features = ["test-utils"] }
+reth-storage-overlay = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
+reth-rpc-eth-api = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
+reth-rpc-convert = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
+reth-rpc-engine-api = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
+reth-rpc-server-types = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
+reth-trie-common = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
+reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
+reth-tasks = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
+reth-transaction-pool = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
 revm = "42.0.1"
 revm-database = "42.0.0"
 revm-bytecode = "42.0.0"

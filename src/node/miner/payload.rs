@@ -2663,6 +2663,12 @@ where
             fees = %best_payload.fees(),
             exec_duration_ms = best_payload.exec_duration.as_millis(),
             trie_root_duration_ms = best_payload.trie_root_duration.as_millis(),
+            // The state root this validator is about to seal into the header. Nothing
+            // cross-checks it before publication: a peer that computes the same value accepts
+            // the block, and only a peer that computes a different one rejects it. Without
+            // this field there is no record of what the producer computed, so a disputed
+            // block cannot be traced back to the node that created it.
+            state_root = %best_payload.block().header().state_root,
             gas_used,
             gas_limit,
             gas_usage_percent,
