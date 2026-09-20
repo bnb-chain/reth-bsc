@@ -665,7 +665,7 @@ where
             }
             // filter out tx with min gas tip.
             if pool_tx.effective_tip_per_gas(base_fee).unwrap_or(0_u128) < min_gas_tip {
-                // Skip packaging underpriced transactions, but do not mark them invalid.
+                // Skip this sender's remaining transactions in this build.
                 trace!(
                     target: "payload_builder",
                     trace_id,
@@ -674,6 +674,7 @@ where
                     min_gas_tip,
                     "Skipping underpriced transaction"
                 );
+                best_tx_list.mark_invalid(&pool_tx, &InvalidPoolTransactionError::Underpriced);
                 continue;
             }
 
