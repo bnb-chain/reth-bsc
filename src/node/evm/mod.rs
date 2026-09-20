@@ -1,4 +1,5 @@
 pub mod error;
+pub mod hook_probe;
 pub mod util;
 
 #[cfg(test)]

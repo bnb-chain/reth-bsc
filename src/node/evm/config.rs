@@ -88,6 +88,10 @@ pub struct BscNextBlockEnvAttributes {
     /// blocks unboundedly past its slot. `None` = legacy unbounded blocking wait
     /// (out-of-turn / bid-sim / import paths).
     pub state_root_deadline_ms: Option<u64>,
+    /// Tallies of what the sparse-trie state hook actually forwarded. Diagnostic only,
+    /// populated when the sealed-root verification probe is enabled. See
+    /// [`crate::node::evm::hook_probe`].
+    pub state_hook_counts: Option<Arc<crate::node::evm::hook_probe::StateHookCounts>>,
 }
 
 impl<H: BlockHeader> BuildPendingEnv<H> for BscNextBlockEnvAttributes {
@@ -102,6 +106,7 @@ impl<H: BlockHeader> BuildPendingEnv<H> for BscNextBlockEnvAttributes {
             state_root_precomputed_sink: None,
             trie_handle: None,
             state_root_deadline_ms: None,
+            state_hook_counts: None,
         }
     }
 }
@@ -177,6 +182,9 @@ pub struct BscBlockExecutionCtx<'a> {
     /// See [`BscNextBlockEnvAttributes::state_root_deadline_ms`]. Bounds the
     /// sparse-trie `state_root()` wait in `finish`.
     pub state_root_deadline_ms: Option<u64>,
+    /// See [`BscNextBlockEnvAttributes::state_hook_counts`]. Read by `finish` so a
+    /// sparse-vs-serial root mismatch can report what the task was actually fed.
+    pub state_hook_counts: Option<Arc<crate::node::evm::hook_probe::StateHookCounts>>,
 }
 
 impl<'a> BscBlockExecutionCtx<'a> {
@@ -483,6 +491,7 @@ where
             state_root_precomputed_sink: None,
             trie_handle: None,
             state_root_deadline_ms: None,
+            state_hook_counts: None,
         })
     }
 
@@ -510,6 +519,7 @@ where
             state_root_precomputed_sink: attributes.state_root_precomputed_sink,
             trie_handle: attributes.trie_handle,
             state_root_deadline_ms: attributes.state_root_deadline_ms,
+            state_hook_counts: attributes.state_hook_counts.clone(),
         })
     }
 
@@ -579,6 +589,7 @@ where
             state_root_precomputed_sink: None,
             trie_handle: None,
             state_root_deadline_ms: None,
+            state_hook_counts: None,
         })
     }
 
