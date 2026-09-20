@@ -248,6 +248,43 @@ where
         // merge all transitions into bundle state
         db.merge_transitions(BundleRetention::Reverts);
 
+        // Proposer-side execution witness (`BSC_WITNESS_EVERY_BLOCK=<dir>`).
+        //
+        // The engine-side `--debug.witness-every-block` only fires for blocks a node
+        // VALIDATES, and a proposer never validates its own block -- verified on the devnet:
+        // blocks 146/156/166 were proposed by node0 and only its peers captured them. That is
+        // precisely the gap that left qanet with no producer-side evidence for 29,470,741,
+        // where .175 built the bad block and captured nothing.
+        //
+        // Named by parent hash because the block has no hash yet at this point; a later build
+        // attempt for the same height overwrites the earlier one.
+        if let Ok(dir) = std::env::var("BSC_WITNESS_EVERY_BLOCK") {
+            // Zero-padded for correct lexical ordering -- unpadded, block 9 sorts after 96.
+            let stem =
+                format!("{:010}_{}.proposed", self.parent.number + 1, self.parent.hash());
+            let started = std::time::Instant::now();
+            match reth_engine_tree::tree::write_execution_witness(
+                db,
+                &state,
+                &stem,
+                std::path::Path::new(&dir),
+            ) {
+                Ok(bytes) => tracing::debug!(
+                    target: "bsc::builder",
+                    block_number = self.parent.number + 1,
+                    bytes,
+                    elapsed = ?started.elapsed(),
+                    "Wrote proposer-side execution witness"
+                ),
+                Err(err) => tracing::warn!(
+                    target: "bsc::builder",
+                    block_number = self.parent.number + 1,
+                    %err,
+                    "Failed to write proposer-side execution witness; continuing"
+                ),
+            }
+        }
+
         let state_root_start = std::time::Instant::now();
         let hashed_state =
             state.hashed_post_state(&db.bundle_state).map_err(BlockExecutionError::other)?;
@@ -277,6 +314,138 @@ where
                 state_root = %root,
                 "Using precomputed state root from sparse-trie task"
             );
+            // Producer-side verification (opt-in, `BSC_VERIFY_SEALED_STATE_ROOT=1`).
+            //
+            // Nothing else in the pipeline can catch a bad sparse-trie root on the producing
+            // validator. This branch seals `root` straight into the header, and an importing
+            // node's only check is `outcome.state_root == block.header().state_root()` --
+            // which is circular, because that header root came from here. So a wrong root is
+            // signed, gossiped and accepted, and the chain extends on an invalid block.
+            //
+            // Recomputing serially is the independent check. It is far too slow to run in-slot
+            // (~900ms under a deep overlay, against a 450ms period), so this is a diagnostic
+            // for devnet reproduction, not something to enable on a real validator. A
+            // production-grade guard would run this off the critical path, after sealing.
+            if std::env::var("BSC_VERIFY_SEALED_STATE_ROOT").is_ok_and(|v| v == "1") {
+                let verify_start = std::time::Instant::now();
+                match state.state_root_with_updates(hashed_state.clone()) {
+                    Ok((serial_root, serial_updates)) if serial_root != root => {
+                        // Which tries the two disagree about. A storage trie present on one
+                        // side only, or `is_deleted` set on one side only, points straight at
+                        // the wipe/deletion handling; a pure account-node path difference
+                        // points at the account trie walk instead.
+                        let only_sparse: Vec<String> = updates
+                            .storage_tries
+                            .keys()
+                            .filter(|a| !serial_updates.storage_tries.contains_key(*a))
+                            .take(8)
+                            .map(|a| format!("{a:?}"))
+                            .collect();
+                        let only_serial: Vec<String> = serial_updates
+                            .storage_tries
+                            .keys()
+                            .filter(|a| !updates.storage_tries.contains_key(*a))
+                            .take(8)
+                            .map(|a| format!("{a:?}"))
+                            .collect();
+                        let deleted_differs: Vec<String> = updates
+                            .storage_tries
+                            .iter()
+                            .filter_map(|(a, u)| {
+                                serial_updates.storage_tries.get(a).and_then(|s| {
+                                    (s.is_deleted != u.is_deleted).then(|| {
+                                        format!("{a:?}:sparse={},serial={}", u.is_deleted, s.is_deleted)
+                                    })
+                                })
+                            })
+                            .take(8)
+                            .collect();
+                        metrics::counter!("bsc_builder_sealed_state_root_mismatch_total")
+                            .increment(1);
+                        tracing::error!(
+                            target: "bsc::builder",
+                            parent_hash = %self.parent.hash(),
+                            block_number = %(self.parent.number + 1),
+                            sparse_root = %root,
+                            serial_root = %serial_root,
+                            user_tx_count = self.transactions.len(),
+                            hashed_accounts = hashed_state.accounts.len(),
+                            hashed_storages = hashed_state.storages.len(),
+                            wiped_storages =
+                                hashed_state.storages.values().filter(|s| s.wiped).count(),
+                            sparse_account_nodes = updates.account_nodes.len(),
+                            serial_account_nodes = serial_updates.account_nodes.len(),
+                            sparse_storage_tries = updates.storage_tries.len(),
+                            serial_storage_tries = serial_updates.storage_tries.len(),
+                            storage_tries_only_sparse = ?only_sparse,
+                            storage_tries_only_serial = ?only_serial,
+                            is_deleted_differs = ?deleted_differs,
+                            // What the sparse-trie task was actually fed. If the ValidatorSet
+                            // never appears here, the updates were lost before the task saw
+                            // them; if it does, the fault is inside the task's ingestion.
+                            state_hook = %self
+                                .ctx
+                                .state_hook_counts
+                                .as_ref()
+                                .map(|c| c.snapshot())
+                                .unwrap_or_else(|| "unavailable".to_string()),
+                            // Streamed (slot, original -> present) for the ValidatorSet, beside
+                            // what the authoritative bundle recorded for the same account. If the
+                            // bundle lists slots the stream reported as unchanged, the streamed
+                            // originals are stale and `is_changed()` is the wrong criterion.
+                            state_hook_samples = %self
+                                .ctx
+                                .state_hook_counts
+                                .as_ref()
+                                .map(|c| c.samples())
+                                .unwrap_or_default(),
+                            // The comparison that matters: what the task accumulated vs the
+                            // authoritative bundle delta.
+                            stream_vs_bundle = %self
+                                .ctx
+                                .state_hook_counts
+                                .as_ref()
+                                .map(|c| c.diff_against(&hashed_state))
+                                .unwrap_or_default(),
+                            bundle_validator_set = ?hashed_state
+                                .storages
+                                .get(&alloy_primitives::keccak256(
+                                    crate::node::evm::hook_probe::VALIDATOR_SET,
+                                ))
+                                .map(|s| {
+                                    (
+                                        s.wiped,
+                                        s.storage
+                                            .iter()
+                                            .take(8)
+                                            .map(|(k, v)| format!("{k:#x}:{v:#x}"))
+                                            .collect::<Vec<_>>(),
+                                    )
+                                }),
+                            verify_ms = verify_start.elapsed().as_millis(),
+                            "Sparse-trie state root disagrees with the serial root; \
+                             this block would seal an invalid state root"
+                        );
+                    }
+                    Ok(_) => {
+                        tracing::debug!(
+                            target: "bsc::builder",
+                            block_number = %(self.parent.number + 1),
+                            verify_ms = verify_start.elapsed().as_millis(),
+                            "Sealed state root verified against serial recomputation"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "bsc::builder",
+                            block_number = %(self.parent.number + 1),
+                            %err,
+                            "Sealed state root verification could not run"
+                        );
+                    }
+                }
+            }
+
             (root, updates)
         } else {
             // Fix #1: bound the synchronous state-root fallback by the slot deadline.

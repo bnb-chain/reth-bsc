@@ -16,29 +16,29 @@ reth_bsc = { path = "../.." }
 rand = "0.9"
 
 # reth dependencies aligned with root crate branch to avoid duplicate crate versions
-reth-chainspec = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
-reth-consensus = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
-reth-ethereum-forks = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
-reth-db = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics", features = [    "mdbx",
+reth-chainspec = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block" }
+reth-consensus = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block" }
+reth-ethereum-forks = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block" }
+reth-db = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block", features = [    "mdbx",
     "test-utils",
     "disable-lock",
 ] }
-reth-db-api = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
-reth-db-common = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
-reth-ethereum-consensus = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
-reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
-reth-evm = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
-reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
+reth-db-api = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block" }
+reth-db-common = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block" }
+reth-ethereum-consensus = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block" }
+reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block" }
+reth-evm = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block" }
+reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block" }
 reth-primitives-traits = { version = "0.6.0", default-features = false }
-reth-provider = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics", features = [
+reth-provider = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block", features = [
     "test-utils",
 ] }
-reth-revm = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics", features = [
+reth-revm = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block", features = [
     "std",
 ] }
-reth-tracing = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
-reth-trie = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
-reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
+reth-tracing = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block" }
+reth-trie = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block" }
+reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block" }
 # revm
 
 # alloy

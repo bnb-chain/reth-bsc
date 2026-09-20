@@ -531,6 +531,13 @@ where
             Mutex<Option<(alloy_primitives::B256, reth_trie_common::updates::TrieUpdates)>>,
         > = Arc::new(Mutex::new(None));
 
+        // Counting shim for the sparse-trie state hook, allocated only when the sealed-root
+        // verification probe is on so the normal path stays untouched.
+        let state_hook_counts =
+            std::env::var("BSC_VERIFY_SEALED_STATE_ROOT").is_ok_and(|v| v == "1").then(|| {
+                Arc::new(crate::node::evm::hook_probe::StateHookCounts::default())
+            });
+
         let next_env_attributes = BscNextBlockEnvAttributes {
             inner: NextBlockEnvAttributes {
                 timestamp: attributes.timestamp,
@@ -553,6 +560,7 @@ where
             // See `BscBlockExecutionCtx::trie_handle` doc.
             trie_handle: Some(trie_handle.clone()),
             state_root_deadline_ms,
+            state_hook_counts: state_hook_counts.clone(),
         };
 
         let mut builder = self
@@ -570,10 +578,19 @@ where
         // wait. When no spawner is registered, `trie_handle` is empty and this is a no-op
         // (synchronous fallback).
         if let Some(handle) = trie_handle.lock().unwrap().as_mut() {
-            builder
-                .evm_mut()
-                .db_mut()
-                .set_state_hook(Some(Box::new(handle.take_execution_hook())));
+            // Wrap the real hook in the counting shim when the verification probe is on, so a
+            // sparse-vs-serial mismatch can say whether the task was ever fed the state it is
+            // missing. The shim forwards everything unchanged and preserves drop order, so it
+            // cannot alter the computed root.
+            let execution_hook: Box<dyn reth_evm::OnStateHook> =
+                match state_hook_counts.as_ref() {
+                    Some(counts) => Box::new(crate::node::evm::hook_probe::CountingStateHook::new(
+                        Box::new(handle.take_execution_hook()),
+                        counts.clone(),
+                    )),
+                    None => Box::new(handle.take_execution_hook()),
+                };
+            builder.evm_mut().db_mut().set_state_hook(Some(execution_hook));
             debug!(
                 target: "payload_builder",
                 trace_id,
@@ -1089,6 +1106,7 @@ where
                     // Empty-payload path: don't engage sparse-trie (would still be
                     // correct but the setup overhead isn't worth it for ~0-tx blocks).
                     trie_handle: None,
+                    state_hook_counts: None,
                     state_root_deadline_ms: None,
                 },
             )

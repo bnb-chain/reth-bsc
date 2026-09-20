@@ -16,51 +16,51 @@ name = "reth-bsc"
 path = "src/main.rs"
 
 [dependencies]
-reth = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
-reth-cli = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
-reth-cli-commands = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
-reth-basic-payload-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
-reth-db = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
-reth-engine-local = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
-reth-engine-tree = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
-reth-node-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
-reth-chainspec = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
-reth-cli-util = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
-reth-discv4 = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics", features = ["test-utils"] }
-reth-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
-reth-ethereum-forks = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics", features = ["serde"] }
-reth-ethereum-payload-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
-reth-payload-builder-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
-reth-chain-state = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
-reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
-reth-eth-wire = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
-reth-eth-wire-types = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
-reth-evm = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
-reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
-reth-execution-types = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
-reth-ipc = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
-reth-metrics = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
-reth-node-core = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
-reth-revm = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
-reth-network = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics", features = ["test-utils"] }
-reth-network-p2p = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
-reth-network-api = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
-reth-node-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics", features = ["test-utils"] }
-reth-network-peers = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
-reth-payload-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
-reth-ethereum-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
+reth = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block" }
+reth-cli = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block" }
+reth-cli-commands = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block" }
+reth-basic-payload-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block" }
+reth-db = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block" }
+reth-engine-local = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block" }
+reth-engine-tree = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block" }
+reth-node-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block" }
+reth-chainspec = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block" }
+reth-cli-util = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block" }
+reth-discv4 = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block", features = ["test-utils"] }
+reth-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block" }
+reth-ethereum-forks = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block", features = ["serde"] }
+reth-ethereum-payload-builder = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block" }
+reth-payload-builder-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block" }
+reth-chain-state = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block" }
+reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block" }
+reth-eth-wire = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block" }
+reth-eth-wire-types = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block" }
+reth-evm = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block" }
+reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block" }
+reth-execution-types = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block" }
+reth-ipc = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block" }
+reth-metrics = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block" }
+reth-node-core = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block" }
+reth-revm = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block" }
+reth-network = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block", features = ["test-utils"] }
+reth-network-p2p = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block" }
+reth-network-api = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block" }
+reth-node-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block", features = ["test-utils"] }
+reth-network-peers = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block" }
+reth-payload-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block" }
+reth-ethereum-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block" }
 reth-primitives-traits = { version = "0.6.0", default-features = false }
 reth-codecs = { version = "0.6.0" }
-reth-provider = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics", features = ["test-utils"] }
-reth-storage-overlay = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
-reth-rpc-eth-api = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
-reth-rpc-convert = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
-reth-rpc-engine-api = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
-reth-rpc-server-types = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
-reth-trie-common = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
-reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
-reth-tasks = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
-reth-transaction-pool = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/state-root-diagnostics" }
+reth-provider = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block", features = ["test-utils"] }
+reth-storage-overlay = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block" }
+reth-rpc-eth-api = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block" }
+reth-rpc-convert = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block" }
+reth-rpc-engine-api = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block" }
+reth-rpc-server-types = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block" }
+reth-trie-common = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block" }
+reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block" }
+reth-tasks = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block" }
+reth-transaction-pool = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/witness-every-block" }
 revm = "42.0.1"
 revm-database = "42.0.0"
 revm-bytecode = "42.0.0"

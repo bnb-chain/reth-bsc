@@ -655,6 +655,7 @@ where
                     // builder will fall through to state_root_with_updates.
                     state_root_precomputed_sink: None,
                     trie_handle: None,
+                    state_hook_counts: None,
                     state_root_deadline_ms: None,
                 },
             )

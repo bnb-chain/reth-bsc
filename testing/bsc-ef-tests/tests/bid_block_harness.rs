@@ -296,6 +296,7 @@ fn trusted_local_build_produces_block() {
                 turn_length_sink: None,
                 state_root_precomputed_sink: None,
                 trie_handle: None,
+                state_hook_counts: None,
                 state_root_deadline_ms: None,
             },
         )
@@ -369,6 +370,7 @@ fn round_trip_build_finalize_reexecute_agree() {
                     turn_length_sink: None,
                     state_root_precomputed_sink: None,
                     trie_handle: None,
+                state_hook_counts: None,
                     state_root_deadline_ms: None,
                 },
             )
@@ -482,6 +484,7 @@ fn execution_gate_round_trip() {
         turn_length_sink: None,
         state_root_precomputed_sink: None,
         trie_handle: None,
+                state_hook_counts: None,
         state_root_deadline_ms: None,
     };
 
