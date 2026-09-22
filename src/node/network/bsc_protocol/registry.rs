@@ -538,6 +538,7 @@ pub async fn request_blocks_by_range_with_failover(
     count: u64,
     timeout_dur: Duration,
     max_attempts: usize,
+    chain_spec: &crate::chainspec::BscChainSpec,
 ) -> Result<BlocksByRangePacket, String> {
     let announcers = list_announcers_for(start_hash);
     let peers = plan_v2_failover_peers(preferred, announcers, list_v2_peers(), max_attempts);
@@ -548,7 +549,28 @@ pub async fn request_blocks_by_range_with_failover(
     let mut last: Result<BlocksByRangePacket, String> =
         Err("uninitialised failover".to_string());
     for (idx, peer) in peers.iter().enumerate() {
-        match request_blocks_by_range(*peer, start_height, start_hash, count, timeout_dur).await {
+        let response = request_blocks_by_range(*peer, start_height, start_hash, count, timeout_dur)
+            .await
+            .and_then(|mut response| {
+                for block in &mut response.blocks {
+                    if let Err(error) = super::super::data_availability::validate_data_availability(
+                        block, chain_spec,
+                    ) {
+                        tracing::warn!(
+                            target: "bsc_protocol",
+                            %peer,
+                            request_id = response.request_id,
+                            block_number = block.header.number,
+                            block_hash = %block.header.hash_slow(),
+                            error = %format_args!("{error:#}"),
+                            "Rejecting BlocksByRange with unavailable blob data"
+                        );
+                        return Err(format!("{error:#}"));
+                    }
+                }
+                Ok(response)
+            });
+        match response {
             Ok(resp) if !resp.blocks.is_empty() => return Ok(resp),
             Ok(empty_resp) => {
                 tracing::debug!(
@@ -601,6 +623,52 @@ mod version_tests {
             if let Ok(mut g) = REGISTRY.write() {
                 g.remove(&self.0);
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn range_failover_retries_missing_sidecars_from_another_announcer() {
+        use crate::node::network::data_availability::tests::blob_block;
+        let spec = crate::chainspec::BscChainSpec::from(
+            reth_chainspec::ChainSpecBuilder::mainnet().cancun_activated().build(),
+        );
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let block = blob_block(now);
+        let hash = block.header.hash_slow();
+        let _hash_guard = TestHashGuard(hash);
+        let peers = [PeerId::random(), PeerId::random()];
+        let _guards = peers.map(TestPeerGuard);
+        let mut tasks = Vec::new();
+        for (index, peer) in peers.into_iter().enumerate() {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            register_peer(peer, tx, 2);
+            record_announcer(hash, peer);
+            let mut reply = block.clone();
+            if index == 0 {
+                reply.body.sidecars = None;
+            }
+            tasks.push(tokio::spawn(async move {
+                while let Some(command) = rx.recv().await {
+                    if let BscCommand::GetBlocksByRange(request, responder) = command {
+                        responder.send(Ok(BlocksByRangePacket {
+                            request_id: request.request_id,
+                            blocks: vec![reply],
+                        })).unwrap();
+                        return;
+                    }
+                }
+                panic!("peer was never requested");
+            }));
+        }
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            request_blocks_by_range_with_failover(
+                peers[0], block.header.number, hash, 1, Duration::from_secs(1), 2, &spec,
+            ),
+        ).await.unwrap().unwrap();
+        assert_eq!(result.blocks, vec![block]);
+        for task in tasks {
+            tokio::time::timeout(Duration::from_secs(1), task).await.unwrap().unwrap();
         }
     }
 
