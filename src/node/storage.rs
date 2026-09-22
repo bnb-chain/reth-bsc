@@ -9,7 +9,7 @@ use reth_db::transaction::{DbTx, DbTxMut};
 use reth_provider::{
     providers::{ChainStorage, NodeTypesForProvider},
     BlockBodyReader, BlockBodyWriter, ChainSpecProvider, ChainStorageReader, ChainStorageWriter,
-    DBProvider, DatabaseProvider, EthStorage, ProviderResult, ReadBodyInput,
+    DBProvider, DatabaseProvider, EthStorage, ProviderError, ProviderResult, ReadBodyInput,
 };
 use reth_transaction_pool::blobstore::BlobStore;
 use std::collections::HashMap;
@@ -37,6 +37,8 @@ where
             })
             .unzip();
         self.0.write_block_bodies(provider, eth_bodies)?;
+        let first_block = sidecar_entries.first().map(|(number, _)| *number);
+        let last_block = sidecar_entries.last().map(|(number, _)| *number);
 
         // Write blob sidecars to the blob store keyed by tx hash.
         if let Some(blob_store) = crate::shared::get_global_blob_store() {
@@ -53,23 +55,34 @@ where
             }
             if !to_insert.is_empty() {
                 let tx_hashes: Vec<_> = to_insert.iter().map(|(h, _)| *h).collect();
-                match blob_store.insert_all(to_insert) {
-                    Ok(()) => {
-                        tracing::debug!(
-                            target: "bsc::storage",
-                            ?tx_hashes,
-                            "blob_store_write: inserted sidecars"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "bsc::storage",
-                            ?tx_hashes,
-                            "blob_store_write: failed to insert sidecars: {e}"
-                        );
-                    }
+                if let Err(error) = blob_store.insert_all(to_insert) {
+                    tracing::warn!(
+                        target: "bsc::storage",
+                        first_block,
+                        last_block,
+                        sidecar_count = tx_hashes.len(),
+                        ?tx_hashes,
+                        %error,
+                        "blob_store_write: failed to insert sidecars; aborting block body write"
+                    );
+                    return Err(ProviderError::other(error));
                 }
+                tracing::debug!(
+                    target: "bsc::storage",
+                    first_block,
+                    last_block,
+                    sidecar_count = tx_hashes.len(),
+                    ?tx_hashes,
+                    "blob_store_write: inserted sidecars"
+                );
             }
+        } else if sidecar_entries.iter().any(|(_, sidecars)| sidecars.is_some_and(|s| !s.is_empty())) {
+            tracing::warn!(
+                target: "bsc::storage",
+                first_block,
+                last_block,
+                "blob_store_write: blob store unavailable; sidecars not written"
+            );
         }
 
         Ok(())
@@ -112,7 +125,7 @@ where
 
         let eth_bodies = self.0.read_block_bodies(provider, inputs)?;
 
-        let blob_store = crate::shared::get_global_blob_store().cloned();
+        let blob_store = crate::shared::get_global_blob_store();
         let bodies = eth_bodies
             .into_iter()
             .zip(block_info)
@@ -123,34 +136,25 @@ where
                     .filter(|(_, (_, ty))| *ty == EIP4844_TX_TYPE_ID)
                     .map(|(idx, (hash, _))| (*hash, idx as u64))
                     .collect();
-                let blob_tx_hashes: Vec<B256> = blob_txs.iter().map(|(h, _)| *h).collect();
                 let sidecars = if blob_txs.is_empty() {
                     None
                 } else {
-                    blob_store.as_ref().and_then(|store| {
+                    blob_store.and_then(|store| {
                         read_sidecars_from_blob_store(store, block_number, block_hash, &blob_txs)
                     })
                 };
-                if !blob_tx_hashes.is_empty() {
-                    let found = sidecars.as_ref().map_or(0, |s| s.len());
+                if !blob_txs.is_empty() {
                     tracing::debug!(
                         target: "bsc::storage",
                         block_number,
                         ?block_hash,
-                        ?blob_tx_hashes,
-                        found,
+                        ?blob_txs,
+                        expected = blob_txs.len(),
+                        found = sidecars.as_ref().map_or(0, Vec::len),
+                        found_tx_hashes = ?sidecars.iter().flatten().map(|s| s.tx_hash).collect::<Vec<_>>(),
                         blob_store_available = blob_store.is_some(),
                         "blob_store_read: queried sidecars for blob txs"
                     );
-                    if found == 0 {
-                        tracing::warn!(
-                            target: "bsc::storage",
-                            block_number,
-                            ?block_hash,
-                            ?blob_tx_hashes,
-                            "blob_store_read: block has blob txs but no sidecars found!"
-                        );
-                    }
                 }
                 BscBlockBody { inner, sidecars }
             })
@@ -168,7 +172,18 @@ fn read_sidecars_from_blob_store(
     blob_txs: &[(B256, u64)],
 ) -> Option<Vec<BscBlobTransactionSidecar>> {
     let tx_hashes: Vec<B256> = blob_txs.iter().map(|(h, _)| *h).collect();
-    let blobs = blob_store.get_all(tx_hashes).ok()?;
+    let blobs = blob_store
+        .get_all(tx_hashes)
+        .inspect_err(|error| {
+            tracing::warn!(
+                target: "bsc::storage",
+                block_number,
+                ?block_hash,
+                error = %error,
+                "blob_store_read: failed to query sidecars"
+            );
+        })
+        .ok()?;
     if blobs.is_empty() {
         return None;
     }
@@ -183,6 +198,7 @@ fn read_sidecars_from_blob_store(
                     tracing::warn!(
                         target: "bsc::storage",
                         block_number,
+                        ?block_hash,
                         ?tx_hash,
                         "blob_store_read: sidecar is NOT Eip4844 variant, skipping"
                     );
@@ -190,20 +206,11 @@ fn read_sidecars_from_blob_store(
                 }
             };
             let tx_index = *hash_to_idx.get(&tx_hash)?;
-            tracing::debug!(
-                target: "bsc::storage",
-                block_number,
-                ?tx_hash,
-                tx_index,
-                blobs = inner.blobs.len(),
-                commitments = inner.commitments.len(),
-                proofs = inner.proofs.len(),
-                "blob_store_read: sidecar detail"
-            );
             if inner.blobs.is_empty() || inner.commitments.is_empty() || inner.proofs.is_empty() {
                 tracing::error!(
                     target: "bsc::storage",
                     block_number,
+                    ?block_hash,
                     ?tx_hash,
                     blobs = inner.blobs.len(),
                     commitments = inner.commitments.len(),
