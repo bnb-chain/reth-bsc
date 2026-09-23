@@ -43,15 +43,11 @@ where
         // Write blob sidecars to the blob store keyed by tx hash.
         if let Some(blob_store) = crate::shared::get_global_blob_store() {
             let mut to_insert: Vec<(B256, BlobTransactionSidecarVariant)> = Vec::new();
-            for (_, sidecars) in &sidecar_entries {
-                if let Some(sidecars) = sidecars {
-                    for sidecar in sidecars.iter() {
-                        to_insert.push((
-                            sidecar.tx_hash,
-                            BlobTransactionSidecarVariant::Eip4844(sidecar.inner.clone()),
-                        ));
-                    }
-                }
+            for sidecar in sidecar_entries.iter().filter_map(|(_, sidecars)| *sidecars).flatten() {
+                to_insert.push((
+                    sidecar.tx_hash,
+                    BlobTransactionSidecarVariant::Eip4844(sidecar.inner.clone()),
+                ));
             }
             if !to_insert.is_empty() {
                 let tx_hashes: Vec<_> = to_insert.iter().map(|(h, _)| *h).collect();

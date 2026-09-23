@@ -75,12 +75,19 @@ pub struct BlobApiImpl<Pool, Provider> {
     pool: Pool,
     /// Provider for blockchain data
     provider: Provider,
+    missing_warning_window_secs: u64,
 }
 
 impl<Pool, Provider> BlobApiImpl<Pool, Provider> {
     /// Create a new BlobApi instance
-    pub fn new(pool: Pool, provider: Provider) -> Self {
-        Self { pool, provider }
+    pub fn new(pool: Pool, provider: Provider, minimal: bool) -> Self {
+        // Match the DA request window, or the shorter minimal-mode sweep policy.
+        let missing_warning_window_secs = if minimal { 60 * 60 } else { 1_572_480 };
+        Self { pool, provider, missing_warning_window_secs }
+    }
+
+    fn within_warning_window(&self, timestamp: u64, now: u64) -> bool {
+        now.checked_sub(timestamp).is_some_and(|age| age <= self.missing_warning_window_secs)
     }
 }
 
@@ -367,19 +374,30 @@ where
             )
         })?;
 
-        if blob_results.len() != hash_to_idx.len()
-            && tracing::enabled!(target: "bsc::blob", tracing::Level::DEBUG)
-        {
+        if blob_results.len() != hash_to_idx.len() {
             let timestamp = self.provider.header_by_number(block_num)
                 .ok().flatten().map(|h| h.timestamp());
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs());
+            let recent = timestamp.zip(now)
+                .is_some_and(|(timestamp, now)| self.within_warning_window(timestamp, now));
             let missing: Vec<_> = hash_to_idx.keys()
                 .filter(|hash| !blob_results.iter().any(|(found, _)| found == *hash))
                 .collect();
-            tracing::debug!(
-                target: "bsc::blob", block_number = block_num, ?block_hash, timestamp,
-                expected = hash_to_idx.len(), found = blob_results.len(), ?missing,
-                "Block blob sidecars missing from local store"
-            );
+            if recent {
+                tracing::warn!(
+                    target: "bsc::blob", block_number = block_num, ?block_hash, timestamp,
+                    missing_warning_window_secs = self.missing_warning_window_secs,
+                    expected = hash_to_idx.len(), found = blob_results.len(), ?missing,
+                    "Block blob sidecars missing within expected availability window"
+                );
+            } else {
+                tracing::debug!(
+                    target: "bsc::blob", block_number = block_num, ?block_hash, timestamp,
+                    expected = hash_to_idx.len(), found = blob_results.len(), ?missing,
+                    "Block blob sidecars missing from local store"
+                );
+            }
         }
 
         // Convert to responses with correct block-level tx_index.
@@ -410,6 +428,18 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_blob_warning_respects_retention() {
+        for (minimal, window) in [(false, 1_572_480), (true, 3_600)] {
+            let api = BlobApiImpl::new((), (), minimal);
+            let timestamp = 100;
+            assert!(api.within_warning_window(timestamp, timestamp));
+            assert!(api.within_warning_window(timestamp, timestamp + window));
+            assert!(!api.within_warning_window(timestamp, timestamp + window + 1));
+            assert!(!api.within_warning_window(timestamp, timestamp - 1));
+        }
+    }
 
     #[test]
     fn test_blob_sidecar_response_serialization() {
