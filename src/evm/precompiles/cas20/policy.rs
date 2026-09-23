@@ -15,6 +15,7 @@ use super::{
 };
 use alloy_primitives::{Address, B256, U256};
 
+#[cfg(test)]
 pub(crate) const NAMESPACE: &str = "bsc.policy_registry";
 
 pub(crate) const TYPE_BLOCKLIST: u8 = 0;

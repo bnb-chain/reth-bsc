@@ -11,6 +11,7 @@ use super::{
 };
 use alloy_primitives::{keccak256, Address, B256, U256};
 
+#[cfg(test)]
 pub(crate) const NAMESPACE: &str = "bsc.cas20";
 
 pub(crate) const SLOT_NAME: u64 = 0;
@@ -40,6 +41,7 @@ pub(crate) const OFF_SEIZE_RECEIVER: usize = 8;
 
 pub(crate) const MAX_STRING_LEN: u64 = 1 << 24;
 
+#[cfg(test)]
 pub(crate) fn erc7201_root(namespace: &str) -> B256 {
     let inner = U256::from_be_bytes(keccak256(namespace.as_bytes()).0) - U256::from(1);
     let mut root = keccak256(inner.to_be_bytes::<32>());

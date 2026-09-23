@@ -1,7 +1,7 @@
 //! CAS20 journal access, gas accounting and frame-wide errors.
 //! Mirrors go-bsc's contracts_stateful.go and cas20_gas.go.
 
-use super::{observer::CallStats, Cas20Version};
+use super::observer::CallStats;
 use alloy_evm::EvmInternals;
 use alloy_primitives::{Address, Bytes, Log, B256, U256};
 use revm::{
@@ -129,9 +129,6 @@ impl Meter {
 pub(crate) struct Frame<'a> {
     pub(crate) state: &'a mut dyn Cas20State,
     pub(crate) gas: Meter,
-    /// The behaviour in force, fixed by the fork the EVM runs under. Internal
-    /// dispatch inherits it, so a bundle cannot reach a version its caller cannot.
-    pub(crate) version: Cas20Version,
     /// What the call has done so far, for the observer; never consulted by the logic.
     pub(crate) stats: CallStats,
     out_of_gas: bool,
@@ -145,15 +142,10 @@ pub(crate) struct Frame<'a> {
 }
 
 impl<'a> Frame<'a> {
-    pub(crate) fn new(
-        state: &'a mut dyn Cas20State,
-        gas_limit: u64,
-        version: Cas20Version,
-    ) -> Self {
+    pub(crate) fn new(state: &'a mut dyn Cas20State, gas_limit: u64) -> Self {
         Self {
             state,
             gas: Meter::new(gas_limit),
-            version,
             stats: CallStats::default(),
             out_of_gas: false,
             write_protected: false,
@@ -252,19 +244,6 @@ impl<'f, 'a> Ctx<'f, 'a> {
         }
     }
 
-    /// The same environment, reborrowed for a token bound to this frame.
-    pub(crate) fn reborrow(&mut self) -> Ctx<'_, 'a> {
-        Ctx {
-            frame: &mut *self.frame,
-            self_addr: self.self_addr,
-            caller: self.caller,
-            read_only: self.read_only,
-            direct_call: self.direct_call,
-            value: self.value,
-            admin_renounced: self.admin_renounced,
-        }
-    }
-
     /// An exhausted frame hands nothing back, whatever it had left when the
     /// charge it could not cover arrived; the meter says so from here on.
     pub(crate) fn mark_out_of_gas(&mut self) {
@@ -292,10 +271,6 @@ impl<'f, 'a> Ctx<'f, 'a> {
     /// fail closed instead of writing inside a STATICCALL.
     pub(crate) fn mark_write_protected(&mut self) {
         self.frame.write_protected = true;
-    }
-
-    pub(crate) fn write_protection_violated(&self) -> bool {
-        self.frame.write_protected
     }
 
     /// Where every CAS20 charge arrives. False means stop before the operation the

@@ -12,6 +12,7 @@ use super::{
 };
 use alloy_primitives::{address, Address, B256, U256};
 
+#[cfg(test)]
 pub(crate) const NAMESPACE: &str = "bsc.activation_registry";
 
 /// mapping(bytes32 feature => bool)

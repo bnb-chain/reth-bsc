@@ -11,6 +11,7 @@ use super::{
 };
 use alloy_primitives::{Address, B256, U256};
 
+#[cfg(test)]
 pub(crate) const NAMESPACE: &str = "bsc.cas20.asset";
 
 pub(crate) const SLOT_DECIMALS: u64 = 0;

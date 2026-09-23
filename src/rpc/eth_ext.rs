@@ -127,7 +127,7 @@ where
         let mut host = ProviderHost { state: &*state, time, chain_id };
         addresses
             .iter()
-            .map(|&addr| match token_info_at(&mut host, chain_id, addr, time) {
+            .map(|&addr| match token_info_at(&mut host, addr) {
                 Ok(info) => Ok(Some(info)),
                 Err(InfoError::NotToken) => Ok(None),
                 Err(e @ InfoError::StringTooLong) => Err(invalid_params(e.to_string())),

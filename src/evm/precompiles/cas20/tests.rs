@@ -4,7 +4,7 @@
 
 use super::{
     abi::*,
-    errors::{Exit, Outcome},
+    errors::Outcome,
     factory::derive_address,
     permit::{domain_separator, ecrecover_address},
     policy::{ALWAYS_ALLOW, ALWAYS_BLOCK, TYPE_ALLOWLIST, TYPE_BLOCKLIST, TYPE_UNION},
@@ -29,7 +29,7 @@ const NOW: u64 = 1_800_000_000;
 const GAS: u64 = 5_000_000;
 
 struct Out {
-    exit: Exit,
+    exit: Outcome,
     used: u64,
     refund: i64,
     logs: Vec<Log>,
@@ -38,14 +38,14 @@ struct Out {
 impl Out {
     fn ret(&self) -> &[u8] {
         match &self.exit {
-            Exit::Return(b) => b,
+            Outcome::Return(b) => b,
             other => panic!("expected a return, got {other:?}"),
         }
     }
 
     fn revert(&self) -> &[u8] {
         match &self.exit {
-            Exit::Revert(b) => b,
+            Outcome::Revert(b) => b,
             other => panic!("expected a revert, got {other:?}"),
         }
     }
@@ -87,13 +87,7 @@ impl Harness {
     ) -> Out {
         let r =
             run_call(&mut self.st, CallSpec { caller, to, gas, is_static, direct, value }, input);
-        let exit = match r.outcome {
-            Outcome::Return(b) => Exit::Return(b),
-            Outcome::Revert(b) => Exit::Revert(b),
-            Outcome::OutOfGas => Exit::OutOfGas,
-            Outcome::Fatal(msg) => panic!("fatal: {msg}"),
-        };
-        Out { exit, used: r.used, refund: r.refund, logs: r.logs }
+        Out { exit: r.outcome, used: r.used, refund: r.refund, logs: r.logs }
     }
 
     /// A transaction boundary: what was written is now committed, and nothing is warm.
@@ -125,10 +119,6 @@ fn w(n: u64) -> B256 {
 
 fn a(addr: Address) -> B256 {
     addr_key(addr)
-}
-
-fn u256_of(b: B256) -> U256 {
-    U256::from_be_bytes(b.0)
 }
 
 fn call_data(sel: Selector, words: &[B256]) -> Vec<u8> {
@@ -242,12 +232,19 @@ fn addresses_route_by_prefix_and_singleton() {
     let mut outside = asset;
     outside.0[5] = 1;
     assert!(!is_cas20_address(outside) && resolve(outside).is_none());
-    assert!(!is_cas20_routed(ALICE));
-    assert!(is_cas20_routed(FACTORY_ADDRESS) && is_cas20_routed(asset));
     let jenner = Cas20Lookup::new(crate::hardforks::bsc::BscHardfork::Jenner);
     assert!(jenner.lookup(&asset).is_some() && jenner.lookup(&ALICE).is_none());
-    assert!(jenner.lookup(&unknown).is_none() && !is_cas20_routed(unknown));
-    assert!(!Cas20Lookup::new(crate::hardforks::bsc::BscHardfork::Pasteur).is_active());
+    assert!(jenner.lookup(&unknown).is_none());
+    let pasteur = Cas20Lookup::new(crate::hardforks::bsc::BscHardfork::Pasteur);
+    for address in [
+        asset,
+        stable,
+        FACTORY_ADDRESS,
+        POLICY_REGISTRY_ADDRESS,
+        ACTIVATION_REGISTRY_ADDRESS,
+    ] {
+        assert!(pasteur.lookup(&address).is_none());
+    }
 }
 
 // --- the layout fixture ---------------------------------------------------------
@@ -565,7 +562,7 @@ fn out_of_gas_halts_and_typed_reverts_do_not() {
     let mut h = Harness::new();
     let token = h.create(ALICE, VARIANT_ASSET, 4, ALICE, &[]);
     let out = h.call_opts(ALICE, token, &call_data(SEL_NAME, &[]), 100, false, true, U256::ZERO);
-    assert_eq!(out.exit, Exit::OutOfGas);
+    assert_eq!(out.exit, Outcome::OutOfGas);
     assert_eq!(out.used, 100, "an exhausted frame has consumed everything");
     // Below the EIP-2200 sentry no write proceeds.
     let out = h.call_opts(
@@ -577,7 +574,7 @@ fn out_of_gas_halts_and_typed_reverts_do_not() {
         true,
         U256::ZERO,
     );
-    assert_eq!(out.exit, Exit::OutOfGas);
+    assert_eq!(out.exit, Outcome::OutOfGas);
 }
 
 #[test]
@@ -612,7 +609,7 @@ fn internal_dispatch_is_charged_per_entry() {
         true,
         U256::ZERO,
     );
-    assert_eq!(out.exit, Exit::OutOfGas);
+    assert_eq!(out.exit, Outcome::OutOfGas);
     assert_eq!(
         h.call(
             BOB,
@@ -1299,7 +1296,7 @@ mod evm {
         assert_eq!(created.stats.created, Some(VARIANT_ASSET));
         assert_eq!(created.stats.internal_calls, 2);
         assert!(created.stats.sstores > 0 && created.stats.sloads > 0 && created.stats.keccaks > 0);
-        assert!(created.gas_used > 0 && created.elapsed.is_some());
+        assert!(created.gas_used > 0);
         assert_eq!(
             calls[2].gas_used,
             22_000 - 21_000 - 4 * 16,
@@ -1654,7 +1651,7 @@ mod info {
             ],
         );
 
-        let info = token_info_at(&mut h.st, 714, token, NOW).expect("a token");
+        let info = token_info_at(&mut h.st, token).expect("a token");
         assert_eq!((info.variant, info.address), ("asset", token));
         assert_eq!(info.name, "Test Token");
         assert_eq!(info.symbol, "TT");
@@ -1683,7 +1680,7 @@ mod info {
 
         // Past the schedule, with no transaction in between.
         h.st.time = future;
-        let matured = token_info_at(&mut h.st, 714, token, future).unwrap();
+        let matured = token_info_at(&mut h.st, token).unwrap();
         assert_eq!(matured.multiplier, Some(U256::from(2_000_000_000_000_000_000u64)));
         assert_eq!(matured.multiplier, Some(sel(&mut h, SEL_MULTIPLIER)));
         assert!(matured.pending_multiplier.is_none());
@@ -1691,7 +1688,7 @@ mod info {
 
         // Stablecoin: fixed decimals, a currency, no multiplier surface.
         let stable = h.create(ALICE, VARIANT_STABLECOIN, 101, ALICE, &[]);
-        let s = token_info_at(&mut h.st, 714, stable, future).unwrap();
+        let s = token_info_at(&mut h.st, stable).unwrap();
         assert_eq!(
             (s.variant, s.decimals, s.currency.as_deref()),
             ("stablecoin", U64::from(6), Some("USD"))
@@ -1723,14 +1720,14 @@ mod info {
         // Not tokens: outside the space, the factory, an address never created.
         for addr in [ALICE, FACTORY_ADDRESS, factory::derive_address(VARIANT_ASSET, BOB, w(0xee))] {
             assert_eq!(
-                token_info_at(&mut h.st, 714, addr, NOW),
+                token_info_at(&mut h.st, addr),
                 Err(InfoError::NotToken),
                 "{addr:?}"
             );
         }
         // A length word no transaction could have paid for is refused, not walked.
         h.st.set(token, slot_at(SLOT_CONTRACT_URI), U256::from(2 * (RPC_MAX_STRING_LEN + 32) + 1));
-        assert_eq!(token_info_at(&mut h.st, 714, token, NOW), Err(InfoError::StringTooLong));
+        assert_eq!(token_info_at(&mut h.st, token), Err(InfoError::StringTooLong));
     }
 
     #[test]
@@ -1750,7 +1747,7 @@ mod info {
             b"ok\xe2\x82\xff\xfe",
         )]));
         h.call(ALICE, token, &update).ret();
-        let info = token_info_at(&mut h.st, 714, token, NOW).unwrap();
+        let info = token_info_at(&mut h.st, token).unwrap();
         assert_eq!(info.symbol, "ok\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}");
         // An empty currency is omitted, as go-bsc's omitempty leaves it out.
         let stable = h.create(ALICE, VARIANT_STABLECOIN, 104, ALICE, &[]);
@@ -1759,7 +1756,7 @@ mod info {
             super::super::stablecoin::stablecoin_slot(super::super::stablecoin::SLOT_CURRENCY),
             U256::ZERO,
         );
-        let s = token_info_at(&mut h.st, 714, stable, NOW).unwrap();
+        let s = token_info_at(&mut h.st, stable).unwrap();
         assert!(s.currency.is_none());
         assert!(!serde_json::to_string(&s).unwrap().contains("currency"));
     }
@@ -1778,7 +1775,7 @@ mod info {
                 call_data(SEL_MINT, &[a(BOB), w(77)]),
             ],
         );
-        let want = token_info_at(&mut h.st, 714, token, NOW).unwrap();
+        let want = token_info_at(&mut h.st, token).unwrap();
 
         let provider = MockEthProvider::default();
         for addr in h.st.coded_accounts().collect::<Vec<_>>() {
@@ -1795,9 +1792,9 @@ mod info {
             );
         }
         let mut host = ProviderHost { state: &provider, time: NOW, chain_id: 714 };
-        assert_eq!(token_info_at(&mut host, 714, token, NOW).unwrap(), want);
+        assert_eq!(token_info_at(&mut host, token).unwrap(), want);
         assert_eq!(
-            token_info_at(&mut host, 714, Address::repeat_byte(0x42), NOW),
+            token_info_at(&mut host, Address::repeat_byte(0x42)),
             Err(InfoError::NotToken)
         );
     }

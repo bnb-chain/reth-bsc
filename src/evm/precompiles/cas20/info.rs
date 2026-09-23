@@ -9,7 +9,7 @@ use super::{
     stablecoin::{stablecoin_slot, SLOT_CURRENCY},
     storage::{slot_at, SLOT_CONTRACT_URI, SLOT_NAME, SLOT_SYMBOL},
     token::{Token, PAUSE_SEIZE},
-    Cas20Version, VARIANT_ASSET, VARIANT_STABLECOIN,
+    VARIANT_ASSET, VARIANT_STABLECOIN,
 };
 use alloy_primitives::{Address, B256, KECCAK256_EMPTY, U256, U64};
 use reth_provider::StateProvider;
@@ -84,13 +84,8 @@ pub struct PendingMultiplier {
     pub effective_at: U64,
 }
 
-/// Reads token configuration at `block_time` with an unbounded gas budget (RPC only).
-pub fn token_info_at(
-    state: &mut dyn Cas20State,
-    chain_id: u64,
-    addr: Address,
-    block_time: u64,
-) -> Result<TokenInfo, InfoError> {
+/// Reads configuration from the host's block context with an unbounded gas budget (RPC only).
+pub fn token_info_at(state: &mut dyn Cas20State, addr: Address) -> Result<TokenInfo, InfoError> {
     let variant = match addr[10] {
         VARIANT_ASSET if is_cas20_address(addr) => "asset",
         VARIANT_STABLECOIN if is_cas20_address(addr) => "stablecoin",
@@ -101,7 +96,9 @@ pub fn token_info_at(
         return Err(InfoError::NotToken);
     }
 
-    let mut frame = Frame::new(state, u64::MAX, Cas20Version::V1);
+    let chain_id = state.chain_id();
+    let block_time = state.block_timestamp();
+    let mut frame = Frame::new(state, u64::MAX);
     let info = {
         let ctx = Ctx {
             frame: &mut frame,

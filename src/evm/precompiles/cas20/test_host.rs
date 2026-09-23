@@ -10,7 +10,7 @@ use super::{
     execute, resolve,
     sigs::{FEATURE_ASSET, FEATURE_POLICY_REGISTRY, FEATURE_STABLECOIN, MARKER_CODE_HASH},
     storage::mapping_slot,
-    CallStats, Cas20Version, ACTIVATION_REGISTRY_ADDRESS, POLICY_REGISTRY_ADDRESS,
+    CallStats, ACTIVATION_REGISTRY_ADDRESS, POLICY_REGISTRY_ADDRESS,
 };
 use alloy_primitives::{Address, Log, B256, KECCAK256_EMPTY, U256};
 use revm::{
@@ -90,10 +90,6 @@ impl MockHost {
     /// Every non-zero slot, by account.
     pub(crate) fn storage(&self) -> impl Iterator<Item = (Address, U256, U256)> + '_ {
         self.now.storage.iter().filter(|(_, v)| !v.is_zero()).map(|(&(a, k), &v)| (a, k, v))
-    }
-
-    pub(crate) fn logs(&self) -> &[Log] {
-        &self.now.logs
     }
 
     /// A transaction boundary: what was written is now committed, and nothing is warm.
@@ -198,8 +194,8 @@ pub(crate) fn run_call(host: &mut MockHost, spec: CallSpec, input: &[u8]) -> Cal
     host.checkpoint();
     let log_start = host.now.logs.len();
     let (outcome, used, refund, stats) = {
-        let mut frame = Frame::new(host, spec.gas, Cas20Version::V1);
-        let mut ctx = Ctx {
+        let mut frame = Frame::new(host, spec.gas);
+        let ctx = Ctx {
             frame: &mut frame,
             self_addr: spec.to,
             caller: spec.caller,
@@ -208,8 +204,8 @@ pub(crate) fn run_call(host: &mut MockHost, spec: CallSpec, input: &[u8]) -> Cal
             value: spec.value,
             admin_renounced: false,
         };
-        let exit = execute(kind, &mut ctx, input);
-        let (outcome, used, refund) = complete(&mut frame, exit);
+        let result = execute(kind, ctx, input);
+        let (outcome, used, refund) = complete(&mut frame, result);
         (outcome, used, refund, frame.stats)
     };
     let logs = if matches!(outcome, Outcome::Return(_)) {

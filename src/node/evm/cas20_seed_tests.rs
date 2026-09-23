@@ -115,7 +115,7 @@ fn seeding_plants_the_sentinel_on_both_registries_and_leaves_foreign_code_alone(
 
     let db = executor.evm_mut().db_mut();
     let activation = db.basic(cas20::ACTIVATION_REGISTRY_ADDRESS).unwrap().expect("account exists");
-    assert!(cas20::is_marker_code_hash(activation.code_hash));
+    assert_eq!(activation.code_hash, cas20::marker_bytecode().hash_slow());
     assert_eq!(
         activation.code.as_ref().map(|c: &Bytecode| c.original_bytes()),
         Some(Bytes::from_static(&cas20::MARKER_CODE))
@@ -127,6 +127,6 @@ fn seeding_plants_the_sentinel_on_both_registries_and_leaves_foreign_code_alone(
     executor.seed_cas20_registries(10).expect("second seeding succeeds");
     let db = executor.evm_mut().db_mut();
     let activation = db.basic(cas20::ACTIVATION_REGISTRY_ADDRESS).unwrap().unwrap();
-    assert!(cas20::is_marker_code_hash(activation.code_hash));
+    assert_eq!(activation.code_hash, cas20::marker_bytecode().hash_slow());
     assert_ne!(activation.code_hash, KECCAK_EMPTY);
 }

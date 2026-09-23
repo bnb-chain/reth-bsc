@@ -53,27 +53,14 @@ pub struct CallRecord {
     pub selector: &'static str,
     pub status: CallStatus,
     pub gas_used: u64,
-    /// Present only when the observer asked for timing.
-    pub elapsed: Option<Duration>,
+    pub elapsed: Duration,
     pub stats: CallStats,
 }
 
 /// Receives finished CAS20 calls. Implementations must be cheap and must not
 /// panic: they run inside block execution.
 pub trait Cas20Observer: Clone + Send + Sync + 'static {
-    /// False for an observer that ignores everything, so the entry point skips
-    /// the clock and the labelling.
-    const ENABLED: bool = true;
-
-    fn record_call(&self, _call: &CallRecord) {}
-}
-
-/// The observer that records nothing.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct NoopObserver;
-
-impl Cas20Observer for NoopObserver {
-    const ENABLED: bool = false;
+    fn record_call(&self, call: &CallRecord);
 }
 
 /// Exports calls with cached handles. Labels are bounded by kind, selector and status.
@@ -132,9 +119,7 @@ impl Cas20Observer for MetricsObserver {
             )
         });
         gas.record(call.gas_used as f64);
-        if let Some(elapsed) = call.elapsed {
-            duration.record(elapsed.as_secs_f64());
-        }
+        duration.record(call.elapsed.as_secs_f64());
         let s = call.stats;
         h.sloads.increment(s.sloads as u64);
         h.sstores.increment(s.sstores as u64);

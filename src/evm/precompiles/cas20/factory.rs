@@ -13,8 +13,8 @@ use super::{
     stablecoin::stablecoin_dispatch,
     storage::addr_key,
     token::Token,
-    variant_feature, variant_recognized, FACTORY_ADDRESS, MARKER_CODE, MARKER_PREFIX,
-    NO_SUPPLY_CAP, VARIANT_ASSET, VARIANT_MAX, VARIANT_STABLECOIN,
+    variant_feature, FACTORY_ADDRESS, MARKER_CODE, MARKER_PREFIX, NO_SUPPLY_CAP, VARIANT_ASSET,
+    VARIANT_MAX, VARIANT_STABLECOIN,
 };
 use alloy_primitives::{keccak256, Address, B256, U256};
 
@@ -67,7 +67,7 @@ pub(crate) fn run_factory(ctx: &mut Ctx<'_, '_>, input: &[u8]) -> R<Vec<u8>> {
             let a = read_address(args, 0)?;
             // The return type is an enum, so an unrecognized variant reverts rather
             // than handing the caller a value its decoder rejects.
-            if !is_cas20_address(a) || !variant_recognized(a[10]) {
+            if !is_cas20_address(a) || variant_feature(a[10]).is_none() {
                 return Err(rev(ERR_INVALID_VARIANT, &[]));
             }
             Ok(enc_word(w_u8(a[10])))

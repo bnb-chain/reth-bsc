@@ -4,6 +4,7 @@
 use super::{abi::enc_string, errors::*, sigs::*, storage::offset_slot, token::Token};
 use alloy_primitives::U256;
 
+#[cfg(test)]
 pub(crate) const NAMESPACE: &str = "bsc.cas20.stablecoin";
 pub(crate) const SLOT_CURRENCY: u64 = 0;
 
