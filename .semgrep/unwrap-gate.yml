@@ -1,0 +1,61 @@
+rules:
+  - id: high-risk-unwrap
+    languages: [rust]
+    message: >
+      A new unwrap() or expect() call was added.
+      Please reply directly to this comment explaining "why unwrap cannot panic here";
+      once the code owner confirms, the conversation can be resolved
+    severity: WARNING
+    patterns:
+      - pattern-either:
+          - pattern: $X.unwrap()
+          - pattern: $X.expect(...)
+      # semgrep's Rust matcher can't bind a metavariable to a `mod` name (mod $MOD { ... }
+      # matches nothing), so each `#[cfg(test)] mod <name>` block in this repo is listed
+      # literally below. Adding a test module under a name not listed here will need this
+      # updated, or standardize new test modules on `mod tests`.
+      - pattern-not-inside: |
+          #[cfg(test)]
+          mod tests {
+            ...
+          }
+      - pattern-not-inside: |
+          #[cfg(test)]
+          mod test {
+            ...
+          }
+      - pattern-not-inside: |
+          #[cfg(test)]
+          mod cooler_tests {
+            ...
+          }
+      - pattern-not-inside: |
+          #[cfg(test)]
+          mod failover_tests {
+            ...
+          }
+      - pattern-not-inside: |
+          #[cfg(test)]
+          mod nodeids_call_tests {
+            ...
+          }
+      - pattern-not-inside: |
+          #[cfg(test)]
+          mod pre_execution_tests {
+            ...
+          }
+      - pattern-not-inside: |
+          #[cfg(test)]
+          mod validator_cache_tests {
+            ...
+          }
+      - pattern-not-inside: |
+          #[cfg(test)]
+          mod validator_tests {
+            ...
+          }
+      - pattern-not-inside: |
+          #[cfg(test)]
+          mod version_tests {
+            ...
+          }
