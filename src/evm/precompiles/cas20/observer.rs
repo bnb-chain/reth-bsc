@@ -1,7 +1,5 @@
-//! Observation of CAS20 calls: an observer is told about each call once it has
-//! finished, and about the work it did, without ever touching gas, state or
-//! control flow. The default observer does nothing and costs nothing; the
-//! metrics observer exports the calls to Prometheus under `bsc.cas20`.
+//! Completed-call metrics under `bsc.cas20`, including simulations and calls
+//! later reverted by an outer frame. These are execution counts, not chain totals.
 
 use super::{Kind, VARIANT_ASSET};
 use metrics::{counter, histogram, Counter, Histogram};
@@ -78,10 +76,7 @@ impl Cas20Observer for NoopObserver {
     const ENABLED: bool = false;
 }
 
-/// Exports every call to Prometheus. The label space is bounded (five kinds, the
-/// selector table, four statuses), so every handle is registered once and kept:
-/// the recorder's per-call registry lookup and label allocation are paid only
-/// the first time a combination is seen.
+/// Exports calls with cached handles. Labels are bounded by kind, selector and status.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MetricsObserver;
 
@@ -110,8 +105,7 @@ static HANDLES: LazyLock<Handles> = LazyLock::new(|| Handles {
     created_stablecoin: counter!("bsc.cas20.tokens_created_total", "variant" => "stablecoin"),
 });
 
-/// Looks a handle up under the read lock, registering it under the write lock the
-/// first time only.
+/// Registers each handle once, using a read lock for subsequent lookups.
 fn cached<K: Copy + Eq + Hash, V: Clone>(
     map: &RwLock<HashMap<K, V>>,
     key: K,

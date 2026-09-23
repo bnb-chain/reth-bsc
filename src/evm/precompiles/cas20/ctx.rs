@@ -1,7 +1,5 @@
-//! The execution environment a CAS20 call runs in: the journal it reads and writes
-//! through, the gas it is metered against, and the frame-wide flags that decide how
-//! the call exits. Mirrors go-bsc's `PrecompileContext` (core/vm/contracts_stateful.go)
-//! and its charge functions (core/vm/cas20_gas.go).
+//! CAS20 journal access, gas accounting and frame-wide errors.
+//! Mirrors go-bsc's contracts_stateful.go and cas20_gas.go.
 
 use super::{observer::CallStats, Cas20Version};
 use alloy_evm::EvmInternals;
@@ -90,8 +88,7 @@ impl Cas20State for EvmInternals<'_> {
     }
 }
 
-/// The frame's gas: a budget that is exhausted, as the interpreter's is, by a charge
-/// it cannot cover.
+/// Frame gas budget; an unaffordable charge exhausts it.
 #[derive(Debug)]
 pub(crate) struct Meter {
     limit: u64,
@@ -128,8 +125,7 @@ impl Meter {
     }
 }
 
-/// State shared by every context spawned in one EVM frame, so a bootstrap child's
-/// failure is not lost on its parent.
+/// Shared accounting and errors for all contexts within one EVM frame.
 pub(crate) struct Frame<'a> {
     pub(crate) state: &'a mut dyn Cas20State,
     pub(crate) gas: Meter,

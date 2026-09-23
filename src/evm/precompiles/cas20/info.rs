@@ -1,6 +1,4 @@
-//! A token's whole configuration read from one state, the way a sequence of
-//! eth_calls at one block would read it: the `eth_getCAS20TokenInfo` result, off
-//! the consensus path. Ported from go-bsc's core/vm/cas20_info.go.
+//! Read-only token configuration for RPC, ported from go-bsc's cas20_info.go.
 
 use super::{
     asset::apply_multiplier,
@@ -21,9 +19,7 @@ use revm::{
 };
 use serde::{Deserialize, Serialize};
 
-/// Bounds what one unmetered read will walk. No single transaction can store a
-/// string this long, so it is only ever met on state that did not come from the
-/// precompile.
+/// Maximum stored string size accepted by an unmetered RPC read.
 pub const RPC_MAX_STRING_LEN: u64 = 256 << 10;
 
 /// Why a token's configuration could not be read.
@@ -88,9 +84,7 @@ pub struct PendingMultiplier {
     pub effective_at: U64,
 }
 
-/// Reads `addr`'s configuration from `state` as of a block with the given time.
-/// Unmetered in effect (the budget is unbounded): for RPC, never for a precompile
-/// frame.
+/// Reads token configuration at `block_time` with an unbounded gas budget (RPC only).
 pub fn token_info_at(
     state: &mut dyn Cas20State,
     chain_id: u64,

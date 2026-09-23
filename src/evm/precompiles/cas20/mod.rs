@@ -1,9 +1,6 @@
-//! CAS20, the Compliant Asset Standard (BEP-702): a token family implemented as
-//! stateful precompiles. Every routed address resolves here once Jenner is active:
-//! the factory, the two registries, and the `0xCA52…` token space, whose members
-//! have no fixed address and are matched by prefix. Ported from go-bsc's
-//! core/vm/cas20*.go; the storage layout in testdata/cas20_layout.json and the
-//! constants in `sigs` are the contract both clients are held to.
+//! CAS20 stateful precompiles (BEP-702), enabled at Jenner.
+//! Routes the factory, registries and `0xCA52…` token addresses by prefix.
+//! Ported from go-bsc's core/vm/cas20*.go; `sigs` and the fixture pin selectors and storage layout.
 
 pub(crate) mod abi;
 pub(crate) mod activation;
@@ -64,8 +61,7 @@ pub const ACTIVATION_REGISTRY_ADDRESS: Address =
     address!("7020000000000000000000000000000000000001");
 pub const POLICY_REGISTRY_ADDRESS: Address = address!("7020000000000000000000000000000000000002");
 
-/// 0xEF cannot be deployed (EIP-3541), so nothing can forge the marker, and it
-/// keeps the account clear of EIP-161 reaping (BEP-702 3.16).
+/// Undeployable under EIP-3541; nonempty code prevents EIP-161 account clearing.
 pub const MARKER_CODE: [u8; 1] = [0xEF];
 
 /// type(uint128).max: the supply cap a token is created with.
@@ -244,8 +240,7 @@ fn run<O: Cas20Observer>(
     let exit = execute(kind, &mut ctx, data);
     let (outcome, used, refund) = complete(&mut frame, exit);
     if O::ENABLED {
-        // Told after the fact, from data already settled: nothing here can reach
-        // gas, state or the result.
+        // Report the settled outcome without exposing mutable execution state.
         observer.record_call(&CallRecord {
             kind,
             selector: match data.get(..4) {

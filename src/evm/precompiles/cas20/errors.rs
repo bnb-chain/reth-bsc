@@ -9,9 +9,7 @@ use super::{
 };
 use alloy_primitives::{B256, U256};
 
-/// How a CAS20 handler fails. `Revert` carries the returndata, empty for a decode
-/// failure or an unknown selector; the other three are exceptional exits the entry
-/// point turns into the shape BEP-702 3.2 prescribes.
+/// Handler failures, translated to BEP-702 return data or an OOG halt at the entry point.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Cas20Err {
     Revert(Vec<u8>),
@@ -98,9 +96,7 @@ pub(crate) fn finish_metered(ctx: &Ctx<'_, '_>, res: R<Vec<u8>>) -> Exit {
     finish(res)
 }
 
-/// The terminal shape of a call, with the precedence every consumer must apply: a
-/// database failure outranks everything, then write protection, then an exhausted
-/// budget, then whatever the handler returned.
+/// Exit precedence: database failure, write protection, OOG, then the handler result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Outcome {
     Return(Vec<u8>),
@@ -120,8 +116,7 @@ impl Outcome {
     }
 }
 
-/// Closes a call: the outcome under the precedence above, the gas it consumed and
-/// the refund it earned. An exhausted or failed frame consumed its whole budget.
+/// Returns the final outcome, gas used and refund. OOG and fatal errors exhaust the budget.
 pub(crate) fn complete(frame: &mut Frame<'_>, exit: Exit) -> (Outcome, u64, i64) {
     if let Some(msg) = frame.fatal.take() {
         frame.gas.exhaust();
