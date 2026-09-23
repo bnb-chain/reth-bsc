@@ -556,6 +556,11 @@ fn main() -> eyre::Result<()> {
                         ctx.modules.merge_if_module_configured(RethRpcModule::Eth, eth_ext_api.into_rpc())?;
                         tracing::info!("Succeed to register BSC Eth extension API");
 
+                        use reth_bsc::rpc::access_list::{BscAccessListApiImpl, BscAccessListApiServer};
+                        ctx.modules.remove_method_from_configured("eth_createAccessList");
+                        let access_list_api = BscAccessListApiImpl(ctx.registry.eth_api().clone());
+                        ctx.modules.merge_if_module_configured(RethRpcModule::Eth, access_list_api.into_rpc())?;
+
                         tracing::info!("Start to register BSC Admin RPC API (admin_setBidBlockPermission)...");
                         use reth_bsc::rpc::admin::{BscAdminApiImpl, BscAdminApiServer};
 

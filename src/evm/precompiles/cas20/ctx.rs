@@ -1,18 +1,24 @@
 //! CAS20 journal access, gas accounting and frame-wide errors.
 //! Mirrors go-bsc's contracts_stateful.go and cas20_gas.go.
 
-use super::observer::CallStats;
+use super::{access_list, observer::CallStats};
+use crate::hardforks::bsc::BscHardfork;
 use alloy_evm::EvmInternals;
 use alloy_primitives::{Address, Bytes, Log, B256, U256};
 use revm::{
     bytecode::Bytecode,
+    context_interface::cfg::GasParams,
     interpreter::{SStoreResult, StateLoad},
 };
+use std::sync::LazyLock;
+
+// Pin native storage costs to Jenner, including when replaying it after future forks.
+pub(crate) static STORAGE_GAS: LazyLock<GasParams> =
+    LazyLock::new(|| GasParams::new_spec(BscHardfork::Jenner.into()));
 
 // Every charge mirrors an existing EVM cost, so nothing a CAS20 call does is cheaper
 // than the same work through bytecode (BEP-702 3.14). The values are go-bsc's `params`.
 pub(crate) const WARM_STORAGE_READ_COST: u64 = 100;
-pub(crate) const COLD_SLOAD_COST: u64 = 2100;
 pub(crate) const COLD_ACCOUNT_ACCESS_COST: u64 = 2600;
 pub(crate) const COPY_GAS: u64 = 3;
 pub(crate) const MEMORY_GAS: u64 = 3;
@@ -23,10 +29,6 @@ pub(crate) const LOG_TOPIC_GAS: u64 = 375;
 pub(crate) const LOG_DATA_GAS: u64 = 8;
 pub(crate) const CREATE_DATA_GAS: u64 = 200;
 pub(crate) const CREATE_GAS: u64 = 32000;
-pub(crate) const SSTORE_SENTRY_GAS: u64 = 2300;
-pub(crate) const SSTORE_SET_GAS: u64 = 20000;
-pub(crate) const SSTORE_RESET_GAS: u64 = 5000;
-pub(crate) const SSTORE_CLEARS_SCHEDULE_REFUND: i64 = 4800;
 pub(crate) const ECRECOVER_GAS: u64 = 3000;
 
 /// A warm CALL plus the copy of one calldata word into the callee's input.
@@ -53,6 +55,7 @@ pub trait Cas20State {
 
 impl Cas20State for EvmInternals<'_> {
     fn sload(&mut self, address: Address, key: U256) -> Result<StateLoad<U256>, String> {
+        access_list::storage(address, key);
         EvmInternals::sload(self, address, key).map_err(|e| e.to_string())
     }
 
@@ -62,15 +65,18 @@ impl Cas20State for EvmInternals<'_> {
         key: U256,
         value: U256,
     ) -> Result<StateLoad<SStoreResult>, String> {
+        access_list::storage(address, key);
         EvmInternals::sstore(self, address, key, value).map_err(|e| e.to_string())
     }
 
     fn code_hash(&mut self, address: Address) -> Result<StateLoad<B256>, String> {
+        access_list::account(address);
         let acc = self.load_account(address).map_err(|e| e.to_string())?;
         Ok(StateLoad::new(acc.data.info.code_hash, acc.is_cold))
     }
 
     fn set_code(&mut self, address: Address, code: Bytecode) -> Result<(), String> {
+        access_list::account(address);
         self.touch_account(address).map_err(|e| e.to_string())?;
         EvmInternals::set_code(self, address, code).map_err(|e| e.to_string())
     }
@@ -364,7 +370,7 @@ impl<'f, 'a> Ctx<'f, 'a> {
     /// EIP-2200's reentrancy guard, which is what makes transfer()/send() safe: a
     /// CAS20 token writes state without SSTORE, so it applies the check itself.
     pub(crate) fn sstore_sentry(&self) -> bool {
-        self.gas_left() > SSTORE_SENTRY_GAS
+        self.gas_left() > STORAGE_GAS.call_stipend()
     }
 }
 

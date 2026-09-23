@@ -1,3 +1,4 @@
+pub mod access_list;
 pub mod admin;
 #[cfg(test)]
 mod block_overrides_tests;

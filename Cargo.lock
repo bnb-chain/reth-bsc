@@ -10612,6 +10612,7 @@ dependencies = [
  "revm-bytecode",
  "revm-database",
  "revm-database-interface",
+ "revm-inspectors",
  "revm-interpreter",
  "revm-primitives",
  "revm-state",

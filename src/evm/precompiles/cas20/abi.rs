@@ -238,3 +238,51 @@ pub(crate) fn read_uint8_array(args: &[u8]) -> R<Vec<u8>> {
     }
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::evm::precompiles::cas20::errors::w_u64;
+
+    fn aliased_array(count: usize, payload: &[u8]) -> Vec<u8> {
+        let mut args = Vec::new();
+        for word in [32, count as u64]
+            .into_iter()
+            .chain(std::iter::repeat_n(count as u64 * 32, count))
+            .chain([payload.len() as u64])
+        {
+            args.extend_from_slice(w_u64(word).as_slice());
+        }
+        args.extend_from_slice(payload);
+        args
+    }
+
+    #[test]
+    fn bytes_array_borrows_shared_large_tail() {
+        let payload = vec![0xff; 64 * 1024];
+        let args = aliased_array(1024, &payload);
+        let items = read_bytes_array(&args, 0).unwrap();
+        assert_eq!(items.len(), 1024);
+        let tail = &args[args.len() - payload.len()..];
+        for item in items {
+            assert_eq!(item, payload);
+            assert_eq!(item.as_ptr(), tail.as_ptr());
+        }
+    }
+
+    #[test]
+    fn bytes_array_rejects_malformed_offsets_and_lengths() {
+        let valid = aliased_array(1, &[1, 2, 3]);
+        for word in 0..4 {
+            let mut args = valid.clone();
+            args[word * 32..(word + 1) * 32].copy_from_slice(w_u64(u64::MAX).as_slice());
+            assert_eq!(read_bytes_array(&args, 0), Err(revert()));
+            let mut args = valid.clone();
+            args[word * 32] = 1;
+            assert_eq!(read_bytes_array(&args, 0), Err(revert()));
+        }
+        for len in 0..valid.len() {
+            assert_eq!(read_bytes_array(&valid[..len], 0), Err(revert()));
+        }
+    }
+}

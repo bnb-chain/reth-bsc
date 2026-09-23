@@ -3,10 +3,7 @@
 //! authoritative description both clients are held to.
 
 use super::{
-    ctx::{
-        Ctx, COLD_SLOAD_COST, SSTORE_CLEARS_SCHEDULE_REFUND, SSTORE_RESET_GAS, SSTORE_SET_GAS,
-        WARM_STORAGE_READ_COST,
-    },
+    ctx::{Ctx, STORAGE_GAS},
     sigs::ROOT_CORE,
 };
 use alloy_primitives::{keccak256, Address, B256, U256};
@@ -112,7 +109,11 @@ impl<'r, 'f, 'a> Store<'r, 'f, 'a> {
             return None;
         }
         let load = self.ctx.frame.sload(self.at, slot)?;
-        let cost = if load.is_cold { COLD_SLOAD_COST } else { WARM_STORAGE_READ_COST };
+        let cost = if load.is_cold {
+            STORAGE_GAS.cold_storage_cost()
+        } else {
+            STORAGE_GAS.warm_storage_read_cost()
+        };
         if !self.ctx.charge_gas(cost) {
             return None;
         }
@@ -129,9 +130,7 @@ impl<'r, 'f, 'a> Store<'r, 'f, 'a> {
         self.read(slot).unwrap_or_default()
     }
 
-    /// Mirrors go-bsc's makeGasSStoreFunc, arming in the same order with the same
-    /// clause numbers. The write is journalled before the charge is known: a refused
-    /// charge ends the frame with every write reverted, so the order is unobservable.
+    /// A failed charge reverts the journalled write with the enclosing frame.
     pub(crate) fn set_word(&mut self, slot: U256, value: U256) -> bool {
         if self.ctx.read_only {
             self.ctx.mark_write_protected();
@@ -145,47 +144,10 @@ impl<'r, 'f, 'a> Store<'r, 'f, 'a> {
             return false;
         }
         let Some(load) = self.ctx.frame.sstore(self.at, slot, value) else { return false };
-        let (original, current) = (load.data.original_value, load.data.present_value);
-        let cost = if load.is_cold { COLD_SLOAD_COST } else { 0 };
-        let refund = &mut self.ctx.frame.gas.refund;
-
-        if current == value {
-            // noop (1)
-            return self.ctx.charge_gas(cost + WARM_STORAGE_READ_COST);
-        }
-        if original == current {
-            if original.is_zero() {
-                // create slot (2.1.1)
-                return self.ctx.charge_gas(cost + SSTORE_SET_GAS);
-            }
-            if value.is_zero() {
-                // delete slot (2.1.2b)
-                *refund += SSTORE_CLEARS_SCHEDULE_REFUND;
-            }
-            // write existing slot (2.1.2)
-            return self.ctx.charge_gas(cost + (SSTORE_RESET_GAS - COLD_SLOAD_COST));
-        }
-        // dirty slot (2.2)
-        if !original.is_zero() {
-            if current.is_zero() {
-                // recreate slot (2.2.1.1)
-                *refund -= SSTORE_CLEARS_SCHEDULE_REFUND;
-            } else if value.is_zero() {
-                // delete slot (2.2.1.2)
-                *refund += SSTORE_CLEARS_SCHEDULE_REFUND;
-            }
-        }
-        if original == value {
-            if original.is_zero() {
-                // reset to original inexistent slot (2.2.2.1)
-                *refund += (SSTORE_SET_GAS - WARM_STORAGE_READ_COST) as i64;
-            } else {
-                // reset to original existing slot (2.2.2.2)
-                *refund += ((SSTORE_RESET_GAS - COLD_SLOAD_COST) - WARM_STORAGE_READ_COST) as i64;
-            }
-        }
-        // dirty update (2.2)
-        self.ctx.charge_gas(cost + WARM_STORAGE_READ_COST)
+        let cost = STORAGE_GAS.sstore_static_gas()
+            + STORAGE_GAS.sstore_dynamic_gas(true, &load.data, load.is_cold);
+        self.ctx.frame.gas.refund += STORAGE_GAS.sstore_refund(true, &load.data);
+        self.ctx.charge_gas(cost)
     }
 
     // --- fixed uint256 fields ---------------------------------------------------
@@ -455,4 +417,79 @@ impl<'r, 'f, 'a> Store<'r, 'f, 'a> {
 
 pub(crate) fn packed_lane(word: U256, byte_off: usize) -> u64 {
     (word >> (byte_off * 8)).to::<U256>().wrapping_to::<u64>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::evm::precompiles::cas20::{
+        ctx::{Cas20State, Frame},
+        test_host::MockHost,
+    };
+
+    #[test]
+    fn sstore_costs_and_refunds_match_jenner() {
+        // original, current, new, warm cost, refund delta
+        let cases = [
+            (0, 0, 0, 100, 0),
+            (0, 0, 1, 20_000, 0),
+            (1, 1, 2, 2_900, 0),
+            (1, 1, 0, 2_900, 4_800),
+            (0, 1, 2, 100, 0),
+            (0, 1, 0, 100, 19_900),
+            (1, 0, 2, 100, -4_800),
+            (1, 0, 1, 100, -2_000),
+            (1, 2, 0, 100, 4_800),
+            (1, 2, 1, 100, 2_800),
+            (1, 2, 2, 100, 0),
+        ];
+        for (original, current, new, warm_cost, refund) in cases {
+            for cold in [false, true] {
+                let mut host = MockHost::default();
+                let at = Address::repeat_byte(1);
+                let slot = U256::ZERO;
+                host.set(at, slot, U256::from(original));
+                host.finalize();
+                host.set(at, slot, U256::from(current));
+                if !cold {
+                    host.sload(at, slot).unwrap();
+                }
+                let mut frame = Frame::new(&mut host, 100_000);
+                let mut ctx = Ctx {
+                    frame: &mut frame,
+                    self_addr: at,
+                    caller: at,
+                    read_only: false,
+                    direct_call: true,
+                    value: U256::ZERO,
+                    admin_renounced: false,
+                };
+                assert!(Store::new(&mut ctx, at).set_word(slot, U256::from(new)));
+                assert_eq!(frame.gas.used(), warm_cost + if cold { 2_100 } else { 0 });
+                assert_eq!(frame.gas.refund, refund);
+                assert_eq!(host.get(at, slot), U256::from(new));
+            }
+        }
+    }
+
+    #[test]
+    fn sstore_stipend_sentry_prevents_even_noop_writes() {
+        for (gas, succeeds) in [(2_300, false), (2_301, true)] {
+            let mut host = MockHost::default();
+            let at = Address::repeat_byte(1);
+            let mut frame = Frame::new(&mut host, gas);
+            let mut ctx = Ctx {
+                frame: &mut frame,
+                self_addr: at,
+                caller: at,
+                read_only: false,
+                direct_call: true,
+                value: U256::ZERO,
+                admin_renounced: false,
+            };
+            assert_eq!(Store::new(&mut ctx, at).set_word(U256::ZERO, U256::ZERO), succeeds);
+            assert_eq!(frame.gas.used(), if succeeds { 2_200 } else { gas });
+            assert_eq!(frame.stats.sstores, u32::from(succeeds));
+        }
+    }
 }

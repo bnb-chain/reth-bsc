@@ -2,6 +2,8 @@
 //! and storage can be inspected directly, plus EVM-level tests for the routing.
 //! The scenarios mirror go-bsc's core/vm/cas20_*_test.go.
 
+mod access_list;
+
 use super::{
     abi::*,
     errors::Outcome,

@@ -78,6 +78,7 @@ revm-bytecode = "10.0.0"
 revm-state = "11.0.0"
 revm-primitives = { version = "23.0.0", default-features = false }
 revm-interpreter = "35.0.0"
+revm-inspectors = "0.39.0"
 revm-database-interface = "11.0.0"
 
 # alloy dependencies

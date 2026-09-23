@@ -5,6 +5,7 @@
 #![warn(dead_code)]
 
 mod abi;
+pub(crate) mod access_list;
 mod activation;
 mod admin;
 mod asset;
