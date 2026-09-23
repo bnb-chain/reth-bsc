@@ -384,6 +384,92 @@ fn factory_creates_a_token_that_transfers() {
 }
 
 #[test]
+fn bootstrap_operations_use_the_factory_as_caller() {
+    for variant in [VARIANT_ASSET, VARIANT_STABLECOIN] {
+        let mut h = Harness::new();
+        let out = h.call(
+            ALICE,
+            FACTORY_ADDRESS,
+            &encode_create(
+                variant,
+                w(901),
+                ALICE,
+                &[
+                    call_data(SEL_MINT, &[a(ALICE), w(100)]),
+                    call_data(SEL_MINT, &[a(FACTORY_ADDRESS), w(100)]),
+                    call_data(SEL_APPROVE, &[a(BOB), w(7)]),
+                    call_data(SEL_TRANSFER, &[a(BOB), w(30)]),
+                    call_data(SEL_BURN, &[w(20)]),
+                ],
+            ),
+        );
+        let token = Address::from_word(out.word());
+        assert_eq!(token, derive_address(variant, ALICE, w(901)));
+        for (owner, balance) in [(ALICE, 100), (FACTORY_ADDRESS, 50), (BOB, 30)] {
+            assert_eq!(
+                h.call(ALICE, token, &call_data(SEL_BALANCE_OF, &[a(owner)])).u256(),
+                U256::from(balance)
+            );
+        }
+        assert_eq!(h.call(ALICE, token, &call_data(SEL_TOTAL_SUPPLY, &[])).u256(), U256::from(180));
+        assert_eq!(
+            h.call(ALICE, token, &call_data(SEL_ALLOWANCE, &[a(ALICE), a(BOB)])).u256(),
+            U256::ZERO
+        );
+        assert_eq!(
+            h.call(ALICE, token, &call_data(SEL_ALLOWANCE, &[a(FACTORY_ADDRESS), a(BOB)])).u256(),
+            U256::from(7)
+        );
+
+        assert_eq!(out.logs.len(), 7);
+        assert_eq!(out.logs[0].address, FACTORY_ADDRESS);
+        assert_eq!(out.logs[0].topics(), &[TOPIC_CAS20_CREATED, a(token), w(variant as u64)]);
+        assert_eq!(
+            out.logs[1].topics(),
+            &[TOPIC_ROLE_GRANTED, ROLE_DEFAULT_ADMIN, a(ALICE), a(FACTORY_ADDRESS)]
+        );
+        assert!(out.logs[1..].iter().all(|log| log.address == token));
+        assert_eq!(out.logs[4].topics(), &[TOPIC_APPROVAL, a(FACTORY_ADDRESS), a(BOB)]);
+        assert_eq!(out.logs[5].topics(), &[TOPIC_TRANSFER, a(FACTORY_ADDRESS), a(BOB)]);
+        assert_eq!(out.logs[6].topics(), &[TOPIC_TRANSFER, a(FACTORY_ADDRESS), a(Address::ZERO)]);
+    }
+}
+
+#[test]
+fn bootstrap_cannot_spend_or_renounce_for_the_creator() {
+    for variant in [VARIANT_ASSET, VARIANT_STABLECOIN] {
+        for call in [
+            call_data(SEL_TRANSFER, &[a(BOB), w(1)]),
+            call_data(SEL_BURN, &[w(1)]),
+            call_data(SEL_RENOUNCE_ROLE, &[ROLE_MINT, a(ALICE)]),
+            call_data(SEL_RENOUNCE_LAST_ADMIN, &[]),
+        ] {
+            let mut h = Harness::new();
+            let token = derive_address(variant, ALICE, w(902));
+            let out = h.call(
+                ALICE,
+                FACTORY_ADDRESS,
+                &encode_create(
+                    variant,
+                    w(902),
+                    ALICE,
+                    &[
+                        call_data(SEL_MINT, &[a(ALICE), w(100)]),
+                        call_data(SEL_GRANT_ROLE, &[ROLE_MINT, a(ALICE)]),
+                        call,
+                    ],
+                ),
+            );
+            assert_rev(out.revert(), ERR_INIT_CALL_FAILED, &[w(2)]);
+            // The early factory event, token code and every bootstrap write revert together.
+            assert!(out.logs.is_empty());
+            assert!(h.st.code_hash_of(token).is_none());
+            assert!(h.st.storage().all(|(at, _, _)| at != token));
+        }
+    }
+}
+
+#[test]
 fn approvals_and_transfer_from() {
     let mut h = Harness::new();
     let token = h.create(
@@ -580,15 +666,15 @@ fn init_calls_are_dispatched_by_the_variant_and_failures_are_indexed() {
         &encode_create(VARIANT_ASSET, w(22), ALICE, &[vec![1, 2, 3]]),
     );
     assert_sel(out.revert(), ERR_INTERNAL_CALL_MALFORMED);
-    // Without an initial admin the bootstrap may still configure roles, but not after
-    // renouncing inside the same bundle.
+    // The factory can renounce only its own initial admin role. Once it does,
+    // even the bootstrap cannot configure roles again in the same bundle.
     let out = h.call(
         ALICE,
         FACTORY_ADDRESS,
         &encode_create(
             VARIANT_ASSET,
             w(23),
-            ALICE,
+            FACTORY_ADDRESS,
             &[
                 call_data(SEL_RENOUNCE_LAST_ADMIN, &[]),
                 call_data(SEL_GRANT_ROLE, &[ROLE_MINT, a(ALICE)]),
@@ -1238,8 +1324,12 @@ mod evm {
         let token = Address::from_word(B256::from_slice(&output(&res)));
         assert_eq!(token, factory::derive_address(VARIANT_ASSET, ALICE, w(1)));
         let ExecutionResult::Success { logs, .. } = &res else { unreachable!() };
-        assert_eq!(logs.last().unwrap().topics()[0], TOPIC_CAS20_CREATED);
-        assert_eq!(logs.last().unwrap().address, FACTORY_ADDRESS);
+        assert_eq!(logs[0].topics()[0], TOPIC_CAS20_CREATED);
+        assert_eq!(logs[0].address, FACTORY_ADDRESS);
+        assert_eq!(
+            logs[1].topics(),
+            &[TOPIC_ROLE_GRANTED, ROLE_DEFAULT_ADMIN, a(ALICE), a(FACTORY_ADDRESS)]
+        );
 
         let res = tx(&mut evm, ALICE, token, call_data(SEL_TRANSFER, &[a(BOB), w(40)]), 200_000);
         assert_eq!(output(&res), abi::enc_bool(true));

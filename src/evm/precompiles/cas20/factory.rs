@@ -13,8 +13,8 @@ use super::{
     stablecoin::stablecoin_dispatch,
     storage::addr_key,
     token::Token,
-    variant_feature, variant_recognized, MARKER_CODE, MARKER_PREFIX, NO_SUPPLY_CAP, VARIANT_ASSET,
-    VARIANT_MAX, VARIANT_STABLECOIN,
+    variant_feature, variant_recognized, FACTORY_ADDRESS, MARKER_CODE, MARKER_PREFIX,
+    NO_SUPPLY_CAP, VARIANT_ASSET, VARIANT_MAX, VARIANT_STABLECOIN,
 };
 use alloy_primitives::{keccak256, Address, B256, U256};
 
@@ -118,7 +118,7 @@ fn create_cas20(ctx: &mut Ctx<'_, '_>, args: &[u8]) -> R<Vec<u8>> {
 
     let decimals = create.decimals;
     {
-        let mut tok = Token::bootstrap(ctx.spawn_bootstrap(addr, creator), decimals);
+        let mut tok = Token::bootstrap(ctx.spawn_bootstrap(addr, FACTORY_ADDRESS), decimals);
 
         if !tok.s().set_name(&create.name) || !tok.s().set_symbol(&create.symbol) {
             return Err(Cas20Err::OutOfGas);
@@ -129,6 +129,17 @@ fn create_cas20(ctx: &mut Ctx<'_, '_>, args: &[u8]) -> R<Vec<u8>> {
         } else if !tok.set_currency(&create.currency) {
             return Err(Cas20Err::OutOfGas);
         }
+    }
+    // The factory announces the token before the admin grant and initCalls. This
+    // charge must also precede them: moving just the log changes low-gas outcomes.
+    if !ctx.add_log(
+        vec![TOPIC_CAS20_CREATED, addr_key(addr), w_u8(variant)],
+        encode_created_data(&create),
+    ) {
+        return Err(Cas20Err::OutOfGas);
+    }
+    {
+        let mut tok = Token::bootstrap(ctx.spawn_bootstrap(addr, FACTORY_ADDRESS), decimals);
         let initial_admin = create.initial_admin;
         if !initial_admin.is_zero() {
             tok.s().set_role(ROLE_DEFAULT_ADMIN, initial_admin, true);
@@ -138,7 +149,7 @@ fn create_cas20(ctx: &mut Ctx<'_, '_>, args: &[u8]) -> R<Vec<u8>> {
                     TOPIC_ROLE_GRANTED,
                     ROLE_DEFAULT_ADMIN,
                     addr_key(initial_admin),
-                    addr_key(creator),
+                    addr_key(FACTORY_ADDRESS),
                 ],
                 Vec::new(),
             ) {
@@ -172,13 +183,7 @@ fn create_cas20(ctx: &mut Ctx<'_, '_>, args: &[u8]) -> R<Vec<u8>> {
     if ctx.out_of_gas() {
         return Err(Cas20Err::OutOfGas);
     }
-    if !ctx.add_log(
-        vec![TOPIC_CAS20_CREATED, addr_key(addr), w_u8(variant)],
-        encode_created_data(&create),
-    ) {
-        return Err(Cas20Err::OutOfGas);
-    }
-    // Recorded last: a creation whose final log could not be paid for is undone.
+    // Recorded last: a creation whose bootstrap fails is undone, including its logs.
     ctx.frame.stats.created = Some(variant);
     Ok(enc_word(addr_key(addr)))
 }
