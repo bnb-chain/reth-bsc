@@ -473,12 +473,17 @@ where
             return 0;
         }
 
-        let mut delay = BACKOFF_TIME_OF_INITIAL;
         let is_parent_lorentz =
             self.spec.is_lorentz_active_at_timestamp(parent.number, parent.timestamp);
-        if is_parent_lorentz {
-            delay = LORENTZ_BACKOFF_TIME_OF_INITIAL;
-        }
+        let is_parent_jenner =
+            self.spec.is_jenner_active_at_timestamp(parent.number, parent.timestamp);
+        // If the in-turn validator has not signed recently, the expected backoff times are
+        // [2, 3, 4, ...] from Lorentz and [1, 2, 3, ...] again from Jenner (BEP-714).
+        let initial_back_off_time = match (is_parent_lorentz, is_parent_jenner) {
+            (true, false) => LORENTZ_BACKOFF_TIME_OF_INITIAL,
+            _ => BACKOFF_TIME_OF_INITIAL,
+        };
+        let mut delay = initial_back_off_time;
         let mut validators = snap.validators.clone();
 
         if self.spec.is_planck_active_at_block(header.number) {
@@ -569,12 +574,12 @@ where
         for (idx, val) in validators.iter().enumerate() {
             if *val == validator {
                 let result = if delay == 0 && is_parent_lorentz {
-                    // If the in-turn validator has signed recently, the expected backoff times are [0, 2, 3, ...].
+                    // If the in-turn validator has signed recently, the expected backoff times are
+                    // [0, 2, 3, ...] from Lorentz and [0, 1, 2, ...] from Jenner.
                     if back_off_steps[idx] == 0 {
                         0
                     } else {
-                        LORENTZ_BACKOFF_TIME_OF_INITIAL
-                            + (back_off_steps[idx] - 1) * BACKOFF_TIME_OF_WIGGLE
+                        initial_back_off_time + (back_off_steps[idx] - 1) * BACKOFF_TIME_OF_WIGGLE
                     }
                 } else {
                     delay + back_off_steps[idx] * BACKOFF_TIME_OF_WIGGLE
@@ -1055,5 +1060,78 @@ mod tests {
         assert_eq!(apply_mining_delay_with_leftover(2500, 3000, false, false, 100), 2400);
         // And no 50ms floor: fully consumed delay stays 0.
         assert_eq!(apply_mining_delay_with_leftover(500, 3000, false, false, 600), 0);
+    }
+
+    fn jenner_backoff_spec(jenner_time: u64) -> Arc<BscChainSpec> {
+        Arc::new(BscChainSpec::from(
+            ChainSpecBuilder::mainnet()
+                .london_activated()
+                .with_fork(BscHardfork::Ramanujan, ForkCondition::Block(0))
+                .with_fork(BscHardfork::Planck, ForkCondition::Block(0))
+                .with_fork(BscHardfork::Bohr, ForkCondition::Timestamp(0))
+                .with_fork(BscHardfork::Lorentz, ForkCondition::Timestamp(0))
+                .with_fork(BscHardfork::Jenner, ForkCondition::Timestamp(jenner_time))
+                .build(),
+        ))
+    }
+
+    #[test]
+    fn jenner_backoff_and_timestamp_boundary() {
+        use crate::consensus::parlia::util::{
+            calculate_millisecond_timestamp, set_millisecond_part_of_timestamp,
+        };
+
+        let jenner_time = 1000u64;
+        let parlia = Parlia::new(jenner_backoff_spec(jenner_time), 1000);
+        for recent in [false, true] {
+            for parent_time in [jenner_time - 1, jenner_time, jenner_time + 1] {
+                let parent = Header { number: 998, timestamp: parent_time, ..Default::default() };
+                let mut header = Header { number: 999, timestamp: 1005, ..Default::default() };
+                let validators: Vec<Address> = (1..=21u8).map(Address::repeat_byte).collect();
+                let mut snap = Snapshot::new(validators, 998, Default::default(), 1000, None);
+                snap.turn_length = Some(4);
+                snap.block_interval = 450;
+                let inturn = snap.inturn_validator();
+                if recent {
+                    for i in 0..4u64 {
+                        snap.recent_proposers.insert(998 - i, inturn);
+                    }
+                }
+
+                let mut delays = Vec::new();
+                for validator in snap.validators.clone() {
+                    header.beneficiary = validator;
+                    if snap.is_inturn(validator) {
+                        assert_eq!(parlia.back_off_time(&snap, &parent, &header), 0);
+                        continue;
+                    }
+                    let delay = parlia.back_off_time(&snap, &parent, &header);
+                    delays.push(delay);
+                    // the block produced with this backoff must validate, one millisecond earlier must not
+                    let timestamp = calculate_millisecond_timestamp(&parent) + snap.block_interval + delay;
+                    header.timestamp = timestamp / 1000;
+                    set_millisecond_part_of_timestamp(timestamp, &mut header);
+                    assert!(parlia.block_time_verify_for_ramanujan_fork(&snap, &header, &parent).is_ok());
+                    header.timestamp = (timestamp - 1) / 1000;
+                    set_millisecond_part_of_timestamp(timestamp - 1, &mut header);
+                    assert!(parlia.block_time_verify_for_ramanujan_fork(&snap, &header, &parent).is_err());
+                }
+
+                delays.sort_unstable();
+                let initial = if parent_time >= jenner_time {
+                    BACKOFF_TIME_OF_INITIAL
+                } else {
+                    LORENTZ_BACKOFF_TIME_OF_INITIAL
+                };
+                for (rank, delay) in delays.iter().enumerate() {
+                    let want = if recent {
+                        if rank == 0 { 0 } else { initial + (rank as u64 - 1) * BACKOFF_TIME_OF_WIGGLE }
+                    } else {
+                        initial + rank as u64 * BACKOFF_TIME_OF_WIGGLE
+                    };
+                    assert_eq!(*delay, want, "recent={recent} parent_time={parent_time} rank={rank}");
+                }
+            }
+        }
     }
 }

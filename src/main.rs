@@ -53,11 +53,15 @@ pub struct BscCliArgs {
     #[arg(long = "mining.bid-block-enabled")]
     pub mining_bid_block_enabled: bool,
 
-    /// Port for the optional BEP-675 `BidBlockService` gRPC listener. Zero disables it.
+    /// Port for the BEP-675 `BidBlockService` gRPC listener (default 8552; zero uses default).
     ///
     /// Env alternative: `BSC_MEV_GRPC_PORT`.
     #[arg(long = "mining.mev-grpc-port")]
     pub mining_mev_grpc_port: Option<u16>,
+
+    /// Disable MEV gRPC. Env alternative: `BSC_MEV_GRPC_DISABLED=true`.
+    #[arg(long = "mev.grpc.disable")]
+    pub mev_grpc_disabled: bool,
 
     /// Maximum process-wide in-flight gRPC `SendBidBlock` requests.
     ///
@@ -307,6 +311,9 @@ fn main() -> eyre::Result<()> {
                 if let Some(port) = args.mining_mev_grpc_port {
                     mining_config.mev_grpc_port = port;
                 }
+                if args.mev_grpc_disabled {
+                    mining_config.mev_grpc_disabled = true;
+                }
                 if let Some(concurrency) = args.mining_mev_grpc_concurrency {
                     mining_config.mev_grpc_concurrency = concurrency;
                 }
@@ -457,7 +464,7 @@ fn main() -> eyre::Result<()> {
             let mev_grpc_config =
                 reth_bsc::node::miner::config::get_global_mining_config().and_then(|config| {
                     let port = config.get_mev_grpc_port();
-                    (port != 0).then(|| {
+                    config.is_mev_grpc_enabled().then(|| {
                         (
                             port,
                             reth_bsc::grpc::mev::MevGrpcConfig::new(

@@ -304,10 +304,15 @@ impl BidBlockPermissionManager {
         let duration_secs =
             if duration_secs == 0 { BID_BLOCK_REVOKE_DURATION_SECS } else { duration_secs };
         let mut revoked = self.revoked.write();
+        let now = (self.clock)();
+        // A shorter policy revoke must not release a builder before its existing deadline.
+        let duration_secs = revoked.get(&builder).map_or(duration_secs, |rec| {
+            duration_secs.max(rec.revoked_at.saturating_add(rec.duration_secs).saturating_sub(now))
+        });
         revoked.insert(
             builder,
             BidBlockRevokeRecord {
-                revoked_at: (self.clock)(),
+                revoked_at: now,
                 duration_secs,
                 reason: reason.into(),
                 block_hash,
@@ -340,23 +345,13 @@ impl BidBlockPermissionManager {
 
     /// Operator override: `allowed = true` clears any revoke; `false` records a manual revoke.
     pub fn set_allowed(&self, builder: Address, allowed: bool) {
-        let mut revoked = self.revoked.write();
-        if allowed {
-            revoked.remove(&builder);
-            // A manual clear is mirrored to disk too, so it is not resurrected on restart.
-            self.mark_dirty_locked(&revoked);
+        if !allowed {
+            self.revoke(builder, REVOKE_REASON_MANUAL, B256::ZERO, 0);
             return;
         }
-        revoked.insert(
-            builder,
-            BidBlockRevokeRecord {
-                revoked_at: (self.clock)(),
-                duration_secs: BID_BLOCK_REVOKE_DURATION_SECS,
-                reason: REVOKE_REASON_MANUAL.to_string(),
-                block_hash: B256::ZERO,
-                block_num: 0,
-            },
-        );
+        let mut revoked = self.revoked.write();
+        revoked.remove(&builder);
+        // A manual clear is mirrored to disk too, so it is not resurrected on restart.
         self.mark_dirty_locked(&revoked);
     }
 
@@ -393,6 +388,20 @@ mod tests {
             now_for_clock.load(Ordering::Relaxed)
         }));
         (mgr, now)
+    }
+
+    #[test]
+    fn shorter_policy_and_manual_revokes_preserve_existing_deadline() {
+        let (mgr, now) = manager_with_fake_clock();
+        mgr.revoke_for(BUILDER, "long lockout", B256::ZERO, 1, 2 * DAY);
+        let deadline = mgr.get_status(BUILDER).reset_at;
+        now.fetch_add(60, Ordering::Relaxed);
+        mgr.revoke_for(BUILDER, "gas price policy", B256::ZERO, 2, 450);
+        assert_eq!(mgr.get_status(BUILDER).reset_at, deadline);
+        mgr.set_allowed(BUILDER, false);
+        assert_eq!(mgr.get_status(BUILDER).reset_at, deadline);
+        mgr.set_allowed(BUILDER, true);
+        assert!(mgr.is_allowed(BUILDER));
     }
 
     #[test]

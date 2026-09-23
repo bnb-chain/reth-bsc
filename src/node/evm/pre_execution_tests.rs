@@ -628,6 +628,132 @@ mod parent_block_env {
         executor
     }
 
+    fn touched(address: Address) -> revm::state::EvmState {
+        let mut account = revm::state::Account::from(revm::state::AccountInfo::default());
+        account.mark_touch();
+        revm::state::EvmState::from_iter([(address, account)])
+    }
+
+    #[test]
+    fn lane_config_is_inherited_until_the_contract_changes() {
+        use crate::consensus::payment_lane::{
+            meta::{cache_get, LaneMeta},
+            state::LaneState,
+            Budget, PAYMENT_LANE_CONTRACT,
+        };
+        use alloy_primitives::{B256, U256};
+        use alloy_evm::Evm as _;
+        use revm::state::{Account, EvmState, EvmStorageSlot};
+
+        let code = Bytecode::new_raw(Bytes::from_static(&[0x00]));
+        let deployed = AccountInfo::default().with_code(code);
+        let mut executor = executor();
+        executor.evm.db_mut().insert_account_info(PAYMENT_LANE_CONTRACT, deployed.clone());
+        executor.lane = LaneState::for_test(
+            LaneMeta { ratio: 500, listed: Default::default() },
+            Budget::default(),
+            30_000_000,
+        );
+
+        let shape = |info: AccountInfo, slot: Option<EvmStorageSlot>| {
+            let mut account = Account::from(info);
+            account.mark_touch();
+            account.storage.extend(slot.map(|slot| (U256::ZERO, slot)));
+            EvmState::from_iter([(PAYMENT_LANE_CONTRACT, account)])
+        };
+        let mut inherits = |tag: u8, states: Vec<EvmState>| {
+            executor.lane_contract_changed = false;
+            executor.ctx.header_hash = Some(B256::repeat_byte(tag));
+            for state in states {
+                executor.commit_state(state);
+            }
+            executor.verify_payment_lane(0).expect("an empty block cannot violate");
+            cache_get(B256::repeat_byte(tag)).is_some()
+        };
+
+        assert!(inherits(0x11, vec![touched(Address::repeat_byte(0xaa))]), "an unrelated account");
+        assert!(
+            inherits(0x22, vec![shape(deployed.clone(), Some(EvmStorageSlot::new(U256::ZERO, 0)))]),
+            "a getter transaction: touched, slots read but unchanged"
+        );
+        assert!(
+            !inherits(
+                0x33,
+                vec![
+                    shape(
+                        deployed.clone(),
+                        Some(EvmStorageSlot::new_changed(U256::ZERO, U256::from(1), 0)),
+                    ),
+                    shape(deployed, Some(EvmStorageSlot::new(U256::from(1), 0))),
+                ]
+            ),
+            "a getter after a governance write must not restore inheritance"
+        );
+        assert!(
+            !inherits(
+                0x44,
+                vec![shape(AccountInfo::default().with_code_hash(B256::repeat_byte(0xcd)), None)]
+            ),
+            "a code replacement, which changes what the getters mean"
+        );
+    }
+
+    #[test]
+    fn lane_meta_refuses_to_read_a_mutated_state() {
+        use crate::consensus::payment_lane::state::LaneState;
+        use alloy_primitives::B256;
+
+        let mut executor = executor();
+        executor.db_at_parent_state = false;
+
+        let err = LaneState::resolve(&mut executor, B256::repeat_byte(0x33), 30_000_000)
+            .expect_err("must refuse");
+        assert!(
+            err.to_string().contains("after this block mutated state"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn a_pool_transaction_may_not_eat_the_idle_payment_lane() {
+        use crate::consensus::payment_lane::{meta::LaneMeta, state::LaneState, Budget};
+        use crate::node::evm::LaneAdmission;
+        use alloy_consensus::TxLegacy;
+        use alloy_primitives::{Signature, TxKind, U256};
+        use reth_ethereum_primitives::TransactionSigned;
+        use reth_primitives_traits::Recovered;
+
+        let listed = Address::repeat_byte(0x2a);
+        let pool_tx = |to: Address, value: u64, gas_limit: u64| {
+            let tx = TxLegacy {
+                to: TxKind::Call(to),
+                value: U256::from(value),
+                gas_limit,
+                ..Default::default()
+            };
+            let signed = TransactionSigned::new_unhashed(
+                tx.into(),
+                Signature::new(U256::ZERO, U256::ZERO, false),
+            );
+            Recovered::new_unchecked(signed, Address::repeat_byte(0x99))
+        };
+
+        let mut executor = executor();
+        executor.lane = LaneState::for_test(
+            LaneMeta { ratio: 500, listed: Arc::new([listed].into_iter().collect()) },
+            Budget { payment_lane_quota: 1_500_000, payment_lane_used: 21_000 },
+            30_000_000,
+        );
+
+        // 1_479_000 remains reserved, leaving 96_000 for general traffic.
+        let shared = 1_575_000;
+        let general = |gas| pool_tx(Address::repeat_byte(0x11), 0, gas);
+        assert!(executor.lane_admits_pool_tx(&general(96_000), shared).unwrap());
+        assert!(!executor.lane_admits_pool_tx(&general(96_001), shared).unwrap());
+
+        assert!(executor.lane_admits_pool_tx(&pool_tx(listed, 1, shared), shared).unwrap());
+    }
+
     /// `Parent` reads the parent env; `Current` reads the current env.
     #[test]
     fn parent_env_call_observes_the_parent_shuffle_window() {
