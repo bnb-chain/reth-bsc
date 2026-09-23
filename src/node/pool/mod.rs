@@ -157,7 +157,9 @@ where
         // Disable the upstream protocol base fee check (MIN_PROTOCOL_BASE_FEE = 7 wei)
         // because BSC handles min gas price dynamically via miner_setGasPrice RPC
         // and enforces it in BscTxValidator instead.
-        let pool_config = ctx.pool_config().with_disabled_protocol_base_fee();
+        let mut pool_config = ctx.pool_config().with_disabled_protocol_base_fee();
+        // Block bodies share this store; leaving the pool does not make a blob disposable.
+        pool_config.retain_blobs_on_discard = true;
 
         // Same as upstream: derive blob cache size based on time
         let blob_cache_size = if let Some(blob_cache_size) = pool_config.blob_cache_size {

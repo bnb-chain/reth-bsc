@@ -2,7 +2,7 @@ use jsonrpsee::core::RpcResult;
 use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::types::ErrorObject;
 use alloy_primitives::B256;
-use alloy_consensus::transaction::TxHashRef;
+use alloy_consensus::{transaction::TxHashRef, BlockHeader};
 use alloy_eips::eip2718::{EIP4844_TX_TYPE_ID, Typed2718};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -366,6 +366,21 @@ where
                 None::<()>,
             )
         })?;
+
+        if blob_results.len() != hash_to_idx.len()
+            && tracing::enabled!(target: "bsc::blob", tracing::Level::DEBUG)
+        {
+            let timestamp = self.provider.header_by_number(block_num)
+                .ok().flatten().map(|h| h.timestamp());
+            let missing: Vec<_> = hash_to_idx.keys()
+                .filter(|hash| !blob_results.iter().any(|(found, _)| found == *hash))
+                .collect();
+            tracing::debug!(
+                target: "bsc::blob", block_number = block_num, ?block_hash, timestamp,
+                expected = hash_to_idx.len(), found = blob_results.len(), ?missing,
+                "Block blob sidecars missing from local store"
+            );
+        }
 
         // Convert to responses with correct block-level tx_index.
         let mut responses = Vec::new();
