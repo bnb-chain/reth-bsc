@@ -18,7 +18,7 @@ pub(crate) const SEL_MINT_ROLE: Selector = hex!("e9a9c850");
 pub(crate) const SEL_MIN_COMPOSITE_CHILDREN: Selector = hex!("b3ae29f7");
 pub(crate) const SEL_OPERATOR_ROLE: Selector = hex!("f5b541a6");
 pub(crate) const SEL_PAUSE_ROLE: Selector = hex!("389ed267");
-pub(crate) const SEL_SEIZE_HOLDER_SCOPE: Selector = hex!("b279d311");
+pub(crate) const SEL_SEIZE_EXEMPT_SCOPE: Selector = hex!("feb346ec");
 pub(crate) const SEL_SEIZE_RECEIVER_SCOPE: Selector = hex!("b31da27f");
 pub(crate) const SEL_SEIZE_ROLE: Selector = hex!("3c7e9ba5");
 pub(crate) const SEL_TRANSFER_EXECUTOR_SCOPE: Selector = hex!("724e9c53");
@@ -266,8 +266,8 @@ pub(crate) const SCOPE_TRANSFER_EXECUTOR: B256 =
     b256!("10be5173aff2a44e748bd9acd8b19fe34689581398a9db7ba2fb671e786ff7d8");
 pub(crate) const SCOPE_MINT_RECEIVER: B256 =
     b256!("a0d5ae037e66a09119acf080a1d807abb9b6d03b6b9130eb19f7c1e6bdb8ffc8");
-pub(crate) const SCOPE_SEIZE_HOLDER: B256 =
-    b256!("1497ab2b67ebb0a75dd9cdd6aec9f0e64620e6b87e911af7a088ac12e58d9ef2");
+pub(crate) const SCOPE_SEIZE_EXEMPT: B256 =
+    b256!("edb5da348cfb67af08746d3afd1be81034b50d5c8576f31aff688f39dfd540ed");
 pub(crate) const SCOPE_SEIZE_RECEIVER: B256 =
     b256!("bf15b19caf5c77422c038bc25f26b8b815c3a14f6d04c6616076b81bcfe07b3d");
 pub(crate) const FEATURE_ASSET: B256 =
@@ -312,7 +312,7 @@ pub(crate) fn selector_name(sel: Selector) -> &'static str {
         SEL_MIN_COMPOSITE_CHILDREN => "MIN_COMPOSITE_CHILD_POLICIES",
         SEL_OPERATOR_ROLE => "OPERATOR_ROLE",
         SEL_PAUSE_ROLE => "PAUSE_ROLE",
-        SEL_SEIZE_HOLDER_SCOPE => "SEIZE_HOLDER_POLICY",
+        SEL_SEIZE_EXEMPT_SCOPE => "SEIZE_EXEMPT_POLICY",
         SEL_SEIZE_RECEIVER_SCOPE => "SEIZE_RECEIVER_POLICY",
         SEL_SEIZE_ROLE => "SEIZE_ROLE",
         SEL_TRANSFER_EXECUTOR_SCOPE => "TRANSFER_EXECUTOR_POLICY",
@@ -445,7 +445,7 @@ mod tests {
         );
         assert_eq!(SEL_OPERATOR_ROLE, sel("OPERATOR_ROLE()"), "OPERATOR_ROLE()");
         assert_eq!(SEL_PAUSE_ROLE, sel("PAUSE_ROLE()"), "PAUSE_ROLE()");
-        assert_eq!(SEL_SEIZE_HOLDER_SCOPE, sel("SEIZE_HOLDER_POLICY()"), "SEIZE_HOLDER_POLICY()");
+        assert_eq!(SEL_SEIZE_EXEMPT_SCOPE, sel("SEIZE_EXEMPT_POLICY()"), "SEIZE_EXEMPT_POLICY()");
         assert_eq!(
             SEL_SEIZE_RECEIVER_SCOPE,
             sel("SEIZE_RECEIVER_POLICY()"),
@@ -1109,7 +1109,7 @@ mod tests {
             "SCOPE_TRANSFER_EXECUTOR"
         );
         assert_eq!(SCOPE_MINT_RECEIVER, keccak256("MINT_RECEIVER_POLICY"), "SCOPE_MINT_RECEIVER");
-        assert_eq!(SCOPE_SEIZE_HOLDER, keccak256("SEIZE_HOLDER_POLICY"), "SCOPE_SEIZE_HOLDER");
+        assert_eq!(SCOPE_SEIZE_EXEMPT, keccak256("SEIZE_EXEMPT_POLICY"), "SCOPE_SEIZE_EXEMPT");
         assert_eq!(
             SCOPE_SEIZE_RECEIVER,
             keccak256("SEIZE_RECEIVER_POLICY"),

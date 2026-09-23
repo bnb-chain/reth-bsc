@@ -1082,6 +1082,19 @@ fn seize_and_roles() {
             call_data(SEL_MINT, &[a(BOB), w(10)]),
         ],
     );
+    assert_eq!(
+        h.call(ALICE, token, &[0xfe, 0xb3, 0x46, 0xec]).ret(),
+        SCOPE_SEIZE_EXEMPT.as_slice()
+    );
+    assert!(h.call(ALICE, token, &[0xb2, 0x79, 0xd3, 0x11]).revert().is_empty());
+    let legacy_scope = keccak256("SEIZE_HOLDER_POLICY");
+    for input in [
+        call_data(SEL_POLICY_ID, &[legacy_scope]),
+        call_data(SEL_UPDATE_POLICY, &[legacy_scope, w(ALWAYS_BLOCK)]),
+    ] {
+        let out = h.call(ALICE, token, &input);
+        assert_rev(out.revert(), ERR_UNSUPPORTED_SCOPE, &[legacy_scope]);
+    }
     // Only a disallowed holder is seizable: with no policy bound every holder is allowed.
     let out = h.call(
         ALICE,
@@ -1096,7 +1109,7 @@ fn seize_and_roles() {
     let mut add = SEL_UPDATE_BLOCKLIST.to_vec();
     add.extend(encode_tuple(&[abi_word(w(block_id)), abi_word(w(1)), abi_word_array(&[a(BOB)])]));
     h.call(ADMIN, reg, &add).ret();
-    h.call(ALICE, token, &call_data(SEL_UPDATE_POLICY, &[SCOPE_SEIZE_HOLDER, w(block_id)])).ret();
+    h.call(ALICE, token, &call_data(SEL_UPDATE_POLICY, &[SCOPE_SEIZE_EXEMPT, w(block_id)])).ret();
     let out = h.call(
         ALICE,
         token,
@@ -1694,6 +1707,7 @@ mod info {
             r#""decimals":"0x12""#,
             r#""totalSupply":"0x3e8""#,
             r#""pausedFeatures":["0x2"]"#,
+            r#""seizeExempt":"0x0""#,
             r#""pendingMultiplier":{"value":"0x1bc16d674ec80000""#,
             r#""contractURI":"""#,
         ] {

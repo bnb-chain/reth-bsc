@@ -35,7 +35,7 @@ pub(crate) const OFF_TRANSFER_SENDER: usize = 0;
 pub(crate) const OFF_TRANSFER_RECEIVER: usize = 8;
 pub(crate) const OFF_TRANSFER_EXECUTOR: usize = 16;
 pub(crate) const OFF_MINT_RECEIVER: usize = 0;
-pub(crate) const OFF_SEIZE_HOLDER: usize = 0;
+pub(crate) const OFF_SEIZE_EXEMPT: usize = 0;
 pub(crate) const OFF_SEIZE_RECEIVER: usize = 8;
 
 pub(crate) const MAX_STRING_LEN: u64 = 1 << 24;
@@ -321,7 +321,7 @@ impl<'r, 'f, 'a> Store<'r, 'f, 'a> {
 
     pub(crate) fn seize_policies(&mut self) -> (u64, u64) {
         let w = self.get_u256_at(slot_at(SLOT_SEIZE_POLICIES));
-        (packed_lane(w, OFF_SEIZE_HOLDER), packed_lane(w, OFF_SEIZE_RECEIVER))
+        (packed_lane(w, OFF_SEIZE_EXEMPT), packed_lane(w, OFF_SEIZE_RECEIVER))
     }
 
     pub(crate) fn mint_receiver_policy(&mut self) -> u64 {

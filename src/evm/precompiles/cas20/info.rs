@@ -77,7 +77,7 @@ pub struct PolicyBindings {
     pub transfer_receiver: U64,
     pub transfer_executor: U64,
     pub mint_receiver: U64,
-    pub seize_holder: U64,
+    pub seize_exempt: U64,
     pub seize_receiver: U64,
 }
 
@@ -148,7 +148,7 @@ fn read(
     let name = tok.s().name().unwrap_or_default();
     let paused = tok.s().paused();
     let (sender, receiver, executor) = tok.s().transfer_policies();
-    let (holder, seize_to) = tok.s().seize_policies();
+    let (exempt, seize_to) = tok.s().seize_policies();
     let mint_receiver = tok.s().mint_receiver_policy();
     let total_supply = tok.s().total_supply();
     let mut info = TokenInfo {
@@ -169,7 +169,7 @@ fn read(
             transfer_receiver: U64::from(receiver),
             transfer_executor: U64::from(executor),
             mint_receiver: U64::from(mint_receiver),
-            seize_holder: U64::from(holder),
+            seize_exempt: U64::from(exempt),
             seize_receiver: U64::from(seize_to),
         },
         domain_separator: domain_separator(&name, chain_id, addr),

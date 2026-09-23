@@ -7,7 +7,7 @@ use super::{
     policy::PolicyReg,
     sigs::*,
     storage::{
-        addr_key, OFF_MINT_RECEIVER, OFF_SEIZE_HOLDER, OFF_SEIZE_RECEIVER, OFF_TRANSFER_EXECUTOR,
+        addr_key, OFF_MINT_RECEIVER, OFF_SEIZE_EXEMPT, OFF_SEIZE_RECEIVER, OFF_TRANSFER_EXECUTOR,
         OFF_TRANSFER_RECEIVER, OFF_TRANSFER_SENDER, SLOT_MINT_POLICY, SLOT_SEIZE_POLICIES,
         SLOT_TRANSFER_POLICIES,
     },
@@ -23,7 +23,7 @@ pub(crate) fn policy_lane(scope: B256) -> Option<(u64, usize)> {
         SCOPE_TRANSFER_RECEIVER => (SLOT_TRANSFER_POLICIES, OFF_TRANSFER_RECEIVER),
         SCOPE_TRANSFER_EXECUTOR => (SLOT_TRANSFER_POLICIES, OFF_TRANSFER_EXECUTOR),
         SCOPE_MINT_RECEIVER => (SLOT_MINT_POLICY, OFF_MINT_RECEIVER),
-        SCOPE_SEIZE_HOLDER => (SLOT_SEIZE_POLICIES, OFF_SEIZE_HOLDER),
+        SCOPE_SEIZE_EXEMPT => (SLOT_SEIZE_POLICIES, OFF_SEIZE_EXEMPT),
         SCOPE_SEIZE_RECEIVER => (SLOT_SEIZE_POLICIES, OFF_SEIZE_RECEIVER),
         _ => return None,
     })
@@ -114,7 +114,7 @@ impl Token<'_, '_> {
             SEL_TRANSFER_RECEIVER_SCOPE => Ok(enc_word(SCOPE_TRANSFER_RECEIVER)),
             SEL_TRANSFER_EXECUTOR_SCOPE => Ok(enc_word(SCOPE_TRANSFER_EXECUTOR)),
             SEL_MINT_RECEIVER_SCOPE => Ok(enc_word(SCOPE_MINT_RECEIVER)),
-            SEL_SEIZE_HOLDER_SCOPE => Ok(enc_word(SCOPE_SEIZE_HOLDER)),
+            SEL_SEIZE_EXEMPT_SCOPE => Ok(enc_word(SCOPE_SEIZE_EXEMPT)),
             SEL_SEIZE_RECEIVER_SCOPE => Ok(enc_word(SCOPE_SEIZE_RECEIVER)),
             SEL_POLICY_ID => (|| {
                 let scope = read_word(args, 0)?;
@@ -373,7 +373,7 @@ impl Token<'_, '_> {
         Ok(())
     }
 
-    /// SEIZE_HOLDER is inverted: only a disallowed holder is seizable.
+    /// Accounts authorized by SEIZE_EXEMPT are exempt from seizure.
     fn seize_with_memo(&mut self, from: Address, to: Address, amount: U256, memo: B256) -> R<()> {
         if self.ctx.read_only {
             return Err(Cas20Err::WriteProtection);
@@ -390,8 +390,8 @@ impl Token<'_, '_> {
         if from.is_zero() {
             return Err(rev(ERR_INVALID_SENDER, &[addr_key(from)]));
         }
-        let (seize_holder, seize_receiver) = self.s().seize_policies();
-        if self.policy_allows(seize_holder, from) {
+        let (seize_exempt, seize_receiver) = self.s().seize_policies();
+        if self.policy_allows(seize_exempt, from) {
             return Err(rev(ERR_ACCOUNT_NOT_SEIZABLE, &[addr_key(from)]));
         }
         if !self.policy_allows(seize_receiver, to) {

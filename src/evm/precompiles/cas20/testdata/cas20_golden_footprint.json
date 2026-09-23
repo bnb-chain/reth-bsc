@@ -644,7 +644,7 @@
     "keccak": 3
   },
   {
-    "name": "updatePolicy SEIZE_HOLDER=id1",
+    "name": "updatePolicy SEIZE_EXEMPT=id1",
     "gas": 24281,
     "sload": 4,
     "sstore": 1,
