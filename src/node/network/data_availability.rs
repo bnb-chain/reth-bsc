@@ -128,7 +128,8 @@ pub(crate) mod tests {
         let spec = BscChainSpec::from(ChainSpecBuilder::mainnet().cancun_activated().build());
         let block = blob_block(100);
         validate_at(&mut block.clone(), &spec, 100).unwrap();
-        let cases: &[(&str, fn(&mut BscBlock))] = &[
+        type MutateBlock = fn(&mut BscBlock);
+        let cases: &[(&str, MutateBlock)] = &[
             ("missing", |b| b.body.sidecars = None),
             ("extra", |b| {
                 let sc = b.body.sidecars.as_mut().unwrap();
