@@ -7,6 +7,7 @@ use crate::node::engine::BscBuiltPayload;
 use crate::node::evm::config::{
     BscEvmConfig, BscExecutionMode, BscNextBlockEnvAttributes, ValidatorCacheSink,
 };
+use crate::node::evm::LaneAdmission;
 use crate::node::miner::bsc_miner::MiningContext;
 use crate::node::miner::payload::DELAY_LEFT_OVER;
 use crate::node::miner::util::{epoch_validators_for_next_block, prepare_new_attributes};
@@ -33,6 +34,7 @@ use reth_payload_primitives::{BuiltPayloadExecutedBlock, PayloadBuilderError};
 use alloy_eips::eip4895::Withdrawals;
 use either::Either;
 use revm::context_interface::Block as EvmBlock;
+use revm::Database;
 use reth_primitives_traits::SealedHeader;
 use reth_ethereum_primitives::TransactionSigned;
 use reth_primitives_traits::SignerRecoverable;
@@ -109,6 +111,24 @@ fn retain_recent_interrupt_tallies(
     min_block_number: u64,
 ) {
     map.retain(|_, tally| tally.block_number >= min_block_number);
+}
+
+/// Drops each sender's bid prefix while preserving the pool iterator's order.
+fn filter_bid_txs<T>(txs: Vec<T>, of: impl Fn(&T) -> (Address, u64, bool)) -> Vec<T> {
+    let mut last_bid_nonce: HashMap<Address, u64> = HashMap::new();
+    for tx in &txs {
+        let (sender, nonce, in_bid) = of(tx);
+        if in_bid {
+            let last = last_bid_nonce.entry(sender).or_default();
+            *last = (*last).max(nonce);
+        }
+    }
+    txs.into_iter()
+        .filter(|tx| {
+            let (sender, nonce, _) = of(tx);
+            last_bid_nonce.get(&sender).is_none_or(|last| nonce > *last)
+        })
+        .collect()
 }
 
 /// Evicts entries older than `min_block_number` from the `best_bid_block` map, keyed by parent
@@ -655,7 +675,7 @@ where
                     // MEV bid simulation reproduces the block this validator would seal, so
                     // it must run the full Parlia finalization the miner runs — unlike
                     // `eth_simulateV1`, which is a caller-facing hypothetical.
-                    mode: BscExecutionMode::Mining,
+                    mode: BscExecutionMode::BidSimulation,
                     // Same remainder the miner would seal into mix_hash for this slot.
                     milli_remainder: bid_runtime.mining_ctx.block_timestamp_ms % 1000,
                     validator_cache_sink: Some(bid_validator_cache_sink.clone()),
@@ -1095,6 +1115,7 @@ where
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
         B: BlockBuilder,
+        B::Executor: LaneAdmission,
         B::Primitives: reth_primitives_traits::NodePrimitives<SignedTx = TransactionSigned>,
     {
         let recovered_txs: Result<Vec<_>, _> =
@@ -1120,6 +1141,7 @@ where
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
         B: BlockBuilder,
+        B::Executor: LaneAdmission,
         B::Primitives: reth_primitives_traits::NodePrimitives<SignedTx = TransactionSigned>,
     {
         let base_fee: u64 = builder.evm().block().basefee();
@@ -1139,7 +1161,11 @@ where
         let start_time = std::time::Instant::now();
         let delay_duration = std::time::Duration::from_millis(delay_ms);
 
+        // Like go-bsc's Pop: skip descendants of a blocked transaction, but not of a stale nonce.
+        let mut skipped_senders = std::collections::HashSet::new();
+
         for (index, recovered_tx) in recovered_txs.into_iter().enumerate() {
+            let signer = recovered_tx.signer();
             if from_pool {
                 let elapsed = start_time.elapsed();
                 if elapsed >= delay_duration {
@@ -1150,27 +1176,38 @@ where
                     trace!("block_gas_limit - gas_used < TX_GAS, break");
                     break;
                 }
+                if skipped_senders.contains(&signer) {
+                    continue;
+                }
             }
             // Check interrupt flag before processing each transaction
             if self.bid.interrupt_flag.load(Ordering::Relaxed) {
                 debug!("Bid runtime interrupted before processing transaction");
                 return Err("bid runtime interrupted".into());
             }
+            if from_pool {
+                // Skip consumed nonces before capacity checks can suppress their descendants.
+                let nonce = builder.evm_mut().db_mut().basic(signer)?.map_or(0, |info| info.nonce);
+                if recovered_tx.nonce() < nonce {
+                    continue;
+                }
+            }
             let is_blob_tx = recovered_tx.is_eip4844();
             let tx_hash = *recovered_tx.hash();
             if is_blob_tx && !blob_eligible {
                 if from_pool {
+                    skipped_senders.insert(signer);
                     continue;
                 }
                 return Err("blob transactions not allowed in this block".into());
             }
             if from_pool {
-                // ensure we still have capacity for this transaction
-                if self.gas_used + recovered_tx.gas_limit() > block_gas_limit {
-                    // we can't fit this transaction into the block, so we need to mark it as invalid
-                    // which also removes all dependent transaction from the iterator before we can
-                    // continue
-                    trace!("bidSimulator: gas limit exceeded, ignore tx:{}, tx gas limit:{}, block gas limit:{}, runtime gasused:{}", tx_hash, recovered_tx.gas_limit(), block_gas_limit, self.gas_used);
+                let shared = block_gas_limit.saturating_sub(self.gas_used);
+                if recovered_tx.gas_limit() > shared
+                    || !builder.executor_mut().lane_admits_pool_tx(&recovered_tx, shared)?
+                {
+                    trace!("bidSimulator: transaction exceeds gas budget, ignore tx:{}, tx gas limit:{}, shared:{}", tx_hash, recovered_tx.gas_limit(), shared);
+                    skipped_senders.insert(signer);
                     continue;
                 }
             }
@@ -1182,6 +1219,7 @@ where
                 if self.block_blob_count + tx_blob_count > max_blob_count {
                     if from_pool {
                         trace!("bidSimulator: blob transaction limit exceeded, ignore tx:{}, tx blob count:{}, block blob count:{}, max blob count:{}", tx_hash, tx_blob_count, self.block_blob_count, max_blob_count);
+                        skipped_senders.insert(signer);
                         continue;
                     }
                     debug!(target: "payload_builder", tx=?tx_hash, ?self.block_blob_count, "skipping blob transaction because it would exceed the max blob count per block");
@@ -1207,6 +1245,9 @@ where
                     }
                     if from_pool {
                         trace!("bidSimulator: invalid transaction, ignore tx:{}, error:{}, recovered tx:{:?}", tx_hash, error, recovered_tx);
+                        if !error.is_nonce_too_low() {
+                            skipped_senders.insert(signer);
+                        }
                         continue;
                     }
                     return Err("invalid transaction".into());
@@ -1214,6 +1255,7 @@ where
                 Err(err) => {
                     if from_pool {
                         trace!("bidSimulator: invalid transaction, ignore tx:{}, error:{}, recovered tx:{:?}", tx_hash, err, recovered_tx);
+                        skipped_senders.insert(signer);
                         continue;
                     }
                     return Err(Box::new(PayloadBuilderError::evm(err)));
@@ -1232,6 +1274,7 @@ where
                         debug!("Failed to insert blob sidecar for tx {:?}: {:?}", tx_hash, e);
                         if from_pool {
                             trace!("bidSimulator: failed to insert blob sidecar, ignore tx:{}, error:{}, recovered tx:{:?}", tx_hash, e, recovered_tx);
+                            skipped_senders.insert(signer);
                             continue;
                         }
                         return Err("Failed to insert blob sidecar".into());
@@ -1286,6 +1329,7 @@ where
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
         B: BlockBuilder,
+        B::Executor: LaneAdmission,
         B::Primitives: reth_primitives_traits::NodePrimitives<SignedTx = TransactionSigned>,
     {
         let base_fee = builder.evm_mut().block().basefee();
@@ -1320,27 +1364,13 @@ where
         let bid_tx_hashes: std::collections::HashSet<B256> =
             bid_txs.iter().map(|tx| *tx.hash()).collect();
 
-        let mut sender_txs_map: HashMap<
-            Address,
-            Vec<Arc<reth::transaction_pool::ValidPoolTransaction<Pool::Transaction>>>,
-        > = HashMap::new();
-
-        for pool_tx in best_tx_list {
-            sender_txs_map.entry(pool_tx.sender()).or_insert_with(Vec::new).push(pool_tx);
-        }
-
-        for txs in sender_txs_map.values_mut() {
-            for i in (0..txs.len()).rev() {
-                let tx_hash = txs[i].hash();
-                if bid_tx_hashes.contains(tx_hash) {
-                    txs.drain(0..=i);
-                    break;
-                }
-            }
-        }
-
         let pending_txs: Vec<reth_primitives_traits::Recovered<TransactionSigned>> =
-            sender_txs_map.into_values().flatten().map(|pool_tx| pool_tx.to_consensus()).collect();
+            filter_bid_txs(best_tx_list, |tx| {
+                (tx.sender(), tx.nonce(), bid_tx_hashes.contains(tx.hash()))
+            })
+            .into_iter()
+            .map(|pool_tx| pool_tx.to_consensus())
+            .collect();
         debug!("fill_tx_from_pool: pending_txs.len={}", pending_txs.len());
 
         let result = self.commit_transaction_recovered(
@@ -1392,6 +1422,182 @@ mod tests {
             system_tx_start: 0,
             builder: Address::ZERO,
             bid_hash: B256::random(),
+        }
+    }
+
+    #[test]
+    fn filter_bid_txs_preserves_pool_order() {
+        let a = Address::repeat_byte(0xa);
+        let b = Address::repeat_byte(0xb);
+
+        let txs = vec![(a, 5, false), (b, 1, true), (a, 6, true), (b, 2, false), (a, 7, false)];
+        assert_eq!(filter_bid_txs(txs, |tx| *tx), vec![(b, 2, false), (a, 7, false)]);
+
+        let txs = vec![(a, 5, false), (b, 1, false)];
+        assert_eq!(filter_bid_txs(txs.clone(), |tx| *tx), txs);
+    }
+
+    #[test]
+    fn greedy_merge_skips_consumed_nonces_before_capacity_checks() {
+        use alloy_consensus::{Header, TxLegacy};
+        use alloy_evm::block::{BlockExecutor, CommitChanges, GasOutput};
+        use alloy_primitives::{Signature, TxKind};
+        use reth::transaction_pool::noop::NoopTransactionPool;
+        use reth_evm::execute::ExecutorTx;
+        use reth_primitives_traits::Recovered;
+        use reth_provider::StateProvider;
+        use reth_rpc_eth_api::helpers::pending_block::BuildPendingEnv;
+        use reth_trie_common::updates::TrieUpdates;
+        use revm::{database::InMemoryDB, state::AccountInfo};
+
+        // Count attempts, not just commits: a nonce-too-high execution leaves no receipt.
+        struct CountingBuilder<B> {
+            inner: B,
+            attempts: usize,
+        }
+        impl<B: BlockBuilder> BlockBuilder for CountingBuilder<B> {
+            type Primitives = B::Primitives;
+            type Executor = B::Executor;
+
+            fn apply_pre_execution_changes(&mut self) -> Result<(), BlockExecutionError> {
+                self.inner.apply_pre_execution_changes()
+            }
+
+            fn execute_transaction_with_commit_condition(
+                &mut self,
+                tx: impl ExecutorTx<Self::Executor>,
+                f: impl FnOnce(&<Self::Executor as BlockExecutor>::Result) -> CommitChanges,
+            ) -> Result<Option<GasOutput>, BlockExecutionError> {
+                self.attempts += 1;
+                self.inner.execute_transaction_with_commit_condition(tx, f)
+            }
+
+            fn finish(
+                self,
+                state_provider: impl StateProvider,
+                state_root_precomputed: Option<(B256, TrieUpdates)>,
+            ) -> Result<BlockBuilderOutcome<Self::Primitives>, BlockExecutionError> {
+                self.inner.finish(state_provider, state_root_precomputed)
+            }
+
+            fn executor_mut(&mut self) -> &mut Self::Executor {
+                self.inner.executor_mut()
+            }
+
+            fn executor(&self) -> &Self::Executor {
+                self.inner.executor()
+            }
+
+            fn into_executor(self) -> Self::Executor {
+                self.inner.into_executor()
+            }
+        }
+
+        let sender = Address::repeat_byte(0xaa);
+        let other = Address::repeat_byte(0xbb);
+        let recipient = Address::repeat_byte(0xcc);
+        let tx = |signer, nonce, gas_limit, value| {
+            Recovered::new_unchecked(
+                TransactionSigned::new_unhashed(
+                    TxLegacy {
+                        nonce,
+                        gas_limit,
+                        gas_price: if signer == other { 2_000_000_000 } else { 1_000_000_000 },
+                        to: TxKind::Call(recipient),
+                        value: U256::from(value),
+                        ..Default::default()
+                    }
+                    .into(),
+                    Signature::new(U256::ZERO, U256::ZERO, false),
+                ),
+                signer,
+            )
+        };
+        for stale_gas_limit in [200_000, TX_GAS] {
+            let spec = Arc::new(BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet()));
+            let config = BscEvmConfig::new(spec.clone());
+            let parent =
+                SealedHeader::seal_slow(Header { gas_limit: 1_000_000, ..Default::default() });
+            let mut attrs = BscNextBlockEnvAttributes::build_pending_env(&parent);
+            attrs.mode = BscExecutionMode::BidSimulation;
+            let mining_ctx = MiningContext {
+                header: Some(Header {
+                    number: 1,
+                    timestamp: attrs.inner.timestamp,
+                    ..Default::default()
+                }),
+                parent_header: parent.clone(),
+                parent_snapshot: Arc::default(),
+                is_inturn: true,
+                cached_reads: None,
+                block_timestamp_ms: attrs.inner.timestamp * 1000,
+                end_mining_timestamp_ms: 0,
+            };
+            let bid = Bid {
+                builder: other,
+                block_number: 1,
+                parent_hash: parent.hash(),
+                txs: vec![],
+                blob_sidecars: HashMap::new(),
+                un_revertible: vec![],
+                gas_used: 0,
+                gas_fee: U256::ZERO,
+                builder_fee: U256::ZERO,
+                committed: false,
+                bid_hash: B256::ZERO,
+                interrupt_flag: Arc::new(AtomicBool::new(false)),
+            };
+            let mut runtime = BidRuntime::new(
+                bid,
+                NoopTransactionPool::default(),
+                config.clone(),
+                EthPayloadAttributes { timestamp: attrs.inner.timestamp, ..Default::default() },
+                spec,
+                mining_ctx,
+            );
+            let mut db = InMemoryDB::default();
+            for address in [sender, other] {
+                db.insert_account_info(
+                    address,
+                    AccountInfo {
+                        balance: U256::from(1_000_000_000_000_000_000u64),
+                        ..Default::default()
+                    },
+                );
+            }
+            let mut state = State::builder().with_database(db).with_bundle_update().build();
+            let mut builder = CountingBuilder {
+                inner: config.builder_for_next_block(&mut state, &parent, attrs).unwrap(),
+                attempts: 0,
+            };
+
+            let prefix = tx(sender, 0, TX_GAS, 1u64);
+            runtime
+                .commit_transaction_recovered(vec![prefix.clone()], &mut builder, 121_000, false, 0)
+                .unwrap();
+            assert_eq!(builder.evm_mut().db_mut().basic(sender).unwrap().unwrap().nonce, 1);
+
+            // A private bid replacement consumes nonce 0 without matching the pool's hash.
+            let stale = tx(sender, 0, stale_gas_limit, 2u64);
+            assert_ne!(stale.hash(), prefix.hash());
+            let candidates = vec![
+                stale,
+                tx(sender, 1, TX_GAS, 1u64),
+                tx(sender, 2, 200_000, 1u64),
+                tx(sender, 3, TX_GAS, 1u64),
+                tx(other, 0, TX_GAS, 1u64),
+            ];
+            runtime
+                .commit_transaction_recovered(candidates, &mut builder, 121_000, true, 10_000)
+                .unwrap();
+
+            assert_eq!(builder.evm_mut().db_mut().basic(sender).unwrap().unwrap().nonce, 2);
+            assert_eq!(builder.evm_mut().db_mut().basic(other).unwrap().unwrap().nonce, 1);
+            assert_eq!(runtime.gas_used, 3 * TX_GAS);
+            assert_eq!(
+                builder.attempts, 3,
+                "only the bid prefix, sender nonce 1 and other nonce 0 should execute",
+            );
         }
     }
 

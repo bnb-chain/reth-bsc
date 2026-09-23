@@ -1,4 +1,4 @@
-use super::config::evm_env_for_header;
+use super::config::{evm_env_for_header, BscExecutionMode};
 use super::executor::BscBlockExecutor;
 use super::factory::BscEvmFactory;
 use crate::evm::transaction::BscTxEnv;
@@ -16,7 +16,10 @@ use alloy_primitives::{BlockHash, BlockNumber, B256};
 use crate::consensus::parlia::{VoteAddress, Snapshot, DIFF_INTURN, DIFF_NOTURN};
 use crate::consensus::parlia::util::{is_breathe_block, debug_header};
 use crate::consensus::parlia::vote::MAX_ATTESTATION_EXTRA_LENGTH;
-use crate::node::evm::error::{BscBlockExecutionError, BscBlockValidationError};
+use crate::consensus::payment_lane::{
+    state::LaneState, LaneError, LaneParentState, GETTER_GAS_LIMIT,
+};
+use crate::node::evm::error::{lane_reject, BscBlockExecutionError, BscBlockValidationError};
 use crate::system_contracts::SystemContract;
 use reth_revm::{database::{EvmStateProvider, StateProviderDatabase}, db::State};
 use crate::system_contracts::feynman_fork::ValidatorElectionInfo;
@@ -294,6 +297,9 @@ where
 
         self.verify_cascading_fields(&header, &parent_header, &snap)?;
 
+        // Initialize before execution; validate total gas in `post_check_new_block`.
+        self.init_payment_lane(&parent_header, header.gas_limit)?;
+
         let epoch_length = snap.epoch_num;
         if header.number.is_multiple_of(epoch_length) {
             let (validator_set, vote_addresses) = self.get_current_validators_with_cache(
@@ -436,6 +442,45 @@ where
             view_call_tx_env(to, data.clone(), self.evm.block().gas_limit(), self.spec.chain().id());
         let result_and_state = self.evm.transact(tx_env.into_tx_env()).map_err(BlockExecutionError::other)?;
         view_call_output(to, &data, result_and_state.result)
+    }
+
+    /// Initialize before state changes. Jenner installs `0x2007` on activation, so the lane
+    /// starts in its child; gate on the parent and use this block's full gas limit.
+    fn init_payment_lane(
+        &mut self,
+        parent: &Header,
+        gas_limit: u64,
+    ) -> Result<(), BlockExecutionError> {
+        if !self.spec.is_jenner_active_at_timestamp(parent.number, parent.timestamp) {
+            return Ok(());
+        }
+        let (block, parent_hash) = (parent.number + 1, self.ctx.base.parent_hash);
+        let producing =
+            matches!(self.ctx.mode, BscExecutionMode::Mining | BscExecutionMode::BidSimulation);
+        self.lane = LaneState::resolve(self, parent_hash, gas_limit)
+            .inspect_err(|err| {
+                if producing {
+                    crate::metrics::LANE_METRICS.produce_declined.increment(1);
+                }
+                tracing::error!(
+                    target: "bsc::payment_lane",
+                    block,
+                    parent = %parent_hash,
+                    gas_limit,
+                    error = %err,
+                    "cannot derive the payment lane"
+                );
+            })
+            .map_err(lane_reject)?;
+        tracing::debug!(
+            target: "bsc::payment_lane",
+            block,
+            ratio = self.lane.ratio(),
+            quota = self.lane.quota(),
+            listed = self.lane.listed_len(),
+            "payment lane active"
+        );
+        Ok(())
     }
 
     /// Runs the same read-only system call against the current DB, but under `parent`'s env.
@@ -781,7 +826,7 @@ where
         // that entirely. Requiring one here would make `eth_simulateV1` fail — or panic on
         // the `unwrap` below — whenever the snapshot provider is unavailable, e.g. during
         // early startup before consensus has published it.
-        if self.ctx.mode.finalizes() {
+        if self.ctx.mode != BscExecutionMode::Simulation {
             let snap = self
                 .snapshot_provider
                 .as_ref()
@@ -791,11 +836,16 @@ where
             self.inner_ctx.snap = Some(snap.clone());
         }
 
+        // Use the full block limit, before subtracting producer reserves.
+        if self.ctx.mode != BscExecutionMode::Simulation {
+            self.init_payment_lane(&parent_header, block.gas_limit())?;
+        }
+
         let header_number = block.number().to::<u64>();
         let header_timestamp = block.timestamp().to::<u64>();
         // The election data below feeds `update_validator_set_v2`, which only runs during
-        // finalization; skip the system-contract calls in simulation.
-        if self.ctx.mode.finalizes() &&
+        // finalization.
+        if self.ctx.mode != BscExecutionMode::Simulation &&
             self.spec.is_feynman_active_at_timestamp(header_number, header_timestamp) &&
             !self.spec.is_feynman_transition_at_timestamp(header_number, header_timestamp, parent_header.timestamp) &&
             is_breathe_block(parent_header.timestamp, header_timestamp)
@@ -843,5 +893,53 @@ where
             self.inner_ctx.validators_election_info = Some(validator_election_info);
         }
         Ok(())
+    }
+}
+
+/// Reject late reads to avoid caching this block's mutations under its parent's hash.
+impl<'a, EVM, Spec, R: ReceiptBuilder> LaneParentState for BscBlockExecutor<'a, EVM, Spec, R>
+where
+    EVM: Evm<
+        DB: alloy_evm::block::StateDB,
+        Tx: FromRecoveredTx<R::Transaction>
+                + FromRecoveredTx<TransactionSigned>
+                + FromTxWithEncoded<TransactionSigned>,
+        BlockEnv = crate::evm::block_env::BscBlockEnv,
+    >,
+    Spec: EthereumHardforks + crate::hardforks::BscHardforks + EthChainSpec + Hardforks + Clone + 'static,
+    R: ReceiptBuilder<Transaction = TransactionSigned, Receipt: TxReceipt>,
+    <R as ReceiptBuilder>::Transaction: Unpin + From<TransactionSigned>,
+    <EVM as alloy_evm::Evm>::Tx: FromTxWithEncoded<<R as ReceiptBuilder>::Transaction>,
+    BscTxEnv: IntoTxEnv<<EVM as alloy_evm::Evm>::Tx>,
+    R::Transaction: Into<TransactionSigned>,
+{
+    fn call_lane_getter(&mut self, to: Address, data: Bytes) -> Result<Bytes, LaneError> {
+        if !self.db_at_parent_state {
+            return Err(LaneError::StateUnavailable(
+                "payment lane read after this block mutated state".into(),
+            ));
+        }
+
+        let tx_env = view_call_tx_env(to, data, GETTER_GAS_LIMIT, self.spec.chain().id());
+        // Execution errors abort validation locally; getter reverts/halts indicate bad config.
+        let result = self
+            .evm
+            .transact(tx_env.into_tx_env())
+            .map_err(|err| LaneError::StateUnavailable(err.to_string()))?
+            .result;
+
+        // Report the reason without retaining potentially large return data.
+        let reason = match result {
+            ExecutionResult::Success { output, .. } => {
+                let data = output.into_data();
+                if !data.is_empty() {
+                    return Ok(data);
+                }
+                "returned no data".to_string()
+            }
+            ExecutionResult::Revert { .. } => "reverted".to_string(),
+            ExecutionResult::Halt { reason, .. } => format!("halted: {reason:?}"),
+        };
+        Err(LaneError::CorruptConfig(format!("getter at {to} {reason}")))
     }
 }

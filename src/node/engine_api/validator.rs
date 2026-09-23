@@ -31,7 +31,10 @@ use reth_primitives_traits::{Block, RecoveredBlock, SealedBlock};
 use reth_provider::HeaderProvider;
 use reth_trie_common::HashedPostState;
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, OnceLock};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, OnceLock,
+};
 
 #[derive(Debug, Default, Clone)]
 #[non_exhaustive]
@@ -175,7 +178,11 @@ where
         payload: BscExecutionData,
         ctx: TreeCtx<'_, BscPrimitives>,
     ) -> ValidationOutcome<BscPrimitives> {
+        let local_fault = payload.local_fault.clone();
         let outcome = self.inner.validate_payload(payload, ctx);
+        if let Some(local_fault) = local_fault {
+            local_fault.store(payload_failed_locally(&outcome), Ordering::Release);
+        }
         self.report_invalid_block(&outcome);
         outcome
     }
@@ -218,7 +225,7 @@ where
     }
 }
 
-/// Validator for Optimism engine API.
+/// Validator for the BSC engine API.
 #[derive(Debug, Clone)]
 pub struct BscEngineValidator {
     inner: BscExecutionPayloadValidator<BscChainSpec>,
@@ -231,24 +238,36 @@ impl BscEngineValidator {
     }
 }
 
+fn payload_failed_locally(outcome: &ValidationOutcome<BscPrimitives>) -> bool {
+    let Err(InsertPayloadError::Block(error)) = outcome else { return false };
+    match error.kind() {
+        InsertBlockErrorKind::Consensus(_) => false,
+        InsertBlockErrorKind::Execution(error) => error.as_internal().is_some(),
+        InsertBlockErrorKind::Provider(_) | InsertBlockErrorKind::Other(_) => true,
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BscExecutionData {
     #[serde(flatten)]
     pub block: BscBlock,
     #[serde(skip, default)]
     hash: OnceLock<B256>,
+    /// Set on local validation failure; shared only by clones of this request, never serialized.
+    #[serde(skip)]
+    pub(crate) local_fault: Option<Arc<AtomicBool>>,
 }
 
 impl BscExecutionData {
     pub fn new(block: BscBlock) -> Self {
-        Self { block, hash: OnceLock::new() }
+        Self { block, hash: OnceLock::new(), local_fault: None }
     }
 
     /// Seeds the hash cache from a trusted sealed-block source.
     pub(crate) fn new_with_hash(block: BscBlock, hash: B256) -> Self {
         let lock = OnceLock::new();
         let _ = lock.set(hash);
-        Self { block, hash: lock }
+        Self { block, hash: lock, local_fault: None }
     }
 
     pub fn block_hash_cached(&self) -> B256 {
@@ -282,7 +301,7 @@ impl Clone for BscExecutionData {
         if let Some(value) = self.hash.get() {
             let _ = hash.set(*value);
         }
-        Self { block: self.block.clone(), hash }
+        Self { block: self.block.clone(), hash, local_fault: self.local_fault.clone() }
     }
 }
 
@@ -396,5 +415,73 @@ where
 
         let block = payload.into_block();
         Ok(block.seal_unchecked(header_hash))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{consensus::payment_lane::LaneError, node::evm::error::lane_reject};
+    use reth_engine_tree::tree::error::InsertBlockError;
+
+    #[test]
+    fn payload_local_fault_classification() {
+        let block = BscBlock::default().seal_slow();
+        let cases = [
+            (
+                InsertBlockErrorKind::Execution(lane_reject(LaneError::StateUnavailable(
+                    "missing trie node".into(),
+                ))),
+                true,
+            ),
+            (
+                InsertBlockErrorKind::Execution(lane_reject(LaneError::Violated {
+                    gas_limit: 100,
+                    gas_used: 100,
+                    quota: 10,
+                    payment_gas_used: 0,
+                })),
+                false,
+            ),
+            (InsertBlockErrorKind::Consensus(ConsensusError::RequestsHashMissing), false),
+            (
+                InsertBlockErrorKind::Provider(reth_provider::ProviderError::StateForHashNotFound(
+                    B256::ZERO,
+                )),
+                true,
+            ),
+            (InsertBlockErrorKind::Other(std::io::Error::other("local failure").into()), true),
+        ];
+        for (kind, expected) in cases {
+            let outcome = Err(InsertBlockError::new(block.clone(), kind).into());
+            assert_eq!(payload_failed_locally(&outcome), expected, "{outcome:?}");
+        }
+        let malformed =
+            Err(InsertPayloadError::Payload(PayloadError::InvalidVersionedHashes.into()));
+        assert!(!payload_failed_locally(&malformed));
+        assert!(!payload_failed_locally(&Ok((ExecutedBlock::default(), None))));
+    }
+
+    #[test]
+    fn payload_local_fault_is_request_scoped() {
+        let mut payload = BscExecutionData::default();
+        let wire = serde_json::to_value(&payload).unwrap();
+        let local_fault = Arc::new(AtomicBool::new(false));
+        payload.local_fault = Some(local_fault.clone());
+        let cloned = payload.clone();
+
+        let mut retry =
+            BscExecutionData::new_with_hash(payload.block.clone(), payload.block_hash_cached());
+        assert!(retry.local_fault.is_none());
+        retry.local_fault = Some(Arc::new(AtomicBool::new(false)));
+        local_fault.store(true, Ordering::Release);
+        assert!(!retry.local_fault.as_ref().unwrap().load(Ordering::Acquire));
+        assert!(cloned.local_fault.as_ref().unwrap().load(Ordering::Acquire));
+
+        assert_eq!(serde_json::to_value(&payload).unwrap(), wire);
+        let decoded: BscExecutionData = serde_json::from_value(wire).unwrap();
+        assert!(decoded.local_fault.is_none());
+        drop((payload, cloned));
+        assert_eq!(Arc::strong_count(&local_fault), 1);
     }
 }
