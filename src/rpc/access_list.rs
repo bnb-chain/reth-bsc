@@ -7,7 +7,7 @@ use alloy_evm::overrides::apply_state_overrides;
 use alloy_primitives::U256;
 use alloy_rpc_types_eth::{state::StateOverride, TransactionRequest};
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
-use reth_evm::{BlockEnvFor, ConfigureEvm, EvmFactory, TransactionEnvMut};
+use reth_evm::{BlockEnvFor, TransactionEnvMut};
 use reth_revm::{database::StateProviderDatabase, db::State};
 use reth_rpc_convert::RpcTypes;
 use reth_rpc_eth_api::{
@@ -35,7 +35,6 @@ pub struct BscAccessListApiImpl<Eth>(pub Eth);
 impl<Eth> BscAccessListApiServer for BscAccessListApiImpl<Eth>
 where
     Eth: EthCall + Trace,
-    Eth::Evm: ConfigureEvm<EvmFactory: EvmFactory<BlockEnv = crate::evm::block_env::BscBlockEnv>>,
     Eth::NetworkTypes: RpcTypes<TransactionRequest = TransactionRequest>,
     BlockEnvFor<Eth::Evm>: BlockOverridesExt,
 {
@@ -47,7 +46,6 @@ where
     ) -> RpcResult<AccessListResult> {
         let (mut env, at) =
             self.0.evm_env_at(block.unwrap_or_default()).await.map_err(Into::into)?;
-        env.block_env.disabled_cas20 = super::code_overrides::code_overridden_addresses(state_override.as_ref());
         // Keep reth's request preparation and second execution for accurate gasUsed.
         self.0
             .spawn_with_state(Some(at), move |eth, state| {
