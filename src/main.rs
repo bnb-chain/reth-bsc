@@ -480,6 +480,9 @@ fn main() -> eyre::Result<()> {
             let NodeHandle { node, node_exit_future: exit_future } =
                 builder.node(node)
                     .extend_rpc_modules(move |ctx| {
+                        if ctx.config().metrics.prometheus.is_some() || ctx.config().metrics.push_gateway_url.is_some() {
+                            reth_bsc::evm::precompiles::cas20::enable_metrics();
+                        }
                         // Every BSC namespace below is registered with `merge_if_module_configured`
                         // rather than `merge_configured`: the latter merges into every configured
                         // transport regardless of `--http.api`/`--ws.api`, so operator namespace
@@ -560,6 +563,20 @@ fn main() -> eyre::Result<()> {
                         ctx.modules.remove_method_from_configured("eth_createAccessList");
                         let access_list_api = BscAccessListApiImpl(ctx.registry.eth_api().clone());
                         ctx.modules.merge_if_module_configured(RethRpcModule::Eth, access_list_api.into_rpc())?;
+
+                        use reth_bsc::rpc::code_overrides::{BscCodeOverridesApiImpl, BscCodeOverridesApiServer};
+                        for method in ["eth_call", "eth_estimateGas", "eth_callMany", "eth_simulateV1"] {
+                            ctx.modules.remove_method_from_configured(method);
+                        }
+                        let overrides_api = BscCodeOverridesApiImpl(ctx.registry.eth_api().clone());
+                        ctx.modules.merge_if_module_configured(RethRpcModule::Eth, overrides_api.into_rpc())?;
+
+                        use reth_bsc::rpc::prestate::{BscPrestateApiImpl, BscPrestateApiServer};
+                        for method in reth_bsc::rpc::prestate::METHODS {
+                            ctx.modules.remove_method_from_configured(method);
+                        }
+                        let prestate_api = BscPrestateApiImpl(ctx.registry.debug_api());
+                        ctx.modules.merge_if_module_configured(RethRpcModule::Debug, prestate_api.into_rpc())?;
 
                         tracing::info!("Start to register BSC Admin RPC API (admin_setBidBlockPermission)...");
                         use reth_bsc::rpc::admin::{BscAdminApiImpl, BscAdminApiServer};

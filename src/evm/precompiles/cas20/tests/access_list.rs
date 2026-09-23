@@ -191,3 +191,38 @@ async fn rpc_retains_native_writes_from_reverted_children_and_opcode_accesses() 
     assert!(result.error.is_some());
     assert!(contains(&result.access_list, token, allowance));
 }
+
+mod prestate;
+
+#[tokio::test]
+async fn rpc_collects_native_account_reads_and_creation() {
+    let mut h = Harness::new();
+    let token = token(&mut h);
+    let api = rpc!(h.st);
+    let result = api
+        .create_access_list(
+            request(FACTORY_ADDRESS, call_data(SEL_IS_CAS20_INITIALIZED, &[a(token)])),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(result.error.is_none());
+    assert!(result
+        .access_list
+        .0
+        .contains(&AccessListItem { address: token, storage_keys: vec![] }));
+    let created = derive_address(VARIANT_ASSET, ALICE, w(901));
+    let result = api
+        .create_access_list(
+            request(FACTORY_ADDRESS, encode_create(VARIANT_ASSET, w(901), ALICE, &[])),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(result.error.is_none(), "{:?}", result.error);
+    assert!(contains(&result.access_list, created, slot_at(storage::SLOT_NAME)));
+    let feature = mapping_slot(activation::act_slot(activation::SLOT_FEATURES), FEATURE_ASSET);
+    assert!(contains(&result.access_list, ACTIVATION_REGISTRY_ADDRESS, feature));
+}

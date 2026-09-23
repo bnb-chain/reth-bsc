@@ -28,10 +28,12 @@ mod test_host;
 #[cfg(test)]
 mod tests;
 
+pub use observer::enable_metrics;
+
 use self::{
     ctx::{had_no_code, Ctx, Frame},
     errors::{complete, rev, Cas20Err, Outcome, R},
-    observer::{CallRecord, CallStats, CallStatus, Cas20Observer, MetricsObserver},
+    observer::{CallRecord, CallStats, CallStatus, Cas20Observer, NodeObserver},
     sigs::{ERR_NON_PAYABLE, FEATURE_ASSET, FEATURE_STABLECOIN, MARKER_CODE_HASH},
     token::Token,
 };
@@ -119,47 +121,78 @@ impl Kind {
 
 /// Leaves fork gating to the caller.
 fn resolve(addr: Address) -> Option<Kind> {
-    match addr {
-        FACTORY_ADDRESS => return Some(Kind::Factory),
-        POLICY_REGISTRY_ADDRESS => return Some(Kind::Policy),
-        ACTIVATION_REGISTRY_ADDRESS => return Some(Kind::Activation),
-        _ => {}
-    }
-    if !is_cas20_address(addr) {
-        return None;
-    }
-    match addr[10] {
-        VARIANT_ASSET => Some(Kind::Asset),
-        VARIANT_STABLECOIN => Some(Kind::Stablecoin),
+    match [addr[0], addr[1]] {
+        [0xca, 0x52] if is_cas20_address(addr) => match addr[10] {
+            VARIANT_ASSET => Some(Kind::Asset),
+            VARIANT_STABLECOIN => Some(Kind::Stablecoin),
+            _ => None,
+        },
+        [0xca, 0x5f] if addr == FACTORY_ADDRESS => Some(Kind::Factory),
+        [0x70, 0x20] => match addr {
+            POLICY_REGISTRY_ADDRESS => Some(Kind::Policy),
+            ACTIVATION_REGISTRY_ADDRESS => Some(Kind::Activation),
+            _ => None,
+        },
         _ => None,
     }
+}
+
+pub(crate) fn is_cas20_precompile(address: Address) -> bool {
+    resolve(address).is_some()
 }
 
 /// Prefix lookup enabled at Jenner. Shared stateful precompiles disable result caching.
 #[derive(Clone, Debug)]
 pub struct Cas20Lookup {
     active: Option<Arc<[DynPrecompile; 5]>>,
+    disabled: std::collections::BTreeSet<Address>,
 }
 
 impl Cas20Lookup {
-    /// The production lookup for `spec`: metrics on, precompiles shared process-wide.
+    /// The production lookup for `spec`, with precompiles shared process-wide.
     pub fn new(spec: BscHardfork) -> Self {
         static PRECOMPILES: LazyLock<Arc<[DynPrecompile; 5]>> =
-            LazyLock::new(|| Arc::new(precompiles(MetricsObserver)));
-        Self { active: (spec >= BscHardfork::Jenner).then(|| PRECOMPILES.clone()) }
+            LazyLock::new(|| Arc::new(precompiles(NodeObserver)));
+        Self {
+            active: (spec >= BscHardfork::Jenner).then(|| PRECOMPILES.clone()),
+            disabled: Default::default(),
+        }
+    }
+
+    /// Disables native routing only for code overrides in this RPC execution.
+    pub fn with_disabled(mut self, disabled: std::collections::BTreeSet<Address>) -> Self {
+        self.disabled = disabled;
+        self
+    }
+
+    /// Select observation explicitly in benchmarks, independently of node startup.
+    #[cfg(any(test, feature = "bench-test"))]
+    pub fn with_metrics(spec: BscHardfork, enabled: bool) -> Self {
+        Self {
+            active: (spec >= BscHardfork::Jenner)
+                .then(|| Arc::new(precompiles(enabled.then(observer::MetricsObserver::register)))),
+            disabled: Default::default(),
+        }
     }
 
     /// A lookup for `spec` reporting to `observer`.
     #[cfg(test)]
     fn with_observer<O: Cas20Observer>(spec: BscHardfork, observer: O) -> Self {
-        Self { active: (spec >= BscHardfork::Jenner).then(|| Arc::new(precompiles(observer))) }
+        Self {
+            active: (spec >= BscHardfork::Jenner).then(|| Arc::new(precompiles(observer))),
+            disabled: Default::default(),
+        }
     }
 }
 
 impl PrecompileLookup for Cas20Lookup {
     fn lookup(&self, address: &Address) -> Option<DynPrecompile> {
         let entries = self.active.as_ref()?;
-        Some(entries[resolve(*address)? as usize].clone())
+        let kind = resolve(*address)?;
+        if self.disabled.contains(address) {
+            return None;
+        }
+        Some(entries[kind as usize].clone())
     }
 }
 
@@ -171,7 +204,7 @@ fn precompiles<O: Cas20Observer>(observer: O) -> [DynPrecompile; 5] {
 }
 
 fn run<O: Cas20Observer>(kind: Kind, observer: &O, input: PrecompileInput<'_>) -> PrecompileResult {
-    let started = Instant::now();
+    let started = observer.enabled().then(Instant::now);
     let direct_call = input.is_direct_call();
     let (data, gas_limit, reservoir) = (input.data, input.gas, input.reservoir);
     let mut internals = input.internals;
@@ -187,17 +220,16 @@ fn run<O: Cas20Observer>(kind: Kind, observer: &O, input: PrecompileInput<'_>) -
     };
     let result = execute(kind, ctx, data);
     let (outcome, used, refund) = complete(&mut frame, result);
-    observer.record_call(&CallRecord {
-        kind,
-        selector: match data.get(..4) {
-            Some(sel) => sigs::selector_name(sel.try_into().unwrap()),
-            None => "short",
-        },
-        status: outcome.status(),
-        gas_used: used,
-        elapsed: started.elapsed(),
-        stats: frame.stats,
-    });
+    if let Some(started) = started {
+        observer.record_call(&CallRecord {
+            kind,
+            selector: sigs::selector_index(data),
+            status: outcome.status(),
+            gas_used: used,
+            elapsed: started.elapsed(),
+            stats: frame.stats,
+        });
+    }
     match outcome {
         Outcome::Return(bytes) => {
             let mut out = PrecompileOutput::new(used, bytes.into(), reservoir);

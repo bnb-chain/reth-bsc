@@ -22,13 +22,15 @@ pub struct BscBlockEnv {
     /// that passed consensus validation; `0` for pre-Lorentz headers and for
     /// constructors that have no millisecond source).
     pub milli_remainder: u64,
+    /// RPC-only code overrides; never populated from a canonical block header.
+    pub disabled_cas20: std::collections::BTreeSet<Address>,
 }
 
 impl BscBlockEnv {
     /// Creates a new [`BscBlockEnv`] from the standard env and the millisecond
     /// remainder.
     pub const fn new(inner: BlockEnv, milli_remainder: u64) -> Self {
-        Self { inner, milli_remainder }
+        Self { inner, milli_remainder, disabled_cas20: std::collections::BTreeSet::new() }
     }
 
     /// The block's millisecond timestamp (BEP-520): computed live from the
@@ -52,7 +54,7 @@ impl BscBlockEnv {
 
 impl From<BlockEnv> for BscBlockEnv {
     fn from(inner: BlockEnv) -> Self {
-        Self { inner, milli_remainder: 0 }
+        Self::new(inner, 0)
     }
 }
 

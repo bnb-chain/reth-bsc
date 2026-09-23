@@ -3,6 +3,7 @@ pub mod admin;
 #[cfg(test)]
 mod block_overrides_tests;
 pub mod blob;
+pub mod code_overrides;
 pub mod debug_builder;
 pub mod eth_config;
 pub mod eth_ext;
@@ -17,3 +18,5 @@ pub use eth_ext::*;
 pub use mev::*;
 pub use miner::*;
 pub use parlia::*;
+
+pub mod prestate;

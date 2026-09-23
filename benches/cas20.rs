@@ -3,19 +3,20 @@
 //! announce carrying two internal calls. Each iteration runs one transaction on
 //! the same pre-state (the journal is discarded, never committed), so the numbers
 //! track the precompile's own work plus the fixed transaction overhead. Fees are
-//! zero and the balance and nonce checks are off, so the transaction overhead is a
-//! little lighter than a paid transaction's; no metrics recorder is installed, so
-//! the production observer's handles are no-ops here.
+//! zero and the balance and nonce checks are off. Separate observer cases compare
+//! no observation, production handles without a recorder, and Prometheus handles.
 //!
-//! `cargo bench --bench cas20`
+//! `cargo bench --bench cas20 --features bench-test`
 
+use alloy_evm::precompiles::PrecompileLookup;
 use alloy_primitives::{keccak256, Address, B256, U256};
 use criterion::{criterion_group, criterion_main, Criterion};
 use reth_bsc::{
     evm::{
         api::BscEvm,
         precompiles::cas20::{
-            marker_bytecode, ACTIVATION_REGISTRY_ADDRESS, FACTORY_ADDRESS, POLICY_REGISTRY_ADDRESS,
+            marker_bytecode, Cas20Lookup, ACTIVATION_REGISTRY_ADDRESS, FACTORY_ADDRESS,
+            POLICY_REGISTRY_ADDRESS,
         },
         transaction::BscTxEnv,
     },
@@ -33,6 +34,7 @@ use revm::{
     state::AccountInfo,
     ExecuteCommitEvm, ExecuteEvm,
 };
+use std::hint::black_box;
 
 const ADMIN: Address =
     Address::new([0x60, 0xfe, 0xed, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
@@ -296,6 +298,89 @@ fn bench(c: &mut Criterion) {
     g.bench_function("isAuthorized(union of 4)", |b| b.iter(|| probe(&mut evm, &is_authorized)));
     g.bench_function("announce(2 internal calls)", |b| b.iter(|| probe(&mut evm, &announce)));
     g.finish();
+
+    let lookup = Cas20Lookup::new(BscHardfork::Jenner);
+    let mut misses = c.benchmark_group("cas20_lookup");
+    for (name, address) in [
+        ("ordinary_miss", Address::repeat_byte(0x11)),
+        ("token_prefix_miss", "0xca52010000000000000000000000000000000000".parse().unwrap()),
+        ("factory_prefix_miss", "0xca5f000000000000000000000000000000000001".parse().unwrap()),
+        ("registry_prefix_miss", "0x7020000000000000000000000000000000000003".parse().unwrap()),
+        ("token_hit", token),
+    ] {
+        misses.bench_function(name, |b| b.iter(|| black_box(lookup.lookup(black_box(&address)))));
+    }
+    misses.finish();
+
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let mut observers = c.benchmark_group("cas20_observer");
+    for (name, lookup) in [
+        ("disabled", Cas20Lookup::with_metrics(BscHardfork::Jenner, false)),
+        ("no_recorder", Cas20Lookup::with_metrics(BscHardfork::Jenner, true)),
+        (
+            "prometheus",
+            metrics::with_local_recorder(&recorder, || {
+                Cas20Lookup::with_metrics(BscHardfork::Jenner, true)
+            }),
+        ),
+    ] {
+        evm.inner.precompiles.set_precompile_lookup(lookup);
+        observers.bench_function(name, |b| b.iter(|| probe(&mut evm, &transfer)));
+    }
+    observers.finish();
+
+    let cfg = evm.inner.ctx.cfg.clone();
+    let block = evm.inner.ctx.block.clone();
+    let db = evm.inner.ctx.journaled_state.database.clone();
+    let mut parallel = c.benchmark_group("cas20_observer_parallel");
+    parallel.throughput(criterion::Throughput::Elements(4 * 256));
+    for (name, lookup) in [
+        ("disabled", Cas20Lookup::with_metrics(BscHardfork::Jenner, false)),
+        ("no_recorder", Cas20Lookup::with_metrics(BscHardfork::Jenner, true)),
+        (
+            "prometheus",
+            metrics::with_local_recorder(&recorder, || {
+                Cas20Lookup::with_metrics(BscHardfork::Jenner, true)
+            }),
+        ),
+    ] {
+        // Keep each non-Send EVM on its worker; barriers delimit a batch without
+        // including thread creation or database cloning in the measurement.
+        let start = std::sync::Barrier::new(5);
+        let done = std::sync::Barrier::new(5);
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let (cfg, block, db, lookup) =
+                    (cfg.clone(), block.clone(), db.clone(), lookup.clone());
+                let (start, done, stop, transfer) = (&start, &done, &stop, &transfer);
+                scope.spawn(move || {
+                    let mut evm =
+                        BscEvm::new(EvmEnv::new(cfg, block), db, NoOpInspector, false, false);
+                    evm.inner.precompiles.set_precompile_lookup(lookup);
+                    loop {
+                        start.wait();
+                        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                            break;
+                        }
+                        for _ in 0..256 {
+                            probe(&mut evm, transfer);
+                        }
+                        done.wait();
+                    }
+                });
+            }
+            parallel.bench_function(name, |b| {
+                b.iter(|| {
+                    start.wait();
+                    done.wait();
+                })
+            });
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            start.wait();
+        });
+    }
+    parallel.finish();
 }
 
 criterion_group!(benches, bench);

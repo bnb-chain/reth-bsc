@@ -1,12 +1,10 @@
 //! Completed-call metrics under `bsc.cas20`, including simulations and calls
 //! later reverted by an outer frame. These are execution counts, not chain totals.
 
-use super::{Kind, VARIANT_ASSET};
+use super::{sigs::SELECTOR_NAMES, Kind, VARIANT_ASSET};
 use metrics::{counter, histogram, Counter, Histogram};
 use std::{
-    collections::HashMap,
-    hash::Hash,
-    sync::{LazyLock, RwLock},
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
@@ -48,9 +46,8 @@ pub struct CallStats {
 #[derive(Clone, Copy, Debug)]
 pub struct CallRecord {
     pub kind: Kind,
-    /// The function's name, `"unknown"` for a selector no table has, `"short"`
-    /// for calldata under four bytes.
-    pub selector: &'static str,
+    /// Fixed index into `sigs::SELECTOR_NAMES`, including unknown and short calldata.
+    pub selector: usize,
     pub status: CallStatus,
     pub gas_used: u64,
     pub elapsed: Duration,
@@ -60,20 +57,33 @@ pub struct CallRecord {
 /// Receives finished CAS20 calls. Implementations must be cheap and must not
 /// panic: they run inside block execution.
 pub trait Cas20Observer: Clone + Send + Sync + 'static {
+    fn enabled(&self) -> bool {
+        true
+    }
     fn record_call(&self, call: &CallRecord);
 }
 
-/// Exports calls with cached handles. Labels are bounded by kind, selector and status.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct MetricsObserver;
+/// Handles are registered before execution; the hot path only indexes arrays.
+#[derive(Clone, Debug)]
+pub(crate) struct MetricsObserver(Arc<Handles>);
 
-type Labels = (&'static str, &'static str, &'static str);
-type GasHandles = (Histogram, Histogram);
+#[derive(Debug)]
+struct SelectorHandles {
+    calls: [Counter; 4],
+    gas: Histogram,
+    duration: Histogram,
+}
 
+#[derive(Debug)]
+struct KindHandles {
+    selectors: Vec<SelectorHandles>,
+    internal_calls: Counter,
+    internal_bytes: Counter,
+}
+
+#[derive(Debug)]
 struct Handles {
-    calls: RwLock<HashMap<Labels, Counter>>,
-    gas: RwLock<HashMap<(&'static str, &'static str), GasHandles>>,
-    internal_calls: RwLock<HashMap<&'static str, (Counter, Counter)>>,
+    kinds: [KindHandles; 5],
     sloads: Counter,
     sstores: Counter,
     keccaks: Counter,
@@ -81,62 +91,124 @@ struct Handles {
     created_stablecoin: Counter,
 }
 
-static HANDLES: LazyLock<Handles> = LazyLock::new(|| Handles {
-    calls: RwLock::default(),
-    gas: RwLock::default(),
-    internal_calls: RwLock::default(),
-    sloads: counter!("bsc.cas20.storage_ops_total", "op" => "sload"),
-    sstores: counter!("bsc.cas20.storage_ops_total", "op" => "sstore"),
-    keccaks: counter!("bsc.cas20.storage_ops_total", "op" => "keccak"),
-    created_asset: counter!("bsc.cas20.tokens_created_total", "variant" => "asset"),
-    created_stablecoin: counter!("bsc.cas20.tokens_created_total", "variant" => "stablecoin"),
-});
+static METRICS: OnceLock<MetricsObserver> = OnceLock::new();
 
-/// Registers each handle once, using a read lock for subsequent lookups.
-fn cached<K: Copy + Eq + Hash, V: Clone>(
-    map: &RwLock<HashMap<K, V>>,
-    key: K,
-    make: impl FnOnce() -> V,
-) -> V {
-    if let Some(v) = map.read().unwrap().get(&key) {
-        return v.clone();
+/// Called after the node's recorder is installed, when metrics export is enabled.
+pub fn enable_metrics() {
+    METRICS.get_or_init(MetricsObserver::register);
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct NodeObserver;
+
+impl Cas20Observer for NodeObserver {
+    fn enabled(&self) -> bool {
+        METRICS.get().is_some()
     }
-    map.write().unwrap().entry(key).or_insert_with(make).clone()
+    fn record_call(&self, call: &CallRecord) {
+        if let Some(observer) = METRICS.get() {
+            observer.record_call(call);
+        }
+    }
+}
+
+impl MetricsObserver {
+    pub(crate) fn register() -> Self {
+        Self(Arc::new(Handles {
+            kinds: Kind::ALL.map(|kind| {
+                let kind = kind.name();
+                KindHandles {
+                    selectors: SELECTOR_NAMES.iter().map(|&selector| SelectorHandles {
+                        calls: [CallStatus::Return, CallStatus::Revert, CallStatus::OutOfGas, CallStatus::Fatal].map(|status|
+                            counter!("bsc.cas20.calls_total", "kind" => kind, "selector" => selector, "status" => status.label())
+                        ),
+                        gas: histogram!("bsc.cas20.call_gas_used", "kind" => kind, "selector" => selector),
+                        duration: histogram!("bsc.cas20.call_duration_seconds", "kind" => kind, "selector" => selector),
+                    }).collect(),
+                    internal_calls: counter!("bsc.cas20.internal_calls_total", "kind" => kind),
+                    internal_bytes: counter!("bsc.cas20.internal_call_bytes_total", "kind" => kind),
+                }
+            }),
+            sloads: counter!("bsc.cas20.storage_ops_total", "op" => "sload"),
+            sstores: counter!("bsc.cas20.storage_ops_total", "op" => "sstore"),
+            keccaks: counter!("bsc.cas20.storage_ops_total", "op" => "keccak"),
+            created_asset: counter!("bsc.cas20.tokens_created_total", "variant" => "asset"),
+            created_stablecoin: counter!("bsc.cas20.tokens_created_total", "variant" => "stablecoin"),
+        }))
+    }
 }
 
 impl Cas20Observer for MetricsObserver {
     fn record_call(&self, call: &CallRecord) {
-        let (kind, selector) = (call.kind.name(), call.selector);
-        let h = &*HANDLES;
-        cached(&h.calls, (kind, selector, call.status.label()), || {
-            counter!("bsc.cas20.calls_total", "kind" => kind, "selector" => selector, "status" => call.status.label())
-        })
-        .increment(1);
-        let (gas, duration) = cached(&h.gas, (kind, selector), || {
-            (
-                histogram!("bsc.cas20.call_gas_used", "kind" => kind, "selector" => selector),
-                histogram!("bsc.cas20.call_duration_seconds", "kind" => kind, "selector" => selector),
-            )
-        });
-        gas.record(call.gas_used as f64);
-        duration.record(call.elapsed.as_secs_f64());
+        let h = &self.0;
+        let kind = &h.kinds[call.kind as usize];
+        let selector = &kind.selectors[call.selector];
+        selector.calls[call.status as usize].increment(1);
+        selector.gas.record(call.gas_used as f64);
+        selector.duration.record(call.elapsed.as_secs_f64());
         let s = call.stats;
         h.sloads.increment(s.sloads as u64);
         h.sstores.increment(s.sstores as u64);
         h.keccaks.increment(s.keccaks as u64);
         if s.internal_calls > 0 {
-            let (calls, bytes) = cached(&h.internal_calls, kind, || {
-                (
-                    counter!("bsc.cas20.internal_calls_total", "kind" => kind),
-                    counter!("bsc.cas20.internal_call_bytes_total", "kind" => kind),
-                )
-            });
-            calls.increment(s.internal_calls as u64);
-            bytes.increment(s.internal_call_bytes);
+            kind.internal_calls.increment(s.internal_calls as u64);
+            kind.internal_bytes.increment(s.internal_call_bytes);
         }
         if let Some(variant) = s.created {
             if variant == VARIANT_ASSET { &h.created_asset } else { &h.created_stablecoin }
                 .increment(1);
         }
+    }
+}
+
+#[cfg(any(test, feature = "bench-test"))]
+impl Cas20Observer for Option<MetricsObserver> {
+    fn enabled(&self) -> bool {
+        self.is_some()
+    }
+    fn record_call(&self, call: &CallRecord) {
+        if let Some(observer) = self {
+            observer.record_call(call);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use metrics_exporter_prometheus::PrometheusBuilder;
+
+    #[test]
+    fn registered_handles_record_bounded_labels_and_internal_work() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let observer = metrics::with_local_recorder(&recorder, MetricsObserver::register);
+        let mut call = CallRecord {
+            kind: Kind::Asset,
+            selector: super::super::sigs::selector_index(&super::super::sigs::SEL_TRANSFER),
+            status: CallStatus::Return,
+            gas_used: 123,
+            elapsed: Duration::from_millis(1),
+            stats: CallStats {
+                sloads: 2,
+                sstores: 1,
+                internal_calls: 2,
+                internal_call_bytes: 64,
+                created: Some(VARIANT_ASSET),
+                ..Default::default()
+            },
+        };
+        observer.record_call(&call);
+        call.selector = super::super::sigs::selector_index(&[0xde, 0xad, 0xbe, 0xef]);
+        call.status = CallStatus::Revert;
+        observer.record_call(&call);
+        let output = recorder.handle().render();
+        assert!(output.contains(
+            "bsc_cas20_calls_total{kind=\"CAS20Asset\",selector=\"transfer\",status=\"return\"} 1"
+        ));
+        assert!(output.contains(
+            "bsc_cas20_calls_total{kind=\"CAS20Asset\",selector=\"unknown\",status=\"revert\"} 1"
+        ));
+        assert!(output.contains("bsc_cas20_internal_calls_total{kind=\"CAS20Asset\"} 4"));
+        assert!(output.contains("bsc_cas20_storage_ops_total{op=\"sload\"} 4"));
     }
 }

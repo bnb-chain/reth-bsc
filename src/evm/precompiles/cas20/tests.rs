@@ -1243,6 +1243,42 @@ mod evm {
         Bytecode::new_raw(Bytes::from(c))
     }
 
+    #[test]
+    fn optional_metrics_preserve_results_gas_refunds_and_logs() {
+        let mut plain = evm_at(BscHardfork::Jenner);
+        let mut measured = evm_at(BscHardfork::Jenner);
+        plain
+            .inner
+            .precompiles
+            .set_precompile_lookup(Cas20Lookup::with_metrics(BscHardfork::Jenner, false));
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let lookup = metrics::with_local_recorder(&recorder, || {
+            Cas20Lookup::with_metrics(BscHardfork::Jenner, true)
+        });
+        measured.inner.precompiles.set_precompile_lookup(lookup);
+        let token = super::derive_address(VARIANT_ASSET, ALICE, w(99));
+        for (to, data, gas) in [
+            (
+                FACTORY_ADDRESS,
+                encode_create(
+                    VARIANT_ASSET,
+                    w(99),
+                    ALICE,
+                    &[call_data(SEL_MINT, &[a(ALICE), w(10)])],
+                ),
+                2_000_000,
+            ),
+            (token, call_data(SEL_TRANSFER, &[a(BOB), w(10)]), 200_000),
+            (token, call_data(SEL_TRANSFER, &[a(BOB), w(1)]), 200_000),
+            (token, call_data(SEL_NAME, &[]), 22_000),
+        ] {
+            assert_eq!(
+                tx(&mut plain, ALICE, to, data.clone(), gas),
+                tx(&mut measured, ALICE, to, data, gas)
+            );
+        }
+    }
+
     /// An observer sees each finished call once, with the settled outcome and the
     /// work it did; it is told nothing for a spec without the family.
     #[test]
@@ -1284,7 +1320,7 @@ mod evm {
 
         let calls = observer.0.lock().unwrap().clone();
         let summary: Vec<(Kind, &str, CallStatus)> =
-            calls.iter().map(|c| (c.kind, c.selector, c.status)).collect();
+            calls.iter().map(|c| (c.kind, sigs::SELECTOR_NAMES[c.selector], c.status)).collect();
         assert_eq!(
             summary,
             vec![
@@ -1304,7 +1340,10 @@ mod evm {
             22_000 - 21_000 - 4 * 16,
             "an exhausted frame reports its whole budget"
         );
-        assert_eq!(sigs::selector_name([0xde, 0xad, 0xbe, 0xef]), "unknown");
+        assert_eq!(
+            sigs::SELECTOR_NAMES[sigs::selector_index(&[0xde, 0xad, 0xbe, 0xef])],
+            "unknown"
+        );
     }
 
     #[test]
@@ -1799,5 +1838,43 @@ mod info {
             token_info_at(&mut host, Address::repeat_byte(0x42)),
             Err(InfoError::NotToken)
         );
+    }
+}
+
+#[test]
+fn lookup_prefix_rejection_preserves_reserved_addresses() {
+    for prefix in 0..=u16::MAX {
+        let mut bytes = [0; 20];
+        bytes[..2].copy_from_slice(&prefix.to_be_bytes());
+        let address = Address::from(bytes);
+        let expected = match prefix {
+            0xca52 => Some(Kind::Asset),
+            0xca5f => Some(Kind::Factory),
+            _ => None,
+        };
+        assert_eq!(resolve(address), expected);
+        bytes[19] = 1;
+        let expected = match prefix {
+            0xca52 => Some(Kind::Asset),
+            0x7020 => Some(Kind::Activation),
+            _ => None,
+        };
+        assert_eq!(resolve(Address::from(bytes)), expected);
+    }
+    assert_eq!(resolve(POLICY_REGISTRY_ADDRESS), Some(Kind::Policy));
+    for variant in 0..=u8::MAX {
+        let mut bytes = [0; 20];
+        bytes[..2].copy_from_slice(&MARKER_PREFIX);
+        bytes[10] = variant;
+        assert_eq!(
+            resolve(Address::from(bytes)),
+            match variant {
+                VARIANT_ASSET => Some(Kind::Asset),
+                VARIANT_STABLECOIN => Some(Kind::Stablecoin),
+                _ => None,
+            }
+        );
+        bytes[2] = 1;
+        assert_eq!(resolve(Address::from(bytes)), None);
     }
 }
