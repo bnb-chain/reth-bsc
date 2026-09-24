@@ -35,6 +35,7 @@ use reth_chainspec::EthChainSpec;
 
 pub mod block_import;
 pub(crate) mod blocks_by_range;
+mod data_availability;
 pub mod bootnodes;
 pub mod evn;
 pub mod evn_peers;

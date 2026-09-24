@@ -405,7 +405,9 @@ where
                                 block_hash, recovering,
                             );
                             let fetcher =
-                                crate::node::network::block_import::fork_recover::BscRangeFetcher;
+                                crate::node::network::block_import::fork_recover::BscRangeFetcher(
+                                    forkchoice_engine_clone.chain_spec().clone(),
+                                );
                             let Some(target) = peer else {
                                 return;
                             };
@@ -720,7 +722,7 @@ where
     }
 
     /// Add a new block import task to the pending imports
-    fn on_new_block(&mut self, block: BlockMsg, peer_id: PeerId) {
+    fn on_new_block(&mut self, mut block: BlockMsg, peer_id: PeerId) {
         tracing::debug!(target: "bsc::block_import", "Receiving new block from network: number = {:?}, hash = {:?}, peer = {:?}", block.block.0.block.header.number, block.hash, peer_id);
 
         // Record before stale-block / dedup checks: announcer remains a
@@ -769,6 +771,21 @@ where
         }
         if self.queued_blocks.contains(&block.hash) {
             tracing::trace!(target: "bsc::block_import", "Block already queued when receiving new block: number = {:?}, hash = {:?}", block.block.0.block.header.number, block.hash);
+            return;
+        }
+
+        if let Err(error) = super::super::data_availability::validate_data_availability(
+            &mut Arc::make_mut(&mut block.block).0.block,
+            self.forkchoice_engine.chain_spec(),
+        ) {
+            tracing::warn!(
+                target: "bsc::block_import",
+                peer = %peer_id,
+                block_number = block.block.0.block.header.number,
+                block_hash = %block.hash,
+                error = %format_args!("{error:#}"),
+                "Rejecting NewBlock with unavailable blob data"
+            );
             return;
         }
 
@@ -925,7 +942,9 @@ where
                     crate::node::network::block_import::fork_recover::RecoveringHeadGuard::new(
                         head_hash, recovering,
                     );
-                let fetcher = crate::node::network::block_import::fork_recover::BscRangeFetcher;
+                let fetcher = crate::node::network::block_import::fork_recover::BscRangeFetcher(
+                    forkchoice_engine.chain_spec().clone(),
+                );
                 let Some(target) = peer else {
                     tracing::debug!(
                         target: "bsc::block_import",
@@ -1264,6 +1283,45 @@ mod tests {
                 )
             })
             .await;
+    }
+
+    #[tokio::test]
+    async fn missing_blob_does_not_queue_or_forward_and_can_be_retried() {
+        use crate::node::network::data_availability::tests::blob_block;
+        let spec = Arc::new(BscChainSpec::from(
+            reth_chainspec::ChainSpecBuilder::mainnet().cancun_activated().build(),
+        ));
+        let (to_engine, mut from_engine) = mpsc::unbounded_channel();
+        let (_, from_network) = mpsc::unbounded_channel();
+        let (_, from_builder) = mpsc::unbounded_channel();
+        let (_, from_bid) = mpsc::unbounded_channel();
+        let (_, from_hashes) = mpsc::unbounded_channel();
+        let (to_network, mut events) = mpsc::unbounded_channel();
+        let mut service = ImportService::new(
+            MockProvider::new(), spec, ConsensusEngineHandle::new(to_engine),
+            from_network, from_builder, from_bid, from_hashes, to_network,
+        );
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let block = blob_block(now);
+        let hash = block.header.hash_slow();
+        let good = NewBlockMessage {
+            hash,
+            td: Some(U256::ZERO),
+            block: Arc::new(BscNewBlock(NewBlock { block, td: U128::ZERO })),
+        };
+        let mut missing = good.clone();
+        Arc::make_mut(&mut missing.block).0.block.body.sidecars = None;
+        service.on_new_block(missing, PeerId::random());
+        assert!(!service.queued_blocks.contains(&hash));
+        assert!(!service.processed_blocks.contains(&hash));
+        assert!(service.pending_imports.is_empty());
+        assert!(events.try_recv().is_err());
+        assert!(from_engine.try_recv().is_err());
+
+        service.on_new_block(good, PeerId::random());
+        assert!(service.queued_blocks.contains(&hash));
+        assert_eq!(service.pending_imports.len(), 1);
+        assert!(matches!(events.try_recv().unwrap(), BlockImportEvent::Announcement(_)));
     }
 
     #[tokio::test]

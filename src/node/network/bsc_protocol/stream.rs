@@ -206,6 +206,8 @@ impl BscProtocolConnection {
                 tracing::debug!(
                     target: "bsc_protocol",
                     req_id = req.request_id,
+                    start_block_height = req.start_block_height,
+                    start_block_hash = ?req.start_block_hash,
                     count = req.count,
                     "Encoded GetBlocksByRange packet"
                 );
@@ -218,6 +220,10 @@ impl BscProtocolConnection {
                     target: "bsc_protocol",
                     req_id = packet.request_id,
                     blocks = packet.blocks.len(),
+                    first_block = packet.blocks.first().map(|b| b.header.number),
+                    last_block = packet.blocks.last().map(|b| b.header.number),
+                    sidecar_count = packet.blocks.iter()
+                        .map(|b| b.body.sidecars.as_ref().map_or(0, Vec::len)).sum::<usize>(),
                     encoded_len = buf.len(),
                     "Encoded BlocksByRange packet"
                 );
@@ -343,7 +349,6 @@ impl BscProtocolConnection {
                 }
             }
             x if x == BscProtoMessageId::GetBlocksByRange as u8 => {
-                tracing::debug!(target: "bsc_protocol", "Processing GetBlocksByRange request");
                 match GetBlocksByRangePacket::decode(&mut &slice[..]) {
                     Ok(req) => {
                         if req.count == 0 || req.count > MAX_REQUEST_RANGE_BLOCKS_COUNT {
@@ -357,7 +362,14 @@ impl BscProtocolConnection {
 
                         let resp = build_blocks_by_range_response(&req);
                         let encoded = Self::encode_command(BscCommand::BlocksByRange(resp));
-                        tracing::debug!(target: "bsc_protocol", "Replying BlocksByRange for request");
+                        tracing::debug!(
+                            target: "bsc_protocol",
+                            peer = ?peer_id,
+                            req_id = req.request_id,
+                            start_block_height = req.start_block_height,
+                            start_block_hash = ?req.start_block_hash,
+                            "Replying BlocksByRange for request"
+                        );
                         Some(encoded)
                     }
                     Err(e) => {
@@ -367,15 +379,19 @@ impl BscProtocolConnection {
                 }
             }
             x if x == BscProtoMessageId::BlocksByRange as u8 => {
-                tracing::debug!(target: "bsc_protocol", "Processing BlocksByRange response");
                 match crate::node::network::blocks_by_range::decode_blocks_by_range(
                     &mut &slice[..],
                 ) {
                     Ok(res) => {
                         tracing::debug!(
                             target: "bsc_protocol",
+                            peer = ?peer_id,
                             req_id = res.request_id,
                             blocks = res.blocks.len(),
+                            first_block = res.blocks.first().map(|b| b.header.number),
+                            last_block = res.blocks.last().map(|b| b.header.number),
+                            sidecar_count = res.blocks.iter()
+                                .map(|b| b.body.sidecars.as_ref().map_or(0, Vec::len)).sum::<usize>(),
                             "Received BlocksByRange"
                         );
                         if let Some((waiter, _)) = pending_range_reqs.remove(&res.request_id) {

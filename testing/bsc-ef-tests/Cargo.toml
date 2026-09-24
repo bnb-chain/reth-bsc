@@ -15,7 +15,7 @@ reth_bsc = { path = "../.." }
 # Used only by the test harness, to generate its validator key instead of embedding one.
 rand = "0.9"
 
-# reth dependencies aligned with the root crate's reth tag to avoid duplicate crate versions
+# reth dependencies aligned with the root crate's reth revision to avoid duplicate crate versions
 reth-chainspec = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
 reth-consensus = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
 reth-ethereum-forks = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }

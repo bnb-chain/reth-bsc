@@ -131,8 +131,8 @@ pub trait RangeFetcher: Send + Sync {
 }
 
 /// Production fetcher that calls into the BSC sub-protocol registry.
-#[derive(Clone, Default)]
-pub struct BscRangeFetcher;
+#[derive(Clone)]
+pub struct BscRangeFetcher(pub Arc<crate::chainspec::BscChainSpec>);
 
 impl RangeFetcher for BscRangeFetcher {
     fn fetch<'a>(
@@ -150,6 +150,7 @@ impl RangeFetcher for BscRangeFetcher {
                 count,
                 FETCH_TIMEOUT,
                 MAX_PEER_ATTEMPTS,
+                &self.0,
             )
             .await?;
             Ok(resp.blocks)

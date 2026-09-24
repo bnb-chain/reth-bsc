@@ -599,7 +599,7 @@ fn main() -> eyre::Result<()> {
                         let pool = ctx.pool().clone();
                         let provider = ctx.provider().clone();
 
-                        let blob_api = BlobApiImpl::new(pool, provider);
+                        let blob_api = BlobApiImpl::new(pool, provider, ctx.config().pruning.minimal);
                         ctx.modules.merge_if_module_configured(RethRpcModule::Eth, blob_api.into_rpc())?;
                         tracing::info!("Succeed to register Blob RPC API");
 

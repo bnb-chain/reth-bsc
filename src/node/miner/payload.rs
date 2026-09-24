@@ -761,8 +761,18 @@ where
                 }
 
                 let blob_sidecar_result = 'sidecar: {
-                    let Some(sidecar) =
-                        self.pool.get_blob(*tx.hash()).map_err(PayloadBuilderError::other)?
+                    let Some(sidecar) = self.pool.get_blob(*tx.hash())
+                        .inspect_err(|error| {
+                            warn!(
+                                target: "payload_builder",
+                                trace_id,
+                                block_number = parent_header.number() + 1,
+                                tx_hash = ?tx.hash(),
+                                error = %error,
+                                "Failed to read blob sidecar while building payload"
+                            );
+                        })
+                        .map_err(PayloadBuilderError::other)?
                     else {
                         break 'sidecar Err(Eip4844PoolTransactionError::MissingEip4844BlobSidecar);
                     };
@@ -2621,11 +2631,17 @@ where
         )
         .map_err(|e| Box::new(BscPayloadJobError::PayloadBuildingError(e.to_string())))?;
 
+        let snapshot_provider = crate::shared::get_snapshot_provider().ok_or_else(|| {
+            Box::new(BscPayloadJobError::PayloadBuildingError(
+                "Snapshot provider not available".to_string(),
+            ))
+        })?;
         finalize_payload(
             &mut best_payload,
             self.parlia.clone(),
             &self.mining_ctx.parent_snapshot,
             &self.mining_ctx.parent_header,
+            snapshot_provider,
             self.mining_ctx.block_timestamp_ms,
             epoch_validators,
         )
@@ -2686,6 +2702,9 @@ where
             is_inturn = self.mining_ctx.is_inturn,
             is_bid = best_payload.bid_builder.is_some(),
             tx_count = best_payload.block().body().transaction_count(),
+            blob_gas_used = best_payload.block().header().blob_gas_used(),
+            sidecar_count = best_payload.block().body().sidecars.as_ref().map_or(0, Vec::len),
+            executed_sidecar_count = best_payload.executed_block.recovered_block.body().sidecars.as_ref().map_or(0, Vec::len),
             fees = %best_payload.fees(),
             exec_duration_ms = best_payload.exec_duration.as_millis(),
             trie_root_duration_ms = best_payload.trie_root_duration.as_millis(),
@@ -2793,16 +2812,11 @@ fn finalize_payload(
     parlia: Arc<Parlia<BscChainSpec>>,
     parent_snapshot: &Snapshot,
     parent_header: &SealedHeader<alloy_consensus::Header>,
+    snapshot_provider: &Arc<dyn crate::consensus::parlia::SnapshotProvider + Send + Sync>,
     block_timestamp_ms: u64,
     epoch_validators: Option<EpochValidators>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let snapshot_provider = crate::shared::get_snapshot_provider().cloned().ok_or_else(|| {
-        Box::new(std::io::Error::other("Snapshot provider not available"))
-            as Box<dyn std::error::Error + Send + Sync>
-    })?;
-
     let senders = payload.executed_block.recovered_block.senders().to_vec();
-    let mut existing_sidecars = payload.block.clone_block().body.sidecars;
     let mut plain_block = payload.executed_block.recovered_block.sealed_block().clone_block();
 
     // Tag legacy `SendBid` winners with their builder (go-bsc `setBidMevInfo`, the Bid case).
@@ -2830,7 +2844,7 @@ fn finalize_payload(
         parent_snapshot,
         parent_header,
         &mut plain_block.header,
-        &snapshot_provider,
+        snapshot_provider,
         block_timestamp_ms,
         epoch_validators,
     )
@@ -2856,21 +2870,18 @@ fn finalize_payload(
         );
     }
 
-    payload.executed_block.recovered_block =
-        Arc::new(RecoveredBlock::new_unhashed(plain_block.clone(), senders));
-
-    let mut finalized_with_sidecars = plain_block;
-    // Update block_hash in each sidecar to reflect the final (post-seal) hash.
-    // The sidecar block_hash was set to the pre-finalization hash at build time;
-    // finalize_new_header() changes the header (difficulty, extra_data, ECDSA seal),
-    // so the hash must be patched here before the sidecars are transmitted over P2P.
-    if let Some(ref mut sidecars) = existing_sidecars {
+    // Both payload blocks must carry sidecars with the final sealed hash.
+    plain_block.body.sidecars = payload.block.body().sidecars.clone();
+    if let Some(sidecars) = &mut plain_block.body.sidecars {
         for sidecar in sidecars.iter_mut() {
             sidecar.block_hash = final_hash;
         }
     }
-    finalized_with_sidecars.body.sidecars = existing_sidecars;
-    payload.block = Arc::new(finalized_with_sidecars.into());
+    payload.block = Arc::new(plain_block.seal_unchecked(final_hash));
+    payload.executed_block.recovered_block = Arc::new(RecoveredBlock::new_sealed(
+        payload.block.as_ref().clone(),
+        senders,
+    ));
 
     Ok(())
 }
@@ -3361,6 +3372,80 @@ mod tests {
             }]),
         };
         RecoveredBlock::new_unhashed(BscBlock { header, body }, Vec::new())
+    }
+
+    #[test]
+    fn finalize_payload_preserves_sidecars_and_senders() {
+        ensure_bid_block_test_signer();
+        let parlia = Arc::new(Parlia::new(luban_chain_spec(), 200));
+        let parent_header = SealedHeader::seal_slow(Header::default());
+        let parent_snap =
+            Snapshot::new(vec![Address::with_last_byte(1)], 0, parent_header.hash(), 200, None);
+        let snapshot_provider: Arc<dyn crate::consensus::parlia::SnapshotProvider + Send + Sync> =
+            Arc::new(MockBidBlockSnapshotProvider { snapshot: parent_snap.clone() });
+        let senders = vec![Address::with_last_byte(2)];
+
+        for with_sidecars in [true, false] {
+            let header = Header { number: 1, parent_hash: parent_header.hash(), ..Default::default() };
+            let original_hash = header.hash_slow();
+            let mut block = bid_block_with_sidecar(header, original_hash).clone_block();
+            let transaction = if with_sidecars {
+                alloy_consensus::TxEip4844::default().into()
+            } else {
+                alloy_consensus::TxLegacy::default().into()
+            };
+            block.body.inner.transactions = vec![super::TransactionSigned::new_unhashed(
+                transaction,
+                alloy_primitives::Signature::new(U256::from(1), U256::from(2), false),
+            )];
+            if !with_sidecars {
+                block.body.sidecars = None;
+            }
+            let mut executed_block = block.clone();
+            executed_block.body.sidecars = None;
+            let mut payload = super::BscBuiltPayload {
+                block: Arc::new(block.into()),
+                fees: U256::ZERO,
+                requests: None,
+                build_kind: super::BuildKind::NormalAttempt,
+                exec_duration: Duration::ZERO,
+                trie_root_duration: Duration::ZERO,
+                executed_block: reth_chain_state::ExecutedBlock {
+                    recovered_block: Arc::new(RecoveredBlock::new_unhashed(
+                        executed_block,
+                        senders.clone(),
+                    )),
+                    ..Default::default()
+                },
+                pending_validators: None,
+                pending_turn_length: None,
+                bid_builder: None,
+            };
+
+            super::finalize_payload(
+                &mut payload,
+                parlia.clone(),
+                &parent_snap,
+                &parent_header,
+                &snapshot_provider,
+                0,
+                None,
+            )
+            .unwrap();
+
+            let recovered = &payload.executed_block.recovered_block;
+            assert_eq!(recovered.body(), payload.block.body());
+            assert_eq!(recovered.hash(), payload.block.hash());
+            assert_ne!(payload.block.hash(), original_hash);
+            assert_eq!(recovered.senders(), senders.as_slice());
+            if with_sidecars {
+                let sidecars = recovered.body().sidecars.as_ref().unwrap();
+                assert_eq!(sidecars.len(), 1);
+                assert_eq!(sidecars[0].block_hash, payload.block.hash());
+            } else {
+                assert!(recovered.body().sidecars.is_none());
+            }
+        }
     }
 
     #[test]
