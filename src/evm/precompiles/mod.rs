@@ -16,6 +16,7 @@ use revm::{
 use std::{boxed::Box, cell::RefCell, collections::HashMap};
 
 mod bls;
+pub mod cas20;
 mod cometbft;
 mod dedup;
 mod double_sign;

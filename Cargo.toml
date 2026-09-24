@@ -39,6 +39,7 @@ reth-chain-state = { git = "https://github.com/bnb-chain/reth.git", branch = "de
 reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
 reth-eth-wire = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
 reth-eth-wire-types = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
+reth-errors = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
 reth-evm = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
 reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
 reth-execution-types = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
@@ -78,6 +79,7 @@ revm-bytecode = "10.0.0"
 revm-state = "11.0.0"
 revm-primitives = { version = "23.0.0", default-features = false }
 revm-interpreter = "35.0.0"
+revm-inspectors = "0.39.0"
 revm-database-interface = "11.0.0"
 
 # alloy dependencies
@@ -87,7 +89,7 @@ alloy-genesis = "2.0.4"
 alloy-consensus = "2.0.4"
 alloy-eips = "2.0.4"
 alloy-network = "2.0.4"
-alloy-rpc-types = { version = "2.0.4", features = ["eth"] }
+alloy-rpc-types = { version = "2.0.4", features = ["eth", "trace"] }
 alloy-rpc-types-eth = "2.0.4"
 alloy-rpc-types-engine = "2.0.4"
 alloy-rpc-types-mev = "2.0.4"
@@ -260,8 +262,16 @@ debug = "line-tables-only"
 strip = false
 
 [dev-dependencies]
+metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
+reth-rpc = { git = "https://github.com/bnb-chain/reth.git", branch = "develop" }
+criterion = "0.5"
 uuid = { version = "1", features = ["v4"] }
 reth-transaction-pool = { git = "https://github.com/bnb-chain/reth.git", branch = "develop", features = ["test-utils"] }
 # `test-util` gives tests a paused clock (`start_paused`, `time::advance`), so timing invariants
 # can be asserted by ordering instead of racing a wall clock.
 tokio = { version = "1.44", features = ["full", "test-util"] }
+
+[[bench]]
+name = "cas20"
+harness = false
+required-features = ["bench-test"]
