@@ -487,6 +487,9 @@ fn main() -> eyre::Result<()> {
             let NodeHandle { node, node_exit_future: exit_future } =
                 builder.node(node)
                     .extend_rpc_modules(move |ctx| {
+                        if ctx.config().metrics.prometheus.is_some() || ctx.config().metrics.push_gateway_url.is_some() {
+                            reth_bsc::evm::precompiles::cas20::enable_metrics();
+                        }
                         // Every BSC namespace below is registered with `merge_if_module_configured`
                         // rather than `merge_configured`: the latter merges into every configured
                         // transport regardless of `--http.api`/`--ws.api`, so operator namespace
@@ -550,14 +553,37 @@ fn main() -> eyre::Result<()> {
                         ctx.modules.merge_if_module_configured(RethRpcModule::Miner, miner_api.into_rpc())?;
                         tracing::info!("Succeed to register Miner RPC API");
 
-                        tracing::info!("Start to register BSC Eth extension API (eth_coinbase, eth_health)...");
+                        tracing::info!("Start to register BSC Eth extension API (eth_coinbase, eth_health, eth_getCAS20TokenInfo)...");
                         use reth_bsc::rpc::eth_ext::{BscEthExtApiImpl, BscEthExtApiServer};
+                        use reth_rpc_eth_api::helpers::SpawnBlocking;
 
                         // Remove the default unimplemented eth_coinbase before registering our version
                         ctx.modules.remove_method_from_configured("eth_coinbase");
-                        let eth_ext_api = BscEthExtApiImpl::new();
+                        let eth_ext_api = BscEthExtApiImpl::new(
+                            ctx.provider().clone(),
+                            ctx.registry.eth_api().blocking_io_task_guard().clone(),
+                        );
                         ctx.modules.merge_if_module_configured(RethRpcModule::Eth, eth_ext_api.into_rpc())?;
                         tracing::info!("Succeed to register BSC Eth extension API");
+
+                        use reth_bsc::rpc::access_list::{BscAccessListApiImpl, BscAccessListApiServer};
+                        ctx.modules.remove_method_from_configured("eth_createAccessList");
+                        let access_list_api = BscAccessListApiImpl(ctx.registry.eth_api().clone());
+                        ctx.modules.merge_if_module_configured(RethRpcModule::Eth, access_list_api.into_rpc())?;
+
+                        use reth_bsc::rpc::code_overrides::{BscCodeOverridesApiImpl, BscCodeOverridesApiServer};
+                        for method in ["eth_call", "eth_estimateGas", "eth_callMany", "eth_simulateV1"] {
+                            ctx.modules.remove_method_from_configured(method);
+                        }
+                        let overrides_api = BscCodeOverridesApiImpl(ctx.registry.eth_api().clone());
+                        ctx.modules.merge_if_module_configured(RethRpcModule::Eth, overrides_api.into_rpc())?;
+
+                        use reth_bsc::rpc::prestate::{BscPrestateApiImpl, BscPrestateApiServer};
+                        for method in reth_bsc::rpc::prestate::METHODS {
+                            ctx.modules.remove_method_from_configured(method);
+                        }
+                        let prestate_api = BscPrestateApiImpl(ctx.registry.debug_api());
+                        ctx.modules.merge_if_module_configured(RethRpcModule::Debug, prestate_api.into_rpc())?;
 
                         tracing::info!("Start to register BSC Admin RPC API (admin_setBidBlockPermission)...");
                         use reth_bsc::rpc::admin::{BscAdminApiImpl, BscAdminApiServer};

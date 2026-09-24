@@ -314,6 +314,16 @@ where
                 );
                 self.apply_history_storage_account(block_number)?;
             }
+
+            // BEP-702 3.16: the CAS20 registries get their account sentinels when
+            // Jenner activates, so EIP-161 cannot clear them and GovHub sees code.
+            if self.spec.is_jenner_transition_at_timestamp(
+                block_number,
+                block_timestamp,
+                parent_timestamp,
+            ) {
+                self.seed_cas20_registries(block_number)?;
+            }
         } else {
             // Upgrade system contracts after Feynman at block end
             if self.spec.is_feynman_active_at_timestamp(block_number, parent_timestamp) {
@@ -391,6 +401,48 @@ where
         // (block 21323714) - geth computed the true root and rejected the block while every
         // reth node agreed on the stale one. Report the change like `commit_transaction` does.
         self.system_caller.on_state(source, &changes);
+        Ok(())
+    }
+
+    /// Plants the CAS20 registries' account sentinels (BEP-702 3.16), the way go-bsc's
+    /// `SeedCAS20Activation` does at the Jenner transition. An account that already
+    /// carries code is left alone: overwriting it would destroy it.
+    pub(crate) fn seed_cas20_registries(
+        &mut self,
+        block_number: BlockNumber,
+    ) -> Result<(), BlockExecutionError> {
+        use crate::evm::precompiles::cas20;
+
+        for address in [cas20::ACTIVATION_REGISTRY_ADDRESS, cas20::POLICY_REGISTRY_ADDRESS] {
+            let db = self.evm.db_mut();
+            let old_info = db.basic(address).map_err(BlockExecutionError::other)?;
+            let mut info = old_info.unwrap_or_default();
+            if info.code_hash != revm::primitives::KECCAK_EMPTY && info.code_hash != alloy_primitives::B256::ZERO {
+                error!(
+                    target: "bsc::executor::cas20",
+                    block_number,
+                    ?address,
+                    code_hash = ?info.code_hash,
+                    "CAS20 registry already carries code"
+                );
+                continue;
+            }
+            let code = cas20::marker_bytecode();
+            info.code_hash = code.hash_slow();
+            info.code = Some(code);
+            let mut account = RevmAccount::from(info);
+            account.mark_touch();
+            let mut changes: EvmState = Default::default();
+            changes.insert(address, account);
+            db.commit(changes.clone());
+            // As for every other block-begin write: the incremental state root only
+            // sees what the hook is told.
+            self.system_caller.on_state(
+                StateChangeSource::PreBlock(StateChangePreBlockSource::Other("bsc_cas20_registry_sentinel")),
+                &changes,
+            );
+            info!(target: "bsc::executor::cas20", block_number, ?address, "Seeded CAS20 registry sentinel (Jenner transition)");
+        }
         Ok(())
     }
 
