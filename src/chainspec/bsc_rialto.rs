@@ -19,7 +19,7 @@ pub fn bsc_qanet() -> ChainSpec {
         hardforks: BscHardfork::bsc_qanet(),
         deposit_contract: None,
         base_fee_params: BaseFeeParamsKind::Constant(BaseFeeParams::new(1, 1)),
-        prune_delete_limit: 3500,
+        prune_delete_limit: super::BSC_PRUNE_DELETE_LIMIT,
         genesis_header: SealedHeader::new(
             make_genesis_header(&genesis, &hardforks),
             BlockHash::from_str(

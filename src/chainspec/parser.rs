@@ -261,6 +261,15 @@ mod tests {
     }
 
     #[test]
+    fn named_chains_use_bsc_prune_delete_limit() {
+        use reth_chainspec::EthChainSpec;
+        for chain in BscChainSpecParser::SUPPORTED_CHAINS {
+            let spec = chain_value_parser(chain).unwrap();
+            assert_eq!(spec.prune_delete_limit(), crate::chainspec::BSC_PRUNE_DELETE_LIMIT, "{chain}");
+        }
+    }
+
+    #[test]
     fn test_parse_jenner_time_from_genesis() {
         // `jennerTime` in the genesis config activates Jenner at that timestamp
         // (the geth genesis key introduced by BEP-706, mirroring go-bsc's

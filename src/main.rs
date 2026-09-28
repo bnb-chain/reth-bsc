@@ -100,6 +100,11 @@ pub struct BscCliArgs {
     #[arg(long = "genesis-hash")]
     pub genesis_hash: Option<String>,
 
+    /// Maximum number of entries the live pruner may delete per run, shared by all
+    /// segments. Defaults to the chain spec value (10000 on BSC networks).
+    #[arg(long = "prune.delete-limit", value_parser = clap::value_parser!(u64).range(1..))]
+    pub prune_delete_limit: Option<u64>,
+
     // ---- BLS vote key management ----
     /// Path to a BLS keystore JSON for vote signing (used for voting/attestations)
     #[arg(long = "bls.keystore-path")]
@@ -233,6 +238,14 @@ fn main() -> eyre::Result<()> {
             if let Err(e) = genesis_override::set_genesis_hash_override(args.genesis_hash) {
                 tracing::error!("Failed to set genesis hash override: {}", e);
                 return Err(e);
+            }
+
+            // The pruner reads this from the node config's chain spec at launch.
+            if let Some(limit) = args.prune_delete_limit {
+                let mut chain = (*builder.config().chain).clone();
+                chain.inner.prune_delete_limit = limit as usize;
+                builder.config_mut().chain = Arc::new(chain);
+                tracing::info!(limit, "Prune delete limit override set");
             }
 
             if builder.config().rpc.ipcdisable {    
