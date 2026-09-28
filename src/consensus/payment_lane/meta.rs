@@ -6,6 +6,7 @@ use super::{
 };
 use alloy_primitives::{map::HashSet, Address, BlockHash, Bytes, U256};
 use alloy_sol_types::{sol, SolCall};
+use revm::database::BundleState;
 use schnellru::{ByLength, LruMap};
 use std::sync::{Arc, LazyLock, Mutex};
 
@@ -185,6 +186,17 @@ pub(crate) fn cache_get(hash: BlockHash) -> Option<LaneMeta> {
     CACHE.lock().unwrap().get(&hash).cloned()
 }
 
+/// Reuses parent metadata for a finalized local block when its execution bundle
+/// contains no lane-contract entry. Otherwise, children load it normally.
+pub(crate) fn inherit_if_untouched(bundle: &BundleState, parent: BlockHash, child: BlockHash) {
+    if bundle.account(&PAYMENT_LANE_CONTRACT).is_some() {
+        return;
+    }
+    if let Some(meta) = cache_get(parent) {
+        cache_store(child, &meta);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,5 +323,65 @@ mod tests {
         let mut w = PageWalk::default();
         first_page(&mut w);
         assert!(w.finish().is_err());
+    }
+
+    #[test]
+    fn a_built_block_inherits_unless_the_block_changed_the_contract() {
+        use alloy_primitives::B256;
+        use revm::{
+            database::{states::bundle_state::BundleRetention, InMemoryDB, State},
+            state::{Account, AccountInfo, EvmState, EvmStorageSlot},
+            Database, DatabaseCommit,
+        };
+
+        // A read-only call to the deployed contract, then one transaction per written value of
+        // slot 0, which starts at zero.
+        let bundle_after = |writes: &[u64]| {
+            let mut db = InMemoryDB::default();
+            db.insert_account_info(
+                PAYMENT_LANE_CONTRACT,
+                AccountInfo::default()
+                    .with_code(revm::bytecode::Bytecode::new_raw(Bytes::from_static(&[0x00]))),
+            );
+            let mut state = State::builder().with_database(db).with_bundle_update().build();
+            let info = state.basic(PAYMENT_LANE_CONTRACT).unwrap().unwrap();
+            let commit = |state: &mut State<InMemoryDB>, slot: Option<EvmStorageSlot>| {
+                let mut account = Account::from(info.clone());
+                account.mark_touch();
+                account.storage.extend(slot.map(|slot| (U256::ZERO, slot)));
+                state.commit(EvmState::from_iter([(PAYMENT_LANE_CONTRACT, account)]));
+            };
+            commit(&mut state, None);
+            let mut previous = 0;
+            for &value in writes {
+                let slot = EvmStorageSlot::new_changed(U256::from(previous), U256::from(value), 0);
+                commit(&mut state, Some(slot));
+                previous = value;
+            }
+            state.merge_transitions(BundleRetention::Reverts);
+            state.take_bundle()
+        };
+        let listed = Arc::new([Address::repeat_byte(9)].into_iter().collect());
+        let meta = LaneMeta { ratio: 700, listed };
+        let parent = B256::repeat_byte(0xa1);
+        cache_store(parent, &meta);
+        let inherits = |writes: &[u64], parent: B256, child: B256| {
+            inherit_if_untouched(&bundle_after(writes), parent, child);
+            cache_get(child)
+        };
+
+        let inherited = inherits(&[], parent, B256::repeat_byte(0xa2)).expect("read-only inherits");
+        assert_eq!(inherited.ratio, 700);
+        assert!(Arc::ptr_eq(&inherited.listed, &meta.listed), "shared, not copied");
+
+        assert!(inherits(&[1], parent, B256::repeat_byte(0xa3)).is_none(), "a write must skip");
+        assert!(
+            inherits(&[1, 0], parent, B256::repeat_byte(0xa4)).is_some(),
+            "a write undone within the block leaves the parent's state"
+        );
+        assert!(
+            inherits(&[], B256::repeat_byte(0xa5), B256::repeat_byte(0xa6)).is_none(),
+            "nothing to inherit from an uncached parent"
+        );
     }
 }
