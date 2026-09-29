@@ -2869,6 +2869,11 @@ fn finalize_payload(
             final_hash
         );
     }
+    crate::consensus::payment_lane::meta::inherit_if_untouched(
+        &payload.executed_block.execution_output.state,
+        parent_header.hash(),
+        final_hash,
+    );
 
     // Both payload blocks must carry sidecars with the final sealed hash.
     plain_block.body.sidecars = payload.block.body().sidecars.clone();
@@ -3376,9 +3381,21 @@ mod tests {
 
     #[test]
     fn finalize_payload_preserves_sidecars_and_senders() {
+        use crate::consensus::payment_lane::{
+            meta::{cache_get, LaneMeta},
+            state::LaneState,
+            Budget,
+        };
+
         ensure_bid_block_test_signer();
         let parlia = Arc::new(Parlia::new(luban_chain_spec(), 200));
-        let parent_header = SealedHeader::seal_slow(Header::default());
+        let parent_header = SealedHeader::seal_slow(Header {
+            extra_data: alloy_primitives::Bytes::from_static(b"lane-finalization-test"),
+            ..Default::default()
+        });
+        let meta = LaneMeta { ratio: 500, listed: Arc::new(Default::default()) };
+        LaneState::for_test(meta.clone(), Budget::default(), 30_000_000)
+            .inherit_to(parent_header.hash());
         let parent_snap =
             Snapshot::new(vec![Address::with_last_byte(1)], 0, parent_header.hash(), 200, None);
         let snapshot_provider: Arc<dyn crate::consensus::parlia::SnapshotProvider + Send + Sync> =
@@ -3437,6 +3454,9 @@ mod tests {
             assert_eq!(recovered.body(), payload.block.body());
             assert_eq!(recovered.hash(), payload.block.hash());
             assert_ne!(payload.block.hash(), original_hash);
+            let inherited = cache_get(payload.block.hash()).expect("final hash inherits metadata");
+            assert_eq!(inherited.ratio, meta.ratio);
+            assert!(Arc::ptr_eq(&inherited.listed, &meta.listed));
             assert_eq!(recovered.senders(), senders.as_slice());
             if with_sidecars {
                 let sidecars = recovered.body().sidecars.as_ref().unwrap();

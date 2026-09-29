@@ -583,15 +583,25 @@ mod parent_block_env {
     /// An executor positioned on `EPOCH_BLOCK`, with the mock installed at `ValidatorSet` and
     /// `parent_header` set as `check_new_block` sets it.
     fn executor() -> TestExecutor {
-        let spec = Arc::new(BscChainSpec::from(bsc_mainnet()));
-        let header = header_at(EPOCH_BLOCK);
+        executor_over(validator_set_db())
+    }
 
+    fn validator_set_db() -> InMemoryDB {
         let mut db = InMemoryDB::default();
         db.insert_account_info(
             VALIDATOR_CONTRACT,
             AccountInfo::default()
                 .with_code(Bytecode::new_raw(Bytes::from_static(WINDOW_REPORTING_VALIDATOR_SET))),
         );
+        db
+    }
+
+    fn executor_over<DB: alloy_evm::block::StateDB>(
+        db: DB,
+    ) -> BscBlockExecutor<'static, BscEvm<DB, NoOpInspector>, Arc<BscChainSpec>, RethReceiptBuilder>
+    {
+        let spec = Arc::new(BscChainSpec::from(bsc_mainnet()));
+        let header = header_at(EPOCH_BLOCK);
 
         let evm =
             BscEvm::new(evm_env_for_header(&spec, &header), db, NoOpInspector {}, false, false);
@@ -696,6 +706,34 @@ mod parent_block_env {
             ),
             "a code replacement, which changes what the getters mean"
         );
+    }
+
+    /// The miner's inheritance in `finalize_payload` skips on any bundle entry for the lane
+    /// contract, so loading the config must not leave one.
+    #[test]
+    fn lane_getters_leave_no_bundle_record() {
+        use crate::consensus::payment_lane::{LaneParentState, PAYMENT_LANE_CONTRACT};
+        use alloy_evm::Evm as _;
+        use revm::database::{states::bundle_state::BundleRetention, State};
+
+        let mut db = validator_set_db();
+        // PUSH1 0x20 PUSH1 0x00 RETURN: one zero word.
+        db.insert_account_info(
+            PAYMENT_LANE_CONTRACT,
+            AccountInfo::default()
+                .with_code(Bytecode::new_raw(Bytes::from_static(&hex!("60206000f3")))),
+        );
+        let state = State::builder().with_database(db).with_bundle_update().build();
+        let mut executor = executor_over(state);
+
+        let ret = executor
+            .call_lane_getter(PAYMENT_LANE_CONTRACT, Bytes::new())
+            .expect("the getter returns a word");
+        assert_eq!(ret.len(), 32);
+
+        let db = executor.evm.db_mut();
+        db.merge_transitions(BundleRetention::Reverts);
+        assert!(db.take_bundle().account(&PAYMENT_LANE_CONTRACT).is_none());
     }
 
     #[test]
