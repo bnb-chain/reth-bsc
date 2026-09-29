@@ -189,8 +189,6 @@ impl reth_rpc_eth_types::BlockOverridesExt for BscBlockEnv {
     }
 
     fn apply_state_overrides_ext(&mut self, overrides: &StateOverride) -> Result<(), String> {
-        // Empty code is an explicit override too. Keep earlier overrides while a batch
-        // reuses its temporary database; fresh requests/simulated blocks get a fresh env.
         self.disabled_cas20.extend(overrides.iter().filter_map(|(address, account)| {
             (account.code.is_some() && is_cas20_precompile(*address)).then_some(*address)
         }));

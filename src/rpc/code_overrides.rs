@@ -1,7 +1,4 @@
 //! Public RPC code-override support for CAS20 prefix routing.
-//!
-//! Generic call and trace paths also propagate overrides through BscBlockEnv's
-//! state-override hook. Keep these existing public RPC execution paths intact.
 
 use crate::evm::{block_env::BscBlockEnv, precompiles::cas20::is_cas20_precompile};
 use alloy_consensus::BlockHeader;

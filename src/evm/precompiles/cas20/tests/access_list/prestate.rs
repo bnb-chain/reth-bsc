@@ -34,19 +34,12 @@ fn prestate(trace: GethTrace, mux: bool) -> Value {
     }
 }
 
-fn output(trace: &GethTrace) -> &Bytes {
-    match trace {
-        GethTrace::Default(frame) => &frame.return_value,
-        other => panic!("unexpected trace: {other:?}"),
-    }
-}
-
 #[tokio::test]
 async fn debug_calls_run_cas20_code_overrides() {
     let mut h = Harness::new();
     let token = token(&mut h);
     let api = debug!(h.st);
-    // Increment slot zero and return it, so repeated state overrides would be observable.
+    // Increment and return slot zero.
     let code = alloy_primitives::hex!("6000546001018060005560005260206000f3");
     let state = [(
         token,
@@ -62,7 +55,8 @@ async fn debug_calls_run_cas20_code_overrides() {
 
     let trace =
         api.debug_trace_call(request(token, vec![]), None, Some(opts.clone())).await.unwrap();
-    assert_eq!(U256::from_be_slice(output(&trace)), U256::from(1));
+    let output = trace.try_into_default_frame().unwrap().return_value;
+    assert_eq!(U256::from_be_slice(&output), U256::from(1));
 
     let bundle = Bundle {
         transactions: vec![request(token, vec![]), request(token, vec![])],
@@ -71,15 +65,17 @@ async fn debug_calls_run_cas20_code_overrides() {
     let traces =
         api.debug_trace_call_many(vec![bundle.clone(), bundle], None, Some(opts)).await.unwrap();
     assert_eq!(traces.len(), 2);
-    for (index, trace) in traces.iter().flatten().enumerate() {
-        assert_eq!(U256::from_be_slice(output(trace)), U256::from(index + 1));
+    for (index, trace) in traces.into_iter().flatten().enumerate() {
+        let output = trace.try_into_default_frame().unwrap().return_value;
+        assert_eq!(U256::from_be_slice(&output), U256::from(index + 1));
     }
-    // A later trace sees the canonical token and still dispatches to native CAS20.
+    // Overrides must not affect later requests.
     let trace = api
         .debug_trace_call(request(token, call_data(SEL_BALANCE_OF, &[a(ALICE)])), None, None)
         .await
         .unwrap();
-    assert_eq!(U256::from_be_slice(output(&trace)), U256::from(123));
+    let output = trace.try_into_default_frame().unwrap().return_value;
+    assert_eq!(U256::from_be_slice(&output), U256::from(123));
 }
 
 #[tokio::test]
