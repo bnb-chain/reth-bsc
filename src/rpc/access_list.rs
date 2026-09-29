@@ -14,7 +14,7 @@ use reth_rpc_eth_api::{
     helpers::{EthCall, Trace},
     FromEvmError,
 };
-use reth_rpc_eth_types::{error::FromEthApiError, BlockOverridesExt, EthApiError};
+use reth_rpc_eth_types::{error::FromEthApiError, BlockOverridesExt};
 use revm::{context::Block, context_interface::Transaction};
 use revm_inspectors::access_list::AccessListInspector;
 
@@ -47,15 +47,14 @@ where
     ) -> RpcResult<AccessListResult> {
         let (mut env, at) =
             self.0.evm_env_at(block.unwrap_or_default()).await.map_err(Into::into)?;
+        env.block_env.disabled_cas20 =
+            super::code_overrides::code_overridden_addresses(state_override.as_ref());
         // Keep reth's request preparation and second execution for accurate gasUsed.
         self.0
             .spawn_with_state(Some(at), move |eth, state| {
                 let mut db =
                     State::builder().with_database(StateProviderDatabase::new(state)).build();
                 if let Some(overrides) = state_override {
-                    env.block_env
-                        .apply_state_overrides_ext(&overrides)
-                        .map_err(EthApiError::InvalidParams)?;
                     apply_state_overrides(overrides, &mut db).map_err(Eth::Error::from_eth_err)?;
                 }
                 let has_gas = request.gas.is_some();

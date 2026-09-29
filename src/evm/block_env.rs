@@ -2,10 +2,8 @@ use crate::evm::precompiles::cas20::is_cas20_precompile;
 use alloy_evm::env::BlockEnvironment;
 use alloy_primitives::{Address, B256, U256};
 use alloy_rpc_types_eth::state::StateOverride;
-use revm::{
-    context::{Block, BlockEnv},
-    context_interface::block::BlobExcessGasAndPrice,
-};
+use revm::context::{Block, BlockEnv};
+use revm::context_interface::block::BlobExcessGasAndPrice;
 use std::ops::{Deref, DerefMut};
 
 /// BSC block environment: revm's [`BlockEnv`] plus the sub-second millisecond
@@ -161,13 +159,15 @@ pub fn bsc_milli_remainder(prev_randao: &B256) -> Result<u64, String> {
 /// after `apply_block_overrides` wrote the standard fields into `inner`, so the
 /// seconds are already the post-override value:
 ///
-/// - `time` override → the sub-second remainder resets to `.000` (`BlockOverrides` has no
-///   millisecond field; a simultaneous `prevRandao` override supplies the remainder below);
-/// - `prevRandao` override → the value **is** the millisecond remainder: validated (`< 1000`,
-///   mirroring the consensus rule on real headers, rejected otherwise so callers cannot pass
-///   arbitrary random values) and assembled into the millisecond timestamp served by the BEP-706
-///   precompile (`time * 1000 + prevRandao`). `prevrandao` itself (the `0x44` opcode view) was
-///   already replaced by `apply_block_overrides` and stays replaced.
+/// - `time` override → the sub-second remainder resets to `.000`
+///   (`BlockOverrides` has no millisecond field; a simultaneous `prevRandao`
+///   override supplies the remainder below);
+/// - `prevRandao` override → the value **is** the millisecond remainder:
+///   validated (`< 1000`, mirroring the consensus rule on real headers,
+///   rejected otherwise so callers cannot pass arbitrary random values) and
+///   assembled into the millisecond timestamp served by the BEP-706 precompile
+///   (`time * 1000 + prevRandao`). `prevrandao` itself (the `0x44` opcode
+///   view) was already replaced by `apply_block_overrides` and stays replaced.
 ///
 /// Each override applies independently: pass one and only it takes effect,
 /// pass both and both do. The validation is client-default behavior — it is
@@ -250,7 +250,11 @@ mod tests {
     /// `apply_block_overrides` only needs `OverrideBlockHashes` from the db.
     struct NoopHashes;
     impl alloy_evm::overrides::OverrideBlockHashes for NoopHashes {
-        fn override_block_hashes(&mut self, _hashes: std::collections::BTreeMap<u64, B256>) {}
+        fn override_block_hashes(
+            &mut self,
+            _hashes: std::collections::BTreeMap<u64, B256>,
+        ) {
+        }
     }
 
     /// Runs the standard apply + BSC hook, exactly in reth's call order.
@@ -286,7 +290,8 @@ mod tests {
     fn test_prev_randao_override_sets_remainder_on_original_seconds() {
         // Scenario 4: `prevRandao` alone — remainder replaced, seconds kept.
         let mut e = env(SECS, REMAINDER);
-        apply(&mut e, BlockOverrides { random: Some(randao(123)), ..Default::default() }).unwrap();
+        apply(&mut e, BlockOverrides { random: Some(randao(123)), ..Default::default() })
+            .unwrap();
         assert_eq!(e.milli_timestamp(), SECS * 1000 + 123);
         // `Random` is still replaced (0x44 serves the override), go parity.
         assert_eq!(e.inner.prevrandao, Some(randao(123)));
@@ -314,10 +319,12 @@ mod tests {
     fn test_prev_randao_at_bound_is_rejected() {
         // Scenario 6: >= 1000 must be rejected with the go-parity message.
         let mut e = env(SECS, REMAINDER);
-        let err =
-            apply(&mut e, BlockOverrides { random: Some(randao(1000)), ..Default::default() })
-                .unwrap_err();
-        assert!(err.contains("must be less than 1000, got 1000"), "unexpected message: {err}");
+        let err = apply(&mut e, BlockOverrides { random: Some(randao(1000)), ..Default::default() })
+            .unwrap_err();
+        assert!(
+            err.contains("must be less than 1000, got 1000"),
+            "unexpected message: {err}"
+        );
     }
 
     #[test]
@@ -330,9 +337,11 @@ mod tests {
         let mut bytes = [0u8; 32];
         bytes[23] = 0x01; // 2^64
         bytes[31] = 0x7b; // low bits decode to 123 < 1000
-        let err =
-            apply(&mut e, BlockOverrides { random: Some(B256::from(bytes)), ..Default::default() })
-                .unwrap_err();
+        let err = apply(
+            &mut e,
+            BlockOverrides { random: Some(B256::from(bytes)), ..Default::default() },
+        )
+        .unwrap_err();
         assert!(err.contains("must be less than 1000"), "unexpected message: {err}");
         assert!(err.contains("18446744073709551739"), "must report the full value: {err}");
     }
