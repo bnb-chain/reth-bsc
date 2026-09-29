@@ -1,6 +1,7 @@
 use super::*;
 use crate::rpc::prestate::{BscPrestateApiImpl, BscPrestateApiServer};
 use alloy_rpc_types::trace::geth::{GethDebugTracingCallOptions, GethTrace};
+use alloy_rpc_types_eth::Bundle;
 use serde_json::{json, Value};
 
 macro_rules! debug {
@@ -31,6 +32,54 @@ fn prestate(trace: GethTrace, mux: bool) -> Value {
     } else {
         trace
     }
+}
+
+fn output(trace: &GethTrace) -> &Bytes {
+    match trace {
+        GethTrace::Default(frame) => &frame.return_value,
+        other => panic!("unexpected trace: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn debug_calls_run_cas20_code_overrides() {
+    let mut h = Harness::new();
+    let token = token(&mut h);
+    let api = debug!(h.st);
+    // Increment slot zero and return it, so repeated state overrides would be observable.
+    let code = alloy_primitives::hex!("6000546001018060005560005260206000f3");
+    let state = [(
+        token,
+        AccountOverride {
+            code: Some(Bytes::copy_from_slice(&code)),
+            state_diff: Some([(B256::ZERO, B256::ZERO)].into_iter().collect()),
+            ..Default::default()
+        },
+    )]
+    .into_iter()
+    .collect();
+    let opts = GethDebugTracingCallOptions { state_overrides: Some(state), ..Default::default() };
+
+    let trace =
+        api.debug_trace_call(request(token, vec![]), None, Some(opts.clone())).await.unwrap();
+    assert_eq!(U256::from_be_slice(output(&trace)), U256::from(1));
+
+    let bundle = Bundle {
+        transactions: vec![request(token, vec![]), request(token, vec![])],
+        block_override: None,
+    };
+    let traces =
+        api.debug_trace_call_many(vec![bundle.clone(), bundle], None, Some(opts)).await.unwrap();
+    assert_eq!(traces.len(), 2);
+    for (index, trace) in traces.iter().flatten().enumerate() {
+        assert_eq!(U256::from_be_slice(output(trace)), U256::from(index + 1));
+    }
+    // A later trace sees the canonical token and still dispatches to native CAS20.
+    let trace = api
+        .debug_trace_call(request(token, call_data(SEL_BALANCE_OF, &[a(ALICE)])), None, None)
+        .await
+        .unwrap();
+    assert_eq!(U256::from_be_slice(output(&trace)), U256::from(123));
 }
 
 #[tokio::test]

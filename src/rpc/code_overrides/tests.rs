@@ -11,11 +11,13 @@ use crate::{
     },
     rpc::access_list::{BscAccessListApiImpl, BscAccessListApiServer},
 };
-use alloy_primitives::{address, hex, keccak256};
-use alloy_rpc_types_eth::state::AccountOverride;
+use alloy_primitives::{address, hex, keccak256, map::HashSet, Address, B256};
+use alloy_rpc_types::trace::parity::TraceType;
+use alloy_rpc_types_eth::{simulate::SimBlock, state::AccountOverride};
 use reth_chainspec::ForkCondition;
 use reth_network_api::noop::NoopNetwork;
 use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
+use reth_rpc_eth_api::EthApiServer;
 use reth_transaction_pool::test_utils::testing_pool;
 use std::sync::Arc;
 
@@ -116,6 +118,59 @@ async fn code_override_runs_on_every_cas20_route_through_rpc() {
         assert!(list.error.is_none(), "{target}: {:?}", list.error);
         assert!(list.access_list.0.is_empty());
     }
+}
+
+#[tokio::test]
+async fn generic_eth_and_trace_calls_run_cas20_code_overrides() {
+    let (api, hash) = rpc!(NOW - 1);
+    let trace = reth_rpc::TraceApi::new(
+        api.0.clone(),
+        reth_tasks::pool::BlockingTaskGuard::new(1),
+        Default::default(),
+    );
+    for target in TARGETS {
+        for code in [RETURNS_42, &[]] {
+            let req = request(target, &[]);
+            let state = overrides(target, code);
+            // The authenticated module uses the generic handler, without the public BSC adapter.
+            let out = EthApiServer::call(
+                &api.0,
+                req.clone(),
+                Some(hash.into()),
+                Some(state.clone()),
+                None,
+            )
+            .await
+            .unwrap();
+            let traced = reth::rpc::api::TraceApiServer::trace_call(
+                &trace,
+                req,
+                HashSet::from_iter([TraceType::Trace]),
+                Some(hash.into()),
+                Some(state),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(traced.output, out, "{target}");
+            if code.is_empty() {
+                assert!(out.is_empty(), "{target}");
+            } else {
+                assert_eq!(value(&out), U256::from(42), "{target}");
+            }
+        }
+    }
+    // Request-local routing and bytecode must not leak into later calls.
+    let out = EthApiServer::call(
+        &api.0,
+        request(TOKEN, &hex!("18160ddd")),
+        Some(hash.into()),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(value(&out), U256::ZERO);
 }
 
 #[tokio::test]
