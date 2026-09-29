@@ -338,7 +338,7 @@ pub struct BscBlockchainMetrics {
     /// Size of transactions in the current block in bytes (equivalent to chain/insert/txsize)
     pub block_tx_size_bytes: Gauge,
 
-    /// Total number of chain reorganizations executed (equivalent to chain/reorg/executes)
+    /// Canonical reorganizations applied by the engine (equivalent to chain/reorg/executes).
     pub reorg_executions_total: Counter,
 
     /// Total number of blocks added during reorganizations (equivalent to chain/reorg/add)
@@ -347,7 +347,7 @@ pub struct BscBlockchainMetrics {
     /// Total number of blocks dropped during reorganizations (equivalent to chain/reorg/drop)
     pub reorg_blocks_dropped_total: Counter,
 
-    /// Depth of the latest chain reorganization
+    /// Number of old canonical blocks removed by the latest reorganization.
     pub latest_reorg_depth: Gauge,
 }
 
