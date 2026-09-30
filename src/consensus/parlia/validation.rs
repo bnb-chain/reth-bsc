@@ -26,18 +26,22 @@ pub const fn validate_header_gas(header: &Header) -> Result<(), ConsensusError> 
     Ok(())
 }
 
-/// Ensure the EIP-1559 base fee is set if the London hardfork is active.
+/// Ensure the base fee is absent before London and zero from London on.
 #[inline]
 pub fn validate_header_base_fee<ChainSpec: EthereumHardforks>(
     header: &Header,
     chain_spec: &ChainSpec,
 ) -> Result<(), ConsensusError> {
-    if chain_spec.is_ethereum_fork_active_at_block(EthereumHardfork::London, header.number) &&
-        header.base_fee_per_gas.is_none()
-    {
-        return Err(ConsensusError::BaseFeeMissing)
+    let london =
+        chain_spec.is_ethereum_fork_active_at_block(EthereumHardfork::London, header.number);
+    match (london, header.base_fee_per_gas) {
+        (false, None) | (true, Some(0)) => Ok(()),
+        (false, Some(got)) => Err(ConsensusError::msg(format!(
+            "invalid baseFee before fork: have {got}, expected 'nil'"
+        ))),
+        (true, None) => Err(ConsensusError::BaseFeeMissing),
+        (true, Some(got)) => Err(ConsensusError::BaseFeeDiff(GotExpected { got, expected: 0 })),
     }
-    Ok(())
 }
 
 /// Validate the 4844 header of BSC block.
@@ -201,39 +205,20 @@ impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 's
     /// bound: go-bsc applies that only in `verifyHeader` (the sync path), never to
     /// builder-submitted BidBlock headers, whose next-slot timestamp is legitimately a few
     /// hundred milliseconds ahead of the validator's clock at admission time.
+    ///
+    /// Extra data is left to the callers, since a BidBlock's is replaced by the validator's.
+    /// The other checks run in go-bsc's order.
     pub fn validate_unsealed_header_fields(
         &self,
         header: &SealedHeader,
     ) -> Result<(), ConsensusError> {
-        // Check extra data
-        self.check_header_extra(header).map_err(|e| ConsensusError::Other(Arc::new(std::io::Error::other(format!("Invalid header extra: {e}")))))?;
-
-        // Ensure that the block with no uncles
-        if header.ommers_hash != EMPTY_OMMER_ROOT_HASH {
-            return Err(ConsensusError::BodyOmmersHashDiff(
-                GotExpected { got: header.ommers_hash, expected: EMPTY_OMMER_ROOT_HASH }.into(),
-            ));
-        }
-
-        validate_header_gas(header)?;
-        validate_header_base_fee(header, &self.spec)?;
-
-        let cancun_active =
-            BscHardforks::is_cancun_active_at_timestamp(&*self.spec, header.number, header.timestamp);
-        validate_withdrawals_root_for_bsc(header, cancun_active)?;
-
-        // Ensures that EIP-4844 fields are valid once cancun is active.
-        if cancun_active {
-            validate_4844_header_of_bsc(header, &*self.spec)?;
-        } else if header.blob_gas_used.is_some() {
-            return Err(ConsensusError::BlobGasUsedUnexpected)
-        } else if header.excess_blob_gas.is_some() {
-            return Err(ConsensusError::ExcessBlobGasUnexpected)
-        }
-
         let lorentz_active =
             self.spec.is_lorentz_active_at_timestamp(header.number, header.timestamp);
         validate_mix_digest_for_parlia(header, lorentz_active)?;
+
+        if header.ommers_hash != EMPTY_OMMER_ROOT_HASH {
+            return Err(ConsensusError::msg("non empty uncle hash"));
+        }
 
         if self.spec.is_bohr_active_at_timestamp(header.number, header.timestamp) {
             if header.parent_beacon_block_root.is_none() ||
@@ -251,7 +236,27 @@ impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 's
 
         validate_optional_trailing_fields_for_bsc(header)?;
 
-       Ok(())
+        validate_header_base_fee(header, &self.spec)?;
+
+        let cancun_active = BscHardforks::is_cancun_active_at_timestamp(
+            &*self.spec,
+            header.number,
+            header.timestamp,
+        );
+        if !cancun_active {
+            if header.excess_blob_gas.is_some() {
+                return Err(ConsensusError::ExcessBlobGasUnexpected)
+            }
+            if header.blob_gas_used.is_some() {
+                return Err(ConsensusError::BlobGasUsedUnexpected)
+            }
+        }
+        validate_withdrawals_root_for_bsc(header, cancun_active)?;
+        if cancun_active {
+            validate_4844_header_of_bsc(header, &*self.spec)?;
+        }
+
+        validate_header_gas(header)
     }
 }
 
@@ -261,6 +266,8 @@ impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 's
         // `verifyHeader`; the BidBlock path uses `validate_unsealed_header_fields` directly).
         validate_header_not_from_future(header, present_unix_seconds())?;
 
+        self.check_header_extra(header)
+            .map_err(|e| ConsensusError::msg(format!("Invalid header extra: {e}")))?;
         self.validate_unsealed_header_fields(header)
     }
 
@@ -391,6 +398,43 @@ mod tests {
     }
 
     #[test]
+    fn base_fee_is_nil_before_london_and_zero_after() {
+        let spec = crate::chainspec::bsc::bsc_mainnet();
+        let check = |number, base_fee_per_gas| {
+            validate_header_base_fee(
+                &Header { number, base_fee_per_gas, ..Default::default() },
+                &spec,
+            )
+        };
+        let london = 31_302_048;
+
+        assert!(check(london - 1, None).is_ok());
+        assert!(check(london - 1, Some(0)).is_err());
+        assert!(check(london, Some(0)).is_ok());
+        assert!(matches!(check(london, None), Err(ConsensusError::BaseFeeMissing)));
+        assert!(matches!(check(london, Some(1)), Err(ConsensusError::BaseFeeDiff(_))));
+    }
+
+    #[test]
+    fn unsealed_header_fields_follow_go_bsc_order() {
+        use crate::chainspec::BscChainSpec;
+        use reth_chainspec::ChainSpecBuilder;
+        let parlia =
+            Parlia::new(Arc::new(BscChainSpec::from(ChainSpecBuilder::mainnet().build())), 200);
+        let first_error = |header| {
+            parlia.validate_unsealed_header_fields(&sealed(header)).unwrap_err().to_string()
+        };
+        let bad_uncle_and_gas =
+            Header { number: 1, ommers_hash: B256::ZERO, gas_used: 1, ..Default::default() };
+
+        assert_eq!(first_error(bad_uncle_and_gas.clone()), "non empty uncle hash");
+        assert_eq!(
+            first_error(Header { mix_hash: B256::from([1u8; 32]), ..bad_uncle_and_gas }),
+            "non-zero mix digest"
+        );
+    }
+
+    #[test]
     fn cancun_requires_empty_withdrawals_root() {
         let header = sealed(Header::default());
         assert!(matches!(
@@ -491,7 +535,6 @@ mod tests {
             timestamp: 1_600_000_000,
             extra_data: vec![0u8; 97].into(),
             ommers_hash: EMPTY_OMMER_ROOT_HASH,
-            base_fee_per_gas: Some(0),
             ..Default::default()
         };
         parlia

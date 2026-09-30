@@ -19,6 +19,7 @@ use crate::consensus::parlia::{
     Snapshot, SnapshotProvider,
 };
 use crate::hardforks::BscHardforks;
+use crate::node::consensus::BscConsensus;
 use crate::node::miner::block_mev_info::{set_block_mev_info, BlockMevInfoVersion};
 use crate::node::miner::signer::sign_system_transaction;
 use crate::node::evm::pre_execution::EpochValidators;
@@ -29,6 +30,7 @@ use alloy_consensus::{Header, Transaction, TxLegacy};
 use alloy_eips::eip2718::Decodable2718;
 use alloy_primitives::{keccak256, Address, Bytes, Signature, B256, U256};
 use alloy_rlp::{Decodable, Encodable};
+use reth::consensus::HeaderValidator;
 use reth::primitives::SealedHeader;
 use reth_chainspec::EthChainSpec;
 use reth_ethereum_primitives::{BlockBody, TransactionSigned};
@@ -545,8 +547,8 @@ pub fn validate_bid_block_average_gas_price<R: alloy_consensus::TxReceipt>(
 /// state root is non-zero, coinbase is the validator, gas limit matches the in-turn target, the
 /// header is a valid unsealed Parlia header, the timestamp is within the slot, the deposit
 /// (gas-fee) value is non-zero, blob sidecars are well-formed, no user tx exceeds the per-tx gas
-/// cap, and the trailing system-tx region is valid. KZG proofs and parent-relative cascading fields
-/// are re-checked at block insertion. Returns the located `(system_tx_start, gas_fee)`.
+/// cap, and the trailing system-tx region is valid. KZG proofs are checked at block insertion.
+/// Returns the located `(system_tx_start, gas_fee)`.
 ///
 /// `expected_gas_limit` is the caller's `calculate_block_gas_limit(parent.gas_limit, ceil)` (reth's
 /// `core.CalcGasLimit`); `etherbase` is the validator address; `snap` is the parent's snapshot.
@@ -569,16 +571,17 @@ pub fn pre_seal_verify_bid_block(
     // too, so a header with a *wrong* coinbase must surface `InvalidCoinbase`, not
     // `UnauthorizedValidator`, matching which error go-bsc would return first.
     verify_bid_block_coinbase_and_gas_limit(&decoded.header, etherbase, expected_gas_limit)?;
-    verify_bid_block_header(parlia, &decoded.header, parent, snap)?;
+    verify_bid_block_header(parlia, &mev_tagged_header(chain_spec, decoded), parent, snap)?;
     verify_bid_block_payload(chain_spec, decoded, parent, etherbase, expected_gas_limit)
 }
 
 /// Header half of [`pre_seal_verify_bid_block`]: the unsealed Parlia header-field checks
-/// (`validate_header`: extra, ommers, gas, base fee, withdrawals, 4844, mix digest, beacon root,
-/// requests hash), the cascading fields go-bsc's `VerifyUnsealedHeader` checks against the parent
-/// snapshot (coinbase is an authorized, not-recently-signed validator; difficulty matches its
-/// in-turn/no-turn status), and the slot timestamp bound (both directions: the existing upper
-/// bound plus go-bsc's `blockTimeVerifyForRamanujanFork` lower bound).
+/// (mix digest, ommers, beacon root, requests hash, base fee, withdrawals, 4844, gas), the
+/// cascading fields go-bsc's `VerifyUnsealedHeader` checks against the parent snapshot (coinbase
+/// is an authorized, not-recently-signed validator; difficulty matches its in-turn/no-turn
+/// status), the block-import checks against the parent, and the slot timestamp bound (both
+/// directions: the existing upper bound plus go-bsc's `blockTimeVerifyForRamanujanFork` lower
+/// bound). Extra data is not checked: the builder's is replaced by the validator's.
 ///
 /// The cascading checks use `header.beneficiary` directly rather than recovering a seal signer:
 /// go-bsc's function is explicitly named "Unsealed" because it runs on headers that may not carry
@@ -587,7 +590,7 @@ pub fn pre_seal_verify_bid_block(
 /// itself happens later, when the finalized block is executed on import.
 ///
 /// Split out because it must also run on the **finalized** header (which carries the validator's
-/// extra and seal) after `finalize_new_header`, to confirm that step didn't itself produce an
+/// seal) after `finalize_new_header`, to confirm that step didn't itself produce an
 /// invalid header, whereas [`verify_bid_block_payload`] must run **before** finalize (its
 /// `system_tx_start` feeds bind-signing, which mutates the tx set and therefore must precede
 /// finalize).
@@ -598,10 +601,6 @@ pub fn verify_bid_block_header(
     snap: &Snapshot,
 ) -> Result<(), PreSealVerifyError> {
     let sealed = SealedHeader::seal_slow(header.clone());
-    // go-bsc's `VerifyUnsealedHeader` scope: the standalone field checks WITHOUT the
-    // wall-clock future bound — a bid's next-slot timestamp is legitimately in the future
-    // (by up to one block interval) when it arrives, and geth only applies the future check
-    // on the sync path (`verifyHeader`).
     parlia
         .validate_unsealed_header_fields(&sealed)
         .map_err(|e| PreSealVerifyError::InvalidHeader(e.to_string()))?;
@@ -623,6 +622,9 @@ pub fn verify_bid_block_header(
 
     parlia
         .block_time_verify_for_ramanujan_fork(snap, header, parent)
+        .map_err(|e| PreSealVerifyError::InvalidHeader(e.to_string()))?;
+    BscConsensus::new(parlia.spec.clone())
+        .validate_header_against_parent(&sealed, &SealedHeader::seal_slow(parent.clone()))
         .map_err(|e| PreSealVerifyError::InvalidHeader(e.to_string()))?;
     parlia
         .block_time_upper_check(snap, header, parent)
@@ -771,13 +773,13 @@ impl fmt::Display for PreSealVerifyError {
             }
             Self::InvalidHeader(detail) => write!(f, "invalid header: {detail}"),
             Self::UnauthorizedValidator { validator } => {
-                write!(f, "unauthorized validator: {validator}")
+                write!(f, "invalid header: unauthorized validator: {validator}")
             }
             Self::SignedTooRecently { validator } => {
-                write!(f, "validator {validator} signed recently")
+                write!(f, "invalid header: validator {validator} signed recently")
             }
             Self::WrongDifficulty { got, want } => {
-                write!(f, "wrong difficulty: got {got}, want {want}")
+                write!(f, "invalid header: wrong difficulty: got {got}, want {want}")
             }
             Self::EmptyGasFee => write!(f, "empty gasFee"),
             Self::TxRootMismatch { got, want } => {
@@ -920,6 +922,15 @@ pub fn set_bid_block_mev_info(header: &mut Header, builder: Address, prague_acti
     set_block_mev_info(header, BlockMevInfoVersion::BidBlock, builder, prague_active);
 }
 
+/// The bid's header as go-bsc `setBidMevInfo` leaves it; the bid (and its hash) is untouched.
+fn mev_tagged_header(chain_spec: &BscChainSpec, decoded: &DecodedBidBlock) -> Header {
+    let mut header = decoded.header.clone();
+    let prague_active =
+        chain_spec.is_prague_active_at_block_and_timestamp(header.number, header.timestamp);
+    set_bid_block_mev_info(&mut header, decoded.builder, prague_active);
+    header
+}
+
 /// Validator-side simulation of an admitted BidBlock: payload-verify, blind-sign the trailing system
 /// txs, install the validator's own block context (its extra + the recomputed tx root), finalize and
 /// seal the header — producing the consensus-valid block the validator would propose.
@@ -956,13 +967,9 @@ pub fn simulate_bid_block(
     // Install the validator's block context: its own extra (vanity; finalize appends the seal slot)
     // and the tx root for the now-signed tx set. Other block-context fields are left as the builder
     // set them so the re-executed state root matches.
-    let mut header = decoded.header.clone();
+    let mut header = mev_tagged_header(chain_spec, decoded);
     header.extra_data = vanity;
     header.transactions_root = alloy_consensus::proofs::calculate_transaction_root(&txs);
-    // Tag the header with BEP-675 BidBlock MEV info (go-bsc setBidMevInfo).
-    let prague_active =
-        chain_spec.is_prague_active_at_block_and_timestamp(header.number, header.timestamp);
-    set_bid_block_mev_info(&mut header, decoded.builder, prague_active);
 
     finalize_new_header(
         parlia.clone(),
@@ -976,7 +983,10 @@ pub fn simulate_bid_block(
     .map_err(|e| SimulateBidBlockError::Finalize(e.to_string()))?;
 
     // The finalized (sealed) header must pass the unsealed-header + slot-time checks.
-    verify_bid_block_header(&parlia, &header, parent.header(), parent_snap)
+    parlia
+        .check_header_extra(&header)
+        .map_err(|e| PreSealVerifyError::InvalidHeader(e.to_string()))
+        .and_then(|()| verify_bid_block_header(&parlia, &header, parent.header(), parent_snap))
         .map_err(SimulateBidBlockError::Verify)?;
 
     let senders = txs
@@ -1519,12 +1529,18 @@ mod tests {
         snap
     }
 
+    /// The block-0 parent every `pre_seal_*` fixture builds on.
+    fn preseal_parent() -> Header {
+        Header { number: 0, timestamp: 1, gas_limit: 30_000_000, ..Default::default() }
+    }
+
     /// A valid unsealed Parlia header for block 1: in-turn validator coinbase, EIP-1559/Cancun/etc.
     /// fields all absent (pre-fork), extra = 32-byte vanity + 65-byte seal slot (non-epoch).
     fn valid_bid_header(etherbase: Address, gas_limit: u64) -> Header {
         Header {
             number: 1,
-            timestamp: 1,
+            parent_hash: preseal_parent().hash_slow(),
+            timestamp: 2,
             beneficiary: etherbase,
             gas_limit,
             gas_used: 21_000,
@@ -1616,7 +1632,7 @@ mod tests {
         // `simulate_bid_block` would overwrite the root to match the forged body, leaving no trace.
         let spec = preseal_spec();
         let etherbase = Address::repeat_byte(0x11);
-        let parent = Header { number: 0, timestamp: 1, gas_limit: 30_000_000, ..Default::default() };
+        let parent = preseal_parent();
         let txs = vec![legacy_tx(0), deposit_system_tx(100)];
         let mut d = decoded_block(valid_bid_header(etherbase, 30_000_000), txs, vec![]);
 
@@ -1666,7 +1682,7 @@ mod tests {
         let parlia = parlia_engine(spec.clone());
         let snap = snap_with_interval(3_000);
         let header = valid_bid_header(etherbase, 30_000_000);
-        let parent = Header { number: 0, timestamp: 1, gas_limit: 30_000_000, ..Default::default() };
+        let parent = preseal_parent();
         // user tx (signed, non-system) then a trailing unsigned deposit tx carrying the gas fee.
         let txs = vec![legacy_tx(0), deposit_system_tx(100)];
         let d = decoded_block(header.clone(), txs, vec![]);
@@ -1694,7 +1710,7 @@ mod tests {
         // win because it is the first pre-seal check.
         let mut header = valid_bid_header(Address::repeat_byte(0x22), 30_000_000);
         header.state_root = B256::ZERO;
-        let parent = Header { number: 0, timestamp: 1, gas_limit: 30_000_000, ..Default::default() };
+        let parent = preseal_parent();
         let d = decoded_block(header, vec![], vec![]);
 
         assert_eq!(
@@ -1718,7 +1734,7 @@ mod tests {
         let snap = snap_with_interval(3_000);
         let etherbase = Address::repeat_byte(0x11);
         let header = valid_bid_header(Address::repeat_byte(0x22), 30_000_000);
-        let parent = Header { number: 0, timestamp: 1, gas_limit: 30_000_000, ..Default::default() };
+        let parent = preseal_parent();
         let d = decoded_block(header, vec![], vec![]);
         assert!(matches!(
             pre_seal_verify_bid_block(&parlia, &spec, &d, &parent, &snap, etherbase, 30_000_000),
@@ -1733,7 +1749,7 @@ mod tests {
         let snap = snap_with_interval(3_000);
         let etherbase = Address::repeat_byte(0x11);
         let header = valid_bid_header(etherbase, 30_000_000);
-        let parent = Header { number: 0, timestamp: 1, gas_limit: 30_000_000, ..Default::default() };
+        let parent = preseal_parent();
         let d = decoded_block(header, vec![], vec![]);
         assert!(matches!(
             pre_seal_verify_bid_block(&parlia, &spec, &d, &parent, &snap, etherbase, 29_000_000),
@@ -1757,7 +1773,7 @@ mod tests {
             s
         };
         let header = valid_bid_header(etherbase, 30_000_000);
-        let parent = Header { number: 0, timestamp: 1, gas_limit: 30_000_000, ..Default::default() };
+        let parent = preseal_parent();
         let d = decoded_block(header, vec![], vec![]);
         assert_eq!(
             pre_seal_verify_bid_block(&parlia, &spec, &d, &parent, &snap, etherbase, 30_000_000),
@@ -1777,7 +1793,7 @@ mod tests {
         // (0 here, since the snapshot's block_number is 0); block 0 itself would be skipped.
         snap.recent_proposers.insert(1, etherbase);
         let header = valid_bid_header(etherbase, 30_000_000);
-        let parent = Header { number: 0, timestamp: 1, gas_limit: 30_000_000, ..Default::default() };
+        let parent = preseal_parent();
         let d = decoded_block(header, vec![], vec![]);
         assert_eq!(
             pre_seal_verify_bid_block(&parlia, &spec, &d, &parent, &snap, etherbase, 30_000_000),
@@ -1793,11 +1809,43 @@ mod tests {
         let etherbase = Address::repeat_byte(0x11);
         let snap = snap_with_interval(3_000);
         let header = Header { difficulty: DIFF_NOTURN, ..valid_bid_header(etherbase, 30_000_000) };
-        let parent = Header { number: 0, timestamp: 1, gas_limit: 30_000_000, ..Default::default() };
+        let parent = preseal_parent();
         let d = decoded_block(header, vec![], vec![]);
         assert_eq!(
             pre_seal_verify_bid_block(&parlia, &spec, &d, &parent, &snap, etherbase, 30_000_000),
             Err(PreSealVerifyError::WrongDifficulty { got: DIFF_NOTURN, want: DIFF_INTURN })
+        );
+    }
+
+    #[test]
+    fn pre_seal_checks_header_before_tx_root() {
+        let spec = preseal_spec();
+        let parlia = parlia_engine(spec.clone());
+        let etherbase = Address::repeat_byte(0x11);
+        let snap = snap_with_interval(3_000);
+        let parent = preseal_parent();
+        let txs = vec![legacy_tx(0), deposit_system_tx(100)];
+        let mut d = decoded_block(valid_bid_header(etherbase, 30_000_000), txs, vec![]);
+        d.header.ommers_hash = B256::ZERO;
+        d.header.transactions_root = B256::ZERO;
+        let err =
+            pre_seal_verify_bid_block(&parlia, &spec, &d, &parent, &snap, etherbase, 30_000_000)
+                .unwrap_err();
+        assert_eq!(err.to_string(), "invalid header: non empty uncle hash");
+    }
+
+    #[test]
+    fn pre_seal_ignores_the_builder_extra() {
+        let spec = preseal_spec();
+        let parlia = parlia_engine(spec.clone());
+        let etherbase = Address::repeat_byte(0x11);
+        let snap = snap_with_interval(3_000);
+        let parent = preseal_parent();
+        let header = Header { extra_data: Bytes::new(), ..valid_bid_header(etherbase, 30_000_000) };
+        let d = decoded_block(header, vec![legacy_tx(0), deposit_system_tx(100)], vec![]);
+        assert_eq!(
+            pre_seal_verify_bid_block(&parlia, &spec, &d, &parent, &snap, etherbase, 30_000_000),
+            Ok((1, U256::from(100)))
         );
     }
 
@@ -1808,7 +1856,7 @@ mod tests {
         let parlia = parlia_engine(spec.clone());
         let snap = snap_with_interval(3_000);
         let header = valid_bid_header(etherbase, 30_000_000);
-        let parent = Header { number: 0, timestamp: 1, gas_limit: 30_000_000, ..Default::default() };
+        let parent = preseal_parent();
         // deposit value 0 => gas fee is zero.
         let txs = vec![legacy_tx(0), deposit_system_tx(0)];
         let d = decoded_block(header.clone(), txs, vec![]);
@@ -1833,7 +1881,7 @@ mod tests {
         let spec = preseal_spec();
         let etherbase = Address::repeat_byte(0x11);
         let header = valid_bid_header(etherbase, 30_000_000);
-        let parent = Header { number: 0, timestamp: 1, gas_limit: 30_000_000, ..Default::default() };
+        let parent = preseal_parent();
         let txs = vec![legacy_tx(0), deposit_system_tx(100)];
         let d = decoded_block(header.clone(), txs, vec![]);
         assert_eq!(
@@ -1946,7 +1994,7 @@ mod tests {
         let chain_spec = std::sync::Arc::new(preseal_spec());
         let parlia = std::sync::Arc::new(Parlia::new(chain_spec.clone(), 200));
 
-        let parent_header = Header { number: 0, timestamp: 1, gas_limit: 30_000_000, ..Default::default() };
+        let parent_header = preseal_parent();
         let parent = SealedHeader::new(parent_header.clone(), parent_header.hash_slow());
         let mut snap = Snapshot::new(vec![validator], 0, parent.hash(), 200, None);
         snap.block_interval = 3_000;
