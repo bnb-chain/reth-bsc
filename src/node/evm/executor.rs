@@ -8,7 +8,11 @@ use crate::{
         parlia::{Parlia, Snapshot, VoteAddress},
         SYSTEM_ADDRESS,
     },
-    evm::{precompiles, transaction::BscTxEnv},
+    evm::{
+        blacklist::{self, BlacklistedAddressError},
+        precompiles,
+        transaction::BscTxEnv,
+    },
     hardforks::BscHardforks,
     metrics::{
         BscBlockchainMetrics, BscConsensusMetrics, BscExecutorMetrics, BscRewardsMetrics,
@@ -783,6 +787,17 @@ where
                 is_system: true,
                 lane_type,
             });
+        }
+
+        // Nano consensus rule: a blacklisted sender or recipient makes the block invalid.
+        if self.spec.is_nano_active_at_block(self.evm.block().number().to::<u64>()) &&
+            blacklist::check_tx_basic_blacklist(signer, tx_signed.to())
+        {
+            return Err(BlockValidationError::InvalidTx {
+                hash: tx_signed.trie_hash(),
+                error: Box::new(BlacklistedAddressError()),
+            }
+            .into());
         }
 
         // The Hertz patches replay historical state fixes, so they only apply to a block that
