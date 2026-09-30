@@ -366,3 +366,37 @@ async fn estimate_gas_validates_the_prev_randao_block_override() {
     let message = response["error"]["message"].as_str().unwrap();
     assert!(message.contains("must be less than 1000, got 1000"), "{message}");
 }
+
+#[tokio::test]
+async fn blob_base_fee_block_override_is_what_blobbasefee_reads() {
+    // BLOBBASEFEE == 42, or INVALID.
+    const REQUIRES_42: &[u8] = &hex!("4a602a14600857fe5b00");
+    let (api, _) = rpc!(NOW - 1);
+    let (req, state) = (request(PROXY, &[]), Some(overrides(PROXY, REQUIRES_42)));
+    let fee_42 = || {
+        Some(Box::new(BlockOverrides { blob_base_fee: Some(U256::from(42)), ..Default::default() }))
+    };
+
+    api.call(req.clone(), None, state.clone(), fee_42()).await.unwrap();
+    api.estimate_gas(req.clone(), None, state.clone(), fee_42()).await.unwrap();
+    assert!(api.estimate_gas(req, None, state, None).await.is_err());
+}
+
+// go-bsc takes the rules from the overridden block, so 0x70 follows `time` across Jenner.
+#[tokio::test]
+async fn time_override_across_jenner_follows_the_fork_schedule() {
+    let req = request(Address::with_last_byte(0x70), &[]);
+    let at = |time| Some(Box::new(BlockOverrides { time: Some(time), ..Default::default() }));
+    let transfer = U256::from(21_000);
+
+    let (api, _) = rpc!(NOW + 1);
+    assert_eq!(api.estimate_gas(req.clone(), None, None, None).await.unwrap(), transfer);
+    assert!(api.estimate_gas(req.clone(), None, None, at(NOW + 1)).await.unwrap() > transfer);
+    let out = api.call(req.clone(), None, None, at(NOW + 1)).await.unwrap();
+    assert_eq!(value(&out), U256::from((NOW + 1) * 1000));
+
+    let (api, _) = rpc!(NOW);
+    assert!(api.estimate_gas(req.clone(), None, None, None).await.unwrap() > transfer);
+    assert_eq!(api.estimate_gas(req.clone(), None, None, at(NOW - 1)).await.unwrap(), transfer);
+    assert!(api.call(req, None, None, at(NOW - 1)).await.unwrap().is_empty());
+}

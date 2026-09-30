@@ -24,9 +24,9 @@ use reth_evm::{
     block::{BlockExecutorFactory, BlockExecutorFor},
     eth::{receipt_builder::ReceiptBuilder, EthBlockExecutionCtx},
     execute::BlockBuilder,
-    ConfigureEngineEvm, ConfigureEvm, Database, EvmEnv, EvmFactory, EvmFor, ExecutableTxIterator,
-    ExecutionCtxFor, FromRecoveredTx, FromTxWithEncoded, InspectorFor, IntoTxEnv,
-    NextBlockEnvAttributes,
+    ConfigureEngineEvm, ConfigureEvm, Database, EvmEnv, EvmEnvFor, EvmFactory, EvmFor,
+    ExecutableTxIterator, ExecutionCtxFor, FromRecoveredTx, FromTxWithEncoded, InspectorFor,
+    IntoTxEnv, NextBlockEnvAttributes,
 };
 use reth_evm_ethereum::RethReceiptBuilder;
 use reth_primitives_traits::{BlockTy, HeaderTy, SealedBlock, SealedHeader};
@@ -257,6 +257,23 @@ impl BscEvmConfig {
     pub const fn chain_spec(&self) -> &Arc<BscChainSpec> {
         self.executor_factory.spec()
     }
+
+    /// Takes the rules from the block env, as go-bsc's `NewEVM` does: RPC block overrides can
+    /// move its number or time across a fork after `cfg_env` was derived.
+    fn with_block_rules(
+        &self,
+        mut evm_env: EvmEnv<BscHardfork, BscBlockEnv>,
+    ) -> EvmEnv<BscHardfork, BscBlockEnv> {
+        let spec = revm_spec_by_timestamp_and_block_number(
+            self.chain_spec().clone(),
+            evm_env.block_env.timestamp.saturating_to(),
+            evm_env.block_env.number.saturating_to(),
+        );
+        if spec != evm_env.cfg_env.spec {
+            evm_env.cfg_env.set_spec_and_mainnet_gas_params(spec);
+        }
+        evm_env
+    }
 }
 
 /// Ethereum block executor factory.
@@ -409,6 +426,23 @@ where
 
     fn block_assembler(&self) -> &Self::BlockAssembler {
         &self.block_assembler
+    }
+
+    fn evm_with_env<DB: Database>(&self, db: DB, evm_env: EvmEnvFor<Self>) -> EvmFor<Self, DB> {
+        self.evm_factory().create_evm(db, self.with_block_rules(evm_env))
+    }
+
+    fn evm_with_env_and_inspector<DB, I>(
+        &self,
+        db: DB,
+        evm_env: EvmEnvFor<Self>,
+        inspector: I,
+    ) -> EvmFor<Self, DB, I>
+    where
+        DB: Database,
+        I: InspectorFor<Self, DB>,
+    {
+        self.evm_factory().create_evm_with_inspector(db, self.with_block_rules(evm_env), inspector)
     }
 
     fn evm_env(&self, header: &Header) -> Result<EvmEnv<BscHardfork, BscBlockEnv>, Self::Error> {

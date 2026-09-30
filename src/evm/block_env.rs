@@ -183,6 +183,15 @@ impl reth_rpc_eth_types::BlockOverridesExt for BscBlockEnv {
         if let Some(prev_randao) = &overrides.random {
             self.milli_remainder = bsc_milli_remainder(prev_randao)?;
         }
+        // alloy-evm 0.34's `apply_block_overrides` drops `blobBaseFee`.
+        if let Some(blob_base_fee) = overrides.blob_base_fee {
+            let excess_blob_gas =
+                self.inner.blob_excess_gas_and_price.map(|b| b.excess_blob_gas).unwrap_or_default();
+            self.inner.blob_excess_gas_and_price = Some(BlobExcessGasAndPrice {
+                excess_blob_gas,
+                blob_gasprice: blob_base_fee.saturating_to(),
+            });
+        }
         Ok(())
     }
 }
