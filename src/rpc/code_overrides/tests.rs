@@ -34,11 +34,17 @@ const TARGETS: [Address; 6] = [
 ];
 const NOW: u64 = 1_800_000_000;
 
+fn forks_at(forks: &[BscHardfork], time: u64) -> reth_chainspec::ChainSpec {
+    let mut chain = bsc_mainnet();
+    for fork in forks {
+        chain.hardforks.insert(*fork, ForkCondition::Timestamp(time));
+    }
+    chain
+}
+
 macro_rules! rpc {
-    ($jenner:expr) => {{
-        let mut chain = bsc_mainnet();
-        chain.hardforks.insert(BscHardfork::Jenner, ForkCondition::Timestamp($jenner));
-        let spec = Arc::new(BscChainSpec::from(chain));
+    (chain $chain:expr) => {{
+        let spec = Arc::new(BscChainSpec::from($chain));
         let provider = MockEthProvider::<BscPrimitives, _>::new().with_chain_spec((*spec).clone());
         let header = alloy_consensus::Header {
             number: 40_000_000,
@@ -72,6 +78,9 @@ macro_rules! rpc {
             hash,
         )
     }};
+    ($jenner:expr) => {
+        rpc!(chain forks_at(&[BscHardfork::Jenner], $jenner))
+    };
 }
 
 fn request(target: Address, input: &[u8]) -> TransactionRequest {
@@ -399,4 +408,39 @@ async fn time_override_across_jenner_follows_the_fork_schedule() {
     assert!(api.estimate_gas(req.clone(), None, None, None).await.unwrap() > transfer);
     assert_eq!(api.estimate_gas(req.clone(), None, None, at(NOW - 1)).await.unwrap(), transfer);
     assert!(api.call(req, None, None, at(NOW - 1)).await.unwrap().is_empty());
+}
+
+// go-bsc caps the estimate at EIP-7825's limit by the overridden block's rules.
+#[tokio::test]
+async fn time_override_across_osaka_moves_the_tx_gas_limit_cap() {
+    // GAS > 2^24, or INVALID.
+    const NEEDS_OVER_2_24: &[u8] = &hex!("63010000005a11600b57fe5b00");
+    const OSAKA_AND_LATER: [BscHardfork; 3] =
+        [BscHardfork::Osaka, BscHardfork::Mendel, BscHardfork::Pasteur];
+    let (before, _) = rpc!(chain forks_at(&OSAKA_AND_LATER, NOW + 1));
+    let (after, _) = rpc!(chain forks_at(&OSAKA_AND_LATER, NOW));
+    let at = |time| Some(Box::new(BlockOverrides { time: Some(time), ..Default::default() }));
+    // Calldata keeps the estimator off its basic-transfer shortcut.
+    let req = TransactionRequest {
+        to: Some(PROXY.into()),
+        input: Bytes::from_static(&[1]).into(),
+        ..Default::default()
+    };
+    let stop = Some(overrides(PROXY, &[0x00]));
+    let needs_over_2_24 = Some(overrides(PROXY, NEEDS_OVER_2_24));
+
+    let osaka = after.estimate_gas(req.clone(), None, stop.clone(), None).await.unwrap();
+    assert_eq!(before.estimate_gas(req.clone(), None, stop, at(NOW + 1)).await.unwrap(), osaka);
+
+    let pre_osaka =
+        before.estimate_gas(req.clone(), None, needs_over_2_24.clone(), None).await.unwrap();
+    assert!(pre_osaka > U256::from(1 << 24));
+    assert!(after.estimate_gas(req.clone(), None, needs_over_2_24.clone(), None).await.is_err());
+    assert_eq!(
+        after.estimate_gas(req.clone(), None, needs_over_2_24.clone(), at(NOW - 1)).await.unwrap(),
+        pre_osaka
+    );
+
+    // eth_call lifts the cap, and crossing into Osaka keeps it lifted.
+    before.call(req, None, needs_over_2_24, at(NOW + 1)).await.unwrap();
 }

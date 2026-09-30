@@ -259,18 +259,24 @@ impl BscEvmConfig {
     }
 
     /// Takes the rules from the block env, as go-bsc's `NewEVM` does: RPC block overrides can
-    /// move its number or time across a fork after `cfg_env` was derived.
-    fn with_block_rules(
+    /// move its number or time across a fork after `cfg_env` was derived. A transaction gas limit
+    /// cap other than the fork's own was set by the caller and is kept.
+    pub(crate) fn with_block_rules(
         &self,
         mut evm_env: EvmEnv<BscHardfork, BscBlockEnv>,
     ) -> EvmEnv<BscHardfork, BscBlockEnv> {
-        let spec = revm_spec_by_timestamp_and_block_number(
-            self.chain_spec().clone(),
-            evm_env.block_env.timestamp.saturating_to(),
-            evm_env.block_env.number.saturating_to(),
-        );
-        if spec != evm_env.cfg_env.spec {
-            evm_env.cfg_env.set_spec_and_mainnet_gas_params(spec);
+        let number = evm_env.block_env.number.saturating_to();
+        let timestamp = evm_env.block_env.timestamp.saturating_to();
+        let spec =
+            revm_spec_by_timestamp_and_block_number(self.chain_spec().clone(), timestamp, number);
+        if spec == evm_env.cfg_env.spec {
+            return evm_env;
+        }
+        evm_env.cfg_env.set_spec_and_mainnet_gas_params(spec);
+        if matches!(evm_env.cfg_env.tx_gas_limit_cap, None | Some(MAX_TX_GAS_LIMIT_OSAKA)) {
+            evm_env.cfg_env.tx_gas_limit_cap =
+                BscHardforks::is_osaka_active_at_timestamp(self.chain_spec(), number, timestamp)
+                    .then_some(MAX_TX_GAS_LIMIT_OSAKA);
         }
         evm_env
     }

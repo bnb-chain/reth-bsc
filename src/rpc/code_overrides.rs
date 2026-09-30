@@ -4,7 +4,10 @@
 //! overridden addresses to dynamic precompile lookups. Keep its simulation and
 //! callMany execution flow here until the upstream helpers expose that hook.
 
-use crate::evm::{block_env::BscBlockEnv, precompiles::cas20::is_cas20_precompile};
+use crate::{
+    evm::{block_env::BscBlockEnv, precompiles::cas20::is_cas20_precompile},
+    node::evm::config::BscEvmConfig,
+};
 use alloy_consensus::BlockHeader;
 use alloy_evm::overrides::{apply_block_overrides, apply_state_overrides};
 use alloy_network::TransactionBuilder;
@@ -85,9 +88,8 @@ pub struct BscCodeOverridesApiImpl<Eth>(pub Eth);
 #[async_trait::async_trait]
 impl<Eth> BscCodeOverridesApiServer<RpcBlock<Eth::NetworkTypes>> for BscCodeOverridesApiImpl<Eth>
 where
-    Eth: EthCall,
+    Eth: EthCall + RpcNodeCore<Evm = BscEvmConfig>,
     Eth::NetworkTypes: RpcTypes<TransactionRequest = TransactionRequest>,
-    reth_evm::EvmFactoryFor<Eth::Evm>: EvmFactory<BlockEnv = BscBlockEnv>,
 {
     async fn call(
         &self,
@@ -141,6 +143,8 @@ where
             env.block_env
                 .apply_block_overrides_ext(&overrides)
                 .map_err(EthApiError::InvalidParams)?;
+            // The estimator sizes its search from the env, before any EVM is created.
+            env = self.0.evm_config().with_block_rules(env);
         }
         self.0
             .spawn_with_state(Some(at), move |eth, provider| {
