@@ -106,8 +106,10 @@ async fn code_override_runs_on_every_cas20_route_through_rpc() {
             U256::from(42),
             "{target}"
         );
-        let gas =
-            api.estimate_gas(req.clone(), Some(hash.into()), Some(state.clone())).await.unwrap();
+        let gas = api
+            .estimate_gas(req.clone(), Some(hash.into()), Some(state.clone()), None)
+            .await
+            .unwrap();
         assert!(gas >= U256::from(21_000));
         let list = BscAccessListApiImpl(api.0.clone())
             .create_access_list(req, Some(hash.into()), Some(state))
@@ -126,7 +128,8 @@ async fn empty_code_and_marker_code_are_explicit_overrides() {
         let out = api.call(req.clone(), None, Some(overrides(target, &[])), None).await.unwrap();
         assert!(out.is_empty(), "{target}");
         let state = overrides(target, &[]);
-        let gas = api.estimate_gas(request(target, &[]), None, Some(state.clone())).await.unwrap();
+        let gas =
+            api.estimate_gas(request(target, &[]), None, Some(state.clone()), None).await.unwrap();
         // Estimation may include a margin; the returned limit must execute the
         // overridden empty account successfully instead of entering CAS20.
         let mut estimated = request(target, &[]);
@@ -334,4 +337,32 @@ async fn rpc_registration_preserves_named_call_parameters_and_block_overrides() 
     let response: serde_json::Value = serde_json::from_str(response.get()).unwrap();
     let bytes: Bytes = serde_json::from_value(response["result"].clone()).unwrap();
     assert_eq!(value(&bytes), U256::from(NOW + 17));
+}
+
+#[tokio::test]
+async fn estimate_gas_validates_the_prev_randao_block_override() {
+    let (api, _) = rpc!(NOW - 1);
+    let module = api.into_rpc();
+    let estimate = |prev_randao: u64| {
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "eth_estimateGas",
+            "params": [
+                { "to": Address::with_last_byte(0x70) },
+                "latest",
+                null,
+                { "prevRandao": B256::from(U256::from(prev_randao)) }
+            ]
+        })
+        .to_string()
+    };
+
+    let (response, _) = module.raw_json_request(&estimate(999), 1).await.unwrap();
+    let response: serde_json::Value = serde_json::from_str(response.get()).unwrap();
+    assert!(response["result"].is_string(), "{response}");
+
+    let (response, _) = module.raw_json_request(&estimate(1000), 1).await.unwrap();
+    let response: serde_json::Value = serde_json::from_str(response.get()).unwrap();
+    assert_eq!(response["error"]["code"], -32602, "{response}");
+    let message = response["error"]["message"].as_str().unwrap();
+    assert!(message.contains("must be less than 1000, got 1000"), "{message}");
 }

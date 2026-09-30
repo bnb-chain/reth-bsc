@@ -10,10 +10,7 @@
 //! E2. Two deliberate scope notes:
 //! - the go-side "non-BSC chain unaffected" case lives in reth itself (the
 //!   explicit no-op impl + tests on the stock `BlockEnv`);
-//! - `eth_estimateGas` has no `blockOverrides` parameter on reth's RPC surface
-//!   (upstream API difference, all chains alike), so its coverage here is the
-//!   0x70-execution smoke test; the override semantics it would share come
-//!   through the same `prepare_call_env` path `eth_call` exercises.
+//! - `eth_estimateGas` block overrides are tested in `rpc::code_overrides`.
 
 use crate::{
     chainspec::{bsc::bsc_mainnet, BscChainSpec},
@@ -296,10 +293,6 @@ async fn eth_call_many_inherits_the_bsc_semantics() {
 
 #[tokio::test]
 async fn eth_estimate_gas_executes_the_precompile() {
-    // reth's eth_estimateGas RPC surface has no blockOverrides parameter
-    // (upstream API difference, all chains alike) — this pins that the 0x70
-    // path executes fine under gas estimation, which shares `prepare_call_env`
-    // with eth_call.
     let api = bsc_eth_api!(spec(Some(JENNER_AT)));
     let gas = api
         .estimate_gas(probe_request(), None, Some(probe_state()))

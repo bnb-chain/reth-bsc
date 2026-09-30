@@ -33,7 +33,7 @@ use reth_rpc_eth_types::{
     simulate::{self, EthSimulateError},
     BlockOverridesExt, EthApiError,
 };
-use revm::{context::Block, DatabaseCommit};
+use revm::{context::Block, database::InMemoryDB, DatabaseCommit};
 use revm_inspectors::transfer::TransferInspector;
 use std::collections::BTreeSet;
 
@@ -63,6 +63,7 @@ pub trait BscCodeOverridesApi<B> {
         request: TransactionRequest,
         block_number: Option<BlockId>,
         state_override: Option<StateOverride>,
+        block_overrides: Option<Box<BlockOverrides>>,
     ) -> RpcResult<U256>;
     #[method(name = "simulateV1")]
     async fn simulate_v1(
@@ -125,10 +126,22 @@ where
         request: TransactionRequest,
         block: Option<BlockId>,
         state: Option<StateOverride>,
+        overrides: Option<Box<BlockOverrides>>,
     ) -> RpcResult<U256> {
         let (mut env, at) =
             self.0.evm_env_at(block.unwrap_or_default()).await.map_err(Into::into)?;
         env.block_env.disabled_cas20 = code_overridden_addresses(state.as_ref());
+        if let Some(overrides) = overrides {
+            // blockHash overrides are ignored, as in go-bsc.
+            apply_block_overrides(
+                (*overrides).clone(),
+                &mut InMemoryDB::default(),
+                env.block_env.inner_mut(),
+            );
+            env.block_env
+                .apply_block_overrides_ext(&overrides)
+                .map_err(EthApiError::InvalidParams)?;
+        }
         self.0
             .spawn_with_state(Some(at), move |eth, provider| {
                 EstimateCall::estimate_gas_with(&eth, env, request, provider, state)
