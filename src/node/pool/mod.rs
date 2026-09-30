@@ -26,14 +26,10 @@ use reth_transaction_pool::{
     CoinbaseTipOrdering, EthPooledTransaction, EthTransactionValidator, Pool,
 };
 
-use crate::evm::blacklist;
+use crate::evm::blacklist::{self, BlacklistedAddressError};
 use crate::hardforks::bsc::BscHardfork;
 
-/// Transaction pool blacklist error type: marked as "bad transaction" to punish source node
-#[derive(thiserror::Error, Debug)]
-#[error("sender or recipient is blacklisted")]
-pub struct BlacklistedAddressError();
-
+/// A blacklisted transaction is a bad transaction, so the peer that sent it is penalized.
 impl reth_transaction_pool::error::PoolTransactionError for BlacklistedAddressError {
     fn is_bad_transaction(&self) -> bool {
         true

@@ -598,11 +598,16 @@ fn main() -> eyre::Result<()> {
                         let prestate_api = BscPrestateApiImpl(ctx.registry.debug_api());
                         ctx.modules.merge_if_module_configured(RethRpcModule::Debug, prestate_api.into_rpc())?;
 
-                        tracing::info!("Start to register BSC Admin RPC API (admin_setBidBlockPermission)...");
+                        tracing::info!("Start to register BSC Admin RPC API (admin_setBidBlockPermission, admin_nodeInfo)...");
                         use reth_bsc::rpc::admin::{BscAdminApiImpl, BscAdminApiServer};
 
                         let admin_api = BscAdminApiImpl::new();
                         ctx.modules.merge_if_module_configured(RethRpcModule::Admin, admin_api.into_rpc())?;
+
+                        use reth_bsc::rpc::admin::{BscNodeInfoApiImpl, BscNodeInfoApiServer};
+                        ctx.modules.remove_method_from_configured("admin_nodeInfo");
+                        let node_info_api = BscNodeInfoApiImpl(ctx.registry.admin_api());
+                        ctx.modules.merge_if_module_configured(RethRpcModule::Admin, node_info_api.into_rpc())?;
                         tracing::info!("Succeed to register BSC Admin RPC API");
 
                         tracing::info!("Start to register Blob RPC API...");

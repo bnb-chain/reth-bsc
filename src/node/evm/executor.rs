@@ -8,7 +8,11 @@ use crate::{
         parlia::{Parlia, Snapshot, VoteAddress},
         SYSTEM_ADDRESS,
     },
-    evm::{precompiles, transaction::BscTxEnv},
+    evm::{
+        blacklist::{self, BlacklistedAddressError},
+        precompiles,
+        transaction::BscTxEnv,
+    },
     hardforks::BscHardforks,
     metrics::{
         BscBlockchainMetrics, BscConsensusMetrics, BscExecutorMetrics, BscRewardsMetrics,
@@ -30,7 +34,7 @@ use alloy_evm::{
     },
     eth::receipt_builder::ReceiptBuilderCtx,
 };
-use crate::node::evm::error::lane_reject;
+use crate::node::evm::error::{lane_reject, BscBlockExecutionError, BscBlockValidationError};
 use crate::consensus::payment_lane::{
     state::LaneState, LaneError, LaneLiveState, LaneType, PAYMENT_LANE_CONTRACT,
 };
@@ -785,6 +789,32 @@ where
             });
         }
 
+        // From Cancun, system transactions must be at the end of the block.
+        if self.ctx.mode == BscExecutionMode::Import &&
+            !self.system_txs.is_empty() &&
+            BscHardforks::is_cancun_active_at_timestamp(
+                &self.spec,
+                self.evm.block().number().to::<u64>(),
+                self.evm.block().timestamp().to::<u64>(),
+            )
+        {
+            return Err(BscBlockExecutionError::Validation(
+                BscBlockValidationError::UnexpectedNormalTx,
+            )
+            .into());
+        }
+
+        // Nano consensus rule: a blacklisted sender or recipient makes the block invalid.
+        if self.spec.is_nano_active_at_block(self.evm.block().number().to::<u64>()) &&
+            blacklist::check_tx_basic_blacklist(signer, tx_signed.to())
+        {
+            return Err(BlockValidationError::InvalidTx {
+                hash: tx_signed.trie_hash(),
+                error: Box::new(BlacklistedAddressError()),
+            }
+            .into());
+        }
+
         // The Hertz patches replay historical state fixes, so they only apply to a block that
         // already exists.
         if self.ctx.mode == BscExecutionMode::Import {
@@ -1047,5 +1077,105 @@ where
 
     fn receipts(&self) -> &[Self::Receipt] {
         &self.receipts
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        chainspec::parser::parse_genesis_json,
+        node::{
+            evm::{config::BscEvmConfig, error::BscBlockValidationError},
+            primitives::BscBlock,
+        },
+        system_contracts::VALIDATOR_CONTRACT,
+    };
+    use alloy_consensus::{Header, TxLegacy};
+    use alloy_evm::block::{BlockExecutionError, BlockExecutor, BlockValidationError};
+    use alloy_primitives::{address, Address, Signature, TxKind};
+    use reth_ethereum_primitives::{Transaction, TransactionSigned};
+    use reth_evm::ConfigureEvm;
+    use reth_primitives_traits::{Recovered, SealedBlock};
+    use revm::database::{InMemoryDB, State};
+
+    const NANO_BLOCK: u64 = 100;
+    const CANCUN_TIME: u64 = 1_000;
+    const BLACKLISTED: Address = address!("0x489A8756C18C0b8B24EC2a2b9FF3D4d447F79BEc");
+    const NORMAL: Address = address!("0x1000000000000000000000000000000000000001");
+    const VALIDATOR: Address = address!("0x2000000000000000000000000000000000000002");
+    const SYSTEM_TX: (Address, Address) = (VALIDATOR, VALIDATOR_CONTRACT);
+    const NORMAL_TX: (Address, Address) = (NORMAL, NORMAL);
+
+    /// Imports `txs`, zero-gas-price calls given as `(from, to)`, into a block mined by
+    /// `VALIDATOR`, so a call from it to a system contract is a system transaction.
+    fn import(
+        number: u64,
+        timestamp: u64,
+        txs: &[(Address, Address)],
+    ) -> Result<(), BlockExecutionError> {
+        let spec = parse_genesis_json(&format!(
+            r#"{{
+                "config": {{
+                    "chainId": 714, "ramanujanBlock": 0, "nielsBlock": 0, "nanoBlock": {NANO_BLOCK},
+                    "berlinBlock": 0, "londonBlock": 0, "shanghaiTime": 0, "keplerTime": 0,
+                    "cancunTime": {CANCUN_TIME}
+                }},
+                "difficulty": "0x1", "gasLimit": "0x2625a00", "alloc": {{}}
+            }}"#
+        ))
+        .expect("genesis should parse");
+        let block = SealedBlock::seal_slow(BscBlock {
+            header: Header {
+                number,
+                timestamp,
+                beneficiary: VALIDATOR,
+                gas_limit: 40_000_000,
+                blob_gas_used: Some(0),
+                excess_blob_gas: Some(0),
+                ..Default::default()
+            },
+            body: Default::default(),
+        });
+        let evm_config = BscEvmConfig::bsc(spec);
+        let mut db = State::builder().with_database(InMemoryDB::default()).build();
+        let mut executor = evm_config.executor_for_block(&mut db, &block).unwrap();
+        for &(from, to) in txs {
+            let tx = TransactionSigned::new_unhashed(
+                Transaction::Legacy(TxLegacy {
+                    to: TxKind::Call(to),
+                    gas_limit: 21_000,
+                    ..Default::default()
+                }),
+                Signature::test_signature(),
+            );
+            executor.execute_transaction_without_commit(Recovered::new_unchecked(tx, from))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn blacklisted_sender_or_recipient_is_rejected_from_nano() {
+        for tx in [(BLACKLISTED, NORMAL), (NORMAL, BLACKLISTED)] {
+            assert!(matches!(
+                import(NANO_BLOCK, 0, &[tx]),
+                Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx { .. }))
+            ));
+            import(NANO_BLOCK - 1, 0, &[tx]).expect("blacklist is not enforced before Nano");
+        }
+        import(NANO_BLOCK, 0, &[NORMAL_TX]).expect("clean tx executes");
+    }
+
+    #[test]
+    fn normal_tx_after_system_tx_is_rejected_from_cancun() {
+        let expected = BscBlockValidationError::UnexpectedNormalTx.to_string();
+        assert!(matches!(
+            import(NANO_BLOCK, CANCUN_TIME, &[SYSTEM_TX, NORMAL_TX]),
+            Err(BlockExecutionError::Validation(BlockValidationError::DepositRequestDecode(msg)))
+                if msg.ends_with(&expected)
+        ));
+        import(NANO_BLOCK, CANCUN_TIME - 1, &[SYSTEM_TX, NORMAL_TX])
+            .expect("order is not enforced before Cancun");
+        import(NANO_BLOCK, CANCUN_TIME, &[NORMAL_TX, SYSTEM_TX])
+            .expect("system txs at the end are allowed");
     }
 }

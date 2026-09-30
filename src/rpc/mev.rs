@@ -702,11 +702,11 @@ impl MevApiImpl {
 
         // Mirrors go-bsc `bidSimulator.bidMustBefore`: reject bids that arrive after the
         // validator must have already started sealing (no time left to simulate).
-        let block_interval_ms = self
+        let snap = self
             .snapshot_provider
             .snapshot_by_hash(&head_header.hash_slow())
-            .map(|s| s.block_interval)
-            .unwrap_or(3_000); // 3 s default
+            .ok_or_else(|| Self::internal_err("chain head snapshot unavailable"))?;
+        let block_interval_ms = snap.block_interval;
         let parent_timestamp_ms =
             crate::consensus::parlia::util::calculate_millisecond_timestamp(head_header);
         let bid_must_before_ms = self.bid_must_before_ms(parent_timestamp_ms, block_interval_ms);
@@ -726,26 +726,18 @@ impl MevApiImpl {
             .to_decoded_bid_block(builder)
             .map_err(|e| Self::invalid_bid(format!("failed to decode bid block: {e}")))?;
 
-        // Mirrors go-bsc `preSealVerifyBidBlock`'s payload-only checks (coinbase, gas limit, the
-        // deposit-derived gas fee, blob sidecar structure, per-tx gas cap, trailing system-tx
-        // shape) synchronously, returning `-38007` immediately on failure like geth does — rather
-        // than admitting optimistically and dropping the bid silently later.
-        //
-        // NOT run here: `verify_bid_block_header`'s structural + cascading checks (extra-data
-        // length/validator-list layout, authorized-validator/sign-recently/difficulty against the
-        // snapshot). go-bsc only makes those checks meaningful by first overwriting the builder's
-        // `Extra` with the validator's own reconstructed vanity/forkhash/validator-list/turnLength
-        // (`SetExtraData`, run before `preSealVerifyBidBlock`) — replicating that rewrite here
-        // would risk rejecting legitimate submissions whose raw `Extra` doesn't yet match that
-        // final structure. Those checks remain deferred to the miner side
-        // (`simulate_bid_block`), which does perform the rewrite first.
+        // go-bsc `preSealVerifyBidBlock`, run synchronously so a failure returns `-38007` here
+        // rather than dropping the bid silently later. The builder's extra is not checked: it is
+        // replaced by the validator's before sealing, as go-bsc's `SetExtraData` does.
         let gas_ceil = crate::shared::get_miner_gas_limit().unwrap_or(head_header.gas_limit);
         let expected_gas_limit =
             EthereumBuilderConfig::new().with_gas_limit(gas_ceil).gas_limit(head_header.gas_limit);
-        match crate::node::miner::bid_block::verify_bid_block_payload(
+        match crate::node::miner::bid_block::pre_seal_verify_bid_block(
+            &crate::consensus::parlia::Parlia::new(self.chain_spec.clone(), 200),
             &self.chain_spec,
             &decoded,
             head_header,
+            &snap,
             self.validator_address,
             expected_gas_limit,
         ) {
@@ -767,7 +759,7 @@ impl MevApiImpl {
         //
         //   • Extra overwrite + SetExtraData  →  header.extra_data = vanity + finalize_new_header
         //   • setBidMevInfo                   →  set_bid_block_mev_info
-        //   • verify_bid_block_header         →  structural + cascading header checks (see above)
+        //   • verify_bid_block_header         →  re-run on the finalized header
         //   • execution + state-root check    →  execute_bid_block_payload
         //
         // Behavioral difference vs geth: geth runs the queue handoff itself
