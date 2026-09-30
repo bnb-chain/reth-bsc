@@ -42,6 +42,7 @@ pub mod pool;
 pub mod miner;
 pub mod network;
 pub mod primitives;
+mod reorg_metrics;
 pub mod storage;
 pub mod vote_producer;
 pub mod vote_journal;

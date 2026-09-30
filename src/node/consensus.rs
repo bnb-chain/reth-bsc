@@ -10,7 +10,7 @@ use crate::{
         ParliaConsensusErr,
     },
     hardforks::BscHardforks,
-    metrics::{BscBlockchainMetrics, BscFinalityMetrics},
+    metrics::BscFinalityMetrics,
     node::{engine_api::payload::BscPayloadTypes, BscNode},
     shared, BscBlock, BscBlockBody, BscPrimitives,
 };
@@ -34,7 +34,7 @@ use reth_engine_primitives::ConsensusEngineHandle;
 use reth_ethereum_primitives::Receipt;
 use reth_primitives_traits::{receipt::gas_spent_by_transactions, GotExpected};
 use reth_primitives_traits::constants::{GAS_LIMIT_BOUND_DIVISOR, MINIMUM_GAS_LIMIT};
-use reth_provider::{BlockNumReader, HeaderProvider};
+use reth_provider::{BlockNumReader, CanonStateSubscriptions, HeaderProvider};
 use std::sync::Arc;
 
 /// A basic Bsc consensus builder.
@@ -61,6 +61,16 @@ where
 
         crate::shared::set_header_provider(Arc::new(ctx.provider().clone()))
             .unwrap_or_else(|e| panic!("Failed to set global header provider: {e}"));
+
+        // Subscribe before the engine starts importing blocks. This observer runs on
+        // every node, independently of mining and its potentially slow work loop.
+        ctx.task_executor().spawn_critical_task(
+            "bsc-reorg-metrics",
+            super::reorg_metrics::run(
+                ctx.provider().subscribe_to_canonical_state(),
+                crate::metrics::BscBlockchainMetrics::default(),
+            ),
+        );
 
         Ok(Arc::new(BscConsensus::new(ctx.chain_spec())))
     }
@@ -1172,8 +1182,6 @@ pub struct BscForkChoiceEngine<P> {
     >,
     /// Finality metrics
     finality_metrics: BscFinalityMetrics,
-    /// Blockchain metrics (including reorg metrics)
-    blockchain_metrics: BscBlockchainMetrics,
 }
 
 impl<P> BscForkChoiceEngine<P>
@@ -1195,7 +1203,6 @@ where
                 schnellru::ByLength::new(128),
             ))),
             finality_metrics: BscFinalityMetrics::default(),
-            blockchain_metrics: BscBlockchainMetrics::default(),
         }
     }
 
@@ -1238,33 +1245,8 @@ where
         // Determine if we need to reorg using fork choice rules
         let need_reorg = self.is_need_reorg(incoming_header, &current_head).await?;
 
-        // Only count as reorg if:
-        // 1. Fork choice says we need to reorg AND
-        // 2. The incoming block number is <= current head (actual chain reorganization)
-        //    OR the incoming block's parent is not the current head (side chain switch)
-        let is_actual_reorg = need_reorg
-            && (incoming_header.number <= current_head.number
-                || incoming_header.parent_hash != current_head.hash_slow());
-
-        if is_actual_reorg {
-            // Calculate reorg depth: the difference between incoming and current head numbers
-            // Note: This is a simplified calculation.
-            let reorg_depth = incoming_header.number.abs_diff(current_head.number);
-
-            self.blockchain_metrics.reorg_executions_total.increment(1);
-            self.blockchain_metrics.latest_reorg_depth.set(reorg_depth as f64);
-
-            tracing::info!(
-                target: "bsc::forkchoice",
-                incoming_number = incoming_header.number,
-                incoming_hash = ?incoming_header.hash_slow(),
-                current_number = current_head.number,
-                current_hash = ?current_head.hash_slow(),
-                reorg_depth,
-                "Reorg detected and metrics recorded"
-            );
-        }
-
+        // A preferred head may simply extend the current chain by several blocks.
+        // Reorg metrics are recorded from the engine's canonical notifications instead.
         let new_canonical_head = if need_reorg { incoming_header } else { &current_head };
 
         // Get safe block and finalized block with new canonical head
