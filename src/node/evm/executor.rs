@@ -34,7 +34,7 @@ use alloy_evm::{
     },
     eth::receipt_builder::ReceiptBuilderCtx,
 };
-use crate::node::evm::error::lane_reject;
+use crate::node::evm::error::{lane_reject, BscBlockExecutionError, BscBlockValidationError};
 use crate::consensus::payment_lane::{
     state::LaneState, LaneError, LaneLiveState, LaneType, PAYMENT_LANE_CONTRACT,
 };
@@ -787,6 +787,21 @@ where
                 is_system: true,
                 lane_type,
             });
+        }
+
+        // go-bsc: from Cancun, system transactions must be at the end of the block.
+        if self.ctx.mode == BscExecutionMode::Import &&
+            !self.system_txs.is_empty() &&
+            BscHardforks::is_cancun_active_at_timestamp(
+                &self.spec,
+                self.evm.block().number().to::<u64>(),
+                self.evm.block().timestamp().to::<u64>(),
+            )
+        {
+            return Err(BscBlockExecutionError::Validation(
+                BscBlockValidationError::UnexpectedNormalTx,
+            )
+            .into());
         }
 
         // Nano consensus rule: a blacklisted sender or recipient makes the block invalid.
