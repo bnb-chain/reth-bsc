@@ -1,5 +1,7 @@
+use crate::evm::precompiles::cas20::is_cas20_precompile;
 use alloy_evm::env::BlockEnvironment;
 use alloy_primitives::{Address, B256, U256};
+use alloy_rpc_types_eth::state::StateOverride;
 use revm::context::{Block, BlockEnv};
 use revm::context_interface::block::BlobExcessGasAndPrice;
 use std::ops::{Deref, DerefMut};
@@ -183,6 +185,13 @@ impl reth_rpc_eth_types::BlockOverridesExt for BscBlockEnv {
         if let Some(prev_randao) = &overrides.random {
             self.milli_remainder = bsc_milli_remainder(prev_randao)?;
         }
+        Ok(())
+    }
+
+    fn apply_state_overrides_ext(&mut self, overrides: &StateOverride) -> Result<(), String> {
+        self.disabled_cas20.extend(overrides.iter().filter_map(|(address, account)| {
+            (account.code.is_some() && is_cas20_precompile(*address)).then_some(*address)
+        }));
         Ok(())
     }
 }
