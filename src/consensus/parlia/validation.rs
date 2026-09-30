@@ -200,14 +200,9 @@ fn validate_optional_trailing_fields_for_bsc(header: &SealedHeader) -> Result<()
 }
 
 impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 'static> Parlia<ChainSpec> {
-    /// The standalone header-field checks shared by the sync path and the BidBlock path —
-    /// go-bsc's `VerifyUnsealedHeader` scope. Deliberately EXCLUDES the wall-clock future
-    /// bound: go-bsc applies that only in `verifyHeader` (the sync path), never to
-    /// builder-submitted BidBlock headers, whose next-slot timestamp is legitimately a few
-    /// hundred milliseconds ahead of the validator's clock at admission time.
-    ///
-    /// Extra data is left to the callers, since a BidBlock's is replaced by the validator's.
-    /// The other checks run in go-bsc's order.
+    /// The standalone checks of go-bsc `VerifyUnsealedHeader`, in its order. Extra data is not
+    /// checked (a BidBlock's is replaced by the validator's), nor is the future-timestamp bound
+    /// (a bid targets the next slot).
     pub fn validate_unsealed_header_fields(
         &self,
         header: &SealedHeader,
@@ -262,8 +257,6 @@ impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 's
 
 impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 'static> HeaderValidator for Parlia<ChainSpec> {
     fn validate_header(&self, header: &SealedHeader) -> Result<(), ConsensusError> {
-        // Don't waste time checking blocks from the future (sync path only — go-bsc's
-        // `verifyHeader`; the BidBlock path uses `validate_unsealed_header_fields` directly).
         validate_header_not_from_future(header, present_unix_seconds())?;
 
         self.check_header_extra(header)
