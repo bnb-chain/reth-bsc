@@ -178,21 +178,21 @@ fn convert_light_block_from_proto(light_block_proto: &TmLightBlock) -> ConvertLi
 // The pinned Rust CometBFT protobuf omits Greenfield's header field 15. Go BSC includes that
 // RandaoMix field in the header hash, even when it is empty, so retain it from the input bytes.
 #[derive(Clone, PartialEq, prost::Message)]
-struct GreenfieldHeaderFields {
+struct HeaderExtensionFields {
     #[prost(bytes = "vec", tag = "15")]
     randao_mix: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
-struct GreenfieldSignedHeaderFields {
+struct SignedHeaderExtensionFields {
     #[prost(message, optional, tag = "1")]
-    header: Option<GreenfieldHeaderFields>,
+    header: Option<HeaderExtensionFields>,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
-struct GreenfieldLightBlockFields {
+struct LightBlockExtensionFields {
     #[prost(message, optional, tag = "1")]
-    signed_header: Option<GreenfieldSignedHeaderFields>,
+    signed_header: Option<SignedHeaderExtensionFields>,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -201,7 +201,7 @@ struct BytesValue {
     value: Vec<u8>,
 }
 
-fn greenfield_header_hash(header: &block::Header, randao_mix: &[u8]) -> Hash {
+fn header_hash_with_randao_mix(header: &block::Header, randao_mix: &[u8]) -> Hash {
     // Match greenfield-cometbft/types.Header.Hash: 14 standard leaves plus RandaoMix.
     let fields = vec![
         Protobuf::<RawConsensusVersion>::encode_vec(header.version),
@@ -226,9 +226,9 @@ fn greenfield_header_hash(header: &block::Header, randao_mix: &[u8]) -> Hash {
 }
 
 fn decode_randao_mix(light_block_bytes: &[u8]) -> Result<Vec<u8>, PrecompileHalt> {
-    let greenfield_fields = GreenfieldLightBlockFields::decode(light_block_bytes)
+    let extension_fields = LightBlockExtensionFields::decode(light_block_bytes)
         .map_err(|_| BscPrecompileError::InvalidInput)?;
-    Ok(greenfield_fields
+    Ok(extension_fields
         .signed_header
         .and_then(|signed| signed.header)
         .map(|header| header.randao_mix)
@@ -320,7 +320,7 @@ impl ConsensusState {
                 light_block.signed_header.header().validators_hash,
             )
             .is_err() ||
-            greenfield_header_hash(light_block.signed_header.header(), randao_mix) !=
+            header_hash_with_randao_mix(light_block.signed_header.header(), randao_mix) !=
                 light_block.signed_header.commit.block_id.hash
         {
             return Err(BscPrecompileError::CometBftApplyBlockFailed.into());
@@ -597,7 +597,7 @@ mod tests {
         // Reattach Greenfield's field 15, which the pinned Rust protobuf drops on re-encoding.
         let mut wire_block = WireLightBlock::decode(light_block.encode_to_vec().as_slice()).unwrap();
         let mut signed = WireSignedHeader::decode(wire_block.signed_header.as_slice()).unwrap();
-        signed.header.extend_from_slice(&GreenfieldHeaderFields { randao_mix }.encode_to_vec());
+        signed.header.extend_from_slice(&HeaderExtensionFields { randao_mix }.encode_to_vec());
         wire_block.signed_header = signed.encode_to_vec();
         let mut result = input[..split].to_vec();
         result.extend_from_slice(&wire_block.encode_to_vec());
@@ -629,7 +629,7 @@ mod tests {
             .validator_sets_match(&block.validators, block.signed_header.header().validators_hash)
             .is_err());
         assert_eq!(
-            greenfield_header_hash(block.signed_header.header(), &randao_mix),
+            header_hash_with_randao_mix(block.signed_header.header(), &randao_mix),
             block.signed_header.commit.block_id.hash,
         );
         // The old voting-power-only check accepts this unchanged, valid signature.
@@ -663,7 +663,7 @@ mod tests {
             .validator_sets_match(&block.validators, block.signed_header.header().validators_hash)
             .is_ok());
         assert_ne!(
-            greenfield_header_hash(block.signed_header.header(), &randao_mix),
+            header_hash_with_randao_mix(block.signed_header.header(), &randao_mix),
             block.signed_header.commit.block_id.hash,
         );
         // Signatures still verify over the commit's old block ID.
@@ -695,13 +695,13 @@ mod tests {
     }
 
     #[test]
-    fn greenfield_header_hash_includes_randao_mix() {
+    fn header_hash_includes_randao_mix() {
         let input = valid_light_block_input();
         let (_, proto, original_randao) =
             decode_light_block_validation_input(&input, false).unwrap();
         let block = convert_light_block_from_proto(&proto).unwrap();
         assert_eq!(
-            greenfield_header_hash(block.signed_header.header(), &original_randao),
+            header_hash_with_randao_mix(block.signed_header.header(), &original_randao),
             block.signed_header.commit.block_id.hash,
         );
 
@@ -720,13 +720,13 @@ mod tests {
         assert!(randao.is_empty());
         // Computed independently with greenfield-cometbft v1.3.2's Header.Hash in Go.
         assert_eq!(
-            greenfield_header_hash(block.signed_header.header(), &randao),
+            header_hash_with_randao_mix(block.signed_header.header(), &randao),
             Hash::Sha256(hex!("5B297EDCE236E97E232A2328F2508350B4A7AEFB567BC13A2233978DFD26E946")),
         );
         assert_precompile_rejects(&without_randao);
 
         signed.header.extend_from_slice(
-            &GreenfieldHeaderFields { randao_mix: vec![0x42; 32] }.encode_to_vec(),
+            &HeaderExtensionFields { randao_mix: vec![0x42; 32] }.encode_to_vec(),
         );
         wire_block.signed_header = signed.encode_to_vec();
         let mut with_randao = input[..split].to_vec();
@@ -737,7 +737,7 @@ mod tests {
         assert_eq!(randao, vec![0x42; 32]);
         // Computed independently with greenfield-cometbft v1.3.2's Header.Hash in Go.
         assert_eq!(
-            greenfield_header_hash(block.signed_header.header(), &randao),
+            header_hash_with_randao_mix(block.signed_header.header(), &randao),
             Hash::Sha256(hex!("D67D0F5D68BDE911412C46FD57E594807A869710927E0485278398A6F629DDB6")),
         );
         assert_precompile_rejects(&with_randao);
