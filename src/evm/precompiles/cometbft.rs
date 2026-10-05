@@ -1,22 +1,27 @@
 //! Credits to <https://github.com/bnb-chain/revm/blob/d66170e712460ae766fc26a063f106658ce33e9d/crates/precompile/src/cometbft.rs>
 use crate::evm::precompiles::{dedup::DuplicateTracker, error::BscPrecompileError};
 use alloy_primitives::Bytes;
-use cometbft::{block::signed_header::SignedHeader, validator::Set, vote::Power, PublicKey};
-use cometbft_light_client::{
-    predicates::VerificationPredicates,
-    types::{LightBlock, TrustThreshold},
-};
+use cometbft::{block::signed_header::SignedHeader, validator::Set, vote::Power, Hash, PublicKey};
+use cometbft_light_client::{predicates::VerificationPredicates, types::TrustThreshold};
 use cometbft_light_client_verifier::{
     operations::voting_power::ProdVotingPowerCalculator,
     predicates::ProdPredicates,
     types::{Validator, ValidatorSet},
 };
-use cometbft_proto::types::v1::LightBlock as TmLightBlock;
+use cometbft_proto::{
+    types::v1::{BlockId as TmBlockId, LightBlock as TmLightBlock},
+    version::v1::Consensus as TmVersion,
+    Protobuf,
+};
 use prost12::Message;
 use revm::precompile::{
-    u64_to_address, PrecompileHalt, PrecompileOutput, PrecompileResult, Precompile, PrecompileId,
+    u64_to_address, Precompile, PrecompileHalt, PrecompileId, PrecompileOutput, PrecompileResult,
 };
-use std::{borrow::{Cow, ToOwned}, string::String, vec::Vec};
+use std::{
+    borrow::{Cow, ToOwned},
+    string::String,
+    vec::Vec,
+};
 
 pub(crate) const COMETBFT_LIGHT_BLOCK_VALIDATION: Precompile =
     Precompile::new(PrecompileId::Custom(Cow::Borrowed("COMET_BFT_LIGHT_BLOCK_VALIDATE_HERTZ")), u64_to_address(103), cometbft_light_block_validation_run);
@@ -99,16 +104,11 @@ fn cometbft_light_block_validation_run_inner(
         return Ok(PrecompileOutput::halt(PrecompileHalt::OutOfGas, reservoir));
     }
 
-    let (mut consensus_state, tm_light_block) =
+    let (mut consensus_state, light_block) =
         match decode_light_block_validation_input(input, require_unique_validators) {
             Ok(v) => v,
             Err(h) => return Ok(PrecompileOutput::halt(h, reservoir)),
         };
-
-    let light_block = match convert_light_block_from_proto(&tm_light_block) {
-        Ok(v) => v,
-        Err(h) => return Ok(PrecompileOutput::halt(h, reservoir)),
-    };
 
     // From Pasteur, reject duplicate identities in the incoming light block's validator set
     // (the trusted consensus state set is checked during decoding above).
@@ -138,8 +138,73 @@ fn cometbft_light_block_validation_run_inner(
     ))
 }
 
-type ConvertLightBlockResult = Result<LightBlock, PrecompileHalt>;
-fn convert_light_block_from_proto(light_block_proto: &TmLightBlock) -> ConvertLightBlockResult {
+/// The pinned CometBFT types omit Greenfield's header field 15 (`RandaoMix`). Preserve it
+/// alongside the standard fields so the header hash agrees with Greenfield's Go client.
+#[derive(Clone)]
+struct LightBlock {
+    signed_header: SignedHeader,
+    validators: ValidatorSet,
+    randao_mix: Vec<u8>,
+}
+
+impl LightBlock {
+    fn height(&self) -> cometbft::block::Height {
+        self.signed_header.header().height
+    }
+
+    fn header_hash(&self) -> Hash {
+        let header = self.signed_header.header();
+        // Mirrors greenfield-cometbft/types/block.go Header.Hash: each field is encoded
+        // separately, including the fifteenth leaf even when RandaoMix is empty.
+        let fields = [
+            Protobuf::<TmVersion>::encode_vec(header.version),
+            header.chain_id.clone().encode_vec(),
+            header.height.encode_vec(),
+            header.time.encode_vec(),
+            Protobuf::<TmBlockId>::encode_vec(header.last_block_id.unwrap_or_default()),
+            header.last_commit_hash.unwrap_or_default().encode_vec(),
+            header.data_hash.unwrap_or_default().encode_vec(),
+            header.validators_hash.encode_vec(),
+            header.next_validators_hash.encode_vec(),
+            header.consensus_hash.encode_vec(),
+            header.app_hash.clone().encode_vec(),
+            header.last_results_hash.unwrap_or_default().encode_vec(),
+            header.evidence_hash.unwrap_or_default().encode_vec(),
+            header.proposer_address.encode_vec(),
+            self.randao_mix.encode_to_vec(),
+        ];
+        Hash::Sha256(cometbft::merkle::simple_hash_from_byte_vectors::<
+            cometbft::crypto::default::Sha256,
+        >(&fields))
+    }
+}
+
+// Decode just the extension in a second protobuf view. Using messages at each level retains
+// protobuf's merge semantics for repeated embedded messages; all other fields are decoded
+// and validated by the pinned CometBFT types as before.
+#[derive(Clone, PartialEq, prost::Message)]
+struct LightBlockExtension {
+    #[prost(message, optional, tag = "1")]
+    signed_header: Option<SignedHeaderExtension>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct SignedHeaderExtension {
+    #[prost(message, optional, tag = "1")]
+    header: Option<HeaderExtension>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct HeaderExtension {
+    #[prost(bytes = "vec", tag = "15")]
+    randao_mix: Vec<u8>,
+}
+
+fn decode_light_block(input: &[u8]) -> Result<LightBlock, PrecompileHalt> {
+    let light_block_proto =
+        TmLightBlock::decode(input).map_err(|_| BscPrecompileError::InvalidInput)?;
+    let extension: LightBlockExtension =
+        prost::Message::decode(input).map_err(|_| BscPrecompileError::InvalidInput)?;
     // Both fields are optional in the protobuf definition, so any caller can omit them by
     // crafting the precompile input; treat a missing field as invalid input instead of
     // unwrapping it.
@@ -157,12 +222,19 @@ fn convert_light_block_from_proto(light_block_proto: &TmLightBlock) -> ConvertLi
         Err(_) => return Err(BscPrecompileError::InvalidInput.into()),
     };
 
-    let next_validator_set = validator_set.clone();
-    let peer_id = cometbft::node::Id::new([0u8; 20]);
-    Ok(LightBlock::new(signed_header, validator_set, next_validator_set, peer_id))
+    let randao_mix = extension
+        .signed_header
+        .and_then(|signed_header| signed_header.header)
+        .map(|header| header.randao_mix)
+        .unwrap_or_default();
+    // Matches Greenfield Header.ValidateBasic (empty or one Ed25519 signature).
+    if !randao_mix.is_empty() && randao_mix.len() != 64 {
+        return Err(BscPrecompileError::InvalidInput.into());
+    }
+    Ok(LightBlock { signed_header, validators: validator_set, randao_mix })
 }
 
-type DecodeLightBlockResult = Result<(ConsensusState, TmLightBlock), PrecompileHalt>;
+type DecodeLightBlockResult = Result<(ConsensusState, LightBlock), PrecompileHalt>;
 fn decode_light_block_validation_input(
     input: &[u8],
     require_unique_validators: bool,
@@ -195,15 +267,11 @@ fn decode_light_block_validation_input(
     );
     let consensus_state = decode_consensus_state(&decode_input, require_unique_validators)?;
 
-    let mut light_block_pb: TmLightBlock = TmLightBlock::default();
-    match light_block_pb
-        .merge(&input[CONSENSUS_STATE_LENGTH_BYTES_LENGTH as usize + cs_length as usize..])
-    {
-        Ok(pb) => pb,
-        Err(_) => return Err(BscPrecompileError::InvalidInput.into()),
-    };
+    let light_block = decode_light_block(
+        &input[CONSENSUS_STATE_LENGTH_BYTES_LENGTH as usize + cs_length as usize..],
+    )?;
 
-    Ok((consensus_state, light_block_pb))
+    Ok((consensus_state, light_block))
 }
 
 struct ConsensusState {
@@ -211,6 +279,24 @@ struct ConsensusState {
     height: u64,
     next_validator_set_hash: Bytes,
     validators: ValidatorSet,
+}
+
+/// Bind the supplied validator set to the header and the header to the signed commit.
+///
+/// These are the hash checks in go-bsc's `LightBlock.ValidateBasic`. Signature and voting-power
+/// checks alone do not authenticate the header or the validator set's BLS and relayer metadata.
+fn validate_light_block_bindings(light_block: &LightBlock) -> Result<(), PrecompileHalt> {
+    if light_block.header_hash() != light_block.signed_header.commit().block_id.hash {
+        return Err(BscPrecompileError::CometBftApplyBlockFailed.into());
+    }
+    let predicates = ProdPredicates;
+    predicates
+        .validator_sets_match(
+            &light_block.validators,
+            light_block.signed_header.header().validators_hash,
+        )
+        .map_err(|_| BscPrecompileError::CometBftApplyBlockFailed)?;
+    Ok(())
 }
 
 impl ConsensusState {
@@ -230,6 +316,9 @@ impl ConsensusState {
         if light_block.signed_header.header().chain_id.as_str() != self.chain_id {
             return Err(BscPrecompileError::InvalidInput.into());
         }
+
+        // Required for both adjacent and skipping updates, before any state is changed.
+        validate_light_block_bindings(light_block)?;
 
         let vp = ProdPredicates;
         let voting_power_calculator = ProdVotingPowerCalculator::default();
@@ -488,12 +577,204 @@ mod tests {
         hex::decode(VALID_LIGHT_BLOCK_INPUT).expect("fixture is valid hex")
     }
 
-    /// `signed_header` and `validator_set` are optional protobuf fields, so any caller can
+    /// Structural rejection tests deliberately carry no commit signatures.
+    fn unsigned_light_block() -> LightBlock {
+        let (_, mut block) = decode_light_block_validation_input(&valid_light_block_input(), true)
+            .expect("decode existing fixture");
+        block.signed_header.commit.signatures.clear();
+        block
+    }
+
+    #[test]
+    fn greenfield_header_hash_includes_randao_mix() {
+        let block = unsigned_light_block();
+        assert_eq!(block.randao_mix.len(), 64);
+        assert_eq!(block.header_hash(), block.signed_header.commit.block_id.hash);
+        // The dependency's standard CometBFT hash omits Greenfield's fifteenth leaf.
+        assert_ne!(block.header_hash(), block.signed_header.header.hash());
+        assert!(validate_light_block_bindings(&block).is_ok());
+    }
+
+    #[test]
+    fn greenfield_header_hash_matches_go_vector() {
+        use sha2::{Digest, Sha256};
+
+        // Independent golden vector from greenfield-cometbft v1.3.2,
+        // types/block_test.go: TestHeaderHash, "Generates expected hash".
+        let hash = |value: &str| Hash::Sha256(Sha256::digest(value.as_bytes()).into());
+        let mut block = unsigned_light_block();
+        let header = &mut block.signed_header.header;
+        header.version = cometbft::block::header::Version { block: 1, app: 2 };
+        header.chain_id = "chainId".parse().unwrap();
+        header.height = 3u32.into();
+        header.time = "2019-10-13T16:14:44Z".parse().unwrap();
+        header.last_block_id = Some(cometbft::block::Id {
+            hash: Hash::Sha256([0; 32]),
+            part_set_header: cometbft::block::parts::Header::new(6, Hash::Sha256([0; 32])).unwrap(),
+        });
+        header.last_commit_hash = Some(hash("last_commit_hash"));
+        header.data_hash = Some(hash("data_hash"));
+        header.validators_hash = hash("validators_hash");
+        header.next_validators_hash = hash("next_validators_hash");
+        header.consensus_hash = hash("consensus_hash");
+        header.app_hash = hash("app_hash").as_bytes().to_vec().try_into().unwrap();
+        header.last_results_hash = Some(hash("last_results_hash"));
+        header.evidence_hash = Some(hash("evidence_hash"));
+        header.proposer_address =
+            hash("proposer_address").as_bytes()[..20].to_vec().try_into().unwrap();
+        // This upstream hash-only vector uses 32 bytes, outside the decoder's allowed lengths.
+        block.randao_mix = hash("random_mix").as_bytes().to_vec();
+
+        assert_eq!(
+            block.header_hash(),
+            "9C301304E5EC0CFDE729FE6DE7DD2D4EA7D0B1B8546DB07CF9A8B4811BE47334".parse().unwrap(),
+        );
+    }
+
+    #[test]
+    fn light_block_bindings_reject_header_commit_mismatch() {
+        let original = unsigned_light_block();
+        let mut wrong_commit = original.clone();
+        wrong_commit.signed_header.commit.block_id.hash = Hash::Sha256([0; 32]);
+        let mut wrong_header = original.clone();
+        wrong_header.signed_header.header.app_hash = vec![0; 32].try_into().unwrap();
+        let mut wrong_randao = original;
+        wrong_randao.randao_mix[0] ^= 1;
+
+        for block in [wrong_commit, wrong_header, wrong_randao] {
+            assert_eq!(block.validators.hash(), block.signed_header.header.validators_hash);
+            assert_ne!(block.header_hash(), block.signed_header.commit.block_id.hash);
+            assert_eq!(
+                validate_light_block_bindings(&block),
+                Err(BscPrecompileError::CometBftApplyBlockFailed.into()),
+            );
+        }
+    }
+
+    #[test]
+    fn light_block_bindings_reject_uncommitted_validator_metadata() {
+        let original = unsigned_light_block();
+        for change_bls in [true, false] {
+            let mut block = original.clone();
+            let mut validators = block.validators.validators().clone();
+            if change_bls {
+                validators[0].bls_key = vec![0; 48].try_into().unwrap();
+            } else {
+                validators[0].relayer_address = vec![0; 20].try_into().unwrap();
+            }
+            block.validators = ValidatorSet::without_proposer(validators);
+            // Isolate the set-to-header check: the header still matches its commit.
+            assert_eq!(block.header_hash(), block.signed_header.commit.block_id.hash);
+            assert_ne!(block.validators.hash(), block.signed_header.header.validators_hash);
+            assert_eq!(
+                validate_light_block_bindings(&block),
+                Err(BscPrecompileError::CometBftApplyBlockFailed.into()),
+            );
+        }
+    }
+
+    #[test]
+    fn light_block_binding_failure_preserves_consensus_state() {
+        let mut wrong_header = unsigned_light_block();
+        wrong_header.signed_header.commit.block_id.hash = Hash::Sha256([0; 32]);
+        let mut wrong_validators = unsigned_light_block();
+        wrong_validators.signed_header.header.validators_hash = Hash::Sha256([0; 32]);
+        wrong_validators.signed_header.commit.block_id.hash = wrong_validators.header_hash();
+
+        // Both adjacent and skipping updates must leave every trusted field unchanged.
+        for trusted_height in [0, 1] {
+            for block in [&wrong_header, &wrong_validators] {
+                let (mut state, _) =
+                    decode_light_block_validation_input(&valid_light_block_input(), true).unwrap();
+                state.height = trusted_height;
+                let before = state.encode().unwrap();
+                assert_eq!(
+                    state.apply_light_block(block),
+                    Err(BscPrecompileError::CometBftApplyBlockFailed.into()),
+                );
+                assert_eq!(state.encode().unwrap(), before);
+            }
+        }
+    }
+
+    #[test]
+    fn matching_bindings_still_require_commit_signatures() {
+        let block = unsigned_light_block();
+        assert!(validate_light_block_bindings(&block).is_ok());
+        let (mut state, _) =
+            decode_light_block_validation_input(&valid_light_block_input(), true).unwrap();
+        let before = state.encode().unwrap();
+        assert!(state.apply_light_block(&block).is_err());
+        assert_eq!(state.encode().unwrap(), before);
+    }
+
+    #[test]
+    fn greenfield_header_extension_preserves_protobuf_merge_semantics() {
+        let block = unsigned_light_block();
+        let proto = TmLightBlock {
+            signed_header: Some(block.signed_header.clone().into()),
+            validator_set: Some(block.validators.clone().into()),
+        };
+        let standard_fields = proto.encode_to_vec();
+        for length in [0, 1, 63, 64, 65] {
+            let randao_mix = if length == 64 { block.randao_mix.clone() } else { vec![0; length] };
+            let extension = LightBlockExtension {
+                signed_header: Some(SignedHeaderExtension {
+                    header: Some(HeaderExtension { randao_mix: randao_mix.clone() }),
+                }),
+            };
+            let extension_fields = prost::Message::encode_to_vec(&extension);
+            // Repeated embedded messages merge in either order. Absent fields must not
+            // erase standard header fields or the separately decoded RandaoMix.
+            for parts in
+                [[&standard_fields, &extension_fields], [&extension_fields, &standard_fields]]
+            {
+                let input = [parts[0].as_slice(), parts[1].as_slice()].concat();
+                let decoded = decode_light_block(&input);
+                if length == 0 || length == 64 {
+                    let decoded = decoded.expect("valid RandaoMix length");
+                    assert_eq!(decoded.signed_header, block.signed_header);
+                    assert_eq!(decoded.validators, block.validators);
+                    assert_eq!(decoded.randao_mix, randao_mix);
+                    if length == 64 {
+                        assert_eq!(decoded.header_hash(), block.signed_header.commit.block_id.hash);
+                    }
+                } else {
+                    assert!(
+                        matches!(decoded, Err(h) if h == BscPrecompileError::InvalidInput.into())
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn all_cometbft_variants_accept_bound_fixture_with_unchanged_output() {
+        let input = valid_light_block_input();
+        let before_hertz =
+            COMETBFT_LIGHT_BLOCK_VALIDATION_BEFORE_HERTZ.execute(&input, 1_000_000, 0).unwrap();
+        let hertz = COMETBFT_LIGHT_BLOCK_VALIDATION.execute(&input, 1_000_000, 0).unwrap();
+        let pasteur =
+            COMETBFT_LIGHT_BLOCK_VALIDATION_PASTEUR.execute(&input, 1_000_000, 0).unwrap();
+        for output in [&before_hertz, &hertz, &pasteur] {
+            assert!(output.is_success());
+            assert_eq!(output.bytes, hertz.bytes);
+        }
+        assert_eq!(before_hertz.gas_used, COMETBFT_LIGHT_BLOCK_VALIDATION_BASE);
+        assert_eq!(hertz.gas_used, COMETBFT_LIGHT_BLOCK_VALIDATION_BASE);
+        assert_eq!(
+            pasteur.gas_used,
+            COMETBFT_LIGHT_BLOCK_VALIDATION_BASE +
+                input.len() as u64 * COMETBFT_LIGHT_BLOCK_VALIDATE_PER_BYTE_GAS,
+        );
+    }
+
+/// `signed_header` and `validator_set` are optional protobuf fields, so any caller can
     /// omit them. They used to be unwrapped, panicking the node before the precompile's own
     /// `InvalidInput` handling could run — reachable by anyone for the base gas cost.
     #[test]
     fn light_block_missing_optional_proto_fields_is_invalid_input() {
-        assert!(convert_light_block_from_proto(&TmLightBlock::default()).is_err());
+        assert!(decode_light_block(&[]).is_err());
 
         let input = valid_light_block_input();
         let cs_length = u64::from_be_bytes(
@@ -517,7 +798,7 @@ mod tests {
                 .expect("a missing proto field must not be a fatal error");
             assert!(output.is_halt(), "expected an InvalidInput halt");
 
-            // Pasteur shares `convert_light_block_from_proto`.
+            // Pasteur shares `decode_light_block`.
             let output = cometbft_light_block_validation_run_pasteur(&crafted, 10_000_000, 0)
                 .expect("a missing proto field must not be a fatal error");
             assert!(output.is_halt(), "expected an InvalidInput halt");
@@ -757,12 +1038,7 @@ mod tests {
                 Err(_) => panic!("decode consensus state failed"),
             };
             let light_block_bytes = Bytes::from(hex!("0aeb060adb030a02080b1213677265656e6669656c645f393030302d3132311802220c08b2d7f3a10610e8d2adb3032a480a20ec6ecb5db4ffb17fabe40c60ca7b8441e9c5d77585d0831186f3c37aa16e9c15122408011220a2ab9e1eb9ea52812f413526e424b326aff2f258a56e00d690db9f805b60fe7e32200f40aeff672e8309b7b0aefbb9a1ae3d4299b5c445b7d54e8ff398488467f0053a20e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85542203c350cd55b99dc6c2b7da9bef5410fbfb869fede858e7b95bf7ca294e228bb404a203c350cd55b99dc6c2b7da9bef5410fbfb869fede858e7b95bf7ca294e228bb405220294d8fbd0b94b767a7eba9840f299a3586da7fe6b5dead3b7eecba193c400f935a20bc50557c12d7392b0d07d75df0b61232d48f86a74fdea6d1485d9be6317d268c6220e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b8556a20e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85572146699336aa109d1beab3946198c8e59f3b2cbd92f7a4065e3cd89e315ca39d87dee92835b98f8b8ec0861d6d9bb2c60156df5d375b3ceb1fbe71af6a244907d62548a694165caa660fec7a9b4e7b9198191361c71be0b128a0308021a480a20726abd0fdbfb6f779b0483e6e4b4b6f12241f6ea2bf374233ab1a316692b6415122408011220159f10ff15a8b58fc67a92ffd7f33c8cd407d4ce81b04ca79177dfd00ca19a67226808021214050cff76cc632760ba9db796c046004c900967361a0c08b3d7f3a10610808cadba03224080713027ffb776a702d78fd0406205c629ba473e1f8d6af646190f6eb9262cd67d69be90d10e597b91e06d7298eb6fa4b8f1eb7752ebf352a1f51560294548042268080212146699336aa109d1beab3946198c8e59f3b2cbd92f1a0c08b3d7f3a10610b087c1c00322405e2ddb70acfe4904438be3d9f4206c0ace905ac4fc306a42cfc9e86268950a0fbfd6ec5f526d3e41a3ef52bf9f9f358e3cb4c3feac76c762fa3651c1244fe004226808021214c55765fd2d0570e869f6ac22e7f2916a35ea300d1a0c08b3d7f3a10610f0b3d492032240ca17898bd22232fc9374e1188636ee321a396444a5b1a79f7628e4a11f265734b2ab50caf21e8092c55d701248e82b2f011426cb35ba22043b497a6b4661930612a0050aa8010a14050cff76cc632760ba9db796c046004c9009673612220a20e33f6e876d63791ebd05ff617a1b4f4ad1aa2ce65e3c3a9cdfb33e0ffa7e84231880ade2042080a6bbf6ffffffffff012a30a0805521b5b7ae56eb3fb24555efbfe59e1622bfe9f7be8c9022e9b3f2442739c1ce870b9adee169afe60f674edd7c86321415154514f68ce65a0d9eecc578c0ab12da0a2a283a14ee7a2a6a44d427f6949eeb8f12ea9fbb2501da880aa2010a146699336aa109d1beab3946198c8e59f3b2cbd92f12220a20451c5363d89052fde8351895eeea166ce5373c36e31b518ed191d0c599aa0f5b1880ade2042080ade2042a30831b2a2de9e504d7ea299e52a202ce529808618eb3bfc0addf13d8c5f2df821d81e18f9bc61583510b322d067d46323b3214432f6c4908a9aa5f3444421f466b11645235c99b3a14a0a7769429468054e19059af4867da0a495567e50aa2010a14c55765fd2d0570e869f6ac22e7f2916a35ea300d12220a200a572635c06a049c0a2a929e3c8184a50cf6a8b95708c25834ade456f399015a1880ade2042080ade2042a309065e38cff24f5323c8c5da888a0f97e5ee4ba1e11b0674b0a0d06204c1dfa247c370cd4be3e799fc4f6f48d977ac7ca3214864cb9828254d712f8e59b164fc6a9402dc4e6c53a143139916d97df0c589312b89950b6ab9795f34d1a12a8010a14050cff76cc632760ba9db796c046004c9009673612220a20e33f6e876d63791ebd05ff617a1b4f4ad1aa2ce65e3c3a9cdfb33e0ffa7e84231880ade2042080a6bbf6ffffffffff012a30a0805521b5b7ae56eb3fb24555efbfe59e1622bfe9f7be8c9022e9b3f2442739c1ce870b9adee169afe60f674edd7c86321415154514f68ce65a0d9eecc578c0ab12da0a2a283a14ee7a2a6a44d427f6949eeb8f12ea9fbb2501da88"));
-            let mut light_block_pb: TmLightBlock = TmLightBlock::default();
-            match light_block_pb.merge(light_block_bytes) {
-                Ok(_) => (),
-                Err(_) => panic!("merge light block failed"),
-            };
-            let light_block = match convert_light_block_from_proto(&light_block_pb) {
+            let light_block = match decode_light_block(&light_block_bytes) {
                 Ok(light_block) => light_block,
                 Err(_) => panic!("convert light block from proto failed"),
             };
@@ -784,12 +1060,7 @@ mod tests {
                 Err(_) => panic!("decode consensus state failed"),
             };
             let light_block_bytes = Bytes::from(hex!("0aeb070ade030a02080b1214677265656e6669656c645f393030302d3137343118e9d810220c08f2f2b6a30610af9fcc8e022a480a20315130cf3a10f78c5f7633e3941f605151a6901910713c84da0d7929898e9b9e122408011220f09b2290e56b59a7286c2144a811c780f0fd5f631614a9f7ec2dec43f14ac5d63220d15354fdbcc6c7d3e8c5ede34f4f71e896599ba67773605eb6579e10e09254773a20e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b8554220311b22582926e7833b72904605441ed602896e8aeb093bca5f2e8170cea5ed6a4a20311b22582926e7833b72904605441ed602896e8aeb093bca5f2e8170cea5ed6a5220048091bc7ddc283f77bfbf91d73c44da58c3df8a9cbc867405d8b7f3daada22f5a20ee2da802b95c55e551291d96fe6ee4fe8074ddfa2df110042d6809acb665628a6220e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b8556a20e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b8557214793cee4b478e537592c40ecfb2148ebe32b8f6057a4034248b04af30e0d302cf8cedff585d5e1c6ff8db526bcf298d665cf301ca938a874c76ba9a1fd9fae302b2ec49a335930cf0242762c92843d7f9f7963d60580a12870408e9d8101a480a20452e1984f64c79550ac23db0c408b3eb021675d678ad94f9206ad7a2dec83a181224080112205224c29260b6c220685b29f593bac728e522e3e3675ec7edd92c12251acfe4b4226808021214d742fa5318dc3986e075e2b050529a22c6fa3b8b1a0c08f4f2b6a306109898f6a70322409762b7abd4dd63bb8858673dffd5795b1a87532d3719458d12fbbd1fd2443ca76bd36c4c09fa8952a440de4904f1b6b9270037a147431892c8ace96ad43bf90b2268080212145fa8b3f3fcd4a3ea2495e11dd5dbd399b3d8d4f81a0c08f4f2b6a30610f8f2fd9e03224093f2fc21a41492a34ed3b31ff2eba571ca752ae989f2e47728740bb1eec0f20eb59f59d390ce3d67734ab49a72bc2e97e185d21a4b00f3288ea50b0f1383220a226808021214793cee4b478e537592c40ecfb2148ebe32b8f6051a0c08f4f2b6a306108e8ed7a7032240a4a3c047ca75aeb6e9a21fbc3742f4339c64ead15d117675a2757f7db965aae3e6901f81a3707a67d91c61d6c842b95009e132e7fab187965dc04861d7faa902226808021214f0f07dc2f5e159a35b9662553c6b4e51868502f71a0c08f4f2b6a30610bfed829f032240e23ddc98b0bf7cc6cd494fd8ec96d440d29193910a6eca3dc7e41cdb14efa32471feb1ea2d613bb5acdd8623e8372ed3a36e1838bc75646bdfe9d2ef96647400220f08011a0b088092b8c398feffffff0112d0060a90010a14d742fa5318dc3986e075e2b050529a22c6fa3b8b12220a2083ed2b763bb872e9bc148fb216fd5c93b18819670d9a946ae4b3075672d726b818880820abe8ffffffffffffff012a308146d231a7b2051c5f7a9c07ab6e6bfe277bd5f4a94f901fe6ee7a6b6bd8479e9e5e448de4b1b33d5ddd74194c86b385321424aab6f85470ff73e3048c64083a09e980d4cb7f0a88010a145fa8b3f3fcd4a3ea2495e11dd5dbd399b3d8d4f812220a2048e2b2f7d9a3e7b668757d9cc0bbd28cd674c34ed1c2ed75c5de3b6a8f8cad4618fc0720fc072a30a4726b542012cc8023ee07b29ab3971cc999d8751bbd16f23413968afcdb070ed66ab47e6e1842bf875bef21dfc5b8af3214668a0acd8f6db5cae959a0e02132f4d6a672c4d70a88010a14793cee4b478e537592c40ecfb2148ebe32b8f60512220a206813bfd82860d361e339bd1ae2f801b6d6ee46b8497a3d51c80b50b6160ea1cc18ec0720ec072a308d4786703c56b300b70f085c0d0482e5d6a3c7208883f0ec8abd2de893f71d18e8f919e7ab198499201d87f92c57ebce32140dfa99423d3084c596c5e3bd6bcb4f654516517b0a88010a14f0f07dc2f5e159a35b9662553c6b4e51868502f712220a202cc140a3f08a9c4149efd45643202f8bef2ad7eecf53e58951c6df6fd932004b18ec0720ec072a3095c286deb3f1657664859d59876bf1ec5a288f6e66e18b37b8a2a1e6ee4a3ef8fa50784d8b758d0c3e70a7cdfe65ab5d32144998f6ef8d999a0f36a851bfa29dbcf0364dd6560a86010a1468478c1a37bc01c3acb7470cc6a78f1009a14f7012220a20de83e10566b038855254800b5b0ebf7c21aede9883c11e5cf289979e233b3efe180120012a3089063607696a9e6dbddbe6c23b4634a7c02b80212afc7ec65fb0d379d55d2d0cb25df19c0252356ffa2e2252eedd8f57321400000000000000000000000000000000000000001290010a14d742fa5318dc3986e075e2b050529a22c6fa3b8b12220a2083ed2b763bb872e9bc148fb216fd5c93b18819670d9a946ae4b3075672d726b818880820abe8ffffffffffffff012a308146d231a7b2051c5f7a9c07ab6e6bfe277bd5f4a94f901fe6ee7a6b6bd8479e9e5e448de4b1b33d5ddd74194c86b385321424aab6f85470ff73e3048c64083a09e980d4cb7f"));
-            let mut light_block_pb: TmLightBlock = TmLightBlock::default();
-            match light_block_pb.merge(light_block_bytes) {
-                Ok(_) => (),
-                Err(_) => panic!("merge light block failed"),
-            };
-            let light_block = match convert_light_block_from_proto(&light_block_pb) {
+            let light_block = match decode_light_block(&light_block_bytes) {
                 Ok(light_block) => light_block,
                 Err(_) => panic!("convert light block from proto failed"),
             };
