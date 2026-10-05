@@ -228,11 +228,16 @@ fn header_hash_with_randao_mix(header: &block::Header, randao_mix: &[u8]) -> Has
 fn decode_randao_mix(light_block_bytes: &[u8]) -> Result<Vec<u8>, PrecompileHalt> {
     let extension_fields = LightBlockExtensionFields::decode(light_block_bytes)
         .map_err(|_| BscPrecompileError::InvalidInput)?;
-    Ok(extension_fields
+    let randao_mix = extension_fields
         .signed_header
         .and_then(|signed| signed.header)
         .map(|header| header.randao_mix)
-        .unwrap_or_default())
+        .unwrap_or_default();
+    // Matches Greenfield Header.ValidateBasic (empty or one Ed25519 signature).
+    if !randao_mix.is_empty() && randao_mix.len() != 64 {
+        return Err(BscPrecompileError::InvalidInput.into());
+    }
+    Ok(randao_mix)
 }
 
 type DecodeLightBlockResult = Result<(ConsensusState, TmLightBlock, Vec<u8>), PrecompileHalt>;
@@ -287,6 +292,27 @@ struct ConsensusState {
     validators: ValidatorSet,
 }
 
+/// Bind the supplied validator set to the header and the header to the signed commit.
+fn validate_light_block_bindings(
+    light_block: &LightBlock,
+    randao_mix: &[u8],
+) -> Result<(), PrecompileHalt> {
+    // These are the hash checks in Go BSC's LightBlock.ValidateBasic. Signature and
+    // voting-power checks alone do not authenticate the header or the validator metadata.
+    if ProdPredicates
+        .validator_sets_match(
+            &light_block.validators,
+            light_block.signed_header.header().validators_hash,
+        )
+        .is_err() ||
+        header_hash_with_randao_mix(light_block.signed_header.header(), randao_mix) !=
+            light_block.signed_header.commit.block_id.hash
+    {
+        return Err(BscPrecompileError::CometBftApplyBlockFailed.into());
+    }
+    Ok(())
+}
+
 impl ConsensusState {
     fn new(
         chain_id: String,
@@ -309,23 +335,10 @@ impl ConsensusState {
             return Err(BscPrecompileError::InvalidInput.into());
         }
 
-        let vp = ProdPredicates;
-        // Go BSC's LightBlock.ValidateBasic binds the supplied validator set to the header
-        // and the signed commit to that same header before tallying voting power. Without
-        // these checks, a caller can validate signatures against an unrelated validator set
-        // or reuse a valid commit with a different header.
-        if vp
-            .validator_sets_match(
-                &light_block.validators,
-                light_block.signed_header.header().validators_hash,
-            )
-            .is_err() ||
-            header_hash_with_randao_mix(light_block.signed_header.header(), randao_mix) !=
-                light_block.signed_header.commit.block_id.hash
-        {
-            return Err(BscPrecompileError::CometBftApplyBlockFailed.into());
-        }
+        // Required for both adjacent and skipping updates, before any state is changed.
+        validate_light_block_bindings(light_block, randao_mix)?;
 
+        let vp = ProdPredicates;
         let voting_power_calculator = ProdVotingPowerCalculator::default();
         let trust_threshold_two_third = TrustThreshold::TWO_THIRDS;
         let trust_threshold_one_third = TrustThreshold::ONE_THIRD;
@@ -700,9 +713,14 @@ mod tests {
         let (_, proto, original_randao) =
             decode_light_block_validation_input(&input, false).unwrap();
         let block = convert_light_block_from_proto(&proto).unwrap();
+        assert_eq!(original_randao.len(), 64);
         assert_eq!(
             header_hash_with_randao_mix(block.signed_header.header(), &original_randao),
             block.signed_header.commit.block_id.hash,
+        );
+        assert_ne!(
+            header_hash_with_randao_mix(block.signed_header.header(), &original_randao),
+            block.signed_header.header.hash(),
         );
 
         let split = fixture_split(&input);
@@ -732,15 +750,223 @@ mod tests {
         let mut with_randao = input[..split].to_vec();
         with_randao.extend_from_slice(&wire_block.encode_to_vec());
 
-        let (_, proto, randao) = decode_light_block_validation_input(&with_randao, false).unwrap();
-        let block = convert_light_block_from_proto(&proto).unwrap();
-        assert_eq!(randao, vec![0x42; 32]);
+        assert!(matches!(
+            decode_light_block_validation_input(&with_randao, false),
+            Err(h) if h == BscPrecompileError::InvalidInput.into()
+        ));
+        // The hash-only vector remains useful, but its 32-byte RandaoMix is invalid input.
+        let randao = vec![0x42; 32];
         // Computed independently with greenfield-cometbft v1.3.2's Header.Hash in Go.
         assert_eq!(
             header_hash_with_randao_mix(block.signed_header.header(), &randao),
             Hash::Sha256(hex!("D67D0F5D68BDE911412C46FD57E594807A869710927E0485278398A6F629DDB6")),
         );
         assert_precompile_rejects(&with_randao);
+    }
+
+    /// Structural rejection tests deliberately carry no commit signatures.
+    fn unsigned_light_block() -> (LightBlock, Vec<u8>) {
+        let (_, proto, randao_mix) =
+            decode_light_block_validation_input(&valid_light_block_input(), true).unwrap();
+        let mut block = convert_light_block_from_proto(&proto).unwrap();
+        block.signed_header.commit.signatures.clear();
+        (block, randao_mix)
+    }
+
+    #[test]
+    fn greenfield_header_hash_matches_go_vector() {
+        use sha2::{Digest, Sha256};
+
+        // Independent golden vector from greenfield-cometbft v1.3.2,
+        // types/block_test.go: TestHeaderHash, "Generates expected hash".
+        let hash = |value: &str| Hash::Sha256(Sha256::digest(value.as_bytes()).into());
+        let (mut block, _) = unsigned_light_block();
+        let header = &mut block.signed_header.header;
+        header.version = block::header::Version { block: 1, app: 2 };
+        header.chain_id = "chainId".parse().unwrap();
+        header.height = 3u32.into();
+        header.time = "2019-10-13T16:14:44Z".parse().unwrap();
+        header.last_block_id = Some(block::Id {
+            hash: Hash::Sha256([0; 32]),
+            part_set_header: block::parts::Header::new(6, Hash::Sha256([0; 32])).unwrap(),
+        });
+        header.last_commit_hash = Some(hash("last_commit_hash"));
+        header.data_hash = Some(hash("data_hash"));
+        header.validators_hash = hash("validators_hash");
+        header.next_validators_hash = hash("next_validators_hash");
+        header.consensus_hash = hash("consensus_hash");
+        header.app_hash = hash("app_hash").as_bytes().to_vec().try_into().unwrap();
+        header.last_results_hash = Some(hash("last_results_hash"));
+        header.evidence_hash = Some(hash("evidence_hash"));
+        header.proposer_address =
+            hash("proposer_address").as_bytes()[..20].to_vec().try_into().unwrap();
+        // This upstream hash-only vector uses 32 bytes, outside the decoder's allowed lengths.
+        let randao_mix = hash("random_mix").as_bytes().to_vec();
+
+        assert_eq!(
+            header_hash_with_randao_mix(header, &randao_mix),
+            "9C301304E5EC0CFDE729FE6DE7DD2D4EA7D0B1B8546DB07CF9A8B4811BE47334".parse().unwrap(),
+        );
+    }
+
+    #[test]
+    fn light_block_bindings_reject_header_commit_mismatch() {
+        let (original, randao_mix) = unsigned_light_block();
+        let mut wrong_commit = original.clone();
+        wrong_commit.signed_header.commit.block_id.hash = Hash::Sha256([0; 32]);
+        let mut wrong_header = original.clone();
+        wrong_header.signed_header.header.app_hash = vec![0; 32].try_into().unwrap();
+        let mut wrong_randao = randao_mix.clone();
+        wrong_randao[0] ^= 1;
+
+        for (block, randao_mix) in [
+            (wrong_commit, randao_mix.clone()),
+            (wrong_header, randao_mix),
+            (original, wrong_randao),
+        ] {
+            assert_eq!(block.validators.hash(), block.signed_header.header.validators_hash);
+            assert_ne!(
+                header_hash_with_randao_mix(block.signed_header.header(), &randao_mix),
+                block.signed_header.commit.block_id.hash,
+            );
+            assert_eq!(
+                validate_light_block_bindings(&block, &randao_mix),
+                Err(BscPrecompileError::CometBftApplyBlockFailed.into()),
+            );
+        }
+    }
+
+    #[test]
+    fn light_block_bindings_reject_uncommitted_validator_metadata() {
+        let (original, randao_mix) = unsigned_light_block();
+        for change_bls in [true, false] {
+            let mut block = original.clone();
+            let mut validators = block.validators.validators().clone();
+            if change_bls {
+                validators[0].bls_key = vec![0; 48].try_into().unwrap();
+            } else {
+                validators[0].relayer_address = vec![0; 20].try_into().unwrap();
+            }
+            block.validators = ValidatorSet::without_proposer(validators);
+            // Isolate the set-to-header check: the header still matches its commit.
+            assert_eq!(
+                header_hash_with_randao_mix(block.signed_header.header(), &randao_mix),
+                block.signed_header.commit.block_id.hash,
+            );
+            assert_ne!(block.validators.hash(), block.signed_header.header.validators_hash);
+            assert_eq!(
+                validate_light_block_bindings(&block, &randao_mix),
+                Err(BscPrecompileError::CometBftApplyBlockFailed.into()),
+            );
+        }
+    }
+
+    #[test]
+    fn light_block_binding_failure_preserves_consensus_state() {
+        let (mut wrong_header, randao_mix) = unsigned_light_block();
+        wrong_header.signed_header.commit.block_id.hash = Hash::Sha256([0; 32]);
+        let (mut wrong_validators, _) = unsigned_light_block();
+        wrong_validators.signed_header.header.validators_hash = Hash::Sha256([0; 32]);
+        wrong_validators.signed_header.commit.block_id.hash =
+            header_hash_with_randao_mix(wrong_validators.signed_header.header(), &randao_mix);
+
+        // Both adjacent and skipping updates must leave every trusted field unchanged.
+        for trusted_height in [0, 1] {
+            for block in [&wrong_header, &wrong_validators] {
+                let (mut state, _, _) =
+                    decode_light_block_validation_input(&valid_light_block_input(), true).unwrap();
+                state.height = trusted_height;
+                let before = state.encode().unwrap();
+                assert_eq!(
+                    state.apply_light_block(block, &randao_mix),
+                    Err(BscPrecompileError::CometBftApplyBlockFailed.into()),
+                );
+                assert_eq!(state.encode().unwrap(), before);
+            }
+        }
+    }
+
+    #[test]
+    fn matching_bindings_still_require_commit_signatures() {
+        let (block, randao_mix) = unsigned_light_block();
+        assert!(validate_light_block_bindings(&block, &randao_mix).is_ok());
+        let (mut state, _, _) =
+            decode_light_block_validation_input(&valid_light_block_input(), true).unwrap();
+        let before = state.encode().unwrap();
+        assert!(state.apply_light_block(&block, &randao_mix).is_err());
+        assert_eq!(state.encode().unwrap(), before);
+    }
+
+    #[test]
+    fn greenfield_header_extension_preserves_protobuf_merge_semantics() {
+        let (block, original_randao) = unsigned_light_block();
+        let proto = TmLightBlock {
+            signed_header: Some(block.signed_header.clone().into()),
+            validator_set: Some(block.validators.clone().into()),
+        };
+        let standard_fields = proto.encode_to_vec();
+        let fixture = valid_light_block_input();
+        let trusted_state_prefix = &fixture[..fixture_split(&fixture)];
+        for length in [0, 1, 32, 63, 64, 65] {
+            let randao_mix = if length == 64 { original_randao.clone() } else { vec![0; length] };
+            let extension = LightBlockExtensionFields {
+                signed_header: Some(SignedHeaderExtensionFields {
+                    header: Some(HeaderExtensionFields { randao_mix: randao_mix.clone() }),
+                }),
+            };
+            let extension_fields = extension.encode_to_vec();
+            // Repeated embedded messages merge in either order. Absent fields must not
+            // erase standard header fields or the separately decoded RandaoMix.
+            for parts in
+                [[&standard_fields, &extension_fields], [&extension_fields, &standard_fields]]
+            {
+                let input =
+                    [trusted_state_prefix, parts[0].as_slice(), parts[1].as_slice()].concat();
+                let decoded = decode_light_block_validation_input(&input, true);
+                if length == 0 || length == 64 {
+                    let (_, decoded_proto, decoded_randao) =
+                        decoded.expect("valid RandaoMix length");
+                    let decoded = convert_light_block_from_proto(&decoded_proto).unwrap();
+                    assert_eq!(decoded.signed_header, block.signed_header);
+                    assert_eq!(decoded.validators, block.validators);
+                    assert_eq!(decoded_randao, randao_mix);
+                    if length == 64 {
+                        assert_eq!(
+                            header_hash_with_randao_mix(
+                                decoded.signed_header.header(),
+                                &decoded_randao
+                            ),
+                            block.signed_header.commit.block_id.hash,
+                        );
+                    }
+                } else {
+                    assert!(
+                        matches!(decoded, Err(h) if h == BscPrecompileError::InvalidInput.into())
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn all_cometbft_variants_accept_bound_fixture_with_unchanged_output() {
+        let input = valid_light_block_input();
+        let before_hertz =
+            COMETBFT_LIGHT_BLOCK_VALIDATION_BEFORE_HERTZ.execute(&input, 1_000_000, 0).unwrap();
+        let hertz = COMETBFT_LIGHT_BLOCK_VALIDATION.execute(&input, 1_000_000, 0).unwrap();
+        let pasteur =
+            COMETBFT_LIGHT_BLOCK_VALIDATION_PASTEUR.execute(&input, 1_000_000, 0).unwrap();
+        for output in [&before_hertz, &hertz, &pasteur] {
+            assert!(output.is_success());
+            assert_eq!(output.bytes, hertz.bytes);
+        }
+        assert_eq!(before_hertz.gas_used, COMETBFT_LIGHT_BLOCK_VALIDATION_BASE);
+        assert_eq!(hertz.gas_used, COMETBFT_LIGHT_BLOCK_VALIDATION_BASE);
+        assert_eq!(
+            pasteur.gas_used,
+            COMETBFT_LIGHT_BLOCK_VALIDATION_BASE +
+                input.len() as u64 * COMETBFT_LIGHT_BLOCK_VALIDATE_PER_BYTE_GAS,
+        );
     }
 
     /// `signed_header` and `validator_set` are optional protobuf fields, so any caller can
