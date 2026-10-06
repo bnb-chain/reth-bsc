@@ -13,9 +13,10 @@ use std::{
 
 use crate::node::network::BscNewBlock;
 
-pub mod handle;
-pub mod service;
 pub(crate) mod fork_recover;
+pub mod handle;
+mod header_validation;
+pub mod service;
 
 #[derive(Debug)]
 pub struct BscBlockImport {
