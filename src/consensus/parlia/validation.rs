@@ -9,7 +9,7 @@ use alloy_consensus::{Header, Transaction, EMPTY_OMMER_ROOT_HASH};
 use alloy_primitives::B256;
 use reth_primitives_traits::GotExpected;
 use alloy_eips::eip4844::{DATA_GAS_PER_BLOB, MAX_DATA_GAS_PER_BLOCK_DENCUN};
-use crate::BscBlock;
+use crate::{BscBlock, BscBlockBody};
 use reth_primitives_traits::Block;
 use std::{sync::Arc, time::SystemTime};
 
@@ -274,25 +274,71 @@ impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 's
     }
 }
 
+/// Validate transaction, ommer, and withdrawal commitments independently of fork activation.
+/// Header validation separately enforces BSC's fork-specific field requirements.
+/// A supplied transaction root must be computed from this body by the caller.
+fn validate_body_commitments(
+    body: &BscBlockBody,
+    header: &Header,
+    transaction_root: Option<B256>,
+) -> Result<(), ConsensusError> {
+    use reth_primitives_traits::BlockBody;
 
-impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 'static> Consensus<BscBlock> for Parlia<ChainSpec> {
+    let ommers_hash = body.calculate_ommers_root();
+    if ommers_hash != Some(header.ommers_hash) {
+        return Err(ConsensusError::BodyOmmersHashDiff(
+            GotExpected {
+                got: ommers_hash.unwrap_or(EMPTY_OMMER_ROOT_HASH),
+                expected: header.ommers_hash,
+            }
+            .into(),
+        ));
+    }
+
+    let transaction_root = transaction_root.unwrap_or_else(|| body.calculate_tx_root());
+    if transaction_root != header.transactions_root {
+        return Err(ConsensusError::BodyTransactionRootDiff(
+            GotExpected { got: transaction_root, expected: header.transactions_root }.into(),
+        ));
+    }
+
+    match (header.withdrawals_root, body.calculate_withdrawals_root()) {
+        (Some(expected), Some(got)) if got != expected => {
+            return Err(ConsensusError::BodyWithdrawalsRootDiff(
+                GotExpected { got, expected }.into(),
+            ));
+        }
+        (Some(_), Some(_)) | (None, None) => {}
+        _ => return Err(ConsensusError::WithdrawalsRootUnexpected),
+    }
+
+    Ok(())
+}
+
+impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 'static>
+    Consensus<BscBlock> for Parlia<ChainSpec>
+{
     fn validate_body_against_header(
         &self,
-        _body: &<BscBlock as Block>::Body,
-        _header: &SealedHeader,
+        body: &<BscBlock as Block>::Body,
+        header: &SealedHeader,
     ) -> Result<(), ConsensusError> {
-        // is unused.
-        unimplemented!()
+        validate_body_commitments(body, header, None)
     }
 
     fn validate_block_pre_execution(
         &self,
         block: &reth_primitives_traits::SealedBlock<BscBlock>,
     ) -> Result<(), ConsensusError> {
-        // Check transaction root
-        if let Err(error) = block.ensure_transaction_root_valid() {
-            return Err(ConsensusError::BodyTransactionRootDiff(error.into()));
-        }
+        self.validate_block_pre_execution_with_tx_root(block, None)
+    }
+
+    fn validate_block_pre_execution_with_tx_root(
+        &self,
+        block: &reth_primitives_traits::SealedBlock<BscBlock>,
+        transaction_root: Option<B256>,
+    ) -> Result<(), ConsensusError> {
+        validate_body_commitments(block.body(), block.header(), transaction_root)?;
 
         if BscHardforks::is_osaka_active_at_timestamp(&*self.spec, block.number, block.timestamp) {
             let rlp_length = BscBlock::rlp_length(block.header(), block.body());
