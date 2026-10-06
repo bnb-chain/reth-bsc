@@ -1410,7 +1410,16 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_peer_headers_are_neither_relayed_nor_executed() {
-        for case in ["extra", "signer", "unauthorized", "difficulty", "parent_time", "body"] {
+        for case in [
+            "extra",
+            "signer",
+            "unauthorized",
+            "difficulty",
+            "parent_time",
+            "body",
+            "ommers",
+            "withdrawals",
+        ] {
             let mut provider = MockProvider::new();
             provider.insert(test_parent(), U256::from(1));
             let mut snapshots = test_snapshot();
@@ -1426,9 +1435,17 @@ mod tests {
                 }
                 "parent_time" => header.timestamp = test_parent().timestamp,
                 "body" => header.transactions_root = B256::ZERO,
+                "ommers" | "withdrawals" => {}
                 _ => unreachable!(),
             }
             block.hash = header.hash_slow();
+            // Change only the body: the previously valid signed header stays intact.
+            let body = &mut Arc::make_mut(&mut block.block).0.block.body;
+            match case {
+                "ommers" => body.inner.ommers.push(Header::default()),
+                "withdrawals" => body.inner.withdrawals = Some(Default::default()),
+                _ => {}
+            }
             let (mut service, mut engine, mut events) = relay_test_service(provider, snapshots);
             service.on_new_block(block, PeerId::random());
             assert!(events.try_recv().is_err(), "{case}: relayed on admission");
