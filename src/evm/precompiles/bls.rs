@@ -3,14 +3,15 @@
 use alloy_primitives::Bytes;
 use bls_on_arkworks as bls;
 use revm::precompile::{
-    u64_to_address, PrecompileHalt, PrecompileOutput, PrecompileResult, Precompile, PrecompileId,
+    u64_to_address, Precompile, PrecompileHalt, PrecompileId, PrecompileOutput, PrecompileResult,
 };
 use std::{borrow::Cow, vec::Vec};
 
-use super::error::BscPrecompileError;
-
-pub(crate) const BLS_SIGNATURE_VALIDATION: Precompile =
-    Precompile::new(PrecompileId::Custom(Cow::Borrowed("BLS_SIGNATURE_VERIFY")), u64_to_address(102), bls_signature_validation_run);
+pub(crate) const BLS_SIGNATURE_VALIDATION: Precompile = Precompile::new(
+    PrecompileId::Custom(Cow::Borrowed("BLS_SIGNATURE_VERIFY")),
+    u64_to_address(102),
+    bls_signature_validation_run,
+);
 
 const BLS_MSG_HASH_LENGTH: u64 = 32;
 const BLS_SIGNATURE_LENGTH: u64 = 96;
@@ -38,40 +39,33 @@ fn bls_signature_validation_run(input: &[u8], gas_limit: u64, reservoir: u64) ->
         return revert()
     }
 
-    let msg_hash: &Vec<u8> = &input[..BLS_MSG_HASH_LENGTH as usize].to_vec();
-    let signature = &input[BLS_MSG_HASH_LENGTH as usize..msg_and_sig_length as usize].to_vec();
-    let pub_keys_data = &input[msg_and_sig_length as usize..].to_vec();
+    let msg_hash = input[..BLS_MSG_HASH_LENGTH as usize].to_vec();
+    let signature = input[BLS_MSG_HASH_LENGTH as usize..msg_and_sig_length as usize].to_vec();
 
     // check signature format
-    if bls::signature_to_point(&signature.to_vec()).is_err() {
+    if bls::signature_to_point(&signature).is_err() {
         return revert()
     }
 
-    let pub_key_count = (input_length - msg_and_sig_length) / BLS_SINGLE_PUBKEY_LENGTH;
-    let mut pub_keys = Vec::with_capacity(pub_key_count as usize);
-    let mut msg_hashes = Vec::with_capacity(pub_key_count as usize);
-
-    // check pubkey format and push to pub_keys
-    for i in 0..pub_key_count {
-        let pub_key = &pub_keys_data[i as usize * BLS_SINGLE_PUBKEY_LENGTH as usize..
-            (i + 1) as usize * BLS_SINGLE_PUBKEY_LENGTH as usize];
-        if !bls::key_validate(&pub_key.to_vec()) {
+    // All keys sign the same message, so sum the validated points before pairing.
+    // Preserve the existing key validation, including rejection of infinity, and
+    // count repeated keys with their full multiplicity, as go-bsc does.
+    let mut aggregate_pubkey = bls::types::G1ProjectivePoint::default();
+    for pub_key in
+        input[msg_and_sig_length as usize..].chunks_exact(BLS_SINGLE_PUBKEY_LENGTH as usize)
+    {
+        let Ok(point) = bls::pubkey_to_point(&pub_key.to_vec()) else { return revert() };
+        if !bls::pubkey_subgroup_check(point) {
             return revert()
         }
-        pub_keys.push(pub_key.to_vec());
-        msg_hashes.push(msg_hash.clone().to_vec());
-    }
-    if pub_keys.is_empty() {
-        return revert()
+        aggregate_pubkey += point;
     }
 
-    // verify signature
-    let mut output = Bytes::from(vec![1]);
-    if (pub_keys.len() == 1 && !bls::verify(&pub_keys[0], msg_hash, signature, &BLS_DST.to_vec())) ||
-        !bls::aggregate_verify(pub_keys, msg_hashes, signature, &BLS_DST.to_vec())
-    {
-        output = Bytes::from(vec![]);
-    }
+    // Hash the message and verify once, including the single-key case. A sum at
+    // infinity returns false: the legacy verifier also rejects infinity signatures.
+    let aggregate_pubkey = bls::point_to_pubkey(aggregate_pubkey.into());
+    let verified = bls::verify(&aggregate_pubkey, &msg_hash, &signature, &BLS_DST.to_vec());
+    let output = if verified { Bytes::from_static(&[1]) } else { Bytes::new() };
 
     Ok(PrecompileOutput::new(cost, output, reservoir))
 }
@@ -99,6 +93,125 @@ fn calc_gas_cost(input: &[u8]) -> u64 {
 mod tests {
     use super::*;
     use alloy_primitives::hex;
+    use blst::min_pk::{AggregateSignature, SecretKey};
+
+    // Use a second implementation to construct small, ordinary aggregate signatures.
+    fn signed_input(signers: &[u8]) -> Vec<u8> {
+        let message = [0x42; 32];
+        let keys: Vec<_> =
+            signers.iter().map(|seed| SecretKey::key_gen(&[*seed; 32], &[]).unwrap()).collect();
+        let signatures: Vec<_> = keys.iter().map(|key| key.sign(&message, BLS_DST, &[])).collect();
+        let signature_refs: Vec<_> = signatures.iter().collect();
+        let signature =
+            AggregateSignature::aggregate(&signature_refs, true).unwrap().to_signature();
+        let mut input = message.to_vec();
+        input.extend_from_slice(&signature.to_bytes());
+        for key in keys {
+            input.extend_from_slice(&key.sk_to_pk().to_bytes());
+        }
+        input
+    }
+
+    fn legacy_verifies(input: &[u8]) -> bool {
+        let message = input[..32].to_vec();
+        let signature = input[32..128].to_vec();
+        let keys: Vec<_> = input[128..].chunks_exact(48).map(<[u8]>::to_vec).collect();
+        let messages = vec![message; keys.len()];
+        bls::aggregate_verify(keys, messages, &signature, &BLS_DST.to_vec())
+    }
+
+    #[test]
+    fn same_message_aggregates_preserve_results_and_gas() {
+        // Repeated keys are valid; each occurrence contributes to the aggregate.
+        for signers in
+            [&[1][..], &[1, 2], &[1, 2, 3], &[1, 2, 3, 4, 5, 6, 7, 8], &[1, 1], &[1, 2, 1]]
+        {
+            let mut input = signed_input(signers);
+            let cost = 1_000 + 3_500 * signers.len() as u64;
+            let reservoir = 73;
+            assert!(legacy_verifies(&input));
+            assert_eq!(
+                bls_signature_validation_run(&input, cost, reservoir).unwrap(),
+                PrecompileOutput::new(cost, Bytes::from_static(&[1]), reservoir),
+            );
+            assert_eq!(
+                bls_signature_validation_run(&input, cost - 1, reservoir).unwrap(),
+                PrecompileOutput::halt(PrecompileHalt::OutOfGas, reservoir),
+            );
+
+            input[0] ^= 1;
+            assert!(!legacy_verifies(&input));
+            assert_eq!(
+                bls_signature_validation_run(&input, cost, reservoir).unwrap(),
+                PrecompileOutput::new(cost, Bytes::new(), reservoir),
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_encodings_and_infinity_preserve_revert_behavior() {
+        let input = signed_input(&[1, 2]);
+        let cost = 8_000;
+        let reservoir = 73;
+        for (start, len) in [(32, 96), (128, 48), (176, 48)] {
+            let mut invalid = input.clone();
+            invalid[start..start + len].fill(0);
+            assert_eq!(
+                bls_signature_validation_run(&invalid, cost, reservoir).unwrap(),
+                PrecompileOutput::revert(cost, Bytes::new(), reservoir),
+            );
+
+            invalid[start] = 0xc0; // Canonical compressed infinity.
+            let expected = if start == 32 {
+                // A decodable infinity signature is false, whereas an infinity key reverts.
+                PrecompileOutput::new(cost, Bytes::new(), reservoir)
+            } else {
+                PrecompileOutput::revert(cost, Bytes::new(), reservoir)
+            };
+            assert_eq!(bls_signature_validation_run(&invalid, cost, reservoir).unwrap(), expected);
+
+            invalid[start + len - 1] = 1; // Non-canonical infinity encoding.
+            assert_eq!(
+                bls_signature_validation_run(&invalid, cost, reservoir).unwrap(),
+                PrecompileOutput::revert(cost, Bytes::new(), reservoir),
+            );
+        }
+    }
+
+    #[test]
+    fn cancelling_public_keys_preserve_false_result() {
+        let mut input = signed_input(&[1]);
+        let point = bls::pubkey_to_point(&input[128..].to_vec()).unwrap();
+        input.extend_from_slice(&bls::point_to_pubkey(-point));
+        assert!(!legacy_verifies(&input));
+        assert_eq!(
+            bls_signature_validation_run(&input, 8_000, 73).unwrap(),
+            PrecompileOutput::new(8_000, Bytes::new(), 73),
+        );
+
+        input[32..128].fill(0);
+        input[32] = 0xc0;
+        assert!(!legacy_verifies(&input));
+        assert_eq!(
+            bls_signature_validation_run(&input, 8_000, 73).unwrap(),
+            PrecompileOutput::new(8_000, Bytes::new(), 73),
+        );
+    }
+
+    #[test]
+    fn malformed_lengths_preserve_gas_precedence() {
+        for len in [0, 32, 128, 175, 177] {
+            let input = vec![0; len];
+            assert_eq!(
+                bls_signature_validation_run(&input, 1_000, 73).unwrap(),
+                PrecompileOutput::revert(1_000, Bytes::new(), 73),
+            );
+            assert_eq!(
+                bls_signature_validation_run(&input, 999, 73).unwrap(),
+                PrecompileOutput::halt(PrecompileHalt::OutOfGas, 73),
+            );
+        }
+    }
 
     #[test]
     fn test_bls_signature_validation_with_single_key() {
@@ -111,7 +224,8 @@ mod tests {
         input.extend_from_slice(&pub_key);
 
         let excepted_output = Bytes::from(vec![1]);
-        let result = match bls_signature_validation_run(&Bytes::from(input.clone()), 100_000_000, 0) {
+        let result = match bls_signature_validation_run(&Bytes::from(input.clone()), 100_000_000, 0)
+        {
             Ok(o) => o.bytes,
             Err(e) => panic!("BLS signature validation failed, {e:?}"),
         };
@@ -127,7 +241,8 @@ mod tests {
         input.extend_from_slice(&pub_key);
 
         let excepted_output = Bytes::from(vec![]);
-        let result = match bls_signature_validation_run(&Bytes::from(input.clone()), 100_000_000, 0) {
+        let result = match bls_signature_validation_run(&Bytes::from(input.clone()), 100_000_000, 0)
+        {
             Ok(o) => o.bytes,
             Err(e) => panic!("BLS signature validation failed, {e:?}"),
         };
@@ -177,7 +292,8 @@ mod tests {
         input.extend_from_slice(&pub_key3);
 
         let excepted_output = Bytes::from(vec![1]);
-        let result = match bls_signature_validation_run(&Bytes::from(input.clone()), 100_000_000, 0) {
+        let result = match bls_signature_validation_run(&Bytes::from(input.clone()), 100_000_000, 0)
+        {
             Ok(o) => o.bytes,
             Err(e) => panic!("BLS signature validation failed, {e:?}"),
         };
@@ -196,7 +312,8 @@ mod tests {
         input.extend_from_slice(&pub_key2);
         input.extend_from_slice(&pub_key3);
         let excepted_output = Bytes::from(vec![]);
-        let result = match bls_signature_validation_run(&Bytes::from(input.clone()), 100_000_000, 0) {
+        let result = match bls_signature_validation_run(&Bytes::from(input.clone()), 100_000_000, 0)
+        {
             Ok(o) => o.bytes,
             Err(e) => panic!("BLS signature validation failed, {e:?}"),
         };
@@ -251,7 +368,8 @@ mod tests {
         input.extend_from_slice(&pub_key2);
         input.extend_from_slice(&pub_key3);
         let excepted_output = Bytes::from(vec![]);
-        let result = match bls_signature_validation_run(&Bytes::from(input.clone()), 100_000_000, 0) {
+        let result = match bls_signature_validation_run(&Bytes::from(input.clone()), 100_000_000, 0)
+        {
             Ok(o) => o.bytes,
             Err(e) => panic!("BLS signature validation failed, {e:?}"),
         };
