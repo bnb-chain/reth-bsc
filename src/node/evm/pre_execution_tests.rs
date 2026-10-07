@@ -895,4 +895,52 @@ mod parent_block_env {
             .expect_err("must not silently fall back to the current env");
         assert!(err.to_string().contains("parent header"), "unexpected error: {err}");
     }
+
+    /// A geth validator may seal `[coinbase 0-gas tx -> StakeCredit, deposit]`: go-bsc runs the
+    /// first as a normal tx, since StakeCredit is not in its system-tx whitelist. Import must
+    /// do the same, or the injected tx takes the head of the system-tx queue and the deposit
+    /// fails to match it.
+    #[test]
+    fn coinbase_zero_gas_tx_to_stake_credit_executes_inline() {
+        use crate::{node::evm::util::set_nonce, system_contracts::STAKE_CREDIT_CONTRACT};
+        use alloy_consensus::TxLegacy;
+        use alloy_evm::block::BlockExecutor;
+        use alloy_primitives::{Signature, TxKind};
+        use reth_ethereum_primitives::{Transaction, TransactionSigned};
+        use reth_primitives_traits::Recovered;
+
+        let mut executor = executor();
+        let coinbase = header_at(EPOCH_BLOCK).beneficiary;
+        let signed = |tx: Transaction| {
+            let tx = TransactionSigned::new_unhashed(
+                tx,
+                Signature::new(Default::default(), Default::default(), false),
+            );
+            Recovered::new_unchecked(tx, coinbase)
+        };
+
+        let injected = signed(Transaction::Legacy(TxLegacy {
+            chain_id: Some(56),
+            nonce: 0,
+            gas_price: 0,
+            gas_limit: 21_000,
+            to: TxKind::Call(STAKE_CREDIT_CONTRACT),
+            ..Default::default()
+        }));
+        let deposit_call = executor.system_contracts.distribute_to_validator(coinbase, 0);
+        let deposit = signed(set_nonce(deposit_call.clone(), 1));
+
+        executor.execute_transaction(&injected).expect("the injected tx executes");
+        executor.execute_transaction(&deposit).expect("the deposit is queued");
+
+        let (receipts, gas_used, queued) =
+            (executor.receipts().len(), executor.gas_used, executor.system_txs.len());
+
+        executor
+            .transact_system_tx(deposit_call, coinbase)
+            .expect("the deposit matches the head of the system-tx queue");
+        assert_eq!(receipts, 1, "the injected tx must get a receipt inline");
+        assert_eq!(gas_used, 21_000);
+        assert_eq!(queued, 1, "only the deposit is a system tx");
+    }
 }
