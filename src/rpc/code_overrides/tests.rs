@@ -43,10 +43,8 @@ fn forks_at(forks: &[BscHardfork], time: u64) -> reth_chainspec::ChainSpec {
 }
 
 macro_rules! rpc {
-    (chain $chain:expr) => {{
-        let spec = Arc::new(BscChainSpec::from($chain));
-        let provider = MockEthProvider::<BscPrimitives, _>::new().with_chain_spec((*spec).clone());
-        let header = alloy_consensus::Header {
+    (chain $chain:expr) => {
+        rpc!(chain $chain, header alloy_consensus::Header {
             number: 40_000_000,
             timestamp: NOW,
             gas_limit: 140_000_000,
@@ -54,7 +52,12 @@ macro_rules! rpc {
             excess_blob_gas: Some(0),
             blob_gas_used: Some(0),
             ..Default::default()
-        };
+        })
+    };
+    (chain $chain:expr, header $header:expr) => {{
+        let spec = Arc::new(BscChainSpec::from($chain));
+        let provider = MockEthProvider::<BscPrimitives, _>::new().with_chain_spec((*spec).clone());
+        let header = $header;
         let hash = header.hash_slow();
         crate::node::evm::util::insert_header_to_cache(header.clone());
         provider.add_header(hash, header.clone());
@@ -65,14 +68,20 @@ macro_rules! rpc {
                 ExtendedAccount::new(0, U256::ZERO).with_bytecode(Bytes::from_static(&MARKER_CODE)),
             );
         }
+        let evm_config = BscEvmConfig::new(spec);
         (
             BscCodeOverridesApiImpl(
                 reth::rpc::eth::core::EthApi::builder(
                     provider,
                     testing_pool(),
                     NoopNetwork::default(),
-                    BscEvmConfig::new(spec),
+                    evm_config.clone(),
                 )
+                .map_converter(|r| {
+                    r.with_tx_env_converter(crate::rpc::transaction::BscTxEnvConverter(
+                        evm_config,
+                    ))
+                })
                 .build(),
             ),
             hash,
@@ -444,3 +453,6 @@ async fn time_override_across_osaka_moves_the_tx_gas_limit_cap() {
     // eth_call lifts the cap, and crossing into Osaka keeps it lifted.
     before.call(req, None, needs_over_2_24, at(NOW + 1)).await.unwrap();
 }
+
+#[path = "fork_tests.rs"]
+mod fork_tests;

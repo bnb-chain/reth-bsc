@@ -21,7 +21,7 @@ use reth_ethereum_primitives::{Receipt, TransactionSigned};
 use reth_evm::{
     block::{BlockExecutionError, BlockExecutorFactory},
     execute::{BlockAssembler, BlockAssemblerInput},
-    EvmEnv,
+    env::BlockEnvironment, EvmEnv,
 };
 use reth_primitives_traits::{logs_bloom, SealedHeader};
 use reth_provider::{BlockExecutionResult, StateProvider};
@@ -80,11 +80,10 @@ where
     }
 
     /// Assemble the block body only — build header fields and transaction/receipt roots but
-    /// skip `finalize_new_header()` (no difficulty, no validators, no attestation, no seal).
+    /// skip consensus finalization of difficulty, validators, attestation and seal.
     ///
-    /// The returned block has:
-    /// - `difficulty = 0`
-    /// - `extra_data = self.extra_data` (raw assembler default, no seal bytes)
+    /// Keeps the environment's raw difficulty and mix hash. Extra data comes from
+    /// the execution context, falling back to the assembler default when empty.
     ///
     /// Callers must invoke `finalize_new_header()` later (e.g. in `pick_best_payload()`)
     /// once the best payload has been chosen and all FF votes have been collected.
@@ -164,12 +163,13 @@ where
             withdrawals_root,
             logs_bloom,
             timestamp,
-            mix_hash: evm_env.block_env.prevrandao().unwrap_or_default(),
+            // Header fields are distinct from the RPC opcode-0x44 view.
+            mix_hash: evm_env.block_env.inner.prevrandao.unwrap_or_default(),
             nonce: BEACON_NONCE.into(),
             base_fee_per_gas,
             number: block_number,
             gas_limit: evm_env.block_env.gas_limit(),
-            difficulty: evm_env.block_env.difficulty(),
+            difficulty: evm_env.block_env.inner.difficulty,
             gas_used: *gas_used,
             extra_data,
             parent_beacon_block_root,
@@ -207,7 +207,7 @@ where
 {
     type Block = crate::node::primitives::BscBlock;
 
-    // note that assemble_block is unused, BscBlockBuiler use assemble_block_bsc instead.
+    // BscBlockBuilder uses assemble_block_body_only for deferred consensus finalization.
     fn assemble_block(
         &self,
         input: BlockAssemblerInput<'_, '_, F>,
@@ -218,7 +218,7 @@ where
             .ok_or_else(|| BlockExecutionError::msg("Snapshot provider not available"))?;
 
         let BlockAssemblerInput {
-            evm_env,
+            mut evm_env,
             execution_ctx: ctx,
             parent,
             transactions,
@@ -276,6 +276,11 @@ where
             if ctx_extra.is_empty() { self.extra_data.clone() } else { ctx_extra }
         };
 
+        // Serialize header fields, not an RPC-specific opcode representation.
+        let (difficulty, mix_hash) = {
+            let block = evm_env.block_env.inner_mut();
+            (block.difficulty, block.prevrandao.unwrap_or_default())
+        };
         let mut header = Header {
             parent_hash: eth_ctx.parent_hash,
             ommers_hash: EMPTY_OMMER_ROOT_HASH,
@@ -286,12 +291,12 @@ where
             withdrawals_root,
             logs_bloom,
             timestamp,
-            mix_hash: evm_env.block_env.prevrandao().unwrap_or_default(),
+            mix_hash,
             nonce: BEACON_NONCE.into(),
             base_fee_per_gas,
             number: evm_env.block_env.number().saturating_to(),
             gas_limit: evm_env.block_env.gas_limit(),
-            difficulty: evm_env.block_env.difficulty(),
+            difficulty,
             gas_used: *gas_used,
             extra_data,
             parent_beacon_block_root: eth_ctx.parent_beacon_block_root,

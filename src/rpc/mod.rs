@@ -10,6 +10,7 @@ pub mod eth_ext;
 pub mod mev;
 pub mod miner;
 pub mod parlia;
+pub mod transaction;
 
 pub use admin::*;
 pub use blob::*;

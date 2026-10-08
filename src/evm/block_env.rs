@@ -8,12 +8,8 @@ use std::ops::{Deref, DerefMut};
 /// remainder of the block timestamp (BEP-520, decoded from the header's
 /// `mix_hash` tail).
 ///
-/// Only the *remainder* is stored — never an absolute millisecond value. The
-/// millisecond timestamp consumed by the BEP-706 precompile (`0x70`, Jenner) is
-/// always computed live as `timestamp * 1000 + milli_remainder`, so code paths
-/// that mutate the inner `timestamp` directly (block overrides,
-/// `debug_traceCallMany`'s per-bundle bump, `eth_callBundle`) can never leave a
-/// stale millisecond value behind.
+/// The BEP-706 precompile (`0x70`) derives milliseconds from the current seconds
+/// and remainder, so direct timestamp mutations cannot leave a stale value.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BscBlockEnv {
     /// The standard revm block environment.
@@ -24,25 +20,28 @@ pub struct BscBlockEnv {
     pub milli_remainder: u64,
     /// RPC-only code overrides; never populated from a canonical block header.
     pub disabled_cas20: std::collections::BTreeSet<Address>,
+    /// RPC-only logical value for opcode 0x44, independent of revm's fork-specific
+    /// DIFFICULTY/PREVRANDAO representation. Kept separate from `inner` so EVM
+    /// normalization cannot rewrite the fields of a simulated block header.
+    pub opcode_44_override: Option<U256>,
 }
 
 impl BscBlockEnv {
     /// Creates a new [`BscBlockEnv`] from the standard env and the millisecond
     /// remainder.
     pub const fn new(inner: BlockEnv, milli_remainder: u64) -> Self {
-        Self { inner, milli_remainder, disabled_cas20: std::collections::BTreeSet::new() }
+        Self {
+            inner,
+            milli_remainder,
+            disabled_cas20: std::collections::BTreeSet::new(),
+            opcode_44_override: None,
+        }
     }
 
     /// The block's millisecond timestamp (BEP-520): computed live from the
     /// *current* seconds value so direct `timestamp` mutations are reflected.
     ///
-    /// The multiply/add **wraps** on overflow, matching go-bsc's plain `uint64`
-    /// arithmetic (`Header.MilliTimestamp()` / `BlockOverrides.Apply`): an
-    /// out-of-domain seconds value (e.g. `blockOverrides.time = u64::MAX`, an
-    /// RPC-reachable input on both clients) must produce the same wrapped value
-    /// as geth. Only the `U256 -> u64` narrowing saturates — go's `Time` *is* a
-    /// `u64`, so a wider value is unrepresentable there and has no parity
-    /// baseline.
+    /// Seconds saturate to `u64`; multiplication and addition wrap on overflow.
     pub fn milli_timestamp(&self) -> u64 {
         self.inner
             .timestamp
@@ -96,11 +95,11 @@ impl Block for BscBlockEnv {
     }
 
     fn difficulty(&self) -> U256 {
-        self.inner.difficulty()
+        self.opcode_44_override.unwrap_or_else(|| self.inner.difficulty())
     }
 
     fn prevrandao(&self) -> Option<B256> {
-        self.inner.prevrandao()
+        self.opcode_44_override.map(Into::into).or_else(|| self.inner.prevrandao())
     }
 
     fn blob_excess_gas_and_price(&self) -> Option<BlobExcessGasAndPrice> {
@@ -127,61 +126,43 @@ impl BlockEnvironment for BscBlockEnv {
 pub const MAX_BSC_MILLI_REMAINDER: u64 = 1000;
 
 /// Interprets a `prevRandao` block override the BSC way: the 32-byte value is
-/// the millisecond remainder and must be below [`MAX_BSC_MILLI_REMAINDER`],
-/// exactly like the `mixHash` of a real BSC header. Mirrors go-bsc's
-/// `BSCMilliRemainder`: the full 32 bytes are parsed and anything that does not
-/// fit in a `u64` is rejected before truncating, so a value with non-zero high
-/// bytes can never be silently accepted via its low 64 bits.
+/// the millisecond remainder and must be below [`MAX_BSC_MILLI_REMAINDER`].
+/// The full 256-bit value is checked before narrowing, so non-zero high bytes
+/// cannot be silently discarded.
 pub fn bsc_milli_remainder(prev_randao: &B256) -> Result<u64, String> {
     let v = U256::from_be_bytes(prev_randao.0);
-    if v > U256::from(u64::MAX) {
+    if v >= U256::from(MAX_BSC_MILLI_REMAINDER) {
         return Err(format!(
             "block override \"prevRandao\" on BSC carries the millisecond remainder of the \
              block timestamp (BEP-520/BEP-706) and must be less than {MAX_BSC_MILLI_REMAINDER}, \
              got {v}"
         ));
     }
-    let ms = v.to::<u64>();
-    if ms >= MAX_BSC_MILLI_REMAINDER {
-        return Err(format!(
-            "block override \"prevRandao\" on BSC carries the millisecond remainder of the \
-             block timestamp (BEP-520/BEP-706) and must be less than {MAX_BSC_MILLI_REMAINDER}, \
-             got {ms}"
-        ));
-    }
-    Ok(ms)
+    Ok(v.to::<u64>())
 }
 
-/// BSC semantics for RPC block overrides (go-bsc `BlockOverrides.Apply` parity,
-/// [#3792](https://github.com/bnb-chain/bsc/pull/3792)). Invoked by reth right
-/// after `apply_block_overrides` wrote the standard fields into `inner`, so the
-/// seconds are already the post-override value:
+/// Applies BSC semantics after alloy has written the standard block fields.
 ///
-/// - `time` override → the sub-second remainder resets to `.000`
-///   (`BlockOverrides` has no millisecond field; a simultaneous `prevRandao`
-///   override supplies the remainder below);
-/// - `prevRandao` override → the value **is** the millisecond remainder:
-///   validated (`< 1000`, mirroring the consensus rule on real headers,
-///   rejected otherwise so callers cannot pass arbitrary random values) and
-///   assembled into the millisecond timestamp served by the BEP-706 precompile
-///   (`time * 1000 + prevRandao`). `prevrandao` itself (the `0x44` opcode
-///   view) was already replaced by `apply_block_overrides` and stays replaced.
-///
-/// Each override applies independently: pass one and only it takes effect,
-/// pass both and both do. The validation is client-default behavior — it is
-/// not gated on Jenner activation, matching go-bsc.
+/// `time` resets the millisecond remainder; `prevRandao` replaces it after
+/// validation, regardless of fork activation. Explicit `prevRandao` or
+/// `difficulty` also sets the fork-independent opcode-0x44 view, with
+/// `prevRandao` taking precedence. Raw header fields remain unchanged here.
 impl reth_rpc_eth_types::BlockOverridesExt for BscBlockEnv {
     fn apply_block_overrides_ext(
         &mut self,
         overrides: &alloy_rpc_types_eth::BlockOverrides,
     ) -> Result<(), String> {
-        // Branch order mirrors go-bsc's `Apply`: `time` first, `prevRandao`
-        // second, so a combined override ends with the overridden remainder.
         if overrides.time.is_some() {
             self.milli_remainder = 0;
         }
         if let Some(prev_randao) = &overrides.random {
             self.milli_remainder = bsc_milli_remainder(prev_randao)?;
+        }
+        // Keep explicit zero distinct from an absent override during fork conversion.
+        if let Some(value) =
+            overrides.random.map(|v| U256::from_be_bytes(v.0)).or(overrides.difficulty)
+        {
+            self.opcode_44_override = Some(value);
         }
         // alloy-evm 0.34's `apply_block_overrides` drops `blobBaseFee`.
         if let Some(blob_base_fee) = overrides.blob_base_fee {
@@ -209,18 +190,13 @@ mod tests {
         let mut e = env(1_790_000_000, 750);
         assert_eq!(e.milli_timestamp(), 1_790_000_000_750);
 
-        // Stale-immunity: mutating the inner timestamp directly (the generic
-        // `inner_mut()` path used by block overrides and the traceCallMany /
-        // callBundle bumps) is reflected without touching the remainder.
+        // Match the direct timestamp mutation used by RPC helpers.
         e.inner_mut().timestamp = U256::from(1_800_000_000u64);
         assert_eq!(e.milli_timestamp(), 1_800_000_000_750);
     }
 
     #[test]
     fn test_zero_remainder_defaults_to_second_precision() {
-        // Structural equivalent of go-bsc's `ts == 0 -> Time*1000` fallback:
-        // an unfilled remainder yields the second-precision value, never a
-        // near-1970 garbage number.
         assert_eq!(env(1_790_000_000, 0).milli_timestamp(), 1_790_000_000_000);
         assert_eq!(BscBlockEnv::from(BlockEnv::default()).milli_remainder, 0);
     }
@@ -232,15 +208,6 @@ mod tests {
         assert_eq!(Block::gas_limit(&e), e.inner.gas_limit);
         assert_eq!(Block::prevrandao(&e), e.inner.prevrandao);
     }
-
-    // ---- BSC block-override semantics (go-bsc C8/C8a parity) ----
-    //
-    // These drive the exact pipeline reth's `prepare_call_env` / `simulate_v1`
-    // run: alloy's `apply_block_overrides` writes the standard fields into the
-    // inner env, then the `BlockOverridesExt` hook applies the BSC millisecond
-    // semantics. RPC end-to-end coverage of the same scenarios (eth_call /
-    // eth_estimateGas / eth_callMany / eth_simulateV1) is exercised on a live
-    // devnet (E2).
 
     use alloy_rpc_types_eth::BlockOverrides;
     use reth_rpc_eth_types::BlockOverridesExt;
@@ -274,8 +241,6 @@ mod tests {
 
     #[test]
     fn test_time_override_resets_remainder() {
-        // Scenario 1: `time` alone — 0x70 must serve NewTime*1000 (remainder
-        // resets to .000), and the 0x44 view is untouched.
         let mut e = env(SECS, REMAINDER);
         let prevrandao_before = e.inner.prevrandao;
         apply(&mut e, BlockOverrides { time: Some(SECS + 1000), ..Default::default() }).unwrap();
@@ -286,19 +251,15 @@ mod tests {
 
     #[test]
     fn test_prev_randao_override_sets_remainder_on_original_seconds() {
-        // Scenario 4: `prevRandao` alone — remainder replaced, seconds kept.
         let mut e = env(SECS, REMAINDER);
         apply(&mut e, BlockOverrides { random: Some(randao(123)), ..Default::default() })
             .unwrap();
         assert_eq!(e.milli_timestamp(), SECS * 1000 + 123);
-        // `Random` is still replaced (0x44 serves the override), go parity.
         assert_eq!(e.inner.prevrandao, Some(randao(123)));
     }
 
     #[test]
     fn test_combined_override_assembles_both() {
-        // Scenario 3: `time + prevRandao` — assembled: seconds from time,
-        // remainder from prevRandao, both views exact.
         let mut e = env(SECS, REMAINDER);
         apply(
             &mut e,
@@ -315,7 +276,6 @@ mod tests {
 
     #[test]
     fn test_prev_randao_at_bound_is_rejected() {
-        // Scenario 6: >= 1000 must be rejected with the go-parity message.
         let mut e = env(SECS, REMAINDER);
         let err = apply(&mut e, BlockOverrides { random: Some(randao(1000)), ..Default::default() })
             .unwrap_err();
@@ -327,10 +287,7 @@ mod tests {
 
     #[test]
     fn test_prev_randao_with_high_bytes_is_rejected() {
-        // Scenario 6a: high 24 bytes non-zero with valid low 8 bytes must be
-        // rejected too (go: big.Int -> IsUint64 interception) — an
-        // implementation that truncates to the low 64 bits would wrongly
-        // accept 0x…0001_0000_0000_0000_007b as 123.
+        // Truncating before validation would incorrectly accept this as 123.
         let mut e = env(SECS, REMAINDER);
         let mut bytes = [0u8; 32];
         bytes[23] = 0x01; // 2^64
@@ -345,10 +302,7 @@ mod tests {
     }
 
     #[test]
-    fn test_wrapping_matches_geth_u64_arithmetic() {
-        // go-bsc computes `Time*1000 + remainder` with plain `uint64` maths, so
-        // an extreme-but-RPC-reachable `blockOverrides.time = u64::MAX` wraps.
-        // (u64::MAX * 1000) mod 2^64 == 2^64 - 1000; + 123 remainder.
+    fn test_milli_timestamp_preserves_wrapping_arithmetic() {
         let mut e = env(SECS, REMAINDER);
         apply(
             &mut e,
@@ -365,9 +319,6 @@ mod tests {
 
     #[test]
     fn test_no_overrides_keep_the_block_values() {
-        // Nothing passed, nothing overridden: an untouched env keeps the real
-        // header's remainder (go semantics: absent fields fall back to the
-        // block's own values).
         let mut e = env(SECS, REMAINDER);
         apply(&mut e, BlockOverrides::default()).unwrap();
         assert_eq!(e.milli_timestamp(), SECS * 1000 + REMAINDER);
@@ -375,8 +326,6 @@ mod tests {
 
     #[test]
     fn test_zero_prev_randao_override_is_a_valid_remainder() {
-        // simulateV1's default zeroed prevrandao (and an explicit zero
-        // override) is the legal `.000` remainder, not an error.
         let mut e = env(SECS, REMAINDER);
         apply(&mut e, BlockOverrides { random: Some(B256::ZERO), ..Default::default() }).unwrap();
         assert_eq!(e.milli_timestamp(), SECS * 1000);
@@ -384,9 +333,7 @@ mod tests {
 
     #[test]
     fn test_validation_is_not_gated_on_activation() {
-        // go C8a: the < 1000 check is client-default behavior, independent of
-        // fork state — the hook itself never consults the chain spec, which
-        // this pins structurally (no spec is even reachable from here).
+        // Validation also applies before any fork activation.
         let mut e = env(0, 0);
         assert!(apply(&mut e, BlockOverrides { random: Some(randao(2000)), ..Default::default() })
             .is_err());

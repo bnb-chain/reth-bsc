@@ -258,9 +258,10 @@ impl BscEvmConfig {
         self.executor_factory.spec()
     }
 
-    /// Takes the rules from the block env, as go-bsc's `NewEVM` does: RPC block overrides can
-    /// move its number or time across a fork after `cfg_env` was derived. A transaction gas limit
-    /// cap other than the fork's own was set by the caller and is kept.
+    /// Reconciles the rules and revm's fork-dependent environment after RPC overrides.
+    /// Explicit opcode-0x44 overrides are captured by `BlockOverridesExt` before
+    /// their presence is lost. Here we translate the remaining header-derived fields,
+    /// without rebuilding the environment or resetting the caller's RPC configuration.
     pub(crate) fn with_block_rules(
         &self,
         mut evm_env: EvmEnv<BscHardfork, BscBlockEnv>,
@@ -271,6 +272,40 @@ impl BscEvmConfig {
             revm_spec_by_timestamp_and_block_number(self.chain_spec().clone(), timestamp, number);
         if spec == evm_env.cfg_env.spec {
             return evm_env;
+        }
+
+        let old_spec = SpecId::from(evm_env.cfg_env.spec);
+        let new_spec = SpecId::from(spec);
+        // BSC still exposes DIFFICULTY after Kepler, using revm's PREVRANDAO
+        // field. Only translate header-derived values: an explicit RPC value is
+        // already exposed by both Block accessors without changing header fields.
+        if evm_env.block_env.opcode_44_override.is_none() {
+            let block = &mut evm_env.block_env.inner;
+            if old_spec < SpecId::MERGE && new_spec >= SpecId::MERGE {
+                block.prevrandao.get_or_insert(block.difficulty.into());
+            } else if old_spec >= SpecId::MERGE && new_spec < SpecId::MERGE {
+                if let Some(random) = block.prevrandao {
+                    block.difficulty = U256::from_be_bytes(random.0);
+                }
+            }
+        }
+
+        if old_spec < SpecId::CANCUN && new_spec >= SpecId::CANCUN {
+            let params = self.chain_spec()
+                .blob_params_at_timestamp(timestamp)
+                .unwrap_or_else(BlobParams::cancun);
+            // Same initial excess as next_evm_env on entry into Cancun. Preserve
+            // any explicit blobBaseFee (including zero) already installed by
+            // BlockOverridesExt, as well as an existing header-derived price.
+            evm_env.block_env.inner.blob_excess_gas_and_price.get_or_insert_with(|| {
+                BlobExcessGasAndPrice {
+                    excess_blob_gas: 0,
+                    blob_gasprice: params.calc_blob_fee(0),
+                }
+            });
+            if evm_env.cfg_env.max_blobs_per_tx.is_none() {
+                evm_env.cfg_env.set_max_blobs_per_tx(params.max_blobs_per_tx);
+            }
         }
         evm_env.cfg_env.set_spec_and_mainnet_gas_params(spec);
         if matches!(evm_env.cfg_env.tx_gas_limit_cap, None | Some(MAX_TX_GAS_LIMIT_OSAKA)) {
