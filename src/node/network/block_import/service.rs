@@ -1,4 +1,7 @@
-use super::handle::ImportHandle;
+use super::{
+    handle::ImportHandle,
+    header_validation::{validate_for_relay, RelayValidation},
+};
 use crate::{
     chainspec::BscChainSpec,
     consensus::{parlia::vote_pool, ParliaConsensusErr},
@@ -12,30 +15,24 @@ use crate::{
 use alloy_consensus::{BlockBody, Header};
 use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::{Address, B256, U128, U256};
-use reth_primitives_traits::SealedBlock;
 use alloy_rpc_types_engine::{ForkchoiceState, PayloadStatusEnum};
 use futures::{future::Either, stream::FuturesUnordered, StreamExt};
 use parking_lot::RwLock;
-use reth::consensus::HeaderValidator;
-use reth::network::cache::LruCache;
+use reth::{consensus::HeaderValidator, network::cache::LruCache};
 use reth_engine_primitives::{ConsensusEngineHandle, EngineTypes};
 use reth_engine_tree::engine::EngineApiRequest;
 use reth_eth_wire::{BlockHashNumber, GetBlockHeaders, NewBlock};
 use reth_eth_wire_types::broadcast::NewBlockHashes;
 use reth_network::{
     import::{BlockImportError, BlockImportEvent, BlockImportOutcome, BlockValidation},
-    message::{NewBlockMessage, PeerMessage},
-};
-use reth_network::{
-    message::{BlockRequest, PeerResponse},
+    message::{BlockRequest, NewBlockMessage, PeerMessage, PeerResponse},
     FetchClient, NetworkHandle,
 };
 use reth_network_api::{PeerId, Peers, ReputationChangeKind};
 use reth_node_ethereum::EthEngineTypes;
 use reth_payload_builder_primitives::Events;
 use reth_payload_primitives::{BuiltPayload, PayloadTypes};
-use reth_primitives_traits::NodePrimitives;
-use reth_primitives_traits::{AlloyBlockHeader, Block};
+use reth_primitives_traits::{AlloyBlockHeader, Block, NodePrimitives, SealedBlock};
 use reth_provider::{
     BlockHashReader, BlockNumReader, BlockReaderIdExt, HeaderProvider, ReceiptProvider,
 };
@@ -117,6 +114,10 @@ where
     from_hashes: UnboundedReceiver<IncomingHashes>,
     /// Send the event of the import to the network
     to_network: UnboundedSender<ImportEvent>,
+    /// Snapshot context for authenticating peer headers before propagation.
+    relay_snapshots: Option<Arc<dyn crate::consensus::parlia::SnapshotProvider + Send + Sync>>,
+    /// Bound concurrent blocking header/snapshot verification jobs.
+    relay_validation_slots: Arc<tokio::sync::Semaphore>,
     /// Pending block imports.
     pending_imports: FuturesUnordered<ImportFut>,
     /// Cache of processed block hashes to avoid reprocessing the same block.
@@ -232,6 +233,10 @@ where
             from_bid_block,
             from_hashes,
             to_network,
+            relay_snapshots: crate::shared::get_snapshot_provider().cloned(),
+            relay_validation_slots: Arc::new(tokio::sync::Semaphore::new(
+                std::thread::available_parallelism().map_or(1, |n| n.get()),
+            )),
             pending_imports: FuturesUnordered::new(),
             processed_blocks: LruCache::new(LRU_PROCESSED_BLOCKS_SIZE),
             queued_blocks: LruCache::new(LRU_PROCESSED_BLOCKS_SIZE),
@@ -260,6 +265,15 @@ where
         let recovering_heads = self.recovering_heads.clone();
         let failed_heads = self.failed_heads.clone();
         let recovery_gate = self.recovery_gate.clone();
+        let provider = self.forkchoice_engine.provider.clone();
+        let chain_spec = self.forkchoice_engine.chain_spec().clone();
+        // Networking is built before consensus initializes the global provider.
+        let snapshots = self
+            .relay_snapshots
+            .clone()
+            .or_else(|| crate::shared::get_snapshot_provider().cloned());
+        let validation_slots = self.relay_validation_slots.clone();
+        let to_network = self.to_network.clone();
 
         let announced_hash = block.hash;
         let block_hash = block.block.0.block.header.hash_slow();
@@ -287,11 +301,48 @@ where
             }
 
             let sealed_block = block.block.0.block.clone().seal_unchecked(block_hash);
+            let permit = validation_slots.acquire_owned().await.ok()?;
+            let validation = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                let result = validate_for_relay(
+                    &sealed_block, &provider, chain_spec, snapshots.as_deref(),
+                );
+                (sealed_block, result)
+            })
+            .await;
+            let (sealed_block, validation) = match validation {
+                Ok((sealed_block, Ok(validation))) => (sealed_block, validation),
+                Ok((_, Err(error))) => {
+                    return Some(Outcome { peer: peer_id, result: Err(error) });
+                }
+                Err(error) => {
+                    tracing::warn!(target: "bsc::block_import", %error, "Header validation task failed");
+                    return None;
+                }
+            };
+            let header_announced = validation == RelayValidation::Valid;
+            if header_announced {
+                if let Err(error) = Self::transfer_to_evn_peers(block.clone()) {
+                    tracing::debug!(target: "bsc::block_import", %error, "EVN relay unavailable");
+                }
+                let _ = to_network.send(BlockImportEvent::Announcement(
+                    BlockValidation::ValidHeader { block: block.clone() },
+                ));
+            }
+
             let header = sealed_block.header().clone();
             let payload = BscPayloadTypes::block_to_payload(sealed_block);
             match engine.new_payload(payload).await {
                 Ok(payload_status) => match payload_status.status {
                     PayloadStatusEnum::Valid => {
+                        // A deferred header can now be relayed: the engine checked it
+                        // with its authoritative parent/snapshot context. EVN forwarding
+                        // happens in the successful-import handler below.
+                        if !header_announced {
+                            let _ = to_network.send(BlockImportEvent::Announcement(
+                                BlockValidation::ValidHeader { block: block.clone() },
+                            ));
+                        }
                         tracing::debug!(target: "bsc::block_import", "New payload is valid, block_hash = {:?}, block_number = {}, peer_id = {:?}", block.hash, header.number, peer_id);
                         // handle fork choice update with valid payload
                         if let Err(e) = forkchoice_engine.update_forkchoice(&header).await {
@@ -473,7 +524,7 @@ where
         );
 
         // send to EVN peers first
-        if let Err(e) = self.transfer_to_evn_peers(block_msg.clone()) {
+        if let Err(e) = Self::transfer_to_evn_peers(block_msg.clone()) {
             tracing::warn!(target: "bsc::block_import", "Failed to transfer block to EVN peers: number = {:?}, hash = {:?}, error = {}", block.header.number, block_hash, e);
         }
         // Send ValidHeader announcement to trigger NewBlock diffusion from few peers
@@ -601,7 +652,7 @@ where
 
         // 1. Broadcast first — before verification. go-bsc posts the sealed block, then runs
         //    InsertChain. Announce header + full block so peers diffuse it immediately.
-        if let Err(e) = self.transfer_to_evn_peers(block_msg.clone()) {
+        if let Err(e) = Self::transfer_to_evn_peers(block_msg.clone()) {
             tracing::warn!(target: "bsc::block_import", number = block_number, hash = %block_hash, error = %e, "BidBlock: failed to transfer to EVN peers");
         }
         let _ = self.to_network.send(BlockImportEvent::Announcement(
@@ -815,17 +866,8 @@ where
             &block.block.0.block.header,
         );
 
-        // send to EVN peers first
-        if let Err(e) = self.transfer_to_evn_peers(block.clone()) {
-            tracing::warn!(target: "bsc::block_import", "Failed to transfer block to EVN peers: number = {:?}, hash = {:?}, error = {}", block.block.0.block.header.number, block.hash, e);
-        }
-        // Send ValidHeader announcement to trigger NewBlock diffusion from few peers
-        // TODO: add header validation later
-        let _ =
-            self.to_network.send(BlockImportEvent::Announcement(BlockValidation::ValidHeader {
-                block: block.clone(),
-            }));
-
+        // Peer blocks are relayed by new_payload only after header authentication.
+        // Unknown ancestry/snapshots continue through import/recovery without early relay.
         tracing::debug!(target: "bsc::block_import", "Sending new block to import service: number = {:?}, hash = {:?}", block.block.0.block.header.number, block.hash);
         let payload_fut = self.new_payload(block.clone(), peer_id);
         self.pending_imports.push(payload_fut);
@@ -1031,7 +1073,7 @@ where
     }
 
     /// Transfer the block to EVN peers if from proxied validators or validator address.
-    fn transfer_to_evn_peers(&self, block: BlockMsg) -> Result<(), Box<dyn std::error::Error>> {
+    fn transfer_to_evn_peers(block: BlockMsg) -> Result<(), Box<dyn std::error::Error>> {
         let mining_config = crate::node::miner::config::get_global_mining_config()
             .ok_or("Mining config is not set")?;
         let cfg =
@@ -1219,7 +1261,7 @@ where
                     this.processed_blocks.insert(block.hash);
                     // Cache the full block body for later range responses.
                     crate::shared::cache_full_block(block.block.0.block.clone());
-                    if let Err(e) = this.transfer_to_evn_peers(block.clone()) {
+                    if let Err(e) = Self::transfer_to_evn_peers(block.clone()) {
                         tracing::warn!(target: "bsc::block_import", "Failed to transfer block to EVN peers: number = {:?}, hash = {:?}, error = {}", block.block.0.block.header.number, block.hash, e);
                     }
                 }
@@ -1321,14 +1363,15 @@ mod tests {
         service.on_new_block(good, PeerId::random());
         assert!(service.queued_blocks.contains(&hash));
         assert_eq!(service.pending_imports.len(), 1);
-        assert!(matches!(events.try_recv().unwrap(), BlockImportEvent::Announcement(_)));
+        // Admission alone does not authorize relay; the pending header check must finish.
+        assert!(events.try_recv().is_err());
     }
 
     #[tokio::test]
-    async fn can_handle_invalid_new_payload() {
+    async fn valid_header_can_relay_before_execution_rejection() {
         // When new_payload returns Invalid, the peer should NOT be penalized.
-        // The only event emitted is the early ValidHeader announcement from
-        // on_new_block; no BlockImportOutcome error should follow.
+        // The signed header passes validation and may be relayed before execution.
+        // The engine's later rejection must not penalize its forwarding peer.
         let mut fixture = TestFixture::new(EngineResponses::invalid_new_payload()).await;
         fixture
             .assert_block_import(|outcome| {
@@ -1363,6 +1406,177 @@ mod tests {
             )),
             "Should not penalize peer for Invalid new_payload. Extra events: {extra:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn invalid_peer_headers_are_neither_relayed_nor_executed() {
+        for case in ["extra", "signer", "unauthorized", "difficulty", "parent_time", "body"] {
+            let mut provider = MockProvider::new();
+            provider.insert(test_parent(), U256::from(1));
+            let mut snapshots = test_snapshot();
+            let mut block = create_test_block();
+            let header = &mut Arc::make_mut(&mut block.block).0.block.header;
+            match case {
+                "extra" => header.extra_data = vec![0; 32].into(),
+                "signer" => header.beneficiary = alloy_primitives::Address::ZERO,
+                "unauthorized" => snapshots.0.validators = vec![alloy_primitives::Address::ZERO],
+                "difficulty" => {
+                    header.difficulty = crate::consensus::parlia::DIFF_NOTURN;
+                    sign_test_header(header);
+                }
+                "parent_time" => header.timestamp = test_parent().timestamp,
+                "body" => header.transactions_root = B256::ZERO,
+                _ => unreachable!(),
+            }
+            block.hash = header.hash_slow();
+            let (mut service, mut engine, mut events) = relay_test_service(provider, snapshots);
+            service.on_new_block(block, PeerId::random());
+            assert!(events.try_recv().is_err(), "{case}: relayed on admission");
+            let outcome = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                service.pending_imports.next(),
+            )
+            .await
+            .expect(case)
+            .flatten()
+            .expect("header rejection");
+            assert!(outcome.result.is_err(), "{case}: accepted invalid header");
+            assert!(events.try_recv().is_err(), "{case}: relayed after validation");
+            assert!(engine.try_recv().is_err(), "{case}: sent to execution engine");
+        }
+    }
+
+    #[tokio::test]
+    async fn deferred_peer_headers_relay_only_after_engine_validation() {
+        for context in ["parent", "snapshot", "snapshot_mismatch", "future_time"] {
+            for status in [
+                PayloadStatusEnum::Valid,
+                PayloadStatusEnum::Invalid { validation_error: "test rejection".into() },
+                PayloadStatusEnum::Syncing,
+                PayloadStatusEnum::Accepted,
+            ] {
+                let mut provider = MockProvider::new();
+                if context != "parent" {
+                    provider.insert(test_parent(), U256::from(1));
+                }
+                let mut snapshots = test_snapshot();
+                if context == "snapshot" {
+                    snapshots.0.block_hash = B256::ZERO;
+                } else if context == "snapshot_mismatch" {
+                    snapshots.0.block_number = 123;
+                }
+                let mut block = create_test_block();
+                if context == "future_time" {
+                    let header = &mut Arc::make_mut(&mut block.block).0.block.header;
+                    header.timestamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs() +
+                        60;
+                    sign_test_header(header);
+                    block.hash = header.hash_slow();
+                }
+                let (mut service, mut engine, mut events) = relay_test_service(provider, snapshots);
+                // Keep this test isolated from ancestor-recovery tasks.
+                service.failed_heads.mark_failed(block.hash);
+                service.on_new_block(block, PeerId::random());
+                assert!(events.try_recv().is_err());
+                let task = tokio::spawn(async move { service.pending_imports.next().await });
+                let message =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), engine.recv())
+                        .await
+                        .expect(context)
+                        .expect("engine request");
+                let BeaconEngineMessage::NewPayload { tx, .. } = message else {
+                    panic!("expected NewPayload");
+                };
+                assert!(events.try_recv().is_err(), "{context}: relayed before engine verdict");
+                let valid = matches!(status, PayloadStatusEnum::Valid);
+                tx.send(Ok(PayloadStatus::new(status, None))).unwrap();
+                if valid {
+                    let event =
+                        tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+                            .await
+                            .expect(context)
+                            .expect("announcement");
+                    assert!(matches!(
+                        event,
+                        BlockImportEvent::Announcement(BlockValidation::ValidHeader { .. })
+                    ));
+                    // Forkchoice is covered separately; this test stops at the relay boundary.
+                    task.abort();
+                } else {
+                    let result = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+                        .await
+                        .expect(context)
+                        .unwrap();
+                    assert!(result.flatten().is_none(), "must not penalize peer");
+                    assert!(events.try_recv().is_err(), "must not relay an unvalidated header");
+                }
+            }
+        }
+    }
+
+    fn relay_test_service(
+        provider: MockProvider,
+        snapshots: TestSnapshots,
+    ) -> (
+        ImportService<MockProvider>,
+        mpsc::UnboundedReceiver<BeaconEngineMessage<BscPayloadTypes>>,
+        mpsc::UnboundedReceiver<ImportEvent>,
+    ) {
+        let (to_engine, from_engine) = mpsc::unbounded_channel();
+        let (_, from_network) = mpsc::unbounded_channel();
+        let (_, from_builder) = mpsc::unbounded_channel();
+        let (_, from_bid) = mpsc::unbounded_channel();
+        let (_, from_hashes) = mpsc::unbounded_channel();
+        let (to_network, events) = mpsc::unbounded_channel();
+        let mut service = ImportService::new(
+            provider,
+            Arc::new(BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet())),
+            ConsensusEngineHandle::new(to_engine),
+            from_network,
+            from_builder,
+            from_bid,
+            from_hashes,
+            to_network,
+        );
+        service.relay_snapshots = Some(Arc::new(snapshots));
+        (service, from_engine, events)
+    }
+
+    #[tokio::test]
+    async fn authenticated_header_relays_without_waiting_for_execution() {
+        let mut provider = MockProvider::new();
+        provider.insert(test_parent(), U256::from(1));
+        let (mut service, mut engine, mut events) = relay_test_service(provider, test_snapshot());
+        service.on_new_block(create_test_block(), PeerId::random());
+        assert!(events.try_recv().is_err());
+        let task = tokio::spawn(async move { service.pending_imports.next().await });
+        let message = tokio::time::timeout(std::time::Duration::from_secs(2), engine.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let BeaconEngineMessage::NewPayload { tx, .. } = message else {
+            panic!("expected NewPayload");
+        };
+        // The engine has not replied yet, but the authenticated header is relayable.
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            BlockImportEvent::Announcement(BlockValidation::ValidHeader { .. })
+        ));
+        tx.send(Ok(PayloadStatus::new(
+            PayloadStatusEnum::Invalid { validation_error: "execution rejection".into() },
+            None,
+        )))
+        .unwrap();
+        assert!(tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .flatten()
+            .is_none());
+        assert!(events.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -1912,8 +2126,9 @@ mod tests {
         /// Create a new test fixture with the given engine responses and a pre-configured
         /// provider (e.g. with receipts installed via [`MockProvider::insert_receipts`] for the
         /// post-import average-gas-price check).
-        async fn new_with_provider(responses: EngineResponses, provider: MockProvider) -> Self {
-            // Use mainnet chain spec for tests; it influences only fast-finality parsing.
+        async fn new_with_provider(responses: EngineResponses, mut provider: MockProvider) -> Self {
+            provider.insert(test_parent(), U256::from(1));
+            // Use mainnet rules, including pre-relay header validation.
             let chain_spec = Arc::new(crate::chainspec::BscChainSpec::from(
                 crate::chainspec::bsc::bsc_mainnet(),
             ));
@@ -1932,7 +2147,7 @@ mod tests {
 
             let handle = ImportHandle::new(to_import, to_hashes, import_outcome);
 
-            let service = ImportService::new(
+            let mut service = ImportService::new(
                 provider,
                 chain_spec,
                 engine_handle,
@@ -1942,6 +2157,7 @@ mod tests {
                 from_hashes,
                 to_network,
             );
+            service.relay_snapshots = Some(Arc::new(test_snapshot()));
             tokio::spawn(Box::pin(async move {
                 service.await.unwrap();
             }));
@@ -2001,8 +2217,24 @@ mod tests {
 
     /// Creates a test block message
     fn create_test_block() -> NewBlockMessage<BscNewBlock> {
+        let secret = secp256k1::SecretKey::from_slice(&[1; 32]).unwrap();
+        let public = secp256k1::PublicKey::from_secret_key(&secp256k1::Secp256k1::new(), &secret);
+        let address = alloy_primitives::Address::from_slice(
+            &alloy_primitives::keccak256(&public.serialize_uncompressed()[1..])[12..],
+        );
+        let mut header = Header {
+            parent_hash: test_parent().hash_slow(),
+            number: 1,
+            timestamp: 4,
+            gas_limit: 30_000_000,
+            beneficiary: address,
+            difficulty: crate::consensus::parlia::DIFF_INTURN,
+            extra_data: vec![0; 97].into(),
+            ..Default::default()
+        };
+        sign_test_header(&mut header);
         let block = BscBlock {
-            header: Header::default(),
+            header,
             body: BscBlockBody {
                 inner: BlockBody {
                     transactions: Vec::new(),
@@ -2015,6 +2247,39 @@ mod tests {
         let new_block = BscNewBlock(NewBlock { block, td: U128::from(1) });
         let hash = new_block.0.block.header.hash_slow();
         NewBlockMessage { hash, block: Arc::new(new_block), td: Some(U256::from(1)) }
+    }
+
+    fn sign_test_header(header: &mut Header) {
+        let secret = secp256k1::SecretKey::from_slice(&[1; 32]).unwrap();
+        let signature =
+            crate::node::miner::signer::MinerSigner::new(secret).seal_header(header, 56).unwrap();
+        let mut extra = header.extra_data.to_vec();
+        extra[32..].copy_from_slice(&signature);
+        header.extra_data = extra.into();
+    }
+
+    fn test_parent() -> Header {
+        Header { timestamp: 1, gas_limit: 30_000_000, ..Default::default() }
+    }
+
+    struct TestSnapshots(crate::consensus::parlia::Snapshot);
+
+    impl crate::consensus::parlia::SnapshotProvider for TestSnapshots {
+        fn snapshot_by_hash(&self, hash: &B256) -> Option<crate::consensus::parlia::Snapshot> {
+            (*hash == self.0.block_hash).then(|| self.0.clone())
+        }
+
+        fn insert(&self, _: crate::consensus::parlia::Snapshot) {}
+    }
+
+    fn test_snapshot() -> TestSnapshots {
+        TestSnapshots(crate::consensus::parlia::Snapshot::new(
+            vec![create_test_block().block.0.block.header.beneficiary],
+            0,
+            test_parent().hash_slow(),
+            200,
+            None,
+        ))
     }
 
     /// Helper function to handle engine messages with specified payload statuses
