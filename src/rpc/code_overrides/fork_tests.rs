@@ -78,7 +78,7 @@ macro_rules! check_routes {
         let results = api
             .call_many(
                 vec![bundle.clone(), bundle.clone()],
-                Some(context.clone()),
+                Some(context),
                 Some(state.clone()),
             )
             .await
@@ -352,8 +352,7 @@ async fn invalid_prev_randao_stays_invalid_across_forks_on_every_rpc() {
         assert_eq!(err.code(), -32602);
         let bundle = Bundle { transactions: vec![req.clone()], block_override: Some(ov.clone()) };
         let context = StateContext { block_number: Some(hash.into()), ..Default::default() };
-        let err =
-            api.call_many(vec![bundle.clone()], Some(context.clone()), None).await.unwrap_err();
+        let err = api.call_many(vec![bundle.clone()], Some(context), None).await.unwrap_err();
         assert!(err.to_string().contains("must be less than 1000"), "{err}");
         let debug = DebugApi::new(
             api.0.clone(),
