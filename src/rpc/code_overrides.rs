@@ -1,8 +1,4 @@
-//! RPC code-override support for CAS20 prefix routing.
-//!
-//! Reth c55455b applies overrides to the temporary database, but does not pass
-//! overridden addresses to dynamic precompile lookups. Keep its simulation and
-//! callMany execution flow here until the upstream helpers expose that hook.
+//! Public RPC code-override support for CAS20 prefix routing.
 
 use crate::evm::{block_env::BscBlockEnv, precompiles::cas20::is_cas20_precompile};
 use alloy_consensus::BlockHeader;
