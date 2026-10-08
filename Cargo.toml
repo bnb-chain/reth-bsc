@@ -114,7 +114,7 @@ jsonrpsee-types = "0.26.0"
 
 # misc dependencies
 auto_impl = "1"
-async-trait = "0.1"
+async-trait = "0.1.92"
 bytes = "1.5"
 clap = { version = "4.4", features = ["derive"] }
 cfg-if = { version = "1.0", default-features = false }
