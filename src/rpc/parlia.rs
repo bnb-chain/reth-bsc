@@ -1,7 +1,8 @@
 use alloy_consensus::Sealable;
+use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::{BlockHash, B256};
 use jsonrpsee::{core::RpcResult, proc_macros::rpc, types::ErrorObject};
-use reth_provider::{BlockNumReader, HeaderProvider};
+use reth_provider::{BlockIdReader, HeaderProvider};
 use serde::{Deserialize, Serialize};
 
 use crate::consensus::parlia::{Snapshot, SnapshotProvider};
@@ -141,7 +142,7 @@ pub trait ParliaApi {
 }
 
 /// Implementation of the Parlia snapshot RPC API
-pub struct ParliaApiImpl<P: SnapshotProvider, B: HeaderProvider + BlockNumReader + Send + Sync> {
+pub struct ParliaApiImpl<P: SnapshotProvider, B: HeaderProvider + BlockIdReader + Send + Sync> {
     /// Snapshot provider for accessing validator snapshots
     snapshot_provider: Arc<P>,
     provider: B,
@@ -171,7 +172,7 @@ impl SnapshotProvider for DynSnapshotProvider {
 impl<P, B> ParliaApiImpl<P, B>
 where
     P: SnapshotProvider + Send + Sync + 'static,
-    B: HeaderProvider + BlockNumReader + Send + Sync + 'static,
+    B: HeaderProvider + BlockIdReader + Send + Sync + 'static,
 {
     /// Create a new Parlia API instance
     pub fn new(snapshot_provider: Arc<P>, provider: B) -> Self {
@@ -193,14 +194,12 @@ where
             }
             "earliest" => return Ok(0),
             "safe" | "finalized" => {
-                // For BSC, treat safe/finalized as latest
-                return self.provider.best_block_number().map_err(|e| {
-                    ErrorObject::owned(
-                        -32603,
-                        format!("Failed to get latest block: {}", e),
-                        None::<()>,
-                    )
-                });
+                let tag = if block_str == "safe" {
+                    BlockNumberOrTag::Safe
+                } else {
+                    BlockNumberOrTag::Finalized
+                };
+                return super::finality::resolve_finality_block(&self.provider, tag);
             }
             _ => {}
         }
@@ -243,7 +242,7 @@ where
 impl<P, B> ParliaApiServer for ParliaApiImpl<P, B>
 where
     P: SnapshotProvider + Send + Sync + 'static,
-    B: HeaderProvider + BlockNumReader + Send + Sync + 'static,
+    B: HeaderProvider + BlockIdReader + Send + Sync + 'static,
 {
     /// Get snapshot at a specific block number (matches BSC official API.GetSnapshot)
     /// Accepts block number as hex string like "0x123132"
@@ -475,8 +474,36 @@ mod tests {
         ..Header::default()
     });
     /// Minimal test provider that satisfies the required traits with stubbed methods.
-    #[derive(Clone, Debug, Default)]
-    struct TestProvider();
+    #[derive(Clone, Debug)]
+    struct TestProvider {
+        safe: Option<u64>,
+        finalized: Option<u64>,
+        fail_markers: bool,
+    }
+
+    impl Default for TestProvider {
+        fn default() -> Self {
+            Self { safe: Some(98), finalized: Some(95), fail_markers: false }
+        }
+    }
+
+    impl BlockIdReader for TestProvider {
+        fn pending_block_num_hash(&self) -> ProviderResult<Option<alloy_eips::BlockNumHash>> {
+            Ok(None)
+        }
+        fn safe_block_num_hash(&self) -> ProviderResult<Option<alloy_eips::BlockNumHash>> {
+            if self.fail_markers {
+                return Err(reth_provider::ProviderError::UnsupportedProvider);
+            }
+            Ok(self.safe.map(|number| alloy_eips::BlockNumHash::new(number, B256::ZERO)))
+        }
+        fn finalized_block_num_hash(&self) -> ProviderResult<Option<alloy_eips::BlockNumHash>> {
+            if self.fail_markers {
+                return Err(reth_provider::ProviderError::UnsupportedProvider);
+            }
+            Ok(self.finalized.map(|number| alloy_eips::BlockNumHash::new(number, B256::ZERO)))
+        }
+    }
 
     impl reth_provider::BlockHashReader for TestProvider {
         fn block_hash(
@@ -510,9 +537,11 @@ mod tests {
 
         fn block_number(
             &self,
-            _hash: alloy_primitives::B256,
+            hash: alloy_primitives::B256,
         ) -> ProviderResult<Option<alloy_primitives::BlockNumber>> {
-            Ok(None)
+            Ok([0, 95, 98, 100].into_iter().find(|number| {
+                self.header_by_number(*number).unwrap().unwrap().hash_slow() == hash
+            }))
         }
     }
 
@@ -529,7 +558,7 @@ mod tests {
         fn header_by_number(&self, _num: u64) -> ProviderResult<Option<Self::Header>> {
             match _num {
                 0 => Ok(Some((*TEST_GENSIS_HEADER).clone())),
-                100 => Ok(Some((*TEST_HEADER).clone())),
+                95 | 98 | 100 => Ok(Some(Header { number: _num, ..(*TEST_HEADER).clone() })),
                 _ => Ok(None),
             }
         }
@@ -599,7 +628,7 @@ mod tests {
             ..Default::default()
         });
 
-        let provider = TestProvider();
+        let provider = TestProvider::default();
         let api = ParliaApiImpl::new(snapshot_provider, provider);
 
         // Test getSnapshot with block number
@@ -633,5 +662,71 @@ mod tests {
         // Test getFinalizedNumber
         let finalized = api.get_finalized_number("latest".to_string()).await.unwrap();
         assert!(finalized <= 99); // Finalized number should be <= justified number
+    }
+
+    #[tokio::test]
+    async fn finality_tags_select_canonical_snapshots_and_preserve_other_inputs() {
+        let db = create_test_rw_db();
+        let snapshots = Arc::new(EnhancedDbSnapshotProvider::new(
+            db,
+            2048,
+            Arc::new(BscChainSpec::from(bsc_testnet())),
+        ));
+        let provider = TestProvider::default();
+        for number in [0, 95, 98, 100] {
+            snapshots.insert(Snapshot {
+                block_number: number,
+                block_hash: provider.header_by_number(number).unwrap().unwrap().hash_slow(),
+                validators: vec![alloy_primitives::Address::repeat_byte(number as u8)],
+                ..Default::default()
+            });
+        }
+        let api = ParliaApiImpl::new(snapshots, provider);
+        for (input, number) in [
+            ("latest", 100),
+            ("safe", 98),
+            ("finalized", 95),
+            ("earliest", 0),
+            ("0x62", 98),
+            ("95", 95),
+        ] {
+            let snapshot = api.get_snapshot(input.into()).await.unwrap().unwrap();
+            assert_eq!(snapshot.number, number);
+            assert_eq!(
+                api.get_validators(input.into()).await.unwrap(),
+                vec![format!("0x{:040x}", alloy_primitives::Address::repeat_byte(number as u8))]
+            );
+        }
+        let hash = api.provider.header_by_number(98).unwrap().unwrap().hash_slow();
+        assert_eq!(api.get_snapshot(hash.to_string()).await.unwrap().unwrap().number, 98);
+        assert_eq!(api.parse_block_number(&hex::encode(hash)), Ok(98));
+        assert_eq!(api.get_snapshot("pending".into()).await.unwrap_err().code(), -32602);
+        assert_eq!(api.get_snapshot("invalid".into()).await.unwrap_err().code(), -32602);
+    }
+
+    #[tokio::test]
+    async fn finality_marker_failures_are_not_latest_fallbacks() {
+        for provider in [
+            TestProvider { safe: None, finalized: None, ..Default::default() },
+            TestProvider { fail_markers: true, ..Default::default() },
+        ] {
+            let snapshots = Arc::new(EnhancedDbSnapshotProvider::new(
+                create_test_rw_db(),
+                2048,
+                Arc::new(BscChainSpec::from(bsc_testnet())),
+            ));
+            let api = ParliaApiImpl::new(snapshots, provider);
+            assert_eq!(api.parse_block_number("latest"), Ok(100));
+            for tag in ["safe", "finalized"] {
+                let error = api.get_snapshot(tag.into()).await.unwrap_err();
+                assert_eq!(error.code(), -32603);
+                assert!(error.message().contains(tag));
+                if api.provider.fail_markers {
+                    assert!(error
+                        .message()
+                        .contains(&reth_provider::ProviderError::UnsupportedProvider.to_string()));
+                }
+            }
+        }
     }
 }

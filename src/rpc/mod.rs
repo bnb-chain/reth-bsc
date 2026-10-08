@@ -7,6 +7,7 @@ pub mod code_overrides;
 pub mod debug_builder;
 pub mod eth_config;
 pub mod eth_ext;
+mod finality;
 pub mod mev;
 pub mod miner;
 pub mod parlia;
