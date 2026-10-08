@@ -882,6 +882,12 @@ pub fn set_miner_gas_tip(val: u64) {
     }
 }
 
+/// Initialize only the tip for tests, without changing other miner settings.
+#[cfg(test)]
+pub(crate) fn init_miner_gas_tip_for_tests(val: u64) {
+    let _ = MINER_GAS_TIP.set(AtomicU64::new(val));
+}
+
 pub fn get_miner_gas_tip() -> Option<u64> {
     MINER_GAS_TIP.get().map(|v| v.load(Ordering::Relaxed))
 }
