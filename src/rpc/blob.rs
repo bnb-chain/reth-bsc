@@ -1,14 +1,15 @@
-use jsonrpsee::core::RpcResult;
-use jsonrpsee::proc_macros::rpc;
-use jsonrpsee::types::ErrorObject;
-use alloy_primitives::B256;
 use alloy_consensus::{transaction::TxHashRef, BlockHeader};
-use alloy_eips::eip2718::{EIP4844_TX_TYPE_ID, Typed2718};
+use alloy_eips::{
+    eip2718::{Typed2718, EIP4844_TX_TYPE_ID},
+    eip7594::BlobTransactionSidecarVariant,
+    BlockNumberOrTag,
+};
+use alloy_primitives::B256;
+use jsonrpsee::{core::RpcResult, proc_macros::rpc, types::ErrorObject};
+use reth_provider::{BlockIdReader, BlockReader, TransactionsProvider};
+use reth_transaction_pool::{BlobStoreError, TransactionPool};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use reth_transaction_pool::{BlobStoreError, TransactionPool};
-use alloy_eips::eip7594::BlobTransactionSidecarVariant;
-use reth_provider::{BlockNumReader, BlockReader, TransactionsProvider};
 
 /// Inner blob sidecar data
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,7 +95,7 @@ impl<Pool, Provider> BlobApiImpl<Pool, Provider> {
 impl<Pool, Provider> BlobApiImpl<Pool, Provider>
 where
     Pool: TransactionPool + Clone + 'static,
-    Provider: TransactionsProvider + BlockNumReader + Clone + 'static,
+    Provider: TransactionsProvider + BlockIdReader + Clone + 'static,
 {
     /// Convert BlobTransactionSidecarVariant to BlobSidecarResponse
     fn sidecar_to_response(
@@ -192,13 +193,12 @@ where
             }
             "earliest" => return Ok(0),
             "safe" | "finalized" => {
-                // For BSC, treat safe/finalized as latest
-                return self.provider.best_block_number()
-                    .map_err(|e| ErrorObject::owned(
-                        -32603,
-                        format!("Failed to get latest block: {}", e),
-                        None::<()>,
-                    ))
+                let tag = if block_str == "safe" {
+                    BlockNumberOrTag::Safe
+                } else {
+                    BlockNumberOrTag::Finalized
+                };
+                return super::finality::resolve_finality_block(&self.provider, tag);
             }
             _ => {}
         }
@@ -241,7 +241,7 @@ where
 impl<Pool, Provider> BlobApiServer for BlobApiImpl<Pool, Provider>
 where
     Pool: TransactionPool + Clone + Send + Sync + 'static,
-    Provider: TransactionsProvider + BlockNumReader + BlockReader + Clone + Send + Sync + 'static,
+    Provider: TransactionsProvider + BlockIdReader + BlockReader + Clone + Send + Sync + 'static,
 {
     /// Get blob sidecar by transaction hash
     async fn get_blob_sidecar_by_tx_hash(
@@ -461,5 +461,94 @@ mod tests {
         assert!(json.contains("blockNumber"));
         assert!(json.contains("blockHash"));
         assert!(json.contains("txIndex"));
+    }
+    #[tokio::test]
+    async fn finality_tags_select_distinct_blob_sidecars() {
+        use alloy_consensus::{Header, TxEip4844};
+        use alloy_eips::eip4844::{BlobTransactionSidecar, Bytes48};
+        use alloy_primitives::{Address, Signature, U256};
+        use reth_chain_state::{ExecutedBlock, NewCanonicalChain};
+        use reth_ethereum_primitives::{Block, BlockBody, TransactionSigned};
+        use reth_primitives_traits::{RecoveredBlock, SealedHeader};
+        use reth_provider::{
+            providers::BlockchainProvider, test_utils::create_test_provider_factory,
+            CanonChainTracker,
+        };
+        use reth_transaction_pool::{blobstore::BlobStore, test_utils::testing_pool};
+
+        let factory = create_test_provider_factory();
+        let mut parent = SealedHeader::seal_slow(Header { number: 94, ..Default::default() });
+        let provider = BlockchainProvider::with_latest(factory, parent.clone()).unwrap();
+        let pool = testing_pool();
+        let mut blocks = Vec::new();
+        let mut headers = std::collections::BTreeMap::new();
+        let mut hashes = std::collections::BTreeMap::new();
+        for number in 95..=100 {
+            let tx = TransactionSigned::new_unhashed(
+                TxEip4844 { nonce: number, ..Default::default() }.into(),
+                Signature::new(U256::ZERO, U256::ZERO, false),
+            );
+            hashes.insert(number, *tx.hash());
+            // Distinct nonempty sidecar responses prove the handler selected the correct block.
+            // KZG validation is outside this RPC selection test.
+            pool.blob_store()
+                .insert(
+                    *tx.hash(),
+                    BlobTransactionSidecar {
+                        blobs: vec![],
+                        commitments: vec![Bytes48::repeat_byte(number as u8)],
+                        proofs: vec![Bytes48::ZERO],
+                    }
+                    .into(),
+                )
+                .unwrap();
+            let block = RecoveredBlock::new_unhashed(
+                Block {
+                    header: Header { number, parent_hash: parent.hash(), ..Default::default() },
+                    body: BlockBody { transactions: vec![tx], ..Default::default() },
+                },
+                vec![Address::ZERO],
+            );
+            parent = block.clone_sealed_header();
+            headers.insert(number, parent.clone());
+            blocks.push(ExecutedBlock { recovered_block: Arc::new(block), ..Default::default() });
+        }
+        provider
+            .canonical_in_memory_state()
+            .update_chain(NewCanonicalChain::Commit { new: blocks });
+        provider.set_canonical_head(headers[&100].clone());
+        let api = BlobApiImpl::new(pool, provider.clone(), false);
+        // A head is present, but neither finality marker is available yet.
+        assert_eq!(api.parse_block_number("latest").unwrap(), 100);
+        for tag in ["safe", "finalized"] {
+            let error = api.get_blob_sidecars(tag.into(), None).await.unwrap_err();
+            assert_eq!(error.code(), -32603);
+            assert!(error.message().contains(tag));
+        }
+        provider.set_safe(headers[&98].clone());
+        provider.set_finalized(headers[&95].clone());
+        for (input, number) in
+            [("latest", 100), ("safe", 98), ("finalized", 95), ("0x62", 98), ("95", 95)]
+        {
+            for full in [None, Some(false), Some(true)] {
+                let responses = api.get_blob_sidecars(input.into(), full).await.unwrap();
+                assert_eq!(responses.len(), 1);
+                let response = &responses[0];
+                assert_eq!(response.block_number, Some(format!("0x{number:x}")));
+                assert_eq!(response.block_hash, Some(format!("0x{:x}", headers[&number].hash())));
+                assert_eq!(response.tx_hash, format!("0x{:x}", hashes[&number]));
+                assert_eq!(response.tx_index.as_deref(), Some("0x0"));
+                assert_eq!(
+                    response.blob_sidecar.commitments,
+                    vec![format!("0x{}", hex::encode([number as u8; 48]))]
+                );
+            }
+        }
+        let response = api.get_blob_sidecars(headers[&98].hash().to_string(), None).await.unwrap();
+        assert_eq!(response[0].tx_hash, format!("0x{:x}", hashes[&98]));
+        assert_eq!(api.parse_block_number(&hex::encode(headers[&98].hash())).unwrap(), 98);
+        assert_eq!(api.parse_block_number("earliest").unwrap(), 0);
+        assert_eq!(api.get_blob_sidecars("pending".into(), None).await.unwrap_err().code(), -32602);
+        assert_eq!(api.get_blob_sidecars("invalid".into(), None).await.unwrap_err().code(), -32602);
     }
 }
