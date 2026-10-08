@@ -131,7 +131,7 @@ impl Default for MiningConfig {
             bid_simulation_left_over: Some(20),  // 20ms (go-bsc's defaultBidSimulationLeftOver)
             no_interrupt_left_over: Some(default_no_interrupt_left_over()),
             delay_left_over: Some(15),           // 15ms (go-bsc's defaultDelayLeftOver)
-            max_bids_per_builder: Some(3),
+            max_bids_per_builder: Some(2),       // go-bsc's defaultMaxBidsPerBuilder
             builder_fee_ceil: Some(1_000_000_000_000_000_000), // 1 BNB
             allowed_builders: None, // No whitelist by default (allow all)
             bid_block_enabled: false, // BEP-675 BidBlock path off by default
@@ -213,7 +213,7 @@ impl MiningConfig {
 
     /// Get maximum bids per builder per block
     pub fn get_max_bids_per_builder(&self) -> u32 {
-        self.max_bids_per_builder.unwrap_or(3) // Default: 3
+        self.max_bids_per_builder.unwrap_or(2) // Default: 2 (go-bsc default)
     }
 
     /// Get builder fee ceiling in wei
@@ -299,7 +299,7 @@ impl MiningConfig {
                 bid_simulation_left_over: Some(20),
                 no_interrupt_left_over: Some(default_no_interrupt_left_over()),
                 delay_left_over: Some(15),
-                max_bids_per_builder: Some(3),
+                max_bids_per_builder: Some(2),
                 builder_fee_ceil: Some(1_000_000_000_000_000_000),
                 allowed_builders: None,
                 bid_block_enabled: false,
@@ -590,6 +590,16 @@ mod tests {
     fn bid_simulation_left_over_matches_go_bsc_default() {
         // go-bsc's `defaultBidSimulationLeftOver = 20 * time.Millisecond`.
         assert_eq!(MiningConfig::default().get_bid_simulation_left_over(), 20);
+    }
+
+    #[test]
+    fn max_bids_per_builder_matches_go_bsc_default() {
+        assert_eq!(MiningConfig::default().get_max_bids_per_builder(), 2);
+        assert_eq!(
+            MiningConfig { max_bids_per_builder: None, ..Default::default() }
+                .get_max_bids_per_builder(),
+            2
+        );
     }
 
     #[test]

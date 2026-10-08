@@ -1,5 +1,5 @@
 use crate::chainspec::BscChainSpec;
-use crate::consensus::parlia::SnapshotProvider;
+use crate::consensus::parlia::{Snapshot, SnapshotProvider};
 use crate::hardforks::BscHardforks;
 use crate::node::miner::bid_block::BidBlockArgs;
 use crate::node::miner::bid_simulator::Bid;
@@ -18,10 +18,10 @@ use reth_ethereum_primitives::TransactionSigned;
 use reth_primitives_traits::SignerRecoverable;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
-
-/// Per-block pending BidBlock tracking: block_number → builder → set of bid hashes.
-type PendingBidBlocks = Arc<RwLock<HashMap<u64, HashMap<Address, HashSet<B256>>>>>;
 use tracing::debug;
+
+/// Per-block pending bid tracking: block_number → builder → set of bid hashes.
+type PendingBids = HashMap<u64, HashMap<Address, HashSet<B256>>>;
 
 /// Raw bid data structure from builder
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -244,11 +244,13 @@ const PAY_BID_TX_GAS_LIMIT: u64 = 25000;
 // JSON-RPC error codes for bid rejections, matching go-bsc `core/types/bid_error.go` so builder
 // clients see the same codes from reth-bsc and geth.
 const INVALID_BID_PARAM_ERROR: i32 = -38001;
+const INVALID_PAY_BID_TX_ERROR: i32 = -38002;
 const MEV_NOT_RUNNING_ERROR: i32 = -38003;
 const MEV_NOT_IN_TURN_ERROR: i32 = -38005;
 const BID_BLOCK_PERMISSION_REVOKED_ERROR: i32 = -38006;
 const BID_BLOCK_PRE_SEAL_VERIFY_ERROR: i32 = -38007;
 const BID_BLOCK_TOO_LATE_ERROR: i32 = -38008;
+const DEFAULT_ERROR: i32 = -32000;
 
 /// Reproduces go-bsc `Miner.bidBlockEnabled()`: a BidBlock is only accepted when MEV is running,
 /// the `BidBlockEnabled` flag is set, and the Pasteur fork is active at the chain head.
@@ -256,9 +258,9 @@ fn bid_block_admission_enabled(mev_running: bool, flag_enabled: bool, pasteur_ac
     mev_running && flag_enabled && pasteur_active
 }
 
-/// Why `mev_sendBidBlock`'s structural validation rejected a submission. Ordered as the checks run.
+/// Why a bid failed structural validation. Ordered as the checks run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BidBlockStructuralRejection {
+enum BidStructuralRejection {
     /// Bid targets a height at or below the head — it can never become the next block.
     StaleNumber,
     /// Bid targets a height beyond `head + 1`.
@@ -289,8 +291,27 @@ fn validate_bid_block_structure(
     head_hash: B256,
     gas_used: u64,
     transaction_count: usize,
-) -> Result<(), BidBlockStructuralRejection> {
-    use BidBlockStructuralRejection::*;
+) -> Result<(), BidStructuralRejection> {
+    use BidStructuralRejection::*;
+    validate_bid_head(block_number, head_number, is_inturn, bid_parent_hash, head_hash)?;
+    if gas_used == 0 {
+        return Err(EmptyGasUsed);
+    }
+    if transaction_count == 0 {
+        return Err(EmptyTransactions);
+    }
+    Ok(())
+}
+
+/// The head checks shared by `mev_sendBid` and `mev_sendBidBlock`, in go-bsc's order.
+fn validate_bid_head(
+    block_number: u64,
+    head_number: u64,
+    is_inturn: bool,
+    bid_parent_hash: B256,
+    head_hash: B256,
+) -> Result<(), BidStructuralRejection> {
+    use BidStructuralRejection::*;
     if block_number < head_number + 1 {
         return Err(StaleNumber);
     }
@@ -303,12 +324,30 @@ fn validate_bid_block_structure(
     if bid_parent_hash != head_hash {
         return Err(NonAlignedParent);
     }
-    if gas_used == 0 {
-        return Err(EmptyGasUsed);
+    Ok(())
+}
+
+/// Mirrors go-bsc `bidSimulator.ReservePending`; a reserved slot is never released. Entries at or
+/// below `head_number` are dropped first, like go-bsc's `clearLoop`.
+fn reserve_pending_bid(
+    pending: &mut PendingBids,
+    head_number: u64,
+    block_number: u64,
+    builder: Address,
+    bid_hash: B256,
+    max_bids: u32,
+) -> Result<(), String> {
+    pending.retain(|number, _| *number > head_number);
+    let hashes = pending.entry(block_number).or_default().entry(builder).or_default();
+    if hashes.contains(&bid_hash) {
+        return Err("bid already exists".to_string());
     }
-    if transaction_count == 0 {
-        return Err(EmptyTransactions);
+    if hashes.len() >= max_bids as usize {
+        return Err(format!(
+            "too many bids: exceeded limit of {max_bids} bids per builder per block"
+        ));
     }
+    hashes.insert(bid_hash);
     Ok(())
 }
 
@@ -329,9 +368,27 @@ fn bid_must_before_ms(parent_timestamp_ms: u64, block_interval_ms: u64, delay_le
         .saturating_sub(delay_left_over_ms as u128)
 }
 
+/// Mirrors go-bsc `bidutil.BidBetterBefore`, the `mev_sendBid` deadline.
+fn bid_better_before_ms(
+    parent_timestamp_ms: u64,
+    block_interval_ms: u64,
+    delay_left_over_ms: u64,
+    bid_simulation_left_over_ms: u64,
+) -> u128 {
+    bid_must_before_ms(parent_timestamp_ms, block_interval_ms, delay_left_over_ms)
+        .saturating_sub(bid_simulation_left_over_ms as u128)
+}
+
+fn unix_now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
 /// Implementation of the MEV Builder RPC API.
 ///
-/// Clones share the whitelist and pending-BidBlock accounting. This lets JSON-RPC and gRPC expose
+/// Clones share the whitelist and pending-bid accounting. This lets JSON-RPC and gRPC expose
 /// the same admission object without creating separate duplicate/quota state.
 #[derive(Clone)]
 pub struct MevApiImpl {
@@ -354,10 +411,8 @@ pub struct MevApiImpl {
     version: String,
     /// Whitelist of allowed builders (shared with miner_ namespace via shared.rs)
     allowed_builders: Arc<RwLock<HashSet<Address>>>,
-    /// Mirrors go-bsc `bidSimulator.pending`: blockNumber → builder → set of bid hashes.
-    /// Used to enforce duplicate detection and the per-builder-per-block quota
-    /// (`max_bids_per_builder`) at RPC admission time, before the bid enters the miner queue.
-    pending_bid_blocks: PendingBidBlocks,
+    /// Mirrors go-bsc `bidSimulator.pending`, shared by `mev_sendBid` and `mev_sendBidBlock`.
+    pending_bids: Arc<RwLock<PendingBids>>,
 }
 
 // NOTE: The allowed_builders is now also accessible via crate::shared::get_builder_whitelist()
@@ -465,52 +520,69 @@ impl MevApiImpl {
             grpc_enabled,
             version,
             allowed_builders,
-            pending_bid_blocks: Arc::new(RwLock::new(HashMap::new())),
+            pending_bids: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
-    /// Mirrors go-bsc `bidSimulator.CheckPending`: returns an error if `bid_hash` is already
-    /// registered for `(block_number, builder)` or if the builder has reached the per-block quota.
-    fn check_pending_bid_block(
+    fn reserve_pending_bid(
         &self,
+        head_number: u64,
         block_number: u64,
         builder: Address,
         bid_hash: B256,
     ) -> Result<(), String> {
-        let pending = self.pending_bid_blocks.read().unwrap();
-        if let Some(by_builder) = pending.get(&block_number) {
-            if let Some(hashes) = by_builder.get(&builder) {
-                if hashes.contains(&bid_hash) {
-                    return Err("bid already exists".to_string());
-                }
-                if hashes.len() >= self.max_bids_per_builder as usize {
-                    return Err(format!(
-                        "too many bids: exceeded limit of {} bids per builder per block",
-                        self.max_bids_per_builder
-                    ));
-                }
+        reserve_pending_bid(
+            &mut self.pending_bids.write().unwrap(),
+            head_number,
+            block_number,
+            builder,
+            bid_hash,
+            self.max_bids_per_builder,
+        )
+    }
+
+    /// The chain head, its hash, and whether this validator is in turn for the next block.
+    fn bid_head(&self) -> RpcResult<(alloy_consensus::Header, B256, bool)> {
+        let head_number = crate::shared::get_best_canonical_block_number()
+            .ok_or_else(|| Self::internal_err("chain head unavailable"))?;
+        let head = self
+            .get_header_by_number(head_number)
+            .ok_or_else(|| Self::internal_err("chain head header unavailable"))?;
+        let head_hash = head.hash_slow();
+        let is_inturn = self
+            .snapshot_provider
+            .snapshot_by_hash(&head_hash)
+            .is_some_and(|snapshot| snapshot.is_inturn(self.validator_address));
+        Ok((head, head_hash, is_inturn))
+    }
+
+    fn head_snapshot(&self, head_hash: &B256) -> RpcResult<Snapshot> {
+        self.snapshot_provider
+            .snapshot_by_hash(head_hash)
+            .ok_or_else(|| Self::internal_err("chain head snapshot unavailable"))
+    }
+
+    fn structural_rejection(
+        rejection: BidStructuralRejection,
+        block_number: u64,
+        head_number: u64,
+        head_hash: B256,
+    ) -> jsonrpsee::types::ErrorObjectOwned {
+        use BidStructuralRejection as R;
+        match rejection {
+            R::StaleNumber => Self::invalid_bid(format!(
+                "stale block number: {block_number}, latest block: {head_number}"
+            )),
+            R::FutureNumber => Self::invalid_bid(format!(
+                "block in future: {block_number}, latest block: {head_number}"
+            )),
+            R::NotInTurn => Self::mev_not_in_turn(),
+            R::NonAlignedParent => {
+                Self::invalid_bid(format!("non-aligned parent hash: {head_hash:?}"))
             }
+            R::EmptyGasUsed => Self::invalid_bid("empty gasUsed in header"),
+            R::EmptyTransactions => Self::invalid_bid("empty transactions"),
         }
-        Ok(())
-    }
-
-    /// Mirrors go-bsc `bidSimulator.AddPending`: registers `bid_hash` for `(block_number, builder)`.
-    fn add_pending_bid_block(&self, block_number: u64, builder: Address, bid_hash: B256) {
-        let mut pending = self.pending_bid_blocks.write().unwrap();
-        pending
-            .entry(block_number)
-            .or_default()
-            .entry(builder)
-            .or_default()
-            .insert(bid_hash);
-    }
-
-    /// Mirrors go-bsc `bidutil.BidMustBefore`: the deadline after which a bid is too late.
-    ///
-    /// See [`bid_must_before_ms`] for the formula and why `parent_timestamp_ms` must be the
-    /// parent's full millisecond timestamp.
-    fn bid_must_before_ms(&self, parent_timestamp_ms: u64, block_interval_ms: u64) -> u128 {
-        bid_must_before_ms(parent_timestamp_ms, block_interval_ms, self.delay_left_over)
     }
 
     /// Get header by number from global header provider
@@ -528,6 +600,16 @@ impl MevApiImpl {
     /// `NewInvalidBidError` — generic invalid-bid rejection (code `-38001`).
     fn invalid_bid(msg: impl Into<String>) -> jsonrpsee::types::ErrorObjectOwned {
         jsonrpsee::types::ErrorObject::owned(INVALID_BID_PARAM_ERROR, msg.into(), None::<()>)
+    }
+
+    /// `NewInvalidPayBidTxError` (code `-38002`).
+    fn invalid_pay_bid_tx(msg: impl Into<String>) -> jsonrpsee::types::ErrorObjectOwned {
+        jsonrpsee::types::ErrorObject::owned(INVALID_PAY_BID_TX_ERROR, msg.into(), None::<()>)
+    }
+
+    /// A go-bsc plain error (code `-32000`).
+    fn plain_err(msg: impl Into<String>) -> jsonrpsee::types::ErrorObjectOwned {
+        jsonrpsee::types::ErrorObject::owned(DEFAULT_ERROR, msg.into(), None::<()>)
     }
 
     /// `ErrMevNotRunning` (code `-38003`, fixed message).
@@ -585,59 +667,27 @@ impl MevApiImpl {
             return Err(Self::mev_not_running());
         }
 
-        // Chain-head context (the parent the bid must build on); go-bsc reads `CurrentBlock()`.
-        let head_number = crate::shared::get_best_canonical_block_number()
-            .ok_or_else(|| Self::internal_err("chain head unavailable"))?;
-        let head_header = self
-            .get_header_by_number(head_number)
-            .ok_or_else(|| Self::internal_err("chain head header unavailable"))?;
-
         // Number, then in-turn, then parent-hash alignment — go-bsc's order, enforced in
         // `validate_bid_block_structure` so the ordering itself is unit-tested.
         let block_number = bb.header.number;
-        let parent_hash = head_header.hash_slow();
-        let is_inturn = self
-            .snapshot_provider
-            .snapshot_by_hash(&parent_hash)
-            .is_some_and(|snapshot| snapshot.is_inturn(self.validator_address));
-
-        if let Err(rejection) = validate_bid_block_structure(
+        let (head_header, head_hash, is_inturn) = self.bid_head()?;
+        validate_bid_block_structure(
             block_number,
-            head_number,
+            head_header.number,
             is_inturn,
             bb.header.parent_hash,
-            parent_hash,
+            head_hash,
             bb.header.gas_used,
             bb.transactions.len(),
-        ) {
-            use BidBlockStructuralRejection as R;
-            return Err(match rejection {
-                R::StaleNumber => Self::invalid_bid(format!(
-                    "stale block number: {block_number}, latest block: {head_number}"
-                )),
-                R::FutureNumber => Self::invalid_bid(format!(
-                    "block in future: {block_number}, latest block: {head_number}"
-                )),
-                R::NotInTurn => Self::mev_not_in_turn(),
-                R::NonAlignedParent => {
-                    Self::invalid_bid(format!("non-aligned parent hash: {parent_hash:?}"))
-                }
-                R::EmptyGasUsed => Self::invalid_bid("empty gasUsed in header"),
-                R::EmptyTransactions => Self::invalid_bid("empty transactions"),
-            });
-        }
+        )
+        .map_err(|r| Self::structural_rejection(r, block_number, head_header.number, head_hash))?;
 
         // Every rejection above returns before this point, so nothing structurally invalid can
         // reach the miner queue (TC-009's `bid_block_queue_len()` invariant).
         self.admit_bid_block(&args, &head_header)
     }
 
-    /// Miner-side BidBlock admission — mirrors the front of go-bsc `Miner.SendBidBlock`:
-    /// `bidBlockEnabled()` gate, builder recovery, whitelist (`ExistBuilder`) and permission. The
-    /// simulator-backed tail (`recordBidBlockBuilder`, `CheckPending`, bid timing,
-    /// `ToDecodedBidBlock` + parlia extra/blind-sign, the full `preSealVerifyBidBlock`, and the
-    /// bid-simulator enqueue) is the validator-side build path and lands in 8d. Until then
-    /// admission acknowledges the bid hash.
+    /// Miner-side BidBlock admission, mirroring go-bsc `Miner.SendBidBlock`.
     fn admit_bid_block(
         &self,
         args: &BidBlockArgs,
@@ -686,7 +736,7 @@ impl MevApiImpl {
             )));
         }
 
-        // Mirrors go-bsc: permission check comes before CheckPending so a revoked builder cannot
+        // Mirrors go-bsc: permission check comes before ReservePending so a revoked builder cannot
         // consume quota.
         if !crate::shared::get_bid_block_permission_manager().is_allowed(builder) {
             return Err(Self::permission_revoked(
@@ -694,26 +744,20 @@ impl MevApiImpl {
             ));
         }
 
-        // Mirrors go-bsc `bidSimulator.CheckPending`: duplicate + per-builder quota guard.
-        // Must run before the timing check so rejected bids do not consume quota.
+        // Like go-bsc, reserve before the remaining checks; a bid they reject keeps its slot.
         let block_number = args.bid_block.header.number;
-        self.check_pending_bid_block(block_number, builder, bid_hash)
-            .map_err(Self::invalid_bid)?;
+        self.reserve_pending_bid(head_header.number, block_number, builder, bid_hash)
+            .map_err(Self::plain_err)?;
 
         // Mirrors go-bsc `bidSimulator.bidMustBefore`: reject bids that arrive after the
         // validator must have already started sealing (no time left to simulate).
-        let snap = self
-            .snapshot_provider
-            .snapshot_by_hash(&head_header.hash_slow())
-            .ok_or_else(|| Self::internal_err("chain head snapshot unavailable"))?;
-        let block_interval_ms = snap.block_interval;
-        let parent_timestamp_ms =
-            crate::consensus::parlia::util::calculate_millisecond_timestamp(head_header);
-        let bid_must_before_ms = self.bid_must_before_ms(parent_timestamp_ms, block_interval_ms);
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
+        let snap = self.head_snapshot(&head_header.hash_slow())?;
+        let bid_must_before_ms = bid_must_before_ms(
+            crate::consensus::parlia::util::calculate_millisecond_timestamp(head_header),
+            snap.block_interval,
+            self.delay_left_over,
+        );
+        let now_ms = unix_now_ms();
         if now_ms >= bid_must_before_ms {
             return Err(Self::too_late(format!(
                 "too late: bid must arrive before {}ms, arrived {}ms later, bidHash={bid_hash}",
@@ -767,10 +811,6 @@ impl MevApiImpl {
         // (`-38004`) on a 1s enqueue timeout; reth-bsc's intake queue is unbounded, so admission
         // can never report busy. Left as a known gap — implementing genuine backpressure here is
         // a distinct change from surfacing the correct error codes for checks that already run.
-        //
-        // Register after all checks pass so quota is only consumed by accepted bids.
-        self.add_pending_bid_block(block_number, builder, bid_hash);
-
         crate::shared::push_bid_block_package(decoded);
 
         tracing::info!(
@@ -1124,198 +1164,65 @@ impl MevApiImpl {
 
 #[async_trait::async_trait]
 impl BscMevApiServer for MevApiImpl {
-    /// Send a bid to the builder
-    /// Returns the bid hash
+    /// Mirrors go-bsc `MevAPI.SendBid` and `Miner.SendBid`, in the same check order.
     async fn send_bid(&self, bid: BidArgs) -> RpcResult<B256> {
-        tracing::info!(
-            "Received bid for block {} with {} txs",
-            bid.raw_bid.block_number,
-            bid.raw_bid.txs.len()
-        );
-
-        // bid.raw_bid.block_number is the NEW block to be built
-        // bid.raw_bid.parent_hash is the hash of the PARENT block (block_number - 1)
-        let new_block_number: u64 = bid.raw_bid.block_number.to();
-        let parent_block_number = new_block_number.saturating_sub(1);
-
-        // Get parent block header from chain (not from snapshot!)
-        let parent_header = match self.get_header_by_number(parent_block_number) {
-            Some(header) => header,
-            None => {
-                tracing::error!(
-                    "Skip bid: parent block {} not found on chain",
-                    parent_block_number
-                );
-                return Err(jsonrpsee::types::ErrorObject::owned(
-                    -32602,
-                    "Parent block not found",
-                    None::<()>,
-                ));
-            }
-        };
-
-        // Verify parent hash matches
-        let parent_hash = parent_header.hash_slow();
-        if bid.raw_bid.parent_hash != parent_hash {
-            tracing::error!(
-                "Skip bid: parent hash mismatch. Expected: {:?}, Got: {:?}, Block: {}",
-                parent_hash,
-                bid.raw_bid.parent_hash,
-                new_block_number
-            );
-            return Err(jsonrpsee::types::ErrorObject::owned(
-                -32602,
-                "Parent hash mismatch",
-                None::<()>,
-            ));
+        if !crate::shared::is_mev_running() {
+            return Err(Self::mev_not_running());
         }
 
-        // Recover builder address from signature
-        let builder = match Self::recover_builder_address(&bid.raw_bid, &bid.signature) {
-            Ok(addr) => addr,
-            Err(e) => {
-                tracing::error!("Failed to recover builder address: {}", e);
-                return Err(jsonrpsee::types::ErrorObject::owned(
-                    -32602,
-                    format!("Invalid signature: {}", e),
-                    None::<()>,
-                ));
-            }
-        };
-        debug!("builder: {:?}", builder);
+        let raw_bid = &bid.raw_bid;
+        let block_number: u64 = raw_bid.block_number.to();
+        let (head_header, head_hash, is_inturn) = self.bid_head()?;
+        let head_number = head_header.number;
+        validate_bid_head(block_number, head_number, is_inturn, raw_bid.parent_hash, head_hash)
+            .map_err(|r| Self::structural_rejection(r, block_number, head_number, head_hash))?;
 
-        // Check if builder is in whitelist
-        if !self.is_builder_allowed(&builder) {
-            tracing::error!(
-                "Builder {} is not in whitelist, rejecting bid for block {}",
-                builder,
-                new_block_number
-            );
-            return Err(jsonrpsee::types::ErrorObject::owned(
-                -32603,
-                format!("Builder {} is not registered", builder),
-                None::<()>,
-            ));
+        if raw_bid.gas_fee == 0 || raw_bid.gas_used == 0 {
+            return Err(Self::invalid_bid("empty gasFee or empty gasUsed"));
         }
-
-        // Calculate bid hash (using RLP hash of RawBid)
-        let bid_hash = Self::calculate_raw_bid_hash(&bid.raw_bid);
-        debug!("bid_hash: {:?}", bid_hash);
-
-        // Optional: Check if validator is inturn using snapshot (for filtering bids)
-        // Note: This is optional - you may want to accept bids even when not inturn
-        if let Some(snapshot) = self.snapshot_provider.snapshot_by_hash(&parent_hash) {
-            // You can add validator checks here if needed
-            tracing::debug!(
-                "Validator snapshot available for block {}, validators: {}",
-                parent_block_number,
-                snapshot.validators.len()
-            );
-            if !snapshot.is_inturn(self.validator_address) {
-                tracing::error!(
-                    "Skip bid: validator is not inturn, block number: {}, validator address: {}",
-                    new_block_number,
-                    self.validator_address
-                );
-                return Err(jsonrpsee::types::ErrorObject::owned(
-                    -32602,
-                    "Validator is not inturn",
-                    None::<()>,
-                ));
-            }
-        } else {
-            tracing::debug!(
-                "No snapshot available for block {} (validator may not be inturn)",
-                parent_block_number
-            );
+        if raw_bid.builder_fee.is_some_and(|fee| fee >= raw_bid.gas_fee) {
+            return Err(Self::invalid_bid("builder fee must be less than gas fee"));
         }
-
-        if bid.raw_bid.gas_fee == 0 || bid.raw_bid.gas_used == 0 {
-            tracing::error!(
-                "Skip to new bid due to gas fee or gas used is 0, block number: {}",
-                new_block_number
-            );
-            return Err(jsonrpsee::types::ErrorObject::owned(
-                -32602,
-                "Gas fee or gas used is 0",
-                None::<()>,
-            ));
-        }
-
-        // Validate builder_fee if provided
-        if let Some(builder_fee) = bid.raw_bid.builder_fee {
-            // U256 is always >= 0, so no need to check for negative values
-            if builder_fee > bid.raw_bid.gas_fee {
-                tracing::error!(
-                    "Skip to new bid due to builder fee is greater than gas fee, block number: {}",
-                    new_block_number
-                );
-                return Err(jsonrpsee::types::ErrorObject::owned(
-                    -32602,
-                    "Builder fee is greater than gas fee",
-                    None::<()>,
-                ));
-            }
-        }
-
         if bid.pay_bid_tx.is_empty() || bid.pay_bid_tx_gas_used == 0 {
-            tracing::error!(
-                "Skip to new bid due to pay bid tx is empty or gas used is 0, block number: {}",
-                new_block_number
-            );
-            return Err(jsonrpsee::types::ErrorObject::owned(
-                -32602,
-                "Pay bid tx is empty or gas used is 0",
-                None::<()>,
-            ));
+            return Err(Self::invalid_pay_bid_tx("payBidTx and payBidTxGasUsed are must-have"));
         }
-
         if bid.pay_bid_tx_gas_used > PAY_BID_TX_GAS_LIMIT {
-            tracing::error!("Skip to new bid due to pay bid tx gas used is greater than limit, block number: {}", new_block_number);
-            return Err(jsonrpsee::types::ErrorObject::owned(
-                -32602,
-                "Pay bid tx gas used is greater than limit",
-                None::<()>,
-            ));
-        }
-        // Check if this bid is already pending - skip for now as we removed miner reference
-        // TODO: Add check_pending_bid to global state if needed
-
-        // Convert BidArgs to Bid object
-        let bid_obj = match Self::to_bid(&bid, builder, &self.chain_spec, bid_hash) {
-            Ok(bid) => bid,
-            Err(e) => {
-                tracing::error!("Failed to convert BidArgs to Bid: {}", e);
-                return Err(jsonrpsee::types::ErrorObject::owned(
-                    -32602,
-                    format!("Invalid bid: {}", e),
-                    None::<()>,
-                ));
-            }
-        };
-
-        // Log acceptance before async processing
-        tracing::info!(
-            "Bid accepted for block {}, bid_hash: {:?}",
-            bid.raw_bid.block_number,
-            bid_hash
-        );
-
-        // Submit to global bid queue
-        debug!(
-            "push bid package to queue bid_hash: {:?}, send time: {:?}",
-            bid_hash,
-            std::time::Instant::now()
-        );
-        if let Err(e) = crate::shared::push_bid_package(bid_obj) {
-            tracing::error!("Failed to push bid package to queue: {}", e);
-            return Err(jsonrpsee::types::ErrorObject::owned(
-                -32603,
-                format!("Failed to queue bid: {}", e),
-                None::<()>,
-            ));
+            return Err(Self::invalid_bid(format!(
+                "transfer tx gas used must be no more than {PAY_BID_TX_GAS_LIMIT}"
+            )));
         }
 
+        let builder = Self::recover_builder_address(raw_bid, &bid.signature)
+            .map_err(|e| Self::invalid_bid(format!("invalid signature:{e}")))?;
+        if !self.is_builder_allowed(&builder) {
+            return Err(Self::invalid_bid("builder is not registered"));
+        }
+
+        let bid_hash = Self::calculate_raw_bid_hash(raw_bid);
+        self.reserve_pending_bid(head_number, block_number, builder, bid_hash)
+            .map_err(Self::plain_err)?;
+
+        let bid_obj = Self::to_bid(&bid, builder, &self.chain_spec, bid_hash)
+            .map_err(|e| Self::invalid_bid(format!("fail to convert bidArgs to bid, {e}")))?;
+
+        let snap = self.head_snapshot(&head_hash)?;
+        let bid_better_before_ms = bid_better_before_ms(
+            crate::consensus::parlia::util::calculate_millisecond_timestamp(&head_header),
+            snap.block_interval,
+            self.delay_left_over,
+            self.bid_simulation_left_over,
+        );
+        let now_ms = unix_now_ms();
+        if now_ms >= bid_better_before_ms {
+            return Err(Self::plain_err(format!(
+                "too late, expected before {bid_better_before_ms}ms, appeared {}ms later",
+                now_ms - bid_better_before_ms
+            )));
+        }
+
+        crate::shared::push_bid_package(bid_obj)
+            .map_err(|e| Self::internal_err(format!("failed to queue bid: {e}")))?;
+        tracing::info!("Bid accepted for block {block_number}, bid_hash: {bid_hash:?}");
         Ok(bid_hash)
     }
 
@@ -1496,12 +1403,12 @@ mod bid_block_param_tests {
         let (_, head, inturn, bid_parent, head_hash, gas, txs) = valid_structure();
         assert_eq!(
             super::validate_bid_block_structure(head, head, inturn, bid_parent, head_hash, gas, txs),
-            Err(super::BidBlockStructuralRejection::StaleNumber)
+            Err(super::BidStructuralRejection::StaleNumber)
         );
         // Well below the head too, not just exactly at it.
         assert_eq!(
             super::validate_bid_block_structure(1, head, inturn, bid_parent, head_hash, gas, txs),
-            Err(super::BidBlockStructuralRejection::StaleNumber)
+            Err(super::BidStructuralRejection::StaleNumber)
         );
     }
 
@@ -1520,7 +1427,7 @@ mod bid_block_param_tests {
                 gas,
                 txs
             ),
-            Err(super::BidBlockStructuralRejection::FutureNumber)
+            Err(super::BidStructuralRejection::FutureNumber)
         );
     }
 
@@ -1531,7 +1438,7 @@ mod bid_block_param_tests {
         let (n, head, _, bid_parent, head_hash, gas, txs) = valid_structure();
         assert_eq!(
             super::validate_bid_block_structure(n, head, false, bid_parent, head_hash, gas, txs),
-            Err(super::BidBlockStructuralRejection::NotInTurn)
+            Err(super::BidStructuralRejection::NotInTurn)
         );
     }
 
@@ -1549,7 +1456,7 @@ mod bid_block_param_tests {
                 gas,
                 txs
             ),
-            Err(super::BidBlockStructuralRejection::NonAlignedParent)
+            Err(super::BidStructuralRejection::NonAlignedParent)
         );
     }
 
@@ -1559,7 +1466,7 @@ mod bid_block_param_tests {
         let (n, head, inturn, bid_parent, head_hash, gas, _) = valid_structure();
         assert_eq!(
             super::validate_bid_block_structure(n, head, inturn, bid_parent, head_hash, gas, 0),
-            Err(super::BidBlockStructuralRejection::EmptyTransactions)
+            Err(super::BidStructuralRejection::EmptyTransactions)
         );
     }
 
@@ -1570,13 +1477,13 @@ mod bid_block_param_tests {
         let (n, head, inturn, bid_parent, head_hash, _, txs) = valid_structure();
         assert_eq!(
             super::validate_bid_block_structure(n, head, inturn, bid_parent, head_hash, 0, txs),
-            Err(super::BidBlockStructuralRejection::EmptyGasUsed)
+            Err(super::BidStructuralRejection::EmptyGasUsed)
         );
     }
 
     #[test]
     fn bid_block_structure_check_order_matches_geth() {
-        use super::BidBlockStructuralRejection as R;
+        use super::BidStructuralRejection as R;
         let head_hash = B256::repeat_byte(0xaa);
         let bad_parent = B256::repeat_byte(0xde);
 
@@ -1621,6 +1528,8 @@ mod bid_block_param_tests {
         assert_eq!(MevApiImpl::mev_not_running().code(), -38003);
         assert_eq!(MevApiImpl::mev_not_in_turn().code(), -38005);
         assert_eq!(MevApiImpl::invalid_bid("x").code(), -38001);
+        assert_eq!(MevApiImpl::invalid_pay_bid_tx("x").code(), -38002);
+        assert_eq!(MevApiImpl::plain_err("x").code(), -32000);
         assert_eq!(MevApiImpl::permission_revoked("x").code(), -38006);
         // Regression guard: these two used to collapse into -38001 (generic invalid-bid), so a
         // builder keying retry/backoff behavior on the specific geth code would misbehave.
@@ -1637,6 +1546,64 @@ mod bid_block_param_tests {
         // parent at second 1_000, no sub-second component, 3s block interval, 15ms delay left
         // over: bidutil.BidMustBefore = 1_000_000 + 3_000 - 15 = 1_002_985.
         assert_eq!(super::bid_must_before_ms(1_000_000, 3_000, 15), 1_002_985);
+    }
+
+    #[test]
+    fn bid_better_before_matches_geth_formula() {
+        // bidutil.BidBetterBefore = BidMustBefore - BidSimulationLeftOver = 1_002_985 - 20.
+        assert_eq!(super::bid_better_before_ms(1_000_000, 3_000, 15, 20), 1_002_965);
+    }
+
+    #[test]
+    fn bid_head_rejects_stale_bid_whose_parent_is_still_canonical() {
+        // hash(N) is still canonical, but the head has moved on to N+9.
+        let head_hash = B256::repeat_byte(0xaa);
+        assert_eq!(
+            super::validate_bid_head(101, 109, true, B256::repeat_byte(0xbb), head_hash),
+            Err(super::BidStructuralRejection::StaleNumber)
+        );
+        assert_eq!(super::validate_bid_head(110, 109, true, head_hash, head_hash), Ok(()));
+    }
+
+    #[test]
+    fn reserve_pending_bid_enforces_duplicate_and_quota() {
+        let mut pending = super::PendingBids::new();
+        let mut reserve = |builder: u8, hash: u8| {
+            super::reserve_pending_bid(
+                &mut pending,
+                100,
+                101,
+                Address::repeat_byte(builder),
+                B256::repeat_byte(hash),
+                2,
+            )
+        };
+
+        assert_eq!(reserve(1, 1), Ok(()));
+        assert_eq!(reserve(1, 1), Err("bid already exists".to_string()));
+        assert_eq!(reserve(1, 2), Ok(()));
+        assert_eq!(
+            reserve(1, 3),
+            Err("too many bids: exceeded limit of 2 bids per builder per block".to_string())
+        );
+        // The quota is per builder.
+        assert_eq!(reserve(2, 3), Ok(()));
+    }
+
+    #[test]
+    fn reserve_pending_bid_drops_entries_at_or_below_head() {
+        let mut pending = super::PendingBids::new();
+        let builder = Address::repeat_byte(0x01);
+        for hash in [1, 2] {
+            super::reserve_pending_bid(&mut pending, 100, 101, builder, B256::repeat_byte(hash), 2)
+                .unwrap();
+        }
+
+        // Block 101 becomes the head.
+        super::reserve_pending_bid(&mut pending, 101, 102, builder, B256::repeat_byte(1), 2)
+            .unwrap();
+        assert!(!pending.contains_key(&101));
+        assert_eq!(pending[&102][&builder].len(), 1);
     }
 
     #[test]
