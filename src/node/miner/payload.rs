@@ -663,8 +663,14 @@ where
                 );
                 continue;
             }
-            // filter out tx with min gas tip.
-            if pool_tx.effective_tip_per_gas(base_fee).unwrap_or(0_u128) < min_gas_tip {
+            // Read the dynamic floor for each candidate, including an update during this build.
+            let min_gas_tip = crate::shared::get_miner_gas_tip().map(u128::from).unwrap_or(min_gas_tip);
+            if !crate::node::pool::tip::enforce_pool_tip(
+                best_tx_list.as_mut(),
+                &pool_tx,
+                base_fee,
+                min_gas_tip,
+            ) {
                 // Skip this sender's remaining transactions in this build.
                 trace!(
                     target: "payload_builder",
@@ -674,7 +680,6 @@ where
                     min_gas_tip,
                     "Skipping underpriced transaction"
                 );
-                best_tx_list.mark_invalid(&pool_tx, &InvalidPoolTransactionError::Underpriced);
                 continue;
             }
 

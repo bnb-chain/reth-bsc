@@ -562,7 +562,7 @@ fn main() -> eyre::Result<()> {
                         ctx.modules.remove_method_from_configured("miner_setExtra");
                         ctx.modules.remove_method_from_configured("miner_setGasPrice");
                         ctx.modules.remove_method_from_configured("miner_setGasLimit");
-                        let miner_api = BscMinerApiImpl::new();
+                        let miner_api = BscMinerApiImpl::new(ctx.pool().clone());
                         ctx.modules.merge_if_module_configured(RethRpcModule::Miner, miner_api.into_rpc())?;
                         tracing::info!("Succeed to register Miner RPC API");
 

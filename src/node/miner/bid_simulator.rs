@@ -1191,6 +1191,13 @@ where
                 if recovered_tx.nonce() < nonce {
                     continue;
                 }
+                if !crate::node::pool::tip::meets_tip_floor(
+                    recovered_tx.effective_tip_per_gas(base_fee),
+                    crate::node::pool::tip::current_tip_floor(),
+                ) {
+                    skipped_senders.insert(signer);
+                    continue;
+                }
             }
             let is_blob_tx = recovered_tx.is_eip4844();
             let tx_hash = *recovered_tx.hash();
@@ -1439,6 +1446,15 @@ mod tests {
 
     #[test]
     fn greedy_merge_skips_consumed_nonces_before_capacity_checks() {
+        greedy_merge_case(0);
+    }
+
+    #[test]
+    fn greedy_merge_enforces_pool_tip_floor_without_rejecting_builder_prefix() {
+        greedy_merge_case(2_000_000_000);
+    }
+
+    fn greedy_merge_case(minimum_tip: u64) {
         use alloy_consensus::{Header, TxLegacy};
         use alloy_evm::block::{BlockExecutor, CommitChanges, GasOutput};
         use alloy_primitives::{Signature, TxKind};
@@ -1496,13 +1512,13 @@ mod tests {
         let sender = Address::repeat_byte(0xaa);
         let other = Address::repeat_byte(0xbb);
         let recipient = Address::repeat_byte(0xcc);
-        let tx = |signer, nonce, gas_limit, value| {
+        let tx_with_price = |signer, nonce, gas_limit, value, gas_price| {
             Recovered::new_unchecked(
                 TransactionSigned::new_unhashed(
                     TxLegacy {
                         nonce,
                         gas_limit,
-                        gas_price: if signer == other { 2_000_000_000 } else { 1_000_000_000 },
+                        gas_price,
                         to: TxKind::Call(recipient),
                         value: U256::from(value),
                         ..Default::default()
@@ -1513,7 +1529,17 @@ mod tests {
                 signer,
             )
         };
+        let tx = |signer, nonce, gas_limit, value| {
+            tx_with_price(
+                signer,
+                nonce,
+                gas_limit,
+                value,
+                if signer == other { 2_000_000_000 } else { 1_000_000_000 },
+            )
+        };
         for stale_gas_limit in [200_000, TX_GAS] {
+            let _guard = crate::node::pool::tests::TipGuard::new(minimum_tip);
             let spec = Arc::new(BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet()));
             let config = BscEvmConfig::new(spec.clone());
             let parent =
@@ -1584,19 +1610,23 @@ mod tests {
                 stale,
                 tx(sender, 1, TX_GAS, 1u64),
                 tx(sender, 2, 200_000, 1u64),
-                tx(sender, 3, TX_GAS, 1u64),
+                tx_with_price(sender, 3, TX_GAS, 1u64, 2_000_000_000),
                 tx(other, 0, TX_GAS, 1u64),
             ];
             runtime
                 .commit_transaction_recovered(candidates, &mut builder, 121_000, true, 10_000)
                 .unwrap();
 
-            assert_eq!(builder.evm_mut().db_mut().basic(sender).unwrap().unwrap().nonce, 2);
-            assert_eq!(builder.evm_mut().db_mut().basic(other).unwrap().unwrap().nonce, 1);
-            assert_eq!(runtime.gas_used, 3 * TX_GAS);
             assert_eq!(
-                builder.attempts, 3,
-                "only the bid prefix, sender nonce 1 and other nonce 0 should execute",
+                builder.evm_mut().db_mut().basic(sender).unwrap().unwrap().nonce,
+                if minimum_tip == 0 { 2 } else { 1 }
+            );
+            assert_eq!(builder.evm_mut().db_mut().basic(other).unwrap().unwrap().nonce, 1);
+            let expected_attempts = if minimum_tip == 0 { 3 } else { 2 };
+            assert_eq!(runtime.gas_used, expected_attempts * TX_GAS);
+            assert_eq!(
+                builder.attempts, expected_attempts as usize,
+                "builder prefix bypasses the pool floor; low-tip pool transactions and their descendants must not execute",
             );
         }
     }

@@ -29,6 +29,9 @@ use reth_transaction_pool::{
 use crate::evm::blacklist;
 use crate::hardforks::bsc::BscHardfork;
 
+pub(crate) mod tip;
+use tip::{current_tip_floor, meets_tip_floor, ADMISSION_BASE_FEE};
+
 /// Transaction pool blacklist error type: marked as "bad transaction" to punish source node
 #[derive(thiserror::Error, Debug)]
 #[error("sender or recipient is blacklisted")]
@@ -96,19 +99,32 @@ where
             );
         }
 
-        // Check miner gas price floor (set by miner_setGasPrice RPC).
-        // Reject transactions whose max_fee_per_gas is below the miner's configured minimum.
-        if let Some(min_gas_price) = crate::shared::get_miner_gas_tip() {
-            if transaction.max_fee_per_gas() < min_gas_price as u128 {
-                return TransactionValidationOutcome::Invalid(
-                    transaction,
-                    InvalidPoolTransactionError::Underpriced,
-                );
-            }
+        if !meets_tip_floor(
+            transaction.effective_tip_per_gas(ADMISSION_BASE_FEE),
+            current_tip_floor(),
+        ) {
+            return TransactionValidationOutcome::Invalid(
+                transaction,
+                InvalidPoolTransactionError::Underpriced,
+            );
         }
 
-        // Delegate to internal validator
-        self.inner.validate_transaction(origin, transaction).await
+        // Validation can await state access while miner_setGasPrice changes the floor.
+        let outcome = self.inner.validate_transaction(origin, transaction).await;
+        match outcome {
+            TransactionValidationOutcome::Valid { transaction, .. }
+                if !meets_tip_floor(
+                    transaction.transaction().effective_tip_per_gas(ADMISSION_BASE_FEE),
+                    current_tip_floor(),
+                ) =>
+            {
+                TransactionValidationOutcome::Invalid(
+                    transaction.into_transaction(),
+                    InvalidPoolTransactionError::Underpriced,
+                )
+            }
+            outcome => outcome,
+        }
     }
 
     fn on_new_head_block(&self, new_tip_block: &reth_primitives_traits::SealedBlock<Self::Block>) {
@@ -214,7 +230,15 @@ where
             .with_validator(validator)
             .build_and_spawn_maintenance_task(blob_store, pool_config)?;
 
+        ctx.task_executor().spawn_critical_task(
+            "bsc-pool-tip-floor",
+            tip::maintain_tip_floor(transaction_pool.clone()),
+        );
+
         tracing::info!(target: "bsc::txpool", "Transaction pool with blacklist validation initialized");
         Ok(transaction_pool)
     }
 }
+
+#[cfg(test)]
+pub(crate) mod tests;

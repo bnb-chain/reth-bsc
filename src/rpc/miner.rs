@@ -1,6 +1,6 @@
 use alloy_primitives::Address;
-use jsonrpsee::core::RpcResult;
-use jsonrpsee::proc_macros::rpc;
+use jsonrpsee::{core::RpcResult, proc_macros::rpc};
+use reth_transaction_pool::TransactionPool;
 
 /// BSC Miner RPC API - matches geth-bsc's MinerAPI
 /// Provides control over mining operations, gas settings, and MEV configuration.
@@ -61,18 +61,19 @@ pub trait BscMinerApi {
 }
 
 /// Implementation of the BSC Miner RPC API
-#[derive(Default)]
-pub struct BscMinerApiImpl;
+pub struct BscMinerApiImpl<Pool> {
+    pool: Pool,
+}
 
-impl BscMinerApiImpl {
+impl<Pool> BscMinerApiImpl<Pool> {
     /// Create a new BSC Miner API instance
-    pub fn new() -> Self {
-        Self
+    pub fn new(pool: Pool) -> Self {
+        Self { pool }
     }
 }
 
 #[async_trait::async_trait]
-impl BscMinerApiServer for BscMinerApiImpl {
+impl<Pool: TransactionPool + 'static> BscMinerApiServer for BscMinerApiImpl<Pool> {
     async fn start(&self) -> RpcResult<()> {
         tracing::info!(target: "bsc::rpc", "miner_start called");
         crate::shared::set_mining_enabled(true);
@@ -103,7 +104,11 @@ impl BscMinerApiServer for BscMinerApiImpl {
         tracing::info!(target: "bsc::rpc", "miner_setGasPrice called with: {}", gas_price);
         // Convert U256 to u64 (gas tip in wei); saturate if it exceeds u64::MAX
         let tip: u64 = gas_price.try_into().unwrap_or(u64::MAX);
+        let previous = crate::shared::get_miner_gas_tip().unwrap_or_default();
         crate::shared::set_miner_gas_tip(tip);
+        if tip > previous {
+            crate::node::pool::tip::remove_underpriced(&self.pool);
+        }
         Ok(true)
     }
 

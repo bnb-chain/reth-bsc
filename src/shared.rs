@@ -877,9 +877,7 @@ pub fn get_miner_gas_limit() -> Option<u64> {
 // --- gas tip (gas price) ---
 
 pub fn set_miner_gas_tip(val: u64) {
-    if let Some(v) = MINER_GAS_TIP.get() {
-        v.store(val, Ordering::Relaxed);
-    }
+    MINER_GAS_TIP.get_or_init(|| AtomicU64::new(val)).store(val, Ordering::Relaxed);
 }
 
 pub fn get_miner_gas_tip() -> Option<u64> {
