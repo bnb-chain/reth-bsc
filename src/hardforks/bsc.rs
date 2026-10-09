@@ -228,6 +228,8 @@ impl BscHardfork {
             // re-arms the transition to verify the fix on qanet.
             // Must stay equal to geth's `--override.pasteur` on this cluster.
             (Self::Pasteur.boxed(), ForkCondition::Timestamp(1785920400)),
+            // Jenner: 2026-10-05 05:00:00 UTC (13:00:00 UTC+8).
+            (Self::Jenner.boxed(), ForkCondition::Timestamp(1791176400)),
         ])
     }
 
@@ -329,6 +331,7 @@ mod tests {
         let qanet = BscHardfork::bsc_qanet();
         const OSAKA_MENDEL: u64 = 1785897000; // 2026-08-05 02:30:00 UTC
         const PASTEUR: u64 = 1785920400; // 2026-08-05 09:00:00 UTC
+        const JENNER: u64 = 1791176400; // 2026-10-05 05:00:00 UTC (13:00:00 UTC+8)
 
         // Osaka and Mendel activated together at 2026-08-05 02:30:00 AM UTC.
         for fork in [BscHardfork::Osaka, BscHardfork::Mendel] {
@@ -352,6 +355,17 @@ mod tests {
             qanet.fork(BscHardfork::Mendel).active_at_timestamp(PASTEUR),
             "Mendel must already be active when Pasteur activates"
         );
+
+        let jenner = qanet.fork(BscHardfork::Jenner);
+        assert_eq!(jenner, ForkCondition::Timestamp(JENNER));
+        const _: () = assert!(JENNER > PASTEUR);
+        assert!(
+            qanet.fork(BscHardfork::Pasteur).active_at_timestamp(JENNER),
+            "Pasteur must already be active when Jenner activates"
+        );
+        assert!(!jenner.active_at_timestamp(JENNER - 1));
+        assert!(jenner.active_at_timestamp(JENNER));
+        assert!(jenner.active_at_timestamp(JENNER + 1));
 
         // Fermi precedes the whole group.
         assert!(
@@ -397,13 +411,12 @@ mod tests {
     }
 
     #[test]
-    fn test_jenner_not_scheduled_on_builtin_chains() {
+    fn test_jenner_not_scheduled_on_other_builtin_chains() {
         // Mirrors go-bsc `JennerTime: nil` on BSCChainConfig/ChapelChainConfig: until the
-        // activation is announced, Jenner must not be present in the built-in fork schedules.
+        // activation is announced, Jenner must not be present in these built-in fork schedules.
         for (name, forks) in [
             ("mainnet", BscHardfork::bsc_mainnet()),
             ("testnet", BscHardfork::bsc_testnet()),
-            ("qanet", BscHardfork::bsc_qanet()),
             ("local", BscHardfork::bsc_local()),
         ] {
             assert_eq!(
