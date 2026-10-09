@@ -225,14 +225,6 @@ pub trait BscMevApi {
     #[method(name = "hasBuilder")]
     async fn has_builder(&self, builder: Address) -> RpcResult<bool>;
 
-    /// Add a builder to the whitelist
-    #[method(name = "addBuilder")]
-    async fn add_builder(&self, builder: Address) -> RpcResult<bool>;
-
-    /// Remove a builder from the whitelist
-    #[method(name = "removeBuilder")]
-    async fn remove_builder(&self, builder: Address) -> RpcResult<bool>;
-
     /// Query a builder's current BEP-675 `SendBidBlock` permission (go-bsc
     /// `MevAPI.GetBidBlockPermission`): whether it's allowed, and if not, why and when it resets.
     #[method(name = "getBidBlockPermission")]
@@ -416,7 +408,7 @@ pub struct MevApiImpl {
 }
 
 // NOTE: The allowed_builders is now also accessible via crate::shared::get_builder_whitelist()
-// so that the miner_ RPC namespace can manage builders too.
+// so that the miner_ RPC namespace can manage builders.
 
 impl MevApiImpl {
     /// Create a new MEV API instance
@@ -489,7 +481,7 @@ impl MevApiImpl {
                 "MEV API initialized with EMPTY builder whitelist - NO builders will be accepted!"
             );
             tracing::warn!(
-                "Use mev_addBuilder or miner_addBuilder to add builders, or set BSC_ALLOWED_BUILDERS environment variable"
+                "Use miner_addBuilder to add builders, or set BSC_ALLOWED_BUILDERS environment variable"
             );
         } else {
             let count = allowed_builders.read().unwrap().len();
@@ -818,20 +810,6 @@ impl MevApiImpl {
         );
 
         Ok(bid_hash)
-    }
-
-    /// Add a builder to the whitelist
-    fn add_builder_internal(&self, builder: Address) -> bool {
-        let mut allowed_builders = self.allowed_builders.write().unwrap();
-        // Add to whitelist, returns true if newly added
-        allowed_builders.insert(builder)
-    }
-
-    /// Remove a builder from the whitelist
-    fn remove_builder_internal(&self, builder: &Address) -> bool {
-        let mut allowed_builders = self.allowed_builders.write().unwrap();
-        // Remove from whitelist, returns true if it was present
-        allowed_builders.remove(builder)
     }
 
     /// Parse transaction from bytes with validation
@@ -1285,30 +1263,6 @@ impl BscMevApiServer for MevApiImpl {
     async fn has_builder(&self, builder: Address) -> RpcResult<bool> {
         tracing::debug!("Checking if builder {} is registered", builder);
         Ok(self.is_builder_allowed(&builder))
-    }
-
-    /// Add a builder to the whitelist
-    async fn add_builder(&self, builder: Address) -> RpcResult<bool> {
-        tracing::info!("Adding builder {} to whitelist", builder);
-        let added = self.add_builder_internal(builder);
-        if added {
-            tracing::info!("Builder {} successfully added to whitelist", builder);
-        } else {
-            tracing::info!("Builder {} was already in whitelist", builder);
-        }
-        Ok(added)
-    }
-
-    /// Remove a builder from the whitelist
-    async fn remove_builder(&self, builder: Address) -> RpcResult<bool> {
-        tracing::info!("Removing builder {} from whitelist", builder);
-        let removed = self.remove_builder_internal(&builder);
-        if removed {
-            tracing::info!("Builder {} successfully removed from whitelist", builder);
-        } else {
-            tracing::info!("Builder {} was not in whitelist", builder);
-        }
-        Ok(removed)
     }
 
     /// Query a builder's current BidBlock permission status.

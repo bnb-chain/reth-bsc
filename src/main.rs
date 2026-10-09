@@ -508,7 +508,7 @@ fn main() -> eyre::Result<()> {
                         // transport regardless of `--http.api`/`--ws.api`, so operator namespace
                         // selection was silently ignored for the BSC-specific APIs. That left
                         // `admin_setBidBlockPermission`, `miner_stop`, `miner_setGasLimit`,
-                        // `miner_setEtherbase` and `mev_addBuilder`/`removeBuilder` callable
+                        // `miner_setEtherbase` and `miner_addBuilder`/`removeBuilder` callable
                         // unauthenticated on any node with HTTP enabled, even when the operator had
                         // excluded those namespaces — geth honours the equivalent `HTTPModules`
                         // setting, so this was also a parity gap.

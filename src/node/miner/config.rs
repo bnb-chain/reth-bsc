@@ -133,7 +133,7 @@ impl Default for MiningConfig {
             delay_left_over: Some(15),           // 15ms (go-bsc's defaultDelayLeftOver)
             max_bids_per_builder: Some(2),       // go-bsc's defaultMaxBidsPerBuilder
             builder_fee_ceil: Some(1_000_000_000_000_000_000), // 1 BNB
-            allowed_builders: None, // No whitelist by default (allow all)
+            allowed_builders: None, // No builders by default (reject all)
             bid_block_enabled: false, // BEP-675 BidBlock path off by default
             mev_grpc_port: 8552,
             mev_grpc_disabled: false,
