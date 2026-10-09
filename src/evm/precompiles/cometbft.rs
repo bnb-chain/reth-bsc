@@ -11,7 +11,7 @@ use cometbft_light_client_verifier::{
     predicates::ProdPredicates,
     types::{Validator, ValidatorSet},
 };
-use cometbft_proto::types::v1::LightBlock as TmLightBlock;
+use cometbft_proto::types::v1::{BlockIdFlag, LightBlock as TmLightBlock};
 use prost12::Message;
 use revm::precompile::{
     u64_to_address, PrecompileHalt, PrecompileOutput, PrecompileResult, Precompile, PrecompileId,
@@ -145,6 +145,19 @@ fn convert_light_block_from_proto(light_block_proto: &TmLightBlock) -> ConvertLi
     // unwrapping it.
     let signed_header_proto =
         light_block_proto.signed_header.as_ref().ok_or(BscPrecompileError::InvalidInput)?;
+
+    // Match go-bsc's CommitSig.ValidateBasic before the dependency converts an absent
+    // signature into an enum variant that discards its validator address.
+    if let Some(commit) = &signed_header_proto.commit {
+        for sig in &commit.signatures {
+            if sig.block_id_flag == BlockIdFlag::Absent as i32 &&
+                !sig.validator_address.is_empty()
+            {
+                return Err(BscPrecompileError::InvalidInput.into());
+            }
+        }
+    }
+
     let signed_header = match SignedHeader::try_from(signed_header_proto.clone()) {
         Ok(sh) => sh.clone(),
         Err(_) => return Err(BscPrecompileError::InvalidInput.into()),
@@ -486,6 +499,65 @@ mod tests {
 
     fn valid_light_block_input() -> Vec<u8> {
         hex::decode(VALID_LIGHT_BLOCK_INPUT).expect("fixture is valid hex")
+    }
+
+    #[test]
+    fn light_block_canonical_absent_commit_sig_is_preserved() {
+        use cometbft_proto::{google::protobuf::Timestamp, types::v1::CommitSig};
+
+        let (_, light_block) =
+            decode_light_block_validation_input(&valid_light_block_input(), false).unwrap();
+        assert!(convert_light_block_from_proto(&light_block).is_ok());
+        let signature_count =
+            light_block.signed_header.as_ref().unwrap().commit.as_ref().unwrap().signatures.len();
+
+        // These are conversion controls, not quorum-valid light blocks. Both omitted
+        // timestamps and explicit Go zero timestamps are accepted for absent entries.
+        for timestamp in [None, Some(Timestamp { seconds: -62_135_596_800, nanos: 0 })] {
+            for index in 0..signature_count {
+                let mut proto = light_block.clone();
+                proto.signed_header.as_mut().unwrap().commit.as_mut().unwrap().signatures[index] =
+                    CommitSig {
+                        block_id_flag: BlockIdFlag::Absent as i32,
+                        timestamp: timestamp.clone(),
+                        ..Default::default()
+                    };
+
+                let converted = convert_light_block_from_proto(&proto)
+                    .expect("a canonical absent signature must survive conversion");
+                assert_eq!(converted.signed_header.commit.signatures.len(), signature_count);
+                assert!(converted.signed_header.commit.signatures[index].is_absent());
+            }
+        }
+    }
+
+    #[test]
+    fn light_block_absent_commit_sig_rejects_nonempty_validator_address() {
+        use cometbft_proto::{google::protobuf::Timestamp, types::v1::CommitSig};
+
+        let (_, light_block) =
+            decode_light_block_validation_input(&valid_light_block_input(), false).unwrap();
+        let signature_count =
+            light_block.signed_header.as_ref().unwrap().commit.as_ref().unwrap().signatures.len();
+
+        // Reject every nonempty address, including zero-filled addresses and lengths
+        // other than 20 bytes, wherever the absent entry occurs in the commit.
+        for validator_address in [vec![0], vec![0; 20], vec![1; 20], vec![1; 21]] {
+            for index in 0..signature_count {
+                let mut proto = light_block.clone();
+                proto.signed_header.as_mut().unwrap().commit.as_mut().unwrap().signatures[index] =
+                    CommitSig {
+                        block_id_flag: BlockIdFlag::Absent as i32,
+                        validator_address: validator_address.clone(),
+                        timestamp: Some(Timestamp { seconds: -62_135_596_800, nanos: 0 }),
+                        signature: Vec::new(),
+                    };
+
+                let error = convert_light_block_from_proto(&proto)
+                    .expect_err("an absent signature must not discard a nonempty address");
+                assert_eq!(error, BscPrecompileError::InvalidInput.into());
+            }
+        }
     }
 
     /// `signed_header` and `validator_set` are optional protobuf fields, so any caller can
