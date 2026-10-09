@@ -36,13 +36,17 @@ const TARGETS: [Address; 6] = [
 ];
 const NOW: u64 = 1_800_000_000;
 
+fn forks_at(forks: &[BscHardfork], time: u64) -> reth_chainspec::ChainSpec {
+    let mut chain = bsc_mainnet();
+    for fork in forks {
+        chain.hardforks.insert(*fork, ForkCondition::Timestamp(time));
+    }
+    chain
+}
+
 macro_rules! rpc {
-    ($jenner:expr) => {{
-        let mut chain = bsc_mainnet();
-        chain.hardforks.insert(BscHardfork::Jenner, ForkCondition::Timestamp($jenner));
-        let spec = Arc::new(BscChainSpec::from(chain));
-        let provider = MockEthProvider::<BscPrimitives, _>::new().with_chain_spec((*spec).clone());
-        let header = alloy_consensus::Header {
+    (chain $chain:expr) => {
+        rpc!(chain $chain, header alloy_consensus::Header {
             number: 40_000_000,
             timestamp: NOW,
             gas_limit: 140_000_000,
@@ -50,7 +54,12 @@ macro_rules! rpc {
             excess_blob_gas: Some(0),
             blob_gas_used: Some(0),
             ..Default::default()
-        };
+        })
+    };
+    (chain $chain:expr, header $header:expr) => {{
+        let spec = Arc::new(BscChainSpec::from($chain));
+        let provider = MockEthProvider::<BscPrimitives, _>::new().with_chain_spec((*spec).clone());
+        let header = $header;
         let hash = header.hash_slow();
         crate::node::evm::util::insert_header_to_cache(header.clone());
         provider.add_header(hash, header.clone());
@@ -61,19 +70,28 @@ macro_rules! rpc {
                 ExtendedAccount::new(0, U256::ZERO).with_bytecode(Bytes::from_static(&MARKER_CODE)),
             );
         }
+        let evm_config = BscEvmConfig::new(spec);
         (
             BscCodeOverridesApiImpl(
                 reth::rpc::eth::core::EthApi::builder(
                     provider,
                     testing_pool(),
                     NoopNetwork::default(),
-                    BscEvmConfig::new(spec),
+                    evm_config.clone(),
                 )
+                .map_converter(|r| {
+                    r.with_tx_env_converter(crate::rpc::transaction::BscTxEnvConverter(
+                        evm_config,
+                    ))
+                })
                 .build(),
             ),
             hash,
         )
     }};
+    ($jenner:expr) => {
+        rpc!(chain forks_at(&[BscHardfork::Jenner], $jenner))
+    };
 }
 
 fn request(target: Address, input: &[u8]) -> TransactionRequest {
@@ -108,8 +126,10 @@ async fn code_override_runs_on_every_cas20_route_through_rpc() {
             U256::from(42),
             "{target}"
         );
-        let gas =
-            api.estimate_gas(req.clone(), Some(hash.into()), Some(state.clone())).await.unwrap();
+        let gas = api
+            .estimate_gas(req.clone(), Some(hash.into()), Some(state.clone()), None)
+            .await
+            .unwrap();
         assert!(gas >= U256::from(21_000));
         let list = BscAccessListApiImpl(api.0.clone())
             .create_access_list(req, Some(hash.into()), Some(state))
@@ -163,7 +183,8 @@ async fn empty_code_and_marker_code_are_explicit_overrides() {
         let out = api.call(req.clone(), None, Some(overrides(target, &[])), None).await.unwrap();
         assert!(out.is_empty(), "{target}");
         let state = overrides(target, &[]);
-        let gas = api.estimate_gas(request(target, &[]), None, Some(state.clone())).await.unwrap();
+        let gas =
+            api.estimate_gas(request(target, &[]), None, Some(state.clone()), None).await.unwrap();
         // Estimation may include a margin; the returned limit must execute the
         // overridden empty account successfully instead of entering CAS20.
         let mut estimated = request(target, &[]);
@@ -372,3 +393,103 @@ async fn rpc_registration_preserves_named_call_parameters_and_block_overrides() 
     let bytes: Bytes = serde_json::from_value(response["result"].clone()).unwrap();
     assert_eq!(value(&bytes), U256::from(NOW + 17));
 }
+
+#[tokio::test]
+async fn estimate_gas_validates_the_prev_randao_block_override() {
+    let (api, _) = rpc!(NOW - 1);
+    let module = api.into_rpc();
+    let estimate = |prev_randao: u64| {
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "eth_estimateGas",
+            "params": [
+                { "to": Address::with_last_byte(0x70) },
+                "latest",
+                null,
+                { "prevRandao": B256::from(U256::from(prev_randao)) }
+            ]
+        })
+        .to_string()
+    };
+
+    let (response, _) = module.raw_json_request(&estimate(999), 1).await.unwrap();
+    let response: serde_json::Value = serde_json::from_str(response.get()).unwrap();
+    assert!(response["result"].is_string(), "{response}");
+
+    let (response, _) = module.raw_json_request(&estimate(1000), 1).await.unwrap();
+    let response: serde_json::Value = serde_json::from_str(response.get()).unwrap();
+    assert_eq!(response["error"]["code"], -32602, "{response}");
+    let message = response["error"]["message"].as_str().unwrap();
+    assert!(message.contains("must be less than 1000, got 1000"), "{message}");
+}
+
+#[tokio::test]
+async fn blob_base_fee_block_override_is_what_blobbasefee_reads() {
+    // BLOBBASEFEE == 42, or INVALID.
+    const REQUIRES_42: &[u8] = &hex!("4a602a14600857fe5b00");
+    let (api, _) = rpc!(NOW - 1);
+    let (req, state) = (request(PROXY, &[]), Some(overrides(PROXY, REQUIRES_42)));
+    let fee_42 = || {
+        Some(Box::new(BlockOverrides { blob_base_fee: Some(U256::from(42)), ..Default::default() }))
+    };
+
+    api.call(req.clone(), None, state.clone(), fee_42()).await.unwrap();
+    api.estimate_gas(req.clone(), None, state.clone(), fee_42()).await.unwrap();
+    assert!(api.estimate_gas(req, None, state, None).await.is_err());
+}
+
+// go-bsc takes the rules from the overridden block, so 0x70 follows `time` across Jenner.
+#[tokio::test]
+async fn time_override_across_jenner_follows_the_fork_schedule() {
+    let req = request(Address::with_last_byte(0x70), &[]);
+    let at = |time| Some(Box::new(BlockOverrides { time: Some(time), ..Default::default() }));
+    let transfer = U256::from(21_000);
+
+    let (api, _) = rpc!(NOW + 1);
+    assert_eq!(api.estimate_gas(req.clone(), None, None, None).await.unwrap(), transfer);
+    assert!(api.estimate_gas(req.clone(), None, None, at(NOW + 1)).await.unwrap() > transfer);
+    let out = api.call(req.clone(), None, None, at(NOW + 1)).await.unwrap();
+    assert_eq!(value(&out), U256::from((NOW + 1) * 1000));
+
+    let (api, _) = rpc!(NOW);
+    assert!(api.estimate_gas(req.clone(), None, None, None).await.unwrap() > transfer);
+    assert_eq!(api.estimate_gas(req.clone(), None, None, at(NOW - 1)).await.unwrap(), transfer);
+    assert!(api.call(req, None, None, at(NOW - 1)).await.unwrap().is_empty());
+}
+
+// go-bsc caps the estimate at EIP-7825's limit by the overridden block's rules.
+#[tokio::test]
+async fn time_override_across_osaka_moves_the_tx_gas_limit_cap() {
+    // GAS > 2^24, or INVALID.
+    const NEEDS_OVER_2_24: &[u8] = &hex!("63010000005a11600b57fe5b00");
+    const OSAKA_AND_LATER: [BscHardfork; 3] =
+        [BscHardfork::Osaka, BscHardfork::Mendel, BscHardfork::Pasteur];
+    let (before, _) = rpc!(chain forks_at(&OSAKA_AND_LATER, NOW + 1));
+    let (after, _) = rpc!(chain forks_at(&OSAKA_AND_LATER, NOW));
+    let at = |time| Some(Box::new(BlockOverrides { time: Some(time), ..Default::default() }));
+    // Calldata keeps the estimator off its basic-transfer shortcut.
+    let req = TransactionRequest {
+        to: Some(PROXY.into()),
+        input: Bytes::from_static(&[1]).into(),
+        ..Default::default()
+    };
+    let stop = Some(overrides(PROXY, &[0x00]));
+    let needs_over_2_24 = Some(overrides(PROXY, NEEDS_OVER_2_24));
+
+    let osaka = after.estimate_gas(req.clone(), None, stop.clone(), None).await.unwrap();
+    assert_eq!(before.estimate_gas(req.clone(), None, stop, at(NOW + 1)).await.unwrap(), osaka);
+
+    let pre_osaka =
+        before.estimate_gas(req.clone(), None, needs_over_2_24.clone(), None).await.unwrap();
+    assert!(pre_osaka > U256::from(1 << 24));
+    assert!(after.estimate_gas(req.clone(), None, needs_over_2_24.clone(), None).await.is_err());
+    assert_eq!(
+        after.estimate_gas(req.clone(), None, needs_over_2_24.clone(), at(NOW - 1)).await.unwrap(),
+        pre_osaka
+    );
+
+    // eth_call lifts the cap, and crossing into Osaka keeps it lifted.
+    before.call(req, None, needs_over_2_24, at(NOW + 1)).await.unwrap();
+}
+
+#[path = "fork_tests.rs"]
+mod fork_tests;

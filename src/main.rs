@@ -508,7 +508,7 @@ fn main() -> eyre::Result<()> {
                         // transport regardless of `--http.api`/`--ws.api`, so operator namespace
                         // selection was silently ignored for the BSC-specific APIs. That left
                         // `admin_setBidBlockPermission`, `miner_stop`, `miner_setGasLimit`,
-                        // `miner_setEtherbase` and `mev_addBuilder`/`removeBuilder` callable
+                        // `miner_setEtherbase` and `miner_addBuilder`/`removeBuilder` callable
                         // unauthenticated on any node with HTTP enabled, even when the operator had
                         // excluded those namespaces — geth honours the equivalent `HTTPModules`
                         // setting, so this was also a parity gap.
@@ -598,11 +598,16 @@ fn main() -> eyre::Result<()> {
                         let prestate_api = BscPrestateApiImpl(ctx.registry.debug_api());
                         ctx.modules.merge_if_module_configured(RethRpcModule::Debug, prestate_api.into_rpc())?;
 
-                        tracing::info!("Start to register BSC Admin RPC API (admin_setBidBlockPermission)...");
+                        tracing::info!("Start to register BSC Admin RPC API (admin_setBidBlockPermission, admin_nodeInfo)...");
                         use reth_bsc::rpc::admin::{BscAdminApiImpl, BscAdminApiServer};
 
                         let admin_api = BscAdminApiImpl::new();
                         ctx.modules.merge_if_module_configured(RethRpcModule::Admin, admin_api.into_rpc())?;
+
+                        use reth_bsc::rpc::admin::{BscNodeInfoApiImpl, BscNodeInfoApiServer};
+                        ctx.modules.remove_method_from_configured("admin_nodeInfo");
+                        let node_info_api = BscNodeInfoApiImpl(ctx.registry.admin_api());
+                        ctx.modules.merge_if_module_configured(RethRpcModule::Admin, node_info_api.into_rpc())?;
                         tracing::info!("Succeed to register BSC Admin RPC API");
 
                         tracing::info!("Start to register Blob RPC API...");

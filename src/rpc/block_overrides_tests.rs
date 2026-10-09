@@ -1,19 +1,6 @@
-//! RPC-handler-level tests for the BSC block-override semantics (BEP-706 phase 2,
-//! go-bsc `api_jenner_test.go` parity).
-//!
-//! These go through the real `EthApiServer` handlers (`eth_call`,
-//! `eth_estimateGas`, `eth_callMany`, `eth_simulateV1`) over a mock provider, so
-//! the whole reth path — `prepare_call_env` / per-simulated-block override
-//! application, alloy's `apply_block_overrides`, and the `BlockOverridesExt`
-//! hook on [`crate::evm::block_env::BscBlockEnv`] — is exercised, not just the
-//! hook in isolation. The same scenarios are verified against a live devnet in
-//! E2. Two deliberate scope notes:
-//! - the go-side "non-BSC chain unaffected" case lives in reth itself (the
-//!   explicit no-op impl + tests on the stock `BlockEnv`);
-//! - `eth_estimateGas` has no `blockOverrides` parameter on reth's RPC surface
-//!   (upstream API difference, all chains alike), so its coverage here is the
-//!   0x70-execution smoke test; the override semantics it would share come
-//!   through the same `prepare_call_env` path `eth_call` exercises.
+//! BSC millisecond block overrides through RPC handlers over a mock provider.
+//! Gas-estimation overrides and successful simulations using BSC's RPC wrapper
+//! are covered in `rpc::code_overrides::tests`.
 
 use crate::{
     chainspec::{bsc::bsc_mainnet, BscChainSpec},
@@ -163,10 +150,7 @@ async fn eth_call_time_override_resets_the_remainder() {
 }
 
 #[tokio::test]
-async fn eth_call_time_override_wraps_like_geth() {
-    // RPC-level regression for the wrapping arithmetic (review P2):
-    // blockOverrides.time = u64::MAX is reachable on both clients and must
-    // produce geth's wrapped uint64 value.
+async fn eth_call_time_override_preserves_wrapping_arithmetic() {
     let api = bsc_eth_api!(spec(Some(JENNER_AT)));
     let out = call_probe!(
         api,
@@ -249,8 +233,7 @@ async fn pre_jenner_the_precompile_is_an_empty_account_but_validation_applies() 
     assert_eq!(milli, 0, "0x70 must behave as an empty account before Jenner");
     assert_eq!(prevrandao, 55, "0x44 still serves the override");
 
-    // … but the < 1000 validation is client-default behavior, independent of
-    // fork state (go C8a).
+    // Validation applies even before the precompile is active.
     let err = call_probe!(
         api,
         Some(BlockOverrides { random: Some(randao(1000)), ..Default::default() })
@@ -261,9 +244,6 @@ async fn pre_jenner_the_precompile_is_an_empty_account_but_validation_applies() 
 
 #[tokio::test]
 async fn eth_call_many_inherits_the_bsc_semantics() {
-    // eth_callMany has no go-bsc counterpart; it inherits the semantics through
-    // the shared `prepare_call_env` (documented as an inherited behavior
-    // extension). Combined override assembles, invalid values reject.
     let api = bsc_eth_api!(spec(Some(JENNER_AT)));
     let t2 = HEAD_SECS + 10_000;
     let bundle = Bundle {
@@ -296,10 +276,6 @@ async fn eth_call_many_inherits_the_bsc_semantics() {
 
 #[tokio::test]
 async fn eth_estimate_gas_executes_the_precompile() {
-    // reth's eth_estimateGas RPC surface has no blockOverrides parameter
-    // (upstream API difference, all chains alike) — this pins that the 0x70
-    // path executes fine under gas estimation, which shares `prepare_call_env`
-    // with eth_call.
     let api = bsc_eth_api!(spec(Some(JENNER_AT)));
     let gas = api
         .estimate_gas(probe_request(), None, Some(probe_state()))
@@ -310,15 +286,7 @@ async fn eth_estimate_gas_executes_the_precompile() {
 
 #[tokio::test]
 async fn eth_simulate_v1_rejects_out_of_range_prev_randao() {
-    // The per-simulated-block override application runs before execution, so
-    // the < 1000 validation is handler-testable here. The *success* path is
-    // not: simulated blocks execute through the BSC block executor, whose
-    // pre-execution hooks read the set-once shared globals (snapshot provider,
-    // header reader) that other tests in this binary already claim — the
-    // assembled-value scenarios for eth_simulateV1 are covered end-to-end on
-    // the live devnet (E2: single-block combo, prevRandao-only without time),
-    // and the chained multi-block case is a pre-existing synthetic-parent gap
-    // tracked separately.
+    // Invalid overrides must fail before block execution.
     let api = bsc_eth_api!(spec(Some(JENNER_AT)));
     let bad = SimulatePayload {
         block_state_calls: vec![SimBlock {
