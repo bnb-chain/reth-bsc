@@ -7,7 +7,7 @@ use cometbft_light_client::{
     types::{LightBlock, TrustThreshold},
 };
 use cometbft_light_client_verifier::{
-    operations::voting_power::ProdVotingPowerCalculator,
+    operations::{voting_power::ProdVotingPowerCalculator, CommitValidator, ProdCommitValidator},
     predicates::ProdPredicates,
     types::{Validator, ValidatorSet},
 };
@@ -230,6 +230,13 @@ impl ConsensusState {
         if light_block.signed_header.header().chain_id.as_str() != self.chain_id {
             return Err(BscPrecompileError::InvalidInput.into());
         }
+
+        // Every incoming validator needs a commit slot, including absent validators.
+        // Quorum checks alone do not enforce this structure. Validate it before either
+        // adjacent or skipping verification, using the incoming (not trusted) set.
+        ProdCommitValidator
+            .validate(&light_block.signed_header, &light_block.validators)
+            .map_err(|_| BscPrecompileError::CometBftApplyBlockFailed)?;
 
         let vp = ProdPredicates;
         let voting_power_calculator = ProdVotingPowerCalculator::default();
@@ -486,6 +493,98 @@ mod tests {
 
     fn valid_light_block_input() -> Vec<u8> {
         hex::decode(VALID_LIGHT_BLOCK_INPUT).expect("fixture is valid hex")
+    }
+
+    #[test]
+    fn invalid_commit_structure_does_not_update_trusted_state() {
+        use cometbft::block::CommitSig;
+
+        for skipping in [false, true] {
+            let (mut state, proto) =
+                decode_light_block_validation_input(&valid_light_block_input(), false).unwrap();
+            let light_block = convert_light_block_from_proto(&proto).unwrap();
+            if skipping {
+                state.height = 0;
+                // A skipping update may change validator count. Commit structure must
+                // be checked against the incoming set, not this smaller trusted set.
+                state.validators =
+                    ValidatorSet::without_proposer(vec![state.validators.validators()[0].clone()]);
+            }
+            let before = state.encode().unwrap();
+            let signatures = &light_block.signed_header.commit.signatures;
+            assert!(signatures.len() > 1);
+            let mut too_many = signatures.clone();
+            too_many.push(CommitSig::BlockIdFlagAbsent);
+
+            for invalid_signatures in [
+                signatures[..signatures.len() - 1].to_vec(),
+                too_many,
+                Vec::new(),
+                vec![CommitSig::BlockIdFlagAbsent; signatures.len()],
+            ] {
+                let mut invalid = light_block.clone();
+                invalid.signed_header.commit.signatures = invalid_signatures;
+                assert_eq!(
+                    state.apply_light_block(&invalid),
+                    Err(BscPrecompileError::CometBftApplyBlockFailed.into()),
+                    "invalid commit structure must fail (skipping={skipping})"
+                );
+                assert_eq!(state.encode().unwrap(), before, "rejection must preserve trusted state");
+            }
+
+            state.apply_light_block(&light_block).expect("the complete fixture must remain valid");
+            assert_eq!(state.height, light_block.height().value());
+            assert_eq!(state.validators, light_block.validators);
+        }
+    }
+
+    #[test]
+    fn all_precompile_variants_reject_mismatched_commit_signature_counts() {
+        use cometbft_proto::{
+            google::protobuf::Timestamp,
+            types::v1::{BlockIdFlag, CommitSig},
+        };
+
+        let input = valid_light_block_input();
+        let (_, proto) = decode_light_block_validation_input(&input, false).unwrap();
+        let cs_length = u64::from_be_bytes(input[24..32].try_into().unwrap()) as usize;
+        let prefix = &input[..CONSENSUS_STATE_LENGTH_BYTES_LENGTH as usize + cs_length];
+        let signature_count =
+            proto.signed_header.as_ref().unwrap().commit.as_ref().unwrap().signatures.len();
+        assert!(signature_count > 1);
+
+        let entry_points: [fn(&[u8], u64, u64) -> PrecompileResult; 3] = [
+            cometbft_light_block_validation_run_before_hertz,
+            cometbft_light_block_validation_run,
+            cometbft_light_block_validation_run_pasteur,
+        ];
+        let expected_halt: PrecompileHalt = BscPrecompileError::CometBftApplyBlockFailed.into();
+        for run in entry_points {
+            assert!(run(&input, 10_000_000, 0).unwrap().is_success());
+
+            for count in [signature_count - 1, signature_count + 1] {
+                let mut invalid = proto.clone();
+                invalid
+                    .signed_header
+                    .as_mut()
+                    .unwrap()
+                    .commit
+                    .as_mut()
+                    .unwrap()
+                    .signatures
+                    .resize_with(count, || CommitSig {
+                        block_id_flag: BlockIdFlag::Absent as i32,
+                        timestamp: Some(Timestamp { seconds: -62_135_596_800, nanos: 0 }),
+                        ..Default::default()
+                    });
+                let mut invalid_input = prefix.to_vec();
+                invalid_input.extend_from_slice(&invalid.encode_to_vec());
+
+                let output = run(&invalid_input, 10_000_000, 0)
+                    .expect("a count mismatch must produce a precompile halt");
+                assert_eq!(output.halt_reason(), Some(&expected_halt));
+            }
+        }
     }
 
     /// `signed_header` and `validator_set` are optional protobuf fields, so any caller can
