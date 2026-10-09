@@ -643,6 +643,9 @@ pub const TOKEN_RECOVER_PORTAL_CONTRACT: Address =
     address!("0x0000000000000000000000000000000000003000");
 
 lazy_static! {
+    /// Targets of BSC system transactions. Must match go-bsc's `systemContracts` map in
+    /// consensus/parlia/parlia.go exactly: TokenManager, Staking and StakeCredit are system
+    /// contracts but not system-tx targets, so a coinbase zero-price tx to them is a normal tx.
     pub static ref SYSTEM_CONTRACTS_SET: Vec<Address> = vec![
         VALIDATOR_CONTRACT,
         SLASH_CONTRACT,
@@ -652,11 +655,8 @@ lazy_static! {
         RELAYER_INCENTIVIZE_CONTRACT,
         RELAYER_HUB_CONTRACT,
         GOV_HUB_CONTRACT,
-        TOKEN_MANAGER_CONTRACT,
         CROSS_CHAIN_CONTRACT,
-        STAKING_CONTRACT,
         STAKE_HUB_CONTRACT,
-        STAKE_CREDIT_CONTRACT,
         GOVERNOR_CONTRACT,
         GOV_TOKEN_CONTRACT,
         TIMELOCK_CONTRACT,
@@ -1448,6 +1448,57 @@ mod tests {
     fn jenner_payment_lane_is_not_a_system_tx_target() {
         assert!(!SYSTEM_CONTRACTS_SET.contains(&PAYMENT_LANE_CONTRACT));
         assert!(!is_invoke_system_contract(&PAYMENT_LANE_CONTRACT));
+    }
+
+    /// The system-tx targets must be exactly go-bsc's `systemContracts` map
+    /// (consensus/parlia/parlia.go), or the two clients disagree on block validity.
+    #[test]
+    fn system_tx_set_matches_go_bsc() {
+        let mut go_bsc = vec![
+            VALIDATOR_CONTRACT,
+            SLASH_CONTRACT,
+            SYSTEM_REWARD_CONTRACT,
+            LIGHT_CLIENT_CONTRACT,
+            RELAYER_HUB_CONTRACT,
+            GOV_HUB_CONTRACT,
+            TOKEN_HUB_CONTRACT,
+            RELAYER_INCENTIVIZE_CONTRACT,
+            CROSS_CHAIN_CONTRACT,
+            STAKE_HUB_CONTRACT,
+            GOVERNOR_CONTRACT,
+            GOV_TOKEN_CONTRACT,
+            TIMELOCK_CONTRACT,
+            TOKEN_RECOVER_PORTAL_CONTRACT,
+        ];
+        go_bsc.sort();
+        let mut ours = SYSTEM_CONTRACTS_SET.clone();
+        ours.sort();
+        assert_eq!(ours, go_bsc);
+    }
+
+    /// go-bsc runs a coinbase zero-price tx to TokenManager, Staking or StakeCredit as a normal
+    /// tx; classifying it as a system tx makes reth reject a block geth accepts.
+    #[test]
+    fn coinbase_zero_gas_tx_to_non_whitelisted_contract_is_not_system() {
+        let coinbase = Address::repeat_byte(0x11);
+        let tx_to = |to: Address| {
+            TransactionSigned::new_unhashed(
+                Transaction::Legacy(TxLegacy {
+                    to: TxKind::Call(to),
+                    gas_price: 0,
+                    ..Default::default()
+                }),
+                Signature::new(U256::ZERO, U256::ZERO, false),
+            )
+        };
+
+        for to in [TOKEN_MANAGER_CONTRACT, STAKING_CONTRACT, STAKE_CREDIT_CONTRACT] {
+            assert!(
+                !is_system_transaction(&tx_to(to), coinbase, coinbase),
+                "{to} is not a system tx target"
+            );
+        }
+        assert!(is_system_transaction(&tx_to(STAKE_HUB_CONTRACT), coinbase, coinbase));
     }
 
     #[test]
