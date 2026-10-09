@@ -394,7 +394,7 @@ where
     }
 }
 
-const EIP1559_INITIAL_BASE_FEE: u64 = 0;
+pub(crate) const EIP1559_INITIAL_BASE_FEE: u64 = 0;
 
 /// The [`EvmEnv`] that `header` itself presents to the EVM — go-bsc's
 /// `core.NewEVMBlockContext(header, ..)`.

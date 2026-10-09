@@ -29,6 +29,10 @@ use reth_transaction_pool::{
 use crate::evm::blacklist::{self, BlacklistedAddressError};
 use crate::hardforks::bsc::BscHardfork;
 
+pub(crate) mod tip;
+use crate::node::evm::config::EIP1559_INITIAL_BASE_FEE;
+use tip::{current_tip_floor, meets_tip_floor};
+
 /// A blacklisted transaction is a bad transaction, so the peer that sent it is penalized.
 impl reth_transaction_pool::error::PoolTransactionError for BlacklistedAddressError {
     fn is_bad_transaction(&self) -> bool {
@@ -93,14 +97,15 @@ where
         }
 
         // Check miner gas price floor (set by miner_setGasPrice RPC).
-        // Reject transactions whose max_fee_per_gas is below the miner's configured minimum.
-        if let Some(min_gas_price) = crate::shared::get_miner_gas_tip() {
-            if transaction.max_fee_per_gas() < min_gas_price as u128 {
-                return TransactionValidationOutcome::Invalid(
-                    transaction,
-                    InvalidPoolTransactionError::Underpriced,
-                );
-            }
+        // Reject transactions whose effective tip is below the miner's configured minimum.
+        if !meets_tip_floor(
+            transaction.effective_tip_per_gas(EIP1559_INITIAL_BASE_FEE),
+            current_tip_floor(),
+        ) {
+            return TransactionValidationOutcome::Invalid(
+                transaction,
+                InvalidPoolTransactionError::Underpriced,
+            );
         }
 
         // Delegate to internal validator
@@ -214,3 +219,6 @@ where
         Ok(transaction_pool)
     }
 }
+
+#[cfg(test)]
+pub(crate) mod tests;

@@ -663,7 +663,10 @@ where
                 continue;
             }
             // filter out tx with min gas tip.
-            if pool_tx.effective_tip_per_gas(base_fee).unwrap_or(0_u128) < min_gas_tip {
+            if !crate::node::pool::tip::meets_tip_floor(
+                pool_tx.effective_tip_per_gas(base_fee),
+                min_gas_tip,
+            ) {
                 // Skip this sender's remaining transactions in this build.
                 trace!(
                     target: "payload_builder",
