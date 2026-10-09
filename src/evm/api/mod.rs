@@ -9,14 +9,15 @@ use revm::{
     handler::{
         evm::{ContextDbError, FrameInitResult},
         instructions::EthInstructions,
-        EthFrame, EvmTr, FrameInitOrResult, FrameResult,
+        EthFrame, EvmTr, FrameInitOrResult, FrameResult, ItemOrResult,
     },
     inspector::InspectorEvmTr,
     interpreter::{
-        interpreter::EthInterpreter, interpreter_action::FrameInit, InstructionResult,
-        InterpreterAction, InterpreterResult,
+        interpreter::EthInterpreter,
+        interpreter_action::{CallOutcome, CallScheme, FrameInit, FrameInput},
+        Gas, InstructionResult, InterpreterAction, InterpreterResult,
     },
-    primitives::{hardfork::SpecId, Bytes},
+    primitives::{constants::CALL_STACK_LIMIT, hardfork::SpecId, Bytes},
     Context, Inspector, Journal,
 };
 use revm::context_interface::journaled_state::account::JournaledAccountTr;
@@ -229,6 +230,37 @@ where
         &mut self,
         frame_input: FrameInit,
     ) -> Result<FrameInitResult<'_, Self::Frame>, ContextDbError<Self::Context>> {
+        // go-bsc's `StaticCall` always enters `Run()`, whose coinbase check fails the frame
+        // even when the coinbase has no code. REVM returns success for empty code here in
+        // `frame_init`, so `frame_run`'s guard below never sees it: reject the call first.
+        // Depth and precompile checks precede `Run()` in geth, so leave those to REVM.
+        // `CALL` to an empty coinbase skips `Run()` in geth too and must keep succeeding.
+        if let FrameInput::Call(inputs) = &frame_input.frame_input {
+            if inputs.scheme == CallScheme::StaticCall &&
+                inputs.target_address == self.block.beneficiary &&
+                frame_input.depth <= CALL_STACK_LIMIT as usize &&
+                self.inner.precompiles.get(&inputs.target_address).is_none()
+            {
+                tracing::debug!(
+                    coinbase = %inputs.target_address,
+                    "Rejected STATICCALL to coinbase address"
+                );
+                let mut gas =
+                    Gas::new_with_regular_gas_and_reservoir(inputs.gas_limit, inputs.reservoir);
+                gas.spend_all();
+                return Ok(ItemOrResult::Result(FrameResult::Call(CallOutcome {
+                    result: InterpreterResult {
+                        result: InstructionResult::PrecompileError,
+                        output: Bytes::new(),
+                        gas,
+                    },
+                    memory_offset: inputs.return_memory_offset.clone(),
+                    was_precompile_called: false,
+                    precompile_call_logs: Vec::new(),
+                })));
+            }
+        }
+
         self.inner.frame_init(frame_input)
     }
 
@@ -881,6 +913,131 @@ mod tests {
             result.is_success(),
             "a plain transfer to an empty coinbase account must succeed, got {result:?}"
         );
+    }
+
+    const STATICCALL: u8 = 0xFA;
+    const CALL: u8 = 0xF1;
+    const CALLCODE: u8 = 0xF2;
+    const DELEGATECALL: u8 = 0xF4;
+
+    /// Probe contract: `<opcode>(gas = 10_000, target, 0, 0, 0, 0)` (zero value for CALL and
+    /// CALLCODE), then `SSTORE(0, success + 1)`, so a failed and a successful call cost the same
+    /// to record. `target = None` uses the COINBASE opcode.
+    fn coinbase_guard_probe(opcode: u8, target: Option<Address>) -> Bytecode {
+        // retSize, retOffset, argsSize, argsOffset
+        let mut code = vec![0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00];
+        if matches!(opcode, CALL | CALLCODE) {
+            // value
+            code.extend([0x60, 0x00]);
+        }
+        match target {
+            None => code.push(0x41),
+            Some(target) => {
+                code.push(0x73);
+                code.extend_from_slice(target.as_slice());
+            }
+        }
+        // PUSH2 10_000; <opcode>; PUSH1 1; ADD; PUSH1 0; SSTORE; STOP
+        code.extend([0x61, 0x27, 0x10, opcode, 0x60, 0x01, 0x01, 0x60, 0x00, 0x55, 0x00]);
+        Bytecode::new_raw(Bytes::from(code))
+    }
+
+    /// Runs `probe` against a coinbase holding `coinbase_code`. Returns (slot 0, gas used).
+    fn run_coinbase_guard_probe(
+        probe: Bytecode,
+        coinbase_code: Option<Bytecode>,
+        inspect: bool,
+    ) -> (U256, u64) {
+        use revm::context::{ContextTr, JournalTr};
+
+        let coinbase = Address::from([0xC0; 20]);
+        let caller = Address::from([0x11; 20]);
+        let probe_address = Address::from([0x22; 20]);
+
+        let cfg_env = CfgEnv::new_with_spec(BscHardfork::Osaka).with_chain_id(56);
+        let block_env = BlockEnv {
+            beneficiary: coinbase,
+            prevrandao: Some(U256::from(1).into()),
+            ..Default::default()
+        };
+        let env = EvmEnv::new(cfg_env, block_env.into());
+
+        let mut db = InMemoryDB::default();
+        db.insert_account_info(
+            caller,
+            AccountInfo { balance: U256::from(1_000_000u64), ..AccountInfo::default() },
+        );
+        db.insert_account_info(probe_address, AccountInfo::default().with_code(probe));
+        if let Some(code) = coinbase_code {
+            db.insert_account_info(coinbase, AccountInfo::default().with_code(code));
+        }
+
+        let mut evm = BscEvm::new(env, db, NoOpInspector, inspect, false);
+        let tx = BscTxEnv::new(
+            TxEnv::builder()
+                .caller(caller)
+                .chain_id(Some(56))
+                .gas_limit(100_000)
+                .gas_price(1)
+                .kind(TxKind::Call(probe_address))
+                .build()
+                .expect("tx env should build"),
+        );
+
+        let result = if inspect { evm.inspect_one_tx(tx) } else { evm.transact_one(tx) }
+            .expect("execution should not error");
+        assert!(result.is_success(), "the probe itself must succeed, got {result:?}");
+        let slot =
+            evm.journal_mut().sload(probe_address, U256::ZERO).expect("sload should succeed").data;
+        (slot, result.tx_gas_used())
+    }
+
+    /// go-bsc's `StaticCall` always enters `Run()`, which rejects the coinbase even when it has
+    /// no code, and burns the forwarded gas. REVM's empty-code fast path must not bypass that.
+    #[test]
+    fn staticcall_to_empty_coinbase_fails_and_burns_forwarded_gas() {
+        for inspect in [false, true] {
+            let (static_slot, static_gas) =
+                run_coinbase_guard_probe(coinbase_guard_probe(STATICCALL, None), None, inspect);
+            assert_eq!(static_slot, U256::from(1), "STATICCALL to coinbase must fail");
+
+            // Same probe with CALL, which skips `Run()` for empty code in geth too.
+            let (call_slot, call_gas) =
+                run_coinbase_guard_probe(coinbase_guard_probe(CALL, None), None, inspect);
+            assert_eq!(call_slot, U256::from(2), "CALL to an empty coinbase must succeed");
+
+            // All 10_000 forwarded gas is burned; the CALL probe has one extra PUSH1 (3 gas).
+            assert_eq!(static_gas - call_gas, 10_000 - 3);
+        }
+    }
+
+    #[test]
+    fn staticcall_to_coinbase_with_code_fails() {
+        let (slot, _) = run_coinbase_guard_probe(
+            coinbase_guard_probe(STATICCALL, None),
+            Some(Bytecode::new_raw(Bytes::from(vec![0x00]))),
+            false,
+        );
+        assert_eq!(slot, U256::from(1), "STATICCALL to coinbase code must fail");
+    }
+
+    #[test]
+    fn staticcall_to_empty_non_coinbase_account_succeeds() {
+        let other = Address::from([0x33; 20]);
+        let (slot, _) =
+            run_coinbase_guard_probe(coinbase_guard_probe(STATICCALL, Some(other)), None, false);
+        assert_eq!(slot, U256::from(2), "STATICCALL to an ordinary empty account must succeed");
+    }
+
+    /// DELEGATECALL and CALLCODE run with the caller's address as the contract address, so
+    /// geth's coinbase check never matches them.
+    #[test]
+    fn delegatecall_and_callcode_to_empty_coinbase_succeed() {
+        for opcode in [DELEGATECALL, CALLCODE] {
+            let (slot, _) =
+                run_coinbase_guard_probe(coinbase_guard_probe(opcode, None), None, false);
+            assert_eq!(slot, U256::from(2), "opcode {opcode:#x} to an empty coinbase must succeed");
+        }
     }
 
     // ---- BEP-706 milliTimestamp precompile (0x70, Jenner) ----
