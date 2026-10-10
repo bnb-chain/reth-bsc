@@ -1,12 +1,6 @@
 //! BEP-675 BidBlock types: the builder-proposed block carried by `mev_sendBidBlock`.
 //!
-//! Ported from bnb-chain/bsc `core/types/bid.go`. The builder signs [`BidBlock::hash`], so that
-//! hash must match geth's `rlpHash` over `[header, transactions, sidecars]` byte-for-byte — it is
-//! validated here against vectors generated from the Go implementation.
-//!
-//! Note: `hash()` is vector-verified for the **no-blob** case (empty sidecars). Hash parity for
-//! non-empty blob sidecars depends on [`BscBlobTransactionSidecar`]'s encoding and needs its own
-//! vector before the blob path is relied upon.
+//! Ported from bnb-chain/bsc `core/types/builder/bid.go`.
 
 use crate::chainspec::BscChainSpec;
 use crate::consensus::eip4844::is_blob_eligible_block;
@@ -50,11 +44,12 @@ const MAX_TX_GAS: u64 = 1 << 24;
 
 /// The builder-proposed block carried by [`BidBlockArgs`].
 ///
-/// JSON field names mirror go-bsc's `core/types/bid.go` (`header`, `transactions`, `sidecars`) so
-/// builder payloads deserialize unchanged.
+/// JSON field names mirror go-bsc's `core/types/builder/bid.go` (`header`, `transactions`,
+/// `sidecars`) so builder payloads deserialize unchanged.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BidBlock {
     /// Proposed block header.
+    #[serde(deserialize_with = "deserialize_header")]
     pub header: Header,
     /// Raw (EIP-2718) transactions: user txs first, unsigned system txs last.
     pub transactions: Vec<Bytes>,
@@ -104,22 +99,73 @@ impl Decodable for BidBlock {
 }
 
 impl BidBlock {
-    /// The header hash — the digest the builder signs.
-    ///
-    /// Matches geth's `BidBlock.Hash()` as of bsc #3742 ("miner: optimize BidBlock signing hash",
-    /// shipped in v1.7.6), which replaced `rlpHash([header, transactions, sidecars])` with
-    /// `b.Header.Hash()`. Re-hashing the body on every call meant re-hashing up to 6 × 128 KiB of
-    /// blob data on the admission hot path; the header is ~600 bytes.
-    ///
-    /// The body is still bound to the signature, indirectly: `header.transactions_root` commits to
-    /// the transactions and is verified in [`verify_bid_block_payload`], and blob sidecars are
-    /// bound through the blob versioned hashes carried inside those transactions. **That tx-root
-    /// check is what makes this digest safe — do not narrow the digest without it.** Recovering a
-    /// signature over the wrong digest does not fail; it silently yields a different address, so a
-    /// mismatch here surfaces as a bogus "builder is not registered" rather than a signature error.
+    /// The digest the builder signs: go-bsc `BidBlock.Hash()`.
     pub fn hash(&self) -> B256 {
-        self.header.hash_slow()
+        gobsc_header_hash(&self.header)
     }
+}
+
+/// go-bsc `Header.Hash()`. alloy's `hash_slow` drops an absent optional field that precedes a
+/// present one; such headers are invalid, but the signature is recovered before validation.
+fn gobsc_header_hash(header: &Header) -> B256 {
+    let h = header;
+    let fixed: [&dyn Encodable; 15] = [
+        &h.parent_hash,
+        &h.ommers_hash,
+        &h.beneficiary,
+        &h.state_root,
+        &h.transactions_root,
+        &h.receipts_root,
+        &h.logs_bloom,
+        &h.difficulty,
+        &h.number,
+        &h.gas_limit,
+        &h.gas_used,
+        &h.timestamp,
+        &h.extra_data,
+        &h.mix_hash,
+        &h.nonce,
+    ];
+    let optional: [Option<&dyn Encodable>; 8] = [
+        h.base_fee_per_gas.as_ref().map(|v| v as _),
+        h.withdrawals_root.as_ref().map(|v| v as _),
+        h.blob_gas_used.as_ref().map(|v| v as _),
+        h.excess_blob_gas.as_ref().map(|v| v as _),
+        h.parent_beacon_block_root.as_ref().map(|v| v as _),
+        h.requests_hash.as_ref().map(|v| v as _),
+        h.block_access_list_hash.as_ref().map(|v| v as _),
+        h.slot_number.as_ref().map(|v| v as _),
+    ];
+    let present = optional.iter().rposition(Option::is_some).map_or(0, |last| last + 1);
+
+    let mut payload = Vec::new();
+    for field in fixed {
+        field.encode(&mut payload);
+    }
+    for field in &optional[..present] {
+        match field {
+            Some(field) => field.encode(&mut payload),
+            None => payload.push(alloy_rlp::EMPTY_STRING_CODE),
+        }
+    }
+    let mut out = Vec::new();
+    alloy_rlp::Header { list: true, payload_length: payload.len() }.encode(&mut out);
+    out.extend_from_slice(&payload);
+    keccak256(out)
+}
+
+/// Also accepts go-bsc's `balHash` key, which upstream go-ethereum renamed to
+/// `blockAccessListHash` in ethereum/go-ethereum#34972.
+fn deserialize_header<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Header, D::Error> {
+    use serde::Deserialize;
+
+    let mut map = serde_json::Map::deserialize(deserializer)?;
+    if let Some(hash) = map.remove("balHash") {
+        map.insert("blockAccessListHash".into(), hash);
+    }
+    serde_json::from_value(map.into()).map_err(serde::de::Error::custom)
 }
 
 /// Input to the `mev_sendBidBlock` RPC: a [`BidBlock`] plus the builder's signature over its hash.
@@ -1159,10 +1205,7 @@ mod tests {
 
     #[test]
     fn ecrecover_matches_geth_vector_c() {
-        // The same fixed signature reth-bsc has always pinned, recovered over the post-#3742
-        // digest. Regenerated with go-bsc `BidBlockArgs.EcrecoverSender()`: narrowing the digest
-        // changes which address a given signature recovers to, which is exactly why the old
-        // mismatch surfaced as a bogus "builder is not registered".
+        // Generated from go-bsc BidBlockArgs.EcrecoverSender().
         let args = BidBlockArgs {
             bid_block: vector_a_block(),
             signature: Bytes::from(hex!(
@@ -1173,6 +1216,49 @@ mod tests {
             args.ecrecover_sender().unwrap(),
             address!("0xd6df9A7DF6A570f65d7BC2B1e1001e0dD8500040"),
         );
+    }
+
+    #[test]
+    fn hash_matches_gobsc_with_trailing_field_gap() {
+        // Generated from go-bsc BidBlock.Hash().
+        let mut bid_block = vector_a_block();
+        bid_block.header.slot_number = Some(1);
+        assert_eq!(
+            bid_block.hash(),
+            b256!("0x4276a827dc3b374848e10059b573eecef2ef7eee6996441d308d7c5efbf38c7c"),
+        );
+    }
+
+    #[test]
+    fn hash_matches_gobsc_with_all_optional_fields() {
+        // Generated from go-bsc BidBlock.Hash().
+        let mut bid_block = vector_a_block();
+        let header = &mut bid_block.header;
+        header.base_fee_per_gas = Some(0);
+        header.withdrawals_root = Some(alloy_consensus::constants::EMPTY_WITHDRAWALS);
+        header.blob_gas_used = Some(0);
+        header.excess_blob_gas = Some(0);
+        header.parent_beacon_block_root = Some(B256::ZERO);
+        header.requests_hash = Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH);
+        header.block_access_list_hash = Some(B256::repeat_byte(0x11));
+        header.slot_number = Some(1);
+        assert_eq!(
+            bid_block.hash(),
+            b256!("0x479a3ed309658e1e4a3a1d89b5efdded5efe269d8762454c80cedc8cb893c7c9"),
+        );
+        assert_eq!(bid_block.hash(), bid_block.header.hash_slow());
+    }
+
+    #[test]
+    fn bid_block_json_accepts_gobsc_bal_hash_key() {
+        let mut expected = vector_a_block();
+        expected.header.block_access_list_hash = Some(B256::repeat_byte(0x11));
+        let mut json = serde_json::to_value(&expected).unwrap();
+        let header = json["header"].as_object_mut().unwrap();
+        let bal_hash = header.remove("blockAccessListHash").unwrap();
+        header.insert("balHash".into(), bal_hash);
+
+        assert_eq!(serde_json::from_value::<BidBlock>(json).unwrap(), expected);
     }
 
     #[test]
