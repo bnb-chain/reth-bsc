@@ -105,44 +105,43 @@ impl BidBlock {
     }
 }
 
-/// go-bsc `Header.Hash()`. alloy's `hash_slow` drops an absent optional field that precedes a
+/// go-bsc `Header.Hash()`. alloy's `hash_slow` skips an absent optional field that precedes a
 /// present one; such headers are invalid, but the signature is recovered before validation.
 fn gobsc_header_hash(header: &Header) -> B256 {
-    let h = header;
     let fixed: [&dyn Encodable; 15] = [
-        &h.parent_hash,
-        &h.ommers_hash,
-        &h.beneficiary,
-        &h.state_root,
-        &h.transactions_root,
-        &h.receipts_root,
-        &h.logs_bloom,
-        &h.difficulty,
-        &h.number,
-        &h.gas_limit,
-        &h.gas_used,
-        &h.timestamp,
-        &h.extra_data,
-        &h.mix_hash,
-        &h.nonce,
+        &header.parent_hash,
+        &header.ommers_hash,
+        &header.beneficiary,
+        &header.state_root,
+        &header.transactions_root,
+        &header.receipts_root,
+        &header.logs_bloom,
+        &header.difficulty,
+        &header.number,
+        &header.gas_limit,
+        &header.gas_used,
+        &header.timestamp,
+        &header.extra_data,
+        &header.mix_hash,
+        &header.nonce,
     ];
     let optional: [Option<&dyn Encodable>; 8] = [
-        h.base_fee_per_gas.as_ref().map(|v| v as _),
-        h.withdrawals_root.as_ref().map(|v| v as _),
-        h.blob_gas_used.as_ref().map(|v| v as _),
-        h.excess_blob_gas.as_ref().map(|v| v as _),
-        h.parent_beacon_block_root.as_ref().map(|v| v as _),
-        h.requests_hash.as_ref().map(|v| v as _),
-        h.block_access_list_hash.as_ref().map(|v| v as _),
-        h.slot_number.as_ref().map(|v| v as _),
+        header.base_fee_per_gas.as_ref().map(|v| v as _),
+        header.withdrawals_root.as_ref().map(|v| v as _),
+        header.blob_gas_used.as_ref().map(|v| v as _),
+        header.excess_blob_gas.as_ref().map(|v| v as _),
+        header.parent_beacon_block_root.as_ref().map(|v| v as _),
+        header.requests_hash.as_ref().map(|v| v as _),
+        header.block_access_list_hash.as_ref().map(|v| v as _),
+        header.slot_number.as_ref().map(|v| v as _),
     ];
-    let present = optional.iter().rposition(Option::is_some).map_or(0, |last| last + 1);
+    let tail = &optional[..optional.iter().rposition(Option::is_some).map_or(0, |last| last + 1)];
 
     let mut payload = Vec::new();
     for field in fixed {
         field.encode(&mut payload);
     }
-    for field in &optional[..present] {
+    for field in tail {
         match field {
             Some(field) => field.encode(&mut payload),
             None => payload.push(alloy_rlp::EMPTY_STRING_CODE),
