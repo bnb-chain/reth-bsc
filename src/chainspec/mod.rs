@@ -371,6 +371,10 @@ mod tests {
         // Regression test: custom/dev chains must advertise a non-zero genesis
         // blockhash as their initial head. A zero hash fails the eth/69+
         // handshake (`BlockhashZero`) and deadlocks fresh private networks.
+        //
+        // NOTE: the validator embedded below is a synthetic fixture address
+        // (keccak256("reth-bsc-privnet-test-validator") truncated to 20 bytes).
+        // It has no known private key and must never be used outside tests.
         let genesis_json = r#"{
             "config": {
                 "chainId": 1337,
@@ -389,7 +393,7 @@ mod tests {
             },
             "nonce": "0x0",
             "timestamp": "0x5e9da7ce",
-            "extraData": "0x000000000000000000000000000000000000000000000000000000000000000019e7e376e7c213b7e7e7e46cc70a5dd086daff2a0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+            "extraData": "0x000000000000000000000000000000000000000000000000000000000000000039876ae9543fd48e49661792c115a3984f73dbe50000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
             "gasLimit": "0x2625a00",
             "difficulty": "0x1",
             "mixHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
