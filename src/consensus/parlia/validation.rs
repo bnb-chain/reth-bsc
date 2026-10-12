@@ -26,16 +26,33 @@ pub const fn validate_header_gas(header: &Header) -> Result<(), ConsensusError> 
     Ok(())
 }
 
-/// Ensure the EIP-1559 base fee is set if the London hardfork is active.
+/// Validate the EIP-1559 base fee against go-bsc's `VerifyEIP1559Header`.
+///
+/// On BSC `CalcBaseFee` is constant `InitialBaseFeeForBSC == 0` for every post-London block, so
+/// go-bsc rejects any header whose base fee is not exactly 0 (`invalid baseFee: have X, want 0`),
+/// and `parlia.go`'s pre-fork branch rejects a base fee that is present before London
+/// (`invalid baseFee before fork`). reth-bsc previously checked only presence, so a validator (or,
+/// on the BidBlock path, a builder) could seal a block with a non-zero base fee that reth accepted
+/// and go-bsc rejected — a consensus split (SRC-2072). Mirror both go-bsc branches here; this
+/// function is on both the sync import path (`validate_header`) and the BidBlock admission path
+/// (`verify_bid_block_header` -> `validate_unsealed_header_fields`).
 #[inline]
 pub fn validate_header_base_fee<ChainSpec: EthereumHardforks>(
     header: &Header,
     chain_spec: &ChainSpec,
 ) -> Result<(), ConsensusError> {
-    if chain_spec.is_ethereum_fork_active_at_block(EthereumHardfork::London, header.number) &&
-        header.base_fee_per_gas.is_none()
-    {
-        return Err(ConsensusError::BaseFeeMissing)
+    if chain_spec.is_ethereum_fork_active_at_block(EthereumHardfork::London, header.number) {
+        match header.base_fee_per_gas {
+            None => return Err(ConsensusError::BaseFeeMissing),
+            // BSC's CalcBaseFee is always 0 post-London (InitialBaseFeeForBSC).
+            Some(0) => {}
+            Some(got) => {
+                return Err(ConsensusError::BaseFeeDiff(GotExpected { got, expected: 0 }))
+            }
+        }
+    } else if let Some(got) = header.base_fee_per_gas {
+        // go-bsc `parlia.go`: "invalid baseFee before fork: have X, expected 'nil'".
+        return Err(ConsensusError::BaseFeeDiff(GotExpected { got, expected: 0 }))
     }
     Ok(())
 }
@@ -544,5 +561,45 @@ mod tests {
         {
             panic!("validate_unsealed_header_fields must NOT apply the wall-clock future bound")
         }
+    }
+
+    /// SRC-2072 regression: go-bsc's `VerifyEIP1559Header` requires `BaseFee == CalcBaseFee == 0`
+    /// on every post-London Parlia header, and `parlia.go` rejects a base fee present before
+    /// London. A presence-only check let a validator seal `base_fee = 1`, which go-bsc rejected and
+    /// reth accepted — a consensus split. Uses the real BSC mainnet chainspec (London at
+    /// 31_302_048) so the fork gating matches production, not a synthetic spec.
+    #[test]
+    fn rejects_nonzero_base_fee_matching_go_bsc() {
+        use crate::chainspec::{bsc::bsc_mainnet, BscChainSpec};
+        let spec = Arc::new(BscChainSpec { inner: bsc_mainnet() });
+        let parlia = Parlia::new(spec.clone(), 200);
+
+        // Post-London, pre-Shanghai, non-epoch, vanity+seal extra: 0 is the only valid base fee.
+        let honest = Header {
+            number: 31_302_101,
+            timestamp: 1_692_000_000,
+            extra_data: vec![0u8; 97].into(),
+            ommers_hash: EMPTY_OMMER_ROOT_HASH,
+            base_fee_per_gas: Some(0),
+            ..Default::default()
+        };
+        validate_header_base_fee(&honest, &*spec).expect("base fee 0 passes");
+        parlia.validate_unsealed_header_fields(&sealed(honest.clone())).expect("base fee 0 passes");
+        parlia.validate_header(&sealed(honest.clone())).expect("base fee 0 passes (sync path)");
+
+        // Non-zero base fee must be rejected on BOTH the sync path and the unsealed/BidBlock path.
+        let malicious = Header { base_fee_per_gas: Some(1), ..honest.clone() };
+        assert!(matches!(
+            validate_header_base_fee(&malicious, &*spec),
+            Err(ConsensusError::BaseFeeDiff(_))
+        ));
+        assert!(parlia.validate_unsealed_header_fields(&sealed(malicious.clone())).is_err());
+        assert!(parlia.validate_header(&sealed(malicious)).is_err());
+
+        // Pre-London: a present base fee is rejected (go-bsc "invalid baseFee before fork").
+        let pre_london = Header { number: 31_302_001, base_fee_per_gas: None, ..honest };
+        parlia.validate_header(&sealed(pre_london.clone())).expect("pre-London, no base fee");
+        let pre_london_with_fee = Header { base_fee_per_gas: Some(0), ..pre_london };
+        assert!(parlia.validate_header(&sealed(pre_london_with_fee)).is_err());
     }
 }

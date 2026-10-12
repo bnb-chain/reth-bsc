@@ -2130,4 +2130,43 @@ mod tests {
         assert_eq!(decoded[0].signature().r(), U256::from(1));
         assert_eq!(decoded[0].signature().s(), U256::from(2));
     }
+
+    /// SRC-2072 regression, BidBlock vector: go-bsc's admission (`VerifyUnsealedHeader` ->
+    /// `verifyCascadingFields` -> `VerifyEIP1559Header`) rejects a builder header with a non-zero
+    /// base fee. reth's BidBlock admission runs the same `validate_unsealed_header_fields`, so a
+    /// builder with no validator key could otherwise make an honest validator seal a split block.
+    #[test]
+    fn pre_seal_rejects_nonzero_base_fee() {
+        let spec = BscChainSpec::from(
+            reth_chainspec::ChainSpecBuilder::mainnet().london_activated().build(),
+        );
+        let etherbase = Address::repeat_byte(0x11);
+        let parlia = parlia_engine(spec.clone());
+        let snap = snap_with_interval(3_000);
+        let parent = Header {
+            number: 0,
+            timestamp: 1,
+            gas_limit: 30_000_000,
+            base_fee_per_gas: Some(0),
+            ..Default::default()
+        };
+        let txs = vec![legacy_tx(0), deposit_system_tx(100)];
+
+        // Baseline: base fee 0 is admitted.
+        let honest =
+            Header { base_fee_per_gas: Some(0), ..valid_bid_header(etherbase, 30_000_000) };
+        let d = decoded_block(honest.clone(), txs.clone(), vec![]);
+        assert_eq!(
+            pre_seal_verify_bid_block(&parlia, &spec, &d, &parent, &snap, etherbase, 30_000_000),
+            Ok((1, U256::from(100))),
+        );
+
+        // base fee 1 is rejected (go-bsc: invalid baseFee: have 1, want 0).
+        let malicious = Header { base_fee_per_gas: Some(1), ..honest };
+        let d = decoded_block(malicious, txs, vec![]);
+        assert!(pre_seal_verify_bid_block(
+            &parlia, &spec, &d, &parent, &snap, etherbase, 30_000_000
+        )
+        .is_err());
+    }
 }
