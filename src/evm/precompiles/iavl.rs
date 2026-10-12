@@ -226,4 +226,46 @@ mod tests {
             assert_eq!(res.halt_reason(), Some(&PrecompileHalt::other("internal error")), "{name}");
         }
     }
+
+    /// A well-formed outer proof whose first `ProofOp.data` is not decodable must halt: the
+    /// verifier unwraps the inner decode.
+    #[test]
+    fn malformed_inner_proof_op_halts_instead_of_panicking() {
+        // Precompile input with a one-byte key and value and two `ProofOp`s of type `op_type`,
+        // each carrying a truncated varint as data.
+        let input_with_ops = |op_type: &str| {
+            let mut op = vec![0x0a, op_type.len() as u8];
+            op.extend_from_slice(op_type.as_bytes());
+            op.extend_from_slice(&[0x1a, 1, 0xff]);
+            let mut proof = Vec::new();
+            for _ in 0..2 {
+                proof.extend_from_slice(&[0x0a, op.len() as u8]);
+                proof.extend_from_slice(&op);
+            }
+
+            let mut payload = vec![0u8; 32 + 31];
+            payload.extend_from_slice(&[1, 0xaa]);
+            payload.extend_from_slice(&[0u8; 31]);
+            payload.extend_from_slice(&[1, 0xbb]);
+            payload.extend_from_slice(&[0u8; 32]);
+            payload.extend_from_slice(&proof);
+            let mut input = vec![0u8; 24];
+            input.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+            input.extend_from_slice(&payload);
+            input
+        };
+
+        let runs: [(&str, &str, revm::precompile::PrecompileFn); 5] = [
+            ("base", "iavl:v", iavl_proof_validation_run),
+            ("moran", "iavl:v", iavl_proof_validation_run_moran),
+            ("planck", "iavl:v", iavl_proof_validation_run_planck),
+            ("planck", "ics23:iavl", iavl_proof_validation_run_planck),
+            ("plato", "ics23:iavl", iavl_proof_validation_run_plato),
+        ];
+        for (name, op_type, run) in runs {
+            let res = run(&input_with_ops(op_type), 3_000, 0).unwrap();
+            let expected = Some(&PrecompileHalt::other("internal error"));
+            assert_eq!(res.halt_reason(), expected, "{name} {op_type}");
+        }
+    }
 }
