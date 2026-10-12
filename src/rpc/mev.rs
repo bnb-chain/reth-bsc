@@ -2,7 +2,7 @@ use crate::chainspec::BscChainSpec;
 use crate::consensus::parlia::{Snapshot, SnapshotProvider};
 use crate::hardforks::BscHardforks;
 use crate::node::miner::bid_block::BidBlockArgs;
-use crate::node::miner::bid_simulator::Bid;
+use crate::node::miner::bid_simulator::{validate_bid_blob_sidecar, Bid};
 use crate::node::miner::config::keystore;
 use crate::node::miner::config::MiningConfig;
 use alloy_consensus::BlobTransactionSidecar;
@@ -19,6 +19,9 @@ use reth_primitives_traits::SignerRecoverable;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use tracing::debug;
+
+#[cfg(test)]
+pub(crate) mod legacy_sidecar_tests;
 
 /// Per-block pending bid tracking: block_number → builder → set of bid hashes.
 type PendingBids = HashMap<u64, HashMap<Address, HashSet<B256>>>;
@@ -843,7 +846,7 @@ impl MevApiImpl {
 
     /// Decode transaction with sidecar support
     /// This matches Go's UnmarshalBinary + decodeTyped logic
-    /// For blob transactions, tries to extract sidecar from the byte stream
+    /// Blob transactions must include a decodable sidecar in the byte stream.
     fn decode_transaction_with_sidecar(
         tx_bytes: &alloy_primitives::Bytes,
         chain_spec: &BscChainSpec,
@@ -863,7 +866,7 @@ impl MevApiImpl {
         // EIP-2718 typed transaction envelope
         let tx_type = tx_bytes[0];
 
-        // For blob transactions (type 0x03), check if sidecar is included
+        // Blob transactions (type 0x03) must carry their sidecar.
         const BLOB_TX_TYPE: u8 = 0x03;
 
         if tx_type == BLOB_TX_TYPE {
@@ -873,7 +876,7 @@ impl MevApiImpl {
                 hex::encode(&tx_bytes[..tx_bytes.len().min(64)])
             );
 
-            // Try to decode with sidecar first
+            // Decode the pooled blob transaction; a bare blob tx is not a valid bid input.
             let payload = &tx_bytes[1..]; // Skip type byte
 
             match Self::try_decode_blob_tx_with_sidecar(payload) {
@@ -902,8 +905,9 @@ impl MevApiImpl {
                     return Ok(DecodedTransaction { tx, sidecar: Some(sidecar) });
                 }
                 Err(e) => {
-                    debug!("Failed to decode with sidecar: {}, trying without", e);
-                    // Fall through to standard decoding
+                    // A private blob bid must carry its sidecar. Never downgrade
+                    // malformed sidecar input to an unchecked bare transaction.
+                    return Err(format!("Invalid blob transaction with sidecar: {e}"));
                 }
             }
         }
@@ -936,6 +940,10 @@ impl MevApiImpl {
                     debug!("Failed to decode TxEip4844WithSidecar: {}", e);
                     format!("Failed to decode transaction with sidecar: {}", e)
                 })?;
+
+        if !buf.is_empty() {
+            return Err("Trailing bytes after blob transaction with sidecar".into());
+        }
 
         debug!(
             "Successfully decoded TxEip4844WithSidecar, blobs={}, remaining bytes={}",
@@ -1022,6 +1030,12 @@ impl MevApiImpl {
             }
 
             txs.push(decoded.tx);
+        }
+
+        // Cover both the builder's transactions and the appended payment tx.
+        // Decoding and signer recovery alone do not verify blob availability.
+        for tx in &txs {
+            validate_bid_blob_sidecar(tx, blob_sidecars.get(tx.hash()))?;
         }
 
         debug!(
