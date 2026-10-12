@@ -57,7 +57,7 @@ pub struct BidBlockPermissionStatus {
     pub allowed: bool,
     /// Error detail for auto revokes, or [`REVOKE_REASON_MANUAL`] for admin revokes.
     pub reason: String,
-    /// Block hash that triggered an auto revoke (zero for manual / none).
+    /// Trigger hash (sealed block, or BidBlock digest for blob-prep revoke; zero if none).
     pub block_hash: B256,
     /// Block number that triggered an auto revoke.
     pub block_num: u64,
