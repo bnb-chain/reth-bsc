@@ -5,7 +5,10 @@ use parity_bytes::BytesRef;
 use revm::precompile::{
     u64_to_address, PrecompileHalt, PrecompileOutput, PrecompileResult, Precompile, PrecompileId,
 };
-use std::borrow::Cow;
+use std::{
+    borrow::Cow,
+    panic::{self, AssertUnwindSafe},
+};
 use tendermint::lite::light_client;
 
 /// Tendermint precompile for BSC.
@@ -40,7 +43,12 @@ fn tendermint_header_validation_run(input: &[u8], gas_limit: u64, reservoir: u64
 
     let mut output = vec![0u8, 0, 0];
     let mut bytes = BytesRef::Flexible(&mut output);
-    let res = light_client::TmHeaderVerifier::execute(input, &mut bytes);
+    // The light client panics on some malformed inputs (unchecked slices and unwraps). go-bsc
+    // recovers such panics into a precompile error, so do the same instead of unwinding.
+    let res = panic::catch_unwind(AssertUnwindSafe(|| {
+        light_client::TmHeaderVerifier::execute(input, &mut bytes)
+    }))
+    .unwrap_or(Err("internal error"));
     match res {
         Ok(()) => Ok(PrecompileOutput::new(TENDERMINT_HEADER_VALIDATION_BASE, Bytes::from(output), reservoir)),
         Err(str) => Ok(PrecompileOutput::halt(PrecompileHalt::other(str), reservoir)),
@@ -68,5 +76,42 @@ mod tests {
     fn deprecated_precompile_rejects_all_input() {
         let res = tendermint_header_validation_run_deprecated(b"anything", 3_000, 0).unwrap();
         assert!(res.is_halt());
+    }
+
+    /// Wraps `payload` in the 32-byte big-endian length prefix the precompile expects.
+    fn with_length_prefix(payload: &[u8]) -> Vec<u8> {
+        let mut input = vec![0u8; 24];
+        input.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+        input.extend_from_slice(payload);
+        input
+    }
+
+    /// Inputs that make the light client panic must halt the precompile, as go-bsc's recover()
+    /// does, instead of unwinding through the EVM.
+    #[test]
+    fn malformed_input_halts_instead_of_panicking() {
+        // Smallest consensus state the parser accepts: chain id, height, app hash, validator
+        // set hash and one validator.
+        let consensus_state = [0u8; 32 + 8 + 32 + 32 + 40];
+        let header_input = |light_block: &[u8]| {
+            let mut payload = vec![0u8; 24];
+            payload.extend_from_slice(&(consensus_state.len() as u64).to_be_bytes());
+            payload.extend_from_slice(&consensus_state);
+            payload.extend_from_slice(light_block);
+            with_length_prefix(&payload)
+        };
+
+        let cases = [
+            // Payload too short to hold the consensus-state length: out-of-bounds slice.
+            ("one-byte payload", with_length_prefix(&[0])),
+            // Empty LightBlock: unwrap on a missing validator_set.
+            ("empty light block", header_input(&[0x00])),
+            // Truncated protobuf: unwrap on the decode error.
+            ("truncated light block", header_input(&[0x05, 0xff])),
+        ];
+        for (name, input) in cases {
+            let res = tendermint_header_validation_run(&input, 3_000, 0).unwrap();
+            assert_eq!(res.halt_reason(), Some(&PrecompileHalt::other("internal error")), "{name}");
+        }
     }
 }
