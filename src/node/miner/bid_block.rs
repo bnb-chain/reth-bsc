@@ -927,9 +927,9 @@ pub struct BidBlockTask {
     pub gas_fee: U256,
     /// Index where the trailing system-tx region begins.
     pub system_tx_start: usize,
-    /// Builder that submitted the BidBlock (for selection logging / revoke-on-mismatch).
+    /// Builder that submitted the BidBlock.
     pub builder: Address,
-    /// Hash of the original BidBlock payload.
+    /// BidBlock digest; differs from `block.hash()` after seal.
     pub bid_hash: B256,
 }
 

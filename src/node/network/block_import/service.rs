@@ -68,13 +68,8 @@ pub(crate) type IncomingBlock = (BlockMsg, PeerId);
 /// Channel message type for incoming mined blocks
 pub(crate) type IncomingMinedBlock = (BscBuiltPayload, BlockMsg);
 
-/// Channel message type for a selected (sealed, unexecuted) BEP-675 BidBlock.
-///
-/// Carries the sealed block plus the `(builder, bid_hash)` needed to revoke the builder if the
-/// block turns out to be invalid on import, and `(gas_fee, system_tx_start)` needed for the
-/// post-import average-gas-price floor check (go-bsc `validateBidBlockAverageGasPrice`) — the
-/// deposit-derived fee the bid was selected on, and the index where the trailing (unsigned,
-/// bind-signed) system-tx region begins, so the check can exclude system-tx gas from the average.
+/// Channel message for a selected (sealed, unexecuted) BEP-675 BidBlock:
+/// `(sealed, builder, bid_hash, gas_fee, system_tx_start)`.
 /// Unlike [`IncomingMinedBlock`] there is no executed payload: under zero-simulate the validator
 /// broadcasts first and executes on import.
 pub(crate) type IncomingBidBlock = (SealedBlock<BscBlock>, Address, B256, U256, usize);
@@ -702,7 +697,7 @@ where
                         crate::shared::get_bid_block_permission_manager().revoke(
                             builder,
                             format!("BidBlock invalid on import: {validation_error}"),
-                            bid_hash,
+                            block_hash,
                             block_number,
                         );
                     }
@@ -1452,10 +1447,12 @@ mod tests {
             (true, false, 0x7b, 900_104),
         ] {
             let sealed = create_bid_sealed_block(block_number);
+            let sealed_hash = sealed.hash();
+            let bid_hash = B256::repeat_byte(0xb1);
             let parent_hash = sealed.header().parent_hash;
             let mut provider = MockProvider::new();
             provider.insert(sealed.header().clone(), U256::from(1));
-            provider.insert_receipts(sealed.hash(), Vec::new());
+            provider.insert_receipts(sealed_hash, Vec::new());
             let (observed_tx, mut new_payload_observed) = mpsc::unbounded_channel();
             let mut responses = if valid {
                 EngineResponses::both_valid()
@@ -1471,7 +1468,7 @@ mod tests {
 
             // The miner claims the slot before handing the signed block to this service.
             assert!(crate::shared::check_and_record_mined_block(block_number, parent_hash));
-            fixture.bid_tx.send((sealed, builder, B256::ZERO, U256::ZERO, 0)).unwrap();
+            fixture.bid_tx.send((sealed, builder, bid_hash, U256::ZERO, 0)).unwrap();
 
             tokio::time::timeout(tokio::time::Duration::from_secs(2), async {
                 loop {
@@ -1497,6 +1494,11 @@ mod tests {
 
             assert_eq!(pm.is_allowed(builder), valid || local_fault);
             assert_eq!(fixture.forkchoice_updates.try_recv().is_ok(), valid);
+            if !valid && !local_fault {
+                let revoked = pm.get_status(builder).block_hash;
+                assert_eq!(revoked, sealed_hash);
+                assert_ne!(revoked, bid_hash);
+            }
             assert!(
                 !crate::shared::check_and_record_mined_block(block_number, parent_hash),
                 "a broadcast block must retain its double-sign reservation"
@@ -1613,6 +1615,9 @@ mod tests {
             tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
         }
         assert!(!pm.is_allowed(builder), "builder must be revoked for a too-low average gas price");
+        let revoked = pm.get_status(builder).block_hash;
+        assert_eq!(revoked, block_hash);
+        assert_ne!(revoked, bid_hash);
     }
 
     #[tokio::test]
