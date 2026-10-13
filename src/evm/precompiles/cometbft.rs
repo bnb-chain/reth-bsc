@@ -152,8 +152,15 @@ fn convert_light_block_from_proto(light_block_proto: &TmLightBlock) -> ConvertLi
         Err(_) => return Err(BscPrecompileError::InvalidInput.into()),
     };
 
-    let mut validator_set_proto =
-        light_block_proto.validator_set.clone().ok_or(BscPrecompileError::InvalidInput)?;
+    let validator_set_proto =
+        light_block_proto.validator_set.as_ref().ok_or(BscPrecompileError::InvalidInput)?;
+    // Go's ValidatorSetFromProto requires a proposer, even though protobuf makes it optional.
+    validator_set_proto.proposer.as_ref().ok_or(BscPrecompileError::InvalidInput)?;
+
+    let mut validator_set_proto = validator_set_proto.clone();
+    // Go ignores the untrusted cache and recomputes the total from the validators. Set::try_from
+    // already computes and bounds that sum; zero disables only its cache-equality check.
+    validator_set_proto.total_voting_power = 0;
     fill_unset_bridge_fields(&mut validator_set_proto);
     let validator_set = match Set::try_from(validator_set_proto) {
         Ok(vs) => vs.clone(),
@@ -599,6 +606,107 @@ mod tests {
             let output = cometbft_light_block_validation_run_pasteur(&crafted, 10_000_000, 0)
                 .expect("a missing proto field must not be a fatal error");
             assert!(output.is_halt(), "expected an InvalidInput halt");
+        }
+    }
+
+    fn input_with_validator_set(
+        mutate: impl FnOnce(&mut cometbft_proto::types::v1::ValidatorSet),
+    ) -> Vec<u8> {
+        let input = valid_light_block_input();
+        let split = 32 + u64::from_be_bytes(input[24..32].try_into().unwrap()) as usize;
+        let mut proto = TmLightBlock::decode(&input[split..]).unwrap();
+        mutate(proto.validator_set.as_mut().unwrap());
+        let mut crafted = input[..split].to_vec();
+        crafted.extend_from_slice(&proto.encode_to_vec());
+        crafted
+    }
+
+    type CometbftRunner = fn(&[u8], u64, u64) -> PrecompileResult;
+
+    fn cometbft_forks() -> [(CometbftRunner, u64); 3] {
+        [
+            (cometbft_light_block_validation_run_before_hertz, 0),
+            (cometbft_light_block_validation_run, 0),
+            (
+                cometbft_light_block_validation_run_pasteur,
+                COMETBFT_LIGHT_BLOCK_VALIDATE_PER_BYTE_GAS,
+            ),
+        ]
+    }
+
+    #[test]
+    fn light_block_ignores_cached_total_voting_power() {
+        for (run, per_byte_gas) in cometbft_forks() {
+            let control = run(&valid_light_block_input(), 1_000_000, 17).unwrap();
+            assert!(control.is_success());
+            // The fixture's three validators each have power 10_000_000.
+            for cache in [0, 1, 30_000_000, -1, i64::MIN, i64::MAX] {
+                let input = input_with_validator_set(|set| set.total_voting_power = cache);
+                let gas = COMETBFT_LIGHT_BLOCK_VALIDATION_BASE + input.len() as u64 * per_byte_gas;
+                let output = run(&input, gas, 17).unwrap();
+                assert!(output.is_success(), "cache={cache}");
+                assert_eq!(output.bytes, control.bytes);
+                assert_eq!(output.gas_used, gas);
+                let out_of_gas = run(&input, gas - 1, 17).unwrap();
+                assert_eq!(
+                    out_of_gas.status,
+                    revm::precompile::PrecompileStatus::Halt(PrecompileHalt::OutOfGas)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn light_block_requires_valid_proposer_regardless_of_cached_power() {
+        for cache in [0, 1, -1, i64::MAX] {
+            for empty in [false, true] {
+                let input = input_with_validator_set(|set| {
+                    set.total_voting_power = cache;
+                    set.proposer = if empty {
+                        Some(Default::default())
+                    } else {
+                        None
+                    };
+                });
+                for (run, per_byte_gas) in cometbft_forks() {
+                    let gas =
+                        COMETBFT_LIGHT_BLOCK_VALIDATION_BASE + input.len() as u64 * per_byte_gas;
+                    let output = run(&input, gas, 17).unwrap();
+                    assert_eq!(
+                        output.status,
+                        revm::precompile::PrecompileStatus::Halt(
+                            BscPrecompileError::InvalidInput.into()
+                        )
+                    );
+                    assert!(output.bytes.is_empty());
+                    let out_of_gas = run(&input, gas - 1, 17).unwrap();
+                    assert_eq!(
+                        out_of_gas.status,
+                        revm::precompile::PrecompileStatus::Halt(PrecompileHalt::OutOfGas)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn light_block_cache_normalization_preserves_power_validation() {
+        for cache in [0, 1, -1, i64::MAX] {
+            for power in [-1, Set::MAX_TOTAL_VOTING_POWER as i64 + 1] {
+                let input = input_with_validator_set(|set| {
+                    set.total_voting_power = cache;
+                    set.validators[0].voting_power = power;
+                });
+                for (run, _) in cometbft_forks() {
+                    let output = run(&input, 1_000_000, 0).unwrap();
+                    assert_eq!(
+                        output.status,
+                        revm::precompile::PrecompileStatus::Halt(
+                            BscPrecompileError::InvalidInput.into()
+                        )
+                    );
+                }
+            }
         }
     }
 
