@@ -308,21 +308,14 @@ impl BidBlockPermissionManager {
         block_hash: B256,
         block_num: u64,
     ) -> usize {
-        let mut revoked = self.revoked.write();
-        let now = (self.clock)();
-        let violation_count = revoked.get(&builder).map(|r| r.violation_count).unwrap_or(0) + 1;
-        Self::apply_revoke_locked(
-            &mut revoked,
+        self.revoke_inner(
             builder,
             reason.into(),
             block_hash,
             block_num,
             BID_BLOCK_REVOKE_DURATION_SECS,
-            violation_count,
-            now,
-        );
-        self.mark_dirty_locked(&revoked);
-        violation_count
+            true,
+        )
     }
 
     /// Deny `builder` for `duration_secs` (0 → default). Leaves `violation_count` unchanged.
@@ -334,33 +327,26 @@ impl BidBlockPermissionManager {
         block_num: u64,
         duration_secs: u64,
     ) {
-        let mut revoked = self.revoked.write();
-        let now = (self.clock)();
-        let violation_count = revoked.get(&builder).map(|r| r.violation_count).unwrap_or(0);
-        Self::apply_revoke_locked(
-            &mut revoked,
-            builder,
-            reason.into(),
-            block_hash,
-            block_num,
-            duration_secs,
-            violation_count,
-            now,
-        );
-        self.mark_dirty_locked(&revoked);
+        self.revoke_inner(builder, reason.into(), block_hash, block_num, duration_secs, false);
     }
 
-    /// Insert/update one revoke. Caller holds the write lock. Never shortens an active lockout.
-    fn apply_revoke_locked(
-        revoked: &mut HashMap<Address, BidBlockRevokeRecord>,
+    /// Shared revoke write. `bump_violation` increments the tally; otherwise it is carried over.
+    /// Never shortens an active lockout.
+    fn revoke_inner(
+        &self,
         builder: Address,
         reason: String,
         block_hash: B256,
         block_num: u64,
         duration_secs: u64,
-        violation_count: usize,
-        now: u64,
-    ) {
+        bump_violation: bool,
+    ) -> usize {
+        let mut revoked = self.revoked.write();
+        let now = (self.clock)();
+        let mut violation_count = revoked.get(&builder).map(|r| r.violation_count).unwrap_or(0);
+        if bump_violation {
+            violation_count += 1;
+        }
         let duration_secs =
             if duration_secs == 0 { BID_BLOCK_REVOKE_DURATION_SECS } else { duration_secs };
         let duration_secs = match revoked.get(&builder) {
@@ -380,6 +366,8 @@ impl BidBlockPermissionManager {
                 violation_count,
             },
         );
+        self.mark_dirty_locked(&revoked);
+        violation_count
     }
 
     /// Current permission snapshot for `builder`.
