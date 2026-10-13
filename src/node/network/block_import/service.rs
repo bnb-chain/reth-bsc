@@ -810,17 +810,8 @@ where
             &block.block.0.block.header,
         );
 
-        // send to EVN peers first
-        if let Err(e) = self.transfer_to_evn_peers(block.clone()) {
-            tracing::warn!(target: "bsc::block_import", "Failed to transfer block to EVN peers: number = {:?}, hash = {:?}, error = {}", block.block.0.block.header.number, block.hash, e);
-        }
-        // Send ValidHeader announcement to trigger NewBlock diffusion from few peers
-        // TODO: add header validation later
-        let _ =
-            self.to_network.send(BlockImportEvent::Announcement(BlockValidation::ValidHeader {
-                block: block.clone(),
-            }));
-
+        // Peer blocks may be forwarded only after the engine validates the full payload.
+        // Admission and a pending execution request do not authorize propagation.
         tracing::debug!(target: "bsc::block_import", "Sending new block to import service: number = {:?}, hash = {:?}", block.block.0.block.header.number, block.hash);
         let payload_fut = self.new_payload(block.clone(), peer_id);
         self.pending_imports.push(payload_fut);
@@ -1217,6 +1208,13 @@ where
                     if let Err(e) = this.transfer_to_evn_peers(block.clone()) {
                         tracing::warn!(target: "bsc::block_import", "Failed to transfer block to EVN peers: number = {:?}, hash = {:?}, error = {}", block.block.0.block.header.number, block.hash, e);
                     }
+                    // ValidHeader triggers full NewBlock relay; the ValidBlock outcome below
+                    // announces its hash. Both paths now follow successful payload validation.
+                    if let Err(e) = this.to_network.send(BlockImportEvent::Announcement(
+                        BlockValidation::ValidHeader { block: block.clone() },
+                    )) {
+                        return Poll::Ready(Err(Box::new(e)));
+                    }
                 }
 
                 // TODO: add queued blocks removal later, to avoid milicious block import, and trigger next download.
@@ -1316,48 +1314,81 @@ mod tests {
         service.on_new_block(good, PeerId::random());
         assert!(service.queued_blocks.contains(&hash));
         assert_eq!(service.pending_imports.len(), 1);
-        assert!(matches!(events.try_recv().unwrap(), BlockImportEvent::Announcement(_)));
+        assert!(events.try_recv().is_err());
     }
 
-    #[tokio::test]
-    async fn can_handle_invalid_new_payload() {
-        // When new_payload returns Invalid, the peer should NOT be penalized.
-        // The only event emitted is the early ValidHeader announcement from
-        // on_new_block; no BlockImportOutcome error should follow.
-        let mut fixture = TestFixture::new(EngineResponses::invalid_new_payload()).await;
-        fixture
-            .assert_block_import(|outcome| {
-                matches!(
-                    outcome,
-                    BlockImportEvent::Announcement(BlockValidation::ValidHeader { .. })
-                )
-            })
-            .await;
+    #[tokio::test(start_paused = true)]
+    async fn peer_blocks_relay_only_after_valid_payload() {
+        for status in [
+            Some(PayloadStatusEnum::Valid),
+            Some(PayloadStatusEnum::Invalid { validation_error: "execution rejection".into() }),
+            Some(PayloadStatusEnum::Accepted),
+            Some(PayloadStatusEnum::Syncing),
+            None, // Engine unavailable.
+        ] {
+            let valid = matches!(status, Some(PayloadStatusEnum::Valid));
+            let (received_tx, mut received_rx) = mpsc::unbounded_channel();
+            let (replied_tx, mut replied_rx) = mpsc::unbounded_channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let mut responses = EngineResponses::both_valid();
+            responses.new_payload_unavailable = status.is_none();
+            if let Some(status) = status {
+                responses.new_payload = status;
+            }
+            responses.new_payload_gate = Some((received_tx, release_rx));
+            responses.new_payload_observed = Some(replied_tx);
+            let mut fixture = TestFixture::new(responses).await;
+            let block = create_test_block();
+            let hash = block.hash;
+            fixture.handle.send_block(block, PeerId::random()).unwrap();
 
-        // Verify no error outcome was emitted
-        let waker = futures::task::noop_waker();
-        let mut cx = Context::from_waker(&waker);
-        let mut extra = Vec::new();
-        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(200);
-        loop {
-            match fixture.handle.poll_outcome(&mut cx) {
-                Poll::Ready(Some(event)) => extra.push(event),
-                Poll::Ready(None) => break,
-                Poll::Pending => {
-                    if tokio::time::Instant::now() >= deadline {
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                }
+            tokio::time::timeout(tokio::time::Duration::from_secs(2), received_rx.recv())
+                .await
+                .expect("engine did not receive payload")
+                .expect("engine request channel closed");
+            let waker = futures::task::noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            assert!(
+                matches!(fixture.handle.poll_outcome(&mut cx), Poll::Pending),
+                "pending payload must not announce a block"
+            );
+
+            release_tx.send(()).unwrap();
+            tokio::time::timeout(tokio::time::Duration::from_secs(2), replied_rx.recv())
+                .await
+                .expect("engine did not reply")
+                .expect("engine response channel closed");
+            if valid {
+                let announcement = tokio::time::timeout(
+                    tokio::time::Duration::from_secs(2),
+                    futures::future::poll_fn(|cx| fixture.handle.poll_outcome(cx)),
+                )
+                .await
+                .expect("validated block was not relayed")
+                .unwrap();
+                assert!(matches!(announcement,
+                    BlockImportEvent::Announcement(BlockValidation::ValidHeader { block })
+                        if block.hash == hash));
+                let outcome = tokio::time::timeout(
+                    tokio::time::Duration::from_secs(2),
+                    futures::future::poll_fn(|cx| fixture.handle.poll_outcome(cx)),
+                )
+                .await
+                .expect("validated block outcome missing")
+                .unwrap();
+                assert!(matches!(outcome,
+                    BlockImportEvent::Outcome(BlockImportOutcome {
+                        result: Ok(BlockValidation::ValidBlock { block }), ..
+                    }) if block.hash == hash));
+            } else {
+                // Let ready import work finish before checking for forbidden relay events.
+                tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+                assert!(
+                    matches!(fixture.handle.poll_outcome(&mut cx), Poll::Pending),
+                    "non-VALID payload must not announce a block or penalize its peer"
+                );
             }
         }
-        assert!(
-            !extra.iter().any(|e| matches!(
-                e,
-                BlockImportEvent::Outcome(BlockImportOutcome { result: Err(_), .. })
-            )),
-            "Should not penalize peer for Invalid new_payload. Extra events: {extra:?}"
-        );
     }
 
     #[tokio::test]
@@ -1860,6 +1891,8 @@ mod tests {
         new_payload_unavailable: bool,
         /// Signals that the mock has replied to or dropped a `NewPayload` request.
         new_payload_observed: Option<mpsc::UnboundedSender<()>>,
+        /// Hold the response after reporting receipt, to test pending validation.
+        new_payload_gate: Option<(mpsc::UnboundedSender<()>, tokio::sync::oneshot::Receiver<()>)>,
     }
 
     impl EngineResponses {
@@ -1870,6 +1903,7 @@ mod tests {
                 fcu: PayloadStatusEnum::Valid,
                 new_payload_unavailable: false,
                 new_payload_observed: None,
+                new_payload_gate: None,
             }
         }
 
@@ -2025,7 +2059,7 @@ mod tests {
     /// Helper function to handle engine messages with specified payload statuses
     async fn handle_engine_msg(
         mut from_engine: mpsc::UnboundedReceiver<BeaconEngineMessage<BscPayloadTypes>>,
-        responses: EngineResponses,
+        mut responses: EngineResponses,
         provider: MockProvider,
     ) -> mpsc::UnboundedReceiver<ForkchoiceState> {
         let (fcu_tx, fcu_rx) = mpsc::unbounded_channel();
@@ -2033,6 +2067,10 @@ mod tests {
             while let Some(message) = from_engine.recv().await {
                 match message {
                     BeaconEngineMessage::NewPayload { payload, tx } => {
+                        if let Some((received, release)) = responses.new_payload_gate.take() {
+                            received.send(()).unwrap();
+                            release.await.unwrap();
+                        }
                         if responses.new_payload_local_fault {
                             let local_fault = payload.local_fault.as_ref().expect("request marker");
                             assert!(!local_fault.load(Ordering::Acquire));
