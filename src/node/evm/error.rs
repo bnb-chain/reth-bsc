@@ -111,6 +111,10 @@ pub enum BscBlockValidationError {
         extra_len: usize,
     },
 
+    /// Error when the attestation's source is not lower than its target.
+    #[error("invalid attestation, SourceNumber not lower than TargetNumber")]
+    InvalidAttestationSourceTargetOrder,
+
     /// Error when the attestation's target is invalid
     #[error("invalid attestation target: number {block_number}, hash {block_hash}")]
     InvalidAttestationTarget {

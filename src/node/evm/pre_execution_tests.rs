@@ -3,8 +3,30 @@
 #[cfg(test)]
 mod tests {
     use crate::consensus::parlia::vote::VoteAddress;
-    use crate::node::evm::pre_execution::{TURN_LENGTH_CACHE, VALIDATOR_CACHE};
+    use crate::node::evm::pre_execution::{
+        validate_attestation_source_target_order, TURN_LENGTH_CACHE, VALIDATOR_CACHE,
+    };
     use alloy_primitives::{Address, B256};
+
+    #[test]
+    fn attestation_source_must_be_lower_than_target() {
+        use crate::node::evm::error::BscBlockValidationError;
+
+        assert!(validate_attestation_source_target_order(99, 100).is_ok());
+
+        for (source, target) in [(99, 99), (99, 98)] {
+            let error = validate_attestation_source_target_order(source, target)
+                .expect_err("equal or reversed source/target must be rejected");
+            assert!(matches!(
+                error,
+                BscBlockValidationError::InvalidAttestationSourceTargetOrder
+            ));
+            assert_eq!(
+                error.to_string(),
+                "invalid attestation, SourceNumber not lower than TargetNumber"
+            );
+        }
+    }
 
     /// Multi-block `eth_simulateV1` parent resolution (regression for bnb-chain/reth#194).
     /// A simulated block must be resolvable by hash for the next block's parent lookup,
