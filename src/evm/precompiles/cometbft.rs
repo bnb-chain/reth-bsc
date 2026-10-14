@@ -11,7 +11,7 @@ use cometbft_light_client_verifier::{
     predicates::ProdPredicates,
     types::{Validator, ValidatorSet},
 };
-use cometbft_proto::types::v1::LightBlock as TmLightBlock;
+use cometbft_proto::{google::protobuf::Timestamp, types::v1::LightBlock as TmLightBlock};
 use prost12::Message;
 use revm::precompile::{
     u64_to_address, PrecompileHalt, PrecompileOutput, PrecompileResult, Precompile, PrecompileId,
@@ -138,6 +138,14 @@ fn cometbft_light_block_validation_run_inner(
     ))
 }
 
+/// The CometBFT/Go zero time (`0001-01-01T00:00:00Z`), which is `EPOCH - 62135596800` seconds.
+/// gogoproto's `nullable=false` stdtime fields decode an omitted value to exactly this, and it is
+/// the same sentinel used for absent votes, so normalising an absent timestamp to it reproduces
+/// go-bsc's decode result bit-for-bit.
+fn go_zero_timestamp() -> Timestamp {
+    Timestamp { seconds: -62_135_596_800, nanos: 0 }
+}
+
 type ConvertLightBlockResult = Result<LightBlock, PrecompileHalt>;
 fn convert_light_block_from_proto(light_block_proto: &TmLightBlock) -> ConvertLightBlockResult {
     // Both fields are optional in the protobuf definition, so any caller can omit them by
@@ -145,7 +153,26 @@ fn convert_light_block_from_proto(light_block_proto: &TmLightBlock) -> ConvertLi
     // unwrapping it.
     let signed_header_proto =
         light_block_proto.signed_header.as_ref().ok_or(BscPrecompileError::InvalidInput)?;
-    let signed_header = match SignedHeader::try_from(signed_header_proto.clone()) {
+
+    // go-bsc models `Header.time` (protobuf field 4) as a non-nullable `time.Time`
+    // (gogoproto `nullable=false, stdtime=true`), so an omitted field 4 decodes to Go's zero
+    // time and `Header.ValidateBasic` never rejects it. The pinned Greenfield Rust model has
+    // `time: Option<Timestamp>` and `Header::try_from` returns `missing_timestamp` when it is
+    // absent, which would make reth reject a light block that canonical geth accepts. Reproduce
+    // the gogoproto non-nullable semantics by normalising an absent timestamp to the Go/protobuf
+    // zero time before domain conversion.
+    let mut signed_header_proto = signed_header_proto.clone();
+    if let Some(header) = signed_header_proto.header.as_mut() {
+        if header.time.is_none() {
+            tracing::debug!(
+                target: "bsc::precompile::cometbft",
+                "normalising absent Header.time to protobuf zero time"
+            );
+            header.time = Some(go_zero_timestamp());
+        }
+    }
+
+    let signed_header = match SignedHeader::try_from(signed_header_proto) {
         Ok(sh) => sh.clone(),
         Err(_) => return Err(BscPrecompileError::InvalidInput.into()),
     };
@@ -486,6 +513,43 @@ mod tests {
 
     fn valid_light_block_input() -> Vec<u8> {
         hex::decode(VALID_LIGHT_BLOCK_INPUT).expect("fixture is valid hex")
+    }
+
+    /// SRC-1735: go-bsc models `Header.time` (protobuf field 4) as a non-nullable stdtime, so an
+    /// omitted field 4 decodes to the Go zero time and is accepted; the pinned Rust model made it
+    /// optional and rejected an absent value, splitting reth from canonical geth. A present
+    /// (even zero) timestamp was always accepted by both clients. The fixtures below are a
+    /// candidate/control pair that differ only in the presence of field 4.
+    #[test]
+    fn light_block_omitted_header_time_is_accepted_like_geth() {
+        // Control: field 4 present and set to the Go zero timestamp.
+        const PRESENT_ZERO: &str = "00000000000000000000000000000000000000000000000000000000000000b46d697373696e672d6865616465722d74696d65000000000000000000000000000000000000000002b4d60c3110707ff32330d32591740508d360c51f3189a1bfbd6cdf9048eab5b840345730f6410d1b1721fb3782e7755ed1169fdd42d1ebaa491b198a52e222c300000000000003e871717171717171717171717171717171717171717272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272720ae4030aae020a02080b12136d697373696e672d6865616465722d74696d651803220b088092b8c398feffffff012a0212004220b4d60c3110707ff32330d32591740508d360c51f3189a1bfbd6cdf9048eab5b84a20b4d60c3110707ff32330d32591740508d360c51f3189a1bfbd6cdf9048eab5b8522011111111111111111111111111111111111111111111111111111111111111115a202222222222222222222222222222222222222222222222222222222222222222622033333333333333333333333333333333333333333333333333333333333333337214e6c77a8b29079a7e84f741ac4c2b03e2547d80757a405555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555512b00108031a480a207727c0a9b5e83a6983bac4343a1df5fe6287017e46ad8f9038d5de3d32d68e611224080112204444444444444444444444444444444444444444444444444444444444444444226208021214e6c77a8b29079a7e84f741ac4c2b03e2547d80751a0608abe6cfaa062240de1f1d50cc13f36465be9091a1f1c08d13e3d22e19dffac224260fd0e3802c46d96a9f1023532dc62f69922c117932af21e5adac0d4a09fbeb4ef492fce637011290020a85010a14e6c77a8b29079a7e84f741ac4c2b03e2547d807512220a2040345730f6410d1b1721fb3782e7755ed1169fdd42d1ebaa491b198a52e222c318e8072a30727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272321471717171717171717171717171717171717171711285010a14e6c77a8b29079a7e84f741ac4c2b03e2547d807512220a2040345730f6410d1b1721fb3782e7755ed1169fdd42d1ebaa491b198a52e222c318e8072a3072727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727232147171717171717171717171717171717171717171";
+        // Candidate: identical light block with field 4 omitted on the wire.
+        const OMITTED: &str = "00000000000000000000000000000000000000000000000000000000000000b46d697373696e672d6865616465722d74696d65000000000000000000000000000000000000000002b4d60c3110707ff32330d32591740508d360c51f3189a1bfbd6cdf9048eab5b840345730f6410d1b1721fb3782e7755ed1169fdd42d1ebaa491b198a52e222c300000000000003e871717171717171717171717171717171717171717272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272720ad7030aa1020a02080b12136d697373696e672d6865616465722d74696d6518032a0212004220b4d60c3110707ff32330d32591740508d360c51f3189a1bfbd6cdf9048eab5b84a20b4d60c3110707ff32330d32591740508d360c51f3189a1bfbd6cdf9048eab5b8522011111111111111111111111111111111111111111111111111111111111111115a202222222222222222222222222222222222222222222222222222222222222222622033333333333333333333333333333333333333333333333333333333333333337214e6c77a8b29079a7e84f741ac4c2b03e2547d80757a405555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555512b00108031a480a207727c0a9b5e83a6983bac4343a1df5fe6287017e46ad8f9038d5de3d32d68e611224080112204444444444444444444444444444444444444444444444444444444444444444226208021214e6c77a8b29079a7e84f741ac4c2b03e2547d80751a0608abe6cfaa062240de1f1d50cc13f36465be9091a1f1c08d13e3d22e19dffac224260fd0e3802c46d96a9f1023532dc62f69922c117932af21e5adac0d4a09fbeb4ef492fce637011290020a85010a14e6c77a8b29079a7e84f741ac4c2b03e2547d807512220a2040345730f6410d1b1721fb3782e7755ed1169fdd42d1ebaa491b198a52e222c318e8072a30727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272321471717171717171717171717171717171717171711285010a14e6c77a8b29079a7e84f741ac4c2b03e2547d807512220a2040345730f6410d1b1721fb3782e7755ed1169fdd42d1ebaa491b198a52e222c318e8072a3072727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727232147171717171717171717171717171717171717171";
+
+        let present = hex::decode(PRESENT_ZERO).expect("control fixture is valid hex");
+        let omitted = hex::decode(OMITTED).expect("candidate fixture is valid hex");
+
+        // The candidate genuinely omits field 4; the control carries a present (zero) timestamp.
+        let (_, present_proto) =
+            decode_light_block_validation_input(&present, true).expect("control decodes");
+        assert!(present_proto.signed_header.as_ref().unwrap().header.as_ref().unwrap().time.is_some());
+        let (_, omitted_proto) =
+            decode_light_block_validation_input(&omitted, true).expect("candidate decodes");
+        assert!(omitted_proto.signed_header.as_ref().unwrap().header.as_ref().unwrap().time.is_none());
+
+        // Both convert, matching geth, on every fork wrapper.
+        assert!(convert_light_block_from_proto(&present_proto).is_ok());
+        assert!(convert_light_block_from_proto(&omitted_proto).is_ok());
+        let runs: [fn(&[u8], u64, u64) -> PrecompileResult; 3] = [
+            cometbft_light_block_validation_run_before_hertz,
+            cometbft_light_block_validation_run,
+            cometbft_light_block_validation_run_pasteur,
+        ];
+        for run in runs {
+            assert!(run(&present, 2_000_000, 0).unwrap().is_success());
+            assert!(run(&omitted, 2_000_000, 0).unwrap().is_success());
+        }
     }
 
     /// `signed_header` and `validator_set` are optional protobuf fields, so any caller can
