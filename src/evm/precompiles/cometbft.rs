@@ -1619,9 +1619,15 @@ mod tests {
     fn input_with_proposer(
         mutate: impl FnOnce(&mut cometbft_proto::types::v1::Validator),
     ) -> Vec<u8> {
+        input_with_proposer_from(&valid_light_block_input(), mutate)
+    }
+
+    fn input_with_proposer_from(
+        input: &[u8],
+        mutate: impl FnOnce(&mut cometbft_proto::types::v1::Validator),
+    ) -> Vec<u8> {
         // Go's schema has additional fields. Preserve the signed header and voting validators
         // verbatim, so changing only the separate proposer does not invalidate the fixture.
-        let input = valid_light_block_input();
         let split = 32 + u64::from_be_bytes(input[24..32].try_into().unwrap()) as usize;
         let light_block = map_proto_message(&input[split..], 2, |set| {
             map_proto_message(set, 2, |proposer| {
@@ -1633,6 +1639,75 @@ mod tests {
         let mut crafted = input[..split].to_vec();
         crafted.extend_from_slice(&light_block);
         crafted
+    }
+
+    #[test]
+    fn light_block_bridge_fields_proposer_and_power_cache_compose() {
+        use cometbft_proto::crypto::v1::public_key::Sum;
+        use prost12::encoding::{encode_key, encode_varint, WireType};
+
+        let golden: serde_json::Value =
+            serde_json::from_str(include_str!("testdata/cometbft_empty_bridge_fields.json"))
+                .unwrap();
+        let secp_key =
+            hex::decode("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+                .unwrap();
+        for vector in golden["vectors"].as_array().unwrap() {
+            let original = hex::decode(vector["input"].as_str().unwrap()).unwrap();
+            let expected = hex::decode(vector["go_output"].as_str().unwrap()).unwrap();
+            let split = 32 + u64::from_be_bytes(original[24..32].try_into().unwrap()) as usize;
+            for cache in [0, 1, 40, -1, i64::MIN, i64::MAX] {
+                let mut input = original[..split].to_vec();
+                input.extend(map_proto_message(&original[split..], 2, |set| {
+                    // Last scalar value wins in protobuf. Preserve all other fields verbatim.
+                    let mut set = set.to_vec();
+                    encode_key(3, WireType::Varint, &mut set);
+                    encode_varint(cache as u64, &mut set);
+                    set
+                }));
+                for valid_proposer in [true, false] {
+                    let input = input_with_proposer_from(&input, |proposer| {
+                        if valid_proposer {
+                            proposer.pub_key.as_mut().unwrap().sum =
+                                Some(Sum::Secp256k1(secp_key.clone()));
+                        } else {
+                            proposer.pub_key = None;
+                        }
+                    });
+                    for (fork, (run, per_byte_gas)) in cometbft_forks().into_iter().enumerate() {
+                        let gas = COMETBFT_LIGHT_BLOCK_VALIDATION_BASE
+                            + input.len() as u64 * per_byte_gas;
+                        let output = run(&input, gas, 17).unwrap();
+                        assert_eq!(
+                            output.is_success(),
+                            valid_proposer,
+                            "{} cache={cache} fork={fork}",
+                            vector["name"]
+                        );
+                        if valid_proposer {
+                            let mut expected = expected.clone();
+                            if fork == 0 {
+                                expected[0] = 0; // Pre-Hertz always reports an unchanged set.
+                            }
+                            assert_eq!(output.bytes.as_ref(), expected);
+                            assert_eq!(output.gas_used, gas);
+                        } else {
+                            assert_eq!(
+                                output.status,
+                                revm::precompile::PrecompileStatus::Halt(
+                                    BscPrecompileError::InvalidInput.into()
+                                )
+                            );
+                            assert!(output.bytes.is_empty());
+                        }
+                        assert_eq!(
+                            run(&input, gas - 1, 17).unwrap().status,
+                            revm::precompile::PrecompileStatus::Halt(PrecompileHalt::OutOfGas)
+                        );
+                    }
+                }
+            }
+        }
     }
 
     fn proposer_test_cases() -> Vec<(&'static str, Vec<u8>, bool)> {
