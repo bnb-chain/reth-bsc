@@ -487,8 +487,8 @@ where
             let forkchoice_engine = self.forkchoice_engine.clone();
             tokio::spawn(async move {
                 let result =
-                    super::mined::insert_then_update(engine_tx, executed_block, || async {
-                        forkchoice_engine.update_forkchoice(&header_for_fcu).await
+                    super::mined::insert_then_update(engine_tx, executed_block, |gate| async {
+                        forkchoice_engine.update_forkchoice_gated(&header_for_fcu, gate).await
                     })
                     .await;
                 match result {

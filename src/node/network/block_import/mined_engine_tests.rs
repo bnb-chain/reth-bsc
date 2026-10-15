@@ -97,7 +97,8 @@ async fn real_engine_discards_competing_mined_block_and_barrier_prevents_downloa
         let selected = AtomicBool::new(false);
         let result = tokio::time::timeout(
             Duration::from_secs(5),
-            insert_then_update(Some(tx.clone()), block, || async {
+            insert_then_update(Some(tx.clone()), block, |gate| async {
+                gate.await?;
                 selected.store(true, Ordering::SeqCst);
                 Ok(())
             }),
