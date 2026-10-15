@@ -59,6 +59,13 @@ pub struct MiningConfig {
     /// synchronous `state_root_with_updates` path when the global spawner has
     /// not been registered or returns `None`.
     pub use_sparse_trie_state_root: bool,
+    /// Allow sealing blocks while no peers are connected.
+    ///
+    /// The miner normally refuses to mine in isolation to avoid forking off a
+    /// side-chain that peers do not know about. Single-validator dev/CI chains
+    /// (e.g. `--chain local` with `--mining.dev`) have no peers by design, so this
+    /// flag lifts the gate there. Keep `false` in production.
+    pub allow_isolated: bool,
 }
 
 impl std::fmt::Debug for MiningConfig {
@@ -81,6 +88,7 @@ impl std::fmt::Debug for MiningConfig {
             .field("allowed_builders", &self.allowed_builders)
             .field("bid_block_enabled", &self.bid_block_enabled)
             .field("use_sparse_trie_state_root", &self.use_sparse_trie_state_root)
+            .field("allow_isolated", &self.allow_isolated)
             .finish()
     }
 }
@@ -124,6 +132,7 @@ impl Default for MiningConfig {
             allowed_builders: None, // No whitelist by default (allow all)
             bid_block_enabled: false, // BEP-675 BidBlock path off by default
             use_sparse_trie_state_root: false, // Opt-in for now (perf testing)
+            allow_isolated: false,
         }
     }
 }
@@ -257,6 +266,7 @@ impl MiningConfig {
                 bid_block_enabled: false,
                 greedy_merge: true,
                 use_sparse_trie_state_root: false,
+                allow_isolated: true,
             }
         } else {
             // Fallback to default if key generation fails
@@ -290,7 +300,7 @@ impl MiningConfig {
 
     /// Create a ready-to-use development mining configuration
     pub fn development() -> Self {
-        Self { enabled: true, ..Default::default() }.ensure_keys_available()
+        Self { enabled: true, allow_isolated: true, ..Default::default() }.ensure_keys_available()
     }
 
     /// Load configuration from environment variables
@@ -357,6 +367,11 @@ impl MiningConfig {
             .map(|v| v.to_lowercase() == "true")
             .unwrap_or(false);
 
+        let allow_isolated = std::env::var("BSC_MINING_ALLOW_ISOLATED")
+            .ok()
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false);
+
         let mut cfg = Self {
             enabled,
             private_key_hex,
@@ -375,6 +390,7 @@ impl MiningConfig {
             allowed_builders,
             bid_block_enabled,
             use_sparse_trie_state_root,
+            allow_isolated,
             ..Default::default()
         };
 
