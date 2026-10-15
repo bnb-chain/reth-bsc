@@ -1,21 +1,26 @@
 //! Credits to <https://github.com/bnb-chain/revm/blob/d66170e712460ae766fc26a063f106658ce33e9d/crates/precompile/src/cometbft.rs>
 use crate::evm::precompiles::{dedup::DuplicateTracker, error::BscPrecompileError};
 use alloy_primitives::Bytes;
-use cometbft::{block::signed_header::SignedHeader, validator::Set, vote::Power, PublicKey};
+use cometbft::{
+    block::signed_header::SignedHeader, crypto::signature, validator::Set, vote::Power, PublicKey,
+    Signature,
+};
 use cometbft_light_client::{
     predicates::VerificationPredicates,
     types::{LightBlock, TrustThreshold},
 };
 use cometbft_light_client_verifier::{
-    operations::voting_power::ProdVotingPowerCalculator,
+    operations::voting_power::ProvidedVotingPowerCalculator,
     predicates::ProdPredicates,
     types::{Validator, ValidatorSet},
 };
 use cometbft_proto::types::v1::LightBlock as TmLightBlock;
+use curve25519_dalek::{edwards::CompressedEdwardsY, EdwardsPoint, Scalar};
 use prost12::Message;
 use revm::precompile::{
     u64_to_address, PrecompileHalt, PrecompileOutput, PrecompileResult, Precompile, PrecompileId,
 };
+use sha2::{Digest, Sha512};
 use std::{borrow::{Cow, ToOwned}, string::String, vec::Vec};
 
 pub(crate) const COMETBFT_LIGHT_BLOCK_VALIDATION: Precompile =
@@ -232,7 +237,7 @@ impl ConsensusState {
         }
 
         let vp = ProdPredicates;
-        let voting_power_calculator = ProdVotingPowerCalculator::default();
+        let voting_power_calculator = ProvidedVotingPowerCalculator::<GoEd25519Verifier>::default();
         let trust_threshold_two_third = TrustThreshold::TWO_THIRDS;
         let trust_threshold_one_third = TrustThreshold::ONE_THIRD;
         if self.height + 1 == light_block.height().value() {
@@ -434,6 +439,63 @@ fn decode_consensus_state(
     }
 
     Ok(consensus_state)
+}
+
+/// Ed25519 verifier with the semantics of Go's `crypto/ed25519.Verify`, which geth-bsc reaches
+/// through greenfield-cometbft's `PubKey.VerifySignature`.
+///
+/// cometbft-rs' default verifier is `ed25519-consensus` (ZIP-215): it checks the cofactored
+/// equation `[8][S]B = [8]R + [8][k]A`, so it accepts a non-canonical `R` encoding or an `R`
+/// with a small-order component. Go checks the cofactorless equation and compares the canonical
+/// encoding of the recomputed `R` with the signature bytes, rejecting both. Either difference
+/// lets any caller make the precompile succeed on reth and fail on geth.
+#[derive(Clone, Copy, Debug, Default)]
+struct GoEd25519Verifier;
+
+impl signature::Verifier for GoEd25519Verifier {
+    fn verify(pubkey: PublicKey, msg: &[u8], sig: &Signature) -> Result<(), signature::Error> {
+        #[allow(unreachable_patterns)]
+        let pubkey: &[u8; 32] = match &pubkey {
+            PublicKey::Ed25519(pk) => {
+                pk.as_bytes().try_into().map_err(|_| signature::Error::MalformedPublicKey)?
+            }
+            _ => return Err(signature::Error::UnsupportedKeyType),
+        };
+        let sig: &[u8; 64] =
+            sig.as_bytes().try_into().map_err(|_| signature::Error::MalformedSignature)?;
+        if go_ed25519_verify(pubkey, msg, sig) {
+            Ok(())
+        } else {
+            Err(signature::Error::VerificationFailed)
+        }
+    }
+}
+
+/// Mirrors Go's `crypto/internal/fips140/ed25519.verifyWithDom` (pure Ed25519, no context).
+fn go_ed25519_verify(pubkey: &[u8; 32], msg: &[u8], sig: &[u8; 64]) -> bool {
+    // Go's `edwards25519.Point.SetBytes` accepts an unreduced y and x = 0 with the sign bit
+    // set, as `decompress` does.
+    let Some(a) = CompressedEdwardsY(*pubkey).decompress() else { return false };
+    if sig[63] & 0xe0 != 0 {
+        return false;
+    }
+    let r_bytes = &sig[..32];
+    let mut s_bytes = [0u8; 32];
+    s_bytes.copy_from_slice(&sig[32..]);
+    let Some(s) = Option::<Scalar>::from(Scalar::from_canonical_bytes(s_bytes)) else {
+        return false;
+    };
+    let k = Scalar::from_bytes_mod_order_wide(
+        &Sha512::new()
+            .chain_update(r_bytes)
+            .chain_update(pubkey)
+            .chain_update(msg)
+            .finalize()
+            .into(),
+    );
+    // Cofactorless: R' = [S]B - [k]A, compared by canonical encoding.
+    let r_prime = EdwardsPoint::vartime_double_scalar_mul_basepoint(&k, &-a, &s);
+    r_prime.compress().as_bytes() == r_bytes
 }
 
 /// Reject validator sets that repeat any identity field, mirroring bnb-chain/bsc's Pasteur
@@ -971,5 +1033,193 @@ mod tests {
         let hertz = cometbft_light_block_validation_run(&input, cost - 1, 0).unwrap();
         assert!(hertz.is_halt());
         assert_ne!(hertz.halt_reason(), Some(&PrecompileHalt::OutOfGas));
+    }
+
+    /// Identity point encoding: a small-order public key that Go's verifier accepts.
+    const IDENTITY: [u8; 32] = {
+        let mut b = [0u8; 32];
+        b[0] = 1;
+        b
+    };
+
+    /// `A = identity, S = 0` verifies against `R = identity` for any message. Go accepts only
+    /// the canonical encoding of `R`; setting the sign bit (`r_last_byte = 0x80`) gives the
+    /// non-canonical encoding that ZIP-215 also accepts.
+    fn identity_vote_signature(r_last_byte: u8) -> [u8; 64] {
+        let mut sig = [0u8; 64];
+        sig[..32].copy_from_slice(&IDENTITY);
+        sig[31] = r_last_byte;
+        sig
+    }
+
+    /// Rebuilds the fixture's light block around a single validator with the identity public
+    /// key, re-binding `validators_hash` and the commit block ID so only the signature matters.
+    fn identity_validator_light_block_input(sig: [u8; 64]) -> Vec<u8> {
+        use cometbft_proto::crypto::v1::{public_key::Sum, PublicKey as RawPublicKey};
+        use sha2::Sha256;
+
+        let input = valid_light_block_input();
+        let cs_length = u64::from_be_bytes(
+            input[(CONSENSUS_STATE_LENGTH_BYTES_LENGTH - UINT64_TYPE_LENGTH) as usize..
+                CONSENSUS_STATE_LENGTH_BYTES_LENGTH as usize]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let mut light_block = TmLightBlock::decode(
+            &input[CONSENSUS_STATE_LENGTH_BYTES_LENGTH as usize + cs_length..],
+        )
+        .expect("fixture light block decodes");
+
+        let address = Sha256::digest(IDENTITY)[..20].to_vec();
+        let mut validator_set = light_block.validator_set.take().unwrap();
+        let mut validator = validator_set.validators[0].clone();
+        validator.address = address.clone();
+        validator.pub_key = Some(RawPublicKey { sum: Some(Sum::Ed25519(IDENTITY.to_vec())) });
+        validator.voting_power = 1_000;
+        validator.proposer_priority = 0;
+        validator_set.validators = vec![validator.clone()];
+        validator_set.proposer = Some(validator.clone());
+        validator_set.total_voting_power = 1_000;
+        let validators_hash =
+            Set::try_from(validator_set.clone()).expect("validator set").hash().as_bytes().to_vec();
+
+        let mut signed_header = light_block.signed_header.take().unwrap();
+        let mut header = signed_header.header.take().unwrap();
+        header.validators_hash = validators_hash.clone();
+        header.next_validators_hash = validators_hash.clone();
+        let header_hash = cometbft::block::Header::try_from(header.clone())
+            .expect("header")
+            .hash()
+            .as_bytes()
+            .to_vec();
+
+        let mut commit = signed_header.commit.take().unwrap();
+        commit.block_id.as_mut().unwrap().hash = header_hash;
+        let mut commit_sig = commit.signatures[0].clone();
+        commit_sig.validator_address = address;
+        commit_sig.signature = sig.to_vec();
+        commit.signatures = vec![commit_sig];
+
+        let chain_id = header.chain_id.clone();
+        let height = header.height as u64;
+        signed_header.header = Some(header);
+        signed_header.commit = Some(commit);
+        light_block.signed_header = Some(signed_header);
+        light_block.validator_set = Some(validator_set);
+
+        // Trusted state one block below, so the adjacent (`height + 1`) path is taken.
+        let mut cs = vec![0u8; CHAIN_ID_LENGTH as usize];
+        cs[..chain_id.len()].copy_from_slice(chain_id.as_bytes());
+        cs.extend_from_slice(&(height - 1).to_be_bytes());
+        cs.extend_from_slice(&validators_hash);
+        cs.extend_from_slice(&IDENTITY);
+        cs.extend_from_slice(&1_000u64.to_be_bytes());
+        cs.extend_from_slice(&validator.relayer_address);
+        cs.extend_from_slice(&validator.bls_key);
+
+        let mut crafted = vec![0u8; CONSENSUS_STATE_LENGTH_BYTES_LENGTH as usize];
+        crafted[24..32].copy_from_slice(&(cs.len() as u64).to_be_bytes());
+        crafted.extend_from_slice(&cs);
+        crafted.extend_from_slice(&light_block.encode_to_vec());
+        crafted
+    }
+
+    /// SRC-2276: geth-bsc accepts the canonical-`R` control and rejects the same vote with a
+    /// non-canonical `R`. reth used to accept both, so a contract branching on 0x67 executed
+    /// differently on the two clients and reth rejected geth's block.
+    #[test]
+    fn non_canonical_r_vote_is_rejected_like_geth() {
+        type Run = fn(&[u8], u64, u64) -> PrecompileResult;
+        let runs: [Run; 3] = [
+            cometbft_light_block_validation_run_before_hertz,
+            cometbft_light_block_validation_run,
+            cometbft_light_block_validation_run_pasteur,
+        ];
+        for run in runs {
+            let control = identity_validator_light_block_input(identity_vote_signature(0x00));
+            let output = run(&control, 10_000_000, 0).unwrap();
+            assert!(!output.is_halt(), "canonical-R control must verify, as on geth");
+
+            let forged = identity_validator_light_block_input(identity_vote_signature(0x80));
+            let output = run(&forged, 10_000_000, 0).unwrap();
+            let expected: PrecompileHalt = BscPrecompileError::CometBftApplyBlockFailed.into();
+            assert_eq!(
+                output.halt_reason(),
+                Some(&expected),
+                "non-canonical R must fail verification, as on geth"
+            );
+        }
+    }
+
+    /// Signs `msg` as Go/RFC 8032 would, then adds `torsion` to `R` (recomputing `k` and `S`
+    /// over the modified `R`, so only the cofactor separates the two verifiers).
+    fn sign_with_torsion(
+        secret: Scalar,
+        nonce: Scalar,
+        torsion: EdwardsPoint,
+        msg: &[u8],
+    ) -> ([u8; 32], [u8; 64]) {
+        use curve25519_dalek::constants::ED25519_BASEPOINT_POINT;
+
+        let pubkey = (ED25519_BASEPOINT_POINT * secret).compress().to_bytes();
+        let r = (ED25519_BASEPOINT_POINT * nonce + torsion).compress().to_bytes();
+        let k = Scalar::from_bytes_mod_order_wide(
+            &Sha512::new().chain_update(r).chain_update(pubkey).chain_update(msg).finalize().into(),
+        );
+        let s = nonce + k * secret;
+        let mut sig = [0u8; 64];
+        sig[..32].copy_from_slice(&r);
+        sig[32..].copy_from_slice(s.as_bytes());
+        (pubkey, sig)
+    }
+
+    #[test]
+    fn go_ed25519_verify_matches_go_semantics() {
+        use cometbft::crypto::{
+            default::signature::Verifier as Zip215Verifier, signature::Verifier,
+        };
+        use curve25519_dalek::constants::EIGHT_TORSION;
+
+        let msg = b"src-2276";
+        let zip215 = |pubkey: &[u8; 32], sig: &[u8; 64]| {
+            let pk = PublicKey::from_raw_ed25519(pubkey).unwrap();
+            Zip215Verifier::verify(pk, msg, &Signature::new(sig).unwrap().unwrap()).is_ok()
+        };
+        let go = |pubkey: &[u8; 32], sig: &[u8; 64]| {
+            let pk = PublicKey::from_raw_ed25519(pubkey).unwrap();
+            GoEd25519Verifier::verify(pk, msg, &Signature::new(sig).unwrap().unwrap()).is_ok()
+        };
+
+        // An honest signature verifies under both.
+        let (pubkey, sig) =
+            sign_with_torsion(Scalar::from(7u64), Scalar::from(11u64), Default::default(), msg);
+        assert!(go(&pubkey, &sig) && zip215(&pubkey, &sig));
+
+        // Reporter's vectors: small-order A with canonical R is fine for Go; non-canonical R is
+        // not.
+        assert!(go(&IDENTITY, &identity_vote_signature(0x00)));
+        assert!(zip215(&IDENTITY, &identity_vote_signature(0x80)));
+        assert!(!go(&IDENTITY, &identity_vote_signature(0x80)));
+
+        // A canonical R with a small-order component under an ordinary key: same divergence,
+        // no exotic encoding needed.
+        for torsion in &EIGHT_TORSION[1..] {
+            let (pubkey, sig) =
+                sign_with_torsion(Scalar::from(7u64), Scalar::from(11u64), *torsion, msg);
+            assert!(zip215(&pubkey, &sig));
+            assert!(!go(&pubkey, &sig));
+        }
+
+        // S must be canonical (S + L is rejected).
+        let (pubkey, mut sig) =
+            sign_with_torsion(Scalar::from(7u64), Scalar::from(11u64), Default::default(), msg);
+        let l = hex!("edd3f55c1a631258d69cf7a2def9de1400000000000000000000000000000010");
+        let mut carry = 0u16;
+        for i in 0..32 {
+            let v = sig[32 + i] as u16 + l[i] as u16 + carry;
+            sig[32 + i] = v as u8;
+            carry = v >> 8;
+        }
+        assert!(!go(&pubkey, &sig));
     }
 }

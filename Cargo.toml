@@ -160,6 +160,7 @@ scrypt = "0.11"
 # precompiles deps
 bls_on_arkworks = "0.3.0"
 blst = "0.3.15"
+curve25519-dalek = "4"
 
 cometbft = { git = "https://github.com/bnb-chain/greenfield-cometbft-rs.git", rev = "1282547" }
 cometbft-light-client-verifier = { git = "https://github.com/bnb-chain/greenfield-cometbft-rs.git", rev = "1282547" }
