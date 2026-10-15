@@ -21,7 +21,10 @@ use cometbft_light_client_verifier::{
     types::{Validator, ValidatorSet},
 };
 use cometbft_proto::{
-    types::v1::{BlockId as RawBlockId, LightBlock as TmLightBlock},
+    types::v1::{
+        BlockId as RawBlockId, LightBlock as TmLightBlock, SimpleValidator as TmSimpleValidator,
+        ValidatorSet as TmValidatorSet,
+    },
     version::v1::Consensus as RawConsensusVersion,
     Protobuf,
 };
@@ -125,6 +128,13 @@ fn cometbft_light_block_validation_run_inner(
         Ok(v) => v,
         Err(h) => return Ok(PrecompileOutput::halt(h, reservoir)),
     };
+    // Hash the validator set as supplied on the wire; the converted set cannot reproduce it.
+    let validators_hash = match tm_light_block.validator_set.as_ref() {
+        Some(validator_set) => validator_set_hash(validator_set),
+        None => {
+            return Ok(PrecompileOutput::halt(BscPrecompileError::InvalidInput.into(), reservoir))
+        }
+    };
 
     // From Pasteur, reject duplicate identities in the incoming light block's validator set
     // (the trusted consensus state set is checked during decoding above).
@@ -135,7 +145,7 @@ fn cometbft_light_block_validation_run_inner(
     }
 
     let mut validator_set_changed =
-        match consensus_state.apply_light_block(&light_block, &randao_mix) {
+        match consensus_state.apply_light_block(&light_block, &randao_mix, validators_hash) {
             Ok(v) => v,
             Err(h) => return Ok(PrecompileOutput::halt(h, reservoir)),
         };
@@ -177,6 +187,28 @@ fn convert_light_block_from_proto(light_block_proto: &TmLightBlock) -> ConvertLi
     let next_validator_set = validator_set.clone();
     let peer_id = cometbft::node::Id::new([0u8; 20]);
     Ok(LightBlock::new(signed_header, validator_set, next_validator_set, peer_id))
+}
+
+/// Go BSC's `ValidatorSet.Hash`: a merkle root over each validator's `SimpleValidator`
+/// encoding, in wire order, where an empty BLS key or relayer address is omitted. The converted
+/// `Set` cannot reproduce this: cometbft-rs sorts it and always encodes 48 / 20-byte fields.
+fn validator_set_hash(validator_set: &TmValidatorSet) -> Hash {
+    let validators: Vec<Vec<u8>> = validator_set
+        .validators
+        .iter()
+        .map(|validator| {
+            TmSimpleValidator {
+                pub_key: validator.pub_key.clone(),
+                voting_power: validator.voting_power,
+                bls_key: validator.bls_key.clone(),
+                relayer_address: validator.relayer_address.clone(),
+            }
+            .encode_to_vec()
+        })
+        .collect();
+    Hash::Sha256(merkle::simple_hash_from_byte_vectors::<cometbft::crypto::default::Sha256>(
+        &validators,
+    ))
 }
 
 // The pinned Rust CometBFT protobuf omits Greenfield's header field 15. Go BSC includes that
@@ -297,18 +329,15 @@ struct ConsensusState {
 }
 
 /// Bind the supplied validator set to the header and the header to the signed commit.
+/// `validators_hash` is `validator_set_hash` of the validator set as supplied on the wire.
 fn validate_light_block_bindings(
     light_block: &LightBlock,
     randao_mix: &[u8],
+    validators_hash: Hash,
 ) -> Result<(), PrecompileHalt> {
     // These are the hash checks in Go BSC's LightBlock.ValidateBasic. Signature and
     // voting-power checks alone do not authenticate the header or the validator metadata.
-    if ProdPredicates
-        .validator_sets_match(
-            &light_block.validators,
-            light_block.signed_header.header().validators_hash,
-        )
-        .is_err() ||
+    if validators_hash != light_block.signed_header.header().validators_hash ||
         header_hash_with_randao_mix(light_block.signed_header.header(), randao_mix) !=
             light_block.signed_header.commit.block_id.hash
     {
@@ -331,6 +360,7 @@ impl ConsensusState {
         &mut self,
         light_block: &LightBlock,
         randao_mix: &[u8],
+        validators_hash: Hash,
     ) -> Result<bool, PrecompileHalt> {
         if light_block.height().value() <= self.height {
             return Err(BscPrecompileError::InvalidInput.into());
@@ -340,7 +370,7 @@ impl ConsensusState {
         }
 
         // Required for both adjacent and skipping updates, before any state is changed.
-        validate_light_block_bindings(light_block, randao_mix)?;
+        validate_light_block_bindings(light_block, randao_mix, validators_hash)?;
 
         let vp = ProdPredicates;
         let voting_power_calculator = ProvidedVotingPowerCalculator::<GoEd25519Verifier>::default();
@@ -657,6 +687,24 @@ mod tests {
         hex::decode(VALID_LIGHT_BLOCK_INPUT).expect("fixture is valid hex")
     }
 
+    /// The header binds the validator set in wire order. cometbft-rs sorts the converted set,
+    /// so its hash differs for a set go-bsc accepts; the binding must hash the wire set.
+    #[test]
+    fn validator_set_binding_uses_wire_order() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("testdata/cometbft_wire_order.json")).unwrap();
+        let input = hex::decode(fixture["input"].as_str().unwrap()).unwrap();
+        let (_, proto, _) = decode_light_block_validation_input(&input, false).unwrap();
+        let block = convert_light_block_from_proto(&proto).unwrap();
+        let header_hash = block.signed_header.header().validators_hash;
+
+        assert_eq!(validator_set_hash(proto.validator_set.as_ref().unwrap()), header_hash);
+        assert_ne!(block.validators.hash(), header_hash);
+        assert!(cometbft_light_block_validation_run_pasteur(&input, 10_000_000, 0)
+            .unwrap()
+            .is_success());
+    }
+
     fn fixture_split(input: &[u8]) -> usize {
         let cs_length = u64::from_be_bytes(input[24..32].try_into().unwrap()) as usize;
         CONSENSUS_STATE_LENGTH_BYTES_LENGTH as usize + cs_length
@@ -699,9 +747,8 @@ mod tests {
         let (_, proto, randao_mix) = decode_light_block_validation_input(&input, false).unwrap();
         let block = convert_light_block_from_proto(&proto).unwrap();
         let predicates = ProdPredicates;
-        assert!(predicates
-            .validator_sets_match(&block.validators, block.signed_header.header().validators_hash)
-            .is_err());
+        let validators_hash = validator_set_hash(proto.validator_set.as_ref().unwrap());
+        assert_ne!(validators_hash, block.signed_header.header().validators_hash);
         assert_eq!(
             header_hash_with_randao_mix(block.signed_header.header(), &randao_mix),
             block.signed_header.commit.block_id.hash,
@@ -721,7 +768,7 @@ mod tests {
         let (mut trusted, _, _) = decode_light_block_validation_input(&input, false).unwrap();
         trusted.height = 0;
         trusted.validators = block.validators.clone();
-        assert!(trusted.apply_light_block(&block, &randao_mix).is_err());
+        assert!(trusted.apply_light_block(&block, &randao_mix, validators_hash).is_err());
     }
 
     #[test]
@@ -733,9 +780,10 @@ mod tests {
         let (_, proto, randao_mix) = decode_light_block_validation_input(&input, false).unwrap();
         let block = convert_light_block_from_proto(&proto).unwrap();
         let predicates = ProdPredicates;
-        assert!(predicates
-            .validator_sets_match(&block.validators, block.signed_header.header().validators_hash)
-            .is_ok());
+        assert_eq!(
+            validator_set_hash(proto.validator_set.as_ref().unwrap()),
+            block.signed_header.header().validators_hash,
+        );
         assert_ne!(
             header_hash_with_randao_mix(block.signed_header.header(), &randao_mix),
             block.signed_header.commit.block_id.hash,
@@ -891,7 +939,7 @@ mod tests {
                 block.signed_header.commit.block_id.hash,
             );
             assert_eq!(
-                validate_light_block_bindings(&block, &randao_mix),
+                validate_light_block_bindings(&block, &randao_mix, block.validators.hash()),
                 Err(BscPrecompileError::CometBftApplyBlockFailed.into()),
             );
         }
@@ -916,7 +964,7 @@ mod tests {
             );
             assert_ne!(block.validators.hash(), block.signed_header.header.validators_hash);
             assert_eq!(
-                validate_light_block_bindings(&block, &randao_mix),
+                validate_light_block_bindings(&block, &randao_mix, block.validators.hash()),
                 Err(BscPrecompileError::CometBftApplyBlockFailed.into()),
             );
         }
@@ -939,7 +987,7 @@ mod tests {
                 state.height = trusted_height;
                 let before = state.encode().unwrap();
                 assert_eq!(
-                    state.apply_light_block(block, &randao_mix),
+                    state.apply_light_block(block, &randao_mix, block.validators.hash()),
                     Err(BscPrecompileError::CometBftApplyBlockFailed.into()),
                 );
                 assert_eq!(state.encode().unwrap(), before);
@@ -950,11 +998,12 @@ mod tests {
     #[test]
     fn matching_bindings_still_require_commit_signatures() {
         let (block, randao_mix) = unsigned_light_block();
-        assert!(validate_light_block_bindings(&block, &randao_mix).is_ok());
+        let validators_hash = block.validators.hash();
+        assert!(validate_light_block_bindings(&block, &randao_mix, validators_hash).is_ok());
         let (mut state, _, _) =
             decode_light_block_validation_input(&valid_light_block_input(), true).unwrap();
         let before = state.encode().unwrap();
-        assert!(state.apply_light_block(&block, &randao_mix).is_err());
+        assert!(state.apply_light_block(&block, &randao_mix, validators_hash).is_err());
         assert_eq!(state.encode().unwrap(), before);
     }
 
@@ -1314,6 +1363,7 @@ mod tests {
             match cs.apply_light_block(
                 &light_block,
                 &decode_randao_mix(light_block_bytes.as_ref()).unwrap(),
+                validator_set_hash(light_block_pb.validator_set.as_ref().unwrap()),
             ) {
                 Ok(validator_set_changed) => {
                     assert_eq!(validator_set_changed, expected_validator_set_changed);
@@ -1344,6 +1394,7 @@ mod tests {
             match cs.apply_light_block(
                 &light_block,
                 &decode_randao_mix(light_block_bytes.as_ref()).unwrap(),
+                validator_set_hash(light_block_pb.validator_set.as_ref().unwrap()),
             ) {
                 Ok(validator_set_changed) => {
                     assert_eq!(validator_set_changed, expected_validator_set_changed);
