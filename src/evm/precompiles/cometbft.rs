@@ -221,10 +221,17 @@ fn convert_light_block_from_proto(light_block_proto: &TmLightBlock) -> ConvertLi
 
     let validator_set_proto =
         light_block_proto.validator_set.as_ref().ok_or(BscPrecompileError::InvalidInput)?;
-    // Go's ValidatorSetFromProto requires a proposer, even though protobuf makes it optional.
-    validator_set_proto.proposer.as_ref().ok_or(BscPrecompileError::InvalidInput)?;
+    // Validate the proposer like Go's ValidatorFromProto + Validator.ValidateBasic, including
+    // secp256k1 keys that the Rust validator conversion does not support.
+    validate_proto_proposer(
+        validator_set_proto.proposer.as_ref().ok_or(BscPrecompileError::InvalidInput)?,
+    )?;
 
     let mut validator_set_proto = validator_set_proto.clone();
+    // Only the validators participate in hashing, quorum verification and consensus-state
+    // encoding below. Do not convert the already validated, unused proposer to Rust's stricter
+    // key/address types. This does not remove the signed header's proposer address.
+    validator_set_proto.proposer = None;
     // Go ignores the untrusted cache and recomputes the total from the validators. Set::try_from
     // already computes and bounds that sum; zero disables only its cache-equality check.
     validator_set_proto.total_voting_power = 0;
@@ -246,6 +253,27 @@ fn convert_light_block_from_proto(light_block_proto: &TmLightBlock) -> ConvertLi
     Ok((LightBlock::new(signed_header, validator_set, next_validator_set, peer_id), validators))
 }
 
+/// Match Go's structural checks for the separate validator-set proposer. In particular,
+/// PubKeyFromProto checks key type/length, not curve-point validity or address/key equality.
+fn validate_proto_proposer(
+    proposer: &cometbft_proto::types::v1::Validator,
+) -> Result<(), PrecompileHalt> {
+    use cometbft_proto::crypto::v1::public_key::Sum;
+
+    let valid_key = match proposer.pub_key.as_ref().and_then(|key| key.sum.as_ref()) {
+        Some(Sum::Ed25519(key)) => key.len() == 32,
+        Some(Sum::Secp256k1(key)) => key.len() == 33,
+        None => false,
+    };
+    if !valid_key || proposer.address.len() != 20 || proposer.voting_power < 0 ||
+        !matches!(proposer.bls_key.len(), 0 | 48) ||
+        !matches!(proposer.relayer_address.len(), 0 | 20)
+    {
+        return Err(BscPrecompileError::InvalidInput.into());
+    }
+    Ok(())
+}
+
 /// go-bsc's `Validator.ValidateBasic` accepts an empty relayer BLS key or relayer address as
 /// "unset", but the cometbft-rs conversion only accepts exactly 48 / 20 bytes. Zero-fill empty
 /// fields, which is how go-bsc stores them in the encoded consensus state (fixed-width `copy`),
@@ -265,8 +293,7 @@ fn fill_unset_bridge_fields(validator_set: &mut TmValidatorSet) {
         }
     };
     validator_set.validators.iter_mut().for_each(fill);
-    // The proposer is converted separately and must stay equal to its entry in the set.
-    validator_set.proposer.iter_mut().for_each(fill);
+    // The proposer has already been validated separately and removed before conversion.
 }
 
 /// Go BSC's `ValidatorSet.Hash`: a merkle root over each validator's `SimpleValidator`
@@ -1560,6 +1587,174 @@ mod tests {
                 COMETBFT_LIGHT_BLOCK_VALIDATE_PER_BYTE_GAS,
             ),
         ]
+    }
+
+    // Rewrite one length-delimited field while preserving all other protobuf bytes.
+    fn map_proto_message(input: &[u8], field: u32, map: impl FnOnce(&[u8]) -> Vec<u8>) -> Vec<u8> {
+        use prost12::encoding::{
+            decode_key, decode_varint, encode_key, encode_varint, skip_field, DecodeContext,
+            WireType,
+        };
+
+        let mut remaining = input;
+        while !remaining.is_empty() {
+            let offset = input.len() - remaining.len();
+            let (tag, wire_type) = decode_key(&mut remaining).unwrap();
+            if tag == field {
+                assert_eq!(wire_type, WireType::LengthDelimited);
+                let len = decode_varint(&mut remaining).unwrap() as usize;
+                let replacement = map(&remaining[..len]);
+                let mut output = input[..offset].to_vec();
+                encode_key(tag, wire_type, &mut output);
+                encode_varint(replacement.len() as u64, &mut output);
+                output.extend_from_slice(&replacement);
+                output.extend_from_slice(&remaining[len..]);
+                return output;
+            }
+            skip_field(wire_type, tag, &mut remaining, DecodeContext::default()).unwrap();
+        }
+        panic!("fixture is missing protobuf field {field}");
+    }
+
+    fn input_with_proposer(
+        mutate: impl FnOnce(&mut cometbft_proto::types::v1::Validator),
+    ) -> Vec<u8> {
+        // Go's schema has additional fields. Preserve the signed header and voting validators
+        // verbatim, so changing only the separate proposer does not invalidate the fixture.
+        let input = valid_light_block_input();
+        let split = 32 + u64::from_be_bytes(input[24..32].try_into().unwrap()) as usize;
+        let light_block = map_proto_message(&input[split..], 2, |set| {
+            map_proto_message(set, 2, |proposer| {
+                let mut proposer = cometbft_proto::types::v1::Validator::decode(proposer).unwrap();
+                mutate(&mut proposer);
+                proposer.encode_to_vec()
+            })
+        });
+        let mut crafted = input[..split].to_vec();
+        crafted.extend_from_slice(&light_block);
+        crafted
+    }
+
+    fn proposer_test_cases() -> Vec<(&'static str, Vec<u8>, bool)> {
+        use cometbft_proto::{crypto::v1::public_key::Sum, types::v1::Validator};
+
+        let mut cases = vec![("control", valid_light_block_input(), true)];
+        // The secp256k1 generator is a valid compressed public key. Go also accepts any
+        // 33-byte encoding here: the proposer is structurally checked, never used to verify.
+        for (label, key) in [
+            ("ed25519", Sum::Ed25519(vec![0; 32])),
+            (
+                "secp256k1",
+                Sum::Secp256k1(
+                    hex::decode(
+                        "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+                    )
+                    .unwrap(),
+                ),
+            ),
+            ("secp256k1_non_point", Sum::Secp256k1(vec![0; 33])),
+        ] {
+            cases.push((
+                label,
+                input_with_proposer(|proposer| {
+                    proposer.pub_key.as_mut().unwrap().sum = Some(key);
+                }),
+                true,
+            ));
+        }
+
+        type Mutation = fn(&mut Validator);
+        for (label, mutate, accepted) in [
+            ("missing_key", (|p| p.pub_key = None) as Mutation, false),
+            (
+                "missing_key_type",
+                |p| p.pub_key.as_mut().unwrap().sum = None,
+                false,
+            ),
+            (
+                "ed25519_empty",
+                |p| p.pub_key.as_mut().unwrap().sum = Some(Sum::Ed25519(vec![])),
+                false,
+            ),
+            (
+                "ed25519_short",
+                |p| p.pub_key.as_mut().unwrap().sum = Some(Sum::Ed25519(vec![0; 31])),
+                false,
+            ),
+            (
+                "ed25519_long",
+                |p| p.pub_key.as_mut().unwrap().sum = Some(Sum::Ed25519(vec![0; 33])),
+                false,
+            ),
+            (
+                "secp256k1_empty",
+                |p| p.pub_key.as_mut().unwrap().sum = Some(Sum::Secp256k1(vec![])),
+                false,
+            ),
+            (
+                "secp256k1_short",
+                |p| p.pub_key.as_mut().unwrap().sum = Some(Sum::Secp256k1(vec![0; 32])),
+                false,
+            ),
+            (
+                "secp256k1_long",
+                |p| p.pub_key.as_mut().unwrap().sum = Some(Sum::Secp256k1(vec![0; 34])),
+                false,
+            ),
+            ("address_empty", |p| p.address.clear(), false),
+            ("address_short", |p| p.address = vec![0; 19], false),
+            ("address_long", |p| p.address = vec![0; 21], false),
+            ("address_unrelated", |p| p.address = vec![0; 20], true),
+            ("power_negative", |p| p.voting_power = -1, false),
+            ("power_zero", |p| p.voting_power = 0, true),
+            ("power_max", |p| p.voting_power = i64::MAX, true),
+            ("priority_min", |p| p.proposer_priority = i64::MIN, true),
+            ("priority_max", |p| p.proposer_priority = i64::MAX, true),
+            ("bls_empty", |p| p.bls_key.clear(), true),
+            ("bls_short", |p| p.bls_key = vec![0; 47], false),
+            ("bls_long", |p| p.bls_key = vec![0; 49], false),
+            ("relayer_empty", |p| p.relayer_address.clear(), true),
+            ("relayer_short", |p| p.relayer_address = vec![0; 19], false),
+            ("relayer_long", |p| p.relayer_address = vec![0; 21], false),
+        ] {
+            cases.push((label, input_with_proposer(mutate), accepted));
+        }
+        cases
+    }
+
+    #[test]
+    fn light_block_proposer_matches_go_validation() {
+        for (label, input, accepted) in proposer_test_cases() {
+            for (run, per_byte_gas) in cometbft_forks() {
+                let gas = COMETBFT_LIGHT_BLOCK_VALIDATION_BASE + input.len() as u64 * per_byte_gas;
+                let output = run(&input, gas, 17).unwrap();
+                assert_eq!(
+                    output.is_success(),
+                    accepted,
+                    "{label}, per_byte_gas={per_byte_gas}"
+                );
+                assert_eq!(output.reservoir, 17);
+                if accepted {
+                    let control = run(&valid_light_block_input(), 1_000_000, 17).unwrap();
+                    assert_eq!(output.bytes, control.bytes, "{label}");
+                    assert_eq!(output.gas_used, gas, "{label}");
+                } else {
+                    assert_eq!(
+                        output.status,
+                        revm::precompile::PrecompileStatus::Halt(
+                            BscPrecompileError::InvalidInput.into()
+                        ),
+                        "{label}",
+                    );
+                    assert!(output.bytes.is_empty(), "{label}");
+                }
+                assert_eq!(
+                    run(&input, gas - 1, 17).unwrap().status,
+                    revm::precompile::PrecompileStatus::Halt(PrecompileHalt::OutOfGas),
+                    "{label}",
+                );
+            }
+        }
     }
 
     #[test]
