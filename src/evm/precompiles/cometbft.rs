@@ -413,7 +413,10 @@ fn decode_consensus_state(
             Some(pk) => pk,
             None => return Err(BscPrecompileError::InvalidInput.into()),
         };
-        let vp = Power::from(voting_power as u32);
+        let vp = match Power::try_from(voting_power) {
+            Ok(power) => power,
+            Err(_) => return Err(BscPrecompileError::InvalidInput.into()),
+        };
         let validator_info = Validator::new_with_bls_and_relayer(
             pk,
             vp,
@@ -971,5 +974,49 @@ mod tests {
         let hertz = cometbft_light_block_validation_run(&input, cost - 1, 0).unwrap();
         assert!(hertz.is_halt());
         assert_ne!(hertz.halt_reason(), Some(&PrecompileHalt::OutOfGas));
+    }
+
+    #[test]
+    fn trusted_voting_power_uses_full_64_bit_value_for_overlap() {
+        // The light block comes from Go BSC's lightclient_test fixture. Its commit is valid,
+        // but only trusted validator B signs. Vary only A's trusted voting power.
+        let original = include_bytes!("testdata/cometbft_trust_overlap.bin");
+        let power_offset = (CONSENSUS_STATE_LENGTH_BYTES_LENGTH +
+            CHAIN_ID_LENGTH +
+            HEIGHT_LENGTH +
+            VALIDATOR_SET_HASH_LENGTH +
+            VALIDATOR_PUBKEY_LENGTH) as usize;
+
+        for (a_power, should_accept) in [
+            (0, true),
+            (1, true),
+            (2, false),
+            (u32::MAX as u64, false),
+            (u32::MAX as u64 + 1, false),
+        ] {
+            let mut input = original.to_vec();
+            input[power_offset..power_offset + VALIDATOR_VOTING_POWER_LENGTH as usize]
+                .copy_from_slice(&a_power.to_be_bytes());
+
+            let cs_length = u64::from_be_bytes(input[24..32].try_into().unwrap()) as usize;
+            let cs = decode_consensus_state(&Bytes::from(input[32..32 + cs_length].to_vec()), true)
+                .expect("valid trusted consensus state");
+            let decoded_a = cs
+                .validators
+                .validators()
+                .iter()
+                .find(|validator| validator.pub_key.to_bytes() == [0x42; 32])
+                .expect("trusted validator A");
+            assert_eq!(decoded_a.power(), a_power);
+
+            for run in [
+                cometbft_light_block_validation_run_before_hertz,
+                cometbft_light_block_validation_run,
+                cometbft_light_block_validation_run_pasteur,
+            ] {
+                let output = run(&input, 1_000_000, 0).expect("nonfatal precompile result");
+                assert_eq!(output.is_success(), should_accept, "A power: {a_power}");
+            }
+        }
     }
 }
