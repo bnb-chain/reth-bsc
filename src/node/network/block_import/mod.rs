@@ -17,6 +17,7 @@ use crate::node::network::BscNewBlock;
 
 pub(crate) mod fork_recover;
 pub mod handle;
+mod mined;
 pub mod service;
 
 const MAX_NEW_BLOCK_HASHES: usize = 1024;

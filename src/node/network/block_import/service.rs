@@ -19,7 +19,6 @@ use parking_lot::RwLock;
 use reth::consensus::HeaderValidator;
 use reth::network::cache::LruCache;
 use reth_engine_primitives::{ConsensusEngineHandle, EngineTypes};
-use reth_engine_tree::engine::EngineApiRequest;
 use reth_eth_wire::{BlockHashNumber, GetBlockHeaders, NewBlock};
 use reth_eth_wire_types::broadcast::NewBlockHashes;
 use reth_network::{
@@ -480,76 +479,32 @@ where
             .to_network
             .send(BlockImportEvent::Announcement(BlockValidation::ValidBlock { block: block_msg }));
 
-        // Insert the executed block into the engine tree, then update fork choice.
-        //
-        // Ordering guarantee: InsertExecutedBlock MUST be processed by the engine before FCU.
-        // Both messages travel through separate channels (engine_api_tx vs consensus_engine_tx)
-        // that feed into the same engine service via a tokio::select! loop. Without explicit
-        // ordering, the engine may process FCU before the block is indexed, causing it to be
-        // rejected or ignored.
-        //
-        // Fix: run both in a single spawned task. After sending InsertExecutedBlock, call
-        // yield_now() so the engine service task can pick up and process the insert from
-        // engine_api_rx before we send FCU through the separate consensus channel.
+        // Confirm that the engine admitted this exact block before selecting it. The engine
+        // may silently drop InsertExecutedBlock when a competing block advances the head.
         {
-            let engine_tx_opt = crate::shared::get_engine_api_tx();
+            let engine_tx = crate::shared::get_engine_api_tx();
             let executed_block = payload.executed_block.clone();
             let forkchoice_engine = self.forkchoice_engine.clone();
             tokio::spawn(async move {
-                if let Some(engine_tx) = engine_tx_opt {
-                    tracing::debug!(
+                let result =
+                    super::mined::insert_then_update(engine_tx, executed_block, |gate| async {
+                        forkchoice_engine.update_forkchoice_gated(&header_for_fcu, gate).await
+                    })
+                    .await;
+                match result {
+                    Ok(()) => tracing::debug!(
                         target: "bsc::block_import",
-                        block_number = %header_for_fcu.number,
+                        block_number = header_for_fcu.number,
                         block_hash = %block_hash,
-                        "Inserting mined block into engine tree"
-                    );
-                    if let Err(e) =
-                        engine_tx.send(EngineApiRequest::InsertExecutedBlock(executed_block))
-                    {
-                        tracing::warn!(
-                            target: "bsc::block_import",
-                            block_number = %header_for_fcu.number,
-                            block_hash = %block_hash,
-                            error = %e,
-                            "Failed to insert executed block into engine tree, block will be dropped"
-                        );
-                        return;
-                    }
-                    // Yield to the tokio runtime so the engine service loop processes
-                    // InsertExecutedBlock from engine_api_rx before FCU is enqueued in
-                    // the separate consensus_engine channel. This closes the race window
-                    // where FCU could arrive at the engine tree before the block is indexed.
-                    tokio::task::yield_now().await;
-                } else {
-                    tracing::warn!(
+                        "Confirmed mined block admission and updated fork choice"
+                    ),
+                    Err(error) => tracing::warn!(
                         target: "bsc::block_import",
-                        block_number = %header_for_fcu.number,
+                        block_number = header_for_fcu.number,
                         block_hash = %block_hash,
-                        "engine_api_tx not initialized, skipping InsertExecutedBlock"
-                    );
-                }
-
-                tracing::debug!(
-                    target: "bsc::block_import",
-                    block_number = %header_for_fcu.number,
-                    block_hash = %block_hash,
-                    "Updating fork choice for mined block"
-                );
-                if let Err(e) = forkchoice_engine.update_forkchoice(&header_for_fcu).await {
-                    tracing::warn!(
-                        target: "bsc::block_import",
-                        block_number = %header_for_fcu.number,
-                        block_hash = %block_hash,
-                        error = %e,
-                        "Failed to update fork choice for mined block"
-                    );
-                } else {
-                    tracing::debug!(
-                        target: "bsc::block_import",
-                        block_number = %header_for_fcu.number,
-                        block_hash = %block_hash,
-                        "Succeeded to update fork choice for mined block"
-                    );
+                        %error,
+                        "Mined block admission or fork choice failed; no unconfirmed head selected"
+                    ),
                 }
             });
         }

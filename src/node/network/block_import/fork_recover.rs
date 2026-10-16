@@ -1751,6 +1751,48 @@ mod tests {
                 "the retry resumes at 105 instead of replaying 101-104",
             );
         }
+
+        /// The mined-block path evaluates fork choice while the engine is still confirming
+        /// admission (see `block_import::mined`). The FCU itself must wait for that gate and
+        /// must never be sent if the gate fails.
+        #[tokio::test]
+        async fn gated_forkchoice_sends_only_after_gate_opens() {
+            let (provider, fetcher, heads) = scenario(10, 1);
+            let (head_hash, _) = heads[0];
+            let header = fetcher.blocks[&head_hash].header.clone();
+            let (engine, _submissions, fcus) = recording_engine(vec![]);
+            let fce = BscForkChoiceEngine::new(provider, engine, chain_spec());
+
+            let failed = fce
+                .update_forkchoice_gated(&header, async {
+                    Err(crate::consensus::ParliaConsensusErr::Internal("discarded".into()))
+                })
+                .await;
+            assert!(failed.is_err());
+            assert!(fcus.lock().unwrap().is_empty(), "failed gate must not send an FCU");
+
+            let (open, gate) = tokio::sync::oneshot::channel::<()>();
+            let pending = tokio::spawn({
+                let fce = fce.clone();
+                let header = header.clone();
+                async move {
+                    fce.update_forkchoice_gated(&header, async {
+                        gate.await.map_err(crate::consensus::ParliaConsensusErr::internal)
+                    })
+                    .await
+                }
+            });
+            // Let evaluation (including its TD queries to the engine) run to the gate.
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+            }
+            assert!(!pending.is_finished());
+            assert!(fcus.lock().unwrap().is_empty(), "FCU must wait for the gate");
+
+            open.send(()).unwrap();
+            pending.await.unwrap().unwrap();
+            assert_eq!(*fcus.lock().unwrap(), vec![head_hash]);
+        }
     }
 }
 
