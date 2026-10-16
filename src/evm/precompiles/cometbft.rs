@@ -1617,18 +1617,20 @@ mod tests {
         validator_set.validators = vec![validator.clone()];
         validator_set.proposer = Some(validator.clone());
         validator_set.total_voting_power = 1_000;
-        let validators_hash =
-            Set::try_from(validator_set.clone()).expect("validator set").hash().as_bytes().to_vec();
+        let validators_hash = validator_set_hash(&validator_set).as_bytes().to_vec();
 
         let mut signed_header = light_block.signed_header.take().unwrap();
         let mut header = signed_header.header.take().unwrap();
         header.validators_hash = validators_hash.clone();
         header.next_validators_hash = validators_hash.clone();
-        let header_hash = cometbft::block::Header::try_from(header.clone())
-            .expect("header")
-            .hash()
-            .as_bytes()
-            .to_vec();
+        // The prost re-encode below drops Greenfield's RandaoMix (field 15), so bind the commit
+        // to the Go header hash with an empty RandaoMix, as the precompile computes it.
+        let header_hash = header_hash_with_randao_mix(
+            &cometbft::block::Header::try_from(header.clone()).expect("header"),
+            &[],
+        )
+        .as_bytes()
+        .to_vec();
 
         let mut commit = signed_header.commit.take().unwrap();
         commit.block_id.as_mut().unwrap().hash = header_hash;
