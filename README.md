@@ -124,8 +124,7 @@ To enable RPC services, add these parameters to your node command:
 
 ### Recommended Hardware for Sync (BSC Mainnet)
 
-Use a **release or maxperf build** for mainnet sync (`make build` or `make maxperf`).
-Do not use a debug build for production sync.
+Build with **`make maxperf`** for mainnet sync.
 
 Place `--datadir` on a mounted **local NVMe SSD**. When using Docker, bind-mount
 that directory into the container. On AWS, EBS volumes can also appear as
