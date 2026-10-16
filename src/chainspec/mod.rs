@@ -3,7 +3,7 @@ use crate::hardforks::{bsc::BscHardfork, BscHardforks};
 use alloy_consensus::Header;
 use alloy_eips::eip7840::BlobParams;
 use alloy_genesis::Genesis;
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{b256, Address, B256, U256};
 use reth_chainspec::{
     BaseFeeParams, ChainKind, ChainSpec, DepositContract, EthChainSpec, EthereumHardfork, EthereumHardforks,
     ForkCondition, ForkFilter, ForkId, Hardforks, Head, NamedChain,
@@ -21,6 +21,17 @@ pub mod bootnode_override;
 mod local;
 
 pub use bsc_chapel::bsc_testnet;
+
+/// Genesis hashes of the bundled networks. Used to tell a bundled spec apart
+/// from a custom genesis that merely reuses a registered chain id (chain kind
+/// alone cannot distinguish them: `Chain::from_id(56)` classifies as BSC
+/// mainnet).
+const BSC_MAINNET_GENESIS_HASH: B256 =
+    b256!("0x0d21840abff46b96c84b2ac9e10e4f5cdaeb5693cb665db62a2f3b02d2d57b5b");
+const BSC_TESTNET_GENESIS_HASH: B256 =
+    b256!("0x6d3c66c5357ec91d5c43af47e234a939b22557cbb552dc45bebbceeed90fbe34");
+const BSC_QANET_GENESIS_HASH: B256 =
+    b256!("0x5b8930564626c76d8f30d4ec583166291a3d876122b48c84de3d33729ccb43ff");
 
 /// Default number of entries the live pruner may delete per run across all segments.
 /// Overridable with `--prune.delete-limit`.
@@ -93,18 +104,28 @@ impl EthChainSpec for BscChainSpec {
             return bootnode_override::get_bootnode_override().clone();
         }
         
-        // Fall back to default bootnodes based on chain
+        // Fall back to default bootnodes based on chain.
+        //
+        // NOTE: unknown (custom/dev) chains resolve to an explicit empty set instead of
+        // `None`. Upstream reth falls back to Ethereum mainnet bootnodes when this returns
+        // `None`, which makes a private/dev node dial and get banned by dozens of public
+        // peers. An empty set keeps custom chains quiet unless the operator passes
+        // `--bootnodes`/`--trusted-peers` explicitly.
+        //
+        // The `is_bundled` guard matters: a custom genesis that reuses a registered
+        // chain id (e.g. 56) still classifies as `ChainKind::Named`, so chain kind
+        // alone would hand it the public bootnodes.
         match self.inner.chain().kind() {
-            ChainKind::Named(NamedChain::BinanceSmartChain) => {
+            ChainKind::Named(NamedChain::BinanceSmartChain) if self.is_bundled() => {
                 Some(crate::node::network::bootnodes::bsc_mainnet_nodes())
             }
-            ChainKind::Named(NamedChain::BinanceSmartChainTestnet) => {
+            ChainKind::Named(NamedChain::BinanceSmartChainTestnet) if self.is_bundled() => {
                 Some(crate::node::network::bootnodes::bsc_testnet_nodes())
             }
-            ChainKind::Id(bsc_rialto::RIALTO_CHAIN_ID) => {
+            ChainKind::Id(bsc_rialto::RIALTO_CHAIN_ID) if self.is_bundled() => {
                 Some(crate::node::network::bootnodes::bsc_qanet_nodes())
             }
-            _ => None,
+            _ => Some(Vec::new()),
         }
     }
 
@@ -171,19 +192,47 @@ impl EthExecutorSpec for BscChainSpec {
 }
 
 impl BscChainSpec {
+    /// Whether this is one of the bundled network specs, as opposed to a custom
+    /// genesis that merely reuses a registered chain id. Provenance is decided
+    /// by genesis identity (not chain kind alone), deliberately bypassing the
+    /// testing genesis-hash override: the override rewrites identity claims,
+    /// not the underlying spec.
+    fn is_bundled(&self) -> bool {
+        let hash = self.inner.genesis_hash();
+        match self.inner.chain().kind() {
+            ChainKind::Named(NamedChain::BinanceSmartChain) => hash == BSC_MAINNET_GENESIS_HASH,
+            ChainKind::Named(NamedChain::BinanceSmartChainTestnet) => {
+                hash == BSC_TESTNET_GENESIS_HASH
+            }
+            ChainKind::Id(bsc_rialto::RIALTO_CHAIN_ID) => hash == BSC_QANET_GENESIS_HASH,
+            _ => false,
+        }
+    }
+
     /// Get the head information for this chain spec
     pub fn head(&self) -> Head {
         let mut head = match self.inner.chain().kind() {
-            ChainKind::Named(NamedChain::BinanceSmartChain) => {
-                bsc::head()
-            }
-            ChainKind::Named(NamedChain::BinanceSmartChainTestnet) => {
+            ChainKind::Named(NamedChain::BinanceSmartChain) if self.is_bundled() => bsc::head(),
+            ChainKind::Named(NamedChain::BinanceSmartChainTestnet) if self.is_bundled() => {
                 bsc_chapel::head()
             }
-            ChainKind::Id(bsc_rialto::RIALTO_CHAIN_ID) => {
-                bsc_rialto::head()
+            ChainKind::Id(bsc_rialto::RIALTO_CHAIN_ID) if self.is_bundled() => bsc_rialto::head(),
+            // Custom/dev chains (e.g. `--chain <genesis.json>`): anchor the initial
+            // head at genesis so the P2P Status message carries a non-zero blockhash.
+            // A zero blockhash fails the eth/69+ handshake (`BlockhashZero`) on the
+            // remote side, which deadlocks fresh private networks: no peer ever
+            // connects, so the miner's peer gate never opens and no block is ever
+            // produced to advance the head.
+            _ => {
+                let genesis_header = self.inner.genesis_header();
+                Head {
+                    number: 0,
+                    hash: self.genesis_hash(),
+                    difficulty: genesis_header.difficulty,
+                    total_difficulty: genesis_header.difficulty,
+                    timestamp: genesis_header.timestamp,
+                }
             }
-            _ => local::head(),
         };
 
         // Override head hash if genesis hash override is set
@@ -324,9 +373,128 @@ mod tests {
         let head = chain_spec.head();
         let fork_id = chain_spec.fork_id(&head);
         let latest_fork_id = chain_spec.latest_fork_id();
-        
+
         // Test consistency
         assert_eq!(fork_id.hash, latest_fork_id.hash, "fork_id and latest_fork_id should have same hash");
         assert_eq!(fork_id.next, latest_fork_id.next, "fork_id and latest_fork_id should have same next");
+    }
+
+    #[test]
+    fn test_known_chains_keep_their_bootnodes() {
+        // Regression guard for the custom-chain bootnode fix: the bundled
+        // networks must keep resolving to their own (non-empty) bootnode sets.
+        for name in ["bsc", "bsc-testnet", "bsc-qanet"] {
+            let spec = crate::chainspec::parser::chain_value_parser(name)
+                .expect("bundled chain should parse");
+            let bootnodes = spec.bootnodes();
+            assert!(
+                bootnodes.as_ref().is_some_and(|nodes| !nodes.is_empty()),
+                "bundled chain {name} must keep non-empty bootnodes"
+            );
+        }
+    }
+
+    #[test]
+    fn test_custom_chain_head_anchors_at_genesis() {
+        // Regression test: custom/dev chains must advertise a non-zero genesis
+        // blockhash as their initial head. A zero hash fails the eth/69+
+        // handshake (`BlockhashZero`) and deadlocks fresh private networks.
+        //
+        // NOTE: the validator embedded below is a synthetic fixture address
+        // (keccak256("reth-bsc-privnet-test-validator") truncated to 20 bytes).
+        // It has no known private key and must never be used outside tests.
+        let genesis_json = r#"{
+            "config": {
+                "chainId": 1337,
+                "homesteadBlock": 0,
+                "eip150Block": 0,
+                "eip155Block": 0,
+                "eip158Block": 0,
+                "byzantiumBlock": 0,
+                "constantinopleBlock": 0,
+                "petersburgBlock": 0,
+                "istanbulBlock": 0,
+                "muirGlacierBlock": 0,
+                "ramanujanBlock": 0,
+                "nielsBlock": 0,
+                "parlia": {"period": 3, "epoch": 200}
+            },
+            "nonce": "0x0",
+            "timestamp": "0x5e9da7ce",
+            "extraData": "0x000000000000000000000000000000000000000000000000000000000000000039876ae9543fd48e49661792c115a3984f73dbe50000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+            "gasLimit": "0x2625a00",
+            "difficulty": "0x1",
+            "mixHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "coinbase": "0x0000000000000000000000000000000000000000",
+            "alloc": {}
+        }"#;
+        let chain_spec = crate::chainspec::parser::parse_genesis_json(genesis_json)
+            .expect("custom genesis should parse");
+
+        let head = chain_spec.head();
+        assert_eq!(head.number, 0, "custom chain head must start at genesis number");
+        assert_eq!(
+            head.hash,
+            chain_spec.genesis_hash(),
+            "custom chain head hash must be the genesis hash"
+        );
+        assert_ne!(head.hash, B256::ZERO, "custom chain head hash must not be zero");
+
+        // Custom chains must not inherit any public bootnodes (which would make a
+        // private node dial the internet); an explicit empty set disables the
+        // upstream Ethereum-mainnet fallback.
+        assert_eq!(
+            chain_spec.bootnodes(),
+            Some(Vec::new()),
+            "custom chains must resolve to an empty bootnode set"
+        );
+    }
+
+    #[test]
+    fn test_custom_genesis_with_registered_chain_id_stays_custom() {
+        // A custom genesis that reuses a registered BSC chain id (56) still
+        // classifies as `ChainKind::Named` via `Chain::from_id`, so chain kind
+        // alone cannot tell it apart from the bundled network. Provenance must
+        // come from genesis identity: same expectations as an unknown chain id.
+        let genesis_json = r#"{
+            "config": {
+                "chainId": 56,
+                "homesteadBlock": 0,
+                "parlia": {"period": 3, "epoch": 200}
+            },
+            "nonce": "0x0",
+            "timestamp": "0x5e9da7ce",
+            "extraData": "0x000000000000000000000000000000000000000000000000000000000000000039876ae9543fd48e49661792c115a3984f73dbe50000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+            "gasLimit": "0x2625a00",
+            "difficulty": "0x1",
+            "mixHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "coinbase": "0x0000000000000000000000000000000000000000",
+            "alloc": {
+                "0x1111111111111111111111111111111111111111": {"balance": "0x1"}
+            }
+        }"#;
+        let chain_spec = crate::chainspec::parser::parse_genesis_json(genesis_json)
+            .expect("custom genesis should parse");
+
+        // Sanity: the id really classifies as the named mainnet kind, so this
+        // test exercises the guard rather than the fallback arm.
+        assert!(matches!(
+            chain_spec.inner.chain().kind(),
+            reth_chainspec::ChainKind::Named(reth_chainspec::NamedChain::BinanceSmartChain)
+        ));
+
+        assert_eq!(
+            chain_spec.bootnodes(),
+            Some(Vec::new()),
+            "chain-id-56 custom genesis must not inherit mainnet bootnodes"
+        );
+        let head = chain_spec.head();
+        assert_eq!(head.number, 0);
+        assert_eq!(
+            head.hash,
+            chain_spec.genesis_hash(),
+            "chain-id-56 custom genesis must anchor at its own genesis"
+        );
+        assert_ne!(head.hash, B256::ZERO);
     }
 }
