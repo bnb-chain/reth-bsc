@@ -124,7 +124,12 @@ To enable RPC services, add these parameters to your node command:
 
 ### Recommended Hardware for Sync (BSC Mainnet)
 
-Use **local NVMe SSDs** for the data directory.
+Use a **release or maxperf build** for mainnet sync (`make build` or `make maxperf`).
+Do not use a debug build for production sync.
+
+Place `--datadir` on a mounted **local NVMe SSD**. When using Docker, bind-mount
+that directory into the container. On AWS, EBS volumes can also appear as
+`/dev/nvme*` devices; verify that the data directory uses local instance storage.
 
 > **These recommendations assume RPC services are disabled while the node is
 > catching up to the chain tip. Serving RPC traffic during catch-up is outside
@@ -144,6 +149,8 @@ CPU and memory reference: [AWS i7ie.6xlarge](https://aws.amazon.com/ec2/instance
 | FullNode | 8 TB+ |
 | ArchiveNode | 20 TB+ |
 
+Allow additional space for data growth, snapshot downloads, and extraction.
+
 **FullNode and ArchiveNode storage reference, checked October 16, 2026:**
 [`bnb-chain/bsc-snapshots` usage guide, `usage/reth-bsc-snapshot.md`](https://github.com/bnb-chain/bsc-snapshots/blob/main/usage/reth-bsc-snapshot.md#requirements).
 Check the snapshot guide for current requirements and details.
@@ -159,7 +166,7 @@ Sync from block 0 (will take weeks):
 ### 2. Snapshot Sync
 
 - Download BSC Reth snapshots from [BSC Reth Snapshots](https://github.com/bnb-chain/bsc-snapshots#source-4-bsc-reth-snapshots)
-- For usage instructions, refer to [Usage](https://github.com/bnb-chain/bsc-snapshots/blob/main/usage/legacyfullnode_usage.md)
+- For usage instructions, refer to [Reth snapshot usage](https://github.com/bnb-chain/bsc-snapshots/blob/main/usage/reth-bsc-snapshot.md)
 
 ## Monitoring
 
