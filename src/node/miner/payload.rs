@@ -2316,6 +2316,7 @@ where
     ///
     /// Returns `false` when there is no candidate, it does not win, or the import sender is missing —
     /// in which case the caller falls back to submitting the best local payload.
+    /// A full or closed local ingress also falls back, before claiming a signing slot.
     fn try_submit_winning_bid_block(&mut self) -> bool {
         let Some(bid) = self.bid_block_candidate.take() else { return false };
 
@@ -2421,7 +2422,7 @@ where
             return false;
         }
 
-        let Some(sender) = crate::shared::get_bid_block_import_sender() else {
+        let Some(sender) = crate::shared::get_local_block_import_sender() else {
             warn!(
                 target: "bsc::miner::payload",
                 trace_id = self.trace_id,
@@ -2429,6 +2430,22 @@ where
                 "BidBlock won but import sender is not initialised; falling back to local payload"
             );
             return false;
+        };
+
+        // Reserve before claiming the signing slot or spawning the timestamp delay. A full
+        // local ingress falls back to the normal result worker, which awaits capacity; it must
+        // not create an unbounded set of delayed tasks waiting to send signed BidBlocks.
+        let permit = match sender.clone().try_reserve_owned() {
+            Ok(permit) => permit,
+            Err(error) => {
+                if matches!(error, tokio::sync::mpsc::error::TrySendError::Full(_)) {
+                    crate::node::network::block_import::metrics::Queue::LocalIngress
+                        .full(sender.max_capacity(), "fallback_to_local_payload");
+                } else {
+                    warn!(target: "bsc::miner::payload", %error, "Local import channel closed; falling back to local payload");
+                }
+                return false;
+            }
         };
 
         // Double-sign guard shared with the local/legacy path (`ResultWorkWorker::submit_payload`
@@ -2463,7 +2480,10 @@ where
         tokio::spawn(async move {
             if let Err(e) = send_bid_block_after_delay(
                 sender,
-                (sealed, builder_addr, bid_hash, gas_fee, system_tx_start),
+                permit,
+                crate::node::network::block_import::service::IncomingLocalBlock::Bid(Box::new(
+                    (sealed, builder_addr, bid_hash, gas_fee, system_tx_start),
+                )),
                 delay,
             )
             .await
@@ -2758,17 +2778,22 @@ fn bid_block_broadcast_delay(header: &alloy_consensus::Header, now_ms: u64) -> s
 /// actually begins.
 ///
 /// Split out from `try_submit_winning_bid_block` so the "not before its timestamp" invariant can be
-/// tested against a channel instead of a P2P capture: the `send` below *is* the start of broadcast,
-/// so a test that observes when the receiver sees the block observes the real timing.
+/// tested against a channel instead of a P2P capture. This is admission to the importer;
+/// actual network propagation happens after the importer consumes the block.
 async fn send_bid_block_after_delay<T>(
-    sender: &tokio::sync::mpsc::UnboundedSender<T>,
+    sender: &tokio::sync::mpsc::Sender<T>,
+    permit: tokio::sync::mpsc::OwnedPermit<T>,
     block: T,
     delay: std::time::Duration,
 ) -> Result<(), tokio::sync::mpsc::error::SendError<T>> {
     if !delay.is_zero() {
         tokio::time::sleep(delay).await;
     }
-    sender.send(block)
+    if sender.is_closed() {
+        return Err(tokio::sync::mpsc::error::SendError(block));
+    }
+    permit.send(block);
+    Ok(())
 }
 
 fn refresh_and_reseal_bid_block(
@@ -2950,16 +2975,20 @@ mod tests {
 
     /// The delay must actually withhold the block, not merely be computed.
     ///
-    /// `send_bid_block_after_delay`'s send is where broadcast begins — the import service takes it
-    /// from there — so observing when the receiver sees the block observes the real broadcast
-    /// timing, without a P2P capture. Time is paused, so this asserts ordering deterministically
+    /// The import service cannot begin broadcast before this handoff. Observe admission
+    /// timing without a P2P capture. Time is paused, so this asserts ordering deterministically
     /// instead of racing a wall clock.
     #[tokio::test(start_paused = true)]
     async fn bid_block_send_is_withheld_until_the_delay_elapses() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<u64>(1);
+        let permit = tx.clone().try_reserve_owned().unwrap();
         let delay = Duration::from_millis(600);
 
-        let task = tokio::spawn(async move { send_bid_block_after_delay(&tx, 7u64, delay).await });
+        let other_producer = tx.clone();
+        let task =
+            tokio::spawn(async move { send_bid_block_after_delay(&tx, permit, 7u64, delay).await });
+        // The delayed task already owns capacity: another task cannot accumulate behind it.
+        assert!(other_producer.try_reserve().is_err());
 
         // One millisecond short of due: still withheld.
         tokio::time::advance(Duration::from_millis(599)).await;
@@ -2972,15 +3001,17 @@ mod tests {
         tokio::time::advance(Duration::from_millis(2)).await;
         task.await.expect("send task panicked").expect("receiver is still alive");
         assert_eq!(rx.try_recv().expect("BidBlock must be released once due"), 7);
+        assert!(other_producer.try_reserve().is_ok());
     }
 
     /// A block already past its timestamp — the common case, sealed at the end of its slot — must go
     /// out without waiting.
     #[tokio::test(start_paused = true)]
     async fn bid_block_send_is_immediate_when_already_due() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<u64>(1);
+        let permit = tx.clone().try_reserve_owned().unwrap();
 
-        send_bid_block_after_delay(&tx, 9u64, Duration::ZERO)
+        send_bid_block_after_delay(&tx, permit, 9u64, Duration::ZERO)
             .await
             .expect("receiver is still alive");
 
@@ -2996,10 +3027,11 @@ mod tests {
     /// free to claim it.
     #[tokio::test(start_paused = true)]
     async fn bid_block_send_reports_a_closed_receiver() {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+        let (tx, rx) = tokio::sync::mpsc::channel::<u64>(1);
+        let permit = tx.clone().try_reserve_owned().unwrap();
         drop(rx);
 
-        let err = send_bid_block_after_delay(&tx, 1u64, Duration::from_millis(50))
+        let err = send_bid_block_after_delay(&tx, permit, 1u64, Duration::from_millis(50))
             .await
             .expect_err("a closed receiver must be reported so the slot can be released");
         assert_eq!(err.0, 1, "the undelivered block is returned to the caller");
