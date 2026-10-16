@@ -687,22 +687,177 @@ mod tests {
         hex::decode(VALID_LIGHT_BLOCK_INPUT).expect("fixture is valid hex")
     }
 
+    /// Rebuilds the fixture as an adjacent light block signed by four equal-power validators
+    /// whose keys are generated at runtime, listed in descending address order. cometbft-rs
+    /// sorts equal powers by ascending address, so only the wire-order hash matches the header.
+    fn runtime_signed_wire_order_light_block_input() -> Vec<u8> {
+        use cometbft_proto::{
+            crypto::v1::{public_key::Sum, PublicKey as RawPublicKey},
+            types::v1::BlockIdFlag,
+        };
+        use curve25519_dalek::constants::ED25519_BASEPOINT_POINT;
+        use sha2::Sha256;
+
+        let input = valid_light_block_input();
+        let mut light_block = TmLightBlock::decode(&input[fixture_split(&input)..])
+            .expect("fixture light block decodes");
+
+        let mut validator_set = light_block.validator_set.take().unwrap();
+        let template = validator_set.validators[0].clone();
+        let mut signers: Vec<_> = (0..4u8)
+            .map(|i| {
+                let secret = Scalar::from_bytes_mod_order(rand::random());
+                let pubkey = (ED25519_BASEPOINT_POINT * secret).compress().to_bytes();
+                let mut validator = template.clone();
+                validator.address = Sha256::digest(pubkey)[..20].to_vec();
+                validator.pub_key = Some(RawPublicKey { sum: Some(Sum::Ed25519(pubkey.to_vec())) });
+                validator.voting_power = 10;
+                validator.proposer_priority = 0;
+                validator.relayer_address = vec![0x10 + i; 20];
+                validator.bls_key = vec![0x20 + i; 48];
+                (secret, pubkey, validator)
+            })
+            .collect();
+        signers.sort_by(|a, b| b.2.address.cmp(&a.2.address));
+        validator_set.validators = signers.iter().map(|(_, _, v)| v.clone()).collect();
+        validator_set.proposer = Some(signers[0].2.clone());
+        validator_set.total_voting_power = 40;
+        let validators_hash = validator_set_hash(&validator_set).as_bytes().to_vec();
+
+        let mut signed_header = light_block.signed_header.take().unwrap();
+        let mut header = signed_header.header.take().unwrap();
+        header.validators_hash = validators_hash.clone();
+        header.next_validators_hash = validators_hash.clone();
+        // The prost re-encode below drops RandaoMix (field 15), so hash with an empty one.
+        let header_hash = header_hash_with_randao_mix(
+            &cometbft::block::Header::try_from(header.clone()).expect("header"),
+            &[],
+        );
+
+        let mut commit = signed_header.commit.take().unwrap();
+        commit.block_id.as_mut().unwrap().hash = header_hash.as_bytes().to_vec();
+        let mut template_sig = commit.signatures[0].clone();
+        template_sig.block_id_flag = BlockIdFlag::Commit as i32;
+        commit.signatures = vec![template_sig.clone()];
+        // A precommit's sign bytes cover the height, round, block ID, timestamp and chain ID,
+        // not the signer, so every validator signs the same message.
+        let sign_bytes = {
+            let commit = cometbft::block::Commit::try_from(commit.clone()).expect("commit");
+            let cometbft::block::CommitSig::BlockIdFlagCommit {
+                validator_address,
+                timestamp,
+                signature,
+            } = &commit.signatures[0]
+            else {
+                unreachable!("flag set to Commit above")
+            };
+            let vote = cometbft::vote::Vote {
+                vote_type: cometbft::vote::Type::Precommit,
+                height: commit.height,
+                round: commit.round,
+                block_id: Some(commit.block_id),
+                timestamp: Some(*timestamp),
+                validator_address: *validator_address,
+                validator_index: 0u32.try_into().unwrap(),
+                signature: signature.clone(),
+                extension: Default::default(),
+                extension_signature: None,
+            };
+            let chain_id = header.chain_id.clone().try_into().expect("chain id");
+            cometbft::vote::SignedVote::from_vote(vote, chain_id).expect("signed").sign_bytes()
+        };
+        commit.signatures = signers
+            .iter()
+            .map(|(secret, _, validator)| {
+                let nonce = Scalar::from_bytes_mod_order(rand::random());
+                let (_, signature) =
+                    sign_with_torsion(*secret, nonce, EdwardsPoint::default(), &sign_bytes);
+                let mut commit_sig = template_sig.clone();
+                commit_sig.validator_address = validator.address.clone();
+                commit_sig.signature = signature.to_vec();
+                commit_sig
+            })
+            .collect();
+
+        // Trusted state one block below, so the adjacent (`height + 1`) path is taken.
+        let mut cs = vec![0u8; CHAIN_ID_LENGTH as usize];
+        cs[..header.chain_id.len()].copy_from_slice(header.chain_id.as_bytes());
+        cs.extend_from_slice(&(header.height as u64 - 1).to_be_bytes());
+        cs.extend_from_slice(&validators_hash);
+        for (_, pubkey, validator) in &signers {
+            cs.extend_from_slice(pubkey);
+            cs.extend_from_slice(&10u64.to_be_bytes());
+            cs.extend_from_slice(&validator.relayer_address);
+            cs.extend_from_slice(&validator.bls_key);
+        }
+
+        signed_header.header = Some(header);
+        signed_header.commit = Some(commit);
+        light_block.signed_header = Some(signed_header);
+        light_block.validator_set = Some(validator_set);
+
+        let mut crafted = vec![0u8; CONSENSUS_STATE_LENGTH_BYTES_LENGTH as usize];
+        crafted[24..32].copy_from_slice(&(cs.len() as u64).to_be_bytes());
+        crafted.extend_from_slice(&cs);
+        crafted.extend_from_slice(&light_block.encode_to_vec());
+        crafted
+    }
+
     /// The header binds the validator set in wire order. cometbft-rs sorts the converted set,
     /// so its hash differs for a set go-bsc accepts; the binding must hash the wire set.
     #[test]
     fn validator_set_binding_uses_wire_order() {
-        let fixture: serde_json::Value =
-            serde_json::from_str(include_str!("testdata/cometbft_wire_order.json")).unwrap();
-        let input = hex::decode(fixture["input"].as_str().unwrap()).unwrap();
+        let input = runtime_signed_wire_order_light_block_input();
         let (_, proto, _) = decode_light_block_validation_input(&input, false).unwrap();
         let block = convert_light_block_from_proto(&proto).unwrap();
         let header_hash = block.signed_header.header().validators_hash;
 
         assert_eq!(validator_set_hash(proto.validator_set.as_ref().unwrap()), header_hash);
         assert_ne!(block.validators.hash(), header_hash);
-        assert!(cometbft_light_block_validation_run_pasteur(&input, 10_000_000, 0)
-            .unwrap()
-            .is_success());
+        type Run = fn(&[u8], u64, u64) -> PrecompileResult;
+        let runs: [Run; 3] = [
+            cometbft_light_block_validation_run_before_hertz,
+            cometbft_light_block_validation_run,
+            cometbft_light_block_validation_run_pasteur,
+        ];
+        for run in runs {
+            let output = run(&input, 10_000_000, 0).unwrap();
+            assert!(output.is_success(), "halted with {:?}", output.halt_reason());
+        }
+    }
+
+    /// Known answer from greenfield-cometbft v1.3.2 `ValidatorSet.Hash` for this set, built
+    /// directly in this order (not via `NewValidatorSet`, which sorts it; sorted, the hash is
+    /// 73acb32e...). The public keys are filler bytes, and the third validator's empty bridge
+    /// fields are omitted from its `SimpleValidator` encoding.
+    #[test]
+    fn validator_set_hash_matches_go_wire_order() {
+        use cometbft_proto::{
+            crypto::v1::{public_key::Sum, PublicKey as RawPublicKey},
+            types::v1::Validator as TmValidator,
+        };
+
+        let validator = |fill: u8, voting_power: i64, relayer_address: Vec<u8>, bls_key: Vec<u8>| {
+            TmValidator {
+                pub_key: Some(RawPublicKey { sum: Some(Sum::Ed25519(vec![fill; 32])) }),
+                voting_power,
+                relayer_address,
+                bls_key,
+                ..Default::default()
+            }
+        };
+        let validator_set = TmValidatorSet {
+            validators: vec![
+                validator(0xa1, 10, vec![0xb1; 20], vec![0xc1; 48]),
+                validator(0xa2, 30, vec![0xb2; 20], vec![0xc2; 48]),
+                validator(0xa3, 20, vec![], vec![]),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            validator_set_hash(&validator_set).as_bytes(),
+            hex!("1142b2b89b3b06fa7a2665b9eac444878b49ce470c880d18aa36649bfce8bf97"),
+        );
     }
 
     fn fixture_split(input: &[u8]) -> usize {
