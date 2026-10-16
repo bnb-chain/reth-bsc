@@ -22,6 +22,10 @@ This project aims to bring Reth's high-performance Ethereum client capabilities 
 
 Use **local NVMe SSDs** for the data directory.
 
+> **These recommendations assume RPC services are disabled while the node is
+> catching up to the chain tip. Serving RPC traffic during catch-up is outside
+> the scope of this configuration.**
+
 CPU and memory reference: [AWS i7ie.6xlarge](https://aws.amazon.com/ec2/instance-types/i7i/).
 
 | Resource | Recommendation |
@@ -30,15 +34,14 @@ CPU and memory reference: [AWS i7ie.6xlarge](https://aws.amazon.com/ec2/instance
 | Memory | 192 GiB |
 | Storage type | Local NVMe SSDs |
 
-**Storage reference, checked October 16, 2026:** the
-[`bnb-chain/bsc-snapshots` usage guide, `usage/reth-bsc-snapshot.md`](https://github.com/bnb-chain/bsc-snapshots/blob/main/usage/reth-bsc-snapshot.md#requirements)
-lists the following space requirements:
-
 | Node type | Free disk space |
 | --- | --- |
-| FullNode | Approximately 8 TB+ |
-| ArchiveNode | Approximately 20 TB+ |
+| FastNode | 2 TB+ |
+| FullNode | 8 TB+ |
+| ArchiveNode | 20 TB+ |
 
+**FullNode and ArchiveNode storage reference, checked October 16, 2026:**
+[`bnb-chain/bsc-snapshots` usage guide, `usage/reth-bsc-snapshot.md`](https://github.com/bnb-chain/bsc-snapshots/blob/main/usage/reth-bsc-snapshot.md#requirements).
 Consult the linked guide for current requirements and snapshot details.
 
 ## Building
