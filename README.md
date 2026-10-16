@@ -146,7 +146,7 @@ CPU and memory reference: [AWS i7ie.6xlarge](https://aws.amazon.com/ec2/instance
 
 **FullNode and ArchiveNode storage reference, checked October 16, 2026:**
 [`bnb-chain/bsc-snapshots` usage guide, `usage/reth-bsc-snapshot.md`](https://github.com/bnb-chain/bsc-snapshots/blob/main/usage/reth-bsc-snapshot.md#requirements).
-Consult the linked guide for current requirements and snapshot details.
+Check the snapshot guide for current requirements and details.
 
 ### 1. Genesis Sync
 
