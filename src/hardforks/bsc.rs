@@ -172,6 +172,7 @@ impl BscHardfork {
             (Self::Osaka.boxed(), ForkCondition::Timestamp(1774319400)),
             (Self::Mendel.boxed(), ForkCondition::Timestamp(1774319400)),
             (Self::Pasteur.boxed(), ForkCondition::Timestamp(1784601000)), /* 2026-07-21 02:30:00 AM UTC */
+            (Self::Jenner.boxed(), ForkCondition::Timestamp(1793241000)), /* 2026-10-29 02:30:00 AM UTC */
         ])
     }
 
@@ -411,12 +412,21 @@ mod tests {
     }
 
     #[test]
+    fn test_jenner_scheduled_on_testnet() {
+        // Chapel JennerTime matches go-bsc: 2026-10-29 02:30:00 AM UTC (1793241000).
+        assert_eq!(
+            BscHardfork::bsc_testnet().fork(BscHardfork::Jenner),
+            ForkCondition::Timestamp(1793241000),
+            "Jenner should activate on testnet at its announced timestamp"
+        );
+    }
+
+    #[test]
     fn test_jenner_not_scheduled_on_other_builtin_chains() {
-        // Mirrors go-bsc `JennerTime: nil` on BSCChainConfig/ChapelChainConfig: until the
-        // activation is announced, Jenner must not be present in these built-in fork schedules.
+        // Mirrors go-bsc `JennerTime: nil` on BSCChainConfig: mainnet activation is not
+        // scheduled in this release. Local stays unscheduled.
         for (name, forks) in [
             ("mainnet", BscHardfork::bsc_mainnet()),
-            ("testnet", BscHardfork::bsc_testnet()),
             ("local", BscHardfork::bsc_local()),
         ] {
             assert_eq!(
