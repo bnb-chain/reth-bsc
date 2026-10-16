@@ -18,32 +18,6 @@ This project aims to bring Reth's high-performance Ethereum client capabilities 
 - **BSC Mainnet**: Synced to the tip ✅ (10.6T disk required)
 - **BSC Testnet**: Synced to the tip ✅ (800GB disk usage)
 
-## Recommended Hardware (BSC Mainnet)
-
-Use **local NVMe SSDs** for the data directory.
-
-> **These recommendations assume RPC services are disabled while the node is
-> catching up to the chain tip. Serving RPC traffic during catch-up is outside
-> the scope of this configuration.**
-
-CPU and memory reference: [AWS i7ie.6xlarge](https://aws.amazon.com/ec2/instance-types/i7i/).
-
-| Resource | Recommendation |
-| --- | --- |
-| CPU | 24 vCPU |
-| Memory | 192 GiB |
-| Storage type | Local NVMe SSDs |
-
-| Node type | Free disk space |
-| --- | --- |
-| FastNode | 2 TB+ |
-| FullNode | 8 TB+ |
-| ArchiveNode | 20 TB+ |
-
-**FullNode and ArchiveNode storage reference, checked October 16, 2026:**
-[`bnb-chain/bsc-snapshots` usage guide, `usage/reth-bsc-snapshot.md`](https://github.com/bnb-chain/bsc-snapshots/blob/main/usage/reth-bsc-snapshot.md#requirements).
-Consult the linked guide for current requirements and snapshot details.
-
 ## Building
 
 ### Clone and Build
@@ -147,6 +121,32 @@ To enable RPC services, add these parameters to your node command:
 
 
 ## Sync
+
+### Recommended Hardware for Sync (BSC Mainnet)
+
+Use **local NVMe SSDs** for the data directory.
+
+> **These recommendations assume RPC services are disabled while the node is
+> catching up to the chain tip. Serving RPC traffic during catch-up is outside
+> the scope of this configuration.**
+
+CPU and memory reference: [AWS i7ie.6xlarge](https://aws.amazon.com/ec2/instance-types/i7i/).
+
+| Resource | Recommendation |
+| --- | --- |
+| CPU | 24 vCPU |
+| Memory | 192 GiB |
+| Storage type | Local NVMe SSDs |
+
+| Node type | Free disk space |
+| --- | --- |
+| FastNode | 2 TB+ |
+| FullNode | 8 TB+ |
+| ArchiveNode | 20 TB+ |
+
+**FullNode and ArchiveNode storage reference, checked October 16, 2026:**
+[`bnb-chain/bsc-snapshots` usage guide, `usage/reth-bsc-snapshot.md`](https://github.com/bnb-chain/bsc-snapshots/blob/main/usage/reth-bsc-snapshot.md#requirements).
+Consult the linked guide for current requirements and snapshot details.
 
 ### 1. Genesis Sync
 
