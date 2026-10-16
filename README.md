@@ -22,21 +22,24 @@ This project aims to bring Reth's high-performance Ethereum client capabilities 
 
 Use **local NVMe SSDs** for the data directory.
 
-Reference hardware: [AWS i7ie.6xlarge](https://aws.amazon.com/ec2/instance-types/i7i/).
+CPU and memory reference: [AWS i7ie.6xlarge](https://aws.amazon.com/ec2/instance-types/i7i/).
 
-| Resource | Specification |
+| Resource | Recommendation |
 | --- | --- |
 | CPU | 24 vCPU |
 | Memory | 192 GiB |
-| Storage | 2 × 7.5 TB local NVMe SSDs (15 TB total raw capacity) |
+| Storage type | Local NVMe SSDs |
 
 **Storage reference, checked October 16, 2026:** the
 [`bnb-chain/bsc-snapshots` usage guide, `usage/reth-bsc-snapshot.md`](https://github.com/bnb-chain/bsc-snapshots/blob/main/usage/reth-bsc-snapshot.md#requirements)
-lists approximately **20 TB+ free space for Mainnet Archive** and **8 TB+ for
-Mainnet FullNode**. These figures are the guide's published space requirements.
-For an archive deployment following this guide, select a configuration with more
-storage than the reference instance above. Consult the linked guide for current
-requirements and snapshot details.
+lists the following space requirements:
+
+| Node type | Free disk space |
+| --- | --- |
+| FullNode | Approximately 8 TB+ |
+| ArchiveNode | Approximately 20 TB+ |
+
+Consult the linked guide for current requirements and snapshot details.
 
 ## Building
 
