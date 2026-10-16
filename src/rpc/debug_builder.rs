@@ -18,7 +18,7 @@ use crate::consensus::parlia::util::{
     calculate_difficulty, calculate_millisecond_timestamp, set_millisecond_part_of_timestamp,
 };
 use crate::hardforks::BscHardforks;
-use crate::node::evm::config::{BscEvmConfig, BscNextBlockEnvAttributes};
+use crate::node::evm::config::{BscEvmConfig, BscExecutionMode, BscNextBlockEnvAttributes};
 use crate::node::miner::bid_block::BidBlock;
 use alloy_consensus::transaction::SignerRecoverable;
 use alloy_consensus::Transaction;
@@ -201,6 +201,12 @@ where
                     extra_data: Default::default(),
                     slot_number: None,
                 },
+                // Finalize system transactions, but do not filter caller-specified transactions
+                // through mining admission.
+                mode: BscExecutionMode::BidSimulation,
+                // The candidate block is built from a second-granularity `timestamp`
+                // parameter with no millisecond source — second precision (`Time*1000`).
+                milli_remainder: 0,
                 validator_cache_sink: None,
                 turn_length_sink: None,
                 state_root_precomputed_sink: None,

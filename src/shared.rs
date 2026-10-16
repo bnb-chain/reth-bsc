@@ -118,6 +118,12 @@ static BID_BLOCK_PERMISSION_MANAGER: OnceLock<
     Arc<crate::node::miner::bid_block_permission::BidBlockPermissionManager>,
 > = OnceLock::new();
 
+/// Journal file the BidBlock permission manager persists revokes to
+/// (`<datadir>/bidblockrevokes.json`). Set during component build (payload service builder) —
+/// before any consumer runs — so the lazily-initialized manager picks it up; a manager already
+/// initialized without it stays purely in-memory (the pre-persistence behavior).
+static BID_BLOCK_REVOKES_JOURNAL: OnceLock<std::path::PathBuf> = OnceLock::new();
+
 /// Global intake queue for admitted BEP-675 BidBlocks. `mev_sendBidBlock` pushes a decoded block
 /// here after admission; the miner pops it to pre-seal verify, execute, and select against the
 /// local block (mirrors the legacy [`BID_PACKAGE_QUEUE`] SendBid intake).
@@ -404,6 +410,16 @@ where
     Ok(())
 }
 
+/// Whether the global header provider has been registered yet.
+///
+/// Distinguishes "no provider" from "provider has no such header". Callers that
+/// classify by block presence need that distinction: before the provider is
+/// registered every lookup misses, which is not the same as the block being
+/// absent from the chain.
+pub fn has_header_by_hash_provider() -> bool {
+    HEADER_BY_HASH_PROVIDER.get().is_some()
+}
+
 /// Get header by hash from the global header provider
 /// Directly calls the stored HeaderProvider::header() function
 pub fn get_canonical_header_by_hash_from_provider(block_hash: &B256) -> Option<Header> {
@@ -511,12 +527,26 @@ pub fn bid_package_queue_len() -> usize {
     BID_PACKAGE_QUEUE.get().map(|queue| queue.lock().len()).unwrap_or(0)
 }
 
-/// Get the global BidBlock permission manager, initializing it lazily on first access.
+/// Set the journal file the BidBlock permission manager persists revokes to. Must be called
+/// before the first [`get_bid_block_permission_manager`] call to take effect. Returns `Err` with
+/// the rejected path if a journal path was already set.
+pub fn set_bid_block_revokes_journal(path: std::path::PathBuf) -> Result<(), std::path::PathBuf> {
+    BID_BLOCK_REVOKES_JOURNAL.set(path)
+}
+
+/// Get the global BidBlock permission manager, initializing it lazily on first access. When a
+/// journal path was registered via [`set_bid_block_revokes_journal`], the first access restores
+/// persisted revokes from it and later mutations are mirrored back; otherwise the manager is
+/// purely in-memory.
 pub fn get_bid_block_permission_manager(
 ) -> Arc<crate::node::miner::bid_block_permission::BidBlockPermissionManager> {
     BID_BLOCK_PERMISSION_MANAGER
         .get_or_init(|| {
-            Arc::new(crate::node::miner::bid_block_permission::BidBlockPermissionManager::new())
+            use crate::node::miner::bid_block_permission::BidBlockPermissionManager;
+            Arc::new(match BID_BLOCK_REVOKES_JOURNAL.get() {
+                Some(path) => BidBlockPermissionManager::with_journal(path.clone()),
+                None => BidBlockPermissionManager::new(),
+            })
         })
         .clone()
 }
@@ -850,6 +880,12 @@ pub fn set_miner_gas_tip(val: u64) {
     if let Some(v) = MINER_GAS_TIP.get() {
         v.store(val, Ordering::Relaxed);
     }
+}
+
+/// Initialize only the tip for tests, without changing other miner settings.
+#[cfg(test)]
+pub(crate) fn init_miner_gas_tip_for_tests(val: u64) {
+    let _ = MINER_GAS_TIP.set(AtomicU64::new(val));
 }
 
 pub fn get_miner_gas_tip() -> Option<u64> {

@@ -126,8 +126,9 @@ const ANNOUNCER_LRU_CAP: u32 = 256;
 const MAX_ANNOUNCERS_PER_HASH: usize = 16;
 
 /// Per-hash announcers, used by `request_blocks_by_range_with_failover` to
-/// prefer peers known to have the block. On miss/empty the caller falls
-/// through to the v2 peer list.
+/// route requests to peers known to have the block. These are the only
+/// failover candidates besides the walked peer itself; see
+/// [`plan_v2_failover_peers`] for why there is no generic v2 fallback.
 static ANNOUNCERS: Lazy<ParkingMutex<schnellru::LruMap<B256, Vec<PeerId>, schnellru::ByLength>>> =
     Lazy::new(|| {
         ParkingMutex::new(schnellru::LruMap::new(schnellru::ByLength::new(ANNOUNCER_LRU_CAP)))
@@ -158,7 +159,7 @@ pub fn list_announcers_for(hash: B256) -> Vec<PeerId> {
         tracing::trace!(
             target: "bsc::registry",
             %hash,
-            "announcer LRU hit but all entries are non-v2 or disconnected; falling back to v2 list"
+            "announcer LRU hit but all entries are non-v2 or disconnected"
         );
     }
     v2
@@ -484,12 +485,20 @@ pub fn spawn_evn_refresh_listener() {
     }
 }
 
-/// Failover plan for `GetBlocksByRange` — only bsc/2 peers eligible.
-/// Order: `preferred` (if bsc/2), `announcers`, then remaining v2 peers.
-/// Duplicates are removed and the result is truncated to `max_attempts`.
+/// Failover plan for `GetBlocksByRange` — only peers with a reason to have
+/// the block are eligible: `preferred` (the peer the caller is walking, if
+/// bsc/2) followed by `announcers` of the requested hash. Duplicates are
+/// removed and the result is truncated to `max_attempts`.
 ///
-/// `announcers` should already be v2-filtered (see [`list_announcers_for`]);
-/// empty `announcers` falls back to the v2 list alone.
+/// `announcers` should already be v2-filtered (see [`list_announcers_for`]).
+///
+/// Deliberately NOT a fallback to the general v2 peer list: a peer that
+/// never announced the hash has no reason to have the block, and geth
+/// answers `GetBlocksByRange` for an unknown start block with an error
+/// followed by a `DiscSubprotocolError` disconnect — misrouting the request
+/// converts a routine gap-fill into losing a peer. An empty plan is the
+/// correct outcome; the caller's cooldown and the far-behind pipeline
+/// trigger cover the gap.
 pub(crate) fn plan_v2_failover_peers(
     preferred: PeerId,
     announcers: Vec<PeerId>,
@@ -503,7 +512,7 @@ pub(crate) fn plan_v2_failover_peers(
     if v2_peers.contains(&preferred) {
         out.push(preferred);
     }
-    for p in announcers.into_iter().chain(v2_peers) {
+    for p in announcers {
         if out.len() >= max_attempts {
             break;
         }
@@ -514,11 +523,14 @@ pub(crate) fn plan_v2_failover_peers(
     out
 }
 
-/// Like [`request_blocks_by_range`], but rotates through other bsc/2 peers on
-/// `Err` or empty response. Returns the first non-empty success, otherwise
-/// the last seen result (preserving the original error for diagnostics).
+/// Like [`request_blocks_by_range`], but rotates through the other announcers
+/// of `start_hash` on `Err` or empty response. Returns the first non-empty
+/// success, otherwise the last seen result (preserving the original error for
+/// diagnostics).
 ///
-/// Candidates are restricted to bsc/2 peers; see [`plan_v2_failover_peers`].
+/// Candidates are restricted to bsc/2 peers with a reason to have the block
+/// (the walked peer and the hash's announcers); see
+/// [`plan_v2_failover_peers`].
 pub async fn request_blocks_by_range_with_failover(
     preferred: PeerId,
     start_height: u64,
@@ -526,6 +538,7 @@ pub async fn request_blocks_by_range_with_failover(
     count: u64,
     timeout_dur: Duration,
     max_attempts: usize,
+    chain_spec: &crate::chainspec::BscChainSpec,
 ) -> Result<BlocksByRangePacket, String> {
     let announcers = list_announcers_for(start_hash);
     let peers = plan_v2_failover_peers(preferred, announcers, list_v2_peers(), max_attempts);
@@ -536,7 +549,28 @@ pub async fn request_blocks_by_range_with_failover(
     let mut last: Result<BlocksByRangePacket, String> =
         Err("uninitialised failover".to_string());
     for (idx, peer) in peers.iter().enumerate() {
-        match request_blocks_by_range(*peer, start_height, start_hash, count, timeout_dur).await {
+        let response = request_blocks_by_range(*peer, start_height, start_hash, count, timeout_dur)
+            .await
+            .and_then(|mut response| {
+                for block in &mut response.blocks {
+                    if let Err(error) = super::super::data_availability::validate_data_availability(
+                        block, chain_spec,
+                    ) {
+                        tracing::warn!(
+                            target: "bsc_protocol",
+                            %peer,
+                            request_id = response.request_id,
+                            block_number = block.header.number,
+                            block_hash = %block.header.hash_slow(),
+                            error = %format_args!("{error:#}"),
+                            "Rejecting BlocksByRange with unavailable blob data"
+                        );
+                        return Err(format!("{error:#}"));
+                    }
+                }
+                Ok(response)
+            });
+        match response {
             Ok(resp) if !resp.blocks.is_empty() => return Ok(resp),
             Ok(empty_resp) => {
                 tracing::debug!(
@@ -589,6 +623,52 @@ mod version_tests {
             if let Ok(mut g) = REGISTRY.write() {
                 g.remove(&self.0);
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn range_failover_retries_missing_sidecars_from_another_announcer() {
+        use crate::node::network::data_availability::tests::blob_block;
+        let spec = crate::chainspec::BscChainSpec::from(
+            reth_chainspec::ChainSpecBuilder::mainnet().cancun_activated().build(),
+        );
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let block = blob_block(now);
+        let hash = block.header.hash_slow();
+        let _hash_guard = TestHashGuard(hash);
+        let peers = [PeerId::random(), PeerId::random()];
+        let _guards = peers.map(TestPeerGuard);
+        let mut tasks = Vec::new();
+        for (index, peer) in peers.into_iter().enumerate() {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            register_peer(peer, tx, 2);
+            record_announcer(hash, peer);
+            let mut reply = block.clone();
+            if index == 0 {
+                reply.body.sidecars = None;
+            }
+            tasks.push(tokio::spawn(async move {
+                while let Some(command) = rx.recv().await {
+                    if let BscCommand::GetBlocksByRange(request, responder) = command {
+                        responder.send(Ok(BlocksByRangePacket {
+                            request_id: request.request_id,
+                            blocks: vec![reply],
+                        })).unwrap();
+                        return;
+                    }
+                }
+                panic!("peer was never requested");
+            }));
+        }
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            request_blocks_by_range_with_failover(
+                peers[0], block.header.number, hash, 1, Duration::from_secs(1), 2, &spec,
+            ),
+        ).await.unwrap().unwrap();
+        assert_eq!(result.blocks, vec![block]);
+        for task in tasks {
+            tokio::time::timeout(Duration::from_secs(1), task).await.unwrap().unwrap();
         }
     }
 
@@ -779,22 +859,25 @@ mod failover_tests {
         assert!(plan.is_empty());
     }
 
-    // ---- plan_v2_failover_peers: legacy (no announcer) tests ----
+    // ---- plan_v2_failover_peers: no-announcer tests ----
 
     #[test]
-    fn plan_v2_keeps_v2_preferred_at_head() {
+    fn plan_v2_preferred_alone_when_no_announcers() {
+        // No announcers recorded: the walked peer is the only candidate.
+        // Other v2 peers never announced the hash and must not be asked.
         let plan =
             plan_v2_failover_peers(pid(1), vec![], vec![pid(1), pid(2), pid(3)], 3);
-        assert_eq!(plan, vec![pid(1), pid(2), pid(3)]);
+        assert_eq!(plan, vec![pid(1)]);
     }
 
     #[test]
-    fn plan_v2_drops_non_v2_preferred() {
-        // preferred (v1) is NOT in the v2 list → must not appear in the plan.
+    fn plan_v2_non_v2_preferred_and_no_announcers_yields_empty_plan() {
+        // preferred (v1) is NOT in the v2 list and nobody announced the
+        // hash → nobody is known to have the block → empty plan, no blind
+        // fallback to unrelated v2 peers.
         let plan =
             plan_v2_failover_peers(pid(9), vec![], vec![pid(2), pid(3), pid(4)], 3);
-        assert_eq!(plan, vec![pid(2), pid(3), pid(4)]);
-        assert!(!plan.contains(&pid(9)));
+        assert!(plan.is_empty());
     }
 
     #[test]
@@ -804,26 +887,29 @@ mod failover_tests {
     }
 
     #[test]
-    fn plan_v2_respects_max_attempts_on_non_v2_path() {
-        let plan =
-            plan_v2_failover_peers(pid(9), vec![], vec![pid(2), pid(3), pid(4)], 2);
+    fn plan_v2_respects_max_attempts_on_announcer_path() {
+        let plan = plan_v2_failover_peers(
+            pid(9),
+            vec![pid(2), pid(3), pid(4)],
+            vec![pid(2), pid(3), pid(4)],
+            2,
+        );
         assert_eq!(plan, vec![pid(2), pid(3)]);
     }
 
     // ---- plan_v2_failover_peers: announcer-aware tests ----
 
     #[test]
-    fn plan_v2_announcers_come_before_other_v2_peers() {
-        // Announcers (already v2-filtered by the caller) are tried before
-        // the rest of the v2 list, regardless of their position in v2_peers.
+    fn plan_v2_candidates_are_preferred_then_announcers_only() {
+        // Order: preferred → announcers. v2 peers that never announced the
+        // hash (pid 2, pid 4) are not candidates.
         let plan = plan_v2_failover_peers(
             pid(1),
             vec![pid(3)],                            // announcer
             vec![pid(1), pid(2), pid(3), pid(4)],    // full v2 list
             4,
         );
-        // Order: preferred → announcer → remaining v2.
-        assert_eq!(plan, vec![pid(1), pid(3), pid(2), pid(4)]);
+        assert_eq!(plan, vec![pid(1), pid(3)]);
     }
 
     #[test]
@@ -840,15 +926,15 @@ mod failover_tests {
     }
 
     #[test]
-    fn plan_v2_dedups_across_preferred_announcers_and_v2() {
-        // A peer appearing in all three sources only shows up once.
+    fn plan_v2_dedups_preferred_across_announcers() {
+        // A peer appearing as both preferred and announcer shows up once.
         let plan = plan_v2_failover_peers(
             pid(1),
             vec![pid(1), pid(2)],
             vec![pid(1), pid(2), pid(3)],
             3,
         );
-        assert_eq!(plan, vec![pid(1), pid(2), pid(3)]);
+        assert_eq!(plan, vec![pid(1), pid(2)]);
     }
 
     #[test]
@@ -864,14 +950,14 @@ mod failover_tests {
 
     #[test]
     fn plan_v2_announcers_only_when_preferred_not_v2() {
-        // Non-v2 preferred is dropped; announcers (v2) lead the plan.
+        // Non-v2 preferred is dropped; announcers (v2) form the whole plan.
         let plan = plan_v2_failover_peers(
             pid(9),
             vec![pid(3), pid(4)],
             vec![pid(2), pid(3), pid(4)],
             3,
         );
-        assert_eq!(plan, vec![pid(3), pid(4), pid(2)]);
+        assert_eq!(plan, vec![pid(3), pid(4)]);
     }
 
 }

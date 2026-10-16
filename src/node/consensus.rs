@@ -10,7 +10,7 @@ use crate::{
         ParliaConsensusErr,
     },
     hardforks::BscHardforks,
-    metrics::{BscBlockchainMetrics, BscFinalityMetrics},
+    metrics::BscFinalityMetrics,
     node::{engine_api::payload::BscPayloadTypes, BscNode},
     shared, BscBlock, BscBlockBody, BscPrimitives,
 };
@@ -34,7 +34,7 @@ use reth_engine_primitives::ConsensusEngineHandle;
 use reth_ethereum_primitives::Receipt;
 use reth_primitives_traits::{receipt::gas_spent_by_transactions, GotExpected};
 use reth_primitives_traits::constants::{GAS_LIMIT_BOUND_DIVISOR, MINIMUM_GAS_LIMIT};
-use reth_provider::{BlockNumReader, HeaderProvider};
+use reth_provider::{BlockNumReader, CanonStateSubscriptions, HeaderProvider};
 use std::sync::Arc;
 
 /// A basic Bsc consensus builder.
@@ -61,6 +61,16 @@ where
 
         crate::shared::set_header_provider(Arc::new(ctx.provider().clone()))
             .unwrap_or_else(|e| panic!("Failed to set global header provider: {e}"));
+
+        // Subscribe before the engine starts importing blocks. This observer runs on
+        // every node, independently of mining and its potentially slow work loop.
+        ctx.task_executor().spawn_critical_task(
+            "bsc-reorg-metrics",
+            super::reorg_metrics::run(
+                ctx.provider().subscribe_to_canonical_state(),
+                crate::metrics::BscBlockchainMetrics::default(),
+            ),
+        );
 
         Ok(Arc::new(BscConsensus::new(ctx.chain_spec())))
     }
@@ -601,8 +611,8 @@ mod tests {
             data: vote_data,
         };
 
-        vote_pool::put_vote(vote1);
-        vote_pool::put_vote(vote2);
+        vote_pool::put_vote_unchecked(vote1);
+        vote_pool::put_vote_unchecked(vote2);
 
         let finalized = engine.get_finalized_number_and_hash(&head).unwrap();
         assert_eq!(finalized, (9, parent_hash));
@@ -680,7 +690,7 @@ mod tests {
             signature: VoteSignature::default(),
             data: vote_data,
         };
-        vote_pool::put_vote(vote1);
+        vote_pool::put_vote_unchecked(vote1);
 
         // Finality should NOT advance - still returns fallback
         let finalized = engine.get_finalized_number_and_hash(&head).unwrap();
@@ -762,8 +772,8 @@ mod tests {
             signature: VoteSignature::default(),
             data: wrong_vote_data,
         };
-        vote_pool::put_vote(vote1);
-        vote_pool::put_vote(vote2);
+        vote_pool::put_vote_unchecked(vote1);
+        vote_pool::put_vote_unchecked(vote2);
 
         // Finality should NOT advance - votes have wrong source
         let finalized = engine.get_finalized_number_and_hash(&head).unwrap();
@@ -845,8 +855,8 @@ mod tests {
             signature: VoteSignature::default(),
             data: wrong_vote_data,
         };
-        vote_pool::put_vote(vote1);
-        vote_pool::put_vote(vote2);
+        vote_pool::put_vote_unchecked(vote1);
+        vote_pool::put_vote_unchecked(vote2);
 
         // Finality should NOT advance - votes have wrong target
         let finalized = engine.get_finalized_number_and_hash(&head).unwrap();
@@ -920,8 +930,8 @@ mod tests {
             signature: VoteSignature::default(),
             data: vote_data,
         };
-        vote_pool::put_vote(vote1);
-        vote_pool::put_vote(vote2);
+        vote_pool::put_vote_unchecked(vote1);
+        vote_pool::put_vote_unchecked(vote2);
 
         // Finality should NOT advance because head.number - 1 (11) != current_justified_number (9)
         let finalized = engine.get_finalized_number_and_hash(&head).unwrap();
@@ -1003,7 +1013,7 @@ mod tests {
                 signature: VoteSignature::default(),
                 data: vote_data,
             };
-            vote_pool::put_vote(vote);
+            vote_pool::put_vote_unchecked(vote);
         }
 
         let finalized = engine.get_finalized_number_and_hash(&head).unwrap();
@@ -1015,7 +1025,7 @@ mod tests {
             signature: VoteSignature::default(),
             data: vote_data,
         };
-        vote_pool::put_vote(vote14);
+        vote_pool::put_vote_unchecked(vote14);
 
         let finalized = engine.get_finalized_number_and_hash(&head).unwrap();
         assert_eq!(finalized, (99, parent_hash), "14 votes should reach quorum");
@@ -1172,8 +1182,6 @@ pub struct BscForkChoiceEngine<P> {
     >,
     /// Finality metrics
     finality_metrics: BscFinalityMetrics,
-    /// Blockchain metrics (including reorg metrics)
-    blockchain_metrics: BscBlockchainMetrics,
 }
 
 impl<P> BscForkChoiceEngine<P>
@@ -1195,7 +1203,6 @@ where
                 schnellru::ByLength::new(128),
             ))),
             finality_metrics: BscFinalityMetrics::default(),
-            blockchain_metrics: BscBlockchainMetrics::default(),
         }
     }
 
@@ -1238,33 +1245,8 @@ where
         // Determine if we need to reorg using fork choice rules
         let need_reorg = self.is_need_reorg(incoming_header, &current_head).await?;
 
-        // Only count as reorg if:
-        // 1. Fork choice says we need to reorg AND
-        // 2. The incoming block number is <= current head (actual chain reorganization)
-        //    OR the incoming block's parent is not the current head (side chain switch)
-        let is_actual_reorg = need_reorg
-            && (incoming_header.number <= current_head.number
-                || incoming_header.parent_hash != current_head.hash_slow());
-
-        if is_actual_reorg {
-            // Calculate reorg depth: the difference between incoming and current head numbers
-            // Note: This is a simplified calculation.
-            let reorg_depth = incoming_header.number.abs_diff(current_head.number);
-
-            self.blockchain_metrics.reorg_executions_total.increment(1);
-            self.blockchain_metrics.latest_reorg_depth.set(reorg_depth as f64);
-
-            tracing::info!(
-                target: "bsc::forkchoice",
-                incoming_number = incoming_header.number,
-                incoming_hash = ?incoming_header.hash_slow(),
-                current_number = current_head.number,
-                current_hash = ?current_head.hash_slow(),
-                reorg_depth,
-                "Reorg detected and metrics recorded"
-            );
-        }
-
+        // A preferred head may simply extend the current chain by several blocks.
+        // Reorg metrics are recorded from the engine's canonical notifications instead.
         let new_canonical_head = if need_reorg { incoming_header } else { &current_head };
 
         // Get safe block and finalized block with new canonical head
@@ -1297,7 +1279,7 @@ where
             "Fork choice updated"
         );
 
-        match self
+        let outcome = match self
             .engine_handle
             .fork_choice_updated(state, None)
             .await
@@ -1309,7 +1291,28 @@ where
                 _ => Ok(()),
             },
             Err(err) => Err(ParliaConsensusErr::ForkChoiceUpdateError(err.to_string())),
+        };
+
+        // Promote future votes now that the block is canonical. This is the
+        // import event go-bsc gets from `highestVerifiedBlock`, and vote arrival
+        // cannot stand in for it: the vote that would trigger promotion may
+        // already have been received and deduped.
+        //
+        // It has to run *after* the forkchoice update, not before. reth
+        // canonicalizes in `on_forkchoice_updated`, never in `on_new_payload`,
+        // and `ConsistentProvider::header` resolves a hash only against the
+        // canonical in-memory chain or the database. Before the update the block
+        // we just imported is in neither, so every vote for it would be judged
+        // "still future" and skipped — leaving the next proposer reading an empty
+        // `cur_votes`, which is the lag this is meant to remove.
+        //
+        // A failed update means the block did not become canonical, so there is
+        // nothing to promote against.
+        if outcome.is_ok() {
+            crate::consensus::parlia::vote_pool::promote_future_votes(new_canonical_head.number);
         }
+
+        outcome
     }
 
     /// Determines if a chain reorganization is needed based on fork choice rules.
@@ -1371,19 +1374,16 @@ where
             return None;
         }
 
-        let sp = shared::get_snapshot_provider()?;
-
-        match sp.snapshot_by_hash(&header.hash_slow()) {
-            Some(snap) => Some((snap.vote_data.target_number, snap.vote_data.target_hash)),
-            None => {
-                tracing::warn!(
-                    target: "bsc::forkchoice",
-                    header_hash = ?header.hash_slow(),
-                    "Missing snapshot for header when get justified number and hash"
-                );
-                None
-            }
+        let hash = header.hash_slow();
+        let pair = crate::consensus::parlia::vote_pool::justified_pair_for_hash(&hash);
+        if pair.is_none() {
+            tracing::warn!(
+                target: "bsc::forkchoice",
+                header_hash = ?hash,
+                "Missing snapshot for header when get justified number and hash"
+            );
         }
+        pair
     }
 
     /// Gets the finalized number and hash from the header's snapshot.

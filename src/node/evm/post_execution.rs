@@ -1,9 +1,9 @@
 use super::executor::BscBlockExecutor;
 use super::error::{BscBlockExecutionError, BscBlockValidationError};
 use super::util::set_nonce;
-use super::config::revm_spec_by_timestamp_and_block_number;
+use super::config::{revm_spec_by_timestamp_and_block_number, BscExecutionMode};
 use crate::consensus::parlia::{FF_REWARD_DISTRIBUTION_INTERVAL};
-use crate::node::evm::pre_execution::TURN_LENGTH_CACHE;
+use crate::node::evm::pre_execution::{CallBlockEnv, TURN_LENGTH_CACHE};
 use crate::node::evm::util::get_header_by_hash_from_cache;
 use crate::node::miner::signer::{sign_system_transaction, is_signer_initialized};
 use crate::consensus::parlia::{DIFF_INTURN, VoteAddress, VoteAttestation, snapshot::DEFAULT_TURN_LENGTH, constants::COLLECT_ADDITIONAL_VOTES_REWARD_RATIO, util::is_breathe_block};
@@ -46,7 +46,7 @@ where
         Tx: FromRecoveredTx<R::Transaction>
                 + FromRecoveredTx<TransactionSigned>
                 + FromTxWithEncoded<TransactionSigned>,
-        BlockEnv = BlockEnv,
+        BlockEnv = crate::evm::block_env::BscBlockEnv,
     >,
     Spec: EthereumHardforks + crate::hardforks::BscHardforks + EthChainSpec + Hardforks + Clone + 'static,
     R: ReceiptBuilder<Transaction = TransactionSigned, Receipt: TxReceipt>,
@@ -61,15 +61,25 @@ where
         &mut self, 
         block: &BlockEnv
     ) -> Result<(), BlockExecutionError> {
-        tracing::debug!("Start to post check new block, block_number: {}, is_miner: {}", block.number(), self.ctx.is_miner); 
+        tracing::debug!("Start to post check new block, block_number: {}, mode: {:?}", block.number(), self.ctx.mode);
         self.verify_validators(self.inner_ctx.current_validators.clone(), self.inner_ctx.header.clone())?;
         self.verify_turn_length(self.inner_ctx.header.clone())?;
 
         // check the system txs.
-        if self.inner_ctx.header.as_ref().unwrap().difficulty != DIFF_INTURN {
+        let header_difficulty = self
+            .inner_ctx
+            .header
+            .as_ref()
+            .ok_or_else(|| BlockExecutionError::msg("Missing header in execution context"))?
+            .difficulty;
+        if header_difficulty != DIFF_INTURN {
             tracing::debug!("Start to slash spoiled validator, block_number: {}, block_difficulty: {:?}, diff_inturn: {:?}", 
-                block.number(), self.inner_ctx.header.as_ref().unwrap().difficulty, DIFF_INTURN);
-            let snap = self.inner_ctx.snap.as_ref().unwrap();
+                block.number(), header_difficulty, DIFF_INTURN);
+            let snap = self
+                .inner_ctx
+                .snap
+                .as_ref()
+                .ok_or_else(|| BlockExecutionError::msg("Missing snapshot in execution context"))?;
             let spoiled_validator = snap.inturn_validator();
             let signed_recently = if self.spec.is_plato_active_at_block(block.number().to()) {
                 snap.sign_recently(spoiled_validator)
@@ -100,7 +110,12 @@ where
         let header_number = self.evm.block().number().to::<u64>();
         let header_timestamp = self.evm.block().timestamp().to::<u64>();
         let header_beneficiary = self.evm.block().beneficiary();
-        let parent_header = self.inner_ctx.parent_header.as_ref().unwrap().clone();
+        let parent_header = self
+            .inner_ctx
+            .parent_header
+            .as_ref()
+            .ok_or_else(|| BlockExecutionError::msg("Missing parent header in execution context"))?
+            .clone();
         if self.spec.is_feynman_active_at_timestamp(header_number, header_timestamp) &&
             is_breathe_block(parent_header.timestamp, header_timestamp) &&
             !self.spec.is_feynman_transition_at_timestamp(header_number, header_timestamp, parent_header.timestamp)
@@ -129,14 +144,19 @@ where
             return Err(BscBlockExecutionError::Validation(BscBlockValidationError::UnexpectedSystemTx).into());
         }
 
-        let header = self.inner_ctx.header.as_ref().unwrap().clone();
+        let header = self
+            .inner_ctx
+            .header
+            .as_ref()
+            .ok_or_else(|| BlockExecutionError::msg("Missing header in execution context"))?
+            .clone();
         
         // Notes: here we get the current block's snapshot (after applying this block's header) to prepare cache.
         // This is important because epoch_num may change during block application
         let current_snap = self
             .snapshot_provider
             .as_ref()
-            .unwrap()
+            .ok_or_else(|| BlockExecutionError::msg("Snapshot provider is not available"))?
             .snapshot_by_hash(&header.hash_slow())
             .ok_or(BlockExecutionError::msg("Failed to get current snapshot from snapshot provider"))?;
         
@@ -146,7 +166,11 @@ where
         if is_next_epoch {  // cache validators
             // cache it on pre block.
             // for verify validators in post-check of fullnode mode and prepare new header in miner mode.
-            self.get_current_validators_with_cache(header.number, header.hash_slow())?;
+            self.get_current_validators_with_cache(
+                header.number,
+                header.hash_slow(),
+                CallBlockEnv::Current, // unchanged: this block's own env
+            )?;
         }
 
         { // cache turnlength
@@ -164,6 +188,8 @@ where
                     header.number, header.hash_slow(), epoch_length, turn_length);
             }
         }
+        self.verify_payment_lane(self.gas_used)?;
+
         tracing::trace!("Succeed to finalize new block, block_number: {}", block.number());
         Ok(())
     }
@@ -173,8 +199,15 @@ where
         current_validators: Option<(Vec<Address>, HashMap<Address, VoteAddress>)>, 
         header: Option<Header>
     ) -> Result<(), BlockExecutionError> {
-        let header_ref = header.as_ref().unwrap();
-        let epoch_length = self.inner_ctx.snap.as_ref().unwrap().epoch_num;
+        let header_ref = header
+            .as_ref()
+            .ok_or_else(|| BlockExecutionError::msg("Missing header in execution context"))?;
+        let epoch_length = self
+            .inner_ctx
+            .snap
+            .as_ref()
+            .ok_or_else(|| BlockExecutionError::msg("Missing snapshot in execution context"))?
+            .epoch_num;
         if !header_ref.number.is_multiple_of(epoch_length) {
             tracing::trace!("Skip verify validator, block_number {} is not an epoch boundary, epoch_length: {}", header_ref.number, epoch_length);
             return Ok(());
@@ -204,7 +237,10 @@ where
             })
             .collect();
 
-        let expected = self.parlia.get_validator_bytes_from_header(header_ref, epoch_length).unwrap();
+        let expected = self
+            .parlia
+            .get_validator_bytes_from_header(header_ref, epoch_length)
+            .ok_or_else(|| BlockExecutionError::msg("Missing validator bytes in epoch header"))?;
         if !validator_bytes.as_slice().eq(expected.as_slice()) {
             warn!("validator bytes: {:?}", hex::encode(validator_bytes));
             warn!("expected: {:?}", hex::encode(expected));
@@ -219,8 +255,15 @@ where
         &mut self, 
         header: Option<Header>
     ) -> Result<(), BlockExecutionError> {
-        let header_ref = header.as_ref().unwrap();
-        let epoch_length = self.inner_ctx.snap.as_ref().unwrap().epoch_num;
+        let header_ref = header
+            .as_ref()
+            .ok_or_else(|| BlockExecutionError::msg("Missing header in execution context"))?;
+        let epoch_length = self
+            .inner_ctx
+            .snap
+            .as_ref()
+            .ok_or_else(|| BlockExecutionError::msg("Missing snapshot in execution context"))?
+            .epoch_num;
         if !header_ref.number.is_multiple_of(epoch_length) || !self.spec.is_bohr_active_at_timestamp(header_ref.number, header_ref.timestamp) {
             tracing::trace!("Skip verify turn length, block_number {} is not an epoch boundary, epoch_length: {}", header_ref.number, epoch_length);
             return Ok(());
@@ -260,7 +303,13 @@ where
             let (to, data) = self.system_contracts.get_turn_length();
             let bz = self.eth_call(to, data)?;
 
-            let turn_length = self.system_contracts.unpack_data_into_turn_length(bz.as_ref()).to::<u8>();
+            let turn_length = self
+                .system_contracts
+                .unpack_data_into_turn_length(bz.as_ref())
+                .ok_or_else(|| {
+                    BlockExecutionError::msg("Failed to decode system contract output")
+                })?
+                .to::<u8>();
             return Ok(turn_length);
         }
 
@@ -299,7 +348,19 @@ where
 
         let transaction = set_nonce(transaction, account.nonce);
 
-        let signed_tx = if !self.ctx.is_miner {
+        // Unreachable today — `finish` skips the finalization and contract-init steps that lead
+        // here — but simulation must never sign, so guard rather than trust the callers.
+        if self.ctx.mode == BscExecutionMode::Simulation {
+            debug_assert!(false, "system tx attempted during simulation: {transaction:?}");
+            tracing::warn!(
+                target: "bsc::evm",
+                "Skipping system transaction in simulation mode: {:?}",
+                transaction.to()
+            );
+            return Ok(());
+        }
+
+        let signed_tx = if self.ctx.mode == BscExecutionMode::Import {
             let hash = transaction.signature_hash();
             if self.system_txs.is_empty() || hash != self.system_txs[0].signature_hash() {
                 // slash tx could fail and not in the block
@@ -338,7 +399,9 @@ where
             return Err(BscBlockExecutionError::GlobalSignerNotInitializedForMiningMode.into());
         };
 
-        if self.ctx.is_miner {
+        // The complement of the branch above: this node signed the transaction rather than
+        // taking it from the block, so it has to be recorded into the block being assembled.
+        if self.ctx.mode != BscExecutionMode::Import {
             if let Some(signed) = signed_tx.clone() {
                 let recovered = signed.clone().try_into_recovered_unchecked().unwrap_or_else(|_| {
                     panic!("Failed to recover system transaction signature")
@@ -374,7 +437,9 @@ where
         let tx_env = BscTxEnv {
             base: TxEnv {
                 caller: sender,
-                kind: TxKind::Call(tx_to.unwrap()),
+                kind: TxKind::Call(
+                    tx_to.ok_or_else(|| BlockExecutionError::msg("System tx has no recipient"))?,
+                ),
                 nonce: account.nonce,
                 gas_limit: u64::MAX / 2,
                 value: transaction.value(),
@@ -436,7 +501,7 @@ where
             state: &state,
             cumulative_gas_used: self.gas_used,
         }));
-        self.evm.db_mut().commit(state);
+        self.commit_state(state);
 
         // Record system contract execution duration
         let duration = start_time.elapsed();
@@ -558,7 +623,7 @@ where
                 ok_or_else(|| BlockExecutionError::msg(format!("Header not found for block hash: {target_hash}")))?;
             let snap = self.snapshot_provider.
                 as_ref().
-                unwrap().
+                ok_or_else(|| BlockExecutionError::msg("Snapshot provider is not available"))?.
                 snapshot_by_hash(&header.parent_hash).
                 ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;
 
@@ -596,8 +661,15 @@ where
             .ok_or_else(|| BlockExecutionError::msg(format!("Header not found, block_hash: {}", attestation.data.target_hash)))?;
         let parent = get_header_by_hash_from_cache(&justified_header.parent_hash)
             .ok_or_else(|| BlockExecutionError::msg(format!("Header not found, block_hash: {}", justified_header.parent_hash)))?;
-        let snapshot = self.snapshot_provider.as_ref().unwrap().snapshot_by_hash(&parent.hash_slow());
-        let validators = &snapshot.unwrap().validators;  
+        let snapshot = self
+            .snapshot_provider
+            .as_ref()
+            .ok_or_else(|| BlockExecutionError::msg("Snapshot provider is not available"))?
+            .snapshot_by_hash(&parent.hash_slow())
+            .ok_or_else(|| BlockExecutionError::msg(format!(
+                "Snapshot not found for block hash: {}", parent.hash_slow()
+            )))?;
+        let validators = &snapshot.validators;
         let mut validators_bit_set = BitSet::new();
         let vote_address_set = attestation.vote_address_set;
         for i in 0..64 {
@@ -657,8 +729,12 @@ where
         &mut self, 
         block: &BlockEnv
     ) -> Result<(), BlockExecutionError> {
-        tracing::debug!("Start to finalize new block, block_number: {}, is_miner: {}", block.number(), self.ctx.is_miner);
-        let snap = self.inner_ctx.snap.as_ref().unwrap();
+        tracing::debug!("Start to finalize new block, block_number: {}, mode: {:?}", block.number(), self.ctx.mode);
+        let snap = self
+            .inner_ctx
+            .snap
+            .as_ref()
+            .ok_or_else(|| BlockExecutionError::msg("Missing snapshot in execution context"))?;
         let epoch_length = snap.epoch_num;
         let expected_validator = snap.inturn_validator();
         if block.beneficiary() != expected_validator {
@@ -695,7 +771,12 @@ where
         let header_number = self.evm.block().number().to::<u64>();
         let header_timestamp = self.evm.block().timestamp().to::<u64>();
         let header_beneficiary = self.evm.block().beneficiary();
-        let parent_header = self.inner_ctx.parent_header.as_ref().unwrap().clone();
+        let parent_header = self
+            .inner_ctx
+            .parent_header
+            .as_ref()
+            .ok_or_else(|| BlockExecutionError::msg("Missing parent header in execution context"))?
+            .clone();
         if self.spec.is_feynman_active_at_timestamp(header_number, header_timestamp) &&
             is_breathe_block(parent_header.timestamp, header_timestamp) &&
             !self.spec.is_feynman_transition_at_timestamp(header_number, header_timestamp, parent_header.timestamp)
@@ -722,7 +803,8 @@ where
                 "Check validator cache update: block_number={}, epoch_length={}, is_next_epoch={}",
                 header_number, epoch_length, is_next_epoch
             );
-            let (validators, vote_addresses) = self.get_current_validators(header_number)?;
+            let (validators, vote_addresses) =
+                self.get_current_validators(header_number, CallBlockEnv::Current)?;
             self.shared_ctx.inner.borrow_mut().current_validators = Some((validators, vote_addresses));
         }
 

@@ -7,7 +7,7 @@ use serde_json::Value as JsonValue;
 use std::fs;
 
 use super::vote::{VoteAddress, VoteData, VoteEnvelope, VoteSignature};
-use blst::min_pk::SecretKey;
+use blst::{min_pk::{PublicKey, SecretKey, Signature}, BLST_ERROR};
 
 /// Domain separation tag used across the codebase for BLS (POP scheme).
 const BLST_DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
@@ -18,6 +18,7 @@ pub enum BlsSignerError {
     NotInitialized,
     InvalidSecret(String),
     SigningFailed(String),
+    VerificationFailed(String),
 }
 
 impl std::fmt::Display for BlsSignerError {
@@ -27,6 +28,7 @@ impl std::fmt::Display for BlsSignerError {
             Self::NotInitialized => write!(f, "Global BLS signer not initialized"),
             Self::InvalidSecret(e) => write!(f, "Invalid BLS secret: {e}"),
             Self::SigningFailed(e) => write!(f, "BLS signing failed: {e}"),
+            Self::VerificationFailed(e) => write!(f, "BLS vote verification failed: {e}"),
         }
     }
 }
@@ -69,6 +71,51 @@ impl BlsVoteSigner {
         let vote_address = self.public_key()?;
         let signature = self.sign_hash(data.hash())?;
         Ok(VoteEnvelope { vote_address, signature, data })
+    }
+}
+
+/// Verifies a vote envelope's BLS signature against the vote address it carries.
+///
+/// Mirrors go-bsc's `VoteEnvelope.Verify` (`core/types/vote.go`), which is invoked
+/// from `basicVerify` before a vote may enter the pool: the 48-byte `vote_address`
+/// must decode to a valid BLS public key, the 96-byte `signature` to a valid G2
+/// point, and the signature must cover `data.hash()`.
+///
+/// This is the authentication boundary for votes arriving from peers — nothing
+/// between the wire and the pool checks them otherwise, and pool contents feed
+/// both finality notification and vote-attestation assembly.
+pub fn verify_vote_envelope(envelope: &VoteEnvelope) -> Result<(), BlsSignerError> {
+    let pk = PublicKey::from_bytes(envelope.vote_address.as_slice())
+        .map_err(|e| BlsSignerError::VerificationFailed(format!("invalid vote address: {e:?}")))?;
+    let sig = Signature::from_bytes(envelope.signature.as_slice())
+        .map_err(|e| BlsSignerError::VerificationFailed(format!("invalid signature: {e:?}")))?;
+
+    match sig.verify(true, envelope.data.hash().as_slice(), BLST_DST, &[], &pk, true) {
+        BLST_ERROR::BLST_SUCCESS => Ok(()),
+        e => Err(BlsSignerError::VerificationFailed(format!("{e:?}"))),
+    }
+}
+
+/// A freshly generated BLS signer for tests.
+///
+/// Generated rather than hard-coded so that no key-shaped literal appears in the
+/// source at all. The top nibble is cleared so the scalar is provably below the
+/// BLS12-381 group order, which exceeds 2^252: unmasked random bytes exceed the
+/// order roughly four times in five and `SecretKey::from_bytes` would reject
+/// them, which would make callers flaky rather than clean.
+///
+/// The key's value is irrelevant to every caller — they need *a* valid keypair,
+/// and distinct calls yield distinct keys, which is what tests needing several
+/// signers rely on.
+#[cfg(test)]
+pub fn random_test_signer() -> BlsVoteSigner {
+    loop {
+        let mut raw: [u8; 32] = alloy_primitives::B256::random().into();
+        raw[0] &= 0x0f;
+        if raw != [0u8; 32] {
+            return BlsVoteSigner::new_from_bytes(raw)
+                .expect("a masked scalar is always a valid BLS secret key");
+        }
     }
 }
 
@@ -313,9 +360,7 @@ mod tests {
     #[test]
     fn bls_sign_and_verify_single_key() {
         // use a small valid BLS scalar: 1 (big-endian)
-        let mut raw = [0u8; 32];
-        raw[31] = 1;
-        let signer = BlsVoteSigner::new_from_bytes(raw).expect("create bls signer");
+        let signer = random_test_signer();
 
         // Compose vote data
         let data = VoteData {

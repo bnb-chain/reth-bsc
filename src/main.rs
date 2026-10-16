@@ -53,6 +53,28 @@ pub struct BscCliArgs {
     #[arg(long = "mining.bid-block-enabled")]
     pub mining_bid_block_enabled: bool,
 
+    /// Port for the BEP-675 `BidBlockService` gRPC listener (default 8552; zero uses default).
+    ///
+    /// Env alternative: `BSC_MEV_GRPC_PORT`.
+    #[arg(long = "mining.mev-grpc-port")]
+    pub mining_mev_grpc_port: Option<u16>,
+
+    /// Disable MEV gRPC. Env alternative: `BSC_MEV_GRPC_DISABLED=true`.
+    #[arg(long = "mev.grpc.disable")]
+    pub mev_grpc_disabled: bool,
+
+    /// Maximum process-wide in-flight gRPC `SendBidBlock` requests.
+    ///
+    /// Env alternative: `BSC_MEV_GRPC_CONCURRENCY`.
+    #[arg(long = "mining.mev-grpc-concurrency")]
+    pub mining_mev_grpc_concurrency: Option<u32>,
+
+    /// Total gRPC `SendBidBlock` timeout in milliseconds.
+    ///
+    /// Env alternative: `BSC_MEV_GRPC_REQUEST_TIMEOUT_MS`.
+    #[arg(long = "mining.mev-grpc-request-timeout-ms")]
+    pub mining_mev_grpc_request_timeout_ms: Option<u64>,
+
     /// Private key for mining (hex format, for testing only)
     /// The validator address will be automatically derived from this key
     #[arg(long = "mining.private-key")]
@@ -77,6 +99,11 @@ pub struct BscCliArgs {
     /// Genesis hash override for chain validation
     #[arg(long = "genesis-hash")]
     pub genesis_hash: Option<String>,
+
+    /// Maximum number of entries the live pruner may delete per run, shared by all
+    /// segments. Defaults to the chain spec value (10000 on BSC networks).
+    #[arg(long = "prune.delete-limit", value_parser = clap::value_parser!(u64).range(1..))]
+    pub prune_delete_limit: Option<u64>,
 
     // ---- BLS vote key management ----
     /// Path to a BLS keystore JSON for vote signing (used for voting/attestations)
@@ -213,6 +240,14 @@ fn main() -> eyre::Result<()> {
                 return Err(e);
             }
 
+            // The pruner reads this from the node config's chain spec at launch.
+            if let Some(limit) = args.prune_delete_limit {
+                let mut chain = (*builder.config().chain).clone();
+                chain.inner.prune_delete_limit = limit as usize;
+                builder.config_mut().chain = Arc::new(chain);
+                tracing::info!(limit, "Prune delete limit override set");
+            }
+
             if builder.config().rpc.ipcdisable {    
                 panic!("IPC is disabled, please enable it by setting --ipc.enable to true");
             }
@@ -284,6 +319,19 @@ fn main() -> eyre::Result<()> {
                 // CLI takes precedence over env BSC_MINING_BID_BLOCK_ENABLED.
                 if args.mining_bid_block_enabled {
                     mining_config.bid_block_enabled = true;
+                }
+
+                if let Some(port) = args.mining_mev_grpc_port {
+                    mining_config.mev_grpc_port = port;
+                }
+                if args.mev_grpc_disabled {
+                    mining_config.mev_grpc_disabled = true;
+                }
+                if let Some(concurrency) = args.mining_mev_grpc_concurrency {
+                    mining_config.mev_grpc_concurrency = concurrency;
+                }
+                if let Some(timeout_ms) = args.mining_mev_grpc_request_timeout_ms {
+                    mining_config.mev_grpc_request_timeout_ms = timeout_ms;
                 }
 
                 // Ensure keys are available if enabled but none provided
@@ -426,16 +474,41 @@ fn main() -> eyre::Result<()> {
                 }
             }
 
+            let mev_grpc_config =
+                reth_bsc::node::miner::config::get_global_mining_config().and_then(|config| {
+                    let port = config.get_mev_grpc_port();
+                    config.is_mev_grpc_enabled().then(|| {
+                        (
+                            port,
+                            reth_bsc::grpc::mev::MevGrpcConfig::new(
+                                config.get_mev_grpc_concurrency(),
+                                std::time::Duration::from_millis(
+                                    config.get_mev_grpc_request_timeout_ms(),
+                                ),
+                            ),
+                        )
+                    })
+                });
+            // Match go-bsc: the gRPC listener uses the configured HTTP bind host and an independent
+            // port. The handle crosses the synchronous RPC-extension hook so it can be shut down
+            // after the node exit future resolves.
+            let mev_grpc_host = builder.config().rpc.http_addr;
+            let mev_grpc_handle = Arc::new(std::sync::Mutex::new(None));
+            let mev_grpc_handle_for_rpc = Arc::clone(&mev_grpc_handle);
+
             let (node, engine_handle_tx) = BscNode::new();
             let NodeHandle { node, node_exit_future: exit_future } =
                 builder.node(node)
                     .extend_rpc_modules(move |ctx| {
+                        if ctx.config().metrics.prometheus.is_some() || ctx.config().metrics.push_gateway_url.is_some() {
+                            reth_bsc::evm::precompiles::cas20::enable_metrics();
+                        }
                         // Every BSC namespace below is registered with `merge_if_module_configured`
                         // rather than `merge_configured`: the latter merges into every configured
                         // transport regardless of `--http.api`/`--ws.api`, so operator namespace
                         // selection was silently ignored for the BSC-specific APIs. That left
                         // `admin_setBidBlockPermission`, `miner_stop`, `miner_setGasLimit`,
-                        // `miner_setEtherbase` and `mev_addBuilder`/`removeBuilder` callable
+                        // `miner_setEtherbase` and `miner_addBuilder`/`removeBuilder` callable
                         // unauthenticated on any node with HTTP enabled, even when the operator had
                         // excluded those namespaces — geth honours the equivalent `HTTPModules`
                         // setting, so this was also a parity gap.
@@ -477,8 +550,8 @@ fn main() -> eyre::Result<()> {
 
                         // Get chain spec from context
                         let chain_spec = std::sync::Arc::new(ctx.config().chain.clone().as_ref().clone());
-                        let mev_api = MevApiImpl::new(snapshot_provider, chain_spec);
-                        ctx.modules.merge_if_module_configured(RethRpcModule::Mev, mev_api.into_rpc())?;
+                        let mev_api = Arc::new(MevApiImpl::new(snapshot_provider, chain_spec));
+                        ctx.modules.merge_if_module_configured(RethRpcModule::Mev, mev_api.as_ref().clone().into_rpc())?;
                         tracing::info!("Succeed to register MEV RPC API");
 
                         tracing::info!("Start to register Miner RPC API...");
@@ -493,20 +566,48 @@ fn main() -> eyre::Result<()> {
                         ctx.modules.merge_if_module_configured(RethRpcModule::Miner, miner_api.into_rpc())?;
                         tracing::info!("Succeed to register Miner RPC API");
 
-                        tracing::info!("Start to register BSC Eth extension API (eth_coinbase, eth_health)...");
+                        tracing::info!("Start to register BSC Eth extension API (eth_coinbase, eth_health, eth_getCAS20TokenInfo)...");
                         use reth_bsc::rpc::eth_ext::{BscEthExtApiImpl, BscEthExtApiServer};
+                        use reth_rpc_eth_api::helpers::SpawnBlocking;
 
                         // Remove the default unimplemented eth_coinbase before registering our version
                         ctx.modules.remove_method_from_configured("eth_coinbase");
-                        let eth_ext_api = BscEthExtApiImpl::new();
+                        let eth_ext_api = BscEthExtApiImpl::new(
+                            ctx.provider().clone(),
+                            ctx.registry.eth_api().blocking_io_task_guard().clone(),
+                        );
                         ctx.modules.merge_if_module_configured(RethRpcModule::Eth, eth_ext_api.into_rpc())?;
                         tracing::info!("Succeed to register BSC Eth extension API");
 
-                        tracing::info!("Start to register BSC Admin RPC API (admin_setBidBlockPermission)...");
+                        use reth_bsc::rpc::access_list::{BscAccessListApiImpl, BscAccessListApiServer};
+                        ctx.modules.remove_method_from_configured("eth_createAccessList");
+                        let access_list_api = BscAccessListApiImpl(ctx.registry.eth_api().clone());
+                        ctx.modules.merge_if_module_configured(RethRpcModule::Eth, access_list_api.into_rpc())?;
+
+                        use reth_bsc::rpc::code_overrides::{BscCodeOverridesApiImpl, BscCodeOverridesApiServer};
+                        for method in ["eth_call", "eth_estimateGas", "eth_callMany", "eth_simulateV1"] {
+                            ctx.modules.remove_method_from_configured(method);
+                        }
+                        let overrides_api = BscCodeOverridesApiImpl(ctx.registry.eth_api().clone());
+                        ctx.modules.merge_if_module_configured(RethRpcModule::Eth, overrides_api.into_rpc())?;
+
+                        use reth_bsc::rpc::prestate::{BscPrestateApiImpl, BscPrestateApiServer};
+                        for method in reth_bsc::rpc::prestate::METHODS {
+                            ctx.modules.remove_method_from_configured(method);
+                        }
+                        let prestate_api = BscPrestateApiImpl(ctx.registry.debug_api());
+                        ctx.modules.merge_if_module_configured(RethRpcModule::Debug, prestate_api.into_rpc())?;
+
+                        tracing::info!("Start to register BSC Admin RPC API (admin_setBidBlockPermission, admin_nodeInfo)...");
                         use reth_bsc::rpc::admin::{BscAdminApiImpl, BscAdminApiServer};
 
                         let admin_api = BscAdminApiImpl::new();
                         ctx.modules.merge_if_module_configured(RethRpcModule::Admin, admin_api.into_rpc())?;
+
+                        use reth_bsc::rpc::admin::{BscNodeInfoApiImpl, BscNodeInfoApiServer};
+                        ctx.modules.remove_method_from_configured("admin_nodeInfo");
+                        let node_info_api = BscNodeInfoApiImpl(ctx.registry.admin_api());
+                        ctx.modules.merge_if_module_configured(RethRpcModule::Admin, node_info_api.into_rpc())?;
                         tracing::info!("Succeed to register BSC Admin RPC API");
 
                         tracing::info!("Start to register Blob RPC API...");
@@ -516,7 +617,7 @@ fn main() -> eyre::Result<()> {
                         let pool = ctx.pool().clone();
                         let provider = ctx.provider().clone();
 
-                        let blob_api = BlobApiImpl::new(pool, provider);
+                        let blob_api = BlobApiImpl::new(pool, provider, ctx.config().pruning.minimal);
                         ctx.modules.merge_if_module_configured(RethRpcModule::Eth, blob_api.into_rpc())?;
                         tracing::info!("Succeed to register Blob RPC API");
 
@@ -541,6 +642,18 @@ fn main() -> eyre::Result<()> {
                         );
                         ctx.modules.merge_if_module_configured(RethRpcModule::Eth, eth_config.into_rpc())?;
                         tracing::info!("Succeed to register eth_config (EIP-7910) API");
+
+                        // Bind only after all RPC module registration succeeded, so a later merge
+                        // error cannot leave a detached gRPC listener behind during failed startup.
+                        if let Some((port, grpc_config)) = mev_grpc_config {
+                            let listen_addr = std::net::SocketAddr::new(mev_grpc_host, port);
+                            let handle = reth_bsc::grpc::mev::start_mev_grpc_server(
+                                listen_addr,
+                                grpc_config,
+                                mev_api,
+                            )?;
+                            *mev_grpc_handle_for_rpc.lock().unwrap() = Some(handle);
+                        }
                         Ok(())
                     })
                     .launch().await?;
@@ -557,10 +670,16 @@ fn main() -> eyre::Result<()> {
                 node.provider.canonical_in_memory_state(),
             );
 
-            // Set the IPC client
-            reth_bsc::shared::set_ipc_client(ipc_path).await.unwrap();
+            // Set the IPC client. IPC is required (see the `--ipc.disable` check above), so a
+            // failure here is a startup error rather than something to panic on.
+            reth_bsc::shared::set_ipc_client(ipc_path).await?;
 
-            exit_future.await
+            let grpc_handle = mev_grpc_handle.lock().unwrap().take();
+            let exit_result = exit_future.await;
+            if let Some(handle) = grpc_handle {
+                handle.shutdown().await;
+            }
+            exit_result
         },
     )?;
     Ok(())

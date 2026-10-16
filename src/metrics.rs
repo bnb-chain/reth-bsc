@@ -191,6 +191,50 @@ pub struct BscMevMetrics {
     pub bid_interrupt_late_total: Counter,
 }
 
+/// Metrics for the BEP-675 gRPC ingress.
+#[derive(Metrics, Clone)]
+#[metrics(scope = "bsc.mev.grpc")]
+pub struct BscMevGrpcMetrics {
+    /// Total `SendBidBlock` requests that reached the gRPC handler.
+    pub requests_total: Counter,
+
+    /// Total gRPC BidBlock requests rejected by decoding or MEV admission.
+    pub errors_total: Counter,
+
+    /// Total requests rejected because the process-wide concurrency budget was exhausted.
+    pub rejected_total: Counter,
+
+    /// Current number of gRPC BidBlock requests holding an admission permit.
+    pub active_requests: Gauge,
+
+    /// RLP BidBlock decode duration in seconds.
+    pub decode_duration_seconds: Histogram,
+
+    /// End-to-end handler duration in seconds.
+    pub handler_duration_seconds: Histogram,
+
+    /// Submitted RLP payload size in bytes.
+    pub payload_size_bytes: Histogram,
+}
+
+/// Live-sync bad-block diagnostics, independent of builder revocation evidence.
+#[derive(Metrics, Clone)]
+#[metrics(scope = "bsc.blockchain")]
+pub struct BscBadBlockMetrics {
+    /// Invalid blocks tagged as BEP-675 BidBlocks, deduplicated by a bounded hash cache.
+    pub bad_bid_blocks_total: Counter,
+}
+
+/// Metrics for BEP-675 cross-validator bad-BidBlock evidence.
+#[derive(Metrics, Clone)]
+#[metrics(scope = "bsc.mev.bid_block_evidence")]
+pub struct BscBidBlockEvidenceMetrics {
+    /// Evidence events dropped because the bounded queue was full.
+    pub dropped_total: Counter,
+    /// Builder revocations triggered after cross-validator evidence reached its threshold.
+    pub revokes_total: Counter,
+}
+
 /// Metrics for BSC miner/worker operations
 ///
 /// Tracks block production and finalization metrics.
@@ -294,7 +338,7 @@ pub struct BscBlockchainMetrics {
     /// Size of transactions in the current block in bytes (equivalent to chain/insert/txsize)
     pub block_tx_size_bytes: Gauge,
 
-    /// Total number of chain reorganizations executed (equivalent to chain/reorg/executes)
+    /// Canonical reorganizations applied by the engine (equivalent to chain/reorg/executes).
     pub reorg_executions_total: Counter,
 
     /// Total number of blocks added during reorganizations (equivalent to chain/reorg/add)
@@ -303,7 +347,7 @@ pub struct BscBlockchainMetrics {
     /// Total number of blocks dropped during reorganizations (equivalent to chain/reorg/drop)
     pub reorg_blocks_dropped_total: Counter,
 
-    /// Depth of the latest chain reorganization
+    /// Number of old canonical blocks removed by the latest reorganization.
     pub latest_reorg_depth: Gauge,
 }
 
@@ -332,6 +376,30 @@ pub struct BscParliaGethMetrics {
     pub doublesign: Counter,
 }
 
+/// Metrics for the BEP-703 payment lane.
+#[derive(Metrics, Clone)]
+#[metrics(scope = "bsc.payment_lane")]
+pub struct BscPaymentLaneMetrics {
+    /// Gas reserved for payment transactions in the last imported block
+    pub quota: Gauge,
+    /// Payment gas the last imported block used
+    pub payment_gas_used: Gauge,
+    /// Reserved gas the last imported block left unclaimed
+    pub idle: Gauge,
+    /// Blocks rejected by the lane rule
+    pub rejected: Counter,
+    /// Lane state reads that failed on this node
+    pub state_unavailable: Counter,
+    /// Transactions dropped to keep the reservation intact
+    pub general_lane_yielded: Counter,
+    /// Blocks this validator declined to produce
+    pub produce_declined: Counter,
+}
+
+/// Process-wide payment lane metrics, shared by import, production and the admission gate.
+pub static LANE_METRICS: std::sync::LazyLock<BscPaymentLaneMetrics> =
+    std::sync::LazyLock::new(BscPaymentLaneMetrics::default);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,8 +412,10 @@ mod tests {
         let _rewards_metrics = BscRewardsMetrics::default();
         let _vote_metrics = BscVoteMetrics::default();
         let _mev_metrics = BscMevMetrics::default();
+        let _bid_block_evidence_metrics = BscBidBlockEvidenceMetrics::default();
         let _miner_metrics = BscMinerMetrics::default();
         let _finality_metrics = BscFinalityMetrics::default();
         let _blockchain_metrics = BscBlockchainMetrics::default();
+        let _payment_lane_metrics = BscPaymentLaneMetrics::default();
     }
 }

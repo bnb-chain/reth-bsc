@@ -55,6 +55,13 @@ lazy_static! {
     );
 }
 
+/// `(consensusAddresses, votingPowers, voteAddresses, totalLength)` from
+/// `StakeHub.getValidatorElectionInfo`.
+type ValidatorElectionInfo = (Vec<Address>, Vec<U256>, Vec<Vec<u8>>, U256);
+
+/// `(consensusAddresses, nodeIDsList)` from `StakeHub.getNodeIDs`.
+type NodeIds = (Vec<Address>, Vec<Vec<[u8; 32]>>);
+
 impl<Spec: EthChainSpec + crate::hardforks::BscHardforks> SystemContract<Spec> {
     pub(crate) fn new(chain_spec: Spec) -> Self {
         let validator_abi_before_luban = Arc::clone(&VALIDATOR_SET_ABI_BEFORE_LUBAN_JSON);
@@ -79,18 +86,19 @@ impl<Spec: EthChainSpec + crate::hardforks::BscHardforks> SystemContract<Spec> {
     }
 
     /// Unpack the data into validator set before luban.
-    pub fn unpack_data_into_validator_set_before_luban(&self, data: &[u8]) -> Vec<Address> {
+    ///
+    /// `data` is whatever the system contract returned, so its shape is only guaranteed while
+    /// the deployed contract matches the ABI compiled in here; `None` means it did not.
+    pub fn unpack_data_into_validator_set_before_luban(&self, data: &[u8]) -> Option<Vec<Address>> {
         let function =
             self.validator_abi_before_luban.function("getValidators").unwrap().first().unwrap();
-        let output = function.abi_decode_output(data).unwrap();
+        let output = function.abi_decode_output(data).ok()?;
 
         output
-            .first()
-            .unwrap()
-            .as_array()
-            .unwrap()
+            .first()?
+            .as_array()?
             .iter()
-            .map(|val| val.as_address().unwrap())
+            .map(|val| val.as_address())
             .collect()
     }
 
@@ -101,26 +109,88 @@ impl<Spec: EthChainSpec + crate::hardforks::BscHardforks> SystemContract<Spec> {
     }
 
     /// Unpack the data into validator set.
-    pub fn unpack_data_into_validator_set(&self, data: &[u8]) -> (Vec<Address>, Vec<VoteAddress>) {
+    ///
+    /// `None` if the returned data does not match the ABI compiled in here.
+    pub fn unpack_data_into_validator_set(
+        &self,
+        data: &[u8],
+    ) -> Option<(Vec<Address>, Vec<VoteAddress>)> {
         let function = self.validator_abi.function("getMiningValidators").unwrap().first().unwrap();
-        let output = function.abi_decode_output(data).unwrap();
+        let output = function.abi_decode_output(data).ok()?;
 
-        let consensus_addresses =
-            output[0].as_array().unwrap().iter().map(|val| val.as_address().unwrap()).collect();
-        let vote_address = output[1]
-            .as_array()
-            .unwrap()
+        let consensus_addresses: Vec<Address> =
+            output.first()?.as_array()?.iter().map(|val| val.as_address()).collect::<Option<_>>()?;
+        let vote_address = output
+            .get(1)?
+            .as_array()?
             .iter()
             .map(|val| {
-                if val.as_bytes().unwrap().is_empty() {
+                let bytes = val.as_bytes()?;
+                Some(if bytes.is_empty() {
                     VoteAddress::default()
                 } else {
-                    VoteAddress::from_slice(val.as_bytes().unwrap())
-                }
+                    VoteAddress::from_slice(bytes)
+                })
             })
-            .collect();
+            .collect::<Option<_>>()?;
 
-        (consensus_addresses, vote_address)
+        Some((consensus_addresses, vote_address))
+    }
+
+    /// Return the full cabinet-first validator set, including candidates.
+    pub(crate) fn get_all_validators(&self) -> (Address, Bytes) {
+        let function = self.validator_abi.function("getValidators").unwrap().first().unwrap();
+        (VALIDATOR_CONTRACT, Bytes::from(function.abi_encode_input(&[]).unwrap()))
+    }
+
+    /// Decode the validator addresses returned by `getValidators()` without panicking on
+    /// malformed returndata.
+    pub(crate) fn unpack_all_validators(
+        &self,
+        data: &[u8],
+    ) -> Result<Vec<Address>, String> {
+        let function = self.validator_abi.function("getValidators").unwrap().first().unwrap();
+        let output = function
+            .abi_decode_output(data)
+            .map_err(|err| format!("decode getValidators output: {err}"))?;
+        let validators = output
+            .first()
+            .and_then(DynSolValue::as_array)
+            .ok_or_else(|| "getValidators returned a non-address-array value".to_string())?;
+
+        validators
+            .iter()
+            .map(|value| {
+                value
+                    .as_address()
+                    .ok_or_else(|| "getValidators returned a non-address element".to_string())
+            })
+            .collect()
+    }
+
+    /// Return the validator contract and calldata for `numOfCabinets()`.
+    pub(crate) fn get_num_of_cabinets(&self) -> (Address, Bytes) {
+        let function = self.validator_abi.function("numOfCabinets").unwrap().first().unwrap();
+        (VALIDATOR_CONTRACT, Bytes::from(function.abi_encode_input(&[]).unwrap()))
+    }
+
+    /// Decode the single `uint256` returned by `numOfCabinets()` without panicking on malformed
+    /// returndata.
+    pub(crate) fn unpack_num_of_cabinets(&self, data: &[u8]) -> Result<U256, String> {
+        self.unpack_validator_uint("numOfCabinets", data)
+    }
+
+    fn unpack_validator_uint(&self, method: &str, data: &[u8]) -> Result<U256, String> {
+        let function = self.validator_abi.function(method).unwrap().first().unwrap();
+        let output = function
+            .abi_decode_output(data)
+            .map_err(|err| format!("decode {method} output: {err}"))?;
+
+        output
+            .first()
+            .and_then(DynSolValue::as_uint)
+            .map(|value| value.0)
+            .ok_or_else(|| format!("{method} returned a non-uint value"))
     }
 
     /// Return system address and input which is used to query max elected validators.
@@ -132,12 +202,14 @@ impl<Spec: EthChainSpec + crate::hardforks::BscHardforks> SystemContract<Spec> {
     }
 
     /// Unpack the data into max elected validators.
-    pub fn unpack_data_into_max_elected_validators(&self, data: &[u8]) -> U256 {
+    ///
+    /// `None` if the returned data does not match the ABI compiled in here.
+    pub fn unpack_data_into_max_elected_validators(&self, data: &[u8]) -> Option<U256> {
         let function =
             self.stake_hub_abi.function("maxElectedValidators").unwrap().first().unwrap();
-        let output = function.abi_decode_output(data).unwrap();
+        let output = function.abi_decode_output(data).ok()?;
 
-        output[0].as_uint().unwrap().0
+        Some(output.first()?.as_uint()?.0)
     }
 
     /// Return system address and input which is used to query validator election info.
@@ -164,27 +236,33 @@ impl<Spec: EthChainSpec + crate::hardforks::BscHardforks> SystemContract<Spec> {
     }
 
     /// Unpack the data into validator election info.
+    ///
+    /// `None` if the returned data does not match the ABI compiled in here.
     pub fn unpack_data_into_validator_election_info(
         &self,
         data: &[u8],
-    ) -> (Vec<Address>, Vec<U256>, Vec<Vec<u8>>, U256) {
+    ) -> Option<ValidatorElectionInfo> {
         let function =
             self.stake_hub_abi.function("getValidatorElectionInfo").unwrap().first().unwrap();
-        let output = function.abi_decode_output(data).unwrap();
+        let output = function.abi_decode_output(data).ok()?;
 
-        let consensus_address =
-            output[0].as_array().unwrap().iter().map(|val| val.as_address().unwrap()).collect();
-        let voting_powers =
-            output[1].as_array().unwrap().iter().map(|val| val.as_uint().unwrap().0).collect();
-        let vote_addresses = output[2]
-            .as_array()
-            .unwrap()
+        let consensus_address: Vec<Address> =
+            output.first()?.as_array()?.iter().map(|val| val.as_address()).collect::<Option<_>>()?;
+        let voting_powers: Vec<U256> = output
+            .get(1)?
+            .as_array()?
             .iter()
-            .map(|val| val.as_bytes().unwrap().to_vec())
-            .collect();
-        let total_length = output[3].as_uint().unwrap().0;
+            .map(|val| Some(val.as_uint()?.0))
+            .collect::<Option<_>>()?;
+        let vote_addresses: Vec<Vec<u8>> = output
+            .get(2)?
+            .as_array()?
+            .iter()
+            .map(|val| Some(val.as_bytes()?.to_vec()))
+            .collect::<Option<_>>()?;
+        let total_length = output.get(3)?.as_uint()?.0;
 
-        (consensus_address, voting_powers, vote_addresses, total_length)
+        Some((consensus_address, voting_powers, vote_addresses, total_length))
     }
 
     /// Return system address and input which is used to query turn length.
@@ -195,11 +273,13 @@ impl<Spec: EthChainSpec + crate::hardforks::BscHardforks> SystemContract<Spec> {
     }
 
     /// Unpack the data into turn length.
-    pub fn unpack_data_into_turn_length(&self, data: &[u8]) -> U256 {
+    ///
+    /// `None` if the returned data does not match the ABI compiled in here.
+    pub fn unpack_data_into_turn_length(&self, data: &[u8]) -> Option<U256> {
         let function = self.validator_abi.function("getTurnLength").unwrap().first().unwrap();
-        let output = function.abi_decode_output(data).unwrap();
+        let output = function.abi_decode_output(data).ok()?;
 
-        output[0].as_uint().unwrap().0
+        Some(output.first()?.as_uint()?.0)
     }
 
     /// Return system address and input to query validator NodeIDs from StakeHub.
@@ -213,36 +293,36 @@ impl<Spec: EthChainSpec + crate::hardforks::BscHardforks> SystemContract<Spec> {
 
     /// Unpack the data into (consensusAddresses, nodeIDsList)
     /// Note: This function should only be called after Maxwell hardfork when StakeHub.getNodeIDs is available.
-    pub fn unpack_data_into_node_ids(&self, data: &[u8]) -> (Vec<Address>, Vec<Vec<[u8; 32]>>) {
+    ///
+    /// `None` if the returned data does not match the ABI compiled in here.
+    pub fn unpack_data_into_node_ids(
+        &self,
+        data: &[u8],
+    ) -> Option<NodeIds> {
         let function = self.stake_hub_abi.function("getNodeIDs").unwrap().first().unwrap();
-        let output = function.abi_decode_output(data).unwrap();
+        let output = function.abi_decode_output(data).ok()?;
 
-        let consensus_addresses = output[0]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|val| val.as_address().unwrap())
-            .collect::<Vec<_>>();
+        let consensus_addresses: Vec<Address> =
+            output.first()?.as_array()?.iter().map(|val| val.as_address()).collect::<Option<_>>()?;
 
-        let node_ids_list = output[1]
-            .as_array()
-            .unwrap()
+        let node_ids_list: Vec<Vec<[u8; 32]>> = output
+            .get(1)?
+            .as_array()?
             .iter()
             .map(|arr| {
-                arr.as_array()
-                    .unwrap()
+                arr.as_array()?
                     .iter()
                     .map(|v| {
-                        let (b, _size) = v.as_fixed_bytes().unwrap();
-                        let mut out = [0u8; 32];
-                        out.copy_from_slice(b);
-                        out
+                        let (b, _size) = v.as_fixed_bytes()?;
+                        // A node ID is a bytes32; anything else means the ABI moved on.
+                        let out: [u8; 32] = b.try_into().ok()?;
+                        Some(out)
                     })
-                    .collect::<Vec<[u8; 32]>>()
+                    .collect::<Option<Vec<[u8; 32]>>>()
             })
-            .collect::<Vec<_>>();
+            .collect::<Option<_>>()?;
 
-        (consensus_addresses, node_ids_list)
+        Some((consensus_addresses, node_ids_list))
     }
 
     /// Return a transaction to slash a validator.
@@ -558,6 +638,7 @@ pub const STAKE_CREDIT_CONTRACT: Address = address!("0x0000000000000000000000000
 pub const GOVERNOR_CONTRACT: Address = address!("0x0000000000000000000000000000000000002004");
 pub const GOV_TOKEN_CONTRACT: Address = address!("0x0000000000000000000000000000000000002005");
 pub const TIMELOCK_CONTRACT: Address = address!("0x0000000000000000000000000000000000002006");
+pub const PAYMENT_LANE_CONTRACT: Address = address!("0x0000000000000000000000000000000000002007");
 pub const TOKEN_RECOVER_PORTAL_CONTRACT: Address =
     address!("0x0000000000000000000000000000000000003000");
 
@@ -589,8 +670,6 @@ lazy_static! {
         read_all_system_contracts(&bsc_testnet());
     pub(crate) static ref BSC_QANET_CONTRACTS: HashMap<String, HashMap<Address, Option<Bytecode>>> =
         read_all_system_contracts(&bsc_qanet());
-
-
 }
 
 /// System contracts with their names as keys and addresses as values.
@@ -633,6 +712,7 @@ fn get_all_system_contracts() -> Vec<SystemContractName> {
             "TokenRecoverPortalContract".to_string(),
             TOKEN_RECOVER_PORTAL_CONTRACT,
         ),
+        SystemContractName::new("PaymentLaneContract".to_string(), PAYMENT_LANE_CONTRACT),
     ];
 
     res
@@ -673,6 +753,7 @@ fn hardforks_with_system_contracts() -> Vec<BscHardfork> {
         BscHardfork::Maxwell,
         BscHardfork::Fermi,
         BscHardfork::Pasteur,
+        BscHardfork::Jenner,
     ]
 }
 
@@ -699,6 +780,7 @@ fn hardfork_to_dir_name(hardfork: &BscHardfork) -> Result<String, SystemContract
         BscHardfork::Maxwell => "maxwell",
         BscHardfork::Fermi => "fermi",
         BscHardfork::Pasteur => "pasteur",
+        BscHardfork::Jenner => "jenner",
         _ => {
             return Err(SystemContractError::InvalidHardfork);
         }
@@ -710,16 +792,15 @@ fn hardfork_to_dir_name(hardfork: &BscHardfork) -> Result<String, SystemContract
 fn read_all_system_contracts(
     spec: &ChainSpec,
 ) -> HashMap<String, HashMap<Address, Option<Bytecode>>> {
-    let dir: String;
-    if spec.chain.eq(&Chain::bsc_mainnet()) {
-        dir = "mainnet".to_string();
+    let dir: String = if spec.chain.eq(&Chain::bsc_mainnet()) {
+        "mainnet".to_string()
     } else if spec.chain.eq(&Chain::bsc_testnet()) {
-        dir = "chapel".to_string();
+        "chapel".to_string()
     } else if spec.chain.eq(&Chain::from_id(714)) {
-        dir = "rialto".to_string();
+        "rialto".to_string()
     } else {
         panic!("invalid spec");
-    }
+    };
 
     let all_contracts = get_all_system_contracts();
     let hardforks = hardforks_with_system_contracts();
@@ -1128,6 +1209,22 @@ where
         }
     }
 
+    if spec.is_jenner_transition_at_timestamp(block_number, block_time, parent_block_time) {
+        if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Jenner.name()) {
+            for (address, v) in &contracts {
+                m.insert(*address, v.clone());
+                info!(
+                    target: "bsc::system_contracts::upgrade",
+                    block_number = block_number,
+                    block_time = block_time,
+                    parent_block_time = parent_block_time,
+                    address = ?address,
+                    "Jenner upgrade contract"
+                );
+            }
+        }
+    }
+
     Ok(m)
 }
 
@@ -1164,8 +1261,70 @@ mod tests {
     use alloy_consensus::TxEip1559;
     use alloy_primitives::{address, Signature, U256};
 
+    /// The unpackers decode whatever the system contract returned. That shape is only
+    /// guaranteed while the deployed contract matches the ABI compiled in here, so a
+    /// mismatch has to surface as `None` instead of unwinding the block execution.
+    #[test]
+    fn unpacking_unexpected_system_contract_output_returns_none() {
+        let contracts = SystemContract::new(crate::chainspec::BscChainSpec::from(
+            crate::chainspec::bsc::bsc_mainnet(),
+        ));
+        // Empty output: what a call to a contract that no longer has the function returns.
+        assert!(contracts.unpack_data_into_validator_set(&[]).is_none());
+        assert!(contracts.unpack_data_into_validator_set_before_luban(&[]).is_none());
+        assert!(contracts.unpack_data_into_max_elected_validators(&[]).is_none());
+        assert!(contracts.unpack_data_into_validator_election_info(&[]).is_none());
+        assert!(contracts.unpack_data_into_turn_length(&[]).is_none());
+        assert!(contracts.unpack_data_into_node_ids(&[]).is_none());
+
+        // Well-sized but structurally wrong output (the dynamic offsets are nonsense).
+        let garbage = [0xffu8; 64];
+        assert!(contracts.unpack_data_into_validator_set(&garbage).is_none());
+        assert!(contracts.unpack_data_into_validator_set_before_luban(&garbage).is_none());
+        assert!(contracts.unpack_data_into_validator_election_info(&garbage).is_none());
+        assert!(contracts.unpack_data_into_node_ids(&garbage).is_none());
+    }
+
     fn dummy_sig() -> Signature {
         Signature::new(U256::ZERO, U256::ZERO, false)
+    }
+
+    #[test]
+    fn bid_block_evidence_validator_set_outputs_round_trip() {
+        let contracts = SystemContract::new(crate::chainspec::BscChainSpec::from(bsc_mainnet()));
+        let validators = vec![
+            address!("1111111111111111111111111111111111111111"),
+            address!("2222222222222222222222222222222222222222"),
+        ];
+        let validator_values = validators.iter().copied().map(DynSolValue::from).collect();
+        let validators_output = contracts
+            .validator_abi
+            .function("getValidators")
+            .unwrap()
+            .first()
+            .unwrap()
+            .abi_encode_output(&[
+                DynSolValue::Array(validator_values),
+            ])
+            .unwrap();
+        assert_eq!(
+            contracts.unpack_all_validators(&validators_output).unwrap(),
+            validators
+        );
+
+        let cabinets = U256::from(21);
+        let cabinets_output = contracts
+            .validator_abi
+            .function("numOfCabinets")
+            .unwrap()
+            .first()
+            .unwrap()
+            .abi_encode_output(&[DynSolValue::from(cabinets)])
+            .unwrap();
+        assert_eq!(contracts.unpack_num_of_cabinets(&cabinets_output).unwrap(), cabinets);
+
+        assert!(contracts.unpack_all_validators(&[]).is_err());
+        assert!(contracts.unpack_num_of_cabinets(&[]).is_err());
     }
 
     #[test]
@@ -1261,6 +1420,53 @@ mod tests {
         let before =
             get_upgrade_system_contracts(&spec, block, pasteur_time - 10, pasteur_time - 11).unwrap();
         assert!(!before.contains_key(&STAKE_HUB_CONTRACT));
+    }
+
+    /// The exact bytecode go-bsc embeds, from the commit its `jennerUpgrade` cites:
+    /// bsc-genesis-contract@2620fb411b0c950dd0abfc4e75fe13393a82c632, solc 0.8.17. A one-byte
+    /// difference here is a different state root on the activation block.
+    #[test]
+    fn jenner_payment_lane_code_matches_genesis_contract() {
+        use sha2::{Digest, Sha256};
+        const WANT_SHA256: &str =
+            "ebee6a014126a2c3c3549e1b9e8924eff695f3f9c99324ada3104616b164a213";
+
+        assert_eq!(PAYMENT_LANE_CONTRACT, address!("0x0000000000000000000000000000000000002007"));
+        for spec in [bsc_mainnet(), bsc_testnet(), bsc_qanet()] {
+            let res = get_system_contract_codes(&spec, BscHardfork::Jenner.name()).unwrap();
+            assert_eq!(res.len(), 1, "Jenner installs only PaymentLane");
+
+            let code = res.get(&PAYMENT_LANE_CONTRACT).expect("PaymentLane present");
+            let bytes = code.as_ref().unwrap().original_bytes();
+            assert_eq!(bytes.len(), 3540);
+            assert_eq!(hex::encode(Sha256::digest(bytes)), WANT_SHA256);
+        }
+    }
+
+    /// PaymentLane is a system contract, but not a system-transaction target.
+    #[test]
+    fn jenner_payment_lane_is_not_a_system_tx_target() {
+        assert!(!SYSTEM_CONTRACTS_SET.contains(&PAYMENT_LANE_CONTRACT));
+        assert!(!is_invoke_system_contract(&PAYMENT_LANE_CONTRACT));
+    }
+
+    #[test]
+    fn jenner_upgrade_applies_only_at_the_transition_block() {
+        use reth_chainspec::ForkCondition;
+
+        let jenner = 1_800_000_000u64;
+        let mut cs = bsc_mainnet();
+        cs.hardforks.insert(BscHardfork::Jenner, ForkCondition::Timestamp(jenner));
+        let spec = crate::chainspec::BscChainSpec::from(cs);
+        let installs = |time, parent_time| {
+            get_upgrade_system_contracts(&spec, 50_000_000, time, parent_time)
+                .unwrap()
+                .contains_key(&PAYMENT_LANE_CONTRACT)
+        };
+
+        assert!(installs(jenner, jenner - 3));
+        assert!(!installs(jenner + 3, jenner));
+        assert!(!installs(jenner - 3, jenner - 6));
     }
 
     #[test]

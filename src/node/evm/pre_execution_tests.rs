@@ -20,17 +20,17 @@ mod tests {
         let block_1_hash = simulated_block_1.hash_slow();
 
         // Unseeded: invisible to the reader (the None that aborts block 2 today).
-        assert!(HEADER_CACHE_READER.lock().unwrap().get_header_by_hash(&block_1_hash).is_none());
+        assert!(HEADER_CACHE_READER.lock().unwrap().cached_header_by_hash(&block_1_hash).is_none());
 
         // Seed by hash, as BscBlockBuilder does before block 2 pre-executes.
         insert_header_to_cache_hash_only(simulated_block_1.clone(), block_1_hash);
 
-        let resolved = HEADER_CACHE_READER.lock().unwrap().get_header_by_hash(&block_1_hash);
+        let resolved = HEADER_CACHE_READER.lock().unwrap().cached_header_by_hash(&block_1_hash);
         assert_eq!(resolved.map(|h| h.number), Some(simulated_block_1.number));
 
         // Hash-only seeding must leave the canonical block-number index untouched.
         let by_number =
-            HEADER_CACHE_READER.lock().unwrap().get_header_by_number(simulated_block_1.number);
+            HEADER_CACHE_READER.lock().unwrap().cached_header_by_number(simulated_block_1.number);
         assert!(by_number.is_none());
     }
 
@@ -446,5 +446,453 @@ mod tests {
             assert!(cache.get(&block_hash1).is_some());
             assert!(cache.get(&block_hash2).is_some());
         }
+    }
+}
+
+/// Helper-level regression tests for parent-vs-current validator reads.
+#[cfg(test)]
+mod parent_block_env {
+    use crate::chainspec::{bsc::bsc_mainnet, BscChainSpec};
+    use crate::consensus::parlia::snapshot::MAXWELL_EPOCH_LENGTH;
+    use crate::evm::api::BscEvm;
+    use crate::node::evm::config::{
+        evm_env_for_header, BscBlockExecutionCtx, BscExecutionMode, BscExecutionSharedCtx,
+    };
+    use crate::node::evm::executor::BscBlockExecutor;
+    use crate::node::evm::pre_execution::{CallBlockEnv, VALIDATOR_CACHE};
+    use crate::system_contracts::{SystemContract, VALIDATOR_CONTRACT};
+    use alloy_consensus::Header;
+    use alloy_evm::eth::EthBlockExecutionCtx;
+    use alloy_primitives::{hex, Address, Bytes, U160};
+    use reth_evm_ethereum::RethReceiptBuilder;
+    use revm::bytecode::Bytecode;
+    use revm::database::InMemoryDB;
+    use revm::inspector::NoOpInspector;
+    use revm::state::AccountInfo;
+    use std::sync::Arc;
+
+    /// Hard-coded interval used by the mock validator contract below.
+    const SHUFFLE_INTERVAL: u64 = 200;
+
+    /// Epoch block used by the fixture.
+    const EPOCH_BLOCK: u64 = 115_596_000;
+
+    /// Stand-in for the `ValidatorSet` contract. The returned validator address is
+    /// `block.number / 200`, so the decoded set reflects the observed block env.
+    ///
+    /// ```text
+    /// PUSH1 0x40   PUSH1 0x00 MSTORE   head[0] = 0x40   -> address[] at 0x40
+    /// PUSH1 0x80   PUSH1 0x20 MSTORE   head[1] = 0x80   -> bytes[]   at 0x80
+    /// PUSH1 0x01   PUSH1 0x40 MSTORE   address[].len = 1
+    /// PUSH1 0xc8   NUMBER DIV
+    ///              PUSH1 0x60 MSTORE   address[0] = NUMBER / 200
+    /// PUSH1 0x01   PUSH1 0x80 MSTORE   bytes[].len = 1
+    /// PUSH1 0x20   PUSH1 0xa0 MSTORE   bytes[0] data offset = 0x20, relative to 0xa0
+    /// PUSH1 0x30   PUSH1 0xc0 MSTORE   bytes[0].len = 48; its 0xe0..0x120 payload stays zero
+    /// PUSH2 0x0120 PUSH1 0x00 RETURN
+    /// ```
+    const WINDOW_REPORTING_VALIDATOR_SET: &[u8] = &hex!(
+        "6040600052" // head[0]
+        "6080602052" // head[1]
+        "6001604052" // address[].len
+        "60c84304606052" // address[0] = NUMBER / 200
+        "6001608052" // bytes[].len
+        "602060a052" // bytes[0] data offset
+        "603060c052" // bytes[0].len
+        "6101206000f3" // return mem[0x00..0x120]
+    );
+
+    /// The address the mock reports for a callee that observed `block_number`.
+    fn window_address(block_number: u64) -> Address {
+        Address::from(U160::from(block_number / SHUFFLE_INTERVAL))
+    }
+
+    fn header_at(number: u64) -> Header {
+        Header {
+            number,
+            timestamp: 1_786_578_821, // real timestamp of EPOCH_BLOCK
+            gas_limit: 140_000_000,
+            // Cancun is long active at this timestamp, and a Cancun block env without it is
+            // rejected outright.
+            excess_blob_gas: Some(0),
+            blob_gas_used: Some(0),
+            ..Default::default()
+        }
+    }
+
+    /// Provider-backed twin of the executor path.
+    mod standalone {
+        use super::*;
+        use crate::node::evm::pre_execution::validators_at_parent;
+        use alloy_primitives::{B256, U256};
+        use reth_primitives_traits::{Account, Bytecode as PrimitivesBytecode, SealedHeader};
+        use reth_provider::ProviderResult;
+        use reth_revm::database::EvmStateProvider;
+
+        /// Serves [`WINDOW_REPORTING_VALIDATOR_SET`] as the code of `VALIDATOR_CONTRACT`, or an
+        /// empty state when `code` is `None` — i.e. the contract not deployed.
+        struct ParentState {
+            code: Option<PrimitivesBytecode>,
+        }
+
+        impl ParentState {
+            fn code_hash(&self) -> B256 {
+                self.code.as_ref().map(|c| c.hash_slow()).unwrap_or_default()
+            }
+        }
+
+        impl EvmStateProvider for ParentState {
+            fn basic_account(&self, address: &Address) -> ProviderResult<Option<Account>> {
+                Ok((self.code.is_some() && *address == VALIDATOR_CONTRACT).then_some(Account {
+                    nonce: 0,
+                    balance: U256::ZERO,
+                    bytecode_hash: Some(self.code_hash()),
+                }))
+            }
+
+            fn block_hash(&self, _: u64) -> ProviderResult<Option<B256>> {
+                Ok(None)
+            }
+
+            fn bytecode_by_hash(
+                &self,
+                code_hash: &B256,
+            ) -> ProviderResult<Option<PrimitivesBytecode>> {
+                Ok((code_hash == &self.code_hash()).then(|| self.code.clone()).flatten())
+            }
+
+            fn storage(&self, _: Address, _: B256) -> ProviderResult<Option<U256>> {
+                Ok(None)
+            }
+        }
+
+        fn parent_state() -> ParentState {
+            let code = PrimitivesBytecode(Bytecode::new_raw(Bytes::from_static(
+                WINDOW_REPORTING_VALIDATOR_SET,
+            )));
+            ParentState { code: Some(code) }
+        }
+
+        #[test]
+        fn observes_the_parent_shuffle_window() {
+            let spec = Arc::new(BscChainSpec::from(bsc_mainnet()));
+            let parent = SealedHeader::seal_slow(header_at(EPOCH_BLOCK - 1));
+
+            let (set, _) = validators_at_parent(parent_state(), spec, &parent).unwrap();
+
+            assert_eq!(
+                set,
+                vec![window_address(EPOCH_BLOCK - 1)],
+                "must draw from the parent env"
+            );
+        }
+
+        /// A call to an address with no code succeeds with empty returndata, which the ABI unpack
+        /// would `unwrap()`-panic on — inside a payload job or the bid loop, where a panic is
+        /// permanent. It must surface as an error instead.
+        #[test]
+        fn missing_validator_set_contract_errors_rather_than_panicking() {
+            let spec = Arc::new(BscChainSpec::from(bsc_mainnet()));
+            let parent = SealedHeader::seal_slow(header_at(EPOCH_BLOCK - 1));
+
+            let err = validators_at_parent(ParentState { code: None }, spec, &parent).unwrap_err();
+            assert!(err.to_string().contains("no data"), "unexpected error: {err}");
+        }
+
+    }
+
+    type TestExecutor = BscBlockExecutor<
+        'static,
+        BscEvm<InMemoryDB, NoOpInspector>,
+        Arc<BscChainSpec>,
+        RethReceiptBuilder,
+    >;
+
+    /// An executor positioned on `EPOCH_BLOCK`, with the mock installed at `ValidatorSet` and
+    /// `parent_header` set as `check_new_block` sets it.
+    fn executor() -> TestExecutor {
+        executor_over(validator_set_db())
+    }
+
+    fn validator_set_db() -> InMemoryDB {
+        let mut db = InMemoryDB::default();
+        db.insert_account_info(
+            VALIDATOR_CONTRACT,
+            AccountInfo::default()
+                .with_code(Bytecode::new_raw(Bytes::from_static(WINDOW_REPORTING_VALIDATOR_SET))),
+        );
+        db
+    }
+
+    fn executor_over<DB: alloy_evm::block::StateDB>(
+        db: DB,
+    ) -> BscBlockExecutor<'static, BscEvm<DB, NoOpInspector>, Arc<BscChainSpec>, RethReceiptBuilder>
+    {
+        let spec = Arc::new(BscChainSpec::from(bsc_mainnet()));
+        let header = header_at(EPOCH_BLOCK);
+
+        let evm =
+            BscEvm::new(evm_env_for_header(&spec, &header), db, NoOpInspector {}, false, false);
+
+        let ctx = BscBlockExecutionCtx {
+            base: EthBlockExecutionCtx {
+                parent_hash: header.parent_hash,
+                parent_beacon_block_root: None,
+                ommers: &[],
+                withdrawals: None,
+                extra_data: Bytes::new(),
+                tx_count_hint: None,
+                slot_number: None,
+            },
+            header: Some(header),
+            header_hash: None,
+            mode: BscExecutionMode::Import,
+            validator_cache_sink: None,
+            turn_length_sink: None,
+            state_root_precomputed_sink: None,
+            trie_handle: None,
+            state_root_deadline_ms: None,
+        };
+
+        let mut executor = BscBlockExecutor::new(
+            evm,
+            ctx,
+            BscExecutionSharedCtx::default(),
+            spec.clone(),
+            RethReceiptBuilder::default(),
+            SystemContract::new(spec),
+        );
+        executor.inner_ctx.parent_header = Some(header_at(EPOCH_BLOCK - 1));
+        executor
+    }
+
+    fn touched(address: Address) -> revm::state::EvmState {
+        let mut account = revm::state::Account::from(revm::state::AccountInfo::default());
+        account.mark_touch();
+        revm::state::EvmState::from_iter([(address, account)])
+    }
+
+    #[test]
+    fn lane_config_is_inherited_until_the_contract_changes() {
+        use crate::consensus::payment_lane::{
+            meta::{cache_get, LaneMeta},
+            state::LaneState,
+            Budget, PAYMENT_LANE_CONTRACT,
+        };
+        use alloy_primitives::{B256, U256};
+        use alloy_evm::Evm as _;
+        use revm::state::{Account, EvmState, EvmStorageSlot};
+
+        let code = Bytecode::new_raw(Bytes::from_static(&[0x00]));
+        let deployed = AccountInfo::default().with_code(code);
+        let mut executor = executor();
+        executor.evm.db_mut().insert_account_info(PAYMENT_LANE_CONTRACT, deployed.clone());
+        executor.lane = LaneState::for_test(
+            LaneMeta { ratio: 500, listed: Default::default() },
+            Budget::default(),
+            30_000_000,
+        );
+
+        let shape = |info: AccountInfo, slot: Option<EvmStorageSlot>| {
+            let mut account = Account::from(info);
+            account.mark_touch();
+            account.storage.extend(slot.map(|slot| (U256::ZERO, slot)));
+            EvmState::from_iter([(PAYMENT_LANE_CONTRACT, account)])
+        };
+        let mut inherits = |tag: u8, states: Vec<EvmState>| {
+            executor.lane_contract_changed = false;
+            executor.ctx.header_hash = Some(B256::repeat_byte(tag));
+            for state in states {
+                executor.commit_state(state);
+            }
+            executor.verify_payment_lane(0).expect("an empty block cannot violate");
+            cache_get(B256::repeat_byte(tag)).is_some()
+        };
+
+        assert!(inherits(0x11, vec![touched(Address::repeat_byte(0xaa))]), "an unrelated account");
+        assert!(
+            inherits(0x22, vec![shape(deployed.clone(), Some(EvmStorageSlot::new(U256::ZERO, 0)))]),
+            "a getter transaction: touched, slots read but unchanged"
+        );
+        assert!(
+            !inherits(
+                0x33,
+                vec![
+                    shape(
+                        deployed.clone(),
+                        Some(EvmStorageSlot::new_changed(U256::ZERO, U256::from(1), 0)),
+                    ),
+                    shape(deployed, Some(EvmStorageSlot::new(U256::from(1), 0))),
+                ]
+            ),
+            "a getter after a governance write must not restore inheritance"
+        );
+        assert!(
+            !inherits(
+                0x44,
+                vec![shape(AccountInfo::default().with_code_hash(B256::repeat_byte(0xcd)), None)]
+            ),
+            "a code replacement, which changes what the getters mean"
+        );
+    }
+
+    /// The miner's inheritance in `finalize_payload` skips on any bundle entry for the lane
+    /// contract, so loading the config must not leave one.
+    #[test]
+    fn lane_getters_leave_no_bundle_record() {
+        use crate::consensus::payment_lane::{LaneParentState, PAYMENT_LANE_CONTRACT};
+        use alloy_evm::Evm as _;
+        use revm::database::{states::bundle_state::BundleRetention, State};
+
+        let mut db = validator_set_db();
+        // PUSH1 0x20 PUSH1 0x00 RETURN: one zero word.
+        db.insert_account_info(
+            PAYMENT_LANE_CONTRACT,
+            AccountInfo::default()
+                .with_code(Bytecode::new_raw(Bytes::from_static(&hex!("60206000f3")))),
+        );
+        let state = State::builder().with_database(db).with_bundle_update().build();
+        let mut executor = executor_over(state);
+
+        let ret = executor
+            .call_lane_getter(PAYMENT_LANE_CONTRACT, Bytes::new())
+            .expect("the getter returns a word");
+        assert_eq!(ret.len(), 32);
+
+        let db = executor.evm.db_mut();
+        db.merge_transitions(BundleRetention::Reverts);
+        assert!(db.take_bundle().account(&PAYMENT_LANE_CONTRACT).is_none());
+    }
+
+    #[test]
+    fn lane_meta_refuses_to_read_a_mutated_state() {
+        use crate::consensus::payment_lane::state::LaneState;
+        use alloy_primitives::B256;
+
+        let mut executor = executor();
+        executor.db_at_parent_state = false;
+
+        let err = LaneState::resolve(&mut executor, B256::repeat_byte(0x33), 30_000_000)
+            .expect_err("must refuse");
+        assert!(
+            err.to_string().contains("after this block mutated state"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn a_pool_transaction_may_not_eat_the_idle_payment_lane() {
+        use crate::consensus::payment_lane::{meta::LaneMeta, state::LaneState, Budget};
+        use crate::node::evm::LaneAdmission;
+        use alloy_consensus::TxLegacy;
+        use alloy_primitives::{Signature, TxKind, U256};
+        use reth_ethereum_primitives::TransactionSigned;
+        use reth_primitives_traits::Recovered;
+
+        let listed = Address::repeat_byte(0x2a);
+        let pool_tx = |to: Address, value: u64, gas_limit: u64| {
+            let tx = TxLegacy {
+                to: TxKind::Call(to),
+                value: U256::from(value),
+                gas_limit,
+                ..Default::default()
+            };
+            let signed = TransactionSigned::new_unhashed(
+                tx.into(),
+                Signature::new(U256::ZERO, U256::ZERO, false),
+            );
+            Recovered::new_unchecked(signed, Address::repeat_byte(0x99))
+        };
+
+        let mut executor = executor();
+        executor.lane = LaneState::for_test(
+            LaneMeta { ratio: 500, listed: Arc::new([listed].into_iter().collect()) },
+            Budget { payment_lane_quota: 1_500_000, payment_lane_used: 21_000 },
+            30_000_000,
+        );
+
+        // 1_479_000 remains reserved, leaving 96_000 for general traffic.
+        let shared = 1_575_000;
+        let general = |gas| pool_tx(Address::repeat_byte(0x11), 0, gas);
+        assert!(executor.lane_admits_pool_tx(&general(96_000), shared).unwrap());
+        assert!(!executor.lane_admits_pool_tx(&general(96_001), shared).unwrap());
+
+        assert!(executor.lane_admits_pool_tx(&pool_tx(listed, 1, shared), shared).unwrap());
+    }
+
+    /// `Parent` reads the parent env; `Current` reads the current env.
+    #[test]
+    fn parent_env_call_observes_the_parent_shuffle_window() {
+        assert_ne!(
+            window_address(EPOCH_BLOCK - 1),
+            window_address(EPOCH_BLOCK),
+            "fixture is useless unless the two windows differ"
+        );
+
+        let mut executor = executor();
+
+        let (validators, _) = executor
+            .get_current_validators(EPOCH_BLOCK - 1, CallBlockEnv::Parent)
+            .expect("parent-env call");
+        assert_eq!(validators, vec![window_address(EPOCH_BLOCK - 1)], "must observe the parent");
+
+        let (validators, _) = executor
+            .get_current_validators(EPOCH_BLOCK - 1, CallBlockEnv::Current)
+            .expect("current-env call");
+        assert_eq!(validators, vec![window_address(EPOCH_BLOCK)], "must observe the current env");
+    }
+
+    /// On a cache miss, the miner resolves validators from parent state and env.
+    #[test]
+    fn the_miner_reads_the_parents_window_on_a_cache_miss() {
+        use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
+
+        let client = MockEthProvider::default();
+        client.add_account(
+            VALIDATOR_CONTRACT,
+            ExtendedAccount::new(0, alloy_primitives::U256::ZERO)
+                .with_bytecode(Bytes::from_static(WINDOW_REPORTING_VALIDATOR_SET)),
+        );
+        // A fresh hash forces the miss; `epoch_num` makes EPOCH_BLOCK the next epoch block.
+        let parent = reth_primitives_traits::SealedHeader::new(
+            header_at(EPOCH_BLOCK - 1),
+            alloy_primitives::B256::random(),
+        );
+        let snap = crate::consensus::parlia::Snapshot::new(
+            vec![Address::with_last_byte(1)],
+            EPOCH_BLOCK - 1,
+            parent.hash(),
+            MAXWELL_EPOCH_LENGTH,
+            None,
+        );
+
+        let resolved = crate::node::miner::util::epoch_validators_for_next_block(
+            &client,
+            &Arc::new(BscChainSpec::from(bsc_mainnet())),
+            &snap,
+            &parent,
+        )
+        .expect("state read on cache miss");
+
+        assert_eq!(
+            resolved.map(|(validators, _)| validators),
+            Some(vec![window_address(EPOCH_BLOCK - 1)]),
+            "the miner must evaluate at the parent, not at the epoch block"
+        );
+        // And file it under the parent, per VALIDATOR_CACHE's invariant.
+        assert_eq!(
+            VALIDATOR_CACHE.lock().unwrap().get(&parent.hash()).unwrap().0,
+            vec![window_address(EPOCH_BLOCK - 1)],
+        );
+    }
+
+    #[test]
+    fn parent_env_call_requires_a_parent_header() {
+        let mut executor = executor();
+        executor.inner_ctx.parent_header = None;
+        let err = executor
+            .get_current_validators(EPOCH_BLOCK - 1, CallBlockEnv::Parent)
+            .expect_err("must not silently fall back to the current env");
+        assert!(err.to_string().contains("parent header"), "unexpected error: {err}");
     }
 }

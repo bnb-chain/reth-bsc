@@ -17,7 +17,6 @@ use reth_primitives_traits::{
 };
 use reth_provider::StateProvider;
 use reth_trie_common::updates::TrieUpdates;
-use revm::context::BlockEnv;
 use revm::database::{states::bundle_state::BundleRetention, State};
 
 /// rewrite BasicBlockBuilder, mainly about the finish() trait.
@@ -97,7 +96,7 @@ where
         Spec = <BscEvmFactory as reth_evm::EvmFactory>::Spec,
         HaltReason = <BscEvmFactory as reth_evm::EvmFactory>::HaltReason,
         DB = &'a mut State<DB>,
-        BlockEnv = BlockEnv,
+        BlockEnv = crate::evm::block_env::BscBlockEnv,
     >,
     DB: reth_evm::Database + 'a,
     R: ReceiptBuilder<Transaction = <BscPrimitives as NodePrimitives>::SignedTx>,

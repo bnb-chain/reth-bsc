@@ -2,18 +2,19 @@ use crate::chainspec::BscChainSpec;
 use crate::consensus::eip4844::{calc_blob_fee, is_blob_eligible_block, BLOB_TX_BLOB_GAS_PER_BLOB};
 use crate::consensus::parlia::util::calculate_millisecond_timestamp;
 use crate::consensus::parlia::{Parlia, Snapshot};
-use crate::evm::blacklist;
+use crate::evm::blacklist::{self, BlacklistedAddressError};
 use crate::hardforks::BscHardforks;
 use crate::metrics::{BscConsensusMetrics, BscMinerMetrics};
 use crate::node::engine::{BscBuiltPayload, BuildKind};
-use crate::node::evm::config::{BscEvmConfig, BscNextBlockEnvAttributes, ValidatorCacheSink};
-use crate::node::evm::pre_execution::{TURN_LENGTH_CACHE, VALIDATOR_CACHE};
+use crate::node::evm::config::{
+    BscEvmConfig, BscExecutionMode, BscNextBlockEnvAttributes, ValidatorCacheSink,
+};
+use crate::node::evm::pre_execution::{EpochValidators, TURN_LENGTH_CACHE, VALIDATOR_CACHE};
 use crate::node::miner::bid_block::{validate_bid_block_blob_kzg, BidBlockTask};
 use crate::node::miner::bid_simulator::BidSimulator;
 use crate::node::miner::block_mev_info::{set_block_mev_info, BlockMevInfoVersion};
 use crate::node::miner::bsc_miner::{MiningContext, SubmitContext};
-use crate::node::miner::util::finalize_new_header;
-use crate::node::pool::BlacklistedAddressError;
+use crate::node::miner::util::{epoch_validators_for_next_block, finalize_new_header};
 use crate::node::primitives::{BscBlobTransactionSidecar, BscBlock};
 use alloy_consensus::{BlockHeader, Transaction};
 use alloy_eips::eip4895::Withdrawals;
@@ -386,6 +387,12 @@ pub struct BscBuildArguments<Attributes> {
     /// `MiningContext::end_mining_timestamp_ms` minus [`STATE_ROOT_WAIT_MARGIN_MS`].
     /// `None` = legacy unbounded blocking wait.
     pub state_root_deadline_ms: Option<u64>,
+    /// Sub-second millisecond remainder (BEP-520) of the block being built:
+    /// `MiningContext::block_timestamp_ms % 1000`. Threaded into
+    /// [`BscNextBlockEnvAttributes`] so [`crate::evm::block_env::BscBlockEnv`] (and the
+    /// BEP-706 precompile) sees the same millisecond timestamp that is later sealed
+    /// into the header's `mix_hash`.
+    pub milli_remainder: u64,
 }
 
 /// BSC payload builder, used to build payload for bsc miner.
@@ -464,6 +471,7 @@ where
             // precomputed root instead of only the first attempt.
             trie_handle: _,
             state_root_deadline_ms,
+            milli_remainder,
         } = args;
         let PayloadConfig { parent_header, attributes, payload_id: _ } = config;
 
@@ -527,6 +535,8 @@ where
                     .unwrap_or_else(|| self.builder_config.extra_data.clone()),
                 slot_number: None,
             },
+            mode: BscExecutionMode::Mining,
+            milli_remainder,
             validator_cache_sink: Some(validator_cache_sink.clone()),
             turn_length_sink: Some(turn_length_sink.clone()),
             state_root_precomputed_sink: Some(state_root_precomputed_sink),
@@ -653,8 +663,11 @@ where
                 continue;
             }
             // filter out tx with min gas tip.
-            if pool_tx.effective_tip_per_gas(base_fee).unwrap_or(0_u128) < min_gas_tip {
-                // Skip packaging underpriced transactions, but do not mark them invalid.
+            if !crate::node::pool::tip::meets_tip_floor(
+                pool_tx.effective_tip_per_gas(base_fee),
+                min_gas_tip,
+            ) {
+                // Skip this sender's remaining transactions in this build.
                 trace!(
                     target: "payload_builder",
                     trace_id,
@@ -663,6 +676,7 @@ where
                     min_gas_tip,
                     "Skipping underpriced transaction"
                 );
+                best_tx_list.mark_invalid(&pool_tx, &InvalidPoolTransactionError::Underpriced);
                 continue;
             }
 
@@ -749,8 +763,18 @@ where
                 }
 
                 let blob_sidecar_result = 'sidecar: {
-                    let Some(sidecar) =
-                        self.pool.get_blob(*tx.hash()).map_err(PayloadBuilderError::other)?
+                    let Some(sidecar) = self.pool.get_blob(*tx.hash())
+                        .inspect_err(|error| {
+                            warn!(
+                                target: "payload_builder",
+                                trace_id,
+                                block_number = parent_header.number() + 1,
+                                tx_hash = ?tx.hash(),
+                                error = %error,
+                                "Failed to read blob sidecar while building payload"
+                            );
+                        })
+                        .map_err(PayloadBuilderError::other)?
                     else {
                         break 'sidecar Err(Eip4844PoolTransactionError::MissingEip4844BlobSidecar);
                     };
@@ -963,9 +987,21 @@ where
                 "Transaction included in block"
             );
             if tx.is_eip4844() {
-                let sidecar = sidecars_map.get(tx.hash()).unwrap();
+                // The sidecar map is built from the same pool transactions, so a miss here
+                // means the block still seals — only its blob record is missing.
+                let Some(inner) =
+                    sidecars_map.get(tx.hash()).and_then(|sidecar| sidecar.as_eip4844())
+                else {
+                    warn!(
+                        target: "payload_builder",
+                        trace_id,
+                        tx_hash = ?tx.hash(),
+                        "No EIP-4844 sidecar for a blob transaction, skipping its blob record"
+                    );
+                    continue;
+                };
                 let bsc_blob_tx_sidecar = BscBlobTransactionSidecar {
-                    inner: sidecar.as_eip4844().unwrap().clone(),
+                    inner: inner.clone(),
                     block_number: sealed_block.header().number(),
                     block_hash: sealed_block.hash(),
                     tx_index: u64::try_from(index).unwrap_or(u64::MAX),
@@ -1026,6 +1062,7 @@ where
             state_root_precomputed,
             trie_handle,
             state_root_deadline_ms: _,
+            milli_remainder,
         } = args;
         let PayloadConfig { parent_header, attributes, payload_id: _ } = config;
 
@@ -1064,6 +1101,8 @@ where
                             .unwrap_or_else(|| self.builder_config.extra_data.clone()),
                         slot_number: None,
                     },
+                    mode: BscExecutionMode::Mining,
+                    milli_remainder,
                     validator_cache_sink: Some(validator_cache_sink.clone()),
                     turn_length_sink: Some(turn_length_sink.clone()),
                     // Empty-fallback build never installs a sparse-trie hook (trie_handle: None
@@ -1282,7 +1321,9 @@ where
         metrics::histogram!("bsc_miner_effective_reserve_ms").record(effective_reserve as f64);
         let mining_delay = parlia.clone().delay_for_mining(
             &mining_ctx.parent_snapshot,
-            mining_ctx.header.as_ref().unwrap(),
+            // Set by `BscMiner` before the job is created; a payload job without it is a
+            // construction bug, not a runtime condition.
+            mining_ctx.header.as_ref().expect("mining context has a header for the block"),
             effective_reserve,
         );
         let pending_basefee = builder.pool.block_info().pending_basefee;
@@ -2584,12 +2625,27 @@ where
         let gas_usage_percent =
             if gas_limit > 0 { (gas_used as f64 / gas_limit as f64 * 100.0) as u64 } else { 0 };
 
+        let epoch_validators = epoch_validators_for_next_block(
+            &self.builder.client,
+            &self.builder.chain_spec,
+            &self.mining_ctx.parent_snapshot,
+            &self.mining_ctx.parent_header,
+        )
+        .map_err(|e| Box::new(BscPayloadJobError::PayloadBuildingError(e.to_string())))?;
+
+        let snapshot_provider = crate::shared::get_snapshot_provider().ok_or_else(|| {
+            Box::new(BscPayloadJobError::PayloadBuildingError(
+                "Snapshot provider not available".to_string(),
+            ))
+        })?;
         finalize_payload(
             &mut best_payload,
             self.parlia.clone(),
             &self.mining_ctx.parent_snapshot,
             &self.mining_ctx.parent_header,
+            snapshot_provider,
             self.mining_ctx.block_timestamp_ms,
+            epoch_validators,
         )
         .map_err(|e| {
             warn!(
@@ -2648,6 +2704,9 @@ where
             is_inturn = self.mining_ctx.is_inturn,
             is_bid = best_payload.bid_builder.is_some(),
             tx_count = best_payload.block().body().transaction_count(),
+            blob_gas_used = best_payload.block().header().blob_gas_used(),
+            sidecar_count = best_payload.block().body().sidecars.as_ref().map_or(0, Vec::len),
+            executed_sidecar_count = best_payload.executed_block.recovered_block.body().sidecars.as_ref().map_or(0, Vec::len),
             fees = %best_payload.fees(),
             exec_duration_ms = best_payload.exec_duration.as_millis(),
             trie_root_duration_ms = best_payload.trie_root_duration.as_millis(),
@@ -2748,32 +2807,18 @@ fn refresh_and_reseal_bid_block(
 
 /// Finalize a built payload in-place.
 ///
-/// Runs `finalize_new_header()` on the payload's header (sets difficulty, prepares validators
-/// for epoch blocks, assembles vote attestation, and ECDSA-seals the header), then:
-///
-/// 1. Writes `pending_validators` / `pending_turn_length` to the global caches keyed by
-///    the now-deterministic final block hash.
-/// 2. Rebuilds `executed_block.recovered_block` with the finalized header so the engine
-///    tree can identify the block by its correct hash.
-/// 3. Rebuilds `block` (sealed block with sidecars) with the finalized header.
-///
-/// This function is intentionally separate from the builder path so that finalization is
-/// deferred until `pick_best_payload_and_finalize()` chooses the winning payload — giving more time for
-/// FF votes to arrive.
+/// This seals the header, writes pending cache entries under the final hash, and rebuilds the
+/// payload objects with the finalized header.
 fn finalize_payload(
     payload: &mut BscBuiltPayload,
     parlia: Arc<Parlia<BscChainSpec>>,
     parent_snapshot: &Snapshot,
     parent_header: &SealedHeader<alloy_consensus::Header>,
+    snapshot_provider: &Arc<dyn crate::consensus::parlia::SnapshotProvider + Send + Sync>,
     block_timestamp_ms: u64,
+    epoch_validators: Option<EpochValidators>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let snapshot_provider = crate::shared::get_snapshot_provider().cloned().ok_or_else(|| {
-        Box::new(std::io::Error::other("Snapshot provider not available"))
-            as Box<dyn std::error::Error + Send + Sync>
-    })?;
-
     let senders = payload.executed_block.recovered_block.senders().to_vec();
-    let mut existing_sidecars = payload.block.clone_block().body.sidecars;
     let mut plain_block = payload.executed_block.recovered_block.sealed_block().clone_block();
 
     // Tag legacy `SendBid` winners with their builder (go-bsc `setBidMevInfo`, the Bid case).
@@ -2801,8 +2846,9 @@ fn finalize_payload(
         parent_snapshot,
         parent_header,
         &mut plain_block.header,
-        &snapshot_provider,
+        snapshot_provider,
         block_timestamp_ms,
+        epoch_validators,
     )
     .map_err(|e| {
         Box::new(std::io::Error::other(e.to_string())) as Box<dyn std::error::Error + Send + Sync>
@@ -2825,22 +2871,24 @@ fn finalize_payload(
             final_hash
         );
     }
+    crate::consensus::payment_lane::meta::inherit_if_untouched(
+        &payload.executed_block.execution_output.state,
+        parent_header.hash(),
+        final_hash,
+    );
 
-    payload.executed_block.recovered_block =
-        Arc::new(RecoveredBlock::new_unhashed(plain_block.clone(), senders));
-
-    let mut finalized_with_sidecars = plain_block;
-    // Update block_hash in each sidecar to reflect the final (post-seal) hash.
-    // The sidecar block_hash was set to the pre-finalization hash at build time;
-    // finalize_new_header() changes the header (difficulty, extra_data, ECDSA seal),
-    // so the hash must be patched here before the sidecars are transmitted over P2P.
-    if let Some(ref mut sidecars) = existing_sidecars {
+    // Both payload blocks must carry sidecars with the final sealed hash.
+    plain_block.body.sidecars = payload.block.body().sidecars.clone();
+    if let Some(sidecars) = &mut plain_block.body.sidecars {
         for sidecar in sidecars.iter_mut() {
             sidecar.block_hash = final_hash;
         }
     }
-    finalized_with_sidecars.body.sidecars = existing_sidecars;
-    payload.block = Arc::new(finalized_with_sidecars.into());
+    payload.block = Arc::new(plain_block.seal_unchecked(final_hash));
+    payload.executed_block.recovered_block = Arc::new(RecoveredBlock::new_sealed(
+        payload.block.as_ref().clone(),
+        senders,
+    ));
 
     Ok(())
 }
@@ -3331,6 +3379,95 @@ mod tests {
             }]),
         };
         RecoveredBlock::new_unhashed(BscBlock { header, body }, Vec::new())
+    }
+
+    #[test]
+    fn finalize_payload_preserves_sidecars_and_senders() {
+        use crate::consensus::payment_lane::{
+            meta::{cache_get, LaneMeta},
+            state::LaneState,
+            Budget,
+        };
+
+        ensure_bid_block_test_signer();
+        let parlia = Arc::new(Parlia::new(luban_chain_spec(), 200));
+        let parent_header = SealedHeader::seal_slow(Header {
+            extra_data: alloy_primitives::Bytes::from_static(b"lane-finalization-test"),
+            ..Default::default()
+        });
+        let meta = LaneMeta { ratio: 500, listed: Arc::new(Default::default()) };
+        LaneState::for_test(meta.clone(), Budget::default(), 30_000_000)
+            .inherit_to(parent_header.hash());
+        let parent_snap =
+            Snapshot::new(vec![Address::with_last_byte(1)], 0, parent_header.hash(), 200, None);
+        let snapshot_provider: Arc<dyn crate::consensus::parlia::SnapshotProvider + Send + Sync> =
+            Arc::new(MockBidBlockSnapshotProvider { snapshot: parent_snap.clone() });
+        let senders = vec![Address::with_last_byte(2)];
+
+        for with_sidecars in [true, false] {
+            let header = Header { number: 1, parent_hash: parent_header.hash(), ..Default::default() };
+            let original_hash = header.hash_slow();
+            let mut block = bid_block_with_sidecar(header, original_hash).clone_block();
+            let transaction = if with_sidecars {
+                alloy_consensus::TxEip4844::default().into()
+            } else {
+                alloy_consensus::TxLegacy::default().into()
+            };
+            block.body.inner.transactions = vec![super::TransactionSigned::new_unhashed(
+                transaction,
+                alloy_primitives::Signature::new(U256::from(1), U256::from(2), false),
+            )];
+            if !with_sidecars {
+                block.body.sidecars = None;
+            }
+            let mut executed_block = block.clone();
+            executed_block.body.sidecars = None;
+            let mut payload = super::BscBuiltPayload {
+                block: Arc::new(block.into()),
+                fees: U256::ZERO,
+                requests: None,
+                build_kind: super::BuildKind::NormalAttempt,
+                exec_duration: Duration::ZERO,
+                trie_root_duration: Duration::ZERO,
+                executed_block: reth_chain_state::ExecutedBlock {
+                    recovered_block: Arc::new(RecoveredBlock::new_unhashed(
+                        executed_block,
+                        senders.clone(),
+                    )),
+                    ..Default::default()
+                },
+                pending_validators: None,
+                pending_turn_length: None,
+                bid_builder: None,
+            };
+
+            super::finalize_payload(
+                &mut payload,
+                parlia.clone(),
+                &parent_snap,
+                &parent_header,
+                &snapshot_provider,
+                0,
+                None,
+            )
+            .unwrap();
+
+            let recovered = &payload.executed_block.recovered_block;
+            assert_eq!(recovered.body(), payload.block.body());
+            assert_eq!(recovered.hash(), payload.block.hash());
+            assert_ne!(payload.block.hash(), original_hash);
+            let inherited = cache_get(payload.block.hash()).expect("final hash inherits metadata");
+            assert_eq!(inherited.ratio, meta.ratio);
+            assert!(Arc::ptr_eq(&inherited.listed, &meta.listed));
+            assert_eq!(recovered.senders(), senders.as_slice());
+            if with_sidecars {
+                let sidecars = recovered.body().sidecars.as_ref().unwrap();
+                assert_eq!(sidecars.len(), 1);
+                assert_eq!(sidecars[0].block_hash, payload.block.hash());
+            } else {
+                assert!(recovered.body().sidecars.is_none());
+            }
+        }
     }
 
     #[test]

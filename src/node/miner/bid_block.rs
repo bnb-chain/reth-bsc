@@ -1,12 +1,6 @@
 //! BEP-675 BidBlock types: the builder-proposed block carried by `mev_sendBidBlock`.
 //!
-//! Ported from bnb-chain/bsc `core/types/bid.go`. The builder signs [`BidBlock::hash`], so that
-//! hash must match geth's `rlpHash` over `[header, transactions, sidecars]` byte-for-byte — it is
-//! validated here against vectors generated from the Go implementation.
-//!
-//! Note: `hash()` is vector-verified for the **no-blob** case (empty sidecars). Hash parity for
-//! non-empty blob sidecars depends on [`BscBlobTransactionSidecar`]'s encoding and needs its own
-//! vector before the blob path is relied upon.
+//! Ported from bnb-chain/bsc `core/types/builder/bid.go`.
 
 use crate::chainspec::BscChainSpec;
 use crate::consensus::eip4844::is_blob_eligible_block;
@@ -19,15 +13,18 @@ use crate::consensus::parlia::{
     Snapshot, SnapshotProvider,
 };
 use crate::hardforks::BscHardforks;
+use crate::node::consensus::BscConsensus;
 use crate::node::miner::block_mev_info::{set_block_mev_info, BlockMevInfoVersion};
 use crate::node::miner::signer::sign_system_transaction;
+use crate::node::evm::pre_execution::EpochValidators;
 use crate::node::miner::util::finalize_new_header;
 use crate::node::primitives::{BscBlobTransactionSidecar, BscBlock, BscBlockBody};
 use alloy_consensus::transaction::RlpEcdsaDecodableTx;
 use alloy_consensus::{Header, Transaction, TxLegacy};
 use alloy_eips::eip2718::Decodable2718;
 use alloy_primitives::{keccak256, Address, Bytes, Signature, B256, U256};
-use alloy_rlp::Decodable;
+use alloy_rlp::{Decodable, Encodable};
+use reth::consensus::HeaderValidator;
 use reth::primitives::SealedHeader;
 use reth_chainspec::EthChainSpec;
 use reth_ethereum_primitives::{BlockBody, TransactionSigned};
@@ -47,11 +44,12 @@ const MAX_TX_GAS: u64 = 1 << 24;
 
 /// The builder-proposed block carried by [`BidBlockArgs`].
 ///
-/// JSON field names mirror go-bsc's `core/types/bid.go` (`header`, `transactions`, `sidecars`) so
-/// builder payloads deserialize unchanged.
+/// JSON field names mirror go-bsc's `core/types/builder/bid.go` (`header`, `transactions`,
+/// `sidecars`) so builder payloads deserialize unchanged.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BidBlock {
     /// Proposed block header.
+    #[serde(deserialize_with = "deserialize_header")]
     pub header: Header,
     /// Raw (EIP-2718) transactions: user txs first, unsigned system txs last.
     pub transactions: Vec<Bytes>,
@@ -60,23 +58,113 @@ pub struct BidBlock {
     pub sidecars: Vec<BscBlobTransactionSidecar>,
 }
 
-impl BidBlock {
-    /// The header hash — the digest the builder signs.
-    ///
-    /// Matches geth's `BidBlock.Hash()` as of bsc #3742 ("miner: optimize BidBlock signing hash",
-    /// shipped in v1.7.6), which replaced `rlpHash([header, transactions, sidecars])` with
-    /// `b.Header.Hash()`. Re-hashing the body on every call meant re-hashing up to 6 × 128 KiB of
-    /// blob data on the admission hot path; the header is ~600 bytes.
-    ///
-    /// The body is still bound to the signature, indirectly: `header.transactions_root` commits to
-    /// the transactions and is verified in [`verify_bid_block_payload`], and blob sidecars are
-    /// bound through the blob versioned hashes carried inside those transactions. **That tx-root
-    /// check is what makes this digest safe — do not narrow the digest without it.** Recovering a
-    /// signature over the wrong digest does not fail; it silently yields a different address, so a
-    /// mismatch here surfaces as a bogus "builder is not registered" rather than a signature error.
-    pub fn hash(&self) -> B256 {
-        self.header.hash_slow()
+// go-bsc transports BidBlock over gRPC as the ordinary RLP encoding of its three exported fields:
+// [header, transactions, sidecars]. Keep this implementation on the domain type so the gRPC path
+// and any future binary ingress cannot drift from the structure builders encode with geth/rlp.
+impl Encodable for BidBlock {
+    fn encode(&self, out: &mut dyn bytes::BufMut) {
+        let payload_length =
+            self.header.length() + self.transactions.length() + self.sidecars.length();
+        alloy_rlp::Header { list: true, payload_length }.encode(out);
+        self.header.encode(out);
+        self.transactions.encode(out);
+        self.sidecars.encode(out);
     }
+
+    fn length(&self) -> usize {
+        let payload_length =
+            self.header.length() + self.transactions.length() + self.sidecars.length();
+        alloy_rlp::Header { list: true, payload_length }.length() + payload_length
+    }
+}
+
+impl Decodable for BidBlock {
+    fn decode(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
+        let header = alloy_rlp::Header::decode(buf)?;
+        if !header.list {
+            return Err(alloy_rlp::Error::UnexpectedString);
+        }
+        let remaining = buf.len();
+
+        let block = Self {
+            header: Header::decode(buf)?,
+            transactions: Vec::<Bytes>::decode(buf)?,
+            sidecars: Vec::<BscBlobTransactionSidecar>::decode(buf)?,
+        };
+        if remaining.saturating_sub(buf.len()) != header.payload_length {
+            return Err(alloy_rlp::Error::UnexpectedLength);
+        }
+        Ok(block)
+    }
+}
+
+impl BidBlock {
+    /// The digest the builder signs: go-bsc `BidBlock.Hash()`.
+    pub fn hash(&self) -> B256 {
+        gobsc_header_hash(&self.header)
+    }
+}
+
+/// go-bsc `Header.Hash()`. alloy's `hash_slow` skips an absent optional field that precedes a
+/// present one; such headers are invalid, but the signature is recovered before validation.
+fn gobsc_header_hash(header: &Header) -> B256 {
+    let fixed: [&dyn Encodable; 15] = [
+        &header.parent_hash,
+        &header.ommers_hash,
+        &header.beneficiary,
+        &header.state_root,
+        &header.transactions_root,
+        &header.receipts_root,
+        &header.logs_bloom,
+        &header.difficulty,
+        &header.number,
+        &header.gas_limit,
+        &header.gas_used,
+        &header.timestamp,
+        &header.extra_data,
+        &header.mix_hash,
+        &header.nonce,
+    ];
+    let optional: [Option<&dyn Encodable>; 8] = [
+        header.base_fee_per_gas.as_ref().map(|v| v as _),
+        header.withdrawals_root.as_ref().map(|v| v as _),
+        header.blob_gas_used.as_ref().map(|v| v as _),
+        header.excess_blob_gas.as_ref().map(|v| v as _),
+        header.parent_beacon_block_root.as_ref().map(|v| v as _),
+        header.requests_hash.as_ref().map(|v| v as _),
+        header.block_access_list_hash.as_ref().map(|v| v as _),
+        header.slot_number.as_ref().map(|v| v as _),
+    ];
+    let tail = &optional[..optional.iter().rposition(Option::is_some).map_or(0, |last| last + 1)];
+
+    let mut payload = Vec::new();
+    for field in fixed {
+        field.encode(&mut payload);
+    }
+    for field in tail {
+        match field {
+            Some(field) => field.encode(&mut payload),
+            None => payload.push(alloy_rlp::EMPTY_STRING_CODE),
+        }
+    }
+    let mut out = Vec::new();
+    alloy_rlp::Header { list: true, payload_length: payload.len() }.encode(&mut out);
+    out.extend_from_slice(&payload);
+    keccak256(out)
+}
+
+/// Also accepts go-bsc's `balHash` key, which upstream go-ethereum renamed to
+/// `blockAccessListHash` in ethereum/go-ethereum#34972.
+fn deserialize_header<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Header, D::Error> {
+    use serde::Deserialize;
+
+    let mut map = serde_json::Map::deserialize(deserializer)?;
+    if let Some(hash) = map.remove("balHash") {
+        map.insert("blockAccessListHash".into(), hash);
+    }
+    serde_json::from_value(map.into()).map_err(serde::de::Error::custom)
 }
 
 /// Input to the `mev_sendBidBlock` RPC: a [`BidBlock`] plus the builder's signature over its hash.
@@ -501,11 +589,11 @@ pub fn validate_bid_block_average_gas_price<R: alloy_consensus::TxReceipt>(
 /// Pre-seal verification of an admitted BidBlock (go-bsc `bidSimulator.preSealVerifyBidBlock`).
 ///
 /// Runs the cheap checks a validator makes before sealing a builder block, in go-bsc's order:
-/// coinbase is the validator, gas limit matches the in-turn target, the header is a valid unsealed
-/// Parlia header, the timestamp is within the slot, the deposit (gas-fee) value is non-zero, blob
-/// sidecars are well-formed, no user tx exceeds the per-tx gas cap, and the trailing system-tx
-/// region is valid. KZG proofs and parent-relative cascading fields are re-checked at block
-/// insertion. Returns the located `(system_tx_start, gas_fee)`.
+/// state root is non-zero, coinbase is the validator, gas limit matches the in-turn target, the
+/// header is a valid unsealed Parlia header, the timestamp is within the slot, the deposit
+/// (gas-fee) value is non-zero, blob sidecars are well-formed, no user tx exceeds the per-tx gas
+/// cap, and the trailing system-tx region is valid. KZG proofs are checked at block insertion.
+/// Returns the located `(system_tx_start, gas_fee)`.
 ///
 /// `expected_gas_limit` is the caller's `calculate_block_gas_limit(parent.gas_limit, ceil)` (reth's
 /// `core.CalcGasLimit`); `etherbase` is the validator address; `snap` is the parent's snapshot.
@@ -519,21 +607,26 @@ pub fn pre_seal_verify_bid_block(
     etherbase: Address,
     expected_gas_limit: u64,
 ) -> Result<(usize, U256), PreSealVerifyError> {
+    // bsc #3798: reject the sentinel root before doing any Parlia or payload work. Builders must
+    // commit to their expected post-state even though zero-simulate verifies it after broadcast.
+    verify_bid_block_state_root(&decoded.header)?;
+
     // go-bsc checks coinbase/gasLimit before VerifyUnsealedHeader (see preSealVerifyBidBlock) —
     // matters now that verify_bid_block_header's cascading checks depend on the header's coinbase
     // too, so a header with a *wrong* coinbase must surface `InvalidCoinbase`, not
     // `UnauthorizedValidator`, matching which error go-bsc would return first.
     verify_bid_block_coinbase_and_gas_limit(&decoded.header, etherbase, expected_gas_limit)?;
-    verify_bid_block_header(parlia, &decoded.header, parent, snap)?;
+    verify_bid_block_header(parlia, &mev_tagged_header(chain_spec, decoded), parent, snap)?;
     verify_bid_block_payload(chain_spec, decoded, parent, etherbase, expected_gas_limit)
 }
 
 /// Header half of [`pre_seal_verify_bid_block`]: the unsealed Parlia header-field checks
-/// (`validate_header`: extra, ommers, gas, base fee, withdrawals, 4844, mix digest, beacon root,
-/// requests hash), the cascading fields go-bsc's `VerifyUnsealedHeader` checks against the parent
-/// snapshot (coinbase is an authorized, not-recently-signed validator; difficulty matches its
-/// in-turn/no-turn status), and the slot timestamp bound (both directions: the existing upper
-/// bound plus go-bsc's `blockTimeVerifyForRamanujanFork` lower bound).
+/// (mix digest, ommers, beacon root, requests hash, base fee, withdrawals, 4844, gas), the
+/// cascading fields go-bsc's `VerifyUnsealedHeader` checks against the parent snapshot (coinbase
+/// is an authorized, not-recently-signed validator; difficulty matches its in-turn/no-turn
+/// status), the block-import checks against the parent, and the slot timestamp bound (both
+/// directions: the existing upper bound plus go-bsc's `blockTimeVerifyForRamanujanFork` lower
+/// bound). Extra data is not checked: the builder's is replaced by the validator's.
 ///
 /// The cascading checks use `header.beneficiary` directly rather than recovering a seal signer:
 /// go-bsc's function is explicitly named "Unsealed" because it runs on headers that may not carry
@@ -542,7 +635,7 @@ pub fn pre_seal_verify_bid_block(
 /// itself happens later, when the finalized block is executed on import.
 ///
 /// Split out because it must also run on the **finalized** header (which carries the validator's
-/// extra and seal) after `finalize_new_header`, to confirm that step didn't itself produce an
+/// seal) after `finalize_new_header`, to confirm that step didn't itself produce an
 /// invalid header, whereas [`verify_bid_block_payload`] must run **before** finalize (its
 /// `system_tx_start` feeds bind-signing, which mutates the tx set and therefore must precede
 /// finalize).
@@ -553,10 +646,6 @@ pub fn verify_bid_block_header(
     snap: &Snapshot,
 ) -> Result<(), PreSealVerifyError> {
     let sealed = SealedHeader::seal_slow(header.clone());
-    // go-bsc's `VerifyUnsealedHeader` scope: the standalone field checks WITHOUT the
-    // wall-clock future bound — a bid's next-slot timestamp is legitimately in the future
-    // (by up to one block interval) when it arrives, and geth only applies the future check
-    // on the sync path (`verifyHeader`).
     parlia
         .validate_unsealed_header_fields(&sealed)
         .map_err(|e| PreSealVerifyError::InvalidHeader(e.to_string()))?;
@@ -578,6 +667,9 @@ pub fn verify_bid_block_header(
 
     parlia
         .block_time_verify_for_ramanujan_fork(snap, header, parent)
+        .map_err(|e| PreSealVerifyError::InvalidHeader(e.to_string()))?;
+    BscConsensus::new(parlia.spec.clone())
+        .validate_header_against_parent(&sealed, &SealedHeader::seal_slow(parent.clone()))
         .map_err(|e| PreSealVerifyError::InvalidHeader(e.to_string()))?;
     parlia
         .block_time_upper_check(snap, header, parent)
@@ -619,6 +711,9 @@ pub fn verify_bid_block_payload(
     expected_gas_limit: u64,
 ) -> Result<(usize, U256), PreSealVerifyError> {
     let header = &decoded.header;
+    // This is the production admission/simulation seam in reth-bsc. Keep the same cheap guard here
+    // as in `pre_seal_verify_bid_block` so both the synchronous RPC path and miner path benefit.
+    verify_bid_block_state_root(header)?;
     verify_bid_block_coinbase_and_gas_limit(header, etherbase, expected_gas_limit)?;
 
     // go-bsc `preSealVerifyBidBlock`: `DeriveSha(decoded.Txs) == header.TxHash`.
@@ -670,9 +765,18 @@ pub fn verify_bid_block_payload(
     Ok((system_tx_start, gas_fee))
 }
 
+fn verify_bid_block_state_root(header: &Header) -> Result<(), PreSealVerifyError> {
+    if header.state_root == B256::ZERO {
+        return Err(PreSealVerifyError::ZeroStateRoot);
+    }
+    Ok(())
+}
+
 /// Why an admitted BidBlock failed pre-seal verification (see [`pre_seal_verify_bid_block`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PreSealVerifyError {
+    /// Builder supplied the zero state-root sentinel (bsc #3798).
+    ZeroStateRoot,
     /// Header coinbase is not the in-turn validator.
     InvalidCoinbase { got: Address, want: Address },
     /// Header gas limit does not equal the in-turn target.
@@ -703,6 +807,9 @@ pub enum PreSealVerifyError {
 impl fmt::Display for PreSealVerifyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ZeroStateRoot => {
+                write!(f, "bid block rejected due to zero state root")
+            }
             Self::InvalidCoinbase { got, want } => {
                 write!(f, "invalid coinbase: got {got}, want {want}")
             }
@@ -711,13 +818,13 @@ impl fmt::Display for PreSealVerifyError {
             }
             Self::InvalidHeader(detail) => write!(f, "invalid header: {detail}"),
             Self::UnauthorizedValidator { validator } => {
-                write!(f, "unauthorized validator: {validator}")
+                write!(f, "invalid header: unauthorized validator: {validator}")
             }
             Self::SignedTooRecently { validator } => {
-                write!(f, "validator {validator} signed recently")
+                write!(f, "invalid header: validator {validator} signed recently")
             }
             Self::WrongDifficulty { got, want } => {
-                write!(f, "wrong difficulty: got {got}, want {want}")
+                write!(f, "invalid header: wrong difficulty: got {got}, want {want}")
             }
             Self::EmptyGasFee => write!(f, "empty gasFee"),
             Self::TxRootMismatch { got, want } => {
@@ -820,9 +927,9 @@ pub struct BidBlockTask {
     pub gas_fee: U256,
     /// Index where the trailing system-tx region begins.
     pub system_tx_start: usize,
-    /// Builder that submitted the BidBlock (for selection logging / revoke-on-mismatch).
+    /// Builder that submitted the BidBlock.
     pub builder: Address,
-    /// Hash of the original BidBlock payload.
+    /// BidBlock digest; differs from `block.hash()` after seal.
     pub bid_hash: B256,
 }
 
@@ -860,6 +967,15 @@ pub fn set_bid_block_mev_info(header: &mut Header, builder: Address, prague_acti
     set_block_mev_info(header, BlockMevInfoVersion::BidBlock, builder, prague_active);
 }
 
+/// The bid's header as go-bsc `setBidMevInfo` leaves it; the bid (and its hash) is untouched.
+fn mev_tagged_header(chain_spec: &BscChainSpec, decoded: &DecodedBidBlock) -> Header {
+    let mut header = decoded.header.clone();
+    let prague_active =
+        chain_spec.is_prague_active_at_block_and_timestamp(header.number, header.timestamp);
+    set_bid_block_mev_info(&mut header, decoded.builder, prague_active);
+    header
+}
+
 /// Validator-side simulation of an admitted BidBlock: payload-verify, blind-sign the trailing system
 /// txs, install the validator's own block context (its extra + the recomputed tx root), finalize and
 /// seal the header — producing the consensus-valid block the validator would propose.
@@ -869,7 +985,8 @@ pub fn set_bid_block_mev_info(header: &mut Header, builder: Address, prague_acti
 /// as the builder set them so the re-executed state root matches the builder's.
 ///
 /// `vanity` is the validator's extra-data vanity (finalize appends the 65-byte seal slot);
-/// `block_timestamp_ms` is the millisecond timestamp for Lorentz.
+/// `block_timestamp_ms` is the millisecond timestamp for Lorentz; `epoch_validators` is the set an
+/// epoch block must carry, forwarded to `finalize_new_header` (see it for the `None` contract).
 #[allow(clippy::too_many_arguments)]
 pub fn simulate_bid_block(
     parlia: Arc<Parlia<BscChainSpec>>,
@@ -882,6 +999,7 @@ pub fn simulate_bid_block(
     expected_gas_limit: u64,
     vanity: Bytes,
     block_timestamp_ms: u64,
+    epoch_validators: Option<EpochValidators>,
 ) -> Result<BidBlockTask, SimulateBidBlockError> {
     let (system_tx_start, gas_fee) =
         verify_bid_block_payload(chain_spec, decoded, parent.header(), validator, expected_gas_limit)
@@ -894,13 +1012,9 @@ pub fn simulate_bid_block(
     // Install the validator's block context: its own extra (vanity; finalize appends the seal slot)
     // and the tx root for the now-signed tx set. Other block-context fields are left as the builder
     // set them so the re-executed state root matches.
-    let mut header = decoded.header.clone();
+    let mut header = mev_tagged_header(chain_spec, decoded);
     header.extra_data = vanity;
     header.transactions_root = alloy_consensus::proofs::calculate_transaction_root(&txs);
-    // Tag the header with BEP-675 BidBlock MEV info (go-bsc setBidMevInfo).
-    let prague_active =
-        chain_spec.is_prague_active_at_block_and_timestamp(header.number, header.timestamp);
-    set_bid_block_mev_info(&mut header, decoded.builder, prague_active);
 
     finalize_new_header(
         parlia.clone(),
@@ -909,11 +1023,15 @@ pub fn simulate_bid_block(
         &mut header,
         snapshot_provider,
         block_timestamp_ms,
+        epoch_validators,
     )
     .map_err(|e| SimulateBidBlockError::Finalize(e.to_string()))?;
 
     // The finalized (sealed) header must pass the unsealed-header + slot-time checks.
-    verify_bid_block_header(&parlia, &header, parent.header(), parent_snap)
+    parlia
+        .check_header_extra(&header)
+        .map_err(|e| PreSealVerifyError::InvalidHeader(e.to_string()))
+        .and_then(|()| verify_bid_block_header(&parlia, &header, parent.header(), parent_snap))
         .map_err(SimulateBidBlockError::Verify)?;
 
     let senders = txs
@@ -935,8 +1053,6 @@ pub fn simulate_bid_block(
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Needed by the hand-rolled RLP fixtures below; the production path no longer RLP-encodes.
-    use alloy_rlp::Encodable;
     use alloy_primitives::{address, b256, bytes, hex};
 
     /// Repro for the blob-BidBlock admission stack overflow: run the decode+hash path a tokio
@@ -1036,6 +1152,21 @@ mod tests {
     }
 
     #[test]
+    fn bid_block_rlp_roundtrip_matches_grpc_wire_shape() {
+        let block = BidBlock {
+            header: vector_a_block().header,
+            transactions: vec![bytes!("0x010203"), bytes!("0xdeadbeef")],
+            sidecars: Vec::new(),
+        };
+        let encoded = alloy_rlp::encode(&block);
+        let mut input = encoded.as_slice();
+        let decoded = BidBlock::decode(&mut input).unwrap();
+
+        assert!(input.is_empty(), "BidBlock decoder must consume one complete RLP value");
+        assert_eq!(decoded, block);
+    }
+
+    #[test]
     fn hash_matches_geth_vector_a() {
         // Generated from go-ethereum BidBlock.Hash() (nil sidecars).
         assert_eq!(
@@ -1073,10 +1204,7 @@ mod tests {
 
     #[test]
     fn ecrecover_matches_geth_vector_c() {
-        // The same fixed signature reth-bsc has always pinned, recovered over the post-#3742
-        // digest. Regenerated with go-bsc `BidBlockArgs.EcrecoverSender()`: narrowing the digest
-        // changes which address a given signature recovers to, which is exactly why the old
-        // mismatch surfaced as a bogus "builder is not registered".
+        // Generated from go-bsc BidBlockArgs.EcrecoverSender().
         let args = BidBlockArgs {
             bid_block: vector_a_block(),
             signature: Bytes::from(hex!(
@@ -1087,6 +1215,49 @@ mod tests {
             args.ecrecover_sender().unwrap(),
             address!("0xd6df9A7DF6A570f65d7BC2B1e1001e0dD8500040"),
         );
+    }
+
+    #[test]
+    fn hash_matches_gobsc_with_trailing_field_gap() {
+        // Generated from go-bsc BidBlock.Hash().
+        let mut bid_block = vector_a_block();
+        bid_block.header.slot_number = Some(1);
+        assert_eq!(
+            bid_block.hash(),
+            b256!("0x4276a827dc3b374848e10059b573eecef2ef7eee6996441d308d7c5efbf38c7c"),
+        );
+    }
+
+    #[test]
+    fn hash_matches_gobsc_with_all_optional_fields() {
+        // Generated from go-bsc BidBlock.Hash().
+        let mut bid_block = vector_a_block();
+        let header = &mut bid_block.header;
+        header.base_fee_per_gas = Some(0);
+        header.withdrawals_root = Some(alloy_consensus::constants::EMPTY_WITHDRAWALS);
+        header.blob_gas_used = Some(0);
+        header.excess_blob_gas = Some(0);
+        header.parent_beacon_block_root = Some(B256::ZERO);
+        header.requests_hash = Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH);
+        header.block_access_list_hash = Some(B256::repeat_byte(0x11));
+        header.slot_number = Some(1);
+        assert_eq!(
+            bid_block.hash(),
+            b256!("0x479a3ed309658e1e4a3a1d89b5efdded5efe269d8762454c80cedc8cb893c7c9"),
+        );
+        assert_eq!(bid_block.hash(), bid_block.header.hash_slow());
+    }
+
+    #[test]
+    fn bid_block_json_accepts_gobsc_bal_hash_key() {
+        let mut expected = vector_a_block();
+        expected.header.block_access_list_hash = Some(B256::repeat_byte(0x11));
+        let mut json = serde_json::to_value(&expected).unwrap();
+        let header = json["header"].as_object_mut().unwrap();
+        let bal_hash = header.remove("blockAccessListHash").unwrap();
+        header.insert("balHash".into(), bal_hash);
+
+        assert_eq!(serde_json::from_value::<BidBlock>(json).unwrap(), expected);
     }
 
     #[test]
@@ -1443,15 +1614,22 @@ mod tests {
         snap
     }
 
+    /// The block-0 parent every `pre_seal_*` fixture builds on.
+    fn preseal_parent() -> Header {
+        Header { number: 0, timestamp: 1, gas_limit: 30_000_000, ..Default::default() }
+    }
+
     /// A valid unsealed Parlia header for block 1: in-turn validator coinbase, EIP-1559/Cancun/etc.
     /// fields all absent (pre-fork), extra = 32-byte vanity + 65-byte seal slot (non-epoch).
     fn valid_bid_header(etherbase: Address, gas_limit: u64) -> Header {
         Header {
             number: 1,
-            timestamp: 1,
+            parent_hash: preseal_parent().hash_slow(),
+            timestamp: 2,
             beneficiary: etherbase,
             gas_limit,
             gas_used: 21_000,
+            state_root: B256::repeat_byte(0x44),
             ommers_hash: EMPTY_OMMER_ROOT_HASH,
             extra_data: Bytes::from(vec![0u8; 32 + 65]),
             // `snap_with_interval`'s lone validator is always in-turn (a single-member set has
@@ -1539,7 +1717,7 @@ mod tests {
         // `simulate_bid_block` would overwrite the root to match the forged body, leaving no trace.
         let spec = preseal_spec();
         let etherbase = Address::repeat_byte(0x11);
-        let parent = Header { number: 0, timestamp: 1, gas_limit: 30_000_000, ..Default::default() };
+        let parent = preseal_parent();
         let txs = vec![legacy_tx(0), deposit_system_tx(100)];
         let mut d = decoded_block(valid_bid_header(etherbase, 30_000_000), txs, vec![]);
 
@@ -1589,7 +1767,7 @@ mod tests {
         let parlia = parlia_engine(spec.clone());
         let snap = snap_with_interval(3_000);
         let header = valid_bid_header(etherbase, 30_000_000);
-        let parent = Header { number: 0, timestamp: 1, gas_limit: 30_000_000, ..Default::default() };
+        let parent = preseal_parent();
         // user tx (signed, non-system) then a trailing unsigned deposit tx carrying the gas fee.
         let txs = vec![legacy_tx(0), deposit_system_tx(100)];
         let d = decoded_block(header.clone(), txs, vec![]);
@@ -1608,13 +1786,40 @@ mod tests {
     }
 
     #[test]
+    fn pre_seal_rejects_zero_state_root_before_other_checks() {
+        let spec = preseal_spec();
+        let parlia = parlia_engine(spec.clone());
+        let snap = snap_with_interval(3_000);
+        let etherbase = Address::repeat_byte(0x11);
+        // Deliberately also use the wrong coinbase: bsc #3798 requires the zero-root rejection to
+        // win because it is the first pre-seal check.
+        let mut header = valid_bid_header(Address::repeat_byte(0x22), 30_000_000);
+        header.state_root = B256::ZERO;
+        let parent = preseal_parent();
+        let d = decoded_block(header, vec![], vec![]);
+
+        assert_eq!(
+            pre_seal_verify_bid_block(&parlia, &spec, &d, &parent, &snap, etherbase, 30_000_000),
+            Err(PreSealVerifyError::ZeroStateRoot)
+        );
+        assert_eq!(
+            verify_bid_block_payload(&spec, &d, &parent, etherbase, 30_000_000),
+            Err(PreSealVerifyError::ZeroStateRoot)
+        );
+        assert_eq!(
+            PreSealVerifyError::ZeroStateRoot.to_string(),
+            "bid block rejected due to zero state root"
+        );
+    }
+
+    #[test]
     fn pre_seal_rejects_wrong_coinbase() {
         let spec = preseal_spec();
         let parlia = parlia_engine(spec.clone());
         let snap = snap_with_interval(3_000);
         let etherbase = Address::repeat_byte(0x11);
         let header = valid_bid_header(Address::repeat_byte(0x22), 30_000_000);
-        let parent = Header { number: 0, timestamp: 1, gas_limit: 30_000_000, ..Default::default() };
+        let parent = preseal_parent();
         let d = decoded_block(header, vec![], vec![]);
         assert!(matches!(
             pre_seal_verify_bid_block(&parlia, &spec, &d, &parent, &snap, etherbase, 30_000_000),
@@ -1629,7 +1834,7 @@ mod tests {
         let snap = snap_with_interval(3_000);
         let etherbase = Address::repeat_byte(0x11);
         let header = valid_bid_header(etherbase, 30_000_000);
-        let parent = Header { number: 0, timestamp: 1, gas_limit: 30_000_000, ..Default::default() };
+        let parent = preseal_parent();
         let d = decoded_block(header, vec![], vec![]);
         assert!(matches!(
             pre_seal_verify_bid_block(&parlia, &spec, &d, &parent, &snap, etherbase, 29_000_000),
@@ -1653,7 +1858,7 @@ mod tests {
             s
         };
         let header = valid_bid_header(etherbase, 30_000_000);
-        let parent = Header { number: 0, timestamp: 1, gas_limit: 30_000_000, ..Default::default() };
+        let parent = preseal_parent();
         let d = decoded_block(header, vec![], vec![]);
         assert_eq!(
             pre_seal_verify_bid_block(&parlia, &spec, &d, &parent, &snap, etherbase, 30_000_000),
@@ -1673,7 +1878,7 @@ mod tests {
         // (0 here, since the snapshot's block_number is 0); block 0 itself would be skipped.
         snap.recent_proposers.insert(1, etherbase);
         let header = valid_bid_header(etherbase, 30_000_000);
-        let parent = Header { number: 0, timestamp: 1, gas_limit: 30_000_000, ..Default::default() };
+        let parent = preseal_parent();
         let d = decoded_block(header, vec![], vec![]);
         assert_eq!(
             pre_seal_verify_bid_block(&parlia, &spec, &d, &parent, &snap, etherbase, 30_000_000),
@@ -1689,11 +1894,43 @@ mod tests {
         let etherbase = Address::repeat_byte(0x11);
         let snap = snap_with_interval(3_000);
         let header = Header { difficulty: DIFF_NOTURN, ..valid_bid_header(etherbase, 30_000_000) };
-        let parent = Header { number: 0, timestamp: 1, gas_limit: 30_000_000, ..Default::default() };
+        let parent = preseal_parent();
         let d = decoded_block(header, vec![], vec![]);
         assert_eq!(
             pre_seal_verify_bid_block(&parlia, &spec, &d, &parent, &snap, etherbase, 30_000_000),
             Err(PreSealVerifyError::WrongDifficulty { got: DIFF_NOTURN, want: DIFF_INTURN })
+        );
+    }
+
+    #[test]
+    fn pre_seal_checks_header_before_tx_root() {
+        let spec = preseal_spec();
+        let parlia = parlia_engine(spec.clone());
+        let etherbase = Address::repeat_byte(0x11);
+        let snap = snap_with_interval(3_000);
+        let parent = preseal_parent();
+        let txs = vec![legacy_tx(0), deposit_system_tx(100)];
+        let mut d = decoded_block(valid_bid_header(etherbase, 30_000_000), txs, vec![]);
+        d.header.ommers_hash = B256::ZERO;
+        d.header.transactions_root = B256::ZERO;
+        let err =
+            pre_seal_verify_bid_block(&parlia, &spec, &d, &parent, &snap, etherbase, 30_000_000)
+                .unwrap_err();
+        assert_eq!(err.to_string(), "invalid header: non empty uncle hash");
+    }
+
+    #[test]
+    fn pre_seal_ignores_the_builder_extra() {
+        let spec = preseal_spec();
+        let parlia = parlia_engine(spec.clone());
+        let etherbase = Address::repeat_byte(0x11);
+        let snap = snap_with_interval(3_000);
+        let parent = preseal_parent();
+        let header = Header { extra_data: Bytes::new(), ..valid_bid_header(etherbase, 30_000_000) };
+        let d = decoded_block(header, vec![legacy_tx(0), deposit_system_tx(100)], vec![]);
+        assert_eq!(
+            pre_seal_verify_bid_block(&parlia, &spec, &d, &parent, &snap, etherbase, 30_000_000),
+            Ok((1, U256::from(100)))
         );
     }
 
@@ -1704,7 +1941,7 @@ mod tests {
         let parlia = parlia_engine(spec.clone());
         let snap = snap_with_interval(3_000);
         let header = valid_bid_header(etherbase, 30_000_000);
-        let parent = Header { number: 0, timestamp: 1, gas_limit: 30_000_000, ..Default::default() };
+        let parent = preseal_parent();
         // deposit value 0 => gas fee is zero.
         let txs = vec![legacy_tx(0), deposit_system_tx(0)];
         let d = decoded_block(header.clone(), txs, vec![]);
@@ -1729,7 +1966,7 @@ mod tests {
         let spec = preseal_spec();
         let etherbase = Address::repeat_byte(0x11);
         let header = valid_bid_header(etherbase, 30_000_000);
-        let parent = Header { number: 0, timestamp: 1, gas_limit: 30_000_000, ..Default::default() };
+        let parent = preseal_parent();
         let txs = vec![legacy_tx(0), deposit_system_tx(100)];
         let d = decoded_block(header.clone(), txs, vec![]);
         assert_eq!(
@@ -1842,7 +2079,7 @@ mod tests {
         let chain_spec = std::sync::Arc::new(preseal_spec());
         let parlia = std::sync::Arc::new(Parlia::new(chain_spec.clone(), 200));
 
-        let parent_header = Header { number: 0, timestamp: 1, gas_limit: 30_000_000, ..Default::default() };
+        let parent_header = preseal_parent();
         let parent = SealedHeader::new(parent_header.clone(), parent_header.hash_slow());
         let mut snap = Snapshot::new(vec![validator], 0, parent.hash(), 200, None);
         snap.block_interval = 3_000;
@@ -1867,6 +2104,7 @@ mod tests {
             30_000_000,
             Bytes::from(vec![0u8; 32]),
             1_000,
+            None, // not an epoch block
         )
         .expect("simulate");
 

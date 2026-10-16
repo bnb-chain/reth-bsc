@@ -715,6 +715,9 @@ where
         );
         let build_args = BscBuildArguments {
             cached_reads: mining_ctx.cached_reads.clone().unwrap_or_default(),
+            // `% 1000` matches `set_millisecond_part_of_timestamp`, which seals the same
+            // remainder into the header's mix_hash at finalize time.
+            milli_remainder: mining_ctx.block_timestamp_ms % 1000,
             config: PayloadConfig::new(Arc::new(mining_ctx.parent_header.clone()), attributes, alloy_rpc_types_engine::PayloadId::new([0u8; 8])),
             cancel: ManualCancel::default(),
             trace_id: crate::node::miner::payload::generate_trace_id(),
