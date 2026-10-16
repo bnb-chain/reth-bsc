@@ -15,9 +15,9 @@
 //! format is needed and a crash mid-write leaves the previous journal intact.
 //!
 //! Persistence is asynchronous and best-effort: mutations snapshot the map and hand it to a
-//! background writer, so the mining path never waits on disk. Load happens once at startup and
-//! drops revokes whose window elapsed while the node was down. An empty journal path keeps the
-//! manager purely in-memory (the pre-persistence behavior).
+//! background writer, so the mining path never waits on disk. Load keeps expired records for
+//! `violationCount`; only active ones deny. An empty journal path keeps the manager purely
+//! in-memory (the pre-persistence behavior).
 //!
 //! The journal is node-local and never exchanged between clients, so the value encoding is
 //! Rust-native (unix seconds for `revokedAt`, seconds for `duration`) while the JSON key names
@@ -87,6 +87,12 @@ struct BidBlockRevokeRecord {
     block_hash: B256,
     #[serde(rename = "blockNum")]
     block_num: u64,
+    #[serde(default, rename = "violationCount", skip_serializing_if = "usize_is_zero")]
+    violation_count: usize,
+}
+
+fn usize_is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// On-disk envelope: a version stamp plus the whole revoke map. The journal is always written as
@@ -221,8 +227,7 @@ impl BidBlockPermissionManager {
         })
     }
 
-    /// Restores persisted revokes at startup, dropping any whose window has already elapsed
-    /// (including time spent offline).
+    /// Restores the journal. Expired records are kept for `violation_count`; only active ones deny.
     fn load(&self) {
         let Some(journal) = &self.journal else { return };
         let blob = match std::fs::read(&journal.path) {
@@ -252,16 +257,19 @@ impl BidBlockPermissionManager {
         }
         let now = (self.clock)();
         let mut revoked = self.revoked.write();
+        let mut active = 0usize;
         for (builder, rec) in decoded.revokes {
             if rec.is_active(now) {
-                revoked.insert(builder, rec);
+                active += 1;
             }
+            revoked.insert(builder, rec);
         }
         if !revoked.is_empty() {
             info!(
                 target: "miner::bid_block",
                 path = %journal.path.display(),
-                count = revoked.len(),
+                active,
+                inactive = revoked.len() - active,
                 "Restored BidBlock revokes from journal"
             );
         }
@@ -287,12 +295,30 @@ impl BidBlockPermissionManager {
         self.active_record(builder, (self.clock)()).is_none()
     }
 
-    /// Deny `builder` for the default lockout window, recording the reason for the permission RPC.
+    /// Deny `builder` for the default lockout window.
     pub fn revoke(&self, builder: Address, reason: impl Into<String>, block_hash: B256, block_num: u64) {
         self.revoke_for(builder, reason, block_hash, block_num, BID_BLOCK_REVOKE_DURATION_SECS);
     }
 
-    /// Deny `builder` for `duration_secs` (defaulting when zero), recording the reason.
+    /// Record an import/verify violation, bump `violation_count`, apply the standard lockout.
+    pub fn revoke_for_violation(
+        &self,
+        builder: Address,
+        reason: impl Into<String>,
+        block_hash: B256,
+        block_num: u64,
+    ) -> usize {
+        self.revoke_inner(
+            builder,
+            reason.into(),
+            block_hash,
+            block_num,
+            BID_BLOCK_REVOKE_DURATION_SECS,
+            true,
+        )
+    }
+
+    /// Deny `builder` for `duration_secs` (0 → default). Leaves `violation_count` unchanged.
     pub fn revoke_for(
         &self,
         builder: Address,
@@ -301,25 +327,47 @@ impl BidBlockPermissionManager {
         block_num: u64,
         duration_secs: u64,
     ) {
-        let duration_secs =
-            if duration_secs == 0 { BID_BLOCK_REVOKE_DURATION_SECS } else { duration_secs };
+        self.revoke_inner(builder, reason.into(), block_hash, block_num, duration_secs, false);
+    }
+
+    /// Shared revoke write. `bump_violation` increments the tally; otherwise it is carried over.
+    /// Never shortens an active lockout.
+    fn revoke_inner(
+        &self,
+        builder: Address,
+        reason: String,
+        block_hash: B256,
+        block_num: u64,
+        duration_secs: u64,
+        bump_violation: bool,
+    ) -> usize {
         let mut revoked = self.revoked.write();
         let now = (self.clock)();
-        // A shorter policy revoke must not release a builder before its existing deadline.
-        let duration_secs = revoked.get(&builder).map_or(duration_secs, |rec| {
-            duration_secs.max(rec.revoked_at.saturating_add(rec.duration_secs).saturating_sub(now))
-        });
+        let mut violation_count = revoked.get(&builder).map(|r| r.violation_count).unwrap_or(0);
+        if bump_violation {
+            violation_count += 1;
+        }
+        let duration_secs =
+            if duration_secs == 0 { BID_BLOCK_REVOKE_DURATION_SECS } else { duration_secs };
+        let duration_secs = match revoked.get(&builder) {
+            Some(rec) if rec.is_active(now) => {
+                duration_secs.max(rec.revoked_at.saturating_add(rec.duration_secs).saturating_sub(now))
+            }
+            _ => duration_secs,
+        };
         revoked.insert(
             builder,
             BidBlockRevokeRecord {
                 revoked_at: now,
                 duration_secs,
-                reason: reason.into(),
+                reason,
                 block_hash,
                 block_num,
+                violation_count,
             },
         );
         self.mark_dirty_locked(&revoked);
+        violation_count
     }
 
     /// Current permission snapshot for `builder`.
@@ -343,7 +391,7 @@ impl BidBlockPermissionManager {
         self.revoked.read().values().filter(|rec| rec.is_active(now)).count()
     }
 
-    /// Operator override: `allowed = true` clears any revoke; `false` records a manual revoke.
+    /// Operator override: allow clears lockout and `violation_count`; deny records a manual revoke.
     pub fn set_allowed(&self, builder: Address, allowed: bool) {
         if !allowed {
             self.revoke(builder, REVOKE_REASON_MANUAL, B256::ZERO, 0);
@@ -641,37 +689,45 @@ mod tests {
         assert_eq!(got, want, "restored record differs from the persisted one");
     }
 
-    /// Mirrors go `TestBidBlockPermission_ExpiredNotRestored`: a revoke whose window elapsed
-    /// while the process was down is dropped on load, while a still-active one is restored. The
-    /// journal is seeded directly so the elapsed time is deterministic.
     #[test]
-    fn expired_revoke_not_restored() {
-        let path = test_journal_path("expired-not-restored");
-        let active = BUILDER_A;
-        let expired = BUILDER_B;
-
+    fn expired_lockout_allows_but_keeps_violation_count() {
+        let path = test_journal_path("expired-keeps-count");
         let now = unix_now();
-        let record = |revoked_at: u64, reason: &str| BidBlockRevokeRecord {
+        let rec = |revoked_at: u64, n: usize| BidBlockRevokeRecord {
             revoked_at,
             duration_secs: BID_BLOCK_REVOKE_DURATION_SECS,
-            reason: reason.to_string(),
+            reason: "x".into(),
             block_hash: B256::ZERO,
             block_num: 0,
+            violation_count: n,
         };
         seed_journal(
             &path,
             &BidBlockRevokeJournal {
                 version: BID_BLOCK_REVOKE_JOURNAL_VERSION,
                 revokes: HashMap::from([
-                    (active, record(now - 60 * 60, "active")),
-                    (expired, record(now - 25 * 60 * 60, "expired")),
+                    (BUILDER_A, rec(now - 60 * 60, 1)),
+                    (BUILDER_B, rec(now - 25 * 60 * 60, 3)),
                 ]),
             },
         );
-
         let mgr = BidBlockPermissionManager::with_journal(path);
-        assert!(!mgr.is_allowed(active), "still-active revoke must be restored");
-        assert!(mgr.is_allowed(expired), "revoke expired during downtime must not be restored");
+        assert!(!mgr.is_allowed(BUILDER_A));
+        assert!(mgr.is_allowed(BUILDER_B));
+        mgr.revoke(BUILDER_B, REVOKE_REASON_MANUAL, B256::ZERO, 0);
+        assert_eq!(mgr.revoked.read().get(&BUILDER_B).unwrap().violation_count, 3);
+    }
+
+    #[test]
+    fn violation_count_increments_only_on_violation_path() {
+        let mgr = BidBlockPermissionManager::with_clock(Box::new(|| 1_000));
+        assert_eq!(mgr.revoke_for_violation(BUILDER, INSERT_CHAIN_REASON, B256::ZERO, 1), 1);
+        assert_eq!(mgr.revoke_for_violation(BUILDER, INSERT_CHAIN_REASON, B256::ZERO, 2), 2);
+        mgr.revoke(BUILDER, REVOKE_REASON_MANUAL, B256::ZERO, 3);
+        mgr.revoke_for(BUILDER, "gas price", B256::ZERO, 4, 450);
+        assert_eq!(mgr.revoked.read().get(&BUILDER).unwrap().violation_count, 2);
+        mgr.set_allowed(BUILDER, true);
+        assert!(mgr.revoked.read().get(&BUILDER).is_none());
     }
 
     /// Mirrors go `TestBidBlockPermission_LoadToleratesBadState`: a missing or corrupt journal
@@ -708,6 +764,7 @@ mod tests {
                         reason: INSERT_CHAIN_REASON.to_string(),
                         block_hash: B256::ZERO,
                         block_num: 1,
+                        violation_count: 0,
                     },
                 )]),
             },
@@ -723,17 +780,15 @@ mod tests {
     fn journal_keys_are_stable() {
         let path = test_journal_path("journal-keys-stable");
         let mgr = BidBlockPermissionManager::with_journal(path.clone());
-        mgr.revoke(BUILDER, INSERT_CHAIN_REASON, B256::repeat_byte(0xab), 100);
+        mgr.revoke_for_violation(BUILDER, INSERT_CHAIN_REASON, B256::repeat_byte(0xab), 100);
         wait_for_journal(&path, |j| j.revokes.contains_key(&BUILDER));
 
         let blob = String::from_utf8(std::fs::read(&path).expect("read journal")).unwrap();
-        for key in
-            ["\"version\"", "\"revokes\"", "\"revokedAt\"", "\"duration\"", "\"reason\"", "\"blockHash\"", "\"blockNum\""]
-        {
-            assert!(
-                blob.contains(key),
-                "journal is missing the stable key {key}; a tag change needs a version bump\ngot: {blob}"
-            );
+        for key in [
+            "\"version\"", "\"revokes\"", "\"revokedAt\"", "\"duration\"", "\"reason\"",
+            "\"blockHash\"", "\"blockNum\"", "\"violationCount\"",
+        ] {
+            assert!(blob.contains(key), "missing journal key {key}; got: {blob}");
         }
     }
 
@@ -756,6 +811,7 @@ mod tests {
                 reason: "revoke".to_string(),
                 block_hash: B256::ZERO,
                 block_num: 0,
+                violation_count: 0,
             },
         )]);
         let cleared = HashMap::new(); // the set_allowed(true) result
