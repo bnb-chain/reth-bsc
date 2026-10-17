@@ -15,6 +15,16 @@ use std::{sync::Arc, time::SystemTime};
 
 const MAX_RLP_BLOCK_SIZE_OSAKA: usize = 8 * 1024 * 1024;
 
+#[inline]
+fn validate_osaka_block_size(rlp_length: usize) -> Result<(), ConsensusError> {
+    if rlp_length > MAX_RLP_BLOCK_SIZE_OSAKA {
+        return Err(ConsensusError::BlockTooLarge {
+            rlp_length,
+            max_rlp_length: MAX_RLP_BLOCK_SIZE_OSAKA,
+        });
+    }
+    Ok(())
+}
 
 pub const fn validate_header_gas(header: &Header) -> Result<(), ConsensusError> {
     if header.gas_used > header.gas_limit {
@@ -275,7 +285,9 @@ impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 's
 }
 
 
-impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 'static> Consensus<BscBlock> for Parlia<ChainSpec> {
+impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 'static>
+    Consensus<BscBlock> for Parlia<ChainSpec>
+{
     fn validate_body_against_header(
         &self,
         _body: &<BscBlock as Block>::Body,
@@ -295,13 +307,7 @@ impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 's
         }
 
         if BscHardforks::is_osaka_active_at_timestamp(&*self.spec, block.number, block.timestamp) {
-            let rlp_length = BscBlock::rlp_length(block.header(), block.body());
-            if rlp_length > MAX_RLP_BLOCK_SIZE_OSAKA {
-                return Err(ConsensusError::BlockTooLarge {
-                    rlp_length,
-                    max_rlp_length: MAX_RLP_BLOCK_SIZE_OSAKA,
-                });
-            }
+            validate_osaka_block_size(BscBlock::canonical_rlp_length(block.header(), block.body()))?;
             // Note: Individual transaction gas limit validation (EIP-7825) is intentionally
             // NOT performed here because system transactions use i64::MAX gas limit.
             // The validation happens during EVM execution via cfg_env.tx_gas_limit_cap,
@@ -347,6 +353,19 @@ mod tests {
 
     fn sealed(header: Header) -> SealedHeader {
         RethSealedHeader::new(header, B256::ZERO)
+    }
+
+    #[test]
+    fn osaka_block_size_limit_boundary() {
+        // Check the boundary numerically without constructing oversized block payloads.
+        assert!(validate_osaka_block_size(MAX_RLP_BLOCK_SIZE_OSAKA - 1).is_ok());
+        assert!(validate_osaka_block_size(MAX_RLP_BLOCK_SIZE_OSAKA).is_ok());
+        let oversized = MAX_RLP_BLOCK_SIZE_OSAKA + 1;
+        assert!(matches!(
+            validate_osaka_block_size(oversized),
+            Err(ConsensusError::BlockTooLarge { rlp_length, max_rlp_length })
+                if rlp_length == oversized && max_rlp_length == MAX_RLP_BLOCK_SIZE_OSAKA
+        ));
     }
 
     #[test]
