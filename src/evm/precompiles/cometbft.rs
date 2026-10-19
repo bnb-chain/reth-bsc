@@ -2,24 +2,16 @@
 use crate::evm::precompiles::{dedup::DuplicateTracker, error::BscPrecompileError};
 use alloy_primitives::Bytes;
 use cometbft::{
-    block::{self, signed_header::SignedHeader},
-    crypto::signature,
+    block::{self, signed_header::SignedHeader, CommitSig},
+    crypto::{default::Sha256, signature},
     hash::Hash,
-    merkle,
+    merkle::{self, simple_hash_from_byte_vectors},
     validator::Set,
-    vote::Power,
-    PublicKey,
-    Signature,
+    vote::{self, Power, SignedVote, ValidatorIndex, Vote},
+    PublicKey, Signature,
 };
-use cometbft_light_client::{
-    predicates::VerificationPredicates,
-    types::{LightBlock, TrustThreshold},
-};
-use cometbft_light_client_verifier::{
-    operations::voting_power::ProvidedVotingPowerCalculator,
-    predicates::ProdPredicates,
-    types::{Validator, ValidatorSet},
-};
+use cometbft_light_client::types::LightBlock;
+use cometbft_light_client_verifier::types::Validator;
 use cometbft_proto::{
     types::v1::{
         BlockId as RawBlockId, LightBlock as TmLightBlock, SimpleValidator as TmSimpleValidator,
@@ -124,7 +116,7 @@ fn cometbft_light_block_validation_run_inner(
             Err(h) => return Ok(PrecompileOutput::halt(h, reservoir)),
         };
 
-    let light_block = match convert_light_block_from_proto(&tm_light_block) {
+    let (light_block, validators) = match convert_light_block_from_proto(&tm_light_block) {
         Ok(v) => v,
         Err(h) => return Ok(PrecompileOutput::halt(h, reservoir)),
     };
@@ -139,16 +131,20 @@ fn cometbft_light_block_validation_run_inner(
     // From Pasteur, reject duplicate identities in the incoming light block's validator set
     // (the trusted consensus state set is checked during decoding above).
     if require_unique_validators {
-        if let Err(h) = validate_unique_validator_set(&light_block.validators) {
+        if let Err(h) = validate_unique_validator_set(&validators) {
             return Ok(PrecompileOutput::halt(h, reservoir));
         }
     }
 
-    let mut validator_set_changed =
-        match consensus_state.apply_light_block(&light_block, &randao_mix, validators_hash) {
-            Ok(v) => v,
-            Err(h) => return Ok(PrecompileOutput::halt(h, reservoir)),
-        };
+    let mut validator_set_changed = match consensus_state.apply_light_block(
+        &light_block,
+        &randao_mix,
+        validators_hash,
+        validators,
+    ) {
+        Ok(v) => v,
+        Err(h) => return Ok(PrecompileOutput::halt(h, reservoir)),
+    };
     if !is_hertz {
         validator_set_changed = false;
     }
@@ -165,7 +161,10 @@ fn cometbft_light_block_validation_run_inner(
     ))
 }
 
-type ConvertLightBlockResult = Result<LightBlock, PrecompileHalt>;
+/// The light block, plus its validators in protobuf order. `Set` sorts validators by power and
+/// address, but go-bsc keeps the wire order: commit signatures are bound to validators by
+/// index, and the set is hashed and re-encoded in that order.
+type ConvertLightBlockResult = Result<(LightBlock, Vec<Validator>), PrecompileHalt>;
 fn convert_light_block_from_proto(light_block_proto: &TmLightBlock) -> ConvertLightBlockResult {
     // Both fields are optional in the protobuf definition, so any caller can omit them by
     // crafting the precompile input; treat a missing field as invalid input instead of
@@ -180,14 +179,21 @@ fn convert_light_block_from_proto(light_block_proto: &TmLightBlock) -> ConvertLi
     let mut validator_set_proto =
         light_block_proto.validator_set.clone().ok_or(BscPrecompileError::InvalidInput)?;
     fill_unset_bridge_fields(&mut validator_set_proto);
-    let validator_set = match Set::try_from(validator_set_proto) {
+    let validator_set = match Set::try_from(validator_set_proto.clone()) {
         Ok(vs) => vs.clone(),
         Err(_) => return Err(BscPrecompileError::InvalidInput.into()),
     };
+    // Each zero-filled entry already converted successfully inside `Set::try_from` above.
+    let validators = validator_set_proto
+        .validators
+        .iter()
+        .map(|v| Validator::try_from(v.clone()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| BscPrecompileError::InvalidInput)?;
 
     let next_validator_set = validator_set.clone();
     let peer_id = cometbft::node::Id::new([0u8; 20]);
-    Ok(LightBlock::new(signed_header, validator_set, next_validator_set, peer_id))
+    Ok((LightBlock::new(signed_header, validator_set, next_validator_set, peer_id), validators))
 }
 
 /// go-bsc's `Validator.ValidateBasic` accepts an empty relayer BLS key or relayer address as
@@ -349,7 +355,8 @@ struct ConsensusState {
     chain_id: String,
     height: u64,
     next_validator_set_hash: Bytes,
-    validators: ValidatorSet,
+    /// In wire order, as go-bsc keeps it (see `ConvertLightBlockResult`).
+    validators: Vec<Validator>,
 }
 
 /// Bind the supplied validator set to the header and the header to the signed commit.
@@ -375,16 +382,18 @@ impl ConsensusState {
         chain_id: String,
         height: u64,
         next_validator_set_hash: Bytes,
-        validators: ValidatorSet,
+        validators: Vec<Validator>,
     ) -> Self {
         Self { chain_id, height, next_validator_set_hash, validators }
     }
 
+    /// `validators` is the light block's validator set in wire order.
     fn apply_light_block(
         &mut self,
         light_block: &LightBlock,
         randao_mix: &[u8],
         validators_hash: Hash,
+        validators: Vec<Validator>,
     ) -> Result<bool, PrecompileHalt> {
         if light_block.height().value() <= self.height {
             return Err(BscPrecompileError::InvalidInput.into());
@@ -396,70 +405,31 @@ impl ConsensusState {
         // Required for both adjacent and skipping updates, before any state is changed.
         validate_light_block_bindings(light_block, randao_mix, validators_hash)?;
 
-        let vp = ProdPredicates;
-        let voting_power_calculator = ProvidedVotingPowerCalculator::<GoEd25519Verifier>::default();
-        let trust_threshold_two_third = TrustThreshold::TWO_THIRDS;
-        let trust_threshold_one_third = TrustThreshold::ONE_THIRD;
+        let signed_header = &light_block.signed_header;
         if self.height + 1 == light_block.height().value() {
-            if self.next_validator_set_hash.ne(light_block
-                .signed_header
-                .header()
-                .validators_hash
-                .as_bytes())
-            {
+            if self.next_validator_set_hash.ne(signed_header.header().validators_hash.as_bytes()) {
                 return Err(BscPrecompileError::CometBftApplyBlockFailed.into());
             }
-            // Verify Commit Light Trusted
-            let result = vp.has_sufficient_validators_overlap(
-                &light_block.signed_header,
-                &light_block.validators,
-                &trust_threshold_two_third,
-                &voting_power_calculator,
-            );
-            if result.is_err() {
-                return Err(BscPrecompileError::CometBftApplyBlockFailed.into());
-            }
+            verify_commit_light(signed_header, &validators)?;
         } else {
-            // Verify Commit Light Trusting
-            let result = vp.has_sufficient_validators_overlap(
-                &light_block.signed_header,
-                &self.validators,
-                &trust_threshold_one_third,
-                &voting_power_calculator,
-            );
-
-            if result.is_err() {
-                return Err(BscPrecompileError::CometBftApplyBlockFailed.into());
-            }
-
-            // Verify Commit Light
-            let result = vp.has_sufficient_validators_overlap(
-                &light_block.signed_header,
-                &light_block.validators,
-                &trust_threshold_two_third,
-                &voting_power_calculator,
-            );
-            if result.is_err() {
-                return Err(BscPrecompileError::CometBftApplyBlockFailed.into());
-            }
+            // More than 1/3 of the trusted set, then more than 2/3 of the new set, must have
+            // signed. The second check stays last, as in go-bsc.
+            verify_commit_light_trusting(signed_header, &self.validators)?;
+            verify_commit_light(signed_header, &validators)?;
         }
 
-        let validator_set_changed = self.validators.hash().as_bytes().ne(light_block
-            .signed_header
-            .header()
-            .validators_hash
-            .as_bytes());
+        let validator_set_changed = trusted_validator_set_hash(&self.validators)
+            .ne(signed_header.header().validators_hash.as_bytes());
         self.height = light_block.height().value();
-        self.next_validator_set_hash = Bytes::from(
-            light_block.signed_header.header().next_validators_hash.as_bytes().to_vec(),
-        );
-        self.validators = light_block.validators.clone();
+        self.next_validator_set_hash =
+            Bytes::from(signed_header.header().next_validators_hash.as_bytes().to_vec());
+        self.validators = validators;
 
         Ok(validator_set_changed)
     }
 
     fn encode(&self) -> Result<Bytes, PrecompileHalt> {
-        let validator_set_length = self.validators.validators().len();
+        let validator_set_length = self.validators.len();
         let serialize_length = (CHAIN_ID_LENGTH +
             HEIGHT_LENGTH +
             VALIDATOR_SET_HASH_LENGTH +
@@ -492,7 +462,7 @@ impl ConsensusState {
         pos += VALIDATOR_SET_HASH_LENGTH as usize;
 
         for i in 0..validator_set_length {
-            let validator = &self.validators.validators()[i];
+            let validator = &self.validators[i];
             let voting_power = validator.power();
 
             output[pos..pos + VALIDATOR_PUBKEY_LENGTH as usize]
@@ -588,12 +558,8 @@ fn decode_consensus_state(
         validator_set.push(validator_info);
     }
 
-    let consensus_state = ConsensusState::new(
-        chain_id,
-        height,
-        next_validator_set_hash,
-        ValidatorSet::without_proposer(validator_set),
-    );
+    let consensus_state =
+        ConsensusState::new(chain_id, height, next_validator_set_hash, validator_set);
     if require_unique_validators {
         validate_unique_validator_set(&consensus_state.validators)?;
     }
@@ -662,8 +628,7 @@ fn go_ed25519_verify(pubkey: &[u8; 32], msg: &[u8], sig: &[u8; 64]) -> bool {
 /// `validateUniqueValidatorSet`. Validator address and consensus pubkey must always be unique;
 /// the optional bridge fields (BLS key, relayer address) are only checked when set, since unset
 /// fields are zero-filled by the fixed-width decoding and legitimately repeat.
-fn validate_unique_validator_set(validators: &ValidatorSet) -> Result<(), PrecompileHalt> {
-    let vals = validators.validators();
+fn validate_unique_validator_set(vals: &[Validator]) -> Result<(), PrecompileHalt> {
     let size = vals.len();
 
     let mut addresses = DuplicateTracker::new("validator address", size, false);
@@ -679,6 +644,112 @@ fn validate_unique_validator_set(validators: &ValidatorSet) -> Result<(), Precom
     }
 
     Ok(())
+}
+
+/// go-bsc's `ValidatorSet.VerifyCommitLight`: more than 2/3 of `validators` signed the commit,
+/// where signature `i` must verify under `validators[i]`. The address in each `CommitSig` is
+/// ignored: canonical vote bytes cover neither the address nor the index, so looking the
+/// signer up by address would accept reordered or relabelled signatures that go-bsc rejects.
+/// Go's height and block ID checks hold by construction here (`SignedHeader::new` checks the
+/// height, and the block ID compared is the commit's own).
+fn verify_commit_light(
+    signed_header: &SignedHeader,
+    validators: &[Validator],
+) -> Result<(), PrecompileHalt> {
+    let signatures = &signed_header.commit.signatures;
+    if validators.len() != signatures.len() {
+        return Err(BscPrecompileError::CometBftApplyBlockFailed.into())
+    }
+
+    let needed = total_voting_power(validators)? * 2 / 3;
+    let mut tallied = 0_u64;
+    for (idx, (commit_sig, validator)) in signatures.iter().zip(validators).enumerate() {
+        // Absent and nil votes are neither verified nor counted.
+        if !commit_sig.is_commit() {
+            continue
+        }
+        verify_commit_sig(signed_header, idx, commit_sig, validator)?;
+        tallied += validator.power();
+        if tallied > needed {
+            return Ok(())
+        }
+    }
+    Err(BscPrecompileError::CometBftApplyBlockFailed.into())
+}
+
+/// go-bsc's `ValidatorSet.VerifyCommitLightTrusting` at the default 1/3 trust level: more than
+/// 1/3 of the trusted `validators` signed the commit. The commit may come from a different set,
+/// so signers are looked up by address; a trusted validator signing twice is rejected.
+fn verify_commit_light_trusting(
+    signed_header: &SignedHeader,
+    validators: &[Validator],
+) -> Result<(), PrecompileHalt> {
+    let needed = total_voting_power(validators)? / 3;
+    let mut tallied = 0_u64;
+    let mut seen = vec![false; validators.len()];
+    for (idx, commit_sig) in signed_header.commit.signatures.iter().enumerate() {
+        let CommitSig::BlockIdFlagCommit { validator_address, .. } = commit_sig else { continue };
+        // Go's `GetByAddress` returns the first match in set order.
+        let Some(val_idx) = validators.iter().position(|v| v.address == *validator_address) else {
+            continue
+        };
+        if std::mem::replace(&mut seen[val_idx], true) {
+            return Err(BscPrecompileError::CometBftApplyBlockFailed.into())
+        }
+        verify_commit_sig(signed_header, idx, commit_sig, &validators[val_idx])?;
+        tallied += validators[val_idx].power();
+        if tallied > needed {
+            return Ok(())
+        }
+    }
+    Err(BscPrecompileError::CometBftApplyBlockFailed.into())
+}
+
+/// Verify the for-block signature at commit index `idx` under `validator`'s key.
+fn verify_commit_sig(
+    signed_header: &SignedHeader,
+    idx: usize,
+    commit_sig: &CommitSig,
+    validator: &Validator,
+) -> Result<(), PrecompileHalt> {
+    let CommitSig::BlockIdFlagCommit { validator_address, timestamp, signature } = commit_sig
+    else {
+        return Err(BscPrecompileError::CometBftApplyBlockFailed.into());
+    };
+    let commit = &signed_header.commit;
+    let vote = Vote {
+        vote_type: vote::Type::Precommit,
+        height: commit.height,
+        round: commit.round,
+        block_id: Some(commit.block_id),
+        timestamp: Some(*timestamp),
+        validator_address: *validator_address,
+        validator_index: ValidatorIndex::try_from(idx)
+            .map_err(|_| BscPrecompileError::CometBftApplyBlockFailed)?,
+        signature: signature.clone(),
+        extension: Vec::new(),
+        extension_signature: None,
+    };
+    let signed_vote = SignedVote::from_vote(vote, signed_header.header().chain_id.clone())
+        .ok_or(BscPrecompileError::CometBftApplyBlockFailed)?;
+    validator
+        .verify_signature::<GoEd25519Verifier>(&signed_vote.sign_bytes(), signed_vote.signature())
+        .map_err(|_| BscPrecompileError::CometBftApplyBlockFailed.into())
+}
+
+fn total_voting_power(validators: &[Validator]) -> Result<u64, PrecompileHalt> {
+    validators
+        .iter()
+        .try_fold(0_u64, |acc, v| acc.checked_add(v.power()))
+        .filter(|total| *total <= Set::MAX_TOTAL_VOTING_POWER)
+        .ok_or_else(|| BscPrecompileError::CometBftApplyBlockFailed.into())
+}
+
+/// go-bsc's `ValidatorSet.Hash` of the trusted set decoded from the consensus state, in the given
+/// order (`Set::hash` sorts first). The decoded bridge fields are always full width, as in go-bsc.
+fn trusted_validator_set_hash(validators: &[Validator]) -> [u8; 32] {
+    let leaves: Vec<Vec<u8>> = validators.iter().map(Validator::hash_bytes).collect();
+    simple_hash_from_byte_vectors::<Sha256>(&leaves)
 }
 
 /// output:
@@ -960,7 +1031,7 @@ mod tests {
     fn validator_set_binding_uses_wire_order() {
         let input = runtime_signed_wire_order_light_block_input();
         let (_, proto, _) = decode_light_block_validation_input(&input, false).unwrap();
-        let block = convert_light_block_from_proto(&proto).unwrap();
+        let block = convert_light_block_from_proto(&proto).unwrap().0;
         let header_hash = block.signed_header.header().validators_hash;
 
         assert_eq!(validator_set_hash(proto.validator_set.as_ref().unwrap()), header_hash);
@@ -1051,30 +1122,24 @@ mod tests {
             validators.validators[0].voting_power += 1;
         });
         let (_, proto, randao_mix) = decode_light_block_validation_input(&input, false).unwrap();
-        let block = convert_light_block_from_proto(&proto).unwrap();
-        let predicates = ProdPredicates;
+        let (block, validators) = convert_light_block_from_proto(&proto).unwrap();
         let validators_hash = validator_set_hash(proto.validator_set.as_ref().unwrap());
         assert_ne!(validators_hash, block.signed_header.header().validators_hash);
         assert_eq!(
             header_hash_with_randao_mix(block.signed_header.header(), &randao_mix),
             block.signed_header.commit.block_id.hash,
         );
-        // The old voting-power-only check accepts this unchanged, valid signature.
-        assert!(predicates
-            .has_sufficient_validators_overlap(
-                &block.signed_header,
-                &block.validators,
-                &TrustThreshold::TWO_THIRDS,
-                &ProvidedVotingPowerCalculator::<GoEd25519Verifier>::default(),
-            )
-            .is_ok());
+        // Signature verification alone accepts this unchanged, valid signature.
+        assert!(verify_commit_light(&block.signed_header, &validators).is_ok());
         assert_precompile_rejects(&input);
 
         // The same binding is required on the non-adjacent trusting path.
         let (mut trusted, _, _) = decode_light_block_validation_input(&input, false).unwrap();
         trusted.height = 0;
-        trusted.validators = block.validators.clone();
-        assert!(trusted.apply_light_block(&block, &randao_mix, validators_hash).is_err());
+        trusted.validators = validators.clone();
+        assert!(trusted
+            .apply_light_block(&block, &randao_mix, validators_hash, validators)
+            .is_err());
     }
 
     #[test]
@@ -1084,8 +1149,7 @@ mod tests {
             header.app_hash[0] ^= 1;
         });
         let (_, proto, randao_mix) = decode_light_block_validation_input(&input, false).unwrap();
-        let block = convert_light_block_from_proto(&proto).unwrap();
-        let predicates = ProdPredicates;
+        let (block, validators) = convert_light_block_from_proto(&proto).unwrap();
         assert_eq!(
             validator_set_hash(proto.validator_set.as_ref().unwrap()),
             block.signed_header.header().validators_hash,
@@ -1095,14 +1159,7 @@ mod tests {
             block.signed_header.commit.block_id.hash,
         );
         // Signatures still verify over the commit's old block ID.
-        assert!(predicates
-            .has_sufficient_validators_overlap(
-                &block.signed_header,
-                &block.validators,
-                &TrustThreshold::TWO_THIRDS,
-                &ProvidedVotingPowerCalculator::<GoEd25519Verifier>::default(),
-            )
-            .is_ok());
+        assert!(verify_commit_light(&block.signed_header, &validators).is_ok());
         assert_precompile_rejects(&input);
     }
 
@@ -1127,7 +1184,7 @@ mod tests {
         let input = valid_light_block_input();
         let (_, proto, original_randao) =
             decode_light_block_validation_input(&input, false).unwrap();
-        let block = convert_light_block_from_proto(&proto).unwrap();
+        let block = convert_light_block_from_proto(&proto).unwrap().0;
         assert_eq!(original_randao.len(), 64);
         assert_eq!(
             header_hash_with_randao_mix(block.signed_header.header(), &original_randao),
@@ -1149,7 +1206,7 @@ mod tests {
         without_randao.extend_from_slice(&wire_block.encode_to_vec());
         let (_, proto, randao) =
             decode_light_block_validation_input(&without_randao, false).unwrap();
-        let block = convert_light_block_from_proto(&proto).unwrap();
+        let block = convert_light_block_from_proto(&proto).unwrap().0;
         assert!(randao.is_empty());
         // Computed independently with greenfield-cometbft v1.3.2's Header.Hash in Go.
         assert_eq!(
@@ -1183,7 +1240,7 @@ mod tests {
     fn unsigned_light_block() -> (LightBlock, Vec<u8>) {
         let (_, proto, randao_mix) =
             decode_light_block_validation_input(&valid_light_block_input(), true).unwrap();
-        let mut block = convert_light_block_from_proto(&proto).unwrap();
+        let mut block = convert_light_block_from_proto(&proto).unwrap().0;
         block.signed_header.commit.signatures.clear();
         (block, randao_mix)
     }
@@ -1262,7 +1319,7 @@ mod tests {
             } else {
                 validators[0].relayer_address = vec![0; 20].try_into().unwrap();
             }
-            block.validators = ValidatorSet::without_proposer(validators);
+            block.validators = Set::without_proposer(validators);
             // Isolate the set-to-header check: the header still matches its commit.
             assert_eq!(
                 header_hash_with_randao_mix(block.signed_header.header(), &randao_mix),
@@ -1293,7 +1350,12 @@ mod tests {
                 state.height = trusted_height;
                 let before = state.encode().unwrap();
                 assert_eq!(
-                    state.apply_light_block(block, &randao_mix, block.validators.hash()),
+                    state.apply_light_block(
+                        block,
+                        &randao_mix,
+                        block.validators.hash(),
+                        block.validators.validators().clone(),
+                    ),
                     Err(BscPrecompileError::CometBftApplyBlockFailed.into()),
                 );
                 assert_eq!(state.encode().unwrap(), before);
@@ -1309,7 +1371,10 @@ mod tests {
         let (mut state, _, _) =
             decode_light_block_validation_input(&valid_light_block_input(), true).unwrap();
         let before = state.encode().unwrap();
-        assert!(state.apply_light_block(&block, &randao_mix, validators_hash).is_err());
+        let validators = block.validators.validators().clone();
+        assert!(state
+            .apply_light_block(&block, &randao_mix, validators_hash, validators)
+            .is_err());
         assert_eq!(state.encode().unwrap(), before);
     }
 
@@ -1342,7 +1407,7 @@ mod tests {
                 if length == 0 || length == 64 {
                     let (_, decoded_proto, decoded_randao) =
                         decoded.expect("valid RandaoMix length");
-                    let decoded = convert_light_block_from_proto(&decoded_proto).unwrap();
+                    let decoded = convert_light_block_from_proto(&decoded_proto).unwrap().0;
                     assert_eq!(decoded.signed_header, block.signed_header);
                     assert_eq!(decoded.validators, block.validators);
                     assert_eq!(decoded_randao, randao_mix);
@@ -1487,7 +1552,7 @@ mod tests {
                 bls_pub_key.to_vec(),
                 relayer_address.to_vec(),
             ));
-            let validator_set = ValidatorSet::without_proposer(validators_info);
+            let validator_set = validators_info;
 
             let cs = ConsensusState::new(chain_id, height, next_validator_set_hash, validator_set);
 
@@ -1529,7 +1594,7 @@ mod tests {
                 Bytes::from(hex!("b32979580ea04984a2be033599c20c7a0c9a8d121b57f94ee05f5eda5b36c38f6e354c89328b92cdd1de33b64d3a0867")).to_vec(),
                 Bytes::from(hex!("97376a436bbf54e0f6949b57aa821a90a749920a")).to_vec(),
             ));
-            let validator_set = ValidatorSet::without_proposer(validators_info);
+            let validator_set = validators_info;
             let cs = ConsensusState::new(chain_id, height, next_validator_set_hash, validator_set);
 
             let expected_output = Bytes::from(hex!("636861696e5f393030302d3132310000000000000000000000000000000000000000000000000001a5f1af4874227f1cdbe5240259a365ad86484a4255bfd65e2a0222d733fcdbc320cc466ee9412ddd49e0fff04cdb41bade2b7622f08b6bdacac94d4de03bdb970000000000002710d5e63aeee6e6fa122a6a23a6e0fca87701ba1541aa2d28cbcd1ea3a63479f6fb260a3d755853e6a78cfa6252584fee97b2ec84a9d572ee4a5d3bc1558bb98a4b370fb8616b0b523ee91ad18a63d63f21e0c40a83ef15963f4260574ca5159fd90a1c527000000000000027106fd1ceb5a48579f322605220d4325bd9ff90d5fab31e74a881fc78681e3dfa440978d2b8be0708a1cbbca2c660866216975fdaf0e9038d9b7ccbf9731f43956dba7f2451919606ae20bf5d248ee353821754bcdb456fd3950618fda3e32d3d0fb990eeda000000000000271097376a436bbf54e0f6949b57aa821a90a749920ab32979580ea04984a2be033599c20c7a0c9a8d121b57f94ee05f5eda5b36c38f6e354c89328b92cdd1de33b64d3a0867"));
@@ -1556,7 +1621,7 @@ mod tests {
                 Bytes::from(hex!("a60afe627fd78b19e07e07e19d446009dd53a18c6c8744176a5d851a762bbb51198e7e006f2a6ea7225661a61ecd832d")).to_vec(),
                 Bytes::from(hex!("B32d0723583040F3A16D1380D1e6AA874cD1bdF7")).to_vec(),
             ));
-            let validator_set = ValidatorSet::without_proposer(validators_info);
+            let validator_set = validators_info;
             let bls_pub_key = Bytes::from(hex!("a60afe627fd78b19e07e07e19d446009dd53a18c6c8744176a5d851a762bbb51198e7e006f2a6ea7225661a61ecd832d"));
             let relayer_address = Bytes::from(hex!("B32d0723583040F3A16D1380D1e6AA874cD1bdF7"));
             let cs_bytes = Bytes::from(hex!("636861696e5f393030302d31323100000000000000000000000000000000000000000000000000010ce856b1dc9cdcf3bf2478291cf02c62aeeb3679889e9866931bf1fb05a10edac3d9a1082f42ca161402f8668f8e39ec9e30092affd8d3262267ac7e248a959e0000000000002710b32d0723583040f3a16d1380d1e6aa874cd1bdf7a60afe627fd78b19e07e07e19d446009dd53a18c6c8744176a5d851a762bbb51198e7e006f2a6ea7225661a61ecd832d"));
@@ -1568,11 +1633,8 @@ mod tests {
             assert_eq!(cs.height, height);
             assert_eq!(cs.next_validator_set_hash, next_validator_set_hash);
             assert_eq!(cs.validators, validator_set);
-            assert_eq!(
-                cs.validators.validators()[0].relayer_address.as_bytes(),
-                relayer_address.to_vec()
-            );
-            assert_eq!(cs.validators.validators()[0].bls_key.as_bytes(), bls_pub_key.to_vec());
+            assert_eq!(cs.validators[0].relayer_address.as_bytes(), relayer_address.to_vec());
+            assert_eq!(cs.validators[0].bls_key.as_bytes(), bls_pub_key.to_vec());
         }
         {
             let chain_id = "chain_9000-121".to_string();
@@ -1616,7 +1678,7 @@ mod tests {
             ));
             bls_pub_keys.push(Bytes::from(hex!("b32979580ea04984a2be033599c20c7a0c9a8d121b57f94ee05f5eda5b36c38f6e354c89328b92cdd1de33b64d3a0867")));
             relayer_addresses.push(Bytes::from(hex!("97376a436bbf54e0f6949b57aa821a90a749920a")));
-            let validator_set = ValidatorSet::without_proposer(validators_info);
+            let validator_set = validators_info;
             let cs_bytes = Bytes::from(hex!("636861696e5f393030302d3132310000000000000000000000000000000000000000000000000001a5f1af4874227f1cdbe5240259a365ad86484a4255bfd65e2a0222d733fcdbc320cc466ee9412ddd49e0fff04cdb41bade2b7622f08b6bdacac94d4de03bdb970000000000002710d5e63aeee6e6fa122a6a23a6e0fca87701ba1541aa2d28cbcd1ea3a63479f6fb260a3d755853e6a78cfa6252584fee97b2ec84a9d572ee4a5d3bc1558bb98a4b370fb8616b0b523ee91ad18a63d63f21e0c40a83ef15963f4260574ca5159fd90a1c527000000000000027106fd1ceb5a48579f322605220d4325bd9ff90d5fab31e74a881fc78681e3dfa440978d2b8be0708a1cbbca2c660866216975fdaf0e9038d9b7ccbf9731f43956dba7f2451919606ae20bf5d248ee353821754bcdb456fd3950618fda3e32d3d0fb990eeda000000000000271097376a436bbf54e0f6949b57aa821a90a749920ab32979580ea04984a2be033599c20c7a0c9a8d121b57f94ee05f5eda5b36c38f6e354c89328b92cdd1de33b64d3a0867"));
             let cs = match decode_consensus_state(&cs_bytes, false) {
                 Ok(cs) => cs,
@@ -1627,21 +1689,12 @@ mod tests {
             assert_eq!(cs.height, height);
             assert_eq!(cs.next_validator_set_hash, next_validator_set_hash);
             assert_eq!(cs.validators, validator_set);
-            assert_eq!(
-                cs.validators.validators()[0].relayer_address.as_bytes(),
-                relayer_addresses[0].to_vec()
-            );
-            assert_eq!(cs.validators.validators()[0].bls_key.as_bytes(), bls_pub_keys[0].to_vec());
-            assert_eq!(
-                cs.validators.validators()[1].relayer_address.as_bytes(),
-                relayer_addresses[1].to_vec()
-            );
-            assert_eq!(cs.validators.validators()[1].bls_key.as_bytes(), bls_pub_keys[1].to_vec());
-            assert_eq!(
-                cs.validators.validators()[2].relayer_address.as_bytes(),
-                relayer_addresses[2].to_vec()
-            );
-            assert_eq!(cs.validators.validators()[2].bls_key.as_bytes(), bls_pub_keys[2].to_vec());
+            assert_eq!(cs.validators[0].relayer_address.as_bytes(), relayer_addresses[0].to_vec());
+            assert_eq!(cs.validators[0].bls_key.as_bytes(), bls_pub_keys[0].to_vec());
+            assert_eq!(cs.validators[1].relayer_address.as_bytes(), relayer_addresses[1].to_vec());
+            assert_eq!(cs.validators[1].bls_key.as_bytes(), bls_pub_keys[1].to_vec());
+            assert_eq!(cs.validators[2].relayer_address.as_bytes(), relayer_addresses[2].to_vec());
+            assert_eq!(cs.validators[2].bls_key.as_bytes(), bls_pub_keys[2].to_vec());
         }
     }
 
@@ -1659,8 +1712,8 @@ mod tests {
                 Ok(_) => (),
                 Err(_) => panic!("merge light block failed"),
             };
-            let light_block = match convert_light_block_from_proto(&light_block_pb) {
-                Ok(light_block) => light_block,
+            let (light_block, validators) = match convert_light_block_from_proto(&light_block_pb) {
+                Ok(v) => v,
                 Err(_) => panic!("convert light block from proto failed"),
             };
             let expected_height = 2_u64;
@@ -1670,6 +1723,7 @@ mod tests {
                 &light_block,
                 &decode_randao_mix(light_block_bytes.as_ref()).unwrap(),
                 validator_set_hash(light_block_pb.validator_set.as_ref().unwrap()),
+                validators,
             ) {
                 Ok(validator_set_changed) => {
                     assert_eq!(validator_set_changed, expected_validator_set_changed);
@@ -1690,8 +1744,8 @@ mod tests {
                 Ok(_) => (),
                 Err(_) => panic!("merge light block failed"),
             };
-            let light_block = match convert_light_block_from_proto(&light_block_pb) {
-                Ok(light_block) => light_block,
+            let (light_block, validators) = match convert_light_block_from_proto(&light_block_pb) {
+                Ok(v) => v,
                 Err(_) => panic!("convert light block from proto failed"),
             };
             let expected_height = 273513_u64;
@@ -1701,6 +1755,7 @@ mod tests {
                 &light_block,
                 &decode_randao_mix(light_block_bytes.as_ref()).unwrap(),
                 validator_set_hash(light_block_pb.validator_set.as_ref().unwrap()),
+                validators,
             ) {
                 Ok(validator_set_changed) => {
                     assert_eq!(validator_set_changed, expected_validator_set_changed);
@@ -1744,7 +1799,7 @@ mod tests {
             Bytes::from(
                 hex!("0ce856b1dc9cdcf3bf2478291cf02c62aeeb3679889e9866931bf1fb05a10eda").to_vec(),
             ),
-            ValidatorSet::without_proposer(vec![
+            vec![
                 Validator::new_with_bls_and_relayer(
                     pk(),
                     Power::from(10000_u32),
@@ -1757,7 +1812,7 @@ mod tests {
                     bls.clone(),
                     relayer.clone(),
                 ),
-            ]),
+            ],
         );
         let encoded = cs.encode().expect("encode consensus state");
 
@@ -1790,30 +1845,30 @@ mod tests {
         let relayer1 = hex!("6fd1ceb5a48579f322605220d4325bd9ff90d5fa").to_vec();
 
         // Duplicate BLS key (pubkeys and relayer addresses distinct).
-        let set = ValidatorSet::without_proposer(vec![
+        let set = vec![
             Validator::new_with_bls_and_relayer(pk0(), Power::from(1_u32), bls0.clone(), relayer0.clone()),
             Validator::new_with_bls_and_relayer(pk1(), Power::from(1_u32), bls0.clone(), relayer1.clone()),
-        ]);
+        ];
         match validate_unique_validator_set(&set).unwrap_err() {
             PrecompileHalt::Other(msg) => assert!(msg.contains("duplicate validator bls key")),
             other => panic!("unexpected halt: {other:?}"),
         }
 
         // Duplicate relayer address.
-        let set = ValidatorSet::without_proposer(vec![
+        let set = vec![
             Validator::new_with_bls_and_relayer(pk0(), Power::from(1_u32), bls0.clone(), relayer0.clone()),
             Validator::new_with_bls_and_relayer(pk1(), Power::from(1_u32), bls1.clone(), relayer0.clone()),
-        ]);
+        ];
         match validate_unique_validator_set(&set).unwrap_err() {
             PrecompileHalt::Other(msg) => assert!(msg.contains("duplicate validator relayer address")),
             other => panic!("unexpected halt: {other:?}"),
         }
 
         // Unset (all-zero) bridge fields may legitimately repeat across validators.
-        let set = ValidatorSet::without_proposer(vec![
+        let set = vec![
             Validator::new_with_bls_and_relayer(pk0(), Power::from(1_u32), vec![0u8; 48], vec![0u8; 20]),
             Validator::new_with_bls_and_relayer(pk1(), Power::from(1_u32), vec![0u8; 48], vec![0u8; 20]),
-        ]);
+        ];
         assert!(validate_unique_validator_set(&set).is_ok());
     }
 
@@ -1826,7 +1881,7 @@ mod tests {
             Bytes::from(
                 hex!("a5f1af4874227f1cdbe5240259a365ad86484a4255bfd65e2a0222d733fcdbc3").to_vec(),
             ),
-            ValidatorSet::without_proposer(vec![
+            vec![
                 Validator::new_with_bls_and_relayer(
                     PublicKey::from_raw_ed25519(&hex!(
                         "20cc466ee9412ddd49e0fff04cdb41bade2b7622f08b6bdacac94d4de03bdb97"
@@ -1854,7 +1909,7 @@ mod tests {
                     hex!("b32979580ea04984a2be033599c20c7a0c9a8d121b57f94ee05f5eda5b36c38f6e354c89328b92cdd1de33b64d3a0867").to_vec(),
                     hex!("97376a436bbf54e0f6949b57aa821a90a749920a").to_vec(),
                 ),
-            ]),
+            ],
         );
         let encoded = cs.encode().expect("encode consensus state");
         assert!(decode_consensus_state(&encoded, true).is_ok());
@@ -2068,4 +2123,94 @@ mod tests {
         assert!(!go(&pubkey, &sig));
     }
 
+    /// Rebuild the valid fixture with its commit signatures changed by `f`.
+    fn with_commit_sigs(
+        mut f: impl FnMut(&mut Vec<cometbft_proto::types::v1::CommitSig>),
+    ) -> Vec<u8> {
+        modify_fixture_light_block(|proto| {
+            f(&mut proto.signed_header.as_mut().unwrap().commit.as_mut().unwrap().signatures)
+        })
+    }
+
+    /// SRC-1850: go-bsc verifies signature `i` under validator `i`. Swapping two complete
+    /// `CommitSig`s keeps every signature valid for its embedded address, but go-bsc rejects it.
+    #[test]
+    fn pasteur_rejects_reordered_commit_sigs() {
+        let unchanged = with_commit_sigs(|_| {});
+        let output =
+            cometbft_light_block_validation_run_pasteur(&unchanged, 10_000_000, 0).unwrap();
+        assert!(output.is_success());
+
+        let swapped = with_commit_sigs(|sigs| sigs.swap(0, 1));
+        let output = cometbft_light_block_validation_run_pasteur(&swapped, 10_000_000, 0).unwrap();
+        assert!(output.is_halt(), "reordered commit signatures must be rejected");
+    }
+
+    /// go-bsc never reads the `CommitSig` address when counting the new validator set, so a
+    /// valid signature carrying a wrong or repeated address still counts.
+    #[test]
+    fn pasteur_ignores_commit_sig_addresses_like_go() {
+        let expected =
+            cometbft_light_block_validation_run_pasteur(&with_commit_sigs(|_| {}), 10_000_000, 0)
+                .unwrap();
+
+        let wrong_address = with_commit_sigs(|sigs| sigs[2].validator_address = vec![0x77; 20]);
+        let duplicate_address = with_commit_sigs(|sigs| {
+            sigs[1].validator_address = sigs[0].validator_address.clone();
+        });
+        for input in [wrong_address, duplicate_address] {
+            let output =
+                cometbft_light_block_validation_run_pasteur(&input, 10_000_000, 0).unwrap();
+            assert!(output.is_success());
+            assert_eq!(output.bytes, expected.bytes);
+        }
+    }
+
+    /// go-bsc skips nil votes without verifying them, so a nil vote with a junk signature is
+    /// ignored and the other three validators are still a quorum.
+    #[test]
+    fn pasteur_skips_nil_vote_with_junk_signature_like_go() {
+        use cometbft_proto::types::v1::BlockIdFlag;
+
+        let (input, expected) = runtime_signed_light_block(
+            |_| {},
+            |sigs| {
+                sigs[0].block_id_flag = BlockIdFlag::Nil as i32;
+                sigs[0].signature = vec![0xab; 64];
+            },
+        );
+        let output = cometbft_light_block_validation_run_pasteur(&input, 10_000_000, 0).unwrap();
+        assert!(output.is_success(), "halted with {:?}", output.halt_reason());
+        assert_eq!(output.bytes.as_ref(), expected.as_slice());
+    }
+
+    /// A validator set that is not in cometbft-rs sort order: signatures bind to validators by
+    /// position, and go-bsc keeps the wire order when re-encoding the consensus state.
+    #[test]
+    fn pasteur_keeps_unsorted_validator_set_in_wire_order() {
+        let (input, expected) = runtime_signed_light_block(|signers| signers.reverse(), |_| {});
+        let output = cometbft_light_block_validation_run_pasteur(&input, 10_000_000, 0).unwrap();
+        assert!(output.is_success(), "halted with {:?}", output.halt_reason());
+        assert_eq!(output.bytes.as_ref(), expected.as_slice());
+    }
+
+    /// Known answer from greenfield-cometbft v1.3.2 `ValidatorSet.Hash` for this decoded set, built
+    /// directly in this order (not via `NewValidatorSet`, which sorts it; sorted, the hash is
+    /// e57bd52c...). The public keys are filler bytes.
+    #[test]
+    fn trusted_validator_set_hash_matches_go_wire_order() {
+        let validator = |fill: u8, power: u32| {
+            Validator::new_with_bls_and_relayer(
+                PublicKey::from_raw_ed25519(&[fill; 32]).unwrap(),
+                Power::from(power),
+                vec![fill + 0x20; 48],
+                vec![fill + 0x10; 20],
+            )
+        };
+        let validators = [validator(0xa1, 10), validator(0xa2, 30), validator(0xa3, 20)];
+        assert_eq!(
+            trusted_validator_set_hash(&validators),
+            hex!("94394bfbba91945d64638bc905fc5c513b3f0583860dc3503160ec32f554b195"),
+        );
+    }
 }
