@@ -24,6 +24,9 @@ pub mod service;
 
 const MAX_NEW_BLOCK_HASHES: usize = 1024;
 /// Bound remote ingress and propagation independently of Engine throughput.
+/// Each of the block, hashes and propagation queues has 128 message slots. For example,
+/// the 129th hashes message is dropped if none have been consumed; a message may contain
+/// up to MAX_NEW_BLOCK_HASHES hashes. Remote traffic never borrows local queue capacity.
 pub(crate) const IMPORT_QUEUE_CAPACITY: usize = 128;
 
 #[derive(Debug)]

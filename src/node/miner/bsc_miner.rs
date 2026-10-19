@@ -1044,9 +1044,8 @@ where
         } else {
             IncomingLocalBlock::Unexecuted(msg)
         };
-        if sender.is_closed() {
-            return Err("Local block import channel closed".into());
-        }
+        // The permit guarantees capacity, not receipt or propagation. Keep the signing
+        // record even if the receiver shuts down after we reserved the slot.
         permit.send(incoming);
         debug!("Submitted local block to import service");
 

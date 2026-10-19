@@ -80,10 +80,13 @@ pub(crate) type IncomingMinedBlock = (BscBuiltPayload, BlockMsg);
 pub(crate) type IncomingBidBlock = (SealedBlock<BscBlock>, Address, B256, U256, usize);
 
 /// Locally produced blocks share a bounded ingress, isolated from remote announcements.
+/// The variants retain separate handlers: sharing capacity does not make a BidBlock an
+/// executed payload. BidBlocks broadcast before validation; fallback blocks validate first.
 #[derive(Debug)]
 pub(crate) enum IncomingLocalBlock {
     Mined(Box<IncomingMinedBlock>),
     Bid(Box<IncomingBidBlock>),
+    /// The submit_built_payload=false fallback: ask Engine to validate before propagation.
     Unexecuted(BlockMsg),
 }
 
@@ -93,8 +96,12 @@ pub(crate) type IncomingHashes = (NewBlockHashes, PeerId);
 /// Size of the LRU cache for processed blocks.
 const LRU_PROCESSED_BLOCKS_SIZE: u32 = 100;
 /// Remote new-payload/fork-choice futures retained while waiting on the Engine.
+/// For example, with 32 unfinished remote imports, the next near-head block is rejected
+/// (and counted/logged) until a slot frees. Excludes local imports and staged-sync downloads.
 const MAX_PENDING_IMPORTS: usize = 32;
 /// Maximum items processed per source in one poll before yielding to other work.
+/// For example, 100 queued network messages get at most 32 turns before local/hash work.
+/// This is per source, not a total concurrency cap; one hashes message may contain many hashes.
 const POLL_BATCH: usize = 32;
 
 /// Announcements whose height exceeds the local canonical tip by more than
@@ -809,7 +816,7 @@ where
         }
 
         if delta > PIPELINE_TRIGGER_DELTA {
-            tracing::info!(
+            tracing::debug!(
                 target: "bsc::block_import",
                 block_hash = %block.hash,
                 block_number,
@@ -892,6 +899,8 @@ where
 
             let delta = hash_number.number.saturating_sub(local_tip);
             if delta > PIPELINE_TRIGGER_DELTA {
+                // Beyond the ancestor-walk limit, ask Engine's optimistic-sync path to
+                // backfill instead. BSC has no CL finalized target; the FCU uses head only.
                 // Coalesce far-ahead targets before sending FCUs. Admission is
                 // bounded and retryable; it does not mark a block as processed.
                 self.pipeline_targets.enqueue(peer_id, hash_number.hash);

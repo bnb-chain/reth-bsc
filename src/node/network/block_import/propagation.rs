@@ -13,9 +13,43 @@ use tokio::sync::mpsc::{
     OwnedPermit, Receiver, Sender,
 };
 
-/// Local ingress and propagation are bounded in blocks, not individual notifications.
+/// Each local queue holds up to 32 blocks, including reserved slots.
+///
+/// ```text
+/// Local miner / selected BidBlock
+///               |
+///               v
+///     Local input queue (32 slots)
+///               |
+///               | Reserve a broadcast slot BEFORE taking a block
+///               v
+///           Importer
+///               | Handle the block according to its type
+///               v
+///   Local broadcast queue (32 slots)
+///               |
+///               v
+///        Network module
+///               | Full-block event, then hash event
+///
+/// Broadcast queue full -> importer stops taking local blocks
+/// Input queue also full -> local payload submission waits for space;
+///                          BidBlock selection falls back to the local payload
+/// ```
 pub(crate) const LOCAL_BLOCK_CAPACITY: usize = 32;
-/// Serve a ready remote event after at most eight local blocks (sixteen notifications).
+/// When both queues have messages, handle up to 8 local blocks, then one remote event.
+/// Each local block emits a full-block event followed immediately by a hash event.
+///
+/// ```text
+/// Local broadcast queue --+
+///                         +--> Network module
+/// Remote event queue -----+
+///
+/// Both ready:  up to 8 local blocks -> 1 remote event -> repeat
+/// One empty:   keep serving the other queue
+/// ```
+///
+/// This is not a per-second limit, and blocks do not wait for a batch of eight to form.
 const LOCAL_BLOCK_BURST: usize = 8;
 
 type Reservation = BoxFuture<'static, Result<OwnedPermit<BlockMsg>, SendError<()>>>;
@@ -27,6 +61,8 @@ pub(crate) struct PropagationSender {
     /// Local blocks reserve a slot before leaving ingress, applying backpressure. Each
     /// block expands into an adjacent full-block/hash pair when the receiver polls it.
     local: Sender<BlockMsg>,
+    /// Retain the capacity waiter across polls so its queue position and wakeup survive.
+    /// While propagation is full, no local input is dequeued and no send task is spawned.
     reservation: Option<Reservation>,
 }
 

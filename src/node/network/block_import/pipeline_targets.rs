@@ -4,8 +4,11 @@ use alloy_primitives::B256;
 use alloy_rpc_types_engine::ForkchoiceState;
 use reth_engine_primitives::ConsensusEngineHandle;
 use reth_network_api::PeerId;
-use std::{collections::VecDeque, future::Future, pin::Pin, task::Context};
+use std::{collections::VecDeque, future::Future, pin::Pin, task::Context, time::Instant};
 
+/// At most 64 waiting peers, one latest-arriving target each, plus one active FCU.
+/// For example, another hash from an already waiting peer replaces its hash without moving
+/// its FIFO position; a 65th waiting peer is rejected and may retry in a later announcement.
 const MAX_WAITING_PEERS: usize = 64;
 
 type FcuFuture = Pin<Box<dyn Future<Output = ()> + Send + Sync>>;
@@ -64,7 +67,7 @@ impl PipelineTargets {
             }
             self.active = None;
         }
-        let Some((_, hash)) = self.waiting.pop_front() else {
+        let Some((peer_id, hash)) = self.waiting.pop_front() else {
             return;
         };
         // Deduplicate only while the FCU is pending. A SYNCING response does not
@@ -73,13 +76,34 @@ impl PipelineTargets {
         self.active = Some((
             hash,
             Box::pin(async move {
+                let started = Instant::now();
+                tracing::debug!(
+                    target: "bsc::block_import", %peer_id, head_hash = %hash,
+                    "Far-behind gap detected; dispatching pipeline-trigger FCU"
+                );
+                // BSC has no CL-supplied finalized target. Engine's optimistic-sync path
+                // can use this head-only FCU to request staged backfill beyond fork_recover.
                 let state = ForkchoiceState {
                     head_block_hash: hash,
                     safe_block_hash: B256::ZERO,
                     finalized_block_hash: B256::ZERO,
                 };
-                if let Err(error) = engine.fork_choice_updated(state, None).await {
-                    tracing::debug!(target: "bsc::block_import", %hash, %error, "Pipeline FCU failed");
+                match engine.fork_choice_updated(state, None).await {
+                    Ok(ret) => {
+                        tracing::debug!(
+                            target: "bsc::block_import", %peer_id, head_hash = %hash,
+                            status = ?ret.payload_status.status,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "Pipeline-trigger FCU dispatched; Engine replied (SYNCING is not download completion)"
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "bsc::block_import", %peer_id, head_hash = %hash, %error,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "Pipeline-trigger FCU failed"
+                        );
+                    }
                 }
             }),
         ));
