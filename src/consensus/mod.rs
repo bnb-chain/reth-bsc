@@ -37,3 +37,4 @@ impl ParliaConsensusErr {
 
 pub mod eip4844;
 pub mod parlia;
+pub mod payment_lane;

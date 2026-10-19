@@ -22,6 +22,10 @@ mod local;
 
 pub use bsc_chapel::bsc_testnet;
 
+/// Default number of entries the live pruner may delete per run across all segments.
+/// Overridable with `--prune.delete-limit`.
+pub const BSC_PRUNE_DELETE_LIMIT: usize = 10_000;
+
 /// Bsc chain spec type.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct BscChainSpec {

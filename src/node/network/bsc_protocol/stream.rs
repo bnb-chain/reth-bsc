@@ -18,6 +18,59 @@ const PENDING_REQ_TTL: Duration = Duration::from_secs(15);
 /// Minimum interval between pending-request pruning passes
 const PRUNE_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Inbound votes a single peer may send us per second, mirroring go-bsc's
+/// `receiveRateLimitPerSecond` (`eth/protocols/bsc/peer.go`). 21 validators each
+/// produce one vote per block interval, so ~47/s is the natural ceiling; go-bsc
+/// sets 68 to leave headroom.
+const VOTE_RECEIVE_RATE_LIMIT_PER_SECOND: u32 = 68;
+/// Length of one vote-accounting period (go-bsc's `secondsPerPeriod`).
+const VOTE_RATE_LIMIT_PERIOD: Duration = Duration::from_secs(30);
+/// Total inbound votes a peer may send us within one period.
+const VOTE_RATE_LIMIT_PER_PERIOD: u32 =
+    VOTE_RECEIVE_RATE_LIMIT_PER_SECOND * VOTE_RATE_LIMIT_PERIOD.as_secs() as u32;
+
+/// Per-peer inbound vote budget over a tumbling window.
+///
+/// Ports go-bsc's `Peer.IsOverLimitAfterReceivingVotes`, including its two
+/// quirks: the window is tumbling rather than sliding, and the packet that rolls
+/// the window is not charged against the new period.
+#[derive(Debug)]
+struct VoteRateLimiter {
+    period_begin: std::time::Instant,
+    period_counter: u32,
+}
+
+impl VoteRateLimiter {
+    fn new() -> Self {
+        Self { period_begin: std::time::Instant::now(), period_counter: 0 }
+    }
+
+    /// Charges `n` received votes against this peer's budget and reports whether
+    /// the peer has exceeded it.
+    ///
+    /// `n` is the number of votes the peer *sent*, not the number we admit. That
+    /// matches go-bsc's `handleVotes`, which charges `len(ann.Votes)` so the
+    /// limit bounds what a peer can push at us rather than what we happen to
+    /// consume.
+    fn is_over_limit_after_receiving(&mut self, n: u32) -> bool {
+        if self.period_begin.elapsed() >= VOTE_RATE_LIMIT_PERIOD {
+            self.period_begin = std::time::Instant::now();
+            self.period_counter = 0;
+            return false;
+        }
+        self.period_counter = self.period_counter.saturating_add(n);
+        self.period_counter > VOTE_RATE_LIMIT_PER_PERIOD
+    }
+
+    /// Backdates the period so the next charge rolls the window.
+    #[cfg(test)]
+    fn force_period_expiry(&mut self) {
+        self.period_begin = std::time::Instant::now()
+            .checked_sub(VOTE_RATE_LIMIT_PERIOD)
+            .expect("machine uptime exceeds one accounting period");
+    }
+}
+
 use super::protocol::proto::BscProtoMessageId;
 use crate::node::network::blocks_by_range::{
     build_blocks_by_range_response, BlocksByRangePacket, GetBlocksByRangePacket,
@@ -60,6 +113,8 @@ pub struct BscProtocolConnection {
     _peer_id: Option<PeerId>,
     /// Last time we pruned pending requests
     last_prune: std::time::Instant,
+    /// Inbound vote budget for this peer
+    vote_rate_limiter: VoteRateLimiter,
 }
 
 impl BscProtocolConnection {
@@ -89,6 +144,7 @@ impl BscProtocolConnection {
             proto_version,
             _peer_id: peer_id,
             last_prune: std::time::Instant::now(),
+            vote_rate_limiter: VoteRateLimiter::new(),
         }
     }
 
@@ -150,6 +206,8 @@ impl BscProtocolConnection {
                 tracing::debug!(
                     target: "bsc_protocol",
                     req_id = req.request_id,
+                    start_block_height = req.start_block_height,
+                    start_block_hash = ?req.start_block_hash,
                     count = req.count,
                     "Encoded GetBlocksByRange packet"
                 );
@@ -162,6 +220,10 @@ impl BscProtocolConnection {
                     target: "bsc_protocol",
                     req_id = packet.request_id,
                     blocks = packet.blocks.len(),
+                    first_block = packet.blocks.first().map(|b| b.header.number),
+                    last_block = packet.blocks.last().map(|b| b.header.number),
+                    sidecar_count = packet.blocks.iter()
+                        .map(|b| b.body.sidecars.as_ref().map_or(0, Vec::len)).sum::<usize>(),
                     encoded_len = buf.len(),
                     "Encoded BlocksByRange packet"
                 );
@@ -222,7 +284,13 @@ impl BscProtocolConnection {
     /// exercised without a [`ProtocolConnection`], which has no public
     /// constructor.
     fn handle_protocol_message(&mut self, frame: &BytesMut) -> Option<BytesMut> {
-        Self::dispatch(frame, &mut self.pending_range_reqs, self._peer_id, self.proto_version)
+        Self::dispatch(
+            frame,
+            &mut self.pending_range_reqs,
+            self._peer_id,
+            self.proto_version,
+            &mut self.vote_rate_limiter,
+        )
     }
 
     /// Route one inbound frame by message id, returning a frame to send back if
@@ -240,6 +308,7 @@ impl BscProtocolConnection {
         pending_range_reqs: &mut PendingRangeReqs,
         peer_id: Option<PeerId>,
         proto_version: u64,
+        vote_rate_limiter: &mut VoteRateLimiter,
     ) -> Option<BytesMut> {
         let slice = frame.as_ref();
         let msg_id = slice[0];
@@ -258,6 +327,17 @@ impl BscProtocolConnection {
                 match VotesPacket::decode(&mut &slice[..]) {
                     Ok(packet) => {
                         let count = packet.0.len();
+                        let charged = u32::try_from(count).unwrap_or(u32::MAX);
+                        if vote_rate_limiter.is_over_limit_after_receiving(charged) {
+                            tracing::debug!(
+                                target: "bsc_protocol",
+                                peer = ?peer_id,
+                                count,
+                                period_total = vote_rate_limiter.period_counter,
+                                "peer exceeded its inbound vote budget, dropping packet",
+                            );
+                            return None;
+                        }
                         handle_votes_broadcast(packet);
                         tracing::trace!(target: "bsc_protocol", count, "Processed votes packet");
                         None
@@ -269,7 +349,6 @@ impl BscProtocolConnection {
                 }
             }
             x if x == BscProtoMessageId::GetBlocksByRange as u8 => {
-                tracing::debug!(target: "bsc_protocol", "Processing GetBlocksByRange request");
                 match GetBlocksByRangePacket::decode(&mut &slice[..]) {
                     Ok(req) => {
                         if req.count == 0 || req.count > MAX_REQUEST_RANGE_BLOCKS_COUNT {
@@ -283,7 +362,14 @@ impl BscProtocolConnection {
 
                         let resp = build_blocks_by_range_response(&req);
                         let encoded = Self::encode_command(BscCommand::BlocksByRange(resp));
-                        tracing::debug!(target: "bsc_protocol", "Replying BlocksByRange for request");
+                        tracing::debug!(
+                            target: "bsc_protocol",
+                            peer = ?peer_id,
+                            req_id = req.request_id,
+                            start_block_height = req.start_block_height,
+                            start_block_hash = ?req.start_block_hash,
+                            "Replying BlocksByRange for request"
+                        );
                         Some(encoded)
                     }
                     Err(e) => {
@@ -293,15 +379,19 @@ impl BscProtocolConnection {
                 }
             }
             x if x == BscProtoMessageId::BlocksByRange as u8 => {
-                tracing::debug!(target: "bsc_protocol", "Processing BlocksByRange response");
                 match crate::node::network::blocks_by_range::decode_blocks_by_range(
                     &mut &slice[..],
                 ) {
                     Ok(res) => {
                         tracing::debug!(
                             target: "bsc_protocol",
+                            peer = ?peer_id,
                             req_id = res.request_id,
                             blocks = res.blocks.len(),
+                            first_block = res.blocks.first().map(|b| b.header.number),
+                            last_block = res.blocks.last().map(|b| b.header.number),
+                            sidecar_count = res.blocks.iter()
+                                .map(|b| b.body.sidecars.as_ref().map_or(0, Vec::len)).sum::<usize>(),
                             "Received BlocksByRange"
                         );
                         if let Some((waiter, _)) = pending_range_reqs.remove(&res.request_id) {
@@ -387,17 +477,22 @@ impl Stream for BscProtocolConnection {
 mod tests {
     use super::*;
     use crate::consensus::parlia::{
+        bls_signer::random_test_signer,
         vote::{VoteData, VoteEnvelope},
         votes,
     };
-    use alloy_primitives::{FixedBytes, B256};
+    use alloy_primitives::B256;
 
     /// `ProtocolConnection` has no public constructor, so these tests drive
     /// [`BscProtocolConnection::dispatch`] directly. That is the function the
     /// deleted handshake gate used to sit in front of.
     fn dispatch(frame: &BytesMut) -> Option<BytesMut> {
+        dispatch_with_limiter(frame, &mut VoteRateLimiter::new())
+    }
+
+    fn dispatch_with_limiter(frame: &BytesMut, limiter: &mut VoteRateLimiter) -> Option<BytesMut> {
         let mut pending = HashMap::new();
-        BscProtocolConnection::dispatch(frame, &mut pending, None, 2)
+        BscProtocolConnection::dispatch(frame, &mut pending, None, 2, limiter)
     }
 
     fn frame_of(msg: impl Encodable) -> BytesMut {
@@ -410,19 +505,20 @@ mod tests {
         frame_of(BscCapPacket { protocol_version, extra: Bytes::from_static(&[0x00u8]) })
     }
 
-    /// A synthetic vote. Signature/address are never verified on this path, and
-    /// `target_number` is kept high so vote-pool pruning cannot evict it.
+    /// A genuinely signed vote: the pool authenticates the BLS signature before
+    /// admitting anything, so a synthetic one would be dropped and this test
+    /// would no longer prove the frame was dispatched. `target_number` is kept
+    /// high so vote-pool pruning cannot evict it.
     fn vote(target_number: u64, target_hash: B256) -> VoteEnvelope {
-        VoteEnvelope {
-            vote_address: FixedBytes::<48>::repeat_byte(0xab),
-            signature: FixedBytes::<96>::repeat_byte(0xcd),
-            data: VoteData {
+        let signer = random_test_signer();
+        signer
+            .sign_vote(VoteData {
                 source_number: target_number - 1,
                 source_hash: B256::repeat_byte(0x11),
                 target_number,
                 target_hash,
-            },
-        }
+            })
+            .expect("sign vote")
     }
 
     // === The bsc#3737 peer generation ===
@@ -501,7 +597,8 @@ mod tests {
         pending.insert(7u64, (tx, std::time::Instant::now()));
 
         let frame = frame_of(BlocksByRangePacket { request_id: 7, blocks: Vec::new() });
-        let reply = BscProtocolConnection::dispatch(&frame, &mut pending, None, 2);
+        let reply =
+            BscProtocolConnection::dispatch(&frame, &mut pending, None, 2, &mut VoteRateLimiter::new());
 
         assert!(reply.is_none(), "a range response needs no reply");
         assert!(pending.is_empty(), "the waiter must be consumed");
@@ -527,4 +624,123 @@ mod tests {
         let decoded = BscCapPacket::decode(&mut &encoded[..]).expect("must round-trip");
         assert_eq!(decoded.protocol_version, 2);
     }
+
+    // === G1: per-peer inbound vote budget (go-bsc receiveRateLimitPerSecond) ===
+
+    #[test]
+    fn vote_budget_matches_go_bsc() {
+        // 68 votes/s over a 30s period => 2040, the value go-bsc compares against.
+        assert_eq!(VOTE_RATE_LIMIT_PER_PERIOD, 2040);
+    }
+
+    #[test]
+    fn vote_rate_limiter_admits_exactly_the_budget() {
+        let mut l = VoteRateLimiter::new();
+        assert!(!l.is_over_limit_after_receiving(VOTE_RATE_LIMIT_PER_PERIOD), "budget itself must pass");
+        assert!(l.is_over_limit_after_receiving(1), "one vote past the budget must trip");
+    }
+
+    #[test]
+    fn vote_rate_limiter_accumulates_across_packets() {
+        let mut l = VoteRateLimiter::new();
+        for _ in 0..(VOTE_RATE_LIMIT_PER_PERIOD / 68) {
+            assert!(!l.is_over_limit_after_receiving(68));
+        }
+        assert!(l.is_over_limit_after_receiving(1), "budget is per period, not per packet");
+    }
+
+    /// go-bsc resets the counter and returns false when the period has elapsed,
+    /// without charging the packet that rolled the window. Ported deliberately.
+    #[test]
+    fn vote_rate_limiter_rolls_the_window_uncharged() {
+        let mut l = VoteRateLimiter::new();
+        assert!(l.is_over_limit_after_receiving(VOTE_RATE_LIMIT_PER_PERIOD + 1));
+
+        l.force_period_expiry();
+        assert!(!l.is_over_limit_after_receiving(VOTE_RATE_LIMIT_PER_PERIOD + 1), "window roll allows");
+        assert_eq!(l.period_counter, 0, "the rolling packet is not charged");
+        assert!(!l.is_over_limit_after_receiving(VOTE_RATE_LIMIT_PER_PERIOD), "fresh budget");
+    }
+
+    /// A peer over budget has its packet dropped before the vote reaches the pool.
+    #[test]
+    fn over_budget_votes_packet_never_reaches_the_pool() {
+        let target_hash = B256::repeat_byte(0x7c);
+        let mut limiter = VoteRateLimiter::new();
+        assert!(limiter.is_over_limit_after_receiving(VOTE_RATE_LIMIT_PER_PERIOD + 1));
+
+        let before = votes::len();
+        let reply = dispatch_with_limiter(
+            &frame_of(VotesPacket(vec![vote(30_000_100, target_hash)])),
+            &mut limiter,
+        );
+        assert!(reply.is_none(), "a votes frame needs no reply");
+        assert_eq!(votes::len(), before, "over-budget packet must not be ingested");
+
+        // Once the window rolls, the same peer is served again.
+        limiter.force_period_expiry();
+        let _ = dispatch_with_limiter(
+            &frame_of(VotesPacket(vec![vote(30_000_100, target_hash)])),
+            &mut limiter,
+        );
+        assert_eq!(votes::len(), before + 1, "peer must be served after the window rolls");
+    }
+
+
+    /// Only the first vote of a packet is admitted, and that is correct.
+    ///
+    /// This pins a behaviour that looks like a bug and is not. go-bsc does the
+    /// same in `eth/handler_bsc.go`:
+    ///
+    /// ```text
+    ///   // Here we only put the first vote, to avoid ddos attack by sending a
+    ///   // large batch of votes. This won't abandon any valid vote, because one
+    ///   // vote is sent every time referring to func voteBroadcastLoop
+    ///   if len(votes) > 0 { h.votepool.PutVote(votes[0]) }
+    /// ```
+    ///
+    /// It arrived in `3fd5b0c149` ("defend ddos voting attack ... according to
+    /// audit", bnb-chain/bsc#1741, 2023-07-11), which *replaced* a
+    /// `for _, vote := range votes { PutVote(vote) }` loop and, in the same
+    /// commit, introduced the per-peer receive rate limit ported above. The two
+    /// are halves of one fix: bound what a packet can admit, and bound what a
+    /// peer may send.
+    ///
+    /// Nothing is lost, because geth's `voteBroadcastLoop` sends one vote per
+    /// message by design (`eth/handler.go`: "one vote will be sent instantly
+    /// without waiting for other votes for batch sending"). Multi-vote packets
+    /// only arise from the best-effort sync-on-connect dump.
+    ///
+    /// A reviewer working from a stale reading of upstream may try to "fix" this
+    /// into whole-packet ingestion. That would need the per-peer budget to
+    /// already be in place, and it would diverge from current go-bsc. This test
+    /// is here to force that conversation rather than let it happen silently.
+    #[test]
+    fn only_the_first_vote_of_a_packet_is_admitted() {
+        let first = B256::repeat_byte(0xa1);
+        let second = B256::repeat_byte(0xa2);
+        let third = B256::repeat_byte(0xa3);
+
+        let before = votes::len();
+        let reply = dispatch(&frame_of(VotesPacket(vec![
+            vote(30_001_000, first),
+            vote(30_001_001, second),
+            vote(30_001_002, third),
+        ])));
+
+        assert!(reply.is_none(), "a votes frame needs no reply");
+        assert_eq!(votes::len(), before + 1, "exactly one vote from the packet is admitted");
+        assert_eq!(
+            votes::fetch_any_vote_by_block_hash(first).len(),
+            1,
+            "the first vote is the one admitted",
+        );
+        for (label, hash) in [("second", second), ("third", third)] {
+            assert!(
+                votes::fetch_any_vote_by_block_hash(hash).is_empty(),
+                "the {label} vote must be discarded",
+            );
+        }
+    }
+
 }

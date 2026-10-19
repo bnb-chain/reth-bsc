@@ -1,12 +1,13 @@
 use crate::{
     evm::{
         api::{BscContext, BscEvm},
+        block_env::BscBlockEnv,
         transaction::BscTxEnv,
     },
     hardforks::bsc::BscHardfork,
 };
 use reth_evm::{precompiles::PrecompilesMap, Database, EvmEnv, EvmFactory};
-use revm::context::{BlockEnv, DBErrorMarker, result::{EVMError, HaltReason}};
+use revm::context::{DBErrorMarker, result::{EVMError, HaltReason}};
 use revm::inspector::NoOpInspector;
 use reth_revm::Inspector;
 
@@ -23,13 +24,13 @@ impl EvmFactory for BscEvmFactory {
         EVMError<DBError>;
     type HaltReason = HaltReason;
     type Spec = BscHardfork;
-    type BlockEnv = BlockEnv;
+    type BlockEnv = BscBlockEnv;
     type Precompiles = PrecompilesMap;
 
     fn create_evm<DB: Database>(
         &self,
         db: DB,
-        input: EvmEnv<BscHardfork>,
+        input: EvmEnv<BscHardfork, BscBlockEnv>,
     ) -> Self::Evm<DB, NoOpInspector> {
         // Check if we're in a trace/debug context by examining the database type
         // CacheDB is used in trace scenarios where we need to replay transactions
@@ -42,7 +43,7 @@ impl EvmFactory for BscEvmFactory {
     fn create_evm_with_inspector<DB: Database, I: Inspector<Self::Context<DB>>>(
         &self,
         db: DB,
-        input: EvmEnv<BscHardfork>,
+        input: EvmEnv<BscHardfork, BscBlockEnv>,
         inspector: I,
     ) -> Self::Evm<DB, I> {
         BscEvm::new(input, db, inspector, true, true)

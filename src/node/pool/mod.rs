@@ -26,14 +26,14 @@ use reth_transaction_pool::{
     CoinbaseTipOrdering, EthPooledTransaction, EthTransactionValidator, Pool,
 };
 
-use crate::evm::blacklist;
+use crate::evm::blacklist::{self, BlacklistedAddressError};
 use crate::hardforks::bsc::BscHardfork;
 
-/// Transaction pool blacklist error type: marked as "bad transaction" to punish source node
-#[derive(thiserror::Error, Debug)]
-#[error("sender or recipient is blacklisted")]
-pub struct BlacklistedAddressError();
+pub(crate) mod tip;
+use crate::node::evm::config::EIP1559_INITIAL_BASE_FEE;
+use tip::{current_tip_floor, meets_tip_floor};
 
+/// A blacklisted transaction is a bad transaction, so the peer that sent it is penalized.
 impl reth_transaction_pool::error::PoolTransactionError for BlacklistedAddressError {
     fn is_bad_transaction(&self) -> bool {
         true
@@ -97,14 +97,15 @@ where
         }
 
         // Check miner gas price floor (set by miner_setGasPrice RPC).
-        // Reject transactions whose max_fee_per_gas is below the miner's configured minimum.
-        if let Some(min_gas_price) = crate::shared::get_miner_gas_tip() {
-            if transaction.max_fee_per_gas() < min_gas_price as u128 {
-                return TransactionValidationOutcome::Invalid(
-                    transaction,
-                    InvalidPoolTransactionError::Underpriced,
-                );
-            }
+        // Reject transactions whose effective tip is below the miner's configured minimum.
+        if !meets_tip_floor(
+            transaction.effective_tip_per_gas(EIP1559_INITIAL_BASE_FEE),
+            current_tip_floor(),
+        ) {
+            return TransactionValidationOutcome::Invalid(
+                transaction,
+                InvalidPoolTransactionError::Underpriced,
+            );
         }
 
         // Delegate to internal validator
@@ -157,7 +158,9 @@ where
         // Disable the upstream protocol base fee check (MIN_PROTOCOL_BASE_FEE = 7 wei)
         // because BSC handles min gas price dynamically via miner_setGasPrice RPC
         // and enforces it in BscTxValidator instead.
-        let pool_config = ctx.pool_config().with_disabled_protocol_base_fee();
+        let mut pool_config = ctx.pool_config().with_disabled_protocol_base_fee();
+        // Block bodies share this store; leaving the pool does not make a blob disposable.
+        pool_config.retain_blobs_on_discard = true;
 
         // Same as upstream: derive blob cache size based on time
         let blob_cache_size = if let Some(blob_cache_size) = pool_config.blob_cache_size {
@@ -216,3 +219,6 @@ where
         Ok(transaction_pool)
     }
 }
+
+#[cfg(test)]
+pub(crate) mod tests;

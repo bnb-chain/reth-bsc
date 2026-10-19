@@ -35,6 +35,7 @@ reth-chain-state = { git = "https://github.com/bnb-chain/reth.git", branch = "fe
 reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
 reth-eth-wire = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
 reth-eth-wire-types = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
+reth-errors = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
 reth-evm = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
 reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
 reth-execution-types = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
@@ -54,6 +55,7 @@ reth-codecs = { version = "0.6.0" }
 reth-provider = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5", features = ["test-utils"] }
 reth-storage-overlay = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
 reth-rpc-eth-api = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
+reth-rpc-eth-types = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
 reth-rpc-convert = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
 reth-rpc-engine-api = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
 reth-rpc-server-types = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
@@ -67,16 +69,17 @@ revm-bytecode = "42.0.0"
 revm-state = "42.0.0"
 revm-primitives = { version = "42.0.0", default-features = false }
 revm-interpreter = "42.0.0"
+revm-inspectors = "0.42.0"
 revm-database-interface = "42.0.0"
 
 # alloy dependencies
-alloy-evm = { version = "0.38.0", features = ["rpc"] }
+alloy-evm = { version = "0.38.0", features = ["rpc", "overrides"] }
 
 alloy-genesis = "2.3.0"
 alloy-consensus = "2.3.0"
 alloy-eips = "2.3.0"
 alloy-network = "2.3.0"
-alloy-rpc-types = { version = "2.3.0", features = ["eth"] }
+alloy-rpc-types = { version = "2.3.0", features = ["eth", "trace"] }
 alloy-rpc-types-eth = "2.3.0"
 alloy-rpc-types-engine = "2.3.0"
 alloy-rpc-types-mev = "2.3.0"
@@ -101,7 +104,7 @@ jsonrpsee-types = "0.26.0"
 
 # misc dependencies
 auto_impl = "1"
-async-trait = "0.1"
+async-trait = "0.1.92"
 bytes = "1.5"
 clap = { version = "4.4", features = ["derive"] }
 cfg-if = { version = "1.0", default-features = false }
@@ -128,7 +131,10 @@ serde_cbor = "0.11"
 schnellru = "0.2"
 thiserror = "2.0"
 tokio = { version = "1.44", features = ["full"] }
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = { version = "0.14.6", features = ["transport"] }
+tonic-health = "0.14.6"
+tonic-prost = "0.14.6"
 tracing = "0.1"
 bit-set = "0.5.3"
 rand = "0.9"
@@ -150,7 +156,10 @@ cometbft-light-client-verifier = { git = "https://github.com/bnb-chain/greenfiel
 cometbft-proto = { git = "https://github.com/bnb-chain/greenfield-cometbft-rs.git", rev = "1282547" }
 cometbft-light-client = { git = "https://github.com/bnb-chain/greenfield-cometbft-rs.git", rev = "1282547" }
 
-prost = { version = "0.12.6" }
+# cometbft-proto is still generated with prost 0.12; the MEV gRPC API uses the
+# prost version paired with tonic 0.14.
+prost12 = { package = "prost", version = "0.12.6" }
+prost = { version = "0.14.3" }
 
 tendermint = { git = "https://github.com/bnb-chain/tendermint-rs-parlia", rev = "8c21ccbd58a174e07eed2c9343e63ccd00f0fbd5", features = [
     "secp256k1",
@@ -158,6 +167,10 @@ tendermint = { git = "https://github.com/bnb-chain/tendermint-rs-parlia", rev = 
 signature = "2.2.0"
 k256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
 eth-keystore = "0.5"
+
+[build-dependencies]
+protoc-bin-vendored = "3"
+tonic-prost-build = "0.14.6"
 
 [target.'cfg(unix)'.dependencies]
 tikv-jemalloc-ctl = "0.6"
@@ -246,10 +259,19 @@ debug = "line-tables-only"
 strip = false
 
 [dev-dependencies]
+metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
+reth-rpc = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5" }
+criterion = "0.5"
 uuid = { version = "1", features = ["v4"] }
+reth-transaction-pool = { git = "https://github.com/bnb-chain/reth.git", branch = "feat/rpc-reimpl-v2.5", features = ["test-utils"] }
 # `test-util` gives tests a paused clock (`start_paused`, `time::advance`), so timing invariants
 # can be asserted by ordering instead of racing a wall clock.
 tokio = { version = "1.44", features = ["full", "test-util"] }
+
+[[bench]]
+name = "cas20"
+harness = false
+required-features = ["bench-test"]
 
 # reth-core family -> bnb-chain/reth-core#5 (from_consensus_header_with_td). Swap to a published version once released.
 [patch.crates-io]

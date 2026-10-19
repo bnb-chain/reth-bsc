@@ -1,10 +1,80 @@
 //! Error types for the Bsc EVM module.
 
 use alloy_primitives::{Address, BlockHash, BlockNumber, B256, U256};
-use crate::consensus::parlia::error::ParliaConsensusError;
+use crate::consensus::{parlia::error::ParliaConsensusError, payment_lane::LaneError};
 use reth_evm::execute::{BlockExecutionError, BlockValidationError};
 use reth_provider::ProviderError;
 use reth_primitives_traits::{GotExpected, GotExpectedBoxed};
+
+/// A validation failure before Parlia has authenticated the imported block.
+/// Keep this typed across the engine boundary: it invalidates the block, but cannot be used
+/// as evidence against the builder named in its untrusted header.
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+pub(crate) struct PreExecutionValidationError(BlockValidationError);
+
+pub(crate) fn mark_pre_execution_error(error: BlockExecutionError) -> BlockExecutionError {
+    match error {
+        BlockExecutionError::Validation(error) => BlockExecutionError::Validation(
+            BlockValidationError::Other(Box::new(PreExecutionValidationError(error))),
+        ),
+        internal => internal,
+    }
+}
+
+pub(crate) fn is_execution_evidence(error: &BlockExecutionError) -> bool {
+    match error {
+        BlockExecutionError::Validation(BlockValidationError::Other(error)) => {
+            !error.is::<PreExecutionValidationError>()
+        }
+        BlockExecutionError::Validation(_) => true,
+        BlockExecutionError::Internal(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod bid_block_evidence_tests {
+    use super::*;
+
+    #[test]
+    fn unauthenticated_seal_errors_cannot_be_evidence() {
+        let failures = [
+            BscBlockValidationError::WrongHeaderSigner {
+                block_number: 1,
+                signer: GotExpected {
+                    got: Address::with_last_byte(1),
+                    expected: Address::with_last_byte(2),
+                }
+                .into(),
+            },
+            BscBlockValidationError::SignerUnauthorized {
+                block_number: 1,
+                proposer: Address::with_last_byte(1),
+            },
+            BscBlockValidationError::InvalidAttestationSignature,
+        ];
+        for failure in failures {
+            let error: BlockExecutionError = BscBlockExecutionError::Validation(failure).into();
+            let marked = mark_pre_execution_error(error);
+            assert!(marked.as_validation().is_some(), "must still invalidate the block");
+            assert!(!is_execution_evidence(&marked), "must never count unauthenticated evidence");
+        }
+    }
+
+    #[test]
+    fn execution_failures_are_evidence_but_internal_errors_are_not() {
+        let error = BlockExecutionError::Validation(
+            BlockValidationError::TransactionGasLimitMoreThanAvailableBlockGas {
+                transaction_gas_limit: 100,
+                block_available_gas: 10,
+            },
+        );
+        assert!(is_execution_evidence(&error));
+        let error = mark_pre_execution_error(BlockExecutionError::msg("parent state unavailable"));
+        assert!(error.as_internal().is_some());
+        assert!(!is_execution_evidence(&error));
+    }
+}
 
 /// BSC specific block validation error
 #[derive(thiserror::Error, Debug, Clone)]
@@ -18,6 +88,10 @@ pub enum BscBlockValidationError {
         hash: B256,
     },
     
+    /// A payment lane rule the block breaks.
+    #[error("{0}")]
+    PaymentLane(String),
+
     /// Error when the system txs are more than expected
     #[error("unexpected system tx")]
     UnexpectedSystemTx,
@@ -123,6 +197,10 @@ pub enum BscBlockExecutionError {
     #[error(transparent)]
     Validation(#[from] BscBlockValidationError),
 
+    /// A local payment lane state read failed on this node.
+    #[error("payment lane state unavailable: {0}")]
+    PaymentLaneStateUnavailable(String),
+
     /// Error when there is no snapshot found
     #[error("no snapshot found")]
     SnapshotNotFound,
@@ -188,6 +266,26 @@ pub enum BscBlockExecutionError {
     GlobalSignerNotInitializedForMiningMode,
 }
 
+/// Routes a payment lane failure to the local-fault side or the block-verdict side, counting
+/// and logging it on the way.
+pub fn lane_reject(err: LaneError) -> BlockExecutionError {
+    let metrics = &crate::metrics::LANE_METRICS;
+    let (counter, category) = match err {
+        LaneError::StateUnavailable(_) => (&metrics.state_unavailable, "stateUnavailable"),
+        _ => (&metrics.rejected, "verdict"),
+    };
+    counter.increment(1);
+    tracing::error!(target: "bsc::payment_lane", category, error = %err, "payment lane check failed");
+
+    match err {
+        LaneError::StateUnavailable(reason) => {
+            BscBlockExecutionError::PaymentLaneStateUnavailable(reason)
+        }
+        verdict => BscBlockValidationError::PaymentLane(verdict.to_string()).into(),
+    }
+    .into()
+}
+
 impl From<BscBlockExecutionError> for BlockExecutionError {
     fn from(err: BscBlockExecutionError) -> Self {
         // Update execution errors metric for all types of errors
@@ -218,6 +316,7 @@ impl From<BscBlockExecutionError> for BlockExecutionError {
                 ))
             }
 
+            BscBlockExecutionError::PaymentLaneStateUnavailable(_) |
             BscBlockExecutionError::SnapshotNotFound |
             BscBlockExecutionError::EthCallFailed |
             BscBlockExecutionError::GetTopValidatorsFailed |
@@ -233,6 +332,34 @@ impl From<BscBlockExecutionError> for BlockExecutionError {
                 // Internal errors: mapped to BlockExecutionError::Internal, which
                 // engine-tree handles without caching in invalid_headers.
                 Self::other(err)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn payment_lane_errors_split_local_faults_from_verdicts() {
+        let local = lane_reject(LaneError::StateUnavailable("missing trie node".into()));
+        assert!(
+            matches!(local, BlockExecutionError::Internal(_)),
+            "a failed state read must not be a validation error: {local:?}"
+        );
+
+        for verdict in [
+            LaneError::CorruptConfig("total changed mid-walk".into()),
+            LaneError::Violated { gas_limit: 1, gas_used: 2, quota: 3, payment_gas_used: 4 },
+        ] {
+            let message = verdict.to_string();
+            match lane_reject(verdict) {
+                BlockExecutionError::Validation(ref inner) => assert!(
+                    inner.to_string().contains(&message),
+                    "the LaneError message must survive: {inner}"
+                ),
+                other => panic!("expected a validation error, got {other:?}"),
             }
         }
     }

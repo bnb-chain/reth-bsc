@@ -2,10 +2,15 @@ pub mod error;
 pub mod util;
 
 #[cfg(test)]
+mod cas20_seed_tests;
+#[cfg(test)]
+mod jenner_transition_tests;
+#[cfg(test)]
 mod pre_execution_tests;
 use crate::{
     evm::{
         api::{BscContext, BscEvm},
+        block_env::BscBlockEnv,
         transaction::BscTxEnv,
     },
     hardforks::bsc::BscHardfork,
@@ -19,8 +24,7 @@ use reth::{
 use reth_evm::{precompiles::PrecompilesMap, Database, Evm, EvmEnv};
 use revm::{
     context::{
-        result::{EVMError, HaltReason, ResultAndState},
-        BlockEnv, CfgEnv,
+        result::{EVMError, HaltReason, ResultAndState}, CfgEnv,
     },
     Context, ExecuteEvm, InspectEvm, Inspector, SystemCallEvm,
 };
@@ -30,7 +34,7 @@ mod builder;
 pub mod config;
 pub use config::BscEvmConfig;
 mod executor;
-pub use executor::BscBlockExecutor;
+pub use executor::{BscBlockExecutor, LaneAdmission};
 mod factory;
 pub use factory::BscEvmFactory;
 mod patch;
@@ -47,7 +51,7 @@ where
     type Error = EVMError<DB::Error>;
     type HaltReason = HaltReason;
     type Spec = BscHardfork;
-    type BlockEnv = BlockEnv;
+    type BlockEnv = BscBlockEnv;
     type Precompiles = PrecompilesMap;
     type Inspector = I;
 
@@ -59,8 +63,8 @@ where
         self.cfg.chain_id
     }
 
-    fn block(&self) -> &BlockEnv {
-        &self.block
+    fn block(&self) -> &BscBlockEnv {
+        &self.inner.ctx.block
     }
 
     fn transact_raw(
