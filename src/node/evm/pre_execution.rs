@@ -35,6 +35,17 @@ use crate::consensus::parlia::constants::K_ANCESTOR_GENERATION_DEPTH;
 
 const BLST_DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
 
+pub(super) fn validate_attestation_source_target_order(
+    source_number: u64,
+    target_number: u64,
+) -> Result<(), BscBlockValidationError> {
+    if source_number < target_number {
+        Ok(())
+    } else {
+        Err(BscBlockValidationError::InvalidAttestationSourceTargetOrder)
+    }
+}
+
 pub type EpochValidators = (Vec<Address>, Vec<VoteAddress>);
 
 /// An address's role in the validator set used for BEP-675 bad-block evidence.
@@ -588,7 +599,13 @@ where
                     }
                 ).into());
             }
-    
+
+            validate_attestation_source_target_order(
+                attestation.data.source_number,
+                attestation.data.target_number,
+            )
+            .map_err(BscBlockExecutionError::Validation)?;
+
             // the attestation target block should be direct parent.
             let target_block = attestation.data.target_number;
             let target_hash = attestation.data.target_hash;
