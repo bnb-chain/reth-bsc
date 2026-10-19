@@ -1,4 +1,9 @@
-use super::handle::ImportHandle;
+use super::{
+    handle::ImportHandle,
+    metrics::Queue,
+    propagation::{self, PropagationSender},
+    IMPORT_QUEUE_CAPACITY,
+};
 use crate::{
     chainspec::BscChainSpec,
     consensus::{parlia::vote_pool, ParliaConsensusErr},
@@ -48,7 +53,7 @@ use std::{
     },
     task::{Context, Poll},
 };
-use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{self, OwnedPermit, Receiver};
 
 /// Network message containing a new block
 pub(crate) type BlockMsg = NewBlockMessage<BscNewBlock>;
@@ -74,11 +79,30 @@ pub(crate) type IncomingMinedBlock = (BscBuiltPayload, BlockMsg);
 /// broadcasts first and executes on import.
 pub(crate) type IncomingBidBlock = (SealedBlock<BscBlock>, Address, B256, U256, usize);
 
+/// Locally produced blocks share a bounded ingress, isolated from remote announcements.
+/// The variants retain separate handlers: sharing capacity does not make a BidBlock an
+/// executed payload. BidBlocks broadcast before validation; fallback blocks validate first.
+#[derive(Debug)]
+pub(crate) enum IncomingLocalBlock {
+    Mined(Box<IncomingMinedBlock>),
+    Bid(Box<IncomingBidBlock>),
+    /// The submit_built_payload=false fallback: ask Engine to validate before propagation.
+    Unexecuted(BlockMsg),
+}
+
 /// Channel message type for incoming block hashes
 pub(crate) type IncomingHashes = (NewBlockHashes, PeerId);
 
 /// Size of the LRU cache for processed blocks.
 const LRU_PROCESSED_BLOCKS_SIZE: u32 = 100;
+/// Remote new-payload/fork-choice futures retained while waiting on the Engine.
+/// For example, with 32 unfinished remote imports, the next near-head block is rejected
+/// (and counted/logged) until a slot frees. Excludes local imports and staged-sync downloads.
+const MAX_PENDING_IMPORTS: usize = 32;
+/// Maximum items processed per source in one poll before yielding to other work.
+/// For example, 100 queued network messages get at most 32 turns before local/hash work.
+/// This is per source, not a total concurrency cap; one hashes message may contain many hashes.
+const POLL_BATCH: usize = 32;
 
 /// Announcements whose height exceeds the local canonical tip by more than
 /// this many blocks are routed to the staged backfill pipeline (via a
@@ -103,17 +127,18 @@ where
     /// The fork choice engine for BSC
     forkchoice_engine: BscForkChoiceEngine<Provider>,
     /// Receive the new block from the network
-    from_network: UnboundedReceiver<IncomingBlock>,
-    /// Receive the new block from the network
-    from_builder: UnboundedReceiver<IncomingMinedBlock>,
-    /// Receive selected (sealed, unexecuted) BEP-675 BidBlocks to broadcast-then-verify.
-    from_bid_block: UnboundedReceiver<IncomingBidBlock>,
+    from_network: Receiver<IncomingBlock>,
+    /// Local blocks, isolated from remote ingress and backpressured by propagation.
+    from_local: Receiver<IncomingLocalBlock>,
     /// Receive block hashes from the network for downloading
-    from_hashes: UnboundedReceiver<IncomingHashes>,
+    from_hashes: Receiver<IncomingHashes>,
     /// Send the event of the import to the network
-    to_network: UnboundedSender<ImportEvent>,
+    to_network: PropagationSender,
     /// Pending block imports.
     pending_imports: FuturesUnordered<ImportFut>,
+    /// Each local fallback holds a propagation permit until validation finishes, bounding
+    /// these futures by the local output capacity independently of remote imports.
+    pending_local_imports: FuturesUnordered<ImportFut>,
     /// Cache of processed block hashes to avoid reprocessing the same block.
     processed_blocks: LruCache<B256>,
     /// Cache of queued block hashes to avoid processing the same block.
@@ -134,6 +159,7 @@ where
     recovery_gate: crate::node::network::block_import::fork_recover::RecoveryGate,
     /// Periodic timer for head announcement.
     announce_interval: tokio::time::Interval,
+    pipeline_targets: super::pipeline_targets::PipelineTargets,
 }
 
 /// Log a `recover_ancestors` error at a level matching its severity.
@@ -203,15 +229,14 @@ where
 {
     /// Create a new block import service
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn new(
         provider: Provider,
         chain_spec: Arc<BscChainSpec>,
         engine: ConsensusEngineHandle<BscPayloadTypes>,
-        from_network: UnboundedReceiver<IncomingBlock>,
-        from_builder: UnboundedReceiver<IncomingMinedBlock>,
-        from_bid_block: UnboundedReceiver<IncomingBidBlock>,
-        from_hashes: UnboundedReceiver<IncomingHashes>,
-        to_network: UnboundedSender<ImportEvent>,
+        from_network: Receiver<IncomingBlock>,
+        from_local: Receiver<IncomingLocalBlock>,
+        from_hashes: Receiver<IncomingHashes>,
+        to_network: PropagationSender,
     ) -> Self {
         let forkchoice_engine = BscForkChoiceEngine::new(provider, engine.clone(), chain_spec);
 
@@ -220,14 +245,14 @@ where
         }
 
         Self {
-            engine,
+            engine: engine.clone(),
             forkchoice_engine,
             from_network,
-            from_builder,
-            from_bid_block,
+            from_local,
             from_hashes,
             to_network,
             pending_imports: FuturesUnordered::new(),
+            pending_local_imports: FuturesUnordered::new(),
             processed_blocks: LruCache::new(LRU_PROCESSED_BLOCKS_SIZE),
             queued_blocks: LruCache::new(LRU_PROCESSED_BLOCKS_SIZE),
             recovering_heads:
@@ -238,6 +263,7 @@ where
                 LRU_PROCESSED_BLOCKS_SIZE,
             ),
             recovery_gate: crate::node::network::block_import::fork_recover::new_recovery_gate(),
+            pipeline_targets: super::pipeline_targets::PipelineTargets::new(engine.clone()),
             announce_interval: {
                 // 3s ≈ 6-7 BSC slots (450ms each). Fast enough to break fork
                 // livelocks, slow enough to be negligible overhead.
@@ -246,6 +272,10 @@ where
                 interval
             },
         }
+    }
+
+    fn send_remote_event(&self, event: ImportEvent) {
+        self.to_network.send_remote(event);
     }
 
     /// Process a new payload and return the outcome
@@ -446,6 +476,7 @@ where
         &mut self,
         payload: BscBuiltPayload,
         block_msg: NewBlockMessage<BscNewBlock>,
+        propagation: OwnedPermit<BlockMsg>,
     ) {
         let block = &block_msg.block.0.block;
         // insert header to cache
@@ -471,14 +502,8 @@ where
         if let Err(e) = self.transfer_to_evn_peers(block_msg.clone()) {
             tracing::warn!(target: "bsc::block_import", "Failed to transfer block to EVN peers: number = {:?}, hash = {:?}, error = {}", block.header.number, block_hash, e);
         }
-        // Send ValidHeader announcement to trigger NewBlock diffusion from few peers
-        let _ =
-            self.to_network.send(BlockImportEvent::Announcement(BlockValidation::ValidHeader {
-                block: block_msg.clone(),
-            }));
-        let _ = self
-            .to_network
-            .send(BlockImportEvent::Announcement(BlockValidation::ValidBlock { block: block_msg }));
+        // One reserved slot owns both full-block and hash propagation notifications.
+        propagation.send(block_msg);
 
         // Insert the executed block into the engine tree, then update fork choice.
         //
@@ -566,6 +591,7 @@ where
         bid_hash: B256,
         gas_fee: U256,
         system_tx_start: usize,
+        propagation: OwnedPermit<BlockMsg>,
     ) {
         let block_hash = sealed.hash();
         let header = sealed.header().clone();
@@ -599,12 +625,7 @@ where
         if let Err(e) = self.transfer_to_evn_peers(block_msg.clone()) {
             tracing::warn!(target: "bsc::block_import", number = block_number, hash = %block_hash, error = %e, "BidBlock: failed to transfer to EVN peers");
         }
-        let _ = self.to_network.send(BlockImportEvent::Announcement(
-            BlockValidation::ValidHeader { block: block_msg.clone() },
-        ));
-        let _ = self.to_network.send(BlockImportEvent::Announcement(
-            BlockValidation::ValidBlock { block: block_msg },
-        ));
+        propagation.send(block_msg);
 
         // 2. Verify after broadcast.
         let engine = self.engine.clone();
@@ -770,6 +791,16 @@ where
             return;
         }
 
+        let local_tip = self.forkchoice_engine.provider.best_block_number().unwrap_or(0);
+        let block_number = block.block.0.block.header.number;
+        let delta = block_number.saturating_sub(local_tip);
+        // Reject overload before cloning or validating the body. A rejected block
+        // remains retryable. Far-ahead targets have their own bounded admission.
+        if delta <= PIPELINE_TRIGGER_DELTA && self.pending_imports.len() >= MAX_PENDING_IMPORTS {
+            Queue::RemoteImports.full(MAX_PENDING_IMPORTS, "drop");
+            return;
+        }
+
         if let Err(error) = super::super::data_availability::validate_data_availability(
             &mut Arc::make_mut(&mut block.block).0.block,
             self.forkchoice_engine.chain_spec(),
@@ -785,11 +816,8 @@ where
             return;
         }
 
-        let local_tip = self.forkchoice_engine.provider.best_block_number().unwrap_or(0);
-        let block_number = block.block.0.block.header.number;
-        let delta = block_number.saturating_sub(local_tip);
         if delta > PIPELINE_TRIGGER_DELTA {
-            tracing::info!(
+            tracing::debug!(
                 target: "bsc::block_import",
                 block_hash = %block.hash,
                 block_number,
@@ -798,8 +826,7 @@ where
                 peer = %peer_id,
                 "NewBlock far ahead of local tip; routing to pipeline instead of fork_recover"
             );
-            self.processed_blocks.insert(block.hash);
-            self.spawn_pipeline_trigger_fcu(peer_id, block.hash, block_number, local_tip, delta);
+            self.pipeline_targets.enqueue(peer_id, block.hash);
             return;
         }
 
@@ -817,13 +844,16 @@ where
         }
         // Send ValidHeader announcement to trigger NewBlock diffusion from few peers
         // TODO: add header validation later
-        let _ =
-            self.to_network.send(BlockImportEvent::Announcement(BlockValidation::ValidHeader {
+        self.send_remote_event(BlockImportEvent::Announcement(
+            BlockValidation::ValidHeader {
                 block: block.clone(),
-            }));
+            },
+        ));
 
         tracing::debug!(target: "bsc::block_import", "Sending new block to import service: number = {:?}, hash = {:?}", block.block.0.block.header.number, block.hash);
         let payload_fut = self.new_payload(block.clone(), peer_id);
+        // Keep the slot until the actual Engine response. Dropping a timed-out
+        // waiter would not cancel the payload already in the Engine queue.
         self.pending_imports.push(payload_fut);
     }
 
@@ -870,20 +900,11 @@ where
 
             let delta = hash_number.number.saturating_sub(local_tip);
             if delta > PIPELINE_TRIGGER_DELTA {
-                // Far-behind: fork_recover's 2048-ancestor walk cannot close
-                // this gap. Mark processed so subsequent announcements of the
-                // same head are deduped, then synthesize an FCU. Engine-tree's
-                // optimistic-sync branch treats `head_block_hash` as a
-                // backfill target when `finalized_block_hash` is zero (BSC has
-                // no CL to supply one).
-                self.processed_blocks.insert(hash_number.hash);
-                self.spawn_pipeline_trigger_fcu(
-                    peer_id,
-                    hash_number.hash,
-                    hash_number.number,
-                    local_tip,
-                    delta,
-                );
+                // Beyond the ancestor-walk limit, ask Engine's optimistic-sync path to
+                // backfill instead. BSC has no CL finalized target; the FCU uses head only.
+                // Coalesce far-ahead targets before sending FCUs. Admission is
+                // bounded and retryable; it does not mark a block as processed.
+                self.pipeline_targets.enqueue(peer_id, hash_number.hash);
                 continue;
             }
 
@@ -977,53 +998,6 @@ where
     /// See [`resolve_bsc_peer_static`].
     fn resolve_bsc_peer(&self, announcer: PeerId) -> Option<PeerId> {
         resolve_bsc_peer_static(announcer)
-    }
-
-    /// Synthesize a `forkchoiceUpdated` call targeting the announced peer head
-    /// so engine-tree's optimistic-sync branch can start the staged backfill
-    /// pipeline. Used for announcements whose gap exceeds
-    /// `PIPELINE_TRIGGER_DELTA`, where `fork_recover` cannot help.
-    fn spawn_pipeline_trigger_fcu(
-        &self,
-        peer_id: PeerId,
-        head_hash: B256,
-        head_num: u64,
-        local_tip: u64,
-        delta: u64,
-    ) {
-        let engine = self.engine.clone();
-        tracing::info!(
-            target: "bsc::block_import",
-            %peer_id,
-            %head_hash,
-            head_num,
-            local_tip,
-            delta,
-            "Far-behind gap detected; dispatching pipeline-trigger FCU"
-        );
-        tokio::spawn(async move {
-            let state = ForkchoiceState {
-                head_block_hash: head_hash,
-                safe_block_hash: B256::ZERO,
-                finalized_block_hash: B256::ZERO,
-            };
-            match engine.fork_choice_updated(state, None).await {
-                Ok(ret) => tracing::info!(
-                    target: "bsc::block_import",
-                    %head_hash,
-                    head_num,
-                    status = ?ret.payload_status.status,
-                    "Pipeline-trigger FCU dispatched"
-                ),
-                Err(err) => tracing::warn!(
-                    target: "bsc::block_import",
-                    %head_hash,
-                    head_num,
-                    error = %err,
-                    "Pipeline-trigger FCU failed"
-                ),
-            }
-        });
     }
 
     /// Transfer the block to EVN peers if from proxied validators or validator address.
@@ -1185,33 +1159,107 @@ where
         let this = self.get_mut();
 
         // Receive new blocks from network
-        while let Poll::Ready(Some((block, peer_id))) = this.from_network.poll_recv(cx) {
+        for n in 0..POLL_BATCH {
+            if n + 1 == POLL_BATCH {
+                cx.waker().wake_by_ref();
+            }
+            let Poll::Ready(Some((block, peer_id))) = this.from_network.poll_recv(cx) else {
+                break;
+            };
             this.on_new_block(block, peer_id);
         }
 
-        // Receive new mined blocks from builder
-        while let Poll::Ready(Some((payload, block_msg))) = this.from_builder.poll_recv(cx) {
-            this.on_new_mined_block(payload, block_msg);
+        // Complete local fallback imports before admitting more local work. Local slots are
+        // independent of the remote import cap. Each future owns a propagation reservation.
+        for _ in 0..POLL_BATCH {
+            match this.pending_local_imports.poll_next_unpin(cx) {
+                Poll::Ready(Some(Some(outcome))) => {
+                    if let Ok(BlockValidation::ValidBlock { block }) = outcome.result {
+                        this.processed_blocks.insert(block.hash);
+                        if let Err(error) = this.transfer_to_evn_peers(block) {
+                            tracing::warn!(target: "bsc::block_import", %error, "Failed to transfer local fallback block to EVN peers");
+                        }
+                    }
+                }
+                Poll::Ready(Some(None)) => {}
+                _ => break,
+            }
         }
-
-        // Receive selected BEP-675 BidBlocks: broadcast then verify-on-import.
-        while let Poll::Ready(Some((sealed, builder, bid_hash, gas_fee, system_tx_start))) =
-            this.from_bid_block.poll_recv(cx)
-        {
-            this.on_new_bid_block(sealed, builder, bid_hash, gas_fee, system_tx_start);
+        for n in 0..POLL_BATCH {
+            // Do not dequeue a local block until its propagation slot is reserved. A single
+            // retained reservation future registers the wakeup; no detached send tasks.
+            let permit = match this.to_network.poll_local_permit(cx) {
+                Poll::Ready(Ok(permit)) => permit,
+                Poll::Ready(Err(error)) => {
+                    tracing::error!(target: "bsc::block_import", %error, "Local propagation channel closed");
+                    return Poll::Ready(Err(Box::new(error)));
+                }
+                Poll::Pending => break,
+            };
+            let Poll::Ready(Some(local)) = this.from_local.poll_recv(cx) else {
+                // Dropping the unused permit returns capacity to the local queue.
+                break;
+            };
+            match local {
+                IncomingLocalBlock::Mined(block) => {
+                    let (payload, message) = *block;
+                    this.on_new_mined_block(payload, message, permit);
+                }
+                IncomingLocalBlock::Bid(block) => {
+                    let (sealed, builder, hash, fee, system_tx_start) = *block;
+                    this.on_new_bid_block(sealed, builder, hash, fee, system_tx_start, permit);
+                }
+                IncomingLocalBlock::Unexecuted(block) => {
+                    let future =
+                        this.new_payload(block, crate::shared::get_local_peer_id_or_default());
+                    this.pending_local_imports.push(Box::pin(async move {
+                        let outcome = future.await;
+                        // The fallback requests Engine validation. Only propagate the pair once
+                        // validation succeeds; the reserved slot cannot be stolen meanwhile.
+                        if let Some(Outcome {
+                            result: Ok(BlockValidation::ValidBlock { block }),
+                            ..
+                        }) = &outcome
+                        {
+                            insert_header_to_cache_with_hash(
+                                block.block.0.block.header.clone(),
+                                Some(block.hash),
+                            );
+                            crate::shared::cache_full_block(block.block.0.block.clone());
+                            permit.send(block.clone());
+                        }
+                        outcome
+                    }));
+                    // Newly inserted futures must be polled even without another input event.
+                    cx.waker().wake_by_ref();
+                }
+            }
+            if n + 1 == POLL_BATCH {
+                cx.waker().wake_by_ref();
+            }
         }
 
         // Receive new block hashes from network
-        while let Poll::Ready(Some((hashes, peer_id))) = this.from_hashes.poll_recv(cx) {
+        for n in 0..POLL_BATCH {
+            if n + 1 == POLL_BATCH {
+                cx.waker().wake_by_ref();
+            }
+            let Poll::Ready(Some((hashes, peer_id))) = this.from_hashes.poll_recv(cx) else {
+                break;
+            };
             this.on_new_block_hashes(hashes, peer_id);
         }
 
         // Process completed imports and send events to network
-        while let Poll::Ready(Some(outcome)) = this.pending_imports.poll_next_unpin(cx) {
+        for n in 0..POLL_BATCH {
+            if n + 1 == POLL_BATCH {
+                cx.waker().wake_by_ref();
+            }
+            let Poll::Ready(Some(outcome)) = this.pending_imports.poll_next_unpin(cx) else {
+                break;
+            };
             if let Some(outcome) = outcome {
-                let mut block_hash = None;
                 if let Ok(BlockValidation::ValidBlock { block }) = &outcome.result {
-                    block_hash = Some(block.hash);
                     this.processed_blocks.insert(block.hash);
                     // Cache the full block body for later range responses.
                     crate::shared::cache_full_block(block.block.0.block.clone());
@@ -1220,18 +1268,27 @@ where
                     }
                 }
 
-                // TODO: add queued blocks removal later, to avoid milicious block import, and trigger next download.
-                // now, it must wait backfilling to download the correct block.
-                // the verified header can drop the peer later, it cannot transfer a bad header now.
-                // if let Some(block_hash) = outcome.block.hash {
-                //     this.queued_blocks.remove(&block_hash);
-                // }
-
-                if let Err(e) = this.to_network.send(BlockImportEvent::Outcome(outcome)) {
-                    return Poll::Ready(Err(Box::new(e)));
-                }
+                // The network may be busy. Do not move bounded imports into an
+                // unbounded outcome queue or stop driving the service on overload.
+                this.send_remote_event(BlockImportEvent::Outcome(outcome));
             }
         }
+
+        this.pipeline_targets.poll(cx);
+        Queue::RemoteBlocks.observe(
+            this.from_network.max_capacity() - this.from_network.capacity(),
+            IMPORT_QUEUE_CAPACITY,
+        );
+        Queue::RemoteHashes.observe(
+            this.from_hashes.max_capacity() - this.from_hashes.capacity(),
+            IMPORT_QUEUE_CAPACITY,
+        );
+        Queue::LocalIngress.observe(
+            this.from_local.max_capacity() - this.from_local.capacity(),
+            propagation::LOCAL_BLOCK_CAPACITY,
+        );
+        Queue::RemoteImports.observe(this.pending_imports.len(), MAX_PENDING_IMPORTS);
+        this.to_network.observe();
 
         // Drive periodic head announcement to break forked-validator livelocks.
         // Each tick spawns a detached task so we never block the poll loop on
@@ -1288,14 +1345,18 @@ mod tests {
             reth_chainspec::ChainSpecBuilder::mainnet().cancun_activated().build(),
         ));
         let (to_engine, mut from_engine) = mpsc::unbounded_channel();
-        let (_, from_network) = mpsc::unbounded_channel();
-        let (_, from_builder) = mpsc::unbounded_channel();
-        let (_, from_bid) = mpsc::unbounded_channel();
-        let (_, from_hashes) = mpsc::unbounded_channel();
-        let (to_network, mut events) = mpsc::unbounded_channel();
+        let (_, from_network) = mpsc::channel(IMPORT_QUEUE_CAPACITY);
+        let (_, from_local) = mpsc::channel(propagation::LOCAL_BLOCK_CAPACITY);
+        let (_, from_hashes) = mpsc::channel(IMPORT_QUEUE_CAPACITY);
+        let (to_network, mut events) = propagation::channel();
         let mut service = ImportService::new(
-            MockProvider::new(), spec, ConsensusEngineHandle::new(to_engine),
-            from_network, from_builder, from_bid, from_hashes, to_network,
+            MockProvider::new(),
+            spec,
+            ConsensusEngineHandle::new(to_engine),
+            from_network,
+            from_local,
+            from_hashes,
+            to_network,
         );
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         let block = blob_block(now);
@@ -1318,6 +1379,201 @@ mod tests {
         assert!(service.queued_blocks.contains(&hash));
         assert_eq!(service.pending_imports.len(), 1);
         assert!(matches!(events.try_recv().unwrap(), BlockImportEvent::Announcement(_)));
+    }
+
+    #[tokio::test]
+    async fn local_backpressure_reaches_producer_without_blocking_remote_imports() {
+        let (engine_tx, mut engine_rx) = mpsc::unbounded_channel();
+        let (network_tx, network_rx) = mpsc::channel(IMPORT_QUEUE_CAPACITY);
+        let (local_tx, local_rx) = mpsc::channel(propagation::LOCAL_BLOCK_CAPACITY);
+        let (_, hashes_rx) = mpsc::channel(IMPORT_QUEUE_CAPACITY);
+        let (mut events_tx, mut events_rx) = propagation::channel();
+        let block = create_test_block();
+        for _ in 0..propagation::LOCAL_BLOCK_CAPACITY {
+            futures::future::poll_fn(|cx| events_tx.poll_local_permit(cx))
+                .await
+                .unwrap()
+                .send(block.clone());
+            local_tx.try_send(IncomingLocalBlock::Unexecuted(block.clone())).unwrap();
+        }
+        let mut service = ImportService::new(
+            MockProvider::new(),
+            Arc::new(BscChainSpec::from(bsc_mainnet())),
+            ConsensusEngineHandle::new(engine_tx),
+            network_rx,
+            local_rx,
+            hashes_rx,
+            events_tx,
+        );
+        let send = local_tx.send(IncomingLocalBlock::Unexecuted(block.clone()));
+        tokio::pin!(send);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(send.as_mut().poll(&mut cx).is_pending());
+        network_tx.try_send((block, PeerId::random())).unwrap();
+        assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
+        assert_eq!(service.from_local.len(), propagation::LOCAL_BLOCK_CAPACITY);
+        assert!(service.pending_local_imports.is_empty());
+        assert!(matches!(engine_rx.try_recv(), Ok(BeaconEngineMessage::NewPayload { .. })));
+        assert!(send.as_mut().poll(&mut cx).is_pending());
+
+        // Taking one grouped local block releases one slot and resumes local admission.
+        assert!(matches!(
+            events_rx.try_recv(),
+            Ok(BlockImportEvent::Announcement(BlockValidation::ValidHeader { .. }))
+        ));
+        assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
+        assert_eq!(service.pending_local_imports.len(), 1);
+        assert!(matches!(send.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
+    }
+
+    #[tokio::test]
+    async fn local_fallback_waits_for_validation_and_uses_local_propagation() {
+        let (engine_tx, mut engine_rx) = mpsc::unbounded_channel();
+        let (_, network_rx) = mpsc::channel(IMPORT_QUEUE_CAPACITY);
+        let (local_tx, local_rx) = mpsc::channel(propagation::LOCAL_BLOCK_CAPACITY);
+        let (_, hashes_rx) = mpsc::channel(IMPORT_QUEUE_CAPACITY);
+        let (events_tx, mut events_rx) = propagation::channel();
+        let mut service = ImportService::new(
+            MockProvider::new(),
+            Arc::new(BscChainSpec::from(bsc_mainnet())),
+            ConsensusEngineHandle::new(engine_tx),
+            network_rx,
+            local_rx,
+            hashes_rx,
+            events_tx,
+        );
+        // Remote saturation must not reject a local fallback block.
+        for _ in 0..MAX_PENDING_IMPORTS {
+            service.pending_imports.push(Box::pin(futures::future::pending()));
+        }
+        local_tx.send(IncomingLocalBlock::Unexecuted(create_test_block())).await.unwrap();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
+        assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
+        assert!(events_rx.try_recv().is_err());
+        let BeaconEngineMessage::NewPayload { tx, .. } = engine_rx.try_recv().unwrap() else {
+            panic!("local fallback did not reach Engine");
+        };
+        tx.send(Ok(PayloadStatus::new(
+            PayloadStatusEnum::Invalid { validation_error: "test".into() },
+            None,
+        )))
+        .unwrap();
+        assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
+        assert!(events_rx.try_recv().is_err());
+        assert!(service.pending_local_imports.is_empty());
+        // Invalid work releases its reserved slot; a subsequent valid submission can proceed.
+        local_tx.send(IncomingLocalBlock::Unexecuted(create_test_block())).await.unwrap();
+        assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
+        assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
+        let BeaconEngineMessage::NewPayload { tx, .. } = engine_rx.try_recv().unwrap() else {
+            panic!("local capacity was not released");
+        };
+        tx.send(Ok(PayloadStatus::new(PayloadStatusEnum::Valid, None))).unwrap();
+        // Fork-choice may require a reply, depending on the fixture's canonical head.
+        assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
+        if let Ok(BeaconEngineMessage::ForkchoiceUpdated { tx, .. }) = engine_rx.try_recv() {
+            tx.send(Ok(OnForkChoiceUpdated::valid(PayloadStatus::new(
+                PayloadStatusEnum::Valid,
+                None,
+            ))))
+            .unwrap();
+            assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
+        }
+        assert!(matches!(
+            events_rx.try_recv(),
+            Ok(BlockImportEvent::Announcement(BlockValidation::ValidHeader { .. }))
+        ));
+        assert!(matches!(
+            events_rx.try_recv(),
+            Ok(BlockImportEvent::Announcement(BlockValidation::ValidBlock { .. }))
+        ));
+        assert!(service.pending_local_imports.is_empty());
+    }
+
+    #[tokio::test]
+    async fn closed_propagation_stops_import_service_with_error() {
+        let (engine_tx, _engine_rx) = mpsc::unbounded_channel();
+        let (_, network_rx) = mpsc::channel(IMPORT_QUEUE_CAPACITY);
+        let (_, local_rx) = mpsc::channel(propagation::LOCAL_BLOCK_CAPACITY);
+        let (_, hashes_rx) = mpsc::channel(IMPORT_QUEUE_CAPACITY);
+        let (events_tx, events_rx) = propagation::channel();
+        drop(events_rx);
+        let mut service = ImportService::new(
+            MockProvider::new(),
+            Arc::new(BscChainSpec::from(bsc_mainnet())),
+            ConsensusEngineHandle::new(engine_tx),
+            network_rx,
+            local_rx,
+            hashes_rx,
+            events_tx,
+        );
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(matches!(Pin::new(&mut service).poll(&mut cx), Poll::Ready(Err(_))));
+    }
+
+    #[tokio::test]
+    async fn slow_engine_bounds_imports_and_completion_allows_retry() {
+        let (tx, mut engine_rx) = mpsc::unbounded_channel();
+        let (_, network_rx) = mpsc::channel(IMPORT_QUEUE_CAPACITY);
+        let (_, local_rx) = mpsc::channel(propagation::LOCAL_BLOCK_CAPACITY);
+        let (_, hashes_rx) = mpsc::channel(IMPORT_QUEUE_CAPACITY);
+        let (events_tx, mut events_rx) = propagation::channel();
+        let mut service = ImportService::new(
+            MockProvider::new(),
+            Arc::new(BscChainSpec::from(bsc_mainnet())),
+            ConsensusEngineHandle::new(tx),
+            network_rx,
+            local_rx,
+            hashes_rx,
+            events_tx,
+        );
+        let peer = PeerId::random();
+        let make_block = |n: u64| {
+            let block = BscBlock {
+                header: Header {
+                    number: 1,
+                    extra_data: n.to_be_bytes().to_vec().into(),
+                    ..Default::default()
+                },
+                body: BscBlockBody::default(),
+            };
+            NewBlockMessage {
+                hash: block.header.hash_slow(),
+                td: Some(U256::ZERO),
+                block: Arc::new(BscNewBlock(NewBlock { block, td: U128::ZERO })),
+            }
+        };
+        for n in 0..1024 {
+            service.on_new_block(make_block(n), peer);
+        }
+        assert_eq!(service.pending_imports.len(), MAX_PENDING_IMPORTS);
+        let rejected = make_block(1023);
+        assert!(!service.queued_blocks.contains(&rejected.hash));
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
+        let mut replies = Vec::new();
+        while let Ok(BeaconEngineMessage::NewPayload { tx, .. }) = engine_rx.try_recv() {
+            replies.push(tx);
+        }
+        assert_eq!(replies.len(), MAX_PENDING_IMPORTS);
+        for _ in 0..100 {
+            service.on_new_block(make_block(2000), peer);
+        }
+        assert_eq!(service.pending_imports.len(), MAX_PENDING_IMPORTS);
+        for tx in replies {
+            let _ = tx.send(Ok(PayloadStatus::new(
+                PayloadStatusEnum::Invalid { validation_error: "test".into() },
+                None,
+            )));
+        }
+        while events_rx.try_recv().is_ok() {}
+        assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
+        assert!(service.pending_imports.is_empty());
+        service.on_new_block(rejected.clone(), peer);
+        assert_eq!(service.pending_imports.len(), 1);
+        assert!(service.queued_blocks.contains(&rejected.hash));
     }
 
     #[tokio::test]
@@ -1469,7 +1725,7 @@ mod tests {
 
             // The miner claims the slot before handing the signed block to this service.
             assert!(crate::shared::check_and_record_mined_block(block_number, parent_hash));
-            fixture.bid_tx.send((sealed, builder, bid_hash, U256::ZERO, 0)).unwrap();
+            fixture.bid_tx.send(IncomingLocalBlock::Bid(Box::new((sealed, builder, bid_hash, U256::ZERO, 0)))).await.unwrap();
 
             tokio::time::timeout(tokio::time::Duration::from_secs(2), async {
                 loop {
@@ -1531,7 +1787,11 @@ mod tests {
             "slot must start unclaimed"
         );
 
-        fixture.bid_tx.send((sealed, builder, bid_hash, U256::ZERO, 0)).unwrap();
+        fixture
+            .bid_tx
+            .send(IncomingLocalBlock::Bid(Box::new((sealed, builder, bid_hash, U256::ZERO, 0))))
+            .await
+            .unwrap();
 
         // 1. Broadcast still happens, before (and despite) the failed verification.
         let waker = futures::task::noop_waker();
@@ -1606,7 +1866,11 @@ mod tests {
         assert!(pm.is_allowed(builder), "builder should start allowed");
 
         // system_tx_start = 1: the single receipt above is the entire non-system-tx region.
-        fixture.bid_tx.send((sealed, builder, bid_hash, U256::ZERO, 1)).unwrap();
+        fixture
+            .bid_tx
+            .send(IncomingLocalBlock::Bid(Box::new((sealed, builder, bid_hash, U256::ZERO, 1))))
+            .await
+            .unwrap();
 
         let waker = futures::task::noop_waker();
         let mut cx = Context::from_waker(&waker);
@@ -1650,7 +1914,11 @@ mod tests {
         // gas_fee well above 21_000 * DEFAULT_MIN_GAS_TIP (21_000 * 50_000_000) clears the floor
         // with room to spare regardless of whatever the test process's ambient config resolves to.
         let gas_fee = U256::from(21_000u64) * U256::from(1_000_000_000_000u64);
-        fixture.bid_tx.send((sealed, builder, bid_hash, gas_fee, 1)).unwrap();
+        fixture
+            .bid_tx
+            .send(IncomingLocalBlock::Bid(Box::new((sealed, builder, bid_hash, gas_fee, 1))))
+            .await
+            .unwrap();
 
         // There's no state change to poll for in the non-revoked case; give the spawned
         // verify-then-check task ample time to run, then assert nothing happened.
@@ -1905,8 +2173,8 @@ mod tests {
     struct TestFixture {
         handle: ImportHandle,
         forkchoice_updates: mpsc::UnboundedReceiver<ForkchoiceState>,
-        /// Sender feeding the service's BEP-675 BidBlock channel (`from_bid_block`).
-        bid_tx: mpsc::UnboundedSender<IncomingBidBlock>,
+        /// Sender feeding the bounded local ingress with selected BidBlocks.
+        bid_tx: mpsc::Sender<IncomingLocalBlock>,
     }
 
     impl TestFixture {
@@ -1930,11 +2198,10 @@ mod tests {
             let forkchoice_updates =
                 handle_engine_msg(from_engine, responses, provider.clone()).await;
 
-            let (to_import, from_network) = mpsc::unbounded_channel();
-            let (to_import_mined, from_builder) = mpsc::unbounded_channel();
-            let (to_import_bid, from_bid_block) = mpsc::unbounded_channel();
-            let (to_hashes, from_hashes) = mpsc::unbounded_channel();
-            let (to_network, import_outcome) = mpsc::unbounded_channel();
+            let (to_import, from_network) = mpsc::channel(IMPORT_QUEUE_CAPACITY);
+            let (to_import_bid, from_local) = mpsc::channel(propagation::LOCAL_BLOCK_CAPACITY);
+            let (to_hashes, from_hashes) = mpsc::channel(IMPORT_QUEUE_CAPACITY);
+            let (to_network, import_outcome) = propagation::channel();
 
             let handle = ImportHandle::new(to_import, to_hashes, import_outcome);
 
@@ -1943,8 +2210,7 @@ mod tests {
                 chain_spec,
                 engine_handle,
                 from_network,
-                from_builder,
-                from_bid_block,
+                from_local,
                 from_hashes,
                 to_network,
             );
@@ -2104,11 +2370,10 @@ mod tests {
             }
         });
 
-        let (to_import, from_network) = mpsc::unbounded_channel();
-        let (_to_import_mined, from_builder) = mpsc::unbounded_channel();
-        let (_to_import_bid, from_bid_block) = mpsc::unbounded_channel();
-        let (to_hashes, from_hashes) = mpsc::unbounded_channel();
-        let (to_network, import_outcome) = mpsc::unbounded_channel();
+        let (to_import, from_network) = mpsc::channel(IMPORT_QUEUE_CAPACITY);
+        let (_to_local, from_local) = mpsc::channel(propagation::LOCAL_BLOCK_CAPACITY);
+        let (to_hashes, from_hashes) = mpsc::channel(IMPORT_QUEUE_CAPACITY);
+        let (to_network, import_outcome) = propagation::channel();
         let handle = ImportHandle::new(to_import, to_hashes, import_outcome);
 
         let service = ImportService::new(
@@ -2116,8 +2381,7 @@ mod tests {
             chain_spec,
             engine_handle,
             from_network,
-            from_builder,
-            from_bid_block,
+            from_local,
             from_hashes,
             to_network,
         );
@@ -2134,6 +2398,29 @@ mod tests {
         timeout: tokio::time::Duration,
     ) -> Option<ForkchoiceState> {
         tokio::time::timeout(timeout, fcu_rx.recv()).await.ok().flatten()
+    }
+
+    #[tokio::test]
+    async fn far_ahead_102_hash_replay_is_coalesced_before_engine() {
+        let (handle, mut fcu_rx, _np_rx) = spawn_service_with_tip(100).await;
+        let peer = PeerId::random();
+        let hashes = NewBlockHashes(
+            (1..=102u64)
+                .map(|n| BlockHashNumber {
+                    hash: B256::from(U256::from(n).to_be_bytes::<32>()),
+                    number: 100 + PIPELINE_TRIGGER_DELTA + n,
+                })
+                .collect(),
+        );
+        handle.send_hashes(hashes.clone(), peer).unwrap();
+        handle.send_hashes(hashes, peer).unwrap();
+        let fcu = recv_fcu_within(&mut fcu_rx, tokio::time::Duration::from_millis(500))
+            .await
+            .expect("one coalesced target should reach Engine");
+        assert_eq!(fcu.head_block_hash, B256::from(U256::from(102).to_be_bytes::<32>()));
+        assert!(recv_fcu_within(&mut fcu_rx, tokio::time::Duration::from_millis(100))
+            .await
+            .is_none());
     }
 
     #[tokio::test]
@@ -2176,29 +2463,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pipeline_fcu_deduped_by_processed_blocks_cache() {
-        // Same head announced twice from two peers should dispatch exactly
-        // one FCU — the Option-A concurrency policy relies on
-        // `processed_blocks.insert(..)` right before spawning the FCU.
+    async fn pipeline_target_can_be_reannounced_after_fcu_completion() {
         let (handle, mut fcu_rx, _np_rx) = spawn_service_with_tip(100).await;
 
         let head_hash = B256::from([0xCC; 32]);
-        let head_num = 100 + PIPELINE_TRIGGER_DELTA + 10;
-        let hashes = NewBlockHashes(vec![BlockHashNumber { hash: head_hash, number: head_num }]);
-
+        let hashes = NewBlockHashes(vec![BlockHashNumber {
+            hash: head_hash,
+            number: 100 + PIPELINE_TRIGGER_DELTA + 10,
+        }]);
         handle.send_hashes(hashes.clone(), PeerId::random()).unwrap();
-        // Let the first FCU be dispatched and recorded.
         let first = recv_fcu_within(&mut fcu_rx, tokio::time::Duration::from_millis(500))
             .await
             .expect("expected one FCU");
         assert_eq!(first.head_block_hash, head_hash);
-
-        // Re-announce the same head. Must be deduped.
-        handle.send_hashes(hashes, PeerId::random()).unwrap();
-        assert!(
-            recv_fcu_within(&mut fcu_rx, tokio::time::Duration::from_millis(200)).await.is_none(),
-            "duplicate head announcement must not dispatch a second FCU"
-        );
+        // A response may still be in transit. Reannounce until the active slot is released;
+        // there is no cooldown or permanent processed marker suppressing this target.
+        let next = tokio::time::timeout(tokio::time::Duration::from_secs(1), async {
+            loop {
+                handle.send_hashes(hashes.clone(), PeerId::random()).unwrap();
+                if let Some(fcu) =
+                    recv_fcu_within(&mut fcu_rx, tokio::time::Duration::from_millis(10)).await
+                {
+                    break fcu;
+                }
+            }
+        })
+        .await
+        .expect("completed FCU must leave the target eligible for retry");
+        assert_eq!(next.head_block_hash, head_hash);
     }
 
     fn peer(tag: u8, best_number: Option<u64>) -> (PeerId, Option<u64>) {

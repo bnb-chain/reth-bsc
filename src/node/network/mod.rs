@@ -270,25 +270,17 @@ impl BscNetworkBuilder {
 
         let network_builder = ctx.network_config_builder()?;
 
-        let (to_import_net, from_network) = mpsc::unbounded_channel();
-        let (to_import_mined, from_builder) = mpsc::unbounded_channel();
-        let (to_import_bid, from_bid_block) = mpsc::unbounded_channel();
-        let (to_network, import_outcome) = mpsc::unbounded_channel();
+        let (to_import_net, from_network) = mpsc::channel(block_import::IMPORT_QUEUE_CAPACITY);
+        let (to_local, from_local) = mpsc::channel(block_import::propagation::LOCAL_BLOCK_CAPACITY);
+        let (to_network, import_outcome) = block_import::propagation::channel();
 
-        let (to_hashes, from_hashes) = mpsc::unbounded_channel();
+        let (to_hashes, from_hashes) = mpsc::channel(block_import::IMPORT_QUEUE_CAPACITY);
         let handle = ImportHandle::new(to_import_net.clone(), to_hashes, import_outcome);
 
-        // Expose the sender globally so that the miner can submit newly mined blocks
-        if crate::shared::set_block_import_mined_sender(to_import_mined.clone()).is_err() {
-            warn!(target: "bsc", "Block import mined sender already initialised; overriding skipped");
-        }
-        if crate::shared::set_block_import_sender(to_import_net.clone()).is_err() {
-            warn!(target: "bsc", "Block import network sender already initialised; overriding skipped");
-        }
-        // Expose the BEP-675 BidBlock sender so the miner can submit a selected (sealed, unexecuted)
-        // BidBlock for broadcast-then-verify (zero-simulate).
-        if crate::shared::set_bid_block_import_sender(to_import_bid.clone()).is_err() {
-            warn!(target: "bsc", "BidBlock import sender already initialised; overriding skipped");
+        // Share bounded local ingress between mined blocks and selected BEP-675 BidBlocks.
+        // Selected sealed, unexecuted BidBlocks still use broadcast-then-verify (zero-simulate).
+        if crate::shared::set_local_block_import_sender(to_local).is_err() {
+            warn!(target: "bsc", "Local block import sender already initialised; overriding skipped");
         }
 
         // Import the necessary types for block import service
@@ -352,8 +344,7 @@ impl BscNetworkBuilder {
                 chain_spec,
                 handle,
                 from_network,
-                from_builder,
-                from_bid_block,
+                from_local,
                 from_hashes,
                 to_network,
             )
