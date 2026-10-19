@@ -328,10 +328,17 @@ where
         code: Bytecode,
     ) -> Result<(), BlockExecutionError> {
         let db = self.evm.db_mut();
-        let mut info = db.basic(address).map_err(BlockExecutionError::other)?.unwrap_or_default();
-        info.code_hash = code.hash_slow();
-        info.code = Some(code);
+        let info = db.basic(address).map_err(BlockExecutionError::other)?.unwrap_or_default();
+        // Build the account from the PRE-upgrade info and mutate afterwards.
+        // `impl From<AccountInfo> for Account` snapshots the value it is given into
+        // `original_info`, and reth's `evm_state_to_hashed_post_state` decides whether an
+        // account changed with `info != original_info()`. Mutating before the conversion makes
+        // those two equal, so the state-root task silently drops the new code hash while
+        // `db.commit` below still applies it -- the sparse root then disagrees with the serial
+        // one and the block seals an invalid state root.
         let mut account = RevmAccount::from(info);
+        account.info.code_hash = code.hash_slow();
+        account.info.code = Some(code);
         account.mark_touch();
         let mut changes: EvmState = Default::default();
         changes.insert(address, account);
@@ -374,12 +381,15 @@ where
             "HistoryStorageAddress account before deployment"
         );
 
-        let mut new_info = old_info.unwrap_or_default();
-        new_info.code_hash = keccak256(HISTORY_STORAGE_CODE.clone());
-        new_info.code = Some(Bytecode::new_raw(Bytes::from_static(&HISTORY_STORAGE_CODE)));
-        new_info.nonce = 1_u64;
-        new_info.balance = U256::ZERO;
-        let mut account = RevmAccount::from(new_info);
+        // Same ordering requirement as `upgrade_system_contract`: construct from the
+        // pre-deployment info so `original_info` holds the old value, then mutate. Building
+        // from the already-mutated info makes `info == original_info()` and the deployment
+        // never reaches the incremental state-root computation.
+        let mut account = RevmAccount::from(old_info.unwrap_or_default());
+        account.info.code_hash = keccak256(HISTORY_STORAGE_CODE.clone());
+        account.info.code = Some(Bytecode::new_raw(Bytes::from_static(&HISTORY_STORAGE_CODE)));
+        account.info.nonce = 1_u64;
+        account.info.balance = U256::ZERO;
         account.mark_touch();
         let mut changes: EvmState = Default::default();
         changes.insert(HISTORY_STORAGE_ADDRESS, account);
@@ -711,5 +721,59 @@ where
 
     fn receipts(&self) -> &[Self::Receipt] {
         &self.receipts
+    }
+}
+
+#[cfg(test)]
+mod original_info_ordering_tests {
+    use super::*;
+    use revm::state::AccountInfo;
+
+    /// `impl From<AccountInfo> for Account` snapshots whatever it is handed into
+    /// `original_info`, and reth's `evm_state_to_hashed_post_state` decides whether an account
+    /// changed with `info != original_info()`. So a hand-built account must be constructed
+    /// from the PRE-state info and mutated afterwards; building it from already-mutated info
+    /// makes the two equal and the change is silently dropped from the state-root task's
+    /// delta while `db.commit` still applies it, producing a wrong sealed state root.
+    ///
+    /// Guards the ordering in `upgrade_system_contract` and
+    /// `apply_history_storage_account`.
+    #[test]
+    fn mutating_after_conversion_keeps_original_info_distinct() {
+        let old = AccountInfo { nonce: 7, balance: U256::from(1_000u64), ..Default::default() };
+
+        // Correct ordering: construct from the pre-state, then mutate.
+        let mut account = RevmAccount::from(old.clone());
+        account.info.code_hash = keccak256([0xaa_u8, 0xbb]);
+        account.mark_touch();
+
+        assert_ne!(
+            account.info,
+            account.original_info(),
+            "account built from pre-state info must read as changed"
+        );
+        assert_eq!(account.original_info(), old, "original_info must hold the pre-state value");
+    }
+
+    /// The inverse: the ordering this fix removed. Kept so the failure mode stays visible --
+    /// if this ever stops holding, revm changed its semantics and the guard above can be
+    /// revisited.
+    #[test]
+    fn mutating_before_conversion_hides_the_change() {
+        let info = AccountInfo {
+            nonce: 7,
+            balance: U256::from(1_000u64),
+            code_hash: keccak256([0xaa_u8, 0xbb]),
+            ..Default::default()
+        };
+
+        let mut account = RevmAccount::from(info);
+        account.mark_touch();
+
+        assert_eq!(
+            account.info,
+            account.original_info(),
+            "mutating before conversion makes the change invisible to the state-root task"
+        );
     }
 }
