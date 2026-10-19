@@ -25,6 +25,7 @@ use crate::{
 use alloy_consensus::{BlobTransactionSidecar, BlockHeader as _, Transaction};
 use alloy_eips::eip4895::Withdrawals;
 use alloy_evm::Evm;
+use alloy_evm::block::BlockExecutor;
 use alloy_primitives::{Address, Bytes, B256, U256};
 use parking_lot::RwLock;
 use reth::transaction_pool::BestTransactionsAttributes;
@@ -55,6 +56,9 @@ use tracing::{debug, trace, warn};
 const PAY_BID_TX_GAS_LIMIT: u64 = 25000;
 const TX_GAS: u64 = 21000;
 
+#[cfg(test)]
+mod sidecar_tests;
+
 #[derive(Clone)]
 pub struct Bid {
     pub builder: Address,
@@ -75,6 +79,30 @@ impl Bid {
     fn is_committed(&self) -> bool {
         self.committed
     }
+}
+
+/// Validate private bid blobs before execution or insertion into the blob store.
+/// `insert_blob` only stores data; it does not run transaction-pool validation.
+pub(crate) fn validate_bid_blob_sidecar(
+    tx: &TransactionSigned,
+    sidecar: Option<&BlobTransactionSidecar>,
+) -> Result<(), String> {
+    let Some(hashes) = tx.blob_versioned_hashes() else {
+        return Ok(());
+    };
+    let sidecar = sidecar.ok_or_else(|| format!("missing blob sidecar for {}", tx.hash()))?;
+    if hashes.is_empty() {
+        return Err("blob transaction has no versioned hashes".into());
+    }
+    if sidecar.blobs.len() != hashes.len()
+        || sidecar.commitments.len() != hashes.len()
+        || sidecar.proofs.len() != hashes.len()
+    {
+        return Err(format!("blob sidecar length mismatch for {}", tx.hash()));
+    }
+    sidecar
+        .validate(hashes, alloy_eips::eip4844::env_settings::EnvKzgSettings::Default.get())
+        .map_err(|err| format!("invalid blob sidecar for {}: {err}", tx.hash()))
 }
 
 /// go-bsc `canBeInterrupted`: a newly arrived bid may preempt the in-flight simulation only if
@@ -1161,6 +1189,13 @@ where
         B::Executor: LaneAdmission,
         B::Primitives: reth_primitives_traits::NodePrimitives<SignedTx = TransactionSigned>,
     {
+        // Validate the entire builder prefix before executing any of it. This
+        // also protects callers that construct a Bid without going through RPC.
+        if !from_pool {
+            for tx in &recovered_txs {
+                validate_bid_blob_sidecar(tx, self.bid.blob_sidecars.get(tx.hash()))?;
+            }
+        }
         let base_fee: u64 = builder.evm().block().basefee();
         let min_gas_tip = crate::node::pool::tip::current_tip_floor();
         let blob_params = self.chain_spec.blob_params_at_timestamp(self.attributes.timestamp);
@@ -1247,9 +1282,35 @@ where
                     debug!(target: "payload_builder", tx=?tx_hash, ?self.block_blob_count, "skipping blob transaction because it would exceed the max blob count per block");
                     return Err("blob transaction limit exceeded".into());
                 }
-
-                self.block_blob_count += tx_blob_count;
             }
+
+            // Pool additions carry their sidecars in the pool, not in the bid.
+            // Resolve and validate before execution so a missing/invalid sidecar
+            // cannot leave an executed transaction without available blob data.
+            let sidecar = if is_blob_tx {
+                let sidecar = if from_pool {
+                    self.pool.get_blob(tx_hash)?.and_then(|sidecar| match sidecar.as_ref() {
+                        alloy_eips::eip7594::BlobTransactionSidecarVariant::Eip4844(inner) => {
+                            Some(inner.clone())
+                        }
+                        _ => None,
+                    })
+                } else {
+                    self.bid.blob_sidecars.get(&tx_hash).cloned()
+                };
+                if from_pool {
+                    if let Err(err) = validate_bid_blob_sidecar(&recovered_tx, sidecar.as_ref()) {
+                        trace!(%tx_hash, %err, "skipping pool transaction with invalid blob sidecar");
+                        skipped_senders.insert(signer);
+                        continue;
+                    }
+                }
+                sidecar
+            } else {
+                None
+            };
+
+            let tx_index = builder.executor().receipts().len() as u64;
 
             let tx_gas_used = match builder.execute_transaction(recovered_tx.clone()) {
                 Ok(tx_gas_used) => tx_gas_used,
@@ -1284,34 +1345,23 @@ where
                 }
             };
 
-            if is_blob_tx {
-                // Get sidecar from bid.blob_sidecars if available and convert to
-                // BscBlobTransactionSidecar
-                if let Some(sidecar) = self.bid.blob_sidecars.get(&tx_hash) {
-                    // Insert blob sidecar into pool's blob store
-                    use alloy_eips::eip7594::BlobTransactionSidecarVariant;
-                    if let Err(e) = self.pool.blob_store().insert(
-                        tx_hash,
-                        BlobTransactionSidecarVariant::Eip4844(sidecar.clone()).into(),
-                    ) {
-                        debug!("Failed to insert blob sidecar for tx {:?}: {:?}", tx_hash, e);
-                        if from_pool {
-                            trace!("bidSimulator: failed to insert blob sidecar, ignore tx:{}, error:{}, recovered tx:{:?}", tx_hash, e, recovered_tx);
-                            skipped_senders.insert(signer);
-                            continue;
-                        }
-                        return Err("Failed to insert blob sidecar".into());
-                    }
-                    let bsc_sidecar = BscBlobTransactionSidecar {
-                        inner: sidecar.clone(),
-                        block_number: self.bid.block_number,
-                        block_hash: B256::ZERO, // Will be set when block is sealed
-                        tx_index: index as u64,
-                        tx_hash,
-                        version: 0,
-                    };
-                    self.blob_sidecars.push(bsc_sidecar);
+            if let Some(sidecar) = sidecar {
+                use alloy_eips::eip7594::BlobTransactionSidecarVariant;
+                if !from_pool {
+                    // The whole builder prefix passed validation above.
+                    self.pool
+                        .insert_blob(tx_hash, BlobTransactionSidecarVariant::Eip4844(sidecar.clone()))
+                        .map_err(|err| format!("failed to insert blob sidecar: {err}"))?;
                 }
+                self.block_blob_count += sidecar.blobs.len() as u64;
+                self.blob_sidecars.push(BscBlobTransactionSidecar {
+                    inner: sidecar,
+                    block_number: self.bid.block_number,
+                    block_hash: B256::ZERO, // Will be set when block is sealed
+                    tx_index,
+                    tx_hash,
+                    version: 0,
+                });
             }
 
             self.gas_used += tx_gas_used.tx_gas_used();
