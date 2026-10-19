@@ -273,10 +273,10 @@ name = "cas20"
 harness = false
 required-features = ["bench-test"]
 
-# reth-core family -> bnb-chain/reth-core#5 (from_consensus_header_with_td). Swap to a published version once released.
+# reth-core family -> bnb-chain/reth-core develop (from_consensus_header_with_td, reth-core#5). Swap to a published version once released.
 [patch.crates-io]
-reth-rpc-traits = { git = "https://github.com/bnb-chain/reth-core", branch = "feat/from-consensus-header-with-td" }
-reth-primitives-traits = { git = "https://github.com/bnb-chain/reth-core", branch = "feat/from-consensus-header-with-td" }
-reth-codecs = { git = "https://github.com/bnb-chain/reth-core", branch = "feat/from-consensus-header-with-td" }
-reth-codecs-derive = { git = "https://github.com/bnb-chain/reth-core", branch = "feat/from-consensus-header-with-td" }
-reth-zstd-compressors = { git = "https://github.com/bnb-chain/reth-core", branch = "feat/from-consensus-header-with-td" }
+reth-rpc-traits = { git = "https://github.com/bnb-chain/reth-core", branch = "develop" }
+reth-primitives-traits = { git = "https://github.com/bnb-chain/reth-core", branch = "develop" }
+reth-codecs = { git = "https://github.com/bnb-chain/reth-core", branch = "develop" }
+reth-codecs-derive = { git = "https://github.com/bnb-chain/reth-core", branch = "develop" }
+reth-zstd-compressors = { git = "https://github.com/bnb-chain/reth-core", branch = "develop" }
