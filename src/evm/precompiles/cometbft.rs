@@ -23,7 +23,7 @@ use cometbft_light_client_verifier::{
 use cometbft_proto::{
     types::v1::{
         BlockId as RawBlockId, LightBlock as TmLightBlock, SimpleValidator as TmSimpleValidator,
-        ValidatorSet as TmValidatorSet,
+        Validator as TmValidator, ValidatorSet as TmValidatorSet,
     },
     version::v1::Consensus as RawConsensusVersion,
     Protobuf,
@@ -177,9 +177,10 @@ fn convert_light_block_from_proto(light_block_proto: &TmLightBlock) -> ConvertLi
         Err(_) => return Err(BscPrecompileError::InvalidInput.into()),
     };
 
-    let validator_set_proto =
-        light_block_proto.validator_set.as_ref().ok_or(BscPrecompileError::InvalidInput)?;
-    let validator_set = match Set::try_from(validator_set_proto.clone()) {
+    let mut validator_set_proto =
+        light_block_proto.validator_set.clone().ok_or(BscPrecompileError::InvalidInput)?;
+    fill_unset_bridge_fields(&mut validator_set_proto);
+    let validator_set = match Set::try_from(validator_set_proto) {
         Ok(vs) => vs.clone(),
         Err(_) => return Err(BscPrecompileError::InvalidInput.into()),
     };
@@ -187,6 +188,29 @@ fn convert_light_block_from_proto(light_block_proto: &TmLightBlock) -> ConvertLi
     let next_validator_set = validator_set.clone();
     let peer_id = cometbft::node::Id::new([0u8; 20]);
     Ok(LightBlock::new(signed_header, validator_set, next_validator_set, peer_id))
+}
+
+/// go-bsc's `Validator.ValidateBasic` accepts an empty relayer BLS key or relayer address as
+/// "unset", but the cometbft-rs conversion only accepts exactly 48 / 20 bytes. Zero-fill empty
+/// fields, which is how go-bsc stores them in the encoded consensus state (fixed-width `copy`),
+/// so the precompile accepts the same light blocks. Non-empty values of the wrong length are
+/// left alone and still rejected by the conversion, as in go-bsc.
+///
+/// The validator-set hash differs: go-bsc omits an empty field from `SimpleValidator`, while a
+/// `Set` built here always encodes 48 / 20 bytes. Never hash this `Set` to check it against
+/// `header.validators_hash`; hash the raw protobuf validators with `validator_set_hash`.
+fn fill_unset_bridge_fields(validator_set: &mut TmValidatorSet) {
+    let fill = |validator: &mut TmValidator| {
+        if validator.bls_key.is_empty() {
+            validator.bls_key = vec![0; RELAYER_BLS_KEY_LENGTH as usize];
+        }
+        if validator.relayer_address.is_empty() {
+            validator.relayer_address = vec![0; RELAYER_ADDRESS_LENGTH as usize];
+        }
+    };
+    validator_set.validators.iter_mut().for_each(fill);
+    // The proposer is converted separately and must stay equal to its entry in the set.
+    validator_set.proposer.iter_mut().for_each(fill);
 }
 
 /// Go BSC's `ValidatorSet.Hash`: a merkle root over each validator's `SimpleValidator`
@@ -685,6 +709,31 @@ mod tests {
 
     fn valid_light_block_input() -> Vec<u8> {
         hex::decode(VALID_LIGHT_BLOCK_INPUT).expect("fixture is valid hex")
+    }
+
+    /// Non-empty bridge fields of the wrong length stay invalid, as in go-bsc's
+    /// `Validator.ValidateBasic`; only the empty value means "unset".
+    #[test]
+    fn light_block_wrong_length_bridge_fields_are_invalid_input() {
+        let (_, light_block, _) =
+            decode_light_block_validation_input(&valid_light_block_input(), false).unwrap();
+        assert!(convert_light_block_from_proto(&light_block).is_ok());
+
+        for (bls_key, relayer_address) in [(Some(vec![1; 47]), None), (None, Some(vec![1; 21]))] {
+            let mut proto = light_block.clone();
+            let validator = &mut proto.validator_set.as_mut().unwrap().validators[0];
+            if let Some(bls_key) = bls_key.clone() {
+                validator.bls_key = bls_key;
+            }
+            if let Some(relayer_address) = relayer_address.clone() {
+                validator.relayer_address = relayer_address;
+            }
+            assert_eq!(
+                convert_light_block_from_proto(&proto).unwrap_err(),
+                BscPrecompileError::InvalidInput.into(),
+                "bls_key={bls_key:?} relayer_address={relayer_address:?}"
+            );
+        }
     }
 
     /// Rebuilds the fixture as an adjacent light block signed by four equal-power validators
