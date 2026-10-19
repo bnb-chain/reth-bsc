@@ -144,7 +144,7 @@ CPU and memory reference: [AWS i7ie.6xlarge](https://aws.amazon.com/ec2/instance
 
 | Node type | Free disk space |
 | --- | --- |
-| FastNode with maximum pruning (`--minimal`) | 2 TB+ |
+| FastNode | 2 TB+ |
 | FullNode | 8 TB+ |
 | ArchiveNode | 20 TB+ |
 
