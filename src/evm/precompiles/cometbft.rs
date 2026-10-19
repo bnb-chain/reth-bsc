@@ -1070,10 +1070,10 @@ mod tests {
     /// go-bsc accepts a validator whose relayer BLS key or relayer address is empty and stores
     /// it zero-filled. Each header commits to go-bsc's validator-set hash, which omits the empty
     /// field, so a fix that hashed the zero-filled fields would not match.
-    #[test]
-    fn light_block_empty_bridge_fields_match_go_bsc() {
-        type Edit = fn(&mut Vec<(Scalar, TmValidator)>);
-        let cases: [(&str, Edit, bool); 5] = [
+    type BridgeFieldEdit = fn(&mut Vec<(Scalar, TmValidator)>);
+
+    fn bridge_field_cases() -> [(&'static str, BridgeFieldEdit, bool); 5] {
+        [
             ("control", |_| {}, false),
             ("zero BLS key", |signers| signers[0].1.bls_key = vec![0; 48], false),
             ("empty BLS key", |signers| signers[0].1.bls_key.clear(), true),
@@ -1088,8 +1088,12 @@ mod tests {
                 },
                 true,
             ),
-        ];
-        for (name, edit, validator_set_changed) in cases {
+        ]
+    }
+
+    #[test]
+    fn light_block_empty_bridge_fields_match_go_bsc() {
+        for (name, edit, validator_set_changed) in bridge_field_cases() {
             let (input, expected) = runtime_signed_light_block(edit, |_| {});
             assert_eq!(expected[0], validator_set_changed as u8, "{name}");
             for (fork, run) in [
@@ -1459,12 +1463,16 @@ mod tests {
     #[test]
     fn greenfield_header_extension_preserves_protobuf_merge_semantics() {
         let (block, original_randao) = unsigned_light_block();
+        let fixture = valid_light_block_input();
+        let (_, original_proto, _) =
+            decode_light_block_validation_input(&fixture, true).unwrap();
         let proto = TmLightBlock {
             signed_header: Some(block.signed_header.clone().into()),
-            validator_set: Some(block.validators.clone().into()),
+            // The converted set omits the separately validated proposer. Keep the original
+            // protobuf set so this test still provides a structurally valid proposer.
+            validator_set: original_proto.validator_set,
         };
         let standard_fields = proto.encode_to_vec();
-        let fixture = valid_light_block_input();
         let trusted_state_prefix = &fixture[..fixture_split(&fixture)];
         for length in [0, 1, 32, 63, 64, 65] {
             let randao_mix = if length == 64 { original_randao.clone() } else { vec![0; length] };
@@ -1569,10 +1577,15 @@ mod tests {
     ) -> Vec<u8> {
         let input = valid_light_block_input();
         let split = 32 + u64::from_be_bytes(input[24..32].try_into().unwrap()) as usize;
-        let mut proto = TmLightBlock::decode(&input[split..]).unwrap();
-        mutate(proto.validator_set.as_mut().unwrap());
+        // Preserve the signed header's Go-only fields (including RandaoMix), which are
+        // covered by the commit's header hash. Only re-encode the validator set.
+        let light_block = map_proto_message(&input[split..], 2, |set| {
+            let mut set = TmValidatorSet::decode(set).unwrap();
+            mutate(&mut set);
+            set.encode_to_vec()
+        });
         let mut crafted = input[..split].to_vec();
-        crafted.extend_from_slice(&proto.encode_to_vec());
+        crafted.extend_from_slice(&light_block);
         crafted
     }
 
@@ -1646,15 +1659,11 @@ mod tests {
         use cometbft_proto::crypto::v1::public_key::Sum;
         use prost12::encoding::{encode_key, encode_varint, WireType};
 
-        let golden: serde_json::Value =
-            serde_json::from_str(include_str!("testdata/cometbft_empty_bridge_fields.json"))
-                .unwrap();
         let secp_key =
             hex::decode("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
                 .unwrap();
-        for vector in golden["vectors"].as_array().unwrap() {
-            let original = hex::decode(vector["input"].as_str().unwrap()).unwrap();
-            let expected = hex::decode(vector["go_output"].as_str().unwrap()).unwrap();
+        for (name, edit, _) in bridge_field_cases() {
+            let (original, expected) = runtime_signed_light_block(edit, |_| {});
             let split = 32 + u64::from_be_bytes(original[24..32].try_into().unwrap()) as usize;
             for cache in [0, 1, 40, -1, i64::MIN, i64::MAX] {
                 let mut input = original[..split].to_vec();
@@ -1681,8 +1690,7 @@ mod tests {
                         assert_eq!(
                             output.is_success(),
                             valid_proposer,
-                            "{} cache={cache} fork={fork}",
-                            vector["name"]
+                            "{name} cache={cache} fork={fork}"
                         );
                         if valid_proposer {
                             let mut expected = expected.clone();
