@@ -6,8 +6,7 @@
 //! an automatic revoke window to expire (or restarting the node).
 
 use alloy_primitives::Address;
-use jsonrpsee::core::RpcResult;
-use jsonrpsee::proc_macros::rpc;
+use jsonrpsee::{core::RpcResult, proc_macros::rpc};
 use reth::rpc::api::AdminApiServer;
 
 /// BSC-specific `admin` namespace additions.

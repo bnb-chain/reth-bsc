@@ -424,7 +424,6 @@ impl PayloadValidator<BscPayloadTypes> for BscEngineValidator {
         let sealed_block = self.convert_payload_to_block(payload)?;
         sealed_block.try_recover().map_err(|e| NewPayloadError::Other(e.into()))
     }
-
 }
 
 /// Execution payload validator.

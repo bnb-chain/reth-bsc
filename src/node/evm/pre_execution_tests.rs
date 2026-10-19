@@ -2,8 +2,10 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::consensus::parlia::vote::VoteAddress;
-    use crate::node::evm::pre_execution::{TURN_LENGTH_CACHE, VALIDATOR_CACHE};
+    use crate::{
+        consensus::parlia::vote::VoteAddress,
+        node::evm::pre_execution::{TURN_LENGTH_CACHE, VALIDATOR_CACHE},
+    };
     use alloy_primitives::{Address, B256};
 
     /// Multi-block `eth_simulateV1` parent resolution (regression for bnb-chain/reth#194).
@@ -452,23 +454,26 @@ mod tests {
 /// Helper-level regression tests for parent-vs-current validator reads.
 #[cfg(test)]
 mod parent_block_env {
-    use crate::chainspec::{bsc::bsc_mainnet, BscChainSpec};
-    use crate::consensus::parlia::snapshot::MAXWELL_EPOCH_LENGTH;
-    use crate::evm::api::BscEvm;
-    use crate::node::evm::config::{
-        evm_env_for_header, BscBlockExecutionCtx, BscExecutionMode, BscExecutionSharedCtx,
+    use crate::{
+        chainspec::{bsc::bsc_mainnet, BscChainSpec},
+        consensus::parlia::snapshot::MAXWELL_EPOCH_LENGTH,
+        evm::api::BscEvm,
+        node::evm::{
+            config::{
+                evm_env_for_header, BscBlockExecutionCtx, BscExecutionMode, BscExecutionSharedCtx,
+            },
+            executor::BscBlockExecutor,
+            pre_execution::{CallBlockEnv, VALIDATOR_CACHE},
+        },
+        system_contracts::{SystemContract, VALIDATOR_CONTRACT},
     };
-    use crate::node::evm::executor::BscBlockExecutor;
-    use crate::node::evm::pre_execution::{CallBlockEnv, VALIDATOR_CACHE};
-    use crate::system_contracts::{SystemContract, VALIDATOR_CONTRACT};
     use alloy_consensus::Header;
     use alloy_evm::eth::EthBlockExecutionCtx;
     use alloy_primitives::{hex, Address, Bytes, U160};
     use reth_evm_ethereum::RethReceiptBuilder;
-    use revm::bytecode::Bytecode;
-    use revm::database::InMemoryDB;
-    use revm::inspector::NoOpInspector;
-    use revm::state::AccountInfo;
+    use revm::{
+        bytecode::Bytecode, database::InMemoryDB, inspector::NoOpInspector, state::AccountInfo,
+    };
     use std::sync::Arc;
 
     /// Hard-coded interval used by the mock validator contract below.
@@ -580,11 +585,7 @@ mod parent_block_env {
 
             let (set, _) = validators_at_parent(parent_state(), spec, &parent).unwrap();
 
-            assert_eq!(
-                set,
-                vec![window_address(EPOCH_BLOCK - 1)],
-                "must draw from the parent env"
-            );
+            assert_eq!(set, vec![window_address(EPOCH_BLOCK - 1)], "must draw from the parent env");
         }
 
         /// A call to an address with no code succeeds with empty returndata, which the ABI unpack
@@ -598,7 +599,6 @@ mod parent_block_env {
             let err = validators_at_parent(ParentState { code: None }, spec, &parent).unwrap_err();
             assert!(err.to_string().contains("no data"), "unexpected error: {err}");
         }
-
     }
 
     type TestExecutor = BscBlockExecutor<
@@ -679,8 +679,8 @@ mod parent_block_env {
             state::LaneState,
             Budget, PAYMENT_LANE_CONTRACT,
         };
-        use alloy_primitives::{B256, U256};
         use alloy_evm::Evm as _;
+        use alloy_primitives::{B256, U256};
         use revm::state::{Account, EvmState, EvmStorageSlot};
 
         let code = Bytecode::new_raw(Bytes::from_static(&[0x00]));
@@ -711,7 +711,13 @@ mod parent_block_env {
 
         assert!(inherits(0x11, vec![touched(Address::repeat_byte(0xaa))]), "an unrelated account");
         assert!(
-            inherits(0x22, vec![shape(deployed.clone(), Some(EvmStorageSlot::new(U256::ZERO, revm::state::TransactionId::ZERO)))]),
+            inherits(
+                0x22,
+                vec![shape(
+                    deployed.clone(),
+                    Some(EvmStorageSlot::new(U256::ZERO, revm::state::TransactionId::ZERO))
+                )]
+            ),
             "a getter transaction: touched, slots read but unchanged"
         );
         assert!(
@@ -720,9 +726,16 @@ mod parent_block_env {
                 vec![
                     shape(
                         deployed.clone(),
-                        Some(EvmStorageSlot::new_changed(U256::ZERO, U256::from(1), revm::state::TransactionId::ZERO)),
+                        Some(EvmStorageSlot::new_changed(
+                            U256::ZERO,
+                            U256::from(1),
+                            revm::state::TransactionId::ZERO
+                        )),
                     ),
-                    shape(deployed, Some(EvmStorageSlot::new(U256::from(1), revm::state::TransactionId::ZERO))),
+                    shape(
+                        deployed,
+                        Some(EvmStorageSlot::new(U256::from(1), revm::state::TransactionId::ZERO))
+                    ),
                 ]
             ),
             "a getter after a governance write must not restore inheritance"
@@ -782,8 +795,10 @@ mod parent_block_env {
 
     #[test]
     fn a_pool_transaction_may_not_eat_the_idle_payment_lane() {
-        use crate::consensus::payment_lane::{meta::LaneMeta, state::LaneState, Budget};
-        use crate::node::evm::LaneAdmission;
+        use crate::{
+            consensus::payment_lane::{meta::LaneMeta, state::LaneState, Budget},
+            node::evm::LaneAdmission,
+        };
         use alloy_consensus::TxLegacy;
         use alloy_primitives::{Signature, TxKind, U256};
         use reth_ethereum_primitives::TransactionSigned;

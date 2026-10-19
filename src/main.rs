@@ -5,15 +5,13 @@ use reth::{
     consensus::FullConsensus,
     version::{default_reth_version_metadata, try_init_version_metadata},
 };
-use reth_bsc::consensus::parlia::bls_signer;
-use reth_bsc::node::consensus::BscConsensus;
 use reth_bsc::{
     chainspec::{genesis_override, parser::BscChainSpecParser},
-    node::{evm::config::BscEvmConfig, BscNode},
+    consensus::parlia::bls_signer,
+    node::{consensus::BscConsensus, evm::config::BscEvmConfig, BscNode},
     BscPrimitives,
 };
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 // We use jemalloc for performance reasons
 #[cfg(all(feature = "jemalloc", unix))]

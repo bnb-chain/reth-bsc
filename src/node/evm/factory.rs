@@ -7,9 +7,14 @@ use crate::{
     hardforks::bsc::BscHardfork,
 };
 use reth_evm::{precompiles::PrecompilesMap, Database, EvmEnv, EvmFactory};
-use revm::context::{DBErrorMarker, result::{EVMError, HaltReason}};
-use revm::inspector::NoOpInspector;
 use reth_revm::Inspector;
+use revm::{
+    context::{
+        result::{EVMError, HaltReason},
+        DBErrorMarker,
+    },
+    inspector::NoOpInspector,
+};
 
 /// Factory producing [`BscEvm`].
 #[derive(Debug, Default, Clone, Copy)]
@@ -36,7 +41,7 @@ impl EvmFactory for BscEvmFactory {
         // CacheDB is used in trace scenarios where we need to replay transactions
         let type_name = std::any::type_name::<DB>();
         let is_trace = type_name.contains("CacheDB");
-        
+
         BscEvm::new(input, db, NoOpInspector {}, false, is_trace)
     }
 

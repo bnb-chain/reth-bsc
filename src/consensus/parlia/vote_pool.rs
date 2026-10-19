@@ -17,9 +17,11 @@ use super::{
     malicious_vote_monitor::MaliciousVoteMonitor,
     vote::{VoteData, VoteEnvelope},
 };
-use crate::consensus::parlia::util::calculate_millisecond_timestamp;
-use crate::metrics::{BscFinalityMetrics, BscVoteMetrics};
-use crate::shared;
+use crate::{
+    consensus::parlia::util::calculate_millisecond_timestamp,
+    metrics::{BscFinalityMetrics, BscVoteMetrics},
+    shared,
+};
 use std::time::SystemTime;
 
 const LOWER_LIMIT_OF_VOTE_BLOCK_NUMBER: u64 = 256;
@@ -231,9 +233,8 @@ impl VotePool {
             // swap — push the bucket past the cap, so the first genuine validator
             // vote for that target is refused. That is the censorship this
             // conditional cap exists to prevent.
-            return authenticated
-                && self
-                    .future_votes
+            return authenticated &&
+                self.future_votes
                     .get(block_hash)
                     .is_some_and(|vm| vm.authenticated >= MAX_FUTURE_VOTE_AMOUNT_PER_BLOCK);
         }
@@ -278,11 +279,7 @@ impl VotePool {
                 pq.push(vote_data);
             }
             let bucket = votes.entry(block_hash).or_default();
-            bucket.vote_messages.push(VoteEntry {
-                hash: vote_hash,
-                envelope: vote,
-                authenticated,
-            });
+            bucket.vote_messages.push(VoteEntry { hash: vote_hash, envelope: vote, authenticated });
             if authenticated {
                 bucket.authenticated += 1;
             }
@@ -319,7 +316,8 @@ impl VotePool {
     fn get_votes(&self) -> Vec<VoteEnvelope> {
         let mut all_votes = Vec::new();
         for vote_messages in self.cur_votes.values() {
-            all_votes.extend(vote_messages.vote_messages.iter().map(|entry| entry.envelope.clone()));
+            all_votes
+                .extend(vote_messages.vote_messages.iter().map(|entry| entry.envelope.clone()));
         }
         all_votes
     }
@@ -339,11 +337,7 @@ impl VotePool {
 
     fn fetch_vote_by_block_hash(&self, block_hash: B256) -> Vec<VoteEnvelope> {
         if let Some(vote_messages) = self.cur_votes.get(&block_hash) {
-            vote_messages
-                .vote_messages
-                .iter()
-                .map(|entry| entry.envelope.clone())
-                .collect()
+            vote_messages.vote_messages.iter().map(|entry| entry.envelope.clone()).collect()
         } else {
             Vec::new()
         }
@@ -575,8 +569,8 @@ impl VotePool {
             // `head + 11`, but it fails open while the head is unknown at
             // startup, so an extreme value can still reach the pool. A plain add
             // would then wrap in release and trap in debug.
-            if vote_data.target_number.saturating_add(LOWER_LIMIT_OF_VOTE_BLOCK_NUMBER)
-                <= latest_block_number
+            if vote_data.target_number.saturating_add(LOWER_LIMIT_OF_VOTE_BLOCK_NUMBER) <=
+                latest_block_number
             {
                 // Remove from priority queue
                 let vote_data = self.cur_votes_pq.pop().unwrap();
@@ -584,7 +578,8 @@ impl VotePool {
 
                 // Remove from votes map and received_votes set
                 if let Some(vote_box) = self.cur_votes.remove(&block_hash) {
-                    self.total_votes = self.total_votes.saturating_sub(vote_box.vote_messages.len());
+                    self.total_votes =
+                        self.total_votes.saturating_sub(vote_box.vote_messages.len());
                     for vote in vote_box.vote_messages {
                         self.received_votes.remove(&vote.hash);
                     }
@@ -595,8 +590,8 @@ impl VotePool {
         }
         // Future entries below the lower bound can never be promoted usefully.
         while let Some(vd) = self.future_votes_pq.peek() {
-            if vd.target_number.saturating_add(LOWER_LIMIT_OF_VOTE_BLOCK_NUMBER)
-                > latest_block_number
+            if vd.target_number.saturating_add(LOWER_LIMIT_OF_VOTE_BLOCK_NUMBER) >
+                latest_block_number
             {
                 break;
             }
@@ -640,7 +635,8 @@ static VOTE_METRICS: Lazy<BscVoteMetrics> = Lazy::new(BscVoteMetrics::default);
 static FINALITY_METRICS: Lazy<BscFinalityMetrics> = Lazy::new(BscFinalityMetrics::default);
 
 /// LRU cache to track which blocks have already been notified for finality.
-/// This prevents repeated update_forkchoice calls for the same block (matches geth's finalizedNotified).
+/// This prevents repeated update_forkchoice calls for the same block (matches geth's
+/// finalizedNotified).
 static FINALIZED_NOTIFIED: Lazy<RwLock<LruCache<B256, ()>>> =
     Lazy::new(|| RwLock::new(LruCache::new(NonZero::new(FINALIZED_NOTIFIED_CACHE_SIZE).unwrap())));
 
@@ -711,13 +707,12 @@ fn justified_pair_of(
 /// authoritative check at promotion.
 ///
 /// Returns:
-/// - `Some(true)`  sender is a validator in our head's set, which we believe
-///   governs the target
-/// - `Some(false)` sender is not — refused early to keep minted keys from
-///   creating a bucket, accepting that a cross-branch sender may be refused with
-///   them. Never cached, so the refusal costs one copy rather than the envelope.
-/// - `None` undecidable: no snapshot, or the governing sets differ. Callers admit
-///   these uncapped rather than guess.
+/// - `Some(true)`  sender is a validator in our head's set, which we believe governs the target
+/// - `Some(false)` sender is not — refused early to keep minted keys from creating a bucket,
+///   accepting that a cross-branch sender may be refused with them. Never cached, so the refusal
+///   costs one copy rather than the envelope.
+/// - `None` undecidable: no snapshot, or the governing sets differ. Callers admit these uncapped
+///   rather than guess.
 fn future_vote_sender_is_validator(vote: &VoteEnvelope) -> Option<bool> {
     let head_number = shared::get_best_canonical_block_number()?;
     let head = shared::get_canonical_header_by_number(head_number)?;
@@ -800,8 +795,8 @@ fn verify_vote_origin(vote: &VoteEnvelope) -> OriginVerdict {
 
     match justified_pair_for_hash(&vote.data.target_hash) {
         Some((justified_number, justified_hash)) => {
-            if vote.data.source_number != justified_number
-                || vote.data.source_hash != justified_hash
+            if vote.data.source_number != justified_number ||
+                vote.data.source_hash != justified_hash
             {
                 metrics::counter!("votes.rejected.source_mismatch").increment(1);
                 return OriginVerdict::Rejected;
@@ -895,8 +890,10 @@ pub fn put_vote(vote: VoteEnvelope) {
     // Height window first of all: it costs nothing, while everything below costs
     // at least a hash. go-bsc orders it ahead of verification the same way in
     // `putIntoVotePool`.
-    if !is_within_admission_window(vote.data.target_number, shared::get_best_canonical_block_number())
-    {
+    if !is_within_admission_window(
+        vote.data.target_number,
+        shared::get_best_canonical_block_number(),
+    ) {
         metrics::counter!("votes.rejected.out_of_range").increment(1);
         tracing::debug!(
             target: "bsc::vote_pool",
@@ -988,8 +985,8 @@ fn put_vote_inner(vote: VoteEnvelope, vote_hash: B256) {
     // `maybe_notify_finality` (so they cannot manufacture quorum), and they are
     // fully origin-checked at promotion once the provider appears.
     let can_classify = shared::has_header_by_hash_provider();
-    let is_future = !can_classify
-        || shared::get_canonical_header_by_hash_from_provider(&target_hash).is_none();
+    let is_future =
+        !can_classify || shared::get_canonical_header_by_hash_from_provider(&target_hash).is_none();
 
     // Future votes cannot be origin-checked (membership lives in the target's
     // parent snapshot, which we do not hold), but we can still ask whether the
@@ -1152,8 +1149,8 @@ pub fn promote_future_votes(head_number: BlockNumber) {
     let mut resolved: HashMap<B256, HashMap<B256, bool>> = HashMap::new();
     for candidate in candidates {
         let target_hash = candidate.target_hash;
-        if !candidate.expired
-            && shared::get_canonical_header_by_hash_from_provider(&target_hash).is_none()
+        if !candidate.expired &&
+            shared::get_canonical_header_by_hash_from_provider(&target_hash).is_none()
         {
             // Still future: we do not hold the target yet.
             tracing::trace!(
@@ -1300,8 +1297,8 @@ fn maybe_notify_finality(target_hash: B256, votes_for_block: usize) {
     let eligible_votes = fetch_vote_by_block_hash(target_hash)
         .into_iter()
         .filter(|vote| {
-            vote.data.source_number == current_justified_number
-                && vote.data.target_number == head.number
+            vote.data.source_number == current_justified_number &&
+                vote.data.target_number == head.number
         })
         .count();
 
@@ -1318,7 +1315,8 @@ fn maybe_notify_finality(target_hash: B256, votes_for_block: usize) {
     // Record early finalization latency: time from the finalized block's millisecond
     // timestamp to now, equivalent to chain/finalized/latency/early in geth.
     // The finalized block is current_justified (head - 1), identified by current_justified_number.
-    if let Some(justified_header) = shared::get_canonical_header_by_number(current_justified_number) {
+    if let Some(justified_header) = shared::get_canonical_header_by_number(current_justified_number)
+    {
         let now_ms = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1338,8 +1336,10 @@ fn maybe_notify_finality(target_hash: B256, votes_for_block: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consensus::parlia::bls_signer::random_test_signer;
-    use crate::consensus::parlia::vote::{VoteAddress, VoteData, VoteEnvelope, VoteSignature};
+    use crate::consensus::parlia::{
+        bls_signer::random_test_signer,
+        vote::{VoteAddress, VoteData, VoteEnvelope, VoteSignature},
+    };
     use alloy_primitives::B256;
 
     fn vote_with_source(target_hash: B256, source_number: u64, unique: u8) -> VoteEnvelope {
@@ -1409,15 +1409,16 @@ mod tests {
 
         // Baseline: a correctly signed vote is admitted.
         put_vote(genuine.clone());
-        assert_eq!(fetch_any_vote_by_block_hash(data.target_hash).len(), 1, "genuine vote rejected");
+        assert_eq!(
+            fetch_any_vote_by_block_hash(data.target_hash).len(),
+            1,
+            "genuine vote rejected"
+        );
 
         // Undecodable signature under a real validator's address. Before
         // verification existed this reached attestation assembly and panicked
         // in `Signature::from_bytes(..).unwrap()`.
-        put_vote(VoteEnvelope {
-            signature: VoteSignature::from([0x42u8; 96]),
-            ..genuine.clone()
-        });
+        put_vote(VoteEnvelope { signature: VoteSignature::from([0x42u8; 96]), ..genuine.clone() });
         assert_eq!(
             fetch_any_vote_by_block_hash(data.target_hash).len(),
             1,
@@ -1436,10 +1437,7 @@ mod tests {
         );
 
         // Signature valid in isolation, but attributed to another validator.
-        put_vote(VoteEnvelope {
-            vote_address: VoteAddress::from([0x07u8; 48]),
-            ..genuine
-        });
+        put_vote(VoteEnvelope { vote_address: VoteAddress::from([0x07u8; 48]), ..genuine });
         assert_eq!(
             fetch_any_vote_by_block_hash(data.target_hash).len(),
             1,
@@ -1448,7 +1446,6 @@ mod tests {
 
         let _ = drain();
     }
-
 
     /// Verification is gated behind two cheap exclusions, so unsolicited traffic
     /// cannot buy unbounded pairings.
@@ -1501,7 +1498,6 @@ mod tests {
 
         let _ = drain();
     }
-
 
     // === D2: (head-256, head+11] admission window ===
 
@@ -1566,9 +1562,6 @@ mod tests {
 
         let _ = drain();
     }
-
-
-
 
     // === D1: per-target vote caps ===
 
@@ -1731,10 +1724,7 @@ mod tests {
         // votes. Buckets are released whole, so shedding can overshoot.
         let shed = pool.shed_future_votes(1);
         assert_eq!(shed, 2, "the whole furthest-ahead bucket is released");
-        assert!(
-            !pool.future_votes.contains_key(&B256::from([0xb3; 32])),
-            "height 300 shed first",
-        );
+        assert!(!pool.future_votes.contains_key(&B256::from([0xb3; 32])), "height 300 shed first",);
         assert!(
             pool.future_votes.contains_key(&B256::from([0xb1; 32])),
             "height 100 retained: nearest to promotion",
@@ -1770,7 +1760,6 @@ mod tests {
 
         let _ = drain();
     }
-
 
     /// An extreme `target_number` must not be able to empty the pool.
     ///
@@ -1842,7 +1831,6 @@ mod tests {
 
         let _ = drain();
     }
-
 
     /// A vote that cannot be classified must not be treated as current.
     ///
@@ -2310,8 +2298,7 @@ mod tests {
             for target in lowest..=(head + UPPER_LIMIT_OF_VOTE_BLOCK_NUMBER) {
                 // Membership comes from the target's parent.
                 let governing = target.saturating_sub(1);
-                let (lo, hi) =
-                    if governing < head { (governing, head) } else { (head, governing) };
+                let (lo, hi) = if governing < head { (governing, head) } else { (head, governing) };
                 // `is_epoch_boundary` in provider.rs, applied block by block.
                 let expected = ((lo + 1)..=hi).any(|n| n > 0 && n % EPOCH == OFFSET);
                 assert_eq!(

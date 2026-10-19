@@ -216,9 +216,7 @@ impl BidBlockPermissionManager {
     }
 
     fn system_clock() -> Box<dyn Fn() -> u64 + Send + Sync> {
-        Box::new(|| {
-            SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
-        })
+        Box::new(|| SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0))
     }
 
     /// Restores persisted revokes at startup, dropping any whose window has already elapsed
@@ -288,7 +286,13 @@ impl BidBlockPermissionManager {
     }
 
     /// Deny `builder` for the default lockout window, recording the reason for the permission RPC.
-    pub fn revoke(&self, builder: Address, reason: impl Into<String>, block_hash: B256, block_num: u64) {
+    pub fn revoke(
+        &self,
+        builder: Address,
+        reason: impl Into<String>,
+        block_hash: B256,
+        block_num: u64,
+    ) {
         self.revoke_for(builder, reason, block_hash, block_num, BID_BLOCK_REVOKE_DURATION_SECS);
     }
 
@@ -441,7 +445,13 @@ mod tests {
     fn revoke_for_uses_custom_duration_and_defaults_on_zero() {
         let (mgr, now) = manager_with_fake_clock();
 
-        mgr.revoke_for(BUILDER, "gas price", B256::ZERO, 7, BID_BLOCK_GAS_PRICE_LOW_REVOKE_DURATION_SECS);
+        mgr.revoke_for(
+            BUILDER,
+            "gas price",
+            B256::ZERO,
+            7,
+            BID_BLOCK_GAS_PRICE_LOW_REVOKE_DURATION_SECS,
+        );
         assert_eq!(
             mgr.get_status(BUILDER).reset_at,
             1_000 + BID_BLOCK_GAS_PRICE_LOW_REVOKE_DURATION_SECS
@@ -581,8 +591,8 @@ mod tests {
 
     /// Fresh journal path in a per-test temp directory (the go `testJournalPath` counterpart).
     fn test_journal_path(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir()
-            .join(format!("bid-block-revokes-{}-{name}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("bid-block-revokes-{}-{name}", std::process::id()));
         // A stale directory from an aborted earlier run must not leak state into this one.
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create test journal dir");
@@ -727,9 +737,15 @@ mod tests {
         wait_for_journal(&path, |j| j.revokes.contains_key(&BUILDER));
 
         let blob = String::from_utf8(std::fs::read(&path).expect("read journal")).unwrap();
-        for key in
-            ["\"version\"", "\"revokes\"", "\"revokedAt\"", "\"duration\"", "\"reason\"", "\"blockHash\"", "\"blockNum\""]
-        {
+        for key in [
+            "\"version\"",
+            "\"revokes\"",
+            "\"revokedAt\"",
+            "\"duration\"",
+            "\"reason\"",
+            "\"blockHash\"",
+            "\"blockNum\"",
+        ] {
             assert!(
                 blob.contains(key),
                 "journal is missing the stable key {key}; a tag change needs a version bump\ngot: {blob}"

@@ -1,11 +1,16 @@
 use crate::{
-    BscBlock, BscBlockBody, chainspec::BscChainSpec, node::{
+    chainspec::BscChainSpec,
+    node::{
         engine_api::{
             builder::BscEngineApiBuilder,
             payload::BscPayloadTypes,
             validator::{BscEngineValidatorBuilder, BscPayloadValidatorBuilder},
-        }, pool::BscPoolBuilder, primitives::BscPrimitives, storage::BscStorage
-    }
+        },
+        pool::BscPoolBuilder,
+        primitives::BscPrimitives,
+        storage::BscStorage,
+    },
+    BscBlock, BscBlockBody,
 };
 use consensus::BscConsensusBuilder;
 use engine::BscPayloadServiceBuilder;
@@ -13,22 +18,20 @@ use evm::BscExecutorBuilder;
 use network::BscNetworkBuilder;
 use reth::{
     api::{FullNodeComponents, FullNodeTypes, NodeTypes, PrimitivesTy},
-    builder::rpc::EthApiCtx,
     builder::{
         components::ComponentsBuilder,
-        rpc::{EthApiBuilder, RpcAddOns},
+        rpc::{EthApiBuilder, EthApiCtx, RpcAddOns},
         DebugNode, Node, NodeAdapter,
     },
-    rpc::eth::core::EthApi,
+    rpc::{eth::core::EthApi, server_types::eth::EthApiError},
 };
 use reth_chainspec::{EthereumHardforks, Hardforks};
-use reth::rpc::server_types::eth::EthApiError;
-use reth_rpc_eth_api::RpcConvert;
 use reth_engine_local::LocalPayloadAttributesBuilder;
 use reth_engine_primitives::ConsensusEngineHandle;
+use reth_rpc_eth_api::RpcConvert;
 
-use reth_payload_primitives::{PayloadAttributesBuilder, PayloadTypes};
 use reth_ethereum_primitives::BlockBody;
+use reth_payload_primitives::{PayloadAttributesBuilder, PayloadTypes};
 use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex};
 
@@ -36,14 +39,14 @@ pub mod consensus;
 pub mod engine;
 pub mod engine_api;
 pub mod evm;
-pub mod pool;
 pub mod miner;
 pub mod network;
+pub mod pool;
 pub mod primitives;
 mod reorg_metrics;
 pub mod storage;
-pub mod vote_producer;
 pub mod vote_journal;
+pub mod vote_producer;
 
 /// Bsc addons configuring RPC types
 pub type BscNodeAddOns<N> = RpcAddOns<
@@ -77,11 +80,8 @@ where
         Types: NodeTypes<ChainSpec: Hardforks + EthereumHardforks>,
         Evm = evm::config::BscEvmConfig,
     >,
-    BscRpcConverterFor<N>: RpcConvert<
-        Primitives = PrimitivesTy<N::Types>,
-        Error = EthApiError,
-        Evm = N::Evm,
-    >,
+    BscRpcConverterFor<N>:
+        RpcConvert<Primitives = PrimitivesTy<N::Types>, Error = EthApiError, Evm = N::Evm>,
 {
     type EthApi = EthApi<N, BscRpcConverterFor<N>>;
 
@@ -109,8 +109,7 @@ where
 /// Type configuration for a regular BSC node.
 #[derive(Debug, Clone)]
 pub struct BscNode {
-    engine_handle_rx:
-        Arc<Mutex<Option<oneshot::Receiver<ConsensusEngineHandle<BscPayloadTypes>>>>>,
+    engine_handle_rx: Arc<Mutex<Option<oneshot::Receiver<ConsensusEngineHandle<BscPayloadTypes>>>>>,
 }
 
 impl BscNode {
@@ -148,7 +147,7 @@ impl BscNode {
             .executor(BscExecutorBuilder::default())
             .payload(BscPayloadServiceBuilder::default())
             .network(BscNetworkBuilder::new(self.engine_handle_rx.clone()))
-            .consensus(BscConsensusBuilder::default())  
+            .consensus(BscConsensusBuilder::default())
     }
 }
 

@@ -12,30 +12,24 @@ use crate::{
 use alloy_consensus::{BlockBody, Header};
 use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::{Address, B256, U128, U256};
-use reth_primitives_traits::SealedBlock;
 use alloy_rpc_types_engine::{ForkchoiceState, PayloadStatusEnum};
 use futures::{future::Either, stream::FuturesUnordered, StreamExt};
 use parking_lot::RwLock;
-use reth::consensus::HeaderValidator;
-use reth::network::cache::LruCache;
+use reth::{consensus::HeaderValidator, network::cache::LruCache};
 use reth_engine_primitives::{ConsensusEngineHandle, EngineTypes};
 use reth_engine_tree::engine::EngineApiRequest;
 use reth_eth_wire::{BlockHashNumber, GetBlockHeaders, NewBlock};
 use reth_eth_wire_types::broadcast::NewBlockHashes;
 use reth_network::{
     import::{BlockImportError, BlockImportEvent, BlockImportOutcome, BlockValidation},
-    message::{NewBlockMessage, PeerMessage},
-};
-use reth_network::{
-    message::{BlockRequest, PeerResponse},
+    message::{BlockRequest, NewBlockMessage, PeerMessage, PeerResponse},
     FetchClient, NetworkHandle,
 };
 use reth_network_api::{PeerId, Peers, ReputationChangeKind};
 use reth_node_ethereum::EthEngineTypes;
 use reth_payload_builder_primitives::Events;
 use reth_payload_primitives::{BuiltPayload, PayloadTypes};
-use reth_primitives_traits::NodePrimitives;
-use reth_primitives_traits::{AlloyBlockHeader, Block};
+use reth_primitives_traits::{AlloyBlockHeader, Block, NodePrimitives, SealedBlock};
 use reth_provider::{
     BlockHashReader, BlockNumReader, BlockReaderIdExt, HeaderProvider, ReceiptProvider,
 };
@@ -462,10 +456,7 @@ where
         // delay; for a block we just produced locally the sample would actually reflect local
         // mining/finalize latency and would pollute cross-region diagnosis. Mirrors geth-bsc,
         // which only sets `RecvNewBlockTime` inside `handleBlockBroadcast` (the network path).
-        crate::consensus::parlia::block_stats::register_self_mined_block(
-            block_hash,
-            &block.header,
-        );
+        crate::consensus::parlia::block_stats::register_self_mined_block(block_hash, &block.header);
 
         // send to EVN peers first
         if let Err(e) = self.transfer_to_evn_peers(block_msg.clone()) {
@@ -558,7 +549,8 @@ where
     }
 
     /// Broadcast a selected BEP-675 BidBlock, then validate it through `new_payload`.
-    /// `Valid` advances fork choice; `Invalid` revokes the builder unless validation failed locally.
+    /// `Valid` advances fork choice; `Invalid` revokes the builder unless validation failed
+    /// locally.
     fn on_new_bid_block(
         &mut self,
         sealed: SealedBlock<BscBlock>,
@@ -585,8 +577,7 @@ where
             block: sealed.clone_block(),
             td: U128::from(new_td.to::<u128>()),
         });
-        let block_msg =
-            NewBlockMessage { hash: block_hash, block: Arc::new(new_block) };
+        let block_msg = NewBlockMessage { hash: block_hash, block: Arc::new(new_block) };
 
         // Cache + register stats like a self-mined block so range responses and vote-delay metrics
         // work for it (mirrors `on_new_mined_block`).
@@ -599,12 +590,13 @@ where
         if let Err(e) = self.transfer_to_evn_peers(block_msg.clone()) {
             tracing::warn!(target: "bsc::block_import", number = block_number, hash = %block_hash, error = %e, "BidBlock: failed to transfer to EVN peers");
         }
-        let _ = self.to_network.send(BlockImportEvent::Announcement(
-            BlockValidation::ValidHeader { block: block_msg.clone() },
-        ));
-        let _ = self.to_network.send(BlockImportEvent::Announcement(
-            BlockValidation::ValidBlock { block: block_msg },
-        ));
+        let _ =
+            self.to_network.send(BlockImportEvent::Announcement(BlockValidation::ValidHeader {
+                block: block_msg.clone(),
+            }));
+        let _ = self
+            .to_network
+            .send(BlockImportEvent::Announcement(BlockValidation::ValidBlock { block: block_msg }));
 
         // 2. Verify after broadcast.
         let engine = self.engine.clone();
@@ -1036,10 +1028,11 @@ where
         }
         let header_ref = &block.block.0.block.header;
         let coinbase = header_ref.beneficiary;
-        // If from proxied validators or validator address, target EVN peers with ETH NewBlockHashes.
-        if cfg.proxyed_validators.contains(&coinbase)
-            || (mining_config.enabled
-                && mining_config.validator_address.unwrap_or_default() == coinbase)
+        // If from proxied validators or validator address, target EVN peers with ETH
+        // NewBlockHashes.
+        if cfg.proxyed_validators.contains(&coinbase) ||
+            (mining_config.enabled &&
+                mining_config.validator_address.unwrap_or_default() == coinbase)
         {
             if let Some(net) = crate::shared::get_network_handle() {
                 let peers = crate::node::network::evn_peers::snapshot();
@@ -1219,11 +1212,11 @@ where
                     }
                 }
 
-                // TODO: add queued blocks removal later, to avoid milicious block import, and trigger next download.
-                // now, it must wait backfilling to download the correct block.
-                // the verified header can drop the peer later, it cannot transfer a bad header now.
-                // if let Some(block_hash) = outcome.block.hash {
-                //     this.queued_blocks.remove(&block_hash);
+                // TODO: add queued blocks removal later, to avoid milicious block import, and
+                // trigger next download. now, it must wait backfilling to download
+                // the correct block. the verified header can drop the peer later,
+                // it cannot transfer a bad header now. if let Some(block_hash) =
+                // outcome.block.hash {     this.queued_blocks.remove(&block_hash);
                 // }
 
                 if let Err(e) = this.to_network.send(BlockImportEvent::Outcome(outcome)) {
@@ -1293,10 +1286,17 @@ mod tests {
         let (_, from_hashes) = mpsc::unbounded_channel();
         let (to_network, mut events) = mpsc::unbounded_channel();
         let mut service = ImportService::new(
-            MockProvider::new(), spec, ConsensusEngineHandle::new(to_engine),
-            from_network, from_builder, from_bid, from_hashes, to_network,
+            MockProvider::new(),
+            spec,
+            ConsensusEngineHandle::new(to_engine),
+            from_network,
+            from_builder,
+            from_bid,
+            from_hashes,
+            to_network,
         );
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let now =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         let block = blob_block(now);
         let hash = block.header.hash_slow();
         let good = NewBlockMessage {
@@ -1430,7 +1430,11 @@ mod tests {
         let block = BscBlock {
             header: Header { number, ..Default::default() },
             body: BscBlockBody {
-                inner: BlockBody { transactions: Vec::new(), ommers: Vec::new(), withdrawals: None },
+                inner: BlockBody {
+                    transactions: Vec::new(),
+                    ommers: Vec::new(),
+                    withdrawals: None,
+                },
                 sidecars: None,
             },
         };
@@ -1659,7 +1663,10 @@ mod tests {
             let _ = fixture.handle.poll_outcome(&mut cx);
             tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
         }
-        assert!(pm.is_allowed(builder), "builder must not be revoked for a sufficient average gas price");
+        assert!(
+            pm.is_allowed(builder),
+            "builder must not be revoked for a sufficient average gas price"
+        );
     }
 
     #[derive(Clone)]
@@ -2232,12 +2239,10 @@ mod tests {
         let expected_head = block.hash;
         handle.send_block(block, PeerId::random()).unwrap();
 
-        let state = recv_fcu_within(&mut fcu_rx, tokio::time::Duration::from_secs(5))
-            .await
-            .expect(
-                "a forkchoice update must be emitted even when the incoming TD is unresolvable; \
+        let state = recv_fcu_within(&mut fcu_rx, tokio::time::Duration::from_secs(5)).await.expect(
+            "a forkchoice update must be emitted even when the incoming TD is unresolvable; \
                  without one the canonical head can never advance and the node is wedged",
-            );
+        );
         assert_eq!(
             state.head_block_hash, expected_head,
             "the forkchoice update must target the incoming block, not the stale local tip"
@@ -2344,7 +2349,8 @@ mod tests {
 
     #[test]
     fn planner_announces_when_peer_best_number_unknown() {
-        // best_number is None before any head info has been observed; announce is the right default.
+        // best_number is None before any head info has been observed; announce is the right
+        // default.
         let peers = vec![peer(1, None)];
         let result = plan_head_announcements(100, &peers);
         assert_eq!(result.len(), 1);

@@ -8,8 +8,10 @@ use crate::{
     },
     BscPrimitives,
 };
-use alloy_evm::block::{BlockExecutor, GasOutput};
-use alloy_evm::eth::receipt_builder::ReceiptBuilder;
+use alloy_evm::{
+    block::{BlockExecutor, GasOutput},
+    eth::receipt_builder::ReceiptBuilder,
+};
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
 use reth_evm::execute::{BlockBuilder, BlockBuilderOutcome, BlockExecutionError, ExecutorTx};
 use reth_primitives_traits::{
@@ -122,7 +124,9 @@ where
     fn execute_transaction_with_commit_condition(
         &mut self,
         tx: impl ExecutorTx<Self::Executor>,
-        f: impl FnOnce(&<Self::Executor as alloy_evm::block::BlockExecutor>::Result) -> alloy_evm::block::CommitChanges,
+        f: impl FnOnce(
+            &<Self::Executor as alloy_evm::block::BlockExecutor>::Result,
+        ) -> alloy_evm::block::CommitChanges,
     ) -> Result<Option<GasOutput>, BlockExecutionError> {
         let (tx_env, recovered) = tx.into_parts();
         if let Some(gas_output) =
@@ -303,8 +307,10 @@ where
             // When the sparse-trie spawner is disabled (v2.4.1 migration), synchronous is the
             // only path — aborting would stop all block production — so we skip the abort and
             // always complete the walk.
-            if let Some(deadline_ms) =
-                self.ctx.state_root_deadline_ms.filter(|_| crate::shared::is_sparse_trie_state_root_enabled())
+            if let Some(deadline_ms) = self
+                .ctx
+                .state_root_deadline_ms
+                .filter(|_| crate::shared::is_sparse_trie_state_root_enabled())
             {
                 let now_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -325,7 +331,9 @@ where
                     )));
                 }
             }
-            state.state_root_with_updates(hashed_state.clone()).map_err(BlockExecutionError::other)?
+            state
+                .state_root_with_updates(hashed_state.clone())
+                .map_err(BlockExecutionError::other)?
         };
         let state_root_duration = state_root_start.elapsed();
 

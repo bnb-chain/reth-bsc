@@ -1,10 +1,10 @@
 use super::{
-    assembler::BscBlockAssembler, builder::BscBlockBuilder,
+    assembler::BscBlockAssembler,
+    builder::BscBlockBuilder,
     executor::{BscBlockExecutor, BscTxResult},
     factory::BscEvmFactory,
 };
 use crate::{
-    BscPrimitives,
     chainspec::BscChainSpec,
     consensus::{
         eip4844::next_block_excess_blob_gas_with_mendel,
@@ -14,12 +14,14 @@ use crate::{
     hardforks::{bsc::BscHardfork, BscHardforks},
     node::engine_api::validator::BscExecutionData,
     system_contracts::{feynman_fork::ValidatorElectionInfo, SystemContract},
+    BscPrimitives,
 };
 use alloy_consensus::{transaction::SignerRecoverable, BlockHeader, Header, TxReceipt};
 use alloy_eips::eip7840::BlobParams;
 use alloy_primitives::{Address, BlockHash, Log, U256};
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
 use reth_ethereum_forks::EthereumHardfork;
+use reth_ethereum_primitives::TransactionSigned;
 use reth_evm::{
     block::{BlockExecutorFactory, BlockExecutorFor},
     eth::{receipt_builder::ReceiptBuilder, EthBlockExecutionCtx},
@@ -29,9 +31,9 @@ use reth_evm::{
     IntoTxEnv, NextBlockEnvAttributes,
 };
 use reth_evm_ethereum::RethReceiptBuilder;
-use reth_primitives_traits::{BlockTy, HeaderTy, SealedBlock, SealedHeader};
-use reth_ethereum_primitives::TransactionSigned;
-use reth_primitives_traits::constants::MAX_TX_GAS_LIMIT_OSAKA;
+use reth_primitives_traits::{
+    constants::MAX_TX_GAS_LIMIT_OSAKA, BlockTy, HeaderTy, SealedBlock, SealedHeader,
+};
 use reth_revm::State;
 use reth_rpc_eth_api::helpers::pending_block::BuildPendingEnv;
 use revm::{
@@ -40,7 +42,13 @@ use revm::{
     primitives::hardfork::SpecId,
     Inspector,
 };
-use std::{borrow::Cow, cell::RefCell, convert::Infallible, rc::Rc, sync::{Arc, Mutex}};
+use std::{
+    borrow::Cow,
+    cell::RefCell,
+    convert::Infallible,
+    rc::Rc,
+    sync::{Arc, Mutex},
+};
 
 /// Shared sink type for transporting `(current_validators, vote_addresses)` from the builder to
 /// the payload/bid layer so that VALIDATOR_CACHE can be written after the definitive block hash
@@ -101,9 +109,7 @@ pub struct BscNextBlockEnvAttributes {
     /// that has the `state_hook` installed; the hook is dropped naturally when the
     /// executor is consumed by `finish()`, which sends `FinishedStateUpdates` to the
     /// background task. Only after that drop is it safe to await `state_root()`.
-    pub trie_handle: Option<
-        Arc<Mutex<Option<reth_engine_tree::tree::StateRootHandle>>>,
-    >,
+    pub trie_handle: Option<Arc<Mutex<Option<reth_engine_tree::tree::StateRootHandle>>>>,
     /// Absolute wall-clock deadline (epoch ms) for bounding the sparse-trie
     /// `state_root()` wait in `finish`. Past it the builder stops waiting and falls
     /// back to synchronous `state_root_with_updates`, so an in-turn block never
@@ -142,7 +148,8 @@ impl<H: BlockHeader> BuildPendingEnv<H> for BscNextBlockEnvAttributes {
 }
 
 /// Type alias for system transactions to reduce complexity
-type SystemTxs = Vec<reth_primitives_traits::Recovered<reth_primitives_traits::TxTy<crate::BscPrimitives>>>;
+type SystemTxs =
+    Vec<reth_primitives_traits::Recovered<reth_primitives_traits::TxTy<crate::BscPrimitives>>>;
 
 #[derive(Debug, Clone, Default)]
 pub struct BscExecutionSharedCtxInner {
@@ -165,9 +172,7 @@ pub struct BscExecutionSharedCtx {
 
 impl Default for BscExecutionSharedCtx {
     fn default() -> Self {
-        Self {
-            inner: Rc::new(RefCell::new(BscExecutionSharedCtxInner::default())),
-        }
+        Self { inner: Rc::new(RefCell::new(BscExecutionSharedCtxInner::default())) }
     }
 }
 
@@ -206,9 +211,7 @@ pub struct BscBlockExecutionCtx<'a> {
     ///
     /// `Arc<Mutex<Option<_>>>` because `StateRootHandle` is `!Clone` (single-use
     /// receiver) and `BscBlockExecutionCtx` derives `Clone`.
-    pub trie_handle: Option<
-        Arc<Mutex<Option<reth_engine_tree::tree::StateRootHandle>>>,
-    >,
+    pub trie_handle: Option<Arc<Mutex<Option<reth_engine_tree::tree::StateRootHandle>>>>,
     /// See [`BscNextBlockEnvAttributes::state_root_deadline_ms`]. Bounds the
     /// sparse-trie `state_root()` wait in `finish`.
     pub state_root_deadline_ms: Option<u64>,
@@ -294,17 +297,15 @@ impl BscEvmConfig {
         }
 
         if old_spec < SpecId::CANCUN && new_spec >= SpecId::CANCUN {
-            let params = self.chain_spec()
+            let params = self
+                .chain_spec()
                 .blob_params_at_timestamp(timestamp)
                 .unwrap_or_else(BlobParams::cancun);
             // Same initial excess as next_evm_env on entry into Cancun. Preserve
             // any explicit blobBaseFee (including zero) already installed by
             // BlockOverridesExt, as well as an existing header-derived price.
             evm_env.block_env.inner.blob_excess_gas_and_price.get_or_insert_with(|| {
-                BlobExcessGasAndPrice {
-                    excess_blob_gas: 0,
-                    blob_gasprice: params.calc_blob_fee(0),
-                }
+                BlobExcessGasAndPrice { excess_blob_gas: 0, blob_gasprice: params.calc_blob_fee(0) }
             });
             if evm_env.cfg_env.max_blobs_per_tx.is_none() {
                 evm_env.cfg_env.set_max_blobs_per_tx(params.max_blobs_per_tx);
@@ -370,8 +371,11 @@ where
     type ExecutionCtx<'a> = BscBlockExecutionCtx<'a>;
     type Transaction = TransactionSigned;
     type Receipt = R::Receipt;
-    type Executor<'a, DB: alloy_evm::block::StateDB, I: Inspector<<Self::EvmFactory as EvmFactory>::Context<DB>>> =
-        BscBlockExecutor<'a, <EvmF as EvmFactory>::Evm<DB, I>, Spec, R>;
+    type Executor<
+        'a,
+        DB: alloy_evm::block::StateDB,
+        I: Inspector<<Self::EvmFactory as EvmFactory>::Context<DB>>,
+    > = BscBlockExecutor<'a, <EvmF as EvmFactory>::Evm<DB, I>, Spec, R>;
 
     fn evm_factory(&self) -> &Self::EvmFactory {
         &self.evm_factory
@@ -528,7 +532,11 @@ where
             BlobExcessGasAndPrice { excess_blob_gas, blob_gasprice }
         });
 
-        if BscHardforks::is_osaka_active_at_timestamp(self.chain_spec(), parent.number + 1, attributes.timestamp) {
+        if BscHardforks::is_osaka_active_at_timestamp(
+            self.chain_spec(),
+            parent.number + 1,
+            attributes.timestamp,
+        ) {
             cfg_env.tx_gas_limit_cap = Some(MAX_TX_GAS_LIMIT_OSAKA);
         }
 
@@ -662,13 +670,7 @@ where
             SystemContract::new(self.executor_factory.spec().clone()),
         );
 
-        BscBlockBuilder::new(
-            bsc_executor,
-            ctx,
-            shared_ctx,
-            &self.block_assembler,
-            parent,
-        )
+        BscBlockBuilder::new(bsc_executor, ctx, shared_ctx, &self.block_assembler, parent)
     }
 }
 
@@ -694,7 +696,12 @@ where
                 parent_hash: block.header.parent_hash(),
                 parent_beacon_block_root: block.header.parent_beacon_block_root,
                 ommers: &block.body.inner.ommers,
-                withdrawals: block.body.inner.withdrawals.as_ref().map(|w| Cow::Borrowed(w.as_slice())),
+                withdrawals: block
+                    .body
+                    .inner
+                    .withdrawals
+                    .as_ref()
+                    .map(|w| Cow::Borrowed(w.as_slice())),
                 extra_data: block.header.extra_data.clone(),
                 slot_number: None,
             },
@@ -817,8 +824,7 @@ mod tests {
     /// `NewEVMBlockContext` (the only fill point on the header-derived paths).
     #[test]
     fn evm_env_fills_millisecond_remainder_from_header() {
-        let chain_spec =
-            crate::chainspec::BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet());
+        let chain_spec = crate::chainspec::BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet());
         let evm_config = BscEvmConfig::bsc(std::sync::Arc::new(chain_spec));
 
         // Post-Lorentz header: seconds in `timestamp`, remainder in the mix_hash tail.
@@ -864,8 +870,7 @@ mod tests {
     /// the miner threads its planned millisecond timestamp through the attributes (R4).
     #[test]
     fn next_evm_env_defaults_to_zero_remainder() {
-        let chain_spec =
-            crate::chainspec::BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet());
+        let chain_spec = crate::chainspec::BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet());
         let evm_config = BscEvmConfig::bsc(std::sync::Arc::new(chain_spec));
 
         let parent = SealedHeader::seal_slow(Header {
@@ -874,8 +879,9 @@ mod tests {
             gas_limit: 30_000_000,
             ..Default::default()
         });
-        let attrs =
-            <BscNextBlockEnvAttributes as BuildPendingEnv<Header>>::build_pending_env(&parent, None);
+        let attrs = <BscNextBlockEnvAttributes as BuildPendingEnv<Header>>::build_pending_env(
+            &parent, None,
+        );
         let env = evm_config.next_evm_env(&parent, &attrs).unwrap();
         assert_eq!(env.block_env.milli_remainder, 0);
         assert_eq!(
@@ -890,8 +896,7 @@ mod tests {
     /// is written into its `mix_hash` (the two millisecond sources must agree).
     #[test]
     fn next_evm_env_carries_the_miner_millisecond_remainder() {
-        let chain_spec =
-            crate::chainspec::BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet());
+        let chain_spec = crate::chainspec::BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet());
         let evm_config = BscEvmConfig::bsc(std::sync::Arc::new(chain_spec));
 
         let parent = SealedHeader::seal_slow(Header {
@@ -902,8 +907,9 @@ mod tests {
         });
         // The planned millisecond timestamp a miner would compute for the next slot.
         let block_timestamp_ms: u64 = 1_780_000_000_750;
-        let mut attrs =
-            <BscNextBlockEnvAttributes as BuildPendingEnv<Header>>::build_pending_env(&parent, None);
+        let mut attrs = <BscNextBlockEnvAttributes as BuildPendingEnv<Header>>::build_pending_env(
+            &parent, None,
+        );
         attrs.inner.timestamp = block_timestamp_ms / 1000;
         attrs.milli_remainder = block_timestamp_ms % 1000;
 
@@ -956,7 +962,9 @@ mod tests {
 
         // The RPC pending-block / `eth_simulateV1` entry point.
         let pending_attrs =
-            <BscNextBlockEnvAttributes as BuildPendingEnv<Header>>::build_pending_env(&parent, None);
+            <BscNextBlockEnvAttributes as BuildPendingEnv<Header>>::build_pending_env(
+                &parent, None,
+            );
         let ctx = evm_config.context_for_next_block(&parent, pending_attrs).unwrap();
         assert_eq!(
             ctx.mode,
@@ -966,13 +974,11 @@ mod tests {
 
         // The miner passes its attributes through the same hook and must keep finalizing.
         let mut mining_attrs =
-            <BscNextBlockEnvAttributes as BuildPendingEnv<Header>>::build_pending_env(&parent, None);
+            <BscNextBlockEnvAttributes as BuildPendingEnv<Header>>::build_pending_env(
+                &parent, None,
+            );
         mining_attrs.mode = BscExecutionMode::Mining;
         let ctx = evm_config.context_for_next_block(&parent, mining_attrs).unwrap();
-        assert_eq!(
-            ctx.mode,
-            BscExecutionMode::Mining,
-            "mining must still run Parlia finalization"
-        );
+        assert_eq!(ctx.mode, BscExecutionMode::Mining, "mining must still run Parlia finalization");
     }
 }

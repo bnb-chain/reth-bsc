@@ -20,9 +20,7 @@ pub trait Suite: Sized {
 
     /// Run only tests matching the given filter.
     fn run_only(&self, filter: &str) {
-        self.run_with_filter(|path| {
-            path.to_string_lossy().contains(filter)
-        })
+        self.run_with_filter(|path| path.to_string_lossy().contains(filter))
     }
 
     /// Run tests with a custom filter.

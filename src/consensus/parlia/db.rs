@@ -1,5 +1,5 @@
-use reth_db::table::Table;
 use alloy_primitives::BlockHash;
+use reth_db::table::Table;
 
 /// Table: epoch boundary block number (u64) -> compressed snapshot bytes.
 #[derive(Debug)]
@@ -11,7 +11,7 @@ impl Table for ParliaSnapshots {
     type Key = u64;
     /// Raw compressed bytes produced by `Snapshot::compress()`.
     type Value = reth_db::models::ParliaSnapshotBlob;
-} 
+}
 
 /// Table: epoch boundary block hash (BlockHash) -> compressed snapshot bytes.
 #[derive(Debug)]
@@ -23,4 +23,4 @@ impl Table for ParliaSnapshotsByHash {
     type Key = BlockHash;
     /// Raw compressed bytes produced by `Snapshot::compress()`.
     type Value = reth_db::models::ParliaSnapshotBlob;
-} 
+}

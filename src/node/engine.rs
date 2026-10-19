@@ -1,31 +1,26 @@
 use crate::{
+    consensus::parlia::VoteAddress,
     node::{
         engine_api::payload::BscPayloadTypes,
         miner::{BscMiner, MiningConfig},
         BscNode,
     },
-    BscPrimitives,
+    BscBlock, BscPrimitives,
 };
-use crate::BscBlock;
-use crate::consensus::parlia::VoteAddress;
-use alloy_primitives::Address;
 use alloy_eips::eip7685::Requests;
-use alloy_primitives::U256;
-use reth::transaction_pool::PoolTransaction;
+use alloy_primitives::{Address, U256};
 use reth::{
     api::FullNodeTypes,
     builder::{components::PayloadServiceBuilder, BuilderContext},
     payload::{PayloadBuilderHandle, PayloadServiceCommand},
-    transaction_pool::TransactionPool,
+    transaction_pool::{PoolTransaction, TransactionPool},
 };
-use reth_payload_primitives::BuiltPayloadExecutedBlock;
+use reth_ethereum_primitives::TransactionSigned;
 use reth_evm::ConfigureEvm;
 use reth_payload_builder_primitives::Events;
-use reth_payload_primitives::BuiltPayload;
+use reth_payload_primitives::{BuiltPayload, BuiltPayloadExecutedBlock};
 use reth_primitives_traits::SealedBlock;
-use reth_ethereum_primitives::TransactionSigned;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info};
 
@@ -113,8 +108,7 @@ where
         // value disables persistence entirely. Registered here, during component build, so it is
         // in place before any consumer lazily initializes the global manager.
         use reth_chainspec::EthChainSpec as _;
-        let datadir =
-            ctx.config().datadir.clone().resolve_datadir(ctx.chain_spec().chain());
+        let datadir = ctx.config().datadir.clone().resolve_datadir(ctx.chain_spec().chain());
         let revokes_journal = match std::env::var("BSC_BID_BLOCK_REVOKES_JOURNAL") {
             Ok(path) if path.is_empty() => None, // explicit opt-out: purely in-memory
             Ok(path) => {
@@ -182,8 +176,8 @@ where
             // dedicated fallback reused for the rest of the run.
             let runtime_cell: std::sync::OnceLock<reth_tasks::Runtime> = std::sync::OnceLock::new();
 
-            let spawn_fn: crate::shared::SparseTrieSpawnFn = std::sync::Arc::new(
-                move |parent: SealedHeader<Header>| {
+            let spawn_fn: crate::shared::SparseTrieSpawnFn =
+                std::sync::Arc::new(move |parent: SealedHeader<Header>| {
                     let parent_hash = parent.hash();
                     // Per-spawn overlay manager fed with the in-memory canonical chain, so the
                     // proof workers can resolve a parent that hasn't been persisted yet (the
@@ -228,9 +222,10 @@ where
                                 "engine Runtime not yet published on first sparse-trie spawn; \
                                  building a dedicated Runtime (proof pools NOT shared this run)"
                             );
-                            RuntimeBuilder::new(RuntimeConfig::default().with_tokio(
-                                TokioConfig::existing_handle(tokio_handle.clone()),
-                            ))
+                            RuntimeBuilder::new(
+                                RuntimeConfig::default()
+                                    .with_tokio(TokioConfig::existing_handle(tokio_handle.clone())),
+                            )
                             .build()
                             .expect("failed to build fallback sparse-trie Runtime")
                         })
@@ -249,13 +244,14 @@ where
                     metrics::histogram!("bsc_miner_sparse_trie_spawn_duration_seconds")
                         .record(spawn_start.elapsed().as_secs_f64());
                     Some(handle)
-                },
-            );
+                });
 
             if crate::shared::set_sparse_trie_spawn_fn(spawn_fn).is_err() {
                 tracing::warn!("Sparse-trie spawner already registered, keeping existing one");
             } else {
-                info!("Sparse-trie state-root spawner registered (use_sparse_trie_state_root=true)");
+                info!(
+                    "Sparse-trie state-root spawner registered (use_sparse_trie_state_root=true)"
+                );
             }
         }
 
@@ -312,7 +308,8 @@ where
         let (events_tx, _events_rx) = broadcast::channel::<Events<BscPayloadTypes>>(100);
         let _ = crate::shared::set_payload_events_tx(events_tx.clone());
 
-        // Handle payload service commands (keep minimal compatibility but with shared events channel)
+        // Handle payload service commands (keep minimal compatibility but with shared events
+        // channel)
         ctx.task_executor().spawn_critical_task("payload-service-handler", async move {
             while let Some(message) = rx.recv().await {
                 match message {

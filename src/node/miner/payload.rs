@@ -1,52 +1,67 @@
-use crate::chainspec::BscChainSpec;
-use crate::consensus::eip4844::{calc_blob_fee, is_blob_eligible_block, BLOB_TX_BLOB_GAS_PER_BLOB};
-use crate::consensus::parlia::util::calculate_millisecond_timestamp;
-use crate::consensus::parlia::{Parlia, Snapshot};
-use crate::evm::blacklist::{self, BlacklistedAddressError};
-use crate::hardforks::BscHardforks;
-use crate::metrics::{BscConsensusMetrics, BscMinerMetrics};
-use crate::node::engine::{BscBuiltPayload, BuildKind};
-use crate::node::evm::config::{
-    BscEvmConfig, BscExecutionMode, BscNextBlockEnvAttributes, ValidatorCacheSink,
+use crate::{
+    chainspec::BscChainSpec,
+    consensus::{
+        eip4844::{calc_blob_fee, is_blob_eligible_block, BLOB_TX_BLOB_GAS_PER_BLOB},
+        parlia::{util::calculate_millisecond_timestamp, Parlia, Snapshot},
+    },
+    evm::blacklist::{self, BlacklistedAddressError},
+    hardforks::BscHardforks,
+    metrics::{BscConsensusMetrics, BscMinerMetrics},
+    node::{
+        engine::{BscBuiltPayload, BuildKind},
+        evm::{
+            config::{
+                BscEvmConfig, BscExecutionMode, BscNextBlockEnvAttributes, ValidatorCacheSink,
+            },
+            pre_execution::{EpochValidators, TURN_LENGTH_CACHE, VALIDATOR_CACHE},
+        },
+        miner::{
+            bid_block::{validate_bid_block_blob_kzg, BidBlockTask},
+            bid_simulator::BidSimulator,
+            block_mev_info::{set_block_mev_info, BlockMevInfoVersion},
+            bsc_miner::{MiningContext, SubmitContext},
+            util::{epoch_validators_for_next_block, finalize_new_header},
+        },
+        primitives::{BscBlobTransactionSidecar, BscBlock},
+    },
 };
-use crate::node::evm::pre_execution::{EpochValidators, TURN_LENGTH_CACHE, VALIDATOR_CACHE};
-use crate::node::miner::bid_block::{validate_bid_block_blob_kzg, BidBlockTask};
-use crate::node::miner::bid_simulator::BidSimulator;
-use crate::node::miner::block_mev_info::{set_block_mev_info, BlockMevInfoVersion};
-use crate::node::miner::bsc_miner::{MiningContext, SubmitContext};
-use crate::node::miner::util::{epoch_validators_for_next_block, finalize_new_header};
-use crate::node::primitives::{BscBlobTransactionSidecar, BscBlock};
 use alloy_consensus::{BlockHeader, Transaction};
 use alloy_eips::eip4895::Withdrawals;
 use alloy_evm::Evm;
 use alloy_primitives::U256;
-use reth_node_ethereum::engine::EthPayloadAttributes;
-use reth::transaction_pool::error::Eip4844PoolTransactionError;
-use reth::transaction_pool::error::InvalidPoolTransactionError;
-use reth::transaction_pool::BestTransactionsAttributes;
-use reth::transaction_pool::{PoolTransaction, TransactionPool};
+use once_cell::sync::Lazy;
+use reth::transaction_pool::{
+    error::{Eip4844PoolTransactionError, InvalidPoolTransactionError},
+    BestTransactionsAttributes, PoolTransaction, TransactionPool,
+};
 use reth_basic_payload_builder::PayloadConfig;
 use reth_chainspec::EthChainSpec;
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
 use reth_ethereum_primitives::TransactionSigned;
-use reth_evm::block::{BlockExecutionError, BlockValidationError};
-use reth_evm::execute::BlockBuilder;
-use reth_evm::execute::BlockBuilderOutcome;
-use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
+use reth_evm::{
+    block::{BlockExecutionError, BlockValidationError},
+    execute::{BlockBuilder, BlockBuilderOutcome},
+    ConfigureEvm, NextBlockEnvAttributes,
+};
 use reth_execution_types::BlockExecutionOutput;
+use reth_node_ethereum::engine::EthPayloadAttributes;
 use reth_payload_primitives::{BuiltPayload, BuiltPayloadExecutedBlock, PayloadBuilderError};
-use once_cell::sync::Lazy;
-use revm::context_interface::Block as EvmBlock;
-use reth_primitives_traits::{HeaderTy, SealedHeader};
-use reth_primitives_traits::transaction::error::InvalidTransactionError;
-use reth_primitives_traits::{Block, BlockBody, RecoveredBlock, SealedBlock, SignerRecoverable};
+use reth_primitives_traits::{
+    transaction::error::InvalidTransactionError, Block, BlockBody, HeaderTy, RecoveredBlock,
+    SealedBlock, SealedHeader, SignerRecoverable,
+};
 use reth_provider::StateProviderFactory;
-use reth_revm::cached::CachedReads;
-use reth_revm::cancelled::ManualCancel;
-use reth_revm::{database::StateProviderDatabase, db::State};
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use reth_revm::{
+    cached::CachedReads, cancelled::ManualCancel, database::StateProviderDatabase, db::State,
+};
+use revm::context_interface::Block as EvmBlock;
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
+};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, trace, warn};
 
@@ -77,9 +92,9 @@ pub const DELAY_LEFT_OVER: u64 = 120;
 ///   DEPTH_LOW, i.e. the floor for normal-depth blocks. Lower it to hand the extra milliseconds
 ///   back to transaction filling: measured `trie_root_duration_ms` on the 3-validator benchmark
 ///   cluster was p50 8ms / p99 28ms / max 46ms, so the 120ms default is ~2.6x the worst observed
-///   case there and 80% of blocks under load ended pinned at the build deadline. Clamped to
-///   `[10, reserve_max_ms]`. Raising throughput this way trades against empty-block rate — A/B it
-///   and watch `bsc_miner_effective_reserve_ms` alongside the empty/diff-1 rates.
+///   case there and 80% of blocks under load ended pinned at the build deadline. Clamped to `[10,
+///   reserve_max_ms]`. Raising throughput this way trades against empty-block rate — A/B it and
+///   watch `bsc_miner_effective_reserve_ms` alongside the empty/diff-1 rates.
 #[derive(Debug, Clone, Copy)]
 struct AdaptiveReserveConfig {
     enabled: bool,
@@ -139,8 +154,8 @@ fn reserve_for_depth(cfg: &AdaptiveReserveConfig, overlay_depth: u64) -> u64 {
     } else {
         let span = (cfg.depth_high - cfg.depth_low) as f64;
         let t = (overlay_depth - cfg.depth_low) as f64 / span;
-        cfg.reserve_min_ms
-            + (t * cfg.reserve_max_ms.saturating_sub(cfg.reserve_min_ms) as f64) as u64
+        cfg.reserve_min_ms +
+            (t * cfg.reserve_max_ms.saturating_sub(cfg.reserve_min_ms) as f64) as u64
     }
 }
 
@@ -248,8 +263,8 @@ fn estimated_uplift_meets_threshold(
     comparison_base: U256,
     threshold_bps: u64,
 ) -> bool {
-    estimated_new_fees.saturating_mul(U256::from(10_000_u64))
-        >= comparison_base.saturating_mul(U256::from(threshold_bps))
+    estimated_new_fees.saturating_mul(U256::from(10_000_u64)) >=
+        comparison_base.saturating_mul(U256::from(threshold_bps))
 }
 
 fn estimated_uplift_bps(current_payload_fees: U256, estimated_new_fees: U256) -> u64 {
@@ -282,10 +297,10 @@ fn local_rebuild_action(input: LocalRebuildPolicyInput) -> LocalRebuildAction {
     let final_shot_max_remaining =
         duration_mul_ratio(input.last_build_duration, FINAL_SHOT_WINDOW_NUM, FINAL_SHOT_WINDOW_DEN);
 
-    if !input.final_shot_used
-        && input.remaining_duration >= final_shot_min_remaining
-        && input.remaining_duration <= final_shot_max_remaining
-        && estimated_uplift_meets_threshold(
+    if !input.final_shot_used &&
+        input.remaining_duration >= final_shot_min_remaining &&
+        input.remaining_duration <= final_shot_max_remaining &&
+        estimated_uplift_meets_threshold(
             input.estimated_new_fees,
             comparison_base,
             FINAL_SHOT_UPLIFT_BPS,
@@ -490,7 +505,8 @@ where
             state_root_deadline_ms,
             milli_remainder,
         } = args;
-        let PayloadConfig { parent_header, attributes, payload_id: _, parent_block_info: _ } = config;
+        let PayloadConfig { parent_header, attributes, payload_id: _, parent_block_info: _ } =
+            config;
 
         let parent_hash = parent_header.hash_slow();
 
@@ -532,8 +548,8 @@ where
         // the empty build, which has no trie_handle so it jumps straight to the take()) steals the
         // root this attempt deposited, forcing this attempt onto the slow synchronous
         // `state_root_with_updates`. A per-attempt sink makes write→read strictly intra-attempt, so
-        // the full build reads back its OWN precomputed root. When the sparse-trie path is not active
-        // (flag off), this Mutex stays `None` and the builder falls through to
+        // the full build reads back its OWN precomputed root. When the sparse-trie path is not
+        // active (flag off), this Mutex stays `None` and the builder falls through to
         // `state_root_with_updates`.
         let state_root_precomputed_sink: Arc<
             Mutex<Option<(alloy_primitives::B256, reth_trie_common::updates::TrieUpdates)>>,
@@ -580,10 +596,7 @@ where
         // wait. When no spawner is registered, `trie_handle` is empty and this is a no-op
         // (synchronous fallback).
         if let Some(handle) = trie_handle.lock().unwrap().as_mut() {
-            builder
-                .evm_mut()
-                .db_mut()
-                .set_state_hook(Some(Box::new(handle.take_execution_hook())));
+            builder.evm_mut().db_mut().set_state_hook(Some(Box::new(handle.take_execution_hook())));
             debug!(
                 target: "payload_builder",
                 trace_id,
@@ -661,8 +674,8 @@ where
             }
 
             // filter out blacklisted transactions before executing.
-            if self.chain_spec.is_nano_active_at_block(parent_header.number + 1)
-                && blacklist::check_tx_basic_blacklist(pool_tx.sender(), pool_tx.to())
+            if self.chain_spec.is_nano_active_at_block(parent_header.number + 1) &&
+                blacklist::check_tx_basic_blacklist(pool_tx.sender(), pool_tx.to())
             {
                 debug!(
                     target: "payload_builder",
@@ -777,7 +790,9 @@ where
                 }
 
                 let blob_sidecar_result = 'sidecar: {
-                    let Some(sidecar) = self.pool.get_blob(*tx.hash())
+                    let Some(sidecar) = self
+                        .pool
+                        .get_blob(*tx.hash())
                         .inspect_err(|error| {
                             warn!(
                                 target: "payload_builder",
@@ -949,8 +964,13 @@ where
         // per-attempt sink (see `state_root_precomputed_sink` above). Kept bound to avoid an
         // unused-variable warning until the field is removed from BscBuildArguments.
         let _ = &state_root_precomputed;
-        let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block, block_access_list: _ } =
-            builder.finish(&state_provider, None)?;
+        let BlockBuilderOutcome {
+            execution_result,
+            hashed_state,
+            trie_updates,
+            block,
+            block_access_list: _,
+        } = builder.finish(&state_provider, None)?;
 
         let mut sealed_block = Arc::new(block.sealed_block().clone());
 
@@ -1077,7 +1097,8 @@ where
             state_root_deadline_ms: _,
             milli_remainder,
         } = args;
-        let PayloadConfig { parent_header, attributes, payload_id: _, parent_block_info: _ } = config;
+        let PayloadConfig { parent_header, attributes, payload_id: _, parent_block_info: _ } =
+            config;
 
         let parent_hash = parent_header.hash_slow();
         let _ = parent_hash;
@@ -1135,7 +1156,8 @@ where
 
         // Total time spent executing pre-execution changes (no user txs for empty payloads).
         let exec_start = std::time::Instant::now();
-        // Everything before `exec_start` is treated as "prepare" time for this empty payload attempt.
+        // Everything before `exec_start` is treated as "prepare" time for this empty payload
+        // attempt.
         let prepare_duration = exec_start.duration_since(build_start);
         builder.apply_pre_execution_changes().map_err(|err| {
             warn!(
@@ -1161,8 +1183,13 @@ where
         // legacy `state_root_with_updates` cost is acceptable. The handle (if any)
         // stays in `trie_handle` and is dropped when the spawned task ends.
         let _ = (&state_root_precomputed, &trie_handle);
-        let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block, block_access_list: _ } =
-            builder.finish(&state_provider, None)?;
+        let BlockBuilderOutcome {
+            execution_result,
+            hashed_state,
+            trie_updates,
+            block,
+            block_access_list: _,
+        } = builder.finish(&state_provider, None)?;
         let finalize_elapsed = finalize_start.elapsed();
 
         let sealed_block = Arc::new(block.sealed_block().clone());
@@ -2138,8 +2165,8 @@ where
                         end_mining_timestamp_ms = self.mining_ctx.end_mining_timestamp_ms,
                         "No background payload candidate finished within wait slice"
                     );
-                    // Keep waiting in further slices until we hit the expected end timestamp (+grace)
-                    // or until all background tasks have completed.
+                    // Keep waiting in further slices until we hit the expected end timestamp
+                    // (+grace) or until all background tasks have completed.
                     continue;
                 }
                 WaitMore::Aborted => {
@@ -2322,12 +2349,13 @@ where
         )
     }
 
-    /// If a collected BidBlock candidate out-bids every local/legacy payload by fee, hand its sealed
-    /// block to the block-import service for broadcast-then-verify and return `true` (the local work
-    /// is then discarded, matching go-bsc's `commitWork` early-return after `enqueueBidBlockTask`).
+    /// If a collected BidBlock candidate out-bids every local/legacy payload by fee, hand its
+    /// sealed block to the block-import service for broadcast-then-verify and return `true`
+    /// (the local work is then discarded, matching go-bsc's `commitWork` early-return after
+    /// `enqueueBidBlockTask`).
     ///
-    /// Returns `false` when there is no candidate, it does not win, or the import sender is missing —
-    /// in which case the caller falls back to submitting the best local payload.
+    /// Returns `false` when there is no candidate, it does not win, or the import sender is missing
+    /// — in which case the caller falls back to submitting the best local payload.
     fn try_submit_winning_bid_block(&mut self) -> bool {
         let Some(bid) = self.bid_block_candidate.take() else { return false };
 
@@ -2407,15 +2435,18 @@ where
         }
 
         // Expensive blob KZG verification on the winning block, BEFORE broadcast (go-bsc
-        // `prepareBidBlockTask` → `validateBidBlockBlobTxs`). Cheap structural sidecar checks already
-        // ran at admission; under zero-simulate full re-execution is deferred to after broadcast, so
-        // this is the last gate that can stop a bad-blob block from being proposed. On failure revoke
-        // the builder and fall back to the local payload (go-bsc `bidBlockFallback`).
+        // `prepareBidBlockTask` → `validateBidBlockBlobTxs`). Cheap structural sidecar checks
+        // already ran at admission; under zero-simulate full re-execution is deferred to
+        // after broadcast, so this is the last gate that can stop a bad-blob block from
+        // being proposed. On failure revoke the builder and fall back to the local payload
+        // (go-bsc `bidBlockFallback`).
         let body = sealed.body();
         let blob_sidecars = body.sidecars.as_deref().unwrap_or(&[]);
-        if let Err(e) =
-            validate_bid_block_blob_kzg(&body.inner.transactions, blob_sidecars, bid.system_tx_start)
-        {
+        if let Err(e) = validate_bid_block_blob_kzg(
+            &body.inner.transactions,
+            blob_sidecars,
+            bid.system_tx_start,
+        ) {
             warn!(
                 target: "bsc::miner::payload",
                 trace_id = self.trace_id,
@@ -2897,10 +2928,8 @@ fn finalize_payload(
         }
     }
     payload.block = Arc::new(plain_block.seal_unchecked(final_hash));
-    payload.executed_block.recovered_block = Arc::new(RecoveredBlock::new_sealed(
-        payload.block.as_ref().clone(),
-        senders,
-    ));
+    payload.executed_block.recovered_block =
+        Arc::new(RecoveredBlock::new_sealed(payload.block.as_ref().clone(), senders));
 
     Ok(())
 }
@@ -2966,22 +2995,22 @@ mod tests {
         refresh_and_reseal_bid_block, send_bid_block_after_delay, validate_bsc_sidecar,
         LocalRebuildAction, LocalRebuildPolicyInput,
     };
-    use crate::chainspec::BscChainSpec;
-    use crate::consensus::parlia::Parlia;
-    use crate::consensus::parlia::Snapshot;
-    use crate::node::miner::bsc_miner::MiningContext;
-    use crate::node::primitives::BscBlock;
-    use alloy_consensus::BlobTransactionSidecar;
-    use alloy_consensus::Header;
-    use alloy_eips::eip4844::{Blob, Bytes48};
-    use alloy_eips::eip7594::{
-        BlobTransactionSidecarEip7594, BlobTransactionSidecarVariant, CELLS_PER_EXT_BLOB,
+    use crate::{
+        chainspec::BscChainSpec,
+        consensus::parlia::{Parlia, Snapshot},
+        node::{miner::bsc_miner::MiningContext, primitives::BscBlock},
+    };
+    use alloy_consensus::{BlobTransactionSidecar, Header};
+    use alloy_eips::{
+        eip4844::{Blob, Bytes48},
+        eip7594::{
+            BlobTransactionSidecarEip7594, BlobTransactionSidecarVariant, CELLS_PER_EXT_BLOB,
+        },
     };
     use alloy_primitives::{Address, B256, U256};
     use reth::transaction_pool::error::Eip4844PoolTransactionError;
     use reth_primitives_traits::{RecoveredBlock, SealedHeader};
-    use std::sync::Arc;
-    use std::time::Duration;
+    use std::{sync::Arc, time::Duration};
 
     /// A won BidBlock must not be released before its own header timestamp.
     ///
@@ -3040,8 +3069,8 @@ mod tests {
         assert_eq!(rx.try_recv().expect("BidBlock must be released once due"), 7);
     }
 
-    /// A block already past its timestamp — the common case, sealed at the end of its slot — must go
-    /// out without waiting.
+    /// A block already past its timestamp — the common case, sealed at the end of its slot — must
+    /// go out without waiting.
     #[tokio::test(start_paused = true)]
     async fn bid_block_send_is_immediate_when_already_due() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
@@ -3151,8 +3180,8 @@ mod tests {
                         rebuilds += 1;
                         return rebuilds;
                     }
-                    LocalRebuildAction::ReturnBestPayload
-                    | LocalRebuildAction::WaitForMoreValue => {
+                    LocalRebuildAction::ReturnBestPayload |
+                    LocalRebuildAction::WaitForMoreValue => {
                         break;
                     }
                     LocalRebuildAction::WaitForCooldown(wait_duration) => {
@@ -3402,7 +3431,10 @@ mod tests {
     fn luban_chain_spec() -> Arc<BscChainSpec> {
         Arc::new(BscChainSpec::from(
             reth_chainspec::ChainSpecBuilder::mainnet()
-                .with_fork(crate::hardforks::bsc::BscHardfork::Luban, reth_chainspec::ForkCondition::Block(0))
+                .with_fork(
+                    crate::hardforks::bsc::BscHardfork::Luban,
+                    reth_chainspec::ForkCondition::Block(0),
+                )
                 .build(),
         ))
     }
@@ -3415,7 +3447,12 @@ mod tests {
         let att = VoteAttestation {
             vote_address_set: 0xFF,
             agg_signature: Default::default(),
-            data: VoteData { source_number: 1, source_hash: B256::ZERO, target_number: 0, target_hash: B256::ZERO },
+            data: VoteData {
+                source_number: 1,
+                source_hash: B256::ZERO,
+                target_number: 0,
+                target_hash: B256::ZERO,
+            },
             extra: bytes::Bytes::new(),
         };
         let mut extra = vec![0u8; crate::consensus::parlia::EXTRA_VANITY_LEN];
@@ -3424,7 +3461,10 @@ mod tests {
         Header { number: 1, extra_data: alloy_primitives::Bytes::from(extra), ..Default::default() }
     }
 
-    fn bid_block_with_sidecar(header: Header, sidecar_block_hash: B256) -> RecoveredBlock<BscBlock> {
+    fn bid_block_with_sidecar(
+        header: Header,
+        sidecar_block_hash: B256,
+    ) -> RecoveredBlock<BscBlock> {
         let body = crate::node::primitives::BscBlockBody {
             inner: reth_ethereum_primitives::BlockBody {
                 transactions: Vec::new(),
@@ -3471,7 +3511,8 @@ mod tests {
         let senders = vec![Address::with_last_byte(2)];
 
         for with_sidecars in [true, false] {
-            let header = Header { number: 1, parent_hash: parent_header.hash(), ..Default::default() };
+            let header =
+                Header { number: 1, parent_hash: parent_header.hash(), ..Default::default() };
             let original_hash = header.hash_slow();
             let mut block = bid_block_with_sidecar(header, original_hash).clone_block();
             let transaction = if with_sidecars {
@@ -3546,7 +3587,8 @@ mod tests {
         ensure_bid_block_test_signer();
         let chain_spec = luban_chain_spec();
         let parlia = Arc::new(Parlia::new(chain_spec, 200));
-        let parent_snap = Snapshot::new(vec![Address::with_last_byte(1)], 0, B256::random(), 200, None);
+        let parent_snap =
+            Snapshot::new(vec![Address::with_last_byte(1)], 0, B256::random(), 200, None);
         let parent_header = Header { number: 0, parent_hash: B256::random(), ..Default::default() };
 
         let header = header_with_fake_attestation();
@@ -3584,9 +3626,11 @@ mod tests {
     fn refresh_and_reseal_is_a_noop_pre_luban() {
         ensure_bid_block_test_signer();
         // Mainnet spec without the Luban fork override: inactive at block 1.
-        let chain_spec = Arc::new(BscChainSpec::from(reth_chainspec::ChainSpecBuilder::mainnet().build()));
+        let chain_spec =
+            Arc::new(BscChainSpec::from(reth_chainspec::ChainSpecBuilder::mainnet().build()));
         let parlia = Arc::new(Parlia::new(chain_spec, 200));
-        let parent_snap = Snapshot::new(vec![Address::with_last_byte(1)], 0, B256::random(), 200, None);
+        let parent_snap =
+            Snapshot::new(vec![Address::with_last_byte(1)], 0, B256::random(), 200, None);
         let parent_header = Header { number: 0, parent_hash: B256::random(), ..Default::default() };
 
         let header = header_with_fake_attestation();

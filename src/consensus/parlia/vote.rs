@@ -1,5 +1,5 @@
-use alloy_primitives::{keccak256, BlockNumber, B256, FixedBytes};
-use alloy_rlp::{RlpDecodable, RlpEncodable, Decodable};
+use alloy_primitives::{keccak256, BlockNumber, FixedBytes, B256};
+use alloy_rlp::{Decodable, RlpDecodable, RlpEncodable};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
@@ -19,7 +19,9 @@ pub type VoteAddress = FixedBytes<48>;
 pub type VoteSignature = FixedBytes<96>;
 
 /// `VoteData` represents one voting range that validators cast votes for fast-finality.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, RlpEncodable, RlpDecodable, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Default, RlpEncodable, RlpDecodable, Serialize, Deserialize,
+)]
 pub struct VoteData {
     /// The source block number (latest justified checkpoint).
     pub source_number: BlockNumber,
@@ -33,7 +35,9 @@ pub struct VoteData {
 
 impl VoteData {
     /// Returns the Keccak-256 hash of the RLP-encoded `VoteData`.
-    pub fn hash(&self) -> B256 { keccak256(alloy_rlp::encode(self)) }
+    pub fn hash(&self) -> B256 {
+        keccak256(alloy_rlp::encode(self))
+    }
 }
 
 /// `VoteEnvelope` represents a single signed vote from one validator.
@@ -49,7 +53,9 @@ pub struct VoteEnvelope {
 
 impl VoteEnvelope {
     /// Returns the Keccak-256 hash of the RLP-encoded envelope.
-    pub fn hash(&self) -> B256 { keccak256(alloy_rlp::encode(self)) }
+    pub fn hash(&self) -> B256 {
+        keccak256(alloy_rlp::encode(self))
+    }
 }
 
 /// `VoteAttestation` is the aggregated vote of a super-majority of validators.

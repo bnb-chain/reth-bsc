@@ -30,9 +30,13 @@ impl BscHandshake {
             // This mirrors the BSC EVN behavior where validator/sentry nodes
             // avoid mempool flooding between EVN peers.
             let evn_enabled = crate::node::network::evn::is_evn_ready();
-            let disable_tx_broadcast_forbidden = crate::node::network::evn::get_global_evn_config().map(|cfg| cfg.disable_tx_broadcast_forbidden).unwrap_or(false);
+            let disable_tx_broadcast_forbidden = crate::node::network::evn::get_global_evn_config()
+                .map(|cfg| cfg.disable_tx_broadcast_forbidden)
+                .unwrap_or(false);
             let upgrade_msg = UpgradeStatus {
-                extension: UpgradeStatusExtension { disable_peer_tx_broadcast: evn_enabled && !disable_tx_broadcast_forbidden },
+                extension: UpgradeStatusExtension {
+                    disable_peer_tx_broadcast: evn_enabled && !disable_tx_broadcast_forbidden,
+                },
             };
             tracing::debug!(target: "bsc_handshake", "Sending upgrade status message, EVN enabled: {}, disable tx broadcast forbidden: {}", evn_enabled, disable_tx_broadcast_forbidden);
             unauth.start_send_unpin(upgrade_msg.into_rlpx())?;

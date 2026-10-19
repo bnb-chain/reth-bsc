@@ -2,15 +2,18 @@
 
 use alloy_primitives::Bytes;
 use revm::precompile::{
-    u64_to_address, PrecompileHalt, PrecompileOutput, PrecompileResult, Precompile, PrecompileId,
+    u64_to_address, Precompile, PrecompileHalt, PrecompileId, PrecompileOutput, PrecompileResult,
 };
 use secp256k1::{ecdsa, Message, PublicKey};
 use std::borrow::Cow;
 use tendermint::{account, public_key};
 
 /// Tendermint SECP256K1 signature recover precompile for BSC.
-pub(crate) const TM_SECP256K1_SIGNATURE_RECOVER: Precompile =
-    Precompile::new(PrecompileId::Custom(Cow::Borrowed("SECP256K1_SIGNATURE_RECOVER")), u64_to_address(105), tm_secp256k1_signature_recover_run);
+pub(crate) const TM_SECP256K1_SIGNATURE_RECOVER: Precompile = Precompile::new(
+    PrecompileId::Custom(Cow::Borrowed("SECP256K1_SIGNATURE_RECOVER")),
+    u64_to_address(105),
+    tm_secp256k1_signature_recover_run,
+);
 
 const SECP256K1_PUBKEY_LENGTH: usize = 33;
 const SECP256K1_SIGNATURE_LENGTH: usize = 64;
@@ -23,7 +26,11 @@ const SECP256K1_SIGNATURE_MSGHASH_LENGTH: usize = 32;
 /// | PubKey   | Signature    |  SignatureMsgHash    |
 ///
 /// | 33 bytes |  64 bytes    |       32 bytes       |
-fn tm_secp256k1_signature_recover_run(input: &[u8], gas_limit: u64, reservoir: u64) -> PrecompileResult {
+fn tm_secp256k1_signature_recover_run(
+    input: &[u8],
+    gas_limit: u64,
+    reservoir: u64,
+) -> PrecompileResult {
     const TM_SECP256K1_SIGNATURE_RECOVER_BASE: u64 = 3_000;
 
     if TM_SECP256K1_SIGNATURE_RECOVER_BASE > gas_limit {
@@ -39,7 +46,9 @@ fn tm_secp256k1_signature_recover_run(input: &[u8], gas_limit: u64, reservoir: u
 
     let public_key = match PublicKey::from_slice(&input[..SECP256K1_PUBKEY_LENGTH]) {
         Ok(pk) => pk,
-        Err(_) => return Ok(PrecompileOutput::halt(PrecompileHalt::other("invalid pubkey"), reservoir)),
+        Err(_) => {
+            return Ok(PrecompileOutput::halt(PrecompileHalt::other("invalid pubkey"), reservoir))
+        }
     };
 
     let message = Message::from_digest(
@@ -50,7 +59,9 @@ fn tm_secp256k1_signature_recover_run(input: &[u8], gas_limit: u64, reservoir: u
         &input[SECP256K1_PUBKEY_LENGTH..SECP256K1_PUBKEY_LENGTH + SECP256K1_SIGNATURE_LENGTH],
     ) {
         Ok(s) => s,
-        Err(_) => return Ok(PrecompileOutput::halt(PrecompileHalt::other("invalid signature"), reservoir)),
+        Err(_) => {
+            return Ok(PrecompileOutput::halt(PrecompileHalt::other("invalid signature"), reservoir))
+        }
     };
 
     let res = sig.verify(&message, &public_key).is_ok();
@@ -62,7 +73,12 @@ fn tm_secp256k1_signature_recover_run(input: &[u8], gas_limit: u64, reservoir: u
     let tm_pub_key =
         match public_key::PublicKey::from_raw_secp256k1(&input[..SECP256K1_PUBKEY_LENGTH]) {
             Some(pk) => pk,
-            None => return Ok(PrecompileOutput::halt(PrecompileHalt::other("invalid pubkey"), reservoir)),
+            None => {
+                return Ok(PrecompileOutput::halt(
+                    PrecompileHalt::other("invalid pubkey"),
+                    reservoir,
+                ))
+            }
         };
 
     Ok(PrecompileOutput::new(

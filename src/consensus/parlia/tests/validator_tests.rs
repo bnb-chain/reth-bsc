@@ -17,7 +17,8 @@ fn apply_rejects_a_header_from_another_branch() {
     let snapshot = Snapshot::new(validators.clone(), 100, snap_hash, 200, None);
     let chain_spec = BscChainSpec::from(bsc_testnet());
     let apply = |parent_hash| {
-        let h = Header { number: 101, parent_hash, beneficiary: validators[0], ..Default::default() };
+        let h =
+            Header { number: 101, parent_hash, beneficiary: validators[0], ..Default::default() };
         snapshot.apply(validators[0], &h, vec![], None, None, None, &chain_spec)
     };
     assert!(apply(snap_hash).is_some(), "a genuine child must still apply");

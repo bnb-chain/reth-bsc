@@ -76,9 +76,9 @@ pub fn marker_bytecode() -> Bytecode {
 
 /// byte[0:2] == 0xCA52 and byte[2:10] all zero.
 pub fn is_cas20_address(addr: Address) -> bool {
-    addr[0] == MARKER_PREFIX[0]
-        && addr[1] == MARKER_PREFIX[1]
-        && addr[2..10].iter().all(|&b| b == 0)
+    addr[0] == MARKER_PREFIX[0] &&
+        addr[1] == MARKER_PREFIX[1] &&
+        addr[2..10].iter().all(|&b| b == 0)
 }
 
 /// One entry per ordinal, so routing and feature gating cannot disagree.

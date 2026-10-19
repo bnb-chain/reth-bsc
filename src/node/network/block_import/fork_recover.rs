@@ -211,8 +211,8 @@ pub async fn discover_fork_blocks<
         // a header when its parent was already Valid via a prior new_payload.
         // Transitively, any side-block in our provider is rooted at the
         // canonical chain, so no further walking is required.
-        let cursor_is_local = provider.block_hash(cursor_num)? == Some(cursor_hash)
-            || provider.header(cursor_hash)?.is_some();
+        let cursor_is_local = provider.block_hash(cursor_num)? == Some(cursor_hash) ||
+            provider.header(cursor_hash)?.is_some();
         if cursor_is_local {
             let outcome = if fork_blocks.is_empty() {
                 DiscoveryOutcome::Shortcircuit
@@ -332,12 +332,11 @@ impl RecoverTarget {
 
 /// Three-phase ancestor-aware recovery:
 ///
-/// 1. `discover_fork_blocks` walks back from `target.fetch_start_*` to the
-///    common ancestor.
-/// 2. Imports fork blocks oldest → newest via `engine.new_payload`, awaiting
-///    `Valid` then `fork_choice_updated` on each before submitting the next.
-/// 3. `fork_choice_updated` for `target.fcu_target_*` so engine-tree
-///    re-evaluates canonical selection.
+/// 1. `discover_fork_blocks` walks back from `target.fetch_start_*` to the common ancestor.
+/// 2. Imports fork blocks oldest → newest via `engine.new_payload`, awaiting `Valid` then
+///    `fork_choice_updated` on each before submitting the next.
+/// 3. `fork_choice_updated` for `target.fcu_target_*` so engine-tree re-evaluates canonical
+///    selection.
 ///
 /// See [`RecoverTarget`] for the parent-start vs single-pair design.
 pub async fn recover_ancestors<P>(
@@ -402,9 +401,7 @@ where
     // block-carried TD). Only header fields are read, so this can run before
     // import. Best-effort: on failure we fall through to the existing
     // `header_td` behavior.
-    if let Err(err) =
-        forkchoice_engine.prime_fork_chain_tds(to_import.iter().map(|b| &b.header))
-    {
+    if let Err(err) = forkchoice_engine.prime_fork_chain_tds(to_import.iter().map(|b| &b.header)) {
         tracing::debug!(
             target: "bsc::fork_recover",
             error = %err,
@@ -537,13 +534,11 @@ where
 
 /// Resolve the FCU target header in priority order:
 ///
-/// 1. Caller override (`fcu_target_header`) — used by `on_new_block` to skip
-///    a provider lookup for a block engine-tree just unbuffered.
-/// 2. Phase-2 tail iff its hash equals `fcu_target_hash` — single-pair
-///    callers; sidesteps the qanet livelock where the DB-backed provider
-///    misses freshly-imported blocks.
-/// 3. Provider — Shortcircuit path or last resort; missing →
-///    `HeadHeaderMissing`.
+/// 1. Caller override (`fcu_target_header`) — used by `on_new_block` to skip a provider lookup for
+///    a block engine-tree just unbuffered.
+/// 2. Phase-2 tail iff its hash equals `fcu_target_hash` — single-pair callers; sidesteps the qanet
+///    livelock where the DB-backed provider misses freshly-imported blocks.
+/// 3. Provider — Shortcircuit path or last resort; missing → `HeadHeaderMissing`.
 fn resolve_fcu_head_header<P>(
     provider: &P,
     fcu_target_hash: B256,
@@ -594,9 +589,7 @@ pub struct FailedHeadsCooler {
 impl FailedHeadsCooler {
     pub fn new(capacity: u32, cooldown: Duration) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(schnellru::LruMap::new(
-                schnellru::ByLength::new(capacity),
-            ))),
+            inner: Arc::new(Mutex::new(schnellru::LruMap::new(schnellru::ByLength::new(capacity)))),
             cooldown,
         }
     }
@@ -862,14 +855,16 @@ mod tests {
         fn sealed_header(
             &self,
             _number: u64,
-        ) -> Result<Option<reth_primitives_traits::SealedHeader<Self::Header>>, ProviderError> {
+        ) -> Result<Option<reth_primitives_traits::SealedHeader<Self::Header>>, ProviderError>
+        {
             Ok(None)
         }
         fn sealed_headers_while(
             &self,
             _range: impl core::ops::RangeBounds<u64>,
             _predicate: impl FnMut(&reth_primitives_traits::SealedHeader<Self::Header>) -> bool,
-        ) -> Result<Vec<reth_primitives_traits::SealedHeader<Self::Header>>, ProviderError> {
+        ) -> Result<Vec<reth_primitives_traits::SealedHeader<Self::Header>>, ProviderError>
+        {
             Ok(vec![])
         }
     }
@@ -950,9 +945,10 @@ mod tests {
         }
 
         let fetcher = ScriptedFetcher::new(vec![]);
-        let out = discover_fork_blocks(fake_peer(), hashes[100], 100, &provider, fetcher.as_ref(), &())
-            .await
-            .unwrap();
+        let out =
+            discover_fork_blocks(fake_peer(), hashes[100], 100, &provider, fetcher.as_ref(), &())
+                .await
+                .unwrap();
 
         assert!(out.fork_blocks.is_empty(), "no blocks to import");
         assert!(matches!(out.outcome, DiscoveryOutcome::Shortcircuit));
@@ -974,9 +970,10 @@ mod tests {
         let fetcher = ScriptedFetcher::new(vec![Ok(hop1)]);
 
         let head_hash = peer_ext.last().unwrap().hash_slow();
-        let out = discover_fork_blocks(fake_peer(), head_hash, 104, &provider, fetcher.as_ref(), &())
-            .await
-            .unwrap();
+        let out =
+            discover_fork_blocks(fake_peer(), head_hash, 104, &provider, fetcher.as_ref(), &())
+                .await
+                .unwrap();
 
         assert!(matches!(out.outcome, DiscoveryOutcome::AncestorFound));
         // Ascending-hash list after reverse; we assert on numbers for clarity.
@@ -1014,10 +1011,16 @@ mod tests {
         hop2.push(make_block(shared[95].clone()));
         let fetcher = ScriptedFetcher::new(vec![Ok(hop1), Ok(hop2)]);
 
-        let out =
-            discover_fork_blocks(fake_peer(), peer_y_hashes[6], 102, &provider, fetcher.as_ref(), &())
-                .await
-                .unwrap();
+        let out = discover_fork_blocks(
+            fake_peer(),
+            peer_y_hashes[6],
+            102,
+            &provider,
+            fetcher.as_ref(),
+            &(),
+        )
+        .await
+        .unwrap();
 
         assert!(matches!(out.outcome, DiscoveryOutcome::AncestorFound));
         let nums: Vec<u64> = out.fork_blocks.iter().map(|b| b.header.number).collect();
@@ -1094,9 +1097,10 @@ mod tests {
         provider.insert_side(side_96);
 
         let fetcher = ScriptedFetcher::new(vec![]);
-        let out = discover_fork_blocks(fake_peer(), side_hash, 96, &provider, fetcher.as_ref(), &())
-            .await
-            .unwrap();
+        let out =
+            discover_fork_blocks(fake_peer(), side_hash, 96, &provider, fetcher.as_ref(), &())
+                .await
+                .unwrap();
         assert!(matches!(out.outcome, DiscoveryOutcome::Shortcircuit));
         assert!(out.fork_blocks.is_empty());
         assert_eq!(fetcher.calls().len(), 0);
@@ -1121,10 +1125,16 @@ mod tests {
         let hop1: Vec<BscBlock> = peer_y.iter().cloned().rev().map(make_block).collect();
         let fetcher = ScriptedFetcher::new(vec![Ok(hop1)]);
 
-        let out =
-            discover_fork_blocks(fake_peer(), peer_y_hashes[3], 99, &provider, fetcher.as_ref(), &())
-                .await
-                .unwrap();
+        let out = discover_fork_blocks(
+            fake_peer(),
+            peer_y_hashes[3],
+            99,
+            &provider,
+            fetcher.as_ref(),
+            &(),
+        )
+        .await
+        .unwrap();
 
         assert!(matches!(out.outcome, DiscoveryOutcome::AncestorFound));
         let nums: Vec<u64> = out.fork_blocks.iter().map(|b| b.header.number).collect();
@@ -1236,8 +1246,7 @@ mod tests {
         let side_hash = side.hash_slow();
         provider.insert_side(side);
 
-        let resolved =
-            super::resolve_fcu_head_header(&provider, side_hash, None, None).unwrap();
+        let resolved = super::resolve_fcu_head_header(&provider, side_hash, None, None).unwrap();
         assert_eq!(resolved.hash_slow(), side_hash);
     }
 
@@ -1249,8 +1258,7 @@ mod tests {
         let provider = FakeProvider::default();
         let head_hash = B256::repeat_byte(0xAB);
 
-        let err =
-            super::resolve_fcu_head_header(&provider, head_hash, None, None).unwrap_err();
+        let err = super::resolve_fcu_head_header(&provider, head_hash, None, None).unwrap_err();
         match err {
             ForkRecoverError::HeadHeaderMissing { hash } => assert_eq!(hash, head_hash),
             other => panic!("expected HeadHeaderMissing, got {other:?}"),
@@ -1292,13 +1300,9 @@ mod tests {
         let supplied_hash = supplied.hash_slow();
         let claimed_target_hash = B256::repeat_byte(0x99); // ≠ supplied_hash
 
-        let err = super::resolve_fcu_head_header(
-            &provider,
-            claimed_target_hash,
-            Some(&supplied),
-            None,
-        )
-        .unwrap_err();
+        let err =
+            super::resolve_fcu_head_header(&provider, claimed_target_hash, Some(&supplied), None)
+                .unwrap_err();
         match err {
             ForkRecoverError::FcuTargetHeaderMismatch { expected, got } => {
                 assert_eq!(expected, claimed_target_hash);
@@ -1341,13 +1345,9 @@ mod tests {
 
         let tail_block = make_block(make_header(9, parent_hash, 0x1));
 
-        let err = super::resolve_fcu_head_header(
-            &provider,
-            target_hash,
-            None,
-            Some(&tail_block.header),
-        )
-        .unwrap_err();
+        let err =
+            super::resolve_fcu_head_header(&provider, target_hash, None, Some(&tail_block.header))
+                .unwrap_err();
         match err {
             ForkRecoverError::HeadHeaderMissing { hash } => assert_eq!(hash, target_hash),
             other => panic!("expected HeadHeaderMissing, got {other:?}"),
@@ -1673,8 +1673,7 @@ mod tests {
             .await
             .unwrap();
 
-            let imported: Vec<u64> =
-                submissions.lock().unwrap().iter().map(|(n, _)| *n).collect();
+            let imported: Vec<u64> = submissions.lock().unwrap().iter().map(|(n, _)| *n).collect();
             assert_eq!(imported, vec![101, 102, 103, 104, 105], "the whole extension imports");
 
             let mut expected: Vec<B256> = heads.iter().map(|(h, _)| *h).collect();

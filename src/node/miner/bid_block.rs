@@ -2,36 +2,41 @@
 //!
 //! Ported from bnb-chain/bsc `core/types/builder/bid.go`.
 
-use crate::chainspec::BscChainSpec;
-use crate::consensus::eip4844::is_blob_eligible_block;
-use crate::consensus::parlia::bid_block::{
-    extract_bid_block_deposit_value, verify_bid_block_system_txs, BidBlockSystemTxError,
+use crate::{
+    chainspec::BscChainSpec,
+    consensus::{
+        eip4844::is_blob_eligible_block,
+        parlia::{
+            bid_block::{
+                extract_bid_block_deposit_value, verify_bid_block_system_txs, BidBlockSystemTxError,
+            },
+            consensus::Parlia,
+            constants::{DIFF_INTURN, DIFF_NOTURN},
+            Snapshot, SnapshotProvider,
+        },
+    },
+    hardforks::BscHardforks,
+    node::{
+        consensus::BscConsensus,
+        evm::pre_execution::EpochValidators,
+        miner::{
+            block_mev_info::{set_block_mev_info, BlockMevInfoVersion},
+            signer::sign_system_transaction,
+            util::finalize_new_header,
+        },
+        primitives::{BscBlobTransactionSidecar, BscBlock, BscBlockBody},
+    },
 };
-use crate::consensus::parlia::{
-    consensus::Parlia,
-    constants::{DIFF_INTURN, DIFF_NOTURN},
-    Snapshot, SnapshotProvider,
-};
-use crate::hardforks::BscHardforks;
-use crate::node::consensus::BscConsensus;
-use crate::node::miner::block_mev_info::{set_block_mev_info, BlockMevInfoVersion};
-use crate::node::miner::signer::sign_system_transaction;
-use crate::node::evm::pre_execution::EpochValidators;
-use crate::node::miner::util::finalize_new_header;
-use crate::node::primitives::{BscBlobTransactionSidecar, BscBlock, BscBlockBody};
-use alloy_consensus::transaction::RlpEcdsaDecodableTx;
-use alloy_consensus::{Header, Transaction, TxLegacy};
+use alloy_consensus::{transaction::RlpEcdsaDecodableTx, Header, Transaction, TxLegacy};
 use alloy_eips::eip2718::Decodable2718;
 use alloy_primitives::{keccak256, Address, Bytes, Signature, B256, U256};
 use alloy_rlp::{Decodable, Encodable};
-use reth::consensus::HeaderValidator;
-use reth::primitives::SealedHeader;
+use reth::{consensus::HeaderValidator, primitives::SealedHeader};
 use reth_chainspec::EthChainSpec;
 use reth_ethereum_primitives::{BlockBody, TransactionSigned};
 use reth_node_ethereum::engine::EthPayloadAttributes;
 use reth_primitives_traits::{RecoveredBlock, SignerRecoverable};
-use std::sync::Arc;
-use std::{fmt, vec::Vec};
+use std::{fmt, sync::Arc, vec::Vec};
 
 /// Sidecar version carrying EIP-7594 cell proofs (PeerDAS). BSC does not support it yet, so a
 /// BidBlock declaring it is rejected; legacy EIP-4844 blob proofs are version `0`.
@@ -377,8 +382,8 @@ fn recover_signer(hash: B256, signature: &[u8]) -> Result<Address, BidBlockError
 /// Walks the user-tx region (`txs[..system_tx_start]`) and, for each EIP-4844 tx, requires the next
 /// sidecar in order to: exist, be a legacy (v0) proof sidecar, match the tx by hash and index, and
 /// keep the running blob count within the per-block max. There must be exactly one sidecar per blob
-/// tx and no trailing extras. KZG proof verification is deliberately *not* done here — only at final
-/// block insertion — matching go-bsc, which runs only these cheap checks at admission.
+/// tx and no trailing extras. KZG proof verification is deliberately *not* done here — only at
+/// final block insertion — matching go-bsc, which runs only these cheap checks at admission.
 pub fn validate_bid_block_blob_sidecars(
     header: &Header,
     txs: &[TransactionSigned],
@@ -387,8 +392,10 @@ pub fn validate_bid_block_blob_sidecars(
     chain_spec: &BscChainSpec,
 ) -> Result<(), BlobSidecarError> {
     let blob_eligible = is_blob_eligible_block(chain_spec, header.number, header.timestamp);
-    let max_blob_count =
-        chain_spec.blob_params_at_timestamp(header.timestamp).map(|p| p.max_blob_count).unwrap_or(0);
+    let max_blob_count = chain_spec
+        .blob_params_at_timestamp(header.timestamp)
+        .map(|p| p.max_blob_count)
+        .unwrap_or(0);
 
     let mut sidecar_index = 0usize;
     let mut blob_count: u64 = 0;
@@ -420,7 +427,10 @@ pub fn validate_bid_block_blob_sidecars(
         }
         blob_count += sidecar.inner.blobs.len() as u64;
         if blob_count > max_blob_count {
-            return Err(BlobSidecarError::TooManyBlobs { have: blob_count, permitted: max_blob_count });
+            return Err(BlobSidecarError::TooManyBlobs {
+                have: blob_count,
+                permitted: max_blob_count,
+            });
         }
         sidecar_index += 1;
     }
@@ -516,8 +526,9 @@ impl std::error::Error for BlobKzgError {}
 /// invariants). go-bsc runs it in `prepareBidBlockTask` — on the *selected* block, *before* sealing
 /// and broadcast — and revokes the builder on failure. Under zero-simulate it must run before the
 /// block is broadcast, since full re-execution (which would also catch a bad blob) is deferred to
-/// after broadcast. Each blob tx in the user-tx region (`txs[..system_tx_start]`) is paired in order
-/// with the next sidecar and its commitments/proofs are verified against the tx's versioned hashes.
+/// after broadcast. Each blob tx in the user-tx region (`txs[..system_tx_start]`) is paired in
+/// order with the next sidecar and its commitments/proofs are verified against the tx's versioned
+/// hashes.
 pub fn validate_bid_block_blob_kzg(
     txs: &[TransactionSigned],
     sidecars: &[BscBlobTransactionSidecar],
@@ -630,9 +641,9 @@ pub fn pre_seal_verify_bid_block(
 ///
 /// The cascading checks use `header.beneficiary` directly rather than recovering a seal signer:
 /// go-bsc's function is explicitly named "Unsealed" because it runs on headers that may not carry
-/// a valid seal yet (this function's first, admission-time call site — [`pre_seal_verify_bid_block`]
-/// — runs on the builder's raw, unfinalized header). Signature-based verification of the seal
-/// itself happens later, when the finalized block is executed on import.
+/// a valid seal yet (this function's first, admission-time call site —
+/// [`pre_seal_verify_bid_block`] — runs on the builder's raw, unfinalized header). Signature-based
+/// verification of the seal itself happens later, when the finalized block is executed on import.
 ///
 /// Split out because it must also run on the **finalized** header (which carries the validator's
 /// seal) after `finalize_new_header`, to confirm that step didn't itself produce an
@@ -687,7 +698,10 @@ fn verify_bid_block_coinbase_and_gas_limit(
     expected_gas_limit: u64,
 ) -> Result<(), PreSealVerifyError> {
     if header.beneficiary != etherbase {
-        return Err(PreSealVerifyError::InvalidCoinbase { got: header.beneficiary, want: etherbase });
+        return Err(PreSealVerifyError::InvalidCoinbase {
+            got: header.beneficiary,
+            want: etherbase,
+        });
     }
     if header.gas_limit != expected_gas_limit {
         return Err(PreSealVerifyError::InvalidGasLimit {
@@ -866,8 +880,10 @@ pub fn bind_sign_bid_block_system_txs(
         if let alloy_consensus::EthereumTypedTransaction::Legacy(ref mut legacy) = unsigned {
             legacy.chain_id = Some(chain_id);
         }
-        let signed = sign_system_transaction(unsigned)
-            .map_err(|e| BindSignError { index: system_tx_start + offset, detail: e.to_string() })?;
+        let signed = sign_system_transaction(unsigned).map_err(|e| BindSignError {
+            index: system_tx_start + offset,
+            detail: e.to_string(),
+        })?;
         out.push(signed);
     }
     Ok(out)
@@ -895,8 +911,8 @@ impl fmt::Display for BindSignError {
 /// produced and fail block insertion (go-bsc `prepareBidBlockTask`: "Do not touch fields that enter
 /// the EVM BlockContext — GasLimit, Coinbase, Time, Difficulty, BaseFee"). So every field is taken
 /// verbatim from the builder's header — notably `prev_randao`, which on BSC is the header
-/// difficulty (the EVM exposes it via PREVRANDAO), so it must NOT be recomputed from the snapshot as
-/// the local-build path does. The gas limit, coinbase, timestamp and base fee live on the header
+/// difficulty (the EVM exposes it via PREVRANDAO), so it must NOT be recomputed from the snapshot
+/// as the local-build path does. The gas limit, coinbase, timestamp and base fee live on the header
 /// itself and are likewise consumed unchanged when the block builder is constructed.
 ///
 /// Consequently the downstream finalize/seal step for a BidBlock must also preserve the builder's
@@ -960,10 +976,10 @@ impl fmt::Display for SimulateBidBlockError {
 
 impl std::error::Error for SimulateBidBlockError {}
 
-/// Stamp a BidBlock header with BEP-675 MEV info (go-bsc `setBidMevInfo` for the BidBlock case): the
-/// validator records `(version = BidBlock, builder)` in `requests_hash`. BidBlock is post-Prague (so
-/// `requests_hash` is present), hence this only applies when Prague is active — matching go-bsc,
-/// where BidBlock blocks are always post-Prague.
+/// Stamp a BidBlock header with BEP-675 MEV info (go-bsc `setBidMevInfo` for the BidBlock case):
+/// the validator records `(version = BidBlock, builder)` in `requests_hash`. BidBlock is
+/// post-Prague (so `requests_hash` is present), hence this only applies when Prague is active —
+/// matching go-bsc, where BidBlock blocks are always post-Prague.
 pub fn set_bid_block_mev_info(header: &mut Header, builder: Address, prague_active: bool) {
     set_block_mev_info(header, BlockMevInfoVersion::BidBlock, builder, prague_active);
 }
@@ -977,13 +993,13 @@ fn mev_tagged_header(chain_spec: &BscChainSpec, decoded: &DecodedBidBlock) -> He
     header
 }
 
-/// Validator-side simulation of an admitted BidBlock: payload-verify, blind-sign the trailing system
-/// txs, install the validator's own block context (its extra + the recomputed tx root), finalize and
-/// seal the header — producing the consensus-valid block the validator would propose.
+/// Validator-side simulation of an admitted BidBlock: payload-verify, blind-sign the trailing
+/// system txs, install the validator's own block context (its extra + the recomputed tx root),
+/// finalize and seal the header — producing the consensus-valid block the validator would propose.
 ///
-/// Execution (to obtain the state root / build a payload) is left to the caller, since it differs by
-/// environment (miner trie backend vs test DB overlay). All other EVM block-context fields are kept
-/// as the builder set them so the re-executed state root matches the builder's.
+/// Execution (to obtain the state root / build a payload) is left to the caller, since it differs
+/// by environment (miner trie backend vs test DB overlay). All other EVM block-context fields are
+/// kept as the builder set them so the re-executed state root matches the builder's.
 ///
 /// `vanity` is the validator's extra-data vanity (finalize appends the 65-byte seal slot);
 /// `block_timestamp_ms` is the millisecond timestamp for Lorentz; `epoch_validators` is the set an
@@ -1002,9 +1018,14 @@ pub fn simulate_bid_block(
     block_timestamp_ms: u64,
     epoch_validators: Option<EpochValidators>,
 ) -> Result<BidBlockTask, SimulateBidBlockError> {
-    let (system_tx_start, gas_fee) =
-        verify_bid_block_payload(chain_spec, decoded, parent.header(), validator, expected_gas_limit)
-            .map_err(SimulateBidBlockError::Verify)?;
+    let (system_tx_start, gas_fee) = verify_bid_block_payload(
+        chain_spec,
+        decoded,
+        parent.header(),
+        validator,
+        expected_gas_limit,
+    )
+    .map_err(SimulateBidBlockError::Verify)?;
 
     let txs =
         bind_sign_bid_block_system_txs(&decoded.txs, system_tx_start, chain_spec.chain().id())
@@ -1041,14 +1062,21 @@ pub fn simulate_bid_block(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| SimulateBidBlockError::SenderRecovery(e.to_string()))?;
 
-    let sidecars =
-        (!decoded.sidecars.is_empty()).then(|| decoded.sidecars.clone());
+    let sidecars = (!decoded.sidecars.is_empty()).then(|| decoded.sidecars.clone());
     let withdrawals = header.withdrawals_root.map(|_| Default::default());
-    let body =
-        BscBlockBody { inner: BlockBody { transactions: txs, ommers: Vec::new(), withdrawals }, sidecars };
+    let body = BscBlockBody {
+        inner: BlockBody { transactions: txs, ommers: Vec::new(), withdrawals },
+        sidecars,
+    };
     let block = RecoveredBlock::new_unhashed(BscBlock { header, body }, senders);
 
-    Ok(BidBlockTask { block, gas_fee, system_tx_start, builder: decoded.builder, bid_hash: decoded.hash() })
+    Ok(BidBlockTask {
+        block,
+        gas_fee,
+        system_tx_start,
+        builder: decoded.builder,
+        bid_hash: decoded.hash(),
+    })
 }
 
 #[cfg(test)]
@@ -1058,10 +1086,15 @@ mod tests {
 
     /// Repro for the blob-BidBlock admission stack overflow: run the decode+hash path a tokio
     /// worker takes (2 MiB stack) on a BidBlockArgs carrying real 128 KiB blobs.
-    fn run_blob_admission_on_stack(stack_bytes: usize, num_blobs: usize) -> std::thread::Result<()> {
+    fn run_blob_admission_on_stack(
+        stack_bytes: usize,
+        num_blobs: usize,
+    ) -> std::thread::Result<()> {
         use alloy_consensus::{BlobTransactionSidecar, TxEip4844};
-        use alloy_eips::eip4844::{Blob, Bytes48};
-        use alloy_eips::eip2718::Encodable2718;
+        use alloy_eips::{
+            eip2718::Encodable2718,
+            eip4844::{Blob, Bytes48},
+        };
 
         // Build a blob tx + matching sidecar exactly like a real submission (non-empty blobs).
         let tx = TxEip4844 {
@@ -1199,7 +1232,8 @@ mod tests {
             b256!("0xad40d96e6b75df67950f6a63e6659936814b5e11407c6cdcf3b5c63675aa59f8"),
         );
         // Post-#3742 the digest is exactly the header hash; the two transactions above do not
-        // enter it (they are bound via `transactions_root` instead — see `verify_bid_block_payload`).
+        // enter it (they are bound via `transactions_root` instead — see
+        // `verify_bid_block_payload`).
         assert_eq!(block.hash(), block.header.hash_slow());
     }
 
@@ -1263,17 +1297,16 @@ mod tests {
 
     #[test]
     fn ecrecover_rejects_bad_signature_length() {
-        let args = BidBlockArgs { bid_block: vector_a_block(), signature: Bytes::from(vec![0u8; 64]) };
+        let args =
+            BidBlockArgs { bid_block: vector_a_block(), signature: Bytes::from(vec![0u8; 64]) };
         assert_eq!(args.ecrecover_sender(), Err(BidBlockError::InvalidSignatureLength(64)));
     }
 
     #[test]
     fn bid_block_args_json_roundtrip_preserves_hash() {
         // The hash is taken over the decoded structure, so a JSON round-trip must not perturb it.
-        let args = BidBlockArgs {
-            bid_block: vector_a_block(),
-            signature: Bytes::from(vec![1u8; 65]),
-        };
+        let args =
+            BidBlockArgs { bid_block: vector_a_block(), signature: Bytes::from(vec![1u8; 65]) };
         let json = serde_json::to_value(&args).unwrap();
         // geth wire parity: outer keys are "BidBlock" and "signature".
         assert!(json.get("BidBlock").is_some());
@@ -1310,9 +1343,7 @@ mod tests {
                 proofs: vec![Bytes48::default()],
             },
             block_number: 7,
-            block_hash: b256!(
-                "0x1111111111111111111111111111111111111111111111111111111111111111"
-            ),
+            block_hash: b256!("0x1111111111111111111111111111111111111111111111111111111111111111"),
             tx_index: 3,
             tx_hash: b256!("0x2222222222222222222222222222222222222222222222222222222222222222"),
             version: 0,
@@ -1381,7 +1412,12 @@ mod tests {
         TransactionSigned::new_unhashed(tx.into(), dummy_sig())
     }
 
-    fn sidecar_for(tx: &TransactionSigned, tx_index: u64, version: u8, blobs: usize) -> BscBlobTransactionSidecar {
+    fn sidecar_for(
+        tx: &TransactionSigned,
+        tx_index: u64,
+        version: u8,
+        blobs: usize,
+    ) -> BscBlobTransactionSidecar {
         use alloy_consensus::BlobTransactionSidecar;
         use alloy_eips::eip4844::{Blob, Bytes48};
         BscBlobTransactionSidecar {
@@ -1406,10 +1442,7 @@ mod tests {
     fn blob_validation_accepts_no_blob_txs() {
         let spec = blob_chain_spec();
         let txs = vec![legacy_tx(0)];
-        assert_eq!(
-            validate_bid_block_blob_sidecars(&blob_header(), &txs, &[], 1, &spec),
-            Ok(())
-        );
+        assert_eq!(validate_bid_block_blob_sidecars(&blob_header(), &txs, &[], 1, &spec), Ok(()));
     }
 
     #[test]
@@ -1511,7 +1544,8 @@ mod tests {
         ));
     }
 
-    // ---- validate_bid_block_average_gas_price / non_system_gas_used (post-import floor check) ----
+    // ---- validate_bid_block_average_gas_price / non_system_gas_used (post-import floor check)
+    // ----
 
     fn receipt_with_cumulative_gas(cumulative_gas_used: u64) -> alloy_consensus::Receipt {
         alloy_consensus::Receipt {
@@ -1543,9 +1577,15 @@ mod tests {
     #[test]
     fn validate_average_gas_price_accepts_at_or_above_floor() {
         // gas_fee=1_050_000 over 50_000 gas => avg=21 (integer division), clears a floor of 21.
-        let receipts = vec![receipt_with_cumulative_gas(21_000), receipt_with_cumulative_gas(50_000)];
+        let receipts =
+            vec![receipt_with_cumulative_gas(21_000), receipt_with_cumulative_gas(50_000)];
         assert_eq!(
-            validate_bid_block_average_gas_price(U256::from(1_050_000), &receipts, 2, U256::from(21)),
+            validate_bid_block_average_gas_price(
+                U256::from(1_050_000),
+                &receipts,
+                2,
+                U256::from(21)
+            ),
             Ok(())
         );
     }
@@ -1553,7 +1593,8 @@ mod tests {
     #[test]
     fn validate_average_gas_price_rejects_below_floor() {
         // gas_fee=1_000 over 50_000 gas => avg=0, below any positive floor.
-        let receipts = vec![receipt_with_cumulative_gas(21_000), receipt_with_cumulative_gas(50_000)];
+        let receipts =
+            vec![receipt_with_cumulative_gas(21_000), receipt_with_cumulative_gas(50_000)];
         assert_eq!(
             validate_bid_block_average_gas_price(U256::from(1_000), &receipts, 2, U256::from(1)),
             Err(U256::ZERO)
@@ -1590,8 +1631,9 @@ mod tests {
 
     // ---- pre_seal_verify_bid_block ----
 
-    use crate::consensus::parlia::bid_block::DEPOSIT_SELECTOR;
-    use crate::system_contracts::VALIDATOR_CONTRACT;
+    use crate::{
+        consensus::parlia::bid_block::DEPOSIT_SELECTOR, system_contracts::VALIDATOR_CONTRACT,
+    };
     use alloy_consensus::EMPTY_OMMER_ROOT_HASH;
     use std::sync::Arc;
 
@@ -1609,8 +1651,7 @@ mod tests {
     /// `pre_seal_*` test below uses — so it passes the authorized-validator/in-turn cascading
     /// checks `verify_bid_block_header` now runs.
     fn snap_with_interval(interval: u64) -> Snapshot {
-        let mut snap =
-            Snapshot::new(vec![Address::repeat_byte(0x11)], 0, B256::ZERO, 200, None);
+        let mut snap = Snapshot::new(vec![Address::repeat_byte(0x11)], 0, B256::ZERO, 200, None);
         snap.block_interval = interval;
         snap
     }
@@ -1692,10 +1733,13 @@ mod tests {
         let raw = bytes!(
             "0xf8498080887fffffffffffffff94000000000000000000000000000000000000100064a4f340fa01000000000000000000000000bcdd0d2cda5f6423e57b6a4dcd75decbe31aecf0808080"
         );
-        let geth_root =
-            b256!("0x4527823c77294bc45e8d370fc7c3e95cf779bdbf98f4adacdb57e361050a1ddf");
+        let geth_root = b256!("0x4527823c77294bc45e8d370fc7c3e95cf779bdbf98f4adacdb57e361050a1ddf");
 
-        assert_eq!(submitted_tx_root(std::slice::from_ref(&raw)), geth_root, "must match go-bsc DeriveSha");
+        assert_eq!(
+            submitted_tx_root(std::slice::from_ref(&raw)),
+            geth_root,
+            "must match go-bsc DeriveSha"
+        );
 
         // And demonstrate why the raw form is required: the re-encoded root differs.
         // `decode_bid_block_tx` is the production decoder — plain `decode_2718` rejects this
@@ -1713,9 +1757,10 @@ mod tests {
     fn pre_seal_rejects_tx_root_mismatch() {
         // The security-critical half of bsc #3742. The signature covers only the header, so
         // `transactions_root` is the sole binding between the signed header and the submitted body.
-        // Without this rejection, anyone could replay an honest builder's (header, signature) with a
-        // substituted transaction list: recovery would still yield the whitelisted builder, and
-        // `simulate_bid_block` would overwrite the root to match the forged body, leaving no trace.
+        // Without this rejection, anyone could replay an honest builder's (header, signature) with
+        // a substituted transaction list: recovery would still yield the whitelisted
+        // builder, and `simulate_bid_block` would overwrite the root to match the forged
+        // body, leaving no trace.
         let spec = preseal_spec();
         let etherbase = Address::repeat_byte(0x11);
         let parent = preseal_parent();
@@ -1723,14 +1768,7 @@ mod tests {
         let mut d = decoded_block(valid_bid_header(etherbase, 30_000_000), txs, vec![]);
 
         // Sanity: the well-formed fixture passes, so the failure below is attributable to the root.
-        assert!(verify_bid_block_payload(
-            &spec,
-            &d,
-            &parent,
-            etherbase,
-            d.header.gas_limit
-        )
-        .is_ok());
+        assert!(verify_bid_block_payload(&spec, &d, &parent, etherbase, d.header.gas_limit).is_ok());
 
         // Now claim a different body than the one supplied — the replay/substitution shape.
         let honest_root = d.header.transactions_root;

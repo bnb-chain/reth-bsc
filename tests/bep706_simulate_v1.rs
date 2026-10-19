@@ -36,8 +36,8 @@ use std::sync::Arc;
 /// Probe: returns `[prevrandao (0x44), staticcall(0x70) result]` as two words.
 const PROBE_CODE: &[u8] = &hex!("44600052602060206000600060705afa5060406000f3");
 const PROBE_ADDR: Address = Address::new([
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x0b, 0xee, 0xf0,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x0b, 0xee, 0xf0,
 ]);
 
 const JENNER_AT: u64 = 1_800_000_000;
@@ -90,8 +90,7 @@ async fn simulate_v1_success_paths_apply_the_bsc_semantics() {
         Arc::new(BscChainSpec::from(cs))
     };
 
-    let provider =
-        MockEthProvider::<BscPrimitives, _>::new().with_chain_spec((*spec).clone());
+    let provider = MockEthProvider::<BscPrimitives, _>::new().with_chain_spec((*spec).clone());
     let mut mix = [0u8; 32];
     mix[24..32].copy_from_slice(&HEAD_REMAINDER.to_be_bytes());
     let header = alloy_consensus::Header {
@@ -160,7 +159,10 @@ async fn simulate_v1_success_paths_apply_the_bsc_semantics() {
     // prevRandao only, no time: sanitize supplies the default next-block seconds,
     // the override supplies the remainder (the go sixth-round-review scenario).
     let blocks = api
-        .simulate_v1(sim_block(BlockOverrides { random: Some(randao(42)), ..Default::default() }), None)
+        .simulate_v1(
+            sim_block(BlockOverrides { random: Some(randao(42)), ..Default::default() }),
+            None,
+        )
         .await
         .expect("prevRandao-only override must simulate");
     let block_secs = blocks[0].inner.header.inner.timestamp;
