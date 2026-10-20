@@ -68,6 +68,10 @@ const COMETBFT_LIGHT_BLOCK_VALIDATION_BASE: u64 = 3_000;
 /// count instead of being a flat fee.
 const COMETBFT_LIGHT_BLOCK_VALIDATE_PER_BYTE_GAS: u64 = 16;
 
+/// CometBFT `version.BlockProtocol`. Go's `Header.ValidateBasic` rejects any other header
+/// `version.block`; cometbft-rs copies the field through unchecked.
+const COMETBFT_BLOCK_PROTOCOL: u64 = 11;
+
 fn cometbft_light_block_validation_run(input: &[u8], gas_limit: u64, reservoir: u64) -> PrecompileResult {
     cometbft_light_block_validation_run_inner(input, gas_limit, reservoir, true, false, 0)
 }
@@ -197,6 +201,10 @@ fn convert_light_block_from_proto(light_block_proto: &TmLightBlock) -> ConvertLi
         Ok(sh) => sh.clone(),
         Err(_) => return Err(BscPrecompileError::InvalidInput.into()),
     };
+    // Go runs `Header.ValidateBasic` while converting the proto header, for every 0x67 variant.
+    if signed_header.header().version.block != COMETBFT_BLOCK_PROTOCOL {
+        return Err(BscPrecompileError::InvalidInput.into());
+    }
 
     let mut validator_set_proto =
         light_block_proto.validator_set.clone().ok_or(BscPrecompileError::InvalidInput)?;
@@ -2120,6 +2128,38 @@ mod tests {
             assert!(present.is_success(), "halted with {:?}", present.halt_reason());
             assert!(omitted.is_success(), "halted with {:?}", omitted.halt_reason());
             assert_eq!(omitted.bytes, present.bytes);
+        }
+    }
+
+    /// SRC-2520: geth-bsc's `Header.ValidateBasic` rejects any `version.block` other than
+    /// `BlockProtocol` (11). reth used to accept the otherwise-valid light block, so a contract
+    /// branching on 0x67 executed differently on the two clients.
+    #[test]
+    fn non_block_protocol_header_version_is_rejected_like_geth() {
+        type Run = fn(&[u8], u64, u64) -> PrecompileResult;
+        let runs: [Run; 3] = [
+            cometbft_light_block_validation_run_before_hertz,
+            cometbft_light_block_validation_run,
+            cometbft_light_block_validation_run_pasteur,
+        ];
+        let with_block_version = |block: u64| {
+            identity_validator_light_block_input_with_header(identity_vote_signature(0x00), |h| {
+                h.version.as_mut().unwrap().block = block
+            })
+        };
+        for run in runs {
+            let output = run(&with_block_version(COMETBFT_BLOCK_PROTOCOL), 10_000_000, 0).unwrap();
+            assert!(!output.is_halt(), "BlockProtocol control must verify, as on geth");
+
+            for block in [0, 10, 12, u64::MAX] {
+                let output = run(&with_block_version(block), 10_000_000, 0).unwrap();
+                let expected: PrecompileHalt = BscPrecompileError::InvalidInput.into();
+                assert_eq!(
+                    output.halt_reason(),
+                    Some(&expected),
+                    "version.block {block} must be rejected, as on geth"
+                );
+            }
         }
     }
 
