@@ -16,7 +16,7 @@ use alloy_primitives::{keccak256, B256};
 use alloy_eips::merge::BEACON_NONCE;
 use alloy_primitives::Bytes;
 use alloy_rpc_types::Withdrawals;
-use reth_chainspec::{EthChainSpec, EthereumHardforks};
+use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
 use reth_ethereum_primitives::{Receipt, TransactionSigned};
 use reth_evm::{
     block::{BlockExecutionError, BlockExecutorFactory},
@@ -203,7 +203,7 @@ where
         Transaction = TransactionSigned,
         Receipt = Receipt,
     >,
-    ChainSpec: EthChainSpec + EthereumHardforks + crate::hardforks::BscHardforks + 'static,
+    ChainSpec: EthChainSpec + EthereumHardforks + crate::hardforks::BscHardforks + Hardforks + 'static,
 {
     type Block = crate::node::primitives::BscBlock;
 
