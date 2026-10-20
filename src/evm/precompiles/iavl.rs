@@ -227,8 +227,9 @@ mod tests {
         }
     }
 
-    /// A well-formed outer proof whose first `ProofOp.data` is not decodable must halt: the
-    /// verifier unwraps the inner decode.
+    /// A well-formed outer proof whose first `ProofOp.data` is not decodable must halt. The
+    /// `iavl:v` verifier unwraps the inner decode, so the guard turns its panic into an internal
+    /// error; the ICS23 verifier now rejects the malformed operator first (SRC-1713).
     #[test]
     fn malformed_inner_proof_op_halts_instead_of_panicking() {
         // Precompile input with a one-byte key and value and two `ProofOp`s of type `op_type`,
@@ -255,17 +256,16 @@ mod tests {
             input
         };
 
-        let runs: [(&str, &str, revm::precompile::PrecompileFn); 5] = [
-            ("base", "iavl:v", iavl_proof_validation_run),
-            ("moran", "iavl:v", iavl_proof_validation_run_moran),
-            ("planck", "iavl:v", iavl_proof_validation_run_planck),
-            ("planck", "ics23:iavl", iavl_proof_validation_run_planck),
-            ("plato", "ics23:iavl", iavl_proof_validation_run_plato),
+        let runs: [(&str, &str, revm::precompile::PrecompileFn, &str); 5] = [
+            ("base", "iavl:v", iavl_proof_validation_run, "internal error"),
+            ("moran", "iavl:v", iavl_proof_validation_run_moran, "internal error"),
+            ("planck", "iavl:v", iavl_proof_validation_run_planck, "internal error"),
+            ("planck", "ics23:iavl", iavl_proof_validation_run_planck, "invalid merkle proof"),
+            ("plato", "ics23:iavl", iavl_proof_validation_run_plato, "invalid merkle proof"),
         ];
-        for (name, op_type, run) in runs {
+        for (name, op_type, run, reason) in runs {
             let res = run(&input_with_ops(op_type), 3_000, 0).unwrap();
-            let expected = Some(&PrecompileHalt::other("internal error"));
-            assert_eq!(res.halt_reason(), expected, "{name} {op_type}");
+            assert_eq!(res.halt_reason(), Some(&PrecompileHalt::other(reason)), "{name} {op_type}");
         }
     }
 }
