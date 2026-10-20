@@ -685,13 +685,14 @@ where
                         tracing::error!(target: "bsc::block_import", number = block_number, hash = %block_hash, %bid_hash, %validation_error, "[BID BLOCK VERIFY FAILED] local fault, not revoking builder");
                     }
                     PayloadStatusEnum::Invalid { validation_error } => {
-                        tracing::error!(target: "bsc::block_import", number = block_number, hash = %block_hash, %bid_hash, %validation_error, "[BID BLOCK VERIFY FAILED] revoking builder");
-                        crate::shared::get_bid_block_permission_manager().revoke(
-                            builder,
-                            format!("BidBlock invalid on import: {validation_error}"),
-                            block_hash,
-                            block_number,
-                        );
+                        let violation_count = crate::shared::get_bid_block_permission_manager()
+                            .revoke_for_violation(
+                                builder,
+                                format!("BidBlock invalid on import: {validation_error}"),
+                                block_hash,
+                                block_number,
+                            );
+                        tracing::error!(target: "bsc::block_import", number = block_number, hash = %block_hash, %bid_hash, %validation_error, violation_count, "[BID BLOCK VERIFY FAILED] revoking builder");
                     }
                     other => {
                         // Parent is canonical (we just built on top of it), so Syncing/Accepted is
