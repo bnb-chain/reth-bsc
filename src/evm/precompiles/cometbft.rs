@@ -178,6 +178,23 @@ fn go_zero_timestamp() -> Timestamp {
     Timestamp { seconds: -62_135_596_800, nanos: 0 }
 }
 
+/// Match gogoproto's non-nullable `stdtime` decoding for signed commit slots.
+/// Prost keeps an omitted Commit/Nil signature timestamp as `None`, while Go decodes it to
+/// `time.Time{}`. Absent signature slots do not carry a vote timestamp and remain untouched.
+fn normalize_go_zero_commit_timestamps(
+    signed_header: &mut cometbft_proto::types::v1::SignedHeader,
+) {
+    let Some(commit) = signed_header.commit.as_mut() else { return };
+
+    for signature in &mut commit.signatures {
+        let is_signed_slot = signature.block_id_flag == BlockIdFlag::Commit as i32 ||
+            signature.block_id_flag == BlockIdFlag::Nil as i32;
+        if is_signed_slot && signature.timestamp.is_none() {
+            signature.timestamp = Some(go_zero_timestamp());
+        }
+    }
+}
+
 type ConvertLightBlockResult = Result<(LightBlock, Vec<Validator>), PrecompileHalt>;
 fn convert_light_block_from_proto(light_block_proto: &TmLightBlock) -> ConvertLightBlockResult {
     // Both fields are optional in the protobuf definition, so any caller can omit them by
@@ -209,6 +226,7 @@ fn convert_light_block_from_proto(light_block_proto: &TmLightBlock) -> ConvertLi
     if let Some(header) = signed_header_proto.header.as_mut() {
         header.time.get_or_insert_with(go_zero_timestamp);
     }
+    normalize_go_zero_commit_timestamps(&mut signed_header_proto);
 
     let signed_header = match SignedHeader::try_from(signed_header_proto) {
         Ok(sh) => sh.clone(),
@@ -1577,6 +1595,54 @@ mod tests {
             let output = cometbft_light_block_validation_run_pasteur(&crafted, 10_000_000, 0)
                 .expect("a missing proto field must not be a fatal error");
             assert!(output.is_halt(), "expected an InvalidInput halt");
+        }
+    }
+
+    #[test]
+    fn omitted_signed_commit_timestamp_matches_explicit_go_zero_time() {
+        let omitted = hex::decode(include_str!("testdata/1690-omitted-timestamp.hex").trim())
+            .expect("1690 fixture is valid hex");
+        let cs_length = u64::from_be_bytes(
+            omitted[(CONSENSUS_STATE_LENGTH_BYTES_LENGTH - UINT64_TYPE_LENGTH) as usize..
+                CONSENSUS_STATE_LENGTH_BYTES_LENGTH as usize]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let split = CONSENSUS_STATE_LENGTH_BYTES_LENGTH as usize + cs_length;
+        let light_block =
+            TmLightBlock::decode(&omitted[split..]).expect("1690 light block decodes");
+        let signatures = &light_block
+            .signed_header
+            .as_ref()
+            .expect("signed header is present")
+            .commit
+            .as_ref()
+            .expect("commit is present")
+            .signatures;
+        let mut present_zero = light_block.clone();
+        let mut filled_indices = Vec::new();
+        for (index, signature) in signatures.iter().enumerate() {
+            if (signature.block_id_flag == cometbft_proto::types::v1::BlockIdFlag::Commit as i32 ||
+                signature.block_id_flag == cometbft_proto::types::v1::BlockIdFlag::Nil as i32) &&
+                signature.timestamp.is_none()
+            {
+                let commit = present_zero.signed_header.as_mut().unwrap().commit.as_mut().unwrap();
+                commit.signatures[index].timestamp = Some(go_zero_timestamp());
+                filled_indices.push(index);
+            }
+        }
+        assert!(!filled_indices.is_empty(), "fixture has omitted signed-slot timestamps");
+
+        let (present_zero, _) = convert_light_block_from_proto(&present_zero)
+            .expect("explicit Go zero-time control converts");
+        let (omitted, _) = convert_light_block_from_proto(&light_block)
+            .expect("omitted timestamps convert as Go zero time");
+        for index in filled_indices {
+            assert_eq!(
+                omitted.signed_header.commit.signatures[index],
+                present_zero.signed_header.commit.signatures[index],
+                "signed slot {index} has the same Go zero time after conversion"
+            );
         }
     }
 
