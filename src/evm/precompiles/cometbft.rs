@@ -13,9 +13,11 @@ use cometbft::{
 use cometbft_light_client::types::LightBlock;
 use cometbft_light_client_verifier::types::Validator;
 use cometbft_proto::{
+    google::protobuf::Timestamp,
     types::v1::{
-        BlockId as RawBlockId, LightBlock as TmLightBlock, SimpleValidator as TmSimpleValidator,
-        Validator as TmValidator, ValidatorSet as TmValidatorSet,
+        BlockId as RawBlockId, BlockIdFlag, LightBlock as TmLightBlock,
+        SimpleValidator as TmSimpleValidator, Validator as TmValidator,
+        ValidatorSet as TmValidatorSet,
     },
     version::v1::Consensus as RawConsensusVersion,
     Protobuf,
@@ -66,6 +68,10 @@ const COMETBFT_LIGHT_BLOCK_VALIDATION_BASE: u64 = 3_000;
 /// Per-input-byte gas charged from Pasteur, so cost scales with the validator/signature
 /// count instead of being a flat fee.
 const COMETBFT_LIGHT_BLOCK_VALIDATE_PER_BYTE_GAS: u64 = 16;
+
+/// CometBFT `version.BlockProtocol`. Go's `Header.ValidateBasic` rejects any other header
+/// `version.block`; cometbft-rs copies the field through unchecked.
+const COMETBFT_BLOCK_PROTOCOL: u64 = 11;
 
 fn cometbft_light_block_validation_run(input: &[u8], gas_limit: u64, reservoir: u64) -> PrecompileResult {
     cometbft_light_block_validation_run_inner(input, gas_limit, reservoir, true, false, 0)
@@ -164,6 +170,14 @@ fn cometbft_light_block_validation_run_inner(
 /// The light block, plus its validators in protobuf order. `Set` sorts validators by power and
 /// address, but go-bsc keeps the wire order: commit signatures are bound to validators by
 /// index, and the set is hashed and re-encoded in that order.
+/// The CometBFT/Go zero time (`0001-01-01T00:00:00Z`), which is `EPOCH - 62135596800` seconds.
+/// gogoproto's `nullable=false` stdtime fields decode an omitted value to exactly this, and it is
+/// the same sentinel used for absent votes, so normalising an absent timestamp to it reproduces
+/// go-bsc's decode result bit-for-bit.
+fn go_zero_timestamp() -> Timestamp {
+    Timestamp { seconds: -62_135_596_800, nanos: 0 }
+}
+
 type ConvertLightBlockResult = Result<(LightBlock, Vec<Validator>), PrecompileHalt>;
 fn convert_light_block_from_proto(light_block_proto: &TmLightBlock) -> ConvertLightBlockResult {
     // Both fields are optional in the protobuf definition, so any caller can omit them by
@@ -171,10 +185,39 @@ fn convert_light_block_from_proto(light_block_proto: &TmLightBlock) -> ConvertLi
     // unwrapping it.
     let signed_header_proto =
         light_block_proto.signed_header.as_ref().ok_or(BscPrecompileError::InvalidInput)?;
-    let signed_header = match SignedHeader::try_from(signed_header_proto.clone()) {
+
+    // Match go-bsc's CommitSig.ValidateBasic before the dependency converts an absent
+    // signature into an enum variant that discards its validator address.
+    if let Some(commit) = &signed_header_proto.commit {
+        for sig in &commit.signatures {
+            if sig.block_id_flag == BlockIdFlag::Absent as i32 &&
+                !sig.validator_address.is_empty()
+            {
+                return Err(BscPrecompileError::InvalidInput.into());
+            }
+        }
+    }
+
+    // go-bsc models `Header.time` (protobuf field 4) as a non-nullable `time.Time`
+    // (gogoproto `nullable=false, stdtime=true`), so an omitted field 4 decodes to Go's zero
+    // time and `Header.ValidateBasic` never rejects it. The pinned Greenfield Rust model has
+    // `time: Option<Timestamp>` and `Header::try_from` returns `missing_timestamp` when it is
+    // absent, which would make reth reject a light block that canonical geth accepts. Reproduce
+    // the gogoproto non-nullable semantics by normalising an absent timestamp to the Go/protobuf
+    // zero time before domain conversion.
+    let mut signed_header_proto = signed_header_proto.clone();
+    if let Some(header) = signed_header_proto.header.as_mut() {
+        header.time.get_or_insert_with(go_zero_timestamp);
+    }
+
+    let signed_header = match SignedHeader::try_from(signed_header_proto) {
         Ok(sh) => sh.clone(),
         Err(_) => return Err(BscPrecompileError::InvalidInput.into()),
     };
+    // Go runs `Header.ValidateBasic` while converting the proto header, for every 0x67 variant.
+    if signed_header.header().version.block != COMETBFT_BLOCK_PROTOCOL {
+        return Err(BscPrecompileError::InvalidInput.into());
+    }
 
     let mut validator_set_proto =
         light_block_proto.validator_set.clone().ok_or(BscPrecompileError::InvalidInput)?;
@@ -508,7 +551,8 @@ fn decode_consensus_state(
     let mut pos = 0_u64;
     let chain_id = &input[..CHAIN_ID_LENGTH as usize];
     let chain_id = String::from_utf8_lossy(chain_id);
-    let chain_id = chain_id.trim_end_matches('\0').to_owned();
+    // Go BSC uses bytes.Trim(..., "\x00") for this fixed-width field.
+    let chain_id = chain_id.trim_matches('\0').to_owned();
     pos += CHAIN_ID_LENGTH;
 
     let height =
@@ -1953,6 +1997,15 @@ mod tests {
     /// Rebuilds the fixture's light block around a single validator with the identity public
     /// key, re-binding `validators_hash` and the commit block ID so only the signature matters.
     fn identity_validator_light_block_input(sig: [u8; 64]) -> Vec<u8> {
+        identity_validator_light_block_input_with_header(sig, |_| {})
+    }
+
+    /// As [`identity_validator_light_block_input`], applying `edit_header` before the header
+    /// hash is bound into the commit.
+    fn identity_validator_light_block_input_with_header(
+        sig: [u8; 64],
+        edit_header: impl FnOnce(&mut cometbft_proto::types::v1::Header),
+    ) -> Vec<u8> {
         use cometbft_proto::crypto::v1::{public_key::Sum, PublicKey as RawPublicKey};
         use sha2::Sha256;
 
@@ -1984,10 +2037,14 @@ mod tests {
         let mut header = signed_header.header.take().unwrap();
         header.validators_hash = validators_hash.clone();
         header.next_validators_hash = validators_hash.clone();
+        edit_header(&mut header);
         // The prost re-encode below drops Greenfield's RandaoMix (field 15), so bind the commit
-        // to the Go header hash with an empty RandaoMix, as the precompile computes it.
+        // to the Go header hash with an empty RandaoMix, as the precompile computes it. Go
+        // hashes an omitted `time` as its zero time, which conversion normalises it to.
+        let mut hashed_header = header.clone();
+        hashed_header.time.get_or_insert_with(go_zero_timestamp);
         let header_hash = header_hash_with_randao_mix(
-            &cometbft::block::Header::try_from(header.clone()).expect("header"),
+            &cometbft::block::Header::try_from(hashed_header).expect("header"),
             &[],
         )
         .as_bytes()
@@ -2048,6 +2105,192 @@ mod tests {
                 Some(&expected),
                 "non-canonical R must fail verification, as on geth"
             );
+        }
+    }
+
+    /// SRC-1735: go-bsc models `Header.time` (protobuf field 4) as a non-nullable stdtime, so an
+    /// omitted field 4 decodes to the Go zero time and is accepted; the pinned Rust model made it
+    /// optional and rejected an absent value, splitting reth from canonical geth. A present
+    /// (even zero) timestamp was always accepted by both clients. The two inputs differ only in
+    /// the presence of field 4, and geth returns the same output for both.
+    #[test]
+    fn light_block_omitted_header_time_is_accepted_like_geth() {
+        let with_time = |time: Option<Timestamp>| {
+            identity_validator_light_block_input_with_header(identity_vote_signature(0x00), |h| {
+                h.time = time
+            })
+        };
+        let present = with_time(Some(go_zero_timestamp()));
+        let omitted = with_time(None);
+
+        let header_time = |input: &[u8]| {
+            let (_, proto, _) = decode_light_block_validation_input(input, true).unwrap();
+            proto.signed_header.unwrap().header.unwrap().time
+        };
+        assert!(header_time(&present).is_some());
+        assert!(header_time(&omitted).is_none());
+
+        type Run = fn(&[u8], u64, u64) -> PrecompileResult;
+        let runs: [Run; 3] = [
+            cometbft_light_block_validation_run_before_hertz,
+            cometbft_light_block_validation_run,
+            cometbft_light_block_validation_run_pasteur,
+        ];
+        for run in runs {
+            let present = run(&present, 10_000_000, 0).unwrap();
+            let omitted = run(&omitted, 10_000_000, 0).unwrap();
+            assert!(present.is_success(), "halted with {:?}", present.halt_reason());
+            assert!(omitted.is_success(), "halted with {:?}", omitted.halt_reason());
+            assert_eq!(omitted.bytes, present.bytes);
+        }
+    }
+
+    /// SRC-2520: geth-bsc's `Header.ValidateBasic` rejects any `version.block` other than
+    /// `BlockProtocol` (11). reth used to accept the otherwise-valid light block, so a contract
+    /// branching on 0x67 executed differently on the two clients.
+    #[test]
+    fn non_block_protocol_header_version_is_rejected_like_geth() {
+        type Run = fn(&[u8], u64, u64) -> PrecompileResult;
+        let runs: [Run; 3] = [
+            cometbft_light_block_validation_run_before_hertz,
+            cometbft_light_block_validation_run,
+            cometbft_light_block_validation_run_pasteur,
+        ];
+        let with_block_version = |block: u64| {
+            identity_validator_light_block_input_with_header(identity_vote_signature(0x00), |h| {
+                h.version.as_mut().unwrap().block = block
+            })
+        };
+        for run in runs {
+            let output = run(&with_block_version(COMETBFT_BLOCK_PROTOCOL), 10_000_000, 0).unwrap();
+            assert!(!output.is_halt(), "BlockProtocol control must verify, as on geth");
+
+            for block in [0, 10, 12, u64::MAX] {
+                let output = run(&with_block_version(block), 10_000_000, 0).unwrap();
+                let expected: PrecompileHalt = BscPrecompileError::InvalidInput.into();
+                assert_eq!(
+                    output.halt_reason(),
+                    Some(&expected),
+                    "version.block {block} must be rejected, as on geth"
+                );
+            }
+        }
+    }
+
+    /// SRC-1249: go-bsc decodes the trusted chain ID with `bytes.Trim(.., "\x00")`, so NUL
+    /// padding is dropped from both ends; interior NULs are kept.
+    #[test]
+    fn consensus_state_chain_id_padding_matches_go() {
+        let input = valid_light_block_input();
+        let cs_length = u64::from_be_bytes(input[24..32].try_into().unwrap()) as usize;
+        let state = &input[CONSENSUS_STATE_LENGTH_BYTES_LENGTH as usize..
+            CONSENSUS_STATE_LENGTH_BYTES_LENGTH as usize + cs_length];
+
+        for (field, expected) in [
+            (b"\0greenfield_9000-121".as_slice(), "greenfield_9000-121"),
+            (b"\0\0greenfield_9000-121".as_slice(), "greenfield_9000-121"),
+            (b"greenfield_9000-121".as_slice(), "greenfield_9000-121"),
+            (b"green\0field_9000-121".as_slice(), "green\0field_9000-121"),
+            (b"12345678901234567890123456789012".as_slice(), "12345678901234567890123456789012"),
+        ] {
+            let mut encoded = state.to_vec();
+            encoded[..CHAIN_ID_LENGTH as usize].fill(0);
+            encoded[..field.len()].copy_from_slice(field);
+            let decoded = decode_consensus_state(&Bytes::from(encoded), false).unwrap();
+            assert_eq!(decoded.chain_id, expected, "field: {field:?}");
+        }
+    }
+
+    /// SRC-1249: a trusted chain ID with leading NUL padding verifies like the canonical one,
+    /// as on go-bsc; an interior NUL still changes the chain ID and fails.
+    #[test]
+    fn precompile_accepts_leading_nul_chain_id_padding() {
+        let input = valid_light_block_input();
+        let mut leading_nul = input.clone();
+        let start = CONSENSUS_STATE_LENGTH_BYTES_LENGTH as usize;
+        let end = start + CHAIN_ID_LENGTH as usize;
+        leading_nul[start] = 0;
+        leading_nul[start + 1..end].copy_from_slice(&input[start..end - 1]);
+
+        let mut interior_nul = input.clone();
+        interior_nul[start + 5] = 0;
+
+        type Run = fn(&[u8], u64, u64) -> PrecompileResult;
+        let runs: [Run; 3] = [
+            cometbft_light_block_validation_run_before_hertz,
+            cometbft_light_block_validation_run,
+            cometbft_light_block_validation_run_pasteur,
+        ];
+        for run in runs {
+            let canonical = run(&input, 10_000_000, 0).unwrap();
+            let padded = run(&leading_nul, 10_000_000, 0).unwrap();
+            assert!(canonical.is_success());
+            assert!(padded.is_success());
+            assert_eq!(padded.bytes, canonical.bytes);
+            assert_eq!(padded.gas_used, canonical.gas_used);
+            assert!(run(&interior_nul, 10_000_000, 0).unwrap().is_halt());
+        }
+    }
+
+    /// SRC-1887: a canonical absent commit signature (no address, no signature) still converts,
+    /// with either an omitted or the explicit Go zero timestamp.
+    #[test]
+    fn light_block_canonical_absent_commit_sig_is_preserved() {
+        use cometbft_proto::types::v1::CommitSig;
+
+        let (_, light_block, _) =
+            decode_light_block_validation_input(&valid_light_block_input(), false).unwrap();
+        assert!(convert_light_block_from_proto(&light_block).is_ok());
+        let signature_count =
+            light_block.signed_header.as_ref().unwrap().commit.as_ref().unwrap().signatures.len();
+
+        // These are conversion controls, not quorum-valid light blocks.
+        for timestamp in [None, Some(go_zero_timestamp())] {
+            for index in 0..signature_count {
+                let mut proto = light_block.clone();
+                proto.signed_header.as_mut().unwrap().commit.as_mut().unwrap().signatures[index] =
+                    CommitSig {
+                        block_id_flag: BlockIdFlag::Absent as i32,
+                        timestamp: timestamp.clone(),
+                        ..Default::default()
+                    };
+
+                let (converted, _) = convert_light_block_from_proto(&proto)
+                    .expect("a canonical absent signature must survive conversion");
+                assert_eq!(converted.signed_header.commit.signatures.len(), signature_count);
+                assert!(converted.signed_header.commit.signatures[index].is_absent());
+            }
+        }
+    }
+
+    /// SRC-1887: go-bsc's `CommitSig.ValidateBasic` rejects an absent signature that carries a
+    /// validator address; cometbft-rs drops the address while converting it.
+    #[test]
+    fn light_block_absent_commit_sig_rejects_nonempty_validator_address() {
+        use cometbft_proto::types::v1::CommitSig;
+
+        let (_, light_block, _) =
+            decode_light_block_validation_input(&valid_light_block_input(), false).unwrap();
+        let signature_count =
+            light_block.signed_header.as_ref().unwrap().commit.as_ref().unwrap().signatures.len();
+
+        // Reject every nonempty address, including zero-filled addresses and lengths
+        // other than 20 bytes, wherever the absent entry occurs in the commit.
+        for validator_address in [vec![0], vec![0; 20], vec![1; 20], vec![1; 21]] {
+            for index in 0..signature_count {
+                let mut proto = light_block.clone();
+                proto.signed_header.as_mut().unwrap().commit.as_mut().unwrap().signatures[index] =
+                    CommitSig {
+                        block_id_flag: BlockIdFlag::Absent as i32,
+                        validator_address: validator_address.clone(),
+                        timestamp: Some(go_zero_timestamp()),
+                        signature: Vec::new(),
+                    };
+
+                let error = convert_light_block_from_proto(&proto)
+                    .expect_err("an absent signature must not discard a nonempty address");
+                assert_eq!(error, BscPrecompileError::InvalidInput.into());
+            }
         }
     }
 
