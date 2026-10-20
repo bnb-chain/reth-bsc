@@ -172,7 +172,7 @@ cometbft-light-client = { git = "https://github.com/bnb-chain/greenfield-cometbf
 prost12 = { package = "prost", version = "0.12.6" }
 prost = { version = "0.14.3" }
 
-tendermint = { git = "https://github.com/bnb-chain/tendermint-rs-parlia", rev = "8c21ccbd58a174e07eed2c9343e63ccd00f0fbd5", features = [
+tendermint = { git = "https://github.com/bnb-chain/tendermint-rs-parlia", rev = "3f7b54d9fb93a0432bdadfc733cdcb8a887a851e", features = [
     "secp256k1",
 ] }
 signature = "2.2.0"
