@@ -366,6 +366,51 @@ mod tests {
         ));
     }
 
+    /// The Osaka limit applies to go-bsc's `Block.Size()`, which excludes blob sidecars. A
+    /// block whose sidecars alone push its network encoding past 8 MiB must not be rejected as
+    /// too large by `validate_block_pre_execution`.
+    #[test]
+    fn osaka_block_size_check_ignores_sidecars() {
+        use crate::{
+            chainspec::BscChainSpec,
+            node::primitives::{BscBlobTransactionSidecar, BscBlockBody},
+        };
+        use alloy_eips::eip4844::{Blob, BlobTransactionSidecar, Bytes48};
+        use reth_primitives_traits::SealedBlock;
+
+        let blobs = 65;
+        let sidecar = BscBlobTransactionSidecar {
+            inner: BlobTransactionSidecar {
+                blobs: vec![Blob::default(); blobs],
+                commitments: vec![Bytes48::default(); blobs],
+                proofs: vec![Bytes48::default(); blobs],
+            },
+            block_number: 0,
+            block_hash: B256::ZERO,
+            tx_index: 0,
+            tx_hash: B256::ZERO,
+            version: 0,
+        };
+        // Mainnet activates Osaka at timestamp 1777343400.
+        let header = Header { number: 50_000_000, timestamp: 1_777_343_401, ..Default::default() };
+        let body = BscBlockBody {
+            inner: alloy_consensus::BlockBody {
+                transactions: Vec::new(),
+                ommers: Vec::new(),
+                withdrawals: None,
+            },
+            sidecars: Some(vec![sidecar]),
+        };
+        assert!(BscBlock::rlp_length(&header, &body) > MAX_RLP_BLOCK_SIZE_OSAKA);
+        assert!(BscBlock::canonical_rlp_length(&header, &body) <= MAX_RLP_BLOCK_SIZE_OSAKA);
+
+        let parlia =
+            Parlia::new(Arc::new(BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet())), 200);
+        let block = SealedBlock::seal_slow(BscBlock { header, body });
+        let result = parlia.validate_block_pre_execution(&block);
+        assert!(!matches!(result, Err(ConsensusError::BlockTooLarge { .. })), "{result:?}");
+    }
+
     #[test]
     fn future_timestamp_check_uses_seconds_parity() {
         let header = sealed(Header { timestamp: 101, ..Default::default() });
