@@ -1718,6 +1718,71 @@ mod tests {
         }
     }
 
+    /// Proposer/cache normalization must preserve the wire order used by indexed verification,
+    /// including when bridge fields are unset. It must not make swapped signatures valid.
+    #[test]
+    fn light_block_validator_decoding_preserves_indexed_verification() {
+        use cometbft_proto::crypto::v1::public_key::Sum;
+
+        for (name, edit, _) in bridge_field_cases() {
+            for cache in [-1, i64::MAX] {
+                for swapped in [false, true] {
+                    let (original, expected) = runtime_signed_light_block(
+                        |signers| {
+                            signers.reverse();
+                            edit(signers);
+                        },
+                        |sigs| {
+                            if swapped {
+                                sigs.swap(0, 1);
+                            }
+                        },
+                    );
+                    let split = fixture_split(&original);
+                    let mut input = original[..split].to_vec();
+                    input.extend(map_proto_message(&original[split..], 2, |set| {
+                        let mut set = TmValidatorSet::decode(set).unwrap();
+                        set.total_voting_power = cache;
+                        set.proposer.as_mut().unwrap().pub_key.as_mut().unwrap().sum =
+                            Some(Sum::Secp256k1(vec![0; 33]));
+                        set.encode_to_vec()
+                    }));
+                    for (fork, (run, per_byte_gas)) in cometbft_forks().into_iter().enumerate() {
+                        let gas = COMETBFT_LIGHT_BLOCK_VALIDATION_BASE
+                            + input.len() as u64 * per_byte_gas;
+                        let output = run(&input, gas, 17).unwrap();
+                        assert_eq!(
+                            output.is_success(),
+                            !swapped,
+                            "{name} cache={cache} swapped={swapped} fork={fork}"
+                        );
+                        if swapped {
+                            assert_eq!(
+                                output.status,
+                                revm::precompile::PrecompileStatus::Halt(
+                                    BscPrecompileError::CometBftApplyBlockFailed.into()
+                                )
+                            );
+                            assert!(output.bytes.is_empty());
+                        } else {
+                            let mut expected = expected.clone();
+                            if fork == 0 {
+                                expected[0] = 0;
+                            }
+                            assert_eq!(output.bytes.as_ref(), expected);
+                            assert_eq!(output.gas_used, gas);
+                        }
+                        assert_eq!(output.reservoir, 17);
+                        assert_eq!(
+                            run(&input, gas - 1, 17).unwrap().status,
+                            revm::precompile::PrecompileStatus::Halt(PrecompileHalt::OutOfGas)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     fn proposer_test_cases() -> Vec<(&'static str, Vec<u8>, bool)> {
         use cometbft_proto::{crypto::v1::public_key::Sum, types::v1::Validator};
 
