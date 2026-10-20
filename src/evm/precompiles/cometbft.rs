@@ -13,6 +13,7 @@ use cometbft::{
 use cometbft_light_client::types::LightBlock;
 use cometbft_light_client_verifier::types::Validator;
 use cometbft_proto::{
+    google::protobuf::Timestamp,
     types::v1::{
         BlockId as RawBlockId, LightBlock as TmLightBlock, SimpleValidator as TmSimpleValidator,
         Validator as TmValidator, ValidatorSet as TmValidatorSet,
@@ -164,6 +165,14 @@ fn cometbft_light_block_validation_run_inner(
 /// The light block, plus its validators in protobuf order. `Set` sorts validators by power and
 /// address, but go-bsc keeps the wire order: commit signatures are bound to validators by
 /// index, and the set is hashed and re-encoded in that order.
+/// The CometBFT/Go zero time (`0001-01-01T00:00:00Z`), which is `EPOCH - 62135596800` seconds.
+/// gogoproto's `nullable=false` stdtime fields decode an omitted value to exactly this, and it is
+/// the same sentinel used for absent votes, so normalising an absent timestamp to it reproduces
+/// go-bsc's decode result bit-for-bit.
+fn go_zero_timestamp() -> Timestamp {
+    Timestamp { seconds: -62_135_596_800, nanos: 0 }
+}
+
 type ConvertLightBlockResult = Result<(LightBlock, Vec<Validator>), PrecompileHalt>;
 fn convert_light_block_from_proto(light_block_proto: &TmLightBlock) -> ConvertLightBlockResult {
     // Both fields are optional in the protobuf definition, so any caller can omit them by
@@ -171,7 +180,20 @@ fn convert_light_block_from_proto(light_block_proto: &TmLightBlock) -> ConvertLi
     // unwrapping it.
     let signed_header_proto =
         light_block_proto.signed_header.as_ref().ok_or(BscPrecompileError::InvalidInput)?;
-    let signed_header = match SignedHeader::try_from(signed_header_proto.clone()) {
+
+    // go-bsc models `Header.time` (protobuf field 4) as a non-nullable `time.Time`
+    // (gogoproto `nullable=false, stdtime=true`), so an omitted field 4 decodes to Go's zero
+    // time and `Header.ValidateBasic` never rejects it. The pinned Greenfield Rust model has
+    // `time: Option<Timestamp>` and `Header::try_from` returns `missing_timestamp` when it is
+    // absent, which would make reth reject a light block that canonical geth accepts. Reproduce
+    // the gogoproto non-nullable semantics by normalising an absent timestamp to the Go/protobuf
+    // zero time before domain conversion.
+    let mut signed_header_proto = signed_header_proto.clone();
+    if let Some(header) = signed_header_proto.header.as_mut() {
+        header.time.get_or_insert_with(go_zero_timestamp);
+    }
+
+    let signed_header = match SignedHeader::try_from(signed_header_proto) {
         Ok(sh) => sh.clone(),
         Err(_) => return Err(BscPrecompileError::InvalidInput.into()),
     };
@@ -1953,6 +1975,15 @@ mod tests {
     /// Rebuilds the fixture's light block around a single validator with the identity public
     /// key, re-binding `validators_hash` and the commit block ID so only the signature matters.
     fn identity_validator_light_block_input(sig: [u8; 64]) -> Vec<u8> {
+        identity_validator_light_block_input_with_header(sig, |_| {})
+    }
+
+    /// As [`identity_validator_light_block_input`], applying `edit_header` before the header
+    /// hash is bound into the commit.
+    fn identity_validator_light_block_input_with_header(
+        sig: [u8; 64],
+        edit_header: impl FnOnce(&mut cometbft_proto::types::v1::Header),
+    ) -> Vec<u8> {
         use cometbft_proto::crypto::v1::{public_key::Sum, PublicKey as RawPublicKey};
         use sha2::Sha256;
 
@@ -1984,10 +2015,14 @@ mod tests {
         let mut header = signed_header.header.take().unwrap();
         header.validators_hash = validators_hash.clone();
         header.next_validators_hash = validators_hash.clone();
+        edit_header(&mut header);
         // The prost re-encode below drops Greenfield's RandaoMix (field 15), so bind the commit
-        // to the Go header hash with an empty RandaoMix, as the precompile computes it.
+        // to the Go header hash with an empty RandaoMix, as the precompile computes it. Go
+        // hashes an omitted `time` as its zero time, which conversion normalises it to.
+        let mut hashed_header = header.clone();
+        hashed_header.time.get_or_insert_with(go_zero_timestamp);
         let header_hash = header_hash_with_randao_mix(
-            &cometbft::block::Header::try_from(header.clone()).expect("header"),
+            &cometbft::block::Header::try_from(hashed_header).expect("header"),
             &[],
         )
         .as_bytes()
@@ -2048,6 +2083,43 @@ mod tests {
                 Some(&expected),
                 "non-canonical R must fail verification, as on geth"
             );
+        }
+    }
+
+    /// SRC-1735: go-bsc models `Header.time` (protobuf field 4) as a non-nullable stdtime, so an
+    /// omitted field 4 decodes to the Go zero time and is accepted; the pinned Rust model made it
+    /// optional and rejected an absent value, splitting reth from canonical geth. A present
+    /// (even zero) timestamp was always accepted by both clients. The two inputs differ only in
+    /// the presence of field 4, and geth returns the same output for both.
+    #[test]
+    fn light_block_omitted_header_time_is_accepted_like_geth() {
+        let with_time = |time: Option<Timestamp>| {
+            identity_validator_light_block_input_with_header(identity_vote_signature(0x00), |h| {
+                h.time = time
+            })
+        };
+        let present = with_time(Some(go_zero_timestamp()));
+        let omitted = with_time(None);
+
+        let header_time = |input: &[u8]| {
+            let (_, proto, _) = decode_light_block_validation_input(input, true).unwrap();
+            proto.signed_header.unwrap().header.unwrap().time
+        };
+        assert!(header_time(&present).is_some());
+        assert!(header_time(&omitted).is_none());
+
+        type Run = fn(&[u8], u64, u64) -> PrecompileResult;
+        let runs: [Run; 3] = [
+            cometbft_light_block_validation_run_before_hertz,
+            cometbft_light_block_validation_run,
+            cometbft_light_block_validation_run_pasteur,
+        ];
+        for run in runs {
+            let present = run(&present, 10_000_000, 0).unwrap();
+            let omitted = run(&omitted, 10_000_000, 0).unwrap();
+            assert!(present.is_success(), "halted with {:?}", present.halt_reason());
+            assert!(omitted.is_success(), "halted with {:?}", omitted.halt_reason());
+            assert_eq!(omitted.bytes, present.bytes);
         }
     }
 
