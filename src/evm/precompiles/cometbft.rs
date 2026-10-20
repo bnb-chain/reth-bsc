@@ -538,7 +538,8 @@ fn decode_consensus_state(
     let mut pos = 0_u64;
     let chain_id = &input[..CHAIN_ID_LENGTH as usize];
     let chain_id = String::from_utf8_lossy(chain_id);
-    let chain_id = chain_id.trim_end_matches('\0').to_owned();
+    // Go BSC uses bytes.Trim(..., "\x00") for this fixed-width field.
+    let chain_id = chain_id.trim_matches('\0').to_owned();
     pos += CHAIN_ID_LENGTH;
 
     let height =
@@ -2160,6 +2161,61 @@ mod tests {
                     "version.block {block} must be rejected, as on geth"
                 );
             }
+        }
+    }
+
+    /// SRC-1249: go-bsc decodes the trusted chain ID with `bytes.Trim(.., "\x00")`, so NUL
+    /// padding is dropped from both ends; interior NULs are kept.
+    #[test]
+    fn consensus_state_chain_id_padding_matches_go() {
+        let input = valid_light_block_input();
+        let cs_length = u64::from_be_bytes(input[24..32].try_into().unwrap()) as usize;
+        let state = &input[CONSENSUS_STATE_LENGTH_BYTES_LENGTH as usize..
+            CONSENSUS_STATE_LENGTH_BYTES_LENGTH as usize + cs_length];
+
+        for (field, expected) in [
+            (b"\0greenfield_9000-121".as_slice(), "greenfield_9000-121"),
+            (b"\0\0greenfield_9000-121".as_slice(), "greenfield_9000-121"),
+            (b"greenfield_9000-121".as_slice(), "greenfield_9000-121"),
+            (b"green\0field_9000-121".as_slice(), "green\0field_9000-121"),
+            (b"12345678901234567890123456789012".as_slice(), "12345678901234567890123456789012"),
+        ] {
+            let mut encoded = state.to_vec();
+            encoded[..CHAIN_ID_LENGTH as usize].fill(0);
+            encoded[..field.len()].copy_from_slice(field);
+            let decoded = decode_consensus_state(&Bytes::from(encoded), false).unwrap();
+            assert_eq!(decoded.chain_id, expected, "field: {field:?}");
+        }
+    }
+
+    /// SRC-1249: a trusted chain ID with leading NUL padding verifies like the canonical one,
+    /// as on go-bsc; an interior NUL still changes the chain ID and fails.
+    #[test]
+    fn precompile_accepts_leading_nul_chain_id_padding() {
+        let input = valid_light_block_input();
+        let mut leading_nul = input.clone();
+        let start = CONSENSUS_STATE_LENGTH_BYTES_LENGTH as usize;
+        let end = start + CHAIN_ID_LENGTH as usize;
+        leading_nul[start] = 0;
+        leading_nul[start + 1..end].copy_from_slice(&input[start..end - 1]);
+
+        let mut interior_nul = input.clone();
+        interior_nul[start + 5] = 0;
+
+        type Run = fn(&[u8], u64, u64) -> PrecompileResult;
+        let runs: [Run; 3] = [
+            cometbft_light_block_validation_run_before_hertz,
+            cometbft_light_block_validation_run,
+            cometbft_light_block_validation_run_pasteur,
+        ];
+        for run in runs {
+            let canonical = run(&input, 10_000_000, 0).unwrap();
+            let padded = run(&leading_nul, 10_000_000, 0).unwrap();
+            assert!(canonical.is_success());
+            assert!(padded.is_success());
+            assert_eq!(padded.bytes, canonical.bytes);
+            assert_eq!(padded.gas_used, canonical.gas_used);
+            assert!(run(&interior_nul, 10_000_000, 0).unwrap().is_halt());
         }
     }
 
