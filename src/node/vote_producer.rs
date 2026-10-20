@@ -317,8 +317,10 @@ mod tests {
         std::env::set_var("BSC_VOTE_JOURNAL_MEMORY_ONLY", "1");
         std::env::set_var("BSC_VOTE_WARMUP_BLOCKS", "2");
 
-        let mut sk = [0u8; 32];
-        sk[31] = 1;
+        // Generated, not hard-coded; clearing the top nibble keeps the scalar below the BLS12-381
+        // group order (see `bls_signer::random_test_signer`).
+        let mut sk: [u8; 32] = B256::random().into();
+        sk[0] &= 0x0f;
         let _ = bls_signer::init_global_bls_signer_from_bytes(sk);
         let me = bls_signer::global_bls_public_key().unwrap();
         // Startup config stays enabled for the whole process, as in production; the vote
@@ -326,7 +328,7 @@ mod tests {
         let _ = crate::node::miner::config::set_global_mining_config(
             crate::node::miner::config::MiningConfig {
                 enabled: true,
-                private_key_hex: Some("11".repeat(32)),
+                private_key_hex: Some(alloy_primitives::hex::encode(B256::random())),
                 ..Default::default()
             },
         );
