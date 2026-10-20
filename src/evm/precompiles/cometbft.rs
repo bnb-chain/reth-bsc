@@ -2264,22 +2264,25 @@ mod tests {
         );
     }
 
-    /// The identity validator's light block over a trusted set {B, X} two heights below, so the
-    /// trusting (1/3) check runs on the trusted set. B is the identity validator with trusted
-    /// power 1 and is the only signer; X has a filler public key, `x_power` and never signs.
-    fn trusted_power_light_block_input(x_power: u64) -> Vec<u8> {
+    /// The identity validator's light block over a trusted set {B, X}. B is the identity
+    /// validator with trusted power `b_power` and is the only signer; X has a filler public key,
+    /// `x_power` and never signs. With `skipping`, the trusted state is two heights below, so
+    /// the trusting (1/3) check runs on the trusted set; otherwise the update is adjacent.
+    fn trusted_power_light_block_input(b_power: u64, x_power: u64, skipping: bool) -> Vec<u8> {
         let input = identity_validator_light_block_input(identity_vote_signature(0x00));
         let (trusted, light_block) = input.split_at(fixture_split(&input));
         let mut cs = trusted[CONSENSUS_STATE_LENGTH_BYTES_LENGTH as usize..].to_vec();
 
-        let height_at = CHAIN_ID_LENGTH as usize;
-        let height = u64::from_be_bytes(cs[height_at..height_at + 8].try_into().unwrap());
-        cs[height_at..height_at + 8].copy_from_slice(&(height - 1).to_be_bytes());
+        if skipping {
+            let height_at = CHAIN_ID_LENGTH as usize;
+            let height = u64::from_be_bytes(cs[height_at..height_at + 8].try_into().unwrap());
+            cs[height_at..height_at + 8].copy_from_slice(&(height - 1).to_be_bytes());
+        }
         let power_at = (CHAIN_ID_LENGTH +
             HEIGHT_LENGTH +
             VALIDATOR_SET_HASH_LENGTH +
             VALIDATOR_PUBKEY_LENGTH) as usize;
-        cs[power_at..power_at + 8].copy_from_slice(&1u64.to_be_bytes());
+        cs[power_at..power_at + 8].copy_from_slice(&b_power.to_be_bytes());
         cs.extend_from_slice(&[0x11; 32]);
         cs.extend_from_slice(&x_power.to_be_bytes());
         cs.extend_from_slice(&[0x12; 20]);
@@ -2319,7 +2322,43 @@ mod tests {
             cometbft_light_block_validation_run_pasteur,
         ];
         for (name, x_power, go_accepts) in cases {
-            let input = trusted_power_light_block_input(x_power);
+            let input = trusted_power_light_block_input(1, x_power, true);
+            for run in runs {
+                let output = run(&input, 10_000_000, 0).unwrap();
+                if go_accepts {
+                    assert!(output.is_success(), "{name}: halted with {:?}", output.halt_reason());
+                } else {
+                    let expected: PrecompileHalt =
+                        BscPrecompileError::CometBftApplyBlockFailed.into();
+                    assert_eq!(output.halt_reason(), Some(&expected), "{name}");
+                }
+            }
+        }
+    }
+
+    /// `MaxTotalVotingPower` is 2^60 - 1. go-bsc totals the trusted set only on the skipping
+    /// path, so a trusted set just over the cap fails a skipping update (go-bsc's panic,
+    /// recovered as a failed call) but still succeeds as an adjacent update. Neither may panic
+    /// here. At exactly the cap the total is accepted, and B, the only signer, holds more than
+    /// 1/3 of it.
+    #[test]
+    fn trusted_voting_power_cap_boundary_matches_go() {
+        let cap = Set::MAX_TOTAL_VOTING_POWER;
+        assert_eq!(cap, (1 << 60) - 1);
+        let cases = [
+            ("at the cap, skipping", cap - 1, 1, true, true),
+            // B = 2^60 - 1 and X = 1, the two powers from the #528 review.
+            ("over the cap, skipping", cap, 1, true, false),
+            ("over the cap, adjacent", cap, 1, false, true),
+        ];
+        type Run = fn(&[u8], u64, u64) -> PrecompileResult;
+        let runs: [Run; 3] = [
+            cometbft_light_block_validation_run_before_hertz,
+            cometbft_light_block_validation_run,
+            cometbft_light_block_validation_run_pasteur,
+        ];
+        for (name, b_power, x_power, skipping, go_accepts) in cases {
+            let input = trusted_power_light_block_input(b_power, x_power, skipping);
             for run in runs {
                 let output = run(&input, 10_000_000, 0).unwrap();
                 if go_accepts {
