@@ -400,6 +400,10 @@ struct ConsensusState {
     next_validator_set_hash: Bytes,
     /// In wire order, as go-bsc keeps it (see `ConvertLightBlockResult`).
     validators: Vec<Validator>,
+    /// Each validator's voting power as go-bsc holds it: the 8 stored bytes read as `int64`, so
+    /// a raw value of 2^63 or more is negative. go-bsc never validates the trusted set, so the
+    /// trusting check, the set hash and the encoding use these, not `Validator::power`.
+    voting_powers: Vec<i64>,
 }
 
 /// Bind the supplied validator set to the header and the header to the signed commit.
@@ -427,7 +431,8 @@ impl ConsensusState {
         next_validator_set_hash: Bytes,
         validators: Vec<Validator>,
     ) -> Self {
-        Self { chain_id, height, next_validator_set_hash, validators }
+        let voting_powers = validators.iter().map(|v| v.power() as i64).collect();
+        Self { chain_id, height, next_validator_set_hash, validators, voting_powers }
     }
 
     /// `validators` is the light block's validator set in wire order.
@@ -457,15 +462,17 @@ impl ConsensusState {
         } else {
             // More than 1/3 of the trusted set, then more than 2/3 of the new set, must have
             // signed. The second check stays last, as in go-bsc.
-            verify_commit_light_trusting(signed_header, &self.validators)?;
+            verify_commit_light_trusting(signed_header, &self.validators, &self.voting_powers)?;
             verify_commit_light(signed_header, &validators)?;
         }
 
-        let validator_set_changed = trusted_validator_set_hash(&self.validators)
-            .ne(signed_header.header().validators_hash.as_bytes());
+        let validator_set_changed =
+            trusted_validator_set_hash(&self.validators, &self.voting_powers)
+                .ne(signed_header.header().validators_hash.as_bytes());
         self.height = light_block.height().value();
         self.next_validator_set_hash =
             Bytes::from(signed_header.header().next_validators_hash.as_bytes().to_vec());
+        self.voting_powers = validators.iter().map(|v| v.power() as i64).collect();
         self.validators = validators;
 
         Ok(validator_set_changed)
@@ -506,7 +513,8 @@ impl ConsensusState {
 
         for i in 0..validator_set_length {
             let validator = &self.validators[i];
-            let voting_power = validator.power();
+            // go-bsc's `EncodeConsensusState` writes `uint64(VotingPower)`.
+            let voting_power = self.voting_powers[i] as u64;
 
             output[pos..pos + VALIDATOR_PUBKEY_LENGTH as usize]
                 .copy_from_slice(&validator.pub_key.to_bytes());
@@ -566,6 +574,7 @@ fn decode_consensus_state(
     let validator_set_length = (input_length - minimum_length) / SINGLE_VALIDATOR_BYTES_LENGTH;
     let validator_set_bytes = input[pos as usize..].to_vec();
     let mut validator_set = Vec::with_capacity(validator_set_length as usize);
+    let mut voting_powers = Vec::with_capacity(validator_set_length as usize);
     for i in 0..validator_set_length {
         let validator = &validator_set_bytes[i as usize * SINGLE_VALIDATOR_BYTES_LENGTH as usize..
             (i + 1) as usize * SINGLE_VALIDATOR_BYTES_LENGTH as usize];
@@ -592,7 +601,10 @@ fn decode_consensus_state(
             Some(pk) => pk,
             None => return Err(BscPrecompileError::InvalidInput.into()),
         };
-        let vp = Power::from(voting_power as u32);
+        // go-bsc reads the power as `int64`. `Power` cannot hold a negative value, so a raw
+        // value of 2^63 or more keeps a zero placeholder here; the trusted-set logic reads
+        // `ConsensusState::voting_powers` instead.
+        let vp = Power::try_from(voting_power).unwrap_or_default();
         let validator_info = Validator::new_with_bls_and_relayer(
             pk,
             vp,
@@ -600,10 +612,12 @@ fn decode_consensus_state(
             relayer_address.to_vec(),
         );
         validator_set.push(validator_info);
+        voting_powers.push(voting_power as i64);
     }
 
-    let consensus_state =
+    let mut consensus_state =
         ConsensusState::new(chain_id, height, next_validator_set_hash, validator_set);
+    consensus_state.voting_powers = voting_powers;
     if require_unique_validators {
         validate_unique_validator_set(&consensus_state.validators)?;
     }
@@ -724,12 +738,17 @@ fn verify_commit_light(
 /// go-bsc's `ValidatorSet.VerifyCommitLightTrusting` at the default 1/3 trust level: more than
 /// 1/3 of the trusted `validators` signed the commit. The commit may come from a different set,
 /// so signers are looked up by address; a trusted validator signing twice is rejected.
+///
+/// `voting_powers` are the trusted powers as go-bsc holds them. go-bsc builds the trusted set
+/// from caller input without validating it, so its `int64` arithmetic is reproduced exactly:
+/// truncating division, and a tally that wraps like Go's `+=`.
 fn verify_commit_light_trusting(
     signed_header: &SignedHeader,
     validators: &[Validator],
+    voting_powers: &[i64],
 ) -> Result<(), PrecompileHalt> {
-    let needed = total_voting_power(validators)? / 3;
-    let mut tallied = 0_u64;
+    let needed = go_total_voting_power(voting_powers)? / 3;
+    let mut tallied = 0_i64;
     let mut seen = vec![false; validators.len()];
     for (idx, commit_sig) in signed_header.commit.signatures.iter().enumerate() {
         let CommitSig::BlockIdFlagCommit { validator_address, .. } = commit_sig else { continue };
@@ -741,12 +760,26 @@ fn verify_commit_light_trusting(
             return Err(BscPrecompileError::CometBftApplyBlockFailed.into())
         }
         verify_commit_sig(signed_header, idx, commit_sig, &validators[val_idx])?;
-        tallied += validators[val_idx].power();
+        tallied = tallied.wrapping_add(voting_powers[val_idx]);
         if tallied > needed {
             return Ok(())
         }
     }
     Err(BscPrecompileError::CometBftApplyBlockFailed.into())
+}
+
+/// go-bsc's `ValidatorSet.TotalVotingPower` over `int64` powers: a running sum clipped at the
+/// `int64` bounds (`safeAddClip`) that may not exceed `MaxTotalVotingPower` at any step. Go
+/// panics there, and its precompile wrapper recovers the panic as a failed call.
+fn go_total_voting_power(voting_powers: &[i64]) -> Result<i64, PrecompileHalt> {
+    let mut total = 0_i64;
+    for &voting_power in voting_powers {
+        total = total.saturating_add(voting_power);
+        if total > Set::MAX_TOTAL_VOTING_POWER as i64 {
+            return Err(BscPrecompileError::CometBftApplyBlockFailed.into());
+        }
+    }
+    Ok(total)
 }
 
 /// Verify the for-block signature at commit index `idx` under `validator`'s key.
@@ -790,9 +823,26 @@ fn total_voting_power(validators: &[Validator]) -> Result<u64, PrecompileHalt> {
 }
 
 /// go-bsc's `ValidatorSet.Hash` of the trusted set decoded from the consensus state, in the given
-/// order (`Set::hash` sorts first). The decoded bridge fields are always full width, as in go-bsc.
-fn trusted_validator_set_hash(validators: &[Validator]) -> [u8; 32] {
-    let leaves: Vec<Vec<u8>> = validators.iter().map(Validator::hash_bytes).collect();
+/// order (`Set::hash` sorts first), with go-bsc's `int64` `voting_powers`. The decoded bridge
+/// fields are always full width, as in go-bsc.
+fn trusted_validator_set_hash(validators: &[Validator], voting_powers: &[i64]) -> [u8; 32] {
+    use cometbft_proto::crypto::v1::{public_key::Sum, PublicKey as RawPublicKey};
+
+    let leaves: Vec<Vec<u8>> = validators
+        .iter()
+        .zip(voting_powers)
+        .map(|(validator, &voting_power)| {
+            TmSimpleValidator {
+                pub_key: Some(RawPublicKey {
+                    sum: Some(Sum::Ed25519(validator.pub_key.to_bytes())),
+                }),
+                voting_power,
+                bls_key: validator.bls_key.as_bytes().to_vec(),
+                relayer_address: validator.relayer_address.as_bytes().to_vec(),
+            }
+            .encode_to_vec()
+        })
+        .collect();
     simple_hash_from_byte_vectors::<Sha256>(&leaves)
 }
 
@@ -2452,8 +2502,116 @@ mod tests {
         };
         let validators = [validator(0xa1, 10), validator(0xa2, 30), validator(0xa3, 20)];
         assert_eq!(
-            trusted_validator_set_hash(&validators),
+            trusted_validator_set_hash(&validators, &[10, 30, 20]),
             hex!("94394bfbba91945d64638bc905fc5c513b3f0583860dc3503160ec32f554b195"),
         );
+    }
+
+    /// The identity validator's light block over a trusted set {B, X}. B is the identity
+    /// validator with trusted power `b_power` and is the only signer; X has a filler public key,
+    /// `x_power` and never signs. With `skipping`, the trusted state is two heights below, so
+    /// the trusting (1/3) check runs on the trusted set; otherwise the update is adjacent.
+    fn trusted_power_light_block_input(b_power: u64, x_power: u64, skipping: bool) -> Vec<u8> {
+        let input = identity_validator_light_block_input(identity_vote_signature(0x00));
+        let (trusted, light_block) = input.split_at(fixture_split(&input));
+        let mut cs = trusted[CONSENSUS_STATE_LENGTH_BYTES_LENGTH as usize..].to_vec();
+
+        if skipping {
+            let height_at = CHAIN_ID_LENGTH as usize;
+            let height = u64::from_be_bytes(cs[height_at..height_at + 8].try_into().unwrap());
+            cs[height_at..height_at + 8].copy_from_slice(&(height - 1).to_be_bytes());
+        }
+        let power_at = (CHAIN_ID_LENGTH +
+            HEIGHT_LENGTH +
+            VALIDATOR_SET_HASH_LENGTH +
+            VALIDATOR_PUBKEY_LENGTH) as usize;
+        cs[power_at..power_at + 8].copy_from_slice(&b_power.to_be_bytes());
+        cs.extend_from_slice(&[0x11; 32]);
+        cs.extend_from_slice(&x_power.to_be_bytes());
+        cs.extend_from_slice(&[0x12; 20]);
+        cs.extend_from_slice(&[0x13; 48]);
+
+        let mut crafted = vec![0u8; CONSENSUS_STATE_LENGTH_BYTES_LENGTH as usize];
+        crafted[24..32].copy_from_slice(&(cs.len() as u64).to_be_bytes());
+        crafted.extend_from_slice(&cs);
+        crafted.extend_from_slice(light_block);
+        crafted
+    }
+
+    /// SRC-1750: go-bsc reads each trusted power as `int64` and runs its own arithmetic on the
+    /// unvalidated trusted set. reth truncated the power to `u32`, so a power of 2^32 became 0
+    /// and B alone passed the 1/3 check that go-bsc fails. The expected results are go-bsc's
+    /// (greenfield-cometbft v1.3.2 `VerifyCommitLightTrusting`) for a trusted set {X, B = 1}
+    /// where only B signs.
+    #[test]
+    fn trusted_voting_power_matches_go_int64_semantics() {
+        let cases = [
+            // X = 10: total 11, B's 1 is not more than 11 / 3.
+            ("control", 10, false),
+            // Truncated to 0 by the old `as u32` cast, which let B alone pass.
+            ("2^32", 1 << 32, false),
+            // The total passes `MaxTotalVotingPower`: Go panics, recovered as a failed call.
+            ("MaxTotalVotingPower", (i64::MAX / 8) as u64, false),
+            ("2^60", 1 << 60, false),
+            // `int64` MinInt64: the total is negative, so any signature clears 1/3 of it.
+            ("2^63", 1 << 63, true),
+            // `int64` -1: the total is 0, and B's 1 is more than 0 / 3.
+            ("u64::MAX", u64::MAX, true),
+        ];
+        type Run = fn(&[u8], u64, u64) -> PrecompileResult;
+        let runs: [Run; 3] = [
+            cometbft_light_block_validation_run_before_hertz,
+            cometbft_light_block_validation_run,
+            cometbft_light_block_validation_run_pasteur,
+        ];
+        for (name, x_power, go_accepts) in cases {
+            let input = trusted_power_light_block_input(1, x_power, true);
+            for run in runs {
+                let output = run(&input, 10_000_000, 0).unwrap();
+                if go_accepts {
+                    assert!(output.is_success(), "{name}: halted with {:?}", output.halt_reason());
+                } else {
+                    let expected: PrecompileHalt =
+                        BscPrecompileError::CometBftApplyBlockFailed.into();
+                    assert_eq!(output.halt_reason(), Some(&expected), "{name}");
+                }
+            }
+        }
+    }
+
+    /// `MaxTotalVotingPower` is 2^60 - 1. go-bsc totals the trusted set only on the skipping
+    /// path, so a trusted set just over the cap fails a skipping update (go-bsc's panic,
+    /// recovered as a failed call) but still succeeds as an adjacent update. Neither may panic
+    /// here. At exactly the cap the total is accepted, and B, the only signer, holds more than
+    /// 1/3 of it.
+    #[test]
+    fn trusted_voting_power_cap_boundary_matches_go() {
+        let cap = Set::MAX_TOTAL_VOTING_POWER;
+        assert_eq!(cap, (1 << 60) - 1);
+        let cases = [
+            ("at the cap, skipping", cap - 1, 1, true, true),
+            // B = 2^60 - 1 and X = 1, the two powers from the #528 review.
+            ("over the cap, skipping", cap, 1, true, false),
+            ("over the cap, adjacent", cap, 1, false, true),
+        ];
+        type Run = fn(&[u8], u64, u64) -> PrecompileResult;
+        let runs: [Run; 3] = [
+            cometbft_light_block_validation_run_before_hertz,
+            cometbft_light_block_validation_run,
+            cometbft_light_block_validation_run_pasteur,
+        ];
+        for (name, b_power, x_power, skipping, go_accepts) in cases {
+            let input = trusted_power_light_block_input(b_power, x_power, skipping);
+            for run in runs {
+                let output = run(&input, 10_000_000, 0).unwrap();
+                if go_accepts {
+                    assert!(output.is_success(), "{name}: halted with {:?}", output.halt_reason());
+                } else {
+                    let expected: PrecompileHalt =
+                        BscPrecompileError::CometBftApplyBlockFailed.into();
+                    assert_eq!(output.halt_reason(), Some(&expected), "{name}");
+                }
+            }
+        }
     }
 }
