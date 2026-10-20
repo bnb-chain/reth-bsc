@@ -15,8 +15,9 @@ use cometbft_light_client_verifier::types::Validator;
 use cometbft_proto::{
     google::protobuf::Timestamp,
     types::v1::{
-        BlockId as RawBlockId, LightBlock as TmLightBlock, SimpleValidator as TmSimpleValidator,
-        Validator as TmValidator, ValidatorSet as TmValidatorSet,
+        BlockId as RawBlockId, BlockIdFlag, LightBlock as TmLightBlock,
+        SimpleValidator as TmSimpleValidator, Validator as TmValidator,
+        ValidatorSet as TmValidatorSet,
     },
     version::v1::Consensus as RawConsensusVersion,
     Protobuf,
@@ -184,6 +185,18 @@ fn convert_light_block_from_proto(light_block_proto: &TmLightBlock) -> ConvertLi
     // unwrapping it.
     let signed_header_proto =
         light_block_proto.signed_header.as_ref().ok_or(BscPrecompileError::InvalidInput)?;
+
+    // Match go-bsc's CommitSig.ValidateBasic before the dependency converts an absent
+    // signature into an enum variant that discards its validator address.
+    if let Some(commit) = &signed_header_proto.commit {
+        for sig in &commit.signatures {
+            if sig.block_id_flag == BlockIdFlag::Absent as i32 &&
+                !sig.validator_address.is_empty()
+            {
+                return Err(BscPrecompileError::InvalidInput.into());
+            }
+        }
+    }
 
     // go-bsc models `Header.time` (protobuf field 4) as a non-nullable `time.Time`
     // (gogoproto `nullable=false, stdtime=true`), so an omitted field 4 decodes to Go's zero
@@ -2216,6 +2229,68 @@ mod tests {
             assert_eq!(padded.bytes, canonical.bytes);
             assert_eq!(padded.gas_used, canonical.gas_used);
             assert!(run(&interior_nul, 10_000_000, 0).unwrap().is_halt());
+        }
+    }
+
+    /// SRC-1887: a canonical absent commit signature (no address, no signature) still converts,
+    /// with either an omitted or the explicit Go zero timestamp.
+    #[test]
+    fn light_block_canonical_absent_commit_sig_is_preserved() {
+        use cometbft_proto::types::v1::CommitSig;
+
+        let (_, light_block, _) =
+            decode_light_block_validation_input(&valid_light_block_input(), false).unwrap();
+        assert!(convert_light_block_from_proto(&light_block).is_ok());
+        let signature_count =
+            light_block.signed_header.as_ref().unwrap().commit.as_ref().unwrap().signatures.len();
+
+        // These are conversion controls, not quorum-valid light blocks.
+        for timestamp in [None, Some(go_zero_timestamp())] {
+            for index in 0..signature_count {
+                let mut proto = light_block.clone();
+                proto.signed_header.as_mut().unwrap().commit.as_mut().unwrap().signatures[index] =
+                    CommitSig {
+                        block_id_flag: BlockIdFlag::Absent as i32,
+                        timestamp: timestamp.clone(),
+                        ..Default::default()
+                    };
+
+                let (converted, _) = convert_light_block_from_proto(&proto)
+                    .expect("a canonical absent signature must survive conversion");
+                assert_eq!(converted.signed_header.commit.signatures.len(), signature_count);
+                assert!(converted.signed_header.commit.signatures[index].is_absent());
+            }
+        }
+    }
+
+    /// SRC-1887: go-bsc's `CommitSig.ValidateBasic` rejects an absent signature that carries a
+    /// validator address; cometbft-rs drops the address while converting it.
+    #[test]
+    fn light_block_absent_commit_sig_rejects_nonempty_validator_address() {
+        use cometbft_proto::types::v1::CommitSig;
+
+        let (_, light_block, _) =
+            decode_light_block_validation_input(&valid_light_block_input(), false).unwrap();
+        let signature_count =
+            light_block.signed_header.as_ref().unwrap().commit.as_ref().unwrap().signatures.len();
+
+        // Reject every nonempty address, including zero-filled addresses and lengths
+        // other than 20 bytes, wherever the absent entry occurs in the commit.
+        for validator_address in [vec![0], vec![0; 20], vec![1; 20], vec![1; 21]] {
+            for index in 0..signature_count {
+                let mut proto = light_block.clone();
+                proto.signed_header.as_mut().unwrap().commit.as_mut().unwrap().signatures[index] =
+                    CommitSig {
+                        block_id_flag: BlockIdFlag::Absent as i32,
+                        validator_address: validator_address.clone(),
+                        timestamp: Some(go_zero_timestamp()),
+                        signature: Vec::new(),
+                    };
+
+                let error = convert_light_block_from_proto(&proto)
+                    .expect_err("an absent signature must not discard a nonempty address");
+                assert_eq!(error, BscPrecompileError::InvalidInput.into());
+            }
         }
     }
 
