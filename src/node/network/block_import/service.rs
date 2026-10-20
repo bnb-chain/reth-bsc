@@ -2237,9 +2237,22 @@ mod tests {
         }
     }
 
+    /// The test validator's signing key, generated once per test process so the block signer,
+    /// the header seal and the snapshot's validator agree.
+    fn test_signer_key() -> secp256k1::SecretKey {
+        static KEY: std::sync::LazyLock<secp256k1::SecretKey> = std::sync::LazyLock::new(|| {
+            loop {
+                if let Ok(key) = secp256k1::SecretKey::from_byte_array(&rand::random()) {
+                    break key;
+                }
+            }
+        });
+        *KEY
+    }
+
     /// Creates a test block message
     fn create_test_block() -> NewBlockMessage<BscNewBlock> {
-        let secret = secp256k1::SecretKey::from_slice(&[1; 32]).unwrap();
+        let secret = test_signer_key();
         let public = secp256k1::PublicKey::from_secret_key(&secp256k1::Secp256k1::new(), &secret);
         let address = alloy_primitives::Address::from_slice(
             &alloy_primitives::keccak256(&public.serialize_uncompressed()[1..])[12..],
@@ -2272,7 +2285,7 @@ mod tests {
     }
 
     fn sign_test_header(header: &mut Header) {
-        let secret = secp256k1::SecretKey::from_slice(&[1; 32]).unwrap();
+        let secret = test_signer_key();
         let signature =
             crate::node::miner::signer::MinerSigner::new(secret).seal_header(header, 56).unwrap();
         let mut extra = header.extra_data.to_vec();
