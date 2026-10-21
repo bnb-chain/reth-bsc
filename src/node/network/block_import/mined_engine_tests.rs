@@ -3,21 +3,25 @@
 use super::*;
 use crate::{
     chainspec::{bsc::bsc_mainnet, BscChainSpec},
-    node::{consensus::BscConsensus, engine_api::validator::BscEngineValidator},
+    node::{
+        consensus::BscConsensus, engine_api::validator::BscEngineValidator,
+        evm::config::BscEvmConfig,
+    },
 };
 use alloy_consensus::Header;
 use alloy_primitives::{Bytes, B256, U256};
 use alloy_rpc_types_engine::{ForkchoiceState, PayloadStatusEnum};
-use reth_chain_state::{CanonicalInMemoryState, ComputedTrieData};
-use reth_engine_primitives::NoopInvalidBlockHook;
+use reth_chain_state::CanonicalInMemoryState;
+use reth_engine_primitives::{BeaconEngineMessage, NoopInvalidBlockHook};
 use reth_engine_tree::{
     engine::{EngineApiEvent, EngineApiKind},
     persistence::PersistenceHandle,
     tree::{payload_validator::BasicEngineValidator, EngineApiTreeHandler, TreeConfig},
 };
+use reth_evm::execute::BlockExecutionOutput;
 use reth_primitives_traits::{RecoveredBlock, SealedHeader};
 use reth_provider::test_utils::MockEthProvider;
-use reth_trie_db::ChangesetCache;
+use reth_storage_overlay::OverlayManager;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -46,18 +50,22 @@ async fn real_engine_discards_competing_mined_block_and_barrier_prevents_downloa
         let local_header =
             Header { extra_data: Bytes::from_static(b"local off-turn block"), ..canonical.clone() };
         let local_hash = local_header.hash_slow();
-        let block = ExecutedBlock::new(
-            Arc::new(RecoveredBlock::new_unhashed(
+        let block = BuiltPayloadExecutedBlock {
+            recovered_block: Arc::new(RecoveredBlock::new_unhashed(
                 crate::BscBlock { header: local_header, body: Default::default() },
                 Vec::new(),
             )),
-            Arc::default(),
-            ComputedTrieData::default(),
-        );
+            execution_output: Arc::new(BlockExecutionOutput {
+                result: Default::default(),
+                state: Default::default(),
+            }),
+            hashed_state: Arc::default(),
+            trie_updates: Arc::default(),
+        };
 
         let runtime = reth_tasks::Runtime::test();
         let config = TreeConfig::default();
-        let cache = ChangesetCache::new();
+        let overlay_manager = OverlayManager::new(runtime.state_trie_overlay_worker_pool());
         let consensus = Arc::new(BscConsensus::new(spec.clone()));
         let evm = BscEvmConfig::new(spec.clone());
         let validator = BasicEngineValidator::new(
@@ -67,7 +75,7 @@ async fn real_engine_discards_competing_mined_block_and_barrier_prevents_downloa
             BscEngineValidator::new(spec),
             config.clone(),
             Box::new(NoopInvalidBlockHook::default()),
-            cache.clone(),
+            overlay_manager.clone(),
             runtime.clone(),
         );
         let (persistence_tx, _persistence_rx) = std::sync::mpsc::channel();
@@ -79,14 +87,13 @@ async fn real_engine_discards_competing_mined_block_and_barrier_prevents_downloa
             PersistenceHandle::new(persistence_tx),
             reth::payload::PayloadBuilderHandle::new(payload_tx),
             CanonicalInMemoryState::with_head(SealedHeader::seal_slow(canonical), None, None),
+            overlay_manager,
             config,
             EngineApiKind::Ethereum,
             evm,
-            cache,
             runtime,
         );
-        let (tx, mut rx): (EngineTx<MockEthProvider<BscPrimitives, BscChainSpec>>, _) =
-            mpsc::unbounded_channel();
+        let (tx, mut rx): (BscEngineApiTx, _) = mpsc::unbounded_channel();
         let engine_control = engine_tx.clone();
         let forwarding = tokio::spawn(async move {
             while let Some(request) = rx.recv().await {
