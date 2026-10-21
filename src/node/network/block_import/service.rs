@@ -3,7 +3,8 @@ use crate::{
     chainspec::BscChainSpec,
     consensus::{parlia::vote_pool, ParliaConsensusErr},
     node::{
-        consensus::BscForkChoiceEngine, engine::BscBuiltPayload,
+        consensus::{BscConsensus, BscForkChoiceEngine},
+        engine::BscBuiltPayload,
         engine_api::payload::BscPayloadTypes, evm::util::insert_header_to_cache_with_hash,
         network::BscNewBlock,
     },
@@ -12,7 +13,7 @@ use crate::{
 use alloy_consensus::{BlockBody, Header};
 use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::{Address, B256, U128, U256};
-use reth_primitives_traits::SealedBlock;
+use reth_primitives_traits::{SealedBlock, SealedHeader};
 use alloy_rpc_types_engine::{ForkchoiceState, PayloadStatusEnum};
 use futures::{future::Either, stream::FuturesUnordered, StreamExt};
 use parking_lot::RwLock;
@@ -61,6 +62,9 @@ pub(crate) type ImportEvent = BlockImportEvent<BscNewBlock>;
 
 /// Future that processes a block import and returns its outcome
 type ImportFut = Pin<Box<dyn Future<Output = Option<Outcome>> + Send + Sync>>;
+
+/// A pending import retains its hash even when execution emits no network outcome.
+type PendingImportFut = Pin<Box<dyn Future<Output = (B256, Option<Outcome>)> + Send + Sync>>;
 
 /// Channel message type for incoming blocks
 pub(crate) type IncomingBlock = (BlockMsg, PeerId);
@@ -113,7 +117,7 @@ where
     /// Send the event of the import to the network
     to_network: UnboundedSender<ImportEvent>,
     /// Pending block imports.
-    pending_imports: FuturesUnordered<ImportFut>,
+    pending_imports: FuturesUnordered<PendingImportFut>,
     /// Cache of processed block hashes to avoid reprocessing the same block.
     processed_blocks: LruCache<B256>,
     /// Cache of queued block hashes to avoid processing the same block.
@@ -720,6 +724,30 @@ where
     fn on_new_block(&mut self, mut block: BlockMsg, peer_id: PeerId) {
         tracing::debug!(target: "bsc::block_import", "Receiving new block from network: number = {:?}, hash = {:?}, peer = {:?}", block.block.0.block.header.number, block.hash, peer_id);
 
+        // Basic consensus validity must precede all propagation and admission markers.
+        let header = &block.block.0.block.header;
+        let computed_hash = header.hash_slow();
+        let validation = if block.hash != computed_hash {
+            Err(BlockImportError::Other(
+                std::io::Error::other(format!(
+                    "announced block hash {} does not match computed header hash {computed_hash}",
+                    block.hash,
+                ))
+                .into(),
+            ))
+        } else {
+            BscConsensus::new(self.forkchoice_engine.chain_spec().clone())
+                .validate_header(&SealedHeader::new(header.clone(), computed_hash))
+                .map_err(BlockImportError::from)
+        };
+        if let Err(error) = validation {
+            let _ = self.to_network.send(BlockImportEvent::Outcome(Outcome {
+                peer: peer_id,
+                result: Err(error),
+            }));
+            return;
+        }
+
         // Record before stale-block / dedup checks: announcer remains a
         // valid `GetBlocksByRange` target even if we skip processing here.
         crate::node::network::bsc_protocol::registry::record_announcer(block.hash, peer_id);
@@ -731,7 +759,7 @@ where
         const MAX_STALE_BLOCK_DISTANCE: u64 = 64;
         if let Ok(info) = self.forkchoice_engine.provider.chain_info() {
             let block_number = block.block.0.block.header.number;
-            if block_number + MAX_STALE_BLOCK_DISTANCE < info.best_number {
+            if block_number.saturating_add(MAX_STALE_BLOCK_DISTANCE) < info.best_number {
                 let gap = info.best_number - block_number;
                 tracing::debug!(
                     target: "bsc::block_import",
@@ -815,7 +843,6 @@ where
             tracing::warn!(target: "bsc::block_import", "Failed to transfer block to EVN peers: number = {:?}, hash = {:?}, error = {}", block.block.0.block.header.number, block.hash, e);
         }
         // Send ValidHeader announcement to trigger NewBlock diffusion from few peers
-        // TODO: add header validation later
         let _ =
             self.to_network.send(BlockImportEvent::Announcement(BlockValidation::ValidHeader {
                 block: block.clone(),
@@ -823,7 +850,8 @@ where
 
         tracing::debug!(target: "bsc::block_import", "Sending new block to import service: number = {:?}, hash = {:?}", block.block.0.block.header.number, block.hash);
         let payload_fut = self.new_payload(block.clone(), peer_id);
-        self.pending_imports.push(payload_fut);
+        let hash = block.hash;
+        self.pending_imports.push(Box::pin(async move { (hash, payload_fut.await) }));
     }
 
     /// Handle incoming block hashes by spawning fork-aware ancestor recovery
@@ -1206,11 +1234,10 @@ where
         }
 
         // Process completed imports and send events to network
-        while let Poll::Ready(Some(outcome)) = this.pending_imports.poll_next_unpin(cx) {
+        while let Poll::Ready(Some((hash, outcome))) = this.pending_imports.poll_next_unpin(cx) {
+            this.queued_blocks.remove(&hash);
             if let Some(outcome) = outcome {
-                let mut block_hash = None;
                 if let Ok(BlockValidation::ValidBlock { block }) = &outcome.result {
-                    block_hash = Some(block.hash);
                     this.processed_blocks.insert(block.hash);
                     // Cache the full block body for later range responses.
                     crate::shared::cache_full_block(block.block.0.block.clone());
@@ -1218,13 +1245,6 @@ where
                         tracing::warn!(target: "bsc::block_import", "Failed to transfer block to EVN peers: number = {:?}, hash = {:?}, error = {}", block.block.0.block.header.number, block.hash, e);
                     }
                 }
-
-                // TODO: add queued blocks removal later, to avoid milicious block import, and trigger next download.
-                // now, it must wait backfilling to download the correct block.
-                // the verified header can drop the peer later, it cannot transfer a bad header now.
-                // if let Some(block_hash) = outcome.block.hash {
-                //     this.queued_blocks.remove(&block_hash);
-                // }
 
                 if let Err(e) = this.to_network.send(BlockImportEvent::Outcome(outcome)) {
                     return Poll::Ready(Err(Box::new(e)));
@@ -1255,7 +1275,6 @@ mod tests {
     use reth_eth_wire::NewBlock;
     use reth_ethereum_primitives::{Block, Receipt};
     use reth_node_ethereum::EthEngineTypes;
-    use reth_primitives_traits::SealedHeader;
     use reth_provider::ProviderError;
     use schnellru::{ByLength, LruMap};
     use std::{
@@ -1280,11 +1299,125 @@ mod tests {
             .await;
     }
 
+    fn direct_service() -> (
+        ImportService<MockProvider>,
+        mpsc::UnboundedReceiver<ImportEvent>,
+        mpsc::UnboundedReceiver<BeaconEngineMessage<BscPayloadTypes>>,
+    ) {
+        let (to_engine, from_engine) = mpsc::unbounded_channel();
+        let (_, from_network) = mpsc::unbounded_channel();
+        let (_, from_builder) = mpsc::unbounded_channel();
+        let (_, from_bid) = mpsc::unbounded_channel();
+        let (_, from_hashes) = mpsc::unbounded_channel();
+        let (to_network, events) = mpsc::unbounded_channel();
+        let service = ImportService::new(
+            MockProvider::new(), Arc::new(BscChainSpec::from(bsc_mainnet())),
+            ConsensusEngineHandle::new(to_engine), from_network, from_builder,
+            from_bid, from_hashes, to_network,
+        );
+        (service, events, from_engine)
+    }
+
+    async fn assert_rejected_before_propagation(mut block: BlockMsg, mismatch: bool) {
+        block.hash = if mismatch { B256::random() } else { block.block.0.block.header.hash_slow() };
+        let hash = block.hash;
+        let peer = PeerId::random();
+        let (mut service, mut events, mut engine) = direct_service();
+        service.on_new_block(block, peer);
+        assert!(!service.queued_blocks.contains(&hash), "invalid header was queued");
+        assert!(!service.processed_blocks.contains(&hash));
+        assert!(service.pending_imports.is_empty());
+        assert!(matches!(events.try_recv().unwrap(), BlockImportEvent::Outcome(
+            BlockImportOutcome { peer: actual, result: Err(_) }) if actual == peer));
+        assert!(events.try_recv().is_err(), "invalid header was announced");
+        let waker = futures::task::noop_waker();
+        assert!(Pin::new(&mut service).poll(&mut Context::from_waker(&waker)).is_pending());
+        assert!(engine.try_recv().is_err(), "invalid header reached engine");
+    }
+
+    #[tokio::test]
+    async fn rejects_gas_over_limit_before_propagation() {
+        let mut block = create_test_block();
+        Arc::make_mut(&mut block.block).0.block.header.gas_used = 1;
+        assert_rejected_before_propagation(block, false).await;
+    }
+
+    #[tokio::test]
+    async fn rejects_short_extra_data_before_propagation() {
+        let mut block = create_test_block();
+        Arc::make_mut(&mut block.block).0.block.header.extra_data = vec![0; 96].into();
+        assert_rejected_before_propagation(block, false).await;
+    }
+
+    #[tokio::test]
+    async fn rejects_hash_mismatch_before_propagation() {
+        assert_rejected_before_propagation(create_test_block(), true).await;
+    }
+
+    #[tokio::test]
+    async fn extreme_block_number_does_not_overflow_stale_guard() {
+        let mut block = create_test_block();
+        let header = &mut Arc::make_mut(&mut block.block).0.block.header;
+        header.number = u64::MAX;
+        header.base_fee_per_gas = Some(0);
+        block.hash = header.hash_slow();
+        let hash = block.hash;
+        let (mut service, _events, _engine) = direct_service();
+        service.on_new_block(block, PeerId::random());
+        // Reaching existing far-ahead handling proves the stale-height arithmetic is safe.
+        assert!(service.processed_blocks.contains(&hash));
+    }
+
+    #[tokio::test]
+    async fn valid_header_is_announced_and_submitted() {
+        let (mut service, mut events, mut engine) = direct_service();
+        let block = create_test_block();
+        let hash = block.hash;
+        service.on_new_block(block, PeerId::random());
+        assert!(service.queued_blocks.contains(&hash));
+        assert!(matches!(events.try_recv().unwrap(), BlockImportEvent::Announcement(
+            BlockValidation::ValidHeader { .. })));
+        let waker = futures::task::noop_waker();
+        assert!(Pin::new(&mut service).poll(&mut Context::from_waker(&waker)).is_pending());
+        assert!(matches!(engine.try_recv().unwrap(), BeaconEngineMessage::NewPayload { .. }));
+    }
+
+    #[tokio::test]
+    async fn completed_imports_clear_queue_without_penalizing_execution_failures() {
+        for status in [Some(PayloadStatusEnum::Invalid { validation_error: "execution failed".into() }),
+            Some(PayloadStatusEnum::Syncing), None] {
+            let (mut service, mut events, mut engine) = direct_service();
+            let block = create_test_block();
+            let hash = block.hash;
+            service.on_new_block(block, PeerId::random());
+            let waker = futures::task::noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
+            let BeaconEngineMessage::NewPayload { tx, .. } = engine.try_recv().unwrap() else {
+                panic!("expected new payload");
+            };
+            if let Some(status) = status {
+                tx.send(Ok(PayloadStatus::new(status, None))).unwrap();
+            } else {
+                drop(tx);
+            }
+            assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
+            assert!(service.pending_imports.is_empty());
+            assert!(!service.queued_blocks.contains(&hash), "completed import remained queued");
+            assert!(!service.processed_blocks.contains(&hash));
+            assert!(matches!(events.try_recv().unwrap(), BlockImportEvent::Announcement(_)));
+            assert!(events.try_recv().is_err(), "execution failure penalized peer");
+        }
+    }
+
     #[tokio::test]
     async fn missing_blob_does_not_queue_or_forward_and_can_be_retried() {
         use crate::node::network::data_availability::tests::blob_block;
         let spec = Arc::new(BscChainSpec::from(
-            reth_chainspec::ChainSpecBuilder::mainnet().cancun_activated().build(),
+            reth_chainspec::ChainSpecBuilder::mainnet().cancun_activated()
+                .without_fork(reth_chainspec::EthereumHardfork::Prague)
+                .with_fork(crate::hardforks::bsc::BscHardfork::Cancun, reth_chainspec::ForkCondition::Timestamp(0))
+                .build(),
         ));
         let (to_engine, mut from_engine) = mpsc::unbounded_channel();
         let (_, from_network) = mpsc::unbounded_channel();
@@ -1293,12 +1426,23 @@ mod tests {
         let (_, from_hashes) = mpsc::unbounded_channel();
         let (to_network, mut events) = mpsc::unbounded_channel();
         let mut service = ImportService::new(
-            MockProvider::new(), spec, ConsensusEngineHandle::new(to_engine),
+            MockProvider::new(), spec.clone(), ConsensusEngineHandle::new(to_engine),
             from_network, from_builder, from_bid, from_hashes, to_network,
         );
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-        let block = blob_block(now);
+        let mut block = blob_block(now);
+        block.header.extra_data = vec![0; 97].into();
+        block.header.base_fee_per_gas = Some(0);
+        block.header.withdrawals_root = Some(crate::consensus::parlia::EMPTY_WITHDRAWALS_HASH);
+        block.header.blob_gas_used = Some(2 * alloy_eips::eip4844::DATA_GAS_PER_BLOB);
+        block.header.excess_blob_gas = Some(0);
         let hash = block.header.hash_slow();
+        for sidecar in block.body.sidecars.as_mut().unwrap() {
+            sidecar.block_hash = hash;
+        }
+        BscConsensus::new(spec.clone())
+            .validate_header(&SealedHeader::new(block.header.clone(), hash))
+            .expect("blob test header must pass basic consensus validation");
         let good = NewBlockMessage {
             hash,
             td: Some(U256::ZERO),
@@ -2007,7 +2151,7 @@ mod tests {
     /// Creates a test block message
     fn create_test_block() -> NewBlockMessage<BscNewBlock> {
         let block = BscBlock {
-            header: Header::default(),
+            header: Header { number: 1, extra_data: vec![0; 97].into(), ..Default::default() },
             body: BscBlockBody {
                 inner: BlockBody {
                     transactions: Vec::new(),
