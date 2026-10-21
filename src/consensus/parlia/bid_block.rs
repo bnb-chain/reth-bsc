@@ -17,7 +17,7 @@ use crate::{
     node::evm::error::{BscBlockExecutionError, BscBlockValidationError},
     system_contracts::{is_invoke_system_contract, VALIDATOR_CONTRACT},
 };
-use alloy_consensus::{Header, Transaction};
+use alloy_consensus::{Header, Transaction, TxType};
 use alloy_primitives::U256;
 use reth_chainspec::EthChainSpec;
 use reth_ethereum_primitives::TransactionSigned;
@@ -91,8 +91,11 @@ fn has_signable_selector(data: &[u8]) -> bool {
 }
 
 /// Reports whether `tx` looks like an unsigned BidBlock system tx (does not recover the sender):
-/// it targets a system contract, has zero gas price, and carries the all-zero signature.
+/// it is legacy, targets a system contract, has zero gas price, and carries the all-zero signature.
 pub fn is_unsigned_system_tx_candidate(tx: &TransactionSigned) -> bool {
+    if tx.tx_type() != TxType::Legacy {
+        return false;
+    }
     let Some(to) = tx.to() else { return false };
     if !is_invoke_system_contract(&to) {
         return false;
@@ -229,7 +232,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_consensus::TxLegacy;
+    use alloy_consensus::{TxEip1559, TxEip2930, TxLegacy};
     use alloy_primitives::{Address, Bytes, Signature, TxKind};
 
     fn mk_header(number: u64, timestamp: u64) -> Header {
@@ -262,6 +265,85 @@ mod tests {
 
     fn system_tx(selector: [u8; 4], value: u64) -> TransactionSigned {
         unsigned_tx(VALIDATOR_CONTRACT, 0, selector.to_vec(), value)
+    }
+
+    fn typed_deposit_txs(value: u64) -> [TransactionSigned; 2] {
+        let signature = Signature::new(U256::ZERO, U256::ZERO, false);
+        let access_list_tx = TxEip2930 {
+            chain_id: 56,
+            gas_price: 0,
+            gas_limit: 1_000_000,
+            to: TxKind::Call(VALIDATOR_CONTRACT),
+            value: U256::from(value),
+            input: Bytes::from(DEPOSIT_SELECTOR.to_vec()),
+            ..Default::default()
+        };
+        let dynamic_fee_tx = TxEip1559 {
+            chain_id: 56,
+            max_fee_per_gas: 0,
+            max_priority_fee_per_gas: 0,
+            gas_limit: 1_000_000,
+            to: TxKind::Call(VALIDATOR_CONTRACT),
+            value: U256::from(value),
+            input: Bytes::from(DEPOSIT_SELECTOR.to_vec()),
+            ..Default::default()
+        };
+        [
+            TransactionSigned::new_unhashed(access_list_tx.into(), signature),
+            TransactionSigned::new_unhashed(dynamic_fee_tx.into(), signature),
+        ]
+    }
+
+    #[test]
+    fn typed_deposits_are_not_unsigned_system_tx_candidates() {
+        let txs = typed_deposit_txs(5_000);
+        assert_eq!(txs.each_ref().map(is_unsigned_system_tx_candidate), [false, false]);
+    }
+
+    #[test]
+    fn typed_deposits_are_not_signable_system_txs() {
+        let txs = typed_deposit_txs(5_000);
+        assert_eq!(txs.each_ref().map(is_signable_system_tx), [false, false]);
+    }
+
+    #[test]
+    fn typed_deposits_are_rejected_by_bid_block_verification() {
+        let header = mk_header(101, 1_000);
+        let parent = mk_header(100, 1_000);
+        let results = typed_deposit_txs(5_000).map(|deposit| {
+            let user_tx = unsigned_tx(Address::repeat_byte(0x11), 1, vec![], 0);
+            verify_bid_block_system_txs(&[user_tx, deposit], &header, &parent, 1)
+        });
+        assert_eq!(
+            results,
+            [
+                Err(BidBlockSystemTxError::NotSignable { index: 1 }),
+                Err(BidBlockSystemTxError::NotSignable { index: 1 }),
+            ]
+        );
+    }
+
+    #[test]
+    fn typed_deposits_do_not_advertise_bid_block_deposit_value() {
+        let results = typed_deposit_txs(5_000).map(|deposit| {
+            let user_tx = unsigned_tx(Address::repeat_byte(0x11), 1, vec![], 0);
+            extract_bid_block_deposit_value(&[user_tx, deposit])
+        });
+        assert_eq!(results, [(2, U256::ZERO); 2]);
+    }
+
+    #[test]
+    fn unsigned_legacy_deposit_remains_accepted() {
+        let deposit = system_tx(DEPOSIT_SELECTOR, 5_000);
+        assert!(is_unsigned_system_tx_candidate(&deposit));
+        assert!(is_signable_system_tx(&deposit));
+        let user_tx = unsigned_tx(Address::repeat_byte(0x11), 1, vec![], 0);
+        let txs = [user_tx, deposit];
+        assert_eq!(extract_bid_block_deposit_value(&txs), (1, U256::from(5_000)));
+        assert_eq!(
+            verify_bid_block_system_txs(&txs, &mk_header(101, 1_000), &mk_header(100, 1_000), 1),
+            Ok(())
+        );
     }
 
     #[test]
