@@ -588,8 +588,14 @@ impl ConsensusState {
         output[pos..pos + HEIGHT_LENGTH as usize].copy_from_slice(&self.height.to_be_bytes());
         pos += HEIGHT_LENGTH as usize;
 
-        output[pos..pos + VALIDATOR_SET_HASH_LENGTH as usize]
-            .copy_from_slice(self.next_validator_set_hash.as_ref());
+        // Go leaves an omitted next-validator hash zero-filled in this fixed-width field.
+        if !self.next_validator_set_hash.is_empty() {
+            if self.next_validator_set_hash.len() != VALIDATOR_SET_HASH_LENGTH as usize {
+                return Err(BscPrecompileError::CometBftEncodeConsensusStateFailed.into());
+            }
+            output[pos..pos + VALIDATOR_SET_HASH_LENGTH as usize]
+                .copy_from_slice(self.next_validator_set_hash.as_ref());
+        }
         pos += VALIDATOR_SET_HASH_LENGTH as usize;
 
         for i in 0..validator_set_length {
@@ -997,7 +1003,9 @@ mod tests {
         let mut cs = vec![0u8; CHAIN_ID_LENGTH as usize];
         cs[..chain_id.len()].copy_from_slice(chain_id.as_bytes());
         cs.extend_from_slice(&height.to_be_bytes());
-        cs.extend_from_slice(next_validators_hash);
+        let mut next_hash = [0u8; VALIDATOR_SET_HASH_LENGTH as usize];
+        next_hash[..next_validators_hash.len()].copy_from_slice(next_validators_hash);
+        cs.extend_from_slice(&next_hash);
         for validator in validators {
             let Some(Sum::Ed25519(pubkey)) = validator.pub_key.clone().and_then(|key| key.sum)
             else {
@@ -1052,6 +1060,15 @@ mod tests {
         order: impl FnOnce(&mut Vec<(Scalar, TmValidator)>),
         edit_sigs: impl FnOnce(&mut Vec<cometbft_proto::types::v1::CommitSig>),
     ) -> (Vec<u8>, Vec<u8>) {
+        runtime_signed_light_block_with_header(order, |_| {}, edit_sigs)
+    }
+
+    /// Applies header edits before hashing and signing, preserving valid header/commit binding.
+    fn runtime_signed_light_block_with_header(
+        order: impl FnOnce(&mut Vec<(Scalar, TmValidator)>),
+        edit_header: impl FnOnce(&mut cometbft_proto::types::v1::Header),
+        edit_sigs: impl FnOnce(&mut Vec<cometbft_proto::types::v1::CommitSig>),
+    ) -> (Vec<u8>, Vec<u8>) {
         use cometbft_proto::{
             crypto::v1::{public_key::Sum, PublicKey as RawPublicKey},
             types::v1::BlockIdFlag,
@@ -1090,6 +1107,7 @@ mod tests {
         let mut header = signed_header.header.take().unwrap();
         header.validators_hash = validators_hash.clone();
         header.next_validators_hash = validators_hash.clone();
+        edit_header(&mut header);
         // The prost re-encode below drops RandaoMix (field 15), so hash with an empty one.
         let header_hash = header_hash_with_randao_mix(
             &cometbft::block::Header::try_from(header.clone()).expect("header"),
@@ -1158,6 +1176,64 @@ mod tests {
         let mut crafted = with_state_prefix(false, trusted);
         crafted.extend_from_slice(&light_block.encode_to_vec());
         (crafted, expected)
+    }
+
+    fn assert_empty_next_validators_hash_output(run: fn(&[u8], u64, u64) -> PrecompileResult) {
+        let (input, expected) = runtime_signed_light_block_with_header(
+            |_| {},
+            |header| header.next_validators_hash.clear(),
+            |_| {},
+        );
+        let hash_start =
+            (CONSENSUS_STATE_LENGTH_BYTES_LENGTH + CHAIN_ID_LENGTH + HEIGHT_LENGTH) as usize;
+        assert_eq!(&expected[hash_start..hash_start + 32], &[0u8; 32]);
+        let output = run(&input, 10_000_000, 0).unwrap();
+        assert!(output.is_success(), "halted: {:?}", output.halt_reason());
+        assert_eq!(output.bytes.as_ref(), expected.as_slice());
+    }
+
+    #[test]
+    fn empty_next_validators_hash_before_hertz_matches_go() {
+        assert_empty_next_validators_hash_output(cometbft_light_block_validation_run_before_hertz);
+    }
+
+    #[test]
+    fn empty_next_validators_hash_hertz_matches_go() {
+        assert_empty_next_validators_hash_output(cometbft_light_block_validation_run);
+    }
+
+    #[test]
+    fn empty_next_validators_hash_pasteur_matches_go() {
+        assert_empty_next_validators_hash_output(cometbft_light_block_validation_run_pasteur);
+    }
+
+    #[test]
+    fn consensus_state_next_hash_encoding_boundaries() {
+        for hash in [Bytes::new(), Bytes::from(vec![0xab; 32])] {
+            let cs = ConsensusState::new("chain".to_string(), 1, hash.clone(), vec![]);
+            let encoded = cs.encode().unwrap();
+            let hash_start = (CHAIN_ID_LENGTH + HEIGHT_LENGTH) as usize;
+            assert_eq!(encoded.len(), hash_start + VALIDATOR_SET_HASH_LENGTH as usize);
+            let expected_hash = if hash.is_empty() { vec![0; 32] } else { hash.to_vec() };
+            assert_eq!(&encoded[hash_start..], expected_hash.as_slice());
+        }
+    }
+
+    #[test]
+    fn consensus_state_next_hash_encoding_rejects_malformed_widths() {
+        for len in [1, 31, 33, 64] {
+            let cs = ConsensusState::new(
+                "chain".to_string(),
+                1,
+                Bytes::from(vec![0xab; len]),
+                vec![],
+            );
+            assert_eq!(
+                cs.encode().unwrap_err(),
+                BscPrecompileError::CometBftEncodeConsensusStateFailed.into(),
+                "hash length {len}",
+            );
+        }
     }
 
     /// An adjacent light block signed by runtime-generated validators listed in descending
