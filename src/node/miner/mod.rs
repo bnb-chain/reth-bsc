@@ -11,3 +11,5 @@ pub mod util;
 
 pub use bsc_miner::BscMiner;
 pub use config::{keystore, MiningConfig};
+
+pub(crate) mod build_diagnostics;

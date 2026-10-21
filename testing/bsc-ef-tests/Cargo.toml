@@ -16,29 +16,29 @@ reth_bsc = { path = "../.." }
 rand = "0.9"
 
 # reth dependencies aligned with root crate branch to avoid duplicate crate versions
-reth-chainspec = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5" }
-reth-consensus = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5" }
-reth-ethereum-forks = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5" }
-reth-db = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5", features = [    "mdbx",
+reth-chainspec = { git = "https://github.com/bnb-chain/reth.git", rev = "3361695910c91adc500ef7bddf89b82dea84bbbc" }
+reth-consensus = { git = "https://github.com/bnb-chain/reth.git", rev = "3361695910c91adc500ef7bddf89b82dea84bbbc" }
+reth-ethereum-forks = { git = "https://github.com/bnb-chain/reth.git", rev = "3361695910c91adc500ef7bddf89b82dea84bbbc" }
+reth-db = { git = "https://github.com/bnb-chain/reth.git", rev = "3361695910c91adc500ef7bddf89b82dea84bbbc", features = [    "mdbx",
     "test-utils",
     "disable-lock",
 ] }
-reth-db-api = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5" }
-reth-db-common = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5" }
-reth-ethereum-consensus = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5" }
-reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5" }
-reth-evm = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5" }
-reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5" }
+reth-db-api = { git = "https://github.com/bnb-chain/reth.git", rev = "3361695910c91adc500ef7bddf89b82dea84bbbc" }
+reth-db-common = { git = "https://github.com/bnb-chain/reth.git", rev = "3361695910c91adc500ef7bddf89b82dea84bbbc" }
+reth-ethereum-consensus = { git = "https://github.com/bnb-chain/reth.git", rev = "3361695910c91adc500ef7bddf89b82dea84bbbc" }
+reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth.git", rev = "3361695910c91adc500ef7bddf89b82dea84bbbc" }
+reth-evm = { git = "https://github.com/bnb-chain/reth.git", rev = "3361695910c91adc500ef7bddf89b82dea84bbbc" }
+reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth.git", rev = "3361695910c91adc500ef7bddf89b82dea84bbbc" }
 reth-primitives-traits = { version = "0.6.0", default-features = false }
-reth-provider = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5", features = [
+reth-provider = { git = "https://github.com/bnb-chain/reth.git", rev = "3361695910c91adc500ef7bddf89b82dea84bbbc", features = [
     "test-utils",
 ] }
-reth-revm = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5", features = [
+reth-revm = { git = "https://github.com/bnb-chain/reth.git", rev = "3361695910c91adc500ef7bddf89b82dea84bbbc", features = [
     "std",
 ] }
-reth-tracing = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5" }
-reth-trie = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5" }
-reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", branch = "merge-upstream-v2.5" }
+reth-tracing = { git = "https://github.com/bnb-chain/reth.git", rev = "3361695910c91adc500ef7bddf89b82dea84bbbc" }
+reth-trie = { git = "https://github.com/bnb-chain/reth.git", rev = "3361695910c91adc500ef7bddf89b82dea84bbbc" }
+reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", rev = "3361695910c91adc500ef7bddf89b82dea84bbbc" }
 # revm
 
 # alloy

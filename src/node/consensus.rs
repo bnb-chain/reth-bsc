@@ -74,6 +74,11 @@ where
             ),
         );
 
+        ctx.task_executor().spawn_critical_task(
+            "bsc-finalized-turn-metrics",
+            super::reorg_metrics::run_finalized(ctx.provider().clone()),
+        );
+
         Ok(Arc::new(BscConsensus::new(ctx.chain_spec())))
     }
 }
