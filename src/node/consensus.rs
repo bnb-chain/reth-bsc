@@ -1187,6 +1187,18 @@ where
         &self,
         incoming_header: &Header,
     ) -> Result<(), ParliaConsensusErr> {
+        self.update_forkchoice_gated(incoming_header, std::future::ready(Ok(()))).await
+    }
+
+    /// Like [`Self::update_forkchoice`], but awaits `gate` after the fork-choice decision and
+    /// immediately before the update is sent. If `gate` fails, nothing is sent. This lets a
+    /// caller overlap fork-choice evaluation with confirming that the engine admitted
+    /// `incoming_header`.
+    pub async fn update_forkchoice_gated(
+        &self,
+        incoming_header: &Header,
+        gate: impl std::future::Future<Output = Result<(), ParliaConsensusErr>>,
+    ) -> Result<(), ParliaConsensusErr> {
         tracing::debug!(
             target: "bsc::forkchoice",
             block_number = incoming_header.number,
@@ -1223,6 +1235,9 @@ where
             self.get_justified_number_and_hash(new_canonical_head).unwrap_or((0, B256::ZERO));
         let (finalized_block_number, finalized_block_hash) =
             self.get_finalized_number_and_hash(new_canonical_head).unwrap_or((0, B256::ZERO));
+
+        // Everything above is read-only evaluation; nothing is published until the gate opens.
+        gate.await?;
 
         // Update finality metrics
         self.finality_metrics.justified_block_height.set(safe_block_number as f64);
