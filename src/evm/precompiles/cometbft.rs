@@ -1298,29 +1298,53 @@ mod tests {
 
     #[test]
     fn rejects_validator_set_unbound_from_header() {
-        let input = modify_fixture_light_block(|proto| {
-            let validators = proto.validator_set.as_mut().unwrap();
-            validators.validators[0].voting_power += 1;
-        });
-        let (_, proto, randao_mix) = decode_light_block_validation_input(&input, false).unwrap();
-        let (block, validators) = convert_light_block_from_proto(&proto).unwrap();
-        let validators_hash = validator_set_hash(proto.validator_set.as_ref().unwrap());
-        assert_ne!(validators_hash, block.signed_header.header().validators_hash);
-        assert_eq!(
-            header_hash_with_randao_mix(block.signed_header.header(), &randao_mix),
-            block.signed_header.commit.block_id.hash,
-        );
-        // Signature verification alone accepts this unchanged, valid signature.
-        assert!(verify_commit_light(&block.signed_header, &validators).is_ok());
-        assert_precompile_rejects(&input);
+        let (_, original, _) =
+            decode_light_block_validation_input(&valid_light_block_input(), false).unwrap();
+        let original_power = original.validator_set.as_ref().unwrap().validators[0].voting_power;
 
-        // The same binding is required on the non-adjacent trusting path.
-        let (mut trusted, _, _) = decode_light_block_validation_input(&input, false).unwrap();
-        trusted.height = 0;
-        trusted.validators = validators.clone();
-        assert!(trusted
-            .apply_light_block(&block, &randao_mix, validators_hash, validators)
-            .is_err());
+        // Keep the existing +1 case and the report's reduction to voting power 1.
+        for voting_power in [original_power + 1, 1] {
+            let input = modify_fixture_light_block(|proto| {
+                proto.validator_set.as_mut().unwrap().validators[0].voting_power = voting_power;
+            });
+            let (_, proto, randao_mix) =
+                decode_light_block_validation_input(&input, false).unwrap();
+            assert_eq!(proto.signed_header, original.signed_header);
+            let (block, validators) = convert_light_block_from_proto(&proto).unwrap();
+            let validators_hash = validator_set_hash(proto.validator_set.as_ref().unwrap());
+            assert_ne!(validators_hash, block.signed_header.header().validators_hash);
+            assert_eq!(
+                header_hash_with_randao_mix(block.signed_header.header(), &randao_mix),
+                block.signed_header.commit.block_id.hash,
+            );
+            // Signature verification alone still accepts the unchanged commit signatures.
+            assert!(verify_commit_light(&block.signed_header, &validators).is_ok());
+            assert_precompile_rejects(&input);
+
+            // Reject both adjacent and skipping updates before changing any trusted field.
+            let height = block.height().value();
+            for trusted_height in [height - 1, height - 2] {
+                let (mut trusted, _, _) =
+                    decode_light_block_validation_input(&input, false).unwrap();
+                trusted.height = trusted_height;
+                let before = trusted.encode().unwrap();
+                assert_eq!(
+                    trusted.apply_light_block(
+                        &block,
+                        &randao_mix,
+                        validators_hash,
+                        validators.clone(),
+                    ),
+                    Err(BscPrecompileError::CometBftApplyBlockFailed.into()),
+                    "voting_power={voting_power}, trusted_height={trusted_height}",
+                );
+                assert_eq!(
+                    trusted.encode().unwrap(),
+                    before,
+                    "voting_power={voting_power}, trusted_height={trusted_height}",
+                );
+            }
+        }
     }
 
     #[test]
