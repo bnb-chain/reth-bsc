@@ -178,6 +178,13 @@ fn go_zero_timestamp() -> Timestamp {
     Timestamp { seconds: -62_135_596_800, nanos: 0 }
 }
 
+/// In Go's protobuf model an omitted empty PartSetHeader decodes to its zero value.
+fn normalize_missing_part_set_header(block_id: &mut Option<RawBlockId>) {
+    if let Some(block_id) = block_id {
+        block_id.part_set_header.get_or_insert_with(Default::default);
+    }
+}
+
 /// Match gogoproto's non-nullable `stdtime` decoding for signed commit slots.
 /// Prost keeps an omitted Commit/Nil signature timestamp as `None`, while Go decodes it to
 /// `time.Time{}`. Absent signature slots do not carry a vote timestamp and remain untouched.
@@ -223,15 +230,37 @@ fn convert_light_block_from_proto(light_block_proto: &TmLightBlock) -> ConvertLi
     // the gogoproto non-nullable semantics by normalising an absent timestamp to the Go/protobuf
     // zero time before domain conversion.
     let mut signed_header_proto = signed_header_proto.clone();
+    let mut first_height_last_block_id = None;
     if let Some(header) = signed_header_proto.header.as_mut() {
         header.time.get_or_insert_with(go_zero_timestamp);
+        normalize_missing_part_set_header(&mut header.last_block_id);
+
+        // Go permits a structurally valid LastBlockID at height 1. The pinned Rust conversion
+        // rejects that shape, so preserve the domain ID and omit it only during that conversion.
+        if header.height == 1 {
+            let non_default_id = header
+                .last_block_id
+                .as_ref()
+                .and_then(|raw_id| block::Id::try_from(raw_id.clone()).ok())
+                .filter(|id| id != &block::Id::default());
+            if let Some(id) = non_default_id {
+                first_height_last_block_id = Some(id);
+                header.last_block_id = None;
+            }
+        }
+    }
+    if let Some(commit) = signed_header_proto.commit.as_mut() {
+        normalize_missing_part_set_header(&mut commit.block_id);
     }
     normalize_go_zero_commit_timestamps(&mut signed_header_proto);
 
-    let signed_header = match SignedHeader::try_from(signed_header_proto) {
+    let mut signed_header = match SignedHeader::try_from(signed_header_proto) {
         Ok(sh) => sh.clone(),
         Err(_) => return Err(BscPrecompileError::InvalidInput.into()),
     };
+    if let Some(last_block_id) = first_height_last_block_id {
+        signed_header.header.last_block_id = Some(last_block_id);
+    }
     // Go runs `Header.ValidateBasic` while converting the proto header, for every 0x67 variant.
     if signed_header.header().version.block != COMETBFT_BLOCK_PROTOCOL {
         return Err(BscPrecompileError::InvalidInput.into());
@@ -919,6 +948,8 @@ mod tests {
     use prost::Message as _;
 
     use super::*;
+
+    type NamedCometBftRun = (&'static str, fn(&[u8], u64, u64) -> PrecompileResult);
 
     /// The first valid `cometbft_light_block_validation` fixture, kept as a string so tests
     /// can rebuild an input around a modified light block.
@@ -2933,6 +2964,82 @@ mod tests {
         assert!(!go(&pubkey, &sig));
     }
 
+    #[test]
+    fn report_1691_missing_part_set_header_matches_go() {
+        let control = hex::decode(
+            include_str!("testdata/cometbft-missing-part-set-header-control.hex").trim(),
+        )
+        .unwrap();
+        let candidate = hex::decode(
+            include_str!("testdata/cometbft-missing-part-set-header-candidate.hex").trim(),
+        )
+        .unwrap();
+        let runs: [NamedCometBftRun; 3] = [
+            ("pre-Hertz", cometbft_light_block_validation_run_before_hertz),
+            ("Hertz", cometbft_light_block_validation_run),
+            ("Pasteur", cometbft_light_block_validation_run_pasteur),
+        ];
+
+        for (fork, run) in runs {
+            let control_output = run(&control, 10_000_000, 0).unwrap();
+            let candidate_output = run(&candidate, 10_000_000, 0).unwrap();
+            assert!(
+                control_output.is_success(),
+                "control ({fork}) halted: {:?}",
+                control_output.halt_reason()
+            );
+            assert!(
+                candidate_output.is_success(),
+                "candidate ({fork}) halted: {:?}",
+                candidate_output.halt_reason()
+            );
+            assert_eq!(
+                candidate_output.bytes.as_ref(),
+                control_output.bytes.as_ref(),
+                "output differs ({fork})"
+            );
+        }
+    }
+
+    #[test]
+    fn report_1694_height_one_last_block_id_matches_go() {
+        let inputs = [
+            (
+                "control",
+                hex::decode(
+                    include_str!("testdata/cometbft-height-one-last-block-id-control.hex").trim(),
+                )
+                .unwrap(),
+            ),
+            (
+                "candidate",
+                hex::decode(
+                    include_str!("testdata/cometbft-height-one-last-block-id-candidate.hex").trim(),
+                )
+                .unwrap(),
+            ),
+        ];
+        let runs: [NamedCometBftRun; 3] = [
+            ("pre-Hertz", cometbft_light_block_validation_run_before_hertz),
+            ("Hertz", cometbft_light_block_validation_run),
+            ("Pasteur", cometbft_light_block_validation_run_pasteur),
+        ];
+
+        for (fork, run) in runs {
+            for (case, input) in &inputs {
+                let (_, proto, _) = decode_light_block_validation_input(input, false).unwrap();
+                let expected = go_light_block_output(&proto);
+                let output = run(input, 10_000_000, 0).unwrap();
+                assert!(output.is_success(), "{case} ({fork}) halted: {:?}", output.halt_reason());
+                assert_eq!(
+                    output.bytes.as_ref(),
+                    expected.as_slice(),
+                    "Go output differs for {case} ({fork})"
+                );
+            }
+        }
+    }
+
     /// Rebuild the valid fixture with its commit signatures changed by `f`.
     fn with_commit_sigs(
         mut f: impl FnMut(&mut Vec<cometbft_proto::types::v1::CommitSig>),
@@ -2945,15 +3052,21 @@ mod tests {
     /// SRC-1850: go-bsc verifies signature `i` under validator `i`. Swapping two complete
     /// `CommitSig`s keeps every signature valid for its embedded address, but go-bsc rejects it.
     #[test]
-    fn pasteur_rejects_reordered_commit_sigs() {
+    fn reordered_commit_sigs_are_rejected_by_all_wrappers() {
         let unchanged = with_commit_sigs(|_| {});
-        let output =
-            cometbft_light_block_validation_run_pasteur(&unchanged, 10_000_000, 0).unwrap();
-        assert!(output.is_success());
-
         let swapped = with_commit_sigs(|sigs| sigs.swap(0, 1));
-        let output = cometbft_light_block_validation_run_pasteur(&swapped, 10_000_000, 0).unwrap();
-        assert!(output.is_halt(), "reordered commit signatures must be rejected");
+        let runs: [NamedCometBftRun; 3] = [
+            ("pre-Hertz", cometbft_light_block_validation_run_before_hertz),
+            ("Hertz", cometbft_light_block_validation_run),
+            ("Pasteur", cometbft_light_block_validation_run_pasteur),
+        ];
+
+        for (fork, run) in runs {
+            let control = run(&unchanged, 10_000_000, 0).unwrap();
+            assert!(control.is_success(), "control ({fork}) halted: {:?}", control.halt_reason());
+            let candidate = run(&swapped, 10_000_000, 0).unwrap();
+            assert!(candidate.is_halt(), "reordered signatures accepted ({fork})");
+        }
     }
 
     /// go-bsc never reads the `CommitSig` address when counting the new validator set, so a
@@ -2979,7 +3092,7 @@ mod tests {
     /// go-bsc skips nil votes without verifying them, so a nil vote with a junk signature is
     /// ignored and the other three validators are still a quorum.
     #[test]
-    fn pasteur_skips_nil_vote_with_junk_signature_like_go() {
+    fn nil_vote_with_junk_signature_is_skipped_by_all_wrappers() {
         use cometbft_proto::types::v1::BlockIdFlag;
 
         let (input, expected) = runtime_signed_light_block(
@@ -2989,9 +3102,16 @@ mod tests {
                 sigs[0].signature = vec![0xab; 64];
             },
         );
-        let output = cometbft_light_block_validation_run_pasteur(&input, 10_000_000, 0).unwrap();
-        assert!(output.is_success(), "halted with {:?}", output.halt_reason());
-        assert_eq!(output.bytes.as_ref(), expected.as_slice());
+        let runs: [NamedCometBftRun; 3] = [
+            ("pre-Hertz", cometbft_light_block_validation_run_before_hertz),
+            ("Hertz", cometbft_light_block_validation_run),
+            ("Pasteur", cometbft_light_block_validation_run_pasteur),
+        ];
+        for (fork, run) in runs {
+            let output = run(&input, 10_000_000, 0).unwrap();
+            assert!(output.is_success(), "({fork}) halted: {:?}", output.halt_reason());
+            assert_eq!(output.bytes.as_ref(), expected.as_slice(), "output differs ({fork})");
+        }
     }
 
     /// A validator set that is not in cometbft-rs sort order: signatures bind to validators by
