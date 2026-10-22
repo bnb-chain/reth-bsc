@@ -223,6 +223,39 @@ fn initial_out_of_turn_build_wait(
     std::time::Duration::from_millis(wait_ms)
 }
 
+/// Keep the fallback handle only while its result is still in this JoinSet. A completed
+/// task still counts toward len(), so completion alone cannot identify the remaining task.
+async fn join_candidate<T: 'static>(
+    tasks: &mut tokio::task::JoinSet<T>,
+    empty_fallback: &mut Option<tokio::task::AbortHandle>,
+) -> Option<Result<T, tokio::task::JoinError>> {
+    let result = tasks.join_next_with_id().await?;
+    let id = match &result {
+        Ok((id, _)) => *id,
+        Err(error) => error.id(),
+    };
+    if empty_fallback.as_ref().is_some_and(|handle| handle.id() == id) {
+        *empty_fallback = None;
+    }
+    Some(result.map(|(_, candidate)| candidate))
+}
+
+/// Stop only when the sole remaining task is known to be the empty fallback. Aborting is
+/// best effort: a synchronous root calculation already running may finish before it yields.
+fn skip_redundant_empty_fallback<T: 'static>(
+    has_normal_candidate: bool,
+    tasks: &tokio::task::JoinSet<T>,
+    empty_fallback: Option<&tokio::task::AbortHandle>,
+) -> bool {
+    if has_normal_candidate && tasks.len() == 1 {
+        if let Some(handle) = empty_fallback {
+            handle.abort();
+            return true;
+        }
+    }
+    false
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LocalRebuildPolicyInput {
     current_payload_fees: U256,
@@ -2150,6 +2183,7 @@ where
     /// until the pre-computed `end_mining_timestamp_ms` deadline (+ 150 ms grace) is reached or
     /// all background tasks finish, whichever comes first.
     fn collect_payload_candidates(&mut self) -> Result<(), Box<BscPayloadJobError>> {
+        let mut empty_fallback = None;
         // Phase 1: guarantee at least one candidate.
         if self.potential_payloads.is_empty() {
             let builder = self.builder.clone();
@@ -2157,12 +2191,12 @@ where
             let cancel = args.cancel.clone();
             let mut observation =
                 AttemptObservation::new(AttemptKind::Empty, self.mining_ctx.is_inturn);
-            self.join_handle.spawn(async move {
+            empty_fallback = Some(self.join_handle.spawn(async move {
                 observation.start();
                 let mut result = builder.build_empty_payload(args).await;
                 observation.finish(result.as_mut().ok(), cancel.is_cancelled());
                 result
-            });
+            }));
 
             // JoinSet::len() counts tasks whose results have not yet been collected via
             // join_next(), regardless of whether the task has already finished executing.
@@ -2176,12 +2210,13 @@ where
 
             let abort_rx = &mut self.abort_rx;
             let join_handle = &mut self.join_handle;
+            let fallback = &mut empty_fallback;
             let wait_started = std::time::Instant::now();
             let outcome = tokio::task::block_in_place(move || {
                 tokio::runtime::Handle::current().block_on(async move {
                     tokio::select! {
                         _ = abort_rx => WaitFirst::Aborted,
-                        res = join_handle.join_next() => WaitFirst::Joined(res),
+                        res = join_candidate(join_handle, fallback) => WaitFirst::Joined(res),
                     }
                 })
             });
@@ -2262,6 +2297,17 @@ where
 
         // Phase 2: collect better candidates until deadline.
         while !self.join_handle.is_empty() {
+            if skip_redundant_empty_fallback(
+                self.potential_payloads.iter().any(|payload| payload.build_kind != BuildKind::EmptyFallback),
+                &self.join_handle,
+                empty_fallback.as_ref(),
+            ) {
+                // Per job, not a canonical empty-block counter. No wait for fallback teardown.
+                metrics::counter!("bsc_miner_empty_fallback_wait_skipped_total",
+                    "turn" => if self.mining_ctx.is_inturn { "inturn" } else { "outofturn" })
+                    .increment(1);
+                break;
+            }
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -2302,13 +2348,14 @@ where
 
             let abort_rx = &mut self.abort_rx;
             let join_handle = &mut self.join_handle;
+            let fallback = &mut empty_fallback;
             let wait_started = std::time::Instant::now();
             let outcome = tokio::task::block_in_place(move || {
                 tokio::runtime::Handle::current().block_on(async move {
                     tokio::select! {
                         _ = abort_rx => WaitMore::Aborted,
                         _ = tokio::time::sleep(remaining) => WaitMore::Deadline,
-                        res = join_handle.join_next() => WaitMore::Joined(res),
+                        res = join_candidate(join_handle, fallback) => WaitMore::Joined(res),
                     }
                 })
             });
@@ -3177,6 +3224,67 @@ mod tests {
     use reth::transaction_pool::error::Eip4844PoolTransactionError;
     use reth_primitives_traits::{RecoveredBlock, SealedHeader};
     use std::{sync::Arc, time::Duration};
+
+    #[tokio::test]
+    async fn normal_candidate_does_not_wait_for_pending_empty_fallback() {
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut fallback = Some(tasks.spawn(std::future::pending::<super::BuildKind>()));
+        tasks.spawn(async { super::BuildKind::NormalAttempt });
+        let candidate = super::join_candidate(&mut tasks, &mut fallback).await.unwrap().unwrap();
+        assert_eq!(candidate, super::BuildKind::NormalAttempt);
+        assert!(super::skip_redundant_empty_fallback(true, &tasks, fallback.as_ref()));
+        // Abort only the fallback; collecting its cancellation clears its identity too.
+        let error = super::join_candidate(&mut tasks, &mut fallback).await.unwrap().unwrap_err();
+        assert!(error.is_cancelled());
+        assert!(fallback.is_none());
+    }
+
+    #[tokio::test]
+    async fn empty_candidate_first_still_waits_for_normal_candidate() {
+        let mut tasks = tokio::task::JoinSet::new();
+        let (send, receive) = tokio::sync::oneshot::channel();
+        tasks.spawn(async move { receive.await.unwrap() });
+        let mut fallback = Some(tasks.spawn(async { super::BuildKind::EmptyFallback }));
+        let candidate = super::join_candidate(&mut tasks, &mut fallback).await.unwrap().unwrap();
+        assert_eq!(candidate, super::BuildKind::EmptyFallback);
+        assert!(fallback.is_none());
+        assert!(!super::skip_redundant_empty_fallback(false, &tasks, fallback.as_ref()));
+        // A consumed fallback must never make us mistake the last normal task for an empty one.
+        assert!(!super::skip_redundant_empty_fallback(true, &tasks, fallback.as_ref()));
+        send.send(super::BuildKind::NormalAttempt).unwrap();
+        assert_eq!(
+            super::join_candidate(&mut tasks, &mut fallback).await.unwrap().unwrap(),
+            super::BuildKind::NormalAttempt,
+        );
+    }
+
+    #[tokio::test]
+    async fn normal_candidate_keeps_waiting_for_other_normal_builds() {
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut fallback = Some(tasks.spawn(std::future::pending::<super::BuildKind>()));
+        let (send, receive) = tokio::sync::oneshot::channel();
+        tasks.spawn(async move { receive.await.unwrap() });
+        assert!(!super::skip_redundant_empty_fallback(true, &tasks, fallback.as_ref()));
+        send.send(super::BuildKind::NormalAttempt).unwrap();
+        assert_eq!(
+            super::join_candidate(&mut tasks, &mut fallback).await.unwrap().unwrap(),
+            super::BuildKind::NormalAttempt,
+        );
+        assert!(super::skip_redundant_empty_fallback(true, &tasks, fallback.as_ref()));
+    }
+
+    #[tokio::test]
+    async fn sole_empty_fallback_is_retained_without_normal_candidate() {
+        let mut tasks = tokio::task::JoinSet::new();
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let mut fallback = Some(tasks.spawn(async move { receive.await.unwrap() }));
+        assert!(!super::skip_redundant_empty_fallback(false, &tasks, fallback.as_ref()));
+        send.send(super::BuildKind::EmptyFallback).unwrap();
+        assert_eq!(
+            super::join_candidate(&mut tasks, &mut fallback).await.unwrap().unwrap(),
+            super::BuildKind::EmptyFallback,
+        );
+    }
 
     /// A won BidBlock must not be released before its own header timestamp.
     ///

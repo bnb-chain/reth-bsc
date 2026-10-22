@@ -27,6 +27,8 @@ INFO 日志 `Sampled mining build budget breakdown`：许可等待或准备 ≥2
 
 指标不受日志级别/日志限频影响。不增加逐笔日志；交易循环仅更新本地计数并测量时间，构建结束时统一上报。现有 DEBUG 日志仍遵从原过滤规则。
 
+`reth_bsc_miner_empty_fallback_wait_skipped_total{turn="inturn/outofturn"}`：已有正常候选，且通过任务 ID 确认唯一尚未收集结果的任务为空块兜底时，每个 job 加一。此时请求中止该空块任务并结束候选等待，随后仍遵守原提交时间。不是上链空块率，也不表示后台同步状态根计算已经停止；已运行的同步计算可能到返回/让出执行权后才响应中止。其他正常构建仍在时继续按原规则收集。
+
 排查顺序：任务窗口小→看父块/任务到达；attempt 窗口正常但 execution 窗口小→看 permit_wait/prepare；窗口正常且到期停止→看 skipped 时间占比和线程 CPU。指标只能定位耗时分布，锁/IO/单核瓶颈仍需线程采样。
 
 ## 父块到矿工启动的时间账
