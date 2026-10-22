@@ -1,4 +1,4 @@
-use super::build_diagnostics::{AttemptKind, AttemptObservation};
+use super::build_diagnostics::{AttemptKind, AttemptObservation, BuildWorkObservation, SkipReason};
 use crate::{
     chainspec::BscChainSpec,
     consensus::{
@@ -493,6 +493,14 @@ where
         &self,
         args: BscBuildArguments<EthPayloadAttributes>,
     ) -> Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>> {
+        self.build_payload_observed(args, AttemptKind::Regular).await
+    }
+
+    async fn build_payload_observed(
+        &self,
+        args: BscBuildArguments<EthPayloadAttributes>,
+        kind: AttemptKind,
+    ) -> Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>> {
         let build_start = std::time::Instant::now();
         let BscBuildArguments {
             mut cached_reads,
@@ -513,6 +521,13 @@ where
             config;
 
         let parent_hash = parent_header.hash_slow();
+        let mut work = BuildWorkObservation::new(
+            kind,
+            self.ctx.is_inturn,
+            trace_id,
+            parent_header.number() + 1,
+            build_control.as_ref(),
+        );
         let _build_permit = if build_control.is_some() {
             Some(
                 super::build_control::LOCAL_BUILD_PERMIT
@@ -523,6 +538,7 @@ where
         } else {
             None
         };
+        work.permit_acquired();
         if let Some(control) = &build_control {
             control.check_active(std::time::Instant::now()).map_err(std::io::Error::other)?;
         }
@@ -682,7 +698,9 @@ where
         let exec_start = std::time::Instant::now();
         // Everything before `exec_start` is treated as "prepare" time for this payload attempt.
         let prepare_duration = exec_start.duration_since(build_start);
+        work.execution_started(exec_start);
         loop {
+            let iteration_started = std::time::Instant::now();
             if cancel.is_cancelled() ||
                 build_control
                     .as_ref()
@@ -691,6 +709,7 @@ where
                 break;
             }
             let Some(pool_tx) = best_tx_list.next() else { break };
+            work.scanned += 1;
 
             // filter out blacklisted transactions before executing.
             if self.chain_spec.is_nano_active_at_block(parent_header.number + 1) &&
@@ -706,6 +725,7 @@ where
                     &pool_tx,
                     InvalidPoolTransactionError::other(BlacklistedAddressError()),
                 );
+                work.skip(SkipReason::Blacklisted, iteration_started);
                 continue;
             }
             // filter out tx with min gas tip.
@@ -723,6 +743,7 @@ where
                     "Skipping underpriced transaction"
                 );
                 best_tx_list.mark_invalid(&pool_tx, InvalidPoolTransactionError::Underpriced);
+                work.skip(SkipReason::Underpriced, iteration_started);
                 continue;
             }
 
@@ -738,12 +759,14 @@ where
                         block_gas_limit,
                     ),
                 );
+                work.skip(SkipReason::GasLimit, iteration_started);
                 continue;
             }
 
             let tx = pool_tx.to_consensus();
             if tx.is_eip4844() && !blob_eligible {
                 best_tx_list.skip_blobs();
+                work.skip(SkipReason::BlobIneligible, iteration_started);
                 continue;
             }
             let tx_start = std::time::Instant::now();
@@ -784,6 +807,7 @@ where
                             },
                         ),
                     );
+                    work.skip(SkipReason::BlobLimit, iteration_started);
                     continue;
                 }
 
@@ -804,6 +828,7 @@ where
                                 },
                             ),
                         );
+                        work.skip(SkipReason::BlobLimit, iteration_started);
                         continue;
                     }
                 }
@@ -848,6 +873,7 @@ where
                         );
                         best_tx_list
                             .mark_invalid(&pool_tx, InvalidPoolTransactionError::Eip4844(error));
+                        work.skip(SkipReason::BlobSidecar, iteration_started);
                         continue;
                     }
                 };
@@ -867,6 +893,11 @@ where
                     error,
                     ..
                 })) => {
+                    let skip_reason = if error.is_nonce_too_low() {
+                        SkipReason::NonceTooLow
+                    } else {
+                        SkipReason::InvalidTransaction
+                    };
                     if error.is_nonce_too_low() {
                         // if the nonce is too low, we can skip this transaction
                         debug!(
@@ -888,6 +919,7 @@ where
                         //     ),
                         // );
                     } else {
+                        work.invalid_error(&error);
                         // if the transaction is invalid, we can skip it and all of its
                         // descendants
                         debug!(
@@ -908,6 +940,7 @@ where
                             ),
                         );
                     }
+                    work.skip(skip_reason, iteration_started);
                     continue;
                 }
                 // this is an error that we should treat as fatal for this attempt
@@ -916,6 +949,7 @@ where
                 }
             };
 
+            work.executed += 1;
             // add to the total blob gas used if the transaction successfully executed
             if let Some(blob_tx) = tx.as_eip4844() {
                 block_blob_count += blob_tx.tx().blob_versioned_hashes.len() as u64;
@@ -974,6 +1008,7 @@ where
             } else {
                 "pool_or_gas_limit"
             };
+            work.selection_stopped(reason);
             let turn = if self.ctx.is_inturn { "in_turn" } else { "out_of_turn" };
             metrics::counter!("bsc_miner_build_stop_total", "turn" => turn, "reason" => reason)
                 .increment(1);
@@ -981,6 +1016,12 @@ where
                 .record(now.saturating_duration_since(control.transactions_until).as_secs_f64());
             debug!(target: "payload_builder", trace_id, reason, cumulative_gas_used,
                 exec_duration_ms = exec_duration.as_millis(), "Stopped selecting payload transactions");
+        } else {
+            work.selection_stopped(if cancel.is_cancelled() {
+                "cancelled"
+            } else {
+                "pool_or_gas_limit"
+            });
         }
         if let Some(control) = &build_control {
             control.check_active(std::time::Instant::now()).map_err(std::io::Error::other)?;
@@ -1118,6 +1159,7 @@ where
             pending_turn_length,
             bid_builder: None,
         };
+        work.completed();
         Ok(payload)
     }
 
@@ -1499,6 +1541,14 @@ where
             slot_remaining,
             self.build_args.cancel.clone(),
         );
+        // One sample per job (not per retry): slot_remaining is the original slot budget;
+        // job_transaction_window is the resulting budget after applying BuildControl.
+        // Both are seconds and use only consensus turn as a label, not block/trace IDs.
+        let turn = if self.mining_ctx.is_inturn { "inturn" } else { "outofturn" };
+        metrics::histogram!("bsc.build_diagnostics.job_slot_remaining_seconds", "turn" => turn)
+            .record(slot_remaining.as_secs_f64());
+        metrics::histogram!("bsc.build_diagnostics.job_transaction_window_seconds", "turn" => turn)
+            .record(control.transactions_until.saturating_duration_since(start_time).as_secs_f64());
         self.timeout = control.transactions_until.saturating_duration_since(start_time);
         self.build_args.build_control = Some(control);
         let initial_wait = initial_out_of_turn_build_wait(&self.parlia, &self.mining_ctx);
@@ -1529,7 +1579,9 @@ where
                     AttemptObservation::new(AttemptKind::Speculative, self.mining_ctx.is_inturn);
                 self.join_handle.spawn(async move {
                     observation.start();
-                    let mut result = builder.build_payload(build_args).await;
+                    let mut result = builder
+                        .build_payload_observed(build_args, AttemptKind::Speculative)
+                        .await;
                     observation.finish(result.as_mut().ok(), cancel.is_cancelled());
                     result
                 });
@@ -1605,7 +1657,7 @@ where
                             let mut observation = AttemptObservation::new(kind, self.mining_ctx.is_inturn);
                             self.join_handle.spawn(async move {
                                 observation.start();
-                                let mut result = builder.build_payload(build_args).await;
+                                let mut result = builder.build_payload_observed(build_args, kind).await;
                                 observation.finish(result.as_mut().ok(), cancel.is_cancelled());
                                 result
                             });
