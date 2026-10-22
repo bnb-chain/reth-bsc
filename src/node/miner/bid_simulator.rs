@@ -874,6 +874,7 @@ where
         let pending_turn_length = bid_turn_length_sink.lock().unwrap().take();
 
         bid_runtime.bsc_payload = Some(BscBuiltPayload {
+            diagnostics: None,
             block: sealed_block.clone(),
             fees: bid_runtime.gas_fee,
             requests: Some(requests),

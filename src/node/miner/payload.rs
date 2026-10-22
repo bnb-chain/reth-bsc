@@ -1,3 +1,4 @@
+use super::build_diagnostics::{AttemptKind, AttemptObservation};
 use crate::{
     chainspec::BscChainSpec,
     consensus::{
@@ -1065,6 +1066,7 @@ where
         let pending_turn_length = turn_length_sink.lock().unwrap().take();
 
         let payload = BscBuiltPayload {
+            diagnostics: None,
             block: sealed_block.clone(),
             fees: total_fees,
             requests: Some(requests),
@@ -1230,6 +1232,7 @@ where
         let pending_turn_length = turn_length_sink.lock().unwrap().take();
 
         let payload = BscBuiltPayload {
+            diagnostics: None,
             block: sealed_block.clone(),
             fees: total_fees,
             requests: Some(requests),
@@ -1455,7 +1458,15 @@ where
             {
                 let builder = self.builder.clone();
                 let build_args = self.build_args.clone();
-                self.join_handle.spawn(async move { builder.build_payload(build_args).await });
+                let cancel = build_args.cancel.clone();
+                let mut observation =
+                    AttemptObservation::new(AttemptKind::Speculative, self.mining_ctx.is_inturn);
+                self.join_handle.spawn(async move {
+                    observation.start();
+                    let mut result = builder.build_payload(build_args).await;
+                    observation.finish(result.as_mut().ok(), cancel.is_cancelled());
+                    result
+                });
             }
 
             tokio::select! {
@@ -1526,8 +1537,14 @@ where
 
                             let builder = self.builder.clone();
                             let build_args = self.build_args.clone();
+                            let cancel = build_args.cancel.clone();
+                            let kind = if self.retries == 1 { AttemptKind::Regular } else { AttemptKind::Rebuild };
+                            let mut observation = AttemptObservation::new(kind, self.mining_ctx.is_inturn);
                             self.join_handle.spawn(async move {
-                                builder.build_payload(build_args).await
+                                observation.start();
+                                let mut result = builder.build_payload(build_args).await;
+                                observation.finish(result.as_mut().ok(), cancel.is_cancelled());
+                                result
                             });
                         }
                         None => {
@@ -2001,7 +2018,15 @@ where
         if self.potential_payloads.is_empty() {
             let builder = self.builder.clone();
             let args = self.build_args.clone();
-            self.join_handle.spawn(async move { builder.build_empty_payload(args).await });
+            let cancel = args.cancel.clone();
+            let mut observation =
+                AttemptObservation::new(AttemptKind::Empty, self.mining_ctx.is_inturn);
+            self.join_handle.spawn(async move {
+                observation.start();
+                let mut result = builder.build_empty_payload(args).await;
+                observation.finish(result.as_mut().ok(), cancel.is_cancelled());
+                result
+            });
 
             // JoinSet::len() counts tasks whose results have not yet been collected via
             // join_next(), regardless of whether the task has already finished executing.
@@ -2739,8 +2764,13 @@ where
             }
         }
 
+        if let Some(diagnostics) = &best_payload.diagnostics {
+            diagnostics.selected();
+        }
         info!(
             target: "bsc::miner::payload",
+            attempt_id = best_payload.diagnostics.as_ref().map(|d| d.id),
+            attempt_kind = best_payload.diagnostics.as_ref().map(|d| d.kind),
             trace_id = self.trace_id,
             block_number = best_payload.block().header().number(),
             block_hash = %best_payload.block().hash(),
@@ -3530,6 +3560,7 @@ mod tests {
             let mut executed_block = block.clone();
             executed_block.body.sidecars = None;
             let mut payload = super::BscBuiltPayload {
+                diagnostics: None,
                 block: Arc::new(block.into()),
                 fees: U256::ZERO,
                 requests: None,

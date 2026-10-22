@@ -38,6 +38,9 @@ pub enum BuildKind {
 /// included into [`BscBlock`].
 #[derive(Debug, Clone)]
 pub struct BscBuiltPayload {
+    /// Attempt metadata; deliberately excluded from block contents and consensus.
+    pub(crate) diagnostics:
+        Option<Arc<crate::node::miner::build_diagnostics::CandidateDiagnostics>>,
     /// The built block
     pub(crate) block: Arc<SealedBlock<BscBlock>>,
     /// The fees of the block
@@ -184,7 +187,10 @@ where
                     // common case during fast block production). The manager owns its own changeset
                     // cache internally (reth v2.5), so there is no shared cache to thread in.
                     let overlay_manager =
-                        OverlayManager::<crate::BscPrimitives>::new(worker_pool.clone());
+                        OverlayManager::<crate::BscPrimitives>::new_with_diagnostic_origin(
+                            worker_pool.clone(),
+                            "miner",
+                        );
                     if let Some(cim) = crate::shared::get_canonical_in_memory_state() {
                         if let Some(state) = cim.state_by_hash(parent_hash) {
                             // chain() yields newest-to-oldest including the parent itself.
