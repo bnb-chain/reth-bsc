@@ -1,6 +1,6 @@
 use super::{
     handle::ImportHandle,
-    header_validation::{validate_for_relay, RelayValidation},
+    header_validation::{validate_for_relay, RelayRejection, RelayValidation},
 };
 use crate::{
     chainspec::BscChainSpec,
@@ -119,6 +119,10 @@ where
     processed_blocks: LruCache<B256>,
     /// Cache of queued block hashes to avoid processing the same block.
     queued_blocks: LruCache<B256>,
+    /// Hashes whose body failed validation against a valid header. Their queued entries are
+    /// released so another peer's correct copy of the block can still be imported.
+    rejected_bodies_tx: UnboundedSender<B256>,
+    rejected_bodies: UnboundedReceiver<B256>,
     /// Heads currently being fork-recovered. Prevents duplicate spawned tasks
     /// when the same head is announced repeatedly.
     recovering_heads: crate::node::network::block_import::fork_recover::RecoveringHeads,
@@ -220,6 +224,7 @@ where
             tracing::warn!(target: "bsc::block_import", error = %e, "Fork choice engine already initialized; skipping global set");
         }
 
+        let (rejected_bodies_tx, rejected_bodies) = tokio::sync::mpsc::unbounded_channel();
         Self {
             engine,
             forkchoice_engine,
@@ -235,6 +240,8 @@ where
             pending_imports: FuturesUnordered::new(),
             processed_blocks: LruCache::new(LRU_PROCESSED_BLOCKS_SIZE),
             queued_blocks: LruCache::new(LRU_PROCESSED_BLOCKS_SIZE),
+            rejected_bodies_tx,
+            rejected_bodies,
             recovering_heads:
                 crate::node::network::block_import::fork_recover::new_recovering_heads(
                     LRU_PROCESSED_BLOCKS_SIZE,
@@ -269,6 +276,7 @@ where
             .or_else(|| crate::shared::get_snapshot_provider().cloned());
         let validation_slots = self.relay_validation_slots.clone();
         let to_network = self.to_network.clone();
+        let rejected_bodies = self.rejected_bodies_tx.clone();
 
         let announced_hash = block.hash;
         let block_hash = block.block.0.block.header.hash_slow();
@@ -307,8 +315,11 @@ where
             .await;
             let (sealed_block, validation) = match validation {
                 Ok((sealed_block, Ok(validation))) => (sealed_block, validation),
-                Ok((_, Err(error))) => {
-                    return Some(Outcome { peer: peer_id, result: Err(error) });
+                Ok((_, Err(rejection))) => {
+                    if matches!(rejection, RelayRejection::Body(_)) {
+                        let _ = rejected_bodies.send(block_hash);
+                    }
+                    return Some(Outcome { peer: peer_id, result: Err(rejection.into_error()) });
                 }
                 Err(error) => {
                     tracing::warn!(target: "bsc::block_import", %error, "Header validation task failed");
@@ -768,6 +779,14 @@ where
     }
 
     /// Add a new block import task to the pending imports
+    /// Release queued entries whose body failed validation, so a later correct copy of the
+    /// block, or a `NewBlockHashes` announcement, for the same hash is not deduplicated away.
+    fn release_rejected_bodies(&mut self) {
+        while let Ok(hash) = self.rejected_bodies.try_recv() {
+            self.queued_blocks.remove(&hash);
+        }
+    }
+
     fn on_new_block(&mut self, mut block: BlockMsg, peer_id: PeerId) {
         tracing::debug!(target: "bsc::block_import", "Receiving new block from network: number = {:?}, hash = {:?}, peer = {:?}", block.block.0.block.header.number, block.hash, peer_id);
 
@@ -1224,6 +1243,7 @@ where
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
+        this.release_rejected_bodies();
 
         // Receive new blocks from network
         while let Poll::Ready(Some((block, peer_id))) = this.from_network.poll_recv(cx) {
@@ -1273,6 +1293,7 @@ where
                 }
             }
         }
+        this.release_rejected_bodies();
 
         // Drive periodic head announcement to break forked-validator livelocks.
         // Each tick spawns a detached task so we never block the poll loop on
@@ -1456,6 +1477,62 @@ mod tests {
             assert!(events.try_recv().is_err(), "{case}: relayed after validation");
             assert!(engine.try_recv().is_err(), "{case}: sent to execution engine");
         }
+    }
+
+    /// A valid header with a body that does not match it (here an extra ommer) is rejected, but
+    /// its hash must not stay queued: a correct copy of the block from another peer still
+    /// imports.
+    #[tokio::test]
+    async fn correct_body_is_retried_after_body_validation_fails() {
+        let mut provider = MockProvider::new();
+        provider.insert(test_parent(), U256::from(1));
+        let good = create_test_block();
+        let mut bad = good.clone();
+        Arc::make_mut(&mut bad.block).0.block.body.inner.ommers.push(Header::default());
+        let (mut service, _engine, _events) = relay_test_service(provider, test_snapshot());
+
+        service.on_new_block(bad, PeerId::random());
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            service.pending_imports.next(),
+        )
+        .await
+        .unwrap()
+        .flatten()
+        .expect("body rejection");
+        assert!(outcome.result.is_err());
+        service.release_rejected_bodies();
+        assert!(!service.queued_blocks.contains(&good.hash));
+
+        service.on_new_block(good.clone(), PeerId::random());
+        assert!(service.queued_blocks.contains(&good.hash));
+        assert_eq!(service.pending_imports.len(), 1, "the correct body must be imported");
+    }
+
+    /// A header that fails validation keeps its hash queued: no body can make it valid.
+    #[tokio::test]
+    async fn invalid_header_stays_queued_after_rejection() {
+        let mut provider = MockProvider::new();
+        provider.insert(test_parent(), U256::from(1));
+        let mut block = create_test_block();
+        let header = &mut Arc::make_mut(&mut block.block).0.block.header;
+        header.beneficiary = alloy_primitives::Address::ZERO;
+        block.hash = header.hash_slow();
+        let hash = block.hash;
+        let (mut service, _engine, _events) = relay_test_service(provider, test_snapshot());
+
+        service.on_new_block(block, PeerId::random());
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            service.pending_imports.next(),
+        )
+        .await
+        .unwrap()
+        .flatten()
+        .expect("header rejection");
+        assert!(outcome.result.is_err());
+        service.release_rejected_bodies();
+        assert!(service.queued_blocks.contains(&hash));
     }
 
     #[tokio::test]
