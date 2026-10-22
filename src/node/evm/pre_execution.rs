@@ -32,10 +32,8 @@ use reth_evm::{
     FromRecoveredTx, FromTxWithEncoded, IntoTxEnv,
 };
 use reth_primitives_traits::{GotExpected, SealedHeader};
-use reth_revm::{
-    database::{EvmStateProvider, StateProviderDatabase},
-    db::State,
-};
+use reth_provider::EvmStateProvider;
+use reth_revm::{database::StateProviderDatabase, db::State};
 use revm::{
     context::{result::ExecutionResult, BlockEnv, TxEnv},
     context_interface::block::Block,

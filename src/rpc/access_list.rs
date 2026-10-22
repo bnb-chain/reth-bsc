@@ -1,5 +1,5 @@
 //! eth_createAccessList with CAS20 native accesses in addition to opcode accesses.
-//! revm-inspectors 0.39 observes storage only through interpreter opcodes.
+//! The opcode inspector cannot observe storage accessed by native precompiles.
 
 use crate::evm::precompiles::cas20::access_list::capture;
 use alloy_eips::{eip2930::AccessListResult, BlockId};
@@ -8,15 +8,14 @@ use alloy_primitives::U256;
 use alloy_rpc_types_eth::{state::StateOverride, TransactionRequest};
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
 use reth_evm::{BlockEnvFor, EvmFactory, TransactionEnvMut};
+use reth_provider::EvmStateProviderAdapter;
 use reth_revm::{database::StateProviderDatabase, db::State};
 use reth_rpc_convert::RpcTypes;
 use reth_rpc_eth_api::{
     helpers::{EthCall, Trace},
     FromEvmError,
 };
-use reth_rpc_eth_types::{
-    cache::db::StateProviderTraitObjWrapper, error::FromEthApiError, BlockOverridesExt,
-};
+use reth_rpc_eth_types::{error::FromEthApiError, BlockOverridesExt};
 use revm::{context::Block, context_interface::Transaction};
 use revm_inspectors::access_list::AccessListInspector;
 
@@ -53,9 +52,9 @@ where
             super::code_overrides::code_overridden_addresses(state_override.as_ref());
         // Keep reth's request preparation and second execution for accurate gasUsed.
         self.0
-            .spawn_with_state(Some(at), move |eth, state| {
+            .spawn_blocking_io_with_state(at, move |eth, state| {
                 let mut db = State::builder()
-                    .with_database(StateProviderDatabase::new(StateProviderTraitObjWrapper(state)))
+                    .with_database(StateProviderDatabase::new(EvmStateProviderAdapter(state)))
                     .build();
                 if let Some(overrides) = state_override {
                     apply_state_overrides(overrides, &mut db).map_err(Eth::Error::from_eth_err)?;

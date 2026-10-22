@@ -24,8 +24,8 @@ use reth_evm_ethereum::EthEvmConfig;
 use reth_primitives_traits::{RecoveredBlock, SealedBlock};
 use reth_provider::{
     test_utils::create_test_provider_factory_with_chain_spec, BlockWriter, DatabaseProviderFactory,
-    ExecutionOutcome, HistoryWriter, OriginalValuesKnown, StateWriteConfig, StateWriter,
-    StaticFileProviderFactory, StaticFileSegment, StaticFileWriter,
+    EvmStateProviderAdapter, ExecutionOutcome, HistoryWriter, OriginalValuesKnown,
+    StateWriteConfig, StateWriter, StaticFileProviderFactory, StaticFileSegment, StaticFileWriter,
 };
 use reth_revm::{database::StateProviderDatabase, State};
 use reth_trie::{HashedPostState, KeccakKeyHasher, StateRoot};
@@ -221,7 +221,7 @@ fn run_case(
 
         // Execute the block
         let state_provider = provider.latest();
-        let state_db = StateProviderDatabase::new(&state_provider);
+        let state_db = StateProviderDatabase::new(EvmStateProviderAdapter(&state_provider));
         let executor = executor_provider.batch_executor(state_db);
 
         // Execute with state closure to get the full output including state

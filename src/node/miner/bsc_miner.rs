@@ -35,8 +35,7 @@ use reth_primitives_traits::{BlockBody, SealedHeader};
 use reth_provider::{
     BlockNumReader, CanonStateNotification, CanonStateSubscriptions, HeaderProvider,
 };
-use reth_revm::cancelled::ManualCancel;
-use reth_tasks::TaskExecutor;
+use reth_tasks::{ManualCancel, TaskExecutor};
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -111,9 +110,10 @@ where
     Provider: HeaderProvider<Header = alloy_consensus::Header>
         + BlockNumReader
         + reth_provider::StateProviderFactory
-        + CanonStateSubscriptions
         + reth_provider::NodePrimitivesProvider
-        + Clone
+        + CanonStateSubscriptions<
+            Primitives = <Provider as reth_provider::NodePrimitivesProvider>::Primitives,
+        > + Clone
         + Send
         + Sync
         + 'static,
@@ -1199,8 +1199,10 @@ where
     Provider: HeaderProvider<Header = alloy_consensus::Header>
         + BlockNumReader
         + reth_provider::StateProviderFactory
-        + CanonStateSubscriptions
-        + Clone
+        + reth_provider::NodePrimitivesProvider
+        + CanonStateSubscriptions<
+            Primitives = <Provider as reth_provider::NodePrimitivesProvider>::Primitives,
+        > + Clone
         + Send
         + Sync
         + 'static,

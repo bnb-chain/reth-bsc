@@ -24,7 +24,7 @@ use reth_engine_primitives::InvalidBlockHook;
 use reth_ethereum_primitives::Receipt;
 use reth_execution_types::BlockExecutionOutput;
 use reth_primitives_traits::{RecoveredBlock, SealedBlock, SealedHeader};
-use reth_provider::StateProviderFactory;
+use reth_provider::{EvmStateProviderAdapter, StateProviderFactory};
 use reth_tasks::TaskExecutor;
 use reth_trie_common::updates::TrieUpdates;
 use std::{
@@ -259,7 +259,7 @@ async fn run_evidence_service<P>(
             }
         };
         let (role, cabinet_count, total_count) = match validator_role_at_parent(
-            state,
+            EvmStateProviderAdapter(state),
             chain_spec.as_ref().clone(),
             &evidence.parent,
             evidence.sealer,

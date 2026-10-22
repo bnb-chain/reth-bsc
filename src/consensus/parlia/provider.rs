@@ -335,9 +335,9 @@ impl<DB: Database + 'static> EnhancedDbSnapshotProvider<DB> {
 
             let new_validators = validators_info.consensus_addrs;
             let vote_addrs = validators_info.vote_addrs;
-            let attestation = 
+            let attestation =
                 self.parlia.get_vote_attestation_from_header(&header, working_snapshot.epoch_num).map_err(|err| {
-                tracing::error!("Failed to get vote attestation from header, block_number: {}, epoch_num: {}, error: {:?}", 
+                tracing::error!("Failed to get vote attestation from header, block_number: {}, epoch_num: {}, error: {:?}",
                     header.number, working_snapshot.epoch_num, err);
                 err
             }).ok()?;
