@@ -839,6 +839,7 @@ where
             return;
         }
 
+        normalize_empty_withdrawals(&mut Arc::make_mut(&mut block.block).0.block);
         if let Err(error) = super::super::data_availability::validate_data_availability(
             &mut Arc::make_mut(&mut block.block).0.block,
             self.forkchoice_engine.chain_spec(),
@@ -1306,6 +1307,19 @@ where
     }
 }
 
+/// go-bsc's block fetcher fills in an empty withdrawals list when a propagated block's header
+/// commits to the empty withdrawals root but its body omits the list
+/// (`eth/fetcher/block_fetcher.go`, `EmptyWithdrawalsHash`). Apply the same normalisation to
+/// `NewBlock` messages before validation, so that representation is not treated as a bad body;
+/// the body-commitment check itself stays strict. The block hash covers only the header.
+fn normalize_empty_withdrawals(block: &mut crate::BscBlock) {
+    if block.header.withdrawals_root == Some(crate::consensus::parlia::EMPTY_WITHDRAWALS_HASH) &&
+        block.body.inner.withdrawals.is_none()
+    {
+        block.body.inner.withdrawals = Some(Default::default());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::chainspec::bsc::bsc_mainnet;
@@ -1533,6 +1547,39 @@ mod tests {
         assert!(outcome.result.is_err());
         service.release_rejected_bodies();
         assert!(service.queued_blocks.contains(&hash));
+    }
+
+    /// go-bsc's fetcher fills in an empty withdrawals list when the header commits to the empty
+    /// root and the propagated body omits it. The body-commitment check itself stays strict.
+    #[test]
+    fn new_block_fills_in_omitted_empty_withdrawals() {
+        use crate::consensus::parlia::EMPTY_WITHDRAWALS_HASH;
+        use reth::consensus::Consensus;
+
+        let consensus = crate::node::consensus::BscConsensus::new(Arc::new(BscChainSpec::from(
+            crate::chainspec::bsc::bsc_mainnet(),
+        )));
+        let mut block = create_test_block().block.0.block.clone();
+        block.header.withdrawals_root = Some(EMPTY_WITHDRAWALS_HASH);
+        block.body.inner.withdrawals = None;
+        let header = reth_primitives_traits::SealedHeader::seal_slow(block.header.clone());
+        assert!(
+            consensus.validate_body_against_header(&block.body, &header).is_err(),
+            "the body-commitment check must stay strict"
+        );
+
+        normalize_empty_withdrawals(&mut block);
+        assert_eq!(block.body.inner.withdrawals, Some(Default::default()));
+        assert!(consensus.validate_body_against_header(&block.body, &header).is_ok());
+
+        // Any other withdrawals root is left alone, and so is a header without one.
+        for withdrawals_root in [Some(B256::repeat_byte(1)), None] {
+            let mut other = create_test_block().block.0.block.clone();
+            other.header.withdrawals_root = withdrawals_root;
+            other.body.inner.withdrawals = None;
+            normalize_empty_withdrawals(&mut other);
+            assert_eq!(other.body.inner.withdrawals, None);
+        }
     }
 
     #[tokio::test]
