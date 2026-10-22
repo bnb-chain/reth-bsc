@@ -25,7 +25,7 @@ use reth::{
 use reth_chainspec::EthChainSpec;
 use reth_discv4::Discv4Config;
 use reth_engine_primitives::ConsensusEngineHandle;
-use reth_eth_wire::{BasicNetworkPrimitives, NewBlock, NewBlockPayload};
+use reth_eth_wire::{BasicNetworkPrimitives, HelloMessageWithProtocols, NewBlock, NewBlockPayload};
 use reth_ethereum_primitives::{PooledTransactionVariant, TransactionSigned};
 use reth_network::{NetworkConfig, NetworkHandle, NetworkManager, PeersConfig, SessionsConfig};
 use reth_network_api::PeersInfo;
@@ -167,6 +167,12 @@ pub type BscNetworkPrimitives =
 #[derive(Debug)]
 pub struct BscNetworkBuilder {
     engine_handle_rx: Arc<Mutex<Option<oneshot::Receiver<ConsensusEngineHandle<BscPayloadTypes>>>>>,
+}
+
+fn apply_bsc_eth_protocol_overrides(hello: &mut HelloMessageWithProtocols) {
+    // BSC eth/70 retains total difficulty and omits UpgradeStatus, unlike Ethereum eth/70.
+    // Use the supported legacy handshake until the BSC-specific wire format is implemented.
+    hello.protocols.retain(|protocol| protocol.cap.name != "eth" || protocol.cap.version <= 68);
 }
 
 fn apply_bsc_discv4_overrides<I>(discv4_config: &mut Option<Discv4Config>, boot_nodes: Option<I>)
@@ -383,6 +389,7 @@ impl BscNetworkBuilder {
 
         let peer_id = network_builder.get_peer_id();
         let mut network_config = ctx.build_network_config(network_builder);
+        apply_bsc_eth_protocol_overrides(&mut network_config.hello_message);
         apply_bsc_discv4_overrides(
             &mut network_config.discovery_v4_config,
             ctx.chain_spec().bootnodes(),
@@ -655,7 +662,10 @@ async fn register_nodeids_actions<P: StateProviderFactory>(
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_bsc_discv4_overrides, apply_bsc_peer_stability_overrides};
+    use super::{
+        apply_bsc_discv4_overrides, apply_bsc_eth_protocol_overrides,
+        apply_bsc_peer_stability_overrides,
+    };
     use reth_discv4::{Discv4Config, NatResolver};
     use reth_network::{PeersConfig, SessionsConfig};
     use reth_network_peers::NodeRecord;
@@ -663,6 +673,19 @@ mod tests {
         net::{IpAddr, Ipv4Addr},
         time::Duration,
     };
+
+    #[test]
+    fn negotiates_eth68_with_go_bsc_eth70_peer() {
+        use reth_eth_wire::{
+            capability::SharedCapabilities, Capability, EthVersion, HelloMessageWithProtocols,
+        };
+
+        let mut hello = HelloMessageWithProtocols::builder(Default::default()).build();
+        apply_bsc_eth_protocol_overrides(&mut hello);
+        let remote = vec![Capability::eth(EthVersion::Eth70), Capability::eth(EthVersion::Eth68)];
+        let shared = SharedCapabilities::try_new(hello.protocols, remote).unwrap();
+        assert_eq!(shared.eth_version().unwrap(), EthVersion::Eth68);
+    }
 
     #[test]
     fn bsc_discv4_overrides_preserve_external_ip_resolver() {
