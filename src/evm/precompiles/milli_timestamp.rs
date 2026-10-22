@@ -8,9 +8,11 @@
 
 use alloy_evm::precompiles::{DynPrecompile, PrecompileInput};
 use alloy_primitives::{Address, U256};
-use revm::context::Block;
-use revm::precompile::{
-    u64_to_address, PrecompileHalt, PrecompileId, PrecompileOutput, PrecompileResult,
+use revm::{
+    context::Block,
+    precompile::{
+        u64_to_address, PrecompileHalt, PrecompileId, PrecompileOutput, PrecompileResult,
+    },
 };
 use std::borrow::Cow;
 
@@ -58,35 +60,41 @@ fn run_milli_timestamp(
 /// (block overrides, `debug_traceCallMany`, `eth_callBundle`) are always reflected.
 pub(crate) fn milli_timestamp_precompile(milli_remainder: u64) -> (Address, DynPrecompile) {
     let address = u64_to_address(0x70);
-    let precompile = DynPrecompile::new_stateful(MILLI_TIMESTAMP_ID, move |input: PrecompileInput<'_>| {
-        let timestamp_secs = input.internals.block_env().timestamp().saturating_to::<u64>();
-        // Wrapping multiply/add: go-bsc computes the millisecond timestamp with
-        // plain `uint64` arithmetic, so RPC-reachable extreme inputs (e.g.
-        // `blockOverrides.time = u64::MAX`) must wrap identically on both
-        // clients. The `U256 -> u64` narrowing above saturates because go's
-        // seconds field is a `u64` — wider values have no parity baseline.
-        let milli_timestamp = timestamp_secs.wrapping_mul(1000).wrapping_add(milli_remainder);
-        let result =
-            run_milli_timestamp(milli_timestamp, timestamp_secs, input.data, input.gas, input.reservoir);
+    let precompile =
+        DynPrecompile::new_stateful(MILLI_TIMESTAMP_ID, move |input: PrecompileInput<'_>| {
+            let timestamp_secs = input.internals.block_env().timestamp().saturating_to::<u64>();
+            // Wrapping multiply/add: go-bsc computes the millisecond timestamp with
+            // plain `uint64` arithmetic, so RPC-reachable extreme inputs (e.g.
+            // `blockOverrides.time = u64::MAX`) must wrap identically on both
+            // clients. The `U256 -> u64` narrowing above saturates because go's
+            // seconds field is a `u64` — wider values have no parity baseline.
+            let milli_timestamp = timestamp_secs.wrapping_mul(1000).wrapping_add(milli_remainder);
+            let result = run_milli_timestamp(
+                milli_timestamp,
+                timestamp_secs,
+                input.data,
+                input.gas,
+                input.reservoir,
+            );
 
-        // Same bring-up diagnostics the fixed-address precompiles get from the
-        // static tracing wrappers in `super` — the dynamic 0x70 is not covered by
-        // `traced_wrapper_for_address`, so it logs from inside the closure.
-        if let Some(ctx) = super::current_precompile_trace_context() {
-            if super::should_trace_precompiles(&ctx) {
-                super::log_precompile_call(
-                    &ctx,
-                    address,
-                    MILLI_TIMESTAMP_ID,
-                    input.gas,
-                    input.data.len(),
-                    &result,
-                );
+            // Same bring-up diagnostics the fixed-address precompiles get from the
+            // static tracing wrappers in `super` — the dynamic 0x70 is not covered by
+            // `traced_wrapper_for_address`, so it logs from inside the closure.
+            if let Some(ctx) = super::current_precompile_trace_context() {
+                if super::should_trace_precompiles(&ctx) {
+                    super::log_precompile_call(
+                        &ctx,
+                        address,
+                        MILLI_TIMESTAMP_ID,
+                        input.gas,
+                        input.data.len(),
+                        &result,
+                    );
+                }
             }
-        }
 
-        result
-    });
+            result
+        });
     (address, precompile)
 }
 
@@ -158,7 +166,10 @@ mod tests {
             U256::from_be_slice(&output_bytes(&res)),
             U256::from(u64::MAX.wrapping_mul(1000))
         );
-        assert_eq!(U256::from_be_slice(&output_bytes(&res)), U256::from(18_446_744_073_709_550_616u64));
+        assert_eq!(
+            U256::from_be_slice(&output_bytes(&res)),
+            U256::from(18_446_744_073_709_550_616u64)
+        );
     }
 
     /// Fixed-seed randomized coverage — the go-bsc `FuzzMilliTimestamp` equivalent
@@ -185,8 +196,7 @@ mod tests {
             let len = rng.random_range(0..scratch.len());
             rng.fill(&mut scratch[..len]);
 
-            let with_input =
-                run_milli_timestamp(ms, secs, &scratch[..len], 1_000_000, 0).unwrap();
+            let with_input = run_milli_timestamp(ms, secs, &scratch[..len], 1_000_000, 0).unwrap();
             let without_input = run_milli_timestamp(ms, secs, &[], 1_000_000, 0).unwrap();
 
             // Output is 32 bytes, only a function of the env, gas is flat 20.

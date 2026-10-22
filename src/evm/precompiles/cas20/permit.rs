@@ -70,9 +70,9 @@ impl Token<'_, '_> {
 
     fn domain_separator(&mut self) -> Option<B256> {
         let name = self.s().name()?;
-        if !self.ctx.charge_keccak(name.len())
-            || !self.ctx.charge_keccak(EIP712_VERSION.len())
-            || !self.ctx.charge_keccak(160)
+        if !self.ctx.charge_keccak(name.len()) ||
+            !self.ctx.charge_keccak(EIP712_VERSION.len()) ||
+            !self.ctx.charge_keccak(160)
         {
             return None;
         }
@@ -122,9 +122,9 @@ impl Token<'_, '_> {
 
         let dom = self.domain_separator().ok_or(Cas20Err::OutOfGas)?;
         // Charged whether or not the signature turns out to be valid, as ECRECOVER would be.
-        if !self.ctx.charge_keccak(struct_hash.len())
-            || !self.ctx.charge_keccak(66)
-            || !self.ctx.charge_gas(ECRECOVER_GAS)
+        if !self.ctx.charge_keccak(struct_hash.len()) ||
+            !self.ctx.charge_keccak(66) ||
+            !self.ctx.charge_gas(ECRECOVER_GAS)
         {
             return Err(Cas20Err::OutOfGas);
         }
@@ -182,11 +182,11 @@ pub(crate) fn ecrecover_address(hash: B256, v: u8, r: B256, s: B256) -> Option<A
         return None;
     }
     let (rv, sv) = (U256::from_be_bytes(r.0), U256::from_be_bytes(s.0));
-    if rv.is_zero()
-        || sv.is_zero()
-        || sv > SECP256K1_HALF_N
-        || rv >= SECP256K1_N
-        || sv >= SECP256K1_N
+    if rv.is_zero() ||
+        sv.is_zero() ||
+        sv > SECP256K1_HALF_N ||
+        rv >= SECP256K1_N ||
+        sv >= SECP256K1_N
     {
         return None;
     }

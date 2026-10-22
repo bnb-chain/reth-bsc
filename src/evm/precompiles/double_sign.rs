@@ -9,13 +9,13 @@
 //! have to be reproduced exactly, and neither survives a naive port to fixed-width Rust types:
 //!
 //! 1. `*big.Int` fields (evidence chain id, header difficulty, header number) accept *any*
-//!    canonically encoded big-endian integer, with no width limit at all
-//!    (`rlp/decode.go: Stream.decodeBigInt` allocates an arbitrary-size buffer). Decoding them
-//!    into `u64`/`U256` silently narrows the accepted domain, so inputs go-bsc accepts get
-//!    rejected here. See [`RlpBigInt`].
-//! 2. `types.Header` carries trailing `rlp:"optional"` fields, and `types.EncodeSigHeader`
-//!    folds part of that tail into the seal hash. Omitting them rejects every post-Cancun
-//!    header outright. See [`Header`] and [`seal_hash`].
+//!    canonically encoded big-endian integer, with no width limit at all (`rlp/decode.go:
+//!    Stream.decodeBigInt` allocates an arbitrary-size buffer). Decoding them into `u64`/`U256`
+//!    silently narrows the accepted domain, so inputs go-bsc accepts get rejected here. See
+//!    [`RlpBigInt`].
+//! 2. `types.Header` carries trailing `rlp:"optional"` fields, and `types.EncodeSigHeader` folds
+//!    part of that tail into the seal hash. Omitting them rejects every post-Cancun header
+//!    outright. See [`Header`] and [`seal_hash`].
 //!
 //! go-bsc also decodes with `rlp.DecodeBytes`, which rejects trailing bytes
 //! (`rlp/decode.go: ErrMoreThanOneValue`), so every decode here uses [`alloy_rlp::decode_exact`]
@@ -46,8 +46,11 @@ pub(crate) const DOUBLE_SIGN_EVIDENCE_VALIDATION: Precompile = Precompile::new(
 /// go-bsc's `verifyDoubleSignEvidenceJenner` embeds `verifyDoubleSignEvidence` and only
 /// overrides `RequiredGas`, so it inherits `Name() == "VERIFY_DOUBLE_SIGN_EVIDENCE"` — the id
 /// here deliberately matches the pre-Jenner one for that reason.
-pub(crate) const DOUBLE_SIGN_EVIDENCE_VALIDATION_JENNER: Precompile =
-    Precompile::new(PrecompileId::Custom(Cow::Borrowed("VERIFY_DOUBLE_SIGN_EVIDENCE")), u64_to_address(104), double_sign_evidence_validation_run_jenner);
+pub(crate) const DOUBLE_SIGN_EVIDENCE_VALIDATION_JENNER: Precompile = Precompile::new(
+    PrecompileId::Custom(Cow::Borrowed("VERIFY_DOUBLE_SIGN_EVIDENCE")),
+    u64_to_address(104),
+    double_sign_evidence_validation_run_jenner,
+);
 
 const EXTRA_SEAL_LENGTH: usize = 65;
 
@@ -291,7 +294,11 @@ fn encode_to_vec<T: Encodable>(value: &T) -> Vec<u8> {
 /// signer address| evidence height|
 ///
 /// 20 bytes      | 32 bytes       |
-fn double_sign_evidence_validation_run(input: &[u8], gas_limit: u64, reservoir: u64) -> PrecompileResult {
+fn double_sign_evidence_validation_run(
+    input: &[u8],
+    gas_limit: u64,
+    reservoir: u64,
+) -> PrecompileResult {
     double_sign_evidence_validation_run_inner(input, gas_limit, reservoir, 0)
 }
 
@@ -431,8 +438,9 @@ fn double_sign_evidence_validation_run_inner(
 ///
 /// The post-Cancun tail is appended only when `parent_beacon_root` is present, and
 /// `requests_hash` only on top of that — matching go-bsc's nested conditionals exactly.
-/// Note this deliberately differs from [`crate::consensus::parlia::util::encode_header_with_chain_id`],
-/// which additionally requires the beacon root to be zero.
+/// Note this deliberately differs from
+/// [`crate::consensus::parlia::util::encode_header_with_chain_id`], which additionally requires the
+/// beacon root to be zero.
 fn seal_hash(header: &Header, chain_id: &RlpBigInt) -> B256 {
     let mut payload = Vec::new();
 
@@ -543,8 +551,7 @@ mod tests {
     /// The seal slot is excluded from the hash, so overwriting it afterwards is sound.
     fn sign_header(header: &mut Header, chain_id: &RlpBigInt, key: &SecretKey) {
         let hash = seal_hash(header, chain_id);
-        let signature =
-            SECP256K1.sign_ecdsa_recoverable(&Message::from_digest(hash.0), key);
+        let signature = SECP256K1.sign_ecdsa_recoverable(&Message::from_digest(hash.0), key);
         let (recovery_id, data) = signature.serialize_compact();
 
         let mut extra = header.extra.to_vec();
@@ -556,7 +563,10 @@ mod tests {
 
     /// Builds valid evidence: two headers at the same height off the same parent, differing in
     /// state root, each signed by the same key.
-    fn signed_evidence_with(chain_id: RlpBigInt, mutate: impl Fn(&mut Header, &mut Header)) -> Vec<u8> {
+    fn signed_evidence_with(
+        chain_id: RlpBigInt,
+        mutate: impl Fn(&mut Header, &mut Header),
+    ) -> Vec<u8> {
         let key = signing_key();
         let (mut header1, mut header2) = (base_header(), base_header());
         header2.root = [0x99; 32];

@@ -26,10 +26,10 @@ pub const LORENTZ_TURN_LENGTH: u8 = 8;
 pub const MAXWELL_EPOCH_LENGTH: u64 = 1000;
 pub const MAXWELL_TURN_LENGTH: u8 = 16;
 
-pub const DEFAULT_BLOCK_INTERVAL: u64 = 3000;   // 3000 ms
-pub const LORENTZ_BLOCK_INTERVAL: u64 = 1500;   // 1500 ms
-pub const MAXWELL_BLOCK_INTERVAL: u64 = 750;    //  750 ms
-pub const FERMI_BLOCK_INTERVAL: u64 = 450;      //  450 ms
+pub const DEFAULT_BLOCK_INTERVAL: u64 = 3000; // 3000 ms
+pub const LORENTZ_BLOCK_INTERVAL: u64 = 1500; // 1500 ms
+pub const MAXWELL_BLOCK_INTERVAL: u64 = 750; //  750 ms
+pub const FERMI_BLOCK_INTERVAL: u64 = 450; //  450 ms
 
 /// Global metrics for vote attestation operations.
 static VOTE_METRICS: Lazy<BscVoteMetrics> = Lazy::new(BscVoteMetrics::default);
@@ -93,11 +93,12 @@ impl Snapshot {
                 "validators and vote_addrs length not equal",
             );
 
-            // Step 1: Build mapping with original order to maintain validator->vote_addr correspondence
+            // Step 1: Build mapping with original order to maintain validator->vote_addr
+            // correspondence
             for (i, v) in validators.iter().enumerate() {
-                let info = ValidatorInfo { 
-                    index: 0,  // Will be set after sorting
-                    vote_addr: vote_addrs[i] 
+                let info = ValidatorInfo {
+                    index: 0, // Will be set after sorting
+                    vote_addr: vote_addrs[i],
                 };
                 validators_map.insert(*v, info);
             }
@@ -116,10 +117,7 @@ impl Snapshot {
             // Sort first, then create map with indices
             validators.sort();
             for (i, v) in validators.iter().enumerate() {
-                let info = ValidatorInfo {
-                    index: i as u64 + 1,
-                    vote_addr: VoteAddress::ZERO,
-                };
+                let info = ValidatorInfo { index: i as u64 + 1, vote_addr: VoteAddress::ZERO };
                 validators_map.insert(*v, info);
             }
         }
@@ -240,26 +238,28 @@ impl Snapshot {
 
         let epoch_length = snap.epoch_num;
         let next_block_number = block_number + 1;
-        if snap.epoch_num == DEFAULT_EPOCH_LENGTH
-            && is_lorentz_active
-            && next_block_number.is_multiple_of(LORENTZ_EPOCH_LENGTH)
+        if snap.epoch_num == DEFAULT_EPOCH_LENGTH &&
+            is_lorentz_active &&
+            next_block_number.is_multiple_of(LORENTZ_EPOCH_LENGTH)
         {
             snap.epoch_num = LORENTZ_EPOCH_LENGTH;
         }
-        if snap.epoch_num == LORENTZ_EPOCH_LENGTH
-            && is_maxwell_active
-            && next_block_number.is_multiple_of(MAXWELL_EPOCH_LENGTH)
+        if snap.epoch_num == LORENTZ_EPOCH_LENGTH &&
+            is_maxwell_active &&
+            next_block_number.is_multiple_of(MAXWELL_EPOCH_LENGTH)
         {
             snap.epoch_num = MAXWELL_EPOCH_LENGTH;
         }
 
         // change validator set
         let epoch_key = u64::MAX - block_number / epoch_length;
-        if !new_validators.is_empty()
-            && (!is_bohr || !snap.recent_proposers.contains_key(&epoch_key))
+        if !new_validators.is_empty() &&
+            (!is_bohr || !snap.recent_proposers.contains_key(&epoch_key))
         {
             // Epoch change driven by new validator set / checkpoint header.
-            if let Some(tl) = turn_length { snap.turn_length = Some(tl) }
+            if let Some(tl) = turn_length {
+                snap.turn_length = Some(tl)
+            }
 
             if is_bohr {
                 // BEP-404: Clear Miner History when Switching Validators Set
@@ -284,12 +284,16 @@ impl Snapshot {
                     "validators and vote_addrs length not equal",
                 );
 
-                // Step 1: Build mapping with original order to maintain validator->vote_addr correspondence
+                // Step 1: Build mapping with original order to maintain validator->vote_addr
+                // correspondence
                 for (i, v) in new_validators.iter().enumerate() {
-                    validators_map.insert(*v, ValidatorInfo { 
-                        index: 0,  // Will be set after sorting
-                        vote_addr: vote_addrs[i] 
-                    });
+                    validators_map.insert(
+                        *v,
+                        ValidatorInfo {
+                            index: 0, // Will be set after sorting
+                            vote_addr: vote_addrs[i],
+                        },
+                    );
                 }
 
                 // Step 2: Sort validators
@@ -305,10 +309,10 @@ impl Snapshot {
                 // Pre-Luban: no vote addresses, just sort and create default entries
                 new_validators.sort();
                 for (i, v) in new_validators.iter().enumerate() {
-                    validators_map.insert(*v, ValidatorInfo {
-                        index: i as u64 + 1,
-                        vote_addr: VoteAddress::ZERO,
-                    });
+                    validators_map.insert(
+                        *v,
+                        ValidatorInfo { index: i as u64 + 1, vote_addr: VoteAddress::ZERO },
+                    );
                 }
             }
             // Clean up fork hashes that exceed the new window after validator set change
@@ -353,10 +357,10 @@ impl Snapshot {
             }
             // Keep parity with go-bsc:
             // only perform target-only update when the snapshot already has attestation data.
-            let has_existing_attestation = self.vote_data.source_number != 0
-                || self.vote_data.source_hash != BlockHash::ZERO
-                || self.vote_data.target_number != 0
-                || self.vote_data.target_hash != BlockHash::ZERO;
+            let has_existing_attestation = self.vote_data.source_number != 0 ||
+                self.vote_data.source_hash != BlockHash::ZERO ||
+                self.vote_data.target_number != 0 ||
+                self.vote_data.target_hash != BlockHash::ZERO;
             if has_existing_attestation && att.data.source_number + 1 != att.data.target_number {
                 self.vote_data.target_number = att.data.target_number;
                 self.vote_data.target_hash = att.data.target_hash;
@@ -447,7 +451,8 @@ impl Snapshot {
                 continue;
             }
             *counts.entry(v).or_insert(0) += 1;
-            // tracing::debug!("count_recent_proposers, block: {:?}, validator: {:?}, count: {:?}", block, v, counts.get(&v).unwrap());
+            // tracing::debug!("count_recent_proposers, block: {:?}, validator: {:?}, count: {:?}",
+            // block, v, counts.get(&v).unwrap());
         }
         counts
     }

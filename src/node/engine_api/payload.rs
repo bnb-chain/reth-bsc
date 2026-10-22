@@ -17,6 +17,7 @@ impl PayloadTypes for BscPayloadTypes {
         block: SealedBlock<
             <<Self::BuiltPayload as BuiltPayload>::Primitives as NodePrimitives>::Block,
         >,
+        _bal: Option<alloy_primitives::Bytes>,
     ) -> Self::ExecutionData {
         let hash = block.hash();
         BscExecutionData::new_with_hash(block.into_block(), hash)

@@ -17,6 +17,17 @@ build: ## Build the reth binary into `target` directory.
 maxperf: ## Builds `reth-bsc` with the most aggressive optimisations.
 	RUSTFLAGS="-C target-cpu=native" cargo build --bin reth-bsc --profile maxperf --features jemalloc,asm-keccak
 
+.PHONY: maxperf-musl
+maxperf-musl: ## Static musl build via glibc->musl cross (runs on old glibc, e.g. Amazon Linux 2). See BUILD_MUSL.md.
+	docker run --rm \
+		-v "$(CURDIR)":/src -w /src \
+		-v "$(CURDIR)/.cargo-musl/registry":/root/.cargo/registry \
+		-v "$(CURDIR)/.cargo-musl/git":/root/.cargo/git \
+		messense/rust-musl-cross:x86_64-musl bash -euxc '\
+			apt-get update && apt-get install -y --no-install-recommends clang libclang-dev m4 cmake perl golang pkg-config && \
+			export PERL_USE_UNSAFE_INC=1 && \
+			RUSTFLAGS="-C target-cpu=native" cargo build --bin reth-bsc --profile maxperf --features jemalloc,asm-keccak --target x86_64-unknown-linux-musl'
+
 .PHONY: bench-test
 bench-test: ## Builds `reth-bsc` with the bench-test feature.
 	RUSTFLAGS="-C target-cpu=native" cargo build --profile maxperf --features jemalloc,asm-keccak,bench-test

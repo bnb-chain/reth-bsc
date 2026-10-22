@@ -272,9 +272,9 @@ impl Plan {
 }
 
 fn empty_account(state: &AccountState) -> bool {
-    state.balance.is_none_or(|balance| balance.is_zero())
-        && state.nonce.unwrap_or_default() == 0
-        && state.code.as_ref().is_none_or(|code| code.is_empty())
+    state.balance.is_none_or(|balance| balance.is_zero()) &&
+        state.nonce.unwrap_or_default() == 0 &&
+        state.code.as_ref().is_none_or(|code| code.is_empty())
 }
 
 #[cfg(test)]

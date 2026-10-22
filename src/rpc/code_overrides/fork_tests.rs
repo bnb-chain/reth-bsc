@@ -76,11 +76,7 @@ macro_rules! check_routes {
         };
         let context = StateContext { block_number: Some(hash.into()), ..Default::default() };
         let results = api
-            .call_many(
-                vec![bundle.clone(), bundle.clone()],
-                Some(context),
-                Some(state.clone()),
-            )
+            .call_many(vec![bundle.clone(), bundle.clone()], Some(context), Some(state.clone()))
             .await
             .unwrap();
         assert_eq!(results.len(), 2);

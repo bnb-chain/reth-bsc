@@ -1,8 +1,8 @@
 pub mod access_list;
 pub mod admin;
+pub mod blob;
 #[cfg(test)]
 mod block_overrides_tests;
-pub mod blob;
 pub mod code_overrides;
 pub mod debug_builder;
 pub mod eth_config;

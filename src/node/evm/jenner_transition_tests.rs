@@ -16,8 +16,7 @@ use crate::{
 use alloy_consensus::Header;
 use alloy_primitives::{Address, Bytes, U256};
 use revm::{
-    context::result::ExecutionResult,
-    context::TxEnv,
+    context::{result::ExecutionResult, TxEnv},
     database::InMemoryDB,
     inspector::NoOpInspector,
     primitives::TxKind,
@@ -37,8 +36,8 @@ fn bep706_caller_code() -> Vec<u8> {
     // PUSH1 0x00 (argsOffset) PUSH1 0x70 (addr) GAS STATICCALL POP
     // PUSH1 0x20 PUSH1 0x00 RETURN
     vec![
-        0x60, 0x20, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x70, 0x5A, 0xFA, 0x50, 0x60,
-        0x20, 0x60, 0x00, 0xF3,
+        0x60, 0x20, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x70, 0x5A, 0xFA, 0x50, 0x60, 0x20,
+        0x60, 0x00, 0xF3,
     ]
 }
 
@@ -70,10 +69,7 @@ fn genesis_with_jenner() -> std::sync::Arc<crate::chainspec::BscChainSpec> {
 
 /// Executes the caller contract in the EVM environment `header` presents, returning
 /// the 32-byte word the contract reads back from `0x70`.
-fn call_bep706_contract_at(
-    spec: &crate::chainspec::BscChainSpec,
-    header: &Header,
-) -> (bool, U256) {
+fn call_bep706_contract_at(spec: &crate::chainspec::BscChainSpec, header: &Header) -> (bool, U256) {
     let caller = Address::from([0x11; 20]);
     let contract = Address::from([0x22; 20]);
 

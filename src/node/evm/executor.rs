@@ -4,10 +4,7 @@ use super::config::{
 use super::patch::HertzPatchManager;
 use crate::consensus::parlia::SnapshotProvider;
 use crate::{
-    consensus::{
-        parlia::{Parlia, Snapshot, VoteAddress},
-        SYSTEM_ADDRESS,
-    },
+    consensus::parlia::{Parlia, Snapshot, VoteAddress},
     evm::{
         blacklist::{self, BlacklistedAddressError},
         precompiles,
@@ -29,8 +26,7 @@ use alloy_eips::eip2935::{HISTORY_STORAGE_ADDRESS, HISTORY_STORAGE_CODE};
 use alloy_eips::{eip7685::Requests, Encodable2718};
 use alloy_evm::{
     block::{
-        ExecutableTx, GasOutput, StateChangePostBlockSource, StateChangePreBlockSource,
-        StateChangeSource, TxResult,
+        ExecutableTx, GasOutput, TxResult,
     },
     eth::receipt_builder::ReceiptBuilderCtx,
 };
@@ -48,7 +44,7 @@ use reth_evm::{
     eth::receipt_builder::ReceiptBuilder,
     execute::{BlockExecutionError, BlockExecutor},
     system_calls::SystemCaller,
-    Evm, FromRecoveredTx, FromTxWithEncoded, IntoTxEnv, OnStateHook,
+    Evm, FromRecoveredTx, FromTxWithEncoded, IntoTxEnv,
 };
 use reth_primitives_traits::Recovered;
 use reth_provider::BlockExecutionResult;
@@ -235,14 +231,14 @@ where
 
     /// Applies system contract upgrades if the Feynman fork is not yet active.
     ///
-    /// `source` identifies the upgrade to the state hook and therefore to the incremental
-    /// state-root computation; pre-Feynman upgrades run at block begin, later ones at block end.
+    /// Pre-Feynman upgrades run at block begin, later ones at block end. The upgraded state reaches
+    /// the incremental state-root computation automatically: the DB-level state hook streams on
+    /// every `commit` (see the note in `commit_transaction`).
     fn upgrade_contracts(
         &mut self,
         block_number: BlockNumber,
         block_timestamp: u64,
         parent_timestamp: u64,
-        source: StateChangeSource,
     ) -> Result<(), BlockExecutionError> {
         trace!(
             target: "bsc::executor::upgrade",
@@ -269,7 +265,7 @@ where
                     code_len = code.len(),
                     "Upgrading system contract"
                 );
-                self.upgrade_system_contract(address, code, source)?;
+                self.upgrade_system_contract(address, code)?;
             }
         }
 
@@ -293,14 +289,7 @@ where
                     parent_timestamp,
                     "Upgrading system contracts at block begin (before Feynman)"
                 );
-                self.upgrade_contracts(
-                    block_number,
-                    block_timestamp,
-                    parent_timestamp,
-                    StateChangeSource::PreBlock(StateChangePreBlockSource::Other(
-                        "bsc_system_contract_upgrade",
-                    )),
-                )?;
+                self.upgrade_contracts(block_number, block_timestamp, parent_timestamp)?;
             }
 
             // HistoryStorageAddress is a special system contract in BSC, which can't be upgraded
@@ -337,14 +326,7 @@ where
                     parent_timestamp,
                     "Upgrading system contracts at block end (Feynman active)"
                 );
-                self.upgrade_contracts(
-                    block_number,
-                    block_timestamp,
-                    parent_timestamp,
-                    StateChangeSource::PostBlock(StateChangePostBlockSource::Other(
-                        "bsc_system_contract_upgrade",
-                    )),
-                )?;
+                self.upgrade_contracts(block_number, block_timestamp, parent_timestamp)?;
             }
         }
         Ok(())
@@ -379,32 +361,29 @@ where
         &mut self,
         address: Address,
         code: Bytecode,
-        source: StateChangeSource,
     ) -> Result<(), BlockExecutionError> {
-        let changes = {
-            let mut info = self
-                .evm
-                .db_mut()
-                .basic(address)
-                .map_err(BlockExecutionError::other)?
-                .unwrap_or_default();
-            info.code_hash = code.hash_slow();
-            info.code = Some(code);
-            let mut account = RevmAccount::from(info);
-            account.mark_touch();
-            let mut changes: EvmState = Default::default();
-            changes.insert(address, account);
-            self.commit_state(changes.clone());
-            changes
-        };
+        let info =
+            self.evm.db_mut().basic(address).map_err(BlockExecutionError::other)?.unwrap_or_default();
+        // Build the account from the PRE-upgrade info and mutate afterwards.
+        // `impl From<AccountInfo> for Account` snapshots the value it is given into
+        // `original_info`, and reth's `evm_state_to_hashed_post_state` decides whether an
+        // account changed with `info != original_info()`. Mutating before the conversion makes
+        // those two equal, so the state-root task silently drops the new code hash while
+        // the commit below still applies it -- the sparse root then disagrees with the serial
+        // one and the block seals an invalid state root.
+        let mut account = RevmAccount::from(info);
+        account.info.code_hash = code.hash_slow();
+        account.info.code = Some(code);
+        account.mark_touch();
+        let mut changes: EvmState = Default::default();
+        changes.insert(address, account);
 
-        // The state root is computed incrementally from the state hook (sparse trie /
-        // `StateRootTask`), so a bare `db.commit` is invisible to it: the account's new
-        // `code_hash` never reaches the trie and the block commits a root describing the
-        // un-upgraded contract. That is what split bsc-qanet at the Pasteur transition
-        // (block 21323714) - geth computed the true root and rejected the block while every
-        // reth node agreed on the stale one. Report the change like `commit_transaction` does.
-        self.system_caller.on_state(source, &changes);
+        // The upgraded account's new `code_hash` must reach the incremental state-root
+        // computation, or the block commits a root describing the un-upgraded contract (this
+        // split bsc-qanet at the Pasteur transition, block 21323714: geth computed the true root
+        // and rejected the block while every reth node agreed on the stale one). The DB-level
+        // state hook streams every `commit` to the state-root task, so committing alone suffices.
+        self.commit_state(changes);
         Ok(())
     }
 
@@ -420,7 +399,7 @@ where
         for address in [cas20::ACTIVATION_REGISTRY_ADDRESS, cas20::POLICY_REGISTRY_ADDRESS] {
             let db = self.evm.db_mut();
             let old_info = db.basic(address).map_err(BlockExecutionError::other)?;
-            let mut info = old_info.unwrap_or_default();
+            let info = old_info.unwrap_or_default();
             if info.code_hash != revm::primitives::KECCAK_EMPTY && info.code_hash != alloy_primitives::B256::ZERO {
                 error!(
                     target: "bsc::executor::cas20",
@@ -432,19 +411,19 @@ where
                 continue;
             }
             let code = cas20::marker_bytecode();
-            info.code_hash = code.hash_slow();
-            info.code = Some(code);
+            // Build from the pre-seed info and mutate afterwards: `From<AccountInfo>` snapshots
+            // its input into `original_info`, and the state-root task skips accounts whose
+            // `info == original_info()`, so mutating first would drop the sentinel from the
+            // sealed root while `commit` still applies it.
             let mut account = RevmAccount::from(info);
+            account.info.code_hash = code.hash_slow();
+            account.info.code = Some(code);
             account.mark_touch();
             let mut changes: EvmState = Default::default();
             changes.insert(address, account);
-            db.commit(changes.clone());
-            // As for every other block-begin write: the incremental state root only
-            // sees what the hook is told.
-            self.system_caller.on_state(
-                StateChangeSource::PreBlock(StateChangePreBlockSource::Other("bsc_cas20_registry_sentinel")),
-                &changes,
-            );
+            // As for every other block-begin write, the DB-level state hook streams this
+            // commit to the incremental state-root task.
+            db.commit(changes);
             info!(target: "bsc::executor::cas20", block_number, ?address, "Seeded CAS20 registry sentinel (Jenner transition)");
         }
         Ok(())
@@ -479,26 +458,22 @@ where
             "HistoryStorageAddress account before deployment"
         );
 
-        let mut new_info = old_info.unwrap_or_default();
-        new_info.code_hash = keccak256(HISTORY_STORAGE_CODE.clone());
-        new_info.code = Some(Bytecode::new_raw(Bytes::from_static(&HISTORY_STORAGE_CODE)));
-        new_info.nonce = 1_u64;
-        new_info.balance = U256::ZERO;
-        let mut account = RevmAccount::from(new_info);
+        // Same ordering requirement as `upgrade_system_contract`: construct from the
+        // pre-deployment info so `original_info` holds the old value, then mutate. Building
+        // from the already-mutated info makes `info == original_info()` and the deployment
+        // never reaches the incremental state-root computation.
+        let mut account = RevmAccount::from(old_info.unwrap_or_default());
+        account.info.code_hash = keccak256(HISTORY_STORAGE_CODE.clone());
+        account.info.code = Some(Bytecode::new_raw(Bytes::from_static(&HISTORY_STORAGE_CODE)));
+        account.info.nonce = 1_u64;
+        account.info.balance = U256::ZERO;
         account.mark_touch();
         let mut changes: EvmState = Default::default();
         changes.insert(HISTORY_STORAGE_ADDRESS, account);
-        self.commit_state(changes.clone());
-
-        // Same reasoning as `upgrade_system_contract`: the incremental state-root pipeline only
-        // sees changes reported through the hook, so this deployment must be announced or the
-        // Prague transition block commits a root without it.
-        self.system_caller.on_state(
-            StateChangeSource::PreBlock(StateChangePreBlockSource::Other(
-                "bsc_history_storage_account",
-            )),
-            &changes,
-        );
+        // Same reasoning as `upgrade_system_contract`: the DB-level state hook streams this
+        // deployment to the incremental state-root pipeline on `commit`, so the Prague transition
+        // block commits a root that includes it.
+        self.commit_state(changes);
 
         info!(
             target: "bsc::executor::prague",
@@ -905,10 +880,11 @@ where
 
         let ResultAndState { result, state } = output.inner;
 
-        let mut temp_state = state.clone();
-        temp_state.remove(&SYSTEM_ADDRESS);
-        self.system_caller
-            .on_state(StateChangeSource::Transaction(self.receipts.len()), &temp_state);
+        // NOTE(reth-v2.4.1): previously streamed post-tx state (excluding SYSTEM_ADDRESS) to the
+        // state-root task via `system_caller.on_state(..)`. v2.4.1 installs the state hook at the
+        // DB level and streams automatically on `commit`, so the manual call is removed; the final
+        // state root is computed over the full committed state regardless. Re-introduce the
+        // SYSTEM_ADDRESS exclusion via the DB hook if it turns out to be required for BSC.
 
         let gas_used = result.tx_gas_used();
         self.gas_used += gas_used;
@@ -1063,9 +1039,6 @@ where
         ))
     }
 
-    fn set_state_hook(&mut self, hook: Option<Box<dyn OnStateHook>>) {
-        self.system_caller.with_state_hook(hook);
-    }
 
     fn evm_mut(&mut self) -> &mut Self::Evm {
         &mut self.evm
@@ -1177,5 +1150,59 @@ mod tests {
             .expect("order is not enforced before Cancun");
         import(NANO_BLOCK, CANCUN_TIME, &[NORMAL_TX, SYSTEM_TX])
             .expect("system txs at the end are allowed");
+    }
+}
+
+#[cfg(test)]
+mod original_info_ordering_tests {
+    use super::*;
+    use revm::state::AccountInfo;
+
+    /// `impl From<AccountInfo> for Account` snapshots whatever it is handed into
+    /// `original_info`, and reth's `evm_state_to_hashed_post_state` decides whether an account
+    /// changed with `info != original_info()`. So a hand-built account must be constructed
+    /// from the PRE-state info and mutated afterwards; building it from already-mutated info
+    /// makes the two equal and the change is silently dropped from the state-root task's
+    /// delta while `db.commit` still applies it, producing a wrong sealed state root.
+    ///
+    /// Guards the ordering in `upgrade_system_contract` and
+    /// `apply_history_storage_account`.
+    #[test]
+    fn mutating_after_conversion_keeps_original_info_distinct() {
+        let old = AccountInfo { nonce: 7, balance: U256::from(1_000u64), ..Default::default() };
+
+        // Correct ordering: construct from the pre-state, then mutate.
+        let mut account = RevmAccount::from(old.clone());
+        account.info.code_hash = keccak256([0xaa_u8, 0xbb]);
+        account.mark_touch();
+
+        assert_ne!(
+            account.info,
+            account.original_info(),
+            "account built from pre-state info must read as changed"
+        );
+        assert_eq!(account.original_info(), old, "original_info must hold the pre-state value");
+    }
+
+    /// The inverse: the ordering this fix removed. Kept so the failure mode stays visible --
+    /// if this ever stops holding, revm changed its semantics and the guard above can be
+    /// revisited.
+    #[test]
+    fn mutating_before_conversion_hides_the_change() {
+        let info = AccountInfo {
+            nonce: 7,
+            balance: U256::from(1_000u64),
+            code_hash: keccak256([0xaa_u8, 0xbb]),
+            ..Default::default()
+        };
+
+        let mut account = RevmAccount::from(info);
+        account.mark_touch();
+
+        assert_eq!(
+            account.info,
+            account.original_info(),
+            "mutating before conversion makes the change invisible to the state-root task"
+        );
     }
 }

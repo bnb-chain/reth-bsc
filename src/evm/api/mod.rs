@@ -1,11 +1,15 @@
 use std::ops::{Deref, DerefMut};
 
-use crate::{evm::block_env::BscBlockEnv, evm::transaction::BscTxEnv, hardforks::bsc::BscHardfork};
+use crate::{
+    evm::{block_env::BscBlockEnv, transaction::BscTxEnv},
+    hardforks::bsc::BscHardfork,
+};
 
 use super::precompiles::BscPrecompiles;
 use reth_evm::{precompiles::PrecompilesMap, Database, EvmEnv};
 use revm::{
     context::{CfgEnv, ContextTr, Evm as EvmCtx, FrameStack, JournalTr},
+    context_interface::journaled_state::account::JournaledAccountTr,
     handler::{
         evm::{ContextDbError, FrameInitResult},
         instructions::EthInstructions,
@@ -19,7 +23,6 @@ use revm::{
     primitives::{hardfork::SpecId, Bytes},
     Context, Inspector, Journal,
 };
-use revm::context_interface::journaled_state::account::JournaledAccountTr;
 
 mod exec;
 
@@ -182,12 +185,7 @@ where
 
     fn all(
         &self,
-    ) -> (
-        &Self::Context,
-        &Self::Instructions,
-        &Self::Precompiles,
-        &FrameStack<Self::Frame>,
-    ) {
+    ) -> (&Self::Context, &Self::Instructions, &Self::Precompiles, &FrameStack<Self::Frame>) {
         self.inner.all()
     }
 
@@ -433,18 +431,11 @@ mod tests {
 
         // Mismatched instruction table (defaults to the latest spec): should undercharge and
         // succeed with the same gas limit.
-        let mut mismatched = BscEvm::new(
-            env,
-            make_db(caller, contract, repetitions),
-            NoOpInspector,
-            false,
-            false,
-        );
+        let mut mismatched =
+            BscEvm::new(env, make_db(caller, contract, repetitions), NoOpInspector, false, false);
         mismatched.inner.instruction = EthInstructions::new_mainnet_with_spec(SpecId::default());
 
-        let mismatched_result = mismatched
-            .transact_one(tx)
-            .expect("execution should not error");
+        let mismatched_result = mismatched.transact_one(tx).expect("execution should not error");
         assert!(
             mismatched_result.is_success(),
             "latest-spec instruction table should succeed with this gas limit"
@@ -461,20 +452,14 @@ mod tests {
         let mut cfg_env = CfgEnv::new_with_spec(spec).with_chain_id(56);
         cfg_env.tx_gas_limit_cap = Some(2u64.pow(24));
 
-        let block_env = BlockEnv {
-            beneficiary,
-            prevrandao: Some(U256::from(1).into()),
-            ..Default::default()
-        };
+        let block_env =
+            BlockEnv { beneficiary, prevrandao: Some(U256::from(1).into()), ..Default::default() };
         let env = EvmEnv::new(cfg_env, block_env.into());
 
         let mut db = InMemoryDB::default();
         db.insert_account_info(
             beneficiary,
-            AccountInfo {
-                balance: U256::from(1_000_000_000_000u64),
-                ..AccountInfo::default()
-            },
+            AccountInfo { balance: U256::from(1_000_000_000_000u64), ..AccountInfo::default() },
         );
         db.insert_account_info(system_contract, AccountInfo::default());
 
@@ -498,9 +483,8 @@ mod tests {
     }
 
     /// BSC `VALIDATOR_CONTRACT` (target of `deposit` / `distributeFinalityReward`).
-    const VALIDATOR_SYSTEM_CONTRACT: Address = Address::new([
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10, 0x00,
-    ]);
+    const VALIDATOR_SYSTEM_CONTRACT: Address =
+        Address::new([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10, 0x00]);
 
     #[test]
     fn prepare_marks_system_shape_tx() {
@@ -625,8 +609,10 @@ mod tests {
         evm: &mut BscEvm<InMemoryDB, NoOpInspector>,
         beneficiary: Address,
     ) -> U256 {
-        use revm::context::{ContextTr, JournalTr};
-        use revm::context_interface::journaled_state::account::JournaledAccountTr;
+        use revm::{
+            context::{ContextTr, JournalTr},
+            context_interface::journaled_state::account::JournaledAccountTr,
+        };
         *evm.journal_mut()
             .load_account_mut(beneficiary)
             .expect("beneficiary account should load")
@@ -663,11 +649,8 @@ mod tests {
         let beneficiary = Address::from([0x10; 20]);
         let mut cfg_env = CfgEnv::new_with_spec(BscHardfork::Osaka).with_chain_id(56);
         cfg_env.tx_gas_limit_cap = Some(2u64.pow(24));
-        let block_env = BlockEnv {
-            beneficiary,
-            prevrandao: Some(U256::from(1).into()),
-            ..Default::default()
-        };
+        let block_env =
+            BlockEnv { beneficiary, prevrandao: Some(U256::from(1).into()), ..Default::default() };
         let mut db = InMemoryDB::default();
         db.insert_account_info(
             beneficiary,
@@ -676,7 +659,8 @@ mod tests {
                 ..AccountInfo::default()
             },
         );
-        let mut evm = BscEvm::new(EvmEnv::new(cfg_env, block_env.into()), db, NoOpInspector, false, false);
+        let mut evm =
+            BscEvm::new(EvmEnv::new(cfg_env, block_env.into()), db, NoOpInspector, false, false);
 
         let initial = U256::from(TRACE_BENEFICIARY_INITIAL_BALANCE);
         evm.fund_beneficiary_for_system_tx_replay(U256::from(123u64));
@@ -1013,15 +997,13 @@ mod tests {
             // PUSH1 0x20 (retSize) PUSH1 0x00 (retOffset) PUSH1 0x00 (argsSize)
             // PUSH1 0x00 (argsOffset) [PUSH1 0x00 (value)] PUSH1 0x70 (addr) GAS <op>
             // POP PUSH1 0x20 PUSH1 0x00 RETURN
-            let mut code =
-                vec![0x60, 0x20, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00];
+            let mut code = vec![0x60, 0x20, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00];
             if pushes_value {
                 code.extend([0x60, 0x00]);
             }
             code.extend([0x60, 0x70, 0x5A, opcode, 0x50, 0x60, 0x20, 0x60, 0x00, 0xF3]);
 
-            let mut evm =
-                make_jenner_evm(BscHardfork::Jenner, caller, Some((contract, code)));
+            let mut evm = make_jenner_evm(BscHardfork::Jenner, caller, Some((contract, code)));
             let tx = BscTxEnv::new(
                 TxEnv::builder()
                     .caller(caller)
@@ -1110,10 +1092,7 @@ mod tests {
 
         // Every pre-Jenner spec stays 0x70-free (spot-check the fork ladder).
         for spec in [BscHardfork::Mendel, BscHardfork::Haber, BscHardfork::Hertz] {
-            assert!(
-                !addresses(spec).contains(&MILLI_TS_ADDRESS),
-                "{spec:?} must not contain 0x70"
-            );
+            assert!(!addresses(spec).contains(&MILLI_TS_ADDRESS), "{spec:?} must not contain 0x70");
         }
     }
 }

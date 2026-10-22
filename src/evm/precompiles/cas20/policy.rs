@@ -230,7 +230,8 @@ impl<'r, 'f, 'a> PolicyReg<'r, 'f, 'a> {
             }
             let slot_w = base.wrapping_add(U256::from(w));
             if packed.is_zero() && w * 4 >= kids.len() {
-                // Only clear a word that holds something: a fresh composite pays for no empty slots.
+                // Only clear a word that holds something: a fresh composite pays for no empty
+                // slots.
                 if self.s.get_word(slot_w).is_zero() {
                     continue;
                 }
@@ -329,15 +330,15 @@ pub(crate) fn run_policy(ctx: &mut Ctx<'_, '_>, input: &[u8]) -> R<Vec<u8>> {
     // Writes: unknown selector, then static frame, then inactive feature, before
     // decoding arguments. The order is consensus-visible.
     match sel {
-        SEL_CREATE_POLICY
-        | SEL_CREATE_POLICY_WITH_ACCOUNTS
-        | SEL_UPDATE_ALLOWLIST
-        | SEL_UPDATE_BLOCKLIST
-        | SEL_STAGE_UPDATE_ADMIN
-        | SEL_FINALIZE_UPDATE_ADMIN
-        | SEL_RENOUNCE_ADMIN
-        | SEL_CREATE_COMPOSITE
-        | SEL_UPDATE_COMPOSITE => {
+        SEL_CREATE_POLICY |
+        SEL_CREATE_POLICY_WITH_ACCOUNTS |
+        SEL_UPDATE_ALLOWLIST |
+        SEL_UPDATE_BLOCKLIST |
+        SEL_STAGE_UPDATE_ADMIN |
+        SEL_FINALIZE_UPDATE_ADMIN |
+        SEL_RENOUNCE_ADMIN |
+        SEL_CREATE_COMPOSITE |
+        SEL_UPDATE_COMPOSITE => {
             if reg.s.ctx.read_only {
                 return Err(Cas20Err::WriteProtection);
             }
@@ -500,7 +501,8 @@ fn create_policy(reg: &mut PolicyReg<'_, '_, '_>, args: &[u8], with_accounts: bo
         return Err(rev(ERR_INCOMPATIBLE_POLICY_TYPE, &[]));
     }
 
-    // Decoded and bounded before any write: a revert would not refund gas metered on premature writes.
+    // Decoded and bounded before any write: a revert would not refund gas metered on premature
+    // writes.
     let mut accounts = Vec::new();
     if with_accounts {
         accounts = read_word_array(args, 2)?;

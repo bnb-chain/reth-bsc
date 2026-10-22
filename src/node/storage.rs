@@ -1,8 +1,9 @@
-use crate::{BscBlock, BscBlockBody, BscPrimitives};
-use crate::node::primitives::BscBlobTransactionSidecar;
+use crate::{node::primitives::BscBlobTransactionSidecar, BscBlock, BscBlockBody, BscPrimitives};
 use alloy_consensus::BlockHeader;
-use alloy_eips::eip2718::{EIP4844_TX_TYPE_ID, Typed2718};
-use alloy_eips::eip7594::BlobTransactionSidecarVariant;
+use alloy_eips::{
+    eip2718::{Typed2718, EIP4844_TX_TYPE_ID},
+    eip7594::BlobTransactionSidecarVariant,
+};
 use alloy_primitives::B256;
 use reth_chainspec::EthereumHardforks;
 use reth_db::transaction::{DbTx, DbTxMut};
@@ -12,8 +13,7 @@ use reth_provider::{
     DBProvider, DatabaseProvider, EthStorage, ProviderError, ProviderResult, ReadBodyInput,
 };
 use reth_transaction_pool::blobstore::BlobStore;
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
@@ -51,7 +51,9 @@ where
             }
             if !to_insert.is_empty() {
                 let tx_hashes: Vec<_> = to_insert.iter().map(|(h, _)| *h).collect();
-                if let Err(error) = blob_store.insert_all(to_insert) {
+                if let Err(error) = blob_store
+                    .insert_all(to_insert.into_iter().map(|(h, s)| (h, s.into())).collect())
+                {
                     tracing::warn!(
                         target: "bsc::storage",
                         first_block,
@@ -72,7 +74,10 @@ where
                     "blob_store_write: inserted sidecars"
                 );
             }
-        } else if sidecar_entries.iter().any(|(_, sidecars)| sidecars.is_some_and(|s| !s.is_empty())) {
+        } else if sidecar_entries
+            .iter()
+            .any(|(_, sidecars)| sidecars.is_some_and(|s| !s.is_empty()))
+        {
             tracing::warn!(
                 target: "bsc::storage",
                 first_block,
@@ -84,11 +89,7 @@ where
         Ok(())
     }
 
-    fn remove_block_bodies_above(
-        &self,
-        provider: &Provider,
-        block: u64,
-    ) -> ProviderResult<()> {
+    fn remove_block_bodies_above(&self, provider: &Provider, block: u64) -> ProviderResult<()> {
         self.0.remove_block_bodies_above(provider, block)?;
         // Blob store cleanup is handled by the pool maintenance task (finality-based eviction).
         Ok(())
@@ -230,7 +231,11 @@ fn read_sidecars_from_blob_store(
     // match the tx position in the block.
     sidecars.sort_unstable_by_key(|s| s.tx_index);
 
-    if sidecars.is_empty() { None } else { Some(sidecars) }
+    if sidecars.is_empty() {
+        None
+    } else {
+        Some(sidecars)
+    }
 }
 
 impl ChainStorage<BscPrimitives> for BscStorage {
