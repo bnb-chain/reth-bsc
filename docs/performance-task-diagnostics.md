@@ -4,8 +4,9 @@ This instrumentation is based on BSC PR #478 at `9387de707bfd337d8542a4072ccec9b
 and its Reth dependency `84e2676cab0800bac971b4251445a2213815bfb1`.
 It does not change build budgets, speculative scheduling, cancellation decisions, cache reuse,
 consensus rules, or block selection. The paired Reth patch is required.
-The manifest pins that patch to `3361695910c91adc500ef7bddf89b82dea84bbbc`
-([Reth PR #242](https://github.com/bnb-chain/reth/pull/242)).
+The manifest pins Reth to `b725cafed1731f7c580986c293fe26eb39553a60` from
+[Reth PR #219](https://github.com/bnb-chain/reth/pull/219), which includes the paired
+diagnostics patch from [Reth PR #242](https://github.com/bnb-chain/reth/pull/242).
 
 ## What is established, and what remains a hypothesis
 
