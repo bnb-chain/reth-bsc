@@ -5,6 +5,7 @@ use crate::{
     node::{
         consensus::BscForkChoiceEngine, engine::BscBuiltPayload,
         engine_api::payload::BscPayloadTypes, evm::util::insert_header_to_cache_with_hash,
+        miner::startup_diagnostics,
         network::BscNewBlock,
     },
     BscBlock, BscBlockBody,
@@ -254,6 +255,7 @@ where
         let block_hash = block.block.0.block.header.hash_slow();
         tracing::debug!(target: "bsc::block_import", "New payload: block = ({:?}, {:?}), peer_id = {:?}", block.block.0.block.header.number, block_hash, peer_id);
         Box::pin(async move {
+            startup_diagnostics::import_started(block_hash);
             if announced_hash != block_hash {
                 tracing::warn!(
                     target: "bsc::block_import",
@@ -278,7 +280,10 @@ where
             let sealed_block = block.block.0.block.clone().seal_unchecked(block_hash);
             let header = sealed_block.header().clone();
             let payload = BscPayloadTypes::block_to_payload(sealed_block, None);
-            match engine.new_payload(payload).await {
+            let new_payload_started = std::time::Instant::now();
+            let result = engine.new_payload(payload).await;
+            startup_diagnostics::new_payload_finished(block_hash, new_payload_started.elapsed());
+            match result {
                 Ok(payload_status) => match payload_status.status {
                     PayloadStatusEnum::Valid => {
                         tracing::debug!(target: "bsc::block_import", "New payload is valid, block_hash = {:?}, block_number = {}, peer_id = {:?}", block.hash, header.number, peer_id);
@@ -441,6 +446,7 @@ where
         payload: BscBuiltPayload,
         block_msg: NewBlockMessage<BscNewBlock>,
     ) {
+        startup_diagnostics::import_started(block_msg.hash);
         let block = &block_msg.block.0.block;
         // insert header to cache
         insert_header_to_cache_with_hash(block.header.clone(), Some(block_msg.hash));
@@ -711,6 +717,12 @@ where
 
     /// Add a new block import task to the pending imports
     fn on_new_block(&mut self, mut block: BlockMsg, peer_id: PeerId) {
+        // Some internal senders bypass ImportHandle; preserve an earlier local/remote ingress.
+        startup_diagnostics::ingress(
+            block.hash,
+            crate::consensus::parlia::util::calculate_millisecond_timestamp(&block.block.0.block.header),
+            "network",
+        );
         tracing::debug!(target: "bsc::block_import", "Receiving new block from network: number = {:?}, hash = {:?}, peer = {:?}", block.block.0.block.header.number, block.hash, peer_id);
 
         // Record before stale-block / dedup checks: announcer remains a

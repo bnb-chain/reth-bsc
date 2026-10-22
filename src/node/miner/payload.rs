@@ -1511,6 +1511,12 @@ where
         (job, handle)
     }
 
+    pub(crate) fn mark_scheduled(&mut self) {
+        if let Some(timing) = &mut self.mining_ctx.startup_timing {
+            timing.scheduled();
+        }
+    }
+
     /// Runs the payload job asynchronously with timeout support
     pub async fn start(mut self) -> Result<(), Box<BscPayloadJobError>> {
         // Sparse-trie state-root (`--mining.use-sparse-trie-state-root`):
@@ -1541,6 +1547,22 @@ where
             slot_remaining,
             self.build_args.cancel.clone(),
         );
+        if let Some(timing) = &self.mining_ctx.startup_timing {
+            timing.report(
+                start_time,
+                self.mining_ctx.parent_header.hash(),
+                self.mining_ctx.parent_header.number() + 1,
+                self.trace_id,
+                if self.mining_ctx.is_inturn { "inturn" } else { "outofturn" },
+                self.mining_ctx.parent_snapshot
+                    .last_block_in_one_turn(self.mining_ctx.parent_header.number() + 1),
+                self.mining_ctx.end_mining_timestamp_ms as i128 - now_ms as i128,
+                std::time::Duration::from_millis(STATE_ROOT_WAIT_MARGIN_MS),
+                self.root_reserve,
+                total_budget,
+                control.transactions_until.saturating_duration_since(start_time),
+            );
+        }
         // One sample per job (not per retry): slot_remaining is the original slot budget;
         // job_transaction_window is the resulting budget after applying BuildControl.
         // Both are seconds and use only consensus turn as a label, not block/trace IDs.
@@ -3292,6 +3314,7 @@ mod tests {
             cached_reads: None,
             block_timestamp_ms: now_ms + delay_ms,
             end_mining_timestamp_ms: 0,
+            startup_timing: None,
         }
     }
 
