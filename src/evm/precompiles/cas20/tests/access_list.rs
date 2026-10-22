@@ -10,13 +10,16 @@ use crate::{
 use alloy_eips::eip2930::{AccessList, AccessListItem};
 use alloy_primitives::Bytes;
 use alloy_rpc_types_eth::{
-    state::{AccountOverride, StateOverride},
+    state::{AccountOverride, EvmOverrides, StateOverride},
     TransactionRequest,
 };
 use reth_chainspec::ForkCondition;
 use reth_network_api::noop::NoopNetwork;
 use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
-use reth_rpc_eth_api::{helpers::EthCall, EthApiServer};
+use reth_rpc_eth_api::{
+    helpers::{Call, LoadState},
+    EthApiServer,
+};
 use reth_transaction_pool::test_utils::testing_pool;
 use std::sync::Arc;
 
@@ -100,9 +103,20 @@ async fn rpc_collects_native_balance_slot_and_replays_with_the_list() {
     );
 
     req.access_list = Some(result.access_list.clone());
-    let replay = api.0.create_access_list_at(req, None, None).await.unwrap();
-    assert_eq!(replay.gas_used, result.gas_used);
-    assert_eq!(replay.access_list, result.access_list);
+    // The opcode inspector excludes the callee's seeded entries and cannot observe native
+    // CAS20 storage. Replay the returned list directly instead of regenerating it upstream.
+    let (env, at) = api.0.evm_env_at(Default::default()).await.unwrap();
+    let replay = api
+        .0
+        .spawn_with_state_at_block(at, move |eth, mut db| {
+            let (env, tx) = eth.prepare_call_env(env, req, &mut db, EvmOverrides::default())?;
+            eth.transact(&mut db, env, tx)
+        })
+        .await
+        .unwrap();
+    assert_eq!(U256::from(replay.result.tx_gas_used()), result.gas_used);
+    assert!(replay.result.is_success());
+    assert_eq!(U256::from_be_slice(replay.result.output().unwrap()), U256::from(123));
 }
 
 #[tokio::test]

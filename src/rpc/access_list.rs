@@ -1,5 +1,5 @@
 //! eth_createAccessList with CAS20 native accesses in addition to opcode accesses.
-//! revm-inspectors 0.39 observes storage only through interpreter opcodes.
+//! The opcode inspector cannot observe storage accessed by native precompiles.
 
 use crate::evm::precompiles::cas20::access_list::capture;
 use alloy_eips::{eip2930::AccessListResult, BlockId};
