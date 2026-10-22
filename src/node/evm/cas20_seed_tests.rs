@@ -80,6 +80,7 @@ fn executor(db: InMemoryDB, header: Header) -> TestExecutor {
         state_root_precomputed_sink: None,
         trie_handle: None,
         state_root_deadline_ms: None,
+        build_control: None,
     };
     BscBlockExecutor::new(
         evm,

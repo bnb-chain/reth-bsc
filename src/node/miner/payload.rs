@@ -420,6 +420,8 @@ pub struct BscBuildArguments<Attributes> {
     /// `MiningContext::end_mining_timestamp_ms` minus [`STATE_ROOT_WAIT_MARGIN_MS`].
     /// `None` = legacy unbounded blocking wait.
     pub state_root_deadline_ms: Option<u64>,
+    /// Job-wide monotonic budget. Cloned attempts must not reset it after backoff.
+    pub build_control: Option<super::build_control::BuildControl>,
     /// Sub-second millisecond remainder (BEP-520) of the block being built:
     /// `MiningContext::block_timestamp_ms % 1000`. Threaded into
     /// [`BscNextBlockEnvAttributes`] so [`crate::evm::block_env::BscBlockEnv`] (and the
@@ -504,19 +506,29 @@ where
             // precomputed root instead of only the first attempt.
             trie_handle: _,
             state_root_deadline_ms,
+            build_control,
             milli_remainder,
         } = args;
         let PayloadConfig { parent_header, attributes, payload_id: _, parent_block_info: _ } =
             config;
 
         let parent_hash = parent_header.hash_slow();
+        let _build_permit = if build_control.is_some() {
+            Some(
+                super::build_control::LOCAL_BUILD_PERMIT
+                    .acquire()
+                    .await
+                    .map_err(std::io::Error::other)?,
+            )
+        } else {
+            None
+        };
+        if let Some(control) = &build_control {
+            control.check_active(std::time::Instant::now()).map_err(std::io::Error::other)?;
+        }
 
-        // R3: spawn a fresh sparse-trie state-root handle for THIS build attempt. The
-        // job-level handle was single-use — the first attempt consumed it and any retry
-        // (e.g. a value-gated rebuild) fell back to the synchronous `state_root_with_updates`,
-        // so ~half of in-turn blocks paid the full sync root cost. A fresh handle per attempt
-        // is cheap now that R1 shares the engine's proof pools. `None` keeps the sync path
-        // (sparse-trie disabled or no spawner registered).
+        // Each candidate owns its root task; all candidates reuse the miner's dedicated
+        // executor. `None` keeps the synchronous path when sparse-trie building is disabled.
         let trie_handle: Arc<Mutex<Option<reth_engine_tree::tree::StateRootHandle>>> = {
             let use_sparse_trie = crate::node::miner::config::get_global_mining_config()
                 .is_some_and(|c| c.use_sparse_trie_state_root);
@@ -580,6 +592,7 @@ where
             // See `BscBlockExecutionCtx::trie_handle` doc.
             trie_handle: Some(trie_handle.clone()),
             state_root_deadline_ms,
+            build_control: build_control.clone(),
         };
 
         let mut builder = self
@@ -669,10 +682,15 @@ where
         let exec_start = std::time::Instant::now();
         // Everything before `exec_start` is treated as "prepare" time for this payload attempt.
         let prepare_duration = exec_start.duration_since(build_start);
-        while let Some(pool_tx) = best_tx_list.next() {
-            if cancel.is_cancelled() {
+        loop {
+            if cancel.is_cancelled() ||
+                build_control
+                    .as_ref()
+                    .is_some_and(|control| control.stop_transactions(std::time::Instant::now()))
+            {
                 break;
             }
+            let Some(pool_tx) = best_tx_list.next() else { break };
 
             // filter out blacklisted transactions before executing.
             if self.chain_spec.is_nano_active_at_block(parent_header.number + 1) &&
@@ -945,6 +963,28 @@ where
             }
         }
         let exec_duration = exec_start.elapsed();
+        if let Some(control) = &build_control {
+            let now = std::time::Instant::now();
+            let reason = if cancel.is_cancelled() {
+                "cancelled"
+            } else if now >= control.finish_until {
+                "completion_deadline"
+            } else if now >= control.transactions_until {
+                "transaction_deadline"
+            } else {
+                "pool_or_gas_limit"
+            };
+            let turn = if self.ctx.is_inturn { "in_turn" } else { "out_of_turn" };
+            metrics::counter!("bsc_miner_build_stop_total", "turn" => turn, "reason" => reason)
+                .increment(1);
+            metrics::histogram!("bsc_miner_execution_budget_overrun_seconds", "turn" => turn)
+                .record(now.saturating_duration_since(control.transactions_until).as_secs_f64());
+            debug!(target: "payload_builder", trace_id, reason, cumulative_gas_used,
+                exec_duration_ms = exec_duration.as_millis(), "Stopped selecting payload transactions");
+        }
+        if let Some(control) = &build_control {
+            control.check_active(std::time::Instant::now()).map_err(std::io::Error::other)?;
+        }
 
         // add system txs to payload.
         let finalize_start = std::time::Instant::now();
@@ -1097,6 +1137,7 @@ where
             state_root_precomputed,
             trie_handle,
             state_root_deadline_ms: _,
+            build_control: _,
             milli_remainder,
         } = args;
         let PayloadConfig { parent_header, attributes, payload_id: _, parent_block_info: _ } =
@@ -1152,6 +1193,7 @@ where
                     // correct but the setup overhead isn't worth it for ~0-tx blocks).
                     trie_handle: None,
                     state_root_deadline_ms: None,
+                    build_control: None,
                 },
             )
             .map_err(PayloadBuilderError::other)?;
@@ -1273,6 +1315,8 @@ where
     builder: Arc<BscPayloadBuilder<Pool, Client, EvmConfig>>,
     /// Timeout for payload building
     timeout: std::time::Duration,
+    /// Time reserved for system transactions and state-root completion.
+    root_reserve: std::time::Duration,
     /// Message queue for processing build arguments
     try_build_rx: mpsc::UnboundedReceiver<()>,
     /// Sender for sending arguments back to queue
@@ -1389,6 +1433,7 @@ where
             mining_ctx,
             builder: Arc::new(builder),
             timeout: std::time::Duration::from_millis(mining_delay),
+            root_reserve: std::time::Duration::from_millis(effective_reserve),
             try_build_rx,
             try_build_tx: try_build_tx.clone(),
             tx_listener: tx_listener_rx,
@@ -1435,6 +1480,27 @@ where
         // synchronous `state_root_with_updates` on miss / no spawner.
 
         let mut start_time = std::time::Instant::now();
+        self.job_start_time = start_time;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let slot_remaining = std::time::Duration::from_millis(
+            self.mining_ctx.end_mining_timestamp_ms.saturating_sub(now_ms).min(u64::MAX as u128)
+                as u64,
+        )
+        .saturating_sub(std::time::Duration::from_millis(STATE_ROOT_WAIT_MARGIN_MS));
+        let total_budget = (self.timeout + self.root_reserve)
+            .min(std::time::Duration::from_millis(self.mining_ctx.parent_snapshot.block_interval));
+        let control = super::build_control::BuildControl::new(
+            start_time,
+            total_budget,
+            self.root_reserve,
+            slot_remaining,
+            self.build_args.cancel.clone(),
+        );
+        self.timeout = control.transactions_until.saturating_duration_since(start_time);
+        self.build_args.build_control = Some(control);
         let initial_wait = initial_out_of_turn_build_wait(&self.parlia, &self.mining_ctx);
         if !initial_wait.is_zero() {
             debug!(
@@ -1479,10 +1545,7 @@ where
             }
         }
 
-        // The job timeout is the budget for payload building attempts. When we intentionally
-        // back off out-of-turn to match go-bsc behavior, start accounting that budget only
-        // after the wait completes.
-        self.job_start_time = std::time::Instant::now();
+        // Backoff delays publication, not the execution budget already used by speculation.
 
         // Skip the normal first-build kickoff if a speculative build from the
         // out-of-turn backoff is already running or has completed into the JoinSet.
@@ -1842,7 +1905,6 @@ where
                         timeout_ms = self.timeout.as_millis(),
                         "Try return best payload due to has no time"
                     );
-                    self.build_args.cancel.clone().cancel();
                     return self.try_return_best_payload();
                 }
 

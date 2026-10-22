@@ -685,6 +685,7 @@ where
                     state_root_precomputed_sink: None,
                     trie_handle: None,
                     state_root_deadline_ms: None,
+                    build_control: None,
                 },
             )
             .map_err(PayloadBuilderError::other)
