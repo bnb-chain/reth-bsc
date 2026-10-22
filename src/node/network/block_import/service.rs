@@ -2039,7 +2039,7 @@ mod tests {
         tokio::spawn(Box::pin(async move {
             while let Some(message) = from_engine.recv().await {
                 match message {
-                    BeaconEngineMessage::NewPayload { payload, tx } => {
+                    BeaconEngineMessage::NewPayload { payload, tx, .. } => {
                         if responses.new_payload_local_fault {
                             let local_fault = payload.local_fault.as_ref().expect("request marker");
                             assert!(!local_fault.load(Ordering::Acquire));
@@ -2055,7 +2055,9 @@ mod tests {
                             let _ = observed.send(());
                         }
                     }
-                    BeaconEngineMessage::ForkchoiceUpdated { state, payload_attrs: _, tx } => {
+                    BeaconEngineMessage::ForkchoiceUpdated {
+                        state, payload_attrs: _, tx, ..
+                    } => {
                         let _ = fcu_tx.send(state);
                         tx.send(Ok(OnForkChoiceUpdated::valid(PayloadStatus::new(
                             responses.fcu.clone(),
@@ -2094,11 +2096,13 @@ mod tests {
         tokio::spawn(async move {
             while let Some(message) = from_engine.recv().await {
                 match message {
-                    BeaconEngineMessage::NewPayload { payload: _, tx } => {
+                    BeaconEngineMessage::NewPayload { payload: _, tx, .. } => {
                         let _ = np_tx.send(());
                         let _ = tx.send(Ok(PayloadStatus::new(PayloadStatusEnum::Valid, None)));
                     }
-                    BeaconEngineMessage::ForkchoiceUpdated { state, payload_attrs: _, tx } => {
+                    BeaconEngineMessage::ForkchoiceUpdated {
+                        state, payload_attrs: _, tx, ..
+                    } => {
                         let _ = fcu_tx.send(state);
                         let _ = tx.send(Ok(OnForkChoiceUpdated::valid(PayloadStatus::new(
                             PayloadStatusEnum::Valid,
@@ -2162,11 +2166,13 @@ mod tests {
         tokio::spawn(async move {
             while let Some(message) = from_engine.recv().await {
                 match message {
-                    BeaconEngineMessage::NewPayload { payload: _, tx } => {
+                    BeaconEngineMessage::NewPayload { payload: _, tx, .. } => {
                         let _ = np_tx.send(());
                         let _ = tx.send(Ok(PayloadStatus::new(PayloadStatusEnum::Valid, None)));
                     }
-                    BeaconEngineMessage::ForkchoiceUpdated { state, payload_attrs: _, tx } => {
+                    BeaconEngineMessage::ForkchoiceUpdated {
+                        state, payload_attrs: _, tx, ..
+                    } => {
                         let _ = fcu_tx.send(state);
                         let _ = tx.send(Ok(OnForkChoiceUpdated::valid(PayloadStatus::new(
                             PayloadStatusEnum::Valid,

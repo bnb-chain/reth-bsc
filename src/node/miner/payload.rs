@@ -51,10 +51,9 @@ use reth_primitives_traits::{
     transaction::error::InvalidTransactionError, Block, BlockBody, HeaderTy, RecoveredBlock,
     SealedBlock, SealedHeader, SignerRecoverable,
 };
-use reth_provider::StateProviderFactory;
-use reth_revm::{
-    cached::CachedReads, cancelled::ManualCancel, database::StateProviderDatabase, db::State,
-};
+use reth_provider::{EvmStateProviderAdapter, StateProviderFactory};
+use reth_revm::{cached::CachedReads, database::StateProviderDatabase, db::State};
+use reth_tasks::ManualCancel;
 use revm::context_interface::Block as EvmBlock;
 use std::{
     collections::HashMap,
@@ -528,7 +527,7 @@ where
         };
 
         let state_provider = self.client.state_by_block_hash(parent_header.hash_slow())?;
-        let state = StateProviderDatabase::new(&state_provider);
+        let state = StateProviderDatabase::new(EvmStateProviderAdapter(&state_provider));
         let mut db = State::builder()
             .with_database(cached_reads.as_db_mut(state))
             .with_bundle_update()
@@ -1106,7 +1105,7 @@ where
         let _ = parent_hash;
 
         let state_provider = self.client.state_by_block_hash(parent_header.hash_slow())?;
-        let state = StateProviderDatabase::new(&state_provider);
+        let state = StateProviderDatabase::new(EvmStateProviderAdapter(&state_provider));
         let mut db = State::builder()
             .with_database(cached_reads.as_db_mut(state))
             .with_bundle_update()

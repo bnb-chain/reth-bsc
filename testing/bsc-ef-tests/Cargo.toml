@@ -16,35 +16,35 @@ reth_bsc = { path = "../.." }
 rand = "0.9"
 
 # reth dependencies aligned with root crate branch to avoid duplicate crate versions
-reth-chainspec = { git = "https://github.com/bnb-chain/reth.git", rev = "b725cafed1731f7c580986c293fe26eb39553a60" }
-reth-consensus = { git = "https://github.com/bnb-chain/reth.git", rev = "b725cafed1731f7c580986c293fe26eb39553a60" }
-reth-ethereum-forks = { git = "https://github.com/bnb-chain/reth.git", rev = "b725cafed1731f7c580986c293fe26eb39553a60" }
-reth-db = { git = "https://github.com/bnb-chain/reth.git", rev = "b725cafed1731f7c580986c293fe26eb39553a60", features = [    "mdbx",
+reth-chainspec = { git = "https://github.com/bnb-chain/reth.git", rev = "5ab86a20b9c8e74200ae036bf33bafa97cf79ef7" }
+reth-consensus = { git = "https://github.com/bnb-chain/reth.git", rev = "5ab86a20b9c8e74200ae036bf33bafa97cf79ef7" }
+reth-ethereum-forks = { git = "https://github.com/bnb-chain/reth.git", rev = "5ab86a20b9c8e74200ae036bf33bafa97cf79ef7" }
+reth-db = { git = "https://github.com/bnb-chain/reth.git", rev = "5ab86a20b9c8e74200ae036bf33bafa97cf79ef7", features = [    "mdbx",
     "test-utils",
     "disable-lock",
 ] }
-reth-db-api = { git = "https://github.com/bnb-chain/reth.git", rev = "b725cafed1731f7c580986c293fe26eb39553a60" }
-reth-db-common = { git = "https://github.com/bnb-chain/reth.git", rev = "b725cafed1731f7c580986c293fe26eb39553a60" }
-reth-ethereum-consensus = { git = "https://github.com/bnb-chain/reth.git", rev = "b725cafed1731f7c580986c293fe26eb39553a60" }
-reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth.git", rev = "b725cafed1731f7c580986c293fe26eb39553a60" }
-reth-evm = { git = "https://github.com/bnb-chain/reth.git", rev = "b725cafed1731f7c580986c293fe26eb39553a60" }
-reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth.git", rev = "b725cafed1731f7c580986c293fe26eb39553a60" }
-reth-primitives-traits = { version = "0.6.0", default-features = false }
-reth-provider = { git = "https://github.com/bnb-chain/reth.git", rev = "b725cafed1731f7c580986c293fe26eb39553a60", features = [
+reth-db-api = { git = "https://github.com/bnb-chain/reth.git", rev = "5ab86a20b9c8e74200ae036bf33bafa97cf79ef7" }
+reth-db-common = { git = "https://github.com/bnb-chain/reth.git", rev = "5ab86a20b9c8e74200ae036bf33bafa97cf79ef7" }
+reth-ethereum-consensus = { git = "https://github.com/bnb-chain/reth.git", rev = "5ab86a20b9c8e74200ae036bf33bafa97cf79ef7" }
+reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth.git", rev = "5ab86a20b9c8e74200ae036bf33bafa97cf79ef7" }
+reth-evm = { git = "https://github.com/bnb-chain/reth.git", rev = "5ab86a20b9c8e74200ae036bf33bafa97cf79ef7" }
+reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth.git", rev = "5ab86a20b9c8e74200ae036bf33bafa97cf79ef7" }
+reth-primitives-traits = { version = "0.8.2", default-features = false }
+reth-provider = { git = "https://github.com/bnb-chain/reth.git", rev = "5ab86a20b9c8e74200ae036bf33bafa97cf79ef7", features = [
     "test-utils",
 ] }
-reth-revm = { git = "https://github.com/bnb-chain/reth.git", rev = "b725cafed1731f7c580986c293fe26eb39553a60", features = [
+reth-revm = { git = "https://github.com/bnb-chain/reth.git", rev = "5ab86a20b9c8e74200ae036bf33bafa97cf79ef7", features = [
     "std",
 ] }
-reth-tracing = { git = "https://github.com/bnb-chain/reth.git", rev = "b725cafed1731f7c580986c293fe26eb39553a60" }
-reth-trie = { git = "https://github.com/bnb-chain/reth.git", rev = "b725cafed1731f7c580986c293fe26eb39553a60" }
-reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", rev = "b725cafed1731f7c580986c293fe26eb39553a60" }
+reth-tracing = { git = "https://github.com/bnb-chain/reth.git", rev = "5ab86a20b9c8e74200ae036bf33bafa97cf79ef7" }
+reth-trie = { git = "https://github.com/bnb-chain/reth.git", rev = "5ab86a20b9c8e74200ae036bf33bafa97cf79ef7" }
+reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", rev = "5ab86a20b9c8e74200ae036bf33bafa97cf79ef7" }
 # revm
 
 # alloy
-alloy-consensus = "2.0.0"
-alloy-eips = "2.0.0"
-alloy-genesis = "2.0.0"
+alloy-consensus = "2.5.0"
+alloy-eips = "2.5.0"
+alloy-genesis = "2.5.0"
 alloy-primitives = "1.5.6"
 alloy-rlp = "0.3.13"
 

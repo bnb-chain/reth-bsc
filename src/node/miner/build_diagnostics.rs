@@ -5,8 +5,8 @@ use alloy_consensus::BlockHeader;
 use reth_primitives_traits::BlockBody;
 use std::{
     sync::{
-        Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
     },
     time::Instant,
 };

@@ -39,7 +39,9 @@ use reth_execution_types::BlockExecutionOutput;
 use reth_node_ethereum::engine::EthPayloadAttributes;
 use reth_payload_primitives::{BuiltPayloadExecutedBlock, PayloadBuilderError};
 use reth_primitives_traits::{SealedHeader, SignerRecoverable};
-use reth_provider::{BlockHashReader, HeaderProvider, StateProviderFactory};
+use reth_provider::{
+    BlockHashReader, EvmStateProviderAdapter, HeaderProvider, StateProviderFactory,
+};
 use reth_revm::{database::StateProviderDatabase, db::State};
 use revm::{context_interface::Block as EvmBlock, Database};
 use std::{
@@ -629,7 +631,7 @@ where
                 return Err(());
             }
         };
-        let sp_db = StateProviderDatabase::new(&state_provider);
+        let sp_db = StateProviderDatabase::new(EvmStateProviderAdapter(&state_provider));
         let mut db = State::builder().with_database(sp_db).with_bundle_update().build();
 
         // Clone necessary fields to avoid borrow conflicts

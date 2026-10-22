@@ -27,7 +27,9 @@ use reth_chainspec::{
 };
 use reth_db_common::init::init_genesis;
 use reth_primitives_traits::SealedHeader;
-use reth_provider::test_utils::create_test_provider_factory_with_chain_spec;
+use reth_provider::{
+    test_utils::create_test_provider_factory_with_chain_spec, EvmStateProviderAdapter,
+};
 use std::{
     collections::HashMap,
     sync::{Arc, RwLock},
@@ -278,7 +280,7 @@ fn trusted_local_build_produces_block() {
     let parent = SealedHeader::new(chain_spec.genesis_header().clone(), chain_spec.genesis_hash());
     let provider = factory.database_provider_rw().expect("rw provider");
     let state_provider = provider.latest();
-    let sp_db = StateProviderDatabase::new(&state_provider);
+    let sp_db = StateProviderDatabase::new(EvmStateProviderAdapter(&state_provider));
     let mut db = State::builder().with_database(sp_db).with_bundle_update().build();
 
     let evm_config = BscEvmConfig::new(chain_spec.clone());
@@ -360,7 +362,7 @@ fn round_trip_build_finalize_reexecute_agree() {
     // the vanity+seal minimum) and prev_randao = the finalized difficulty (BSC PREVRANDAO).
     let block = {
         let state_provider = provider.latest();
-        let sp_db = StateProviderDatabase::new(&state_provider);
+        let sp_db = StateProviderDatabase::new(EvmStateProviderAdapter(&state_provider));
         let mut db = State::builder().with_database(sp_db).with_bundle_update().build();
         let evm_config = BscEvmConfig::new(chain_spec.clone());
         let mut builder = evm_config
@@ -424,7 +426,8 @@ fn round_trip_build_finalize_reexecute_agree() {
     // Re-execute the sealed block via the executor path and recompute the state root.
     let state_provider2 = provider.latest();
     let evm_config = BscEvmConfig::new(chain_spec.clone());
-    let executor = evm_config.batch_executor(StateProviderDatabase::new(&state_provider2));
+    let executor = evm_config
+        .batch_executor(StateProviderDatabase::new(EvmStateProviderAdapter(&state_provider2)));
     let output = executor.execute(&finalized).expect("re-execute sealed block");
     let hashed = HashedPostState::from_bundle_state::<KeccakKeyHasher>(output.state.state());
     let (computed_root, _) = <StateRoot<
@@ -513,7 +516,7 @@ fn execution_gate_round_trip() {
     let (block1, out1): (RecoveredBlock<reth_bsc::BscBlock>, BlockExecutionOutput<_>) = {
         let provider = factory.database_provider_rw().unwrap();
         let state_provider = provider.latest();
-        let sp_db = StateProviderDatabase::new(&state_provider);
+        let sp_db = StateProviderDatabase::new(EvmStateProviderAdapter(&state_provider));
         let mut db = State::builder().with_database(sp_db).with_bundle_update().build();
         let evm_config = BscEvmConfig::new(chain_spec.clone());
         let diff = calculate_difficulty(&genesis_snap, *TEST_VALIDATOR);
@@ -586,7 +589,7 @@ fn execution_gate_round_trip() {
     let (block2_ref, _out2): (RecoveredBlock<reth_bsc::BscBlock>, BlockExecutionOutput<_>) = {
         let provider = factory.database_provider_rw().unwrap();
         let state_provider = provider.latest();
-        let sp_db = StateProviderDatabase::new(&state_provider);
+        let sp_db = StateProviderDatabase::new(EvmStateProviderAdapter(&state_provider));
         let mut db = State::builder().with_database(sp_db).with_bundle_update().build();
         let evm_config = BscEvmConfig::new(chain_spec.clone());
         let diff = calculate_difficulty(&block1_snap, *TEST_VALIDATOR);
@@ -662,7 +665,8 @@ fn execution_gate_round_trip() {
     let provider = factory.database_provider_rw().unwrap();
     let state_provider = provider.latest();
     let evm_config = BscEvmConfig::new(chain_spec.clone());
-    let executor = evm_config.batch_executor(StateProviderDatabase::new(&state_provider));
+    let executor = evm_config
+        .batch_executor(StateProviderDatabase::new(EvmStateProviderAdapter(&state_provider)));
     let output = executor.execute(&sim.block).expect("execute simulated block 2");
     let hashed = HashedPostState::from_bundle_state::<KeccakKeyHasher>(output.state.state());
     let (computed_root, _) = <StateRoot<
@@ -797,7 +801,7 @@ fn jenner_payment_lane_chain_round_trips() {
             let provider = factory.database_provider_rw().unwrap();
             let state_provider = provider.latest();
             let mut db = State::builder()
-                .with_database(StateProviderDatabase::new(&state_provider))
+                .with_database(StateProviderDatabase::new(EvmStateProviderAdapter(&state_provider)))
                 .with_bundle_update()
                 .build();
             let diff = calculate_difficulty(&parent_snap, *TEST_VALIDATOR);
@@ -887,7 +891,9 @@ fn jenner_payment_lane_chain_round_trips() {
         {
             let provider = factory.database_provider_rw().unwrap();
             let state_provider = provider.latest();
-            let executor = evm_config.batch_executor(StateProviderDatabase::new(&state_provider));
+            let executor = evm_config.batch_executor(StateProviderDatabase::new(
+                EvmStateProviderAdapter(&state_provider),
+            ));
             executor
                 .execute(&block)
                 .unwrap_or_else(|e| panic!("re-import of block {number} rejected: {e:?}"));
