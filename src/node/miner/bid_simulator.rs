@@ -9,6 +9,7 @@ use crate::node::evm::config::{
 };
 use crate::node::evm::LaneAdmission;
 use crate::node::miner::bsc_miner::MiningContext;
+use crate::node::miner::config::{get_global_mining_config, MiningConfig};
 use crate::node::miner::payload::DELAY_LEFT_OVER;
 use crate::node::miner::util::{epoch_validators_for_next_block, prepare_new_attributes};
 use crate::node::primitives::BscBlobTransactionSidecar;
@@ -238,13 +239,34 @@ where
             best_bid_block: Arc::new(RwLock::new(HashMap::new())),
             pending_bid: Arc::new(RwLock::new(HashMap::new())),
             bid_receiving: true,
-            min_gas_price: U256::ZERO,
+            min_gas_price: U256::from(get_global_mining_config().map_or_else(
+                || MiningConfig::default().get_min_gas_tip(),
+                MiningConfig::get_min_gas_tip,
+            )),
             mev_metrics: crate::metrics::BscMevMetrics::default(),
             validator_commission,
             greedy_merge,
             no_interrupt_left_over,
             interrupt_counts: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    fn validate_bid_gas_price(&self, gas_fee: U256, gas_used: u64) -> Result<(), ()> {
+        if gas_used != 0 {
+            let bid_gas_price = gas_fee / U256::from(gas_used);
+            // Read at simulation time so miner_setGasPrice also applies to legacy bids.
+            let min_gas_price = crate::shared::get_miner_gas_tip()
+                .map(U256::from)
+                .unwrap_or(self.min_gas_price);
+            if bid_gas_price < min_gas_price {
+                debug!(
+                    "bid gas price is lower than min gas price, bid:{}, min:{}",
+                    bid_gas_price, min_gas_price
+                );
+                return Err(());
+            }
+        }
+        Ok(())
     }
 
     pub fn check_pending_bid(&self, block_number: u64, builder: Address, bid_hash: B256) -> bool {
@@ -769,16 +791,7 @@ where
             return Err(());
         }
 
-        if bid_runtime.gas_used != 0 {
-            let bid_gas_price = bid_runtime.gas_fee / U256::from(bid_runtime.gas_used);
-            if bid_gas_price < self.min_gas_price {
-                debug!(
-                    "bid gas price is lower than min gas price, bid:{}, min:{}",
-                    bid_gas_price, self.min_gas_price
-                );
-                return Err(());
-            }
-        }
+        self.validate_bid_gas_price(bid_runtime.gas_fee, bid_runtime.gas_used)?;
 
         // if enable greedy merge, fill bid env with transactions from mempool
         if self.greedy_merge {
@@ -1452,6 +1465,64 @@ mod tests {
     use super::*;
     use crate::node::primitives::{BscBlock, BscBlockBody};
     use reth_primitives_traits::RecoveredBlock;
+
+    fn price_test_simulator() -> BidSimulator<
+        reth_provider::test_utils::MockEthProvider,
+        reth_transaction_pool::noop::NoopTransactionPool,
+    > {
+        struct EmptySnapshots;
+        impl SnapshotProvider for EmptySnapshots {
+            fn snapshot_by_hash(&self, _: &B256) -> Option<Snapshot> {
+                None
+            }
+            fn insert(&self, _: Snapshot) {}
+        }
+        let spec = Arc::new(BscChainSpec::from(
+            reth_chainspec::ChainSpecBuilder::mainnet().build(),
+        ));
+        BidSimulator::new(
+            reth_provider::test_utils::MockEthProvider::default(),
+            reth_transaction_pool::noop::NoopTransactionPool::default(),
+            spec.clone(),
+            Arc::new(crate::consensus::parlia::Parlia::new(spec, 200)),
+            Address::ZERO,
+            Arc::new(EmptySnapshots),
+            100,
+            false,
+            0,
+        )
+    }
+
+    #[test]
+    fn legacy_bid_price_fallback_uses_mining_configuration() {
+        let simulator = price_test_simulator();
+        let expected = get_global_mining_config().map_or_else(
+            || MiningConfig::default().get_min_gas_tip(),
+            MiningConfig::get_min_gas_tip,
+        );
+        assert_eq!(simulator.min_gas_price, U256::from(expected));
+    }
+
+    #[test]
+    fn legacy_bid_price_guard_observes_live_floor_updates() {
+        let _guard = crate::node::pool::tests::TipGuard::new(50_000_000);
+        let simulator = price_test_simulator();
+        let gas_used = 21_000;
+        for floor in [50_000_000, 75_000_000, 25_000_000] {
+            crate::shared::set_miner_gas_tip(floor);
+            for price in [floor - 1, floor, floor + 1] {
+                let gas_fee = U256::from(price) * U256::from(gas_used);
+                assert_eq!(
+                    simulator.validate_bid_gas_price(gas_fee, gas_used).is_ok(),
+                    price >= floor,
+                    "average price {price} with live floor {floor}",
+                );
+            }
+        }
+        assert!(simulator.validate_bid_gas_price(U256::ZERO, 0).is_ok());
+        crate::shared::set_miner_gas_tip(0);
+        assert!(simulator.validate_bid_gas_price(U256::ZERO, gas_used).is_ok());
+    }
 
     #[test]
     fn can_be_interrupted_requires_full_simulation_window() {
