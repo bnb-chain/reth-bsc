@@ -188,14 +188,10 @@ this evidence. Thread stacks remain necessary where the snapshots only locate a 
 
 This document describes new instrumentation, not preconfigured monitoring panels. Deploy the paired revisions together after review.
 
-For local compilation against the paired Reth checkout:
+To validate against the Reth revision pinned in the manifest and lock file:
 
 ```sh
-python3 scripts/perf-diag-local-config.py ../reth-perf-diag > /tmp/reth-local.toml
-cargo check --lib --config /tmp/reth-local.toml
-cargo test --lib --config /tmp/reth-local.toml node::reorg_metrics::tests
-cargo test --lib --config /tmp/reth-local.toml node::miner::build_diagnostics::tests
+cargo check --locked --lib
+cargo test --locked --lib node::reorg_metrics::tests
+cargo test --locked --lib node::miner::build_diagnostics::tests
 ```
-
-Cargo locally rewrites the Reth source entries in Cargo.lock to paths; do not publish that path-only
-lock change. The checked-in manifest and lock file pin the paired Reth diagnostics revision.
