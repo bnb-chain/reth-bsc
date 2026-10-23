@@ -15,6 +15,16 @@ use std::{sync::Arc, time::SystemTime};
 
 const MAX_RLP_BLOCK_SIZE_OSAKA: usize = 8 * 1024 * 1024;
 
+#[inline]
+fn validate_osaka_block_size(rlp_length: usize) -> Result<(), ConsensusError> {
+    if rlp_length > MAX_RLP_BLOCK_SIZE_OSAKA {
+        return Err(ConsensusError::BlockTooLarge {
+            rlp_length,
+            max_rlp_length: MAX_RLP_BLOCK_SIZE_OSAKA,
+        });
+    }
+    Ok(())
+}
 
 pub const fn validate_header_gas(header: &Header) -> Result<(), ConsensusError> {
     if header.gas_used > header.gas_limit {
@@ -295,13 +305,7 @@ impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 's
         }
 
         if BscHardforks::is_osaka_active_at_timestamp(&*self.spec, block.number, block.timestamp) {
-            let rlp_length = BscBlock::rlp_length(block.header(), block.body());
-            if rlp_length > MAX_RLP_BLOCK_SIZE_OSAKA {
-                return Err(ConsensusError::BlockTooLarge {
-                    rlp_length,
-                    max_rlp_length: MAX_RLP_BLOCK_SIZE_OSAKA,
-                });
-            }
+            validate_osaka_block_size(BscBlock::canonical_rlp_length(block.header(), block.body()))?;
             // Note: Individual transaction gas limit validation (EIP-7825) is intentionally
             // NOT performed here because system transactions use i64::MAX gas limit.
             // The validation happens during EVM execution via cfg_env.tx_gas_limit_cap,
@@ -347,6 +351,64 @@ mod tests {
 
     fn sealed(header: Header) -> SealedHeader {
         RethSealedHeader::new(header, B256::ZERO)
+    }
+
+    #[test]
+    fn osaka_block_size_limit_boundary() {
+        // Check the boundary numerically without constructing oversized block payloads.
+        assert!(validate_osaka_block_size(MAX_RLP_BLOCK_SIZE_OSAKA - 1).is_ok());
+        assert!(validate_osaka_block_size(MAX_RLP_BLOCK_SIZE_OSAKA).is_ok());
+        let oversized = MAX_RLP_BLOCK_SIZE_OSAKA + 1;
+        assert!(matches!(
+            validate_osaka_block_size(oversized),
+            Err(ConsensusError::BlockTooLarge { rlp_length, max_rlp_length })
+                if rlp_length == oversized && max_rlp_length == MAX_RLP_BLOCK_SIZE_OSAKA
+        ));
+    }
+
+    /// The Osaka limit applies to go-bsc's `Block.Size()`, which excludes blob sidecars. A
+    /// block whose sidecars alone push its network encoding past 8 MiB must not be rejected as
+    /// too large by `validate_block_pre_execution`.
+    #[test]
+    fn osaka_block_size_check_ignores_sidecars() {
+        use crate::{
+            chainspec::BscChainSpec,
+            node::primitives::{BscBlobTransactionSidecar, BscBlockBody},
+        };
+        use alloy_eips::eip4844::{Blob, BlobTransactionSidecar, Bytes48};
+        use reth_primitives_traits::SealedBlock;
+
+        let blobs = 65;
+        let sidecar = BscBlobTransactionSidecar {
+            inner: BlobTransactionSidecar {
+                blobs: vec![Blob::default(); blobs],
+                commitments: vec![Bytes48::default(); blobs],
+                proofs: vec![Bytes48::default(); blobs],
+            },
+            block_number: 0,
+            block_hash: B256::ZERO,
+            tx_index: 0,
+            tx_hash: B256::ZERO,
+            version: 0,
+        };
+        // Mainnet activates Osaka at timestamp 1777343400.
+        let header = Header { number: 50_000_000, timestamp: 1_777_343_401, ..Default::default() };
+        let body = BscBlockBody {
+            inner: alloy_consensus::BlockBody {
+                transactions: Vec::new(),
+                ommers: Vec::new(),
+                withdrawals: None,
+            },
+            sidecars: Some(vec![sidecar]),
+        };
+        assert!(BscBlock::rlp_length(&header, &body) > MAX_RLP_BLOCK_SIZE_OSAKA);
+        assert!(BscBlock::canonical_rlp_length(&header, &body) <= MAX_RLP_BLOCK_SIZE_OSAKA);
+
+        let parlia =
+            Parlia::new(Arc::new(BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet())), 200);
+        let block = SealedBlock::seal_slow(BscBlock { header, body });
+        let result = parlia.validate_block_pre_execution(&block);
+        assert!(!matches!(result, Err(ConsensusError::BlockTooLarge { .. })), "{result:?}");
     }
 
     #[test]
