@@ -51,9 +51,9 @@ fn bls_signature_validation_run(input: &[u8], gas_limit: u64, reservoir: u64) ->
     // Preserve the existing key validation, including rejection of infinity, and
     // count repeated keys with their full multiplicity, as go-bsc does.
     let mut aggregate_pubkey = bls::types::G1ProjectivePoint::default();
-    for pub_key in
-        input[msg_and_sig_length as usize..].chunks_exact(BLS_SINGLE_PUBKEY_LENGTH as usize)
-    {
+    let (pub_keys, _) = input[msg_and_sig_length as usize..]
+        .as_chunks::<{ BLS_SINGLE_PUBKEY_LENGTH as usize }>();
+    for pub_key in pub_keys {
         let Ok(point) = bls::pubkey_to_point(&pub_key.to_vec()) else { return revert() };
         if !bls::pubkey_subgroup_check(point) {
             return revert()
@@ -115,7 +115,8 @@ mod tests {
     fn legacy_verifies(input: &[u8]) -> bool {
         let message = input[..32].to_vec();
         let signature = input[32..128].to_vec();
-        let keys: Vec<_> = input[128..].chunks_exact(48).map(<[u8]>::to_vec).collect();
+        let (keys, _) = input[128..].as_chunks::<48>();
+        let keys: Vec<_> = keys.iter().map(|key| key.to_vec()).collect();
         let messages = vec![message; keys.len()];
         bls::aggregate_verify(keys, messages, &signature, &BLS_DST.to_vec())
     }
