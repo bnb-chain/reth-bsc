@@ -218,6 +218,7 @@ where
                 trie_handle: None,
                 state_root_deadline_ms: None,
                 build_control: None,
+                finish_diagnostics: None,
             },
         )
         .map_err(|e| internal_err(format!("builder_for_next_block: {e}")))?;

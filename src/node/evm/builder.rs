@@ -155,6 +155,10 @@ where
             self.precomputed_state_root = state_root_precomputed;
         }
         let finish_start = std::time::Instant::now();
+        let mut stages = super::finish_metrics::FinishObservation::new(
+            self.ctx.finish_diagnostics,
+            self.ctx.build_control.clone(),
+        );
         let build_control = self.ctx.build_control.clone();
         if let Some(control) = &build_control {
             control.check_active(finish_start).map_err(BlockExecutionError::msg)?;
@@ -163,6 +167,7 @@ where
         // validator, distribute fees / finality rewards, breathe-block validator-set
         // updates). The sparse-trie `state_hook` is installed on the DB (v2.4.1), so it
         // captures those commits here too.
+        stages.enter("system_transactions");
         let (evm, result) = self.executor.finish()?;
         let (db, evm_env) = evm.finish();
 
@@ -171,6 +176,7 @@ where
         // Clearing drops the `StateRootUpdateHook`, which signals end-of-updates so the
         // background task can finalize and `state_root()` below returns. Without this the task
         // waits forever for more updates and the miner falls back after the slot deadline.
+        stages.enter("close_state_stream");
         db.set_state_hook(None);
         if let Some(control) = &build_control {
             control.check_active(std::time::Instant::now()).map_err(BlockExecutionError::msg)?;
@@ -184,6 +190,7 @@ where
         // logged at WARN. A failure here is non-fatal but indicates the task panicked
         // or its channel was dropped; investigate via the trace target below.
         if let Some(handle_slot) = self.ctx.trie_handle.take() {
+            stages.enter("root_wait");
             if let Some(mut handle) = handle_slot.lock().unwrap().take() {
                 let wait_start = std::time::Instant::now();
                 // R2: bound the wait by the slot deadline (if set) so an in-turn block
@@ -254,6 +261,7 @@ where
                         },
                     }
                 };
+                stages.enter("root_result");
                 if let Some(outcome) = delivered {
                     let updates = std::sync::Arc::try_unwrap(outcome.trie_updates)
                         .unwrap_or_else(|arc| (*arc).clone());
@@ -277,6 +285,7 @@ where
             }
         }
 
+        stages.enter("merge_state");
         let assembled_system_txs = {
             let mut inner = self.shared_ctx.inner.borrow_mut();
             std::mem::take(&mut inner.assembled_system_txs)
@@ -288,9 +297,11 @@ where
         if let Some(control) = &build_control {
             control.check_active(state_root_start).map_err(BlockExecutionError::msg)?;
         }
+        stages.enter("hash_state");
         let hashed_state =
             state.hashed_post_state(&db.bundle_state).map_err(BlockExecutionError::other)?;
 
+        stages.enter("root_select");
         let (state_root, trie_updates) = if let Some((root, updates)) = self
             .ctx
             .state_root_precomputed_sink
@@ -318,6 +329,7 @@ where
             );
             (root, updates)
         } else {
+            stages.enter("sync_root");
             // Fix #1: bound the synchronous state-root fallback by the slot deadline.
             //
             // When the sparse-trie precomputed root is unavailable (recv_timeout expired, or no
@@ -372,6 +384,7 @@ where
             control.check_active(std::time::Instant::now()).map_err(BlockExecutionError::msg)?;
         }
 
+        stages.enter("assemble");
         let user_tx_len = self.transactions.len();
         let system_tx_len = assembled_system_txs.len();
         self.transactions.extend(assembled_system_txs);
@@ -432,6 +445,7 @@ where
         );
 
         let block = RecoveredBlock::new_unhashed(block, senders);
+        stages.complete();
         Ok(BlockBuilderOutcome {
             execution_result: result,
             hashed_state,

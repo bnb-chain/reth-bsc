@@ -118,6 +118,9 @@ pub struct BscNextBlockEnvAttributes {
     pub state_root_deadline_ms: Option<u64>,
     /// Monotonic local-build budget and cancellation; absent for import and RPC.
     pub build_control: Option<crate::node::miner::build_control::BuildControl>,
+    /// Miner-only bounded (attempt kind, consensus turn) labels for finish-stage diagnostics.
+    /// None for import, RPC and bid simulation; never infer kind from transaction count.
+    pub finish_diagnostics: Option<(&'static str, &'static str)>,
     /// Sub-second millisecond remainder (BEP-520) of the block being built, consumed by
     /// [`BscBlockEnv`] and the BEP-706 precompile. The miner and bid simulator fill it
     /// with `block_timestamp_ms % 1000` (the planned millisecond timestamp that is
@@ -143,6 +146,7 @@ impl<H: BlockHeader> BuildPendingEnv<H> for BscNextBlockEnvAttributes {
             trie_handle: None,
             state_root_deadline_ms: None,
             build_control: None,
+            finish_diagnostics: None,
             // RPC pending/simulate blocks have no millisecond source — second precision
             // (`Time*1000`), like go-bsc's zero-MixDigest synthetic headers.
             milli_remainder: 0,
@@ -220,6 +224,9 @@ pub struct BscBlockExecutionCtx<'a> {
     pub state_root_deadline_ms: Option<u64>,
     /// Monotonic local-build budget and cancellation; absent for import and RPC.
     pub build_control: Option<crate::node::miner::build_control::BuildControl>,
+    /// Miner-only bounded (attempt kind, consensus turn) labels for finish-stage diagnostics.
+    /// None for import, RPC and bid simulation; never infer kind from transaction count.
+    pub finish_diagnostics: Option<(&'static str, &'static str)>,
 }
 
 impl<'a> BscBlockExecutionCtx<'a> {
@@ -614,6 +621,7 @@ where
             trie_handle: None,
             state_root_deadline_ms: None,
             build_control: None,
+            finish_diagnostics: None,
         })
     }
 
@@ -649,6 +657,7 @@ where
             trie_handle: attributes.trie_handle,
             state_root_deadline_ms: attributes.state_root_deadline_ms,
             build_control: attributes.build_control,
+            finish_diagnostics: attributes.finish_diagnostics,
         })
     }
 
@@ -721,6 +730,7 @@ where
             trie_handle: None,
             state_root_deadline_ms: None,
             build_control: None,
+            finish_diagnostics: None,
         })
     }
 

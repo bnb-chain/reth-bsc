@@ -642,6 +642,10 @@ where
             trie_handle: Some(trie_handle.clone()),
             state_root_deadline_ms,
             build_control: build_control.clone(),
+            finish_diagnostics: Some((
+                kind.label(),
+                if self.ctx.is_inturn { "inturn" } else { "outofturn" },
+            )),
         };
 
         let mut builder = self
@@ -1274,6 +1278,10 @@ where
                     // it does not inherit that attempt's cancellation or expired root deadline.
                     state_root_deadline_ms: None,
                     build_control: None,
+                    finish_diagnostics: Some((
+                        "empty",
+                        if self.ctx.is_inturn { "inturn" } else { "outofturn" },
+                    )),
                 },
             )
             .map_err(PayloadBuilderError::other)?;

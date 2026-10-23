@@ -20,7 +20,7 @@ pub(crate) enum AttemptKind {
     Empty,
 }
 impl AttemptKind {
-    const fn label(self) -> &'static str {
+    pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Speculative => "speculative",
             Self::Regular => "regular",

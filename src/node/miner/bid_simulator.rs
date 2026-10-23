@@ -687,6 +687,7 @@ where
                     trie_handle: None,
                     state_root_deadline_ms: None,
                     build_control: None,
+                    finish_diagnostics: None,
                 },
             )
             .map_err(PayloadBuilderError::other)

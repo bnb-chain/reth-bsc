@@ -653,6 +653,7 @@ mod parent_block_env {
             trie_handle: None,
             state_root_deadline_ms: None,
             build_control: None,
+            finish_diagnostics: None,
         };
 
         let mut executor = BscBlockExecutor::new(

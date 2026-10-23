@@ -32,6 +32,7 @@ use revm::{
 
 mod assembler;
 mod builder;
+mod finish_metrics;
 pub mod config;
 pub use config::BscEvmConfig;
 mod executor;
