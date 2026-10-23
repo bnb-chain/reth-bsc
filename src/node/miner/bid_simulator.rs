@@ -288,6 +288,7 @@ where
             cached_reads: None,
             block_timestamp_ms: 0,
             end_mining_timestamp_ms: 0,
+            startup_timing: None,
         };
         let attributes = prepare_new_attributes(
             &mut mining_ctx,
@@ -685,6 +686,8 @@ where
                     state_root_precomputed_sink: None,
                     trie_handle: None,
                     state_root_deadline_ms: None,
+                    build_control: None,
+                    finish_diagnostics: None,
                 },
             )
             .map_err(PayloadBuilderError::other)
@@ -1567,6 +1570,7 @@ mod tests {
                 cached_reads: None,
                 block_timestamp_ms: attrs.inner.timestamp * 1000,
                 end_mining_timestamp_ms: 0,
+                startup_timing: None,
             };
             let bid = Bid {
                 builder: other,
