@@ -155,11 +155,14 @@ where
         // chain to a miner-owned overlay cache so proof workers can resolve a
         // not-yet-persisted parent without merging every ancestor on each build.
         if mining_config.use_sparse_trie_state_root {
+            use crate::node::miner::proof_provider::{
+                MinerProofOverlayCache, MinerProofProviderFactory,
+            };
             use alloy_consensus::Header;
             use reth_chain_state::ExecutedBlock;
             use reth_engine_tree::tree::state_root_strategy::spawn_payload_builder_state_root;
             use reth_primitives_traits::SealedHeader;
-            use reth_storage_overlay::{OverlayManager, OverlayStateProviderFactory};
+            use reth_storage_overlay::OverlayManager;
             use reth_tasks::{RayonConfig, RuntimeBuilder, RuntimeConfig, TokioConfig};
 
             let tree_config = Arc::new(ctx.config().engine.tree_config());
@@ -216,6 +219,7 @@ where
             let overlay_cache =
                 parking_lot::Mutex::new(crate::node::miner::overlay::MinerOverlayCache::default());
 
+            let proof_overlay_cache = Arc::new(MinerProofOverlayCache::default());
             let spawn_fn: crate::shared::SparseTrieSpawnFn =
                 std::sync::Arc::new(move |parent: SealedHeader<Header>, kind| {
                     let parent_hash = parent.hash();
@@ -253,8 +257,13 @@ where
                     // in-memory parent trie (mirrors the engine's own payload-builder path in
                     // `payload_state_root_handle_for`).
                     let overlay_builder = overlay_manager.overlay_builder(parent_hash);
-                    let overlay_factory =
-                        OverlayStateProviderFactory::new(provider.clone(), overlay_builder);
+                    let overlay_factory = MinerProofProviderFactory::new(
+                        provider.clone(),
+                        overlay_builder,
+                        parent_hash,
+                        proof_overlay_cache.clone(),
+                        matches!(kind, crate::shared::MinerRootKind::EmptyFallback),
+                    );
 
                     let spawn_start = std::time::Instant::now();
                     let executor = match kind {
@@ -268,7 +277,8 @@ where
                         parent,
                         None, // tx count unknown at spawn time → full proof-worker pool
                         tree_config_for_closure.as_ref(),
-                        None, // sparse-trie reuse is separate from parent-overlay reuse
+                        // Pruning hint; sparse-trie reuse is controlled inside the wrapper.
+                        None,
                     );
                     metrics::histogram!("bsc_miner_sparse_trie_spawn_duration_seconds")
                         .record(spawn_start.elapsed().as_secs_f64());

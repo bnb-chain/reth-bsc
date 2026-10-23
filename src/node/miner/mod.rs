@@ -7,6 +7,7 @@ pub mod bsc_miner;
 pub mod build_control;
 pub mod config;
 pub(crate) mod overlay;
+pub(crate) mod proof_provider;
 pub mod payload;
 pub mod signer;
 pub mod util;
