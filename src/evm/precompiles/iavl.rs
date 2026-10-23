@@ -3,7 +3,10 @@ use parity_bytes::BytesRef;
 use revm::precompile::{
     u64_to_address, PrecompileHalt, PrecompileOutput, PrecompileResult, Precompile, PrecompileId,
 };
-use std::borrow::Cow;
+use std::{
+    borrow::Cow,
+    panic::{self, AssertUnwindSafe},
+};
 use tendermint::lite::iavl_proof;
 
 /// Iavl proof validation precompile for BSC.
@@ -77,7 +80,12 @@ fn iavl_proof_validation_run_inner(
 
     let mut output = [0u8; 32];
     let mut bytes = BytesRef::Fixed(&mut output);
-    let res = iavl_proof::execute(input, &mut bytes, is_moran, is_planck, is_plato);
+    // The IAVL verifier panics on some malformed inputs (unchecked arithmetic and unwraps).
+    // go-bsc recovers such panics into a precompile error, so do the same instead of unwinding.
+    let res = panic::catch_unwind(AssertUnwindSafe(|| {
+        iavl_proof::execute(input, &mut bytes, is_moran, is_planck, is_plato)
+    }))
+    .unwrap_or(Err("internal error"));
     match res {
         Ok(()) => Ok(PrecompileOutput::new(
             IAVL_PROOF_VALIDATION_BASE,
@@ -192,5 +200,72 @@ mod tests {
     fn deprecated_precompile_rejects_all_input() {
         let res = iavl_proof_validation_run_deprecated(b"anything", 3_000, 0).unwrap();
         assert!(res.is_halt());
+    }
+
+    /// Inputs that make the IAVL verifier panic must halt the precompile, as go-bsc's recover()
+    /// does, instead of unwinding through the EVM.
+    #[test]
+    fn malformed_input_halts_instead_of_panicking() {
+        // Store name, then a key length of u64::MAX, then enough bytes to pass the minimum
+        // length check. The key-length arithmetic overflows and the key slice goes out of bounds.
+        let mut payload = vec![0u8; 32 + 24];
+        payload.extend_from_slice(&u64::MAX.to_be_bytes());
+        payload.extend_from_slice(&[0u8; 32 + 32 + 1]);
+        let mut input = vec![0u8; 24];
+        input.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+        input.extend_from_slice(&payload);
+
+        let runs: [(&str, revm::precompile::PrecompileFn); 4] = [
+            ("base", iavl_proof_validation_run),
+            ("moran", iavl_proof_validation_run_moran),
+            ("planck", iavl_proof_validation_run_planck),
+            ("plato", iavl_proof_validation_run_plato),
+        ];
+        for (name, run) in runs {
+            let res = run(&input, 3_000, 0).unwrap();
+            assert_eq!(res.halt_reason(), Some(&PrecompileHalt::other("internal error")), "{name}");
+        }
+    }
+
+    /// A well-formed outer proof whose first `ProofOp.data` is not decodable must halt. The
+    /// `iavl:v` verifier unwraps the inner decode, so the guard turns its panic into an internal
+    /// error; the ICS23 verifier now rejects the malformed operator first (SRC-1713).
+    #[test]
+    fn malformed_inner_proof_op_halts_instead_of_panicking() {
+        // Precompile input with a one-byte key and value and two `ProofOp`s of type `op_type`,
+        // each carrying a truncated varint as data.
+        let input_with_ops = |op_type: &str| {
+            let mut op = vec![0x0a, op_type.len() as u8];
+            op.extend_from_slice(op_type.as_bytes());
+            op.extend_from_slice(&[0x1a, 1, 0xff]);
+            let mut proof = Vec::new();
+            for _ in 0..2 {
+                proof.extend_from_slice(&[0x0a, op.len() as u8]);
+                proof.extend_from_slice(&op);
+            }
+
+            let mut payload = vec![0u8; 32 + 31];
+            payload.extend_from_slice(&[1, 0xaa]);
+            payload.extend_from_slice(&[0u8; 31]);
+            payload.extend_from_slice(&[1, 0xbb]);
+            payload.extend_from_slice(&[0u8; 32]);
+            payload.extend_from_slice(&proof);
+            let mut input = vec![0u8; 24];
+            input.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+            input.extend_from_slice(&payload);
+            input
+        };
+
+        let runs: [(&str, &str, revm::precompile::PrecompileFn, &str); 5] = [
+            ("base", "iavl:v", iavl_proof_validation_run, "internal error"),
+            ("moran", "iavl:v", iavl_proof_validation_run_moran, "internal error"),
+            ("planck", "iavl:v", iavl_proof_validation_run_planck, "internal error"),
+            ("planck", "ics23:iavl", iavl_proof_validation_run_planck, "invalid merkle proof"),
+            ("plato", "ics23:iavl", iavl_proof_validation_run_plato, "invalid merkle proof"),
+        ];
+        for (name, op_type, run, reason) in runs {
+            let res = run(&input_with_ops(op_type), 3_000, 0).unwrap();
+            assert_eq!(res.halt_reason(), Some(&PrecompileHalt::other(reason)), "{name} {op_type}");
+        }
     }
 }

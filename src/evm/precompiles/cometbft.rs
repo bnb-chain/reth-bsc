@@ -178,6 +178,30 @@ fn go_zero_timestamp() -> Timestamp {
     Timestamp { seconds: -62_135_596_800, nanos: 0 }
 }
 
+/// In Go's protobuf model an omitted empty PartSetHeader decodes to its zero value.
+fn normalize_missing_part_set_header(block_id: &mut Option<RawBlockId>) {
+    if let Some(block_id) = block_id {
+        block_id.part_set_header.get_or_insert_with(Default::default);
+    }
+}
+
+/// Match gogoproto's non-nullable `stdtime` decoding for signed commit slots.
+/// Prost keeps an omitted Commit/Nil signature timestamp as `None`, while Go decodes it to
+/// `time.Time{}`. Absent signature slots do not carry a vote timestamp and remain untouched.
+fn normalize_go_zero_commit_timestamps(
+    signed_header: &mut cometbft_proto::types::v1::SignedHeader,
+) {
+    let Some(commit) = signed_header.commit.as_mut() else { return };
+
+    for signature in &mut commit.signatures {
+        let is_signed_slot = signature.block_id_flag == BlockIdFlag::Commit as i32 ||
+            signature.block_id_flag == BlockIdFlag::Nil as i32;
+        if is_signed_slot && signature.timestamp.is_none() {
+            signature.timestamp = Some(go_zero_timestamp());
+        }
+    }
+}
+
 type ConvertLightBlockResult = Result<(LightBlock, Vec<Validator>), PrecompileHalt>;
 fn convert_light_block_from_proto(light_block_proto: &TmLightBlock) -> ConvertLightBlockResult {
     // Both fields are optional in the protobuf definition, so any caller can omit them by
@@ -206,21 +230,58 @@ fn convert_light_block_from_proto(light_block_proto: &TmLightBlock) -> ConvertLi
     // the gogoproto non-nullable semantics by normalising an absent timestamp to the Go/protobuf
     // zero time before domain conversion.
     let mut signed_header_proto = signed_header_proto.clone();
+    let mut first_height_last_block_id = None;
     if let Some(header) = signed_header_proto.header.as_mut() {
         header.time.get_or_insert_with(go_zero_timestamp);
-    }
+        normalize_missing_part_set_header(&mut header.last_block_id);
 
-    let signed_header = match SignedHeader::try_from(signed_header_proto) {
+        // Go permits a structurally valid LastBlockID at height 1. The pinned Rust conversion
+        // rejects that shape, so preserve the domain ID and omit it only during that conversion.
+        if header.height == 1 {
+            let non_default_id = header
+                .last_block_id
+                .as_ref()
+                .and_then(|raw_id| block::Id::try_from(raw_id.clone()).ok())
+                .filter(|id| id != &block::Id::default());
+            if let Some(id) = non_default_id {
+                first_height_last_block_id = Some(id);
+                header.last_block_id = None;
+            }
+        }
+    }
+    if let Some(commit) = signed_header_proto.commit.as_mut() {
+        normalize_missing_part_set_header(&mut commit.block_id);
+    }
+    normalize_go_zero_commit_timestamps(&mut signed_header_proto);
+
+    let mut signed_header = match SignedHeader::try_from(signed_header_proto) {
         Ok(sh) => sh.clone(),
         Err(_) => return Err(BscPrecompileError::InvalidInput.into()),
     };
+    if let Some(last_block_id) = first_height_last_block_id {
+        signed_header.header.last_block_id = Some(last_block_id);
+    }
     // Go runs `Header.ValidateBasic` while converting the proto header, for every 0x67 variant.
     if signed_header.header().version.block != COMETBFT_BLOCK_PROTOCOL {
         return Err(BscPrecompileError::InvalidInput.into());
     }
 
-    let mut validator_set_proto =
-        light_block_proto.validator_set.clone().ok_or(BscPrecompileError::InvalidInput)?;
+    let validator_set_proto =
+        light_block_proto.validator_set.as_ref().ok_or(BscPrecompileError::InvalidInput)?;
+    // Validate the proposer like Go's ValidatorFromProto + Validator.ValidateBasic, including
+    // secp256k1 keys that the Rust validator conversion does not support.
+    validate_proto_proposer(
+        validator_set_proto.proposer.as_ref().ok_or(BscPrecompileError::InvalidInput)?,
+    )?;
+
+    let mut validator_set_proto = validator_set_proto.clone();
+    // Only the validators participate in hashing, quorum verification and consensus-state
+    // encoding below. Do not convert the already validated, unused proposer to Rust's stricter
+    // key/address types. This does not remove the signed header's proposer address.
+    validator_set_proto.proposer = None;
+    // Go ignores the untrusted cache and recomputes the total from the validators. Set::try_from
+    // already computes and bounds that sum; zero disables only its cache-equality check.
+    validator_set_proto.total_voting_power = 0;
     fill_unset_bridge_fields(&mut validator_set_proto);
     let validator_set = match Set::try_from(validator_set_proto.clone()) {
         Ok(vs) => vs.clone(),
@@ -237,6 +298,27 @@ fn convert_light_block_from_proto(light_block_proto: &TmLightBlock) -> ConvertLi
     let next_validator_set = validator_set.clone();
     let peer_id = cometbft::node::Id::new([0u8; 20]);
     Ok((LightBlock::new(signed_header, validator_set, next_validator_set, peer_id), validators))
+}
+
+/// Match Go's structural checks for the separate validator-set proposer. In particular,
+/// PubKeyFromProto checks key type/length, not curve-point validity or address/key equality.
+fn validate_proto_proposer(
+    proposer: &cometbft_proto::types::v1::Validator,
+) -> Result<(), PrecompileHalt> {
+    use cometbft_proto::crypto::v1::public_key::Sum;
+
+    let valid_key = match proposer.pub_key.as_ref().and_then(|key| key.sum.as_ref()) {
+        Some(Sum::Ed25519(key)) => key.len() == 32,
+        Some(Sum::Secp256k1(key)) => key.len() == 33,
+        None => false,
+    };
+    if !valid_key || proposer.address.len() != 20 || proposer.voting_power < 0 ||
+        !matches!(proposer.bls_key.len(), 0 | 48) ||
+        !matches!(proposer.relayer_address.len(), 0 | 20)
+    {
+        return Err(BscPrecompileError::InvalidInput.into());
+    }
+    Ok(())
 }
 
 /// go-bsc's `Validator.ValidateBasic` accepts an empty relayer BLS key or relayer address as
@@ -258,8 +340,7 @@ fn fill_unset_bridge_fields(validator_set: &mut TmValidatorSet) {
         }
     };
     validator_set.validators.iter_mut().for_each(fill);
-    // The proposer is converted separately and must stay equal to its entry in the set.
-    validator_set.proposer.iter_mut().for_each(fill);
+    // The proposer has already been validated separately and removed before conversion.
 }
 
 /// Go BSC's `ValidatorSet.Hash`: a merkle root over each validator's `SimpleValidator`
@@ -507,8 +588,14 @@ impl ConsensusState {
         output[pos..pos + HEIGHT_LENGTH as usize].copy_from_slice(&self.height.to_be_bytes());
         pos += HEIGHT_LENGTH as usize;
 
-        output[pos..pos + VALIDATOR_SET_HASH_LENGTH as usize]
-            .copy_from_slice(self.next_validator_set_hash.as_ref());
+        // Go leaves an omitted next-validator hash zero-filled in this fixed-width field.
+        if !self.next_validator_set_hash.is_empty() {
+            if self.next_validator_set_hash.len() != VALIDATOR_SET_HASH_LENGTH as usize {
+                return Err(BscPrecompileError::CometBftEncodeConsensusStateFailed.into());
+            }
+            output[pos..pos + VALIDATOR_SET_HASH_LENGTH as usize]
+                .copy_from_slice(self.next_validator_set_hash.as_ref());
+        }
         pos += VALIDATOR_SET_HASH_LENGTH as usize;
 
         for i in 0..validator_set_length {
@@ -868,6 +955,8 @@ mod tests {
 
     use super::*;
 
+    type NamedCometBftRun = (&'static str, fn(&[u8], u64, u64) -> PrecompileResult);
+
     /// The first valid `cometbft_light_block_validation` fixture, kept as a string so tests
     /// can rebuild an input around a modified light block.
     const VALID_LIGHT_BLOCK_INPUT: &str = "000000000000000000000000000000000000000000000000000000000000018c677265656e6669656c645f393030302d3132310000000000000000000000000000000000000000013c350cd55b99dc6c2b7da9bef5410fbfb869fede858e7b95bf7ca294e228bb40e33f6e876d63791ebd05ff617a1b4f4ad1aa2ce65e3c3a9cdfb33e0ffa7e8423000000000098968015154514f68ce65a0d9eecc578c0ab12da0a2a28a0805521b5b7ae56eb3fb24555efbfe59e1622bfe9f7be8c9022e9b3f2442739c1ce870b9adee169afe60f674edd7c86451c5363d89052fde8351895eeea166ce5373c36e31b518ed191d0c599aa0f5b0000000000989680432f6c4908a9aa5f3444421f466b11645235c99b831b2a2de9e504d7ea299e52a202ce529808618eb3bfc0addf13d8c5f2df821d81e18f9bc61583510b322d067d46323b0a572635c06a049c0a2a929e3c8184a50cf6a8b95708c25834ade456f399015a0000000000989680864cb9828254d712f8e59b164fc6a9402dc4e6c59065e38cff24f5323c8c5da888a0f97e5ee4ba1e11b0674b0a0d06204c1dfa247c370cd4be3e799fc4f6f48d977ac7ca0aeb060adb030a02080b1213677265656e6669656c645f393030302d3132311802220c08b2d7f3a10610e8d2adb3032a480a20ec6ecb5db4ffb17fabe40c60ca7b8441e9c5d77585d0831186f3c37aa16e9c15122408011220a2ab9e1eb9ea52812f413526e424b326aff2f258a56e00d690db9f805b60fe7e32200f40aeff672e8309b7b0aefbb9a1ae3d4299b5c445b7d54e8ff398488467f0053a20e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85542203c350cd55b99dc6c2b7da9bef5410fbfb869fede858e7b95bf7ca294e228bb404a203c350cd55b99dc6c2b7da9bef5410fbfb869fede858e7b95bf7ca294e228bb405220294d8fbd0b94b767a7eba9840f299a3586da7fe6b5dead3b7eecba193c400f935a20bc50557c12d7392b0d07d75df0b61232d48f86a74fdea6d1485d9be6317d268c6220e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b8556a20e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85572146699336aa109d1beab3946198c8e59f3b2cbd92f7a4065e3cd89e315ca39d87dee92835b98f8b8ec0861d6d9bb2c60156df5d375b3ceb1fbe71af6a244907d62548a694165caa660fec7a9b4e7b9198191361c71be0b128a0308021a480a20726abd0fdbfb6f779b0483e6e4b4b6f12241f6ea2bf374233ab1a316692b6415122408011220159f10ff15a8b58fc67a92ffd7f33c8cd407d4ce81b04ca79177dfd00ca19a67226808021214050cff76cc632760ba9db796c046004c900967361a0c08b3d7f3a10610808cadba03224080713027ffb776a702d78fd0406205c629ba473e1f8d6af646190f6eb9262cd67d69be90d10e597b91e06d7298eb6fa4b8f1eb7752ebf352a1f51560294548042268080212146699336aa109d1beab3946198c8e59f3b2cbd92f1a0c08b3d7f3a10610b087c1c00322405e2ddb70acfe4904438be3d9f4206c0ace905ac4fc306a42cfc9e86268950a0fbfd6ec5f526d3e41a3ef52bf9f9f358e3cb4c3feac76c762fa3651c1244fe004226808021214c55765fd2d0570e869f6ac22e7f2916a35ea300d1a0c08b3d7f3a10610f0b3d492032240ca17898bd22232fc9374e1188636ee321a396444a5b1a79f7628e4a11f265734b2ab50caf21e8092c55d701248e82b2f011426cb35ba22043b497a6b4661930612a0050aa8010a14050cff76cc632760ba9db796c046004c9009673612220a20e33f6e876d63791ebd05ff617a1b4f4ad1aa2ce65e3c3a9cdfb33e0ffa7e84231880ade2042080a6bbf6ffffffffff012a30a0805521b5b7ae56eb3fb24555efbfe59e1622bfe9f7be8c9022e9b3f2442739c1ce870b9adee169afe60f674edd7c86321415154514f68ce65a0d9eecc578c0ab12da0a2a283a14ee7a2a6a44d427f6949eeb8f12ea9fbb2501da880aa2010a146699336aa109d1beab3946198c8e59f3b2cbd92f12220a20451c5363d89052fde8351895eeea166ce5373c36e31b518ed191d0c599aa0f5b1880ade2042080ade2042a30831b2a2de9e504d7ea299e52a202ce529808618eb3bfc0addf13d8c5f2df821d81e18f9bc61583510b322d067d46323b3214432f6c4908a9aa5f3444421f466b11645235c99b3a14a0a7769429468054e19059af4867da0a495567e50aa2010a14c55765fd2d0570e869f6ac22e7f2916a35ea300d12220a200a572635c06a049c0a2a929e3c8184a50cf6a8b95708c25834ade456f399015a1880ade2042080ade2042a309065e38cff24f5323c8c5da888a0f97e5ee4ba1e11b0674b0a0d06204c1dfa247c370cd4be3e799fc4f6f48d977ac7ca3214864cb9828254d712f8e59b164fc6a9402dc4e6c53a143139916d97df0c589312b89950b6ab9795f34d1a12a8010a14050cff76cc632760ba9db796c046004c9009673612220a20e33f6e876d63791ebd05ff617a1b4f4ad1aa2ce65e3c3a9cdfb33e0ffa7e84231880ade2042080a6bbf6ffffffffff012a30a0805521b5b7ae56eb3fb24555efbfe59e1622bfe9f7be8c9022e9b3f2442739c1ce870b9adee169afe60f674edd7c86321415154514f68ce65a0d9eecc578c0ab12da0a2a283a14ee7a2a6a44d427f6949eeb8f12ea9fbb2501da88";
@@ -914,7 +1003,9 @@ mod tests {
         let mut cs = vec![0u8; CHAIN_ID_LENGTH as usize];
         cs[..chain_id.len()].copy_from_slice(chain_id.as_bytes());
         cs.extend_from_slice(&height.to_be_bytes());
-        cs.extend_from_slice(next_validators_hash);
+        let mut next_hash = [0u8; VALIDATOR_SET_HASH_LENGTH as usize];
+        next_hash[..next_validators_hash.len()].copy_from_slice(next_validators_hash);
+        cs.extend_from_slice(&next_hash);
         for validator in validators {
             let Some(Sum::Ed25519(pubkey)) = validator.pub_key.clone().and_then(|key| key.sum)
             else {
@@ -969,6 +1060,15 @@ mod tests {
         order: impl FnOnce(&mut Vec<(Scalar, TmValidator)>),
         edit_sigs: impl FnOnce(&mut Vec<cometbft_proto::types::v1::CommitSig>),
     ) -> (Vec<u8>, Vec<u8>) {
+        runtime_signed_light_block_with_header(order, |_| {}, edit_sigs)
+    }
+
+    /// Applies header edits before hashing and signing, preserving valid header/commit binding.
+    fn runtime_signed_light_block_with_header(
+        order: impl FnOnce(&mut Vec<(Scalar, TmValidator)>),
+        edit_header: impl FnOnce(&mut cometbft_proto::types::v1::Header),
+        edit_sigs: impl FnOnce(&mut Vec<cometbft_proto::types::v1::CommitSig>),
+    ) -> (Vec<u8>, Vec<u8>) {
         use cometbft_proto::{
             crypto::v1::{public_key::Sum, PublicKey as RawPublicKey},
             types::v1::BlockIdFlag,
@@ -1007,6 +1107,7 @@ mod tests {
         let mut header = signed_header.header.take().unwrap();
         header.validators_hash = validators_hash.clone();
         header.next_validators_hash = validators_hash.clone();
+        edit_header(&mut header);
         // The prost re-encode below drops RandaoMix (field 15), so hash with an empty one.
         let header_hash = header_hash_with_randao_mix(
             &cometbft::block::Header::try_from(header.clone()).expect("header"),
@@ -1077,6 +1178,64 @@ mod tests {
         (crafted, expected)
     }
 
+    fn assert_empty_next_validators_hash_output(run: fn(&[u8], u64, u64) -> PrecompileResult) {
+        let (input, expected) = runtime_signed_light_block_with_header(
+            |_| {},
+            |header| header.next_validators_hash.clear(),
+            |_| {},
+        );
+        let hash_start =
+            (CONSENSUS_STATE_LENGTH_BYTES_LENGTH + CHAIN_ID_LENGTH + HEIGHT_LENGTH) as usize;
+        assert_eq!(&expected[hash_start..hash_start + 32], &[0u8; 32]);
+        let output = run(&input, 10_000_000, 0).unwrap();
+        assert!(output.is_success(), "halted: {:?}", output.halt_reason());
+        assert_eq!(output.bytes.as_ref(), expected.as_slice());
+    }
+
+    #[test]
+    fn empty_next_validators_hash_before_hertz_matches_go() {
+        assert_empty_next_validators_hash_output(cometbft_light_block_validation_run_before_hertz);
+    }
+
+    #[test]
+    fn empty_next_validators_hash_hertz_matches_go() {
+        assert_empty_next_validators_hash_output(cometbft_light_block_validation_run);
+    }
+
+    #[test]
+    fn empty_next_validators_hash_pasteur_matches_go() {
+        assert_empty_next_validators_hash_output(cometbft_light_block_validation_run_pasteur);
+    }
+
+    #[test]
+    fn consensus_state_next_hash_encoding_boundaries() {
+        for hash in [Bytes::new(), Bytes::from(vec![0xab; 32])] {
+            let cs = ConsensusState::new("chain".to_string(), 1, hash.clone(), vec![]);
+            let encoded = cs.encode().unwrap();
+            let hash_start = (CHAIN_ID_LENGTH + HEIGHT_LENGTH) as usize;
+            assert_eq!(encoded.len(), hash_start + VALIDATOR_SET_HASH_LENGTH as usize);
+            let expected_hash = if hash.is_empty() { vec![0; 32] } else { hash.to_vec() };
+            assert_eq!(&encoded[hash_start..], expected_hash.as_slice());
+        }
+    }
+
+    #[test]
+    fn consensus_state_next_hash_encoding_rejects_malformed_widths() {
+        for len in [1, 31, 33, 64] {
+            let cs = ConsensusState::new(
+                "chain".to_string(),
+                1,
+                Bytes::from(vec![0xab; len]),
+                vec![],
+            );
+            assert_eq!(
+                cs.encode().unwrap_err(),
+                BscPrecompileError::CometBftEncodeConsensusStateFailed.into(),
+                "hash length {len}",
+            );
+        }
+    }
+
     /// An adjacent light block signed by runtime-generated validators listed in descending
     /// address order, the reverse of cometbft-rs's order for equal powers.
     fn runtime_signed_wire_order_light_block_input() -> Vec<u8> {
@@ -1086,10 +1245,10 @@ mod tests {
     /// go-bsc accepts a validator whose relayer BLS key or relayer address is empty and stores
     /// it zero-filled. Each header commits to go-bsc's validator-set hash, which omits the empty
     /// field, so a fix that hashed the zero-filled fields would not match.
-    #[test]
-    fn light_block_empty_bridge_fields_match_go_bsc() {
-        type Edit = fn(&mut Vec<(Scalar, TmValidator)>);
-        let cases: [(&str, Edit, bool); 5] = [
+    type BridgeFieldEdit = fn(&mut Vec<(Scalar, TmValidator)>);
+
+    fn bridge_field_cases() -> [(&'static str, BridgeFieldEdit, bool); 5] {
+        [
             ("control", |_| {}, false),
             ("zero BLS key", |signers| signers[0].1.bls_key = vec![0; 48], false),
             ("empty BLS key", |signers| signers[0].1.bls_key.clear(), true),
@@ -1104,8 +1263,12 @@ mod tests {
                 },
                 true,
             ),
-        ];
-        for (name, edit, validator_set_changed) in cases {
+        ]
+    }
+
+    #[test]
+    fn light_block_empty_bridge_fields_match_go_bsc() {
+        for (name, edit, validator_set_changed) in bridge_field_cases() {
             let (input, expected) = runtime_signed_light_block(edit, |_| {});
             assert_eq!(expected[0], validator_set_changed as u8, "{name}");
             for (fork, run) in [
@@ -1211,29 +1374,53 @@ mod tests {
 
     #[test]
     fn rejects_validator_set_unbound_from_header() {
-        let input = modify_fixture_light_block(|proto| {
-            let validators = proto.validator_set.as_mut().unwrap();
-            validators.validators[0].voting_power += 1;
-        });
-        let (_, proto, randao_mix) = decode_light_block_validation_input(&input, false).unwrap();
-        let (block, validators) = convert_light_block_from_proto(&proto).unwrap();
-        let validators_hash = validator_set_hash(proto.validator_set.as_ref().unwrap());
-        assert_ne!(validators_hash, block.signed_header.header().validators_hash);
-        assert_eq!(
-            header_hash_with_randao_mix(block.signed_header.header(), &randao_mix),
-            block.signed_header.commit.block_id.hash,
-        );
-        // Signature verification alone accepts this unchanged, valid signature.
-        assert!(verify_commit_light(&block.signed_header, &validators).is_ok());
-        assert_precompile_rejects(&input);
+        let (_, original, _) =
+            decode_light_block_validation_input(&valid_light_block_input(), false).unwrap();
+        let original_power = original.validator_set.as_ref().unwrap().validators[0].voting_power;
 
-        // The same binding is required on the non-adjacent trusting path.
-        let (mut trusted, _, _) = decode_light_block_validation_input(&input, false).unwrap();
-        trusted.height = 0;
-        trusted.validators = validators.clone();
-        assert!(trusted
-            .apply_light_block(&block, &randao_mix, validators_hash, validators)
-            .is_err());
+        // Keep the existing +1 case and the report's reduction to voting power 1.
+        for voting_power in [original_power + 1, 1] {
+            let input = modify_fixture_light_block(|proto| {
+                proto.validator_set.as_mut().unwrap().validators[0].voting_power = voting_power;
+            });
+            let (_, proto, randao_mix) =
+                decode_light_block_validation_input(&input, false).unwrap();
+            assert_eq!(proto.signed_header, original.signed_header);
+            let (block, validators) = convert_light_block_from_proto(&proto).unwrap();
+            let validators_hash = validator_set_hash(proto.validator_set.as_ref().unwrap());
+            assert_ne!(validators_hash, block.signed_header.header().validators_hash);
+            assert_eq!(
+                header_hash_with_randao_mix(block.signed_header.header(), &randao_mix),
+                block.signed_header.commit.block_id.hash,
+            );
+            // Signature verification alone still accepts the unchanged commit signatures.
+            assert!(verify_commit_light(&block.signed_header, &validators).is_ok());
+            assert_precompile_rejects(&input);
+
+            // Reject both adjacent and skipping updates before changing any trusted field.
+            let height = block.height().value();
+            for trusted_height in [height - 1, height - 2] {
+                let (mut trusted, _, _) =
+                    decode_light_block_validation_input(&input, false).unwrap();
+                trusted.height = trusted_height;
+                let before = trusted.encode().unwrap();
+                assert_eq!(
+                    trusted.apply_light_block(
+                        &block,
+                        &randao_mix,
+                        validators_hash,
+                        validators.clone(),
+                    ),
+                    Err(BscPrecompileError::CometBftApplyBlockFailed.into()),
+                    "voting_power={voting_power}, trusted_height={trusted_height}",
+                );
+                assert_eq!(
+                    trusted.encode().unwrap(),
+                    before,
+                    "voting_power={voting_power}, trusted_height={trusted_height}",
+                );
+            }
+        }
     }
 
     #[test]
@@ -1475,12 +1662,16 @@ mod tests {
     #[test]
     fn greenfield_header_extension_preserves_protobuf_merge_semantics() {
         let (block, original_randao) = unsigned_light_block();
+        let fixture = valid_light_block_input();
+        let (_, original_proto, _) =
+            decode_light_block_validation_input(&fixture, true).unwrap();
         let proto = TmLightBlock {
             signed_header: Some(block.signed_header.clone().into()),
-            validator_set: Some(block.validators.clone().into()),
+            // The converted set omits the separately validated proposer. Keep the original
+            // protobuf set so this test still provides a structurally valid proposer.
+            validator_set: original_proto.validator_set,
         };
         let standard_fields = proto.encode_to_vec();
-        let fixture = valid_light_block_input();
         let trusted_state_prefix = &fixture[..fixture_split(&fixture)];
         for length in [0, 1, 32, 63, 64, 65] {
             let randao_mix = if length == 64 { original_randao.clone() } else { vec![0; length] };
@@ -1577,6 +1768,463 @@ mod tests {
             let output = cometbft_light_block_validation_run_pasteur(&crafted, 10_000_000, 0)
                 .expect("a missing proto field must not be a fatal error");
             assert!(output.is_halt(), "expected an InvalidInput halt");
+        }
+    }
+
+    fn input_with_validator_set(
+        mutate: impl FnOnce(&mut cometbft_proto::types::v1::ValidatorSet),
+    ) -> Vec<u8> {
+        let input = valid_light_block_input();
+        let split = 32 + u64::from_be_bytes(input[24..32].try_into().unwrap()) as usize;
+        // Preserve the signed header's Go-only fields (including RandaoMix), which are
+        // covered by the commit's header hash. Only re-encode the validator set.
+        let light_block = map_proto_message(&input[split..], 2, |set| {
+            let mut set = TmValidatorSet::decode(set).unwrap();
+            mutate(&mut set);
+            set.encode_to_vec()
+        });
+        let mut crafted = input[..split].to_vec();
+        crafted.extend_from_slice(&light_block);
+        crafted
+    }
+
+    type CometbftRunner = fn(&[u8], u64, u64) -> PrecompileResult;
+
+    fn cometbft_forks() -> [(CometbftRunner, u64); 3] {
+        [
+            (cometbft_light_block_validation_run_before_hertz, 0),
+            (cometbft_light_block_validation_run, 0),
+            (
+                cometbft_light_block_validation_run_pasteur,
+                COMETBFT_LIGHT_BLOCK_VALIDATE_PER_BYTE_GAS,
+            ),
+        ]
+    }
+
+    // Rewrite one length-delimited field while preserving all other protobuf bytes.
+    fn map_proto_message(input: &[u8], field: u32, map: impl FnOnce(&[u8]) -> Vec<u8>) -> Vec<u8> {
+        use prost12::encoding::{
+            decode_key, decode_varint, encode_key, encode_varint, skip_field, DecodeContext,
+            WireType,
+        };
+
+        let mut remaining = input;
+        while !remaining.is_empty() {
+            let offset = input.len() - remaining.len();
+            let (tag, wire_type) = decode_key(&mut remaining).unwrap();
+            if tag == field {
+                assert_eq!(wire_type, WireType::LengthDelimited);
+                let len = decode_varint(&mut remaining).unwrap() as usize;
+                let replacement = map(&remaining[..len]);
+                let mut output = input[..offset].to_vec();
+                encode_key(tag, wire_type, &mut output);
+                encode_varint(replacement.len() as u64, &mut output);
+                output.extend_from_slice(&replacement);
+                output.extend_from_slice(&remaining[len..]);
+                return output;
+            }
+            skip_field(wire_type, tag, &mut remaining, DecodeContext::default()).unwrap();
+        }
+        panic!("fixture is missing protobuf field {field}");
+    }
+
+    fn input_with_proposer(
+        mutate: impl FnOnce(&mut cometbft_proto::types::v1::Validator),
+    ) -> Vec<u8> {
+        input_with_proposer_from(&valid_light_block_input(), mutate)
+    }
+
+    fn input_with_proposer_from(
+        input: &[u8],
+        mutate: impl FnOnce(&mut cometbft_proto::types::v1::Validator),
+    ) -> Vec<u8> {
+        // Go's schema has additional fields. Preserve the signed header and voting validators
+        // verbatim, so changing only the separate proposer does not invalidate the fixture.
+        let split = 32 + u64::from_be_bytes(input[24..32].try_into().unwrap()) as usize;
+        let light_block = map_proto_message(&input[split..], 2, |set| {
+            map_proto_message(set, 2, |proposer| {
+                let mut proposer = cometbft_proto::types::v1::Validator::decode(proposer).unwrap();
+                mutate(&mut proposer);
+                proposer.encode_to_vec()
+            })
+        });
+        let mut crafted = input[..split].to_vec();
+        crafted.extend_from_slice(&light_block);
+        crafted
+    }
+
+    #[test]
+    fn light_block_bridge_fields_proposer_and_power_cache_compose() {
+        use cometbft_proto::crypto::v1::public_key::Sum;
+        use prost12::encoding::{encode_key, encode_varint, WireType};
+
+        let secp_key =
+            hex::decode("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+                .unwrap();
+        for (name, edit, _) in bridge_field_cases() {
+            let (original, expected) = runtime_signed_light_block(edit, |_| {});
+            let split = 32 + u64::from_be_bytes(original[24..32].try_into().unwrap()) as usize;
+            for cache in [0, 1, 40, -1, i64::MIN, i64::MAX] {
+                let mut input = original[..split].to_vec();
+                input.extend(map_proto_message(&original[split..], 2, |set| {
+                    // Last scalar value wins in protobuf. Preserve all other fields verbatim.
+                    let mut set = set.to_vec();
+                    encode_key(3, WireType::Varint, &mut set);
+                    encode_varint(cache as u64, &mut set);
+                    set
+                }));
+                for valid_proposer in [true, false] {
+                    let input = input_with_proposer_from(&input, |proposer| {
+                        if valid_proposer {
+                            proposer.pub_key.as_mut().unwrap().sum =
+                                Some(Sum::Secp256k1(secp_key.clone()));
+                        } else {
+                            proposer.pub_key = None;
+                        }
+                    });
+                    for (fork, (run, per_byte_gas)) in cometbft_forks().into_iter().enumerate() {
+                        let gas = COMETBFT_LIGHT_BLOCK_VALIDATION_BASE
+                            + input.len() as u64 * per_byte_gas;
+                        let output = run(&input, gas, 17).unwrap();
+                        assert_eq!(
+                            output.is_success(),
+                            valid_proposer,
+                            "{name} cache={cache} fork={fork}"
+                        );
+                        if valid_proposer {
+                            let mut expected = expected.clone();
+                            if fork == 0 {
+                                expected[0] = 0; // Pre-Hertz always reports an unchanged set.
+                            }
+                            assert_eq!(output.bytes.as_ref(), expected);
+                            assert_eq!(output.gas_used, gas);
+                        } else {
+                            assert_eq!(
+                                output.status,
+                                revm::precompile::PrecompileStatus::Halt(
+                                    BscPrecompileError::InvalidInput.into()
+                                )
+                            );
+                            assert!(output.bytes.is_empty());
+                        }
+                        assert_eq!(
+                            run(&input, gas - 1, 17).unwrap().status,
+                            revm::precompile::PrecompileStatus::Halt(PrecompileHalt::OutOfGas)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Proposer/cache normalization must preserve the wire order used by indexed verification,
+    /// including when bridge fields are unset. It must not make swapped signatures valid.
+    #[test]
+    fn light_block_validator_decoding_preserves_indexed_verification() {
+        use cometbft_proto::crypto::v1::public_key::Sum;
+
+        for (name, edit, _) in bridge_field_cases() {
+            for cache in [-1, i64::MAX] {
+                for swapped in [false, true] {
+                    let (original, expected) = runtime_signed_light_block(
+                        |signers| {
+                            signers.reverse();
+                            edit(signers);
+                        },
+                        |sigs| {
+                            if swapped {
+                                sigs.swap(0, 1);
+                            }
+                        },
+                    );
+                    let split = fixture_split(&original);
+                    let mut input = original[..split].to_vec();
+                    input.extend(map_proto_message(&original[split..], 2, |set| {
+                        let mut set = TmValidatorSet::decode(set).unwrap();
+                        set.total_voting_power = cache;
+                        set.proposer.as_mut().unwrap().pub_key.as_mut().unwrap().sum =
+                            Some(Sum::Secp256k1(vec![0; 33]));
+                        set.encode_to_vec()
+                    }));
+                    for (fork, (run, per_byte_gas)) in cometbft_forks().into_iter().enumerate() {
+                        let gas = COMETBFT_LIGHT_BLOCK_VALIDATION_BASE
+                            + input.len() as u64 * per_byte_gas;
+                        let output = run(&input, gas, 17).unwrap();
+                        assert_eq!(
+                            output.is_success(),
+                            !swapped,
+                            "{name} cache={cache} swapped={swapped} fork={fork}"
+                        );
+                        if swapped {
+                            assert_eq!(
+                                output.status,
+                                revm::precompile::PrecompileStatus::Halt(
+                                    BscPrecompileError::CometBftApplyBlockFailed.into()
+                                )
+                            );
+                            assert!(output.bytes.is_empty());
+                        } else {
+                            let mut expected = expected.clone();
+                            if fork == 0 {
+                                expected[0] = 0;
+                            }
+                            assert_eq!(output.bytes.as_ref(), expected);
+                            assert_eq!(output.gas_used, gas);
+                        }
+                        assert_eq!(output.reservoir, 17);
+                        assert_eq!(
+                            run(&input, gas - 1, 17).unwrap().status,
+                            revm::precompile::PrecompileStatus::Halt(PrecompileHalt::OutOfGas)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn proposer_test_cases() -> Vec<(&'static str, Vec<u8>, bool)> {
+        use cometbft_proto::{crypto::v1::public_key::Sum, types::v1::Validator};
+
+        let mut cases = vec![("control", valid_light_block_input(), true)];
+        // The secp256k1 generator is a valid compressed public key. Go also accepts any
+        // 33-byte encoding here: the proposer is structurally checked, never used to verify.
+        for (label, key) in [
+            ("ed25519", Sum::Ed25519(vec![0; 32])),
+            (
+                "secp256k1",
+                Sum::Secp256k1(
+                    hex::decode(
+                        "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+                    )
+                    .unwrap(),
+                ),
+            ),
+            ("secp256k1_non_point", Sum::Secp256k1(vec![0; 33])),
+        ] {
+            cases.push((
+                label,
+                input_with_proposer(|proposer| {
+                    proposer.pub_key.as_mut().unwrap().sum = Some(key);
+                }),
+                true,
+            ));
+        }
+
+        type Mutation = fn(&mut Validator);
+        for (label, mutate, accepted) in [
+            ("missing_key", (|p| p.pub_key = None) as Mutation, false),
+            (
+                "missing_key_type",
+                |p| p.pub_key.as_mut().unwrap().sum = None,
+                false,
+            ),
+            (
+                "ed25519_empty",
+                |p| p.pub_key.as_mut().unwrap().sum = Some(Sum::Ed25519(vec![])),
+                false,
+            ),
+            (
+                "ed25519_short",
+                |p| p.pub_key.as_mut().unwrap().sum = Some(Sum::Ed25519(vec![0; 31])),
+                false,
+            ),
+            (
+                "ed25519_long",
+                |p| p.pub_key.as_mut().unwrap().sum = Some(Sum::Ed25519(vec![0; 33])),
+                false,
+            ),
+            (
+                "secp256k1_empty",
+                |p| p.pub_key.as_mut().unwrap().sum = Some(Sum::Secp256k1(vec![])),
+                false,
+            ),
+            (
+                "secp256k1_short",
+                |p| p.pub_key.as_mut().unwrap().sum = Some(Sum::Secp256k1(vec![0; 32])),
+                false,
+            ),
+            (
+                "secp256k1_long",
+                |p| p.pub_key.as_mut().unwrap().sum = Some(Sum::Secp256k1(vec![0; 34])),
+                false,
+            ),
+            ("address_empty", |p| p.address.clear(), false),
+            ("address_short", |p| p.address = vec![0; 19], false),
+            ("address_long", |p| p.address = vec![0; 21], false),
+            ("address_unrelated", |p| p.address = vec![0; 20], true),
+            ("power_negative", |p| p.voting_power = -1, false),
+            ("power_zero", |p| p.voting_power = 0, true),
+            ("power_max", |p| p.voting_power = i64::MAX, true),
+            ("priority_min", |p| p.proposer_priority = i64::MIN, true),
+            ("priority_max", |p| p.proposer_priority = i64::MAX, true),
+            ("bls_empty", |p| p.bls_key.clear(), true),
+            ("bls_short", |p| p.bls_key = vec![0; 47], false),
+            ("bls_long", |p| p.bls_key = vec![0; 49], false),
+            ("relayer_empty", |p| p.relayer_address.clear(), true),
+            ("relayer_short", |p| p.relayer_address = vec![0; 19], false),
+            ("relayer_long", |p| p.relayer_address = vec![0; 21], false),
+        ] {
+            cases.push((label, input_with_proposer(mutate), accepted));
+        }
+        cases
+    }
+
+    #[test]
+    fn light_block_proposer_matches_go_validation() {
+        for (label, input, accepted) in proposer_test_cases() {
+            for (run, per_byte_gas) in cometbft_forks() {
+                let gas = COMETBFT_LIGHT_BLOCK_VALIDATION_BASE + input.len() as u64 * per_byte_gas;
+                let output = run(&input, gas, 17).unwrap();
+                assert_eq!(
+                    output.is_success(),
+                    accepted,
+                    "{label}, per_byte_gas={per_byte_gas}"
+                );
+                assert_eq!(output.reservoir, 17);
+                if accepted {
+                    let control = run(&valid_light_block_input(), 1_000_000, 17).unwrap();
+                    assert_eq!(output.bytes, control.bytes, "{label}");
+                    assert_eq!(output.gas_used, gas, "{label}");
+                } else {
+                    assert_eq!(
+                        output.status,
+                        revm::precompile::PrecompileStatus::Halt(
+                            BscPrecompileError::InvalidInput.into()
+                        ),
+                        "{label}",
+                    );
+                    assert!(output.bytes.is_empty(), "{label}");
+                }
+                assert_eq!(
+                    run(&input, gas - 1, 17).unwrap().status,
+                    revm::precompile::PrecompileStatus::Halt(PrecompileHalt::OutOfGas),
+                    "{label}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn light_block_ignores_cached_total_voting_power() {
+        for (run, per_byte_gas) in cometbft_forks() {
+            let control = run(&valid_light_block_input(), 1_000_000, 17).unwrap();
+            assert!(control.is_success());
+            // The fixture's three validators each have power 10_000_000.
+            for cache in [0, 1, 30_000_000, -1, i64::MIN, i64::MAX] {
+                let input = input_with_validator_set(|set| set.total_voting_power = cache);
+                let gas = COMETBFT_LIGHT_BLOCK_VALIDATION_BASE + input.len() as u64 * per_byte_gas;
+                let output = run(&input, gas, 17).unwrap();
+                assert!(output.is_success(), "cache={cache}");
+                assert_eq!(output.bytes, control.bytes);
+                assert_eq!(output.gas_used, gas);
+                let out_of_gas = run(&input, gas - 1, 17).unwrap();
+                assert_eq!(
+                    out_of_gas.status,
+                    revm::precompile::PrecompileStatus::Halt(PrecompileHalt::OutOfGas)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn light_block_requires_valid_proposer_regardless_of_cached_power() {
+        for cache in [0, 1, -1, i64::MAX] {
+            for empty in [false, true] {
+                let input = input_with_validator_set(|set| {
+                    set.total_voting_power = cache;
+                    set.proposer = if empty {
+                        Some(Default::default())
+                    } else {
+                        None
+                    };
+                });
+                for (run, per_byte_gas) in cometbft_forks() {
+                    let gas =
+                        COMETBFT_LIGHT_BLOCK_VALIDATION_BASE + input.len() as u64 * per_byte_gas;
+                    let output = run(&input, gas, 17).unwrap();
+                    assert_eq!(
+                        output.status,
+                        revm::precompile::PrecompileStatus::Halt(
+                            BscPrecompileError::InvalidInput.into()
+                        )
+                    );
+                    assert!(output.bytes.is_empty());
+                    let out_of_gas = run(&input, gas - 1, 17).unwrap();
+                    assert_eq!(
+                        out_of_gas.status,
+                        revm::precompile::PrecompileStatus::Halt(PrecompileHalt::OutOfGas)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn light_block_cache_normalization_preserves_power_validation() {
+        for cache in [0, 1, -1, i64::MAX] {
+            for power in [-1, Set::MAX_TOTAL_VOTING_POWER as i64 + 1] {
+                let input = input_with_validator_set(|set| {
+                    set.total_voting_power = cache;
+                    set.validators[0].voting_power = power;
+                });
+                for (run, _) in cometbft_forks() {
+                    let output = run(&input, 1_000_000, 0).unwrap();
+                    assert_eq!(
+                        output.status,
+                        revm::precompile::PrecompileStatus::Halt(
+                            BscPrecompileError::InvalidInput.into()
+                        )
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn omitted_signed_commit_timestamp_matches_explicit_go_zero_time() {
+        let omitted = hex::decode(include_str!("testdata/1690-omitted-timestamp.hex").trim())
+            .expect("1690 fixture is valid hex");
+        let cs_length = u64::from_be_bytes(
+            omitted[(CONSENSUS_STATE_LENGTH_BYTES_LENGTH - UINT64_TYPE_LENGTH) as usize..
+                CONSENSUS_STATE_LENGTH_BYTES_LENGTH as usize]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let split = CONSENSUS_STATE_LENGTH_BYTES_LENGTH as usize + cs_length;
+        let light_block =
+            TmLightBlock::decode(&omitted[split..]).expect("1690 light block decodes");
+        let signatures = &light_block
+            .signed_header
+            .as_ref()
+            .expect("signed header is present")
+            .commit
+            .as_ref()
+            .expect("commit is present")
+            .signatures;
+        let mut present_zero = light_block.clone();
+        let mut filled_indices = Vec::new();
+        for (index, signature) in signatures.iter().enumerate() {
+            if (signature.block_id_flag == cometbft_proto::types::v1::BlockIdFlag::Commit as i32 ||
+                signature.block_id_flag == cometbft_proto::types::v1::BlockIdFlag::Nil as i32) &&
+                signature.timestamp.is_none()
+            {
+                let commit = present_zero.signed_header.as_mut().unwrap().commit.as_mut().unwrap();
+                commit.signatures[index].timestamp = Some(go_zero_timestamp());
+                filled_indices.push(index);
+            }
+        }
+        assert!(!filled_indices.is_empty(), "fixture has omitted signed-slot timestamps");
+
+        let (present_zero, _) = convert_light_block_from_proto(&present_zero)
+            .expect("explicit Go zero-time control converts");
+        let (omitted, _) = convert_light_block_from_proto(&light_block)
+            .expect("omitted timestamps convert as Go zero time");
+        for index in filled_indices {
+            assert_eq!(
+                omitted.signed_header.commit.signatures[index],
+                present_zero.signed_header.commit.signatures[index],
+                "signed slot {index} has the same Go zero time after conversion"
+            );
         }
     }
 
@@ -2416,6 +3064,82 @@ mod tests {
         assert!(!go(&pubkey, &sig));
     }
 
+    #[test]
+    fn report_1691_missing_part_set_header_matches_go() {
+        let control = hex::decode(
+            include_str!("testdata/cometbft-missing-part-set-header-control.hex").trim(),
+        )
+        .unwrap();
+        let candidate = hex::decode(
+            include_str!("testdata/cometbft-missing-part-set-header-candidate.hex").trim(),
+        )
+        .unwrap();
+        let runs: [NamedCometBftRun; 3] = [
+            ("pre-Hertz", cometbft_light_block_validation_run_before_hertz),
+            ("Hertz", cometbft_light_block_validation_run),
+            ("Pasteur", cometbft_light_block_validation_run_pasteur),
+        ];
+
+        for (fork, run) in runs {
+            let control_output = run(&control, 10_000_000, 0).unwrap();
+            let candidate_output = run(&candidate, 10_000_000, 0).unwrap();
+            assert!(
+                control_output.is_success(),
+                "control ({fork}) halted: {:?}",
+                control_output.halt_reason()
+            );
+            assert!(
+                candidate_output.is_success(),
+                "candidate ({fork}) halted: {:?}",
+                candidate_output.halt_reason()
+            );
+            assert_eq!(
+                candidate_output.bytes.as_ref(),
+                control_output.bytes.as_ref(),
+                "output differs ({fork})"
+            );
+        }
+    }
+
+    #[test]
+    fn report_1694_height_one_last_block_id_matches_go() {
+        let inputs = [
+            (
+                "control",
+                hex::decode(
+                    include_str!("testdata/cometbft-height-one-last-block-id-control.hex").trim(),
+                )
+                .unwrap(),
+            ),
+            (
+                "candidate",
+                hex::decode(
+                    include_str!("testdata/cometbft-height-one-last-block-id-candidate.hex").trim(),
+                )
+                .unwrap(),
+            ),
+        ];
+        let runs: [NamedCometBftRun; 3] = [
+            ("pre-Hertz", cometbft_light_block_validation_run_before_hertz),
+            ("Hertz", cometbft_light_block_validation_run),
+            ("Pasteur", cometbft_light_block_validation_run_pasteur),
+        ];
+
+        for (fork, run) in runs {
+            for (case, input) in &inputs {
+                let (_, proto, _) = decode_light_block_validation_input(input, false).unwrap();
+                let expected = go_light_block_output(&proto);
+                let output = run(input, 10_000_000, 0).unwrap();
+                assert!(output.is_success(), "{case} ({fork}) halted: {:?}", output.halt_reason());
+                assert_eq!(
+                    output.bytes.as_ref(),
+                    expected.as_slice(),
+                    "Go output differs for {case} ({fork})"
+                );
+            }
+        }
+    }
+
     /// Rebuild the valid fixture with its commit signatures changed by `f`.
     fn with_commit_sigs(
         mut f: impl FnMut(&mut Vec<cometbft_proto::types::v1::CommitSig>),
@@ -2428,15 +3152,21 @@ mod tests {
     /// SRC-1850: go-bsc verifies signature `i` under validator `i`. Swapping two complete
     /// `CommitSig`s keeps every signature valid for its embedded address, but go-bsc rejects it.
     #[test]
-    fn pasteur_rejects_reordered_commit_sigs() {
+    fn reordered_commit_sigs_are_rejected_by_all_wrappers() {
         let unchanged = with_commit_sigs(|_| {});
-        let output =
-            cometbft_light_block_validation_run_pasteur(&unchanged, 10_000_000, 0).unwrap();
-        assert!(output.is_success());
-
         let swapped = with_commit_sigs(|sigs| sigs.swap(0, 1));
-        let output = cometbft_light_block_validation_run_pasteur(&swapped, 10_000_000, 0).unwrap();
-        assert!(output.is_halt(), "reordered commit signatures must be rejected");
+        let runs: [NamedCometBftRun; 3] = [
+            ("pre-Hertz", cometbft_light_block_validation_run_before_hertz),
+            ("Hertz", cometbft_light_block_validation_run),
+            ("Pasteur", cometbft_light_block_validation_run_pasteur),
+        ];
+
+        for (fork, run) in runs {
+            let control = run(&unchanged, 10_000_000, 0).unwrap();
+            assert!(control.is_success(), "control ({fork}) halted: {:?}", control.halt_reason());
+            let candidate = run(&swapped, 10_000_000, 0).unwrap();
+            assert!(candidate.is_halt(), "reordered signatures accepted ({fork})");
+        }
     }
 
     /// go-bsc never reads the `CommitSig` address when counting the new validator set, so a
@@ -2462,7 +3192,7 @@ mod tests {
     /// go-bsc skips nil votes without verifying them, so a nil vote with a junk signature is
     /// ignored and the other three validators are still a quorum.
     #[test]
-    fn pasteur_skips_nil_vote_with_junk_signature_like_go() {
+    fn nil_vote_with_junk_signature_is_skipped_by_all_wrappers() {
         use cometbft_proto::types::v1::BlockIdFlag;
 
         let (input, expected) = runtime_signed_light_block(
@@ -2472,9 +3202,16 @@ mod tests {
                 sigs[0].signature = vec![0xab; 64];
             },
         );
-        let output = cometbft_light_block_validation_run_pasteur(&input, 10_000_000, 0).unwrap();
-        assert!(output.is_success(), "halted with {:?}", output.halt_reason());
-        assert_eq!(output.bytes.as_ref(), expected.as_slice());
+        let runs: [NamedCometBftRun; 3] = [
+            ("pre-Hertz", cometbft_light_block_validation_run_before_hertz),
+            ("Hertz", cometbft_light_block_validation_run),
+            ("Pasteur", cometbft_light_block_validation_run_pasteur),
+        ];
+        for (fork, run) in runs {
+            let output = run(&input, 10_000_000, 0).unwrap();
+            assert!(output.is_success(), "({fork}) halted: {:?}", output.halt_reason());
+            assert_eq!(output.bytes.as_ref(), expected.as_slice(), "output differs ({fork})");
+        }
     }
 
     /// A validator set that is not in cometbft-rs sort order: signatures bind to validators by

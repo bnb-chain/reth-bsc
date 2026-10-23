@@ -288,6 +288,23 @@ pub struct BscBlock {
     pub body: BscBlockBody,
 }
 
+impl BscBlock {
+    /// Canonical block RLP size, matching go-bsc's `Block.Size()`.
+    ///
+    /// Blob sidecars are part of BSC's network encoding, but are excluded from the
+    /// Osaka block-size limit. Preserve the body's optional withdrawals exactly.
+    pub(crate) fn canonical_rlp_length(header: &Header, body: &BscBlockBody) -> usize {
+        rlp::BlockHelper {
+            header: Cow::Borrowed(header),
+            transactions: Cow::Borrowed(&body.inner.transactions),
+            ommers: Cow::Borrowed(&body.inner.ommers),
+            withdrawals: body.inner.withdrawals.as_ref().map(Cow::Borrowed),
+            sidecars: None,
+        }
+        .length()
+    }
+}
+
 impl InMemorySize for BscBlock {
     fn size(&self) -> usize {
         self.header.size() + self.body.size()
@@ -501,6 +518,80 @@ mod tests {
             },
             sidecars: None,
         }
+    }
+
+    // Serialization-only fixture: blob proof validity is not relevant to RLP sizing.
+    fn size_test_sidecar() -> BscBlobTransactionSidecar {
+        BscBlobTransactionSidecar {
+            inner: BlobTransactionSidecar {
+                blobs: vec![alloy_eips::eip4844::Blob::default()],
+                commitments: vec![alloy_eips::eip4844::Bytes48::default()],
+                proofs: vec![alloy_eips::eip4844::Bytes48::default()],
+            },
+            block_number: 1,
+            block_hash: B256::ZERO,
+            tx_index: 0,
+            tx_hash: B256::ZERO,
+            version: 0,
+        }
+    }
+
+    #[test]
+    fn canonical_rlp_length_matches_go_bsc_with_or_without_sidecars() {
+        #[derive(serde::Deserialize)]
+        struct Fixture {
+            name: String,
+            size: usize,
+            rlp: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct Fixtures {
+            cases: Vec<Fixture>,
+        }
+
+        // Generated with go-bsc Block.Size() and EncodeToBytes(Block). Covers legacy
+        // and typed transactions plus absent, empty, and non-empty withdrawals.
+        let fixtures: Fixtures =
+            serde_json::from_str(include_str!("testdata/canonical_block_sizes.json")).unwrap();
+        for fixture in fixtures.cases {
+            let encoded = alloy_primitives::hex::decode(&fixture.rlp).unwrap();
+            let mut remaining = encoded.as_slice();
+            let mut block = BscBlock::decode(&mut remaining).unwrap();
+            assert!(remaining.is_empty());
+            assert_eq!(encoded.len(), fixture.size, "{}", fixture.name);
+
+            for sidecars in [None, Some(Vec::new()), Some(vec![size_test_sidecar()])] {
+                block.body.sidecars = sidecars;
+                assert_eq!(
+                    BscBlock::canonical_rlp_length(&block.header, &block.body),
+                    fixture.size,
+                    "canonical size must match go-bsc regardless of sidecars: {}",
+                    fixture.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_rlp_length_preserves_network_sidecars() {
+        let block = BscBlock {
+            header: create_test_header(),
+            body: BscBlockBody {
+                sidecars: Some(vec![size_test_sidecar()]),
+                ..create_test_body_empty_withdrawals()
+            },
+        };
+        let canonical_size = BscBlock::canonical_rlp_length(&block.header, &block.body);
+        let mut encoded = Vec::new();
+        block.encode(&mut encoded);
+
+        assert!(encoded.len() > canonical_size);
+        assert_eq!(encoded.len(), BscBlock::rlp_length(&block.header, &block.body));
+        let mut remaining = encoded.as_slice();
+        let decoded = BscBlock::decode(&mut remaining).unwrap();
+        assert!(remaining.is_empty());
+        assert_eq!(decoded, block, "network encoding must retain the complete sidecar");
+        assert_eq!(BscBlock::canonical_rlp_length(&decoded.header, &decoded.body), canonical_size);
     }
 
     #[test]

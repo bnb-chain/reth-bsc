@@ -21,42 +21,22 @@ pub(super) enum RelayValidation {
     Deferred,
 }
 
-/// Why a peer's block was refused before relay.
-#[derive(Debug)]
-pub(super) enum RelayRejection {
-    /// The header itself failed validation, so every block with this hash is invalid.
-    Header(BlockImportError),
-    /// The header is valid but this body does not match it. Another peer may still deliver
-    /// the correct body for the same hash.
-    Body(BlockImportError),
-}
-
-impl RelayRejection {
-    pub(super) fn into_error(self) -> BlockImportError {
-        match self {
-            Self::Header(error) | Self::Body(error) => error,
-        }
-    }
-}
-
 /// Runs on the blocking pool because snapshot reconstruction may access the database.
 pub(super) fn validate_for_relay<P: HeaderProvider<Header = Header>>(
     block: &SealedBlock<BscBlock>,
     provider: &P,
     chain_spec: Arc<BscChainSpec>,
     snapshots: Option<&(dyn SnapshotProvider + Send + Sync)>,
-) -> Result<RelayValidation, RelayRejection> {
+) -> Result<RelayValidation, BlockImportError> {
     let consensus = BscConsensus::new(chain_spec.clone());
     match consensus.validate_header(block.sealed_header()) {
         // A clock difference is not proof of a bad peer. Leave handling to import,
         // without authorizing early relay.
         Err(ConsensusError::TimestampIsInFuture { .. }) => return Ok(RelayValidation::Deferred),
-        result => result.map_err(|error| RelayRejection::Header(error.into()))?,
+        result => result?,
     }
     // A signed header alone must not authorize forwarding an unrelated body.
-    consensus
-        .validate_block_pre_execution(block)
-        .map_err(|error| RelayRejection::Body(error.into()))?;
+    consensus.validate_block_pre_execution(block)?;
 
     let parent = match provider.header(block.parent_hash()) {
         Ok(Some(parent)) => parent,
@@ -70,9 +50,7 @@ pub(super) fn validate_for_relay<P: HeaderProvider<Header = Header>>(
         }
     };
     let parent = SealedHeader::seal_slow(parent);
-    consensus
-        .validate_header_against_parent(block.sealed_header(), &parent)
-        .map_err(|error| RelayRejection::Header(error.into()))?;
+    consensus.validate_header_against_parent(block.sealed_header(), &parent)?;
 
     let Some(snapshots) = snapshots else {
         return Ok(RelayValidation::Deferred);
@@ -94,7 +72,7 @@ pub(super) fn validate_for_relay<P: HeaderProvider<Header = Header>>(
     ) {
         Ok(()) => Ok(RelayValidation::Valid),
         Err(error) if error.as_validation().is_some() => {
-            Err(RelayRejection::Header(BlockImportError::Other(Box::new(error))))
+            Err(BlockImportError::Other(Box::new(error)))
         }
         Err(error) => {
             // Missing attestation ancestors/snapshots are local availability failures,
