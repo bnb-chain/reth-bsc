@@ -10641,6 +10641,7 @@ dependencies = [
  "prost 0.14.4",
  "protoc-bin-vendored",
  "rand 0.9.5",
+ "rayon",
  "reth",
  "reth-basic-payload-builder",
  "reth-chain-state",
