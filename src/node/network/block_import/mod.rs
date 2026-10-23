@@ -23,6 +23,7 @@ pub mod config;
 pub(crate) mod fork_recover;
 pub mod handle;
 pub(crate) mod head_fetch;
+mod header_validation;
 pub mod service;
 
 const MAX_NEW_BLOCK_HASHES: usize = 1024;
