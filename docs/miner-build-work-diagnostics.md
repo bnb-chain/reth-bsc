@@ -29,6 +29,8 @@ INFO 日志 `Sampled mining build budget breakdown`：许可等待或准备 ≥2
 
 `reth_bsc_miner_empty_fallback_wait_skipped_total{turn="inturn/outofturn"}`：已有正常候选，且通过任务 ID 确认唯一尚未收集结果的任务为空块兜底时，每个 job 加一。此时请求中止该空块任务并结束候选等待，随后仍遵守原提交时间。不是上链空块率，也不表示后台同步状态根计算已经停止；已运行的同步计算可能到返回/让出执行权后才响应中止。其他正常构建仍在时继续按原规则收集。
 
+空块兜底启用 sparse-trie 时复用矿工的父状态 overlay 缓存，使用独立的 `miner-empty` root/hash/proof 工作通道，避免等待正常构建的流式任务；每次仍有独立的任务、系统交易更新流和状态根结果槽，不读取正常候选的状态根。`reth_bsc_miner_empty_root_builds_total{path="sparse/sync"}` 在空块构建选择路径时加一：sparse 表示成功创建独立任务，sync 表示未启用或未注册 spawner；不保证 sparse 最终成功，任务失败仍保留同步回退。用已有 `build_diagnostics_root_seconds{kind="empty"}` 的 sum/count 比较完成的空候选收尾均值；中止且未完成的任务不在该分母内。空块不继承正常候选已过期的预算，继续保留兜底能力。
+
 排查顺序：任务窗口小→看父块/任务到达；attempt 窗口正常但 execution 窗口小→看 permit_wait/prepare；窗口正常且到期停止→看 skipped 时间占比和线程 CPU。指标只能定位耗时分布，锁/IO/单核瓶颈仍需线程采样。
 
 ## 父块到矿工启动的时间账

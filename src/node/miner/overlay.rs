@@ -159,6 +159,190 @@ mod tests {
         MinerOverlayCache::default().for_parent(blocks, OverlayManager::default).0
     }
 
+    /// An empty candidate's system writes and a normal candidate's user writes share
+    /// parent overlays, but must produce independent roots even when running together.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn empty_and_normal_root_tasks_share_only_parent_overlay() {
+        use alloy_primitives::{keccak256, Address, U256};
+        use reth_engine_tree::tree::{
+            state_root_strategy::spawn_payload_builder_state_root, TreeConfig,
+        };
+        use reth_evm::OnStateHook;
+        use reth_storage_overlay::OverlayStateProviderFactory;
+        use reth_tasks::{RayonConfig, RuntimeBuilder, RuntimeConfig, TokioConfig};
+        use revm::state::{AccountInfo, AccountStatus, EvmState, EvmStorageSlot, TransactionId};
+
+        let factory = reth_provider::test_utils::create_test_provider_factory_with_chain_spec(
+            Arc::new(reth_chainspec::ChainSpec::default()),
+        );
+        let genesis_hash = reth_db_common::init::init_genesis(&factory).unwrap();
+        let anchor = BlockNumHash::new(0, genesis_hash);
+        let address = Address::with_last_byte(7);
+        let key = keccak256(address);
+        let initial = HashedPostState::default()
+            .with_accounts([(key, Some(Account { nonce: 1, ..Default::default() }))])
+            .with_storages([(
+                key,
+                HashedStorage::from_iter([(keccak256(B256::ZERO), U256::from(1))]),
+            )]);
+        let serial_root = |state| {
+            LatestStateProvider::new(factory.provider().unwrap()).state_root(state).unwrap()
+        };
+        let parent_root = serial_root(initial.clone());
+        let parent = ExecutedBlock::new(
+            Arc::new(RecoveredBlock::new_unhashed(
+                BscBlock {
+                    header: Header {
+                        number: 1,
+                        parent_hash: genesis_hash,
+                        state_root: parent_root,
+                        ..Default::default()
+                    },
+                    body: Default::default(),
+                },
+                Vec::new(),
+            )),
+            Default::default(),
+            ComputedTrieData::new(Arc::new(initial.clone().into_sorted()), Default::default()),
+        );
+        let runtime = RuntimeBuilder::new(
+            RuntimeConfig::default()
+                .with_tokio(TokioConfig::existing_handle(tokio::runtime::Handle::current()))
+                .with_rayon(RayonConfig {
+                    cpu_threads: Some(2),
+                    proof_storage_worker_threads: Some(2),
+                    proof_account_worker_threads: Some(2),
+                    state_trie_overlay_worker_threads: Some(2),
+                    ..Default::default()
+                }),
+        )
+        .with_worker_namespace("empty-root-test")
+        .build()
+        .unwrap();
+        let empty_runtime = RuntimeBuilder::new(
+            RuntimeConfig::default()
+                .with_tokio(TokioConfig::existing_handle(tokio::runtime::Handle::current()))
+                .with_rayon(RayonConfig {
+                    cpu_threads: Some(1),
+                    proof_storage_worker_threads: Some(1),
+                    proof_account_worker_threads: Some(1),
+                    ..Default::default()
+                }),
+        )
+        .with_worker_namespace("empty-fallback-test")
+        .build()
+        .unwrap();
+        let mut cache = MinerOverlayCache::default();
+        let (normal_manager, _) = cache.for_parent(std::slice::from_ref(&parent), || {
+            OverlayManager::new(runtime.state_trie_overlay_worker_pool())
+        });
+        let parent_hash = parent.recovered_block().hash();
+        let first = normal_manager
+            .overlay_builder(parent_hash)
+            .build_overlay_at_frontiers(&factory.provider().unwrap(), anchor, anchor)
+            .unwrap();
+        let (empty_manager, _) = cache.for_parent(std::slice::from_ref(&parent), || {
+            panic!("empty fallback must reuse the parent's manager")
+        });
+        let second = empty_manager
+            .overlay_builder(parent_hash)
+            .build_overlay_at_frontiers(&factory.provider().unwrap(), anchor, anchor)
+            .unwrap();
+        assert!(Arc::ptr_eq(&first.hashed_post_state, &second.hashed_post_state));
+        let spawn = |manager: &OverlayManager<BscPrimitives>, executor| {
+            spawn_payload_builder_state_root(
+                executor,
+                manager,
+                OverlayStateProviderFactory::new(
+                    factory.clone(),
+                    manager.overlay_builder(parent_hash),
+                ),
+                parent.recovered_block().sealed_header().clone(),
+                None,
+                &TreeConfig::default(),
+                None,
+            )
+        };
+        let mut normal = spawn(&normal_manager, &runtime);
+        let mut empty = spawn(&empty_manager, &empty_runtime);
+        let update = |nonce: u64| {
+            let mut account = revm::state::Account::default();
+            account.info = AccountInfo { nonce, ..Default::default() };
+            account.status = AccountStatus::Touched;
+            account.storage.insert(
+                U256::ZERO,
+                EvmStorageSlot::new_changed(U256::from(1), U256::from(nonce), TransactionId::ZERO),
+            );
+            EvmState::from_iter([(address, account)])
+        };
+        let mut normal_hook = normal.take_execution_hook();
+        let mut empty_hook = empty.take_execution_hook();
+        normal_hook.on_state(update(3));
+        empty_hook.on_state(update(2));
+        drop(empty_hook);
+        let expected = |nonce| {
+            serial_root(
+                initial
+                    .clone()
+                    .with_accounts([(key, Some(Account { nonce, ..Default::default() }))])
+                    .with_storages([(
+                        key,
+                        HashedStorage::from_iter([(keccak256(B256::ZERO), U256::from(nonce))]),
+                    )]),
+            )
+        };
+        // The normal stream remains open while the fallback completes: sharing its
+        // named root/hash/proof workers would deadlock this bounded receive.
+        let empty_root = empty
+            .take_state_root_rx()
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap()
+            .state_root;
+        drop(empty);
+        drop(normal_hook);
+        let normal_root = normal
+            .take_state_root_rx()
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap()
+            .state_root;
+        drop(normal);
+        assert_eq!(normal_root, expected(3));
+        assert_eq!(empty_root, expected(2));
+        assert_ne!(normal_root, empty_root);
+        // Neither candidate may poison the reusable parent overlay.
+        let after = empty_manager
+            .overlay_builder(parent_hash)
+            .build_overlay_at_frontiers(&factory.provider().unwrap(), anchor, anchor)
+            .unwrap();
+        assert_eq!(after.hashed_post_state, first.hashed_post_state);
+
+        // A cancelled normal producer must release its sessions so the fallback can finish.
+        let mut cancelled = spawn(&normal_manager, &runtime);
+        let cancelled_hook = cancelled.take_execution_hook();
+        let mut fallback = spawn(&empty_manager, &empty_runtime);
+        let mut hook = fallback.take_execution_hook();
+        hook.on_state(update(2));
+        drop(hook);
+        drop(cancelled_hook);
+        drop(cancelled);
+        let outcome = fallback
+            .take_state_root_rx()
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        drop(fallback);
+        tokio::task::block_in_place(|| {
+            for executor in [&runtime, &empty_runtime] {
+                for name in ["sparse-trie", "trie-hashing", "account-workers", "storage-workers"] {
+                    executor.spawn_blocking_named(name, || {}).get();
+                }
+            }
+        });
+        assert_eq!(outcome.state_root, expected(2));
+    }
+
     #[test]
     fn retries_share_computed_overlay_and_extension_matches_fresh_root() {
         let anchor = BlockNumHash::new(0, B256::ZERO);

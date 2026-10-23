@@ -191,13 +191,33 @@ where
             )
             .with_worker_namespace("miner")
             .build()?;
+            // An empty fallback must not queue behind a normal candidate that still owns
+            // a streaming root/hash/proof session. These small, persistent pools share only
+            // the parent overlay cache below; they are also independent of import workers.
+            let empty_runtime = RuntimeBuilder::new(
+                RuntimeConfig::default()
+                    .with_tokio(TokioConfig::existing_handle(ctx.task_executor().handle().clone()))
+                    .with_rayon(RayonConfig {
+                        cpu_threads: Some(1),
+                        rpc_threads: Some(1),
+                        storage_threads: Some(1),
+                        proof_storage_worker_threads: Some(1),
+                        proof_account_worker_threads: Some(1),
+                        prewarming_threads: Some(1),
+                        bal_streaming_threads: Some(1),
+                        state_trie_overlay_worker_threads: Some(1),
+                        ..Default::default()
+                    }),
+            )
+            .with_worker_namespace("miner-empty")
+            .build()?;
             let worker_pool = runtime.state_trie_overlay_worker_pool();
             let tree_config_for_closure = tree_config.clone();
             let overlay_cache =
                 parking_lot::Mutex::new(crate::node::miner::overlay::MinerOverlayCache::default());
 
             let spawn_fn: crate::shared::SparseTrieSpawnFn =
-                std::sync::Arc::new(move |parent: SealedHeader<Header>| {
+                std::sync::Arc::new(move |parent: SealedHeader<Header>, kind| {
                     let parent_hash = parent.hash();
                     let mut blocks = Vec::<ExecutedBlock<crate::BscPrimitives>>::new();
                     if let Some(cim) = crate::shared::get_canonical_in_memory_state() {
@@ -237,8 +257,12 @@ where
                         OverlayStateProviderFactory::new(provider.clone(), overlay_builder);
 
                     let spawn_start = std::time::Instant::now();
+                    let executor = match kind {
+                        crate::shared::MinerRootKind::Normal => &runtime,
+                        crate::shared::MinerRootKind::EmptyFallback => &empty_runtime,
+                    };
                     let handle = spawn_payload_builder_state_root(
-                        &runtime,
+                        executor,
                         &overlay_manager,
                         overlay_factory,
                         parent,

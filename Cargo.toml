@@ -259,6 +259,7 @@ debug = "line-tables-only"
 strip = false
 
 [dev-dependencies]
+reth-db-common = { git = "https://github.com/bnb-chain/reth.git", rev = "05120465b201a0f524143053ca5dbb1f14c2f941" }
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 reth-rpc = { git = "https://github.com/bnb-chain/reth.git", rev = "05120465b201a0f524143053ca5dbb1f14c2f941" }
 criterion = "0.5"

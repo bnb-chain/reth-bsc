@@ -1209,8 +1209,8 @@ where
             cancel: _,
             trace_id,
             min_gas_tip: _,
-            state_root_precomputed,
-            trie_handle,
+            state_root_precomputed: _,
+            trie_handle: _,
             state_root_deadline_ms: _,
             build_control: _,
             milli_remainder,
@@ -1218,8 +1218,19 @@ where
         let PayloadConfig { parent_header, attributes, payload_id: _, parent_block_info: _ } =
             config;
 
-        let parent_hash = parent_header.hash_slow();
-        let _ = parent_hash;
+        // Reuse the miner's parent-overlay cache, but never a normal candidate's update
+        // stream or root sink: system transactions give this empty candidate its own state.
+        let use_sparse_trie = crate::node::miner::config::get_global_mining_config()
+            .is_some_and(|c| c.use_sparse_trie_state_root);
+        let trie_handle = Arc::new(Mutex::new(if use_sparse_trie {
+            crate::shared::spawn_empty_sparse_trie_state_root(parent_header.as_ref().clone())
+        } else {
+            None
+        }));
+        let state_root_precomputed_sink = Arc::new(Mutex::new(None));
+        metrics::counter!("bsc_miner_empty_root_builds_total",
+            "path" => if trie_handle.lock().unwrap().is_some() { "sparse" } else { "sync" })
+            .increment(1);
 
         let state_provider = self.client.state_by_block_hash(parent_header.hash_slow())?;
         let state = StateProviderDatabase::new(&state_provider);
@@ -1257,21 +1268,21 @@ where
                     milli_remainder,
                     validator_cache_sink: Some(validator_cache_sink.clone()),
                     turn_length_sink: Some(turn_length_sink.clone()),
-                    // Empty-fallback build never installs a sparse-trie hook (trie_handle: None
-                    // below), so it must NOT read from any sparse-trie sink. Passing None makes the
-                    // builder compute this empty block's own (cheap) state root via
-                    // `state_root_with_updates` instead of stealing a full build's precomputed root
-                    // out of a shared sink (which both starved the full build and risked sealing a
-                    // foreign root onto the empty block).
-                    state_root_precomputed_sink: None,
-                    // Empty-payload path: don't engage sparse-trie (would still be
-                    // correct but the setup overhead isn't worth it for ~0-tx blocks).
-                    trie_handle: None,
+                    state_root_precomputed_sink: Some(state_root_precomputed_sink),
+                    trie_handle: Some(trie_handle.clone()),
+                    // The fallback must remain available after the normal attempt expires;
+                    // it does not inherit that attempt's cancellation or expired root deadline.
                     state_root_deadline_ms: None,
                     build_control: None,
                 },
             )
             .map_err(PayloadBuilderError::other)?;
+
+        // Install before pre-execution; finish() also streams all system transactions,
+        // closes this candidate's hook, and consumes only its own root result.
+        if let Some(handle) = trie_handle.lock().unwrap().as_mut() {
+            builder.evm_mut().db_mut().set_state_hook(Some(Box::new(handle.take_execution_hook())));
+        }
 
         // Total time spent executing pre-execution changes (no user txs for empty payloads).
         let exec_start = std::time::Instant::now();
@@ -1295,13 +1306,7 @@ where
 
         // Add system txs to payload and finalize.
         let finalize_start = std::time::Instant::now();
-        //
-        // Empty-payload path: we skip the sparse-trie state-root machinery here. The
-        // empty path is the "give up and seal whatever we have" branch and only runs
-        // BSC system txs (slash / fee distribution) — state delta is minimal so the
-        // legacy `state_root_with_updates` cost is acceptable. The handle (if any)
-        // stays in `trie_handle` and is dropped when the spawned task ends.
-        let _ = (&state_root_precomputed, &trie_handle);
+        // Without the sparse-trie flag/spawner, finish keeps the legacy synchronous path.
         let BlockBuilderOutcome {
             execution_result,
             hashed_state,
