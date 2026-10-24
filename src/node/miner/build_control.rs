@@ -12,6 +12,7 @@ pub struct BuildControl {
     pub(crate) transactions_until: Instant,
     pub(crate) finish_until: Instant,
     cancel: ManualCancel,
+    allow_late_finish: bool,
 }
 
 impl BuildControl {
@@ -29,7 +30,19 @@ impl BuildControl {
             transactions_until: started + budget.saturating_sub(reserve),
             finish_until: started + budget,
             cancel,
+            allow_late_finish: false,
         }
+    }
+
+    /// QA experiment: soften only the completion deadline; transaction selection and
+    /// cancellation keep their original limits. Callers enable this only for in-turn jobs.
+    pub(crate) fn with_late_finish(mut self, enabled: bool) -> Self {
+        self.allow_late_finish = enabled;
+        self
+    }
+
+    pub(crate) fn allows_late_finish(&self) -> bool {
+        self.allow_late_finish
     }
 
     pub(crate) fn stop_transactions(&self, now: Instant) -> bool {
@@ -39,7 +52,7 @@ impl BuildControl {
     pub(crate) fn check_active(&self, now: Instant) -> Result<(), &'static str> {
         if self.cancel.is_cancelled() {
             Err("payload build canceled")
-        } else if now >= self.finish_until {
+        } else if !self.allow_late_finish && now >= self.finish_until {
             Err("payload build completion deadline exceeded")
         } else {
             Ok(())
@@ -49,7 +62,12 @@ impl BuildControl {
     pub(crate) fn root_wait(&self, now: Instant) -> Result<Duration, &'static str> {
         self.check_active(now)?;
         // Poll cancellation while waiting on the synchronous root-result channel.
-        Ok(self.finish_until.saturating_duration_since(now).min(Duration::from_millis(10)))
+        let poll = Duration::from_millis(10);
+        Ok(if self.allow_late_finish {
+            poll
+        } else {
+            self.finish_until.saturating_duration_since(now).min(poll)
+        })
     }
 }
 
@@ -105,6 +123,32 @@ mod tests {
         assert!(control.check_active(start + Duration::from_millis(451)).is_err());
         cancel.cancel();
         assert!(control.stop_transactions(start));
+        assert!(control.root_wait(start).is_err());
+    }
+
+    #[test]
+    fn late_finish_keeps_transaction_deadline_and_cancellation() {
+        let start = Instant::now();
+        let cancel = ManualCancel::default();
+        let control = BuildControl::new(
+            start,
+            Duration::from_millis(270),
+            Duration::from_millis(120),
+            Duration::from_millis(420),
+            cancel.clone(),
+        )
+        .with_late_finish(true);
+        assert!(!control.stop_transactions(start + Duration::from_millis(149)));
+        assert!(control.stop_transactions(start + Duration::from_millis(150)));
+        // Both the internal finish deadline and the original slot can pass.
+        assert!(control.check_active(start + Duration::from_secs(1)).is_ok());
+        // Avoid a zero-timeout busy loop after the old deadline.
+        assert_eq!(
+            control.root_wait(start + Duration::from_secs(1)).unwrap(),
+            Duration::from_millis(10)
+        );
+        cancel.cancel();
+        assert!(control.check_active(start).is_err());
         assert!(control.root_wait(start).is_err());
     }
 }
