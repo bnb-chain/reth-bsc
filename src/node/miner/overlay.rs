@@ -4,76 +4,151 @@ use crate::BscPrimitives;
 use alloy_primitives::B256;
 use reth_chain_state::ExecutedBlock;
 use reth_storage_overlay::OverlayManager;
+use std::{
+    collections::{HashSet, VecDeque},
+    time::Instant,
+};
 
-// Persistence normally rolls the generation sooner. Bound retained parent overlays even if
-// persistence stalls; this limits cache growth, not the ancestor data required by a root task.
+// Bound distinct (durable anchor, parent) views admitted to each manager, rather than
+// clearing it on every persistence frontier change. This is an entry/lifetime bound,
+// not a byte limit: a captured chain and in-flight task references can be larger.
 const MAX_PARENTS_PER_GENERATION: usize = 32;
+const MAX_GENERATIONS: usize = 2;
 
 #[derive(Default)]
 pub(crate) struct MinerOverlayCache {
-    current: Option<Generation>,
+    // Most recently selected manager first. Never prune a manager in place: old proof
+    // workers may still depend on its captured chain and durable frontier.
+    generations: VecDeque<Generation>,
 }
 
 struct Generation {
     manager: OverlayManager<BscPrimitives>,
-    anchor: B256,
     tip: B256,
-    parents: usize,
+    blocks: usize,
+    views: HashSet<(B256, B256)>,
 }
 
 impl MinerOverlayCache {
-    /// Select a cache using a captured parent-chain snapshot, ordered newest to oldest.
-    ///
-    /// Only append to a generation. Never prune it in place: proof workers may still be using
-    /// its old parent while persistence, a reorg, or another build changes the current chain.
-    /// Return the retired manager so the caller can release it off the mining thread; existing
-    /// factories/tasks retain their clones until their work ends.
+    /// Reuse a manager only when its block graph covers the requested chain, or its
+    /// tip is an ancestor in the captured snapshot. The underlying Reth cache still
+    /// keys each flattened overlay by (anchor, parent); changing frontiers does not
+    /// allow a flattened overlay with a different anchor to be reused as-is.
+    /// Return evicted managers for destruction away from the mining thread. Readers
+    /// keep their own clones, including after eviction or an empty snapshot.
     pub(crate) fn for_parent(
         &mut self,
         blocks: &[ExecutedBlock<BscPrimitives>],
         new_manager: impl FnOnce() -> OverlayManager<BscPrimitives>,
-    ) -> (OverlayManager<BscPrimitives>, Option<OverlayManager<BscPrimitives>>) {
+    ) -> (OverlayManager<BscPrimitives>, Vec<OverlayManager<BscPrimitives>>) {
+        let started = Instant::now();
         let (Some(tip), Some(oldest)) = (blocks.first(), blocks.last()) else {
-            let retired = self.current.take().map(|generation| generation.manager);
+            let retired: Vec<_> = self.generations.drain(..).map(|g| g.manager).collect();
+            metrics::counter!("bsc_miner_overlay_cache_evictions_total", "reason" => "empty_snapshot")
+                .increment(retired.len() as u64);
+            self.record("empty", started, 0);
             return (new_manager(), retired);
         };
         let tip = tip.recovered_block().hash();
         let anchor = oldest.recovered_block().parent_hash;
-
-        // A previous tip must be on the requested parent chain. This also handles rollback:
-        // asking for an ancestor of our previous tip starts a separate generation.
-        let extension = self.current.as_ref().and_then(|current| {
-            (current.anchor == anchor).then(|| {
-                blocks.iter().position(|block| block.recovered_block().hash() == current.tip)
-            })?
-        });
-        let reuse = extension.is_some_and(|added| {
-            let current = self.current.as_ref().expect("extension requires a generation");
-            added == 0 || current.parents < MAX_PARENTS_PER_GENERATION
-        });
-
-        if reuse {
-            let current = self.current.as_mut().expect("reuse requires a generation");
-            let added = extension.expect("reuse requires a parent on the chain");
+        let key = (anchor, tip);
+        let mut capacity_seen = false;
+        let mut selected = None;
+        for (index, generation) in self.generations.iter().enumerate() {
+            let covered = generation.manager.contains_hash(tip, anchor, anchor);
+            let added = if covered {
+                Some(0)
+            } else {
+                blocks
+                    .iter()
+                    .position(|b| b.recovered_block().hash() == generation.tip)
+                    .or_else(|| (generation.tip == anchor).then_some(blocks.len()))
+            };
+            let Some(added) = added else { continue };
+            if !generation.views.contains(&key) &&
+                generation.views.len() == MAX_PARENTS_PER_GENERATION
+            {
+                capacity_seen = true;
+                continue;
+            }
+            selected = Some((index, added));
+            break;
+        }
+        if let Some((index, added)) = selected {
+            let mut generation =
+                self.generations.remove(index).expect("selected generation exists");
             for block in blocks[..added].iter().rev() {
-                current.manager.insert_block(block.clone());
+                generation.manager.insert_block(block.clone());
             }
             if added > 0 {
-                current.parents += 1;
-                current.tip = tip;
+                generation.blocks += added;
+                generation.tip = tip;
             }
-            return (current.manager.clone(), None);
+            let repeated = !generation.views.insert(key);
+            let manager = generation.manager.clone();
+            self.generations.push_front(generation);
+            self.record(
+                if index > 0 {
+                    "retained"
+                } else if repeated {
+                    "repeat"
+                } else if added > 0 {
+                    "extend"
+                } else {
+                    "covered"
+                },
+                started,
+                added,
+            );
+            return (manager, Vec::new());
         }
 
         let manager = new_manager();
         for block in blocks.iter().rev() {
             manager.insert_block(block.clone());
         }
-        let retired = self
-            .current
-            .replace(Generation { manager: manager.clone(), anchor, tip, parents: 1 })
-            .map(|generation| generation.manager);
+        let reason = if self.generations.is_empty() {
+            "cold"
+        } else if capacity_seen {
+            "capacity"
+        } else {
+            "chain_miss"
+        };
+        metrics::counter!("bsc_miner_overlay_cache_generations_total", "reason" => reason)
+            .increment(1);
+        self.generations.push_front(Generation {
+            manager: manager.clone(),
+            tip,
+            blocks: blocks.len(),
+            views: HashSet::from([key]),
+        });
+        let retired = if self.generations.len() > MAX_GENERATIONS {
+            metrics::counter!("bsc_miner_overlay_cache_evictions_total", "reason" => "capacity")
+                .increment(1);
+            vec![self.generations.pop_back().expect("over capacity").manager]
+        } else {
+            Vec::new()
+        };
+        self.record("new", started, blocks.len());
         (manager, retired)
+    }
+
+    fn record(&self, result: &'static str, started: Instant, inserted: usize) {
+        // Selections are manager reuse, NOT flattened-overlay hits. Views bound admissions;
+        // block references may overlap across generations, and neither gauge measures bytes
+        // or references held by in-flight tasks after eviction. No parent hashes as labels.
+        metrics::counter!("bsc_miner_overlay_cache_selections_total", "result" => result)
+            .increment(1);
+        metrics::gauge!("bsc_miner_overlay_cache_generations").set(self.generations.len() as f64);
+        metrics::gauge!("bsc_miner_overlay_cache_views")
+            .set(self.generations.iter().map(|g| g.views.len()).sum::<usize>() as f64);
+        metrics::gauge!("bsc_miner_overlay_cache_block_references")
+            .set(self.generations.iter().map(|g| g.blocks).sum::<usize>() as f64);
+        metrics::histogram!("bsc_miner_overlay_cache_inserted_blocks").record(inserted as f64);
+        // Includes the caller's cache lock hold work, but not time acquiring that lock,
+        // proof computation, waiting for a flattened overlay, or asynchronous retirement.
+        metrics::histogram!("bsc_miner_overlay_cache_selection_seconds")
+            .record(started.elapsed().as_secs_f64());
     }
 }
 
@@ -440,7 +515,7 @@ mod tests {
         assert_eq!(root(&after), root(&baseline));
         assert_eq!(root(&overlay(&old, b.recovered_block().hash(), anchor)), root(&before));
         cache.for_parent(&[], OverlayManager::default);
-        assert!(cache.current.is_none());
+        assert!(cache.generations.is_empty());
         assert_eq!(root(&overlay(&new, b.recovered_block().hash(), next_anchor)), root(&after));
     }
 
@@ -466,7 +541,7 @@ mod tests {
             }
         }
         assert_eq!(created, 2);
-        assert_eq!(cache.current.as_ref().unwrap().parents, 1);
+        assert_eq!(cache.generations.front().unwrap().views.len(), 1);
         let first = chain.last().unwrap();
         let anchor = BlockNumHash::new(0, B256::ZERO);
         let retained = overlay(&old.unwrap(), first.recovered_block().hash(), anchor);
@@ -525,5 +600,68 @@ mod tests {
         drop(cache);
         barrier.wait();
         assert_eq!(worker.join().unwrap(), expected);
+    }
+    #[test]
+    fn frontier_progress_reuses_manager_but_not_wrong_anchor_overlay() {
+        let anchor = BlockNumHash::new(0, B256::ZERO);
+        let a = block(1, anchor.hash, 1);
+        let b = block(2, a.recovered_block().hash(), 2);
+        let c = block(3, b.recovered_block().hash(), 3);
+        let mut cache = MinerOverlayCache::default();
+        let first = cache.for_parent(&[b.clone(), a.clone()], OverlayManager::default).0;
+        let old = overlay(&first, b.recovered_block().hash(), anchor);
+        let frontier = BlockNumHash::new(1, a.recovered_block().hash());
+        let progressed = cache
+            .for_parent(&[c.clone(), b.clone()], || {
+                panic!("frontier must not retire a covering manager")
+            })
+            .0;
+        let actual = overlay(&progressed, c.recovered_block().hash(), frontier);
+        let expected =
+            overlay(&fresh(&[c.clone(), b.clone()]), c.recovered_block().hash(), frontier);
+        assert_eq!(actual.input().state, expected.input().state);
+        assert_eq!(actual.input().nodes, expected.input().nodes);
+        assert_eq!(root(&actual), root(&expected));
+        let again =
+            cache.for_parent(&[b.clone(), a.clone()], || panic!("older snapshot is retained")).0;
+        let retried = overlay(&again, b.recovered_block().hash(), anchor);
+        assert!(Arc::ptr_eq(&old.input().state, &retried.input().state));
+        assert_eq!(cache.generations.len(), 1);
+    }
+
+    #[test]
+    fn returning_to_retained_fork_reuses_completed_overlay() {
+        let anchor = BlockNumHash::new(0, B256::ZERO);
+        let a = block(1, anchor.hash, 1);
+        let b = block(2, a.recovered_block().hash(), 2);
+        let fork = block(2, a.recovered_block().hash(), 99);
+        let mut cache = MinerOverlayCache::default();
+        let old = cache.for_parent(&[b.clone(), a.clone()], OverlayManager::default).0;
+        let original = overlay(&old, b.recovered_block().hash(), anchor);
+        cache.for_parent(&[fork.clone(), a.clone()], OverlayManager::default);
+        let reused =
+            cache.for_parent(&[b.clone(), a.clone()], || panic!("retained fork must be found")).0;
+        let retried = overlay(&reused, b.recovered_block().hash(), anchor);
+        assert!(Arc::ptr_eq(&original.input().state, &retried.input().state));
+        assert_eq!(cache.generations.len(), 2);
+    }
+
+    #[test]
+    fn eviction_bounds_owners_without_invalidating_old_readers() {
+        let anchor = BlockNumHash::new(0, B256::ZERO);
+        let a = block(1, anchor.hash, 1);
+        let mut cache = MinerOverlayCache::default();
+        let old = cache.for_parent(std::slice::from_ref(&a), OverlayManager::default).0;
+        let before = overlay(&old, a.recovered_block().hash(), anchor);
+        let mut evicted = 0;
+        for nonce in 2..=5 {
+            let fork = block(1, anchor.hash, nonce);
+            let (_, retired) = cache.for_parent(&[fork], OverlayManager::default);
+            evicted += retired.len();
+            drop(retired);
+            assert!(cache.generations.len() <= MAX_GENERATIONS);
+        }
+        assert_eq!(evicted, 3);
+        assert_eq!(root(&overlay(&old, a.recovered_block().hash(), anchor)), root(&before));
     }
 }

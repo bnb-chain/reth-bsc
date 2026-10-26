@@ -222,6 +222,39 @@ fn initial_out_of_turn_build_wait(
     std::time::Duration::from_millis(wait_ms)
 }
 
+/// Opt-in QA experiment, deliberately restricted to in-turn local jobs.
+fn late_finish_experiment(is_inturn: bool) -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let enabled = std::env::var("BSC_MINING_ALLOW_LATE_FINISH")
+            .is_ok_and(|value| matches!(value.trim(), "1" | "true" | "on"));
+        if enabled {
+            warn!(target: "bsc::miner::payload",
+                "QA late-finish experiment enabled: in-turn jobs retain at least 50ms for transactions and completion may overrun the slot; cancellation remains active");
+        }
+        enabled
+    });
+    is_inturn && *ENABLED
+}
+
+/// Do not race a still-running normal build against a newly spawned empty fallback.
+/// Actual errors exhaust the tasks and let the caller use its usual empty fallback.
+async fn wait_for_late_candidate<T: 'static, E: 'static>(
+    tasks: &mut tokio::task::JoinSet<Result<T, E>>,
+    abort_rx: &mut oneshot::Receiver<()>,
+) -> Result<Option<T>, ()> {
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut *abort_rx => return Err(()),
+            result = tasks.join_next() => match result {
+                Some(Ok(Ok(payload))) => return Ok(Some(payload)),
+                Some(Ok(Err(_))) | Some(Err(_)) => continue,
+                None => return Ok(None),
+            },
+        }
+    }
+}
+
 /// Keep the fallback handle only while its result is still in this JoinSet. A completed
 /// task still counts toward len(), so completion alone cannot identify the remaining task.
 async fn join_candidate<T: 'static>(
@@ -639,7 +672,9 @@ where
             // (slash / reward / validator-set updates) with the state_hook installed.
             // See `BscBlockExecutionCtx::trie_handle` doc.
             trie_handle: Some(trie_handle.clone()),
-            state_root_deadline_ms,
+            state_root_deadline_ms: state_root_deadline_ms.filter(|_| {
+                !build_control.as_ref().is_some_and(|control| control.allows_late_finish())
+            }),
             build_control: build_control.clone(),
             finish_diagnostics: Some((
                 kind.label(),
@@ -1037,7 +1072,7 @@ where
             let now = std::time::Instant::now();
             let reason = if cancel.is_cancelled() {
                 "cancelled"
-            } else if now >= control.finish_until {
+            } else if !control.allows_late_finish() && now >= control.finish_until {
                 "completion_deadline"
             } else if now >= control.transactions_until {
                 "transaction_deadline"
@@ -1089,6 +1124,17 @@ where
             block,
             block_access_list: _,
         } = builder.finish(&state_provider, None)?;
+
+        if let Some(control) = build_control.as_ref().filter(|control| control.allows_late_finish())
+        {
+            let overrun = std::time::Instant::now().saturating_duration_since(control.finish_until);
+            if !overrun.is_zero() {
+                // Completed local candidates, not canonical blocks or accepted submissions.
+                metrics::counter!("bsc_miner_late_finish_completed_total").increment(1);
+                metrics::histogram!("bsc_miner_late_finish_overrun_seconds")
+                    .record(overrun.as_secs_f64());
+            }
+        }
 
         let mut sealed_block = Arc::new(block.sealed_block().clone());
 
@@ -1591,6 +1637,11 @@ where
             self.root_reserve,
             slot_remaining,
             self.build_args.cancel.clone(),
+        )
+        .with_late_finish(
+            late_finish_experiment(self.mining_ctx.is_inturn),
+            start_time,
+            self.root_reserve,
         );
         if let Some(timing) = &self.mining_ctx.startup_timing {
             timing.report(
@@ -2195,6 +2246,29 @@ where
     /// until the pre-computed `end_mining_timestamp_ms` deadline (+ 150 ms grace) is reached or
     /// all background tasks finish, whichever comes first.
     fn collect_payload_candidates(&mut self) -> Result<(), Box<BscPayloadJobError>> {
+        // The experiment waits for the normal task before creating an empty fallback,
+        // even past the usual collection grace. New-parent/shutdown abort still wins.
+        if self.build_args.build_control.as_ref().is_some_and(|c| c.allows_late_finish()) {
+            if self.potential_payloads.iter().any(|p| p.build_kind != BuildKind::EmptyFallback) {
+                return Ok(());
+            }
+            let outcome = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(wait_for_late_candidate(&mut self.join_handle, &mut self.abort_rx))
+            });
+            match outcome {
+                Ok(Some(payload)) => {
+                    self.potential_payloads.push(payload);
+                    return Ok(());
+                }
+                Ok(None) => {} // All normal tasks failed: retain the real-error fallback.
+                Err(()) => {
+                    self.build_args.cancel.clone().cancel();
+                    self.is_aborted = true;
+                    return Err(Box::new(BscPayloadJobError::JobAborted));
+                }
+            }
+        }
         let mut empty_fallback = None;
         // Phase 1: guarantee at least one candidate.
         if self.potential_payloads.is_empty() {
@@ -3163,6 +3237,7 @@ fn finalize_payload(
 
 #[cfg(test)]
 mod tests {
+    use tokio::sync::oneshot;
 
     use super::{reserve_for_depth, AdaptiveReserveConfig, DELAY_LEFT_OVER};
 
@@ -3944,5 +4019,37 @@ mod tests {
         assert_eq!(refreshed.hash(), original_hash);
         let sidecar = refreshed.body().sidecars.as_ref().unwrap().first().unwrap();
         assert_eq!(sidecar.block_hash, original_hash);
+    }
+
+    #[test]
+    fn late_finish_experiment_never_applies_out_of_turn() {
+        assert!(!super::late_finish_experiment(false));
+    }
+
+    #[tokio::test]
+    async fn late_candidate_waits_for_normal_completion() {
+        let mut tasks = tokio::task::JoinSet::new();
+        let (ready_tx, ready_rx) = oneshot::channel();
+        tasks.spawn(async move { ready_rx.await.map(|_| 7).map_err(|_| ()) });
+        let (_abort_tx, mut abort_rx) = oneshot::channel();
+        let wait = super::wait_for_late_candidate(&mut tasks, &mut abort_rx);
+        tokio::pin!(wait);
+        assert!(tokio::time::timeout(Duration::from_millis(10), &mut wait).await.is_err());
+        ready_tx.send(()).unwrap();
+        assert_eq!(wait.await, Ok(Some(7)));
+    }
+
+    #[tokio::test]
+    async fn late_candidate_abort_and_real_errors_still_exit() {
+        let mut tasks = tokio::task::JoinSet::<Result<u8, ()>>::new();
+        tasks.spawn(std::future::pending());
+        let (abort_tx, mut abort_rx) = oneshot::channel();
+        abort_tx.send(()).unwrap();
+        assert_eq!(super::wait_for_late_candidate(&mut tasks, &mut abort_rx).await, Err(()));
+        tasks.abort_all();
+        let mut failed = tokio::task::JoinSet::new();
+        failed.spawn(async { Err::<u8, _>(()) });
+        let (_abort_tx, mut abort_rx) = oneshot::channel();
+        assert_eq!(super::wait_for_late_candidate(&mut failed, &mut abort_rx).await, Ok(None));
     }
 }

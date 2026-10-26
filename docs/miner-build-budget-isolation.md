@@ -13,6 +13,12 @@ candidates are discarded; reaching the transaction cutoff still allows system
 transactions and root completion. Synchronous EVM/provider calls cannot be forcibly
 interrupted, so checks reject overruns when those calls return.
 
+With `BSC_MINING_ALLOW_LATE_FINISH=1`, in-turn jobs instead retain at least 50 ms
+from job creation for transaction selection and may finish past the completion deadline.
+Cancellation remains active, and retries reuse the same deadlines. The floor includes
+preparation and permit waits. See [minimum transaction window](miner-minimum-window.md)
+for the opt-in QA policy and its validation limits.
+
 The miner owns a persistent, bounded runtime including root/hash session workers,
 account/storage proof pools and its overlay pool. Each proof pool uses 1–4 threads,
 the overlay pool uses 2. Import retains the engine runtime. A single local-build

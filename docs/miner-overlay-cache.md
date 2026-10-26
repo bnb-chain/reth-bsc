@@ -13,12 +13,14 @@ Keep a miner-owned manager across retries and linear parent-chain extensions. In
 observed executed ancestors. Keep the existing isolated miner worker pools and fresh sparse-trie
 behavior; candidate output never advances the shared parent-state cache.
 
-Rotate the manager on an in-memory anchor change, fork/rollback, missing parent snapshot, or after
-32 distinct parent selections in a generation. The limit bounds retained cached parent views
-when persistence stalls; it does not cap the ancestor snapshot needed to build a valid root.
-Repeated selection of the same parent does not consume the limit. Reth still keys each cached
-overlay by its actual durable anchor and parent hash, including when persistence advances
-before the in-memory snapshot is pruned.
+Retain at most two managers in LRU order across frontier changes and compatible chain
+extensions. Admit at most 32 distinct `(snapshot anchor, parent)` views per manager;
+repeated views remain reusable at capacity. Select a retained manager only if its block
+graph covers the requested chain or its tip is an ancestor in the captured snapshot.
+An empty snapshot retires all owned managers. These limits bound ownership and admissions,
+not bytes or references held by in-flight tasks. Reth still keys each computed overlay by
+its actual durable anchor and parent hash. See [overlay retention](miner-overlay-retention.md)
+for selection metrics and validation details.
 
 Never remove ancestors from a manager used by an in-flight task. Old provider factories and root
 tasks retain their manager clones until completion/cancellation. Retired managers and unused

@@ -245,7 +245,7 @@ where
                         overlay_cache.lock().for_parent(&blocks, || {
                             OverlayManager::new_with_diagnostic_origin(worker_pool.clone(), "miner")
                         });
-                    if let Some(retired) = retired {
+                    if !retired.is_empty() {
                         runtime.spawn_drop(retired);
                     }
                     // The external builder still starts a fresh sparse trie. Discard any
