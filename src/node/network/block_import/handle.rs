@@ -39,6 +39,13 @@ impl ImportHandle {
     /// Sends the block to import to the service.
     /// Returns a [`BlockImportError`] if the channel to the import service is closed.
     pub fn send_block(&self, block: BlockMsg, peer_id: PeerId) -> Result<(), BlockImportError> {
+        crate::node::miner::startup_diagnostics::ingress(
+            block.hash,
+            crate::consensus::parlia::util::calculate_millisecond_timestamp(
+                &block.block.0.block.header,
+            ),
+            "network",
+        );
         self.to_import
             .send((block, peer_id))
             .map_err(|_| BlockImportError::Other("block import service channel closed".into()))

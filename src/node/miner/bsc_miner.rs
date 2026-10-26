@@ -1,6 +1,9 @@
+use super::startup_diagnostics::StartupTiming;
 use crate::{
     chainspec::BscChainSpec,
-    consensus::parlia::{provider::SnapshotProvider, Parlia},
+    consensus::parlia::{
+        provider::SnapshotProvider, util::calculate_millisecond_timestamp, Parlia,
+    },
     metrics::BscConsensusMetrics,
     node::{
         engine::BscBuiltPayload,
@@ -58,6 +61,8 @@ pub struct MiningContext {
     pub block_timestamp_ms: u64,
     /// End timestamp of the mining job (UNIX epoch ms), computed via `delay_for_ramanujan_fork`.
     pub end_mining_timestamp_ms: u128,
+    /// Per-job startup observation; absent for bid simulation and synthetic test contexts.
+    pub(crate) startup_timing: Option<StartupTiming>,
 }
 
 #[derive(Clone)]
@@ -162,7 +167,12 @@ where
                     mining_queue_tx,
                     consensus,
                 );
-                worker.try_new_work(&tip_header).await;
+                let timing = StartupTiming::new(
+                    tip_header.hash(),
+                    calculate_millisecond_timestamp(tip_header.header()),
+                    "startup",
+                );
+                worker.try_new_work(&tip_header, timing).await;
             });
         }
 
@@ -186,6 +196,7 @@ where
             let event = event; // rebind to avoid move issues
                     let committed = event.committed();
                     let tip = committed.tip();
+                    let mut startup_timing = StartupTiming::new(tip.hash(), super::startup_diagnostics::header_ms(tip.header()), "canonical");
                     let is_reorg = matches!(event, CanonStateNotification::Reorg { .. });
                     debug!(
                         target: "bsc::miner",
@@ -278,10 +289,12 @@ where
                         }
                     }
 
+                    let cache_started = std::time::Instant::now();
                     self.cache_for_next(&committed);
+                    startup_timing.cache_finished(cache_started.elapsed());
 
                     self.last_triggered_tip = Some(tip_header.hash());
-                    self.try_new_work(&tip_header).await;
+                    self.try_new_work(&tip_header, startup_timing).await;
                 }
             _ = periodic_tick.tick() => {
                 // Periodic retry: fires when no canonical events have arrived recently.
@@ -303,7 +316,7 @@ where
                         "Periodic sync-gate retry"
                     );
                     self.last_triggered_tip = Some(tip.hash());
-                    self.try_new_work(&tip).await;
+                    self.try_new_work(&tip, StartupTiming::new(tip.hash(), calculate_millisecond_timestamp(tip.header()), "retry")).await;
                     // Clear so the next tick retries if try_new_work was skipped (e.g.
                     // backfill still active). If a canonical event fires before the next
                     // tick it will set last_triggered_tip again, preventing a duplicate.
@@ -438,7 +451,7 @@ where
         self.pre_cached.as_ref().filter(|pc| pc.block == parent).map(|pc| pc.cached.clone())
     }
 
-    async fn try_new_work<H>(&self, tip: &SealedHeader<H>)
+    async fn try_new_work<H>(&self, tip: &SealedHeader<H>, startup_timing: StartupTiming)
     where
         H: alloy_consensus::BlockHeader + Sealable,
     {
@@ -525,7 +538,7 @@ where
         }
 
         let parent_hash = parent_header.hash();
-        let mining_ctx = MiningContext {
+        let mut mining_ctx = MiningContext {
             header: None,
             parent_header,
             parent_snapshot: Arc::new(parent_snapshot),
@@ -533,9 +546,13 @@ where
             cached_reads: self.maybe_pre_cached(parent_hash),
             block_timestamp_ms: 0,
             end_mining_timestamp_ms: 0,
+            startup_timing: Some(startup_timing),
         };
 
         debug!("Queuing mining context, next_block: {}", tip.number() + 1);
+        if let Some(timing) = &mut mining_ctx.startup_timing {
+            timing.queued();
+        }
         if let Err(e) = self.mining_queue_tx.send(mining_ctx) {
             error!("Failed to send mining context to queue due to {}", e);
         }
@@ -609,7 +626,8 @@ where
             tokio::select! {
                 mining_ctx = self.mining_queue_rx.recv() => {
                     match mining_ctx {
-                        Some(ctx) => {
+                        Some(mut ctx) => {
+                            if let Some(timing) = &mut ctx.startup_timing { timing.dequeued(); }
                             let next_block = ctx.parent_header.number() + 1;
                             let parent_hash = ctx.parent_header.hash();
                             if !self.recheck_mining_ctx(&ctx) {
@@ -734,6 +752,7 @@ where
             trie_handle: std::sync::Arc::new(std::sync::Mutex::new(None)),
             // R2: bound the sparse-trie state_root() wait to this slot so an in-turn
             // block never blocks past its deadline (then falls back to sync root).
+            build_control: None,
             state_root_deadline_ms: Some(
                 (mining_ctx.end_mining_timestamp_ms as u64)
                     .saturating_sub(crate::node::miner::payload::STATE_ROOT_WAIT_MARGIN_MS),
@@ -741,7 +760,7 @@ where
         };
 
         let parent_hash = mining_ctx.parent_header.hash();
-        let (payload_job, job_handle) = BscPayloadJob::new(
+        let (mut payload_job, job_handle) = BscPayloadJob::new(
             self.parlia.clone(),
             mining_ctx,
             payload_builder,
@@ -752,6 +771,7 @@ where
 
         let start_time = std::time::Instant::now();
         self.running_job_handle = Some(job_handle);
+        payload_job.mark_scheduled();
         self.payload_job_join_set.spawn(async move { payload_job.start().await });
         debug!("Succeed to async start payload job, cost_time: {:?}, block_number: {}, parent_hash: 0x{:x}",
             start_time.elapsed(), block_number, parent_hash);
@@ -867,6 +887,11 @@ where
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let sealed_block = payload.block();
         let block_hash = sealed_block.hash();
+        super::startup_diagnostics::ingress(
+            block_hash,
+            calculate_millisecond_timestamp(sealed_block.header()),
+            "local",
+        );
         let block_number = sealed_block.number();
         let parent_hash = sealed_block.header().parent_hash;
         let best_block_number = self.provider.best_block_number()?;
