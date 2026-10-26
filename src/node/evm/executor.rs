@@ -2,7 +2,7 @@ use super::config::{
     revm_spec_by_timestamp_and_block_number, BscBlockExecutionCtx, BscExecutionMode,
 };
 use super::patch::HertzPatchManager;
-use crate::consensus::parlia::SnapshotProvider;
+use crate::consensus::parlia::{util::calculate_millisecond_timestamp, SnapshotProvider};
 use crate::{
     consensus::parlia::{Parlia, Snapshot, VoteAddress},
     evm::{
@@ -1014,13 +1014,12 @@ where
             .sum();
         self.blockchain_metrics.block_tx_size_bytes.set(tx_size_bytes as f64);
 
-        // Calculate block receive time difference
-        // This is the difference between current block timestamp and parent block timestamp
-        let current_timestamp = self.evm.block().timestamp().to::<u64>();
+        // Record the block timestamp interval, including BSC's sub-second component.
         if let Some(parent_header) = &self.inner_ctx.parent_header {
-            let parent_timestamp = parent_header.timestamp;
-            let time_diff = (current_timestamp as i64) - (parent_timestamp as i64);
-            self.blockchain_metrics.block_receive_time_diff_seconds.set(time_diff as f64);
+            let current_timestamp_ms = self.evm.block().milli_timestamp();
+            let parent_timestamp_ms = calculate_millisecond_timestamp(parent_header);
+            let time_diff_ms = current_timestamp_ms as i128 - parent_timestamp_ms as i128;
+            self.blockchain_metrics.block_receive_time_diff_seconds.set(time_diff_ms as f64 / 1000.0);
         }
 
         // Note: For gas-related metrics, use reth's ExecutorMetrics:
@@ -1078,6 +1077,67 @@ mod tests {
     const VALIDATOR: Address = address!("0x2000000000000000000000000000000000000002");
     const SYSTEM_TX: (Address, Address) = (VALIDATOR, VALIDATOR_CONTRACT);
     const NORMAL_TX: (Address, Address) = (NORMAL, NORMAL);
+
+    #[test]
+    fn block_interval_metric_preserves_milliseconds() {
+        use crate::{
+            consensus::parlia::util::set_millisecond_part_of_timestamp, metrics::BscBlockchainMetrics,
+            node::evm::config::BscExecutionMode,
+        };
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        let spec = parse_genesis_json(
+            r#"{
+                "config": {"chainId": 714, "ramanujanBlock": 0},
+                "difficulty": "0x1", "gasLimit": "0x2625a00", "alloc": {}
+            }"#,
+        )
+        .expect("genesis should parse");
+        let evm_config = BscEvmConfig::bsc(spec);
+
+        for (parent_ms, current_ms, expected_seconds) in [
+            (1_000_100, 1_000_550, 0.45), // Both blocks within the same second.
+            (1_000_800, 1_001_250, 0.45), // Cross a second boundary.
+            (1_000_500, 1_001_250, 0.75),
+            (1_000_750, 1_002_250, 1.5),
+            (1_000_000, 1_003_000, 3.0), // Legacy whole-second timestamps.
+        ] {
+            let mut parent = Header {
+                number: 100,
+                timestamp: parent_ms / 1000,
+                gas_limit: 40_000_000,
+                ..Default::default()
+            };
+            set_millisecond_part_of_timestamp(parent_ms, &mut parent);
+            let mut header = Header {
+                number: parent.number + 1,
+                timestamp: current_ms / 1000,
+                gas_limit: parent.gas_limit,
+                ..Default::default()
+            };
+            set_millisecond_part_of_timestamp(current_ms, &mut header);
+            let block = SealedBlock::seal_slow(BscBlock { header, body: Default::default() });
+            let mut db = State::builder().with_database(InMemoryDB::default()).build();
+            let mut executor = evm_config.executor_for_block(&mut db, &block).unwrap();
+            executor.inner_ctx.parent_header = Some(parent);
+            // Exercise finish's metric emission without requiring Parlia system transactions.
+            executor.ctx.mode = BscExecutionMode::Simulation;
+            let recorder = PrometheusBuilder::new().build_recorder();
+            executor.blockchain_metrics = metrics::with_local_recorder(&recorder, || {
+                BscBlockchainMetrics::new_with_labels(&[] as &[(&str, &str)])
+            });
+            executor.finish().expect("empty block should finish");
+
+            let output = recorder.handle().render();
+            let value = output
+                .lines()
+                .find_map(|line| line.strip_prefix("bsc_blockchain_block_receive_time_diff_seconds "))
+                .expect("block interval gauge should be exported")
+                .parse::<f64>()
+                .unwrap();
+            assert_eq!(value, expected_seconds, "parent={parent_ms}ms, block={current_ms}ms");
+        }
+    }
 
     /// Imports `txs`, zero-gas-price calls given as `(from, to)`, into a block mined by
     /// `VALIDATOR`, so a call from it to a system contract is a system transaction.
