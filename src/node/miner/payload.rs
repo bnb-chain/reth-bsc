@@ -230,7 +230,7 @@ fn late_finish_experiment(is_inturn: bool) -> bool {
             .is_ok_and(|value| matches!(value.trim(), "1" | "true" | "on"));
         if enabled {
             warn!(target: "bsc::miner::payload",
-                "QA late-finish experiment enabled: in-turn completion may overrun the slot; transaction deadlines and cancellation remain active");
+                "QA late-finish experiment enabled: in-turn jobs retain at least 50ms for transactions and completion may overrun the slot; cancellation remains active");
         }
         enabled
     });
@@ -1638,7 +1638,11 @@ where
             slot_remaining,
             self.build_args.cancel.clone(),
         )
-        .with_late_finish(late_finish_experiment(self.mining_ctx.is_inturn));
+        .with_late_finish(
+            late_finish_experiment(self.mining_ctx.is_inturn),
+            start_time,
+            self.root_reserve,
+        );
         if let Some(timing) = &self.mining_ctx.startup_timing {
             timing.report(
                 start_time,
